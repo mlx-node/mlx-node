@@ -120,6 +120,7 @@ const EMPTY_PARSED: ParsedUpdates = {
   retries: [],
   lastTs: 0,
   toolNames: new Map(),
+  contextUsed: null,
 };
 
 function fresh(entry: Stamp | undefined, st: Stats): boolean {
@@ -381,6 +382,7 @@ export class AgentSessionsReader {
       transcript,
       turns: updates.ok ? updates.parsed.turns : [],
       ...(updates.ok ? {} : { transcriptError: updates.error }),
+      ...(updates.ok && updates.parsed.contextUsed !== null ? { contextUsed: updates.parsed.contextUsed } : {}),
       resumeCommand: this.origin === 'chat' ? null : resumeCommand(s.cwd, id, this.agentHome, this.defaultAgentHome),
     };
   }

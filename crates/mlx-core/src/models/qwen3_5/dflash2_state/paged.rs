@@ -13,11 +13,15 @@ use crate::array::MxArray;
 
 use super::super::arrays_cache::ArraysCache;
 use super::super::config::Qwen3_5Config;
-use super::super::dflash2::{DFlash2Config, DFlash2ContextCache};
+use super::super::dflash2::{DFlash2Config, DFlash2ContextCache, DFlash2Model};
+use super::super::dflash2_decode::{DraftedProposals, append_kept_taps};
 use super::super::draft_context::DraftContextWindow;
+use super::super::gated_delta_net::GdnLayerTape;
+use super::super::gdn_blob::GdnStateBlobs;
 use super::super::layer_cache::Qwen3_5LayerCache;
 use super::plan::StatePlan;
 use super::store::{Entry, EntryId, HybridStateStore, StateBytes};
+use crate::engine::scheduled_verify::ScheduledVerifyBatch;
 
 /// GDN slots (full-attention slots are empty placeholders) and the 4-bit
 /// draft context window, both at the same block-aligned row; a load without
@@ -139,6 +143,18 @@ pub(crate) struct DFlash2States {
     /// Each scheduled sequence's context window on a draft load, which its
     /// prefill slices continue (Splash keeps one lane per request).
     pub(crate) seq_windows: HashMap<u32, DraftContextWindow>,
+    /// Each scheduled sequence's DFlash2 decode lane on a draft load
+    /// (Splash keeps one lane per request).
+    pub(crate) seq_lanes: HashMap<u32, DraftLane>,
+    /// The lanes' verify wave between its write and its commit: the
+    /// tickets of every row in it.
+    pub(crate) lane_batch: Option<ScheduledVerifyBatch>,
+    /// The cells each autoregressive peer of the open wave had before its
+    /// row's forward: a zero keep or an abort puts them back.
+    pub(crate) peer_cells: HashMap<u32, Vec<Qwen3_5LayerCache>>,
+    /// The decode cache limit of a lane's 8-row verify, held while any lane
+    /// lives.
+    pub(crate) lane_decode_limit: Option<crate::cache_limit::DecodeCacheLimitGuard>,
     pub(crate) counters: StateCounters,
     /// The finalize released the DFlash2 turn's lane; its history save
     /// takes it.
@@ -178,6 +194,99 @@ pub(crate) struct StateRead {
 pub(crate) struct DiskRead {
     pub(crate) id: EntryId,
     pub(crate) window: Option<DraftContextWindow>,
+}
+
+/// A scheduled sequence's DFlash2 decode state: its draft ring, its two GDN
+/// cells with their pending rows, its cycle's draft and its open verify.
+pub(crate) struct DraftLane {
+    pub(crate) ring: DFlash2ContextCache,
+    /// The position the next ring append is stamped with: the sequence's
+    /// committed rows.
+    pub(crate) next_position: i32,
+    pub(crate) gdn: Option<GdnStateBlobs>,
+    /// The cycle's whole draft: the proposals past the driver's cap are the
+    /// verify's tail rows.
+    pub(crate) drafted: Option<DraftedProposals>,
+    pub(crate) open: Option<OpenVerify>,
+    pub(crate) verifies: LaneVerifies,
+    /// Planes GEMM calls of the committed verifies: a wave's calls count
+    /// once for each of its lanes.
+    pub(crate) planes_calls: u64,
+    /// The part of `planes_calls` from verify waves.
+    pub(crate) wave_planes_calls: u64,
+}
+
+/// The cycles a lane committed, by the verify that ran them: in a verify
+/// wave, by the wave's lanes, or alone (its `[1, 8]` lane kernel). A verify
+/// its step retracted, or that kept no row, is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaneVerifies {
+    /// Waves of 2, 3 and 4 lanes.
+    pub(crate) waves: [u64; 3],
+    pub(crate) alone: u64,
+}
+
+impl LaneVerifies {
+    /// One cycle verified by `lanes` lanes together (1: alone).
+    pub(crate) fn record(&mut self, lanes: usize) {
+        if lanes <= 1 {
+            self.alone += 1;
+        } else if let Some(count) = self.waves.get_mut(lanes - 2) {
+            *count += 1;
+        }
+    }
+
+    pub(crate) fn wave_cycles(&self) -> u64 {
+        self.waves.iter().sum()
+    }
+
+    /// `key=value` fields, space separated.
+    pub(crate) fn fields(&self) -> String {
+        format!(
+            "wave_cycles={} lanes2={} lanes3={} lanes4={} alone_cycles={}",
+            self.wave_cycles(),
+            self.waves[0],
+            self.waves[1],
+            self.waves[2],
+            self.alone
+        )
+    }
+}
+
+/// A lane's verify between its write and its commit; its ticket is in
+/// [`DFlash2States::lane_batch`].
+pub(crate) struct OpenVerify {
+    pub(crate) tape: Vec<Option<GdnLayerTape>>,
+    pub(crate) tapped: Vec<MxArray>,
+    pub(crate) ids: Vec<u32>,
+    /// The lanes that verified together, this one included.
+    pub(crate) lanes: usize,
+    /// Planes GEMM calls of this verify; of the whole wave for a wave lane.
+    pub(crate) planes_calls: u64,
+}
+
+impl DraftLane {
+    /// Appends the kept rows' taps to the ring at the lane's position and
+    /// moves the position past them.
+    pub(crate) fn append_kept(
+        &mut self,
+        draft: &DFlash2Model,
+        tapped: &[MxArray],
+        token_ids: &[u32],
+    ) -> Result<()> {
+        self.next_position =
+            append_kept_taps(draft, &mut self.ring, self.next_position, tapped, token_ids)?;
+        Ok(())
+    }
+
+    /// What the lane holds beside the sequence's current GDN cell: the ring
+    /// buffers, the second cell and the pending GDN tape.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.ring
+            .buffer_bytes()
+            .saturating_add(self.gdn.as_ref().map_or(0, GdnStateBlobs::spare_bytes))
+            .saturating_add(self.gdn.as_ref().map_or(0, GdnStateBlobs::pending_bytes))
+    }
 }
 
 /// A released lane's buffers: the draft ring with its rows dropped and the
@@ -244,6 +353,10 @@ impl DFlash2States {
             generation_suffix: None,
             lane_window: None,
             seq_windows: HashMap::new(),
+            seq_lanes: HashMap::new(),
+            lane_batch: None,
+            peer_cells: HashMap::new(),
+            lane_decode_limit: None,
             counters: StateCounters::default(),
             released: false,
             restore_uses: HashMap::new(),
@@ -263,6 +376,10 @@ impl DFlash2States {
         self.replay_points.clear();
         self.lane_window = None;
         self.seq_windows.clear();
+        self.seq_lanes.clear();
+        self.lane_batch = None;
+        self.peer_cells.clear();
+        self.lane_decode_limit = None;
         self.disk_read = None;
         self.state_read = None;
         self.restore_uses.clear();
@@ -328,6 +445,42 @@ impl DFlash2States {
         self.state_read = None;
         let window = self.seq_windows.remove(&seq);
         self.idle_lane.give_window(window);
+    }
+
+    /// `seq`'s decode lane; a new one takes the idle lane's ring (Splash
+    /// `QwenStateStorage::acquire`).
+    pub(crate) fn begin_lane(&mut self, seq: u32, config: &DFlash2Config) -> &mut DraftLane {
+        let idle = &mut self.idle_lane;
+        self.seq_lanes.entry(seq).or_insert_with(|| DraftLane {
+            ring: idle.take_ring(config),
+            next_position: 0,
+            gdn: None,
+            drafted: None,
+            open: None,
+            verifies: LaneVerifies::default(),
+            planes_calls: 0,
+            wave_planes_calls: 0,
+        })
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn lane_mut(&mut self, seq: u32) -> Option<&mut DraftLane> {
+        self.seq_lanes.get_mut(&seq)
+    }
+
+    /// `seq`'s lane ends (Splash `QwenStateStorage::releaseLane`): its ring
+    /// goes to the idle lane, its cells and draft drop; the last lane drops
+    /// the decode cache limit. Its pending rows drop unfolded:
+    /// `scheduled_dflash2::end_lane` retracts an open wave and settles the
+    /// sequence's cells first.
+    pub(crate) fn release_lane(&mut self, seq: u32) {
+        let Some(lane) = self.seq_lanes.remove(&seq) else {
+            return;
+        };
+        self.idle_lane.give_ring(Some(lane.ring));
+        if self.seq_lanes.is_empty() {
+            self.lane_decode_limit = None;
+        }
     }
 
     /// `seq`'s context window: the serial lane's for sequence 0.

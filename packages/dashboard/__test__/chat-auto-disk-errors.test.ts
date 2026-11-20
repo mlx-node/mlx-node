@@ -93,6 +93,7 @@ function request(kind: 'bash' | 'edit', input: string): PermissionRequest {
       : { file_path: input, content: 'x' },
     options: OPTIONS,
     hookAsk: { hookName: GUARD, reason: null },
+    requester: null,
   };
 }
 

@@ -24,6 +24,7 @@ use crate::engine::backend::{
     TurnOutput, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::decode::{StreamingCtx, TurnStreaming};
+use crate::engine::dspark_timeline::{self as timeline, Mark};
 use crate::engine::paged_turn::FinishPagedTurnArgs;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{CutTargets, ReasoningTracker, ThinkingCut, apply_all_penalties};
@@ -60,6 +61,7 @@ fn penalized_greedy_accept(
         &decisions.iter().collect::<Vec<_>>(),
         "speculative_greedy_accept",
     )?;
+    timeline::mark(Mark::VerifyWait);
     for (i, decision) in decisions.iter().enumerate() {
         let target = match forced.and_then(|f| f.at(i)) {
             Some(token) => token as i32,
@@ -93,6 +95,7 @@ fn accept_device_budgeted_greedy(
     }
     let argmax = logits.argmax(-1, None)?;
     MxArray::eval_arrays_with_context(&[&argmax, budget], "speculative_budgeted_greedy_accept")?;
+    timeline::mark(Mark::VerifyWait);
     let rows = usize::try_from(budget.item_at_int32(0)?)
         .map_err(|_| Error::from_reason("negative device verification row budget"))?;
     if rows == 0 || rows > draft_len + 1 {
@@ -114,6 +117,13 @@ fn accept_device_budgeted_greedy(
         rows,
         raw_matches,
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sampled acceptances on this thread: (device graph, host walk).
+    pub(crate) static TEST_SAMPLED_ACCEPTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Shared whole-turn and scheduler acceptance. Probability/penalty work stays
@@ -167,6 +177,7 @@ pub(crate) fn accept_dspark_proposal(
         (|| {
             let argmax_arr = logits.argmax(-1, None)?;
             MxArray::eval_arrays_with_context(&[&argmax_arr], "speculative_greedy_accept")?;
+            timeline::mark(Mark::VerifyWait);
             // The verify graph (incl. a device-resident proposal path) is
             // now materialized: the host back-fill below is a plain copy.
             proposal.materialize_draft_ids()?;
@@ -193,10 +204,11 @@ pub(crate) fn accept_dspark_proposal(
     } else {
         // Sampled path: per-position Leviathan accept + residual
         // resample against the stepper's proposal densities.
+        #[cfg(test)]
+        TEST_SAMPLED_ACCEPTS.with(|c| c.set((c.get().0, c.get().1 + 1)));
         (|| {
-            // Sampled accept consumes host proposal ids at graph-build time
-            // (a device path is not produced for sampled turns today; this
-            // keeps the contract correct if one ever is).
+            // Sampled accept consumes host proposal ids and rows at graph-build
+            // time; a device-drawn proposal lands here first.
             proposal.materialize_draft_ids()?;
             let forced = cut_targets(cut, &proposal.draft_ids);
             if forced.is_some() {
@@ -204,6 +216,7 @@ pub(crate) fn accept_dspark_proposal(
                 // verify graph is still forced before its anchor's cache state
                 // is kept.
                 MxArray::eval_arrays_with_context(&[logits], "speculative_cut_accept")?;
+                timeline::mark(Mark::VerifyWait);
             }
             let forced_at = |row: usize| forced.as_ref().and_then(|f| f.at(row));
             // A zero-draft cycle is the intentional AR-through-verify
@@ -242,6 +255,7 @@ pub(crate) fn accept_dspark_proposal(
                 .chain(proposal.draft_dists.iter())
                 .collect::<Vec<_>>();
             MxArray::eval_arrays_with_context(&roots, "speculative_sampled_accept")?;
+            timeline::mark(Mark::VerifyWait);
             let mut k = 0usize;
             let mut boundary: Option<u32> = None;
             for (i, p_target) in targets.iter().enumerate() {
@@ -286,6 +300,328 @@ pub(crate) fn accept_dspark_proposal(
             };
             Ok((k, boundary_id))
         })()
+    }
+}
+
+/// Sampled acceptance of a device-drawn proposal in one device graph (Splash
+/// `accept_sampled_lane`, runtime/metal/kernels/decode/sampling.metal,
+/// Apache-2.0): draft `d_i` stays while `u_i * q_i(d_i) < p_i(d_i)`; the first
+/// refused row emits its draw from `(p_i - q_i)+` (its argmax when that has
+/// no mass), and a fully accepted block emits the bonus row's draw from
+/// `p_L`. Every coin and draw key is taken from `rng` before the graph, the
+/// same count each cycle; unused ones are discarded.
+pub(crate) fn accept_device_sampled(
+    logits: &MxArray,
+    proposal: &mut DsparkProposal,
+    p: &ChatParams,
+    rng: &mut dyn rand::Rng,
+) -> Result<(usize, u32)> {
+    use rand::RngExt;
+    let draft_len = proposal.draft_len()?;
+    let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+    if sampling::is_greedy_temperature(temperature)
+        || p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+    {
+        return Err(Error::from_reason(
+            "device sampled acceptance requires an unpenalized sampled turn",
+        ));
+    }
+    let (Some(ids), Some(rows)) = (
+        proposal.device_draft_ids.as_ref(),
+        proposal.device_draft_sparse.as_ref(),
+    ) else {
+        return Err(Error::from_reason(
+            "device sampled acceptance needs a device-drawn proposal",
+        ));
+    };
+    if draft_len == 0
+        || logits.ndim()? != 3
+        || logits.shape_at(0)? != 1
+        || logits.shape_at(1)? != (draft_len + 1) as i64
+        || rows.ids.shape_at(0)? != draft_len as i64
+    {
+        return Err(Error::from_reason(
+            "speculative verifier logits do not match proposal width",
+        ));
+    }
+    #[cfg(test)]
+    TEST_SAMPLED_ACCEPTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+    let vocab = logits.shape_at(2)?;
+    let len = draft_len as i64;
+    let mut targets = Vec::with_capacity(draft_len + 1);
+    for i in 0..=len {
+        let row = logits
+            .slice(&[0, i, 0], &[1, i + 1, vocab])?
+            .squeeze(Some(&[0, 1]))?;
+        targets.push(
+            sampling::sampling_distribution(&row, p.sampling_config)?.astype(DType::Float32)?,
+        );
+    }
+    let coins: Vec<f32> = (0..draft_len).map(|_| rng.random::<f32>()).collect();
+    let coins = MxArray::from_float32(&coins, &[len])?;
+    let drafted = MxArray::stack(targets[..draft_len].iter().collect(), Some(0))?;
+    let column = ids.reshape(&[len, 1])?;
+    let p_draft = drafted.take_along_axis(&column, 1)?.reshape(&[len])?;
+    let q_draft = rows
+        .probs
+        .mul(&rows.ids.equal(&column)?.astype(DType::Float32)?)?
+        .sum(Some(&[1]), None)?;
+    let kept = coins.mul(&q_draft)?.less(&p_draft)?;
+    let refused = MxArray::concatenate(
+        &kept.logical_not()?.astype(DType::Int32)?,
+        &MxArray::from_int32(&[1], &[1])?,
+        0,
+    )?;
+    let accepted = refused.argmax(0, None)?;
+    let residual = drafted
+        .sub(
+            &MxArray::zeros(&[len, vocab], Some(DType::Float32))?.put_along_axis(
+                &rows.ids,
+                &rows.probs,
+                1,
+            )?,
+        )?
+        .clip(Some(0.0), None)?;
+    let mut draws = Vec::with_capacity(draft_len + 1);
+    for i in 0..len {
+        let row = residual.slice_axis(0, i, i + 1)?.reshape(&[vocab])?;
+        draws.push(sampling::residual_draw_array(&targets[i as usize], &row, rng)?.reshape(&[1])?);
+    }
+    draws.push(sampling::sample_dense_distribution_array(&targets[draft_len], rng)?.reshape(&[1])?);
+    let boundary =
+        MxArray::concatenate_many(draws.iter().collect(), Some(0))?.take(&accepted, 0)?;
+    MxArray::eval_arrays_with_context(
+        &[&accepted, &boundary],
+        "speculative_device_sampled_accept",
+    )?;
+    timeline::mark(Mark::VerifyWait);
+    let k = usize::try_from(accepted.item_at_int32(0)?)
+        .map_err(|_| Error::from_reason("device sampled acceptance: negative count"))?;
+    let boundary = boundary.item_at_int32(0)?;
+    if boundary < 0 {
+        return Err(Error::from_reason(
+            "speculative target distribution has no positive probability mass",
+        ));
+    }
+    proposal.device_draft_sparse = None;
+    proposal.materialize_draft_ids()?;
+    Ok((k, boundary as u32))
+}
+
+/// The largest `top_k` the device rows take (`DFLASH2_ROWS_MAX_TOP_K`).
+const SAMPLED_ROWS_MAX_TOP_K: i32 = 256;
+/// The widest draft candidate row (`DFLASH2_ROWS_MAX_CANDIDATES`).
+const SAMPLED_ROWS_MAX_CANDIDATES: usize = 64;
+/// A record holds token ids as f32.
+const SAMPLED_ROWS_MAX_VOCAB: i64 = 1 << 24;
+const SAMPLED_ROWS_RECORD: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Cycles on this thread whose target rows the device kernels decided.
+    pub(crate) static TEST_SAMPLED_ROWS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Whether the device rows take a turn with these parameters: sampled, no
+/// penalty, `top_k` within the kernels' list, mlx-node's filter order, a GPU
+/// that launches the kernels.
+pub(crate) fn sampled_rows_take(p: &ChatParams) -> bool {
+    let config = p.sampling_config.unwrap_or_default();
+    !sampling::is_greedy_temperature(config.temperature.unwrap_or(1.0))
+        && p.repetition_penalty == 1.0
+        && p.presence_penalty == 0.0
+        && p.frequency_penalty == 0.0
+        && (1..=SAMPLED_ROWS_MAX_TOP_K).contains(&config.top_k.unwrap_or(0))
+        && sampling::default_filter_order()
+        && unsafe { mlx_sys::mlx_dflash2_sampled_rows_supported() }
+}
+
+/// A cycle's target rows, queued on the device: one record per verify row
+/// and the cycle's acceptance coins.
+pub(crate) struct SampledRows {
+    records: MxArray,
+    coins: Vec<f64>,
+}
+
+/// Queues the target rows of a sampled DFlash2 cycle (Splash
+/// `Sampling::addSelection`, runtime/ops/Sampling.cpp, Apache-2.0): every
+/// row's distribution under the turn's temperature, top_k, top_p and min_p,
+/// each drafted row's draft token probabilities and its draw from the
+/// residual, and the last row's draw from the target. `logits` holds the
+/// `1 + L` rows of the cycle. One draw uniform per row and one coin per
+/// drafted row come from `rng` before the dispatch, the same count each
+/// cycle. `None`: the kernels do not take the cycle and `rng` is untouched.
+pub(crate) fn submit_sampled_rows(
+    logits: &MxArray,
+    proposal: &DsparkProposal,
+    p: &ChatParams,
+    rng: &mut dyn rand::Rng,
+) -> Result<Option<SampledRows>> {
+    use rand::RngExt;
+    if !sampled_rows_take(p) {
+        return Ok(None);
+    }
+    let draft_len = proposal.draft_len()?;
+    let rows = draft_len + 1;
+    let ndim = logits.ndim()?;
+    let vocab = if ndim == 0 {
+        0
+    } else {
+        logits.shape_at(ndim - 1)?
+    };
+    if vocab == 0 || logits.size()? != rows as u64 * vocab as u64 {
+        return Err(Error::from_reason(
+            "speculative verifier logits do not match proposal width",
+        ));
+    }
+    if vocab > SAMPLED_ROWS_MAX_VOCAB || rows > 64 {
+        return Ok(None);
+    }
+    let drafts = if draft_len == 0 {
+        None
+    } else if let (Some(ids), Some(sparse)) = (
+        proposal.device_draft_ids.as_ref(),
+        proposal.device_draft_sparse.as_ref(),
+    ) {
+        if sparse.ids.ndim()? != 2
+            || sparse.ids.shape_at(0)? != draft_len as i64
+            || sparse.ids.shape_at(1)? > SAMPLED_ROWS_MAX_CANDIDATES as i64
+        {
+            return Ok(None);
+        }
+        Some((
+            ids.astype(DType::Int32)?,
+            sparse.ids.astype(DType::Int32)?,
+            sparse.probs.astype(DType::Float32)?,
+        ))
+    } else if proposal.device_draft_ids.is_none() && proposal.draft_sparse_dists.len() == draft_len
+    {
+        let width = proposal
+            .draft_sparse_dists
+            .iter()
+            .map(|row| row.candidates().0.len())
+            .max()
+            .unwrap_or(0);
+        if width == 0 || width > SAMPLED_ROWS_MAX_CANDIDATES {
+            return Ok(None);
+        }
+        let mut candidate_ids = vec![-1i32; draft_len * width];
+        let mut candidate_probs = vec![0f32; draft_len * width];
+        for (row, sparse) in proposal.draft_sparse_dists.iter().enumerate() {
+            let (ids, probs) = sparse.candidates();
+            candidate_ids[row * width..row * width + ids.len()].copy_from_slice(ids);
+            for (slot, &prob) in probs.iter().enumerate() {
+                candidate_probs[row * width + slot] = prob as f32;
+            }
+        }
+        let shape = [draft_len as i64, width as i64];
+        Some((
+            MxArray::from_int32(&proposal.draft_ids, &[draft_len as i64])?,
+            MxArray::from_int32(&candidate_ids, &shape)?,
+            MxArray::from_float32(&candidate_probs, &shape)?,
+        ))
+    } else {
+        return Ok(None);
+    };
+    let config = p.sampling_config.unwrap_or_default();
+    let draws: Vec<f32> = (0..rows).map(|_| rng.random::<f32>()).collect();
+    let coins: Vec<f64> = (0..draft_len).map(|_| rng.random::<f64>()).collect();
+    let logits = logits
+        .reshape(&[rows as i64, vocab])?
+        .astype(DType::Float32)?;
+    let uniforms = MxArray::from_float32(&draws, &[rows as i64])?;
+    let null = std::ptr::null_mut();
+    let (ids, candidates, probabilities) = match &drafts {
+        Some((ids, candidates, probabilities)) => {
+            (ids.handle.0, candidates.handle.0, probabilities.handle.0)
+        }
+        None => (null, null, null),
+    };
+    let mut output = std::ptr::null_mut();
+    let taken = unsafe {
+        mlx_sys::mlx_dflash2_sampled_rows(
+            logits.handle.0,
+            uniforms.handle.0,
+            ids,
+            candidates,
+            probabilities,
+            config.temperature.unwrap_or(1.0) as f32,
+            config.top_k.unwrap_or(0),
+            config.top_p.unwrap_or(1.0) as f32,
+            config.min_p.unwrap_or(0.0) as f32,
+            &mut output,
+        )
+    };
+    if taken != 1 {
+        return Err(Error::from_reason(
+            "sampled DFlash2 rows: the device kernels refused a checked cycle",
+        ));
+    }
+    let records = MxArray::from_handle(output, "dflash2_sampled_rows")?;
+    #[cfg(test)]
+    TEST_SAMPLED_ROWS.with(|c| c.set(c.get() + 1));
+    Ok(Some(SampledRows { records, coins }))
+}
+
+impl SampledRows {
+    /// The lazy records, for a caller that forces several cycles at once.
+    pub(crate) fn records(&self) -> &MxArray {
+        &self.records
+    }
+
+    /// The cycle's accepted draft count and boundary token, by the
+    /// acceptance law of [`accept_dspark_proposal`]: draft `d_i` stays while
+    /// its coin is below `min(1, p_i(d_i) / q_i(d_i))`; the first refused row
+    /// emits its residual draw, a fully accepted block the last row's draw.
+    /// `cut` decides its rows with no coin. Reads the records, which forces
+    /// them and the verify graph when the caller has not.
+    pub(crate) fn accept(
+        self,
+        proposal: &mut DsparkProposal,
+        cut: Option<&ThinkingCut>,
+    ) -> Result<(usize, u32)> {
+        let records = self.records.to_float32()?;
+        proposal.device_draft_sparse = None;
+        proposal.materialize_draft_ids()?;
+        let draft_len = proposal.draft_ids.len();
+        if self.coins.len() != draft_len || records.len() != (draft_len + 1) * SAMPLED_ROWS_RECORD {
+            return Err(Error::from_reason(
+                "sampled DFlash2 rows do not match the proposal",
+            ));
+        }
+        let forced = cut_targets(cut, &proposal.draft_ids);
+        let forced_at = |row: usize| forced.as_ref().and_then(|f| f.at(row));
+        let drawn = |row: usize| {
+            let token = records[row * SAMPLED_ROWS_RECORD + 2];
+            if token >= 0.0 {
+                Ok(token as u32)
+            } else {
+                Err(Error::from_reason(
+                    "speculative target distribution has no positive probability mass",
+                ))
+            }
+        };
+        for row in 0..draft_len {
+            if let Some(token) = forced_at(row) {
+                if proposal.draft_ids[row] == token as i32 {
+                    continue;
+                }
+                return Ok((row, token));
+            }
+            let target = f64::from(records[row * SAMPLED_ROWS_RECORD]);
+            let draft = f64::from(records[row * SAMPLED_ROWS_RECORD + 1]);
+            if self.coins[row] < sampling::acceptance_probability_from_probs(target, draft) {
+                continue;
+            }
+            return Ok((row, drawn(row)?));
+        }
+        match forced_at(draft_len) {
+            Some(token) => Ok((draft_len, token)),
+            None => Ok((draft_len, drawn(draft_len)?)),
+        }
     }
 }
 
@@ -779,6 +1115,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     // gemma4 has no post-commit heal path, so a mid-emit cancel must never
     // be observed AFTER the cycle's commit already kept its slots.
     loop {
+        timeline::cycle_start(hist.len());
         if observer_stopped {
             *reason = String::from("stop");
             break;
@@ -831,6 +1168,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             break;
         }
 
+        timeline::mark(Mark::StopChecks);
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
         profiler.begin_cycle("dspark_cycle");
         let cycle_started_at = Instant::now();
@@ -891,6 +1229,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         if l_cap >= 1 && cut.as_ref().is_some_and(|c| c.touches(l_cap)) {
             measurement_cycle = DsparkMeasurementCycle::None;
         }
+        timeline::mark(Mark::Plan);
 
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
@@ -904,6 +1243,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             DsparkProposal {
                 draft_ids: Vec::new(),
                 device_draft_ids: None,
+                device_draft_sparse: None,
                 draft_dists: Vec::new(),
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -948,6 +1288,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
         let draft_len = proposal.draft_len()?;
         let replaced = cut.as_ref().map_or(0, |c| c.replaced(draft_len));
+        timeline::mark(Mark::DraftPost);
 
         profiler.begin("dspark_verify");
         // The one-token calibration path deliberately omits speculative
@@ -1007,10 +1348,32 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 },
             )
         } else {
-            accept_dspark_proposal(&logits, &mut proposal, hist, p, rng, cut.as_ref())
+            let rows_route = step.device_sampled_rows();
+            let submitted = if rows_route {
+                submit_sampled_rows(&logits, &proposal, p, rng)
+            } else {
+                Ok(None)
+            };
+            match submitted {
+                Err(error) => Err(error),
+                Ok(Some(rows)) => {
+                    MxArray::eval_arrays_with_context(&[rows.records()], "speculative_sampled_rows")
+                        .and_then(|()| {
+                            timeline::mark(Mark::VerifyWait);
+                            rows.accept(&mut proposal, cut.as_ref())
+                        })
+                }
+                Ok(None) if !touched && proposal.device_draft_sparse.is_some() => {
+                    accept_device_sampled(&logits, &mut proposal, p, rng)
+                }
+                Ok(None) => {
+                    accept_dspark_proposal(&logits, &mut proposal, hist, p, rng, cut.as_ref())
+                }
+            }
         };
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
+        timeline::mark(Mark::Accept);
         // Acceptance has forced the verify graph. Back-fill a device proposal
         // now so commit can reuse the engine's exact verify provenance instead
         // of reading the concatenated verify input from the device again. The
@@ -1071,6 +1434,8 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             },
         );
         let kept_drafts = keep - 1;
+        timeline::cycle_counts(draft_len, accepted_drafts_k, emit_count);
+        timeline::mark(Mark::StopClamp);
         let verified_ids = tf_ids.unwrap_or_else(|| {
             let mut verified_ids = Vec::with_capacity(1 + draft_len);
             verified_ids.push(anchor);
@@ -1196,6 +1561,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // the divergence note at the loop top). Cancel parity: the token on
         // which the clamp observed the cancel is committed but NOT streamed,
         // matching the mtp emit arm's break-before-detok.
+        timeline::mark(Mark::PostCommit);
         profiler.begin("dspark_emit_loop");
         for (idx, &tok_id) in accepted[..emit_count].iter().enumerate() {
             generated.push(tok_id);
@@ -1225,6 +1591,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             }
         }
         profiler.end();
+        timeline::mark(Mark::Emit);
 
         // Bound allocator cache growth at the established token cadence.
         if generated.len() >= last_clear_at + 256 {
@@ -1232,6 +1599,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             crate::array::synchronize_and_clear_cache();
             profiler.end();
             last_clear_at = generated.len();
+            timeline::mark(Mark::CacheClear);
         }
 
         // `last_in_cache` invariant: true iff the LAST emitted token's K/V
@@ -1272,6 +1640,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             step.observe_device_verification(rows, raw_matches, milliseconds)?;
         }
         profiler.end();
+        timeline::mark(Mark::BoundarySubmit);
     }
 
     step.finish()?;
@@ -1782,7 +2151,9 @@ mod tests {
         reserve_calls: Cell<usize>,
         /// Emit `device_draft_ids` instead of host ids — exercises the
         /// engine's `verify_device` dispatch and post-eval materialization.
+        /// A sampled position script also gets the device-drawn rows.
         emit_device_proposals: bool,
+        sampled_rows: bool,
         device_budget_enabled: bool,
         verify_row_budget: Option<MxArray>,
         pending_committed_state: RefCell<Option<MxArray>>,
@@ -1948,6 +2319,34 @@ mod tests {
                         .and_then(|c| c.temperature)
                         .unwrap_or(1.0),
                 );
+                if self.emit_device_proposals {
+                    let len = draft_ids.len() as i64;
+                    let device_draft_sparse = if greedy {
+                        None
+                    } else {
+                        let ids = draft_ids
+                            .iter()
+                            .flat_map(|&id| [id, (id + 1) % self.vocab as i32])
+                            .collect::<Vec<_>>();
+                        let probs = draft_ids
+                            .iter()
+                            .flat_map(|_| [1.0f32, 0.0])
+                            .collect::<Vec<_>>();
+                        Some(crate::engine::backend::DeviceSparseRows {
+                            ids: MxArray::from_int32(&ids, &[len, 2])?,
+                            probs: MxArray::from_float32(&probs, &[len, 2])?,
+                            vocab_size: self.vocab as usize,
+                        })
+                    };
+                    return Ok(DsparkProposal {
+                        draft_ids: Vec::new(),
+                        device_draft_ids: Some(MxArray::from_int32(&draft_ids, &[len])?),
+                        device_draft_sparse,
+                        draft_dists: Vec::new(),
+                        draft_sparse_dists: Vec::new(),
+                        keep_probabilities: None,
+                    });
+                }
                 let draft_dists = if greedy {
                     Vec::new()
                 } else {
@@ -1959,6 +2358,7 @@ mod tests {
                 return Ok(DsparkProposal {
                     draft_ids,
                     device_draft_ids: None,
+                    device_draft_sparse: None,
                     draft_dists,
                     draft_sparse_dists: Vec::new(),
                     keep_probabilities: None,
@@ -1987,6 +2387,7 @@ mod tests {
             Ok(DsparkProposal {
                 draft_ids,
                 device_draft_ids,
+                device_draft_sparse: None,
                 draft_dists,
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -2010,11 +2411,19 @@ mod tests {
             let len = usize::try_from(verify_ids.shape_at(0)?)
                 .map_err(|_| Error::from_reason("mock verify_device bad len"))?;
             self.ledger.borrow_mut().push(Call::VerifyDevice { len });
+            if self.positions.is_some() {
+                *self.last_verify.borrow_mut() =
+                    verify_ids.to_int32()?.iter().map(|&id| id as u32).collect();
+            }
             self.scripted_verify_output(len)
         }
 
         fn device_verification_budget(&self) -> Option<&MxArray> {
             self.verify_row_budget.as_ref()
+        }
+
+        fn device_sampled_rows(&self) -> bool {
+            self.sampled_rows
         }
 
         fn observe_device_verification(
@@ -2139,6 +2548,7 @@ mod tests {
         draft_block_size: Option<usize>,
         /// Forwarded to the stepper — proposals carry `device_draft_ids`.
         emit_device_proposals: bool,
+        sampled_rows: bool,
         device_budget_enabled: bool,
         ledger: Rc<RefCell<Vec<Call>>>,
         begin_calls: Cell<usize>,
@@ -2161,6 +2571,7 @@ mod tests {
                 reserve_exhausted_from: None,
                 draft_block_size: None,
                 emit_device_proposals: false,
+                sampled_rows: false,
                 device_budget_enabled: false,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
@@ -2210,6 +2621,12 @@ mod tests {
         /// dispatch `verify_device` and materialize ids post-eval.
         fn with_device_proposals(mut self) -> Self {
             self.emit_device_proposals = true;
+            self
+        }
+
+        /// Stepper asks for the device rows of its sampled cycles.
+        fn with_sampled_rows(mut self) -> Self {
+            self.sampled_rows = true;
             self
         }
 
@@ -2324,6 +2741,7 @@ mod tests {
                 reserve_exhausted_from: self.reserve_exhausted_from,
                 reserve_calls: Cell::new(0),
                 emit_device_proposals: self.emit_device_proposals,
+                sampled_rows: self.sampled_rows,
                 device_budget_enabled: self.device_budget_enabled,
                 verify_row_budget: None,
                 pending_committed_state: RefCell::new(None),
@@ -2934,6 +3352,7 @@ mod tests {
             .iter()
             .filter_map(|call| match call {
                 Call::Verify { ids } => Some(ids.len()),
+                Call::VerifyDevice { len } => Some(*len),
                 _ => None,
             })
             .collect()
@@ -2986,13 +3405,16 @@ mod tests {
         let end = [8, 10, 9];
         for budget in [0, 1, 2, 3, 5, 12, 16] {
             for block in [1, 3, 7] {
-                for sampled in [false, true] {
+                for (sampled, device) in [(false, false), (true, false), (true, true)] {
                     let stop = budget as usize + end.len() + 10;
                     let mut targets: Vec<i32> = (0..200).map(content).collect();
                     targets[stop] = 15;
                     let misses = vec![2, 7, budget as usize + 1, budget as usize + 5];
                     let mut backend =
                         MockDsparkBackend::positions(targets.clone(), misses, sampled);
+                    if device {
+                        backend = backend.with_device_proposals();
+                    }
                     let mut params = if sampled {
                         dense_params()
                     } else {
@@ -3013,7 +3435,9 @@ mod tests {
                         None,
                         tracker(),
                     );
-                    let label = format!("budget={budget}, block={block}, sampled={sampled}");
+                    let label = format!(
+                        "budget={budget}, block={block}, sampled={sampled}, device={device}"
+                    );
                     assert!(out.result.is_ok(), "{label}: {:?}", out.result.err());
                     let (expected, outcome) = plain(&targets, tracker(), 15, 200);
                     assert_eq!(out.generated, expected, "{label}");
@@ -3033,6 +3457,265 @@ mod tests {
                         "{label}: every token but the last is cached once"
                     );
                 }
+            }
+        }
+    }
+
+    /// A device-drawn sampled cycle accepts on the device unless a thinking
+    /// cut decides one of its rows; a budget the cycle does not reach (the
+    /// server's default 12,000) leaves every cycle on the device.
+    #[test]
+    fn a_sampled_cycle_accepts_on_the_device_unless_a_cut_decides_a_row() {
+        let end = [8u32, 10, 9];
+        let turn = |tracker: ReasoningTracker| {
+            let mut targets: Vec<i32> = (0..400).map(content).collect();
+            targets[390] = 15;
+            let misses = vec![2, 7, 19, 40, 41, 77];
+            let mut backend =
+                MockDsparkBackend::positions(targets.clone(), misses, true).with_device_proposals();
+            let mut params = dense_params();
+            params.max_new_tokens = 120;
+            params.mtp_depth = 7;
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+            super::TEST_SAMPLED_ACCEPTS.with(|c| c.set((0, 0)));
+            let out = drive_turn_with_tracker(
+                &mut backend,
+                params,
+                targets[0] as u32,
+                15,
+                7,
+                &mut rng,
+                None,
+                None,
+                tracker,
+            );
+            if let Err(error) = &out.result {
+                panic!("{}", error.reason);
+            }
+            let drafted = backend
+                .ledger_snapshot()
+                .iter()
+                .filter(|call| matches!(call, Call::Propose { .. }))
+                .count();
+            (super::TEST_SAMPLED_ACCEPTS.with(|c| c.get()), drafted, out)
+        };
+        for (label, budget, thinking) in [
+            ("thinking, budget 12000", Some(12_000), true),
+            ("thinking, no budget", None, true),
+            ("not thinking", None, false),
+        ] {
+            let ends: &[u32] = if thinking { &end } else { &[] };
+            let ((device, host), drafted, _) = turn(ReasoningTracker::new(thinking, budget, ends));
+            assert!(drafted > 0, "{label}: no cycle drafted");
+            assert_eq!(
+                (device, host),
+                (drafted, 0),
+                "{label}: (device, host) accepts"
+            );
+        }
+        let ((device, host), drafted, out) = turn(ReasoningTracker::new(true, Some(40), &end));
+        assert_eq!(out.outcome.cut_at, Some(40));
+        assert!(
+            (1..=2).contains(&host),
+            "the cut's cycles accept on the host: {host} of {drafted}"
+        );
+        assert_eq!(
+            device + host,
+            drafted,
+            "every other cycle accepts on the device"
+        );
+    }
+
+    /// A sampled, unpenalized cycle takes the device rows only when its
+    /// stepper asks for them and its parameters are on the kernels' list;
+    /// every other cycle keeps the filter chain.
+    #[test]
+    fn sampled_cycles_take_the_device_rows_only_for_a_stepper_that_asks() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            || crate::test_support::apple_gpu_family_absent(
+                "sampled_cycles_take_the_device_rows_only_for_a_stepper_that_asks",
+            )
+        {
+            return;
+        }
+        let turn = |asks: bool, device: bool, params: ChatParams| {
+            let mut targets: Vec<i32> = (0..400).map(content).collect();
+            targets[390] = 15;
+            let misses = vec![2, 7, 19, 40, 41, 77];
+            let mut backend = MockDsparkBackend::positions(targets.clone(), misses, true);
+            if device {
+                backend = backend.with_device_proposals();
+            }
+            if asks {
+                backend = backend.with_sampled_rows();
+            }
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+            super::TEST_SAMPLED_ACCEPTS.with(|c| c.set((0, 0)));
+            super::TEST_SAMPLED_ROWS.with(|c| c.set(0));
+            let out = drive_turn_with_tracker(
+                &mut backend,
+                params,
+                targets[0] as u32,
+                15,
+                7,
+                &mut rng,
+                None,
+                None,
+                ReasoningTracker::new(false, None, &[]),
+            );
+            if let Err(error) = &out.result {
+                panic!("{}", error.reason);
+            }
+            let drafted = backend
+                .ledger_snapshot()
+                .iter()
+                .filter(|call| matches!(call, Call::Propose { .. }))
+                .count();
+            let (device, host) = super::TEST_SAMPLED_ACCEPTS.with(|c| c.get());
+            (
+                super::TEST_SAMPLED_ROWS.with(|c| c.get()),
+                device + host,
+                drafted,
+            )
+        };
+        let app = |top_k: i32| {
+            let mut params = dense_params();
+            params.sampling_config = Some(SamplingConfig {
+                temperature: Some(0.6),
+                top_k: Some(top_k),
+                top_p: Some(0.95),
+                min_p: Some(0.0),
+            });
+            params.max_new_tokens = 120;
+            params.mtp_depth = 7;
+            params
+        };
+        let (rows, chain, drafted) = turn(true, true, app(20));
+        assert!(drafted > 0);
+        assert!(
+            rows >= drafted && chain == 0,
+            "a stepper that asks: {rows} device rows cycles, {chain} chain cycles, {drafted} drafted"
+        );
+        let (rows, chain, drafted) = turn(false, true, app(20));
+        assert_eq!(
+            (rows, chain >= drafted),
+            (0, true),
+            "a stepper that does not ask keeps the filter chain ({chain} of {drafted})"
+        );
+        let (rows, chain, drafted) = turn(true, true, app(0));
+        assert_eq!(
+            (rows, chain >= drafted),
+            (0, true),
+            "top_k 0 keeps the filter chain"
+        );
+        let mut penalized = app(20);
+        penalized.repetition_penalty = 1.1;
+        penalized.repetition_context_size = 64;
+        let (rows, chain, drafted) = turn(true, false, penalized);
+        assert_eq!(
+            (rows, chain >= drafted),
+            (0, true),
+            "a penalized turn keeps the filter chain"
+        );
+        let mut greedy = app(20);
+        greedy.sampling_config = greedy_params().sampling_config;
+        let (rows, chain, _) = turn(true, true, greedy);
+        assert_eq!((rows, chain), (0, 0), "a greedy turn draws nothing");
+    }
+
+    /// A thinking cut on cycles the device rows decide lands where the
+    /// filter chain puts it: on the app's sampling (T 0.6, top_k 20, top_p
+    /// 0.95), for every budget and block, the device rows turn gives the
+    /// tokens, close and cut row of the same turn on the filter chain and of
+    /// plain decoding, and every cycle of it, the cut's cycles too, took the
+    /// device rows. The verify rows are one-hot, so the two routes see the
+    /// same draws.
+    #[test]
+    fn a_thinking_cut_on_the_device_rows_lands_where_the_filter_chain_puts_it() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            || crate::test_support::apple_gpu_family_absent(
+                "a_thinking_cut_on_the_device_rows_lands_where_the_filter_chain_puts_it",
+            )
+        {
+            return;
+        }
+        let end = [8u32, 10, 9];
+        for budget in [0, 1, 2, 3, 5, 12] {
+            for block in [1, 3, 7] {
+                let stop = budget as usize + end.len() + 10;
+                let mut targets: Vec<i32> = (0..200).map(content).collect();
+                targets[stop] = 15;
+                let misses = vec![2, 7, budget as usize + 1, budget as usize + 5];
+                let tracker = || ReasoningTracker::new(true, Some(budget), &end);
+                let turn = |rows: bool| {
+                    let mut backend =
+                        MockDsparkBackend::positions(targets.clone(), misses.clone(), true)
+                            .with_device_proposals();
+                    if rows {
+                        backend = backend.with_sampled_rows();
+                    }
+                    let mut params = dense_params();
+                    params.sampling_config = Some(SamplingConfig {
+                        temperature: Some(0.6),
+                        top_k: Some(20),
+                        top_p: Some(0.95),
+                        min_p: Some(0.0),
+                    });
+                    params.max_new_tokens = 200;
+                    params.mtp_depth = block;
+                    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+                    super::TEST_SAMPLED_ACCEPTS.with(|c| c.set((0, 0)));
+                    super::TEST_SAMPLED_ROWS.with(|c| c.set(0));
+                    let out = drive_turn_with_tracker(
+                        &mut backend,
+                        params,
+                        targets[0] as u32,
+                        15,
+                        block,
+                        &mut rng,
+                        None,
+                        None,
+                        tracker(),
+                    );
+                    let verifies = verify_widths(&backend.ledger_snapshot()).len();
+                    (
+                        out,
+                        verifies,
+                        super::TEST_SAMPLED_ROWS.with(|c| c.get()),
+                        super::TEST_SAMPLED_ACCEPTS.with(|c| c.get()),
+                    )
+                };
+                let label = format!("budget={budget}, block={block}");
+                let (device, verifies, rows, accepts) = turn(true);
+                let (chain, _, chain_rows, _) = turn(false);
+                for (route, out) in [("device rows", &device), ("filter chain", &chain)] {
+                    if let Err(error) = &out.result {
+                        panic!("{label}, {route}: {}", error.reason);
+                    }
+                    assert_eq!(
+                        out.outcome.close,
+                        Some(ReasoningClose::Budget),
+                        "{label}, {route}"
+                    );
+                    assert_eq!(out.outcome.cut_at, Some(budget as u32), "{label}, {route}");
+                }
+                let (expected, outcome) = plain(&targets, tracker(), 15, 200);
+                assert_eq!(device.generated, expected, "{label}: plain decoding");
+                assert_eq!(device.outcome, outcome, "{label}: plain decoding");
+                assert_eq!(
+                    device.generated, chain.generated,
+                    "{label}: the filter chain"
+                );
+                assert_eq!(device.outcome, chain.outcome, "{label}: the filter chain");
+                assert!(
+                    verifies > 0 && rows >= verifies && accepts == (0, 0),
+                    "{label}: every verify takes the device rows: {rows} rows cycles, \
+                     {verifies} verifies, (device, host) accepts {accepts:?}"
+                );
+                assert_eq!(
+                    chain_rows, 0,
+                    "{label}: the chain turn takes no device rows"
+                );
             }
         }
     }
@@ -3221,6 +3904,7 @@ mod tests {
             let mut proposal = DsparkProposal {
                 draft_ids: drafts.clone(),
                 device_draft_ids: None,
+                device_draft_sparse: None,
                 draft_dists: Vec::new(),
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -4436,6 +5120,7 @@ mod device_budget_tests {
             let mut proposal = DsparkProposal {
                 draft_ids: Vec::new(),
                 device_draft_ids: Some(MxArray::from_int32(&[1, 2, 3, 4, 5, 6, 7], &[7])?),
+                device_draft_sparse: None,
                 draft_dists: Vec::new(),
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -4466,6 +5151,7 @@ mod device_budget_tests {
         let mut proposal = DsparkProposal {
             draft_ids: vec![1, 2, 3, 4, 5, 6, 7],
             device_draft_ids: None,
+            device_draft_sparse: None,
             draft_dists: Vec::new(),
             draft_sparse_dists: Vec::new(),
             keep_probabilities: None,

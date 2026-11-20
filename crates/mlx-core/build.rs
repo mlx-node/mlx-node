@@ -19,6 +19,7 @@ fn main() {
 fn build_ggml_kquant_reference() {
     let dir = "vendor/ggml";
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.c");
+    println!("cargo:rerun-if-changed={dir}/ggml_planes_ref.c");
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.h");
     println!("cargo:rerun-if-changed={dir}/ggml_grid_tables.inc");
     let mut build = cc::Build::new();
@@ -30,6 +31,7 @@ fn build_ggml_kquant_reference() {
     };
     build
         .file(format!("{dir}/ggml_kquant_ref.c"))
+        .file(format!("{dir}/ggml_planes_ref.c"))
         .include(dir)
         .flag(no_contraction)
         .std("c11")

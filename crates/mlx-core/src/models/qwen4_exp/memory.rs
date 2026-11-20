@@ -34,6 +34,13 @@ pub(super) struct Plan {
     pub bank_budget: u64,
     /// `HostMemory::non_reclaimable` when the residency was chosen.
     pub live_non_reclaimable: u64,
+    /// The host read behind `live_non_reclaimable` and `bank_budget`.
+    pub host: Option<HostMemory>,
+    /// What the plan holds beside the experts when the residency was chosen.
+    pub anonymous_need: u64,
+    /// This process's MLX active plus cache bytes when the residency was
+    /// chosen.
+    pub self_mlx_bytes: u64,
 }
 
 impl Plan {
@@ -89,15 +96,18 @@ pub(super) const FIXTURE_HOST_ENV: &str = "MLX_QWEN4_FIXTURE_HOST";
 thread_local! {
     static TEST_HOST: std::cell::Cell<Option<HostMemory>> =
         const { std::cell::Cell::new(None) };
+    /// Anonymous bytes every read of the scoped host adds for the next read.
+    static TEST_HOST_DRIFT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-pub(super) struct TestHostGuard(Option<HostMemory>);
+pub(super) struct TestHostGuard(Option<HostMemory>, u64);
 
 #[cfg(test)]
 impl Drop for TestHostGuard {
     fn drop(&mut self) {
         TEST_HOST.with(|host| host.set(self.0));
+        TEST_HOST_DRIFT.with(|drift| drift.set(self.1));
     }
 }
 
@@ -117,7 +127,17 @@ pub(super) fn fixture_host() -> HostMemory {
 
 #[cfg(test)]
 pub(super) fn scoped_test_host(host: HostMemory) -> TestHostGuard {
-    TestHostGuard(TEST_HOST.with(|current| current.replace(Some(host))))
+    scoped_drifting_test_host(host, 0)
+}
+
+/// A scoped host whose anonymous pages grow by `drift` after every read, so
+/// two reads never agree.
+#[cfg(test)]
+pub(super) fn scoped_drifting_test_host(host: HostMemory, drift: u64) -> TestHostGuard {
+    TestHostGuard(
+        TEST_HOST.with(|current| current.replace(Some(host))),
+        TEST_HOST_DRIFT.with(|current| current.replace(drift)),
+    )
 }
 
 #[cfg(test)]
@@ -128,7 +148,17 @@ pub(super) fn scoped_fixture_host() -> TestHostGuard {
 #[cfg(test)]
 fn test_host_override() -> Option<HostMemory> {
     TEST_HOST
-        .with(|host| host.get())
+        .with(|host| {
+            let current = host.get()?;
+            let drift = TEST_HOST_DRIFT.with(std::cell::Cell::get);
+            if drift > 0 {
+                host.set(Some(HostMemory {
+                    anonymous: current.anonymous.saturating_add(drift),
+                    ..current
+                }));
+            }
+            Some(current)
+        })
         .or_else(|| std::env::var_os(FIXTURE_HOST_ENV).map(|_| fixture_host()))
 }
 
@@ -158,7 +188,19 @@ pub(super) struct BankGate {
 /// non-reclaimable memory and the other anonymous need (dense banks, bounded
 /// auxiliary inventory, LRU room and the KV pool) covers the whole bank set.
 pub(super) fn bank_gate(host: &HostMemory, anonymous_need: u64, margin: u64) -> BankGate {
-    let non_reclaimable = host.non_reclaimable();
+    bank_gate_beside(host, 0, anonymous_need, margin)
+}
+
+/// [`bank_gate`] on a host that already holds `own` bytes of this model:
+/// they leave the host's non-reclaimable number first, so the gate reads
+/// the host as a load that held none of them did.
+pub(super) fn bank_gate_beside(
+    host: &HostMemory,
+    own: u64,
+    anonymous_need: u64,
+    margin: u64,
+) -> BankGate {
+    let non_reclaimable = host.non_reclaimable().saturating_sub(own);
     BankGate {
         bank_budget: host
             .physical
@@ -188,12 +230,24 @@ pub(super) fn host_snapshot(plan: &mut Plan) -> Result<()> {
 /// refusal leaves what the host admits in `plan.bank_budget`. Without a host
 /// snapshot the gate admits the banks.
 pub(super) fn direct_gate(plan: &mut Plan, anonymous_need: u64, bank_bytes: u64) -> Result<()> {
+    direct_gate_beside(plan, 0, anonymous_need, bank_bytes)
+}
+
+/// [`direct_gate`] read while this model holds `own` bytes of the host
+/// (see [`bank_gate_beside`]).
+pub(super) fn direct_gate_beside(
+    plan: &mut Plan,
+    own: u64,
+    anonymous_need: u64,
+    bank_bytes: u64,
+) -> Result<()> {
     let gate = match plan.physical_bytes {
         Some(_) => {
             let host = host_memory()?;
             plan.available_bytes = Some(host.available());
             plan.physical_bytes = Some(host.physical);
-            bank_gate(&host, anonymous_need, DIRECT_MARGIN)
+            plan.host = Some(host);
+            bank_gate_beside(&host, own, anonymous_need, DIRECT_MARGIN)
         }
         None => BankGate {
             bank_budget: bank_bytes,
@@ -547,6 +601,9 @@ mod tests {
             direct_layers: 0,
             bank_budget: 0,
             live_non_reclaimable: 0,
+            host: None,
+            anonymous_need: 0,
+            self_mlx_bytes: 0,
         }
     }
 
@@ -623,6 +680,21 @@ pub(crate) fn prefill_scratch(c: &super::config::Config, tokens: usize, context:
         .saturating_add(t * blocks * 4 * 6)
         .saturating_add(2 * c.num_key_value_heads as u64 * context * c.head_dim as u64 * 2);
     per_token.saturating_mul(t).saturating_add(window.max(qsa))
+}
+
+/// What a layer-major group of `windows` windows of `rows` rows holds beyond
+/// one pass's scratch: every window's residual stream across layers and,
+/// inside a union layer from the first window's attention to the last
+/// window's injection, each window's attention output, MLP input, injection
+/// gate, routes, scores, routed rows and their sum.
+pub(crate) fn group_scratch(c: &super::config::Config, windows: usize, rows: usize) -> u64 {
+    let h = c.hidden_size as u64;
+    let hc = c.hc_count as u64;
+    let top = c.num_experts_per_tok as u64;
+    let per_row = 2 * hc * h * 2 + hc * 4 + 2 * h * 2 + top * (4 + 4 + 4) + top * h * 2;
+    per_row
+        .saturating_mul(windows as u64)
+        .saturating_mul(rows as u64)
 }
 
 /// The byte size of the activation dtype the recurrent rows are kept in: the

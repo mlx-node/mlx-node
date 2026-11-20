@@ -116,7 +116,10 @@ const finishLine = (child: WokenChild): EventLine =>
     tokens_used: 9_000,
     will_wake: false,
   });
-const workflowLine = (offset: number, status: string, revision: number): EventLine =>
+/** The run's report in its last `workflow_updated` (`result_summary`). */
+export const WOKEN_REPORT = '# Findings\n\nThe plan holds.';
+export const WOKEN_PHASES = ['Plan', 'Research', 'Verify', 'Report'] as const;
+const workflowLine = (offset: number, status: string, revision: number, phase: number): EventLine =>
   xai(offset, {
     sessionUpdate: 'workflow_updated',
     run_id: WOKEN_RUN,
@@ -125,6 +128,23 @@ const workflowLine = (offset: number, status: string, revision: number): EventLi
     revision,
     foreground: false,
     elapsed_ms: offset - 60_702,
+    phases: WOKEN_PHASES.map((title, k) => ({
+      title,
+      state: k < phase ? 'done' : k === phase ? 'active' : 'pending',
+    })),
+    current_phase: WOKEN_PHASES[phase] ?? null,
+    agent_budget: 128,
+    agents_used: WOKEN_CHILDREN.filter((c) => c.spawn <= offset).length,
+    agents: WOKEN_CHILDREN.filter((c) => c.spawn <= offset).map((c) => ({
+      agent_id: c.subagentId,
+      label: c.description,
+      phase: null,
+      state: c.finish <= offset ? 'done' : 'running',
+      tokens_used: c.finish <= offset ? c.tokens : 0,
+      duration_ms: c.finish <= offset ? c.finish - c.spawn : 0,
+    })),
+    pause_message: null,
+    result_summary: status === 'complete' ? WOKEN_REPORT : null,
   });
 const thought = (offset: number, text: string): EventLine =>
   acp(offset, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } });
@@ -185,7 +205,7 @@ export function wokenParentLines(options: WokenOptions = {}): EventLine[] {
     }),
     thought(20_000, 'Planning the work'),
     tool(60_642, 'call-wf', 'workflow', 'pending'),
-    workflowLine(60_702, 'active', 1),
+    workflowLine(60_702, 'active', 1, 0),
     tool(60_705, 'call-wf', 'workflow', 'completed'),
     spawnLine(plan),
     finishLine(plan),
@@ -199,15 +219,15 @@ export function wokenParentLines(options: WokenOptions = {}): EventLine[] {
     finishLine(r2),
     finishLine(r3),
     finishLine(r4),
-    workflowLine(1_282_025, 'active', 7),
+    workflowLine(1_282_025, 'active', 7, 2),
     spawnLine(va),
     spawnLine(vb),
     finishLine(va),
     finishLine(vb),
-    workflowLine(2_177_840, 'active', 25),
+    workflowLine(2_177_840, 'active', 25, 3),
     spawnLine(report),
     finishLine(report),
-    workflowLine(2_680_142, 'complete', 30),
+    workflowLine(2_680_142, 'complete', 30, 4),
   ];
   if (options.noHook !== true) {
     lines.push(

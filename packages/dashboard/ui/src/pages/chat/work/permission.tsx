@@ -133,16 +133,13 @@ export function cardButtons(
  * The card's note lines: the agent's own words for its "always" option, what allowing all edits also allows, then what
  * Deny does and where grants live.
  */
-export function cardNotes(access: Access, buttons: readonly CardButton[]): string[] {
+export function cardNotes(access: Access, buttons: readonly CardButton[], ofRun = false): string[] {
   const always = buttons.find((button) => button.always);
   const notes: string[] = [];
   if (always !== undefined) notes.push(fill(CHAT.agentWording, { name: oneLine(always.option.name) }));
   if (always !== undefined && access === 'edit') notes.push(CHAT.editsSessionNote);
-  notes.push(
-    always !== undefined && (access === 'bash' || access === 'mcp')
-      ? `${CHAT.denyNote} ${CHAT.grantsNote}`
-      : CHAT.denyNote,
-  );
+  const deny = ofRun ? CHAT.denyRunNote : CHAT.denyNote;
+  notes.push(always !== undefined && (access === 'bash' || access === 'mcp') ? `${deny} ${CHAT.grantsNote}` : deny);
   return notes;
 }
 
@@ -169,15 +166,42 @@ interface CardBase {
   onAnswer: (answer: InteractionAnswer) => Promise<void>;
 }
 
-function metaText(folder: string | null): string | undefined {
-  return folder === null ? undefined : fill(CHAT.permIn, { folder });
+type From = PermissionInteraction['from'];
+
+/** Who asks, when it is a helper and not the conversation's own turn. */
+export function fromText(from: From): string | null {
+  if (from === undefined) return null;
+  return from.run === null
+    ? fill(CHAT.permFromNoRun, { label: from.label })
+    : fill(CHAT.permFrom, { label: from.label, run: from.run });
 }
 
-function Meta({ folder, position }: Pick<CardBase, 'folder' | 'position'>): ReactNode {
-  if (folder === null && position.count <= 1) return undefined;
+function metaText(folder: string | null, from?: From): string | undefined {
+  const who = fromText(from);
+  const elsewhere = from?.cwd ?? null;
+  const where =
+    elsewhere !== null
+      ? fill(CHAT.permFromFolder, { folder: elsewhere })
+      : folder === null
+        ? null
+        : fill(CHAT.permIn, { folder });
+  const parts = [who, where].filter((part): part is string => part !== null);
+  return parts.length === 0 ? undefined : parts.join(', ');
+}
+
+function Meta({ folder, position, from }: Pick<CardBase, 'folder' | 'position'> & { from?: From }): ReactNode {
+  const who = fromText(from);
+  const elsewhere = from?.cwd ?? null;
+  if (folder === null && elsewhere === null && who === null && position.count <= 1) return undefined;
   return (
     <>
-      {folder !== null ? (
+      {who !== null ? <span data-asked-by="">{who}</span> : null}
+      {elsewhere !== null ? (
+        <span className="inline-flex min-w-0" data-works-in="">
+          {fill(CHAT.permFromFolder, { folder: '' })}
+          <PathText path={elsewhere} mono={false} maxChars={META_PATH_CHARS} />
+        </span>
+      ) : folder !== null ? (
         <span className="inline-flex min-w-0">
           {'in '}
           <PathText path={folder} mono={false} maxChars={META_PATH_CHARS} />
@@ -262,8 +286,8 @@ export function PermissionCard(
     <InteractionCard
       icon={<Shield size={16} strokeWidth={1.75} />}
       title={permissionTitle(interaction.access)}
-      meta={<Meta folder={props.folder} position={props.position} />}
-      metaText={metaText(props.folder)}
+      meta={<Meta folder={props.folder} position={props.position} from={interaction.from} />}
+      metaText={metaText(props.folder, interaction.from)}
       describedBy={describedBy}
       subtitle={cardDescription(interaction) ?? undefined}
       subtitleTitle={oneLine(interaction.title)}
@@ -283,7 +307,7 @@ export function PermissionCard(
             }
       }
       busy={pressed !== null}
-      notes={cardNotes(interaction.access, buttons)}
+      notes={cardNotes(interaction.access, buttons, interaction.from !== undefined && interaction.from.run !== null)}
       actions={buttons.map((button, index) => (
         <Button
           key={button.option.optionId}

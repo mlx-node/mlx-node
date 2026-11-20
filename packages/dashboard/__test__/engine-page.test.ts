@@ -544,6 +544,39 @@ describe('Engine page', () => {
     expect(caption?.parentElement?.contains(badge?.firstElementChild ?? null)).toBe(false);
   });
 
+  it('says how many experts each model holds in memory on the caption line, and nothing for a model without the record', async () => {
+    const local = {
+      name: 'qwen3.8-flash-next-gguf',
+      path: '/models/qwen3.8-flash-next-gguf',
+      modelType: 'qwen4_exp',
+      quant: 'Q4_K_M',
+      contextWindow: 262_144,
+      sizeBytes: 71 * 1024 ** 3,
+      fileCount: 1,
+      servedIds: ['flash-next'],
+    };
+    const page = await mountEngine('/engine', { '/models': { models: [local], warnings: [], dir: '/models' } });
+    const models = [
+      liveModel('flash-next', { modelType: 'qwen4_exp', experts: { inMemory: 409, total: 512, streaming: true } }),
+      liveModel('flash-direct', { modelType: 'qwen4_exp', experts: { inMemory: 512, total: 512, streaming: false } }),
+      liveModel('flash-rows', { modelType: 'qwen4_exp', experts: { inMemory: 0, total: 512, streaming: true } }),
+      liveModel('qwen3-8b', { experts: null }),
+    ];
+    await push(live({ processes: [process({ models, turns: [] })] }), (text) =>
+      text.includes('Experts: streaming from SSD'),
+    );
+    const table = byRole(page.container, 'table', 'Loaded models');
+    const detailOf = (name: string): string | null | undefined =>
+      table?.querySelector(`tr[data-model="${name}"] [data-model-detail]`)?.textContent;
+    // MUTATION: swap inMemory and total in the partial line -> "Experts: 512 of 409 in memory, streaming".
+    expect(detailOf('flash-next')).toBe('Q4_K_M · 71.0 GB on disk · Experts: 409 of 512 in memory, streaming');
+    expect(detailOf('flash-direct')).toBe('Experts: 512 of 512 in memory');
+    expect(detailOf('flash-rows')).toBe('Experts: streaming from SSD');
+    expect(table?.querySelector('tr[data-model="qwen3-8b"]')).not.toBeNull();
+    expect(detailOf('qwen3-8b')).toBeUndefined();
+    expect(page.text()).not.toContain('512 of 409');
+  });
+
   it('gives every table card one frame: the card, not a second one around the table', async () => {
     const page = await mountEngine();
     await push(live(), (text) => text.includes('1h ago'));

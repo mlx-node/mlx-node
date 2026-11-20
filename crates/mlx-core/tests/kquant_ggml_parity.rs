@@ -2383,6 +2383,43 @@ const SPANS: [(&str, usize, usize); 14] = [
     ("dequantize_row_iq1_m", 2675, 2723),
 ];
 
+/// The decoders of `vendor/ggml/ggml_planes_ref.c`.
+const PLANES_SPANS: [(&str, usize, usize); 4] = [
+    ("dequantize_row_q8_0", 553, 567),
+    ("dequantize_row_q3_K", 1305, 1353),
+    ("dequantize_row_iq4_nl", 2725, 2741),
+    ("dequantize_row_iq4_xs", 2743, 2764),
+];
+
+/// The block structs and the IQ4_NL value row of `vendor/ggml/ggml_planes_ref.c`.
+const PLANES_COMMON_SPANS: [(&str, usize, usize); 5] = [
+    ("block_q8_0", 251, 255),
+    ("block_q3_K", 315, 320),
+    ("block_iq4_nl", 447, 451),
+    ("block_iq4_xs", 454, 459),
+    ("kvalues_iq4nl", 1121, 1121),
+];
+
+/// An upstream ggml file: its name in span markers, the checked-in anchor
+/// and the variable that points the guard at a real checkout instead.
+struct Upstream {
+    file: &'static str,
+    anchor: &'static str,
+    env: &'static str,
+}
+
+const QUANTS_C: Upstream = Upstream {
+    file: "ggml-quants.c",
+    anchor: "ggml_quants_upstream.inc",
+    env: "GGML_QUANTS_C",
+};
+
+const COMMON_H: Upstream = Upstream {
+    file: "ggml-common.h",
+    anchor: "ggml_common_upstream.inc",
+    env: "GGML_COMMON_H",
+};
+
 /// The three sanctioned edits, applied to both sides so only real drift shows.
 ///
 /// * `get_scale_min_k4` loses `static inline` and gains an `ggml_ref_` prefix so
@@ -2410,23 +2447,24 @@ fn vendor_dir() -> PathBuf {
 }
 
 /// Upstream lines for `span`, either from the checked-in anchor or, when
-/// `GGML_QUANTS_C` points at a real llama.cpp checkout, straight out of it.
-fn upstream_span(name: &str, first: usize, last: usize) -> Vec<String> {
-    if let Some(path) = std::env::var_os("GGML_QUANTS_C") {
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("GGML_QUANTS_C={path:?}: {e}"));
+/// the source's variable points at a real llama.cpp checkout, straight out
+/// of it.
+fn upstream_span(source: &Upstream, name: &str, first: usize, last: usize) -> Vec<String> {
+    let env = source.env;
+    if let Some(path) = std::env::var_os(env) {
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{env}={path:?}: {e}"));
         let lines: Vec<&str> = src.split('\n').collect();
         assert!(
             lines.len() >= last,
-            "GGML_QUANTS_C={path:?} has {} lines, need {last}",
+            "{env}={path:?} has {} lines, need {last}",
             lines.len()
         );
         return lines[first - 1..last].iter().map(|l| canon(l)).collect();
     }
-    let anchor = vendor_dir().join("ggml_quants_upstream.inc");
+    let anchor = vendor_dir().join(source.anchor);
     let text =
         std::fs::read_to_string(&anchor).unwrap_or_else(|e| panic!("{}: {e}", anchor.display()));
-    let marker = format!("// @@ {name} ggml-quants.c:{first}-{last}");
+    let marker = format!("// @@ {name} {}:{first}-{last}", source.file);
     let mut out = Vec::new();
     let mut inside = false;
     for line in text.split('\n') {
@@ -2461,31 +2499,90 @@ fn upstream_span(name: &str, first: usize, last: usize) -> Vec<String> {
 /// modulo the three edits `canon` normalises away.
 #[test]
 fn vendored_ggml_reference_is_verbatim() {
-    let mine_path = vendor_dir().join("ggml_kquant_ref.c");
+    for (file, source, spans) in [
+        ("ggml_kquant_ref.c", &QUANTS_C, &SPANS[..]),
+        ("ggml_planes_ref.c", &QUANTS_C, &PLANES_SPANS[..]),
+        ("ggml_planes_ref.c", &COMMON_H, &PLANES_COMMON_SPANS[..]),
+    ] {
+        if let Err(msg) = verbatim(file, source, spans, None) {
+            panic!("{msg}");
+        }
+    }
+}
+
+/// The guard is not blind to the structs: one byte changed in the vendored
+/// `block_q3_K` (its `scales[12]` read as `scales[13]`) is named as drift.
+#[test]
+fn a_drifted_ggml_struct_is_named() {
+    let drift = (
+        "    uint8_t scales[12];    // scales, quantized with 6 bits",
+        "    uint8_t scales[13];    // scales, quantized with 6 bits",
+    );
+    let err = verbatim(
+        "ggml_planes_ref.c",
+        &COMMON_H,
+        &PLANES_COMMON_SPANS,
+        Some(drift),
+    )
+    .expect_err("a changed struct line must fail the guard");
+    assert!(
+        err.contains("DRIFTED in block_q3_K") && err.contains("scales[13]"),
+        "the guard must name block_q3_K and the changed line:\n{err}"
+    );
+    println!("ROW mutation struct_drift red=1");
+}
+
+/// Diffs `file` (with `drift` = (line, replacement) applied, for the guard's
+/// own test) against `source` span by span; Err names each drifted line.
+fn verbatim(
+    file: &str,
+    source: &Upstream,
+    spans: &[(&str, usize, usize)],
+    drift: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let mine_path = vendor_dir().join(file);
     let mine_src = std::fs::read_to_string(&mine_path)
         .unwrap_or_else(|e| panic!("{}: {e}", mine_path.display()));
-    let mine: Vec<String> = mine_src.split('\n').map(canon).collect();
+    let mine: Vec<String> = mine_src
+        .split('\n')
+        .map(|l| match drift {
+            Some((from, to)) if l == from => canon(to),
+            _ => canon(l),
+        })
+        .collect();
+    let upstream_file = source.file;
 
-    for (name, first, last) in SPANS {
-        let upstream = upstream_span(name, first, last);
-        let start = mine
-            .iter()
-            .position(|l| *l == upstream[0])
-            .unwrap_or_else(|| {
-                panic!(
-                    "{} does not contain {name} (ggml-quants.c:{first})",
+    for &(name, first, last) in spans {
+        let upstream = upstream_span(source, name, first, last);
+        // Where the most lines of the span match, the first such place (a
+        // struct span's `typedef struct {` occurs more than once).
+        let start = (0..mine.len())
+            .map(|i| {
+                let same = upstream
+                    .iter()
+                    .zip(&mine[i..])
+                    .filter(|(a, b)| a == b)
+                    .count();
+                (i, same)
+            })
+            .filter(|&(_, same)| same > 0)
+            .max_by_key(|&(i, same)| (same, std::cmp::Reverse(i)))
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                format!(
+                    "{} does not contain {name} ({upstream_file}:{first})",
                     mine_path.display()
                 )
-            });
+            })?;
         let got = &mine[start..(start + upstream.len()).min(mine.len())];
         if got == upstream.as_slice() {
-            println!("  verbatim ok: {name:24} ggml-quants.c:{first}-{last}");
+            println!("  verbatim ok: {name:24} {upstream_file}:{first}-{last}");
             continue;
         }
         let mut msg = format!("VENDORED ggml CODE HAS DRIFTED in {name}\n");
         for (i, (want, have)) in upstream.iter().zip(got.iter()).enumerate() {
             if want != have {
-                msg.push_str(&format!("  ggml-quants.c:{}\n", first + i));
+                msg.push_str(&format!("  {upstream_file}:{}\n", first + i));
                 msg.push_str(&format!("    ggml: {want:?}\n"));
                 msg.push_str(&format!("    ours: {have:?}\n"));
             }
@@ -2497,6 +2594,7 @@ fn vendored_ggml_reference_is_verbatim() {
                 upstream.len()
             ));
         }
-        panic!("{msg}");
+        return Err(msg);
     }
+    Ok(())
 }

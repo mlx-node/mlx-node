@@ -76,7 +76,7 @@ import {
   sendAnthropicRateLimit,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
-import { withAdmissionControlledInference } from '../inference-admission.js';
+import { residentSessionRegistry, withAdmissionControlledInference } from '../inference-admission.js';
 import { canonicalizeSystemForCacheKey, mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -124,7 +124,7 @@ import {
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
 import { QUARANTINE_MESSAGE, requestFingerprint, type TurnJournal } from '../turn-journal.js';
-import { measuredPrefillOf, type TracedChatConfig } from '../turn-trace.js';
+import { clientSessionOf, measuredPrefillOf, type TracedChatConfig } from '../turn-trace.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
 /**
@@ -1245,6 +1245,7 @@ export async function handleCreateMessage(
   modelWorkCoordinator?: ModelWorkCoordinator,
   serverThinking?: ServerThinking,
   turnJournal?: TurnJournal,
+  bindLoadedModel?: (name: string) => boolean,
 ): Promise<void> {
   if (modelWorkCoordinator) {
     registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
@@ -1344,7 +1345,7 @@ export async function handleCreateMessage(
   // handoff).
   let preDispatchAdmission: PreDispatchAdmission | undefined;
   let modelLoadAdmission: ModelLoadAdmission | undefined;
-  const preDispatchRegistry = registry.getSessionRegistry(body.model);
+  const preDispatchRegistry = residentSessionRegistry(registry, body.model, bindLoadedModel, modelWorkCoordinator);
   if (preDispatchRegistry) {
     try {
       preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
@@ -1528,6 +1529,8 @@ export async function handleCreateMessage(
     // Stamp the requesting alias so the shared model wrapper attributes the
     // turn to the name the client used, not the binding's first registration.
     (config as TracedChatConfig).modelAlias = body.model;
+    const clientSession = clientSessionOf(httpReq?.headers);
+    if (clientSession !== undefined) (config as TracedChatConfig).clientSession = clientSession;
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results

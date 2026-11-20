@@ -131,6 +131,7 @@ describe('GET /api/cache/prefix', () => {
       queueLimit: null,
       pool: null,
       stateNamespace: NS_A,
+      experts: null,
     };
     heartbeat(Date.now(), { dir: null, limitBytes: null }, [row, { ...row, name: 'Qwen3-8B', stateNamespace: null }]);
     const body = await list();

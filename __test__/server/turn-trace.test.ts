@@ -16,10 +16,19 @@ import type { ChatResult, ChatStreamProgress, ColdCacheStats, ColdSidecarStats }
 import { ChatSession, type ChatStreamControl, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src/metrics-trace.js';
-import type { PipelineStats, TurnProgressSnapshot } from '../../packages/server/src/native-progress.js';
+import {
+  MetricsTrace,
+  RESIDENCY_DELTA_FIELDS,
+  type MetricsTraceRecord,
+} from '../../packages/server/src/metrics-trace.js';
+import {
+  LOAD_RESIDENCY_FIELDS,
+  type PipelineStats,
+  type TurnProgressSnapshot,
+} from '../../packages/server/src/native-progress.js';
 import { SessionRegistry } from '../../packages/server/src/session-registry.js';
 import {
+  clientSessionOf,
   measuredPrefillOf,
   TurnTraceModel,
   turnCounters,
@@ -128,6 +137,20 @@ function makeInner(overrides: Partial<Record<keyof SessionCapableModel, unknown>
   } as unknown as SessionCapableModel;
 }
 
+/** A partial store's `residencyInfo()` whose counters the test moves; every other counter stays 0. */
+function residencyModel(inner: SessionCapableModel, counters: Record<string, number>): SessionCapableModel {
+  return Object.assign(inner, {
+    residencyInfo: () => {
+      const info: Record<string, unknown> = { residency: 'store-plan', partialExpertSlots: 412, expertCount: 512 };
+      for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+      for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+      return { ...info, ...counters };
+    },
+  });
+}
+
+const RESIDENCY_ROW_KEYS: readonly string[] = [...RESIDENCY_DELTA_FIELDS, 'expertResidency', 'expertSlots'];
+
 function traceFile(dir: string): string {
   return join(dir, `2026-07-21-${process.pid}.jsonl`);
 }
@@ -210,6 +233,41 @@ describe('TurnTraceModel', () => {
     const raw = readFileSync(traceFile(dir), 'utf8');
     expect(raw).not.toContain('"text"');
     expect(raw).not.toContain('rawText');
+  });
+
+  // A drafted turn's line names its drafted cycles, the drafts proposed and
+  // accepted over them, and the rows per verify.
+  // Mutation: drop `mtpProposed` from the line → red.
+  // Mutation: rows per verify read as the drafts alone → red.
+  it('names the drafted cycles, proposed, accepted and rows per verify of a drafted turn', async () => {
+    const drafted = makeResult({
+      performance: {
+        ttftMs: 125,
+        prefillTokensPerSecond: 800,
+        decodeTokensPerSecond: 50,
+        mtpCycles: 4,
+        mtpMeanDepth: 2.5,
+        mtpMeanAcceptedTokens: 1.25,
+        mtpMeanAcceptedTokensTotal: 2.25,
+      },
+    });
+    const model = new TurnTraceModel(makeInner({ chatSessionContinue: vi.fn(async () => drafted) }), {
+      modelName: 'flash-next',
+      trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
+      now: () => FIXED_NOW,
+      coldStats: () => undefined,
+      sidecarStats: () => undefined,
+      watermarks: { cold: {}, sidecar: {} },
+    });
+    await model.chatSessionContinue([{ role: 'user', content: 'hi' }], { cacheOwnerId: 'owner-1' });
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({
+      mtpCycles: 4,
+      mtpProposed: 10,
+      mtpAcceptedDrafts: 5,
+      mtpVerifyRows: 3.5,
+      mtpMeanAccepted: 2.25,
+    });
   });
 
   it('attributes a turn to the requesting alias stamped on the config', async () => {
@@ -1032,6 +1090,38 @@ describe('TurnTraceModel', () => {
     expect(lines[1]).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'temp' });
   });
 
+  it('a live turn names the session its request named, and null for a request that named none', async () => {
+    const gates: Array<() => void> = [];
+    const inner = makeInner({
+      chatSessionContinue: vi.fn(
+        () =>
+          new Promise<ChatResult>((resolve) => {
+            gates.push(() => resolve(makeResult()));
+          }),
+      ),
+    });
+    const model = new TurnTraceModel(inner, deps());
+    const named = model.chatSessionContinue([], { clientSession: 'acp-1' } as TracedChatConfig);
+    const unnamed = model.chatSessionContinue([]);
+    expect(model.liveTurns().map((turn) => turn.clientSession)).toEqual(['acp-1', null]);
+    gates[0]!();
+    await named;
+    expect(model.liveTurns().map((turn) => turn.clientSession)).toEqual([null]);
+    gates[1]!();
+    await unnamed;
+    expect(model.liveTurns()).toEqual([]);
+  });
+
+  it('reads the session header: one trimmed value up to 128 characters', () => {
+    expect(clientSessionOf({ 'x-grok-session-id': ' acp-1 ' })).toBe('acp-1');
+    expect(clientSessionOf({ 'x-grok-session-id': 'a'.repeat(128) })).toBe('a'.repeat(128));
+    expect(clientSessionOf({ 'x-grok-session-id': 'a'.repeat(129) })).toBeUndefined();
+    expect(clientSessionOf({ 'x-grok-session-id': '  ' })).toBeUndefined();
+    expect(clientSessionOf({ 'x-grok-session-id': ['a', 'b'] })).toBeUndefined();
+    expect(clientSessionOf({ 'x-grok-conv-id': 'acp-1' })).toBeUndefined();
+    expect(clientSessionOf(undefined)).toBeUndefined();
+  });
+
   it('reports concurrency and concurrencyPeak for overlapping turns', async () => {
     const gates: Array<() => void> = [];
     const inner = makeInner({
@@ -1415,6 +1505,274 @@ describe('TurnTraceModel', () => {
     const [line] = readTraceLines(dir);
     for (const key of ['waitMs', 'slotMs', 'prepareMs', 'pipelinesCreated', 'pipelineCreateMs']) {
       expect(key in line!).toBe(false);
+    }
+  });
+
+  // Timeline on one model: slow begins (marks seed at 10) -> slow +2 -> fast begins -> fast +1 -> fast records
+  // (13) -> slow +3 -> slow records (16). The advance is 6.
+  // MUTATION: diff against the turn's own begin value -> slow 6 + fast 3 = 9 -> red.
+  it('residency deltas of two overlapping turns sum to the counter advance', async () => {
+    const counters = { routeTries: 10, slotMisses: 100 };
+    const bump = (n: number) => {
+      counters.routeTries += n;
+      counters.slotMisses += 10 * n;
+    };
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let calls = 0;
+    const inner = residencyModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          calls += 1;
+          if (calls === 1) {
+            bump(2);
+            await slowGate;
+            bump(3);
+          } else {
+            bump(1);
+          }
+          return makeResult();
+        }),
+      }),
+      counters,
+    );
+    const model = new TurnTraceModel(inner, deps());
+    const slowTurn = model.chatSessionContinue([]);
+    await Promise.resolve();
+    await model.chatSessionContinue([]);
+    releaseSlow();
+    await slowTurn;
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((line) => line.routeTries)).toEqual([3, 3]);
+    expect(lines.reduce((sum, line) => sum + (line.routeTries ?? 0), 0)).toBe(6);
+    expect(lines.reduce((sum, line) => sum + (line.slotMisses ?? 0), 0)).toBe(60);
+    for (const line of lines) expect(line).toMatchObject({ expertResidency: 'store-plan', expertSlots: 412 });
+  });
+
+  // MUTATION: the failure path writes no residency deltas -> the cancelled row lacks them and the next turn
+  // inherits its +5 (6) -> red.
+  it('a cancelled turn records its own residency deltas and moves the marks', async () => {
+    const counters = { routeTries: 40, routeReplays: 7 };
+    const controller = new AbortController();
+    let calls = 0;
+    const inner = residencyModel(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          calls += 1;
+          if (calls === 1) {
+            counters.routeTries += 5;
+            counters.routeReplays += 2;
+            controller.abort();
+            throw new Error('aborted');
+          }
+          counters.routeTries += 1;
+          return makeResult();
+        }),
+      }),
+      counters,
+    );
+    const model = new TurnTraceModel(inner, deps());
+    await expect(model.chatSessionStart([], null, controller.signal)).rejects.toThrow('aborted');
+    await model.chatSessionStart([]);
+
+    const [cancelled, ok] = readTraceLines(dir);
+    expect(cancelled).toMatchObject({ outcome: 'cancelled', routeTries: 5, routeReplays: 2 });
+    expect(ok).toMatchObject({ outcome: 'ok', routeTries: 1, routeReplays: 0 });
+  });
+
+  // MUTATION: leave the `prefill*` keys out of RESIDENCY_DELTA_FIELDS -> they are absent from the row -> red.
+  it('a turn row carries the deltas of the fill, group and prefill-share counters', async () => {
+    const advance = {
+      fillCalls: 16,
+      fillMicros: 16_376,
+      fillReadBytes: 209_567_744,
+      groupPasses: 4,
+      groupWindows: 16,
+      prefillFillCalls: 14,
+      prefillFillMicros: 15_000,
+      prefillFillReadBytes: 200_000_000,
+      prefillSlotMisses: 63,
+      prefillCheckpointBytesRead: 208_595_552,
+      prefillRouteReplays: 0,
+    };
+    const counters: Record<string, number> = {};
+    for (const [key, value] of Object.entries(advance)) counters[key] = 1000 + value;
+    const inner = residencyModel(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          for (const [key, value] of Object.entries(advance)) counters[key] = 1000 + 2 * value;
+          return makeResult();
+        }),
+      }),
+      counters,
+    );
+    await new TurnTraceModel(inner, deps()).chatSessionStart([]);
+
+    expect(readTraceLines(dir)[0]).toMatchObject(advance);
+  });
+
+  // MUTATION: leave the `prefix*` keys out of RESIDENCY_DELTA_FIELDS -> they are absent from the row -> red.
+  it('a turn row carries the deltas of the prefix-state publications, refusals, skips and drops', async () => {
+    const advance = {
+      prefixPublished: 2,
+      prefixRestored: 1,
+      prefixRefusedRoom: 3,
+      prefixRefusedLive: 4,
+      prefixRefusedRegister: 5,
+      prefixRefusedOffGrid: 6,
+      prefixRefusedDraft: 7,
+      prefixSkippedReuseOff: 8,
+      prefixSkippedNoPoints: 9,
+      prefixMissedReplay: 10,
+      prefixDroppedKv: 11,
+      prefixDroppedMemory: 12,
+    };
+    const counters: Record<string, number> = {};
+    for (const [key, value] of Object.entries(advance)) counters[key] = 100 + value;
+    const inner = residencyModel(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          for (const [key, value] of Object.entries(advance)) counters[key] = 100 + 2 * value;
+          return makeResult();
+        }),
+      }),
+      counters,
+    );
+    await new TurnTraceModel(inner, deps()).chatSessionStart([]);
+
+    expect(readTraceLines(dir)[0]).toMatchObject(advance);
+  });
+
+  // MUTATION: leave `residencyPromotions` out of RESIDENCY_DELTA_FIELDS -> it is absent from the row -> red.
+  it('a turn whose close moved a host-gate store up to whole records the move and the direct store', async () => {
+    let state = { residency: 'host-gate', partialExpertSlots: 409, residencyPromotions: 0 };
+    const inner = Object.assign(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          state = { residency: 'direct', partialExpertSlots: 512, residencyPromotions: 1 };
+          return makeResult();
+        }),
+      }),
+      {
+        residencyInfo: () => {
+          const info: Record<string, unknown> = { expertCount: 512 };
+          for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+          for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+          return { ...info, ...state };
+        },
+      },
+    );
+    const model = new TurnTraceModel(inner, deps());
+    await model.chatSessionStart([]);
+    await model.chatSessionStart([]);
+
+    const [moved, next] = readTraceLines(dir);
+    expect(moved).toMatchObject({ residencyPromotions: 1, expertResidency: 'direct', expertSlots: 512 });
+    expect(next).toMatchObject({ residencyPromotions: 0, expertResidency: 'direct', expertSlots: 512 });
+  });
+
+  // MUTATION: leave `residencyPromotionRefusals` out of RESIDENCY_DELTA_FIELDS -> it is absent from the row -> red.
+  it('a turn whose close could not move a host-gate store records the refusal and the partial store', async () => {
+    let state = { residency: 'host-gate', partialExpertSlots: 409, residencyPromotionRefusals: 0 };
+    const inner = Object.assign(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          state = { residency: 'host-gate', partialExpertSlots: 409, residencyPromotionRefusals: 1 };
+          return makeResult();
+        }),
+      }),
+      {
+        residencyInfo: () => {
+          const info: Record<string, unknown> = { expertCount: 512 };
+          for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+          for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+          return { ...info, ...state };
+        },
+      },
+    );
+    const model = new TurnTraceModel(inner, deps());
+    await model.chatSessionStart([]);
+    await model.chatSessionStart([]);
+
+    const [refused, next] = readTraceLines(dir);
+    expect(refused).toMatchObject({
+      residencyPromotionRefusals: 1,
+      residencyPromotions: 0,
+      expertResidency: 'host-gate',
+      expertSlots: 409,
+    });
+    expect(next).toMatchObject({ residencyPromotionRefusals: 0, expertResidency: 'host-gate', expertSlots: 409 });
+  });
+
+  // MUTATION: leave `draftOneRowCycles` out of RESIDENCY_DELTA_FIELDS -> it is absent from the row -> red.
+  it('a drafted turn records its one-row cycles, which the speculative cycle count leaves out', async () => {
+    let cycles = 0;
+    const inner = Object.assign(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          cycles += 16;
+          return makeResult();
+        }),
+      }),
+      {
+        residencyInfo: () => {
+          const info: Record<string, unknown> = { expertCount: 512, residency: 'direct', partialExpertSlots: 512 };
+          for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+          for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+          return { ...info, draftOneRowCycles: cycles };
+        },
+      },
+    );
+    const model = new TurnTraceModel(inner, deps());
+    await model.chatSessionStart([]);
+    await model.chatSessionStart([]);
+
+    const [first, second] = readTraceLines(dir);
+    expect(first).toMatchObject({ draftOneRowCycles: 16, expertResidency: 'direct' });
+    expect(second).toMatchObject({ draftOneRowCycles: 16 });
+  });
+
+  // MUTATION: leave `laneSteps` out of RESIDENCY_DELTA_FIELDS -> it is absent from the row -> red.
+  it('a turn records the lane steps it ran beside other turns', async () => {
+    let steps = 0;
+    const inner = Object.assign(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          steps += 24;
+          return makeResult();
+        }),
+      }),
+      {
+        residencyInfo: () => {
+          const info: Record<string, unknown> = { expertCount: 512, residency: 'direct', partialExpertSlots: 512 };
+          for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+          for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+          return { ...info, laneSteps: steps };
+        },
+      },
+    );
+    const model = new TurnTraceModel(inner, deps());
+    await model.chatSessionStart([]);
+    await model.chatSessionStart([]);
+
+    const [first, second] = readTraceLines(dir);
+    expect(first).toMatchObject({ laneSteps: 24, expertResidency: 'direct' });
+    expect(second).toMatchObject({ laneSteps: 24 });
+  });
+
+  it('a model without residencyInfo, or with another one, writes no residency key', async () => {
+    const other = Object.assign(makeInner(), {
+      residencyInfo: () => ({ denseBytes: 1, bankSwitches: 2, inTurn: false }),
+    });
+    await new TurnTraceModel(makeInner(), deps()).chatSessionStart([]);
+    await new TurnTraceModel(other, deps()).chatSessionStart([]);
+
+    for (const line of readTraceLines(dir)) {
+      expect(Object.keys(line).filter((key) => RESIDENCY_ROW_KEYS.includes(key))).toEqual([]);
     }
   });
 

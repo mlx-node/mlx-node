@@ -7,6 +7,8 @@ import { Panel } from '../../components/arc-x/panel/panel';
 import { Meter } from '../../components/arc-x/split-bar/split-bar';
 import { SwapText } from '../../components/arc-x/swap-text/swap-text';
 import { Badge } from '../../components/arc/badge/badge';
+import { fill } from '../../lib/chat-strings';
+import { ENGINE } from '../../lib/engine-strings';
 import {
   formatBytes,
   formatClock,
@@ -25,6 +27,16 @@ type Row = { kind: 'model'; model: LoadedModel } | { kind: 'loading'; name: stri
 
 function rowName(row: Row): string {
   return row.kind === 'model' ? row.model.name : row.name;
+}
+
+function expertsLine(experts: LoadedModel['experts']): string | null {
+  if (experts === null) return null;
+  if (!experts.streaming) return fill(ENGINE.models.expertsAll, { total: formatNumber(experts.total) });
+  if (experts.inMemory === 0) return ENGINE.models.expertsStreaming;
+  return fill(ENGINE.models.expertsPartial, {
+    inMemory: formatNumber(experts.inMemory),
+    total: formatNumber(experts.total),
+  });
 }
 
 export function ModelsSection({
@@ -72,18 +84,19 @@ export function ModelsSection({
             />
           );
         }
+        const detail = [
+          local?.quant,
+          local === undefined ? null : `${formatBytes(local.sizeBytes)} on disk`,
+          expertsLine(row.model.experts),
+        ]
+          .filter((part) => part !== null && part !== undefined && part !== '')
+          .join(' · ');
         return (
           <ModelBadge
             name={name}
             size="sm"
             fit="width"
-            detail={
-              local === undefined
-                ? undefined
-                : [local.quant, `${formatBytes(local.sizeBytes)} on disk`]
-                    .filter((part) => part !== null && part !== undefined && part !== '')
-                    .join(' · ')
-            }
+            detail={detail === '' ? undefined : <span title={detail}>{detail}</span>}
           />
         );
       },

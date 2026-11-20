@@ -303,6 +303,24 @@ void require_row_contiguous_zero_offset(
   }
 }
 
+// The rows' score scales of an INT8-query decode read: f32 [rows,
+// num_q_heads] over INT8 pages.
+void validate_score_scales(
+    const array& score_scales,
+    int rows,
+    int num_q_heads,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  require_row_contiguous_zero_offset(score_scales, op_name, "score_scales");
+  if (kv_dtype != KvDtype::Int8 || score_scales.dtype() != mlx::core::float32 ||
+      score_scales.shape() != Shape{rows, num_q_heads}) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] score_scales must be float32 [query rows, query heads] over INT8 pages";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
 // =============================================================================
 // Unified factory + eval_gpu validation.
 //
@@ -376,12 +394,16 @@ void validate_paged_kv_write_inputs(
         << ") must be positive and divide head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
+  // A rank-4 K without `values_token_major` is the keys-token-major page.
+  const bool keys_token_major = !values_token_major && k_pool.ndim() == 4;
   // Caller's `x_pack` must agree with the dtype-derived value
   // (`16 / sizeof(kv_dtype)`). A mismatch means caller and dispatcher
   // disagree on the K-pool layout — guaranteed garbage on read.
   {
     // A token-major page is K with x = head_size.
-    int x_pack_expected = values_token_major ? head_size : x_pack_for(kv_dtype);
+    int x_pack_expected = values_token_major || keys_token_major
+        ? head_size
+        : x_pack_for(kv_dtype);
     if (x_pack != x_pack_expected) {
       std::ostringstream msg;
       msg << "[validator] [" << op_name << "] x_pack (" << x_pack
@@ -473,6 +495,24 @@ void validate_paged_kv_write_inputs(
           << head_size << "]";
       throw std::invalid_argument(msg.str());
     }
+  } else if (keys_token_major) {
+    if (kv_dtype != KvDtype::Int8 || block_size != 32) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] a keys-token-major page is int8 "
+          << "with block_size 32; got kv_dtype " << static_cast<int>(kv_dtype)
+          << ", block_size " << block_size;
+      throw std::invalid_argument(msg.str());
+    }
+    const Shape keys{k_pool.shape(0), num_kv_heads, block_size, head_size};
+    const Shape values{k_pool.shape(0), num_kv_heads, head_size, block_size};
+    if (k_pool.shape() != keys || v_pool.shape() != values) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] a keys-token-major page needs K "
+          << "[num_blocks, " << num_kv_heads << ", " << block_size << ", "
+          << head_size << "] and V [num_blocks, " << num_kv_heads << ", "
+          << head_size << ", " << block_size << "]";
+      throw std::invalid_argument(msg.str());
+    }
   } else if (k_pool.ndim() != 5) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool must be rank 5 "
@@ -480,7 +520,7 @@ void validate_paged_kv_write_inputs(
         << k_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
-  if (!values_token_major) {
+  if (!values_token_major && !keys_token_major) {
     if (v_pool.ndim() != 4) {
       std::ostringstream msg;
       msg << "[validator] [" << op_name << "] v_pool must be rank 4 "
@@ -591,6 +631,45 @@ void validate_paged_kv_write_inputs(
     msg << "[validator] [" << op_name << "] slot_mapping length ("
         << slot_mapping.shape(0) << ") disagrees with new_k tokens ("
         << new_k.shape(0) << ")";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+// The decode kernels of the keys-token-major page exist for the int8
+// 32-token page of group 6 at D 256 with bf16 queries only
+// (paged_attention_ktm.h).
+void validate_keys_token_major_read_pools(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  if (kv_dtype != KvDtype::Int8 || block_size != 32 ||
+      q.dtype() != mlx::core::bfloat16 ||
+      !paged::paged_prefill_keys_token_major_geometry(
+          num_q_heads / num_kv_heads, head_size)) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] a keys-token-major page is read "
+        << "by bf16 queries as int8 with block_size 32, group "
+        << paged::kPagedPrefillKeysTokenMajorGroup << " and head_size "
+        << paged::kPagedPrefillKeysTokenMajorHeadDim << " only; got kv_dtype "
+        << static_cast<int>(kv_dtype) << ", block_size " << block_size
+        << ", group " << num_q_heads / num_kv_heads << ", head_size "
+        << head_size;
+    throw std::invalid_argument(msg.str());
+  }
+  const Shape keys{k_pool.shape(0), num_kv_heads, block_size, head_size};
+  const Shape values{k_pool.shape(0), num_kv_heads, head_size, block_size};
+  if (k_pool.shape() != keys || v_pool.shape() != values) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] a keys-token-major page needs K "
+        << "[num_blocks, " << num_kv_heads << ", " << block_size << ", "
+        << head_size << "] and V [num_blocks, " << num_kv_heads << ", "
+        << head_size << ", " << block_size << "]";
     throw std::invalid_argument(msg.str());
   }
 }
@@ -760,8 +839,14 @@ void validate_paged_attention_inputs(
     throw std::invalid_argument(msg.str());
   }
 
-  // 6. Pool rank/shape validation.
-  if (k_pool.ndim() != 5) {
+  // 6. Pool rank/shape validation. A rank-4 K is the keys-token-major page.
+  const bool keys_token_major = k_pool.ndim() == 4;
+  if (keys_token_major) {
+    validate_keys_token_major_read_pools(
+        q, k_pool, v_pool, block_size, num_q_heads, num_kv_heads, head_size,
+        kv_dtype, op_name);
+  }
+  if (!keys_token_major && k_pool.ndim() != 5) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool must be rank 5 "
         << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
@@ -788,7 +873,8 @@ void validate_paged_attention_inputs(
         << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
     throw std::invalid_argument(msg.str());
   }
-  if (k_pool.shape(3) != block_size || v_pool.shape(3) != block_size) {
+  if (!keys_token_major &&
+      (k_pool.shape(3) != block_size || v_pool.shape(3) != block_size)) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool/v_pool block_size ("
         << k_pool.shape(3) << "/" << v_pool.shape(3)
@@ -801,7 +887,7 @@ void validate_paged_attention_inputs(
         << ") disagrees with head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
-  if (k_pool.shape(2) != head_size / x_pack_expected) {
+  if (!keys_token_major && k_pool.shape(2) != head_size / x_pack_expected) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
         << ") disagrees with head_size/x_pack ("
@@ -810,7 +896,7 @@ void validate_paged_attention_inputs(
         << " for kv_dtype " << static_cast<int>(kv_dtype) << ")";
     throw std::invalid_argument(msg.str());
   }
-  if (k_pool.shape(4) != x_pack_expected) {
+  if (!keys_token_major && k_pool.shape(4) != x_pack_expected) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
         << ") disagrees with dtype-derived x_pack (" << x_pack_expected
@@ -1022,10 +1108,10 @@ void PagedAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   validate_paged_attention_plan(route_hint_, grouped_stripes_);
-  if (inputs.size() != 7) {
+  if (inputs.size() != 7 && inputs.size() != 8) {
     throw std::runtime_error(
-        "PagedAttention: expected 7 inputs (q, k_pool, v_pool, block_table, "
-        "seq_lens, k_scale, v_scale)");
+        "PagedAttention: expected 7 or 8 inputs (q, k_pool, v_pool, block_table, "
+        "seq_lens, k_scale, v_scale[, score_scales])");
   }
   if (outputs.size() != 1) {
     throw std::runtime_error("PagedAttention: expected 1 output");
@@ -1067,6 +1153,12 @@ void PagedAttention::eval_gpu(
       sliding_window_,
       kv_dtype_,
       "PagedAttention::eval_gpu");
+
+  const array* score_scales = inputs.size() == 8 ? &inputs[7] : nullptr;
+  if (score_scales != nullptr) {
+    validate_score_scales(
+        *score_scales, q.shape(0), num_q_heads_, kv_dtype_, "PagedAttention::eval_gpu");
+  }
 
   uint32_t num_seqs = static_cast<uint32_t>(q.shape(0));
   uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
@@ -1207,7 +1299,8 @@ void PagedAttention::eval_gpu(
       to_paged_dtype(kv_dtype_),
       static_cast<mlx::core::fast::paged::PagedAttentionRouteHint>(
           route_hint_),
-      grouped_stripes_);
+      grouped_stripes_,
+      score_scales);
 }
 
 std::vector<array> PagedAttention::vjp(
@@ -1428,7 +1521,8 @@ array paged_attention_with_route_hint(
     KvDtype kv_dtype,
     uint8_t route_hint,
     StreamOrDevice s_,
-    uint32_t grouped_stripes) {
+    uint32_t grouped_stripes,
+    const std::optional<array>& score_scales) {
   validate_paged_attention_plan(route_hint, grouped_stripes);
   auto s = to_stream(s_);
 
@@ -1469,6 +1563,10 @@ array paged_attention_with_route_hint(
 
   std::vector<array> inputs = {
       q, k_pool, v_pool, block_table, seq_lens, k_scale, v_scale};
+  if (score_scales) {
+    validate_score_scales(*score_scales, q.shape(0), num_q_heads, kv_dtype, "paged_attention");
+    inputs.push_back(*score_scales);
+  }
 
   auto primitive = std::make_shared<PagedAttention>(
       s,
@@ -1717,10 +1815,10 @@ void validate_paged_attention_varlen_inputs(
 void PagedAttentionVarlen::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (inputs.size() != 8) {
+  if (inputs.size() != 8 && inputs.size() != 9) {
     throw std::runtime_error(
-        "PagedAttentionVarlen: expected 8 inputs (q, k_pool, v_pool, "
-        "block_table, seq_lens, cu_seqlens_q, k_scale, v_scale)");
+        "PagedAttentionVarlen: expected 8 or 9 inputs (q, k_pool, v_pool, "
+        "block_table, seq_lens, cu_seqlens_q, k_scale, v_scale[, score_scales])");
   }
   if (outputs.size() != 1) {
     throw std::runtime_error("PagedAttentionVarlen: expected 1 output");
@@ -1753,6 +1851,16 @@ void PagedAttentionVarlen::eval_gpu(
       sliding_window_,
       kv_dtype_,
       "PagedAttentionVarlen::eval_gpu");
+
+  const array* score_scales = inputs.size() == 9 ? &inputs[8] : nullptr;
+  if (score_scales != nullptr) {
+    validate_score_scales(
+        *score_scales,
+        q.shape(0),
+        num_q_heads_,
+        kv_dtype_,
+        "PagedAttentionVarlen::eval_gpu");
+  }
 
   uint32_t num_seqs = static_cast<uint32_t>(seq_lens.shape(0));
   uint32_t total_queries = static_cast<uint32_t>(q.shape(0));
@@ -1880,7 +1988,8 @@ void PagedAttentionVarlen::eval_gpu(
       scale_,
       softcap_,
       sliding_window_,
-      to_paged_dtype(kv_dtype_));
+      to_paged_dtype(kv_dtype_),
+      score_scales);
 }
 
 std::vector<array> PagedAttentionVarlen::vjp(
@@ -1931,7 +2040,8 @@ array paged_attention_varlen(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
-    StreamOrDevice s_) {
+    StreamOrDevice s_,
+    const std::optional<array>& score_scales) {
   auto s = to_stream(s_);
 
   auto fallback = [](std::vector<array> /*inputs*/) -> std::vector<array> {
@@ -1968,6 +2078,11 @@ array paged_attention_varlen(
       cu_seqlens_q,
       k_scale,
       v_scale};
+  if (score_scales) {
+    validate_score_scales(
+        *score_scales, q.shape(0), num_q_heads, kv_dtype, "paged_attention_varlen");
+    inputs.push_back(*score_scales);
+  }
 
   auto primitive = std::make_shared<PagedAttentionVarlen>(
       s,
@@ -2016,6 +2131,7 @@ void validate_paged_prefill_inputs(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
+    bool int8_queries,
     const char* op_name) {
   namespace paged = mlx::core::fast::paged;
   require_row_contiguous_head_offset(q_staged, op_name, "q_staged");
@@ -2027,6 +2143,9 @@ void validate_paged_prefill_inputs(
   require_row_contiguous_zero_offset(workspace, op_name, "workspace");
   if (kv_dtype != KvDtype::Bf16 && kv_dtype != KvDtype::Int8) {
     prefill_reject(op_name, "kv_dtype must be bf16 or int8");
+  }
+  if (int8_queries && kv_dtype != KvDtype::Int8) {
+    prefill_reject(op_name, "INT8 queries take INT8 pages");
   }
   if (num_kv_heads <= 0 || num_q_heads <= 0 || num_q_heads % num_kv_heads != 0) {
     prefill_reject(
@@ -2075,11 +2194,32 @@ void validate_paged_prefill_inputs(
   if (k_pool.dtype() != cache_dtype || v_pool.dtype() != cache_dtype) {
     prefill_reject(op_name, "k_pool / v_pool dtype must match kv_dtype");
   }
-  if (k_pool.ndim() != 5 || v_pool.ndim() != 4) {
-    prefill_reject(op_name, "k_pool must be rank 5 and v_pool rank 4");
+  // A rank-4 K is the keys-token-major page (K [blocks, kv heads, 32,
+  // head_size], V dimension-major); the dispatch routes by this rank.
+  const bool keys_token_major = k_pool.ndim() == 4;
+  if ((!keys_token_major && k_pool.ndim() != 5) || v_pool.ndim() != 4) {
+    prefill_reject(
+        op_name, "k_pool must be rank 5 (rank 4: keys token-major) and v_pool rank 4");
   }
   const int num_blocks = k_pool.shape(0);
-  if (k_pool.shape() != Shape{num_blocks, num_kv_heads, head_size / x, block_size, x} ||
+  if (keys_token_major) {
+    if (kv_dtype != KvDtype::Int8 || block_size != 32 ||
+        !paged::paged_prefill_keys_token_major_geometry(group, head_size)) {
+      prefill_reject(
+          op_name,
+          "a keys-token-major page is read by the int8 block-32 tile of group " +
+              std::to_string(paged::kPagedPrefillKeysTokenMajorGroup) + ", head_size " +
+              std::to_string(paged::kPagedPrefillKeysTokenMajorHeadDim) + " only");
+    }
+    if (k_pool.shape() != Shape{num_blocks, num_kv_heads, block_size, head_size} ||
+        v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
+      prefill_reject(
+          op_name,
+          "keys-token-major planes do not match K [blocks, kv heads, block_size, head_size] "
+          "and V [blocks, kv heads, head_size, block_size]");
+    }
+  } else if (
+      k_pool.shape() != Shape{num_blocks, num_kv_heads, head_size / x, block_size, x} ||
       v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
     prefill_reject(op_name, "pool planes do not match [blocks, kv heads, head_size, block_size]");
   }
@@ -2122,7 +2262,8 @@ void PagedPrefillAttention::eval_gpu(
   validate_paged_prefill_inputs(
       q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
       committed_tokens_, rows_, splits_, max_splits_, block_size_, num_q_heads_,
-      num_kv_heads_, head_size_, kv_dtype_, "PagedPrefillAttention::eval_gpu");
+      num_kv_heads_, head_size_, kv_dtype_, int8_queries_,
+      "PagedPrefillAttention::eval_gpu");
 
   // The kernel reads table entries [0, ceil((committed + rows) / block_size))
   // without bounds checks.
@@ -2173,6 +2314,7 @@ void PagedPrefillAttention::eval_gpu(
       num_q_heads_,
       head_size_,
       to_paged_dtype(kv_dtype_),
+      int8_queries_,
       live_blocks);
 }
 
@@ -2198,7 +2340,83 @@ bool PagedPrefillAttention::is_equivalent(const Primitive& other) const {
       splits_ == o.splits_ && max_splits_ == o.max_splits_ &&
       block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
       num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
-      kv_dtype_ == o.kv_dtype_;
+      kv_dtype_ == o.kv_dtype_ && int8_queries_ == o.int8_queries_;
+}
+
+void PagedQueryCodes::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  if (inputs.size() != 2 || outputs.size() != 2) {
+    throw std::runtime_error("PagedQueryCodes: expected 2 inputs and 2 outputs");
+  }
+  const array& q = inputs[0];
+  const array& positions = inputs[1];
+  require_row_contiguous_zero_offset(q, "PagedQueryCodes::eval_gpu", "q");
+  require_row_contiguous_zero_offset(positions, "PagedQueryCodes::eval_gpu", "positions");
+  outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& encoder = mlx::core::metal::get_command_encoder(s);
+  mlx::core::fast::paged::PagedQueryCodesParams params{
+      static_cast<uint32_t>(q.shape(0)),
+      static_cast<uint32_t>(num_q_heads_),
+      from_,
+      scale_};
+  mlx::core::fast::paged::dispatch_paged_query_codes(
+      encoder, d, q, positions, outputs[0], outputs[1], params, head_size_);
+}
+
+std::vector<array> PagedQueryCodes::vjp(
+    const std::vector<array>& /*primals*/,
+    const std::vector<array>& /*cotangents*/,
+    const std::vector<int>& /*argnums*/,
+    const std::vector<array>& /*outputs*/) {
+  throw std::runtime_error("PagedQueryCodes is inference-only");
+}
+
+std::vector<Shape> PagedQueryCodes::output_shapes(const std::vector<array>& inputs) {
+  if (inputs.size() != 2) {
+    throw std::runtime_error("PagedQueryCodes::output_shapes: expected 2 inputs");
+  }
+  return {inputs[0].shape(), Shape{inputs[0].shape(0), num_q_heads_}};
+}
+
+bool PagedQueryCodes::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const PagedQueryCodes&>(other);
+  return num_q_heads_ == o.num_q_heads_ && head_size_ == o.head_size_ &&
+      from_ == o.from_ && scale_ == o.scale_;
+}
+
+std::array<array, 2> paged_query_codes(
+    const array& q,
+    const array& positions,
+    uint32_t from,
+    float scale,
+    StreamOrDevice s_) {
+  const char* op_name = "paged_query_codes";
+  auto s = to_stream(s_);
+  if (q.ndim() != 3 || q.dtype() != mlx::core::bfloat16 ||
+      (q.shape(2) != 128 && q.shape(2) != 256) || q.shape(0) <= 0 || q.shape(1) <= 0) {
+    prefill_reject(op_name, "q must be bf16 [rows, query heads, 128 or 256]");
+  }
+  if (positions.ndim() != 1 || positions.dtype() != mlx::core::int32 ||
+      positions.shape(0) != q.shape(0)) {
+    prefill_reject(op_name, "positions must be int32 [rows]");
+  }
+  const int num_q_heads = q.shape(1);
+  const int head_size = q.shape(2);
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error("paged_query_codes has no fallback implementation (inference-only)");
+  };
+  auto primitive = std::make_shared<PagedQueryCodes>(
+      s, std::move(fallback), num_q_heads, head_size, from, scale);
+  auto results = array::make_arrays(
+      {q.shape(), Shape{q.shape(0), num_q_heads}},
+      {mlx::core::bfloat16, mlx::core::float32},
+      primitive,
+      {contiguous(q, false, s), contiguous(positions, false, s)});
+  return {std::move(results[0]), std::move(results[1])};
 }
 
 std::array<array, 2> paged_prefill_attention(
@@ -2217,6 +2435,7 @@ std::array<array, 2> paged_prefill_attention(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
+    bool int8_queries,
     float scale,
     StreamOrDevice s_) {
   const char* op_name = "paged_prefill_attention";
@@ -2247,7 +2466,7 @@ std::array<array, 2> paged_prefill_attention(
   validate_paged_prefill_inputs(
       staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
       committed_tokens, rows, splits, max_splits, block_size, num_q_heads,
-      num_kv_heads, head_size, kv_dtype, op_name);
+      num_kv_heads, head_size, kv_dtype, int8_queries, op_name);
 
   auto fallback = [](std::vector<array>) -> std::vector<array> {
     throw std::runtime_error(
@@ -2255,7 +2474,7 @@ std::array<array, 2> paged_prefill_attention(
   };
   auto primitive = std::make_shared<PagedPrefillAttention>(
       s, std::move(fallback), committed_tokens, rows, splits, max_splits,
-      block_size, num_q_heads, num_kv_heads, head_size, kv_dtype);
+      block_size, num_q_heads, num_kv_heads, head_size, kv_dtype, int8_queries);
   auto results = array::make_arrays(
       {Shape{rows, num_q_heads, head_size}, workspace.shape()},
       {mlx::core::bfloat16, mlx::core::float32},
@@ -2294,7 +2513,8 @@ mlx_array* mlx_paged_attention_forward_with_plan(
     int head_size,
     uint8_t kv_dtype_raw,
     uint8_t route_hint,
-    uint32_t grouped_stripes) {
+    uint32_t grouped_stripes,
+    mlx_array* score_scales_ptr) {
   if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
       !seq_lens_ptr || !k_scale_ptr || !v_scale_ptr) {
     return nullptr;
@@ -2343,7 +2563,12 @@ mlx_array* mlx_paged_attention_forward_with_plan(
         num_kv_heads,
         head_size,
         kv_dtype,
-        route_hint, {}, grouped_stripes);
+        route_hint,
+        {},
+        grouped_stripes,
+        score_scales_ptr == nullptr
+            ? std::nullopt
+            : std::optional<array>(*reinterpret_cast<array*>(score_scales_ptr)));
 
     return reinterpret_cast<mlx_array*>(new array(std::move(out)));
   } catch (const std::exception& e) {
@@ -2389,7 +2614,8 @@ mlx_array* mlx_paged_attention_forward(
       head_size,
       kv_dtype_raw,
       /*route_hint=*/0,
-      /*grouped_stripes=*/0);
+      /*grouped_stripes=*/0,
+      /*score_scales=*/nullptr);
 }
 
 /// Production FFI: emit a `PagedAttentionVarlen` MLX Custom primitive and
@@ -2417,7 +2643,8 @@ mlx_array* mlx_paged_attention_varlen_forward(
     int num_q_heads,
     int num_kv_heads,
     int head_size,
-    uint8_t kv_dtype_raw) {
+    uint8_t kv_dtype_raw,
+    mlx_array* score_scales_ptr) {
   if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
       !seq_lens_ptr || !cu_seqlens_q_ptr || !k_scale_ptr || !v_scale_ptr) {
     return nullptr;
@@ -2464,7 +2691,11 @@ mlx_array* mlx_paged_attention_varlen_forward(
         num_q_heads,
         num_kv_heads,
         head_size,
-        kv_dtype);
+        kv_dtype,
+        {},
+        score_scales_ptr == nullptr
+            ? std::nullopt
+            : std::optional<array>(*reinterpret_cast<array*>(score_scales_ptr)));
 
     return reinterpret_cast<mlx_array*>(new array(std::move(out)));
   } catch (const std::exception& e) {
@@ -2477,6 +2708,39 @@ mlx_array* mlx_paged_attention_varlen_forward(
   }
 }
 
+
+/// Production FFI: emit a `PagedQueryCodes`. Returns false on a validation
+/// error; the outputs stay lazy.
+bool mlx_paged_query_codes_forward(
+    mlx_array* q_ptr,
+    mlx_array* positions_ptr,
+    uint32_t from,
+    float scale,
+    mlx_array** out_codes,
+    mlx_array** out_score_scales) {
+  if (out_codes) *out_codes = nullptr;
+  if (out_score_scales) *out_score_scales = nullptr;
+  if (!q_ptr || !positions_ptr || !out_codes || !out_score_scales) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    auto results = fast::paged_query_codes(
+        *reinterpret_cast<array*>(q_ptr),
+        *reinterpret_cast<array*>(positions_ptr),
+        from,
+        scale);
+    *out_codes = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    *out_score_scales = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_query_codes_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("paged_query_codes_forward", "unknown exception");
+    return false;
+  }
+}
 
 /// Production FFI: emit a `PagedPrefillAttention` (queries staged inside).
 /// Returns false on a validation error; the outputs stay lazy.
@@ -2496,6 +2760,7 @@ bool mlx_paged_prefill_attention_forward(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype_raw,
+    bool int8_queries,
     float scale,
     mlx_array** out_attention,
     mlx_array** out_workspace) {
@@ -2525,6 +2790,7 @@ bool mlx_paged_prefill_attention_forward(
         num_kv_heads,
         head_size,
         static_cast<KvDtype>(kv_dtype_raw),
+        int8_queries,
         scale);
     *out_attention = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
     *out_workspace = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
@@ -2608,7 +2874,8 @@ bool mlx_paged_kv_write_forward(
         block_size,
         num_kv_heads,
         head_size,
-        values_token_major ? head_size : x_pack_for(kv_dtype),
+        values_token_major || k_pool.ndim() == 4 ? head_size
+                                                 : x_pack_for(kv_dtype),
         kv_dtype,
         StreamOrDevice{},
         values_token_major);
@@ -7025,7 +7292,8 @@ int mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() {
       /*num_q_heads=*/8,
       /*num_kv_heads=*/4,
       /*head_size=*/64,
-      /*kv_dtype_raw=*/255);
+      /*kv_dtype_raw=*/255,
+      /*score_scales=*/nullptr);
   if (out == nullptr) {
     return 1;
   }

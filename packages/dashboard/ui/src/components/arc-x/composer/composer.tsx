@@ -1,12 +1,10 @@
 import { ArrowBigUp, CircleAlert, CornerDownLeft, Info, TriangleAlert } from 'lucide-react';
 import { motion } from 'motion/react';
 import {
-  Fragment,
   useCallback,
   useId,
   useLayoutEffect,
   useRef,
-  useState,
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
@@ -23,9 +21,11 @@ import { LiveLabel } from '../live-label/live-label';
 import { motionX } from '../motion/motion';
 import { useStaticMotion } from '../motion/use-static-motion';
 import styles from './composer.module.css';
+import { ContextRing, type ContextUse } from './context-ring';
 import { SendButton, type ComposerPhase } from './send-button';
 
 export { SendButton, sendFace, type ComposerPhase, type SendButtonProps } from './send-button';
+export { contextText, type ContextUse } from './context-ring';
 
 export interface ComposerNotice {
   tone: 'neutral' | 'warning' | 'danger';
@@ -34,14 +34,6 @@ export interface ComposerNotice {
   working?: boolean;
   action?: { label: string; onSelect: () => void };
   secondary?: { label: string; onSelect: () => void };
-}
-
-export type KeyName = 'enter' | 'shift' | 'esc';
-
-/** One part of the key legend: the keys, then the word. */
-export interface KeyHint {
-  keys: readonly KeyName[];
-  label: string;
 }
 
 export interface ComposerProps {
@@ -56,10 +48,8 @@ export interface ComposerProps {
   notice?: ComposerNotice;
   /** Model picker and chips. */
   tools: ReactNode;
-  /** The key legend of the tools row when there is no `blocked` text. Each part is drawn whole or not at all. */
-  hint?: readonly KeyHint[];
-  /** The hint shows only while the text field has focus. */
-  hintOnFocus?: boolean;
+  /** How full the context window is: a ring at the end of the tools row while no reason or counter shows. */
+  context?: ContextUse;
   /** Default 100_000. */
   maxLength?: number;
   /** Accessible name of the textarea. Default 'Message'. */
@@ -99,17 +89,6 @@ function placeWholeParts(fit: HTMLElement): void {
     const box = part.getBoundingClientRect();
     if (box.height > 0 && box.top >= line) part.setAttribute('data-dropped', '');
   }
-}
-
-function KeyGlyph({ name }: { name: KeyName }): ReactElement {
-  if (name === 'esc') return <>{CHAT.keyNames.esc}</>;
-  const Icon = name === 'enter' ? CornerDownLeft : ArrowBigUp;
-  return (
-    <>
-      <Icon size={12} strokeWidth={1.75} aria-hidden="true" />
-      <span className={styles.srOnly}>{CHAT.keyNames[name]}</span>
-    </>
-  );
 }
 
 function NoticeStrip({ notice }: { notice: ComposerNotice }): ReactElement {
@@ -157,11 +136,9 @@ export function Composer(props: ComposerProps): ReactElement {
     props.value.length >= max * 0.9 && !tooLong
       ? fill(CHAT.counter, { length: formatNumber(props.value.length), max: formatNumber(max) })
       : null;
-  const [focused, setFocused] = useState(false);
-  const hint = props.hintOnFocus === true && !focused ? undefined : props.hint;
   const sideId = useId();
   const reasonShown = reason !== undefined && !blank;
-  const side = reasonShown ? 'reason' : counter !== null ? 'count' : hint !== undefined ? 'hint' : 'none';
+  const side = reasonShown ? 'reason' : counter !== null ? 'count' : 'none';
 
   const attach = useCallback(
     (node: HTMLTextAreaElement | null) => {
@@ -237,22 +214,33 @@ export function Composer(props: ComposerProps): ReactElement {
       onSubmit={submit}
     >
       {props.notice !== undefined ? <NoticeStrip notice={props.notice} /> : null}
-      <textarea
-        ref={attach}
-        className={styles.input}
-        rows={1}
-        value={props.value}
-        placeholder={props.placeholder}
-        aria-label={label}
-        aria-describedby={reasonShown ? sideId : undefined}
-        spellCheck
-        onChange={(event) => props.onValueChange(event.target.value)}
-        onKeyDown={onKeyDown}
-        onFocus={() => setFocused(true)}
-        onBlur={() => setFocused(false)}
-        onDragOver={ignoreFiles}
-        onDrop={ignoreFiles}
-      />
+      <div className={styles.field}>
+        <textarea
+          ref={attach}
+          className={styles.input}
+          rows={1}
+          value={props.value}
+          placeholder={props.placeholder}
+          aria-label={label}
+          aria-describedby={reasonShown ? sideId : undefined}
+          spellCheck
+          onChange={(event) => props.onValueChange(event.target.value)}
+          onKeyDown={onKeyDown}
+          onDragOver={ignoreFiles}
+          onDrop={ignoreFiles}
+        />
+        {props.value === '' ? (
+          <span className={styles.newLine}>
+            <kbd className={styles.keys}>
+              <ArrowBigUp size={12} strokeWidth={1.75} aria-hidden="true" />
+              <span className={styles.srOnly}>{CHAT.keyNames.shift}</span>{' '}
+              <CornerDownLeft size={12} strokeWidth={1.75} aria-hidden="true" />
+              <span className={styles.srOnly}>{CHAT.keyNames.enter}</span>
+            </kbd>{' '}
+            <span>{CHAT.newLine}</span>
+          </span>
+        ) : null}
+      </div>
       <div className={styles.tools}>
         <div ref={fit} className={styles.fit} data-side={side}>
           <div className={styles.toolsStart}>{props.tools}</div>
@@ -262,29 +250,18 @@ export function Composer(props: ComposerProps): ReactElement {
             </span>
           ) : side === 'count' ? (
             <span className={styles.count}>{counter}</span>
-          ) : side === 'hint' ? (
-            hint?.map((part) => (
-              <span key={part.label} className={styles.hint}>
-                <kbd className={styles.keys}>
-                  {part.keys.map((name, index) => (
-                    <Fragment key={`${name}${String(index)}`}>
-                      {index > 0 ? ' ' : null}
-                      <KeyGlyph name={name} />
-                    </Fragment>
-                  ))}
-                </kbd>{' '}
-                <span>{part.label}</span>
-              </span>
-            ))
           ) : null}
         </div>
-        <SendButton
-          phase={props.phase}
-          canSend={canSend}
-          reason={blank ? undefined : reason}
-          onSend={props.onSend}
-          onStop={props.onStop}
-        />
+        <div className={styles.end}>
+          {props.context !== undefined && side === 'none' ? <ContextRing context={props.context} /> : null}
+          <SendButton
+            phase={props.phase}
+            canSend={canSend}
+            reason={blank ? undefined : reason}
+            onSend={props.onSend}
+            onStop={props.onStop}
+          />
+        </div>
       </div>
     </form>
   );

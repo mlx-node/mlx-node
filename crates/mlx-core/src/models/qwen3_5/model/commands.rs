@@ -201,7 +201,7 @@ impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCo
 
 impl HybridSchedulerBackend for Qwen35Inner {
     type FamilyCommand = Qwen35FamilyCommand;
-    type RestoreTicket = crate::engine::hybrid_scheduler::NoRestoreTicket;
+    type RestoreTicket = super::restore::Qwen35Restore;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
 
@@ -224,8 +224,12 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.paged_adapter.as_mut()
     }
 
-    /// The turn's replay point leaves InUse when it closes.
+    /// The turn's replay point leaves InUse when it closes. Its DFlash2 lane
+    /// ends here, the first hook of a turn's end: the history checkpoint and
+    /// the parked owner state read the sequence's cells after this.
     fn scheduled_turn_closed(&mut self, seq_id: SeqId) {
+        self.drop_prefill_run(seq_id);
+        crate::models::qwen3_5::scheduled_dflash2::end_lane(self, seq_id);
         self.end_gdn_use(seq_id);
         self.dflash2_states.end_turn(seq_id);
     }
@@ -353,13 +357,15 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
 
     fn supports_scheduled_speculation(&self) -> bool {
-        self.has_mtp_weights()
+        self.has_speculative_weights()
             && self.paged_adapter.is_some()
             && self.config.recurrent_state_bytes() > 0
             && self.cached_rope_deltas.unwrap_or(0) == 0
-            && self.dflash2.is_none()
     }
     fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        if let Some(bytes) = crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self) {
+            return bytes;
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
             &self.config,
             total_tokens,
@@ -376,17 +382,83 @@ impl HybridSchedulerBackend for Qwen35Inner {
         Some(pool.lane.window.maximum())
     }
     fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
+        if let Some(bytes) = crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self) {
+            return bytes;
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
             &self.config,
             total_tokens,
         )
     }
+    fn scheduled_lane_state_bytes(&self) -> u64 {
+        crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self).unwrap_or(0)
+    }
+    fn prepare_contended_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        _owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        block_size: u32,
+    ) -> Result<
+        crate::engine::hybrid_scheduler::ScheduledPrefixAdmission<
+            Self::PrefixState,
+            Self::RestoreTicket,
+        >,
+    > {
+        self.prepare_parked_prefix(seq_id, tokens, reuse_cache, cache_salt, block_size)
+    }
+    fn poll_scheduled_restore(
+        &mut self,
+        _seq_id: SeqId,
+        restore: &mut Self::RestoreTicket,
+        uploads: &mut crate::transformer::paged_kv_cache_adapter::RestoreUploadBudget,
+        _prompt_tokens: &[u32],
+        _owner_history: &[u32],
+        _is_preemption_replay: bool,
+    ) -> Result<Option<crate::engine::hybrid_scheduler::ScheduledRestoreResult<Self::PrefixState>>>
+    {
+        self.poll_parked_restore(restore, uploads)
+    }
+    fn scheduled_restore_lands(restore: &Self::RestoreTicket) -> bool {
+        restore.lands()
+    }
+    fn land_scheduled_restore(
+        &mut self,
+        seq_id: SeqId,
+        restore: &mut Self::RestoreTicket,
+        prompt_tokens: &[u32],
+        _owner_history: &[u32],
+        _is_preemption_replay: bool,
+    ) -> Result<Option<crate::engine::hybrid_scheduler::ScheduledRestoreResult<Self::PrefixState>>>
+    {
+        self.land_parked_restore(seq_id, restore, prompt_tokens)
+    }
+    fn restore_reserved_blocks(restore: &Self::RestoreTicket) -> u32 {
+        restore.held_blocks()
+    }
+    fn scheduled_prefix_probe(&self, tokens: &[u32], cache_salt: u64) -> u32 {
+        crate::models::qwen3_5::dflash2_turn::stored_resume_depth(self, tokens, cache_salt)
+    }
+    fn scheduled_prefix_probe_generation(&self) -> u64 {
+        self.dflash2_states.store.generation()
+    }
+    /// On a draft load the sequence's DFlash2 lane, at any position: its
+    /// first prefill slice places the ring at the slice's start.
     fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
+        if let Some(draft) = self.dflash2.as_ref() {
+            self.dflash2_states.begin_lane(seq_id, &draft.config);
+            return Ok(true);
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
             self, seq_id, position,
         )
     }
     fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
+        if self.dflash2.is_some() && self.dflash2_states.seq_lanes.contains_key(&seq_id) {
+            return crate::models::qwen3_5::scheduled_dflash2::reserve_lane(self, seq_id);
+        }
         if queries > crate::models::qwen3_5::scheduled_mtp::MAX_DRAFTS + 1 {
             return Err(Error::from_reason(
                 "MTP reservation exceeds its maximum verifier width",
@@ -402,6 +474,9 @@ impl HybridSchedulerBackend for Qwen35Inner {
             Err(error) => Err(Error::from_reason(error)),
         }
     }
+    fn scheduled_sampled_rows(&self) -> bool {
+        self.dflash2.is_some()
+    }
     fn propose_scheduled(
         &mut self,
         seq_id: SeqId,
@@ -411,6 +486,11 @@ impl HybridSchedulerBackend for Qwen35Inner {
         rng: &mut dyn rand::Rng,
         _confidence: bool,
     ) -> Result<crate::engine::backend::DsparkProposal> {
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::scheduled_dflash2::propose(
+                self, seq_id, anchor, cap, params, rng,
+            );
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::propose_scheduled_mtp(
             self, seq_id, anchor, cap, params, rng,
         )
@@ -419,16 +499,24 @@ impl HybridSchedulerBackend for Qwen35Inner {
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
     ) -> Result<MxArray> {
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::scheduled_dflash2::verify(self, rows);
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::verify_scheduled_mtp(self, rows)
     }
     fn commit_scheduled_verify(
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
     ) -> Result<Vec<Result<()>>> {
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::scheduled_dflash2::commit(self, rows);
+        }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::commit_scheduled_mtp(self, rows)
     }
     fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.drop_prefill_run(seq_id);
         self.scheduled_mtp.release(seq_id);
+        crate::models::qwen3_5::scheduled_dflash2::end_lane(self, seq_id);
     }
 
     fn token_vocab_size(&self) -> u32 {
@@ -463,6 +551,12 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn scheduled_speculation_owners(&self) -> usize {
         self.scheduled_mtp.owner_count()
+            + self.dflash2_states.seq_lanes.len()
+            + self
+                .prefill_runs
+                .values()
+                .filter(|run| run.holds_decode_lane())
+                .count()
     }
 
     fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
@@ -486,7 +580,137 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
 
     fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.drop_prefill_run(seq_id);
         self.release_scheduled_recurrent_for(seq_id);
+    }
+
+    fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
+        self.drop_prefill_run(seq_id);
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return Ok(());
+        };
+        if adapter.block_table_for(seq_id).is_some() {
+            adapter
+                .release_request_for(seq_id)
+                .map(|_| ())
+                .map_err(Error::from_reason)?;
+        }
+        Ok(())
+    }
+
+    /// A unit in flight goes back to its start first: its booked rows are
+    /// not written in the layers it did not run, so none of them registers.
+    fn preempt_scheduled_cache(
+        &mut self,
+        seq_id: SeqId,
+        cache_salt: u64,
+        mode: crate::engine::scheduler::PreemptionMode,
+    ) -> Result<()> {
+        self.end_prefill_run(seq_id)?;
+        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            Error::from_reason(format!(
+                "{} cache manager is unavailable during preemption",
+                Self::SCHEDULER_NAME
+            ))
+        })?;
+        adapter
+            .register_full_blocks_for_reuse_for(
+                seq_id,
+                &[],
+                cache_salt,
+                mode == crate::engine::scheduler::PreemptionMode::Ssd,
+            )
+            .and_then(|_| adapter.release_request_for(seq_id).map(|_| ()))
+            .map_err(Error::from_reason)
+    }
+
+    /// A draft load's text prefills take the draft-lane path; a pass checks
+    /// the sequence's own path again.
+    fn prefill_runs_in_passes(&self, seq_id: SeqId) -> bool {
+        self.dflash2.is_some()
+            && !self.scheduled_mtp.owners.contains_key(&seq_id)
+            && self.cached_rope_deltas.unwrap_or(0) == 0
+    }
+
+    fn prefill_rows_done(&self, seq_id: SeqId) -> Option<u32> {
+        self.prefill_runs
+            .get(&seq_id)
+            .map(|run| run.driver.rows_done(self.config.num_layers as usize))
+    }
+
+    fn run_scheduled_prefill_pass(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        base: &Self::PrefixState,
+        start: usize,
+        end: usize,
+        generation_stream: Stream,
+        first_chunk: bool,
+        budget_ms: Option<f64>,
+    ) -> Result<crate::engine::hybrid_scheduler::ScheduledPrefillPass> {
+        use crate::engine::hybrid_scheduler::ScheduledPrefillPass;
+        #[cfg(test)]
+        let budget_ms = budget_ms.map(|ms| {
+            crate::models::qwen3_5::paged_forward::PREFILL_PASS_BUDGET_OVERRIDE
+                .with(std::cell::Cell::get)
+                .unwrap_or(ms)
+        });
+        let held = self.prefill_runs.contains_key(&seq_id);
+        if (budget_ms.is_none() && !held)
+            || !self.prefill_takes_passes(seq_id)
+            || self.draft_lane_turn()
+        {
+            self.end_prefill_run(seq_id)?;
+            return self
+                .run_scheduled_prefill_slice(
+                    seq_id,
+                    source,
+                    base,
+                    start,
+                    end,
+                    generation_stream,
+                    first_chunk,
+                )
+                .map(ScheduledPrefillPass::Done);
+        }
+        let prefix = self.build_scheduled_prefix(
+            base,
+            start,
+            end.saturating_sub(start),
+            source.to_vec(),
+            first_chunk,
+        );
+        self.dense_paged_prefill_pass(&prefix, start, end, budget_ms)
+    }
+
+    /// A draft lane's unit short of its source's end gives no logits (the
+    /// scheduler drops them): its last layer only stores its K/V.
+    fn run_scheduled_prefill_slice(
+        &mut self,
+        _seq_id: SeqId,
+        source: &[u32],
+        base: &Self::PrefixState,
+        start: usize,
+        end: usize,
+        generation_stream: Stream,
+        first_chunk: bool,
+    ) -> Result<Option<MxArray>> {
+        let prefix = self.build_scheduled_prefix(
+            base,
+            start,
+            end.saturating_sub(start),
+            source.to_vec(),
+            first_chunk,
+        );
+        if self.draft_lane_turn() {
+            return self
+                .paged_prefill(&source[start..end], &prefix, generation_stream)
+                .map(Some);
+        }
+        let end_output = crate::models::qwen3_5::paged_forward::unit_end_output(end, source.len());
+        self.dense_paged_prefill_unit(&source[start..end], &prefix, None, end_output)
+            .map(|(logits, _)| logits)
     }
 
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {

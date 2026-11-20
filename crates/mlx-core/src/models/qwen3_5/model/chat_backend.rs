@@ -280,8 +280,7 @@ impl ChatBackend for Qwen35Inner {
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
                 // DFlash2 verifies on the paged pool (Splash has no flat
-                // lane); the draft blocks scheduled speculation, so the lane
-                // is Barrier.
+                // lane); its text turns run as scheduled lanes.
                 supports_paged_attention: true,
                 supports_streaming: true,
             })

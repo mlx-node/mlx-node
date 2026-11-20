@@ -26,6 +26,7 @@ export const QUARANTINE_MESSAGE =
 const UNFINGERPRINTED_CONFIG: ReadonlySet<string> = new Set([
   'cacheOwnerId',
   'cacheRootOwnerId',
+  'clientSession',
   'modelAlias',
   'reportPerformance',
 ]);

@@ -139,7 +139,7 @@ mlx_array* mlx_paged_attention_forward_with_plan(
     int,
     int,
     uint8_t,
-    uint8_t, uint32_t grouped_stripes) {
+    uint8_t, uint32_t grouped_stripes, mlx_array*) {
   (void)grouped_stripes;
   return nullptr;
 }
@@ -166,8 +166,17 @@ mlx_array* mlx_paged_attention_varlen_forward(
     int,
     int,
     int,
-    uint8_t) {
+    uint8_t,
+    mlx_array*) {
   return nullptr;
+}
+
+bool mlx_paged_query_codes_forward(
+    mlx_array*, mlx_array*, uint32_t, float, mlx_array** out_codes,
+    mlx_array** out_score_scales) {
+  if (out_codes) *out_codes = nullptr;
+  if (out_score_scales) *out_score_scales = nullptr;
+  return false;
 }
 
 bool mlx_paged_kv_write_forward(
@@ -211,6 +220,7 @@ bool mlx_paged_prefill_attention_forward(
     int,
     int,
     uint8_t,
+    bool,
     float,
     mlx_array** out_attention,
     mlx_array** out_workspace) {

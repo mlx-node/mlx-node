@@ -4,6 +4,7 @@ import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  AGENT_IDLE_TIMEOUT_SECS,
   CHAT_ANSWER_TOKENS,
   CHAT_MAX_COMPLETION_TOKENS,
   chatAgentEnv,
@@ -71,6 +72,9 @@ describe('chatAgentEnv', () => {
         GROK_CURSOR_SKILLS_ENABLED: 'false',
         GROK_TURN_SUMMARY: '0',
         GROK_SESSION_SEARCH: '0',
+        GROK_WORKFLOWS: '0',
+        GROK_TWO_PASS_COMPACTION: '0',
+        GROK_COMPACTION_WALL_CLOCK_SECS: '0',
         GROK_CONFIG: '{"models":{"max_completion_tokens":20192}}',
       });
     } finally {
@@ -115,7 +119,11 @@ describe('workAgentEnv', () => {
     expect(env.GROK_IMAGE_EDIT).toBe('0');
     expect(env.GROK_RESUME_COMMAND).toBe('mlx agent');
     expect(env.GROK_TURN_SUMMARY).toBe('0');
-    expect(env.GROK_CONFIG).toBe('{"mine":true,"models":{"max_completion_tokens":28384}}');
+    expect(env.GROK_TWO_PASS_COMPACTION).toBe('0');
+    expect(env.GROK_COMPACTION_WALL_CLOCK_SECS).toBe('0');
+    expect(env.GROK_CONFIG).toBe(
+      '{"mine":true,"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}',
+    );
     expect(env).not.toHaveProperty('GROK_HOME');
     expect(env.FIRECRAWL_NO_SEARCH_FEEDBACK).toBe('1');
     expect(env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK).toBe('1');
@@ -130,6 +138,17 @@ describe('workAgentEnv', () => {
     }
   });
 
+  it('turns two-pass compaction and the compaction clock off, also over inherited values', () => {
+    const env = workAgentEnv({
+      base: { ...base, GROK_TWO_PASS_COMPACTION: '1', GROK_COMPACTION_WALL_CLOCK_SECS: '300' },
+      endpoint,
+      agentHome: null,
+      providerKeys: {},
+    });
+    expect([env.GROK_TWO_PASS_COMPACTION, env.GROK_COMPACTION_WALL_CLOCK_SECS]).toEqual(['0', '0']);
+    expect(AGENT_IDLE_TIMEOUT_SECS).toBe(3600);
+  });
+
   // Mutation: the cap is the answer room alone → red (16,384 and 8,192).
   it('caps each mode at its answer room plus the host thinking budget', () => {
     expect(AGENT_HOST_THINKING.tokenBudget).toBe(12_000);
@@ -141,12 +160,12 @@ describe('workAgentEnv', () => {
 
   it('caps output at 28,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
     const env = workAgentEnv({ base: { PATH: '/bin' }, endpoint, agentHome: '/custom/agent', providerKeys: {} });
-    expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384}}');
+    expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}');
     expect(env.GROK_HOME).toBe('/custom/agent');
   });
 
-  it("keeps the user's own overlay and puts the cap inside it; a value that is not an object is replaced", () => {
-    const cap = '{"models":{"max_completion_tokens":28384}}';
+  it("keeps the user's own overlay and puts the cap and the stall limit inside it; a value that is not an object is replaced", () => {
+    const cap = '{"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}';
     const rows: Array<[string | undefined, string]> = [
       [undefined, cap],
       ['', cap],
@@ -154,15 +173,44 @@ describe('workAgentEnv', () => {
       ['[1]', cap],
       ['null', cap],
       ['{"models":"x"}', cap],
-      ['{"features":{"a":true}}', '{"features":{"a":true},"models":{"max_completion_tokens":28384}}'],
+      [
+        '{"features":{"a":true}}',
+        '{"features":{"a":true},"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}',
+      ],
       [
         '{"models":{"default_reasoning_effort":"low","max_completion_tokens":99999}}',
-        '{"models":{"default_reasoning_effort":"low","max_completion_tokens":28384}}',
+        '{"models":{"default_reasoning_effort":"low","max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}',
       ],
-      ['{"models":{"max_completion_tokens":4096}}', '{"models":{"max_completion_tokens":4096}}'],
-      ['{"models":{"max_completion_tokens":20000}}', '{"models":{"max_completion_tokens":20000}}'],
+      [
+        '{"models":{"max_completion_tokens":4096}}',
+        '{"models":{"max_completion_tokens":4096,"inference_idle_timeout_secs":3600}}',
+      ],
+      [
+        '{"models":{"max_completion_tokens":20000}}',
+        '{"models":{"max_completion_tokens":20000,"inference_idle_timeout_secs":3600}}',
+      ],
       ['{"models":{"max_completion_tokens":0}}', cap],
       ['{"models":{"max_completion_tokens":"8"}}', cap],
+      [
+        '{"models":{"inference_idle_timeout_secs":7200}}',
+        '{"models":{"inference_idle_timeout_secs":7200,"max_completion_tokens":28384}}',
+      ],
+      [
+        '{"models":{"inference_idle_timeout_secs":60}}',
+        '{"models":{"inference_idle_timeout_secs":3600,"max_completion_tokens":28384}}',
+      ],
+      [
+        '{"models":{"inference_idle_timeout_secs":"x"}}',
+        '{"models":{"inference_idle_timeout_secs":3600,"max_completion_tokens":28384}}',
+      ],
+      [
+        '{"models":{"inference_idle_timeout_secs":3600.5}}',
+        '{"models":{"inference_idle_timeout_secs":3600,"max_completion_tokens":28384}}',
+      ],
+      [
+        '{"models":{"inference_idle_timeout_secs":0}}',
+        '{"models":{"inference_idle_timeout_secs":3600,"max_completion_tokens":28384}}',
+      ],
     ];
     for (const [base, want] of rows) {
       expect([base, workOverlay(base)]).toEqual([base, want]);

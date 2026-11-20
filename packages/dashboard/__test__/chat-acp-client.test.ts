@@ -9,11 +9,15 @@ import {
   type AcpClientHandlers,
 } from '../src/chat/acp/client.js';
 import {
+  readCompaction,
   readInitialize,
   readPermissionRequest,
   readSessionInfo,
   readSessionReply,
   readSessionUpdate,
+  readSpawnedChild,
+  readWorkflowStop,
+  readWorkflowUpdate,
 } from '../src/chat/acp/messages.js';
 
 function peer(handlers: AcpClientHandlers = {}): { client: AcpClient; sent: Array<Record<string, unknown>> } {
@@ -159,6 +163,7 @@ describe('message readers', () => {
       agentCapabilities: { loadSession: true, promptCapabilities: { image: false, embeddedContext: true } },
       _meta: {
         'x.ai/pluginDirs': true,
+        'x.ai/workflowControl': true,
         agentVersion: '1.0.45',
         modelState: {
           currentModelId: 'q',
@@ -173,9 +178,11 @@ describe('message readers', () => {
       loadSession: true,
       embeddedContext: true,
       pluginDirs: true,
+      workflowControl: true,
       agentVersion: '1.0.45',
       models: [{ modelId: 'q', contextTokens: 262144 }],
     });
+    expect(readInitialize({ _meta: { 'x.ai/workflowControl': 'true' } }).workflowControl).toBe(false);
     expect(readInitialize({ _meta: { modelState: { availableModels: [{ id: 'x' }] } } }).models).toBeNull();
     expect(readInitialize(null).models).toBeNull();
   });
@@ -213,6 +220,72 @@ describe('message readers', () => {
     });
   });
 
+  it('read the requester of a helper ask as the fork sends it; a present malformed one makes the request unreadable', () => {
+    const base = {
+      sessionId: 'parent',
+      toolCall: { toolCallId: 't', kind: 'execute', rawInput: { command: 'ls' } },
+      options: [{ optionId: 'allow-once', name: 'Allow', kind: 'allow_once' }],
+    };
+    const requester = { sessionId: 'child', label: 'researcher-0', runId: 'wf_1', cwd: '/work/repo' };
+    expect(readPermissionRequest(base)?.requester).toBeNull();
+    expect(
+      readPermissionRequest({ ...base, _meta: { hookAsk: { hookName: 'guard' }, 'x.ai/requester': requester } }),
+    ).toMatchObject({ sessionId: 'parent', hookAsk: { hookName: 'guard', reason: null }, requester });
+    expect(
+      readPermissionRequest({ ...base, _meta: { 'x.ai/requester': { ...requester, runId: null } } })?.requester,
+    ).toEqual({ ...requester, runId: null });
+    const junk: unknown[] = [
+      null,
+      'child',
+      [],
+      { ...requester, sessionId: '' },
+      { ...requester, sessionId: 7 },
+      { ...requester, label: undefined },
+      { ...requester, cwd: '' },
+      { ...requester, cwd: null },
+      { ...requester, runId: '' },
+      { ...requester, runId: 3 },
+      { sessionId: 'child', label: 'x', cwd: '/w' },
+    ];
+    for (const value of junk) {
+      expect(readPermissionRequest({ ...base, _meta: { 'x.ai/requester': value } })).toBeNull();
+    }
+  });
+
+  it('read a workflow update, a spawned child and the stop answer; other shapes are null', () => {
+    const update = {
+      sessionUpdate: 'workflow_updated',
+      run_id: 'wf_1',
+      revision: 3,
+      name: 'deep-research',
+      status: 'active',
+      phases: [],
+    };
+    expect(readWorkflowUpdate(update)).toEqual({ runId: 'wf_1', revision: 3, name: 'deep-research', status: 'active' });
+    expect(readWorkflowUpdate({ ...update, name: undefined })).toMatchObject({ name: '' });
+    for (const bad of [
+      { ...update, sessionUpdate: 'workflow_started' },
+      { ...update, run_id: '' },
+      { ...update, run_id: 1 },
+      { ...update, revision: -1 },
+      { ...update, revision: 1.5 },
+      { ...update, revision: '3' },
+      { ...update, status: '' },
+      { ...update, status: null },
+    ]) {
+      expect(readWorkflowUpdate(bad)).toBeNull();
+    }
+    expect(readSpawnedChild({ sessionUpdate: 'subagent_spawned', child_session_id: 'c1' })).toBe('c1');
+    expect(readSpawnedChild({ sessionUpdate: 'subagent_spawned', child_session_id: '' })).toBeNull();
+    expect(readSpawnedChild({ sessionUpdate: 'subagent_finished', child_session_id: 'c1' })).toBeNull();
+    expect(readWorkflowStop({ outcome: 'stopped', runId: 'wf_1', name: 'deep-research' })).toBe('stopped');
+    expect(readWorkflowStop({ outcome: 'rejected', code: 'workflow_control_unknown_run', detail: 'x' })).toBe(
+      'rejected',
+    );
+    expect(readWorkflowStop({ outcome: 'Stopped' })).toBeNull();
+    expect(readWorkflowStop(null)).toBeNull();
+  });
+
   it('read updates from the three methods and nothing else', () => {
     const params = { sessionId: 's', update: { sessionUpdate: 'x' } };
     expect(readSessionUpdate('session/update', params)?.xai).toBe(false);
@@ -220,5 +293,67 @@ describe('message readers', () => {
     expect(readSessionUpdate('_x.ai/session/update', params)?.xai).toBe(true);
     expect(readSessionUpdate('_x.ai/mcp/server_status', params)).toBeNull();
     expect(readSessionUpdate('session/update', { update: { sessionUpdate: 'x' } })).toBeNull();
+  });
+
+  it("read the agent's four compaction updates as the fork sends them, and junk counts as null", () => {
+    expect(
+      readCompaction({
+        sessionUpdate: 'auto_compact_started',
+        tokens_used: 222_822,
+        context_window: 262_144,
+        percentage: 85,
+        reason: 'Context window 85% full',
+      }),
+    ).toEqual({ kind: 'started', tokensUsed: 222_822, contextWindow: 262_144 });
+    expect(
+      readCompaction({
+        sessionUpdate: 'auto_compact_completed',
+        tokens_before: 222_822,
+        tokens_after: 31_204,
+        elapsed_ms: 1_221_000,
+        summary_preview: null,
+      }),
+    ).toEqual({ kind: 'completed', tokensBefore: 222_822, tokensAfter: 31_204, elapsedMs: 1_221_000 });
+    // Manual `/compact`: tokens_before and elapsed_ms may be missing.
+    expect(readCompaction({ sessionUpdate: 'auto_compact_completed', tokens_after: 9 })).toEqual({
+      kind: 'completed',
+      tokensBefore: null,
+      tokensAfter: 9,
+      elapsedMs: null,
+    });
+    expect(
+      readCompaction({
+        sessionUpdate: 'auto_compact_failed',
+        error: "it'll retry on the next turn, or start a new session using /new.\nstream idle timeout after 600s",
+      }),
+    ).toEqual({
+      kind: 'failed',
+      error: "it'll retry on the next turn, or start a new session using /new.\nstream idle timeout after 600s",
+      retry: true,
+    });
+    expect(
+      readCompaction({ sessionUpdate: 'auto_compact_failed', error: 'this conversation is too large to compact.' }),
+    ).toEqual({ kind: 'failed', error: 'this conversation is too large to compact.', retry: false });
+    expect(readCompaction({ sessionUpdate: 'auto_compact_cancelled', reason: 'user_cancelled' })).toEqual({
+      kind: 'cancelled',
+    });
+    expect(
+      readCompaction({ sessionUpdate: 'auto_compact_started', tokens_used: -1, context_window: '262144' }),
+    ).toEqual({ kind: 'started', tokensUsed: null, contextWindow: null });
+    expect(
+      readCompaction({
+        sessionUpdate: 'auto_compact_completed',
+        tokens_before: 1.5,
+        tokens_after: null,
+        elapsed_ms: {},
+      }),
+    ).toEqual({ kind: 'completed', tokensBefore: null, tokensAfter: null, elapsedMs: null });
+    expect(readCompaction({ sessionUpdate: 'auto_compact_failed', error: 7 })).toEqual({
+      kind: 'failed',
+      error: '',
+      retry: false,
+    });
+    expect(readCompaction({ sessionUpdate: 'memory_flush_started' })).toBeNull();
+    expect(readCompaction({ sessionUpdate: 'auto_continue_completed', total_tokens: 1 })).toBeNull();
   });
 });

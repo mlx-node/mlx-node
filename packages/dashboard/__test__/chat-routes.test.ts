@@ -155,6 +155,7 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/conversations',
       'main POST /api/chat/conversations/:id/prompt',
       'main POST /api/chat/conversations/:id/cancel',
+      'main POST /api/chat/conversations/:id/runs/:runId/stop',
       'main POST /api/chat/conversations/:id/interactions/:iid',
       'main POST /api/chat/conversations/:id/permission-mode',
       'main POST /api/chat/drafts/:draft/permission-mode',

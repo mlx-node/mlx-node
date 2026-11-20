@@ -313,11 +313,17 @@ constexpr int default_group_size(Mode mode) {
                                                                        : 32;
 }
 
+// `lane_tiers`: x is 16, 24 or 32 rows, each block of 8 a lane that must get
+// the bits an 8-row call gives it alone (lane_tier_available asks first; a
+// shape the tier cannot hold throws at eval). Rows whose own 8-row call does
+// not take the tier (x at a byte offset not divisible by 8) run that call per
+// lane.
 array quantized_matmul(const array &x, const array &w, const array &scales,
                        const std::optional<array> &biases, bool transpose,
                        std::optional<int> group_size, std::optional<int> bits,
                        Mode mode, StreamOrDevice s = {},
-                       Layout layout = Layout::RowMajor);
+                       Layout layout = Layout::RowMajor,
+                       bool lane_tiers = false);
 
 array gather_qmm(const array &x, const array &w, const array &scales,
                  const std::optional<array> &biases,
@@ -354,19 +360,66 @@ bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine);
 // shape, or MLX_QMM_SPLITK_MIN_M); 0 without Metal. For the route tests.
 // Shared policy/workspace for independently formatted projection segments.
 int tiled_projection_splits(int N, int K);
+int kquant_tiled_splits(int N, int K, int cores);
 bool tiled_projection_spread(const Stream& stream);
 array tiled_projection_counters(const Stream& stream, int tiles);
 int tiled_qmv_vector_limit(int K, int N);
+// Whether a Tiled64 bfloat16 x @ w.T of (N, K) in `mode` takes the 8-row
+// tensor-op tier at M = 8 on this device, so its 16/32-row tier gives each
+// lane of 8 rows that call's bits. False without Metal or NAX.
+bool lane_tier_available(Mode mode, int N, int K);
 
 void prepared_sg8_matmul_eval(const std::vector<array>& inputs, array& out,
                               const Stream& stream);
 
+// What the store of the Tiled64 tensor-op GEMM does with its operand `aux`
+// (shaped as the output): `aux + y`, or `sigmoid(aux) * aux * y` with the
+// gate as aux. The values are the separate ops' bits (kquant_nax.h).
+enum class StoreEpilogue { Residual = 1, Swiglu = 2 };
+
+// Whether a bfloat16 x @ w.T of (M, N, K) on a Tiled64 `mode` weight runs
+// the plain KQuantMatmul on the tensor-op GEMM (qmm_t_nax_t64) on this
+// device, and the mode has the epilogue kernels: the only shapes the
+// epilogue op accepts, since it must give the plain GEMM's sums. Defined in
+// Metal builds only.
+bool store_epilogue_route(Mode mode, int M, int N, int K);
+
+// x @ w.T on a Tiled64 weight with `epilogue` in the GEMM store, or nullopt
+// when store_epilogue_route refuses the shapes, the dtypes are not bfloat16,
+// or aux is not shaped as the output.
+std::optional<array> quantized_matmul_epilogue(
+    const array &x, const array &w, const array &scales, const array &biases,
+    const array &aux, Mode mode, StoreEpilogue epilogue);
+
+class KQuantMatmulEpilogue : public UnaryPrimitive {
+public:
+  KQuantMatmulEpilogue(Stream stream, int group_size, int bits, Mode mode,
+                       StoreEpilogue epilogue)
+      : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
+        mode_(mode), epilogue_(epilogue) {}
+
+  void eval_cpu(const std::vector<array> &inputs, array &out) override;
+  void eval_gpu(const std::vector<array> &inputs, array &out) override;
+
+  DEFINE_NAME(KQuantMatmulEpilogue)
+  bool is_equivalent(const Primitive &other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array> &inputs) override;
+
+private:
+  int group_size_;
+  int bits_;
+  Mode mode_;
+  StoreEpilogue epilogue_;
+};
+
 class KQuantMatmul : public UnaryPrimitive {
 public:
   KQuantMatmul(Stream stream, int group_size, int bits, Mode mode,
-               bool transpose, Layout layout = Layout::RowMajor)
+               bool transpose, Layout layout = Layout::RowMajor,
+               bool lane_tiers = false)
       : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
-        mode_(mode), transpose_(transpose), layout_(layout) {}
+        mode_(mode), transpose_(transpose), layout_(layout),
+        lane_tiers_(lane_tiers) {}
 
   void eval_cpu(const std::vector<array> &inputs, array &out) override;
   void eval_gpu(const std::vector<array> &inputs, array &out) override;
@@ -381,6 +434,7 @@ private:
   Mode mode_;
   bool transpose_;
   Layout layout_;
+  bool lane_tiers_;
 };
 
 class KQuantGatherQMM : public UnaryPrimitive {

@@ -10,7 +10,13 @@ mod speculative;
 #[cfg(all(test, target_os = "macos"))]
 mod lane_wave_tests;
 #[cfg(all(test, target_os = "macos"))]
+mod part_page_restore_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod pass_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod progress_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod restore_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,11 +65,16 @@ use crate::sampling::{check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext, WiredResidency};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::BlockRefusal;
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, RestoreUploadBudget, SeqId};
 
 /// Uninhabited restore ticket used by cache managers whose prefix restore is
 /// synchronous on the model thread.
 pub(crate) enum NoRestoreTicket {}
+
+/// Model-thread time a drive pass may spend on prefix work (starts,
+/// restore uploads and landings, the state tier's tick) beside a running
+/// lane before it starts no further prefix unit.
+const PREFIX_PASS_MS: f64 = 50.0;
 
 pub(crate) enum ScheduledPrefixAdmission<P, R> {
     Ready(P),
@@ -154,6 +165,15 @@ pub(crate) struct ScheduledVerifyCommit {
     pub keep: usize,
 }
 
+/// What one prefill pass of a unit left.
+pub(crate) enum ScheduledPrefillPass {
+    /// The unit stopped between its layers; its rows are not computed yet.
+    Paused,
+    /// The unit ran to its end; the logits of its last row, for a family
+    /// that gives them.
+    Done(Option<MxArray>),
+}
+
 /// Family capabilities required by the shared hybrid scheduler lifecycle.
 ///
 /// This mirrors vLLM's scheduler/cache-manager boundary: the engine owns
@@ -182,9 +202,11 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduled_turn_opened(&mut self, _seq_id: SeqId) {}
     fn scheduled_turn_closed(&mut self, _seq_id: SeqId) {}
     /// The family prefills this prompt (`prompt_tokens`, `cached_prefix` of
-    /// them cached) as one group of windows: its prefill is one slice and
-    /// one step, the step's only prefill row, outside the token budget.
-    /// Read with the slice grid at admission and at every re-pin.
+    /// them cached) in groups of windows: each slice (its
+    /// `scheduler_prefill_ends`, else the whole prompt) is one step, the
+    /// step's only prefill row, outside the token budget. Read with the ends
+    /// at admission, at every re-pin, and for every whole-flagged prefill
+    /// when another turn is admitted.
     fn scheduler_whole_prompt_prefill(&self, _prompt_tokens: u32, _cached_prefix: u32) -> bool {
         false
     }
@@ -440,6 +462,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
         false
     }
+    /// Whether the target rows of this backend's sampled, unpenalized
+    /// speculative lanes come from the device row kernels
+    /// ([`engine::dspark_turn::submit_sampled_rows`]).
+    fn scheduled_sampled_rows(&self) -> bool {
+        false
+    }
     fn scheduled_verification_budget(
         &mut self,
     ) -> Option<&mut engine::verification_budget::ScheduledVerificationBudget> {
@@ -456,6 +484,13 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// prefill holds.
     fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
         self.scheduled_draft_state_bytes(total_tokens)
+    }
+    /// Draft state a speculative lane allocates whole at its first verify
+    /// (its second GDN cell and pending tape): its admission's reservation
+    /// of these bytes is held until that verify's step ran. 0 when a turn's
+    /// draft state grows with its tokens, claimed step by step.
+    fn scheduled_lane_state_bytes(&self) -> u64 {
+        0
     }
     /// A family whose recurrent rows and draft snapshots live outside the
     /// paged pool budgets them here and charges nothing to the pool through
@@ -480,6 +515,17 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// Off-pool state `seq_id` holds now; a live turn's reservation is charged
     /// only beyond this.
     fn scheduled_state_held_bytes(&self, _seq_id: SeqId) -> u64 {
+        0
+    }
+    /// The rows of `tokens` a scheduled start that reuses the cache resumes
+    /// at from a stored state, read only. It ranks the start for admission
+    /// and nothing else: what the start books is unchanged.
+    fn scheduled_prefix_probe(&self, _tokens: &[u32], _cache_salt: u64) -> u32 {
+        0
+    }
+    /// Unchanged between two reads only when
+    /// [`Self::scheduled_prefix_probe`]'s answers are.
+    fn scheduled_prefix_probe_generation(&self) -> u64 {
         0
     }
     /// Return false when this prefix cannot seed complete draft state. The
@@ -560,6 +606,40 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         self.paged_prefill(&source[start..end], &prefix, generation_stream)
             .map(Some)
     }
+    /// Whether `seq_id`'s contended prefill units run in passes of a few
+    /// layers (Splash `PassCommand`), decode steps between them.
+    fn prefill_runs_in_passes(&self, _seq_id: SeqId) -> bool {
+        false
+    }
+    /// The rows of `seq_id`'s paused unit its passes ran, by layers done.
+    fn prefill_rows_done(&self, _seq_id: SeqId) -> Option<u32> {
+        None
+    }
+    /// One pass of the prefill unit `[start, end)`, within `budget_ms`; to
+    /// the unit's end without one. A family without passes runs the slice.
+    #[allow(clippy::too_many_arguments)]
+    fn run_scheduled_prefill_pass(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        base: &Self::PrefixState,
+        start: usize,
+        end: usize,
+        generation_stream: Stream,
+        first_chunk: bool,
+        _budget_ms: Option<f64>,
+    ) -> Result<ScheduledPrefillPass> {
+        self.run_scheduled_prefill_slice(
+            seq_id,
+            source,
+            base,
+            start,
+            end,
+            generation_stream,
+            first_chunk,
+        )
+        .map(ScheduledPrefillPass::Done)
+    }
     /// Called after the sampled GPU values have materialized, before host
     /// result handling. Forced tokens and failed samples do not qualify.
     fn observe_scheduled_decode_batch(&mut self, _completed: bool) {}
@@ -580,7 +660,50 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         self.prime_prefix_state(tokens, reuse_cache, block_size as usize, &[], cache_salt)
             .map(ScheduledPrefixAdmission::Ready)
     }
+    /// A start's prefix while other turns are admitted on the model: a
+    /// family that restores beside them without holding the model thread
+    /// parks the turn here. A lone start takes
+    /// [`Self::prepare_scheduled_prefix`].
+    fn prepare_contended_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        block_size: u32,
+    ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+        self.prepare_scheduled_prefix(
+            seq_id,
+            tokens,
+            owner_history,
+            reuse_cache,
+            cache_salt,
+            block_size,
+        )
+    }
+    /// One poll of a parked restore; `uploads` is the pass's upload budget,
+    /// shared by every restore the pass polls.
     fn poll_scheduled_restore(
+        &mut self,
+        _seq_id: SeqId,
+        _restore: &mut Self::RestoreTicket,
+        _uploads: &mut RestoreUploadBudget,
+        _prompt_tokens: &[u32],
+        _owner_history: &[u32],
+        _is_preemption_replay: bool,
+    ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
+        Ok(None)
+    }
+    /// The restore's data is in place and its turn lands through
+    /// [`Self::land_scheduled_restore`], in the turn's own context.
+    fn scheduled_restore_lands(_restore: &Self::RestoreTicket) -> bool {
+        false
+    }
+    /// The landing of a restore whose data is in place, run with the
+    /// turn's sequence active and its admission context installed;
+    /// `Ok(None)` leaves it parked.
+    fn land_scheduled_restore(
         &mut self,
         _seq_id: SeqId,
         _restore: &mut Self::RestoreTicket,
@@ -588,7 +711,10 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         _owner_history: &[u32],
         _is_preemption_replay: bool,
     ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
-        Ok(None)
+        Err(Error::from_reason(format!(
+            "{} has no restore landing",
+            Self::SCHEDULER_NAME
+        )))
     }
     fn restore_reserved_blocks(_restore: &Self::RestoreTicket) -> u32 {
         0
@@ -1080,6 +1206,14 @@ impl ScheduledReply {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The base seed of this thread's speculative lanes: a lane's rng is then
+    /// a function of it and the owner id.
+    pub(crate) static TEST_LANE_SEED: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(crate) struct ScheduledTurn<P> {
     pub(crate) owner_id: String,
     pub(crate) scheduled_speculation: Option<rand::rngs::StdRng>,
@@ -1127,6 +1261,10 @@ pub(crate) struct ScheduledTurn<P> {
     /// The GDN cell its admission reserved, held until its first step ran
     /// (the cell's arrays are allocated lazily).
     pub(crate) cell: Option<Reservation<'static>>,
+    /// The lane state its admission reserved
+    /// ([`HybridSchedulerBackend::scheduled_lane_state_bytes`]), held from
+    /// its first step until its first decode step ran.
+    pub(crate) draft_lane: Option<Reservation<'static>>,
     pub(crate) clock: TurnClock,
 }
 
@@ -1222,6 +1360,17 @@ struct PreparedTurn {
     order: Option<u64>,
     /// Splash `Request::overtaken` while it is held.
     overtaken: u32,
+    /// The last stored-state probe of its prompt: hashing a long prompt's
+    /// chain on every admission pass is the cost the generation saves.
+    stored_prefix: std::cell::Cell<Option<ProbedPrefix>>,
+}
+
+/// [`HybridSchedulerBackend::scheduled_prefix_probe`]'s answer at one
+/// generation.
+#[derive(Clone, Copy)]
+struct ProbedPrefix {
+    generation: u64,
+    tokens: u32,
 }
 
 /// Who a prepared turn answers and the sequence it runs as.
@@ -1281,6 +1430,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             finished: false,
             allocation_blocked: true,
             prefill_micros: 0,
+            prefill_in_flight: false,
         }
     }
 
@@ -1317,6 +1467,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             finished: true,
             allocation_blocked: false,
             prefill_micros: 0,
+            prefill_in_flight: false,
         }
     }
 
@@ -1375,6 +1526,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         &mut self,
         row: &engine::scheduler::StepRow,
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
+        pass_ms: Option<u32>,
     ) -> Result<RowStepResult> {
         if row.cancel_snapshot {
             if stop_vacates(turn) {
@@ -1417,18 +1569,24 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             |replay| replay.cached_prefix as usize,
         );
         let first_chunk = start == cached_prefix;
+        // A unit a pass started did its once-only work on that pass.
+        let unit_started = turn.prefill_unit == Some((row.token_start, row.num_tokens));
+        let budget_ms = pass_ms.filter(|_| turn.prefill_passes).map(f64::from);
         let progress = turn
             .payload
             .response
             .sink()
             .and_then(|sink| sink.progress());
-        if first_chunk && let Some(progress) = progress {
+        if first_chunk
+            && !unit_started
+            && let Some(progress) = progress
+        {
             progress.begin_prefill(
                 source_len.saturating_sub(cached_prefix) as u32,
                 cached_prefix as u32,
             );
         }
-        if first_chunk && turn.payload.scheduled_speculation.is_some() {
+        if first_chunk && !unit_started && turn.payload.scheduled_speculation.is_some() {
             match self
                 .inner
                 .begin_scheduled_speculation(row.seq_id, start as u32)
@@ -1451,7 +1609,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             .map_or(turn.payload.prompt_tokens.as_slice(), |replay| {
                 replay.tokens.as_slice()
             });
-        let logits = match self.inner.run_scheduled_prefill_slice(
+        let logits = match self.inner.run_scheduled_prefill_pass(
             row.seq_id,
             source,
             &turn.payload.prefix,
@@ -1459,8 +1617,33 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             end,
             turn.payload.generation_stream,
             first_chunk,
+            budget_ms,
         ) {
-            Ok(logits) => logits,
+            Ok(ScheduledPrefillPass::Done(logits)) => logits,
+            Ok(ScheduledPrefillPass::Paused) => {
+                turn.payload.profiler.end_prefill();
+                if let Some(progress) = turn
+                    .payload
+                    .response
+                    .sink()
+                    .and_then(|sink| sink.progress())
+                    && let Some(done) = self.inner.prefill_rows_done(row.seq_id)
+                {
+                    progress.prefill_advanced(
+                        (start + done as usize).saturating_sub(cached_prefix) as u32,
+                    );
+                }
+                return Ok(RowStepResult {
+                    seq_id: row.seq_id,
+                    num_computed_tokens: 0,
+                    generated_token: None,
+                    speculative: None,
+                    finished: false,
+                    allocation_blocked: false,
+                    prefill_micros: Self::elapsed_micros(started),
+                    prefill_in_flight: true,
+                });
+            }
             Err(error) if is_paged_allocation_blocked(&error.reason) => {
                 turn.payload.profiler.end_prefill();
                 return Ok(Self::blocked(row));
@@ -1499,6 +1682,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 finished: false,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
+                prefill_in_flight: false,
             });
         }
         if turn
@@ -1521,6 +1705,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 finished: false,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
+                prefill_in_flight: false,
             });
         }
         turn.payload.preemption_replay = None;
@@ -1549,6 +1734,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             ) {
             crate::sampling::sampling_distribution(&logits, config)
                 .and_then(|distribution| distribution.astype(crate::array::DType::Float32))
+                .and_then(one_sampling_row)
                 .and_then(|distribution| {
                     crate::sampling::sample_dense_distribution_array(&distribution, rng)
                 })
@@ -1600,6 +1786,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 finished: true,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
+                prefill_in_flight: false,
             });
         }
         let token = match sampled.item_at_int32(0) {
@@ -1621,6 +1808,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             finished: false,
             allocation_blocked: false,
             prefill_micros: Self::elapsed_micros(started),
+            prefill_in_flight: false,
         })
     }
 
@@ -1974,6 +2162,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     finished,
                     allocation_blocked: false,
                     prefill_micros: 0,
+                    prefill_in_flight: false,
                 },
             ));
         }
@@ -2029,7 +2218,7 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
             let _request = Self::request_scope(turn);
             prefill_started.get_or_insert_with(Instant::now);
             rows[index] = Some(
-                self.execute_prefill(planned, turn)
+                self.execute_prefill(planned, turn, plan.prefill_pass_ms)
                     .unwrap_or_else(|error| Self::fail(turn, planned, error)),
             );
         }
@@ -2350,6 +2539,15 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// turn is still preparing.
     #[cfg(test)]
     after_prefix_prepare: Option<Box<dyn FnMut() + Send>>,
+    /// Runs right after each parked restore's landing.
+    #[cfg(test)]
+    after_restore_landing: Option<Box<dyn FnMut() + Send>>,
+    /// Runs right after each poll of a parked restore that reads.
+    #[cfg(test)]
+    after_restore_poll: Option<Box<dyn FnMut() + Send>>,
+    /// Runs right after each pass's state tier tick.
+    #[cfg(test)]
+    after_state_tick: Option<Box<dyn FnMut() + Send>>,
     /// The next step that plans rows fails in its executor with this text.
     #[cfg(test)]
     step_failure: Option<&'static str>,
@@ -2359,6 +2557,14 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// it ran.
     pass_start: f64,
     pass_work: PassWork,
+    /// The current pass's prefix work beside a running lane, in ms on the
+    /// governor's clock, and the restore uploads it may still
+    /// make.
+    prefix_spent_ms: f64,
+    restore_uploads: RestoreUploadBudget,
+    /// Starts that took the contended prefix path.
+    #[cfg(test)]
+    contended_prepares: u32,
     /// What held the requests that have no claim and no row yet.
     timeline: Timeline,
     /// When the model's accounts are next published.
@@ -2438,9 +2644,10 @@ pub(crate) fn next_command_pages<P>(
         .sum()
 }
 
-/// The pinned prefill ends of one prompt and whether the family runs it as
-/// one whole-prompt step (then the grid is the one end `prompt`).
-fn prefill_breaks<B: HybridSchedulerBackend>(
+/// The pinned prefill ends of one prompt and whether the family runs each
+/// slice as one step outside the budget: the family's own ends when it fixes
+/// them, else the slice grid (for a whole prompt the one end `prompt`).
+pub(crate) fn prefill_breaks<B: HybridSchedulerBackend>(
     inner: &B,
     seq_id: SeqId,
     cached_prefix: u32,
@@ -2448,13 +2655,12 @@ fn prefill_breaks<B: HybridSchedulerBackend>(
     extra_breaks: Vec<u32>,
 ) -> (Vec<u32>, bool) {
     let whole = inner.scheduler_whole_prompt_prefill(prompt_tokens, cached_prefix);
-    if !whole
-        && let Some(ends) = inner.scheduler_prefill_ends(seq_id, prompt_tokens, cached_prefix)
+    if let Some(ends) = inner.scheduler_prefill_ends(seq_id, prompt_tokens, cached_prefix)
         && ends.last() == Some(&prompt_tokens)
         && ends.first().is_some_and(|&end| end > cached_prefix)
         && ends.windows(2).all(|pair| pair[0] < pair[1])
     {
-        return (ends, false);
+        return (ends, whole);
     }
     let slice = if whole {
         u32::MAX
@@ -2465,6 +2671,46 @@ fn prefill_breaks<B: HybridSchedulerBackend>(
         prefill_slice_ends(cached_prefix, prompt_tokens, slice, extra_breaks),
         whole,
     )
+}
+
+/// A final prefill slice's sampling distribution as the one row the dense
+/// draw takes: `[1, .., 1, vocab]` becomes `[vocab]`. Any other shape stays,
+/// so the draw refuses it instead of drawing an id past the vocabulary.
+fn one_sampling_row(distribution: MxArray) -> Result<MxArray> {
+    let shape = distribution.shape()?.as_ref().to_vec();
+    match shape.split_last() {
+        Some((&vocab, leading)) if !leading.is_empty() && leading.iter().all(|&dim| dim == 1) => {
+            distribution.reshape(&[vocab])
+        }
+        _ => Ok(distribution),
+    }
+}
+
+/// Pins again the rest of every queued or running prefill flagged whole,
+/// from where it stands: the family reads the turns open now, so a turn
+/// pinned to whole slices while it was the only one gives them up once
+/// another opens, and the newcomer's prefill rows wait for the slice in
+/// flight, not for the whole prompt.
+pub(crate) fn repin_whole_prefills<'a, B: HybridSchedulerBackend, P: 'a>(
+    inner: &B,
+    turns: impl Iterator<Item = &'a mut TurnState<P>>,
+) {
+    for turn in turns {
+        if !turn.whole_prompt_prefill
+            || turn.num_computed_tokens >= turn.prompt_tokens
+            || !matches!(turn.status, TurnStatus::Waiting | TurnStatus::Running)
+        {
+            continue;
+        }
+        let extra_breaks = std::mem::take(&mut turn.pinned_prefill_breaks);
+        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
+            inner,
+            turn.seq_id,
+            turn.num_computed_tokens,
+            turn.prompt_tokens,
+            extra_breaks,
+        );
+    }
 }
 
 impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
@@ -2534,10 +2780,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             #[cfg(test)]
             after_prefix_prepare: None,
             #[cfg(test)]
+            after_restore_landing: None,
+            #[cfg(test)]
+            after_restore_poll: None,
+            #[cfg(test)]
+            after_state_tick: None,
+            #[cfg(test)]
             step_failure: None,
             stopped: None,
             pass_start: 0.0,
             pass_work: PassWork::default(),
+            prefix_spent_ms: 0.0,
+            restore_uploads: RestoreUploadBudget::per_pass(),
+            #[cfg(test)]
+            contended_prepares: 0,
             timeline: Timeline::default(),
             accounts_due: 0.0,
             next_seq_id: 1,
@@ -3064,6 +3320,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             held: false,
             order: None,
             overtaken: 0,
+            stored_prefix: std::cell::Cell::new(None),
         }))
     }
 
@@ -3239,6 +3496,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     #[cfg(test)]
     pub(crate) fn enable_continuous_batching(&mut self) {
         self.enabled = true;
+    }
+
+    /// Every turn runs whole in the exclusive lane, as under
+    /// `MLX_SERVE_FORCE_SERIAL=1`.
+    #[cfg(test)]
+    pub(crate) fn serve_whole_turns(&mut self) {
+        self.enabled = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_stats(&self) -> &crate::engine::scheduler::SchedulerStats {
+        self.scheduler.stats()
     }
 
     #[cfg(test)]
@@ -3649,6 +3918,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         // A lane vacated before its first step drops its admission's cell
         // bytes: its resume reserves them again.
         turn.payload.cell = None;
+        turn.payload.draft_lane = None;
         turn.resume_target = target;
         defer_resource_retry(
             &mut turn.resource_wait,
@@ -3770,6 +4040,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 0
             };
+            let lane_bytes = if speculative {
+                self.inner.scheduled_lane_state_bytes()
+            } else {
+                0
+            };
             let seq_id = row.seq_id;
             let mut units = SchedUnits {
                 state: &mut *self,
@@ -3811,7 +4086,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 if let Some(Ok(reservation)) = admission.state.map(|state| state.0) {
                     claims.reservations.push(reservation);
                 }
-                claims.reservations.extend(turn.payload.cell.take());
+                if let Some(mut cell) = turn.payload.cell.take() {
+                    if lane_bytes > 0 {
+                        turn.payload.draft_lane = Some(cell.split_off(lane_bytes));
+                    }
+                    claims.reservations.push(cell);
+                }
+                if row.kind == StepKind::Decode {
+                    claims.reservations.extend(turn.payload.draft_lane.take());
+                }
                 claims.grants.push(None);
             }
         }
@@ -3854,8 +4137,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Splash `Engine::admit`'s state claim: the GDN cell `seq_id`
     /// activates and, for a speculative lane, its draft state's fixed part
     /// (Splash `CompositeStateLayout::laneBytes`), a bytes reservation (the
-    /// arrays are allocated lazily). `None` when the request's row is live
-    /// already.
+    /// arrays are allocated lazily). A live row reserves only the lane state
+    /// its lane allocates again
+    /// ([`HybridSchedulerBackend::scheduled_lane_state_bytes`]); `None`
+    /// when it needs none.
     fn claim_cell(
         &mut self,
         seq_id: SeqId,
@@ -3865,15 +4150,26 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         hold_ended: bool,
         speculative: bool,
     ) -> Option<crate::engine::governor::allocate::Allocation<StateAdmission<'static>>> {
-        if self.inner.has_scheduled_recurrent(seq_id) {
-            return None;
-        }
-        let draft = if speculative {
-            self.inner.scheduled_draft_state_held_bytes(0)
+        let lane = if speculative {
+            self.inner.scheduled_lane_state_bytes()
         } else {
             0
         };
-        let bytes = self.inner.recurrent_state_bytes().saturating_add(draft);
+        let bytes = if self.inner.has_scheduled_recurrent(seq_id) {
+            if lane == 0 {
+                return None;
+            }
+            lane
+        } else {
+            let draft = if lane > 0 {
+                lane
+            } else if speculative {
+                self.inner.scheduled_draft_state_held_bytes(0)
+            } else {
+                0
+            };
+            self.inner.recurrent_state_bytes().saturating_add(draft)
+        };
         let governor = claim.governor;
         let mut units = SchedUnits {
             state: &mut *self,
@@ -5082,19 +5378,47 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 
     /// Whether the scheduler holds the prepared start back
     /// (`Scheduler::prefillAdmissionOrder`), which Splash ranks by its
-    /// cached tokens: a live continuation's are the ones it keeps.
+    /// cached tokens: a live continuation's are the ones it keeps, a start
+    /// on a stored state's the ones it resumes at.
     fn admission_waits(&self, prepared: &PreparedTurn) -> bool {
         let tokens = &prepared.admitted.tokens;
         let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
-        let cached = live_held_prefix(self.inner.paged_adapter(), prepared.seq_id, tokens, reuse)
-            .unwrap_or(0);
+        let live = live_held_prefix(self.inner.paged_adapter(), prepared.seq_id, tokens, reuse)
+            .map_or(0, |kept| u32::try_from(kept).unwrap_or(u32::MAX));
+        let stored = if reuse {
+            self.stored_prefix(prepared)
+        } else {
+            0
+        };
         !self.scheduler.serves_candidate(
             prepared.seq_id,
-            u32::try_from(cached).unwrap_or(u32::MAX),
+            live.max(stored),
             u32::try_from(tokens.len()).unwrap_or(u32::MAX),
             prepared.order,
             prepared.overtaken,
+            self.inner.prefill_runs_in_passes(prepared.seq_id),
         )
+    }
+
+    /// The backend's stored-state probe of the start's prompt, taken again
+    /// only once the backend's probe generation moved.
+    fn stored_prefix(&self, prepared: &PreparedTurn) -> u32 {
+        let generation = self.inner.scheduled_prefix_probe_generation();
+        if let Some(probed) = prepared
+            .stored_prefix
+            .get()
+            .filter(|probed| probed.generation == generation)
+        {
+            return probed.tokens;
+        }
+        let tokens = self.inner.scheduled_prefix_probe(
+            &prepared.admitted.tokens,
+            prepared.admitted.params.cache_salt,
+        );
+        prepared
+            .stored_prefix
+            .set(Some(ProbedPrefix { generation, tokens }));
+        tokens
     }
 
     /// Splash `Engine::admitQueued`'s `queue` (`deferWait`): a start the
@@ -5316,14 +5640,30 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let progress = reply_progress(&prepared.response).cloned();
         mark(progress.as_ref(), Waiting::Prepare);
         let installed = engine::progress::install_prepare_progress(progress);
-        let prefix_admission = self.inner.prepare_scheduled_prefix(
-            seq_id,
-            &prepared.admitted.tokens,
-            &owner_history,
-            prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache,
-            prepared.admitted.params.cache_salt,
-            prepared.block_size,
-        );
+        let reuse_cache = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
+        let prefix_admission = if self.scheduler.has_live_turns() {
+            #[cfg(test)]
+            {
+                self.contended_prepares += 1;
+            }
+            self.inner.prepare_contended_prefix(
+                seq_id,
+                &prepared.admitted.tokens,
+                &owner_history,
+                reuse_cache,
+                prepared.admitted.params.cache_salt,
+                prepared.block_size,
+            )
+        } else {
+            self.inner.prepare_scheduled_prefix(
+                seq_id,
+                &prepared.admitted.tokens,
+                &owner_history,
+                reuse_cache,
+                prepared.admitted.params.cache_salt,
+                prepared.block_size,
+            )
+        };
         #[cfg(test)]
         if let Some(hook) = self.after_prefix_prepare.as_mut() {
             hook();
@@ -5432,6 +5772,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         });
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let extra_eos_ids = admitted.params.extra_eos_ids.clone();
+        #[cfg(test)]
+        let lane_seed = TEST_LANE_SEED.with(|seed| seed.get()).map(|seed| {
+            owner_id.bytes().fold(seed, |state, byte| {
+                state.wrapping_mul(0x100_0000_01B3) ^ u64::from(byte)
+            })
+        });
         let payload = ScheduledTurn {
             owner_id,
             scheduled_speculation: matches!(
@@ -5440,6 +5786,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             )
             .then(|| {
                 use rand::SeedableRng;
+                #[cfg(test)]
+                if let Some(seed) = lane_seed {
+                    return rand::rngs::StdRng::seed_from_u64(seed);
+                }
                 rand::rngs::StdRng::from_rng(&mut rand::rng())
             }),
             pending_token_emitted: false,
@@ -5487,6 +5837,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             requested_tokens,
             claim,
             cell,
+            draft_lane: None,
             clock: TurnClock {
                 ttft,
                 ..TurnClock::default()
@@ -5504,6 +5855,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         } else {
             0
         };
+        let passes = self.inner.prefill_runs_in_passes(seq_id);
         let mut turn = match TurnState::try_new_recover_payload(
             seq_id,
             admitted.tokens,
@@ -5512,7 +5864,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Some(cancelled),
             payload,
         ) {
-            Ok(turn) => turn,
+            Ok(mut turn) => {
+                turn.prefill_passes = passes;
+                turn
+            }
             Err((error, payload)) => {
                 let failed_owner_id = payload.owner_id.clone();
                 self.inner.abort_paged_turn();
@@ -5533,6 +5888,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         .with_scheduled_state_reservation(scheduled_state_bytes);
         turn.decode_draft_allowance = draft_allowance;
         turn.whole_prompt_prefill = whole_prompt_prefill;
+        repin_whole_prefills(&self.inner, self.scheduler.turns_mut());
         turn.submitted_order = order;
         turn.overtaken = overtaken;
         if ledger {
@@ -5652,9 +6008,47 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// The parked restores, oldest arrival first: the landings of those
+    /// whose data came in an earlier pass, then every other ticket's
+    /// uploads, sharing the pass's upload budget, then the landings of those
+    /// whose data is now in place; each landing only while the pass's
+    /// prefix budget lasts.
     fn poll_restores(&mut self) {
-        let seq_ids = self.pending_restores.keys().copied().collect::<Vec<_>>();
+        if self.pending_restores.is_empty() {
+            return;
+        }
+        let arrivals: HashMap<SeqId, u64> = self
+            .scheduler
+            .turns()
+            .map(|turn| (turn.seq_id, turn.arrival_order()))
+            .collect();
+        let mut seq_ids = self.pending_restores.keys().copied().collect::<Vec<_>>();
+        seq_ids.sort_by_key(|seq_id| (arrivals.get(seq_id).copied().unwrap_or(0), *seq_id));
+        let ready: Vec<SeqId> = seq_ids
+            .iter()
+            .copied()
+            .filter(|seq_id| {
+                self.pending_restores
+                    .get(seq_id)
+                    .is_some_and(B::scheduled_restore_lands)
+            })
+            .collect();
+        self.land_restores(ready);
+        let mut landings = Vec::new();
         for seq_id in seq_ids {
+            if self
+                .pending_restores
+                .get(&seq_id)
+                .is_none_or(B::scheduled_restore_lands)
+            {
+                continue;
+            }
+            #[cfg(test)]
+            let reading = self
+                .pending_restores
+                .get(&seq_id)
+                .is_some_and(|restore| !B::scheduled_restore_lands(restore));
+            let started = self.prefix_clock();
             let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
                 self.pending_restores.remove(&seq_id);
                 let _ = self.inner.release_scheduled_cache(seq_id);
@@ -5667,6 +6061,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.poll_scheduled_restore(
                     seq_id,
                     restore,
+                    &mut self.restore_uploads,
                     &turn.payload.prompt_tokens,
                     self.owner_states
                         .get(&turn.payload.owner_id)
@@ -5675,53 +6070,238 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     turn.payload.preemption_replay.is_some(),
                 )
             };
+            #[cfg(test)]
+            if reading && let Some(hook) = self.after_restore_poll.as_mut() {
+                hook();
+            }
+            self.charge_prefix(started);
             match outcome {
-                Ok(None) => {}
-                Ok(Some(restored)) => {
-                    self.pending_restores.remove(&seq_id);
-                    self.restore_landed();
-                    let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
-                        let _ = self.inner.release_scheduled_cache(seq_id);
-                        continue;
-                    };
-                    mark(reply_progress(&turn.payload.response), Waiting::Queued);
-                    turn.num_computed_tokens = restored.prefix.effective_cached_prefix_len() as u32;
-                    turn.block_materialized_blocks = restored.materialized_blocks;
-                    if let Some(replay) = turn.payload.preemption_replay.as_mut() {
-                        replay.cached_prefix = turn.num_computed_tokens;
-                    }
-                    turn.payload.prefix = restored.prefix;
-                    turn.payload
-                        .profiler
-                        .set_prompt_tokens(restored.profiler_prefill_tokens);
-                    (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
-                        &self.inner,
-                        seq_id,
-                        turn.num_computed_tokens,
-                        turn.prompt_tokens,
-                        restored.extra_prefill_breaks,
-                    );
-                    if let Err(error) =
-                        self.scheduler
-                            .wake_from_ssd(seq_id, restored.bytes_restored, restored.wait)
+                Ok(None) => {
+                    if self
+                        .pending_restores
+                        .get(&seq_id)
+                        .is_some_and(B::scheduled_restore_lands)
                     {
-                        tracing::error!(
-                            "{} failed to wake SSD restore {seq_id}: {error}",
-                            B::SCHEDULER_NAME
-                        );
+                        landings.push(seq_id);
                     }
                 }
-                Err(error) => {
-                    self.pending_restores.remove(&seq_id);
-                    if let Some(mut turn) = self.scheduler.take_waiting(seq_id) {
-                        turn.payload.failure = Some(error);
-                        self.finish_completed(turn);
-                    } else {
-                        let _ = self.inner.release_scheduled_cache(seq_id);
-                    }
-                }
+                Ok(Some(restored)) => self.wake_restored(seq_id, restored),
+                Err(error) => self.fail_parked(seq_id, error),
             }
         }
+        self.land_restores(landings);
+    }
+
+    /// Lands `seq_ids` in order, each in its turn's context, while the
+    /// pass's prefix budget lasts; a refused one waits for its retry.
+    fn land_restores(&mut self, seq_ids: Vec<SeqId>) {
+        for seq_id in seq_ids {
+            if !self.prefix_unit_allowed() {
+                break;
+            }
+            if !self.landing_retry_ready(seq_id) {
+                continue;
+            }
+            let Some(mut restore) = self.pending_restores.remove(&seq_id) else {
+                continue;
+            };
+            let started = self.prefix_clock();
+            let landed = self.land_parked_restore(seq_id, |inner, prompt, history, replay| {
+                inner.land_scheduled_restore(seq_id, &mut restore, prompt, history, replay)
+            });
+            #[cfg(test)]
+            if let Some(hook) = self.after_restore_landing.as_mut() {
+                hook();
+            }
+            match landed {
+                Ok(None) => {
+                    self.pending_restores.insert(seq_id, restore);
+                }
+                Ok(Some(restored)) => {
+                    drop(restore);
+                    if let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) {
+                        turn.resource_wait = ResourceWait::default();
+                    }
+                    self.wake_restored(seq_id, restored);
+                }
+                Err(error) => match self.landing_failed(seq_id, error) {
+                    None => {
+                        self.pending_restores.insert(seq_id, restore);
+                    }
+                    Some((error, gpu_oom)) => {
+                        drop(restore);
+                        self.fail_parked(seq_id, error);
+                        if gpu_oom {
+                            self.recover_if_gpu_oom();
+                        }
+                    }
+                },
+            }
+            self.charge_prefix(started);
+        }
+    }
+
+    /// A parked turn whose restore landed joins the next plan.
+    fn wake_restored(&mut self, seq_id: SeqId, restored: ScheduledRestoreResult<B::PrefixState>) {
+        self.pending_restores.remove(&seq_id);
+        self.restore_landed();
+        let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
+            let _ = self.inner.release_scheduled_cache(seq_id);
+            return;
+        };
+        mark(reply_progress(&turn.payload.response), Waiting::Queued);
+        turn.num_computed_tokens = restored.prefix.effective_cached_prefix_len() as u32;
+        turn.block_materialized_blocks = restored.materialized_blocks;
+        if let Some(replay) = turn.payload.preemption_replay.as_mut() {
+            replay.cached_prefix = turn.num_computed_tokens;
+        }
+        turn.payload.prefix = restored.prefix;
+        turn.payload
+            .profiler
+            .set_prompt_tokens(restored.profiler_prefill_tokens);
+        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
+            &self.inner,
+            seq_id,
+            turn.num_computed_tokens,
+            turn.prompt_tokens,
+            restored.extra_prefill_breaks,
+        );
+        if let Err(error) =
+            self.scheduler
+                .wake_from_ssd(seq_id, restored.bytes_restored, restored.wait)
+        {
+            tracing::error!(
+                "{} failed to wake SSD restore {seq_id}: {error}",
+                B::SCHEDULER_NAME
+            );
+        }
+    }
+
+    /// A parked turn whose restore failed ends with `error`.
+    fn fail_parked(&mut self, seq_id: SeqId, error: Error) {
+        self.pending_restores.remove(&seq_id);
+        if let Some(mut turn) = self.scheduler.take_waiting(seq_id) {
+            turn.payload.failure = Some(error);
+            self.finish_completed(turn);
+        } else {
+            let _ = self.inner.release_scheduled_cache(seq_id);
+        }
+    }
+
+    /// A landing that failed: one refused memory stays parked (`None`),
+    /// landed, and is tried again under its resource wait as a refused
+    /// start; anything else ends the turn with the error returned, a GPU
+    /// OOM (`true`) restarting the model after it.
+    fn landing_failed(&mut self, seq_id: SeqId, error: Error) -> Option<(Error, bool)> {
+        if let Some(oom) = self.prefix_gpu_oom(&error) {
+            return Some((Error::from_reason(oom), true));
+        }
+        let mut wait = match self.scheduler.waiting_turn_mut(seq_id) {
+            Some(turn) => std::mem::take(&mut turn.resource_wait),
+            None => ResourceWait::default(),
+        };
+        let refused = self.prefix_refused(seq_id, &mut wait, true);
+        if let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) {
+            turn.resource_wait = wait;
+        }
+        match refused {
+            Some(Ok(())) => None,
+            Some(Err(failed)) => Some((failed, false)),
+            None => Some((error, false)),
+        }
+    }
+
+    /// A refused landing is tried again once its wait reached its retry.
+    fn landing_retry_ready(&self, seq_id: SeqId) -> bool {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return true;
+        }
+        let governor = self.memory_governor();
+        let (now, epoch) = (governor.now(), governor.epoch(self.inner.memory_model()));
+        self.scheduler
+            .turns()
+            .find(|turn| turn.seq_id == seq_id)
+            .is_some_and(|turn| retry_ready(&turn.resource_wait, now, epoch))
+    }
+
+    /// Runs `land` for the parked turn `seq_id` in the turn's own context,
+    /// as its admission set it before its prepare (other starts replaced
+    /// it since): its sequence active first, since a prime writes the
+    /// active sequence's GDN cells, then its owner state, cache owner,
+    /// cancel flag, claim scope, generation suffix and prepare progress.
+    fn land_parked_restore<R>(
+        &mut self,
+        seq_id: SeqId,
+        land: impl FnOnce(&mut B, &[u32], &[u32], bool) -> Result<R>,
+    ) -> Result<R> {
+        self.inner.activate_paged_seq(seq_id)?;
+        let Self {
+            scheduler,
+            inner,
+            owner_states,
+            ..
+        } = self;
+        let turn = scheduler.waiting_turn_mut(seq_id).ok_or_else(|| {
+            Error::from_reason(format!(
+                "{} cannot land the restore of unknown sequence {seq_id}",
+                B::SCHEDULER_NAME
+            ))
+        })?;
+        let owner_state = owner_states
+            .entry(turn.payload.owner_id.clone())
+            .or_default();
+        inner.install_owner_state(seq_id, owner_state);
+        inner.set_cache_owner_id(
+            &turn.payload.params.cache_owner_id,
+            turn.payload.params.cache_root_owner_id.as_deref(),
+        );
+        inner.set_turn_cancel_flag(turn.cancelled.clone());
+        let scope = turn
+            .payload
+            .claim
+            .as_ref()
+            .map(|claim| Scope::enter_lane(claim.claim()));
+        inner.set_generation_suffix(
+            turn.payload
+                .tokenizer
+                .generation_suffix(&turn.payload.config)
+                .ok()
+                .flatten(),
+        );
+        let progress = reply_progress(&turn.payload.response).cloned();
+        mark(progress.as_ref(), Waiting::Prepare);
+        let installed = engine::progress::install_prepare_progress(progress);
+        let history = owner_states
+            .get(&turn.payload.owner_id)
+            .map(B::owner_tokens)
+            .unwrap_or_default();
+        let landed = land(
+            inner,
+            &turn.payload.prompt_tokens,
+            history,
+            turn.payload.preemption_replay.is_some(),
+        );
+        drop(installed);
+        drop(scope);
+        landed
+    }
+
+    /// The pass's clock for a prefix unit: read only while a turn runs,
+    /// since no budget binds a pass with none.
+    fn prefix_clock(&self) -> Option<f64> {
+        (self.scheduler.running_len() > 0).then(|| self.memory_governor().now())
+    }
+
+    fn charge_prefix(&mut self, started: Option<f64>) {
+        if let Some(started) = started {
+            self.prefix_spent_ms += ((self.memory_governor().now() - started) * 1000.0).max(0.0);
+        }
+    }
+
+    /// Beside a running turn a pass starts a prefix unit only
+    /// while its prefix work is below [`PREFIX_PASS_MS`].
+    fn prefix_unit_allowed(&self) -> bool {
+        self.scheduler.running_len() == 0 || self.prefix_spent_ms < PREFIX_PASS_MS
     }
 
     /// Release both halves of a hybrid victim. Full-attention blocks remain
@@ -6036,6 +6616,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             governor.lane_resumed(self.inner.memory_model());
             turn.resume_target = 0;
             turn.payload.cell = cell;
+            turn.payload.draft_lane = None;
             self.admissions = self.admissions.saturating_add(1);
             turn.admission = self.admissions;
         }
@@ -6315,6 +6896,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             if deferred
                 || self.scheduler.waiting_len() + self.scheduler.running_len()
                     >= self.scheduler.max_num_seqs()
+                || !self.prefix_unit_allowed()
             {
                 self.held.push_back(prepared);
                 continue;
@@ -6322,7 +6904,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             if let Some(wired) = wired.as_mut() {
                 wired.mark();
             }
+            let started = self.prefix_clock();
             deferred = self.start_prepared(prepared);
+            self.charge_prefix(started);
         }
         deferred
     }
@@ -6356,6 +6940,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         self.pass_work = PassWork::default();
         self.pass_start = self.memory_governor().now();
+        self.prefix_spent_ms = 0.0;
+        self.restore_uploads = RestoreUploadBudget::per_pass();
         let mut wired = self.inner.wired_residency().map(|r| r.begin());
         self.reap_cancelled_waiters();
         self.poll_restores();
@@ -6366,10 +6952,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.inner.scheduler_block_size().unwrap_or(0),
             |seq_id| self.inner.scheduler_materialized_blocks(seq_id),
         );
+        let started = self.prefix_clock();
         self.inner
             .tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Full {
                 command_pages,
             });
+        #[cfg(test)]
+        if let Some(hook) = self.after_state_tick.as_mut() {
+            hook();
+        }
+        self.charge_prefix(started);
         self.refresh_wanted_chains();
         self.run_control_pass(woke);
 
@@ -6391,12 +6983,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 
         let mut deferred = false;
         if !self.scheduler.has_pending_control()
+            && self.prefix_unit_allowed()
             && let Some(prepared) = self.prepared_waiting.take()
         {
             if let Some(wired) = wired.as_mut() {
                 wired.mark();
             }
+            let started = self.prefix_clock();
             deferred = self.start_prepared(prepared);
+            self.charge_prefix(started);
         }
         // Splash `Engine::admitQueued`'s recovery tries no start of a
         // suspended lane's priority: a held start's earlier order would
@@ -6424,13 +7019,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 lanes_or_held = true;
                 break;
             }
-            if command
+            let starts = command
                 .as_chat()
-                .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
+                .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }));
+            if starts
                 && self.scheduler.waiting_len() + self.scheduler.running_len()
                     >= self.scheduler.max_num_seqs()
             {
                 lanes_or_held = true;
+                break;
+            }
+            // Before its render: a start the pass's prefix budget defers
+            // stays queued, never tokenized and never refused.
+            if starts && !self.prefix_unit_allowed() {
                 break;
             }
             let Some(Queued { command, arrival }) = self.pending.pop_front() else {
@@ -6478,13 +7079,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                             arrival,
                         });
                         exclusive = true;
-                    } else if let Some(prepared) = {
+                    } else {
                         if let Some(wired) = wired.as_mut() {
                             wired.mark();
                         }
-                        self.prepare_chat(chat, arrival)
-                    } {
-                        deferred = self.start_prepared(prepared);
+                        let started = self.prefix_clock();
+                        if let Some(prepared) = self.prepare_chat(chat, arrival) {
+                            deferred = self.start_prepared(prepared);
+                        }
+                        self.charge_prefix(started);
                     }
                     if is_reset || exclusive {
                         break;
@@ -6506,6 +7109,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             mark(command_progress(queued), waiting);
         }
 
+        self.scheduler.set_prefix_work_owed(
+            self.scheduler.running_len() > 0 && self.prefix_spent_ms >= PREFIX_PASS_MS,
+        );
         self.begin_scheduled_step();
         let action = self.step();
         self.count_held_overtakes();
@@ -6713,6 +7319,35 @@ pub(crate) mod tests {
     use crate::models::qwen3_5::model::{Qwen35Cmd, Qwen35Inner};
     use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
     use crate::models::qwen3_5_moe::model::Qwen35MoeInner;
+
+    /// The first sampled draw of a speculative turn takes the one row of a
+    /// final prefill slice whatever its leading ones, and the draw refuses a
+    /// slice of two rows.
+    /// MUTATION: every shape is flattened → red (two rows are refused).
+    #[test]
+    fn the_first_sampled_draw_takes_one_row_and_refuses_two() {
+        use rand::SeedableRng;
+        let probabilities = [0.25f32, 0.5, 0.25];
+        for shape in [vec![3i64], vec![1, 3], vec![1, 1, 3]] {
+            let row =
+                one_sampling_row(MxArray::from_float32(&probabilities, &shape).unwrap()).unwrap();
+            assert_eq!(row.shape().unwrap().as_ref(), [3], "{shape:?}: one row");
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let token =
+                crate::sampling::sample_dense_distribution(&row, &mut rng).expect("one row draws");
+            assert!(
+                (0..3).contains(&token),
+                "{shape:?}: id {token} in the vocabulary"
+            );
+        }
+        let two = [0.25f32, 0.5, 0.25, 0.1, 0.1, 0.8];
+        let rows = one_sampling_row(MxArray::from_float32(&two, &[2, 3]).unwrap()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        assert!(
+            crate::sampling::sample_dense_distribution_array(&rows, &mut rng).is_err(),
+            "two rows are refused"
+        );
+    }
 
     fn tiny_config() -> Qwen3_5Config {
         Qwen3_5Config {
@@ -7317,6 +7952,66 @@ pub(crate) mod tests {
         assert!(
             !state.chat_requires_barrier(&command),
             "plain AR remains schedulable"
+        );
+    }
+
+    /// A dense paged load with a DFlash2 draft and no native MTP head runs
+    /// its speculative text turns, streaming or not, as scheduled lanes; a
+    /// session with an image context (a rope delta) keeps the exclusive
+    /// lane; a turn with its draft off stays schedulable.
+    #[test]
+    fn dense_dflash2_text_turns_take_the_scheduled_lane() {
+        if crate::test_support::paged_prefill_unsupported(
+            "dense_dflash2_text_turns_take_the_scheduled_lane",
+        ) {
+            return;
+        }
+        let inner = crate::models::qwen3_5::dflash2_decode::paged_dflash2_tests::tiny_paged_int8_dflash_inner(
+            0xDFA5_3505,
+        );
+        assert!(!inner.has_mtp_weights(), "the fixture has no native head");
+        assert!(
+            inner.supports_scheduled_speculation(),
+            "a draft load drafts on the scheduled lane"
+        );
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        for streaming in [false, true] {
+            let (command, _keepalive): (ChatCmd, Box<dyn std::any::Any>) = if streaming {
+                let (command, rx) = streaming_start(mtp_config());
+                (command, Box::new(rx))
+            } else {
+                let (command, rx) = sync_start(mtp_config());
+                (command, Box::new(rx))
+            };
+            assert!(
+                !state.chat_requires_barrier(&command),
+                "streaming {streaming}: a DFlash2 text turn is a scheduled lane"
+            );
+            let plan = TurnPlan::resolve(
+                state.inner.execution_plan(),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming,
+                },
+            );
+            assert_eq!(
+                plan.decoder,
+                DecoderPlan::Speculative(engine::plan::SpeculativeKind::DraftModel)
+            );
+        }
+        let (plain, _rx) = sync_start(ChatConfig {
+            enable_mtp: Some(false),
+            ..ChatConfig::default()
+        });
+        assert!(!state.chat_requires_barrier(&plain));
+        state.inner.cached_rope_deltas = Some(3);
+        let (command, _rx) = sync_start(mtp_config());
+        assert!(
+            state.chat_requires_barrier(&command),
+            "an image context keeps the whole turn"
         );
     }
 
@@ -8640,6 +9335,7 @@ pub(crate) mod tests {
                         finished: false,
                         allocation_blocked: false,
                         prefill_micros: 0,
+                        prefill_in_flight: false,
                     })
                     .collect(),
                 executed_decode_batch: plan
@@ -8733,6 +9429,7 @@ pub(crate) mod tests {
             }],
             contended: false,
             leader_cut: None,
+            prefill_pass_ms: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         assert!(claims.grants[0].is_none(), "{:?}", claims.grants[0]);
@@ -8803,6 +9500,7 @@ pub(crate) mod tests {
                 }],
                 contended: false,
                 leader_cut: None,
+                prefill_pass_ms: None,
             };
             let claims = state.claim_rows_in_order(&plan);
             assert!(
@@ -9295,6 +9993,7 @@ pub(crate) mod tests {
             held: false,
             order: None,
             overtaken: 0,
+            stored_prefix: std::cell::Cell::new(None),
         };
         (Box::new(prepared), result)
     }
@@ -10062,6 +10761,7 @@ pub(crate) mod tests {
                         finished: true,
                         allocation_blocked: false,
                         prefill_micros: 0,
+                        prefill_in_flight: false,
                     })
                     .collect(),
                 executed_decode_batch: 0,
@@ -12459,6 +13159,53 @@ pub(crate) mod tests {
         assert!(!state.admission_waits(&prepared));
     }
 
+    /// Splash ranks a start by what a cache probe finds: a start whose
+    /// first 32 of 2,050 tokens sit under a stored state resumes there, so
+    /// it has fewer left than a 2,047 token prefill, leads and is served at
+    /// once. Once the state goes, it ranks as uncached again and waits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stored_state_start_is_ranked_by_what_it_resumes() {
+        use crate::engine::governor::governor::tests::G;
+        use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+        use crate::models::qwen3_5::draft_context::DraftContextWindow;
+        let (mut state, _governor, _io) = ledger_state(16 * G, 0).expect("a ledger state");
+        let stored = tokens_of(2, 2);
+        let mut prompt = stored.clone();
+        prompt.extend((0..2_018).map(|token| token % 15 + 1));
+        let (mut prepared, _reply) = prepared_turn(&mut state, 2, prompt);
+        prepared.admitted.params.reuse_cache = true;
+        let anchor = PagedAnchor {
+            linear: Vec::new(),
+            window: Some(DraftContextWindow::new(64, 8).expect("window")),
+        };
+        let id = state
+            .inner
+            .dflash2_states
+            .store
+            .insert(
+                Lineage::text(&stored, prepared.admitted.params.cache_salt),
+                anchor,
+                StateClass::Ordinary,
+            )
+            .expect("a stored state")
+            .id;
+        let mut lead = speculative::tests::request(
+            &mut state.inner,
+            1,
+            tokens_of(1, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        lead.prompt_tokens = 2_047;
+        lead.num_tokens = 2_047;
+        state.scheduler.reinstate_running(lead);
+        assert!(!state.admission_waits(&prepared));
+        assert!(state.inner.dflash2_states.store.remove(id));
+        assert!(state.admission_waits(&prepared));
+    }
+
     /// Splash `Engine::admitQueued` queues a start the scheduler does not
     /// want (`deferWait`): its claim stops waiting, and its wait keeps only
     /// when it began.
@@ -12589,6 +13336,311 @@ pub(crate) mod tests {
         let schedulers = governor.schedulers();
         assert_eq!(schedulers.len(), 1);
         assert_eq!(schedulers[0].model_id, model_id);
+    }
+
+    // ---- the pass budget and the parked-restore landing ----
+
+    #[cfg(target_os = "macos")]
+    type Qwen35Channel = (
+        tokio::sync::mpsc::UnboundedSender<Qwen35Cmd>,
+        tokio::sync::mpsc::UnboundedReceiver<Qwen35Cmd>,
+    );
+
+    #[cfg(target_os = "macos")]
+    fn chat_start(
+        owner: &str,
+        max_new_tokens: i32,
+    ) -> (ChatCmd, tokio::sync::oneshot::Receiver<Result<ChatResult>>) {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::SessionStart {
+            messages: vacated_stop_message(),
+            config: ChatConfig {
+                max_new_tokens: Some(max_new_tokens),
+                ..vacated_stop_config(owner)
+            },
+            reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        (command, result)
+    }
+
+    /// The tokens `owner`'s turn generated so far; 0 when it has none.
+    #[cfg(target_os = "macos")]
+    fn generated(state: &mut HybridSchedulerState<Qwen35Inner>, owner: &str) -> usize {
+        let Some(&seq) = state.owner_sequences.get(owner) else {
+            return 0;
+        };
+        state
+            .turn_mut(seq)
+            .map_or(0, |turn| turn.payload.generated_tokens.len())
+    }
+
+    /// A Qwen3.5 scheduler on a governor with a fake clock; with
+    /// `decoding`, lane "a" (40 tokens) runs and has decoded 3 tokens.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn budget_state(
+        name: &str,
+        decoding: bool,
+    ) -> Option<(
+        HybridSchedulerState<Qwen35Inner>,
+        Arc<crate::engine::governor::governor::tests::FakeIo>,
+        Qwen35Channel,
+        Option<tokio::sync::oneshot::Receiver<Result<ChatResult>>>,
+    )> {
+        use crate::engine::governor::governor::tests::{G, model};
+        if crate::test_support::paged_prefill_unsupported(name)
+            || !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device()
+        {
+            return None;
+        }
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0201);
+        inner.tokenizer = Some(vacated_stop_tokenizer());
+        inner.grant_scheduled_lanes(4);
+        let (io, governor) = roomy_governor();
+        inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        let mut state = HybridSchedulerState::new(inner).expect("scheduler");
+        state.enabled = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        if !decoding {
+            return Some((state, io, (sender, receiver), None));
+        }
+        let (command, result) = chat_start("a", 40);
+        assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+        for _ in 0..64 {
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+            if generated(&mut state, "a") >= 3 {
+                return Some((state, io, (sender, receiver), Some(result)));
+            }
+        }
+        panic!("lane a never decoded");
+    }
+
+    /// Each prefix prepare costs `ms` on the fake clock; the returned
+    /// counter counts them.
+    #[cfg(target_os = "macos")]
+    fn costly_prepares(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        io: &Arc<crate::engine::governor::governor::tests::FakeIo>,
+        ms: f64,
+    ) -> Arc<std::sync::atomic::AtomicU32> {
+        let starts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (clock, counted) = (Arc::clone(io), Arc::clone(&starts));
+        state.after_prefix_prepare = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            clock.with(|fake| fake.now += ms / 1000.0);
+        }));
+        starts
+    }
+
+    /// Beside a decoding lane, a start whose prepare took 60 ms
+    /// ends the pass's prefix work. The second start that arrived with it
+    /// stays queued, not rendered and not refused, while the lane decodes
+    /// in that pass's step; it starts in the next pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_starts_beside_a_running_lane_have_a_decode_step_between_them() {
+        let Some((mut state, io, (sender, mut receiver), _a)) = budget_state(
+            "two_starts_beside_a_running_lane_have_a_decode_step_between_them",
+            true,
+        ) else {
+            return;
+        };
+        let starts = costly_prepares(&mut state, &io, 60.0);
+        let (b, _b) = chat_start("b", 2);
+        let (c, _c) = chat_start("c", 2);
+        assert!(sender.send(ModelCommand::from_chat(b)).is_ok());
+        assert!(sender.send(ModelCommand::from_chat(c)).is_ok());
+        let before = generated(&mut state, "a");
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "one start in the pass");
+        assert!(state.prefix_spent_ms >= PREFIX_PASS_MS);
+        assert_eq!(state.pending.len(), 1, "the second start stays queued");
+        assert!(
+            state.prepared_waiting.is_none() && state.held.is_empty(),
+            "a start the budget defers is not refused"
+        );
+        assert!(!state.owner_sequences.contains_key("c"), "nor rendered");
+        assert!(
+            generated(&mut state, "a") > before,
+            "the lane decoded in the pass's step"
+        );
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(state.pending.is_empty(), "the second start ran next pass");
+    }
+
+    /// The held starts obey the same budget: one 60 ms start ends the
+    /// pass's starts; the start held after it keeps its place, its hold
+    /// unchanged, and is tried in the next pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_starts_obey_the_pass_budget() {
+        let Some((mut state, io, _channel, _a)) =
+            budget_state("held_starts_obey_the_pass_budget", true)
+        else {
+            return;
+        };
+        let starts = costly_prepares(&mut state, &io, 60.0);
+        let (first, _first) = prepared_turn(&mut state, 90, tokens_of(5, 1));
+        let (second, _second) = prepared_turn(&mut state, 91, tokens_of(6, 1));
+        state.held.push_back(first);
+        state.held.push_back(second);
+        state.prefix_spent_ms = 0.0;
+        assert!(!state.retry_held(None));
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "one held start ran");
+        assert_eq!(state.held.len(), 1);
+        assert_eq!(state.held[0].seq_id, 91);
+        assert!(!state.held[0].held, "the budget did not hold it");
+        assert!(state.held[0].resource_wait.reason == WaitReason::None);
+        assert!(state.prepared_waiting.is_none());
+        state.prefix_spent_ms = 0.0;
+        assert!(!state.retry_held(None));
+        assert!(
+            starts.load(Ordering::SeqCst) == 2 || state.held.iter().any(|held| held.held),
+            "the next pass tries it"
+        );
+    }
+
+    /// Lone behaviour: with nothing running there is no budget and no
+    /// clock read. Two starts that arrive together on an idle model both
+    /// start in the first pass, however long their prepares
+    /// take; the first takes the lone prepare, the second (beside the
+    /// first, admitted) the contended one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lone_start_takes_the_unbudgeted_path() {
+        let Some((mut state, io, (sender, mut receiver), _)) =
+            budget_state("a_lone_start_takes_the_unbudgeted_path", false)
+        else {
+            return;
+        };
+        let starts = costly_prepares(&mut state, &io, 60.0);
+        let (b, _b) = chat_start("b", 2);
+        let (c, _c) = chat_start("c", 2);
+        assert!(sender.send(ModelCommand::from_chat(b)).is_ok());
+        assert!(sender.send(ModelCommand::from_chat(c)).is_ok());
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "both start in one pass");
+        assert!(state.pending.is_empty());
+        assert_eq!(state.prefix_spent_ms, 0.0, "nothing ran: nothing charged");
+        assert_eq!(state.contended_prepares, 1, "only the second is beside");
+    }
+
+    /// The state tier's tick counts against the pass's prefix budget: a
+    /// tick of 60 ms beside a decoding lane leaves no budget for a start,
+    /// which stays queued while the lane decodes in that pass's step.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_state_tick_counts_against_the_pass_budget() {
+        let Some((mut state, io, (sender, mut receiver), _a)) =
+            budget_state("the_state_tick_counts_against_the_pass_budget", true)
+        else {
+            return;
+        };
+        let starts = costly_prepares(&mut state, &io, 0.0);
+        let clock = Arc::clone(&io);
+        state.after_state_tick = Some(Box::new(move || {
+            clock.with(|fake| fake.now += 0.060);
+        }));
+        let (b, _b) = chat_start("b", 2);
+        assert!(sender.send(ModelCommand::from_chat(b)).is_ok());
+        let before = generated(&mut state, "a");
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(
+            state.prefix_spent_ms >= PREFIX_PASS_MS,
+            "the tick was charged"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "no start in the pass");
+        assert_eq!(state.pending.len(), 1, "the start stays queued");
+        assert!(
+            generated(&mut state, "a") > before,
+            "the lane decoded in the pass's step"
+        );
+    }
+
+    /// A landing runs in its parked turn's context. Lane "a" is
+    /// active when Y lands: the helper activates Y first, installs Y's
+    /// owner state, and a landing that writes the active sequence's GDN
+    /// cells leaves lane a's cells and KV bit for bit. A landing error
+    /// ends the turn through `take_waiting` + `finish_completed`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_landing_runs_in_its_turns_context_and_leaves_the_other_lanes_alone() {
+        use crate::models::qwen3_5::dflash2_decode::paged_dflash2_tests::cell_bits;
+        let Some((mut state, _io, _channel, _a)) = budget_state(
+            "a_landing_runs_in_its_turns_context_and_leaves_the_other_lanes_alone",
+            true,
+        ) else {
+            return;
+        };
+        let a = state.owner_sequences["a"];
+        let y = state.next_seq_id;
+        state.next_seq_id += 1;
+        let prompt = tokens_of(7, 2);
+        let y_cancel = Arc::new(AtomicBool::new(false));
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            y,
+            prompt.clone(),
+            false,
+            Arc::clone(&y_cancel),
+        );
+        let (reply, mut ended) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        let owner = turn.payload.owner_id.clone();
+        state.owner_sequences.insert(owner.clone(), y);
+        state.owner_states.insert(owner, vec![5, 6, 7]);
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+        state.scheduler.park_waiting_for_ssd(y).expect("park");
+
+        HybridSchedulerBackend::activate_paged_seq(&mut state.inner, a).expect("a active");
+        state.inner.turn_cancel = Some(Arc::new(AtomicBool::new(false)));
+        let cells = cell_bits(state.inner.caches.as_ref().expect("a's cells")).unwrap();
+        let kv = state
+            .inner
+            .paged_adapter()
+            .and_then(|adapter| adapter.current_token_count_for(a));
+        let landed = state.land_parked_restore(y, |inner, tokens, history, replay| {
+            assert_eq!(inner.active_scheduled_seq, Some(y), "Y is active");
+            assert!(
+                inner
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|flag| Arc::ptr_eq(flag, &y_cancel)),
+                "the landing sees Y's cancel flag"
+            );
+            assert_eq!(inner.cached_token_history, vec![5, 6, 7]);
+            assert_eq!(history, &[5, 6, 7]);
+            assert_eq!(tokens, &prompt[..]);
+            assert!(!replay);
+            inner.caches.as_mut().expect("Y's cells").reverse();
+            Ok(11u32)
+        });
+        assert_eq!(landed.expect("landed"), 11);
+        HybridSchedulerBackend::activate_paged_seq(&mut state.inner, a).expect("a active");
+        assert!(
+            cell_bits(state.inner.caches.as_ref().expect("a's cells")).unwrap() == cells,
+            "lane a's cells are untouched"
+        );
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.current_token_count_for(a)),
+            kv
+        );
+
+        let failure = state.landing_failed(y, Error::from_reason("landing failed"));
+        let Some((error, gpu_oom)) = failure else {
+            panic!("a plain error ends the turn");
+        };
+        assert!(!gpu_oom);
+        state.fail_parked(y, error);
+        assert!(state.scheduler.turns().all(|turn| turn.seq_id != y));
+        let reply = ended.try_recv().expect("the turn ended");
+        assert_eq!(reply.expect_err("it failed").reason, "landing failed");
+        assert!(state.scheduler.turns().any(|turn| turn.seq_id == a));
     }
 }
 

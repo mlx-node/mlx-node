@@ -13,11 +13,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::*;
 
 use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes;
+use crate::transformer::cold_tier::part_page_image_keys;
 
 /// Bytes a parked state keeps alive.
 pub(crate) trait StateBytes {
@@ -44,6 +46,11 @@ impl<'a> Lineage<'a> {
 }
 
 pub(crate) type EntryId = u64;
+
+/// The rows a state may hold past its last whole 32-token block: the 16-row
+/// part page a state moved from a 16-token store ends on. Its KV is a
+/// fragment object of that many rows on the tier, not a block.
+pub(crate) const PART_PAGE_ROWS: usize = 16;
 
 /// A publication's class (Splash `StateClass` as `StateCache` keeps it): a
 /// checkpoint is disposable and goes before ordinary states.
@@ -184,11 +191,21 @@ impl<S> Entry<S> {
 
     /// The entry's lineage equals `prompt[..depth]` and `depth < |prompt|`
     /// (a RAM copy or a disk copy: Splash `StateCache::acquireDeepest`).
+    /// A state on a part page resumes with its fragment. No chain hash
+    /// covers the part page's image keys, so they must be the keys the
+    /// prompt has for those rows of that page; one with no whole block
+    /// under it resumes nothing.
     fn resumes(&self, prompt: &PromptKey<'_>) -> bool {
         let depth = self.depth();
         let blocks = self.chain.len();
+        let on_part_page = || {
+            blocks > 0
+                && part_page_image_keys(keys_at(prompt.extra_keys, blocks), PART_PAGE_ROWS)
+                    .is_some_and(|keys| keys == keys_at(&self.extra_keys, blocks))
+        };
         (self.ram.is_some() || self.disk.is_some())
             && depth > 0
+            && (depth.is_multiple_of(self.block_size as usize) || on_part_page())
             && depth < prompt.tokens.len()
             && self.block_size == prompt.block_size
             && self.salt == prompt.salt
@@ -197,8 +214,14 @@ impl<S> Entry<S> {
     }
 }
 
+/// The image keys of block `index`; none past the end of `keys`.
+fn keys_at(keys: &[Vec<u64>], index: usize) -> &[u64] {
+    keys.get(index).map_or(&[][..], Vec::as_slice)
+}
+
 struct PromptKey<'a> {
     tokens: &'a [u32],
+    extra_keys: &'a [Vec<u64>],
     chain: Vec<u64>,
     block_size: u32,
     salt: u64,
@@ -233,6 +256,14 @@ pub(crate) fn lineage_bytes(tokens: usize, chain: usize) -> u64 {
         .saturating_add((chain as u64).saturating_mul(std::mem::size_of::<u64>() as u64))
 }
 
+/// Shared by every store, so a store built in another's place never
+/// repeats a generation the old one handed out.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    GENERATIONS.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreHit {
     pub(crate) id: EntryId,
@@ -254,6 +285,9 @@ pub(crate) struct HybridStateStore<S> {
     /// (Splash `StateCache::uses_`).
     uses: HashMap<u64, u32>,
     recency: Arc<CacheRecency>,
+    /// Taken anew whenever an entry, or its RAM or disk copy, comes or
+    /// goes.
+    generation: u64,
 }
 
 impl<S: StateBytes> HybridStateStore<S> {
@@ -265,7 +299,19 @@ impl<S: StateBytes> HybridStateStore<S> {
             publications: 0,
             uses: HashMap::new(),
             recency: Arc::new(CacheRecency::new()),
+            generation: next_generation(),
         }
+    }
+
+    /// Equal across two reads only when no entry and no copy of one came
+    /// or went between them: a lookup's answer, and whether its entry has a
+    /// copy, stand while it does.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn changed(&mut self) {
+        self.generation = next_generation();
     }
 
     /// Stamp from `recency` from now on, the clock the model's other caches
@@ -303,6 +349,7 @@ impl<S: StateBytes> HybridStateStore<S> {
     fn prompt_key<'a>(&self, lineage: Lineage<'a>) -> PromptKey<'a> {
         PromptKey {
             tokens: lineage.tokens,
+            extra_keys: lineage.extra_keys,
             chain: block_chain(lineage, self.block_size),
             block_size: self.block_size,
             salt: lineage.salt,
@@ -387,6 +434,41 @@ impl<S: StateBytes> HybridStateStore<S> {
         Ok(id)
     }
 
+    /// [`Self::adopt_disk`] for a state on a part page: its lineage is whole
+    /// 32-token blocks and [`PART_PAGE_ROWS`] more rows. Its chain is the
+    /// whole blocks'; it keeps the image keys of its part page too, which
+    /// its object's key and label carry.
+    pub(crate) fn adopt_disk_on_part_page(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+        last_used: u64,
+    ) -> Result<EntryId> {
+        let row = lineage.tokens.len();
+        let block = self.block_size as usize;
+        if block != 2 * PART_PAGE_ROWS || row % block != PART_PAGE_ROWS {
+            return Err(Error::from_reason(format!(
+                "DFlash2 state at row {row} is not on a {PART_PAGE_ROWS}-row part page of \
+                 {block}-token blocks"
+            )));
+        }
+        let key = self.prompt_key(lineage);
+        if self.entry_on(&key).is_some() {
+            return Err(Error::from_reason(
+                "a block's state is published once; reuse it instead",
+            ));
+        }
+        let id = self
+            .push_entry(lineage, key, None, cached_bytes, class, Some(disk))
+            .id;
+        if let Some(entry) = self.get_mut(id) {
+            entry.last_used = last_used;
+        }
+        Ok(id)
+    }
+
     /// New stamps continue after `stamp`, one an earlier process handed out
     /// (Splash `CacheRecency::continueAfter`).
     pub(crate) fn continue_after(&self, stamp: u64) {
@@ -411,10 +493,16 @@ impl<S: StateBytes> HybridStateStore<S> {
         let mark = key.chain.last().copied().unwrap_or_default();
         let checkpoint = class == StateClass::Checkpoint && !self.in_use(mark);
         let lineage_bytes = lineage_bytes(lineage.tokens.len(), key.chain.len());
+        let part_page = usize::from(
+            !lineage
+                .tokens
+                .len()
+                .is_multiple_of(self.block_size as usize),
+        );
         let mut extra_keys: Vec<Vec<u64>> = lineage
             .extra_keys
             .iter()
-            .take(key.chain.len())
+            .take(key.chain.len() + part_page)
             .cloned()
             .collect();
         while extra_keys.last().is_some_and(Vec::is_empty) {
@@ -423,6 +511,7 @@ impl<S: StateBytes> HybridStateStore<S> {
         let id = self.next_id;
         self.next_id += 1;
         self.publications += 1;
+        self.changed();
         let stamp = self.recency.next();
         self.entries.push(Entry {
             id,
@@ -470,7 +559,11 @@ impl<S: StateBytes> HybridStateStore<S> {
         next.is_some()
     }
 
+    /// The entry on `key`'s rows. No chain hash covers a part page's image
+    /// keys, so a part-page key also needs that page's keys equal.
     fn entry_on(&self, key: &PromptKey<'_>) -> Option<EntryId> {
+        let blocks = key.chain.len();
+        let part_page = !key.tokens.len().is_multiple_of(key.block_size as usize);
         self.entries
             .iter()
             .find(|old| {
@@ -478,6 +571,8 @@ impl<S: StateBytes> HybridStateStore<S> {
                     && old.block_size == key.block_size
                     && old.chain == key.chain
                     && old.tokens[..] == key.tokens[..]
+                    && (!part_page
+                        || keys_at(&old.extra_keys, blocks) == keys_at(key.extra_keys, blocks))
             })
             .map(Entry::id)
     }
@@ -543,6 +638,29 @@ impl<S: StateBytes> HybridStateStore<S> {
             .iter()
             .filter(|entry| entry.depth() <= depth && entry.resumes(&key))
             .max_by_key(|entry| (entry.depth(), entry.last_used))
+            .map(|entry| StoreHit {
+                id: entry.id,
+                depth: entry.depth(),
+            })
+    }
+
+    /// The deepest state of [`Self::lookup_within`] that `accept` takes,
+    /// deeper ones it refuses passed over, the prompt's chain hashed once.
+    pub(crate) fn deepest_accepted_within(
+        &self,
+        prompt: Lineage<'_>,
+        depth: usize,
+        mut accept: impl FnMut(EntryId) -> bool,
+    ) -> Option<StoreHit> {
+        let key = self.prompt_key(prompt);
+        let mut hits: Vec<&Entry<S>> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.depth() <= depth && entry.resumes(&key))
+            .collect();
+        hits.sort_by_key(|entry| std::cmp::Reverse((entry.depth(), entry.last_used)));
+        hits.into_iter()
+            .find(|entry| accept(entry.id))
             .map(|entry| StoreHit {
                 id: entry.id,
                 depth: entry.depth(),
@@ -629,7 +747,11 @@ impl<S: StateBytes> HybridStateStore<S> {
     pub(crate) fn remove(&mut self, id: EntryId) -> bool {
         let before = self.entries.len();
         self.entries.retain(|entry| entry.id != id);
-        self.entries.len() < before
+        let removed = self.entries.len() < before;
+        if removed {
+            self.changed();
+        }
+        removed
     }
 
     /// The block of every entry whose chain must stay resident.
@@ -642,10 +764,16 @@ impl<S: StateBytes> HybridStateStore<S> {
 
     /// Sets `id`'s disk copy; false when it is gone.
     pub(crate) fn set_disk(&mut self, id: EntryId, disk: Option<DiskCopy>) -> bool {
-        self.get_mut(id).map(|entry| entry.disk = disk).is_some()
+        let set = self.get_mut(id).map(|entry| entry.disk = disk).is_some();
+        if set {
+            self.changed();
+        }
+        set
     }
 
+    /// A copy taken here may land: the generation moves.
     pub(crate) fn disk_mut(&mut self, id: EntryId) -> Option<&mut DiskCopy> {
+        self.changed();
         self.get_mut(id).and_then(|entry| entry.disk.as_mut())
     }
 
@@ -655,6 +783,7 @@ impl<S: StateBytes> HybridStateStore<S> {
         match self.get_mut(id) {
             Some(entry) if entry.ram.is_none() => {
                 entry.ram = Some(state);
+                self.changed();
                 true
             }
             _ => false,
@@ -663,13 +792,18 @@ impl<S: StateBytes> HybridStateStore<S> {
 
     /// Drops `id`'s RAM copy (Splash `StateCache::discardRam`).
     pub(crate) fn drop_ram(&mut self, id: EntryId) -> Option<S> {
-        self.get_mut(id).and_then(|entry| entry.ram.take())
+        let dropped = self.get_mut(id).and_then(|entry| entry.ram.take());
+        if dropped.is_some() {
+            self.changed();
+        }
+        dropped
     }
 
     /// Drops every entry and use (`ResetScope::Command`, a new pool).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.uses.clear();
+        self.changed();
     }
 }
 
@@ -904,6 +1038,60 @@ mod tests {
         // Forge a collision: A's entry now carries B's block hashes.
         store.entries[0].chain = block_chain(Lineage::text(&b[..64], 0), BS);
         assert_eq!(hit(&store, &b, 0), None);
+    }
+
+    /// The stored-state probe takes the deepest state `accept` takes: a
+    /// deeper state it refuses is passed over for the next one down, not
+    /// for the shallowest; none when it refuses every one; states past the
+    /// depth or off the lineage are never offered.
+    #[test]
+    fn the_probe_takes_the_deepest_state_it_accepts() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 200);
+        let mut ids = Vec::new();
+        for (row, name) in [(32, "a32"), (64, "a64"), (96, "a96"), (160, "a160")] {
+            let inserted = store
+                .insert(
+                    Lineage::text(&a[..row], 0),
+                    fx.state(name),
+                    StateClass::Ordinary,
+                )
+                .unwrap();
+            ids.push((inserted.id, row));
+        }
+        let other = store
+            .insert(
+                Lineage::text(&lineage(2, 128), 0),
+                fx.state("b128"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let id_at = |row: usize| ids.iter().find(|(_, at)| *at == row).unwrap().0;
+        let prompt = Lineage::text(&a[..120], 0);
+        let probe = |refused: &[usize]| {
+            let mut offered = Vec::new();
+            let found = store.deepest_accepted_within(prompt, 119, |id| {
+                offered.push(id);
+                !refused.iter().any(|&row| id_at(row) == id)
+            });
+            (found.map(|hit| (hit.id, hit.depth)), offered)
+        };
+
+        assert_eq!(probe(&[]).0, Some((id_at(96), 96)));
+        let (found, offered) = probe(&[96]);
+        assert_eq!(found, Some((id_at(64), 64)), "the deeper state is refused");
+        assert_eq!(offered, vec![id_at(96), id_at(64)]);
+        assert_eq!(
+            probe(&[96, 64]).0,
+            Some((id_at(32), 32)),
+            "two deeper states are refused"
+        );
+        let (found, offered) = probe(&[96, 64, 32]);
+        assert_eq!(found, None, "every state is refused");
+        assert!(!offered.contains(&id_at(160)), "past the depth");
+        assert!(!offered.contains(&other), "off the lineage");
     }
 
     /// A state sits only on a complete KV block (Splash `Cache::blockAt`).
@@ -1172,3 +1360,6 @@ mod tests {
         assert_eq!(Store::new(0).block_size(), 1);
     }
 }
+
+#[cfg(test)]
+mod part_page_tests;

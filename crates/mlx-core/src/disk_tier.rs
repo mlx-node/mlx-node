@@ -457,6 +457,10 @@ pub(crate) struct DiskTier {
     /// temporary tier.
     #[cfg(unix)]
     others: Mutex<VecDeque<Idle>>,
+    /// The source namespace a persistent tier holds from its open until
+    /// [`Self::release_source`] or its close.
+    #[cfg(unix)]
+    source: Mutex<Option<source_hold::SourceHold>>,
 }
 
 #[cfg(unix)]
@@ -484,6 +488,7 @@ impl DiskTier {
         else {
             return true;
         };
+        self.release_source();
         match hold {
             TierHold::Persistent { _lock } => {
                 self.manager.hold_until_writer_exits(Box::new(_lock));
@@ -553,6 +558,15 @@ impl DiskTier {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hold.is_some().then(remove)
+    }
+
+    /// Lets go of the source namespace; true when this tier held one.
+    pub(crate) fn release_source(&self) -> bool {
+        self.source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
     }
 }
 
@@ -1058,6 +1072,7 @@ fn open_temporary(
         kv_fingerprint: fingerprint,
         hold: Mutex::new(Some(TierHold::Temp { dir, _lock: lock })),
         others: Mutex::new(VecDeque::new()),
+        source: Mutex::new(None),
     }))
 }
 
@@ -1105,8 +1120,11 @@ fn open_persistent(
         kv_fingerprint: identity.kv,
         hold: Mutex::new(Some(TierHold::Persistent { _lock: lock })),
         others: Mutex::new(VecDeque::new()),
+        source: Mutex::new(None),
     }))
 }
+
+pub(crate) mod source_hold;
 
 #[cfg(all(test, unix))]
 mod tests;

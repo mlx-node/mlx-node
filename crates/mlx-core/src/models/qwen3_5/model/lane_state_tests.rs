@@ -1527,3 +1527,11 @@ fn text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()> {
     )?);
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+#[path = "store_tail_order_tests.rs"]
+mod store_tail_order_tests;
+
+#[cfg(target_os = "macos")]
+#[path = "restart_order_tests.rs"]
+mod restart_order_tests;

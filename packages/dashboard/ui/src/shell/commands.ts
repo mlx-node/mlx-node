@@ -226,7 +226,7 @@ export function conversationCommands(
       parts.push(formatRelativeTime(row.updatedAt));
       const live = active.find((entry) => entry.conversationId === row.id);
       if (live?.waiting === true) parts.push(CHAT.waiting.toLowerCase());
-      else if (live?.busy === true) parts.push(CHAT.running.toLowerCase());
+      else if (live?.busy === true || live?.background === true) parts.push(CHAT.running.toLowerCase());
       return {
         id: `conversation:${row.id}`,
         label: chatTitle(row.title, row.mode),

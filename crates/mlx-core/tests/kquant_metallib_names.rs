@@ -46,22 +46,31 @@ const BASE_NAMES: i64 = MODES * 3 * (39 + 15) + 4 + 2 + AFFINE_MODES * 3 * (1 + 
 /// row tiers (qmm_m8/m16/m32_nax_t64) per mode and the 10 row-major
 /// qmm_m8_nax (q3k, q2k, iq4nl and the seven grid formats); each affine mode
 /// adds qmm_t_nax_t64 per dtype and its three Tiled64 row tiers.
-// The Q6_K tiled M8 head adds one FP32-output NAX kernel.
+// The Q6_K tiled M8 head adds one FP32-output NAX kernel; seven bfloat16
+// Tiled64 modes add the residual and swiglu store-epilogue GEMMs.
 const NAX_NAMES: i64 =
-    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3 + 1;
+    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3 + 1 + 7 * 2;
+/// The GGUF planes kernels (`mlx_gguf_planes.cpp`, Splash's sources in
+/// `src/metal/splash_gguf`): 8 formats x 3 row tiers (8, 16, 32) x {a, r, g,
+/// gate_up}, the fused kernel at 3 row tiers and `gguf_repack`.
+const PLANES_NAMES: i64 = 8 * 3 * 4 + 3 + 1;
+/// The planes' test-only kernels, in `gguf_planes_test.metallib` alone:
+/// `gguf_dequant` of both builds and the two Q4_K 8-row fp32 epilogue kernels.
+const PLANES_TEST_NAMES: i64 = 2 + 2;
 
 struct Check {
     base: i64,
     nax: i64,
     in_library: i64,
     built: i64,
+    planes: i64,
     report: String,
 }
 
 fn check(build_pipelines: bool) -> Check {
-    let mut counts = [0i64; 4];
+    let mut counts = [0i64; 5];
     let mut report = vec![0 as c_char; 1 << 20];
-    // SAFETY: `counts` has the 4 slots the hook writes; `report` is a
+    // SAFETY: `counts` has the 5 slots the hook writes; `report` is a
     // writable buffer of the length passed.
     let ok = unsafe {
         mlx_sys::mlx_test_kquant_metallib_check(
@@ -84,6 +93,7 @@ fn check(build_pipelines: bool) -> Check {
         nax: counts[1],
         in_library: counts[2],
         built: counts[3],
+        planes: counts[4],
         report,
     }
 }
@@ -98,6 +108,7 @@ fn every_dispatchable_kernel_is_in_the_metallib() {
     let c = check(false);
     assert_eq!(c.base, BASE_NAMES, "dispatcher base kernel names");
     assert_eq!(c.nax, NAX_NAMES, "dispatcher NAX kernel names");
+    assert_eq!(c.planes, PLANES_NAMES, "GGUF planes kernel names");
     assert!(
         c.report.is_empty(),
         "paged_attn.metallib does not match the dispatcher:\n{}",
@@ -106,20 +117,84 @@ fn every_dispatchable_kernel_is_in_the_metallib() {
     // NAX kernels are built under MLX's own NAX condition; a host that cannot
     // dispatch them may still carry them.
     let expected = if nax_available() {
-        vec![BASE_NAMES + NAX_NAMES]
+        vec![BASE_NAMES + NAX_NAMES + PLANES_NAMES]
     } else {
-        vec![BASE_NAMES, BASE_NAMES + NAX_NAMES]
+        vec![
+            BASE_NAMES + PLANES_NAMES,
+            BASE_NAMES + NAX_NAMES + PLANES_NAMES,
+        ]
     };
     assert!(
         expected.contains(&c.in_library),
-        "{} K-quant functions in the metallib, expected one of {expected:?}",
+        "{} K-quant and gguf_ functions in the metallib, expected one of {expected:?}",
         c.in_library
     );
     println!(
-        "{} K-quant functions in paged_attn.metallib (nax available: {})",
+        "{} K-quant and gguf_ functions in paged_attn.metallib (nax available: {})",
         c.in_library,
         nax_available()
     );
+}
+
+/// A planes kernel the library lacks is reported by name: the check is run
+/// with `gguf_decode_iq4xs_m8_r` taken out of the library's set.
+#[test]
+fn a_missing_planes_kernel_is_named() {
+    // SAFETY: test-only thread-local setter.
+    unsafe { mlx_sys::mlx_test_gguf_planes_mutation(5) };
+    let c = check(false);
+    // SAFETY: as above.
+    unsafe { mlx_sys::mlx_test_gguf_planes_mutation(0) };
+    assert_eq!(
+        c.report.trim(),
+        "missing gguf_decode_iq4xs_m8_r",
+        "the check must name the one missing planes kernel"
+    );
+}
+
+/// A test-only planes kernel in the shipped library is reported by name: the
+/// check is run with `gguf_dequant` put into the library's set.
+#[test]
+fn a_test_kernel_in_the_shipped_metallib_is_named() {
+    // SAFETY: test-only thread-local setter.
+    unsafe { mlx_sys::mlx_test_gguf_planes_mutation(9) };
+    let c = check(false);
+    // SAFETY: as above.
+    unsafe { mlx_sys::mlx_test_gguf_planes_mutation(0) };
+    assert_eq!(
+        c.report.trim(),
+        "unexpected gguf_dequant",
+        "the check must name the test kernel in paged_attn.metallib"
+    );
+}
+
+/// `gguf_planes_test.metallib` holds the planes' test-only kernels and
+/// nothing else.
+#[test]
+fn the_test_metallib_holds_the_test_kernels_only() {
+    mlx_sys::gguf_planes_use_test_library();
+    let mut count = 0i64;
+    let mut report = vec![0 as c_char; 1 << 16];
+    // SAFETY: `report` is a writable buffer of the length passed.
+    let ok = unsafe {
+        mlx_sys::mlx_test_gguf_planes_test_metallib_check(
+            &mut count,
+            report.as_mut_ptr(),
+            report.len(),
+        )
+    };
+    assert!(ok, "gguf_planes_test.metallib did not load");
+    // SAFETY: the hook wrote a NUL-terminated string into `report`.
+    let report = unsafe { CStr::from_ptr(report.as_ptr()) }.to_string_lossy();
+    assert!(
+        report.is_empty(),
+        "gguf_planes_test.metallib does not match the test kernel names:\n{report}"
+    );
+    assert_eq!(
+        count, PLANES_TEST_NAMES,
+        "functions in gguf_planes_test.metallib"
+    );
+    println!("{count} functions in gguf_planes_test.metallib");
 }
 
 #[test]
@@ -139,6 +214,11 @@ fn jit_preamble_compiles_with_local_helpers() {
 fn every_dispatchable_kernel_builds_a_pipeline() {
     let c = check(true);
     assert!(c.report.is_empty(), "{}", c.report);
-    let expected = BASE_NAMES + if nax_available() { NAX_NAMES } else { 0 };
+    let expected = BASE_NAMES
+        + if nax_available() {
+            NAX_NAMES + PLANES_NAMES
+        } else {
+            0
+        };
     assert_eq!(c.built, expected, "pipelines built");
 }

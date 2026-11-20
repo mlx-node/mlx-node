@@ -71,6 +71,7 @@ fn page_layout(config: &super::config::Config) -> mlx_paged_attn::PageLayout {
         values_token_major: true,
         index_rows: (32 / config.indexer_compress_ratio.max(1)) as u32,
         index_dimension: config.indexer_head_dim as u32,
+        ..mlx_paged_attn::PageLayout::default()
     }
 }
 
@@ -270,6 +271,9 @@ impl PagedBackend for Inner {
             (Vec::new(), Vec::new())
         };
         let publish = text && reuse;
+        if text && !reuse {
+            self.prefix_states.counters.skipped_reuse_off += 1;
+        }
         let keys = if publish {
             prefix_state::pass_keys(tokens, &ends, grid)
         } else {
@@ -397,19 +401,24 @@ impl PagedBackend for Inner {
         let seq = self.active_seq.unwrap_or(0);
         let base = self.decoder.history.len();
         let grid = self.decoder.prefill_slice_size();
+        let limit = self
+            .decoder
+            .group_limit(base, tokens.len())
+            .unwrap_or(super::decoder::GroupLimit::Windows(1));
         let runs = self
             .prefix_states
             .turns
             .get(&seq)
             .filter(|_| self.media_prefill.is_none())
-            .map(|turn| turn.runs(base, base + tokens.len(), grid));
+            .map(|turn| turn.runs(base, base + tokens.len(), grid, limit));
         let logits = if let Some(runs) = runs {
             // Group mode follows the direct-fill state at execution time; a
             // group holds only whole windows of the turn's passes.
             let mut logits = None;
             for run in runs {
                 let (from, to) = (run[0].0, run[run.len() - 1].1);
-                logits = Some(if run.len() > 1 && self.decoder.group_mode(to - from) {
+                let group = run.len() > 1 && self.decoder.group_limit(from, to - from).is_some();
+                logits = Some(if group {
                     let windows: Vec<&[u32]> = run
                         .iter()
                         .map(|&(start, end)| &tokens[start - base..end - base])
@@ -428,8 +437,10 @@ impl PagedBackend for Inner {
                 });
             }
             logits.ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?
-        } else if self.media_prefill.is_none() && self.decoder.group_mode(tokens.len()) {
-            self.prefill_group_part(seq, tokens)?
+        } else if self.media_prefill.is_none()
+            && let Some(limit) = self.decoder.group_limit(base, tokens.len())
+        {
+            self.prefill_group_part(seq, tokens, limit)?
         } else {
             self.prefill_windows(seq, tokens, 0, tokens.len())?
         };
@@ -568,6 +579,9 @@ impl Inner {
         } else {
             Vec::new()
         };
+        if publish && points.is_empty() {
+            states.counters.skipped_no_points += 1;
+        }
         let last = points.last().map_or(0, |point| point.row);
         let blocks = last / prefix_state::BLOCK_ROWS;
         keys.truncate(blocks);
@@ -600,6 +614,7 @@ impl Inner {
                 keys,
                 points,
                 cursor: 0,
+                reached_replay: false,
                 uses,
                 checkpoint: None,
                 replay: None,
@@ -994,22 +1009,58 @@ impl Inner {
         );
     }
 
-    /// One layer-major group over `tokens` (and its tail), observed by the
-    /// MTP owner per window: a prompt without a text turn.
-    fn prefill_group_part(&mut self, seq: SeqId, tokens: &[u32]) -> Result<MxArray> {
+    /// The groups the scheduler pins a prompt's prefill to as whole slices
+    /// (`prompt_tokens`, `cached_prefix` of them cached): a direct fill's
+    /// one group; capped groups on a store whose slots can miss only while
+    /// the turn is the only one open, so other turns' prefill rows keep
+    /// alternating pass by pass.
+    pub(super) fn scheduled_group(
+        &self,
+        prompt_tokens: u32,
+        cached_prefix: u32,
+    ) -> Option<super::decoder::GroupLimit> {
+        if self.media_prefill.is_some() {
+            return None;
+        }
+        let limit = self.decoder.group_limit(
+            cached_prefix as usize,
+            prompt_tokens.saturating_sub(cached_prefix) as usize,
+        )?;
+        let lone = self.open_turns.len() <= 1 && !self.exclusive_turn;
+        (limit == super::decoder::GroupLimit::Whole || lone).then_some(limit)
+    }
+
+    /// Layer-major groups of at most `limit`'s windows over `tokens`, the
+    /// last with the tail, observed by the MTP owner per window: a prompt
+    /// without a text turn.
+    fn prefill_group_part(
+        &mut self,
+        seq: SeqId,
+        tokens: &[u32],
+        limit: super::decoder::GroupLimit,
+    ) -> Result<MxArray> {
         let (windows, tail) = self.decoder.group_windows(tokens);
+        let groups: Vec<_> = windows.chunks(limit.per_group()).collect();
         let tracking = self.mtp_tracking(seq);
-        let (logits, views) = self.decoder.prefill_group(&windows, tail, true, tracking)?;
-        if tracking {
-            for (window, hidden) in windows.iter().zip(&views) {
-                self.observe_mtp(seq, window, hidden)?;
-            }
-            if !tail.is_empty() {
-                let hidden = self.decoder.last_chunk_hidden.clone();
-                self.observe_mtp(seq, tail, &hidden)?;
+        let mut logits = None;
+        for (k, group) in groups.iter().enumerate() {
+            let last = k + 1 == groups.len();
+            let group_tail = if last { tail } else { &[] };
+            let (group_logits, views) = self
+                .decoder
+                .prefill_group(group, group_tail, last, tracking)?;
+            logits = Some(group_logits);
+            if tracking {
+                for (window, hidden) in group.iter().zip(&views) {
+                    self.observe_mtp(seq, window, hidden)?;
+                }
             }
         }
-        Ok(logits)
+        if tracking && !tail.is_empty() {
+            let hidden = self.decoder.last_chunk_hidden.clone();
+            self.observe_mtp(seq, tail, &hidden)?;
+        }
+        logits.ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))
     }
 
     /// One layer-major group over a run of the turn's passes, observed by
@@ -1123,20 +1174,27 @@ impl HybridSchedulerBackend for Inner {
         self.decoder.paged.as_mut()
     }
     fn supports_scheduled_speculation(&self) -> bool {
-        self.has_mtp
+        self.has_mtp || self.draft.is_some()
     }
     fn ownerless_session_in_owner_tables(&self) -> bool {
         true
     }
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
-        self.has_mtp
+        self.has_mtp || self.draft.is_some()
     }
+    /// A draft's rows come from its own rule, never from a measured cost.
     fn scheduled_verification_budget(
         &mut self,
     ) -> Option<&mut crate::engine::verification_budget::ScheduledVerificationBudget> {
+        if self.draft.is_some() {
+            return None;
+        }
         Some(&mut self.mtp.budget)
     }
     fn begin_scheduled_speculation(&mut self, seq: SeqId, position: u32) -> Result<bool> {
+        if self.draft.is_some() {
+            return self.begin_draft_turn(seq);
+        }
         self.begin_mtp(seq, position)
     }
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
@@ -1163,6 +1221,9 @@ impl HybridSchedulerBackend for Inner {
     ) -> Result<crate::engine::backend::DsparkProposal> {
         self.in_decode_pass(|inner| {
             inner.activate_paged_seq(seq)?;
+            if inner.draft.is_some() {
+                return inner.propose_draft(seq, anchor, cap, params, rng);
+            }
             inner.propose_mtp(seq, anchor, cap, params, rng, confidence)
         })
     }
@@ -1179,6 +1240,7 @@ impl HybridSchedulerBackend for Inner {
         self.in_decode_pass(|inner| inner.commit_mtp(rows))
     }
     fn release_scheduled_speculation(&mut self, seq: SeqId) {
+        self.end_draft_turn(seq);
         self.mtp.finish(
             seq,
             (self.active_seq == Some(seq)).then_some(self.decoder.history.len()),
@@ -1188,12 +1250,14 @@ impl HybridSchedulerBackend for Inner {
         super::LANES
     }
     fn scheduled_turn_opened(&mut self, seq: SeqId) {
+        self.draft_peer_opened(seq);
         let first = self.open_turns.is_empty() && !self.exclusive_turn;
         if self.open_turns.insert(seq) {
             self.open_turn(first);
         }
     }
     fn scheduled_turn_closed(&mut self, seq: SeqId) {
+        self.end_draft_turn(seq);
         self.open_turns.remove(&seq);
         self.close_prefix_turn(seq);
     }
@@ -1201,7 +1265,10 @@ impl HybridSchedulerBackend for Inner {
         self.decoder.prefill_slice_size() as u32
     }
     /// A text turn's slices end at its pass ends, the ends a cold prefill of
-    /// its prompt cuts at.
+    /// its prompt cuts at. A turn the scheduler pins as whole slices
+    /// ([`Inner::scheduled_group`]) ends at its groups' ends instead: the
+    /// prompt for a direct fill's one group, each capped run's end on a
+    /// store whose slots can miss.
     fn scheduler_prefill_ends(
         &self,
         seq: SeqId,
@@ -1212,11 +1279,26 @@ impl HybridSchedulerBackend for Inner {
         if turn.prompt_len != prompt_tokens as usize {
             return None;
         }
-        turn.ends
-            .iter()
-            .filter(|&&end| end > cached_prefix as usize)
-            .map(|&end| u32::try_from(end).ok())
-            .collect()
+        let from = cached_prefix as usize;
+        match self.scheduled_group(prompt_tokens, cached_prefix) {
+            Some(super::decoder::GroupLimit::Whole) => Some(vec![prompt_tokens]),
+            Some(limit) => turn
+                .runs(
+                    from,
+                    turn.prompt_len,
+                    self.decoder.prefill_slice_size(),
+                    limit,
+                )
+                .iter()
+                .map(|run| u32::try_from(run[run.len() - 1].1).ok())
+                .collect(),
+            None => turn
+                .ends
+                .iter()
+                .filter(|&&end| end > from)
+                .map(|&end| u32::try_from(end).ok())
+                .collect(),
+        }
     }
     fn scheduler_output_budget_is_rest_of_window(&self) -> bool {
         true
@@ -1231,10 +1313,7 @@ impl HybridSchedulerBackend for Inner {
         Some(pool.lane.window.maximum().min(self.context_cap()))
     }
     fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
-        self.media_prefill.is_none()
-            && self
-                .decoder
-                .group_mode(prompt_tokens.saturating_sub(cached_prefix) as usize)
+        self.scheduled_group(prompt_tokens, cached_prefix).is_some()
     }
     fn max_position_embeddings(&self) -> i32 {
         self.context_cap() as i32
@@ -1283,7 +1362,9 @@ impl HybridSchedulerBackend for Inner {
         // hidden rows at most) until its prompt is in.
         let held = self.mtp.owner_frontier(seq).unwrap_or(0) as u64;
         let rows = u64::from(tokens).saturating_sub(held);
-        let draft = if speculative {
+        let draft = if speculative && self.draft.is_some() {
+            super::decoder::DRAFT_VERIFY_ROWS as u64 * super::memory::row_state_bytes(c)
+        } else if speculative {
             super::memory::draft_state_bytes(c, rows)
                 + rows * super::memory::draft_index_bytes_per_token(c)
         } else if self.has_mtp {
@@ -1536,6 +1617,11 @@ impl Inner {
             ));
         }
         if rows.len() > 1 {
+            // Read at every step: a turn's close can move the store up to
+            // whole (`promote_store`).
+            if rows.len() <= super::decoder::LANE_ROWS && self.decoder.weights.plan.direct {
+                return self.decode_lanes(rows);
+            }
             return self.decode_shared_layers(rows);
         }
         let mut logits = Vec::with_capacity(rows.len());
@@ -1548,6 +1634,53 @@ impl Inner {
             self.observe_mtp(seq, &[token], &hidden)?;
         }
         MxArray::concatenate_many(logits.iter().collect(), Some(0))
+    }
+    /// `rows` through `Decoder::lanes_step`: each row's state leaves its
+    /// parked slot for the step and returns to it advanced.
+    fn decode_lanes(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        let started = std::time::Instant::now();
+        let mut lanes = Vec::with_capacity(rows.len());
+        let mut result = (|| {
+            for &(seq, token) in rows {
+                self.activate_paged_seq(seq)?;
+                self.active_seq = None;
+                lanes.push(super::decoder::Lane {
+                    seq,
+                    token,
+                    state: self.decoder.take_state(),
+                });
+            }
+            self.decoder.lanes_step(&mut lanes)
+        })();
+        let mut hidden = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            hidden.push(lane.state.last_chunk_hidden().to_vec());
+            self.rows.insert(lane.seq, lane.state);
+        }
+        if result.is_ok() {
+            result = (|| -> Result<()> {
+                for (&(seq, token), hidden) in rows.iter().zip(&hidden) {
+                    self.activate_paged_seq(seq)?;
+                    self.observe_mtp(seq, &[token], hidden)?;
+                }
+                Ok(())
+            })()
+            .and(result);
+        }
+        if result.is_err() {
+            // A failed layer has no trusted frontier in any participating row.
+            for &(seq, _) in rows {
+                if let Some(adapter) = &mut self.decoder.paged
+                    && adapter.activate_request(seq).is_ok()
+                {
+                    let _ = adapter.release_request();
+                }
+                self.release_scheduled_recurrent_for(seq);
+            }
+        } else {
+            self.decoder.observe_pass(rows.len(), started.elapsed());
+        }
+        result
     }
     fn decode_shared_layers(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
         let started = std::time::Instant::now();

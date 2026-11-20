@@ -1,9 +1,31 @@
 use super::*;
 use std::sync::atomic::Ordering;
+#[path = "draft_attach_tests.rs"]
+mod draft_attach;
+#[path = "draft_cycle_tests.rs"]
+mod draft_cycle;
+#[path = "draft_rows_tests.rs"]
+mod draft_rows;
+#[path = "draft_switch_tests.rs"]
+mod draft_switch;
+#[path = "draft_turns_tests.rs"]
+mod draft_turns;
+#[path = "draft_view_tests.rs"]
+mod draft_view;
+#[path = "hidden_taps_tests.rs"]
+mod hidden_taps;
+#[path = "lanes_tests.rs"]
+mod lanes;
+#[path = "prefill_store_tests.rs"]
+mod prefill_store;
 #[path = "prefix_disk_tests.rs"]
 mod prefix_disk_tests;
 #[path = "prefix_reuse_tests.rs"]
 mod prefix_reuse;
+#[path = "promote_tests.rs"]
+mod promote;
+#[path = "route_step_tests.rs"]
+mod route_step;
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp")
 }
@@ -2657,57 +2679,7 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         prefix_states: prefix_state::States::new(Vec::new()),
         disk: None,
         telemetry: Arc::new(prefix_disk::Telemetry::default()),
-    }
-}
-
-#[test]
-fn device_route_replay_restores_recurrent_and_paged_frontiers() {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    for paged in [false, true] {
-        for boundary in [15, 16, 31, 32] {
-            let mut candidate = tiny_inner();
-            let mut reference = tiny_inner();
-            if paged {
-                candidate.activate_paged_seq(1).unwrap();
-                reference.activate_paged_seq(1).unwrap();
-            } else {
-                candidate.decoder.paged = None;
-                reference.decoder.paged = None;
-            }
-            for i in 0..boundary {
-                let token = 3 + (i % 10) as u32;
-                candidate.decoder.step(token).unwrap();
-                reference.decoder.step(token).unwrap();
-            }
-            let base = candidate.decoder.snapshot();
-            // A different tentative token poisons every recurrent/KV update,
-            // exercising rejection more strongly than an all-hit forced replay.
-            candidate.decoder.step(11).unwrap();
-            let got = candidate
-                .decoder
-                .replay_device_token(base, 7, true)
-                .unwrap();
-            let want = reference.decoder.step(7).unwrap();
-            assert_eq!(
-                &*got.to_float32().unwrap(),
-                &*want.to_float32().unwrap(),
-                "replay paged={paged}, boundary={boundary}"
-            );
-            assert_eq!(candidate.decoder.history, reference.decoder.history);
-            if paged {
-                assert_eq!(
-                    candidate.decoder.paged.as_ref().unwrap().request_tokens(),
-                    reference.decoder.paged.as_ref().unwrap().request_tokens()
-                );
-            }
-            for token in [9, 4, 12] {
-                assert_eq!(
-                    &*candidate.decoder.step(token).unwrap().to_float32().unwrap(),
-                    &*reference.decoder.step(token).unwrap().to_float32().unwrap(),
-                    "continuation paged={paged}, boundary={boundary}, token={token}"
-                );
-            }
-        }
+        draft: None,
     }
 }
 
@@ -2923,54 +2895,6 @@ fn scheduled_turns_open_at_admission_and_close_when_they_finish() {
     assert_eq!(most_open, 2, "the second admission joined the first turn");
     assert!(state.inner.open_turns.is_empty());
     assert!(!state.inner.exclusive_turn);
-}
-
-/// A route miss on request A sets A's cooldown; B starts with none while A
-/// is parked, and A resumes with its own and counts it down on its next
-/// token. Every replay, of a decode token or a prefill window, counts once in
-/// the live counters.
-/// MUTATION: `take_state` parks a row with a zero cooldown → red (A resumes
-/// at 0).
-#[test]
-fn a_route_miss_keeps_its_cooldown_across_row_switches() {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    let mut inner = tiny_inner();
-    let replays = |inner: &Inner| {
-        inner
-            .decoder
-            .weights
-            .live
-            .route_replays
-            .load(Ordering::Relaxed)
-    };
-    inner.activate_paged_seq(1).unwrap();
-    for token in [3, 4, 5] {
-        inner.decoder.step(token).unwrap();
-    }
-    let base = inner.decoder.snapshot();
-    inner.decoder.step(11).unwrap();
-    inner.decoder.replay_device_token(base, 7, true).unwrap();
-    let cooldown = inner.decoder.device_route_cooldown;
-    assert!(cooldown > 0, "a miss sets the cooldown");
-    assert_eq!(replays(&inner), 1);
-    inner.activate_paged_seq(2).unwrap();
-    assert_eq!(inner.decoder.device_route_cooldown, 0, "B starts with none");
-    inner.decoder.step(6).unwrap();
-    inner.activate_paged_seq(1).unwrap();
-    assert_eq!(
-        inner.decoder.device_route_cooldown, cooldown,
-        "A resumes with its own cooldown"
-    );
-    inner.decoder.step(8).unwrap();
-    assert_eq!(inner.decoder.device_route_cooldown, cooldown - 1);
-    let base = inner.decoder.snapshot();
-    inner.decoder.prefill_chunk(&[11; 5], None, true).unwrap();
-    inner
-        .decoder
-        .replay_device_prefill(base, &[3, 4, 5, 6, 7], None, true)
-        .unwrap();
-    assert_eq!(replays(&inner), 2);
-    assert_eq!(inner.decoder.device_route_cooldown, cooldown - 1);
 }
 
 /// A store the host gate refused prefills each pass at the rows whose
@@ -5923,6 +5847,18 @@ fn expert_kernel_follows_the_window_not_the_bank() {
 /// under 256 (the host sort's floor), under four rows per slot (MLX's
 /// gather-vector pick), at or above it (NAX), a 200-token window whose first
 /// group crosses MLX's rows-per-expert line, and a 75-token tail.
+/// The pieces a group's union lease hands a window are any subset of its
+/// experts: every window (all three kernel classes) also runs random
+/// subsets, a piece of one assignment and an empty piece, which takes no
+/// lease. Every case runs twice: as the process is set, and with true f32
+/// on the thread, where the NAX kernels refuse and MLX's sorted gather runs
+/// a Tiles window's down projection.
+/// MUTATION: a piece picks its kernel from its own size -> the one-assignment
+/// piece of a Tiles or Gather window runs the per-row GEMV -> red.
+/// MUTATION: an empty piece is leased like the others -> red.
+/// MUTATION: a sorted gather of fewer rows than MLX's batched floor is not
+/// padded -> a Tiles piece below four rows per slot runs MLX's per-row GEMV
+/// under true f32 -> red.
 #[test]
 fn slot_groups_match_the_whole_window_bit_for_bit() {
     use crate::array::DType;
@@ -5951,6 +5887,7 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
             &mut self,
             experts: &[u32],
         ) -> Result<Option<([std::sync::Arc<weights::Weight>; 3], Vec<u32>, usize)>> {
+            assert!(!experts.is_empty(), "an empty piece took a lease");
             let mut slot_of = HashMap::new();
             let mut occupants = Vec::new();
             for &expert in experts {
@@ -5999,15 +5936,18 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
             Ok(())
         }
     }
+    let next = |state: &mut u64| {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as usize
+    };
     let routes = |tokens: usize, pool: usize, mut state: u64| -> Vec<u32> {
         let mut ids = Vec::with_capacity(tokens * top);
         for _ in 0..tokens {
             let mut picked: Vec<u32> = Vec::with_capacity(top);
             while picked.len() < top {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let expert = ((state >> 33) % pool as u64) as u32;
+                let expert = (next(&mut state) % pool) as u32;
                 if !picked.contains(&expert) {
                     picked.push(expert);
                 }
@@ -6017,141 +5957,233 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
         ids
     };
     // (tokens, expert pool, remainder-row targets beside 454 and 461 slots)
-    let windows: [(usize, usize, &[usize]); 5] = [
+    let windows: [(usize, usize, &[usize]); 6] = [
         (1024, 470, &[40, 120, 600, 1400, 2000]),
         (2000, 470, &[40, 600]),
         (200, 470, &[]),
         (75, 300, &[40]),
         (20, 470, &[]),
+        (8, 470, &[]),
     ];
-    let mut failures = Vec::new();
-    for (tokens, pool, targets) in windows {
-        let ids = routes(tokens, pool, 0x5eed + tokens as u64);
-        let rows = ids.len();
-        let x = MxArray::from_float32(
-            &(0..tokens * h)
-                .map(|i| ((i * 13 % 251) as f32 - 125.) / 128. + ((i / h) % 17) as f32 / 64.)
-                .collect::<Vec<_>>(),
-            &[1, tokens as i64, h as i64],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let scores = MxArray::from_float32(
-            &(0..rows)
-                .map(|i| (i % 11 + 1) as f32 * 0.0113)
-                .collect::<Vec<_>>(),
-            &[1, rows as i64, 1],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let kernel = math::ExpertKernel::for_window(rows, E);
-        let selected = MxArray::from_uint32(&ids, &[rows as i64]).unwrap();
-        let (out, inverse) =
-            decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, kernel, top)
-                .unwrap();
-        let reference = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
+    let combined = |out: &MxArray, inverse: Option<&MxArray>, scores: &MxArray| {
+        math::combine_expert_rows(out, scores, inverse, top)
             .unwrap()
             .to_uint16_native()
+            .unwrap()
+    };
+    let compare = |actual: &[u16], reference: &[u16]| {
+        let differing = actual.iter().zip(reference).filter(|(a, b)| a != b).count();
+        let first = actual.iter().zip(reference).position(|(a, b)| a != b);
+        (differing, first)
+    };
+    let mut classes = Vec::new();
+    let mut failures = Vec::new();
+    for tf32 in [None, Some(false)] {
+        crate::array::set_thread_tf32(tf32);
+        for (tokens, pool, targets) in windows {
+            let ids = routes(tokens, pool, 0x5eed + tokens as u64);
+            let rows = ids.len();
+            let x = MxArray::from_float32(
+                &(0..tokens * h)
+                    .map(|i| ((i * 13 % 251) as f32 - 125.) / 128. + ((i / h) % 17) as f32 / 64.)
+                    .collect::<Vec<_>>(),
+                &[1, tokens as i64, h as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
             .unwrap();
-        // The whole-bank bits, for comparison across trees.
-        let digest = reference.iter().fold(0xcbf29ce484222325u64, |d, &v| {
-            (d ^ u64::from(v)).wrapping_mul(0x100000001b3)
-        });
-        eprintln!("slot groups: whole-bank tokens {tokens} rows {rows} digest {digest:016x}");
-        let order = route_plan::expert_order(&ids, E).unwrap();
-        let mut counts = vec![0usize; E];
-        for &e in &ids {
-            counts[e as usize] += 1;
-        }
-        // Rows of the experts past slot `c` in last-use order: the remainder.
-        let remainder = |c: usize| {
-            order[c.min(order.len())..]
-                .iter()
-                .map(|&e| counts[e as usize])
-                .sum::<usize>()
-        };
-        let mut capacities = vec![454usize, 461];
-        for &target in targets {
-            capacities.push(
-                (top..order.len())
-                    .min_by_key(|&c| remainder(c).abs_diff(target))
-                    .unwrap(),
-            );
-        }
-        if tokens == 1024 {
-            let bands: Vec<_> = capacities[2..].iter().map(|&c| (c, remainder(c))).collect();
-            assert!(
-                bands[0].1 <= 80
-                    && (81..256).contains(&bands[1].1)
-                    && (256..4 * bands[2].0).contains(&bands[2].1)
-                    && (256..4 * bands[3].0).contains(&bands[3].1)
-                    && bands[4].1 >= 4 * bands[4].0,
-                "remainder bands {bands:?}"
-            );
-        }
-        if tokens == 200 {
-            // One group whose bank has exactly the window's experts: four
-            // rows per slot, the NAX line of the old bank-keyed choice.
-            capacities.push(order.len());
-        }
-        if tokens == 75 {
-            capacities.push(200);
-        }
-        if tokens == 20 {
-            capacities.push(100);
-        }
-        for capacity in capacities {
-            let mut slots = SlotBanks {
-                banks: &banks,
-                capacity,
-                leases: 0,
+            let scores = MxArray::from_float32(
+                &(0..rows)
+                    .map(|i| (i % 11 + 1) as f32 * 0.0113)
+                    .collect::<Vec<_>>(),
+                &[1, rows as i64, 1],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let kernel = math::ExpertKernel::for_window(rows, E);
+            classes.push(kernel);
+            let selected = MxArray::from_uint32(&ids, &[rows as i64]).unwrap();
+            let (out, inverse) =
+                decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, kernel, top)
+                    .unwrap();
+            let reference = combined(&out, inverse.as_ref(), &scores);
+            // The whole-bank bits, for comparison across trees.
+            let digest = reference.iter().fold(0xcbf29ce484222325u64, |d, &v| {
+                (d ^ u64::from(v)).wrapping_mul(0x100000001b3)
+            });
+            eprintln!("slot groups: whole-bank tokens {tokens} rows {rows} digest {digest:016x}");
+            let order = route_plan::expert_order(&ids, E).unwrap();
+            let mut counts = vec![0usize; E];
+            for &e in &ids {
+                counts[e as usize] += 1;
+            }
+            // Rows of the experts past slot `c` in last-use order: the remainder.
+            let remainder = |c: usize| {
+                order[c.min(order.len())..]
+                    .iter()
+                    .map(|&e| counts[e as usize])
+                    .sum::<usize>()
             };
-            let (out, inverse, groups) = if order.len() <= capacity {
-                let (group_banks, local, count) = slots.lease(&ids).unwrap().unwrap();
-                let local = MxArray::from_uint32(&local, &[rows as i64]).unwrap();
-                let (out, inverse) = decoder::Decoder::single_slot_group_rows(
-                    &x,
-                    &local,
-                    &group_banks,
-                    count,
-                    kernel,
-                    top,
-                )
-                .unwrap();
-                (out, inverse, 1)
-            } else {
-                let groups = route_plan::assignment_groups(&ids, &order, E, capacity).unwrap();
+            let mut capacities = vec![454usize, 461];
+            for &target in targets {
+                capacities.push(
+                    (top..order.len())
+                        .min_by_key(|&c| remainder(c).abs_diff(target))
+                        .unwrap(),
+                );
+            }
+            if tokens == 1024 {
+                let bands: Vec<_> = capacities[2..].iter().map(|&c| (c, remainder(c))).collect();
+                assert!(
+                    bands[0].1 <= 80
+                        && (81..256).contains(&bands[1].1)
+                        && (256..4 * bands[2].0).contains(&bands[2].1)
+                        && (256..4 * bands[3].0).contains(&bands[3].1)
+                        && bands[4].1 >= 4 * bands[4].0,
+                    "remainder bands {bands:?}"
+                );
+            }
+            if tokens == 200 {
+                // One group whose bank has exactly the window's experts: four
+                // rows per slot, the NAX line of the old bank-keyed choice.
+                capacities.push(order.len());
+            }
+            if tokens == 75 {
+                capacities.push(200);
+            }
+            if tokens == 20 {
+                capacities.push(100);
+            }
+            for capacity in capacities {
+                let mut slots = SlotBanks {
+                    banks: &banks,
+                    capacity,
+                    leases: 0,
+                };
+                let (out, inverse, groups) = if order.len() <= capacity {
+                    let (group_banks, local, count) = slots.lease(&ids).unwrap().unwrap();
+                    let local = MxArray::from_uint32(&local, &[rows as i64]).unwrap();
+                    let (out, inverse) = decoder::Decoder::single_slot_group_rows(
+                        &x,
+                        &local,
+                        &group_banks,
+                        count,
+                        kernel,
+                        top,
+                    )
+                    .unwrap();
+                    (out, inverse, 1)
+                } else {
+                    let groups = route_plan::assignment_groups(&ids, &order, E, capacity).unwrap();
+                    let (out, inverse) = decoder::Decoder::grouped_expert_rows(
+                        &x, &ids, &groups, kernel, top, &mut slots,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    (out, Some(inverse), groups.len())
+                };
+                assert_eq!(slots.leases, groups);
+                let actual = combined(&out, inverse.as_ref(), &scores);
+                let (differing, first) = compare(&actual, &reference);
+                let line = format!(
+                    "tf32 {tf32:?} tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {} {kernel:?}: {differing} of {} bf16 values differ, first {first:?}",
+                    order.len(),
+                    remainder(capacity),
+                    reference.len()
+                );
+                eprintln!("slot groups: {line}");
+                if differing > 0 {
+                    failures.push(line);
+                }
+            }
+            // One assignment moves to an expert no other row routes to, so one
+            // piece holds a single assignment.
+            let lone = (E - 1) as u32;
+            let mut union_ids = ids.clone();
+            union_ids[rows / 2] = lone;
+            let union_selected = MxArray::from_uint32(&union_ids, &[rows as i64]).unwrap();
+            let (out, inverse) = decoder::Decoder::single_slot_group_rows(
+                &x,
+                &union_selected,
+                &banks,
+                E,
+                kernel,
+                top,
+            )
+            .unwrap();
+            let union_reference = combined(&out, inverse.as_ref(), &scores);
+            let mut experts: Vec<u32> = route_plan::expert_order(&union_ids, E)
+                .unwrap()
+                .into_iter()
+                .filter(|&e| e != lone)
+                .collect();
+            for split in [2usize, 5] {
+                let mut state = 0x9e37 + (tokens * split) as u64;
+                for k in (1..experts.len()).rev() {
+                    experts.swap(k, next(&mut state) % (k + 1));
+                }
+                let mut cuts: Vec<usize> = (1..split)
+                    .map(|_| 1 + next(&mut state) % (experts.len() - 1))
+                    .collect();
+                cuts.push(experts.len());
+                cuts.sort_unstable();
+                cuts.dedup();
+                let mut pieces: Vec<Vec<u32>> = Vec::new();
+                let mut start = 0;
+                for cut in cuts {
+                    pieces.push(experts[start..cut].to_vec());
+                    start = cut;
+                }
+                pieces.insert(1, Vec::new());
+                pieces.insert(pieces.len() - 1, vec![lone]);
+                let mut piece_of = vec![usize::MAX; E];
+                for (p, piece) in pieces.iter().enumerate() {
+                    for &e in piece {
+                        piece_of[e as usize] = p;
+                    }
+                }
+                let mut groups = vec![Vec::new(); pieces.len()];
+                for (assignment, &e) in union_ids.iter().enumerate() {
+                    groups[piece_of[e as usize]].push(assignment);
+                }
+                let sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+                assert!(sizes.contains(&0) && sizes.contains(&1), "pieces {sizes:?}");
+                let mut slots = SlotBanks {
+                    banks: &banks,
+                    capacity: pieces.iter().map(Vec::len).max().unwrap(),
+                    leases: 0,
+                };
                 let (out, inverse) = decoder::Decoder::grouped_expert_rows(
-                    &x, &ids, &groups, kernel, top, &mut slots,
+                    &x, &union_ids, &groups, kernel, top, &mut slots,
                 )
                 .unwrap()
                 .unwrap();
-                (out, Some(inverse), groups.len())
-            };
-            assert_eq!(slots.leases, groups);
-            let actual = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
-                .unwrap()
-                .to_uint16_native()
-                .unwrap();
-            let differing = actual
-                .iter()
-                .zip(&reference)
-                .filter(|(a, b)| a != b)
-                .count();
-            let first = actual.iter().zip(&reference).position(|(a, b)| a != b);
-            let line = format!(
-                "tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {} {kernel:?}: {differing} of {} bf16 values differ, first {first:?}",
-                order.len(),
-                remainder(capacity),
-                reference.len()
-            );
-            eprintln!("slot groups: {line}");
-            if differing > 0 {
-                failures.push(line);
+                assert_eq!(
+                    slots.leases,
+                    pieces.len() - 1,
+                    "the empty piece takes no lease"
+                );
+                let actual = combined(&out, Some(&inverse), &scores);
+                let (differing, first) = compare(&actual, &union_reference);
+                let line = format!(
+                    "tf32 {tf32:?} union tokens {tokens} rows {rows} {kernel:?} pieces of {sizes:?} assignments: {differing} of {} bf16 values differ, first {first:?}",
+                    union_reference.len()
+                );
+                eprintln!("slot groups: {line}");
+                if differing > 0 {
+                    failures.push(line);
+                }
             }
         }
+    }
+    crate::array::set_thread_tf32(None);
+    for class in [
+        math::ExpertKernel::Tiles,
+        math::ExpertKernel::Gather,
+        math::ExpertKernel::Rows,
+    ] {
+        assert!(classes.contains(&class), "no {class:?} window: {classes:?}");
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
@@ -8578,7 +8610,9 @@ fn real_model_greedy_argmax_matches_expected() {
         let prompt = real_prompt(Path::new(&inputs), &case);
         decoder.reset();
         decoder.weights.begin_turn().unwrap();
-        let group = decoder.group_mode(prompt.len());
+        let group = decoder
+            .group_limit(decoder.history.len(), prompt.len())
+            .is_some();
         let mut logits = decoder.prefill_prompt(&prompt).unwrap();
         let mut tokens = Vec::with_capacity(steps);
         for i in 0..steps {
@@ -9150,12 +9184,12 @@ fn direct_fill_progress_enables_the_layer_major_group_gate() {
     let mut decoder = group_fixture_decoder(256, 1);
     decoder.weights.plan.direct = true;
     decoder.weights.set_direct_fill_pass_for_test(true);
-    assert!(decoder.group_mode(600));
+    assert!(decoder.group_limit(0, 600).is_some());
     decoder.weights.set_direct_fill_pass_for_test(false);
-    assert!(!decoder.group_mode(600));
+    assert!(decoder.group_limit(0, 600).is_none());
     decoder.weights.set_direct_fill_pass_for_test(true);
     decoder.weights.plan.direct = false;
-    assert!(!decoder.group_mode(600));
+    assert!(decoder.group_limit(0, 600).is_none());
 }
 
 fn f32s(a: &MxArray) -> Vec<f32> {
@@ -9531,7 +9565,9 @@ fn real_model_group_matches_window_at_a_time_during_direct_fill() {
         decoder
             .weights
             .set_direct_fill_pass_for_test(run == "group");
-        let group = decoder.group_mode(prompt.len());
+        let group = decoder
+            .group_limit(decoder.history.len(), prompt.len())
+            .is_some();
         assert_eq!(group, run == "group", "{run}: direct-fill group gate");
         decoder.tentative_commits.clear();
         let started = std::time::Instant::now();
@@ -9661,6 +9697,8 @@ fn tiny_planned_inner() -> Inner {
         None,
         false,
         false,
+        load_plan::DraftPrice::default(),
+        0,
     )
     .unwrap();
     inner
@@ -9783,6 +9821,7 @@ fn token_major_page_gathers_read_the_stored_rows() {
         values_token_major: true,
         index_rows: 8,
         index_dimension: 128,
+        ..mlx_paged_attn::PageLayout::default()
     };
     for dtype in [MetalDtype::Int8, MetalDtype::BFloat16] {
         let Some((mut adapter, _)) = adapter_with_layout(config.clone(), 6, 6, dtype, layout)

@@ -18,6 +18,7 @@ import {
   type ChatThreadProps,
 } from '../ui/src/components/chat-thread.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
+import { formatClock } from '../ui/src/lib/format.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import {
   CITED_ANSWER,
@@ -41,6 +42,10 @@ import {
   outcomeSample,
   streamingSample,
   user,
+  finishedRun,
+  RUN_ID,
+  runSample,
+  workflowRun,
   type ThreadSample,
 } from './helpers/chat-thread-fixtures.js';
 import { allByRole, byRole, skipAnimations, waitFor } from './render.js';
@@ -99,6 +104,13 @@ afterEach(() => {
   container.remove();
   mounted = undefined;
 });
+
+/** A wait line's words, without its clock. */
+function waitText(line: Element | null | undefined): string | undefined {
+  const copy = line?.cloneNode(true) as HTMLElement | undefined;
+  copy?.querySelector('[data-wait-clock]')?.remove();
+  return copy?.textContent ?? undefined;
+}
 
 function anchors(container: HTMLElement): string[] {
   return [...container.querySelectorAll('a[href]')].map((a) => a.getAttribute('href') ?? '');
@@ -629,7 +641,7 @@ describe('ChatThread: streaming and live region', () => {
       container.querySelector<HTMLElement>('article[aria-busy="true"][data-wait-line]');
     expect(line()?.getAttribute('data-wait-line')).toBe('think');
     expect(line()?.getAttribute('aria-label')).toBe('Assistant');
-    expect(line()?.textContent).toBe('Thinking…');
+    expect(waitText(line())).toBe('Thinking…');
     const orb = line()?.querySelectorAll('canvas[data-wait-orb]');
     expect(orb).toHaveLength(1);
     expect(orb?.[0]?.getAttribute('data-wait-orb')).toBe('think');
@@ -657,7 +669,7 @@ describe('ChatThread: streaming and live region', () => {
         vi.advanceTimersByTime(3_000);
       });
       const line = container.querySelector('article[aria-busy="true"][data-wait-line="hold"]');
-      expect(line?.textContent).toBe(CHAT.pendingWaiting);
+      expect(waitText(line)).toBe(CHAT.pendingWaiting);
       expect(line?.querySelector('canvas[data-wait-orb="hold"]')).toBe(orb);
     } finally {
       vi.useRealTimers();
@@ -979,6 +991,556 @@ describe('ChatThread: a message that waits for its model', () => {
     expect(onUnload).toHaveBeenCalledTimes(1);
     rerender(threadOf(sample, { model: 'qwen-a', host, unload: { state: 'off', onUnload } }));
     expect(unloadButton()?.disabled).toBe(true);
+  });
+});
+
+describe('ChatThread: the wait line between the steps of a long turn', () => {
+  const NOW = 1_794_411_600_000;
+  const tool = (status: string, ts: number, endTs?: number, id = 'r1'): TranscriptEntry => ({
+    kind: 'tool',
+    ts,
+    id,
+    name: 'probe',
+    title: 'Probe src/main.rs',
+    status,
+    ...(endTs === undefined ? {} : { endTs }),
+  });
+  const work = (entries: TranscriptEntry[]): ThreadSample => ({
+    mode: 'work',
+    entries: [user('Fix the build', NOW - 600_000), ...entries],
+    turns: [],
+    turn: { turnId: 't', phase: 'running', startedAt: NOW - 600_000, wait: null },
+    lastEnd: null,
+  });
+  const afterRead = work([
+    thinking('Look at main', NOW - 200_000, NOW - 190_000),
+    tool('completed', NOW - 189_000, NOW - 65_000),
+  ]);
+  type Request = NonNullable<NonNullable<ChatThreadProps['host']>['requests']>[number];
+  const request = (over: Partial<Request>): Request => ({
+    session: 'conv-1',
+    modelId: 'qwen-a',
+    phase: 'decode',
+    startedAt: NOW - 30_000,
+    prefillDone: null,
+    prefillTotal: null,
+    generated: null,
+    ...over,
+  });
+  const hostWith = (requests: Request[], queued = 0) => ({
+    inference: 'ready' as const,
+    loading: [],
+    resident: [{ modelId: 'qwen-a', sizeBytes: null }],
+    answers: [{ modelId: 'qwen-a', inFlight: requests.length, maxConcurrent: 4, queued, lastStart: NOW - 30_000 }],
+    requests,
+  });
+  const props = (requests: Request[], queued = 0): Partial<ChatThreadProps> => ({
+    conversationId: 'conv-1',
+    model: 'qwen-a',
+    host: hostWith(requests, queued),
+  });
+  const line = (container: HTMLElement): HTMLElement | null =>
+    container.querySelector<HTMLElement>('article[aria-busy="true"][data-wait-line]');
+  const clock = (container: HTMLElement): string | undefined =>
+    line(container)?.querySelector('[data-wait-clock]')?.textContent ?? undefined;
+  const timers = () =>
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+
+  it('after a finished tool row the turn says it is working, with the time since that step ended', () => {
+    timers();
+    try {
+      const container = mount(threadOf(afterRead, { model: 'qwen-a' }));
+      expect(container.textContent).toContain('Thought');
+      expect(waitText(line(container))).toBe(CHAT.pendingWorking);
+      expect(line(container)?.getAttribute('data-wait-line')).toBe('think');
+      expect(clock(container)).toBe('1:05');
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(waitText(line(container))).toBe(CHAT.pendingWaiting);
+      expect(clock(container)).toBe('1:08');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names what the engine does with this conversation's request: queued, reading the prompt, generating", () => {
+    const container = mount(threadOf(afterRead, props([request({ phase: 'queued' })])));
+    expect(waitText(line(container))).toBe(CHAT.pendingQueued);
+    expect(line(container)?.getAttribute('data-wait-line')).toBe('hold');
+    rerender(
+      threadOf(
+        afterRead,
+        props([
+          request({ session: 'conv-2', phase: 'decode', startedAt: NOW - 400_000 }),
+          request({ phase: 'prefill', prefillDone: 69_300, prefillTotal: 121_300 }),
+        ]),
+      ),
+    );
+    expect(waitText(line(container))).toBe(fill(CHAT.pendingReadingOf, { done: '69.3K', total: '121.3K' }));
+    const bar = byRole(container, 'meter', CHAT.pendingReadMeter);
+    expect(bar?.getAttribute('aria-valuenow')).toBe('57');
+    expect(bar?.getAttribute('aria-valuetext')).toBe('57%, 69.3K of 121.3K');
+    rerender(threadOf(afterRead, props([request({ phase: 'decode' })])));
+    expect(waitText(line(container))).toBe(CHAT.pendingThinking);
+    expect(container.querySelector('[role="meter"]')).toBeNull();
+  });
+
+  it("another conversation's request never reads as this one's: the model is busy only when ours may wait behind it", () => {
+    const other = request({ session: 'conv-2', phase: 'prefill', prefillDone: 5_000, prefillTotal: 20_000 });
+    const container = mount(threadOf(afterRead, props([other])));
+    expect(waitText(line(container))).toBe(CHAT.pendingWorking);
+    rerender(threadOf(afterRead, props([other], 1)));
+    expect(waitText(line(container))).toBe(fill(CHAT.pendingBusyReading, { done: '5,000', total: '20K' }));
+    expect(waitText(line(container))).not.toContain('conversation');
+    rerender(threadOf(afterRead, props([request({ session: null, phase: 'decode', startedAt: NOW - 10_000 })])));
+    expect(waitText(line(container))).toBe(CHAT.pendingBusy);
+    rerender(threadOf(afterRead, props([request({ session: null, phase: 'decode', startedAt: NOW - 120_000 })])));
+    expect(waitText(line(container))).toBe(CHAT.pendingWorking);
+  });
+
+  it('a model load or a stop keeps its own row between steps', () => {
+    const loading = {
+      ...hostWith([]),
+      inference: 'loading' as const,
+      loading: [{ modelId: 'qwen-a', startedAt: NOW - 5_000, phase: 'weights' as const, stepsDone: 0, steps: 0 }],
+    };
+    const container = mount(threadOf(afterRead, { conversationId: 'conv-1', model: 'qwen-a', host: loading }));
+    expect(container.querySelector('[data-load-card]')).not.toBeNull();
+    expect(line(container)).toBeNull();
+    rerender(
+      threadOf(
+        { ...afterRead, turn: { turnId: 't', phase: 'cancelling', startedAt: NOW - 600_000, wait: null } },
+        props([request({ phase: 'decode' })]),
+      ),
+    );
+    expect(waitText(line(container))).toBe(CHAT.pendingStopping);
+  });
+
+  it('hides while a tool runs, while text streams, and while a permission card is open', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const container = mount(threadOf(work([tool('in_progress', NOW - 1_000)]), props([request({})])));
+      expect(line(container)).toBeNull();
+      rerender(threadOf(work([tool('pending', NOW - 1_000)]), props([request({})])));
+      expect(line(container)).toBeNull();
+      rerender(threadOf(afterRead, { ...props([request({})]), asking: true }));
+      expect(line(container)).toBeNull();
+      const streaming = work([tool('completed', NOW - 9_000, NOW - 8_000), answer('Now I', NOW - 500)]);
+      rerender(threadOf(streaming, { ...props([request({})]), asOfMs: NOW - 500 }));
+      expect(line(container)).toBeNull();
+      expect(container.textContent).toContain('Now I');
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(waitText(line(container))).toBe(CHAT.pendingThinking);
+      rerender(threadOf(work([thinking('Hm', NOW, NOW + 100)]), { ...props([]), asOfMs: NOW + 3_100 }));
+      expect(line(container)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a thought or text quiet for 3 s hands its live mark to the wait line: one Thinking, not two', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const live = (container: HTMLElement): Element[] => [...container.querySelectorAll('[data-live]')];
+      const thought = work([thinking('Now call the build', NOW - 500, NOW - 400)]);
+      const container = mount(threadOf(thought, { ...props([request({})]), asOfMs: NOW - 400 }));
+      expect(line(container)).toBeNull();
+      expect(live(container)).toHaveLength(1);
+      expect(container.textContent).toContain(CHAT.thinking);
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(waitText(line(container))).toBe(CHAT.pendingThinking);
+      expect(live(container)).toHaveLength(0);
+      expect(container.textContent?.split(CHAT.thinking)).toHaveLength(2);
+      expect(container.textContent).toContain(CHAT.thought);
+      rerender(threadOf(work([answer('Now I', NOW + 2_900)]), { ...props([request({})]), asOfMs: NOW + 3_000 }));
+      expect(line(container)).toBeNull();
+      expect(container.querySelector('[data-role="assistant"][data-live]')).not.toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(waitText(line(container))).toBe(CHAT.pendingThinking);
+      expect(container.querySelector('[data-role="assistant"][data-live]')).toBeNull();
+      expect(container.textContent).not.toContain(CHAT.writing);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the clock restarts at each new wait', () => {
+    timers();
+    try {
+      const first = work([tool('completed', NOW - 70_000, NOW - 61_000)]);
+      const container = mount(threadOf(first, props([])));
+      expect(clock(container)).toBe('1:01');
+      act(() => {
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(clock(container)).toBe('1:03');
+      const running = work([
+        tool('completed', NOW - 70_000, NOW - 61_000),
+        tool('in_progress', NOW + 2_000, undefined, 'r2'),
+      ]);
+      rerender(threadOf(running, props([])));
+      expect(line(container)).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      const second = work([
+        tool('completed', NOW - 70_000, NOW - 61_000),
+        tool('completed', NOW + 2_000, NOW + 12_000, 'r2'),
+      ]);
+      rerender(threadOf(second, props([])));
+      expect(clock(container)).toBe('0:00');
+      act(() => {
+        vi.advanceTimersByTime(4_000);
+      });
+      expect(clock(container)).toBe('0:04');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('ChatThread: the compaction line and its marker', () => {
+  const NOW = 1_794_411_600_000;
+  const tool = (ts: number, endTs: number): TranscriptEntry => ({
+    kind: 'tool',
+    ts,
+    id: 'r1',
+    name: 'probe',
+    title: 'Probe src/main.rs',
+    status: 'completed',
+    endTs,
+  });
+  const work = (entries: TranscriptEntry[]): ThreadSample => ({
+    mode: 'work',
+    entries: [user('Fix the build', NOW - 600_000), ...entries],
+    turns: [],
+    turn: { turnId: 't', phase: 'running', startedAt: NOW - 600_000, wait: null },
+    lastEnd: null,
+  });
+  const afterRead = work([thinking('Look at main', NOW - 200_000, NOW - 190_000), tool(NOW - 189_000, NOW - 65_000)]);
+  const compaction = { phase: 'running' as const, startedAt: NOW - 42_000, tokensBefore: 222_822 };
+  type Request = NonNullable<NonNullable<ChatThreadProps['host']>['requests']>[number];
+  const request = (over: Partial<Request>): Request => ({
+    session: 'conv-1',
+    modelId: 'qwen-a',
+    phase: 'decode',
+    startedAt: NOW - 40_000,
+    prefillDone: null,
+    prefillTotal: null,
+    generated: null,
+    ...over,
+  });
+  const props = (requests: Request[], over: Partial<ChatThreadProps> = {}): Partial<ChatThreadProps> => ({
+    conversationId: 'conv-1',
+    model: 'qwen-a',
+    host: {
+      inference: 'ready',
+      loading: [],
+      resident: [{ modelId: 'qwen-a', sizeBytes: null }],
+      answers: [{ modelId: 'qwen-a', inFlight: 1, maxConcurrent: 4, queued: 0, lastStart: NOW - 40_000 }],
+      requests,
+    },
+    compaction,
+    ...over,
+  });
+  const lines = (container: HTMLElement): HTMLElement[] => [
+    ...container.querySelectorAll<HTMLElement>('article[aria-busy="true"][data-wait-line]'),
+  ];
+  const detail = (container: HTMLElement): string | null =>
+    container.querySelector('[data-compaction-line] article .text-muted')?.textContent ?? null;
+  const help = (container: HTMLElement): boolean =>
+    container.querySelector('[data-compaction-line] > p')?.textContent === CHAT.compactingHelp;
+
+  it('takes the place of the wait line: one line with the fold orb and the clock since the compaction started', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    try {
+      const container = mount(threadOf(afterRead, props([])));
+      expect(lines(container)).toHaveLength(1);
+      const line = lines(container)[0]!;
+      expect(line.getAttribute('data-wait-line')).toBe('fold');
+      expect(line.querySelector('canvas')?.getAttribute('data-wait-orb')).toBe('fold');
+      expect(waitText(line)).toBe(CHAT.compacting);
+      expect(line.querySelector('[data-wait-clock]')?.textContent).toBe('0:42');
+      expect(detail(container)).toBeNull();
+      expect(help(container)).toBe(true);
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(lines(container)).toHaveLength(1);
+      expect(line.querySelector('[data-wait-clock]')?.textContent).toBe('0:45');
+      rerender(threadOf(afterRead, props([], { compaction: null })));
+      expect(lines(container)).toHaveLength(1);
+      expect(lines(container)[0]!.getAttribute('data-wait-line')).not.toBe('fold');
+      expect(container.querySelector('[data-compaction-line]')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows while text would hide the wait line, and the tail hands it its live mark', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const streaming = work([answer('Now I', NOW - 100)]);
+      const container = mount(threadOf(streaming, props([], { asOfMs: NOW - 100 })));
+      expect(lines(container).map((l) => l.getAttribute('data-wait-line'))).toEqual(['fold']);
+      expect(container.querySelectorAll('[data-live]')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says what the conversation's summary request does: reading with a bar, then writing with its tokens", () => {
+    const reading = request({ phase: 'prefill', prefillDone: 113_200, prefillTotal: 172_200 });
+    const container = mount(threadOf(afterRead, props([reading])));
+    expect(detail(container)).toBe(fill(CHAT.compactingReading, { done: '113.2K', total: '172.2K' }));
+    expect(byRole(container, 'meter', CHAT.pendingReadMeter)?.getAttribute('aria-valuenow')).toBe('66');
+    rerender(threadOf(afterRead, props([request({ generated: 3_200 })])));
+    expect(detail(container)).toBe(fill(CHAT.compactingWritingOf, { n: '3,200' }));
+    expect(container.querySelector('[role="meter"]')).toBeNull();
+    rerender(threadOf(afterRead, props([request({ generated: 12_400 })])));
+    expect(detail(container)).toBe(fill(CHAT.compactingWritingOf, { n: '12.4K' }));
+    rerender(threadOf(afterRead, props([request({})])));
+    expect(detail(container)).toBe(CHAT.compactingWriting);
+    rerender(threadOf(afterRead, props([request({ phase: 'queued' })])));
+    expect(detail(container)).toBeNull();
+    // A request from before the compaction, or another conversation's, says nothing about it.
+    rerender(threadOf(afterRead, props([request({ startedAt: NOW - 50_000, generated: 900 })])));
+    expect(detail(container)).toBeNull();
+    rerender(threadOf(afterRead, props([request({ session: 'conv-2', generated: 900 })])));
+    expect(detail(container)).toBeNull();
+    expect(lines(container)).toHaveLength(1);
+  });
+
+  it('the help sentence shows only for the first compaction of a conversation', () => {
+    const before: TranscriptEntry = { kind: 'compaction', ts: NOW - 300_000, outcome: 'done' };
+    const sample = work([before, tool(NOW - 189_000, NOW - 65_000)]);
+    const container = mount(threadOf(sample, props([])));
+    expect(lines(container)).toHaveLength(1);
+    expect(help(container)).toBe(false);
+  });
+
+  it('a marker at the place of each compaction: counts and time when the agent gave them, failed, stopped', () => {
+    const at = NOW - 100_000;
+    const entries: TranscriptEntry[] = [
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 222_822, tokensAfter: 31_204 },
+      { kind: 'compaction', ts: at, outcome: 'done', tokensAfter: 9_000 },
+      { kind: 'compaction', ts: at, outcome: 'failed', retry: true },
+      { kind: 'compaction', ts: at, outcome: 'failed' },
+      { kind: 'compaction', ts: at, outcome: 'stopped' },
+      { kind: 'compaction', ts: 0, outcome: 'stopped' },
+    ];
+    const container = mount(
+      threadOf({ ...work([...entries, answer('Done.', NOW - 1_000)]), turn: null, lastEnd: null }),
+    );
+    const clockAt = formatClock(at);
+    expect([...container.querySelectorAll('[data-compaction-mark]')].map((m) => m.textContent)).toEqual([
+      `${fill(CHAT.compactedTokens, { before: '222.8K', after: '31.2K' })} · ${clockAt}`,
+      `${CHAT.compacted} · ${clockAt}`,
+      `${CHAT.compactFailedRetry} · ${clockAt}`,
+      `${CHAT.compactFailed} · ${clockAt}`,
+      `${CHAT.compactStopped} · ${clockAt}`,
+      CHAT.compactStopped,
+    ]);
+    expect(fill(CHAT.compactedTokens, { before: '222.8K', after: '31.2K' })).toBe(
+      'Conversation compacted · 222.8K → 31.2K tokens',
+    );
+    expect(lines(container)).toHaveLength(0);
+  });
+
+  // Mutation: drop the `after * 100 > before * 99` check in compactionText → "236K → 235.9K tokens" and the rest.
+  it('a compaction whose count did not fall (equal, higher, or under 1% lower) shows no numbers', () => {
+    const at = NOW - 100_000;
+    const entries: TranscriptEntry[] = [
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 235_952, tokensAfter: 235_939 },
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 235_952, tokensAfter: 235_952 },
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 235_952, tokensAfter: 236_100 },
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 10_000, tokensAfter: 9_901 },
+      { kind: 'compaction', ts: at, outcome: 'done', tokensBefore: 10_000, tokensAfter: 9_900 },
+    ];
+    const container = mount(
+      threadOf({ ...work([...entries, answer('Done.', NOW - 1_000)]), turn: null, lastEnd: null }),
+    );
+    const clockAt = formatClock(at);
+    expect([...container.querySelectorAll('[data-compaction-mark]')].map((m) => m.textContent)).toEqual([
+      `${CHAT.compacted} · ${clockAt}`,
+      `${CHAT.compacted} · ${clockAt}`,
+      `${CHAT.compacted} · ${clockAt}`,
+      `${CHAT.compacted} · ${clockAt}`,
+      `${fill(CHAT.compactedTokens, { before: '10K', after: '9,900' })} · ${clockAt}`,
+    ]);
+  });
+});
+
+describe('ChatThread: the workflow run card', () => {
+  const card = (container: HTMLElement): HTMLElement => {
+    const found = container.querySelector<HTMLElement>(`[data-run="${RUN_ID}"]`)?.closest('section');
+    if (found == null) throw new Error('no run card');
+    return found;
+  };
+  const heading = (container: HTMLElement): string => card(container).querySelector('h3')?.textContent ?? '';
+  const stopNone = (): Promise<void> => Promise.resolve();
+  const status = (container: HTMLElement): string =>
+    card(container).querySelector('header [data-tone]')?.textContent ?? '';
+
+  it('running: title, status, step line, helpers used of the budget, one row per helper, and Stop run', () => {
+    const container = mount(
+      threadOf(runSample(workflowRun()), { runs: [{ runId: RUN_ID, stopping: false }], onStopRun: stopNone }),
+    );
+    expect(heading(container)).toBe(fill(CHAT.run.title, { name: 'deep-research' }));
+    const text = card(container).textContent ?? '';
+    expect(status(container)).toBe(CHAT.run.status.active);
+    expect(text).toContain(fill(CHAT.run.phase, { i: 2, n: 4, phase: 'Research' }));
+    expect(text).toContain(fill(CHAT.run.helpersUsed, { used: 5, budget: 128 }));
+    const steps = byRole(card(container), 'list', CHAT.run.steps)!;
+    expect(steps.querySelector('[aria-current="step"]')?.textContent).toContain('Research');
+    expect(byRole(card(container), 'meter', fill(CHAT.run.helpersUsed, { used: 5, budget: 128 }))).not.toBeNull();
+    const helpers = byRole(card(container), 'button', fill(CHAT.run.helpers, { n: 3 }))!;
+    expect(helpers.getAttribute('aria-expanded')).toBe('true');
+    for (const label of ['research-planner', 'researcher-0', 'researcher-1']) expect(text).toContain(label);
+    expect(text).toContain('11K tokens · 2m 47s');
+    expect(text).toContain(CHAT.run.helperState.failed);
+    expect(byRole(card(container), 'button', CHAT.run.stop)).not.toBeNull();
+    expect(card(container).getAttribute('aria-busy')).toBe('true');
+  });
+
+  it('Stop run asks first, keeps running on the cancel button, and sends the run id on confirm', async () => {
+    const onStopRun = vi.fn(() => Promise.resolve());
+    const container = mount(
+      threadOf(runSample(workflowRun()), { runs: [{ runId: RUN_ID, stopping: false }], onStopRun }),
+    );
+    act(() => byRole(card(container), 'button', CHAT.run.stop)!.click());
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    const dialog = byRole(document.body, 'dialog')!;
+    expect(dialog.textContent).toContain(CHAT.run.stopTitle);
+    expect(dialog.textContent).toContain(CHAT.run.stopText);
+    const keep = allByRole(dialog, 'button').find((b) => b.textContent === CHAT.run.stopKeep)!;
+    act(() => keep.click());
+    expect(onStopRun).not.toHaveBeenCalled();
+    act(() => byRole(card(container), 'button', CHAT.run.stop)!.click());
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    const confirm = allByRole(byRole(document.body, 'dialog')!, 'button').find((b) => b.textContent === CHAT.run.stop)!;
+    await act(async () => {
+      confirm.click();
+      await Promise.resolve();
+    });
+    expect(onStopRun).toHaveBeenCalledWith(RUN_ID);
+  });
+
+  it('stopping: the status says so and Stop run is gone', () => {
+    const container = mount(
+      threadOf(runSample(workflowRun()), { runs: [{ runId: RUN_ID, stopping: true }], onStopRun: stopNone }),
+    );
+    expect(status(container)).toBe(CHAT.run.stopping);
+    expect(byRole(card(container), 'button', CHAT.run.stop)).toBeNull();
+  });
+
+  it('waiting: a helper of this run asks, the card says who, and the request card below is not the turn waiting', () => {
+    const asks = new Map([['deep-research', 'researcher-0']]);
+    const container = mount(
+      threadOf(runSample(workflowRun()), {
+        runs: [{ runId: RUN_ID, stopping: false }],
+        runAsks: asks,
+        onStopRun: stopNone,
+        card: createElement('div', { 'data-interaction-card': '' }, 'Allow this command?'),
+      }),
+    );
+    const text = card(container).textContent ?? '';
+    expect(status(container)).toBe(CHAT.run.waitingYou);
+    expect(text).toContain(fill(CHAT.run.asks, { label: 'researcher-0' }));
+    expect(byRole(card(container), 'button', CHAT.run.stop)).not.toBeNull();
+    // The request card is drawn at the thread's end, after the run card.
+    const request = container.querySelector('[data-interaction-card]')!;
+    expect(card(container).compareDocumentPosition(request) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('a run with no turn: no wait line says the agent works; the live run card is the only sign', () => {
+    const container = mount(
+      threadOf(runSample(workflowRun()), {
+        runs: [{ runId: RUN_ID, stopping: false }],
+        conversationId: 'conv-1',
+        host: { inference: 'ready', loading: [], resident: [], answers: [], requests: [] },
+      }),
+    );
+    expect(container.querySelector('[data-wait-line]')).toBeNull();
+    expect(container.querySelector('[data-compaction-line]')).toBeNull();
+    expect(status(container)).toBe(CHAT.run.status.active);
+  });
+
+  it('a wake turn while a run is live shows the wait line as for any turn', () => {
+    const sample = runSample(workflowRun(), {
+      turnId: 'w1',
+      phase: 'running',
+      startedAt: T0 + 800,
+      wait: null,
+      origin: 'wake',
+    });
+    const container = mount(threadOf(sample, { runs: [{ runId: RUN_ID, stopping: false }] }));
+    expect(container.querySelector('[data-wait-line]')).not.toBeNull();
+  });
+
+  it('done: Done, no step line, no Stop run, the report open as Markdown, the helpers closed', () => {
+    const container = mount(threadOf(runSample(finishedRun())));
+    const text = card(container).textContent ?? '';
+    expect(status(container)).toBe(CHAT.run.status.complete);
+    expect(text).not.toContain('Step ');
+    expect(text).toContain(fill(CHAT.run.helpersUsed, { used: 8, budget: 128 }));
+    expect(byRole(card(container), 'button', CHAT.run.stop)).toBeNull();
+    const report = byRole(card(container), 'button', CHAT.run.report)!;
+    expect(report.getAttribute('aria-expanded')).toBe('true');
+    expect(text).toContain('Findings');
+    expect(card(container).querySelector('strong')?.textContent).toBe('4 lanes');
+    expect(byRole(card(container), 'button', fill(CHAT.run.helpers, { n: 3 }))?.getAttribute('aria-expanded')).toBe(
+      'false',
+    );
+    expect(byRole(card(container), 'list', CHAT.run.steps)?.querySelector('[aria-current="step"]')).toBeNull();
+  });
+
+  it('a cut report says so', () => {
+    const container = mount(threadOf(runSample(finishedRun({ truncated: true }))));
+    expect(card(container).textContent).toContain(CHAT.run.reportCut);
+  });
+
+  it('ended early: active on disk but not held by the host reads "Ended early", with no Stop run', () => {
+    const container = mount(threadOf(runSample(workflowRun()), { runs: [], onStopRun: stopNone }));
+    const text = card(container).textContent ?? '';
+    expect(status(container)).toBe(CHAT.run.status.interrupted);
+    expect(text).not.toContain('Step ');
+    expect(byRole(card(container), 'button', CHAT.run.stop)).toBeNull();
+  });
+
+  it('paused, out of helpers, failed and stopped: their words, a pause message, and no Stop run', () => {
+    const cases: Array<[NonNullable<Parameters<typeof workflowRun>[0]>, string]> = [
+      [{ status: 'user_paused', pauseMessage: 'Waiting for a key' }, CHAT.run.status.paused],
+      [{ status: 'budget_limited' }, CHAT.run.status.budget_limited],
+      [{ status: 'failed' }, CHAT.run.status.failed],
+      [{ status: 'cancelled' }, CHAT.run.status.cancelled],
+      [{ status: 'blocked' }, CHAT.run.status.blocked],
+    ];
+    for (const [over, word] of cases) {
+      const container = mount(
+        threadOf(runSample(workflowRun(over)), { runs: [{ runId: RUN_ID, stopping: false }], onStopRun: stopNone }),
+      );
+      expect(status(container), word).toBe(word);
+      expect(byRole(card(container), 'button', CHAT.run.stop), word).toBeNull();
+      if (over.pauseMessage !== undefined)
+        expect(card(container).textContent).toContain(fill(CHAT.run.paused, { message: 'Waiting for a key' }));
+      act(() => mounted!.root.unmount());
+      container.remove();
+      mounted = undefined;
+    }
+  });
+
+  it('a run with no budget says how many helpers it used', () => {
+    const container = mount(threadOf(runSample(workflowRun({ agentBudget: null }))));
+    expect(card(container).textContent).toContain(fill(CHAT.run.helpersUsedNoBudget, { used: 5 }));
+    expect(byRole(card(container), 'meter')).toBeNull();
   });
 });
 

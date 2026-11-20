@@ -127,3 +127,4 @@ instantiate_reshape_and_cache_int8(128, false, "");
 instantiate_reshape_and_cache_int8(256, false, "");
 instantiate_reshape_and_cache_int8(128, true, "_vt");
 instantiate_reshape_and_cache_int8(256, true, "_vt");
+#include "kv_int8_store_ktm.h"

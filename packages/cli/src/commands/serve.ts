@@ -81,6 +81,14 @@ Options:
                       their output faster during a long prompt and slows
                       that prompt; 0 alternates one command each. Qwen3.5
                       dense and MoE take it.
+  --activations <mode>  auto or bf16 (default: auto for Qwen3.5 dense with a
+                      DFlash2 draft, bf16 for dense with none and for
+                      MoE). On M5 and later Macs auto lets attention
+                      over the int8 KV cache score int8 queries for every
+                      token at position 7,168 or later, in prefill, verify
+                      and decode alike: faster at depth. bf16 keeps every
+                      query bf16. Both modes share one disk cache. Qwen3.5
+                      dense and MoE take it.
   --idle-release <duration>  Time without a request before the engine unwires
                       its memory and frees the weights: seconds, or with an
                       s, m or h suffix, e.g. 30m (default: 10m); off keeps
@@ -150,6 +158,7 @@ export interface ServeArgs {
   maxMemoryBytes?: number;
   maxContextTokens?: number;
   decodeShare?: number;
+  activations?: 'auto' | 'bf16';
   /** `--idle-release` in seconds; `Infinity` for `off`. */
   idleReleaseSeconds?: number;
   /** `--max-cache-disk` as the native load option's text: `'auto'`, `'0'` or a byte count. */
@@ -195,6 +204,7 @@ export function parseServeArgs(
       'max-memory': { type: 'string' },
       'max-context': { type: 'string' },
       'decode-share': { type: 'string' },
+      activations: { type: 'string' },
       'idle-release': { type: 'string' },
       'max-cache-disk': { type: 'string' },
       'persist-cache': { type: 'boolean' },
@@ -235,6 +245,9 @@ export function parseServeArgs(
   const maxContextTokens = maxContextText === undefined ? undefined : parseMaxContext(maxContextText);
   const decodeShareText = values['decode-share'];
   const decodeShare = decodeShareText === undefined ? undefined : parseDecodeShare(decodeShareText);
+  const activations = values.activations;
+  if (activations !== undefined && activations !== 'auto' && activations !== 'bf16')
+    throw new Error('--activations must be auto or bf16');
   const idleReleaseText = values['idle-release'];
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
   const cacheDiskText = values['max-cache-disk'];
@@ -270,6 +283,7 @@ export function parseServeArgs(
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(decodeShare !== undefined ? { decodeShare } : {}),
+    ...(activations !== undefined ? { activations } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
     cacheDisk,
     ...(persistPagedCache !== undefined ? { persistPagedCache } : {}),
@@ -355,6 +369,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.maxMemoryBytes !== undefined ? { maxMemoryBytes: args.maxMemoryBytes } : {}),
       ...(args.maxContextTokens !== undefined ? { maxContextTokens: args.maxContextTokens } : {}),
       ...(args.decodeShare !== undefined ? { decodeShare: args.decodeShare } : {}),
+      ...(args.activations !== undefined ? { activations: args.activations } : {}),
       ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
       cacheDisk: args.cacheDisk,
       persistPagedCache: persistOption(args.persistPagedCache),

@@ -107,7 +107,7 @@ The server implements:
 - `GET /v1/audio/voices` — see [audio protocols and examples](docs/serve-audio.md)
 - `GET /health` and `GET /v1/health`
 
-Paged text models use continuous batching when the model supports it. Media turns and request-specific speculative decoding stay on ordered paths. The server also bounds admission and callback queues, propagates cancellation, and honors SSE backpressure. See [docs/concurrent-inference.md](docs/concurrent-inference.md) for the scheduler details.
+Paged text models use continuous batching when the model supports it. Media turns and some speculative modes (adaptive MTP, Gemma4 assistant drafts, Qwen3.5 MoE DFlash2) stay on ordered paths; Qwen3.5 dense DFlash2 text turns are scheduled lanes that verify in waves. The server also bounds admission and callback queues, propagates cancellation, and honors SSE backpressure. See [docs/concurrent-inference.md](docs/concurrent-inference.md) for the scheduler details.
 
 ## Training
 

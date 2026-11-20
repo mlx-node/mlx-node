@@ -49,6 +49,21 @@ use crate::inference_trace::{enabled as inference_trace_enabled, write as write_
 
 use super::paged_kv_cache_adapter::{PagedTurnPlanReason, SeqId};
 
+/// One layer of one page as host bytes, `(keys, values)`, each side's scales
+/// after its plane.
+pub(crate) type PageLayerBytes = (Vec<u8>, Vec<u8>);
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_RESTORE_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: block restores the synchronous walk tried on this thread.
+#[cfg(test)]
+pub(crate) fn sync_restore_blocks() -> u64 {
+    SYNC_RESTORE_BLOCKS.with(std::cell::Cell::get)
+}
+
 /// SSD cold-tier handle for persisting full paged KV blocks across process
 /// restarts. `fingerprint` binds every persisted block to one model + cache
 /// layout identity; any drift (weights, config, pool geometry, dtype) must
@@ -152,6 +167,11 @@ pub(crate) struct PendingColdRestore {
     pub(crate) job: mlx_paged_attn::ColdRestoreBatchJob,
     pub(crate) reserved: Vec<Arc<PhysicalBlock>>,
     pub(crate) identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+    /// A state-backed restore keeps its chain's files from eviction.
+    pub(crate) hold: Option<mlx_paged_attn::ColdKeyHold>,
+    /// Hot blocks below the restore, and its end, in blocks.
+    pub(crate) base: usize,
+    pub(crate) limit: usize,
 }
 
 impl ColdRestore {
@@ -166,25 +186,34 @@ impl ColdRestore {
 }
 
 impl ColdTierWalk<'_> {
-    /// Prepare a dense-family cold restore without performing filesystem I/O
-    /// or Metal work on the model thread. The consecutive on-disk chain is
+    /// Prepare a cold restore without performing filesystem I/O or Metal
+    /// work on the model thread. The consecutive on-disk chain is
     /// index-probed first, every destination is reserved next, and only then
     /// is the background read launched.
+    ///
+    /// `Sidecar(None)` serves a `KvOnly` tier: the chain as far as it is on
+    /// disk. `State { depth }` serves a `StateOnly` tier: exactly the blocks
+    /// below `depth`, every one on the tier, or nothing; its keys are held
+    /// from eviction before the probe. A sidecar policy takes the
+    /// synchronous walk.
     pub(crate) fn begin_restore_extend<'k>(
         &self,
         lookup_tokens: &[u32],
         hot_cached_tokens: usize,
         cache_salt: u64,
+        backing: ColdBacking<'_>,
         extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
         hot_hashes: impl FnOnce(usize) -> Vec<u64>,
     ) -> Option<PendingColdRestore> {
-        if !self.cold.kv_only() {
-            return None;
-        }
         let bs = self.block_size as usize;
         if bs == 0 {
             return None;
         }
+        let state_blocks = match backing {
+            ColdBacking::Sidecar(None) if self.cold.kv_only() => None,
+            ColdBacking::State { depth } if self.cold.state_only() => Some(depth / bs),
+            ColdBacking::Sidecar(_) | ColdBacking::State { .. } => return None,
+        };
         let mut full_blocks = lookup_tokens.len() / bs;
         let base = hot_cached_tokens.min(lookup_tokens.len()) / bs;
         if base >= full_blocks {
@@ -210,14 +239,18 @@ impl ColdTierWalk<'_> {
                 index,
             ));
         }
-        let limit = self.kv_chain_upper_bound(
-            lookup_tokens,
-            cache_salt,
-            &extra_keys_for,
-            base,
-            full_blocks,
-            parent_key,
-        );
+        let limit = match state_blocks {
+            None => self.kv_chain_upper_bound(
+                lookup_tokens,
+                cache_salt,
+                &extra_keys_for,
+                base,
+                full_blocks,
+                parent_key,
+            ),
+            Some(blocks) if blocks <= full_blocks => blocks,
+            Some(_) => return None,
+        };
         if limit <= base {
             return None;
         }
@@ -246,6 +279,10 @@ impl ColdTierWalk<'_> {
                 block_index: index,
             });
             parent_key = Some(key);
+        }
+        let hold = state_blocks.map(|_| self.cold.manager.hold_keys(keys.clone()));
+        if hold.is_some() && !keys.iter().all(|key| self.cold.manager.contains(key)) {
+            return None;
         }
 
         let reserved = self
@@ -276,6 +313,9 @@ impl ColdTierWalk<'_> {
             job,
             reserved,
             identities,
+            hold,
+            base,
+            limit,
         })
     }
 
@@ -490,6 +530,8 @@ impl ColdTierWalk<'_> {
                 cache_salt,
                 block_index: idx,
             };
+            #[cfg(test)]
+            SYNC_RESTORE_BLOCKS.with(|count| count.set(count.get() + 1));
             match self.cold.manager.restore_block(
                 self.pool,
                 self.allocator,
@@ -781,6 +823,76 @@ impl ColdTierWalk<'_> {
         None
     }
 
+    /// The key of the fragment that holds the rows of `lookup_tokens` from
+    /// its last whole page below `depth` up to `depth`: chained on that
+    /// page's key, over those rows and the image keys of that half of the
+    /// page. `None` unless `depth` ends half a page past a whole one and
+    /// every page up to it has a cache identity.
+    pub(crate) fn part_page_key<'k>(
+        &self,
+        lookup_tokens: &[u32],
+        depth: usize,
+        cache_salt: u64,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+    ) -> Option<mlx_paged_attn::ColdCacheKey> {
+        let bs = self.block_size as usize;
+        if bs == 0 || depth % bs != bs / 2 {
+            return None;
+        }
+        let pages = depth / bs;
+        let mut parent = None;
+        for index in 0..pages {
+            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent,
+                lookup_tokens.get(index * bs..(index + 1) * bs)?,
+                extra_keys_for(index)?,
+                cache_salt,
+                index,
+            ));
+        }
+        let image_keys = part_page_image_keys(extra_keys_for(pages)?, bs / 2)?;
+        Some(mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::Kv,
+            self.cold.fingerprint,
+            parent,
+            lookup_tokens.get(pages * bs..depth)?,
+            &image_keys,
+            cache_salt,
+            pages,
+        ))
+    }
+
+    /// The fragment `key` of a state on a part page as one page of the
+    /// pool: its rows in the page's first half, the other half zero. `None`
+    /// when the pool has another page than keys token-major (only a move
+    /// into such a pool writes a fragment, and a vLLM block of half a page
+    /// has the same layout), when no state backs the tier, and when the
+    /// object is absent, damaged, of another layout or of other rows than
+    /// `tokens`. A read that comes back moves the fragment's time to now.
+    pub(crate) fn load_part_page(
+        &self,
+        key: mlx_paged_attn::ColdCacheKey,
+        tokens: &[u32],
+    ) -> Option<Vec<PageLayerBytes>> {
+        if !self.pool.layout().keys_token_major || !self.cold.state_only() {
+            return None;
+        }
+        let expected = part_page_layout(self.pool)?;
+        if tokens.len() != expected.block_size as usize {
+            return None;
+        }
+        let block = self
+            .cold
+            .manager
+            .load_with_layout(key, self.cold.fingerprint, &expected)?;
+        if block.tokens != tokens {
+            return None;
+        }
+        widen_part_page(&block, &expected)
+    }
+
     /// SSD cold-tier capture, fail-open: a persistence error only means the
     /// next process recomputes this prefix. Keys follow the hot chain-hash
     /// contract — parent-linked per block, `cache_salt` mixed into block 0 only
@@ -899,6 +1011,104 @@ impl ColdTierWalk<'_> {
     }
 }
 
+/// A page's image keys (two words of format, then one `(image, row)` pair
+/// per image token of the page) as the keys of its first `rows` rows: the
+/// pairs of those rows behind the same two words, nothing when no pair is
+/// left. `None` for keys not in that form.
+pub(crate) fn part_page_image_keys(page: &[u64], rows: usize) -> Option<Vec<u64>> {
+    let Some((format, pairs)) = page.split_first_chunk::<2>() else {
+        return page.is_empty().then(Vec::new);
+    };
+    let (pairs, odd) = pairs.as_chunks::<2>();
+    if pairs.is_empty() || !odd.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::new();
+    for pair in pairs.iter().filter(|pair| pair[1] < rows as u64) {
+        if keys.is_empty() {
+            keys.extend(format);
+        }
+        keys.extend(pair);
+    }
+    Some(keys)
+}
+
+/// The layout of a fragment of `pool`: the first half of one of its pages.
+/// Every plane of a page is linear in its rows, so each side is half the
+/// page's bytes.
+fn part_page_layout(pool: &LayerKVPool) -> Option<mlx_paged_attn::ColdCacheLayout> {
+    let (key_bytes, value_bytes) = pool.block_blob_bytes().ok()?;
+    let block_size = pool.block_size();
+    if !block_size.is_multiple_of(2)
+        || !key_bytes.is_multiple_of(2)
+        || !value_bytes.is_multiple_of(2)
+    {
+        return None;
+    }
+    Some(mlx_paged_attn::ColdCacheLayout {
+        block_size: block_size / 2,
+        num_layers: u32::try_from(pool.num_layers()).ok()?,
+        num_kv_heads: pool.config().num_kv_heads,
+        head_size: pool.config().head_size,
+        cache_dtype: format!("{:?}", pool.cache_dtype()),
+        key_bytes_per_layer: usize::try_from(key_bytes / 2).ok()?,
+        value_bytes_per_layer: usize::try_from(value_bytes / 2).ok()?,
+    })
+}
+
+/// `fragment`'s rows as the first half of a keys-token-major int8 page (K
+/// `[KV][rows][D]`, V `[KV][D][rows]`, each side's f32 scales `[KV][rows]`
+/// after its plane), the other half zero.
+fn widen_part_page(
+    fragment: &mlx_paged_attn::ColdCacheBlock,
+    layout: &mlx_paged_attn::ColdCacheLayout,
+) -> Option<Vec<PageLayerBytes>> {
+    const SCALE_BYTES: usize = std::mem::size_of::<f32>();
+    let heads = layout.num_kv_heads as usize;
+    let dim = layout.head_size as usize;
+    let half = layout.block_size as usize;
+    let rows = half * 2;
+    let half_plane = heads.checked_mul(dim)?.checked_mul(half)?;
+    let half_side = half_plane.checked_add(heads.checked_mul(half)?.checked_mul(SCALE_BYTES)?)?;
+    if fragment.layers.len() != layout.num_layers as usize
+        || layout.key_bytes_per_layer != half_side
+        || layout.value_bytes_per_layer != half_side
+    {
+        return None;
+    }
+    let plane = half_plane * 2;
+    let side = half_side * 2;
+    fragment
+        .layers
+        .iter()
+        .map(|layer| {
+            if layer.keys.len() != half_side || layer.values.len() != half_side {
+                return None;
+            }
+            let (key_plane, key_scales) = layer.keys.split_at(half_plane);
+            let (value_plane, value_scales) = layer.values.split_at(half_plane);
+            let mut keys = vec![0u8; side];
+            let mut values = vec![0u8; side];
+            for head in 0..heads {
+                let from = head * half * dim;
+                let to = head * rows * dim;
+                keys[to..to + half * dim].copy_from_slice(&key_plane[from..from + half * dim]);
+                let from = head * half * SCALE_BYTES;
+                let to = plane + head * rows * SCALE_BYTES;
+                let scales = half * SCALE_BYTES;
+                keys[to..to + scales].copy_from_slice(&key_scales[from..from + scales]);
+                values[to..to + scales].copy_from_slice(&value_scales[from..from + scales]);
+                for d in 0..dim {
+                    let from = (head * dim + d) * half;
+                    let to = (head * dim + d) * rows;
+                    values[to..to + half].copy_from_slice(&value_plane[from..from + half]);
+                }
+            }
+            Some((keys, values))
+        })
+        .collect()
+}
+
 /// How much of the prompt one turn's cold-tier capture walk may persist.
 ///
 /// Two independent bounds because they answer different failure modes.
@@ -1015,6 +1225,159 @@ impl Drop for PagedRestoreTicket {
         for block in blocks {
             allocator.free(block);
         }
+    }
+}
+
+/// A state-backed chain read beside other turns: the hot leading blocks it
+/// pinned, the reserved destinations of the rest (unpublished until the
+/// batch commits), the background read, and the holds that keep the chain
+/// and its state on the tier. After the commit it holds the published
+/// chain until it drops, so the landing's lookup finds it hot; dropping it
+/// releases everything it still holds.
+pub(crate) struct ChainPrefetch {
+    pub(crate) depth: usize,
+    pub(crate) hot: Vec<Arc<PhysicalBlock>>,
+    pub(crate) job: mlx_paged_attn::ColdRestoreBatchJob,
+    pub(crate) reserved: Option<Vec<Arc<PhysicalBlock>>>,
+    pub(crate) identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+    pub(crate) committed: Option<Vec<Arc<PhysicalBlock>>>,
+    pub(crate) bytes_restored: u64,
+    pub(crate) failed: bool,
+    pub(crate) base: usize,
+    pub(crate) limit: usize,
+    pub(crate) retried: bool,
+    pub(crate) allocator: Arc<Mutex<BlockAllocator>>,
+    pub(crate) _holds: Vec<mlx_paged_attn::ColdKeyHold>,
+}
+
+/// What starting a [`ChainPrefetch`] gave.
+pub(crate) enum ChainPrefetchStart {
+    Started(Box<ChainPrefetch>),
+    /// The hot chain already reaches the state's depth.
+    Hot,
+    /// The pool has no room for the chain's `blocks` destinations.
+    Refused {
+        blocks: u32,
+    },
+    /// No read can start: no state-backed tier, a command reset armed, or
+    /// the chain is not whole on the tier.
+    Unavailable,
+}
+
+#[cfg(test)]
+impl ChainPrefetchStart {
+    pub(crate) fn started(self) -> Option<ChainPrefetch> {
+        match self {
+            Self::Started(prefetch) => Some(*prefetch),
+            _ => None,
+        }
+    }
+}
+
+/// One poll of a [`ChainPrefetch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainPrefetchPoll {
+    /// The reader is not done, or this pass's upload budget is spent.
+    Pending,
+    /// Every block is uploaded and published; the prefetch holds them.
+    Landed { blocks: usize, bytes_restored: u64 },
+    /// The read, an upload or the publish failed: nothing was published and
+    /// every reserved block is free again.
+    Failed,
+}
+
+impl ChainPrefetch {
+    /// The disk state depth the chain backs, in tokens.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Blocks the commit published (adopted ones included), 0 before it.
+    pub(crate) fn restored_blocks(&self) -> usize {
+        self.committed.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn reserved_blocks(&self) -> u32 {
+        self.reserved
+            .as_ref()
+            .map_or(0, |blocks| blocks.len().try_into().unwrap_or(u32::MAX))
+    }
+
+    /// A second prefetch for the same turn (the landing's one retry).
+    pub(crate) fn mark_retried(&mut self) {
+        self.retried = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> mlx_paged_attn::ColdRestoreJobStats {
+        self.job.stats()
+    }
+
+    /// Blocks the prefetch holds: its hot pins, its reserved destinations
+    /// and, once landed, the published chain.
+    pub(crate) fn held_blocks(&self) -> u32 {
+        u32::try_from(self.hot.len() + self.restored_blocks())
+            .unwrap_or(u32::MAX)
+            .saturating_add(self.reserved_blocks())
+    }
+
+    /// Test-only: waits up to 5 s for the reader's last chunk.
+    #[cfg(test)]
+    pub(crate) fn await_reader_for_test(&self) {
+        for _ in 0..5000 {
+            if self.job.reader_finished_for_test() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for ChainPrefetch {
+    fn drop(&mut self) {
+        let mut allocator = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for block in self.reserved.take().into_iter().flatten() {
+            allocator.free(block);
+        }
+        for block in self.committed.take().into_iter().flatten() {
+            allocator.free(block);
+        }
+        for block in std::mem::take(&mut self.hot) {
+            allocator.free(block);
+        }
+    }
+}
+
+/// The `cold_restore_batch` trace line, at every asynchronous commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_cold_restore_batch(
+    blocks: usize,
+    base: usize,
+    limit: usize,
+    adopted: usize,
+    stats: mlx_paged_attn::ColdRestoreJobStats,
+    wait: Duration,
+    published: bool,
+    retried: bool,
+) {
+    if inference_trace_enabled() {
+        write_inference_trace(format_args!(
+            "[MLX_TRACE] paged cold_restore_batch blocks={} base={} limit={} adopted={} read_ms={:.3} upload_ms={:.3} polls={} chunks={} wait_ms={:.3} published={} retried={}",
+            blocks,
+            base,
+            limit,
+            adopted,
+            stats.read.as_secs_f64() * 1000.0,
+            stats.upload.as_secs_f64() * 1000.0,
+            stats.polls,
+            stats.chunks,
+            wait.as_secs_f64() * 1000.0,
+            published,
+            u8::from(retried),
+        ));
     }
 }
 

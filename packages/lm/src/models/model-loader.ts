@@ -63,8 +63,11 @@ export interface LoadModelOptions {
    * companion, such as `z-lab/Qwen3.8-27B-DFlash2` for dense targets or
    * `incoai/Qwen3.6-35B-A3B-DFlash2` for 35B-A3B MoE. It shares the target embedding and
    * LM head, validates all companion tensors at load time, and takes
-   * precedence over an inline target MTP head. Other model families reject
-   * this option.
+   * precedence over an inline target MTP head. `qwen4_exp` accepts
+   * `incoai/Qwen3.8-Flash-Next-DFlash2`, only from this option (it is never
+   * discovered): a turn that sets `enableMtp` runs its cycle when it starts
+   * alone on a whole store whose banks are filled.
+   * Other model families reject this option.
    */
   draftModelPath?: string;
   /**
@@ -102,6 +105,16 @@ export interface LoadModelOptions {
    */
   decodeShare?: number;
   /**
+   * Int8 activations of `qwen3_5` and `qwen3_5_moe` targets
+   * (`--activations`): `'auto'` lets the paged attention over an int8 pool
+   * score int8 query codes for every query row at KV position 7,168 or
+   * later, in prefill, verify and decode alike, on Apple10 GPUs (M5) and
+   * later; `'bf16'` keeps every query bf16. Unset: `'auto'` for a `qwen3_5`
+   * load with a DFlash2 draft, `'bf16'` for a `qwen3_5` load with none and
+   * for `qwen3_5_moe`. Other model families reject it.
+   */
+  activations?: 'auto' | 'bf16';
+  /**
    * SSD state tier of `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
    * `'0'` (off). Whether it survives a restart is the paged KV disk cache
@@ -121,6 +134,7 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     options?.maxMemoryBytes === undefined &&
     options?.maxContextTokens === undefined &&
     options?.decodeShare === undefined &&
+    options?.activations === undefined &&
     options?.cacheDisk === undefined &&
     options?.cacheDir === undefined
   )
@@ -128,6 +142,7 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
   return {
     draftModelPath: options.draftModelPath,
     kvFormat: options.kvFormat,
+    ...(options.activations !== undefined ? { activations: options.activations } : {}),
     maxMemoryBytes: options.maxMemoryBytes,
     maxContextTokens: options.maxContextTokens,
     decodeShare: options.decodeShare,
@@ -139,6 +154,7 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
 function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoadOptions | null {
   if (
     options?.auxiliaryModelPath === undefined &&
+    options?.draftModelPath === undefined &&
     options?.kvFormat === undefined &&
     options?.maxMemoryBytes === undefined &&
     options?.maxContextTokens === undefined &&
@@ -148,6 +164,7 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
     return null;
   return {
     ...(options.auxiliaryModelPath !== undefined ? { auxiliaryModelPath: options.auxiliaryModelPath } : {}),
+    ...(options.draftModelPath !== undefined ? { draftModelPath: options.draftModelPath } : {}),
     ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
     ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
     ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
@@ -295,7 +312,7 @@ function dispatchLoad(
   }
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5 and qwen3_5_moe models; ` +
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -308,6 +325,12 @@ function dispatchLoad(
   if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
     throw new Error(
       `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (options?.activations !== undefined && requireFamilyData(modelType).acceptsActivations !== true) {
+    throw new Error(
+      `activations (int8 activations) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -356,6 +379,8 @@ function dispatchLoad(
  * Qwen also discovers `draft/` or a shared `qwen3.8-27b-dflash2` directory
  * beside a Qwen3.8-27B target, or `qwen3.6-35b-a3b-dflash2` beside a
  * Qwen3.6-35B-A3B target. Set `autoLoadDraft: false` to disable discovery.
+ * A `qwen4_exp` (Flash Next) target attaches a draft only from
+ * `draftModelPath`; nothing is discovered for it.
  */
 export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);

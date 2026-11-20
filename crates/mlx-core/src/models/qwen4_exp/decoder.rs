@@ -12,10 +12,29 @@ mod attention_window;
 mod batch;
 #[path = "device_routes.rs"]
 mod device_routes;
+pub(super) use device_routes::RouteGuard;
 #[path = "draft_window.rs"]
 mod draft_window;
+#[path = "hidden_taps.rs"]
+mod hidden_taps;
+pub(super) use hidden_taps::TappedRows;
+#[path = "draft_view.rs"]
+mod draft_view;
+pub(super) use draft_view::{draft_target_shape_of, tapped_rows};
+#[path = "draft_cycle.rs"]
+mod draft_cycle;
+#[cfg(test)]
+pub(super) use draft_cycle::{
+    ChosenRows, DraftRecord, DraftStepper, draft_turn, follow_history, next_verify_rows,
+};
+pub(super) use draft_cycle::{DRAFT_VERIFY_ROWS, DraftSlot, load_draft};
+#[cfg(test)]
+pub(super) use hidden_taps::stream_means;
+#[path = "lanes.rs"]
+mod lanes;
 #[path = "scheduled_batch.rs"]
 mod scheduled_batch;
+pub(super) use lanes::{LANE_ROWS, Lane};
 
 /// Slot banks for a window's expert groups: a lease per group, then the
 /// release of that group's output before the slots serve the next group.
@@ -239,6 +258,74 @@ impl LayerCache {
             .chain(self.index_tail.iter())
     }
 }
+/// A decode route mode a test pins.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RouteMode {
+    /// Every decode token reads its routes back on the host, as after a
+    /// route miss.
+    Host,
+}
+/// How a decode pass over the layers ended. A stop is not an error: an
+/// error resets the whole sequence.
+pub(super) enum LayerPass {
+    /// Every layer and the head ran: the token's output.
+    Done(MxArray),
+    /// The pass stopped before layer `at`: the layers before it advanced
+    /// their caches, layer `at` and later are untouched, `history` too.
+    Stopped { at: usize },
+}
+/// Which route groups a device decode pass reads at a group submit, in
+/// place of the live rule (the groups submitted before this one).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GroupPoll {
+    /// None: route entries are not submitted with the groups and a miss
+    /// waits for the pass end.
+    Never,
+    /// The group just submitted too, still in flight.
+    InFlight,
+    /// The group just submitted too, after the GPU completed it.
+    Ready,
+    /// The live rule after the GPU completed the earlier groups: the group
+    /// is submitted after that wait, so it can still be in flight.
+    Older,
+}
+/// What every layer of one carried-window pass shares: the prompt length
+/// before its first window, and when its page writes and layers submit.
+#[derive(Clone, Copy)]
+struct GroupPass {
+    base: usize,
+    async_window: bool,
+    submit_span: usize,
+    defer_final: bool,
+}
+
+/// The most windows a layer-major group holds on a store whose slots can
+/// miss.
+pub(super) const PARTIAL_GROUP_WINDOWS: usize = 4;
+
+/// How the layer-major groups of a prompt are bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GroupLimit {
+    /// One group per run of whole windows, cut only at the deepest
+    /// checkpoint and the replay point inside it (a direct fill).
+    Whole,
+    /// At most this many windows per group, cut at every state point (a
+    /// store whose slots can miss).
+    Windows(usize),
+}
+
+impl GroupLimit {
+    /// The most windows one group holds.
+    pub(super) fn per_group(self) -> usize {
+        match self {
+            Self::Whole => usize::MAX,
+            Self::Windows(windows) => windows,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct DecoderState {
     caches: Vec<LayerCache>,
@@ -248,11 +335,12 @@ pub struct DecoderState {
     media_digests: Vec<crate::engine::cache::ImageCacheDigest>,
     last_chunk_hidden: Vec<MxArray>,
     cancelled: Option<Arc<AtomicBool>>,
-    /// Decode tokens this request still runs on the ordinary path after a
-    /// tentative device route missed the slots.
-    device_route_cooldown: usize,
+    route_guard: RouteGuard,
 }
 impl DecoderState {
+    pub(super) fn last_chunk_hidden(&self) -> &[MxArray] {
+        &self.last_chunk_hidden
+    }
     pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
         self.caches
             .iter()
@@ -268,6 +356,9 @@ pub struct Decoder {
     /// The prefill scratch a host gate that refused the whole bank set
     /// reserved beside the partial slots; `None` on every other store.
     pub(super) host_prefill_scratch: Option<u64>,
+    /// The lane transient the memory plan priced at its allowance context;
+    /// a partial store's layer-major group runs inside it.
+    pub(super) planned_scratch: Option<u64>,
     /// A test that sizes admission through the prefill window keeps its
     /// window across the turn opens that re-derive it from the plan.
     #[cfg(test)]
@@ -295,10 +386,71 @@ pub struct Decoder {
     pub(super) yarn: Option<math::Yarn>,
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
-    pub(super) device_route_cooldown: usize,
+    /// When set, every index-plane store pushes the plane it wrote.
+    index_planes: Option<Vec<MxArray>>,
+    /// The residual stream entering each layer of the decode token in
+    /// flight, when kept: entry `i` is layer `i`'s input. A pass from layer
+    /// `m` keeps entries `0..m` and writes its own from `m` on.
+    pub(super) layer_inputs: Option<Vec<MxArray>>,
+    /// Tests keep `layer_inputs` (or not) in place of the live rule.
+    #[cfg(test)]
+    pub(super) layer_inputs_pin: Option<bool>,
+    /// Layer inputs decode passes kept.
+    #[cfg(test)]
+    pub(super) kept_layer_inputs: u64,
+    /// Tests stop a decode pass before this layer.
+    #[cfg(test)]
+    pub(super) stop_before: Option<usize>,
+    /// Tests zero the MoE output of this layer once, in the next pass that
+    /// runs it: a stand-in for a skipped expert.
+    #[cfg(test)]
+    pub(super) poison_moe_at: Option<usize>,
+    /// The running request's route guard.
+    pub(super) route_guard: RouteGuard,
     /// Layers whose routes a pass read back to the host one at a time.
     #[cfg(test)]
     pub(super) route_readbacks: u64,
+    /// Layers a tentative pass ran through the fused routed+shared kernel.
+    #[cfg(test)]
+    pub(super) fused_shared_layers: u64,
+    /// The (layer, routes) tape of every checked device decode pass.
+    #[cfg(test)]
+    pub(super) route_tapes: Vec<Vec<(usize, Vec<u32>)>>,
+    /// Tests read, in place of each hint, experts its layer did not route.
+    #[cfg(test)]
+    pub(super) wrong_hints: bool,
+    /// (layer, every id it preloaded holds a slot after the token's fills),
+    /// per layer a replay preloaded.
+    #[cfg(test)]
+    pub(super) preload_checks: Vec<(usize, bool)>,
+    /// The most device layers one decode token ran again.
+    #[cfg(test)]
+    pub(super) device_rerun_peak: usize,
+    /// Tests pick the route groups a group submit reads.
+    #[cfg(test)]
+    pub(super) after_group_submit: Option<GroupPoll>,
+    /// Device passes a route read stopped before their last layer.
+    #[cfg(test)]
+    pub(super) early_stops: u64,
+    /// Route reads that found an entry still in flight.
+    #[cfg(test)]
+    pub(super) unready_polls: std::cell::Cell<u64>,
+    /// Tests pin the decode route mode in place of the live rule.
+    #[cfg(test)]
+    pub(super) route_mode_pin: Option<RouteMode>,
+    /// Lane steps that ran.
+    #[cfg(test)]
+    pub(super) lane_steps: u64,
+    /// When set, every one-token pass pushes (layer, residual stream after
+    /// the layer), the tentative pass and its replay alike.
+    #[cfg(test)]
+    pub(super) layer_outputs: Option<Vec<(usize, MxArray)>>,
+    /// When set, every prefill window, layer-major group and verify pass
+    /// pushes (layer, each window's residual stream after the layer).
+    #[cfg(test)]
+    pub(super) pass_outputs: Option<Vec<(usize, Vec<MxArray>)>>,
+    /// The DFlash2 draft's taps; `None` without a draft.
+    hidden_taps: Option<hidden_taps::HiddenTaps>,
     #[cfg(test)]
     pub(super) submit_log: std::cell::RefCell<Vec<String>>,
     pub last_chunk_hidden: Vec<MxArray>,
@@ -308,6 +460,21 @@ pub struct Decoder {
     /// Tests pin group mode on or off in place of the live rule.
     #[cfg(test)]
     pub(super) group_pin: Option<bool>,
+    /// Per layer-major union lease: the layer and the group's routes, window
+    /// after window.
+    #[cfg(test)]
+    pub(super) union_routes: Vec<(usize, Vec<u32>)>,
+    /// Per layer-major union lease: the bytes of the arrays the group holds
+    /// at its widest (every window's streams, MLP inputs, routes, scores,
+    /// routed rows and sums).
+    #[cfg(test)]
+    pub(super) group_held: Vec<u64>,
+    /// When set, per fill read ahead of its lease: the layer, whether a
+    /// victim is a slot the sub-group running beside the reads leased, and
+    /// whether those slots' bank rows were unchanged once its rows were
+    /// submitted.
+    #[cfg(test)]
+    pub(super) fill_bank_checks: Option<Vec<(usize, bool, bool)>>,
     /// Tentative commits taken, each with the windows it covered.
     #[cfg(test)]
     pub(super) tentative_commits: Vec<usize>,
@@ -357,6 +524,7 @@ impl Decoder {
             Some(super::live::Fallback::LoadGate { .. })
         )
         .then(|| super::load_plan::transient(&self.config, allowance_tokens));
+        self.planned_scratch = Some(super::load_plan::transient(&self.config, allowance_tokens));
         self.residency_changed();
     }
 
@@ -381,6 +549,23 @@ impl Decoder {
     pub fn residency_changed(&mut self) {
         self.register_cache_limit();
         self.refresh_prefill_window();
+    }
+
+    /// [`Store::promote_whole_with`], then the prefill passes of a whole
+    /// store: no reservation of the refused gate halves them.
+    pub(super) fn promote_whole_with(
+        &mut self,
+        own: u64,
+        gate: &mut impl FnMut(&mut super::memory::Plan, u64, u64, u64) -> Result<()>,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<bool> {
+        if !self.weights.promote_whole_with(own, gate, admit)? {
+            return Ok(false);
+        }
+        self.host_prefill_scratch = None;
+        self.device_routes = None;
+        self.residency_changed();
+        Ok(true)
     }
 
     /// Record a completed pass and run the test admission hook.
@@ -408,6 +593,7 @@ impl Decoder {
             prefill_chunk_size: super::MAX_PREFILL_CHUNK,
             context_window,
             host_prefill_scratch: None,
+            planned_scratch: None,
             #[cfg(test)]
             prefill_window_pin: None,
             caches: (0..config.num_hidden_layers)
@@ -429,15 +615,56 @@ impl Decoder {
             yarn,
             verification: None,
             device_routes: None,
-            device_route_cooldown: 0,
+            index_planes: None,
+            layer_inputs: None,
+            #[cfg(test)]
+            layer_inputs_pin: None,
+            #[cfg(test)]
+            kept_layer_inputs: 0,
+            #[cfg(test)]
+            stop_before: None,
+            #[cfg(test)]
+            poison_moe_at: None,
+            route_guard: RouteGuard::default(),
             #[cfg(test)]
             route_readbacks: 0,
+            #[cfg(test)]
+            fused_shared_layers: 0,
+            #[cfg(test)]
+            route_tapes: Vec::new(),
+            #[cfg(test)]
+            wrong_hints: false,
+            #[cfg(test)]
+            preload_checks: Vec::new(),
+            #[cfg(test)]
+            device_rerun_peak: 0,
+            #[cfg(test)]
+            after_group_submit: None,
+            #[cfg(test)]
+            early_stops: 0,
+            #[cfg(test)]
+            unready_polls: Default::default(),
+            #[cfg(test)]
+            route_mode_pin: None,
+            #[cfg(test)]
+            lane_steps: 0,
+            #[cfg(test)]
+            layer_outputs: None,
+            #[cfg(test)]
+            pass_outputs: None,
+            hidden_taps: None,
             #[cfg(test)]
             submit_log: Default::default(),
             last_chunk_hidden: Vec::new(),
             group_streams: Vec::new(),
             #[cfg(test)]
             group_pin: None,
+            #[cfg(test)]
+            union_routes: Vec::new(),
+            #[cfg(test)]
+            group_held: Vec::new(),
+            #[cfg(test)]
+            fill_bank_checks: None,
             #[cfg(test)]
             tentative_commits: Vec::new(),
             #[cfg(test)]
@@ -460,7 +687,7 @@ impl Decoder {
             media_digests: self.media_digests.clone(),
             last_chunk_hidden: self.last_chunk_hidden.clone(),
             cancelled: self.cancelled.clone(),
-            device_route_cooldown: self.device_route_cooldown,
+            route_guard: self.route_guard.clone(),
         }
     }
     #[cfg(test)]
@@ -492,6 +719,9 @@ impl Decoder {
                 .store_index_rows(layer, &keys, cache.index_blocks as u32)
                 .map_err(Error::from_reason)?;
             cache.index_blocks += blocks;
+            if let Some(planes) = &mut self.index_planes {
+                planes.push(plane.clone());
+            }
             return Ok(plane);
         }
         cache.append_index_keys(keys).cloned()
@@ -519,7 +749,7 @@ impl Decoder {
             media_digests: self.media_digests.clone(),
             last_chunk_hidden: std::mem::take(&mut self.last_chunk_hidden),
             cancelled: self.cancelled.take(),
-            device_route_cooldown: self.device_route_cooldown,
+            route_guard: std::mem::take(&mut self.route_guard),
         };
         self.reset();
         state
@@ -533,7 +763,7 @@ impl Decoder {
         self.media_digests = state.media_digests;
         self.last_chunk_hidden = state.last_chunk_hidden;
         self.cancelled = state.cancelled;
-        self.device_route_cooldown = state.device_route_cooldown;
+        self.route_guard = state.route_guard;
     }
     /// The cell outside the pool at this row, in storage of its own; `None`
     /// where an indexer key still waits for a block or a cache holds rows
@@ -607,17 +837,92 @@ impl Decoder {
         self.rotary_tables.get_mut().clear();
         self.verification = None;
         self.device_routes = None;
-        self.device_route_cooldown = 0;
+        self.layer_inputs = None;
+        self.route_guard = RouteGuard::default();
         self.history.clear();
         self.positions.clear();
         self.rope_delta = 0;
         self.media_digests.clear();
         self.last_chunk_hidden.clear();
         self.group_streams.clear();
+        if let Some(taps) = &mut self.hidden_taps {
+            taps.clear();
+        }
         self.caches = (0..self.config.num_hidden_layers)
             .map(|_| LayerCache::default())
             .collect();
     }
+    /// Taps the outputs of `layers` on every pass from here on; `None`
+    /// takes no tap.
+    pub(super) fn set_hidden_taps(&mut self, layers: Option<&[usize]>) -> Result<()> {
+        self.hidden_taps = layers
+            .map(|layers| hidden_taps::HiddenTaps::new(layers, self.config.num_hidden_layers))
+            .transpose()?;
+        Ok(())
+    }
+
+    /// The taps of the passes finished since the last take, in row order.
+    pub(super) fn take_hidden_taps(&mut self) -> Vec<TappedRows> {
+        self.hidden_taps
+            .as_mut()
+            .map_or_else(Vec::new, hidden_taps::HiddenTaps::take)
+    }
+
+    /// The layers the taps set read; `None` with no taps.
+    pub(super) fn hidden_tap_layers(&self) -> Option<&[usize]> {
+        self.hidden_taps
+            .as_ref()
+            .map(hidden_taps::HiddenTaps::layers)
+    }
+
+    /// Whether the taps are set and every unread record is evaluated.
+    #[cfg(test)]
+    pub(super) fn hidden_taps_available(&self) -> bool {
+        self.hidden_taps.as_ref().is_some_and(|taps| {
+            taps.passes()
+                .iter()
+                .flat_map(|pass| &pass.hidden)
+                .all(|tap| unsafe { mlx_sys::mlx_array_is_available(tap.as_raw_ptr()) })
+        })
+    }
+
+    /// Bytes of the taps the decoder holds: the pass in flight and the
+    /// finished passes not yet taken.
+    pub(super) fn hidden_tap_bytes(&self) -> u64 {
+        self.hidden_taps
+            .as_ref()
+            .map_or(0, hidden_taps::HiddenTaps::held_bytes)
+    }
+
+    /// The taps set keep only the records of their last `rows` rows.
+    pub(super) fn bound_hidden_taps(&mut self, rows: Option<usize>) {
+        if let Some(taps) = &mut self.hidden_taps {
+            taps.keep_rows(rows);
+        }
+    }
+
+    fn begin_taps(&mut self) {
+        if let Some(taps) = &mut self.hidden_taps {
+            taps.begin();
+        }
+    }
+
+    /// Layer `i` of the pass in flight finished with `outputs`.
+    fn tap_layer(&mut self, i: usize, outputs: &[MxArray]) -> Result<()> {
+        let Some(taps) = &mut self.hidden_taps else {
+            return Ok(());
+        };
+        taps.tap(i, outputs, self.config.hc_count, self.config.hidden_size)
+    }
+
+    /// The pass in flight ran its last layer; its first row is `first`.
+    fn finish_taps(&mut self, first: usize) -> Result<()> {
+        match &mut self.hidden_taps {
+            Some(taps) => taps.finish(first),
+            None => Ok(()),
+        }
+    }
+
     fn rope(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
         if !self.scope.is_empty() || self.positions.is_empty() {
             return math::rope(
@@ -2387,6 +2692,13 @@ impl Decoder {
             normed.as_ref(),
         )?;
         let branch = self.moe(&mixed, i)?;
+        #[cfg(test)]
+        let branch = if self.poison_moe_at == Some(i) {
+            self.poison_moe_at = None;
+            MxArray::zeros(&branch.shape()?, Some(branch.dtype()?))?
+        } else {
+            branch
+        };
         let gate =
             gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
         Self::inject(&x, &branch, &gate)
@@ -2466,8 +2778,9 @@ impl Decoder {
         }
         self.rotary_tables.get_mut().clear();
         let started = std::time::Instant::now();
-        let result =
-            self.prefill_group_with_device_routes(&[tokens], next, embeddings, project_logits);
+        let result = self.count_prefill(|decoder| {
+            decoder.prefill_group_with_device_routes(&[tokens], next, embeddings, project_logits)
+        });
         self.rotary_tables.get_mut().clear();
         if result.is_err() {
             self.reset();
@@ -2592,44 +2905,66 @@ impl Decoder {
         (windows, tail)
     }
 
-    /// Whether a prompt of `suffix` new tokens runs as one layer-major
-    /// group: a direct fill is still publishing banks, every window is a
-    /// tentative-eligible slice, and the residual streams fit beside the
-    /// direct turn floor.
-    pub(super) fn group_mode(&self, suffix: usize) -> bool {
+    /// How the layer-major groups of a prompt of `suffix` new tokens after
+    /// `start` rows are bounded; `None` runs it one window at a time.
+    /// During a direct fill every window is a tentative-eligible slice and
+    /// the residual streams fit beside the direct turn floor (live host):
+    /// one group. On a store whose slots can miss, the most windows (up to
+    /// [`PARTIAL_GROUP_WINDOWS`]) whose group scratch fits beside one pass's
+    /// scratch at the prompt's last row inside the transient the memory plan
+    /// priced; no live host read.
+    pub(super) fn group_limit(&self, start: usize, suffix: usize) -> Option<GroupLimit> {
         let slice = self.prefill_slice_size().max(1);
         let windows = suffix / slice + usize::from(suffix % slice >= 256);
         if windows < 2 || self.verification.is_some() {
-            return false;
+            return None;
         }
         #[cfg(test)]
         if let Some(pin) = self.group_pin {
-            return pin;
+            return pin.then_some(GroupLimit::Whole);
         }
-        let filling = self.weights.direct_fill_pass();
-        if !filling || slice < 256 {
-            return false;
+        if self.weights.direct_fill_pass() {
+            if slice < 256 {
+                return None;
+            }
+            let host = super::memory::host_memory().ok()?;
+            let need = 22_400 * suffix as u64
+                + super::memory::prefill_scratch(
+                    &self.config,
+                    super::MAX_PREFILL_CHUNK,
+                    self.context_window,
+                )
+                + super::memory::DIRECT_TURN_FLOOR;
+            return (need <= host.available()).then_some(GroupLimit::Whole);
         }
-        let Ok(host) = super::memory::host_memory() else {
-            return false;
-        };
-        let need = 22_400 * suffix as u64
-            + super::memory::prefill_scratch(
-                &self.config,
-                super::MAX_PREFILL_CHUNK,
-                self.context_window,
-            )
-            + super::memory::DIRECT_TURN_FLOOR;
-        need <= host.available()
+        if !self.weights.slot_store() {
+            return None;
+        }
+        let planned = self.planned_scratch?;
+        let pass = super::memory::prefill_scratch(&self.config, slice, start + suffix);
+        (2..=windows.min(PARTIAL_GROUP_WINDOWS))
+            .rev()
+            .find(|&k| {
+                pass.saturating_add(super::memory::group_scratch(&self.config, k, slice)) <= planned
+            })
+            .map(GroupLimit::Windows)
     }
 
-    /// A whole prompt: one layer-major group and its tail in group mode,
-    /// else one window at a time with the next window's rows requested while
-    /// this one runs. The admitted window is read before every pass.
+    /// A whole prompt: layer-major groups (the last with the tail) when
+    /// [`Decoder::group_limit`] allows them, else one window at a time with
+    /// the next window's rows requested while this one runs. The admitted
+    /// window is read before every pass.
     pub fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<MxArray> {
-        if self.group_mode(tokens.len()) {
+        if let Some(limit) = self.group_limit(self.history.len(), tokens.len()) {
             let (windows, tail) = self.group_windows(tokens);
-            return Ok(self.prefill_group(&windows, tail, true, false)?.0);
+            let groups: Vec<_> = windows.chunks(limit.per_group()).collect();
+            let mut logits = None;
+            for (k, group) in groups.iter().enumerate() {
+                let last = k + 1 == groups.len();
+                let tail = if last { tail } else { &[] };
+                logits = Some(self.prefill_group(group, tail, last, false)?.0);
+            }
+            return logits.ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"));
         }
         let mut logits = None;
         let mut start = 0;
@@ -2680,12 +3015,14 @@ impl Decoder {
             }
         }
         let started = std::time::Instant::now();
-        let result = self.prefill_group_with_device_routes(
-            windows,
-            tail,
-            None,
-            project_logits && tail.is_empty(),
-        );
+        let result = self.count_prefill(|decoder| {
+            decoder.prefill_group_with_device_routes(
+                windows,
+                tail,
+                None,
+                project_logits && tail.is_empty(),
+            )
+        });
         self.rotary_tables.get_mut().clear();
         let logits = match result {
             Ok(logits) => logits,
@@ -2696,6 +3033,12 @@ impl Decoder {
             }
         };
         self.note("qwen4::group::end");
+        if windows.len() > 1 {
+            let live = &self.weights.live;
+            live.group_passes.fetch_add(1, Ordering::Relaxed);
+            live.group_windows
+                .fetch_add(windows.len() as u64, Ordering::Relaxed);
+        }
         let streams = std::mem::take(&mut self.group_streams);
         let views = if views && windows.len() > 1 {
             streams
@@ -2726,6 +3069,37 @@ impl Decoder {
         self.note("qwen4::tail::start");
         let logits = self.prefill_chunk_ahead(tail, &[], None, project_logits)?;
         Ok((logits, views))
+    }
+
+    /// Slot misses, fill read bytes and fill microseconds since load, for a
+    /// pass's debug line.
+    fn fill_records(&self) -> [u64; 3] {
+        let live = &self.weights.live;
+        [
+            live.slot_misses.load(Ordering::Relaxed),
+            live.fill_read_bytes.load(Ordering::Relaxed),
+            live.fill_micros.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Runs one prefill pass and adds what it moved of the fill, miss, read
+    /// and replay counters to their prefill shares.
+    fn count_prefill<T>(&mut self, pass: impl FnOnce(&mut Self) -> T) -> T {
+        let read = |live: &super::live::Live| {
+            live.prefill_shares()
+                .map(|(total, _)| total.load(Ordering::Relaxed))
+        };
+        let before = read(&self.weights.live);
+        let out = pass(self);
+        let live = &self.weights.live;
+        for ((_, share), (after, before)) in live
+            .prefill_shares()
+            .into_iter()
+            .zip(read(live).into_iter().zip(before))
+        {
+            share.fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+        }
+        out
     }
 
     /// Window `w` of a group starts a layer: `history` is the prompt before
@@ -2769,18 +3143,20 @@ impl Decoder {
     /// Layer `i` of a window of `rows` tokens at `first` is done: a full
     /// attention layer's keys and values go to the pool, lazily, and are
     /// evaluated where a plain pass evaluates them.
-    #[allow(clippy::too_many_arguments)]
     fn write_window_kv(
         &mut self,
         i: usize,
         cache: &mut LayerCache,
         rows: usize,
         first: usize,
-        floor: usize,
-        async_window: bool,
-        submit_span: usize,
-        defer_final: bool,
+        pass: GroupPass,
     ) -> Result<()> {
+        let GroupPass {
+            base: floor,
+            async_window,
+            submit_span,
+            defer_final,
+        } = pass;
         if self.config.linear(i) {
             return Ok(());
         }
@@ -2820,6 +3196,103 @@ impl Decoder {
         Ok(())
     }
 
+    /// Layer `i` of a carried-window pass over `windows`, each window of a
+    /// group at its own cursor; `streams` holds each window's residual
+    /// stream (window 0's from the start, the others' from layer 0 on).
+    /// Under a union lease every window's attention, K/V write, hyper mix
+    /// and routes run first, then the routed experts of all windows over one
+    /// lease plan, then each window's shared expert and injection.
+    fn group_layer(
+        &mut self,
+        i: usize,
+        cache: &mut LayerCache,
+        windows: &[&[u32]],
+        streams: &mut Vec<MxArray>,
+        pass: GroupPass,
+    ) -> Result<()> {
+        let group = windows.len() > 1;
+        let union = self.union_lease(windows, i)?;
+        let mut routed = Vec::new();
+        let mut inputs = Vec::new();
+        for (w, tokens_w) in windows.iter().enumerate() {
+            if group {
+                if w > 0 {
+                    self.check_cancelled()?;
+                }
+                self.set_cursor(pass.base, windows, w);
+            }
+            let input = if i == 0 && w > 0 {
+                let embedding_key = self.key("embed_tokens.weight", "token_embd.weight");
+                let rows: Vec<usize> = tokens_w.iter().map(|&t| t as usize).collect();
+                let e = self.weights.lookup_rows(&embedding_key, &rows)?.reshape(&[
+                    1,
+                    tokens_w.len() as i64,
+                    self.config.hidden_size as i64,
+                ])?;
+                let stream = MxArray::tile(&e, &[1, 1, self.config.hc_count as i32])?;
+                streams.push(stream.clone());
+                stream
+            } else {
+                streams[w].clone()
+            };
+            let (stream, normed) =
+                self.attention_matrix_for_mlp(&input, tokens_w, i, cache, true)?;
+            if !union {
+                streams[w] = self.mlp_matrix_for_attention(&stream, i, normed.as_ref())?;
+            }
+            let first = self.paged_chunk_start;
+            self.write_window_kv(i, cache, tokens_w.len(), first, pass)?;
+            if !union {
+                continue;
+            }
+            let (mixed, gate) = self.mlp_mix(&stream, i, normed.as_ref())?;
+            let (selected, scores) = self.route_window(&mixed, i)?;
+            let ids = selected.to_uint32()?.to_vec();
+            routed.push((stream, gate, selected));
+            inputs.push((mixed, ids, scores));
+        }
+        if !union {
+            return Ok(());
+        }
+        let sums = match self.union_expert_rows(&inputs, i)? {
+            Some(sums) => sums,
+            None => {
+                let mut sums = Vec::with_capacity(inputs.len());
+                for ((mixed, _, scores), (_, _, selected)) in inputs.iter().zip(&routed) {
+                    sums.push(self.expert_rows_for(mixed, selected, scores, i)?);
+                }
+                sums
+            }
+        };
+        #[cfg(test)]
+        if let Some(held) = self.group_held.last_mut() {
+            let arrays = streams
+                .iter()
+                .chain(
+                    routed
+                        .iter()
+                        .flat_map(|(stream, gate, selected)| {
+                            [Some(stream), gate.as_ref(), Some(selected)]
+                        })
+                        .flatten(),
+                )
+                .chain(inputs.iter().flat_map(|(mixed, _, scores)| [mixed, scores]))
+                .chain(&sums);
+            *held += arrays.map(|a| a.nbytes() as u64).sum::<u64>()
+                + inputs
+                    .iter()
+                    .map(|(_, ids, _)| 4 * ids.len() as u64)
+                    .sum::<u64>();
+        }
+        for (w, (((stream, gate, _), (mixed, _, _)), sum)) in
+            routed.into_iter().zip(&inputs).zip(sums).enumerate()
+        {
+            let branch = self.with_shared_expert(mixed, &sum, i)?;
+            streams[w] = self.mlp_inject(&stream, &branch, gate, i)?;
+        }
+        Ok(())
+    }
+
     /// One pass over `windows`, `for layer { for window }`. A group of one
     /// window is the window-major pass; a group of more runs every window of
     /// a layer before the next layer, each window at its own cursor, so the
@@ -2832,9 +3305,15 @@ impl Decoder {
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
+        if let [[token]] = windows
+            && self.verification.is_none()
+        {
+            return self.decode_token(*token, next, embeddings, true, project_logits);
+        }
         let base = self.history.len();
         let started = std::time::Instant::now();
         let rows = (self.weights.lookup.prefetched(), self.weights.lookup.late());
+        let fills = self.fill_records();
         let group = windows.len() > 1;
         let tokens = *windows
             .first()
@@ -2945,7 +3424,7 @@ impl Decoder {
                         media_digests: self.media_digests.clone(),
                         last_chunk_hidden: Vec::new(),
                         cancelled: self.cancelled.clone(),
-                        device_route_cooldown: self.device_route_cooldown,
+                        route_guard: self.route_guard.clone(),
                     })
                     .collect(),
             );
@@ -2954,76 +3433,39 @@ impl Decoder {
             window = Some(MxArray::concatenate_many(hidden.iter().collect(), Some(1))?);
             hidden.clear();
         }
+        self.begin_taps();
         for i in 0..layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
             if carry {
-                for (w, tokens_w) in windows.iter().enumerate() {
-                    if group {
-                        if w > 0 {
-                            self.check_cancelled()?;
-                        }
-                        self.set_cursor(base, windows, w);
-                    }
-                    let input = if i == 0 && w > 0 {
-                        let rows: Vec<usize> = tokens_w.iter().map(|&t| t as usize).collect();
-                        let e = self.weights.lookup_rows(&embedding_key, &rows)?.reshape(&[
-                            1,
-                            tokens_w.len() as i64,
-                            self.config.hidden_size as i64,
-                        ])?;
-                        let stream = MxArray::tile(&e, &[1, 1, hc])?;
-                        streams.push(stream.clone());
-                        stream
-                    } else {
-                        streams[w].clone()
-                    };
-                    let (stream, normed) =
-                        self.attention_matrix_for_mlp(&input, tokens_w, i, &mut cache, true)?;
-                    streams[w] = self.mlp_matrix_for_attention(&stream, i, normed.as_ref())?;
-                    let first = self.paged_chunk_start;
-                    self.write_window_kv(
-                        i,
-                        &mut cache,
-                        tokens_w.len(),
-                        first,
-                        base,
-                        async_window,
-                        submit_span,
-                        defer_final,
-                    )?;
+                let pass = GroupPass {
+                    base,
+                    async_window,
+                    submit_span,
+                    defer_final,
+                };
+                self.group_layer(i, &mut cache, windows, &mut streams, pass)?;
+                #[cfg(test)]
+                if let Some(passes) = &mut self.pass_outputs {
+                    passes.push((i, streams.clone()));
                 }
-            } else if self.verification.is_some() {
+                self.tap_layer(i, &streams)?;
+            } else {
                 let input = window
                     .take()
                     .ok_or_else(|| Error::from_reason("Qwen4 verification lost its window"))?;
                 let (stream, saved) = self.verify_layer(&input, tokens, i, &mut cache)?;
                 self.submit(&[&stream], "qwen4::decoder::verify")?;
+                #[cfg(test)]
+                if let Some(passes) = &mut self.pass_outputs {
+                    passes.push((i, vec![stream.clone()]));
+                }
+                self.tap_layer(i, std::slice::from_ref(&stream))?;
                 window = Some(stream);
                 if let Some(states) = &mut self.verification {
                     for (state, saved) in states.iter_mut().zip(saved) {
                         state.caches[i] = saved;
                     }
-                }
-            } else {
-                for (j, &token) in tokens.iter().enumerate() {
-                    self.check_cancelled()?;
-                    let next = self.layer(hidden[j].clone(), token, i, &mut cache)?;
-                    if defer_final && i + 1 == self.config.num_hidden_layers {
-                        // TrackFastModel returns a lazy final mixer/head. The
-                        // checked route commit joins it with all state/readers.
-                    } else if tokens.len() == 1
-                        && (i + 1) % submit_span != 0
-                        && i + 1 < self.config.num_hidden_layers
-                    {
-                        if self.decode_should_submit(i + 1) {
-                            self.submit(&[&next], "qwen4::decoder::next")?;
-                        }
-                    } else {
-                        MxArray::eval_arrays_with_context(&[&next], "qwen4::decoder::next")?;
-                    }
-                    hidden[j] = next;
-                    self.history.push(token);
                 }
             }
             self.history.truncate(base);
@@ -3031,16 +3473,6 @@ impl Decoder {
                 self.paged_chunk_start = base;
             }
             self.caches[i] = cache;
-            if tokens.len() == 1
-                && self.verification.is_none()
-                && ((i + 1) % submit_span == 0 || i + 1 == self.config.num_hidden_layers)
-                && !(defer_final && i + 1 == self.config.num_hidden_layers)
-                && let Some(adapter) = &mut self.paged
-            {
-                adapter
-                    .eval_pending_pool_writes()
-                    .map_err(Error::from_reason)?;
-            }
             super::memory::maintain_freelist(self.weights.plan.physical_bytes);
             if group {
                 #[cfg(test)]
@@ -3050,6 +3482,7 @@ impl Decoder {
                 }
             }
         }
+        self.finish_taps(base)?;
         let last_tokens = windows[windows.len() - 1];
         let final_window = if carry {
             streams.last().cloned()
@@ -3087,8 +3520,9 @@ impl Decoder {
         if !defer_final {
             MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
         }
+        let filled = self.fill_records();
         tracing::debug!(
-            "qwen4 prefill {}: {total} tokens at {base} in {:.1?}, rows prefetched +{} late +{}",
+            "qwen4 prefill {}: {total} tokens at {base} in {:.1?}, rows prefetched +{} late +{}, slot misses +{} fill bytes +{} fill time +{:.1} ms",
             if group {
                 format!("group of {} windows", windows.len())
             } else {
@@ -3096,7 +3530,10 @@ impl Decoder {
             },
             started.elapsed(),
             self.weights.lookup.prefetched() - rows.0,
-            self.weights.lookup.late() - rows.1
+            self.weights.lookup.late() - rows.1,
+            filled[0].saturating_sub(fills[0]),
+            filled[1].saturating_sub(fills[1]),
+            filled[2].saturating_sub(fills[2]) as f64 / 1000.0
         );
 
         for window in windows {
@@ -3106,46 +3543,201 @@ impl Decoder {
         Ok(logits)
     }
 
-    fn forward_token_inner(&mut self, token: u32, project_logits: bool) -> Result<MxArray> {
-        self.check_cancelled()?;
-        let submit_span = self.decode_submit_span();
-        let defer_final = self.deferred_forward_completion();
-        if token as usize >= self.config.vocab_size || self.history.len() >= self.context_window {
+    /// The once-per-token start of a decode pass: the frontier check, the
+    /// page cursor's record, the row requests and the embedding, as the
+    /// stream entering layer 0. `embedding_ahead` hands the token's embedding
+    /// row to the reader threads with its PLE rows; else this thread reads
+    /// it when the token starts.
+    pub(super) fn begin_decode_token(
+        &mut self,
+        token: u32,
+        next: &[u32],
+        embedding: Option<&MxArray>,
+        embedding_ahead: bool,
+    ) -> Result<MxArray> {
+        let base = self.history.len();
+        if base + 1 > self.context_window || token as usize >= self.config.vocab_size {
             return Err(Error::from_reason(
-                "qwen4_exp token/context outside configured limits",
+                "Qwen4 prefill chunk exceeds token/context budget",
             ));
         }
-        self.prefetch_ple_rows(&[token])?;
-        let row = self.embed_token(token)?;
-        let mut x = MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])?;
-        for i in 0..self.config.num_hidden_layers {
+        if let Some(e) = embedding
+            && *e.shape()? != [1, 1, self.config.hidden_size as i64]
+        {
+            return Err(Error::from_reason("Qwen4 media embedding shape mismatch"));
+        }
+        self.paged_chunk_start = base;
+        if let Some(adapter) = &mut self.paged {
+            if adapter.request_tokens() != self.history {
+                return Err(Error::from_reason(
+                    "Qwen4 paged/recurrent frontier mismatch",
+                ));
+            }
+            adapter
+                .record_tokens(&[token])
+                .map_err(Error::from_reason)?;
+        }
+        self.prefetch_window_rows(&[token], next, embedding.is_none() && embedding_ahead)?;
+        self.check_cancelled()?;
+        let row = match embedding {
+            Some(e) => e.slice_axis(1, 0, 1)?,
+            None => self.embed_token(token)?,
+        };
+        MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])
+    }
+
+    /// Whether this decode token keeps its layer inputs: a tentative pass
+    /// over a partial store.
+    fn keeps_layer_inputs(&self) -> bool {
+        #[cfg(test)]
+        if let Some(pin) = self.layer_inputs_pin {
+            return pin;
+        }
+        self.device_routes.is_some() && !self.weights.plan.direct
+    }
+
+    /// One decode token over every layer and the head.
+    fn decode_token(
+        &mut self,
+        token: u32,
+        next: &[u32],
+        embedding: Option<&MxArray>,
+        embedding_ahead: bool,
+        project: bool,
+    ) -> Result<MxArray> {
+        let LayerPass::Done(out) =
+            self.decode_pass(token, next, embedding, embedding_ahead, project)?
+        else {
+            return Err(Error::from_reason(
+                "Qwen4 decode pass stopped before its last layer",
+            ));
+        };
+        Ok(out)
+    }
+
+    /// `decode_token` that hands back a pass a route miss stopped.
+    pub(super) fn decode_pass(
+        &mut self,
+        token: u32,
+        next: &[u32],
+        embedding: Option<&MxArray>,
+        embedding_ahead: bool,
+        project: bool,
+    ) -> Result<LayerPass> {
+        let x = self.begin_decode_token(token, next, embedding, embedding_ahead)?;
+        self.begin_taps();
+        self.layer_inputs = self
+            .keeps_layer_inputs()
+            .then(|| Vec::with_capacity(self.config.num_hidden_layers));
+        let pass = self.decode_layers(0, x, token, project)?;
+        self.group_streams = Vec::new();
+        Ok(pass)
+    }
+
+    /// Layers `from..` of the decode token begun by `begin_decode_token`,
+    /// on `x`, the stream entering layer `from`, then the head. The caller
+    /// gives layers `from..` the caches they held before this token. A
+    /// device pass that keeps its layer inputs submits each group's route
+    /// entries with it and stops after a group submit once an earlier group's
+    /// finished routes name an expert with no slot.
+    pub(super) fn decode_layers(
+        &mut self,
+        from: usize,
+        mut x: MxArray,
+        token: u32,
+        project: bool,
+    ) -> Result<LayerPass> {
+        let layers = self.config.num_hidden_layers;
+        let submit_span = self.decode_submit_span();
+        let defer_final = self.deferred_forward_completion();
+        let polls = self.device_routes.is_some() && self.layer_inputs.is_some();
+        #[cfg(test)]
+        let polls = polls && self.after_group_submit != Some(GroupPoll::Never);
+        // Route entries [polled, submitted) of this pass were submitted and
+        // not yet read.
+        let (mut polled, mut submitted) = (0, 0);
+        if let Some(inputs) = &mut self.layer_inputs {
+            if inputs.len() < from {
+                return Err(Error::from_reason(format!(
+                    "Qwen4 layer inputs hold no input for layer {from}"
+                )));
+            }
+            inputs.truncate(from);
+        }
+        for i in from..layers {
             self.check_cancelled()?;
+            if let Some(inputs) = &mut self.layer_inputs {
+                inputs.push(x.clone());
+                #[cfg(test)]
+                {
+                    self.kept_layer_inputs += 1;
+                }
+            }
+            #[cfg(test)]
+            if self.stop_before == Some(i) {
+                return Ok(LayerPass::Stopped { at: i });
+            }
             let mut cache = std::mem::take(&mut self.caches[i]);
-            x = self.layer(x, token, i, &mut cache)?;
-            if defer_final && i + 1 == self.config.num_hidden_layers {
-                // The validated route commit completes the final head too.
-            } else if (i + 1) % submit_span != 0 && i + 1 < self.config.num_hidden_layers {
+            let next = self.layer(x, token, i, &mut cache)?;
+            #[cfg(test)]
+            if let Some(outputs) = &mut self.layer_outputs {
+                outputs.push((i, next.clone()));
+            }
+            self.tap_layer(i, std::slice::from_ref(&next))?;
+            let last = i + 1 == layers;
+            let mut poll = None;
+            if defer_final && last {
+                // TrackFastModel returns a lazy final mixer/head. The
+                // checked route commit joins it with all state/readers.
+            } else if (i + 1) % submit_span != 0 && !last {
                 if self.decode_should_submit(i + 1) {
-                    self.submit(&[&x], "qwen4::decoder::x")?;
+                    #[cfg(test)]
+                    if polls && self.after_group_submit == Some(GroupPoll::Older) {
+                        crate::array::synchronize();
+                    }
+                    let mut group = vec![&next];
+                    if polls && let Some(routes) = &self.device_routes {
+                        poll = Some(submitted);
+                        group.extend(routes[submitted..].iter().map(|(_, ids)| ids));
+                        submitted = routes.len();
+                    }
+                    self.submit(&group, "qwen4::decoder::next")?;
                 }
             } else {
-                MxArray::eval_arrays_with_context(&[&x], "qwen4::decoder::x")?;
+                MxArray::eval_arrays_with_context(&[&next], "qwen4::decoder::next")?;
             }
+            x = next;
             self.caches[i] = cache;
+            #[cfg(test)]
+            let poll = poll.map(|older| self.pinned_poll(older, submitted));
+            if let Some(upto) = poll
+                && self.routes_missed(upto, &mut polled)?
+            {
+                return Ok(LayerPass::Stopped { at: i + 1 });
+            }
+            if ((i + 1) % submit_span == 0 || last)
+                && !(defer_final && last)
+                && let Some(adapter) = &mut self.paged
+            {
+                adapter
+                    .eval_pending_pool_writes()
+                    .map_err(Error::from_reason)?;
+            }
             // Keep reusable buffers bounded after all layer consumers complete.
             super::memory::maintain_freelist(self.weights.plan.physical_bytes);
         }
+        self.finish_taps(self.history.len())?;
         self.last_chunk_hidden = vec![x.clone()];
-        let (hidden, _) = self.hyper(&x, "hyper_connection_mixer", "output_hc", false)?;
-        let logits = if project_logits {
-            self.linear(&hidden, "lm_head.weight", "output.weight")?
+        let (mixed, _) = self.hyper(&x, "hyper_connection_mixer", "output_hc", false)?;
+        let out = if project {
+            self.linear(&mixed, "lm_head.weight", "output.weight")?
         } else {
-            hidden
+            mixed
         };
         if !defer_final {
-            MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
+            MxArray::eval_arrays_with_context(&[&out], "qwen4::decoder::logits")?;
         }
         self.history.push(token);
-        Ok(logits)
+        Ok(LayerPass::Done(out))
     }
 }

@@ -38,6 +38,21 @@ export const WORK_ANSWER_TOKENS = 16384;
 /** Each cap is the answer room plus the engine's thinking budget, so the budget fires before the cap. */
 export const CHAT_MAX_COMPLETION_TOKENS = CHAT_ANSWER_TOKENS + AGENT_HOST_THINKING.tokenBudget;
 export const WORK_MAX_COMPLETION_TOKENS = WORK_ANSWER_TOKENS + AGENT_HOST_THINKING.tokenBudget;
+/**
+ * Work's stall limit for one model stream, in seconds. A local compaction reads the conversation for many minutes with
+ * no event the agent counts, and a workflow child queued behind it dies at the agent's 600 s default. `0` would mean
+ * 10 s in the agent, never "off".
+ */
+export const AGENT_IDLE_TIMEOUT_SECS = 3600;
+
+/**
+ * Set over any inherited value. Two-pass compaction starts a second summary early, which the local engine serves only
+ * after the main step, and the 300 s compaction clock cuts every local summary before it ends.
+ */
+function compactionEnv(env: Record<string, string>): void {
+  env.GROK_TWO_PASS_COMPACTION = '0';
+  env.GROK_COMPACTION_WALL_CLOCK_SECS = '0';
+}
 
 function baseUrls(endpoint: InferenceAccess): Record<string, string> {
   const v1 = `${endpoint.url}/v1`;
@@ -79,6 +94,8 @@ export function chatAgentEnv(input: ChatEnvInput): Record<string, string> {
   env.GROK_CURSOR_SKILLS_ENABLED = 'false';
   env.GROK_TURN_SUMMARY = '0';
   env.GROK_SESSION_SEARCH = '0';
+  env.GROK_WORKFLOWS = '0';
+  compactionEnv(env);
   env.GROK_CONFIG = JSON.stringify({ models: { max_completion_tokens: CHAT_MAX_COMPLETION_TOKENS } });
   return env;
 }
@@ -100,8 +117,8 @@ function plainObject(value: unknown): Record<string, unknown> | null {
 }
 
 /**
- * `GROK_CONFIG` of Work: the user's own overlay object keeps every key and gets the output cap in `models` (a lower cap
- * of theirs stays). A value that is not a JSON object is replaced, so the cap always holds. The overlay cannot carry
+ * `GROK_CONFIG` of Work: the user's own overlay object keeps every key and gets the output cap and the stall limit in
+ * `models` (a lower cap and a longer integer limit of theirs stay). A value that is not a JSON object is replaced, so the cap always holds. The overlay cannot carry
  * permission rules (the agent drops `[permission]` from it); the Work guard plugin does that job.
  */
 export function workOverlay(base: string | undefined): string {
@@ -119,7 +136,15 @@ export function workOverlay(base: string | undefined): string {
     typeof own === 'number' && Number.isInteger(own) && own > 0 && own < WORK_MAX_COMPLETION_TOKENS
       ? own
       : WORK_MAX_COMPLETION_TOKENS;
-  return JSON.stringify({ ...overlay, models: { ...models, max_completion_tokens: cap } });
+  const ownIdle = models.inference_idle_timeout_secs;
+  const idle =
+    typeof ownIdle === 'number' && Number.isInteger(ownIdle) && ownIdle > AGENT_IDLE_TIMEOUT_SECS
+      ? ownIdle
+      : AGENT_IDLE_TIMEOUT_SECS;
+  return JSON.stringify({
+    ...overlay,
+    models: { ...models, max_completion_tokens: cap, inference_idle_timeout_secs: idle },
+  });
 }
 
 export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
@@ -133,6 +158,7 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   for (const name of ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN']) env[name] ??= '0';
   env.GROK_RESUME_COMMAND ??= 'mlx agent';
   env.GROK_TURN_SUMMARY = '0';
+  compactionEnv(env);
   // Set, so the agent does not fill it from the login shell: the Auto check places a relative `cd` in the folder.
   env.CDPATH = '';
   env.GROK_CONFIG = workOverlay(env.GROK_CONFIG);

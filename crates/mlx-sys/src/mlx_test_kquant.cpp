@@ -2,6 +2,7 @@
 // K-quant entry points and a shapeless-compile replay. No production caller.
 
 #include "mlx_common.h"
+#include "mlx_gguf_planes.h"
 #include "mlx_kquant.h"
 #include "mlx_test_counters.h"
 
@@ -133,10 +134,12 @@ int32_t mlx_test_kquant_qmv_vector_limit(int32_t K, int32_t N) {
   }
 }
 
-// Checks paged_attn.metallib against kquant::metal_kernel_names(). `counts`
-// receives {base names, NAX names, K-quant functions in the library, pipelines
-// built}. `report` receives one line per missing name (one the dispatcher can
-// request on this device) and per unexpected K-quant function in the library.
+// Checks paged_attn.metallib against the union of kquant::metal_kernel_names()
+// and gguf_planes::metal_kernel_names(). `counts` receives {base names, NAX
+// names, K-quant and "gguf_" functions in the library, pipelines built, GGUF
+// planes names}. `report` receives one line per missing name (one the
+// dispatcher can request on this device) and per unexpected function (a
+// test-only gguf_planes::test_kernel_names() one among them).
 // `build_pipelines` also builds every required pipeline. False without Metal,
 // on error, or when `report` cannot hold the text.
 bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
@@ -154,10 +157,17 @@ bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
     for (NS::UInteger i = 0; i < functions->count(); ++i) {
       std::string name = functions->object<NS::String>(i)->utf8String();
       auto prefix = name.substr(0, name.find('_'));
-      if (kquant::parse_mode(prefix) || name.rfind("kquant_", 0) == 0) {
+      if (kquant::parse_mode(prefix) || name.rfind("kquant_", 0) == 0 ||
+          name.rfind("gguf_", 0) == 0) {
         in_library.insert(std::move(name));
       }
     }
+    if (mlx::core::gguf_planes::testing::mutation ==
+        mlx::core::gguf_planes::testing::kNameRemoved)
+      in_library.erase("gguf_decode_iq4xs_m8_r");
+    if (mlx::core::gguf_planes::testing::mutation ==
+        mlx::core::gguf_planes::testing::kTestNameInProduct)
+      in_library.insert("gguf_dequant");
 
     std::ostringstream out;
     std::set<std::string> known;
@@ -187,6 +197,29 @@ bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
       }
       ++built;
     }
+    int64_t planes_names = 0;
+    for (const auto &name : mlx::core::gguf_planes::metal_kernel_names()) {
+      known.insert(name);
+      ++planes_names;
+      if (!in_library.count(name)) {
+        out << "missing " << name << "\n";
+        continue;
+      }
+      if (!build_pipelines || !nax)
+        continue;
+      if (name.rfind("gguf_decode_fused_m", 0) == 0) {
+        uint32_t format = 0;
+        mlx::core::metal::MTLFCList consts = {
+            {&format, MTL::DataType::DataTypeUInt, 0},
+            {&format, MTL::DataType::DataTypeUInt, 1},
+            {&format, MTL::DataType::DataTypeUInt, 2},
+        };
+        d.get_kernel(name, lib, name + "_f0_0_0", consts);
+      } else {
+        d.get_kernel(name, lib);
+      }
+      ++built;
+    }
     for (const auto &name : in_library) {
       if (!known.count(name))
         out << "unexpected " << name << "\n";
@@ -195,6 +228,7 @@ bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
     counts[1] = nax_names;
     counts[2] = static_cast<int64_t>(in_library.size());
     counts[3] = built;
+    counts[4] = planes_names;
     std::string text = out.str();
     if (text.size() + 1 > len)
       return false;

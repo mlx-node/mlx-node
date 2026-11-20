@@ -322,6 +322,7 @@ fn attend(
             pool.kv as i32,
             d as i32,
             pool.format.code(),
+            false,
             1.0 / (d as f32).sqrt(),
             &mut attention,
             &mut workspace_out,

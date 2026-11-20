@@ -294,6 +294,7 @@ export function liveModel(name: string, overrides: Partial<LiveModel> = {}): Liv
       freeBlocks: 2380,
       reclaimableBlocks: 400,
     },
+    experts: null,
     ...overrides,
   };
 }
@@ -316,6 +317,7 @@ export function liveTurn(traceId: string, overrides: Partial<LiveTurn> = {}): Li
     prefillTotal: 1_000,
     prefillDone: 1_000,
     generatedTokens: 1_204,
+    clientSession: null,
     ...overrides,
   };
 }

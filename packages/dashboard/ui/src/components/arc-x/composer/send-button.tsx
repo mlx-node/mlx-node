@@ -39,7 +39,7 @@ export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string
         glyph: 'send',
         enabled: canSend,
         name: CHAT.send,
-        tip: canSend ? CHAT.sendTip : (reason ?? CHAT.send),
+        tip: reason ?? CHAT.sendTip,
         ring: false,
         spin: false,
         dim: !canSend,

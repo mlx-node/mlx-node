@@ -109,6 +109,95 @@ pub(crate) fn arm_native_failure_at(context: &str) {
     }
 }
 
+/// Test-only log of the synchronous evals, host reads and synchronizes on
+/// this thread that had to wait for an array not yet on the host (MLX
+/// `array::is_available` false at the call), with the scope a graph build
+/// marks around itself.
+#[cfg(test)]
+pub(crate) mod host_waits {
+    use std::cell::{Cell, RefCell};
+    use std::panic::Location;
+
+    use mlx_sys as sys;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct HostWait {
+        /// The graph-build scope open at the call, `""` outside any.
+        pub(crate) scope: &'static str,
+        pub(crate) what: &'static str,
+        pub(crate) at: &'static Location<'static>,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<HostWait>>> = const { RefCell::new(None) };
+        static SCOPE: Cell<&'static str> = const { Cell::new("") };
+    }
+
+    /// Starts a fresh log on this thread.
+    pub(crate) fn start() {
+        LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Ends the log and returns it.
+    pub(crate) fn take() -> Vec<HostWait> {
+        LOG.with(|log| log.borrow_mut().take()).unwrap_or_default()
+    }
+
+    pub(crate) struct Scope(&'static str);
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            SCOPE.with(|scope| scope.set(self.0));
+        }
+    }
+
+    /// Marks the calls until the guard drops as part of the `name` build.
+    pub(crate) fn scope(name: &'static str) -> Scope {
+        Scope(SCOPE.with(|scope| scope.replace(name)))
+    }
+
+    pub(crate) struct Pending {
+        what: &'static str,
+        at: &'static Location<'static>,
+    }
+
+    /// `Some` when the log is on and one of `handles` is not on the host.
+    #[track_caller]
+    pub(crate) fn begin(what: &'static str, handles: &[*mut sys::mlx_array]) -> Option<Pending> {
+        let at = Location::caller();
+        let armed = LOG.with(|log| log.borrow().is_some());
+        let pending = armed
+            && handles
+                .iter()
+                .any(|&handle| !unsafe { sys::mlx_array_is_available(handle) });
+        pending.then_some(Pending { what, at })
+    }
+
+    /// [`begin`] for a call that always waits for the GPU (a synchronize).
+    #[track_caller]
+    pub(crate) fn begin_always(what: &'static str) -> Option<Pending> {
+        let at = Location::caller();
+        LOG.with(|log| log.borrow().is_some())
+            .then_some(Pending { what, at })
+    }
+
+    pub(crate) fn end(pending: Option<Pending>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        let wait = HostWait {
+            scope: SCOPE.with(Cell::get),
+            what: pending.what,
+            at: pending.at,
+        };
+        LOG.with(|log| {
+            if let Some(log) = log.borrow_mut().as_mut() {
+                log.push(wait);
+            }
+        });
+    }
+}
+
 /// Whether MLX's Metal backend is available on this host (cached; constant per
 /// process). False on the CUDA/Linux build, which must use synchronous eval to
 /// avoid the async-eval cross-stream `cu::AtomicEvent::wait` segfault.
@@ -144,7 +233,11 @@ impl MxArray {
 
     #[napi]
     pub fn eval(&self) {
+        #[cfg(test)]
+        let watch = host_waits::begin("eval", &[self.handle.0]);
         unsafe { sys::mlx_array_eval(self.handle.0) };
+        #[cfg(test)]
+        host_waits::end(watch);
     }
 
     /// Asynchronously evaluate multiple arrays in parallel (non-blocking)
@@ -185,12 +278,14 @@ impl MxArray {
 
     /// Synchronously evaluate multiple arrays (blocking).
     /// Used between prefill chunks to materialize KV caches and break lazy dependency chains.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn eval_arrays(arrays: &[&MxArray]) -> Result<()> {
         Self::eval_arrays_with_context(arrays, "eval_arrays")
     }
 
     /// Synchronously evaluate multiple arrays and attach an operation name to
     /// both the structured trace event and any caller-visible error.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn eval_arrays_with_context(arrays: &[&MxArray], context: &str) -> Result<()> {
         if arrays.is_empty() {
             return Ok(());
@@ -198,7 +293,20 @@ impl MxArray {
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
         #[cfg(test)]
         arm_native_failure_at(context);
-        match eval_native(&mut handles) {
+        #[cfg(test)]
+        if arrays.iter().any(|arr| !arr.is_available()) {
+            WAITED_EVALS.with(|log| {
+                if let Some(log) = log.borrow_mut().as_mut() {
+                    log.push(context.to_owned());
+                }
+            });
+        }
+        #[cfg(test)]
+        let watch = host_waits::begin("eval_arrays", &handles);
+        let evaluated = eval_native(&mut handles);
+        #[cfg(test)]
+        host_waits::end(watch);
+        match evaluated {
             Ok(()) => Ok(()),
             Err(detail) => {
                 tracing::error!(
@@ -258,9 +366,14 @@ impl MxArray {
     }
 
     /// Extract scalar int32 value without allocating a Vec
+    #[cfg_attr(test, track_caller)]
     pub fn item_at_int32(&self, index: usize) -> Result<i32> {
         let mut value: i32 = 0;
+        #[cfg(test)]
+        let watch = host_waits::begin("item_at_int32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_item_at_int32(self.handle.0, index, &mut value) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(value)
         } else {
@@ -272,9 +385,14 @@ impl MxArray {
     }
 
     /// Extract scalar uint32 value without allocating a Vec
+    #[cfg_attr(test, track_caller)]
     pub fn item_at_uint32(&self, index: usize) -> Result<u32> {
         let mut value: u32 = 0;
+        #[cfg(test)]
+        let watch = host_waits::begin("item_at_uint32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_item_at_uint32(self.handle.0, index, &mut value) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(value)
         } else {
@@ -287,9 +405,14 @@ impl MxArray {
 
     /// Extract float32 value at specific index without copying entire array
     /// More efficient than to_float32_noeval()[index] for large arrays
+    #[cfg_attr(test, track_caller)]
     pub fn item_at_float32(&self, index: usize) -> Result<f32> {
         let mut value: f32 = 0.0;
+        #[cfg(test)]
+        let watch = host_waits::begin("item_at_float32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_item_at_float32(self.handle.0, index, &mut value) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(value)
         } else {
@@ -330,7 +453,11 @@ impl MxArray {
     pub fn to_float32(&self) -> Result<Float32Array> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0f32; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_float32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_float32(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer.into())
         } else {
@@ -348,7 +475,11 @@ impl MxArray {
     pub fn to_int32(&self) -> Result<Int32Array> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0i32; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_int32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_int32(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer.into())
         } else {
@@ -365,7 +496,11 @@ impl MxArray {
     pub fn to_uint32(&self) -> Result<Uint32Array> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0u32; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_uint32", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_uint32(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer.into())
         } else {
@@ -374,10 +509,15 @@ impl MxArray {
     }
     /// Extract raw uint8 values from uint8 arrays.
     /// Used by SafeTensors writer for MXFP8 scales (E8M0 format).
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn to_uint8(&self) -> Result<Vec<u8>> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0u8; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_uint8", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_uint8(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer)
         } else {
@@ -389,10 +529,15 @@ impl MxArray {
 
     /// Extract raw int8 values from int8 arrays.
     /// Used by SafeTensors writer for sym8 per-channel symmetric weights.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn to_int8(&self) -> Result<Vec<i8>> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0i8; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_int8", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_int8(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer)
         } else {
@@ -404,10 +549,15 @@ impl MxArray {
 
     /// Extract raw uint16 values from bf16/f16 arrays without f32 round-trip.
     /// Used by SafeTensors writer to avoid tripling memory for 16-bit tensors.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn to_uint16_native(&self) -> Result<Vec<u16>> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0u16; len];
+        #[cfg(test)]
+        let watch = host_waits::begin("to_uint16", &[self.handle.0]);
         let ok = unsafe { sys::mlx_array_to_uint16(self.handle.0, buffer.as_mut_ptr(), len) };
+        #[cfg(test)]
+        host_waits::end(watch);
         if ok {
             Ok(buffer)
         } else {
@@ -415,6 +565,58 @@ impl MxArray {
                 "Failed to extract uint16 from array (must be bf16 or f16 dtype)",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNREADY_ID_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the `ready_ids` reads on this thread of an array whose
+/// evaluation had not finished.
+#[cfg(test)]
+pub(crate) fn unready_id_reads() -> u64 {
+    UNREADY_ID_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAITED_EVALS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: the contexts of the checked evals on this thread that found
+/// an array not yet finished (so they waited), in order, since the last
+/// call; the first call starts the log.
+#[cfg(test)]
+pub(crate) fn take_waited_evals() -> Vec<String> {
+    WAITED_EVALS.with(|log| log.borrow_mut().replace(Vec::new()).unwrap_or_default())
+}
+
+impl MxArray {
+    /// Whether the array's evaluation has finished; never waits.
+    pub(crate) fn is_available(&self) -> bool {
+        unsafe { sys::mlx_array_is_available(self.handle.0) }
+    }
+
+    /// The values of a 1-D u32 array whose evaluation has finished, read
+    /// without waiting; `None` while it is unscheduled or in flight, and for
+    /// any other shape or type: reading those builds a reshape or a cast and
+    /// waits for the whole GPU queue.
+    pub(crate) fn ready_ids(&self) -> Result<Option<Vec<u32>>> {
+        if !self.is_available() || self.ndim()? != 1 || self.dtype()? != DType::Uint32 {
+            return Ok(None);
+        }
+        self.read_ids().map(Some)
+    }
+
+    fn read_ids(&self) -> Result<Vec<u32>> {
+        #[cfg(test)]
+        if !self.is_available() {
+            UNREADY_ID_READS.with(|reads| reads.set(reads.get() + 1));
+        }
+        Ok(self.to_uint32()?.to_vec())
     }
 }
 

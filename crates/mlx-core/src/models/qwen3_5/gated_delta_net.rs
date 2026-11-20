@@ -12,7 +12,7 @@ use super::gated_delta::{
     gated_delta_update_with_tape, prefill_fused_enabled,
 };
 use crate::models::quantized_linear::{
-    DEFAULT_QUANT_MODE, LinearProj, PreparedSg8, QuantizedLinear,
+    DEFAULT_QUANT_MODE, LinearProj, MixerResidual, PreparedSg8, QuantizedLinear,
 };
 
 /// Chunk-relative rows at which a prefill forward captures every GDN layer's
@@ -59,6 +59,14 @@ fn note_route(route: GdnRoute) {
 #[cfg(test)]
 pub(crate) fn take_gdn_routes() -> Vec<GdnRoute> {
     GDN_ROUTES.with(|routes| routes.take())
+}
+
+/// One lane of [`GatedDeltaNet::forward_wave`]: the lane's own cell (the
+/// verify layout of `GdnStateBlobs::verify_cell`: slots 0/1 its live cell,
+/// 2/3 its other cell, 4..9 its pending tape) and its tape sink.
+pub(crate) struct GdnWaveLane<'a> {
+    pub cell: &'a mut ArraysCache,
+    pub tape: &'a mut Option<GdnLayerTape>,
 }
 
 /// Rows `[start, end)` of a `[B, T, ...]` window.
@@ -628,7 +636,72 @@ impl GatedDeltaNet {
         tape_sink: Option<&mut Option<GdnLayerTape>>,
         residual: &MxArray,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, Some(residual), None)
+        self.forward_with_tape_impl(
+            x,
+            mask,
+            cache,
+            use_kernel,
+            tape_sink,
+            Some(MixerResidual::Source(residual)),
+            None,
+        )
+    }
+
+    /// The unmasked, untaped prefill forward whose output projection adds
+    /// `residual` in its GEMM store where the shape takes the epilogue GEMM
+    /// ([`Self::out_proj_store_route`]); residual-inclusive output, the bits
+    /// of `residual + forward(x)`.
+    pub(crate) fn forward_store_residual(
+        &self,
+        x: &MxArray,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(
+            x,
+            None,
+            cache,
+            use_kernel,
+            None,
+            Some(MixerResidual::Store(residual)),
+            None,
+        )
+    }
+
+    /// The taped forward of a DFlash2 verify's rows whose output projection
+    /// adds `residual` in its planes `_r` store
+    /// ([`Self::out_proj_verify_route`]); residual-inclusive output, same
+    /// cache and tape as [`Self::forward_with_tape`].
+    pub(crate) fn forward_verify_residual_with_tape(
+        &self,
+        x: &MxArray,
+        cache: Option<&mut ArraysCache>,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(
+            x,
+            None,
+            cache,
+            true,
+            tape_sink,
+            Some(MixerResidual::Verify(residual)),
+            None,
+        )
+    }
+
+    /// Whether a DFlash2 verify's `rows` rows reach the output projection's
+    /// planes.
+    pub(crate) fn out_proj_verify_route(&self, rows: i64) -> bool {
+        self.out_proj.verify_residual_route(rows)
+    }
+
+    /// Whether the output projection of `rows` rows takes the store-epilogue
+    /// GEMM.
+    pub(crate) fn out_proj_store_route(&self, rows: i64) -> Result<bool> {
+        self.out_proj
+            .store_epilogue_route(rows, self.value_dim as i64)
     }
 
     /// Unmasked batch-1 prefill forward (no tape) that also captures the
@@ -651,7 +724,7 @@ impl GatedDeltaNet {
             cache,
             use_kernel,
             None,
-            residual,
+            residual.map(MixerResidual::Source),
             Some((plan, &mut captured)),
         )?;
         Ok((out, captured))
@@ -716,7 +789,7 @@ impl GatedDeltaNet {
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
-        residual: Option<&MxArray>,
+        residual: Option<MixerResidual<'_>>,
         capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
@@ -736,55 +809,7 @@ impl GatedDeltaNet {
             ));
         }
 
-        // When the stacked weight is available, do one matmul + one split.
-        let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
-        let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
-            let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
-            let parts = combined.split_sections(&[qkvz_dim], 2)?;
-            Some((parts[0].clone(), parts[1].clone()))
-        } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
-            let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
-            let parts = combined.split_sections(&[qkvz_dim], 2)?;
-            Some((parts[0].clone(), parts[1].clone()))
-        } else if self.split_in_proj_qkv_z.is_none() && self.split_in_proj_b_a.is_none() {
-            crate::models::quantized_linear::mixed_projection_forward(
-                x,
-                &[&self.in_proj_qkvz, &self.in_proj_ba],
-            )?
-            .map(|outputs| (outputs[0].clone(), outputs[1].clone()))
-        } else {
-            None
-        };
-
-        let (qkv, z) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
-            match crate::models::quantized_linear::mixed_projection_forward(x, &[qkv_proj, z_proj])?
-            {
-                Some(outputs) => (outputs[0].clone(), outputs[1].clone()),
-                None => (qkv_proj.forward(x)?, z_proj.forward(x)?),
-            }
-        } else {
-            let qkvz = if let Some((qkvz, _)) = &stacked {
-                qkvz.clone()
-            } else {
-                self.in_proj_qkvz.forward(x)?
-            };
-            let qkvz_split = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
-            (qkvz_split[0].clone(), qkvz_split[1].clone())
-        };
-
-        let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
-            match project_split_ba_m8(x, self.split_in_proj_b_a_m8.as_ref())? {
-                Some(pair) => pair,
-                None => (b_proj.forward(x)?, a_proj.forward(x)?),
-            }
-        } else {
-            let ba = if let Some((_, ba)) = &stacked {
-                ba.clone()
-            } else {
-                self.in_proj_ba.forward(x)?
-            };
-            self.split_ba_padded(&ba)?
-        };
+        let (qkv, z, b, a) = self.in_projections(x)?;
 
         // Apply mask before conv to prevent masked values leaking through convolution
         let qkv = if let Some(m) = mask {
@@ -809,7 +834,7 @@ impl GatedDeltaNet {
         };
         let incoming_conv = rows.and(conv_state.clone());
 
-        // Prompt-window fusion: one dispatch for the whole GDN core of an
+        // Prompt-window fusion: one primitive for the whole GDN core of an
         // unmasked batch-1 `T >= 64` window — bit-identical to the
         // `prep_via_conv` -> `gated_delta_update` -> tail chain it replaces.
         // Decode/verify (`T < 64`) and the tape path never see it.
@@ -860,7 +885,7 @@ impl GatedDeltaNet {
             use_kernel,
             batch,
             seq_len,
-            residual.is_none(),
+            !matches!(residual, Some(MixerResidual::Source(_))),
             rows,
         )? {
             if let Some(cache) = cache {
@@ -1268,6 +1293,336 @@ impl GatedDeltaNet {
 
         // Output projection
         self.out_proj.forward_mixer_output(&y_flat, None, residual)
+    }
+
+    /// `x` `[B, T, H]` -> `(qkv, z, b, a)`, the layer's input projections.
+    fn in_projections(&self, x: &MxArray) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        // When the stacked weight is available, do one matmul + one split.
+        let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
+        let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
+            let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
+            let parts = combined.split_sections(&[qkvz_dim], 2)?;
+            Some((parts[0].clone(), parts[1].clone()))
+        } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
+            let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
+            let parts = combined.split_sections(&[qkvz_dim], 2)?;
+            Some((parts[0].clone(), parts[1].clone()))
+        } else if self.split_in_proj_qkv_z.is_none() && self.split_in_proj_b_a.is_none() {
+            crate::models::quantized_linear::mixed_projection_forward(
+                x,
+                &[&self.in_proj_qkvz, &self.in_proj_ba],
+            )?
+            .map(|outputs| (outputs[0].clone(), outputs[1].clone()))
+        } else {
+            None
+        };
+
+        let (qkv, z, joined_ba) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
+            let joined = if stacked.is_none() && self.split_in_proj_b_a.is_none() {
+                crate::models::quantized_linear::mixed_projection_forward(
+                    x,
+                    &[qkv_proj, z_proj, &self.in_proj_ba],
+                )?
+            } else {
+                None
+            };
+            match joined {
+                Some(outputs) => (
+                    outputs[0].clone(),
+                    outputs[1].clone(),
+                    Some(outputs[2].clone()),
+                ),
+                None => match crate::models::quantized_linear::mixed_projection_forward(
+                    x,
+                    &[qkv_proj, z_proj],
+                )? {
+                    Some(outputs) => (outputs[0].clone(), outputs[1].clone(), None),
+                    None => (qkv_proj.forward(x)?, z_proj.forward(x)?, None),
+                },
+            }
+        } else {
+            let qkvz = if let Some((qkvz, _)) = &stacked {
+                qkvz.clone()
+            } else {
+                self.in_proj_qkvz.forward(x)?
+            };
+            let qkvz_split = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
+            (qkvz_split[0].clone(), qkvz_split[1].clone(), None)
+        };
+
+        let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
+            match project_split_ba_m8(x, self.split_in_proj_b_a_m8.as_ref())? {
+                Some(pair) => pair,
+                None => (b_proj.forward(x)?, a_proj.forward(x)?),
+            }
+        } else {
+            let ba = if let Some(ba) = joined_ba {
+                ba
+            } else if let Some((_, ba)) = &stacked {
+                ba.clone()
+            } else {
+                self.in_proj_ba.forward(x)?
+            };
+            self.split_ba_padded(&ba)?
+        };
+        Ok((qkv, z, b, a))
+    }
+
+    /// [`Self::in_projections`] of a wave `x` `[N, T, H]`: lane `i`'s rows
+    /// of each output carry the bits `in_projections(x[i])` gives. Each
+    /// projection runs once over the lanes (`forward_lanes`); the mixed
+    /// dispatch of one lane keeps its standalone projections' bits, so its
+    /// segments run as their own projections. The dense stacked weight and
+    /// the merged M8 b|a pair (an 8-row contract) run per lane.
+    pub(super) fn in_projections_lanes(
+        &self,
+        x: &MxArray,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        let lanes = x.shape_at(0)?;
+        let per_lane = |f: &dyn Fn(&MxArray) -> Result<Vec<MxArray>>| -> Result<Vec<MxArray>> {
+            let mut parts: Vec<Vec<MxArray>> = Vec::new();
+            for lane in 0..lanes {
+                let outs = f(&x.slice_axis(0, lane, lane + 1)?)?;
+                parts.resize_with(outs.len(), Vec::new);
+                for (part, out) in parts.iter_mut().zip(outs) {
+                    part.push(out);
+                }
+            }
+            parts
+                .iter()
+                .map(|part| MxArray::concatenate_many(part.iter().collect(), Some(0)))
+                .collect()
+        };
+        if self.in_proj_qkvz_ba_t.is_some() {
+            let parts = per_lane(&|x| {
+                let (qkv, z, b, a) = self.in_projections(x)?;
+                Ok(vec![qkv, z, b, a])
+            })?;
+            return Ok((
+                parts[0].clone(),
+                parts[1].clone(),
+                parts[2].clone(),
+                parts[3].clone(),
+            ));
+        }
+        let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
+        let merged = match &self.in_proj_qkvz_ba_q {
+            Some(merged) => {
+                let parts = merged.forward_lanes(x)?.split_sections(&[qkvz_dim], 2)?;
+                Some((parts[0].clone(), parts[1].clone()))
+            }
+            None => None,
+        };
+        let (qkv, z) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
+            (qkv_proj.forward_lanes(x)?, z_proj.forward_lanes(x)?)
+        } else {
+            let qkvz = match &merged {
+                Some((qkvz, _)) => qkvz.clone(),
+                None => self.in_proj_qkvz.forward_lanes(x)?,
+            };
+            let parts = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
+            (parts[0].clone(), parts[1].clone())
+        };
+        let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
+            if self.split_in_proj_b_a_m8.is_some() {
+                let parts = per_lane(&|x| {
+                    let (b, a) = match project_split_ba_m8(x, self.split_in_proj_b_a_m8.as_ref())? {
+                        Some(pair) => pair,
+                        None => (b_proj.forward(x)?, a_proj.forward(x)?),
+                    };
+                    Ok(vec![b, a])
+                })?;
+                (parts[0].clone(), parts[1].clone())
+            } else {
+                (b_proj.forward_lanes(x)?, a_proj.forward_lanes(x)?)
+            }
+        } else {
+            let ba = match &merged {
+                Some((_, ba)) => ba.clone(),
+                None => self.in_proj_ba.forward_lanes(x)?,
+            };
+            self.split_ba_padded(&ba)?
+        };
+        Ok((qkv, z, b, a))
+    }
+
+    /// Why [`Self::forward_wave`] on `hidden`-wide lanes would not stream its
+    /// in-projection weights once on this device: the complete kernel's
+    /// static contract for a deferred cell fails, or the q|k|v(|z) projection
+    /// misses the lane tier. `None` when it would.
+    pub(crate) fn wave_unready(&self, hidden: i64) -> Result<Option<&'static str>> {
+        let heads = self.tiled_gguf_layout
+            || self.num_k_heads == self.num_v_heads
+            || (self.num_k_heads > 0 && self.num_v_heads % self.num_k_heads == 0);
+        if self.conv_kernel_dim != 4
+            || self.key_head_dim != 128
+            || self.value_head_dim != 128
+            || !heads
+            || self.conv1d_w4_f32.is_none()
+            || self.gdn_scale_f32.is_none()
+            || self.dt_bias_f32.is_none()
+            || self.norm.weight().dtype()? != crate::array::DType::BFloat16
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return Ok(Some("the complete GDN kernel's contract"));
+        }
+        let tier = if self.in_proj_qkvz_ba_t.is_some() {
+            false
+        } else if let Some((qkv, z)) = &self.split_in_proj_qkv_z {
+            qkv.lane_tier_holds(hidden)? && z.lane_tier_holds(hidden)?
+        } else if let Some(merged) = &self.in_proj_qkvz_ba_q {
+            merged.lane_tier_holds(hidden)?
+        } else {
+            self.in_proj_qkvz.lane_tier_holds(hidden)?
+        };
+        Ok((!tier).then_some("the GDN in-projection's lane tier"))
+    }
+
+    /// One verify wave of this layer: `x` `[N, T, H]`, lane `i`'s rows for
+    /// `lanes[i]`. Each lane's output rows, cell slots and tape are the bits
+    /// [`Self::forward_with_tape`] gives that lane alone with its cell and a
+    /// tape sink, on the complete kernel. The projections run once over the
+    /// stacked lanes; the core once per lane on the lane's own cell. A lane
+    /// the complete kernel declines fails the wave and no lane's cell or
+    /// tape changes. With `residual` (`[N, T, H]`) the output is the whole
+    /// hidden state, the output projection adding it in its planes `_r`
+    /// store over the lanes where [`Self::out_proj_verify_lanes_route`]
+    /// holds.
+    pub(crate) fn forward_wave(
+        &self,
+        x: &MxArray,
+        lanes: &mut [GdnWaveLane<'_>],
+        residual: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if lanes.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != lanes.len() as i64
+            || shape[1] <= 0
+        {
+            return Err(Error::from_reason(format!(
+                "GatedDeltaNet::forward_wave expects [N,T,H] for {} lanes, got {:?}",
+                lanes.len(),
+                shape.as_ref()
+            )));
+        }
+        let (qkv, z, b, a) = self.in_projections_lanes(x)?;
+        let cores = self.wave_core(&qkv, &z, &a, &b, lanes)?;
+        if cores.iter().all(|(_, prepared)| prepared.is_none()) {
+            let gated =
+                MxArray::concatenate_many(cores.iter().map(|(out, _)| out).collect(), Some(0))?;
+            return match residual {
+                Some(residual) => self.out_proj.forward_verify_lanes_mixer(&gated, residual),
+                None => self.out_proj.forward_lanes(&gated),
+            };
+        }
+        let outs = cores
+            .iter()
+            .map(|(out, prepared)| self.out_proj.forward_prepared_sg8(out, prepared.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        let out = MxArray::concatenate_many(outs.iter().collect(), Some(0))?;
+        match residual {
+            Some(residual) => residual.add(&out),
+            None => Ok(out),
+        }
+    }
+
+    /// Whether a verify wave of `lanes` lanes reaches the output
+    /// projection's planes.
+    pub(crate) fn out_proj_verify_lanes_route(&self, lanes: i64) -> bool {
+        self.out_proj.verify_lanes_residual_route(lanes)
+    }
+
+    /// The per-lane core of [`Self::forward_wave`] over its projections
+    /// (each `[N, T, ...]`): the complete kernel on lane `i`'s rows and cell,
+    /// then every lane's cell slots 0/1 and tape. Returns each lane's gated
+    /// rows `[1, T, value_dim]` and prepared SG8 operands.
+    pub(super) fn wave_core(
+        &self,
+        qkv: &MxArray,
+        z: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        lanes: &mut [GdnWaveLane<'_>],
+    ) -> Result<Vec<(MxArray, Option<PreparedSg8>)>> {
+        let seq_len = qkv.shape_at(1)?;
+        if qkv.shape_at(0)? != lanes.len() as i64 {
+            return Err(Error::from_reason(format!(
+                "GDN wave: {} lanes of projections for {} cells",
+                qkv.shape_at(0)?,
+                lanes.len()
+            )));
+        }
+        let mut runs = Vec::with_capacity(lanes.len());
+        for (i, lane) in lanes.iter().enumerate() {
+            let row = |x: &MxArray| x.slice_axis(0, i as i64, i as i64 + 1);
+            let qkv = row(qkv)?;
+            let run = {
+                let cell: &ArraysCache = &*lane.cell;
+                let conv_state = cell.get(0).cloned();
+                self.forward_complete(
+                    &qkv,
+                    &row(z)?,
+                    &row(a)?,
+                    &row(b)?,
+                    conv_state.as_ref(),
+                    Some(cell),
+                    None,
+                    true,
+                    1,
+                    seq_len,
+                    true,
+                    None,
+                )?
+            };
+            let run = run.ok_or_else(|| {
+                Error::from_reason(format!("GDN wave: the complete kernel declined lane {i}"))
+            })?;
+            runs.push((run, qkv));
+        }
+        let mut outputs = Vec::with_capacity(runs.len());
+        let mut tapes = Vec::with_capacity(runs.len());
+        for (run, qkv) in runs {
+            let tape = match (run.raw.or(Some(qkv)), run.tape) {
+                (Some(qkv), Some(kernel)) => Some(GdnLayerTape {
+                    kernel,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                }),
+                _ => None,
+            };
+            tapes.push(tape);
+            outputs.push((run.out, run.prepared_sg8, run.state, run.history));
+        }
+        let mut cores = Vec::with_capacity(outputs.len());
+        for (i, ((out, prepared, state, history), tape)) in
+            outputs.into_iter().zip(tapes).enumerate()
+        {
+            self.adopt_wave_run(&mut lanes[i], state, &history, tape)?;
+            #[cfg(test)]
+            note_route(GdnRoute::Complete);
+            cores.push((out, prepared));
+        }
+        Ok(cores)
+    }
+
+    /// Lane `lane`'s cell slots 0/1 after its complete run, and its tape.
+    fn adopt_wave_run(
+        &self,
+        lane: &mut GdnWaveLane<'_>,
+        state: MxArray,
+        history: &MxArray,
+        tape: Option<GdnLayerTape>,
+    ) -> Result<()> {
+        lane.cell.set(
+            0,
+            history.reshape(&[1, (self.conv_kernel_dim - 1) as i64, self.conv_dim as i64])?,
+        )?;
+        lane.cell.set(1, state)?;
+        if tape.is_some() {
+            *lane.tape = tape;
+        }
+        Ok(())
     }
 
     /// The whole GDN core as one dispatch (`gated_delta_fused_complete`):
@@ -1711,7 +2066,7 @@ impl GatedDeltaNet {
         Ok((q, k, v))
     }
 
-    /// Prompt-window fused path (`mlx_gdn_fused_prefill`): one dispatch for
+    /// Prompt-window fused path (`mlx_gdn_fused_prefill`): one primitive for
     /// the gating + q/k norm + chunked recurrence + gated norm + z gate of an
     /// unmasked batch-1 window, bit-identical to `prep_via_conv` +
     /// `gated_delta_update` + the layer tail. Gated to `seq_len >= 64`: below
@@ -1751,10 +2106,7 @@ impl GatedDeltaNet {
         {
             return Ok(None);
         }
-        // a_log/dt_bias ride the same `float*` contract as the fused gating
-        // kernel — require f32 storage rather than trusting the blind read.
-        if self.a_log.dtype().ok() != Some(crate::array::DType::Float32)
-            || self.dt_bias.dtype().ok() != Some(crate::array::DType::Float32)
+        if !super::gated_delta::prefill_scalar_dtypes(&self.a_log, &self.dt_bias)
             || recurrent
                 .as_ref()
                 .is_some_and(|s| s.dtype().ok() != Some(crate::array::DType::Float32))
@@ -1942,8 +2294,8 @@ impl GatedDeltaNet {
     }
     pub fn set_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
         // norm.weight may be stored as f32 in checkpoints for precision;
-        // cast to the model's compute dtype — not to dt_bias's dtype
-        // (GGUF keeps dt_bias f32 for the gating kernel's `float*` reads).
+        // cast to the model's compute dtype, not to dt_bias's dtype (bf16 or
+        // f32 depending on the checkpoint).
         self.norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
@@ -2038,6 +2390,15 @@ impl GatedDeltaNet {
             mode(&self.in_proj_ba),
             self.in_proj_qkvz_ba_q.as_ref().and_then(mode),
         )
+    }
+
+    /// The output projection, where a load attaches its planes.
+    pub(crate) fn out_proj_mut(&mut self) -> &mut LinearProj {
+        &mut self.out_proj
+    }
+
+    pub(crate) fn out_proj(&self) -> &LinearProj {
+        &self.out_proj
     }
 
     /// The quantization mode of `out_proj` (`None` when dense).
@@ -2798,8 +3159,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The production geometry with f32 `dt_bias`/`a_log` (what every prompt
-    /// route requires), compact tiled heads or the repeat-expanded map. The
+    /// The production geometry with f32 `dt_bias`/`a_log` (a GGUF load keeps
+    /// them bf16: `gdn_bf16_gates_tests`), compact tiled heads or the repeat-expanded map. The
     /// input projections are exact (`exact_bf16`), so a forward of the
     /// first `c` rows of a window sees the same projected rows as the whole
     /// window: GEMM M cannot change the recurrence inputs.
@@ -3168,3 +3529,9 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod wave_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod join_tests;

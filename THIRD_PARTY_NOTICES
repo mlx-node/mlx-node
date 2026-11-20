@@ -167,6 +167,19 @@ verify_gdn_fused (gdn_decode_batch_phase, gdn_decode_scan, gdn_decode_gate)
 in runtime/metal/kernels/decode/gdn.metal and runtime/ops/GDN.cpp, with the
 arithmetic kept as MLX's rms_norm kernel and compiled sigmoid gate so the
 result equals mlx-node's unfused chain.
+The sampled DFlash2 target rows
+(crates/mlx-sys/src/metal/sampling/dflash2_rows.metal,
+crates/mlx-sys/src/mlx_dflash2_rows.cpp) — a sharded online-softmax scan of
+each row's denominator, one threadgroup per row that brackets the kept tokens
+by key with pivot counts (no sort or partition of the vocabulary) and ranks
+them in threadgroup memory, a tie order by id, and an inverse-CDF draw from
+host uniforms — follow the structure of Splash's decode_sample_mass_sharded,
+decode_sample_vocabulary_search (logit_key, place_pivots, measure_pivots,
+narrow, resolve) and decode_sample_vocabulary_draw in
+runtime/metal/kernels/decode/sampling.metal and Sampling::addSelection in
+runtime/ops/Sampling.cpp, with the filter law (top_k, top_p and min_p on the
+temperature-1 log-probabilities, softmax at the temperature) and the
+acceptance law kept as mlx-node's.
 
 The optional source-routing path in
 crates/mlx-sys/src/metal/common/source_routing.metal.inc and its dedicated
@@ -218,6 +231,23 @@ d8af1054aab0f97de21d043e01aa98af3754f10e. mlx-node places the replay point
 and the checkpoints on its prefill pass grid (1,024 rows) instead of 32-token
 pages, and keeps the states in the existing qwen3_5 HybridStateStore.
 
+The GGUF decode kernels on Splash's MDGG0001 weight planes in
+crates/mlx-sys/src/metal/splash_gguf/ (metal/abi/{QuantFormat,QuantTables,
+Gguf,GgufRepack}.h, metal/kernels/common/{quant_formats,gguf_staged,
+gguf_staged_tile,split_reduce}.h, metal/kernels/shared/{gguf_linear,
+gguf_repack}.metal) are copied from Splash revision
+d8af1054aab0f97de21d043e01aa98af3754f10e, runtime/metal/ at the same paths,
+cut to eight formats and the 8 / 16 / 32-row decode kernels; each file's
+header names its changes. metal/kernels/common/gguf_tile.h replaces Splash's
+store epilogues with mlx-node's (MLX's Add and Sigmoid / Multiply functors in
+bf16) and keeps Splash's fp32 ones for test-only kernels. The plan law, encoding and repack host side in
+crates/mlx-sys/src/mlx_gguf_planes.cpp are rewritten from Splash
+runtime/ops/{KernelSelection.cpp,KernelCalibration.hpp,LinearGguf.cpp} and
+runtime/model/GgufPreparation.cpp at the same revision, and so are the
+planes plan of a load and the import's planes writer in
+crates/mlx-core/src/utils/gguf_planes.rs. The full Apache-2.0 license is
+also in crates/mlx-sys/src/metal/splash_gguf/LICENSE.
+
 Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 
@@ -241,10 +271,13 @@ The IQ1 / IQ2 / IQ3 grid tables in
 crates/mlx-sys/src/metal/kquant/kquant_grid_tables.h (iq2xxs_grid,
 iq2xs_grid, iq2s_grid, iq3xxs_grid, iq3s_grid, iq1s_grid_gpu; read by the Metal kernels
 and the C++ CPU reference) and the K-quant parity oracle in
-crates/mlx-core/vendor/ggml/ (ggml_kquant_ref.{h,c}, ggml_grid_tables.inc,
-ggml_quants_upstream.inc: the block structs, grid tables and
-dequantize_row_* decoders, copied verbatim; test-only) are from ggml's
-ggml/src/ggml-common.h and ggml/src/ggml-quants.c, under the MIT License:
+crates/mlx-core/vendor/ggml/ (ggml_kquant_ref.{h,c}, ggml_planes_ref.c,
+ggml_grid_tables.inc, ggml_quants_upstream.inc, ggml_common_upstream.inc:
+the block structs, grid tables and dequantize_row_* decoders, copied
+verbatim; test-only) are from
+ggml's ggml/src/ggml-common.h and ggml/src/ggml-quants.c, and the GGUF
+decoding in crates/mlx-sys/src/metal/splash_gguf/ follows ggml's Metal
+dequantize.h and mul_mm.metal (through Splash), under the MIT License:
 
    MIT License
 

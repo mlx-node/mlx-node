@@ -373,6 +373,82 @@ fn warm_up_leaves_a_just_loaded_model() {
     leaves_the_model_as_loaded(moe(4));
 }
 
+/// The dense paged fixture with a DFlash2 draft and no native MTP head.
+fn dense_draft(lanes: usize) -> Qwen35Inner {
+    let mut inner =
+        crate::models::qwen3_5::dflash2_decode::paged_dflash2_tests::tiny_paged_int8_dflash_inner(
+            0x5741_0103,
+        );
+    inner.tokenizer = Some(content_tokenizer());
+    inner.memory_registration = Some(registration());
+    inner.grant_scheduled_lanes(lanes);
+    inner
+}
+
+/// A draft load's warm-up runs every speculative step as scheduled DFlash2
+/// lanes (none skipped, each width's verify forwards ran) and leaves the
+/// model as loaded: no lane, no open wave, no peer cells, no decode cache
+/// limit, no reset; the idle lane holds the ring and window the scratch
+/// lanes released, which the first serving lane takes.
+#[test]
+fn warm_up_leaves_a_just_loaded_draft_model() {
+    const NAME: &str = "engine::warmup::tests::warm_up_leaves_a_just_loaded_draft_model";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let lanes = 2;
+    let inner = dense_draft(lanes);
+    assert!(!inner.has_mtp_weights());
+    let drafts_on_lanes = inner.supports_scheduled_speculation();
+    let plan = WarmupPlan::for_backend(&inner, SLICE);
+    let speculative = plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step, Step::Speculative { .. }))
+        .count();
+    let idle = |inner: &Qwen35Inner| {
+        let idle = &inner.dflash2_states.idle_lane;
+        (idle.ring.is_some(), idle.window.is_some())
+    };
+    let idle_before = idle(&inner);
+    let before = Snapshot::take(&inner);
+    let forwards = || {
+        crate::models::qwen3_5::paged_forward::DFLASH2_VERIFY_FORWARDS.with(std::cell::Cell::get)
+    };
+    let forwards_before = forwards();
+    let warmed = warm(inner);
+    let verified = forwards() - forwards_before;
+    assert!(drafts_on_lanes, "a draft load drafts on the scheduled lane");
+    assert_eq!(speculative, lanes + 1, "{:?}", plan.steps);
+    assert_eq!(warmed.report.reset, 0);
+    assert_eq!(warmed.report.skipped, 0, "{:?}", warmed.trace.skipped);
+    assert_eq!(warmed.report.steps as usize, plan.steps.len());
+    assert_eq!(Snapshot::take(&warmed.inner), before);
+    assert_eq!(
+        warmed.trace.decode_widths.iter().max(),
+        Some(&lanes),
+        "the widest speculative step ran"
+    );
+    let at_least = (1..=lanes).sum::<usize>() * GOAL_STEPS + GOAL_STEPS;
+    assert!(
+        verified as usize >= at_least,
+        "each speculative step verified: {verified} < {at_least}"
+    );
+    let states = &warmed.inner.dflash2_states;
+    assert!(states.seq_lanes.is_empty());
+    assert!(states.lane_batch.is_none());
+    assert!(states.peer_cells.is_empty());
+    assert!(states.lane_decode_limit.is_none());
+    assert_eq!(idle_before, (false, false));
+    assert_eq!(
+        idle(&warmed.inner),
+        (true, true),
+        "the released ring and window"
+    );
+}
+
 /// W-T3: on a pool of 4 blocks (max 64) the warm-up skips what does not
 /// fit, ends `Ok` and leaves the pool its size, also when step A asks for
 /// its full rows (49 blocks) past the fit check: the admission may not grow
@@ -1039,13 +1115,21 @@ fn a_tool_load_reports_no_warm_up() {
                 .unwrap_or_else(|error| panic!("{label}: resolve: {}", error.reason));
             let loaded = match family {
                 NativeGgufFamily::Qwen35Moe => {
-                    crate::models::qwen3_5_moe::persistence::load_tool_source(&source, None)
-                        .await
-                        .map(|model| (model.paged_active, model.warmup.clone()))
-                }
-                _ => crate::models::qwen3_5::persistence::load_tool_source(&source, None)
+                    crate::models::qwen3_5_moe::persistence::load_tool_source(
+                        &source,
+                        None,
+                        crate::models::qwen3_5::load_plan::default_activations(true, false),
+                    )
                     .await
-                    .map(|model| (model.paged_active, model.warmup.clone())),
+                    .map(|model| (model.paged_active, model.warmup.clone()))
+                }
+                _ => crate::models::qwen3_5::persistence::load_tool_source(
+                    &source,
+                    None,
+                    crate::models::qwen3_5::load_plan::default_activations(false, false),
+                )
+                .await
+                .map(|model| (model.paged_active, model.warmup.clone())),
             };
             loaded.unwrap_or_else(|error| {
                 source.release_lease();
@@ -1054,6 +1138,108 @@ fn a_tool_load_reports_no_warm_up() {
         });
         assert!(paged, "{label}: the load has a pool");
         assert_eq!(warmup, None, "{label}");
+    }
+}
+
+/// The `activations` load option reaches the pool's attention through each
+/// family's tool load (`mlx eval`) from a prepared GGUF asset directory: on
+/// both families' small checkpoints loaded with an int8 pool, `"bf16"`
+/// records bf16 queries, `"auto"` records int8 queries on a GPU that scores
+/// them (Apple10 and later), bf16 elsewhere; unset is the default of a load
+/// with no draft: `"bf16"` for both families.
+/// Mutations: the dense load drops the option (`inner.activations` not set)
+/// → red at "dense bf16"; the MoE pool is built without it → red at "moe
+/// bf16"; the default ignores the draft flag → red at "dense unset" (Apple10
+/// only); `load_for_tool` takes its path as a safetensors directory → red at
+/// every case.
+#[test]
+fn a_load_hands_its_activations_to_the_pool() {
+    use crate::engine::checkpoint_source::CheckpointSource;
+    use crate::transformer::{Activations, KvFormat};
+    use crate::utils::gguf::NativeGgufFamily;
+    use crate::utils::gguf_test_fixtures::Qwen35Geometry;
+    const NAME: &str = "engine::warmup::tests::a_load_hands_its_activations_to_the_pool";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    // SAFETY: nullary FFI query.
+    let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+    let scores = mlx_paged_attn::prefill_plan::int8_query_from(gpu_gen).is_some();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (label, geometry, family) in [
+        (
+            "dense",
+            Qwen35Geometry::QWEN38_27B.small(),
+            NativeGgufFamily::Qwen35,
+        ),
+        (
+            "moe",
+            Qwen35Geometry::ORNITH_35B.small(),
+            NativeGgufFamily::Qwen35Moe,
+        ),
+    ] {
+        let dir = GeometryDir(
+            std::env::temp_dir().join(format!("mlx-activations-{label}-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join(format!("{label}.gguf"));
+        let (metadata, tensors) =
+            crate::utils::gguf_test_fixtures::qwen35_geometry_checkpoint(&geometry);
+        crate::utils::gguf_test_fixtures::write_streamed_gguf(
+            &path,
+            &metadata,
+            &tensors,
+            0x5741_7400,
+        )
+        .expect("write the synthetic checkpoint");
+        let source = runtime
+            .block_on(CheckpointSource::resolve_in(
+                &path,
+                family,
+                Some(&dir.0.join("cache")),
+            ))
+            .unwrap_or_else(|error| panic!("{label}: resolve: {}", error.reason));
+        let asset_dir = source.asset_dir().to_string_lossy().into_owned();
+        let moe = family == NativeGgufFamily::Qwen35Moe;
+        let int8 = if scores { "int8" } else { "bf16" };
+        for (option, want) in [(None, "bf16"), (Some("bf16"), "bf16"), (Some("auto"), int8)] {
+            let activations = Activations::parse(
+                option,
+                crate::models::qwen3_5::load_plan::default_activations(moe, false),
+            )
+            .unwrap();
+            let case = format!("{label} {}", option.unwrap_or("unset"));
+            let (kv_format, queries) = runtime.block_on(async {
+                let limits = match family {
+                    NativeGgufFamily::Qwen35Moe => {
+                        crate::models::qwen3_5_moe::persistence::load_for_tool(
+                            &asset_dir,
+                            Some(KvFormat::Int8),
+                            activations,
+                        )
+                        .await
+                        .map(|model| model.context_limits.clone())
+                    }
+                    _ => crate::models::qwen3_5::persistence::load_for_tool(
+                        &asset_dir,
+                        Some(KvFormat::Int8),
+                        activations,
+                    )
+                    .await
+                    .map(|model| model.context_limits.clone()),
+                };
+                let limits = limits.unwrap_or_else(|error| {
+                    source.release_lease();
+                    panic!("{case}: load: {}", error.reason)
+                });
+                (limits.kv_format, limits.attention_queries)
+            });
+            assert_eq!(kv_format, "int8", "{case}");
+            assert_eq!(queries, want, "{case}");
+        }
+        source.release_lease();
     }
 }
 
@@ -1235,6 +1421,7 @@ fn geometry_load_and_serve(
                     &source,
                     None,
                     None,
+                    crate::models::qwen3_5::load_plan::default_activations(moe, false),
                     None,
                     None,
                     crate::engine::scheduler::DEFAULT_DECODE_SHARE,

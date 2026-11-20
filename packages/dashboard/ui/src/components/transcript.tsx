@@ -23,6 +23,8 @@ import { EmptyState } from './arc/empty-state/empty-state';
 import { SearchField } from './arc/search-field/search-field';
 import SegmentedControl, { type Segment } from './arc/segmented-control/segmented-control';
 import { Tooltip } from './arc/tooltip/tooltip';
+import { CompactionMark } from './compaction-mark';
+import { RunCard } from './run-card';
 
 export interface TranscriptProps {
   entries: TranscriptEntry[];
@@ -81,7 +83,10 @@ function entryMatches(entry: TranscriptEntry, needle: string): boolean {
       return has(entry.description);
     case 'plan':
       return entry.entries.some((item) => has(item.content));
+    case 'workflow':
+      return has(entry.name) || has(entry.report) || entry.agents.some((agent) => has(agent.label));
     case 'model':
+    case 'compaction':
     case 'turn-end':
       return false;
   }
@@ -322,6 +327,12 @@ function GroupBody(props: BodyProps): ReactElement {
             {`Model switched to ${entry.modelId}`}
           </RuleLabel>,
         );
+        break;
+      case 'compaction':
+        items.push(<CompactionMark key={at} entry={entry} />);
+        break;
+      case 'workflow':
+        items.push(<RunCard key={at} entry={entry} live={false} />);
         break;
       case 'turn-end':
         break;

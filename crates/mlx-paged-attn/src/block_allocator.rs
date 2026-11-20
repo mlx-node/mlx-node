@@ -1638,12 +1638,20 @@ impl BlockAllocator {
     /// while this exclusive allocator borrow is held. This is the commit
     /// boundary used by asynchronous SSD restore: a missing/corrupt block or
     /// failed upload leaves no partial hot prefix discoverable.
+    ///
+    /// A hash a peer published while the restore read is ADOPTED when the
+    /// cache holds its identity and it matches: the caller gets the cached
+    /// block (one ref taken, as a lookup takes it) in that position and the
+    /// reserved duplicate is freed. Any other hit on a hash, or an identity
+    /// that differs, publishes nothing (`Ok(None)`). `Ok(Some(blocks))` is the
+    /// chain the caller now holds, in order; the reserved blocks of adopted
+    /// positions must not be freed again.
     pub fn publish_restored_prefix_batch(
         &mut self,
         registrations: &[RestoredPrefixRegistration<'_>],
-    ) -> Result<bool, &'static str> {
+    ) -> Result<Option<Vec<Arc<PhysicalBlock>>>, &'static str> {
         if registrations.is_empty() {
-            return Ok(true);
+            return Ok(Some(Vec::new()));
         }
         if registrations.len() > self.num_blocks as usize {
             return Err("restored prefix batch exceeds prefix-cache capacity");
@@ -1651,7 +1659,8 @@ impl BlockAllocator {
 
         let mut hashes = HashSet::with_capacity(registrations.len());
         let mut block_ids = HashSet::with_capacity(registrations.len());
-        for registration in registrations {
+        let mut adopted = vec![false; registrations.len()];
+        for (position, registration) in registrations.iter().enumerate() {
             if registration.token_ids.len() != self.block_size as usize {
                 return Err("restored prefix must contain exactly one full block");
             }
@@ -1660,11 +1669,6 @@ impl BlockAllocator {
             }
             if !hashes.insert(registration.hash) || !block_ids.insert(registration.block.block_id) {
                 return Err("restored prefix batch contains duplicate hashes or blocks");
-            }
-            if let Some(existing) = self.prefix_cache.get(&registration.hash)
-                && existing.block_id != registration.block.block_id
-            {
-                return Ok(false);
             }
             if let Some(identity) = self.prefix_cache_identities.get(&registration.hash)
                 && !identity.matches(
@@ -1675,11 +1679,47 @@ impl BlockAllocator {
                     registration.block_index,
                 )
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            if let Some(existing) = self.prefix_cache.get(&registration.hash)
+                && existing.block_id != registration.block.block_id
+            {
+                let verified = self.prefix_identity_matches(
+                    registration.hash,
+                    registration.token_ids,
+                    registration.parent_hash,
+                    registration.extra_keys,
+                    registration.cache_salt,
+                    registration.block_index,
+                );
+                if !verified {
+                    return Ok(None);
+                }
+                adopted[position] = true;
             }
         }
 
-        for registration in registrations {
+        let mut cached = Vec::with_capacity(registrations.len());
+        for (registration, &adopted) in registrations.iter().zip(&adopted) {
+            cached.push(if adopted {
+                Some(
+                    self.prefix_cache
+                        .get(&registration.hash)
+                        .map(Arc::clone)
+                        .ok_or("adopted prefix block left the cache during its publish")?,
+                )
+            } else {
+                None
+            });
+        }
+        let mut held = Vec::with_capacity(registrations.len());
+        for (registration, cached) in registrations.iter().zip(cached) {
+            if let Some(cached) = cached {
+                cached.incref();
+                self.free(Arc::clone(&registration.block));
+                held.push(cached);
+                continue;
+            }
             let inserted = self.register_prefix(Arc::clone(&registration.block), registration.hash);
             debug_assert!(inserted, "batch publication was fully preflighted");
             self.remember_prefix_identity(
@@ -1690,8 +1730,9 @@ impl BlockAllocator {
                 registration.cache_salt,
                 registration.block_index,
             );
+            held.push(Arc::clone(&registration.block));
         }
-        Ok(true)
+        Ok(Some(held))
     }
 }
 
@@ -3421,9 +3462,11 @@ mod tests {
                 block_index: 1,
             },
         ];
-        assert_eq!(
-            allocator.publish_restored_prefix_batch(&registrations),
-            Ok(false),
+        assert!(
+            matches!(
+                allocator.publish_restored_prefix_batch(&registrations),
+                Ok(None)
+            ),
             "the second registration collides with the existing block"
         );
         assert!(
@@ -3432,6 +3475,102 @@ mod tests {
         );
         assert_eq!(first.get_ref_count(), 1);
         assert_eq!(second.get_ref_count(), 1);
+    }
+
+    /// A peer published the first block of a restored chain while the read
+    /// ran, with the same identity: the batch takes the peer's block there,
+    /// frees its own duplicate and publishes the rest.
+    #[test]
+    fn a_restored_batch_adopts_a_block_a_peer_published() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let hashes = chain_hashes(&tokens, 4, &[], 0);
+        let mut allocator = BlockAllocator::new(6, 6, 4);
+        let peer = allocator.allocate().expect("peer block");
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&tokens[..4], std::slice::from_ref(&peer), 4, &[], 0)
+                .unwrap(),
+            1
+        );
+        let first = allocator.allocate().expect("first destination");
+        let second = allocator.allocate().expect("second destination");
+        let free_before = allocator.num_free_blocks();
+        let registrations = [
+            RestoredPrefixRegistration {
+                block: Arc::clone(&first),
+                hash: hashes[0],
+                token_ids: &tokens[..4],
+                parent_hash: 0,
+                extra_keys: &[],
+                cache_salt: 0,
+                block_index: 0,
+            },
+            RestoredPrefixRegistration {
+                block: Arc::clone(&second),
+                hash: hashes[1],
+                token_ids: &tokens[4..],
+                parent_hash: hashes[0],
+                extra_keys: &[],
+                cache_salt: 0,
+                block_index: 1,
+            },
+        ];
+        let held = allocator
+            .publish_restored_prefix_batch(&registrations)
+            .expect("well formed")
+            .expect("the peer's matching block is adopted");
+        drop(registrations);
+        assert_eq!(held.len(), 2);
+        assert_eq!(
+            held[0].block_id, peer.block_id,
+            "position 0 is the peer's block"
+        );
+        assert_eq!(held[1].block_id, second.block_id);
+        assert_eq!(peer.get_ref_count(), 3, "peer, cache, and the restore");
+        assert_eq!(
+            allocator.num_free_blocks(),
+            free_before + 1,
+            "the duplicate is free"
+        );
+        drop(first);
+        let (hits, cached) = allocator.find_longest_cache_hit(&tokens, 4, &[], 0);
+        assert_eq!(cached, 8, "the whole chain is hot");
+        assert_eq!(hits[0].block_id, peer.block_id);
+        assert_eq!(hits[1].block_id, second.block_id);
+        for block in hits.into_iter().chain(held) {
+            allocator.free(block);
+        }
+        allocator.free(peer);
+        assert_eq!(
+            second.get_ref_count(),
+            1,
+            "only the cache holds the restored block"
+        );
+        assert_eq!(allocator.num_free_blocks(), 4, "two cache-only blocks stay");
+
+        let mut other = BlockAllocator::new(6, 6, 4);
+        let peer = other.allocate().unwrap();
+        other
+            .publish_restored_prefix(Arc::clone(&peer), hashes[0], &[9, 9, 9, 9], 0, &[], 0, 0)
+            .unwrap();
+        let first = other.allocate().unwrap();
+        let registration = RestoredPrefixRegistration {
+            block: Arc::clone(&first),
+            hash: hashes[0],
+            token_ids: &tokens[..4],
+            parent_hash: 0,
+            extra_keys: &[],
+            cache_salt: 0,
+            block_index: 0,
+        };
+        assert!(
+            matches!(
+                other.publish_restored_prefix_batch(&[registration]),
+                Ok(None)
+            ),
+            "a hot hash with another identity is a collision, not an adoption"
+        );
+        assert_eq!(first.get_ref_count(), 1);
     }
 
     #[test]

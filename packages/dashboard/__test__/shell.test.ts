@@ -152,6 +152,7 @@ function process(overrides: Partial<RuntimeProcessLive> = {}): RuntimeProcessLiv
     queued: 0,
     queueLimit: null,
     pool: null,
+    experts: null,
   });
   return {
     status: 'running',
@@ -373,16 +374,16 @@ describe('keyboard', () => {
     api!.emitChatHost({
       type: 'state',
       state: state([
-        { conversationId: 'a', mode: 'chat', busy: true, waiting: false },
-        { conversationId: 'b', mode: 'chat', busy: true, waiting: false },
+        { conversationId: 'a', mode: 'chat', busy: true, waiting: false, background: false },
+        { conversationId: 'b', mode: 'chat', busy: true, waiting: false, background: false },
       ]),
     });
     await waitFor(() => dot() === '2 running');
     api!.emitChatHost({
       type: 'state',
       state: state([
-        { conversationId: 'a', mode: 'chat', busy: true, waiting: false },
-        { conversationId: 'w', mode: 'work', busy: true, waiting: true },
+        { conversationId: 'a', mode: 'chat', busy: true, waiting: false, background: false },
+        { conversationId: 'w', mode: 'work', busy: true, waiting: true, background: false },
       ]),
     });
     await waitFor(() => dot() === '1 waiting for you');

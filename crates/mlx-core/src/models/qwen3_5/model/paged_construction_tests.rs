@@ -222,8 +222,26 @@ fn planned_load_within(
     Some(inner.initialize_paged_adapter().map(|()| inner))
 }
 
-/// A tiny head-256 paged load with BF16 weights and `kv_format` as given.
+/// A tiny head-256 paged load with BF16 weights and `kv_format` as given,
+/// on the activations of a load that names none.
 fn planned_head256_load(kv_format: &str, bf16: bool) -> Option<Result<Qwen35Inner>> {
+    planned_head256_load_on(kv_format, bf16, None)
+}
+
+/// [`planned_head256_load`] with the load's activations.
+fn planned_head256_load_with(
+    kv_format: &str,
+    bf16: bool,
+    activations: crate::transformer::Activations,
+) -> Option<Result<Qwen35Inner>> {
+    planned_head256_load_on(kv_format, bf16, Some(activations))
+}
+
+fn planned_head256_load_on(
+    kv_format: &str,
+    bf16: bool,
+    activations: Option<crate::transformer::Activations>,
+) -> Option<Result<Qwen35Inner>> {
     if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
         return None;
     }
@@ -233,10 +251,278 @@ fn planned_head256_load(kv_format: &str, bf16: bool) -> Option<Result<Qwen35Inne
     cfg.paged_cache_memory_mb = None;
     cfg.kv_format = Some(kv_format.to_string());
     let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+    if let Some(activations) = activations {
+        inner.activations = activations;
+    }
     if bf16 {
         cast_qwen35_inner_weights_bf16(&mut inner);
     }
     Some(inner.initialize_paged_adapter().map(|()| inner))
+}
+
+/// The load's activations reach the pool's attention and its record (Splash
+/// `ExecutionPlans` hands the runtime's `Int8Activations` to its attention
+/// plans): an int8 pool with activations auto reports int8 queries on a GPU
+/// that scores them (Apple10 and later), bf16 everywhere else; activations
+/// bf16 and a bf16 pool report bf16.
+/// Mutation load-drop: the load does not hand its activations to the
+/// adapter → red on Apple10.
+#[test]
+fn activations_reach_the_pool_attention() {
+    use crate::transformer::Activations;
+    // SAFETY: nullary FFI query.
+    let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+    let scores = mlx_paged_attn::prefill_plan::int8_query_from(gpu_gen).is_some();
+    for (format, activations, want) in [
+        (
+            "int8",
+            Activations::Auto,
+            if scores { "int8" } else { "bf16" },
+        ),
+        ("int8", Activations::Bf16, "bf16"),
+        ("bf16", Activations::Auto, "bf16"),
+    ] {
+        let Some(load) = planned_head256_load_with(format, true, activations) else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|error| panic!("{format} load: {}", error.reason));
+        assert_eq!(
+            inner.context_limits_snapshot().attention_queries,
+            want,
+            "{format} pool, activations {}",
+            activations.as_str()
+        );
+    }
+}
+
+/// A dense draft load that names no activations takes `Auto` (Splash's
+/// default): over an int8 pool it scores int8 queries on a GPU that scores
+/// them (Apple10 and later); a dense load with no draft and a MoE load take
+/// `Bf16`. The state store identity is the pool's dtype (`Int8`) in every
+/// mode, so the stores an older build wrote with bf16 queries still restore.
+/// Mutations draft-ignored (the default reads no draft flag) and q8-kept (the
+/// identity names the threshold) → red on Apple10.
+#[test]
+fn a_default_dense_load_scores_int8_queries_under_the_one_store_identity() {
+    use crate::models::qwen3_5::load_plan::default_activations;
+    use crate::transformer::Activations;
+    // SAFETY: nullary FFI query.
+    let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+    let scores = mlx_paged_attn::prefill_plan::int8_query_from(gpu_gen).is_some();
+    for draft in [false, true] {
+        assert_eq!(
+            default_activations(true, draft),
+            Activations::Bf16,
+            "the MoE default, draft {draft}"
+        );
+    }
+    let identity = |inner: &Qwen35Inner| {
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .cache_identity()
+    };
+    for (draft, want) in [
+        (true, if scores { "int8" } else { "bf16" }),
+        (false, "bf16"),
+    ] {
+        let Some(load) = planned_head256_load_with("int8", true, default_activations(false, draft))
+        else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|error| panic!("default load: {}", error.reason));
+        assert_eq!(
+            inner.context_limits_snapshot().attention_queries,
+            want,
+            "the dense default, draft {draft}"
+        );
+        assert_eq!(identity(&inner), "Int8", "the default load's identity");
+    }
+    let Some(load) = planned_head256_load("int8", true) else {
+        return;
+    };
+    let inner = load.unwrap_or_else(|error| panic!("constructed load: {}", error.reason));
+    assert_eq!(
+        inner.activations,
+        Activations::Bf16,
+        "a model built with no draft"
+    );
+    drop(inner);
+    for activations in [Activations::Bf16, Activations::Auto] {
+        let Some(load) = planned_head256_load_with("int8", true, activations) else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|error| panic!("{activations:?} load: {}", error.reason));
+        assert_eq!(identity(&inner), "Int8", "{activations:?}");
+    }
+}
+
+/// A planned tensor that does not attach fails the load, as does a planned
+/// tensor with no array or an array no tensor plans; nothing stays attached
+/// and the store identity part stays empty.
+/// Mutation attach-skip (a failed attach is skipped) → red.
+#[test]
+fn a_planned_tensor_that_does_not_attach_fails_the_load() {
+    use crate::utils::gguf_planes::{Kernel, PlanesPlan, PlanesTensor, Role, Walk};
+    let mut inner = Qwen35Inner::new(tiny_paged_forward_cfg()).expect("construct tiny model");
+    let tensor = PlanesTensor {
+        key: "blk.0.ffn_down.planes".to_string(),
+        layer: 0,
+        sources: vec![("blk.0.ffn_down.weight".to_string(), 0)],
+        format: crate::utils::gguf_planes::FMT_Q4K,
+        rows: 64,
+        k: 256,
+        role: Role::Down,
+        kernel: Kernel::Residual,
+        splits: 1,
+        one_pass: false,
+        walk: true,
+        tile: 8,
+        bytes: 4096,
+    };
+    let plan = PlanesPlan {
+        tensors: vec![tensor.clone()],
+        walk: Walk::Spread,
+        left_out: Vec::new(),
+    };
+    let array = || MxArray::zeros(&[4096], Some(crate::array::DType::Uint8)).expect("planes");
+    let dense = inner
+        .attach_planes(&plan, HashMap::from([(tensor.key.clone(), array())]))
+        .expect_err("a dense MLP takes no planes");
+    println!("ATTACH refused: {}", dense.reason);
+    assert!(
+        dense.reason.contains("blk.0.ffn_down.planes"),
+        "{}",
+        dense.reason
+    );
+    let missing = inner
+        .attach_planes(&plan, HashMap::new())
+        .expect_err("a planned tensor with no array");
+    assert!(missing.reason.contains("no array"), "{}", missing.reason);
+    let empty = PlanesPlan::default();
+    let extra = inner
+        .attach_planes(&empty, HashMap::from([(tensor.key.clone(), array())]))
+        .expect_err("an array no tensor plans");
+    assert!(extra.reason.contains("not planned"), "{}", extra.reason);
+    assert!(inner.attached_planes().is_empty());
+    assert_eq!(inner.attached_planes_plan().store_identity(), None);
+}
+
+/// The pool's planes guard drops what it refuses: every planes array
+/// detaches (the load gives back all their bytes), no planes part is left in
+/// the store identity, and the load names the drop. When the ledger keeps
+/// them, the same load keeps the planes and names them in the identity
+/// (spread walk).
+/// Mutation guard-drop-keeps (the drop detaches nothing) → red.
+#[test]
+fn a_guard_drop_detaches_the_planes_and_the_identity_part() {
+    use super::lifecycle::PLANES_GUARD_REFUSES;
+    use crate::models::quantized_linear::MLPVariant;
+    use crate::models::qwen3_5::attention::wave_tests::projection;
+    use crate::utils::gguf::GgufTensorType::{Q4K, Q8_0};
+    use crate::utils::gguf_planes::{
+        FMT_Q4K, Kernel, LOAD_LINES, PlanesPlan, PlanesTensor, Role, Walk, planes_bytes,
+    };
+    // SAFETY: plain query.
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device()
+        || !unsafe { mlx_sys::mlx_gguf_planes_available() }
+    {
+        return;
+    }
+    let lines_now = || {
+        LOAD_LINES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    let load = |refuse: bool| -> (Qwen35Inner, u64, Vec<String>) {
+        let _live = LiveMemory::set(16 * GIB, 0);
+        let mut inner = Qwen35Inner::new(tiny_paged_forward_cfg()).expect("construct tiny model");
+        inner.layers[0].mlp = MLPVariant::Quantized {
+            gate_proj: projection(Q8_0, 256, 128, 0x91).expect("gate"),
+            up_proj: projection(Q8_0, 256, 128, 0x92).expect("up"),
+            down_proj: projection(Q4K, 128, 256, 0x93).expect("down"),
+            gate_up: None,
+        };
+        let tensor = PlanesTensor {
+            key: "blk.0.ffn_down.planes".to_string(),
+            layer: 0,
+            sources: vec![("blk.0.ffn_down.weight".to_string(), 0)],
+            format: FMT_Q4K,
+            rows: 128,
+            k: 256,
+            role: Role::Down,
+            kernel: Kernel::Residual,
+            splits: 1,
+            one_pass: false,
+            walk: true,
+            tile: 8,
+            bytes: planes_bytes(FMT_Q4K, 128, 256),
+        };
+        let plan = PlanesPlan {
+            tensors: vec![tensor.clone()],
+            walk: Walk::Spread,
+            left_out: Vec::new(),
+        };
+        let array = MxArray::zeros(&[tensor.bytes as i64], Some(DType::Uint8)).expect("planes");
+        inner
+            .attach_planes(&plan, HashMap::from([(tensor.key.clone(), array)]))
+            .expect("the down planes attach");
+        let attached = inner.attached_planes_bytes();
+        let from = lines_now().len();
+        PLANES_GUARD_REFUSES.with(|refuses| refuses.set(refuse));
+        let done = inner.initialize_paged_adapter();
+        PLANES_GUARD_REFUSES.with(|refuses| refuses.set(false));
+        if let Err(error) = done {
+            panic!("tiny load: {}", error.reason);
+        }
+        (inner, attached, lines_now().split_off(from))
+    };
+    let (dropped, attached, lines) = load(true);
+    for line in &lines {
+        println!("GUARD refused {line}");
+    }
+    assert!(attached > 0, "the fixture attaches planes");
+    assert!(
+        dropped.attached_planes().is_empty(),
+        "the guard drop detaches every planes array"
+    );
+    assert_eq!(
+        dropped.attached_planes_bytes(),
+        0,
+        "the load gives back all {attached} planes bytes"
+    );
+    assert!(dropped.planes.is_none(), "no attached plan is left");
+    let identity = dropped
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .cache_identity();
+    assert!(!identity.contains("planes-route:"), "{identity}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(&format!("GGUF planes dropped ({attached} B)"))),
+        "the load names the drop"
+    );
+    drop(dropped);
+    let (kept, _, lines) = load(false);
+    for line in &lines {
+        println!("GUARD kept {line}");
+    }
+    assert_eq!(
+        kept.attached_planes().len(),
+        1,
+        "the ledger keeps the tiny planes"
+    );
+    let identity = kept
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .cache_identity();
+    println!("GUARD kept identity {identity}");
+    assert!(identity.contains("planes-route:"), "{identity}");
 }
 
 /// The pool's pages follow `kv_format` (Splash `RuntimeResources::create`:
@@ -3644,9 +3930,11 @@ fn greedy_paged_logits(inner: &mut Qwen35Inner, prompt: &[u32], steps: usize) ->
 /// A GPU that cannot build the tensor-op prefill pipelines runs the turn
 /// through the varlen kernel: a 70-token prompt in 16-row chunks and 15
 /// greedy decode steps on a bf16 (D128, group 4) and an int8 (D256, group
-/// 4) pool keep every step's logits within `BOUND` of the tile turn and
-/// pick the same token, until a step whose top-2 margin the bound could
-/// flip picks another (the turns then diverge).
+/// 4, INT8 queries from 32 tokens on where the device scores them) pool
+/// keep every step's logits within `BOUND` of the tile turn and pick the
+/// same token, until a step whose top-2 margin the bound could flip picks
+/// another (the turns then diverge). Both int8 turns code query rows.
+/// Mutation portable-bf16 (the varlen chunks keep bf16 queries) → red.
 #[cfg(target_os = "macos")]
 #[test]
 fn portable_prefill_turn_matches_the_tile_turn() {
@@ -3667,20 +3955,54 @@ fn portable_prefill_turn_matches_the_tile_turn() {
         });
     // SAFETY: as above.
     unsafe { mlx_sys::mlx_seed(0x7066_0002) };
-    let int8 = planned_head256_load("int8", true)
-        .map(|load| load.unwrap_or_else(|error| panic!("int8 load: {}", error.reason)));
+    let int8 = planned_head256_load_with("int8", true, crate::transformer::Activations::Auto).map(
+        |load| {
+            let mut inner = load.unwrap_or_else(|error| panic!("int8 load: {}", error.reason));
+            let adapter = inner.paged_adapter.as_mut().expect("adapter");
+            if adapter.int8_queries_active() {
+                adapter.set_int8_query_threshold(32);
+            }
+            inner
+        },
+    );
     let (Some(bf16), Some(int8)) = (bf16, int8) else {
         return;
     };
     let argmax = |l: &[f32]| (0..l.len()).fold(0, |b, i| if l[i] > l[b] { i } else { b });
     for (label, mut inner) in [("bf16", bf16), ("int8", int8)] {
+        let coded = |inner: &Qwen35Inner| {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            [
+                adapter.tile_query_launches()[1],
+                adapter.decode_query_rows()[1],
+            ]
+        };
+        let rule = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .int8_queries_active();
         let tile = greedy_paged_logits(&mut inner, &prompt, STEPS);
+        let [tile_launches, tile_rows] = coded(&inner);
         inner
             .paged_adapter
             .as_mut()
             .expect("adapter")
             .force_portable_prefill();
         let portable = greedy_paged_logits(&mut inner, &prompt, STEPS);
+        if rule {
+            // The tile turn codes its decode rows; the portable turn the
+            // same rows and its prompt rows from 32 on.
+            assert!(
+                tile_launches > 0 && tile_rows > 0,
+                "{label}: the tile turn coded no query"
+            );
+            let portable_rows = coded(&inner)[1] - tile_rows;
+            assert!(
+                portable_rows > tile_rows,
+                "{label}: the portable prefill coded no query ({portable_rows} rows, decode {tile_rows})"
+            );
+        }
         let mut same = 0;
         let mut largest = 0f32;
         for (step, (a, b)) in tile.iter().zip(&portable).enumerate() {
@@ -3719,7 +4041,9 @@ fn portable_prefill_turn_matches_the_tile_turn() {
 
 /// A native failure at a dense paged prefill chunk's eval fails the prefill
 /// with MLX's text; MLX throws a failed command's error once, so a dropped
-/// one lets the next chunk run on what it wrote.
+/// one lets the next chunk run on what it wrote. The first chunk's last
+/// layer only stores its K/V, so its eval holds that layer's input and its
+/// four pool arrays.
 /// Mutation F1_CHUNK (the chunk eval drops its error) → red.
 #[test]
 fn a_failed_dense_prefill_chunk_eval_fails_the_prefill() {
@@ -3743,6 +4067,6 @@ fn a_failed_dense_prefill_chunk_eval_fails_the_prefill() {
     };
     assert_eq!(
         error.reason,
-        format!("MLX eval failed in paged_prefill_chunk while materializing 1 arrays: {OOM}")
+        format!("MLX eval failed in paged_prefill_chunk while materializing 5 arrays: {OOM}")
     );
 }

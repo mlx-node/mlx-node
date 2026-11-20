@@ -200,6 +200,10 @@ pub(crate) struct LoadLanes<'a> {
     /// The load can run an MTP turn on the pool lane (MTP heads, no
     /// DFlash2 draft): the lane holds its draft state at the window.
     pub mtp: bool,
+    /// The scheduler runs `draft`'s turns as DFlash2 decode lanes: every
+    /// lane, not only the first, holds the draft's lane state and its
+    /// pending GDN tape.
+    pub draft_lanes: bool,
     /// The most decode lanes the scheduler runs on this load
     /// ([`qwen35_scheduler_lanes`]); the plan grants at most this many.
     pub lanes: u32,
@@ -316,14 +320,15 @@ fn evaluate_qwen35_lanes(
     let mtp = lanes.mtp;
     let step_rows = decode_step_rows(count, mtp);
     let pool_transient = |window| {
-        let one_lane = pool_lane_transient(config, draft_taps, window);
+        let verifying = if lanes.draft_lanes { count } else { 1 };
+        let verify = pool_lane_transient(config, draft_taps, window, verifying);
         if count > 1 {
-            one_lane.max(
+            verify.max(
                 pool_decode_step_bytes(config, step_rows, window)
                     .saturating_add(step_rows.saturating_mul(lanes.expert_row_bytes)),
             )
         } else {
-            one_lane
+            verify
         }
     };
     let draft_state =
@@ -335,11 +340,17 @@ fn evaluate_qwen35_lanes(
             0
         }
     };
+    let draft_lane = draft.filter(|_| lanes.draft_lanes).map(|draft| {
+        super::scheduled_dflash2::lane_state_bytes(config, recurrent_state_bytes, draft.lane_bytes)
+    });
     // Each lane past the first holds its own GDN state and, on an MTP load,
-    // its own draft state at the full window.
+    // its own draft state at the full window; a DFlash2 lane its draft
+    // state and its pending GDN tape (the first lane's tape is in the
+    // one-lane transient).
     let lane_state = |window: u32| {
         let first = draft_state.unwrap_or_else(|| mtp_state(window));
-        let other = recurrent_state_bytes.saturating_add(mtp_state(window));
+        let other =
+            recurrent_state_bytes.saturating_add(draft_lane.unwrap_or_else(|| mtp_state(window)));
         first.saturating_add(other.saturating_mul(u64::from(count.max(1) - 1)))
     };
     let pool_input = lanes.pool.map(|geometry| {
@@ -476,47 +487,125 @@ fn check_unplanned_max_context(
 }
 
 /// The plan of `target`'s load from what the device holds now: the pool lane
-/// when `pool` is set, else the footprint. `None` when the working set is
+/// when `pool` is set, else the footprint; `draft_lanes` when the scheduler
+/// runs the draft's turns as decode lanes. `None` when the working set is
 /// unreadable.
 pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     label: &str,
     target: &T,
     recurrent_state_bytes: u64,
     mtp_weights: bool,
+    draft_lanes: bool,
     pool: Option<PoolGeometry>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     cache_disk: CacheDisk,
 ) -> Result<Option<MemoryPlan>> {
+    let Some(plan) = plan_qwen35_load_freed(
+        label,
+        target,
+        recurrent_state_bytes,
+        mtp_weights,
+        draft_lanes,
+        pool,
+        max_memory_bytes,
+        max_context,
+        cache_disk,
+        0,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(line) = plan.max_memory_ignored() {
+        tracing::info!("{label} {line}");
+    }
+    tracing::info!("{label} memory plan:\n{}", plan.describe());
+    Ok(Some(plan))
+}
+
+/// [`plan_qwen35_load`] as if `freed_bytes` of what the device holds now
+/// were free, with no log line.
+pub(crate) fn plan_qwen35_load_freed<T: DFlash2Target>(
+    label: &str,
+    target: &T,
+    recurrent_state_bytes: u64,
+    mtp_weights: bool,
+    draft_lanes: bool,
+    pool: Option<PoolGeometry>,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+    cache_disk: CacheDisk,
+    freed_bytes: u64,
+) -> Result<Option<MemoryPlan>> {
     let draft = target.dflash2();
     let config = target.dense_config();
-    let Some(live) = live_memory() else {
+    let Some(mut live) = live_memory() else {
         check_unplanned_max_context(label, &config, max_context)?;
         return Ok(None);
     };
+    live.active_bytes = live.active_bytes.saturating_sub(freed_bytes);
     let mut lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes,
         pool,
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
         mtp: mtp_weights && draft.is_none(),
+        draft_lanes,
         lanes: qwen35_scheduler_lanes(),
         expert_row_bytes: target.decode_row_expert_bytes(),
         state_staging_bytes: 0,
     };
-    let plan = plan_with_disk(
+    plan_with_disk(
         label,
         &mut lanes,
         live,
         max_memory_bytes,
         max_context,
         cache_disk,
-    )?;
-    if let Some(line) = plan.max_memory_ignored() {
-        tracing::info!("{label} {line}");
+    )
+    .map(Some)
+}
+
+/// The most of the pool's blocks a load's GGUF planes may take.
+pub(crate) const PLANES_POOL_LOSS_LIMIT: f64 = 0.15;
+
+/// Whether a load keeps its GGUF planes of `planes_bytes`: `with` is its plan
+/// with the planes resident, `without` the plan with those bytes free. The
+/// planes stay only when both plans grant the same lanes and window and the
+/// pool loses at most [`PLANES_POOL_LOSS_LIMIT`] of its blocks. `Ok` holds
+/// the ledger line, `Err` the reason they leave.
+pub(crate) fn planes_ledger(
+    planes_bytes: u64,
+    with: &MemoryPlan,
+    without: &MemoryPlan,
+) -> std::result::Result<String, String> {
+    let (Some(a), Some(b)) = (with.pool.as_ref(), without.pool.as_ref()) else {
+        return Err("the load plans no pool".to_string());
+    };
+    if a.lanes != b.lanes {
+        return Err(format!("{} lanes, {} without them", a.lanes, b.lanes));
     }
-    tracing::info!("{label} memory plan:\n{}", plan.describe());
-    Ok(Some(plan))
+    let (wa, wb) = (a.lane.window.maximum(), b.lane.window.maximum());
+    if wa != wb {
+        return Err(format!("a window of {wa} tokens, {wb} without them"));
+    }
+    let lost = b.max_blocks.saturating_sub(a.max_blocks);
+    let share = f64::from(lost) / f64::from(b.max_blocks.max(1));
+    let line = format!(
+        "planes {planes_bytes} B in the weights: pool {} of {} max blocks ({:.1} % less), lanes {}, \
+         window {wa}",
+        a.max_blocks,
+        b.max_blocks,
+        share * 100.0,
+        a.lanes
+    );
+    if share > PLANES_POOL_LOSS_LIMIT {
+        return Err(format!(
+            "{line}; more than {:.0} % of the pool",
+            PLANES_POOL_LOSS_LIMIT * 100.0
+        ));
+    }
+    Ok(line)
 }
 
 /// Splash `auditActualMemory` at the end of a load: what is resident now
@@ -556,6 +645,86 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
         Some(_) => Err(Error::from_reason(format!(
             "{label} load: maxMemoryBytes must be a positive byte count"
         ))),
+    }
+}
+
+/// The activations of a load whose options name none: `Auto` for a dense
+/// load with a DFlash2 draft (Splash's default, `RuntimeResources`: int8
+/// queries from KV position 7,168 where the device scores them), `Bf16` for
+/// a dense load with no draft (its autoregressive decode reads slower with
+/// int8 queries) and for MoE.
+pub(crate) fn default_activations(moe: bool, draft: bool) -> crate::transformer::Activations {
+    if !moe && draft {
+        crate::transformer::Activations::Auto
+    } else {
+        crate::transformer::Activations::Bf16
+    }
+}
+
+/// The page of a dense Qwen3.5 pool: its block and its key order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolPage {
+    pub block_size: u32,
+    /// Keys token-major, values dimension-major
+    /// (`mlx_paged_attn::PageLayout::keys_token_major`).
+    pub keys_token_major: bool,
+}
+
+/// What [`pool_page`] reads of a load.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageInputs {
+    pub heads: PoolHeads,
+    pub cache_dtype: mlx_paged_attn::metal::MetalDtype,
+    /// The load has a DFlash2 draft. Such a load plans no native MTP turn
+    /// (its speculative plan is the draft's), so MTP weights it ships are not
+    /// read on the pool.
+    pub draft: bool,
+    /// `paged_block_size` in the checkpoint's config.
+    pub explicit_block: Option<u32>,
+    /// The GPU builds the in-place prefill attention pipelines.
+    pub tile: bool,
+}
+
+/// The page a dense Qwen3.5 pool takes (Splash's attention page: 32-token
+/// blocks, keys token-major, `paged_attention_tile.h`):
+///
+/// | load | page |
+/// |---|---|
+/// | `paged_block_size` set | that block, vLLM page |
+/// | heads 24/4, head 256, int8 pool, DFlash2 draft, tile GPU | 32, keys token-major |
+/// | any other | 16, vLLM page |
+///
+/// A store a 16-token load wrote moves into the new page at the first load
+/// (`dflash2_state::migrate`).
+pub(crate) fn pool_page(load: &PageInputs) -> PoolPage {
+    let vllm_page = PoolPage {
+        block_size: load.explicit_block.unwrap_or(16),
+        keys_token_major: false,
+    };
+    let shape = load.heads.query == 24 && load.heads.kv == 4 && load.heads.dim == 256;
+    if load.explicit_block.is_some()
+        || !shape
+        || load.cache_dtype != mlx_paged_attn::metal::MetalDtype::Int8
+        || !load.draft
+        || !load.tile
+    {
+        return vllm_page;
+    }
+    PoolPage {
+        block_size: 32,
+        keys_token_major: true,
+    }
+}
+
+/// Whether this GPU builds the in-place prefill attention pipelines.
+pub(crate) fn device_builds_tile() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::transformer::paged_kv_cache_adapter::device_prefill_mpp_builds()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -622,6 +791,12 @@ pub async fn estimate_qwen35_context_window(
                 asset_dir: source.asset_dir(),
                 moe,
                 weight_bytes,
+                planes_bytes: planes_estimate_bytes(
+                    &source,
+                    moe,
+                    options.draft_model_path.is_some(),
+                    max_memory_bytes,
+                ),
                 header: checkpoint_header(&source, moe)?,
                 draft_dir: options.draft_model_path.as_deref().map(Path::new),
                 kv_format,
@@ -633,6 +808,30 @@ pub async fn estimate_qwen35_context_window(
     });
     source.release_lease();
     estimate
+}
+
+/// The bytes of the GGUF planes a dense load of `source` would write: the
+/// plan a load makes from the header, the device and the load's draft and
+/// memory cap. A load that cannot read its planes in whole 64-row bands or
+/// whose device refuses a pipeline writes fewer.
+pub(crate) fn planes_estimate_bytes(
+    source: &CheckpointSource,
+    moe: bool,
+    draft: bool,
+    max_memory_bytes: Option<u64>,
+) -> u64 {
+    let CheckpointSource::Gguf(checkpoint) = source else {
+        return 0;
+    };
+    if moe {
+        return 0;
+    }
+    crate::utils::gguf_planes::plan_for_load(
+        &checkpoint.main.header,
+        &crate::utils::gguf_planes::PlanesDevice::this(max_memory_bytes),
+        &crate::utils::gguf_planes::PlanesLoad::of_load(draft, false, checkpoint.main.parts.len()),
+    )
+    .bytes()
 }
 
 /// Bytes of a checkpoint's weight files: a directory's top-level
@@ -819,6 +1018,8 @@ pub(crate) struct EstimateInput<'a> {
     pub asset_dir: &'a Path,
     pub moe: bool,
     pub weight_bytes: u64,
+    /// The GGUF planes a load would write ([`planes_estimate_bytes`]).
+    pub planes_bytes: u64,
     pub header: CheckpointHeader,
     pub draft_dir: Option<&'a Path>,
     pub kv_format: Option<KvFormat>,
@@ -828,11 +1029,58 @@ pub(crate) struct EstimateInput<'a> {
 }
 
 /// The plan a load of `input` would make on the device now, with the
-/// target's and the draft's weight files counted as active bytes.
+/// target's and the draft's weight files counted as active bytes; with its
+/// planes when [`planes_ledger`] keeps them.
 pub(crate) fn estimate_qwen35_load(
     label: &str,
     input: &EstimateInput<'_>,
 ) -> Result<Option<Qwen35ContextEstimate>> {
+    let Some(plans) = estimate_plans(label, input)? else {
+        return Ok(None);
+    };
+    let plan = match plans.with {
+        Some(Ok(with)) if planes_ledger(input.planes_bytes, &with, &plans.without).is_ok() => with,
+        _ => plans.without,
+    };
+    let window = turn_window(&plan);
+    Ok(Some(Qwen35ContextEstimate {
+        window_tokens: window
+            .map_or(plans.served, |window| window.maximum())
+            .min(plans.cap),
+        bound: window.map_or("model", |window| window.bound()).to_string(),
+    }))
+}
+
+/// Whether a load of `input` may write its `input.planes_bytes` of GGUF
+/// planes, judged before its import from the device now with the target's
+/// and the draft's weight files counted as active bytes: [`planes_ledger`]
+/// of the plans with and without them. A load that would lose a lane, its
+/// window or too much of its pool to them never allocates them. `Ok` holds
+/// the ledger line, `Err` why they leave.
+pub(crate) fn admit_planes(
+    label: &str,
+    input: &EstimateInput<'_>,
+) -> std::result::Result<String, String> {
+    let plans = estimate_plans(label, input)
+        .map_err(|error| error.reason)?
+        .ok_or_else(|| "the working set is unreadable".to_string())?;
+    let with = plans
+        .with
+        .ok_or_else(|| "no planes to price".to_string())?
+        .map_err(|error| error.reason)?;
+    planes_ledger(input.planes_bytes, &with, &plans.without)
+}
+
+/// The plans of [`estimate_qwen35_load`]: `with` holds the plan with the
+/// planes resident when `input` has planes.
+struct EstimatePlans {
+    without: MemoryPlan,
+    with: Option<Result<MemoryPlan>>,
+    served: u32,
+    cap: u32,
+}
+
+fn estimate_plans(label: &str, input: &EstimateInput<'_>) -> Result<Option<EstimatePlans>> {
     let raw = read_config_json(input.asset_dir)?;
     let (mut config, mtp_body, expert_row_bytes) = if input.moe {
         let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
@@ -890,9 +1138,21 @@ pub(crate) fn estimate_qwen35_load(
         .transpose()?;
     let pool = if qwen35_pool_backend() {
         let layers = config.full_attention_layer_count() as u32;
-        let block_size = config.paged_block_size();
-        let cache_dtype =
-            qwen35_pool_cache_dtype(label, format, PoolHeads::of(&config), block_size, compute)?;
+        let heads = PoolHeads::of(&config);
+        let config_block = config.paged_block_size();
+        let cache_dtype = qwen35_pool_cache_dtype(label, format, heads, config_block, compute)?;
+        let block_size = if input.moe {
+            config_block
+        } else {
+            pool_page(&PageInputs {
+                heads,
+                cache_dtype,
+                draft: draft.is_some(),
+                explicit_block: config.paged_block_size,
+                tile: device_builds_tile(),
+            })
+            .block_size
+        };
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             layers,
             config.num_kv_heads as u32,
@@ -934,11 +1194,12 @@ pub(crate) fn estimate_qwen35_load(
         pool,
         draft,
         mtp: mtp_head && draft.is_none(),
+        draft_lanes: !input.moe,
         lanes: qwen35_scheduler_lanes(),
         expert_row_bytes,
         state_staging_bytes: 0,
     };
-    let plan = plan_with_disk(
+    let without = plan_with_disk(
         label,
         &mut lanes,
         live,
@@ -946,10 +1207,23 @@ pub(crate) fn estimate_qwen35_load(
         input.max_context,
         input.cache_disk,
     )?;
-    let window = turn_window(&plan);
-    Ok(Some(Qwen35ContextEstimate {
-        window_tokens: window.map_or(served, |window| window.maximum()).min(cap),
-        bound: window.map_or("model", |window| window.bound()).to_string(),
+    let with = (input.planes_bytes > 0).then(|| {
+        let mut with_live = live;
+        with_live.active_bytes = with_live.active_bytes.saturating_add(input.planes_bytes);
+        plan_with_disk(
+            label,
+            &mut lanes,
+            with_live,
+            input.max_memory_bytes,
+            input.max_context,
+            input.cache_disk,
+        )
+    });
+    Ok(Some(EstimatePlans {
+        without,
+        with,
+        served,
+        cap,
     }))
 }
 

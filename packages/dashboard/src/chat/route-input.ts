@@ -241,6 +241,12 @@ export function idParam(value: string | undefined): string {
   return value;
 }
 
+/** A workflow run id from the path; another shape is 404 like an unknown run. */
+export function runParam(value: string | undefined): string {
+  if (value === undefined || !isIdShape(value)) throw ApiError.notFound('No such run.');
+  return value;
+}
+
 function isIdShape(value: string): boolean {
   if (value === '' || value.length > MAX_ID_CHARS) return false;
   for (let i = 0; i < value.length; i++) {
