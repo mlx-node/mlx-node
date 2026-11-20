@@ -285,7 +285,8 @@ impl Block {
                 )));
             }
         };
-        self.mla.core(&w.attn, p, start, &mut st.cache, index)
+        self.mla
+            .core_for(&w.attn, p, start, &mut st.cache, index, kind)
     }
 
     /// A sublayer's reduced input and post gate, under the HC clock.

@@ -1130,9 +1130,14 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
             unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nax_nt".as_ptr()) };
         unsafe { mlx_sys::mlx_test_kquant_counting(false) };
         let rhs = if nax_avail { rhs_nax } else { rhs_nt };
+        let expected_rhs = if nax_avail && prefill_indirect_gu_enabled() {
+            1
+        } else {
+            3
+        };
         assert_eq!(
-            rhs, 3,
-            "layer {il}: the prefill did not take the sorted-rhs kernel (nt={rhs_nt}, nax={rhs_nax})"
+            rhs, expected_rhs,
+            "layer {il}: the prefill did not take the expected sorted-rhs count (nt={rhs_nt}, nax={rhs_nax})"
         );
         for (r, want) in full.iter().enumerate() {
             assert_eq!(
@@ -1782,6 +1787,350 @@ fn kq_routed_decode_asymmetric_clamp_boundaries() {
         }
         bank.end_turn().unwrap();
     }
+}
+
+#[test]
+fn build_prefill_tiles_handles_partial_and_multi_tiles() {
+    assert!(build_prefill_tiles(&[]).is_empty());
+    let mut slots = Vec::new();
+    slots.extend(std::iter::repeat_n(3u32, 1));
+    slots.extend(std::iter::repeat_n(7u32, 31));
+    slots.extend(std::iter::repeat_n(12u32, 32));
+    slots.extend(std::iter::repeat_n(20u32, 33));
+    slots.extend(std::iter::repeat_n(45u32, 65));
+    let tiles = build_prefill_tiles(&slots);
+    let expected: Vec<u32> = vec![
+        0, 1, 3, // partial (1)
+        1, 32, 7, // partial (31)
+        32, 64, 12, // exact (32)
+        64, 96, 20, // full + partial (33)
+        96, 97, 20, //
+        97, 129, 45, // 2 full + partial (65)
+        129, 161, 45, //
+        161, 162, 45, //
+    ];
+    assert_eq!(tiles, expected);
+}
+
+#[test]
+fn kq_prefill_indirect_gu_and_sorted_combine_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (rows, k_dim, m_dim, top, n_experts) = (256usize, 1536usize, 1536usize, 16usize, 40usize);
+    for (class, seed) in [(ExpertClass::Q4kDown, 83u64), (ExpertClass::Q6kDown, 89u64)] {
+        let mut rng = Rng::new(seed);
+        let m = moe_cfg(n_experts, top, m_dim, k_dim);
+        let mut file = rng.bytes(128);
+        let experts = vec![None, Some(kquant_layer(&mut rng, &m, 1, class, &mut file))];
+        let dir = Temp::new();
+        let path = dir.0.join("data.bin");
+        std::fs::write(&path, &file).unwrap();
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let cache = match class {
+            ExpertClass::Q6kDown => [n_experts, 0],
+            ExpertClass::Q4kDown => [0, n_experts],
+            ExpertClass::Bf16 => unreachable!(),
+        };
+        let bank = Arc::new(KqBank::new(pool, &m, &experts, cache, 1).unwrap());
+
+        // Skew expert frequencies so experts 32..40 are empty (0 assignments),
+        // experts 24..31 have partial tiles (< 32 rows), and experts 0..23 span
+        // multiple tiles (> 32 rows).
+        let mut ids = Vec::with_capacity(rows * top);
+        let mut weights = Vec::with_capacity(rows * top);
+        let mut counts = vec![0usize; n_experts];
+        for r in 0..rows {
+            let mut picks: Vec<u32> = Vec::with_capacity(top);
+            // Guarantee a small subset of partial-tile experts (< 32 rows).
+            if r < 11 {
+                picks.push(24 + (r as u32 % 8));
+            }
+            let mut cursor = (r * 5) % 24;
+            while picks.len() < top {
+                let e = cursor as u32;
+                if !picks.contains(&e) {
+                    picks.push(e);
+                }
+                cursor = (cursor + 1) % 24;
+            }
+            for &e in &picks {
+                counts[e as usize] += 1;
+            }
+            ids.extend(picks);
+            for _ in 0..top {
+                weights.push(0.2 + 0.6 * rng.next().abs());
+            }
+        }
+        assert!(
+            counts[32..].iter().all(|&c| c == 0),
+            "test must leave empty experts"
+        );
+        assert!(
+            counts[24..32].iter().any(|&c| c > 0 && c < 32),
+            "test must include partial expert tiles (< 32 rows)"
+        );
+        assert!(
+            counts[..24].iter().any(|&c| c > 32),
+            "test must include multi-tile experts (> 32 rows)"
+        );
+
+        // Amplitude chosen so pre-activations cross < -10 and > +10 for limit=10.
+        let z = MxArray::from_float32(&rng.vec(rows * k_dim, 3.0), &[rows as i64, k_dim as i64])
+            .unwrap();
+        let routes = Routes {
+            k: top,
+            ids: ids.clone(),
+            weights: weights.clone(),
+        };
+
+        for limit in [10.0f32, 0.0f32] {
+            let c = ffn_cfg(64, m.clone(), limit);
+            let (w, _, _) = moe_weights(&mut rng, &c, 32);
+            let ffn = Ffn::Moe(w);
+            let layer =
+                LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+            let FfnKind::Moe(moe) = &layer.kind else {
+                panic!("expected MoE");
+            };
+
+            let ref_out = with_prefill_indirect_gu(false, || {
+                TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(usize::MAX));
+                let out = moe.routed(1, &z, &routes, RowKind::Prefill);
+                TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(0));
+                read(&out.unwrap())
+            });
+            bank.settle_all();
+
+            // Check both ungrouped and subgrouped fused prefill paths.
+            for (sub_limit, mode_name) in [(usize::MAX, "ungrouped"), (12usize, "subgrouped")] {
+                let got_out = with_prefill_indirect_gu(true, || {
+                    TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(sub_limit));
+                    let out = moe.routed(1, &z, &routes, RowKind::Prefill);
+                    TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(0));
+                    read(&out.unwrap())
+                });
+                bank.settle_all();
+
+                assert_eq!(got_out.len(), ref_out.len());
+                assert!(
+                    got_out.iter().all(|v| v.is_finite()),
+                    "{class:?} limit={limit} {mode_name}: non-finite output"
+                );
+                let diff_sq: f64 = got_out
+                    .iter()
+                    .zip(&ref_out)
+                    .map(|(&a, &b)| {
+                        let d = f64::from(a) - f64::from(b);
+                        d * d
+                    })
+                    .sum();
+                let ref_sq: f64 = ref_out.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+                let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
+                assert!(
+                    rel_l2 < 1e-3,
+                    "{class:?} limit={limit} {mode_name}: rel_l2={rel_l2:e} >= 1e-3"
+                );
+            }
+
+            // Confirm asymmetric clamp boundaries are actually exercised when limit == 10.
+            if limit > 0.0 {
+                let (ids_asc, w_asc) = routes.by_expert();
+                let (used, uses) = distinct_uses(&ids_asc);
+                let p = bank.prepare(1, &used, &uses, false).unwrap();
+                let sample_slots: Vec<u32> =
+                    ids_asc[..32].iter().map(|&e| p.slot(e).unwrap()).collect();
+                let sid_2d = MxArray::from_uint32(&sample_slots, &[2, top as i64]).unwrap();
+                let ze = z
+                    .slice(&[0, 0], &[2, k_dim as i64])
+                    .unwrap()
+                    .reshape(&[2, 1, 1, k_dim as i64])
+                    .unwrap();
+                let g_raw = read(&p.arrays[0].gather(&ze, &sid_2d).unwrap());
+                let u_raw = read(&p.arrays[1].gather(&ze, &sid_2d).unwrap());
+                assert!(g_raw.iter().any(|&v| v < -10.0), "{class:?}: need g < -10");
+                assert!(g_raw.iter().any(|&v| v > 10.0), "{class:?}: need g > 10");
+                assert!(u_raw.iter().any(|&v| v < -10.0), "{class:?}: need u < -10");
+                assert!(u_raw.iter().any(|&v| v > 10.0), "{class:?}: need u > 10");
+
+                // Standalone kq_sorted_combine parity vs take + reshape + mul + sum.
+                let pairs = rows * top;
+                let down_vals = rng.vec(pairs * k_dim, 0.5);
+                let down_arr =
+                    MxArray::from_float32(&down_vals, &[pairs as i64, k_dim as i64]).unwrap();
+                let mut inv: Vec<u32> = (0..pairs as u32).collect();
+                inv.reverse();
+                let combined = read(
+                    &Moe::kq_sorted_combine(&down_arr, &w_asc, &inv, rows as i64, top as i64)
+                        .unwrap()
+                        .unwrap(),
+                );
+                let expected = read(
+                    &down_arr
+                        .take(&MxArray::from_uint32(&inv, &[pairs as i64]).unwrap(), 0)
+                        .unwrap()
+                        .reshape(&[rows as i64, top as i64, k_dim as i64])
+                        .unwrap()
+                        .mul(&MxArray::from_float32(&w_asc, &[rows as i64, top as i64, 1]).unwrap())
+                        .unwrap()
+                        .sum(Some(&[1]), Some(false))
+                        .unwrap(),
+                );
+                let max_abs = combined
+                    .iter()
+                    .zip(&expected)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs <= 1e-4,
+                    "{class:?} kq_sorted_combine max_abs={max_abs:e}"
+                );
+                bank.settle_all();
+            }
+        }
+        bank.end_turn().unwrap();
+    }
+}
+
+#[test]
+fn kq_prefill_indirect_gu_bench_2048() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (rows, k_dim, m_dim, top, n_experts) = (2048usize, 1536usize, 1536usize, 16usize, 64usize);
+    let mut rng = Rng::new(97);
+    let m = moe_cfg(n_experts, top, m_dim, k_dim);
+    let c = ffn_cfg(64, m.clone(), 10.0);
+    let mut file = rng.bytes(128);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [n_experts, 0], 1).unwrap());
+    let (w, _, _) = moe_weights(&mut rng, &c, 32);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+    let FfnKind::Moe(moe) = &layer.kind else {
+        panic!("expected MoE");
+    };
+
+    let mut ids = Vec::with_capacity(rows * top);
+    let mut weights = Vec::with_capacity(rows * top);
+    for r in 0..rows {
+        let base = (r * 7) % n_experts;
+        for j in 0..top {
+            ids.push(((base + j * 3) % n_experts) as u32);
+            weights.push(0.25 + 0.5 * rng.next().abs());
+        }
+    }
+    let routes = Routes {
+        k: top,
+        ids,
+        weights,
+    };
+    let (ids_asc, w_asc) = routes.by_expert();
+    let (used, uses) = distinct_uses(&ids_asc);
+    let p = bank.prepare(1, &used, &uses, false).unwrap();
+
+    let z =
+        MxArray::from_float32(&rng.vec(rows * k_dim, 0.75), &[rows as i64, k_dim as i64]).unwrap();
+    let slots: Vec<u32> = ids_asc.iter().map(|&e| p.slot(e).unwrap()).collect();
+
+    let pairs = rows * top;
+    let mut order: Vec<u32> = (0..pairs as u32).collect();
+    order.sort_by_key(|&i| slots[i as usize]);
+    let token_rows: Vec<u32> = order.iter().map(|&i| i / top as u32).collect();
+    let sorted_slots: Vec<u32> = order.iter().map(|&i| slots[i as usize]).collect();
+    let tiles = build_prefill_tiles(&sorted_slots);
+    let (y_tiles, max_group) = sorted_slot_bounds(&sorted_slots);
+
+    let run_unfused_ref = || {
+        moe.combine(&z, &slots, &w_asc, true, |pi, x, i| {
+            p.arrays[pi].gather_sorted_nax_bounded(x, i, y_tiles, max_group)
+        })
+        .unwrap()
+    };
+
+    // Accuracy check at rows=2048 against unfused gather_sorted_nax + take + sum.
+    let ref_out = read(&run_unfused_ref());
+    let fused_out = with_prefill_indirect_gu(true, || {
+        let out = moe.banked_prefill_sorted(&z, &slots, &w_asc, &p).unwrap();
+        read(&out)
+    });
+    let diff_sq: f64 = fused_out
+        .iter()
+        .zip(&ref_out)
+        .map(|(&a, &b)| {
+            let d = f64::from(a) - f64::from(b);
+            d * d
+        })
+        .sum();
+    let ref_sq: f64 = ref_out.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+    let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
+    assert!(rel_l2 < 1e-3, "rows=2048 rel_l2={rel_l2:e} >= 1e-3");
+
+    // Warmup + timed runs at rows=2048.
+    let iters = 3usize;
+    let flops_gu = 4.0 * (pairs as f64) * (k_dim as f64) * (m_dim as f64);
+    let flops_full = 6.0 * (pairs as f64) * (k_dim as f64) * (m_dim as f64);
+
+    if let Some(a0) = moe
+        .kq_prefill_indirect_gu(&z, &token_rows, &tiles, &p)
+        .unwrap()
+    {
+        MxArray::eval_arrays(&[&a0]).unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let a = moe
+                .kq_prefill_indirect_gu(&z, &token_rows, &tiles, &p)
+                .unwrap()
+                .unwrap();
+            MxArray::eval_arrays(&[&a]).unwrap();
+        }
+        let gu_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let gu_tflops = flops_gu / (gu_ms * 1e9);
+
+        let f0 = with_prefill_indirect_gu(true, || {
+            moe.banked_prefill_sorted(&z, &slots, &w_asc, &p).unwrap()
+        });
+        MxArray::eval_arrays(&[&f0]).unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            let out = with_prefill_indirect_gu(true, || {
+                moe.banked_prefill_sorted(&z, &slots, &w_asc, &p).unwrap()
+            });
+            MxArray::eval_arrays(&[&out]).unwrap();
+        }
+        let fused_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let fused_tflops = flops_full / (fused_ms * 1e9);
+
+        let r0 = run_unfused_ref();
+        MxArray::eval_arrays(&[&r0]).unwrap();
+        let t2 = std::time::Instant::now();
+        for _ in 0..iters {
+            let out = run_unfused_ref();
+            MxArray::eval_arrays(&[&out]).unwrap();
+        }
+        let ref_ms = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let ref_tflops = flops_full / (ref_ms * 1e9);
+
+        eprintln!(
+            "hy4 prefill MoE (rows={rows}, R={pairs}, K={k_dim}, M={m_dim}, TOP={top}, Q6K down, rel_l2={rel_l2:.3e}):\n  \
+             indirect_gu:   {gu_ms:.2} ms ({gu_tflops:.2} TFLOPS)\n  \
+             fused full:    {fused_ms:.2} ms ({fused_tflops:.2} TFLOPS)\n  \
+             unfused ref:   {ref_ms:.2} ms ({ref_tflops:.2} TFLOPS)  speedup={:.2}x",
+            ref_ms / fused_ms
+        );
+    }
+
+    bank.settle_all();
+    bank.end_turn().unwrap();
 }
 
 fn real_scan() -> Scan {

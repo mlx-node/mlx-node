@@ -24,10 +24,10 @@ use super::batch::{MIN_Q8_ROWS, Wave};
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
-use super::moe::{prefill_q8_grouped_nax_enabled, qlinear};
+use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear};
 use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
 use super::paged::{SlotMap, planes, write_latent};
-use super::sparse::{KeyRows, gather_sink_attention, gather_sink_attention_rows};
+use super::sparse::{KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
@@ -448,8 +448,23 @@ impl Mla {
         cache: &mut LayerCache,
         index: Option<Indexing<'_>>,
     ) -> Result<MxArray> {
+        self.core_for(w, p, start, cache, index, RowKind::Decode)
+    }
+
+    /// `core` with an explicit row kind for prefill vs decode kernel selection.
+    pub fn core_for(
+        &self,
+        w: &AttnWeights,
+        p: &Projected,
+        start: usize,
+        cache: &mut LayerCache,
+        index: Option<Indexing<'_>>,
+        kind: RowKind,
+    ) -> Result<MxArray> {
         match (self.g.attn, cache, index) {
-            (Attn::Sliding, LayerCache::Window(ring), None) => self.core_sliding(w, p, start, ring),
+            (Attn::Sliding, LayerCache::Window(ring), None) => {
+                self.core_sliding_for(w, p, start, ring, kind)
+            }
             (Attn::Indexed, LayerCache::Latent(buf), Some(mut ix)) => {
                 self.core_indexed(w, p, start, buf, &mut ix)
             }
@@ -465,6 +480,18 @@ impl Mla {
         start: usize,
         ring: &mut WindowRing,
     ) -> Result<MxArray> {
+        self.core_sliding_for(w, p, start, ring, RowKind::Decode)
+    }
+
+    /// `core` of a sliding layer with explicit row kind.
+    pub fn core_sliding_for(
+        &self,
+        w: &AttnWeights,
+        p: &Projected,
+        start: usize,
+        ring: &mut WindowRing,
+        kind: RowKind,
+    ) -> Result<MxArray> {
         let n = p.kv.shape_at(0)? as usize;
         let (keys, first) = ring.append(&p.kv, start)?;
         let tp = prof_start();
@@ -473,13 +500,14 @@ impl Mla {
             &window_rows(start, n, first, window),
             &[n as i64, window as i64],
         )?;
-        let o = gather_sink_attention(
+        let o = gather_sink_attention_for(
             &p.q,
             &keys,
             &idx,
             self.g.kv_lora as i64,
             &w.sinks,
             self.g.scale,
+            kind,
         )?;
         prof_end(Phase::Sparse, tp, &[&o])?;
         Ok(o)
@@ -505,13 +533,14 @@ impl Mla {
         let idx = ix.indexer.select(ix.weights, call, ix.state)?;
         prof_end(Phase::Indexer, tp, &[&idx])?;
         let tp = prof_start();
-        let o = gather_sink_attention(
+        let o = gather_sink_attention_for(
             &p.q,
             buf.rows()?,
             &idx,
             self.g.kv_lora as i64,
             &w.sinks,
             self.g.scale,
+            ix.kind,
         )?;
         prof_end(Phase::Sparse, tp, &[&o])?;
         Ok(o)
@@ -549,13 +578,14 @@ impl Mla {
         let tp = prof_start();
         let slots = pool.slots.slots(pool.adapter, &idx)?;
         let (k, v) = planes(pool.adapter, layer)?;
-        let o = gather_sink_attention_rows(
+        let o = gather_sink_attention_rows_for(
             &p.q,
             KeyRows::Split(&k, &v),
             &slots,
             self.g.kv_lora as i64,
             &w.sinks,
             self.g.scale,
+            ix.kind,
         )?;
         prof_end(Phase::Sparse, tp, &[&o])?;
         Ok(o)

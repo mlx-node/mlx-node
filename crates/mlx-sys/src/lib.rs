@@ -3518,6 +3518,35 @@ unsafe extern "C" {
         v_width: i32,
         scale: f32,
     ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_prefill_nax(
+        q: *mut mlx_array,
+        k0: *mut mlx_array,
+        k1: *mut mlx_array,
+        idx: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_prefill_indirect_gu(
+        x: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        tiles: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_sorted_combine(
+        down: *mut mlx_array,
+        weights: *mut mlx_array,
+        inverse: *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C-unwind" {

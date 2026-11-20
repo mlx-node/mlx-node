@@ -1,4 +1,6 @@
 #include "mlx_common.h"
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 #ifdef MLX_NODE_METAL_ENABLED
@@ -24,6 +26,9 @@ enum Hy4KernelId : int {
   kKernelMlaSplitK = 8,
   kKernelMlaMerge = 9,
   kKernelQ8Prefill = 10,
+  kKernelMlaPrefillNax = 11,
+  kKernelKqPrefillIndirectGu = 12,
+  kKernelKqSortedCombine = 13,
 };
 
 struct CachedPrimKey {
@@ -436,6 +441,25 @@ const mlx::core::fast::CustomKernelFunction &hy4_kq_down_weighted_kernel() {
   return kernel;
 }
 
+const mlx::core::fast::CustomKernelFunction &
+hy4_kq_prefill_indirect_gu_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_kq_prefill_indirect_gu",
+      {"x", "token_rows", "tiles", "wg", "sg", "bg", "wu", "su", "bu", "limit"},
+      {"out"},
+#include "metal/hy4/kq_prefill_indirect_gu.metal.inc"
+      , nax_header());
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_kq_sorted_combine_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_kq_sorted_combine", {"down", "weights", "inverse"}, {"out"},
+#include "metal/hy4/kq_sorted_combine.metal.inc"
+  );
+  return kernel;
+}
+
 bool validate_kq_banks(const array &wg, const array &sg, const array &bg,
                        const array &wu, const array &su, const array &bu,
                        const array &wd, const array &sd, const array &bd,
@@ -511,6 +535,91 @@ const mlx::core::fast::CustomKernelFunction &hy4_mla_merge_kernel() {
       {"out"},
 #include "metal/hy4/mla_decode_merge.metal.inc"
   );
+  return kernel;
+}
+
+const std::string &hy4_mla_prefill_nax_header() {
+  static const std::string header =
+      std::string(mlx::core::quantized_preamble::nax()) + R"METAL(
+using namespace mlx::steel;
+
+struct Hy4MaxOp {
+  template <typename T>
+  METAL_FUNC static constexpr T apply(T x, T y) {
+    return metal::max(x, y);
+  }
+};
+
+struct Hy4SumOp {
+  template <typename T>
+  METAL_FUNC static constexpr T apply(T x, T y) {
+    return x + y;
+  }
+};
+
+struct Hy4MulOp {
+  template <typename T>
+  METAL_FUNC static constexpr T apply(T x, T y) {
+    return x * y;
+  }
+};
+
+struct Hy4Exp2SubOp {
+  template <typename T>
+  METAL_FUNC static constexpr T apply(T x, T y) {
+    return metal::exp2(x - y);
+  }
+};
+
+template <typename C, bool SPLIT, int D_K, int HALF>
+METAL_FUNC void hy4_load_kv_frag(
+    thread metal::vec<C, 8>& dst,
+    const device half* k0,
+    const device half* k1,
+    const int slot_a,
+    const int slot_b,
+    const int col_off,
+    const short fn) {
+  const device half* plane = (SPLIT && col_off >= HALF) ? k1 : k0;
+  const int stride = SPLIT ? HALF : D_K;
+  const int pcol = (SPLIT && col_off >= HALF) ? (col_off - HALF) : col_off;
+  if (slot_a >= 0) {
+    const half4 va = *reinterpret_cast<const device half4*>(
+        plane + size_t(slot_a) * size_t(stride) + size_t(pcol + int(fn)));
+    dst[0] = C(va.x);
+    dst[1] = C(va.y);
+    dst[2] = C(va.z);
+    dst[3] = C(va.w);
+  } else {
+    dst[0] = C(0);
+    dst[1] = C(0);
+    dst[2] = C(0);
+    dst[3] = C(0);
+  }
+  if (slot_b >= 0) {
+    const half4 vb = *reinterpret_cast<const device half4*>(
+        plane + size_t(slot_b) * size_t(stride) + size_t(pcol + int(fn)));
+    dst[4] = C(vb.x);
+    dst[5] = C(vb.y);
+    dst[6] = C(vb.z);
+    dst[7] = C(vb.w);
+  } else {
+    dst[4] = C(0);
+    dst[5] = C(0);
+    dst[6] = C(0);
+    dst[7] = C(0);
+  }
+}
+)METAL";
+  return header;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_mla_prefill_nax_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_mla_prefill_nax", {"q", "k0", "k1", "idx", "sinks", "scale"},
+      {"out"},
+#include "metal/hy4/mla_prefill_nax.metal.inc"
+      , hy4_mla_prefill_nax_header());
   return kernel;
 }
 
@@ -1490,6 +1599,286 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
   (void)sinks;
   (void)v_width;
   (void)scale;
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_mla_prefill_nax(mlx_array *q, mlx_array *k0, mlx_array *k1,
+                                   mlx_array *idx, mlx_array *sinks,
+                                   int v_width, float scale) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu) ||
+        !mlx::core::metal::is_nax_available()) {
+      return nullptr;
+    }
+    if (!q || !k0 || !idx || !sinks || !std::isfinite(scale)) {
+      return nullptr;
+    }
+    const auto &qa = *reinterpret_cast<array *>(q);
+    const auto &k0a = *reinterpret_cast<array *>(k0);
+    const auto &idxa = *reinterpret_cast<array *>(idx);
+    const auto &sinksa = *reinterpret_cast<array *>(sinks);
+    const bool split = (k1 != nullptr);
+
+    if (qa.ndim() != 3 || k0a.ndim() != 2 || idxa.ndim() != 2 ||
+        sinksa.ndim() != 1) {
+      return nullptr;
+    }
+    if (qa.dtype() != mlx::core::float32 || k0a.dtype() != mlx::core::float16 ||
+        idxa.dtype() != mlx::core::int32 ||
+        sinksa.dtype() != mlx::core::float32) {
+      return nullptr;
+    }
+    const int s = qa.shape(0);
+    const int h = qa.shape(1);
+    const int d_k = qa.shape(2);
+    const int d_v = v_width;
+    const int d_rope = d_k - d_v;
+    const int n_keys = k0a.shape(0);
+    const int kmax = idxa.shape(1);
+    if (s < 1 || h < 32 || h % 32 != 0 || n_keys < 1 || kmax < 1 ||
+        idxa.shape(0) != s || sinksa.shape(0) != h) {
+      return nullptr;
+    }
+    if (d_v != 512 || d_rope != 64) {
+      return nullptr;
+    }
+    if (split) {
+      const auto &k1a = *reinterpret_cast<array *>(k1);
+      if (k1a.ndim() != 2 || k1a.dtype() != mlx::core::float16 ||
+          k0a.shape(1) != 288 || k1a.shape(0) != n_keys ||
+          k1a.shape(1) != 288) {
+        return nullptr;
+      }
+    } else if (k0a.shape(1) != d_k) {
+      return nullptr;
+    }
+
+    array qc = ensure_contiguous_aligned(qa, 1);
+    array k0c = ensure_contiguous_aligned(k0a, 4);
+    array k1c = split ? ensure_contiguous_aligned(
+                            *reinterpret_cast<array *>(k1), 4)
+                      : cached_zero_f16();
+    array idxc = ensure_contiguous_aligned(idxa, 1);
+    array sinksc = ensure_contiguous_aligned(sinksa, 1);
+    array scale_arr = cached_f32_scalar(scale);
+    const auto stream = default_stream(Device::gpu);
+
+    constexpr int wm = 2;
+    constexpr int wn = 4;
+    constexpr int bh = wm * 16;
+    constexpr int bk = 32;
+    const Dtype compute_dtype = mlx::core::float32;
+    const int head_groups = h / bh;
+    const std::tuple<int, int, int> grid{32, head_groups * wm * wn, s};
+    const std::tuple<int, int, int> tg{32, wm * wn, 1};
+    const uint64_t tmpl_key = uint64_t(d_v) | (uint64_t(d_rope) << 16) |
+                              (uint64_t(split ? 1 : 0) << 32) |
+                              (uint64_t(wm) << 36) | (uint64_t(wn) << 40) |
+                              (uint64_t(bk) << 44);
+    const std::vector<array> inputs{qc, k0c, k1c, idxc, sinksc, scale_arr};
+    const std::vector<Shape> out_shapes{{s, h, d_v}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto out = dispatch_cached_kernel(
+        kKernelMlaPrefillNax, stream, grid, tg, tmpl_key, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_mla_prefill_nax_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"D_V", d_v},
+               {"D_ROPE", d_rope},
+               {"SPLIT", split},
+               {"WM", wm},
+               {"WN", wn},
+               {"BK", bk},
+               {"C", compute_dtype}},
+              std::nullopt, false, stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 mla_prefill_nax: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)q;
+  (void)k0;
+  (void)k1;
+  (void)idx;
+  (void)sinks;
+  (void)v_width;
+  (void)scale;
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_kq_prefill_indirect_gu(mlx_array *x, mlx_array *token_rows,
+                                          mlx_array *tiles, mlx_array *wg,
+                                          mlx_array *sg, mlx_array *bg,
+                                          mlx_array *wu, mlx_array *su,
+                                          mlx_array *bu, float limit) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    static const bool env_disabled = [] {
+      const char *v = std::getenv("MLX_HY4_PREFILL_INDIRECT_GU");
+      return v && std::strcmp(v, "0") == 0;
+    }();
+    if (env_disabled || !mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu) ||
+        !mlx::core::metal::is_nax_available()) {
+      return nullptr;
+    }
+    if (!x || !token_rows || !tiles || !wg || !sg || !bg || !wu || !su || !bu ||
+        !std::isfinite(limit)) {
+      return nullptr;
+    }
+    const auto &xa = *reinterpret_cast<array *>(x);
+    const auto &tra = *reinterpret_cast<array *>(token_rows);
+    const auto &ta = *reinterpret_cast<array *>(tiles);
+    const auto &wga = *reinterpret_cast<array *>(wg);
+    const auto &sga = *reinterpret_cast<array *>(sg);
+    const auto &bga = *reinterpret_cast<array *>(bg);
+    const auto &wua = *reinterpret_cast<array *>(wu);
+    const auto &sua = *reinterpret_cast<array *>(su);
+    const auto &bua = *reinterpret_cast<array *>(bu);
+
+    if (xa.ndim() != 2 || tra.ndim() != 1 || ta.ndim() != 2 ||
+        wga.ndim() != 3 || sga.ndim() != 3 || bga.ndim() != 3 ||
+        wua.ndim() != 3 || sua.ndim() != 3 || bua.ndim() != 3) {
+      return nullptr;
+    }
+    if (xa.dtype() != mlx::core::float32 || tra.dtype() != mlx::core::uint32 ||
+        ta.dtype() != mlx::core::uint32) {
+      return nullptr;
+    }
+    const int n_tok = xa.shape(0);
+    const int k = xa.shape(1);
+    const int r = tra.shape(0);
+    const int n_tiles = ta.shape(0);
+    const int s = wga.shape(0);
+    const int m = wga.shape(1);
+    if (n_tok < 1 || r < 1 || n_tiles < 1 || ta.shape(1) != 3 || s < 1 ||
+        k < 256 || k % 256 != 0 || m < 64 || m % 64 != 0) {
+      return nullptr;
+    }
+    const Shape q4_w{s, m, k / 8};
+    const Shape q4_s{s, m, k / 16};
+    const Shape q4_b{s, m, k / 128};
+    if (wga.dtype() != mlx::core::uint32 || wga.shape() != q4_w ||
+        sga.dtype() != mlx::core::uint8 || sga.shape() != q4_s ||
+        bga.dtype() != mlx::core::float16 || bga.shape() != q4_b ||
+        wua.dtype() != mlx::core::uint32 || wua.shape() != q4_w ||
+        sua.dtype() != mlx::core::uint8 || sua.shape() != q4_s ||
+        bua.dtype() != mlx::core::float16 || bua.shape() != q4_b) {
+      return nullptr;
+    }
+
+    array xc = ensure_contiguous_aligned(xa, 4);
+    array trc = ensure_contiguous_aligned(tra, 1);
+    array tc = ensure_contiguous_aligned(ta, 1);
+    array wgc = ensure_contiguous_aligned(wga, 1);
+    array sgc = ensure_contiguous_aligned(sga, 1);
+    array bgc = ensure_contiguous_aligned(bga, 1);
+    array wuc = ensure_contiguous_aligned(wua, 1);
+    array suc = ensure_contiguous_aligned(sua, 1);
+    array buc = ensure_contiguous_aligned(bua, 1);
+    array limit_arr = cached_f32_scalar(limit);
+
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{32 * (m / 64), 4 * n_tiles, 1};
+    const std::tuple<int, int, int> tg{32, 4, 1};
+    const std::vector<array> inputs{xc,  trc, tc,  wgc, sgc,
+                                    bgc, wuc, suc, buc, limit_arr};
+    const std::vector<Shape> out_shapes{{r, m}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto out = dispatch_cached_kernel(
+        kKernelKqPrefillIndirectGu, stream, grid, tg, 0, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_kq_prefill_indirect_gu_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg, {}, std::nullopt, false,
+              stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 kq_prefill_indirect_gu: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)x;
+  (void)token_rows;
+  (void)tiles;
+  (void)wg;
+  (void)sg;
+  (void)bg;
+  (void)wu;
+  (void)su;
+  (void)bu;
+  (void)limit;
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_kq_sorted_combine(mlx_array *down, mlx_array *weights,
+                                     mlx_array *inverse) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return nullptr;
+    }
+    if (!down || !weights || !inverse) {
+      return nullptr;
+    }
+    const auto &da = *reinterpret_cast<array *>(down);
+    const auto &wa = *reinterpret_cast<array *>(weights);
+    const auto &ia = *reinterpret_cast<array *>(inverse);
+    if (da.ndim() != 2 || wa.ndim() != 2 || ia.ndim() != 2 ||
+        da.dtype() != mlx::core::float32 || wa.dtype() != mlx::core::float32 ||
+        ia.dtype() != mlx::core::uint32) {
+      return nullptr;
+    }
+    const int r = da.shape(0);
+    const int h = da.shape(1);
+    const int n_tok = wa.shape(0);
+    const int top = wa.shape(1);
+    if (r < 1 || h < 1 || n_tok < 1 || top < 1 || top > 32 ||
+        ia.shape() != Shape{n_tok, top}) {
+      return nullptr;
+    }
+
+    // Only cast down/out to device float4* when size >= 8 so MLX binds both in
+    // device address space rather than constant.
+    const bool vec4 = (h % 4 == 0) && (da.size() >= 8) &&
+                      (size_t(n_tok) * size_t(h) >= 8);
+    array dc = ensure_contiguous_aligned(da, vec4 ? 4 : 1);
+    array wc = ensure_contiguous_aligned(wa, 1);
+    array ic = ensure_contiguous_aligned(ia, 1);
+
+    const int cols = vec4 ? (h / 4) : h;
+    const int tg_x = std::min(256, cols);
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{cols, n_tok, 1};
+    const std::tuple<int, int, int> tg{tg_x, 1, 1};
+    const uint64_t tmpl_key = uint64_t(top) | (uint64_t(vec4 ? 1 : 0) << 8);
+    const std::vector<array> inputs{dc, wc, ic};
+    const std::vector<Shape> out_shapes{{n_tok, h}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto out = dispatch_cached_kernel(
+        kKernelKqSortedCombine, stream, grid, tg, tmpl_key, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_kq_sorted_combine_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"TOP", top}, {"VEC4", vec4}}, std::nullopt, false, stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 kq_sorted_combine: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)down;
+  (void)weights;
+  (void)inverse;
   return nullptr;
 #endif
 }

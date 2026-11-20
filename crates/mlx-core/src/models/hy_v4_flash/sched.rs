@@ -757,7 +757,9 @@ impl WaveOwners for PagedOwners<'_> {
             .ok_or_else(|| bad(format!("owner {owner} has no layer {l}")))?;
         let mla = call.blk.mla();
         match part {
-            CellLayer::Window(ring) => mla.core_sliding(&call.w.attn, call.p, call.start, ring),
+            CellLayer::Window(ring) => {
+                mla.core_sliding_for(&call.w.attn, call.p, call.start, ring, call.kind)
+            }
             CellLayer::Index(state) => {
                 let (Some(indexer), Some(weights)) = (call.blk.indexer(), call.w.indexer.as_ref())
                 else {

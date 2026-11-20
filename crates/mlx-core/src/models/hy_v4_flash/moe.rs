@@ -35,7 +35,9 @@ use std::sync::Arc;
 
 use napi::{Error, Result};
 
-use super::bank::{KqBank, Prepared, sorted_slot_bounds};
+#[cfg(test)]
+use super::bank::sorted_slot_bounds;
+use super::bank::{KqBank, Prepared};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{rms_norm, route, router_scores};
@@ -64,6 +66,57 @@ thread_local! {
     static TEST_SUBGROUP_EXPERTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_SPLIT_M1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_PREFILL_Q8_NAX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_PREFILL_INDIRECT_GU: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn prefill_indirect_gu_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_PREFILL_INDIRECT_GU.with(std::cell::Cell::get) {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_HY4_PREFILL_INDIRECT_GU").as_deref() != Ok("0")
+            && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0")
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn with_prefill_indirect_gu<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    let prev = TEST_PREFILL_INDIRECT_GU.with(|c| c.replace(Some(enabled)));
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_PREFILL_INDIRECT_GU.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Builds exact BM=32 `(begin, end, bank_slot)` tiles for contiguous runs of
+/// ascending bank slot ids.
+pub(crate) fn build_prefill_tiles(sorted_slots: &[u32]) -> Vec<u32> {
+    const BM: usize = 32;
+    let mut tiles = Vec::new();
+    let mut i = 0usize;
+    while i < sorted_slots.len() {
+        let slot = sorted_slots[i];
+        let mut j = i + 1;
+        while j < sorted_slots.len() && sorted_slots[j] == slot {
+            j += 1;
+        }
+        let mut begin = i;
+        while begin < j {
+            let end = (begin + BM).min(j);
+            tiles.push(begin as u32);
+            tiles.push(end as u32);
+            tiles.push(slot);
+            begin = end;
+        }
+        i = j;
+    }
+    tiles
 }
 
 pub(crate) fn prefill_q8_nax_enabled() -> bool {
@@ -969,40 +1022,15 @@ impl Moe {
             }
             let mut row = Vec::with_capacity(total);
             let mut slot = Vec::with_capacity(total);
-            let mut ws = Vec::with_capacity(total);
             for (s, e) in by_slot {
                 for &pair_idx in &by_expert[e as usize] {
                     back[pair_idx as usize] = offset;
                     offset += 1;
                     row.push(pair_idx / k as u32);
                     slot.push(s);
-                    ws.push(w[pair_idx as usize]);
                 }
             }
-            let m = total as i64;
-            let (y_tiles, max_group) = sorted_slot_bounds(&slot);
-            let x = z
-                .take(&MxArray::from_uint32(&row, &[m])?, 0)?
-                .reshape(&[m, 1, latent])?;
-            let si = MxArray::from_uint32(&slot, &[m])?;
-            let g = p.arrays[0].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
-            let u = p.arrays[1].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
-            let g = if g.dtype()? == DType::Float32 {
-                g
-            } else {
-                g.astype(DType::Float32)?
-            };
-            let u = if u.dtype()? == DType::Float32 {
-                u
-            } else {
-                u.astype(DType::Float32)?
-            };
-            let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
-            let d_g = p.arrays[2]
-                .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
-                .astype(DType::Float32)?
-                .mul(&MxArray::from_float32(&ws, &[m, 1, 1])?)?
-                .reshape(&[m, latent])?;
+            let d_g = self.prefill_sorted_down(z, &row, &slot, &p)?;
             MxArray::async_eval_arrays(&[&d_g]);
             Ok(Some(d_g))
         };
@@ -1037,12 +1065,163 @@ impl Moe {
             1 => parts.swap_remove(0),
             _ => MxArray::concatenate_many(parts.iter().collect(), Some(0))?,
         };
-        let out = all
-            .take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
-            .reshape(&[rows, k as i64, latent])?
-            .sum(Some(&[1]), Some(false))?;
+        let out = match Self::kq_sorted_combine(&all, w, &back, rows, k as i64)? {
+            Some(out) => out,
+            None => all
+                .take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+                .reshape(&[rows, k as i64, latent])?
+                .mul(&MxArray::from_float32(w, &[rows, k as i64, 1])?)?
+                .sum(Some(&[1]), Some(false))?,
+        };
         prof_end(Phase::Routed, tp, &[&out])?;
         Ok(out)
+    }
+
+    fn kq_prefill_indirect_gu(
+        &self,
+        z: &MxArray,
+        token_rows: &[u32],
+        tiles: &[u32],
+        p: &Prepared,
+    ) -> Result<Option<MxArray>> {
+        if !prefill_indirect_gu_enabled()
+            || p.arrays[0].format != KQuantFormat::Q4K
+            || p.arrays[1].format != KQuantFormat::Q4K
+            || token_rows.is_empty()
+            || tiles.is_empty()
+            || !tiles.len().is_multiple_of(3)
+        {
+            return Ok(None);
+        }
+        let zf = if z.dtype()? == DType::Float32 {
+            z.clone()
+        } else {
+            z.astype(DType::Float32)?
+        };
+        let tr = MxArray::from_uint32(token_rows, &[token_rows.len() as i64])?;
+        let tl = MxArray::from_uint32(tiles, &[(tiles.len() / 3) as i64, 3])?;
+        let [g, u, _] = &p.arrays;
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_kq_prefill_indirect_gu(
+                zf.as_raw_ptr(),
+                tr.as_raw_ptr(),
+                tl.as_raw_ptr(),
+                g.w.as_raw_ptr(),
+                g.s.as_raw_ptr(),
+                g.b.as_raw_ptr(),
+                u.w.as_raw_ptr(),
+                u.s.as_raw_ptr(),
+                u.b.as_raw_ptr(),
+                self.limit,
+            )
+        };
+        if h.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            h,
+            "hy_v4_flash kq_prefill_indirect_gu",
+        )?))
+    }
+
+    pub(crate) fn kq_sorted_combine(
+        down: &MxArray,
+        weights: &[f32],
+        inverse: &[u32],
+        rows: i64,
+        k: i64,
+    ) -> Result<Option<MxArray>> {
+        let df = if down.dtype()? == DType::Float32 {
+            down.clone()
+        } else {
+            down.astype(DType::Float32)?
+        };
+        let wa = MxArray::from_float32(weights, &[rows, k])?;
+        let ia = MxArray::from_uint32(inverse, &[rows, k])?;
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_kq_sorted_combine(df.as_raw_ptr(), wa.as_raw_ptr(), ia.as_raw_ptr())
+        };
+        if h.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            h,
+            "hy_v4_flash kq_sorted_combine",
+        )?))
+    }
+
+    /// Runs gate+up+clamped-SwiGLU and down over a slot-sorted group,
+    /// returning unweighted `[slot.len(), latent]` F32 outputs.
+    fn prefill_sorted_down(
+        &self,
+        z: &MxArray,
+        row: &[u32],
+        slot: &[u32],
+        p: &Prepared,
+    ) -> Result<MxArray> {
+        let latent = z.shape_at(1)?;
+        let m = slot.len() as i64;
+        let tiles = build_prefill_tiles(slot);
+        let y_tiles = (tiles.len() / 3).min(i32::MAX as usize) as i32;
+        let max_group = slot
+            .last()
+            .map_or(0, |&s| (s as usize + 1).min(i32::MAX as usize) as i32);
+        let si = MxArray::from_uint32(slot, &[m])?;
+        let a = match self.kq_prefill_indirect_gu(z, row, &tiles, p)? {
+            Some(a2d) => a2d.reshape(&[m, 1, self.moe.ff as i64])?,
+            None => {
+                let x = z
+                    .take(&MxArray::from_uint32(row, &[m])?, 0)?
+                    .reshape(&[m, 1, latent])?;
+                let g = p.arrays[0].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
+                let u = p.arrays[1].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
+                let g = if g.dtype()? == DType::Float32 {
+                    g
+                } else {
+                    g.astype(DType::Float32)?
+                };
+                let u = if u.dtype()? == DType::Float32 {
+                    u
+                } else {
+                    u.astype(DType::Float32)?
+                };
+                Activations::swiglu_clamped_compiled(&g, &u, self.limit)?
+            }
+        };
+        p.arrays[2]
+            .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
+            .astype(DType::Float32)?
+            .reshape(&[m, latent])
+    }
+
+    fn banked_prefill_sorted(
+        &self,
+        z: &MxArray,
+        slots: &[u32],
+        w: &[f32],
+        p: &Prepared,
+    ) -> Result<MxArray> {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used;
+        let pairs = (rows as usize) * k;
+        let mut order: Vec<u32> = (0..pairs as u32).collect();
+        order.sort_by_key(|&i| slots[i as usize]);
+        let mut back = vec![0u32; pairs];
+        for (at, &i) in order.iter().enumerate() {
+            back[i as usize] = at as u32;
+        }
+        let row: Vec<u32> = order.iter().map(|&i| i / k as u32).collect();
+        let slot: Vec<u32> = order.iter().map(|&i| slots[i as usize]).collect();
+        let d = self.prefill_sorted_down(z, &row, &slot, p)?;
+        if let Some(out) = Self::kq_sorted_combine(&d, w, &back, rows, k as i64)? {
+            return Ok(out);
+        }
+        d.take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+            .reshape(&[rows, k as i64, latent])?
+            .mul(&MxArray::from_float32(w, &[rows, k as i64, 1])?)?
+            .sum(Some(&[1]), Some(false))
     }
 
     fn kq_down_bits(p: &Prepared) -> Option<i32> {
@@ -1179,21 +1358,10 @@ impl Moe {
         if !sorted && let Some(out) = self.kq_routed_decode(z, &slots, w, p)? {
             return Ok(out);
         }
-        let (y_tiles, max_group) = if sorted {
-            let mut sorted_slots = slots.clone();
-            sorted_slots.sort_unstable();
-            sorted_slot_bounds(&sorted_slots)
-        } else {
-            (0, 0)
-        };
-        self.combine(z, &slots, w, sorted, |pi, x, i| {
-            let a = &p.arrays[pi];
-            if sorted {
-                a.gather_sorted_nax_bounded(x, i, y_tiles, max_group)
-            } else {
-                a.gather(x, i)
-            }
-        })
+        if sorted {
+            return self.banked_prefill_sorted(z, &slots, w, p);
+        }
+        self.combine(z, &slots, w, false, |pi, x, i| p.arrays[pi].gather(x, i))
     }
 
     /// The expert math over `idx` (`[rows, k]` row-major, each row's

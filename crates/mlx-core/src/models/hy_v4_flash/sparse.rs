@@ -9,7 +9,16 @@
 
 use napi::{Error, Result};
 
+use super::moe::RowKind;
 use crate::array::{DType, MxArray};
+
+/// Minimum query row count to prefer the NAX prefill kernel over split-K.
+const PREFILL_NAX_MIN_ROWS: i64 = 16;
+
+pub(crate) fn mla_prefill_nax_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_MLA_PREFILL_NAX").as_deref() != Ok("0"))
+}
 
 /// Byte budget of one row chunk (gathered keys + scores), DS
 /// `SPARSE_CHUNK_BYTES` (`deepseek_v41/attention.rs:262`).
@@ -86,6 +95,29 @@ pub fn gather_sink_attention(
     gather_sink_attention_in(q, keys, idx, v_width, sinks, scale, SPARSE_CHUNK_BYTES)
 }
 
+/// `gather_sink_attention` with row-kind dispatch (`RowKind::Prefill` uses the
+/// NAX tensor-op kernel when enabled and `s >= 16`).
+pub fn gather_sink_attention_for(
+    q: &MxArray,
+    keys: &MxArray,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    kind: RowKind,
+) -> Result<MxArray> {
+    gather_rows_in(
+        q,
+        KeyRows::Whole(keys),
+        idx,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+        kind,
+    )
+}
+
 /// `gather_sink_attention` over `keys` from either source; `idx` lists row
 /// ids of `Whole` rows or slot ids of `Split` planes.
 pub fn gather_sink_attention_rows(
@@ -96,7 +128,38 @@ pub fn gather_sink_attention_rows(
     sinks: &MxArray,
     scale: f32,
 ) -> Result<MxArray> {
-    gather_rows_in(q, keys, idx, v_width, sinks, scale, SPARSE_CHUNK_BYTES)
+    gather_rows_in(
+        q,
+        keys,
+        idx,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+        RowKind::Decode,
+    )
+}
+
+/// `gather_sink_attention_rows` with row-kind dispatch.
+pub fn gather_sink_attention_rows_for(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    kind: RowKind,
+) -> Result<MxArray> {
+    gather_rows_in(
+        q,
+        keys,
+        idx,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+        kind,
+    )
 }
 
 /// `gather_sink_attention` with an explicit chunk budget.
@@ -109,11 +172,21 @@ pub(crate) fn gather_sink_attention_in(
     scale: f32,
     budget: usize,
 ) -> Result<MxArray> {
-    gather_rows_in(q, KeyRows::Whole(keys), idx, v_width, sinks, scale, budget)
+    gather_rows_in(
+        q,
+        KeyRows::Whole(keys),
+        idx,
+        v_width,
+        sinks,
+        scale,
+        budget,
+        RowKind::Decode,
+    )
 }
 
 /// The core of every entry above. Uses the fused Metal kernel when geometry and
 /// dtypes match; otherwise falls back to the chunked MLX graph.
+#[allow(clippy::too_many_arguments)]
 fn gather_rows_in(
     q: &MxArray,
     keys: KeyRows<'_>,
@@ -122,6 +195,7 @@ fn gather_rows_in(
     sinks: &MxArray,
     scale: f32,
     budget: usize,
+    kind: RowKind,
 ) -> Result<MxArray> {
     let (s, h, d, kmax) = validate_inputs(q, keys, idx, v_width, sinks)?;
     let idx = if idx.dtype()? == DType::Int32 {
@@ -144,6 +218,23 @@ fn gather_rows_in(
             KeyRows::Whole(k) => (k.as_raw_ptr(), std::ptr::null_mut()),
             KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
         };
+        if kind == RowKind::Prefill && s >= PREFILL_NAX_MIN_ROWS && mla_prefill_nax_enabled() {
+            // SAFETY: all handles are live arrays owned by this call; k1_ptr is null for Whole.
+            let handle = unsafe {
+                mlx_sys::mlx_hy4_mla_prefill_nax(
+                    qf.as_raw_ptr(),
+                    k0_ptr,
+                    k1_ptr,
+                    idx.as_raw_ptr(),
+                    sf.as_raw_ptr(),
+                    vw,
+                    scale,
+                )
+            };
+            if !handle.is_null() {
+                return MxArray::from_handle(handle, "hy_v4_flash mla_prefill_nax");
+            }
+        }
         // SAFETY: all handles are live arrays owned by this call; k1_ptr is null for Whole.
         let handle = unsafe {
             mlx_sys::mlx_hy4_mla_sink_attention(

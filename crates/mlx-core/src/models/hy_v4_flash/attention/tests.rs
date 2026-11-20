@@ -7,7 +7,10 @@ use crate::models::deepseek_v41::ops::rope_angle;
 use crate::models::hy_v4_flash::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing};
 use crate::models::hy_v4_flash::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use crate::models::hy_v4_flash::moe::RowKind;
-use crate::models::hy_v4_flash::sparse::{gather_rows_reference, gather_sink_attention_in};
+use crate::models::hy_v4_flash::sparse::{
+    gather_rows_reference, gather_sink_attention, gather_sink_attention_for,
+    gather_sink_attention_in, gather_sink_attention_rows, gather_sink_attention_rows_for,
+};
 use crate::models::hy_v4_flash::weights::IndexerWeights;
 
 fn ops() -> Value {
@@ -1181,4 +1184,385 @@ fn mla_sink_attention_strict_row_invariance_up_to_256() {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn call_mla_prefill_nax(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    vw: i64,
+    sinks: &MxArray,
+    scale: f32,
+) -> Option<MxArray> {
+    let (k0_ptr, k1_ptr) = match keys {
+        KeyRows::Whole(k) => (k.as_raw_ptr(), std::ptr::null_mut()),
+        KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
+    };
+    let raw = unsafe {
+        mlx_sys::mlx_hy4_mla_prefill_nax(
+            q.as_raw_ptr(),
+            k0_ptr,
+            k1_ptr,
+            idx.as_raw_ptr(),
+            sinks.as_raw_ptr(),
+            vw as i32,
+            scale,
+        )
+    };
+    if raw.is_null() {
+        None
+    } else {
+        Some(MxArray::from_handle(raw, "test mla_prefill_nax").unwrap())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_nax_matches_reference_full_geometry() {
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        return;
+    }
+    crate::models::hy_v4_flash::exact_f32();
+    let (d, vw) = (576usize, 512i64);
+    let scale = 0.0625f32;
+    for (s, h, kmax, seed) in [
+        (64usize, 32usize, 512usize, 211u64),
+        (64usize, 32usize, 2048usize, 223u64),
+        (64usize, 64usize, 512usize, 227u64),
+        (256usize, 64usize, 512usize, 229u64),
+        (32usize, 32usize, 500usize, 233u64),
+    ] {
+        let n = kmax + 17;
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(s * h * d, 1.0), &[s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.0), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let mut sinks_v = r.vec(h, 2.0);
+        sinks_v[0] = -20.0;
+        sinks_v[1] = 50.0;
+        sinks_v[2] = 0.0;
+        sinks_v[h - 1] = 50.0;
+        let sinks = arr(&sinks_v, &[h]);
+
+        let mut idx = vec![-1i32; s * kmax];
+        for row in 0..s {
+            let base = row * kmax;
+            match row % 5 {
+                0 => {
+                    for j in 0..kmax {
+                        idx[base + j] = ((j * 7 + row * 13 + 3) % n) as i32;
+                    }
+                }
+                1 => {
+                    for j in 0..(kmax / 3) {
+                        idx[base + j] = ((j * 11 + row * 5 + 1) % n) as i32;
+                    }
+                }
+                2 => {
+                    for j in 0..kmax {
+                        idx[base + j] = match j % 5 {
+                            0 | 1 => ((j / 5 + row) % n) as i32,
+                            2 | 3 => ((j / 5 + 42 + row) % n) as i32,
+                            _ => -1,
+                        };
+                    }
+                }
+                3 => {
+                    idx[base] = (n - 1 - (row % 7)) as i32;
+                }
+                _ => {
+                    // Keyless row (all -1).
+                }
+            }
+        }
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+        let got_arr = call_mla_prefill_nax(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale)
+            .expect("expected NAX prefill kernel");
+        let got = read(&got_arr);
+        let want = read(
+            &gather_rows_reference(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale).unwrap(),
+        );
+        assert_eq!(got.len(), want.len());
+
+        let mut max_abs = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        let mut worst = (0usize, 0.0f32, 0.0f32);
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                g.is_finite(),
+                "non-finite output for S={s} H={h} kmax={kmax}"
+            );
+            let diff = (g - w).abs();
+            if diff > max_abs {
+                max_abs = diff;
+                worst = (i, g, w);
+            }
+            let df = f64::from(g - w);
+            let wf = f64::from(w);
+            sum_sq_err += df * df;
+            sum_sq_ref += wf * wf;
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref.max(1e-30)).sqrt();
+        eprintln!("[parity] S={s} H={h} kmax={kmax}: max_abs={max_abs:.3e} rel_l2={rel_l2:.3e}");
+        assert!(
+            max_abs <= 1e-5 && rel_l2 <= 1e-5,
+            "S={s} H={h} kmax={kmax}: max_abs={max_abs:e} rel_l2={rel_l2:e} at (row={}, head={}, col={}) got={} want={}",
+            worst.0 / (h * vw as usize),
+            (worst.0 / vw as usize) % h,
+            worst.0 % vw as usize,
+            worst.1,
+            worst.2,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_nax_keyless_nan_slot_zero_and_whole_vs_split_and_row_invariance() {
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        return;
+    }
+    let (d, vw) = (576usize, 512i64);
+    let scale = 0.0625f32;
+
+    // 1. Keyless rows + NaN/Inf in slot 0 + Whole vs Split bit-identity.
+    {
+        let (s, h, n, kmax) = (32usize, 32usize, 64usize, 512usize);
+        let mut r = Rng(239);
+        let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+        let mut keys_v = r.vec(n * d, 1.5);
+        let mut sinks_v = r.vec(h, 2.0);
+        sinks_v[0] = -20.0;
+        sinks_v[1] = 50.0;
+        sinks_v[2] = 0.0;
+        let sinks = arr(&sinks_v, &[h]);
+
+        let mut idx = vec![-1i32; s * kmax];
+        for row in 0..s {
+            if row % 3 != 0 {
+                for j in 0..37 {
+                    idx[row * kmax + j * 2] = (1 + (j * 5 + row) % (n - 1)) as i32;
+                }
+            }
+        }
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+        let run = |kv: &[f32]| {
+            let ka = arr(kv, &[n, d]).astype(DType::Float16).unwrap();
+            let k0 = ka.slice(&[0, 0], &[n as i64, 288]).unwrap();
+            let k1 = ka.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+            let whole = bits(
+                &call_mla_prefill_nax(&q, KeyRows::Whole(&ka), &ia, vw, &sinks, scale).unwrap(),
+            );
+            let split = bits(
+                &call_mla_prefill_nax(&q, KeyRows::Split(&k0, &k1), &ia, vw, &sinks, scale)
+                    .unwrap(),
+            );
+            (whole, split)
+        };
+
+        keys_v[..d].fill(0.0);
+        let (want_whole, want_split) = run(&keys_v);
+        assert_eq!(want_whole, want_split);
+
+        for (c, slot_val) in keys_v[..d].iter_mut().enumerate() {
+            *slot_val = match c % 3 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                _ => f32::NEG_INFINITY,
+            };
+        }
+        let (got_whole, got_split) = run(&keys_v);
+        assert_eq!(got_whole, want_whole);
+        assert_eq!(got_split, want_split);
+
+        let per_row = h * vw as usize;
+        let zero_bits = 0.0f32.to_bits();
+        for row in (0..s).step_by(3) {
+            assert!(
+                got_whole[row * per_row..(row + 1) * per_row]
+                    .iter()
+                    .all(|&b| b == zero_bits),
+                "Whole keyless row {row} must be exact 0.0f"
+            );
+            assert!(
+                got_split[row * per_row..(row + 1) * per_row]
+                    .iter()
+                    .all(|&b| b == zero_bits),
+                "Split keyless row {row} must be exact 0.0f"
+            );
+        }
+    }
+
+    // 2. Whole vs Split bit-identity and strict row invariance for both H=32 and H=64.
+    for (h, kmax, seed) in [(32usize, 2048usize, 241u64), (64usize, 512usize, 251u64)] {
+        let (max_s, n) = (64usize, kmax + 11);
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(max_s * h * d, 1.5), &[max_s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+        let idx: Vec<i32> = (0..max_s * kmax)
+            .map(|i| {
+                let (row, j) = (i / kmax, i % kmax);
+                if (j + row) % 13 == 0 {
+                    -1
+                } else {
+                    ((j * 3 + row * 17) % n) as i32
+                }
+            })
+            .collect();
+        let ia = MxArray::from_int32(&idx, &[max_s as i64, kmax as i64]).unwrap();
+
+        let whole_all =
+            bits(&call_mla_prefill_nax(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale).unwrap());
+        let split_all = bits(
+            &call_mla_prefill_nax(&q, KeyRows::Split(&k0, &k1), &ia, vw, &sinks, scale).unwrap(),
+        );
+        assert_eq!(
+            whole_all, split_all,
+            "H={h} kmax={kmax}: Whole vs Split bits differ"
+        );
+
+        let per = h * vw as usize;
+        for row in [0usize, 1, 15, 31, 63] {
+            let qs = q
+                .slice(&[row as i64, 0, 0], &[(row + 1) as i64, h as i64, d as i64])
+                .unwrap();
+            let is = ia
+                .slice(&[row as i64, 0], &[(row + 1) as i64, kmax as i64])
+                .unwrap();
+            let alone = bits(
+                &call_mla_prefill_nax(&qs, KeyRows::Whole(&keys), &is, vw, &sinks, scale).unwrap(),
+            );
+            assert_eq!(
+                &whole_all[row * per..(row + 1) * per],
+                &alone[..],
+                "H={h} kmax={kmax}: S={max_s} row {row} differs from S=1"
+            );
+        }
+
+        if std::env::var("MLX_HY4_MLA_PREFILL_NAX").as_deref() != Ok("0") {
+            let dispatched_whole = bits(
+                &gather_sink_attention_for(&q, &keys, &ia, vw, &sinks, scale, RowKind::Prefill)
+                    .unwrap(),
+            );
+            let dispatched_split = bits(
+                &gather_sink_attention_rows_for(
+                    &q,
+                    KeyRows::Split(&k0, &k1),
+                    &ia,
+                    vw,
+                    &sinks,
+                    scale,
+                    RowKind::Prefill,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                dispatched_whole, whole_all,
+                "H={h} kmax={kmax}: Prefill Whole dispatch did not match NAX kernel"
+            );
+            assert_eq!(
+                dispatched_split, split_all,
+                "H={h} kmax={kmax}: Prefill Split dispatch did not match NAX kernel"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_nax_bench_s2048() {
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        return;
+    }
+    let (d, vw) = (576usize, 512i64);
+    let scale = 0.0625f32;
+    let iters = 10usize;
+    for (label, s, h, kmax, split) in [
+        ("sliding_s2048_whole", 2048usize, 64usize, 512usize, false),
+        ("indexed_s2048_whole", 2048usize, 32usize, 2048usize, false),
+        ("indexed_s2048_split", 2048usize, 32usize, 2048usize, true),
+        ("decode_s1_sliding", 1usize, 64usize, 512usize, false),
+        ("decode_s1_indexed", 1usize, 32usize, 2048usize, false),
+    ] {
+        let n = s + kmax;
+        let q = MxArray::zeros(&[s as i64, h as i64, d as i64], Some(DType::Float32)).unwrap();
+        let keys = MxArray::zeros(&[n as i64, d as i64], Some(DType::Float16)).unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = MxArray::zeros(&[h as i64], Some(DType::Float32)).unwrap();
+        let idx_v: Vec<i32> = (0..s * kmax)
+            .map(|i| ((i / kmax) + (i % kmax)) as i32 % n as i32)
+            .collect();
+        let ia = MxArray::from_int32(&idx_v, &[s as i64, kmax as i64]).unwrap();
+        q.eval();
+        keys.eval();
+        k0.eval();
+        k1.eval();
+        sinks.eval();
+        ia.eval();
+
+        let kr = if split {
+            KeyRows::Split(&k0, &k1)
+        } else {
+            KeyRows::Whole(&keys)
+        };
+        // Warmup
+        let w = call_mla_prefill_nax(&q, kr, &ia, vw, &sinks, scale).unwrap();
+        w.eval();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let o = call_mla_prefill_nax(&q, kr, &ia, vw, &sinks, scale).unwrap();
+            o.eval();
+        }
+        let nax_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // Total FLOPs = 2 * S * H * KMAX * (D_K + D_V)
+        let flops = 2.0 * (s as f64) * (h as f64) * (kmax as f64) * ((d as f64) + (vw as f64));
+        let tflops = flops / (nax_ms * 1e-3) / 1e12;
+
+        // Also time scalar/split-K for S=1 comparison
+        let mut scalar_ms = 0.0;
+        if s == 1 {
+            let sw =
+                super::super::sparse::gather_sink_attention_rows(&q, kr, &ia, vw, &sinks, scale)
+                    .unwrap();
+            sw.eval();
+            let ts = std::time::Instant::now();
+            for _ in 0..iters {
+                let o = super::super::sparse::gather_sink_attention_rows(
+                    &q, kr, &ia, vw, &sinks, scale,
+                )
+                .unwrap();
+                o.eval();
+            }
+            scalar_ms = ts.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        }
+        eprintln!(
+            "[bench] {label}: nax={nax_ms:.3} ms ({tflops:.2} TFLOPS){}",
+            if s == 1 {
+                format!(", scalar_splitk={scalar_ms:.3} ms")
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    // Check window_rows + from_int32 overhead for S=2048, window=512.
+    let tw0 = std::time::Instant::now();
+    for _ in 0..iters {
+        let rows = window_rows(2048, 2048, 1536, 512);
+        let arr_idx = MxArray::from_int32(&rows, &[2048, 512]).unwrap();
+        arr_idx.eval();
+    }
+    let wr_ms = tw0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    eprintln!("[bench] window_rows_s2048_w512 (cpu+upload): {wr_ms:.3} ms");
 }
