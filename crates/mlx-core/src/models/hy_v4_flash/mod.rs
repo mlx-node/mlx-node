@@ -14,6 +14,7 @@ pub mod f8;
 pub mod finalize;
 pub mod header;
 pub mod indexer;
+pub(crate) mod kq_slot;
 pub mod ladder;
 pub mod model;
 pub mod moe;

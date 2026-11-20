@@ -7,6 +7,7 @@ use super::*;
 use crate::array::alloc::SendPtr;
 use crate::models::hy_v4_flash::scan::Scan;
 use crate::moe_stream::io::{AlignedBuf, ShardSet};
+use crate::utils::gguf_cpu_repack::cpu_kquant_band_into;
 use crate::utils::gguf_gpu::RepackDst;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantRepacker, KQuantScales, repack_kquant};
 
@@ -553,11 +554,12 @@ fn repack_sink_failures_fail_the_ticket() {
 
 type RepackFnArc = crate::moe_stream::io::RepackFn;
 
-/// Slot writes (direct and through the IO pool) == the same experts of a
+/// Slot writes (direct and through the IO pool in row bands: one band, the
+/// default bands, uneven bands, one row per band) == the same experts of a
 /// whole-tensor `KQuantRepacker`, Q4_K and Q6_K, into slots in another order.
 #[test]
 fn slot_repack_equals_whole_tensor_repacker() {
-    let (n, rows, k) = (5usize, 64usize, 512usize);
+    let (n, rows, k) = (5usize, 67usize, 512usize);
     for (i, ty) in [GgufTensorType::Q4K, GgufTensorType::Q6K]
         .into_iter()
         .enumerate()
@@ -586,27 +588,46 @@ fn slot_repack_equals_whole_tensor_repacker() {
         }
         assert!(d.write(&loc.info, 3, &payload[..per]).is_err());
         assert!(d.write(&loc.info, 0, &payload[..per - 1]).is_err());
+        let row = format.row_bytes(k);
+        assert!(
+            d.write_rows(&loc.info, 0, rows - 1, 2, &payload[..2 * row])
+                .is_err()
+        );
+        assert!(d.write_rows(&loc.info, 0, 0, 0, &[]).is_err());
         let dir = Temp::new();
         let path = dir.file(&file);
         let pool = pool_over(&path, 3);
-        let mut pooled = Host::new(geo, picks.len());
-        let p = pooled.dst();
-        let reads = picks
-            .iter()
-            .enumerate()
-            .map(|(slot, &e)| p.read(&loc, e, slot).unwrap())
-            .collect();
-        // SAFETY: distinct slots of `pooled`, alive until the wait returns.
-        unsafe { pool.submit(reads, Priority::High) }
-            .unwrap()
-            .wait()
-            .unwrap();
-        assert!(p.read(&loc, 5, 0).is_err());
-        assert!(p.read(&loc, 0, 3).is_err());
-        for (slot, &e) in picks.iter().enumerate() {
-            let want = expert_of(&whole, geo, e as usize);
-            assert_eq!(direct.slot(slot), want, "{ty:?} direct slot {slot}");
-            assert_eq!(pooled.slot(slot), want, "{ty:?} pooled slot {slot}");
+        let row = row as u64;
+        for (band, want_bands) in [
+            (per as u64, 1),
+            (BAND_BYTES, 1),
+            (7 * row + 5, 10),
+            (row, rows),
+            (1, rows),
+        ] {
+            let mut pooled = Host::new(geo, picks.len());
+            let p = pooled.dst();
+            let reads: Vec<Read> = picks
+                .iter()
+                .enumerate()
+                .flat_map(|(slot, &e)| p.reads_banded(&loc, e, slot, band).unwrap())
+                .collect();
+            assert_eq!(reads.len(), picks.len() * want_bands, "band {band}");
+            let covered: u64 = reads.iter().map(|r| r.extent.len).sum();
+            assert_eq!(covered, (picks.len() * per) as u64);
+            // SAFETY: distinct rows of distinct slots of `pooled`, alive until
+            // the wait returns.
+            unsafe { pool.submit(reads, Priority::High) }
+                .unwrap()
+                .wait()
+                .unwrap();
+            for (slot, &e) in picks.iter().enumerate() {
+                let want = expert_of(&whole, geo, e as usize);
+                assert_eq!(direct.slot(slot), want, "{ty:?} direct slot {slot}");
+                assert_eq!(pooled.slot(slot), want, "{ty:?} band {band} slot {slot}");
+            }
+            assert!(p.reads_banded(&loc, 5, 0, band).is_err());
+            assert!(p.reads_banded(&loc, 0, 3, band).is_err());
         }
     }
 }
@@ -779,7 +800,7 @@ fn real_expert_repack_equals_whole_tensor_repacker() {
         let reads = picks
             .iter()
             .enumerate()
-            .map(|(i, &e)| dst.read(&loc, e, picks.len() - 1 - i).unwrap())
+            .flat_map(|(i, &e)| dst.reads(&loc, e, picks.len() - 1 - i).unwrap())
             .collect();
         // SAFETY: distinct slots of `host`, alive until the wait returns.
         unsafe { pool.submit(reads, Priority::High) }

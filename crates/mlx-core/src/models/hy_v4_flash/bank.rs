@@ -5,8 +5,9 @@
 //! `[slots, rows, cols]`. Slots `0..L * n_experts` are `L` staging layers
 //! (class-local layer `l` stages expert `e` in `(l % L) * n_experts + e`);
 //! the rest are the class's cache ([`Cache`], class-local layer ids). A miss
-//! is read by the IO pool and repacked on the reader thread with
-//! `cpu_kquant_band_into`, so a slot holds the bytes the whole-file loader
+//! is read by the IO pool in row bands of about [`BAND_BYTES`] per
+//! projection, each repacked on its reader thread by `kq_slot` (the bytes of
+//! `cpu_kquant_band_into`), so a slot holds the bytes the whole-file loader
 //! makes. A staging tag is cleared before a refill and set only after every
 //! read of the step is in; `prepare` returns only when no read it queued is
 //! in flight.
@@ -22,6 +23,7 @@ use std::time::Instant;
 use napi::{Error, Result};
 
 use super::config::MoeConfig;
+use super::kq_slot;
 use super::scan::{ExpertClass, ExpertLayer, Located};
 use crate::array::alloc::{DstPtrs, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
@@ -29,7 +31,6 @@ use crate::array::{DType, MxArray};
 use crate::moe_stream::cache::{Cache, Source};
 use crate::moe_stream::io::{Extent, IoPool, IoStats, Priority, Read};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
-use crate::utils::gguf_cpu_repack::cpu_kquant_band_into;
 use crate::utils::gguf_kquant::KQuantFormat;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -39,6 +40,11 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// GGUF bytes one read of a projection's row band aims at: a 1536 x 1536
+/// Q4_K projection reads as 3 bands, Q6_K as 4, so the reader threads
+/// share one expert.
+pub const BAND_BYTES: u64 = 512 << 10;
 
 /// The streamed classes, in bank index order.
 pub const CLASSES: [ExpertClass; 2] = [ExpertClass::Q6kDown, ExpertClass::Q4kDown];
@@ -521,7 +527,21 @@ impl SlotDst {
     }
 
     /// Repacks one expert's GGUF blocks of `info` into `slot`.
+    #[cfg(test)]
     pub(crate) fn write(&self, info: &GgufTensorInfo, slot: usize, blocks: &[u8]) -> Result<()> {
+        self.write_rows(info, slot, 0, self.rows, blocks)
+    }
+
+    /// Repacks rows `[r0, r0 + rows)` of one expert (exactly their GGUF
+    /// blocks) into those rows of `slot`.
+    pub(crate) fn write_rows(
+        &self,
+        info: &GgufTensorInfo,
+        slot: usize,
+        r0: usize,
+        rows: usize,
+        blocks: &[u8],
+    ) -> Result<()> {
         if slot >= self.slots {
             return Err(bad(format!("slot {slot} of {}", self.slots)));
         }
@@ -533,19 +553,36 @@ impl SlotDst {
                 self.format.mlx_mode()
             )));
         }
-        if blocks.len() as u64 != self.file_bytes() {
+        let row_bytes = self.format.row_bytes(self.dst.k);
+        if rows == 0 || r0.checked_add(rows).is_none_or(|end| end > self.rows) {
             return Err(bad(format!(
-                "'{}': {} bytes for a slot of {}",
-                info.name,
-                blocks.len(),
-                self.file_bytes()
+                "'{}': rows {r0}+{rows} of a slot of {}",
+                info.name, self.rows
             )));
         }
-        cpu_kquant_band_into(info, blocks, slot * self.rows, self.rows, &self.dst)
+        if blocks.len() != rows * row_bytes {
+            return Err(bad(format!(
+                "'{}': {} bytes for {rows} rows of {row_bytes}",
+                info.name,
+                blocks.len()
+            )));
+        }
+        kq_slot::rows_into(info, blocks, slot * self.rows + r0, rows, &self.dst)
     }
 
-    /// Expert `e` of `t`, read and repacked into `slot` on a reader thread.
-    pub(crate) fn read(&self, t: &Arc<Located>, e: u32, slot: usize) -> Result<Read> {
+    /// Expert `e` of `t`, read and repacked into `slot` in row bands of
+    /// about [`BAND_BYTES`], each on a reader thread.
+    pub(crate) fn reads(&self, t: &Arc<Located>, e: u32, slot: usize) -> Result<Vec<Read>> {
+        self.reads_banded(t, e, slot, BAND_BYTES)
+    }
+
+    pub(crate) fn reads_banded(
+        &self,
+        t: &Arc<Located>,
+        e: u32,
+        slot: usize,
+        band_bytes: u64,
+    ) -> Result<Vec<Read>> {
         if slot >= self.slots {
             return Err(bad(format!("slot {slot} of {}", self.slots)));
         }
@@ -558,11 +595,27 @@ impl SlotDst {
                 self.file_bytes()
             )));
         }
-        let (dst, t) = (*self, Arc::clone(t));
-        Ok(Read::repack(
-            ext,
-            Arc::new(move |b: &[u8]| dst.write(&t.info, slot, b)),
-        ))
+        let row_bytes = self.format.row_bytes(self.dst.k) as u64;
+        let bands = ext
+            .len
+            .div_ceil(band_bytes.max(1))
+            .clamp(1, self.rows as u64) as usize;
+        let per = self.rows.div_ceil(bands);
+        let mut out = Vec::with_capacity(bands);
+        for r0 in (0..self.rows).step_by(per) {
+            let rows = per.min(self.rows - r0);
+            let band = Extent {
+                shard: ext.shard,
+                offset: ext.offset + r0 as u64 * row_bytes,
+                len: rows as u64 * row_bytes,
+            };
+            let (dst, t) = (*self, Arc::clone(t));
+            out.push(Read::repack(
+                band,
+                Arc::new(move |b: &[u8]| dst.write_rows(&t.info, slot, r0, rows, b)),
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -746,7 +799,7 @@ struct ClassBank {
 impl ClassBank {
     fn reads(&self, layer: usize, plan: &Plan) -> Result<Vec<Read>> {
         let base = self.dir.base() as usize;
-        let mut out = Vec::with_capacity(plan.reads() * 3);
+        let mut out = Vec::with_capacity(plan.reads() * 12);
         let targets = plan
             .staging
             .iter()
@@ -754,7 +807,7 @@ impl ClassBank {
             .chain(plan.victims.iter().map(|&(e, c)| (e, base + c as usize)));
         for (e, slot) in targets {
             for (t, p) in self.tensors[layer].iter().zip(&self.proj) {
-                out.push(p.dst.read(t, e, slot)?);
+                out.extend(p.dst.reads(t, e, slot)?);
             }
         }
         Ok(out)
