@@ -37,6 +37,11 @@ pub trait EvalBackend {
 
     /// Format of the K/V cache [`Self::teacher_forced_hidden`] writes.
     fn kv_format(&self) -> crate::transformer::KvFormat;
+
+    /// Paged attention launches so far, `[bf16 queries, int8 queries]`.
+    fn attention_query_launches(&self) -> [u64; 2] {
+        [0, 0]
+    }
 }
 
 /// Run one eval request against `backend`.
@@ -115,7 +120,13 @@ pub fn run<B: EvalBackend>(backend: &mut B, request: EvalRequest) -> Result<Eval
             cache_dir,
             logit_chunk,
             identity,
+            depth_edges,
         } => {
+            if depth_edges.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(Error::from_reason(format!(
+                    "eval depth edges must increase strictly, got {depth_edges:?}"
+                )));
+            }
             let meta = read_meta(&cache_dir)?;
             identity.require_match(&meta.identity)?;
             if meta.vocab_size != backend.vocab_size() {
@@ -128,6 +139,7 @@ pub fn run<B: EvalBackend>(backend: &mut B, request: EvalRequest) -> Result<Eval
             }
 
             let mut totals = ScoreTotals::default();
+            let mut buckets = vec![ScoreTotals::default(); depth_edges.len() + 1];
             for index in 0..meta.rows {
                 let row = read_row(&cache_dir, index)?;
                 let scored = row.tokens.len() as i64 - 1;
@@ -142,14 +154,24 @@ pub fn run<B: EvalBackend>(backend: &mut B, request: EvalRequest) -> Result<Eval
                 let targets = MxArray::from_uint32(&row.tokens[1..], &[scored])?;
                 let chunks =
                     fold_position_chunks(backend, &hidden, logit_chunk, |start, end, logits| {
-                        score_chunk(
-                            logits,
-                            &targets.slice_axis(0, start as i64, end as i64)?,
-                            &row.logits.slice(start as i64, end as i64)?,
-                        )
+                        depth_pieces(&depth_edges, start, end)
+                            .map(|(bucket, from, to)| {
+                                let piece = score_chunk(
+                                    &logits.slice_axis(
+                                        0,
+                                        (from - start) as i64,
+                                        (to - start) as i64,
+                                    )?,
+                                    &targets.slice_axis(0, from as i64, to as i64)?,
+                                    &row.logits.slice(from as i64, to as i64)?,
+                                )?;
+                                Ok((bucket, piece))
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })?;
-                for chunk in &chunks {
-                    totals.add(chunk);
+                for (bucket, piece) in chunks.iter().flatten() {
+                    totals.add(piece);
+                    buckets[*bucket].add(piece);
                 }
                 crate::array::synchronize_and_clear_cache();
             }
@@ -183,15 +205,52 @@ pub fn run<B: EvalBackend>(backend: &mut B, request: EvalRequest) -> Result<Eval
                 )));
             }
 
-            Ok(EvalOutcome::Scored(totals.into_report(
-                meta.rows,
-                meta.top_k,
-                meta.teacher_path,
-                meta.teacher_quantized,
-                backend.kv_format(),
-            )?))
+            Ok(EvalOutcome::Scored(
+                totals.into_report(
+                    meta.rows,
+                    meta.top_k,
+                    meta.teacher_path,
+                    meta.teacher_quantized,
+                    backend.kv_format(),
+                    backend.attention_query_launches(),
+                    buckets
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, bucket)| {
+                            let from = if index == 0 {
+                                0
+                            } else {
+                                depth_edges[index - 1]
+                            };
+                            bucket.into_depth_bucket(from, depth_edges.get(index).copied())
+                        })
+                        .collect(),
+                )?,
+            ))
         }
     }
+}
+
+/// Split the positions `[start, end)` at `edges` into `(bucket, from, to)`
+/// pieces, bucket `i` covering `[edges[i - 1], edges[i])`.
+fn depth_pieces(
+    edges: &[u32],
+    start: usize,
+    end: usize,
+) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let mut from = start;
+    std::iter::from_fn(move || {
+        if from >= end {
+            return None;
+        }
+        let bucket = edges.partition_point(|&edge| edge as usize <= from);
+        let to = edges
+            .get(bucket)
+            .map_or(end, |&edge| (edge as usize).min(end));
+        let piece = (bucket, from, to);
+        from = to;
+        Some(piece)
+    })
 }
 
 /// Capture one ALREADY-tokenized sequence: prefill it, fold the head over
@@ -515,6 +574,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("b"),
                 logit_chunk: 8,
+                depth_edges: Vec::new(),
             },
         );
         let Err(err) = outcome else {
@@ -533,6 +593,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk: 8,
+                depth_edges: Vec::new(),
             },
         )
         .expect("the teacher's own identity must still score");
@@ -588,6 +649,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk: 8,
+                depth_edges: Vec::new(),
             },
         );
         let Err(err) = outcome else {
@@ -646,6 +708,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk: 8,
+                depth_edges: Vec::new(),
             },
         )
         .unwrap();
@@ -699,6 +762,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk: 8,
+                depth_edges: Vec::new(),
             },
         )
         .unwrap();
@@ -741,6 +805,7 @@ mod tests {
                 cache_dir: dir.to_path_buf(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk,
+                depth_edges: Vec::new(),
             },
         )
         .unwrap()
@@ -778,6 +843,100 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Each depth bucket holds exactly the positions in `[from, to)`, whatever
+    /// the head chunking. The expected sums come from scoring every position
+    /// on its own and bucketing it here; the fixture's NLL differs by position,
+    /// so a position in the wrong bucket moves a mean.
+    /// Mutation: `depth_pieces` ends a piece one past its edge (the edge
+    /// position stays in the bucket below) → red.
+    #[test]
+    fn depth_buckets_hold_the_positions_of_their_range() {
+        let dir = scratch("depth");
+        let mut backend = FixtureBackend::new();
+        capture(&mut backend, &dir, 3);
+        let edges = vec![2u32, 5];
+
+        let mut expected = [ScoreTotals::default(); 3];
+        for index in 0..2 {
+            let row = read_row(&dir, index).unwrap();
+            let hidden = backend.teacher_forced_hidden(&row.tokens).unwrap();
+            let positions = row.tokens.len() - 1;
+            for p in 0..positions {
+                let logits = hidden
+                    .slice_axis(1, p as i64, p as i64 + 1)
+                    .unwrap()
+                    .reshape(&[1, FIXTURE_VOCAB])
+                    .unwrap();
+                let target = MxArray::from_uint32(&row.tokens[p + 1..p + 2], &[1]).unwrap();
+                let one = score_chunk(
+                    &logits,
+                    &target,
+                    &row.logits.slice(p as i64, p as i64 + 1).unwrap(),
+                )
+                .unwrap();
+                let bucket = match p {
+                    0 | 1 => 0,
+                    2..=4 => 1,
+                    _ => 2,
+                };
+                expected[bucket].add(&one);
+            }
+        }
+
+        for logit_chunk in [1, 4, 64] {
+            let report = match run(
+                &mut backend,
+                EvalRequest::Score {
+                    cache_dir: dir.clone(),
+                    identity: EvalIdentity::fixture("a"),
+                    logit_chunk,
+                    depth_edges: edges.clone(),
+                },
+            )
+            .unwrap()
+            {
+                EvalOutcome::Scored(report) => report,
+                EvalOutcome::Captured { .. } => panic!("score returned a capture count"),
+            };
+            let ranges: Vec<(u32, Option<u32>)> =
+                report.depth.iter().map(|b| (b.from, b.to)).collect();
+            assert_eq!(ranges, vec![(0, Some(2)), (2, Some(5)), (5, None)]);
+            let counts: Vec<u32> = report.depth.iter().map(|b| b.positions).collect();
+            assert_eq!(counts, vec![4, 4, 1], "chunk {logit_chunk}");
+            for (got, want) in report.depth.iter().zip(expected) {
+                let want = want.into_depth_bucket(got.from, got.to);
+                assert!(
+                    (got.mean_nll - want.mean_nll).abs() < 1e-5
+                        && (got.teacher_mean_nll - want.teacher_mean_nll).abs() < 1e-5,
+                    "chunk {logit_chunk} bucket [{}, {:?}): got {} / {}, want {} / {}",
+                    got.from,
+                    got.to,
+                    got.mean_nll,
+                    got.teacher_mean_nll,
+                    want.mean_nll,
+                    want.teacher_mean_nll
+                );
+            }
+            assert_eq!(report.positions, 9);
+        }
+
+        let refused = run(
+            &mut backend,
+            EvalRequest::Score {
+                cache_dir: dir.clone(),
+                identity: EvalIdentity::fixture("a"),
+                logit_chunk: 4,
+                depth_edges: vec![5, 5],
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "edges that do not increase must be refused"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The report names the K/V format the candidate prefilled with.
     /// Mutation: `into_report` writes `"bf16"` → red.
     #[test]
@@ -807,6 +966,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 identity: EvalIdentity::fixture("a"),
                 logit_chunk: 3,
+                depth_edges: Vec::new(),
             },
         );
         let reason = match refused {

@@ -274,6 +274,12 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsMaxMemory?: true;
   /**
+   * Native `load` plans its expert store from the memory live in the process
+   * and on the host, so a switch to this family frees an idle old model and
+   * waits for it before the load reads that memory.
+   */
+  readonly loadsAlone?: true;
+  /**
    * Native `load` accepts `LoadModelOptions.maxContextTokens` (`--max-context`):
    * every turn holds at most that many tokens, and past the native window the
    * target's RoPE takes YaRN (Splash `yarnContextTokens`).
@@ -285,6 +291,13 @@ interface ModelFamilyDataBase {
    * share of each cut's time (Splash `Scheduler::planPrefill`).
    */
   readonly acceptsDecodeShare?: true;
+  /**
+   * Native `load` accepts `LoadModelOptions.activations` (`--activations`):
+   * with `'auto'` its paged attention over an int8 pool scores int8 queries
+   * where that is faster (Splash `Int8Activations`); unset is `'auto'` for
+   * `qwen3_5`, `'bf16'` for `qwen3_5_moe`.
+   */
+  readonly acceptsActivations?: true;
   /**
    * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
    * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
@@ -479,6 +492,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
     acceptsDecodeShare: true,
+    acceptsActivations: true,
     acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
@@ -501,6 +515,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
     acceptsDecodeShare: true,
+    acceptsActivations: true,
     acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
@@ -515,8 +530,10 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
     acceptsAuxiliaryModel: true,
+    acceptsDraftModel: true,
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
+    loadsAlone: true,
     acceptsMaxContext: true,
     acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },

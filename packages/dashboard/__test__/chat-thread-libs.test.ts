@@ -7,6 +7,7 @@ import {
   continuingTurn,
   conversationMarkdown,
   engineNote,
+  engineWait,
   formatElapsed,
   liveOutcome,
   fullLimit,
@@ -145,6 +146,120 @@ describe('outcomes', () => {
     expect(pendingRow({ ...base, wait: 'model', full: 1 })).toEqual({ kind: 'load', modelId: 'qwen-a' });
     expect(pendingRow({ ...base, quiet: true })).toEqual(label(CHAT.pendingWaiting));
     expect(pendingRow(base)).toEqual(label(CHAT.pendingThinking, 'think'));
+  });
+
+  it('wait states: this conversation queued, reading, generating; the busy model; then Working or Waiting', () => {
+    const base = {
+      creating: false,
+      phase: 'running' as 'starting' | 'running' | 'cancelling' | null,
+      wait: null as 'model' | null,
+      model: 'qwen-a',
+      loading: null as { modelId: string; startedAt: number } | null,
+      inference: 'ready' as const,
+      quiet: false,
+      full: null as number | null,
+      work: true,
+    };
+    const label = (text: string, orb = 'hold') => ({ kind: 'label', text, orb });
+    const ours = (phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null, done = 0, total = 0) => ({
+      kind: 'ours' as const,
+      phase,
+      done,
+      total,
+    });
+    expect(pendingRow({ ...base, engine: ours('queued') })).toEqual(label(CHAT.pendingQueued));
+    expect(pendingRow({ ...base, engine: ours('slot'), quiet: true })).toEqual(label(CHAT.pendingQueued));
+    expect(pendingRow({ ...base, engine: ours('queued'), full: 1 })).toEqual(
+      label(fill(CHAT.pendingQueuedOne, { model: 'qwen-a' })),
+    );
+    expect(pendingRow({ ...base, engine: ours('prefill', 69_300, 121_300), quiet: true })).toEqual({
+      kind: 'label',
+      text: fill(CHAT.pendingReadingOf, { done: '69.3K', total: '121.3K' }),
+      orb: 'think',
+      progress: { done: 69_300, total: 121_300 },
+    });
+    expect(pendingRow({ ...base, engine: ours('prepare') })).toEqual(label(CHAT.pendingReading, 'think'));
+    expect(pendingRow({ ...base, engine: ours('prefill', 0, 0) })).toEqual(label(CHAT.pendingReading, 'think'));
+    expect(pendingRow({ ...base, engine: ours('decode'), quiet: true })).toEqual(label(CHAT.pendingThinking, 'think'));
+    expect(pendingRow({ ...base, engine: ours(null) })).toEqual(label(CHAT.pendingThinking, 'think'));
+    expect(pendingRow({ ...base, engine: ours('decode'), phase: 'cancelling' })).toEqual(label(CHAT.pendingStopping));
+    expect(pendingRow({ ...base, engine: ours('decode'), creating: true })).toEqual(label(CHAT.pendingStarting));
+    const swap = { modelId: 'qwen-b', startedAt: 1 };
+    expect(pendingRow({ ...base, engine: ours('decode'), loading: swap })).toEqual(
+      label(CHAT.pendingThinking, 'think'),
+    );
+    const busy = { kind: 'model' as const, reading: { done: 5_000, total: 20_000 } };
+    expect(pendingRow({ ...base, engine: busy, quiet: true })).toEqual({
+      kind: 'label',
+      text: fill(CHAT.pendingBusyReading, { done: '5,000', total: '20K' }),
+      orb: 'hold',
+      progress: { done: 5_000, total: 20_000 },
+    });
+    expect(pendingRow({ ...base, engine: { kind: 'model', reading: null } })).toEqual(label(CHAT.pendingBusy));
+    expect(pendingRow({ ...base, engine: busy, full: 1 })).toEqual(
+      label(fill(CHAT.pendingQueuedOne, { model: 'qwen-a' })),
+    );
+    expect(pendingRow({ ...base, engine: busy, loading: swap })).toEqual({ kind: 'load', modelId: 'qwen-b' });
+    expect(pendingRow({ ...base, engine: busy, phase: 'starting' })).toEqual(label(CHAT.pendingStarting));
+    expect(pendingRow({ ...base, engine: null })).toEqual(label(CHAT.pendingWorking, 'think'));
+    expect(pendingRow({ ...base, engine: null, quiet: true })).toEqual(label(CHAT.pendingWaiting));
+    expect(pendingRow({ ...base, work: false })).toEqual(label(CHAT.pendingThinking, 'think'));
+  });
+
+  it("the engine's requests: this conversation's newest by its session, else the model's words, else nothing", () => {
+    const request = (
+      session: string | null,
+      startedAt: number,
+      phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null,
+      prefill: [number, number] | null = null,
+      modelId = 'qwen-a',
+    ) => ({
+      session,
+      modelId,
+      phase,
+      startedAt,
+      prefillDone: prefill?.[0] ?? null,
+      prefillTotal: prefill?.[1] ?? null,
+      generated: null,
+    });
+    const at = (requests: ReturnType<typeof request>[], since: number | null = 1_000, hidden = 0) =>
+      engineWait({ requests, session: 'acp-ours', model: 'qwen-a', since, hidden });
+    const other = request('acp-other', 500, 'prefill', [69_300, 121_300]);
+    expect(at([other, request('acp-ours', 900, 'queued')])).toEqual({
+      kind: 'ours',
+      phase: 'queued',
+      done: null,
+      total: null,
+    });
+    expect(at([request('acp-ours', 400, 'decode'), request('acp-ours', 1_200, 'prefill', [10, 40])])).toEqual({
+      kind: 'ours',
+      phase: 'prefill',
+      done: 10,
+      total: 40,
+    });
+    expect(at([request('acp-ours', 1_200, 'decode', null, 'qwen-b')])).toBeNull();
+    expect(at([other])).toBeNull();
+    expect(at([other], 1_000, 1)).toEqual({ kind: 'model', reading: { done: 69_300, total: 121_300 } });
+    expect(at([request(null, 1_000, 'decode')])).toEqual({ kind: 'model', reading: null });
+    expect(at([request(null, 999, 'decode')])).toBeNull();
+    expect(at([request(null, 1_500, 'queued'), other])).toEqual({
+      kind: 'model',
+      reading: { done: 69_300, total: 121_300 },
+    });
+    expect(at([request(null, 1_500, 'decode')], null)).toBeNull();
+    expect(at([request(null, 500, 'decode')], 1_000, 1)).toEqual({ kind: 'model', reading: null });
+    expect(at([request(null, 1_500, 'decode', null, 'qwen-b')], 1_000, 1)).toBeNull();
+    expect(at([], 1_000, 1)).toBeNull();
+    expect(at([request(null, 2_000, 'prefill', [50, 10])])).toEqual({
+      kind: 'model',
+      reading: { done: 10, total: 10 },
+    });
+    expect(
+      engineWait({ requests: [request(null, 2_000, 'decode')], session: null, model: null, since: 0, hidden: 1 }),
+    ).toBeNull();
+    expect(
+      engineWait({ requests: [request(null, 2_000, 'queued')], session: null, model: 'qwen-a', since: 0, hidden: 0 }),
+    ).toEqual({ kind: 'model', reading: null });
   });
 
   it('a model is full only when its running answers fill its limit and a request waits', () => {

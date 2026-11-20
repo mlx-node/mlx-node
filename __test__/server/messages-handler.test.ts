@@ -1,4 +1,5 @@
-import type { ServerResponse } from 'node:http';
+import { EventEmitter } from 'node:events';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from '@mlx-node/core';
 import { ChatSession, isContextCapacityError, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
@@ -8019,5 +8020,21 @@ describe('handleCreateMessage trace metadata', () => {
     });
     const meta = config.turnMeta as { queueMs: number; preDispatchMs: number };
     expect(meta.preDispatchMs).toBeGreaterThanOrEqual(meta.queueMs);
+  });
+
+  it('stamps the session the agent named in x-grok-session-id, and none without the header', async () => {
+    const registry = new ModelRegistry();
+    const mockModel = createMockModel();
+    registry.register('test-model', mockModel);
+    const request = (headers: Record<string, string>): IncomingMessage =>
+      Object.assign(new EventEmitter(), { method: 'POST', url: '/v1/messages', headers }) as unknown as IncomingMessage;
+    const body = { model: 'test-model', messages: [{ role: 'user' as const, content: 'hi' }], max_tokens: 100 };
+    await handleCreateMessage(createMockRes().res, body, registry, request({ 'x-grok-session-id': 'acp-1' }));
+    await handleCreateMessage(createMockRes().res, body, registry, request({ host: 'localhost' }));
+    const calls = [
+      ...(mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mock.calls,
+      ...(mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>).mock.calls,
+    ] as Array<[unknown, { clientSession?: string }]>;
+    expect(calls.map(([, config]) => config.clientSession)).toEqual(['acp-1', undefined]);
   });
 });

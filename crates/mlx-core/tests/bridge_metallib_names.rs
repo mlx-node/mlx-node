@@ -137,27 +137,39 @@ fn every_splash_moe_kernel_builds_a_pipeline() {
     assert_eq!(c.built, if nax { 15 } else { 0 });
 }
 
-/// Split (int8 and bf16 pages) and reduce instances of the in-place paged
-/// prefill attention: groups {4, 6, 8, 16} x head dims {128, 256}.
-const PAGED_PREFILL_NAMES: i64 = 4 * 2 * 3;
+/// Split (int8 pages with bf16 or INT8 queries, bf16 pages) and reduce
+/// instances of the in-place paged prefill attention: groups {4, 6, 8, 16}
+/// x head dims {128, 256}; the decode's query codes, one per head dim; and
+/// the keys-token-major page's q8 and q8q splits (group 6, D 256).
+const PAGED_PREFILL_NAMES: i64 = 4 * 2 * 4 + 2 + 2;
+/// The INT8-query (`q8q`) splits and the query codes among them, built only
+/// on Apple10 and later.
+const PAGED_PREFILL_Q8Q_NAMES: i64 = 4 * 2 + 2 + 1;
 
 #[test]
 fn every_paged_prefill_kernel_is_in_the_metallib() {
     assert_names("paged_prefill", PAGED_PREFILL_NAMES);
 }
 
-/// Every paged prefill pipeline builds on every Apple GPU family. A hosted
-/// VM GPU builds none and prefills through the varlen kernel.
+/// Every paged prefill pipeline builds on every Apple GPU family, the q8q
+/// splits and the query codes on Apple10 and later (Splash: no Apple9 GPU scores INT8 queries).
+/// A hosted VM GPU builds none and prefills through the varlen kernel.
 #[test]
 fn every_paged_prefill_kernel_builds_a_pipeline() {
     let c = check("paged_prefill", true);
     assert!(c.report.is_empty(), "{}", c.report);
     // SAFETY: nullary predicate that catches internally.
     let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
+    // SAFETY: nullary FFI query.
+    let apple10 = unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= 17;
+    let expected = match (lacks, apple10) {
+        (true, _) => 0,
+        (false, true) => PAGED_PREFILL_NAMES,
+        (false, false) => PAGED_PREFILL_NAMES - PAGED_PREFILL_Q8Q_NAMES,
+    };
     assert_eq!(
-        c.built,
-        if lacks { 0 } else { PAGED_PREFILL_NAMES },
-        "pipelines built (no Apple GPU family: {lacks})"
+        c.built, expected,
+        "pipelines built (no Apple GPU family: {lacks}, Apple10: {apple10})"
     );
 }
 

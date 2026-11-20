@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use super::decoder::GroupLimit;
 use crate::array::MxArray;
 use crate::models::qwen3_5::dflash2_state::plan::planned_checkpoints;
 use crate::models::qwen3_5::dflash2_state::store::{
@@ -276,7 +277,9 @@ pub(super) struct PassPlan {
     pub(super) keys: Vec<Vec<u64>>,
 }
 
-/// What the store published, refused and dropped since load.
+/// What the store published, refused and dropped since load. A refusal
+/// counts one point (or one read-back from disk for room and live); a skip
+/// counts one turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Counters {
     pub(super) restored: u64,
@@ -292,6 +295,15 @@ pub(super) struct Counters {
     pub(super) refused_off_grid: u64,
     /// A load with the MTP head had no draft history of the cold run there.
     pub(super) refused_draft: u64,
+    /// A text turn whose request asked for no reuse: it plans no point.
+    pub(super) skipped_reuse_off: u64,
+    /// A turn that may publish planned no point: no block-aligned row past
+    /// its resume row before its last token, or a window that is not whole
+    /// KV blocks.
+    pub(super) skipped_no_points: u64,
+    /// A turn ended before its replay point was reached: a pass ran past
+    /// it, or the turn was cancelled, failed or reset first.
+    pub(super) missed_replay: u64,
     pub(super) dropped_kv: u64,
     pub(super) dropped_memory: u64,
 }
@@ -314,6 +326,8 @@ pub(super) struct Turn {
     pub(super) keys: Vec<Vec<u64>>,
     pub(super) points: Vec<Point>,
     pub(super) cursor: usize,
+    /// A pass ended at the replay point.
+    pub(super) reached_replay: bool,
     /// Every pass so far is the pass a cold prefill runs there.
     pub(super) canonical: bool,
     /// Blocks whose states this turn resumed from or published as its
@@ -344,10 +358,17 @@ impl Turn {
 
     /// The passes over `[from, to)`, grouped into the runs a layer-major
     /// group may hold: consecutive cold passes of exactly `grid` rows, the
-    /// last of a run possibly one of at least 256 rows, never past a group
-    /// cut ([`Turn::group_cuts`]). Every other pass is a run of its own.
-    pub(super) fn runs(&self, from: usize, to: usize, grid: usize) -> Vec<Vec<(usize, usize)>> {
-        let cuts = self.group_cuts(from, to);
+    /// last of a run possibly one of at least 256 rows, at most `limit`'s
+    /// windows, never past a group cut ([`Turn::group_cuts`]). Every other
+    /// pass is a run of its own.
+    pub(super) fn runs(
+        &self,
+        from: usize,
+        to: usize,
+        grid: usize,
+        limit: GroupLimit,
+    ) -> Vec<Vec<(usize, usize)>> {
+        let cuts = self.group_cuts(from, to, limit);
         let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
         let mut open = false;
         let mut at = from;
@@ -359,7 +380,10 @@ impl Turn {
                 Some(run) if open && fits => run.push((at, end)),
                 _ => runs.push(vec![(at, end)]),
             }
-            open = fits && rows == grid && !cuts.contains(&end);
+            open = fits
+                && rows == grid
+                && !cuts.contains(&end)
+                && runs.last().is_some_and(|run| run.len() < limit.per_group());
             at = end;
         }
         runs
@@ -382,14 +406,25 @@ impl Turn {
             .copied()
             .filter(|point| point.row == end)?;
         self.cursor += 1;
+        self.reached_replay |= !point.checkpoint;
         Some(point)
     }
 
-    /// The deepest checkpoint and the replay point inside `(start, end)`:
-    /// the rows a layer-major group over `[start, end)` ends at, so that a
-    /// group holds no captured cell of its own.
-    pub(super) fn group_cuts(&self, start: usize, end: usize) -> Vec<usize> {
+    /// The rows inside `(start, end)` a layer-major group over
+    /// `[start, end)` ends at, so that a group holds no captured cell of its
+    /// own: the deepest checkpoint and the replay point for one whole group;
+    /// every point for groups of a few windows, whose runs then end at the
+    /// same rows whatever range a call covers.
+    pub(super) fn group_cuts(&self, start: usize, end: usize, limit: GroupLimit) -> Vec<usize> {
         let inside = |point: &&Point| point.row > start && point.row < end;
+        if let GroupLimit::Windows(_) = limit {
+            return self
+                .points
+                .iter()
+                .filter(inside)
+                .map(|point| point.row)
+                .collect();
+        }
         let mut cuts: Vec<usize> = self
             .points
             .iter()
@@ -560,6 +595,9 @@ impl States {
     /// class (Splash `StateCache::unuse`). What it published stays.
     pub(super) fn end_turn(&mut self, seq: SeqId) {
         if let Some(turn) = self.turns.remove(&seq) {
+            if !turn.points.is_empty() && !turn.reached_replay {
+                self.counters.missed_replay += 1;
+            }
             for block in turn.uses {
                 self.store.end_use(block);
             }
@@ -850,15 +888,16 @@ mod tests {
             keys: Vec::new(),
             points: plan_points(0, 96, &ends, 32, 32),
             cursor: 0,
+            reached_replay: false,
             canonical: true,
             uses: Vec::new(),
             checkpoint: None,
             replay: None,
         };
-        assert_eq!(turn.group_cuts(0, 100), [64, 96]);
-        assert_eq!(turn.group_cuts(32, 96), [64]);
+        assert_eq!(turn.group_cuts(0, 100, GroupLimit::Whole), [64, 96]);
+        assert_eq!(turn.group_cuts(32, 96, GroupLimit::Whole), [64]);
         assert_eq!(
-            turn.runs(0, 100, 32),
+            turn.runs(0, 100, 32, GroupLimit::Whole),
             [vec![(0, 32), (32, 64)], vec![(64, 96)], vec![(96, 100)]]
         );
         assert_eq!(turn.next_end(40), Some(64));
@@ -882,5 +921,76 @@ mod tests {
             })
         );
         assert!(!turn.canonical);
+    }
+
+    /// Groups of at most four 1,024-row windows end at every point: with an
+    /// assistant opening at row 2,976 the passes shift off the 4,096 grid,
+    /// so the checkpoint planned at 4,096 sits at the pass end 5,024, inside
+    /// a four-window span that starts at 2,976. No capped run holds a point,
+    /// none holds more than four windows, and a run over part of the prompt
+    /// is a run over the whole. One whole group still cuts only at the
+    /// deepest checkpoint and the replay point.
+    /// MUTATION: capped runs cut only at the deepest checkpoint -> the run
+    /// from 2,976 holds the point at 5,024 -> red.
+    #[test]
+    fn capped_groups_end_at_every_point() {
+        let (len, boundaries) = (15_100, [2_976, 14_976]);
+        let ends = pass_ends(len, &boundaries, grid(1_024));
+        let replay = replay_row(&boundaries, &ends, len);
+        let turn = Turn {
+            salt: 0,
+            prompt_len: len,
+            resume: 0,
+            ends: ends.clone(),
+            lineage: Vec::new(),
+            chain: Vec::new(),
+            keys: Vec::new(),
+            points: plan_points(0, replay, &ends, 1_024, CHECKPOINT_INTERVAL),
+            cursor: 0,
+            reached_replay: false,
+            canonical: true,
+            uses: Vec::new(),
+            checkpoint: None,
+            replay: None,
+        };
+        let rows: Vec<usize> = turn.points.iter().map(|point| point.row).collect();
+        assert_eq!(rows, [5_024, 9_120, 13_216, 14_976]);
+        let capped = turn.runs(0, len, 1_024, GroupLimit::Windows(4));
+        assert_eq!(
+            capped
+                .iter()
+                .map(|run| (run[0].0, run[run.len() - 1].1, run.len()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 2_976, 3),
+                (2_976, 5_024, 2),
+                (5_024, 9_120, 4),
+                (9_120, 13_216, 4),
+                (13_216, 14_976, 2),
+                (14_976, 15_100, 1),
+            ]
+        );
+        for run in &capped {
+            let (start, end) = (run[0].0, run[run.len() - 1].1);
+            assert!(
+                rows.iter().all(|&row| row <= start || row >= end),
+                "a capped run holds a point: {run:?}"
+            );
+        }
+        let part = turn.runs(2_976, 13_216, 1_024, GroupLimit::Windows(4));
+        assert_eq!(part, capped[1..4]);
+        let whole = turn.runs(0, len, 1_024, GroupLimit::Whole);
+        assert_eq!(
+            whole
+                .iter()
+                .map(|run| (run[0].0, run[run.len() - 1].1))
+                .collect::<Vec<_>>(),
+            [
+                (0, 2_976),
+                (2_976, 13_216),
+                (13_216, 14_976),
+                (14_976, 15_100)
+            ]
+        );
     }
 }

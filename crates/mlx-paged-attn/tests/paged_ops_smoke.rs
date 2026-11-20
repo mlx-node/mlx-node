@@ -1917,6 +1917,7 @@ fn read_call(
                 heads as i32,
                 head_size as i32,
                 kv_dtype,
+                std::ptr::null_mut(),
             )
         } else {
             mlx_sys::mlx_paged_attention_forward(

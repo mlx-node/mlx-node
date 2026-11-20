@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import { Transcript, type TranscriptProps } from '../ui/src/components/transcript.js';
+import { formatClock } from '../ui/src/lib/format.js';
 import { LIVE_FRESH_MS, useFreshness } from '../ui/src/lib/sessions.js';
 import type { TranscriptEntry, TurnMetric } from '../ui/src/lib/types.js';
 import { waitFor } from './render.js';
@@ -322,6 +323,25 @@ describe('Transcript', () => {
     rerender(transcript({ entries, turns: before.turns, sessionLive: true, live: true }));
     expect(container.textContent).toContain('Fresh answer');
     expect(container.textContent).toContain('in progress');
+  });
+
+  it('draws a compaction marker read from disk at its place in the turn', () => {
+    const { entries, turns } = closedTurns(1);
+    const marker: TranscriptEntry = {
+      kind: 'compaction',
+      ts: T0 + 60_700,
+      outcome: 'done',
+      tokensBefore: 222_822,
+      tokensAfter: 31_204,
+    };
+    entries.splice(2, 0, marker);
+    const container = mount(transcript({ entries, turns }));
+    const mark = container.querySelector('[data-compaction-mark="done"]');
+    expect(mark?.textContent).toBe(`Conversation compacted · 222.8K → 31.2K tokens · ${formatClock(T0 + 60_700)}`);
+    const order = [...container.querySelectorAll('[data-compaction-mark], [data-role]')].map(
+      (el) => el.getAttribute('data-compaction-mark') ?? el.getAttribute('data-role'),
+    );
+    expect(order.indexOf('done')).toBeLessThan(order.lastIndexOf('assistant'));
   });
 
   it('shows the reader error and the empty state', () => {

@@ -1193,9 +1193,8 @@ pub(crate) fn gated_delta_update_fused(
 
 /// The prologue/tail inputs [`gated_delta_fused_prefill`] needs beyond the
 /// prepared conv views: the raw gate projections `a`/`b` `[1, T, Hv]` (rows
-/// may be strided), `a_log`/`dt_bias` `[Hv]` bound `float*` exactly like the
-/// `fused_gdn_gating` kernel's contract (f32 in production), the folded q/k
-/// rms_norm weights `[Dk]` (`qk_norm_w_q`/`qk_norm_w_k`), and the [`GdnTail`]
+/// may be strided), `a_log`/`dt_bias` `[Hv]` (see [`prefill_scalar_dtypes`]),
+/// the folded q/k rms_norm weights `[Dk]` (`qk_norm_w_q`/`qk_norm_w_k`), and the [`GdnTail`]
 /// (strided `z`, gated-norm weight and eps).
 pub(crate) struct GdnPrefill<'a> {
     pub a: &'a MxArray,
@@ -1212,10 +1211,20 @@ pub(crate) struct GdnPrefill<'a> {
     pub tail: GdnTail<'a>,
 }
 
-/// One dispatch for a whole prompt window: `fused_gdn_gating` + the q/k
-/// `rms_norm` + the 32-row-chunked 4-vcol recurrence (f32 register state
-/// carries across chunks) + the gated RMSNorm and z gate — bit-identical to
-/// the unfused prefill chain. `q`/`k`/`v` are the PRE-NORM conv outputs
+/// `a_log`/`dt_bias` storage the fused prefill reads: both f32, or both bf16
+/// (a GGUF load keeps them bf16). Each value is widened to f32 in the kernel,
+/// as `fused_gdn_gating` reads it, so the chain's bits hold for both.
+pub(crate) fn prefill_scalar_dtypes(a_log: &MxArray, dt_bias: &MxArray) -> bool {
+    match (a_log.dtype().ok(), dt_bias.dtype().ok()) {
+        (Some(x), Some(y)) => x == y && matches!(x, DType::Float32 | DType::BFloat16),
+        _ => false,
+    }
+}
+
+/// One primitive for a whole prompt window: `fused_gdn_gating` + the q/k
+/// `rms_norm` + the 4-vcol recurrence (16 state rows of a value head per
+/// threadgroup, f32 register state) + the gated RMSNorm and z gate —
+/// bit-identical to the unfused prefill chain. `q`/`k`/`v` are the PRE-NORM conv outputs
 /// (`[1, T, Hk|Hv, Dk|Dv]`, rows may be strided). `None` when off-contract
 /// (batch != 1, Dk/Dv != 128, non-bf16 activations, a `state_dst`, a
 /// non-f32 carried state, or a kernel decline) — the caller runs the chain.
@@ -1244,17 +1253,23 @@ pub(crate) fn gated_delta_fused_prefill(
         ]
         .iter()
         .any(|x| x.dtype().ok() != Some(DType::BFloat16))
-        || [pf.a_log, pf.dt_bias]
-            .iter()
-            .any(|x| x.dtype().ok() != Some(DType::Float32))
+        || !prefill_scalar_dtypes(pf.a_log, pf.dt_bias)
         || state.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
     {
         return Ok(None);
     }
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+    #[cfg(test)]
+    let entry = if HEAD_SCAN_PREFILL.with(std::cell::Cell::get) {
+        mlx_gdn_fused_prefill_head_reference
+    } else {
+        sys::mlx_gdn_fused_prefill
+    };
+    #[cfg(not(test))]
+    let entry = sys::mlx_gdn_fused_prefill;
     let ok = unsafe {
-        sys::mlx_gdn_fused_prefill(
+        entry(
             q.as_raw_ptr(),
             k.as_raw_ptr(),
             v.as_raw_ptr(),
@@ -1283,6 +1298,36 @@ pub(crate) fn gated_delta_fused_prefill(
         MxArray::from_handle(out, "gdn_fused_prefill:out")?,
         MxArray::from_handle(out_state, "gdn_fused_prefill:state")?,
     )))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs [`gated_delta_fused_prefill`] on the one-value-head-per-threadgroup
+    /// kernel, on this thread: the bit reference of the row-split scan.
+    pub(crate) static HEAD_SCAN_PREFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+unsafe extern "C-unwind" {
+    fn mlx_gdn_fused_prefill_head_reference(
+        q: *mut sys::mlx_array,
+        k: *mut sys::mlx_array,
+        v: *mut sys::mlx_array,
+        a: *mut sys::mlx_array,
+        b: *mut sys::mlx_array,
+        a_log: *mut sys::mlx_array,
+        dt_bias: *mut sys::mlx_array,
+        state: *mut sys::mlx_array,
+        wq: *mut sys::mlx_array,
+        wk: *mut sys::mlx_array,
+        z: *mut sys::mlx_array,
+        w: *mut sys::mlx_array,
+        eps: f32,
+        qk_eps: f32,
+        tiled: i32,
+        out: *mut *mut sys::mlx_array,
+        out_state: *mut *mut sys::mlx_array,
+    ) -> bool;
 }
 
 /// What [`gated_delta_split_at`] hands from one segment to the next: the f32
@@ -3252,3 +3297,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "gdn_deferred_tests.rs"]
 mod deferred_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "gdn_bf16_gates_tests.rs"]
+mod gdn_bf16_gates_tests;

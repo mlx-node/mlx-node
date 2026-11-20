@@ -1517,7 +1517,7 @@ impl Qwen35Inner {
                     adapter,
                 },
                 &layer_kinds,
-                PREFILL_STEP_SIZE as i32,
+                crate::models::qwen3_5::paged_forward::prefill_chunk_rows(PREFILL_STEP_SIZE as i32),
                 None,
                 0,
                 None,
@@ -1531,6 +1531,12 @@ impl Qwen35Inner {
 /// the teacher cache live in [`crate::quality::runner`]; this supplies only what
 /// is family-specific.
 impl crate::quality::runner::EvalBackend for Qwen35Inner {
+    fn attention_query_launches(&self) -> [u64; 2] {
+        self.paged_adapter
+            .as_ref()
+            .map_or([0, 0], |adapter| adapter.tile_query_launches())
+    }
+
     fn kv_format(&self) -> crate::transformer::KvFormat {
         match self.paged_adapter.as_ref() {
             Some(adapter) => match adapter.layer_kv_pool().cache_dtype() {

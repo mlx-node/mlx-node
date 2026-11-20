@@ -1,0 +1,77 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "grok-build-plan",
+    "toolDefinitionsCount": 20,
+    "skills": 1,
+    "mcpServers": 0,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "permission": {
+            "toolName": "workflow",
+            "kind": "other",
+            "title": "Run workflow deep-research",
+            "rawInput": {
+              "source": {
+                "name": "deep-research"
+              },
+              "args": {
+                "question": "Which files hold the lane count?",
+                "breadth": 2
+              }
+            },
+            "output": "{\"run_id\":\"wf_1\",\"status\":\"active\"}"
+          }
+        },
+        {
+          "workflow": {
+            "runId": "wf_1",
+            "name": "deep-research",
+            "label": "researcher-0",
+            "command": "ls"
+          }
+        },
+        {
+          "text": "The workflow runs on its own. Its report comes when it ends.",
+          "chunk": 7
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

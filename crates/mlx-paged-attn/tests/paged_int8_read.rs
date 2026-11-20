@@ -404,6 +404,7 @@ fn paged(
                 kv_heads() as i32,
                 d as i32,
                 3,
+                std::ptr::null_mut(),
             )
         }
     };

@@ -7,9 +7,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
@@ -258,7 +259,7 @@ describe('Auto', () => {
     );
   });
 
-  it('after the user allows a helper with its own folder, every call of the session asks', async () => {
+  it("a helper start is one card; once allowed, the session's own calls are judged as before (no latch)", async () => {
     await withAuto(
       [toolStep('spawn_subagent', { prompt: 'look', cwd: '/' }), bashStep('ls'), editStep('notes.md')],
       async (fake, sw, id) => {
@@ -266,15 +267,114 @@ describe('Auto', () => {
         const spawnCard = await nth(fake, 1);
         expect(spawnCard.autoAsk).toBe('helper-start');
         fake.host.answer(id, spawnCard.id, 'allow-once');
-        const shell = await nth(fake, 2);
-        expect(shell.autoAsk).toBe('helper');
-        fake.host.answer(id, shell.id, 'allow-once');
-        expect((await nth(fake, 3)).autoAsk).toBe('helper');
-        fake.host.answer(id, fake.events.interactions[2]!.interaction.id, 'allow-once');
         expect((await turn.done).outcome).toBe('completed');
-        expect(sw.marks).toEqual([]);
+        expect(fake.events.interactions).toHaveLength(1);
+        expect(sw.marks.map((m) => m.access)).toEqual(['bash', 'edit']);
       },
     );
+  });
+
+  describe('the helpers of a workflow run', () => {
+    const gates: string[] = [];
+    afterEach(() => {
+      for (const dir of gates.splice(0)) rmSync(dir, { recursive: true, force: true });
+    });
+
+    /** A file path that does not exist yet, in a folder removed after the test. */
+    function gateFile(): string {
+      const dir = mkdtempSync(join(tmpdir(), 'mlx-wf-gate-'));
+      gates.push(dir);
+      return join(dir, 'go');
+    }
+
+    /** Turn `p1` starts a run whose helper asks once `gate` exists; turn `p2` runs `ls`. */
+    function run(gate: string, workflow: Json): (scenario: Json) => void {
+      return (scenario) => {
+        const steps = ((scenario.prompts as Json[])[0]!.steps as Json[]).slice(0, 2);
+        steps[1] = { workflow: { ...(steps[1]!.workflow as Json), childOn: gate, ...workflow } };
+        scenario.prompts = [
+          { match: 'p1', steps: [...steps, ...END] },
+          { match: 'p2', steps: [bashStep('ls'), ...END] },
+        ];
+      };
+    }
+
+    /** Turn p1 to its end, with the workflow start allowed on its card. */
+    async function startRun(fake: FakeHost, id: string): Promise<void> {
+      const turn = start(fake, id, 'p1');
+      const card = await nth(fake, 1);
+      expect([card.toolName, card.autoAsk]).toEqual(['workflow', 'helper-start']);
+      fake.host.answer(id, card.id, 'allow-once');
+      expect((await turn.done).outcome).toBe('completed');
+      expect(fake.host.runs(id)).toEqual([{ runId: 'wf_1', stopping: false }]);
+    }
+
+    /** The run ended and its wake turn ended: every helper line before them was handled. */
+    async function runEnded(fake: FakeHost, id: string): Promise<void> {
+      await until(() => fake.events.ends.length === 2, 5_000);
+      expect(fake.host.runs(id)).toEqual([]);
+    }
+
+    it("a helper's shell call in the Work folder is judged like the session's own: allowed with no card", async () => {
+      const gate = gateFile();
+      await withAuto(
+        [],
+        async (fake, sw, id) => {
+          await startRun(fake, id);
+          writeFileSync(gate, '');
+          await runEnded(fake, id);
+          expect(fake.events.interactions).toHaveLength(1);
+          expect(sw.marks.map((m) => [m.toolCallId, m.card?.command, m.card?.from])).toEqual([
+            ['wf_1-call-1', 'ls', { label: 'researcher-0', run: 'deep-research', cwd: null }],
+          ]);
+          expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBe('allow-once');
+        },
+        { name: 'work-workflow-run', mutate: run(gate, { command: 'ls' }) },
+      );
+    });
+
+    it('a helper in another folder asks (helper) and its card names the folder', async () => {
+      const gate = gateFile();
+      const other = realpathSync(tmpdir());
+      await withAuto(
+        [],
+        async (fake, sw, id) => {
+          await startRun(fake, id);
+          writeFileSync(gate, '');
+          const card = await nth(fake, 2);
+          expect([card.command, card.autoAsk, card.from]).toEqual([
+            'ls',
+            'helper',
+            { label: 'researcher-0', run: 'deep-research', cwd: other },
+          ]);
+          fake.host.answer(id, card.id, 'reject-once');
+          await runEnded(fake, id);
+          expect(sw.marks).toEqual([]);
+          expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBe('reject-once');
+        },
+        { name: 'work-workflow-run', mutate: run(gate, { childCwd: other }) },
+      );
+    });
+
+    it("the helper's own end line frees the folder: the next call of the session runs with no card", async () => {
+      const gate = gateFile();
+      await withAuto(
+        [],
+        async (fake, sw, id) => {
+          writeFileSync(join(fake.project, 'a.txt'), 'a');
+          await startRun(fake, id);
+          writeFileSync(gate, '');
+          const card = await nth(fake, 2);
+          expect([card.command, card.autoAsk]).toEqual(['sed -i s/a/b/ a.txt', 'not-known']);
+          fake.host.answer(id, card.id, 'allow-once');
+          await runEnded(fake, id);
+          expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+          expect(fake.events.interactions).toHaveLength(2);
+          expect(sw.marks.map((m) => m.card?.command)).toEqual(['ls']);
+        },
+        { name: 'work-workflow-run', mutate: run(gate, { command: 'sed -i s/a/b/ a.txt' }) },
+      );
+    });
   });
 
   it(`the call after ${AUTO_PER_TURN_MAX} asks (many); an allow by the user starts the count again`, async () => {

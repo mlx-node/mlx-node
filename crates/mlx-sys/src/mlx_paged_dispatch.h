@@ -164,7 +164,13 @@ void dispatch_paged_attention_auto(
     int sliding_window,
     KvDtype kv_dtype,
     PagedAttentionRouteHint route_hint,
-    uint32_t grouped_stripes = 0);
+    uint32_t grouped_stripes = 0,
+    const mlx::core::array* score_scales = nullptr);
+
+// `score_scales` (INT8 pages only, may be null): f32 [query rows, query
+// heads], each the score scale of its row's queries in place of `scale`.
+// `paged_query_codes` writes it beside the INT8 query codes of rows at or
+// past the position rule, and `scale` for rows it passes through.
 
 /// Ragged-Q dispatcher. Writes `[total_queries, num_q_heads,
 /// head_size]` attention output to `out`. `cu_seqlens_q` carries the
@@ -198,7 +204,8 @@ void dispatch_paged_attention_varlen_auto(
     float scale,
     float softcap,
     int sliding_window,
-    KvDtype kv_dtype);
+    KvDtype kv_dtype,
+    const mlx::core::array* score_scales = nullptr);
 
 /// Parameters of the in-place prefill / verify attention (Splash
 /// SplashPrefillAttentionParams over the mlx-node pool). Mirrored by
@@ -229,6 +236,12 @@ constexpr int kPagedVerifyRows = 8;
 /// Whether a (query heads per KV head, head dim) pair has an instance.
 bool paged_prefill_attention_geometry(int group, int head_size);
 
+/// The one geometry with a keys-token-major split entry (INT8, block 32):
+/// dense Qwen3.5 heads 24/4 at D 256.
+constexpr int kPagedPrefillKeysTokenMajorGroup = 6;
+constexpr int kPagedPrefillKeysTokenMajorHeadDim = 256;
+bool paged_prefill_keys_token_major_geometry(int group, int head_size);
+
 /// Every split and reduce function the dispatch can request.
 std::vector<std::string> paged_prefill_attention_kernel_names();
 
@@ -238,8 +251,13 @@ MTL::ComputePipelineState* paged_prefill_pipeline(
     mlx::core::metal::Device& device,
     const std::string& name);
 
-/// Builds the split and reduce pipelines of every instance.
+/// Builds the split and reduce pipelines of every instance this device runs
+/// (the q8q entries only where `paged_prefill_int8_queries_supported`).
 int64_t build_paged_prefill_attention_pipelines(mlx::core::metal::Device& device);
+
+/// Whether the device runs the q8q (INT8-query) split entries: Apple10 and
+/// later (Splash `AttentionCalibration::int8QueriesFromPages`).
+bool paged_prefill_int8_queries_supported(mlx::core::metal::Device& device);
 
 /// Floats of the workspace one launch writes: partials then statistics
 /// (Splash PagedAttention::prefillPlan, exact).
@@ -249,7 +267,8 @@ int64_t paged_prefill_workspace_floats(
 /// Encodes the split then the reduce. `q_staged` is
 /// [kv heads][chunk_stride][group][D] bf16, `out` [rows][query heads][D]
 /// bf16, `workspace` the f32 partials + statistics the split writes and the
-/// reduce reads.
+/// reduce reads. `int8_queries` (INT8 pages only) takes the q8q split. A
+/// rank-4 `k_pool` is the keys-token-major page and takes its `_ktm` split.
 void dispatch_paged_prefill_attention(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -265,7 +284,32 @@ void dispatch_paged_prefill_attention(
     int num_q_heads,
     int head_size,
     KvDtype cache_dtype,
+    bool int8_queries,
     int64_t live_blocks);
+
+/// Parameters of `paged_prefill_attention_query_codes_d{128,256}`. Mirrored by the Metal
+/// struct of the same name.
+struct PagedQueryCodesParams {
+  uint32_t rows;
+  uint32_t query_heads;
+  uint32_t from;
+  float scale;
+};
+static_assert(sizeof(PagedQueryCodesParams) == 16, "matches the Metal struct");
+
+/// Encodes the decode kernels' INT8 query codes: `q` [rows, query heads, D]
+/// bf16 at `positions` [rows] int32; rows at or past `params.from` write
+/// codes (bf16 integers) and the tile's score scale, rows below copy `q`
+/// and `params.scale`.
+void dispatch_paged_query_codes(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    const mlx::core::array& q,
+    const mlx::core::array& positions,
+    mlx::core::array& codes,
+    mlx::core::array& score_scales,
+    const PagedQueryCodesParams& params,
+    int head_size);
 
 } // namespace mlx::core::fast::paged
 

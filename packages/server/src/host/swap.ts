@@ -5,7 +5,10 @@
  * the `ModelRegistry` at a time. Switching models (e.g. via Claude Code's
  * `/model` picker, or the desktop app's model menu) unregisters the previous
  * instance, disposing it and waiting for native resource release before loading
- * the new one.
+ * the new one. A target that loads alone (`loadsAlone`) also drops the old
+ * model's aliases first when the old model is idle, so its load reads live
+ * memory with the old weights gone if the old model has `dispose()`. A model
+ * without it is freed by garbage collection, which this wait does not cover.
  */
 
 import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-node/lm';
@@ -18,6 +21,12 @@ import type { DiscoveredModel } from './discover.js';
 
 export interface SwapController {
   resolveModel: (name: string) => Promise<void>;
+  /**
+   * Binds an unknown name to the loaded selected model when `resolveModel`
+   * would only add that alias: nothing to load, swap or release, and no
+   * resolve or unload in progress. Synchronous; returns whether it bound.
+   */
+  bindLoadedAlias?: (name: string) => boolean;
   listModels: () => PublicModelEntry[];
   disposeAll?: () => Promise<void>;
   /**
@@ -52,6 +61,13 @@ function hasCacheToClose(model: unknown): model is CacheClosingModel {
  * `estimatedWindow` is the window an entry's load would serve, priced before
  * it loads; `listModels` shows it between the trained window and the loaded
  * model's own.
+ *
+ * `loadsAlone` names the entries whose load plans from the memory live at
+ * load time. A switch to one, with an old model that holds no dispatch lease,
+ * no persist retention and no pre-dispatch permit, also unregisters every
+ * alias of the old model, so the awaited disposal ends before the load. If
+ * that load fails nothing stays resident and the selection stays the old
+ * entry, so the next request loads the old model again.
  */
 export function makeSwapController(
   discovered: DiscoveredModel[],
@@ -59,6 +75,7 @@ export function makeSwapController(
   loadModelFn: (path: string) => Promise<LoadableModel>,
   defaultName?: string,
   estimatedWindow?: (name: string) => number | undefined,
+  loadsAlone?: (entry: DiscoveredModel) => boolean,
 ): SwapController {
   const byName = new Map<string, DiscoveredModel>();
   for (const entry of discovered) byName.set(entry.name, entry);
@@ -83,6 +100,8 @@ export function makeSwapController(
   // alive past the user's swap.
   const aliases = new Set<string>();
   let currentOp: Promise<unknown> = Promise.resolve();
+  // Resolves and unloads not yet finished; while any runs, the resident may be leaving.
+  let pending = 0;
   // A dropped model frees its SSD cache only when V8 collects it, and a lease
   // or a persist can keep it for long. A new load of the same model opens
   // the same cache directory and would wait 20 s for its lock, then keep a
@@ -122,6 +141,7 @@ export function makeSwapController(
     // resident or as an alias we previously installed). Avoid chaining.
     if (registry.getAny(name)) return;
 
+    pending += 1;
     const next = currentOp.then(async () => {
       // Re-check under the serialized section — a prior waiter may have loaded it.
       if (registry.getAny(name)) return;
@@ -152,14 +172,36 @@ export function makeSwapController(
       // so the name always resolves to *some* live instance.
       const oldResident = resident;
       const carriedAliases = new Set(aliases);
+      // A busy old model would defer its teardown behind a request that
+      // waits for this load, so it keeps its aliases until the new model is
+      // in hand. A request between its resolve and its dispatch lease holds
+      // a pre-dispatch permit, or (no permit) takes the lease in the
+      // microtasks that resume it, which the yield lets run: either one
+      // makes the old model busy.
+      let freeFirst =
+        oldResident !== null &&
+        oldResident.name !== targetEntry.name &&
+        !registry.getAny(targetEntry.name) &&
+        loadsAlone?.(targetEntry) === true;
+      if (freeFirst) {
+        await new Promise<void>((resume) => setImmediate(resume));
+        freeFirst =
+          registry.dispatchLeaseCount === 0 &&
+          registry.persistRetainCount === 0 &&
+          registry.preDispatchAdmitCount === 0;
+      }
       if (oldResident && oldResident.name !== targetEntry.name) {
         // Drop our local alias bookkeeping AND the old resident's primary
-        // name binding, but leave the alias *names* in the registry pointed
-        // at the old model — they hold the only refcount preventing disposal,
-        // and an in-flight `registry.getAny(alias)` must keep resolving to
-        // *some* live instance until the new model is in hand.
+        // name binding. Unless the target loads alone, leave the alias
+        // *names* in the registry pointed at the old model: they hold the
+        // only refcount preventing disposal, and an in-flight
+        // `registry.getAny(alias)` must keep resolving to *some* live
+        // instance until the new model is in hand.
         aliases.clear();
         drop(oldResident.name, { dispose: true });
+        if (freeFirst) {
+          for (const aliasName of carriedAliases) if (registry.getAny(aliasName)) drop(aliasName, { dispose: true });
+        }
         resident = null;
         // With no aliases this joins the old model thread before the new load.
         // Aliased or leased bindings finish through the same tracked disposal path.
@@ -193,9 +235,10 @@ export function makeSwapController(
           // can do to recover in that case — the user will need to /model-
           // pick again. This is acceptable: alias-less load failures are
           // rare, and the user-facing symptom is "prior model gone, please
-          // re-pick", not silently-wrong responses.
-          for (const aliasName of carriedAliases) aliases.add(aliasName);
-          if (oldResident) {
+          // re-pick", not silently-wrong responses. A target that loaded
+          // alone disposed the old model first: nothing is left to restore.
+          if (!freeFirst) for (const aliasName of carriedAliases) aliases.add(aliasName);
+          if (oldResident && !freeFirst) {
             let oldInstance: SessionCapableModel | DecisionModel | undefined;
             for (const aliasName of carriedAliases) {
               const probe = registry.getAny(aliasName);
@@ -256,7 +299,24 @@ export function makeSwapController(
       await registry.settleModelDisposals();
     });
     currentOp = next.catch(() => undefined);
-    await next;
+    try {
+      await next;
+    } finally {
+      pending -= 1;
+    }
+  }
+
+  function bindLoadedAlias(name: string): boolean {
+    if (pending > 0 || byName.has(name) || registry.getAny(name)) return false;
+    if (resident === null || resident.name !== selectedEntry.name) return false;
+    const instance = registry.get(resident.name);
+    if (instance === undefined) return false;
+    registry.registerAny(name, instance, {
+      samplingDefaults: selectedEntry.preset.sampling,
+      maxOutputTokens: selectedEntry.preset.maxOutputTokens,
+    });
+    aliases.add(name);
+    return true;
   }
 
   function listModels(): PublicModelEntry[] {
@@ -283,16 +343,22 @@ export function makeSwapController(
   }
 
   async function unloadAll(dispose: boolean): Promise<void> {
-    await currentOp;
-    const sessions = registry.listSessionRegistries();
-    for (const entry of registry.list()) if (registry.getAny(entry.id)) drop(entry.id, { dispose });
-    resident = null;
-    aliases.clear();
-    await Promise.all(sessions.map((session) => session.flushPendingDisposals()));
-    if (dispose) await registry.settleModelDisposals();
+    pending += 1;
+    try {
+      await currentOp;
+      const sessions = registry.listSessionRegistries();
+      for (const entry of registry.list()) if (registry.getAny(entry.id)) drop(entry.id, { dispose });
+      resident = null;
+      aliases.clear();
+      await Promise.all(sessions.map((session) => session.flushPendingDisposals()));
+      if (dispose) await registry.settleModelDisposals();
+    } finally {
+      pending -= 1;
+    }
   }
   return {
     resolveModel,
+    bindLoadedAlias,
     listModels,
     disposeAll: () => unloadAll(false),
     releaseAll: () => unloadAll(true),

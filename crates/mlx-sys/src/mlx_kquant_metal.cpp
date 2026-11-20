@@ -17,6 +17,7 @@
 #include "mlx/backend/metal/matmul.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/transforms_impl.h"
 #include "mlx/utils.h"
 #include "mlx_paged_metallib.h"
 #include "mlx_kquant_register_plan.h"
@@ -263,6 +264,28 @@ std::string gather_qmm_rhs_nax(Mode m, Dtype t, const Tile &tile) {
 }
 std::string dequantize(Mode m, Dtype t) { return base(m, "dequantize", t); }
 
+// The modes with the Tiled64 GEMM store epilogues (kquant_nax.metal),
+// bfloat16 only.
+constexpr Mode kEpilogueModes[] = {Mode::Q3K,   Mode::Q4K,   Mode::Q5K, Mode::Q6K,
+                                   Mode::IQ4NL, Mode::IQ4XS, Mode::IQ3S};
+constexpr bool epilogue_mode(Mode mode) {
+  for (Mode m : kEpilogueModes) {
+    if (m == mode) {
+      return true;
+    }
+  }
+  return false;
+}
+std::string qmm_t_nax_t64_epilogue(Mode m, StoreEpilogue ep) {
+  std::string name = base(m,
+                          ep == StoreEpilogue::Residual ? "qmm_t_nax_t64_res"
+                                                        : "qmm_t_nax_t64_swiglu",
+                          bfloat16);
+  concatenate(name, "_bm", kNaxTile.bm, "_bn", kNaxTile.bn, "_bk", kNaxTile.bk,
+              "_wm", kNaxTile.wm, "_wn", kNaxTile.wn);
+  return name;
+}
+
 } // namespace kernels
 
 std::vector<KernelName> metal_kernel_names() {
@@ -339,6 +362,11 @@ std::vector<KernelName> metal_kernel_names() {
   for (Mode m : kAffineModes) {
     for (int rows : kM8NaxRows) {
       add(qmm_m8_nax(m, true, rows), true);
+    }
+  }
+  for (Mode m : kEpilogueModes) {
+    for (StoreEpilogue ep : {StoreEpilogue::Residual, StoreEpilogue::Swiglu}) {
+      add(qmm_t_nax_t64_epilogue(m, ep), true);
     }
   }
   // Head-only M8 instantiation stores the same tensor-op accumulator as F32.
@@ -889,7 +917,7 @@ array m8_nax_counters(const Stream &s, int tiles) {
 // One dispatch: grid (N / 64, splits) of 64 threads. Splits > 1 publish fp32
 // partials [splits][rows][N] in a temporary; the last-arriving partition of
 // a tile sums them in split order (kquant_m8_nax.h).
-void qmm_m8_nax(const Operands &o, int M, int N, int K) {
+void qmm_m8_nax(const Operands &o, int M, int N, int K, bool lane_tier = false) {
   const int tiles = N / kernels::kM8TileCols;
   const int rows = o.tiled ? kernels::m8_nax_rows(M) : 8;
   const int splits = qmm_m8_nax_splits(o.mode, N, K, gpu_core_count(o.d), rows, o.bits);
@@ -917,7 +945,7 @@ void qmm_m8_nax(const Operands &o, int M, int N, int K) {
   enc.set_bytes(N, 8);
   enc.set_bytes(splits, 9);
   enc.set_bytes(M, 10);
-  const uint32_t spread = M == 8 && staged_decode_spread(o.d);
+  const uint32_t spread = (M == 8 || lane_tier) && staged_decode_spread(o.d);
   enc.set_bytes(spread, 11);
   enc.dispatch_threadgroups(MTL::Size(tiles, splits, 1), MTL::Size(64, 1, 1));
 }
@@ -1092,7 +1120,8 @@ void qmm(const Operands &o, bool transpose, int M, int N, int K) {
   enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-void qmm_splitk(const Operands &o, int M, int N, int K) {
+// The K partitions qmm_splitk runs; 1 sends it to qmm.
+int splitk_count(int group_size, int M, int N, int K) {
   // Target ~512 threadgroups.
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -1102,11 +1131,19 @@ void qmm_splitk(const Operands &o, int M, int N, int K) {
 
   // qmm_t_splitk tiles K by BK=32 without bounding it, so every partition
   // must be whole BK tiles and whole groups.
-  int k_align = o.group_size > 32 ? o.group_size : 32;
+  int k_align = group_size > 32 ? group_size : 32;
   split_k = std::min(split_k, K / k_align);
   while (split_k > 1 && (K % (split_k * k_align) != 0)) {
     split_k--;
   }
+  return split_k;
+}
+
+void qmm_splitk(const Operands &o, int M, int N, int K) {
+  int bm = 32, bn = 32;
+  int n_tiles = (N + bn - 1) / bn;
+  int m_tiles = (M + bm - 1) / bm;
+  int split_k = splitk_count(o.group_size, M, N, K);
   if (split_k <= 1) {
     return qmm(o, true, M, N, K);
   }
@@ -1339,11 +1376,126 @@ int qmv_vector_limit(int K, int N, bool transpose, metal::Device &d) {
   return vector_limit;
 }
 
+// A K-quant Tiled64 (N, K) whose M = 8 call takes qmm_m8_nax: not the M = 8
+// register output route, and 8 under the GEMM's row limit.
+bool m8_tier_is_the_eight_row_route(Mode mode, int N, int K, metal::Device &d) {
+  return metal::is_nax_available() && !is_affine(mode) &&
+         N % kernels::kM8TileCols == 0 && K % 32 == 0 &&
+         !(mode == Mode::Q4K && N == 2048 && K == 4096) &&
+         8 < qmv_vector_limit(K, N, true, d);
+}
+
+// The lane tier: M of 16, 24 or 32 on the 16/32-row tile. A K-quant mode's
+// split count does not depend on the row tier (qmm_m8_nax_splits), so each
+// 8-row block of x is summed in the M = 8 call's order.
+bool lane_tier_fits(const Operands &o, int M, int N, int K) {
+  return (M == 16 || M == 24 || M == 32) && o.tiled &&
+         m8_tier_is_the_eight_row_route(o.mode, N, K, o.d) &&
+         o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
+         o.out.size() == size_t(M) * N;
+}
+
+// Rows [8 * lane, 8 * lane + 8) of a row-contiguous [M, cols] array: the
+// view an 8-row call on that lane reads or writes.
+array lane_rows(const array &a, int lane, int cols) {
+  array view({8, cols}, a.dtype(), nullptr, {});
+  auto flags = a.flags();
+  flags.contiguous = true;
+  flags.row_contiguous = true;
+  flags.col_contiguous = cols == 1;
+  view.copy_shared_buffer(a, Strides{int64_t(cols), 1}, flags,
+                          size_t(8) * cols, int64_t(lane) * 8 * cols);
+  return view;
+}
+
+// The Tiled64 route of x @ w.T without the lane tier.
+void tiled_route(const Operands &o, int M, int N, int K) {
+  // The four measured companion shapes use register MMA by default.
+  // Explicit 1 preserves the broader opt-in; 0 retains the staged route.
+  if (o.mode == Mode::A4G64 && M == 8 && N >= 2048 && N % 32 == 0 && K <= 8192 &&
+      o.d.get_architecture_gen() >= 17 && o.x.dtype() == bfloat16 &&
+      o.x.offset() % 8 == 0 && o.scales.offset() % 8 == 0 && o.biases.offset() % 8 == 0) {
+    const char* experiment = std::getenv("MLX_KQUANT_REGISTER_AFFINE");
+    const bool measured_shape =
+        (K == 2048 && (N == 6144 || N == 12288)) ||
+        (N == 2048 && (K == 6144 || K == 4096));
+    if ((!experiment && measured_shape) ||
+        (experiment && std::string_view(experiment) == "1")) {
+      qmv_sg8(o, N, K);
+      return;
+    }
+  }
+  // Keep this default limited to the measured target output projection.
+  // The Rust prepared-SG8 eligibility uses the same unset/1/0 policy.
+  if (o.mode == Mode::Q4K && M == 8 && N == 2048 && K == 4096 &&
+      use_qmv_sg8(o, M, N)) {
+    const char* experiment = std::getenv("MLX_KQUANT_REGISTER_OUTPUT");
+    if (!experiment || std::string_view(experiment) == "1") {
+      qmv_sg8(o, N, K);
+      return;
+    }
+  }
+  // The tensor-op tiers cover M = 8..32 ahead of the GEMM: at these
+  // heights the GEMM's 64-row tiles stream the weights at 190-210 GB/s
+  // where the tiers hold 450 (M5 Max, Qwen3.8 shapes).
+  // The affine tiers go ahead of the GEMM; a K-quant mode keeps the
+  // GEMM ahead of its 8-row tier, as it shipped.
+  const bool tier = use_qmm_m8_nax(o, M, N, K);
+  if (tier && is_affine(o.mode)) {
+    qmm_m8_nax(o, M, N, K);
+    return;
+  }
+  if (M >= qmv_vector_limit(K, N, true, o.d)) {
+    qmm_splitk(o, M, N, K);
+    return;
+  }
+  if (tier) {
+    qmm_m8_nax(o, M, N, K);
+    return;
+  }
+  if (M == 1) {
+    qmv_t64(o, M, N, K);
+    return;
+  }
+  qmv_wide(o, M, N, K);
+}
+
+// One lane-tier dispatch when every lane's own 8-row call takes the 8-row
+// tier; otherwise each lane runs its own 8-row route (a lane at a byte
+// offset not divisible by 8 takes qmv_wide alone, and the tier's bits differ).
+void lane_tiers_matmul(const Operands &o, int M, int N, int K) {
+  const int lanes = M / 8;
+  std::vector<array> xs, outs;
+  xs.reserve(lanes);
+  outs.reserve(lanes);
+  bool tier = true;
+  for (int lane = 0; lane < lanes; ++lane) {
+    xs.push_back(lane_rows(o.x, lane, K));
+    outs.push_back(lane_rows(o.out, lane, N));
+    Operands lo{xs.back(), o.w, o.scales, o.biases, outs.back(), o.group_size,
+                o.bits,    o.mode, o.d, o.s, o.tiled};
+    tier = tier && use_qmm_m8_nax(lo, 8, N, K);
+  }
+  if (tier) {
+    qmm_m8_nax(o, M, N, K, true);
+    return;
+  }
+  for (int lane = 0; lane < lanes; ++lane) {
+    Operands lo{xs[lane], o.w, o.scales, o.biases, outs[lane], o.group_size,
+                o.bits,   o.mode, o.d, o.s, o.tiled};
+    tiled_route(lo, 8, N, K);
+  }
+}
+
 } // namespace
 
 int tiled_projection_splits(int N, int K) {
   auto& d = metal::device(Device::gpu);
   return qmm_m8_nax_splits(Mode::Q4K, N, K, gpu_core_count(d), 8, 4);
+}
+
+int kquant_tiled_splits(int N, int K, int cores) {
+  return qmm_m8_nax_splits(Mode::Q4K, N, K, cores, 8, 4);
 }
 
 bool tiled_projection_spread(const Stream& s) {
@@ -1359,6 +1511,11 @@ int tiled_qmv_vector_limit(int K, int N) {
     return 0;
   }
   return qmv_vector_limit(K, N, true, metal::device(Device::gpu));
+}
+
+bool lane_tier_available(Mode mode, int N, int K) {
+  return is_available(Device::gpu) &&
+         m8_tier_is_the_eight_row_route(mode, N, K, metal::device(Device::gpu));
 }
 
 bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine) {
@@ -1425,55 +1582,21 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
       throw std::runtime_error(
           "[quantized_matmul] The @t64 layout needs x @ w.T on a 2-D weight.");
     }
-    // The four measured companion shapes use register MMA by default.
-    // Explicit 1 preserves the broader opt-in; 0 retains the staged route.
-    if (mode_ == Mode::A4G64 && M == 8 && N >= 2048 && N % 32 == 0 && K <= 8192 &&
-        d.get_architecture_gen() >= 17 && x.dtype() == bfloat16 &&
-        x.offset() % 8 == 0 && scales.offset() % 8 == 0 && biases.offset() % 8 == 0) {
-      const char* experiment = std::getenv("MLX_KQUANT_REGISTER_AFFINE");
-      const bool measured_shape =
-          (K == 2048 && (N == 6144 || N == 12288)) ||
-          (N == 2048 && (K == 6144 || K == 4096));
-      if ((!experiment && measured_shape) ||
-          (experiment && std::string_view(experiment) == "1")) {
-        qmv_sg8(o, N, K);
-        return;
+    if (lane_tiers_) {
+      if (!lane_tier_fits(o, M, N, K)) {
+        throw std::runtime_error(
+            "[quantized_matmul] The lane tier needs 16, 24 or 32 bfloat16 rows "
+            "of a K-quant whose 8-row call takes the tensor-op tier.");
       }
-    }
-    // Keep this default limited to the measured target output projection.
-    // The Rust prepared-SG8 eligibility uses the same unset/1/0 policy.
-    if (mode_ == Mode::Q4K && M == 8 && N == 2048 && K == 4096 &&
-        use_qmv_sg8(o, M, N)) {
-      const char* experiment = std::getenv("MLX_KQUANT_REGISTER_OUTPUT");
-      if (!experiment || std::string_view(experiment) == "1") {
-        qmv_sg8(o, N, K);
-        return;
-      }
-    }
-    // The tensor-op tiers cover M = 8..32 ahead of the GEMM: at these
-    // heights the GEMM's 64-row tiles stream the weights at 190-210 GB/s
-    // where the tiers hold 450 (M5 Max, Qwen3.8 shapes).
-    // The affine tiers go ahead of the GEMM; a K-quant mode keeps the
-    // GEMM ahead of its 8-row tier, as it shipped.
-    const bool tier = use_qmm_m8_nax(o, M, N, K);
-    if (tier && is_affine(mode_)) {
-      qmm_m8_nax(o, M, N, K);
+      lane_tiers_matmul(o, M, N, K);
       return;
     }
-    if (M >= qmv_vector_limit(K, N, transpose_, d)) {
-      qmm_splitk(o, M, N, K);
-      return;
-    }
-    if (tier) {
-      qmm_m8_nax(o, M, N, K);
-      return;
-    }
-    if (M == 1) {
-      qmv_t64(o, M, N, K);
-      return;
-    }
-    qmv_wide(o, M, N, K);
+    tiled_route(o, M, N, K);
     return;
+  }
+  if (lane_tiers_) {
+    throw std::runtime_error(
+        "[quantized_matmul] The lane tier reads the @t64 layout only.");
   }
   if (is_affine(mode_)) {
     throw std::runtime_error(
@@ -1516,6 +1639,94 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
     return;
   }
   qvm_split_k(o, M, N, K);
+}
+
+// Mirrors the Tiled64 branch of KQuantMatmul::eval_gpu for a bfloat16 x of a
+// K-quant mode: true only where it reaches qmm_nax (qmm_splitk with one
+// partition, then qmm on the tensor op). The Q4_K output shape that may take
+// qmv_sg8 is refused whatever the environment says.
+bool store_epilogue_route(Mode mode, int M, int N, int K) {
+  if (!is_available(Device::gpu) || !metal::is_nax_available() ||
+      !kernels::epilogue_mode(mode) || M < 1 || N % kernels::kNaxTile.bn != 0 ||
+      K % kernels::kNaxTile.bk != 0) {
+    return false;
+  }
+  if (mode == Mode::Q4K && M == 8 && N == 2048 && K == 4096) {
+    return false;
+  }
+  auto &d = metal::device(Device::gpu);
+  return M >= qmv_vector_limit(K, N, true, d) &&
+         splitk_count(default_group_size(mode), M, N, K) <= 1;
+}
+
+std::optional<array> quantized_matmul_epilogue(
+    const array &x, const array &w, const array &scales, const array &biases,
+    const array &aux, Mode mode, StoreEpilogue epilogue) {
+  if (detail::in_grad_tracing() || !(default_device() == Device::gpu) ||
+      x.dtype() != bfloat16 || aux.dtype() != bfloat16 || w.ndim() != 2 ||
+      x.ndim() < 1) {
+    return std::nullopt;
+  }
+  const int K = x.shape(-1);
+  if (K <= 0 || x.size() % K != 0) {
+    return std::nullopt;
+  }
+  const int M = x.size() / K;
+  const int N = w.shape(0);
+  if (!store_epilogue_route(mode, M, N, K)) {
+    return std::nullopt;
+  }
+  // The plain op validates the operands and gives the output's shape.
+  array plain = quantized_matmul(x, w, scales, biases, true, std::nullopt,
+                                 std::nullopt, mode, {}, Layout::Tiled64);
+  if (aux.shape() != plain.shape()) {
+    return std::nullopt;
+  }
+  std::vector<array> inputs = plain.inputs();
+  inputs.push_back(aux);
+  return array(plain.shape(), bfloat16,
+               std::make_shared<KQuantMatmulEpilogue>(
+                   plain.primitive().stream(), default_group_size(mode),
+                   default_bits(mode), mode, epilogue),
+               std::move(inputs));
+}
+
+void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &inputs,
+                                    array &out) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous(inputs[0], s);
+  array w = ensure_row_contiguous_matrix(inputs[1], s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], s);
+  array aux = ensure_row_contiguous(inputs[4], s);
+  const int K = x.shape(-1);
+  const int M = x.size() / K;
+  const int N = out.shape(-1);
+  if (!store_epilogue_route(mode_, M, N, K)) {
+    throw std::runtime_error(
+        "[quantized_matmul] The K-quant store epilogue left the tensor-op GEMM.");
+  }
+  constexpr auto tile = kernels::kNaxTile;
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims(N / tile.bn, (M + tile.bm - 1) / tile.bm, 1);
+  auto kernel = get_kernel(
+      d,
+      epilogue_ == StoreEpilogue::Residual ? "qmm_t_nax_t64_res"
+                                           : "qmm_t_nax_t64_swiglu",
+      kernels::qmm_t_nax_t64_epilogue(mode_, epilogue_), M, N, K);
+  auto &enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, w, scales, biases);
+  enc.set_input_array(x, 3);
+  enc.set_output_array(out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  enc.set_input_array(aux, 8);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
@@ -1615,12 +1826,19 @@ extern "C" int mlx_gpu_reported_core_count() {
       : 0;
 }
 
+// K splits of a K-quant Tiled64 call of an [n, k] weight on `cores` GPU cores: the same law at 8, 16, 24 and 32 rows
+// and for every K-quant mode. 0 without Metal.
+extern "C" int mlx_kquant_tiled_splits(int n, int k, int cores) {
+  return mlx::core::kquant::kquant_tiled_splits(n, k, cores);
+}
+
 #else
 
 #include <stdexcept>
 
 extern "C" int mlx_gpu_core_count() { return 0; }
 extern "C" int mlx_gpu_reported_core_count() { return 0; }
+extern "C" int mlx_kquant_tiled_splits(int, int, int) { return 0; }
 
 namespace mlx::core::kquant {
 
@@ -1628,6 +1846,7 @@ int tiled_qmv_vector_limit(int, int) { return 0; }
 int tiled_projection_splits(int, int) { return 1; }
 bool tiled_projection_spread(const Stream&) { return false; }
 bool tiled_tensor_op_tier(int, int, int, int, bool) { return false; }
+bool lane_tier_available(Mode, int, int) { return false; }
 
 #ifndef MLX_NODE_CUDA_ENABLED
 void KQuantMatmul::eval_gpu(const std::vector<array> &, array &) {
@@ -1646,6 +1865,20 @@ void KQuantDequantize::eval_gpu(const std::vector<array> &, array &) {
       "[dequantize] K-quant modes are not implemented on this GPU backend.");
 }
 #endif
+
+bool store_epilogue_route(Mode, int, int, int) { return false; }
+
+std::optional<array> quantized_matmul_epilogue(const array &, const array &,
+                                               const array &, const array &,
+                                               const array &, Mode,
+                                               StoreEpilogue) {
+  return std::nullopt;
+}
+
+void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[quantized_matmul] The K-quant store epilogue needs Metal.");
+}
 
 } // namespace mlx::core::kquant
 

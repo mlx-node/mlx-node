@@ -377,6 +377,41 @@ fn reclaim_stages_one_write_and_frees_at_once() {
     );
 }
 
+/// Reads before writes (Splash `SlotFile`): while a parked restore's state
+/// read waits for the staging buffer, a write (a reclaim's or a copy
+/// ahead, both through `stage`) finds it out and changes nothing; once the
+/// wait ends the write starts.
+#[test]
+fn a_waiting_state_read_keeps_the_staging_buffer_from_writes() {
+    let Some((mut inner, _tier)) = fixture(0x5713_1302, "state-tier-read-first") else {
+        return;
+    };
+    let o = park(&mut inner, 34, StateClass::Ordinary);
+    let wait = read_wait(&inner.dflash2_states).expect("a tier");
+    assert_eq!(
+        stage(&mut inner, o, MakeRoom::Evict, true),
+        Staged::Busy,
+        "a copy ahead waits for the read"
+    );
+    let disk = inner.dflash2_states.disk.as_ref().expect("tier");
+    assert!(
+        disk.staging.is_some() && !disk.writing(),
+        "nothing was written"
+    );
+    assert!(ram(&inner, o) && disk_copy(&inner, o).is_none());
+    drop(wait);
+    assert_eq!(
+        inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("tier")
+            .read_waiters(),
+        0
+    );
+    assert_eq!(stage(&mut inner, o, MakeRoom::Evict, true), Staged::Started);
+}
+
 /// A failed state write leaves no copy (Splash `StateCache::pollOffload`:
 /// a failed offload drops the disk copy, and a state with no copy left is
 /// invalid and goes); the staging buffer comes back and the chain's mark
@@ -1227,5 +1262,212 @@ fn a_draft_changed_during_load_keeps_the_tier_temporary() {
         !open(true),
         "a draft replaced during load keeps the tier temporary"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Both query modes share one persistent state tier: under activations
+/// `bf16` and `auto` the pool's identity text is the dtype alone (`Int8`,
+/// the namespace of the tree before int8 queries), and each mode adopts a
+/// state the other wrote. Attached planes on the spread walk add their
+/// planes id: a state written under one id (or none) is never adopted under
+/// another; the same id adopts it.
+/// Mutation q8-kept (the identity names the threshold under `auto`) → red
+/// on a device that scores INT8 queries.
+#[test]
+fn both_query_modes_share_the_persistent_tier() {
+    use crate::transformer::Activations;
+    if crate::test_support::paged_prefill_unsupported("both_query_modes_share_the_persistent_tier")
+    {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!(
+        "mlx-state-tier-query-mode-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    std::fs::create_dir_all(root.join("tmp")).expect("temp root");
+    std::fs::write(target.join("model.safetensors"), b"target").expect("target shard");
+    let options = DiskTierOptions {
+        cache_disk: CacheDisk::Bytes(1 << 30),
+        persistent: true,
+        cache_dir: Some(root.join("cache")),
+        temp_root: Some(root.join("tmp")),
+    };
+    let weights = WeightsResident::for_test(1, 4096);
+    let files = CheckpointFiles::Dir(&target);
+    let fixture_with = |activations: Activations, route: Option<&str>| -> (Qwen35Inner, TestTier) {
+        let mut inner =
+            crate::models::qwen3_5::dflash2_decode::paged_dflash2_tests::tiny_paged_int8_dflash_inner(
+                0x5713_0808,
+            );
+        install_pool(&mut inner, 8, 8, passing_probe()).expect("pool");
+        let adapter = inner.paged_adapter.as_mut().expect("pool");
+        assert_eq!(
+            adapter.layer_kv_pool().cache_dtype(),
+            mlx_paged_attn::metal::MetalDtype::Int8
+        );
+        adapter.set_activations(activations);
+        adapter.set_planes_route(route.map(str::to_string));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut guard = CheckpointLoadGuard::before_read(files, true);
+            guard.record_read();
+            let load = TierLoad {
+                family: "qwen3_5",
+                config_json: b"{}".to_vec(),
+                dense: &inner.config,
+                activation: DType::BFloat16,
+                draft: None,
+                adapter: inner.paged_adapter.as_ref().expect("pool"),
+                files,
+                weights: &weights,
+                guard: &guard,
+            };
+            let (context, disk) = open_state_disk(&load, &options, inner.model_id).expect("a tier");
+            if disk.tier.persistent || std::time::Instant::now() >= deadline {
+                assert!(disk.tier.persistent, "the namespace's last writer let go");
+                let tier = TestTier {
+                    tier: Arc::clone(&disk.tier),
+                    root: PathBuf::new(),
+                };
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("pool")
+                    .set_cold_tier(context);
+                inner.dflash2_states.disk = Some(disk);
+                return (inner, tier);
+            }
+            disk.tier.close(std::time::Instant::now());
+            drop(disk);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    let fixture = |activations: Activations| fixture_with(activations, None);
+    let round_trip = |writer: Option<&str>, reader: Option<&str>| -> u64 {
+        let _ = std::fs::remove_dir_all(root.join("cache"));
+        let (mut inner, tier) = fixture_with(Activations::Bf16, writer);
+        let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let tokens = chain_tokens(41, 1, block_size);
+        cache_chain(&inner, &tokens);
+        let mut anchor = writable_anchor(&inner.config, window(&inner));
+        anchor.window = None;
+        let id = inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Checkpoint)
+            .expect("a whole-block state")
+            .id;
+        inner.sync_gdn_state_marks();
+        assert_eq!(reclaim(&mut inner, id), Reclaimed::Written);
+        settle(&mut inner, &tier, id);
+        assert!(close_cache(
+            &mut inner,
+            std::time::Instant::now() + std::time::Duration::from_secs(6)
+        ));
+        drop((inner, tier));
+        let (mut inner, tier) = fixture_with(Activations::Bf16, reader);
+        let adopted = adopt_all(&mut inner);
+        drop((inner, tier));
+        adopted
+    };
+    let a = "planes-route:aa";
+    let b = "planes-route:bb";
+    let (inner, tier) = fixture_with(Activations::Bf16, Some(a));
+    let int8 = format!(
+        "{:?}",
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .layer_kv_pool()
+            .cache_dtype()
+    );
+    assert_eq!(
+        inner.paged_adapter.as_ref().expect("pool").cache_identity(),
+        format!("{int8} {a}")
+    );
+    drop((inner, tier));
+    for (writer, reader, adopted) in [
+        (None, Some(a), 0),
+        (Some(a), None, 0),
+        (Some(a), Some(b), 0),
+        (Some(a), Some(a), 1),
+    ] {
+        let got = round_trip(writer, reader);
+        println!("PLANESID writer={writer:?} reader={reader:?} adopted={got}");
+        assert_eq!(
+            got, adopted,
+            "written under {writer:?}, read under {reader:?}"
+        );
+    }
+    let (inner, tier) = fixture(Activations::Bf16);
+    let dtype = format!(
+        "{:?}",
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .layer_kv_pool()
+            .cache_dtype()
+    );
+    assert_eq!(
+        inner.paged_adapter.as_ref().expect("pool").cache_identity(),
+        dtype,
+        "bf16 queries keep the identity of the tree before int8 queries"
+    );
+    let bf16_namespace = tier.tier.namespace.clone();
+    drop((inner, tier));
+    let (inner, tier) = fixture(Activations::Auto);
+    let auto = inner.paged_adapter.as_ref().expect("pool");
+    println!(
+        "QUERYMODE auto rule from {:?}, identity {}",
+        auto.int8_queries_from(),
+        auto.cache_identity()
+    );
+    assert_eq!(auto.cache_identity(), dtype, "one identity in both modes");
+    assert_eq!(tier.tier.namespace, bf16_namespace, "one namespace");
+    drop((inner, tier));
+
+    for (writer, reader) in [
+        (Activations::Bf16, Activations::Auto),
+        (Activations::Auto, Activations::Bf16),
+        (Activations::Auto, Activations::Auto),
+        (Activations::Bf16, Activations::Bf16),
+    ] {
+        let _ = std::fs::remove_dir_all(root.join("cache"));
+        let (mut inner, tier) = fixture(writer);
+        let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let tokens = chain_tokens(41, 1, block_size);
+        cache_chain(&inner, &tokens);
+        let mut anchor = writable_anchor(&inner.config, window(&inner));
+        anchor.window = None;
+        let id = inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Checkpoint)
+            .expect("a whole-block state")
+            .id;
+        inner.sync_gdn_state_marks();
+        assert_eq!(reclaim(&mut inner, id), Reclaimed::Written);
+        settle(&mut inner, &tier, id);
+        assert!(close_cache(
+            &mut inner,
+            std::time::Instant::now() + std::time::Duration::from_secs(6)
+        ));
+        drop((inner, tier));
+        let (mut inner, tier) = fixture(reader);
+        assert_eq!(
+            adopt_all(&mut inner),
+            1,
+            "written under {writer:?}, read under {reader:?}"
+        );
+        drop((inner, tier));
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

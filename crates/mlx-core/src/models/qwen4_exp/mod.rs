@@ -112,6 +112,10 @@ struct Inner {
     /// The stored states' disk tier; `None` when it is off.
     disk: Option<prefix_disk::Disk>,
     telemetry: Arc<prefix_disk::Telemetry>,
+    /// The DFlash2 draft of the load's `draftModelPath`. Its cycle runs
+    /// only in a scheduled turn that `draft_turn` admits at the turn's
+    /// start.
+    draft: Option<decoder::DraftSlot>,
 }
 
 impl Drop for Inner {
@@ -220,6 +224,43 @@ impl Inner {
         }
         self.decoder.refresh_prefill_window();
     }
+    /// The last open turn closed: a store the host gate refused at load
+    /// moves up to whole when the host has room now.
+    fn close_turns(&mut self) {
+        if !self.open_turns.is_empty() || self.exclusive_turn {
+            return;
+        }
+        if let Err(error) = self.promote_store(&mut memory::admit_direct) {
+            tracing::warn!("qwen4 residency: the partial store stays: {error}");
+        }
+    }
+    /// The bytes of this model the host holds that its ledgers count: the
+    /// store's banks, slots and rows, the KV pool and the stored states.
+    fn own_bytes(&self) -> u64 {
+        let pool = self
+            .decoder
+            .paged
+            .as_ref()
+            .and_then(|adapter| adapter.pool_allocated_bytes().ok())
+            .unwrap_or(0);
+        self.decoder
+            .weights
+            .ledgered_bytes()
+            .saturating_add(pool)
+            .saturating_add(self.prefix_states.bytes())
+            .saturating_add(self.draft_bytes_held())
+    }
+    /// [`decoder::Decoder::promote_whole_with`] through the load's host gate.
+    /// A load with the MTP head keeps its store: the whole branch also sizes
+    /// the draft banks, which no promotion re-plans.
+    fn promote_store(&mut self, admit: &mut impl FnMut(u64) -> Result<()>) -> Result<bool> {
+        if self.has_mtp {
+            return Ok(false);
+        }
+        let own = self.own_bytes();
+        self.decoder
+            .promote_whole_with(own, &mut memory::direct_gate_beside, admit)
+    }
 }
 struct Step<'a>(&'a mut Inner);
 impl DecodeStep for Step<'_> {
@@ -279,8 +320,12 @@ impl ChatBackend for Inner {
             paged_attention: self.decoder.paged.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_mtp.then_some(SpeculativePlan {
-                kind: SpeculativeKind::NativeMtp,
+            speculative: (self.has_mtp || self.draft.is_some()).then_some(SpeculativePlan {
+                kind: if self.draft.is_some() {
+                    SpeculativeKind::DraftModel
+                } else {
+                    SpeculativeKind::NativeMtp
+                },
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
                 supports_paged_attention: true,
@@ -365,17 +410,31 @@ impl ChatBackend for Inner {
         let mut config = config.clone();
         crate::engine::params::apply_generation_defaults(&mut config, &self.defaults);
         let mut params = crate::engine::params::extract_chat_params(&config);
-        params.mtp_depth = config.mtp_depth.map_or(2, |_| params.mtp_depth.min(3));
-        // The shared measured verification policy models greedy acceptance.
+        let drafted = self.draft.is_some();
+        let unset_depth = if drafted {
+            decoder::DRAFT_VERIFY_ROWS - 1
+        } else {
+            2
+        };
+        params.mtp_depth = config
+            .mtp_depth
+            .map_or(unset_depth, |_| params.mtp_depth.min(3));
         // Stochastic requests retain fixed-depth, distribution-correct MTP.
-        if !crate::sampling::is_greedy_temperature(
+        let greedy = crate::sampling::is_greedy_temperature(
             params
                 .sampling_config
                 .and_then(|c| c.temperature)
                 .unwrap_or(1.0),
-        ) {
-            params.mtp_adaptive_depth = false;
-        }
+        );
+        // A draft picks its rows itself unless the request pins them.
+        params.mtp_adaptive_depth = if drafted {
+            greedy
+                && config
+                    .mtp_adaptive_depth
+                    .unwrap_or(config.mtp_depth.is_none())
+        } else {
+            greedy && params.mtp_adaptive_depth
+        };
         params
     }
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
@@ -451,6 +510,7 @@ impl ChatBackend for Inner {
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
         if flag.is_none() {
             self.exclusive_turn = false;
+            self.close_turns();
         } else if self.open_turns.is_empty() && !self.exclusive_turn {
             self.exclusive_turn = true;
             self.open_turn(true);
@@ -481,6 +541,11 @@ impl ChatBackend for Inner {
 pub struct Qwen4ExpLoadOptions {
     /// Original matching HF checkpoint containing MTP/vision omitted by GGUF.
     pub auxiliary_model_path: Option<String>,
+    /// A DFlash2 draft checkpoint directory (`DFlash2DraftModel`) for this
+    /// target. The load fails when the draft does not serve the model. A
+    /// turn that asks for speculation (`enableMtp`) runs the draft's cycle
+    /// when it starts alone on a whole store whose banks are filled.
+    pub draft_model_path: Option<String>,
     /// The Metal memory budget (`--max-memory`) the memory plan sizes the
     /// stores, the pool and the windows within.
     pub max_memory_bytes: Option<i64>,
@@ -514,6 +579,7 @@ pub struct Qwen4ExpLoadOptions {
 /// Load-time residency decision (the budget is admitted before payload
 /// reads) plus the live pinned-bank total.
 #[napi(object)]
+#[derive(Default)]
 pub struct Qwen4ExpResidencyInfo {
     pub weight_budget_bytes: f64,
     pub hot_weight_bytes: f64,
@@ -544,7 +610,40 @@ pub struct Qwen4ExpResidencyInfo {
     /// Wired, compressed and other processes' anonymous memory when the
     /// residency was chosen.
     pub live_non_reclaimable_bytes: f64,
-    /// Present when the full-bank load gate selected partial direct slots.
+    /// The host read behind `liveNonReclaimableBytes`: wired + compressor +
+    /// anonymous - purgeable. All 0 without a host read.
+    pub host_wired_bytes: f64,
+    pub host_compressor_bytes: f64,
+    pub host_anonymous_bytes: f64,
+    pub host_purgeable_bytes: f64,
+    /// What the plan holds beside the experts (fixed weights, draft banks,
+    /// row cache, KV allowance, state staging) when residency was chosen.
+    pub anonymous_need_bytes: f64,
+    /// This process's MLX active plus cache bytes when residency was chosen.
+    pub self_mlx_bytes: f64,
+    /// Times since load a store the host gate refused at load moved up to
+    /// whole banks after a turn, the host having room by then.
+    pub residency_promotions: f64,
+    /// Times since load the gate admitted such a move but the host could not
+    /// take its growth (the whole banks less the partial banks, plus a
+    /// layer's staging), so the store stayed partial with every slot kept.
+    pub residency_promotion_refusals: f64,
+    /// Drafted cycles since load whose rows the rule set to one: the draft
+    /// proposed and the verify took the anchor alone. The speculative cycle
+    /// counts (`mtpCycles`) leave these out.
+    pub draft_one_row_cycles: f64,
+    /// Decode steps since load that ran the rows of 2-4 scheduled turns in
+    /// one pass (the lane step); a turn decoding alone adds none.
+    pub lane_steps: f64,
+    /// Where the routed experts live: every one in a direct bank, partial
+    /// slots because the host refused the whole bank set or because the
+    /// store plan streams them, or per-row imports.
+    #[napi(ts_type = "'direct' | 'host-gate' | 'store-plan' | 'rows'")]
+    pub residency: String,
+    /// Routed experts per layer in the checkpoint.
+    pub expert_count: u32,
+    /// Present when the experts take partial slots: the host gate's or the
+    /// store plan's reason.
     pub fallback_reason: Option<String>,
     /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
     /// it had to import.
@@ -567,9 +666,41 @@ pub struct Qwen4ExpResidencyInfo {
     /// Bytes read from the checkpoint files since load (expert fills and row
     /// imports); the page cache may serve part of them.
     pub checkpoint_bytes_read: f64,
-    /// Decode tokens and prefill windows replayed after a tentative device
-    /// route missed the slots.
+    /// Replay passes after a tentative device route missed the slots: each
+    /// pass a decode token runs again from its missed layer (on device or
+    /// host routes; one token can run several) and each prefill window.
     pub route_replays: f64,
+    /// Decode tokens that ran a tentative device-route pass, and those of
+    /// them whose routes missed the slots.
+    pub route_tries: f64,
+    pub route_miss_tokens: f64,
+    /// Decode layers replays ran again on device routes after reading the
+    /// missed experts, and those they ran again on host routes.
+    pub replayed_layers: f64,
+    pub host_tail_layers: f64,
+    /// Times the route guard sent decode tokens to host routes.
+    pub route_guard_trips: f64,
+    /// Slot fills since load, the wall time inside them in microseconds, and
+    /// the bytes they asked of the checkpoint files (each wanted range
+    /// rounded out to 16 KiB pages, a page two ranges share read once, no
+    /// bytes between two ranges).
+    pub fill_calls: f64,
+    pub fill_micros: f64,
+    pub fill_read_bytes: f64,
+    /// The share of `fillCalls`, `fillMicros`, `fillReadBytes`,
+    /// `slotMisses`, `checkpointBytesRead` and `routeReplays` that prefill
+    /// passes moved since load; decode fills and MTP verification passes are
+    /// not in them.
+    pub prefill_fill_calls: f64,
+    pub prefill_fill_micros: f64,
+    pub prefill_fill_read_bytes: f64,
+    pub prefill_slot_misses: f64,
+    pub prefill_checkpoint_bytes_read: f64,
+    pub prefill_route_replays: f64,
+    /// Layer-major prefill groups of two or more windows since load, and the
+    /// windows they ran.
+    pub group_passes: f64,
+    pub group_windows: f64,
     /// Stored prefix states with a RAM copy, and the bytes of every stored
     /// state.
     pub prefix_states: f64,
@@ -577,6 +708,29 @@ pub struct Qwen4ExpResidencyInfo {
     /// States published since load, and turns that resumed from one.
     pub prefix_published: f64,
     pub prefix_restored: f64,
+    /// Points not published since load, by reason (a disk read-back the
+    /// room or live check refuses counts too): the room the plan leaves for
+    /// states had none even after the oldest went; the host's free memory or
+    /// MLX's active ceiling had none; the blocks below the point did not
+    /// register; a pass a cold prefill does not run came before it; a load
+    /// with the MTP head had no draft history there.
+    pub prefix_refused_room: f64,
+    pub prefix_refused_live: f64,
+    pub prefix_refused_register: f64,
+    pub prefix_refused_off_grid: f64,
+    pub prefix_refused_draft: f64,
+    /// Text turns that planned no point since load: the request asked for no
+    /// reuse; or no block-aligned row lies past the resume row before the
+    /// prompt's last token.
+    pub prefix_skipped_reuse_off: f64,
+    pub prefix_skipped_no_points: f64,
+    /// Turns that ended before their replay point was reached: a pass ran
+    /// past it, or the turn was cancelled, failed or reset first.
+    pub prefix_missed_replay: f64,
+    /// States dropped since load because a block of their chain left the
+    /// prefix cache, and because memory gave up their RAM copy.
+    pub prefix_dropped_kv: f64,
+    pub prefix_dropped_memory: f64,
     /// The stored states' disk tier is open and takes writes.
     pub prefix_disk_enabled: bool,
     /// States waiting for their disk write, the one in flight included.
@@ -600,6 +754,27 @@ pub struct Qwen4ExpResidencyInfo {
     pub prefix_disk_owed_blocks: f64,
     /// Bytes of states written.
     pub prefix_disk_state_bytes_written: f64,
+}
+
+impl Qwen4ExpResidencyInfo {
+    /// The stored states' counters, each under its `prefix*` name.
+    fn with_prefix_counters(self, c: &prefix_state::Counters) -> Self {
+        Self {
+            prefix_published: c.published as f64,
+            prefix_restored: c.restored as f64,
+            prefix_refused_room: c.refused_room as f64,
+            prefix_refused_live: c.refused_live as f64,
+            prefix_refused_register: c.refused_register as f64,
+            prefix_refused_off_grid: c.refused_off_grid as f64,
+            prefix_refused_draft: c.refused_draft as f64,
+            prefix_skipped_reuse_off: c.skipped_reuse_off as f64,
+            prefix_skipped_no_points: c.skipped_no_points as f64,
+            prefix_missed_replay: c.missed_replay as f64,
+            prefix_dropped_kv: c.dropped_kv as f64,
+            prefix_dropped_memory: c.dropped_memory as f64,
+            ..self
+        }
+    }
 }
 
 #[napi(object)]
@@ -651,6 +826,8 @@ pub struct Qwen4ExpModel {
     config: config::Config,
     assets_path: String,
     has_mtp: bool,
+    /// A DFlash2 draft is attached.
+    has_draft: bool,
     context_limits: Qwen4ExpContextLimits,
     residency: memory::Plan,
     live: Arc<live::Live>,
@@ -706,6 +883,21 @@ impl Qwen4ExpModel {
                 config.kv_format =
                     load_plan::resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
+                load_plan::refuse_head_with_draft(
+                    LABEL,
+                    has_mtp,
+                    options.draft_model_path.as_deref(),
+                )?;
+                let draft = options
+                    .draft_model_path
+                    .as_deref()
+                    .map(|dir| decoder::load_draft(Path::new(dir), &config))
+                    .transpose()?;
+                let draft_price = draft
+                    .as_ref()
+                    .map_or_else(load_plan::DraftPrice::default, |d| {
+                        load_plan::DraftPrice::of(&config, &d.config, d.weight_bytes)
+                    });
                 let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
                 let (tier_options, disk) = disk_plan(LABEL, &options, env.as_deref())?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
@@ -743,6 +935,7 @@ impl Qwen4ExpModel {
                     max_context,
                     has_mtp,
                     disk,
+                    draft_price,
                 )?;
                 weights.set_store_plan(decision.store, inventory.store_fixed_bytes);
                 let mut decoder = decoder::Decoder::new(config.clone(), weights)?;
@@ -774,6 +967,8 @@ impl Qwen4ExpModel {
                             max_memory,
                             has_mtp,
                             disk,
+                            draft_price,
+                            decision.states,
                         )
                     };
                     let held_back = decoder.weights.held_back_bytes();
@@ -850,7 +1045,10 @@ impl Qwen4ExpModel {
                     prefix_states: prefix_state::States::new(open),
                     disk: None,
                     telemetry: Arc::clone(&telemetry),
+                    draft: None,
                 };
+                let has_draft = draft.is_some();
+                inner.set_draft(draft)?;
                 if disk {
                     let identity = inner
                         .decoder
@@ -883,6 +1081,7 @@ impl Qwen4ExpModel {
                         config,
                         assets,
                         has_mtp,
+                        has_draft,
                         context_limits,
                         residency,
                         live,
@@ -900,6 +1099,7 @@ impl Qwen4ExpModel {
             config,
             assets_path,
             has_mtp,
+            has_draft,
             context_limits,
             residency,
             live,
@@ -949,6 +1149,7 @@ impl Qwen4ExpModel {
             config,
             assets_path,
             has_mtp,
+            has_draft,
             context_limits,
             residency,
             live,
@@ -1050,6 +1251,18 @@ impl Qwen4ExpModel {
             direct_fill_in_progress: live.direct_fill_in_progress.load(Ordering::Acquire),
             bank_budget_bytes: live.bank_budget.load(Ordering::Acquire) as f64,
             live_non_reclaimable_bytes: live.live_non_reclaimable.load(Ordering::Acquire) as f64,
+            host_wired_bytes: live.host_wired.load(Ordering::Acquire) as f64,
+            host_compressor_bytes: live.host_compressor.load(Ordering::Acquire) as f64,
+            host_anonymous_bytes: live.host_anonymous.load(Ordering::Acquire) as f64,
+            host_purgeable_bytes: live.host_purgeable.load(Ordering::Acquire) as f64,
+            anonymous_need_bytes: live.anonymous_need.load(Ordering::Acquire) as f64,
+            self_mlx_bytes: live.self_mlx_bytes.load(Ordering::Acquire) as f64,
+            residency_promotions: live.promotions.load(Ordering::Acquire) as f64,
+            residency_promotion_refusals: live.promotion_refusals.load(Ordering::Acquire) as f64,
+            draft_one_row_cycles: live.draft_one_row_cycles.load(Ordering::Acquire) as f64,
+            lane_steps: live.lane_steps.load(Ordering::Acquire) as f64,
+            residency: live.residency().as_str().to_owned(),
+            expert_count: self.config.num_experts as u32,
             fallback_reason: fallback.as_ref().map(ToString::to_string),
             decoded_row_lookups: lookups as f64,
             decoded_row_misses: misses as f64,
@@ -1066,10 +1279,24 @@ impl Qwen4ExpModel {
             slot_misses: live.slot_misses.load(Ordering::Relaxed) as f64,
             checkpoint_bytes_read: live.bytes_read.load(Ordering::Relaxed) as f64,
             route_replays: live.route_replays.load(Ordering::Relaxed) as f64,
+            route_tries: live.route_tries.load(Ordering::Relaxed) as f64,
+            route_miss_tokens: live.route_miss_tokens.load(Ordering::Relaxed) as f64,
+            replayed_layers: live.replayed_layers.load(Ordering::Relaxed) as f64,
+            host_tail_layers: live.host_tail_layers.load(Ordering::Relaxed) as f64,
+            route_guard_trips: live.route_guard_trips.load(Ordering::Relaxed) as f64,
+            fill_calls: live.fill_calls.load(Ordering::Relaxed) as f64,
+            fill_micros: live.fill_micros.load(Ordering::Relaxed) as f64,
+            fill_read_bytes: live.fill_read_bytes.load(Ordering::Relaxed) as f64,
+            prefill_fill_calls: live.prefill_fill_calls.load(Ordering::Relaxed) as f64,
+            prefill_fill_micros: live.prefill_fill_micros.load(Ordering::Relaxed) as f64,
+            prefill_fill_read_bytes: live.prefill_fill_read_bytes.load(Ordering::Relaxed) as f64,
+            prefill_slot_misses: live.prefill_slot_misses.load(Ordering::Relaxed) as f64,
+            prefill_checkpoint_bytes_read: live.prefill_bytes_read.load(Ordering::Relaxed) as f64,
+            prefill_route_replays: live.prefill_route_replays.load(Ordering::Relaxed) as f64,
+            group_passes: live.group_passes.load(Ordering::Relaxed) as f64,
+            group_windows: live.group_windows.load(Ordering::Relaxed) as f64,
             prefix_states: self.prefix.states.load(Ordering::Relaxed) as f64,
             prefix_state_bytes: self.prefix.state_bytes.load(Ordering::Relaxed) as f64,
-            prefix_published: self.prefix.published.load(Ordering::Relaxed) as f64,
-            prefix_restored: self.prefix.restored.load(Ordering::Relaxed) as f64,
             prefix_disk_enabled: self.prefix.mode(&self.state_tier) != 0,
             prefix_disk_waiting: self.prefix.waiting.load(Ordering::Relaxed) as f64,
             prefix_disk_durable: self.prefix.durable.load(Ordering::Relaxed) as f64,
@@ -1081,15 +1308,19 @@ impl Qwen4ExpModel {
             prefix_disk_owed_blocks: self.prefix.owed.load(Ordering::Relaxed) as f64,
             prefix_disk_state_bytes_written: self.prefix.state_bytes_written.load(Ordering::Relaxed)
                 as f64,
+            ..Default::default()
         }
+        .with_prefix_counters(&self.prefix.counters())
     }
     #[napi]
     pub fn model_assets_path(&self) -> String {
         self.assets_path.clone()
     }
+    /// The MTP head or a DFlash2 draft is attached: a turn that asks for
+    /// speculation (`enableMtp`) can run its cycle.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
-        self.has_mtp
+        self.has_mtp || self.has_draft
     }
     /// SSD-backed draft and verification work is opt-in; head availability
     /// alone does not establish a latency benefit for the current workload.

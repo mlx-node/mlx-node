@@ -350,6 +350,12 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
             total_tokens,
         )
     }
+    fn scheduled_prefix_probe(&self, tokens: &[u32], cache_salt: u64) -> u32 {
+        crate::models::qwen3_5::dflash2_turn::stored_resume_depth(self, tokens, cache_salt)
+    }
+    fn scheduled_prefix_probe_generation(&self) -> u64 {
+        self.dflash2_states.store.generation()
+    }
     fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
             self, seq_id, position,

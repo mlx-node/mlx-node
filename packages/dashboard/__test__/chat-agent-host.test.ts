@@ -114,6 +114,7 @@ describe('Chat host', () => {
           'GROK_CLI_CHAT_PROXY_BASE_URL',
           'GROK_CODEX_HOOKS_ENABLED',
           'GROK_CODEX_MCPS_ENABLED',
+          'GROK_COMPACTION_WALL_CLOCK_SECS',
           'GROK_CONFIG',
           'GROK_CURSOR_HOOKS_ENABLED',
           'GROK_CURSOR_MCPS_ENABLED',
@@ -127,7 +128,9 @@ describe('Chat host', () => {
           'GROK_TELEMETRY_ENABLED',
           'GROK_TELEMETRY_TRACE_UPLOAD',
           'GROK_TURN_SUMMARY',
+          'GROK_TWO_PASS_COMPACTION',
           'GROK_VIDEO_GEN',
+          'GROK_WORKFLOWS',
           'GROK_XAI_API_BASE_URL',
           'HOME',
           'LANG',
@@ -1153,4 +1156,112 @@ describe('Work host: the length stop', () => {
       },
     );
   });
+});
+
+describe('compaction state', () => {
+  /** One prompt: a text, a compaction (`compact` step of the fake agent), then `after`. */
+  const compacting =
+    (compact: Json, after: Json[] = [{ text: ' done.', chunk: 6 }, { end: { stopReason: 'end_turn' } }]) =>
+    (scenario: Json): void => {
+      scenario.prompts = [{ match: '', steps: [{ text: 'Working', chunk: 7 }, { compact }, ...after] }];
+    };
+  const kinds = (fake: FakeHost, id: string) =>
+    fake.events.compactions.filter((c) => c.sessionId === id).map((c) => (c.compaction === null ? null : 'running'));
+
+  it('runs from the started update to the completed one, with the context the agent counted', async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { id, result } = await turn(fake, 'go');
+        expect(result.outcome).toBe('completed');
+        const states = fake.events.compactions.filter((c) => c.sessionId === id).map((c) => c.compaction);
+        expect(states).toEqual([{ phase: 'running', startedAt: expect.any(Number), tokensBefore: 222_822 }, null]);
+        const order = fake.events.timeline.filter((k) => k.includes('compact') || k === 'turn end');
+        expect(order).toEqual([
+          'auto_compact_started',
+          'compaction start',
+          'auto_compact_completed',
+          'compaction end',
+          'turn end',
+        ]);
+        expect(fake.host.compaction(id)).toBeNull();
+      },
+      { mutate: compacting({ ms: 200 }) },
+    );
+  }, 20_000);
+
+  it('a failed compaction ends the state; the turn goes on', async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { id, result } = await turn(fake, 'go');
+        expect(result.outcome).toBe('completed');
+        expect(kinds(fake, id)).toEqual(['running', null]);
+        expect(fake.events.timeline.indexOf('compaction end')).toBe(
+          fake.events.timeline.indexOf('auto_compact_failed') + 1,
+        );
+      },
+      { mutate: compacting({ ms: 100, outcome: 'failed' }) },
+    );
+  }, 20_000);
+
+  it('Stop during a compaction: the agent cancels it, the state ends, the turn ends cancelled', async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+        const started = fake.host.startTurn(sessionId, 'go', { modelId: MODEL });
+        await until(() => fake.host.compaction(sessionId) !== null, 5_000);
+        expect(fake.host.cancel(sessionId)).toBe(true);
+        expect((await started.done).outcome).toBe('cancelled');
+        expect(kinds(fake, sessionId)).toEqual(['running', null]);
+        expect(fake.events.timeline).toContain('auto_compact_cancelled');
+      },
+      { mutate: compacting({ ms: 10_000 }) },
+    );
+  }, 20_000);
+
+  it('the end of the turn ends a compaction the agent never closed', async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { id } = await turn(fake, 'go');
+        const order = fake.events.timeline.filter((k) => k.startsWith('compaction') || k === 'turn end');
+        expect(order).toEqual(['compaction start', 'compaction end', 'turn end']);
+        expect(fake.host.compaction(id)).toBeNull();
+      },
+      { mutate: compacting({ outcome: 'none' }) },
+    );
+  }, 20_000);
+
+  it("the agent's turn_completed line ends it before the prompt's reply", async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+        const started = fake.host.startTurn(sessionId, 'go', { modelId: MODEL });
+        await until(() => fake.events.timeline.includes('compaction end'), 5_000);
+        expect(fake.host.modeState().turnsInFlight).toBe(1);
+        expect(fake.host.compaction(sessionId)).toBeNull();
+        fake.host.cancel(sessionId);
+        await started.done;
+      },
+      { mutate: compacting({ outcome: 'none' }, [{ turnCompleted: {} }, { sleepMs: 10_000 }]) },
+    );
+  }, 20_000);
+
+  it('the exit of the agent ends it at once, before the turn ends', async () => {
+    await withFake(
+      'cancel',
+      async (fake) => {
+        const { result } = await turn(fake, 'go');
+        expect(result.outcome).toBe('agent-crashed');
+        const order = fake.events.timeline.filter(
+          (k) => k.startsWith('compaction') || k === 'cold' || k === 'turn end',
+        );
+        expect(order).toEqual(['compaction start', 'compaction end', 'cold', 'turn end']);
+      },
+      { mutate: compacting({ outcome: 'none' }, [{ exit: 9 }]) },
+    );
+  }, 20_000);
 });

@@ -100,6 +100,8 @@ export function redactEntry(entry: TranscriptEntry, needles: readonly string[]):
     if (out.output !== undefined) out.output = redactCutText(out.output, needles);
   } else if (out.kind === 'wake' && out.truncated === true) {
     out.text = redactCutText(out.text, needles);
+  } else if (out.kind === 'workflow' && out.truncated === true && out.report !== undefined) {
+    out.report = redactCutText(out.report, needles);
   }
   return out;
 }

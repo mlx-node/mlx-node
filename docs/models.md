@@ -367,7 +367,9 @@ load whose GDN layers the fused verify kernel cannot run (non-bf16, missing
 f32 sidecars, heads not 128 wide) refuses the draft.
 The draft state (a second GDN cell and the draft's K/V ring) is priced into
 the one pool window, and every turn, DFlash2 or not, takes that window. A
-DFlash2 turn runs alone on the Barrier lane. An AR, image or MTP turn drops
+dense DFlash2 text turn is a scheduled lane (verify waves of 2 to 4 lanes,
+[concurrent-inference.md](concurrent-inference.md#dflash2-lanes-qwen35-dense));
+a media turn runs alone on the Barrier lane. An AR, image or MTP turn drops
 the live draft window, and a prefix hit without it prefills the draft context
 from 0: parked DFlash2 states have no store on the pool yet, so there is no
 cross-turn resume of a draft window that another turn dropped. A load with a
@@ -500,6 +502,97 @@ keys too, and every turn (AR, image, MTP) takes the one window
 ([docs/qwen38-flash-next.md](qwen38-flash-next.md)). `mlx eval score
 --kv-format int8` scores the int8 cache against the same teacher cache and
 the report names the format the load resolved.
+
+A qwen3_5 load with a DFlash2 draft, 24 / 4 heads of 256, an int8 pool and no
+`paged_block_size` in its config (the Qwen3.8-27B app load) takes Splash's
+attention page: 32-token blocks with keys token-major, store identity `Int8 ktm`.
+Its first load moves the store an older build wrote on the 16-token page into the
+new one, so every stored chat restores at the row it had
+([paged-cache.md](paged-cache.md#32-token-pages-with-token-major-keys-qwen3_5-draft-loads)).
+The first load after the update is longer by that one move. A downgrade to a build
+without 32-token pages makes the moved chats cold.
+
+### Int8 queries (`activations`, qwen3_5 and qwen3_5_moe)
+
+`activations: 'auto'` (Splash `--activations auto`) lets the
+paged attention over an int8 pool score int8 query codes against the int8
+keys (Splash `q8q`): each (row, query head) is rounded to `clamp(rint(x * 127
+/ m), ±127)` with `m` its largest magnitude, and QK is an exact integer
+product. `'bf16'` keeps every query bf16. A qwen3_5 load with a DFlash2
+draft that names no option takes `'auto'` (as Splash does); a qwen3_5 load
+with no draft and a qwen3_5_moe load take `'bf16'` (with no draft every
+decode row is an autoregressive row, which reads 5-11 % slower with int8
+queries on M5 Max at 8K-25K).
+
+**The rule is the row's position.** A query row at KV position `p` scores
+int8 codes iff `p >= 7,168`, on Apple10 GPUs (M5) and later
+(`prefill_plan::int8_query_from`: 32 splits × 7 pages × 32 tokens, the depth
+from which Splash's verify reads 8 pages per split). It is the same in every
+pass: prefill chunks and pieces, verify blocks, plain AR decode, the
+scheduler's batched and ragged lanes, and the portable chunk path. A launch
+that straddles 7,168 runs as two launches; in a decode launch each row takes
+its own rule. So a row takes the same kernel family whatever launch holds
+it. "A DFlash2 lane equals the same request alone" stays bit for bit. "Spec = AR"
+and "warm equals cold" stay what they are with bf16 queries, closeness on
+tie-screened fixtures (X8 in
+[vllm-speculative-alignment.md](vllm-speculative-alignment.md#x8-test-contract-strict-byte-equality-not-thresholded-matching)),
+but in a wider class: launch shapes round a row apart (an 8-row verify
+against a 1-row decode step, a piece against a chunk), from the second layer
+on those ULPs reach the queries, and int8 rounding turns some of them into
+whole code steps. On the sharp test fixtures, past the threshold, the
+spec-vs-AR logits gap is 0.9 to 2.2 times the bf16-query gap (four seeds),
+and the teacher-forced distance of 4-row pieces, 48-row chunks, the portable
+path and AR decode to one cold prefill is 1.2 to 1.7 times. Within one layer
+(the same hidden rows through real 1-row and 8-row projections) a decode row
+stays as close to its verify row as with bf16 queries (0.87 to 1.30 times).
+Fixtures past 7,168 tokens are screened under the mode they run in, with
+about twice the bf16 margin.
+Below 7,168 every query is bf16: a launch that ends at or below 7,168 is bit
+for bit the `'bf16'` path, and the launch that straddles it runs its rows
+below 7,168 as a launch of their own, whose split plan can differ from the
+whole launch's (summation order). Never: M1-M4, bf16 pools, head sizes other
+than 128 / 256, other families, and drafts.
+
+The decode kernels get the codes from one small kernel per attention layer
+(`paged_prefill_attention_query_codes_d128/d256`, the tile's quantizer) and one score scale per
+(row, query head); past 7,168 each AR, batched and ragged decode step pays
+that one dispatch per attention layer. In one timing run at one GPU clock
+(M5 Max, 4 KV heads x 256) the prefill attention's depth cost dropped 21%,
+a verify's attention at 150K 17%, and one AR decode step's attention at
+151K cost the same with the codes, the code dispatch included (two runs:
+median -10% and -5%, minimum -3% and +2%). Teacher-forced on rows of about 7.5K tokens, int8 KV with int8 queries
+against a bf16-KV teacher: Qwen3.5-0.8B top-1 0.980, KL 1.2e-3; Qwen3.8-27B
+top-1 0.986, KL 1.0e-3. At depth (Qwen3.8-27B UD-Q4_K_XL, one 100K-token and two
+36K-token rows of this repository's source and docs, 151,140 positions past
+7,168): top-1 0.9925 and KL 1.9e-3 against the bf16-KV teacher (int8 KV with
+bf16 queries: 0.9927, 1.6e-3), and top-1 0.9926, KL 2.0e-3 against the int8-KV
+bf16-query teacher; every depth bucket up to 100K stays at top-1 >= 0.991 and
+KL <= 4.9e-3. Splash turns it on by default on the same GPUs (Apple10 and
+later) and the band for default-on is top-1 >= 0.97 and KL <= 0.05; the
+qwen3_5 default follows Splash.
+
+**Choosing the mode.** `activations: 'auto' | 'bf16'` in the qwen3_5 /
+qwen3_5_moe load options, `mlx serve --activations`, or `mlx eval score
+--activations`. The desktop app and `mlx agent` pass no option, so a qwen3_5
+load with its DFlash2 draft runs `'auto'`, one with no draft and a
+qwen3_5_moe load `'bf16'`.
+
+The SSD state tier has one identity for both modes: its namespace and KV
+fingerprint name the pool `Int8` under `'auto'` and `'bf16'` alike (as
+Splash's namespace names no mode). Queries are never stored and both modes
+write pages of one layout (past 7,168 their values differ, as the queries that
+fed them differ), so a state written in one mode restores in the other,
+and the stores older builds wrote (bf16 queries, `Int8`) restore under the
+`'auto'` default with no cold prefill. A restored chat then runs its new rows
+past 7,168 with int8 queries over KV that bf16 queries wrote: other bits
+than a cold `'auto'` prefill, the same class as a warm turn against a cold
+one. A parity run between the two modes needs a fresh cache dir.
+
+`contextLimits().attentionQueries` is `'int8'` when the load scores int8
+queries past the threshold, else `'bf16'`. `mlx serve --activations` sets it
+for served qwen3_5 / qwen3_5_moe loads; `mlx eval score --activations` for the
+candidate (unset: the same family default), whose report counts `int8QueryLaunches` and `bf16QueryLaunches`.
+`mlx eval cache` always captures the teacher with bf16 queries.
 
 **Context windows come from the memory plan.** A qwen3_5 / qwen3_5_moe load
 evaluates one memory plan (Splash `evaluateEngineMemoryPlan`) after its

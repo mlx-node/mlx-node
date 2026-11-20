@@ -106,6 +106,8 @@ export interface RouteExtras {
   releaseMemory?: () => Promise<MemoryReleaseAnswer>;
   /** Backs `POST /v1/models/unload`; the route answers 404 without it. */
   unloadModels?: () => Promise<string[]>;
+  /** See `ServerConfig.bindLoadedModel`. */
+  bindLoadedModel?: (name: string) => boolean;
 }
 
 export async function routeRequest(
@@ -252,6 +254,7 @@ export async function routeRequest(
       modelWorkCoordinator,
       resolveModel,
       extras?.turnJournal,
+      extras?.bindLoadedModel,
     );
     return;
   }
@@ -274,7 +277,15 @@ export async function routeRequest(
     }
 
     if (rejectAudio(body)) return;
-    await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel, modelWorkCoordinator);
+    await handleCountMessageTokens(
+      res,
+      body,
+      registry,
+      idleSweeper,
+      resolveModel,
+      modelWorkCoordinator,
+      extras?.bindLoadedModel,
+    );
     return;
   }
 
@@ -310,6 +321,7 @@ export async function routeRequest(
         endText: extras?.thinkingEndText,
       },
       extras?.turnJournal,
+      extras?.bindLoadedModel,
     );
     return;
   }

@@ -5,7 +5,13 @@ import { join, resolve } from 'node:path';
 import { convertModel } from '@mlx-node/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-import { evalCache, evalScore, formatReport, reportJson } from '../../packages/cli/src/commands/eval.js';
+import {
+  evalCache,
+  evalScore,
+  formatReport,
+  parseDepthEdges,
+  reportJson,
+} from '../../packages/cli/src/commands/eval.js';
 
 /**
  * End-to-end for `mlx eval`: capture a bf16 teacher, then score checkpoints
@@ -56,6 +62,7 @@ const EVAL_ROWS = [
 
 // Mutation: `reportJson` writes the CLI's `kvFormat ?? 'bf16'` after `...report` → red.
 // Mutation: drop the `kv_format` line from `formatReport` → red.
+// Mutation: drop the `attention` line from `formatReport` → red.
 describe('mlx eval report', () => {
   const report = {
     rows: 1,
@@ -71,11 +78,39 @@ describe('mlx eval report', () => {
     teacherTailMass: 0.1,
     top1Agreement: 1,
     kvFormat: 'int8' as const,
+    bf16QueryLaunches: 6,
+    int8QueryLaunches: 222,
+    depth: [],
   };
 
   it('names the resolved K/V format in the text and the --json line', () => {
     expect(formatReport('/model', report)).toContain('kv_format        int8');
     expect(JSON.parse(reportJson('/model', report))).toMatchObject({ model: '/model', kvFormat: 'int8' });
+  });
+
+  it('counts the attention launches by query format', () => {
+    expect(formatReport('/model', report)).toContain('attention        222 int8-query / 6 bf16-query launches');
+    expect(JSON.parse(reportJson('/model', report))).toMatchObject({ int8QueryLaunches: 222, bf16QueryLaunches: 6 });
+  });
+
+  // Mutation: `formatReport` skips the depth lines → red. Mutation: `parseDepthEdges` accepts equal edges → red.
+  it('prints one line per depth bucket and parses the edges', () => {
+    const bucket = (from: number, to: number | undefined, top1: number) => ({
+      from,
+      to,
+      positions: 10,
+      meanNll: 1,
+      teacherMeanNll: 1,
+      meanKlTopk: 0.001,
+      top1Agreement: top1,
+    });
+    const text = formatReport('/model', { ...report, depth: [bucket(0, 7168, 0.99), bucket(7168, undefined, 0.98)] });
+    expect(text).toContain('depth       0-7168    ');
+    expect(text).toContain('top1 98.00%');
+    expect(parseDepthEdges('7168,16384')).toEqual([7168, 16384]);
+    expect(() => parseDepthEdges('7168,7168')).toThrow('increase strictly');
+    expect(() => parseDepthEdges('7k')).toThrow('positive integer');
+    expect(() => parseDepthEdges('0')).toThrow('positive integer');
   });
 });
 

@@ -583,6 +583,23 @@ static array paddleocr_vl_block_forward_batched(
 // Public FFI functions
 // ============================================================================
 
+// The Tiled64 K-quant mode `mode` ("q4k@t64") resolved at `bits`, when its
+// 8-row call takes the tensor-op tier for (n, k) on this device.
+namespace {
+std::optional<mlx::core::kquant::Mode> lane_tier_mode(const char* mode, int bits, int n, int k) {
+    if (!mode)
+        return std::nullopt;
+    auto parsed = mlx::core::kquant::parse_mode_layout(mode);
+    if (!parsed || parsed->layout != mlx::core::kquant::Layout::Tiled64)
+        return std::nullopt;
+    auto resolved = mlx::core::kquant::resolve_mode(parsed->mode, bits);
+    if (mlx::core::kquant::is_affine(resolved) ||
+        !mlx::core::kquant::lane_tier_available(resolved, n, k))
+        return std::nullopt;
+    return resolved;
+}
+}  // namespace
+
 extern "C" {
 
 
@@ -1354,6 +1371,51 @@ mlx_array* mlx_quantized_matmul(
         return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
     } catch (const std::exception& e) {
         std::cerr << "mlx_quantized_matmul error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
+bool mlx_kquant_lane_tier_available(const char* mode, int bits, int n, int k) {
+    try {
+        return lane_tier_mode(mode, bits, n, k).has_value();
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_kquant_lane_tier_available error: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// x [16 | 24 | 32, K] bfloat16 of 8-row lanes on the 16/32-row tier: each
+// lane's rows get the bits of an 8-row call. Null when the projection or x
+// does not fit (mlx_kquant_lane_tier_available asks first).
+mlx_array* mlx_quantized_matmul_lane_tier(
+    mlx_array* x,
+    mlx_array* w,
+    mlx_array* scales,
+    mlx_array* biases,
+    int group_size,
+    int bits,
+    const char* mode) {
+    try {
+        if (!x || !w || !scales || !biases)
+            return nullptr;
+        auto& x_arr = *reinterpret_cast<mlx::core::array*>(x);
+        auto& w_arr = *reinterpret_cast<mlx::core::array*>(w);
+        if (x_arr.ndim() != 2 || w_arr.ndim() != 2 || x_arr.dtype() != mlx::core::bfloat16)
+            return nullptr;
+        const int rows = x_arr.shape(0);
+        if (rows != 16 && rows != 24 && rows != 32)
+            return nullptr;
+        auto kmode = lane_tier_mode(mode, bits, w_arr.shape(0), x_arr.shape(1));
+        if (!kmode)
+            return nullptr;
+        auto result = mlx::core::kquant::quantized_matmul(
+            x_arr, w_arr, *reinterpret_cast<mlx::core::array*>(scales),
+            *reinterpret_cast<mlx::core::array*>(biases), true,
+            std::optional<int>(group_size), std::optional<int>(bits), *kmode, {},
+            mlx::core::kquant::Layout::Tiled64, true);
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_quantized_matmul_lane_tier error: " << e.what() << std::endl;
         return nullptr;
     }
 }

@@ -324,6 +324,24 @@ pub(crate) struct Reservation<'g> {
     bytes: u64,
 }
 
+impl<'g> Reservation<'g> {
+    /// `bytes` of this reservation (at most all of it) as a reservation of
+    /// their own; the books do not move.
+    pub(crate) fn split_off(&mut self, bytes: u64) -> Reservation<'g> {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Reservation {
+            governor: self.governor,
+            bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if self.bytes > 0 {

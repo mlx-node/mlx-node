@@ -2572,10 +2572,13 @@ pub async fn load_with_thread(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
 ) -> Result<Qwen3_5Model> {
+    let activations =
+        crate::models::qwen3_5::load_plan::default_activations(false, draft_model_path.is_some());
     load_with_source(
         &CheckpointSource::Dir(PathBuf::from(model_path)),
         draft_model_path,
         kv_format,
+        activations,
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
@@ -2587,22 +2590,35 @@ pub async fn load_with_thread(
 
 /// [`load_with_thread`] for a tool that drives the model directly (`mlx
 /// eval`, FP8 calibration): no load warm-up, since no scheduled turn runs.
+/// `model_path` is a checkpoint directory or a prepared GGUF asset directory.
 pub async fn load_for_tool(
     model_path: &str,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
 ) -> Result<Qwen3_5Model> {
-    load_tool_source(&CheckpointSource::Dir(PathBuf::from(model_path)), kv_format).await
+    let source = CheckpointSource::resolve(
+        Path::new(model_path),
+        crate::utils::gguf::NativeGgufFamily::Qwen35,
+    )
+    .await?;
+    let loaded = load_tool_source(&source, kv_format, activations).await;
+    if loaded.is_err() {
+        source.release_lease();
+    }
+    loaded
 }
 
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_tool_source(
     source: &CheckpointSource,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
 ) -> Result<Qwen3_5Model> {
     load_with_thread_impl(
         source,
         None,
         kv_format,
+        activations,
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
@@ -2619,6 +2635,7 @@ pub(crate) async fn load_with_source(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
@@ -2629,6 +2646,7 @@ pub(crate) async fn load_with_source(
         source,
         draft_model_path,
         kv_format,
+        activations,
         max_memory_bytes,
         max_context,
         decode_share,
@@ -2640,6 +2658,122 @@ pub(crate) async fn load_with_source(
     .await
 }
 
+/// The GGUF planes a load of `input` writes in its import (conditions in
+/// [`crate::utils::gguf_planes`]): the header's plan on this device under
+/// the load's memory cap, with a DFlash2 draft and not for CLEF, every
+/// tensor whose pipelines build in all row tiers and whose sources the import
+/// reads in whole 64-row bands, and only when `admission` admits their bytes
+/// on the device now; `None` when nothing is planned.
+fn load_planes_plan(
+    input: &crate::utils::gguf_import::PreloadInput,
+    draft: bool,
+    clef: bool,
+    max_memory_bytes: Option<u64>,
+    admission: Option<std::result::Result<PlanesAdmission, String>>,
+) -> Option<crate::utils::gguf_planes::PlanesPlan> {
+    use crate::utils::gguf_planes::{
+        PlanesDevice, PlanesLoad, PlanesPlan, load_line, plan_for_load, prepare_planes,
+    };
+    let load = PlanesLoad::of_load(draft, clef, input.main.parts.len());
+    let plan = plan_for_load(
+        &input.main.header,
+        &PlanesDevice::this(max_memory_bytes),
+        &load,
+    );
+    let mut plan = if plan.tensors.is_empty() {
+        plan
+    } else {
+        let import = &input.main.plan;
+        prepare_planes(plan)
+            .keep_banded(|name| import.import_k_quants && import.tiled_gguf_names.contains(name))
+    };
+    if !plan.tensors.is_empty() {
+        let verdict = admission
+            .ok_or_else(|| "the load has no draft to price".to_string())
+            .and_then(|admission| admission)
+            .and_then(|admission| admission.verdict(plan.bytes()));
+        match verdict {
+            Ok(line) => load_line(format!("GGUF planes admitted before the import: {line}")),
+            Err(why) => {
+                load_line(format!("GGUF planes not admitted before the import: {why}"));
+                plan = PlanesPlan {
+                    tensors: Vec::new(),
+                    walk: plan.walk,
+                    left_out: vec![(
+                        "import guard".to_string(),
+                        "lanes, window or pool lost to the planes",
+                    )],
+                };
+            }
+        }
+    }
+    load_line(plan.describe());
+    (!plan.tensors.is_empty()).then_some(plan)
+}
+
+/// What a dense GGUF load with a DFlash2 draft prices its planes with before
+/// the import ([`crate::models::qwen3_5::load_plan::admit_planes`]).
+struct PlanesAdmission {
+    asset_dir: PathBuf,
+    weight_bytes: u64,
+    header: crate::models::qwen3_5::load_plan::CheckpointHeader,
+    draft_dir: PathBuf,
+    kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+    cache_disk: crate::disk_tier::CacheDisk,
+}
+
+impl PlanesAdmission {
+    /// `None` for a load that plans no planes (no GGUF, no draft, CLEF);
+    /// `Err` holds why the load cannot price them.
+    fn of(
+        source: &CheckpointSource,
+        draft: Option<&str>,
+        clef: bool,
+        kv_format: Option<crate::transformer::KvFormat>,
+        max_memory_bytes: Option<u64>,
+        max_context: Option<u32>,
+        cache_disk: crate::disk_tier::CacheDisk,
+    ) -> Option<std::result::Result<Self, String>> {
+        use crate::models::qwen3_5::load_plan::{checkpoint_header, checkpoint_weight_bytes};
+        let (CheckpointSource::Gguf(_), Some(draft), false) = (source, draft, clef) else {
+            return None;
+        };
+        let priced = checkpoint_weight_bytes(source).and_then(|weight_bytes| {
+            Ok(Self {
+                asset_dir: source.asset_dir().to_path_buf(),
+                weight_bytes,
+                header: checkpoint_header(source, false)?,
+                draft_dir: PathBuf::from(draft),
+                kv_format,
+                max_memory_bytes,
+                max_context,
+                cache_disk,
+            })
+        });
+        Some(priced.map_err(|error| error.reason))
+    }
+
+    fn verdict(self, planes_bytes: u64) -> std::result::Result<String, String> {
+        crate::models::qwen3_5::load_plan::admit_planes(
+            "Qwen3.5",
+            &crate::models::qwen3_5::load_plan::EstimateInput {
+                asset_dir: &self.asset_dir,
+                moe: false,
+                weight_bytes: self.weight_bytes,
+                planes_bytes,
+                header: self.header,
+                draft_dir: Some(&self.draft_dir),
+                kv_format: self.kv_format,
+                max_memory_bytes: self.max_memory_bytes,
+                max_context: self.max_context,
+                cache_disk: self.cache_disk,
+            },
+        )
+    }
+}
+
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Qwen3_5Model> {
     check_clef_assets(source)?;
@@ -2647,6 +2781,7 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
         source,
         None,
         Some(crate::transformer::KvFormat::Bf16),
+        crate::transformer::Activations::Bf16,
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
@@ -2707,6 +2842,7 @@ async fn load_with_thread_impl(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
@@ -2715,15 +2851,25 @@ async fn load_with_thread_impl(
     warm: bool,
     progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5Model> {
+    crate::engine::dspark_timeline::configure_from_env();
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
     let model_path = model_assets_path.clone();
-    let preload_input = match source {
+    let mut preload_input = match source {
         CheckpointSource::Dir(_) => None,
         CheckpointSource::Gguf(checkpoint) => {
             checkpoint.check_asset_config()?;
             Some(checkpoint.preload_input(true))
         }
     };
+    let planes_admission = PlanesAdmission::of(
+        source,
+        draft_model_path.as_deref(),
+        clef,
+        kv_format,
+        max_memory_bytes,
+        max_context,
+        disk.cache_disk,
+    );
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
@@ -2834,6 +2980,15 @@ async fn load_with_thread_impl(
                 let mut streamed_params = HashMap::new();
                 let mut clef_layers_finalized = 0usize;
                 let mut prepared_clef = None;
+                if let Some(input) = preload_input.as_mut() {
+                    input.planes = load_planes_plan(
+                        input,
+                        draft_model_path.is_some(),
+                        clef,
+                        max_memory_bytes,
+                        planes_admission,
+                    );
+                }
                 let mut preload = match preload_input.as_ref() {
                     Some(input)
                         if clef
@@ -2907,6 +3062,10 @@ async fn load_with_thread_impl(
                         stats.cpu_tensors,
                     );
                 }
+                let planes_arrays = preload
+                    .as_mut()
+                    .map(|preload| std::mem::take(&mut preload.planes))
+                    .unwrap_or_default();
                 let mut raw_params = load_checkpoint(path, true, preload.as_mut())?;
                 let gguf_clef_head = preload.map(|preload| preload.clef_head.filter(|_| clef));
 
@@ -3109,6 +3268,7 @@ async fn load_with_thread_impl(
                 inner.disk_options = disk.clone();
                 inner.max_context = max_context;
                 inner.decode_share = decode_share;
+                inner.activations = activations;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Deterministic weight-byte total of the text checkpoint for
@@ -3144,12 +3304,21 @@ async fn load_with_thread_impl(
                     clef_residency,
                     prepared_clef,
                 )?;
+                if let Some(plan) = preload_input
+                    .as_ref()
+                    .and_then(|input| input.planes.as_ref())
+                {
+                    inner.attach_planes(plan, planes_arrays)?;
+                }
                 // A Dir load's CLEF pre-pass replaced packed groups with int8
                 // or bf16. Streamed GGUF arrays were counted after residency,
-                // so their installation returns a zero delta.
-                let text_weight_bytes = (text_weight_bytes as i64)
+                // so their installation returns a zero delta. The planes are
+                // weights the cache-limit count holds too.
+                let planes_bytes = inner.attached_planes_bytes();
+                let text_weight_bytes = ((text_weight_bytes as i64)
                     .saturating_add(clef_byte_delta)
-                    .max(0) as u64;
+                    .max(0) as u64)
+                    .saturating_add(planes_bytes);
                 inner.prism_hadamard = prism_runtime;
                 if clef {
                     // Presence is the contract: decide_json never runs the
@@ -3190,6 +3359,7 @@ async fn load_with_thread_impl(
                     draft.validate_target(&config)?;
                     inner.dflash2 = Some(draft);
                     info!("Loaded external Qwen3.8 DFlash2 companion from {draft_path}");
+                    inner.dflash2_wave_ready = super::scheduled_dflash2::wave_ready_at_load(&inner);
                     bytes
                 } else {
                     0
@@ -3320,6 +3490,11 @@ async fn load_with_thread_impl(
                         },
                     )?;
 
+                // The pool's plan may drop the planes (they cost lanes, window or
+                // too much of the pool); the count then gives their bytes back.
+                weight_bytes = weight_bytes
+                    .saturating_sub(planes_bytes.saturating_sub(inner.attached_planes_bytes()));
+
                 inner.build_disk_tier_context(
                     checkpoint_files,
                     draft_load.as_ref(),
@@ -3330,6 +3505,8 @@ async fn load_with_thread_impl(
                 Ok((inner, weight_bytes, pool_cache_limit_guard))
             })();
             let (mut inner, weight_bytes, pool_cache_limit_guard) = load_result?;
+            #[cfg(test)]
+            planes_real_tests::run_loaded_hook(&mut inner)?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
             // Dynamic (grow-on-demand) pools re-register their byte total on
             // every grow. The closure captures only the guard's id (Copy), so
@@ -3605,6 +3782,10 @@ pub fn create_random_qwen35_checkpoint<'env>(
         Ok(())
     })
 }
+
+#[cfg(test)]
+#[path = "persistence_planes_real_tests.rs"]
+mod planes_real_tests;
 
 #[cfg(test)]
 mod tests {

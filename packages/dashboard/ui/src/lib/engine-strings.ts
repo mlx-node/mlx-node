@@ -61,6 +61,11 @@ export const ENGINE = {
     thisModel: 'This model',
     unread: 'The pool is read when the model is idle. There is no reading yet.',
   },
+  models: {
+    expertsPartial: 'Experts: {inMemory} of {total} in memory, streaming',
+    expertsAll: 'Experts: {total} of {total} in memory',
+    expertsStreaming: 'Experts: streaming from SSD',
+  },
   memory: {
     pools: 'Block pool capacity',
     poolsHint: 'limit of {n} paged models',

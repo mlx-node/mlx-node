@@ -66,6 +66,7 @@ function request(tool: string, rawInput: unknown, over: Partial<PermissionReques
     rawInput,
     options: OPTIONS,
     ...over,
+    requester: over.requester ?? null,
   };
 }
 

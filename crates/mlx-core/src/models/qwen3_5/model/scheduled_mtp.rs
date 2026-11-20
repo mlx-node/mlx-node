@@ -136,6 +136,27 @@ impl ScheduledMtpTarget for Qwen35Inner {
     }
 }
 
+/// A full-attention layer made sharp, so the rounding of INT8 query codes
+/// moves the logits: q_norm gain 24 on one dimension and 1 elsewhere,
+/// k_norm gain 4.
+#[cfg(test)]
+pub(crate) fn sharpen_attention(attn: &mut crate::models::qwen3_5::attention::Qwen3_5Attention) {
+    use crate::array::DType;
+    let head = attn.get_q_norm_weight().shape().unwrap()[0] as usize;
+    let mut q = vec![1.0f32; head];
+    q[head / 3] = 24.0;
+    let q = MxArray::from_float32(&q, &[head as i64])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+    attn.set_q_norm_weight(&q, DType::BFloat16).unwrap();
+    let k = MxArray::from_float32(&vec![4.0f32; head], &[head as i64])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+    attn.set_k_norm_weight(&k, DType::BFloat16).unwrap();
+}
+
 #[cfg(test)]
 pub(crate) fn seeded_inner(seed: u64) -> Qwen35Inner {
     seeded_inner_with_config(seed, |_| {})

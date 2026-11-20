@@ -159,6 +159,7 @@ function request(row: Row): PermissionRequest {
     rawInput,
     options: OPTIONS,
     hookAsk: { hookName: GUARD, reason: null },
+    requester: null,
   };
 }
 

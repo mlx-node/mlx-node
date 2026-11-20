@@ -8,6 +8,8 @@ export interface CapabilityAdapter {
   listModels(): PublicModelEntry[];
   hasResident(name: string): boolean;
   resolveModel(name: string): Promise<void>;
+  /** See {@link SwapController.bindLoadedAlias}. */
+  bindLoadedAlias?(name: string): boolean;
   disposeAll(): Promise<void>;
 }
 /** Called under ModelWorkCoordinator's writer admission, shared by every task. */
@@ -30,6 +32,10 @@ export function withCapabilityModels(
       if (residency === 'single') for (const other of adapters) if (other !== adapter) await other.disposeAll();
       await adapter.resolveModel(name);
     },
+    bindLoadedAlias(name) {
+      if (residency === 'single' || byName.has(name)) return false;
+      return chat?.bindLoadedAlias?.(name) ?? false;
+    },
     listModels: () => adapters.flatMap((a) => a.listModels()).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
   };
 }
@@ -39,6 +45,7 @@ export function chatCapability(chat: SwapController, registry: ModelRegistry): C
     listModels: () => chat.listModels(),
     hasResident: (name) => !!registry.getAny(name),
     resolveModel: (name) => chat.resolveModel(name),
+    bindLoadedAlias: (name) => chat.bindLoadedAlias?.(name) ?? false,
     async disposeAll() {
       if (chat.disposeAll) {
         await chat.disposeAll();

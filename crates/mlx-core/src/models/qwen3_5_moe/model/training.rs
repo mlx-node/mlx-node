@@ -1799,6 +1799,12 @@ impl Qwen35MoeInner {
 /// `impl EvalBackend for Qwen35Inner`, plus the `fa_idx` the MoE stack threads
 /// through its forward.
 impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
+    fn attention_query_launches(&self) -> [u64; 2] {
+        self.paged_adapter
+            .as_ref()
+            .map_or([0, 0], |adapter| adapter.tile_query_launches())
+    }
+
     fn kv_format(&self) -> crate::transformer::KvFormat {
         match self.paged_adapter.as_ref() {
             Some(adapter) => match adapter.layer_kv_pool().cache_dtype() {

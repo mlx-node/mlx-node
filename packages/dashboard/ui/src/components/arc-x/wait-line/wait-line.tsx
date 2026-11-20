@@ -1,4 +1,4 @@
-import type { ReactElement } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { LiveLabel } from '../live-label/live-label';
 import { WaitOrb, type WaitOrbState } from '../wait-orb/wait-orb';
@@ -11,10 +11,12 @@ export interface WaitLineProps {
   text: string;
   /** It arrived live (not from history): it rises in once. */
   enter?: boolean;
+  /** Drawn after the status on the same line: a bar of a measured wait, its clock. */
+  trail?: ReactNode;
 }
 
-/** The pending row of a turn with no answer yet: an orb and the status, one line high unless the text wraps. */
-export function WaitLine({ orb, text, enter }: WaitLineProps): ReactElement {
+/** The pending row of a turn: an orb and the status, one line high unless the text wraps. */
+export function WaitLine({ orb, text, enter, trail }: WaitLineProps): ReactElement {
   return (
     <article
       className={styles.root}
@@ -27,6 +29,7 @@ export function WaitLine({ orb, text, enter }: WaitLineProps): ReactElement {
       <LiveLabel active className={styles.text}>
         {text}
       </LiveLabel>
+      {trail}
     </article>
   );
 }

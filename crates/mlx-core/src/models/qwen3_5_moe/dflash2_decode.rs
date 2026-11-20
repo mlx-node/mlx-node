@@ -103,7 +103,8 @@ impl Qwen35MoeDFlash2Stepper<'_> {
             crate::models::qwen3_5::dflash2::SelectorPath::Host(ids) => {
                 Ok(ids.into_iter().map(|id| id as u32).collect())
             }
-            crate::models::qwen3_5::dflash2::SelectorPath::Device(ids) => {
+            crate::models::qwen3_5::dflash2::SelectorPath::Device(ids)
+            | crate::models::qwen3_5::dflash2::SelectorPath::Sampled { ids, .. } => {
                 DraftedProposals::Device(ids).host()
             }
         }
@@ -255,6 +256,10 @@ impl Qwen35MoeDFlash2Stepper<'_> {
 }
 
 impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
+    fn device_sampled_rows(&self) -> bool {
+        true
+    }
+
     fn propose(
         &mut self,
         anchor_id: u32,
@@ -314,23 +319,29 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
                 "dflash2_verify_budget",
             )?);
         }
-        let (draft_ids, device_draft_ids) = match path {
+        let (draft_ids, device_draft_ids, device_draft_sparse) = match path {
             crate::models::qwen3_5::dflash2::SelectorPath::Device(ids) => {
-                // Queue the draft before the verify graph is built so the GPU
-                // is not idle during that host work. Off Metal this call is a
-                // blocking eval, which would only serialize the two builds.
-                if unsafe { mlx_sys::mlx_metal_is_available() } {
-                    let mut roots = vec![&ids];
-                    roots.extend(self.verify_row_budget.as_ref());
-                    MxArray::async_eval_arrays(&roots);
-                }
-                (Vec::new(), Some(ids))
+                (Vec::new(), Some(ids), None)
             }
-            crate::models::qwen3_5::dflash2::SelectorPath::Host(ids) => (ids, None),
+            crate::models::qwen3_5::dflash2::SelectorPath::Sampled { ids, rows } => {
+                (Vec::new(), Some(ids), Some(rows))
+            }
+            crate::models::qwen3_5::dflash2::SelectorPath::Host(ids) => (ids, None, None),
         };
+        // Queue the draft before the verify graph is built so the GPU is not
+        // idle during that host work. Off Metal this call is a blocking eval,
+        // which would only serialize the two builds.
+        if let Some(ids) = &device_draft_ids
+            && unsafe { mlx_sys::mlx_metal_is_available() }
+        {
+            let mut roots = vec![ids];
+            roots.extend(self.verify_row_budget.as_ref());
+            MxArray::async_eval_arrays(&roots);
+        }
         let mut proposal = DsparkProposal {
             draft_ids,
             device_draft_ids,
+            device_draft_sparse,
             draft_dists: Vec::new(),
             draft_sparse_dists,
             keep_probabilities: None,
@@ -2185,5 +2196,182 @@ mod paged_dflash2_tests {
         })();
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
         result
+    }
+
+    fn sampled_config(max_new_tokens: i32) -> crate::engine::types::ChatConfig {
+        crate::engine::types::ChatConfig {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.0),
+            max_new_tokens: Some(max_new_tokens),
+            reasoning_effort: Some("none".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The sampled cycle of `run_dspark_turn` on the device rows: propose
+    /// (the MoE draft is walked on the host), verify the host ids, queue the
+    /// rows, accept, commit, queue the boundary. Returns the tokens, the
+    /// cached prefix and the cycles the rows took.
+    fn sampled_rows_cycles(
+        inner: &mut Qwen35MoeInner,
+        prompt: &[u32],
+        n: usize,
+        seed: u64,
+    ) -> Result<(Vec<u32>, usize, usize)> {
+        let prefix = inner.prime_dspark_prefix_state(prompt, true, 0)?;
+        let cached = prefix.effective_cached_prefix_len();
+        let suffix = prompt[cached..].to_vec();
+        let logits =
+            inner.paged_prefill_with_draft_state(&suffix, &prefix, Stream::generation())?;
+        let mut generated = argmax_rows(&logits)?;
+        generated.drain(..generated.len() - 1);
+        let params = crate::engine::extract_chat_params(&sampled_config(n as i32));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut cycles = 0;
+        let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
+        while generated.len() < n {
+            let anchor = *generated.last().expect("one token");
+            let l_cap = DFLASH2_DRAFT_PROPOSALS.min(n - generated.len() - 1);
+            if l_cap == 0 {
+                break;
+            }
+            let mut proposal = step.propose(anchor, l_cap, &params, &mut rng)?;
+            if proposal.device_draft_ids.is_some() {
+                return Err(Error::from_reason(
+                    "a sampled MoE draft is walked on the host",
+                ));
+            }
+            let mut ids = vec![anchor];
+            ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+            let verified = step.verify(&ids)?;
+            let rows = crate::engine::dspark_turn::submit_sampled_rows(
+                &verified.logits,
+                &proposal,
+                &params,
+                &mut rng,
+            )?
+            .ok_or_else(|| Error::from_reason("the device rows take a sampled MoE cycle"))?;
+            let (k, boundary) = rows.accept(&mut proposal, None)?;
+            cycles += 1;
+            step.commit_with_provenance(k + 1, ids.len(), &ids)?;
+            generated.extend_from_slice(&ids[1..=k]);
+            generated.push(boundary);
+            DsparkStepper::eval_boundary(&step, &MxArray::from_int32(&[boundary as i32], &[1])?);
+        }
+        step.finish()?;
+        generated.truncate(n);
+        Ok((generated, cached, cycles))
+    }
+
+    /// One product whole turn (`run_paged_turn`, the draft-model plan) on
+    /// `config`: (device rows cycles, (device, host) accepts).
+    fn moe_product_turn(
+        inner: &mut Qwen35MoeInner,
+        tokens: &[u32],
+        config: &crate::engine::types::ChatConfig,
+    ) -> Result<(usize, (usize, usize))> {
+        use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
+        use crate::engine::dspark_turn::{TEST_SAMPLED_ACCEPTS, TEST_SAMPLED_ROWS};
+        use crate::engine::plan::{
+            DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+        };
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let params = ChatBackend::resolve_params(inner, config);
+        let mut args = WholeTurnArgs {
+            tokens,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config,
+            params: &params,
+            thinking: ChatBackend::thinking_setup(inner, config),
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        TEST_SAMPLED_ROWS.with(|c| c.set(0));
+        TEST_SAMPLED_ACCEPTS.with(|c| c.set((0, 0)));
+        let TurnOutput::Complete(result) = ChatBackend::run_paged_turn(inner, &mut args)? else {
+            return Err(Error::from_reason("a sync turn completes"));
+        };
+        assert_eq!(result.num_tokens, config.max_new_tokens.unwrap_or(0) as u32);
+        Ok((
+            TEST_SAMPLED_ROWS.with(|c| c.get()),
+            TEST_SAMPLED_ACCEPTS.with(|c| c.get()),
+        ))
+    }
+
+    /// A sampled MoE DFlash2 whole turn takes the route the stepper
+    /// documents: an unpenalized turn with `top_k` 1-256 walks its draft on
+    /// the host and accepts every cycle on the device rows; a penalized turn
+    /// and a `top_k` 0 turn keep the filter chain. On the rows, a seed
+    /// repeats its tokens, another seed draws others, and a restored prefix
+    /// gives the tokens of a cold one.
+    #[test]
+    fn a_sampled_moe_dflash2_turn_takes_the_device_rows() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_sampled_moe_dflash2_turn_takes_the_device_rows",
+        ) || !unsafe { mlx_sys::mlx_metal_is_available() }
+        {
+            return Ok(());
+        }
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_8101;
+        let first = prompt(40);
+        let (rows, accepts) = moe_product_turn(
+            &mut tiny_paged_int8_moe_dflash_inner(seed),
+            &first,
+            &sampled_config(24),
+        )?;
+        assert!(
+            rows >= 3 && accepts == (0, 0),
+            "the device rows: {rows} cycles, (device, host) accepts {accepts:?}"
+        );
+        let mut penalized = sampled_config(24);
+        penalized.repetition_penalty = Some(1.1);
+        let mut unbounded = sampled_config(24);
+        unbounded.top_k = Some(0);
+        for (tag, config) in [("penalized", penalized), ("top_k 0", unbounded)] {
+            let (rows, (device, host)) =
+                moe_product_turn(&mut tiny_paged_int8_moe_dflash_inner(seed), &first, &config)?;
+            assert!(
+                rows == 0 && device == 0 && host >= 3,
+                "{tag}: the filter chain: {rows} rows cycles, accepts ({device}, {host})"
+            );
+        }
+        let run = |draws: u64| -> Result<(Vec<u32>, usize, usize)> {
+            sampled_rows_cycles(
+                &mut tiny_paged_int8_moe_dflash_inner(seed),
+                &first,
+                48,
+                draws,
+            )
+        };
+        let a = run(5)?;
+        assert!(a.2 >= 6, "{} rows cycles", a.2);
+        assert_eq!(a, run(5)?, "same seed, other tokens");
+        assert_ne!(a.0, run(6)?.0, "the stream does not follow the seed");
+        let mut second = first.clone();
+        second.extend((0..8u32).map(|i| (i * 3 + 2) % VOCAB));
+        let mut warm = tiny_paged_int8_moe_dflash_inner(seed);
+        moe_product_turn(&mut warm, &first, &sampled_config(12))?;
+        let restored = sampled_rows_cycles(&mut warm, &second, 32, 21)?;
+        let fresh =
+            sampled_rows_cycles(&mut tiny_paged_int8_moe_dflash_inner(seed), &second, 32, 21)?;
+        assert!(restored.1 > 0, "the second turn restored nothing");
+        assert_eq!(fresh.1, 0);
+        assert_eq!(restored.0, fresh.0, "restored {} rows", restored.1);
+        Ok(())
     }
 }

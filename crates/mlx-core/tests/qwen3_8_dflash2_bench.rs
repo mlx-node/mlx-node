@@ -127,6 +127,7 @@ async fn qwen38_dflash2_perf() {
         Some(Qwen35LoadOptions {
             draft_model_path: Some(draft),
             kv_format: None,
+            activations: None,
             max_memory_bytes: None,
             max_context_tokens: None,
             decode_share: None,
@@ -805,6 +806,7 @@ async fn run_restore_case(case: RestoreCase) {
         Some(Qwen35LoadOptions {
             draft_model_path: Some(draft),
             kv_format: None,
+            activations: None,
             max_memory_bytes: None,
             max_context_tokens: None,
             decode_share: None,

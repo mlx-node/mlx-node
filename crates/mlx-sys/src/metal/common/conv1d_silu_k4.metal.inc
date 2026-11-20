@@ -3,7 +3,8 @@
 R"(
     const uint ch = thread_position_in_grid.x;
     const uint token = thread_position_in_grid.y;
-    if (ch >= W || token >= TOKENS) return;
+    const uint tokens = uint(x_shape[1]);
+    if (ch >= W || token >= tokens) return;
     float total = 0.0f;
     {
         #pragma clang fp contract(off)
@@ -21,7 +22,7 @@ R"(
     // Every output history row must be written even for a one-token chunk.
     if (token == 0) {
         for (uint row = 0; row < 3; ++row) {
-            uint source = TOKENS + row;
+            uint source = tokens + row;
             next_history[row * W + ch] = source < 3
                 ? history[source * W + ch] : x[(source - 3) * W + ch];
         }

@@ -18,6 +18,7 @@ import {
   patchConversationInput,
   permissionModeInput,
   promptInput,
+  runParam,
   workHooksQuery,
 } from '../../chat/route-input.js';
 import type { ChatService } from '../../chat/service.js';
@@ -95,6 +96,19 @@ export function handleChatCancel(ctx: MainApiContext, req: ApiRequest): Promise<
     const id = idParam(req.params.id);
     noBody(req.body);
     return service(ctx).cancel(id);
+  });
+}
+
+/**
+ * `POST /api/chat/conversations/:id/runs/:runId/stop`: Stop run. 404 `No such run.` when the run is not live, 409 when
+ * the agent rejects the stop, 503 when its reply does not come.
+ */
+export function handleChatStopRun(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => {
+    const id = idParam(req.params.id);
+    const runId = runParam(req.params.runId);
+    noBody(req.body);
+    return service(ctx).stopRun(id, runId);
   });
 }
 

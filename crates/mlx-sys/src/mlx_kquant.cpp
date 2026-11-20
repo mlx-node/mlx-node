@@ -13,6 +13,7 @@
 #include "mlx/ops.h"
 #include "mlx/transforms_impl.h"
 
+#include <cstdio>
 #include <numeric>
 #include <sstream>
 
@@ -369,7 +370,8 @@ void validate_tiled_layout(std::string_view tag, const array &w, int bits,
 array quantized_matmul(const array &x, const array &w, const array &scales,
                        const std::optional<array> &biases, bool transpose,
                        std::optional<int> group_size_, std::optional<int> bits_,
-                       Mode mode_, StreamOrDevice s, Layout layout) {
+                       Mode mode_, StreamOrDevice s, Layout layout,
+                       bool lane_tiers) {
   const Mode mode = resolve_mode(mode_, bits_);
   validate_mode_with_type("quantized_matmul", mode, scales, biases,
                           std::nullopt);
@@ -397,7 +399,8 @@ array quantized_matmul(const array &x, const array &w, const array &scales,
   out_shape.back() = w_outer;
   return array(std::move(out_shape), dtype,
                std::make_shared<KQuantMatmul>(to_stream(s), group_size, bits,
-                                              mode, transpose, layout),
+                                              mode, transpose, layout,
+                                              lane_tiers),
                std::move(inputs));
 }
 
@@ -522,7 +525,8 @@ array dequantize(const array &w, const array &scales,
 bool KQuantMatmul::is_equivalent(const Primitive &other) const {
   const auto &o = static_cast<const KQuantMatmul &>(other);
   return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_ &&
-         transpose_ == o.transpose_ && layout_ == o.layout_;
+         transpose_ == o.transpose_ && layout_ == o.layout_ &&
+         lane_tiers_ == o.lane_tiers_;
 }
 
 std::vector<Shape>
@@ -531,6 +535,17 @@ KQuantMatmul::output_shapes(const std::vector<array> &inputs) {
   auto out_shape = inputs[0].shape();
   out_shape.back() = transpose_ ? w.shape(-2) : w.shape(-1) * 32 / bits_;
   return {std::move(out_shape)};
+}
+
+bool KQuantMatmulEpilogue::is_equivalent(const Primitive &other) const {
+  const auto &o = static_cast<const KQuantMatmulEpilogue &>(other);
+  return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_ &&
+         epilogue_ == o.epilogue_;
+}
+
+std::vector<Shape>
+KQuantMatmulEpilogue::output_shapes(const std::vector<array> &inputs) {
+  return {inputs[4].shape()};
 }
 
 bool KQuantGatherQMM::is_equivalent(const Primitive &other) const {
@@ -1317,6 +1332,12 @@ void KQuantMatmul::eval_cpu(const std::vector<array> &inputs, array &out) {
       });
 }
 
+void KQuantMatmulEpilogue::eval_cpu(const std::vector<array> &,
+                                    array &) {
+  throw std::runtime_error(
+      "[quantized_matmul] The K-quant store epilogue runs on the GPU only.");
+}
+
 void KQuantGatherQMM::eval_cpu(const std::vector<array> &inputs, array &out) {
   validate_cpu_config("gather_qmm", mode_, inputs[0].dtype(), bits_,
                       group_size_);
@@ -1391,3 +1412,65 @@ void KQuantDequantize::eval_cpu(const std::vector<array> &inputs, array &out) {
 }
 
 } // namespace mlx::core::kquant
+
+struct mlx_array;
+
+extern "C" {
+
+// x @ w.T on a Tiled64 K-quant weight (`mode` = "<mode>@t64") with the
+// GEMM store applying `epilogue` (1 residual, 2 SwiGLU with the gate as
+// aux). 1 with *output set, 0 when the op does not take these operands (the
+// caller runs the separate ops), -1 on an error.
+int mlx_kquant_matmul_epilogue(mlx_array *x, mlx_array *w, mlx_array *scales,
+                               mlx_array *biases, mlx_array *aux,
+                               const char *mode, int epilogue,
+                               mlx_array **output) {
+  using namespace mlx::core;
+  if (output) {
+    *output = nullptr;
+  }
+  try {
+    if (!x || !w || !scales || !biases || !aux || !mode || !output) {
+      return -1;
+    }
+    if (epilogue != static_cast<int>(kquant::StoreEpilogue::Residual) &&
+        epilogue != static_cast<int>(kquant::StoreEpilogue::Swiglu)) {
+      return -1;
+    }
+    auto parsed = kquant::parse_mode_layout(mode);
+    if (!parsed || parsed->layout != kquant::Layout::Tiled64) {
+      return 0;
+    }
+    auto result = kquant::quantized_matmul_epilogue(
+        *reinterpret_cast<array *>(x), *reinterpret_cast<array *>(w),
+        *reinterpret_cast<array *>(scales), *reinterpret_cast<array *>(biases),
+        *reinterpret_cast<array *>(aux), parsed->mode,
+        static_cast<kquant::StoreEpilogue>(epilogue));
+    if (!result) {
+      return 0;
+    }
+    *output = reinterpret_cast<mlx_array *>(new array(std::move(*result)));
+    return 1;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_kquant_matmul_epilogue: %s\n", e.what());
+    return -1;
+  }
+}
+
+// Whether a bfloat16 x of `m` rows times a Tiled64 `mode` weight of (n, k)
+// takes the store-epilogue GEMM (kquant::store_epilogue_route).
+bool mlx_kquant_store_epilogue_route(const char *mode, int m, int n, int k) {
+  using namespace mlx::core;
+  try {
+    if (!mode) {
+      return false;
+    }
+    auto parsed = kquant::parse_mode_layout(mode);
+    return parsed && parsed->layout == kquant::Layout::Tiled64 &&
+           kquant::store_epilogue_route(parsed->mode, m, n, k);
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+} // extern "C"

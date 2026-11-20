@@ -16,9 +16,9 @@ export const UNLOAD_PATH = '/chat/engine/unload';
 
 const NONE: ReadonlySet<string> = new Set();
 
-/** An answer or a load holds the engine: Unload is off. */
+/** An answer, a workflow run or a load holds the engine: Unload is off. */
 export function engineBusy(host: Pick<ChatHostState, 'loading' | 'active'>): boolean {
-  return host.loading.length > 0 || host.active.some((entry) => entry.busy);
+  return host.loading.length > 0 || host.active.some((entry) => entry.busy || entry.background);
 }
 
 export interface Unload {

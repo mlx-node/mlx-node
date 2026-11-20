@@ -19,6 +19,14 @@
 
 #include "kquant_mode.h"
 #include "kquant_grid.h"
+// The store epilogues apply MLX's own elementwise functors. Their headers
+// define functions with external linkage, so only the bfloat16 build (the
+// one that instantiates the epilogues) includes them: paged_attn.metallib
+// links the three dtype builds together.
+#if KQUANT_DTYPE == 2
+#include "mlx/backend/metal/kernels/binary_ops.h"
+#include "mlx/backend/metal/kernels/unary_ops.h"
+#endif
 
 using namespace metal;
 using namespace mlx::steel;
@@ -633,6 +641,29 @@ struct QuantizedBlockLoader {
   }
 };
 
+// The store epilogues of the GEMM (mlx_kquant.h StoreEpilogue). Each output
+// element is first rounded to T exactly as the plain store rounds it, then
+// combined with aux at the same element by MLX's own functors on T, in the
+// order of the separate ops they replace: Add(residual, y) for `residual +
+// y`, and Multiply(Multiply(Sigmoid(gate), gate), up) for the compiled
+// `sigmoid(gate) * gate * up` (mlx_qwen35_common.h). Every intermediate is a
+// T, as in those kernels.
+MLX_MTL_CONST int KQ_EP_NONE = 0;
+MLX_MTL_CONST int KQ_EP_RESIDUAL = 1;
+MLX_MTL_CONST int KQ_EP_SWIGLU = 2;
+
+// Defined after kquant_qmm_t_nax_tgp_impl: the custom-kernel JIT header
+// (common/quantized.h nax_header) keeps this file only up to that template,
+// and MLX's functors are not in it.
+template <int ep, bool full, typename T, typename Tile>
+METAL_FUNC void kq_store_epilogue(
+    const thread Tile& D,
+    device T* y,
+    const device T* aux,
+    const int ld,
+    const short lim_rows,
+    const short lim_cols);
+
 template <
     typename T,
     const int group_size,
@@ -647,7 +678,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    bool tiled = false>
+    bool tiled = false,
+    int epilogue = KQ_EP_NONE>
 METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     KQScales<float, bits, super_ratio, has_min, kind, scale_shift> scales,
@@ -663,7 +695,9 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     uint simd_lid [[thread_index_in_simdgroup]],
     // Tiled64 only: the whole companions (`w` is then the whole weight too).
     const device uint8_t* scales_tiled = nullptr,
-    const device float16_t* biases_tiled = nullptr) {
+    const device float16_t* biases_tiled = nullptr,
+    // The epilogue's operand, shaped as y.
+    const device T* aux = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   static_assert(BM % WM == 0, "BM should be divisible by WM");
@@ -707,6 +741,9 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
   wl += y_col * K_w;
   scales.advance(static_cast<size_t>(y_col) * K_g);
   y += y_row * static_cast<int64_t>(N) + y_col;
+  if constexpr (epilogue != KQ_EP_NONE) {
+    aux += y_row * static_cast<int64_t>(N) + y_col;
+  }
 
   // Make the weight loader
   loader_w_t loader_w = [&]() {
@@ -791,7 +828,15 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
       // Store results to device memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      if constexpr (kAlignedM.value && kAlignedN.value) {
+      if constexpr (epilogue != KQ_EP_NONE) {
+        if (sgp_sm == SM && sgp_sn == SN) {
+          kq_store_epilogue<epilogue, true>(
+              Dtile, y + tm * N + tn, aux + tm * N + tn, N, SM, SN);
+        } else {
+          kq_store_epilogue<epilogue, false>(
+              Dtile, y + tm * N + tn, aux + tm * N + tn, N, sgp_sm, sgp_sn);
+        }
+      } else if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * N + tn, N);
       } else if (kAlignedM.value && sgp_sn == SN) {
         Dtile.store(y + tm * N + tn, N);
@@ -801,6 +846,93 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     });
   });
 }
+
+#if KQUANT_DTYPE == 2
+template <int ep, typename T>
+METAL_FUNC T kq_epilogue_value(float acc, T a) {
+#pragma clang fp reassociate(off)
+  const T v = static_cast<T>(acc);
+  if constexpr (ep == KQ_EP_RESIDUAL) {
+    return ::Add{}(a, v);
+  } else {
+    static_assert(ep == KQ_EP_SWIGLU, "unknown store epilogue");
+    return ::Multiply{}(::Multiply{}(::Sigmoid{}(a), a), v);
+  }
+}
+
+// NAXTile::store / store_safe with the epilogue: the same element mapping
+// (BaseNAXFrag::get_coord), `aux` laid out as `y` (row stride ld).
+template <int ep, bool full, typename T, typename Tile>
+METAL_FUNC void kq_store_epilogue(
+    const thread Tile& D,
+    device T* y,
+    const device T* aux,
+    const int ld,
+    const short lim_rows,
+    const short lim_cols) {
+  using Frag = typename Tile::NAXFrag_t;
+  const short2 sc = Frag::get_coord();
+  if constexpr (full && Frag::kElemCols == 4) {
+    // Every aux load is issued before the first store; a lane's 4 columns
+    // are 8-byte aligned (ld, the tile origin and sc.x are multiples of 4).
+    using V = vec<T, 4>;
+    constexpr short kVecs = Tile::kTileRows * Tile::kTileCols * Frag::kElemRows;
+    V a[kVecs];
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < Tile::kTileRows; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < Tile::kTileCols; j++) {
+        STEEL_PRAGMA_UNROLL
+        for (short r = 0; r < Frag::kElemRows; r++) {
+          const int row = i * Frag::kFragRows + sc.y + r * Frag::kElemRowsJump;
+          const int col = j * Frag::kFragCols + sc.x;
+          a[(i * Tile::kTileCols + j) * Frag::kElemRows + r] =
+              *reinterpret_cast<const device V*>(aux + row * ld + col);
+        }
+      }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < Tile::kTileRows; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < Tile::kTileCols; j++) {
+        const thread auto& f = D.frag_at(i, j);
+        STEEL_PRAGMA_UNROLL
+        for (short r = 0; r < Frag::kElemRows; r++) {
+          const int row = i * Frag::kFragRows + sc.y + r * Frag::kElemRowsJump;
+          const int col = j * Frag::kFragCols + sc.x;
+          const thread V& av = a[(i * Tile::kTileCols + j) * Frag::kElemRows + r];
+          V out;
+          STEEL_PRAGMA_UNROLL
+          for (short c = 0; c < 4; c++) {
+            out[c] = kq_epilogue_value<ep, T>(f[r * 4 + c], av[c]);
+          }
+          *reinterpret_cast<device V*>(y + row * ld + col) = out;
+        }
+      }
+    }
+    return;
+  }
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < Tile::kTileRows; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < Tile::kTileCols; j++) {
+      const thread auto& f = D.frag_at(i, j);
+      STEEL_PRAGMA_UNROLL
+      for (short r = 0; r < Frag::kElemRows; r++) {
+        const short row = i * Frag::kFragRows + sc.y + r * Frag::kElemRowsJump;
+        STEEL_PRAGMA_UNROLL
+        for (short c = 0; c < Frag::kElemCols; c++) {
+          const short col = j * Frag::kFragCols + sc.x + c;
+          if (full || (row < lim_rows && col < lim_cols)) {
+            const int64_t at = int64_t(row) * ld + col;
+            y[at] = kq_epilogue_value<ep, T>(f[r * Frag::kElemCols + c], aux[at]);
+          }
+        }
+      }
+    }
+  }
+}
+#endif
 
 template <typename T>
 METAL_FUNC void adjust_matrix_offsets(
@@ -986,6 +1118,75 @@ template <
       simd_lid,
       scales,
       biases);
+}
+
+// kquant_qmm_t_nax on a Tiled64 weight (aligned N, unbatched) whose store
+// applies `epilogue` with `aux` (shaped as y). Every other step is the plain
+// kernel's.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int super_ratio,
+    const bool has_min,
+    int kind,
+    int scale_shift,
+    int epilogue,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+[[kernel]] void kquant_qmm_t_nax_ep(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float16_t* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const device T* aux [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(epilogue != KQ_EP_NONE, "the plain store is kquant_qmm_t_nax");
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  threadgroup T Ws[BN * BK_padded];
+
+  kquant_qmm_t_nax_tgp_impl<
+      T,
+      group_size,
+      bits,
+      super_ratio,
+      has_min,
+      kind,
+      scale_shift,
+      true,
+      BM,
+      BK,
+      BN,
+      WM,
+      WN,
+      true,
+      epilogue>(
+      w,
+      KQScales<float, bits, super_ratio, has_min, kind, scale_shift>(scales, biases),
+      x,
+      y,
+      Ws,
+      K,
+      N,
+      M,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid,
+      scales,
+      biases,
+      aux);
 }
 
 // The sorted-rhs MoE expert matmul (x @ w[e].T, one expert per row run) on

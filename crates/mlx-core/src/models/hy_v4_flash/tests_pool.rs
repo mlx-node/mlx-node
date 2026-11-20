@@ -44,6 +44,7 @@ fn config(num_layers: u32) -> PagedAttentionConfig {
 fn layout() -> PageLayout {
     PageLayout {
         values_token_major: true,
+        keys_token_major: false,
         index_rows: INDEX_ROWS as u32,
         index_dimension: DK as u32,
     }

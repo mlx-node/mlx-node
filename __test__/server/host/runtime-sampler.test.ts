@@ -16,7 +16,14 @@ import {
   type RuntimeSampler,
   type RuntimeSamplerDeps,
 } from '../../../packages/server/src/host/runtime-sampler.js';
-import type { LoadProgress, PipelineStats, WarmupReport } from '../../../packages/server/src/native-progress.js';
+import { RESIDENCY_DELTA_FIELDS } from '../../../packages/server/src/metrics-trace.js';
+import {
+  LOAD_RESIDENCY_FIELDS,
+  readResidency,
+  type LoadProgress,
+  type PipelineStats,
+  type WarmupReport,
+} from '../../../packages/server/src/native-progress.js';
 import type { ResidentModel } from '../../../packages/server/src/registry.js';
 import type {
   RuntimeLiveFile,
@@ -63,6 +70,21 @@ function schedStats(overrides: Partial<SchedulerStats> = {}): SchedulerStats {
     ...overrides,
   };
 }
+
+/** A `residencyInfo()` report of a partial store, every counter 0. */
+function residencyInfo(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const info: Record<string, unknown> = {
+    residency: 'store-plan',
+    partialExpertSlots: 412,
+    expertCount: 512,
+    fallbackReason: 'store plan: experts stream through a 59.2 GiB store, all banks need 73.1 GiB',
+  };
+  for (const key of LOAD_RESIDENCY_FIELDS) info[key] = 0;
+  for (const key of RESIDENCY_DELTA_FIELDS) info[key] = 0;
+  return { ...info, ...overrides };
+}
+
+const LOAD_RECORD_RESIDENCY_KEYS = ['residency', 'expertSlots', 'expertCount', ...LOAD_RESIDENCY_FIELDS];
 
 interface FakeState {
   live: number;
@@ -408,6 +430,7 @@ describe('runtime sampler', () => {
         stream: true,
         dispatch: 'start',
         progress: { phase: 'decode', prefillTotal: 40, prefillDone: 40, cachedTokens: 60, generatedTokens: 5 },
+        clientSession: 'acp-session-1',
       },
     ];
     const records = start([binding.entry]);
@@ -441,6 +464,7 @@ describe('runtime sampler', () => {
         queueLimit: 16,
         pool: null,
         stateNamespace: null,
+        experts: null,
       },
     ]);
     expect(live.turns).toEqual([
@@ -461,6 +485,7 @@ describe('runtime sampler', () => {
         prefillTotal: 40,
         prefillDone: 40,
         generatedTokens: 5,
+        clientSession: 'acp-session-1',
       },
     ]);
     expect(readdirSync(dir).filter((name) => name.endsWith('.tmp'))).toEqual([]);
@@ -546,6 +571,35 @@ describe('runtime sampler', () => {
     await landed();
     expect(readLive().models.map((model) => model.stateNamespace)).toEqual([
       '0123456789abcdef0123456789abcdef',
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  // MUTATION: `streaming: snapshot.residency === 'direct'` -> the partial row says false -> red.
+  it('each model row carries its experts: in memory, of the checkpoint, streaming', async () => {
+    const partial = fakeBinding();
+    (partial.entry.model as { residencyInfo?: () => unknown }).residencyInfo = () => residencyInfo();
+    const direct = fakeBinding();
+    (direct.entry.model as { residencyInfo?: () => unknown }).residencyInfo = () =>
+      residencyInfo({ residency: 'direct', partialExpertSlots: 512 });
+    const rows = fakeBinding();
+    (rows.entry.model as { residencyInfo?: () => unknown }).residencyInfo = () =>
+      residencyInfo({ residency: 'rows', partialExpertSlots: 0 });
+    const other = fakeBinding();
+    (other.entry.model as { residencyInfo?: () => unknown }).residencyInfo = () => ({ denseBytes: 1, inTurn: false });
+    const broken = fakeBinding();
+    (broken.entry.model as { residencyInfo?: () => unknown }).residencyInfo = () => {
+      throw new Error('gone');
+    };
+    const plain = fakeBinding();
+    start([partial.entry, direct.entry, rows.entry, other.entry, broken.entry, plain.entry]);
+    await landed();
+    expect(readLive().models.map((model) => model.experts)).toEqual([
+      { inMemory: 412, total: 512, streaming: true },
+      { inMemory: 512, total: 512, streaming: false },
+      { inMemory: 0, total: 512, streaming: true },
       null,
       null,
       null,
@@ -772,6 +826,54 @@ describe('runtime sampler', () => {
     expect(Object.keys(loads[1]!).filter((key) => key.startsWith('warmup'))).toEqual([]);
   });
 
+  // MUTATION: drop the `residencyFields` spread of the load record -> the fields are absent -> red.
+  it('a load record carries the residency facts, numbers and the enum only, and none without residencyInfo', async () => {
+    const records = start([]);
+    const facts = {
+      residency: 'host-gate',
+      partialExpertSlots: 406,
+      expertCount: 512,
+      bankBudgetBytes: 61_000_000_000,
+      liveNonReclaimableBytes: 30_000_000_000,
+      anonymousNeedBytes: 9_000_000_000,
+      hostWiredBytes: 12_000_000_000,
+      hostCompressorBytes: 3_000_000_000,
+      hostAnonymousBytes: 16_000_000_000,
+      hostPurgeableBytes: 1_000_000_000,
+      selfMlxBytes: 2_000_000_000,
+      slotMisses: 77,
+    };
+    const load = (model: string, result: object) =>
+      sampler!.timedLoad(
+        { model, modelType: 'qwen4_exp', capability: 'chat', path: `/m/${model}`, residencyOf: readResidency },
+        async () => result,
+      );
+    await load('flash', { residencyInfo: () => residencyInfo(facts) });
+    await load('plain', {});
+    await load('deepseek', { residencyInfo: () => ({ denseBytes: 1, bankSwitches: 2, inTurn: false }) });
+    const loads = records.filter((r): r is RuntimeLoadRecord => r.k === 'load');
+    expect(loads[0]).toMatchObject({
+      model: 'flash',
+      ok: true,
+      residency: 'host-gate',
+      expertSlots: 406,
+      expertCount: 512,
+      bankBudgetBytes: 61_000_000_000,
+      liveNonReclaimableBytes: 30_000_000_000,
+      anonymousNeedBytes: 9_000_000_000,
+      hostWiredBytes: 12_000_000_000,
+      hostCompressorBytes: 3_000_000_000,
+      hostAnonymousBytes: 16_000_000_000,
+      hostPurgeableBytes: 1_000_000_000,
+      selfMlxBytes: 2_000_000_000,
+    });
+    expect(Object.keys(loads[0]!)).not.toContain('fallbackReason');
+    expect(Object.keys(loads[0]!)).not.toContain('slotMisses');
+    for (const later of loads.slice(1)) {
+      expect(Object.keys(later).filter((key) => LOAD_RECORD_RESIDENCY_KEYS.includes(key))).toEqual([]);
+    }
+  });
+
   it('a sample carries the serving pipeline count only while the counter is alive', async () => {
     let stats: PipelineStats | null = null;
     const records = start([], { pipelineStats: () => stats });
@@ -795,6 +897,7 @@ describe('runtime sampler', () => {
         stream: true,
         dispatch: 'continue',
         progress: { phase: 'prepare', waitMs: 75_070.4, slotMs: 0, prepareMs: 300.6, cachedTokens: 19_000 },
+        clientSession: null,
       },
       {
         traceId: 't-slot',
@@ -805,13 +908,16 @@ describe('runtime sampler', () => {
         stream: true,
         dispatch: 'start',
         progress: { phase: 'slot', waitMs: 2, slotMs: 1_500 },
+        clientSession: 'acp-session-2',
       },
     ];
     start([binding.entry]);
     await landed();
-    expect(readLive().turns.map((t) => [t.phase, t.waitMs, t.slotMs, t.prepareMs, t.cachedTokens])).toEqual([
-      ['prepare', 75_070, 0, 301, 19_000],
-      ['slot', 2, 1_500, null, null],
+    expect(
+      readLive().turns.map((t) => [t.phase, t.waitMs, t.slotMs, t.prepareMs, t.cachedTokens, t.clientSession]),
+    ).toEqual([
+      ['prepare', 75_070, 0, 301, 19_000, null],
+      ['slot', 2, 1_500, null, null, 'acp-session-2'],
     ]);
   });
 

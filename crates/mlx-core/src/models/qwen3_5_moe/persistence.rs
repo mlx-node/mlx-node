@@ -1763,6 +1763,7 @@ pub async fn load_with_thread(
         &CheckpointSource::Dir(PathBuf::from(model_path)),
         draft_model_path,
         kv_format,
+        crate::models::qwen3_5::load_plan::default_activations(true, false),
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
@@ -1774,22 +1775,35 @@ pub async fn load_with_thread(
 
 /// [`load_with_thread`] for a tool that drives the model directly (`mlx
 /// eval`, FP8 calibration): no load warm-up, since no scheduled turn runs.
+/// `model_path` is a checkpoint directory or a prepared GGUF asset directory.
 pub async fn load_for_tool(
     model_path: &str,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
 ) -> Result<Qwen3_5MoeModel> {
-    load_tool_source(&CheckpointSource::Dir(PathBuf::from(model_path)), kv_format).await
+    let source = CheckpointSource::resolve(
+        Path::new(model_path),
+        crate::utils::gguf::NativeGgufFamily::Qwen35Moe,
+    )
+    .await?;
+    let loaded = load_tool_source(&source, kv_format, activations).await;
+    if loaded.is_err() {
+        source.release_lease();
+    }
+    loaded
 }
 
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_tool_source(
     source: &CheckpointSource,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
 ) -> Result<Qwen3_5MoeModel> {
     load_with_source_impl(
         source,
         None,
         kv_format,
+        activations,
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
@@ -1829,6 +1843,7 @@ pub(crate) async fn load_with_source(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
@@ -1839,6 +1854,7 @@ pub(crate) async fn load_with_source(
         source,
         draft_model_path,
         kv_format,
+        activations,
         max_memory_bytes,
         max_context,
         decode_share,
@@ -1854,6 +1870,7 @@ async fn load_with_source_impl(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    activations: crate::transformer::Activations,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
@@ -2143,6 +2160,7 @@ async fn load_with_source_impl(
                 inner.disk_options = disk.clone();
                 inner.max_context = max_context;
                 inner.decode_share = decode_share;
+                inner.activations = activations;
                 inner.configure_source_moe_policy(source_moe_policy);
                 if source_moe_policy.active() {
                     info!(

@@ -100,6 +100,7 @@ impl Qwen35MoeInner {
             },
             max_context: None,
             decode_share: crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+            activations: crate::models::qwen3_5::load_plan::default_activations(true, false),
             dflash2_verify_budget: super::super::verify_budget::VerifyBudget::default(),
             vision_encoder: None,
             image_processor: None,
@@ -162,6 +163,7 @@ impl Qwen35MoeInner {
                 &*self,
                 recurrent,
                 self.has_mtp_weights(),
+                false,
                 None,
                 self.max_memory_bytes,
                 self.max_context,
@@ -201,6 +203,7 @@ impl Qwen35MoeInner {
             &*self,
             recurrent,
             self.has_mtp_weights(),
+            false,
             Some(crate::models::qwen3_5::load_plan::PoolGeometry {
                 format,
                 bytes_per_block,
@@ -275,6 +278,7 @@ impl Qwen35MoeInner {
             );
         }
         adapter.set_memory_ceiling(plan.ceiling_bytes());
+        adapter.set_activations(self.activations);
         self.paged_adapter = Some(adapter);
         self.scheduled_recurrent
             .set_max_live_units(pool_plan.lanes as usize);
@@ -797,6 +801,9 @@ impl Qwen35MoeInner {
                 self.paged_context_limits(),
                 self.paged_adapter.is_some(),
                 kv_format,
+                self.paged_adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.int8_queries_active()),
             )
         }
     }

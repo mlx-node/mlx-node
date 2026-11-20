@@ -302,6 +302,13 @@ export interface ServerConfig {
    */
   resolveModel?: (name: string) => Promise<void>;
   /**
+   * Binds a name `resolveModel` would only alias onto the loaded model,
+   * synchronously and with no load, swap or release; returns whether it
+   * bound. A request so bound takes a reader slot beside running turns
+   * instead of the writer slot that waits for all of them.
+   */
+  bindLoadedModel?: (name: string) => boolean;
+  /**
    * Optional override for `GET /v1/models` enumeration. When provided,
    * the endpoint returns this list instead of `registry.list()`.
    * Intended for dynamic discovery schemes (e.g. enumerate every model
@@ -581,6 +588,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     responseRetentionSec,
     idleSweeper: chatSweeper,
     resolveModel: config?.resolveModel,
+    ...(config?.bindLoadedModel !== undefined ? { bindLoadedModel: config.bindLoadedModel } : {}),
     modelWorkCoordinator,
     listModels: config?.listModels,
     unloadModels: config?.unloadModels,

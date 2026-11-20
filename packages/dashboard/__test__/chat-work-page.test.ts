@@ -20,12 +20,13 @@ import type {
 import { flagLines, folderName } from '../ui/src/lib/permission-text.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
 import { toast } from '../ui/src/lib/toast.js';
+import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import Chat from '../ui/src/pages/chat.js';
 import { chooseFolder, forgetPlace, NEW_PLACE, writeDraft } from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
 import { CARD_ARM_MS, cardButtons, cardNotes, FEEDBACK_MAX_CHARS } from '../ui/src/pages/chat/work/permission.js';
 import { APP_ROUTES, NAV_ROUTES } from '../ui/src/shell/routes.js';
-import { answer, end, user } from './helpers/chat-thread-fixtures.js';
+import { answer, end, RUN_ID, runSample, user, workflowRun } from './helpers/chat-thread-fixtures.js';
 import {
   accessibleName,
   byRole,
@@ -97,6 +98,7 @@ function sync(id: string, over: Partial<ChatSync> = {}, conversation: Partial<Co
     notices: [],
     transcriptError: null,
     permissionMarks: [],
+    runs: [],
     ...over,
   };
 }
@@ -209,6 +211,11 @@ function shown(scope: Element = page!.container): string {
 
 function card(): HTMLElement | null {
   return page!.container.querySelector<HTMLElement>('[data-interaction-card]');
+}
+
+/** The card's visible "Asked by" line (its screen-reader copy is a separate node). */
+function askedBy(): string | null {
+  return card()?.querySelector('[data-asked-by]')?.textContent ?? null;
 }
 
 /** The answer buttons of the open card, in tab order. */
@@ -540,6 +547,205 @@ describe('Work plan card', () => {
     });
     await waitFor(() => byRole(card()!, 'textbox', CHAT.planFeedbackLabel) === null);
     await waitFor(() => reachable(card()!).some((b) => accessibleName(b) === CHAT.planApprove), 2_000);
+  });
+});
+
+describe('Work: workflow runs', () => {
+  const runEntries = runSample(workflowRun()).entries;
+  const RUN_TITLE = fill(CHAT.run.title, { name: 'deep-research' });
+  const runCard = (): HTMLElement | null =>
+    page!.container.querySelector<HTMLElement>(`[data-run="${RUN_ID}"]`)?.closest('section') ?? null;
+  const runStatus = (): string => runCard()?.querySelector('header [data-tone]')?.textContent ?? '';
+  /** A finished step of the running turn: the turn has shown work, so an open request of its own hides the wait line. */
+  const listed = (): TranscriptEntry => ({
+    kind: 'tool',
+    ts: NOW + 10,
+    id: 'ls-1',
+    name: 'list_dir',
+    title: 'List docs',
+    status: 'completed',
+    endTs: NOW + 20,
+  });
+  const helperAsk = (over: Partial<PermissionInteraction> = {}): PermissionInteraction =>
+    permission({
+      id: 'i-helper',
+      command: 'curl -s https://example.com',
+      from: { label: 'researcher-0', run: 'deep-research', cwd: null },
+      ...over,
+    });
+
+  it('Stop run asks first, then POSTs the run stop route; the card says Stopping… once the host does', async () => {
+    await open('/chat?c=p-run-stop', (text) => text.includes(RUN_TITLE), {
+      routes: { [`POST /chat/conversations/p-run-stop/runs/${RUN_ID}/stop`]: {} },
+      conversations: {
+        'p-run-stop': sync('p-run-stop', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    expect(runStatus()).toBe(CHAT.run.status.active);
+    expect(accessibleName(sendFace())).not.toBe(CHAT.stop);
+    click(button(CHAT.run.stop, runCard()!));
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    expect(writes()).toEqual([]);
+    click(button(CHAT.run.stop, byRole(document.body, 'dialog')!));
+    await waitFor(() => writes().length === 1);
+    expect(writes()).toEqual([
+      { method: 'POST', path: `/chat/conversations/p-run-stop/runs/${RUN_ID}/stop`, body: undefined },
+    ]);
+    act(() => api!.emitChat('p-run-stop', { type: 'runs', seq: 1, runs: [{ runId: RUN_ID, stopping: true }] }));
+    await waitFor(() => runStatus() === CHAT.run.stopping);
+    act(() => api!.emitChat('p-run-stop', { type: 'runs', seq: 2, runs: [] }));
+    await waitFor(() => runStatus() === CHAT.run.status.interrupted);
+  });
+
+  it('a refused stop shows the server sentence in the confirmation', async () => {
+    await open('/chat?c=p-run-gone', (text) => text.includes(RUN_TITLE), {
+      routes: {
+        [`POST /chat/conversations/p-run-gone/runs/${RUN_ID}/stop`]: stubError('E_NOT_FOUND', 'No such run.'),
+      },
+      conversations: {
+        'p-run-gone': sync('p-run-gone', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    click(button(CHAT.run.stop, runCard()!));
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    click(button(CHAT.run.stop, byRole(document.body, 'dialog')!));
+    await waitFor(() => (byRole(document.body, 'dialog')?.textContent ?? '').includes('No such run.'));
+    expect(byRole(document.body, 'dialog')!.textContent).toContain(CHAT.run.stopError);
+  });
+
+  it('a stop that fails after the card went to Stopping… shows a toast; the card runs again', async () => {
+    const error = vi.spyOn(toast, 'error');
+    const held = deferred(STUB_FAILURE);
+    await open('/chat?c=p-run-fail', (text) => text.includes(RUN_TITLE), {
+      routes: { [`POST /chat/conversations/p-run-fail/runs/${RUN_ID}/stop`]: held.body },
+      conversations: {
+        'p-run-fail': sync('p-run-fail', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    click(button(CHAT.run.stop, runCard()!));
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    click(button(CHAT.run.stop, byRole(document.body, 'dialog')!));
+    await waitFor(() => writes().length === 1);
+    act(() => api!.emitChat('p-run-fail', { type: 'runs', seq: 1, runs: [{ runId: RUN_ID, stopping: true }] }));
+    await waitFor(() => runStatus() === CHAT.run.stopping);
+    act(() => api!.emitChat('p-run-fail', { type: 'runs', seq: 2, runs: [{ runId: RUN_ID, stopping: false }] }));
+    await waitFor(() => runStatus() === CHAT.run.status.active);
+    held.release();
+    await waitFor(() => error.mock.calls.length === 1);
+    expect(error.mock.calls[0]![0]).toBe(CHAT.run.stopError);
+  });
+
+  it('a wake turn shows Stop like any turn, and Stop cancels it', async () => {
+    await open('/chat?c=p-wake', (text) => text.includes(RUN_TITLE), {
+      routes: { '/chat/conversations/p-wake/cancel': {} },
+      conversations: {
+        'p-wake': sync('p-wake', {
+          entries: runEntries,
+          turn: { turnId: 'w1', phase: 'running', startedAt: NOW, wait: null, origin: 'wake' },
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    await waitFor(() => accessibleName(sendFace()) === CHAT.stop);
+    click(sendFace());
+    await waitFor(() => writes().length === 1);
+    expect(writes()[0]!.path).toBe('/chat/conversations/p-wake/cancel');
+  });
+
+  it("a helper's request names who asks and where it works; the run card waits for you", async () => {
+    await open('/chat?c=p-run-ask', (text) => text.includes(RUN_TITLE) && text.includes(CHAT.permRun), {
+      conversations: {
+        'p-run-ask': sync('p-run-ask', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+          interactions: [helperAsk({ from: { label: 'researcher-0', run: 'deep-research', cwd: '/tmp/work/other' } })],
+        }),
+      },
+    });
+    const meta = shown(card()!);
+    expect(askedBy()).toBe(fill(CHAT.permFrom, { label: 'researcher-0', run: 'deep-research' }));
+    expect(card()!.querySelector('[data-works-in]')?.textContent).toBe('Works in /tmp/work/other');
+    expect(meta).toContain(CHAT.denyRunNote);
+    expect(meta).not.toContain(CHAT.denyNote);
+    expect(runStatus()).toBe(CHAT.run.waitingYou);
+    expect(shown(runCard()!)).toContain(fill(CHAT.run.asks, { label: 'researcher-0' }));
+    expect(page!.container.querySelector('[data-wait-line]')).toBeNull();
+  });
+
+  it('a helper of no run says "Asked by helper"; a card with no helper names nobody', async () => {
+    await open('/chat?c=p-plain-helper', (text) => text.includes(CHAT.permRun), {
+      conversations: {
+        'p-plain-helper': sync('p-plain-helper', {
+          interactions: [helperAsk({ from: { label: 'explore-1', run: null, cwd: null } })],
+        }),
+      },
+    });
+    expect(askedBy()).toBe(fill(CHAT.permFromNoRun, { label: 'explore-1' }));
+    expect(shown(card()!)).toContain(CHAT.denyNote);
+    expect(card()!.querySelector('[data-works-in]')).toBeNull();
+    page!.unmount();
+    api?.();
+    await open('/chat?c=p-own', (text) => text.includes(CHAT.permRun), {
+      conversations: { 'p-own': sync('p-own', { interactions: [permission()] }) },
+    });
+    expect(card()!.querySelector('[data-asked-by]')).toBeNull();
+  });
+
+  it("a run helper's open request does not hide the typed turn's wait line; the turn's own request does", async () => {
+    await open('/chat?c=p-both', (text) => text.includes(RUN_TITLE) && text.includes(CHAT.permRun), {
+      conversations: {
+        'p-both': sync('p-both', {
+          entries: [...runEntries, user('And the docs?', NOW), listed()],
+          turn: { turnId: 't2', phase: 'running', startedAt: NOW, wait: null },
+          runs: [{ runId: RUN_ID, stopping: false }],
+          interactions: [helperAsk()],
+        }),
+      },
+    });
+    await waitFor(() => page!.container.querySelector('[data-wait-line]') !== null);
+    page!.unmount();
+    api?.();
+    await open('/chat?c=p-own-ask', (text) => text.includes(CHAT.permRun), {
+      conversations: {
+        'p-own-ask': sync('p-own-ask', {
+          entries: [user('Fix the build', NOW), listed()],
+          interactions: [permission()],
+        }),
+      },
+    });
+    expect(page!.container.querySelector('[data-wait-line]')).toBeNull();
+  });
+
+  it('a live run keeps delete and the model picker off with its reason; rename stays on', async () => {
+    await open('/chat?c=p-run-busy', (text) => text.includes(RUN_TITLE), {
+      conversations: {
+        'p-run-busy': sync('p-run-busy', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    expect(button(CHAT.remove, page!.container).getAttribute('aria-disabled')).toBe('true');
+    expect(button(CHAT.rename, page!.container).disabled).toBe(false);
+    const picker = button(
+      fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }),
+      page!.container,
+    );
+    expect(picker.disabled).toBe(true);
   });
 });
 

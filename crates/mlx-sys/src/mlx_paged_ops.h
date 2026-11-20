@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 
 #include "mlx/fast_primitives.h"
 #include "mlx/utils.h" // StreamOrDevice
@@ -320,7 +321,8 @@ array paged_attention_with_route_hint(
     KvDtype kv_dtype,
     uint8_t route_hint,
     StreamOrDevice s = {},
-    uint32_t grouped_stripes = 0);
+    uint32_t grouped_stripes = 0,
+    const std::optional<array>& score_scales = std::nullopt);
 
 /// Ragged-Q sibling of `PagedAttention`. Accepts a flat
 /// `[total_queries, num_q_heads, head_size]` Q tensor and a
@@ -429,7 +431,8 @@ array paged_attention_varlen(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
-    StreamOrDevice s = {});
+    StreamOrDevice s = {},
+    const std::optional<array>& score_scales = std::nullopt);
 
 /// `PagedPrefillAttention`: one prefill chunk or verify block of one
 /// sequence attends in place over the block-paged pool (Splash
@@ -441,7 +444,9 @@ array paged_attention_varlen(
 /// rows rounded up to 32, padding rows zero), `k_pool`, `v_pool`, `k_scale`,
 /// `v_scale` (the pool planes), `block_table` int32 holding at least
 /// ceil((committed + rows) / block_size) entries, `workspace` f32 of at least
-/// `paged_prefill_workspace_floats(rows, splits, ...)`.
+/// `paged_prefill_workspace_floats(rows, splits, ...)`. `int8_queries`
+/// (INT8 pages only) scores INT8 query codes against the INT8 keys (Splash
+/// `q8q`); the caller selects it (`mlx_paged_attn::prefill_plan`).
 /// Outputs: [rows, num_q_heads, head_size] bf16, and the workspace (same
 /// buffer), so the next launch that takes it is ordered after this one.
 class PagedPrefillAttention : public Custom {
@@ -457,7 +462,8 @@ class PagedPrefillAttention : public Custom {
       int num_q_heads,
       int num_kv_heads,
       int head_size,
-      KvDtype kv_dtype)
+      KvDtype kv_dtype,
+      bool int8_queries)
       : Custom(stream, std::move(fallback)),
         committed_tokens_(committed_tokens),
         rows_(rows),
@@ -467,7 +473,8 @@ class PagedPrefillAttention : public Custom {
         num_q_heads_(num_q_heads),
         num_kv_heads_(num_kv_heads),
         head_size_(head_size),
-        kv_dtype_(kv_dtype) {}
+        kv_dtype_(kv_dtype),
+        int8_queries_(int8_queries) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -500,7 +507,8 @@ class PagedPrefillAttention : public Custom {
         num_q_heads_,
         num_kv_heads_,
         head_size_,
-        static_cast<uint8_t>(kv_dtype_));
+        static_cast<uint8_t>(kv_dtype_),
+        int8_queries_);
   }
 
  private:
@@ -513,7 +521,68 @@ class PagedPrefillAttention : public Custom {
   int num_kv_heads_;
   int head_size_;
   KvDtype kv_dtype_;
+  bool int8_queries_;
 };
+
+/// `PagedQueryCodes`: the decode kernels' INT8 query codes by the tile's
+/// quantizer. Inputs: `q` [rows, num_q_heads, head_size] bf16, `positions`
+/// [rows] int32 (each row's KV index). Outputs: codes [rows, num_q_heads,
+/// head_size] bf16 (rows below `from` copy `q`), score scales [rows,
+/// num_q_heads] f32 (the tile's 1/sqrt(D) literal x the row scale; `scale`
+/// below `from`).
+class PagedQueryCodes : public Custom {
+ public:
+  PagedQueryCodes(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int num_q_heads,
+      int head_size,
+      uint32_t from,
+      float scale)
+      : Custom(stream, std::move(fallback)),
+        num_q_heads_(num_q_heads),
+        head_size_(head_size),
+        from_(from),
+        scale_(scale) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("PagedQueryCodes CPU NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(PagedQueryCodes);
+
+  auto state() const {
+    return std::make_tuple(nullptr, num_q_heads_, head_size_, from_, scale_);
+  }
+
+ private:
+  int num_q_heads_;
+  int head_size_;
+  uint32_t from_;
+  float scale_;
+};
+
+/// Emits `PagedQueryCodes`: {codes, score scales}.
+std::array<array, 2> paged_query_codes(
+    const array& q,
+    const array& positions,
+    uint32_t from,
+    float scale,
+    StreamOrDevice s = {});
 
 /// Stages `q` [rows, num_q_heads, head_size] KV-head-major and emits a
 /// `PagedPrefillAttention`. Returns {attention [rows, num_q_heads,
@@ -534,6 +603,7 @@ std::array<array, 2> paged_prefill_attention(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
+    bool int8_queries,
     float scale,
     StreamOrDevice s = {});
 
@@ -560,7 +630,18 @@ extern "C" mlx_array* mlx_paged_attention_varlen_forward(
     int num_q_heads,
     int num_kv_heads,
     int head_size,
-    uint8_t kv_dtype);
+    uint8_t kv_dtype,
+    mlx_array* score_scales);
+
+// The decode kernels' INT8 query codes (`PagedQueryCodes`). False on a
+// validation error; both outputs are then null.
+extern "C" bool mlx_paged_query_codes_forward(
+    mlx_array* q,
+    mlx_array* positions,
+    uint32_t from,
+    float scale,
+    mlx_array** out_codes,
+    mlx_array** out_score_scales);
 
 // In-place prefill / verify attention (`PagedPrefillAttention`). False on a
 // validation error; both outputs are then null.
@@ -580,6 +661,7 @@ extern "C" bool mlx_paged_prefill_attention_forward(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype,
+    bool int8_queries,
     float scale,
     mlx_array** out_attention,
     mlx_array** out_workspace);

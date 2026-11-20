@@ -102,12 +102,44 @@
   instantiate_kquant_nax_tiled(a4g64, qmm_t_nax, type, 64, 4, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2) \
   instantiate_kquant_nax_tiled(a8g64, qmm_t_nax, type, 64, 8, 4, false, KQ_AFFINE, 0, 64, 64, 64, 2, 2)
 
+// The Tiled64 GEMM with a store epilogue (bfloat16 only): "res" adds a
+// residual, "swiglu" applies silu(gate) * gate * up with the gate as aux
+// (mlx_kquant_metal.cpp kernels::qmm_t_nax_t64_epilogue).
+#define instantiate_kquant_nax_epilogue(mode, ep_name, ep, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kernel( \
+      #mode "_qmm_t_nax_t64_" #ep_name "_bfloat16_t_gs_" #group_size "_b_" #bits "_bm64_bn64_bk64_wm2_wn2", \
+      kquant_qmm_t_nax_ep, \
+      bfloat16_t, \
+      group_size, \
+      bits, \
+      super_ratio, \
+      has_min, \
+      kind, \
+      shift, \
+      ep, \
+      64, \
+      64, \
+      64, \
+      2, \
+      2)
+
+#define instantiate_kquant_nax_epilogues(mode, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kquant_nax_epilogue(mode, res, KQ_EP_RESIDUAL, group_size, bits, super_ratio, has_min, kind, shift) \
+  instantiate_kquant_nax_epilogue(mode, swiglu, KQ_EP_SWIGLU, group_size, bits, super_ratio, has_min, kind, shift)
+
 #if KQUANT_DTYPE == 0
 instantiate_kquant_nax_types(float)
 #elif KQUANT_DTYPE == 1
 instantiate_kquant_nax_types(float16_t)
 #elif KQUANT_DTYPE == 2
 instantiate_kquant_nax_types(bfloat16_t)
+instantiate_kquant_nax_epilogues(q6k, 16, 6, 16, false, KQ_LINEAR, 0)
+instantiate_kquant_nax_epilogues(q4k, 32, 4, 8, true, KQ_LINEAR, 0)
+instantiate_kquant_nax_epilogues(q5k, 32, 5, 8, true, KQ_LINEAR, 0)
+instantiate_kquant_nax_epilogues(q3k, 16, 3, 16, false, KQ_LINEAR, 0)
+instantiate_kquant_nax_epilogues(iq4nl, 32, 4, 1, false, KQ_CODEBOOK, 0)
+instantiate_kquant_nax_epilogues(iq4xs, 32, 4, 8, false, KQ_CODEBOOK, 0)
+instantiate_kquant_nax_epilogues(iq3s, 32, 3, 8, false, KQ_GRID_IQ3S, 0)
 #else
 #error "KQUANT_DTYPE must be 0, 1 or 2"
 #endif

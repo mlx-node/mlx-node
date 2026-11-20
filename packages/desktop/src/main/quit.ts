@@ -10,6 +10,14 @@ export function createQuitHandler(options: {
   shouldRelaunch(): boolean;
   relaunch(): void;
   quit(): void;
+  /**
+   * True while MAIN still has a filesystem request that may never settle. Node's
+   * exit waits for every in-flight request (`Environment::RunCleanup`), so
+   * `quit()` would hang forever: measured with `app.quit()`, `app.exit()` and
+   * `process.exit()` alike.
+   */
+  exitBlocked?(): boolean;
+  forceExit?(): void;
   report(error: unknown): void;
 }): (event: { preventDefault(): void }) => void {
   let started = false;
@@ -23,6 +31,13 @@ export function createQuitHandler(options: {
     completed = true;
     if (install) {
       install(relaunchRequested);
+    } else if (options.forceExit !== undefined && options.exitBlocked?.() === true) {
+      options.report(
+        new Error(
+          `a filesystem request never settled; exiting without the normal teardown${relaunchRequested ? ' and without the requested relaunch' : ''}`,
+        ),
+      );
+      options.forceExit();
     } else {
       if (relaunchRequested) options.relaunch();
       options.quit();

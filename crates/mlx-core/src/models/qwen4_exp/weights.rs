@@ -347,6 +347,33 @@ impl<'a> DirectGgufReader<'a> {
     }
 }
 
+/// A [`DirectGgufReader`] that owns its source and descriptors, for readers
+/// that outlive one call.
+pub(super) struct OwnedDirectGgufReader {
+    source: DirectGgufSource,
+    files: Vec<Arc<File>>,
+}
+
+impl OwnedDirectGgufReader {
+    pub(super) fn new(source: DirectGgufSource, files: Vec<Arc<File>>) -> Result<Self> {
+        if files.len() != source.shards.len() {
+            return Err(err("Qwen4 direct GGUF shard set is incomplete"));
+        }
+        Ok(Self { source, files })
+    }
+}
+
+impl crate::utils::gguf_read::ReadAt for OwnedDirectGgufReader {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        let files: Vec<&File> = self.files.iter().map(AsRef::as_ref).collect();
+        DirectGgufReader {
+            source: &self.source,
+            files: &files,
+        }
+        .read_exact_at(buf, off)
+    }
+}
+
 impl crate::utils::gguf_read::ReadAt for DirectGgufReader<'_> {
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
         if buf.is_empty() {
@@ -718,7 +745,9 @@ pub struct Store {
     direct_error: Option<String>,
     /// This turn admitted a layer-major prefill beside a direct fill.
     direct_fill_pass: bool,
-    wide_routes: HashMap<usize, Vec<u32>>,
+    /// Experts a preload of the decode token in flight read, per layer: they
+    /// counted as misses, so the routes that use them do not count hits.
+    preloaded: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
     /// The bank ceiling of partial direct slots: the streamed store's cap
@@ -737,10 +766,38 @@ pub struct Store {
     pub bytes_read: u64,
     pub peak_cache_bytes: u64,
     gguf_source: Option<DirectGgufSource>,
+    slot_fill: Option<expert_slots::SlotFill>,
+    /// A slot fill whose reads run while the GPU computes the experts that
+    /// hold slots; the next slot fill finishes or abandons it.
+    pending_fill: Option<expert_slots::PendingFill>,
+    /// No slot fill reads ahead of its lease.
+    #[cfg(test)]
+    pub(in super::super) no_fill_ahead: bool,
+    /// Slot fills take the loop they had before one fill per lease: eight
+    /// misses per fill, each through the whole-store fill's reads.
+    #[cfg(test)]
+    pub(in super::super) old_slot_fill: bool,
+    /// The slot fills' batch (and staging buffer) bytes, set before the
+    /// first slot fill.
+    #[cfg(test)]
+    pub(in super::super) fill_batch_bytes: Option<usize>,
+    /// A slot fill fails at this batch, as on a read error.
+    #[cfg(test)]
+    pub(in super::super) fail_fill_batch: Option<usize>,
+    /// Slot fill reader threads started and staging buffers allocated.
+    #[cfg(test)]
+    pub(in super::super) slot_fill_builds: [usize; 2],
     #[cfg(test)]
     direct_gguf: bool,
     #[cfg(test)]
-    direct_read_windows: Vec<(u64, usize)>,
+    pub(in super::super) direct_read_windows: Vec<(u64, usize)>,
+    /// Per layer of a partial store: the experts its slot leases wanted and
+    /// the misses they counted.
+    #[cfg(test)]
+    pub(in super::super) layer_leases: HashMap<usize, (HashSet<u32>, u64)>,
+    /// Per (layer, expert) of a partial store: the slot fills that read it.
+    #[cfg(test)]
+    pub(in super::super) expert_fills: HashMap<(usize, u32), u32>,
     /// One open descriptor per checkpoint file; row reads `pread` through it.
     files: HashMap<PathBuf, Arc<File>>,
     rows: Option<Fetcher>,
@@ -840,6 +897,12 @@ impl Store {
         Ok(store)
     }
 
+    /// The fixture under the production forward reserve from here on.
+    #[cfg(test)]
+    pub(in super::super) fn end_fixture_exemption(&mut self) {
+        self.fixture = false;
+    }
+
     /// `open_metadata`'s `None` resolves the user's real pack cache, whose
     /// sweep deletes idle packs of other builds and processes; a unit test
     /// must never reach it. The root is never created.
@@ -894,6 +957,9 @@ impl Store {
                 direct_layers: 0,
                 bank_budget: 0,
                 live_non_reclaimable: 0,
+                host: None,
+                anonymous_need: 0,
+                self_mlx_bytes: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
@@ -905,7 +971,7 @@ impl Store {
             direct_fill_remaining: 0,
             direct_error: None,
             direct_fill_pass: false,
-            wide_routes: HashMap::new(),
+            preloaded: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
             slot_bank_budget: None,
@@ -919,10 +985,26 @@ impl Store {
             bytes_read: 0,
             peak_cache_bytes: 0,
             gguf_source: None,
+            slot_fill: None,
+            pending_fill: None,
+            #[cfg(test)]
+            no_fill_ahead: false,
+            #[cfg(test)]
+            old_slot_fill: false,
+            #[cfg(test)]
+            fill_batch_bytes: None,
+            #[cfg(test)]
+            fail_fill_batch: None,
+            #[cfg(test)]
+            slot_fill_builds: [0; 2],
             #[cfg(test)]
             direct_gguf: true,
             #[cfg(test)]
             direct_read_windows: Vec::new(),
+            #[cfg(test)]
+            layer_leases: HashMap::new(),
+            #[cfg(test)]
+            expert_fills: HashMap::new(),
             files: HashMap::new(),
             rows: None,
             rows_pending: Arc::default(),
@@ -3102,14 +3184,17 @@ mod direct_tests {
         (store, paths)
     }
 
-    fn assert_split_read_windows(store: &Store) {
+    /// Reads are aligned in every shard they touch. The whole-store fill's
+    /// 8 MiB windows cross a shard boundary (`must_cross`); a slot fill reads
+    /// its experts' pages only, which need not.
+    fn assert_split_read_windows(store: &Store, must_cross: bool) {
         let source = store.gguf_source.as_ref().unwrap();
         assert!(source.shards.len() > 1);
         assert!(!store.direct_read_windows.is_empty());
         let mut crossed = false;
         for &(off, len) in &store.direct_read_windows {
             let len = len as u64;
-            assert!(len <= 8 << 20 && off % (16 << 10) == 0);
+            assert!(len <= 64 << 20 && off % (16 << 10) == 0);
             for shard in &source.shards {
                 let actual_start = off.max(shard.base);
                 let actual_end = (off + len).min(shard.base + shard.len);
@@ -3121,7 +3206,49 @@ mod direct_tests {
                 }
             }
         }
-        assert!(crossed, "no direct read window crossed a shard boundary");
+        assert!(
+            crossed || !must_cross,
+            "no direct read window crossed a shard boundary"
+        );
+    }
+
+    /// Every slot-fill read of a single-file store is one 64 MiB batch or
+    /// less, 16 KiB aligned, and covers only pages of the experts its
+    /// partial leases wanted: no gap between two of them is read.
+    fn assert_reads_hold_only_leased_experts(store: &Store) {
+        assert!(!store.direct_read_windows.is_empty());
+        assert!(!store.layer_leases.is_empty());
+        let align = 16u64 << 10;
+        let mut pages: Vec<(u64, u64)> = Vec::new();
+        for (&layer, (leased, _)) in &store.layer_leases {
+            for part in ["gate", "up", "down"] {
+                let tensor = store
+                    .descriptor(&format!("blk.{layer}.ffn_{part}_exps.weight"))
+                    .unwrap();
+                let rows = tensor.shape[1];
+                for &expert in leased {
+                    let (offset, bytes) = tensor.range(expert as usize * rows, rows).unwrap();
+                    let end = (offset + bytes).next_multiple_of(align);
+                    pages.push((offset - offset % align, end));
+                }
+            }
+        }
+        for &(offset, len) in &store.direct_read_windows {
+            assert!(
+                len <= 64 << 20 && offset % align == 0,
+                "read {offset} + {len}"
+            );
+            let mut at = offset;
+            while at < offset + len as u64 {
+                let page = pages
+                    .iter()
+                    .find(|&&(lo, hi)| lo <= at && at < hi)
+                    .unwrap_or_else(|| {
+                        panic!("read {offset} + {len} covers byte {at} of no leased expert")
+                    });
+                at = page.1.min(offset + len as u64);
+            }
+        }
     }
 
     fn encoded(weight: &Weight) -> (Vec<u8>, i32, i32, String) {
@@ -3327,7 +3454,7 @@ mod direct_tests {
                     .unwrap();
                 assert_banks_match_checkpoint_layer(&store, layer, parts, &banks, &ids, &local);
             }
-            assert_split_read_windows(&store);
+            assert_split_read_windows(&store, false);
         }
     }
 
@@ -3365,7 +3492,7 @@ mod direct_tests {
         assert_eq!(store.plan.direct_layers, 2);
         assert_eq!(store.plan.direct_bytes, store.slot_bytes);
         assert_eq!(store.slot_upload_bytes, store.slot_bytes);
-        assert_split_read_windows(&store);
+        assert_split_read_windows(&store, true);
     }
 
     #[test]
@@ -3770,26 +3897,29 @@ mod direct_tests {
 
             decoder.weights.begin_turn().unwrap();
             let mut logits = decoder.prefill_prompt(&prompt).unwrap();
-            let unique = decoder
-                .weights
-                .wide_routes
+            // MUTATION: lease a window's assignments in chunks of `capacity`
+            // in router order → an expert is read twice → red.
+            let leases = &decoder.weights.layer_leases;
+            assert_eq!(leases.len(), decoder.config.num_hidden_layers);
+            for (layer, (leased, misses)) in leases {
+                assert!(!leased.is_empty());
+                assert_eq!(
+                    *misses,
+                    leased.len() as u64,
+                    "layer {layer}: last-assignment expert groups re-read an expert during prefill"
+                );
+            }
+            let unique = leases
                 .values()
-                .map(Vec::len)
-                .sum::<usize>() as u64;
-            assert!(unique > 0);
+                .map(|(leased, _)| leased.len() as u64)
+                .sum::<u64>();
             assert_eq!(
-                decoder.weights.slot_misses, unique,
-                "last-assignment expert chunks re-read an expert during prefill"
+                decoder.weights.live.slot_misses.load(Ordering::Relaxed),
+                unique,
+                "slotMisses counts each prefill expert once"
             );
             assert!(decoder.weights.slot_bytes <= bank_budget);
-            assert!(!decoder.weights.direct_read_windows.is_empty());
-            assert!(
-                decoder
-                    .weights
-                    .direct_read_windows
-                    .iter()
-                    .all(|&(offset, len)| len <= 8 << 20 && offset % (16 << 10) == 0)
-            );
+            assert_reads_hold_only_leased_experts(&decoder.weights);
             let mut actual = Vec::new();
             for step in 0..6 {
                 let id = super::super::tests::argmax(&logits);
@@ -4114,7 +4244,7 @@ mod direct_tests {
     }
 
     #[test]
-    fn direct_gguf_flash_geometry_matches_checkpoint_and_layers_reads_at_8mib() {
+    fn direct_gguf_flash_geometry_matches_checkpoint_and_reads_exact_ranges() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -4129,17 +4259,11 @@ mod direct_tests {
             assert_banks_match_checkpoint(&store, &FLASH_PARTS, &banks, &ids, &local).len();
         assert_eq!(store.bytes_read, 24_576_000);
         assert_eq!(store.slot_upload_bytes, store.slot_bytes);
-        assert!(store.direct_read_windows.len() > 1);
-        assert!(
-            store
-                .direct_read_windows
-                .iter()
-                .all(|&(off, len)| len <= 8 << 20 && off % (16 << 10) == 0),
-            "{:?}",
-            store.direct_read_windows
-        );
+        // The three tensors' eight experts lie back to back: one read.
+        assert_eq!(store.direct_read_windows.len(), 1);
+        assert_reads_hold_only_leased_experts(&store);
         eprintln!(
-            "P3.0-d Flash geometry parity: {compared} bank bytes in {} aligned windows",
+            "P3.0-d Flash geometry parity: {compared} bank bytes in {} aligned reads",
             store.direct_read_windows.len()
         );
     }

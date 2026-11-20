@@ -91,6 +91,7 @@ impl PageGeometry {
     pub fn layout(&self) -> PageLayout {
         PageLayout {
             values_token_major: true,
+            keys_token_major: false,
             index_rows: self.index_rows,
             index_dimension: self.index_dim,
         }

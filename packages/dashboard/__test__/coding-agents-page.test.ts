@@ -206,9 +206,15 @@ it('its status re-read is the one timer in the SPA, and the docs say so', () => 
     }
   };
   walk(ui);
-  expect(timers).toEqual(['components/arc-x/load-card/load-card.tsx', 'pages/coding-agents.tsx']);
-  const card = readFileSync(join(ui, 'components/arc-x/load-card/load-card.tsx'), 'utf8');
-  for (const reader of ['lib/api', 'lib/use-api', 'fetch(']) expect(card).not.toContain(reader);
+  expect(timers.sort()).toEqual([
+    'components/arc-x/load-card/load-card.tsx',
+    'components/wait-clock.tsx',
+    'pages/coding-agents.tsx',
+  ]);
+  for (const clock of ['components/arc-x/load-card/load-card.tsx', 'components/wait-clock.tsx']) {
+    const source = readFileSync(join(ui, clock), 'utf8');
+    for (const reader of ['lib/api', 'lib/use-api', 'fetch(']) expect(source).not.toContain(reader);
+  }
   for (const doc of ['../../../docs/dashboard.md', '../README.md']) {
     const text = readFileSync(join(import.meta.dirname, doc), 'utf8');
     expect(text).not.toContain('never polls');

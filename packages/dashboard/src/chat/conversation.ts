@@ -9,11 +9,13 @@ import { TranscriptReducer, type UpdateLine } from '../agent-sessions/transcript
 import type { TranscriptEntry, TurnMetric } from '../agent-sessions/types.js';
 import { needleList, redactDeep, redactEntry, StreamRedactor } from './redact.js';
 import type {
+  CompactionState,
   PermissionMark,
   ConversationEvent,
   ConversationInfo,
   ConversationNotice,
   Interaction,
+  RunView,
   TranscriptOp,
   TurnEnd,
   TurnState,
@@ -35,6 +37,8 @@ export interface ConversationDeps {
 export interface HostView {
   turn: TurnState | null;
   interactions: Interaction[];
+  compaction: CompactionState | null;
+  runs: RunView[];
 }
 
 interface Base {
@@ -44,6 +48,8 @@ interface Base {
   view: TranscriptEntry[];
   turns: TurnMetric[];
   transcriptError: string | null;
+  /** The conversation's current context in tokens, as the page was sent it; null while unknown. */
+  contextUsed: number | null;
 }
 
 function isText(entry: TranscriptEntry): entry is Extract<TranscriptEntry, { kind: 'assistant' | 'thinking' }> {
@@ -99,10 +105,15 @@ export class Conversation {
   }
 
   /** Starts the transcript from what is on disk (empty for a new conversation). Live ops index after it. */
-  seed(entries: readonly TranscriptEntry[], turns: readonly TurnMetric[], transcriptError: string | null): void {
+  seed(
+    entries: readonly TranscriptEntry[],
+    turns: readonly TurnMetric[],
+    transcriptError: string | null,
+    contextUsed: number | null = null,
+  ): void {
     this.version += 1;
     const reducer = new TranscriptReducer();
-    reducer.seed(entries, turns);
+    reducer.seed(entries, turns, contextUsed);
     const needles = this.needles();
     this.open.clear();
     this.queue = [];
@@ -116,6 +127,7 @@ export class Conversation {
         needles,
       ),
       transcriptError,
+      contextUsed,
     };
   }
 
@@ -185,6 +197,17 @@ export class Conversation {
 
   turnChanged(turn: TurnState): void {
     this.event({ type: 'turn', seq: 0, turn });
+  }
+
+  compactionChanged(compaction: CompactionState | null): void {
+    // A compaction adds no entry and runs for minutes: the held-back tail of the open text must go out now.
+    if (compaction !== null) this.closeOpenText();
+    this.event({ type: 'compaction', seq: 0, compaction: compaction === null ? null : { ...compaction } });
+  }
+
+  /** Work: the live workflow runs, the whole list. */
+  runsChanged(runs: readonly RunView[]): void {
+    this.event({ type: 'runs', seq: 0, runs: runs.map((r) => ({ ...r })) });
   }
 
   turnEnded(end: TurnEnd): void {
@@ -283,6 +306,9 @@ export class Conversation {
         needles,
       ),
       ...(this.lastEnd === null ? {} : { lastEnd: { ...this.lastEnd } }),
+      ...(this.base === null || this.base.contextUsed === null ? {} : { contextUsed: this.base.contextUsed }),
+      ...(host.compaction === null ? {} : { compaction: { ...host.compaction } }),
+      runs: host.runs.map((r) => ({ ...r })),
     };
   }
 
@@ -322,6 +348,8 @@ export class Conversation {
       } else if (op.op === 'set') {
         this.open.delete(op.index);
         out.push({ op: 'set', index: op.index, entry: redactEntry(op.entry, needles) });
+      } else if (op.op === 'context') {
+        out.push(op);
       } else {
         this.closeOpenTextInto(out);
         out.push({ op: 'metric', metric: redactDeep({ ...op.metric }, needles) });
@@ -365,7 +393,10 @@ export class Conversation {
 
   private commit(ops: TranscriptOp[]): void {
     if (this.base === null || ops.length === 0) return;
-    for (const op of ops) applyOp(this.base.view, this.base.turns, op);
+    for (const op of ops) {
+      if (op.op === 'context') this.base.contextUsed = op.used;
+      else applyOp(this.base.view, this.base.turns, op);
+    }
     if (this.sinks.size === 0 || this.closed) return;
     this.queue.push(...ops);
     if (this.timer === null) {
@@ -410,7 +441,7 @@ function countPushes(ops: readonly TranscriptOp[]): number {
   return n;
 }
 
-/** Applies one op to an entry list, as the page does. */
+/** Applies one op to an entry list, as the page does. A `context` op changes no entry. */
 export function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: TranscriptOp): void {
   switch (op.op) {
     case 'push':
@@ -433,13 +464,20 @@ export function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: Tra
     case 'metric':
       turns.push({ ...op.metric });
       return;
+    case 'context':
+      return;
   }
 }
 
-/** Consecutive `text` ops on one index become one. */
+/** Consecutive `text` ops on one index become one; of the `context` ops only the last is kept, at the end. */
 export function mergeTextOps(ops: readonly TranscriptOp[]): TranscriptOp[] {
   const out: TranscriptOp[] = [];
+  let context: TranscriptOp | null = null;
   for (const op of ops) {
+    if (op.op === 'context') {
+      context = op;
+      continue;
+    }
     const last = out[out.length - 1];
     if (op.op === 'text' && last !== undefined && last.op === 'text' && last.index === op.index) {
       const endTs = op.endTs ?? last.endTs;
@@ -453,5 +491,6 @@ export function mergeTextOps(ops: readonly TranscriptOp[]): TranscriptOp[] {
       out.push(op);
     }
   }
+  if (context !== null) out.push(context);
   return out;
 }

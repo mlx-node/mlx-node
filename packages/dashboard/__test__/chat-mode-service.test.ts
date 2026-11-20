@@ -1068,7 +1068,7 @@ describe('the marks of a conversation', () => {
       });
     }
     const events: ConversationEvent[] = [];
-    conversation.attach((e) => events.push(e), { turn: null, interactions: [] });
+    conversation.attach((e) => events.push(e), { turn: null, interactions: [], compaction: null, runs: [] });
     const sync = events[0];
     if (sync?.type !== 'sync') throw new Error('no sync');
     expect(sync.permissionMarks).toHaveLength(2_500);

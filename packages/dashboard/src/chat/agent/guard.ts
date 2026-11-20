@@ -15,13 +15,14 @@ export type SelfCheck =
       models: Array<{ modelId: string; contextTokens: number | null }>;
       embeddedContext: boolean;
     }
-  /** Rows 1–4 block the mode as `agent-incompatible`; row 5 (no models) is resolved by the host. */
-  | { ok: false; row: 1 | 2 | 3 | 4 | 5 };
+  /** Every row but 5 blocks the mode as `agent-incompatible`; row 5 (no models) is resolved by the host. */
+  | { ok: false; row: 1 | 2 | 3 | 4 | 5 | 6 };
 
 export function selfCheck(facts: InitializeFacts): SelfCheck {
   if (facts.protocolVersion !== 1) return { ok: false, row: 1 };
   if (!facts.loadSession) return { ok: false, row: 2 };
   if (!facts.pluginDirs) return { ok: false, row: 3 };
+  if (!facts.workflowControl) return { ok: false, row: 6 };
   if (facts.agentVersion === null) return { ok: false, row: 4 };
   if (facts.models === null || facts.models.length === 0) return { ok: false, row: 5 };
   return { ok: true, agentVersion: facts.agentVersion, models: facts.models, embeddedContext: facts.embeddedContext };

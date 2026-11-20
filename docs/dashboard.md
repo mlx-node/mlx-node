@@ -80,6 +80,17 @@ do not ask. `GROK_CONFIG` of Work is the user's own overlay object (when there i
 16,384 + 12,000 = 28,384, Chat 8,192 + 12,000 = 20,192 (`src/chat/agent/env.ts`). A lower cap of the user's own still
 holds.
 
+Compaction (the agent summarizes older messages once its context passes 85 % of the window) is set for a local model
+in both modes, over any inherited value:
+
+| Setting                                            | Value          | Mode       | Why                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------- | -------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| env `GROK_TWO_PASS_COMPACTION`                     | `0`            | Work, Chat | the early second summary waits behind the main step on the local engine and doubles the work                                                                                                                                                                                   |
+| env `GROK_COMPACTION_WALL_CLOCK_SECS`              | `0` (no clock) | Work, Chat | the agent's 300 s clock cut every local summary, so each step of a long turn waited 5 minutes and compacted nothing                                                                                                                                                            |
+| `GROK_CONFIG` `models.inference_idle_timeout_secs` | `3600`         | Work       | a stall limit, not a turn cap: a summary reads the conversation for minutes with no event the agent counts, and a workflow child queued behind it ends at the agent's 600 s default; `0` would mean 10 s; a higher integer of the user's own stays (`AGENT_IDLE_TIMEOUT_SECS`) |
+
+Chat keeps the agent's 600 s stall limit: its turn cap pauses while the agent compacts (Turns, below).
+
 The desktop engine runs these agents, so its server sets the three thinking options of
 `@mlx-node/server/host/agent-thinking` on every Messages request that is not reasoning effort `none`: a budget of
 12,000 thinking tokens (only when the request sets none), the cycle guard (an exact repeat inside a thought closes it)
@@ -116,7 +127,9 @@ mutation "The change may or may not have been applied."); streams and other call
 retry timer. A turn of any length passes the liveness check as long as the Control Panel answers one ping in 120 s;
 the Control Panel also pushes a pong when a turn starts and when one ends, so MAIN never holds a turn count older than
 the turn. A turn the agent starts by itself (a wake) counts as running from its first update with no typed prompt open
-(the typed turn's reply may come in the same stdout chunk) until its `turn_completed` line or the agent's exit. At a
+(the typed turn's reply may come in the same stdout chunk) until its `turn_completed` line or the agent's exit; the
+host keeps it (`TurnState.origin: 'wake'`), not the service. A workflow run the agent reports `active` counts as running
+too, with no turn: the conversation is in the host's `active` list with `background: true`. At a
 signal the Control Panel tells MAIN once which turns its close cancels; a turn the user already stopped is not listed.
 
 A stuck or dead database worker is replaced once its exit is confirmed (a queued mutation must be dead first). Its open
@@ -135,7 +148,7 @@ new worker.
 | Control Panel exit cap                        | 10 s                                  | its own teardown                                                     |
 | agent stop ladder                             | EOF, +1.5 s, +1 s                     | stops the agent at teardown                                          |
 | `pageGoneMs`                                  | 60 s                                  | with no window, open Work requests are denied                        |
-| Chat turn cap                                 | 10 min, Chat only                     | ends a Chat turn                                                     |
+| Chat turn cap                                 | 10 min, Chat only                     | ends a Chat turn; paused while the agent compacts                    |
 | restart budget                                | 6 short lives, 0 / 5 / 10 / 20 / 40 s | a liveness restart counts                                            |
 
 **The record.** MAIN writes `~/.mlx-node/ledger/main-<startMs>-<pid>.1.jsonl` (folder 0700, file 0600, append only, one
@@ -350,6 +363,8 @@ Delete in Local models and Reinstall never reach the same entry: Delete needs a 
 `mlx-agent` with the app's `web_search` / `web_fetch` tools and no shell; Work runs it in a folder the user chooses.
 The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 
+- Workflows: Work only. The Chat agent starts with `GROK_WORKFLOWS=0` (the environment beats any config file), so a
+  Chat prompt lists no workflow and the model has no `workflow` tool to call.
 - Places: `/chat?c=<id>` is a conversation, `/chat?mode=chat|work` the New screen of a mode. A send from the New screen
   creates the conversation and pushes `?c=<id>`. The last mode and the model picked per mode are kept in
   `localStorage`; drafts stay in memory only, one per place, and are never written to storage.
@@ -362,14 +377,25 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   stopped, no models, Work without a folder, text that starts with `/`. On the New screen such a state replaces the
   hero with a panel and its action; inside a conversation it is a strip over the composer. A send the server refuses
   puts the text back and shows the strip for its `reason` (`blockers.ts`).
-- Tools row: the chips, then the key legend (`↵ Send`, `⇧↵ New line`, or `Esc to stop` while an answer runs and the
-  text field has the focus; icons with hidden key names), then Send / Stop in a column of its own that never shrinks.
-  A legend part is drawn whole or not at all. As the row gets short, first the legend parts go (New line, then Send),
-  then the folder label shortens, then the web label, then (Work) the quantization badge goes, then the model name,
-  each label down to a floor (a label of 8 characters or fewer never shortens). A badge that does not fit whole is not
+- Keys: the tooltip of the round button names its key (`Send ↵`, `Stop Esc`). The empty text field shows `⇧↵ New line`
+  at the end of its first line (icons with hidden key names; not drawn under 520 px of composer).
+- Tools row: the chips, then Send / Stop in a column of its own that never shrinks. As the row gets short, first the
+  folder label shortens, then the web label, then (Work) the quantization badge goes, then the model name, each label
+  down to a floor (a label of 8 characters or fewer never shortens). A badge that does not fit whole is not
   drawn and its room goes back to the folder and web labels (`data-fit-whole`, composer); under 520 px of composer
   the chips are icons, under 320 px they wrap. The Bypass word and the Send button never give way. The reason Send is
   off keeps up to two lines beside the chips.
+- Context hint: an 18 px ring just before Send / Stop, outside the box the chips shrink in, with no text. The arc
+  (`--info` blue; warning from 80 %, danger from 95 %; a share above 0 shows at least a short arc) is the conversation's
+  context over its model's window. The numbers are only in its tooltip and name (`Context: 11,971 of 262,144 tokens
+  (5%)`); it takes keyboard focus so the tooltip opens without a mouse. Used: the agent's `params._meta.totalTokens`
+  on each `session/update` (its count of the current context, not a usage sum; a line without it keeps the last
+  value). The transcript reducer keeps it, a `context` op carries it live, `sync` carries it (`contextUsed`), and a
+  stored conversation gets it back from the same `updates.jsonl` lines its thread is rebuilt from (the session
+  detail's `contextUsed`), so it survives a reload and an app restart. Window: the model's `contextTokens` from the
+  host state: the window an agent process last listed for it, kept in `model-windows.json`, so it is known while no
+  agent runs (after the 10 min idle stop, after a restart). Not drawn while either is unknown, beside a reason or the
+  counter, or under 320 px of composer.
 - Model: before each message goes to the agent, the app selects the conversation's model on the engine
   (`POST /v1/messages/count_tokens` over `node:http` to 127.0.0.1 only, the token in the `x-api-key` header, a 30 min
   ceiling; `src/chat/agent/select-model.ts`). Only that model loads. While the engine loads it, the thread shows the
@@ -377,17 +403,71 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   engine prepares GPU kernels for that model (load progress `phase: 'kernels'` with `steps` known), the card's title
   is "Preparing GPU kernels", its head counts "n of m" steps, a bar fills by steps and the note says "The first load
   after an update prepares the GPU. It can take a couple of minutes."; the weight read, or an engine that reports no
-  steps, keeps the plain card. Loads can overlap: the card shows the load of the conversation's own model, else the
+  steps, keeps the plain card. The first load of a model that moves its stored chats to 32-token pages
+  ([paged-cache.md](paged-cache.md#32-token-pages-with-token-major-keys-qwen3_5-draft-loads)) also does that move
+  inside the load; the card shows no step for it, so it reads as a longer plain load. Loads can overlap: the card shows the load of the conversation's own model, else the
   oldest one (`loadFor`, `ChatHostState.loading` is a list, oldest first). A model change
   in an open conversation loads nothing until the next message. A model in memory is selected at once, also while
   answers run on it (the engine skips its load gate for a resident name). If the select still waits, the card says the
   model is in memory and does not say it loads. When the turn has no output yet and the live file shows that the
   model runs as many answers as its limit while a request waits, and every running answer started before the turn (so
   none is its own request; `ChatHostState.answers`), the thread says "Waiting for a running answer".
-- Wait line: until the turn's first entry the thread shows the status as text beside a 20 px dotted orb
-  (`arc-x/wait-line`, `arc-x/wait-orb`; the orb is `aria-hidden`). Its shape says which wait: a slow ring while the
-  turn waits (starting, stopping, the engine, a full model, no event for 3 s), a waving band while events arrive. The
-  load card has the orb in its head: a pulsing sphere while the engine loads this model, the slow ring otherwise.
+- Wait line: while a turn runs and nothing moves on screen, the end of the thread shows one status line beside a 20 px
+  dotted orb (`arc-x/wait-line`, `arc-x/wait-orb`; the orb is `aria-hidden`), with a clock (`m:ss`) that counts from
+  the start of this wait: the turn's start before its first entry, else the newest time of the turn's entries (the end
+  of the last step). It shows before the first entry and again between any two steps of a long turn. It hides while a
+  drawn tool row runs (`in_progress` or `pending`), while a permission or plan card is open, and while text or a
+  thought got a stream event in the last 3 s. While it shows, that last thought or text is drawn finished ("Thought",
+  no live mark), so the turn has one live indicator. Its shape says which wait: a slow ring while the turn waits (starting,
+  stopping, the engine, a queue, the busy model, no event for 3 s), a waving band while the model works for this
+  conversation. The load card has the orb in its head: a pulsing sphere while the engine loads this model, the slow
+  ring otherwise. What it says, first match (`pendingRow`, `engineWait` in `ui/src/lib/chat-turns.ts`):
+
+  | Engine state                                                       | Line                                                                      |
+  | ------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+  | the turn is created / stopping                                     | "Starting…" / "Stopping…"                                                 |
+  | this conversation's request is `queued` or `slot`                  | "Waiting for the model. Another answer runs first." (full: below)         |
+  | this conversation's request is in `prepare` or `prefill`           | "Reading the conversation · 69.3K of 121.3K tokens" and a bar             |
+  | this conversation's request is in `decode`                         | "Thinking…"                                                               |
+  | the model loads, the engine starts, the turn starts                | the load card, "Starting the engine…", "Starting…"                        |
+  | the model is full and every running answer started before the turn | "Waiting for a running answer. … runs one answer at a time."              |
+  | the request may be this one's but the app cannot tell (see below)  | "The model is busy · reading 5,000 of 20K tokens" / "…busy…"              |
+  | nothing known; after 3 s with no event                             | "Working…" ("Thinking…" before the first entry); "Waiting for the model…" |
+
+  The link from a conversation to its engine request is exact: the agent sends `x-grok-session-id: <ACP session id>`
+  on every model request; `/v1/messages` and `/v1/responses` keep it on the traced config (`clientSession`,
+  `clientSessionOf` in `packages/server/src/turn-trace.ts`), the engine's live file lists it per turn
+  (`turns[].clientSession`), and the host state lists the app engine's requests (`ChatHostState.requests`: session,
+  model, phase, start, prefill counts, oldest first) on the host stream, pushed on each heartbeat. A request names this
+  conversation when its session equals the conversation id. A request that named no session (an older engine, a
+  terminal client) on the conversation's model that started in this wait, or requests in the server's own queue (the
+  model's `queued`, which the live file does not list) while every listed request on the model is another's, give the
+  model's words, never "the conversation". Requests in that server queue have no phase until they reach the model.
+
+- Compaction: when the agent's context passes 85 % of the window it summarizes older messages; on a local model one
+  summary reads the whole conversation and then writes for 10 to 25 minutes. The agent sends four xAI updates on
+  `_x.ai/session_notification` (mlx-agent v0.3.3 `extensions/notification.rs`): `auto_compact_started`
+  (`tokens_used`, `context_window`, `percentage`, `reason`), then `auto_compact_completed` (`tokens_before`,
+  `tokens_after`, `elapsed_ms`), `auto_compact_failed` (`error`; text that starts "it'll retry on the next turn" when
+  it tries again at its next step) or `auto_compact_cancelled` (Stop). A manual `/compact` sends `completed` alone, and
+  the app refuses text that starts with `/`, so a running compaction is always an automatic one. The host keeps
+  `{ phase: 'running', startedAt, tokensBefore }` per conversation (`AgentHost.compaction`) from `started` until an
+  end update, the agent's `turn_completed`, the end of the turn or the agent's exit, and sends it on the conversation
+  stream (`compaction` event, `sync.compaction`); it is not a second channel and not part of the turn, so a compaction
+  with no typed turn (a model-family switch, a woken turn) shows too. While it runs the thread end shows ONE line in
+  place of the wait line (never both): the `fold` orb (five dotted lines that squeeze into one bar, then the next page
+  fades in; `arc-x/wait-orb/fold.ts`, a still frame under reduced motion), "Compacting the conversation", a quieter
+  note from the conversation's newest engine request since the start ("Reading 113.2K of 172.2K tokens" with the bar,
+  then "Writing the summary · 3,200 tokens" from the request's `generated`, nothing while it waits) and the clock from
+  the start. Under the first compaction of a conversation one line says "Older messages are summarized to free space.
+  This can take several minutes on a local model." Stop works as in any turn: `session/cancel` cancels the
+  compaction. The agent writes the end updates to `updates.jsonl` (`_x.ai/session/update`), so the transcript reducer
+  makes a `compaction` entry from them, live and from disk alike, and the marker survives a reload and an app restart:
+  "Conversation compacted · 222.8K → 31.2K tokens · 12:04" (counts only when the agent sent both), "Compaction
+  failed. The agent tries again." (or "Compaction failed." when it does not), "Compaction stopped." The Sessions
+  transcript draws the same marker. The context ring drops through its usual path: the next update after the summary
+  carries the smaller `totalTokens`.
+
 - Picker: the pill shows the base model and a badge with its quantization (`Qwen3.8-27B` `UD-Q4_K_XL`; the badge hides
   under 520 px of composer, and in Work it is drawn whenever the row has room for it with the folder and web labels
   at their floors, else not at all; the picker, its title and its name always say it),
@@ -407,7 +487,8 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   next message loads it again. The Engine page has no Unload.
 - Turns: the Stop button, the palette's "Stop answer" and `Esc` in the composer cancel the running turn. `Esc` stops
   nothing on a key repeat, while an input method composes, or with the focus anywhere else. A Chat turn stops after 10
-  minutes (`turn-timeout`). A Work turn has no time limit: it runs until the agent ends it or you press Stop, and the
+  minutes (`turn-timeout`); the time the agent compacts the conversation is not counted (the cap pauses at
+  `auto_compact_started` and runs on with the time that was left after the end update). A Work turn has no time limit: it runs until the agent ends it or you press Stop, and the
   app ends it only when the engine or the agent is gone, or after two length stops in a row (below). The end of a turn says why it stopped; `output-limit` offers
   Continue, `tool-refused`, `address-refused`, `arguments-unreadable` and `tool-loop`
   offer Send again.
@@ -486,9 +567,36 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   word edge (`Run gitk` on the command `git` is shown whole). A one-word title is hidden only when it is the target or
   the agent's own verb or tool name. MCP and other cards always show it (the tool's name). The server says when it cut
   a title (`titleCut`); such a title ends with "…", at a whole word when the last word is short; the whole title is
-  its hover text. The card reads in three groups:
+  its hover text. A request a helper agent made (the agent's `x.ai/requester`) names it in the card's header: "Asked by
+  researcher-0 · deep-research" for a helper of a workflow run, "Asked by helper explore-1" for one of no run, and
+  "Works in <folder>" in place of the conversation's folder when the helper works in another one. The card reads in three groups:
   what is asked (title, description, wells), what to know (Auto's reason line, then the warnings), the answer
   (buttons, then the notes): 8 px between groups, 12 px before the buttons, 6 px before the first note.
+- **Workflows** (`ui/src/components/run-card.tsx`). A run the agent starts with its `workflow` tool is one card in
+  the turn that started it, kept in place as the run moves (one `workflow` transcript entry per run, replaced by each
+  higher `revision`; the Sessions transcript draws the same card, read only). The card: "Workflow · deep-research",
+  the status word with a dot (Running, Waiting for you while a helper's request is open, Stopping…, Paused, Waiting,
+  Out of helpers, Done, Failed, Stopped, Ended early), the steps with "Step 2 of 4: Research", "5 of 128 helpers used"
+  with a bar, a pause message, Helpers (one row per helper: label, state, step, tokens, time; open while the run
+  works) and Report (the run's `result_summary` as Markdown, cut at 16 KB, open when the run is Done). While a run is
+  `active` and no turn runs, the card's moving dot is the only sign of work: the thread shows no wait line. A helper's
+  engine requests carry the helper's own session, so they never show on the conversation's wait line, also while a
+  typed turn runs: the run card is the sign. A card
+  the agent still says is `active` but the host no longer holds (the agent stopped, the app restarted) reads "Ended
+  early". **Stop run** (only while the host holds the run and it is `active`) asks "Stop this workflow? Its helpers
+  stop now." with Stop run / Keep running, then sends `POST /api/chat/conversations/:id/runs/:runId/stop`; the card
+  reads Stopping… until the run's last update, and no wake turn follows a stopped run. A stop the agent rejects, or
+  that gets no reply, fails the call (409 "The run could not be stopped.", or 503), gives the card back to running and
+  shows the toast "Could not stop the run". The composer's Stop stops the
+  turn only, a typed one or a wake, never a run. During a run: a typed prompt is allowed, the model picker and Delete
+  are off ("A workflow runs here. Stop it first."), Rename stays on, Unload waits, the agent's idle stop and a config
+  restart wait for the run's end (a config restart also waits for the wake that follows a run's end, or for the idle
+  stop when none comes), and an engine address change stops the run. The list and the mode switch count the
+  conversation as running. Requests of the run's helpers come one at a time, as cards under the thread like any other;
+  such a card does not count as the typed turn waiting, so that turn's wait line stays, and its Deny refuses only
+  that helper's call ("Deny refuses this call of the helper only."), never the typed turn. When a run ends the agent may start a turn with no prompt (the wake): it shows
+  the wait line and Stop like any turn, and its row reads "Woken by workflow <name>" from its first line (the host
+  names the run that ended; the wake's `turn_completed` corrects it when the agent woke for something else).
 - **Plan card.** The plan as Markdown in a scrolling well; Approve plan, or Send feedback… with a text field of at
   most 4,000 characters (Escape goes back). A request with no plan text (`planContent` null, absent or blank) shows
   "The agent sent no plan text." and the buttons Keep planning and Approve plan; no feedback is sent then (with no
@@ -570,7 +678,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   warning line says so in that line); while the mode is Auto it answers only with Deny and Allow once. The guard hook
   must have asked for each shell command (this start's name). At most 100 calls pass this way in one answer: a call
   counts when the app decides, so calls that arrive together (parallel tool calls, helper agents, whose requests carry
-  the conversation's session) cannot pass the cap; with no window open, every call is a card. A check that fails with
+  the conversation's session) cannot pass the cap; the cap counts per owner (the typed turn, the wake, or each run);
+  with no window open, every call is a card. Starting a workflow or a helper is a card once (`helper-start`: "this
+  starts helpers that run on their own. Each of their calls is checked like yours."); after that each helper request
+  is judged like the conversation's own, by the folder the request names: a helper whose folder is not the Work folder
+  asks (`helper`: "this helper works in another folder."), per request. A helper's edit inside the Work folder is
+  allowed with no card, as for a typed turn (also from a workflow whose prompt says not to edit). A check that fails with
   an error is a card (`unread`).
 
   _Auto and the temp folder._ The places Auto answers for are a closed list of roots, given as data by the host
@@ -673,6 +786,7 @@ Chat and Work add, under `~/.mlx-node/chat` (0700):
 | File                                                   | Holds                                                                                |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------ |
 | `conversations.json`                                   | the Work index: session id and creation time only, no title, no path                 |
+| `model-windows.json`                                   | the context window an agent last listed per model: model id and token count only     |
 | `providers.json`                                       | provider selection and check results; never a key                                    |
 | `plugins/<id>/`                                        | provider skill folders copied from the bundle                                        |
 | `work-guard/plugin.json`                               | the Work guard plugin: one `PreToolUse` hook that asks before every shell command    |
@@ -789,7 +903,7 @@ and also holds other turns' decode steps.
 `schedulerStats()` is a scheduler barrier, so the sampler never calls it on a model with work: it goes through
 `SessionRegistry.tryIdleProbe`, which holds any dispatch that arrives until the reply settles. Scheduler counters are
 cumulative, so the difference of two idle snapshots is exact for the burst between them. A turn in the one-turn-at-a-time
-lane moves no scheduler counter (any family under `MLX_SERVE_FORCE_SERIAL=1`, DFlash2 and other barrier
+lane moves no scheduler counter (any family under `MLX_SERVE_FORCE_SERIAL=1`, MoE DFlash2, media and other barrier
 turns), so `turns` against `admitted` tells such a model from an idle scheduler; a record without `turns` reads as
 unknown. Live concurrency comes from TS-side state. At 16 MiB a series file takes only `load` and `exit` records (each still led by this process's
 `proc` header when the file has none from it yet); `sample`, `sched` and `proc` records are dropped until the next
@@ -819,8 +933,9 @@ only the tail appended since the last read of each file. Files past retention ar
 
 Live state is pushed over the same port; no page polls for it. The one timer that reads data is the Coding Agents
 page, which re-reads `GET /api/coding-agents` every 30 s while the window is visible (and on window focus). The Chat
-load card has a 1 s clock while it is shown; it changes only its elapsed-time text (the kernel step count comes with
-the live snapshot).
+load card and the thread's wait line (`components/wait-clock.tsx`) have a 1 s clock while they are shown; it changes
+only their elapsed-time text (the kernel step count and the engine's request phases come with the live snapshot and
+the host state).
 
 ```
  SPA  ── { kind: 'watch', id, topic: 'live' } ──▶  service
@@ -908,6 +1023,13 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   default is one turn on each of two models). `MLX_DEV_DISK_CACHE=native|off|older` sets the disk cache the heartbeat
   reports: on with the native 128-block limit, off, or no field at all (default: on, the whole prompt).
   `MLX_DEV_FLIGHT=phases` adds three turns before their prefill: model busy, waiting for a slot, preparing.
+  `MLX_DEV_FLIGHT=chat` runs a 40 s cycle on the harness's chat model: 10 s busy (one request of another session
+  reads its prompt for 6 s, then generates, while the model's `queued` counts the Work conversations' requests,
+  unlisted), then one request per Work conversation named with its id (queued 10 s, prefill 15 s, decode 5 s): send a
+  Work prompt with "slow" and the wait line shows each state, the model-busy ones included, during the 45 s pause
+  after the Read row. The request's decode writes 640 tokens a second. A prompt with "compact" (Chat or Work) runs a
+  45 s compaction in the fake agent (`compact` step: started, then completed with 222,822 → 31,204 tokens): the
+  compaction line shows, in Work with the reading and writing notes of the cycle, then the marker.
   `MLX_DEV_LOAD_KERNELS=3/50` reports the harness engine's load as "Preparing GPU kernels", 3 of 50.
 - The fixture home holds three model caches under `prefix-cache/` (sparse files, last used 2 minutes, 3 days and 12
   days ago); the harness holds the lock of the newest one, so the Cache page shows one "In use", and the fixture
@@ -1177,21 +1299,22 @@ runs), not through the session routes.
 
 ### Chat routes
 
-| Route                                           | Method | Thread    | Purpose                                                                                                                               |
-| ----------------------------------------------- | ------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks     |
-| `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                             |
-| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode  |
-| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                             |
-| `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                       |
-| `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                       |
-| `/api/chat/conversations/:id/permission-mode`   | POST   | transport | `{mode, up}` → `{mode}`; Work only; 409 `card-open` or `mode-changed`; 503 if a line write fails: see [Chat and Work](#chat-and-work) |
-| `/api/chat/drafts/:draft/permission-mode`       | POST   | transport | `{mode, up, cwd?, temp?}` → `{mode}`; the New Work screen's pick; `up: true` needs `cwd`; 409 `mode-changed` or `temp-unnamed`        |
-| `/api/chat/work/hooks`                          | GET    | transport | `?cwd=` → `{userHooks}`; the folder rule of create first                                                                              |
-| `/api/chat/conversations/:id`                   | PATCH  | transport | `{title}` or `{modelId}` → `ConversationInfo`                                                                                         |
-| `/api/chat/conversations/:id`                   | DELETE | transport | → `{}`; open streams end with `gone`                                                                                                  |
-| `/api/chat/agent`                               | POST   | transport | `{action: 'restart', mode?}` or `{action: 'install'}` → `ChatHostState`                                                               |
-| `/api/chat/engine/unload`                       | POST   | transport | no body → `{unloaded: string[]}`; 409 `engine-busy` while an answer or a load runs                                                    |
+| Route                                           | Method | Thread    | Purpose                                                                                                                                                                     |
+| ----------------------------------------------- | ------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks                                           |
+| `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                                                                   |
+| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode                                        |
+| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                                                                   |
+| `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                                                             |
+| `/api/chat/conversations/:id/runs/:runId/stop`  | POST   | transport | no body → `{}`; Stop run of one live workflow run; 404 "No such run." when the host does not hold it; 409 when the agent rejects the stop, 503 when its reply does not come |
+| `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                                                             |
+| `/api/chat/conversations/:id/permission-mode`   | POST   | transport | `{mode, up}` → `{mode}`; Work only; 409 `card-open` or `mode-changed`; 503 if a line write fails: see [Chat and Work](#chat-and-work)                                       |
+| `/api/chat/drafts/:draft/permission-mode`       | POST   | transport | `{mode, up, cwd?, temp?}` → `{mode}`; the New Work screen's pick; `up: true` needs `cwd`; 409 `mode-changed` or `temp-unnamed`                                              |
+| `/api/chat/work/hooks`                          | GET    | transport | `?cwd=` → `{userHooks}`; the folder rule of create first                                                                                                                    |
+| `/api/chat/conversations/:id`                   | PATCH  | transport | `{title}` or `{modelId}` → `ConversationInfo`                                                                                                                               |
+| `/api/chat/conversations/:id`                   | DELETE | transport | → `{}`; open streams end with `gone`                                                                                                                                        |
+| `/api/chat/agent`                               | POST   | transport | `{action: 'restart', mode?}` or `{action: 'install'}` → `ChatHostState`                                                                                                     |
+| `/api/chat/engine/unload`                       | POST   | transport | no body → `{unloaded: string[]}`; 409 `engine-busy` while an answer, a workflow or a load runs                                                                              |
 
 Bodies hold exactly the listed fields: any other field (`_meta`, `mcpServers`, `pluginDirs`, `env`, …) is 400. Text is
 1–100,000 characters (413 above); text whose first non-space character is `/` is 400 with `reason: 'slash-text'` and
@@ -1200,8 +1323,9 @@ never reaches the agent. A Chat route failure carries a fixed sentence and, wher
 
 Streams are not routes: `runtime.watchChat({scope: 'host'}, fn)` sends `{type: 'state'}` (coalesced to 100 ms) and
 `{type: 'conversations-changed'}`; `runtime.watchChat({scope: 'conversation', conversationId}, fn)` sends a full `sync`
-first, then `ops`, `turn`, `interaction`, `interaction-closed`, `notice`, `conversation`, `permission-mark` and `gone`, each with `seq` one
-above the last. A page that sees a gap re-opens the stream for a fresh `sync`. Over the port the request kind is
+first, then `ops`, `turn`, `interaction`, `interaction-closed`, `notice`, `conversation`, `permission-mark`, `compaction`, `runs`
+and `gone`, each with `seq` one above the last. `runs` (and `sync.runs`) is the whole list of the conversation's live
+workflow runs, `{runId, stopping}`; a `turn` whose `origin` is `'wake'` is a turn the agent started with no prompt. A page that sees a gap re-opens the stream for a fresh `sync`. Over the port the request kind is
 `chat`; streams close on `unsubscribe` and when the port closes.
 
 `GET /api/sessions/:id/timeline?turn=<n>` → `{turn, turns, open, live, stopReason, asOfMs, range, lanes, spans,

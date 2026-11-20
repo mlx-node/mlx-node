@@ -438,6 +438,7 @@ fn pool_blobs_are_split_block_of_the_rows() {
     };
     let layout = PageLayout {
         values_token_major: true,
+        keys_token_major: false,
         index_rows: PAGE.index_rows,
         index_dimension: PAGE.index_dim,
     };

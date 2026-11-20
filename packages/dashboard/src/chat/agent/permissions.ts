@@ -266,7 +266,8 @@ export function shownCut(text: string, max: number, needles: readonly string[]):
  * A Work permission request as the page sees it. Only the options of `WORK_OPTIONS` pass, so `enable-always-approve`, every
  * `reject_always` and any other "always" grant are never offered. `place` adds the "outside the work folder" check;
  * `landing` is where an edit really lands once the disk follows its links, which decides that check. A landing that
- * cannot be known (null) is warned about as outside the folder.
+ * cannot be known (null) is warned about as outside the folder. `from`: the helper that asks, the name of its run, and
+ * its folder when that is not the Work folder.
  */
 export function workInteraction(
   id: string,
@@ -274,6 +275,7 @@ export function workInteraction(
   needles: readonly string[],
   place?: WorkPlace,
   landing?: string | null,
+  from?: NonNullable<PermissionInteraction['from']>,
 ): PermissionInteraction {
   const access = accessOf(req);
   const options: PermissionInteraction['options'] = [];
@@ -317,6 +319,15 @@ export function workInteraction(
     resolvedPath: shown(resolvedPath),
     options,
     flags,
+    ...(from === undefined
+      ? {}
+      : {
+          from: {
+            label: shownCut(from.label, TITLE_MAX, needles),
+            run: from.run === null ? null : shownCut(from.run, TITLE_MAX, needles),
+            cwd: shown(from.cwd),
+          },
+        }),
   };
 }
 

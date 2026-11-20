@@ -30,6 +30,8 @@ export interface ConfirmContent {
   description: ReactNode;
   /** "Delete" */
   confirmLabel: string;
+  /** The button that keeps things as they are. Default "Cancel". */
+  cancelLabel?: string;
   /** "Deleting…" */
   workingLabel: string;
   /** "Deleted" */
@@ -427,7 +429,7 @@ export function ConfirmPopover(props: ConfirmPopoverProps): ReactElement {
                 ) : null}
                 <div className={styles.footer}>
                   <Button ref={cancelRef} type="button" variant="ghost" size="md" disabled={working} onClick={cancel}>
-                    Cancel
+                    {props.cancelLabel ?? 'Cancel'}
                   </Button>
                   <Button
                     ref={confirmRef}

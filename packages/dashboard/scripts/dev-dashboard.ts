@@ -10,6 +10,9 @@
  * `MLX_DEV_TICKER_TPS` / `MLX_DEV_TICKER_MEM_GB`: fixed Output rate and MLX memory values in the heartbeat.
  * `MLX_DEV_FLIGHT=one-model`: both turns in flight on one model, one asked through the alias `mlx-local`.
  * `MLX_DEV_FLIGHT=phases`: three more turns before their prefill: model busy, waiting for a slot, preparing.
+ * `MLX_DEV_FLIGHT=chat`: a 40 s cycle on the chat model for the thread's wait line: 10 s model busy (another
+ * session's request reads, then generates, while the conversations' requests wait unlisted), then each Work
+ * conversation's own request queued, in prefill, in decode; start a "slow" prompt to see it between steps.
  * `MLX_DEV_LOAD_KERNELS=<done>/<steps>`: the heartbeat reports a load as "Preparing GPU kernels", done of steps.
  * `MLX_DEV_DISK_CACHE=native|off|older`: the disk cache the heartbeat reports (default: on, whole prompt).
  * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
@@ -62,7 +65,7 @@ function tickerValues(): LiveProcess['ticker'] {
 }
 
 function flightValue(value: string | undefined): LiveProcess['flight'] {
-  return value === 'one-model' || value === 'phases' ? value : 'two-models';
+  return value === 'one-model' || value === 'phases' || value === 'chat' ? value : 'two-models';
 }
 
 /** `<done>/<steps>` of `MLX_DEV_LOAD_KERNELS`, or null. */

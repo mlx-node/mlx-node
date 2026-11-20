@@ -37,6 +37,13 @@ export interface EvalScoreOptions {
   logitChunk?: number;
   /** Flat full-attention K/V cache format of the candidate (qwen3_5 / qwen3_5_moe); unset = the load default. */
   kvFormat?: 'int8' | 'bf16';
+  /**
+   * Int8 activations of the candidate's load (`--activations`); unset = the
+   * load default (bf16: the candidate loads with no DFlash2 draft).
+   */
+  activations?: 'auto' | 'bf16';
+  /** Strictly increasing position edges of the report's depth buckets (`--depth-edges`). */
+  depthEdges?: number[];
 }
 
 const DEFAULT_LOGIT_CHUNK = 64;
@@ -75,6 +82,8 @@ export async function evalScore(opts: EvalScoreOptions): Promise<EvalReport> {
     resolve(opts.cache),
     opts.logitChunk ?? DEFAULT_LOGIT_CHUNK,
     opts.kvFormat ?? null,
+    opts.activations ?? null,
+    opts.depthEdges ?? null,
   );
 }
 
@@ -95,6 +104,15 @@ export function formatReport(modelPath: string, report: EvalReport): string {
     `kl_topk          ${report.meanKlTopk.toFixed(5)}  (K=${report.topK}, teacher tail mass ${report.teacherTailMass.toFixed(5)})`,
     `top1_agreement   ${(report.top1Agreement * 100).toFixed(2)}%`,
     `kv_format        ${report.kvFormat}`,
+    `attention        ${report.int8QueryLaunches} int8-query / ${report.bf16QueryLaunches} bf16-query launches`,
+    ...(report.depth.length > 1
+      ? report.depth.map(
+          (bucket) =>
+            `depth ${String(bucket.from).padStart(7)}-${(bucket.to === undefined || bucket.to === null ? '' : String(bucket.to)).padEnd(7)} ` +
+            `${String(bucket.positions).padStart(7)} pos  kl_topk ${bucket.meanKlTopk.toFixed(5)}  top1 ${(bucket.top1Agreement * 100).toFixed(2)}%  ` +
+            `nll ${bucket.meanNll.toFixed(4)} (teacher ${bucket.teacherMeanNll.toFixed(4)})`,
+        )
+      : []),
   ].join('\n');
 }
 
@@ -133,9 +151,18 @@ Score Arguments:
                         default, int8 on Metal at head 256 and BF16
                         compute, else bf16). On Metal the candidate
                         scores through the pool.
+  --activations <mode>  Candidate int8 activations: auto or bf16 (default:
+                        bf16, the candidate has no draft; auto scores
+                        int8 queries over an int8 pool for rows at position
+                        7,168 or later, on M5 and later)
+  --depth-edges <list>  Comma-separated, strictly increasing positions; the
+                        report adds one bucket per range between them
+                        (e.g. 7168,16384,32768,65536)
   --json                Emit the report as one JSON object
 
 Shared Arguments:
+  --teacher and --model take a checkpoint directory or a prepared GGUF asset
+  directory (the one holding gguf-source.json).
   --logit-chunk <int>   Positions per head projection (default: ${DEFAULT_LOGIT_CHUNK})
   --help, -h            Show this help message
 
@@ -166,6 +193,22 @@ function parsePositiveInt(flag: string, raw?: string): number | undefined {
   return Number(raw);
 }
 
+/** `--depth-edges`: comma-separated positive integers, strictly increasing. */
+export function parseDepthEdges(raw: string): number[] {
+  const edges: number[] = [];
+  for (const part of raw.split(',')) {
+    const text = part.trim();
+    let digits = text.length > 0 && text[0] !== '0';
+    for (const ch of text) if (ch < '0' || ch > '9') digits = false;
+    const value = Number(text);
+    if (!digits || !Number.isSafeInteger(value) || value > 0xffffffff)
+      throw new Error(`--depth-edges: "${text}" is not a positive integer`);
+    if (edges.length > 0 && value <= edges[edges.length - 1]) throw new Error('--depth-edges must increase strictly');
+    edges.push(value);
+  }
+  return edges;
+}
+
 function requireModelDir(flag: string, path: string): void {
   if (!existsSync(join(path, 'config.json'))) {
     console.error(`Error: ${flag} model config not found: ${join(path, 'config.json')}`);
@@ -187,6 +230,8 @@ export async function run(argv: string[]) {
       'top-k': { type: 'string' },
       'logit-chunk': { type: 'string' },
       'kv-format': { type: 'string' },
+      activations: { type: 'string' },
+      'depth-edges': { type: 'string' },
       json: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -253,7 +298,27 @@ export async function run(argv: string[]) {
         console.error(`Error: --kv-format must be bf16 or int8, got "${kvFormat}"`);
         process.exit(1);
       }
-      const report = await evalScore({ model: modelPath, cache: args.cache, logitChunk, kvFormat });
+      const activations = args.activations;
+      if (activations !== undefined && activations !== 'auto' && activations !== 'bf16') {
+        console.error(`Error: --activations must be auto or bf16, got "${activations}"`);
+        process.exit(1);
+      }
+      const depthEdgesText = args['depth-edges'];
+      let depthEdges: number[] | undefined;
+      try {
+        depthEdges = depthEdgesText === undefined ? undefined : parseDepthEdges(depthEdgesText);
+      } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        process.exit(1);
+      }
+      const report = await evalScore({
+        model: modelPath,
+        cache: args.cache,
+        logitChunk,
+        kvFormat,
+        activations,
+        depthEdges,
+      });
       if (args.json) {
         console.log(reportJson(modelPath, report));
         return;

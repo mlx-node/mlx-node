@@ -58,7 +58,9 @@ import { canonicalCacheRoot, COLD_TIER_STATE_FAMILIES } from '@mlx-node/lm/cold-
 import {
   enumOf,
   MetricsTrace,
+  RESIDENCY_DELTA_FIELDS,
   STATE_TIER_MODES,
+  type ResidencyDeltaField,
   type MetricsTraceInput,
   type TurnBudgetFrom,
   type TurnDispatch,
@@ -66,7 +68,7 @@ import {
   type TurnErrorKind,
   type TurnFailPhase,
 } from './metrics-trace.js';
-import { readPipelineStats, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
+import { readPipelineStats, readResidency, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
 import { reasoningOutcomeOf, type NativeReasoningOutcome } from './native-thinking.js';
 import type { MeasuredPrefill } from './timing.js';
 
@@ -183,6 +185,8 @@ export interface LiveTurn {
   stream: boolean;
   dispatch: TurnDispatch;
   progress: TurnProgressSnapshot | null;
+  /** The session the request named ({@link clientSessionOf}); null when it named none. */
+  clientSession: string | null;
 }
 
 /**
@@ -274,6 +278,22 @@ class TraceControl implements ChatStreamControl {
 export interface TracedChatConfig extends ChatConfig {
   modelAlias?: string;
   turnMeta?: TurnRequestMeta;
+  /** The client's own session id ({@link clientSessionOf}): the Control Panel finds a conversation's turns by it. */
+  clientSession?: string;
+}
+
+/** The request header an agent names its session in. */
+export const CLIENT_SESSION_HEADER = 'x-grok-session-id';
+const CLIENT_SESSION_MAX = 128;
+
+/** The session a request names in {@link CLIENT_SESSION_HEADER}; undefined when absent, repeated, empty or too long. */
+export function clientSessionOf(
+  headers: Record<string, string | string[] | undefined> | undefined,
+): string | undefined {
+  const value = headers?.[CLIENT_SESSION_HEADER];
+  if (typeof value !== 'string') return undefined;
+  const id = value.trim();
+  return id.length === 0 || id.length > CLIENT_SESSION_MAX ? undefined : id;
 }
 
 /** Injectable seams for {@link TurnTraceModel} (unit tests). */
@@ -356,6 +376,7 @@ interface TurnContext {
   sessionId: string | undefined;
   /** Registry name this request resolved through; wins over the binding name. */
   modelAlias: string | undefined;
+  clientSession: string | undefined;
   startMs: number;
   cold: ColdCacheStats | undefined;
   sidecar: ColdSidecarStats | undefined;
@@ -477,6 +498,12 @@ export class TurnTraceModel implements SessionCapableModel {
   private begun = 0;
   private lastSettleAt = 0;
   private readonly ctxWindow: number | undefined;
+  /**
+   * Marks of the wrapped model's `residencyInfo()` counters, last recorded value per field. The counters live on
+   * the model object, so the marks are this wrapper's, not process-wide like the cold ones; every recorded
+   * outcome advances them, so recorded deltas sum to the counters' advance.
+   */
+  private readonly residencyMarks: Partial<Record<ResidencyDeltaField, number>> = {};
 
   // Optional members installed verbatim on this instance in the constructor
   // when — and only when — the inner model defines them. `declare` so the
@@ -548,6 +575,7 @@ export class TurnTraceModel implements SessionCapableModel {
         stream: ctx.stream,
         dispatch: ctx.dispatch,
         progress,
+        clientSession: ctx.clientSession ?? null,
       });
     }
     return out;
@@ -600,6 +628,10 @@ export class TurnTraceModel implements SessionCapableModel {
         if (typeof value === 'number') marks.sidecar[key] ??= value;
       }
     }
+    const residency = readResidency(this.inner);
+    if (residency !== null) {
+      for (const key of RESIDENCY_DELTA_FIELDS) this.residencyMarks[key] ??= residency.counters[key];
+    }
     const traced = config as TracedChatConfig | null | undefined;
     const ctx: TurnContext = {
       traceId: randomUUID(),
@@ -607,6 +639,7 @@ export class TurnTraceModel implements SessionCapableModel {
       // The requesting alias outranks the binding name: one SessionRegistry
       // (and one wrapper) serves every alias of a model.
       modelAlias: traced?.modelAlias,
+      clientSession: traced?.clientSession,
       startMs: this.now(),
       cold,
       sidecar,
@@ -653,6 +686,21 @@ export class TurnTraceModel implements SessionCapableModel {
         return undefined;
       }
     };
+  }
+
+  /** The residency counters' advance since this wrapper's previous record, with the same reset rule as cold. */
+  private residencyDeltas(rec: MetricsTraceInput): void {
+    const residency = readResidency(this.inner);
+    if (residency === null) return;
+    const marks = this.residencyMarks;
+    for (const key of RESIDENCY_DELTA_FIELDS) {
+      const current = residency.counters[key];
+      const since = marks[key];
+      rec[key] = since === undefined || current < since ? current : current - since;
+      marks[key] = current;
+    }
+    rec.expertResidency = residency.residency;
+    rec.expertSlots = residency.expertSlots;
   }
 
   private pipelineStats(): PipelineStats | null {
@@ -770,6 +818,16 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.mtpMeanDrafts = perf.mtpMeanAcceptedTokens;
         rec.mtpMeanDepth = perf.mtpMeanDepth;
         rec.mtpAcceptByPos = perf.mtpAcceptanceByPosition;
+        const cycles = perf.mtpCycles;
+        if (typeof cycles === 'number' && cycles > 0) {
+          if (typeof perf.mtpMeanDepth === 'number') {
+            rec.mtpProposed = Math.round(perf.mtpMeanDepth * cycles);
+            rec.mtpVerifyRows = perf.mtpMeanDepth + 1;
+          }
+          if (typeof perf.mtpMeanAcceptedTokens === 'number') {
+            rec.mtpAcceptedDrafts = Math.round(perf.mtpMeanAcceptedTokens * cycles);
+          }
+        }
       }
       const measured = measuredPrefillOf(snap);
       if (measured !== undefined) {
@@ -847,6 +905,7 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.coldSidecarQueueDrops = delta(marks.sidecar, 'queueDrops', sidecar.queueDrops);
         rec.coldSidecarInstalled = delta(marks.sidecar, 'installed', sidecar.installed);
       }
+      this.residencyDeltas(rec);
       this.trace.record(rec);
     } catch {
       // Telemetry is best-effort; a broken recorder must never break inference.
@@ -855,8 +914,9 @@ export class TurnTraceModel implements SessionCapableModel {
   }
 
   /**
-   * Record an `error` or `cancelled` turn. Marks advance exactly as
-   * {@link discardTurn} does; the record carries no cold fields.
+   * Record an `error` or `cancelled` turn. Cold marks advance exactly as
+   * {@link discardTurn} does; the record carries no cold fields, but it
+   * carries the residency deltas, so the next turn does not inherit them.
    *
    * The live progress read comes first: a `finish_error` turn is recorded
    * inside the stream loop, before the bridge clears the reader, so the
@@ -895,6 +955,7 @@ export class TurnTraceModel implements SessionCapableModel {
         }
       }
       if (snap !== null) rec.prefillDoneTokens = snap.prefillDone;
+      this.residencyDeltas(rec);
       this.trace.record(rec);
     } catch {
       // Telemetry is best-effort; a broken recorder must never break inference.

@@ -30,6 +30,7 @@ import type {
   RuntimeLiveTurn,
   RuntimeTraceRecord,
 } from '../../server/src/runtime-trace.js';
+import { readWorkIndexSync, workIds } from '../src/chat/index-file.js';
 import { managedBlock } from '../src/coding-agents.js';
 
 export const DEFAULT_SEED = 0x4d4c58;
@@ -497,6 +498,72 @@ function writeTraces(home: string, random: Random, now: number): number {
   return index;
 }
 
+/** The session of a request no fixture conversation sent. */
+export const OTHER_SESSION = 'dev-other-session';
+const CHAT_PROMPT_TOKENS = 121_300;
+
+/**
+ * Requests the Chat wait line reads, over a 40 s cycle. 0-10 s: the model is busy: each Work conversation's request
+ * waits unlisted in the server's queue (`queued` counts them) while one of {@link OTHER_SESSION} reads its prompt for
+ * 6 s, then generates. 10-40 s: each conversation's request (its id as the session) is queued for 10 s, then a 15 s
+ * prefill, then 5 s of decode that writes 640 tokens a second, beside the other one in decode. None without a chat
+ * model. A Work prompt with "compact" shows the compaction line over the same requests.
+ */
+export function chatWaitTurns(
+  home: string,
+  live: LiveProcess,
+  now: number,
+): { turns: RuntimeLiveTurn[]; queued: number } {
+  const model = live.chatModels?.[0];
+  if (model === undefined) return { turns: [], queued: 0 };
+  const ids = [...workIds(readWorkIndexSync(join(home, 'chat', 'conversations.json')))].slice(0, 8);
+  const second = Math.floor(now / 1000) % 40;
+  const turn = (
+    traceId: string,
+    session: string,
+    at: number,
+    state: RuntimeLiveTurn['phase'],
+    done: number | null,
+    generated = 12,
+  ): RuntimeLiveTurn => ({
+    traceId,
+    model,
+    modelId: model,
+    ctxWindow: 262_144,
+    startedAt: at,
+    stream: true,
+    dispatch: 'continue_tool',
+    phase: state,
+    waitMs: null,
+    slotMs: null,
+    prepareMs: null,
+    promptTokens: state === 'queued' ? null : CHAT_PROMPT_TOKENS,
+    cachedTokens: state === 'queued' ? null : 0,
+    prefillTotal: state === 'queued' ? null : CHAT_PROMPT_TOKENS,
+    prefillDone: state === 'queued' ? null : done,
+    generatedTokens: state === 'decode' ? generated : null,
+    clientSession: session,
+  });
+  if (second < 10) {
+    const reading = second < 6;
+    const read = reading ? Math.round((CHAT_PROMPT_TOKENS * (second + 1)) / 7) : CHAT_PROMPT_TOKENS;
+    return {
+      turns: [turn('fx-chat-other', OTHER_SESSION, now - second * 1000, reading ? 'prefill' : 'decode', read)],
+      queued: ids.length,
+    };
+  }
+  const ours = second - 10;
+  const phase = ours < 10 ? 'queued' : ours < 25 ? 'prefill' : 'decode';
+  const done = phase === 'queued' ? null : Math.round((CHAT_PROMPT_TOKENS * Math.min(ours - 9, 15)) / 15);
+  return {
+    turns: [
+      turn('fx-chat-other', OTHER_SESSION, now - 90_000, 'decode', CHAT_PROMPT_TOKENS),
+      ...ids.map((id, n) => turn(`fx-chat-${String(n)}`, id, now - ours * 1000, phase, done, (ours - 24) * 640)),
+    ],
+    queued: 0,
+  };
+}
+
 /** Three turns before their prefill, one per waiting phase. */
 function phaseTurns(model: string, now: number): RuntimeLiveTurn[] {
   const turn = (traceId: string, startedAgo: number, patch: Partial<RuntimeLiveTurn>): RuntimeLiveTurn => ({
@@ -516,6 +583,7 @@ function phaseTurns(model: string, now: number): RuntimeLiveTurn[] {
     prefillTotal: null,
     prefillDone: null,
     generatedTokens: null,
+    clientSession: null,
     ...patch,
   });
   return [
@@ -550,8 +618,10 @@ export interface LiveProcess {
    * The turns in flight. 'two-models' (default): one turn on each fixture model, the big one asked through an alias.
    * 'one-model': two turns on the big model, one of them asked through the alias `mlx-local`.
    * 'phases': three more turns on the big model before their prefill: model busy, waiting for a slot, preparing.
+   * 'chat': on the first of `chatModels`, a request of another session, then one more per Work conversation of the
+   * home named with the conversation's id ({@link chatWaitTurns}).
    */
-  flight?: 'two-models' | 'one-model' | 'phases';
+  flight?: 'two-models' | 'one-model' | 'phases' | 'chat';
   /**
    * The disk cache the heartbeat reports. 'whole-prompt' (default): on, the whole prompt per turn. 'native': on, the
    * native 128 blocks. 'off': off. 'older': neither field, as an engine from before them writes.
@@ -612,6 +682,7 @@ const SERIAL_MODELS: readonly SerialModel[] = [
 ];
 const FLAT_MODEL = { name: 'Mistral-Small-24B-4bit', modelType: 'mistral', ctxWindow: 32_768 };
 const UNREAD_MODEL = { name: 'Nemotron-3.5-Lightning-4bit', modelType: 'nemotron_h', ctxWindow: 262_144 };
+const STREAMING_MODEL = { name: 'qwen3.8-flash-next-gguf', modelType: 'qwen4_exp', ctxWindow: 262_144 };
 const SERIAL_CAPACITY = 16_384;
 
 function serialSched(
@@ -866,6 +937,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
       : diskCache === 'native'
         ? { blocks: 128, ms: 250 }
         : null;
+  const chat = live.flight === 'chat' ? chatWaitTurns(home, live, now) : { turns: [], queued: 0 };
   const file: RuntimeLiveFile = {
     v: 2,
     pid: live.pid,
@@ -909,6 +981,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
           reclaimableBlocks: 420,
         },
         stateNamespace: fixturePrefixNamespaces()[0]!,
+        experts: null,
       },
       {
         name: small,
@@ -923,6 +996,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         queueLimit: 32,
         pool: { at: now - 40_000, blockCapacity: 2048, allocatedBlocks: 310, freeBlocks: 1738, reclaimableBlocks: 120 },
         stateNamespace: null,
+        experts: null,
       },
       ...(live.chatModels ?? []).map((name) => ({
         name,
@@ -933,10 +1007,11 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         loadedAt: now - 1000,
         loadMs: 4000,
         inFlight: 0,
-        queued: 0,
+        queued: name === live.chatModels?.[0] ? chat.queued : 0,
         queueLimit: 32,
         pool: null,
         stateNamespace: null,
+        experts: null,
       })),
       ...(live.engineStates === true ? engineStateModels(live, now) : []),
     ],
@@ -958,6 +1033,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         prefillTotal: 1536,
         prefillDone: 1536,
         generatedTokens: 214,
+        clientSession: null,
       },
       {
         traceId: 'fx-live-prefill',
@@ -976,8 +1052,10 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         prefillTotal: PREFILL_TOTAL,
         prefillDone: Math.floor((PREFILL_TOTAL * ((Math.floor(now / 1000) % 10) + 1)) / 12),
         generatedTokens: null,
+        clientSession: null,
       },
       ...(live.flight === 'phases' ? phaseTurns(big, now) : []),
+      ...chat.turns,
     ],
   };
   if (diskCache === 'older') {
@@ -1013,6 +1091,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
         reclaimableBlocks: 0,
       },
       stateNamespace: null,
+      experts: null,
     };
   });
   const loadedAt = live.startedAt + 3000;
@@ -1029,6 +1108,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       queueLimit: 16,
       pool: null,
       stateNamespace: null,
+      experts: null,
     },
     {
       ...UNREAD_MODEL,
@@ -1041,6 +1121,20 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       queueLimit: 32,
       pool: null,
       stateNamespace: null,
+      experts: null,
+    },
+    {
+      ...STREAMING_MODEL,
+      paged: true,
+      maxConcurrent: 1,
+      loadedAt: now - 90_000,
+      loadMs: 41_000,
+      inFlight: 0,
+      queued: 0,
+      queueLimit: 16,
+      pool: null,
+      stateNamespace: null,
+      experts: { inMemory: 409, total: 512, streaming: true },
     },
   ];
 }

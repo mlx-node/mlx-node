@@ -82,9 +82,11 @@ pub(crate) struct TurnState<P> {
     /// Maximum additional hypothetical query rows; never part of token_history.
     pub decode_draft_allowance: u32,
     pub pinned_prefill_breaks: Vec<u32>,
-    /// The family prefills this prompt as one group of windows in one step
+    /// The family prefills this prompt in groups of windows, each pinned
+    /// slice one step outside the budget
     /// (`HybridSchedulerBackend::scheduler_whole_prompt_prefill`); re-pinned
-    /// with the breaks on every restore and replay.
+    /// with the breaks on every restore and replay, and when another turn is
+    /// admitted.
     pub whole_prompt_prefill: bool,
     pub token_history: Vec<u32>,
     pub status: TurnStatus,
@@ -125,6 +127,10 @@ pub(crate) struct TurnState<P> {
     /// Splash `Request::overtaken`: prefill units in a row that served
     /// later arrivals and not it, up to [`MAX_OVERTAKES`].
     pub overtaken: u32,
+    /// Its contended prefill units run in passes of a few layers.
+    pub prefill_passes: bool,
+    /// The unit a pass started, `(start, rows)`, until its last pass.
+    pub prefill_unit: Option<(u32, u32)>,
     /// The submission order a start the scheduler held before admission
     /// keeps (Splash `Request::order`).
     pub submitted_order: Option<u64>,
@@ -178,6 +184,7 @@ pub(crate) fn install_preemption_replay<P>(
     }
 
     turn.num_computed_tokens = 0;
+    turn.prefill_unit = None;
     turn.prompt_tokens = target;
     // Replay prefills from scratch: the family's plain slice grid, no
     // cached-prefix start and no extra breaks (those re-pin on restore).
@@ -253,6 +260,8 @@ impl<P> TurnState<P> {
             resource_wait: ResourceWait::default(),
             admission: 0,
             overtaken: 0,
+            prefill_passes: false,
+            prefill_unit: None,
             submitted_order: None,
             payload,
             arrival_order: 0,
@@ -460,6 +469,9 @@ pub(crate) struct StepPlan {
     /// The leader the measured cut gave fewer rows (Splash
     /// `Planned::boundCuts`).
     pub leader_cut: Option<SeqId>,
+    /// The step's prefill row runs one pass of at most this wall (Splash
+    /// `PassCommand`), decode rows having run first.
+    pub prefill_pass_ms: Option<u32>,
 }
 
 /// Splash `ExecutionLimits::prefillTokenBudget`.
@@ -477,6 +489,9 @@ pub(crate) const MAX_OVERTAKES: u32 = PREFILL_MAX_LANES as u32 - 1;
 pub(crate) const DECODE_GAP_MS: f64 = 500.0;
 /// Splash `EngineConfig::decodeShare`.
 pub(crate) const DEFAULT_DECODE_SHARE: f64 = 0.5;
+/// The wall a contended prefill pass aims at: about one decode step, so a
+/// stream's gap is at most a decode step and a pass.
+pub(crate) const PREFILL_PASS_MS: u32 = 100;
 
 /// Splash `model::denseAttentionPairs`.
 pub(crate) fn dense_attention_pairs(position: u64, rows: u64) -> u64 {
@@ -508,6 +523,8 @@ enum PrefillUnit {
         decode_share: f64,
         /// Splash `decodeDebtMilliseconds_`.
         decode_debt_ms: f64,
+        /// The wall of the last step's decode rows.
+        last_decode_ms: f64,
     },
 }
 
@@ -517,6 +534,8 @@ pub(crate) struct SchedulerCounters {
     pub prefill_batches: AtomicU64,
     pub prefill_rows: AtomicU64,
     pub prefill_units: AtomicU64,
+    /// Contended prefill passes run (Splash `PassCommand`s).
+    pub prefill_passes: AtomicU64,
     pub bound_cuts: AtomicU64,
     pub decode_batches: AtomicU64,
     /// Decode batches of width `index + 1`.
@@ -536,6 +555,7 @@ pub(crate) struct SchedulerCounterSnapshot {
     pub prefill_batches: u64,
     pub prefill_rows: u64,
     pub prefill_units: u64,
+    pub prefill_passes: u64,
     pub bound_cuts: u64,
     pub decode_batches: u64,
     pub decode_batches_by_width: Vec<u64>,
@@ -553,6 +573,7 @@ impl SchedulerCounters {
             prefill_batches: AtomicU64::new(0),
             prefill_rows: AtomicU64::new(0),
             prefill_units: AtomicU64::new(0),
+            prefill_passes: AtomicU64::new(0),
             bound_cuts: AtomicU64::new(0),
             decode_batches: AtomicU64::new(0),
             decode_batches_by_width: (0..max_num_seqs.max(1))
@@ -573,6 +594,7 @@ impl SchedulerCounters {
             prefill_batches: load(&self.prefill_batches),
             prefill_rows: load(&self.prefill_rows),
             prefill_units: load(&self.prefill_units),
+            prefill_passes: load(&self.prefill_passes),
             bound_cuts: load(&self.bound_cuts),
             decode_batches: load(&self.decode_batches),
             decode_batches_by_width: self.decode_batches_by_width.iter().map(load).collect(),
@@ -602,6 +624,9 @@ struct PrefillLane {
     processed: u32,
     remaining: u32,
     overdue: bool,
+    passes: bool,
+    /// The rows of the unit a pass started here.
+    started_rows: Option<u32>,
 }
 
 fn prefill_lane<P>(turn: &TurnState<P>) -> PrefillLane {
@@ -612,6 +637,11 @@ fn prefill_lane<P>(turn: &TurnState<P>) -> PrefillLane {
         processed: turn.num_computed_tokens,
         remaining: turn.prompt_tokens - turn.num_computed_tokens,
         overdue: turn.overtaken >= MAX_OVERTAKES,
+        passes: turn.prefill_passes,
+        started_rows: turn
+            .prefill_unit
+            .filter(|&(start, _)| start == turn.num_computed_tokens)
+            .map(|(_, rows)| rows),
     }
 }
 
@@ -657,6 +687,8 @@ fn cut_rows(leader: &PrefillLane, measured: Option<MeasuredUnit>) -> u32 {
 struct PlannedUnit {
     lanes: Vec<(PrefillLane, u32)>,
     leader_cut: bool,
+    /// The leader runs in passes beside a decoding lane.
+    passes: bool,
 }
 
 /// The clock a waiter's retry is judged by (Splash
@@ -686,6 +718,9 @@ pub(crate) struct RowStepResult {
     pub allocation_blocked: bool,
     /// Wall time attributable to a successful prefill/recompute slice.
     pub prefill_micros: u64,
+    /// A pass of the row's unit ran and the unit goes on in a later step:
+    /// no token of it is computed yet.
+    pub prefill_in_flight: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -964,6 +999,9 @@ pub(crate) struct Scheduler<P, Exclusive, Barrier> {
     /// Splash `Scheduler::complete`'s `youngestServed` of the last prefill
     /// unit, for the starts held outside the scheduler.
     youngest_served: Option<u64>,
+    /// The pass before the next plan spent its prefix budget beside a
+    /// running lane: that plan owes its decode rows the step.
+    prefix_work_owed: bool,
     global_step: u64,
     stats: SchedulerStats,
 }
@@ -987,6 +1025,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             counters: Arc::new(SchedulerCounters::new(max_num_seqs)),
             next_order: 0,
             youngest_served: None,
+            prefix_work_owed: false,
             global_step: 0,
             stats: SchedulerStats::default(),
         })
@@ -1003,6 +1042,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             measured: None,
             decode_share: config.decode_share,
             decode_debt_ms: 0.0,
+            last_decode_ms: 0.0,
         };
         self
     }
@@ -1130,6 +1170,12 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
     pub fn has_live_turns(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
+    }
+
+    /// Whether the next plan owes its decode rows the step: the pass before
+    /// it spent its prefix budget, so it plans no prefill unit.
+    pub fn set_prefix_work_owed(&mut self, owed: bool) {
+        self.prefix_work_owed = owed;
     }
 
     /// Splash `Engine::lanes_` is not empty: a running turn, or a restore
@@ -1576,9 +1622,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         for turn in &mut self.running {
             turn.snapshot_cancel();
         }
+        let prefix_owed = std::mem::take(&mut self.prefix_work_owed);
         let mut budget = match self.prefill {
             PrefillUnit::Fixed { budget } => budget,
-            PrefillUnit::Measured { .. } => return self.build_measured_plan(clock),
+            PrefillUnit::Measured { .. } => return self.build_measured_plan(clock, prefix_owed),
         };
         self.plan_excluded.clear();
         let mut rows: Vec<StepRow> = Vec::with_capacity(self.running.len());
@@ -1651,6 +1698,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             rows,
             contended: self.contended(),
             leader_cut: None,
+            prefill_pass_ms: None,
         }
     }
 
@@ -1667,7 +1715,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     /// Splash `Scheduler::next` + `planPrefill`: the decode rows, outside
     /// the unit; the prefill unit; then the cancelled prefill turns, one
     /// row each, which the executor fails.
-    fn build_measured_plan(&mut self, clock: Option<RetryClock>) -> StepPlan {
+    fn build_measured_plan(&mut self, clock: Option<RetryClock>, prefix_owed: bool) -> StepPlan {
         let excluded: Vec<SeqId> = match clock {
             Some(clock) => self
                 .running
@@ -1697,10 +1745,24 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         let contended = self.contended();
         let mut leader_cut = None;
-        // Splash `Scheduler::next`: decode runs while prefill owes it time.
-        let owed = matches!(self.prefill, PrefillUnit::Measured { decode_debt_ms, .. } if decode_debt_ms > 0.0)
+        let mut prefill_pass_ms = None;
+        let unit = self.plan_unit(self.ready_lanes(&excluded), contended);
+        // Splash `Scheduler::next`: decode runs while prefill owes it time. A
+        // pass runs after this step's decode rows, which pay up to their
+        // last wall of the debt first.
+        let paid = match (&unit, &self.prefill) {
+            (Some(unit), PrefillUnit::Measured { last_decode_ms, .. }) if unit.passes => {
+                *last_decode_ms
+            }
+            _ => 0.0,
+        };
+        let owed = (prefix_owed
+            || matches!(self.prefill, PrefillUnit::Measured { decode_debt_ms, .. } if decode_debt_ms > paid))
             && rows.iter().any(|row| !row.cancel_snapshot);
-        if !owed && let Some(unit) = self.plan_unit(self.ready_lanes(&excluded), contended) {
+        if !owed && let Some(unit) = unit {
+            if unit.passes {
+                prefill_pass_ms = Some(PREFILL_PASS_MS);
+            }
             if unit.leader_cut {
                 leader_cut = unit.lanes.first().map(|(lane, _)| lane.seq_id);
             }
@@ -1732,6 +1794,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             rows,
             contended,
             leader_cut,
+            prefill_pass_ms,
         }
     }
 
@@ -1793,13 +1856,22 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             }
         });
         let (&leader, joiners) = ready.split_first()?;
+        let passes = leader.passes && contended;
+        // A unit a pass started keeps its rows to its last pass.
+        if let Some(rows) = leader.started_rows {
+            return Some(PlannedUnit {
+                lanes: vec![(leader, rows)],
+                leader_cut: false,
+                passes,
+            });
+        }
         let pairs =
             |position: u32, rows: u32| dense_attention_pairs(u64::from(position), u64::from(rows));
         let mut own = leader.remaining.min(PREFILL_CHUNK_ROWS);
         while own > PREFILL_MIN_ROWS && pairs(leader.processed, own) > pair_bound {
             own /= 2;
         }
-        let unit = if contended {
+        let unit = if contended && !passes {
             cut_rows(&leader, measured)
         } else {
             PREFILL_CHUNK_ROWS
@@ -1810,8 +1882,11 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let mut unit_rows = leader_rows;
         let mut unit_pairs = pairs(leader.processed, leader_rows);
         for &lane in joiners {
-            if lanes.len() == PREFILL_MAX_LANES {
+            if lanes.len() == PREFILL_MAX_LANES || passes {
                 break;
+            }
+            if lane.started_rows.is_some() || (contended && lane.passes) {
+                continue;
             }
             let rows = (lane.remaining - 1) % PREFILL_CHUNK_ROWS + 1;
             let with = unit_pairs + pairs(lane.processed, rows);
@@ -1822,7 +1897,11 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             unit_rows += rows;
             unit_pairs = with;
         }
-        Some(PlannedUnit { lanes, leader_cut })
+        Some(PlannedUnit {
+            lanes,
+            leader_cut,
+            passes,
+        })
     }
 
     /// Splash `Scheduler::prefillAdmissionOrder` for one candidate of
@@ -1839,6 +1918,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         prompt_tokens: u32,
         submitted: Option<u64>,
         overtaken: u32,
+        passes: bool,
     ) -> bool {
         let processed = cached.min(prompt_tokens.saturating_sub(1));
         if !matches!(self.prefill, PrefillUnit::Measured { .. }) || prompt_tokens == 0 {
@@ -1850,6 +1930,8 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             processed,
             remaining: prompt_tokens - processed,
             overdue: overtaken >= MAX_OVERTAKES,
+            passes,
+            started_rows: None,
         };
         let mut ready = self.admission_lanes(seq_id);
         ready.push(candidate);
@@ -1941,6 +2023,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .collect(),
             contended: plan.contended,
             leader_cut: plan.leader_cut,
+            prefill_pass_ms: plan.prefill_pass_ms,
         };
         let result = if executed.rows.is_empty() {
             StepResult {
@@ -1982,6 +2065,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                         finished: false,
                         allocation_blocked: true,
                         prefill_micros: 0,
+                        prefill_in_flight: false,
                     })
                 } else {
                     ran.next()
@@ -2126,9 +2210,19 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     /// over as Splash's replan leaves it (`Engine::tick` commits with the
     /// excluded lanes less the refused). Whether a prefill row ran.
     fn observe_prefill_unit(&mut self, plan: &StepPlan, result: &StepResult) -> bool {
+        // A unit that earlier passes started ends here with only part of
+        // its wall: it sizes nothing.
+        let resumed = plan.rows.iter().any(|planned| {
+            planned.kind == StepKind::Prefill
+                && self.running.iter().any(|turn| {
+                    turn.seq_id == planned.seq_id
+                        && turn.prefill_unit == Some((planned.token_start, planned.num_tokens))
+                })
+        });
         let PrefillUnit::Measured {
             measured,
             decode_debt_ms,
+            last_decode_ms,
             ..
         } = &mut self.prefill
         else {
@@ -2138,6 +2232,9 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let mut cancelled: Vec<SeqId> = Vec::new();
         let (mut rows, mut pairs, mut untimed) = (0u32, 0u64, false);
         let mut decoded = 0usize;
+        // Splash `Scheduler::complete` for a pass: its wall is owed and
+        // sampled; the unit counts, sizes and overtakes once, at its last.
+        let mut passed = false;
         for (planned, output) in plan.rows.iter().zip(&result.rows) {
             if planned.kind != StepKind::Prefill {
                 if !output.allocation_blocked && !planned.cancel_snapshot {
@@ -2155,6 +2252,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 untimed = true;
                 continue;
             }
+            passed = true;
+            if output.prefill_in_flight {
+                continue;
+            }
             served.push(planned.seq_id);
             rows += planned.num_tokens;
             pairs += dense_attention_pairs(
@@ -2165,8 +2266,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         if decoded > 0 && result.decode_wall_micros > 0 {
             *decode_debt_ms =
                 (*decode_debt_ms - result.decode_wall_micros as f64 / 1000.0).max(0.0);
+            *last_decode_ms = result.decode_wall_micros as f64 / 1000.0;
         }
-        if rows > 0 && !untimed && result.prefill_wall_micros > 0 {
+        if rows > 0
+            && !untimed
+            && !resumed
+            && result.prefill_wall_micros > 0
+            && plan.prefill_pass_ms.is_none()
+        {
             *measured = Some(MeasuredUnit {
                 rows,
                 pairs,
@@ -2191,11 +2298,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             {
                 counters.bound_cuts.fetch_add(1, Ordering::Relaxed);
             }
-            if plan.contended && result.prefill_wall_micros > 0 {
-                counters
-                    .contended_prefill
-                    .add(result.prefill_wall_micros.saturating_mul(1000));
-            }
+        }
+        if passed && plan.contended && result.prefill_wall_micros > 0 {
+            counters
+                .contended_prefill
+                .add(result.prefill_wall_micros.saturating_mul(1000));
+        }
+        if passed && plan.prefill_pass_ms.is_some() {
+            counters.prefill_passes.fetch_add(1, Ordering::Relaxed);
         }
         let Some(youngest) = self
             .running
@@ -2204,7 +2314,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .map(|turn| turn.arrival_order)
             .max()
         else {
-            return false;
+            return passed;
         };
         self.youngest_served = Some(youngest);
         let excluded = &self.plan_excluded;
@@ -2352,6 +2462,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                         output.seq_id
                     ));
                 }
+            } else if output.prefill_in_flight {
+                if planned.kind != StepKind::Prefill
+                    || output.num_computed_tokens != 0
+                    || output.generated_token.is_some()
+                    || output.finished
+                {
+                    return Err(format!(
+                        "a prefill pass of request {} must report no computed token",
+                        output.seq_id
+                    ));
+                }
             } else if output.num_computed_tokens != planned.num_tokens {
                 return Err(format!(
                     "executor row {} computed {} tokens for a {}-token slice",
@@ -2385,12 +2506,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         let prefill_ran = self.observe_prefill_unit(plan, &result);
         let prefill_wall_micros = result.prefill_wall_micros;
-        for output in result.rows {
+        for (planned, output) in plan.rows.iter().zip(result.rows) {
             let turn = self
                 .running
                 .iter_mut()
                 .find(|turn| turn.seq_id == output.seq_id)
                 .ok_or_else(|| format!("executor returned unknown row {}", output.seq_id))?;
+            if planned.kind == StepKind::Prefill && !output.allocation_blocked {
+                turn.prefill_unit = output
+                    .prefill_in_flight
+                    .then_some((planned.token_start, planned.num_tokens));
+            }
             turn.num_computed_tokens = turn
                 .num_computed_tokens
                 .checked_add(output.num_computed_tokens)
@@ -2523,6 +2649,7 @@ mod tests {
                             && (self.finish.contains(&row.seq_id) || row.cancel_snapshot),
                         allocation_blocked: self.allocation_blocked.contains(&row.seq_id),
                         prefill_micros: u64::from(row.kind == StepKind::Prefill),
+                        prefill_in_flight: false,
                     }
                 })
                 .collect();
@@ -2641,6 +2768,7 @@ mod tests {
                     finished: false,
                     allocation_blocked: false,
                     prefill_micros: 0,
+                    prefill_in_flight: false,
                 })
                 .collect(),
             executed_decode_batch: 3,
@@ -2672,6 +2800,7 @@ mod tests {
                     finished: false,
                     allocation_blocked: false,
                     prefill_micros: 0,
+                    prefill_in_flight: false,
                 })
                 .collect(),
             executed_decode_batch: 3,
@@ -3613,6 +3742,11 @@ mod tests {
         untimed: HashSet<SeqId>,
         /// Decoders whose next row ends their turn.
         finishing: HashSet<SeqId>,
+        /// A unit run in passes takes this many; each pass takes the next
+        /// wall of `pass_walls` (its last one again once they run out).
+        passes_per_unit: u32,
+        pass_walls: VecDeque<u64>,
+        passes_left: HashMap<SeqId, u32>,
     }
 
     impl StepExecutor<&'static str> for TimedStep {
@@ -3637,6 +3771,7 @@ mod tests {
                         finished: row.cancel_snapshot,
                         allocation_blocked: false,
                         prefill_micros: 0,
+                        prefill_in_flight: false,
                     };
                     if row.cancel_snapshot {
                         return result;
@@ -3652,8 +3787,41 @@ mod tests {
                                 .iter()
                                 .find(|turn| turn.seq_id == row.seq_id)
                                 .expect("planned turn");
+                            if plan.prefill_pass_ms.is_some() && turn.prefill_passes {
+                                let left = self
+                                    .passes_left
+                                    .entry(row.seq_id)
+                                    .or_insert(self.passes_per_unit.max(1));
+                                *left -= 1;
+                                let wall = if self.pass_walls.len() > 1 {
+                                    self.pass_walls.pop_front()
+                                } else {
+                                    self.pass_walls.front().copied()
+                                }
+                                .unwrap_or(1);
+                                result.prefill_micros = wall;
+                                prefill_wall_micros += wall;
+                                if *left > 0 {
+                                    result.num_computed_tokens = 0;
+                                    result.prefill_in_flight = true;
+                                    return result;
+                                }
+                                self.passes_left.remove(&row.seq_id);
+                                if row.token_start + row.num_tokens == turn.prompt_tokens {
+                                    result.generated_token = Some(9);
+                                }
+                                return result;
+                            }
                             if row.token_start + row.num_tokens == turn.prompt_tokens {
                                 result.generated_token = Some(9);
+                            }
+                            // A held unit run to its end without a budget
+                            // takes one more pass's wall.
+                            if self.passes_left.remove(&row.seq_id).is_some() {
+                                let wall = self.pass_walls.front().copied().unwrap_or(1);
+                                result.prefill_micros = wall;
+                                prefill_wall_micros += wall;
+                                return result;
                             }
                             if !self.untimed.contains(&row.seq_id) {
                                 result.prefill_micros =
@@ -3693,6 +3861,192 @@ mod tests {
             panic!("expected a step");
         };
         plan
+    }
+
+    /// A running prefill whose contended units run in passes.
+    fn push_pass_prefill(scheduler: &mut Measured, seq: SeqId, n: u32, computed: u32) {
+        push_prefill(scheduler, seq, n, computed);
+        running_mut(scheduler, seq).prefill_passes = true;
+    }
+
+    fn passes(per_unit: u32, walls: &[u64], decode_micros: u64) -> TimedStep {
+        TimedStep {
+            micros_per_row: 100,
+            decode_micros,
+            passes_per_unit: per_unit,
+            pass_walls: walls.iter().copied().collect(),
+            ..TimedStep::default()
+        }
+    }
+
+    /// Beside a decoding lane a pass lane's unit is the lone unit
+    /// (2048 rows, no cut, no joiner), run with the pass budget.
+    /// Mutation: a pass lane takes `cut_rows` → red (512 rows).
+    #[test]
+    fn a_contended_pass_unit_keeps_the_lone_rows() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        push_prefill(&mut scheduler, 3, 300, 0);
+        running_mut(&mut scheduler, 3).prefill_passes = true;
+        let plan = scheduler.build_plan(None);
+        assert!(plan.contended);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (3, 0, 300)]);
+        assert_eq!(plan.prefill_pass_ms, Some(PREFILL_PASS_MS));
+        running_mut(&mut scheduler, 3).num_computed_tokens = 300;
+        running_mut(&mut scheduler, 3).status = TurnStatus::Draining;
+        let plan = scheduler.build_plan(None);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (1, 0, 2048)]);
+        assert_eq!(plan.leader_cut, None);
+        assert_eq!(plan.prefill_pass_ms, Some(PREFILL_PASS_MS));
+    }
+
+    /// A unit a pass started keeps its rows; it neither joins
+    /// another lane's unit nor takes other rows when contention ends.
+    /// Mutation: the started unit is not pinned → red (it joins with
+    /// 1088 rows).
+    #[test]
+    fn a_started_pass_unit_keeps_its_rows() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        let mut executor = passes(3, &[50_000], 50_000);
+        let plan = step(&mut scheduler, &mut executor);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (1, 0, 2048)]);
+        assert_eq!(running_mut(&mut scheduler, 1).num_computed_tokens, 0);
+        assert_eq!(running_mut(&mut scheduler, 1).prefill_unit, Some((0, 2048)));
+        // A short lane without passes leads once the decoder is gone; the
+        // started unit waits and does not join.
+        running_mut(&mut scheduler, 2).status = TurnStatus::Draining;
+        push_prefill(&mut scheduler, 3, 300, 0);
+        let plan = scheduler.build_plan(None);
+        assert!(!plan.contended);
+        assert_eq!(spans(&plan), vec![(3, 0, 300)]);
+        assert_eq!(plan.prefill_pass_ms, None);
+        running_mut(&mut scheduler, 3).status = TurnStatus::Draining;
+        let plan = scheduler.build_plan(None);
+        assert_eq!(spans(&plan), vec![(1, 0, 2048)]);
+        assert_eq!(plan.prefill_pass_ms, None);
+    }
+
+    /// A pass follows every decode step while its debt (half its
+    /// wall) is within the last decode wall; a 400 ms pass owes 200 ms,
+    /// so two decode-only steps follow it.
+    /// Mutation: a pass waits for no debt at all → red (decode-only
+    /// steps between 80 ms passes).
+    #[test]
+    fn a_pass_follows_each_decode_step_until_one_runs_long() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        let mut executor = passes(20, &[80_000, 80_000, 80_000, 400_000, 80_000], 95_000);
+        let mut kinds = Vec::new();
+        for _ in 0..8 {
+            let plan = step(&mut scheduler, &mut executor);
+            kinds.push(plan.rows.iter().any(|row| row.kind == StepKind::Prefill));
+        }
+        assert_eq!(
+            kinds,
+            vec![true, true, true, true, false, false, true, true],
+            "debt {}",
+            decode_debt(&scheduler)
+        );
+    }
+
+    /// The plan after a pass that spent its prefix budget
+    /// beside a decoding lane holds the decode rows only; the plan after it
+    /// holds the unit again, and a prefix budget left unspent owes nothing.
+    #[test]
+    fn a_prefix_unit_and_a_prefill_pass_do_not_share_a_step() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        scheduler.set_prefix_work_owed(true);
+        let plan = scheduler.build_plan(None);
+        assert_eq!(spans(&plan), vec![(2, 4, 5)], "decode rows only");
+        assert_eq!(plan.prefill_pass_ms, None);
+        let plan = scheduler.build_plan(None);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (1, 0, 2048)], "the unit next");
+        scheduler.set_prefix_work_owed(false);
+        let plan = scheduler.build_plan(None);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (1, 0, 2048)]);
+
+        // With no lane decoding nothing is owed.
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        scheduler.set_prefix_work_owed(true);
+        let plan = scheduler.build_plan(None);
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row.seq_id == 1 && row.kind == StepKind::Prefill),
+            "{plan:?}"
+        );
+    }
+
+    /// With no lane decoding a pass lane runs its unit in
+    /// one call with no pass budget.
+    /// Mutation: the budget is set on a lone unit → red.
+    #[test]
+    fn a_lone_pass_unit_has_no_budget() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        push_pass_prefill(&mut scheduler, 3, 300, 0);
+        let plan = scheduler.build_plan(None);
+        assert!(!plan.contended);
+        assert_eq!(plan.prefill_pass_ms, None);
+        assert_eq!(spans(&plan), vec![(3, 0, 300), (1, 0, 1088)]);
+    }
+
+    /// A paused pass computes no token and books its wall in the
+    /// debt and the contended sample; the unit counts, and passes over an
+    /// older lane, once, at its last pass.
+    /// Mutation: every pass counts as a unit served → red (overtaken 3,
+    /// units 3).
+    #[test]
+    fn a_pass_unit_counts_and_overtakes_once() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_prefill(&mut scheduler, 1, 40_000, 0);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 3, 1000, 0);
+        let mut executor = passes(3, &[40_000], 95_000);
+        let plan = step(&mut scheduler, &mut executor);
+        assert_eq!(spans(&plan), vec![(2, 4, 5), (3, 0, 1000)]);
+        assert_eq!(running_mut(&mut scheduler, 3).num_computed_tokens, 0);
+        assert!((decode_debt(&scheduler) - 20.0).abs() < 1e-9);
+        assert_eq!(running_mut(&mut scheduler, 1).overtaken, 0);
+        step(&mut scheduler, &mut executor);
+        step(&mut scheduler, &mut executor);
+        assert_eq!(running_mut(&mut scheduler, 3).num_computed_tokens, 1000);
+        assert_eq!(running_mut(&mut scheduler, 1).overtaken, 1);
+        let counters = scheduler.counters().snapshot();
+        assert_eq!(counters.prefill_units, 1);
+        assert_eq!(counters.prefill_passes, 3);
+        assert_eq!(counters.contended_prefill.samples, 3);
+        assert_eq!(measured(&scheduler), None);
+    }
+
+    /// A unit that ran passes and ends in a step with no pass budget (its
+    /// decoder finished) sizes nothing: that step's wall is only its rest.
+    /// Mutation: the wall is recorded → red (2048 rows in 30 ms).
+    #[test]
+    fn a_unit_ended_after_its_passes_sizes_nothing() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        push_decoder(&mut scheduler, 2);
+        push_pass_prefill(&mut scheduler, 1, 40_000, 0);
+        let mut executor = passes(3, &[30_000], 50_000);
+        executor.finishing.insert(2);
+        let plan = step(&mut scheduler, &mut executor);
+        assert_eq!(plan.prefill_pass_ms, Some(PREFILL_PASS_MS));
+        assert_eq!(running_mut(&mut scheduler, 1).prefill_unit, Some((0, 2048)));
+        let plan = step(&mut scheduler, &mut executor);
+        assert_eq!(plan.prefill_pass_ms, None);
+        assert_eq!(spans(&plan), vec![(1, 0, 2048)]);
+        assert_eq!(running_mut(&mut scheduler, 1).num_computed_tokens, 2048);
+        assert_eq!(measured(&scheduler), None);
+        let plan = step(&mut scheduler, &mut executor);
+        assert_eq!(spans(&plan), vec![(1, 2048, 4096)]);
+        assert!(measured(&scheduler).is_some(), "a whole unit sizes the cut");
     }
 
     /// Splash `cutRows`: a unit that took 2048 ms for 2048 rows sizes the
@@ -3998,20 +4352,20 @@ mod tests {
     #[test]
     fn admission_waits_for_a_command_that_serves_it() {
         let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
-        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0));
+        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0, false));
         push_prefill(&mut scheduler, 1, 40_000, 0);
-        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0));
-        assert!(scheduler.serves_candidate(9, 0, 300, None, 0));
+        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0, false));
+        assert!(scheduler.serves_candidate(9, 0, 300, None, 0, false));
         let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
         push_prefill(&mut scheduler, 1, 400, 0);
-        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0));
+        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0, false));
         let mut fixed = Scheduler::<&'static str, (), ()>::new(10, PREFILL_CHUNK_ROWS).unwrap();
         fixed.running.push({
             let mut turn = TurnState::new(1, vec![1; 40_000], 0, Vec::new(), None, "p").unwrap();
             turn.status = TurnStatus::Running;
             turn
         });
-        assert!(fixed.serves_candidate(9, 0, 50_000, None, 0));
+        assert!(fixed.serves_candidate(9, 0, 50_000, None, 0, false));
     }
 
     /// Splash `Scheduler::admit`: a start admitted earlier in the same pass
@@ -4023,8 +4377,8 @@ mod tests {
         scheduler
             .enqueue_turn(TurnState::new(1, vec![1; 40_000], 0, Vec::new(), None, "p").unwrap())
             .expect("enqueue");
-        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0));
-        assert!(scheduler.serves_candidate(9, 0, 300, None, 0));
+        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0, false));
+        assert!(scheduler.serves_candidate(9, 0, 300, None, 0, false));
     }
 
     /// Splash `Engine::tick` commits a unit with the excluded lanes less

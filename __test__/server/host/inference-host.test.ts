@@ -879,6 +879,71 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(calls[0].path).toBe(join(modelsDir, name));
   });
 
+  /** A store with a 27B and a Flash Next target, each with its released draft beside it. */
+  async function storeWithBothDrafts(): Promise<{ modelsDir: string; draft27b: string }> {
+    const modelsDir = await makeModelsDir(['qwen3.8-27b-mxfp4-mlx', 'qwen3.8-flash-next']);
+    await writeFile(join(modelsDir, 'qwen3.8-flash-next', 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
+    const draft27b = join(modelsDir, 'qwen3.8-27b-dflash2');
+    await mkdir(draft27b);
+    await writeFile(join(draft27b, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    await writeFile(join(draft27b, 'model.safetensors'), 'weights');
+    const flashDraft = join(modelsDir, 'qwen3.8-flash-next-dflash2');
+    await mkdir(flashDraft);
+    await writeFile(
+      join(flashDraft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2560, num_target_layers: 48 }),
+    );
+    await writeFile(join(flashDraft, 'model.safetensors'), 'weights');
+    return { modelsDir, draft27b };
+  }
+
+  // Mutation: discover a Flash Next draft in `findDFlash2Draft` → red (Flash Next).
+  // Mutation: `findDFlash2Draft` finds nothing for qwen3_5 → red (27B).
+  it('loads Flash Next with no draft found in the store; the 27B load keeps its draft', async () => {
+    const { modelsDir, draft27b } = await storeWithBothDrafts();
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    expect(host.models.map((model) => model.name).sort()).toEqual(['qwen3.8-27b-mxfp4-mlx', 'qwen3.8-flash-next']);
+    await host.loadModel('qwen3.8-flash-next');
+    await host.loadModel('qwen3.8-27b-mxfp4-mlx');
+    expect(calls[0], 'Flash Next: no draft').toEqual({
+      path: join(modelsDir, 'qwen3.8-flash-next'),
+      options: undefined,
+    });
+    expect(calls[1], '27B: its draft').toEqual({
+      path: join(modelsDir, 'qwen3.8-27b-mxfp4-mlx'),
+      options: process.platform === 'darwin' ? { draftModelPath: draft27b } : undefined,
+    });
+  });
+
+  // Mutation: discover a Flash Next draft in `findDFlash2Draft` → red (Flash Next).
+  // Mutation: `findDFlash2Draft` finds nothing for qwen3_5 → red (27B).
+  it('estimates Flash Next with no draft found in the store; the 27B estimate keeps its draft', async () => {
+    const { modelsDir, draft27b } = await storeWithBothDrafts();
+    const asked = new Map<string, unknown>();
+    let done: () => void = () => undefined;
+    const both = new Promise<void>((resolve) => (done = resolve));
+    await start({
+      modelsDir,
+      estimateContextWindow: async (_path, modelType, options) => {
+        asked.set(String(modelType), options);
+        if (asked.size === 2) done();
+        return null;
+      },
+    });
+    await both;
+    expect(asked.get('qwen4_exp'), 'Flash Next: no draft').toEqual({});
+    expect(asked.get('qwen3_5'), '27B: its draft').toEqual(
+      process.platform === 'darwin' ? { draftModelPath: draft27b } : {},
+    );
+  });
+
   // Mutation: drop the `kvFormat` pass-through → red (qwen3_5 load gets no kvFormat).
   // Mutation: drop the family check → red (gemma4 load gets kvFormat).
   it('kvFormat reaches the qwen loader only', async () => {
@@ -993,6 +1058,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
 
   // Mutation: drop `maxContextTokens` from the qwen4_exp estimator options in
   // `nativeContextEstimate` → red. Mutation: drop `kvFormat` from them → red.
+  // Mutation: drop `draftModelPath` from them → red (the draft goes unpriced).
   // Mutation: drop `cacheDisk` from them → red (a load with the SSD cache off
   // plans no staging, the estimate would).
   it('hands maxContextTokens to both estimators', async () => {
@@ -1010,11 +1076,13 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await estimate('/flash', 'qwen4_exp', { maxContextTokens: 102_400 });
     await estimate('/flash', 'qwen4_exp', { kvFormat: 'int8' });
     await estimate('/flash', 'qwen4_exp', { cacheDisk: '0' });
+    await estimate('/flash', 'qwen4_exp', { draftModelPath: '/flash-draft' });
     await estimate('/qwen', 'qwen3_5', { maxContextTokens: 409_600 });
     expect(asked).toEqual([
       { family: 'flash-next', options: { maxContextTokens: 102_400 } },
       { family: 'flash-next', options: { kvFormat: 'int8' } },
       { family: 'flash-next', options: { cacheDisk: '0' } },
+      { family: 'flash-next', options: { draftModelPath: '/flash-draft' } },
       { family: 'qwen3_5', options: { maxContextTokens: 409_600 } },
     ]);
   });
@@ -1057,7 +1125,8 @@ describe('createInferenceHost — out-of-band loadModel', () => {
   });
 
   // Mutation: price qwen4_exp with the qwen3_5 estimator in
-  // `nativeContextEstimate` → red.
+  // `nativeContextEstimate` → red. The draft goes with it: the estimator
+  // prices its weights and lane.
   it('prices a Flash Next entry with its own estimator', async () => {
     const asked: Array<{ family: string; path: string; options?: unknown }> = [];
     const estimate = nativeContextEstimate(
@@ -1082,7 +1151,11 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       bound: 'memory',
     });
     expect(asked).toEqual([
-      { family: 'flash-next', path: '/flash', options: { kvFormat: 'int8', maxMemoryBytes: 25_769_803_776 } },
+      {
+        family: 'flash-next',
+        path: '/flash',
+        options: { kvFormat: 'int8', maxMemoryBytes: 25_769_803_776, draftModelPath: '/draft' },
+      },
       { family: 'qwen3_5', path: '/qwen', options: { maxMemoryBytes: 1_024 } },
     ]);
   });
@@ -1787,5 +1860,186 @@ describe('createInferenceHost — runtime sampler', () => {
       if (savedMetrics === undefined) delete process.env.MLX_AGENT_METRICS;
       else process.env.MLX_AGENT_METRICS = savedMetrics;
     }
+  });
+});
+
+/**
+ * The agent's title request names `mlx-local`, an alias of the loaded model.
+ * Its first use after a load must not take the writer slot: that waits for
+ * every running turn (and holds back every new one) though nothing loads.
+ */
+describe('createInferenceHost — an alias of the loaded model', () => {
+  interface Turn {
+    load: number;
+    text: string;
+  }
+
+  /** Two-lane paged stand-ins; a turn whose text is `long` runs until `finishLong`. */
+  function lanes(): {
+    loads: string[];
+    turns: Turn[];
+    entered: (text: string) => Promise<void>;
+    finishLong: () => void;
+    loadModel: (path: string) => Promise<LoadableModel>;
+  } {
+    const loads: string[] = [];
+    const turns: Turn[] = [];
+    const waiters = new Map<string, () => void>();
+    const longGate = deferred();
+    const result = {
+      text: 'ok',
+      toolCalls: [],
+      thinkingEnabled: false,
+      numTokens: 1,
+      promptTokens: 1,
+      reasoningTokens: 0,
+      finishReason: 'stop',
+      rawText: 'ok',
+      cachedTokens: 0,
+    };
+    const run = async (load: number, messages: Array<{ content?: unknown }>): Promise<void> => {
+      const text = messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join(' ');
+      turns.push({ load, text });
+      for (const [key, wake] of waiters) if (text.includes(key)) wake();
+      if (text.includes('long')) await longGate.promise;
+    };
+    const loadModel = async (path: string): Promise<LoadableModel> => {
+      loads.push(path);
+      const load = loads.length - 1;
+      async function* stream(): AsyncGenerator<Record<string, unknown>> {
+        yield { ...result, done: true, thinking: null };
+      }
+      const start = async (messages: Array<{ content?: unknown }>) => (await run(load, messages), result);
+      return {
+        hasBlockPagedCache: () => true,
+        maxConcurrentSequences: () => 4,
+        chatSessionStart: start,
+        chatSessionContinue: start,
+        chatSessionContinueTool: start,
+        chatStreamSessionStart: async function* (messages: Array<{ content?: unknown }>) {
+          await run(load, messages);
+          yield* stream();
+        },
+        resetCaches: async () => undefined,
+      } as unknown as LoadableModel;
+    };
+    return {
+      loads,
+      turns,
+      entered: (text) =>
+        new Promise<void>((resolve) => {
+          if (turns.some((turn) => turn.text.includes(text))) resolve();
+          else waiters.set(text, resolve);
+        }),
+      finishLong: longGate.resolve,
+      loadModel,
+    };
+  }
+
+  async function startLanes(fake: ReturnType<typeof lanes>): Promise<InferenceHost> {
+    return start({
+      modelsDir: await makeModelsDir(['alpha', 'beta']),
+      model: 'beta',
+      pagedModelTypes: [],
+      loadModel: fake.loadModel,
+    });
+  }
+
+  function send(host: InferenceHost, path: string, model: string, text: string): Promise<number> {
+    const body =
+      path === '/v1/responses'
+        ? { model, input: text }
+        : { model, messages: [{ role: 'user', content: text }], max_tokens: 8 };
+    return fetch(`${host.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(async (res) => (await res.text(), res.status));
+  }
+
+  /** Settles on whichever comes first: `started`, or a request parked for the writer slot. */
+  async function startedOrParked(host: InferenceHost, started: Promise<unknown>): Promise<'started' | 'parked'> {
+    let done = false;
+    const parked = (async () => {
+      while (!done && host.server.modelWork.waitingWriters === 0) await new Promise((r) => setImmediate(r));
+      return 'parked' as const;
+    })();
+    const first = await Promise.race([started.then(() => 'started' as const), parked]);
+    done = true;
+    return first;
+  }
+
+  // Mutation: `residentSessionRegistry` ignores `bindLoadedModel` → red ('parked').
+  // Mutation (responses, count_tokens): that endpoint keeps `registry.getSessionRegistry` → red.
+  it.each(['/v1/messages', '/v1/responses', '/v1/messages/count_tokens'])(
+    '%s with an alias starts beside a running turn',
+    async (path) => {
+      const fake = lanes();
+      const host = await startLanes(fake);
+      const long = send(host, '/v1/messages', 'beta', 'long turn');
+      await fake.entered('long');
+
+      const alias = send(host, path, 'mlx-local', 'title please');
+      const started = path === '/v1/messages/count_tokens' ? alias : fake.entered('title');
+      expect(await startedOrParked(host, started)).toBe('started');
+      expect(host.server.modelWork.waitingWriters).toBe(0);
+
+      fake.finishLong();
+      expect(await long).toBe(200);
+      // The stand-in has no chat template, so a count answers 501: it was dispatched, not parked.
+      expect(await alias).toBe(path === '/v1/messages/count_tokens' ? 501 : 200);
+      expect(fake.loads).toHaveLength(1);
+    },
+  );
+
+  // Mutation: `residentSessionRegistry` ignores `bindLoadedModel` → red ('parked').
+  it('two alias requests at once both start beside a running turn, with no load', async () => {
+    const fake = lanes();
+    const host = await startLanes(fake);
+    const long = send(host, '/v1/messages', 'beta', 'long turn');
+    await fake.entered('long');
+
+    const first = send(host, '/v1/messages', 'mlx-local', 'title one');
+    const second = send(host, '/v1/messages', 'mlx-local', 'title two');
+    const both = Promise.all([fake.entered('title one'), fake.entered('title two')]);
+    expect(await startedOrParked(host, both)).toBe('started');
+
+    fake.finishLong();
+    expect(await Promise.all([long, first, second])).toEqual([200, 200, 200]);
+    expect(fake.loads).toHaveLength(1);
+    expect(fake.turns.filter((turn) => turn.text.includes('title')).map((turn) => turn.load)).toEqual([0, 0]);
+  });
+
+  // Mutation: `residentSessionRegistry` ignores a held or queued writer → red (the alias answers 400).
+  it('an alias that arrives behind a queued swap runs on the new model', async () => {
+    const fake = lanes();
+    const host = await startLanes(fake);
+    const long = send(host, '/v1/messages', 'beta', 'long turn');
+    await fake.entered('long');
+
+    const swap = send(host, '/v1/messages', 'alpha', 'swap turn');
+    while (host.server.modelWork.waitingWriters === 0) await new Promise((r) => setImmediate(r));
+    const alias = send(host, '/v1/messages', 'mlx-local', 'title please');
+    while (host.server.modelWork.waitingWriters < 2 && host.server.registry.get('mlx-local') === undefined)
+      await new Promise((r) => setImmediate(r));
+
+    fake.finishLong();
+    expect(await Promise.all([long, swap, alias])).toEqual([200, 200, 200]);
+    expect(fake.loads.map((path) => path.slice(path.lastIndexOf('/') + 1))).toEqual(['beta', 'alpha']);
+    expect(fake.turns.find((turn) => turn.text.includes('title'))?.load).toBe(1);
+  });
+
+  // Mutation: the residency guard removed from `bindLoadedAlias` → red (500).
+  it('an alias with nothing loaded loads under the writer slot, again after a release', async () => {
+    const fake = lanes();
+    const host = await startLanes(fake);
+    expect(await send(host, '/v1/messages', 'mlx-local', 'title please')).toBe(200);
+    expect(fake.loads).toHaveLength(1);
+    expect(host.health().lastLoad).toMatchObject({ ok: true });
+
+    expect((await fetch(`${host.url}/v1/memory/release`, { method: 'POST' })).status).toBe(200);
+    expect(host.server.registry.list()).toHaveLength(0);
+    expect(await send(host, '/v1/messages', 'mlx-local', 'title again')).toBe(200);
+    expect(fake.loads).toHaveLength(2);
   });
 });

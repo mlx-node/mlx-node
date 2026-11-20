@@ -57,6 +57,7 @@ function bashRequest(command: string, extra: Record<string, unknown> = {}): Perm
     rawInput: { variant: 'Bash', command, description: 'run', is_background: false, ...extra },
     options: OPTIONS,
     hookAsk: { hookName: GUARD, reason: null },
+    requester: null,
   };
 }
 

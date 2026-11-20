@@ -1083,6 +1083,7 @@ fn empty_proposal() -> DsparkProposal {
     DsparkProposal {
         draft_ids: Vec::new(),
         device_draft_ids: None,
+        device_draft_sparse: None,
         draft_dists: Vec::new(),
         draft_sparse_dists: Vec::new(),
         keep_probabilities: None,

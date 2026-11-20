@@ -20,17 +20,21 @@ mod mlp_test;
 pub mod paged_attention_inputs;
 pub(crate) mod paged_flags;
 #[cfg(all(test, target_os = "macos"))]
+mod paged_int8_query_tests;
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) mod paged_int8_tests;
 pub mod paged_kv_cache_adapter;
 #[cfg(target_os = "macos")]
 pub(crate) mod paged_metadata_cache;
 pub(crate) mod paged_policy;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod part_page_tests;
 pub mod rotating_kv_cache;
 
 // Re-export all public types
 pub use attention::{Attention, QKVResult};
 pub use block::TransformerBlock;
-pub use kv_cache::{KVCache, KvFormat};
+pub use kv_cache::{Activations, KVCache, KvFormat};
 pub use kv_cache_spec::{
     AttentionKind, KVCacheCoordinator, KVCacheCoordinatorError, KVCacheDType, KVCacheGroup,
     KVCachePhysicalLayout, KVCacheSpecError, LayerKVCacheRoute, LayerKVCacheSpec,

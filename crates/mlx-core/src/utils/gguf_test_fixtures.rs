@@ -763,6 +763,7 @@ pub(crate) fn fixture_payload(ty: GgufTensorType, elements: usize, seed: u64) ->
 /// f16 scale fields.
 fn block_layout(ty: GgufTensorType) -> Option<(usize, usize, &'static [usize])> {
     Some(match ty {
+        GgufTensorType::Q2K => (256, 84, &[80, 82]),
         GgufTensorType::Q3K => (256, 110, &[108]),
         GgufTensorType::Q4K => (256, 144, &[0, 2]),
         GgufTensorType::Q5K => (256, 176, &[0, 2]),
