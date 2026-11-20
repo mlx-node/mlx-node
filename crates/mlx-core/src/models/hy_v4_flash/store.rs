@@ -655,7 +655,9 @@ pub fn reading(
 
 /// Bank bytes a turn start's flip to non-volatile left in the host's
 /// purgeable count (measured: 55.5 GB right after the flip, the bank's
-/// 54.9 plus the usual 0.5, with every in-turn reading at 0.3-0.5). The
+/// 54.9 plus the usual 0.5, with every in-turn reading at 0.3-0.5; 18
+/// buffers held volatile for 30 s stayed in the count 0.1-1 s past the
+/// flip while the kernel already listed them non-volatile). The
 /// count `before` the flip held the `volatile` bank bytes it took out, so
 /// what `after` holds past `before - volatile`, up to `volatile`, is the
 /// bank's; others' pages that turned volatile in between count as used, at
