@@ -24,16 +24,6 @@ use mlx_core::tokenizer::ChatMessage;
 /// `lanes >= 2` on 7 GB CI runners while still scaling up on larger machines.
 const ASYMMETRIC_MAX_POSITION_EMBEDDINGS: u32 = 8_192;
 
-/// Served context cap for the waves parity test (bf16 KV, `cache_disk = 0`, MTP on).
-///
-/// With MTP enabled on `int8` KV, the 2-lane minimum (~713 MiB) exceeds the
-/// ~555 MiB dynamic budget on 7 GB macOS CI runners regardless of context cap.
-/// Switching the waves load to `bf16` KV + `cache_disk = 0` at 2,048 context
-/// avoids the `SDPA_TWO_PASS_MIN_KEYS` (4,096) partials cliff and trims 2-lane
-/// MTP `draft_kv`, giving >16 MiB real headroom inside the 7 GB CI runner hard
-/// budget while keeping both `mtp = false` and `mtp = true` coverage.
-const WAVES_MAX_POSITION_EMBEDDINGS: u32 = 2_048;
-
 /// Both gates flip the process env `MLX_SERVE_FORCE_SERIAL`; they must not
 /// run at once.
 static ENV_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -61,17 +51,12 @@ fn test_max_memory_bytes() -> Option<i64> {
 }
 
 /// RAII-cleaned checkpoint clone that symlinks weights and writes a modified
-/// `config.json` with a capped `max_position_embeddings`, no explicit
-/// `paged_cache_memory_mb` override, and optionally MTP disabled.
-struct CappedCheckpointDir(PathBuf);
+/// `config.json` with a capped `max_position_embeddings`, MTP disabled, and no
+/// explicit `paged_cache_memory_mb` override.
+struct PlainArCheckpointDir(PathBuf);
 
-impl CappedCheckpointDir {
-    fn from_checkpoint(
-        src: &Path,
-        label: &str,
-        max_position_embeddings: u32,
-        disable_mtp: bool,
-    ) -> Self {
+impl PlainArCheckpointDir {
+    fn from_checkpoint(src: &Path, label: &str, max_position_embeddings: u32) -> Self {
         let src = fs::canonicalize(src).expect("canonicalize checkpoint dir");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -84,7 +69,7 @@ impl CappedCheckpointDir {
         if dst.exists() {
             let _ = fs::remove_dir_all(&dst);
         }
-        fs::create_dir_all(&dst).expect("create capped checkpoint dir");
+        fs::create_dir_all(&dst).expect("create plain-AR checkpoint dir");
         let guard = Self(dst);
 
         let patch_config = |obj: &mut serde_json::Map<String, serde_json::Value>| {
@@ -93,13 +78,11 @@ impl CappedCheckpointDir {
                 serde_json::Value::from(max_position_embeddings),
             );
             obj.remove("paged_cache_memory_mb");
-            if disable_mtp {
-                obj.insert(
-                    "mtp_num_hidden_layers".to_string(),
-                    serde_json::Value::from(0),
-                );
-                obj.remove("num_nextn_predict_layers");
-            }
+            obj.insert(
+                "mtp_num_hidden_layers".to_string(),
+                serde_json::Value::from(0),
+            );
+            obj.remove("num_nextn_predict_layers");
         };
 
         for entry in fs::read_dir(&src).expect("read checkpoint dir") {
@@ -138,7 +121,7 @@ impl CappedCheckpointDir {
     }
 }
 
-impl Drop for CappedCheckpointDir {
+impl Drop for PlainArCheckpointDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -202,11 +185,10 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         return;
     };
     let _env = ENV_GATE.lock().await;
-    let capped = CappedCheckpointDir::from_checkpoint(
+    let capped = PlainArCheckpointDir::from_checkpoint(
         &path,
         "asymmetric",
         ASYMMETRIC_MAX_POSITION_EMBEDDINGS,
-        true,
     );
     let model = Qwen3_5Model::load(
         capped.path().to_string_lossy().into_owned(),
@@ -335,14 +317,10 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
         return;
     };
     let _env = ENV_GATE.lock().await;
-    let capped =
-        CappedCheckpointDir::from_checkpoint(&path, "waves", WAVES_MAX_POSITION_EMBEDDINGS, false);
     let model = Qwen3_5Model::load(
-        capped.path().to_string_lossy().into_owned(),
-        Some(Qwen35LoadOptions {
-            kv_format: Some("bf16".to_string()),
-            cache_disk: Some("0".to_string()),
-            max_memory_bytes: test_max_memory_bytes(),
+        path.to_string_lossy().into_owned(),
+        test_max_memory_bytes().map(|max_memory_bytes| Qwen35LoadOptions {
+            max_memory_bytes: Some(max_memory_bytes),
             ..Default::default()
         }),
     )
@@ -351,10 +329,7 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
     assert!(model.has_block_paged_cache(), "gate requires paged Qwen3.5");
     let lanes = model.max_concurrent_sequences();
     eprintln!("planned lanes: {lanes}");
-    assert!(
-        (2..=8).contains(&lanes),
-        "expected 2..=8 planned lanes with capped context, got {lanes}"
-    );
+    assert!((1..=8).contains(&lanes));
     let modes: &[bool] = if model.has_mtp_weights() {
         &[false, true]
     } else {

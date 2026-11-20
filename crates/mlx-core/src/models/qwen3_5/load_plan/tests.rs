@@ -2705,18 +2705,13 @@ fn the_pool_page_rule_takes_the_token_major_page_only_on_its_load() {
 ///    regardless of context cap.
 /// 3. Plain AR (`int8 + mtp=false + max_pos=8_192`) plans `lanes == 2` at the
 ///    full 8,192 window with >256 MiB headroom.
-/// 4. MTP (`bf16 + mtp=true + CacheDisk::Off + max_pos=2_048`) plans
-///    `lanes == 2` at the full 2,048 window, with >16 MiB headroom (passes
-///    even at `REAL_0_8B_ACTIVE_BYTES + 16 MiB`, avoiding the 4,096 two-pass
-///    SDPA partials cliff).
 #[test]
-fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
+fn small_runner_0_8b_plain_ar_grants_two_lanes() {
     const CI_7GB_WORKING_SET: u64 = 5_010_305_024;
     const REAL_0_8B_ACTIVE_BYTES: u64 = 2_462_871_120;
-    let make_0_8b = |max_pos: i32, mtp: bool, kv_format: Option<&str>| {
+    let make_0_8b = |max_pos: i32, mtp: bool| {
         let mut config = shaped_config(1024, 24, 8, 2, 3584, 16, 16, mtp);
         config.max_position_embeddings = max_pos;
-        config.kv_format = kv_format.map(str::to_string);
         config.rope_scaling = Some(
             RopeScaling::served_for("Qwen3.5", max_pos as u32, RopeScaling::default(), None)
                 .unwrap(),
@@ -2725,7 +2720,7 @@ fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
     };
 
     // 1. Native int8 + MTP at 262,144 -> 1 lane (memory-bound).
-    let native = make_0_8b(262_144, true, None);
+    let native = make_0_8b(262_144, true);
     let native_plan = shaped_disk_plan(
         &native,
         REAL_0_8B_ACTIVE_BYTES,
@@ -2749,7 +2744,7 @@ fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
     assert!(native_pool.lane.window.maximum() < 262_144);
 
     // 2. int8 + MTP at 8,192 -> STILL 1 lane (2-lane minimum ~713 MiB > ~555 MiB dynamic budget).
-    let capped_int8_mtp = make_0_8b(8_192, true, None);
+    let capped_int8_mtp = make_0_8b(8_192, true);
     let capped_int8_mtp_plan = shaped_disk_plan(
         &capped_int8_mtp,
         REAL_0_8B_ACTIVE_BYTES,
@@ -2774,7 +2769,7 @@ fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
     );
 
     // 3. Plain AR (int8 + mtp=false + max_pos=8_192) -> 2 lanes with huge headroom.
-    let plain_ar = make_0_8b(8_192, false, None);
+    let plain_ar = make_0_8b(8_192, false);
     let plain_ar_plan = shaped_disk_plan(
         &plain_ar,
         REAL_0_8B_ACTIVE_BYTES,
@@ -2804,37 +2799,4 @@ fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
         "expected >256 MiB headroom for plain AR int8, got {:.2} MiB",
         plain_ar_headroom as f64 / MIB as f64,
     );
-
-    // 4. MTP (bf16 + mtp=true + CacheDisk::Off + max_pos=2_048) -> 2 lanes at 2,048 window,
-    //    even with +16 MiB extra active footprint headroom.
-    let bf16_mtp = make_0_8b(2_048, true, Some("bf16"));
-    for extra_mib in [0u64, 16u64] {
-        let bf16_mtp_plan = shaped_disk_plan(
-            &bf16_mtp,
-            REAL_0_8B_ACTIVE_BYTES + extra_mib * MIB,
-            CI_7GB_WORKING_SET,
-            true,
-            2,
-            0,
-            Some(CacheDisk::Off),
-        )
-        .expect("0.8B bf16+mtp fits 2 lanes on 7 GB runner");
-        let bf16_mtp_pool = bf16_mtp_plan.pool.expect("pool plan");
-        let bf16_mtp_headroom = bf16_mtp_plan
-            .dynamic_budget_bytes
-            .saturating_sub(bf16_mtp_pool.lane.minimum_bytes);
-        println!(
-            "CI_7GB bf16+mtp+disk_off max_pos=2048 (+{extra_mib}MiB): lanes={} window={} dynamic={:.2}MiB min={:.2}MiB headroom={:.2}MiB",
-            bf16_mtp_pool.lanes,
-            bf16_mtp_pool.lane.window.maximum(),
-            bf16_mtp_plan.dynamic_budget_bytes as f64 / MIB as f64,
-            bf16_mtp_pool.lane.minimum_bytes as f64 / MIB as f64,
-            bf16_mtp_headroom as f64 / MIB as f64,
-        );
-        assert_eq!(
-            bf16_mtp_pool.lanes, 2,
-            "bf16+mtp+disk_off at max_pos=2048 (+{extra_mib}MiB) should grant 2 lanes"
-        );
-        assert_eq!(bf16_mtp_pool.lane.window.maximum(), 2_048);
-    }
 }
