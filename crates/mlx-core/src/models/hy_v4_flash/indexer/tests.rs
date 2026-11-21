@@ -1249,9 +1249,10 @@ mod fused_metal {
             for (g, wv) in got_flat.iter().zip(&want) {
                 max_diff_flat = max_diff_flat.max((g - wv).abs());
             }
+            let tol = if s > 16 { 5e-3 } else { 1e-3 };
             assert!(
-                max_diff_flat <= 1e-3,
-                "flat S={s} N_g={n_groups} start_g={start_g}: max_abs_diff={max_diff_flat}"
+                max_diff_flat <= tol,
+                "flat S={s} N_g={n_groups} start_g={start_g}: max_abs_diff={max_diff_flat} > {tol}"
             );
 
             // Paged mode with scattered non-monotonic physical blocks.

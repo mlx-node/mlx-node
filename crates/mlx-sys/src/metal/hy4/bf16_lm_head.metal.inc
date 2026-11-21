@@ -3,7 +3,10 @@ constexpr int VP = FAST_K ? 8 : 4;
 constexpr int BLOCK = VP * 32;
 const int M = x_shape[0];
 const int K = x_shape[1];
-const int V = w_shape[0];
+const int V = int(w_meta[1]);
+const device bfloat* wb = reinterpret_cast<const device bfloat*>(
+    reinterpret_cast<const device uint8_t*>(w) +
+    (MMAP_U8 ? size_t(w_meta[0]) : 0ul));
 const uint lane = thread_index_in_simdgroup;
 const uint sg = simdgroup_index_in_threadgroup;
 const int first = int(threadgroup_position_in_grid.y) * (NSG * RPS) + int(sg) * RPS;
@@ -28,7 +31,7 @@ if constexpr (FAST_K) {
         const int vrow = first + o;
         if (vrow < V) {
           const device bfloat4* wp = reinterpret_cast<const device bfloat4*>(
-              w + size_t(vrow) * size_t(K) + col);
+              wb + size_t(vrow) * size_t(K) + col);
           const float4 w0 = float4(wp[0]);
           const float4 w1 = float4(wp[1]);
           for (int r = 0; r < R_TILE; ++r) {
@@ -63,7 +66,7 @@ if constexpr (FAST_K) {
         const int vrow = first + o;
         if (vrow < V) {
           const device bfloat4* wp = reinterpret_cast<const device bfloat4*>(
-              w + size_t(vrow) * size_t(K) + col);
+              wb + size_t(vrow) * size_t(K) + col);
           const float4 w0 = float4(wp[0]);
           const float4 w1 = float4(wp[1]);
 #pragma unroll
@@ -85,7 +88,7 @@ if constexpr (FAST_K) {
           const int vrow = first + o;
           if (vrow < V) {
             const float4 w0 = float4(*reinterpret_cast<const device bfloat4*>(
-                w + size_t(vrow) * size_t(K) + col));
+                wb + size_t(vrow) * size_t(K) + col));
             for (int r = 0; r < R_TILE; ++r) {
               const int row = row0 + r;
               if (row < M) {
@@ -113,7 +116,7 @@ if constexpr (FAST_K) {
           const int vrow = first + o;
           if (vrow < V) {
             const float4 w0 = float4(*reinterpret_cast<const device bfloat4*>(
-                w + size_t(vrow) * size_t(K) + col));
+                wb + size_t(vrow) * size_t(K) + col));
 #pragma unroll
             for (int r = 0; r < R_TILE; ++r) {
               acc[r][o] += dot(x0[r], w0);

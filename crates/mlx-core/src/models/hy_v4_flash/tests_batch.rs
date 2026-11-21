@@ -612,6 +612,96 @@ fn q8_dual_down_add_parity_and_clamp_boundaries() {
 }
 
 #[test]
+fn q8_dual_down_add_prefill_nax_parity_and_strided_inputs() {
+    use super::ops::try_q8_dual_down_add;
+    use crate::nn::Activations;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(2030);
+    let boundary_g = [-25.0f32, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];
+    let boundary_u = [-25.0f32, -10.5, -10.0, -2.0, 0.0, 3.0, 10.0, 10.5, 25.0];
+
+    for &(m, k, n) in &[
+        (17usize, 192usize, 71usize),
+        (45, 192, 160),
+        (64, 512, 256),
+        (77, 1536, 3072),
+    ] {
+        let w_up = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
+        let w_sd = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
+        let mut combined = r.vec(m * 3 * k, 1.0);
+        for row in 0..m {
+            let base = row * 3 * k + k;
+            for (i, (&g, &u)) in boundary_g.iter().zip(&boundary_u).enumerate() {
+                combined[base + i] = g;
+                combined[base + k + i] = u;
+            }
+        }
+        let all = arr(&combined, &[m, 3 * k]);
+        let rl_strided = all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+        let sgu_strided = all
+            .slice(&[0, k as i64], &[m as i64, (3 * k) as i64])
+            .unwrap();
+        let rl_contig = arr(&read(&rl_strided), &[m, k]);
+        let sgu_contig = arr(&read(&sgu_strided), &[m, 2 * k]);
+
+        let wf_up = w_up.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
+        let wf_sd = w_sd.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
+
+        for limit in [0.0f32, 10.0f32] {
+            let fused_strided =
+                try_q8_dual_down_add(&rl_strided, &sgu_strided, &w_up, &w_sd, limit)
+                    .unwrap()
+                    .expect("SymQ8 dual_down_add prefill must run on Metal");
+            let fused_contig = try_q8_dual_down_add(&rl_contig, &sgu_contig, &w_up, &w_sd, limit)
+                .unwrap()
+                .expect("SymQ8 dual_down_add prefill must run on Metal");
+            assert_eq!(
+                read_bits(&fused_strided),
+                read_bits(&fused_contig),
+                "dual_down_add prefill strided vs contig mismatch M={m} K={k} N={n} limit={limit}"
+            );
+
+            let sg = sgu_contig.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+            let su = sgu_contig
+                .slice(&[0, k as i64], &[m as i64, (2 * k) as i64])
+                .unwrap();
+            let act = if limit > 0.0 {
+                Activations::swiglu_clamped_compiled(&sg, &su, limit).unwrap()
+            } else {
+                Activations::swiglu_compiled(&sg, &su).unwrap()
+            };
+            let want = read(
+                &rl_contig
+                    .matmul(&wf_up)
+                    .unwrap()
+                    .add(&act.matmul(&wf_sd).unwrap())
+                    .unwrap(),
+            );
+            let got = read(&fused_contig);
+            let mut err2 = 0.0f64;
+            let mut ref2 = 0.0f64;
+            for (&g, &w) in got.iter().zip(&want) {
+                assert!(g.is_finite(), "non-finite dual_down_add prefill output");
+                let d = f64::from(g - w);
+                err2 += d * d;
+                ref2 += f64::from(w) * f64::from(w);
+            }
+            let rel = (err2 / ref2.max(1e-30)).sqrt();
+            let tol = if std::env::var("MLX_HY4_Q8_PREFILL_1MMA").as_deref() == Ok("0") {
+                5e-6
+            } else {
+                5e-4
+            };
+            assert!(
+                rel <= tol,
+                "dual_down_add prefill M={m} K={k} N={n} limit={limit}: rel_l2={rel:e} > {tol:e}"
+            );
+        }
+    }
+}
+
+#[test]
 fn q8_grouped_decode_row_invariant_and_f32_parity() {
     crate::models::hy_v4_flash::exact_f32();
     let mut r = Rng(103);

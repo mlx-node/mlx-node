@@ -1682,6 +1682,138 @@ fn mmap_bank_rejects_misaligned_or_truncated_shard_cleanly() {
     drop(forced);
 }
 
+#[test]
+fn rset_keepalive_idle_grace_and_mmap_dense_residency() {
+    // Pure predicate coverage: initial post-load idle stays quiet, active turn pings,
+    // short inter-turn gap (<= 15 s) pings, long idle (> 15 s) goes quiet.
+    assert!(!should_ping_rset(
+        false,
+        RSET_NO_TURN_ENDED,
+        0,
+        RSET_IDLE_GRACE_MS
+    ));
+    assert!(!should_ping_rset(
+        false,
+        RSET_NO_TURN_ENDED,
+        60_000,
+        RSET_IDLE_GRACE_MS
+    ));
+    assert!(should_ping_rset(
+        true,
+        RSET_NO_TURN_ENDED,
+        60_000,
+        RSET_IDLE_GRACE_MS
+    ));
+    assert!(should_ping_rset(true, 10_000, 90_000, RSET_IDLE_GRACE_MS));
+    assert!(should_ping_rset(false, 10_000, 10_000, RSET_IDLE_GRACE_MS));
+    assert!(should_ping_rset(false, 10_000, 25_000, RSET_IDLE_GRACE_MS));
+    assert!(!should_ping_rset(false, 10_000, 25_001, RSET_IDLE_GRACE_MS));
+    assert!(!should_ping_rset(false, 10_000, 70_000, RSET_IDLE_GRACE_MS));
+
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+
+    let m = moe(6, 256, 256);
+    let mut experts = vec![None];
+    let mut at = 1024u64;
+    for (il, class) in [
+        (1, ExpertClass::Q6kDown),
+        (2, ExpertClass::Q4kDown),
+        (3, ExpertClass::Q6kDown),
+    ] {
+        let (l, end) = layer(&m, il, class, at);
+        experts.push(Some(l));
+        at = end.div_ceil(32) * 32;
+    }
+    let vocab = 16i64;
+    let dim = 64i64;
+    let emb_off = at;
+    let emb_info = GgufTensorInfo {
+        name: "token_embd.weight".into(),
+        n_dims: 2,
+        dims: vec![dim as u64, vocab as u64],
+        tensor_type: GgufTensorType::Q8_0,
+        offset: 0,
+    };
+    let emb_bytes = emb_info.data_size().unwrap();
+    at = (emb_off + emb_bytes).div_ceil(32) * 32;
+    let out_off = at;
+    let out_info = GgufTensorInfo {
+        name: "output.weight".into(),
+        n_dims: 2,
+        dims: vec![dim as u64, vocab as u64],
+        tensor_type: GgufTensorType::BF16,
+        offset: 0,
+    };
+    let out_bytes = out_info.data_size().unwrap();
+    at = (out_off + out_bytes).div_ceil(32) * 32;
+
+    let file = random_bytes(at as usize, 37);
+    let dir = Temp::new();
+    let path = dir.file(&file);
+    let dense_spec = MmapDenseSpec {
+        token_embd: Some((
+            Located {
+                shard: 0,
+                data_offset: emb_off,
+                info: emb_info,
+            },
+            vocab,
+            dim,
+        )),
+        output: Some((
+            Located {
+                shard: 0,
+                data_offset: out_off,
+                info: out_info,
+            },
+            vocab,
+            dim,
+        )),
+    };
+    let expected_mapped: u64 = experts
+        .iter()
+        .flatten()
+        .map(|l| file_bytes(&m, l.class).unwrap() * m.n_experts as u64)
+        .sum::<u64>()
+        + emb_bytes
+        + out_bytes;
+    let (bank, dense) = KqBank::new_mmap_with_dense(
+        pool_over(&path, 2),
+        &m,
+        &experts,
+        std::slice::from_ref(&path),
+        0,
+        false,
+        &dense_spec,
+    )
+    .unwrap();
+
+    assert_eq!(bank.extra_mmap_bufs(), 2);
+    assert_eq!(bank.mapped_bytes(), expected_mapped);
+    assert_eq!(bank.nbytes(), 0);
+    assert_eq!(bank.last_turn_end_ms(), Some(RSET_NO_TURN_ENDED));
+    assert!(matches!(dense.token_embd, Some(Dense::MmapQ8_0 { .. })));
+    assert!(matches!(dense.output, Some(Dense::MmapBf16 { .. })));
+    assert_eq!(dense.token_embd.as_ref().unwrap().nbytes(), 0);
+    assert_eq!(dense.output.as_ref().unwrap().nbytes(), 0);
+
+    // Turning active -> inactive records last_turn_end_ms for the idle grace window.
+    bank.begin_turn().unwrap();
+    assert!(bank.in_turn());
+    assert_eq!(bank.last_turn_end_ms(), Some(RSET_NO_TURN_ENDED));
+    bank.end_turn().unwrap();
+    assert!(!bank.in_turn());
+    assert_ne!(bank.last_turn_end_ms(), Some(RSET_NO_TURN_ENDED));
+
+    // Drop dense views BEFORE bank (matching Store's drop order) so extra_bufs
+    // keeps MTL::Buffers alive until MetalResidencySet drops.
+    drop(dense);
+    drop(bank);
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

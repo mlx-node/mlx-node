@@ -37,10 +37,14 @@ use super::prefill::{Runner, Seq, index_keeps, session_keeps};
 use super::prefix_state::PrefixState;
 use super::scan::Scan;
 use super::sparse::gather_sink_attention;
-use super::weights::{Dense, LayerWeights, NextnWeights, OUTPUT, Residual, quantize_sym_q8_array};
+use super::weights::{
+    Dense, LayerWeights, NextnWeights, OUTPUT, Residual, quantize_sym_q8_array,
+    quantize_sym_q8_from_bf16_raw,
+};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::deepseek_v41::ops::inv_freqs;
+use crate::models::deepseek_v41::store::Weight;
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
 
@@ -126,14 +130,25 @@ fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
     if mtp_head_mode()? != MtpHeadMode::SymQ8 {
         return Ok(None);
     }
-    let Dense::Array(a) = output else {
-        return Ok(None);
-    };
-    if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 32 != 0 {
-        return Ok(None);
-    }
     let t0 = std::time::Instant::now();
-    let q = quantize_sym_q8_array(a)?;
+    let q = match output {
+        Dense::Array(a) => {
+            if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 32 != 0 {
+                return Ok(None);
+            }
+            quantize_sym_q8_array(a)?
+        }
+        Dense::MmapBf16 { cols, .. } => {
+            if *cols <= 0 || cols % 32 != 0 {
+                return Ok(None);
+            }
+            let Some((raw, rows, k)) = output.mmap_bf16_raw_slice()? else {
+                return Ok(None);
+            };
+            quantize_sym_q8_from_bf16_raw(raw, rows, k)?
+        }
+        _ => return Ok(None),
+    };
     tracing::info!(
         "hy_v4_flash MTP draft head: SymQ8 {} bytes ({:.0} ms)",
         q.nbytes(),
@@ -553,6 +568,14 @@ fn draft_embedding(token_embd: &Dense, vocab: usize, dim: usize) -> Result<Embed
             e.load_quantized_packed(w, scales, Some(biases), 32, 8, "affine")?;
             Ok(e)
         }
+        Dense::MmapQ8_0 {
+            buf, byte_offset, ..
+        } => {
+            let mut e = Embedding::new_uninitialized(v, d)?;
+            e.load_gguf_q8_0_mmap(buf, *byte_offset)?;
+            Ok(e)
+        }
+        Dense::MmapBf16 { .. } => Embedding::from_weight(&token_embd.f32()?),
     }
 }
 
@@ -1477,5 +1500,13 @@ impl Runner<Lagged> for LagRunner<'_> {
         cancel: &dyn Fn(usize) -> bool,
     ) -> Result<Output> {
         seq.prefill(self.model, self.mtp, ids, want, cancel)
+    }
+
+    fn begin_prefill(&self, prompt: &[u32], from: usize, ends: &[usize]) {
+        self.model.begin_prefill_engram(prompt, from, ends);
+    }
+
+    fn end_prefill(&self) {
+        self.model.clear_prefill_engram();
     }
 }

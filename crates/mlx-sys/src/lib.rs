@@ -3490,6 +3490,21 @@ unsafe extern "C" {
 
     pub fn mlx_hy4_bf16_lm_head(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
 
+    pub fn mlx_hy4_bf16_lm_head_mmap(
+        x: *mut mlx_array,
+        w_buf: *mut mlx_array,
+        byte_offset: u64,
+        vocab: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_q8_0_embed_rows(
+        ids: *mut mlx_array,
+        buf: *mut mlx_array,
+        byte_offset: u64,
+        vocab: i32,
+        dim: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_q8_dense_decode(
         x: *mut mlx_array,
         w: *mut mlx_array,
@@ -3512,11 +3527,28 @@ unsafe extern "C" {
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_q8_dense_prefill_epilogue(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        aux: *mut mlx_array,
+        epilogue: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_q8_grouped_prefill(
         x: *mut mlx_array,
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_prefill_gated(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        gate: *mut mlx_array,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_kq_routed_decode(
@@ -3566,6 +3598,7 @@ unsafe extern "C" {
 
     pub fn mlx_hy4_mla_prefill_nax(
         q: *mut mlx_array,
+        q_pe: *mut mlx_array,
         k0: *mut mlx_array,
         k1: *mut mlx_array,
         idx: *mut mlx_array,
@@ -3576,6 +3609,7 @@ unsafe extern "C" {
 
     pub fn mlx_hy4_mla_prefill_sliding_nax(
         q: *mut mlx_array,
+        q_pe: *mut mlx_array,
         k: *mut mlx_array,
         sinks: *mut mlx_array,
         v_width: i32,

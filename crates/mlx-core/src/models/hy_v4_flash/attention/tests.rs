@@ -1338,6 +1338,7 @@ fn call_mla_prefill_nax(
     let raw = unsafe {
         mlx_sys::mlx_hy4_mla_prefill_nax(
             q.as_raw_ptr(),
+            std::ptr::null_mut(),
             k0_ptr,
             k1_ptr,
             idx.as_raw_ptr(),
@@ -1828,7 +1829,7 @@ fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
         let sinks = arr(&sinks_v, &[h]);
 
         let got_arr = try_sliding_sink_attention_prefill(
-            &q, &keys, &sinks, vw, scale, start_pos, is_ring, ring_cap, window, first_key,
+            &q, None, &keys, &sinks, vw, scale, start_pos, is_ring, ring_cap, window, first_key,
         )
         .unwrap()
         .expect("expected sliding NAX prefill kernel");
@@ -1902,7 +1903,7 @@ fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
         };
         let got = read(
             &try_sliding_sink_attention_prefill(
-                &q, keys, &sinks, vw, scale, start, is_ring, cap, window, first,
+                &q, None, keys, &sinks, vw, scale, start, is_ring, cap, window, first,
             )
             .unwrap()
             .expect("WindowRing sliding NAX"),
@@ -2080,4 +2081,152 @@ fn mla_decode_bench_timing() {
     eprintln!(
         "[mla_decode_bench:{mode}] 42L est: M=1 {m1_42l:.3} ms, M=2 {m2_42l:.3} ms, M=4 {m4_42l:.3} ms"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_split_q_matches_combined_bitwise_sliding_and_indexed() {
+    use super::super::sparse::{
+        gather_sink_attention_rows_split_q_for, gather_sink_attention_split_q_for,
+    };
+
+    crate::models::hy_v4_flash::exact_f32();
+    let (d_v, d_r, d) = (512usize, 64usize, 576usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let window = 512usize;
+
+    // Sliding NAX: cover partial BH=4 head tiles (H=6), H=32, H=64, Ring & Linear.
+    for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in &[
+        (17usize, 6usize, 500usize, true, 540usize, 0usize, 701u64),
+        (35, 32, 600, true, 650, 0, 709),
+        (64, 64, 512, false, 0, 12, 719),
+    ] {
+        let mut r = Rng(seed);
+        let q_abs = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v]);
+        let q_pe = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r]);
+        let q_full = MxArray::concatenate(&q_abs, &q_pe, -1).unwrap();
+        let key_rows = if is_ring {
+            ring_cap
+        } else {
+            start_pos + s - first_key
+        };
+        let keys = arr(&r.vec(key_rows * d, 1.0), &[key_rows, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+
+        let out_full = try_sliding_sink_attention_prefill(
+            &q_full, None, &keys, &sinks, d_v as i64, scale, start_pos, is_ring, ring_cap, window,
+            first_key,
+        )
+        .unwrap()
+        .expect("sliding combined");
+        let out_split = try_sliding_sink_attention_prefill(
+            &q_abs,
+            Some(&q_pe),
+            &keys,
+            &sinks,
+            d_v as i64,
+            scale,
+            start_pos,
+            is_ring,
+            ring_cap,
+            window,
+            first_key,
+        )
+        .unwrap()
+        .expect("sliding split-Q");
+        assert_eq!(
+            bits(&out_split),
+            bits(&out_full),
+            "sliding split-Q vs combined mismatch S={s} H={h} ring={is_ring}"
+        );
+    }
+
+    // Indexed NAX: Whole & Split KV planes, partial & full tiles.
+    for &(s, h, kmax, split_kv, seed) in &[
+        (19usize, 32usize, 512usize, false, 727u64),
+        (64, 64, 512, true, 733),
+        (32, 32, 2048, true, 739),
+    ] {
+        let n = kmax + 37;
+        let mut r = Rng(seed);
+        let q_abs = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v]);
+        let q_pe = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r]);
+        let q_full = MxArray::concatenate(&q_abs, &q_pe, -1).unwrap();
+        let keys = arr(&r.vec(n * d, 1.0), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+        let idx: Vec<i32> = (0..s * kmax)
+            .map(|i| {
+                if i % 41 == 40 {
+                    -1
+                } else {
+                    ((i * 11 + 5) % n) as i32
+                }
+            })
+            .collect();
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+        let (out_full, out_split) = if split_kv {
+            let kr = KeyRows::Split(&k0, &k1);
+            (
+                gather_sink_attention_rows_split_q_for(
+                    &q_full,
+                    None,
+                    kr,
+                    &ia,
+                    d_v as i64,
+                    &sinks,
+                    scale,
+                    RowKind::Prefill,
+                )
+                .unwrap(),
+                gather_sink_attention_rows_split_q_for(
+                    &q_abs,
+                    Some(&q_pe),
+                    kr,
+                    &ia,
+                    d_v as i64,
+                    &sinks,
+                    scale,
+                    RowKind::Prefill,
+                )
+                .unwrap(),
+            )
+        } else {
+            (
+                gather_sink_attention_split_q_for(
+                    &q_full,
+                    None,
+                    &keys,
+                    &ia,
+                    d_v as i64,
+                    &sinks,
+                    scale,
+                    RowKind::Prefill,
+                )
+                .unwrap(),
+                gather_sink_attention_split_q_for(
+                    &q_abs,
+                    Some(&q_pe),
+                    &keys,
+                    &ia,
+                    d_v as i64,
+                    &sinks,
+                    scale,
+                    RowKind::Prefill,
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            bits(&out_split),
+            bits(&out_full),
+            "indexed split-Q vs combined mismatch S={s} H={h} kmax={kmax} split_kv={split_kv}"
+        );
+    }
 }

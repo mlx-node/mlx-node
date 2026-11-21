@@ -47,6 +47,8 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// - `Q8`: Q8_0 codes (`[rows, k / 4]` u32) + f16 scales (`[rows, k / 32]` f16) for row gathers
 /// - `SymQ8`: symmetric Q8_0 codes + f16 scales with derived `-128 * scale` bias (34 B / 32 weights)
 /// - `Qmm`: affine-8 codes + explicit scales and biases (e.g. MTP requantized BF16)
+/// - `MmapBf16`: zero-copy read-only mmap BF16 matrix (`buf` uint8 + `byte_offset`)
+/// - `MmapQ8_0`: zero-copy read-only mmap GGUF Q8_0 table (`buf` uint8 + `byte_offset`)
 pub enum Dense {
     Array(MxArray),
     Q8 {
@@ -62,6 +64,90 @@ pub enum Dense {
         scales: MxArray,
         biases: MxArray,
     },
+    MmapBf16 {
+        buf: MxArray,
+        byte_offset: u64,
+        rows: i64,
+        cols: i64,
+    },
+    MmapQ8_0 {
+        buf: MxArray,
+        byte_offset: u64,
+        rows: i64,
+        cols: i64,
+    },
+}
+
+fn mmap_raw_slice(buf: &MxArray, byte_offset: u64, len: usize) -> Result<&[u8]> {
+    buf.eval();
+    let total = buf.nbytes();
+    let off = usize::try_from(byte_offset).map_err(|_| bad("mmap byte_offset exceeds usize"))?;
+    if off.checked_add(len).is_none_or(|end| end > total) {
+        return Err(bad(format!(
+            "mmap slice {off}..+{len} exceeds buffer size {total}"
+        )));
+    }
+    let ptr = buf.storage_ptr();
+    if ptr.is_null() {
+        return Err(bad("mmap buffer has null storage pointer"));
+    }
+    // SAFETY: `buf` is evaluated and alive for the returned borrow, and
+    // `off..off + len` was bounds-checked against `buf.nbytes()`.
+    Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(off), len) })
+}
+
+pub(crate) fn mmap_q8_0_gather_rows(
+    idx: &MxArray,
+    buf: &MxArray,
+    byte_offset: u64,
+    rows: i64,
+    cols: i64,
+) -> Result<MxArray> {
+    if let Some(arr) = super::ops::gguf_q8_0_embed_rows(idx, buf, byte_offset, rows, cols)? {
+        return Ok(arr);
+    }
+    let orig_shape = idx.shape()?.as_ref().to_vec();
+    let mut out_shape = orig_shape.clone();
+    out_shape.push(cols);
+    let n: usize = orig_shape.iter().map(|&d| d as usize).product();
+    if n == 0 {
+        return MxArray::zeros(&out_shape, Some(DType::Float32));
+    }
+    let flat = if orig_shape.len() == 1 {
+        idx.clone()
+    } else {
+        idx.reshape(&[n as i64])?
+    };
+    let flat_i32 = if flat.dtype()? == DType::Int32 {
+        flat
+    } else {
+        flat.astype(DType::Int32)?
+    };
+    let ids = flat_i32.to_int32()?;
+    let rows_u = usize::try_from(rows).map_err(|_| bad("rows exceeds usize"))?;
+    let cols_u = usize::try_from(cols).map_err(|_| bad("cols exceeds usize"))?;
+    if cols_u == 0 || !cols_u.is_multiple_of(Q8_0_VALUES) {
+        return Err(bad(format!("Q8_0 mmap cols {cols_u} not divisible by 32")));
+    }
+    let row_bytes = (cols_u / Q8_0_VALUES)
+        .checked_mul(Q8_0_BYTES)
+        .ok_or_else(|| bad("Q8_0 mmap row bytes overflow"))?;
+    let table_bytes = rows_u
+        .checked_mul(row_bytes)
+        .ok_or_else(|| bad("Q8_0 mmap table bytes overflow"))?;
+    let raw = mmap_raw_slice(buf, byte_offset, table_bytes)?;
+    alloc_filled(&out_shape, DType::Float32, n * cols_u, |out| {
+        for (i, &id) in ids.iter().enumerate() {
+            let dst = &mut out[i * cols_u..(i + 1) * cols_u];
+            if id < 0 || (id as usize) >= rows_u {
+                dst.fill(0.0);
+            } else {
+                let r = id as usize;
+                q8_0_into_f32(&raw[r * row_bytes..(r + 1) * row_bytes], dst)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 impl From<MxArray> for Dense {
@@ -122,6 +208,51 @@ impl Weight for Dense {
             Self::Array(a) => a.astype(DType::Float32),
             Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => dequant_q8(w, scales),
             Self::Qmm { w, scales, biases } => dequant_affine8(w, scales, biases),
+            Self::MmapBf16 {
+                buf,
+                byte_offset,
+                rows,
+                cols,
+            } => {
+                let (r, c) = (
+                    usize::try_from(*rows).map_err(|_| bad("rows exceeds usize"))?,
+                    usize::try_from(*cols).map_err(|_| bad("cols exceeds usize"))?,
+                );
+                let n = r
+                    .checked_mul(c)
+                    .ok_or_else(|| bad("mmap bf16 elements overflow"))?;
+                let bytes = n
+                    .checked_mul(2)
+                    .ok_or_else(|| bad("mmap bf16 bytes overflow"))?;
+                let raw = mmap_raw_slice(buf, *byte_offset, bytes)?;
+                alloc_filled(&[*rows, *cols], DType::Float32, n, |out| {
+                    bf16_into_f32(raw, out)
+                })
+            }
+            Self::MmapQ8_0 {
+                buf,
+                byte_offset,
+                rows,
+                cols,
+            } => {
+                let (r, c) = (
+                    usize::try_from(*rows).map_err(|_| bad("rows exceeds usize"))?,
+                    usize::try_from(*cols).map_err(|_| bad("cols exceeds usize"))?,
+                );
+                if c == 0 || !c.is_multiple_of(Q8_0_VALUES) {
+                    return Err(bad(format!("Q8_0 mmap cols {c} not divisible by 32")));
+                }
+                let n = r
+                    .checked_mul(c)
+                    .ok_or_else(|| bad("mmap q8_0 elements overflow"))?;
+                let bytes = (n / Q8_0_VALUES)
+                    .checked_mul(Q8_0_BYTES)
+                    .ok_or_else(|| bad("mmap q8_0 bytes overflow"))?;
+                let raw = mmap_raw_slice(buf, *byte_offset, bytes)?;
+                alloc_filled(&[*rows, *cols], DType::Float32, n, |out| {
+                    q8_0_into_f32(raw, out)
+                })
+            }
         }
     }
 
@@ -132,7 +263,9 @@ impl Weight for Dense {
                 qmm_t(x, w, &s, &b)
             }
             Self::Qmm { w, scales, biases } => qmm_t(x, w, scales, biases),
-            Self::Array(_) | Self::Q8 { .. } => x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?),
+            Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
+                x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?)
+            }
         }
     }
 }
@@ -141,8 +274,12 @@ impl Dense {
     pub fn array(self) -> Result<MxArray> {
         match self {
             Self::Array(a) => Ok(a),
-            Self::Q8 { .. } | Self::SymQ8 { .. } | Self::Qmm { .. } => {
-                Err(bad("Q8_0 tensor where an f32 array is expected"))
+            Self::Q8 { .. }
+            | Self::SymQ8 { .. }
+            | Self::Qmm { .. }
+            | Self::MmapBf16 { .. }
+            | Self::MmapQ8_0 { .. } => {
+                Err(bad("quantized or mmap tensor where an array is expected"))
             }
         }
     }
@@ -156,8 +293,29 @@ impl Dense {
         match self {
             Self::SymQ8 { w, scales } => Some((w, scales, None)),
             Self::Qmm { w, scales, biases } => Some((w, scales, Some(biases))),
-            Self::Array(_) | Self::Q8 { .. } => None,
+            Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
+                None
+            }
         }
+    }
+
+    pub(crate) fn mmap_bf16_raw_slice(&self) -> Result<Option<(&[u8], usize, usize)>> {
+        let Self::MmapBf16 {
+            buf,
+            byte_offset,
+            rows,
+            cols,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let r = usize::try_from(*rows).map_err(|_| bad("rows exceeds usize"))?;
+        let c = usize::try_from(*cols).map_err(|_| bad("cols exceeds usize"))?;
+        let bytes = r
+            .checked_mul(c)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| bad("mmap bf16 bytes overflow"))?;
+        Ok(Some((mmap_raw_slice(buf, *byte_offset, bytes)?, r, c)))
     }
 
     pub fn shape_at(&self, axis: u32) -> Result<i64> {
@@ -169,6 +327,11 @@ impl Dense {
                 Ok(scales.shape_at(axis)? * 32)
             }
             Self::Q8 { w, .. } | Self::SymQ8 { w, .. } | Self::Qmm { w, .. } => w.shape_at(axis),
+            Self::MmapBf16 { rows, cols, .. } | Self::MmapQ8_0 { rows, cols, .. } => match axis {
+                0 => Ok(*rows),
+                1 => Ok(*cols),
+                _ => Err(bad(format!("axis {axis} out of range for 2-D mmap tensor"))),
+            },
         }
     }
 
@@ -183,6 +346,13 @@ impl Dense {
                 &scales.take(idx, 0)?,
                 &biases.take(idx, 0)?,
             ),
+            Self::MmapQ8_0 {
+                buf,
+                byte_offset,
+                rows,
+                cols,
+            } => mmap_q8_0_gather_rows(idx, buf, *byte_offset, *rows, *cols),
+            Self::MmapBf16 { .. } => self.f32()?.take(idx, 0),
         }
     }
 
@@ -203,6 +373,52 @@ impl Dense {
                 scales: cut(scales)?,
                 biases: cut(biases)?,
             },
+            Self::MmapBf16 {
+                buf,
+                byte_offset,
+                rows,
+                cols,
+            } => {
+                if lo < 0 || lo > hi || hi > *rows {
+                    return Err(bad(format!(
+                        "mmap bf16 row_range {lo}..{hi} out of 0..{rows}"
+                    )));
+                }
+                let shift = (lo as u64)
+                    .checked_mul(*cols as u64)
+                    .and_then(|n| n.checked_mul(2))
+                    .and_then(|b| byte_offset.checked_add(b))
+                    .ok_or_else(|| bad("mmap bf16 row_range offset overflows"))?;
+                Self::MmapBf16 {
+                    buf: buf.clone(),
+                    byte_offset: shift,
+                    rows: hi - lo,
+                    cols: *cols,
+                }
+            }
+            Self::MmapQ8_0 {
+                buf,
+                byte_offset,
+                rows,
+                cols,
+            } => {
+                if lo < 0 || lo > hi || hi > *rows {
+                    return Err(bad(format!(
+                        "mmap q8_0 row_range {lo}..{hi} out of 0..{rows}"
+                    )));
+                }
+                let row_bytes = (*cols as u64 / Q8_0_VALUES as u64) * Q8_0_BYTES as u64;
+                let shift = (lo as u64)
+                    .checked_mul(row_bytes)
+                    .and_then(|b| byte_offset.checked_add(b))
+                    .ok_or_else(|| bad("mmap q8_0 row_range offset overflows"))?;
+                Self::MmapQ8_0 {
+                    buf: buf.clone(),
+                    byte_offset: shift,
+                    rows: hi - lo,
+                    cols: *cols,
+                }
+            }
         })
     }
 
@@ -216,7 +432,9 @@ impl Dense {
             Self::Qmm { w, scales, biases } => {
                 Ok(Some(qmm_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
             }
-            Self::Array(_) | Self::Q8 { .. } => Ok(None),
+            Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
+                Ok(None)
+            }
         }
     }
 
@@ -225,6 +443,7 @@ impl Dense {
             Self::Array(a) => a.nbytes(),
             Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => w.nbytes() + scales.nbytes(),
             Self::Qmm { w, scales, biases } => w.nbytes() + scales.nbytes() + biases.nbytes(),
+            Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => 0,
         }
     }
 }
@@ -304,6 +523,68 @@ pub fn role_resident(scan: &Scan, role: Role) -> Result<u64> {
         acc.checked_add(resident_bytes(role, &loc.info)?)
             .ok_or_else(|| bad("resident bytes overflow u64"))
     })
+}
+
+/// Compact trunk dense tensors eligible for zero-copy mmap (`token_embd.weight`
+/// Q8_0 and `output.weight` BF16 only).
+#[derive(Clone, Default)]
+pub struct MmapDenseSpec {
+    pub token_embd: Option<(Located, i64, i64)>,
+    pub output: Option<(Located, i64, i64)>,
+}
+
+/// Pre-mapped zero-copy dense views created alongside `MmapExpertBank` on the
+/// same shard mappings and residency set.
+#[derive(Default)]
+pub struct MmapDense {
+    pub token_embd: Option<Dense>,
+    pub output: Option<Dense>,
+}
+
+/// Selects eligible `token_embd.weight` (Q8_0) and `output.weight` (BF16)
+/// tensors from `scan` for zero-copy mmap.
+pub fn mmap_dense_spec(scan: &Scan) -> Result<MmapDenseSpec> {
+    let mut spec = MmapDenseSpec::default();
+    if let Some(entry) = scan.tensors.get(TOKEN_EMBD)
+        && entry.role == Role::Dense
+        && entry.loc.info.tensor_type == GgufTensorType::Q8_0
+        && entry.loc.abs_offset()?.is_multiple_of(2)
+        && let [rows, cols] = held_shape(&entry.loc.info)?.as_slice()
+        && *rows > 0
+        && *cols > 0
+        && cols % (Q8_0_VALUES as i64) == 0
+    {
+        spec.token_embd = Some((entry.loc.clone(), *rows, *cols));
+    }
+    if let Some(entry) = scan.tensors.get(OUTPUT)
+        && entry.role == Role::Dense
+        && entry.loc.info.tensor_type == GgufTensorType::BF16
+        && entry.loc.abs_offset()?.is_multiple_of(8)
+        && let [rows, cols] = held_shape(&entry.loc.info)?.as_slice()
+        && *rows > 0
+        && *cols > 0
+        && cols % 4 == 0
+    {
+        spec.output = Some((entry.loc.clone(), *rows, *cols));
+    }
+    Ok(spec)
+}
+
+/// `(resident_saved_bytes, file_bytes)` for the compact dense tensors eligible
+/// for zero-copy mmap in `scan`.
+pub fn mmap_dense_saved_bytes(scan: &Scan) -> Result<(u64, u64)> {
+    let spec = mmap_dense_spec(scan)?;
+    let mut saved = 0u64;
+    let mut file = 0u64;
+    for item in [&spec.token_embd, &spec.output].into_iter().flatten() {
+        saved = saved
+            .checked_add(resident_bytes(Role::Dense, &item.0.info)?)
+            .ok_or_else(|| bad("mmap dense saved bytes overflow u64"))?;
+        file = file
+            .checked_add(item.0.info.data_size()?)
+            .ok_or_else(|| bad("mmap dense file bytes overflow u64"))?;
+    }
+    Ok((saved, file))
 }
 
 /// The held shape: the MLX shape, with every axis but the last folded into
@@ -808,6 +1089,23 @@ impl<'a> Reader<'a> {
         self.plain(name).map(Some)
     }
 
+    fn skip_mmap(&mut self, name: &str, d: &Dense) -> Result<()> {
+        let entry = self
+            .scan
+            .tensors
+            .get(name)
+            .ok_or_else(|| bad(format!("tensor '{name}' missing")))?;
+        let want = held_shape(&entry.loc.info)?;
+        let got = vec![d.shape_at(0)?, d.shape_at(1)?];
+        if want != got {
+            return Err(bad(format!(
+                "mmap tensor '{name}' shape {got:?} != expected {want:?}"
+            )));
+        }
+        self.count += 1;
+        Ok(())
+    }
+
     /// Experts `lo..hi` of a BF16 expert tensor (ggml `{k, rows, E}`) as one
     /// bf16 `[hi - lo, rows, k]` array. Counts `read`, not `bytes`.
     pub fn bf16_experts(&mut self, loc: &Located, lo: usize, hi: usize) -> Result<MxArray> {
@@ -1247,17 +1545,35 @@ pub struct Resident {
 impl Resident {
     /// Trunk tensors (`Role::Dense`). Model thread only.
     pub fn load(scan: &Scan, shards: &ShardSet) -> Result<Self> {
-        let out = Self::read_trunk(scan, shards);
+        Self::load_with_mmap(scan, shards, MmapDense::default())
+    }
+
+    /// Trunk tensors (`Role::Dense`), substituting pre-mapped zero-copy dense
+    /// views for `token_embd` / `output` when provided. Model thread only.
+    pub fn load_with_mmap(scan: &Scan, shards: &ShardSet, mmap_dense: MmapDense) -> Result<Self> {
+        let out = Self::read_trunk(scan, shards, mmap_dense);
         // Release pre-concat temporaries (or partial buffers on error) from MLX's free pool.
         crate::array::clear_cache();
         out
     }
 
-    fn read_trunk(scan: &Scan, shards: &ShardSet) -> Result<Self> {
+    fn read_trunk(scan: &Scan, shards: &ShardSet, mmap_dense: MmapDense) -> Result<Self> {
         let cfg = &scan.cfg;
         let mut r = Reader::new(scan, shards);
-        let token_embd = r.dense(TOKEN_EMBD)?;
-        let output = r.dense(OUTPUT)?;
+        let token_embd = match mmap_dense.token_embd {
+            Some(d) => {
+                r.skip_mmap(TOKEN_EMBD, &d)?;
+                d
+            }
+            None => r.dense(TOKEN_EMBD)?,
+        };
+        let output = match mmap_dense.output {
+            Some(d) => {
+                r.skip_mmap(OUTPUT, &d)?;
+                d
+            }
+            None => r.dense(OUTPUT)?,
+        };
         let output_norm = r.plain("output_norm.weight")?;
         let output_hc = HcWeights::load(&mut r, "output_hc")?;
         let layers = (0..cfg.n_layers)

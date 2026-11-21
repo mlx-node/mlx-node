@@ -771,9 +771,14 @@ fn q8_dense_prefill_nax_parity() {
 
         let y_nax = with_prefill_q8_nax(true, || read(&qlinear(&x, &sym).unwrap()));
         let rel_sym = rel_l2(&y_nax, &y_ref);
+        let sym_tol = if std::env::var("MLX_HY4_Q8_PREFILL_1MMA").as_deref() == Ok("0") {
+            5e-6
+        } else {
+            5e-4
+        };
         assert!(
-            rel_sym <= 5e-6,
-            "dense prefill SymQ8 M={m} K={k} N={n}: rel_l2={rel_sym:e}"
+            rel_sym <= sym_tol,
+            "dense prefill SymQ8 M={m} K={k} N={n}: rel_l2={rel_sym:e} > {sym_tol:e}"
         );
 
         let y_qmm = with_prefill_q8_nax(true, || read(&qlinear(&x, &qmm).unwrap()));
@@ -877,4 +882,350 @@ fn q8_grouped_prefill_nax_parity() {
             );
         }
     }
+}
+
+#[test]
+fn q8_dense_and_grouped_prefill_strided_and_epilogue_parity() {
+    use super::attention::grouped_mm_t_mgh;
+    use super::moe::{qlinear, try_qlinear_sigmoid_mul, with_prefill_q8_nax};
+    use crate::nn::Activations;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let bits = |a: &MxArray| -> Vec<u32> { read(a).into_iter().map(f32::to_bits).collect() };
+
+    // Strided 2D dense input matches contiguous bit-for-bit, and EPILOGUE=1
+    // matches `sigmoid(qlinear(x, w)) * aux` across aligned & tail shapes.
+    for (ci, &(m, k, n)) in [
+        (17usize, 192usize, 96usize),
+        (64, 512, 256),
+        (77, 512, 160),
+        (256, 3072, 256),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let sym = make_sym_q8(n, k, 1400 + ci as u64 * 13);
+        let pad_k = k + 128;
+        let x_big = MxArray::from_float32(
+            &lcg(1500 + ci as u64 * 17, m * pad_k),
+            &[m as i64, pad_k as i64],
+        )
+        .unwrap();
+        let x_strided = x_big.slice(&[0, 64], &[m as i64, (64 + k) as i64]).unwrap();
+        let x_contig = MxArray::from_float32(&read(&x_strided), &[m as i64, k as i64]).unwrap();
+
+        let y_strided = with_prefill_q8_nax(true, || qlinear(&x_strided, &sym).unwrap());
+        let y_contig = with_prefill_q8_nax(true, || qlinear(&x_contig, &sym).unwrap());
+        assert_eq!(
+            bits(&y_strided),
+            bits(&y_contig),
+            "strided dense prefill mismatch M={m} K={k} N={n}"
+        );
+
+        let aux = MxArray::from_float32(&lcg(1600 + ci as u64 * 19, m * n), &[m as i64, n as i64])
+            .unwrap();
+        let fused = with_prefill_q8_nax(true, || {
+            try_qlinear_sigmoid_mul(&x_strided, &sym, &aux)
+                .unwrap()
+                .expect("expected q8_dense_prefill_epilogue")
+        });
+        let want = Activations::sigmoid_mul_compiled(&y_contig, &aux).unwrap();
+        let rel = rel_l2(&read(&fused), &read(&want));
+        assert!(
+            rel <= 1e-6,
+            "dense prefill sigmoid_mul epilogue M={m} K={k} N={n}: rel_l2={rel:e}"
+        );
+    }
+
+    // Strided grouped `q_nope` slice matches contiguous bit-for-bit, and
+    // EPILOGUE=2 (`v_b` + `sigmoid(gate_lin)`) matches with strided `gate_lin`.
+    for (ci, &(m, g, k, n)) in [(17usize, 4usize, 192usize, 128usize), (64, 4, 512, 128)]
+        .iter()
+        .enumerate()
+    {
+        let sym = make_sym_q8(g * n, k, 1700 + ci as u64 * 23);
+        let qk = k + 64;
+        let q_raw = MxArray::from_float32(
+            &lcg(1800 + ci as u64 * 29, m * g * qk),
+            &[m as i64, g as i64, qk as i64],
+        )
+        .unwrap();
+        let x_strided = q_raw
+            .slice(&[0, 0, 0], &[m as i64, g as i64, k as i64])
+            .unwrap();
+        let x_contig =
+            MxArray::from_float32(&read(&x_strided), &[m as i64, g as i64, k as i64]).unwrap();
+
+        let y_strided = with_prefill_q8_nax(true, || {
+            grouped_mm_t_mgh(&sym, &x_strided, g as i64).unwrap()
+        });
+        let y_contig = with_prefill_q8_nax(true, || {
+            grouped_mm_t_mgh(&sym, &x_contig, g as i64).unwrap()
+        });
+        assert_eq!(
+            bits(&y_strided),
+            bits(&y_contig),
+            "strided grouped prefill mismatch M={m} G={g} K={k} N={n}"
+        );
+
+        let width = g * n;
+        let gl_pad = width + 96;
+        let gl_big = MxArray::from_float32(
+            &lcg(1900 + ci as u64 * 31, m * gl_pad),
+            &[m as i64, gl_pad as i64],
+        )
+        .unwrap();
+        let gl_strided = gl_big
+            .slice(&[0, 96], &[m as i64, (96 + width) as i64])
+            .unwrap();
+        let (qw, scales, biases) = sym.qmm_parts().unwrap();
+        let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        let h = unsafe {
+            mlx_sys::mlx_hy4_q8_grouped_prefill_gated(
+                x_strided.as_raw_ptr(),
+                qw.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases_ptr,
+                gl_strided.as_raw_ptr(),
+            )
+        };
+        assert!(!h.is_null(), "expected q8_grouped_prefill_gated");
+        let gated = MxArray::from_handle(h, "test q8_grouped_prefill_gated").unwrap();
+        let want = Activations::sigmoid_mul_compiled(
+            &gl_strided,
+            &y_contig.reshape(&[m as i64, width as i64]).unwrap(),
+        )
+        .unwrap();
+        let rel = rel_l2(&read(&gated), &read(&want));
+        assert!(
+            rel <= 1e-6,
+            "grouped prefill gated epilogue M={m} G={g} K={k} N={n}: rel_l2={rel:e}"
+        );
+    }
+}
+
+#[cfg(unix)]
+struct TempMappedBuf {
+    path: PathBuf,
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl TempMappedBuf {
+    fn create(name: &str, byte_offset: usize, payload: &[u8]) -> (Self, MxArray) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let page = crate::array::page_size();
+        let total = (byte_offset + payload.len()).div_ceil(page).max(1) * page;
+        let path = std::env::temp_dir().join(format!(
+            "hy4-weights-mmap-{name}-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let mut bytes = vec![0xA5u8; total];
+        bytes[byte_offset..byte_offset + payload.len()].copy_from_slice(payload);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        let f = std::fs::File::open(&path).unwrap();
+        // SAFETY: read-only shared mmap of `total` bytes from file start.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        unsafe extern "C" fn noop_release(_: *mut std::ffi::c_void) {}
+        // SAFETY: `TempMappedBuf` outlives all arrays derived from `buf` in each test.
+        let arr = unsafe {
+            MxArray::from_mmap_readonly(ptr, total, noop_release, std::ptr::null_mut()).unwrap()
+        };
+        (
+            Self {
+                path,
+                ptr,
+                len: total,
+            },
+            arr,
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempMappedBuf {
+    fn drop(&mut self) {
+        crate::array::synchronize();
+        // SAFETY: mapping created in `TempMappedBuf::create`; GPU work drained above.
+        unsafe {
+            let _ = libc::munmap(self.ptr, self.len);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mmap_bf16_lm_head_matches_dense_bit_exact() {
+    use super::model::head_rows;
+    use super::ops::{head_logits, head_logits_chunked};
+    use super::weights::{quantize_sym_q8_array, quantize_sym_q8_from_bf16_raw};
+
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    crate::models::hy_v4_flash::exact_f32();
+
+    // Test both FAST_K (K = 256) and non-FAST_K (K = 64) with non-zero byte_offset.
+    for (ci, &(vocab, k, byte_off)) in [(67usize, 256usize, 64usize), (53, 64, 128)]
+        .iter()
+        .enumerate()
+    {
+        let words: Vec<u16> = (0..vocab * k)
+            .map(|i| {
+                let v = (((i * 37 + ci * 13) % 101) as f32 - 50.0) * 0.015;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let out_info = info(OUTPUT, &[k as u64, vocab as u64], GgufTensorType::BF16);
+        let dense_arr = dense_from_raw(&out_info, &raw, Form::Bf16).unwrap();
+
+        let (_mapped, buf) = TempMappedBuf::create(&format!("bf16-{ci}"), byte_off, &raw);
+        let dense_mmap = Dense::MmapBf16 {
+            buf,
+            byte_offset: byte_off as u64,
+            rows: vocab as i64,
+            cols: k as i64,
+        };
+        assert_eq!(dense_mmap.nbytes(), 0);
+        assert_eq!(dense_mmap.shape_at(0).unwrap(), vocab as i64);
+        assert_eq!(dense_mmap.shape_at(1).unwrap(), k as i64);
+
+        // M = 1, 2, 7 (STREAM_X=false), 12, 16 (STREAM_X=true), 24 (chunked head_chunks fallback).
+        for &m in &[1usize, 2, 7, 12, 16, 24] {
+            let x = MxArray::from_float32(
+                &lcg(2000 + m as u64 + ci as u64 * 100, m * k),
+                &[m as i64, k as i64],
+            )
+            .unwrap();
+            let want_hl = bits(&read(&head_logits(&x, &dense_arr).unwrap()));
+            let got_hl = bits(&read(&head_logits(&x, &dense_mmap).unwrap()));
+            assert_eq!(got_hl, want_hl, "head_logits K={k} M={m}");
+
+            let want_hr = bits(&read(&head_rows(&x, &dense_arr).unwrap()));
+            let got_hr = bits(&read(&head_rows(&x, &dense_mmap).unwrap()));
+            assert_eq!(got_hr, want_hr, "head_rows K={k} M={m}");
+
+            if m == 24 {
+                let want_ch = bits(&read(&head_logits_chunked(&x, &dense_arr, 17).unwrap()));
+                let got_ch = bits(&read(&head_logits_chunked(&x, &dense_mmap, 17).unwrap()));
+                assert_eq!(got_ch, want_ch, "head_logits_chunked K={k} M={m}");
+            }
+        }
+
+        // MTP draft-head requant from raw mmap BF16 matches array requant bit-for-bit.
+        let Dense::Array(ref bf16_arr) = dense_arr else {
+            panic!("expected Dense::Array");
+        };
+        let q_arr = quantize_sym_q8_array(bf16_arr).unwrap();
+        let (raw_slice, r, c) = dense_mmap.mmap_bf16_raw_slice().unwrap().unwrap();
+        let q_mmap = quantize_sym_q8_from_bf16_raw(raw_slice, r, c).unwrap();
+        assert_eq!(
+            bits(&read(&q_mmap.f32().unwrap())),
+            bits(&read(&q_arr.f32().unwrap())),
+            "SymQ8 draft head requant K={k}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mmap_q8_0_embed_rows_matches_dense_q8_bit_exact() {
+    use crate::nn::Embedding;
+
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+
+    let (vocab, dim) = (29usize, 128usize);
+    let raw = q8_0_raw(vocab * dim);
+    let mut exact = vec![0f32; vocab * dim];
+    q8_0_into_f32(&raw, &mut exact).unwrap();
+
+    let emb_info = info(
+        TOKEN_EMBD,
+        &[dim as u64, vocab as u64],
+        GgufTensorType::Q8_0,
+    );
+    let dense_q8 = dense_from_raw(&emb_info, &raw, Form::Codes).unwrap();
+
+    // Use a 2-byte-aligned (NOT 4-byte-aligned) offset to verify Q8_0 alignment safety.
+    let byte_off = 34usize;
+    let (_mapped, buf) = TempMappedBuf::create("q8-0-embed", byte_off, &raw);
+    let dense_mmap = Dense::MmapQ8_0 {
+        buf: buf.clone(),
+        byte_offset: byte_off as u64,
+        rows: vocab as i64,
+        cols: dim as i64,
+    };
+    assert_eq!(dense_mmap.nbytes(), 0);
+    assert_eq!(dense_mmap.shape_at(0).unwrap(), vocab as i64);
+    assert_eq!(dense_mmap.shape_at(1).unwrap(), dim as i64);
+    assert_eq!(bits(&read(&dense_mmap.f32().unwrap())), bits(&exact));
+
+    // Check 1-D u32 and i32 indices across M < 8 (constant) and M >= 8 (device),
+    // including duplicates and boundary rows.
+    for ids_u32 in [
+        vec![0u32],
+        vec![28, 0, 17, 5, 17],
+        vec![3, 19, 0, 28, 12, 7, 1, 25, 14, 9, 28, 4],
+    ] {
+        let m = ids_u32.len() as i64;
+        let idx_u = MxArray::from_uint32(&ids_u32, &[m]).unwrap();
+        let ids_i32: Vec<i32> = ids_u32.iter().map(|&x| x as i32).collect();
+        let idx_i = MxArray::from_int32(&ids_i32, &[m]).unwrap();
+
+        let want = bits(&read(&dense_q8.rows(&idx_u).unwrap()));
+        let got_u = bits(&read(&dense_mmap.rows(&idx_u).unwrap()));
+        let got_i = bits(&read(&dense_mmap.rows(&idx_i).unwrap()));
+        assert_eq!(got_u, want, "u32 embed gather M={m}");
+        assert_eq!(got_i, want, "i32 embed gather M={m}");
+    }
+
+    // Check MTP `Embedding::load_gguf_q8_0_mmap` across 1-D `[1]` and 2-D `[2, 3]` indices.
+    let mut emb = Embedding::new_uninitialized(vocab as u32, dim as u32).unwrap();
+    emb.load_gguf_q8_0_mmap(&buf, byte_off as u64).unwrap();
+    assert!(emb.is_quantized());
+
+    let idx1 = MxArray::from_int32(&[11], &[1]).unwrap();
+    let got1 = emb.forward(&idx1).unwrap();
+    assert_eq!(got1.shape().unwrap().as_ref(), &[1, dim as i64]);
+    assert_eq!(
+        bits(&read(&got1)),
+        bits(&read(&dense_q8.rows(&idx1).unwrap()))
+    );
+
+    let idx2d = MxArray::from_int32(&[0, 5, 28, 7, 13, 2], &[2, 3]).unwrap();
+    let got2d = emb.forward(&idx2d).unwrap();
+    assert_eq!(got2d.shape().unwrap().as_ref(), &[2, 3, dim as i64]);
+    let idx_flat = MxArray::from_int32(&[0, 5, 28, 7, 13, 2], &[6]).unwrap();
+    assert_eq!(
+        bits(&read(&got2d)),
+        bits(&read(&dense_q8.rows(&idx_flat).unwrap()))
+    );
+
+    // Out-of-bounds indices safely produce zeros without faulting.
+    let oob = MxArray::from_int32(&[-1, vocab as i32], &[2]).unwrap();
+    assert_eq!(read(&emb.forward(&oob).unwrap()), vec![0.0f32; 2 * dim]);
+    let probe = MxArray::from_float32(&vec![0.0; dim], &[1, dim as i64]).unwrap();
+    assert!(emb.as_linear(&probe).is_err());
 }

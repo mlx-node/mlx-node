@@ -35,6 +35,7 @@ use napi::{Error, Result};
 use super::config::MoeConfig;
 use super::kq_slot;
 use super::scan::{ExpertClass, ExpertLayer, Located};
+use super::weights::{Dense, MmapDense, MmapDenseSpec};
 use crate::array::alloc::{DstPtrs, MetalResidencySet, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
@@ -1913,6 +1914,23 @@ fn run_mmap_prewarm(
 
 pub const RSET_KEEPALIVE_ENV: &str = "MLX_HY4_RSET_KEEPALIVE_MS";
 const DEFAULT_RSET_KEEPALIVE_MS: u64 = 2000;
+/// Keep pinging residency briefly after a turn ends so short inter-turn gaps
+/// stay warm, then go quiet during long idle cooldowns so Metal residency pings
+/// do not fight macOS's VM compressor.
+pub(crate) const RSET_IDLE_GRACE_MS: u64 = 15_000;
+pub(crate) const RSET_NO_TURN_ENDED: u64 = u64::MAX;
+
+pub(crate) fn should_ping_rset(
+    in_turn: bool,
+    last_turn_end_ms: u64,
+    now_ms: u64,
+    grace_ms: u64,
+) -> bool {
+    if in_turn {
+        return true;
+    }
+    last_turn_end_ms != RSET_NO_TURN_ENDED && now_ms.saturating_sub(last_turn_end_ms) <= grace_ms
+}
 
 fn parse_rset_keepalive_ms(val: Option<&str>) -> Option<Duration> {
     let ms = val
@@ -1946,6 +1964,8 @@ fn run_rset_keepalive(
     state: Arc<(Mutex<bool>, Condvar)>,
     interval: Duration,
     origin: Instant,
+    in_turn: Arc<AtomicBool>,
+    last_turn_end_ms: Arc<AtomicU64>,
     last_keepalive_ms: Arc<AtomicU64>,
 ) {
     let (mtx, cv) = &*state;
@@ -1959,9 +1979,17 @@ fn run_rset_keepalive(
             break;
         }
         drop(stopped);
-        rset.request();
-        let ms = origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        last_keepalive_ms.store(ms, Ordering::Release);
+        let now_ms = origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if should_ping_rset(
+            in_turn.load(Ordering::Acquire),
+            last_turn_end_ms.load(Ordering::Acquire),
+            now_ms,
+            RSET_IDLE_GRACE_MS,
+        ) {
+            rset.request();
+            let ms = origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            last_keepalive_ms.store(ms, Ordering::Release);
+        }
         stopped = lock(mtx);
     }
 }
@@ -1973,12 +2001,13 @@ struct MmapLayer {
 
 struct MmapExpertBank {
     // Drop order is load-bearing: join keepalive and pre-warm threads,
-    // release Metal residency set, drop MTL::Buffer arrays (`layers`), then
-    // release shard Arcs (`_shards`).
+    // release Metal residency set, drop MTL::Buffer arrays (`layers`,
+    // `_extra_bufs`), then release shard Arcs (`_shards`).
     _rset_keepalive: Option<RsetKeepaliveHandle>,
     _warm: Option<MmapWarmHandle>,
     rset: Option<Arc<MetalResidencySet>>,
     layers: Vec<MmapLayer>,
+    _extra_bufs: Vec<MxArray>,
     _shards: Vec<Arc<MmapShard>>,
     layer_to_idx: Vec<Option<usize>>,
     uses: [AtomicUsize; 2],
@@ -1987,6 +2016,7 @@ struct MmapExpertBank {
     mapped_bytes: u64,
     in_turn: Arc<AtomicBool>,
     origin: Instant,
+    last_turn_end_ms: Arc<AtomicU64>,
     last_keepalive_ms: Arc<AtomicU64>,
     prefill_ran: AtomicBool,
 }
@@ -2015,10 +2045,104 @@ impl MmapExpertBank {
     }
 
     fn set_in_turn(&self, active: bool) {
-        self.in_turn.store(active, Ordering::Release);
+        let prev = self.in_turn.swap(active, Ordering::AcqRel);
         if active {
             self.keep_residency_alive();
+        } else if prev {
+            self.last_turn_end_ms
+                .store(self.elapsed_ms(), Ordering::Release);
         }
+    }
+
+    #[cfg(unix)]
+    fn map_located(
+        shards: &mut Vec<Arc<MmapShard>>,
+        shard_map: &mut HashMap<usize, usize>,
+        paths: &[PathBuf],
+        page: usize,
+        loc: &Located,
+        min_align: u64,
+        raw_spans: &mut Vec<(usize, u64, u64)>,
+        mapped_bytes: &mut u64,
+    ) -> Result<(MxArray, u64)> {
+        let page_u64 = page as u64;
+        let shard_slot = match shard_map.get(&loc.shard) {
+            Some(&idx) => idx,
+            None => {
+                let path = paths
+                    .get(loc.shard)
+                    .ok_or_else(|| bad(format!("shard {} path missing", loc.shard)))?;
+                let opened = Arc::new(MmapShard::open(path, page)?);
+                let idx = shards.len();
+                shards.push(opened);
+                shard_map.insert(loc.shard, idx);
+                idx
+            }
+        };
+        let shard = &shards[shard_slot];
+        let abs_off = loc.abs_offset()?;
+        let tensor_bytes = loc.info.data_size()?;
+        let end_off = abs_off
+            .checked_add(tensor_bytes)
+            .ok_or_else(|| bad(format!("'{}' end offset overflows", loc.info.name)))?;
+        if end_off > shard.file_len {
+            return Err(bad(format!(
+                "'{}' ends at {end_off}, past shard length {}",
+                loc.info.name, shard.file_len
+            )));
+        }
+        let aligned_off = abs_off & !(page_u64 - 1);
+        let intra_off = abs_off - aligned_off;
+        if !intra_off.is_multiple_of(min_align) {
+            return Err(bad(format!(
+                "'{}' offset {abs_off} is not {min_align}-byte aligned",
+                loc.info.name
+            )));
+        }
+        let aligned_len_u64 = intra_off
+            .checked_add(tensor_bytes)
+            .and_then(|n| n.checked_add(page_u64 - 1))
+            .map(|n| n & !(page_u64 - 1))
+            .ok_or_else(|| bad(format!("'{}' aligned length overflows", loc.info.name)))?;
+        let aligned_end = aligned_off
+            .checked_add(aligned_len_u64)
+            .ok_or_else(|| bad(format!("'{}' aligned end overflows", loc.info.name)))?;
+        if aligned_end > shard.mapped_len as u64 {
+            return Err(bad(format!(
+                "'{}' aligned range ends at {aligned_end}, past mapping {}",
+                loc.info.name, shard.mapped_len
+            )));
+        }
+        let aligned_off_usize = usize::try_from(aligned_off)
+            .map_err(|_| bad(format!("'{}' offset overflows usize", loc.info.name)))?;
+        let aligned_len = usize::try_from(aligned_len_u64)
+            .map_err(|_| bad(format!("'{}' length overflows usize", loc.info.name)))?;
+        // SAFETY: `aligned_off + aligned_len <= shard.mapped_len`.
+        let aligned_ptr = unsafe { shard.ptr.add(aligned_off_usize) };
+        let raw_ctx = Arc::into_raw(Arc::clone(shard)) as *mut std::ffi::c_void;
+        // SAFETY: `shard` owns a read-only `MAP_SHARED` mapping that stays
+        // alive until `release_mmap_shard` decrements the refcount passed in
+        // `raw_ctx`; on `Err`, `from_mmap_readonly` never calls `release_fn`.
+        let buf = match unsafe {
+            MxArray::from_mmap_readonly(
+                aligned_ptr.cast(),
+                aligned_len,
+                release_mmap_shard,
+                raw_ctx,
+            )
+        } {
+            Ok(arr) => arr,
+            Err(err) => {
+                // SAFETY: `raw_ctx` ownership was not taken on `Err`.
+                unsafe { drop(Arc::from_raw(raw_ctx.cast::<MmapShard>())) };
+                return Err(err);
+            }
+        };
+        *mapped_bytes = mapped_bytes
+            .checked_add(tensor_bytes)
+            .ok_or_else(|| bad("mmap bytes overflow u64"))?;
+        raw_spans.push((loc.shard, abs_off, end_off));
+        Ok((buf, intra_off))
     }
 
     #[cfg(unix)]
@@ -2030,12 +2154,12 @@ impl MmapExpertBank {
         paths: &[PathBuf],
         warm_budget_bytes: u64,
         force_prewarm: bool,
-    ) -> Result<Self> {
+        dense_spec: &MmapDenseSpec,
+    ) -> Result<(Self, MmapDense)> {
         if n_experts == 0 || u32::try_from(n_experts).is_err() {
             return Err(bad(format!("invalid mmap expert count {n_experts}")));
         }
         let page = os_page_size()?;
-        let page_u64 = page as u64;
         let slot_bytes = [
             geos[0].iter().map(ProjGeo::file_bytes).sum(),
             geos[1].iter().map(ProjGeo::file_bytes).sum(),
@@ -2048,8 +2172,9 @@ impl MmapExpertBank {
         let mut shards: Vec<Arc<MmapShard>> = Vec::new();
         let mut shard_map: HashMap<usize, usize> = HashMap::new();
         let mut layers = Vec::with_capacity(n_moe_layers);
+        let mut extra_bufs: Vec<MxArray> = Vec::new();
         let mut layer_to_idx = vec![None; layout.of_layer.len()];
-        let mut raw_spans: Vec<(usize, u64, u64)> = Vec::with_capacity(n_moe_layers * 3);
+        let mut raw_spans: Vec<(usize, u64, u64)> = Vec::with_capacity(n_moe_layers * 3 + 2);
         let mut mapped_bytes = 0u64;
 
         for (il, opt) in layout.of_layer.iter().enumerate() {
@@ -2064,86 +2189,20 @@ impl MmapExpertBank {
             let tensors = check_layer(il, exp, class, geo, n_experts)?;
             let mut projs_vec = Vec::with_capacity(3);
             for (loc, g) in tensors.iter().zip(geo) {
-                let shard_slot = match shard_map.get(&loc.shard) {
-                    Some(&idx) => idx,
-                    None => {
-                        let path = paths
-                            .get(loc.shard)
-                            .ok_or_else(|| bad(format!("shard {} path missing", loc.shard)))?;
-                        let opened = Arc::new(MmapShard::open(path, page)?);
-                        let idx = shards.len();
-                        shards.push(opened);
-                        shard_map.insert(loc.shard, idx);
-                        idx
-                    }
-                };
-                let shard = &shards[shard_slot];
-                let abs_off = loc.abs_offset()?;
-                let tensor_bytes = loc.info.data_size()?;
-                let end_off = abs_off
-                    .checked_add(tensor_bytes)
-                    .ok_or_else(|| bad(format!("'{}' end offset overflows", loc.info.name)))?;
-                if end_off > shard.file_len {
-                    return Err(bad(format!(
-                        "'{}' ends at {end_off}, past shard length {}",
-                        loc.info.name, shard.file_len
-                    )));
-                }
-                let aligned_off = abs_off & !(page_u64 - 1);
-                let intra_off = abs_off - aligned_off;
                 let min_align = match g.format {
                     KQuantFormat::Q6K => 2u64,
                     _ => 4u64,
                 };
-                if !intra_off.is_multiple_of(min_align) {
-                    return Err(bad(format!(
-                        "'{}' offset {abs_off} is not {min_align}-byte aligned for {:?}",
-                        loc.info.name, g.format
-                    )));
-                }
-                let aligned_len_u64 = intra_off
-                    .checked_add(tensor_bytes)
-                    .and_then(|n| n.checked_add(page_u64 - 1))
-                    .map(|n| n & !(page_u64 - 1))
-                    .ok_or_else(|| bad(format!("'{}' aligned length overflows", loc.info.name)))?;
-                let aligned_end = aligned_off
-                    .checked_add(aligned_len_u64)
-                    .ok_or_else(|| bad(format!("'{}' aligned end overflows", loc.info.name)))?;
-                if aligned_end > shard.mapped_len as u64 {
-                    return Err(bad(format!(
-                        "'{}' aligned range ends at {aligned_end}, past mapping {}",
-                        loc.info.name, shard.mapped_len
-                    )));
-                }
-                let aligned_off_usize = usize::try_from(aligned_off)
-                    .map_err(|_| bad(format!("'{}' offset overflows usize", loc.info.name)))?;
-                let aligned_len = usize::try_from(aligned_len_u64)
-                    .map_err(|_| bad(format!("'{}' length overflows usize", loc.info.name)))?;
-                // SAFETY: `aligned_off + aligned_len <= shard.mapped_len`.
-                let aligned_ptr = unsafe { shard.ptr.add(aligned_off_usize) };
-                let raw_ctx = Arc::into_raw(Arc::clone(shard)) as *mut std::ffi::c_void;
-                // SAFETY: `shard` owns a read-only `MAP_SHARED` mapping that stays
-                // alive until `release_mmap_shard` decrements the refcount passed in
-                // `raw_ctx`; on `Err`, `from_mmap_readonly` never calls `release_fn`.
-                let buf = match unsafe {
-                    MxArray::from_mmap_readonly(
-                        aligned_ptr.cast(),
-                        aligned_len,
-                        release_mmap_shard,
-                        raw_ctx,
-                    )
-                } {
-                    Ok(arr) => arr,
-                    Err(err) => {
-                        // SAFETY: `raw_ctx` ownership was not taken on `Err`.
-                        unsafe { drop(Arc::from_raw(raw_ctx.cast::<MmapShard>())) };
-                        return Err(err);
-                    }
-                };
-                mapped_bytes = mapped_bytes
-                    .checked_add(tensor_bytes)
-                    .ok_or_else(|| bad("mmap expert bytes overflow u64"))?;
-                raw_spans.push((loc.shard, abs_off, end_off));
+                let (buf, intra_off) = Self::map_located(
+                    &mut shards,
+                    &mut shard_map,
+                    paths,
+                    page,
+                    loc,
+                    min_align,
+                    &mut raw_spans,
+                    &mut mapped_bytes,
+                )?;
                 projs_vec.push(MmapProj {
                     buf,
                     base_offset: intra_off,
@@ -2160,22 +2219,69 @@ impl MmapExpertBank {
             layers.push(MmapLayer { ci, projs });
         }
 
+        let mut mmap_dense = MmapDense::default();
+        if let Some((loc, rows, cols)) = &dense_spec.token_embd {
+            let (buf, intra_off) = Self::map_located(
+                &mut shards,
+                &mut shard_map,
+                paths,
+                page,
+                loc,
+                2,
+                &mut raw_spans,
+                &mut mapped_bytes,
+            )?;
+            extra_bufs.push(buf.clone());
+            mmap_dense.token_embd = Some(Dense::MmapQ8_0 {
+                buf,
+                byte_offset: intra_off,
+                rows: *rows,
+                cols: *cols,
+            });
+        }
+        if let Some((loc, rows, cols)) = &dense_spec.output {
+            let (buf, intra_off) = Self::map_located(
+                &mut shards,
+                &mut shard_map,
+                paths,
+                page,
+                loc,
+                8,
+                &mut raw_spans,
+                &mut mapped_bytes,
+            )?;
+            extra_bufs.push(buf.clone());
+            mmap_dense.output = Some(Dense::MmapBf16 {
+                buf,
+                byte_offset: intra_off,
+                rows: *rows,
+                cols: *cols,
+            });
+        }
+
         let buf_refs: Vec<&MxArray> = layers
             .iter()
             .flat_map(|l| l.projs.iter().map(|p| &p.buf))
+            .chain(extra_bufs.iter())
             .collect();
         let rset = MetalResidencySet::create(&buf_refs).map(Arc::new);
         let origin = Instant::now();
+        let in_turn = Arc::new(AtomicBool::new(false));
+        let last_turn_end_ms = Arc::new(AtomicU64::new(RSET_NO_TURN_ENDED));
         let last_keepalive_ms = Arc::new(AtomicU64::new(0));
         let rset_keepalive = match (&rset, rset_keepalive_interval()) {
             (Some(rset_ref), Some(interval)) => {
                 let state = Arc::new((Mutex::new(false), Condvar::new()));
                 let rset_c = Arc::clone(rset_ref);
                 let state_c = Arc::clone(&state);
+                let turn_c = Arc::clone(&in_turn);
+                let end_c = Arc::clone(&last_turn_end_ms);
                 let last_c = Arc::clone(&last_keepalive_ms);
                 let worker = std::thread::Builder::new()
                     .name("hy4-rset-keepalive".into())
-                    .spawn(move || run_rset_keepalive(rset_c, state_c, interval, origin, last_c))
+                    .spawn(move || {
+                        run_rset_keepalive(rset_c, state_c, interval, origin, turn_c, end_c, last_c)
+                    })
                     .map_err(|e| bad(format!("spawn rset keepalive thread: {e}")))?;
                 Some(RsetKeepaliveHandle {
                     state,
@@ -2187,7 +2293,6 @@ impl MmapExpertBank {
 
         // Skip background pread pre-warming in auto mode when Metal residency
         // sets already pin mmap pages, preventing idle page-cache pressure.
-        let in_turn = Arc::new(AtomicBool::new(false));
         let spawn_warm =
             warm_budget_bytes > 0 && !raw_spans.is_empty() && (force_prewarm || rset.is_none());
         let warm = if spawn_warm {
@@ -2220,22 +2325,27 @@ impl MmapExpertBank {
             None
         };
 
-        Ok(Self {
-            _rset_keepalive: rset_keepalive,
-            _warm: warm,
-            rset,
-            layers,
-            _shards: shards,
-            layer_to_idx,
-            uses: [AtomicUsize::new(0), AtomicUsize::new(0)],
-            slot_bytes,
-            cache_slots,
-            mapped_bytes,
-            in_turn,
-            origin,
-            last_keepalive_ms,
-            prefill_ran: AtomicBool::new(false),
-        })
+        Ok((
+            Self {
+                _rset_keepalive: rset_keepalive,
+                _warm: warm,
+                rset,
+                layers,
+                _extra_bufs: extra_bufs,
+                _shards: shards,
+                layer_to_idx,
+                uses: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                slot_bytes,
+                cache_slots,
+                mapped_bytes,
+                in_turn,
+                origin,
+                last_turn_end_ms,
+                last_keepalive_ms,
+                prefill_ran: AtomicBool::new(false),
+            },
+            mmap_dense,
+        ))
     }
 
     #[cfg(not(unix))]
@@ -2247,7 +2357,8 @@ impl MmapExpertBank {
         _paths: &[PathBuf],
         _warm_budget_bytes: u64,
         _force_prewarm: bool,
-    ) -> Result<Self> {
+        _dense_spec: &MmapDenseSpec,
+    ) -> Result<(Self, MmapDense)> {
         Err(bad("mmap expert bank requires Unix"))
     }
 }
@@ -2400,6 +2511,30 @@ impl KqBank {
         warm_budget_bytes: u64,
         force_prewarm: bool,
     ) -> Result<Self> {
+        let (bank, _) = Self::new_mmap_with_dense(
+            pool,
+            moe,
+            experts,
+            paths,
+            warm_budget_bytes,
+            force_prewarm,
+            &MmapDenseSpec::default(),
+        )?;
+        Ok(bank)
+    }
+
+    /// Zero-copy mmap expert bank that also maps `token_embd.weight` /
+    /// `output.weight` on the same shard mappings and registers them in the
+    /// shared `MetalResidencySet`.
+    pub fn new_mmap_with_dense(
+        pool: IoPool,
+        moe: &MoeConfig,
+        experts: &[Option<ExpertLayer>],
+        paths: &[PathBuf],
+        warm_budget_bytes: u64,
+        force_prewarm: bool,
+        dense_spec: &MmapDenseSpec,
+    ) -> Result<(Self, MmapDense)> {
         let n = moe.n_experts;
         let classes: Vec<Option<ExpertClass>> = experts
             .iter()
@@ -2407,7 +2542,7 @@ impl KqBank {
             .collect();
         let layout = ClassLayout::new(&classes)?;
         let geos = [geometry(moe, CLASSES[0])?, geometry(moe, CLASSES[1])?];
-        let mmap = MmapExpertBank::new(
+        let (mmap, dense) = MmapExpertBank::new(
             n,
             &layout,
             &geos,
@@ -2415,26 +2550,30 @@ impl KqBank {
             paths,
             warm_budget_bytes,
             force_prewarm,
+            dense_spec,
         )?;
-        Ok(Self {
-            direct: OnceLock::from(ResidentBank::Mmap(mmap)),
-            inner: Mutex::new(Inner {
-                ahead: [Vec::new(), Vec::new()],
-                inflight: Vec::new(),
-                ahead_left: [Vec::new(), Vec::new()],
-                classes: Vec::new(),
-                in_turn: false,
-                retired: Vec::new(),
-            }),
-            pool: Arc::new(pool),
-            n_experts: n,
-            n_used: moe.n_used,
-            layout,
-            split: AtomicBool::new(true),
-            prefetch: AtomicBool::new(true),
-            decode_prefetch: AtomicBool::new(decode_prefetch_enabled()),
-            stats: Mutex::new([KqStats::default(); 2]),
-        })
+        Ok((
+            Self {
+                direct: OnceLock::from(ResidentBank::Mmap(mmap)),
+                inner: Mutex::new(Inner {
+                    ahead: [Vec::new(), Vec::new()],
+                    inflight: Vec::new(),
+                    ahead_left: [Vec::new(), Vec::new()],
+                    classes: Vec::new(),
+                    in_turn: false,
+                    retired: Vec::new(),
+                }),
+                pool: Arc::new(pool),
+                n_experts: n,
+                n_used: moe.n_used,
+                layout,
+                split: AtomicBool::new(true),
+                prefetch: AtomicBool::new(true),
+                decode_prefetch: AtomicBool::new(decode_prefetch_enabled()),
+                stats: Mutex::new([KqStats::default(); 2]),
+            },
+            dense,
+        ))
     }
 
     /// Transitions an idle streamed bank (`in_turn == false`, after GPU sync)
@@ -2587,6 +2726,22 @@ impl KqBank {
     #[cfg(test)]
     pub(crate) fn has_rset_keepalive(&self) -> bool {
         matches!(self.direct.get(), Some(ResidentBank::Mmap(m)) if m._rset_keepalive.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extra_mmap_bufs(&self) -> usize {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => m._extra_bufs.len(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_turn_end_ms(&self) -> Option<u64> {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => Some(m.last_turn_end_ms.load(Ordering::Acquire)),
+            _ => None,
+        }
     }
 
     /// Records `count` routed-expert uses for `layer` in direct or mmap mode.
@@ -3027,6 +3182,8 @@ impl KqBank {
             Some(ResidentBank::Mmap(mmap)) => {
                 if mmap.in_turn.swap(false, Ordering::AcqRel) {
                     crate::array::synchronize();
+                    mmap.last_turn_end_ms
+                        .store(mmap.elapsed_ms(), Ordering::Release);
                 }
                 return Ok(());
             }

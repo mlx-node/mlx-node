@@ -30,11 +30,12 @@ pub(crate) fn mla_sliding_prefill_nax_enabled() -> bool {
 
 /// Sliding-window NAX prefill attention reading directly from a circular
 /// `WindowRing` (`is_ring = true`) or linear key window (`is_ring = false`)
-/// without an `[S, window]` index table. Returns `Ok(None)` when Metal/NAX
-/// or geometry is unsupported.
+/// without an `[S, window]` index table. Accepts combined `q [S, H, 576]`
+/// (`q_pe = None`) or split `(q [S, H, 512], q_pe = Some([S, H, 64]))`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_sliding_sink_attention_prefill(
     q: &MxArray,
+    q_pe: Option<&MxArray>,
     keys: &MxArray,
     sinks: &MxArray,
     v_width: i64,
@@ -59,6 +60,14 @@ pub(crate) fn try_sliding_sink_attention_prefill(
     } else {
         q.astype(DType::Float32)?
     };
+    let qpef = match q_pe {
+        Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
+        Some(pe) => Some(pe.astype(DType::Float32)?),
+        None => None,
+    };
+    let qpe_ptr = qpef
+        .as_ref()
+        .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
     let sf = if sinks.dtype()? == DType::Float32 {
         sinks.clone()
     } else {
@@ -68,6 +77,7 @@ pub(crate) fn try_sliding_sink_attention_prefill(
     let handle = unsafe {
         mlx_sys::mlx_hy4_mla_prefill_sliding_nax(
             qf.as_raw_ptr(),
+            qpe_ptr,
             keys.as_raw_ptr(),
             sf.as_raw_ptr(),
             vw,
@@ -176,6 +186,32 @@ pub fn gather_sink_attention_for(
 ) -> Result<MxArray> {
     gather_rows_in(
         q,
+        None,
+        KeyRows::Whole(keys),
+        idx,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+        kind,
+    )
+}
+
+/// `gather_sink_attention_for` accepting split `(q_abs [s, h, v_width], q_pe [s, h, d_rope])`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_sink_attention_split_q_for(
+    q: &MxArray,
+    q_pe: Option<&MxArray>,
+    keys: &MxArray,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    kind: RowKind,
+) -> Result<MxArray> {
+    gather_rows_in(
+        q,
+        q_pe,
         KeyRows::Whole(keys),
         idx,
         v_width,
@@ -198,6 +234,7 @@ pub fn gather_sink_attention_rows(
 ) -> Result<MxArray> {
     gather_rows_in(
         q,
+        None,
         keys,
         idx,
         v_width,
@@ -220,6 +257,32 @@ pub fn gather_sink_attention_rows_for(
 ) -> Result<MxArray> {
     gather_rows_in(
         q,
+        None,
+        keys,
+        idx,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+        kind,
+    )
+}
+
+/// `gather_sink_attention_rows_for` accepting split `(q_abs, q_pe)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_sink_attention_rows_split_q_for(
+    q: &MxArray,
+    q_pe: Option<&MxArray>,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    kind: RowKind,
+) -> Result<MxArray> {
+    gather_rows_in(
+        q,
+        q_pe,
         keys,
         idx,
         v_width,
@@ -242,6 +305,7 @@ pub(crate) fn gather_sink_attention_in(
 ) -> Result<MxArray> {
     gather_rows_in(
         q,
+        None,
         KeyRows::Whole(keys),
         idx,
         v_width,
@@ -257,6 +321,7 @@ pub(crate) fn gather_sink_attention_in(
 #[allow(clippy::too_many_arguments)]
 fn gather_rows_in(
     q: &MxArray,
+    q_pe: Option<&MxArray>,
     keys: KeyRows<'_>,
     idx: &MxArray,
     v_width: i64,
@@ -265,18 +330,23 @@ fn gather_rows_in(
     budget: usize,
     kind: RowKind,
 ) -> Result<MxArray> {
-    let (s, h, d, kmax) = validate_inputs(q, keys, idx, v_width, sinks)?;
+    let (s, h, d, kmax) = validate_inputs(q, q_pe, keys, idx, v_width, sinks)?;
     let idx = if idx.dtype()? == DType::Int32 {
         idx.clone()
     } else {
         idx.astype(DType::Int32)?
     };
+    let qf = if q.dtype()? == DType::Float32 {
+        q.clone()
+    } else {
+        q.astype(DType::Float32)?
+    };
+    let qpef = match q_pe {
+        Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
+        Some(pe) => Some(pe.astype(DType::Float32)?),
+        None => None,
+    };
     if let Ok(vw) = i32::try_from(v_width) {
-        let qf = if q.dtype()? == DType::Float32 {
-            q.clone()
-        } else {
-            q.astype(DType::Float32)?
-        };
         let sf = if sinks.dtype()? == DType::Float32 {
             sinks.clone()
         } else {
@@ -287,10 +357,14 @@ fn gather_rows_in(
             KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
         };
         if kind == RowKind::Prefill && s >= PREFILL_NAX_MIN_ROWS && mla_prefill_nax_enabled() {
-            // SAFETY: all handles are live arrays owned by this call; k1_ptr is null for Whole.
+            let qpe_ptr = qpef
+                .as_ref()
+                .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+            // SAFETY: all handles are live arrays owned by this call; k1_ptr/qpe_ptr may be null.
             let handle = unsafe {
                 mlx_sys::mlx_hy4_mla_prefill_nax(
                     qf.as_raw_ptr(),
+                    qpe_ptr,
                     k0_ptr,
                     k1_ptr,
                     idx.as_raw_ptr(),
@@ -303,10 +377,14 @@ fn gather_rows_in(
                 return MxArray::from_handle(handle, "hy_v4_flash mla_prefill_nax");
             }
         }
+        let q_whole = match &qpef {
+            Some(pe) => MxArray::concatenate(&qf, pe, -1)?,
+            None => qf.clone(),
+        };
         // SAFETY: all handles are live arrays owned by this call; k1_ptr is null for Whole.
         let handle = unsafe {
             mlx_sys::mlx_hy4_mla_sink_attention(
-                qf.as_raw_ptr(),
+                q_whole.as_raw_ptr(),
                 k0_ptr,
                 k1_ptr,
                 idx.as_raw_ptr(),
@@ -318,8 +396,17 @@ fn gather_rows_in(
         if !handle.is_null() {
             return MxArray::from_handle(handle, "hy_v4_flash mla_sink_attention");
         }
+        return gather_rows_mlx(
+            &q_whole, keys, &idx, s, h, d, kmax, v_width, sinks, scale, budget,
+        );
     }
-    gather_rows_mlx(q, keys, &idx, s, h, d, kmax, v_width, sinks, scale, budget)
+    let q_whole = match &qpef {
+        Some(pe) => MxArray::concatenate(&qf, pe, -1)?,
+        None => qf,
+    };
+    gather_rows_mlx(
+        &q_whole, keys, &idx, s, h, d, kmax, v_width, sinks, scale, budget,
+    )
 }
 
 #[cfg(test)]
@@ -331,7 +418,7 @@ pub(crate) fn gather_rows_reference(
     sinks: &MxArray,
     scale: f32,
 ) -> Result<MxArray> {
-    let (s, h, d, kmax) = validate_inputs(q, keys, idx, v_width, sinks)?;
+    let (s, h, d, kmax) = validate_inputs(q, None, keys, idx, v_width, sinks)?;
     let idx = idx.astype(DType::Int32)?;
     gather_rows_mlx(
         q,
@@ -350,16 +437,34 @@ pub(crate) fn gather_rows_reference(
 
 fn validate_inputs(
     q: &MxArray,
+    q_pe: Option<&MxArray>,
     keys: KeyRows<'_>,
     idx: &MxArray,
     v_width: i64,
     sinks: &MxArray,
 ) -> Result<(i64, i64, i64, i64)> {
-    let &[s, h, d] = dims(q)?.as_slice() else {
+    let &[s, h, qd] = dims(q)?.as_slice() else {
         return Err(bad(format!(
             "queries must be [s, h, d], got {:?}",
             dims(q)?
         )));
+    };
+    let d = match q_pe {
+        Some(pe) => {
+            let &[ps, ph, rd] = dims(pe)?.as_slice() else {
+                return Err(bad(format!(
+                    "q_pe must be [s, h, d_rope], got {:?}",
+                    dims(pe)?
+                )));
+            };
+            if ps != s || ph != h || rd <= 0 || qd != v_width {
+                return Err(bad(format!(
+                    "split queries [{s}, {h}, {qd}] + [{ps}, {ph}, {rd}] incompatible with v_width {v_width}"
+                )));
+            }
+            qd + rd
+        }
+        None => qd,
     };
     let kd = keys.width()?;
     if kd != d {

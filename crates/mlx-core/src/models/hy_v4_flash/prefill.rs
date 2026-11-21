@@ -80,6 +80,14 @@ pub trait Runner<S: Seq> {
         want: Want,
         cancel: &dyn Fn(usize) -> bool,
     ) -> Result<Self::Out>;
+
+    /// Notifies the runner of a multi-chunk prefill schedule covering
+    /// `prompt[from..]` with absolute chunk `ends` so lookahead prefetch can
+    /// overlap chunk `k+1` I/O with chunk `k`.
+    fn begin_prefill(&self, _prompt: &[u32], _from: usize, _ends: &[usize]) {}
+
+    /// Ends the active prefill schedule and cancels any unused lookahead work.
+    fn end_prefill(&self) {}
 }
 
 impl Snapshot for Mark {
@@ -135,6 +143,14 @@ impl Runner<Session> for Model {
         cancel: &dyn Fn(usize) -> bool,
     ) -> Result<Output> {
         self.forward(seq, ids, RowKind::Prefill, want, Some(cancel), None)
+    }
+
+    fn begin_prefill(&self, prompt: &[u32], from: usize, ends: &[usize]) {
+        self.begin_prefill_engram(prompt, from, ends);
+    }
+
+    fn end_prefill(&self) {
+        self.clear_prefill_engram();
     }
 }
 
@@ -461,8 +477,17 @@ impl<R> Driver<'_, R> {
         R: Runner<S>,
     {
         let states = self.grid.states(from, prompt);
+        let ends = self.grid.ends(from, prompt);
+        self.runner.begin_prefill(prompt, from, &ends);
+        struct PrefillScope<'a, S: Seq, R: Runner<S>>(&'a R, std::marker::PhantomData<fn(&S)>);
+        impl<S: Seq, R: Runner<S>> Drop for PrefillScope<'_, S, R> {
+            fn drop(&mut self) {
+                self.0.end_prefill();
+            }
+        }
+        let _scope = PrefillScope(self.runner, std::marker::PhantomData);
         let mut start = from;
-        for end in self.grid.ends(from, prompt) {
+        for end in ends {
             let last = end == prompt.len();
             let want = Want {
                 logits: if last { Logits::Last } else { Logits::None },

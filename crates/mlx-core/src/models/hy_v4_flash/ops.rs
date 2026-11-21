@@ -915,7 +915,8 @@ pub fn router_logits(x: &MxArray, router: &Dense) -> Result<MxArray> {
 }
 
 /// Fused `routed_up(routed_latent) + shared_down(swiglu(shared_gu, limit))` for
-/// SymQ8 decode (`1..=8` rows). Returns `Ok(None)` when unsupported.
+/// SymQ8 decode (`1..=8` rows) and NAX prefill (`> 8` rows, `K % 64 == 0`).
+/// Returns `Ok(None)` when unsupported.
 pub(crate) fn try_q8_dual_down_add(
     routed_latent: &MxArray,
     shared_gu: &MxArray,
@@ -941,12 +942,15 @@ pub(crate) fn try_q8_dual_down_add(
     }
     let m = routed_latent.shape_at(0)?;
     let k = routed_latent.shape_at(1)?;
-    if !(1..=8).contains(&m)
+    if m < 1
         || k < 32
         || k % 32 != 0
         || shared_gu.shape_at(0)? != m
         || shared_gu.shape_at(1)? != 2 * k
     {
+        return Ok(None);
+    }
+    if m > 8 && (k < 64 || k % 64 != 0 || !super::moe::prefill_q8_nax_enabled()) {
         return Ok(None);
     }
     let rlf = as_f32(routed_latent)?;
@@ -1212,22 +1216,106 @@ pub fn route_pair(
     ))
 }
 
-/// Single-dispatch BF16-weight / F32-accumulation LM head for 1..=16 rows.
-pub(crate) fn try_bf16_lm_head(xf: &MxArray, w: &MxArray) -> Result<Option<MxArray>> {
-    if xf.ndim()? != 2 || w.ndim()? != 2 || w.dtype()? != DType::BFloat16 {
+/// Single-dispatch BF16-weight / F32-accumulation LM head for 1..=16 rows,
+/// supporting both resident `Dense::Array(bf16)` and zero-copy `Dense::MmapBf16`.
+pub(crate) fn try_bf16_lm_head(xf: &MxArray, head: &Dense) -> Result<Option<MxArray>> {
+    if xf.ndim()? != 2 {
         return Ok(None);
     }
     let rows = xf.shape_at(0)?;
     let k = xf.shape_at(1)?;
-    if !(1..=16).contains(&rows) || k <= 0 || k % 4 != 0 || w.shape_at(1)? != k {
+    if !(1..=16).contains(&rows) || k <= 0 || k % 4 != 0 {
         return Ok(None);
     }
-    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
-    let h = unsafe { mlx_sys::mlx_hy4_bf16_lm_head(xf.as_raw_ptr(), w.as_raw_ptr()) };
+    let h = match head {
+        Dense::Array(w) => {
+            if w.ndim()? != 2 || w.dtype()? != DType::BFloat16 || w.shape_at(1)? != k {
+                return Ok(None);
+            }
+            // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+            unsafe { mlx_sys::mlx_hy4_bf16_lm_head(xf.as_raw_ptr(), w.as_raw_ptr()) }
+        }
+        Dense::MmapBf16 {
+            buf,
+            byte_offset,
+            rows: vocab,
+            cols,
+        } => {
+            if *cols != k {
+                return Ok(None);
+            }
+            let Ok(v_i32) = i32::try_from(*vocab) else {
+                return Ok(None);
+            };
+            // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+            unsafe {
+                mlx_sys::mlx_hy4_bf16_lm_head_mmap(
+                    xf.as_raw_ptr(),
+                    buf.as_raw_ptr(),
+                    *byte_offset,
+                    v_i32,
+                )
+            }
+        }
+        _ => return Ok(None),
+    };
     if h.is_null() {
         return Ok(None);
     }
     Ok(Some(MxArray::from_handle(h, "hy_v4_flash bf16_lm_head")?))
+}
+
+/// Gathers token rows from a zero-copy GGUF Q8_0 mmap buffer directly into
+/// `[..ids.shape, dim]` f32 on Metal. Returns `Ok(None)` when Metal or the
+/// arguments are unsupported.
+pub(crate) fn gguf_q8_0_embed_rows(
+    ids: &MxArray,
+    buf: &MxArray,
+    byte_offset: u64,
+    vocab: i64,
+    dim: i64,
+) -> Result<Option<MxArray>> {
+    let (Ok(v_i32), Ok(d_i32)) = (i32::try_from(vocab), i32::try_from(dim)) else {
+        return Ok(None);
+    };
+    if v_i32 <= 0 || d_i32 <= 0 || d_i32 % 32 != 0 {
+        return Ok(None);
+    }
+    let orig_shape = dims(ids)?;
+    let mut out_shape = orig_shape.clone();
+    out_shape.push(dim);
+    let n: i64 = orig_shape.iter().copied().product();
+    if n == 0 {
+        return Ok(Some(MxArray::zeros(&out_shape, Some(DType::Float32))?));
+    }
+    let flat = if orig_shape.len() == 1 {
+        ids.clone()
+    } else {
+        ids.reshape(&[n])?
+    };
+    let flat = match flat.dtype()? {
+        DType::Int32 | DType::Uint32 => flat,
+        _ => flat.astype(DType::Int32)?,
+    };
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_gguf_q8_0_embed_rows(
+            flat.as_raw_ptr(),
+            buf.as_raw_ptr(),
+            byte_offset,
+            v_i32,
+            d_i32,
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    let out = MxArray::from_handle(h, "hy_v4_flash gguf_q8_0_embed_rows")?;
+    if orig_shape.len() == 1 {
+        Ok(Some(out))
+    } else {
+        Ok(Some(out.reshape(&out_shape)?))
+    }
 }
 
 /// f32 logits `[s, vocab]` of `x [s, d]`; see `head_logits_chunked`.
@@ -1236,8 +1324,9 @@ pub fn head_logits(x: &MxArray, head: &Dense) -> Result<MxArray> {
 }
 
 /// f32 logits of `x [s, d]`. A `Qmm` head is one `quantized_matmul`; a BF16
-/// `Dense::Array` with 1..=16 rows runs through the native BF16 LM head kernel;
-/// any other head is cast to f32 `chunk` vocab rows at a time (`head_chunks`).
+/// `Dense::Array` or `Dense::MmapBf16` with 1..=16 rows runs through the native
+/// BF16 LM head kernel; any other head is cast to f32 `chunk` vocab rows at a
+/// time (`head_chunks`).
 pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxArray> {
     if chunk <= 0 {
         return Err(bad(format!("head chunk {chunk} must be > 0")));
@@ -1246,9 +1335,7 @@ pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxAr
     if head.is_qmm() {
         return head.mm_t(&xf);
     }
-    if let Dense::Array(w) = head
-        && let Some(logits) = try_bf16_lm_head(&xf, w)?
-    {
+    if let Some(logits) = try_bf16_lm_head(&xf, head)? {
         return Ok(logits);
     }
     head_chunks(head, chunk, xf.shape_at(0)?, |w| {

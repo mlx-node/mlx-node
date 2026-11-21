@@ -55,6 +55,9 @@ use crate::utils::gguf_kquant::KQuantFormat;
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 ff + latent)`.
 pub const FFN_CHUNK_ROWS: usize = 256;
 pub const PREFILL_FFN_CHUNK_ROWS: usize = 2048;
+/// Prefill slices at or below this row count bypass full-expert indirect GEMM
+/// in mmap mode and route through deduped decode slices.
+const MMAP_PREFILL_TINY_TAIL_MAX: usize = 32;
 const PREFILL_SUBGROUP_EXPERTS: usize = 128;
 
 pub fn prefill_ffn_chunk_rows() -> usize {
@@ -291,6 +294,50 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
         }
     }
     linear(x, w)
+}
+
+/// `sigmoid(x · wᵀ) * mul_in` fused in the Q8 NAX prefill epilogue.
+/// Returns `Ok(None)` when the kernel is unavailable or `M < 12`.
+pub(crate) fn try_qlinear_sigmoid_mul(
+    x: &MxArray,
+    w: &Dense,
+    mul_in: &MxArray,
+) -> Result<Option<MxArray>> {
+    if let Some((qw, scales, biases)) = w.qmm_parts()
+        && x.ndim()? == 2
+        && x.shape_at(0)? >= 12
+        && prefill_q8_nax_enabled()
+    {
+        let xf = if x.dtype()? == DType::Float32 {
+            x.clone()
+        } else {
+            x.astype(DType::Float32)?
+        };
+        let mf = if mul_in.dtype()? == DType::Float32 {
+            mul_in.clone()
+        } else {
+            mul_in.astype(DType::Float32)?
+        };
+        let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_q8_dense_prefill_epilogue(
+                xf.as_raw_ptr(),
+                qw.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases_ptr,
+                mf.as_raw_ptr(),
+                1,
+            )
+        };
+        if !h.is_null() {
+            return Ok(Some(MxArray::from_handle(
+                h,
+                "hy_v4_flash q8_dense_prefill_sigmoid_mul",
+            )?));
+        }
+    }
+    Ok(None)
 }
 
 /// `f(row)` for every row of `x [n, ..]`, concatenated on axis 0.
@@ -1524,10 +1571,9 @@ impl Moe {
         weights: &MxArray,
         inverse: &MxArray,
     ) -> Result<Option<MxArray>> {
-        let df = if down.dtype()? == DType::Float32 {
-            down.clone()
-        } else {
-            down.astype(DType::Float32)?
+        let df = match down.dtype()? {
+            DType::Float16 | DType::Float32 => down.clone(),
+            _ => down.astype(DType::Float32)?,
         };
         let wf = if weights.dtype()? == DType::Float32 {
             weights.clone()
@@ -1746,7 +1792,8 @@ impl Moe {
         weights: &MxArray,
         projs: &[MmapProj; 3],
     ) -> Result<MxArray> {
-        const DECODE_CHUNK_ROWS: usize = 32;
+        // Keep rows * top <= 128 so `mlx_hy4_gguf_routed_decode` activates slot dedup.
+        let chunk_rows = (128 / self.moe.n_used.max(1)).clamp(1, 32);
         let down_bits = Self::gguf_down_bits(projs)?;
         let rows = z.shape_at(0)? as usize;
         let latent = z.shape_at(1)?;
@@ -1771,11 +1818,11 @@ impl Moe {
             )?
             .ok_or_else(|| bad("gguf_routed_decode unavailable for mmap experts"))
         };
-        if rows <= DECODE_CHUNK_ROWS {
+        if rows <= chunk_rows {
             return run_one(z, slots, weights);
         }
-        let mut parts = Vec::with_capacity(rows.div_ceil(DECODE_CHUNK_ROWS));
-        for (lo, hi) in chunks(rows, DECODE_CHUNK_ROWS) {
+        let mut parts = Vec::with_capacity(rows.div_ceil(chunk_rows));
+        for (lo, hi) in chunks(rows, chunk_rows) {
             let zc = z.slice(&[lo as i64, 0], &[hi as i64, latent])?;
             let sc = slots.slice(&[lo as i64, 0], &[hi as i64, k])?;
             let wc = weights.slice(&[lo as i64, 0], &[hi as i64, k])?;
@@ -1792,10 +1839,10 @@ impl Moe {
         projs: &[MmapProj; 3],
     ) -> Result<MxArray> {
         let down_bits = Self::gguf_down_bits(projs)?;
-        if !prefill_indirect_gu_enabled() {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        if !prefill_indirect_gu_enabled() || (rows as usize) <= MMAP_PREFILL_TINY_TAIL_MAX {
             return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
         }
-        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
         let k = self.moe.n_used as i64;
         let n_experts = self.moe.n_experts;
         let pairs = rows * k;
@@ -1831,7 +1878,12 @@ impl Moe {
             if let Some(out) = Self::kq_sorted_combine_arr(&down, gpu_weights, &inv)? {
                 return Ok(out);
             }
-            return down
+            let down_f32 = if down.dtype()? == DType::Float32 {
+                down
+            } else {
+                down.astype(DType::Float32)?
+            };
+            return down_f32
                 .take(&inv.reshape(&[pairs])?, 0)?
                 .reshape(&[rows, k, latent])?
                 .mul(&gpu_weights.reshape(&[rows, k, 1])?)?
@@ -1861,7 +1913,7 @@ impl Moe {
                 ids_asc.len()
             )));
         }
-        if !prefill_indirect_gu_enabled() {
+        if !prefill_indirect_gu_enabled() || (rows as usize) <= MMAP_PREFILL_TINY_TAIL_MAX {
             return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
         }
         let mut counts = vec![0usize; n_experts];
@@ -1918,7 +1970,13 @@ impl Moe {
         if let Some(out) = Self::kq_sorted_combine_gpu(&down, gpu_weights, &back, rows, k as i64)? {
             return Ok(out);
         }
-        down.take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+        let down_f32 = if down.dtype()? == DType::Float32 {
+            down
+        } else {
+            down.astype(DType::Float32)?
+        };
+        down_f32
+            .take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
             .reshape(&[rows, k as i64, latent])?
             .mul(&gpu_weights.reshape(&[rows, k as i64, 1])?)?
             .sum(Some(&[1]), Some(false))
@@ -2372,6 +2430,23 @@ impl LayerFfn {
         self.forward_traced_with_next(w, h, kind, need_routes, None)
     }
 
+    fn prefill_chunk_rows(&self) -> usize {
+        if let Ok(v) = std::env::var("MLX_HY4_PREFILL_FFN_CHUNK")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            return n.max(FFN_CHUNK_ROWS);
+        }
+        match &self.kind {
+            FfnKind::Dense => super::store::MMAP_PREFILL_CHUNK_MAX.max(PREFILL_FFN_CHUNK_ROWS),
+            FfnKind::Moe(m) => match &m.experts {
+                ExpertSource::Bank(b) if b.is_mmap() => {
+                    super::store::MMAP_PREFILL_CHUNK_MAX.max(PREFILL_FFN_CHUNK_ROWS)
+                }
+                _ => PREFILL_FFN_CHUNK_ROWS,
+            },
+        }
+    }
+
     pub fn forward_traced_with_next(
         &self,
         w: &LayerWeights,
@@ -2381,7 +2456,7 @@ impl LayerFfn {
         next: Option<(&LayerFfn, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let chunk = match kind {
-            RowKind::Prefill => prefill_ffn_chunk_rows(),
+            RowKind::Prefill => self.prefill_chunk_rows(),
             RowKind::Decode => FFN_CHUNK_ROWS,
         };
         self.forward_chunked_traced_with_next(
@@ -2550,7 +2625,7 @@ impl LayerFfn {
         next: Option<(&LayerFfn, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let chunk = match kind {
-            RowKind::Prefill => prefill_ffn_chunk_rows(),
+            RowKind::Prefill => self.prefill_chunk_rows(),
             RowKind::Decode => FFN_CHUNK_ROWS,
         };
         let shape = dims(x)?;

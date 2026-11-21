@@ -43,7 +43,10 @@ use super::moe::ExpertSource;
 use super::mtp::SEEDS;
 use super::rows::{EngramRows, F8Table, PrefetchHandle};
 use super::scan::{Role, Scan};
-use super::weights::{Form, Resident, form, resident_bytes, role_resident};
+use super::weights::{
+    Form, MmapDense, Resident, form, mmap_dense_saved_bytes, mmap_dense_spec, resident_bytes,
+    role_resident,
+};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::deepseek_v41::store::POOL_LIMIT;
 use crate::moe_stream::budget::{
@@ -67,13 +70,15 @@ pub const MMAP_PREWARM_ENV: &str = "MLX_HY4_MMAP_PREWARM";
 pub const SHARD1_NOCACHE_ENV: &str = "MLX_HY4_SHARD1_NOCACHE";
 /// Lowers the admitted prefill chunk (a multiple of 256).
 pub const CHUNK_ENV: &str = "MLX_HY4_PREFILL_CHUNK";
+/// Overrides the mmap prefill chunk cap (a multiple of 256; default [`MMAP_PREFILL_CHUNK_MAX`]).
+pub const MMAP_CHUNK_ENV: &str = "MLX_HY4_MMAP_PREFILL_CHUNK";
 /// `0` leaves the MTP layer out of the admission.
 pub const MTP_ENV: &str = "MLX_HY4_MTP";
 /// Prefill chunk rows the admission may pick, largest first.
 pub const CHUNKS: [usize; 3] = [8192, 4096, 2048];
 /// Maximum prefill chunk rows for mmap expert residency so peak Metal scratch
 /// stays below macOS's working set limit.
-pub const MMAP_PREFILL_CHUNK_MAX: usize = 2048;
+pub const MMAP_PREFILL_CHUNK_MAX: usize = 4096;
 /// The context ladder's floor.
 pub const MIN_CONTEXT: usize = 16_384;
 /// Most lanes a load admits.
@@ -852,9 +857,40 @@ pub fn pick_mmap(
     reserve_override: Option<u64>,
     max_memory: Option<u64>,
 ) -> (usize, MmapDecision) {
+    pick_mmap_with_max(
+        mode,
+        metal_available,
+        has_experts,
+        p,
+        ctx,
+        host,
+        own,
+        dense_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        reserve_override,
+        max_memory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn pick_mmap_with_max(
+    mode: MmapMode,
+    metal_available: bool,
+    has_experts: bool,
+    p: &Profile,
+    ctx: usize,
+    host: &HostMemory,
+    own: &Own,
+    dense_bytes: u64,
+    mapped_bytes: u64,
+    chunk_max: usize,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+) -> (usize, MmapDecision) {
     let margin = direct_margin(reserve_override);
     let kv_allowance_initial = direct_kv_allowance(p, ctx);
-    let cap = ctx.min(MMAP_PREFILL_CHUNK_MAX);
+    let cap = ctx.min(chunk_max);
     let eval = |chunk: usize| {
         let rows = chunk.min(cap);
         let scratch = direct_scratch_bytes(p, rows, ctx);
@@ -873,18 +909,24 @@ pub fn pick_mmap(
         );
         (rows, gate)
     };
-    let mut last = None;
+    let mut cands = Vec::with_capacity(CHUNKS.len() + 1);
+    if !CHUNKS.contains(&chunk_max) {
+        cands.push(chunk_max);
+    }
     for &chunk in &CHUNKS {
-        if chunk > MMAP_PREFILL_CHUNK_MAX {
-            continue;
+        if chunk <= chunk_max {
+            cands.push(chunk);
         }
+    }
+    let mut last = None;
+    for chunk in cands {
         let res = eval(chunk);
         if res.1.admitted {
             return res;
         }
         last = Some(res);
     }
-    last.unwrap_or_else(|| eval(MMAP_PREFILL_CHUNK_MAX))
+    last.unwrap_or_else(|| eval(chunk_max))
 }
 
 /// Selected expert residency mode at load.
@@ -921,9 +963,46 @@ pub fn select_expert_mode(
     max_memory: Option<u64>,
     cache_cap: Option<u64>,
 ) -> Result<ExpertResidency> {
+    select_expert_mode_for(
+        mmap,
+        direct,
+        metal_available,
+        p,
+        ctx,
+        host,
+        own,
+        dense_bytes,
+        dense_bytes,
+        direct_expert_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        reserve_override,
+        max_memory,
+        cache_cap,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn select_expert_mode_for(
+    mmap: MmapMode,
+    direct: DirectMode,
+    metal_available: bool,
+    p: &Profile,
+    ctx: usize,
+    host: &HostMemory,
+    own: &Own,
+    dense_bytes: u64,
+    mmap_dense_bytes: u64,
+    direct_expert_bytes: u64,
+    mapped_bytes: u64,
+    mmap_chunk_max: usize,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+    cache_cap: Option<u64>,
+) -> Result<ExpertResidency> {
     let has_experts = direct_expert_bytes > 0 && mapped_bytes > 0;
     let try_mmap = |mode: MmapMode| {
-        pick_mmap(
+        pick_mmap_with_max(
             mode,
             metal_available,
             has_experts,
@@ -931,8 +1010,9 @@ pub fn select_expert_mode(
             ctx,
             host,
             own,
-            dense_bytes,
+            mmap_dense_bytes,
             mapped_bytes,
+            mmap_chunk_max,
             reserve_override,
             max_memory,
         )
@@ -1156,6 +1236,19 @@ pub fn chunk_cap(raw: Option<&str>) -> Result<Option<usize>> {
     }
 }
 
+/// `MLX_HY4_MMAP_PREFILL_CHUNK`: unset or blank = [`MMAP_PREFILL_CHUNK_MAX`].
+pub fn mmap_prefill_chunk_max(raw: Option<&str>) -> Result<usize> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(MMAP_PREFILL_CHUNK_MAX);
+    };
+    match v.parse::<usize>() {
+        Ok(c) if c >= CHUNK_ALIGN && c.is_multiple_of(CHUNK_ALIGN) => Ok(c),
+        _ => Err(bad(format!(
+            "{MMAP_CHUNK_ENV}={v:?}: expected a multiple of {CHUNK_ALIGN}"
+        ))),
+    }
+}
+
 /// How many cache slots the bank gets.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CachePlan {
@@ -1188,6 +1281,7 @@ pub struct Options {
     pub direct: DirectMode,
     pub mmap: MmapMode,
     pub mmap_prewarm: MmapMode,
+    pub mmap_chunk_max: usize,
 }
 
 impl Options {
@@ -1210,6 +1304,7 @@ impl Options {
             direct: direct_mode(std::env::var(DIRECT_ENV).ok().as_deref())?,
             mmap: mmap_mode(std::env::var(MMAP_ENV).ok().as_deref())?,
             mmap_prewarm: mmap_prewarm_mode(std::env::var(MMAP_PREWARM_ENV).ok().as_deref())?,
+            mmap_chunk_max: mmap_prefill_chunk_max(std::env::var(MMAP_CHUNK_ENV).ok().as_deref())?,
         })
     }
 }
@@ -1948,6 +2043,8 @@ impl Store {
                 staging: usize,
             },
         }
+        let (mmap_dense_saved, mmap_dense_file) = mmap_dense_saved_bytes(&scan)?;
+        let mmap_dense_bytes = base.dense.saturating_sub(mmap_dense_saved);
         let (lanes, ctx, admitted, admission, direct_budget, bank_init) = match (
             &limits, &opts.plan,
         ) {
@@ -1956,11 +2053,11 @@ impl Store {
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
                 let direct_expert_bytes = sizes.direct_expert_bytes();
-                let mapped_bytes = mmap_expert_bytes(&scan)?;
+                let mapped_bytes = mmap_expert_bytes(&scan)?.saturating_add(mmap_dense_file);
                 let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
                 // SAFETY: pure process-wide Metal availability probe.
                 let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
-                let selected = select_expert_mode(
+                let selected = select_expert_mode_for(
                     opts.mmap,
                     opts.direct,
                     metal_available,
@@ -1969,8 +2066,10 @@ impl Store {
                     &h,
                     &own,
                     base.dense,
+                    mmap_dense_bytes,
                     direct_expert_bytes,
                     mapped_bytes,
+                    opts.mmap_chunk_max,
                     reserve_override,
                     opts.max_memory,
                     l.cache_cap,
@@ -2199,8 +2298,14 @@ impl Store {
         // lowers the chunk the driver runs
         let rows = admitted as u64;
         let chunk = opts.chunk_cap.map_or(admitted, |c| admitted.min(c));
+        let is_mmap = matches!(bank_init, BankInit::Mmap { .. });
         let size = ModelSize {
             ctx: ctx as u64,
+            dense: if is_mmap {
+                mmap_dense_bytes
+            } else {
+                base.dense
+            },
             ..base
         };
         let allow_cache = shard_page_cache(
@@ -2209,35 +2314,45 @@ impl Store {
         );
         let shards = Arc::new(ShardSet::open_with_cache(&scan.paths, &allow_cache)?);
         let t_bank = Instant::now();
-        let is_mmap = matches!(bank_init, BankInit::Mmap { .. });
-        let bank = match bank_init {
+        let (bank, mmap_dense) = match bank_init {
             BankInit::Mmap {
                 warm_budget,
                 force_prewarm,
-            } => Arc::new(KqBank::new_mmap(
-                IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
-                &scan.cfg.moe,
-                scan.trunk_experts(),
-                &scan.paths,
-                warm_budget,
-                force_prewarm,
-            )?),
-            BankInit::Direct => Arc::new(KqBank::new_direct(
-                IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
-                &scan.cfg.moe,
-                scan.trunk_experts(),
-            )?),
-            BankInit::Streamed { cache, staging } => Arc::new(KqBank::new(
-                IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
-                &scan.cfg.moe,
-                scan.trunk_experts(),
-                cache,
-                staging,
-            )?),
+            } => {
+                let dense_spec = mmap_dense_spec(&scan)?;
+                let (b, d) = KqBank::new_mmap_with_dense(
+                    IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
+                    &scan.cfg.moe,
+                    scan.trunk_experts(),
+                    &scan.paths,
+                    warm_budget,
+                    force_prewarm,
+                    &dense_spec,
+                )?;
+                (Arc::new(b), d)
+            }
+            BankInit::Direct => (
+                Arc::new(KqBank::new_direct(
+                    IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
+                    &scan.cfg.moe,
+                    scan.trunk_experts(),
+                )?),
+                MmapDense::default(),
+            ),
+            BankInit::Streamed { cache, staging } => (
+                Arc::new(KqBank::new(
+                    IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
+                    &scan.cfg.moe,
+                    scan.trunk_experts(),
+                    cache,
+                    staging,
+                )?),
+                MmapDense::default(),
+            ),
         };
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let built = (|| -> Result<_> {
-            let resident = Resident::load(&scan, &shards)?;
+            let resident = Resident::load_with_mmap(&scan, &shards, mmap_dense)?;
             let (read, bytes) = (resident.read, resident.bytes);
             let table = Arc::new(F8Table::open_in(
                 Arc::clone(&shards),

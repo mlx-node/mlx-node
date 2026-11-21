@@ -24,14 +24,14 @@ use super::batch::{MIN_Q8_ROWS, Wave};
 use super::cache::{LatentBuf, LayerCache, WindowKeys, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
-use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear};
+use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear, try_qlinear_sigmoid_mul};
 use super::ops::{
     fast_rope_with_pos, rms_norm, rope_inv_freqs, rope_positions_f32, try_mla_prep_q_kv,
     try_q8_grouped_k192_rope,
 };
 use super::paged::{SlotMap, planes, write_latent, write_latent_split};
 use super::sparse::{
-    KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for,
+    KeyRows, gather_sink_attention_rows_split_q_for, gather_sink_attention_split_q_for,
     mla_sliding_prefill_nax_enabled, try_sliding_sink_attention_prefill,
 };
 use super::stats::{Phase, prof_end, prof_start};
@@ -238,8 +238,10 @@ pub struct Projected {
     pub x: MxArray,
     /// `rms(q_a·x)·q_a_norm` `[n, q_lora]`.
     pub qr: MxArray,
-    /// Absorbed queries `[n, H, kv_lora + rope]` f32.
+    /// Absorbed queries `[n, H, kv_lora + rope]` f32, or `[n, H, kv_lora]` when `q_pe` is `Some`.
     pub q: MxArray,
+    /// Separate RoPE query tail `[n, H, rope]` f32 when prefill skips concatenating `q`.
+    pub(crate) q_pe: Option<MxArray>,
     /// Latent rows `[n, kv_lora + rope]` (f16 when produced by fused prep, else f32).
     pub kv: MxArray,
     /// Pre-split contiguous `[n, half]` f16 K/V halves for paged indexed writes.
@@ -255,6 +257,11 @@ impl Projected {
             x: wave.owner_rows(&self.x, owner)?,
             qr: wave.owner_rows(&self.qr, owner)?,
             q: wave.owner_rows(&self.q, owner)?,
+            q_pe: self
+                .q_pe
+                .as_ref()
+                .map(|pe| wave.owner_rows(pe, owner))
+                .transpose()?,
             kv: wave.owner_rows(&self.kv, owner)?,
             kv_split: self
                 .kv_split
@@ -388,6 +395,17 @@ impl Mla {
         pos_arr: &MxArray,
         split_kv: bool,
     ) -> Result<Projected> {
+        self.project_normed_with_pos_split_q(w, x, pos_arr, split_kv, false)
+    }
+
+    pub(crate) fn project_normed_with_pos_split_q(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        pos_arr: &MxArray,
+        split_kv: bool,
+        split_q: bool,
+    ) -> Result<Projected> {
         let g = &self.g;
         let n = x.shape_at(0)?;
         if pos_arr.ndim()? != 1 || pos_arr.shape_at(0)? != n {
@@ -458,12 +476,12 @@ impl Mla {
         };
 
         let q_raw = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
-        let q = if (1..=16).contains(&n)
+        let (q, q_pe) = if (1..=16).contains(&n)
             && nope == 192
             && let Some(fused_q) =
                 try_q8_grouped_k192_rope(&q_raw, &w.k_b, heads, pos_arr, &self.inv_freqs)?
         {
-            fused_q
+            (fused_q, None)
         } else {
             let q_nope = q_raw.slice(&[0, 0, 0], &[n, heads, nope])?;
             let q_pe = fast_rope_with_pos(
@@ -472,12 +490,17 @@ impl Mla {
                 pos_arr,
             )?;
             let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
-            MxArray::concatenate(&q_abs, &q_pe, -1)?
+            if split_q && n >= 16 && kv_lora == 512 && rd == 64 {
+                (q_abs, Some(q_pe))
+            } else {
+                (MxArray::concatenate(&q_abs, &q_pe, -1)?, None)
+            }
         };
         Ok(Projected {
             x,
             qr,
             q,
+            q_pe,
             kv,
             kv_split,
             gate_lin,
@@ -505,8 +528,20 @@ impl Mla {
         pos_arr: &MxArray,
         split_kv: bool,
     ) -> Result<Projected> {
+        self.project_normed_timed_with_pos_split_q(w, x, pos_arr, split_kv, false)
+    }
+
+    /// `project_normed_with_pos_split_q` under the attention-projection clock.
+    pub(crate) fn project_normed_timed_with_pos_split_q(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        pos_arr: &MxArray,
+        split_kv: bool,
+        split_q: bool,
+    ) -> Result<Projected> {
         let tp = prof_start();
-        let p = self.project_normed_with_pos_split(w, x, pos_arr, split_kv)?;
+        let p = self.project_normed_with_pos_split_q(w, x, pos_arr, split_kv, split_q)?;
         prof_end_projected(tp, &p)?;
         Ok(p)
     }
@@ -529,38 +564,70 @@ impl Mla {
         let heads = g.n_heads as i64;
         let width = heads * g.head_v as i64;
         if let Some(gl) = gate_lin
-            && (1..=16).contains(&n)
             && let Some((qw, scales, biases)) = w.v_b.qmm_parts()
             && o_lat.ndim()? == 3
             && o_lat.shape_at(1)? == heads
         {
-            let xf = if o_lat.dtype()? == DType::Float32 {
-                o_lat.clone()
-            } else {
-                o_lat.astype(DType::Float32)?
-            };
-            let glf = if gl.dtype()? == DType::Float32 {
-                gl.clone()
-            } else {
-                gl.astype(DType::Float32)?
-            };
-            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
-            // SAFETY: all handles are live arrays owned by this call.
-            let h = unsafe {
-                mlx_sys::mlx_hy4_q8_grouped_decode(
-                    xf.as_raw_ptr(),
-                    qw.as_raw_ptr(),
-                    scales.as_raw_ptr(),
-                    biases_ptr,
-                    glf.as_raw_ptr(),
-                )
-            };
-            if !h.is_null() {
-                let gated = MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode_gated")?;
-                return qlinear(&gated, &w.output);
+            if (1..=16).contains(&n) {
+                let xf = if o_lat.dtype()? == DType::Float32 {
+                    o_lat.clone()
+                } else {
+                    o_lat.astype(DType::Float32)?
+                };
+                let glf = if gl.dtype()? == DType::Float32 {
+                    gl.clone()
+                } else {
+                    gl.astype(DType::Float32)?
+                };
+                let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+                // SAFETY: all handles are live arrays owned by this call.
+                let h = unsafe {
+                    mlx_sys::mlx_hy4_q8_grouped_decode(
+                        xf.as_raw_ptr(),
+                        qw.as_raw_ptr(),
+                        scales.as_raw_ptr(),
+                        biases_ptr,
+                        glf.as_raw_ptr(),
+                    )
+                };
+                if !h.is_null() {
+                    let gated = MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode_gated")?;
+                    return qlinear(&gated, &w.output);
+                }
+            } else if n > 16 && prefill_q8_grouped_nax_enabled() {
+                let xf = if o_lat.dtype()? == DType::Float32 {
+                    o_lat.clone()
+                } else {
+                    o_lat.astype(DType::Float32)?
+                };
+                let glf = if gl.dtype()? == DType::Float32 {
+                    gl.clone()
+                } else {
+                    gl.astype(DType::Float32)?
+                };
+                let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+                // SAFETY: all handles are live arrays owned by this call.
+                let h = unsafe {
+                    mlx_sys::mlx_hy4_q8_grouped_prefill_gated(
+                        xf.as_raw_ptr(),
+                        qw.as_raw_ptr(),
+                        scales.as_raw_ptr(),
+                        biases_ptr,
+                        glf.as_raw_ptr(),
+                    )
+                };
+                if !h.is_null() {
+                    let gated = MxArray::from_handle(h, "hy_v4_flash q8_grouped_prefill_gated")?;
+                    return qlinear(&gated, &w.output);
+                }
             }
         }
         let o = grouped_mm_t_mgh(&w.v_b, o_lat, heads)?.reshape(&[n, width])?;
+        if gate_lin.is_none()
+            && let Some(gated) = try_qlinear_sigmoid_mul(x, &w.gate, &o)?
+        {
+            return qlinear(&gated, &w.output);
+        }
         let gate_lin = match gate_lin {
             Some(gl) => gl.clone(),
             None => qlinear(x, &w.gate)?,
@@ -705,6 +772,7 @@ impl Mla {
             };
             if let Some(o) = try_sliding_sink_attention_prefill(
                 &p.q,
+                p.q_pe.as_ref(),
                 k_ref,
                 &w.sinks,
                 self.g.kv_lora as i64,
@@ -724,8 +792,9 @@ impl Mla {
             WindowKeys::Linear { keys, first } => (keys, false, *first),
         };
         let idx = cached_window_idx(is_ring, start, n, param, window)?;
-        let o = gather_sink_attention_for(
+        let o = gather_sink_attention_split_q_for(
             &p.q,
+            p.q_pe.as_ref(),
             k_ref,
             &idx,
             self.g.kv_lora as i64,
@@ -757,8 +826,9 @@ impl Mla {
         let idx = ix.indexer.select(ix.weights, call, ix.state)?;
         prof_end(Phase::Indexer, tp, &[&idx])?;
         let tp = prof_start();
-        let o = gather_sink_attention_for(
+        let o = gather_sink_attention_split_q_for(
             &p.q,
+            p.q_pe.as_ref(),
             buf.rows()?,
             &idx,
             self.g.kv_lora as i64,
@@ -805,8 +875,9 @@ impl Mla {
         prof_end(Phase::Indexer, tp, &[&slots])?;
         let tp = prof_start();
         let (k, v) = planes(pool.adapter, layer)?;
-        let o = gather_sink_attention_rows_for(
+        let o = gather_sink_attention_rows_split_q_for(
             &p.q,
+            p.q_pe.as_ref(),
             KeyRows::Split(&k, &v),
             &slots,
             self.g.kv_lora as i64,
@@ -896,12 +967,24 @@ impl Mla {
 }
 
 fn prof_end_projected(tp: Option<std::time::Instant>, p: &Projected) -> Result<()> {
-    match (&p.kv_split, &p.gate_lin) {
-        (Some((k0, k1)), Some(g)) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, k0, k1, g]),
-        (Some((k0, k1)), None) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, k0, k1]),
-        (None, Some(g)) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g]),
-        (None, None) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv]),
+    let mut refs: Vec<&MxArray> = Vec::with_capacity(7);
+    refs.push(&p.q);
+    if let Some(pe) = &p.q_pe {
+        refs.push(pe);
     }
+    refs.push(&p.x);
+    refs.push(&p.qr);
+    match &p.kv_split {
+        Some((k0, k1)) => {
+            refs.push(k0);
+            refs.push(k1);
+        }
+        None => refs.push(&p.kv),
+    }
+    if let Some(g) = &p.gate_lin {
+        refs.push(g);
+    }
+    prof_end(Phase::AttnProj, tp, &refs)
 }
 
 /// Positions `start..start + n` of the rows of `h [n, ..]`.

@@ -406,14 +406,19 @@ impl Block {
         owners: &mut dyn Owners,
     ) -> Result<MxArray> {
         let split_kv = owners.is_paged() && self.mla.geometry().attn == Attn::Indexed;
+        let split_q = wave.kind() == RowKind::Prefill
+            && wave.rows() >= 16
+            && self.mla.geometry().kv_lora == 512
+            && self.mla.geometry().rope_dim == 64;
         let p = match pos_f32 {
             Some(pos) => self
                 .mla
-                .project_normed_timed_with_pos_split(&w.attn, x_norm, pos, split_kv)?,
+                .project_normed_timed_with_pos_split_q(&w.attn, x_norm, pos, split_kv, split_q)?,
             None => {
                 let pos = super::ops::rope_positions_f32(&wave.positions())?;
-                self.mla
-                    .project_normed_timed_with_pos_split(&w.attn, x_norm, &pos, split_kv)?
+                self.mla.project_normed_timed_with_pos_split_q(
+                    &w.attn, x_norm, &pos, split_kv, split_q,
+                )?
             }
         };
         let mut outs = Vec::with_capacity(wave.owners());

@@ -293,28 +293,17 @@ inline void hy4_indexer_score_prefill_nax_impl(
     dot_h.clear();
 
     STEEL_PRAGMA_UNROLL
-    for (int d = 0; d < 128; d += 32) {
-      mlx::steel::NAXTile<float, 1, 2> q_f32;
+    for (int d = 0; d < 128; d += 64) {
+      mlx::steel::NAXTile<half, 1, 4> q_h;
       if (valid_s == 16) {
-        q_f32.load(q_ptr + d, q_ld);
+        q_h.load(q_ptr + d, q_ld);
       } else {
-        q_f32.load_rows(q_ptr + d, q_ld, valid_s);
+        q_h.load_rows(q_ptr + d, q_ld, valid_s);
       }
-      mlx::steel::NAXTile<half, 1, 2> q_hi;
-      mlx::steel::NAXTile<half, 1, 2> q_lo;
-      STEEL_PRAGMA_UNROLL
-      for (short e = 0; e < mlx::steel::NAXTile<float, 1, 2>::kElemsPerTile; ++e) {
-        const float v = q_f32.elems()[e];
-        const half hi = half(v);
-        q_hi.elems()[e] = hi;
-        q_lo.elems()[e] = half(v - float(hi));
-      }
-      mlx::steel::NAXTile<half, 2, 2> kt;
+      mlx::steel::NAXTile<half, 2, 4> kt;
       kt.template load<half, PAD, 1>(k_tile + d);
       mlx::steel::tile_matmad_nax(
-          dot_h, q_hi, metal::false_type{}, kt, metal::true_type{});
-      mlx::steel::tile_matmad_nax(
-          dot_h, q_lo, metal::false_type{}, kt, metal::true_type{});
+          dot_h, q_h, metal::false_type{}, kt, metal::true_type{});
     }
 
     STEEL_PRAGMA_UNROLL

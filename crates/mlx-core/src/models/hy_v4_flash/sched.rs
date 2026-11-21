@@ -1353,57 +1353,89 @@ impl Inner {
         tokens: &[u32],
         logits: bool,
     ) -> Result<Option<MxArray>> {
-        let (base, ends) = {
+        let (base, ends, lookahead_prompt) = {
             let p = self.paged()?;
             let base = p.owners.get(seq).map_or(0, OwnerCell::len);
             let stop = base + tokens.len();
-            let mut ends: Vec<usize> = match p.turns.get(&seq) {
-                Some(t) if t.prompt.len() >= stop && t.prompt[base..stop] == *tokens => self
-                    .grid
-                    .ends(base, &t.prompt)
-                    .into_iter()
-                    .filter(|&e| e < stop)
-                    .collect(),
-                _ => (1..)
-                    .map(|k| (base / self.grid.chunk() + k) * self.grid.chunk())
-                    .take_while(|&e| e < stop)
-                    .collect(),
+            let (mut ends, prompt): (Vec<usize>, Option<Vec<u32>>) = match p.turns.get(&seq) {
+                Some(t) if t.prompt.len() >= stop && t.prompt[base..stop] == *tokens => (
+                    self.grid
+                        .ends(base, &t.prompt)
+                        .into_iter()
+                        .filter(|&e| e < stop)
+                        .collect(),
+                    Some(t.prompt[..stop].to_vec()),
+                ),
+                _ => (
+                    (1..)
+                        .map(|k| (base / self.grid.chunk() + k) * self.grid.chunk())
+                        .take_while(|&e| e < stop)
+                        .collect(),
+                    None,
+                ),
             };
             ends.push(stop);
-            (base, ends)
+            let prompt = if ends.len() >= 2 {
+                Some(match prompt {
+                    Some(pr) => pr,
+                    None => {
+                        let hist = p.live_tokens(seq);
+                        let mut pr = Vec::with_capacity(base + tokens.len());
+                        pr.extend_from_slice(&hist[..base.min(hist.len())]);
+                        pr.extend_from_slice(tokens);
+                        pr
+                    }
+                })
+            } else {
+                None
+            };
+            (base, ends, prompt)
+        };
+        let installed_lookahead = match lookahead_prompt.as_deref() {
+            Some(prompt) if !self.store.model.has_prefill_engram(prompt, base) => {
+                self.store.model.begin_prefill_engram(prompt, base, &ends);
+                true
+            }
+            _ => false,
         };
         let flag = self.cancel.clone();
         let check = move |_: usize| cancelled(&flag);
         let layer_cancel: &dyn Fn(usize) -> bool = &check;
-        let mut out = None;
-        let mut from = base;
-        for end in ends {
-            self.safe_point()?;
-            if cancelled(&self.cancel) {
-                return Err(Error::from_reason(PREFILL_CANCELLED));
-            }
-            let last = end == base + tokens.len();
-            let rows = [Rows {
-                seq,
-                ids: &tokens[from - base..end - base],
-                logits: if last && logits {
-                    Logits::Last
-                } else {
-                    Logits::None
-                },
-            }];
-            let outs = match self.wave_rows(&rows, RowKind::Prefill, true, Some(layer_cancel)) {
-                Ok(o) => o,
-                Err(_) if cancelled(&self.cancel) => {
+        let run_res = (|| -> Result<Option<MxArray>> {
+            let mut out = None;
+            let mut from = base;
+            for end in ends {
+                self.safe_point()?;
+                if cancelled(&self.cancel) {
                     return Err(Error::from_reason(PREFILL_CANCELLED));
                 }
-                Err(e) => return Err(e),
-            };
-            self.publish_at(seq, end);
-            out = outs.into_iter().next().and_then(|o| o.logits);
-            from = end;
+                let last = end == base + tokens.len();
+                let rows = [Rows {
+                    seq,
+                    ids: &tokens[from - base..end - base],
+                    logits: if last && logits {
+                        Logits::Last
+                    } else {
+                        Logits::None
+                    },
+                }];
+                let outs = match self.wave_rows(&rows, RowKind::Prefill, true, Some(layer_cancel)) {
+                    Ok(o) => o,
+                    Err(_) if cancelled(&self.cancel) => {
+                        return Err(Error::from_reason(PREFILL_CANCELLED));
+                    }
+                    Err(e) => return Err(e),
+                };
+                self.publish_at(seq, end);
+                out = outs.into_iter().next().and_then(|o| o.logits);
+                from = end;
+            }
+            out.map(|l| l.reshape(&[-1])).transpose()
+        })();
+        if installed_lookahead {
+            self.store.model.clear_prefill_engram();
         }
-        out.map(|l| l.reshape(&[-1])).transpose()
+        run_res
     }
 
     /// At a prompt state row of a publishing turn: registers `seq`'s blocks
@@ -2878,8 +2910,11 @@ impl HybridSchedulerBackend for Inner {
     }
 
     fn preempt_scheduled_cache(&mut self, seq: SeqId, _: u64, _: PreemptionMode) -> Result<()> {
-        let p = self.paged_mut()?;
-        p.turns.remove(&seq);
+        let Inner { store, paged, .. } = self;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        if let Some(t) = p.turns.remove(&seq) {
+            store.model.clear_prefill_engram_for_prompt(&t.prompt);
+        }
         p.lines.remove(&seq);
         if let Some(disk) = p.disk.as_mut() {
             disk.close(seq);
@@ -2888,10 +2923,13 @@ impl HybridSchedulerBackend for Inner {
     }
 
     fn release_scheduled_recurrent_for(&mut self, seq: SeqId) {
-        let Some(p) = self.paged.as_mut() else {
+        let Inner { store, paged, .. } = self;
+        let Some(p) = paged.as_mut() else {
             return;
         };
-        p.turns.remove(&seq);
+        if let Some(t) = p.turns.remove(&seq) {
+            store.model.clear_prefill_engram_for_prompt(&t.prompt);
+        }
         p.lines.remove(&seq);
         if let Some(disk) = p.disk.as_mut() {
             disk.close(seq);
@@ -2930,10 +2968,26 @@ impl HybridSchedulerBackend for Inner {
                 source.len()
             )));
         }
+        if end < source.len() && !self.store.model.has_prefill_engram(source, start) {
+            let mut all_ends = self.grid.ends(start, source);
+            if !all_ends.contains(&end) {
+                all_ends.push(end);
+                all_ends.sort_unstable();
+                all_ends.dedup();
+            }
+            if all_ends.len() >= 2 {
+                self.store
+                    .model
+                    .begin_prefill_engram(source, start, &all_ends);
+            }
+        }
         let _ctx = StreamContext::new(stream);
         let beside = self.paged()?.busy.others_open(seq);
         let t0 = Instant::now();
         let out = self.prefill_rows(seq, &source[start..end], end == source.len());
+        if out.is_err() || end == source.len() {
+            self.store.model.clear_prefill_engram_for_prompt(source);
+        }
         if beside {
             self.waves
                 .stalled(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));

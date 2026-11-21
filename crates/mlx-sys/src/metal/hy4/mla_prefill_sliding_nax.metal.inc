@@ -5,11 +5,12 @@ constexpr int BQ = kU;
 constexpr int BH = WM;
 constexpr int BK = 32;
 constexpr int TK = BK / kU;
-constexpr int D_CHUNK = 128;
-constexpr int KV_STRIDE = D_CHUNK + 8;
+constexpr int D_CHUNK = 256;
+constexpr int ROPE_STRIDE = D_ROPE + 8;
 constexpr int VEC8_STRIP = D_CHUNK / 8;
 constexpr int VEC8_ROPE = D_ROPE / 8;
 constexpr int N_STRIPS = D_V / D_CHUNK;
+constexpr int SUBS_PER_STRIP = D_CHUNK / (WN * kU);
 constexpr int TDh = D_V / (WN * kU);
 constexpr int TRh = D_ROPE / (WN * kU);
 constexpr int XCHG_STRIDE = TK * BaseNAXFrag::kElemsPerFrag * 32;
@@ -40,11 +41,11 @@ using stile_t = NAXTile<float, 1, TK>;
 using hfrag_t = typename BaseNAXFrag::template dtype_frag_t<half>;
 constexpr short kEPF = BaseNAXFrag::kElemsPerFrag;
 
-// Single 8,704 B buffer serves as s_kv (32 x 136 half) and s_xchg (8,192 B
-// 2-slot tree reduction across WN=4), keeping TG <= 8.5 KiB (2+ TGs/core).
-alignas(16) threadgroup uint s_buf[(BK * KV_STRIDE) / 2];
-threadgroup half* s_kv = reinterpret_cast<threadgroup half*>(s_buf);
-threadgroup float* s_xchg = reinterpret_cast<threadgroup float*>(s_buf);
+// XOR-swizzled s_kv (16,384 B, bank-conflict-free) + s_xchg_rope (16,384 B for
+// WM=4 2-slot reduction, also staging s_rope 4,608 B before reduction) = 32 KiB.
+alignas(16) threadgroup half s_kv[BK * D_CHUNK];
+alignas(16) threadgroup float s_xchg[WM * 2 * XCHG_STRIDE];
+threadgroup half* s_rope = reinterpret_cast<threadgroup half*>(s_xchg);
 
 const short2 coord = BaseNAXFrag::get_coord();
 const short fm = coord.y;
@@ -54,27 +55,38 @@ const short valid_q = (head < H)
     ? short(metal::max(0, metal::min(int(kU), S - q_tile_base)))
     : short(0);
 
-const int q_stride = H * D_K;
-const device float* q_base =
-    q + (size_t(q_tile_base) * size_t(H) + size_t(metal::min(head, H - 1))) * size_t(D_K);
+const int q_v_dim = SPLIT_Q ? D_V : D_K;
+const int q_v_stride = H * q_v_dim;
+const device float* qv_base =
+    q + (size_t(q_tile_base) * size_t(H) + size_t(metal::min(head, H - 1))) *
+        size_t(q_v_dim);
+
+const int q_r_dim = SPLIT_Q ? D_ROPE : D_K;
+const int q_r_stride = H * q_r_dim;
+const device float* qr_base = SPLIT_Q
+    ? (q_pe +
+       (size_t(q_tile_base) * size_t(H) + size_t(metal::min(head, H - 1))) *
+           size_t(D_ROPE))
+    : (qv_base + D_V);
 
 hfrag_t Qv_hi[TDh];
 hfrag_t Qv_lo[TDh];
 STEEL_PRAGMA_UNROLL
 for (short strip = 0; strip < N_STRIPS; ++strip) {
   STEEL_PRAGMA_UNROLL
-  for (short sub = 0; sub < 2; ++sub) {
-    const int col = int(strip) * D_CHUNK + d_group * 32 + int(sub) * kU;
+  for (short sub = 0; sub < SUBS_PER_STRIP; ++sub) {
+    const int col =
+        int(strip) * D_CHUNK + d_group * (D_CHUNK / WN) + int(sub) * kU;
     NAXTile<float, 1, 1> qt;
     if (valid_q == kU) {
-      qt.load(q_base + col, q_stride);
+      qt.load(qv_base + col, q_v_stride);
     } else if (valid_q > 0) {
-      qt.load_rows(q_base + col, q_stride, valid_q);
+      qt.load_rows(qv_base + col, q_v_stride, valid_q);
     } else {
       qt.clear();
     }
     const thread auto& qf = qt.frag_at(0, 0);
-    const short id = strip * 2 + sub;
+    const short id = strip * SUBS_PER_STRIP + sub;
     STEEL_PRAGMA_UNROLL
     for (short e = 0; e < kEPF; ++e) {
       const float v = qf[e];
@@ -89,12 +101,12 @@ hfrag_t Qr_hi[TRh];
 hfrag_t Qr_lo[TRh];
 STEEL_PRAGMA_UNROLL
 for (short ir = 0; ir < TRh; ++ir) {
-  const int col = D_V + d_group * (D_ROPE / WN) + int(ir) * kU;
+  const int col = d_group * (D_ROPE / WN) + int(ir) * kU;
   NAXTile<float, 1, 1> qt;
   if (valid_q == kU) {
-    qt.load(q_base + col, q_stride);
+    qt.load(qr_base + col, q_r_stride);
   } else if (valid_q > 0) {
-    qt.load_rows(q_base + col, q_stride, valid_q);
+    qt.load_rows(qr_base + col, q_r_stride, valid_q);
   } else {
     qt.clear();
   }
@@ -126,70 +138,89 @@ const int q_pos1 = q_pos0 + 8;
 const bool q_ok0 = (head < H) && ((q_tile_base + int(fm)) < S);
 const bool q_ok1 = (head < H) && ((q_tile_base + int(fm) + 8) < S);
 
+constexpr int NUM_THREADS = WM * WN * 32;
+constexpr int ROWS_PER_PASS = NUM_THREADS / VEC8_STRIP;
+constexpr int STRIP_PASSES = BK / ROWS_PER_PASS;
 const int strip_row = int(tid) / VEC8_STRIP;
 const int strip_c8 = int(tid) % VEC8_STRIP;
 const int rope_row = int(tid) / VEC8_ROPE;
 const int rope_c8 = int(tid) % VEC8_ROPE;
 
 for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
-  stile_t Stile;
-  Stile.clear();
-
-  // Stage K in D_CHUNK=128 strips into s_kv (32 x 136 half) shared across BH heads.
-  STEEL_PRAGMA_UNROLL
-  for (short strip = 0; strip < N_STRIPS; ++strip) {
-    const int base_c8 = int(strip) * VEC8_STRIP;
-    STEEL_PRAGMA_UNROLL
-    for (int pass = 0; pass < 2; ++pass) {
-      const int row = strip_row + pass * 16;
-      const int kp = k_base + row;
-      threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
-          s_kv + row * KV_STRIDE + strip_c8 * 8);
-      if (kp <= k_hi) {
-        const int slot = IS_RING ? (kp % ring_cap) : (kp - first_key);
-        *dst = *reinterpret_cast<const device float4*>(
-            k + size_t(slot) * size_t(D_K) + size_t((base_c8 + strip_c8) * 8));
-      } else {
-        *dst = float4(0.0f);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (valid_q > 0) {
-      STEEL_PRAGMA_UNROLL
-      for (short sub = 0; sub < 2; ++sub) {
-        const int col_off = d_group * 32 + int(sub) * kU;
-        hfrag_t kf0, kf1;
-        hy4_load_kv_frag_tg<half, KV_STRIDE>(kf0, s_kv, col_off, fm, fn);
-        hy4_load_kv_frag_tg<half, KV_STRIDE>(
-            kf1, s_kv + kU * KV_STRIDE, col_off, fm, fn);
-        const short id = strip * 2 + sub;
-        BaseNAXFrag::mma(
-            Stile.frag_at(0, 0),
-            Stile.frag_at(0, 1),
-            Qv_hi[id],
-            metal::false_type{},
-            kf0,
-            kf1,
-            metal::true_type{});
-        BaseNAXFrag::mma(
-            Stile.frag_at(0, 0),
-            Stile.frag_at(0, 1),
-            Qv_lo[id],
-            metal::false_type{},
-            kf0,
-            kf1,
-            metal::true_type{});
-      }
-    }
+  if (k_base > k_lo) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // RoPE strip (64 cols).
-  {
+  stile_t Stile;
+  Stile.clear();
+
+  // Strip 0 (0..255) staged into XOR-swizzled s_kv and kept in registers for P@V.
+  STEEL_PRAGMA_UNROLL
+  for (int pass = 0; pass < STRIP_PASSES; ++pass) {
+    const int row = strip_row + pass * ROWS_PER_PASS;
+    const int kp = k_base + row;
+    const int sw_c8 = strip_c8 ^ (row & 7);
+    threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
+        s_kv + row * D_CHUNK + sw_c8 * 8);
+    if (kp <= k_hi) {
+      const int slot = IS_RING ? (kp % ring_cap) : (kp - first_key);
+      *dst = *reinterpret_cast<const device float4*>(
+          k + size_t(slot) * size_t(D_K) + size_t(strip_c8 * 8));
+    } else {
+      *dst = float4(0.0f);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  hfrag_t k0_s0[SUBS_PER_STRIP];
+  hfrag_t k1_s0[SUBS_PER_STRIP];
+  if (valid_q > 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short sub = 0; sub < SUBS_PER_STRIP; ++sub) {
+      const int col_off = d_group * (D_CHUNK / WN) + int(sub) * kU;
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(k0_s0[sub], s_kv, col_off, fm, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(
+          k1_s0[sub], s_kv + kU * D_CHUNK, col_off, fm, fn);
+      BaseNAXFrag::mma(
+          Stile.frag_at(0, 0),
+          Stile.frag_at(0, 1),
+          Qv_hi[sub],
+          metal::false_type{},
+          k0_s0[sub],
+          k1_s0[sub],
+          metal::true_type{});
+      BaseNAXFrag::mma(
+          Stile.frag_at(0, 0),
+          Stile.frag_at(0, 1),
+          Qv_lo[sub],
+          metal::false_type{},
+          k0_s0[sub],
+          k1_s0[sub],
+          metal::true_type{});
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Strip 1 (256..511) into s_kv (stays alive for P@V) + RoPE (512..575) into s_rope.
+  STEEL_PRAGMA_UNROLL
+  for (int pass = 0; pass < STRIP_PASSES; ++pass) {
+    const int row = strip_row + pass * ROWS_PER_PASS;
+    const int kp = k_base + row;
+    const int sw_c8 = strip_c8 ^ (row & 7);
+    threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
+        s_kv + row * D_CHUNK + sw_c8 * 8);
+    if (kp <= k_hi) {
+      const int slot = IS_RING ? (kp % ring_cap) : (kp - first_key);
+      *dst = *reinterpret_cast<const device float4*>(
+          k + size_t(slot) * size_t(D_K) + size_t(D_CHUNK + strip_c8 * 8));
+    } else {
+      *dst = float4(0.0f);
+    }
+  }
+  if (rope_row < BK) {
     const int kp = k_base + rope_row;
     threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
-        s_kv + rope_row * KV_STRIDE + rope_c8 * 8);
+        s_rope + rope_row * ROPE_STRIDE + rope_c8 * 8);
     if (kp <= k_hi) {
       const int slot = IS_RING ? (kp % ring_cap) : (kp - first_key);
       *dst = *reinterpret_cast<const device float4*>(
@@ -202,12 +233,37 @@ for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
 
   if (valid_q > 0) {
     STEEL_PRAGMA_UNROLL
+    for (short sub = 0; sub < SUBS_PER_STRIP; ++sub) {
+      const int col_off = d_group * (D_CHUNK / WN) + int(sub) * kU;
+      hfrag_t kf0, kf1;
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(kf0, s_kv, col_off, fm, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(
+          kf1, s_kv + kU * D_CHUNK, col_off, fm, fn);
+      const short id = SUBS_PER_STRIP + sub;
+      BaseNAXFrag::mma(
+          Stile.frag_at(0, 0),
+          Stile.frag_at(0, 1),
+          Qv_hi[id],
+          metal::false_type{},
+          kf0,
+          kf1,
+          metal::true_type{});
+      BaseNAXFrag::mma(
+          Stile.frag_at(0, 0),
+          Stile.frag_at(0, 1),
+          Qv_lo[id],
+          metal::false_type{},
+          kf0,
+          kf1,
+          metal::true_type{});
+    }
+    STEEL_PRAGMA_UNROLL
     for (short ir = 0; ir < TRh; ++ir) {
       const int col_off = d_group * (D_ROPE / WN) + int(ir) * kU;
       hfrag_t kf0, kf1;
-      hy4_load_kv_frag_tg<half, KV_STRIDE>(kf0, s_kv, col_off, fm, fn);
-      hy4_load_kv_frag_tg<half, KV_STRIDE>(
-          kf1, s_kv + kU * KV_STRIDE, col_off, fm, fn);
+      hy4_load_kv_frag_tg<half, ROPE_STRIDE>(kf0, s_rope, col_off, fm, fn);
+      hy4_load_kv_frag_tg<half, ROPE_STRIDE>(
+          kf1, s_rope + kU * ROPE_STRIDE, col_off, fm, fn);
       BaseNAXFrag::mma(
           Stile.frag_at(0, 0),
           Stile.frag_at(0, 1),
@@ -226,6 +282,7 @@ for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
           metal::true_type{});
     }
   }
+  // WAR barrier before s_xchg overwrites s_rope (s_kv remains untouched).
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Deterministic 2-slot tree reduction across WN=4 in s_xchg: (dg0+dg2)+(dg1+dg3).
@@ -343,24 +400,55 @@ for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
       }
     }
 
-    const int kp0a = k_base + int(fm);
-    const int kp0b = kp0a + 8;
-    const int kp1a = k_base + kU + int(fm);
-    const int kp1b = kp1a + 8;
-    const int s0a = (kp0a <= k_hi) ? (IS_RING ? (kp0a % ring_cap) : (kp0a - first_key)) : -1;
-    const int s0b = (kp0b <= k_hi) ? (IS_RING ? (kp0b % ring_cap) : (kp0b - first_key)) : -1;
-    const int s1a = (kp1a <= k_hi) ? (IS_RING ? (kp1a % ring_cap) : (kp1a - first_key)) : -1;
-    const int s1b = (kp1b <= k_hi) ? (IS_RING ? (kp1b % ring_cap) : (kp1b - first_key)) : -1;
-
+    // P @ V Strip 0: reuse k0_s0/k1_s0 already in registers (zero device reads).
     STEEL_PRAGMA_UNROLL
-    for (short strip = 0; strip < N_STRIPS; ++strip) {
-      const int col0 = int(strip) * D_CHUNK + d_group * 32;
+    for (short pair = 0; pair < SUBS_PER_STRIP / 2; ++pair) {
+      const short id0 = pair * 2;
+      const short id1 = id0 + 1;
+      BaseNAXFrag::mma(
+          Otile.frag_at(0, id0),
+          Otile.frag_at(0, id1),
+          p_hi[0],
+          metal::false_type{},
+          k0_s0[id0],
+          k0_s0[id1],
+          metal::false_type{});
+      BaseNAXFrag::mma(
+          Otile.frag_at(0, id0),
+          Otile.frag_at(0, id1),
+          p_lo[0],
+          metal::false_type{},
+          k0_s0[id0],
+          k0_s0[id1],
+          metal::false_type{});
+      BaseNAXFrag::mma(
+          Otile.frag_at(0, id0),
+          Otile.frag_at(0, id1),
+          p_hi[1],
+          metal::false_type{},
+          k1_s0[id0],
+          k1_s0[id1],
+          metal::false_type{});
+      BaseNAXFrag::mma(
+          Otile.frag_at(0, id0),
+          Otile.frag_at(0, id1),
+          p_lo[1],
+          metal::false_type{},
+          k1_s0[id0],
+          k1_s0[id1],
+          metal::false_type{});
+    }
+
+    // P @ V Strip 1: read directly from TG-staged s_kv (zero device reads).
+    STEEL_PRAGMA_UNROLL
+    for (short pair = 0; pair < SUBS_PER_STRIP / 2; ++pair) {
+      const int col0 = d_group * (D_CHUNK / WN) + int(pair * 2) * kU;
       const int col1 = col0 + kU;
-      const short id0 = strip * 2;
+      const short id0 = SUBS_PER_STRIP + pair * 2;
       const short id1 = id0 + 1;
       hfrag_t vf0, vf1;
-      hy4_load_kv_frag_dev<false, D_K, D_K>(vf0, k, k, s0a, s0b, col0, fn);
-      hy4_load_kv_frag_dev<false, D_K, D_K>(vf1, k, k, s0a, s0b, col1, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(vf0, s_kv, col0, fm, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(vf1, s_kv, col1, fm, fn);
       BaseNAXFrag::mma(
           Otile.frag_at(0, id0),
           Otile.frag_at(0, id1),
@@ -378,8 +466,10 @@ for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
           vf1,
           metal::false_type{});
 
-      hy4_load_kv_frag_dev<false, D_K, D_K>(vf0, k, k, s1a, s1b, col0, fn);
-      hy4_load_kv_frag_dev<false, D_K, D_K>(vf1, k, k, s1a, s1b, col1, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(
+          vf0, s_kv + kU * D_CHUNK, col0, fm, fn);
+      hy4_load_kv_frag_tg_swz<half, D_CHUNK>(
+          vf1, s_kv + kU * D_CHUNK, col1, fm, fn);
       BaseNAXFrag::mma(
           Otile.frag_at(0, id0),
           Otile.frag_at(0, id1),
@@ -398,7 +488,6 @@ for (int k_base = k_lo; k_base <= k_hi; k_base += BK) {
           metal::false_type{});
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 if (valid_q > 0) {
@@ -421,17 +510,18 @@ if (valid_q > 0) {
   const int out_stride = H * D_V;
   STEEL_PRAGMA_UNROLL
   for (short strip = 0; strip < N_STRIPS; ++strip) {
-    const int col0 = int(strip) * D_CHUNK + d_group * 32;
-    if (valid_q == kU) {
-      BaseNAXFrag::store(
-          Otile.frag_at(0, strip * 2), out_base + col0, out_stride, Int<1>{});
-      BaseNAXFrag::store(
-          Otile.frag_at(0, strip * 2 + 1), out_base + col0 + kU, out_stride, Int<1>{});
-    } else {
-      BaseNAXFrag::store_rows(
-          Otile.frag_at(0, strip * 2), out_base + col0, out_stride, Int<1>{}, valid_q);
-      BaseNAXFrag::store_rows(
-          Otile.frag_at(0, strip * 2 + 1), out_base + col0 + kU, out_stride, Int<1>{}, valid_q);
+    STEEL_PRAGMA_UNROLL
+    for (short sub = 0; sub < SUBS_PER_STRIP; ++sub) {
+      const int col0 =
+          int(strip) * D_CHUNK + d_group * (D_CHUNK / WN) + int(sub) * kU;
+      const short id = strip * SUBS_PER_STRIP + sub;
+      if (valid_q == kU) {
+        BaseNAXFrag::store(
+            Otile.frag_at(0, id), out_base + col0, out_stride, Int<1>{});
+      } else {
+        BaseNAXFrag::store_rows(
+            Otile.frag_at(0, id), out_base + col0, out_stride, Int<1>{}, valid_q);
+      }
     }
   }
 }

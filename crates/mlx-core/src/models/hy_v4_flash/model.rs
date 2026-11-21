@@ -15,7 +15,7 @@
 //! window clones (`Mark`), and a failed or cancelled step puts every owner
 //! back at its start.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use napi::{Error, Result};
@@ -184,9 +184,7 @@ pub fn head_rows(x: &MxArray, head: &Dense) -> Result<MxArray> {
     if head.is_qmm() {
         return qlinear(&xf, head);
     }
-    if let Dense::Array(w) = head
-        && let Some(logits) = try_bf16_lm_head(&xf, w)?
-    {
+    if let Some(logits) = try_bf16_lm_head(&xf, head)? {
         return Ok(logits);
     }
     if xf.shape_at(0)? == 1 {
@@ -609,6 +607,21 @@ impl Session {
     }
 }
 
+struct PrefillChunkPlan {
+    start: usize,
+    end: usize,
+    /// Pre-hashed Engram table row IDs per Engram layer (`[n_engram][rows * n_cols]`).
+    layer_ids: Vec<Vec<u32>>,
+    /// Handles pre-submitted during the prior chunk (`[n_engram]`).
+    handles: Vec<Option<PrefetchHandle>>,
+}
+
+struct EngramLookahead {
+    prompt: Vec<u32>,
+    chunks: Vec<PrefillChunkPlan>,
+    cursor: usize,
+}
+
 pub struct Model {
     cfg: HyV4FlashConfig,
     weights: Box<dyn TrunkWeights>,
@@ -617,6 +630,7 @@ pub struct Model {
     table: Box<dyn EngramRows>,
     /// The distinct banks the blocks gather from.
     banks: Vec<Arc<KqBank>>,
+    engram_lookahead: Mutex<Option<EngramLookahead>>,
 }
 
 /// Refuses an empty call or one past the session's context.
@@ -691,7 +705,155 @@ impl Model {
             hasher,
             table,
             banks,
+            engram_lookahead: Mutex::new(None),
         })
+    }
+
+    /// Pre-hashes Engram row IDs for all chunks of a multi-chunk prefill so
+    /// chunk `k+1`'s Engram layers can be prefetched asynchronously during
+    /// chunk `k`.
+    pub fn begin_prefill_engram(&self, prompt: &[u32], from: usize, ends: &[usize]) {
+        let n_engram = self.hasher.n_layers();
+        let n_cols = self.hasher.n_cols();
+        if ends.len() < 2 || from >= prompt.len() || n_engram == 0 || n_cols == 0 {
+            self.clear_prefill_engram();
+            return;
+        }
+        let Ok(all_rows) = self.hasher.call_rows(prompt, from) else {
+            self.clear_prefill_engram();
+            return;
+        };
+        let stride = n_engram * n_cols;
+        let mut chunks = Vec::with_capacity(ends.len());
+        let mut start = from;
+        for &end in ends {
+            if end <= start || end > prompt.len() {
+                self.clear_prefill_engram();
+                return;
+            }
+            let pos_lo = start - from;
+            let pos_hi = end - from;
+            let n_pos = pos_hi - pos_lo;
+            let mut layer_ids = Vec::with_capacity(n_engram);
+            for e in 0..n_engram {
+                let mut ids_e = Vec::with_capacity(n_pos * n_cols);
+                for p in pos_lo..pos_hi {
+                    let base = p * stride + e * n_cols;
+                    ids_e.extend_from_slice(&all_rows[base..base + n_cols]);
+                }
+                layer_ids.push(ids_e);
+            }
+            chunks.push(PrefillChunkPlan {
+                start,
+                end,
+                layer_ids,
+                handles: (0..n_engram).map(|_| None).collect(),
+            });
+            start = end;
+        }
+        *self
+            .engram_lookahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(EngramLookahead {
+            prompt: prompt.to_vec(),
+            chunks,
+            cursor: 0,
+        });
+    }
+
+    /// Clears any active prefill Engram lookahead plan and cancels unused handles.
+    pub fn clear_prefill_engram(&self) {
+        *self
+            .engram_lookahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn clear_prefill_engram_for_prompt(&self, prompt: &[u32]) {
+        let mut g = self
+            .engram_lookahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if g.as_ref().is_some_and(|la| la.prompt == prompt) {
+            *g = None;
+        }
+    }
+
+    pub(crate) fn has_prefill_engram(&self, prompt: &[u32], start: usize) -> bool {
+        let g = self
+            .engram_lookahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        g.as_ref().is_some_and(|la| {
+            la.prompt.len() >= prompt.len()
+                && la.prompt[..prompt.len()] == *prompt
+                && la.chunks.get(la.cursor).is_some_and(|c| c.start == start)
+        })
+    }
+
+    fn take_engram_chunk(
+        &self,
+        start: usize,
+        ids: &[u32],
+        history: &[u32],
+    ) -> Option<(Vec<Vec<u32>>, Vec<Option<PrefetchHandle>>)> {
+        let mut g = self
+            .engram_lookahead
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let la = g.as_mut()?;
+        let cur = la.chunks.get_mut(la.cursor)?;
+        if cur.start != start
+            || cur.end != start + ids.len()
+            || la.prompt.len() < cur.end
+            || la.prompt[cur.start..cur.end] != *ids
+        {
+            return None;
+        }
+        let back = self.cfg.engram.max_ngram.saturating_sub(1);
+        let lo = start.saturating_sub(back);
+        if history.len() < start || la.prompt[lo..start] != history[lo..start] {
+            return None;
+        }
+        let layer_ids = std::mem::take(&mut cur.layer_ids);
+        let handles = std::mem::take(&mut cur.handles);
+        la.cursor += 1;
+        Some((layer_ids, handles))
+    }
+
+    fn prefetch_next_engram_layer(&self, e: usize) {
+        let next_req = {
+            let g = self
+                .engram_lookahead
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            g.as_ref().and_then(|la| {
+                let next = la.chunks.get(la.cursor)?;
+                if e < next.handles.len() && next.handles[e].is_none() {
+                    Some((next.start, next.end, next.layer_ids[e].clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        let Some((start, end, ids)) = next_req else {
+            return;
+        };
+        if let Ok(Some(handle)) = self.table.prefetch(e, &ids) {
+            let mut g = self
+                .engram_lookahead
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(la) = g.as_mut()
+                && let Some(next) = la.chunks.get_mut(la.cursor)
+                && next.start == start
+                && next.end == end
+                && e < next.handles.len()
+                && next.handles[e].is_none()
+            {
+                next.handles[e] = Some(handle);
+            }
+        }
     }
 
     pub fn cfg(&self) -> &HyV4FlashConfig {
@@ -872,22 +1034,58 @@ impl Model {
         let mut ids = Vec::with_capacity(total);
         let mut keep = Vec::with_capacity(total);
         let mut rows = Vec::new();
+        let n_engram = self.hasher.n_layers();
+        let mut handles: Vec<Option<PrefetchHandle>> = Vec::with_capacity(n_engram);
+        let mut lookahead_layer_ids: Option<Vec<Vec<u32>>> = None;
         let tp = prof_start();
         for i in 0..wave.owners() {
             let call = owners.ids(i);
-            rows.extend(call_engram_rows(
-                &self.hasher,
-                self.cfg.engram.max_ngram - 1,
-                owners.history(i),
-                call,
-            )?);
             keep.extend(keeps(call, self.cfg.engram.pad_token_id));
             ids.extend_from_slice(call);
         }
-        let n_engram = self.hasher.n_layers();
-        let mut handles: Vec<Option<PrefetchHandle>> = Vec::with_capacity(n_engram);
-        for e in 0..n_engram {
-            handles.push(self.table.prefetch(e, &self.hasher.layer_ids(&rows, e)?)?);
+        let matched_lookahead = if wave.kind() == RowKind::Prefill && wave.owners() == 1 {
+            let span = wave.spans()[0];
+            if let Some((layer_ids, mut pre_handles)) =
+                self.take_engram_chunk(span.start, owners.ids(0), owners.history(0))
+            {
+                for (e, lids) in layer_ids.iter().enumerate() {
+                    let h = match pre_handles.get_mut(e).and_then(Option::take) {
+                        Some(h) => Some(h),
+                        None => self.table.prefetch(e, lids)?,
+                    };
+                    handles.push(h);
+                }
+                if trace.is_some() {
+                    let n_cols = self.hasher.n_cols();
+                    let n_pos = span.rows;
+                    rows.reserve(n_pos * n_engram * n_cols);
+                    for p in 0..n_pos {
+                        for lids in &layer_ids {
+                            let base = p * n_cols;
+                            rows.extend_from_slice(&lids[base..base + n_cols]);
+                        }
+                    }
+                }
+                lookahead_layer_ids = Some(layer_ids);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !matched_lookahead {
+            for i in 0..wave.owners() {
+                rows.extend(call_engram_rows(
+                    &self.hasher,
+                    self.cfg.engram.max_ngram - 1,
+                    owners.history(i),
+                    owners.ids(i),
+                )?);
+            }
+            for e in 0..n_engram {
+                handles.push(self.table.prefetch(e, &self.hasher.layer_ids(&rows, e)?)?);
+            }
         }
         prof_end(Phase::Engram, tp, &[])?;
         if let Some(t) = trace.as_deref_mut() {
@@ -939,9 +1137,15 @@ impl Model {
                     let tp = prof_start();
                     let r = match handles.get_mut(e).and_then(Option::take) {
                         Some(h) => self.table.take_prefetched(h)?,
-                        None => self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?,
+                        None => match lookahead_layer_ids.as_ref().and_then(|v| v.get(e)) {
+                            Some(lids) => self.table.rows(e, lids)?,
+                            None => self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?,
+                        },
                     };
                     prof_end(Phase::Engram, tp, &[])?;
+                    if matched_lookahead {
+                        self.prefetch_next_engram_layer(e);
+                    }
                     Some(r)
                 }
                 None => None,
@@ -997,11 +1201,15 @@ impl Model {
                 }
                 RowKind::Prefill | RowKind::Decode => {
                     // Flush at layer 0 in direct decode so GPU layer 0 overlaps
-                    // layer 1's Engram SSD read, then every 10 layers.
+                    // layer 1's Engram SSD read, then every 10 layers. For large
+                    // prefill chunks (> 2048 rows), flush every layer so peak
+                    // Metal scratch stays bounded to one layer.
                     let flush = if !direct {
                         true
                     } else if wave.kind() == RowKind::Decode {
                         l == 0 || l == 10 || l == 20 || l == 30
+                    } else if total > 2048 {
+                        true
                     } else {
                         l >= 2 && (l - 2).is_multiple_of(3)
                     };

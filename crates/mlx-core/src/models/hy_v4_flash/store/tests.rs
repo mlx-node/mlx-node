@@ -1054,6 +1054,7 @@ fn real_store_admits_at_load() {
         direct: DirectMode::Off,
         mmap: MmapMode::Off,
         mmap_prewarm: MmapMode::Off,
+        mmap_chunk_max: MMAP_PREFILL_CHUNK_MAX,
     };
     let st = Store::open(&s.paths, &opts).unwrap();
     TEST_HOST.with(|c| c.set(None));
@@ -2236,7 +2237,7 @@ fn mmap_admission_headroom_guard_and_precedence() {
         ..Default::default()
     };
 
-    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 2048 chunk
+    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 4096 chunk
     //    (budget 104 GiB >= dense + kv/scratch + 83.35 GiB mapped_bytes), wired_limit < 20 GiB.
     let res = select_expert_mode(
         MmapMode::Auto,
@@ -2681,4 +2682,138 @@ fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
     assert!(!lease.in_turn() && !bank.in_turn());
     assert!(bank.is_mmap());
     assert!(lease.switches().is_empty());
+}
+
+#[test]
+fn mmap_chunk_max_override_fallback_and_dense_savings_accounting() {
+    assert_eq!(MMAP_PREFILL_CHUNK_MAX, 4096);
+    assert_eq!(mmap_prefill_chunk_max(None).unwrap(), 4096);
+    assert_eq!(mmap_prefill_chunk_max(Some("")).unwrap(), 4096);
+    assert_eq!(mmap_prefill_chunk_max(Some("2048")).unwrap(), 2048);
+    assert_eq!(mmap_prefill_chunk_max(Some("3072")).unwrap(), 3072);
+    assert!(mmap_prefill_chunk_max(Some("0")).is_err());
+    assert!(mmap_prefill_chunk_max(Some("300")).is_err());
+    assert!(mmap_prefill_chunk_max(Some("abc")).is_err());
+
+    let sizes = Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    };
+    let dense_full = sizes.dense_trunk + sizes.dense_mtp;
+    let saved = 1_194_590_208u64; // output.weight (BF16) + token_embd.weight (Q8_0)
+    let dense_mmap = dense_full - saved;
+    let direct_bytes = sizes.direct_expert_bytes();
+    let mapped_bytes = 89_500_000_000u64 + saved;
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let quiet_128 = HostMemory {
+        physical: 128 * G,
+        wired: 20 * G,
+        ..Default::default()
+    };
+
+    // Default cap selects 4096 and subtracts saved dense bytes from mmap gate & wired limit.
+    let res_default = select_expert_mode_for(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &quiet_128,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExpertResidency::Mmap { chunk, gate } = res_default else {
+        panic!("expected Mmap at default 4096 cap, got {res_default:?}");
+    };
+    assert_eq!(chunk, 4096);
+    assert_eq!(gate.dense_bytes, dense_mmap);
+    let wired_default = gate.dense_bytes + gate.kv_and_scratch;
+
+    // Explicit env override to 2048 caps mmap chunk at 2048.
+    let res_2048 = select_expert_mode_for(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &quiet_128,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        2048,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExpertResidency::Mmap {
+        chunk: chunk_2048,
+        gate: gate_2048,
+    } = res_2048
+    else {
+        panic!("expected Mmap at 2048 override, got {res_2048:?}");
+    };
+    assert_eq!(chunk_2048, 2048);
+    assert_eq!(gate_2048.dense_bytes, dense_mmap);
+    assert!(gate_2048.scratch_bytes < gate.scratch_bytes);
+
+    // Tight budget between 2048 need and 4096 need falls back cleanly from 4096 -> 2048.
+    let mid_cap = gate_2048.need + (gate.need - gate_2048.need) / 2;
+    let (fb_chunk, fb_gate) = pick_mmap_with_max(
+        MmapMode::Auto,
+        true,
+        true,
+        &p,
+        ctx,
+        &quiet_128,
+        &Own::default(),
+        dense_mmap,
+        mapped_bytes,
+        4096,
+        None,
+        Some(mid_cap),
+    );
+    assert!(fb_gate.admitted);
+    assert_eq!(fb_chunk, 2048);
+
+    // Direct mode still charges full dense_bytes (not reduced by mmap savings).
+    let res_direct = select_expert_mode_for(
+        MmapMode::Off,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &quiet_128,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        4096,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExpertResidency::Direct { gate: d_gate, .. } = res_direct else {
+        panic!("expected Direct when MmapMode::Off, got {res_direct:?}");
+    };
+    assert_eq!(d_gate.dense_bytes, dense_full);
+    assert!(wired_default < 15 * G);
 }

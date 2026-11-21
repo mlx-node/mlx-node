@@ -132,11 +132,17 @@ if (slot < uint(S)) {
       const int g1 = g0 + 1;
       STEEL_PRAGMA_UNROLL
       for (int p = 0; p < 2; ++p) {
-        if (w_live[p]) {
-          const uint wr = row0 + uint(p) * 32u;
-          float d0, m0, d1, m1;
+        float d0 = 0.0f, m0 = 0.0f, d1 = 0.0f, m1 = 0.0f;
+        if (w_live[p] && lane4 == 0u) {
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g0, d0, m0);
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g1, d1, m1);
+        }
+        d0 = simd_shuffle(d0, quad_base);
+        m0 = simd_shuffle(m0, quad_base);
+        d1 = simd_shuffle(d1, quad_base);
+        m1 = simd_shuffle(m1, quad_base);
+        if (w_live[p]) {
+          const uint wr = row0 + uint(p) * 32u;
           threadgroup half4* d_lo =
               reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
           threadgroup half4* d_hi =
@@ -214,36 +220,46 @@ if (slot < uint(S)) {
       }
     }
   } else {
-    // block_q6_K is 210 bytes (2-byte aligned only); use uint16_t/int8_t/half only.
-    uint16_t ql0[2][4];
-    uint16_t ql1[2][4];
-    uint16_t qh[2][4];
-    float sc[2][4];
+    // block_q6_K is 210 bytes (2-byte aligned ONLY); use packed_ushort4/half only.
+    uchar4 ql0_v[2][2];
+    uchar4 ql1_v[2][2];
+    uchar4 qh_v[2][2];
+    float4 sc[2];
     const size_t l_off = size_t(lane4) * 8u;
-    const size_t sc_off = size_t(lane4 >> 1);
 
     STEEL_PRAGMA_UNROLL
     for (int p = 0; p < 2; ++p) {
+      float d_val = 0.0f;
+      uint2 sc_u2 = uint2(0u);
       if (w_live[p]) {
-        const device uint16_t* p_ql0 =
-            reinterpret_cast<const device uint16_t*>(w_row[p] + l_off);
-        const device uint16_t* p_ql1 = p_ql0 + 16;
-        const device uint16_t* p_qh =
-            reinterpret_cast<const device uint16_t*>(w_row[p] + 128u + l_off);
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          ql0[p][i] = p_ql0[i];
-          ql1[p][i] = p_ql1[i];
-          qh[p][i] = p_qh[i];
+        const ushort4 v0 = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+            w_row[p] + l_off));
+        const ushort4 v1 = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+            w_row[p] + 32u + l_off));
+        const ushort4 vh = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+            w_row[p] + 128u + l_off));
+        ql0_v[p][0] = as_type<uchar4>(v0.xy);
+        ql0_v[p][1] = as_type<uchar4>(v0.zw);
+        ql1_v[p][0] = as_type<uchar4>(v1.xy);
+        ql1_v[p][1] = as_type<uchar4>(v1.zw);
+        qh_v[p][0] = as_type<uchar4>(vh.xy);
+        qh_v[p][1] = as_type<uchar4>(vh.zw);
+        if (lane4 == 0u) {
+          d_val = float(*reinterpret_cast<const device half*>(w_row[p] + 208u));
+          const ushort4 sc_raw = ushort4(
+              *reinterpret_cast<const device packed_ushort4*>(w_row[p] + 192u));
+          sc_u2 = uint2(as_type<uint>(sc_raw.xy), as_type<uint>(sc_raw.zw));
         }
-        const float d =
-            float(*reinterpret_cast<const device half*>(w_row[p] + 208u));
-        const device int8_t* scp =
-            reinterpret_cast<const device int8_t*>(w_row[p] + 192u) + sc_off;
-        sc[p][0] = d * float(scp[0]);
-        sc[p][1] = d * float(scp[2]);
-        sc[p][2] = d * float(scp[4]);
-        sc[p][3] = d * float(scp[6]);
+      }
+      d_val = simd_shuffle(d_val, quad_base);
+      sc_u2 = simd_shuffle(sc_u2, quad_base);
+      if (w_live[p]) {
+        const char4 c0 = as_type<char4>(sc_u2.x);
+        const char4 c1 = as_type<char4>(sc_u2.y);
+        const float4 sv = ((lane4 & 2u) == 0u)
+            ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
+            : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
+        sc[p] = sv * d_val;
       }
     }
 
@@ -260,44 +276,29 @@ if (slot < uint(S)) {
         dst[3] = av[3];
       }
       const int hi_half = (base >> 6) & 1;
-      const int ql_sh = hi_half ? 4 : 0;
-      const int qh_sh_a = hi_half ? 4 : 0;
-      const int qh_sh_b = hi_half ? 6 : 2;
+      const uchar ql_sh = hi_half ? 4u : 0u;
+      const uchar qh_sh_a = hi_half ? 4u : 0u;
+      const uchar qh_sh_b = hi_half ? 6u : 2u;
       STEEL_PRAGMA_UNROLL
       for (int p = 0; p < 2; ++p) {
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
-          const float sc_a = hi_half ? sc[p][2] : sc[p][0];
-          const float sc_b = hi_half ? sc[p][3] : sc[p][1];
+          const float sc_a = hi_half ? sc[p].z : sc[p].x;
+          const float sc_b = hi_half ? sc[p].w : sc[p].y;
           threadgroup half4* d_lo =
               reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
           threadgroup half4* d_hi =
               reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
           STEEL_PRAGMA_UNROLL
           for (int i = 0; i < 2; ++i) {
-            const uint16_t q0a = ql0[p][2 * i];
-            const uint16_t q0b = ql0[p][2 * i + 1];
-            const uint16_t q1a = ql1[p][2 * i];
-            const uint16_t q1b = ql1[p][2 * i + 1];
-            const uint16_t ha = qh[p][2 * i];
-            const uint16_t hb = qh[p][2 * i + 1];
-
-            const uint8_t h0 = uint8_t(ha & 0xFFu);
-            const uint8_t h1 = uint8_t(ha >> 8);
-            const uint8_t h2 = uint8_t(hb & 0xFFu);
-            const uint8_t h3 = uint8_t(hb >> 8);
-
-            const int a0 = int((((q0a & 0xFFu) >> ql_sh) & 0x0Fu) | (((h0 >> qh_sh_a) & 0x03u) << 4)) - 32;
-            const int a1 = int((((q0a >> 8) >> ql_sh) & 0x0Fu) | (((h1 >> qh_sh_a) & 0x03u) << 4)) - 32;
-            const int a2 = int((((q0b & 0xFFu) >> ql_sh) & 0x0Fu) | (((h2 >> qh_sh_a) & 0x03u) << 4)) - 32;
-            const int a3 = int((((q0b >> 8) >> ql_sh) & 0x0Fu) | (((h3 >> qh_sh_a) & 0x03u) << 4)) - 32;
-            d_lo[i] = half4(float(a0) * sc_a, float(a1) * sc_a, float(a2) * sc_a, float(a3) * sc_a);
-
-            const int b0 = int((((q1a & 0xFFu) >> ql_sh) & 0x0Fu) | (((h0 >> qh_sh_b) & 0x03u) << 4)) - 32;
-            const int b1 = int((((q1a >> 8) >> ql_sh) & 0x0Fu) | (((h1 >> qh_sh_b) & 0x03u) << 4)) - 32;
-            const int b2 = int((((q1b & 0xFFu) >> ql_sh) & 0x0Fu) | (((h2 >> qh_sh_b) & 0x03u) << 4)) - 32;
-            const int b3 = int((((q1b >> 8) >> ql_sh) & 0x0Fu) | (((h3 >> qh_sh_b) & 0x03u) << 4)) - 32;
-            d_hi[i] = half4(float(b0) * sc_b, float(b1) * sc_b, float(b2) * sc_b, float(b3) * sc_b);
+            const uchar4 q0 =
+                ((ql0_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
+                (((qh_v[p][i] >> qh_sh_a) & uchar4(0x03u)) << 4);
+            d_lo[i] = half4(float4(int4(q0) - 32) * sc_a);
+            const uchar4 q1 =
+                ((ql1_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
+                (((qh_v[p][i] >> qh_sh_b) & uchar4(0x03u)) << 4);
+            d_hi[i] = half4(float4(int4(q1) - 32) * sc_b);
           }
         }
       }
@@ -327,30 +328,39 @@ if (slot < uint(S)) {
           const size_t nip = size_t((next >> 7) & 1);
           STEEL_PRAGMA_UNROLL
           for (int p = 0; p < 2; ++p) {
+            float d_val = 0.0f;
+            uint2 sc_u2 = uint2(0u);
             if (w_live[p]) {
               const device uint8_t* nblk = w_row[p] + nblk_off;
-              const device uint16_t* p_ql0 =
-                  reinterpret_cast<const device uint16_t*>(
-                      nblk + nip * 64u + l_off);
-              const device uint16_t* p_ql1 = p_ql0 + 16;
-              const device uint16_t* p_qh =
-                  reinterpret_cast<const device uint16_t*>(
-                      nblk + 128u + nip * 32u + l_off);
-              STEEL_PRAGMA_UNROLL
-              for (int i = 0; i < 4; ++i) {
-                ql0[p][i] = p_ql0[i];
-                ql1[p][i] = p_ql1[i];
-                qh[p][i] = p_qh[i];
+              const ushort4 v0 = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+                  nblk + nip * 64u + l_off));
+              const ushort4 v1 = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+                  nblk + nip * 64u + 32u + l_off));
+              const ushort4 vh = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+                  nblk + 128u + nip * 32u + l_off));
+              ql0_v[p][0] = as_type<uchar4>(v0.xy);
+              ql0_v[p][1] = as_type<uchar4>(v0.zw);
+              ql1_v[p][0] = as_type<uchar4>(v1.xy);
+              ql1_v[p][1] = as_type<uchar4>(v1.zw);
+              qh_v[p][0] = as_type<uchar4>(vh.xy);
+              qh_v[p][1] = as_type<uchar4>(vh.zw);
+              if (lane4 == 0u) {
+                d_val = float(*reinterpret_cast<const device half*>(nblk + 208u));
+                const ushort4 sc_raw = ushort4(
+                    *reinterpret_cast<const device packed_ushort4*>(
+                        nblk + 192u + nip * 8u));
+                sc_u2 = uint2(as_type<uint>(sc_raw.xy), as_type<uint>(sc_raw.zw));
               }
-              const float d =
-                  float(*reinterpret_cast<const device half*>(nblk + 208u));
-              const device int8_t* scp =
-                  reinterpret_cast<const device int8_t*>(nblk + 192u) +
-                  nip * 8u + sc_off;
-              sc[p][0] = d * float(scp[0]);
-              sc[p][1] = d * float(scp[2]);
-              sc[p][2] = d * float(scp[4]);
-              sc[p][3] = d * float(scp[6]);
+            }
+            d_val = simd_shuffle(d_val, quad_base);
+            sc_u2 = simd_shuffle(sc_u2, quad_base);
+            if (w_live[p]) {
+              const char4 c0 = as_type<char4>(sc_u2.x);
+              const char4 c1 = as_type<char4>(sc_u2.y);
+              const float4 sv = ((lane4 & 2u) == 0u)
+                  ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
+                  : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
+              sc[p] = sv * d_val;
             }
           }
         }
@@ -368,7 +378,7 @@ if (slot < uint(S)) {
 }
 
 if (valid_m > 0 && valid_n > 0) {
-  device float* out_ptr =
+  auto out_ptr =
       out + size_t(begin + uint(tm)) * size_t(H) + size_t(col + uint(tn));
   if (valid_m == 16 && valid_n == 32) {
     cd.store(out_ptr, H);

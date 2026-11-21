@@ -1908,7 +1908,8 @@ fn mmap_mode_decode_and_prefill_match_direct_bank() {
         .map(|&(seed, n)| Rng::new(seed).ids(n))
         .collect();
 
-    // 1. Prefill (NAX enabled) matches DirectBank.
+    // 1. Prefill (<= 32 tiny-tail fastpath AND > 32 indirect NAX path) matches DirectBank.
+    let long_prompt = Rng::new(42).ids(40);
     let mut d_sess = direct_model.new_session(CTX).unwrap();
     let mut m_sess = mmap_model.new_session(CTX).unwrap();
     let d_pre = direct_model
@@ -1935,7 +1936,41 @@ fn mmap_mode_decode_and_prefill_match_direct_bank() {
         m_pre.logits.as_ref().unwrap(),
         d_pre.logits.as_ref().unwrap(),
     );
-    assert!(pre_diff <= 1e-2, "mmap prefill max_diff={pre_diff}");
+    assert!(
+        pre_diff <= 1e-2,
+        "mmap tiny-tail prefill max_diff={pre_diff}"
+    );
+
+    let mut d_long = direct_model.new_session(CTX).unwrap();
+    let mut m_long = mmap_model.new_session(CTX).unwrap();
+    let d_pre_long = direct_model
+        .forward(
+            &mut d_long,
+            &long_prompt,
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let m_pre_long = mmap_model
+        .forward(
+            &mut m_long,
+            &long_prompt,
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let long_diff = max_diff(
+        m_pre_long.logits.as_ref().unwrap(),
+        d_pre_long.logits.as_ref().unwrap(),
+    );
+    assert!(
+        long_diff <= 1e-2,
+        "mmap >32-row prefill max_diff={long_diff}"
+    );
 
     // 2. Prefill non-NAX fallback (32-row decode chunks) also matches DirectBank.
     let mut d_fb_sess = direct_model.new_session(CTX).unwrap();
@@ -2257,4 +2292,208 @@ fn circular_window_decode_wrap_truncate_and_restore_match_reference() {
         replayed, want_decode,
         "mark/restore replay diverged from clean decode"
     );
+}
+
+#[test]
+fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
+    use super::ladder::Ladder;
+    use super::prefill::{Driver, Grid, Prefilled};
+    use super::rows::{EngramRows, PrefetchHandle};
+    use std::sync::Mutex;
+
+    let mut cfg = tiny_cfg();
+    cfg.context_length = 128;
+
+    let head_dim = cfg.engram.head_dim;
+    let total_rows = cfg
+        .engram
+        .head_offsets
+        .iter()
+        .zip(&cfg.engram.head_vocab_sizes)
+        .map(|(&o, &n)| o + n)
+        .max()
+        .unwrap();
+    let mut raw_f8 = Rng::new(77).bytes(total_rows as usize * head_dim);
+    // Clear bit 0 of 0x7F/0xFF so no byte is F8_E4M3 NaN.
+    for b in &mut raw_f8 {
+        if (*b & 0x7F) == 0x7F {
+            *b &= 0xFE;
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("hy4-engram-la-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    struct DirGuard(PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = DirGuard(dir.clone());
+    let path = dir.join("engram.bin");
+    std::fs::write(&path, &raw_f8).unwrap();
+    let loc = Located {
+        shard: 0,
+        data_offset: 0,
+        info: GgufTensorInfo {
+            name: "per_layer_token_embd.weight".into(),
+            n_dims: 2,
+            dims: vec![head_dim as u64, total_rows],
+            tensor_type: GgufTensorType::MXFP8,
+            offset: 0,
+        },
+    };
+    let table = F8Table::open_at(&path, &loc, &cfg.engram).unwrap();
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Ev {
+        Prefetch(usize, usize),
+        Take(usize),
+        SyncRows(usize),
+    }
+
+    struct SpyRows {
+        inner: F8Table,
+        events: Arc<Mutex<Vec<Ev>>>,
+    }
+
+    impl EngramRows for SpyRows {
+        fn rows(&self, layer: usize, ids: &[u32]) -> napi::Result<Vec<f32>> {
+            self.events.lock().unwrap().push(Ev::SyncRows(layer));
+            self.inner.rows(layer, ids)
+        }
+
+        fn prefetch(&self, layer: usize, ids: &[u32]) -> napi::Result<Option<PrefetchHandle>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(Ev::Prefetch(layer, ids.len()));
+            self.inner.prefetch(layer, ids)
+        }
+
+        fn take_prefetched(&self, handle: PrefetchHandle) -> napi::Result<Vec<f32>> {
+            self.events.lock().unwrap().push(Ev::Take(0));
+            self.inner.take_prefetched(handle)
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let make_model = |spy: Option<Arc<Mutex<Vec<Ev>>>>| -> (Model, Arc<KqBank>, Temp) {
+        let (bank, bank_dir) = tiny_bank(&cfg, 91);
+        let b = Arc::clone(&bank);
+        let weights = tiny_weights(&cfg, 19);
+        let tbl: Box<dyn EngramRows> = match spy {
+            Some(ev) => Box::new(SpyRows {
+                inner: F8Table::open_at(&path, &loc, &cfg.engram).unwrap(),
+                events: ev,
+            }),
+            None => Box::new(F8Table::open_at(&path, &loc, &cfg.engram).unwrap()),
+        };
+        let model = Model::new(
+            cfg.clone(),
+            Box::new(weights),
+            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+            tbl,
+        )
+        .unwrap();
+        (model, bank, bank_dir)
+    };
+    drop(table);
+
+    let (model_la, bank_la, _bank_dir_la) = make_model(Some(Arc::clone(&events)));
+    let (model_ref, bank_ref, _bank_dir_ref) = make_model(None);
+    let ids = Rng::new(123).ids(96);
+
+    // Reference: manual chunked prefill without Driver lookahead (same 32-token chunks).
+    let mut ref_sess = model_ref.new_session(128).unwrap();
+    let mut ref_out = None;
+    for chunk in ids.chunks(32) {
+        ref_out = Some(
+            model_ref
+                .forward(
+                    &mut ref_sess,
+                    chunk,
+                    RowKind::Prefill,
+                    Want::LAST,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+    }
+    let want_bits: Vec<u32> = read(ref_out.unwrap().logits.as_ref().unwrap())
+        .into_iter()
+        .map(f32::to_bits)
+        .collect();
+
+    // Driver multi-chunk prefill (3 chunks of 32 tokens) with lookahead active.
+    let grid = Grid::new(32, Vec::new()).unwrap();
+    let driver = Driver {
+        runner: &model_la,
+        grid: &grid,
+        hidden: false,
+    };
+    let mut sess = model_la.new_session(128).unwrap();
+    let mut ladder = Ladder::new();
+    let mut ran_chunks = Vec::new();
+    let prefilled = driver
+        .prefill(
+            &mut sess,
+            &mut ladder,
+            None,
+            &ids,
+            &|_| false,
+            &mut |r, _| {
+                ran_chunks.push(r);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let Prefilled::Done { out, .. } = prefilled else {
+        panic!("expected Prefilled::Done");
+    };
+    assert_eq!(ran_chunks, vec![0..32, 32..64, 64..96]);
+    let got_bits: Vec<u32> = read(out.logits.as_ref().unwrap())
+        .into_iter()
+        .map(f32::to_bits)
+        .collect();
+    assert_eq!(
+        got_bits, want_bits,
+        "lookahead multi-chunk prefill must be bit-exact vs manual chunks"
+    );
+
+    // Verify cross-chunk interleaving: chunk 1's prefetch fires right after chunk 0's take,
+    // and chunk 2's prefetch fires right after chunk 1's take (zero sync fallbacks, no duplicates).
+    let n_cols = cfg.engram.n_cols();
+    let log = events.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec![
+            Ev::Prefetch(0, 32 * n_cols),
+            Ev::Take(0),
+            Ev::Prefetch(0, 32 * n_cols),
+            Ev::Take(0),
+            Ev::Prefetch(0, 32 * n_cols),
+            Ev::Take(0),
+        ],
+        "expected prefetch(c0)->take(c0)->prefetch(c1)->take(c1)->prefetch(c2)->take(c2)"
+    );
+    assert!(!model_la.has_prefill_engram(&ids, 0));
+
+    // Cancelling during chunk 0 after layer 1 drops chunk 1's prefetched handle cleanly.
+    let mut cancel_sess = model_la.new_session(128).unwrap();
+    let mut cancel_ladder = Ladder::new();
+    let res = driver
+        .prefill(
+            &mut cancel_sess,
+            &mut cancel_ladder,
+            None,
+            &ids,
+            &|layer| layer >= 2,
+            &mut |_, _| Ok(()),
+        )
+        .unwrap();
+    assert!(matches!(res, Prefilled::Cancelled { at: 0 }));
+    assert!(!model_la.has_prefill_engram(&ids, 32));
+    bank_la.end_turn().unwrap();
+    bank_ref.end_turn().unwrap();
 }
