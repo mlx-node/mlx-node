@@ -242,6 +242,10 @@ pub trait Owners {
     /// The owner's tokens before this call (as long as its start).
     fn history(&self, owner: usize) -> &[u32];
     fn want(&self, owner: usize) -> Want;
+    /// Whether attention cores write into the paged KV pool.
+    fn is_paged(&self) -> bool {
+        false
+    }
     /// Writes the owner's rows of `call.blk`'s layer to its state and
     /// returns `o_lat [rows, H, kv_lora]`. On error the caller puts the
     /// owner's state back.

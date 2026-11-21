@@ -772,6 +772,10 @@ impl WaveOwners for PagedOwners<'_> {
         }
     }
 
+    fn is_paged(&self) -> bool {
+        true
+    }
+
     fn core(&mut self, owner: usize, call: Core<'_>) -> Result<MxArray> {
         let seq = self
             .rows

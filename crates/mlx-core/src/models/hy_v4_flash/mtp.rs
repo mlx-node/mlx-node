@@ -795,7 +795,9 @@ impl MtpLayer {
         let x = self.eh(&emb.reshape(&[1, self.dim])?, &h.reshape(&[1, self.dim])?)?;
         let w = &self.w.attn;
         let p = self.mla.project(w, &x, at + 1)?;
-        let mark = persist_state.then(|| d.index.mark());
+        let prev_held = d.index.held();
+        let fast_rb = persist_state && d.index.tail().rollback_slack() >= 1;
+        let mark = (persist_state && !fast_rb).then(|| d.index.mark());
         let call = Call {
             x: &p.x,
             qr: &p.qr,
@@ -812,6 +814,8 @@ impl MtpLayer {
         if let Err(e) = d.kv.write(&p.kv, at) {
             if let Some(m) = mark {
                 d.index.restore(m)?;
+            } else if fast_rb {
+                d.index.rollback_push(at, prev_held)?;
             }
             return Err(e);
         }
@@ -820,6 +824,8 @@ impl MtpLayer {
             d.kv.truncate(at)?;
             if let Some(m) = mark {
                 d.index.restore(m)?;
+            } else if fast_rb {
+                d.index.rollback_push(at, prev_held)?;
             }
         }
         out
@@ -893,6 +899,7 @@ impl MtpLayer {
         let pkv_w = p.kv.shape_at(1)?;
 
         let mut marks: Vec<Option<IndexerMark>> = Vec::with_capacity(b);
+        let mut fast_rbs: Vec<Option<usize>> = Vec::with_capacity(b);
         let mut kv_written = 0usize;
         let mut attn_parts: Vec<MxArray> = Vec::with_capacity(b);
         let core_res: Result<MxArray> = (|| {
@@ -911,7 +918,9 @@ impl MtpLayer {
                         p.kv.slice(&[lo, 0], &[hi, pkv_w])?,
                     )
                 };
-                marks.push(keep_idx.then(|| d.index.mark()));
+                let fast_rb = keep_idx && d.index.tail().rollback_slack() >= 1;
+                fast_rbs.push(fast_rb.then(|| d.index.held()));
+                marks.push((keep_idx && !fast_rb).then(|| d.index.mark()));
                 let call = Call {
                     x: &px_i,
                     qr: &pqr_i,
@@ -968,6 +977,10 @@ impl MtpLayer {
                 }
                 if let Some(m) = mark {
                     let _ = drafts[j].index.restore(m);
+                } else if let Some(prev_held) = fast_rbs.get(j).copied().flatten()
+                    && drafts[j].index.len() > ats[j]
+                {
+                    let _ = drafts[j].index.rollback_push(ats[j], prev_held);
                 }
             }
         }

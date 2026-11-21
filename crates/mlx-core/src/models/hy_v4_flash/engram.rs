@@ -54,6 +54,9 @@ pub fn normed_rows(rows: &[f32], n: i64, w: &EngramWeights) -> Result<MxArray> {
         )));
     }
     let r = MxArray::from_float32(rows, &[n, cols, hd])?;
+    if let Some(out) = super::ops::try_engram_norm_rows(&r, &w.lookup_norm, ENGRAM_EPS)? {
+        return Ok(out);
+    }
     rms(&r)?
         .mul(&w.lookup_norm.astype(DType::Float32)?)?
         .reshape(&[n, cols * hd])
@@ -136,17 +139,55 @@ pub fn forward(x: &MxArray, rows: &[f32], keep: &[bool], w: &EngramWeights) -> R
             keep.len()
         )));
     }
-    let kv = key_value(&normed_rows(rows, n, w)?, w)?;
+    let nr = normed_rows(rows, n, w)?;
+    let [heads, _] = dims2(&w.kv_b, "engram kv_b")?;
+    if w.kv.shape_at(0)? != heads * d {
+        return Err(bad(format!(
+            "engram_kv has {} rows, kv_b is [{heads}, {d}]",
+            w.kv.shape_at(0)?
+        )));
+    }
+    let kv_raw = qlinear(&nr, &w.kv)?;
+    let xf = if x.dtype()? == DType::Float32 {
+        x.clone()
+    } else {
+        x.astype(DType::Float32)?
+    };
+    let all_keep = keep.iter().all(|&k| k);
+    let mask_arr = if all_keep {
+        None
+    } else {
+        let mask: Vec<u8> = keep.iter().map(|&k| u8::from(k)).collect();
+        Some(MxArray::from_uint8(&mask, &[n])?)
+    };
+    if let Some(y) = super::ops::try_engram_gate_add(
+        &xf,
+        &kv_raw,
+        &w.kv_b,
+        &w.gate,
+        &w.pre_gamma,
+        &w.hc_scale,
+        mask_arr.as_ref(),
+        ENGRAM_EPS,
+    )? {
+        return if x.dtype()? == DType::Float32 {
+            Ok(y)
+        } else {
+            y.astype(x.dtype()?)
+        };
+    }
+    let kv = kv_raw
+        .reshape(&[n, heads, d])?
+        .add(&w.kv_b.astype(DType::Float32)?)?;
     let key = kv.slice(&[0, 0, 0], &[n, hc, d])?;
     let value = kv.slice(&[0, hc, 0], &[n, hc + 1, d])?.reshape(&[n, d])?;
-    let xf = x.astype(DType::Float32)?;
     let gate = stream_gate(&stream_dot(&xf, &key, &w.gate)?)?;
     let scale = gate
         .reshape(&[n, hc, 1])?
         .add(&w.hc_scale.astype(DType::Float32)?)?;
     let s = signal(&value, &w.pre_gamma)?.reshape(&[n, 1, d])?;
     let y = xf.add(&s.mul(&scale)?)?;
-    let y = if keep.iter().all(|&k| k) {
+    let y = if all_keep {
         y
     } else {
         let mask: Vec<u8> = keep.iter().map(|&k| u8::from(k)).collect();

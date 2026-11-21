@@ -405,13 +405,16 @@ impl Block {
         pos_f32: Option<&MxArray>,
         owners: &mut dyn Owners,
     ) -> Result<MxArray> {
+        let split_kv = owners.is_paged() && self.mla.geometry().attn == Attn::Indexed;
         let p = match pos_f32 {
             Some(pos) => self
                 .mla
-                .project_normed_timed_with_pos(&w.attn, x_norm, pos)?,
-            None => self
-                .mla
-                .project_normed_timed(&w.attn, x_norm, &wave.positions())?,
+                .project_normed_timed_with_pos_split(&w.attn, x_norm, pos, split_kv)?,
+            None => {
+                let pos = super::ops::rope_positions_f32(&wave.positions())?;
+                self.mla
+                    .project_normed_timed_with_pos_split(&w.attn, x_norm, &pos, split_kv)?
+            }
         };
         let mut outs = Vec::with_capacity(wave.owners());
         for (i, s) in wave.spans().iter().enumerate() {

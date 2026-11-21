@@ -269,6 +269,14 @@ pub fn fast_partial_rope_tail_with_pos(
     if rd == width {
         return fast_rope_with_pos(x, inv_freqs, pos_arr);
     }
+    let dt = x.dtype()?;
+    if let Some(rot) = try_partial_rope_tail(x, pos_arr, inv_freqs)? {
+        return if dt == DType::Float32 {
+            Ok(rot)
+        } else {
+            rot.astype(dt)
+        };
+    }
     let head = last(x, 0, width - rd)?;
     let tail = last(x, width - rd, width)?;
     let rot = fast_rope_with_pos(&tail, inv_freqs, pos_arr)?;
@@ -1620,5 +1628,286 @@ pub(crate) fn try_indexer_topk_cells(
     Ok(Some(MxArray::from_handle(
         handle,
         "hy_v4_flash indexer_topk_cells",
+    )?))
+}
+
+/// Fused `rms_norm(q_a)`, `rms_norm(kv_lora)`, interleaved precise `rope(k_pe)`,
+/// and optional f16 cast / split `[M, half]` × 2 output directly from strided
+/// `q_kv_gate` / `q_kv` `[M, total]`. Returns `(qr, kv0, kv1_opt)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_mla_prep_q_kv(
+    all: &MxArray,
+    q_norm_w: &MxArray,
+    kv_norm_w: &MxArray,
+    pos: &MxArray,
+    inv_freq: &MxArray,
+    q_lora: i64,
+    kv_lora: i64,
+    rope_dim: i64,
+    norm_eps: f32,
+    out_f16: bool,
+    split_out: bool,
+) -> Result<Option<(MxArray, MxArray, Option<MxArray>)>> {
+    let (Ok(ql), Ok(kvl), Ok(rd)) = (
+        i32::try_from(q_lora),
+        i32::try_from(kv_lora),
+        i32::try_from(rope_dim),
+    ) else {
+        return Ok(None);
+    };
+    let allf = as_f32(all)?;
+    let qnwf = as_f32(q_norm_w)?;
+    let kvnwf = as_f32(kv_norm_w)?;
+    let invf = as_f32(inv_freq)?;
+    let pos_arr = if matches!(pos.dtype()?, DType::Float32 | DType::Int32) {
+        pos.clone()
+    } else {
+        pos.astype(DType::Float32)?
+    };
+    let mut out_qr = std::ptr::null_mut();
+    let mut out_kv0 = std::ptr::null_mut();
+    let mut out_kv1 = std::ptr::null_mut();
+    // SAFETY: input handles are live for the call; out pointers receive new arrays on true.
+    let ok = unsafe {
+        mlx_sys::mlx_hy4_mla_prep_q_kv(
+            allf.as_raw_ptr(),
+            qnwf.as_raw_ptr(),
+            kvnwf.as_raw_ptr(),
+            pos_arr.as_raw_ptr(),
+            invf.as_raw_ptr(),
+            ql,
+            kvl,
+            rd,
+            norm_eps,
+            out_f16,
+            split_out,
+            &mut out_qr,
+            &mut out_kv0,
+            if split_out {
+                &mut out_kv1
+            } else {
+                std::ptr::null_mut()
+            },
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let qr = MxArray::from_handle(out_qr, "hy_v4_flash mla_prep_q_kv qr")?;
+    let kv0 = MxArray::from_handle(out_kv0, "hy_v4_flash mla_prep_q_kv kv0")?;
+    let kv1 = if split_out {
+        Some(MxArray::from_handle(
+            out_kv1,
+            "hy_v4_flash mla_prep_q_kv kv1",
+        )?)
+    } else {
+        None
+    };
+    Ok(Some((qr, kv0, kv1)))
+}
+
+/// Fused `k_b` grouped Q8 (`K = 192`) + strided `q_pe` precise interleaved RoPE
+/// directly into `[M, H, N + rope_dim]` f32 (`[M, H, 576]`).
+pub(crate) fn try_q8_grouped_k192_rope(
+    q_b: &MxArray,
+    k_b: &Dense,
+    heads: i64,
+    pos: &MxArray,
+    inv_freq: &MxArray,
+) -> Result<Option<MxArray>> {
+    let Some((qw, scales, biases)) = k_b.qmm_parts() else {
+        return Ok(None);
+    };
+    if q_b.ndim()? != 3 || q_b.shape_at(1)? != heads || !(1..=16).contains(&q_b.shape_at(0)?) {
+        return Ok(None);
+    }
+    let qbf = as_f32(q_b)?;
+    let invf = as_f32(inv_freq)?;
+    let pos_arr = if matches!(pos.dtype()?, DType::Float32 | DType::Int32) {
+        pos.clone()
+    } else {
+        pos.astype(DType::Float32)?
+    };
+    let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_q8_grouped_k192_rope(
+            qbf.as_raw_ptr(),
+            qw.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases_ptr,
+            pos_arr.as_raw_ptr(),
+            invf.as_raw_ptr(),
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash q8_grouped_k192_rope",
+    )?))
+}
+
+/// Fused indexer kpool-4 compression (`d = 128`): gathers open rows from the
+/// circular `tail_buf` + `tok`, applies `w_val`, `w_gate + ape`, per-channel
+/// softmax weighted sum, RMSNorm, and trailing precise interleaved RoPE,
+/// writing `[n_groups, 128]` directly in `out_dtype`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_kpool_compress(
+    tail_buf: Option<&MxArray>,
+    tok: &MxArray,
+    w_val: &MxArray,
+    w_gate: &MxArray,
+    ape: &MxArray,
+    comp_norm: &MxArray,
+    inv_freq: &MxArray,
+    n_groups: usize,
+    first_group: usize,
+    open_len: usize,
+    tail_start_slot: usize,
+    tail_cap: usize,
+    norm_eps: f32,
+    out_dtype: DType,
+) -> Result<Option<MxArray>> {
+    let (Ok(ng), Ok(fg), Ok(ol), Ok(ts), Ok(tc)) = (
+        i32::try_from(n_groups),
+        i32::try_from(first_group),
+        i32::try_from(open_len),
+        i32::try_from(tail_start_slot),
+        i32::try_from(tail_cap),
+    ) else {
+        return Ok(None);
+    };
+    let out_code = match out_dtype {
+        DType::Float32 => 0,
+        DType::Float16 => 1,
+        DType::BFloat16 => 2,
+        _ => return Ok(None),
+    };
+    let tail_f = tail_buf.map(as_f32).transpose()?;
+    let tok_f = as_f32(tok)?;
+    let wv_f = as_f32(w_val)?;
+    let wg_f = as_f32(w_gate)?;
+    let ape_f = as_f32(ape)?;
+    let cn_f = as_f32(comp_norm)?;
+    let inv_f = as_f32(inv_freq)?;
+    let tail_ptr = tail_f
+        .as_ref()
+        .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_kpool_compress(
+            tail_ptr,
+            tok_f.as_raw_ptr(),
+            wv_f.as_raw_ptr(),
+            wg_f.as_raw_ptr(),
+            ape_f.as_raw_ptr(),
+            cn_f.as_raw_ptr(),
+            inv_f.as_raw_ptr(),
+            ng,
+            fg,
+            ol,
+            ts,
+            tc,
+            norm_eps,
+            out_code,
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(h, "hy_v4_flash kpool_compress")?))
+}
+
+/// Single-dispatch partial interleaved precise RoPE on the trailing `2 * inv_freq.len()`
+/// dims of `x` (`[M, D]` or `[M, H, D]`), copying leading dims untouched.
+pub(crate) fn try_partial_rope_tail(
+    x: &MxArray,
+    pos: &MxArray,
+    inv_freq: &MxArray,
+) -> Result<Option<MxArray>> {
+    let nd = x.ndim()?;
+    if nd != 2 && nd != 3 {
+        return Ok(None);
+    }
+    let xf = as_f32(x)?;
+    let invf = as_f32(inv_freq)?;
+    let pos_arr = if matches!(pos.dtype()?, DType::Float32 | DType::Int32) {
+        pos.clone()
+    } else {
+        pos.astype(DType::Float32)?
+    };
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_partial_rope_tail(xf.as_raw_ptr(), pos_arr.as_raw_ptr(), invf.as_raw_ptr())
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash partial_rope_tail",
+    )?))
+}
+
+/// Fused Engram `rms(rows) * lookup_norm` flattened to `[M, cols * hd]` f32.
+pub(crate) fn try_engram_norm_rows(
+    rows: &MxArray,
+    lookup_norm: &MxArray,
+    eps: f32,
+) -> Result<Option<MxArray>> {
+    let rf = as_f32(rows)?;
+    let nf = as_f32(lookup_norm)?;
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let h = unsafe { mlx_sys::mlx_hy4_engram_norm_rows(rf.as_raw_ptr(), nf.as_raw_ptr(), eps) };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash engram_norm_rows",
+    )?))
+}
+
+/// Fused Engram tail: `kv_b` add + `rms(x)` + `rms(key)` + dot + `stream_gate`
+/// + `hc_scale` + `signal` + optional masked residual add into `[M, HC, D]` f32.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_engram_gate_add(
+    x: &MxArray,
+    kv_raw: &MxArray,
+    kv_b: &MxArray,
+    gate_w: &MxArray,
+    pre_gamma: &MxArray,
+    hc_scale: &MxArray,
+    keep_mask: Option<&MxArray>,
+    eps: f32,
+) -> Result<Option<MxArray>> {
+    let xf = as_f32(x)?;
+    let kvf = as_f32(kv_raw)?;
+    let kvbf = as_f32(kv_b)?;
+    let gwf = as_f32(gate_w)?;
+    let pgf = as_f32(pre_gamma)?;
+    let hsf = as_f32(hc_scale)?;
+    let mask_ptr = keep_mask.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_engram_gate_add(
+            xf.as_raw_ptr(),
+            kvf.as_raw_ptr(),
+            kvbf.as_raw_ptr(),
+            gwf.as_raw_ptr(),
+            pgf.as_raw_ptr(),
+            hsf.as_raw_ptr(),
+            mask_ptr,
+            eps,
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash engram_gate_add",
     )?))
 }

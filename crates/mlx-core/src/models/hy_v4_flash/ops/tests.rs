@@ -1582,6 +1582,872 @@ fn hc_fused_suite_matches_unfused_and_is_row_invariant() {
                     "hc_bridge_head inv d={d} M={m} r={r}"
                 );
             }
+
+            // Lazy Broadcast `res` (matches Layer-0 embedding fanout into multi-TG Hy4HcBridge).
+            let res_bcast = ym
+                .reshape(&[m as i64, 1, d])
+                .unwrap()
+                .broadcast_to(&[m as i64, hc, d])
+                .unwrap();
+            let res_dense = res_bcast.deep_copy().unwrap();
+            let (bx_bcast, bh_bcast, bp_bcast) = hc_bridge(
+                &ym,
+                &res_bcast,
+                &pm,
+                &post_norm_w,
+                &w_next,
+                Some(&next_norm_w),
+                norm_eps,
+                &cfg,
+            )
+            .unwrap();
+            let (bx_dense, bh_dense, bp_dense) = hc_bridge(
+                &ym,
+                &res_dense,
+                &pm,
+                &post_norm_w,
+                &w_next,
+                Some(&next_norm_w),
+                norm_eps,
+                &cfg,
+            )
+            .unwrap();
+            assert_eq!(
+                to_bits(&read(&bx_bcast)),
+                to_bits(&read(&bx_dense)),
+                "hc_bridge broadcast x_out d={d} M={m}"
+            );
+            assert_eq!(
+                to_bits(&read(&bh_bcast)),
+                to_bits(&read(&bh_dense)),
+                "hc_bridge broadcast h_out d={d} M={m}"
+            );
+            assert_eq!(
+                to_bits(&read(&bp_bcast)),
+                to_bits(&read(&bp_dense)),
+                "hc_bridge broadcast post_next d={d} M={m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mla_prep_q_kv_matches_unfused_and_is_row_invariant() {
+    use crate::models::deepseek_v41::ops::inv_freqs;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let eps = 1e-5f32;
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    for &(q_lora, kv_lora, rd, gate_w) in &[(1024i64, 512i64, 64i64, 4096i64), (6, 6, 4, 10)] {
+        let kv_row = kv_lora + rd;
+        let total = q_lora + kv_row + gate_w;
+        let inv = inv_freqs(rd as usize, 10_000.0, None);
+        let inv_arr = rope_inv_freqs(&inv).unwrap();
+        let q_nw = MxArray::from_float32(
+            &det_f32(3101 + q_lora as u64, q_lora as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[q_lora],
+        )
+        .unwrap();
+        let kv_nw = MxArray::from_float32(
+            &det_f32(3201 + kv_lora as u64, kv_lora as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[kv_lora],
+        )
+        .unwrap();
+
+        let all_4 = MxArray::from_float32(
+            &det_f32(3301 + total as u64, 4 * total as usize, 1.5),
+            &[4, total],
+        )
+        .unwrap();
+        let pos_all_u64 = [0u64, 17, 4095, 262_144];
+        let pos_all_i32 = [0i32, 17, 4095, 262_144];
+
+        // Single-row baselines for strict bitwise row invariance (out_f16=true, split=false/true).
+        let mut s_qr = Vec::new();
+        let mut s_kv_f16 = Vec::new();
+        let mut s_k0 = Vec::new();
+        let mut s_k1 = Vec::new();
+        for (r, &pos_val) in pos_all_u64.iter().enumerate() {
+            let row = all_4.slice(&[r as i64, 0], &[r as i64 + 1, total]).unwrap();
+            let pos1 = rope_positions_f32(&[pos_val]).unwrap();
+            let Some((qr1, kv1, _)) = try_mla_prep_q_kv(
+                &row, &q_nw, &kv_nw, &pos1, &inv_arr, q_lora, kv_lora, rd, eps, true, false,
+            )
+            .unwrap() else {
+                return;
+            };
+            let (qr1s, k0_1, k1_1) = try_mla_prep_q_kv(
+                &row, &q_nw, &kv_nw, &pos1, &inv_arr, q_lora, kv_lora, rd, eps, true, true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(to_bits(&read(&qr1)), to_bits(&read(&qr1s)));
+            s_qr.push(to_bits(&read(&qr1)));
+            s_kv_f16.push(kv1.to_uint16_native().unwrap().to_vec());
+            s_k0.push(k0_1.to_uint16_native().unwrap().to_vec());
+            s_k1.push(k1_1.unwrap().to_uint16_native().unwrap().to_vec());
+        }
+
+        for &m in &[1usize, 2, 4] {
+            let sub = all_4.slice(&[0, 0], &[m as i64, total]).unwrap();
+            let pos_f32 = rope_positions_f32(&pos_all_u64[..m]).unwrap();
+            let pos_i32 = MxArray::from_int32(&pos_all_i32[..m], &[m as i64]).unwrap();
+
+            // Unfused reference.
+            let ref_qr = rms_norm(
+                &sub.slice(&[0, 0], &[m as i64, q_lora]).unwrap(),
+                &q_nw,
+                eps,
+            )
+            .unwrap();
+            let ref_kv_n = rms_norm(
+                &sub.slice(&[0, q_lora], &[m as i64, q_lora + kv_lora])
+                    .unwrap(),
+                &kv_nw,
+                eps,
+            )
+            .unwrap();
+            let ref_kpe = fast_rope_with_pos(
+                &sub.slice(&[0, q_lora + kv_lora], &[m as i64, q_lora + kv_row])
+                    .unwrap(),
+                &inv_arr,
+                &pos_f32,
+            )
+            .unwrap();
+            let ref_kv_f32 = MxArray::concatenate(&ref_kv_n, &ref_kpe, -1).unwrap();
+            let ref_kv_f16 = ref_kv_f32.astype(DType::Float16).unwrap();
+
+            for (pos_tag, pos_in) in [("f32", &pos_f32), ("i32", &pos_i32)] {
+                // F32 output mode.
+                let (qr, kv_f32, none1) = try_mla_prep_q_kv(
+                    &sub, &q_nw, &kv_nw, pos_in, &inv_arr, q_lora, kv_lora, rd, eps, false, false,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(none1.is_none());
+                assert_eq!(shape(&qr), [m as i64, q_lora]);
+                assert_eq!(shape(&kv_f32), [m as i64, kv_row]);
+                assert_eq!(kv_f32.dtype().unwrap(), DType::Float32);
+                assert!(
+                    max_err(&read(&qr), &read(&ref_qr)) <= 1e-5,
+                    "mla_prep qr f32 q={q_lora} M={m} pos={pos_tag}"
+                );
+                assert!(
+                    max_err(&read(&kv_f32), &read(&ref_kv_f32)) <= 1e-5,
+                    "mla_prep kv f32 q={q_lora} M={m} pos={pos_tag}"
+                );
+
+                // F16 unsplit output mode.
+                let (qr_h, kv_h, _) = try_mla_prep_q_kv(
+                    &sub, &q_nw, &kv_nw, pos_in, &inv_arr, q_lora, kv_lora, rd, eps, true, false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(kv_h.dtype().unwrap(), DType::Float16);
+                assert!(
+                    max_err(&read(&kv_h), &read(&ref_kv_f16)) <= 1e-5,
+                    "mla_prep kv f16 q={q_lora} M={m} pos={pos_tag}"
+                );
+
+                // F16 split output mode.
+                let (qr_s, k0, k1_opt) = try_mla_prep_q_kv(
+                    &sub, &q_nw, &kv_nw, pos_in, &inv_arr, q_lora, kv_lora, rd, eps, true, true,
+                )
+                .unwrap()
+                .unwrap();
+                let k1 = k1_opt.unwrap();
+                let half = kv_row / 2;
+                assert_eq!(shape(&k0), [m as i64, half]);
+                assert_eq!(shape(&k1), [m as i64, half]);
+                assert_eq!(k0.dtype().unwrap(), DType::Float16);
+                assert_eq!(k1.dtype().unwrap(), DType::Float16);
+                let joined = MxArray::concatenate(&k0, &k1, -1).unwrap();
+                assert_eq!(
+                    joined.to_uint16_native().unwrap().to_vec(),
+                    kv_h.to_uint16_native().unwrap().to_vec(),
+                    "mla_prep split matches unsplit bit-exact q={q_lora} M={m} pos={pos_tag}"
+                );
+
+                // Bitwise row invariance against M=1.
+                let qr_v = read(&qr_s);
+                let kv_bits = kv_h.to_uint16_native().unwrap().to_vec();
+                let k0_bits = k0.to_uint16_native().unwrap().to_vec();
+                let k1_bits = k1.to_uint16_native().unwrap().to_vec();
+                let ql_u = q_lora as usize;
+                let kvr_u = kv_row as usize;
+                let h_u = half as usize;
+                for r in 0..m {
+                    assert_eq!(
+                        to_bits(&qr_v[r * ql_u..(r + 1) * ql_u]),
+                        s_qr[r],
+                        "mla_prep qr inv q={q_lora} M={m} r={r} pos={pos_tag}"
+                    );
+                    assert_eq!(to_bits(&read(&qr_h)[r * ql_u..(r + 1) * ql_u]), s_qr[r]);
+                    assert_eq!(
+                        &kv_bits[r * kvr_u..(r + 1) * kvr_u],
+                        s_kv_f16[r].as_slice(),
+                        "mla_prep kv inv q={q_lora} M={m} r={r} pos={pos_tag}"
+                    );
+                    assert_eq!(
+                        &k0_bits[r * h_u..(r + 1) * h_u],
+                        s_k0[r].as_slice(),
+                        "mla_prep k0 inv q={q_lora} M={m} r={r} pos={pos_tag}"
+                    );
+                    assert_eq!(
+                        &k1_bits[r * h_u..(r + 1) * h_u],
+                        s_k1[r].as_slice(),
+                        "mla_prep k1 inv q={q_lora} M={m} r={r} pos={pos_tag}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn q8_grouped_k192_rope_matches_unfused_and_is_row_invariant() {
+    use crate::models::deepseek_v41::ops::inv_freqs;
+    use crate::models::hy_v4_flash::attention::grouped_mm_t_mgh;
+    use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    let nope = 192i64;
+    let rd = 64i64;
+    let qk = nope + rd;
+    let inv = inv_freqs(rd as usize, 10_000.0, None);
+    let inv_arr = rope_inv_freqs(&inv).unwrap();
+    let pos_all_u64 = [0u64, 23, 509, 262_144];
+    let pos_all_i32 = [0i32, 23, 509, 262_144];
+
+    // Covers real Hy4 (H=32, N=512) and N < 16 edge case (H=2, N=8).
+    for &(heads, n_out) in &[(32i64, 512i64), (2, 8)] {
+        let kb_f32 = MxArray::from_float32(
+            &det_f32(3401 + heads as u64, (heads * n_out * nope) as usize, 0.2),
+            &[heads * n_out, nope],
+        )
+        .unwrap();
+        let kb_sym = quantize_sym_q8_array(&kb_f32).unwrap();
+        let Dense::SymQ8 { w, scales } = &kb_sym else {
+            unreachable!();
+        };
+        let scales_f32 = scales.astype(DType::Float32).unwrap();
+        let biases_f32 = scales_f32.mul_scalar(-128.0).unwrap();
+        let kb_qmm = Dense::Qmm {
+            w: w.clone(),
+            scales: scales_f32,
+            biases: biases_f32,
+        };
+
+        let qb_4 = MxArray::from_float32(
+            &det_f32(3501 + heads as u64, (4 * heads * qk) as usize, 1.0),
+            &[4, heads, qk],
+        )
+        .unwrap();
+
+        for (tag, kb) in [("sym_q8", &kb_sym), ("qmm_f32", &kb_qmm)] {
+            let mut single_rows = Vec::new();
+            for (r, &pos_val) in pos_all_u64.iter().enumerate() {
+                let row = qb_4
+                    .slice(&[r as i64, 0, 0], &[r as i64 + 1, heads, qk])
+                    .unwrap();
+                let pos1 = rope_positions_f32(&[pos_val]).unwrap();
+                let Some(q1) = try_q8_grouped_k192_rope(&row, kb, heads, &pos1, &inv_arr).unwrap()
+                else {
+                    return;
+                };
+                single_rows.push(to_bits(&read(&q1)));
+            }
+
+            let out_n = (n_out + rd) as usize;
+            for &m in &[1usize, 2, 4] {
+                let sub = qb_4.slice(&[0, 0, 0], &[m as i64, heads, qk]).unwrap();
+                let pos_f32 = rope_positions_f32(&pos_all_u64[..m]).unwrap();
+                let pos_i32 = MxArray::from_int32(&pos_all_i32[..m], &[m as i64]).unwrap();
+
+                let ref_nope = sub.slice(&[0, 0, 0], &[m as i64, heads, nope]).unwrap();
+                let ref_pe = fast_rope_with_pos(
+                    &sub.slice(&[0, 0, nope], &[m as i64, heads, qk]).unwrap(),
+                    &inv_arr,
+                    &pos_f32,
+                )
+                .unwrap();
+                let ref_abs = grouped_mm_t_mgh(kb, &ref_nope, heads).unwrap();
+                let ref_q = read(&MxArray::concatenate(&ref_abs, &ref_pe, -1).unwrap());
+
+                for (ptag, pin) in [("f32", &pos_f32), ("i32", &pos_i32)] {
+                    let got = try_q8_grouped_k192_rope(&sub, kb, heads, pin, &inv_arr)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(shape(&got), [m as i64, heads, n_out + rd]);
+                    let got_v = read(&got);
+                    let err = max_err(&got_v, &ref_q);
+                    assert!(
+                        err <= 1e-5,
+                        "q8_grouped_k192_rope {tag} H={heads} N={n_out} M={m} pos={ptag}: err={err:e}"
+                    );
+                    let stride = heads as usize * out_n;
+                    for r in 0..m {
+                        assert_eq!(
+                            to_bits(&got_v[r * stride..(r + 1) * stride]),
+                            single_rows[r],
+                            "q8_grouped_k192_rope inv {tag} H={heads} M={m} r={r} pos={ptag}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn kpool_compress_and_partial_rope_tail_match_unfused() {
+    use crate::models::deepseek_v41::ops::inv_freqs;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let eps = 1e-5f32;
+    let d = 128i64;
+    let rd = 64i64;
+    let inv = inv_freqs(rd as usize, 1e7, None);
+    let inv_arr = rope_inv_freqs(&inv).unwrap();
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    let w_val = MxArray::from_float32(&det_f32(3601, (d * d) as usize, 0.2), &[d, d]).unwrap();
+    let w_gate = MxArray::from_float32(&det_f32(3602, (d * d) as usize, 0.2), &[d, d]).unwrap();
+    let ape = MxArray::from_float32(&det_f32(3603, (4 * d) as usize, 0.5), &[4, d]).unwrap();
+    let comp_norm = MxArray::from_float32(
+        &det_f32(3604, d as usize, 0.5)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>(),
+        &[d],
+    )
+    .unwrap();
+
+    let ref_pool = |grp: &MxArray, first: usize| -> Vec<f32> {
+        let k = grp.shape_at(0).unwrap() as usize;
+        let v = grp
+            .matmul(&w_val.transpose(Some(&[1, 0])).unwrap())
+            .unwrap();
+        let gt = grp
+            .matmul(&w_gate.transpose(Some(&[1, 0])).unwrap())
+            .unwrap()
+            .add(&ape)
+            .unwrap();
+        let mx = gt.max(Some(&[1]), Some(true)).unwrap();
+        let e = gt.sub(&mx).unwrap().exp().unwrap();
+        let p = e.div(&e.sum(Some(&[1]), Some(true)).unwrap()).unwrap();
+        let pooled = v.mul(&p).unwrap().sum(Some(&[1]), Some(false)).unwrap();
+        let normed = rms_norm(&pooled, &comp_norm, eps).unwrap();
+        let pos: Vec<u64> = (first..first + k).map(|g| (g * 4) as u64).collect();
+        let pos_arr = rope_positions_f32(&pos).unwrap();
+        let head = normed.slice(&[0, 0], &[k as i64, d - rd]).unwrap();
+        let tail = normed.slice(&[0, d - rd], &[k as i64, d]).unwrap();
+        let rot = fast_rope_with_pos(&tail, &inv_arr, &pos_arr).unwrap();
+        read(&MxArray::concatenate(&head, &rot, -1).unwrap())
+    };
+
+    // Exercise circular ring wrap-around, open_len 0..=3, n_groups 1, 2, 4, and f32/f16/bf16 outputs.
+    let tail_cap = 10usize;
+    let ring_rows = det_f32(3605, tail_cap * d as usize, 1.0);
+    let ring_arr = MxArray::from_float32(&ring_rows, &[tail_cap as i64, d]).unwrap();
+    let tok_rows = det_f32(3606, 16 * d as usize, 1.0);
+    let tok_arr = MxArray::from_float32(&tok_rows, &[16, d]).unwrap();
+
+    for &(n_groups, first_group, open_len, start_slot) in &[
+        (1usize, 0usize, 0usize, 0usize),
+        (1, 17, 1, 9),
+        (1, 1024, 2, 9),
+        (1, 65_535, 3, 8),
+        (2, 5, 3, 9),
+        (4, 100, 2, 9),
+    ] {
+        let mut linear = Vec::with_capacity(n_groups * 4 * d as usize);
+        for t in 0..n_groups * 4 {
+            if t < open_len {
+                let slot = (start_slot + t) % tail_cap;
+                linear.extend_from_slice(&ring_rows[slot * d as usize..(slot + 1) * d as usize]);
+            } else {
+                let tr = t - open_len;
+                linear.extend_from_slice(&tok_rows[tr * d as usize..(tr + 1) * d as usize]);
+            }
+        }
+        let grp = MxArray::from_float32(&linear, &[n_groups as i64, 4, d]).unwrap();
+        let want_f32 = ref_pool(&grp, first_group);
+
+        let Some(got_f32) = try_kpool_compress(
+            (open_len > 0).then_some(&ring_arr),
+            &tok_arr,
+            &w_val,
+            &w_gate,
+            &ape,
+            &comp_norm,
+            &inv_arr,
+            n_groups,
+            first_group,
+            open_len,
+            start_slot,
+            tail_cap,
+            eps,
+            DType::Float32,
+        )
+        .unwrap() else {
+            return;
+        };
+        assert_eq!(shape(&got_f32), [n_groups as i64, d]);
+        let err = max_err(&read(&got_f32), &want_f32);
+        assert!(
+            err <= 1e-5,
+            "kpool_compress f32 ng={n_groups} fg={first_group} open={open_len}: err={err:e}"
+        );
+
+        for dt in [DType::Float16, DType::BFloat16] {
+            let got_dt = try_kpool_compress(
+                (open_len > 0).then_some(&ring_arr),
+                &tok_arr,
+                &w_val,
+                &w_gate,
+                &ape,
+                &comp_norm,
+                &inv_arr,
+                n_groups,
+                first_group,
+                open_len,
+                start_slot,
+                tail_cap,
+                eps,
+                dt,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(got_dt.dtype().unwrap(), dt);
+            let want_dt = read(&got_f32.astype(dt).unwrap());
+            assert_eq!(
+                to_bits(&read(&got_dt)),
+                to_bits(&want_dt),
+                "kpool_compress cast {dt:?} ng={n_groups} open={open_len}"
+            );
+        }
+    }
+
+    // Fused partial RoPE tail on [M, 128] and [M, 16, 128] across M = 1, 2, 4.
+    let pos_all = [0u64, 7, 1024, 262_144];
+    let x3_all = MxArray::from_float32(&det_f32(3610, 4 * 16 * 128, 1.5), &[4, 16, 128]).unwrap();
+    let mut single3 = Vec::new();
+    for (r, &pos_val) in pos_all.iter().enumerate() {
+        let row = x3_all
+            .slice(&[r as i64, 0, 0], &[r as i64 + 1, 16, 128])
+            .unwrap();
+        let pos1 = rope_positions_f32(&[pos_val]).unwrap();
+        let y1 = try_partial_rope_tail(&row, &pos1, &inv_arr)
+            .unwrap()
+            .unwrap();
+        single3.push(to_bits(&read(&y1)));
+    }
+    for &m in &[1usize, 2, 4] {
+        let xm = x3_all.slice(&[0, 0, 0], &[m as i64, 16, 128]).unwrap();
+        let pos_m = rope_positions_f32(&pos_all[..m]).unwrap();
+        let got = try_partial_rope_tail(&xm, &pos_m, &inv_arr)
+            .unwrap()
+            .unwrap();
+        let head = xm.slice(&[0, 0, 0], &[m as i64, 16, 64]).unwrap();
+        let tail = xm.slice(&[0, 0, 64], &[m as i64, 16, 128]).unwrap();
+        let want = read(
+            &MxArray::concatenate(
+                &head,
+                &fast_rope_with_pos(&tail, &inv_arr, &pos_m).unwrap(),
+                -1,
+            )
+            .unwrap(),
+        );
+        let got_v = read(&got);
+        let err = max_err(&got_v, &want);
+        assert!(err <= 1e-5, "partial_rope_tail 3D M={m}: err={err:e}");
+        for r in 0..m {
+            assert_eq!(
+                to_bits(&got_v[r * 16 * 128..(r + 1) * 16 * 128]),
+                single3[r],
+                "partial_rope_tail 3D inv M={m} r={r}"
+            );
+        }
+    }
+}
+
+#[test]
+fn engram_fused_norm_and_gate_add_match_unfused_and_are_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    // Real Hy4 (HC=4, D=3072, COLS=16, HD=96 -> USE_REG=true), small VEC4 (D=8), and scalar (D=66).
+    for &(hc, d, cols, hd) in &[(4i64, 3072i64, 16i64, 96i64), (4, 8, 2, 4), (4, 66, 4, 12)] {
+        let lookup_norm = MxArray::from_float32(
+            &det_f32(3701 + d as u64, (cols * hd) as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[cols, hd],
+        )
+        .unwrap();
+        let kv_b = MxArray::from_float32(
+            &det_f32(3702 + d as u64, ((hc + 1) * d) as usize, 0.25),
+            &[hc + 1, d],
+        )
+        .unwrap();
+        let gate_w =
+            MxArray::from_float32(&det_f32(3703 + d as u64, (hc * d) as usize, 0.5), &[hc, d])
+                .unwrap();
+        let pre_gamma = MxArray::from_float32(
+            &det_f32(3704 + d as u64, d as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[d],
+        )
+        .unwrap();
+        let hc_scale =
+            MxArray::from_float32(&det_f32(3705 + d as u64, (hc * d) as usize, 0.5), &[hc, d])
+                .unwrap();
+
+        let rows_4 = MxArray::from_float32(
+            &det_f32(3706 + d as u64, (4 * cols * hd) as usize, 1.5),
+            &[4, cols, hd],
+        )
+        .unwrap();
+        let x_4 = MxArray::from_float32(
+            &det_f32(3707 + d as u64, (4 * hc * d) as usize, 1.5),
+            &[4, hc, d],
+        )
+        .unwrap();
+        let kv_raw_4 = MxArray::from_float32(
+            &det_f32(3708 + d as u64, (4 * (hc + 1) * d) as usize, 1.2),
+            &[4, (hc + 1) * d],
+        )
+        .unwrap();
+
+        // Single-row baselines for strict bitwise row invariance.
+        let mut s_nr = Vec::new();
+        let mut s_out = Vec::new();
+        for r in 0..4usize {
+            let rr = rows_4
+                .slice(&[r as i64, 0, 0], &[r as i64 + 1, cols, hd])
+                .unwrap();
+            let xr = x_4
+                .slice(&[r as i64, 0, 0], &[r as i64 + 1, hc, d])
+                .unwrap();
+            let kvr = kv_raw_4
+                .slice(&[r as i64, 0], &[r as i64 + 1, (hc + 1) * d])
+                .unwrap();
+            let Some(nr1) = try_engram_norm_rows(&rr, &lookup_norm, ENGRAM_EPS).unwrap() else {
+                return;
+            };
+            let out1 = try_engram_gate_add(
+                &xr, &kvr, &kv_b, &gate_w, &pre_gamma, &hc_scale, None, ENGRAM_EPS,
+            )
+            .unwrap()
+            .unwrap();
+            s_nr.push(to_bits(&read(&nr1)));
+            s_out.push(to_bits(&read(&out1)));
+        }
+
+        for &m in &[1usize, 2, 4] {
+            let rm = rows_4.slice(&[0, 0, 0], &[m as i64, cols, hd]).unwrap();
+            let xm = x_4.slice(&[0, 0, 0], &[m as i64, hc, d]).unwrap();
+            let kvm = kv_raw_4.slice(&[0, 0], &[m as i64, (hc + 1) * d]).unwrap();
+
+            // 1. normed_rows parity + invariance.
+            let got_nr = try_engram_norm_rows(&rm, &lookup_norm, ENGRAM_EPS)
+                .unwrap()
+                .unwrap();
+            let ref_nr = read(
+                &rms_norm_unweighted(&rm, ENGRAM_EPS)
+                    .unwrap()
+                    .mul(&lookup_norm)
+                    .unwrap()
+                    .reshape(&[m as i64, cols * hd])
+                    .unwrap(),
+            );
+            let got_nr_v = read(&got_nr);
+            assert!(
+                max_err(&got_nr_v, &ref_nr) <= 1e-5,
+                "engram_norm_rows d={d} M={m}"
+            );
+            let nr_stride = (cols * hd) as usize;
+            for r in 0..m {
+                assert_eq!(
+                    to_bits(&got_nr_v[r * nr_stride..(r + 1) * nr_stride]),
+                    s_nr[r],
+                    "engram_norm_rows inv d={d} M={m} r={r}"
+                );
+            }
+
+            // 2. engram_gate_add unmasked parity + invariance.
+            let kv = kvm
+                .reshape(&[m as i64, hc + 1, d])
+                .unwrap()
+                .add(&kv_b)
+                .unwrap();
+            let key = kv.slice(&[0, 0, 0], &[m as i64, hc, d]).unwrap();
+            let value = kv
+                .slice(&[0, hc, 0], &[m as i64, hc + 1, d])
+                .unwrap()
+                .reshape(&[m as i64, d])
+                .unwrap();
+            let ref_gate = stream_gate(&stream_dot(&xm, &key, &gate_w).unwrap()).unwrap();
+            let ref_scale = ref_gate
+                .reshape(&[m as i64, hc, 1])
+                .unwrap()
+                .add(&hc_scale)
+                .unwrap();
+            let ref_sig = signal(&value, &pre_gamma)
+                .unwrap()
+                .reshape(&[m as i64, 1, d])
+                .unwrap();
+            let ref_out = read(&xm.add(&ref_sig.mul(&ref_scale).unwrap()).unwrap());
+
+            let got_out = try_engram_gate_add(
+                &xm, &kvm, &kv_b, &gate_w, &pre_gamma, &hc_scale, None, ENGRAM_EPS,
+            )
+            .unwrap()
+            .unwrap();
+            let got_out_v = read(&got_out);
+            let err = max_err(&got_out_v, &ref_out);
+            assert!(err <= 1e-5, "engram_gate_add d={d} M={m}: err={err:e}");
+            let row_stride = (hc * d) as usize;
+            for r in 0..m {
+                assert_eq!(
+                    to_bits(&got_out_v[r * row_stride..(r + 1) * row_stride]),
+                    s_out[r],
+                    "engram_gate_add inv d={d} M={m} r={r}"
+                );
+            }
+
+            // 3. Masked rows stay bit-identical to x; kept rows match unmasked bit-for-bit.
+            let mask_v: Vec<u8> = (0..m).map(|r| u8::from(r % 2 == 0)).collect();
+            let mask_arr = MxArray::from_uint8(&mask_v, &[m as i64]).unwrap();
+            let masked_out = read(
+                &try_engram_gate_add(
+                    &xm,
+                    &kvm,
+                    &kv_b,
+                    &gate_w,
+                    &pre_gamma,
+                    &hc_scale,
+                    Some(&mask_arr),
+                    ENGRAM_EPS,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            let xm_v = read(&xm);
+            for (r, &keep) in mask_v.iter().enumerate() {
+                let lo = r * row_stride;
+                let hi = (r + 1) * row_stride;
+                if keep == 0 {
+                    assert_eq!(
+                        to_bits(&masked_out[lo..hi]),
+                        to_bits(&xm_v[lo..hi]),
+                        "engram_gate_add masked row d={d} M={m} r={r}"
+                    );
+                } else {
+                    assert_eq!(
+                        to_bits(&masked_out[lo..hi]),
+                        to_bits(&got_out_v[lo..hi]),
+                        "engram_gate_add kept row d={d} M={m} r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Stress M = 512, HC = 4, D = 3072 across repeated launches to catch any
+    // threadgroup reduction race on tg_red (including negative gate dot sums).
+    let (hc, d, m) = (4i64, 3072i64, 512i64);
+    let kv_b =
+        MxArray::from_float32(&det_f32(3801, ((hc + 1) * d) as usize, 0.25), &[hc + 1, d]).unwrap();
+    let gate_w = MxArray::from_float32(
+        &det_f32(3802, (hc * d) as usize, 1.0)
+            .into_iter()
+            .map(|v| -v.abs() - 0.5)
+            .collect::<Vec<_>>(),
+        &[hc, d],
+    )
+    .unwrap();
+    let pre_gamma = MxArray::from_float32(
+        &det_f32(3803, d as usize, 0.5)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>(),
+        &[d],
+    )
+    .unwrap();
+    let hc_scale = MxArray::from_float32(&det_f32(3804, (hc * d) as usize, 0.5), &[hc, d]).unwrap();
+    let xm =
+        MxArray::from_float32(&det_f32(3805, (m * hc * d) as usize, 1.5), &[m, hc, d]).unwrap();
+    let kvm = MxArray::from_float32(
+        &det_f32(3806, (m * (hc + 1) * d) as usize, 1.2),
+        &[m, (hc + 1) * d],
+    )
+    .unwrap();
+    let kv = kvm.reshape(&[m, hc + 1, d]).unwrap().add(&kv_b).unwrap();
+    let key = kv.slice(&[0, 0, 0], &[m, hc, d]).unwrap();
+    let value = kv
+        .slice(&[0, hc, 0], &[m, hc + 1, d])
+        .unwrap()
+        .reshape(&[m, d])
+        .unwrap();
+    let ref_gate = stream_gate(&stream_dot(&xm, &key, &gate_w).unwrap()).unwrap();
+    let ref_scale = ref_gate
+        .reshape(&[m, hc, 1])
+        .unwrap()
+        .add(&hc_scale)
+        .unwrap();
+    let ref_sig = signal(&value, &pre_gamma)
+        .unwrap()
+        .reshape(&[m, 1, d])
+        .unwrap();
+    let ref_out = read(&xm.add(&ref_sig.mul(&ref_scale).unwrap()).unwrap());
+
+    let mut first_bits: Option<Vec<u32>> = None;
+    for rep in 0..8 {
+        let got = read(
+            &try_engram_gate_add(
+                &xm, &kvm, &kv_b, &gate_w, &pre_gamma, &hc_scale, None, ENGRAM_EPS,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "engram_gate_add stress rep={rep} produced non-finite value"
+        );
+        let err = max_err(&got, &ref_out);
+        assert!(
+            err <= 1e-5,
+            "engram_gate_add stress M=512 rep={rep}: err={err:e}"
+        );
+        let bits = to_bits(&got);
+        if let Some(prev) = &first_bits {
+            assert_eq!(
+                bits, *prev,
+                "engram_gate_add stress M=512 rep={rep} diverged from rep=0"
+            );
+        } else {
+            first_bits = Some(bits);
+        }
+    }
+}
+
+#[test]
+#[ignore = "microbenchmark for hc_bridge 1-TG vs multi-TG"]
+fn bench_hc_bridge_latency() {
+    crate::models::hy_v4_flash::exact_f32();
+    let hc = 4i64;
+    let d = 3072i64;
+    let hd = (hc * d) as usize;
+    let cfg = HcConfig {
+        count: hc as usize,
+        eps: 1e-6,
+        magnitude: 2.0,
+    };
+    let n_cold = 400usize; // 400 * 393 KiB = 157 MB > SLC
+    let weights: Vec<(HcWeights, MxArray, MxArray)> = (0..n_cold)
+        .map(|l| {
+            let scale_w = 1.0 / (hd as f32).sqrt();
+            let w = HcWeights {
+                weight: MxArray::from_float32(
+                    &det_f32(5000 + l as u64, (2 * hc) as usize * hd, scale_w),
+                    &[2 * hc, hc * d],
+                )
+                .unwrap(),
+                scale: MxArray::from_float32(&[0.75, 1.25], &[2]).unwrap(),
+                base: MxArray::from_float32(
+                    &det_f32(6000 + l as u64, (2 * hc) as usize, 0.5),
+                    &[2 * hc],
+                )
+                .unwrap(),
+            };
+            let pnw = MxArray::from_float32(&vec![1.0f32; d as usize], &[d]).unwrap();
+            let nnw = MxArray::from_float32(&vec![1.0f32; d as usize], &[d]).unwrap();
+            (w, pnw, nnw)
+        })
+        .collect();
+    // Materialize weights once and boost GPU clocks before timing.
+    let w_refs: Vec<&MxArray> = weights.iter().map(|(w, _, _)| &w.weight).collect();
+    MxArray::eval_arrays_with_context(&w_refs, "bench weights").unwrap();
+
+    for (label, slice_len, iters) in [("warm83", 83usize, 30usize), ("cold400", n_cold, 10usize)] {
+        let w_slice = &weights[..slice_len];
+        for &m in &[1usize, 2, 4] {
+            let x0 =
+                MxArray::from_float32(&det_f32(7000 + m as u64, m * hd, 1.0), &[m as i64, hc, d])
+                    .unwrap();
+            let y0 = MxArray::from_float32(
+                &det_f32(8000 + m as u64, m * d as usize, 1.0),
+                &[m as i64, d],
+            )
+            .unwrap();
+            let p0 =
+                MxArray::from_float32(&vec![0.5f32; m * hc as usize], &[m as i64, hc]).unwrap();
+            MxArray::eval_arrays_with_context(&[&x0, &y0, &p0], "bench warmup inputs").unwrap();
+
+            let run_once = || {
+                let mut x = x0.clone();
+                let mut y = y0.clone();
+                let mut p = p0.clone();
+                for (w, pnw, nnw) in w_slice {
+                    let (nx, nh, np) =
+                        hc_bridge(&y, &x, &p, pnw, w, Some(nnw), 1e-5, &cfg).unwrap();
+                    x = nx;
+                    y = nh;
+                    p = np;
+                }
+                MxArray::eval_arrays_with_context(&[&x, &y, &p], "bench hc_bridge").unwrap();
+            };
+            for _ in 0..8 {
+                run_once();
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                run_once();
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_ms = times[times.len() / 2];
+            let per_us = med_ms * 1000.0 / slice_len as f64;
+            let eq83_ms = per_us * 83.0 / 1000.0;
+            eprintln!(
+                "hc_bridge {label} M={m} splits={}: {per_us:.2} us/call (83x = {eq83_ms:.3} ms)",
+                std::env::var("MLX_HY4_HC_BRIDGE_SPLITS").unwrap_or_else(|_| "default".into()),
+            );
         }
     }
 }

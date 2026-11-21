@@ -1729,4 +1729,336 @@ mod fused_metal {
         let want_p1 = slots1.slots(&adapter, &flat_decode).unwrap();
         assert_eq!(read_i32(&got_p1), read_i32(&want_p1), "paged decode D=128");
     }
+
+    #[test]
+    fn tok_tail_ring_wrap_truncate_rollback_and_snapshot_parity() {
+        crate::models::hy_v4_flash::exact_f32();
+        let g = IndexerGeometry {
+            n_heads: 16,
+            head_dim: 128,
+            rope_dim: 64,
+            kpool: 4,
+            n_top: 8,
+            select_tail: true,
+            eps: 1e-5,
+            weight_scale: (2048f32).sqrt().recip(),
+            rope_theta: 1e7,
+        };
+        let keep = g.kpool - 1 + WINDOW_SLACK;
+        let all_rows = inputs(64, g.head_dim, 401);
+
+        // Push across multiple circular ring wraps with M = 1, 2, 4, 3 steps.
+        let mut tail = TokTail::new(&g);
+        let mut pos = 0usize;
+        let steps = [
+            1usize, 2, 4, 3, 1, 1, 2, 4, 1, 3, 2, 4, 1, 2, 4, 1, 3, 2, 4, 3,
+        ];
+        for &n in &steps {
+            let chunk = rows_of(&all_rows[pos..pos + n]);
+            tail.push(&chunk).unwrap();
+            pos += n;
+            assert_eq!(tail.len(), pos);
+            assert_eq!(tail.held(), pos.min(keep));
+            let snap = tail.snapshot().unwrap();
+            assert_eq!(snap.len(), pos);
+            assert_eq!(snap.held(), pos.min(keep));
+            let got = read(snap.rows().unwrap());
+            let start = pos - pos.min(keep);
+            let want: Vec<f32> = all_rows[start..pos].iter().flatten().copied().collect();
+            assert_eq!(got, want, "ring snapshot mismatch at pos={pos}");
+
+            // Roundtrip through of_rows produces identical linear snapshot.
+            let rebuilt = TokTail::of_rows(&g, snap.rows().cloned(), pos).unwrap();
+            assert_eq!(read(rebuilt.rows().unwrap()), want);
+        }
+
+        // O(1) rollback within rollback_slack (1..=4) restores all `keep` retained rows.
+        assert!(tail.rollback_slack() >= 4);
+        let before_pos = pos;
+        let before_held = tail.held();
+        let push4 = rows_of(&all_rows[pos..pos + 4]);
+        tail.push(&push4).unwrap();
+        assert_eq!(tail.len(), before_pos + 4);
+        tail.rollback_push(before_pos, before_held);
+        assert_eq!(tail.len(), before_pos);
+        assert_eq!(tail.held(), before_held);
+        let snap_after_rb = tail.snapshot().unwrap();
+        let want_after_rb: Vec<f32> = all_rows[before_pos - keep..before_pos]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            read(snap_after_rb.rows().unwrap()),
+            want_after_rb,
+            "ring O(1) rollback corrupted retained rows"
+        );
+
+        // End-to-end real D=128 kpool=4 decode chunks crossing ring wraps and group closures.
+        let (w, hw) = indexer_weights(&g, 409);
+        let ix = Indexer::new(g.clone(), &w).unwrap();
+        let n = 40usize;
+        let xs = inputs(n, D, 410);
+        let qrs = inputs(n, Q_LORA, 411);
+        let want = host_cells(&g, &hw, &xs, &qrs);
+
+        let run_schedule = |sched: &[usize]| -> (Vec<Vec<i32>>, Vec<f32>) {
+            let mut st = IndexerState::new(64, &g);
+            let mut cells = Vec::new();
+            let mut at = 0usize;
+            for &m in sched {
+                let got = ix
+                    .select(
+                        &w,
+                        Call {
+                            x: &rows_of(&xs[at..at + m]),
+                            qr: &rows_of(&qrs[at..at + m]),
+                            start: at,
+                            kind: RowKind::Decode,
+                        },
+                        &mut st,
+                    )
+                    .unwrap();
+                cells.extend(cell_sets(&got));
+                at += m;
+            }
+            let pooled = read(st.pooled.rows().unwrap());
+            (cells, pooled)
+        };
+
+        for (dt, tol) in [(DType::Float32, 1e-5f64), (DType::Float16, 1e-3f64)] {
+            crate::models::hy_v4_flash::cache::with_row_dtype(dt, || {
+                let (cells_1, pooled_1) = run_schedule(&vec![1; n]);
+                assert_eq!(cells_1, want, "D=128 {dt:?} M=1 schedule vs host");
+                for sched in [
+                    vec![2; n / 2],
+                    vec![4; n / 4],
+                    vec![3, 1, 2, 4, 1, 3, 2, 4, 1, 2, 3, 4, 2, 1, 3, 4],
+                ] {
+                    let (cells, pooled) = run_schedule(&sched);
+                    assert_eq!(cells, want, "D=128 {dt:?} schedule {sched:?} vs host");
+                    assert_eq!(pooled.len(), pooled_1.len());
+                    for (i, (a, b)) in pooled.iter().zip(&pooled_1).enumerate() {
+                        close(
+                            *a,
+                            *b,
+                            tol,
+                            tol,
+                            &format!("D=128 {dt:?} pooled {sched:?}[{i}]"),
+                        );
+                    }
+                }
+            });
+        }
+
+        // Failed decode update on real D=128 fast-rollback path leaves state bit-exact.
+        let mut st = IndexerState::new(64, &g);
+        ix.update(&w, &rows_of(&xs[..18]), 0, &mut st).unwrap();
+        let snap_before = read(st.tail().snapshot().unwrap().rows().unwrap());
+        let live_pooled = |s: &IndexerState| {
+            read(
+                &s.pooled
+                    .rows()
+                    .unwrap()
+                    .slice(&[0, 0], &[s.pooled_len() as i64, g.head_dim as i64])
+                    .unwrap(),
+            )
+        };
+        let pooled_before = live_pooled(&st);
+        let meta_before = (st.len(), st.pooled_len(), st.held());
+        {
+            let _armed = crate::array::fail_native_call_at(
+                "hy_v4_flash indexer tail",
+                "test: ring tail eval failed",
+            );
+            assert!(ix.update(&w, &rows_of(&xs[18..22]), 18, &mut st).is_err());
+        }
+        assert_eq!((st.len(), st.pooled_len(), st.held()), meta_before);
+        assert_eq!(
+            read(st.tail().snapshot().unwrap().rows().unwrap()),
+            snap_before
+        );
+        assert_eq!(live_pooled(&st), pooled_before);
+        ix.update(&w, &rows_of(&xs[18..22]), 18, &mut st).unwrap();
+        assert_eq!((st.len(), st.pooled_len()), (22, 5));
+    }
+
+    #[test]
+    fn indexer_score_decode_nax_large_contexts_flat_and_paged_match_reference() {
+        crate::models::hy_v4_flash::exact_f32();
+        let d = 128usize;
+        let index_rows = 8usize;
+
+        for (h, s, n_groups, start_g, seed) in [
+            (16usize, 1usize, 256usize, 0usize, 701u64),
+            (16, 2, 256, 7, 702),
+            (16, 4, 256, 13, 703),
+            (16, 1, 2048, 0, 704),
+            (16, 2, 2048, 9, 705),
+            (16, 4, 2048, 5, 706),
+            (16, 1, 7763, 3, 707),
+            (16, 1, 8192, 0, 708),
+            (16, 2, 8192, 11, 709),
+            (16, 4, 8192, 4, 710),
+            (8, 2, 256, 3, 711),
+        ] {
+            let mut rng = Rng(seed);
+            let q_vec = rng.vec(s * h * d, 1.5);
+            let w_vec = rng.vec(s * h, 0.2);
+            let k_f32_vec = rng.vec(n_groups * d, 1.5);
+
+            let q = arr(&q_vec, &[s, h, d]);
+            let w = arr(&w_vec, &[s, h]);
+            let keys_f16 = arr(&k_f32_vec, &[n_groups, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
+            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
+
+            let cap_g = start_g + n_groups + 17;
+            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+            let mut flat_bits = vec![0u16; cap_g * d];
+            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
+            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
+
+            let Some(got_flat_arr) =
+                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
+            else {
+                eprintln!("skipping indexer_score large context test (no GPU)");
+                return;
+            };
+            let got_flat = read(&got_flat_arr);
+            assert_eq!(got_flat.len(), want.len());
+            let mut max_diff = 0.0f32;
+            for (&g, &wv) in got_flat.iter().zip(&want) {
+                assert!(g.is_finite(), "non-finite flat H={h} S={s} N_g={n_groups}");
+                max_diff = max_diff.max((g - wv).abs());
+            }
+            assert!(
+                max_diff <= 1e-3,
+                "flat H={h} S={s} N_g={n_groups} start_g={start_g}: max_abs={max_diff:e} > 1e-3"
+            );
+
+            let n_pages = (start_g + n_groups).div_ceil(index_rows);
+            let n_blocks = n_pages + 9;
+            let pages_u32 = scattered_pages(n_pages, n_blocks);
+            let pages_arr = page_ids(&pages_u32).unwrap();
+            let paged_pool = pack_paged_keys(
+                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
+            );
+            let got_paged_arr =
+                try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
+                    .unwrap()
+                    .expect("paged indexer_score");
+            let got_paged = read(&got_paged_arr);
+            assert_eq!(
+                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "paged vs flat mismatch H={h} S={s} N_g={n_groups}"
+            );
+
+            if s == 4 && n_groups == 2048 {
+                for row in 0..s {
+                    let qr = q
+                        .slice(&[row as i64, 0, 0], &[(row + 1) as i64, h as i64, d as i64])
+                        .unwrap();
+                    let wr = w
+                        .slice(&[row as i64, 0], &[(row + 1) as i64, h as i64])
+                        .unwrap();
+                    let one = read(
+                        &try_indexer_score(
+                            &qr,
+                            &wr,
+                            &paged_pool,
+                            Some(&pages_arr),
+                            n_groups,
+                            start_g,
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    );
+                    let row_got = &got_paged[row * n_groups..(row + 1) * n_groups];
+                    assert_eq!(
+                        row_got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        one.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "row {row} invariance N_g={n_groups}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexer_score_decode_bench_timing() {
+        let h = 16usize;
+        let d = 128usize;
+        let index_rows = 8usize;
+        let mode = if std::env::var("MLX_HY4_INDEXER_DECODE_NAX").as_deref() == Ok("0") {
+            "scalar"
+        } else {
+            "nax"
+        };
+        let iters = 20usize;
+        let batch_calls = 36usize;
+
+        for (s, n_groups, paged) in [
+            (1usize, 2048usize, true),
+            (1, 7763, true),
+            (2, 7763, true),
+            (4, 7763, true),
+            (1, 8192, false),
+            (4, 8192, false),
+        ] {
+            let mut rng = Rng(801 + (s * 17 + n_groups) as u64);
+            let q = arr(&rng.vec(s * h * d, 1.0), &[s, h, d]);
+            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
+            let keys_f16 = arr(&rng.vec(n_groups * d, 1.0), &[n_groups, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+            let (pool, pages) = if paged {
+                let n_pages = n_groups.div_ceil(index_rows);
+                let n_blocks = n_pages + 9;
+                let pages_u32 = scattered_pages(n_pages, n_blocks);
+                let pages_arr = page_ids(&pages_u32).unwrap();
+                let paged_pool =
+                    pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
+                paged_pool.eval();
+                pages_arr.eval();
+                (paged_pool, Some(pages_arr))
+            } else {
+                keys_f16.eval();
+                (keys_f16, None)
+            };
+            q.eval();
+            w.eval();
+
+            for _ in 0..4 {
+                let Some(o) =
+                    try_indexer_score(&q, &w, &pool, pages.as_ref(), n_groups, 0).unwrap()
+                else {
+                    return;
+                };
+                o.eval();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut outs = Vec::with_capacity(batch_calls);
+                for _ in 0..batch_calls {
+                    outs.push(
+                        try_indexer_score(&q, &w, &pool, pages.as_ref(), n_groups, 0)
+                            .unwrap()
+                            .unwrap(),
+                    );
+                }
+                let refs: Vec<&MxArray> = outs.iter().collect();
+                crate::models::hy_v4_flash::stats::eval(&refs, "indexer bench").unwrap();
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / (iters * batch_calls) as f64;
+            eprintln!(
+                "[indexer_score_bench:{mode}] S={s} N_g={n_groups} paged={paged}: {us:.2} us/layer (12L={:.2} ms)",
+                us * 12.0 / 1000.0
+            );
+        }
+    }
 }

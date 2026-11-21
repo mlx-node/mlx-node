@@ -3721,6 +3721,72 @@ unsafe extern "C" {
         out_inverse: *mut *mut mlx_array,
         out_sorted_slots: *mut *mut mlx_array,
     ) -> bool;
+
+    pub fn mlx_hy4_mla_prep_q_kv(
+        all: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        kv_norm_w: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        q_lora: i32,
+        kv_lora: i32,
+        rope_dim: i32,
+        norm_eps: f32,
+        out_f16: bool,
+        split_out: bool,
+        out_qr: *mut *mut mlx_array,
+        out_kv0: *mut *mut mlx_array,
+        out_kv1: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_q8_grouped_k192_rope(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kpool_compress(
+        tail_buf: *mut mlx_array,
+        tok: *mut mlx_array,
+        w_val: *mut mlx_array,
+        w_gate: *mut mlx_array,
+        ape: *mut mlx_array,
+        comp_norm: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        n_groups: i32,
+        first_group: i32,
+        open_len: i32,
+        tail_start_slot: i32,
+        tail_cap: i32,
+        norm_eps: f32,
+        out_dtype_code: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_partial_rope_tail(
+        x: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_engram_norm_rows(
+        rows: *mut mlx_array,
+        lookup_norm: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_engram_gate_add(
+        x: *mut mlx_array,
+        kv_raw: *mut mlx_array,
+        kv_b: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        pre_gamma: *mut mlx_array,
+        hc_scale: *mut mlx_array,
+        keep_mask: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C-unwind" {

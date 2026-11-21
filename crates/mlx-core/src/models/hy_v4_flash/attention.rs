@@ -25,8 +25,11 @@ use super::cache::{LatentBuf, LayerCache, WindowKeys, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
 use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear};
-use super::ops::{fast_rope_with_pos, rms_norm, rope_inv_freqs, rope_positions_f32};
-use super::paged::{SlotMap, planes, write_latent};
+use super::ops::{
+    fast_rope_with_pos, rms_norm, rope_inv_freqs, rope_positions_f32, try_mla_prep_q_kv,
+    try_q8_grouped_k192_rope,
+};
+use super::paged::{SlotMap, planes, write_latent, write_latent_split};
 use super::sparse::{
     KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for,
     mla_sliding_prefill_nax_enabled, try_sliding_sink_attention_prefill,
@@ -237,8 +240,10 @@ pub struct Projected {
     pub qr: MxArray,
     /// Absorbed queries `[n, H, kv_lora + rope]` f32.
     pub q: MxArray,
-    /// Latent rows `[n, kv_lora + rope]` f32, before the cache's f16 cast.
+    /// Latent rows `[n, kv_lora + rope]` (f16 when produced by fused prep, else f32).
     pub kv: MxArray,
+    /// Pre-split contiguous `[n, half]` f16 K/V halves for paged indexed writes.
+    pub(crate) kv_split: Option<(MxArray, MxArray)>,
     /// Precomputed `attn_gate·x` `[n, H·head_v]` f32 when fused (`n <= 256`).
     pub gate_lin: Option<MxArray>,
 }
@@ -251,6 +256,13 @@ impl Projected {
             qr: wave.owner_rows(&self.qr, owner)?,
             q: wave.owner_rows(&self.q, owner)?,
             kv: wave.owner_rows(&self.kv, owner)?,
+            kv_split: self
+                .kv_split
+                .as_ref()
+                .map(|(k0, k1)| -> Result<_> {
+                    Ok((wave.owner_rows(k0, owner)?, wave.owner_rows(k1, owner)?))
+                })
+                .transpose()?,
             gate_lin: self
                 .gate_lin
                 .as_ref()
@@ -366,6 +378,16 @@ impl Mla {
         x: &MxArray,
         pos_arr: &MxArray,
     ) -> Result<Projected> {
+        self.project_normed_with_pos_split(w, x, pos_arr, false)
+    }
+
+    pub(crate) fn project_normed_with_pos_split(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        pos_arr: &MxArray,
+        split_kv: bool,
+    ) -> Result<Projected> {
         let g = &self.g;
         let n = x.shape_at(0)?;
         if pos_arr.ndim()? != 1 || pos_arr.shape_at(0)? != n {
@@ -385,49 +407,79 @@ impl Mla {
         let kv_row = kv_lora + rd;
         let q_lora = w.q_a.shape_at(0)?;
 
-        let (q_a_out, ckv, gate_lin) = match (n <= FUSED_GATE_MAX_ROWS, &w.q_kv_gate, &w.q_kv) {
+        let (fused_all, gate_lin) = match (n <= FUSED_GATE_MAX_ROWS, &w.q_kv_gate, &w.q_kv) {
             (true, Some(fused), _) => {
                 let all = qlinear(&x, fused)?;
                 let total = all.shape_at(1)?;
-                (
-                    all.slice(&[0, 0], &[n, q_lora])?,
-                    all.slice(&[0, q_lora], &[n, q_lora + kv_row])?,
-                    Some(all.slice(&[0, q_lora + kv_row], &[n, total])?),
-                )
+                let gate = all.slice(&[0, q_lora + kv_row], &[n, total])?;
+                (Some(all), Some(gate))
             }
-            (false, _, Some(fused)) => {
-                let all = qlinear(&x, fused)?;
-                (
-                    all.slice(&[0, 0], &[n, q_lora])?,
-                    all.slice(&[0, q_lora], &[n, q_lora + kv_row])?,
-                    None,
-                )
-            }
-            _ => (qlinear(&x, &w.q_a)?, qlinear(&x, &w.kv_a)?, None),
+            (false, _, Some(fused)) => (Some(qlinear(&x, fused)?), None),
+            _ => (None, None),
         };
-        let qr = rms_norm(&q_a_out, &w.q_a_norm, g.eps)?;
-        let q = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
-        let q_nope = q.slice(&[0, 0, 0], &[n, heads, nope])?;
-        let q_pe = fast_rope_with_pos(
-            &q.slice(&[0, 0, nope], &[n, heads, qk])?,
-            &self.inv_freqs,
-            pos_arr,
-        )?;
-        let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
-        let q = MxArray::concatenate(&q_abs, &q_pe, -1)?;
 
-        let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
-        let k_pe = fast_rope_with_pos(
-            &ckv.slice(&[0, kv_lora], &[n, kv_row])?,
-            &self.inv_freqs,
-            pos_arr,
-        )?;
-        let kv = MxArray::concatenate(&kv, &k_pe, -1)?;
+        let out_f16 = super::cache::row_dtype() == DType::Float16;
+        let do_split = split_kv && out_f16 && kv_row % 2 == 0;
+        let (qr, kv, kv_split) = if let Some(all) = &fused_all
+            && let Some((qr, kv0, kv1)) = try_mla_prep_q_kv(
+                all,
+                &w.q_a_norm,
+                &w.kv_a_norm,
+                pos_arr,
+                &self.inv_freqs,
+                q_lora,
+                kv_lora,
+                rd,
+                g.eps,
+                out_f16,
+                do_split,
+            )? {
+            match kv1 {
+                Some(k1) => (qr, kv0.clone(), Some((kv0, k1))),
+                None => (qr, kv0, None),
+            }
+        } else {
+            let (q_a_out, ckv) = match fused_all {
+                Some(all) => (
+                    all.slice(&[0, 0], &[n, q_lora])?,
+                    all.slice(&[0, q_lora], &[n, q_lora + kv_row])?,
+                ),
+                None => (qlinear(&x, &w.q_a)?, qlinear(&x, &w.kv_a)?),
+            };
+            let qr = rms_norm(&q_a_out, &w.q_a_norm, g.eps)?;
+            let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
+            let k_pe = fast_rope_with_pos(
+                &ckv.slice(&[0, kv_lora], &[n, kv_row])?,
+                &self.inv_freqs,
+                pos_arr,
+            )?;
+            let kv = MxArray::concatenate(&kv, &k_pe, -1)?;
+            (qr, kv, None)
+        };
+
+        let q_raw = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
+        let q = if (1..=16).contains(&n)
+            && nope == 192
+            && let Some(fused_q) =
+                try_q8_grouped_k192_rope(&q_raw, &w.k_b, heads, pos_arr, &self.inv_freqs)?
+        {
+            fused_q
+        } else {
+            let q_nope = q_raw.slice(&[0, 0, 0], &[n, heads, nope])?;
+            let q_pe = fast_rope_with_pos(
+                &q_raw.slice(&[0, 0, nope], &[n, heads, qk])?,
+                &self.inv_freqs,
+                pos_arr,
+            )?;
+            let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
+            MxArray::concatenate(&q_abs, &q_pe, -1)?
+        };
         Ok(Projected {
             x,
             qr,
             q,
             kv,
+            kv_split,
             gate_lin,
         })
     }
@@ -441,39 +493,21 @@ impl Mla {
     ) -> Result<Projected> {
         let tp = prof_start();
         let p = self.project_at(w, h, positions)?;
-        if let Some(g) = &p.gate_lin {
-            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g])?;
-        } else {
-            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv])?;
-        }
+        prof_end_projected(tp, &p)?;
         Ok(p)
     }
 
-    /// `project_normed` under the attention-projection clock.
-    pub(crate) fn project_normed_timed(
-        &self,
-        w: &AttnWeights,
-        x: &MxArray,
-        positions: &[u64],
-    ) -> Result<Projected> {
-        let pos_arr = rope_positions_f32(positions)?;
-        self.project_normed_timed_with_pos(w, x, &pos_arr)
-    }
-
-    /// `project_normed_with_pos` under the attention-projection clock.
-    pub(crate) fn project_normed_timed_with_pos(
+    /// `project_normed_with_pos_split` under the attention-projection clock.
+    pub(crate) fn project_normed_timed_with_pos_split(
         &self,
         w: &AttnWeights,
         x: &MxArray,
         pos_arr: &MxArray,
+        split_kv: bool,
     ) -> Result<Projected> {
         let tp = prof_start();
-        let p = self.project_normed_with_pos(w, x, pos_arr)?;
-        if let Some(g) = &p.gate_lin {
-            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g])?;
-        } else {
-            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv])?;
-        }
+        let p = self.project_normed_with_pos_split(w, x, pos_arr, split_kv)?;
+        prof_end_projected(tp, &p)?;
         Ok(p)
     }
 
@@ -753,7 +787,11 @@ impl Mla {
         }
         let layer = ix.state.layer();
         let base = u32::try_from(start).map_err(|_| bad("position exceeds u32"))?;
-        write_latent(pool.adapter, layer, &p.kv, base, pool.floor)?;
+        if let Some((k0, k1)) = &p.kv_split {
+            write_latent_split(pool.adapter, layer, k0, k1, base, pool.floor)?;
+        } else {
+            write_latent(pool.adapter, layer, &p.kv, base, pool.floor)?;
+        }
         let tp = prof_start();
         let call = Call {
             x: &p.x,
@@ -843,7 +881,9 @@ impl Mla {
         if self.g.attn != Attn::Indexed {
             return Err(bad("sliding layer given the paged pool"));
         }
-        let p = self.project_timed(w, h, &positions(h, start)?)?;
+        let pos_arr = rope_positions_f32(&positions(h, start)?)?;
+        let x = rms_norm(&h.astype(DType::Float32)?, &w.norm, self.g.eps)?;
+        let p = self.project_normed_timed_with_pos_split(w, &x, &pos_arr, true)?;
         let mark = ix.state.mark();
         let out = self
             .core_indexed_paged(w, &p, start, &mut pool, &mut ix)
@@ -852,6 +892,15 @@ impl Mla {
             ix.state.restore(mark)?;
         }
         out
+    }
+}
+
+fn prof_end_projected(tp: Option<std::time::Instant>, p: &Projected) -> Result<()> {
+    match (&p.kv_split, &p.gate_lin) {
+        (Some((k0, k1)), Some(g)) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, k0, k1, g]),
+        (Some((k0, k1)), None) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, k0, k1]),
+        (None, Some(g)) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g]),
+        (None, None) => prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv]),
     }
 }
 

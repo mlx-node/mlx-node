@@ -9620,9 +9620,12 @@ impl PagedKVCacheAdapter {
             .map(|block| self.index_plane_row(block))
             .collect::<Result<Vec<_>, _>>()?;
         let slots = MxArray::from_int32(&slots, &[i64::from(count)]).map_err(|e| e.to_string())?;
-        let rows = rows
-            .astype(metal_io_dtype(self.layer_kv_pool.index_dtype())?)
-            .map_err(|e| e.to_string())?;
+        let target_dt = metal_io_dtype(self.layer_kv_pool.index_dtype())?;
+        let rows = if rows.dtype().map_err(|e| e.to_string())? == target_dt {
+            rows.clone()
+        } else {
+            rows.astype(target_dt).map_err(|e| e.to_string())?
+        };
         self.native_pool_arrays_for_layer(layer_idx)?;
         let idx = layer_idx as usize;
         let plane = self.native_pool_arrays[idx]

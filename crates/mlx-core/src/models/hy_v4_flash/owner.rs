@@ -268,7 +268,7 @@ impl OwnerCell {
             .iter()
             .filter_map(|lm| match lm {
                 LayerMark::Window(s) => s.rows(),
-                LayerMark::Index(_) => None,
+                LayerMark::Index(im) => im.tail().rows(),
             })
             .collect();
         if !live.is_empty() {
@@ -459,14 +459,14 @@ impl OwnerCell {
             .iter()
             .map(|p| match p {
                 CellLayer::Window(r) => r.snapshot_lazy().map(StateLayer::Window),
-                CellLayer::Index(ix) => Ok(StateLayer::Tail(ix.tail().clone())),
+                CellLayer::Index(ix) => ix.tail().snapshot_lazy().map(StateLayer::Tail),
             })
             .collect::<Result<_>>()?;
         let live: Vec<&MxArray> = layers
             .iter()
             .filter_map(|sl| match sl {
                 StateLayer::Window(s) => s.rows(),
-                StateLayer::Tail(_) => None,
+                StateLayer::Tail(t) => t.rows(),
             })
             .collect();
         if !live.is_empty() {
@@ -490,7 +490,7 @@ impl OwnerCell {
         if d.len() != m || d.index().len() != m || d.index().pooled_len() != m / self.kpool {
             return Ok(None);
         }
-        let tail = d.index().tail().clone();
+        let tail = d.index().tail().snapshot()?;
         draft_state_at(d, m, self.kpool, &mut self.segments, tail, seed).map(Some)
     }
 }

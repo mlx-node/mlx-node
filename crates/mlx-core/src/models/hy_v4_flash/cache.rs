@@ -27,12 +27,12 @@ thread_local! {
 }
 
 #[cfg(not(test))]
-fn row_dtype() -> DType {
+pub(crate) fn row_dtype() -> DType {
     ROW_DTYPE
 }
 
 #[cfg(test)]
-fn row_dtype() -> DType {
+pub(crate) fn row_dtype() -> DType {
     TEST_ROW_DTYPE.with(std::cell::Cell::get)
 }
 
@@ -513,7 +513,11 @@ impl LatentBuf {
                 self.cap
             )));
         }
-        let rows = kv.astype(row_dtype())?;
+        let rows = if kv.dtype()? == row_dtype() {
+            kv.clone()
+        } else {
+            kv.astype(row_dtype())?
+        };
         if self.buf.is_none() {
             let cap = i64::try_from(self.cap).map_err(|_| bad("context exceeds i64"))?;
             let b = MxArray::zeros(&[cap, self.width], Some(row_dtype()))?;

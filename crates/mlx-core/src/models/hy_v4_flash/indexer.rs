@@ -252,14 +252,41 @@ pub fn scores(q: &MxArray, w: &MxArray, keys: &MxArray) -> Result<MxArray> {
         .sum(Some(&[1]), Some(false))
 }
 
+/// Extra slots reserved in [`TokTail`]'s circular ring beyond `keep` so
+/// decode steps up to 4 rows write disjoint slots and roll back in O(1)
+/// without cloning the ring buffer.
+const TAIL_ROLLBACK_SLACK: usize = 4;
+
+fn linear_tail_range(
+    buf: &MxArray,
+    cap: usize,
+    width: i64,
+    first_pos: usize,
+    count: usize,
+    detach: bool,
+) -> Result<MxArray> {
+    let lo = first_pos % cap;
+    if lo + count <= cap {
+        let view = buf.slice(&[lo as i64, 0], &[(lo + count) as i64, width])?;
+        if detach { view.deep_copy() } else { Ok(view) }
+    } else {
+        let head = buf.slice(&[lo as i64, 0], &[cap as i64, width])?;
+        let tail = buf.slice(&[0, 0], &[(lo + count - cap) as i64, width])?;
+        MxArray::concatenate(&head, &tail, 0)
+    }
+}
+
 /// `tok_k` rows of positions `len - held .. len` (the open group and up to
-/// `WINDOW_SLACK` positions before it), f32, a fresh array.
+/// `WINDOW_SLACK` positions before it), f32. Live tails use a fixed circular
+/// ring buffer (`ring_cap > 0`) updated in place via `Hy4RingWrite`; snapshots
+/// and restored `of_rows` tails hold a linear `[held, width]` array (`ring_cap == 0`).
 #[derive(Clone)]
 pub struct TokTail {
     kpool: usize,
     width: i64,
     keep: usize,
     rows: Option<MxArray>,
+    ring_cap: usize,
     held: usize,
     len: usize,
 }
@@ -271,9 +298,20 @@ impl TokTail {
             width: g.head_dim as i64,
             keep: g.kpool - 1 + WINDOW_SLACK,
             rows: None,
+            ring_cap: 0,
             held: 0,
             len: 0,
         }
+    }
+
+    fn target_ring_cap(&self) -> usize {
+        self.keep + TAIL_ROLLBACK_SLACK
+    }
+
+    /// Max rows a push can append without touching any of the `keep` held rows,
+    /// enabling O(1) rollback with zero buffer clone.
+    pub(crate) fn rollback_slack(&self) -> usize {
+        self.ring_cap.saturating_sub(self.keep)
     }
 
     /// Positions seen.
@@ -317,14 +355,61 @@ impl TokTail {
             )));
         }
         t.rows = rows.map(|r| r.astype(DType::Float32)).transpose()?;
+        t.ring_cap = 0;
         t.held = held;
         t.len = len;
         Ok(t)
     }
 
-    /// The held rows `[held, d]` f32.
+    /// The held rows `[held, d]` f32 (for linear snapshots / `of_rows`).
     pub fn rows(&self) -> Option<&MxArray> {
         self.rows.as_ref()
+    }
+
+    /// Detached linear oldest-first `[held, d]` copy (unevaluated).
+    pub(crate) fn snapshot_lazy(&self) -> Result<Self> {
+        if self.held == 0 {
+            return Ok(Self {
+                kpool: self.kpool,
+                width: self.width,
+                keep: self.keep,
+                rows: None,
+                ring_cap: 0,
+                held: 0,
+                len: self.len,
+            });
+        }
+        let buf = self
+            .rows
+            .as_ref()
+            .ok_or_else(|| bad("tok_k rows missing"))?;
+        let linear = if self.ring_cap == 0 {
+            buf.clone()
+        } else {
+            let first_pos = self.len - self.held;
+            linear_tail_range(buf, self.ring_cap, self.width, first_pos, self.held, true)?
+        };
+        Ok(Self {
+            kpool: self.kpool,
+            width: self.width,
+            keep: self.keep,
+            rows: Some(linear),
+            ring_cap: 0,
+            held: self.held,
+            len: self.len,
+        })
+    }
+
+    /// Evaluated detached linear oldest-first `[held, d]` snapshot so live ring
+    /// buffers drop back to refcount 1.
+    pub(crate) fn snapshot(&self) -> Result<Self> {
+        let snap = self.snapshot_lazy()?;
+        if let Some(rows) = snap.rows()
+            && self.ring_cap > 0
+        {
+            MxArray::eval_arrays_with_context(&[rows], "hy_v4_flash indexer tail snapshot")?;
+        }
+        Ok(snap)
     }
 
     pub fn nbytes(&self) -> usize {
@@ -336,7 +421,28 @@ impl TokTail {
         self.kpool * groups..self.len
     }
 
-    /// The last `n` held rows (`n <= held`).
+    /// Backing buffer, start slot, and circular capacity for reading the last
+    /// `n` held rows without slicing or concatenating.
+    fn open_ring_args(&self, n: usize) -> Result<Option<(&MxArray, usize, usize)>> {
+        if n == 0 {
+            return Ok(None);
+        }
+        if n > self.held {
+            return Err(bad(format!("{n} open rows needed, {} held", self.held)));
+        }
+        let buf = self
+            .rows
+            .as_ref()
+            .ok_or_else(|| bad("tok_k rows missing"))?;
+        if self.ring_cap > 0 {
+            let first = self.len - n;
+            Ok(Some((buf, first % self.ring_cap, self.ring_cap)))
+        } else {
+            Ok(Some((buf, self.held - n, self.held)))
+        }
+    }
+
+    /// The last `n` held rows (`n <= held`) in oldest-first linear order.
     fn last_rows(&self, n: usize) -> Result<Option<MxArray>> {
         if n == 0 {
             return Ok(None);
@@ -349,36 +455,83 @@ impl TokTail {
             .rows
             .as_ref()
             .ok_or_else(|| bad("tok_k rows missing"))?;
-        Ok(Some(r.slice(
-            &[(held - n) as i64, 0],
-            &[held as i64, self.width],
-        )?))
+        if self.ring_cap > 0 {
+            let first = self.len - n;
+            Ok(Some(linear_tail_range(
+                r,
+                self.ring_cap,
+                self.width,
+                first,
+                n,
+                false,
+            )?))
+        } else {
+            Ok(Some(r.slice(
+                &[(held - n) as i64, 0],
+                &[held as i64, self.width],
+            )?))
+        }
     }
 
-    /// Appends `tok [n, d]` (positions `len..len + n`).
+    /// Appends `tok [n, d]` (positions `len..len + n`) via in-place donated
+    /// circular ring write.
     fn push(&mut self, tok: &MxArray) -> Result<()> {
         let n = tok.shape_at(0)? as usize;
-        let hold = (self.held + n).min(self.keep);
-        let from_tok = hold.min(n);
-        let new = tok.slice(&[(n - from_tok) as i64, 0], &[n as i64, self.width])?;
-        let rows = match self.last_rows(hold - from_tok)? {
-            Some(old) => MxArray::concatenate(&old, &new, 0)?,
-            None => new,
+        let cap = if self.ring_cap > 0 {
+            self.ring_cap
+        } else {
+            self.target_ring_cap()
+        };
+        let cap_i64 = i64::try_from(cap).map_err(|_| bad("tail ring capacity exceeds i64"))?;
+
+        let prev = if self.ring_cap > 0 {
+            match self.rows.take() {
+                Some(b) => b,
+                None => MxArray::zeros(&[cap_i64, self.width], Some(DType::Float32))?,
+            }
+        } else {
+            let zero = MxArray::zeros(&[cap_i64, self.width], Some(DType::Float32))?;
+            if let Some(linear) = self.rows.take()
+                && self.held > 0
+            {
+                let first_pos = self.len - self.held;
+                let filled = super::ops::ring_write(&zero, &linear, first_pos % cap, cap)?;
+                drop(zero);
+                filled
+            } else {
+                zero
+            }
+        };
+
+        let (src, write_start) = if n > cap {
+            (
+                tok.slice(&[(n - cap) as i64, 0], &[n as i64, self.width])?,
+                self.len + n - cap,
+            )
+        } else {
+            (tok.clone(), self.len)
+        };
+        let next = super::ops::ring_write(&prev, &src, write_start % cap, cap)?;
+        drop(prev);
+        self.rows = Some(next);
+        self.ring_cap = cap;
+        if let Some(buf) = self.rows.as_ref() {
+            super::stats::defer(buf, "hy_v4_flash indexer tail")?;
         }
-        .deep_copy()?;
-        super::stats::defer(&rows, "hy_v4_flash indexer tail")?;
-        self.rows = Some(rows);
-        self.held = hold;
+        self.held = (self.held + n).min(self.keep);
         self.len += n;
         Ok(())
     }
 
-    /// This tail cut to `len` positions. Refused when the open rows of
-    /// `len` are no longer held.
-    fn truncated(&self, len: usize) -> Result<Self> {
+    /// Cuts this tail to `len` positions in place. O(1) metadata-only when
+    /// backed by a circular ring; refused when open rows of `len` are gone.
+    fn truncate_in_place(&mut self, len: usize) -> Result<()> {
         let now = self.len;
         if len > now {
             return Err(bad(format!("truncate to {len}, {now} positions held")));
+        }
+        if len == now {
+            return Ok(());
         }
         let closed = len / self.kpool;
         let first = now - self.held;
@@ -388,8 +541,13 @@ impl TokTail {
                 closed * self.kpool
             )));
         }
-        let keep = len.saturating_sub(first);
-        let rows = match (&self.rows, keep) {
+        let rem = len.saturating_sub(first);
+        if self.ring_cap > 0 {
+            self.held = rem;
+            self.len = len;
+            return Ok(());
+        }
+        let rows = match (&self.rows, rem) {
             (_, 0) => None,
             (Some(r), k) => {
                 let r = r.slice(&[0, 0], &[k as i64, self.width])?.deep_copy()?;
@@ -398,12 +556,17 @@ impl TokTail {
             }
             (None, _) => return Err(bad("tok_k rows missing")),
         };
-        Ok(Self {
-            rows,
-            held: keep,
-            len,
-            ..*self
-        })
+        self.rows = rows;
+        self.held = rem;
+        self.len = len;
+        Ok(())
+    }
+
+    /// Reverts a circular-ring push of at most `rollback_slack()` rows in O(1),
+    /// restoring the exact `prev_held` rows that were untouched in disjoint slots.
+    fn rollback_push(&mut self, prev_len: usize, prev_held: usize) {
+        self.len = prev_len;
+        self.held = prev_held;
     }
 }
 
@@ -449,7 +612,9 @@ enum ScoreKeys {
 /// The pooled keys of the closed groups, in group order.
 trait PooledKeys {
     fn groups(&self) -> usize;
-    /// Writes `keys [k, d]` f32 as groups `first..first + k`; `first` must
+    /// Storage dtype of pooled rows (`f16` in production, `f32` under test override).
+    fn storage_dtype(&self) -> DType;
+    /// Writes `keys [k, d]` as groups `first..first + k`; `first` must
     /// equal `groups()`.
     fn store(&mut self, keys: &MxArray, first: usize) -> Result<()>;
     /// Groups `0..k`, `[k, d]` f16.
@@ -465,6 +630,10 @@ trait PooledKeys {
 impl PooledKeys for LatentBuf {
     fn groups(&self) -> usize {
         self.len()
+    }
+
+    fn storage_dtype(&self) -> DType {
+        super::cache::row_dtype()
     }
 
     fn store(&mut self, keys: &MxArray, first: usize) -> Result<()> {
@@ -501,6 +670,14 @@ struct PlaneKeys<'a> {
 impl PooledKeys for PlaneKeys<'_> {
     fn groups(&self) -> usize {
         *self.groups
+    }
+
+    fn storage_dtype(&self) -> DType {
+        match self.adapter.layer_kv_pool().index_dtype() {
+            mlx_paged_attn::metal::MetalDtype::Float16 => DType::Float16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => DType::BFloat16,
+            _ => DType::Float32,
+        }
     }
 
     fn store(&mut self, keys: &MxArray, first: usize) -> Result<()> {
@@ -600,7 +777,10 @@ impl IndexerState {
 
     pub fn mark(&self) -> IndexerMark {
         IndexerMark {
-            tail: self.tail.clone(),
+            tail: self
+                .tail
+                .snapshot_lazy()
+                .unwrap_or_else(|_| self.tail.clone()),
         }
     }
 
@@ -608,6 +788,14 @@ impl IndexerState {
     /// have been rewritten since.
     pub fn restore(&mut self, m: IndexerMark) -> Result<()> {
         restore_in(&mut self.pooled, &mut self.tail, m)
+    }
+
+    /// Reverts a ring push of at most `rollback_slack()` rows in O(1),
+    /// restoring exact `prev_len`, `prev_held`, and closed group count.
+    pub(crate) fn rollback_push(&mut self, prev_len: usize, prev_held: usize) -> Result<()> {
+        self.pooled.cut(prev_len / self.tail.kpool)?;
+        self.tail.rollback_push(prev_len, prev_held);
+        Ok(())
     }
 
     /// Fills an empty state: the pooled keys `[k, d]` of groups `0..k`
@@ -669,7 +857,8 @@ impl IndexerState {
     /// Drops the positions past `len`. Refused when the open rows of `len`
     /// are no longer held.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
-        let tail = self.tail.truncated(len)?;
+        let mut tail = self.tail.clone();
+        tail.truncate_in_place(len)?;
         self.pooled.truncate(len / tail.kpool)?;
         self.tail = tail;
         Ok(())
@@ -738,7 +927,10 @@ impl PagedIndexerState {
 
     pub fn mark(&self) -> IndexerMark {
         IndexerMark {
-            tail: self.tail.clone(),
+            tail: self
+                .tail
+                .snapshot_lazy()
+                .unwrap_or_else(|_| self.tail.clone()),
         }
     }
 
@@ -753,9 +945,8 @@ impl PagedIndexerState {
     /// Drops the positions past `len`. Refused when the open rows of `len`
     /// are no longer held.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
-        let tail = self.tail.truncated(len)?;
-        self.groups = len / tail.kpool;
-        self.tail = tail;
+        self.tail.truncate_in_place(len)?;
+        self.groups = len / self.tail.kpool;
         Ok(())
     }
 
@@ -870,6 +1061,28 @@ impl Indexer {
     pub fn pool(&self, w: &IndexerWeights, grp: &MxArray, first: usize) -> Result<MxArray> {
         let k = grp.shape_at(0)? as usize;
         let grp = grp.astype(DType::Float32)?;
+        if k > 0
+            && self.g.head_dim == 128
+            && self.g.kpool == 4
+            && let Some(keys) = super::ops::try_kpool_compress(
+                None,
+                &grp.reshape(&[(k * 4) as i64, 128])?,
+                &w.compressor_value,
+                &w.compressor_gate,
+                &w.compressor_ape,
+                &w.compressor_norm,
+                &self.inv_freqs,
+                k,
+                first,
+                0,
+                0,
+                1,
+                self.g.eps,
+                DType::Float32,
+            )?
+        {
+            return Ok(keys);
+        }
         let v = linear(&grp, &w.compressor_value)?;
         let gt =
             linear(&grp, &w.compressor_gate)?.add(&w.compressor_ape.astype(DType::Float32)?)?;
@@ -917,6 +1130,30 @@ impl Indexer {
         start: usize,
         st: &mut IndexerState,
     ) -> Result<()> {
+        let n = x.shape_at(0)? as usize;
+        let fast_rollback = (st.tail.len == 0 && n <= st.tail.target_ring_cap())
+            || (st.tail.ring_cap > 0 && n <= st.tail.rollback_slack());
+        if fast_rollback {
+            let (prev_len, prev_held, prev_groups, had_buf) = (
+                st.tail.len,
+                st.tail.held,
+                st.pooled.groups(),
+                st.tail.rows.is_some(),
+            );
+            let out = self.update_in(w, x, start, &mut st.pooled, &mut st.tail);
+            if out.is_err() {
+                st.pooled.cut(prev_groups)?;
+                if !had_buf {
+                    st.tail.rows = None;
+                    st.tail.ring_cap = 0;
+                    st.tail.held = 0;
+                    st.tail.len = 0;
+                } else {
+                    st.tail.rollback_push(prev_len, prev_held);
+                }
+            }
+            return out;
+        }
         let mark = st.mark();
         let out = self.update_in(w, x, start, &mut st.pooled, &mut st.tail);
         if out.is_err() {
@@ -953,16 +1190,46 @@ impl Indexer {
         }
         let tok = self.tok_k(w, x)?;
         if !plan.groups.is_empty() {
-            let d = self.g.head_dim as i64;
-            let all = match tail.last_rows(plan.open_in.len())? {
-                Some(open) => MxArray::concatenate(&open, &tok, 0)?,
-                None => tok.clone(),
-            };
             let k = plan.groups.len();
-            let grp = all
-                .slice(&[0, 0], &[(k * kp) as i64, d])?
-                .reshape(&[k as i64, kp as i64, d])?;
-            let keys = self.pool(w, &grp, plan.groups.start)?;
+            let open_len = plan.open_in.len();
+            let fused = if self.g.head_dim == 128 && kp == 4 {
+                let (tail_buf, tail_start, tail_cap) = match tail.open_ring_args(open_len)? {
+                    Some((buf, s, c)) => (Some(buf), s, c),
+                    None => (None, 0, 1),
+                };
+                super::ops::try_kpool_compress(
+                    tail_buf,
+                    &tok,
+                    &w.compressor_value,
+                    &w.compressor_gate,
+                    &w.compressor_ape,
+                    &w.compressor_norm,
+                    &self.inv_freqs,
+                    k,
+                    plan.groups.start,
+                    open_len,
+                    tail_start,
+                    tail_cap,
+                    self.g.eps,
+                    pooled.storage_dtype(),
+                )?
+            } else {
+                None
+            };
+            let keys = match fused {
+                Some(keys) => keys,
+                None => {
+                    let d = self.g.head_dim as i64;
+                    let all = match tail.last_rows(open_len)? {
+                        Some(open) => MxArray::concatenate(&open, &tok, 0)?,
+                        None => tok.clone(),
+                    };
+                    let grp = all
+                        .slice(&[0, 0], &[(k * kp) as i64, d])?
+                        .reshape(&[k as i64, kp as i64, d])?;
+                    self.pool(w, &grp, plan.groups.start)?
+                }
+            };
             pooled.store(&keys, plan.groups.start)?;
         }
         tail.push(&tok)
@@ -1240,7 +1507,31 @@ impl Indexer {
         tail: &mut TokTail,
         map_pages: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let mark = IndexerMark { tail: tail.clone() };
+        let n = call.x.shape_at(0)? as usize;
+        let fast_rollback = (tail.len == 0 && n <= tail.target_ring_cap())
+            || (tail.ring_cap > 0 && n <= tail.rollback_slack());
+        if fast_rollback {
+            let (prev_len, prev_held, prev_groups, had_buf) =
+                (tail.len, tail.held, pooled.groups(), tail.rows.is_some());
+            let out = self
+                .update_in(w, call.x, call.start, pooled, tail)
+                .and_then(|()| self.cells_in(w, call, pooled, tail, map_pages));
+            if out.is_err() {
+                pooled.cut(prev_groups)?;
+                if !had_buf {
+                    tail.rows = None;
+                    tail.ring_cap = 0;
+                    tail.held = 0;
+                    tail.len = 0;
+                } else {
+                    tail.rollback_push(prev_len, prev_held);
+                }
+            }
+            return out;
+        }
+        let mark = IndexerMark {
+            tail: tail.snapshot_lazy().unwrap_or_else(|_| tail.clone()),
+        };
         let out = self
             .update_in(w, call.x, call.start, pooled, tail)
             .and_then(|()| self.cells_in(w, call, pooled, tail, map_pages));

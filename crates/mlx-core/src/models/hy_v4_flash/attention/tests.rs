@@ -1921,3 +1921,163 @@ fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+
+    for (h, split, seed_base) in [
+        (16usize, false, 503u64),
+        (32usize, true, 509u64),
+        (64usize, false, 521u64),
+    ] {
+        for &s in &[1usize, 2usize, 4usize, 16usize] {
+            for &kmax in &[17usize, 512usize, 836usize] {
+                let n = kmax + 19;
+                let mut r = Rng(seed_base + (s * 1009 + kmax * 37) as u64);
+                let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+                let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+                    .astype(DType::Float16)
+                    .unwrap();
+                let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+                let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+                let mut sinks_v = r.vec(h, 2.0);
+                sinks_v[0] = -20.0;
+                sinks_v[1] = 35.0;
+                let sinks = arr(&sinks_v, &[h]);
+
+                let mut idx = vec![-1i32; s * kmax];
+                for row in 0..s {
+                    for j in 0..kmax {
+                        if (row == 1 && (j % 17 == 16))
+                            || (row == 2 && j >= (kmax / 2).max(1))
+                            || (row == 3 && s >= 4)
+                        {
+                            idx[row * kmax + j] = -1;
+                        } else {
+                            idx[row * kmax + j] = ((j * 7 + row * 13 + 3) % n) as i32;
+                        }
+                    }
+                }
+                let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+                let kr = if split {
+                    KeyRows::Split(&k0, &k1)
+                } else {
+                    KeyRows::Whole(&keys)
+                };
+
+                let got_arr = gather_sink_attention_rows(&q, kr, &ia, vw, &sinks, scale).unwrap();
+                let got = read(&got_arr);
+                let want = read(&gather_rows_reference(&q, kr, &ia, vw, &sinks, scale).unwrap());
+                assert_eq!(got.len(), want.len());
+
+                let mut max_abs = 0.0f32;
+                for (&g, &w) in got.iter().zip(&want) {
+                    assert!(
+                        g.is_finite(),
+                        "non-finite output H={h} split={split} S={s} kmax={kmax}"
+                    );
+                    max_abs = max_abs.max((g - w).abs());
+                }
+                assert!(
+                    max_abs <= 1e-3,
+                    "H={h} split={split} S={s} kmax={kmax}: max_abs={max_abs:e} > 1e-3"
+                );
+
+                // Exact bitwise equality between kmax=836 and kmax=837 with trailing -1.
+                if kmax == 836 {
+                    let kmax_pad = 837usize;
+                    let mut idx_pad = vec![-1i32; s * kmax_pad];
+                    for row in 0..s {
+                        idx_pad[row * kmax_pad..row * kmax_pad + kmax]
+                            .copy_from_slice(&idx[row * kmax..(row + 1) * kmax]);
+                    }
+                    let ia_pad =
+                        MxArray::from_int32(&idx_pad, &[s as i64, kmax_pad as i64]).unwrap();
+                    let pad_arr =
+                        gather_sink_attention_rows(&q, kr, &ia_pad, vw, &sinks, scale).unwrap();
+                    assert_eq!(
+                        bits(&got_arr),
+                        bits(&pad_arr),
+                        "H={h} split={split} S={s}: kmax=836 vs padded kmax=837 bits differ"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_decode_bench_timing() {
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    let mode = if std::env::var("MLX_HY4_MLA_DECODE_NAX").as_deref() == Ok("0") {
+        "v2"
+    } else {
+        "nax"
+    };
+    let iters = 20usize;
+    let batch_calls = 30usize;
+    let mut times = Vec::new();
+
+    for (label, s, h, kmax, split) in [
+        ("sliding_s1_h64_k512", 1usize, 64usize, 512usize, false),
+        ("sliding_s2_h64_k512", 2, 64, 512, false),
+        ("sliding_s4_h64_k512", 4, 64, 512, false),
+        ("indexed_s1_h32_k2048", 1, 32, 2048, true),
+        ("indexed_s2_h32_k2048", 2, 32, 2048, true),
+        ("indexed_s4_h32_k2048", 4, 32, 2048, true),
+    ] {
+        let n = kmax + 64;
+        let mut r = Rng(601 + (s * 31 + h) as u64);
+        let q = arr(&r.vec(s * h * d, 0.5), &[s, h, d]);
+        let keys = arr(&r.vec(n * d, 0.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = arr(&r.vec(h, 1.0), &[h]);
+        let idx_v: Vec<i32> = (0..s * kmax)
+            .map(|i| (((i % kmax) * 7 + (i / kmax) * 13) % n) as i32)
+            .collect();
+        let ia = MxArray::from_int32(&idx_v, &[s as i64, kmax as i64]).unwrap();
+        q.eval();
+        keys.eval();
+        k0.eval();
+        k1.eval();
+        sinks.eval();
+        ia.eval();
+
+        let kr = if split {
+            KeyRows::Split(&k0, &k1)
+        } else {
+            KeyRows::Whole(&keys)
+        };
+        for _ in 0..5 {
+            let w = gather_sink_attention_rows(&q, kr, &ia, vw, &sinks, scale).unwrap();
+            w.eval();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut outs = Vec::with_capacity(batch_calls);
+            for _ in 0..batch_calls {
+                outs.push(gather_sink_attention_rows(&q, kr, &ia, vw, &sinks, scale).unwrap());
+            }
+            let refs: Vec<&MxArray> = outs.iter().collect();
+            crate::models::hy_v4_flash::stats::eval(&refs, "mla bench").unwrap();
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / (iters * batch_calls) as f64;
+        times.push((label, us));
+        eprintln!("[mla_decode_bench:{mode}] {label}: {us:.2} us/layer");
+    }
+    let m1_42l = (30.0 * times[0].1 + 12.0 * times[3].1) / 1000.0;
+    let m2_42l = (30.0 * times[1].1 + 12.0 * times[4].1) / 1000.0;
+    let m4_42l = (30.0 * times[2].1 + 12.0 * times[5].1) / 1000.0;
+    eprintln!(
+        "[mla_decode_bench:{mode}] 42L est: M=1 {m1_42l:.3} ms, M=2 {m2_42l:.3} ms, M=4 {m4_42l:.3} ms"
+    );
+}

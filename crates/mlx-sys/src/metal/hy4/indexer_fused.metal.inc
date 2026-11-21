@@ -336,6 +336,172 @@ inline void hy4_indexer_score_prefill_nax_impl(
     acc.store_slice(out_ptr, N_g, short2(0, 0), short2(valid_g, valid_s));
   }
 }
+
+template <
+    bool PAGED,
+    int INDEX_ROWS,
+    bool SHARE_S,
+    typename QPtr,
+    typename WPtr,
+    typename KPtr,
+    typename PagePtr,
+    typename ParamsPtr>
+inline void hy4_indexer_score_decode_nax_impl(
+    QPtr q,
+    WPtr w,
+    KPtr k_pool,
+    PagePtr page_ids,
+    ParamsPtr params,
+    device float* out,
+    threadgroup half* k_tile,
+    int H,
+    uint s_grid,
+    uint g_tile,
+    uint lane) {
+  constexpr uint PAD = 136u;
+
+  const uint S = params[0];
+  const uint N_g = params[1];
+  const uint start_g = params[2];
+  const uint g0 = g_tile * 32u;
+  if ((!SHARE_S && s_grid >= S) || g0 >= N_g) {
+    return;
+  }
+
+  // Each half-warp (16 lanes) loads one 256-byte key row via half8 (float4).
+  const uint lane_r = lane >> 4;
+  const uint c8 = lane & 15u;
+  STEEL_PRAGMA_UNROLL
+  for (uint rb = 0u; rb < 32u; rb += 2u) {
+    const uint r = rb + lane_r;
+    const uint g = g0 + r;
+    threadgroup float4* dst =
+        reinterpret_cast<threadgroup float4*>(k_tile + r * PAD + c8 * 8u);
+    if (g < N_g) {
+      const uint g_abs = start_g + g;
+      size_t k_row;
+      if constexpr (PAGED) {
+        const uint page_idx = g_abs / uint(INDEX_ROWS);
+        const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
+        const int phys_page = page_ids[page_idx];
+        k_row = size_t(phys_page) * size_t(INDEX_ROWS) + size_t(local_row);
+      } else {
+        k_row = size_t(g_abs);
+      }
+      *dst = *reinterpret_cast<const device float4*>(
+          k_pool + k_row * 128u + size_t(c8) * 8u);
+    } else {
+      *dst = float4(0.0f);
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  using hfrag_t = typename mlx::steel::BaseNAXFrag::template dtype_frag_t<half>;
+  using ffrag_t = typename mlx::steel::BaseNAXFrag::template dtype_frag_t<float>;
+
+  const short2 sc = mlx::steel::BaseNAXFrag::get_coord();
+  const short fm = sc.y;
+  const short fn = sc.x;
+  const bool ok0 = int(fm) < H;
+  const bool ok1 = (int(fm) + 8) < H;
+
+  const uint s_lo = SHARE_S ? 0u : s_grid;
+  const uint s_hi = SHARE_S ? S : (s_grid + 1u);
+
+  for (uint s = s_lo; s < s_hi; ++s) {
+    const device float* q_s = q + size_t(s) * size_t(H) * 128u;
+    ffrag_t dot0 = ffrag_t(0.0f);
+    ffrag_t dot1 = ffrag_t(0.0f);
+
+    // Split F32 Q into FP16 hi + residual to preserve <= 1e-3 accuracy across D=128.
+    STEEL_PRAGMA_UNROLL
+    for (int d = 0; d < 128; d += 16) {
+      const float4 qa = ok0
+          ? *reinterpret_cast<const device float4*>(
+                q_s + size_t(fm) * 128u + size_t(d + int(fn)))
+          : float4(0.0f);
+      const float4 qb = ok1
+          ? *reinterpret_cast<const device float4*>(
+                q_s + size_t(fm + 8) * 128u + size_t(d + int(fn)))
+          : float4(0.0f);
+      const half4 ha = half4(qa);
+      const half4 hb = half4(qb);
+      const half4 la = half4(qa - float4(ha));
+      const half4 lb = half4(qb - float4(hb));
+      const hfrag_t q_hi(ha.x, ha.y, ha.z, ha.w, hb.x, hb.y, hb.z, hb.w);
+      const hfrag_t q_lo(la.x, la.y, la.z, la.w, lb.x, lb.y, lb.z, lb.w);
+
+      const half4 k0a = *reinterpret_cast<const threadgroup half4*>(
+          k_tile + size_t(fm) * PAD + size_t(d + int(fn)));
+      const half4 k0b = *reinterpret_cast<const threadgroup half4*>(
+          k_tile + size_t(fm + 8) * PAD + size_t(d + int(fn)));
+      const half4 k1a = *reinterpret_cast<const threadgroup half4*>(
+          k_tile + size_t(16 + fm) * PAD + size_t(d + int(fn)));
+      const half4 k1b = *reinterpret_cast<const threadgroup half4*>(
+          k_tile + size_t(24 + fm) * PAD + size_t(d + int(fn)));
+      const hfrag_t kf0(k0a.x, k0a.y, k0a.z, k0a.w, k0b.x, k0b.y, k0b.z, k0b.w);
+      const hfrag_t kf1(k1a.x, k1a.y, k1a.z, k1a.w, k1b.x, k1b.y, k1b.z, k1b.w);
+
+      mlx::steel::BaseNAXFrag::mma(
+          dot0, dot1, q_hi, metal::false_type{}, kf0, kf1, metal::true_type{});
+      mlx::steel::BaseNAXFrag::mma(
+          dot0, dot1, q_lo, metal::false_type{}, kf0, kf1, metal::true_type{});
+    }
+
+    const float w0 = ok0 ? w[size_t(s) * size_t(H) + size_t(fm)] : 0.0f;
+    const float w1 = ok1 ? w[size_t(s) * size_t(H) + size_t(fm) + 8u] : 0.0f;
+
+    float4 s0(
+        metal::fma(w0, metal::max(dot0[0], 0.0f), w1 * metal::max(dot0[4], 0.0f)),
+        metal::fma(w0, metal::max(dot0[1], 0.0f), w1 * metal::max(dot0[5], 0.0f)),
+        metal::fma(w0, metal::max(dot0[2], 0.0f), w1 * metal::max(dot0[6], 0.0f)),
+        metal::fma(w0, metal::max(dot0[3], 0.0f), w1 * metal::max(dot0[7], 0.0f)));
+    float4 s1(
+        metal::fma(w0, metal::max(dot1[0], 0.0f), w1 * metal::max(dot1[4], 0.0f)),
+        metal::fma(w0, metal::max(dot1[1], 0.0f), w1 * metal::max(dot1[5], 0.0f)),
+        metal::fma(w0, metal::max(dot1[2], 0.0f), w1 * metal::max(dot1[6], 0.0f)),
+        metal::fma(w0, metal::max(dot1[3], 0.0f), w1 * metal::max(dot1[7], 0.0f)));
+
+    // Lanes sharing the same fn differ only in bits 1, 2, 4 (fm = [b4 b2 b1]).
+    s0 += simd_shuffle_xor(s0, ushort(2));
+    s0 += simd_shuffle_xor(s0, ushort(4));
+    s0 += simd_shuffle_xor(s0, ushort(16));
+
+    s1 += simd_shuffle_xor(s1, ushort(2));
+    s1 += simd_shuffle_xor(s1, ushort(4));
+    s1 += simd_shuffle_xor(s1, ushort(16));
+
+    if (fm == 0) {
+      device float* out_row = out + size_t(s) * size_t(N_g);
+      const uint base0 = g0 + uint(fn);
+      const uint base1 = base0 + 16u;
+      if (base0 + 4u <= N_g) {
+        out_row[base0 + 0u] = s0.x;
+        out_row[base0 + 1u] = s0.y;
+        out_row[base0 + 2u] = s0.z;
+        out_row[base0 + 3u] = s0.w;
+      } else {
+        for (uint j = 0u; j < 4u; ++j) {
+          if (base0 + j < N_g) {
+            out_row[base0 + j] = s0[j];
+          }
+        }
+      }
+      if (base1 + 4u <= N_g) {
+        out_row[base1 + 0u] = s1.x;
+        out_row[base1 + 1u] = s1.y;
+        out_row[base1 + 2u] = s1.z;
+        out_row[base1 + 3u] = s1.w;
+      } else {
+        for (uint j = 0u; j < 4u; ++j) {
+          if (base1 + j < N_g) {
+            out_row[base1 + j] = s1[j];
+          }
+        }
+      }
+    }
+  }
+}
 #endif
 
 // Order-preserving IEEE-754 float -> uint32 map. Canonicalizes -0.0f to +0.0f
@@ -547,6 +713,173 @@ inline void hy4_indexer_topk_cells_impl(
           tail_start + (i - n_sel_cells), page_ids, block_size);
     }
     out[out_base + size_t(i)] = slot;
+  }
+}
+
+template <
+    typename TailPtr,
+    typename TokPtr,
+    typename WValPtr,
+    typename WGatePtr,
+    typename ApePtr,
+    typename NormPtr,
+    typename InvFreqPtr,
+    typename ParamsPtr,
+    typename EpsPtr,
+    typename OutT>
+inline void hy4_kpool_compress_impl(
+    TailPtr tail_buf,
+    TokPtr tok,
+    WValPtr w_val,
+    WGatePtr w_gate,
+    ApePtr ape,
+    NormPtr comp_norm,
+    InvFreqPtr inv_freq,
+    ParamsPtr params,
+    EpsPtr eps_ptr,
+    device OutT* out,
+    threadgroup float4* x_tg,
+    threadgroup float* tg_pooled,
+    threadgroup float* tg_sq,
+    int rope_dim,
+    uint g,
+    uint tid,
+    uint lane,
+    uint sg) {
+  const uint n_groups = params[0];
+  const uint first_group = params[1];
+  const uint open_len = params[2];
+  const uint tail_start_slot = params[3];
+  const uint tail_cap = params[4];
+  if (g >= n_groups) {
+    return;
+  }
+
+  if (tid < 128u) {
+    const uint s = tid >> 5;
+    const uint c4 = tid & 31u;
+    const uint t = g * 4u + s;
+    float4 xv;
+    if (t < open_len) {
+      const uint slot = (tail_start_slot + t) % tail_cap;
+      const size_t off = size_t(slot) * 128u + size_t(c4) * 4u;
+      xv = float4(
+          tail_buf[off], tail_buf[off + 1u], tail_buf[off + 2u], tail_buf[off + 3u]);
+    } else {
+      const uint tr = t - open_len;
+      const size_t off = size_t(tr) * 128u + size_t(c4) * 4u;
+      xv = float4(tok[off], tok[off + 1u], tok[off + 2u], tok[off + 3u]);
+    }
+    x_tg[s * 32u + c4] = xv;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device float4* wv4 = reinterpret_cast<const device float4*>(w_val);
+  const device float4* wg4 = reinterpret_cast<const device float4*>(w_gate);
+  const float4 x0 = x_tg[0u * 32u + lane];
+  const float4 x1 = x_tg[1u * 32u + lane];
+  const float4 x2 = x_tg[2u * 32u + lane];
+  const float4 x3 = x_tg[3u * 32u + lane];
+
+  for (uint iter = 0u; iter < 16u; ++iter) {
+    const uint c = sg + iter * 8u;
+    const float4 wv = wv4[size_t(c) * 32u + size_t(lane)];
+    const float4 wg = wg4[size_t(c) * 32u + size_t(lane)];
+    const float v0 = simd_sum(metal::dot(x0, wv));
+    const float v1 = simd_sum(metal::dot(x1, wv));
+    const float v2 = simd_sum(metal::dot(x2, wv));
+    const float v3 = simd_sum(metal::dot(x3, wv));
+    const float g0 = simd_sum(metal::dot(x0, wg));
+    const float g1 = simd_sum(metal::dot(x1, wg));
+    const float g2 = simd_sum(metal::dot(x2, wg));
+    const float g3 = simd_sum(metal::dot(x3, wg));
+    if (lane == 0u) {
+      const float a0 = g0 + ape[0u * 128u + c];
+      const float a1 = g1 + ape[1u * 128u + c];
+      const float a2 = g2 + ape[2u * 128u + c];
+      const float a3 = g3 + ape[3u * 128u + c];
+      const float gm = metal::max(metal::max(a0, a1), metal::max(a2, a3));
+      const float e0 = metal::exp(a0 - gm);
+      const float e1 = metal::exp(a1 - gm);
+      const float e2 = metal::exp(a2 - gm);
+      const float e3 = metal::exp(a3 - gm);
+      const float es = e0 + e1 + e2 + e3;
+      tg_pooled[c] =
+          v0 * (e0 / es) + v1 * (e1 / es) + v2 * (e2 / es) + v3 * (e3 / es);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float pv = 0.0f;
+  if (tid < 128u) {
+    pv = tg_pooled[tid];
+  }
+  const float sq = simd_sum(pv * pv);
+  if (lane == 0u && sg < 4u) {
+    tg_sq[sg] = sq;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float sq_tot = tg_sq[0] + tg_sq[1] + tg_sq[2] + tg_sq[3];
+  const float rs = metal::precise::rsqrt(sq_tot / 128.0f + eps_ptr[0]);
+  if (tid < 128u) {
+    tg_pooled[tid] = pv * rs * comp_norm[tid];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint head_w = 128u - uint(rope_dim);
+  const uint half_rd = uint(rope_dim) >> 1;
+  const size_t out_off = size_t(g) * 128u;
+  if (tid < head_w) {
+    out[out_off + size_t(tid)] = OutT(tg_pooled[tid]);
+  } else if (tid < head_w + half_rd) {
+    const uint p = tid - head_w;
+    const float pos_g = float((first_group + g) * 4u);
+    const float theta = pos_g * inv_freq[p];
+    const float c_v = metal::precise::cos(theta);
+    const float s_v = metal::precise::sin(theta);
+    const float r0 = tg_pooled[head_w + 2u * p];
+    const float r1 = tg_pooled[head_w + 2u * p + 1u];
+    out[out_off + size_t(head_w + 2u * p)] = OutT(r0 * c_v - r1 * s_v);
+    out[out_off + size_t(head_w + 2u * p + 1u)] = OutT(r0 * s_v + r1 * c_v);
+  }
+}
+
+template <uint TG_X, typename XPtr, typename PosPtr, typename InvFreqPtr>
+inline void hy4_partial_rope_tail_impl(
+    XPtr x,
+    PosPtr pos,
+    InvFreqPtr inv_freq,
+    device float* out,
+    int M,
+    int H,
+    int D,
+    int half_rd,
+    size_t x_s0,
+    size_t x_s1,
+    uint h,
+    uint m,
+    uint tid) {
+  if (int(m) >= M || int(h) >= H) {
+    return;
+  }
+  const uint rd = uint(half_rd) * 2u;
+  const uint head_w = uint(D) - rd;
+  const size_t x_off = size_t(m) * x_s0 + size_t(h) * x_s1;
+  const size_t o_off = (size_t(m) * size_t(H) + size_t(h)) * size_t(D);
+
+  for (uint j = tid; j < head_w; j += TG_X) {
+    out[o_off + size_t(j)] = x[x_off + size_t(j)];
+  }
+  const float pos_m = float(pos[m]);
+  for (uint p = tid; p < uint(half_rd); p += TG_X) {
+    const float theta = pos_m * inv_freq[p];
+    const float c = metal::precise::cos(theta);
+    const float s = metal::precise::sin(theta);
+    const float x0 = x[x_off + size_t(head_w + 2u * p)];
+    const float x1 = x[x_off + size_t(head_w + 2u * p + 1u)];
+    out[o_off + size_t(head_w + 2u * p)] = x0 * c - x1 * s;
+    out[o_off + size_t(head_w + 2u * p + 1u)] = x0 * s + x1 * c;
   }
 }
 )METAL"

@@ -171,11 +171,56 @@ pub fn write_latent(
     if w != 2 * half || n <= 0 {
         return Err(bad(format!("latent rows {d:?} for planes of {half}")));
     }
-    let rows = kv.astype(ROW_DTYPE)?;
+    let rows = if kv.dtype()? == ROW_DTYPE {
+        kv.clone()
+    } else {
+        kv.astype(ROW_DTYPE)?
+    };
     let k = rows.slice(&[0, 0], &[n, half])?.reshape(&[n, 1, half])?;
     let v = rows
         .slice(&[0, half], &[n, 2 * half])?
         .reshape(&[n, 1, half])?;
+    adapter
+        .update_keys_values_native_recorded(layer, &k, &v, base, floor)
+        .map_err(bad)
+}
+
+/// Writes pre-split contiguous latent halves `k0, k1 [n, half]` (f16) of
+/// positions `base..base + n` directly into pool layer `layer` without
+/// strided column slices or hidden contiguous copies.
+pub fn write_latent_split(
+    adapter: &mut PagedKVCacheAdapter,
+    layer: u32,
+    k0: &MxArray,
+    k1: &MxArray,
+    base: u32,
+    floor: u32,
+) -> Result<()> {
+    let half = i64::from(adapter.layer_kv_pool().config().head_size);
+    let d0 = k0.shape()?.as_ref().to_vec();
+    let d1 = k1.shape()?.as_ref().to_vec();
+    let (&[n, w0], &[n1, w1]) = (d0.as_slice(), d1.as_slice()) else {
+        return Err(bad(format!(
+            "split latent rows {d0:?}/{d1:?} must be [n, {half}]"
+        )));
+    };
+    if n <= 0 || n != n1 || w0 != half || w1 != half {
+        return Err(bad(format!(
+            "split latent rows {d0:?}/{d1:?} for planes of {half}"
+        )));
+    }
+    let k0 = if k0.dtype()? == ROW_DTYPE {
+        k0.clone()
+    } else {
+        k0.astype(ROW_DTYPE)?
+    };
+    let k1 = if k1.dtype()? == ROW_DTYPE {
+        k1.clone()
+    } else {
+        k1.astype(ROW_DTYPE)?
+    };
+    let k = k0.reshape(&[n, 1, half])?;
+    let v = k1.reshape(&[n, 1, half])?;
     adapter
         .update_keys_values_native_recorded(layer, &k, &v, base, floor)
         .map_err(bad)
