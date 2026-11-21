@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1929,13 +1929,38 @@ struct MmapExpertBank {
     cache_slots: [usize; 2],
     mapped_bytes: u64,
     in_turn: Arc<AtomicBool>,
+    origin: Instant,
+    last_keepalive_ms: AtomicU64,
+    prefill_ran: AtomicBool,
 }
 
 impl MmapExpertBank {
+    fn elapsed_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn keep_residency_alive(&self) {
+        if let Some(rset) = &self.rset {
+            rset.request();
+            self.last_keepalive_ms
+                .store(self.elapsed_ms(), Ordering::Release);
+        }
+    }
+
+    fn residency_stale(&self, max_age: Duration) -> bool {
+        if self.rset.is_none() {
+            return false;
+        }
+        let max_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.elapsed_ms()
+            .saturating_sub(self.last_keepalive_ms.load(Ordering::Acquire))
+            >= max_ms
+    }
+
     fn set_in_turn(&self, active: bool) {
         self.in_turn.store(active, Ordering::Release);
-        if active && let Some(rset) = &self.rset {
-            rset.request();
+        if active {
+            self.keep_residency_alive();
         }
     }
 
@@ -1947,6 +1972,7 @@ impl MmapExpertBank {
         experts: &[Option<ExpertLayer>],
         paths: &[PathBuf],
         warm_budget_bytes: u64,
+        force_prewarm: bool,
     ) -> Result<Self> {
         if n_experts == 0 || u32::try_from(n_experts).is_err() {
             return Err(bad(format!("invalid mmap expert count {n_experts}")));
@@ -2077,8 +2103,18 @@ impl MmapExpertBank {
             layers.push(MmapLayer { ci, projs });
         }
 
+        let buf_refs: Vec<&MxArray> = layers
+            .iter()
+            .flat_map(|l| l.projs.iter().map(|p| &p.buf))
+            .collect();
+        let rset = MetalResidencySet::create(&buf_refs);
+
+        // Skip background pread pre-warming in auto mode when Metal residency
+        // sets already pin mmap pages, preventing idle page-cache pressure.
         let in_turn = Arc::new(AtomicBool::new(false));
-        let warm = if warm_budget_bytes > 0 && !raw_spans.is_empty() {
+        let spawn_warm =
+            warm_budget_bytes > 0 && !raw_spans.is_empty() && (force_prewarm || rset.is_none());
+        let warm = if spawn_warm {
             raw_spans.sort_unstable_by_key(|&(s, start, _)| (s, start));
             let mut merged: Vec<(PathBuf, u64, u64)> = Vec::new();
             for (s, start, end) in raw_spans {
@@ -2108,12 +2144,6 @@ impl MmapExpertBank {
             None
         };
 
-        let buf_refs: Vec<&MxArray> = layers
-            .iter()
-            .flat_map(|l| l.projs.iter().map(|p| &p.buf))
-            .collect();
-        let rset = MetalResidencySet::create(&buf_refs);
-
         Ok(Self {
             _warm: warm,
             rset,
@@ -2125,6 +2155,9 @@ impl MmapExpertBank {
             cache_slots,
             mapped_bytes,
             in_turn,
+            origin: Instant::now(),
+            last_keepalive_ms: AtomicU64::new(0),
+            prefill_ran: AtomicBool::new(false),
         })
     }
 
@@ -2136,6 +2169,7 @@ impl MmapExpertBank {
         _experts: &[Option<ExpertLayer>],
         _paths: &[PathBuf],
         _warm_budget_bytes: u64,
+        _force_prewarm: bool,
     ) -> Result<Self> {
         Err(bad("mmap expert bank requires Unix"))
     }
@@ -2278,7 +2312,8 @@ impl KqBank {
 
     /// Zero-copy read-only mmap expert bank: maps each shard once and wraps
     /// every trunk expert tensor as a page-aligned Metal buffer with 0 B
-    /// anonymous RAM. When `warm_budget_bytes > 0`, spawns a low-priority
+    /// anonymous RAM. When `warm_budget_bytes > 0` and either `force_prewarm`
+    /// is set or Metal residency sets are unavailable, spawns a low-priority
     /// background pre-warmer that pauses during active turns.
     pub fn new_mmap(
         pool: IoPool,
@@ -2286,6 +2321,7 @@ impl KqBank {
         experts: &[Option<ExpertLayer>],
         paths: &[PathBuf],
         warm_budget_bytes: u64,
+        force_prewarm: bool,
     ) -> Result<Self> {
         let n = moe.n_experts;
         let classes: Vec<Option<ExpertClass>> = experts
@@ -2294,7 +2330,15 @@ impl KqBank {
             .collect();
         let layout = ClassLayout::new(&classes)?;
         let geos = [geometry(moe, CLASSES[0])?, geometry(moe, CLASSES[1])?];
-        let mmap = MmapExpertBank::new(n, &layout, &geos, experts, paths, warm_budget_bytes)?;
+        let mmap = MmapExpertBank::new(
+            n,
+            &layout,
+            &geos,
+            experts,
+            paths,
+            warm_budget_bytes,
+            force_prewarm,
+        )?;
         Ok(Self {
             direct: OnceLock::from(ResidentBank::Mmap(mmap)),
             inner: Mutex::new(Inner {
@@ -2424,6 +2468,43 @@ impl KqBank {
             Some(ResidentBank::Mmap(m)) => m.mapped_bytes,
             _ => 0,
         }
+    }
+
+    /// Re-affirms Metal residency for mmap expert buffers; no-op otherwise.
+    pub fn keep_residency_alive(&self) {
+        if let Some(ResidentBank::Mmap(mmap)) = self.direct.get() {
+            mmap.keep_residency_alive();
+        }
+    }
+
+    pub(crate) fn mark_prefill_wave(&self) {
+        if let Some(ResidentBank::Mmap(mmap)) = self.direct.get() {
+            mmap.prefill_ran.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn take_prefill_ran(&self) -> bool {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(mmap)) => mmap.prefill_ran.swap(false, Ordering::AcqRel),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn residency_stale(&self, max_age: Duration) -> bool {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(mmap)) => mmap.residency_stale(max_age),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_mmap_prewarm(&self) -> bool {
+        matches!(self.direct.get(), Some(ResidentBank::Mmap(m)) if m._warm.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_residency_set(&self) -> bool {
+        matches!(self.direct.get(), Some(ResidentBank::Mmap(m)) if m.rset.is_some())
     }
 
     /// Records `count` routed-expert uses for `layer` in direct or mmap mode.

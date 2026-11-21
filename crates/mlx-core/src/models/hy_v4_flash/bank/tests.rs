@@ -1547,11 +1547,18 @@ fn mmap_bank_maps_views_reports_zero_anon_and_toggles_in_turn() {
         &experts,
         std::slice::from_ref(&path),
         file.len() as u64,
+        false,
     )
     .unwrap();
 
     assert!(bank.is_direct());
     assert!(bank.is_mmap());
+    assert_eq!(bank.has_mmap_prewarm(), !bank.has_residency_set());
+    bank.keep_residency_alive();
+    assert!(!bank.take_prefill_ran());
+    bank.mark_prefill_wave();
+    assert!(bank.take_prefill_ran());
+    assert!(!bank.take_prefill_ran());
     assert_eq!(bank.nbytes(), 0);
     assert_eq!(bank.resident_bytes().unwrap(), 0);
     assert_eq!(
@@ -1621,6 +1628,7 @@ fn mmap_bank_rejects_misaligned_or_truncated_shard_cleanly() {
         &experts,
         std::slice::from_ref(&path),
         0,
+        false,
     );
     assert!(err.is_err());
 
@@ -1638,8 +1646,23 @@ fn mmap_bank_rejects_misaligned_or_truncated_shard_cleanly() {
         &experts2,
         std::slice::from_ref(&path2),
         0,
+        false,
     );
     assert!(err.is_err());
+
+    // Explicit force_prewarm spawns the background pre-warmer even when residency sets are active.
+    let (_dir3, path3, m3, experts3, file3) = aligned_bank_fixture();
+    let forced = KqBank::new_mmap(
+        pool_over(&path3, 2),
+        &m3,
+        &experts3,
+        std::slice::from_ref(&path3),
+        file3.len() as u64,
+        true,
+    )
+    .unwrap();
+    assert!(forced.has_mmap_prewarm());
+    drop(forced);
 }
 
 fn real_scan() -> Scan {

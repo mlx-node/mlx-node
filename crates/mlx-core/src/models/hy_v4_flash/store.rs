@@ -71,6 +71,9 @@ pub const CHUNK_ENV: &str = "MLX_HY4_PREFILL_CHUNK";
 pub const MTP_ENV: &str = "MLX_HY4_MTP";
 /// Prefill chunk rows the admission may pick, largest first.
 pub const CHUNKS: [usize; 3] = [8192, 4096, 2048];
+/// Maximum prefill chunk rows for mmap expert residency so peak Metal scratch
+/// stays below macOS's working set limit.
+pub const MMAP_PREFILL_CHUNK_MAX: usize = 2048;
 /// The context ladder's floor.
 pub const MIN_CONTEXT: usize = 16_384;
 /// Most lanes a load admits.
@@ -827,10 +830,10 @@ pub fn mmap_gate(
     }
 }
 
-/// Evaluates mmap residency across `CHUNKS` (largest first, capped at `ctx`)
-/// using [`direct_kv_allowance`] (`min(ctx, DIRECT_KV_ALLOWANCE_TOKENS)`).
-/// Returns the largest admitted chunk and its decision, or the smallest chunk's
-/// refused decision when none fits.
+/// Evaluates mmap residency across `CHUNKS` capped at
+/// `ctx.min(MMAP_PREFILL_CHUNK_MAX)` using [`direct_kv_allowance`]
+/// (`min(ctx, DIRECT_KV_ALLOWANCE_TOKENS)`). Returns the largest admitted chunk
+/// and its decision, or the smallest evaluated chunk's refused decision.
 #[allow(clippy::too_many_arguments)]
 pub fn pick_mmap(
     mode: MmapMode,
@@ -847,8 +850,9 @@ pub fn pick_mmap(
 ) -> (usize, MmapDecision) {
     let margin = direct_margin(reserve_override);
     let kv_allowance_initial = direct_kv_allowance(p, ctx);
+    let cap = ctx.min(MMAP_PREFILL_CHUNK_MAX);
     let eval = |chunk: usize| {
-        let rows = chunk.min(ctx);
+        let rows = chunk.min(cap);
         let scratch = direct_scratch_bytes(p, rows, ctx);
         let gate = mmap_gate(
             mode,
@@ -865,13 +869,18 @@ pub fn pick_mmap(
         );
         (rows, gate)
     };
-    for &chunk in &CHUNKS[..CHUNKS.len() - 1] {
-        let (rows, gate) = eval(chunk);
-        if gate.admitted {
-            return (rows, gate);
+    let mut last = None;
+    for &chunk in &CHUNKS {
+        if chunk > MMAP_PREFILL_CHUNK_MAX {
+            continue;
         }
+        let res = eval(chunk);
+        if res.1.admitted {
+            return res;
+        }
+        last = Some(res);
     }
-    eval(CHUNKS[CHUNKS.len() - 1])
+    last.unwrap_or_else(|| eval(MMAP_PREFILL_CHUNK_MAX))
 }
 
 /// Selected expert residency mode at load.
@@ -1925,9 +1934,15 @@ impl Store {
         };
         let smallest = CHUNKS[CHUNKS.len() - 1];
         enum BankInit {
-            Mmap { warm_budget: u64 },
+            Mmap {
+                warm_budget: u64,
+                force_prewarm: bool,
+            },
             Direct,
-            Streamed { cache: [usize; 2], staging: usize },
+            Streamed {
+                cache: [usize; 2],
+                staging: usize,
+            },
         }
         let (lanes, ctx, admitted, admission, direct_budget, bank_init) = match (
             &limits, &opts.plan,
@@ -2030,7 +2045,10 @@ impl Store {
                             chunk,
                             Some(a),
                             Some(gate.budget),
-                            BankInit::Mmap { warm_budget },
+                            BankInit::Mmap {
+                                warm_budget,
+                                force_prewarm: opts.mmap_prewarm == MmapMode::On,
+                            },
                         )
                     }
                     ExpertResidency::Direct { chunk, gate } => {
@@ -2189,12 +2207,16 @@ impl Store {
         let t_bank = Instant::now();
         let is_mmap = matches!(bank_init, BankInit::Mmap { .. });
         let bank = match bank_init {
-            BankInit::Mmap { warm_budget } => Arc::new(KqBank::new_mmap(
+            BankInit::Mmap {
+                warm_budget,
+                force_prewarm,
+            } => Arc::new(KqBank::new_mmap(
                 IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
                 &scan.cfg.moe,
                 scan.trunk_experts(),
                 &scan.paths,
                 warm_budget,
+                force_prewarm,
             )?),
             BankInit::Direct => Arc::new(KqBank::new_direct(
                 IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,

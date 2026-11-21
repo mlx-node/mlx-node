@@ -2233,7 +2233,7 @@ fn mmap_admission_headroom_guard_and_precedence() {
         ..Default::default()
     };
 
-    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 8192 chunk
+    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 2048 chunk
     //    (budget 104 GiB >= dense + kv/scratch + 83.35 GiB mapped_bytes), wired_limit < 20 GiB.
     let res = select_expert_mode(
         MmapMode::Auto,
@@ -2254,7 +2254,7 @@ fn mmap_admission_headroom_guard_and_precedence() {
     let ExpertResidency::Mmap { chunk, gate } = res else {
         panic!("expected Mmap on 128 GiB host with 20 GiB others, got {res:?}");
     };
-    assert_eq!(chunk, 8192);
+    assert_eq!(chunk, MMAP_PREFILL_CHUNK_MAX);
     assert!(gate.admitted);
     assert_eq!(gate.mapped_bytes, mapped_bytes);
     assert_eq!(
@@ -2357,7 +2357,7 @@ fn mmap_admission_headroom_guard_and_precedence() {
     else {
         panic!("expected MLX_HY4_MMAP=1 to force Mmap at 50 GiB others, got {res_force_busy:?}");
     };
-    assert_eq!(force_chunk, 8192);
+    assert_eq!(force_chunk, MMAP_PREFILL_CHUNK_MAX);
     assert!(force_gate.admitted);
     assert_eq!(
         force_gate.need,
@@ -2600,7 +2600,7 @@ fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
     let path = dir.join("experts.bin");
     std::fs::write(&path, vec![0u8; off as usize]).unwrap();
     let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
-    let bank = KqBank::new_mmap(pool, &m, &experts, std::slice::from_ref(&path), 0).unwrap();
+    let bank = KqBank::new_mmap(pool, &m, &experts, std::slice::from_ref(&path), 0, false).unwrap();
 
     assert!(bank.is_direct());
     assert!(bank.is_mmap());
@@ -2619,7 +2619,7 @@ fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
     let dense = 10 * G;
     let ws = 96 * G;
     let kv_initial = direct_kv_allowance(&p, ctx);
-    let scratch = direct_scratch_bytes(&p, 8192, ctx);
+    let scratch = direct_scratch_bytes(&p, MMAP_PREFILL_CHUNK_MAX, ctx);
     let mmap_fixed = dense + kv_initial + scratch;
     assert!(mmap_fixed < 20 * G);
     let classes = Classes {
@@ -2658,7 +2658,7 @@ fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
     let lease = Lease::new(
         p,
         size,
-        8192,
+        MMAP_PREFILL_CHUNK_MAX as u64,
         classes,
         Some(Limits::default()),
         Some(mmap_adm),

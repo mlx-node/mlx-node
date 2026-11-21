@@ -17,11 +17,35 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
 using mlx::core::array;
 using mlx::core::Device;
+
+#ifdef MLX_NODE_METAL_ENABLED
+constexpr uint64_t kMaxBytesPerResidencySet = 10ULL << 30;
+
+struct MmapResidencySets {
+  std::vector<MTL::ResidencySet*> sets;
+
+  ~MmapResidencySets() {
+    if (sets.empty()) return;
+    if (__builtin_available(macOS 15, iOS 18, *)) {
+      auto pool = mlx::core::metal::new_scoped_memory_pool();
+      for (MTL::ResidencySet* rset : sets) {
+        if (!rset) continue;
+        rset->endResidency();
+        rset->removeAllAllocations();
+        rset->commit();
+        rset->release();
+      }
+    }
+    sets.clear();
+  }
+};
+#endif
 
 bool known_dtype_code(int32_t code) {
   return code >= 0 && code <= 6;
@@ -254,9 +278,9 @@ mlx_array* mlx_array_from_mmap_readonly(void* aligned_ptr,
 #endif
 }
 
-// Standing Metal residency set over existing array buffers so macOS keeps
-// mmap GPU page tables resident across command buffers. Caller must destroy
-// the set before releasing the backing buffers.
+// Standing Metal residency sets (capped at 10 GiB each so macOS does not drop
+// one monolithic mapping under memory pressure) over existing array buffers.
+// Caller must destroy the handle before releasing the backing buffers.
 void* mlx_metal_residency_set_create(mlx_array* const* arrays, size_t count) {
 #ifdef MLX_NODE_METAL_ENABLED
   try {
@@ -268,34 +292,51 @@ void* mlx_metal_residency_set_create(mlx_array* const* arrays, size_t count) {
       if (!mtl_dev || !mtl_dev->supportsFamily(MTL::GPUFamilyMetal3)) {
         return nullptr;
       }
-      auto pool = mlx::core::metal::new_scoped_memory_pool();
-      auto* desc = MTL::ResidencySetDescriptor::alloc()->init()->autorelease();
-      desc->setInitialCapacity(static_cast<NS::UInteger>(count));
-      NS::Error* error = nullptr;
-      MTL::ResidencySet* rset = mtl_dev->newResidencySet(desc, &error);
-      if (!rset) {
-        if (error && error->localizedDescription()) {
-          std::fprintf(stderr, "[MLX] metal_residency_set_create: %s\n",
-                       error->localizedDescription()->utf8String());
-        }
-        return nullptr;
-      }
-      size_t added = 0;
+      std::vector<std::vector<MTL::Allocation*>> buckets;
+      uint64_t set_bytes = 0;
       for (size_t i = 0; i < count; ++i) {
         if (!arrays[i]) continue;
         auto* arr = reinterpret_cast<array*>(arrays[i]);
         void* buf_ptr = arr->buffer().ptr();
         if (!buf_ptr) continue;
-        rset->addAllocation(static_cast<MTL::Allocation*>(buf_ptr));
-        ++added;
+        auto* mtl_buf = static_cast<MTL::Buffer*>(buf_ptr);
+        const uint64_t alloc_bytes = static_cast<uint64_t>(mtl_buf->length());
+        if (buckets.empty() ||
+            (set_bytes > 0 &&
+             (alloc_bytes > kMaxBytesPerResidencySet ||
+              set_bytes > kMaxBytesPerResidencySet - alloc_bytes))) {
+          buckets.emplace_back();
+          set_bytes = 0;
+        }
+        buckets.back().push_back(static_cast<MTL::Allocation*>(buf_ptr));
+        set_bytes += alloc_bytes;
       }
-      if (added == 0) {
-        rset->release();
+      if (buckets.empty()) {
         return nullptr;
       }
-      rset->commit();
-      rset->requestResidency();
-      return static_cast<void*>(rset);
+      auto pool = mlx::core::metal::new_scoped_memory_pool();
+      auto holder = std::make_unique<MmapResidencySets>();
+      holder->sets.reserve(buckets.size());
+      for (const auto& bucket : buckets) {
+        auto* desc = MTL::ResidencySetDescriptor::alloc()->init()->autorelease();
+        desc->setInitialCapacity(static_cast<NS::UInteger>(bucket.size()));
+        NS::Error* error = nullptr;
+        MTL::ResidencySet* rset = mtl_dev->newResidencySet(desc, &error);
+        if (!rset) {
+          if (error && error->localizedDescription()) {
+            std::fprintf(stderr, "[MLX] metal_residency_set_create: %s\n",
+                         error->localizedDescription()->utf8String());
+          }
+          return nullptr;
+        }
+        for (MTL::Allocation* alloc : bucket) {
+          rset->addAllocation(alloc);
+        }
+        rset->commit();
+        rset->requestResidency();
+        holder->sets.push_back(rset);
+      }
+      return static_cast<void*>(holder.release());
     }
     return nullptr;
   } catch (const std::exception& e) {
@@ -317,7 +358,10 @@ void mlx_metal_residency_set_request(void* handle) {
     if (!handle) return;
     if (__builtin_available(macOS 15, iOS 18, *)) {
       auto pool = mlx::core::metal::new_scoped_memory_pool();
-      static_cast<MTL::ResidencySet*>(handle)->requestResidency();
+      auto* holder = static_cast<MmapResidencySets*>(handle);
+      for (MTL::ResidencySet* rset : holder->sets) {
+        if (rset) rset->requestResidency();
+      }
     }
   } catch (...) {
   }
@@ -330,14 +374,7 @@ void mlx_metal_residency_set_destroy(void* handle) {
 #ifdef MLX_NODE_METAL_ENABLED
   try {
     if (!handle) return;
-    if (__builtin_available(macOS 15, iOS 18, *)) {
-      auto pool = mlx::core::metal::new_scoped_memory_pool();
-      auto* rset = static_cast<MTL::ResidencySet*>(handle);
-      rset->endResidency();
-      rset->removeAllAllocations();
-      rset->commit();
-      rset->release();
-    }
+    delete static_cast<MmapResidencySets*>(handle);
   } catch (...) {
   }
 #else

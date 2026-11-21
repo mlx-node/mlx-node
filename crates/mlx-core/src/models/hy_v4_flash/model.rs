@@ -16,6 +16,7 @@
 //! back at its start.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use napi::{Error, Result};
 
@@ -902,6 +903,22 @@ impl Model {
                 .broadcast_to(&[ni, hc, dim])?,
         );
         let direct = self.bank_is_direct();
+        if direct && wave.kind() == RowKind::Decode {
+            let mut from_prefill = false;
+            let mut stale = false;
+            for b in &self.banks {
+                from_prefill |= b.take_prefill_ran();
+                stale |= b.residency_stale(Duration::from_secs(1));
+            }
+            if from_prefill {
+                crate::array::clear_cache();
+            }
+            if from_prefill || stale {
+                for b in &self.banks {
+                    b.keep_residency_alive();
+                }
+            }
+        }
         let prefill_ahead = !direct
             && wave.kind() == RowKind::Prefill
             && total >= super::block::READ_AHEAD_MIN_ROWS;
@@ -995,6 +1012,13 @@ impl Model {
                         HcCarry::Pending { .. } => pending_trace_out = true,
                     }
                 }
+            }
+        }
+        if direct && wave.kind() == RowKind::Prefill {
+            crate::array::clear_cache();
+            for b in &self.banks {
+                b.mark_prefill_wave();
+                b.keep_residency_alive();
             }
         }
         if pending_trace_out {

@@ -1858,6 +1858,7 @@ fn mmap_mode_decode_and_prefill_match_direct_bank() {
                     &experts,
                     std::slice::from_ref(&path),
                     file.len() as u64,
+                    false,
                 )
                 .unwrap(),
             )
