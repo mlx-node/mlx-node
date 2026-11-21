@@ -65,6 +65,26 @@ pub fn open_nocache(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// `O_RDONLY` + `F_RDAHEAD` 0 without `F_NOCACHE` so clean file-backed pages
+/// remain in the OS page cache without speculative read-ahead.
+fn open_cached_no_rdahead(path: &Path) -> Result<File> {
+    let file = File::open(path).map_err(|e| bad(format!("open '{}': {e}", path.display())))?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` owns an open descriptor; `F_RDAHEAD` only disables
+        // speculative read-ahead.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } != 0 {
+            return Err(bad(format!(
+                "F_RDAHEAD on '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 struct Shard {
     path: PathBuf,
     file: File,
@@ -88,6 +108,44 @@ impl ShardSet {
         for p in paths {
             let path = p.as_ref().to_path_buf();
             let file = open_nocache(&path)?;
+            let meta = file
+                .metadata()
+                .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?;
+            shards.push(Shard {
+                len: meta.len(),
+                stat: ShardIdentity::from_metadata(&meta),
+                path,
+                file,
+            });
+        }
+        Ok(Self {
+            shards,
+            #[cfg(test)]
+            fault: Mutex::new(None),
+            #[cfg(test)]
+            delay_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Opens `paths` with per-shard OS page-cache policy: `allow_page_cache[i]`
+    /// omits `F_NOCACHE` (keeping `F_RDAHEAD 0`), while `false` sets both
+    /// `F_NOCACHE 1` and `F_RDAHEAD 0` like [`ShardSet::open`].
+    pub fn open_with_cache<P: AsRef<Path>>(paths: &[P], allow_page_cache: &[bool]) -> Result<Self> {
+        if paths.len() != allow_page_cache.len() {
+            return Err(bad(format!(
+                "{} shard paths for {} page-cache flags",
+                paths.len(),
+                allow_page_cache.len()
+            )));
+        }
+        let mut shards = Vec::with_capacity(paths.len());
+        for (p, &cached) in paths.iter().zip(allow_page_cache) {
+            let path = p.as_ref().to_path_buf();
+            let file = if cached {
+                open_cached_no_rdahead(&path)?
+            } else {
+                open_nocache(&path)?
+            };
             let meta = file
                 .metadata()
                 .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?;

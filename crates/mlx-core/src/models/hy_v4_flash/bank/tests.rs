@@ -694,6 +694,87 @@ fn slot_repack_equals_whole_tensor_repacker() {
     }
 }
 
+#[test]
+fn band_rows_aligns_q4k_1536_to_16k_pages_and_matches_repack() {
+    let q4k_row = KQuantFormat::Q4K.row_bytes(1536);
+    assert_eq!(q4k_row, 864);
+    let step = band_rows(1536, q4k_row, BAND_BYTES);
+    assert_eq!(step, 512);
+    assert_eq!((step * q4k_row) % 16384, 0);
+
+    // Every 32-byte-aligned GGUF offset yields exact 16 KiB internal boundaries
+    // covering 0..1536 with zero gaps or overlaps.
+    for m in 0..512u64 {
+        let off = m * 32;
+        let ranges = band_ranges(off, 1536, q4k_row, BAND_BYTES);
+        assert!(!ranges.is_empty());
+        let mut cursor = 0usize;
+        for (i, &(r0, len)) in ranges.iter().enumerate() {
+            assert_eq!(r0, cursor, "gap or overlap at m={m} band {i}");
+            assert!(len > 0, "empty band at m={m} band {i}");
+            cursor += len;
+            if i + 1 < ranges.len() {
+                assert_eq!(
+                    (off + cursor as u64 * q4k_row as u64) % 16384,
+                    0,
+                    "internal cut not 16 KiB aligned at m={m} band {i}"
+                );
+            }
+        }
+        assert_eq!(cursor, 1536, "incomplete coverage at m={m}");
+    }
+
+    // Q6_K K=1536 also covers 0..1536 contiguously with zero gaps or overlaps.
+    let q6k_row = KQuantFormat::Q6K.row_bytes(1536);
+    assert_eq!(q6k_row, 1260);
+    let q6_ranges = band_ranges(14_336, 1536, q6k_row, BAND_BYTES);
+    let mut cursor = 0usize;
+    for &(r0, len) in &q6_ranges {
+        assert_eq!(r0, cursor);
+        assert!(len > 0);
+        cursor += len;
+    }
+    assert_eq!(cursor, 1536);
+
+    // Full 1536x1536 Q4_K read at real-fixture offset mod 16384 = 14336 matches
+    // whole-tensor repack bit-for-bit, and sort_reads orders by (shard, offset).
+    let geo = ProjGeo {
+        format: KQuantFormat::Q4K,
+        rows: 1536,
+        k: 1536,
+    };
+    let per = geo.file_bytes() as usize;
+    let at = 14_336usize;
+    let mut file = random_bytes(at, 41);
+    let payload = random_bytes(2 * per, 42);
+    file.extend_from_slice(&payload);
+    let whole = repack_kquant(KQuantFormat::Q4K, &payload, 2 * 1536, 1536).unwrap();
+    let loc = Arc::new(located(
+        "blk.1.ffn_gate_exps.weight",
+        [1536, 1536, 2],
+        GgufTensorType::Q4K,
+        at as u64,
+    ));
+    let dir = Temp::new();
+    let path = dir.file(&file);
+    let pool = pool_over(&path, 4);
+    let mut host = Host::new(geo, 2);
+    let dst = host.dst();
+    let mut reads = dst.reads(&loc, 1, 0).unwrap();
+    reads.extend(dst.reads(&loc, 0, 1).unwrap());
+    sort_reads(&mut reads);
+    assert!(reads.windows(2).all(
+        |w| (w[0].extent.shard, w[0].extent.offset) <= (w[1].extent.shard, w[1].extent.offset)
+    ));
+    // SAFETY: `host` outlives the ticket and bands write disjoint rows/slots.
+    unsafe { pool.submit(reads, Priority::High) }
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(host.slot(0), expert_of(&whole, geo, 1));
+    assert_eq!(host.slot(1), expert_of(&whole, geo, 0));
+}
+
 /// A file of 4 layers (0 dense, 1 and 3 class A, 2 class B), 6 experts of
 /// 256 x 256, every tensor at an unaligned offset.
 fn bank_fixture() -> (Temp, PathBuf, MoeConfig, Vec<Option<ExpertLayer>>, Vec<u8>) {
@@ -1083,6 +1164,61 @@ fn two_class_interleaved_read_ahead() {
 }
 
 #[test]
+fn decode_read_ahead_harvests_hits_and_counts_unused() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [4, 2], 2).unwrap();
+    bank.set_decode_prefetch(false);
+    assert!(!bank.decode_prefetch());
+    bank.set_decode_prefetch(true);
+    assert!(bank.decode_prefetch());
+
+    // Direct and single-staging banks must not prefetch.
+    let single = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 2], 1).unwrap();
+    assert_eq!(single.prefetch_layer(1, &[0, 1]).unwrap(), 0);
+    single.end_turn().unwrap();
+
+    // Layer 1 (class 0 local 0): submit Priority::High decode misses and immediately
+    // queue Layer 2 (class 1 local 0) at Priority::Low before waiting on Layer 1.
+    let (p1, pending1) = bank.prepare_split(1, &[0, 1], &[1, 1], true).unwrap();
+    assert_eq!(bank.prefetch_layer(2, &[1, 3, 5]).unwrap(), 3);
+    pending1.expect("layer 1 misses").finish().unwrap();
+    bank.assert_slots(&p1);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &p1);
+    bank.end_layer(1);
+    bank.settle_all();
+    assert_eq!(bank.stats()[1].prefetch_slots, 3);
+
+    // Layer 2 (class 1 local 0) needs [1, 3, 4]: 1 and 3 hit prefetched staging slots
+    // (not in `reading`), 4 falls through to Priority::High, 5 counts as unused.
+    let (p2, pending2) = bank.prepare_split(2, &[1, 3, 4], &[1, 1, 1], true).unwrap();
+    assert_eq!(p2.reading, vec![4]);
+    bank.assert_ready_slots(&p2);
+    assert_eq!(bank.prefetch_layer(3, &[0, 2]).unwrap(), 2);
+    pending2.expect("mispredicted expert 4").finish().unwrap();
+    bank.assert_slots(&p2);
+    check_prepared(&file, &m, experts[2].as_ref().unwrap(), &p2);
+    bank.end_layer(2);
+    bank.settle_all();
+    assert_eq!(bank.stats()[1].prefetch_slots, 3);
+    assert_eq!(bank.stats()[1].prefetch_unused, 1);
+    assert_eq!(bank.stats()[1].slots, 4);
+
+    // Layer 3 (class 0 local 1) needs [0, 2]: 100% prefetched hits -> zero High reads.
+    let (p3, pending3) = bank.prepare_split(3, &[0, 2], &[1, 1], true).unwrap();
+    assert!(pending3.is_none());
+    assert!(p3.reading.is_empty());
+    bank.assert_slots(&p3);
+    check_prepared(&file, &m, experts[3].as_ref().unwrap(), &p3);
+    bank.end_layer(3);
+    bank.settle_all();
+    assert_eq!(bank.stats()[0].prefetch_slots, 2);
+    assert_eq!(bank.stats()[0].prefetch_unused, 0);
+    assert_eq!(bank.stats()[0].drains, 0);
+    bank.test_check_caches();
+    bank.end_turn().unwrap();
+}
+
+#[test]
 fn prefill_subgroups_last_use_order_and_drop_on_error() {
     let (_dir, path, m, experts, file) = bank_fixture();
     // Class 0 has 2 layers (1, 3), 4 cache slots -> quota 2/layer.
@@ -1278,6 +1414,99 @@ fn direct_bank_late_layer_read_error_propagates_through_wait_direct_fill() {
     assert!(bank.direct_layer(2).unwrap().is_some());
     assert!(bank.wait_direct_fill().is_err());
     assert!(bank.direct_layer(3).is_err());
+}
+
+#[test]
+fn partial_bank_promotes_to_direct_when_idle_and_serves_identical_bytes() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 1], 1).unwrap();
+    let reference = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 1], 1).unwrap();
+    assert!(!bank.is_direct());
+
+    // Serve a streamed turn first.
+    let warm = bank.prepare(1, &[0, 3], &[], true).unwrap();
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &warm);
+    bank.settle_all();
+
+    // Promotion while in_turn == true must be refused without altering state.
+    assert!(bank.promote_to_direct().is_err());
+    assert!(!bank.is_direct());
+    assert!(bank.in_turn());
+
+    // Release Prepared handle before idle promotion so old banks can free cleanly.
+    drop(warm);
+    bank.end_turn().unwrap();
+    assert!(!bank.in_turn());
+
+    bank.promote_to_direct().unwrap();
+    assert!(bank.is_direct());
+    assert!(!bank.in_turn());
+    assert_eq!(bank.staging_layers(), 0);
+    assert_eq!(bank.cache_slots(), [2 * m.n_experts, m.n_experts]);
+    bank.wait_direct_fill().unwrap();
+    assert!(bank.direct_fill_complete());
+    // Promoting an already-direct bank is an idempotent no-op.
+    bank.promote_to_direct().unwrap();
+
+    // Every layer and expert matches the streamed reference bit-for-bit.
+    let all_experts: Vec<u32> = (0..m.n_experts as u32).collect();
+    for il in [1usize, 2, 3] {
+        let l = experts[il].as_ref().unwrap();
+        let geo = geometry(&m, l.class).unwrap();
+        let dir_arrays = bank.direct_layer(il).unwrap().expect("direct arrays");
+        let sp = reference.prepare(il, &all_experts, &[], false).unwrap();
+        for pi in 0..3 {
+            for (&e, &s) in sp.experts.iter().zip(&sp.slots) {
+                assert_eq!(
+                    bank_slot(&dir_arrays[pi], geo[pi], e),
+                    bank_slot(&sp.arrays[pi], geo[pi], s),
+                    "promoted layer {il} proj {pi} expert {e}"
+                );
+            }
+        }
+        reference.settle_all();
+    }
+
+    // Next turn works in direct mode and never flips volatile at turn end.
+    assert!(!bank.begin_turn().unwrap());
+    assert!(bank.in_turn());
+    let p = bank.prepare(2, &[1, 4, 5], &[], true).unwrap();
+    assert_eq!(p.slots, vec![1, 4, 5]);
+    bank.assert_slots(&p);
+    check_prepared(&file, &m, experts[2].as_ref().unwrap(), &p);
+    bank.end_turn().unwrap();
+    assert!(!bank.in_turn());
+    let res = bank.residency().unwrap();
+    assert!(res.resident > 0);
+    assert_eq!(res.volatile, 0);
+    reference.end_turn().unwrap();
+}
+
+#[test]
+fn promote_to_direct_restores_partial_bank_on_alloc_failure() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 1], 1).unwrap();
+    let old_nbytes = bank.nbytes();
+    let old_slots = bank.cache_slots();
+    bank.end_turn().unwrap();
+
+    // Inject allocation failure on the second direct MoE layer.
+    TEST_FAIL_DIRECT_ALLOC_AT.with(|c| c.set(Some(1)));
+    let err = bank.promote_to_direct();
+    TEST_FAIL_DIRECT_ALLOC_AT.with(|c| c.set(None));
+    assert!(err.is_err());
+    assert!(!bank.is_direct());
+    assert!(!bank.in_turn());
+    assert_eq!(bank.cache_slots(), old_slots);
+    assert_eq!(bank.nbytes(), old_nbytes);
+
+    // Restored partial bank serves bit-exact experts on the next turn.
+    bank.begin_turn().unwrap();
+    let p = bank.prepare(1, &[2, 5], &[], true).unwrap();
+    bank.assert_slots(&p);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &p);
+    bank.settle_all();
+    bank.end_turn().unwrap();
 }
 
 fn real_scan() -> Scan {

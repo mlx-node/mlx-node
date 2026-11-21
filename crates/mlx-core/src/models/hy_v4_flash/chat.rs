@@ -612,10 +612,32 @@ impl Inner {
             return;
         }
         self.in_turn = false;
-        {
+        let idle = self.paged.as_ref().is_none_or(|p| !p.busy.is_live());
+        let kv = self.kv_bytes();
+        let promoted_chunk = {
             let _ctx = StreamContext::new(Stream::generation());
-            if let Err(e) = self.store.end_turn() {
-                tracing::warn!("hy_v4_flash end of turn: {e}");
+            if idle {
+                match self.store.end_turn_idle(kv) {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        tracing::warn!("hy_v4_flash end of turn: {e}");
+                        None
+                    }
+                }
+            } else {
+                if let Err(e) = self.store.end_turn() {
+                    tracing::warn!("hy_v4_flash end of turn: {e}");
+                }
+                None
+            }
+        };
+        if let Some(direct_chunk) = promoted_chunk
+            && direct_chunk < self.grid.chunk()
+        {
+            let next = self.store.chunk.min(direct_chunk);
+            if let Ok(grid) = Grid::new(next, self.grid.open().to_vec()) {
+                self.store.chunk = next;
+                self.grid = grid;
             }
         }
         let resident = self.store.bank.resident_bytes().unwrap_or(0);

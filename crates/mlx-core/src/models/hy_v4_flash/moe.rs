@@ -40,7 +40,7 @@ use super::bank::sorted_slot_bounds;
 use super::bank::{KqBank, Prepared, ProjArrays};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
-use super::ops::{rms_norm, route, router_logits, router_scores, router_topk_gpu};
+use super::ops::{rms_norm, route, route_pair, router_logits, router_scores, router_topk_gpu};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
@@ -733,13 +733,16 @@ impl Moe {
 
     /// `x [rows, dim]` f32 (after `ffn_norm`) -> the FFN output before
     /// `post_ffw_norm`, and the routes when `need_routes` is set.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         layer: usize,
         w: &MoeWeights,
         x: &MxArray,
+        h: &MxArray,
         kind: RowKind,
         need_routes: bool,
+        next: Option<(&LayerFfn, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let use_gpu_route = !need_routes && {
             #[cfg(test)]
@@ -810,7 +813,7 @@ impl Moe {
                         return Ok((f, None));
                     }
                     let scores = Activations::sigmoid(&r_logits)?;
-                    return self.forward_host_routed(layer, w, x, kind, tp, scores);
+                    return self.forward_host_routed(layer, w, x, h, kind, tp, scores, None);
                 }
                 ExpertSource::Resident(a) if kind.is_decode() => {
                     let tp = prof_start();
@@ -832,7 +835,7 @@ impl Moe {
                         return Ok((f, None));
                     }
                     let scores = Activations::sigmoid(&r_logits)?;
-                    return self.forward_host_routed(layer, w, x, kind, tp, scores);
+                    return self.forward_host_routed(layer, w, x, h, kind, tp, scores, None);
                 }
                 _ => {}
             }
@@ -843,27 +846,67 @@ impl Moe {
             Group::Row => per_row(x, |r| router_scores(r, &w.router))?,
             Group::Fused | Group::Owner => router_scores(x, &w.router)?,
         };
-        self.forward_host_routed(layer, w, x, kind, tp, scores)
+        self.forward_host_routed(layer, w, x, h, kind, tp, scores, next)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_host_routed(
         &self,
         layer: usize,
         w: &MoeWeights,
         x: &MxArray,
+        h: &MxArray,
         kind: RowKind,
         tp: Option<std::time::Instant>,
         scores: MxArray,
+        next: Option<(&LayerFfn, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let bank = match &self.experts {
             ExpertSource::Bank(b) => Some((b, b.issued())),
             ExpertSource::Resident(_) => None,
         };
-        let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+        let next_spec = if kind.is_decode()
+            && !matches!(&self.experts, ExpertSource::Bank(b) if b.is_direct())
+        {
+            next.and_then(|(nffn, nw)| nffn.decode_prefetch_target(nw))
+        } else {
+            None
+        };
+        let next_issued = next_spec.and_then(|(_, _, _, _, nb)| match bank {
+            Some((b, _)) if Arc::ptr_eq(b, nb) => None,
+            _ => Some((nb, nb.issued())),
+        });
+        let (ids, weights, next_prefetch) = match next_spec {
+            Some((nffn, nw, next_m, _, next_bank)) => {
+                if let Some(scores_next) = nffn.speculative_router_scores(nw, h)? {
+                    let ((ids, weights), (mut next_ids, _)) = route_pair(
+                        &scores,
+                        self.bias.as_deref(),
+                        &self.moe,
+                        &scores_next,
+                        next_m.bias.as_deref(),
+                        &next_m.moe,
+                    )?;
+                    next_ids.sort_unstable();
+                    next_ids.dedup();
+                    (ids, weights, Some((next_bank, nffn.layer, next_ids)))
+                } else {
+                    let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+                    (ids, weights, None)
+                }
+            }
+            None => {
+                let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+                (ids, weights, None)
+            }
+        };
         // every gather planned before this read feeds `x` through the
         // residual stream, or was evaluated with its FFN chunk: it finished
         if let Some((b, issued)) = bank {
             b.settle(issued);
+        }
+        if let Some((nb, issued)) = next_issued {
+            nb.settle(issued);
         }
         #[cfg(test)]
         let (ids, weights) = forced::apply(layer, &scores, ids, weights, &self.moe)?;
@@ -879,11 +922,28 @@ impl Moe {
             && let ExpertSource::Bank(bank) = &self.experts
             && bank.split()
         {
-            let f = self.forward_split(layer, w, x, &routes, bank)?;
+            let f = self.forward_split(
+                layer,
+                w,
+                x,
+                &routes,
+                bank,
+                next_prefetch
+                    .as_ref()
+                    .map(|(nb, nl, want)| (nb.as_ref(), *nl, want.as_slice())),
+            )?;
             return Ok((f, Some(routes)));
         }
         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
-        let r = self.routed(layer, &z, &routes, kind)?;
+        let r = self.routed_with_next(
+            layer,
+            &z,
+            &routes,
+            kind,
+            next_prefetch
+                .as_ref()
+                .map(|(nb, nl, want)| (nb.as_ref(), *nl, want.as_slice())),
+        )?;
         let f = self.finish_with_shared(w, x, &r, shared_gu)?;
         Ok((f, Some(routes)))
     }
@@ -895,6 +955,7 @@ impl Moe {
         x: &MxArray,
         routes: &Routes,
         bank: &KqBank,
+        next_prefetch: Option<(&KqBank, usize, &[u32])>,
     ) -> Result<MxArray> {
         let rows = x.shape_at(0)?;
         let k = self.moe.n_used;
@@ -915,6 +976,9 @@ impl Moe {
         let (used, uses) = distinct_uses(&ids_asc);
         let tp = prof_start();
         let (p, pending) = bank.prepare_split(layer, &used, &uses, true)?;
+        if let Some((nb, next_layer, want_next)) = next_prefetch {
+            nb.prefetch_layer(next_layer, want_next)?;
+        }
         prof_end(Phase::Fill, tp, &[])?;
 
         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
@@ -1053,7 +1117,19 @@ impl Moe {
 
     /// `z [rows, latent]` -> `Σ w_e · expert_e(z)` `[rows, latent]` f32;
     /// the bank prepares the union of the rows' experts once.
+    #[cfg(test)]
     fn routed(&self, layer: usize, z: &MxArray, routes: &Routes, kind: RowKind) -> Result<MxArray> {
+        self.routed_with_next(layer, z, routes, kind, None)
+    }
+
+    fn routed_with_next(
+        &self,
+        layer: usize,
+        z: &MxArray,
+        routes: &Routes,
+        kind: RowKind,
+        next_prefetch: Option<(&KqBank, usize, &[u32])>,
+    ) -> Result<MxArray> {
         let rows = z.shape_at(0)?;
         let n = self.moe.n_experts as u32;
         if routes.k != self.moe.n_used
@@ -1085,7 +1161,19 @@ impl Moe {
                         .routed_prefill_subgrouped(layer, z, &ids, &w, &used, &uses, bank, sub);
                 }
                 let tp = prof_start();
-                let p = bank.prepare(layer, &used, &uses, kind.is_decode())?;
+                let p = match next_prefetch {
+                    Some((nb, next_layer, want_next)) => {
+                        let (mut p, pending) =
+                            bank.prepare_split(layer, &used, &uses, kind.is_decode())?;
+                        nb.prefetch_layer(next_layer, want_next)?;
+                        if let Some(pending) = pending {
+                            pending.finish()?;
+                        }
+                        p.reading.clear();
+                        p
+                    }
+                    None => bank.prepare(layer, &used, &uses, kind.is_decode())?,
+                };
                 prof_end(Phase::Fill, tp, &[])?;
                 bank.assert_slots(&p);
                 let tp = prof_start();
@@ -1789,6 +1877,44 @@ impl LayerFfn {
         m.prefetch_from(self.layer, mw, &x)
     }
 
+    pub fn speculative_router_scores(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let (FfnKind::Moe(_), Ffn::Moe(mw)) = (&self.kind, &w.ffn) else {
+            return Ok(None);
+        };
+        let x = rms_norm(&h.astype(DType::Float32)?, &w.ffn_norm, self.eps)?;
+        Ok(Some(router_scores(&x, &mw.router)?))
+    }
+
+    fn decode_prefetch_target<'a>(
+        &'a self,
+        w: &'a LayerWeights,
+    ) -> Option<(
+        &'a Self,
+        &'a LayerWeights,
+        &'a Moe,
+        &'a MoeWeights,
+        &'a Arc<KqBank>,
+    )> {
+        let (FfnKind::Moe(m), Ffn::Moe(mw)) = (&self.kind, &w.ffn) else {
+            return None;
+        };
+        let ExpertSource::Bank(bank) = &m.experts else {
+            return None;
+        };
+        if bank.is_direct()
+            || !bank.prefetch()
+            || !bank.decode_prefetch()
+            || bank.staging_layers() < 2
+        {
+            return None;
+        }
+        Some((self, w, m, mw, bank))
+    }
+
     pub fn end_layer(&self) {
         if let FfnKind::Moe(m) = &self.kind
             && let ExpertSource::Bank(bank) = &m.experts
@@ -1815,11 +1941,22 @@ impl LayerFfn {
         kind: RowKind,
         need_routes: bool,
     ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_traced_with_next(w, h, kind, need_routes, None)
+    }
+
+    pub fn forward_traced_with_next(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+        kind: RowKind,
+        need_routes: bool,
+        next: Option<(&LayerFfn, &LayerWeights)>,
+    ) -> Result<(MxArray, Option<Routes>)> {
         let chunk = match kind {
             RowKind::Prefill => prefill_ffn_chunk_rows(),
             RowKind::Decode => FFN_CHUNK_ROWS,
         };
-        self.forward_chunked_traced(
+        self.forward_chunked_traced_with_next(
             &w.ffn,
             &w.ffn_norm,
             &w.post_ffw_norm,
@@ -1827,6 +1964,7 @@ impl LayerFfn {
             chunk,
             kind,
             need_routes,
+            next,
         )
     }
 
@@ -1859,6 +1997,30 @@ impl LayerFfn {
         chunk: usize,
         kind: RowKind,
         need_routes: bool,
+    ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_chunked_traced_with_next(
+            ffn,
+            norm,
+            post_norm,
+            h,
+            chunk,
+            kind,
+            need_routes,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunked_traced_with_next(
+        &self,
+        ffn: &Ffn,
+        norm: &MxArray,
+        post_norm: &MxArray,
+        h: &MxArray,
+        chunk: usize,
+        kind: RowKind,
+        need_routes: bool,
+        next: Option<(&LayerFfn, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let shape = dims(h)?;
         let n = match shape.as_slice() {
@@ -1900,6 +2062,12 @@ impl LayerFfn {
             } else {
                 x.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
             };
+            let hc = if parts.len() == 1 {
+                h.clone()
+            } else {
+                h.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
+            };
+            let chunk_next = if parts.len() == 1 { next } else { None };
             let f = match (&self.kind, ffn) {
                 (
                     FfnKind::Dense,
@@ -1916,7 +2084,8 @@ impl LayerFfn {
                     f
                 }
                 (FfnKind::Moe(m), Ffn::Moe(mw)) => {
-                    let (f, r) = m.forward(self.layer, mw, &xc, kind, need_routes)?;
+                    let (f, r) =
+                        m.forward(self.layer, mw, &xc, &hc, kind, need_routes, chunk_next)?;
                     if let (Some(all), Some(r)) = (routes.as_mut(), r) {
                         all.append(r);
                     }

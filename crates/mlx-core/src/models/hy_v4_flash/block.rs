@@ -34,6 +34,9 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// Fewest prefill rows that trigger next-layer expert read-ahead.
 pub const READ_AHEAD_MIN_ROWS: usize = 256;
 
+/// Most decode rows that trigger next-layer expert read-ahead.
+pub const DECODE_READ_AHEAD_MAX_ROWS: usize = 4;
+
 /// One layer's per-sequence state.
 pub struct LayerState {
     pub cache: LayerCache,
@@ -164,6 +167,14 @@ impl Block {
         self.ffn.prefetch_from(w, h)
     }
 
+    pub fn speculative_router_scores(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        self.ffn.speculative_router_scores(w, h)
+    }
+
     pub fn end_layer(&self) {
         self.ffn.end_layer();
     }
@@ -236,10 +247,17 @@ impl Block {
         let x = post(&a, &x, &post_attn)?;
 
         let (h, post_ffn) = self.mix(&x, hc_ffn, kind)?;
-        if let Some((next_blk, next_w)) = next {
-            next_blk.prefetch_from(next_w, &h)?;
-        }
-        let (f, routes) = self.ffn.forward_traced(w, &h, kind, need_routes)?;
+        let decode_next = if kind.is_decode() {
+            next.map(|(next_blk, next_w)| (&next_blk.ffn, next_w))
+        } else {
+            if let Some((next_blk, next_w)) = next {
+                next_blk.prefetch_from(next_w, &h)?;
+            }
+            None
+        };
+        let (f, routes) =
+            self.ffn
+                .forward_traced_with_next(w, &h, kind, need_routes, decode_next)?;
         self.end_layer();
         Ok((post(&f, &x, &post_ffn)?, routes))
     }

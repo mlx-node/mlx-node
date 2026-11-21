@@ -58,6 +58,9 @@ pub const CACHE_ENV: &str = "MLX_HY4_EXPERT_CACHE_GB";
 pub const RESERVE_ENV: &str = "MLX_HY4_ADMIT_RESERVE_GB";
 /// Direct full-expert residency switch: `0`/`false`, `1`/`true`, or unset/`auto`.
 pub const DIRECT_ENV: &str = "MLX_HY4_DIRECT";
+/// `1`/`true` forces `F_NOCACHE` on expert shards too; default lets expert
+/// shards use the OS page cache while keeping the Engram shard `F_NOCACHE`.
+pub const SHARD1_NOCACHE_ENV: &str = "MLX_HY4_SHARD1_NOCACHE";
 /// Lowers the admitted prefill chunk (a multiple of 256).
 pub const CHUNK_ENV: &str = "MLX_HY4_PREFILL_CHUNK";
 /// `0` leaves the MTP layer out of the admission.
@@ -76,6 +79,9 @@ const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// Headroom reserved for other processes when evaluating direct full-expert residency.
 pub const DIRECT_MARGIN: u64 = 4 * GIB;
+/// Upfront KV token allowance for direct full-expert residency; the paged KV
+/// pool still serves up to `max_ctx` dynamically as memory allows.
+pub const DIRECT_KV_ALLOWANCE_TOKENS: usize = 65_536;
 /// RAM ladder entries (window clones and tails).
 pub const LADDER_BYTES: u64 = 150 * MIB;
 const HY4_COMPUTE_BASE: u64 = 512 * MIB;
@@ -512,6 +518,46 @@ pub enum DirectMode {
     Auto,
 }
 
+/// Parses `MLX_HY4_SHARD1_NOCACHE`: `1`/`true` forces `F_NOCACHE` on expert shards.
+pub fn shard1_nocache(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Per-shard OS page-cache flags for [`ShardSet::open_with_cache`]: expert
+/// shards allow clean file-backed caching unless `nocache` is set, and the
+/// Engram table shard always stays `F_NOCACHE`.
+pub fn shard_page_cache(scan: &Scan, nocache: bool) -> Vec<bool> {
+    shard_page_cache_for(
+        scan.paths.len(),
+        scan.trunk_experts(),
+        scan.engram_table.shard,
+        nocache,
+    )
+}
+
+pub(crate) fn shard_page_cache_for(
+    n_shards: usize,
+    experts: &[Option<super::scan::ExpertLayer>],
+    engram_shard: usize,
+    nocache: bool,
+) -> Vec<bool> {
+    let mut allow = vec![false; n_shards];
+    if !nocache {
+        for layer in experts.iter().flatten() {
+            for s in [layer.gate.shard, layer.up.shard, layer.down.shard] {
+                if let Some(slot) = allow.get_mut(s) {
+                    *slot = true;
+                }
+            }
+        }
+        if let Some(slot) = allow.get_mut(engram_shard) {
+            *slot = false;
+        }
+    }
+    allow
+}
+
 /// Parses `MLX_HY4_DIRECT`: `0`/`false` disables direct residency, `1`/`true`
 /// requests it, unset/blank/`auto` enables it when host memory admits it.
 pub fn direct_mode(raw: Option<&str>) -> Result<DirectMode> {
@@ -563,6 +609,14 @@ pub fn parse_reserve_override(raw: Option<&str>) -> Option<u64> {
 /// raises it.
 pub fn direct_margin(reserve_override: Option<u64>) -> u64 {
     reserve_override.map_or(DIRECT_MARGIN, |r| DIRECT_MARGIN.max(r))
+}
+
+/// Upfront KV allowance for direct residency: `min(max_ctx, DIRECT_KV_ALLOWANCE_TOKENS)`
+/// tokens plus the profile's fixed KV base.
+pub fn direct_kv_allowance(p: &Profile, max_ctx: usize) -> u64 {
+    let tokens = max_ctx.min(DIRECT_KV_ALLOWANCE_TOKENS) as u64;
+    p.kv_base
+        .saturating_add(p.kv_per_ctx.saturating_mul(tokens))
 }
 
 /// Direct-mode prefill scratch allowance at `prefill_rows` and `ctx`, using the
@@ -621,7 +675,8 @@ pub fn direct_gate(
     }
 }
 
-/// Evaluates direct residency across `CHUNKS` (largest first, capped at `ctx`).
+/// Evaluates direct residency across `CHUNKS` (largest first, capped at `ctx`)
+/// using [`direct_kv_allowance`] (`min(ctx, DIRECT_KV_ALLOWANCE_TOKENS)`).
 /// Returns the largest admitted chunk and its decision, or the smallest chunk's
 /// refused decision when none fits.
 #[allow(clippy::too_many_arguments)]
@@ -633,12 +688,12 @@ pub fn pick_direct(
     own: &Own,
     dense_bytes: u64,
     direct_expert_bytes: u64,
-    kv_allowance_initial: u64,
     reserve_override: Option<u64>,
     max_memory: Option<u64>,
     cache_cap: Option<u64>,
 ) -> (usize, DirectDecision) {
     let margin = direct_margin(reserve_override);
+    let kv_allowance_initial = direct_kv_allowance(p, ctx);
     let eval = |chunk: usize| {
         let rows = chunk.min(ctx);
         let scratch = direct_scratch_bytes(p, rows, ctx);
@@ -942,8 +997,39 @@ pub fn own_of(dense: u64, kv: u64, resident: u64, in_turn: bool, free_pool: u64,
     }
 }
 
+/// Policy parameters for idle-gap promotion from partial streaming to direct
+/// full-expert residency when the last open turn closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectPromotion {
+    pub mode: DirectMode,
+    pub reserve_override: Option<u64>,
+    pub n_experts: usize,
+}
+
+impl DirectPromotion {
+    fn direct_expert_bytes(&self, classes: &Classes) -> u64 {
+        let n = self.n_experts as u64;
+        (classes.layers[0] as u64)
+            .saturating_mul(n)
+            .saturating_mul(classes.slot[0])
+            .saturating_add(
+                (classes.layers[1] as u64)
+                    .saturating_mul(n)
+                    .saturating_mul(classes.slot[1]),
+            )
+    }
+
+    fn total_experts(&self, classes: &Classes) -> [usize; 2] {
+        [
+            classes.layers[0] * self.n_experts,
+            classes.layers[1] * self.n_experts,
+        ]
+    }
+}
+
 struct TurnState {
     admission: Option<Admission>,
+    direct_budget: Option<u64>,
     wired: Option<WiredLimitContext>,
     guard: CacheLimitGuard,
     /// Bank switches: (cache slots, seconds to free the old bank and allocate).
@@ -962,6 +1048,7 @@ pub struct Lease {
     /// `None`: no admission (tests).
     limits: Option<Limits>,
     max_memory: Option<u64>,
+    direct_promotion: Option<DirectPromotion>,
     turn: Mutex<TurnState>,
 }
 
@@ -984,8 +1071,10 @@ impl Lease {
             classes,
             limits,
             max_memory: None,
+            direct_promotion: None,
             turn: Mutex::new(TurnState {
                 admission,
+                direct_budget: None,
                 wired: None,
                 guard: coordinator().register_with_cache_limit(bank.nbytes(), Some(POOL_LIMIT)),
                 switches: Vec::new(),
@@ -1000,12 +1089,28 @@ impl Lease {
         self
     }
 
+    /// Enables idle-gap promotion from partial streaming to direct residency
+    /// when `end_turn_idle` runs with 0 active turns.
+    pub fn with_direct_promotion(
+        mut self,
+        promotion: DirectPromotion,
+        direct_budget: Option<u64>,
+    ) -> Self {
+        self.direct_promotion = Some(promotion);
+        self.turn().direct_budget = direct_budget;
+        self
+    }
+
     fn turn(&self) -> MutexGuard<'_, TurnState> {
         self.turn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn admission(&self) -> Option<Admission> {
         self.turn().admission
+    }
+
+    pub fn direct_budget(&self) -> Option<u64> {
+        self.turn().direct_budget
     }
 
     /// Every bank switch so far: (cache slots of both classes, seconds).
@@ -1183,6 +1288,157 @@ impl Lease {
         t.wired = None;
         bank.end_turn()
     }
+
+    /// Turn end when 0 turns remain open: releases the wired lease, evaluates
+    /// idle-gap promotion from partial streaming to direct full-expert
+    /// residency, and transitions the bank when both `pick_direct` and live
+    /// headroom admit the growth. Returns the admitted direct prefill chunk
+    /// when promotion occurred.
+    pub fn end_turn_idle(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<Option<usize>> {
+        let mut t = self.turn();
+        crate::array::synchronize();
+        t.wired = None;
+        if bank.is_direct() {
+            bank.end_turn()?;
+            return Ok(None);
+        }
+        let Some(promo) = self.direct_promotion.filter(|p| p.mode != DirectMode::Off) else {
+            bank.end_turn()?;
+            return Ok(None);
+        };
+        let Some(limits) = &self.limits else {
+            bank.end_turn()?;
+            return Ok(None);
+        };
+        let direct_expert_bytes = promo.direct_expert_bytes(&self.classes);
+        if direct_expert_bytes == 0
+            || limits
+                .cache_cap
+                .is_some_and(|cap| cap < direct_expert_bytes)
+        {
+            bank.end_turn()?;
+            return Ok(None);
+        }
+        let r = bank.residency()?;
+        let current_bank_bytes = r.resident.saturating_sub(r.volatile);
+        let ctx = self.size.ctx as usize;
+        let eval = || -> Result<(u64, Own, usize, DirectDecision, bool)> {
+            let (h, ws) = host_reading(self.max_memory)?;
+            let own = Own {
+                active: dense.saturating_add(current_bank_bytes).saturating_add(kv),
+                pool: 0,
+                volatile: 0,
+            };
+            let (direct_chunk, gate) = pick_direct(
+                promo.mode,
+                &self.profile,
+                ctx,
+                &h,
+                &own,
+                self.size.dense,
+                direct_expert_bytes,
+                promo.reserve_override,
+                self.max_memory,
+                limits.cache_cap,
+            );
+            let growth = direct_expert_bytes.saturating_sub(current_bank_bytes);
+            let headroom_ok = gate.admitted
+                && h.non_reclaimable()
+                    .saturating_add(growth)
+                    .saturating_add(gate.margin)
+                    <= h.physical
+                && self.max_memory.is_none_or(|cap| {
+                    dense.saturating_add(direct_expert_bytes).saturating_add(kv) <= cap
+                });
+            Ok((ws, own, direct_chunk, gate, headroom_ok))
+        };
+        let evaluated = match eval() {
+            Ok(v) => v,
+            Err(err) => {
+                bank.end_turn()?;
+                tracing::warn!("hy_v4_flash idle direct promotion check failed: {err}");
+                return Ok(None);
+            }
+        };
+        let (ws, own, direct_chunk, gate, headroom_ok) =
+            if evaluated.3.admitted && !evaluated.4 && crate::array::get_cache_memory() > 0.0 {
+                crate::array::clear_cache();
+                match eval() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        bank.end_turn()?;
+                        tracing::warn!("hy_v4_flash idle direct promotion recheck failed: {err}");
+                        return Ok(None);
+                    }
+                }
+            } else {
+                evaluated
+            };
+        if !headroom_ok {
+            bank.end_turn()?;
+            return Ok(None);
+        }
+        let t0 = Instant::now();
+        bank.end_turn()?;
+        if let Err(err) = bank.promote_to_direct() {
+            if bank.nbytes() == 0 {
+                t.lost = true;
+            }
+            tracing::warn!(
+                "hy_v4_flash idle promotion to direct failed, keeping partial bank: {err}"
+            );
+            return Ok(None);
+        }
+        t.lost = false;
+        t.guard = coordinator().register_with_cache_limit(bank.nbytes(), Some(POOL_LIMIT));
+        let total_slots = promo.total_experts(&self.classes);
+        let direct_kv = direct_kv_allowance(&self.profile, ctx);
+        let direct_fixed = gate.dense_bytes.saturating_add(gate.kv_and_scratch);
+        let wired_cap = direct_wired_limit(direct_fixed.saturating_add(direct_expert_bytes), ws);
+        let a = Admission {
+            physical: gate.physical,
+            host_used: gate.host_used,
+            own: own.bytes(),
+            others: gate.others,
+            reserve: gate.margin,
+            live: gate.available,
+            ws,
+            terms: Terms {
+                dense: gate.dense_bytes,
+                staging_layer: 0,
+                kv: direct_kv,
+                compute: gate.scratch_bytes,
+                io: 0,
+                driver: 0,
+                pool: 0,
+            },
+            staging_layers: 0,
+            fixed: direct_fixed,
+            slot: self.size.slot,
+            cache_slots: (total_slots[0] + total_slots[1]) as u64,
+            bound: if self.max_memory.is_some_and(|m| m < gate.available) {
+                Bound::Env
+            } else {
+                Bound::Live
+            },
+        };
+        t.admission = Some(a);
+        t.direct_budget = Some(gate.budget);
+        let elapsed = t0.elapsed().as_secs_f64();
+        let n = total_slots[0] + total_slots[1];
+        t.switches.push((n, elapsed));
+        tracing::info!(
+            "hy_v4_flash promoted partial bank to direct residency in {elapsed:.2} s: \
+             chunk {direct_chunk}, direct experts {:.2} GiB ({n} slots), others {:.2} GiB, \
+             available {:.2} GiB, margin {:.2} GiB, wired cap {:.2} GiB",
+            direct_expert_bytes as f64 / GIB as f64,
+            gate.others as f64 / GIB as f64,
+            gate.available as f64 / GIB as f64,
+            gate.margin as f64 / GIB as f64,
+            wired_cap as f64 / GIB as f64,
+        );
+        Ok(Some(direct_chunk))
+    }
 }
 
 /// `turn` with a rebuild kept unless the wary reading rebuilds too, at its
@@ -1315,7 +1571,7 @@ impl Store {
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
                 let direct_expert_bytes = sizes.direct_expert_bytes();
-                let kv_initial = one_lane.kv_base + one_lane.kv_per_ctx * max_ctx as u64;
+                let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
                 let (direct_chunk, gate) = pick_direct(
                     opts.direct,
                     &one_lane,
@@ -1324,7 +1580,6 @@ impl Store {
                     &own,
                     base.dense,
                     direct_expert_bytes,
-                    kv_initial,
                     reserve_override,
                     opts.max_memory,
                     l.cache_cap,
@@ -1461,7 +1716,11 @@ impl Store {
             ctx: ctx as u64,
             ..base
         };
-        let shards = Arc::new(ShardSet::open(&scan.paths)?);
+        let allow_cache = shard_page_cache(
+            &scan,
+            shard1_nocache(std::env::var(SHARD1_NOCACHE_ENV).ok().as_deref()),
+        );
+        let shards = Arc::new(ShardSet::open_with_cache(&scan.paths, &allow_cache)?);
         let t_bank = Instant::now();
         let bank = if direct_budget.is_some() {
             Arc::new(KqBank::new_direct(
@@ -1506,7 +1765,15 @@ impl Store {
             }
         };
         let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank)
-            .with_max_memory(opts.max_memory);
+            .with_max_memory(opts.max_memory)
+            .with_direct_promotion(
+                DirectPromotion {
+                    mode: opts.direct,
+                    reserve_override,
+                    n_experts: sizes.n_experts,
+                },
+                direct_budget,
+            );
         Ok(Self {
             model,
             bank,
@@ -1554,7 +1821,9 @@ impl Store {
     /// The memory governor's limit for this model: direct host budget when
     /// direct residency is active, otherwise the capped Metal working set.
     pub fn hard_budget(&self) -> u64 {
-        self.direct_budget
+        self.lease
+            .direct_budget()
+            .or(self.direct_budget)
             .unwrap_or_else(|| capped_ws(working_set(), self.max_memory))
     }
 
@@ -1575,6 +1844,12 @@ impl Store {
 
     pub fn end_turn(&self) -> Result<()> {
         self.lease.end_turn(&self.bank)
+    }
+
+    /// Idle-gap turn end (0 active turns): releases the wired lease and
+    /// promotes a partial bank to direct residency when host headroom admits it.
+    pub fn end_turn_idle(&self, kv: u64) -> Result<Option<usize>> {
+        self.lease.end_turn_idle(&self.bank, self.dense_bytes, kv)
     }
 
     /// `kv`: bytes of every live session (`Session::nbytes`).

@@ -1591,18 +1591,74 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
     };
     let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
     let direct_bytes = sizes.direct_expert_bytes();
-    let p = profile(15_812);
+    let p_mtp = profile(15_812);
+    let p_ar = profile(14_596);
     let ctx = 262_144usize;
-    let kv_initial = p.kv_base + p.kv_per_ctx * ctx as u64;
-    let s8 = direct_scratch_bytes(&p, 8192, ctx);
-    let s4 = direct_scratch_bytes(&p, 4096, ctx);
-    let s2 = direct_scratch_bytes(&p, 2048, ctx);
+
+    // Direct KV allowance caps at 64K tokens while respecting smaller explicit max_context.
+    let kv_64k = direct_kv_allowance(&p_mtp, ctx);
+    assert_eq!(
+        kv_64k,
+        p_mtp.kv_base + p_mtp.kv_per_ctx * DIRECT_KV_ALLOWANCE_TOKENS as u64
+    );
+    assert_eq!(
+        direct_kv_allowance(&p_mtp, 32_768),
+        p_mtp.kv_base + p_mtp.kv_per_ctx * 32_768
+    );
+
+    let s8 = direct_scratch_bytes(&p_mtp, 8192, ctx);
+    let s4 = direct_scratch_bytes(&p_mtp, 4096, ctx);
+    let s2 = direct_scratch_bytes(&p_mtp, 2048, ctx);
     assert!(s8 > s4 && s4 > s2);
 
-    let fixed_base = dense_mtp + direct_bytes + kv_initial;
+    let fixed_base = dense_mtp + direct_bytes + kv_64k;
     let need_8k = fixed_base + s8;
     let need_4k = fixed_base + s4;
     let need_2k = fixed_base + s2;
+
+    // With 64K direct KV allowance + chunk step-down, MTP-1 fits at 26 GiB others
+    // and AR fits at 28 GiB others on a 128 GiB host.
+    let (mtp_chunk, mtp_gate) = pick_direct(
+        DirectMode::Auto,
+        &p_mtp,
+        ctx,
+        &HostMemory {
+            physical: 128 * G,
+            wired: 26 * G,
+            ..Default::default()
+        },
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        mtp_gate.admitted,
+        "MTP-1 must admit direct at 26 GiB others"
+    );
+    assert_eq!(mtp_chunk, 2048);
+    assert_eq!(mtp_gate.kv_and_scratch, kv_64k + s2);
+
+    let (ar_chunk, ar_gate) = pick_direct(
+        DirectMode::Auto,
+        &p_ar,
+        ctx,
+        &HostMemory {
+            physical: 128 * G,
+            wired: 28 * G,
+            ..Default::default()
+        },
+        &Own::default(),
+        sizes.dense_trunk,
+        direct_bytes,
+        None,
+        None,
+        None,
+    );
+    assert!(ar_gate.admitted, "AR must admit direct at 28 GiB others");
+    assert_eq!(ar_chunk, 2048);
 
     // Quiet host admits direct at 8192 when no reserve override is set.
     let quiet = HostMemory {
@@ -1612,13 +1668,12 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
     };
     let (chunk, gate) = pick_direct(
         DirectMode::Auto,
-        &p,
+        &p_mtp,
         ctx,
         &quiet,
         &Own::default(),
         dense_mtp,
         direct_bytes,
-        kv_initial,
         None,
         None,
         None,
@@ -1627,19 +1682,19 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
     assert_eq!(chunk, 8192);
     assert_eq!(gate.margin, DIRECT_MARGIN);
     assert_eq!(gate.scratch_bytes, s8);
+    assert_eq!(gate.kv_and_scratch, kv_64k + s8);
 
     // Raising the explicit reserve override pushes available just below 2048's need
     // and forces streamed fallback at the exact boundary.
     let exact_reserve = quiet.physical - quiet.wired - need_2k;
     let (chunk_ok, gate_ok) = pick_direct(
         DirectMode::Auto,
-        &p,
+        &p_mtp,
         ctx,
         &quiet,
         &Own::default(),
         dense_mtp,
         direct_bytes,
-        kv_initial,
         Some(exact_reserve),
         None,
         None,
@@ -1650,13 +1705,12 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
 
     let (_, gate_refused) = pick_direct(
         DirectMode::Auto,
-        &p,
+        &p_mtp,
         ctx,
         &quiet,
         &Own::default(),
         dense_mtp,
         direct_bytes,
-        kv_initial,
         Some(exact_reserve + 1),
         None,
         None,
@@ -1675,13 +1729,12 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
     ] {
         let (got_chunk, got_gate) = pick_direct(
             DirectMode::Auto,
-            &p,
+            &p_mtp,
             ctx,
             &quiet,
             &Own::default(),
             dense_mtp,
             direct_bytes,
-            kv_initial,
             None,
             Some(cap),
             None,
@@ -1690,6 +1743,291 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
         assert_eq!(got_chunk, want_chunk, "cap={cap}");
         assert_eq!(got_gate.scratch_bytes, want_scratch, "cap={cap}");
     }
+}
+
+fn filled_fixture_bank(
+    cache: [usize; 2],
+    staging: usize,
+) -> (KqBank, KqBank, Classes, MoeConfig, Temp) {
+    let m = moe();
+    let mut experts = Vec::new();
+    let mut off = 0u64;
+    for (il, class) in [
+        (0, ExpertClass::Q6kDown),
+        (1, ExpertClass::Q4kDown),
+        (2, ExpertClass::Q4kDown),
+    ] {
+        let mut l = layer(&m, il, class);
+        let geo = geometry(&m, class).unwrap();
+        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
+            .into_iter()
+            .enumerate()
+        {
+            loc.data_offset = off;
+            off += geo[p].file_bytes() * m.n_experts as u64;
+        }
+        experts.push(Some(l));
+    }
+    let dir = std::env::temp_dir().join(format!("hy4-store-promo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("experts.bin");
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let payload: Vec<u8> = (0..off as usize)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    std::fs::write(&path, &payload).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
+    let ref_pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
+    let bank = KqBank::new(pool, &m, &experts, cache, staging).unwrap();
+    let reference = KqBank::new(ref_pool, &m, &experts, [0, 0], 1).unwrap();
+    let classes = Classes {
+        layers: [1, 2],
+        slot: bank.slot_bytes(),
+    };
+    (bank, reference, classes, m, Temp(dir))
+}
+
+#[test]
+fn lease_end_turn_idle_promotes_partial_to_direct_when_others_drop() {
+    let (bank, reference, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let dense = 10 * G;
+    let kv_live = 2 * G;
+    let ws = 96 * G;
+    let promo = DirectPromotion {
+        mode: DirectMode::Auto,
+        reserve_override: None,
+        n_experts: m.n_experts,
+    };
+    // Size the virtual admission using real-scale 41-layer direct bytes? Here the
+    // fixture has 3 tiny layers, so set physical so high-others refuses and
+    // low-others admits cleanly.
+    let direct_bytes = promo.direct_expert_bytes(&classes);
+    let kv_64k = direct_kv_allowance(&p, ctx);
+    let scratch_2k = direct_scratch_bytes(&p, 2048, ctx);
+    let physical = 40 * G;
+    let need_2k = dense + direct_bytes + kv_64k + scratch_2k;
+    let size = ModelSize {
+        dense,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: 8,
+        ctx: ctx as u64,
+    };
+    let limits = Limits::default();
+    let partial_adm = Admission {
+        physical,
+        host_used: physical - need_2k - DIRECT_MARGIN + 2 * G,
+        own: 0,
+        others: physical - need_2k - DIRECT_MARGIN + 2 * G,
+        reserve: limits.reserve,
+        live: 20 * G,
+        ws,
+        terms: Terms::with(&p, &size, ws, 2048),
+        staging_layers: 1,
+        fixed: dense + kv_64k + scratch_2k,
+        slot: size.slot,
+        cache_slots: 4,
+        bound: Bound::Live,
+    };
+    let lease = Lease::new(
+        p,
+        size,
+        2048,
+        classes,
+        Some(limits),
+        Some(partial_adm),
+        &bank,
+    )
+    .with_direct_promotion(promo, None);
+
+    // Turn 1: others stay above the direct threshold -> end_turn_idle does NOT promote.
+    let r = bank.residency().unwrap();
+    let high_others = physical - need_2k - DIRECT_MARGIN + G;
+    TEST_HOST.with(|c| {
+        c.set(Some((
+            HostMemory {
+                physical,
+                wired: high_others + dense + r.resident + kv_live,
+                ..Default::default()
+            },
+            ws,
+        )))
+    });
+    assert_eq!(lease.end_turn_idle(&bank, dense, kv_live).unwrap(), None);
+    assert!(!bank.is_direct());
+    assert!(lease.switches().is_empty());
+
+    // Turn 2: others drop below threshold -> end_turn_idle promotes to Direct!
+    let low_others = 2 * G;
+    TEST_HOST.with(|c| {
+        c.set(Some((
+            HostMemory {
+                physical,
+                wired: low_others + dense + r.resident + kv_live,
+                ..Default::default()
+            },
+            ws,
+        )))
+    });
+    let promoted = lease.end_turn_idle(&bank, dense, kv_live).unwrap();
+    assert!(promoted.is_some());
+    assert!(bank.is_direct());
+    assert!(!bank.in_turn());
+    assert_eq!(lease.switches().len(), 1);
+    assert_eq!(lease.admission().unwrap().staging_layers, 0);
+    assert!(lease.direct_budget().is_some());
+    bank.wait_direct_fill().unwrap();
+    assert!(bank.direct_fill_complete());
+
+    // Promoted direct bank serves identical expert bytes across every layer.
+    let all_experts: Vec<u32> = (0..m.n_experts as u32).collect();
+    for il in 0..3 {
+        let dir_p = bank.prepare(il, &all_experts, &[], true).unwrap();
+        let ref_p = reference.prepare(il, &all_experts, &[], false).unwrap();
+        assert_eq!(dir_p.slots, all_experts);
+        for pi in 0..3 {
+            let dw = dir_p.arrays[pi].w.to_uint32().unwrap().to_vec();
+            let rw = ref_p.arrays[pi].w.to_uint32().unwrap().to_vec();
+            let cols = dw.len() / m.n_experts;
+            for (&e, &s) in ref_p.experts.iter().zip(&ref_p.slots) {
+                let de = e as usize * cols..(e as usize + 1) * cols;
+                let rs = s as usize * cols..(s as usize + 1) * cols;
+                assert_eq!(dw[de], rw[rs], "layer {il} proj {pi} expert {e}");
+            }
+        }
+        reference.settle_all();
+    }
+
+    // Subsequent turns stay direct and NonVolatile even if host memory spikes again.
+    TEST_HOST.with(|c| {
+        c.set(Some((
+            HostMemory {
+                physical,
+                wired: physical - G,
+                ..Default::default()
+            },
+            ws,
+        )))
+    });
+    lease.begin_turn(&bank, dense, kv_live).unwrap();
+    assert!(lease.in_turn() && bank.in_turn());
+    assert_eq!(lease.end_turn_idle(&bank, dense, kv_live).unwrap(), None);
+    assert_eq!(lease.switches().len(), 1);
+    assert_eq!(bank.residency().unwrap().volatile, 0);
+    TEST_HOST.with(|c| c.set(None));
+    reference.end_turn().unwrap();
+}
+
+#[test]
+fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight() {
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let dense = 10 * G;
+    let physical = 40 * G;
+    let ws = 96 * G;
+    let quiet = (
+        HostMemory {
+            physical,
+            wired: 12 * G,
+            ..Default::default()
+        },
+        ws,
+    );
+
+    // 1. MLX_HY4_DIRECT=0 (DirectMode::Off) never promotes even on a quiet host.
+    {
+        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+        let size = ModelSize {
+            dense,
+            slot: classes.slot[0].max(classes.slot[1]),
+            n_experts: 8,
+            ctx: ctx as u64,
+        };
+        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
+            .with_direct_promotion(
+                DirectPromotion {
+                    mode: DirectMode::Off,
+                    reserve_override: None,
+                    n_experts: m.n_experts,
+                },
+                None,
+            );
+        TEST_HOST.with(|c| c.set(Some(quiet)));
+        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
+        assert!(!bank.is_direct());
+        assert!(lease.switches().is_empty());
+    }
+
+    // 2. cache_cap below direct_expert_bytes never promotes.
+    {
+        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+        let promo = DirectPromotion {
+            mode: DirectMode::Auto,
+            reserve_override: None,
+            n_experts: m.n_experts,
+        };
+        let direct_bytes = promo.direct_expert_bytes(&classes);
+        let size = ModelSize {
+            dense,
+            slot: classes.slot[0].max(classes.slot[1]),
+            n_experts: 8,
+            ctx: ctx as u64,
+        };
+        let limits = Limits {
+            cache_cap: Some(direct_bytes - 1),
+            ..Limits::default()
+        };
+        let lease = Lease::new(p, size, 2048, classes, Some(limits), None, &bank)
+            .with_direct_promotion(promo, None);
+        TEST_HOST.with(|c| c.set(Some(quiet)));
+        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
+        assert!(!bank.is_direct());
+    }
+
+    // 3. Large live KV exceeding physical headroom blocks promotion before dropping partial bank.
+    {
+        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+        let old_nbytes = bank.nbytes();
+        let promo = DirectPromotion {
+            mode: DirectMode::Auto,
+            reserve_override: None,
+            n_experts: m.n_experts,
+        };
+        let direct_bytes = promo.direct_expert_bytes(&classes);
+        let size = ModelSize {
+            dense,
+            slot: classes.slot[0].max(classes.slot[1]),
+            n_experts: 8,
+            ctx: ctx as u64,
+        };
+        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
+            .with_direct_promotion(promo, None);
+        // Live KV + dense + others leaves less than DIRECT_MARGIN + growth, even
+        // though subtracting own (dense + kv) makes pick_direct's 64K check pass.
+        let huge_kv = 26 * G;
+        TEST_HOST.with(|c| {
+            c.set(Some((
+                HostMemory {
+                    physical,
+                    wired: dense + huge_kv + G,
+                    ..Default::default()
+                },
+                ws,
+            )))
+        });
+        assert_eq!(lease.end_turn_idle(&bank, dense, huge_kv).unwrap(), None);
+        assert!(!bank.is_direct());
+        assert_eq!(bank.nbytes(), old_nbytes);
+        assert!(direct_bytes > 0);
+    }
+
+    TEST_HOST.with(|c| c.set(None));
 }
 
 #[test]
@@ -1800,4 +2138,28 @@ fn lease_direct_bank_never_shrinks_or_flips_volatile() {
     assert!(lease.switches().is_empty());
     lease.end_turn(&bank).unwrap();
     TEST_HOST.with(|c| c.set(None));
+}
+
+#[test]
+fn shard1_nocache_and_page_cache_flags() {
+    assert!(!shard1_nocache(None));
+    assert!(!shard1_nocache(Some("")));
+    assert!(!shard1_nocache(Some("0")));
+    assert!(!shard1_nocache(Some("false")));
+    assert!(shard1_nocache(Some("1")));
+    assert!(shard1_nocache(Some("true")));
+    assert!(shard1_nocache(Some(" TRUE ")));
+
+    let m = moe();
+    let experts = vec![None, Some(layer(&m, 1, ExpertClass::Q6kDown))];
+    assert_eq!(
+        shard_page_cache_for(2, &experts, 1, false),
+        vec![true, false]
+    );
+    assert_eq!(
+        shard_page_cache_for(2, &experts, 1, true),
+        vec![false, false]
+    );
+    // Single-shard layout: Engram shard stays F_NOCACHE even when experts share it.
+    assert_eq!(shard_page_cache_for(1, &experts, 0, false), vec![false]);
 }

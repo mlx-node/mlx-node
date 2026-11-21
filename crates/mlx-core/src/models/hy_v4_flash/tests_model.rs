@@ -1432,6 +1432,191 @@ fn prefill_with_prefetch_matches_without_prefetch_bitwise() {
     bank.end_turn().unwrap();
 }
 
+/// Decode with read-ahead (`decode_prefetch=true`, 2 staging layers, rows <= 4)
+/// matches `decode_prefetch=false` bit-for-bit, uses identical `evals` (0 extra
+/// host syncs), and records `prefetch_slots > 0` for both classes.
+#[test]
+fn decode_with_prefetch_matches_without_prefetch_bitwise_and_zero_extra_evals() {
+    use super::stats;
+
+    let cfg = tiny_cfg();
+    let mut r = Rng::new(7);
+    let mut file = r.bytes(1000);
+    let experts: Vec<Option<ExpertLayer>> = CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
+        .collect();
+    let dir = Temp::new();
+    let path = dir.0.join("experts.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 2).unwrap());
+    let weights = tiny_weights(&cfg, 11);
+    let table = engram_table(&cfg.engram, 13);
+    let b = Arc::clone(&bank);
+    let model = Model::new(
+        cfg,
+        Box::new(weights),
+        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+        Box::new(table),
+    )
+    .unwrap();
+
+    let prefill_ids = Rng::new(19).ids(12);
+    let decode_ids = [7u32, 23, 41, 60];
+
+    let run_decode_seq = |enabled: bool| {
+        bank.end_turn().unwrap();
+        bank.set_decode_prefetch(enabled);
+        let mut s = prefilled(&model, &prefill_ids);
+        bank.test_forget_where(|_, _| true);
+        let st_before = bank.stats();
+        let evals_before = stats::thread_evals();
+        let mut all_bits = Vec::new();
+        let mut all_routes = Vec::new();
+        for &id in &decode_ids {
+            let mut t = Trace::default();
+            let out = model
+                .forward(
+                    &mut s,
+                    &[id],
+                    RowKind::Decode,
+                    Want::LAST,
+                    None,
+                    Some(&mut t),
+                )
+                .unwrap();
+            all_bits.push(bits(out.logits.as_ref().unwrap()));
+            all_routes.push(routes_of(&t));
+        }
+        let evals = stats::thread_evals() - evals_before;
+        let st_after = bank.stats();
+        let pf = [
+            st_after[0].prefetch_slots - st_before[0].prefetch_slots,
+            st_after[1].prefetch_slots - st_before[1].prefetch_slots,
+        ];
+        (all_bits, all_routes, evals, pf)
+    };
+
+    let (bits_off, routes_off, evals_off, pf_off) = run_decode_seq(false);
+    let (bits_on, routes_on, evals_on, pf_on) = run_decode_seq(true);
+    assert_eq!(pf_off, [0, 0]);
+    assert_eq!(
+        bits_on, bits_off,
+        "M=1 decode_prefetch logits must be bit-exact"
+    );
+    assert_eq!(
+        routes_on, routes_off,
+        "M=1 decode_prefetch routes must match"
+    );
+    assert_eq!(
+        evals_on, evals_off,
+        "M=1 decode_prefetch must add 0 extra evals"
+    );
+    assert!(
+        pf_on[0] > 0 && pf_on[1] > 0,
+        "M=1 decode_prefetch must prefetch both classes, got {pf_on:?}"
+    );
+
+    // Multi-row decode wave (3 rows <= 4, exercises `forward_split`).
+    let p_a = Rng::new(31).ids(10);
+    let p_b = Rng::new(37).ids(14);
+    let run_wave = |enabled: bool| {
+        bank.end_turn().unwrap();
+        bank.set_decode_prefetch(enabled);
+        let mut sa = prefilled(&model, &p_a);
+        let mut sb = prefilled(&model, &p_b);
+        bank.test_forget_where(|_, _| true);
+        let st_before = bank.stats();
+        let evals_before = stats::thread_evals();
+        let outs = {
+            let mut owners = [
+                OwnerRows {
+                    sess: &mut sa,
+                    ids: &[11],
+                    want: Want::LAST,
+                },
+                OwnerRows {
+                    sess: &mut sb,
+                    ids: &[12, 13],
+                    want: Want::ALL,
+                },
+            ];
+            model
+                .step(&mut owners, RowKind::Decode, None, None)
+                .unwrap()
+        };
+        let evals = stats::thread_evals() - evals_before;
+        let st_after = bank.stats();
+        let pf = [
+            st_after[0].prefetch_slots - st_before[0].prefetch_slots,
+            st_after[1].prefetch_slots - st_before[1].prefetch_slots,
+        ];
+        let out_bits: Vec<Vec<u32>> = outs
+            .iter()
+            .map(|o| bits(o.logits.as_ref().unwrap()))
+            .collect();
+        (out_bits, evals, pf)
+    };
+    let (w_off, w_evals_off, w_pf_off) = run_wave(false);
+    let (w_on, w_evals_on, w_pf_on) = run_wave(true);
+    assert_eq!(w_pf_off, [0, 0]);
+    assert_eq!(w_on, w_off, "M=3 decode wave logits must be bit-exact");
+    assert_eq!(
+        w_evals_on, w_evals_off,
+        "M=3 decode wave must add 0 extra evals"
+    );
+    assert!(
+        w_pf_on[0] > 0 && w_pf_on[1] > 0,
+        "M=3 decode wave must prefetch both classes, got {w_pf_on:?}"
+    );
+
+    // Wide decode wave (5 rows > DECODE_READ_AHEAD_MAX_ROWS) must not prefetch.
+    bank.end_turn().unwrap();
+    bank.set_decode_prefetch(true);
+    let mut wide_s = prefilled(&model, &p_a);
+    bank.test_forget_where(|_, _| true);
+    let st_before = bank.stats();
+    model
+        .forward(
+            &mut wide_s,
+            &[1, 2, 3, 4, 5],
+            RowKind::Decode,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let st_after = bank.stats();
+    assert_eq!(
+        (st_after[0].prefetch_slots - st_before[0].prefetch_slots)
+            + (st_after[1].prefetch_slots - st_before[1].prefetch_slots),
+        0,
+        "decode waves past 4 rows must skip decode read-ahead"
+    );
+
+    // Single-staging bank (`staging_layers == 1`) must never decode-prefetch.
+    let single = fixture();
+    single.bank.set_decode_prefetch(true);
+    let mut ss = prefilled(&single.model, &prefill_ids);
+    single.bank.test_forget_where(|_, _| true);
+    let st_before = single.bank.stats();
+    single
+        .model
+        .forward(&mut ss, &[7], RowKind::Decode, Want::LAST, None, None)
+        .unwrap();
+    let st_after = single.bank.stats();
+    assert_eq!(
+        (st_after[0].prefetch_slots - st_before[0].prefetch_slots)
+            + (st_after[1].prefetch_slots - st_before[1].prefetch_slots),
+        0,
+        "staging_layers < 2 must never decode-prefetch"
+    );
+
+    bank.end_turn().unwrap();
+}
+
 /// Direct-mode model decode wave vs partial-mode model decode wave:
 /// bit-identical outputs on single-owner, multi-row verify, and 4-owner waves,
 /// and exactly 1 eval (the final head sync) per decode step in direct mode.

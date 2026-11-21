@@ -237,6 +237,10 @@ impl Grid {
         self.chunk
     }
 
+    pub fn open(&self) -> &[u32] {
+        &self.open
+    }
+
     /// The block row before the last assistant opening past position 0,
     /// else the block row before the prompt's last token.
     pub fn replay_row(&self, prompt: &[u32]) -> usize {

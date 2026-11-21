@@ -647,6 +647,40 @@ pub fn route(
     route_host(s.as_ref(), bias, moe)
 }
 
+/// Like `route`, evaluating `scores` and `next_scores` in one host sync.
+pub fn route_pair(
+    scores: &MxArray,
+    bias: Option<&[f32]>,
+    moe: &MoeConfig,
+    next_scores: &MxArray,
+    next_bias: Option<&[f32]>,
+    next_moe: &MoeConfig,
+) -> Result<((Vec<u32>, Vec<f32>), (Vec<u32>, Vec<f32>))> {
+    if scores.ndim()? != 2 || scores.shape_at(1)? != moe.n_experts as i64 {
+        return Err(bad(format!(
+            "router scores {:?} for {} experts",
+            dims(scores)?,
+            moe.n_experts
+        )));
+    }
+    if next_scores.ndim()? != 2 || next_scores.shape_at(1)? != next_moe.n_experts as i64 {
+        return Err(bad(format!(
+            "router scores {:?} for {} experts",
+            dims(next_scores)?,
+            next_moe.n_experts
+        )));
+    }
+    let s = as_f32(scores)?;
+    let ns = as_f32(next_scores)?;
+    super::stats::eval(&[&s, &ns], "hy_v4_flash router")?;
+    let s = s.to_float32()?;
+    let ns = ns.to_float32()?;
+    Ok((
+        route_host(s.as_ref(), bias, moe)?,
+        route_host(ns.as_ref(), next_bias, next_moe)?,
+    ))
+}
+
 /// Single-dispatch BF16-weight / F32-accumulation LM head for 1..=16 rows.
 pub(crate) fn try_bf16_lm_head(xf: &MxArray, w: &MxArray) -> Result<Option<MxArray>> {
     if xf.ndim()? != 2 || w.ndim()? != 2 || w.dtype()? != DType::BFloat16 {

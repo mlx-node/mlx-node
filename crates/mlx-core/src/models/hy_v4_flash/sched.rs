@@ -547,9 +547,16 @@ impl Paged {
         let cfg = store.model.cfg();
         let g = PageGeometry::of(cfg)?;
         let lanes = lanes(store.lanes, store.row_cap);
-        let blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
-        let blocks = u32::try_from(blocks).map_err(|_| bad("pool blocks exceed u32"))?;
+        let max_blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
+        let max_blocks = u32::try_from(max_blocks).map_err(|_| bad("pool blocks exceed u32"))?;
         let page = g.block_bytes()?;
+        let initial_blocks = if store.is_direct() {
+            crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(page)
+                .max(u32::try_from(lanes).unwrap_or(1).saturating_add(4))
+                .min(max_blocks)
+        } else {
+            max_blocks
+        };
         let registration = ModelRegistration {
             model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
                 .fetch_add(1, Ordering::Relaxed),
@@ -560,10 +567,16 @@ impl Paged {
         crate::array::memory::synchronize_and_clear_cache();
         let gov: &'static Governor = crate::engine::governor::governor();
         let (governor, (adapter, pool)) = start_under_growth_lock(gov, || {
-            gov.load_pool(registration, u64::from(blocks) * page, || {
-                let adapter =
-                    create(&g, store.ctx, blocks, blocks, u64::MAX).map_err(|e| e.reason)?;
+            gov.load_pool(registration, u64::from(initial_blocks) * page, || {
+                let mut adapter = create(&g, store.ctx, initial_blocks, max_blocks, u64::MAX)
+                    .map_err(|e| e.reason)?;
                 let pool = coordinator().register_pool(block_bytes(&adapter));
+                if initial_blocks < max_blocks {
+                    let pool_id = pool.id();
+                    adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
+                        coordinator().update_pool(pool_id, bytes);
+                    })));
+                }
                 Ok((adapter, pool))
             })
             .map_err(Error::from_reason)

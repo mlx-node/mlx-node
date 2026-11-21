@@ -642,6 +642,12 @@ impl Model {
         !self.banks.is_empty() && self.banks.iter().all(|b| b.is_direct())
     }
 
+    fn decode_prefetch_active(&self) -> bool {
+        self.banks.iter().any(|b| {
+            !b.is_direct() && b.prefetch() && b.decode_prefetch() && b.staging_layers() >= 2
+        })
+    }
+
     /// An empty sequence of at most `cap` positions (the admitted context);
     /// its indexed-layer buffers are made at the first write and kept. A new
     /// conversation reuses a session through `truncate(0)`: a second live
@@ -825,6 +831,14 @@ impl Model {
             .astype(DType::Float32)?
             .reshape(&[ni, 1, dim])?
             .broadcast_to(&[ni, hc, dim])?;
+        let direct = self.bank_is_direct();
+        let prefill_ahead = !direct
+            && wave.kind() == RowKind::Prefill
+            && total >= super::block::READ_AHEAD_MIN_ROWS;
+        let decode_ahead = !direct
+            && wave.kind().is_decode()
+            && total <= super::block::DECODE_READ_AHEAD_MAX_ROWS
+            && self.decode_prefetch_active();
         for (l, blk) in self.blocks.iter().enumerate() {
             if cancel.is_some_and(|c| c(l)) {
                 return Err(bad(format!("cancelled before layer {l}")));
@@ -850,12 +864,8 @@ impl Model {
                 x = xi.clone();
             }
             let need_routes = trace.is_some();
-            let direct = self.bank_is_direct();
-            let next = (!direct
-                && wave.kind() == RowKind::Prefill
-                && total >= super::block::READ_AHEAD_MIN_ROWS
-                && l + 1 < self.blocks.len())
-            .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
+            let next = ((prefill_ahead || decode_ahead) && l + 1 < self.blocks.len())
+                .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
             let (y, routes) =
                 blk.forward_traced(&w.layers()[l], &x, wave, owners, engram, next, need_routes)?;
             match wave.kind() {
