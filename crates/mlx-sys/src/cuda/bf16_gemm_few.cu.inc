@@ -1,7 +1,7 @@
 R"cuda(
 #include <cuda_bf16.h>
 
-// Bandwidth-optimal BF16 GEMM for small M (1..=8), large K (multiple of 8), large N.
+// Bandwidth-optimal BF16 GEMM for small M (1..=16), large K (multiple of 8), large N.
 // Computes Y[M, N] = X[M, K] @ W[N, K]^T in FP32 accumulation, BF16 output.
 // Grid: dim3((N + 7) / 8), Block: dim3(32, 4). Each warp computes 2 output rows of W.
 template <int M_ROWS>

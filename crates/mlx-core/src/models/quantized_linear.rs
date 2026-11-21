@@ -17,10 +17,108 @@ use super::int8_gemm;
 /// 8-row tile; a Q8_0 segment (MLX affine 8-bit group 32 with F32 sidecars)
 /// runs the per-thread loop of its standalone `AffineMixedQmm` qmv_wide call.
 /// Set MLX_MIXED_PROJECTION=0 before loading a model for an unfused comparison.
+fn is_cuda_kquant_multi_eligible(q: &QuantizedLinear, rows: i64) -> bool {
+    let (base, tiled) = crate::models::quant_dispatch::split_kquant_layout(&q.mode);
+    let mode_ok = matches!(base, "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs");
+    mode_ok
+        && q.bias.is_none()
+        && q.hadamard.is_none()
+        && q.input_amax.is_none()
+        && q.biases.is_some()
+        && (rows <= 16 || tiled)
+}
+
+pub(crate) fn cuda_kquant_multi_ql(
+    x: &MxArray,
+    projs: &[&QuantizedLinear],
+) -> Result<Option<Vec<MxArray>>> {
+    use crate::array::DType;
+    if !crate::accelerator::cuda_ops_available()
+        || !(2..=4).contains(&projs.len())
+        || x.dtype()? != DType::BFloat16
+    {
+        return Ok(None);
+    }
+    let ndim = x.ndim()?;
+    if ndim < 2 {
+        return Ok(None);
+    }
+    let k = x.shape_at(ndim - 1)?;
+    let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+    if rows < 1 || k < 2048 || k % 256 != 0 {
+        return Ok(None);
+    }
+    if !projs.iter().all(|q| is_cuda_kquant_multi_eligible(q, rows)) {
+        return Ok(None);
+    }
+    let mut specs = Vec::with_capacity(projs.len());
+    for q in projs {
+        let Some(biases) = q.biases.as_ref() else {
+            return Ok(None);
+        };
+        specs.push((&q.weight, &q.scales, biases, q.mode.as_str()));
+    }
+    let out = crate::kernels::linear::kquant_matmul_multi(x, rows, &specs)?;
+    if out.is_some() && rows == 1 {
+        for q in projs {
+            q.clear_cuda_dense_prefill();
+        }
+    }
+    Ok(out)
+}
+
+fn cuda_mixed_projection_forward(
+    x: &MxArray,
+    projections: &[&LinearProj],
+) -> Result<Option<Vec<MxArray>>> {
+    use crate::array::DType;
+    if !(2..=4).contains(&projections.len()) || x.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let ndim = x.ndim()?;
+    if ndim < 2 {
+        return Ok(None);
+    }
+    let k = x.shape_at(ndim - 1)?;
+    let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+    if rows < 1 || k < 2048 || k % 256 != 0 {
+        return Ok(None);
+    }
+    let mut kq_indices = Vec::with_capacity(projections.len());
+    let mut kq_projs = Vec::with_capacity(projections.len());
+    for (idx, proj) in projections.iter().enumerate() {
+        if let LinearProj::Quantized(q) = proj
+            && is_cuda_kquant_multi_eligible(q, rows)
+        {
+            kq_indices.push(idx);
+            kq_projs.push(q);
+        }
+    }
+    if kq_projs.len() < 2 {
+        return Ok(None);
+    }
+    let Some(kq_outs) = cuda_kquant_multi_ql(x, &kq_projs)? else {
+        return Ok(None);
+    };
+    let mut results: Vec<Option<MxArray>> = (0..projections.len()).map(|_| None).collect();
+    for (idx, arr) in kq_indices.into_iter().zip(kq_outs) {
+        results[idx] = Some(arr);
+    }
+    for (idx, slot) in results.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(projections[idx].forward(x)?);
+        }
+    }
+    Ok(Some(results.into_iter().map(Option::unwrap).collect()))
+}
+
 pub(crate) fn mixed_projection_forward(
     x: &MxArray,
     projections: &[&LinearProj],
 ) -> Result<Option<Vec<MxArray>>> {
+    if crate::accelerator::cuda_ops_available() {
+        return cuda_mixed_projection_forward(x, projections);
+    }
     use crate::array::DType;
     // `MixedProjectionFormat` (mlx-sys `metal/mixed_projection/abi.h`).
     const Q4K: u32 = 4;
@@ -695,6 +793,9 @@ impl MLPVariant {
             let last = combined.ndim()? as usize - 1;
             let gu = combined.split_sections(&[*split], last as i32)?;
             return Activations::swiglu_compiled(&gu[0], &gu[1]);
+        }
+        if let Some(pair) = cuda_kquant_multi_ql(x, &[gate_proj, up_proj])? {
+            return Activations::swiglu_compiled(&pair[0], &pair[1]);
         }
         let gate = gate_proj.forward(x)?;
         let up = up_proj.forward(x)?;
@@ -2988,34 +3089,45 @@ impl QuantizedLinear {
             None
         };
 
-        // BF16 rows against F32 sidecars (Qwen3.5 GGUF affine): one primitive
-        // with the promoted path's F32 math and a single BF16 rounding, instead
-        // of casting x up and the result back. Small row counts only, so M=1
-        // decode and prefill graphs keep their standalone casts.
-        if activation_dtype == Some(crate::array::DType::BFloat16)
+        // CUDA affine Q8_0 (bits=8, group_size=32) fast path with BF16 `x` and
+        // F32 / BF16 / F16 sidecars: small-row (M in 1..=16) stays packed in
+        // `mlx_affine_q8_few_cuda`; M >= 17 uses the cached dense BF16 cuBLAS path.
+        if crate::accelerator::cuda_ops_available()
+            && activation_dtype == Some(crate::array::DType::BFloat16)
+            && self.bits == 8
+            && self.group_size == 32
             && self.bias.is_none()
-            && self.scales.dtype()? == crate::array::DType::Float32
             && let Some(biases) = &self.biases
-            && biases.dtype()? == crate::array::DType::Float32
         {
-            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
-            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
-            if (2..=8).contains(&rows) {
-                if let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
-                    x,
-                    &self.weight,
-                    &self.scales,
-                    biases,
-                    self.group_size,
-                    self.bits,
-                )? {
+            let scale_dtype = self.scales.dtype()?;
+            if scale_dtype == biases.dtype()?
+                && matches!(
+                    scale_dtype,
+                    crate::array::DType::Float32
+                        | crate::array::DType::BFloat16
+                        | crate::array::DType::Float16
+                )
+            {
+                let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+                let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+                if (1..=16).contains(&rows)
+                    && k >= 32
+                    && k % 32 == 0
+                    && let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
+                        x,
+                        &self.weight,
+                        &self.scales,
+                        biases,
+                        32,
+                        8,
+                    )?
+                {
+                    if rows == 1 {
+                        self.clear_cuda_dense_prefill();
+                    }
                     return Ok(out);
                 }
-            } else if crate::accelerator::cuda_ops_available()
-                && self.bits == 8
-                && self.group_size == 32
-            {
-                if rows >= 16 {
+                if rows >= 17 {
                     let mut dense = self
                         .cuda_dense_prefill_slot()
                         .map(|slot| {
@@ -3046,6 +3158,33 @@ impl QuantizedLinear {
             }
         }
 
+        // BF16 rows against F32 sidecars (Qwen3.5 GGUF affine): one primitive
+        // with the promoted path's F32 math and a single BF16 rounding, instead
+        // of casting x up and the result back. Small row counts only, so M=1
+        // decode and prefill graphs keep their standalone casts.
+        if !crate::accelerator::cuda_ops_available()
+            && activation_dtype == Some(crate::array::DType::BFloat16)
+            && self.bias.is_none()
+            && self.scales.dtype()? == crate::array::DType::Float32
+            && let Some(biases) = &self.biases
+            && biases.dtype()? == crate::array::DType::Float32
+        {
+            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+            if (2..=8).contains(&rows)
+                && let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                    self.group_size,
+                    self.bits,
+                )?
+            {
+                return Ok(out);
+            }
+        }
+
         // Supported small-row batches stay packed through CUDA INT8 MMA (checked
         // BEFORE taking the dense-prefill lock so decode has zero mutex overhead).
         // Other K-quant batches share one dense weight through cuBLAS when the
@@ -3059,7 +3198,7 @@ impl QuantizedLinear {
         {
             let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
             let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
-            if (2..=8).contains(&rows)
+            if (1..=16).contains(&rows)
                 && k >= 2048
                 && matches!(
                     crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
@@ -3069,6 +3208,28 @@ impl QuantizedLinear {
                 && x.dtype()? == crate::array::DType::BFloat16
                 && let Some(biases) = self.biases.as_ref()
                 && let Some(out) = crate::kernels::linear::kquant_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                    &self.mode,
+                )?
+            {
+                if rows == 1 {
+                    self.clear_cuda_dense_prefill();
+                }
+                return Ok(out);
+            }
+            if rows >= 17
+                && k >= 2048
+                && matches!(
+                    crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
+                    "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"
+                )
+                && self.bias.is_none()
+                && x.dtype()? == crate::array::DType::BFloat16
+                && let Some(biases) = self.biases.as_ref()
+                && let Some(out) = crate::kernels::linear::kquant_matmul_prefill(
                     x,
                     &self.weight,
                     &self.scales,
@@ -3113,6 +3274,35 @@ impl QuantizedLinear {
                 return Ok(result);
             }
             self.clear_cuda_dense_prefill();
+        }
+
+        // High-bandwidth 8-warp split-K BF16 MMA kernel for row-major affine
+        // Q4/g64 draft & decode weights (replaces slow non-split-K qmm_sm80 at
+        // M=8 and weight-rereading qmv_kernel at M=1..7).
+        if crate::accelerator::cuda_ops_available()
+            && self.mode == DEFAULT_QUANT_MODE
+            && self.bits == 4
+            && self.group_size == 64
+            && self.bias.is_none()
+            && x.dtype()? == crate::array::DType::BFloat16
+            && self.scales.dtype()? == crate::array::DType::BFloat16
+            && let Some(biases) = self.biases.as_ref()
+            && biases.dtype()? == crate::array::DType::BFloat16
+        {
+            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+            if (1..=8).contains(&rows)
+                && k >= 1024
+                && k % 256 == 0
+                && let Some(out) = crate::kernels::linear::affine_q4_g64_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                )?
+            {
+                return Ok(out);
+            }
         }
 
         let mode_c = CString::new(self.mode.as_str())

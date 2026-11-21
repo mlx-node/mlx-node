@@ -465,7 +465,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         MxArray::eval_arrays(&[&expected]).unwrap();
         let block = MxArray::from_int32(&[anchor as i32, 0, 0, 0, 0, 0, 0, 0], &[1, 8]).unwrap();
         let (actual, actual_confidence) = model
-            .propose_compiled(&embedding, None, &mut compiled, &block, true)
+            .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
             .unwrap()
             .unwrap();
         MxArray::eval_arrays(&[&actual]).unwrap();
@@ -521,7 +521,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
     let block = MxArray::from_int32(&[1, 0, 0, 0, 0, 0, 0, 0], &[1, 8]).unwrap();
     assert!(
         model
-            .propose_compiled(&embedding, None, &mut compiled, &block, true)
+            .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
             .is_err()
     );
     assert!(
@@ -558,7 +558,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         .unwrap();
     MxArray::eval_arrays(&[&expected]).unwrap();
     let (retry, _) = model
-        .propose_compiled(&embedding, None, &mut compiled, &block, true)
+        .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
         .unwrap()
         .unwrap();
     MxArray::eval_arrays(&[&retry]).unwrap();

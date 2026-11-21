@@ -1002,6 +1002,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
     let mut tf = super::tf_research::TfMode::begin(hist)?;
     let mut step = backend.begin_dspark_decode(block_size)?;
+    if step.supports_tree_verify() {
+        step.observe_emitted_tokens(hist);
+    }
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
     y.eval();
@@ -1036,6 +1039,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
         generated.push(initial_token_id);
         hist.push(initial_token_id);
+        if step.supports_tree_verify() {
+            step.observe_emitted_tokens(&[initial_token_id]);
+        }
         profiler.step();
         let _is_reasoning = tracker.observe_token(initial_token_id);
         if !turn_cancelled() {
@@ -1107,6 +1113,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             "DSpark break-even calibration started"
         );
     }
+
+    let tree_temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+    let tree_greedy_unpenalized = sampling::is_greedy_temperature(tree_temperature)
+        && p.repetition_penalty == 1.0
+        && p.presence_penalty == 0.0
+        && p.frequency_penalty == 0.0;
 
     // DELIBERATE DIVERGENCE from `run_mtp_turn`: cancellation is checked at
     // the cycle top and inside the pre-commit stop-clamp, NOT per emitted
@@ -1231,329 +1243,422 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
         timeline::mark(Mark::Plan);
 
-        // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
-        // degenerates to a single AR step THROUGH verify (verify_ids =
-        // [anchor] only), keeping the anchor's K/V write on the one path.
-        let mut proposal = if l_cap >= 1 {
-            profiler.begin("dspark_propose");
-            let res = step.propose(anchor, l_cap, p, rng);
-            profiler.end();
-            res?
-        } else {
-            DsparkProposal {
-                draft_ids: Vec::new(),
-                device_draft_ids: None,
-                device_draft_sparse: None,
-                draft_dists: Vec::new(),
-                draft_sparse_dists: Vec::new(),
-                keep_probabilities: None,
-            }
-        };
-        // Contract enforcement at the proposal boundary: `propose` may
-        // return FEWER than `l_cap` (confidence truncation), NEVER more. An
-        // over-long block would inflate the verify write past the
-        // `remaining - 1` budget cap's target-cache slot expectations, and
-        // the stop-clamp runs AFTER verify so it cannot un-write those
-        // slots — a hard error surfaces the stepper bug instead of masking
-        // it.
-        let proposed_len = proposal.draft_len()?;
-        if proposed_len > l_cap {
-            return Err(Error::from_reason(format!(
-                "DSpark propose over-returned: {proposed_len} draft tokens for a cap of {l_cap} \
-                 (the DsparkStepper::propose contract allows fewer, never more)"
-            )));
-        }
-        // At row 0 the end tokens are the first proposals; the cycle then
-        // verifies host ids.
-        let touched = cut.as_ref().is_some_and(|c| c.touches(proposed_len));
-        if touched && let Some(c) = cut.as_ref() {
-            proposal.materialize_draft_ids()?;
-            proposal.replace_prefix(c.proposals(proposed_len))?;
-        }
+        let tree_max_nodes: usize = 16;
+        let tree_max_depth: usize = remaining.saturating_sub(1).min(15);
+        let use_tree = step.supports_tree_verify()
+            && remaining > 1
+            && l_cap >= 1
+            && measurement_cycle == DsparkMeasurementCycle::None
+            && tree_greedy_unpenalized
+            && !tf.is_forcing()
+            && !cut.as_ref().is_some_and(|c| c.touches(tree_max_depth));
 
-        let proposal_ns = cycle_started_at
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        if measurement_cycle == DsparkMeasurementCycle::None
-            && proposed_len > 0
-            && let (Some(policy), Some(confidence)) =
-                (&mut verification_budget, &proposal.keep_probabilities)
-            && let Some(keep) = policy.choose(confidence, proposal_ns)
-        {
-            if keep == 0 {
-                step.enter_ar_fallback()?;
-            }
-            proposal.truncate(keep);
-        }
-        let draft_len = proposal.draft_len()?;
-        let replaced = cut.as_ref().map_or(0, |c| c.replaced(draft_len));
-        timeline::mark(Mark::DraftPost);
-
-        profiler.begin("dspark_verify");
-        // The one-token calibration path deliberately omits speculative
-        // rollback snapshotting, but still builds the ordinary tapped target
-        // graph needed to seed the following speculative cycle. Start the AR
-        // timer immediately before that method: target graph construction and
-        // dispatch, GPU force, and sampling are measured; only draft-context
-        // fusion in `commit_ar_probe` remains outside it.
-        let verify_started_at = Instant::now();
-        let ar_probe_started_at =
-            (measurement_cycle == DsparkMeasurementCycle::ArProbe).then_some(verify_started_at);
-        // Teacher forcing: the reference continuation replaces the drafts as
-        // the verify input, through the same host verify path.
-        let tf_ids = tf.verify_ids(generated, anchor, draft_len)?;
-        let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
-            step.verify_ar_probe(anchor)
-        } else if let Some(ids) = tf_ids.as_ref() {
-            step.verify(ids)
-        } else if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
-            // Device-resident proposal: anchor + draft path enter the target
-            // graph without a host round-trip (the acceptance eval below
-            // remains the cycle's single materialization point).
-            let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
-            let ids = MxArray::concatenate(&anchor_arr, device_ids, 0)?;
-            step.verify_device(&ids)
-        } else {
-            let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
-            verify_ids.push(anchor);
-            verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
-            step.verify(&verify_ids)
-        };
-        profiler.end();
-        let verify_out = verify_res?;
-        let logits = verify_out.logits; // [1, 1+L, vocab]
-
-        // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
-        // boundary token (bonus on full accept, residual on rejection).
-        profiler.begin("dspark_accept");
-        let mut device_budget_observation = None;
-        let accept_res = if tf_ids.is_some() {
-            tf.accept(&logits, &mut proposal, generated)
-        } else if !touched && let Some(budget) = step.device_verification_budget() {
-            let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
-            if !sampling::is_greedy_temperature(temperature)
-                || p.repetition_penalty != 1.0
-                || p.presence_penalty != 0.0
-                || p.frequency_penalty != 0.0
-            {
-                return Err(Error::from_reason(
-                    "device verification budgeting requires unpenalized greedy acceptance",
-                ));
-            }
-            accept_device_budgeted_greedy(&logits, &mut proposal, budget).map(
-                |(k, token, rows, raw)| {
-                    device_budget_observation = Some((rows, raw));
-                    (k, token)
-                },
-            )
-        } else {
-            let rows_route = step.device_sampled_rows();
-            let submitted = if rows_route {
-                submit_sampled_rows(&logits, &proposal, p, rng)
+        let (accepted, emit_count, kept_drafts, stop, boundary_id, device_budget_observation) =
+            if use_tree {
+                profiler.begin("dspark_verify");
+                let tree_res = step.verify_tree_greedy(anchor, tree_max_nodes, tree_max_depth);
+                profiler.end();
+                let tree_out = tree_res?;
+                if tree_out.emitted_tokens.is_empty()
+                    || tree_out.accepted_nodes.len() != tree_out.emitted_tokens.len()
+                    || tree_out.accepted_nodes[0] != 0
+                    || tree_out.emitted_tokens.len() > remaining
+                {
+                    return Err(Error::from_reason(format!(
+                        "DSpark tree verify contract violation: emitted={}, accepted_nodes={:?}, remaining={remaining}",
+                        tree_out.emitted_tokens.len(),
+                        tree_out.accepted_nodes,
+                    )));
+                }
+                let accepted_drafts_k = tree_out.accepted_nodes.len() - 1;
+                let Some(&boundary_id) = tree_out.emitted_tokens.last() else {
+                    return Err(Error::from_reason(
+                        "DSpark tree verify emitted_tokens unexpectedly empty",
+                    ));
+                };
+                let accepted = tree_out.emitted_tokens;
+                let DsparkCycleDecision {
+                    emit_count,
+                    keep,
+                    stop,
+                } = clamp_dspark_cycle(
+                    generated,
+                    &accepted,
+                    accepted_drafts_k,
+                    p,
+                    max_as_usize,
+                    eos_id,
+                    || {
+                        turn_cancelled()
+                            || streaming
+                                .as_ref()
+                                .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
+                    },
+                    |token| {
+                        turn_token_observer
+                            .as_deref_mut()
+                            .is_some_and(|observer| observer.observe_token_id(token))
+                    },
+                );
+                let kept_drafts = keep - 1;
+                timeline::cycle_counts(tree_out.draft_count, accepted_drafts_k, emit_count);
+                timeline::mark(Mark::StopClamp);
+                let keep_nodes = &tree_out.accepted_nodes[..keep];
+                let keep_contiguous = if keep == tree_out.accepted_nodes.len() {
+                    tree_out.is_contiguous_prefix
+                } else {
+                    keep_nodes.iter().enumerate().all(|(i, &n)| n == i)
+                };
+                profiler.begin("dspark_commit");
+                let commit_res = step.commit_tree(keep_nodes, keep_contiguous);
+                profiler.end();
+                commit_res?;
+                if tree_out.draft_count >= 1 {
+                    profiler.record_mtp_cycle(tree_out.draft_count, tree_out.accepted_draft_count);
+                }
+                (accepted, emit_count, kept_drafts, stop, boundary_id, None)
             } else {
-                Ok(None)
-            };
-            match submitted {
-                Err(error) => Err(error),
-                Ok(Some(rows)) => {
-                    MxArray::eval_arrays_with_context(&[rows.records()], "speculative_sampled_rows")
+                // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
+                // degenerates to a single AR step THROUGH verify (verify_ids =
+                // [anchor] only), keeping the anchor's K/V write on the one path.
+                let mut proposal = if l_cap >= 1 {
+                    profiler.begin("dspark_propose");
+                    let res = step.propose(anchor, l_cap, p, rng);
+                    profiler.end();
+                    res?
+                } else {
+                    DsparkProposal {
+                        draft_ids: Vec::new(),
+                        device_draft_ids: None,
+                        device_draft_sparse: None,
+                        draft_dists: Vec::new(),
+                        draft_sparse_dists: Vec::new(),
+                        keep_probabilities: None,
+                    }
+                };
+                // Contract enforcement at the proposal boundary: `propose` may
+                // return FEWER than `l_cap` (confidence truncation), NEVER more. An
+                // over-long block would inflate the verify write past the
+                // `remaining - 1` budget cap's target-cache slot expectations, and
+                // the stop-clamp runs AFTER verify so it cannot un-write those
+                // slots — a hard error surfaces the stepper bug instead of masking
+                // it.
+                let proposed_len = proposal.draft_len()?;
+                if proposed_len > l_cap {
+                    return Err(Error::from_reason(format!(
+                        "DSpark propose over-returned: {proposed_len} draft tokens for a cap of {l_cap} \
+                 (the DsparkStepper::propose contract allows fewer, never more)"
+                    )));
+                }
+                // At row 0 the end tokens are the first proposals; the cycle then
+                // verifies host ids.
+                let touched = cut.as_ref().is_some_and(|c| c.touches(proposed_len));
+                if touched && let Some(c) = cut.as_ref() {
+                    proposal.materialize_draft_ids()?;
+                    proposal.replace_prefix(c.proposals(proposed_len))?;
+                }
+
+                let proposal_ns = cycle_started_at
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                if measurement_cycle == DsparkMeasurementCycle::None
+                    && proposed_len > 0
+                    && let (Some(policy), Some(confidence)) =
+                        (&mut verification_budget, &proposal.keep_probabilities)
+                    && let Some(keep) = policy.choose(confidence, proposal_ns)
+                {
+                    if keep == 0 {
+                        step.enter_ar_fallback()?;
+                    }
+                    proposal.truncate(keep);
+                }
+                let draft_len = proposal.draft_len()?;
+                let replaced = cut.as_ref().map_or(0, |c| c.replaced(draft_len));
+                timeline::mark(Mark::DraftPost);
+
+                profiler.begin("dspark_verify");
+                // The one-token calibration path deliberately omits speculative
+                // rollback snapshotting, but still builds the ordinary tapped target
+                // graph needed to seed the following speculative cycle. Start the AR
+                // timer immediately before that method: target graph construction and
+                // dispatch, GPU force, and sampling are measured; only draft-context
+                // fusion in `commit_ar_probe` remains outside it.
+                let verify_started_at = Instant::now();
+                let ar_probe_started_at = (measurement_cycle == DsparkMeasurementCycle::ArProbe)
+                    .then_some(verify_started_at);
+                // Teacher forcing: the reference continuation replaces the drafts as
+                // the verify input, through the same host verify path.
+                let tf_ids = tf.verify_ids(generated, anchor, draft_len)?;
+                let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+                    step.verify_ar_probe(anchor)
+                } else if let Some(ids) = tf_ids.as_ref() {
+                    step.verify(ids)
+                } else if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
+                    // Device-resident proposal: anchor + draft path enter the target
+                    // graph without a host round-trip (the acceptance eval below
+                    // remains the cycle's single materialization point).
+                    let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
+                    let ids = MxArray::concatenate(&anchor_arr, device_ids, 0)?;
+                    step.verify_device(&ids)
+                } else {
+                    let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
+                    verify_ids.push(anchor);
+                    verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+                    step.verify(&verify_ids)
+                };
+                profiler.end();
+                let verify_out = verify_res?;
+                let logits = verify_out.logits; // [1, 1+L, vocab]
+
+                // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
+                // boundary token (bonus on full accept, residual on rejection).
+                profiler.begin("dspark_accept");
+                let mut device_budget_observation = None;
+                let accept_res = if tf_ids.is_some() {
+                    tf.accept(&logits, &mut proposal, generated)
+                } else if !touched && let Some(budget) = step.device_verification_budget() {
+                    let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+                    if !sampling::is_greedy_temperature(temperature)
+                        || p.repetition_penalty != 1.0
+                        || p.presence_penalty != 0.0
+                        || p.frequency_penalty != 0.0
+                    {
+                        return Err(Error::from_reason(
+                            "device verification budgeting requires unpenalized greedy acceptance",
+                        ));
+                    }
+                    accept_device_budgeted_greedy(&logits, &mut proposal, budget).map(
+                        |(k, token, rows, raw)| {
+                            device_budget_observation = Some((rows, raw));
+                            (k, token)
+                        },
+                    )
+                } else {
+                    let rows_route = step.device_sampled_rows();
+                    let submitted = if rows_route {
+                        submit_sampled_rows(&logits, &proposal, p, rng)
+                    } else {
+                        Ok(None)
+                    };
+                    match submitted {
+                        Err(error) => Err(error),
+                        Ok(Some(rows)) => MxArray::eval_arrays_with_context(
+                            &[rows.records()],
+                            "speculative_sampled_rows",
+                        )
                         .and_then(|()| {
                             timeline::mark(Mark::VerifyWait);
                             rows.accept(&mut proposal, cut.as_ref())
-                        })
-                }
-                Ok(None) if !touched && proposal.device_draft_sparse.is_some() => {
-                    accept_device_sampled(&logits, &mut proposal, p, rng)
-                }
-                Ok(None) => {
-                    accept_dspark_proposal(&logits, &mut proposal, hist, p, rng, cut.as_ref())
-                }
-            }
-        };
-        profiler.end();
-        let (accepted_drafts_k, boundary_id) = accept_res?;
-        timeline::mark(Mark::Accept);
-        // Acceptance has forced the verify graph. Back-fill a device proposal
-        // now so commit can reuse the engine's exact verify provenance instead
-        // of reading the concatenated verify input from the device again. The
-        // ordinary accept paths already did this.
-        proposal.materialize_draft_ids()?;
-        let verify_ns = verify_started_at
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        // Acceptance's token read has now fully forced the target graph.
-        // AR measures from immediately before its dedicated target forward;
-        // speculative probes retain the whole-cycle propose+verify timer.
-        // Both stop before their respective commit/materialization handling.
-        let measured_before_commit_started_at = ar_probe_started_at.unwrap_or(cycle_started_at);
-        let precommit_wall_ns = measured_before_commit_started_at
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-
-        let mut accepted: Vec<u32> = Vec::with_capacity(accepted_drafts_k + 1);
-        accepted.extend(
-            proposal.draft_ids[..accepted_drafts_k]
-                .iter()
-                .map(|&id| id as u32),
-        );
-        accepted.push(boundary_id);
-
-        // STOP-CLAMP BEFORE COMMIT: walk the accepted list simulating the
-        // history, replaying `run_mtp_turn`'s emit-loop per-token check
-        // order (budget-before-push → push → cancel → EOS/extra-EOS →
-        // repetition) so the stop decision is byte-equivalent — but taken
-        // BEFORE `commit`, so the stepper keeps exactly the emitted
-        // prefix's K/V and never needs a post-commit rollback. The
-        // EOS/repetition/cancel cuts are INCLUSIVE of the tripping token;
-        // the budget cut is EXCLUSIVE (mtp checks the budget before the
-        // push).
-        let DsparkCycleDecision {
-            emit_count,
-            keep,
-            stop,
-        } = clamp_dspark_cycle(
-            generated,
-            &accepted,
-            accepted_drafts_k,
-            p,
-            max_as_usize,
-            eos_id,
-            || {
-                turn_cancelled()
-                    || streaming
-                        .as_ref()
-                        .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
-            },
-            |token| {
-                turn_token_observer
-                    .as_deref_mut()
-                    .is_some_and(|observer| observer.observe_token_id(token))
-            },
-        );
-        let kept_drafts = keep - 1;
-        timeline::cycle_counts(draft_len, accepted_drafts_k, emit_count);
-        timeline::mark(Mark::StopClamp);
-        let verified_ids = tf_ids.unwrap_or_else(|| {
-            let mut verified_ids = Vec::with_capacity(1 + draft_len);
-            verified_ids.push(anchor);
-            verified_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
-            verified_ids
-        });
-        profiler.begin("dspark_commit");
-        let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
-            if keep != 1 || draft_len != 0 {
-                Err(Error::from_reason(format!(
-                    "DSpark AR probe contract violation: keep={keep}, draft_len={draft_len}"
-                )))
-            } else {
-                step.commit_ar_probe()
-            }
-        } else {
-            step.commit_with_provenance(keep, 1 + draft_len, &verified_ids)
-        };
-        profiler.end();
-        commit_res?;
-        let device_budget_observation = match device_budget_observation {
-            Some((rows, raw_matches)) => {
-                // Charge this cycle's committed GPU work before host-only emission.
-                // Boundary submission includes the rollback and draft-context roots.
-                let boundary = MxArray::from_int32(&[boundary_id as i32], &[1])?;
-                profiler.begin("dspark_eval_boundary");
-                step.eval_boundary(&boundary);
-                profiler.end();
-                crate::array::synchronize();
-                let milliseconds = cycle_started_at.elapsed().as_secs_f64() * 1000.0;
-                Some((rows, raw_matches, milliseconds))
-            }
-            None => None,
-        };
-        if tf.is_forcing() {
-            tf.end_cycle(cycle_started_at.elapsed());
-        }
-        let break_even_decision = if stop.is_some() {
-            None
-        } else {
-            match measurement_cycle {
-                DsparkMeasurementCycle::None => None,
-                DsparkMeasurementCycle::ArProbe => {
-                    // Build/materialize the context needed by the following
-                    // speculative probes, but deliberately exclude that
-                    // draft-only calibration cost from target-AR throughput.
-                    step.materialize_adaptive_state()?;
-                    if let Some(policy) = verification_budget.as_mut() {
-                        policy.record(0, verify_ns);
+                        }),
+                        Ok(None) if !touched && proposal.device_draft_sparse.is_some() => {
+                            accept_device_sampled(&logits, &mut proposal, p, rng)
+                        }
+                        Ok(None) => accept_dspark_proposal(
+                            &logits,
+                            &mut proposal,
+                            hist,
+                            p,
+                            rng,
+                            cut.as_ref(),
+                        ),
                     }
-                    break_even.record_cycle(
-                        measurement_cycle,
-                        precommit_wall_ns,
-                        (accepted_drafts_k + 1) as u32,
-                    )
+                };
+                profiler.end();
+                let (accepted_drafts_k, boundary_id) = accept_res?;
+                timeline::mark(Mark::Accept);
+                // Acceptance has forced the verify graph. Back-fill a device proposal
+                // now so commit can reuse the engine's exact verify provenance instead
+                // of reading the concatenated verify input from the device again. The
+                // ordinary accept paths already did this.
+                proposal.materialize_draft_ids()?;
+                let verify_ns = verify_started_at
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                // Acceptance's token read has now fully forced the target graph.
+                // AR measures from immediately before its dedicated target forward;
+                // speculative probes retain the whole-cycle propose+verify timer.
+                // Both stop before their respective commit/materialization handling.
+                let measured_before_commit_started_at =
+                    ar_probe_started_at.unwrap_or(cycle_started_at);
+                let precommit_wall_ns = measured_before_commit_started_at
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+
+                let mut accepted: Vec<u32> = Vec::with_capacity(accepted_drafts_k + 1);
+                accepted.extend(
+                    proposal.draft_ids[..accepted_drafts_k]
+                        .iter()
+                        .map(|&id| id as u32),
+                );
+                accepted.push(boundary_id);
+
+                // STOP-CLAMP BEFORE COMMIT: walk the accepted list simulating the
+                // history, replaying `run_mtp_turn`'s emit-loop per-token check
+                // order (budget-before-push → push → cancel → EOS/extra-EOS →
+                // repetition) so the stop decision is byte-equivalent — but taken
+                // BEFORE `commit`, so the stepper keeps exactly the emitted
+                // prefix's K/V and never needs a post-commit rollback. The
+                // EOS/repetition/cancel cuts are INCLUSIVE of the tripping token;
+                // the budget cut is EXCLUSIVE (mtp checks the budget before the
+                // push).
+                let DsparkCycleDecision {
+                    emit_count,
+                    keep,
+                    stop,
+                } = clamp_dspark_cycle(
+                    generated,
+                    &accepted,
+                    accepted_drafts_k,
+                    p,
+                    max_as_usize,
+                    eos_id,
+                    || {
+                        turn_cancelled()
+                            || streaming
+                                .as_ref()
+                                .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
+                    },
+                    |token| {
+                        turn_token_observer
+                            .as_deref_mut()
+                            .is_some_and(|observer| observer.observe_token_id(token))
+                    },
+                );
+                let kept_drafts = keep - 1;
+                timeline::cycle_counts(draft_len, accepted_drafts_k, emit_count);
+                timeline::mark(Mark::StopClamp);
+                let verified_ids = tf_ids.unwrap_or_else(|| {
+                    let mut verified_ids = Vec::with_capacity(1 + draft_len);
+                    verified_ids.push(anchor);
+                    verified_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+                    verified_ids
+                });
+                profiler.begin("dspark_commit");
+                let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+                    if keep != 1 || draft_len != 0 {
+                        Err(Error::from_reason(format!(
+                            "DSpark AR probe contract violation: keep={keep}, draft_len={draft_len}"
+                        )))
+                    } else {
+                        step.commit_ar_probe()
+                    }
+                } else {
+                    step.commit_with_provenance(keep, 1 + draft_len, &verified_ids)
+                };
+                profiler.end();
+                commit_res?;
+                let device_budget_observation = match device_budget_observation {
+                    Some((rows, raw_matches)) => {
+                        // Charge this cycle's committed GPU work before host-only emission.
+                        // Boundary submission includes the rollback and draft-context roots.
+                        let boundary = MxArray::from_int32(&[boundary_id as i32], &[1])?;
+                        profiler.begin("dspark_eval_boundary");
+                        step.eval_boundary(&boundary);
+                        profiler.end();
+                        crate::array::synchronize();
+                        let milliseconds = cycle_started_at.elapsed().as_secs_f64() * 1000.0;
+                        Some((rows, raw_matches, milliseconds))
+                    }
+                    None => None,
+                };
+                if tf.is_forcing() {
+                    tf.end_cycle(cycle_started_at.elapsed());
                 }
-                DsparkMeasurementCycle::SpecProbe => {
-                    // Include this cycle's own context append. Without the
-                    // eval, MLX would charge it to the next proposal and make
-                    // the two probe timings order-dependent.
-                    step.materialize_adaptive_state()?;
-                    if let Some(policy) = verification_budget.as_mut() {
-                        // Include rollback, durable settlement and this cycle's
-                        // context append. Only calibration forces this boundary;
-                        // steady-state proposals retain their asynchronous graph.
-                        policy.record(
-                            draft_len,
-                            verify_started_at
+                let break_even_decision = if stop.is_some() {
+                    None
+                } else {
+                    match measurement_cycle {
+                        DsparkMeasurementCycle::None => None,
+                        DsparkMeasurementCycle::ArProbe => {
+                            // Build/materialize the context needed by the following
+                            // speculative probes, but deliberately exclude that
+                            // draft-only calibration cost from target-AR throughput.
+                            step.materialize_adaptive_state()?;
+                            if let Some(policy) = verification_budget.as_mut() {
+                                policy.record(0, verify_ns);
+                            }
+                            break_even.record_cycle(
+                                measurement_cycle,
+                                precommit_wall_ns,
+                                (accepted_drafts_k + 1) as u32,
+                            )
+                        }
+                        DsparkMeasurementCycle::SpecProbe => {
+                            // Include this cycle's own context append. Without the
+                            // eval, MLX would charge it to the next proposal and make
+                            // the two probe timings order-dependent.
+                            step.materialize_adaptive_state()?;
+                            if let Some(policy) = verification_budget.as_mut() {
+                                // Include rollback, durable settlement and this cycle's
+                                // context append. Only calibration forces this boundary;
+                                // steady-state proposals retain their asynchronous graph.
+                                policy.record(
+                                    draft_len,
+                                    verify_started_at
+                                        .elapsed()
+                                        .as_nanos()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                );
+                            }
+                            let wall_ns = cycle_started_at
                                 .elapsed()
                                 .as_nanos()
-                                .min(u128::from(u64::MAX)) as u64,
-                        );
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            break_even.record_cycle(
+                                measurement_cycle,
+                                wall_ns,
+                                (accepted_drafts_k + 1) as u32,
+                            )
+                        }
                     }
-                    let wall_ns = cycle_started_at
-                        .elapsed()
-                        .as_nanos()
-                        .min(u128::from(u64::MAX)) as u64;
-                    break_even.record_cycle(
-                        measurement_cycle,
-                        wall_ns,
-                        (accepted_drafts_k + 1) as u32,
-                    )
+                };
+
+                if let Some(decision) = break_even_decision {
+                    if decision.choice == DsparkBreakEvenChoice::FallBackToAr {
+                        step.enter_ar_fallback()?;
+                    }
+                    tracing::info!(
+                        target: "mlx_core::inference",
+                        event = "dspark_break_even_decision",
+                        decision = match decision.choice {
+                            DsparkBreakEvenChoice::KeepSpeculation => "keep_speculation",
+                            DsparkBreakEvenChoice::FallBackToAr => "target_only_ar",
+                        },
+                        ar_tokens_per_second = decision.ar_tokens_per_second,
+                        spec_tokens_per_second = decision.spec_tokens_per_second,
+                        spec_tokens = decision.spec_tokens,
+                        spec_cycles = decision.spec_cycles,
+                        minimum_speedup = DSPARK_BREAK_EVEN_MIN_SPEEDUP,
+                        "DSpark break-even decision"
+                    );
                 }
-            }
-        };
 
-        if let Some(decision) = break_even_decision {
-            if decision.choice == DsparkBreakEvenChoice::FallBackToAr {
-                step.enter_ar_fallback()?;
-            }
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "dspark_break_even_decision",
-                decision = match decision.choice {
-                    DsparkBreakEvenChoice::KeepSpeculation => "keep_speculation",
-                    DsparkBreakEvenChoice::FallBackToAr => "target_only_ar",
-                },
-                ar_tokens_per_second = decision.ar_tokens_per_second,
-                spec_tokens_per_second = decision.spec_tokens_per_second,
-                spec_tokens = decision.spec_tokens,
-                spec_cycles = decision.spec_cycles,
-                minimum_speedup = DSPARK_BREAK_EVEN_MIN_SPEEDUP,
-                "DSpark break-even decision"
-            );
-        }
-
-        // Per-cycle acceptance stats: DRAFTED depth `L` and accepted draft
-        // count `k` — the same argument semantics as `run_mtp_cycle`'s
-        // `record_mtp_cycle(effective_depth, accepted_drafts)` (boundary
-        // excluded from both). Degenerate `L == 0` cycles are plain AR
-        // steps and are NOT recorded, nor are end tokens that replaced
-        // proposals.
-        if draft_len - replaced >= 1 {
-            profiler.record_mtp_cycle(
-                draft_len - replaced,
-                accepted_drafts_k.saturating_sub(replaced),
-            );
-        }
+                // Per-cycle acceptance stats: DRAFTED depth `L` and accepted draft
+                // count `k` — the same argument semantics as `run_mtp_cycle`'s
+                // `record_mtp_cycle(effective_depth, accepted_drafts)` (boundary
+                // excluded from both). Degenerate `L == 0` cycles are plain AR
+                // steps and are NOT recorded, nor are end tokens that replaced
+                // proposals.
+                if draft_len - replaced >= 1 {
+                    profiler.record_mtp_cycle(
+                        draft_len - replaced,
+                        accepted_drafts_k.saturating_sub(replaced),
+                    );
+                }
+                (
+                    accepted,
+                    emit_count,
+                    kept_drafts,
+                    stop,
+                    boundary_id,
+                    device_budget_observation,
+                )
+            };
 
         // Emit the clamped prefix — `run_mtp_turn`'s emit-block bookkeeping
         // (push / observe / detok / emitter), with the stop checks already
@@ -1591,15 +1696,28 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             }
         }
         profiler.end();
+        if step.supports_tree_verify() && emit_count > 0 {
+            step.observe_emitted_tokens(&accepted[..emit_count]);
+        }
         timeline::mark(Mark::Emit);
 
         // Bound allocator cache growth at the established token cadence.
+        // On CUDA/WDDM, unconditional `clear_cache()` runs `cudaMemPoolTrimTo(0)`
+        // (~670 ms stall per trim) even when the cache is only a few MB; only
+        // trim on CUDA when cache memory actually exceeds 1 GiB.
         if generated.len() >= last_clear_at + 256 {
-            profiler.begin("dspark_cache_clear");
-            crate::array::synchronize_and_clear_cache();
-            profiler.end();
+            let should_clear = if crate::accelerator::cuda_ops_available() {
+                crate::array::get_cache_memory() > 1024.0 * 1024.0 * 1024.0
+            } else {
+                true
+            };
+            if should_clear {
+                profiler.begin("dspark_cache_clear");
+                crate::array::synchronize_and_clear_cache();
+                profiler.end();
+                timeline::mark(Mark::CacheClear);
+            }
             last_clear_at = generated.len();
-            timeline::mark(Mark::CacheClear);
         }
 
         // `last_in_cache` invariant: true iff the LAST emitted token's K/V
@@ -5172,5 +5290,498 @@ mod device_budget_tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tree_verify_tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::backend::{
+        ChatBackend, DsparkTreeGreedyResult, DsparkVerifyOutput, FinalizeArgs, ResetScope,
+        SaveStateArgs, TurnSetup,
+    };
+    use crate::engine::penalties::ReasoningTracker;
+    use crate::engine::types::ChatResult;
+    use crate::sampling::SamplingConfig;
+    use crate::tokenizer::Qwen3Tokenizer;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TreeCall {
+        Observe(Vec<u32>),
+        VerifyTree {
+            anchor: u32,
+            max_nodes: usize,
+            max_depth: usize,
+        },
+        CommitTree {
+            nodes: Vec<usize>,
+            contiguous: bool,
+        },
+        LinearPropose {
+            anchor: u32,
+            max_len: usize,
+        },
+        LinearVerify(Vec<u32>),
+        LinearCommit {
+            keep: usize,
+            total: usize,
+        },
+    }
+
+    struct TreeScriptStep {
+        emitted_tokens: Vec<u32>,
+        accepted_nodes: Vec<usize>,
+        draft_count: usize,
+        tree_nodes: usize,
+    }
+
+    struct TreeMockBackend {
+        tree_steps: VecDeque<TreeScriptStep>,
+        linear_next_token: u32,
+        calls: Rc<RefCell<Vec<TreeCall>>>,
+    }
+
+    struct TreeMockStepper<'a> {
+        backend: &'a mut TreeMockBackend,
+    }
+
+    impl DsparkStepper for TreeMockStepper<'_> {
+        fn supports_tree_verify(&self) -> bool {
+            true
+        }
+
+        fn observe_emitted_tokens(&mut self, tokens: &[u32]) {
+            self.backend
+                .calls
+                .borrow_mut()
+                .push(TreeCall::Observe(tokens.to_vec()));
+        }
+
+        fn verify_tree_greedy(
+            &mut self,
+            anchor: u32,
+            max_nodes: usize,
+            max_depth: usize,
+        ) -> Result<DsparkTreeGreedyResult> {
+            self.backend.calls.borrow_mut().push(TreeCall::VerifyTree {
+                anchor,
+                max_nodes,
+                max_depth,
+            });
+            let step = self
+                .backend
+                .tree_steps
+                .pop_front()
+                .ok_or_else(|| Error::from_reason("unexpected verify_tree_greedy call"))?;
+            let is_contiguous_prefix = step.accepted_nodes.iter().enumerate().all(|(i, &n)| n == i);
+            let accepted_draft_count = step.accepted_nodes.len().saturating_sub(1);
+            Ok(DsparkTreeGreedyResult {
+                emitted_tokens: step.emitted_tokens,
+                accepted_nodes: step.accepted_nodes,
+                is_contiguous_prefix,
+                draft_count: step.draft_count,
+                tree_nodes: step.tree_nodes,
+                accepted_draft_count,
+            })
+        }
+
+        fn commit_tree(
+            &mut self,
+            accepted_nodes: &[usize],
+            is_contiguous_prefix: bool,
+        ) -> Result<()> {
+            self.backend.calls.borrow_mut().push(TreeCall::CommitTree {
+                nodes: accepted_nodes.to_vec(),
+                contiguous: is_contiguous_prefix,
+            });
+            Ok(())
+        }
+
+        fn propose(
+            &mut self,
+            anchor_id: u32,
+            max_len: usize,
+            _params: &ChatParams,
+            _rng: &mut dyn rand::Rng,
+        ) -> Result<DsparkProposal> {
+            self.backend
+                .calls
+                .borrow_mut()
+                .push(TreeCall::LinearPropose {
+                    anchor: anchor_id,
+                    max_len,
+                });
+            Ok(DsparkProposal {
+                draft_ids: Vec::new(),
+                device_draft_ids: None,
+                device_draft_sparse: None,
+                draft_dists: Vec::new(),
+                draft_sparse_dists: Vec::new(),
+                keep_probabilities: None,
+            })
+        }
+
+        fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+            self.backend
+                .calls
+                .borrow_mut()
+                .push(TreeCall::LinearVerify(verify_ids.to_vec()));
+            let mut row = vec![-10.0f32; 32];
+            row[self.backend.linear_next_token as usize] = 10.0;
+            let logits = MxArray::from_float32(&row, &[1, 1, 32])?;
+            Ok(DsparkVerifyOutput { logits })
+        }
+
+        fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+            self.backend
+                .calls
+                .borrow_mut()
+                .push(TreeCall::LinearCommit {
+                    keep,
+                    total: total_written,
+                });
+            Ok(())
+        }
+
+        fn eval_boundary(&self, _token: &MxArray) {}
+    }
+
+    struct DummyDecode;
+    impl DecodeStep for DummyDecode {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            unreachable!()
+        }
+    }
+
+    impl ChatBackend for TreeMockBackend {
+        type Decode<'a>
+            = DummyDecode
+        where
+            Self: 'a;
+
+        fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+            unreachable!()
+        }
+        fn family_name(&self) -> &'static str {
+            "tree_mock"
+        }
+        fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+            Ok(31)
+        }
+        fn cached_token_history(&self) -> &[u32] {
+            &[]
+        }
+        fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+            Ok(())
+        }
+        fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+            0
+        }
+        fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+        fn eval_caches(&self) -> Result<()> {
+            Ok(())
+        }
+        fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+            unreachable!()
+        }
+        fn begin_decode(&mut self, _setup: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+            Ok(DummyDecode)
+        }
+        fn finalize_turn(&self, _args: FinalizeArgs<'_>) -> Result<ChatResult> {
+            unreachable!()
+        }
+    }
+
+    impl DsparkBackend for TreeMockBackend {
+        type DsparkDecode<'a>
+            = TreeMockStepper<'a>
+        where
+            Self: 'a;
+
+        fn begin_dspark_decode(&mut self, _block_size: usize) -> Result<Self::DsparkDecode<'_>> {
+            Ok(TreeMockStepper { backend: self })
+        }
+    }
+
+    fn greedy_tree_params(max_new_tokens: i32) -> ChatParams {
+        ChatParams {
+            max_new_tokens,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                top_k: None,
+                top_p: None,
+                min_p: None,
+            }),
+            repetition_penalty: 1.0,
+            repetition_context_size: 20,
+            presence_penalty: 0.0,
+            presence_context_size: 20,
+            frequency_penalty: 0.0,
+            frequency_context_size: 20,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            include_reasoning: true,
+            report_performance: false,
+            reuse_cache: false,
+            enable_mtp: true,
+            mtp_depth: 7,
+            mtp_adaptive_depth: false,
+            extra_eos_ids: Vec::new(),
+            cache_salt: 0,
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+        }
+    }
+
+    #[test]
+    fn tree_verify_non_contiguous_branch_and_linear_tail() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = TreeMockBackend {
+            tree_steps: VecDeque::from([TreeScriptStep {
+                emitted_tokens: vec![5, 6, 7],
+                accepted_nodes: vec![0, 3, 5],
+                draft_count: 7,
+                tree_nodes: 16,
+            }]),
+            linear_next_token: 8,
+            calls: Rc::clone(&calls),
+        };
+        let params = greedy_tree_params(5);
+        let y = MxArray::from_int32(&[4], &[1]).unwrap();
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
+        let mut profiler = DecodeProfiler::new("test", "tree_mock");
+        let mut generated = Vec::new();
+        let mut history = vec![1, 2, 3];
+        let mut finish_reason = String::new();
+        let mut first_tok = None;
+        let mut rng = rand::rng();
+
+        let outcome = run_dspark_turn(
+            &mut backend,
+            &mut rng,
+            DsparkTurnArgs {
+                y,
+                block_size: 7,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 5,
+                eos_id: 31,
+                generated_tokens: &mut generated,
+                token_history: &mut history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_tok,
+                report_perf: false,
+                generation_stream: Stream::generation(),
+                cancel_flag: None,
+                turn_token_observer: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(generated, vec![4, 5, 6, 7, 8]);
+        assert_eq!(history, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(finish_reason, "length");
+        assert!(!outcome.last_in_cache);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                TreeCall::Observe(vec![1, 2, 3]),
+                TreeCall::Observe(vec![4]),
+                TreeCall::VerifyTree {
+                    anchor: 4,
+                    max_nodes: 16,
+                    max_depth: 3,
+                },
+                TreeCall::CommitTree {
+                    nodes: vec![0, 3, 5],
+                    contiguous: false,
+                },
+                TreeCall::Observe(vec![5, 6, 7]),
+                // remaining == 1 falls back to single-token linear verify.
+                TreeCall::LinearVerify(vec![7]),
+                TreeCall::LinearCommit { keep: 1, total: 1 },
+                TreeCall::Observe(vec![8]),
+            ]
+        );
+        let (mean, _, cycles) = profiler
+            .mtp_acceptance_summary()
+            .expect("tree cycle must record MTP stats");
+        assert_eq!(cycles, 1);
+        assert!((mean - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tree_verify_clamps_eos_and_recomputes_contiguity() {
+        // Case A: EOS at index 1 of non-contiguous [0, 2, 4] -> keep = 2 -> [0, 2] (non-contiguous).
+        let calls_a = Rc::new(RefCell::new(Vec::new()));
+        let mut backend_a = TreeMockBackend {
+            tree_steps: VecDeque::from([TreeScriptStep {
+                emitted_tokens: vec![10, 31, 12],
+                accepted_nodes: vec![0, 2, 4],
+                draft_count: 7,
+                tree_nodes: 12,
+            }]),
+            linear_next_token: 0,
+            calls: Rc::clone(&calls_a),
+        };
+        let params = greedy_tree_params(10);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
+        let mut profiler = DecodeProfiler::new("test", "tree_mock");
+        let mut generated = Vec::new();
+        let mut history = vec![1, 2];
+        let mut finish_reason = String::new();
+        let mut first_tok = None;
+        let mut rng = rand::rng();
+
+        let out_a = run_dspark_turn(
+            &mut backend_a,
+            &mut rng,
+            DsparkTurnArgs {
+                y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                block_size: 7,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 10,
+                eos_id: 31,
+                generated_tokens: &mut generated,
+                token_history: &mut history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_tok,
+                report_perf: false,
+                generation_stream: Stream::generation(),
+                cancel_flag: None,
+                turn_token_observer: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(generated, vec![4, 10, 31]);
+        assert_eq!(finish_reason, "stop");
+        assert!(!out_a.last_in_cache);
+        assert!(calls_a.borrow().contains(&TreeCall::CommitTree {
+            nodes: vec![0, 2],
+            contiguous: false,
+        }));
+
+        // Case B: EOS at index 1 of [0, 1, 5] -> keep = 2 -> [0, 1] (becomes contiguous!).
+        let calls_b = Rc::new(RefCell::new(Vec::new()));
+        let mut backend_b = TreeMockBackend {
+            tree_steps: VecDeque::from([TreeScriptStep {
+                emitted_tokens: vec![10, 31, 12],
+                accepted_nodes: vec![0, 1, 5],
+                draft_count: 7,
+                tree_nodes: 12,
+            }]),
+            linear_next_token: 0,
+            calls: Rc::clone(&calls_b),
+        };
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
+        let mut profiler = DecodeProfiler::new("test", "tree_mock");
+        let mut generated = Vec::new();
+        let mut history = vec![1, 2];
+        let mut finish_reason = String::new();
+        let mut first_tok = None;
+
+        let out_b = run_dspark_turn(
+            &mut backend_b,
+            &mut rng,
+            DsparkTurnArgs {
+                y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                block_size: 7,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 10,
+                eos_id: 31,
+                generated_tokens: &mut generated,
+                token_history: &mut history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_tok,
+                report_perf: false,
+                generation_stream: Stream::generation(),
+                cancel_flag: None,
+                turn_token_observer: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(generated, vec![4, 10, 31]);
+        assert_eq!(finish_reason, "stop");
+        assert!(!out_b.last_in_cache);
+        assert!(calls_b.borrow().contains(&TreeCall::CommitTree {
+            nodes: vec![0, 1],
+            contiguous: true,
+        }));
+    }
+
+    #[test]
+    fn tree_verify_falls_back_to_linear_when_penalties_active() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = TreeMockBackend {
+            tree_steps: VecDeque::new(),
+            linear_next_token: 31,
+            calls: Rc::clone(&calls),
+        };
+        let mut params = greedy_tree_params(5);
+        params.repetition_penalty = 1.1;
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
+        let mut profiler = DecodeProfiler::new("test", "tree_mock");
+        let mut generated = Vec::new();
+        let mut history = vec![1, 2, 3];
+        let mut finish_reason = String::new();
+        let mut first_tok = None;
+        let mut rng = rand::rng();
+
+        let _ = run_dspark_turn(
+            &mut backend,
+            &mut rng,
+            DsparkTurnArgs {
+                y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                block_size: 7,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 5,
+                eos_id: 31,
+                generated_tokens: &mut generated,
+                token_history: &mut history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_tok,
+                report_perf: false,
+                generation_stream: Stream::generation(),
+                cancel_flag: None,
+                turn_token_observer: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(generated, vec![4, 31]);
+        assert_eq!(finish_reason, "stop");
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .all(|c| !matches!(c, TreeCall::VerifyTree { .. })),
+            "penalized turns must not invoke verify_tree_greedy"
+        );
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, TreeCall::LinearPropose { .. })),
+            "penalized turns must route through linear propose"
+        );
     }
 }

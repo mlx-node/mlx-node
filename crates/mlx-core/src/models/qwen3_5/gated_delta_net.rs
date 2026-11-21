@@ -9,7 +9,8 @@ use super::gated_delta::{
     GdnCarry, GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail,
     gated_delta_fused_complete_deferred, gated_delta_fused_complete_with_prepared,
     gated_delta_fused_prefill, gated_delta_split_at, gated_delta_update, gated_delta_update_fused,
-    gated_delta_update_with_tape, prefill_fused_enabled,
+    gated_delta_update_fused_deferred, gated_delta_update_tree_deferred,
+    gated_delta_update_tree_with_tape, gated_delta_update_with_tape, prefill_fused_enabled,
 };
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_MODE, LinearProj, MixerResidual, PreparedSg8, QuantizedLinear,
@@ -245,6 +246,17 @@ impl GdnLayerTape {
         cache.set(1, new_recurrent)?;
 
         // --- Conv state --------------------------------------------------
+        self.replay_conv_into(cache, snapshot_conv, accepted_steps)
+    }
+
+    /// Rebuild only `cache[0]` (`conv_state`) to the accepted prefix. Used by
+    /// CUDA deferred-GDN commit where `cache[1]` already holds `S_folded`.
+    pub(crate) fn replay_conv_into(
+        &self,
+        cache: &mut ArraysCache,
+        snapshot_conv: Option<&MxArray>,
+        accepted_steps: usize,
+    ) -> Result<()> {
         let keep = (self.conv_kernel_dim - 1) as i64;
         if keep > 0 {
             cache.set(
@@ -252,6 +264,79 @@ impl GdnLayerTape {
                 replay_conv_state(&self.qkv, snapshot_conv, keep, accepted_steps)?,
             )?;
         }
+        Ok(())
+    }
+
+    /// Rebuild `cache[0]` (`conv_state`) along an accepted speculative tree
+    /// path (`accepted_nodes`, ordered ancestor-to-descendant).
+    ///
+    /// When `is_contiguous_prefix` is true, delegates to [`Self::replay_conv_into`].
+    /// Otherwise gathers the trailing `min(keep_conv, accepted_nodes.len())`
+    /// rows from `self.qkv` (reusing the caller's `accepted_i32` when provided)
+    /// and prepends any needed tail from `snapshot_conv`.
+    pub(crate) fn replay_conv_tree_into(
+        &self,
+        cache: &mut ArraysCache,
+        snapshot_conv: Option<&MxArray>,
+        accepted_nodes: &[usize],
+        is_contiguous_prefix: bool,
+        accepted_i32: Option<&MxArray>,
+    ) -> Result<()> {
+        let keep_conv = (self.conv_kernel_dim - 1) as i64;
+        if keep_conv <= 0 {
+            return Ok(());
+        }
+        let window_len = self.qkv.shape_at(1)? as usize;
+        for &node in accepted_nodes {
+            if node >= window_len {
+                return Err(Error::from_reason(format!(
+                    "GdnLayerTape::replay_conv_tree_into: node {node} >= window {window_len}"
+                )));
+            }
+        }
+        if is_contiguous_prefix || accepted_nodes.is_empty() {
+            return self.replay_conv_into(cache, snapshot_conv, accepted_nodes.len());
+        }
+        let n = accepted_nodes.len() as i64;
+        let new_conv = if n >= keep_conv {
+            // Only gather the final `keep_conv` nodes along the accepted branch.
+            if let Some(idx_arr) = accepted_i32 {
+                let tail_idx = idx_arr.slice_axis(0, n - keep_conv, n)?;
+                self.qkv.take(&tail_idx, 1)?
+            } else {
+                let start = accepted_nodes.len() - keep_conv as usize;
+                let tail_nodes: Vec<i32> = accepted_nodes[start..]
+                    .iter()
+                    .map(|&node| node as i32)
+                    .collect();
+                let tail_idx = MxArray::from_int32(&tail_nodes, &[keep_conv])?;
+                self.qkv.take(&tail_idx, 1)?
+            }
+        } else {
+            let owned_idx;
+            let idx_ref = match accepted_i32 {
+                Some(arr) => arr,
+                None => {
+                    let nodes: Vec<i32> = accepted_nodes.iter().map(|&node| node as i32).collect();
+                    owned_idx = MxArray::from_int32(&nodes, &[n])?;
+                    &owned_idx
+                }
+            };
+            let gathered = self.qkv.take(idx_ref, 1)?;
+            let tail_keep = keep_conv - n;
+            let prior_tail = match snapshot_conv {
+                Some(state) => {
+                    let state_len = state.shape_at(1)?;
+                    state.slice_axis(1, state_len - tail_keep, state_len)?
+                }
+                None => MxArray::zeros(
+                    &[self.qkv.shape_at(0)?, tail_keep, self.qkv.shape_at(2)?],
+                    Some(self.qkv.dtype()?),
+                )?,
+            };
+            MxArray::concatenate(&prior_tail, &gathered, 1)?
+        };
+        cache.set(0, new_conv)?;
         Ok(())
     }
 }
@@ -647,6 +732,15 @@ impl GatedDeltaNet {
     /// rollback replay. When `None`, behavior is byte-identical to
     /// [`GatedDeltaNet::forward`]. All recording is by lazy `.clone()` (no
     /// eval), so it stays inside the fused MLX graph.
+    pub(crate) fn is_cuda_deferred_eligible(&self) -> bool {
+        self.key_head_dim == 128
+            && self.value_head_dim == 128
+            && self.num_k_heads > 0
+            && self.num_v_heads > 0
+            && self.num_v_heads % self.num_k_heads == 0
+            && self.norm.weight().dtype().ok() == Some(DType::BFloat16)
+    }
+
     pub(crate) fn forward_with_tape(
         &self,
         x: &MxArray,
@@ -655,7 +749,58 @@ impl GatedDeltaNet {
         use_kernel: bool,
         tape_sink: Option<&mut Option<GdnLayerTape>>,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, None, None)
+        self.forward_with_tape_impl(
+            x, mask, cache, use_kernel, tape_sink, None, None, None, None,
+        )
+    }
+
+    /// CUDA deferred-fold variant of [`Self::forward_with_tape`].
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn forward_with_tape_deferred(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(
+            x,
+            mask,
+            cache,
+            use_kernel,
+            tape_sink,
+            None,
+            None,
+            cuda_deferred,
+            None,
+        )
+    }
+
+    /// Tree-verification + CUDA deferred-fold variant of [`Self::forward_with_tape`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_tape_deferred_tree(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(
+            x,
+            mask,
+            cache,
+            use_kernel,
+            tape_sink,
+            None,
+            None,
+            cuda_deferred,
+            tree,
+        )
     }
 
     /// Explicit residual-inclusive output, with unchanged cache/tape ownership.
@@ -676,6 +821,8 @@ impl GatedDeltaNet {
             use_kernel,
             tape_sink,
             Some(MixerResidual::Source(residual)),
+            None,
+            None,
             None,
         )
     }
@@ -699,6 +846,8 @@ impl GatedDeltaNet {
             None,
             Some(MixerResidual::Store(residual)),
             None,
+            None,
+            None,
         )
     }
 
@@ -720,6 +869,8 @@ impl GatedDeltaNet {
             true,
             tape_sink,
             Some(MixerResidual::Verify(residual)),
+            None,
+            None,
             None,
         )
     }
@@ -759,6 +910,8 @@ impl GatedDeltaNet {
             None,
             residual.map(MixerResidual::Source),
             Some((plan, &mut captured)),
+            None,
+            None,
         )?;
         Ok((out, captured))
     }
@@ -824,9 +977,29 @@ impl GatedDeltaNet {
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
         residual: Option<MixerResidual<'_>>,
         capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        if let Some(tv) = tree {
+            if batch != 1 {
+                return Err(Error::from_reason(format!(
+                    "GatedDeltaNet tree forward requires batch == 1, got {batch}"
+                )));
+            }
+            if seq_len as usize != tv.tree_len {
+                return Err(Error::from_reason(format!(
+                    "GatedDeltaNet tree forward seq_len {seq_len} != tree_len {}",
+                    tv.tree_len
+                )));
+            }
+            if mask.is_some() {
+                return Err(Error::from_reason(
+                    "GatedDeltaNet tree forward does not support an explicit padding mask",
+                ));
+            }
+        }
         let rows = capture
             .as_ref()
             .map(|(plan, _)| plan.rows)
@@ -835,6 +1008,7 @@ impl GatedDeltaNet {
             && (batch != 1
                 || mask.is_some()
                 || tape_sink.is_some()
+                || tree.is_some()
                 || cache.as_deref().and_then(|c| c.get(4)).is_some())
         {
             return Err(Error::from_reason(
@@ -871,7 +1045,7 @@ impl GatedDeltaNet {
         // unmasked batch-1 `T >= 64` window — bit-identical to the
         // `prep_via_conv` -> `gated_delta_update` -> tail chain it replaces.
         // Decode/verify (`T < 64`) and the tape path never see it.
-        let prefill_prep = if tape_sink.is_none() {
+        let prefill_prep = if tape_sink.is_none() && cuda_deferred.is_none() && tree.is_none() {
             self.prefill_fused(
                 &qkv,
                 &z,
@@ -907,20 +1081,23 @@ impl GatedDeltaNet {
         // z gate): the decode/verify geometry with compact tiled heads. Same
         // bits as the gdn_prepare -> fused step chain below, which stays the
         // fallback (as does the generic path after it).
-        if let Some(complete) = self.forward_complete(
-            &qkv,
-            &z,
-            &a,
-            &b,
-            conv_state.as_ref(),
-            cache.as_deref(),
-            mask,
-            use_kernel,
-            batch,
-            seq_len,
-            !matches!(residual, Some(MixerResidual::Source(_))),
-            rows,
-        )? {
+        if cuda_deferred.is_none()
+            && tree.is_none()
+            && let Some(complete) = self.forward_complete(
+                &qkv,
+                &z,
+                &a,
+                &b,
+                conv_state.as_ref(),
+                cache.as_deref(),
+                mask,
+                use_kernel,
+                batch,
+                seq_len,
+                !matches!(residual, Some(MixerResidual::Source(_))),
+                rows,
+            )?
+        {
             if let Some(cache) = cache {
                 cache.set(
                     0,
@@ -959,11 +1136,16 @@ impl GatedDeltaNet {
         }
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
-        // gating in ONE GPU dispatch (`kernels::gdn::prepare` — Metal or CUDA,
-        // hardcoded to this family's 10240-wide 16k/48v×128 geometry).
+        // gating in ONE GPU dispatch (`kernels::gdn::prepare` or `prepare_tree`
+        // — Metal or CUDA, hardcoded to this family's 10240-wide 16k/48v×128 geometry).
         let prepared = (|| -> Option<[MxArray; 6]> {
+            let max_prepare_seq = if crate::accelerator::cuda_ops_available() {
+                4097
+            } else {
+                64
+            };
             if batch != 1
-                || seq_len >= 64
+                || seq_len >= max_prepare_seq
                 || self.conv_kernel_dim != 4
                 || self.conv_dim != 10240
                 || self.num_k_heads != 16
@@ -993,8 +1175,24 @@ impl GatedDeltaNet {
             };
             // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
             // mean) and bf16 beta — bit-faithful to the conv fallback.
-            crate::kernels::gdn::prepare(&qkv, &a, &b, conv_w, &history, scale, dt, true, true)
+            if let Some(tv) = tree {
+                crate::kernels::gdn::prepare_tree(
+                    &qkv,
+                    &a,
+                    &b,
+                    conv_w,
+                    &history,
+                    scale,
+                    dt,
+                    &tv.conv_taps_i32,
+                    true,
+                    true,
+                )
                 .ok()?
+            } else {
+                crate::kernels::gdn::prepare(&qkv, &a, &b, conv_w, &history, scale, dt, true, true)
+                    .ok()?
+            }
         })();
 
         let (q, k, v, precomputed) = if let Some([pq, pk, pv, decay, beta, history]) = prepared {
@@ -1010,6 +1208,16 @@ impl GatedDeltaNet {
                 )?;
             }
             (pq, pk, pv, Some((decay, beta)))
+        } else if let Some(tv) = tree {
+            let (q, k, v) = self.prep_via_conv_tree(
+                &qkv,
+                batch,
+                seq_len,
+                cache.as_deref_mut(),
+                conv_state,
+                &tv.conv_taps_i32,
+            )?;
+            (q, k, v, None)
         } else {
             let (q, k, v) = match prefill_prep {
                 // The conv already ran inside `prefill_fused`; only the q/k
@@ -1041,6 +1249,126 @@ impl GatedDeltaNet {
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
         let seq = seq_len as usize;
+
+        // CUDA deferred-fold verify step (linear or tree): folds the prior
+        // cycle's pending rows into `state_base` before stepping the current
+        // window/tree, storing `S_folded` back into `cache[1]` and recording
+        // this cycle's tape. Fails closed if the deferred kernel declines so no
+        // non-deferred path can silently advance `cache[1]` past `S_folded`.
+        if let Some(pending) = cuda_deferred {
+            if rows.is_some() || mask.is_some() || !crate::accelerator::cuda_ops_available() {
+                return Err(Error::from_reason(
+                    "deferred CUDA GDN step requires unmasked CUDA forward without capture splits",
+                ));
+            }
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let stepped = if let Some(tv) = tree {
+                gated_delta_update_tree_deferred(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    pending,
+                    &tv.parent_i32,
+                    mask,
+                    use_kernel,
+                    self.tiled_gguf_layout,
+                    precomputed.as_ref().map(|(d, b)| (d, b)),
+                    GdnTail {
+                        z: &z,
+                        norm_weight: self.norm.weight(),
+                        eps: self.norm.eps(),
+                        state_dst: None,
+                    },
+                    tape_sink.is_some().then_some(&mut kernel_sink),
+                )?
+            } else {
+                gated_delta_update_fused_deferred(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    pending,
+                    mask,
+                    use_kernel,
+                    self.tiled_gguf_layout,
+                    precomputed.as_ref().map(|(d, b)| (d, b)),
+                    GdnTail {
+                        z: &z,
+                        norm_weight: self.norm.weight(),
+                        eps: self.norm.eps(),
+                        state_dst: None,
+                    },
+                    tape_sink.is_some().then_some(&mut kernel_sink),
+                )?
+            };
+            let Some((gated, committed_state)) = stepped else {
+                return Err(Error::from_reason("deferred CUDA GDN step kernel declined"));
+            };
+            if let Some(cache) = cache {
+                cache.set(1, committed_state)?;
+            }
+            #[cfg(test)]
+            note_route(GdnRoute::FusedTail);
+            if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
+            {
+                *sink = Some(GdnLayerTape {
+                    kernel,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                });
+            }
+            return self.out_proj.forward_mixer_output(&gated, None, residual);
+        }
+
+        // Non-deferred tree fallback (e.g. Metal/CPU or unit-test geometries).
+        if let Some(tv) = tree {
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let (y, new_state) = gated_delta_update_tree_with_tape(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                &tv.parent_i32,
+                self.tiled_gguf_layout,
+                precomputed.as_ref().map(|(d, b)| (d, b)),
+                tape_sink.is_some().then_some(&mut kernel_sink),
+            )?;
+            if let Some(cache) = cache {
+                cache.set(1, new_state)?;
+            }
+            #[cfg(test)]
+            note_route(GdnRoute::Chain);
+            if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
+            {
+                *sink = Some(GdnLayerTape {
+                    kernel,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                });
+            }
+            let z = z.reshape(&[
+                batch,
+                seq_len,
+                self.num_v_heads as i64,
+                self.value_head_dim as i64,
+            ])?;
+            let y_normed = self.norm.forward(&y, Some(&z))?;
+            let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
+            return self.out_proj.forward_mixer_output(&y_flat, None, residual);
+        }
 
         // Fused tail: recurrence + gated norm + z gate in one dispatch (the
         // production decode/verify geometry). Slot 2 of the cache, when a
@@ -1242,7 +1570,66 @@ impl GatedDeltaNet {
             }
             result
         } else {
-            if self.tiled_gguf_layout {
+            let mut start_state_opt = None;
+            if mask.is_none()
+                && batch == 1
+                && use_kernel
+                && crate::accelerator::cuda_ops_available()
+                && self.key_head_dim == 128
+                && self.value_head_dim == 128
+                && let Some((decay, beta)) = precomputed.as_ref()
+            {
+                let start_state = match recurrent_state {
+                    Some(s) => s.clone(),
+                    None => MxArray::zeros(
+                        &[
+                            1,
+                            self.num_v_heads as i64,
+                            self.value_head_dim as i64,
+                            self.key_head_dim as i64,
+                        ],
+                        Some(crate::array::DType::Float32),
+                    )?,
+                };
+                if let Some((y_flat, new_state)) = crate::kernels::gdn::prefill_chain_gated(
+                    &q,
+                    &k,
+                    &v,
+                    decay,
+                    beta,
+                    &start_state,
+                    &z,
+                    self.norm.weight(),
+                    self.norm.eps(),
+                    self.tiled_gguf_layout,
+                )? {
+                    if let Some(cache) = cache {
+                        cache.set(1, new_state)?;
+                    }
+                    #[cfg(test)]
+                    note_route(GdnRoute::Chain);
+                    return self.out_proj.forward_mixer_output(&y_flat, None, residual);
+                }
+                start_state_opt = Some(start_state);
+            }
+            let cuda_chain = if let (Some(start_state), Some((decay, beta))) =
+                (start_state_opt.as_ref(), precomputed.as_ref())
+            {
+                crate::kernels::gdn::prefill_chain(
+                    &q,
+                    &k,
+                    &v,
+                    decay,
+                    beta,
+                    start_state,
+                    self.tiled_gguf_layout,
+                )?
+            } else {
+                None
+            };
+            if let Some(pair) = cuda_chain {
+                pair
+            } else if self.tiled_gguf_layout {
                 gated_delta_update_with_tape(
                     &q,
                     &k,
@@ -2068,6 +2455,76 @@ impl GatedDeltaNet {
         use_kernel: bool,
     ) -> Result<(MxArray, MxArray, MxArray)> {
         let (q, k, v) = self.prep_conv_qkv(qkv, batch, seq_len, cache, conv_state, use_kernel)?;
+        let (q, k) = self.norm_qk(&q, &k)?;
+        Ok((q, k, v))
+    }
+
+    /// Tree-conv1d fallback when fused CUDA `prepare_tree` does not apply
+    /// (Metal/CPU or non-10240 test geometries). Matches `mlx_gdn_prepare_tree_cuda`
+    /// tap indexing (`src < 0 -> history[keep + src]`, `src >= 0 -> qkv[src]`).
+    fn prep_via_conv_tree(
+        &self,
+        qkv: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        cache: Option<&mut ArraysCache>,
+        conv_state: Option<MxArray>,
+        conv_taps: &MxArray,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let kd = i64::from(self.conv_kernel_dim);
+        let keep = kd - 1;
+        let conv_dim = i64::from(self.conv_dim);
+        let dtype = qkv.dtype()?;
+        let history = match conv_state {
+            Some(s) => s,
+            None => MxArray::zeros(&[batch, keep, conv_dim], Some(dtype))?,
+        };
+        let combined = MxArray::concatenate(&history, qkv, 1)?;
+        if let Some(cache) = cache {
+            let total_len = combined.shape_at(1)?;
+            if total_len >= keep {
+                let tail = combined.slice_axis(1, total_len - keep, total_len)?;
+                cache.set(0, tail)?;
+            }
+        }
+        let shift = MxArray::from_int32(&[keep as i32], &[1])?;
+        let shifted = conv_taps.add(&shift)?.reshape(&[seq_len * kd])?;
+        let gathered = combined
+            .take(&shifted, 1)?
+            .reshape(&[batch, seq_len, kd, conv_dim])?;
+        let w = self
+            .conv1d
+            .get_weight()
+            .reshape(&[conv_dim, kd])?
+            .transpose(Some(&[1, 0]))?
+            .reshape(&[1, 1, kd, conv_dim])?
+            .astype(dtype)?;
+        let conv_raw = gathered
+            .astype(DType::Float32)?
+            .mul(&w.astype(DType::Float32)?)?
+            .sum(Some(&[2]), Some(false))?
+            .astype(dtype)?;
+        let conv_out = Activations::sigmoid_mul_compiled(&conv_raw, &conv_raw)?;
+        let conv_split =
+            conv_out.split_sections(&[self.key_dim as i64, (self.key_dim * 2) as i64], 2)?;
+        let q = conv_split[0].reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads as i64,
+            self.key_head_dim as i64,
+        ])?;
+        let k = conv_split[1].reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads as i64,
+            self.key_head_dim as i64,
+        ])?;
+        let v = conv_split[2].reshape(&[
+            batch,
+            seq_len,
+            self.num_v_heads as i64,
+            self.value_head_dim as i64,
+        ])?;
         let (q, k) = self.norm_qk(&q, &k)?;
         Ok((q, k, v))
     }
@@ -3381,6 +3838,8 @@ mod tests {
                 Some(&mut taped),
                 None,
                 Some((&GdnCapturePlan { rows: &[4] }, &mut captured)),
+                None,
+                None,
             )
             .is_err()
         );
@@ -3394,6 +3853,8 @@ mod tests {
                 None,
                 None,
                 Some((&GdnCapturePlan { rows: &[4] }, &mut captured)),
+                None,
+                None,
             )
             .is_err()
         );
@@ -3532,6 +3993,162 @@ mod tests {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// End-to-end Wave B2a CUDA tree GDN parity test:
+    /// 1. Prime prefix state (5 tokens).
+    /// 2. Run cycle 1 on a 6-node branching tree (`parent = [-1, 0, 1, 0, 3, 4]`)
+    ///    using `forward_with_tape_deferred_tree` (`prepare_tree` + `tree_step_deferred`).
+    /// 3. Commit non-contiguous branch `[0, 3, 4, 5]` via `commit_tree_dflash2_deferred`.
+    /// 4. Run cycle 2 (a 3-node chain) folding cycle 1's `prev_indices = Some([0, 3, 4, 5])`
+    ///    through `forward_with_tape_deferred_tree` (both `tree = Some` and `tree = None` paths).
+    /// 5. Settle via `settle_flat_dflash2_deferred`.
+    ///
+    /// Every output row on `[0, 3, 4, 5]` + cycle 2 and the final settled
+    /// `(conv_state, recurrent_state)` must match running the exact accepted
+    /// branch sequentially as a 1D chain.
+    #[test]
+    fn tree_forward_deferred_commit_and_settle_match_branch_chain() -> Result<()> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(());
+        }
+        use crate::models::qwen3_5::layer_cache::{
+            CudaPendingGdn, Qwen3_5LayerCache, commit_tree_dflash2_deferred,
+            settle_flat_dflash2_deferred, snapshot_flat_dflash2,
+        };
+        use crate::models::qwen3_5::verify_tree::TreeDeviceViews;
+
+        let net = capture_net_heads(48, false);
+        let prefix = exact_bf16(&[1, 5, 64], 101);
+        let mut ref_cache = ArraysCache::new(2);
+        net.forward(&prefix, None, Some(&mut ref_cache), true)?;
+        MxArray::eval_arrays(&[ref_cache.get(0).unwrap(), ref_cache.get(1).unwrap()])?;
+
+        let mut tree_caches = vec![Qwen3_5LayerCache::Linear(copy_cache(&ref_cache))];
+        let mut pending: Vec<Option<CudaPendingGdn>> = vec![None];
+
+        // 6-node branching tree:
+        //   0 (root) -> 1 -> 2
+        //   0 (root) -> 3 -> 4 -> 5
+        let x_tree = exact_bf16(&[1, 6, 64], 202);
+        let tv1 = TreeDeviceViews {
+            depths_i32: MxArray::from_int32(&[0, 1, 2, 1, 2, 3], &[6])?,
+            mask_u32: MxArray::from_uint32(&[1, 3, 7, 9, 25, 57], &[6])?,
+            parent_i32: MxArray::from_int32(&[-1, 0, 1, 0, 3, 4], &[6])?,
+            conv_taps_i32: MxArray::from_int32(
+                &[
+                    -3, -2, -1, 0, // node 0
+                    -2, -1, 0, 1, // node 1
+                    -1, 0, 1, 2, // node 2
+                    -2, -1, 0, 3, // node 3
+                    -1, 0, 3, 4, // node 4
+                    0, 3, 4, 5, // node 5
+                ],
+                &[6, 4],
+            )?,
+            tree_len: 6,
+        };
+
+        // Cycle 1: tree forward with deferred fold (pending = None).
+        let snap1 = snapshot_flat_dflash2(&tree_caches)?;
+        let mut tape1 = None;
+        let out_tree1 = net.forward_with_tape_deferred_tree(
+            &x_tree,
+            None,
+            tree_caches[0].as_arrays_cache_mut(),
+            true,
+            Some(&mut tape1),
+            Some(pending[0].as_ref()),
+            Some(&tv1),
+        )?;
+        pending[0] = None;
+
+        // Commit non-contiguous accepted branch [0, 3, 4, 5].
+        let accepted1 = [0usize, 3, 4, 5];
+        let tapes1 = vec![tape1];
+        commit_tree_dflash2_deferred(
+            &mut tree_caches,
+            &snap1,
+            &tapes1,
+            &accepted1,
+            false,
+            false,
+            &mut pending,
+            "tree_gdn_test_cycle1",
+        )?;
+        assert!(
+            pending[0]
+                .as_ref()
+                .is_some_and(|p| p.keep == 4 && p.prev_indices.is_some())
+        );
+
+        // Cycle 2: 3-node chain with `tree = None` (verifying `fused_step_deferred`
+        // handles non-contiguous `prev_indices` from cycle 1!).
+        let x_chain2 = exact_bf16(&[1, 3, 64], 303);
+        let snap2 = snapshot_flat_dflash2(&tree_caches)?;
+        let mut tape2 = None;
+        let out_tree2 = net.forward_with_tape_deferred_tree(
+            &x_chain2,
+            None,
+            tree_caches[0].as_arrays_cache_mut(),
+            true,
+            Some(&mut tape2),
+            Some(pending[0].as_ref()),
+            None,
+        )?;
+        pending[0] = None;
+
+        // Commit partial prefix [0, 1] of cycle 2, then settle!
+        let tapes2 = vec![tape2];
+        commit_tree_dflash2_deferred(
+            &mut tree_caches,
+            &snap2,
+            &tapes2,
+            &[0, 1],
+            true,
+            true,
+            &mut pending,
+            "tree_gdn_test_cycle2",
+        )?;
+        settle_flat_dflash2_deferred(&mut tree_caches, &mut pending)?;
+        assert!(pending[0].is_none());
+
+        // Reference: run accepted branch [0, 3, 4, 5] then [0, 1] of cycle 2 linearly.
+        let branch_idx = MxArray::from_int32(&[0, 3, 4, 5], &[4])?;
+        let x_branch1 = x_tree.take(&branch_idx, 1)?;
+        let out_ref1 = net.forward(&x_branch1, None, Some(&mut ref_cache), true)?;
+        let out_ref2 = net.forward(&x_chain2, None, Some(&mut copy_cache(&ref_cache)), true)?;
+        let x_chain2_keep = x_chain2.slice_axis(1, 0, 2)?;
+        net.forward(&x_chain2_keep, None, Some(&mut ref_cache), true)?;
+
+        let out_tree1_branch = out_tree1.take(&branch_idx, 1)?;
+        let max_diff = |a: &MxArray, b: &MxArray| -> Result<f32> {
+            let af = a.astype(DType::Float32)?.to_float32()?;
+            let bf = b.astype(DType::Float32)?.to_float32()?;
+            Ok(af
+                .iter()
+                .zip(bf.iter())
+                .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs())))
+        };
+        assert!(
+            max_diff(&out_tree1_branch, &out_ref1)? <= 1e-2,
+            "cycle 1 branch output mismatch"
+        );
+        assert!(
+            max_diff(&out_tree2, &out_ref2)? <= 1e-2,
+            "cycle 2 output after non-contiguous fold mismatch"
+        );
+        let settled_arrays = tree_caches[0].as_arrays_cache_mut().unwrap();
+        assert_eq!(
+            raw_bits(settled_arrays.get(0).unwrap()),
+            raw_bits(ref_cache.get(0).unwrap()),
+            "settled conv_state must match branch chain bit-for-bit"
+        );
+        assert!(
+            max_diff(settled_arrays.get(1).unwrap(), ref_cache.get(1).unwrap())? <= 1e-4,
+            "settled recurrent_state mismatch"
+        );
         Ok(())
     }
 }
