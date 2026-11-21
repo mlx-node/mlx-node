@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use napi::{Error, Result};
 
-use super::cache::WindowRing;
+use super::cache::WindowRingSnapshot;
 use super::indexer::TokTail;
 use super::ladder::{Kind, RAM_STATES};
 use super::prefill::{BLOCK_ROWS, Grid, StateRow, turn_row};
@@ -84,7 +84,7 @@ impl DraftState {
 /// One trunk layer's part of a state.
 #[derive(Clone)]
 pub enum StateLayer {
-    Window(WindowRing),
+    Window(WindowRingSnapshot),
     Tail(TokTail),
 }
 

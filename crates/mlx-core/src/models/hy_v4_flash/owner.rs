@@ -22,7 +22,7 @@ use std::sync::{Arc, Weak};
 
 use napi::{Error, Result};
 
-use super::cache::{WINDOW_SLACK, WindowRing};
+use super::cache::{WINDOW_SLACK, WindowRing, WindowRingSnapshot};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{IndexerGeometry, IndexerMark, PagedIndexerState, TokTail};
 use super::mtp::{Draft, DraftMark};
@@ -91,7 +91,7 @@ fn layers_of(cfg: &HyV4FlashConfig) -> Result<Vec<CellLayer>> {
 
 /// One trunk layer's part of a mark.
 enum LayerMark {
-    Window(WindowRing),
+    Window(WindowRingSnapshot),
     Index(IndexerMark),
 }
 
@@ -166,7 +166,7 @@ impl OwnerCell {
         for (l, (c, sl)) in cell.layers.iter_mut().zip(&s.layers).enumerate() {
             let part = match (&*c, sl) {
                 (CellLayer::Window(_), StateLayer::Window(r)) if r.len() == s.row => {
-                    CellLayer::Window(r.clone())
+                    CellLayer::Window(WindowRing::from_snapshot(r, WINDOW_SLACK)?)
                 }
                 (CellLayer::Index(ix), StateLayer::Tail(t)) if t.len() == s.row => {
                     CellLayer::Index(PagedIndexerState::at(ix.layer(), t.clone()))
@@ -250,14 +250,23 @@ impl OwnerCell {
             Some(d) => Some(d.mark(self.len)?),
             None => None,
         };
-        let layers = self
-            .layers
-            .iter()
-            .map(|p| match p {
-                CellLayer::Window(r) => LayerMark::Window(r.clone()),
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for p in &self.layers {
+            layers.push(match p {
+                CellLayer::Window(r) => LayerMark::Window(r.snapshot_lazy().ok()?),
                 CellLayer::Index(ix) => LayerMark::Index(ix.mark()),
+            });
+        }
+        let live: Vec<&MxArray> = layers
+            .iter()
+            .filter_map(|lm| match lm {
+                LayerMark::Window(s) => s.rows(),
+                LayerMark::Index(_) => None,
             })
             .collect();
+        if !live.is_empty() {
+            MxArray::eval_arrays_with_context(&live, "hy_v4_flash owner mark").ok()?;
+        }
         Some(CellMark {
             len: self.len,
             recent: self.recent.clone(),
@@ -277,7 +286,9 @@ impl OwnerCell {
         }
         for (l, (p, lm)) in self.layers.iter_mut().zip(m.layers).enumerate() {
             match (p, lm) {
-                (CellLayer::Window(r), LayerMark::Window(s)) => *r = s,
+                (CellLayer::Window(r), LayerMark::Window(s)) => {
+                    *r = WindowRing::from_snapshot(&s, WINDOW_SLACK)?;
+                }
                 (CellLayer::Index(ix), LayerMark::Index(im)) => ix.restore(im)?,
                 _ => return Err(bad(format!("layer {l}: a mark of another kind"))),
             }
@@ -310,7 +321,7 @@ impl OwnerCell {
                 .layers
                 .iter()
                 .filter_map(|p| match p {
-                    CellLayer::Window(r) => r.rows(),
+                    CellLayer::Window(r) => r.buf(),
                     CellLayer::Index(_) => None,
                 })
                 .collect();
@@ -436,14 +447,24 @@ impl OwnerCell {
         } else {
             None
         };
-        let layers = self
+        let layers: Vec<StateLayer> = self
             .layers
             .iter()
             .map(|p| match p {
-                CellLayer::Window(r) => StateLayer::Window(r.clone()),
-                CellLayer::Index(ix) => StateLayer::Tail(ix.tail().clone()),
+                CellLayer::Window(r) => r.snapshot_lazy().map(StateLayer::Window),
+                CellLayer::Index(ix) => Ok(StateLayer::Tail(ix.tail().clone())),
+            })
+            .collect::<Result<_>>()?;
+        let live: Vec<&MxArray> = layers
+            .iter()
+            .filter_map(|sl| match sl {
+                StateLayer::Window(s) => s.rows(),
+                StateLayer::Tail(_) => None,
             })
             .collect();
+        if !live.is_empty() {
+            MxArray::eval_arrays_with_context(&live, "hy_v4_flash window state")?;
+        }
         Ok(Some(PrefixState {
             row: b,
             layers,

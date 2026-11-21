@@ -2196,7 +2196,7 @@ fn mmap_mode_and_prewarm_env_parsing() {
 }
 
 #[test]
-fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
+fn mmap_admission_headroom_guard_and_precedence() {
     let sizes = Sizes {
         dense_trunk: 8_003_184_948,
         dense_mtp: 2_189_929_600,
@@ -2208,6 +2208,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
     };
     let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
     let direct_bytes = sizes.direct_expert_bytes();
+    let mapped_bytes = 89_500_000_000u64;
     let p = profile(15_812);
     let ctx = 262_144usize;
     let ws = 96 * G;
@@ -2221,55 +2222,67 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         wired: 20 * G,
         ..Default::default()
     };
+    let busy_192 = HostMemory {
+        physical: 192 * G,
+        wired: 50 * G,
+        ..Default::default()
+    };
     let host_96 = HostMemory {
         physical: 96 * G,
         wired: 20 * G,
         ..Default::default()
     };
 
-    // 1. 128 GiB host with 50 GiB others + MLX_HY4_MMAP=auto admits Mmap at 8192 chunk,
-    //    wired_limit < 20 GiB, and computes a positive pre-warm budget without self-evicting.
+    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 8192 chunk
+    //    (budget 104 GiB >= dense + kv/scratch + 83.35 GiB mapped_bytes), wired_limit < 20 GiB.
     let res = select_expert_mode(
         MmapMode::Auto,
         DirectMode::Auto,
         true,
         &p,
         ctx,
-        &busy_128,
+        &quiet_128,
         &Own::default(),
         dense_mtp,
         direct_bytes,
+        mapped_bytes,
         None,
         None,
         None,
     )
     .unwrap();
     let ExpertResidency::Mmap { chunk, gate } = res else {
-        panic!("expected Mmap on 128 GiB host with 50 GiB others, got {res:?}");
+        panic!("expected Mmap on 128 GiB host with 20 GiB others, got {res:?}");
     };
     assert_eq!(chunk, 8192);
     assert!(gate.admitted);
-    assert!(
-        gate.need < 20 * G,
-        "mmap need {:.2} GiB",
-        gate.need as f64 / G as f64
+    assert_eq!(gate.mapped_bytes, mapped_bytes);
+    assert_eq!(
+        gate.need,
+        gate.dense_bytes + gate.kv_and_scratch + mapped_bytes
     );
-    assert!(direct_wired_limit(gate.need, ws) < 20 * G);
-    let mapped_bytes = 89_500_000_000u64;
+    let wired_want = gate.dense_bytes + gate.kv_and_scratch;
+    assert!(
+        wired_want < 20 * G,
+        "mmap wired need {:.2} GiB",
+        wired_want as f64 / G as f64
+    );
+    assert!(direct_wired_limit(wired_want, ws) < 20 * G);
+
     let kv_initial = direct_kv_allowance(&p, ctx);
     let warm = mmap_warm_budget(
         MmapMode::Auto,
-        &busy_128,
+        &quiet_128,
         dense_mtp,
         kv_initial,
         DIRECT_MARGIN,
         mapped_bytes,
     );
-    assert!(warm >= 50 * G && warm <= mapped_bytes);
+    assert_eq!(warm, mapped_bytes);
     assert_eq!(
         mmap_warm_budget(
             MmapMode::Off,
-            &busy_128,
+            &quiet_128,
             dense_mtp,
             kv_initial,
             DIRECT_MARGIN,
@@ -2277,7 +2290,6 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         ),
         0
     );
-    // Tight host (< 8 GiB headroom) skips pre-warm.
     let tight_warm = HostMemory {
         physical: 128 * G,
         wired: 108 * G,
@@ -2295,7 +2307,86 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         0
     );
 
-    // 2. MLX_HY4_MMAP=0 falls back cleanly to existing Direct (quiet) / Streamed (busy).
+    // 2. 128 GiB host with 50 GiB others: MLX_HY4_MMAP=auto falls back to Streamed
+    //    because budget (74 GiB) cannot hold 83.35 GiB clean file cache without thrashing.
+    for direct in [DirectMode::Auto, DirectMode::Off, DirectMode::On] {
+        let res_busy = select_expert_mode(
+            MmapMode::Auto,
+            direct,
+            true,
+            &p,
+            ctx,
+            &busy_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            mapped_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(res_busy, ExpertResidency::Streamed { .. }),
+            "128 GiB host with 50 GiB others (direct={direct:?}) must fall back to Streamed, got {res_busy:?}"
+        );
+    }
+
+    // 3. MLX_HY4_MMAP=1 forces Mmap at others = 50 GiB (and on 96 GiB host) whenever
+    //    budget >= dense + kv_and_scratch.
+    let res_force_busy = select_expert_mode(
+        MmapMode::On,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &busy_128,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        mapped_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExpertResidency::Mmap {
+        chunk: force_chunk,
+        gate: force_gate,
+    } = res_force_busy
+    else {
+        panic!("expected MLX_HY4_MMAP=1 to force Mmap at 50 GiB others, got {res_force_busy:?}");
+    };
+    assert_eq!(force_chunk, 8192);
+    assert!(force_gate.admitted);
+    assert_eq!(
+        force_gate.need,
+        force_gate.dense_bytes + force_gate.kv_and_scratch
+    );
+    assert!(force_gate.need < 20 * G);
+
+    // 4. 192 GiB host with 50 GiB others still auto-admits Mmap.
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            true,
+            &p,
+            ctx,
+            &busy_192,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            mapped_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Mmap { .. }
+    ));
+
+    // 5. MLX_HY4_MMAP=0 falls back cleanly to existing Direct (quiet) / Streamed (busy).
     let res_off_quiet = select_expert_mode(
         MmapMode::Off,
         DirectMode::Auto,
@@ -2306,6 +2397,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         &Own::default(),
         dense_mtp,
         direct_bytes,
+        mapped_bytes,
         None,
         None,
         None,
@@ -2323,6 +2415,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         &Own::default(),
         dense_mtp,
         direct_bytes,
+        mapped_bytes,
         None,
         None,
         None,
@@ -2330,7 +2423,8 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
     .unwrap();
     assert!(matches!(res_off_busy, ExpertResidency::Streamed { .. }));
 
-    // 3. MLX_HY4_MMAP=auto precedence across DirectMode::{On, Auto, Off} and physical < 100 GiB.
+    // 6. MLX_HY4_MMAP=auto precedence across DirectMode::{On, Auto, Off}, physical < 100 GiB,
+    //    and Metal unavailability.
     assert!(matches!(
         select_expert_mode(
             MmapMode::Auto,
@@ -2342,6 +2436,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
             &Own::default(),
             dense_mtp,
             direct_bytes,
+            mapped_bytes,
             None,
             None,
             None,
@@ -2352,25 +2447,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
     assert!(matches!(
         select_expert_mode(
             MmapMode::Auto,
-            DirectMode::On,
-            true,
-            &p,
-            ctx,
-            &busy_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Mmap { .. }
-    ));
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Auto,
+            DirectMode::Off,
             true,
             &p,
             ctx,
@@ -2378,6 +2455,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
             &Own::default(),
             dense_mtp,
             direct_bytes,
+            mapped_bytes,
             None,
             None,
             None,
@@ -2385,25 +2463,6 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         .unwrap(),
         ExpertResidency::Mmap { .. }
     ));
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Off,
-            true,
-            &p,
-            ctx,
-            &busy_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Mmap { .. }
-    ));
-    // Below MMAP_MIN_PHYSICAL (96 GiB), Auto skips Mmap and falls through to Direct/Streamed.
     assert!(matches!(
         select_expert_mode(
             MmapMode::Auto,
@@ -2415,6 +2474,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
             &Own::default(),
             dense_mtp,
             direct_bytes,
+            mapped_bytes,
             None,
             None,
             None,
@@ -2422,18 +2482,18 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         .unwrap(),
         ExpertResidency::Streamed { .. }
     ));
-    // Without Metal, Auto never selects Mmap.
     assert!(matches!(
         select_expert_mode(
             MmapMode::Auto,
-            DirectMode::Auto,
+            DirectMode::Off,
             false,
             &p,
             ctx,
-            &busy_128,
+            &quiet_128,
             &Own::default(),
             dense_mtp,
             direct_bytes,
+            mapped_bytes,
             None,
             None,
             None,
@@ -2442,8 +2502,8 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         ExpertResidency::Streamed { .. }
     ));
 
-    // 4. MLX_HY4_MMAP=1 admits even below 100 GiB if budget >= need, and fails loud
-    //    when mmap_need > budget or Metal is unavailable.
+    // 7. MLX_HY4_MMAP=1 admits even below 100 GiB if budget >= base need, and fails loud
+    //    when base need > budget or Metal is unavailable.
     assert!(matches!(
         select_expert_mode(
             MmapMode::On,
@@ -2455,6 +2515,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
             &Own::default(),
             dense_mtp,
             direct_bytes,
+            mapped_bytes,
             None,
             None,
             None,
@@ -2477,6 +2538,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         &Own::default(),
         dense_mtp,
         direct_bytes,
+        mapped_bytes,
         None,
         None,
         None,
@@ -2497,6 +2559,7 @@ fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
         &Own::default(),
         dense_mtp,
         direct_bytes,
+        mapped_bytes,
         None,
         None,
         None,

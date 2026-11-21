@@ -820,7 +820,7 @@ pub(crate) fn try_router_mv(xf: &MxArray, router: &Dense) -> Result<Option<MxArr
 pub fn router_logits(x: &MxArray, router: &Dense) -> Result<MxArray> {
     let xf = as_f32(x)?;
     if xf.ndim()? == 2
-        && (1..=8).contains(&xf.shape_at(0)?)
+        && (1..=16).contains(&xf.shape_at(0)?)
         && let Some(logits) = try_router_mv(&xf, router)?
     {
         return Ok(logits);
@@ -1343,5 +1343,116 @@ pub fn gguf_prefill_indirect_down(
     Ok(Some(MxArray::from_handle(
         handle,
         "hy_v4_flash gguf_prefill_indirect_down",
+    )?))
+}
+
+/// Circular row write of `src [s, width]` into `buf [cap, width]` starting at
+/// `start_slot`, wrapping modulo `cap`. Donates `buf` in place when it has no
+/// other live references.
+pub fn ring_write(buf: &MxArray, src: &MxArray, start_slot: usize, cap: usize) -> Result<MxArray> {
+    let start_i32 = i32::try_from(start_slot)
+        .map_err(|_| bad(format!("ring_write start_slot {start_slot} exceeds i32")))?;
+    let cap_i32 =
+        i32::try_from(cap).map_err(|_| bad(format!("ring_write cap {cap} exceeds i32")))?;
+    // SAFETY: buf and src are live array handles for the call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_ring_write(buf.as_raw_ptr(), src.as_raw_ptr(), start_i32, cap_i32)
+    };
+    if handle.is_null() {
+        return Err(bad(format!(
+            "ring_write rejected buf {:?}, src {:?}, start_slot {start_slot}, cap {cap}",
+            dims(buf)?,
+            dims(src)?,
+        )));
+    }
+    MxArray::from_handle(handle, "hy_v4_flash ring_write")
+}
+
+/// Fused indexer group scoring directly from a flat `[cap_g, 128]` f16 or
+/// paged `[n_blocks, index_rows, 128]` f16 pool. Returns `[S, n_groups]` f32,
+/// or `Ok(None)` when Metal or shape is unsupported.
+pub(crate) fn try_indexer_score(
+    q: &MxArray,
+    w: &MxArray,
+    k_pool: &MxArray,
+    page_ids: Option<&MxArray>,
+    n_groups: usize,
+    start_g: usize,
+) -> Result<Option<MxArray>> {
+    let (Ok(ng_i32), Ok(sg_i32)) = (i32::try_from(n_groups), i32::try_from(start_g)) else {
+        return Ok(None);
+    };
+    if ng_i32 < 1 || sg_i32 < 0 {
+        return Ok(None);
+    }
+    let qf = as_f32(q)?;
+    let wf = as_f32(w)?;
+    let pages_ptr = page_ids.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_indexer_score(
+            qf.as_raw_ptr(),
+            wf.as_raw_ptr(),
+            k_pool.as_raw_ptr(),
+            pages_ptr,
+            ng_i32,
+            sg_i32,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash indexer_score",
+    )?))
+}
+
+/// Fused radix top-k group selection + cell expansion + causal tail + optional
+/// paged slot mapping (`page_ids[c / block_size] * block_size + c % block_size`)
+/// padded to `kmax` with `-1`. Returns `[S, kmax]` i32, or `Ok(None)` when
+/// Metal or shape is unsupported.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_indexer_topk_cells(
+    scores: &MxArray,
+    visible_groups: &MxArray,
+    tail_starts: &MxArray,
+    tail_lens: &MxArray,
+    page_ids: Option<&MxArray>,
+    n_top: usize,
+    kpool: usize,
+    kmax: usize,
+    block_size: usize,
+) -> Result<Option<MxArray>> {
+    let (Ok(nt_i32), Ok(kp_i32), Ok(km_i32), Ok(bs_i32)) = (
+        i32::try_from(n_top),
+        i32::try_from(kpool),
+        i32::try_from(kmax),
+        i32::try_from(block_size),
+    ) else {
+        return Ok(None);
+    };
+    let sf = as_f32(scores)?;
+    let pages_ptr = page_ids.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    // SAFETY: all handles are live for the call; returns a new array or null.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_indexer_topk_cells(
+            sf.as_raw_ptr(),
+            visible_groups.as_raw_ptr(),
+            tail_starts.as_raw_ptr(),
+            tail_lens.as_raw_ptr(),
+            pages_ptr,
+            nt_i32,
+            kp_i32,
+            km_i32,
+            bs_i32,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash indexer_topk_cells",
     )?))
 }

@@ -439,6 +439,13 @@ impl IndexerMark {
     }
 }
 
+/// Direct backing storage for fused indexer scoring without materializing
+/// `[cols, d]` f32 keys.
+enum ScoreKeys {
+    Flat { pool: MxArray },
+    Paged { pool: MxArray, pages: MxArray },
+}
+
 /// The pooled keys of the closed groups, in group order.
 trait PooledKeys {
     fn groups(&self) -> usize;
@@ -449,6 +456,10 @@ trait PooledKeys {
     fn read(&self, k: usize) -> Result<MxArray>;
     /// Forgets the groups past `k` (`k <= groups()`).
     fn cut(&mut self, k: usize) -> Result<()>;
+    /// Raw f16 pool view for fused scoring, when available.
+    fn score_keys(&self) -> Result<Option<ScoreKeys>> {
+        Ok(None)
+    }
 }
 
 impl PooledKeys for LatentBuf {
@@ -467,6 +478,15 @@ impl PooledKeys for LatentBuf {
     fn cut(&mut self, k: usize) -> Result<()> {
         self.truncate(k)
     }
+
+    fn score_keys(&self) -> Result<Option<ScoreKeys>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ScoreKeys::Flat {
+            pool: self.rows()?.clone(),
+        }))
+    }
 }
 
 /// A paged sequence's pooled keys: the index plane of pool layer `layer`
@@ -475,6 +495,7 @@ struct PlaneKeys<'a> {
     adapter: &'a mut PagedKVCacheAdapter,
     layer: u32,
     groups: &'a mut usize,
+    pages: Option<MxArray>,
 }
 
 impl PooledKeys for PlaneKeys<'_> {
@@ -512,6 +533,17 @@ impl PooledKeys for PlaneKeys<'_> {
         }
         *self.groups = k;
         Ok(())
+    }
+
+    fn score_keys(&self) -> Result<Option<ScoreKeys>> {
+        let Some(pages) = self.pages.as_ref() else {
+            return Ok(None);
+        };
+        let pool = self.adapter.index_pool_array(self.layer).map_err(bad)?;
+        Ok(Some(ScoreKeys::Paged {
+            pool,
+            pages: pages.clone(),
+        }))
     }
 }
 
@@ -938,7 +970,7 @@ impl Indexer {
     /// Index rows `[n, plan.kmax]` i32 (`-1` = no cell) of `call`, after
     /// `update` of the same call.
     pub fn cells(&self, w: &IndexerWeights, call: Call<'_>, st: &IndexerState) -> Result<MxArray> {
-        self.cells_in(w, call, &st.pooled, &st.tail)
+        self.cells_in(w, call, &st.pooled, &st.tail, None)
     }
 
     fn cells_in<P: PooledKeys>(
@@ -947,6 +979,7 @@ impl Indexer {
         call: Call<'_>,
         pooled: &P,
         tail: &TokTail,
+        map_pages: Option<&MxArray>,
     ) -> Result<MxArray> {
         let start = call.start;
         let n = call.x.shape_at(0)? as usize;
@@ -963,14 +996,18 @@ impl Indexer {
         let mut parts = Vec::new();
         if !plan.dense.is_empty() {
             let rows = plan.dense.len();
-            parts.push(MxArray::from_int32(
+            let dense = MxArray::from_int32(
                 &dense_rows(plan.dense.start, rows, width)?,
                 &[rows as i64, width as i64],
-            )?);
+            )?;
+            let dense = match map_pages {
+                Some(pages) => super::paged::slot_ids(pages, &dense)?,
+                None => dense,
+            };
+            parts.push(dense);
         }
         if !plan.sparse.is_empty() {
-            let keys = pooled.read(plan.cols)?.astype(DType::Float32)?;
-            parts.push(self.sparse_cells(w, call, &plan, &keys)?);
+            parts.push(self.sparse_cells(w, call, &plan, pooled, map_pages)?);
         }
         match parts.len() {
             1 => Ok(parts.swap_remove(0)),
@@ -978,13 +1015,15 @@ impl Indexer {
         }
     }
 
-    /// The picks of the scored rows over `keys [plan.cols, d]` f32.
-    fn sparse_cells(
+    /// The picks of the scored rows over `pooled` (logical cells when
+    /// `map_pages` is `None`, physical slots when `Some`).
+    fn sparse_cells<P: PooledKeys>(
         &self,
         w: &IndexerWeights,
         call: Call<'_>,
         plan: &CallPlan,
-        keys: &MxArray,
+        pooled: &P,
+        map_pages: Option<&MxArray>,
     ) -> Result<MxArray> {
         let g = &self.g;
         let start = call.start;
@@ -999,37 +1038,101 @@ impl Indexer {
         let q = self.queries(w, &rows(call.qr, sp)?, &pos)?;
         let hw = self.head_weights(w, &rows(call.x, sp)?, call.kind)?;
         let to_i32 = |v: usize| i32::try_from(v).map_err(|_| bad(format!("{v} exceeds i32")));
-        let visible = sp
-            .clone()
-            .map(|t| to_i32(g.visible(t)))
-            .collect::<Result<Vec<_>>>()?;
         let slots = g.tail_slots();
-        let mut tails = Vec::with_capacity(sp.len() * slots);
+        let mut visible = Vec::with_capacity(sp.len());
+        let mut tail_starts = Vec::with_capacity(sp.len());
+        let mut tail_lens = Vec::with_capacity(sp.len());
         for t in sp.clone() {
+            visible.push(to_i32(g.visible(t))?);
             let cells = g.tail_cells(t);
             let k = cells.len();
             if k > slots {
                 return Err(bad(format!("tail of {t} has {k} cells, {slots} slots")));
             }
-            for c in cells {
-                tails.push(to_i32(c)?);
-            }
-            tails.extend(std::iter::repeat_n(-1, slots - k));
+            tail_starts.push(to_i32(cells.start)?);
+            tail_lens.push(to_i32(k)?);
         }
+
+        let score_keys = pooled.score_keys()?;
+        let can_fused_score =
+            score_keys.is_some() && g.head_dim == 128 && (1..=16).contains(&g.n_heads);
+        let mut flat_keys_f32: Option<MxArray> = None;
+
         let (h, d) = (g.n_heads as i64, g.head_dim as i64);
-        let per = score_rows(g.n_heads, plan.cols, INDEX_CHUNK_BYTES);
+        let per = if can_fused_score {
+            (INDEX_CHUNK_BYTES / (4 * plan.cols.max(1))).max(1)
+        } else {
+            score_rows(g.n_heads, plan.cols, INDEX_CHUNK_BYTES)
+        };
         let total = sp.len();
         let mut outs = Vec::new();
         let mut lo = 0;
         while lo < total {
             let hi = (lo + per).min(total);
             let c = (hi - lo) as i64;
-            let qc = q.slice(&[lo as i64, 0, 0], &[hi as i64, h, d])?;
-            let wc = hw.slice(&[lo as i64, 0], &[hi as i64, h])?;
-            let sc = scores(&qc, &wc, keys)?;
-            let ids = pick_groups(&sc, &visible[lo..hi], g.n_top)?;
-            let tail = MxArray::from_int32(&tails[lo * slots..hi * slots], &[c, slots as i64])?;
-            let idx = MxArray::concatenate(&group_cells(&ids, g.kpool)?, &tail, 1)?;
+            let (qc, wc) = if lo == 0 && hi == total {
+                (q.clone(), hw.clone())
+            } else {
+                (
+                    q.slice(&[lo as i64, 0, 0], &[hi as i64, h, d])?,
+                    hw.slice(&[lo as i64, 0], &[hi as i64, h])?,
+                )
+            };
+            let sc = match score_keys.as_ref() {
+                Some(ScoreKeys::Flat { pool }) => {
+                    super::ops::try_indexer_score(&qc, &wc, pool, None, plan.cols, 0)?
+                }
+                Some(ScoreKeys::Paged { pool, pages }) => {
+                    super::ops::try_indexer_score(&qc, &wc, pool, Some(pages), plan.cols, 0)?
+                }
+                None => None,
+            };
+            let sc = match sc {
+                Some(sc) => sc,
+                None => {
+                    let keys = match flat_keys_f32.as_ref() {
+                        Some(k) => k,
+                        None => {
+                            flat_keys_f32.insert(pooled.read(plan.cols)?.astype(DType::Float32)?)
+                        }
+                    };
+                    scores(&qc, &wc, keys)?
+                }
+            };
+            let vis_arr = MxArray::from_int32(&visible[lo..hi], &[c])?;
+            let ts_arr = MxArray::from_int32(&tail_starts[lo..hi], &[c])?;
+            let tl_arr = MxArray::from_int32(&tail_lens[lo..hi], &[c])?;
+            let idx = match super::ops::try_indexer_topk_cells(
+                &sc,
+                &vis_arr,
+                &ts_arr,
+                &tl_arr,
+                map_pages,
+                g.n_top,
+                g.kpool,
+                plan.kmax,
+                super::paged::BLOCK as usize,
+            )? {
+                Some(idx) => idx,
+                None => {
+                    let ids = pick_groups(&sc, &visible[lo..hi], g.n_top)?;
+                    let mut tails = Vec::with_capacity((hi - lo) * slots);
+                    for idx_r in lo..hi {
+                        let s0 = tail_starts[idx_r];
+                        let tl = tail_lens[idx_r] as usize;
+                        for off in 0..tl {
+                            tails.push(s0 + off as i32);
+                        }
+                        tails.extend(std::iter::repeat_n(-1, slots - tl));
+                    }
+                    let tail = MxArray::from_int32(&tails, &[c, slots as i64])?;
+                    let logical = MxArray::concatenate(&group_cells(&ids, g.kpool)?, &tail, 1)?;
+                    match map_pages {
+                        Some(pages) => super::paged::slot_ids(pages, &logical)?,
+                        None => logical,
+                    }
+                }
+            };
             if per < total {
                 super::stats::eval(&[&idx], "hy_v4_flash indexer pick")?;
             }
@@ -1049,11 +1152,11 @@ impl Indexer {
         call: Call<'_>,
         st: &mut IndexerState,
     ) -> Result<MxArray> {
-        self.select_in(w, call, &mut st.pooled, &mut st.tail)
+        self.select_in(w, call, &mut st.pooled, &mut st.tail, None)
     }
 
     /// `select` for a paged sequence: the pooled keys go to and come from
-    /// the index plane of the adapter's active request.
+    /// the index plane of the adapter's active request. Returns logical cell ids.
     pub fn select_paged(
         &self,
         w: &IndexerWeights,
@@ -1061,12 +1164,38 @@ impl Indexer {
         st: &mut PagedIndexerState,
         adapter: &mut PagedKVCacheAdapter,
     ) -> Result<MxArray> {
+        let pages = adapter
+            .block_table()
+            .filter(|t| !t.block_ids().is_empty())
+            .map(|t| super::paged::page_ids(&t.block_ids()))
+            .transpose()?;
         let mut keys = PlaneKeys {
             adapter,
             layer: st.layer,
             groups: &mut st.groups,
+            pages,
         };
-        self.select_in(w, call, &mut keys, &mut st.tail)
+        self.select_in(w, call, &mut keys, &mut st.tail, None)
+    }
+
+    /// `select` for a paged sequence returning physical slot ids directly
+    /// (`pages[c / 32] * 32 + c % 32`, `-1` kept) via `slots`.
+    pub fn select_paged_slots(
+        &self,
+        w: &IndexerWeights,
+        call: Call<'_>,
+        st: &mut PagedIndexerState,
+        adapter: &mut PagedKVCacheAdapter,
+        slots: &super::paged::SlotMap,
+    ) -> Result<MxArray> {
+        let pages = slots.pages(adapter)?.clone();
+        let mut keys = PlaneKeys {
+            adapter,
+            layer: st.layer,
+            groups: &mut st.groups,
+            pages: Some(pages.clone()),
+        };
+        self.select_in(w, call, &mut keys, &mut st.tail, Some(&pages))
     }
 
     fn select_in<P: PooledKeys>(
@@ -1075,11 +1204,12 @@ impl Indexer {
         call: Call<'_>,
         pooled: &mut P,
         tail: &mut TokTail,
+        map_pages: Option<&MxArray>,
     ) -> Result<MxArray> {
         let mark = IndexerMark { tail: tail.clone() };
         let out = self
             .update_in(w, call.x, call.start, pooled, tail)
-            .and_then(|()| self.cells_in(w, call, pooled, tail));
+            .and_then(|()| self.cells_in(w, call, pooled, tail, map_pages));
         if out.is_err() {
             restore_in(pooled, tail, mark)?;
         }

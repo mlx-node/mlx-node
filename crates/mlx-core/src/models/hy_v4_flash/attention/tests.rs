@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use super::*;
 use crate::models::deepseek_v41::ops::rope_angle;
-use crate::models::hy_v4_flash::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing};
+use crate::models::hy_v4_flash::cache::{
+    LatentBuf, LayerCache, WINDOW_SLACK, WindowKeys, WindowRing,
+};
 use crate::models::hy_v4_flash::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use crate::models::hy_v4_flash::moe::RowKind;
 use crate::models::hy_v4_flash::sparse::{
@@ -562,29 +564,56 @@ fn first_col(x: &MxArray, width: usize) -> Vec<f32> {
 #[test]
 fn window_ring_keeps_window_plus_slack() {
     let mut ring = WindowRing::new(4, WINDOW_SLACK, 2);
-    let (keys, first) = ring.append(&positions(0..5, 2), 0).unwrap();
-    assert_eq!((first, first_col(&keys, 2)), (0, vec![0., 1., 2., 3., 4.]));
-    let (keys, first) = ring.append(&positions(5..9, 2), 5).unwrap();
-    assert_eq!(first, 0);
-    assert_eq!(keys.shape_at(0).unwrap(), 9);
+    match ring.append(&positions(0..5, 2), 0).unwrap() {
+        WindowKeys::Ring { keys, cap } => {
+            assert_eq!(cap, 7);
+            let vals = first_col(keys, 2);
+            assert_eq!(vals[..5], [0., 1., 2., 3., 4.]);
+        }
+        WindowKeys::Linear { .. } => panic!("expected Ring for initial 5 rows in cap 7"),
+    }
+    match ring.append(&positions(5..9, 2), 5).unwrap() {
+        WindowKeys::Ring { keys, cap } => {
+            assert_eq!(cap, 7);
+            let vals = first_col(keys, 2);
+            for p in 2..9 {
+                assert_eq!(vals[p % cap], p as f32);
+            }
+        }
+        WindowKeys::Linear { .. } => panic!("expected Ring for 4 rows in cap 7"),
+    }
     assert_eq!(ring.kept(), 7);
-    let (keys, first) = ring.append(&positions(9..10, 2), 9).unwrap();
-    assert_eq!(
-        (first, first_col(&keys, 2)),
-        (2, (2..10).map(|p| p as f32).collect())
-    );
+    match ring.append(&positions(9..10, 2), 9).unwrap() {
+        WindowKeys::Ring { keys, cap } => {
+            let vals = first_col(keys, 2);
+            for p in 3..10 {
+                assert_eq!(vals[p % cap], p as f32);
+            }
+        }
+        WindowKeys::Linear { .. } => panic!("expected Ring for decode row"),
+    }
     assert!(ring.append(&positions(0..1, 2), 4).is_err());
 
-    let snap = ring.clone();
+    let snap = ring.snapshot().unwrap();
     ring.truncate(7).unwrap();
     assert_eq!((ring.len(), ring.kept()), (7, 4));
     let mut v = positions(7..8, 2);
     v = v.mul_scalar(10.0).unwrap();
-    let (keys, first) = ring.append(&v, 7).unwrap();
-    assert_eq!((first, first_col(&keys, 2)), (3, vec![3., 4., 5., 6., 70.]));
+    match ring.append(&v, 7).unwrap() {
+        WindowKeys::Ring { keys, cap } => {
+            let vals = first_col(keys, 2);
+            let got: Vec<f32> = (3..8).map(|p| vals[p % cap]).collect();
+            assert_eq!(got, vec![3., 4., 5., 6., 70.]);
+        }
+        WindowKeys::Linear { .. } => panic!("expected Ring after rollback"),
+    }
     assert!(ring.truncate(5).is_err());
     assert_eq!(snap.len(), 10);
     assert_eq!(snap.kept(), 7);
+    assert_eq!(
+        first_col(snap.rows().unwrap(), 2),
+        (3..10).map(|p| p as f32).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -601,17 +630,15 @@ fn window_ring_defers_appends_and_truncates_within_slack_without_eval() {
         assert_eq!(stats::deferred(), 0);
         let before_evals = stats::thread_evals();
 
-        // total <= keep (0 extra copy, deferred)
         ring.append(&positions(0..5, 2), 0).unwrap();
         assert_eq!(stats::deferred(), 1);
         assert_eq!(stats::thread_evals(), before_evals);
 
-        // total - hold <= WINDOW_SLACK + 1 (slice view, deferred)
         ring.append(&positions(5..8, 2), 5).unwrap();
         assert_eq!(stats::deferred(), 2);
         assert_eq!(stats::thread_evals(), before_evals);
 
-        // n >= keep (deep_copy cuts lineage, deferred)
+        // Large prefill chunk (n >= cap) returns Linear keys and updates ring lazily.
         ring.append(&positions(8..16, 2), 8).unwrap();
         assert_eq!(stats::deferred(), 3);
         assert_eq!(stats::thread_evals(), before_evals);
@@ -628,7 +655,7 @@ fn window_ring_defers_appends_and_truncates_within_slack_without_eval() {
 
     // Outside DeferScope: truncate with drop <= WINDOW_SLACK triggers 0 evals
     // and keeps snapshots independent with exact rollback contents.
-    let snap = ring.clone();
+    let snap = ring.snapshot().unwrap();
     let want_snap = first_col(snap.rows().unwrap(), 2);
     assert_eq!(want_snap, (9..16).map(|p| p as f32).collect::<Vec<_>>());
 
@@ -636,14 +663,20 @@ fn window_ring_defers_appends_and_truncates_within_slack_without_eval() {
     ring.truncate(16 - WINDOW_SLACK).unwrap();
     assert_eq!(stats::thread_evals(), before_evals);
     assert_eq!((ring.len(), ring.kept()), (13, 4));
-    assert_eq!(first_col(ring.rows().unwrap(), 2), vec![9., 10., 11., 12.]);
+    assert_eq!(
+        first_col(ring.snapshot().unwrap().rows().unwrap(), 2),
+        vec![9., 10., 11., 12.]
+    );
 
     let replacement = positions(13..14, 2).mul_scalar(10.0).unwrap();
-    let (keys, first) = ring.append(&replacement, 13).unwrap();
-    assert_eq!(
-        (first, first_col(&keys, 2)),
-        (9, vec![9., 10., 11., 12., 130.])
-    );
+    match ring.append(&replacement, 13).unwrap() {
+        WindowKeys::Ring { keys, cap } => {
+            let vals = first_col(keys, 2);
+            let got: Vec<f32> = (9..14).map(|p| vals[p % cap]).collect();
+            assert_eq!(got, vec![9., 10., 11., 12., 130.]);
+        }
+        WindowKeys::Linear { .. } => panic!("expected Ring on single-row append"),
+    }
     assert_eq!(first_col(snap.rows().unwrap(), 2), want_snap);
     assert_eq!(
         first_col(latent.rows().unwrap(), 2)[..3].to_vec(),
@@ -1748,5 +1781,143 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
+    use crate::models::hy_v4_flash::sparse::try_sliding_sink_attention_prefill;
+
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        return;
+    }
+    crate::models::hy_v4_flash::exact_f32();
+    let (d, vw, window) = (576usize, 512i64, 512usize);
+    let scale = 0.0625f32;
+
+    // Circular ring (unwrapped + wrapped) and linear window across S = 16, 17, 50, 64, 128.
+    let cases: &[(usize, usize, usize, bool, usize, usize, u64)] = &[
+        // (s, h, start_pos, is_ring, ring_cap, first_key, seed)
+        (16, 64, 0, true, 540, 0, 401),
+        (17, 64, 500, true, 540, 0, 409),
+        (50, 32, 600, true, 650, 0, 419),
+        (64, 64, 600, true, 650, 0, 421),
+        (128, 64, 700, true, 650, 0, 431),
+        (64, 64, 0, false, 0, 0, 433),
+        (128, 64, 512, false, 0, 12, 439),
+        (128, 32, 1024, false, 0, 513, 443),
+    ];
+
+    for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in cases {
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(s * h * d, 1.0), &[s, h, d]);
+        let key_rows = if is_ring {
+            ring_cap
+        } else {
+            start_pos + s - first_key
+        };
+        let keys = arr(&r.vec(key_rows * d, 1.0), &[key_rows, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let mut sinks_v = r.vec(h, 2.0);
+        sinks_v[0] = -20.0;
+        sinks_v[1] = 40.0;
+        sinks_v[2] = 0.0;
+        sinks_v[h - 1] = 40.0;
+        let sinks = arr(&sinks_v, &[h]);
+
+        let got_arr = try_sliding_sink_attention_prefill(
+            &q, &keys, &sinks, vw, scale, start_pos, is_ring, ring_cap, window, first_key,
+        )
+        .unwrap()
+        .expect("expected sliding NAX prefill kernel");
+        let got = read(&got_arr);
+
+        let idx_v = if is_ring {
+            window_ring_rows(start_pos, s, ring_cap, window)
+        } else {
+            window_rows(start_pos, s, first_key, window)
+        };
+        let ia = MxArray::from_int32(&idx_v, &[s as i64, window as i64]).unwrap();
+        let want = read(
+            &gather_rows_reference(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale).unwrap(),
+        );
+        assert_eq!(got.len(), want.len());
+
+        let mut max_abs = 0.0f32;
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (&g, &w) in got.iter().zip(&want) {
+            assert!(
+                g.is_finite(),
+                "non-finite sliding NAX output S={s} H={h} ring={is_ring}"
+            );
+            max_abs = max_abs.max((g - w).abs());
+            let df = f64::from(g - w);
+            let wf = f64::from(w);
+            sum_sq_err += df * df;
+            sum_sq_ref += wf * wf;
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref.max(1e-30)).sqrt();
+        eprintln!(
+            "[sliding_nax] S={s} H={h} start={start_pos} ring={is_ring} cap={ring_cap} first={first_key}: max_abs={max_abs:.3e} rel_l2={rel_l2:.3e}"
+        );
+        assert!(
+            max_abs <= 1e-5 && rel_l2 <= 1e-5,
+            "sliding NAX S={s} H={h} start={start_pos} ring={is_ring}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+        );
+    }
+
+    // Exercise actual WindowRing::append across wrap-around (both Ring and Linear returns).
+    let mut r = Rng(449);
+    let h = 64usize;
+    let mut ring = WindowRing::new(window, WINDOW_SLACK, d as i64);
+    let pre = arr(&r.vec(600 * d, 1.0), &[600, d]);
+    let _ = ring.append(&pre, 0).unwrap();
+    for (start, s) in [
+        (600usize, 16usize),
+        (616usize, 64usize),
+        (680usize, 128usize),
+    ] {
+        let chunk = arr(&r.vec(s * d, 1.0), &[s, d]);
+        let wk = ring.append(&chunk, start).unwrap();
+        let q = arr(&r.vec(s * h * d, 1.0), &[s, h, d]);
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+        let (keys, is_ring, cap, first, idx_v) = match &wk {
+            WindowKeys::Ring { keys, cap } => (
+                *keys,
+                true,
+                *cap,
+                0usize,
+                window_ring_rows(start, s, *cap, window),
+            ),
+            WindowKeys::Linear { keys, first } => (
+                keys,
+                false,
+                0usize,
+                *first,
+                window_rows(start, s, *first, window),
+            ),
+        };
+        let got = read(
+            &try_sliding_sink_attention_prefill(
+                &q, keys, &sinks, vw, scale, start, is_ring, cap, window, first,
+            )
+            .unwrap()
+            .expect("WindowRing sliding NAX"),
+        );
+        let ia = MxArray::from_int32(&idx_v, &[s as i64, window as i64]).unwrap();
+        let want =
+            read(&gather_rows_reference(&q, KeyRows::Whole(keys), &ia, vw, &sinks, scale).unwrap());
+        let max_abs = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 1e-5,
+            "WindowRing append start={start} S={s} ring={is_ring}: max_abs={max_abs:e}"
+        );
     }
 }

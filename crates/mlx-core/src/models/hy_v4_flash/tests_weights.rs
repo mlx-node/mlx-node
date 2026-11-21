@@ -775,9 +775,17 @@ fn q8_dense_prefill_nax_parity() {
 #[test]
 fn q8_grouped_prefill_nax_parity() {
     use super::attention::grouped_mm_t_mgh;
-    use super::moe::with_prefill_q8_nax;
+    use super::moe::{prefill_q8_grouped_nax_enabled, with_prefill_q8_nax};
 
     crate::models::hy_v4_flash::exact_f32();
+    if std::env::var("MLX_HY4_PREFILL_Q8_GROUPED_NAX").as_deref() != Ok("0")
+        && std::env::var("MLX_HY4_PREFILL_Q8_NAX").as_deref() != Ok("0")
+    {
+        assert!(
+            prefill_q8_grouped_nax_enabled(),
+            "3-MMA grouped Q8 NAX should be enabled by default"
+        );
+    }
 
     // k_b (K=192, N=512) and v_b (K=512, N=256) across M = 17, 64, 256, 2048.
     let cases: [(usize, usize, usize, usize); 7] = [
@@ -815,9 +823,17 @@ fn q8_grouped_prefill_nax_parity() {
             read(&grouped_mm_t_mgh(&sym, &x, g as i64).unwrap())
         });
         let rel_sym = rel_l2(&y_sym, &y_ref);
+        let max_abs_sym = y_sym
+            .iter()
+            .zip(&y_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[grouped_q8_nax] SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:.3e} max_abs={max_abs_sym:.3e}"
+        );
         assert!(
-            rel_sym < 1e-3,
-            "grouped prefill SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:e}"
+            rel_sym <= 5e-6,
+            "grouped prefill SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:e} max_abs={max_abs_sym:e}"
         );
 
         if m == 64 {
@@ -825,9 +841,17 @@ fn q8_grouped_prefill_nax_parity() {
                 read(&grouped_mm_t_mgh(&qmm, &x, g as i64).unwrap())
             });
             let rel_qmm = rel_l2(&y_qmm, &y_ref);
+            let max_abs_qmm = y_qmm
+                .iter()
+                .zip(&y_ref)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "[grouped_q8_nax] Qmm   M={m} G={g} K={k} N={n}: rel_l2={rel_qmm:.3e} max_abs={max_abs_qmm:.3e}"
+            );
             assert!(
-                rel_qmm < 1e-3,
-                "grouped prefill Qmm M={m} G={g} K={k} N={n}: rel_l2={rel_qmm:e}"
+                rel_qmm <= 5e-6,
+                "grouped prefill Qmm M={m} G={g} K={k} N={n}: rel_l2={rel_qmm:e} max_abs={max_abs_qmm:e}"
             );
         }
     }

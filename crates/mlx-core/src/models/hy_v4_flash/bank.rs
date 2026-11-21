@@ -35,7 +35,7 @@ use napi::{Error, Result};
 use super::config::MoeConfig;
 use super::kq_slot;
 use super::scan::{ExpertClass, ExpertLayer, Located};
-use crate::array::alloc::{DstPtrs, OutLayout};
+use crate::array::alloc::{DstPtrs, MetalResidencySet, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
 use crate::moe_stream::cache::{Cache, Source};
@@ -1917,11 +1917,12 @@ struct MmapLayer {
 }
 
 struct MmapExpertBank {
-    // Declared before `_shards` and `layers` so Drop stops and joins the
-    // pre-warmer thread before any mapped view or shard is released.
+    // Drop order is load-bearing: join pre-warm, release Metal residency set,
+    // drop MTL::Buffer arrays (`layers`), then release shard Arcs (`_shards`).
     _warm: Option<MmapWarmHandle>,
-    _shards: Vec<Arc<MmapShard>>,
+    rset: Option<MetalResidencySet>,
     layers: Vec<MmapLayer>,
+    _shards: Vec<Arc<MmapShard>>,
     layer_to_idx: Vec<Option<usize>>,
     uses: [AtomicUsize; 2],
     slot_bytes: [u64; 2],
@@ -1931,6 +1932,13 @@ struct MmapExpertBank {
 }
 
 impl MmapExpertBank {
+    fn set_in_turn(&self, active: bool) {
+        self.in_turn.store(active, Ordering::Release);
+        if active && let Some(rset) = &self.rset {
+            rset.request();
+        }
+    }
+
     #[cfg(unix)]
     fn new(
         n_experts: usize,
@@ -2100,10 +2108,17 @@ impl MmapExpertBank {
             None
         };
 
+        let buf_refs: Vec<&MxArray> = layers
+            .iter()
+            .flat_map(|l| l.projs.iter().map(|p| &p.buf))
+            .collect();
+        let rset = MetalResidencySet::create(&buf_refs);
+
         Ok(Self {
             _warm: warm,
-            _shards: shards,
+            rset,
             layers,
+            _shards: shards,
             layer_to_idx,
             uses: [AtomicUsize::new(0), AtomicUsize::new(0)],
             slot_bytes,
@@ -2748,7 +2763,7 @@ impl KqBank {
     pub fn set_in_turn(&self, active: bool) {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => d.in_turn.store(active, Ordering::Release),
-            Some(ResidentBank::Mmap(m)) => m.in_turn.store(active, Ordering::Release),
+            Some(ResidentBank::Mmap(m)) => m.set_in_turn(active),
             None => lock(&self.inner).in_turn = active,
         }
     }
@@ -2762,7 +2777,7 @@ impl KqBank {
                 return Ok(false);
             }
             Some(ResidentBank::Mmap(mmap)) => {
-                mmap.in_turn.store(true, Ordering::Release);
+                mmap.set_in_turn(true);
                 return Ok(false);
             }
             None => {}

@@ -202,7 +202,10 @@ fn q8_wave_rows_equal_each_owner_alone() {
         .collect();
     let inputs: Vec<Vec<f32>> = next.iter().map(|&n| r.vec(n * DIM, 2.0)).collect();
 
-    let mut alone_rings = rings.clone();
+    let mut alone_rings: Vec<WindowRing> = rings
+        .iter()
+        .map(|ring| WindowRing::from_snapshot(&ring.snapshot().unwrap(), WINDOW_SLACK).unwrap())
+        .collect();
     let alone: Vec<Vec<f32>> = alone_rings
         .iter_mut()
         .zip(&inputs)

@@ -254,6 +254,97 @@ mlx_array* mlx_array_from_mmap_readonly(void* aligned_ptr,
 #endif
 }
 
+// Standing Metal residency set over existing array buffers so macOS keeps
+// mmap GPU page tables resident across command buffers. Caller must destroy
+// the set before releasing the backing buffers.
+void* mlx_metal_residency_set_create(mlx_array* const* arrays, size_t count) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!arrays || count == 0 || !mlx::core::metal::is_available()) {
+      return nullptr;
+    }
+    if (__builtin_available(macOS 15, iOS 18, *)) {
+      auto* mtl_dev = mlx::core::metal::device(Device::gpu).mtl_device();
+      if (!mtl_dev || !mtl_dev->supportsFamily(MTL::GPUFamilyMetal3)) {
+        return nullptr;
+      }
+      auto pool = mlx::core::metal::new_scoped_memory_pool();
+      auto* desc = MTL::ResidencySetDescriptor::alloc()->init()->autorelease();
+      desc->setInitialCapacity(static_cast<NS::UInteger>(count));
+      NS::Error* error = nullptr;
+      MTL::ResidencySet* rset = mtl_dev->newResidencySet(desc, &error);
+      if (!rset) {
+        if (error && error->localizedDescription()) {
+          std::fprintf(stderr, "[MLX] metal_residency_set_create: %s\n",
+                       error->localizedDescription()->utf8String());
+        }
+        return nullptr;
+      }
+      size_t added = 0;
+      for (size_t i = 0; i < count; ++i) {
+        if (!arrays[i]) continue;
+        auto* arr = reinterpret_cast<array*>(arrays[i]);
+        void* buf_ptr = arr->buffer().ptr();
+        if (!buf_ptr) continue;
+        rset->addAllocation(static_cast<MTL::Allocation*>(buf_ptr));
+        ++added;
+      }
+      if (added == 0) {
+        rset->release();
+        return nullptr;
+      }
+      rset->commit();
+      rset->requestResidency();
+      return static_cast<void*>(rset);
+    }
+    return nullptr;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[MLX] metal_residency_set_create: %s\n", e.what());
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+#else
+  (void)arrays;
+  (void)count;
+  return nullptr;
+#endif
+}
+
+void mlx_metal_residency_set_request(void* handle) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!handle) return;
+    if (__builtin_available(macOS 15, iOS 18, *)) {
+      auto pool = mlx::core::metal::new_scoped_memory_pool();
+      static_cast<MTL::ResidencySet*>(handle)->requestResidency();
+    }
+  } catch (...) {
+  }
+#else
+  (void)handle;
+#endif
+}
+
+void mlx_metal_residency_set_destroy(void* handle) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!handle) return;
+    if (__builtin_available(macOS 15, iOS 18, *)) {
+      auto pool = mlx::core::metal::new_scoped_memory_pool();
+      auto* rset = static_cast<MTL::ResidencySet*>(handle);
+      rset->endResidency();
+      rset->removeAllAllocations();
+      rset->commit();
+      rset->release();
+    }
+  } catch (...) {
+  }
+#else
+  (void)handle;
+#endif
+}
+
 // Set purgeability on the array's existing Metal allocation. Returns the
 // previous state (2 non-volatile, 3 volatile, 4 empty), or -1 on unsupported
 // builds and invalid handles/states. Never evaluates or replaces the array.

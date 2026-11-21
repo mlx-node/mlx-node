@@ -131,16 +131,19 @@ pub(crate) fn prefill_q8_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("MLX_HY4_PREFILL_Q8_NAX").as_deref() != Ok("0"))
 }
 
-/// Grouped MLA Q8 projections (`k_b`, `v_b`) stay in exact f32 during prefill
-/// by default so TF32 rounding does not perturb pre-softmax attention scores;
-/// opt in with `MLX_HY4_PREFILL_Q8_GROUPED_NAX=1`.
+/// Grouped MLA Q8 projections (`k_b`, `v_b`) use the 3-MMA TF32 hi+lo split
+/// NAX kernel during prefill by default; set `MLX_HY4_PREFILL_Q8_GROUPED_NAX=0`
+/// to fall back to MLX `quantized_matmul`.
 pub(crate) fn prefill_q8_grouped_nax_enabled() -> bool {
     #[cfg(test)]
     if let Some(v) = TEST_PREFILL_Q8_NAX.with(std::cell::Cell::get) {
         return v;
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_PREFILL_Q8_GROUPED_NAX").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_HY4_PREFILL_Q8_GROUPED_NAX").as_deref() != Ok("0")
+            && std::env::var("MLX_HY4_PREFILL_Q8_NAX").as_deref() != Ok("0")
+    })
 }
 
 #[cfg(test)]

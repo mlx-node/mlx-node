@@ -88,12 +88,49 @@ for (int base = 0; base < K; base += BK) {
         A.load_safe(x_ptr + kk, x_ld, short2(32, valid_m));
       }
       B.template load<C, PAD, 1>(Ws + size_t(tn) * size_t(PAD) + size_t(kk));
-      tile_matmad_nax(
-          D,
-          A,
-          metal::bool_constant<false>{},
-          B,
-          metal::bool_constant<true>{});
+      if constexpr (HI_LO_SPLIT && metal::is_same_v<C, float>) {
+        NAXTile<C, TM / 16, 2> A_lo;
+        NAXTile<C, 2, 2> B_lo;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < NAXTile<C, TM / 16, 2>::kElemsPerTile; ++i) {
+          const float v = A.elems()[i];
+          const float hi = as_type<float>(as_type<uint>(v) & 0xffffe000u);
+          A.elems()[i] = hi;
+          A_lo.elems()[i] = v - hi;
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < NAXTile<C, 2, 2>::kElemsPerTile; ++i) {
+          const float v = B.elems()[i];
+          const float hi = as_type<float>(as_type<uint>(v) & 0xffffe000u);
+          B.elems()[i] = hi;
+          B_lo.elems()[i] = v - hi;
+        }
+        tile_matmad_nax(
+            D,
+            A,
+            metal::bool_constant<false>{},
+            B,
+            metal::bool_constant<true>{});
+        tile_matmad_nax(
+            D,
+            A,
+            metal::bool_constant<false>{},
+            B_lo,
+            metal::bool_constant<true>{});
+        tile_matmad_nax(
+            D,
+            A_lo,
+            metal::bool_constant<false>{},
+            B,
+            metal::bool_constant<true>{});
+      } else {
+        tile_matmad_nax(
+            D,
+            A,
+            metal::bool_constant<false>{},
+            B,
+            metal::bool_constant<true>{});
+      }
     }
   }
 

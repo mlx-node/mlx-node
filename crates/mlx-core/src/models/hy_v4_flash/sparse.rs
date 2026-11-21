@@ -20,6 +20,74 @@ pub(crate) fn mla_prefill_nax_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("MLX_HY4_MLA_PREFILL_NAX").as_deref() != Ok("0"))
 }
 
+pub(crate) fn mla_sliding_prefill_nax_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_HY4_SLIDING_PREFILL_NAX").as_deref() != Ok("0")
+            && mla_prefill_nax_enabled()
+    })
+}
+
+/// Sliding-window NAX prefill attention reading directly from a circular
+/// `WindowRing` (`is_ring = true`) or linear key window (`is_ring = false`)
+/// without an `[S, window]` index table. Returns `Ok(None)` when Metal/NAX
+/// or geometry is unsupported.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_sliding_sink_attention_prefill(
+    q: &MxArray,
+    keys: &MxArray,
+    sinks: &MxArray,
+    v_width: i64,
+    scale: f32,
+    start_pos: usize,
+    is_ring: bool,
+    ring_cap: usize,
+    window_size: usize,
+    first_key: usize,
+) -> Result<Option<MxArray>> {
+    let (Ok(vw), Ok(sp), Ok(rc), Ok(ws), Ok(fk)) = (
+        i32::try_from(v_width),
+        i32::try_from(start_pos),
+        i32::try_from(ring_cap),
+        i32::try_from(window_size),
+        i32::try_from(first_key),
+    ) else {
+        return Ok(None);
+    };
+    let qf = if q.dtype()? == DType::Float32 {
+        q.clone()
+    } else {
+        q.astype(DType::Float32)?
+    };
+    let sf = if sinks.dtype()? == DType::Float32 {
+        sinks.clone()
+    } else {
+        sinks.astype(DType::Float32)?
+    };
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_mla_prefill_sliding_nax(
+            qf.as_raw_ptr(),
+            keys.as_raw_ptr(),
+            sf.as_raw_ptr(),
+            vw,
+            scale,
+            sp,
+            is_ring,
+            rc,
+            ws,
+            fk,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash mla_prefill_sliding_nax",
+    )?))
+}
+
 /// Byte budget of one row chunk (gathered keys + scores), DS
 /// `SPARSE_CHUNK_BYTES` (`deepseek_v41/attention.rs:262`).
 pub const SPARSE_CHUNK_BYTES: usize = 1 << 30;

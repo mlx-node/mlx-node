@@ -21,13 +21,16 @@
 use napi::{Error, Result};
 
 use super::batch::{MIN_Q8_ROWS, Wave};
-use super::cache::{LatentBuf, LayerCache, WindowRing};
+use super::cache::{LatentBuf, LayerCache, WindowKeys, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
 use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear};
 use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
 use super::paged::{SlotMap, planes, write_latent};
-use super::sparse::{KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for};
+use super::sparse::{
+    KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for,
+    mla_sliding_prefill_nax_enabled, try_sliding_sink_attention_prefill,
+};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
@@ -98,6 +101,18 @@ pub fn window_rows(start: usize, n: usize, first: usize, window: usize) -> Vec<i
     for p in start..start + n {
         let lo = (p + 1).saturating_sub(window).max(first);
         idx.extend((lo..=p).map(|kp| (kp - first) as i32));
+        idx.extend(std::iter::repeat_n(-1, window - (p + 1 - lo)));
+    }
+    idx
+}
+
+/// Physical circular ring slots `(kp % cap) as i32` of the window of each
+/// query `start..start + n`: `window` slots per row, `-1` when empty.
+pub fn window_ring_rows(start: usize, n: usize, cap: usize, window: usize) -> Vec<i32> {
+    let mut idx = Vec::with_capacity(n * window);
+    for p in start..start + n {
+        let lo = (p + 1).saturating_sub(window);
+        idx.extend((lo..=p).map(|kp| (kp % cap) as i32));
         idx.extend(std::iter::repeat_n(-1, window - (p + 1 - lo)));
     }
     idx
@@ -550,16 +565,40 @@ impl Mla {
         kind: RowKind,
     ) -> Result<MxArray> {
         let n = p.kv.shape_at(0)? as usize;
-        let (keys, first) = ring.append(&p.kv, start)?;
-        let tp = prof_start();
         let window = self.g.window;
-        let idx = MxArray::from_int32(
-            &window_rows(start, n, first, window),
-            &[n as i64, window as i64],
-        )?;
+        let keys = ring.append(&p.kv, start)?;
+        let tp = prof_start();
+        if kind == RowKind::Prefill && n >= 16 && mla_sliding_prefill_nax_enabled() {
+            let (k_ref, is_ring, ring_cap, first_key) = match &keys {
+                WindowKeys::Ring { keys, cap } => {
+                    (*keys, true, *cap, (start + 1).saturating_sub(window))
+                }
+                WindowKeys::Linear { keys, first } => (keys, false, 0, *first),
+            };
+            if let Some(o) = try_sliding_sink_attention_prefill(
+                &p.q,
+                k_ref,
+                &w.sinks,
+                self.g.kv_lora as i64,
+                self.g.scale,
+                start,
+                is_ring,
+                ring_cap,
+                window,
+                first_key,
+            )? {
+                prof_end(Phase::Sparse, tp, &[&o])?;
+                return Ok(o);
+            }
+        }
+        let (k_ref, idx_vec) = match &keys {
+            WindowKeys::Ring { keys, cap } => (*keys, window_ring_rows(start, n, *cap, window)),
+            WindowKeys::Linear { keys, first } => (keys, window_rows(start, n, *first, window)),
+        };
+        let idx = MxArray::from_int32(&idx_vec, &[n as i64, window as i64])?;
         let o = gather_sink_attention_for(
             &p.q,
-            &keys,
+            k_ref,
             &idx,
             self.g.kv_lora as i64,
             &w.sinks,
@@ -628,12 +667,11 @@ impl Mla {
             start,
             kind: ix.kind,
         };
-        let idx = ix
-            .indexer
-            .select_paged(ix.weights, call, ix.state, pool.adapter)?;
-        prof_end(Phase::Indexer, tp, &[&idx])?;
+        let slots =
+            ix.indexer
+                .select_paged_slots(ix.weights, call, ix.state, pool.adapter, pool.slots)?;
+        prof_end(Phase::Indexer, tp, &[&slots])?;
         let tp = prof_start();
-        let slots = pool.slots.slots(pool.adapter, &idx)?;
         let (k, v) = planes(pool.adapter, layer)?;
         let o = gather_sink_attention_rows_for(
             &p.q,
@@ -656,12 +694,21 @@ impl Mla {
         ring: &mut WindowRing,
     ) -> Result<MxArray> {
         let p = self.project_timed(w, h, &positions(h, start)?)?;
-        let before = ring.clone();
+        let n = p.kv.shape_at(0)? as usize;
+        let before = if n > ring.slack() {
+            Some(ring.snapshot()?)
+        } else {
+            None
+        };
         let out = self
             .core_sliding(w, &p, start, ring)
             .and_then(|o| self.finish_timed_with_gate(w, &p.x, p.gate_lin.as_ref(), &o));
         if out.is_err() {
-            *ring = before;
+            if let Some(saved) = before {
+                *ring = WindowRing::from_snapshot(&saved, ring.slack())?;
+            } else if ring.len() > start {
+                let _ = ring.truncate(start);
+            }
         }
         out
     }

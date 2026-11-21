@@ -9531,6 +9531,21 @@ impl PagedKVCacheAdapter {
         self.raw_value_pool_array(layer_idx)
     }
 
+    /// Wrap the index plane buffer for `layer_idx` (`[num_blocks, index_rows,
+    /// index_dim]`) as a zero-copy MxArray view, returning the last native
+    /// write's output while the pool generation matches.
+    #[cfg(target_os = "macos")]
+    pub fn index_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+            && let Some(index) = state.index.as_ref()
+        {
+            return Ok(index.clone());
+        }
+        self.raw_index_array(layer_idx)?
+            .ok_or_else(|| "the pool has no index plane".to_string())
+    }
+
     /// The K and V scale planes of `layer_idx` for a `&self` reader, like
     /// [`Self::key_pool_array`]: the last native write's outputs while the
     /// pool generation matches, else fresh views; the unit `[1]` array for a
@@ -9677,6 +9692,12 @@ impl PagedKVCacheAdapter {
     #[cfg(not(target_os = "macos"))]
     pub fn key_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
         Err("key_pool_array is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub for `index_pool_array`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn index_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        Err("index_pool_array is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Non-macOS stub for `value_pool_array`.

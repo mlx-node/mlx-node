@@ -22,7 +22,7 @@ use napi::{Error, Result};
 use super::bank::KqBank;
 use super::batch::{Core, Group, Op, Owners, Wave, group};
 use super::block::{Block, EngramIn, HcCarry, LayerState};
-use super::cache::{LatentBuf, LayerCache, WindowRing};
+use super::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing, WindowRingSnapshot};
 use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
@@ -229,11 +229,19 @@ fn index_keeps(st: &IndexerState, len: usize, kpool: usize) -> bool {
 
 #[derive(Clone)]
 enum LayerMark {
-    Window(WindowRing),
+    Window(Option<WindowRingSnapshot>),
     Latent {
         len: usize,
         index: Option<IndexerMark>,
     },
+}
+
+enum StepMark {
+    Short {
+        len: usize,
+        index: Vec<Option<IndexerMark>>,
+    },
+    Full(Mark),
 }
 
 /// A point of a session to go back to: valid while no write lands below
@@ -262,7 +270,10 @@ impl Mark {
             .iter()
             .enumerate()
             .map(|(l, m)| match m {
-                LayerMark::Window(r) => Ok(StateLayer::Window(r.clone())),
+                LayerMark::Window(Some(r)) => Ok(StateLayer::Window(r.clone())),
+                LayerMark::Window(None) => {
+                    Err(bad(format!("layer {l}: window snapshot unavailable")))
+                }
                 LayerMark::Latent {
                     index: Some(im), ..
                 } => Ok(StateLayer::Tail(im.tail().clone())),
@@ -314,20 +325,75 @@ impl Session {
     }
 
     pub fn mark(&self) -> Mark {
+        let mut layers: Vec<LayerMark> = self
+            .layers
+            .iter()
+            .map(|st| match &st.cache {
+                LayerCache::Window(r) => LayerMark::Window(r.snapshot_lazy().ok()),
+                LayerCache::Latent(b) => LayerMark::Latent {
+                    len: b.len(),
+                    index: st.index.as_ref().map(IndexerState::mark),
+                },
+            })
+            .collect();
+        let live: Vec<&MxArray> = layers
+            .iter()
+            .filter_map(|lm| match lm {
+                LayerMark::Window(Some(s)) => s.rows(),
+                _ => None,
+            })
+            .collect();
+        if !live.is_empty()
+            && MxArray::eval_arrays_with_context(&live, "hy_v4_flash session mark").is_err()
+        {
+            for lm in &mut layers {
+                if let LayerMark::Window(w) = lm {
+                    *w = None;
+                }
+            }
+        }
         Mark {
             len: self.tokens.len(),
             last: self.written.last().copied(),
-            layers: self
-                .layers
-                .iter()
-                .map(|st| match &st.cache {
-                    LayerCache::Window(r) => LayerMark::Window(r.clone()),
-                    LayerCache::Latent(b) => LayerMark::Latent {
-                        len: b.len(),
-                        index: st.index.as_ref().map(IndexerState::mark),
-                    },
-                })
-                .collect(),
+            layers,
+        }
+    }
+
+    fn step_mark(&self, rows: usize) -> StepMark {
+        if rows <= WINDOW_SLACK {
+            StepMark::Short {
+                len: self.tokens.len(),
+                index: self
+                    .layers
+                    .iter()
+                    .map(|st| st.index.as_ref().map(IndexerState::mark))
+                    .collect(),
+            }
+        } else {
+            StepMark::Full(self.mark())
+        }
+    }
+
+    fn restore_step(&mut self, m: &StepMark) -> Result<()> {
+        match m {
+            StepMark::Full(mark) => self.restore(mark),
+            StepMark::Short { len, index } => {
+                for (st, im) in self.layers.iter_mut().zip(index) {
+                    if let (Some(ix), Some(saved)) = (st.index.as_mut(), im) {
+                        ix.restore(saved.clone())?;
+                    }
+                }
+                for st in &mut self.layers {
+                    match &mut st.cache {
+                        LayerCache::Window(r) if r.len() > *len => r.truncate(*len)?,
+                        LayerCache::Latent(b) if b.len() > *len => b.truncate(*len)?,
+                        _ => {}
+                    }
+                }
+                self.tokens.truncate(*len);
+                self.written.truncate(*len);
+                Ok(())
+            }
         }
     }
 
@@ -336,6 +402,18 @@ impl Session {
     /// rewritten since `m` was taken.
     pub fn restore(&mut self, m: &Mark) -> Result<()> {
         self.fits(m)?;
+        let rebuilt: Vec<Option<WindowRing>> = self
+            .layers
+            .iter()
+            .zip(&m.layers)
+            .map(|(st, lm)| match (&st.cache, lm) {
+                (LayerCache::Window(_), LayerMark::Window(Some(saved))) => {
+                    WindowRing::from_snapshot(saved, WINDOW_SLACK).map(Some)
+                }
+                (LayerCache::Latent(_), LayerMark::Latent { .. }) => Ok(None),
+                _ => Err(bad("layer kinds changed during restore")),
+            })
+            .collect::<Result<_>>()?;
         for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
             if let (
                 Some(ix),
@@ -347,10 +425,10 @@ impl Session {
                 ix.restore(im.clone())?;
             }
         }
-        for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
-            match (&mut st.cache, lm) {
-                (LayerCache::Window(r), LayerMark::Window(saved)) => *r = saved.clone(),
-                (LayerCache::Latent(b), LayerMark::Latent { len, .. }) => b.truncate(*len)?,
+        for ((st, lm), ring) in self.layers.iter_mut().zip(&m.layers).zip(rebuilt) {
+            match (&mut st.cache, lm, ring) {
+                (LayerCache::Window(r), LayerMark::Window(_), Some(fresh)) => *r = fresh,
+                (LayerCache::Latent(b), LayerMark::Latent { len, .. }, None) => b.truncate(*len)?,
                 _ => return Err(bad("layer kinds changed during restore")),
             }
         }
@@ -416,7 +494,7 @@ impl Session {
         for (l, (st, part)) in self.layers.iter_mut().zip(layers).enumerate() {
             match (&mut st.cache, st.index.as_ref(), part) {
                 (LayerCache::Window(r), None, StateLayer::Window(s)) if s.len() == b => {
-                    *r = s.clone();
+                    *r = WindowRing::from_snapshot(s, WINDOW_SLACK)?;
                 }
                 (LayerCache::Latent(_), Some(_), StateLayer::Tail(t)) if t.len() == b => {
                     indexed.push((l, t));
@@ -474,7 +552,7 @@ impl Session {
         }
         for (l, (st, lm)) in self.layers.iter().zip(&m.layers).enumerate() {
             let fits = match (&st.cache, lm) {
-                (LayerCache::Window(_), LayerMark::Window(_)) => st.index.is_none(),
+                (LayerCache::Window(_), LayerMark::Window(Some(_))) => st.index.is_none(),
                 (LayerCache::Latent(b), LayerMark::Latent { len, index }) => {
                     *len <= b.len() && st.index.is_some() == index.is_some()
                 }
@@ -506,35 +584,21 @@ impl Session {
                 "truncate {now} -> {len}: layer {l}'s indexer no longer holds the open rows"
             )));
         }
-        let rings: Vec<Option<WindowRing>> = self
-            .layers
-            .iter()
-            .map(|st| match &st.cache {
-                LayerCache::Window(r) => Some(r.clone()),
-                LayerCache::Latent(_) => None,
-            })
-            .collect();
-        let windows = self
-            .layers
-            .iter_mut()
-            .try_for_each(|st| match &mut st.cache {
-                LayerCache::Window(r) => r.truncate(len),
-                LayerCache::Latent(_) => Ok(()),
-            });
-        if let Err(e) = windows {
-            for (st, saved) in self.layers.iter_mut().zip(rings) {
-                if let (LayerCache::Window(r), Some(s)) = (&mut st.cache, saved) {
-                    *r = s;
-                }
-            }
-            return Err(e);
+        if let Some(l) = self.layers.iter().position(|st| match &st.cache {
+            LayerCache::Window(r) => !r.can_truncate(len),
+            LayerCache::Latent(_) => false,
+        }) {
+            return Err(bad(format!(
+                "truncate {now} -> {len}: layer {l}'s window no longer holds the rows"
+            )));
         }
         for st in &mut self.layers {
             if let Some(ix) = st.index.as_mut() {
                 ix.truncate(len)?;
             }
-            if let LayerCache::Latent(b) = &mut st.cache {
-                b.truncate(len)?;
+            match &mut st.cache {
+                LayerCache::Window(r) => r.truncate(len)?,
+                LayerCache::Latent(b) => b.truncate(len)?,
             }
         }
         self.tokens.truncate(len);
@@ -725,7 +789,10 @@ impl Model {
             .map(|o| (o.sess.tokens.len(), o.ids.len()))
             .collect();
         let wave = Wave::new(kind, &spans, None)?;
-        let marks: Vec<Mark> = owners.iter().map(|o| o.sess.mark()).collect();
+        let marks: Vec<StepMark> = owners
+            .iter()
+            .map(|o| o.sess.step_mark(o.ids.len()))
+            .collect();
         let out = self.wave(
             &mut FlatOwners {
                 owners: &mut *owners,
@@ -748,7 +815,7 @@ impl Model {
                 let lost: Vec<String> = owners
                     .iter_mut()
                     .zip(&marks)
-                    .filter_map(|(o, m)| o.sess.restore(m).err().map(|r| r.reason))
+                    .filter_map(|(o, m)| o.sess.restore_step(m).err().map(|r| r.reason))
                     .collect();
                 if !lost.is_empty() {
                     return Err(bad(format!(

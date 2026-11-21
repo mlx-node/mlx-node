@@ -772,6 +772,7 @@ pub struct MmapDecision {
     pub budget: u64,
     pub margin: u64,
     pub dense_bytes: u64,
+    pub mapped_bytes: u64,
     pub kv_and_scratch: u64,
     pub scratch_bytes: u64,
     pub need: u64,
@@ -788,6 +789,7 @@ pub fn mmap_gate(
     host: &HostMemory,
     own: &Own,
     dense_bytes: u64,
+    mapped_bytes: u64,
     kv_allowance_initial: u64,
     scratch_bytes: u64,
     margin: u64,
@@ -798,7 +800,11 @@ pub fn mmap_gate(
     let available = host.physical.saturating_sub(others).saturating_sub(margin);
     let budget = max_memory.map_or(available, |m| available.min(m));
     let kv_and_scratch = kv_allowance_initial.saturating_add(scratch_bytes);
-    let need = dense_bytes.saturating_add(kv_and_scratch);
+    let base_need = dense_bytes.saturating_add(kv_and_scratch);
+    let need = match mode {
+        MmapMode::Auto => base_need.saturating_add(mapped_bytes),
+        MmapMode::On | MmapMode::Off => base_need,
+    };
     let physical_ok = match mode {
         MmapMode::Off => false,
         MmapMode::On => true,
@@ -811,6 +817,7 @@ pub fn mmap_gate(
         budget,
         margin,
         dense_bytes,
+        mapped_bytes,
         kv_and_scratch,
         scratch_bytes,
         need,
@@ -834,6 +841,7 @@ pub fn pick_mmap(
     host: &HostMemory,
     own: &Own,
     dense_bytes: u64,
+    mapped_bytes: u64,
     reserve_override: Option<u64>,
     max_memory: Option<u64>,
 ) -> (usize, MmapDecision) {
@@ -849,6 +857,7 @@ pub fn pick_mmap(
             host,
             own,
             dense_bytes,
+            mapped_bytes,
             kv_allowance_initial,
             scratch,
             margin,
@@ -894,11 +903,12 @@ pub fn select_expert_mode(
     own: &Own,
     dense_bytes: u64,
     direct_expert_bytes: u64,
+    mapped_bytes: u64,
     reserve_override: Option<u64>,
     max_memory: Option<u64>,
     cache_cap: Option<u64>,
 ) -> Result<ExpertResidency> {
-    let has_experts = direct_expert_bytes > 0;
+    let has_experts = direct_expert_bytes > 0 && mapped_bytes > 0;
     let try_mmap = |mode: MmapMode| {
         pick_mmap(
             mode,
@@ -909,6 +919,7 @@ pub fn select_expert_mode(
             host,
             own,
             dense_bytes,
+            mapped_bytes,
             reserve_override,
             max_memory,
         )
@@ -1926,6 +1937,7 @@ impl Store {
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
                 let direct_expert_bytes = sizes.direct_expert_bytes();
+                let mapped_bytes = mmap_expert_bytes(&scan)?;
                 let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
                 // SAFETY: pure process-wide Metal availability probe.
                 let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
@@ -1939,6 +1951,7 @@ impl Store {
                     &own,
                     base.dense,
                     direct_expert_bytes,
+                    mapped_bytes,
                     reserve_override,
                     opts.max_memory,
                     l.cache_cap,
@@ -1960,7 +1973,6 @@ impl Store {
                         let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
                         let mmap_fixed = gate.dense_bytes.saturating_add(kv_scratch);
                         let total_slots = sizes.total_experts();
-                        let mapped_bytes = mmap_expert_bytes(&scan)?;
                         let warm_budget = mmap_warm_budget(
                             opts.mmap_prewarm,
                             &h,

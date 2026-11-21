@@ -16,7 +16,7 @@ use std::sync::Arc;
 use mlx_paged_attn::{ColdCacheLayout, ColdLayerBlock};
 use napi::Result;
 
-use super::cache::{WINDOW_SLACK, WindowRing};
+use super::cache::{WINDOW_SLACK, WindowRingSnapshot};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{IndexerGeometry, TokTail};
 use super::paged::{BLOCK, PAGE_DTYPE, PageGeometry};
@@ -471,7 +471,7 @@ pub fn decode_state(
         let rows = arrays.next()?;
         layers.push(match l {
             LayerShape::Window { window, width } => StateLayer::Window(
-                WindowRing::of_rows(*window, WINDOW_SLACK, *width, rows, row).ok()?,
+                WindowRingSnapshot::of_rows(*window, WINDOW_SLACK, *width, rows, row).ok()?,
             ),
             LayerShape::Tail(g) => StateLayer::Tail(TokTail::of_rows(g, rows, row).ok()?),
         });

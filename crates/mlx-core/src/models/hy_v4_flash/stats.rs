@@ -265,6 +265,16 @@ pub fn flush(what: &str) -> napi::Result<()> {
     eval(&[], what)
 }
 
+/// Submits what [`defer`] holds via `async_eval` without blocking the host.
+pub fn async_flush() {
+    let held = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    if held.is_empty() {
+        return;
+    }
+    let refs: Vec<&MxArray> = held.iter().collect();
+    MxArray::async_eval_arrays(&refs);
+}
+
 /// Arrays [`defer`] holds on this thread.
 pub fn deferred() -> usize {
     DEFERRED.with(|d| d.borrow().len())

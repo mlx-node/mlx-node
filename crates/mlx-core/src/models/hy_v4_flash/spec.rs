@@ -145,6 +145,7 @@ pub(crate) struct Flat<'a> {
     embedding: Embedding,
     committed: usize,
     snap: Option<usize>,
+    draft_scope: Option<super::stats::DeferScope>,
     err: Option<Error>,
 }
 
@@ -168,6 +169,7 @@ impl<'a> Flat<'a> {
             embedding: mtp.embedding().clone(),
             seq,
             snap: None,
+            draft_scope: None,
             err: None,
         })
     }
@@ -230,9 +232,11 @@ impl MtpStepper for Flat<'_> {
     }
 
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
+        self.draft_scope
+            .get_or_insert_with(super::stats::DeferScope::enter);
         let (model, mtp) = (self.model, self.mtp);
         let d = self.draft_mut()?;
-        mtp.draft(model, d, prev_h, prev_emb)
+        mtp.draft_lazy(model, d, prev_h, prev_emb)
     }
 
     fn verify_step(
@@ -242,6 +246,7 @@ impl MtpStepper for Flat<'_> {
         depth: usize,
     ) -> Result<MtpVerifyOutput> {
         if ids.len() != depth + 1 || ids.len() > LOOKAHEAD_MAX {
+            self.draft_scope = None;
             return Err(bad(format!("{} verify ids at depth {depth}", ids.len())));
         }
         let model = self.model;
@@ -252,7 +257,9 @@ impl MtpStepper for Flat<'_> {
             logits: Logits::All,
             hidden: true,
         };
-        let out = model.forward(trunk, ids, RowKind::Decode, want, None, None)?;
+        let out = model.forward(trunk, ids, RowKind::Decode, want, None, None);
+        self.draft_scope = None;
+        let out = out?;
         let n = ids.len() as i64;
         let shaped = out
             .logits
@@ -338,6 +345,7 @@ impl MtpStepper for Flat<'_> {
     }
 
     fn begin_cycle(&mut self, chained_anchor: bool) {
+        self.draft_scope = None;
         let r = match cycle_rows(self.committed, chained_anchor) {
             Some(keep) => self.draft_mut().and_then(|d| d.cut(keep)),
             None => Err(bad("a chained cycle with no committed row")),
@@ -403,6 +411,7 @@ pub(crate) struct Paged<'a> {
     seq: SeqId,
     embedding: Embedding,
     snap: Option<usize>,
+    draft_scope: Option<super::stats::DeferScope>,
     err: Option<Error>,
 }
 
@@ -428,6 +437,7 @@ impl<'a> Paged<'a> {
             seq,
             embedding,
             snap: None,
+            draft_scope: None,
             err: None,
         })
     }
@@ -478,7 +488,9 @@ impl MtpStepper for Paged<'_> {
     }
 
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
-        self.inner.draft_row(self.seq, prev_h, prev_emb)
+        self.draft_scope
+            .get_or_insert_with(super::stats::DeferScope::enter);
+        self.inner.draft_row_lazy(self.seq, prev_h, prev_emb)
     }
 
     fn verify_step(
@@ -488,10 +500,13 @@ impl MtpStepper for Paged<'_> {
         depth: usize,
     ) -> Result<MtpVerifyOutput> {
         if ids.len() != depth + 1 || ids.len() > LOOKAHEAD_MAX {
+            self.draft_scope = None;
             return Err(bad(format!("{} verify ids at depth {depth}", ids.len())));
         }
         let start = self.inner.owner_len(self.seq);
-        let (logits, hidden) = self.wave(ids, Logits::All)?;
+        let wave = self.wave(ids, Logits::All);
+        self.draft_scope = None;
+        let (logits, hidden) = wave?;
         let shaped = verify_output(&logits, &hidden, ids.len() as i64);
         if shaped.is_err() {
             let _ = self.inner.cut_owner(self.seq, start);
@@ -542,6 +557,7 @@ impl MtpStepper for Paged<'_> {
     }
 
     fn begin_cycle(&mut self, _chained_anchor: bool) {
+        self.draft_scope = None;
         let r = self.inner.settle(self.seq);
         self.stash(r);
     }

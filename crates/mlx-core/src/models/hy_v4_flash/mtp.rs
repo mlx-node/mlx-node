@@ -632,7 +632,30 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
-        let _scope = super::stats::DeferScope::enter();
+        self.draft_with_flush(model, d, h, emb, true)
+    }
+
+    /// Like [`Self::draft`], leaving deferred KV/indexer updates unevaluated so
+    /// multi-depth draft chains sync once after all depth steps.
+    pub fn draft_lazy(
+        &self,
+        model: &Model,
+        d: &mut Draft,
+        h: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        self.draft_with_flush(model, d, h, emb, false)
+    }
+
+    fn draft_with_flush(
+        &self,
+        model: &Model,
+        d: &mut Draft,
+        h: &MxArray,
+        emb: &MxArray,
+        flush: bool,
+    ) -> Result<(MxArray, MxArray)> {
+        let _scope = flush.then(super::stats::DeferScope::enter);
         let at = d.len();
         if at >= d.cap {
             return Err(bad(format!("draft row {at} past the {} rows held", d.cap)));
@@ -654,10 +677,129 @@ impl MtpLayer {
             d.index.restore(mark)?;
             return Err(e);
         }
-        let out = self.finish_draft(model, d, &x, &p, &idx);
+        let out = self.finish_draft(model, d, &x, &p, &idx, flush);
         if out.is_err() {
             d.kv.truncate(at)?;
             d.index.restore(mark)?;
+        }
+        out
+    }
+
+    /// Batched draft step over `B = drafts.len()` active lanes sharing
+    /// `eh_proj`, `mla.project_at`, `mla.finish_with_gate`, `ffn`,
+    /// `shared_head_norm`, and the vocab head in a single pass.
+    /// `h` and `emb` are `[B, dim]`; returns `(h_mtp [B, dim], logits [B, vocab])`.
+    /// Does not flush `stats::defer`; the caller owns the enclosing `DeferScope`
+    /// and evaluates once across all depth steps. On error every mutated lane is
+    /// rolled back to its entry length.
+    pub fn draft_batch(
+        &self,
+        model: &Model,
+        drafts: &mut [&mut Draft],
+        h: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let b = drafts.len();
+        if b == 0 {
+            return Err(bad("draft_batch requires at least one lane"));
+        }
+        let bi = b as i64;
+        let h2 = h.reshape(&[bi, self.dim])?;
+        let e2 = emb.reshape(&[bi, self.dim])?;
+        let mut ats = Vec::with_capacity(b);
+        let mut positions = Vec::with_capacity(b);
+        for (i, d) in drafts.iter().enumerate() {
+            let at = d.len();
+            if at >= d.cap {
+                return Err(bad(format!(
+                    "lane {i} draft row {at} past the {} rows held",
+                    d.cap
+                )));
+            }
+            ats.push(at);
+            positions.push((at + 1) as u64);
+        }
+
+        let x = self.eh(&e2, &h2)?;
+        let w = &self.w.attn;
+        let g = self.mla.geometry();
+        let iw = self.indexer_weights()?;
+        let p = self.mla.project_at(w, &x, &positions)?;
+
+        let px_w = p.x.shape_at(1)?;
+        let pqr_w = p.qr.shape_at(1)?;
+        let pq_h = p.q.shape_at(1)?;
+        let pq_d = p.q.shape_at(2)?;
+        let pkv_w = p.kv.shape_at(1)?;
+
+        let mut marks: Vec<IndexerMark> = Vec::with_capacity(b);
+        let mut kv_written = 0usize;
+        let mut attn_parts: Vec<MxArray> = Vec::with_capacity(b);
+        let core_res: Result<MxArray> = (|| {
+            for (i, d) in drafts.iter_mut().enumerate() {
+                let at = ats[i];
+                let lo = i as i64;
+                let hi = lo + 1;
+                let (px_i, pqr_i, pq_i, pkv_i) = if b == 1 {
+                    (p.x.clone(), p.qr.clone(), p.q.clone(), p.kv.clone())
+                } else {
+                    (
+                        p.x.slice(&[lo, 0], &[hi, px_w])?,
+                        p.qr.slice(&[lo, 0], &[hi, pqr_w])?,
+                        p.q.slice(&[lo, 0, 0], &[hi, pq_h, pq_d])?,
+                        p.kv.slice(&[lo, 0], &[hi, pkv_w])?,
+                    )
+                };
+                let mark = d.index.mark();
+                marks.push(mark);
+                let call = Call {
+                    x: &px_i,
+                    qr: &pqr_i,
+                    start: at,
+                    kind: RowKind::Decode,
+                };
+                let idx = self.indexer.select(iw, call, &mut d.index)?;
+                d.kv.write(&pkv_i, at)?;
+                kv_written = i + 1;
+                let o_i = gather_sink_attention(
+                    &pq_i,
+                    d.kv.rows()?,
+                    &idx,
+                    g.kv_lora as i64,
+                    &w.sinks,
+                    g.scale,
+                )?;
+                attn_parts.push(o_i);
+            }
+            if attn_parts.len() == 1 {
+                Ok(attn_parts.swap_remove(0))
+            } else {
+                MxArray::concatenate_many(attn_parts.iter().collect(), Some(0))
+            }
+        })();
+
+        let out = core_res.and_then(|o| {
+            let x = x.add(
+                &self
+                    .mla
+                    .finish_with_gate(w, &p.x, p.gate_lin.as_ref(), &o)?,
+            )?;
+            let (f, _) = self
+                .ffn
+                .forward_traced(&self.w, &x, RowKind::Decode, false)?;
+            let x = x.add(&f)?;
+            let h_out = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
+            let logits = head_rows(&h_out, model.weights().output())?;
+            Ok((h_out, logits))
+        });
+
+        if out.is_err() {
+            for j in 0..marks.len() {
+                if j < kv_written {
+                    let _ = drafts[j].kv.truncate(ats[j]);
+                }
+                let _ = drafts[j].index.restore(marks[j].clone());
+            }
         }
         out
     }
@@ -669,6 +811,7 @@ impl MtpLayer {
         x: &MxArray,
         p: &Projected,
         idx: &MxArray,
+        flush: bool,
     ) -> Result<(MxArray, MxArray)> {
         let g = self.mla.geometry();
         let w = &self.w.attn;
@@ -685,7 +828,9 @@ impl MtpLayer {
         let x = x.add(&f)?;
         let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
         let logits = head_rows(&h, model.weights().output())?;
-        super::stats::flush("hy_v4_flash MTP draft")?;
+        if flush {
+            super::stats::flush("hy_v4_flash MTP draft")?;
+        }
         Ok((h.reshape(&[1, 1, self.dim])?, logits))
     }
 }

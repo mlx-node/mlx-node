@@ -2178,3 +2178,82 @@ fn real_trunk_forward_last() {
     }
     bank.end_turn().unwrap();
 }
+
+/// Circular `WindowRing` across wrapped decode steps (`> window + slack`),
+/// O(1) `truncate` rollback, and `mark` / `restore` gives bit-exact logits.
+#[test]
+fn circular_window_decode_wrap_truncate_and_restore_match_reference() {
+    let f = fixture();
+    let ids = prompt();
+    assert!(ids.len() > f.model.cfg().window + super::cache::WINDOW_SLACK);
+
+    let mut prefill_sess = f.model.new_session(CTX).unwrap();
+    let want_prefill = read(
+        &f.model
+            .forward_last(&mut prefill_sess, &ids, RowKind::Prefill, None)
+            .unwrap(),
+    );
+
+    let mut clean_sess = f.model.new_session(CTX).unwrap();
+    let mut want_decode = Vec::new();
+    for &tok in &ids {
+        want_decode = read(
+            &f.model
+                .forward_last(&mut clean_sess, &[tok], RowKind::Decode, None)
+                .unwrap(),
+        );
+    }
+
+    // Step through single-token decode waves so sliding rings wrap around cap
+    // via in-place circular writes (StepMark::Short).
+    let mut sess = f.model.new_session(CTX).unwrap();
+    for &tok in &ids[..18] {
+        f.model
+            .forward_last(&mut sess, &[tok], RowKind::Decode, None)
+            .unwrap();
+    }
+    let mark = sess.mark();
+    // Append 3 speculative tokens (== WINDOW_SLACK), then truncate back to 18.
+    for &tok in &ids[18..21] {
+        f.model
+            .forward_last(&mut sess, &[tok], RowKind::Decode, None)
+            .unwrap();
+    }
+    sess.truncate(18).unwrap();
+    assert_eq!(sess.len(), 18);
+
+    let mut last = Vec::new();
+    for &tok in &ids[18..] {
+        last = read(
+            &f.model
+                .forward_last(&mut sess, &[tok], RowKind::Decode, None)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        last, want_decode,
+        "wrapped circular ring + truncate diverged from clean decode"
+    );
+    assert_within(
+        &[last],
+        &[want_prefill],
+        "wrapped circular ring vs prefill",
+        2e-3,
+        2e-3,
+    );
+
+    // Restore mark from pos 18 and replay remaining tokens.
+    sess.restore(&mark).unwrap();
+    let mut replayed = Vec::new();
+    for &tok in &ids[18..] {
+        replayed = read(
+            &f.model
+                .forward_last(&mut sess, &[tok], RowKind::Decode, None)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        replayed, want_decode,
+        "mark/restore replay diverged from clean decode"
+    );
+}

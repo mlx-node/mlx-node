@@ -2,12 +2,13 @@
 //!
 //! | layer | state |
 //! |---|---|
-//! | sliding | `WindowRing`: the last `window + slack` rows, a fresh array per append |
+//! | sliding | `WindowRing`: fixed `[window + slack, width]` circular ring written in place |
 //! | indexed | `LatentBuf`: one `[cap, width]` array written in place, a logical `len` |
 //!
-//! A `LatentBuf` array must have exactly one handle (this struct): a second
-//! handle turns every in-place write into a copy of the whole buffer. Save
-//! and restore go through lengths (`len` / `truncate`), never array clones.
+//! Live `WindowRing` and `LatentBuf` buffers must have exactly one handle: a
+//! second live reference prevents MLX buffer donation and forces a full buffer
+//! copy on the next write. Snapshots go through `WindowRingSnapshot` (linear
+//! oldest-first copy); short rollbacks go through lengths (`truncate`).
 
 use napi::{Error, Result};
 
@@ -60,34 +61,50 @@ fn rows_of(x: &MxArray, width: i64, what: &str) -> Result<usize> {
     }
 }
 
-/// The latent rows of one sliding layer: positions `len - kept .. len`,
-/// oldest first. A clone is a snapshot (every append makes a new array).
+/// Reads `count` logical rows starting at `first_pos` out of a circular
+/// `[cap, width]` buffer in oldest-first linear order.
+fn linear_range(
+    buf: &MxArray,
+    cap: usize,
+    width: i64,
+    first_pos: usize,
+    count: usize,
+    detach: bool,
+) -> Result<MxArray> {
+    let lo = first_pos % cap;
+    if lo + count <= cap {
+        let view = buf.slice(&[lo as i64, 0], &[(lo + count) as i64, width])?;
+        if detach { view.deep_copy() } else { Ok(view) }
+    } else {
+        let head = buf.slice(&[lo as i64, 0], &[cap as i64, width])?;
+        let tail = buf.slice(&[0, 0], &[(lo + count - cap) as i64, width])?;
+        MxArray::concatenate(&head, &tail, 0)
+    }
+}
+
+/// Keys returned by [`WindowRing::append`] for one attention call.
+pub enum WindowKeys<'a> {
+    /// Physical circular ring `[cap, width]`; position `kp` lives at slot `kp % cap`.
+    Ring { keys: &'a MxArray, cap: usize },
+    /// Linear buffer `[m, width]`; position `kp` lives at row `kp - first`.
+    Linear { keys: MxArray, first: usize },
+}
+
+/// Linear oldest-first snapshot of a [`WindowRing`]: positions `len - kept .. len`
+/// in `[kept, width]` f16. Safe to clone, retain in prefix states, and persist.
 #[derive(Clone)]
-pub struct WindowRing {
+pub struct WindowRingSnapshot {
     window: usize,
-    keep: usize,
     width: i64,
     rows: Option<MxArray>,
     held: usize,
     len: usize,
 }
 
-impl WindowRing {
-    pub fn new(window: usize, slack: usize, width: i64) -> Self {
-        Self {
-            window,
-            keep: window + slack,
-            width,
-            rows: None,
-            held: 0,
-            len: 0,
-        }
-    }
-
-    /// A ring of `len` positions holding `rows [held, width]` (f16), the
-    /// rows of its last `held` positions. Refused past `window + slack`
-    /// rows, past `len`, or below a window of rows (all of `len` when
-    /// shorter).
+impl WindowRingSnapshot {
+    /// A snapshot of `len` positions holding `rows [held, width]` (f16), the
+    /// rows of its last `held` positions. Refused past `window + slack` rows,
+    /// past `len`, or below a window of rows (all of `len` when shorter).
     pub fn of_rows(
         window: usize,
         slack: usize,
@@ -104,19 +121,174 @@ impl WindowRing {
                 "a ring of {len} positions with {held} rows (window {window}, slack {slack})"
             )));
         }
+        let rows = rows
+            .map(|r| {
+                if r.dtype()? == row_dtype() {
+                    Ok(r)
+                } else {
+                    r.astype(row_dtype())
+                }
+            })
+            .transpose()?;
         Ok(Self {
             window,
-            keep: window + slack,
             width,
-            rows: rows.map(|r| r.astype(row_dtype())).transpose()?,
+            rows,
             held,
             len,
         })
     }
 
-    /// The held rows `[kept, width]` f16.
+    /// The held rows `[kept, width]` in oldest-first linear order.
     pub fn rows(&self) -> Option<&MxArray> {
         self.rows.as_ref()
+    }
+
+    /// Positions appended up to this snapshot.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    pub fn width(&self) -> i64 {
+        self.width
+    }
+
+    /// Rows held in this snapshot.
+    pub fn kept(&self) -> usize {
+        self.held
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.rows.as_ref().map_or(0, MxArray::nbytes)
+    }
+}
+
+/// The latent rows of one sliding layer in a fixed `[cap, width]` circular
+/// buffer (`cap = window + slack`). Position `p` in `(len - held)..len` lives
+/// at physical row `p % cap`. Never `Clone` so `buf` keeps refcount 1 for
+/// zero-copy MLX buffer donation.
+pub struct WindowRing {
+    window: usize,
+    cap: usize,
+    width: i64,
+    buf: Option<MxArray>,
+    held: usize,
+    len: usize,
+}
+
+impl WindowRing {
+    pub fn new(window: usize, slack: usize, width: i64) -> Self {
+        Self {
+            window,
+            cap: window + slack,
+            width,
+            buf: None,
+            held: 0,
+            len: 0,
+        }
+    }
+
+    /// Rebuilds a live circular ring from a linear [`WindowRingSnapshot`].
+    pub fn from_snapshot(snap: &WindowRingSnapshot, slack: usize) -> Result<Self> {
+        let mut ring = Self::new(snap.window, slack, snap.width);
+        let Some(rows) = &snap.rows else {
+            if snap.len != 0 {
+                return Err(bad(format!(
+                    "a ring of {} positions with 0 rows (window {}, slack {slack})",
+                    snap.len, ring.window
+                )));
+            }
+            return Ok(ring);
+        };
+        if ring.cap == 0 {
+            return Err(bad("window ring capacity must be > 0"));
+        }
+        let held = snap.held;
+        let len = snap.len;
+        if held > ring.cap || held > len || held < len.min(ring.window) {
+            return Err(bad(format!(
+                "a ring of {len} positions with {held} rows (window {}, slack {slack})",
+                ring.window
+            )));
+        }
+        let rows = if rows.dtype()? == row_dtype() {
+            rows.clone()
+        } else {
+            rows.astype(row_dtype())?
+        };
+        let cap_i64 = i64::try_from(ring.cap).map_err(|_| bad("window capacity exceeds i64"))?;
+        let zero = MxArray::zeros(&[cap_i64, ring.width], Some(row_dtype()))?;
+        let first_pos = len - held;
+        let buf = super::ops::ring_write(&zero, &rows, first_pos % ring.cap, ring.cap)?;
+        drop(zero);
+        super::stats::defer(&buf, "hy_v4_flash window ring")?;
+        ring.buf = Some(buf);
+        ring.held = held;
+        ring.len = len;
+        Ok(ring)
+    }
+
+    /// Builds a live circular ring directly from oldest-first linear `rows`.
+    pub fn of_rows(
+        window: usize,
+        slack: usize,
+        width: i64,
+        rows: Option<MxArray>,
+        len: usize,
+    ) -> Result<Self> {
+        let snap = WindowRingSnapshot::of_rows(window, slack, width, rows, len)?;
+        Self::from_snapshot(&snap, slack)
+    }
+
+    /// Builds an unevaluated linear oldest-first snapshot detached from `buf`.
+    /// Callers taking snapshots across many layers can batch-evaluate the
+    /// returned arrays once so live `buf` drops back to refcount 1.
+    pub fn snapshot_lazy(&self) -> Result<WindowRingSnapshot> {
+        if self.held == 0 {
+            return Ok(WindowRingSnapshot {
+                window: self.window,
+                width: self.width,
+                rows: None,
+                held: 0,
+                len: self.len,
+            });
+        }
+        let buf = self
+            .buf
+            .as_ref()
+            .ok_or_else(|| bad("window buffer missing"))?;
+        let first_pos = self.len - self.held;
+        let rows = linear_range(buf, self.cap, self.width, first_pos, self.held, true)?;
+        Ok(WindowRingSnapshot {
+            window: self.window,
+            width: self.width,
+            rows: Some(rows),
+            held: self.held,
+            len: self.len,
+        })
+    }
+
+    /// Evaluates and returns a detached linear oldest-first snapshot of the
+    /// held rows, leaving live `buf` with refcount 1 for donation.
+    pub fn snapshot(&self) -> Result<WindowRingSnapshot> {
+        let snap = self.snapshot_lazy()?;
+        if let Some(rows) = snap.rows() {
+            MxArray::eval_arrays_with_context(&[rows], "hy_v4_flash window snapshot")?;
+        }
+        Ok(snap)
+    }
+
+    /// The underlying `[cap, width]` circular buffer when allocated.
+    pub fn buf(&self) -> Option<&MxArray> {
+        self.buf.as_ref()
     }
 
     /// Positions appended so far.
@@ -132,51 +304,121 @@ impl WindowRing {
         self.window
     }
 
-    /// Rows held now.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub fn slack(&self) -> usize {
+        self.cap - self.window
+    }
+
+    pub fn width(&self) -> i64 {
+        self.width
+    }
+
+    /// Valid rows held now.
     pub fn kept(&self) -> usize {
         self.held
     }
 
+    /// Whether `truncate(len)` would succeed.
+    pub fn can_truncate(&self, len: usize) -> bool {
+        if len > self.len {
+            return false;
+        }
+        if len == self.len || len == 0 {
+            return true;
+        }
+        let drop = self.len - len;
+        self.held.saturating_sub(drop) >= len.min(self.window)
+    }
+
     /// Appends `kv [n, width]` at `start` (== `len()`), stored as f16.
-    /// Returns the keys a query of this call may read (kept rows, then the
-    /// new rows) and the position of the first one.
-    pub fn append(&mut self, kv: &MxArray, start: usize) -> Result<(MxArray, usize)> {
+    /// When all keys needed by queries `start..start + n` fit in the ring
+    /// without overwriting needed history, returns [`WindowKeys::Ring`] pointing
+    /// directly at `buf` (O(1) zero-copy in-place write). Larger prefill chunks
+    /// return [`WindowKeys::Linear`] covering the call's needed window and
+    /// update `buf` with the trailing `min(held + n, cap)` rows.
+    pub fn append(&mut self, kv: &MxArray, start: usize) -> Result<WindowKeys<'_>> {
         if start != self.len {
             return Err(bad(format!(
                 "window append at {start}, {} positions held",
                 self.len
             )));
         }
+        if self.cap == 0 {
+            return Err(bad("window ring capacity must be > 0"));
+        }
         let n = rows_of(kv, self.width, "window append")?;
-        let kv = kv.astype(row_dtype())?;
-        let kept = self.kept();
-        let keys = match &self.rows {
-            Some(r) => MxArray::concatenate(r, &kv, 0)?,
-            None => kv.clone(),
-        };
-        let total = kept + n;
-        let hold = total.min(self.keep);
-        let rows = if total <= self.keep {
-            keys.clone()
-        } else if n >= self.keep {
-            // deep copy cuts lineage from a large prefill buffer
-            kv.slice(&[(n - hold) as i64, 0], &[n as i64, self.width])?
-                .deep_copy()?
-        } else if total - hold <= WINDOW_SLACK + 1 {
-            keys.slice(&[(total - hold) as i64, 0], &[total as i64, self.width])?
+        let kv = if kv.dtype()? == row_dtype() {
+            kv.clone()
         } else {
-            keys.slice(&[(total - hold) as i64, 0], &[total as i64, self.width])?
-                .deep_copy()?
+            kv.astype(row_dtype())?
         };
-        super::stats::defer(&rows, "hy_v4_flash window ring")?;
-        self.rows = Some(rows);
-        self.held = hold;
-        self.len = start + n;
-        Ok((keys, start - kept))
+        let end = start + n;
+        let kept = self.held;
+        let first_needed = (start + 1).saturating_sub(self.window).max(start - kept);
+        let cap_i64 = i64::try_from(self.cap).map_err(|_| bad("window capacity exceeds i64"))?;
+
+        if end - first_needed <= self.cap {
+            let prev = match self.buf.take() {
+                Some(b) => b,
+                None => MxArray::zeros(&[cap_i64, self.width], Some(row_dtype()))?,
+            };
+            let next = super::ops::ring_write(&prev, &kv, start % self.cap, self.cap)?;
+            drop(prev);
+            super::stats::defer(&next, "hy_v4_flash window ring")?;
+            self.buf = Some(next);
+            self.held = (kept + n).min(self.cap);
+            self.len = end;
+            let keys = self
+                .buf
+                .as_ref()
+                .ok_or_else(|| bad("window buffer missing"))?;
+            return Ok(WindowKeys::Ring {
+                keys,
+                cap: self.cap,
+            });
+        }
+
+        let prefix_len = start - first_needed;
+        let keys = if prefix_len > 0 {
+            let buf = self
+                .buf
+                .as_ref()
+                .ok_or_else(|| bad("window buffer missing"))?;
+            let prefix = linear_range(buf, self.cap, self.width, first_needed, prefix_len, false)?;
+            MxArray::concatenate(&prefix, &kv, 0)?
+        } else {
+            kv.clone()
+        };
+
+        let (src, write_start) = if n >= self.cap {
+            (
+                kv.slice(&[(n - self.cap) as i64, 0], &[n as i64, self.width])?,
+                end - self.cap,
+            )
+        } else {
+            (kv, start)
+        };
+        let prev = match self.buf.take() {
+            Some(b) => b,
+            None => MxArray::zeros(&[cap_i64, self.width], Some(row_dtype()))?,
+        };
+        let next = super::ops::ring_write(&prev, &src, write_start % self.cap, self.cap)?;
+        drop(prev);
+        super::stats::defer(&next, "hy_v4_flash window ring")?;
+        self.buf = Some(next);
+        self.held = (kept + n).min(self.cap);
+        self.len = end;
+        Ok(WindowKeys::Linear {
+            keys,
+            first: first_needed,
+        })
     }
 
-    /// Drops the positions past `len`. Refused when fewer than a window of
-    /// rows (or all of `len`) would remain held.
+    /// Drops the positions past `len` in O(1) metadata-only. Refused when fewer
+    /// than a window of rows (or all of `len`) would remain held.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
         if len > self.len {
             return Err(bad(format!(
@@ -188,41 +430,25 @@ impl WindowRing {
             return Ok(());
         }
         if len == 0 {
-            self.rows = None;
             self.held = 0;
             self.len = 0;
             return Ok(());
         }
         let drop = self.len - len;
-        let kept = self.kept();
-        let left = kept.saturating_sub(drop);
+        let left = self.held.saturating_sub(drop);
         if left < len.min(self.window) {
             return Err(bad(format!(
-                "window truncate {} -> {len} drops {drop} of {kept} held rows",
-                self.len
+                "window truncate {} -> {len} drops {drop} of {} held rows",
+                self.len, self.held
             )));
         }
-        let slice = self
-            .rows
-            .as_ref()
-            .ok_or_else(|| bad("window rows missing"))?
-            .slice(&[0, 0], &[left as i64, self.width])?;
-        let rows = if drop <= WINDOW_SLACK + 1 {
-            // cut_owner calls truncate outside DeferScope; avoid a copy and sync
-            slice
-        } else {
-            let rows = slice.deep_copy()?;
-            super::stats::defer(&rows, "hy_v4_flash window ring")?;
-            rows
-        };
-        self.rows = Some(rows);
         self.held = left;
         self.len = len;
         Ok(())
     }
 
     pub fn nbytes(&self) -> usize {
-        self.rows.as_ref().map_or(0, MxArray::nbytes)
+        self.buf.as_ref().map_or(0, MxArray::nbytes)
     }
 }
 
@@ -358,6 +584,157 @@ impl LayerCache {
         match self {
             Self::Window(r) => r.nbytes(),
             Self::Latent(b) => b.nbytes(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::hy_v4_flash::stats;
+
+    fn pattern_f16(rows: std::ops::Range<usize>, width: usize) -> MxArray {
+        let n = rows.len();
+        let bits: Vec<u16> = rows
+            .flat_map(|p| {
+                (0..width).map(move |c| {
+                    // Finite non-zero f16 bit pattern unique per (p, c)
+                    0x3C00 | (((p * 37 + c * 13) & 0x03FF) as u16)
+                })
+            })
+            .collect();
+        MxArray::from_float16(&bits, &[n as i64, width as i64]).unwrap()
+    }
+
+    fn bits_of(x: &MxArray) -> Vec<u16> {
+        x.to_uint16_native().unwrap().to_vec()
+    }
+
+    #[test]
+    fn circular_window_ring_wrap_around_truncate_and_snapshot_round_trip() {
+        let window = 12usize;
+        let width = 576usize;
+        let cap = window + WINDOW_SLACK;
+        let mut ring = WindowRing::new(window, WINDOW_SLACK, width as i64);
+
+        // Prefill chunk larger than cap (Linear path) followed by decode wrap-arounds (Ring path).
+        let total = cap * 2 + 7;
+        let all = pattern_f16(0..total, width);
+        let all_bits = bits_of(&all);
+        let row_bits = |p: usize| &all_bits[p * width..(p + 1) * width];
+
+        // 1. Large prefill chunk: 0..20 (> cap = 15).
+        match ring.append(&pattern_f16(0..20, width), 0).unwrap() {
+            WindowKeys::Linear { keys, first } => {
+                assert_eq!(first, 0);
+                assert_eq!(keys.shape_at(0).unwrap(), 20);
+            }
+            WindowKeys::Ring { .. } => panic!("expected Linear for prefill chunk > cap"),
+        }
+        assert_eq!((ring.len(), ring.kept(), ring.cap()), (20, cap, cap));
+
+        // 2. Decode single & multi-row appends crossing wrap boundary multiple times.
+        let mut pos = 20;
+        for step in [1usize, 3, 2, 1, 4, 1, 3, 2] {
+            let end = (pos + step).min(total);
+            if pos >= end {
+                break;
+            }
+            let chunk = pattern_f16(pos..end, width);
+            match ring.append(&chunk, pos).unwrap() {
+                WindowKeys::Ring { keys, cap: c } => {
+                    assert_eq!(c, cap);
+                    let buf_bits = bits_of(keys);
+                    let first_valid = end - cap;
+                    for p in first_valid..end {
+                        let slot = p % cap;
+                        assert_eq!(
+                            &buf_bits[slot * width..(slot + 1) * width],
+                            row_bits(p),
+                            "slot {slot} for pos {p}"
+                        );
+                    }
+                }
+                WindowKeys::Linear { .. } => panic!("expected Ring for decode step {step}"),
+            }
+            pos = end;
+        }
+        assert_eq!(pos, total);
+
+        // 3. Snapshot + from_snapshot bit-exact round-trip.
+        let snap = ring.snapshot().unwrap();
+        assert_eq!((snap.len(), snap.kept()), (total, cap));
+        let snap_bits = bits_of(snap.rows().unwrap());
+        let expected_linear: Vec<u16> = (total - cap..total)
+            .flat_map(|p| row_bits(p).iter().copied())
+            .collect();
+        assert_eq!(snap_bits, expected_linear);
+
+        let rebuilt = WindowRing::from_snapshot(&snap, WINDOW_SLACK).unwrap();
+        assert_eq!((rebuilt.len(), rebuilt.kept()), (total, cap));
+        let rebuilt_buf = bits_of(rebuilt.buf().unwrap());
+        for p in total - cap..total {
+            let slot = p % cap;
+            assert_eq!(
+                &rebuilt_buf[slot * width..(slot + 1) * width],
+                row_bits(p),
+                "rebuilt slot {slot} for pos {p}"
+            );
+        }
+        assert_eq!(
+            bits_of(rebuilt.snapshot().unwrap().rows().unwrap()),
+            snap_bits
+        );
+
+        // 4. O(1) metadata-only truncate within WINDOW_SLACK triggers zero evals and
+        // preserves all remaining window rows intact.
+        let evals_before = stats::thread_evals();
+        let target = total - WINDOW_SLACK;
+        ring.truncate(target).unwrap();
+        assert_eq!(stats::thread_evals(), evals_before);
+        assert_eq!((ring.len(), ring.kept()), (target, window));
+        let after_trunc = bits_of(ring.snapshot().unwrap().rows().unwrap());
+        let expected_after_trunc: Vec<u16> = (target - window..target)
+            .flat_map(|p| row_bits(p).iter().copied())
+            .collect();
+        assert_eq!(after_trunc, expected_after_trunc);
+
+        // Appending replacement rows overwrites discarded tail slots without touching snap.
+        let repl = pattern_f16(1000..1002, width);
+        let repl_bits = bits_of(&repl);
+        ring.append(&repl, target).unwrap();
+        let after_repl = bits_of(ring.snapshot().unwrap().rows().unwrap());
+        assert_eq!(&after_repl[..window * width], &expected_after_trunc[..]);
+        assert_eq!(&after_repl[window * width..], &repl_bits[..]);
+        assert_eq!(bits_of(snap.rows().unwrap()), expected_linear);
+    }
+
+    #[test]
+    fn ring_write_non_donatable_preserves_shared_buffer() {
+        let cap = 7usize;
+        let width = 12usize;
+        let base = pattern_f16(0..cap, width);
+        MxArray::eval_arrays_with_context(&[&base], "test ring base").unwrap();
+        let base_bits = bits_of(&base);
+
+        // Holding an alias makes `is_donatable(base, out)` false, forcing a safe copy.
+        let alias = base.clone();
+        let patch = pattern_f16(100..103, width);
+        let patch_bits = bits_of(&patch);
+        let out = super::super::ops::ring_write(&base, &patch, 5, cap).unwrap();
+        MxArray::eval_arrays_with_context(&[&out], "test ring write").unwrap();
+
+        assert_eq!(bits_of(&alias), base_bits);
+        let out_bits = bits_of(&out);
+        for slot in 0..cap {
+            let got = &out_bits[slot * width..(slot + 1) * width];
+            let want = match slot {
+                5 => &patch_bits[0..width],
+                6 => &patch_bits[width..2 * width],
+                0 => &patch_bits[2 * width..3 * width],
+                _ => &base_bits[slot * width..(slot + 1) * width],
+            };
+            assert_eq!(got, want, "slot {slot}");
         }
     }
 }

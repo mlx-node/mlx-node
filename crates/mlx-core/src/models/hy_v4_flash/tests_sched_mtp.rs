@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use super::cache::WINDOW_SLACK;
 use super::chat::{MTP_DEPTH_MAX, generation_defaults, resolve};
-use super::sched::{Open, WaveBudget, commit_len, rows_fit};
+use super::sched::{Open, WaveBudget, commit_len, mtp_wave_row_cap, rows_fit};
 use super::spec::{LOOKAHEAD_MAX, PAGED_PLAN, PLAN};
 use crate::engine::mtp_turn::turn_lookahead_rows;
 use crate::engine::plan::SpeculativeLane;
@@ -43,6 +43,21 @@ fn drafts_fill_the_row_cap_after_the_decode_rows() {
     assert_eq!(grants(4, 3, 11), vec![3, 3, 1, 0]);
     assert_eq!(grants(1, 3, 2), vec![1]);
     assert_eq!(grants(2, 3, 2), vec![0, 0]);
+}
+
+#[test]
+fn mtp_wave_row_cap_accommodates_multi_lane_depth_two_and_three() {
+    for base in [11usize, 12] {
+        let cap = mtp_wave_row_cap(base, 4, true, false);
+        assert_eq!(cap, 16);
+        assert_eq!(grants(4, 1, cap), vec![1, 1, 1, 1]);
+        assert_eq!(grants(4, 2, cap), vec![2, 2, 2, 2]);
+        assert_eq!(grants(4, 3, cap), vec![3, 3, 3, 3]);
+        assert_eq!(mtp_wave_row_cap(base, 4, false, false), base);
+        assert_eq!(mtp_wave_row_cap(base, 4, true, true), base);
+    }
+    assert_eq!(mtp_wave_row_cap(12, 2, true, false), 12);
+    assert_eq!(mtp_wave_row_cap(11, 3, true, false), 12);
 }
 
 /// Every lane keeps its decode row; a lane is cut only after every lane

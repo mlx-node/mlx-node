@@ -3573,6 +3573,19 @@ unsafe extern "C" {
         scale: f32,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_mla_prefill_sliding_nax(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
+        start_pos: i32,
+        is_ring: bool,
+        ring_cap: i32,
+        window_size: i32,
+        first_key: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_kq_prefill_indirect_gu(
         x: *mut mlx_array,
         token_rows: *mut mlx_array,
@@ -3654,6 +3667,34 @@ unsafe extern "C" {
         h: i32,
         down_bits: i32,
     ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_ring_write(
+        buf: *mut mlx_array,
+        src: *mut mlx_array,
+        start_slot: i32,
+        cap: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_indexer_score(
+        q: *mut mlx_array,
+        w: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        page_ids: *mut mlx_array,
+        n_groups: i32,
+        start_g: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_indexer_topk_cells(
+        scores: *mut mlx_array,
+        visible_groups: *mut mlx_array,
+        tail_starts: *mut mlx_array,
+        tail_lens: *mut mlx_array,
+        page_ids: *mut mlx_array,
+        n_top: i32,
+        kpool: i32,
+        kmax: i32,
+        block_size: i32,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C-unwind" {
@@ -3689,6 +3730,15 @@ unsafe extern "C-unwind" {
         release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
         ctx: *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    /// Standing Metal residency set over `arrays[0..count]` (`mlx_array_alloc.cpp`).
+    /// Must be destroyed before the backing buffers are freed. Null on failure
+    /// or non-Metal builds.
+    pub fn mlx_metal_residency_set_create(
+        arrays: *const *mut mlx_array,
+        count: usize,
+    ) -> *mut std::ffi::c_void;
+    pub fn mlx_metal_residency_set_request(handle: *mut std::ffi::c_void);
+    pub fn mlx_metal_residency_set_destroy(handle: *mut std::ffi::c_void);
     /// Set purgeability on an array's existing Metal allocation. `state` is 2
     /// (non-volatile), 3 (volatile), or 4 (empty); returns the previous state,
     /// or -1 on unsupported builds and invalid handles/states. Never evaluates.

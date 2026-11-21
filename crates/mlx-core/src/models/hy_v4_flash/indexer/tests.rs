@@ -1130,3 +1130,578 @@ fn decode_head_weights_run_per_row() {
     );
     assert_eq!(pre.len(), 3 * h);
 }
+
+#[cfg(target_os = "macos")]
+mod fused_metal {
+    use super::*;
+    use crate::models::hy_v4_flash::ops::{try_indexer_score, try_indexer_topk_cells};
+    use crate::models::hy_v4_flash::paged::{BLOCK, page_ids, slot_ids};
+
+    /// Builds a scattered physical page table of `n_pages` distinct physical
+    /// blocks inside `n_blocks` total blocks (`n_blocks >= n_pages`).
+    fn scattered_pages(n_pages: usize, n_blocks: usize) -> Vec<u32> {
+        let mut pages = Vec::with_capacity(n_pages);
+        for i in 0..n_pages {
+            pages.push(((i * 7 + 3) % n_blocks) as u32);
+        }
+        // Guarantee uniqueness if stride shares a factor with n_blocks.
+        let mut seen = vec![false; n_blocks];
+        for p in &mut pages {
+            while seen[*p as usize] {
+                *p = ((*p as usize + 1) % n_blocks) as u32;
+            }
+            seen[*p as usize] = true;
+        }
+        pages
+    }
+
+    /// Packs logical `[n_groups, 128]` f16 keys into a paged
+    /// `[n_blocks, index_rows, 128]` f16 pool at `(pages[(start_g + g)/index_rows], (start_g + g)%index_rows)`.
+    fn pack_paged_keys(
+        logical_f16: &[u16],
+        n_groups: usize,
+        start_g: usize,
+        pages: &[u32],
+        n_blocks: usize,
+        index_rows: usize,
+        d: usize,
+    ) -> MxArray {
+        let mut buf = vec![0u16; n_blocks * index_rows * d];
+        for g in 0..n_groups {
+            let g_abs = start_g + g;
+            let phys = pages[g_abs / index_rows] as usize;
+            let local = g_abs % index_rows;
+            let dst = (phys * index_rows + local) * d;
+            let src = g * d;
+            buf[dst..dst + d].copy_from_slice(&logical_f16[src..src + d]);
+        }
+        MxArray::from_float16(&buf, &[n_blocks as i64, index_rows as i64, d as i64]).unwrap()
+    }
+
+    #[test]
+    fn indexer_score_decode_and_prefill_flat_and_paged_match_reference() {
+        crate::models::hy_v4_flash::exact_f32();
+        let h = 16usize;
+        let d = 128usize;
+        let index_rows = 8usize;
+
+        for (s, n_groups, start_g, seed) in [
+            (1usize, 37usize, 0usize, 101u64),
+            (1usize, 256usize, 11usize, 102u64),
+            (4usize, 193usize, 5usize, 103u64),
+            (19usize, 73usize, 0usize, 104u64),
+            (64usize, 260usize, 8usize, 105u64),
+        ] {
+            let mut rng = Rng(seed);
+            let q_vec = rng.vec(s * h * d, 1.5);
+            let w_vec = rng.vec(s * h, 0.2);
+            let k_f32_vec = rng.vec(n_groups * d, 1.5);
+
+            let q = arr(&q_vec, &[s, h, d]);
+            let w = arr(&w_vec, &[s, h]);
+            let keys_f16 = arr(&k_f32_vec, &[n_groups, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
+            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
+
+            // Flat mode (with leading padding of `start_g` rows + trailing slack).
+            let cap_g = start_g + n_groups + 13;
+            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+            let mut flat_bits = vec![0u16; cap_g * d];
+            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
+            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
+
+            let Some(got_flat_arr) =
+                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
+            else {
+                eprintln!("skipping hy4_indexer_score Metal test (no GPU)");
+                return;
+            };
+            let got_flat = read(&got_flat_arr);
+            assert_eq!(got_flat.len(), want.len());
+            let mut max_diff_flat = 0.0f32;
+            for (g, wv) in got_flat.iter().zip(&want) {
+                max_diff_flat = max_diff_flat.max((g - wv).abs());
+            }
+            assert!(
+                max_diff_flat <= 1e-3,
+                "flat S={s} N_g={n_groups} start_g={start_g}: max_abs_diff={max_diff_flat}"
+            );
+
+            // Paged mode with scattered non-monotonic physical blocks.
+            let n_pages = (start_g + n_groups).div_ceil(index_rows);
+            let n_blocks = n_pages + 9;
+            let pages_u32 = scattered_pages(n_pages, n_blocks);
+            let pages_arr = page_ids(&pages_u32).unwrap();
+            let paged_pool = pack_paged_keys(
+                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
+            );
+
+            let got_paged_arr =
+                try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
+                    .unwrap()
+                    .expect("paged indexer_score");
+            let got_paged = read(&got_paged_arr);
+            assert_eq!(
+                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "paged vs flat bit mismatch for S={s} N_g={n_groups} start_g={start_g}"
+            );
+
+            // Decode multi-row invariance: S=4 matches 4 independent S=1 calls bit-for-bit.
+            if s == 4 {
+                for row in 0..s {
+                    let qr = q
+                        .slice(&[row as i64, 0, 0], &[(row + 1) as i64, h as i64, d as i64])
+                        .unwrap();
+                    let wr = w
+                        .slice(&[row as i64, 0], &[(row + 1) as i64, h as i64])
+                        .unwrap();
+                    let one = read(
+                        &try_indexer_score(
+                            &qr,
+                            &wr,
+                            &paged_pool,
+                            Some(&pages_arr),
+                            n_groups,
+                            start_g,
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    );
+                    let row_got = &got_paged[row * n_groups..(row + 1) * n_groups];
+                    assert_eq!(
+                        row_got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        one.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "decode row {row} invariance"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reference implementation matching `pick_groups + group_cells + tail + slot_ids`
+    /// for sparse rows (`vis > n_top`), and packed `0..vis*kpool + tail + -1` + `slot_ids`
+    /// for dense rows (`vis <= n_top`).
+    fn ref_topk_cells(
+        sc: &MxArray,
+        visible: &[i32],
+        tail_starts: &[i32],
+        tail_lens: &[i32],
+        pages: Option<&MxArray>,
+        n_top: usize,
+        kpool: usize,
+        kmax: usize,
+    ) -> Vec<i32> {
+        let s = visible.len();
+        let n_g = sc.shape_at(1).unwrap() as usize;
+        let can_pick = n_g >= n_top;
+        let picked_all = if can_pick {
+            Some(read_i32(&pick_groups(sc, visible, n_top).unwrap()))
+        } else {
+            None
+        };
+        let mut logical = vec![-1i32; s * kmax];
+        for r in 0..s {
+            let vis = visible[r].max(0) as usize;
+            let row = &mut logical[r * kmax..(r + 1) * kmax];
+            let ts = tail_starts[r];
+            let tl = tail_lens[r].max(0) as usize;
+            if vis <= n_top {
+                let n_vis = vis * kpool;
+                for (i, slot) in row.iter_mut().enumerate().take(n_vis.min(kmax)) {
+                    *slot = i as i32;
+                }
+                for off in 0..tl {
+                    if n_vis + off < kmax {
+                        row[n_vis + off] = ts + off as i32;
+                    }
+                }
+            } else {
+                let ids = &picked_all.as_ref().unwrap()[r * n_top..(r + 1) * n_top];
+                for (gi, &g_id) in ids.iter().enumerate() {
+                    if g_id >= 0 {
+                        for sub in 0..kpool {
+                            row[gi * kpool + sub] = g_id * kpool as i32 + sub as i32;
+                        }
+                    }
+                }
+                let base = n_top * kpool;
+                for off in 0..tl {
+                    if base + off < kmax {
+                        row[base + off] = ts + off as i32;
+                    }
+                }
+            }
+        }
+        let logical_arr = MxArray::from_int32(&logical, &[s as i64, kmax as i64]).unwrap();
+        match pages {
+            Some(p) => read_i32(&slot_ids(p, &logical_arr).unwrap()),
+            None => logical,
+        }
+    }
+
+    fn check_topk_case(
+        label: &str,
+        score_rows: &[Vec<f32>],
+        visible: &[i32],
+        tail_starts: &[i32],
+        tail_lens: &[i32],
+        n_top: usize,
+        kpool: usize,
+        kmax: usize,
+    ) {
+        let s = score_rows.len();
+        let n_g = score_rows[0].len();
+        let flat_scores: Vec<f32> = score_rows.iter().flatten().copied().collect();
+        let sc = arr(&flat_scores, &[s, n_g]);
+        let vis_arr = MxArray::from_int32(visible, &[s as i64]).unwrap();
+        let ts_arr = MxArray::from_int32(tail_starts, &[s as i64]).unwrap();
+        let tl_arr = MxArray::from_int32(tail_lens, &[s as i64]).unwrap();
+
+        let max_cell = visible
+            .iter()
+            .zip(tail_starts)
+            .zip(tail_lens)
+            .map(|((&v, &ts), &tl)| ((v.max(0) as usize) * kpool).max((ts + tl).max(0) as usize))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let n_pages = max_cell.div_ceil(BLOCK as usize);
+        let n_blocks = n_pages + 11;
+        let pages_u32 = scattered_pages(n_pages, n_blocks);
+        let pages_arr = page_ids(&pages_u32).unwrap();
+
+        // Flat (PAGED=false)
+        let Some(got_flat_arr) = try_indexer_topk_cells(
+            &sc,
+            &vis_arr,
+            &ts_arr,
+            &tl_arr,
+            None,
+            n_top,
+            kpool,
+            kmax,
+            BLOCK as usize,
+        )
+        .unwrap() else {
+            eprintln!("skipping hy4_indexer_topk_cells Metal test (no GPU)");
+            return;
+        };
+        let got_flat = read_i32(&got_flat_arr);
+        let want_flat = ref_topk_cells(
+            &sc,
+            visible,
+            tail_starts,
+            tail_lens,
+            None,
+            n_top,
+            kpool,
+            kmax,
+        );
+        assert_eq!(got_flat, want_flat, "{label} (flat)");
+
+        // Paged (PAGED=true)
+        let got_paged_arr = try_indexer_topk_cells(
+            &sc,
+            &vis_arr,
+            &ts_arr,
+            &tl_arr,
+            Some(&pages_arr),
+            n_top,
+            kpool,
+            kmax,
+            BLOCK as usize,
+        )
+        .unwrap()
+        .expect("paged topk_cells");
+        let got_paged = read_i32(&got_paged_arr);
+        let want_paged = ref_topk_cells(
+            &sc,
+            visible,
+            tail_starts,
+            tail_lens,
+            Some(&pages_arr),
+            n_top,
+            kpool,
+            kmax,
+        );
+        assert_eq!(got_paged, want_paged, "{label} (paged)");
+    }
+
+    #[test]
+    fn indexer_topk_cells_dense_fast_path_and_distinct_large_contexts() {
+        let n_top = 511usize;
+        let kpool = 4usize;
+        let kmax = 2048usize;
+
+        // 1. Dense fast path: vis <= n_top (0, 1, 17, 510, 511)
+        let mut rng = Rng(201);
+        let dense_vis = vec![0i32, 1, 17, 510, 511];
+        let dense_ts: Vec<i32> = dense_vis.iter().map(|&v| v * kpool as i32).collect();
+        let dense_tl = vec![1i32, 4, 2, 3, 4];
+        let dense_scores: Vec<Vec<f32>> = (0..dense_vis.len()).map(|_| rng.vec(520, 5.0)).collect();
+        check_topk_case(
+            "dense vis <= n_top",
+            &dense_scores,
+            &dense_vis,
+            &dense_ts,
+            &dense_tl,
+            n_top,
+            kpool,
+            kmax,
+        );
+
+        // 2. Large contexts: vis = 1024, 4096, 8192 with distinct scores
+        for (vis, s, seed) in [(1024usize, 3usize, 202u64), (4096, 10, 203), (8192, 4, 204)] {
+            let mut r = Rng(seed);
+            let cols = vis + 17;
+            let mut rows_sc = Vec::with_capacity(s);
+            let mut vis_v = Vec::with_capacity(s);
+            let mut ts_v = Vec::with_capacity(s);
+            let mut tl_v = Vec::with_capacity(s);
+            for row in 0..s {
+                let v = vis - (row % 3);
+                vis_v.push(v as i32);
+                ts_v.push((v * kpool) as i32);
+                tl_v.push(((row % 4) + 1) as i32);
+                // Distinct scores with wide dynamic range (positive + negative)
+                rows_sc.push(
+                    (0..cols)
+                        .map(|g| r.next() * 50.0 + (g as f32) * 1e-5)
+                        .collect(),
+                );
+            }
+            check_topk_case(
+                &format!("distinct vis={vis} s={s}"),
+                &rows_sc,
+                &vis_v,
+                &ts_v,
+                &tl_v,
+                n_top,
+                kpool,
+                kmax,
+            );
+        }
+    }
+
+    #[test]
+    fn indexer_topk_cells_heavy_ties_negatives_zeros_and_signed_zero_bit_exact() {
+        let n_top = 511usize;
+        let kpool = 4usize;
+        let kmax = 2048usize;
+        let vis = 2048usize;
+        let cols = vis + 16;
+
+        // Row 0: all equal positive scores
+        let r0 = vec![1.25f32; cols];
+
+        // Row 1: all equal negative scores
+        let r1 = vec![-3.5f32; cols];
+
+        // Row 2: all zeros, alternating -0.0f and +0.0f (must tie and pick 0..511!)
+        let r2: Vec<f32> = (0..cols)
+            .map(|g| if g % 2 == 0 { -0.0f32 } else { 0.0f32 })
+            .collect();
+
+        // Row 3: 50% tied at threshold 0.0 (mixing -0.0f and +0.0f), 200 strictly
+        // above, rest strictly below
+        let r3: Vec<f32> = (0..cols)
+            .map(|g| {
+                if g % 10 == 7 && g < 2000 {
+                    5.0 + (g as f32) * 1e-4
+                } else if g % 2 == 0 {
+                    if g % 4 == 0 { -0.0f32 } else { 0.0f32 }
+                } else {
+                    -1.0 - (g as f32) * 1e-3
+                }
+            })
+            .collect();
+
+        // Row 4: 50% tied at negative threshold -2.5f, 300 strictly above (still negative!)
+        let r4: Vec<f32> = (0..cols)
+            .map(|g| {
+                if g % 7 == 3 && g < 2100 {
+                    -0.1 - (g as f32) * 1e-5
+                } else if g % 2 == 1 {
+                    -2.5f32
+                } else {
+                    -50.0f32
+                }
+            })
+            .collect();
+
+        // Row 5: strictly negative distinct values with subnormals & -inf/+inf
+        let mut r5: Vec<f32> = (0..cols).map(|g| -(g as f32) * 0.01 - 1e-30).collect();
+        r5[1500] = f32::INFINITY;
+        r5[1501] = f32::MAX;
+        r5[0] = f32::NEG_INFINITY;
+        r5[10] = -0.0f32;
+        r5[11] = 0.0f32;
+        r5[12] = -f32::from_bits(1); // negative min subnormal
+        r5[13] = f32::from_bits(1); // positive min subnormal
+
+        // Row 6: threshold strictly at -0.0f/+0.0f with > 511 zeros and some -0.0
+        // earlier than +0.0
+        let mut r6 = vec![-1.0f32; cols];
+        for g in 0..100 {
+            r6[cols - 1 - g] = 1.0f32; // invisible or late high values
+        }
+        for (g, v) in r6.iter_mut().enumerate().take(1500).skip(100) {
+            *v = if g < 800 { -0.0f32 } else { 0.0f32 };
+        }
+
+        // Row 7: every visible entry is -0.0f except 100 late entries are +0.0f
+        let mut r7 = vec![-0.0f32; cols];
+        r7[1800..cols].fill(0.0f32);
+
+        let rows_sc = vec![r0, r1, r2, r3, r4, r5, r6, r7];
+        let visible = vec![vis as i32; rows_sc.len()];
+        let tail_starts = vec![(vis * kpool) as i32; rows_sc.len()];
+        let tail_lens = vec![1i32, 2, 3, 4, 1, 2, 3, 4];
+
+        check_topk_case(
+            "heavy ties & signed zero",
+            &rows_sc,
+            &visible,
+            &tail_starts,
+            &tail_lens,
+            n_top,
+            kpool,
+            kmax,
+        );
+
+        // Also test NaN handling explicitly: NaNs must rank strictly below -inf.
+        let mut nan_row = vec![f32::NAN; 1024];
+        nan_row[700] = f32::NEG_INFINITY;
+        nan_row[200] = -1000.0;
+        nan_row[900] = 0.0;
+        let sc = arr(&nan_row, &[1, 1024]);
+        let vis_arr = MxArray::from_int32(&[1024], &[1]).unwrap();
+        let ts_arr = MxArray::from_int32(&[4096], &[1]).unwrap();
+        let tl_arr = MxArray::from_int32(&[2], &[1]).unwrap();
+        if let Some(got_arr) = try_indexer_topk_cells(
+            &sc,
+            &vis_arr,
+            &ts_arr,
+            &tl_arr,
+            None,
+            4,
+            4,
+            20,
+            BLOCK as usize,
+        )
+        .unwrap()
+        {
+            let got = read_i32(&got_arr);
+            // Groups 200, 700, 900 are finite/-inf; 4th pick is lowest-index NaN = group 0!
+            // Sorted ascending: groups [0, 200, 700, 900], plus tail [4096, 4097], padded -1.
+            let expected = vec![
+                0, 1, 2, 3, 800, 801, 802, 803, 2800, 2801, 2802, 2803, 3600, 3601, 3602, 3603,
+                4096, 4097, -1, -1,
+            ];
+            assert_eq!(
+                got, expected,
+                "NaN ranks below -inf with lowest-index tie-break"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_real_dim_128_flat_and_paged_slots_match_reference() {
+        use crate::models::hy_v4_flash::paged::{PageGeometry, SlotMap, create};
+
+        crate::models::hy_v4_flash::exact_f32();
+        let g = IndexerGeometry {
+            n_heads: 16,
+            head_dim: 128,
+            rope_dim: 64,
+            kpool: 4,
+            n_top: 8,
+            select_tail: true,
+            eps: 1e-5,
+            weight_scale: (2048f32).sqrt().recip(),
+            rope_theta: 1e7,
+        };
+        let (w, hw) = indexer_weights(&g, 303);
+        let ix = Indexer::new(g.clone(), &w).unwrap();
+        let n = 68usize; // 17 groups > n_top=8, crosses 2 pages of 32 tokens
+        let xs = inputs(n, D, 304);
+        let qrs = inputs(n, Q_LORA, 305);
+
+        let want = host_cells(&g, &hw, &xs, &qrs);
+
+        // Flat IndexerState (exercises hy4_indexer_score PAGED=false + hy4_indexer_topk_cells PAGED=false)
+        let mut flat_st = IndexerState::new(128, &g);
+        let flat_prefill = ix
+            .select(
+                &w,
+                prefill(&rows_of(&xs[..64]), &rows_of(&qrs[..64]), 0),
+                &mut flat_st,
+            )
+            .unwrap();
+        let flat_decode = ix
+            .select(
+                &w,
+                Call {
+                    x: &rows_of(&xs[64..]),
+                    qr: &rows_of(&qrs[64..]),
+                    start: 64,
+                    kind: RowKind::Decode,
+                },
+                &mut flat_st,
+            )
+            .unwrap();
+        let mut got_flat = cell_sets(&flat_prefill);
+        got_flat.extend(cell_sets(&flat_decode));
+        assert_eq!(got_flat, want, "flat D=128 H=16 vs host");
+
+        // Paged IndexerState + select_paged_slots (exercises hy4_indexer_score PAGED=true + hy4_indexer_topk_cells PAGED=true)
+        let pg = PageGeometry {
+            layers: 1,
+            half: 32,
+            index_rows: (BLOCK as usize / g.kpool) as u32,
+            index_dim: g.head_dim as u32,
+        };
+        let Ok(mut adapter) = create(&pg, 1024, 12, 12, u64::MAX) else {
+            return;
+        };
+        let mut paged_st = PagedIndexerState::new(0, &g);
+        // Interleave another sequence's pages so physical page IDs are scattered.
+        adapter.record_tokens_for(99, &[1; 32]).unwrap();
+        adapter.record_tokens_for(1, &[2; 64]).unwrap();
+        let slots0 = SlotMap::of(&adapter).unwrap();
+        let got_p0 = ix
+            .select_paged_slots(
+                &w,
+                prefill(&rows_of(&xs[..64]), &rows_of(&qrs[..64]), 0),
+                &mut paged_st,
+                &mut adapter,
+                &slots0,
+            )
+            .unwrap();
+        let want_p0 = slots0.slots(&adapter, &flat_prefill).unwrap();
+        assert_eq!(read_i32(&got_p0), read_i32(&want_p0), "paged prefill D=128");
+
+        adapter.record_tokens_for(99, &[1; 32]).unwrap();
+        adapter.record_tokens_for(1, &[2; 4]).unwrap();
+        let slots1 = SlotMap::of(&adapter).unwrap();
+        let got_p1 = ix
+            .select_paged_slots(
+                &w,
+                Call {
+                    x: &rows_of(&xs[64..]),
+                    qr: &rows_of(&qrs[64..]),
+                    start: 64,
+                    kind: RowKind::Decode,
+                },
+                &mut paged_st,
+                &mut adapter,
+                &slots1,
+            )
+            .unwrap();
+        let want_p1 = slots1.slots(&adapter, &flat_decode).unwrap();
+        assert_eq!(read_i32(&got_p1), read_i32(&want_p1), "paged decode D=128");
+    }
+}

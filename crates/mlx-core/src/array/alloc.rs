@@ -34,6 +34,41 @@ pub(crate) struct DstPtrs {
     pub layout: OutLayout,
 }
 
+/// Standing Metal residency set keeping backing buffers' GPU page tables
+/// resident across command buffers. Must be dropped before the arrays it tracks.
+pub(crate) struct MetalResidencySet {
+    handle: *mut std::ffi::c_void,
+}
+
+// SAFETY: `MTL::ResidencySet` is reference-counted and thread-safe for
+// `requestResidency()` and final teardown when uniquely owned here.
+unsafe impl Send for MetalResidencySet {}
+unsafe impl Sync for MetalResidencySet {}
+
+impl MetalResidencySet {
+    pub(crate) fn create(arrays: &[&MxArray]) -> Option<Self> {
+        if arrays.is_empty() {
+            return None;
+        }
+        let ptrs: Vec<*mut sys::mlx_array> = arrays.iter().map(|a| a.handle.0).collect();
+        // SAFETY: every handle in `ptrs` points to a live `MxArray` for the call.
+        let handle = unsafe { sys::mlx_metal_residency_set_create(ptrs.as_ptr(), ptrs.len()) };
+        (!handle.is_null()).then_some(Self { handle })
+    }
+
+    pub(crate) fn request(&self) {
+        // SAFETY: `self.handle` is a live residency set owned by `self`.
+        unsafe { sys::mlx_metal_residency_set_request(self.handle) };
+    }
+}
+
+impl Drop for MetalResidencySet {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` is uniquely owned and destroyed once on drop.
+        unsafe { sys::mlx_metal_residency_set_destroy(self.handle) };
+    }
+}
+
 impl MxArray {
     /// A row-contiguous `shape` / `dtype` array over a fresh, uninitialized
     /// buffer, its storage pointer and its byte length. Model thread only. The
@@ -520,6 +555,81 @@ mod tests {
                 assert!(!called.load(Ordering::SeqCst));
 
                 assert_eq!(libc::munmap(ptr, len), 0);
+            }
+        }
+
+        #[test]
+        fn metal_residency_set_create_request_and_drop_over_mmap_arrays() {
+            assert!(
+                unsafe { sys::mlx_metal_is_available() },
+                "residency set Metal test requires a Metal device on macOS"
+            );
+            let _guard = MMAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(MetalResidencySet::create(&[]).is_none());
+
+            let page = super::super::super::page_size();
+            let len = 2 * page;
+            let temp1 = TempMmapFile::new("rset-1", len);
+            let temp2 = TempMmapFile::new("rset-2", len);
+            let released1 = Arc::new(AtomicBool::new(false));
+            let released2 = Arc::new(AtomicBool::new(false));
+            let lease1 = Arc::new(MmapLease {
+                ptr: temp1.map_readonly(),
+                len,
+                released: Arc::clone(&released1),
+            });
+            let lease2 = Arc::new(MmapLease {
+                ptr: temp2.map_readonly(),
+                len,
+                released: Arc::clone(&released2),
+            });
+            let ptr1 = lease1.ptr;
+            let ptr2 = lease2.ptr;
+            let ctx1 = Arc::into_raw(lease1).cast_mut().cast::<c_void>();
+            let ctx2 = Arc::into_raw(lease2).cast_mut().cast::<c_void>();
+
+            // SAFETY: valid page-aligned read-only mappings owned by `lease1`/`lease2`.
+            let arr1 = unsafe { MxArray::from_mmap_readonly(ptr1, len, release_mmap_lease, ctx1) }
+                .unwrap();
+            let arr2 = unsafe { MxArray::from_mmap_readonly(ptr2, len, release_mmap_lease, ctx2) }
+                .unwrap();
+
+            let rset = MetalResidencySet::create(&[&arr1, &arr2])
+                .expect("MetalResidencySet::create should succeed on Metal");
+            rset.request();
+
+            let s1 = arr1
+                .astype(DType::Float32)
+                .unwrap()
+                .sum(None, None)
+                .unwrap();
+            let s2 = arr2
+                .astype(DType::Float32)
+                .unwrap()
+                .sum(None, None)
+                .unwrap();
+            let want1: f32 = temp1.bytes.iter().map(|&b| f32::from(b)).sum();
+            let want2: f32 = temp2.bytes.iter().map(|&b| f32::from(b)).sum();
+            assert_eq!(s1.to_float32().unwrap()[0], want1);
+            assert_eq!(s2.to_float32().unwrap()[0], want2);
+
+            rset.request();
+            drop(s1);
+            drop(s2);
+            synchronize();
+            // Drop residency set before the backing mmap arrays.
+            drop(rset);
+            drop(arr1);
+            drop(arr2);
+            synchronize();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !(released1.load(Ordering::Acquire) && released2.load(Ordering::Acquire)) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mmap leases did not release after dropping residency set and arrays"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
     }

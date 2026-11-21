@@ -253,15 +253,21 @@ impl SlotMap {
         })
     }
 
-    /// `slot_ids` over this map's pages. Refused once the active request's
-    /// pages differ from the ones the map was built on.
-    pub fn slots(&self, adapter: &PagedKVCacheAdapter, idx: &MxArray) -> Result<MxArray> {
+    /// Validated `[pages]` i32 page table of the active request. Refused once
+    /// the active request's pages differ from the ones the map was built on.
+    pub fn pages(&self, adapter: &PagedKVCacheAdapter) -> Result<&MxArray> {
         let now = adapter
             .block_table()
             .map(|t| (t.metadata_identity(), t.physical_revision()));
         if now != Some(self.table) {
             return Err(bad("slot map of other pages than the active request's"));
         }
-        slot_ids(&self.pages, idx)
+        Ok(&self.pages)
+    }
+
+    /// `slot_ids` over this map's pages. Refused once the active request's
+    /// pages differ from the ones the map was built on.
+    pub fn slots(&self, adapter: &PagedKVCacheAdapter, idx: &MxArray) -> Result<MxArray> {
+        slot_ids(self.pages(adapter)?, idx)
     }
 }

@@ -622,3 +622,100 @@ fn a_clean_stop_copies_every_block_past_the_queue_window() {
     assert!(flushed);
     drop(disk);
 }
+
+/// Circular `WindowRing` wrapped across many multiples of `cap` encodes into
+/// `HY4S` linear format and decodes back into an identical live `OwnerCell`.
+#[test]
+fn hy4s_state_round_trips_wrapped_circular_window_ring() {
+    use super::cache::WINDOW_SLACK;
+    use super::indexer::{IndexerGeometry, PagedIndexerState, TokTail};
+    use super::owner::{CellLayer, OwnerCell};
+    use super::persist_codec::{decode_state, encode_state_into};
+    use super::prefix_state::StateLayer;
+    use crate::array::MxArray;
+
+    let cfg = super::tests_model::tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let width = cfg.mla.kv_row();
+    let idx_layer = cfg
+        .trunk()
+        .iter()
+        .position(|l| l.attn == super::config::Attn::Indexed)
+        .unwrap();
+    let idx_g = IndexerGeometry::of(&cfg, idx_layer).unwrap();
+
+    let mut cell = OwnerCell::new(&cfg, None).unwrap();
+    let total = 2 * BLOCK_ROWS;
+    let tok: Vec<u32> = (0..total as u32).map(|i| 7 + i).collect();
+
+    // Grow in mixed chunks so every sliding ring wraps multiple times (cap = 8 + 3 = 11).
+    let mut pos = 0usize;
+    for chunk in [19usize, 1, 3, 2, 1, 6, 32] {
+        let bits: Vec<u16> = (pos..pos + chunk)
+            .flat_map(|p| (0..width).map(move |c| 0x3C00 | (((p * 29 + c * 7) & 0x03FF) as u16)))
+            .collect();
+        let kv = MxArray::from_float16(&bits, &[chunk as i64, width as i64]).unwrap();
+        let end = pos + chunk;
+        for part in cell.layers_mut() {
+            match part {
+                CellLayer::Window(ring) => {
+                    ring.append(&kv, pos).unwrap();
+                }
+                CellLayer::Index(ix) => {
+                    let held = (idx_g.kpool - 1 + WINDOW_SLACK).min(end);
+                    let tail_vals: Vec<f32> = (0..held * idx_g.head_dim)
+                        .map(|i| (end + i) as f32 * 0.25)
+                        .collect();
+                    let r =
+                        MxArray::from_float32(&tail_vals, &[held as i64, idx_g.head_dim as i64])
+                            .unwrap();
+                    let tail = TokTail::of_rows(&idx_g, Some(r), end).unwrap();
+                    *ix = PagedIndexerState::at(ix.layer(), tail);
+                }
+            }
+        }
+        cell.advance(&tok[pos..end]).unwrap();
+        pos = end;
+    }
+    assert_eq!(pos, total);
+
+    let state = cell.state().unwrap().unwrap();
+    let mut buf = vec![0u8; shape.span_bytes() as usize];
+    assert!(encode_state_into(&state, &mut buf).unwrap());
+    assert_eq!(&buf[..4], b"HY4S");
+
+    let decoded = decode_state(&buf, &shape, Vec::new()).unwrap();
+    assert_eq!(decoded.row, total);
+    let restored = OwnerCell::from_state(&cfg, &decoded, &tok, None).unwrap();
+
+    for (l, (orig, back)) in cell.layers().iter().zip(restored.layers()).enumerate() {
+        if let (CellLayer::Window(a), CellLayer::Window(b)) = (orig, back) {
+            assert_eq!((a.len(), a.kept()), (b.len(), b.kept()), "layer {l}");
+            let a_bits = a
+                .snapshot()
+                .unwrap()
+                .rows()
+                .unwrap()
+                .to_uint16_native()
+                .unwrap()
+                .to_vec();
+            let b_bits = b
+                .snapshot()
+                .unwrap()
+                .rows()
+                .unwrap()
+                .to_uint16_native()
+                .unwrap()
+                .to_vec();
+            assert_eq!(a_bits, b_bits, "layer {l} window bits");
+            if let StateLayer::Window(sw) = &decoded.layers[l] {
+                assert_eq!(
+                    sw.rows().unwrap().to_uint16_native().unwrap().to_vec(),
+                    a_bits
+                );
+            } else {
+                panic!("expected StateLayer::Window at layer {l}");
+            }
+        }
+    }
+}

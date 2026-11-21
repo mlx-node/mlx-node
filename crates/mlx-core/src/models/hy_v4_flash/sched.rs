@@ -46,7 +46,7 @@ use super::prefill::{BLOCK_ROWS, Grid};
 use super::prefix_state::{Key, States, Turn, prompt_keys, turn_keys};
 use super::spec::{self, LOOKAHEAD_MAX};
 use super::stats::{self, Counters, WaveSample};
-use super::store::{LADDER_BYTES, Store, kv_per_token, lane_bytes};
+use super::store::{LADDER_BYTES, SPLITK_ENV, Store, kv_per_token, lane_bytes, splitk_min_m};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{PoolCacheLimitGuard, coordinator};
 use crate::engine::backend::{DsparkProposal, PagedBackend, PagedPrefix, PagedSpeculativeArgs};
@@ -55,8 +55,8 @@ use crate::engine::governor::governor::{
 };
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
-    ScheduledStateCapacity, ScheduledVerifyCommit, ScheduledVerifyRow, SchedulerOwnerContext,
-    StepClaims, scheduler_max_num_seqs_for,
+    ScheduledProposalRequest, ScheduledStateCapacity, ScheduledVerifyCommit, ScheduledVerifyRow,
+    SchedulerOwnerContext, StepClaims, scheduler_max_num_seqs_for,
 };
 use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
 use crate::engine::paged_epilogue::FinalTokenPolicy;
@@ -484,6 +484,23 @@ pub fn commit_len(open: Open, keep: usize) -> Result<usize> {
     Ok(open.start + keep)
 }
 
+/// Effective decode-wave row cap in paged mode. With MTP enabled and no
+/// explicit split-K override, accommodates all admitted lanes at maximum draft
+/// depth (`lanes * LOOKAHEAD_MAX`) so multi-lane depth 2-3 waves are not
+/// throttled back to depth 1.
+pub fn mtp_wave_row_cap(
+    base_row_cap: usize,
+    lanes: usize,
+    mtp: bool,
+    splitk_override: bool,
+) -> usize {
+    if mtp && !splitk_override && base_row_cap >= MIN_Q8_ROWS as usize {
+        base_row_cap.max(lanes.saturating_mul(LOOKAHEAD_MAX))
+    } else {
+        base_row_cap
+    }
+}
+
 /// Whether `rows` more rows fit an owner of `len` positions: one cut must
 /// be able to drop all but the anchor, one wave must hold them, and the
 /// context must.
@@ -547,6 +564,8 @@ impl Paged {
         let cfg = store.model.cfg();
         let g = PageGeometry::of(cfg)?;
         let lanes = lanes(store.lanes, store.row_cap);
+        let splitk_override = splitk_min_m(std::env::var(SPLITK_ENV).ok().as_deref()).is_some();
+        let row_cap = mtp_wave_row_cap(store.row_cap, lanes, store.mtp, splitk_override);
         let max_blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
         let max_blocks = u32::try_from(max_blocks).map_err(|_| bad("pool blocks exceed u32"))?;
         let page = g.block_bytes()?;
@@ -590,7 +609,7 @@ impl Paged {
             busy: Busy::default(),
             safe: SafePoint::new(READMIT_EVERY),
             lanes,
-            row_cap: store.row_cap,
+            row_cap,
             published: 0,
             restored: 0,
             spec: Spec::default(),
@@ -881,7 +900,11 @@ impl Run<'_> {
                     .ok_or_else(|| bad("the wave returned no hidden rows"))?;
                 lag_chunk(m, self.model, d, start, r.ids, h)?;
             }
-            stats::flush("hy_v4_flash MTP lag")?;
+            if self.kind.is_decode() && !stats::profiling() {
+                stats::async_flush();
+            } else {
+                stats::flush("hy_v4_flash MTP lag")?;
+            }
         }
         Ok(outs)
     }
@@ -1763,8 +1786,9 @@ impl Inner {
             }
     }
 
-    /// One draft row at the end of `seq`'s draft from `h` and `emb`.
-    pub(super) fn draft_row(
+    /// One draft row at the end of `seq`'s draft from `h` and `emb`, deferring
+    /// KV/indexer eval to the caller's scope.
+    pub(super) fn draft_row_lazy(
         &mut self,
         seq: SeqId,
         h: &MxArray,
@@ -1780,7 +1804,7 @@ impl Inner {
             .get_mut(seq)
             .and_then(OwnerCell::draft_mut)
             .ok_or_else(|| bad(format!("owner {seq} has no draft")))?;
-        m.draft(&store.model, d, h, emb)
+        m.draft_lazy(&store.model, d, h, emb)
     }
 
     /// `n` drafts after `anchor` on `seq`'s settled draft, drawn as the
@@ -1819,19 +1843,22 @@ impl Inner {
         &mut self,
         seq: SeqId,
         mut h: MxArray,
-        mut token: u32,
+        anchor: u32,
         n: usize,
         params: &ChatParams,
         rng: &mut dyn Rng,
     ) -> Result<DsparkProposal> {
+        let _scope = stats::DeferScope::enter();
         let mut out = empty_proposal();
         let target = params.sampling_config.unwrap_or_default();
         let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
         let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
+        let mut tok = MxArray::from_uint32(&[anchor], &[1])?;
+        let mut step_ids: Vec<MxArray> = Vec::with_capacity(n);
+        let mut step_dists: Vec<MxArray> = Vec::new();
         for step in 0..n {
-            let tok = MxArray::from_uint32(&[token], &[1])?;
             let emb = self.store.model.weights().token_embd().rows(&tok)?;
-            let (next, logits) = self.draft_row(seq, &h, &emb)?;
+            let (next, logits) = self.draft_row_lazy(seq, &h, &emb)?;
             let logits = logits.reshape(&[-1])?;
             let (id, dist) = if greedy {
                 (logits.argmax(-1, None)?.astype(DType::Int32)?, None)
@@ -1841,24 +1868,354 @@ impl Inner {
                 let id = crate::sampling::sample_dense_distribution_array(&dist, &mut *rng)?;
                 (id, Some(dist))
             };
-            let mut eval_targets: Vec<&MxArray> = Vec::with_capacity(3);
-            eval_targets.push(&id);
-            if let Some(d) = dist.as_ref() {
-                eval_targets.push(d);
+            let id_1d = id.reshape(&[1])?;
+            if let Some(d) = dist {
+                step_dists.push(d);
             }
             if step + 1 < n {
-                eval_targets.push(&next);
+                tok = id_1d.clone();
+                h = next;
             }
-            stats::eval(&eval_targets, "hy_v4_flash MTP proposal")?;
-            if let Some(d) = dist {
-                out.draft_dists.push(d);
-            }
-            let id = id.item_at_int32(0)?;
-            token = u32::try_from(id).map_err(|_| bad(format!("draft id {id}")))?;
-            out.draft_ids.push(id);
-            h = next;
+            step_ids.push(id_1d);
         }
+        let mut eval_targets: Vec<&MxArray> = Vec::with_capacity(step_ids.len() + step_dists.len());
+        eval_targets.extend(step_ids.iter());
+        eval_targets.extend(step_dists.iter());
+        stats::eval(&eval_targets, "hy_v4_flash MTP proposal")?;
+        for id in &step_ids {
+            let v = id.item_at_int32(0)?;
+            u32::try_from(v).map_err(|_| bad(format!("draft id {v}")))?;
+            out.draft_ids.push(v);
+        }
+        out.draft_dists = step_dists;
         Ok(out)
+    }
+
+    /// Batched MTP proposals across all eligible lanes: shares `embed_tokens`,
+    /// `eh_proj`, `mla.project_at`, `mla.finish_with_gate`, `ffn`,
+    /// `shared_head_norm`, and the vocab head in one pass per depth step, with
+    /// lazy GPU token-to-embedding chaining and a single `stats::eval` across
+    /// all depth steps.
+    fn propose_batch(
+        &mut self,
+        requests: &mut [ScheduledProposalRequest<'_>],
+    ) -> Vec<Result<DsparkProposal>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        if self.mtp.is_none() {
+            return requests.iter().map(|_| Err(no_mtp())).collect();
+        }
+        let grants: Vec<usize> = match self.paged_mut() {
+            Ok(p) => {
+                let row_cap = p.row_cap;
+                requests
+                    .iter()
+                    .map(|req| p.spec.budget.grant(req.seq_id, req.max_drafts, row_cap))
+                    .collect()
+            }
+            Err(e) => {
+                return requests
+                    .iter()
+                    .map(|_| Err(Error::from_reason(e.reason.clone())))
+                    .collect();
+            }
+        };
+
+        struct ActiveLane {
+            req_idx: usize,
+            seq: SeqId,
+            grant: usize,
+            greedy: bool,
+            cfg: crate::sampling::SamplingConfig,
+            h: MxArray,
+            tok: MxArray,
+            step_ids: Vec<MxArray>,
+            step_dists: Vec<MxArray>,
+        }
+
+        let mut results: Vec<Result<DsparkProposal>> =
+            (0..requests.len()).map(|_| Ok(empty_proposal())).collect();
+        let mut active: Vec<ActiveLane> = Vec::with_capacity(requests.len());
+        let mut seen = HashSet::with_capacity(requests.len());
+
+        for (i, (&grant, req)) in grants.iter().zip(requests.iter()).enumerate() {
+            if grant == 0 {
+                continue;
+            }
+            if !seen.insert(req.seq_id) {
+                results[i] = Err(bad(format!(
+                    "duplicate owner {} in proposal batch",
+                    req.seq_id
+                )));
+                continue;
+            }
+            if let Err(e) = self.settle(req.seq_id) {
+                results[i] = Err(e);
+                continue;
+            }
+            let last = match self.owner_len(req.seq_id).checked_sub(1) {
+                Some(l) => l,
+                None => {
+                    results[i] = Err(bad(format!(
+                        "owner {} proposes on an empty cell",
+                        req.seq_id
+                    )));
+                    continue;
+                }
+            };
+            let seed = match self
+                .paged()
+                .ok()
+                .and_then(|p| p.owners.get(req.seq_id))
+                .and_then(OwnerCell::draft)
+                .and_then(|d| d.seed(last))
+                .cloned()
+            {
+                Some(s) => s,
+                None => {
+                    results[i] = Err(bad(format!(
+                        "owner {} has no seed for row {last}",
+                        req.seq_id
+                    )));
+                    continue;
+                }
+            };
+            let tok = match MxArray::from_uint32(&[req.anchor], &[1]) {
+                Ok(t) => t,
+                Err(e) => {
+                    results[i] = Err(e);
+                    continue;
+                }
+            };
+            let target = req.params.sampling_config.unwrap_or_default();
+            let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
+            let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
+            active.push(ActiveLane {
+                req_idx: i,
+                seq: req.seq_id,
+                grant,
+                greedy,
+                cfg,
+                h: seed,
+                tok,
+                step_ids: Vec::with_capacity(grant),
+                step_dists: Vec::new(),
+            });
+        }
+
+        if active.is_empty() {
+            return results;
+        }
+
+        let max_depth = active.iter().map(|l| l.grant).max().unwrap_or(0);
+        let dim = self.store.model.cfg().dim as i64;
+        let (was, mut cells) = match self.paged_mut() {
+            Ok(p) => {
+                let was = p.owners.active();
+                let mut cells = Vec::with_capacity(active.len());
+                let mut taken_ok = true;
+                for lane in &active {
+                    match p.owners.take(lane.seq) {
+                        Some(cell) => cells.push((lane.seq, cell)),
+                        None => {
+                            taken_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !taken_ok {
+                    for (seq, cell) in cells {
+                        let _ = p.owners.put(seq, cell);
+                    }
+                    let _ = reactivate(p, was);
+                    for lane in &active {
+                        results[lane.req_idx] =
+                            Err(bad(format!("owner {} lost its cell", lane.seq)));
+                    }
+                    return results;
+                }
+                (was, cells)
+            }
+            Err(e) => {
+                for lane in &active {
+                    results[lane.req_idx] = Err(Error::from_reason(e.reason.clone()));
+                }
+                return results;
+            }
+        };
+
+        let run_res: Result<()> = (|| {
+            let _scope = stats::DeferScope::enter();
+            let m = self.mtp.as_ref().ok_or_else(no_mtp)?;
+            let model = &self.store.model;
+            let token_embd = model.weights().token_embd();
+
+            for step in 0..max_depth {
+                let step_indices: Vec<usize> = active
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, lane)| (step < lane.grant).then_some(idx))
+                    .collect();
+                let b = step_indices.len();
+                if b == 0 {
+                    break;
+                }
+
+                let tok_batch = if b == 1 {
+                    active[step_indices[0]].tok.clone()
+                } else {
+                    let toks: Vec<&MxArray> =
+                        step_indices.iter().map(|&idx| &active[idx].tok).collect();
+                    MxArray::concatenate_many(toks, Some(0))?
+                };
+                let emb_batch = token_embd.rows(&tok_batch)?;
+
+                let h_rows: Vec<MxArray> = step_indices
+                    .iter()
+                    .map(|&idx| active[idx].h.reshape(&[1, dim]))
+                    .collect::<Result<_>>()?;
+                let h_batch = if b == 1 {
+                    h_rows[0].clone()
+                } else {
+                    MxArray::concatenate_many(h_rows.iter().collect(), Some(0))?
+                };
+
+                let mut step_set = vec![false; cells.len()];
+                for &idx in &step_indices {
+                    step_set[idx] = true;
+                }
+                let mut drafts: Vec<&mut super::mtp::Draft> = Vec::with_capacity(b);
+                for (idx, (seq, cell)) in cells.iter_mut().enumerate() {
+                    if step_set[idx] {
+                        let d = cell
+                            .draft_mut()
+                            .ok_or_else(|| bad(format!("owner {seq} has no draft")))?;
+                        drafts.push(d);
+                    }
+                }
+
+                let (h_next, logits) = m.draft_batch(model, &mut drafts, &h_batch, &emb_batch)?;
+                let all_greedy = step_indices.iter().all(|&idx| active[idx].greedy);
+                let vocab = logits.shape_at(1)?;
+
+                if all_greedy {
+                    let argmax_all = logits.argmax(-1, None)?.astype(DType::Int32)?;
+                    for (j, &idx) in step_indices.iter().enumerate() {
+                        let lo = j as i64;
+                        let hi = lo + 1;
+                        let id_1d = if b == 1 {
+                            argmax_all.reshape(&[1])?
+                        } else {
+                            argmax_all.slice(&[lo], &[hi])?
+                        };
+                        let lane = &mut active[idx];
+                        if step + 1 < lane.grant {
+                            lane.tok = id_1d.clone();
+                            lane.h = if b == 1 {
+                                h_next.clone()
+                            } else {
+                                h_next.slice(&[lo, 0], &[hi, dim])?
+                            };
+                        }
+                        lane.step_ids.push(id_1d);
+                    }
+                } else {
+                    for (j, &idx) in step_indices.iter().enumerate() {
+                        let lo = j as i64;
+                        let hi = lo + 1;
+                        let row_logits = if b == 1 {
+                            logits.reshape(&[-1])?
+                        } else {
+                            logits.slice(&[lo, 0], &[hi, vocab])?.reshape(&[-1])?
+                        };
+                        let lane = &mut active[idx];
+                        let (id_1d, dist) = if lane.greedy {
+                            (
+                                row_logits
+                                    .argmax(-1, None)?
+                                    .astype(DType::Int32)?
+                                    .reshape(&[1])?,
+                                None,
+                            )
+                        } else {
+                            let dist = crate::sampling::sampling_distribution(
+                                &row_logits,
+                                Some(lane.cfg),
+                            )?
+                            .astype(DType::Float32)?;
+                            let id = crate::sampling::sample_dense_distribution_array(
+                                &dist,
+                                &mut *requests[lane.req_idx].rng,
+                            )?
+                            .reshape(&[1])?;
+                            (id, Some(dist))
+                        };
+                        if let Some(d) = dist {
+                            lane.step_dists.push(d);
+                        }
+                        if step + 1 < lane.grant {
+                            lane.tok = id_1d.clone();
+                            lane.h = if b == 1 {
+                                h_next.clone()
+                            } else {
+                                h_next.slice(&[lo, 0], &[hi, dim])?
+                            };
+                        }
+                        lane.step_ids.push(id_1d);
+                    }
+                }
+            }
+
+            let mut eval_targets: Vec<&MxArray> = Vec::new();
+            for lane in &active {
+                eval_targets.extend(lane.step_ids.iter());
+                eval_targets.extend(lane.step_dists.iter());
+            }
+            stats::eval(&eval_targets, "hy_v4_flash MTP proposal batch")?;
+            Ok(())
+        })();
+
+        if let Ok(p) = self.paged_mut() {
+            for (seq, cell) in cells {
+                let _ = p.owners.put(seq, cell);
+            }
+            let _ = reactivate(p, was);
+        }
+
+        for lane in &active {
+            let settle_res = self.settle(lane.seq);
+            if let Err(e) = &run_res {
+                results[lane.req_idx] = Err(Error::from_reason(e.reason.clone()));
+                continue;
+            }
+            if let Err(e) = settle_res {
+                results[lane.req_idx] = Err(e);
+                continue;
+            }
+            let mut proposal = empty_proposal();
+            let mut lane_err = None;
+            for id in &lane.step_ids {
+                match id.item_at_int32(0) {
+                    Ok(v) if u32::try_from(v).is_ok() => proposal.draft_ids.push(v),
+                    Ok(v) => {
+                        lane_err = Some(bad(format!("draft id {v}")));
+                        break;
+                    }
+                    Err(e) => {
+                        lane_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = lane_err {
+                results[lane.req_idx] = Err(e);
+            } else {
+                proposal.draft_dists = lane.step_dists.clone();
+                results[lane.req_idx] = Ok(proposal);
+            }
+        }
+        results
     }
 
     /// One decode wave of `rows` (distinct owners) on settled drafts: every
@@ -2272,6 +2629,13 @@ impl HybridSchedulerBackend for Inner {
         let row_cap = p.row_cap;
         let n = p.spec.budget.grant(seq, cap, row_cap);
         self.propose(seq, anchor, n, params, rng)
+    }
+
+    fn propose_scheduled_batch(
+        &mut self,
+        requests: &mut [ScheduledProposalRequest<'_>],
+    ) -> Vec<Result<DsparkProposal>> {
+        self.propose_batch(requests)
     }
 
     fn run_scheduled_verify(&mut self, rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
