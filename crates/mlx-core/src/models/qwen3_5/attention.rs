@@ -837,7 +837,20 @@ impl Qwen3_5Attention {
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, None)
+        self.forward_impl(x, mask, cache, position_ids, None, None)
+    }
+
+    /// Tree-verification variant of [`Self::forward`] with per-node RoPE depths
+    /// and ancestor-bitmask SDPA.
+    pub(crate) fn forward_tree(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<MxArray> {
+        self.forward_impl(x, mask, cache, position_ids, None, tree)
     }
 
     /// Returns residual-inclusive hidden state; callers must not add again.
@@ -849,7 +862,85 @@ impl Qwen3_5Attention {
         position_ids: Option<&MxArray>,
         residual: &MxArray,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, Some(residual))
+        self.forward_impl(x, mask, cache, position_ids, Some(residual), None)
+    }
+
+    /// Prefill tail pruning (non-final chunk, final FullAttn layer):
+    /// updates the KV cache for all rows and skips Q/SDPA/gate/O completely.
+    pub(crate) fn forward_kv_only(&self, x: &MxArray, cache: Option<&mut KVCache>) -> Result<()> {
+        let Some(c) = cache else {
+            return Ok(());
+        };
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let (keys, values) = self.project_kv(x)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let keys = self.k_norm.forward(&keys)?;
+        let offset = c.get_offset();
+        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = self.rope.forward(&k_t, Some(offset))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+        let _ = c.update_and_fetch(&keys, &values)?;
+        Ok(())
+    }
+
+    /// Prefill tail pruning (final chunk, final FullAttn layer):
+    /// updates the KV cache for all rows, then runs Q/SDPA/gate/O on ONLY the
+    /// last row `[B, 1, hidden]`.
+    pub(crate) fn forward_last_row_prefill(
+        &self,
+        x: &MxArray,
+        cache: Option<&mut KVCache>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+        let (keys, values) = self.project_kv(x)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let keys = self.k_norm.forward(&keys)?;
+        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = self.rope.forward(&k_t, Some(offset))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+        let (keys, values) = if let Some(c) = cache {
+            c.update_and_fetch(&keys, &values)?
+        } else {
+            (keys, values)
+        };
+
+        let x_last = x.slice_axis(1, seq_len - 1, seq_len)?;
+        let (queries, gate) = self.project_q_gate(&x_last, batch, 1)?;
+        let queries = self.q_norm.forward(&queries)?;
+        let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let last_offset = offset + (seq_len as i32) - 1;
+        let queries = self.rope.forward(&q_t, Some(last_offset))?;
+        let output =
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?;
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+        self.o_proj.forward(&gated_output)
     }
 
     fn forward_impl(
@@ -859,9 +950,23 @@ impl Qwen3_5Attention {
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
         residual: Option<&MxArray>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        if let Some(tv) = tree {
+            if batch != 1 {
+                return Err(Error::from_reason(format!(
+                    "Qwen3_5Attention tree forward requires batch == 1, got {batch}"
+                )));
+            }
+            if seq_len as usize != tv.tree_len {
+                return Err(Error::from_reason(format!(
+                    "Qwen3_5Attention tree forward seq_len {seq_len} != tree_len {}",
+                    tv.tree_len
+                )));
+            }
+        }
 
         let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
 
@@ -880,89 +985,190 @@ impl Qwen3_5Attention {
             self.head_dim as i64,
         ])?;
 
-        let source_pair =
-            if self.source_qk.is_some() && position_ids.is_none() && batch == 1 && seq_len == 8 {
+        let mut cache = cache;
+        // Capture prefix KV length BEFORE appending tree/block rows so
+        // `sdpa_tree_few` and tree RoPE know the exact prefix boundary.
+        let pre_cache_len = cache.as_ref().map_or(0, |c| c.get_offset());
+        let fused_qkv = if self.source_qk.is_none()
+            && position_ids.is_none()
+            && !self.rope.traditional
+            && !self.rope.is_scaled()
+            && self.q_norm.eps_f32().to_bits() == self.k_norm.eps_f32().to_bits()
+            && let Some(c) = cache.as_deref_mut()
+        {
+            if let Some(tv) = tree {
+                c.qk_norm_rope_update_and_fetch_tree(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.q_norm.weight(),
+                    self.k_norm.weight(),
+                    &tv.depths_i32,
+                    self.q_norm.eps_f32(),
+                    self.rope.dims,
+                    self.rope.base,
+                    self.rope.scale,
+                    self.rope.traditional,
+                )?
+            } else {
+                c.qk_norm_rope_update_and_fetch(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.q_norm.weight(),
+                    self.k_norm.weight(),
+                    self.q_norm.eps_f32(),
+                    self.rope.dims,
+                    self.rope.base,
+                    self.rope.scale,
+                )?
+            }
+        } else {
+            None
+        };
+
+        let (queries, keys, values) = if let Some(triple) = fused_qkv {
+            triple
+        } else {
+            let source_pair = if tree.is_none()
+                && self.source_qk.is_some()
+                && position_ids.is_none()
+                && batch == 1
+                && seq_len == 8
+            {
                 let offset = cache.as_ref().map_or(0, |c| c.get_offset());
                 let offsets = MxArray::from_int32(&[offset], &[1])?;
                 self.try_source_qk_norm_rope(&queries, &keys, &offsets)?
             } else {
                 None
             };
-        let (queries, keys) = if let Some(pair) = source_pair {
-            pair
-        } else {
-            // Apply QK normalization (operates on last dim)
-            let queries = self.q_norm.forward(&queries)?;
-            let keys = self.k_norm.forward(&keys)?;
-
-            // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
-            let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope)
-            {
-                // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
-                // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
-                // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
-                let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-                // Transpose to [B, H, T, D] for the rotary apply.
-                let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-                let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-                let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
-                    &q_t,
-                    &k_t,
-                    &cos,
-                    &sin,
-                    mrope.mrope_section_arr().to_vec(),
-                )?;
-                // Transpose back to [B, T, H, D]
-                let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
-                let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
-                (q_out, k_out)
+            let (queries, keys) = if let Some(pair) = source_pair {
+                pair
+            } else if let Some(tv) = tree {
+                // Non-CUDA / Metal / YaRN tree fallback: QK-norm + per-node
+                // depth RoPE at positions `pre_cache_len + depths[t]`.
+                let queries = self.q_norm.forward(&queries)?;
+                let keys = self.k_norm.forward(&keys)?;
+                let base_arr = MxArray::from_int32(&[pre_cache_len], &[1])?;
+                let pos_offsets = tv.depths_i32.add(&base_arr)?;
+                let q_r =
+                    queries.reshape(&[seq_len, self.num_heads as i64, 1, self.head_dim as i64])?;
+                let k_r =
+                    keys.reshape(&[seq_len, self.num_kv_heads as i64, 1, self.head_dim as i64])?;
+                let q_rot = self
+                    .rope
+                    .forward_with_offsets(&q_r, &pos_offsets)?
+                    .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                let k_rot = self
+                    .rope
+                    .forward_with_offsets(&k_r, &pos_offsets)?
+                    .reshape(&[1, seq_len, self.num_kv_heads as i64, self.head_dim as i64])?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                (q_rot, k_rot)
             } else {
-                // Standard scalar-offset RoPE (text-only path).
-                //
-                // `fast::rope` varies the rotation position along axis -2 of its
-                // input, so it must see the [B, H, T, D] layout (token axis at
-                // -2) — matching mlx-lm's `self.rope(x.transpose(0, 2, 1, 3),
-                // offset)`. Applying it on [B, T, H, D] rotates along the HEAD
-                // axis instead: every token in a multi-token forward gets the
-                // same angle (offset + head_index), collapsing per-token
-                // positions. Transpose in, rotate, transpose back (the extra
-                // transposes are views; qwen3.5's partial rotary
-                // (rope_dims < head_dim) takes the rope kernel's copying
-                // `dims_ < D` branch either way, so the transposed input costs a
-                // strided rather than vector copy — the same price mlx-lm pays).
-                let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-                let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-                let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-                let q_rot = self.rope.forward(&q_t, Some(offset))?;
-                let k_rot = self.rope.forward(&k_t, Some(offset))?;
-                (
-                    q_rot.transpose(Some(&[0, 2, 1, 3]))?,
-                    k_rot.transpose(Some(&[0, 2, 1, 3]))?,
-                )
+                // Apply QK normalization (operates on last dim)
+                let queries = self.q_norm.forward(&queries)?;
+                let keys = self.k_norm.forward(&keys)?;
+
+                // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
+                let (queries, keys) =
+                    if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
+                        // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
+                        // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
+                        // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
+                        let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+                        // Transpose to [B, H, T, D] for the rotary apply.
+                        let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+                        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+                        let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
+                            &q_t,
+                            &k_t,
+                            &cos,
+                            &sin,
+                            mrope.mrope_section_arr().to_vec(),
+                        )?;
+                        // Transpose back to [B, T, H, D]
+                        let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
+                        let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
+                        (q_out, k_out)
+                    } else {
+                        // Standard scalar-offset RoPE (text-only path).
+                        let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+                        let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+                        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+                        let q_rot = self.rope.forward(&q_t, Some(offset))?;
+                        let k_rot = self.rope.forward(&k_t, Some(offset))?;
+                        (
+                            q_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                            k_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                        )
+                    };
+
+                // Transpose to [B, H, T, D] for KVCache and SDPA
+                let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+                let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+                (queries, keys)
             };
+            let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-            // Transpose to [B, H, T, D] for KVCache and SDPA
-            let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
-            let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            (queries, keys)
-        };
-        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        // Update KV cache (expects [B, H, T, D])
-        let (keys, values) = if let Some(c) = cache {
-            c.update_and_fetch(&keys, &values)?
-        } else {
-            (keys, values)
+            // Update KV cache (expects [B, H, T, D])
+            let (keys, values) = if let Some(c) = cache {
+                c.update_and_fetch(&keys, &values)?
+            } else {
+                (keys, values)
+            };
+            (queries, keys, values)
         };
 
         // Scaled dot-product attention using fast kernel.
+        // When `tree` is `Some`: use `sdpa_tree_few` on CUDA (mask_mode=3) or
+        // an explicit boolean ancestor mask fallback on Metal/CPU.
         // When no explicit mask is provided:
         //   - seq_len > 1 (prefill): use "causal" mode — MLX's fused Metal kernel handles
         //     causal masking internally without materializing an O(N²) mask array.
         //     This matches Python mlx-lm's `create_attention_mask` returning "causal".
         //   - seq_len == 1 (decode): no mask needed (single token only attends to past).
         // When an explicit mask is provided (e.g., sliding window): use it directly.
-        let output = if let Some(m) = mask {
+        let output = if let Some(tv) = tree {
+            let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+            if let Some(out) = crate::kernels::attention::sdpa_tree_few(
+                &queries,
+                &keys,
+                &values,
+                &tv.mask_u32,
+                pre_cache_len,
+                self.head_dim as i64,
+                gqa,
+                seq_len,
+                self.scale,
+            )? {
+                out
+            } else {
+                let kv_len = keys.shape_at(2)?;
+                let prefix_len = usize::try_from(pre_cache_len).map_err(|_| {
+                    Error::from_reason("Qwen3_5Attention tree SDPA: negative cache_len")
+                })?;
+                let tree_len = seq_len as usize;
+                let masks = tv.mask_u32.to_uint32()?;
+                let mut visible = Vec::with_capacity(tree_len * kv_len as usize);
+                for &row_mask in masks.iter().take(tree_len) {
+                    visible.resize(visible.len() + prefix_len, 1u8);
+                    for j in 0..tree_len {
+                        visible.push(u8::from(((row_mask >> j) & 1) != 0));
+                    }
+                }
+                let tree_mask = MxArray::from_uint8(&visible, &[1, 1, seq_len, kv_len])?
+                    .not_equal(&MxArray::from_uint8(&[0], &[1])?)?;
+                scaled_dot_product_attention(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                    Some(&tree_mask),
+                )?
+            }
+        } else if let Some(m) = mask {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
         } else if seq_len > 1 {
             // The fused vector kernel launches 32×gqa×qL threads in its
@@ -1024,6 +1230,15 @@ impl Qwen3_5Attention {
                 &values,
                 self.head_dim as i64,
                 gqa,
+                seq_len,
+                self.scale,
+            )? {
+                out
+            } else if let Some(out) = crate::kernels::attention::sdpa_prefill_d256(
+                &queries,
+                &keys,
+                &values,
+                self.head_dim as i64,
                 seq_len,
                 self.scale,
             )? {

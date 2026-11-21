@@ -801,6 +801,23 @@ unsafe extern "C-unwind" {
         out_k: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Standalone fused CUDA QK-Norm + non-traditional partial RoPE matching
+    /// `mlx_qk_norm_rope` semantics (`q` `[B, T, HQ, D]`, `k` `[B, T, HK, D]`,
+    /// plain RMSNorm weights `[D]`, `offsets` int32 `[B]` or scalar for `B == 1`).
+    pub fn mlx_qk_norm_rope_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        q_weight: *mut mlx_array,
+        k_weight: *mut mlx_array,
+        offsets: *mut mlx_array,
+        eps: f32,
+        rope_base: f32,
+        rope_scale: f32,
+        rope_dims: i32,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+    ) -> bool;
+
     // Strict test entry: null on unsupported segmented dispatch; no concat
     // fallback. Always the vector routes (bit-identical to MLX's vector
     // SDPA), whatever the calibrated crossover says.
@@ -2050,9 +2067,46 @@ unsafe extern "C-unwind" {
         mode: *const std::os::raw::c_char,
     ) -> *mut mlx_array;
 
+    pub fn mlx_kquant_prefill(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_kquant_few_multi(
+        x: *mut mlx_array,
+        count: u32,
+        weights: *const *mut mlx_array,
+        scales: *const *mut mlx_array,
+        biases: *const *mut mlx_array,
+        modes: *const *const std::os::raw::c_char,
+        out_handles: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_kquant_prefill_multi(
+        x: *mut mlx_array,
+        count: u32,
+        weights: *const *mut mlx_array,
+        scales: *const *mut mlx_array,
+        biases: *const *mut mlx_array,
+        modes: *const *const std::os::raw::c_char,
+        out_handles: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Direct BF16 -> BF16 small-row (M in 2..=8) affine 8-bit group_size=32
     /// quantized matmul with FP32 scales and biases on CUDA.
     pub fn mlx_affine_q8_few_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// Direct BF16 -> BF16 small-row (M in 1..=8) affine 4-bit group_size=64
+    /// quantized matmul with BF16 scales and biases on CUDA (8-warp split-K MMA).
+    pub fn mlx_affine_q4_g64_few_cuda(
         x: *mut mlx_array,
         w: *mut mlx_array,
         scales: *mut mlx_array,
@@ -2078,6 +2132,25 @@ unsafe extern "C-unwind" {
         mask: *mut mlx_array,
         scale: f32,
         is_causal: bool,
+    ) -> *mut mlx_array;
+
+    /// Tensor-Core split-KV Flash-Decoding for tree verify (`Q in 1..=16`, D in {128, 256},
+    /// `tree_mask` uint32 `[Q]` bitmask over speculative tree nodes past `cache_len`).
+    pub fn mlx_sdpa_tc_tree_few_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        tree_mask: *mut mlx_array,
+        cache_len: i32,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    /// FlashAttention-2 D=256 BF16 causal prefill SDPA on CUDA.
+    pub fn mlx_sdpa_prefill_d256_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        scale: f32,
     ) -> *mut mlx_array;
 
     /// BF16 `x` times a transposed affine projection whose scales/biases are
@@ -2382,6 +2455,55 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    /// CUDA deferred-fold fused GDN step: folds `prev_keep` accepted rows from
+    /// `(prev_k, prev_v, prev_g, prev_beta)` into `state_base` before stepping
+    /// the current window and returning `(out_y, out_committed_state)`.
+    /// When `prev_keep == 0`, `prev_*` may be null and `out_committed_state`
+    /// aliases `state_base`.
+    pub fn mlx_gdn_fused_step_deferred_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA tree-verify fused GDN step with deferred fold (`parent` is int32 `[T]`,
+    /// `prev_indices` is nullable int32 `[prev_keep]`).
+    pub fn mlx_gdn_tree_step_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        prev_indices: *mut mlx_array,
+        parent: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA fused GDN accepted-prefix recurrent-state replay (no q/output).
     pub fn mlx_gdn_replay_cuda(
         k: *mut mlx_array,
@@ -2406,6 +2528,48 @@ unsafe extern "C-unwind" {
         mean_eps: bool,
         beta_input_dtype: bool,
         outputs: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Tree-conv1d variant of fused CUDA GDN preparation (`conv_taps` is int32 `[T, 4]`).
+    pub fn mlx_gdn_prepare_tree_cuda(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        mean_eps: bool,
+        beta_input_dtype: bool,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_gdn_prefill_chain_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_gdn_prefill_chain_gated_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
     ) -> bool;
 
     // The complete fused GDN layer core: `qwen4_gdn_prepare` (conv + SiLU +
@@ -2516,6 +2680,55 @@ unsafe extern "C-unwind" {
         src: *const *mut mlx_array,
         offsets: *const i32,
         out: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qk_norm_rope_kv_store_cuda(
+        q_in: *mut mlx_array,
+        k_in: *mut mlx_array,
+        v_in: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        offset: i32,
+        out_q: *mut *mut mlx_array,
+        out_k_cache: *mut *mut mlx_array,
+        out_v_cache: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Tree-RoPE variant of fused CUDA QK-Norm + partial RoPE + in-place KV cache store.
+    /// RoPE position for token `t` is `offset + depths[t]`, while KV writes at `offset + t`.
+    pub fn mlx_qk_norm_rope_kv_store_tree_cuda(
+        q_in: *mut mlx_array,
+        k_in: *mut mlx_array,
+        v_in: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        depths: *mut mlx_array,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        offset: i32,
+        out_q: *mut *mut mlx_array,
+        out_k_cache: *mut *mut mlx_array,
+        out_v_cache: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Race-free in-place CUDA KV cache row compaction for tree acceptance (`keep <= 16`).
+    pub fn mlx_kv_compact_rows_cuda(
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        base_offset: i32,
+        accepted_nodes: *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+        out_v: *mut *mut mlx_array,
     ) -> bool;
 
     // Draft proposal tail store. Six inputs: full K/V, live+reserved K/V
@@ -2982,6 +3195,23 @@ unsafe extern "C" {
         scores: *mut mlx_array,
         out_path: *mut *mut mlx_array,
         out_confidence: *mut *mut mlx_array,
+    ) -> bool;
+    /// Single-block GPU-resident DFlash2 speculative verification tree builder.
+    /// Outputs 6 arrays into `outputs[0..6]`:
+    /// `[tree_tokens [1,T] u32, parent [T] i32, depths [T] i32, ancestors_mask [T] u32,
+    ///  conv_taps [T,4] i32, node_meta [T,4] f32]`.
+    pub fn mlx_dflash2_select_tree_cuda(
+        candidates: *mut mlx_array,
+        scores: *mut mlx_array,
+        lookup_tokens: *mut mlx_array,
+        lookup_rates: *mut mlx_array,
+        budget_intercepts: *mut mlx_array,
+        anchor: u32,
+        lookup_len: i32,
+        max_nodes: i32,
+        max_depth: i32,
+        budget_slope: f32,
+        outputs: *mut *mut mlx_array,
     ) -> bool;
     /// Sampled DFlash2 predecessor walk: candidates `[1,L,K]` i32, score
     /// tables `[L,K,K]` f32, uniforms `[L]` f32, temperature `[1]` f32.

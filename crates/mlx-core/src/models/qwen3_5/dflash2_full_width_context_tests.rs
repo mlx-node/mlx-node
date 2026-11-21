@@ -232,7 +232,7 @@ fn full_width_context_commit_feeds_eager_and_compiled_draft_identically() {
         block[0] = anchor as i32;
         let block = MxArray::from_int32(&block, &[1, 8]).unwrap();
         let (actual, probability) = model
-            .propose_compiled(&embedding, None, &mut compiled, &block, true)
+            .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
             .unwrap()
             .unwrap();
         MxArray::eval_arrays(&[&actual]).unwrap();

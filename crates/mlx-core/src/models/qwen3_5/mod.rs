@@ -37,6 +37,7 @@ pub(crate) mod scheduled_dflash2;
 pub(crate) mod scheduled_mtp;
 #[cfg(all(test, target_os = "macos"))]
 mod store_epilogue_tests;
+pub(crate) mod verify_tree;
 pub use config::Qwen3_5Config;
 pub use model::Qwen3_5Model;
 
