@@ -1196,3 +1196,324 @@ fn router_topk_gpu_matches_route_select_fast_and_is_row_invariant() {
         }
     }
 }
+
+#[test]
+fn hc_fused_suite_matches_unfused_and_is_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let hc = 4i64;
+    let norm_eps = 1e-5f32;
+    let hc_eps = 1e-6f32;
+    let magnitude = 2.0f32;
+    let cfg = HcConfig {
+        count: hc as usize,
+        eps: hc_eps,
+        magnitude,
+    };
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    for &d in &[64i64, 66, 3072] {
+        let hd = (hc * d) as usize;
+        let scale_w = 1.0 / (hd as f32).sqrt();
+        let w_next = HcWeights {
+            weight: MxArray::from_float32(
+                &det_f32(2101 + d as u64, (2 * hc) as usize * hd, scale_w),
+                &[2 * hc, hc * d],
+            )
+            .unwrap(),
+            scale: MxArray::from_float32(&[0.75, 1.25], &[2]).unwrap(),
+            base: MxArray::from_float32(
+                &det_f32(2201 + d as u64, (2 * hc) as usize, 0.5),
+                &[2 * hc],
+            )
+            .unwrap(),
+        };
+        let w_head = HcWeights {
+            weight: MxArray::from_float32(
+                &det_f32(2301 + d as u64, hc as usize * hd, scale_w),
+                &[hc, hc * d],
+            )
+            .unwrap(),
+            scale: MxArray::from_float32(&[0.85], &[1]).unwrap(),
+            base: MxArray::from_float32(&det_f32(2401 + d as u64, hc as usize, 0.5), &[hc])
+                .unwrap(),
+        };
+        let post_norm_w = MxArray::from_float32(
+            &det_f32(2501 + d as u64, d as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[d],
+        )
+        .unwrap();
+        let next_norm_w = MxArray::from_float32(
+            &det_f32(2601 + d as u64, d as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[d],
+        )
+        .unwrap();
+
+        let max_m = 17usize;
+        let x_all = MxArray::from_float32(
+            &det_f32(2701 + d as u64, max_m * hd, 1.5),
+            &[max_m as i64, hc, d],
+        )
+        .unwrap();
+        let y_all = MxArray::from_float32(
+            &det_f32(2801 + d as u64, max_m * d as usize, 1.5),
+            &[max_m as i64, d],
+        )
+        .unwrap();
+        let post_prev_all = MxArray::from_float32(
+            &det_f32(2901 + d as u64, max_m * hc as usize, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[max_m as i64, hc],
+        )
+        .unwrap();
+
+        let sample_rows = [0usize, 1, 3, 16];
+        let mut s_mrn_h = std::collections::HashMap::new();
+        let mut s_mrn_p = std::collections::HashMap::new();
+        let mut s_hn = std::collections::HashMap::new();
+        let mut s_pnhp = std::collections::HashMap::new();
+        let mut s_br_x = std::collections::HashMap::new();
+        let mut s_br_h = std::collections::HashMap::new();
+        let mut s_br_p = std::collections::HashMap::new();
+        let mut s_br_skip_h = std::collections::HashMap::new();
+        let mut s_br_head = std::collections::HashMap::new();
+
+        for &r in &sample_rows {
+            let xr = x_all
+                .slice(&[r as i64, 0, 0], &[r as i64 + 1, hc, d])
+                .unwrap();
+            let yr = y_all.slice(&[r as i64, 0], &[r as i64 + 1, d]).unwrap();
+            let pr = post_prev_all
+                .slice(&[r as i64, 0], &[r as i64 + 1, hc])
+                .unwrap();
+
+            let (mrn_h, mrn_p) =
+                hc_mix_reduce_norm(&xr, &w_next, &next_norm_w, norm_eps, &cfg).unwrap();
+            let hn = hc_head_norm(&xr, &w_head, &next_norm_w, norm_eps, hc_eps).unwrap();
+            let pnhp = post_norm_hc_post(&yr, &xr, &pr, &post_norm_w, norm_eps).unwrap();
+            let (br_x, br_h, br_p) = hc_bridge(
+                &yr,
+                &xr,
+                &pr,
+                &post_norm_w,
+                &w_next,
+                Some(&next_norm_w),
+                norm_eps,
+                &cfg,
+            )
+            .unwrap();
+            let (_, br_skip_h, _) =
+                hc_bridge(&yr, &xr, &pr, &post_norm_w, &w_next, None, norm_eps, &cfg).unwrap();
+            let br_head = hc_bridge_head(
+                &yr,
+                &xr,
+                &pr,
+                &post_norm_w,
+                &w_head,
+                Some(&next_norm_w),
+                norm_eps,
+                hc_eps,
+            )
+            .unwrap();
+
+            s_mrn_h.insert(r, to_bits(&read(&mrn_h)));
+            s_mrn_p.insert(r, to_bits(&read(&mrn_p)));
+            s_hn.insert(r, to_bits(&read(&hn)));
+            s_pnhp.insert(r, to_bits(&read(&pnhp)));
+            s_br_x.insert(r, to_bits(&read(&br_x)));
+            s_br_h.insert(r, to_bits(&read(&br_h)));
+            s_br_p.insert(r, to_bits(&read(&br_p)));
+            s_br_skip_h.insert(r, to_bits(&read(&br_skip_h)));
+            s_br_head.insert(r, to_bits(&read(&br_head)));
+        }
+
+        for &m in &[1usize, 2, 4, 17] {
+            let xm = x_all.slice(&[0, 0, 0], &[m as i64, hc, d]).unwrap();
+            let ym = y_all.slice(&[0, 0], &[m as i64, d]).unwrap();
+            let pm = post_prev_all.slice(&[0, 0], &[m as i64, hc]).unwrap();
+
+            // 1. hc_mix_reduce_norm (HEAD_ONLY=false)
+            let (got_mrn_h, got_mrn_p) =
+                hc_mix_reduce_norm(&xm, &w_next, &next_norm_w, norm_eps, &cfg).unwrap();
+            let (ref_h, ref_p) = hc_mix_reduce(&xm, &w_next, norm_eps, &cfg).unwrap();
+            let ref_mrn_h = read(&rms_norm(&ref_h, &next_norm_w, norm_eps).unwrap());
+            let got_mrn_hv = read(&got_mrn_h);
+            let got_mrn_pv = read(&got_mrn_p);
+            assert!(
+                max_err(&got_mrn_hv, &ref_mrn_h) <= 1e-5,
+                "hc_mix_reduce_norm h d={d} M={m}"
+            );
+            assert!(
+                max_err(&got_mrn_pv, &read(&ref_p)) <= 1e-5,
+                "hc_mix_reduce_norm post d={d} M={m}"
+            );
+
+            // 2. hc_head_norm (HEAD_ONLY=true)
+            let got_hn = read(&hc_head_norm(&xm, &w_head, &next_norm_w, norm_eps, hc_eps).unwrap());
+            let ref_hn = read(
+                &rms_norm(
+                    &hc_head(&xm, &w_head, norm_eps, hc_eps).unwrap(),
+                    &next_norm_w,
+                    norm_eps,
+                )
+                .unwrap(),
+            );
+            assert!(
+                max_err(&got_hn, &ref_hn) <= 1e-5,
+                "hc_head_norm d={d} M={m}"
+            );
+
+            // 3. post_norm_hc_post
+            let got_pnhp = read(&post_norm_hc_post(&ym, &xm, &pm, &post_norm_w, norm_eps).unwrap());
+            let ref_yn = rms_norm(&ym, &post_norm_w, norm_eps).unwrap();
+            let ref_x_next = hc_post_identity(&ref_yn, &xm, &pm).unwrap();
+            let ref_x_next_v = read(&ref_x_next);
+            assert!(
+                max_err(&got_pnhp, &ref_x_next_v) <= 1e-5,
+                "post_norm_hc_post d={d} M={m}"
+            );
+
+            // 4. hc_bridge (normal: SKIP_NEXT_NORM=false, HEAD_ONLY=false)
+            let (got_bx, got_bh, got_bp) = hc_bridge(
+                &ym,
+                &xm,
+                &pm,
+                &post_norm_w,
+                &w_next,
+                Some(&next_norm_w),
+                norm_eps,
+                &cfg,
+            )
+            .unwrap();
+            let (ref_bh_raw, ref_bp) = hc_mix_reduce(&ref_x_next, &w_next, norm_eps, &cfg).unwrap();
+            let ref_bh_norm = read(&rms_norm(&ref_bh_raw, &next_norm_w, norm_eps).unwrap());
+            let got_bx_v = read(&got_bx);
+            let got_bh_v = read(&got_bh);
+            let got_bp_v = read(&got_bp);
+            assert!(
+                max_err(&got_bx_v, &ref_x_next_v) <= 1e-5,
+                "hc_bridge x_out d={d} M={m}"
+            );
+            assert!(
+                max_err(&got_bh_v, &ref_bh_norm) <= 1e-5,
+                "hc_bridge h_out d={d} M={m}"
+            );
+            assert!(
+                max_err(&got_bp_v, &read(&ref_bp)) <= 1e-5,
+                "hc_bridge post_next d={d} M={m}"
+            );
+
+            // 5. hc_bridge (SKIP_NEXT_NORM=true, HEAD_ONLY=false)
+            let (got_sx, got_sh, got_sp) =
+                hc_bridge(&ym, &xm, &pm, &post_norm_w, &w_next, None, norm_eps, &cfg).unwrap();
+            let got_sh_v = read(&got_sh);
+            assert!(
+                max_err(&read(&got_sx), &ref_x_next_v) <= 1e-5,
+                "hc_bridge skip x_out d={d} M={m}"
+            );
+            assert!(
+                max_err(&got_sh_v, &read(&ref_bh_raw)) <= 1e-5,
+                "hc_bridge skip h_out d={d} M={m}"
+            );
+            assert!(
+                max_err(&read(&got_sp), &read(&ref_bp)) <= 1e-5,
+                "hc_bridge skip post_next d={d} M={m}"
+            );
+
+            // 6. hc_bridge_head (HEAD_ONLY=true, with output_norm and with SKIP_NEXT_NORM=true)
+            let got_bhead = read(
+                &hc_bridge_head(
+                    &ym,
+                    &xm,
+                    &pm,
+                    &post_norm_w,
+                    &w_head,
+                    Some(&next_norm_w),
+                    norm_eps,
+                    hc_eps,
+                )
+                .unwrap(),
+            );
+            let ref_head_raw = hc_head(&ref_x_next, &w_head, norm_eps, hc_eps).unwrap();
+            let ref_bhead = read(&rms_norm(&ref_head_raw, &next_norm_w, norm_eps).unwrap());
+            assert!(
+                max_err(&got_bhead, &ref_bhead) <= 1e-5,
+                "hc_bridge_head d={d} M={m}"
+            );
+            let got_bhead_skip = read(
+                &hc_bridge_head(&ym, &xm, &pm, &post_norm_w, &w_head, None, norm_eps, hc_eps)
+                    .unwrap(),
+            );
+            assert!(
+                max_err(&got_bhead_skip, &read(&ref_head_raw)) <= 1e-5,
+                "hc_bridge_head skip d={d} M={m}"
+            );
+
+            // Strict bitwise row invariance against M=1.
+            let du = d as usize;
+            let hcu = hc as usize;
+            for &r in &sample_rows {
+                if r >= m {
+                    continue;
+                }
+                assert_eq!(
+                    to_bits(&got_mrn_hv[r * du..(r + 1) * du]),
+                    s_mrn_h[&r],
+                    "hc_mix_reduce_norm h inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_mrn_pv[r * hcu..(r + 1) * hcu]),
+                    s_mrn_p[&r],
+                    "hc_mix_reduce_norm p inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_hn[r * du..(r + 1) * du]),
+                    s_hn[&r],
+                    "hc_head_norm inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_pnhp[r * hd..(r + 1) * hd]),
+                    s_pnhp[&r],
+                    "post_norm_hc_post inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_bx_v[r * hd..(r + 1) * hd]),
+                    s_br_x[&r],
+                    "hc_bridge x inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_bh_v[r * du..(r + 1) * du]),
+                    s_br_h[&r],
+                    "hc_bridge h inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_bp_v[r * hcu..(r + 1) * hcu]),
+                    s_br_p[&r],
+                    "hc_bridge p inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_sh_v[r * du..(r + 1) * du]),
+                    s_br_skip_h[&r],
+                    "hc_bridge skip h inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_bhead[r * du..(r + 1) * du]),
+                    s_br_head[&r],
+                    "hc_bridge_head inv d={d} M={m} r={r}"
+                );
+            }
+        }
+    }
+}

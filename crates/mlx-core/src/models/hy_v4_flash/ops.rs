@@ -436,9 +436,454 @@ pub fn hc_head(x: &MxArray, w: &HcWeights, norm_eps: f32, hc_eps: f32) -> Result
     hc_reduce(x, &hc_head_pre(x, w, norm_eps, hc_eps)?)
 }
 
+/// Fused `hc_mix_reduce` + `rms_norm(norm_w)`: returns `(h_norm [n, d], post [n, hc])`
+/// with `h_norm` in `x`'s dtype and `post` in f32.
+pub fn hc_mix_reduce_norm(
+    x: &MxArray,
+    w: &HcWeights,
+    norm_w: &MxArray,
+    norm_eps: f32,
+    cfg: &HcConfig,
+) -> Result<(MxArray, MxArray)> {
+    let [n, hc, d] = streams(x)?;
+    if hc != cfg.count as i64
+        || w.weight.ndim()? != 2
+        || w.weight.shape_at(0)? != 2 * hc
+        || w.weight.shape_at(1)? != hc * d
+    {
+        return Err(bad(format!(
+            "hc mix norm: {hc} streams of {d}, config {}, fn {:?}",
+            cfg.count,
+            dims(&w.weight)?
+        )));
+    }
+    check_len(&w.scale, 2, "hc scale")?;
+    check_len(&w.base, 2 * hc, "hc base")?;
+    check_len(norm_w, d, "hc norm_w")?;
+    if n > 0 {
+        let dt = x.dtype()?;
+        let xf = as_f32(x)?;
+        let wf = as_f32(&w.weight)?;
+        let sf = as_f32(&w.scale)?;
+        let bf = as_f32(&w.base)?;
+        let nwf = as_f32(norm_w)?;
+        let mut out_h = std::ptr::null_mut();
+        let mut out_post = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out pointers receive new arrays on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_mix_reduce_norm(
+                xf.as_raw_ptr(),
+                wf.as_raw_ptr(),
+                sf.as_raw_ptr(),
+                bf.as_raw_ptr(),
+                nwf.as_raw_ptr(),
+                norm_eps,
+                cfg.eps,
+                cfg.magnitude,
+                norm_eps,
+                false,
+                &mut out_h,
+                &mut out_post,
+            )
+        };
+        if ok {
+            let h = MxArray::from_handle(out_h, "hy_v4_flash hc_mix_reduce_norm h")?;
+            let post = MxArray::from_handle(out_post, "hy_v4_flash hc_mix_reduce_norm post")?;
+            let h = if dt == DType::Float32 {
+                h
+            } else {
+                h.astype(dt)?
+            };
+            return Ok((h, post));
+        }
+    }
+    let (h, post) = hc_mix_reduce(x, w, norm_eps, cfg)?;
+    let hn = rms_norm(&h, norm_w, norm_eps)?;
+    Ok((hn, post))
+}
+
+/// Fused `hc_head` + `rms_norm(norm_w)`: returns `h_norm [n, d]` in `x`'s dtype.
+pub fn hc_head_norm(
+    x: &MxArray,
+    w: &HcWeights,
+    norm_w: &MxArray,
+    norm_eps: f32,
+    hc_eps: f32,
+) -> Result<MxArray> {
+    let [n, hc, d] = streams(x)?;
+    if w.weight.ndim()? != 2 || w.weight.shape_at(0)? != hc || w.weight.shape_at(1)? != hc * d {
+        return Err(bad(format!(
+            "hc head norm fn {:?} for {hc} streams of {d}",
+            dims(&w.weight)?
+        )));
+    }
+    check_len(&w.scale, 1, "hc head scale")?;
+    check_len(&w.base, hc, "hc head base")?;
+    check_len(norm_w, d, "hc head norm_w")?;
+    if n > 0 {
+        let dt = x.dtype()?;
+        let xf = as_f32(x)?;
+        let wf = as_f32(&w.weight)?;
+        let sf = as_f32(&w.scale)?;
+        let bf = as_f32(&w.base)?;
+        let nwf = as_f32(norm_w)?;
+        let mut out_h = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out_h receives a new array on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_mix_reduce_norm(
+                xf.as_raw_ptr(),
+                wf.as_raw_ptr(),
+                sf.as_raw_ptr(),
+                bf.as_raw_ptr(),
+                nwf.as_raw_ptr(),
+                norm_eps,
+                hc_eps,
+                0.0,
+                norm_eps,
+                true,
+                &mut out_h,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok {
+            let h = MxArray::from_handle(out_h, "hy_v4_flash hc_head_norm h")?;
+            return if dt == DType::Float32 {
+                Ok(h)
+            } else {
+                h.astype(dt)
+            };
+        }
+    }
+    rms_norm(&hc_head(x, w, norm_eps, hc_eps)?, norm_w, norm_eps)
+}
+
+/// Fused `rms_norm(y, post_norm_w)` + `hc_post_identity`: returns `[n, hc, d]` in `res`'s dtype.
+pub fn post_norm_hc_post(
+    y: &MxArray,
+    res: &MxArray,
+    post: &MxArray,
+    post_norm_w: &MxArray,
+    norm_eps: f32,
+) -> Result<MxArray> {
+    let [n, hc, d] = streams(res)?;
+    if dims(y)?.as_slice() != [n, d] || dims(post)?.as_slice() != [n, hc] {
+        return Err(bad(format!(
+            "post_norm_hc_post: y {:?}, post {:?} for streams [{n}, {hc}, {d}]",
+            dims(y)?,
+            dims(post)?
+        )));
+    }
+    check_len(post_norm_w, d, "post_norm_w")?;
+    let dt = res.dtype()?;
+    if n > 0 {
+        let yf = as_f32(y)?;
+        let rf = as_f32(res)?;
+        let pf = as_f32(post)?;
+        let pnwf = as_f32(post_norm_w)?;
+        // SAFETY: all input handles are live for the call; returns a new array or null.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_post_norm_hc_post(
+                yf.as_raw_ptr(),
+                rf.as_raw_ptr(),
+                pf.as_raw_ptr(),
+                pnwf.as_raw_ptr(),
+                norm_eps,
+            )
+        };
+        if !h.is_null() {
+            let out = MxArray::from_handle(h, "hy_v4_flash post_norm_hc_post")?;
+            return if dt == DType::Float32 {
+                Ok(out)
+            } else {
+                out.astype(dt)
+            };
+        }
+    }
+    let yn = rms_norm(&as_f32(y)?, post_norm_w, norm_eps)?;
+    hc_post_identity(&yn, res, post)
+}
+
+/// Megafused `post_norm(y) + hc_post_identity(res, post_prev) + hc_mix_reduce(next_hc) [+ rms_norm(next_norm_w)]`.
+/// Returns `(x_out [n, hc, d], h_next [n, d], post_next [n, hc])`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_bridge(
+    y: &MxArray,
+    res: &MxArray,
+    post_prev: &MxArray,
+    post_norm_w: &MxArray,
+    next_hc: &HcWeights,
+    next_norm_w: Option<&MxArray>,
+    norm_eps: f32,
+    cfg: &HcConfig,
+) -> Result<(MxArray, MxArray, MxArray)> {
+    let [n, hc, d] = streams(res)?;
+    if dims(y)?.as_slice() != [n, d] || dims(post_prev)?.as_slice() != [n, hc] {
+        return Err(bad(format!(
+            "hc_bridge: y {:?}, post_prev {:?} for streams [{n}, {hc}, {d}]",
+            dims(y)?,
+            dims(post_prev)?
+        )));
+    }
+    if hc != cfg.count as i64
+        || next_hc.weight.ndim()? != 2
+        || next_hc.weight.shape_at(0)? != 2 * hc
+        || next_hc.weight.shape_at(1)? != hc * d
+    {
+        return Err(bad(format!(
+            "hc_bridge: {hc} streams of {d}, config {}, fn {:?}",
+            cfg.count,
+            dims(&next_hc.weight)?
+        )));
+    }
+    check_len(post_norm_w, d, "post_norm_w")?;
+    check_len(&next_hc.scale, 2, "next hc scale")?;
+    check_len(&next_hc.base, 2 * hc, "next hc base")?;
+    if let Some(nnw) = next_norm_w {
+        check_len(nnw, d, "next_norm_w")?;
+    }
+    let dt = res.dtype()?;
+    if n > 0 {
+        let yf = as_f32(y)?;
+        let rf = as_f32(res)?;
+        let ppf = as_f32(post_prev)?;
+        let pnwf = as_f32(post_norm_w)?;
+        let nwf = as_f32(&next_hc.weight)?;
+        let nsf = as_f32(&next_hc.scale)?;
+        let nbf = as_f32(&next_hc.base)?;
+        let nnwf = next_norm_w.map(as_f32).transpose()?;
+        let nnw_ptr = nnwf
+            .as_ref()
+            .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        let mut out_x = std::ptr::null_mut();
+        let mut out_h = std::ptr::null_mut();
+        let mut out_post = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out pointers receive new arrays on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_bridge(
+                yf.as_raw_ptr(),
+                rf.as_raw_ptr(),
+                ppf.as_raw_ptr(),
+                pnwf.as_raw_ptr(),
+                nwf.as_raw_ptr(),
+                nsf.as_raw_ptr(),
+                nbf.as_raw_ptr(),
+                nnw_ptr,
+                norm_eps,
+                norm_eps,
+                cfg.eps,
+                cfg.magnitude,
+                norm_eps,
+                next_norm_w.is_none(),
+                false,
+                &mut out_x,
+                &mut out_h,
+                &mut out_post,
+            )
+        };
+        if ok {
+            let x_out = MxArray::from_handle(out_x, "hy_v4_flash hc_bridge x_out")?;
+            let h_out = MxArray::from_handle(out_h, "hy_v4_flash hc_bridge h_out")?;
+            let p_out = MxArray::from_handle(out_post, "hy_v4_flash hc_bridge post_next")?;
+            let x_out = if dt == DType::Float32 {
+                x_out
+            } else {
+                x_out.astype(dt)?
+            };
+            let h_out = if dt == DType::Float32 {
+                h_out
+            } else {
+                h_out.astype(dt)?
+            };
+            return Ok((x_out, h_out, p_out));
+        }
+    }
+    let x_out = post_norm_hc_post(y, res, post_prev, post_norm_w, norm_eps)?;
+    let (h_out, p_out) = match next_norm_w {
+        Some(nnw) => hc_mix_reduce_norm(&x_out, next_hc, nnw, norm_eps, cfg)?,
+        None => hc_mix_reduce(&x_out, next_hc, norm_eps, cfg)?,
+    };
+    Ok((x_out, h_out, p_out))
+}
+
+/// Megafused `post_norm(y) + hc_post_identity(res, post_prev) + hc_head(output_hc) [+ rms_norm(output_norm)]`.
+/// Avoids materializing the final `[n, hc, d]` stream tensor.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_bridge_head(
+    y: &MxArray,
+    res: &MxArray,
+    post_prev: &MxArray,
+    post_norm_w: &MxArray,
+    output_hc: &HcWeights,
+    output_norm_w: Option<&MxArray>,
+    norm_eps: f32,
+    hc_eps: f32,
+) -> Result<MxArray> {
+    let [n, hc, d] = streams(res)?;
+    if dims(y)?.as_slice() != [n, d] || dims(post_prev)?.as_slice() != [n, hc] {
+        return Err(bad(format!(
+            "hc_bridge_head: y {:?}, post_prev {:?} for streams [{n}, {hc}, {d}]",
+            dims(y)?,
+            dims(post_prev)?
+        )));
+    }
+    if output_hc.weight.ndim()? != 2
+        || output_hc.weight.shape_at(0)? != hc
+        || output_hc.weight.shape_at(1)? != hc * d
+    {
+        return Err(bad(format!(
+            "hc_bridge_head: fn {:?} for {hc} streams of {d}",
+            dims(&output_hc.weight)?
+        )));
+    }
+    check_len(post_norm_w, d, "post_norm_w")?;
+    check_len(&output_hc.scale, 1, "hc head scale")?;
+    check_len(&output_hc.base, hc, "hc head base")?;
+    if let Some(nnw) = output_norm_w {
+        check_len(nnw, d, "output_norm_w")?;
+    }
+    let dt = res.dtype()?;
+    if n > 0 {
+        let yf = as_f32(y)?;
+        let rf = as_f32(res)?;
+        let ppf = as_f32(post_prev)?;
+        let pnwf = as_f32(post_norm_w)?;
+        let nwf = as_f32(&output_hc.weight)?;
+        let nsf = as_f32(&output_hc.scale)?;
+        let nbf = as_f32(&output_hc.base)?;
+        let nnwf = output_norm_w.map(as_f32).transpose()?;
+        let nnw_ptr = nnwf
+            .as_ref()
+            .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        let mut out_h = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out_h receives a new array on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_bridge(
+                yf.as_raw_ptr(),
+                rf.as_raw_ptr(),
+                ppf.as_raw_ptr(),
+                pnwf.as_raw_ptr(),
+                nwf.as_raw_ptr(),
+                nsf.as_raw_ptr(),
+                nbf.as_raw_ptr(),
+                nnw_ptr,
+                norm_eps,
+                norm_eps,
+                hc_eps,
+                0.0,
+                norm_eps,
+                output_norm_w.is_none(),
+                true,
+                std::ptr::null_mut(),
+                &mut out_h,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok {
+            let h_out = MxArray::from_handle(out_h, "hy_v4_flash hc_bridge_head h_out")?;
+            return if dt == DType::Float32 {
+                Ok(h_out)
+            } else {
+                h_out.astype(dt)
+            };
+        }
+    }
+    let x_out = post_norm_hc_post(y, res, post_prev, post_norm_w, norm_eps)?;
+    match output_norm_w {
+        Some(nnw) => hc_head_norm(&x_out, output_hc, nnw, norm_eps, hc_eps),
+        None => hc_head(&x_out, output_hc, norm_eps, hc_eps),
+    }
+}
+
+/// Row-invariant f32 router GEMV for `1..=16` rows when `router` is a 2-D f32
+/// weight with `K % 32 == 0`. Returns `Ok(None)` when Metal or shape is unsupported.
+pub(crate) fn try_router_mv(xf: &MxArray, router: &Dense) -> Result<Option<MxArray>> {
+    let Dense::Array(w) = router else {
+        return Ok(None);
+    };
+    if xf.ndim()? != 2 || w.ndim()? != 2 || w.dtype()? != DType::Float32 {
+        return Ok(None);
+    }
+    let m = xf.shape_at(0)?;
+    let k = xf.shape_at(1)?;
+    if !(1..=16).contains(&m) || k < 32 || k % 32 != 0 || w.shape_at(1)? != k {
+        return Ok(None);
+    }
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe { mlx_sys::mlx_hy4_router_mv(xf.as_raw_ptr(), w.as_raw_ptr()) };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(h, "hy_v4_flash router_mv")?))
+}
+
 /// Raw router matmul logits `x · gate_inpᵀ` in f32, `[rows, n_experts]`.
 pub fn router_logits(x: &MxArray, router: &Dense) -> Result<MxArray> {
-    linear(&x.astype(DType::Float32)?, router)
+    let xf = as_f32(x)?;
+    if xf.ndim()? == 2
+        && (1..=8).contains(&xf.shape_at(0)?)
+        && let Some(logits) = try_router_mv(&xf, router)?
+    {
+        return Ok(logits);
+    }
+    linear(&xf, router)
+}
+
+/// Fused `routed_up(routed_latent) + shared_down(swiglu(shared_gu, limit))` for
+/// SymQ8 decode (`1..=8` rows). Returns `Ok(None)` when unsupported.
+pub(crate) fn try_q8_dual_down_add(
+    routed_latent: &MxArray,
+    shared_gu: &MxArray,
+    routed_up: &Dense,
+    shared_down: &Dense,
+    limit: f32,
+) -> Result<Option<MxArray>> {
+    let (
+        Dense::SymQ8 {
+            w: w_up,
+            scales: s_up,
+        },
+        Dense::SymQ8 {
+            w: w_sd,
+            scales: s_sd,
+        },
+    ) = (routed_up, shared_down)
+    else {
+        return Ok(None);
+    };
+    if routed_latent.ndim()? != 2 || shared_gu.ndim()? != 2 {
+        return Ok(None);
+    }
+    let m = routed_latent.shape_at(0)?;
+    let k = routed_latent.shape_at(1)?;
+    if !(1..=8).contains(&m)
+        || k < 32
+        || k % 32 != 0
+        || shared_gu.shape_at(0)? != m
+        || shared_gu.shape_at(1)? != 2 * k
+    {
+        return Ok(None);
+    }
+    let rlf = as_f32(routed_latent)?;
+    let sguf = as_f32(shared_gu)?;
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_q8_dual_down_add(
+            rlf.as_raw_ptr(),
+            sguf.as_raw_ptr(),
+            w_up.as_raw_ptr(),
+            s_up.as_raw_ptr(),
+            w_sd.as_raw_ptr(),
+            s_sd.as_raw_ptr(),
+            limit,
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash q8_dual_down_add",
+    )?))
 }
 
 /// Router scores `σ(x · gate_inpᵀ)` in f32, `[rows, n_experts]`.

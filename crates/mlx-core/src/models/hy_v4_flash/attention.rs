@@ -292,18 +292,33 @@ impl Mla {
     /// Projections of `h [n, dim]`, row `i` at position `positions[i]`:
     /// the rows of several owners in one call of each Q8 matrix.
     pub fn project_at(&self, w: &AttnWeights, h: &MxArray, positions: &[u64]) -> Result<Projected> {
+        let x = rms_norm(&h.astype(DType::Float32)?, &w.norm, self.g.eps)?;
+        self.project_normed(w, &x, positions)
+    }
+
+    /// `project_at` when `x = rms(h)·attn_norm` has already been computed in f32.
+    pub(crate) fn project_normed(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        positions: &[u64],
+    ) -> Result<Projected> {
         let g = &self.g;
-        let n = h.shape_at(0)?;
+        let n = x.shape_at(0)?;
         if positions.len() as i64 != n {
             return Err(bad(format!("{} positions for {n} rows", positions.len())));
         }
+        let x = if x.dtype()? == DType::Float32 {
+            x.clone()
+        } else {
+            x.astype(DType::Float32)?
+        };
         let (heads, nope, rd) = (g.n_heads as i64, g.nope as i64, g.rope_dim as i64);
         let qk = g.head_qk() as i64;
         let kv_lora = g.kv_lora as i64;
         let kv_row = kv_lora + rd;
         let q_lora = w.q_a.shape_at(0)?;
 
-        let x = rms_norm(&h.astype(DType::Float32)?, &w.norm, g.eps)?;
         let (q_a_out, ckv, gate_lin) = match (n <= FUSED_GATE_MAX_ROWS, &w.q_kv_gate, &w.q_kv) {
             (true, Some(fused), _) => {
                 let all = qlinear(&x, fused)?;
@@ -368,13 +383,30 @@ impl Mla {
         Ok(p)
     }
 
+    /// `project_normed` under the attention-projection clock.
+    pub(crate) fn project_normed_timed(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        positions: &[u64],
+    ) -> Result<Projected> {
+        let tp = prof_start();
+        let p = self.project_normed(w, x, positions)?;
+        if let Some(g) = &p.gate_lin {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g])?;
+        } else {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv])?;
+        }
+        Ok(p)
+    }
+
     /// `o_lat [n, H, kv_lora]` -> the sublayer output `[n, dim]` f32.
     pub fn finish(&self, w: &AttnWeights, x: &MxArray, o_lat: &MxArray) -> Result<MxArray> {
         self.finish_with_gate(w, x, None, o_lat)
     }
 
-    /// `finish` using a precomputed `gate_lin` when `project_at` fused `attn_gate`.
-    pub fn finish_with_gate(
+    /// `finish` before `post_attention_norm`: returns raw `attn_output · o`.
+    pub(crate) fn finish_raw_with_gate(
         &self,
         w: &AttnWeights,
         x: &MxArray,
@@ -391,8 +423,19 @@ impl Mla {
             None => qlinear(x, &w.gate)?,
         };
         let gated = Activations::sigmoid_mul_compiled(&gate_lin, &o)?;
-        let y = qlinear(&gated, &w.output)?;
-        rms_norm(&y, &w.post_norm, g.eps)
+        qlinear(&gated, &w.output)
+    }
+
+    /// `finish` using a precomputed `gate_lin` when `project_at` fused `attn_gate`.
+    pub fn finish_with_gate(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        gate_lin: Option<&MxArray>,
+        o_lat: &MxArray,
+    ) -> Result<MxArray> {
+        let y = self.finish_raw_with_gate(w, x, gate_lin, o_lat)?;
+        rms_norm(&y, &w.post_norm, self.g.eps)
     }
 
     /// `finish` under the attention-projection clock.
@@ -410,6 +453,20 @@ impl Mla {
     ) -> Result<MxArray> {
         let tp = prof_start();
         let y = self.finish_with_gate(w, x, gate_lin, o_lat)?;
+        prof_end(Phase::AttnProj, tp, &[&y])?;
+        Ok(y)
+    }
+
+    /// `finish_raw_with_gate` under the attention-projection clock.
+    pub(crate) fn finish_raw_timed_with_gate(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        gate_lin: Option<&MxArray>,
+        o_lat: &MxArray,
+    ) -> Result<MxArray> {
+        let tp = prof_start();
+        let y = self.finish_raw_with_gate(w, x, gate_lin, o_lat)?;
         prof_end(Phase::AttnProj, tp, &[&y])?;
         Ok(y)
     }

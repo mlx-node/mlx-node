@@ -42,7 +42,7 @@ use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{
     gguf_prefill_indirect_down, gguf_prefill_indirect_gu, gguf_routed_decode, rms_norm, route,
-    route_pair, router_logits, router_scores, router_topk_gpu,
+    route_pair, router_logits, router_scores, router_topk_gpu, try_q8_dual_down_add, try_router_mv,
 };
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
@@ -217,16 +217,16 @@ impl RowKind {
     }
 }
 
-/// `linear` using the row-invariant Q8 Metal kernel for 1..=16 decode rows
-/// and the NAX tensor-op Q8 kernel for `M > 16` prefill rows, falling back to
-/// MLX `quantized_matmul` (with `MIN_Q8_ROWS` padding when needed) on
-/// unsupported shapes or non-Metal/non-NAX devices.
+/// `linear` using the row-invariant Q8 Metal kernel for 1..=11 decode rows
+/// and the NAX tensor-op Q8 kernel for `M >= 12` rows, falling back to
+/// decode for 12..=16 when NAX is unavailable/disabled, and then to MLX
+/// `quantized_matmul` (with `MIN_Q8_ROWS` padding when needed).
 pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
     if let Some((qw, scales, biases)) = w.qmm_parts()
         && x.ndim()? == 2
     {
         let n = x.shape_at(0)?;
-        if (1..=16).contains(&n) {
+        if (1..=11).contains(&n) {
             let xf = if x.dtype()? == DType::Float32 {
                 x.clone()
             } else {
@@ -245,24 +245,40 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
             if !h.is_null() {
                 return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
             }
-        } else if n > 16 && prefill_q8_nax_enabled() {
+        } else if n >= 12 {
             let xf = if x.dtype()? == DType::Float32 {
                 x.clone()
             } else {
                 x.astype(DType::Float32)?
             };
             let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
-            // SAFETY: all handles are live arrays owned by this call.
-            let h = unsafe {
-                mlx_sys::mlx_hy4_q8_dense_prefill(
-                    xf.as_raw_ptr(),
-                    qw.as_raw_ptr(),
-                    scales.as_raw_ptr(),
-                    biases_ptr,
-                )
-            };
-            if !h.is_null() {
-                return MxArray::from_handle(h, "hy_v4_flash q8_dense_prefill");
+            if prefill_q8_nax_enabled() {
+                // SAFETY: all handles are live arrays owned by this call.
+                let h = unsafe {
+                    mlx_sys::mlx_hy4_q8_dense_prefill(
+                        xf.as_raw_ptr(),
+                        qw.as_raw_ptr(),
+                        scales.as_raw_ptr(),
+                        biases_ptr,
+                    )
+                };
+                if !h.is_null() {
+                    return MxArray::from_handle(h, "hy_v4_flash q8_dense_prefill");
+                }
+            }
+            if n <= 16 {
+                // SAFETY: all handles are live arrays owned by this call.
+                let h = unsafe {
+                    mlx_sys::mlx_hy4_q8_dense_decode(
+                        xf.as_raw_ptr(),
+                        qw.as_raw_ptr(),
+                        scales.as_raw_ptr(),
+                        biases_ptr,
+                    )
+                };
+                if !h.is_null() {
+                    return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
+                }
             }
         }
         if n > 0 && n < MIN_Q8_ROWS {
@@ -664,7 +680,7 @@ impl Moe {
         &self,
         w: &MoeWeights,
         x: &MxArray,
-    ) -> Result<(MxArray, Option<(MxArray, MxArray)>)> {
+    ) -> Result<(MxArray, Option<MxArray>)> {
         match &w.down_shared_gu {
             Some(fused) => {
                 let tp = prof_start();
@@ -673,10 +689,9 @@ impl Moe {
                 let sff = w.shared_gate.shape_at(0)?;
                 let all = qlinear(x, fused)?;
                 let z = all.slice(&[0, 0], &[n, lat])?;
-                let sg = all.slice(&[0, lat], &[n, lat + sff])?;
-                let su = all.slice(&[0, lat + sff], &[n, lat + 2 * sff])?;
-                prof_end(Phase::Routed, tp, &[&z, &sg, &su])?;
-                Ok((z, Some((sg, su))))
+                let shared_gu = all.slice(&[0, lat], &[n, lat + 2 * sff])?;
+                prof_end(Phase::Routed, tp, &[&z, &shared_gu])?;
+                Ok((z, Some(shared_gu)))
             }
             None => {
                 let tp = prof_start();
@@ -714,19 +729,50 @@ impl Moe {
         bank.prefetch_layer(layer, &want)
     }
 
+    fn router_logits_for(x: &MxArray, router: &Dense, kind: RowKind) -> Result<MxArray> {
+        if kind.is_decode() {
+            let xf = if x.dtype()? == DType::Float32 {
+                x.clone()
+            } else {
+                x.astype(DType::Float32)?
+            };
+            if let Some(logits) = try_router_mv(&xf, router)? {
+                return Ok(logits);
+            }
+            return per_row(&xf, |r| router_logits(r, router));
+        }
+        match group(Op::Router, kind) {
+            Group::Row => per_row(x, |r| router_logits(r, router)),
+            Group::Fused | Group::Owner => router_logits(x, router),
+        }
+    }
+
     fn finish_with_shared(
         &self,
         w: &MoeWeights,
         x: &MxArray,
         r: &MxArray,
-        shared_gu: Option<(MxArray, MxArray)>,
+        shared_gu: Option<MxArray>,
     ) -> Result<MxArray> {
+        if let Some(ref sgu) = shared_gu {
+            let tp = prof_start();
+            if let Some(f) = try_q8_dual_down_add(r, sgu, &w.routed_up, &w.shared_down, 0.0)? {
+                prof_end(Phase::Shared, tp, &[&f])?;
+                return Ok(f);
+            }
+        }
         let tp = prof_start();
         let up = qlinear(r, &w.routed_up)?;
         prof_end(Phase::Routed, tp, &[&up])?;
         let tp = prof_start();
         let shared = match shared_gu {
-            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
+            Some(sgu) => {
+                let n = sgu.shape_at(0)?;
+                let sff = sgu.shape_at(1)? / 2;
+                let sg = sgu.slice(&[0, 0], &[n, sff])?;
+                let su = sgu.slice(&[0, sff], &[n, 2 * sff])?;
+                qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?
+            }
             None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
         };
         let f = up.add(&shared)?;
@@ -762,10 +808,7 @@ impl Moe {
             match &self.experts {
                 ExpertSource::Bank(bank) if bank.is_direct() => {
                     let tp = prof_start();
-                    let r_logits = match group(Op::Router, kind) {
-                        Group::Row => per_row(x, |r| router_logits(r, &w.router))?,
-                        Group::Fused | Group::Owner => router_logits(x, &w.router)?,
-                    };
+                    let r_logits = Self::router_logits_for(x, &w.router, kind)?;
                     if let Some((gpu_ids, gpu_weights)) =
                         router_topk_gpu(&r_logits, self.bias_gpu.as_ref(), &self.moe)?
                     {
@@ -840,10 +883,7 @@ impl Moe {
                 }
                 ExpertSource::Resident(a) if kind.is_decode() => {
                     let tp = prof_start();
-                    let r_logits = match group(Op::Router, kind) {
-                        Group::Row => per_row(x, |r| router_logits(r, &w.router))?,
-                        Group::Fused | Group::Owner => router_logits(x, &w.router)?,
-                    };
+                    let r_logits = Self::router_logits_for(x, &w.router, kind)?;
                     if let Some((gpu_ids, gpu_weights)) =
                         router_topk_gpu(&r_logits, self.bias_gpu.as_ref(), &self.moe)?
                     {
@@ -865,10 +905,7 @@ impl Moe {
         }
 
         let tp = prof_start();
-        let scores = match group(Op::Router, kind) {
-            Group::Row => per_row(x, |r| router_scores(r, &w.router))?,
-            Group::Fused | Group::Owner => router_scores(x, &w.router)?,
-        };
+        let scores = Activations::sigmoid(&Self::router_logits_for(x, &w.router, kind)?)?;
         self.forward_host_routed(layer, w, x, h, kind, tp, scores, next)
     }
 
@@ -1008,7 +1045,13 @@ impl Moe {
         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
         let tp_sh = prof_start();
         let shared = match shared_gu {
-            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
+            Some(sgu) => {
+                let n = sgu.shape_at(0)?;
+                let sff = sgu.shape_at(1)? / 2;
+                let sg = sgu.slice(&[0, 0], &[n, sff])?;
+                let su = sgu.slice(&[0, sff], &[n, 2 * sff])?;
+                qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?
+            }
             None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
         };
         prof_end(Phase::Shared, tp_sh, &[&shared])?;
@@ -2293,6 +2336,104 @@ impl LayerFfn {
             _ => MxArray::concatenate_many(outs.iter().collect(), Some(0))?,
         };
         Ok((y, routes))
+    }
+
+    /// FFN forward when `x [n, dim]` has already passed `ffn_norm`, returning
+    /// the raw output before `post_ffw_norm`.
+    pub(crate) fn forward_normed_raw(
+        &self,
+        w: &LayerWeights,
+        x: &MxArray,
+        kind: RowKind,
+        need_routes: bool,
+        next: Option<(&LayerFfn, &LayerWeights)>,
+    ) -> Result<(MxArray, Option<Routes>)> {
+        let chunk = match kind {
+            RowKind::Prefill => prefill_ffn_chunk_rows(),
+            RowKind::Decode => FFN_CHUNK_ROWS,
+        };
+        let shape = dims(x)?;
+        let n = match shape.as_slice() {
+            &[n, d] if n > 0 && d == self.dim as i64 => n as usize,
+            s => {
+                return Err(bad(format!(
+                    "layer {}: input {s:?}, need [n > 0, {}]",
+                    self.layer, self.dim
+                )));
+            }
+        };
+        if kind == RowKind::Decode && n > chunk {
+            return Err(bad(format!(
+                "layer {}: {n} decode rows past one chunk of {chunk}",
+                self.layer
+            )));
+        }
+        let xf = if x.dtype()? == DType::Float32 {
+            x.clone()
+        } else {
+            x.astype(DType::Float32)?
+        };
+        let parts = chunks(n, chunk);
+        let mut routes = if need_routes {
+            match &self.kind {
+                FfnKind::Dense => None,
+                FfnKind::Moe(m) => Some(Routes {
+                    k: m.moe.n_used,
+                    ids: Vec::new(),
+                    weights: Vec::new(),
+                }),
+            }
+        } else {
+            None
+        };
+        let mut outs = Vec::with_capacity(parts.len());
+        for &(lo, hi) in &parts {
+            let xc = if parts.len() == 1 {
+                xf.clone()
+            } else {
+                xf.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
+            };
+            let chunk_next = if parts.len() == 1 { next } else { None };
+            let f = match (&self.kind, &w.ffn) {
+                (
+                    FfnKind::Dense,
+                    Ffn::Mlp {
+                        gate,
+                        up,
+                        down,
+                        gate_up,
+                    },
+                ) => {
+                    let tp = prof_start();
+                    let f = mlp(&xc, gate, up, down, gate_up.as_ref())?;
+                    prof_end(Phase::Shared, tp, &[&f])?;
+                    f
+                }
+                (FfnKind::Moe(m), Ffn::Moe(mw)) => {
+                    let (f, r) =
+                        m.forward(self.layer, mw, &xc, &xc, kind, need_routes, chunk_next)?;
+                    if let (Some(all), Some(r)) = (routes.as_mut(), r) {
+                        all.append(r);
+                    }
+                    f
+                }
+                _ => {
+                    return Err(bad(format!(
+                        "layer {}: weights of the other FFN kind",
+                        self.layer
+                    )));
+                }
+            };
+            if parts.len() > 1 {
+                super::stats::eval(&[&f], "hy_v4_flash ffn chunk")?;
+            }
+            outs.push(f);
+        }
+        let f = match outs.len() {
+            1 => outs.swap_remove(0),
+            _ => MxArray::concatenate_many(outs.iter().collect(), Some(0))?,
+        };
+        Ok((f, routes))
     }
 }
 

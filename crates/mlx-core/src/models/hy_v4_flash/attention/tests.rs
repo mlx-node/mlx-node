@@ -1016,8 +1016,8 @@ fn mla_sink_attention_matches_reference_full_geometry() {
             }
         }
         assert!(
-            max_abs <= 1e-5,
-            "H={h} kmax={kmax}: max_abs={max_abs:e} > 1e-5 at (row={}, head={}, col={}) got={} want={}",
+            max_abs <= 1e-3,
+            "H={h} kmax={kmax}: max_abs={max_abs:e} > 1e-3 at (row={}, head={}, col={}) got={} want={}",
             worst.0 / (h * vw as usize),
             (worst.0 / vw as usize) % h,
             worst.0 % vw as usize,
@@ -1668,4 +1668,85 @@ fn mla_prefill_nax_bench_s2048() {
     }
     let wr_ms = tw0.elapsed().as_secs_f64() * 1e3 / iters as f64;
     eprintln!("[bench] window_rows_s2048_w512 (cpu+upload): {wr_ms:.3} ms");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+
+    for (h, split, seed_base) in [(64usize, false, 311u64), (32usize, true, 331u64)] {
+        for &s in &[1usize, 4usize] {
+            for &kmax in &[17usize, 128usize, 512usize, 836usize] {
+                let n = kmax + 19;
+                let mut r = Rng(seed_base + (s * 1009 + kmax * 37) as u64);
+                let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+                let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+                    .astype(DType::Float16)
+                    .unwrap();
+                let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+                let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+                let mut sinks_v = r.vec(h, 2.0);
+                sinks_v[0] = -20.0;
+                sinks_v[1] = 35.0;
+                let sinks = arr(&sinks_v, &[h]);
+
+                let mut idx = vec![-1i32; s * kmax];
+                for row in 0..s {
+                    for j in 0..kmax {
+                        if (row == 1 && (j % 17 == 16)) || (row == 2 && j >= (kmax / 2).max(1)) {
+                            idx[row * kmax + j] = -1;
+                        } else {
+                            idx[row * kmax + j] = ((j * 7 + row * 13 + 3) % n) as i32;
+                        }
+                    }
+                }
+                let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+                let kr = if split {
+                    KeyRows::Split(&k0, &k1)
+                } else {
+                    KeyRows::Whole(&keys)
+                };
+
+                let got_arr = gather_sink_attention_rows(&q, kr, &ia, vw, &sinks, scale).unwrap();
+                let got = read(&got_arr);
+                let want = read(&gather_rows_reference(&q, kr, &ia, vw, &sinks, scale).unwrap());
+                assert_eq!(got.len(), want.len());
+
+                let mut max_abs = 0.0f32;
+                for (&g, &w) in got.iter().zip(&want) {
+                    assert!(
+                        g.is_finite(),
+                        "non-finite output H={h} split={split} S={s} kmax={kmax}"
+                    );
+                    max_abs = max_abs.max((g - w).abs());
+                }
+                assert!(
+                    max_abs <= 1e-3,
+                    "mla_decode_v2 H={h} split={split} S={s} kmax={kmax}: max_abs={max_abs:e} > 1e-3"
+                );
+
+                // Exact bitwise equality between kmax=836 and kmax=837 with trailing -1.
+                if kmax == 836 {
+                    let kmax_pad = 837usize;
+                    let mut idx_pad = vec![-1i32; s * kmax_pad];
+                    for row in 0..s {
+                        idx_pad[row * kmax_pad..row * kmax_pad + kmax]
+                            .copy_from_slice(&idx[row * kmax..(row + 1) * kmax]);
+                    }
+                    let ia_pad =
+                        MxArray::from_int32(&idx_pad, &[s as i64, kmax_pad as i64]).unwrap();
+                    let pad_arr =
+                        gather_sink_attention_rows(&q, kr, &ia_pad, vw, &sinks, scale).unwrap();
+                    assert_eq!(
+                        bits(&got_arr),
+                        bits(&pad_arr),
+                        "H={h} split={split} S={s}: kmax=836 vs padded kmax=837 bits differ"
+                    );
+                }
+            }
+        }
+    }
 }

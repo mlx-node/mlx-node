@@ -17,7 +17,7 @@ fn decode_groups_follow_the_op_table() {
         (Op::HcMix, Group::Fused),
         (Op::AttnQ8, Group::Fused),
         (Op::AttnCore, Group::Owner),
-        (Op::Router, Group::Row),
+        (Op::Router, Group::Fused),
         (Op::Experts, Group::Fused),
         (Op::FfnQ8, Group::Fused),
         (Op::TrunkOut, Group::Fused),
@@ -78,7 +78,7 @@ fn wave_spans_and_positions() {
         ]
     );
     assert_eq!(w.positions(), vec![9, 14, 15, 20]);
-    assert_eq!(w.group(Op::Router), Group::Row);
+    assert_eq!(w.group(Op::Router), Group::Fused);
 }
 
 #[test]
@@ -263,10 +263,13 @@ fn assert_f32_close(got: &[f32], want: &[f32], rel: f64, label: &str) {
 
 #[test]
 fn q8_dense_decode_row_invariant_and_f32_parity() {
+    use super::moe::with_prefill_q8_nax;
+
     crate::models::hy_v4_flash::exact_f32();
     let mut r = Rng(101);
     let max_m = 16usize;
-    let ms = [1usize, 2, 3, 4, 5, 12, 16];
+    let decode_ms = [1usize, 2, 3, 4, 5, 8, 11];
+    let nax_ms = [12usize, 16];
     let shapes = [
         (3072usize, 1024usize),
         (3072, 576),
@@ -283,7 +286,7 @@ fn q8_dense_decode_row_invariant_and_f32_parity() {
             })
             .collect();
         let wf = w.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
-        for m in ms {
+        for m in decode_ms {
             let xm = arr(&x_all[..m * k], &[m, k]);
             let y = qlinear(&xm, &w).unwrap();
             let yb = read_bits(&y);
@@ -294,9 +297,298 @@ fn q8_dense_decode_row_invariant_and_f32_parity() {
                     "dense ({k},{n}) M={m} row {row} bit-exact vs M=1"
                 );
             }
-            if m == 1 || m == 16 {
+            if m == 1 || m == 8 {
                 let y_ref = read(&xm.matmul(&wf).unwrap());
                 assert_f32_close(&read(&y), &y_ref, 1e-4, &format!("dense ({k},{n}) M={m}"));
+            }
+        }
+        for m in nax_ms {
+            let xm = arr(&x_all[..m * k], &[m, k]);
+            let y_nax = qlinear(&xm, &w).unwrap();
+            let y_ref = read(&xm.matmul(&wf).unwrap());
+            assert_f32_close(
+                &read(&y_nax),
+                &y_ref,
+                5e-3,
+                &format!("dense NAX ({k},{n}) M={m}"),
+            );
+            let y_dec = with_prefill_q8_nax(false, || qlinear(&xm, &w).unwrap());
+            let yb = read_bits(&y_dec);
+            for row in 0..m {
+                assert_eq!(
+                    &yb[row * n..(row + 1) * n],
+                    &alone[row][..],
+                    "dense decode fallback ({k},{n}) M={m} row {row} bit-exact vs M=1"
+                );
+            }
+        }
+    }
+}
+
+/// Builds a `Dense::SymQ8` weight from f32 values `[rows, k]` (`k % 32 == 0`).
+fn sym_q8(v: &[f32], rows: usize, k: usize) -> Dense {
+    use super::weights::{Form, dense_from_raw};
+    use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+
+    assert_eq!(v.len(), rows * k);
+    assert_eq!(k % 32, 0);
+    let mut raw = Vec::with_capacity((rows * k / 32) * 34);
+    for blk in v.as_chunks::<32>().0 {
+        let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let d = half::f16::from_f32((amax / 127.0).max(1e-6));
+        let df = d.to_f32();
+        raw.extend(d.to_bits().to_le_bytes());
+        for &x in blk {
+            let q = (x / df).round().clamp(-127.0, 127.0) as i8;
+            raw.extend(q.to_le_bytes());
+        }
+    }
+    let info = GgufTensorInfo {
+        name: "w".into(),
+        n_dims: 2,
+        dims: vec![k as u64, rows as u64],
+        tensor_type: GgufTensorType::Q8_0,
+        offset: 0,
+    };
+    dense_from_raw(&info, &raw, Form::Qmm).unwrap()
+}
+
+#[test]
+fn q8_dense_sym_v2_parity_and_row_invariance() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(2026);
+    let max_m = 12usize;
+    let ms = [1usize, 2, 3, 4, 8, 12];
+    let shapes = [(1024usize, 256usize), (1536, 384), (3072, 261), (192, 67)];
+    for (k, n) in shapes {
+        let w = sym_q8(&r.vec(n * k, 1.0 / (k as f32).sqrt()), n, k);
+        assert!(matches!(w, Dense::SymQ8 { .. }));
+        let wf = w.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
+        let x_all = r.vec(max_m * k, 1.25);
+        let alone: Vec<Vec<u32>> = (0..8)
+            .map(|row| {
+                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
+                read_bits(&qlinear(&xr, &w).unwrap())
+            })
+            .collect();
+        for m in ms {
+            let xm = arr(&x_all[..m * k], &[m, k]);
+            let y = qlinear(&xm, &w).unwrap();
+            let got = read(&y);
+            let want = read(&xm.matmul(&wf).unwrap());
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            if m <= 8 {
+                assert!(
+                    max_abs <= 1e-5,
+                    "sym dense v2 ({k},{n}) M={m} max_abs={max_abs:e}"
+                );
+                let yb = read_bits(&y);
+                for (row, want_bits) in alone.iter().enumerate().take(m) {
+                    assert_eq!(
+                        &yb[row * n..(row + 1) * n],
+                        &want_bits[..],
+                        "sym dense v2 ({k},{n}) M={m} row {row} bit-exact vs M=1"
+                    );
+                }
+            } else {
+                assert_f32_close(&got, &want, 5e-3, &format!("sym dense M={m} NAX ({k},{n})"));
+            }
+        }
+    }
+}
+
+#[test]
+fn q8_grouped_short_row_sym_parity_and_row_invariance() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(2027);
+    let max_m = 4usize;
+    let ms = [1usize, 2, 3, 4];
+    let shapes = [
+        (32usize, 192usize, 512usize),
+        (64, 192, 512),
+        (32, 512, 256),
+        (64, 512, 256),
+        (4, 192, 37),
+        (4, 512, 19),
+    ];
+    for (h, k, n) in shapes {
+        let w = sym_q8(&r.vec(h * n * k, 1.0 / (k as f32).sqrt()), h * n, k);
+        assert!(matches!(w, Dense::SymQ8 { .. }));
+        let wf = w
+            .f32()
+            .unwrap()
+            .reshape(&[h as i64, n as i64, k as i64])
+            .unwrap()
+            .transpose(Some(&[0, 2, 1]))
+            .unwrap();
+        let x_all = r.vec(max_m * h * k, 1.25);
+        let alone: Vec<Vec<u32>> = (0..max_m)
+            .map(|row| {
+                let xr = arr(&x_all[row * h * k..(row + 1) * h * k], &[1, h, k]);
+                read_bits(&grouped_mm_t_mgh(&w, &xr, h as i64).unwrap())
+            })
+            .collect();
+        for m in ms {
+            let xm = arr(&x_all[..m * h * k], &[m, h, k]);
+            let y = grouped_mm_t_mgh(&w, &xm, h as i64).unwrap();
+            let got = read(&y);
+            let want = read(
+                &xm.transpose(Some(&[1, 0, 2]))
+                    .unwrap()
+                    .matmul(&wf)
+                    .unwrap()
+                    .transpose(Some(&[1, 0, 2]))
+                    .unwrap(),
+            );
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-5,
+                "grouped short sym (H={h},K={k},N={n}) M={m} max_abs={max_abs:e}"
+            );
+            let yb = read_bits(&y);
+            for (row, want_bits) in alone.iter().enumerate().take(m) {
+                assert_eq!(
+                    &yb[row * h * n..(row + 1) * h * n],
+                    &want_bits[..],
+                    "grouped short sym (H={h},K={k},N={n}) M={m} row {row} bit-exact vs M=1"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn router_mv_bitwise_row_invariant_and_f32_parity() {
+    use super::ops::router_logits;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(2028);
+    let max_m = 8usize;
+    let ms = [1usize, 2, 3, 4, 8];
+    let cases = [(512usize, 3072usize), (509, 96)];
+    for (e, k) in cases {
+        let w_raw = r.vec(e * k, 1.0 / (k as f32).sqrt());
+        let w_arr = arr(&w_raw, &[e, k]);
+        let wt = w_arr.transpose(Some(&[1, 0])).unwrap();
+        let router = Dense::Array(w_arr);
+        let x_all = r.vec(max_m * k, 1.25);
+
+        let alone: Vec<Vec<u32>> = (0..max_m)
+            .map(|row| {
+                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
+                read_bits(&router_logits(&xr, &router).unwrap())
+            })
+            .collect();
+
+        for m in ms {
+            let xm = arr(&x_all[..m * k], &[m, k]);
+            let y = router_logits(&xm, &router).unwrap();
+            let got = read(&y);
+            let yb = read_bits(&y);
+            for (row, want_bits) in alone.iter().enumerate().take(m) {
+                assert_eq!(
+                    &yb[row * e..(row + 1) * e],
+                    &want_bits[..],
+                    "router_mv (E={e},K={k}) M={m} row {row} bit-exact vs M=1"
+                );
+            }
+            let want = read(&xm.matmul(&wt).unwrap());
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-5,
+                "router_mv (E={e},K={k}) M={m} max_abs={max_abs:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn q8_dual_down_add_parity_and_clamp_boundaries() {
+    use super::ops::try_q8_dual_down_add;
+    use crate::nn::Activations;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(2029);
+    let max_m = 4usize;
+    let ms = [1usize, 2, 4];
+    let cases = [(1536usize, 3072usize), (192, 71)];
+    let boundary_g = [-25.0f32, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];
+    let boundary_u = [-25.0f32, -10.5, -10.0, -2.0, 0.0, 3.0, 10.0, 10.5, 25.0];
+
+    for (k, n) in cases {
+        let w_up = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
+        let w_sd = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
+        let rl_all = r.vec(max_m * k, 1.0);
+        let mut sgu_all = r.vec(max_m * 2 * k, 1.5);
+        // Inject explicit clamp boundary pairs into every row's sg/su halves.
+        for row in 0..max_m {
+            let base = row * 2 * k;
+            for (i, (&g, &u)) in boundary_g.iter().zip(&boundary_u).enumerate() {
+                sgu_all[base + i] = g;
+                sgu_all[base + k + i] = u;
+            }
+        }
+
+        for limit in [0.0f32, 10.0f32] {
+            let mut single_bits = Vec::with_capacity(max_m);
+            for row in 0..max_m {
+                let rl = arr(&rl_all[row * k..(row + 1) * k], &[1, k]);
+                let sgu = arr(&sgu_all[row * 2 * k..(row + 1) * 2 * k], &[1, 2 * k]);
+                let fused = try_q8_dual_down_add(&rl, &sgu, &w_up, &w_sd, limit)
+                    .unwrap()
+                    .expect("SymQ8 dual_down_add must run on Metal");
+                single_bits.push(read_bits(&fused));
+            }
+            for m in ms {
+                let rl = arr(&rl_all[..m * k], &[m, k]);
+                let sgu = arr(&sgu_all[..m * 2 * k], &[m, 2 * k]);
+                let fused = try_q8_dual_down_add(&rl, &sgu, &w_up, &w_sd, limit)
+                    .unwrap()
+                    .expect("SymQ8 dual_down_add must run on Metal");
+                let got = read(&fused);
+
+                let sg = sgu.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+                let su = sgu
+                    .slice(&[0, k as i64], &[m as i64, 2 * k as i64])
+                    .unwrap();
+                let act = if limit > 0.0 {
+                    Activations::swiglu_clamped_compiled(&sg, &su, limit).unwrap()
+                } else {
+                    Activations::swiglu_compiled(&sg, &su).unwrap()
+                };
+                let up_ref = qlinear(&rl, &w_up).unwrap();
+                let sd_ref = qlinear(&act, &w_sd).unwrap();
+                let want = read(&up_ref.add(&sd_ref).unwrap());
+
+                let max_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs <= 1e-5,
+                    "dual_down_add (K={k},N={n}) M={m} limit={limit} max_abs={max_abs:e}"
+                );
+                let fb = read_bits(&fused);
+                for (row, want_bits) in single_bits.iter().enumerate().take(m) {
+                    assert_eq!(
+                        &fb[row * n..(row + 1) * n],
+                        &want_bits[..],
+                        "dual_down_add (K={k},N={n}) M={m} limit={limit} row {row} bit-exact vs M=1"
+                    );
+                }
             }
         }
     }

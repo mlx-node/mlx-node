@@ -8,7 +8,7 @@
 //! AttnQ8      fused   q_a, q_b, kv_a, k_b, v_b, gate, output fused
 //! AttnCore    owner   cache write, indexer (its Q8 too),     owner
 //!                     sparse attention on the owner's rows
-//! Router      row     f32 router one row per call            fused
+//! Router      fused   row-invariant f32 router GEMV          fused
 //! Experts     fused   one bank prepare over the union        fused
 //! FfnQ8       fused   latent down / up, shared expert        fused
 //! TrunkOut    fused   fused HC head + rms norm               fused
@@ -83,12 +83,12 @@ pub const fn decode_group(op: Op) -> Group {
         Op::Engram
         | Op::HcMix
         | Op::AttnQ8
+        | Op::Router
         | Op::Experts
         | Op::FfnQ8
         | Op::TrunkOut
         | Op::VocabHead => Group::Fused,
         Op::AttnCore => Group::Owner,
-        Op::Router => Group::Row,
     }
 }
 

@@ -591,11 +591,12 @@ fn sym_to_explicit_qmm(d: &Dense) -> Dense {
 #[test]
 fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
     use super::attention::grouped_mm_t_mgh;
-    use super::moe::qlinear;
+    use super::moe::{qlinear, with_prefill_q8_nax};
 
     crate::models::hy_v4_flash::exact_f32();
 
-    // Dense SymQ8: M = 1..=16 row-invariance, bit-identical to explicit F32 Qmm, <= 1e-5 vs F32 ref.
+    // Dense SymQ8: M = 1..=11 decode row-invariance and <= 1e-5 vs F32 ref;
+    // M = 12..=16 routes to NAX prefill by default and stays row-invariant when NAX is disabled.
     let (k, n) = (256usize, 96usize);
     let sym = make_sym_q8(n, k, 701);
     assert!(matches!(sym, Dense::SymQ8 { .. }));
@@ -611,7 +612,12 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
         let xr = MxArray::from_float32(&all_xs[r * k..(r + 1) * k], &[1, k as i64]).unwrap();
         let y_sym = read(&qlinear(&xr, &sym).unwrap());
         let y_qmm = read(&qlinear(&xr, &qmm).unwrap());
-        assert_eq!(bits(&y_sym), bits(&y_qmm), "M=1 row {r} SymQ8 vs Qmm");
+        let diff_qmm = y_sym
+            .iter()
+            .zip(&y_qmm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff_qmm <= 1e-5, "M=1 row {r} SymQ8 vs Qmm {diff_qmm:e}");
         let y_ref = read(&xr.matmul(&wt).unwrap());
         let max_abs = y_sym
             .iter()
@@ -621,13 +627,33 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
         assert!(max_abs <= 1e-5, "M=1 row {r} max_abs {max_abs:e}");
         single_bits.push(bits(&y_sym));
     }
-    for m in 2..=16usize {
+    for m in 2..=11usize {
         let xm = MxArray::from_float32(&all_xs[..m * k], &[m as i64, k as i64]).unwrap();
         let ym = read(&qlinear(&xm, &sym).unwrap());
         let ym_qmm = read(&qlinear(&xm, &qmm).unwrap());
-        assert_eq!(bits(&ym), bits(&ym_qmm), "M={m} SymQ8 vs Qmm");
+        let diff_qmm = ym
+            .iter()
+            .zip(&ym_qmm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff_qmm <= 1e-5, "M={m} SymQ8 vs Qmm {diff_qmm:e}");
         for (r, want) in single_bits.iter().enumerate().take(m) {
             assert_eq!(&bits(&ym[r * n..(r + 1) * n]), want, "M={m} row {r}");
+        }
+    }
+    for m in 12..=16usize {
+        let xm = MxArray::from_float32(&all_xs[..m * k], &[m as i64, k as i64]).unwrap();
+        let ym_nax = read(&qlinear(&xm, &sym).unwrap());
+        let y_ref = read(&xm.matmul(&wt).unwrap());
+        let rel = rel_l2(&ym_nax, &y_ref);
+        assert!(rel < 1e-3, "M={m} dense NAX rel_l2={rel:e}");
+        let ym_dec = with_prefill_q8_nax(false, || read(&qlinear(&xm, &sym).unwrap()));
+        for (r, want) in single_bits.iter().enumerate().take(m) {
+            assert_eq!(
+                &bits(&ym_dec[r * n..(r + 1) * n]),
+                want,
+                "M={m} decode fallback row {r}"
+            );
         }
     }
 
@@ -652,7 +678,15 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
         .unwrap();
         let y_sym = read(&grouped_mm_t_mgh(&gsym, &xr, g as i64).unwrap());
         let y_qmm = read(&grouped_mm_t_mgh(&gqmm, &xr, g as i64).unwrap());
-        assert_eq!(bits(&y_sym), bits(&y_qmm), "grouped M=1 row {r}");
+        let diff_qmm = y_sym
+            .iter()
+            .zip(&y_qmm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff_qmm <= 1e-5,
+            "grouped M=1 row {r} SymQ8 vs Qmm {diff_qmm:e}"
+        );
         let y_ref = read(
             &xr.transpose(Some(&[1, 0, 2]))
                 .unwrap()

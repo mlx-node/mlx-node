@@ -3444,6 +3444,50 @@ unsafe extern "C" {
         post: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_hc_mix_reduce_norm(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scale: *mut mlx_array,
+        base: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        hc_norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        out_norm_eps: f32,
+        head_only: bool,
+        out_h_norm: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_post_norm_hc_post(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post: *mut mlx_array,
+        post_norm_w: *mut mlx_array,
+        post_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_bridge(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post_prev: *mut mlx_array,
+        post_norm_w: *mut mlx_array,
+        next_weight: *mut mlx_array,
+        next_scale: *mut mlx_array,
+        next_base: *mut mlx_array,
+        next_norm_w: *mut mlx_array,
+        post_eps: f32,
+        hc_norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        next_eps: f32,
+        skip_next_norm: bool,
+        head_only: bool,
+        out_x: *mut *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+        out_post_next: *mut *mut mlx_array,
+    ) -> bool;
+
     pub fn mlx_hy4_bf16_lm_head(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_dense_decode(
@@ -3546,6 +3590,18 @@ unsafe extern "C" {
         down: *mut mlx_array,
         weights: *mut mlx_array,
         inverse: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_router_mv(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dual_down_add(
+        routed_latent: *mut mlx_array,
+        shared_gu: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        w_sd: *mut mlx_array,
+        s_sd: *mut mlx_array,
+        limit: f32,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_router_topk(

@@ -21,13 +21,15 @@ use napi::{Error, Result};
 
 use super::bank::KqBank;
 use super::batch::{Core, Group, Op, Owners, Wave, group};
-use super::block::{Block, EngramIn, LayerState};
+use super::block::{Block, EngramIn, HcCarry, LayerState};
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
-use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits, rms_norm, try_bf16_lm_head};
+use super::ops::{
+    HEAD_CHUNK, hc_bridge_head, hc_head_norm, head_chunks, head_logits, try_bf16_lm_head,
+};
 use super::prefix_state::StateLayer;
 use super::rows::{EngramRows, PrefetchHandle};
 use super::stats::{DeferScope, Phase, prof_end, prof_start};
@@ -825,12 +827,13 @@ impl Model {
         let w = self.weights.as_ref();
         let (ni, hc, dim) = (total as i64, self.cfg.hc.count as i64, self.cfg.dim as i64);
         let tok = MxArray::from_uint32(&ids, &[ni])?;
-        let mut x = w
-            .token_embd()
-            .rows(&tok)?
-            .astype(DType::Float32)?
-            .reshape(&[ni, 1, dim])?
-            .broadcast_to(&[ni, hc, dim])?;
+        let mut carry = HcCarry::Streams(
+            w.token_embd()
+                .rows(&tok)?
+                .astype(DType::Float32)?
+                .reshape(&[ni, 1, dim])?
+                .broadcast_to(&[ni, hc, dim])?,
+        );
         let direct = self.bank_is_direct();
         let prefill_ahead = !direct
             && wave.kind() == RowKind::Prefill
@@ -839,6 +842,8 @@ impl Model {
             && wave.kind().is_decode()
             && total <= super::block::DECODE_READ_AHEAD_MAX_ROWS
             && self.decode_prefetch_active();
+        let keep_out = trace.as_deref().is_some_and(|t| t.keep_out);
+        let mut pending_trace_out = false;
         for (l, blk) in self.blocks.iter().enumerate() {
             if cancel.is_some_and(|c| c(l)) {
                 return Err(bad(format!("cancelled before layer {l}")));
@@ -861,36 +866,79 @@ impl Model {
             });
             #[cfg(test)]
             if let Some(Some(xi)) = trace.as_deref().and_then(|t| t.inputs.get(l)) {
-                x = xi.clone();
+                let injected = xi.clone();
+                if pending_trace_out {
+                    let prev_x = carry.into_streams(self.cfg.norm_eps)?;
+                    if let Some(t) = trace.as_deref_mut() {
+                        t.out.push(prev_x);
+                    }
+                    pending_trace_out = false;
+                }
+                carry = HcCarry::Streams(injected);
             }
             let need_routes = trace.is_some();
             let next = ((prefill_ahead || decode_ahead) && l + 1 < self.blocks.len())
                 .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
-            let (y, routes) =
-                blk.forward_traced(&w.layers()[l], &x, wave, owners, engram, next, need_routes)?;
+            let mut prev_out_slot = None;
+            let (next_carry, routes) = blk.forward_carry(
+                &w.layers()[l],
+                carry,
+                wave,
+                owners,
+                engram,
+                next,
+                need_routes,
+                pending_trace_out.then_some(&mut prev_out_slot),
+            )?;
+            if pending_trace_out {
+                if let (Some(t), Some(prev_x)) = (trace.as_deref_mut(), prev_out_slot) {
+                    t.out.push(prev_x);
+                }
+                pending_trace_out = false;
+            }
             match wave.kind() {
                 RowKind::Prefill => {
-                    super::stats::eval(&[&y], "hy_v4_flash layer")?;
+                    match &next_carry {
+                        HcCarry::Streams(y) => super::stats::eval(&[y], "hy_v4_flash layer")?,
+                        HcCarry::Pending { y, res, post, .. } => {
+                            super::stats::eval(&[y, res, post], "hy_v4_flash layer")?
+                        }
+                    }
                     for b in &self.banks {
                         b.settle_all();
                     }
                 }
                 RowKind::Decode => {
                     if !direct || (l >= 2 && (l - 2).is_multiple_of(3)) {
-                        MxArray::async_eval_arrays(&[&y]);
+                        match &next_carry {
+                            HcCarry::Streams(y) => MxArray::async_eval_arrays(&[y]),
+                            HcCarry::Pending { y, res, post, .. } => {
+                                MxArray::async_eval_arrays(&[y, res, post])
+                            }
+                        }
                     }
                 }
             }
-            x = y;
+            carry = next_carry;
             if let Some(t) = trace.as_deref_mut() {
                 t.routes.push(routes);
-                if t.keep_out {
-                    t.out.push(x.clone());
+                if keep_out {
+                    match &carry {
+                        HcCarry::Streams(y) => t.out.push(y.clone()),
+                        HcCarry::Pending { .. } => pending_trace_out = true,
+                    }
                 }
             }
         }
+        if pending_trace_out {
+            let x_last = carry.into_streams(self.cfg.norm_eps)?;
+            if let Some(t) = trace {
+                t.out.push(x_last.clone());
+            }
+            carry = HcCarry::Streams(x_last);
+        }
         let tp = prof_start();
-        let outs = self.heads(&x, owners, wave)?;
+        let outs = self.heads_carry(carry, owners, wave)?;
         prof_end(Phase::Head, tp, &[])?;
         Ok(outs)
     }
@@ -930,11 +978,7 @@ impl Model {
     fn trunk_out(&self, x: &MxArray) -> Result<MxArray> {
         let w = self.weights.as_ref();
         let eps = self.cfg.norm_eps;
-        rms_norm(
-            &hc_head(x, w.output_hc(), eps, self.cfg.hc.eps)?,
-            w.output_norm(),
-            eps,
-        )
+        hc_head_norm(x, w.output_hc(), w.output_norm(), eps, self.cfg.hc.eps)
     }
 
     /// `trunk_out` as `Op::TrunkOut` groups for `kind`.
@@ -945,20 +989,127 @@ impl Model {
         }
     }
 
-    /// Every owner's outputs from its rows of `x [r, hc, d]`, evaluated
-    /// together with `x` and what `stats::defer` holds.
-    fn heads(&self, x: &MxArray, owners: &dyn Owners, wave: &Wave) -> Result<Vec<Output>> {
+    /// `rms(hc_head(x))·output_norm` directly from `carry` (fuses the final
+    /// `post_norm + hc_post_identity + hc_head + output_norm` when `Pending`).
+    fn trunk_out_carry(&self, carry: &HcCarry) -> Result<MxArray> {
+        let w = self.weights.as_ref();
+        let eps = self.cfg.norm_eps;
+        match carry {
+            HcCarry::Streams(x) => self.trunk_out(x),
+            HcCarry::Pending {
+                y,
+                res,
+                post,
+                post_norm,
+            } => hc_bridge_head(
+                y,
+                res,
+                post,
+                post_norm,
+                w.output_hc(),
+                Some(w.output_norm()),
+                eps,
+                self.cfg.hc.eps,
+            ),
+        }
+    }
+
+    /// Slices rows `lo..hi` of `carry` before applying `trunk_out_carry`.
+    fn trunk_out_carry_slice(&self, carry: &HcCarry, lo: i64, hi: i64) -> Result<MxArray> {
+        let w = self.weights.as_ref();
+        let eps = self.cfg.norm_eps;
+        match carry {
+            HcCarry::Streams(x) => {
+                let (hc, d) = (x.shape_at(1)?, x.shape_at(2)?);
+                let sub = x.slice(&[lo, 0, 0], &[hi, hc, d])?;
+                self.trunk_out(&sub)
+            }
+            HcCarry::Pending {
+                y,
+                res,
+                post,
+                post_norm,
+            } => {
+                let (hc, d) = (res.shape_at(1)?, res.shape_at(2)?);
+                let ys = y.slice(&[lo, 0], &[hi, d])?;
+                let rs = res.slice(&[lo, 0, 0], &[hi, hc, d])?;
+                let ps = post.slice(&[lo, 0], &[hi, hc])?;
+                hc_bridge_head(
+                    &ys,
+                    &rs,
+                    &ps,
+                    post_norm,
+                    w.output_hc(),
+                    Some(w.output_norm()),
+                    eps,
+                    self.cfg.hc.eps,
+                )
+            }
+        }
+    }
+
+    /// Every owner's outputs from `carry`, evaluated together with the trunk
+    /// output and what `stats::defer` holds.
+    fn heads_carry(&self, carry: HcCarry, owners: &dyn Owners, wave: &Wave) -> Result<Vec<Output>> {
         let kind = wave.kind();
         let n_owners = wave.owners();
+        let any_wanted = (0..n_owners).any(|i| {
+            let want = owners.want(i);
+            want.hidden || want.logits != Logits::None
+        });
+        if !any_wanted {
+            let anchor = match &carry {
+                HcCarry::Streams(x) => x,
+                HcCarry::Pending { y, .. } => y,
+            };
+            super::stats::eval(&[anchor], "hy_v4_flash head")?;
+            return Ok((0..n_owners)
+                .map(|_| Output {
+                    logits: None,
+                    hidden: None,
+                })
+                .collect());
+        }
+
+        // Fast path for single-owner prefill needing only the final row's logits:
+        // avoid computing hc_head + output_norm on the other S-1 rows.
+        if n_owners == 1
+            && !owners.want(0).hidden
+            && owners.want(0).logits == Logits::Last
+            && wave.rows() > 1
+        {
+            let last = (wave.rows() - 1) as i64;
+            let h = self.trunk_out_carry_slice(&carry, last, last + 1)?;
+            let mut outs = vec![Output {
+                logits: None,
+                hidden: None,
+            }];
+            let anchor = match &carry {
+                HcCarry::Streams(x) => x,
+                HcCarry::Pending { y, .. } => y,
+            };
+            self.eval_head_logits(anchor, &mut outs, vec![h], &[(0, 0, 1)], owners, wave)?;
+            return Ok(outs);
+        }
+
+        let all_trunk = match group(Op::TrunkOut, kind) {
+            Group::Row => {
+                let x = carry.into_streams(self.cfg.norm_eps)?;
+                let h = self.trunk_rows(&x, kind)?;
+                return self.heads_from_trunk(&x, &h, owners, wave);
+            }
+            Group::Fused | Group::Owner => self.trunk_out_carry(&carry)?,
+        };
+
         let mut outs = Vec::with_capacity(n_owners);
         let mut logit_hs: Vec<MxArray> = Vec::new();
         let mut logit_spans: Vec<(usize, i64, i64)> = Vec::new();
         let mut row_off = 0i64;
         for i in 0..n_owners {
-            let xo = wave.owner_rows(x, i)?;
             let want = owners.want(i);
+            let span = wave.spans()[i];
             let hidden = if want.hidden {
-                Some(self.trunk_rows(&xo, kind)?)
+                Some(wave.owner_rows(&all_trunk, i)?)
             } else {
                 None
             };
@@ -966,26 +1117,29 @@ impl Model {
                 Logits::None => None,
                 Logits::All => Some(match &hidden {
                     Some(h) => h.clone(),
-                    None => self.trunk_rows(&xo, kind)?,
+                    None => wave.owner_rows(&all_trunk, i)?,
                 }),
                 Logits::Last => {
-                    let n = xo.shape_at(0)?;
-                    // In Prefill with n > 1, hidden used a multi-row matmul whose rounding
-                    // differs from a 1-row matmul, so compute the last row alone.
-                    let h = match &hidden {
-                        Some(h) if n == 1 => h.clone(),
-                        Some(h) if kind == RowKind::Decode => {
+                    let n = span.rows as i64;
+                    let h = if let Some(h) = &hidden {
+                        if n == 1 {
+                            h.clone()
+                        } else if kind == RowKind::Decode {
                             h.slice(&[n - 1, 0], &[n, h.shape_at(1)?])?
+                        } else {
+                            let last = (span.lo + span.rows - 1) as i64;
+                            self.trunk_out_carry_slice(&carry, last, last + 1)?
                         }
-                        _ => {
-                            let (hc, d) = (xo.shape_at(1)?, xo.shape_at(2)?);
-                            let last = if n == 1 {
-                                xo
-                            } else {
-                                xo.slice(&[n - 1, 0, 0], &[n, hc, d])?
-                            };
-                            self.trunk_out(&last)?
+                    } else if kind == RowKind::Decode || n == 1 {
+                        let ho = wave.owner_rows(&all_trunk, i)?;
+                        if n == 1 {
+                            ho
+                        } else {
+                            ho.slice(&[n - 1, 0], &[n, ho.shape_at(1)?])?
                         }
+                    } else {
+                        let last = (span.lo + span.rows - 1) as i64;
+                        self.trunk_out_carry_slice(&carry, last, last + 1)?
                     };
                     Some(h)
                 }
@@ -1001,6 +1155,74 @@ impl Model {
                 hidden,
             });
         }
+        self.eval_head_logits(
+            match &carry {
+                HcCarry::Streams(x) => x,
+                HcCarry::Pending { y, .. } => y,
+            },
+            &mut outs,
+            logit_hs,
+            &logit_spans,
+            owners,
+            wave,
+        )?;
+        Ok(outs)
+    }
+
+    fn heads_from_trunk(
+        &self,
+        anchor: &MxArray,
+        all_trunk: &MxArray,
+        owners: &dyn Owners,
+        wave: &Wave,
+    ) -> Result<Vec<Output>> {
+        let n_owners = wave.owners();
+        let mut outs = Vec::with_capacity(n_owners);
+        let mut logit_hs: Vec<MxArray> = Vec::new();
+        let mut logit_spans: Vec<(usize, i64, i64)> = Vec::new();
+        let mut row_off = 0i64;
+        for i in 0..n_owners {
+            let want = owners.want(i);
+            let ho = wave.owner_rows(all_trunk, i)?;
+            let hidden = want.hidden.then(|| ho.clone());
+            let h = match want.logits {
+                Logits::None => None,
+                Logits::All => Some(ho),
+                Logits::Last => {
+                    let n = ho.shape_at(0)?;
+                    Some(if n == 1 {
+                        ho
+                    } else {
+                        ho.slice(&[n - 1, 0], &[n, ho.shape_at(1)?])?
+                    })
+                }
+            };
+            if let Some(h) = h {
+                let rows = h.shape_at(0)?;
+                logit_spans.push((i, row_off, rows));
+                row_off += rows;
+                logit_hs.push(h);
+            }
+            outs.push(Output {
+                logits: None,
+                hidden,
+            });
+        }
+        self.eval_head_logits(anchor, &mut outs, logit_hs, &logit_spans, owners, wave)?;
+        Ok(outs)
+    }
+
+    fn eval_head_logits(
+        &self,
+        anchor: &MxArray,
+        outs: &mut [Output],
+        mut logit_hs: Vec<MxArray>,
+        logit_spans: &[(usize, i64, i64)],
+        owners: &dyn Owners,
+        wave: &Wave,
+    ) -> Result<()> {
+        let kind = wave.kind();
+        let n_owners = wave.owners();
         if !logit_hs.is_empty() {
             let head = self.weights.output();
             let all_h = if logit_hs.len() == 1 {
@@ -1021,18 +1243,18 @@ impl Model {
                 outs[logit_spans[0].0].logits = Some(all_logits);
             } else {
                 let vocab = all_logits.shape_at(1)?;
-                for &(owner, lo, rows) in &logit_spans {
+                for &(owner, lo, rows) in logit_spans {
                     outs[owner].logits = Some(all_logits.slice(&[lo, 0], &[lo + rows, vocab])?);
                 }
             }
         }
-        let live: Vec<&MxArray> = std::iter::once(x)
+        let live: Vec<&MxArray> = std::iter::once(anchor)
             .chain(
                 outs.iter()
                     .flat_map(|o| o.logits.iter().chain(o.hidden.iter())),
             )
             .collect();
         super::stats::eval(&live, "hy_v4_flash head")?;
-        Ok(outs)
+        Ok(())
     }
 }
