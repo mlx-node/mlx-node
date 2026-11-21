@@ -21,22 +21,11 @@ use crate::utils::safetensors::load_safetensors_lazy;
 
 /// Whether the Metal-only native paths can run on this host.
 ///
-/// The block-paged custom primitives (`paged_kv_write` / `paged_attention`)
-/// and the GDN `fast::metal_kernel` kernels require MLX's Metal backend and
-/// throw at runtime without it. On the CUDA/Linux build
-/// (`mlx_metal_is_available()` is false) the model constructors leave the
-/// paged adapter unset and the GDN dispatch takes the ops path, so every
-/// forward falls back to the device-agnostic eager Rust path.
-///
-/// (The name is historical: this probe originally gated the deleted
-/// compiled-C++-forward weight registration; today it is a plain
-/// Metal-availability check.)
-///
-/// The probe is cached: `mlx_metal_is_available()` is a constant per process.
+/// Delegates to [`crate::accelerator::host_has_metal`] (single process-wide
+/// capability source of truth).
+#[inline]
 pub(crate) fn compiled_forward_backend_available() -> bool {
-    use std::sync::OnceLock;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() })
+    crate::accelerator::host_has_metal()
 }
 
 /// Strip the known Qwen3.5 vision-tower wrappers from a checkpoint key.

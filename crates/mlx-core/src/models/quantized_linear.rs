@@ -17,10 +17,108 @@ use super::int8_gemm;
 /// 8-row tile; a Q8_0 segment (MLX affine 8-bit group 32 with F32 sidecars)
 /// runs the per-thread loop of its standalone `AffineMixedQmm` qmv_wide call.
 /// Set MLX_MIXED_PROJECTION=0 before loading a model for an unfused comparison.
+fn is_cuda_kquant_multi_eligible(q: &QuantizedLinear, rows: i64) -> bool {
+    let (base, tiled) = crate::models::quant_dispatch::split_kquant_layout(&q.mode);
+    let mode_ok = matches!(base, "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs");
+    mode_ok
+        && q.bias.is_none()
+        && q.hadamard.is_none()
+        && q.input_amax.is_none()
+        && q.biases.is_some()
+        && (rows <= 16 || tiled)
+}
+
+pub(crate) fn cuda_kquant_multi_ql(
+    x: &MxArray,
+    projs: &[&QuantizedLinear],
+) -> Result<Option<Vec<MxArray>>> {
+    use crate::array::DType;
+    if !crate::accelerator::cuda_ops_available()
+        || !(2..=4).contains(&projs.len())
+        || x.dtype()? != DType::BFloat16
+    {
+        return Ok(None);
+    }
+    let ndim = x.ndim()?;
+    if ndim < 2 {
+        return Ok(None);
+    }
+    let k = x.shape_at(ndim - 1)?;
+    let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+    if rows < 1 || k < 2048 || k % 256 != 0 {
+        return Ok(None);
+    }
+    if !projs.iter().all(|q| is_cuda_kquant_multi_eligible(q, rows)) {
+        return Ok(None);
+    }
+    let mut specs = Vec::with_capacity(projs.len());
+    for q in projs {
+        let Some(biases) = q.biases.as_ref() else {
+            return Ok(None);
+        };
+        specs.push((&q.weight, &q.scales, biases, q.mode.as_str()));
+    }
+    let out = crate::kernels::linear::kquant_matmul_multi(x, rows, &specs)?;
+    if out.is_some() && rows == 1 {
+        for q in projs {
+            q.clear_cuda_dense_prefill();
+        }
+    }
+    Ok(out)
+}
+
+fn cuda_mixed_projection_forward(
+    x: &MxArray,
+    projections: &[&LinearProj],
+) -> Result<Option<Vec<MxArray>>> {
+    use crate::array::DType;
+    if !(2..=4).contains(&projections.len()) || x.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let ndim = x.ndim()?;
+    if ndim < 2 {
+        return Ok(None);
+    }
+    let k = x.shape_at(ndim - 1)?;
+    let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+    if rows < 1 || k < 2048 || k % 256 != 0 {
+        return Ok(None);
+    }
+    let mut kq_indices = Vec::with_capacity(projections.len());
+    let mut kq_projs = Vec::with_capacity(projections.len());
+    for (idx, proj) in projections.iter().enumerate() {
+        if let LinearProj::Quantized(q) = proj
+            && is_cuda_kquant_multi_eligible(q, rows)
+        {
+            kq_indices.push(idx);
+            kq_projs.push(q);
+        }
+    }
+    if kq_projs.len() < 2 {
+        return Ok(None);
+    }
+    let Some(kq_outs) = cuda_kquant_multi_ql(x, &kq_projs)? else {
+        return Ok(None);
+    };
+    let mut results: Vec<Option<MxArray>> = (0..projections.len()).map(|_| None).collect();
+    for (idx, arr) in kq_indices.into_iter().zip(kq_outs) {
+        results[idx] = Some(arr);
+    }
+    for (idx, slot) in results.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(projections[idx].forward(x)?);
+        }
+    }
+    Ok(Some(results.into_iter().map(Option::unwrap).collect()))
+}
+
 pub(crate) fn mixed_projection_forward(
     x: &MxArray,
     projections: &[&LinearProj],
 ) -> Result<Option<Vec<MxArray>>> {
+    if crate::accelerator::cuda_ops_available() {
+        return cuda_mixed_projection_forward(x, projections);
+    }
     use crate::array::DType;
     // `MixedProjectionFormat` (mlx-sys `metal/mixed_projection/abi.h`).
     const Q4K: u32 = 4;
@@ -460,6 +558,12 @@ impl LinearProj {
         }
     }
 
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        if let LinearProj::Quantized(projection) = self {
+            projection.clear_cuda_dense_prefill();
+        }
+    }
+
     /// `x` `[lanes, rows, K]`: each lane's rows get the bits `forward` gives
     /// them alone. A plain Tiled64 K-quant takes one 16/32-row tier call for
     /// 2-4 lanes of 8 rows; every other projection runs once per lane.
@@ -689,6 +793,9 @@ impl MLPVariant {
             let last = combined.ndim()? as usize - 1;
             let gu = combined.split_sections(&[*split], last as i32)?;
             return Activations::swiglu_compiled(&gu[0], &gu[1]);
+        }
+        if let Some(pair) = cuda_kquant_multi_ql(x, &[gate_proj, up_proj])? {
+            return Activations::swiglu_compiled(&pair[0], &pair[1]);
         }
         let gate = gate_proj.forward(x)?;
         let up = up_proj.forward(x)?;
@@ -932,6 +1039,25 @@ impl MLPVariant {
         }
     }
 
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        match self {
+            MLPVariant::Standard(_) => {}
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            } => {
+                gate_proj.clear_cuda_dense_prefill();
+                up_proj.clear_cuda_dense_prefill();
+                down_proj.clear_cuda_dense_prefill();
+                if let Some(pair) = gate_up {
+                    pair.0.clear_cuda_dense_prefill();
+                }
+            }
+        }
+    }
+
     /// `x` `[lanes, rows, K]`: each lane's rows get the bits `forward` gives
     /// them alone. Every projection goes through `forward_lanes`; SwiGLU is
     /// row-wise and runs stacked.
@@ -985,7 +1111,6 @@ impl MLPVariant {
         };
         Ok(gate_up_hold && down_proj.lane_tier_holds(intermediate)?)
     }
-
     pub fn get_gate_proj_weight(&self) -> MxArray {
         match self {
             MLPVariant::Standard(mlp) => mlp.get_gate_proj_weight(),
@@ -1745,6 +1870,12 @@ pub struct QuantizedLinear {
     // Set only after the MoE loader validates and installs the complete head.
     // Immutable thereafter; compiled closures share this same projection.
     source_head: bool,
+    // CUDA-only transient dense weights for K-quant prefill and DFlash2 verify
+    // batches. `None` (zero allocation, 8-byte niche-optimized inline footprint
+    // across all OSes) on Metal/CPU; single-row AR decode or turn cleanup
+    // releases retained weights for packed QMV.
+    cuda_dense_prefill:
+        Option<Box<std::sync::Mutex<Option<crate::accelerator::RetainedDenseWeight>>>>,
     // Splash weight planes of the same rows (`attach_planes`). Every change of
     // the packed arrays drops them: stale planes would compute another layer.
     planes: Option<Box<AttachedPlanes>>,
@@ -1887,6 +2018,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
         }
     }
@@ -2059,6 +2191,7 @@ impl QuantizedLinear {
         self.biases = Some(biases);
         self.bias = bias;
         self.mode = format!("{}{KQUANT_TILED_SUFFIX}", kq.mode_str);
+        self.clear_cuda_dense_prefill();
         Ok(true)
     }
 
@@ -2234,6 +2367,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
         }))
     }
@@ -2304,6 +2438,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
         })
     }
@@ -2332,6 +2467,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
         }
     }
@@ -2459,6 +2595,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
         }
     }
@@ -2952,33 +3089,219 @@ impl QuantizedLinear {
             None
         };
 
+        // CUDA affine Q8_0 (bits=8, group_size=32) fast path with BF16 `x` and
+        // F32 / BF16 / F16 sidecars: small-row (M in 1..=16) stays packed in
+        // `mlx_affine_q8_few_cuda`; M >= 17 uses the cached dense BF16 cuBLAS path.
+        if crate::accelerator::cuda_ops_available()
+            && activation_dtype == Some(crate::array::DType::BFloat16)
+            && self.bits == 8
+            && self.group_size == 32
+            && self.bias.is_none()
+            && let Some(biases) = &self.biases
+        {
+            let scale_dtype = self.scales.dtype()?;
+            if scale_dtype == biases.dtype()?
+                && matches!(
+                    scale_dtype,
+                    crate::array::DType::Float32
+                        | crate::array::DType::BFloat16
+                        | crate::array::DType::Float16
+                )
+            {
+                let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+                let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+                if (1..=16).contains(&rows)
+                    && k >= 32
+                    && k % 32 == 0
+                    && let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
+                        x,
+                        &self.weight,
+                        &self.scales,
+                        biases,
+                        32,
+                        8,
+                    )?
+                {
+                    if rows == 1 {
+                        self.clear_cuda_dense_prefill();
+                    }
+                    return Ok(out);
+                }
+                if rows >= 17 {
+                    let mut dense = self
+                        .cuda_dense_prefill_slot()
+                        .map(|slot| {
+                            slot.lock().map_err(|_| {
+                                Error::from_reason("CUDA dense prefill cache is poisoned")
+                            })
+                        })
+                        .transpose()?;
+                    if let Some(weight) = dense.as_deref().and_then(Option::as_ref) {
+                        return x.matmul(&weight.array().transpose(Some(&[1, 0]))?);
+                    }
+                    let weight = self
+                        .dequantize_current_weight()?
+                        .astype(crate::array::DType::BFloat16)?;
+                    let weight_bytes = weight.size()?.saturating_mul(2);
+                    let result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
+                    if let Some(slot) = dense.as_deref_mut()
+                        && let Some(retained) = crate::accelerator::try_retain_dense_prefill_weight(
+                            weight,
+                            weight_bytes,
+                        )
+                    {
+                        *slot = Some(retained);
+                    }
+                    return Ok(result);
+                }
+                self.clear_cuda_dense_prefill();
+            }
+        }
+
         // BF16 rows against F32 sidecars (Qwen3.5 GGUF affine): one primitive
         // with the promoted path's F32 math and a single BF16 rounding, instead
         // of casting x up and the result back. Small row counts only, so M=1
         // decode and prefill graphs keep their standalone casts.
-        if activation_dtype == Some(crate::array::DType::BFloat16)
+        if !crate::accelerator::cuda_ops_available()
+            && activation_dtype == Some(crate::array::DType::BFloat16)
             && self.bias.is_none()
             && self.scales.dtype()? == crate::array::DType::Float32
             && let Some(biases) = &self.biases
             && biases.dtype()? == crate::array::DType::Float32
-            && crate::engine::persistence::compiled_forward_backend_available()
         {
             let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
             let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
-            if (2..=8).contains(&rows) {
-                let handle = unsafe {
-                    sys::mlx_quantized_matmul_affine_bf16(
-                        x.handle.0,
-                        self.weight.handle.0,
-                        self.scales.handle.0,
-                        biases.handle.0,
-                        self.group_size,
-                        self.bits,
-                    )
-                };
-                if !handle.is_null() {
-                    return MxArray::from_handle(handle, "quantized_matmul_affine_bf16");
+            if (2..=8).contains(&rows)
+                && let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                    self.group_size,
+                    self.bits,
+                )?
+            {
+                return Ok(out);
+            }
+        }
+
+        // Supported small-row batches stay packed through CUDA INT8 MMA (checked
+        // BEFORE taking the dense-prefill lock so decode has zero mutex overhead).
+        // Other K-quant batches share one dense weight through cuBLAS when the
+        // device memory budget admits retention, or dequantize ephemerally on
+        // tighter discrete GPUs.
+        if crate::accelerator::cuda_ops_available()
+            && matches!(
+                crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
+                "q2k" | "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"
+            )
+        {
+            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+            if (1..=16).contains(&rows)
+                && k >= 2048
+                && matches!(
+                    crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
+                    "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"
+                )
+                && self.bias.is_none()
+                && x.dtype()? == crate::array::DType::BFloat16
+                && let Some(biases) = self.biases.as_ref()
+                && let Some(out) = crate::kernels::linear::kquant_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                    &self.mode,
+                )?
+            {
+                if rows == 1 {
+                    self.clear_cuda_dense_prefill();
                 }
+                return Ok(out);
+            }
+            if rows >= 17
+                && k >= 2048
+                && matches!(
+                    crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
+                    "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"
+                )
+                && self.bias.is_none()
+                && x.dtype()? == crate::array::DType::BFloat16
+                && let Some(biases) = self.biases.as_ref()
+                && let Some(out) = crate::kernels::linear::kquant_matmul_prefill(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                    &self.mode,
+                )?
+            {
+                return Ok(out);
+            }
+            if rows >= 2 {
+                let mut dense = self
+                    .cuda_dense_prefill_slot()
+                    .map(|slot| {
+                        slot.lock()
+                            .map_err(|_| Error::from_reason("CUDA dense prefill cache is poisoned"))
+                    })
+                    .transpose()?;
+                let output_dtype = x.dtype()?;
+                let weight_owned;
+                let weight = if let Some(cached) = dense.as_deref().and_then(Option::as_ref) {
+                    cached.array()
+                } else {
+                    weight_owned = self.dequantize_current_weight()?;
+                    let weight_bytes = weight_owned.size()?.saturating_mul(2);
+                    if let Some(slot) = dense.as_deref_mut()
+                        && let Some(retained) = crate::accelerator::try_retain_dense_prefill_weight(
+                            weight_owned.clone(),
+                            weight_bytes,
+                        )
+                    {
+                        *slot = Some(retained);
+                    }
+                    &weight_owned
+                };
+                let mut result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
+                if let Some(ref bias) = self.bias {
+                    result = result.add(bias)?;
+                }
+                if result.dtype()? != output_dtype {
+                    result = result.astype(output_dtype)?;
+                }
+                return Ok(result);
+            }
+            self.clear_cuda_dense_prefill();
+        }
+
+        // High-bandwidth 8-warp split-K BF16 MMA kernel for row-major affine
+        // Q4/g64 draft & decode weights (replaces slow non-split-K qmm_sm80 at
+        // M=8 and weight-rereading qmv_kernel at M=1..7).
+        if crate::accelerator::cuda_ops_available()
+            && self.mode == DEFAULT_QUANT_MODE
+            && self.bits == 4
+            && self.group_size == 64
+            && self.bias.is_none()
+            && x.dtype()? == crate::array::DType::BFloat16
+            && self.scales.dtype()? == crate::array::DType::BFloat16
+            && let Some(biases) = self.biases.as_ref()
+            && biases.dtype()? == crate::array::DType::BFloat16
+        {
+            let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+            let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+            if (1..=8).contains(&rows)
+                && k >= 1024
+                && k % 256 == 0
+                && let Some(out) = crate::kernels::linear::affine_q4_g64_matmul_few(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    biases,
+                )?
+            {
+                return Ok(out);
             }
         }
 
@@ -3105,6 +3428,7 @@ impl QuantizedLinear {
 
     pub fn set_weight(&mut self, weight: MxArray) {
         self.weight = weight;
+        self.clear_cuda_dense_prefill();
         self.planes = None;
         if self.mode == FP8_E4M3_MODE {
             // This infallible legacy mutator cannot validate/rebuild the plain
@@ -3116,6 +3440,7 @@ impl QuantizedLinear {
 
     pub fn set_scales(&mut self, scales: MxArray) {
         self.scales = scales;
+        self.clear_cuda_dense_prefill();
         self.planes = None;
         if self.mode == FP8_E4M3_MODE {
             self.fp8_dequant_weight = None;
@@ -3312,6 +3637,34 @@ impl QuantizedLinear {
         &self.scales
     }
 
+    fn new_cuda_dense_prefill_slot()
+    -> Option<Box<std::sync::Mutex<Option<crate::accelerator::RetainedDenseWeight>>>> {
+        crate::accelerator::host_has_cuda().then(|| Box::new(std::sync::Mutex::new(None)))
+    }
+
+    fn cuda_dense_prefill_slot(
+        &self,
+    ) -> Option<&std::sync::Mutex<Option<crate::accelerator::RetainedDenseWeight>>> {
+        self.cuda_dense_prefill.as_deref()
+    }
+
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        if let Some(slot) = self.cuda_dense_prefill.as_deref()
+            && let Ok(mut dense) = slot.lock()
+        {
+            dense.take();
+        }
+    }
+
+    #[cfg(test)]
+    fn cuda_dense_prefill_resident(&self) -> bool {
+        self.cuda_dense_prefill
+            .as_deref()
+            .and_then(|slot| slot.lock().ok())
+            .map(|dense| dense.is_some())
+            .unwrap_or(false)
+    }
+
     /// Dense `[out, in]` reconstruction of the packed weight for consumers
     /// that read the projection as a weight matrix (for example the CLEF
     /// joint head gathering output embeddings). Plain `fp8_e4m3` reuses the
@@ -3325,6 +3678,12 @@ impl QuantizedLinear {
                  rows, not logical output rows; remap the permutation first",
             ));
         }
+        self.dequantize_current_weight()
+    }
+
+    /// Dequantize the arrays in their current forward order. Unlike the public
+    /// storage-layout API above, this is valid after q/gate finalization.
+    fn dequantize_current_weight(&self) -> Result<MxArray> {
         if self.mode == FP8_E4M3_MODE {
             return self.fp8_dequant_weight.clone().ok_or_else(|| {
                 Error::from_reason(
@@ -4026,6 +4385,912 @@ mod plain_fp8_weight_tests {
             MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
         );
         assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cuda_prefill_tests {
+    use super::*;
+
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        a.eval();
+        b.eval();
+        let av = a.to_float32().unwrap();
+        let bv = b.to_float32().unwrap();
+        av.iter()
+            .zip(bv.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn iq4xs_verify_matches_naive_and_decode_releases_dense_weight() {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return;
+        }
+        let packed = (0..64)
+            .map(|i| 0x0123_4567u32.wrapping_mul(i + 1) ^ 0x5a5a_5a5a)
+            .collect::<Vec<_>>();
+        let weight = MxArray::from_uint32(&packed, &[2, 32]).unwrap();
+        let scales = MxArray::from_int8(&[1i8; 16], &[2, 8]).unwrap();
+        let bias_values = vec![half::f16::from_f32(0.01).to_bits(); 2];
+        let biases = MxArray::from_float16(&bias_values, &[2, 1]).unwrap();
+        let linear = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            4,
+            "iq4xs".to_string(),
+        );
+        let x = MxArray::random_normal(&[1, 8, 256], 0.0, 0.1, Some(crate::array::DType::BFloat16))
+            .unwrap();
+        let mode = CString::new("iq4xs").unwrap();
+        let reference = MxArray::from_handle(
+            unsafe {
+                sys::mlx_quantized_matmul(
+                    x.handle.0,
+                    weight.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    32,
+                    4,
+                    mode.as_ptr(),
+                )
+            },
+            "iq4xs verify reference",
+        )
+        .unwrap();
+        let got = linear.forward(&x).unwrap();
+        assert!(linear.cuda_dense_prefill_resident());
+        let diff = max_abs_diff(&got, &reference);
+        assert!(diff < 0.05, "dense IQ4_XS verify: max abs diff {diff}");
+
+        let decode = linear.forward(&x.slice_axis(1, 0, 1).unwrap()).unwrap();
+        decode.eval();
+        assert!(!linear.cuda_dense_prefill_resident());
+    }
+
+    #[test]
+    fn q4k_few_matches_naive_at_multiple_units_and_blocks() {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return;
+        }
+        let (n, k) = (32i64, 2048i64);
+        let packed = (0..n * k / 8)
+            .map(|i| 0x0123_4567u32.wrapping_mul(i as u32 + 1) ^ 0x5a5a_5a5a)
+            .collect::<Vec<_>>();
+        let weight = MxArray::from_uint32(&packed, &[n, k / 8]).unwrap();
+        let scale_values = (0..n * k / 16)
+            .map(|i| (i % 63 + 1) as u8)
+            .collect::<Vec<_>>();
+        let scales = MxArray::from_uint8(&scale_values, &[n, k / 16]).unwrap();
+        let bias_values = (0..n * k / 128)
+            .map(|i| half::f16::from_f32(if i % 2 == 0 { 0.01 } else { 0.001 }).to_bits())
+            .collect::<Vec<_>>();
+        let biases = MxArray::from_float16(&bias_values, &[n, k / 128]).unwrap();
+        let linear = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        );
+        for rows in [2i64, 8] {
+            let x = MxArray::random_normal(
+                &[1, rows, k],
+                0.0,
+                0.5,
+                Some(crate::array::DType::BFloat16),
+            )
+            .unwrap();
+            let got = linear.forward(&x).unwrap();
+            assert!(!linear.cuda_dense_prefill_resident());
+            let reference = MxArray::from_handle(
+                unsafe {
+                    sys::mlx_quantized_matmul(
+                        x.handle.0,
+                        weight.handle.0,
+                        scales.handle.0,
+                        biases.handle.0,
+                        true,
+                        32,
+                        4,
+                        c"q4k".as_ptr(),
+                    )
+                },
+                "q4k few reference",
+            )
+            .unwrap();
+            got.eval();
+            reference.eval();
+            let actual = got.to_float32().unwrap();
+            let expected = reference.to_float32().unwrap();
+            let mut error = 0.0f64;
+            let mut norm = 0.0f64;
+            let mut max = 0.0f32;
+            for (&a, &e) in actual.iter().zip(expected.iter()) {
+                error += f64::from(a - e).powi(2);
+                norm += f64::from(e).powi(2);
+                max = max.max((a - e).abs());
+            }
+            let nmse = error / norm.max(f64::MIN_POSITIVE);
+            assert!(
+                nmse < 5e-4,
+                "Q4_K few-row M={rows}: NMSE={nmse}, max abs diff={max}"
+            );
+        }
+    }
+
+    #[test]
+    fn kquant_few_other_modes_match_naive() {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return;
+        }
+        let (n, k) = (64i64, 2048i64);
+        for (mode, bits, scale_cols, bias_cols, signed_scales) in [
+            ("q4k", 4, k / 16, k / 128, false),
+            ("q5k", 5, k / 16, k / 128, false),
+            ("q6k", 6, k / 16, k / 256, true),
+            ("iq4xs", 4, k / 32, k / 256, true),
+            ("iq4nl", 4, k / 32, k / 32, true),
+            ("q3k", 3, k / 16, k / 256, true),
+        ] {
+            let weight_cols = k * bits / 32;
+            let group_size = if matches!(mode, "q3k" | "q6k") {
+                16
+            } else {
+                32
+            };
+            let packed = (0..n * weight_cols)
+                .map(|i| 0x0123_4567u32.wrapping_mul(i as u32 + 1) ^ 0x5a5a_5a5a)
+                .collect::<Vec<_>>();
+            let weight = MxArray::from_uint32(&packed, &[n, weight_cols]).unwrap();
+            let scales = if signed_scales {
+                let values = (0..n * scale_cols)
+                    .map(|i| (i % 31) as i8 - 15)
+                    .collect::<Vec<_>>();
+                MxArray::from_int8(&values, &[n, scale_cols]).unwrap()
+            } else {
+                let values = (0..n * scale_cols)
+                    .map(|i| (i % 63 + 1) as u8)
+                    .collect::<Vec<_>>();
+                MxArray::from_uint8(&values, &[n, scale_cols]).unwrap()
+            };
+            let bias_values = (0..n * bias_cols)
+                .map(|i| half::f16::from_f32(if i % 2 == 0 { 0.01 } else { 0.001 }).to_bits())
+                .collect::<Vec<_>>();
+            let biases = MxArray::from_float16(&bias_values, &[n, bias_cols]).unwrap();
+            let linear = QuantizedLinear::new(
+                weight.clone(),
+                scales.clone(),
+                Some(biases.clone()),
+                None,
+                group_size,
+                bits as i32,
+                mode.to_string(),
+            );
+            let mut tiled_linear = QuantizedLinear::new(
+                weight.clone(),
+                scales.clone(),
+                Some(biases.clone()),
+                None,
+                group_size,
+                bits as i32,
+                mode.to_string(),
+            );
+            assert!(tiled_linear.tile_kquant_layout().unwrap());
+            for rows in [8i64] {
+                let x = MxArray::random_normal(
+                    &[1, rows, k],
+                    0.0,
+                    0.5,
+                    Some(crate::array::DType::BFloat16),
+                )
+                .unwrap();
+                let mode_c = CString::new(mode).unwrap();
+                let reference = MxArray::from_handle(
+                    unsafe {
+                        sys::mlx_quantized_matmul(
+                            x.handle.0,
+                            weight.handle.0,
+                            scales.handle.0,
+                            biases.handle.0,
+                            true,
+                            group_size,
+                            bits as i32,
+                            mode_c.as_ptr(),
+                        )
+                    },
+                    "kquant few reference",
+                )
+                .unwrap();
+                reference.eval();
+                let expected = reference.to_float32().unwrap();
+                for (layout, candidate) in [("row-major", &linear), ("tiled64", &tiled_linear)] {
+                    let got = candidate.forward(&x).unwrap();
+                    assert!(!candidate.cuda_dense_prefill_resident());
+                    got.eval();
+                    let actual = got.to_float32().unwrap();
+                    let mut error = 0.0f64;
+                    let mut norm = 0.0f64;
+                    let mut max = 0.0f32;
+                    for (&a, &e) in actual.iter().zip(expected.iter()) {
+                        error += f64::from(a - e).powi(2);
+                        norm += f64::from(e).powi(2);
+                        max = max.max((a - e).abs());
+                    }
+                    let nmse = error / norm.max(f64::MIN_POSITIVE);
+                    assert!(
+                        nmse < 5e-4,
+                        "{mode} {layout} rows={rows}: NMSE={nmse}, max abs diff={max}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affine_q8_few_matches_naive() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        for (n, k) in [(48i64, 5120i64), (1024, 5120)] {
+            let packed = (0..n * (k / 4))
+                .map(|i| 0x0123_4567u32.wrapping_mul(i as u32 + 1) ^ 0x5a5a_5a5a)
+                .collect::<Vec<_>>();
+            let weight = MxArray::from_uint32(&packed, &[n, k / 4]).unwrap();
+            let scale_vals = (0..n * (k / 32))
+                .map(|i| ((i % 19) as f32 - 9.0) * 0.002 + 0.005)
+                .collect::<Vec<_>>();
+            let bias_vals = (0..n * (k / 32))
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
+                .collect::<Vec<_>>();
+            let scales = MxArray::from_float32(&scale_vals, &[n, k / 32]).unwrap();
+            let biases = MxArray::from_float32(&bias_vals, &[n, k / 32]).unwrap();
+            let linear = QuantizedLinear::new(
+                weight.clone(),
+                scales.clone(),
+                Some(biases.clone()),
+                None,
+                32,
+                8,
+                "affine".to_string(),
+            );
+            for rows in [2i64, 8, 32] {
+                let x = MxArray::random_normal(
+                    &[1, rows, k],
+                    0.0,
+                    0.25,
+                    Some(crate::array::DType::BFloat16),
+                )
+                .unwrap();
+                let got = linear.forward(&x).unwrap();
+                let x_f32 = x.astype(crate::array::DType::Float32).unwrap();
+                let reference = MxArray::from_handle(
+                    unsafe {
+                        sys::mlx_quantized_matmul(
+                            x_f32.handle.0,
+                            weight.handle.0,
+                            scales.handle.0,
+                            biases.handle.0,
+                            true,
+                            32,
+                            8,
+                            c"affine".as_ptr(),
+                        )
+                    },
+                    "affine q8 reference",
+                )
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap();
+                got.eval();
+                reference.eval();
+                let actual = got.to_float32().unwrap();
+                let expected = reference.to_float32().unwrap();
+                let mut error = 0.0f64;
+                let mut norm = 0.0f64;
+                let mut max = 0.0f32;
+                for (&a, &e) in actual.iter().zip(expected.iter()) {
+                    error += f64::from(a - e).powi(2);
+                    norm += f64::from(e).powi(2);
+                    max = max.max((a - e).abs());
+                }
+                let nmse = error / norm.max(f64::MIN_POSITIVE);
+                assert!(
+                    nmse < 1e-4,
+                    "affine Q8_0 N={n} K={k} M={rows}: NMSE={nmse}, max abs diff {max}"
+                );
+            }
+            assert!(linear.cuda_dense_prefill_resident());
+            linear.clear_cuda_dense_prefill();
+            assert!(!linear.cuda_dense_prefill_resident());
+        }
+    }
+
+    #[test]
+    fn bf16_gemm_few_matches_matmul() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        for (n, k) in [(1024i64, 1024i64), (1027, 2048)] {
+            let w = MxArray::random_normal(&[n, k], 0.0, 0.05, Some(crate::array::DType::BFloat16))
+                .unwrap();
+            let wt = w.transpose(Some(&[1, 0])).unwrap();
+            for rows in [1i64, 3, 6, 8] {
+                let x = MxArray::random_normal(
+                    &[1, rows, k],
+                    0.0,
+                    0.25,
+                    Some(crate::array::DType::BFloat16),
+                )
+                .unwrap();
+                let got = MxArray::from_handle(
+                    unsafe { sys::mlx_bf16_gemm_few_cuda(x.as_raw_ptr(), w.as_raw_ptr()) },
+                    "bf16_gemm_few",
+                )
+                .unwrap();
+                let reference = x.matmul(&wt).unwrap();
+                got.eval();
+                reference.eval();
+                let actual = got.to_float32().unwrap();
+                let expected = reference.to_float32().unwrap();
+                let mut error = 0.0f64;
+                let mut norm = 0.0f64;
+                for (&a, &e) in actual.iter().zip(expected.iter()) {
+                    error += f64::from(a - e).powi(2);
+                    norm += f64::from(e).powi(2);
+                }
+                let nmse = error / norm.max(f64::MIN_POSITIVE);
+                assert!(
+                    nmse < 1e-5,
+                    "bf16_gemm_few N={n} K={k} M={rows}: NMSE={nmse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_tc_few_cuda_matches_causal() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let scale = 1.0f32 / 256.0f32.sqrt();
+        for (q_len, k_len, cap) in [(8i64, 6219i64, 6400i64), (4, 16, 256), (2, 100, 100)] {
+            let q = MxArray::random_normal(
+                &[1, 24, q_len, 256],
+                0.0,
+                0.2,
+                Some(crate::array::DType::BFloat16),
+            )
+            .unwrap();
+            let k_buf = MxArray::random_normal(
+                &[1, 4, cap, 256],
+                0.0,
+                0.2,
+                Some(crate::array::DType::BFloat16),
+            )
+            .unwrap();
+            let v_buf = MxArray::random_normal(
+                &[1, 4, cap, 256],
+                0.0,
+                0.2,
+                Some(crate::array::DType::BFloat16),
+            )
+            .unwrap();
+            // Exercise sliced (non-row-contiguous) KV cache view when cap > k_len.
+            let k = k_buf.slice_axis(2, 0, k_len).unwrap();
+            let v = v_buf.slice_axis(2, 0, k_len).unwrap();
+            let got = MxArray::from_handle(
+                unsafe {
+                    sys::mlx_sdpa_tc_few_cuda(q.as_raw_ptr(), k.as_raw_ptr(), v.as_raw_ptr(), scale)
+                },
+                "sdpa_tc_few_cuda",
+            )
+            .unwrap();
+            let reference = crate::array::attention::scaled_dot_product_attention_causal(
+                &q,
+                &k,
+                &v,
+                f64::from(scale),
+            )
+            .unwrap();
+            got.eval();
+            reference.eval();
+            let actual = got.to_float32().unwrap();
+            let expected = reference.to_float32().unwrap();
+            let mut error = 0.0f64;
+            let mut norm = 0.0f64;
+            let mut max = 0.0f32;
+            for (&a, &e) in actual.iter().zip(expected.iter()) {
+                error += f64::from(a - e).powi(2);
+                norm += f64::from(e).powi(2);
+                max = max.max((a - e).abs());
+            }
+            let nmse = error / norm.max(f64::MIN_POSITIVE);
+            assert!(
+                nmse < 1e-4 && max < 0.02,
+                "sdpa_tc_few Q={q_len} K={k_len}: NMSE={nmse} max={max}"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_replay_cuda_matches_fused_step() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let dtype = crate::array::DType::BFloat16;
+        let f32_dt = crate::array::DType::Float32;
+        for (hk, tiled) in [(48i64, 0i32), (16, 1)] {
+            let q = MxArray::random_normal(&[1, 8, hk, 128], 0.0, 0.2, Some(dtype)).unwrap();
+            let k = MxArray::random_normal(&[1, 8, hk, 128], 0.0, 0.2, Some(dtype)).unwrap();
+            let v = MxArray::random_normal(&[1, 8, 48, 128], 0.0, 0.2, Some(dtype)).unwrap();
+            let g = MxArray::full(&[1, 8, 48], Either::A(0.9), Some(f32_dt)).unwrap();
+            let beta = MxArray::full(&[1, 8, 48], Either::A(0.3), Some(dtype)).unwrap();
+            let state = MxArray::random_normal(&[1, 48, 128, 128], 0.0, 0.1, Some(f32_dt)).unwrap();
+            let z = MxArray::random_normal(&[1, 5, 48 * 128], 0.0, 0.2, Some(dtype)).unwrap();
+            let w = MxArray::ones(&[128], Some(dtype)).unwrap();
+            let mut replay_state = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_gdn_replay_cuda(
+                    k.as_raw_ptr(),
+                    v.as_raw_ptr(),
+                    g.as_raw_ptr(),
+                    beta.as_raw_ptr(),
+                    state.as_raw_ptr(),
+                    5,
+                    tiled,
+                    &mut replay_state,
+                )
+            };
+            assert!(ok && !replay_state.is_null());
+            let got = MxArray::from_handle(replay_state, "gdn_replay_cuda").unwrap();
+            let mut step_out = std::ptr::null_mut();
+            let mut step_state = std::ptr::null_mut();
+            let ok2 = unsafe {
+                sys::mlx_gdn_fused_step_cuda(
+                    q.slice_axis(1, 0, 5).unwrap().as_raw_ptr(),
+                    k.slice_axis(1, 0, 5).unwrap().as_raw_ptr(),
+                    v.slice_axis(1, 0, 5).unwrap().as_raw_ptr(),
+                    g.slice_axis(1, 0, 5).unwrap().as_raw_ptr(),
+                    beta.slice_axis(1, 0, 5).unwrap().as_raw_ptr(),
+                    state.as_raw_ptr(),
+                    z.as_raw_ptr(),
+                    w.as_raw_ptr(),
+                    1e-6,
+                    tiled,
+                    std::ptr::null_mut(),
+                    &mut step_out,
+                    &mut step_state,
+                )
+            };
+            assert!(ok2 && !step_state.is_null());
+            let _out = MxArray::from_handle(step_out, "gdn_step_out").unwrap();
+            let expected = MxArray::from_handle(step_state, "gdn_step_state").unwrap();
+            got.eval();
+            expected.eval();
+            assert_eq!(
+                got.to_float32().unwrap().as_ref(),
+                expected.to_float32().unwrap().as_ref(),
+                "gdn_replay_cuda must be bit-identical to gdn_fused_step_cuda (hk={hk}, tiled={tiled})"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_prepare_cuda_matches_conv_prep() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let bf16 = crate::array::DType::BFloat16;
+        let f32_dt = crate::array::DType::Float32;
+        let t = 8i64;
+        let qkv = MxArray::random_normal(&[1, t, 10240], 0.0, 0.3, Some(bf16)).unwrap();
+        let a = MxArray::random_normal(&[1, t, 48], 0.0, 0.5, Some(bf16)).unwrap();
+        let b = MxArray::random_normal(&[1, t, 48], 0.0, 0.5, Some(bf16)).unwrap();
+        let conv = MxArray::random_normal(&[10240, 4], 0.0, 0.2, Some(f32_dt)).unwrap();
+        let history = MxArray::random_normal(&[3, 10240], 0.0, 0.3, Some(bf16)).unwrap();
+        let scale = MxArray::full(&[48], Either::A(-0.5), Some(f32_dt)).unwrap();
+        let dt = MxArray::full(&[48], Either::A(0.1), Some(f32_dt)).unwrap();
+        let mut outs = [std::ptr::null_mut(); 6];
+        let ok = unsafe {
+            sys::mlx_gdn_prepare_cuda(
+                qkv.as_raw_ptr(),
+                a.as_raw_ptr(),
+                b.as_raw_ptr(),
+                conv.as_raw_ptr(),
+                history.as_raw_ptr(),
+                scale.as_raw_ptr(),
+                dt.as_raw_ptr(),
+                true,
+                true,
+                outs.as_mut_ptr(),
+            )
+        };
+        assert!(ok);
+        let pq = MxArray::from_handle(outs[0], "q").unwrap();
+        let pk = MxArray::from_handle(outs[1], "k").unwrap();
+        let pv = MxArray::from_handle(outs[2], "v").unwrap();
+        let pdecay = MxArray::from_handle(outs[3], "decay").unwrap();
+        let pbeta = MxArray::from_handle(outs[4], "beta").unwrap();
+        let phist = MxArray::from_handle(outs[5], "hist").unwrap();
+        MxArray::eval_arrays(&[&pq, &pk, &pv, &pdecay, &pbeta, &phist]).unwrap();
+
+        // Reference via standard ops:
+        let win = MxArray::concatenate(&history.reshape(&[1, 3, 10240]).unwrap(), &qkv, 1).unwrap();
+        let ref_hist = win
+            .slice_axis(1, t, t + 3)
+            .unwrap()
+            .squeeze(Some(&[0]))
+            .unwrap();
+        ref_hist.eval();
+        assert_eq!(
+            phist.to_uint16_native().unwrap(),
+            ref_hist.to_uint16_native().unwrap(),
+            "next_history must be bit-identical"
+        );
+        // Reference gates:
+        let ax = a.astype(f32_dt).unwrap().add(&dt).unwrap();
+        let sp = ax
+            .maximum(&MxArray::scalar_float(0.0).unwrap())
+            .unwrap()
+            .add(
+                &ax.abs()
+                    .unwrap()
+                    .negative()
+                    .unwrap()
+                    .exp()
+                    .unwrap()
+                    .add_scalar(1.0)
+                    .unwrap()
+                    .log()
+                    .unwrap(),
+            )
+            .unwrap();
+        let ref_decay = sp.mul(&scale).unwrap().exp().unwrap();
+        let ref_beta = Activations::sigmoid(&b.astype(f32_dt).unwrap())
+            .unwrap()
+            .astype(bf16)
+            .unwrap();
+        MxArray::eval_arrays(&[&ref_decay, &ref_beta]).unwrap();
+        let max_d = pdecay
+            .to_float32()
+            .unwrap()
+            .iter()
+            .zip(ref_decay.to_float32().unwrap().iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let max_b = pbeta
+            .to_float32()
+            .unwrap()
+            .iter()
+            .zip(ref_beta.to_float32().unwrap().iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_d < 1e-5, "decay mismatch: {max_d}");
+        assert!(max_b < 1e-2, "beta mismatch: {max_b}");
+
+        // Reference 4-tap depthwise conv + SiLU + norm_qk:
+        let win_f32 = win.astype(f32_dt).unwrap();
+        let mut conv_acc = MxArray::zeros(&[1, t, 10240], Some(f32_dt)).unwrap();
+        for tap in 0..4i64 {
+            let x_tap = win_f32.slice_axis(1, tap, tap + t).unwrap();
+            let w_tap = conv
+                .slice_axis(1, tap, tap + 1)
+                .unwrap()
+                .reshape(&[1, 1, 10240])
+                .unwrap();
+            conv_acc = conv_acc.add(&x_tap.mul(&w_tap).unwrap()).unwrap();
+        }
+        let conv_out = conv_acc.astype(bf16).unwrap();
+        let silu = conv_out
+            .mul(&Activations::sigmoid(&conv_out).unwrap())
+            .unwrap();
+        let parts = silu.split_sections(&[2048, 4096], 2).unwrap();
+        let ref_v = parts[2].reshape(&[1, t, 48, 128]).unwrap();
+        let k_raw = parts[1].reshape(&[1, t, 16, 128]).unwrap();
+        let q_raw = parts[0].reshape(&[1, t, 16, 128]).unwrap();
+        let w_k = MxArray::full(&[128], Either::A(128.0f64.powf(-0.5)), Some(bf16)).unwrap();
+        let w_q = MxArray::full(&[128], Either::A(128.0f64.powf(-1.0)), Some(bf16)).unwrap();
+        let ref_k = MxArray::from_handle(
+            unsafe { sys::mlx_fast_rms_norm(k_raw.as_raw_ptr(), w_k.as_raw_ptr(), 1e-6) },
+            "rms_k",
+        )
+        .unwrap();
+        let ref_q = MxArray::from_handle(
+            unsafe { sys::mlx_fast_rms_norm(q_raw.as_raw_ptr(), w_q.as_raw_ptr(), 1e-6) },
+            "rms_q",
+        )
+        .unwrap();
+        MxArray::eval_arrays(&[&ref_q, &ref_k, &ref_v]).unwrap();
+        for (name, got_a, ref_a) in [("q", &pq, &ref_q), ("k", &pk, &ref_k), ("v", &pv, &ref_v)] {
+            let a_v = got_a.to_float32().unwrap();
+            let e_v = ref_a.to_float32().unwrap();
+            let mut err = 0.0f64;
+            let mut norm = 0.0f64;
+            for (&x, &y) in a_v.iter().zip(e_v.iter()) {
+                err += f64::from(x - y).powi(2);
+                norm += f64::from(y).powi(2);
+            }
+            let nmse = err / norm.max(f64::MIN_POSITIVE);
+            assert!(nmse < 1e-4, "gdn_prepare_cuda {name} NMSE={nmse}");
+        }
+    }
+
+    #[test]
+    fn kv_store_rows_cuda_in_place_matches_slice_update() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let bf16 = crate::array::DType::BFloat16;
+        let k_buf = MxArray::zeros(&[1, 4, 128, 256], Some(bf16)).unwrap();
+        let v_buf = MxArray::zeros(&[1, 4, 128, 256], Some(bf16)).unwrap();
+        let mut k_ref = k_buf.deep_copy().unwrap();
+        let mut v_ref = v_buf.deep_copy().unwrap();
+        let k_new = MxArray::random_normal(&[1, 4, 8, 256], 0.0, 0.3, Some(bf16)).unwrap();
+        let v_new = MxArray::random_normal(&[1, 4, 8, 256], 0.0, 0.3, Some(bf16)).unwrap();
+        MxArray::eval_arrays(&[&k_buf, &v_buf, &k_ref, &v_ref, &k_new, &v_new]).unwrap();
+
+        let dst = [k_buf.as_raw_ptr(), v_buf.as_raw_ptr()];
+        let src = [k_new.as_raw_ptr(), v_new.as_raw_ptr()];
+        let offsets = [37i32, 37i32];
+        let mut out = [std::ptr::null_mut(); 2];
+        let ok = unsafe {
+            sys::mlx_kv_store_rows(
+                2,
+                dst.as_ptr(),
+                src.as_ptr(),
+                offsets.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        assert!(ok && !out[0].is_null() && !out[1].is_null());
+        let k_got = MxArray::from_handle(out[0], "k_got").unwrap();
+        let v_got = MxArray::from_handle(out[1], "v_got").unwrap();
+        k_ref.slice_assign_axis_inplace(2, 37, 45, &k_new).unwrap();
+        v_ref.slice_assign_axis_inplace(2, 37, 45, &v_new).unwrap();
+        MxArray::eval_arrays(&[&k_got, &v_got, &k_ref, &v_ref]).unwrap();
+        assert_eq!(
+            k_got.to_uint16_native().unwrap(),
+            k_ref.to_uint16_native().unwrap()
+        );
+        assert_eq!(
+            v_got.to_uint16_native().unwrap(),
+            v_ref.to_uint16_native().unwrap()
+        );
+        assert!(unsafe { sys::mlx_array_aliases(k_got.as_raw_ptr(), k_buf.as_raw_ptr()) });
+        assert!(unsafe { sys::mlx_array_aliases(v_got.as_raw_ptr(), v_buf.as_raw_ptr()) });
+    }
+
+    #[test]
+    fn sdpa_tc_few_d128_masked_cuda_matches_sdpa() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let bf16 = crate::array::DType::BFloat16;
+        let scale = 1.0f32 / 128.0f32.sqrt();
+        let q = MxArray::random_normal(&[1, 32, 8, 128], 0.0, 0.2, Some(bf16)).unwrap();
+        let k = MxArray::random_normal(&[1, 8, 2056, 128], 0.0, 0.2, Some(bf16)).unwrap();
+        let v = MxArray::random_normal(&[1, 8, 2056, 128], 0.0, 0.2, Some(bf16)).unwrap();
+        // Unmasked non-causal
+        let got_unmasked = MxArray::from_handle(
+            unsafe {
+                sys::mlx_sdpa_tc_few_masked_cuda(
+                    q.as_raw_ptr(),
+                    k.as_raw_ptr(),
+                    v.as_raw_ptr(),
+                    std::ptr::null_mut(),
+                    scale,
+                    false,
+                )
+            },
+            "sdpa_d128_unmasked",
+        )
+        .unwrap();
+        let ref_unmasked = crate::array::attention::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            f64::from(scale),
+            None,
+        )
+        .unwrap();
+        MxArray::eval_arrays(&[&got_unmasked, &ref_unmasked]).unwrap();
+        // Masked ring window [1, 1, 8, 2056] bool
+        let mut vis = vec![0u8; 8 * 2056];
+        for r in 0..8 {
+            for c in 0..2056 {
+                vis[r * 2056 + c] = u8::from(c >= r && c < 2048 + r);
+            }
+        }
+        let mask = MxArray::from_uint8(&vis, &[1, 1, 8, 2056])
+            .unwrap()
+            .not_equal(&MxArray::from_uint8(&[0], &[1]).unwrap())
+            .unwrap();
+        let got_masked = MxArray::from_handle(
+            unsafe {
+                sys::mlx_sdpa_tc_few_masked_cuda(
+                    q.as_raw_ptr(),
+                    k.as_raw_ptr(),
+                    v.as_raw_ptr(),
+                    mask.as_raw_ptr(),
+                    scale,
+                    false,
+                )
+            },
+            "sdpa_d128_masked",
+        )
+        .unwrap();
+        let ref_masked = crate::array::attention::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            f64::from(scale),
+            Some(&mask),
+        )
+        .unwrap();
+        MxArray::eval_arrays(&[&got_masked, &ref_masked]).unwrap();
+        for (label, got, expected) in [
+            ("unmasked", &got_unmasked, &ref_unmasked),
+            ("masked", &got_masked, &ref_masked),
+        ] {
+            let a = got.to_float32().unwrap();
+            let e = expected.to_float32().unwrap();
+            let mut err = 0.0f64;
+            let mut norm = 0.0f64;
+            for (&x, &y) in a.iter().zip(e.iter()) {
+                err += f64::from(x - y).powi(2);
+                norm += f64::from(y).powi(2);
+            }
+            let nmse = err / norm.max(f64::MIN_POSITIVE);
+            assert!(nmse < 1e-4, "sdpa_d128 {label}: NMSE={nmse}");
+        }
+    }
+
+    #[test]
+    fn q4k_verify_matches_naive_and_decode_releases_dense_weight() {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return;
+        }
+        let packed = (0..64)
+            .map(|i| 0x0123_4567u32.wrapping_mul(i + 1) ^ 0x5a5a_5a5a)
+            .collect::<Vec<_>>();
+        let weight = MxArray::from_uint32(&packed, &[2, 32]).unwrap();
+        let scales = MxArray::from_uint8(&[1u8; 32], &[2, 16]).unwrap();
+        let bias_values = vec![half::f16::from_f32(0.01).to_bits(); 4];
+        let biases = MxArray::from_float16(&bias_values, &[2, 2]).unwrap();
+        let linear = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        );
+        let x = MxArray::random_normal(&[1, 8, 256], 0.0, 0.1, Some(crate::array::DType::BFloat16))
+            .unwrap();
+        let mode = CString::new("q4k").unwrap();
+        let reference = MxArray::from_handle(
+            unsafe {
+                sys::mlx_quantized_matmul(
+                    x.handle.0,
+                    weight.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    32,
+                    4,
+                    mode.as_ptr(),
+                )
+            },
+            "q4k verify reference",
+        )
+        .unwrap();
+        let got = linear.forward(&x).unwrap();
+        assert!(linear.cuda_dense_prefill_resident());
+        let diff = max_abs_diff(&got, &reference);
+        assert!(diff < 0.05, "dense Q4_K verify: max abs diff {diff}");
+
+        let decode = linear.forward(&x.slice_axis(1, 0, 1).unwrap()).unwrap();
+        decode.eval();
+        assert!(!linear.cuda_dense_prefill_resident());
+    }
+
+    #[test]
+    fn q5k_large_prefill_matches_naive_and_decode_releases_dense_weight() {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return;
+        }
+        let packed = (0..80)
+            .map(|i| 0x0123_4567u32.wrapping_mul(i + 1) ^ 0x5a5a_5a5a)
+            .collect::<Vec<_>>();
+        let weight = MxArray::from_uint32(&packed, &[2, 40]).unwrap();
+        let scales = MxArray::from_uint8(&[1u8; 32], &[2, 16]).unwrap();
+        let bias_values = vec![half::f16::from_f32(0.01).to_bits(); 4];
+        let biases = MxArray::from_float16(&bias_values, &[2, 2]).unwrap();
+        let mut linear = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            5,
+            "q5k".to_string(),
+        );
+        linear.finalize_packed_q_gate_block(1, 1).unwrap();
+        let x =
+            MxArray::random_normal(&[1, 16, 256], 0.0, 0.1, Some(crate::array::DType::BFloat16))
+                .unwrap();
+        let mode = CString::new("q5k").unwrap();
+        let reference = MxArray::from_handle(
+            unsafe {
+                sys::mlx_quantized_matmul(
+                    x.handle.0,
+                    weight.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    32,
+                    5,
+                    mode.as_ptr(),
+                )
+            },
+            "q5k naive reference",
+        )
+        .unwrap();
+        let got = linear.forward(&x).unwrap();
+        assert!(linear.cuda_dense_prefill_resident());
+        let diff = max_abs_diff(&got, &reference);
+        assert!(
+            diff < 0.05,
+            "dense prefill vs naive Q5_K: max abs diff {diff}"
+        );
+
+        let verify_input = x.slice_axis(1, 0, 8).unwrap();
+        let verify_reference = MxArray::from_handle(
+            unsafe {
+                sys::mlx_quantized_matmul(
+                    verify_input.handle.0,
+                    weight.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    32,
+                    5,
+                    mode.as_ptr(),
+                )
+            },
+            "q5k verify reference",
+        )
+        .unwrap();
+        let verify = linear.forward(&verify_input).unwrap();
+        assert!(linear.cuda_dense_prefill_resident());
+        let verify_diff = max_abs_diff(&verify, &verify_reference);
+        assert!(
+            verify_diff < 0.05,
+            "dense 8-row verify vs naive Q5_K: max abs diff {verify_diff}"
+        );
+
+        let decode = linear.forward(&x.slice_axis(1, 0, 1).unwrap()).unwrap();
+        decode.eval();
+        assert!(!linear.cuda_dense_prefill_resident());
     }
 }
 

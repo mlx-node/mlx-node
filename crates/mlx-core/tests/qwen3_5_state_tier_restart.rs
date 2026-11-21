@@ -271,8 +271,8 @@ async fn status_once(
     model: &Qwen3_5Model,
     ready: impl Fn(&MemoryGovernorStatus) -> bool,
 ) -> MemoryGovernorStatus {
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         model
             .mtp_paged_gdn_state_for_test()
             .await

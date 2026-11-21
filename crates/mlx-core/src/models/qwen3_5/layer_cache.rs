@@ -1,4 +1,4 @@
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::transformer::KVCache;
 use napi::bindgen_prelude::*;
 
@@ -286,6 +286,409 @@ pub(crate) fn replay_mtp_snapshot_to(
 /// lives in the pool, rewound through `adapter.rollback_last_tokens`).
 pub(crate) fn snapshot_all_mtp(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
     caches.iter().map(|c| c.snapshot()).collect()
+}
+
+/// Restore point for the off-Metal DFlash2 lane, whose full-attention K/V
+/// lives in these flat caches rather than in a paged pool.
+pub(crate) struct Qwen35FlatSnapshot {
+    layers: Vec<Qwen35FlatLayerSnapshot>,
+}
+
+enum Qwen35FlatLayerSnapshot {
+    FullAttention {
+        offset: i32,
+    },
+    Linear {
+        conv_state: Option<MxArray>,
+        recurrent_state: Option<MxArray>,
+    },
+}
+
+pub(crate) fn snapshot_flat_dflash2(caches: &[Qwen3_5LayerCache]) -> Result<Qwen35FlatSnapshot> {
+    let layers = caches
+        .iter()
+        .map(|cache| match cache {
+            Qwen3_5LayerCache::FullAttention(kv) => Ok(Qwen35FlatLayerSnapshot::FullAttention {
+                offset: kv.get_offset(),
+            }),
+            Qwen3_5LayerCache::Linear(arrays) => Ok(Qwen35FlatLayerSnapshot::Linear {
+                conv_state: arrays.get(0).cloned(),
+                recurrent_state: arrays.get(1).cloned(),
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Qwen35FlatSnapshot { layers })
+}
+
+/// Keep `steps` rows of a flat verify: trim full-attention K/V to the
+/// accepted frontier and replay each GDN layer from its pre-verify state.
+pub(crate) fn replay_flat_dflash2_snapshot_to(
+    caches: &mut [Qwen3_5LayerCache],
+    snapshot: &Qwen35FlatSnapshot,
+    tape: &[Option<super::gated_delta_net::GdnLayerTape>],
+    steps: usize,
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snapshot.layers.len() || caches.len() != tape.len() {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {}, tape {})",
+            caches.len(),
+            snapshot.layers.len(),
+            tape.len(),
+        )));
+    }
+    let accepted = i32::try_from(steps)
+        .map_err(|_| Error::from_reason(format!("{context}: accepted row count exceeds i32")))?;
+    for (index, (cache, snapshot)) in caches.iter_mut().zip(&snapshot.layers).enumerate() {
+        match (cache, snapshot) {
+            (
+                Qwen3_5LayerCache::FullAttention(kv),
+                Qwen35FlatLayerSnapshot::FullAttention { offset },
+            ) => {
+                if tape[index].is_some() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: full-attention layer {index} unexpectedly has a GDN tape"
+                    )));
+                }
+                let target = offset.checked_add(accepted).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{context}: K/V frontier overflows at layer {index}"
+                    ))
+                })?;
+                if target > kv.get_offset() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: K/V frontier {target} exceeds the verified offset {} at layer {index}",
+                        kv.get_offset()
+                    )));
+                }
+                kv.trim(target);
+            }
+            (
+                Qwen3_5LayerCache::Linear(arrays),
+                Qwen35FlatLayerSnapshot::Linear {
+                    conv_state,
+                    recurrent_state,
+                },
+            ) => {
+                let layer_tape = tape[index].as_ref().ok_or_else(|| {
+                    Error::from_reason(format!("{context}: GDN layer {index} has no tape"))
+                })?;
+                let window_len = layer_tape.kernel.window_len()? as usize;
+                if steps > window_len {
+                    return Err(Error::from_reason(format!(
+                        "{context}: accepted rows {steps} exceed the GDN window at layer {index}"
+                    )));
+                }
+                // On full accept (steps == window_len), the verify forward
+                // already advanced both conv_state and recurrent_state to the
+                // exact post-window frontier; skip the redundant 48-layer replay.
+                if steps < window_len {
+                    layer_tape.replay_into(
+                        arrays,
+                        conv_state.as_ref(),
+                        recurrent_state.as_ref(),
+                        steps,
+                    )?;
+                }
+            }
+            (cache, _) => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {index} snapshot kind {} does not match its cache",
+                    match cache {
+                        Qwen3_5LayerCache::Linear(_) => "FullAttention",
+                        Qwen3_5LayerCache::FullAttention(_) => "Linear",
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pending CUDA GDN recurrent-state fold carried from commit of cycle `c - 1`
+/// into verify of cycle `c`. Storing `GdnKernelTape` preserves `(k, v, g, beta)`
+/// and `tiled_heads` so [`settle_flat_dflash2_deferred`] can fold it via
+/// [`super::gated_delta::GdnKernelTape::replay_recurrent_state`] on `finish()` / `Drop`.
+#[derive(Clone)]
+pub(crate) struct CudaPendingGdn {
+    pub(crate) kernel: super::gated_delta::GdnKernelTape,
+    pub(crate) keep: usize,
+    /// `None` when the accepted nodes are the contiguous prefix `0..keep`.
+    /// `Some(int32[keep])` when a non-contiguous tree branch was accepted.
+    pub(crate) prev_indices: Option<MxArray>,
+}
+
+/// Commit a flat DFlash2 verify cycle in CUDA deferred-GDN mode:
+/// - FullAttention layers: trim K/V cache to `offset + steps`.
+/// - Linear layers: update `cache[0]` (`conv_state`) to the accepted prefix;
+///   leave `cache[1]` untouched (it ALREADY holds `S_folded` written by the
+///   deferred verify kernel); and record the current cycle's tape + `steps`
+///   into `pending_out[index]` so the next verify cycle (or
+///   [`settle_flat_dflash2_deferred`]) folds it.
+pub(crate) fn commit_flat_dflash2_deferred(
+    caches: &mut [Qwen3_5LayerCache],
+    snapshot: &Qwen35FlatSnapshot,
+    tape: &[Option<super::gated_delta_net::GdnLayerTape>],
+    steps: usize,
+    pending_out: &mut [Option<CudaPendingGdn>],
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snapshot.layers.len()
+        || caches.len() != tape.len()
+        || caches.len() != pending_out.len()
+    {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {}, tape {}, pending {})",
+            caches.len(),
+            snapshot.layers.len(),
+            tape.len(),
+            pending_out.len(),
+        )));
+    }
+    let accepted = i32::try_from(steps)
+        .map_err(|_| Error::from_reason(format!("{context}: accepted row count exceeds i32")))?;
+    for (index, (cache, snapshot)) in caches.iter_mut().zip(&snapshot.layers).enumerate() {
+        match (cache, snapshot) {
+            (
+                Qwen3_5LayerCache::FullAttention(kv),
+                Qwen35FlatLayerSnapshot::FullAttention { offset },
+            ) => {
+                if tape[index].is_some() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: full-attention layer {index} unexpectedly has a GDN tape"
+                    )));
+                }
+                let target = offset.checked_add(accepted).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{context}: K/V frontier overflows at layer {index}"
+                    ))
+                })?;
+                if target > kv.get_offset() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: K/V frontier {target} exceeds the verified offset {} at layer {index}",
+                        kv.get_offset()
+                    )));
+                }
+                kv.trim(target);
+                pending_out[index] = None;
+            }
+            (
+                Qwen3_5LayerCache::Linear(arrays),
+                Qwen35FlatLayerSnapshot::Linear { conv_state, .. },
+            ) => {
+                let layer_tape = tape[index].as_ref().ok_or_else(|| {
+                    Error::from_reason(format!("{context}: GDN layer {index} has no tape"))
+                })?;
+                let window_len = layer_tape.kernel.window_len()? as usize;
+                if steps > window_len {
+                    return Err(Error::from_reason(format!(
+                        "{context}: accepted rows {steps} exceed the GDN window at layer {index}"
+                    )));
+                }
+                // On full accept (steps == window_len), `cache[0]` already holds
+                // the post-window conv state written by verify; on partial accept,
+                // slice the accepted prefix from the recorded qkv tape.
+                if steps < window_len {
+                    layer_tape.replay_conv_into(arrays, conv_state.as_ref(), steps)?;
+                }
+                // `cache[1]` already holds `S_folded` written by the deferred
+                // verify kernel; defer folding this cycle's `steps` rows to the
+                // next verify (or settle on finish/drop).
+                pending_out[index] = if steps > 0 {
+                    Some(CudaPendingGdn {
+                        kernel: layer_tape.kernel.clone(),
+                        keep: steps,
+                        prev_indices: None,
+                    })
+                } else {
+                    None
+                };
+            }
+            (cache, _) => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {index} snapshot kind {} does not match its cache",
+                    match cache {
+                        Qwen3_5LayerCache::Linear(_) => "FullAttention",
+                        Qwen3_5LayerCache::FullAttention(_) => "Linear",
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Commit a speculative tree-verify cycle in CUDA deferred-GDN mode:
+/// - Uploads ONE shared `accepted_i32` (`int32[K]`) when `!is_contiguous_prefix`,
+///   reused across all 16 FullAttention layers and all 48 GDN layers.
+/// - FullAttention layers: fast `trim(offset + K)` when `is_contiguous_prefix`,
+///   else in-place race-free compaction via [`KVCache::compact_tree_rows_with_indices`].
+/// - Linear layers: rebuilds `cache[0]` (`conv_state`) along `accepted_nodes`
+///   (skipping only when `is_chain && is_contiguous_prefix && keep == window_len`);
+///   leaves `cache[1]` at `S_folded` and records `CudaPendingGdn` with
+///   `prev_indices: accepted_i32.clone()` for the next verify cycle or settle.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn commit_tree_dflash2_deferred(
+    caches: &mut [Qwen3_5LayerCache],
+    snapshot: &Qwen35FlatSnapshot,
+    tape: &[Option<super::gated_delta_net::GdnLayerTape>],
+    accepted_nodes: &[usize],
+    is_contiguous_prefix: bool,
+    is_chain: bool,
+    pending_out: &mut [Option<CudaPendingGdn>],
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snapshot.layers.len()
+        || caches.len() != tape.len()
+        || caches.len() != pending_out.len()
+    {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {}, tape {}, pending {})",
+            caches.len(),
+            snapshot.layers.len(),
+            tape.len(),
+            pending_out.len(),
+        )));
+    }
+    if accepted_nodes.len() > 16 {
+        return Err(Error::from_reason(format!(
+            "{context}: accepted tree node count {} exceeds 16",
+            accepted_nodes.len()
+        )));
+    }
+    for (idx, &node) in accepted_nodes.iter().enumerate() {
+        if node >= 16 {
+            return Err(Error::from_reason(format!(
+                "{context}: accepted tree node {node} outside 0..16"
+            )));
+        }
+        if is_contiguous_prefix && node != idx {
+            return Err(Error::from_reason(format!(
+                "{context}: is_contiguous_prefix set but accepted_nodes[{idx}] == {node}"
+            )));
+        }
+    }
+    let keep = accepted_nodes.len();
+    let accepted_i32 = if !is_contiguous_prefix && keep > 0 {
+        let nodes: Vec<i32> = accepted_nodes.iter().map(|&n| n as i32).collect();
+        Some(MxArray::from_int32(&nodes, &[keep as i64])?)
+    } else {
+        None
+    };
+
+    for (index, (cache, snap)) in caches.iter_mut().zip(&snapshot.layers).enumerate() {
+        match (cache, snap) {
+            (
+                Qwen3_5LayerCache::FullAttention(kv),
+                Qwen35FlatLayerSnapshot::FullAttention { offset },
+            ) => {
+                if tape[index].is_some() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: full-attention layer {index} unexpectedly has a GDN tape"
+                    )));
+                }
+                kv.compact_tree_rows_with_indices(
+                    *offset,
+                    accepted_nodes,
+                    is_contiguous_prefix,
+                    accepted_i32.as_ref(),
+                )
+                .map_err(|e| Error::from_reason(format!("{context}: layer {index}: {e}")))?;
+                pending_out[index] = None;
+            }
+            (
+                Qwen3_5LayerCache::Linear(arrays),
+                Qwen35FlatLayerSnapshot::Linear { conv_state, .. },
+            ) => {
+                let layer_tape = tape[index].as_ref().ok_or_else(|| {
+                    Error::from_reason(format!("{context}: GDN layer {index} has no tape"))
+                })?;
+                let window_len = layer_tape.kernel.window_len()? as usize;
+                if keep > window_len || accepted_nodes.iter().any(|&node| node >= window_len) {
+                    return Err(Error::from_reason(format!(
+                        "{context}: accepted nodes {accepted_nodes:?} exceed GDN window {window_len} at layer {index}"
+                    )));
+                }
+                if !(is_chain && is_contiguous_prefix && keep == window_len) {
+                    layer_tape.replay_conv_tree_into(
+                        arrays,
+                        conv_state.as_ref(),
+                        accepted_nodes,
+                        is_contiguous_prefix,
+                        accepted_i32.as_ref(),
+                    )?;
+                }
+                pending_out[index] = if keep > 0 {
+                    Some(CudaPendingGdn {
+                        kernel: layer_tape.kernel.clone(),
+                        keep,
+                        prev_indices: accepted_i32.clone(),
+                    })
+                } else {
+                    None
+                };
+            }
+            (cache, _) => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {index} snapshot kind {} does not match its cache",
+                    match cache {
+                        Qwen3_5LayerCache::Linear(_) => "FullAttention",
+                        Qwen3_5LayerCache::FullAttention(_) => "Linear",
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fold any remaining pending CUDA deferred GDN updates into `caches[i][1]`
+/// (`recurrent_state`) via [`super::gated_delta::GdnKernelTape::replay_recurrent_state`]
+/// (or [`super::gated_delta::GdnKernelTape::replay_recurrent_state_indices`]
+/// for a non-contiguous tree branch) and clear `pending`. Called on `finish()`
+/// and `Drop` so subsequent turns or AR fallback see exact settled recurrent states.
+pub(crate) fn settle_flat_dflash2_deferred(
+    caches: &mut [Qwen3_5LayerCache],
+    pending: &mut [Option<CudaPendingGdn>],
+) -> Result<()> {
+    if caches.len() != pending.len() {
+        return Err(Error::from_reason(format!(
+            "settle_flat_dflash2_deferred: length mismatch (caches {}, pending {})",
+            caches.len(),
+            pending.len(),
+        )));
+    }
+    for (cache, slot) in caches.iter_mut().zip(pending.iter_mut()) {
+        let Some(p) = slot.take() else {
+            continue;
+        };
+        if p.keep == 0 {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = cache else {
+            return Err(Error::from_reason(
+                "settle_flat_dflash2_deferred: pending GDN fold on non-Linear cache slot",
+            ));
+        };
+        let start_state = match arrays.get(1) {
+            Some(s) => s.clone(),
+            None => {
+                let batch = p.kernel.v.shape_at(0)?;
+                let num_v_heads = p.kernel.v.shape_at(2)?;
+                let v_dim = p.kernel.v.shape_at(3)?;
+                let k_dim = p.kernel.q.shape_at(3)?;
+                MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?
+            }
+        };
+        let settled = if let Some(indices) = p.prev_indices.as_ref() {
+            p.kernel
+                .replay_recurrent_state_indices(&start_state, indices, p.keep)?
+        } else {
+            p.kernel.replay_recurrent_state(&start_state, p.keep)?
+        };
+        arrays.set(1, settled)?;
+    }
+    Ok(())
 }
 
 /// Restore every layer's cache from a matching slice of snapshots.
@@ -616,6 +1019,44 @@ mod tests {
             );
         } else {
             panic!("layer 1 must still be Linear");
+        }
+    }
+
+    #[test]
+    fn flat_dflash2_replay_trims_kv_to_every_accepted_frontier() {
+        for keep in 0..=4usize {
+            let mut caches = vec![Qwen3_5LayerCache::new_full_attention()];
+            let keys = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+            let values = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
+            if !try_eval_or_skip(&keys, "flat_dflash2_replay::prime") {
+                return;
+            }
+            caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&keys, &values)
+                .unwrap();
+            let snapshot = snapshot_flat_dflash2(&caches).unwrap();
+            let drafted = MxArray::from_float32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]).unwrap();
+            caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&drafted, &drafted)
+                .unwrap();
+            assert_eq!(caches[0].offset(), 8);
+            replay_flat_dflash2_snapshot_to(&mut caches, &snapshot, &[None], keep, "test").unwrap();
+            assert_eq!(caches[0].offset(), 4 + keep as i32);
+
+            let boundary = MxArray::from_float32(&[99.0], &[1, 1, 1, 1]).unwrap();
+            let (keys, _) = caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&boundary, &boundary)
+                .unwrap();
+            let mut expected = vec![1.0, 2.0, 3.0, 4.0];
+            expected.extend((0..keep).map(|row| 5.0 + row as f32));
+            expected.push(99.0);
+            assert_eq!(vec_of(&keys), expected, "accepted rows={keep}");
         }
     }
 

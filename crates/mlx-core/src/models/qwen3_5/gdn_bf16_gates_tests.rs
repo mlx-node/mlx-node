@@ -179,6 +179,7 @@ fn chain(
         &wt.dt_bias,
         state,
         wt.tiled,
+        false,
         None,
     )?;
     let (y, new_state) = gated_delta_kernel(&q, &k, &v, &g, &beta, &init, None)?;

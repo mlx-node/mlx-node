@@ -6,6 +6,7 @@
 import {
   DeepseekV41Model as NativeDeepseekV41Model,
   Gemma4Model as NativeGemma4Model,
+  getRuntimeCapabilities,
   ggufArchitecture,
   HarrierModel,
   HyV4FlashModel as NativeHyV4FlashModel,
@@ -323,6 +324,18 @@ function requireFamilyData(modelType: ModelType) {
 }
 
 /**
+ * Whether automatic DFlash2 draft companion discovery is supported for
+ * `modelType` on the active native backend (Metal supports both dense and MoE;
+ * CUDA supports dense Qwen3.5/Qwen3.8 via flat DFlash2; CPU disables auto-draft).
+ */
+export function supportsAutomaticDFlash2(modelType: ModelType): boolean {
+  const caps = getRuntimeCapabilities();
+  if (modelType === 'qwen3_5') return caps.supportsDenseDflash2;
+  if (modelType === 'qwen3_5_moe') return caps.supportsMoeDflash2;
+  return caps.backend === 'metal';
+}
+
+/**
  * Dispatch a load through the registry, validating draft-capable families.
  * `draftModelPath` reaches gemma4, qwen3_5 and qwen3_5_moe; every other family
  * rejects it loudly instead of silently ignoring speculative-decode intent.
@@ -383,9 +396,10 @@ function dispatchLoad(
     );
   }
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
-  // Automatic DFlash2 verification needs the Metal-only fused GDN kernel. Explicit drafts retain native validation.
+  // Automatic DFlash2 verification follows the active backend's native capabilities.
+  // Explicit drafts always retain native validation.
   const automaticDraft =
-    options?.autoLoadDraft === false || process.platform !== 'darwin'
+    options?.autoLoadDraft === false || !supportsAutomaticDFlash2(modelType)
       ? undefined
       : findDFlash2Draft(modelPath, modelType);
   const draftModelPath = options?.draftModelPath ?? automaticDraft;

@@ -961,11 +961,10 @@ fn dflash2_takes_the_one_pool_window() {
     assert_eq!(pool.lane.window.maximum(), 112_473);
 }
 
-/// A draft load without a pool (off Metal) is refused before any read:
-/// DFlash2 runs only on the pool. Mutation: drop the check in `estimate_qwen35_load` →
-/// red (`Ok`).
+/// A dense draft load without a pool uses the eager flat lane and returns
+/// the model's served window. MoE retains its separate Metal-pool gate.
 #[test]
-fn draft_without_a_pool_is_refused() {
+fn draft_without_a_pool_uses_the_dense_flat_lane() {
     let target = estimate_fixture_dir("draft-flat");
     let draft = estimate_fixture_dir("draft-flat-draft");
     write_27b_fixture(&target, &draft);
@@ -997,13 +996,11 @@ fn draft_without_a_pool_is_refused() {
     super::NO_METAL_POOL.with(|off| off.set(false));
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
-    let err = estimate.expect_err("no pool for the draft");
-    assert!(
-        err.reason
-            .contains("DFlash2 runs on the block-paged KV pool"),
-        "{}",
-        err.reason
-    );
+    let estimate = estimate
+        .expect("the dense flat lane accepts the draft")
+        .expect("the live-memory estimate includes the served window");
+    assert!(estimate.window_tokens > 0);
+    assert_eq!(estimate.bound, "model");
 }
 
 /// One window for every turn: a load that can run MTP turns on
@@ -2692,4 +2689,111 @@ fn the_pool_page_rule_takes_the_token_major_page_only_on_its_load() {
         println!("PAGE_RULE {label}: {got:?}");
         assert_eq!(got, want, "{label}");
     }
+}
+
+/// On a 7 GB macOS CI runner (`working_set = 5,010,305,024` B,
+/// `hard_budget = 3,936,563,200` B) with the real measured active footprint of
+/// `qwen3.5-0.8b-mlx-bf16` (`2,462,871,120` B ≈ 2,348.78 MiB: 1,666 MiB
+/// safetensors + 683 MiB finalized caches):
+///
+/// 1. Native `int8 + mtp=true + max_pos=262_144` plans `lanes == 1`.
+/// 2. `int8 + mtp=true + max_pos=8_192` STILL plans `lanes == 1`, because the
+///    2-lane int8 + MTP minimum (~713 MiB) exceeds the ~555 MiB dynamic budget
+///    regardless of context cap.
+/// 3. Plain AR (`int8 + mtp=false + max_pos=8_192`) plans `lanes == 2` at the
+///    full 8,192 window with >256 MiB headroom.
+#[test]
+fn small_runner_0_8b_plain_ar_grants_two_lanes() {
+    const CI_7GB_WORKING_SET: u64 = 5_010_305_024;
+    const REAL_0_8B_ACTIVE_BYTES: u64 = 2_462_871_120;
+    let make_0_8b = |max_pos: i32, mtp: bool| {
+        let mut config = shaped_config(1024, 24, 8, 2, 3584, 16, 16, mtp);
+        config.max_position_embeddings = max_pos;
+        config.rope_scaling = Some(
+            RopeScaling::served_for("Qwen3.5", max_pos as u32, RopeScaling::default(), None)
+                .unwrap(),
+        );
+        config
+    };
+
+    // 1. Native int8 + MTP at 262,144 -> 1 lane (memory-bound).
+    let native = make_0_8b(262_144, true);
+    let native_plan = shaped_disk_plan(
+        &native,
+        REAL_0_8B_ACTIVE_BYTES,
+        CI_7GB_WORKING_SET,
+        true,
+        2,
+        0,
+        Some(CacheDisk::Auto),
+    )
+    .expect("0.8B native fits 1 lane on 7 GB runner");
+    let native_pool = native_plan.pool.expect("pool plan");
+    println!(
+        "CI_7GB native int8+mtp max_pos=262144: lanes={} window={} dynamic={:.2}MiB min={:.2}MiB",
+        native_pool.lanes,
+        native_pool.lane.window.maximum(),
+        native_plan.dynamic_budget_bytes as f64 / MIB as f64,
+        native_pool.lane.minimum_bytes as f64 / MIB as f64,
+    );
+    assert_eq!(native_plan.hard_budget_bytes, 3_936_563_200);
+    assert_eq!(native_pool.lanes, 1);
+    assert!(native_pool.lane.window.maximum() < 262_144);
+
+    // 2. int8 + MTP at 8,192 -> STILL 1 lane (2-lane minimum ~713 MiB > ~555 MiB dynamic budget).
+    let capped_int8_mtp = make_0_8b(8_192, true);
+    let capped_int8_mtp_plan = shaped_disk_plan(
+        &capped_int8_mtp,
+        REAL_0_8B_ACTIVE_BYTES,
+        CI_7GB_WORKING_SET,
+        true,
+        2,
+        0,
+        Some(CacheDisk::Auto),
+    )
+    .expect("0.8B int8+mtp capped fits 1 lane on 7 GB runner");
+    let capped_int8_mtp_pool = capped_int8_mtp_plan.pool.expect("pool plan");
+    println!(
+        "CI_7GB int8+mtp max_pos=8192: lanes={} window={} dynamic={:.2}MiB min={:.2}MiB",
+        capped_int8_mtp_pool.lanes,
+        capped_int8_mtp_pool.lane.window.maximum(),
+        capped_int8_mtp_plan.dynamic_budget_bytes as f64 / MIB as f64,
+        capped_int8_mtp_pool.lane.minimum_bytes as f64 / MIB as f64,
+    );
+    assert_eq!(
+        capped_int8_mtp_pool.lanes, 1,
+        "capping context alone cannot grant 2 int8+MTP lanes on 7 GB CI"
+    );
+
+    // 3. Plain AR (int8 + mtp=false + max_pos=8_192) -> 2 lanes with huge headroom.
+    let plain_ar = make_0_8b(8_192, false);
+    let plain_ar_plan = shaped_disk_plan(
+        &plain_ar,
+        REAL_0_8B_ACTIVE_BYTES,
+        CI_7GB_WORKING_SET,
+        false,
+        2,
+        0,
+        Some(CacheDisk::Auto),
+    )
+    .expect("0.8B plain AR fits 2 lanes on 7 GB runner");
+    let plain_ar_pool = plain_ar_plan.pool.expect("pool plan");
+    let plain_ar_headroom = plain_ar_plan
+        .dynamic_budget_bytes
+        .saturating_sub(plain_ar_pool.lane.minimum_bytes);
+    println!(
+        "CI_7GB int8+ar max_pos=8192: lanes={} window={} dynamic={:.2}MiB min={:.2}MiB headroom={:.2}MiB",
+        plain_ar_pool.lanes,
+        plain_ar_pool.lane.window.maximum(),
+        plain_ar_plan.dynamic_budget_bytes as f64 / MIB as f64,
+        plain_ar_pool.lane.minimum_bytes as f64 / MIB as f64,
+        plain_ar_headroom as f64 / MIB as f64,
+    );
+    assert_eq!(plain_ar_pool.lanes, 2);
+    assert_eq!(plain_ar_pool.lane.window.maximum(), 8_192);
+    assert!(
+        plain_ar_headroom >= 256 * MIB,
+        "expected >256 MiB headroom for plain AR int8, got {:.2} MiB",
+        plain_ar_headroom as f64 / MIB as f64,
+    );
 }

@@ -5,6 +5,9 @@ fn draft_execution_policy_is_scoped_and_honors_explicit_overrides() {
     let moe = dense.with_moe_profile(true);
     assert!(!dense.compile_draft() && !dense.tensor_attention());
     assert!(moe.compile_draft() && moe.tensor_attention());
+    let cuda = dense.with_dense_cuda_profile(true);
+    assert!(cuda.compile_draft() && !cuda.tensor_attention());
+    assert!(!cuda.with_dense_cuda_profile(false).compile_draft());
     assert!(!moe.with_moe_profile(false).compile_draft());
     for (value, enabled) in [("0", false), ("1", true), ("true", false), ("", false)] {
         for supported in [false, true] {
@@ -462,7 +465,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         MxArray::eval_arrays(&[&expected]).unwrap();
         let block = MxArray::from_int32(&[anchor as i32, 0, 0, 0, 0, 0, 0, 0], &[1, 8]).unwrap();
         let (actual, actual_confidence) = model
-            .propose_compiled(&embedding, None, &mut compiled, &block, true)
+            .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
             .unwrap()
             .unwrap();
         MxArray::eval_arrays(&[&actual]).unwrap();
@@ -518,7 +521,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
     let block = MxArray::from_int32(&[1, 0, 0, 0, 0, 0, 0, 0], &[1, 8]).unwrap();
     assert!(
         model
-            .propose_compiled(&embedding, None, &mut compiled, &block, true)
+            .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
             .is_err()
     );
     assert!(
@@ -555,7 +558,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         .unwrap();
     MxArray::eval_arrays(&[&expected]).unwrap();
     let (retry, _) = model
-        .propose_compiled(&embedding, None, &mut compiled, &block, true)
+        .propose_compiled(&embedding, None, None, &mut compiled, &block, true)
         .unwrap()
         .unwrap();
     MxArray::eval_arrays(&[&retry]).unwrap();

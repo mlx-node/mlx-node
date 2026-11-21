@@ -3355,8 +3355,9 @@ async fn load_with_thread_impl(
                     )
                 });
                 let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
-                    let (draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
+                    let (mut draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
                     draft.validate_target(&config)?;
+                    draft.configure_dense_execution();
                     inner.dflash2 = Some(draft);
                     info!("Loaded external Qwen3.8 DFlash2 companion from {draft_path}");
                     inner.dflash2_wave_ready = super::scheduled_dflash2::wave_ready_at_load(&inner);

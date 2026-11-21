@@ -195,6 +195,287 @@ pub(super) fn forward_pre_norm_inner(
     )
 }
 
+/// How much of the sequence an external-draft target forward must project.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DFlash2LogitsSpan {
+    None,
+    All,
+    LastRow,
+}
+
+/// Device-agnostic DFlash2 target forward. It captures the draft's residual
+/// taps and, for a verify block, the GDN tape needed to keep only accepted
+/// rows. The Metal pool path has its own fused implementation.
+pub(crate) fn forward_dflash2_eager_with_taps(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
+) -> Result<(
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<super::super::gated_delta_net::GdnLayerTape>>,
+)> {
+    forward_dflash2_eager_with_taps_deferred(
+        inner,
+        input_ids,
+        tap_layers,
+        record_tape,
+        logits_span,
+        None,
+    )
+}
+
+/// [`forward_dflash2_eager_with_taps`] with optional per-layer CUDA deferred
+/// GDN fold (`cuda_pending`). When `Some`, each linear layer folds
+/// `pending[index]` into `cache[index][1]` during its verify step and clears
+/// `pending[index]` immediately afterward so `cache[i][1] + pending[i]` stays
+/// exact at every layer boundary. Uses cross-layer `AddRMSNorm` fusion across
+/// all decoder layers and into `inner.final_norm`.
+pub(crate) fn forward_dflash2_eager_with_taps_deferred(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
+    cuda_pending: Option<&mut [Option<super::super::layer_cache::CudaPendingGdn>]>,
+) -> Result<(
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<super::super::gated_delta_net::GdnLayerTape>>,
+)> {
+    forward_dflash2_eager_with_taps_deferred_tree(
+        inner,
+        input_ids,
+        tap_layers,
+        record_tape,
+        logits_span,
+        cuda_pending,
+        None,
+    )
+}
+
+/// Tree-verification variant of [`forward_dflash2_eager_with_taps_deferred`].
+/// When `tree` is `Some`, routes FullAttention through tree-depth RoPE +
+/// `sdpa_tree_few` and GDN layers through `prepare_tree` + `tree_step_deferred`
+/// while preserving cross-layer `AddRMSNorm` fusion (`tree_len <= 16`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_dflash2_eager_with_taps_deferred_tree(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
+    mut cuda_pending: Option<&mut [Option<super::super::layer_cache::CudaPendingGdn>]>,
+    tree: Option<&super::super::verify_tree::TreeDeviceViews>,
+) -> Result<(
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<super::super::gated_delta_net::GdnLayerTape>>,
+)> {
+    use super::super::decoder_layer::LayerResidual;
+
+    if tap_layers.is_empty() || tap_layers.iter().any(|&layer| layer >= inner.layers.len()) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 target tap layers are invalid: {tap_layers:?} for {} layers",
+            inner.layers.len()
+        )));
+    }
+    if input_ids.shape_at(1)? == 0 {
+        return Err(Error::from_reason(
+            "DFlash2 target forward needs at least one token",
+        ));
+    }
+    if let Some(pending) = cuda_pending.as_deref()
+        && pending.len() != inner.layers.len()
+    {
+        return Err(Error::from_reason(format!(
+            "DFlash2 deferred GDN pending length {} != layer count {}",
+            pending.len(),
+            inner.layers.len()
+        )));
+    }
+    let seq_len = input_ids.shape_at(1)?;
+    if let Some(tv) = tree
+        && seq_len as usize != tv.tree_len
+    {
+        return Err(Error::from_reason(format!(
+            "DFlash2 tree target forward seq_len {seq_len} != tree_len {}",
+            tv.tree_len
+        )));
+    }
+    // Fuse cross-layer MLP residual add into the next layer's input_layernorm
+    // for decode/verify steps (seq_len <= 16, including verify trees). Prefill
+    // keeps eager residual materialization so an extra [chunk_rows, hidden]
+    // tensor is not held live across layer boundaries (+30 MB peak RAM on 6k chunks).
+    let use_cross_norm = seq_len <= 16;
+    let mut state = LayerResidual::Hidden(inner.embedding.forward(input_ids)?);
+    let mut taps = vec![None; tap_layers.len()];
+    let mut tape = (0..inner.layers.len()).map(|_| None).collect::<Vec<_>>();
+    let last_layer_idx = inner.layers.len().saturating_sub(1);
+    let can_prune_final_layer = !record_tape
+        && cuda_pending.is_none()
+        && tree.is_none()
+        && logits_span != DFlash2LogitsSpan::All
+        && !tap_layers.contains(&last_layer_idx);
+    let capture_tap = |taps: &mut [Option<MxArray>], layer_idx: usize, hidden: &MxArray| {
+        for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+            if tap_layer == layer_idx {
+                taps[slot] = Some(hidden.clone());
+            }
+        }
+    };
+    for index in 0..inner.layers.len() {
+        let mut cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
+        if can_prune_final_layer
+            && index == last_layer_idx
+            && let Some((prev_completed, next_state)) = inner.layers[index]
+                .forward_final_prefill_pruned_pending(
+                    &state,
+                    cache.as_deref_mut(),
+                    logits_span == DFlash2LogitsSpan::LastRow,
+                )?
+        {
+            if index > 0 && matches!(state, LayerResidual::Pending { .. }) {
+                capture_tap(&mut taps, index - 1, &prev_completed);
+            }
+            state = next_state;
+            continue;
+        }
+        let layer_deferred = cuda_pending
+            .as_deref()
+            .map(|pending| pending[index].as_ref());
+        let was_pending = matches!(state, LayerResidual::Pending { .. });
+        let (prev_completed, next_state) = if record_tape {
+            let mut slot = None;
+            let res = inner.layers[index].forward_inner_with_tape_pending_tree(
+                state,
+                None,
+                cache,
+                None,
+                true,
+                Some(&mut slot),
+                layer_deferred,
+                tree,
+            )?;
+            tape[index] = slot;
+            res
+        } else {
+            inner.layers[index].forward_inner_with_tape_pending_tree(
+                state,
+                None,
+                cache,
+                None,
+                true,
+                None,
+                layer_deferred,
+                tree,
+            )?
+        };
+        if let Some(pending) = cuda_pending.as_deref_mut() {
+            pending[index] = None;
+        }
+        if index > 0 && was_pending {
+            capture_tap(&mut taps, index - 1, &prev_completed);
+        }
+        if use_cross_norm {
+            state = next_state;
+        } else {
+            let completed = next_state.into_hidden()?;
+            capture_tap(&mut taps, index, &completed);
+            state = LayerResidual::Hidden(completed);
+        }
+    }
+    enum FinalOutput {
+        Hidden(MxArray),
+        Normed(MxArray),
+    }
+    let last_layer_tapped = tap_layers.contains(&last_layer_idx);
+    let final_out = match logits_span {
+        DFlash2LogitsSpan::None => {
+            let hidden = state.into_hidden()?;
+            if last_layer_tapped {
+                capture_tap(&mut taps, last_layer_idx, &hidden);
+            }
+            FinalOutput::Hidden(hidden)
+        }
+        DFlash2LogitsSpan::All => match state {
+            LayerResidual::Hidden(hidden) => {
+                if last_layer_tapped {
+                    capture_tap(&mut taps, last_layer_idx, &hidden);
+                }
+                FinalOutput::Normed(inner.final_norm.forward(&hidden)?)
+            }
+            LayerResidual::Pending { h, delta } => {
+                let (hidden, normalized) =
+                    DecoderLayer::add_residual_norm(&inner.final_norm, &h, &delta)?;
+                if last_layer_tapped {
+                    capture_tap(&mut taps, last_layer_idx, &hidden);
+                }
+                FinalOutput::Normed(normalized)
+            }
+        },
+        DFlash2LogitsSpan::LastRow => {
+            if last_layer_tapped {
+                let hidden = state.into_hidden()?;
+                capture_tap(&mut taps, last_layer_idx, &hidden);
+                let rows = hidden.shape_at(1)?;
+                let last = if rows == 1 {
+                    hidden
+                } else {
+                    hidden.slice_axis(1, rows - 1, rows)?
+                };
+                FinalOutput::Normed(inner.final_norm.forward(&last)?)
+            } else {
+                let normalized = match state {
+                    LayerResidual::Hidden(hidden) => {
+                        let rows = hidden.shape_at(1)?;
+                        let last = if rows == 1 {
+                            hidden
+                        } else {
+                            hidden.slice_axis(1, rows - 1, rows)?
+                        };
+                        inner.final_norm.forward(&last)?
+                    }
+                    LayerResidual::Pending { h, delta } => {
+                        let rows = h.shape_at(1)?;
+                        let (h_last, delta_last) = if rows == 1 {
+                            (h, delta)
+                        } else {
+                            (
+                                h.slice_axis(1, rows - 1, rows)?,
+                                delta.slice_axis(1, rows - 1, rows)?,
+                            )
+                        };
+                        DecoderLayer::add_residual_norm(&inner.final_norm, &h_last, &delta_last)?.1
+                    }
+                };
+                FinalOutput::Normed(normalized)
+            }
+        }
+    };
+    let taps = taps
+        .into_iter()
+        .enumerate()
+        .map(|(slot, tap)| {
+            tap.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "DFlash2 target tap {} at layer {} was not captured",
+                    slot, tap_layers[slot]
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match final_out {
+        FinalOutput::Hidden(hidden) => Ok((hidden, taps, tape)),
+        FinalOutput::Normed(normalized) => {
+            let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
+            Ok((logits, taps, tape))
+        }
+    }
+}
+
 pub(super) fn project_logits_from_hidden(
     hidden: &MxArray,
     lm_head: &Option<LinearProj>,

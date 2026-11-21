@@ -13,6 +13,7 @@ import {
   Qwen35Model,
   Qwen35MoeModel,
   Qwen4ExpModel,
+  supportsAutomaticDFlash2,
 } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -291,7 +292,7 @@ describe('standalone GGUF model detection', () => {
     await loadModel(modelPath);
     expect(loadSpy).toHaveBeenLastCalledWith(
       modelPath,
-      process.platform === 'darwin' ? { draftModelPath: inside } : null,
+      supportsAutomaticDFlash2('qwen3_5') ? { draftModelPath: inside } : null,
     );
     await rm(inside, { recursive: true });
     await loadModel(modelPath);

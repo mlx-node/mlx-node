@@ -47,6 +47,7 @@ struct CompiledGraphEntry {
   std::function<std::vector<array>(const std::vector<array>&)> fn;
   size_t n_inputs = 0;
   size_t n_outputs = 0;
+  bool no_fuse = false;
 };
 
 // fn_ids are namespaced per caller site (e.g. one id per model instance), so
@@ -89,14 +90,15 @@ mlx_array* mlx_array_clone_handle(const mlx_array* handle) {
 
 } // extern "C"
 
-extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
+extern "C" bool mlx_compiled_graph_invoke_with_mode(uint64_t fn_id,
                                           MlxGraphBuilder builder,
                                           void* ctx,
                                           const mlx_array* const* inputs,
                                           size_t n_inputs,
                                           mlx_array** outputs,
                                           size_t n_outputs,
-                                          bool shapeless) {
+                                          bool shapeless,
+                                          bool no_fuse) {
   if (!builder || (!inputs && n_inputs > 0) || (!outputs && n_outputs > 0)) {
     return false;
   }
@@ -114,7 +116,7 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
       if (!entry.fn) {
         entry.n_inputs = n_inputs;
         entry.n_outputs = n_outputs;
-        entry.fn = mlx::core::compile(
+        auto graph_builder =
           [builder, n_outputs](const std::vector<array>& traced)
               -> std::vector<array> {
             // Hand Rust owning copies of the tracers: `array` shares the
@@ -149,14 +151,24 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
               delete reinterpret_cast<array*>(h);
             }
             return result;
-          },
-          shapeless);
+          };
+        entry.no_fuse = no_fuse;
+        entry.fn = no_fuse
+            ? mlx::core::compile_with_mode(
+                  std::move(graph_builder), shapeless, mlx::core::CompileMode::no_fuse)
+            : mlx::core::compile(std::move(graph_builder), shapeless);
       }
       if (n_inputs != entry.n_inputs || n_outputs != entry.n_outputs) {
         std::cerr << "mlx_compiled_graph_invoke: arity mismatch for fn_id "
                   << fn_id << " (got " << n_inputs << " in / " << n_outputs
                   << " out, expected " << entry.n_inputs << " / "
                   << entry.n_outputs << ")" << std::endl;
+        return false;
+      }
+      if (no_fuse != entry.no_fuse) {
+        std::cerr << "mlx_compiled_graph_invoke: compile mode mismatch for fn_id "
+                  << fn_id << " (got no_fuse=" << no_fuse
+                  << ", expected no_fuse=" << entry.no_fuse << ")" << std::endl;
         return false;
       }
       // Copy the callable out and drop the lock: MLX traces lazily on the
@@ -211,6 +223,18 @@ extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
 // Drop every cached entry whose fn_id matches `value` under `mask`. Compiled
 // tapes hold their captured constants (model weights) alive, so a model must
 // erase its ids on destruction or a reload keeps the old weights resident.
+extern "C" bool mlx_compiled_graph_invoke(uint64_t fn_id,
+                                          MlxGraphBuilder builder,
+                                          void* ctx,
+                                          const mlx_array* const* inputs,
+                                          size_t n_inputs,
+                                          mlx_array** outputs,
+                                          size_t n_outputs,
+                                          bool shapeless) {
+  return mlx_compiled_graph_invoke_with_mode(
+      fn_id, builder, ctx, inputs, n_inputs, outputs, n_outputs, shapeless, false);
+}
+
 extern "C" void mlx_compiled_graph_erase_matching(uint64_t mask,
                                                   uint64_t value) {
   std::lock_guard<std::mutex> lock(registry_mutex());
@@ -231,6 +255,7 @@ extern "C" void mlx_compiled_graph_set_compile_disabled(bool disabled) {
   mlx::core::set_compile_mode(disabled ? mlx::core::CompileMode::disabled
                                        : mlx::core::CompileMode::enabled);
 }
+
 
 // Test hook: count the primitive nodes reachable from `outputs` that depend on
 // none of `inputs`. On a compiled replay these are lazy constants the trace

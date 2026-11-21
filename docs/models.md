@@ -355,7 +355,7 @@ does not override it. The final cycle still respects the remaining token budget.
 draft families retain their own adaptive policies.
 An external DFlash2 companion takes precedence over an inline native MTP head.
 
-DFlash2 runs on the block-paged KV pool, like Splash: the tapped prefill
+On Metal, DFlash2 runs on the block-paged KV pool, like Splash: the tapped prefill
 writes the prompt into the pool and books each chunk end; every cycle drafts
 seven proposals and verifies the anchor plus seven in one fixed 8-row graph
 on the pool (dense and MoE), then commits the kept rows and rolls the rest
@@ -363,7 +363,7 @@ back without freeing a page. Like Splash, no GDN commit or replay runs per
 cycle: each verify folds the previous cycle's kept rows from their tape into
 the lane's other GDN cell before its own rows, the commit swaps the two cells
 and keeps the verify's tape, and `finish` folds the last kept rows once. A
-load whose GDN layers the fused verify kernel cannot run (non-bf16, missing
+Metal load whose GDN layers the fused verify kernel cannot run (non-bf16, missing
 f32 sidecars, heads not 128 wide) refuses the draft.
 The draft state (a second GDN cell and the draft's K/V ring) is priced into
 the one pool window, and every turn, DFlash2 or not, takes that window. A
@@ -372,8 +372,20 @@ dense DFlash2 text turn is a scheduled lane (verify waves of 2 to 4 lanes,
 a media turn runs alone on the Barrier lane. An AR, image or MTP turn drops
 the live draft window, and a prefix hit without it prefills the draft context
 from 0: parked DFlash2 states have no store on the pool yet, so there is no
-cross-turn resume of a draft window that another turn dropped. A load with a
+cross-turn resume of a draft window that another turn dropped. A Metal load with a
 draft and no pool fails.
+
+Off Metal, dense Qwen3.8 uses an eager flat-cache DFlash2 lane. Each turn
+cold-starts the draft and prefills the full prompt. Verify blocks run through
+ordinary MLX operations; commit trims full-attention K/V to the accepted
+frontier and replays each GDN layer's tape from its pre-verify state. Unmasked
+128-wide CUDA heads use a register-resident recurrent kernel for prefill,
+decode, and accepted-prefix replay; other geometries retain generic ops.
+Supported K-quant prefill and verify projections share temporary dense weights
+across rows, then release them at turn cleanup or single-row decode. The lane
+supports streaming and reports the same DFlash2 cycle and acceptance metrics.
+It does not reuse prompt prefixes or DFlash2 SSD states. MoE DFlash2 retains
+its Metal pool requirement.
 
 Loading is fail-closed: the loader requires `DFlash2DraftModel`, validates the
 target hidden size, vocabulary, tap indices, every expected tensor shape, and
@@ -610,10 +622,11 @@ second GDN cell and the draft's K/V ring, Splash
 larger of the tapped prefill chunk and the 8-row verify cycle with the free
 pool MLX keeps of it (twice the cycle; MLX collects that pool only at 95% of
 the working set). On the M3 Pro inputs (27 GiB working set, the 27B and its
-draft, int8 pool) that is 221,177 tokens for every turn. DFlash2 runs only on
-the block-paged pool: a load with a draft and no pool fails. On Metal every
-Qwen3.5 load serves its turns from the pool (a sym8 checkpoint included);
-only a load off Metal has none, and it plans its weights only. The load
+draft, int8 pool) that is 221,177 tokens for every turn. Metal DFlash2 runs on
+the block-paged pool; dense off-Metal DFlash2 uses the cold-start eager flat
+lane described above. On Metal every Qwen3.5 load serves its turns from the
+pool (a sym8 checkpoint included); only a load off Metal has none, and it
+plans its weights only. The load
 log prints the plan and which bound wins (`memory` or `model`). A
 `paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
 plan allows, and so does an unreadable Metal working set on a paged load.

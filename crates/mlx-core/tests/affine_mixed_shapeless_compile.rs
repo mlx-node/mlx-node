@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! The BF16-x / F32-sidecar affine matmul runs inside the shapeless DFlash2
 //! verify compile. Traced at one row count and replayed at another, it must
 //! route by the replay's rows and equal both its eager result and the promoted

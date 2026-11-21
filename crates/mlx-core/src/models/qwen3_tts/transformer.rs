@@ -5,7 +5,6 @@ use crate::{
     transformer::{KVCache, kv_cache::KvBlock},
 };
 use napi::{Error, Result};
-use std::sync::OnceLock;
 
 #[derive(Default)]
 pub struct AttentionState {
@@ -169,9 +168,7 @@ impl DecoderLayer {
         k: &MxArray,
         position: i32,
     ) -> Option<(MxArray, MxArray)> {
-        static METAL: OnceLock<bool> = OnceLock::new();
-        let metal = *METAL.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() });
-        if !metal || self.rope.traditional {
+        if !crate::accelerator::metal_ops_available() || self.rope.traditional {
             return None;
         }
         let (q_norm, k_norm) = self.q_norm.as_ref().zip(self.k_norm.as_ref())?;

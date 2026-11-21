@@ -930,6 +930,7 @@ module.exports.estimateQwen4ExpContextWindow = nativeBinding.estimateQwen4ExpCon
 module.exports.formatDocument = nativeBinding.formatDocument;
 module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
+module.exports.getRuntimeCapabilities = nativeBinding.getRuntimeCapabilities;
 module.exports.ggufArchitecture = nativeBinding.ggufArchitecture;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;
 module.exports.loadProgress = nativeBinding.loadProgress;

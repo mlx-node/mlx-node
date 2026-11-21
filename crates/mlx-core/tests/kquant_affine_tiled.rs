@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! The MLX affine modes of the K-quant kernels (`a4g64`, `a8g64`:
 //! `mlx_kquant.h` `Mode::A4G64` / `Mode::A8G64`): MLX's own affine arrays —
 //! the LSB-first codes, one bfloat16 scale and one bfloat16 bias per group —

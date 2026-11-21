@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Opt-in staged K-walk spreading on the exact target projection shapes.
 mod kquant_support;
 use kquant_support::*;

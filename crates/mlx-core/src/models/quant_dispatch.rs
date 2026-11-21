@@ -424,11 +424,9 @@ pub fn split_kquant_layout(mode: &str) -> (&str, bool) {
 /// Whether row-major K-quant linears are tiled at load: only the `_t64` Metal
 /// kernels read the layout, so a Metal host. (A checkpoint whose bytes are
 /// already stored `t64` is tiled regardless.) Read once per process.
+#[inline]
 pub fn kquant_tiled_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    // SAFETY: nullary predicate that catches internally.
-    *ENABLED.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() })
+    crate::accelerator::host_has_metal()
 }
 
 /// Whether a 2-D K-quant weight of `n` rows and `k` inputs may be tiled:

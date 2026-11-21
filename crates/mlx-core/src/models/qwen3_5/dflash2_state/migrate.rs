@@ -458,11 +458,11 @@ pub(crate) fn tail_keys<'a>(
 
 pub(crate) mod move_source;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod move_tests;
 
 #[cfg(test)]
 mod source_tests;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;

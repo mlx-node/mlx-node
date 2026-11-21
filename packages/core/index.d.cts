@@ -4439,6 +4439,9 @@ export declare function getMemorySnapshot(): GpuMemorySnapshot;
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
 
+/** Query static host backend and runtime feature capabilities. */
+export declare function getRuntimeCapabilities(): RuntimeCapabilities;
+
 /**
  * Read the architecture declared by a GGUF header without loading any tensor
  * payloads. This is the model-family detection seam for standalone GGUF files
@@ -4840,8 +4843,9 @@ export interface HyV4FlashResidencyInfo {
   slotHits: number;
   slotMisses: number;
   /**
-   * Bytes read from the GGUF shards since load: expert fills and Engram
-   * rows; the page cache may serve part of them.
+   * Expert fill bytes read from the GGUF shards since load (excluding Engram
+   * rows, reported separately in `engram_bytes_read`); the page cache may
+   * serve part of them.
    */
   checkpointBytesRead: number;
   engramBytesRead: number;
@@ -6704,6 +6708,30 @@ export interface RunAggregates {
   avgGenerationTimeMs: number;
   /** Average training time (milliseconds) */
   avgTrainingTimeMs: number;
+}
+
+/**
+ * Runtime backend and feature capabilities reported to TypeScript callers.
+ *
+ * Replaces `process.platform === 'darwin' | 'linux'` heuristics in higher-level
+ * packages with concrete, backend-truthful capabilities across
+ * `(macOS | Linux | Windows) x (Metal | CUDA | CPU)`.
+ */
+export interface RuntimeCapabilities {
+  /** Active host GPU backend: `"metal"`, `"cuda"`, or `"cpu"`. */
+  backend: string;
+  /** Whether the active device shares unified memory with the host CPU. */
+  isUnifiedMemory: boolean;
+  /** Total usable device memory in bytes (or host RAM on CPU-only hosts). */
+  totalMemoryBytes: number;
+  /** Whether Metal paged KV attention is available on this host. */
+  supportsPagedAttention: boolean;
+  /** Whether fused Gated Delta Net (GDN) kernels are available on this host. */
+  supportsFusedGdn: boolean;
+  /** Whether dense Qwen3.5/Qwen3.8 DFlash2 speculative decoding is supported. */
+  supportsDenseDflash2: boolean;
+  /** Whether MoE DFlash2 speculative decoding is supported. */
+  supportsMoeDflash2: boolean;
 }
 
 /**

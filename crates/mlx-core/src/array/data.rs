@@ -198,15 +198,6 @@ pub(crate) mod host_waits {
     }
 }
 
-/// Whether MLX's Metal backend is available on this host (cached; constant per
-/// process). False on the CUDA/Linux build, which must use synchronous eval to
-/// avoid the async-eval cross-stream `cu::AtomicEvent::wait` segfault.
-fn metal_backend_available() -> bool {
-    use std::sync::OnceLock;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| unsafe { sys::mlx_metal_is_available() })
-}
-
 #[napi]
 impl MxArray {
     #[napi]
@@ -240,30 +231,33 @@ impl MxArray {
         host_waits::end(watch);
     }
 
-    /// Asynchronously evaluate multiple arrays in parallel (non-blocking)
-    /// This allows overlapping GPU computation with CPU processing
-    pub(crate) fn async_eval_arrays(arrays: &[&MxArray]) {
+    /// Fire-and-forget overlap hint for pipelining next-step GPU work with CPU
+    /// bookkeeping. Runs `mlx_async_eval` on Metal; no-op off Metal so CUDA
+    /// never injects a blocking sync at overlap-only boundaries.
+    pub(crate) fn schedule_overlap(arrays: &[&MxArray]) {
+        if arrays.is_empty() || !crate::accelerator::supports_async_overlap() {
+            return;
+        }
+        let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
+        unsafe {
+            sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
+
+    /// Materialization barrier to break lazy graph growth between chunks/steps.
+    /// Uses non-blocking `mlx_async_eval` on Metal and synchronous `eval_native`
+    /// off Metal (where cross-stream async eval segfaults in `cu::AtomicEvent::wait`).
+    pub(crate) fn flush_graph_barrier(arrays: &[&MxArray]) {
         if arrays.is_empty() {
             return;
         }
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
-        // MLX-CUDA: async eval attaches a per-stream `Event` to each output
-        // (transforms.cpp, `async=true` branch). A later consumer hits the
-        // cross-stream `in.event().wait(stream)` path, which segfaults inside
-        // `cu::AtomicEvent::wait` on the CUDA backend. Synchronous eval takes the
-        // `async=false` branch and attaches no events, so it sidesteps the crash.
-        // Fall back to sync eval when the Metal backend is unavailable; macOS
-        // keeps the async overlap.
-        if !metal_backend_available() {
-            // Sync eval returns false if materialization threw. This path can't
-            // surface a Result (callers are fire-and-forget overlap evals), so
-            // record the failure through the configured tracing subscriber
-            // like `eval_arrays` does rather than dropping it silently.
+        if !crate::accelerator::supports_async_overlap() {
             if let Err(detail) = eval_native(&mut handles) {
                 tracing::error!(
                     target: "mlx_core::inference",
                     event = "mlx_eval_failed",
-                    context = "async_eval_arrays_sync_fallback",
+                    context = "flush_graph_barrier_sync_fallback",
                     array_count = handles.len(),
                     error = %detail,
                     "MLX array materialization failed"
@@ -274,6 +268,13 @@ impl MxArray {
         unsafe {
             sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
         }
+    }
+
+    /// Asynchronously evaluate multiple arrays in parallel (non-blocking on
+    /// Metal, synchronous barrier off Metal). Prefer [`Self::schedule_overlap`]
+    /// or [`Self::flush_graph_barrier`] at new call sites to make intent explicit.
+    pub(crate) fn async_eval_arrays(arrays: &[&MxArray]) {
+        Self::flush_graph_barrier(arrays);
     }
 
     /// Synchronously evaluate multiple arrays (blocking).

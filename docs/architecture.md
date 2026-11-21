@@ -20,6 +20,27 @@ speculative-decoding plan, see [inference-architecture.md](inference-architectur
 └────────────────────────────────────────────────────────────┘
 ```
 
+## Accelerator operation dispatch
+
+Model code dispatches at operation boundaries, not by growing model-specific
+platform branches. `crates/mlx-core/src/accelerator.rs` owns the shared CUDA
+availability predicate; each operation separately checks its shape, dtype, and
+numeric contract before selecting its CUDA implementation. Metal continues
+through its existing operation paths, including its existing execution-policy
+decisions.
+
+CUDA primitives in `mlx-sys` use `mlx_cuda_ops.h` for two shared responsibilities:
+making non-contiguous inputs valid for the encoded operation and keeping their
+copies alive, and loading NVRTC kernels under a source/entry/architecture cache
+key. Kernel source and primitive-specific output contracts stay beside the
+operation. Backend selection is automatic; adding an optimized operation does
+not require a new environment variable.
+
+For temporary accelerated weights, the projection owns the cache and defines
+its lifetime: large multi-row work can retain a dense copy, small packed batches
+and turn cleanup release it. This keeps memory policy visible at the same layer
+that chooses the matmul implementation.
+
 ## Memory model: unified memory decides the cache hierarchy
 
 MLX is built for Apple Silicon's unified memory — the CPU and the GPU address **one

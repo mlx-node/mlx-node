@@ -68,6 +68,31 @@ pub(crate) fn compute_layer_kinds(
     kinds
 }
 
+/// Input to a decoder layer when cross-layer `AddRMSNorm` fusion is active:
+/// either a materialized hidden state (layer 0 after embedding) or a deferred
+/// `(h, delta)` pair from the previous layer's MLP whose sum is fused with
+/// this layer's `input_layernorm` (or `final_norm` after the last layer).
+pub(crate) enum LayerResidual {
+    Hidden(MxArray),
+    Pending { h: MxArray, delta: MxArray },
+}
+
+impl LayerResidual {
+    pub(crate) fn seq_len(&self) -> Result<i64> {
+        match self {
+            Self::Hidden(x) => x.shape_at(1),
+            Self::Pending { h, .. } => h.shape_at(1),
+        }
+    }
+
+    pub(crate) fn into_hidden(self) -> Result<MxArray> {
+        match self {
+            Self::Hidden(x) => Ok(x),
+            Self::Pending { h, delta } => h.add(&delta),
+        }
+    }
+}
+
 /// A single decoder layer in the Qwen3.5 dense model.
 ///
 /// Each layer has:
@@ -82,6 +107,14 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        match &self.attn {
+            AttentionType::Linear(gdn) => gdn.clear_cuda_dense_prefill(),
+            AttentionType::Full(attention) => attention.clear_cuda_dense_prefill(),
+        }
+        self.mlp.clear_cuda_dense_prefill();
+    }
+
     /// `h = x + res` + `normed = norm(h)` — one Metal dispatch via the fused
     /// add_rmsnorm kernel when the contract holds, else the separate ops.
     /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
@@ -103,6 +136,50 @@ impl DecoderLayer {
     /// Whether this layer uses linear attention (derived from attention type).
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
+    }
+
+    /// Prefill tail pruning for the final layer when it is a FullAttention layer
+    /// past the last tap, preserving cross-layer `AddRMSNorm` fusion: resolves
+    /// `input` through `input_layernorm` (returning the completed previous
+    /// layer hidden state as the first tuple element), updates the KV cache for
+    /// all rows, and either skips Q/SDPA/O/MLP (`keep_last_row == false`) or
+    /// computes them only on the last row, returning `LayerResidual::Pending`
+    /// so `final_norm` fuses the last MLP residual too.
+    pub(crate) fn forward_final_prefill_pruned_pending(
+        &mut self,
+        input: &LayerResidual,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        keep_last_row: bool,
+    ) -> Result<Option<(MxArray, LayerResidual)>> {
+        let AttentionType::Full(attn) = &self.attn else {
+            return Ok(None);
+        };
+        let kv_cache = match cache {
+            Some(Qwen3_5LayerCache::FullAttention(kv)) => Some(kv),
+            None => None,
+            Some(Qwen3_5LayerCache::Linear(_)) => return Ok(None),
+        };
+        let seq_len = input.seq_len()?;
+        if seq_len <= 1 {
+            return Ok(None);
+        }
+        let (x, normed) = match input {
+            LayerResidual::Hidden(x) => (x.clone(), self.input_layernorm.forward(x)?),
+            LayerResidual::Pending { h, delta } => {
+                Self::add_residual_norm(&self.input_layernorm, h, delta)?
+            }
+        };
+        if !keep_last_row {
+            attn.forward_kv_only(&normed, kv_cache)?;
+            let last = x.slice_axis(1, seq_len - 1, seq_len)?;
+            return Ok(Some((x, LayerResidual::Hidden(last))));
+        }
+        let attn_last = attn.forward_last_row_prefill(&normed, kv_cache)?;
+        let x_last = x.slice_axis(1, seq_len - 1, seq_len)?;
+        let (h, post_normed) =
+            Self::add_residual_norm(&self.post_attention_layernorm, &x_last, &attn_last)?;
+        let mlp_out = self.mlp.forward(&post_normed)?;
+        Ok(Some((x, LayerResidual::Pending { h, delta: mlp_out })))
     }
 
     pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
@@ -200,10 +277,88 @@ impl DecoderLayer {
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
-
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         h.add(&self.mlp.forward(&normed)?)
+    }
+
+    /// Cross-layer `AddRMSNorm` variant of [`Self::forward_inner_with_tape`]:
+    /// resolves `input` through `input_layernorm` (fusing the previous layer's
+    /// MLP residual add into `input_layernorm` when `input` is
+    /// [`LayerResidual::Pending`]), runs the mixer (with optional CUDA deferred
+    /// GDN fold) and MLP, and returns `(completed_x, LayerResidual::Pending { h, delta })`.
+    /// `completed_x` is the previous layer's exact post-MLP hidden state.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn forward_inner_with_tape_pending(
+        &mut self,
+        input: LayerResidual,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+    ) -> Result<(MxArray, LayerResidual)> {
+        self.forward_inner_with_tape_pending_tree(
+            input,
+            mask,
+            cache,
+            position_ids,
+            use_kernel,
+            tape_sink,
+            cuda_deferred,
+            None,
+        )
+    }
+
+    /// Tree-verification variant of [`Self::forward_inner_with_tape_pending`]:
+    /// threads optional [`super::verify_tree::TreeDeviceViews`] into both
+    /// linear (GDN) and full-attention layers while preserving cross-layer
+    /// `AddRMSNorm` fusion (`tree_len <= 16`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_inner_with_tape_pending_tree(
+        &mut self,
+        input: LayerResidual,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<(MxArray, LayerResidual)> {
+        let (x, normed) = match input {
+            LayerResidual::Hidden(x) => {
+                let normed = self.input_layernorm.forward(&x)?;
+                (x, normed)
+            }
+            LayerResidual::Pending { h, delta } => {
+                Self::add_residual_norm(&self.input_layernorm, &h, &delta)?
+            }
+        };
+        let attn_out = match &mut self.attn {
+            AttentionType::Linear(gdn) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_with_tape_deferred_tree(
+                    &normed,
+                    mask,
+                    ac,
+                    use_kernel,
+                    tape_sink,
+                    cuda_deferred,
+                    tree,
+                )?
+            }
+            AttentionType::Full(attn) => {
+                let _ = tape_sink;
+                let _ = cuda_deferred;
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_tree(&normed, mask, kvc, position_ids, tree)?
+            }
+        };
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, &x, &attn_out)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok((x, LayerResidual::Pending { h, delta: mlp_out }))
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

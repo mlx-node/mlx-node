@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Shape-scoped T64 register-MMA output projection and explicit rollback.
 mod kquant_support;
 

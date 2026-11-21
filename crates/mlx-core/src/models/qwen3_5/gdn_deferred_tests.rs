@@ -316,6 +316,7 @@ fn from_outputs(mut outputs: Vec<MxArray>) -> GdnCompleteOut {
             v: iter.next().unwrap(),
             g: iter.next().unwrap(),
             beta: iter.next().unwrap(),
+            tiled_heads: true,
         },
         history: iter.next().unwrap(),
         prepared_sg8,
@@ -557,6 +558,7 @@ fn grouped_tape(tape: &GdnKernelTape, hk: i64, hv: i64) -> GdnKernelTape {
         v: tape.v.clone(),
         g: tape.g.clone(),
         beta: tape.beta.clone(),
+        tiled_heads: false,
     }
 }
 

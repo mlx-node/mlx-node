@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! The Tiled64 K-quant weight layout (`mlx_kquant.h`, mode suffix `@t64`):
 //! the row-major `.weight` / `.scales` / `.biases` bytes permuted so the 64
 //! rows of a tile interleave per 32-code unit. A pure permutation, so every

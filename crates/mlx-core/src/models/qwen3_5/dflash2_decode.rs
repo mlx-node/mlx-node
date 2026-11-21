@@ -3,7 +3,9 @@
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
+use crate::engine::backend::{
+    DsparkBackend, DsparkProposal, DsparkStepper, DsparkTreeGreedyResult, DsparkVerifyOutput,
+};
 use crate::engine::dspark_timeline::{self as timeline, Mark};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 
@@ -20,10 +22,27 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
+    verified_device_ids: Option<MxArray>,
     /// The lane's two GDN cells and pending tape: each verify folds the
     /// last commit's retained rows, each commit swaps parity. Lent to the
     /// target across the verify's claim ([`lend_lane`]).
     gdn_blobs: Option<GdnStateBlobs>,
+    flat_snapshot: Option<super::layer_cache::Qwen35FlatSnapshot>,
+    /// CUDA flat-verify deferred GDN fold slots (one per layer). `Some` when
+    /// `eager_flat && cuda_ops_available()` and every linear layer satisfies
+    /// `mlx_gdn_fused_step_deferred_cuda`'s contract; each cycle's commit
+    /// records `(tape, keep)` here so the next verify folds it in-register
+    /// instead of launching a separate 48-layer replay pass on commit.
+    cuda_pending_gdn: Option<Vec<Option<super::layer_cache::CudaPendingGdn>>>,
+    eager_flat: bool,
+    tree_enabled: bool,
+    tree_max_nodes: usize,
+    lookup_enabled: bool,
+    lookup_index: super::verify_tree::LookupIndex,
+    lookup_acceptance: super::verify_tree::LookupAcceptance,
+    verify_budget: super::verify_tree::VerifyBudget,
+    last_tree_is_chain: bool,
+    last_tree_len: usize,
     paged: PagedVerifyLane,
 }
 
@@ -533,7 +552,12 @@ impl Qwen35DFlash2Stepper<'_> {
     }
 
     fn ensure_clean(&self, operation: &str) -> Result<()> {
-        if self.tape.is_some() || self.tapped.is_some() || self.verified_ids.is_some() {
+        if self.tape.is_some()
+            || self.tapped.is_some()
+            || self.verified_ids.is_some()
+            || self.verified_device_ids.is_some()
+            || self.flat_snapshot.is_some()
+        {
             return Err(Error::from_reason(format!(
                 "Qwen3.8 DFlash2 {operation}: prior verify was not committed"
             )));
@@ -565,6 +589,64 @@ impl Qwen35DFlash2Stepper<'_> {
             &mut self.context,
             anchor,
         )
+    }
+
+    /// Verify through the device-agnostic flat forward. The snapshot owns
+    /// the pre-verify recurrent state and the logical full-attention offsets;
+    /// commit trims both to the accepted prefix.
+    fn flat_verify_array(&mut self, input: &MxArray) -> Result<DsparkVerifyOutput> {
+        let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
+        let started = std::time::Instant::now();
+        if input.size()? == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.8 DFlash2 verify block must not be empty",
+            ));
+        }
+        self.ensure_clean("verify")?;
+        debug_assert!(self.inner.paged_adapter.is_none());
+        let snapshot = super::layer_cache::snapshot_flat_dflash2(
+            self.inner
+                .caches
+                .as_deref()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+        )?;
+        let (logits, taps, tape) = super::model::forward_dflash2_eager_with_taps_deferred(
+            self.inner,
+            input,
+            &self.tap_layers,
+            true,
+            super::model::DFlash2LogitsSpan::All,
+            self.cuda_pending_gdn.as_deref_mut(),
+        )?;
+        self.flat_snapshot = Some(snapshot);
+        self.tape = Some(tape);
+        self.tapped = Some(taps);
+        if phase_time {
+            eprintln!("[dflash2-phase] flat-verify-build: {:?}", started.elapsed());
+            let eval_started = std::time::Instant::now();
+            MxArray::eval_arrays(&[&logits])?;
+            eprintln!(
+                "[dflash2-phase] flat-verify-eval: {:?}",
+                eval_started.elapsed()
+            );
+        }
+        Ok(DsparkVerifyOutput { logits })
+    }
+
+    fn flat_verify(&mut self, ids: &[u32]) -> Result<DsparkVerifyOutput> {
+        let input = MxArray::from_uint32(ids, &[1, ids.len() as i64])?;
+        let output = self.flat_verify_array(&input)?;
+        self.verified_ids = Some(ids.to_vec());
+        self.verified_device_ids = None;
+        Ok(output)
+    }
+
+    fn flat_verify_device(&mut self, ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        let input = ids.reshape(&[1, ids.size()? as i64])?;
+        let output = self.flat_verify_array(&input)?;
+        self.verified_ids = None;
+        self.verified_device_ids = Some(input);
+        Ok(output)
     }
 
     /// The verify on the pool: the 8 rows booked (Splash `Engine::workEndOf`
@@ -770,6 +852,178 @@ impl Qwen35DFlash2Stepper<'_> {
         )?;
         Ok(())
     }
+
+    fn append_tapped_tree(
+        &mut self,
+        tapped: &[MxArray],
+        accepted_nodes: &[usize],
+        is_contiguous_prefix: bool,
+        token_ids: &[u32],
+    ) -> Result<()> {
+        let draft = self
+            .inner
+            .dflash2
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
+        self.next_position = append_kept_tree_taps(
+            draft,
+            &mut self.context,
+            self.next_position,
+            tapped,
+            accepted_nodes,
+            is_contiguous_prefix,
+            token_ids,
+        )?;
+        Ok(())
+    }
+
+    fn commit_flat(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        if keep == 0 || keep > total_written {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 invalid commit keep={keep}, total={total_written}"
+            )));
+        }
+        let snapshot = self.flat_snapshot.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 flat commit has no target snapshot")
+        })?;
+        let tape = self
+            .tape
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no GDN tape"))?;
+        let tapped = self
+            .tapped
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no target taps"))?;
+        let verified_ids = match self.verified_ids.take() {
+            Some(ids) => ids,
+            None => {
+                let ids = self.verified_device_ids.take().ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 commit has no token provenance")
+                })?;
+                // Acceptance has already synchronized the target graph. Read
+                // provenance here instead of serializing draft and verify.
+                DraftedProposals::Device(ids).host()?
+            }
+        };
+        if verified_ids.len() != total_written {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 commit wrote {total_written} rows for {} token ids",
+                verified_ids.len()
+            )));
+        }
+        let caches = self
+            .inner
+            .caches
+            .as_deref_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+        if let Some(pending) = self.cuda_pending_gdn.as_mut() {
+            super::layer_cache::commit_flat_dflash2_deferred(
+                caches,
+                &snapshot,
+                &tape,
+                keep,
+                pending,
+                "Qwen3.8 DFlash2 flat commit",
+            )?;
+        } else {
+            super::layer_cache::replay_flat_dflash2_snapshot_to(
+                caches,
+                &snapshot,
+                &tape,
+                keep,
+                "Qwen3.8 DFlash2 flat commit",
+            )?;
+        }
+        self.append_tapped(&tapped, &verified_ids[..keep])
+    }
+
+    /// Asynchronously flush `prev_commit + draft_propose` onto CUDA's single
+    /// default GPU stream right before `flat_verify_array` spends 1.5-2.5 ms on
+    /// CPU building the 64-layer target verify graph.
+    ///
+    /// Calls `mlx_sys::mlx_async_eval` directly (not `MxArray::async_eval_arrays`,
+    /// which falls back to synchronous blocking eval off Metal). Single-stream
+    /// safety: on CUDA `Stream::generation()` collapses to
+    /// `Stream::default(DeviceType::Gpu)` and `async_eval` records a GPU
+    /// `CopyableCudaEvent` (`signal_value == 1`, zero cross-stream
+    /// `AtomicEvent::wait`), so `flat-verify-eval` executes strictly in stream
+    /// order right behind `prev_commit + draft_propose`.
+    fn cuda_async_flush_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("MLX_DFLASH2_CUDA_ASYNC_FLUSH").map_or(true, |v| v != "0")
+        })
+    }
+
+    fn cuda_gpu_tree_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("MLX_DFLASH2_GPU_TREE").map_or(true, |v| v != "0"))
+    }
+
+    fn async_flush_cuda_tree_select(&self, sel: &crate::kernels::dflash2::SelectTreeOutputs) {
+        if !Self::cuda_async_flush_enabled() {
+            return;
+        }
+        let mut arrays: Vec<&MxArray> = vec![
+            &sel.tree_tokens,
+            &sel.parent,
+            &sel.depths,
+            &sel.ancestors_mask,
+            &sel.conv_taps,
+            &sel.node_meta,
+        ];
+        self.context.collect_arrays(&mut arrays);
+        let mut handles: Vec<*mut mlx_sys::mlx_array> =
+            arrays.iter().map(|arr| arr.as_raw_ptr()).collect();
+        unsafe {
+            mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
+
+    fn async_flush_cuda_propose(&self, proposal: &DsparkProposal) {
+        if !Self::cuda_async_flush_enabled() {
+            return;
+        }
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        if let Some(ids) = proposal.device_draft_ids.as_ref() {
+            arrays.push(ids);
+        }
+        if let Some(sparse) = proposal.device_draft_sparse.as_ref() {
+            arrays.push(&sparse.ids);
+            arrays.push(&sparse.probs);
+        }
+        self.context.collect_arrays(&mut arrays);
+        crate::models::forward::CollectCacheArrays::collect_arrays(&self.inner.caches, &mut arrays);
+        if arrays.is_empty() {
+            return;
+        }
+        let mut handles: Vec<*mut mlx_sys::mlx_array> =
+            arrays.iter().map(|arr| arr.as_raw_ptr()).collect();
+        unsafe {
+            mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
+
+    /// Asynchronously flush `commit_tree`'s KV compaction, GDN conv replay,
+    /// and draft-context update onto CUDA's single default stream so they
+    /// overlap with host token emission, SAM updates, and the next cycle's
+    /// `propose_tree_lattice` graph build.
+    fn async_flush_cuda_state(&self) {
+        if !Self::cuda_async_flush_enabled() {
+            return;
+        }
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        self.context.collect_arrays(&mut arrays);
+        crate::models::forward::CollectCacheArrays::collect_arrays(&self.inner.caches, &mut arrays);
+        if arrays.is_empty() {
+            return;
+        }
+        let mut handles: Vec<*mut mlx_sys::mlx_array> =
+            arrays.iter().map(|arr| arr.as_raw_ptr()).collect();
+        unsafe {
+            mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
 }
 
 /// A greedy draft of the 7 proposals after `anchor` from `ring` (no
@@ -883,6 +1137,39 @@ pub(crate) fn append_kept_taps(
     Ok(position.saturating_add(keep as i32))
 }
 
+/// Tree-verify counterpart to [`append_kept_taps`]: reuses the zero-copy
+/// `slice_axis` fast path when `is_contiguous_prefix`, otherwise gathers the
+/// accepted tree rows via `take(axis = 1)`.
+pub(crate) fn append_kept_tree_taps(
+    draft: &super::dflash2::DFlash2Model,
+    ring: &mut DFlash2ContextCache,
+    position: i32,
+    tapped: &[MxArray],
+    accepted_nodes: &[usize],
+    is_contiguous_prefix: bool,
+    token_ids: &[u32],
+) -> Result<i32> {
+    if is_contiguous_prefix {
+        return append_kept_taps(draft, ring, position, tapped, token_ids);
+    }
+    let keep = token_ids.len();
+    if accepted_nodes.len() != keep {
+        return Err(Error::from_reason(format!(
+            "Qwen3.8 DFlash2 tree taps length mismatch: nodes={}, tokens={keep}",
+            accepted_nodes.len()
+        )));
+    }
+    let indices: Vec<i32> = accepted_nodes.iter().map(|&n| n as i32).collect();
+    let idx = MxArray::from_int32(&indices, &[keep as i64])?;
+    let mut kept = Vec::with_capacity(tapped.len());
+    for hidden in tapped {
+        kept.push(hidden.take(&idx, 1)?);
+    }
+    let fused = draft.fuse_context(&kept)?;
+    ring.append(draft, &fused, position, token_ids)?;
+    Ok(position.saturating_add(keep as i32))
+}
+
 impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     fn device_sampled_rows(&self) -> bool {
         true
@@ -910,19 +1197,31 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             params,
             rng,
         )?;
-        self.paged.drafted = Some(drafted);
+        if !self.eager_flat {
+            self.paged.drafted = Some(drafted);
+        }
         proposal.truncate(max_len);
+        if self.eager_flat && crate::accelerator::cuda_ops_available() {
+            self.async_flush_cuda_propose(&proposal);
+        }
         timeline::mark(Mark::DraftSubmit);
         Ok(proposal)
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+        if self.eager_flat {
+            return self.flat_verify(verify_ids);
+        }
         self.paged_verify(VerifyIds::Host(verify_ids))
     }
 
     /// The verify graph embeds the device ids and is built while the draft
-    /// runs; the host ids are read back once the verify is queued.
+    /// runs; the host ids are read back once the verify is queued. On the
+    /// off-Metal eager flat lane, verify runs directly against the flat cache.
     fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        if self.eager_flat {
+            return self.flat_verify_device(verify_ids);
+        }
         let device_draft = matches!(self.paged.drafted, Some(DraftedProposals::Device(_)));
         #[cfg(test)]
         let device_draft = device_draft && !verify_order::READ_BACK_FIRST.with(|first| first.get());
@@ -935,6 +1234,9 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     }
 
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        if self.eager_flat {
+            return self.commit_flat(keep, total_written);
+        }
         if keep == 0 || keep > total_written {
             return Err(Error::from_reason(format!(
                 "Qwen3.8 DFlash2 invalid commit keep={keep}, total={total_written}"
@@ -982,6 +1284,22 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
+        if self.verified_ids.is_none()
+            && let Some(device) = self.verified_device_ids.as_ref()
+        {
+            #[cfg(any(debug_assertions, test))]
+            {
+                let expected = DraftedProposals::Device(device.clone()).host()?;
+                if expected.as_slice() != verified_ids {
+                    return Err(Error::from_reason(
+                        "Qwen3.8 DFlash2 supplied commit provenance disagrees with device verify input",
+                    ));
+                }
+            }
+            let _ = device;
+            self.verified_device_ids = None;
+            self.verified_ids = Some(verified_ids.to_vec());
+        }
         match &self.verified_ids {
             Some(expected) if expected.as_slice() == verified_ids => {}
             Some(_) => {
@@ -1000,6 +1318,24 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
 
     fn finish(mut self) -> Result<()> {
         self.ensure_clean("finish")?;
+        if self.eager_flat {
+            if let Some(mut pending) = self.cuda_pending_gdn.take() {
+                let caches = self.inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 target caches are absent")
+                })?;
+                super::layer_cache::settle_flat_dflash2_deferred(caches, &mut pending)?;
+            }
+            let config = self
+                .inner
+                .dflash2
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
+                .config
+                .clone();
+            let context = std::mem::replace(&mut self.context, DFlash2ContextCache::new(&config));
+            self.inner.dflash2_context = Some(context);
+            return Ok(());
+        }
         let caches = self
             .inner
             .caches
@@ -1022,11 +1358,392 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     }
 
     fn eval_boundary(&self, token: &MxArray) {
+        if !crate::accelerator::supports_async_overlap() {
+            return;
+        }
         let mut arrays: Vec<&MxArray> = Vec::new();
         crate::models::forward::CollectCacheArrays::collect_arrays(&self.inner.caches, &mut arrays);
         self.context.collect_arrays(&mut arrays);
         arrays.push(token);
-        MxArray::async_eval_arrays(&arrays);
+        MxArray::schedule_overlap(&arrays);
+    }
+
+    fn supports_tree_verify(&self) -> bool {
+        self.tree_enabled
+    }
+
+    fn observe_emitted_tokens(&mut self, tokens: &[u32]) {
+        if self.tree_enabled && self.lookup_enabled && !tokens.is_empty() {
+            self.lookup_index.append(tokens);
+        }
+    }
+
+    fn verify_tree_greedy(
+        &mut self,
+        anchor: u32,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<DsparkTreeGreedyResult> {
+        let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
+        let started = std::time::Instant::now();
+        if !self.tree_enabled || self.cuda_pending_gdn.is_none() {
+            return Err(Error::from_reason(
+                "Qwen3.8 DFlash2 tree verification is not enabled on this stepper",
+            ));
+        }
+        self.ensure_clean("verify_tree")?;
+        debug_assert!(self.inner.paged_adapter.is_none());
+
+        let draft_slots = self
+            .inner
+            .dflash2
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
+            .config
+            .block_size;
+        let (candidates, scores) = {
+            let draft = self
+                .inner
+                .dflash2
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
+            draft.propose_tree_lattice_arrays(
+                &self.inner.embedding,
+                self.inner.lm_head.as_ref(),
+                &mut self.context,
+                anchor,
+                draft_slots,
+            )?
+        };
+        let after_propose = std::time::Instant::now();
+
+        let lookup_info = self.lookup_index.match_info();
+        let eff_max_depth = max_depth.min(super::verify_tree::MAX_LOOKUP_CHAIN);
+        let node_budget = max_nodes
+            .min(self.tree_max_nodes)
+            .clamp(1, super::verify_tree::MAX_TREE_NODES);
+        let lookup_cap = super::verify_tree::MAX_LOOKUP_CHAIN.min(eff_max_depth);
+        let lookup_proposals = if self.lookup_enabled && lookup_cap > 0 {
+            self.lookup_index.proposals(lookup_cap)
+        } else {
+            Vec::new()
+        };
+        let lookup_len = if lookup_info.match_len >= super::verify_tree::LookupIndex::MIN_MATCH {
+            lookup_proposals
+                .len()
+                .min(super::verify_tree::MAX_LOOKUP_CHAIN)
+        } else {
+            0
+        };
+
+        let gpu_sel = if crate::accelerator::cuda_ops_available() && Self::cuda_gpu_tree_enabled() {
+            let mut lt = [0i32; super::verify_tree::MAX_TREE_NODES];
+            for (dst, &tok) in lt.iter_mut().zip(lookup_proposals.iter().take(lookup_len)) {
+                *dst = tok as i32;
+            }
+            let mut lr = [0.0f32; super::verify_tree::MAX_TREE_NODES * 4];
+            if lookup_len > 0 {
+                let agreements = [
+                    super::verify_tree::LookupAgreement::Top,
+                    super::verify_tree::LookupAgreement::Candidate,
+                    super::verify_tree::LookupAgreement::Absent,
+                    super::verify_tree::LookupAgreement::Unknown,
+                ];
+                for d in 0..lookup_len {
+                    for &ag in &agreements {
+                        lr[d * 4 + ag as usize] =
+                            self.lookup_acceptance
+                                .rate(false, lookup_info.match_len, d, ag);
+                    }
+                }
+            }
+            let budget_acc = self.verify_budget.acceptance(false);
+            let mut bi = [0.0f32; 8];
+            bi[..super::verify_tree::DRAFT_SLOTS].copy_from_slice(&budget_acc.intercepts);
+
+            let lookup_tokens_arr =
+                MxArray::from_int32(&lt, &[super::verify_tree::MAX_TREE_NODES as i64])?;
+            let lookup_rates_arr =
+                MxArray::from_float32(&lr, &[super::verify_tree::MAX_TREE_NODES as i64, 4])?;
+            let budget_intercepts_arr = MxArray::from_float32(&bi, &[8])?;
+            crate::kernels::dflash2::select_tree_cuda(
+                &candidates,
+                &scores,
+                &lookup_tokens_arr,
+                &lookup_rates_arr,
+                &budget_intercepts_arr,
+                anchor,
+                lookup_len as i32,
+                node_budget as i32,
+                eff_max_depth as i32,
+                budget_acc.slope,
+            )?
+        } else {
+            None
+        };
+
+        let (
+            tree,
+            snapshot,
+            tape,
+            taps,
+            walk,
+            is_chain,
+            is_full_chain,
+            after_build_tree,
+            after_verify_build,
+            gpu_path,
+        ) = if let Some(sel) = gpu_sel {
+            // Immediately flush `prev_commit + draft + select_tree_cuda` onto
+            // CUDA's single stream before building the 64-layer target graph.
+            self.async_flush_cuda_tree_select(&sel);
+            let snapshot = super::layer_cache::snapshot_flat_dflash2(
+                self.inner.caches.as_deref().ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 target caches are absent")
+                })?,
+            )?;
+            let views = super::verify_tree::TreeDeviceViews {
+                depths_i32: sel.depths,
+                mask_u32: sel.ancestors_mask,
+                parent_i32: sel.parent.clone(),
+                conv_taps_i32: sel.conv_taps,
+                tree_len: node_budget,
+            };
+            let after_build_tree = std::time::Instant::now();
+            let (logits, taps, tape) = super::model::forward_dflash2_eager_with_taps_deferred_tree(
+                self.inner,
+                &sel.tree_tokens,
+                &self.tap_layers,
+                true,
+                super::model::DFlash2LogitsSpan::All,
+                self.cuda_pending_gdn.as_deref_mut(),
+                Some(&views),
+            )?;
+            let argmax = logits.argmax(-1, None)?;
+            let after_verify_build = std::time::Instant::now();
+            MxArray::eval_arrays_with_context(
+                &[&argmax, &sel.tree_tokens, &sel.parent, &sel.node_meta],
+                "speculative_tree_greedy_accept",
+            )?;
+            timeline::mark(Mark::VerifyWait);
+
+            let target_argmax_all: Vec<u32> = argmax.to_uint32()?.to_vec();
+            let raw_tokens: Vec<u32> = sel.tree_tokens.to_uint32()?.to_vec();
+            let raw_parent: Vec<i32> = sel.parent.to_int32()?.to_vec();
+            let raw_meta: Vec<f32> = sel.node_meta.to_float32()?.to_vec();
+            if target_argmax_all.len() != node_budget {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.8 DFlash2 GPU tree argmax length {} != node_budget {}",
+                    target_argmax_all.len(),
+                    node_budget
+                )));
+            }
+            let (tree, agreements, is_chain) = super::verify_tree::VerifyTree::from_gpu_readback(
+                &raw_tokens,
+                &raw_parent,
+                &raw_meta,
+            )?;
+            let walk = tree.greedy_walk(&target_argmax_all[..tree.len()]);
+
+            let labels = tree.budget_labels(&walk.emitted_tokens);
+            self.verify_budget.observe(false, &labels);
+            if lookup_len > 0 {
+                let outcome = tree.lookup_outcome_with_agreements(
+                    &lookup_proposals[..lookup_len],
+                    &walk.emitted_tokens,
+                    &agreements,
+                );
+                self.lookup_acceptance.observe(
+                    false,
+                    lookup_info.match_len,
+                    &outcome.verified,
+                    outcome.accepted,
+                );
+            }
+            let is_full_chain = is_chain && tree.len() == node_budget;
+            (
+                tree,
+                snapshot,
+                tape,
+                taps,
+                walk,
+                is_chain,
+                is_full_chain,
+                after_build_tree,
+                after_verify_build,
+                true,
+            )
+        } else {
+            let lattice = {
+                let draft = self
+                    .inner
+                    .dflash2
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
+                draft.lattice_from_arrays(&candidates, &scores, draft_slots)?
+            };
+            let tree = super::verify_tree::build_verify_tree(
+                anchor,
+                &lattice,
+                &lookup_proposals,
+                lookup_info.match_len,
+                node_budget,
+                Some(eff_max_depth),
+                false,
+                &self.verify_budget,
+                &self.lookup_acceptance,
+            );
+            let views = tree.to_device_views()?;
+            let ids = MxArray::from_uint32(&tree.tokens, &[1, tree.len() as i64])?;
+            let snapshot = super::layer_cache::snapshot_flat_dflash2(
+                self.inner.caches.as_deref().ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 target caches are absent")
+                })?,
+            )?;
+            let after_build_tree = std::time::Instant::now();
+            let (logits, taps, tape) = super::model::forward_dflash2_eager_with_taps_deferred_tree(
+                self.inner,
+                &ids,
+                &self.tap_layers,
+                true,
+                super::model::DFlash2LogitsSpan::All,
+                self.cuda_pending_gdn.as_deref_mut(),
+                Some(&views),
+            )?;
+            let argmax = logits.argmax(-1, None)?;
+            let after_verify_build = std::time::Instant::now();
+            MxArray::eval_arrays_with_context(&[&argmax], "speculative_tree_greedy_accept")?;
+            timeline::mark(Mark::VerifyWait);
+            let target_argmax: Vec<u32> = argmax.to_uint32()?.to_vec();
+            if target_argmax.len() != tree.len() {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.8 DFlash2 tree argmax length {} != tree length {}",
+                    target_argmax.len(),
+                    tree.len()
+                )));
+            }
+            let walk = tree.greedy_walk(&target_argmax);
+
+            let labels = tree.budget_labels(&walk.emitted_tokens);
+            self.verify_budget.observe(false, &labels);
+            if lookup_len > 0 {
+                let outcome = tree.lookup_outcome(
+                    &lookup_proposals[..lookup_len],
+                    &walk.emitted_tokens,
+                    &lattice,
+                );
+                self.lookup_acceptance.observe(
+                    false,
+                    lookup_info.match_len,
+                    &outcome.verified,
+                    outcome.accepted,
+                );
+            }
+            let is_chain = tree.is_chain();
+            (
+                tree,
+                snapshot,
+                tape,
+                taps,
+                walk,
+                is_chain,
+                is_chain,
+                after_build_tree,
+                after_verify_build,
+                false,
+            )
+        };
+
+        let draft_count = tree.depth.iter().copied().max().unwrap_or(0).max(0) as usize;
+        let accepted_draft_count = walk.accepted_nodes.len().saturating_sub(1);
+        let tree_nodes = tree.len();
+        if phase_time {
+            eprintln!(
+                "[dflash2-phase] tree(gpu={gpu_path},T={tree_nodes},chain={is_chain},match={},acc={accepted_draft_count}/{draft_count}): propose={:?} build_tree={:?} verify_build={:?} verify_eval={:?}",
+                lookup_info.match_len,
+                after_propose.duration_since(started),
+                after_build_tree.duration_since(after_propose),
+                after_verify_build.duration_since(after_build_tree),
+                after_verify_build.elapsed(),
+            );
+        }
+
+        self.flat_snapshot = Some(snapshot);
+        self.tape = Some(tape);
+        self.tapped = Some(taps);
+        self.verified_ids = Some(tree.tokens);
+        self.verified_device_ids = None;
+        self.last_tree_is_chain = is_full_chain;
+        self.last_tree_len = tree_nodes;
+
+        Ok(DsparkTreeGreedyResult {
+            emitted_tokens: walk.emitted_tokens,
+            accepted_nodes: walk.accepted_nodes,
+            is_contiguous_prefix: walk.is_contiguous_prefix,
+            draft_count,
+            tree_nodes,
+            accepted_draft_count,
+        })
+    }
+
+    fn commit_tree(&mut self, accepted_nodes: &[usize], is_contiguous_prefix: bool) -> Result<()> {
+        let keep = accepted_nodes.len();
+        if keep == 0 || keep > self.last_tree_len || accepted_nodes[0] != 0 {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 invalid tree commit accepted_nodes={accepted_nodes:?}, tree_len={}",
+                self.last_tree_len
+            )));
+        }
+        let snapshot = self.flat_snapshot.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 tree commit has no target snapshot")
+        })?;
+        let tape = self
+            .tape
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 tree commit has no GDN tape"))?;
+        let tapped = self
+            .tapped
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 tree commit has no target taps"))?;
+        let verified_ids = self.verified_ids.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 tree commit has no token provenance")
+        })?;
+        self.verified_device_ids = None;
+        if verified_ids.len() != self.last_tree_len {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 tree commit wrote {} rows for {} token ids",
+                self.last_tree_len,
+                verified_ids.len()
+            )));
+        }
+        let caches = self
+            .inner
+            .caches
+            .as_deref_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+        let pending = self.cuda_pending_gdn.as_mut().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 tree commit requires CUDA deferred GDN state")
+        })?;
+        super::layer_cache::commit_tree_dflash2_deferred(
+            caches,
+            &snapshot,
+            &tape,
+            accepted_nodes,
+            is_contiguous_prefix,
+            self.last_tree_is_chain,
+            pending,
+            "qwen3_5::dflash2::commit_tree",
+        )?;
+        let kept_tokens: Vec<u32> = if is_contiguous_prefix {
+            verified_ids[..keep].to_vec()
+        } else {
+            accepted_nodes.iter().map(|&n| verified_ids[n]).collect()
+        };
+        self.append_tapped_tree(&tapped, accepted_nodes, is_contiguous_prefix, &kept_tokens)?;
+        if self.eager_flat && crate::accelerator::cuda_ops_available() {
+            self.async_flush_cuda_state();
+        }
+        Ok(())
     }
 }
 
@@ -1058,26 +1775,37 @@ impl DsparkBackend for Qwen35Inner {
             .config
             .target_layers
             .clone();
-        // Pack the prefill's per-layer GDN states once per turn (two concats)
-        // into the lane's current cell; nothing is pending after a prefill.
-        let tiled = self.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
-        let caches = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        let gdn_blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
-            Error::from_reason("Qwen3.8 DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)")
-        })?;
-        gdn_blobs.apply_views(caches)?;
-        let seq = self
-            .paged_adapter
-            .as_ref()
-            .and_then(
-                crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::active_seq_id,
-            )
-            .ok_or_else(|| {
-                Error::from_reason("Qwen3.8 DFlash2 paged turn has no active request")
+        let eager_flat = self.paged_adapter.is_none();
+        // Metal packs the prefill's per-layer GDN states into the paged lane's
+        // current cell. The off-Metal lane snapshots those arrays per verify.
+        let gdn_blobs = if eager_flat {
+            None
+        } else {
+            let tiled = self.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
+            let caches = self
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+            let blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
+                Error::from_reason(
+                    "Qwen3.8 DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)",
+                )
             })?;
+            blobs.apply_views(caches)?;
+            Some(blobs)
+        };
+        let seq = if eager_flat {
+            0
+        } else {
+            self.paged_adapter
+                .as_ref()
+                .and_then(
+                    crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::active_seq_id,
+                )
+                .ok_or_else(|| {
+                    Error::from_reason("Qwen3.8 DFlash2 paged turn has no active request")
+                })?
+        };
         let context_window = self.pool_context_limit();
         let paged = PagedVerifyLane {
             seq,
@@ -1091,9 +1819,44 @@ impl DsparkBackend for Qwen35Inner {
                 )),
             ),
         };
-        if self.active_scheduled_seq.is_none() {
+        if !eager_flat && self.active_scheduled_seq.is_none() {
             self.serial_decode = Some(crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2);
         }
+        let cuda_deferred_eligible = eager_flat
+            && crate::accelerator::cuda_ops_available()
+            && !std::env::var("MLX_DFLASH2_CUDA_DEFERRED").is_ok_and(|v| v == "0")
+            && expected <= 16
+            && self.config.linear_key_head_dim == 128
+            && self.config.linear_value_head_dim == 128
+            && self.config.linear_num_key_heads > 0
+            && self.config.linear_num_value_heads > 0
+            && self.config.linear_num_value_heads % self.config.linear_num_key_heads == 0
+            && self.caches.as_deref().is_some_and(|caches| {
+                caches.iter().all(|c| match c {
+                    super::layer_cache::Qwen3_5LayerCache::FullAttention(_) => true,
+                    super::layer_cache::Qwen3_5LayerCache::Linear(arrays) => {
+                        arrays.get(0).and_then(|a| a.dtype().ok()) == Some(DType::BFloat16)
+                            && arrays.get(1).and_then(|a| a.dtype().ok()) == Some(DType::Float32)
+                    }
+                })
+            })
+            && self.layers.iter().all(|layer| match &layer.attn {
+                super::decoder_layer::AttentionType::Full(_) => true,
+                super::decoder_layer::AttentionType::Linear(gdn) => gdn.is_cuda_deferred_eligible(),
+            });
+        let cuda_pending_gdn = if cuda_deferred_eligible {
+            Some(vec![None; self.layers.len()])
+        } else {
+            None
+        };
+        let tree_enabled = cuda_pending_gdn.is_some()
+            && std::env::var("MLX_DFLASH2_TREE").ok().as_deref() != Some("0");
+        let tree_max_nodes = std::env::var("MLX_DFLASH2_TREE_MAX_NODES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(super::verify_tree::MAX_TREE_NODES)
+            .clamp(2, super::verify_tree::MAX_TREE_NODES);
+        let lookup_enabled = std::env::var("MLX_DFLASH2_LOOKUP").ok().as_deref() != Some("0");
         timeline::begin_turn();
         Ok(Qwen35DFlash2Stepper {
             inner: self,
@@ -1103,7 +1866,19 @@ impl DsparkBackend for Qwen35Inner {
             tape: None,
             tapped: None,
             verified_ids: None,
-            gdn_blobs: Some(gdn_blobs),
+            verified_device_ids: None,
+            gdn_blobs,
+            flat_snapshot: None,
+            cuda_pending_gdn,
+            eager_flat,
+            tree_enabled,
+            tree_max_nodes,
+            lookup_enabled,
+            lookup_index: super::verify_tree::LookupIndex::new(),
+            lookup_acceptance: super::verify_tree::LookupAcceptance::new(),
+            verify_budget: super::verify_tree::VerifyBudget::new(),
+            last_tree_is_chain: true,
+            last_tree_len: 0,
             paged,
         })
     }
@@ -1113,6 +1888,11 @@ impl Drop for Qwen35DFlash2Stepper<'_> {
     fn drop(&mut self) {
         timeline::end_turn();
         self.inner.serial_decode = None;
+        if let Some(mut pending) = self.cuda_pending_gdn.take()
+            && let Some(caches) = self.inner.caches.as_mut()
+        {
+            let _ = super::layer_cache::settle_flat_dflash2_deferred(caches, &mut pending);
+        }
         // A turn that failed between the verify write and its commit leaves
         // the cycle open; keeping every row closes the ticket, and the
         // turn's abort releases the request.
@@ -1701,6 +2481,136 @@ pub(crate) mod tests {
         let mut tokens = body.to_vec();
         tokens.extend(GENERATION_PROMPT);
         tokens
+    }
+
+    fn flat_greedy_reference(
+        inner: &mut Qwen35Inner,
+        prompt: &[u32],
+        count: usize,
+    ) -> Result<Vec<u32>> {
+        inner.reset_caches_sync()?;
+        inner.init_caches_sync()?;
+        let tap_layers = inner
+            .dflash2
+            .as_ref()
+            .expect("tiny draft")
+            .config
+            .target_layers
+            .clone();
+        let argmax = |logits: &MxArray| -> Result<u32> {
+            let ids = logits.argmax(-1, None)?;
+            ids.eval();
+            Ok(ids.to_int32()?[0] as u32)
+        };
+        let mut forward = |ids: &[u32]| -> Result<u32> {
+            let input = MxArray::from_uint32(ids, &[1, ids.len() as i64])?;
+            let (logits, _, _) = super::super::model::forward_dflash2_eager_with_taps(
+                inner,
+                &input,
+                &tap_layers,
+                false,
+                super::super::model::DFlash2LogitsSpan::LastRow,
+            )?;
+            argmax(&logits)
+        };
+        let mut generated = vec![forward(prompt)?];
+        while generated.len() < count {
+            let last = *generated.last().expect("one generated token");
+            generated.push(forward(&[last])?);
+        }
+        Ok(generated)
+    }
+
+    #[test]
+    fn eager_flat_dflash2_turn_matches_greedy_ar_and_saves_aligned_caches() -> Result<()> {
+        use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
+        use crate::engine::plan::{
+            DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+        };
+        use crate::stream::{Stream, StreamContext};
+
+        const N: usize = 24;
+        let prompt = (0..40u32).map(|i| (i * 7 + 3) % 16).collect::<Vec<_>>();
+        let mut ar = tiny_dflash_inner_with_config(0xDFA5_F147, |config| {
+            config.vocab_size = 16;
+        });
+        let reference = flat_greedy_reference(&mut ar, &prompt, N)?;
+        let mut inner = tiny_dflash_inner_with_config(0xDFA5_F147, |config| {
+            config.vocab_size = 16;
+        });
+        let tokenizer = content_tokenizer();
+        let config = crate::engine::types::ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(N as i32),
+            reasoning_effort: Some("none".to_string()),
+            report_performance: Some(true),
+            reuse_cache: Some(true),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            ..Default::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let mut args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let TurnOutput::Complete(result) =
+            ChatBackend::run_speculative_turn(&mut inner, &mut args)?
+        else {
+            panic!("a sync flat DFlash2 turn completes");
+        };
+        assert_eq!(result.num_tokens as usize, N);
+        assert_eq!(result.prompt_tokens as usize, prompt.len());
+        assert_eq!(result.cached_tokens, 0, "the off-Metal draft starts cold");
+        assert_eq!(result.finish_reason, "length");
+        assert!(
+            result
+                .performance
+                .as_ref()
+                .and_then(|performance| performance.mtp_cycles)
+                .is_some_and(|cycles| cycles > 0),
+            "the turn must execute DFlash2 cycles"
+        );
+
+        let mut expected_history = prompt.clone();
+        expected_history.extend_from_slice(&reference[..N - 1]);
+        assert_eq!(inner.cached_token_history, expected_history);
+        for cache in inner.caches.as_deref().unwrap_or(&[]) {
+            if let crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache::FullAttention(kv) = cache
+            {
+                assert_eq!(kv.get_offset() as usize, inner.cached_token_history.len());
+            }
+        }
+        drop(_ctx);
+        drop(inner);
+        drop(ar);
+        // Direct test threads do not pass through model_thread's Windows
+        // shutdown hook; release cuDNN before their TLS destructors run.
+        #[cfg(windows)]
+        unsafe {
+            mlx_sys::mlx_clear_streams();
+        }
+        Ok(())
     }
 
     /// A greedy `chatSessionStart` of one user message of `body` for
@@ -2903,25 +3813,48 @@ pub(crate) mod paged_dflash2_tests {
         Ok(())
     }
 
-    /// A draft needs the pool, and with one the plan routes DFlash2 turns to
-    /// the paged lane. Mutation L1 (the check passes without a pool) turns
-    /// it red.
+    /// A draft uses the pool on Metal and the speculative flat lane off
+    /// Metal. Mutation L1 (requiring a pool in both cases) turns this red.
     #[test]
-    fn dflash2_companion_needs_the_pool() {
+    fn dflash2_companion_selects_pool_or_flat_backend() {
         use crate::engine::backend::ChatBackend;
         use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
-        let mut inner = tiny_paged_int8_dflash_inner(0x5_8008);
+        if super::tests::metal_is_default_device() {
+            let inner = tiny_paged_int8_dflash_inner(0x5_8008);
+            inner
+                .require_dflash2_pool()
+                .expect("a pool admits the draft");
+            let plan = inner.execution_plan();
+            assert!(
+                plan.speculative
+                    .expect("draft plan")
+                    .supports_paged_attention
+            );
+            let turn = TurnPlan::resolve(
+                plan,
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming: false,
+                },
+            );
+            assert!(matches!(turn.path(), TurnPath::Paged));
+        }
+        let inner = super::tests::tiny_dflash_inner_with_config(0x5_8008, |_| {});
         inner
             .require_dflash2_pool()
-            .expect("a pool admits the draft");
-        let plan = inner.execution_plan();
+            .expect("the eager flat lane admits the draft off Metal");
+        let flat = inner.execution_plan();
         assert!(
-            plan.speculative
-                .expect("draft plan")
+            !flat
+                .speculative
+                .expect("flat draft plan")
                 .supports_paged_attention
         );
-        let turn = TurnPlan::resolve(
-            plan,
+        let flat_turn = TurnPlan::resolve(
+            flat,
             TurnRequest {
                 is_delta: false,
                 input_media: MediaCapabilities::NONE,
@@ -2930,14 +3863,7 @@ pub(crate) mod paged_dflash2_tests {
                 streaming: false,
             },
         );
-        assert!(matches!(turn.path(), TurnPath::Paged));
-        inner.paged_adapter = None;
-        let refused = inner.require_dflash2_pool().expect_err("no pool, no draft");
-        assert!(
-            refused.reason.contains("runs on the block-paged KV pool"),
-            "{}",
-            refused.reason
-        );
+        assert!(matches!(flat_turn.path(), TurnPath::Speculative));
     }
 
     /// The paged DSpark driver runs on the session's params, the copy a

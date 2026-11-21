@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -17,7 +18,7 @@ use rand::{Rng, RngExt};
 use serde::Deserialize;
 
 use crate::array::attention::scaled_dot_product_attention;
-use crate::array::{DType, MxArray};
+use crate::array::{DType, MxArray, MxHandle};
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::models::qwen3_5::draft_context::{DRAFT_CONTEXT_GROUP, DraftContextWindow};
@@ -31,6 +32,42 @@ pub(crate) const DFLASH2_DRAFT_PROPOSALS: usize = 7;
 /// Rows of the one verify graph: the anchor and the proposals (Splash
 /// `SPLASH_TARGET_VERIFY_ROWS`).
 pub(crate) const DFLASH2_VERIFY_ROWS: usize = DFLASH2_DRAFT_PROPOSALS + 1;
+
+/// Adaptive spanned draft vocabulary for Qwen3.8 (`vocab_size == 248,320`),
+/// matching TensorFold `cuda_draft_frame.zig`: `[0, 98_304) U [248_032, 248_320)`.
+///
+/// Target verification ALWAYS uses the full 248,320-row `lm_head`, so verified
+/// tokens are mathematically unchanged. For narrow turns on CUDA, the draft
+/// head projects the 64-aligned low span `[0, 98_304)` and the 64-aligned tail
+/// tile `[248_000, 248_320)`, drops the leading 32 padding columns, runs top-k
+/// over the packed 98,592 columns, and remaps candidate IDs `>= 98_304` by
+/// `+149_728` before `edge_scores`. Any prompt or emitted/accepted token in
+/// `[98_304, 248_032)` permanently switches the turn back to the full head.
+const SPANNED_VOCAB_SIZE: i64 = 248_320;
+const SPANNED_LOW_END: i64 = 98_304;
+const SPANNED_HIGH_START: i64 = 248_032;
+const SPANNED_TAIL_TILE_START: i64 = 248_000;
+const SPANNED_TAIL_TILE_SKIP: i64 = SPANNED_HIGH_START - SPANNED_TAIL_TILE_START;
+const SPANNED_TAIL_TILE_LEN: i64 = SPANNED_VOCAB_SIZE - SPANNED_TAIL_TILE_START;
+const SPANNED_ID_SHIFT: i32 = (SPANNED_HIGH_START - SPANNED_LOW_END) as i32;
+
+#[inline]
+pub(crate) fn is_wide_vocab_token(token: u32) -> bool {
+    (SPANNED_LOW_END as u32..SPANNED_HIGH_START as u32).contains(&token)
+}
+
+fn cuda_spanned_head_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MLX_DFLASH2_SPANNED_HEAD").map_or(true, |v| v != "0"))
+}
+
+fn remap_spanned_candidate_ids(candidates: &MxArray) -> Result<MxArray> {
+    let split = MxArray::from_int32(&[SPANNED_LOW_END as i32], &[1])?;
+    let shift = MxArray::from_int32(&[SPANNED_ID_SHIFT], &[1])?;
+    candidates
+        .greater_equal(&split)?
+        .where_(&candidates.add(&shift)?, candidates)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct RawDFlashConfig {
@@ -361,6 +398,7 @@ struct DraftExecutionPolicy {
     compile_override: Option<bool>,
     attention_override: Option<bool>,
     supported_moe: bool,
+    dense_cuda: bool,
     source_conv_requested: bool,
     source_conv_supported: bool,
 }
@@ -376,6 +414,7 @@ impl DraftExecutionPolicy {
             compile_override: compile.map(|value| value == "1"),
             attention_override: attention.map(|value| value == "1"),
             supported_moe: false,
+            dense_cuda: false,
             source_conv_requested: source_conv == Some("1"),
             source_conv_supported: false,
         }
@@ -388,6 +427,7 @@ impl DraftExecutionPolicy {
             attention_override: std::env::var_os("MLX_DFLASH2_ATTENTION_NAX")
                 .map(|value| value == "1"),
             supported_moe: false,
+            dense_cuda: false,
             source_conv_requested: std::env::var_os("MLX_DFLASH2_SOURCE_CONV")
                 .is_some_and(|value| value == "1"),
             source_conv_supported: false,
@@ -408,8 +448,14 @@ impl DraftExecutionPolicy {
         self.source_conv_requested && self.supported_moe && self.source_conv_supported
     }
 
+    fn with_dense_cuda_profile(mut self, supported: bool) -> Self {
+        self.dense_cuda = supported;
+        self
+    }
+
     fn compile_draft(self) -> bool {
-        self.compile_override.unwrap_or(self.supported_moe)
+        self.compile_override
+            .unwrap_or(self.supported_moe || self.dense_cuda)
     }
 
     fn tensor_attention(self) -> bool {
@@ -564,8 +610,9 @@ impl DFlash2Attention {
     }
 
     /// `rope(q_norm(q))`, `rope(k_norm(k))` in one dispatch
-    /// (`mlx_qk_norm_rope`, bit-identical to the four-op chain) from
-    /// `[B, T, H, D]` inputs to `[B, H, T, D]`; `None` on a contract miss.
+    /// (`mlx_qk_norm_rope` on Metal / `mlx_qk_norm_rope_cuda` on CUDA, bit-identical
+    /// to the four-op chain) from `[B, T, H, D]` inputs to `[B, H, T, D]`;
+    /// `None` on a contract miss.
     #[cfg(test)]
     fn fused_qk_norm_rope(
         &self,
@@ -573,10 +620,7 @@ impl DFlash2Attention {
         keys: &MxArray,
         query_base: i32,
     ) -> Option<(MxArray, MxArray)> {
-        if !unsafe { sys::mlx_metal_is_available() }
-            || self.rope.traditional
-            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
-        {
+        if self.rope.traditional || self.q_norm.eps_f32() != self.k_norm.eps_f32() {
             return None;
         }
         let batch = queries.shape_at(0).ok()?;
@@ -590,38 +634,22 @@ impl DFlash2Attention {
         keys: &MxArray,
         offsets: &MxArray,
     ) -> Option<(MxArray, MxArray)> {
-        if !unsafe { sys::mlx_metal_is_available() }
-            || self.rope.traditional
-            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
-        {
+        if self.rope.traditional || self.q_norm.eps_f32() != self.k_norm.eps_f32() {
             return None;
         }
-        let mut out_q = std::ptr::null_mut();
-        let mut out_k = std::ptr::null_mut();
-        // SAFETY: every handle is a live array for the call; the outputs are
-        // owned handles or stay null when the call reports false.
-        let ok = unsafe {
-            sys::mlx_qk_norm_rope(
-                queries.as_raw_ptr(),
-                keys.as_raw_ptr(),
-                self.q_norm.weight().as_raw_ptr(),
-                self.k_norm.weight().as_raw_ptr(),
-                offsets.as_raw_ptr(),
-                self.q_norm.eps_f32(),
-                self.rope.base,
-                self.rope.scale,
-                self.rope.dims,
-                &mut out_q,
-                &mut out_k,
-            )
-        };
-        if !ok {
-            return None;
-        }
-        Some((
-            MxArray::from_handle(out_q, "dflash2 qk_norm_rope:q").ok()?,
-            MxArray::from_handle(out_k, "dflash2 qk_norm_rope:k").ok()?,
-        ))
+        crate::kernels::attention::qk_norm_rope_offsets(
+            queries,
+            keys,
+            self.q_norm.weight(),
+            self.k_norm.weight(),
+            offsets,
+            self.q_norm.eps_f32(),
+            self.rope.base,
+            self.rope.scale,
+            self.rope.dims,
+        )
+        .ok()
+        .flatten()
     }
 
     /// The block's roped queries `[B, HQ, T, D]` and its K/V rows
@@ -727,30 +755,21 @@ impl DFlash2Attention {
         let batch = queries.shape_at(0)?;
         let seq = queries.shape_at(2)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut tensor_op = std::ptr::null_mut();
-        let status = unsafe {
-            sys::mlx_dflash2_attention_with_policy(
-                queries.as_raw_ptr(),
-                keys.as_raw_ptr(),
-                values.as_raw_ptr(),
-                mask.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
-                scale as f32,
-                self.tensor_attention_enabled,
-                &mut tensor_op,
-            )
-        };
-        // Unsupported devices, shapes and a disabled per-model policy use
-        // the established attention path. A constructed graph's execution
-        // errors propagate; cache mutation is never retried after a failure.
-        let attended = match status {
-            1 => MxArray::from_handle(tensor_op, "dflash2 tensor-op attention")?,
-            0 => {
+        let attended = match crate::kernels::attention::sdpa_draft_masked(
+            queries,
+            keys,
+            values,
+            mask,
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            seq,
+            scale as f32,
+            self.tensor_attention_enabled,
+        )? {
+            Some(out) => out,
+            None => {
                 scaled_dot_product_attention(queries, keys, values, scale, broadcast_mask.or(mask))?
-            }
-            _ => {
-                return Err(Error::from_reason(
-                    "DFlash2 tensor-op attention construction failed",
-                ));
             }
         }
         .transpose(Some(&[0, 2, 1, 3]))?
@@ -849,9 +868,7 @@ impl GroupedDynamicCausalConv {
     /// (non-Metal build, dtype mismatch, unusual dims) so the caller can run
     /// the elementwise chain instead.
     fn fused_convolve(&self, hidden: &MxArray, dynamic: &MxArray, side: usize) -> Option<MxArray> {
-        // On non-Metal builds the FFI throws and this falls back anyway —
-        // skip the throw/catch + stderr line per call (~4 per layer).
-        if !unsafe { sys::mlx_metal_is_available() } {
+        if !crate::accelerator::host_has_metal() && !crate::accelerator::cuda_ops_available() {
             return None;
         }
         let dtype = hidden.dtype().ok()?;
@@ -1181,29 +1198,19 @@ pub(crate) fn device_sampled_path<R: Rng + ?Sized>(
 }
 
 impl CandidateSelector {
-    /// Sharded top-16 over the vocab via `mlx_dflash2_topk16`: two Metal
-    /// dispatches instead of argpartition's full per-row merge sort. Returns
+    /// Fused top-16 over the vocab via the Metal or CUDA primitive. Returns
     /// (ids [1,L,16] i32, values [1,L,16] f32) ascending by value — the same
     /// contract the argpartition slice produces. `None` falls back to the
-    /// generic path (non-16 K, non-Metal, shape/dtype mismatch).
+    /// generic path for shape, dtype, or backend capability misses.
     fn fused_topk16(&self, logits: &MxArray) -> Option<(MxArray, MxArray)> {
-        if self.top_k != 16 || !unsafe { sys::mlx_metal_is_available() } {
+        if self.top_k != 16 {
             return None;
         }
         let shape = logits.shape().ok()?;
         if shape.len() != 3 || shape[0] != 1 {
             return None;
         }
-        let mut ids = std::ptr::null_mut();
-        let mut values = std::ptr::null_mut();
-        if !unsafe { sys::mlx_dflash2_topk16(logits.as_raw_ptr(), &mut ids, &mut values) }
-            || ids.is_null()
-            || values.is_null()
-        {
-            return None;
-        }
-        let ids = MxArray::from_handle(ids, "dflash2_topk16:ids").ok()?;
-        let values = MxArray::from_handle(values, "dflash2_topk16:values").ok()?;
+        let (ids, values) = crate::kernels::dflash2::topk16(logits)?;
         // The kernel emits f32 values (widened for the merge compare), while
         // the take_along_axis fallback returns logits.dtype(). bf16→f32 is
         // lossless, so casting back restores bit-parity: `scores`' add then
@@ -1215,22 +1222,12 @@ impl CandidateSelector {
     }
 
     /// One-dispatch version of the device-resident greedy predecessor walk.
-    /// The Metal kernel scans each selected score row in reverse with strict
+    /// The Metal/CUDA kernel scans each selected score row in reverse with strict
     /// `>`, exactly matching the lazy fallback's reversed MLX argmax: the last
     /// non-NaN maximum wins, NaNs do not win, and an all-NaN/-inf row selects
     /// the final slot. `None` keeps the existing lazy graph as the fallback.
     fn fused_greedy_path(&self, candidates: &MxArray, scores: &MxArray) -> Option<MxArray> {
-        if !unsafe { sys::mlx_metal_is_available() } {
-            return None;
-        }
-        let mut path = std::ptr::null_mut();
-        if !unsafe {
-            sys::mlx_dflash2_greedy_path(candidates.as_raw_ptr(), scores.as_raw_ptr(), &mut path)
-        } || path.is_null()
-        {
-            return None;
-        }
-        MxArray::from_handle(path, "dflash2_greedy_path").ok()
+        crate::kernels::dflash2::greedy_path(candidates, scores)
     }
 
     /// Same greedy predecessor decisions, with temperature-one confidence for
@@ -1240,25 +1237,7 @@ impl CandidateSelector {
         candidates: &MxArray,
         scores: &MxArray,
     ) -> Option<(MxArray, MxArray)> {
-        if !unsafe { sys::mlx_metal_is_available() } {
-            return None;
-        }
-        let mut path = std::ptr::null_mut();
-        let mut confidence = std::ptr::null_mut();
-        if !unsafe {
-            sys::mlx_dflash2_greedy_path_confidence(
-                candidates.as_raw_ptr(),
-                scores.as_raw_ptr(),
-                &mut path,
-                &mut confidence,
-            )
-        } {
-            return None;
-        }
-        Some((
-            MxArray::from_handle(path, "dflash2_greedy_path_confidence:path").ok()?,
-            MxArray::from_handle(confidence, "dflash2_greedy_path_confidence:confidence").ok()?,
-        ))
+        crate::kernels::dflash2::greedy_path_confidence(candidates, scores)
     }
 
     /// Original lazy device walk, retained both as the contract fallback and
@@ -1300,6 +1279,7 @@ impl CandidateSelector {
         MxArray::concatenate_many(tokens.iter().collect(), Some(0))
     }
 
+    #[cfg(test)]
     fn select<R: Rng + ?Sized>(
         &self,
         hidden: &MxArray,
@@ -1310,6 +1290,30 @@ impl CandidateSelector {
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        self.select_spanned(
+            hidden,
+            logits,
+            anchor,
+            temperature,
+            device_path,
+            false,
+            confidence,
+            rng,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_spanned<R: Rng + ?Sized>(
+        &self,
+        hidden: &MxArray,
+        logits: &MxArray,
+        anchor: u32,
+        temperature: f64,
+        device_path: bool,
+        spanned: bool,
+        confidence: Option<&mut Option<MxArray>>,
+        rng: &mut R,
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
         self.select_with_anchor(
             hidden,
@@ -1317,32 +1321,29 @@ impl CandidateSelector {
             &anchor_ids,
             temperature,
             device_path,
+            spanned,
             confidence,
             rng,
         )
     }
 
-    fn select_with_anchor<R: Rng + ?Sized>(
+    /// Compute top-K candidate vocabulary IDs (`[1, L, K]` Int32) and
+    /// predecessor-conditioned transition scores (`[L, K, K]` Float32).
+    fn select_lattice_arrays(
         &self,
         hidden: &MxArray,
         logits: &MxArray,
         anchor_ids: &MxArray,
-        temperature: f64,
-        device_path: bool,
-        confidence: Option<&mut Option<MxArray>>,
-        rng: &mut R,
-    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        spanned: bool,
+    ) -> Result<(MxArray, MxArray)> {
         let length = hidden.shape_at(1)? as usize;
         let (candidates, unary) = match self.fused_topk16(logits) {
             Some((ids, values)) => (ids, values),
             None => {
+                let vocab = logits.shape_at(2)?;
                 let candidates = logits
                     .argpartition(-(self.top_k as i32), Some(-1))?
-                    .slice_axis(
-                        2,
-                        self.vocab_size as i64 - self.top_k as i64,
-                        self.vocab_size as i64,
-                    )?;
+                    .slice_axis(2, vocab - self.top_k as i64, vocab)?;
                 let unary = logits.take_along_axis(&candidates, -1)?;
                 (candidates, unary)
             }
@@ -1353,7 +1354,30 @@ impl CandidateSelector {
             self.rank as i64,
         ])?;
         let candidates = candidates.astype(DType::Int32)?;
+        let candidates = if spanned {
+            remap_spanned_candidate_ids(&candidates)?
+        } else {
+            candidates
+        };
         let scores = self.edge_scores(&candidates, &unary, &projected, anchor_ids, length)?;
+        Ok((candidates, scores))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_with_anchor<R: Rng + ?Sized>(
+        &self,
+        hidden: &MxArray,
+        logits: &MxArray,
+        anchor_ids: &MxArray,
+        temperature: f64,
+        device_path: bool,
+        spanned: bool,
+        confidence: Option<&mut Option<MxArray>>,
+        rng: &mut R,
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        let length = hidden.shape_at(1)? as usize;
+        let (candidates, scores) =
+            self.select_lattice_arrays(hidden, logits, anchor_ids, spanned)?;
 
         let greedy = is_greedy_temperature(temperature);
         if greedy && device_path {
@@ -1422,21 +1446,24 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         length: usize,
     ) -> Result<MxArray> {
-        if self.top_k == 16
-            && self.rank == 256
+        let use_cuda = crate::accelerator::cuda_ops_available();
+        let use_metal = !use_cuda
             && std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").is_ok_and(|v| v == "1")
-            && unsafe { sys::mlx_metal_is_available() && sys::mlx_default_device() == 1 }
-        {
+            && unsafe { sys::mlx_metal_is_available() && sys::mlx_default_device() == 1 };
+        if self.top_k == 16 && self.rank == 256 && (use_cuda || use_metal) {
             let predecessor = self.predecessor_codebook.get_weight();
             let successor = self.successor_codebook.get_weight();
-            // The native top-k wrapper preserves the head's dtype. Widen
-            // those existing unary values here; changing the head's own
-            // output precision is a separate experiment.
-            let unary = unary.astype(DType::Float32)?;
+            let unary_arg;
+            let unary_ref = if use_cuda {
+                unary
+            } else {
+                unary_arg = unary.astype(DType::Float32)?;
+                &unary_arg
+            };
             let scores = unsafe {
                 sys::mlx_dflash2_selector_edges(
                     candidates.as_raw_ptr(),
-                    unary.as_raw_ptr(),
+                    unary_ref.as_raw_ptr(),
                     projected.as_raw_ptr(),
                     predecessor.as_raw_ptr(),
                     successor.as_raw_ptr(),
@@ -1444,8 +1471,6 @@ impl CandidateSelector {
                 )
             };
             if !scores.is_null() {
-                // Preserve FP32 through the existing greedy/confidence walk;
-                // this experiment intentionally changes the BF16 edge math.
                 return MxArray::from_handle(scores, "dflash2_selector_edges");
             }
         }
@@ -1482,28 +1507,8 @@ impl CandidateSelector {
 }
 
 fn store_window_tail(window: &[MxArray], keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
-    if window.len() != 4 {
-        return Err(Error::from_reason(
-            "compiled draft window expects full K/V and two views",
-        ));
-    }
-    let args = [
-        window[0].as_raw_ptr(),
-        window[1].as_raw_ptr(),
-        window[2].as_raw_ptr(),
-        window[3].as_raw_ptr(),
-        keys.as_raw_ptr(),
-        values.as_raw_ptr(),
-    ];
-    let mut out = [std::ptr::null_mut(); 4];
-    if !unsafe { sys::mlx_kv_store_window_tail(args.as_ptr(), out.as_mut_ptr()) } {
-        return Err(Error::from_reason(
-            "compiled draft KV tail-store contract failed",
-        ));
-    }
-    out.into_iter()
-        .map(|handle| MxArray::from_handle(handle, "compiled draft tail store"))
-        .collect()
+    crate::kernels::kv::store_window_tail(window, keys, values)?
+        .ok_or_else(|| Error::from_reason("compiled draft KV tail-store contract failed"))
 }
 
 /// Whether draft projections of the given row widths may be row-merged (and
@@ -1515,7 +1520,16 @@ fn store_window_tail(window: &[MxArray], keys: &MxArray, values: &MxArray) -> Re
 /// its per-row `qmv` / GEMM choice follows the width.
 fn kquant_rows_merge(packed: &QuantizedLinear, widths: &[i64]) -> bool {
     use crate::models::quant_dispatch::{KQUANT_TILE_ROWS, split_kquant_layout};
-    split_kquant_layout(packed.mode()).1 && widths.iter().all(|w| w % KQUANT_TILE_ROWS == 0)
+    let (base_mode, tiled) = split_kquant_layout(packed.mode());
+    if tiled {
+        return widths.iter().all(|w| w % KQUANT_TILE_ROWS == 0);
+    }
+    // On CUDA, standard row-major affine Q4/g64 draft weights concatenate
+    // and slice cleanly along axis 0, collapsing 35 matmuls/cycle into 11.
+    crate::accelerator::cuda_ops_available()
+        && base_mode == "affine"
+        && packed.bits() == 4
+        && packed.group_size() == 64
 }
 
 /// One draft layer's attention context (Splash `draft_attention_split_phase`):
@@ -1789,25 +1803,15 @@ impl DraftKvWindow {
         let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
             return Err(Error::from_reason("DFlash2 draft window has no buffers"));
         };
-        let dst = [buffer_keys.as_raw_ptr(), buffer_values.as_raw_ptr()];
-        let src = [keys.as_raw_ptr(), values.as_raw_ptr()];
-        let offsets = [offset as i32; 2];
-        let mut out: [*mut sys::mlx_array; 2] = [std::ptr::null_mut(); 2];
-        // SAFETY: every pointer is a live array handle for the call; `out`
-        // receives owned handles (same buffers as `dst`) or stays null.
-        let fused = unsafe { sys::mlx_metal_is_available() }
-            && unsafe {
-                sys::mlx_kv_store_rows(
-                    2,
-                    dst.as_ptr(),
-                    src.as_ptr(),
-                    offsets.as_ptr(),
-                    out.as_mut_ptr(),
-                )
-            };
-        if fused {
-            self.keys = Some(MxArray::from_handle(out[0], "draft_kv_store:keys")?);
-            self.values = Some(MxArray::from_handle(out[1], "draft_kv_store:values")?);
+        if let Some((new_k, new_v)) = crate::kernels::kv::store_kv_pair(
+            buffer_keys,
+            buffer_values,
+            keys,
+            values,
+            offset as i32,
+        )? {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
             return Ok(());
         }
         let (Some(buffer_keys), Some(buffer_values)) = (&mut self.keys, &mut self.values) else {
@@ -1848,6 +1852,9 @@ pub(crate) struct DFlash2ContextCache {
     /// end at the same position. Keep the ids beside the draft K/V so a warm
     /// DFlash2 continuation is admitted only for the prefix that produced it.
     token_history: Vec<u32>,
+    /// True once any prompt, accepted, or anchor token falls outside the
+    /// spanned draft vocabulary `[0, 98_304) U [248_032, 248_320)`.
+    wide_vocab: bool,
 }
 
 impl DFlash2ContextCache {
@@ -1862,7 +1869,18 @@ impl DFlash2ContextCache {
             logical_len: 0,
             kv_end: 0,
             token_history: Vec::new(),
+            wide_vocab: false,
         }
+    }
+
+    pub(crate) fn observe_tokens(&mut self, token_ids: &[u32]) {
+        if !self.wide_vocab && token_ids.iter().any(|&t| is_wide_vocab_token(t)) {
+            self.wide_vocab = true;
+        }
+    }
+
+    pub(crate) fn wide_vocab(&self) -> bool {
+        self.wide_vocab
     }
 
     pub(crate) fn append(
@@ -1943,6 +1961,7 @@ impl DFlash2ContextCache {
         self.logical_len = next;
         self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
+        self.observe_tokens(token_ids);
         Ok(())
     }
 
@@ -1997,6 +2016,7 @@ impl DFlash2ContextCache {
         self.logical_len = next;
         self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
+        self.observe_tokens(token_ids);
         Ok(())
     }
 
@@ -2015,6 +2035,7 @@ impl DFlash2ContextCache {
             })?)
             .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
         self.token_history.extend_from_slice(token_ids);
+        self.observe_tokens(token_ids);
         Ok(())
     }
 
@@ -2038,6 +2059,7 @@ impl DFlash2ContextCache {
         self.logical_len = 0;
         self.kv_end = 0;
         self.token_history.clear();
+        self.wide_vocab = false;
     }
 
     #[cfg(test)]
@@ -2103,10 +2125,43 @@ impl DFlash2ContextCache {
 const COMPILED_DRAFT_TAG: u64 = 0xDFA2_0000_0000_0000;
 static NEXT_COMPILED_DRAFT: AtomicU64 = AtomicU64::new(1);
 
+struct SpannedDraftHeads {
+    /// Weak reference to the target head's packed weight handle so a replaced
+    /// head never aliases a stale cached slice view.
+    source_weight: Weak<MxHandle>,
+    low: QuantizedLinear,
+    tail: QuantizedLinear,
+}
+
+impl SpannedDraftHeads {
+    /// Project `[1, rows, hidden]` over `[0, 98_304) U [248_032, 248_320)` ->
+    /// `[1, rows, 98_592]`.
+    fn forward_logits(&self, hidden: &MxArray) -> Result<MxArray> {
+        let last_axis = hidden.ndim()?.saturating_sub(1) as usize;
+        let (low_logits, tail_raw) = if let Some(mut outs) =
+            crate::models::quantized_linear::cuda_kquant_multi_ql(hidden, &[&self.low, &self.tail])?
+        {
+            let tail = outs.pop().ok_or_else(|| {
+                Error::from_reason("spanned draft head multi-projection missing tail")
+            })?;
+            let low = outs.pop().ok_or_else(|| {
+                Error::from_reason("spanned draft head multi-projection missing low")
+            })?;
+            (low, tail)
+        } else {
+            (self.low.forward(hidden)?, self.tail.forward(hidden)?)
+        };
+        let tail_logits =
+            tail_raw.slice_axis(last_axis, SPANNED_TAIL_TILE_SKIP, SPANNED_TAIL_TILE_LEN)?;
+        MxArray::concatenate(&low_logits, &tail_logits, last_axis as i32)
+    }
+}
+
 struct CompiledDraft {
     id: u64,
     disabled: AtomicBool,
     prepared: AtomicBool,
+    spanned_heads: Mutex<Option<Arc<SpannedDraftHeads>>>,
     #[cfg(test)]
     traces: AtomicU64,
 }
@@ -2117,6 +2172,7 @@ impl Default for CompiledDraft {
             id: NEXT_COMPILED_DRAFT.fetch_add(1, Ordering::Relaxed),
             disabled: AtomicBool::new(false),
             prepared: AtomicBool::new(false),
+            spanned_heads: Mutex::new(None),
             #[cfg(test)]
             traces: AtomicU64::new(0),
         }
@@ -2203,6 +2259,14 @@ pub(crate) struct DFlash2Model {
 }
 
 impl DFlash2Model {
+    /// Dense CUDA uses the same compiled whole-block draft as the supported
+    /// MoE profile. Metal retains the captured dense policy unchanged.
+    pub(crate) fn configure_dense_execution(&mut self) {
+        let cuda = crate::accelerator::cuda_ops_available();
+        self.invalidate_compiled();
+        self.execution_policy = self.execution_policy.with_dense_cuda_profile(cuda);
+    }
+
     /// Called only by the MoE loader after target validation and before the
     /// companion is published. Dense loaders retain the captured unset-off
     /// policy. Runtime hardware, dtype, shape and gradient guards still apply.
@@ -2243,6 +2307,59 @@ impl DFlash2Model {
             COMPILED_DRAFT_TAG | ((self.compiled.id & 0xffff_ffff) << 16),
         );
         self.compiled.prepared.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = self.compiled.spanned_heads.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Return cached materialized zero-copy `[0, 98_304)` and `[248_000, 248_320)`
+    /// views of a 248,320-row `Tiled64` K-quant target `lm_head`, or `None` for
+    /// dense, non-tiled, or non-248,320 heads.
+    fn spanned_draft_heads(
+        &self,
+        target_lm_head: Option<&LinearProj>,
+    ) -> Result<Option<Arc<SpannedDraftHeads>>> {
+        if self.config.vocab_size as i64 != SPANNED_VOCAB_SIZE {
+            return Ok(None);
+        }
+        let Some(head) = target_lm_head else {
+            return Ok(None);
+        };
+        let LinearProj::Quantized(ql) = head else {
+            return Ok(None);
+        };
+        if !ql.is_kquant_tiled() || head.packed_out_features()? != SPANNED_VOCAB_SIZE {
+            return Ok(None);
+        }
+        let weight_handle = &ql.get_weight().handle;
+        if let Ok(guard) = self.compiled.spanned_heads.lock()
+            && let Some(cached) = guard.as_ref()
+            && cached
+                .source_weight
+                .upgrade()
+                .is_some_and(|src| Arc::ptr_eq(&src, weight_handle))
+        {
+            return Ok(Some(Arc::clone(cached)));
+        }
+        let Ok(low) = ql.slice_rows(0, SPANNED_LOW_END) else {
+            return Ok(None);
+        };
+        let Ok(tail) = ql.slice_rows(SPANNED_TAIL_TILE_START, SPANNED_VOCAB_SIZE) else {
+            return Ok(None);
+        };
+        // Materialize the zero-copy slice views once before any compiled graph
+        // captures them, so no `Slice` producer ops bake into the replay tape.
+        low.eval_packed_arrays("dflash2_spanned_low_head")?;
+        tail.eval_packed_arrays("dflash2_spanned_tail_head")?;
+        let built = Arc::new(SpannedDraftHeads {
+            source_weight: Arc::downgrade(weight_handle),
+            low,
+            tail,
+        });
+        if let Ok(mut guard) = self.compiled.spanned_heads.lock() {
+            *guard = Some(Arc::clone(&built));
+        }
+        Ok(Some(built))
     }
 
     pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
@@ -2497,12 +2614,12 @@ impl DFlash2Model {
         &self,
         target_embedding: &Embedding,
         target_lm_head: Option<&LinearProj>,
+        spanned_heads: Option<&SpannedDraftHeads>,
         context: &mut DFlash2ContextCache,
         block: &MxArray,
         with_confidence: bool,
     ) -> Result<Option<(MxArray, Option<MxArray>)>> {
         if self.compiled.disabled.load(Ordering::Relaxed)
-            || !unsafe { sys::mlx_metal_is_available() }
             || unsafe { sys::mlx_default_device() } != 1
             || self.selector.top_k > 64
             || self.layers.is_empty()
@@ -2568,8 +2685,10 @@ impl DFlash2Model {
                 values.slice_axis(2, from, to)?,
             ]);
         }
+        let is_spanned = spanned_heads.is_some();
         let fn_id = COMPILED_DRAFT_TAG
             | ((self.compiled.id & 0xffff_ffff) << 16)
+            | ((is_spanned as u64) << 11)
             | ((has_mask as u64) << 9)
             | ((with_confidence as u64) << 8)
             | (rows - 1) as u64;
@@ -2601,18 +2720,28 @@ impl DFlash2Model {
                 let output =
                     pending.ok_or_else(|| Error::from_reason("compiled draft has no layers"))?;
                 let hidden = output.hidden_and_normalized(&self.norm)?.1;
-                let logits = match target_lm_head {
-                    Some(head) => head.forward_logits(&hidden)?,
-                    None => target_embedding.as_linear(&hidden)?,
+                let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+                let logits = if let Some(spanned) = spanned_heads {
+                    spanned.forward_logits(&draft_hidden)?
+                } else {
+                    // Match `propose_with`: run the full-vocab head on the whole
+                    // block (anchor + proposals, 8 rows) so Metal keeps its
+                    // K-quant M = 8 NAX route and eager/compiled stay bit-identical.
+                    let full_logits = match target_lm_head {
+                        Some(head) => head.forward_logits(&hidden)?,
+                        None => target_embedding.as_linear(&hidden)?,
+                    };
+                    full_logits.slice_axis(1, 1, rows)?
                 };
                 let mut confidence = None;
                 let anchor = args[0].slice_axis(1, 0, 1)?.reshape(&[1])?;
                 let (path, _) = self.selector.select_with_anchor(
-                    &hidden.slice_axis(1, 1, rows)?,
-                    &logits.slice_axis(1, 1, rows)?,
+                    &draft_hidden,
+                    &logits,
                     &anchor,
                     0.0,
                     true,
+                    is_spanned,
                     with_confidence.then_some(&mut confidence),
                     &mut rand::rng(),
                 )?;
@@ -2632,11 +2761,12 @@ impl DFlash2Model {
             };
         // Once invoked, a failure must reset the turn: an in-place primitive
         // may already have recorded writes. Never retry the same prefix eager.
-        let outputs = crate::compiled_graph::invoke_compiled_graph(
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
             fn_id,
             &inputs.iter().collect::<Vec<_>>(),
             cache_output_at + self.layers.len() * 2,
             true,
+            crate::accelerator::cuda_draft_no_fuse(),
             &mut builder,
         )?
         .ok_or_else(|| Error::from_reason("compiled draft invocation failed"))?;
@@ -2672,6 +2802,335 @@ impl DFlash2Model {
             outputs[0].clone(),
             with_confidence.then(|| outputs[1].clone()),
         )))
+    }
+
+    /// Compiled tree-lattice proposal returning `(candidates [1, L, K] Int32,
+    /// scores [L, K, K] Float32)`. Uses free bit 10 (`1 << 10`) in `fn_id`
+    /// under `COMPILED_DRAFT_TAG` so `Drop` and `invalidate_compiled` release
+    /// it automatically.
+    fn propose_tree_lattice_compiled(
+        &self,
+        target_embedding: &Embedding,
+        target_lm_head: Option<&LinearProj>,
+        spanned_heads: Option<&SpannedDraftHeads>,
+        context: &mut DFlash2ContextCache,
+        block: &MxArray,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        if self.compiled.disabled.load(Ordering::Relaxed)
+            || unsafe { sys::mlx_default_device() } != 1
+            || self.selector.top_k > 64
+            || self.layers.is_empty()
+            || context.layers.len() != self.layers.len()
+        {
+            return Ok(None);
+        }
+        let rows = block.shape_at(1)?;
+        if !(2..=256).contains(&rows) || block.shape_at(0)? != 1 {
+            return Ok(None);
+        }
+        let (start, end) = (context.layers[0].start, context.layers[0].end);
+        // An empty window has no full buffer owner; keep the eager path.
+        if start == end
+            || context
+                .layers
+                .iter()
+                .any(|w| (w.start, w.end) != (start, end))
+        {
+            return Ok(None);
+        }
+        let mut inputs = vec![
+            block.clone(),
+            MxArray::from_int32(&[context.logical_len], &[1])?,
+        ];
+        let mask = context.layers[0].block_mask(
+            &mut context.mask_memo,
+            context.logical_len,
+            rows,
+            self.config.sliding_window as i64,
+        )?;
+        let has_mask = mask.is_some();
+        if let Some(mask) = mask {
+            let heads = self.layers[0].attention.num_heads;
+            if self
+                .layers
+                .iter()
+                .any(|layer| layer.attention.num_heads != heads)
+            {
+                return Ok(None);
+            }
+            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, mask.shape_at(3)?])?;
+            inputs.extend([mask, broadcast_mask]);
+        }
+        let windows_at = inputs.len();
+        for window in &context.layers {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Ok(None);
+            };
+            let Some((from, to)) = window.block_range(rows)? else {
+                return Ok(None);
+            };
+            if keys.dtype()? != DType::BFloat16
+                || values.dtype()? != DType::BFloat16
+                || keys.shape_at(0)? != 1
+            {
+                return Ok(None);
+            }
+            inputs.extend([
+                keys.clone(),
+                values.clone(),
+                keys.slice_axis(2, from, to)?,
+                values.slice_axis(2, from, to)?,
+            ]);
+        }
+        const COMPILED_LATTICE_BIT: u64 = 1u64 << 10;
+        let is_spanned = spanned_heads.is_some();
+        let fn_id = COMPILED_DRAFT_TAG
+            | ((self.compiled.id & 0xffff_ffff) << 16)
+            | ((is_spanned as u64) << 11)
+            | COMPILED_LATTICE_BIT
+            | ((has_mask as u64) << 9)
+            | (rows - 1) as u64;
+        let cache_output_at = 2;
+        let mut builder = |args: &[MxArray]| -> Result<Vec<MxArray>> {
+            #[cfg(test)]
+            self.compiled.traces.fetch_add(1, Ordering::Relaxed);
+            let embedded = target_embedding.forward(&args[0])?;
+            let mut pending: Option<DraftLayerOutput> = None;
+            let mut buffers = Vec::with_capacity(self.layers.len() * 2);
+            for (i, layer) in self.layers.iter().enumerate() {
+                let input = match &pending {
+                    Some(output) => output.as_input(),
+                    None => DraftResidual::Hidden(&embedded),
+                };
+                let at = windows_at + i * 4;
+                let (output, keys, values) = layer.forward_compiled(
+                    input,
+                    &args[at..at + 4],
+                    &args[1],
+                    has_mask.then(|| &args[2]),
+                    has_mask.then(|| &args[3]),
+                    self.merged_rows(),
+                )?;
+                pending = Some(output);
+                buffers.extend([keys, values]);
+            }
+            let output =
+                pending.ok_or_else(|| Error::from_reason("compiled draft has no layers"))?;
+            let hidden = output.hidden_and_normalized(&self.norm)?.1;
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let logits = if let Some(spanned) = spanned_heads {
+                spanned.forward_logits(&draft_hidden)?
+            } else {
+                // Match `propose_tree_lattice_arrays`: run the full-vocab head on
+                // the whole block (anchor + proposals) so Metal keeps its K-quant
+                // M = 8 NAX route and eager/compiled stay bit-identical.
+                let full_logits = match target_lm_head {
+                    Some(head) => head.forward_logits(&hidden)?,
+                    None => target_embedding.as_linear(&hidden)?,
+                };
+                full_logits.slice_axis(1, 1, rows)?
+            };
+            let anchor = args[0].slice_axis(1, 0, 1)?.reshape(&[1])?;
+            let (candidates, scores) =
+                self.selector
+                    .select_lattice_arrays(&draft_hidden, &logits, &anchor, is_spanned)?;
+            let mut outputs = vec![candidates, scores];
+            outputs.extend(buffers);
+            Ok(outputs)
+        };
+        // Once invoked, a failure must reset the turn: an in-place primitive
+        // may already have recorded writes. Never retry the same prefix eager.
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
+            fn_id,
+            &inputs.iter().collect::<Vec<_>>(),
+            cache_output_at + self.layers.len() * 2,
+            true,
+            crate::accelerator::cuda_draft_no_fuse(),
+            &mut builder,
+        )?
+        .ok_or_else(|| Error::from_reason("compiled draft lattice invocation failed"))?;
+        for (window, pair) in context
+            .layers
+            .iter()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Err(Error::from_reason(
+                    "compiled draft lattice returned incompatible cache buffers",
+                ));
+            };
+            if pair[0].shape()?.as_ref() != keys.shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != values.shape()?.as_ref()
+                || pair[0].dtype()? != DType::BFloat16
+                || pair[1].dtype()? != DType::BFloat16
+            {
+                return Err(Error::from_reason(
+                    "compiled draft lattice returned incompatible cache buffers",
+                ));
+            }
+        }
+        for (window, pair) in context
+            .layers
+            .iter_mut()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            window.keys = Some(pair[0].clone());
+            window.values = Some(pair[1].clone());
+        }
+        Ok(Some((outputs[0].clone(), outputs[1].clone())))
+    }
+
+    /// Run DFlash2 draft + selector and return the unevaluated device-resident
+    /// candidate IDs (`[1, L, K]` Int32) and predecessor-conditioned transition
+    /// scores (`[L, K, K]` Float32) without host sync.
+    ///
+    /// On the first compiled-eligible cycle, performs a one-time eval before
+    /// setting `compiled.prepared = true` (mirroring [`Self::propose_with`]).
+    pub(crate) fn propose_tree_lattice_arrays(
+        &self,
+        target_embedding: &Embedding,
+        target_lm_head: Option<&LinearProj>,
+        context: &mut DFlash2ContextCache,
+        anchor: u32,
+        max_len: usize,
+    ) -> Result<(MxArray, MxArray)> {
+        if max_len == 0 {
+            return Err(Error::from_reason(
+                "DFlash2 propose_tree_lattice_arrays requires max_len > 0",
+            ));
+        }
+        context.observe_tokens(&[anchor]);
+        let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
+        let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+        let use_spanned_head = crate::accelerator::cuda_ops_available()
+            && cuda_spanned_head_enabled()
+            && !context.wide_vocab();
+        let spanned_heads = if use_spanned_head {
+            self.spanned_draft_heads(target_lm_head)?
+        } else {
+            None
+        };
+        let compile = max_len == self.config.block_size
+            && unsafe { sys::mlx_default_device() } == 1
+            && self.execution_policy.compile_draft();
+        let compiled_pair = if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+            match self.propose_tree_lattice_compiled(
+                target_embedding,
+                target_lm_head,
+                spanned_heads.as_deref(),
+                context,
+                &block,
+            ) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    self.compiled.disabled.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let (candidates, scores) = if let Some(pair) = compiled_pair {
+            pair
+        } else {
+            let query_base = context.logical_len;
+            let embedded = target_embedding.forward(&block)?;
+            let hidden = self.forward_embedded(&embedded, query_base, context)?;
+            let rows = max_len as i64 + 1;
+            let (draft_hidden, draft_logits, is_spanned) =
+                if let Some(spanned) = spanned_heads.as_deref() {
+                    let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+                    let draft_logits = spanned.forward_logits(&draft_hidden)?;
+                    (draft_hidden, draft_logits, true)
+                } else {
+                    let logits = match target_lm_head {
+                        Some(head) => head.forward_logits(&hidden)?,
+                        None => target_embedding.as_linear(&hidden)?,
+                    };
+                    let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+                    let draft_logits = logits.slice_axis(1, 1, rows)?;
+                    (draft_hidden, draft_logits, false)
+                };
+            let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
+            self.selector.select_lattice_arrays(
+                &draft_hidden,
+                &draft_logits,
+                &anchor_ids,
+                is_spanned,
+            )?
+        };
+        if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
+            MxArray::eval_arrays(&[&candidates, &scores])?;
+            self.compiled.prepared.store(true, Ordering::Relaxed);
+        }
+        Ok((candidates, scores))
+    }
+
+    /// Evaluate and read back device-resident `(candidates, scores)` into a
+    /// host [`DraftLattice`].
+    pub(crate) fn lattice_from_arrays(
+        &self,
+        candidates: &MxArray,
+        scores: &MxArray,
+        max_len: usize,
+    ) -> Result<super::verify_tree::DraftLattice> {
+        if max_len == 0 {
+            return Ok(super::verify_tree::DraftLattice::empty());
+        }
+        MxArray::eval_arrays(&[candidates, scores])?;
+        let cand_i32 = candidates.to_int32()?;
+        let scores_f32 = scores.to_float32()?;
+        let top_k = self.selector.top_k;
+        let expected_cands = max_len.saturating_mul(top_k);
+        let expected_scores = expected_cands.saturating_mul(top_k);
+        if cand_i32.len() != expected_cands || scores_f32.len() != expected_scores {
+            return Err(Error::from_reason(format!(
+                "DFlash2 tree lattice shape mismatch: got {} candidates / {} scores, expected {expected_cands} / {expected_scores}",
+                cand_i32.len(),
+                scores_f32.len()
+            )));
+        }
+        let cand_u32 = cand_i32
+            .iter()
+            .map(|&id| {
+                u32::try_from(id).map_err(|_| {
+                    Error::from_reason(format!(
+                        "DFlash2 tree lattice produced negative candidate id {id}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(super::verify_tree::DraftLattice::from_selector_scores(
+            &cand_u32,
+            &scores_f32,
+            max_len,
+            top_k,
+        ))
+    }
+
+    /// Run DFlash2 draft + selector and materialize the full `[L, K, K]`
+    /// conditional candidate lattice (`~7.6 KB` readback for `L=7, K=16`) for
+    /// speculative verification tree construction.
+    #[allow(dead_code)]
+    pub(crate) fn propose_tree_lattice(
+        &self,
+        target_embedding: &Embedding,
+        target_lm_head: Option<&LinearProj>,
+        context: &mut DFlash2ContextCache,
+        anchor: u32,
+        max_len: usize,
+    ) -> Result<super::verify_tree::DraftLattice> {
+        if max_len == 0 {
+            return Ok(super::verify_tree::DraftLattice::empty());
+        }
+        let (candidates, scores) = self.propose_tree_lattice_arrays(
+            target_embedding,
+            target_lm_head,
+            context,
+            anchor,
+            max_len,
+        )?;
+        self.lattice_from_arrays(&candidates, &scores, max_len)
     }
 
     pub(crate) fn propose<R: Rng + ?Sized>(
@@ -2713,11 +3172,24 @@ impl DFlash2Model {
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        // Observe the current anchor (prefill first token or previous boundary
+        // token) before deciding narrow vs full draft head.
+        context.observe_tokens(&[anchor]);
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
         let traced = target.traced();
+        let use_spanned_head = crate::accelerator::cuda_ops_available()
+            && cuda_spanned_head_enabled()
+            && !context.wide_vocab();
+        let spanned_heads = if use_spanned_head {
+            traced
+                .and_then(|(_, head)| self.spanned_draft_heads(head).transpose())
+                .transpose()?
+        } else {
+            None
+        };
         let compile = device_path
             && traced.is_some()
             && is_greedy_temperature(temperature)
@@ -2735,6 +3207,7 @@ impl DFlash2Model {
             match self.propose_compiled(
                 target_embedding,
                 target_lm_head,
+                spanned_heads.as_deref(),
                 context,
                 &block,
                 confidence.is_some(),
@@ -2755,20 +3228,28 @@ impl DFlash2Model {
         let query_base = context.logical_len;
         let embedded = target.embed(&block, &ids)?;
         let hidden = self.forward_embedded(&embedded, query_base, context)?;
-        // The head runs on the whole block (anchor + proposals, 8 rows), the
-        // height its K-quant M = 8 route serves, and the anchor row's logits
-        // are dropped: at 7 rows the head took the per-row kernel and cost
-        // more than at 8.
-        let logits = target.logits(&hidden)?;
         let rows = max_len as i64 + 1;
-        let hidden = hidden.slice_axis(1, 1, rows)?;
-        let logits = logits.slice_axis(1, 1, rows)?;
-        let out = self.selector.select(
+        let (hidden, logits, is_spanned) = if let Some(spanned) = spanned_heads.as_deref() {
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let draft_logits = spanned.forward_logits(&draft_hidden)?;
+            (draft_hidden, draft_logits, true)
+        } else {
+            // The head runs on the whole block (anchor + proposals, 8 rows), the
+            // height its K-quant M = 8 route serves, and the anchor row's logits
+            // are dropped: at 7 rows the head took the per-row kernel and cost
+            // more than at 8.
+            let logits = target.logits(&hidden)?;
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let draft_logits = logits.slice_axis(1, 1, rows)?;
+            (draft_hidden, draft_logits, false)
+        };
+        let out = self.selector.select_spanned(
             &hidden,
             &logits,
             anchor,
             temperature,
             device_path,
+            is_spanned,
             confidence,
             rng,
         )?;
@@ -3867,12 +4348,14 @@ mod tests {
             })
             .sum::<u64>();
         // The merges follow the tiled contract: on a Metal host every
-        // projection tiles, so q|k|v, gate|up and the cross-layer k|v (a
-        // second resident copy of k/v) all exist.
-        let tiled = crate::models::quant_dispatch::kquant_tiled_enabled();
-        assert_eq!(model.context_kv.is_some(), tiled);
-        assert_eq!(model.layers[0].attention.qkv_proj.is_some(), tiled);
-        assert_eq!(model.layers[0].mlp.gate_up.is_some(), tiled);
+        // projection tiles, and on CUDA affine Q4/g64 draft projections also
+        // merge rows, so q|k|v, gate|up and the cross-layer k|v (a second
+        // resident copy of k/v) all exist.
+        let merges_rows = crate::models::quant_dispatch::kquant_tiled_enabled()
+            || crate::accelerator::cuda_ops_available();
+        assert_eq!(model.context_kv.is_some(), merges_rows);
+        assert_eq!(model.layers[0].attention.qkv_proj.is_some(), merges_rows);
+        assert_eq!(model.layers[0].mlp.gate_up.is_some(), merges_rows);
         if model.context_kv.is_some() {
             let kv = (config.num_key_value_heads * config.head_dim * config.hidden_size) as u64;
             expected_bytes += 2 * packed_bytes(kv) * config.num_hidden_layers as u64;
@@ -3988,17 +4471,30 @@ mod tests {
     }
 
     fn direct_fused_greedy(candidates: &MxArray, scores: &MxArray) -> Option<Vec<i32>> {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() };
+        let cuda = crate::accelerator::cuda_ops_available();
+        if !metal && !cuda {
             return None;
         }
         let mut path = std::ptr::null_mut();
-        assert!(unsafe {
-            mlx_sys::mlx_dflash2_greedy_path(
-                candidates.as_raw_ptr(),
-                scores.as_raw_ptr(),
-                &mut path,
-            )
-        });
+        let ok = if metal {
+            unsafe {
+                mlx_sys::mlx_dflash2_greedy_path(
+                    candidates.as_raw_ptr(),
+                    scores.as_raw_ptr(),
+                    &mut path,
+                )
+            }
+        } else {
+            unsafe {
+                mlx_sys::mlx_dflash2_greedy_path_cuda(
+                    candidates.as_raw_ptr(),
+                    scores.as_raw_ptr(),
+                    &mut path,
+                )
+            }
+        };
+        assert!(ok);
         assert!(!path.is_null());
         let path = MxArray::from_handle(path, "test dflash2 greedy path").unwrap();
         Some(path.to_int32().unwrap().as_ref().to_vec())
@@ -4021,8 +4517,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_matches_lazy_random_and_branching_walks() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         for top_k in [4usize, 16] {
@@ -4082,8 +4580,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_matches_lazy_ties_infinities_signed_zero_and_nan() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         for top_k in [4usize, 16] {
@@ -4171,8 +4671,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_accepts_noncontiguous_views() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         let (length, top_k) = (7usize, 16usize);
@@ -4197,6 +4699,62 @@ mod tests {
             direct_fused_greedy(&candidates, &scores).unwrap(),
             lazy_greedy(&selector, &candidates, &scores, length),
         );
+    }
+
+    #[test]
+    fn fused_greedy_confidence_matches_selected_softmax_probability() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            return;
+        }
+        let (length, top_k) = (7usize, 16usize);
+        let selector = test_selector(32, top_k, 4, 4);
+        let candidates = MxArray::from_int32(
+            &(0..length * top_k).map(|i| i as i32).collect::<Vec<_>>(),
+            &[1, length as i64, top_k as i64],
+        )
+        .unwrap();
+        let scores = MxArray::random_normal(
+            &[length as i64, top_k as i64, top_k as i64],
+            0.0,
+            2.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let score_values = scores.to_float32().unwrap().to_vec();
+        let (path, confidence) = selector
+            .fused_greedy_path_confidence(&candidates, &scores)
+            .unwrap();
+        MxArray::eval_arrays(&[&path, &confidence]).unwrap();
+        assert_eq!(
+            path.to_int32().unwrap().as_ref(),
+            lazy_greedy(&selector, &candidates, &scores, length)
+        );
+        let actual = confidence.to_float32().unwrap();
+        let mut predecessor = 0usize;
+        for position in 0..length {
+            let row = (position * top_k + predecessor) * top_k;
+            let mut selected = top_k - 1;
+            let mut best = f32::NEG_INFINITY;
+            for candidate in (0..top_k).rev() {
+                let value = score_values[row + candidate];
+                if (!best.is_nan() && value.is_nan()) || value > best {
+                    best = value;
+                    selected = candidate;
+                }
+            }
+            let normalizer = (0..top_k)
+                .map(|candidate| (score_values[row + candidate] - best).exp())
+                .sum::<f32>();
+            let expected = 1.0 / normalizer;
+            assert!(
+                (actual[position] - expected).abs() <= 2e-6 * expected.max(1.0),
+                "confidence position {position}: {} vs {expected}",
+                actual[position]
+            );
+            predecessor = selected;
+        }
     }
 
     #[test]
@@ -4238,10 +4796,12 @@ mod tests {
     /// before warmup. Alternating batches limit order/thermal bias. This prints
     /// observations and deliberately asserts no timing threshold.
     #[test]
-    #[ignore = "diagnostic Metal timing; run manually on an idle machine"]
+    #[ignore = "diagnostic GPU timing; run manually on an idle machine"]
     fn benchmark_fused_greedy_path_vs_lazy_graph() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: DFlash2 greedy-path benchmark requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: DFlash2 greedy-path benchmark needs a supported GPU");
             return;
         }
         const LENGTH: usize = 7;
@@ -4500,6 +5060,65 @@ mod tests {
                 "PASS fused topk16 parity: native scan+merge ran for {ROWS} rows, \
                  dtype={dtype:?}, vocab={vocab}"
             );
+        }
+    }
+
+    #[test]
+    fn cuda_topk16_matches_argpartition_candidate_set() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        const ROWS: usize = 3;
+        const VOCAB: i64 = 257;
+        let mut data = (0..ROWS * VOCAB as usize)
+            .map(|i| -1.0 - (i % 97) as f32)
+            .collect::<Vec<_>>();
+        for row in 0..ROWS {
+            for rank in 0..16usize {
+                let token = rank * 16 + row + 1;
+                data[row * VOCAB as usize + token] = (rank + 1) as f32;
+            }
+        }
+        let logits = MxArray::from_float32(&data, &[1, ROWS as i64, VOCAB])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let mut ids = std::ptr::null_mut();
+        let mut values = std::ptr::null_mut();
+        let status =
+            unsafe { mlx_sys::mlx_dflash2_topk16_cuda(logits.as_raw_ptr(), &mut ids, &mut values) };
+        assert_eq!(status, 1);
+        let ids = MxArray::from_handle(ids, "CUDA topk16 ids").unwrap();
+        let values = MxArray::from_handle(values, "CUDA topk16 values").unwrap();
+        let ids: Vec<i32> = ids.to_int32().unwrap().as_ref().to_vec();
+        let values: Vec<f32> = values.to_float32().unwrap().as_ref().to_vec();
+        let reference = logits
+            .argpartition(-16, Some(-1))
+            .unwrap()
+            .slice_axis(2, VOCAB - 16, VOCAB)
+            .unwrap();
+        let ref_ids: Vec<i32> = reference.to_int32().unwrap().as_ref().to_vec();
+        let logits_f: Vec<f32> = logits
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        for row in 0..ROWS {
+            let mine = &ids[row * 16..(row + 1) * 16];
+            let mine_v = &values[row * 16..(row + 1) * 16];
+            let theirs = &ref_ids[row * 16..(row + 1) * 16];
+            let mut a = mine.to_vec();
+            let mut b = theirs.to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "row {row}: candidate sets differ");
+            assert!(mine_v.windows(2).all(|w| w[0] <= w[1]));
+            for (&id, &value) in mine.iter().zip(mine_v.iter()) {
+                assert!(id >= 0 && i64::from(id) < VOCAB);
+                assert_eq!(value, logits_f[row * VOCAB as usize + id as usize]);
+            }
         }
     }
 
@@ -5018,7 +5637,10 @@ mod tests {
         assert!(!kquant_rows_merge(&packed("a4g64@t64"), &[64, 96]));
         assert!(kquant_rows_merge(&packed("q4k@t64"), &[128]));
         assert!(!kquant_rows_merge(&packed("q4k"), &[64]));
-        assert!(!kquant_rows_merge(&packed("affine"), &[64]));
+        assert_eq!(
+            kquant_rows_merge(&packed("affine"), &[64]),
+            crate::accelerator::cuda_ops_available()
+        );
         assert!(!kquant_rows_merge(&packed("mxfp4"), &[64]));
     }
 
@@ -5738,7 +6360,9 @@ mod tests {
 
     #[test]
     fn compiled_draft_replays_positions_windows_and_masks() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let mut model = three_layer_tiny_draft();
@@ -5819,7 +6443,7 @@ mod tests {
             MxArray::eval_arrays(&[&expected]).unwrap();
             let ids = MxArray::from_int32(&[anchor as i32, 0, 0], &[1, 3]).unwrap();
             let (path, probability) = model
-                .propose_compiled(&embedding, None, &mut compiled, &ids, true)
+                .propose_compiled(&embedding, None, None, &mut compiled, &ids, true)
                 .unwrap()
                 .unwrap();
             MxArray::eval_arrays(&[&path]).unwrap();
@@ -5835,13 +6459,13 @@ mod tests {
             );
             for (left, right) in eager.layers.iter().zip(&compiled.layers) {
                 assert_eq!(
-                    bits(left.keys.as_ref().unwrap()),
                     bits(right.keys.as_ref().unwrap()),
+                    bits(left.keys.as_ref().unwrap()),
                     "K case {case}"
                 );
                 assert_eq!(
-                    bits(left.values.as_ref().unwrap()),
                     bits(right.values.as_ref().unwrap()),
+                    bits(left.values.as_ref().unwrap()),
                     "V case {case}"
                 );
                 assert_eq!(
@@ -5867,7 +6491,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_rejects_unrelated_view_before_any_write() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
@@ -5893,7 +6519,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_rejects_cross_aliased_blocks_before_any_write() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
@@ -5928,7 +6556,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_preserves_same_buffer_prefix_views() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
@@ -5997,6 +6627,71 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 3);
+    }
+
+    #[test]
+    fn propose_tree_lattice_matches_selector_and_handles_16_row_context_append() {
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 64;
+        model.config.block_size = 7;
+        model.selector.top_k = 16;
+        let mut embedding = Embedding::new(32, 64).unwrap();
+        embedding
+            .load_weight(
+                &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            )
+            .unwrap();
+
+        let mut ctx_lattice = super::DFlash2ContextCache::new(&model.config);
+        let mut ctx_propose = super::DFlash2ContextCache::new(&model.config);
+
+        // Verify `DFlash2ContextCache::append` handles `keep = 16` cleanly.
+        let fused_16 =
+            MxArray::random_normal(&[1, 16, 64], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let tokens_16: Vec<u32> = (0..16).map(|t| 1 + (t % 20)).collect();
+        ctx_lattice
+            .append(&model, &fused_16, 0, &tokens_16)
+            .unwrap();
+        ctx_propose
+            .append(&model, &fused_16, 0, &tokens_16)
+            .unwrap();
+        assert_eq!(ctx_lattice.logical_len(), 16);
+
+        // max_len == 0 returns an empty lattice.
+        let empty = model
+            .propose_tree_lattice(&embedding, None, &mut ctx_lattice, 5, 0)
+            .unwrap();
+        assert_eq!(empty.slots, 0);
+
+        // Full-width lattice proposal matches `propose(...)` greedy Markov path.
+        let lattice = model
+            .propose_tree_lattice(&embedding, None, &mut ctx_lattice, 5, 7)
+            .unwrap();
+        assert_eq!(lattice.slots, 7);
+        assert_eq!(lattice.top_k, 16);
+        let (path, _) = model
+            .propose(
+                &embedding,
+                None,
+                &mut ctx_propose,
+                5,
+                7,
+                0.0,
+                false,
+                None,
+                &mut rand::rng(),
+            )
+            .unwrap();
+        let super::SelectorPath::Host(expected_path) = path else {
+            panic!("expected Host selector path");
+        };
+        let lattice_top_path: Vec<i32> = (0..7)
+            .map(|pos| lattice.token(pos, lattice.top_candidate[pos]) as i32)
+            .collect();
+        assert_eq!(
+            lattice_top_path, expected_path,
+            "DraftLattice greedy Markov chain must match CandidateSelector::select_with_anchor"
+        );
     }
 }
 

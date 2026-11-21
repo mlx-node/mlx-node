@@ -141,11 +141,13 @@ export {
   getQwen3Config,
 } from './models/qwen3-configs.js';
 
-// Model loading
+// Model loading & runtime capabilities
+export { getRuntimeCapabilities, type RuntimeCapabilities } from '@mlx-node/core';
 export {
   loadModel,
   loadSession,
   detectModelType,
+  supportsAutomaticDFlash2,
   type LoadableModel,
   type TrainableModel,
   type LoadModelOptions,

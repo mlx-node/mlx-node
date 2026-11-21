@@ -12,13 +12,14 @@ ml-explore/mlx main  bebd6422f (2026-10-14)
         │  + 1 patch     local CUDA fix
         │  + 1 patch     thread-scoped TF32
         │  + 1 patch     Windows cuDNN thread-exit release
+        │  + 1 patch     per-graph compile_with_mode
         ▼
-mlx-node/mlx         849f89346  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         5ddc3d9e2  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 13 patches
+## The 14 patches
 
 | #   | commit      | patch                                                                                                                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -35,11 +36,12 @@ Name a patch by its subject and use its commit hash for the exact gitlink.
 | 11  | `e0dcc863e` | Pass explicit `CompileOptions::Data` zero at both CUDA `CustomKernel` construction sites                                                                                                                                                                              | `std::make_shared` cannot deduce the type of a braced `{}` argument; zero preserves the default safe math mode and completes patch 1's `output_shapes` support on CUDA. The constructor and call sites are inside MLX. This is our local fork commit, not an upstream `ml-explore/mlx` commit                                                                                                                                                                     | yes                |
 | 12  | `6fe39a2b7` | `enable_tf32()` reads a per-thread override first; `set_thread_tf32(-1\|0\|1)` sets it (`mlx/utils.{h,cpp}`)                                                                                                                                                          | `enable_tf32()` was an inline process static read inside `eval_gpu` at every NAX GEMM, quantized and SDPA dispatch. The other routes are the process-wide `MLX_ENABLE_TF32` (Qwen3.8 Flash Next needs TF32 on) or per-primitive state. DeepSeek V4.1 Flash sets true f32 on its model thread (`Model::from_gguf`)                                                                                                                                                 | yes                |
 | 13  | `849f89346` | `clear_streams()` synchronizes encoders, clears the cuDNN graph caches, and destroys the cuDNN handle before thread exit                                                                                                                                             | Windows destroys a used cuDNN handle from its `thread_local` destructor. `cudnnDestroy` then returns `CUDNN_STATUS_INTERNAL_ERROR`, `CHECK_CUDNN_ERROR` throws, and the `noexcept` destructor terminates the process with `0xC0000409`. The release has to run while the thread can still call CUDA.                                                                                                                                                            | yes                |
+| 14  | `5ddc3d9e2` | `compile_with_mode()` compiles a function with a per-function `CompileMode` override (and matching cache-key erasure on destruction), leaving the global compile mode untouched                                                                                      | CUDA DFlash2 compiled draft replay requires `CompileMode::no_fuse` for BF16 rounding bit-parity with eager execution while Metal graphs and other compiled graphs stay fused. MLX's public `compile()` only reads the process-global `compile_mode()`.                                                                                                                                                                                                           | yes                |
 
 The active pin merges the 10 direct commits from the fork's `fn-d1` branch with
 our local CUDA constructor fix `e0dcc863e`, which is not an upstream
-`ml-explore/mlx` change, and carries the thread-scoped TF32 commit `6fe39a2b7`
-and the cuDNN thread-exit commit `849f89346` on top. The retired workspace commit remains an inactive
+`ml-explore/mlx` change, and carries the thread-scoped TF32 commit `6fe39a2b7`,
+the cuDNN thread-exit commit `849f89346`, and `compile_with_mode` `5ddc3d9e2` on top. The retired workspace commit remains an inactive
 descendant on `fn-d1`; moving the gitlink to its parent does not rewrite that
 branch. `build.rs` uses the checked-out submodule directly for CMake, bridge
 headers, Metal kernels and generated preambles. There is no parent-repo patch

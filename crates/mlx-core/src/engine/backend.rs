@@ -2052,6 +2052,29 @@ pub(crate) struct DsparkVerifyOutput {
     pub logits: MxArray,
 }
 
+/// Output of [`DsparkStepper::verify_tree_greedy`] — speculative tree proposal,
+/// single-pass tree verification, and greedy walk along the accepted branch.
+pub(crate) struct DsparkTreeGreedyResult {
+    /// Greedy verified tokens emitted in order along the accepted tree walk
+    /// (`len >= 1`). `emitted_tokens[..len - 1]` are accepted speculative
+    /// tokens; `emitted_tokens[len - 1]` is the bonus next-anchor token.
+    pub emitted_tokens: Vec<u32>,
+    /// Tree node indices accepted along the walk (`len == emitted_tokens.len()`,
+    /// `accepted_nodes[0] == 0`).
+    pub accepted_nodes: Vec<usize>,
+    /// True iff `accepted_nodes == [0, 1, ..., len - 1]`.
+    pub is_contiguous_prefix: bool,
+    /// Deepest speculative depth offered by the tree (`>= accepted_draft_count`),
+    /// for telemetry.
+    pub draft_count: usize,
+    /// Total number of tree nodes verified (`1..=16`).
+    #[allow(dead_code)]
+    pub tree_nodes: usize,
+    /// Number of speculative draft tokens accepted along the walk
+    /// (`accepted_nodes.len() - 1`).
+    pub accepted_draft_count: usize,
+}
+
 /// Per-turn DSpark stepper the engine-owned loop
 /// ([`crate::engine::dspark_turn::run_dspark_turn`]) drives.
 ///
@@ -2250,6 +2273,42 @@ pub(crate) trait DsparkStepper {
     /// iteration boundary on the continue path (the analog of
     /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
     fn eval_boundary(&self, token: &MxArray);
+
+    /// Whether this stepper supports greedy speculative tree verification
+    /// ([`Self::verify_tree_greedy`] / [`Self::commit_tree`]).
+    fn supports_tree_verify(&self) -> bool {
+        false
+    }
+
+    /// Feed prompt or emitted tokens into the stepper's lookup index.
+    fn observe_emitted_tokens(&mut self, _tokens: &[u32]) {}
+
+    /// Build a speculative verification tree from `anchor` (up to `max_nodes`
+    /// nodes and `max_depth` speculative depth), run one batched tree verify
+    /// pass, and return the greedy verified walk.
+    fn verify_tree_greedy(
+        &mut self,
+        _anchor: u32,
+        _max_nodes: usize,
+        _max_depth: usize,
+    ) -> Result<DsparkTreeGreedyResult> {
+        Err(Error::from_reason(
+            "DSpark stepper does not support tree verification",
+        ))
+    }
+
+    /// Commit the kept tree branch `accepted_nodes` (`accepted_nodes[0] == 0`)
+    /// from the prior [`Self::verify_tree_greedy`] call, compacting KV/GDN and
+    /// appending kept draft taps.
+    fn commit_tree(
+        &mut self,
+        _accepted_nodes: &[usize],
+        _is_contiguous_prefix: bool,
+    ) -> Result<()> {
+        Err(Error::from_reason(
+            "DSpark stepper does not support tree commit",
+        ))
+    }
 }
 
 /// Per-family training backend the model-neutral training-command handler
