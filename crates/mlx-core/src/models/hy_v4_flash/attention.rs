@@ -118,6 +118,41 @@ pub fn window_ring_rows(start: usize, n: usize, cap: usize, window: usize) -> Ve
     idx
 }
 
+type WindowIdxKey = (bool, usize, usize, usize, usize);
+
+/// Shares one `[n, window]` sliding-window index tensor across all 30 sliding
+/// layers of a decode wave when `(is_ring, start, n, param, window)` matches.
+fn cached_window_idx(
+    is_ring: bool,
+    start: usize,
+    n: usize,
+    param: usize,
+    window: usize,
+) -> Result<MxArray> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(WindowIdxKey, MxArray)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let key = (is_ring, start, n, param, window);
+    if let Some(hit) = CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|(k, a)| (*k == key).then(|| a.clone()))
+    }) {
+        return Ok(hit);
+    }
+    let idx_vec = if is_ring {
+        window_ring_rows(start, n, param, window)
+    } else {
+        window_rows(start, n, param, window)
+    };
+    let arr = MxArray::from_int32(&idx_vec, &[n as i64, window as i64])?;
+    CACHE.with(|c| {
+        *c.borrow_mut() = Some((key, arr.clone()));
+    });
+    Ok(arr)
+}
+
 /// `x [g, s, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
 /// -> `[g, s, r]`. A Q8 `w` takes fewer than `MIN_Q8_ROWS` rows padded
 /// with zero rows, as `qlinear` does.
@@ -163,6 +198,7 @@ pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxA
                     qw.as_raw_ptr(),
                     scales.as_raw_ptr(),
                     biases_ptr,
+                    std::ptr::null_mut(),
                 )
             };
             if !h.is_null() {
@@ -432,6 +468,38 @@ impl Mla {
         let n = o_lat.shape_at(0)?;
         let heads = g.n_heads as i64;
         let width = heads * g.head_v as i64;
+        if let Some(gl) = gate_lin
+            && (1..=16).contains(&n)
+            && let Some((qw, scales, biases)) = w.v_b.qmm_parts()
+            && o_lat.ndim()? == 3
+            && o_lat.shape_at(1)? == heads
+        {
+            let xf = if o_lat.dtype()? == DType::Float32 {
+                o_lat.clone()
+            } else {
+                o_lat.astype(DType::Float32)?
+            };
+            let glf = if gl.dtype()? == DType::Float32 {
+                gl.clone()
+            } else {
+                gl.astype(DType::Float32)?
+            };
+            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+            // SAFETY: all handles are live arrays owned by this call.
+            let h = unsafe {
+                mlx_sys::mlx_hy4_q8_grouped_decode(
+                    xf.as_raw_ptr(),
+                    qw.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases_ptr,
+                    glf.as_raw_ptr(),
+                )
+            };
+            if !h.is_null() {
+                let gated = MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode_gated")?;
+                return qlinear(&gated, &w.output);
+            }
+        }
         let o = grouped_mm_t_mgh(&w.v_b, o_lat, heads)?.reshape(&[n, width])?;
         let gate_lin = match gate_lin {
             Some(gl) => gl.clone(),
@@ -591,11 +659,11 @@ impl Mla {
                 return Ok(o);
             }
         }
-        let (k_ref, idx_vec) = match &keys {
-            WindowKeys::Ring { keys, cap } => (*keys, window_ring_rows(start, n, *cap, window)),
-            WindowKeys::Linear { keys, first } => (keys, window_rows(start, n, *first, window)),
+        let (k_ref, is_ring, param) = match &keys {
+            WindowKeys::Ring { keys, cap } => (*keys, true, *cap),
+            WindowKeys::Linear { keys, first } => (keys, false, *first),
         };
-        let idx = MxArray::from_int32(&idx_vec, &[n as i64, window as i64])?;
+        let idx = cached_window_idx(is_ring, start, n, param, window)?;
         let o = gather_sink_attention_for(
             &p.q,
             k_ref,

@@ -1911,16 +1911,73 @@ fn run_mmap_prewarm(
     }
 }
 
+pub const RSET_KEEPALIVE_ENV: &str = "MLX_HY4_RSET_KEEPALIVE_MS";
+const DEFAULT_RSET_KEEPALIVE_MS: u64 = 2000;
+
+fn parse_rset_keepalive_ms(val: Option<&str>) -> Option<Duration> {
+    let ms = val
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RSET_KEEPALIVE_MS);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+fn rset_keepalive_interval() -> Option<Duration> {
+    parse_rset_keepalive_ms(std::env::var(RSET_KEEPALIVE_ENV).ok().as_deref())
+}
+
+struct RsetKeepaliveHandle {
+    state: Arc<(Mutex<bool>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for RsetKeepaliveHandle {
+    fn drop(&mut self) {
+        let (mtx, cv) = &*self.state;
+        *lock(mtx) = true;
+        cv.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_rset_keepalive(
+    rset: Arc<MetalResidencySet>,
+    state: Arc<(Mutex<bool>, Condvar)>,
+    interval: Duration,
+    origin: Instant,
+    last_keepalive_ms: Arc<AtomicU64>,
+) {
+    let (mtx, cv) = &*state;
+    let mut stopped = lock(mtx);
+    while !*stopped {
+        let (guard, _) = cv
+            .wait_timeout_while(stopped, interval, |s| !*s)
+            .unwrap_or_else(PoisonError::into_inner);
+        stopped = guard;
+        if *stopped {
+            break;
+        }
+        drop(stopped);
+        rset.request();
+        let ms = origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        last_keepalive_ms.store(ms, Ordering::Release);
+        stopped = lock(mtx);
+    }
+}
+
 struct MmapLayer {
     ci: usize,
     projs: [MmapProj; 3],
 }
 
 struct MmapExpertBank {
-    // Drop order is load-bearing: join pre-warm, release Metal residency set,
-    // drop MTL::Buffer arrays (`layers`), then release shard Arcs (`_shards`).
+    // Drop order is load-bearing: join keepalive and pre-warm threads,
+    // release Metal residency set, drop MTL::Buffer arrays (`layers`), then
+    // release shard Arcs (`_shards`).
+    _rset_keepalive: Option<RsetKeepaliveHandle>,
     _warm: Option<MmapWarmHandle>,
-    rset: Option<MetalResidencySet>,
+    rset: Option<Arc<MetalResidencySet>>,
     layers: Vec<MmapLayer>,
     _shards: Vec<Arc<MmapShard>>,
     layer_to_idx: Vec<Option<usize>>,
@@ -1930,7 +1987,7 @@ struct MmapExpertBank {
     mapped_bytes: u64,
     in_turn: Arc<AtomicBool>,
     origin: Instant,
-    last_keepalive_ms: AtomicU64,
+    last_keepalive_ms: Arc<AtomicU64>,
     prefill_ran: AtomicBool,
 }
 
@@ -2107,7 +2164,26 @@ impl MmapExpertBank {
             .iter()
             .flat_map(|l| l.projs.iter().map(|p| &p.buf))
             .collect();
-        let rset = MetalResidencySet::create(&buf_refs);
+        let rset = MetalResidencySet::create(&buf_refs).map(Arc::new);
+        let origin = Instant::now();
+        let last_keepalive_ms = Arc::new(AtomicU64::new(0));
+        let rset_keepalive = match (&rset, rset_keepalive_interval()) {
+            (Some(rset_ref), Some(interval)) => {
+                let state = Arc::new((Mutex::new(false), Condvar::new()));
+                let rset_c = Arc::clone(rset_ref);
+                let state_c = Arc::clone(&state);
+                let last_c = Arc::clone(&last_keepalive_ms);
+                let worker = std::thread::Builder::new()
+                    .name("hy4-rset-keepalive".into())
+                    .spawn(move || run_rset_keepalive(rset_c, state_c, interval, origin, last_c))
+                    .map_err(|e| bad(format!("spawn rset keepalive thread: {e}")))?;
+                Some(RsetKeepaliveHandle {
+                    state,
+                    worker: Some(worker),
+                })
+            }
+            _ => None,
+        };
 
         // Skip background pread pre-warming in auto mode when Metal residency
         // sets already pin mmap pages, preventing idle page-cache pressure.
@@ -2145,6 +2221,7 @@ impl MmapExpertBank {
         };
 
         Ok(Self {
+            _rset_keepalive: rset_keepalive,
             _warm: warm,
             rset,
             layers,
@@ -2155,8 +2232,8 @@ impl MmapExpertBank {
             cache_slots,
             mapped_bytes,
             in_turn,
-            origin: Instant::now(),
-            last_keepalive_ms: AtomicU64::new(0),
+            origin,
+            last_keepalive_ms,
             prefill_ran: AtomicBool::new(false),
         })
     }
@@ -2505,6 +2582,11 @@ impl KqBank {
     #[cfg(test)]
     pub(crate) fn has_residency_set(&self) -> bool {
         matches!(self.direct.get(), Some(ResidentBank::Mmap(m)) if m.rset.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_rset_keepalive(&self) -> bool {
+        matches!(self.direct.get(), Some(ResidentBank::Mmap(m)) if m._rset_keepalive.is_some())
     }
 
     /// Records `count` routed-expert uses for `layer` in direct or mmap mode.

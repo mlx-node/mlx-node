@@ -3502,6 +3502,7 @@ unsafe extern "C" {
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
+        gate: *mut mlx_array,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_dense_prefill(
@@ -3695,6 +3696,15 @@ unsafe extern "C" {
         kmax: i32,
         block_size: i32,
     ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_moe_prefill_sort_tiles(
+        ids: *mut mlx_array,
+        n_experts: i32,
+        out_token_rows: *mut *mut mlx_array,
+        out_tiles: *mut *mut mlx_array,
+        out_inverse: *mut *mut mlx_array,
+        out_sorted_slots: *mut *mut mlx_array,
+    ) -> bool;
 }
 
 unsafe extern "C-unwind" {

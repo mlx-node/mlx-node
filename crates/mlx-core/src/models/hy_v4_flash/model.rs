@@ -981,7 +981,7 @@ impl Model {
                 pending_trace_out = false;
             }
             match wave.kind() {
-                RowKind::Prefill => {
+                RowKind::Prefill if !direct => {
                     match &next_carry {
                         HcCarry::Streams(y) => super::stats::eval(&[y], "hy_v4_flash layer")?,
                         HcCarry::Pending { y, res, post, .. } => {
@@ -992,13 +992,16 @@ impl Model {
                         b.settle_all();
                     }
                 }
-                RowKind::Decode => {
+                RowKind::Prefill | RowKind::Decode => {
                     if !direct || (l >= 2 && (l - 2).is_multiple_of(3)) {
                         match &next_carry {
                             HcCarry::Streams(y) => MxArray::async_eval_arrays(&[y]),
                             HcCarry::Pending { y, res, post, .. } => {
                                 MxArray::async_eval_arrays(&[y, res, post])
                             }
+                        }
+                        if direct && wave.kind() == RowKind::Prefill {
+                            super::stats::async_flush();
                         }
                     }
                 }
@@ -1015,7 +1018,6 @@ impl Model {
             }
         }
         if direct && wave.kind() == RowKind::Prefill {
-            crate::array::clear_cache();
             for b in &self.banks {
                 b.mark_prefill_wave();
                 b.keep_residency_alive();
@@ -1031,6 +1033,12 @@ impl Model {
         let tp = prof_start();
         let outs = self.heads_carry(carry, owners, wave)?;
         prof_end(Phase::Head, tp, &[])?;
+        if direct
+            && wave.kind() == RowKind::Prefill
+            && (0..wave.owners()).any(|i| owners.want(i).logits != Logits::None)
+        {
+            crate::array::clear_cache();
+        }
         Ok(outs)
     }
 

@@ -1,14 +1,17 @@
 R"METAL(
-// Short-row grouped SymQ8 decode helpers (K = 192 half-warp, K = 512 full-warp).
-template <int M_TILE, typename ScalePtr>
+// Short-row grouped Q8 decode helpers (K = 192 half-warp, K = 512 full-warp).
+template <int M_TILE, bool SYM_F16, typename ScalePtr, typename BiasPtr>
 inline void hy4_q8_grouped_k192_impl(
     const device float* x,
     const device uint32_t* w,
     ScalePtr scales,
+    BiasPtr biases,
     device float* out,
     int M,
     int G,
     int N,
+    size_t x_s0_f4,
+    size_t x_s1_f4,
     uint tgp_y,
     uint tgp_z,
     uint sg,
@@ -58,27 +61,58 @@ inline void hy4_q8_grouped_k192_impl(
   const float s1_1 = float(s_row1[g1]);
   const float s1_2 = float(s_row1[g2]);
 
-  const float4 w0_0 = float4(as_type<char4>(u0_0 ^ 0x80808080u)) * s0_0;
-  const float4 w0_1 = float4(as_type<char4>(u0_1 ^ 0x80808080u)) * s0_1;
-  const float4 w0_2 = float4(as_type<char4>(u0_2 ^ 0x80808080u)) * s0_2;
-
-  const float4 w1_0 = float4(as_type<char4>(u1_0 ^ 0x80808080u)) * s1_0;
-  const float4 w1_1 = float4(as_type<char4>(u1_1 ^ 0x80808080u)) * s1_1;
-  const float4 w1_2 = float4(as_type<char4>(u1_2 ^ 0x80808080u)) * s1_2;
-
   const device float4* x_base = reinterpret_cast<const device float4*>(x);
   float acc[M_TILE][2];
+
+  if constexpr (SYM_F16) {
+    const float4 w0_0 = float4(as_type<char4>(u0_0 ^ 0x80808080u)) * s0_0;
+    const float4 w0_1 = float4(as_type<char4>(u0_1 ^ 0x80808080u)) * s0_1;
+    const float4 w0_2 = float4(as_type<char4>(u0_2 ^ 0x80808080u)) * s0_2;
+
+    const float4 w1_0 = float4(as_type<char4>(u1_0 ^ 0x80808080u)) * s1_0;
+    const float4 w1_1 = float4(as_type<char4>(u1_1 ^ 0x80808080u)) * s1_1;
+    const float4 w1_2 = float4(as_type<char4>(u1_2 ^ 0x80808080u)) * s1_2;
+
 #pragma unroll
-  for (int r = 0; r < M_TILE; ++r) {
-    const int mr = metal::min(row0 + r, M - 1);
-    const device float4* xp =
-        x_base + (size_t(mr) * size_t(G) + size_t(g)) * size_t(N_F4) +
-        size_t(k0);
-    const float4 x0 = xp[0];
-    const float4 x1 = xp[1];
-    const float4 x2 = xp[2];
-    acc[r][0] = metal::dot(x0, w0_0) + metal::dot(x1, w0_1) + metal::dot(x2, w0_2);
-    acc[r][1] = metal::dot(x0, w1_0) + metal::dot(x1, w1_1) + metal::dot(x2, w1_2);
+    for (int r = 0; r < M_TILE; ++r) {
+      const int mr = metal::min(row0 + r, M - 1);
+      const device float4* xp =
+          x_base + size_t(mr) * x_s0_f4 + size_t(g) * x_s1_f4 + size_t(k0);
+      const float4 x0 = xp[0];
+      const float4 x1 = xp[1];
+      const float4 x2 = xp[2];
+      acc[r][0] = metal::dot(x0, w0_0) + metal::dot(x1, w0_1) + metal::dot(x2, w0_2);
+      acc[r][1] = metal::dot(x0, w1_0) + metal::dot(x1, w1_1) + metal::dot(x2, w1_2);
+    }
+  } else {
+    const auto b_row0 = biases + wrow0 * size_t(N_GRP);
+    const auto b_row1 = biases + wrow1 * size_t(N_GRP);
+    const float b0_0 = float(b_row0[g0]);
+    const float b0_1 = float(b_row0[g1]);
+    const float b0_2 = float(b_row0[g2]);
+    const float b1_0 = float(b_row1[g0]);
+    const float b1_1 = float(b_row1[g1]);
+    const float b1_2 = float(b_row1[g2]);
+
+    const float4 w0_0 = float4(as_type<uchar4>(u0_0)) * s0_0 + b0_0;
+    const float4 w0_1 = float4(as_type<uchar4>(u0_1)) * s0_1 + b0_1;
+    const float4 w0_2 = float4(as_type<uchar4>(u0_2)) * s0_2 + b0_2;
+
+    const float4 w1_0 = float4(as_type<uchar4>(u1_0)) * s1_0 + b1_0;
+    const float4 w1_1 = float4(as_type<uchar4>(u1_1)) * s1_1 + b1_1;
+    const float4 w1_2 = float4(as_type<uchar4>(u1_2)) * s1_2 + b1_2;
+
+#pragma unroll
+    for (int r = 0; r < M_TILE; ++r) {
+      const int mr = metal::min(row0 + r, M - 1);
+      const device float4* xp =
+          x_base + size_t(mr) * x_s0_f4 + size_t(g) * x_s1_f4 + size_t(k0);
+      const float4 x0 = xp[0];
+      const float4 x1 = xp[1];
+      const float4 x2 = xp[2];
+      acc[r][0] = metal::dot(x0, w0_0) + metal::dot(x1, w0_1) + metal::dot(x2, w0_2);
+      acc[r][1] = metal::dot(x0, w1_0) + metal::dot(x1, w1_1) + metal::dot(x2, w1_2);
+    }
   }
 
 #pragma unroll
@@ -104,15 +138,19 @@ inline void hy4_q8_grouped_k192_impl(
   }
 }
 
-template <int M_TILE, typename ScalePtr>
+template <int M_TILE, bool SYM_F16, bool GATED, typename ScalePtr, typename BiasPtr, typename GatePtr>
 inline void hy4_q8_grouped_k512_impl(
     const device float* x,
     const device uint32_t* w,
     ScalePtr scales,
+    BiasPtr biases,
+    GatePtr gate,
     device float* out,
     int M,
     int G,
     int N,
+    size_t g_s0,
+    size_t g_s1,
     uint tgp_y,
     uint tgp_z,
     uint sg,
@@ -149,45 +187,89 @@ inline void hy4_q8_grouped_k512_impl(
   const uint4 w1_u = w_ptr1[lane];
   const float sc1 = float(s_row1[grp]);
 
-  const float4 q0_0 = float4(as_type<char4>(w0_u.x ^ 0x80808080u));
-  const float4 q0_1 = float4(as_type<char4>(w0_u.y ^ 0x80808080u));
-  const float4 q0_2 = float4(as_type<char4>(w0_u.z ^ 0x80808080u));
-  const float4 q0_3 = float4(as_type<char4>(w0_u.w ^ 0x80808080u));
-
-  const float4 q1_0 = float4(as_type<char4>(w1_u.x ^ 0x80808080u));
-  const float4 q1_1 = float4(as_type<char4>(w1_u.y ^ 0x80808080u));
-  const float4 q1_2 = float4(as_type<char4>(w1_u.z ^ 0x80808080u));
-  const float4 q1_3 = float4(as_type<char4>(w1_u.w ^ 0x80808080u));
-
   const device float4* x_base = reinterpret_cast<const device float4*>(x);
   float acc[M_TILE][2];
+
+  if constexpr (SYM_F16) {
+    const float4 q0_0 = float4(as_type<char4>(w0_u.x ^ 0x80808080u));
+    const float4 q0_1 = float4(as_type<char4>(w0_u.y ^ 0x80808080u));
+    const float4 q0_2 = float4(as_type<char4>(w0_u.z ^ 0x80808080u));
+    const float4 q0_3 = float4(as_type<char4>(w0_u.w ^ 0x80808080u));
+
+    const float4 q1_0 = float4(as_type<char4>(w1_u.x ^ 0x80808080u));
+    const float4 q1_1 = float4(as_type<char4>(w1_u.y ^ 0x80808080u));
+    const float4 q1_2 = float4(as_type<char4>(w1_u.z ^ 0x80808080u));
+    const float4 q1_3 = float4(as_type<char4>(w1_u.w ^ 0x80808080u));
+
 #pragma unroll
-  for (int r = 0; r < M_TILE; ++r) {
-    const int mr = metal::min(row0 + r, M - 1);
-    const device float4* xp =
-        x_base + (size_t(mr) * size_t(G) + size_t(g)) * size_t(N_F4) +
-        size_t(f4_idx);
-    const float4 x0 = xp[0];
-    const float4 x1 = xp[1];
-    const float4 x2 = xp[2];
-    const float4 x3 = xp[3];
-    const float d0 = metal::dot(x0, q0_0) + metal::dot(x1, q0_1) +
-                     metal::dot(x2, q0_2) + metal::dot(x3, q0_3);
-    const float d1 = metal::dot(x0, q1_0) + metal::dot(x1, q1_1) +
-                     metal::dot(x2, q1_2) + metal::dot(x3, q1_3);
-    acc[r][0] = d0 * sc0;
-    acc[r][1] = d1 * sc1;
+    for (int r = 0; r < M_TILE; ++r) {
+      const int mr = metal::min(row0 + r, M - 1);
+      const device float4* xp =
+          x_base + (size_t(mr) * size_t(G) + size_t(g)) * size_t(N_F4) +
+          size_t(f4_idx);
+      const float4 x0 = xp[0];
+      const float4 x1 = xp[1];
+      const float4 x2 = xp[2];
+      const float4 x3 = xp[3];
+      const float d0 = metal::dot(x0, q0_0) + metal::dot(x1, q0_1) +
+                       metal::dot(x2, q0_2) + metal::dot(x3, q0_3);
+      const float d1 = metal::dot(x0, q1_0) + metal::dot(x1, q1_1) +
+                       metal::dot(x2, q1_2) + metal::dot(x3, q1_3);
+      acc[r][0] = d0 * sc0;
+      acc[r][1] = d1 * sc1;
+    }
+  } else {
+    const float bi0 = float(biases[wrow0 * size_t(N_GRP) + size_t(grp)]);
+    const float bi1 = float(biases[wrow1 * size_t(N_GRP) + size_t(grp)]);
+    const float4 q0_0 = float4(as_type<uchar4>(w0_u.x));
+    const float4 q0_1 = float4(as_type<uchar4>(w0_u.y));
+    const float4 q0_2 = float4(as_type<uchar4>(w0_u.z));
+    const float4 q0_3 = float4(as_type<uchar4>(w0_u.w));
+
+    const float4 q1_0 = float4(as_type<uchar4>(w1_u.x));
+    const float4 q1_1 = float4(as_type<uchar4>(w1_u.y));
+    const float4 q1_2 = float4(as_type<uchar4>(w1_u.z));
+    const float4 q1_3 = float4(as_type<uchar4>(w1_u.w));
+
+#pragma unroll
+    for (int r = 0; r < M_TILE; ++r) {
+      const int mr = metal::min(row0 + r, M - 1);
+      const device float4* xp =
+          x_base + (size_t(mr) * size_t(G) + size_t(g)) * size_t(N_F4) +
+          size_t(f4_idx);
+      const float4 x0 = xp[0];
+      const float4 x1 = xp[1];
+      const float4 x2 = xp[2];
+      const float4 x3 = xp[3];
+      const float4 xs = (x0 + x1) + (x2 + x3);
+      const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
+      const float d0 = metal::dot(x0, q0_0) + metal::dot(x1, q0_1) +
+                       metal::dot(x2, q0_2) + metal::dot(x3, q0_3);
+      const float d1 = metal::dot(x0, q1_0) + metal::dot(x1, q1_1) +
+                       metal::dot(x2, q1_2) + metal::dot(x3, q1_3);
+      acc[r][0] = metal::fma(d0, sc0, xsum * bi0);
+      acc[r][1] = metal::fma(d1, sc1, xsum * bi1);
+    }
   }
 
 #pragma unroll
   for (int r = 0; r < M_TILE; ++r) {
-    const float v0 = simd_sum(acc[r][0]);
-    const float v1 = simd_sum(acc[r][1]);
+    float v0 = simd_sum(acc[r][0]);
+    float v1 = simd_sum(acc[r][1]);
     const int mr = row0 + r;
     if (lane == 0 && mr < M) {
       const size_t obase = (size_t(mr) * size_t(G) + size_t(g)) * size_t(N);
+      const size_t gbase = size_t(mr) * g_s0 + size_t(g) * g_s1;
+      if constexpr (GATED) {
+        const float g0 = gate[gbase + size_t(out_row0)];
+        v0 *= 1.0f / (1.0f + metal::exp(-g0));
+      }
       out[obase + size_t(out_row0)] = v0;
       if (out_row0 + 1 < N) {
+        if constexpr (GATED) {
+          const float g1 = gate[gbase + size_t(out_row0 + 1)];
+          v1 *= 1.0f / (1.0f + metal::exp(-g1));
+        }
         out[obase + size_t(out_row0 + 1)] = v1;
       }
     }

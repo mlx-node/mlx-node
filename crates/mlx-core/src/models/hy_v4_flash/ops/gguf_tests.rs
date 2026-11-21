@@ -421,6 +421,43 @@ fn gguf_routed_decode_matches_kq_decode_q4k_and_q6k() {
             7.0,
             true,
         );
+        // Realistic MTP-1 mix: ROWS=2, TOP=16 with unique + shared experts + OOB slot.
+        let mut slots_r2_mix: Vec<u32> = (0..16).chain(10..26).map(|i| i % 24).collect();
+        slots_r2_mix[15] = 24;
+        run_decode_parity_case(
+            550 + down_bits as u64,
+            down_bits,
+            24,
+            1536,
+            1536,
+            1536,
+            2,
+            16,
+            &slots_r2_mix,
+            4.0,
+            7.0,
+            true,
+        );
+        // Realistic Hy4 dims, ROWS=4, TOP=16 with shared + unique experts + OOB slot.
+        let mut slots_r4: Vec<u32> = (0..64)
+            .map(|i| ((i / 16) * 5 + (i % 16) * 2) % 12)
+            .collect();
+        slots_r4[7] = 12;
+        slots_r4[39] = 12;
+        run_decode_parity_case(
+            600 + down_bits as u64,
+            down_bits,
+            12,
+            1536,
+            1536,
+            1536,
+            4,
+            16,
+            &slots_r4,
+            4.0,
+            7.0,
+            true,
+        );
     }
 }
 
@@ -571,16 +608,63 @@ fn run_prefill_parity_case(
     .unwrap()
     .expect("gguf_prefill_indirect_gu returned None when kq_prefill_indirect_gu succeeded");
 
-    let (gu_max, gu_rel) = error_stats(&eval_f32(&got_hidden), &eval_f32(&ref_hidden));
+    let x_sorted = x_arr
+        .take(&tr_arr, 0)
+        .unwrap()
+        .reshape(&[pairs as i64, 1, 1, k as i64])
+        .unwrap();
+    let slots_2d = slots_arr.reshape(&[pairs as i64, 1]).unwrap();
+    let fp32_g = g_kq
+        .gather(&x_sorted, &slots_2d)
+        .unwrap()
+        .astype(DType::Float32)
+        .unwrap()
+        .reshape(&[pairs as i64, m as i64])
+        .unwrap();
+    let fp32_u = u_kq
+        .gather(&x_sorted, &slots_2d)
+        .unwrap()
+        .astype(DType::Float32)
+        .unwrap()
+        .reshape(&[pairs as i64, m as i64])
+        .unwrap();
+    let fp32_hidden =
+        crate::nn::Activations::swiglu_clamped_compiled(&fp32_g, &fp32_u, limit).unwrap();
+
+    let (gu_f32_max, gu_f32_rel) = error_stats(&eval_f32(&got_hidden), &eval_f32(&fp32_hidden));
     eprintln!(
-        "gguf_prefill GU bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={gu_max:e} rel_l2={gu_rel:e}"
+        "gguf_prefill GU vs FP32 bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={gu_f32_max:e} rel_l2={gu_f32_rel:e}"
     );
     assert!(
-        gu_rel <= 5e-4,
-        "prefill GU parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={gu_max:e} rel_l2={gu_rel:e}"
+        gu_f32_rel <= 5e-4,
+        "prefill GU vs FP32 parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={gu_f32_max:e} rel_l2={gu_f32_rel:e}"
+    );
+
+    let (gu_max, gu_rel) = error_stats(&eval_f32(&got_hidden), &eval_f32(&ref_hidden));
+    eprintln!(
+        "gguf_prefill GU vs TF32-kq bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={gu_max:e} rel_l2={gu_rel:e}"
+    );
+    // `kq_prefill_indirect_gu` uses TF32 MMA (~2^-10 mantissa), whereas
+    // `gguf_prefill_indirect_gu` splits f32 activations into hi+lo f16 with
+    // exact 4-bit weights and f32 post-scaling (~2e-4 vs FP32 from f16 output).
+    assert!(
+        gu_rel <= 2e-3,
+        "prefill GU vs TF32-kq parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={gu_max:e} rel_l2={gu_rel:e}"
     );
 
     let max_group = sorted_slots.last().map_or(0, |&s| (s as i32) + 1);
+    let fp32_down = d_kq
+        .gather(
+            &fp32_hidden
+                .reshape(&[pairs as i64, 1, 1, m as i64])
+                .unwrap(),
+            &slots_2d,
+        )
+        .unwrap()
+        .astype(DType::Float32)
+        .unwrap()
+        .reshape(&[pairs as i64, h as i64])
+        .unwrap();
     let ref_down = d_kq
         .gather_sorted_nax_bounded(
             &ref_hidden.reshape(&[pairs as i64, 1, m as i64]).unwrap(),
@@ -605,24 +689,42 @@ fn run_prefill_parity_case(
     .unwrap()
     .expect("gguf_prefill_indirect_down returned None when NAX is available");
 
-    let (d_max, d_rel) = error_stats(&eval_f32(&got_down), &eval_f32(&ref_down));
+    let (d_f32_max, d_f32_rel) = error_stats(&eval_f32(&got_down), &eval_f32(&fp32_down));
     eprintln!(
-        "gguf_prefill DOWN bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={d_max:e} rel_l2={d_rel:e}"
+        "gguf_prefill DOWN vs FP32 bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={d_f32_max:e} rel_l2={d_f32_rel:e}"
     );
     assert!(
-        d_rel <= 5e-4,
-        "prefill DOWN parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={d_max:e} rel_l2={d_rel:e}"
+        d_f32_rel <= 5e-4,
+        "prefill DOWN vs FP32 parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={d_f32_max:e} rel_l2={d_f32_rel:e}"
     );
 
-    let ref_comb = call_kq_sorted_combine(&ref_down, &weights_arr, &inv_arr);
-    let got_comb = call_kq_sorted_combine(&got_down, &weights_arr, &inv_arr);
-    let (c_max, c_rel) = error_stats(&eval_f32(&got_comb), &eval_f32(&ref_comb));
+    let (d_max, d_rel) = error_stats(&eval_f32(&got_down), &eval_f32(&ref_down));
     eprintln!(
-        "gguf_prefill COMBINE bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={c_max:e} rel_l2={c_rel:e}"
+        "gguf_prefill DOWN vs TF32-kq bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={d_max:e} rel_l2={d_rel:e}"
     );
     assert!(
-        c_rel <= 5e-4,
-        "prefill COMBINE parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={c_max:e} rel_l2={c_rel:e}"
+        d_rel <= 2.5e-3,
+        "prefill DOWN vs TF32-kq parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={d_max:e} rel_l2={d_rel:e}"
+    );
+
+    let fp32_comb = call_kq_sorted_combine(&fp32_down, &weights_arr, &inv_arr);
+    let ref_comb = call_kq_sorted_combine(&ref_down, &weights_arr, &inv_arr);
+    let got_comb = call_kq_sorted_combine(&got_down, &weights_arr, &inv_arr);
+    let (c_f32_max, c_f32_rel) = error_stats(&eval_f32(&got_comb), &eval_f32(&fp32_comb));
+    eprintln!(
+        "gguf_prefill COMBINE vs FP32 bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={c_f32_max:e} rel_l2={c_f32_rel:e}"
+    );
+    assert!(
+        c_f32_rel <= 5e-4,
+        "prefill COMBINE vs FP32 parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={c_f32_max:e} rel_l2={c_f32_rel:e}"
+    );
+    let (c_max, c_rel) = error_stats(&eval_f32(&got_comb), &eval_f32(&ref_comb));
+    eprintln!(
+        "gguf_prefill COMBINE vs TF32-kq bits={down_bits} K={k} M={m} H={h} R={pairs}: max_abs={c_max:e} rel_l2={c_rel:e}"
+    );
+    assert!(
+        c_rel <= 2.5e-3,
+        "prefill COMBINE vs TF32-kq parity failed (bits={down_bits} K={k} M={m} H={h} R={pairs}): max_abs={c_max:e} rel_l2={c_rel:e}"
     );
 }
 

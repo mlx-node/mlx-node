@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ use crate::array::MxArray;
 pub use crate::models::deepseek_v41::stats::{host_pressure, rusage};
 
 pub const STATS_ENV: &str = "MLX_HY4_STATS";
+pub const PROFILE_ENV: &str = "MLX_HY4_PROFILE";
 
 /// Phases of a forward. Each phase evaluates its outputs before its clock
 /// stops, so phases do not overlap (an eval does not change bits).
@@ -62,7 +64,17 @@ pub const PHASES: [Phase; 11] = [
 ];
 
 static PHASE_NS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static PROFILE_EMITTED_NS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static PROFILE_EMIT_LOCK: Mutex<()> = Mutex::new(());
+static PROFILE_INIT: OnceLock<()> = OnceLock::new();
 static PROFILE: AtomicBool = AtomicBool::new(false);
+
+fn parse_profile_env(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let t = v.trim();
+        t == "1" || t.eq_ignore_ascii_case("true")
+    })
+}
 
 impl Phase {
     pub fn name(self) -> &'static str {
@@ -83,12 +95,60 @@ impl Phase {
 }
 
 pub fn profiling() -> bool {
+    PROFILE_INIT.get_or_init(|| {
+        if parse_profile_env(std::env::var(PROFILE_ENV).ok().as_deref()) {
+            PROFILE.store(true, Ordering::Relaxed);
+        }
+    });
     PROFILE.load(Ordering::Relaxed)
 }
 
 /// Turns the phase split on or off for this process.
 pub fn set_profiling(on: bool) {
+    let _ = PROFILE_INIT.set(());
     PROFILE.store(on, Ordering::Relaxed);
+}
+
+/// Returns per-phase delta milliseconds since the previous emission and advances
+/// the emission cursor (leaving `phase_seconds()` monotonic). Returns `None`
+/// when no phase recorded time since the last emission.
+pub fn take_profile_delta_ms() -> Option<[f64; 11]> {
+    let _g = PROFILE_EMIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut delta_ms = [0.0f64; 11];
+    let mut any = false;
+    for i in 0..PHASES.len() {
+        let cur = PHASE_NS[i].load(Ordering::Relaxed);
+        let prev = PROFILE_EMITTED_NS[i].swap(cur, Ordering::Relaxed);
+        let diff = cur.saturating_sub(prev);
+        if diff > 0 {
+            any = true;
+            delta_ms[i] = diff as f64 * 1e-6;
+        }
+    }
+    any.then_some(delta_ms)
+}
+
+pub fn format_profile_line(label: &str, ms: &[f64; 11]) -> String {
+    let total: f64 = ms.iter().sum();
+    let mut out = format!("[HY4_PROF] stage={label} total_ms={total:.2}");
+    for (p, &v) in PHASES.iter().zip(ms) {
+        use std::fmt::Write as _;
+        let _ = write!(out, " {}={v:.2}", p.name());
+    }
+    out
+}
+
+/// When profiling is active and any phase accrued time since the last emission,
+/// prints a compact summary line to stderr and advances the cursor.
+pub fn emit_profile(label: &str) {
+    if !profiling() {
+        return;
+    }
+    if let Some(ms) = take_profile_delta_ms() {
+        eprintln!("{}", format_profile_line(label, &ms));
+    }
 }
 
 /// A phase clock when profiling (the GPU is drained first, so the phase
@@ -430,6 +490,7 @@ impl WaveLog {
         for &(seq, r) in s.owners {
             self.open.insert(seq, r);
         }
+        emit_profile("decode");
     }
 
     /// `seq` lost its top `rows` rows: those of its last wave among them

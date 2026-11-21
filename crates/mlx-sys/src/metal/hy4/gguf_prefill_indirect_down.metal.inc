@@ -1,8 +1,8 @@
 R"METAL(
 constexpr int BM = 32;
 constexpr int BN = 64;
-constexpr int BK = 32;
-constexpr int PAD = 36;
+constexpr int BK = 64;
+constexpr int PAD = 72;
 
 const int R = hidden_shape[0];
 const int M = hidden_shape[1];
@@ -26,105 +26,136 @@ const short tn = short((sg_idx % 2u) * 32u);
 const short valid_m = short(max(0, min(16, int(end - begin) - int(tm))));
 const short valid_n = short(max(0, min(32, int(H) - int(col + uint(tn)))));
 
-// BM=32, BN=64, BK=32, PAD=36 keeps threadgroup memory at 13,824 B (<= 32 KB).
-alignas(16) threadgroup float As[BM * PAD];
-alignas(16) threadgroup float Bs[BN * PAD];
+// As (4,608 B) + Bs (9,216 B) = 13,824 B <= 16 KiB (2 TGs/core).
+alignas(16) threadgroup half As[BM * PAD];
+alignas(16) threadgroup half Bs[BN * PAD];
 
-constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-    16, 32, 16, false, true, true,
-    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-auto ca = op.template get_left_input_cooperative_tensor<float, float, float>();
-auto cb = op.template get_right_input_cooperative_tensor<float, float, float>();
-using AT = metal::remove_addrspace_t<decltype(ca)>;
-using BT = metal::remove_addrspace_t<decltype(cb)>;
-auto cd = op.template get_destination_cooperative_tensor<AT, BT, float>();
-constexpr int FE = NAXTile<float, 1, 2>::kElemsPerFrag;
-STEEL_PRAGMA_UNROLL
-for (int e = 0; e < 2 * FE; ++e) {
-  cd[e] = 0.0f;
-}
+NAXTile<float, 1, 2> cd;
+cd.clear();
 
 if (slot < uint(S)) {
-  const uint ar = tid / 4u;
-  const uint ac = (tid % 4u) * 8u;
+  const uint ar = tid >> 2;
+  const uint ac = (tid & 3u) * 16u;
   const bool live = (begin + ar) < end;
-  float4 av[2];
+  half4 av[4];
   if (live) {
-    const device float4* src = reinterpret_cast<const device float4*>(
-        hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
-    av[0] = src[0];
-    av[1] = src[1];
+    if constexpr (IN_F16) {
+      const device half4* src = reinterpret_cast<const device half4*>(
+          hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
+      av[0] = src[0];
+      av[1] = src[1];
+      av[2] = src[2];
+      av[3] = src[3];
+    } else {
+      const device float4* src = reinterpret_cast<const device float4*>(
+          hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
+      av[0] = half4(src[0]);
+      av[1] = half4(src[1]);
+      av[2] = half4(src[2]);
+      av[3] = half4(src[3]);
+    }
   } else {
-    threadgroup float4* dst =
-        reinterpret_cast<threadgroup float4*>(As + ar * PAD + ac);
-    dst[0] = float4(0.0f);
-    dst[1] = float4(0.0f);
+    threadgroup half4* dst =
+        reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
+    dst[0] = half4(0.0h);
+    dst[1] = half4(0.0h);
+    dst[2] = half4(0.0h);
+    dst[3] = half4(0.0h);
   }
 
-  // 2 threads per weight row: half_id=0 covers 0..15, half_id=1 covers 16..31.
-  const uint wr_local = tid >> 1;
-  const uint half_id = tid & 1u;
-  const bool w_live = (col + wr_local) < uint(H);
+  // 4 threads per weight row cooperatively load 8 consecutive bytes each = 32 B.
+  const uint row0 = tid >> 2;
+  const uint lane4 = tid & 3u;
+  const ushort quad_base = ushort(lane & ~3u);
+  const bool w_live[2] = {
+      (col + row0) < uint(H),
+      (col + row0 + 32u) < uint(H),
+  };
   constexpr size_t BLK_BYTES = (BITS == 6) ? 210u : 144u;
   const size_t row_bytes = size_t(M / 256) * BLK_BYTES;
-  const device uint8_t* w_row =
-      down_buf + size_t(down_off[0]) +
-      (size_t(slot) * size_t(H) + size_t(col + wr_local)) * row_bytes;
-  threadgroup float4* w_dst4 = reinterpret_cast<threadgroup float4*>(
-      Bs + wr_local * PAD + half_id * 16u);
-
-  if (!w_live) {
-    STEEL_PRAGMA_UNROLL
-    for (int i = 0; i < 4; ++i) {
-      w_dst4[i] = float4(0.0f);
+  const device uint8_t* w_row[2];
+  STEEL_PRAGMA_UNROLL
+  for (int p = 0; p < 2; ++p) {
+    const uint wr = row0 + uint(p) * 32u;
+    w_row[p] = down_buf + size_t(down_off[0]) +
+        (size_t(slot) * size_t(H) + size_t(col + wr)) * row_bytes;
+    if (!w_live[p]) {
+      threadgroup half4* d_lo =
+          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+      threadgroup half4* d_hi =
+          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+      d_lo[0] = half4(0.0h);
+      d_lo[1] = half4(0.0h);
+      d_hi[0] = half4(0.0h);
+      d_hi[1] = half4(0.0h);
     }
   }
 
   if constexpr (BITS == 4) {
-    float blk_d = 0.0f;
-    float blk_dmin = 0.0f;
-    uint32_t sc_w[3] = {0u, 0u, 0u};
-    uint32_t qs_w[4];
+    float blk_d[2], blk_dmin[2];
+    uint32_t sc_w[2][3];
+    uint32_t qs_w[2][2];
 
-    if (w_live) {
-      const half2 dm = *reinterpret_cast<const device half2*>(w_row);
-      blk_d = float(dm.x);
-      blk_dmin = float(dm.y);
-      const device uint32_t* scp =
-          reinterpret_cast<const device uint32_t*>(w_row + 4);
-      sc_w[0] = scp[0];
-      sc_w[1] = scp[1];
-      sc_w[2] = scp[2];
-      const device uint32_t* qsp = reinterpret_cast<const device uint32_t*>(
-          w_row + 16 + size_t(half_id) * 16u);
-      STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; ++i) {
-        qs_w[i] = qsp[i];
+    STEEL_PRAGMA_UNROLL
+    for (int p = 0; p < 2; ++p) {
+      const uint32_t hdr = w_live[p]
+          ? reinterpret_cast<const device uint32_t*>(w_row[p])[lane4]
+          : 0u;
+      const half2 dm = as_type<half2>(simd_shuffle(hdr, quad_base));
+      blk_d[p] = float(dm.x);
+      blk_dmin[p] = float(dm.y);
+      sc_w[p][0] = simd_shuffle(hdr, quad_base | 1u);
+      sc_w[p][1] = simd_shuffle(hdr, quad_base | 2u);
+      sc_w[p][2] = simd_shuffle(hdr, quad_base | 3u);
+      if (w_live[p]) {
+        const device uint32_t* qsp = reinterpret_cast<const device uint32_t*>(
+            w_row[p] + 16u + size_t(lane4) * 8u);
+        qs_w[p][0] = qsp[0];
+        qs_w[p][1] = qsp[1];
       }
     }
 
     for (int base = 0; base < M; base += BK) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (base > 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
       if (live) {
-        threadgroup float4* dst =
-            reinterpret_cast<threadgroup float4*>(As + ar * PAD + ac);
+        threadgroup half4* dst =
+            reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
         dst[0] = av[0];
         dst[1] = av[1];
+        dst[2] = av[2];
+        dst[3] = av[3];
       }
-      if (w_live) {
-        const int g = (base >> 5) & 7;
-        float d_g, m_g;
-        hy4_gguf_q4k_group_scale(sc_w, blk_d, blk_dmin, g, d_g, m_g);
-        const int shift = (g & 1) * 4;
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          const uint32_t w = qs_w[i] >> shift;
-          w_dst4[i] = float4(
-              fma(float(w & 0x0Fu), d_g, m_g),
-              fma(float((w >> 8) & 0x0Fu), d_g, m_g),
-              fma(float((w >> 16) & 0x0Fu), d_g, m_g),
-              fma(float((w >> 24) & 0x0Fu), d_g, m_g));
+      const int c = (base >> 6) & 3;
+      const int g0 = 2 * c;
+      const int g1 = g0 + 1;
+      STEEL_PRAGMA_UNROLL
+      for (int p = 0; p < 2; ++p) {
+        if (w_live[p]) {
+          const uint wr = row0 + uint(p) * 32u;
+          float d0, m0, d1, m1;
+          hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g0, d0, m0);
+          hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g1, d1, m1);
+          threadgroup half4* d_lo =
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+          threadgroup half4* d_hi =
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+          STEEL_PRAGMA_UNROLL
+          for (int i = 0; i < 2; ++i) {
+            const uint32_t w = qs_w[p][i];
+            d_lo[i] = half4(
+                fma(float(w & 0x0Fu), d0, m0),
+                fma(float((w >> 8) & 0x0Fu), d0, m0),
+                fma(float((w >> 16) & 0x0Fu), d0, m0),
+                fma(float((w >> 24) & 0x0Fu), d0, m0));
+            const uint32_t wh = w >> 4;
+            d_hi[i] = half4(
+                fma(float(wh & 0x0Fu), d1, m1),
+                fma(float((wh >> 8) & 0x0Fu), d1, m1),
+                fma(float((wh >> 16) & 0x0Fu), d1, m1),
+                fma(float((wh >> 24) & 0x0Fu), d1, m1));
+          }
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -132,114 +163,142 @@ if (slot < uint(S)) {
       const int next = base + BK;
       if (next < M) {
         if (live) {
-          const device float4* src = reinterpret_cast<const device float4*>(
-              hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-          av[0] = src[0];
-          av[1] = src[1];
-        }
-        if (w_live && ((next & 32) == 0)) {
-          const device uint8_t* nblk = w_row + size_t(next >> 8) * 144u;
-          if ((next & 255) == 0) {
-            const half2 dm = *reinterpret_cast<const device half2*>(nblk);
-            blk_d = float(dm.x);
-            blk_dmin = float(dm.y);
-            const device uint32_t* scp =
-                reinterpret_cast<const device uint32_t*>(nblk + 4);
-            sc_w[0] = scp[0];
-            sc_w[1] = scp[1];
-            sc_w[2] = scp[2];
+          if constexpr (IN_F16) {
+            const device half4* src = reinterpret_cast<const device half4*>(
+                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
+            av[0] = src[0];
+            av[1] = src[1];
+            av[2] = src[2];
+            av[3] = src[3];
+          } else {
+            const device float4* src = reinterpret_cast<const device float4*>(
+                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
+            av[0] = half4(src[0]);
+            av[1] = half4(src[1]);
+            av[2] = half4(src[2]);
+            av[3] = half4(src[3]);
           }
-          const int next_c = (next >> 6) & 3;
-          const device uint32_t* qsp = reinterpret_cast<const device uint32_t*>(
-              nblk + 16 + size_t(next_c) * 32u + size_t(half_id) * 16u);
-          STEEL_PRAGMA_UNROLL
-          for (int i = 0; i < 4; ++i) {
-            qs_w[i] = qsp[i];
+        }
+        const size_t nblk_off = size_t(next >> 8) * 144u;
+        const size_t nq_off =
+            16u + size_t((next >> 6) & 3) * 32u + size_t(lane4) * 8u;
+        STEEL_PRAGMA_UNROLL
+        for (int p = 0; p < 2; ++p) {
+          const device uint8_t* nblk = w_row[p] + nblk_off;
+          if ((next & 255) == 0) {
+            const uint32_t hdr = w_live[p]
+                ? reinterpret_cast<const device uint32_t*>(nblk)[lane4]
+                : 0u;
+            const half2 dm = as_type<half2>(simd_shuffle(hdr, quad_base));
+            blk_d[p] = float(dm.x);
+            blk_dmin[p] = float(dm.y);
+            sc_w[p][0] = simd_shuffle(hdr, quad_base | 1u);
+            sc_w[p][1] = simd_shuffle(hdr, quad_base | 2u);
+            sc_w[p][2] = simd_shuffle(hdr, quad_base | 3u);
+          }
+          if (w_live[p]) {
+            const device uint32_t* qsp =
+                reinterpret_cast<const device uint32_t*>(nblk + nq_off);
+            qs_w[p][0] = qsp[0];
+            qs_w[p][1] = qsp[1];
           }
         }
       }
 
       if (valid_m > 0 && valid_n > 0) {
-        NAXTile<float, 1, 2> A;
-        NAXTile<float, 2, 2> B;
-        A.template load<float, PAD, 1>(As + tm * PAD);
-        B.template load<float, PAD, 1>(Bs + tn * PAD);
-        STEEL_PRAGMA_UNROLL
-        for (short k = 0; k < 2; ++k) {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < FE; ++e) {
-            ca[e] = A.frag_at(0, k)[e];
-            cb[e] = B.frag_at(0, k)[e];
-            cb[FE + e] = B.frag_at(1, k)[e];
-          }
-          op.run(ca, cb, cd);
-        }
+        NAXTile<half, 1, 4> A;
+        NAXTile<half, 2, 4> B;
+        A.template load<half, PAD, 1>(As + tm * PAD);
+        B.template load<half, PAD, 1>(Bs + tn * PAD);
+        tile_matmad_nax(cd, A, metal::false_type{}, B, metal::true_type{});
       }
     }
   } else {
     // block_q6_K is 210 bytes (2-byte aligned only); use uint16_t/int8_t/half only.
-    uint16_t ql0[8];
-    uint16_t ql1[8];
-    uint16_t qh[8];
-    float sc_half[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    const size_t l_off = size_t(half_id) * 16u;
+    uint16_t ql0[2][4];
+    uint16_t ql1[2][4];
+    uint16_t qh[2][4];
+    float sc[2][4];
+    const size_t l_off = size_t(lane4) * 8u;
+    const size_t sc_off = size_t(lane4 >> 1);
 
-    if (w_live) {
-      const device uint16_t* p_ql0 =
-          reinterpret_cast<const device uint16_t*>(w_row + l_off);
-      const device uint16_t* p_ql1 = p_ql0 + 16;
-      const device uint16_t* p_qh =
-          reinterpret_cast<const device uint16_t*>(w_row + 128 + l_off);
-      STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 8; ++i) {
-        ql0[i] = p_ql0[i];
-        ql1[i] = p_ql1[i];
-        qh[i] = p_qh[i];
+    STEEL_PRAGMA_UNROLL
+    for (int p = 0; p < 2; ++p) {
+      if (w_live[p]) {
+        const device uint16_t* p_ql0 =
+            reinterpret_cast<const device uint16_t*>(w_row[p] + l_off);
+        const device uint16_t* p_ql1 = p_ql0 + 16;
+        const device uint16_t* p_qh =
+            reinterpret_cast<const device uint16_t*>(w_row[p] + 128u + l_off);
+        STEEL_PRAGMA_UNROLL
+        for (int i = 0; i < 4; ++i) {
+          ql0[p][i] = p_ql0[i];
+          ql1[p][i] = p_ql1[i];
+          qh[p][i] = p_qh[i];
+        }
+        const float d =
+            float(*reinterpret_cast<const device half*>(w_row[p] + 208u));
+        const device int8_t* scp =
+            reinterpret_cast<const device int8_t*>(w_row[p] + 192u) + sc_off;
+        sc[p][0] = d * float(scp[0]);
+        sc[p][1] = d * float(scp[2]);
+        sc[p][2] = d * float(scp[4]);
+        sc[p][3] = d * float(scp[6]);
       }
-      const float d = float(*reinterpret_cast<const device half*>(w_row + 208));
-      const device int8_t* scp =
-          reinterpret_cast<const device int8_t*>(w_row + 192) + half_id;
-      sc_half[0] = d * float(scp[0]);
-      sc_half[1] = d * float(scp[2]);
-      sc_half[2] = d * float(scp[4]);
-      sc_half[3] = d * float(scp[6]);
     }
 
     for (int base = 0; base < M; base += BK) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (base > 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
       if (live) {
-        threadgroup float4* dst =
-            reinterpret_cast<threadgroup float4*>(As + ar * PAD + ac);
+        threadgroup half4* dst =
+            reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
         dst[0] = av[0];
         dst[1] = av[1];
+        dst[2] = av[2];
+        dst[3] = av[3];
       }
-      if (w_live) {
-        const int q_quad = (base >> 5) & 3;
-        const int ql_shift = (q_quad >> 1) * 4;
-        const int qh_shift = q_quad * 2;
-        const float sc_eff = sc_half[q_quad];
-        const bool use_ql1 = (q_quad & 1) != 0;
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          const uint16_t qa = use_ql1 ? ql1[2 * i] : ql0[2 * i];
-          const uint16_t qb = use_ql1 ? ql1[2 * i + 1] : ql0[2 * i + 1];
-          const uint16_t ha = qh[2 * i];
-          const uint16_t hb = qh[2 * i + 1];
+      const int hi_half = (base >> 6) & 1;
+      const int ql_sh = hi_half ? 4 : 0;
+      const int qh_sh_a = hi_half ? 4 : 0;
+      const int qh_sh_b = hi_half ? 6 : 2;
+      STEEL_PRAGMA_UNROLL
+      for (int p = 0; p < 2; ++p) {
+        if (w_live[p]) {
+          const uint wr = row0 + uint(p) * 32u;
+          const float sc_a = hi_half ? sc[p][2] : sc[p][0];
+          const float sc_b = hi_half ? sc[p][3] : sc[p][1];
+          threadgroup half4* d_lo =
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+          threadgroup half4* d_hi =
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+          STEEL_PRAGMA_UNROLL
+          for (int i = 0; i < 2; ++i) {
+            const uint16_t q0a = ql0[p][2 * i];
+            const uint16_t q0b = ql0[p][2 * i + 1];
+            const uint16_t q1a = ql1[p][2 * i];
+            const uint16_t q1b = ql1[p][2 * i + 1];
+            const uint16_t ha = qh[p][2 * i];
+            const uint16_t hb = qh[p][2 * i + 1];
 
-          const uint8_t ql_b0 = uint8_t(qa & 0xFFu);
-          const uint8_t ql_b1 = uint8_t(qa >> 8);
-          const uint8_t ql_b2 = uint8_t(qb & 0xFFu);
-          const uint8_t ql_b3 = uint8_t(qb >> 8);
-          const uint8_t qh_b0 = uint8_t(ha & 0xFFu);
-          const uint8_t qh_b1 = uint8_t(ha >> 8);
-          const uint8_t qh_b2 = uint8_t(hb & 0xFFu);
-          const uint8_t qh_b3 = uint8_t(hb >> 8);
+            const uint8_t h0 = uint8_t(ha & 0xFFu);
+            const uint8_t h1 = uint8_t(ha >> 8);
+            const uint8_t h2 = uint8_t(hb & 0xFFu);
+            const uint8_t h3 = uint8_t(hb >> 8);
 
-          const int c0 = int(((ql_b0 >> ql_shift) & 0x0Fu) | (((qh_b0 >> qh_shift) & 0x03u) << 4)) - 32;
-          const int c1 = int(((ql_b1 >> ql_shift) & 0x0Fu) | (((qh_b1 >> qh_shift) & 0x03u) << 4)) - 32;
-          const int c2 = int(((ql_b2 >> ql_shift) & 0x0Fu) | (((qh_b2 >> qh_shift) & 0x03u) << 4)) - 32;
-          const int c3 = int(((ql_b3 >> ql_shift) & 0x0Fu) | (((qh_b3 >> qh_shift) & 0x03u) << 4)) - 32;
-          w_dst4[i] = float4(float(c0) * sc_eff, float(c1) * sc_eff, float(c2) * sc_eff, float(c3) * sc_eff);
+            const int a0 = int((((q0a & 0xFFu) >> ql_sh) & 0x0Fu) | (((h0 >> qh_sh_a) & 0x03u) << 4)) - 32;
+            const int a1 = int((((q0a >> 8) >> ql_sh) & 0x0Fu) | (((h1 >> qh_sh_a) & 0x03u) << 4)) - 32;
+            const int a2 = int((((q0b & 0xFFu) >> ql_sh) & 0x0Fu) | (((h2 >> qh_sh_a) & 0x03u) << 4)) - 32;
+            const int a3 = int((((q0b >> 8) >> ql_sh) & 0x0Fu) | (((h3 >> qh_sh_a) & 0x03u) << 4)) - 32;
+            d_lo[i] = half4(float(a0) * sc_a, float(a1) * sc_a, float(a2) * sc_a, float(a3) * sc_a);
+
+            const int b0 = int((((q1a & 0xFFu) >> ql_sh) & 0x0Fu) | (((h0 >> qh_sh_b) & 0x03u) << 4)) - 32;
+            const int b1 = int((((q1a >> 8) >> ql_sh) & 0x0Fu) | (((h1 >> qh_sh_b) & 0x03u) << 4)) - 32;
+            const int b2 = int((((q1b & 0xFFu) >> ql_sh) & 0x0Fu) | (((h2 >> qh_sh_b) & 0x03u) << 4)) - 32;
+            const int b3 = int((((q1b >> 8) >> ql_sh) & 0x0Fu) | (((h3 >> qh_sh_b) & 0x03u) << 4)) - 32;
+            d_hi[i] = half4(float(b0) * sc_b, float(b1) * sc_b, float(b2) * sc_b, float(b3) * sc_b);
+          }
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -247,70 +306,74 @@ if (slot < uint(S)) {
       const int next = base + BK;
       if (next < M) {
         if (live) {
-          const device float4* src = reinterpret_cast<const device float4*>(
-              hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-          av[0] = src[0];
-          av[1] = src[1];
-        }
-        if (w_live && ((next & 127) == 0)) {
-          const device uint8_t* nblk = w_row + size_t(next >> 8) * 210u;
-          const size_t nip = size_t((next >> 7) & 1);
-          const device uint16_t* p_ql0 = reinterpret_cast<const device uint16_t*>(
-              nblk + nip * 64u + l_off);
-          const device uint16_t* p_ql1 = p_ql0 + 16;
-          const device uint16_t* p_qh = reinterpret_cast<const device uint16_t*>(
-              nblk + 128 + nip * 32u + l_off);
-          STEEL_PRAGMA_UNROLL
-          for (int i = 0; i < 8; ++i) {
-            ql0[i] = p_ql0[i];
-            ql1[i] = p_ql1[i];
-            qh[i] = p_qh[i];
+          if constexpr (IN_F16) {
+            const device half4* src = reinterpret_cast<const device half4*>(
+                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
+            av[0] = src[0];
+            av[1] = src[1];
+            av[2] = src[2];
+            av[3] = src[3];
+          } else {
+            const device float4* src = reinterpret_cast<const device float4*>(
+                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
+            av[0] = half4(src[0]);
+            av[1] = half4(src[1]);
+            av[2] = half4(src[2]);
+            av[3] = half4(src[3]);
           }
-          const float d = float(*reinterpret_cast<const device half*>(nblk + 208));
-          const device int8_t* scp =
-              reinterpret_cast<const device int8_t*>(nblk + 192) + nip * 8u + half_id;
-          sc_half[0] = d * float(scp[0]);
-          sc_half[1] = d * float(scp[2]);
-          sc_half[2] = d * float(scp[4]);
-          sc_half[3] = d * float(scp[6]);
+        }
+        if ((next & 127) == 0) {
+          const size_t nblk_off = size_t(next >> 8) * 210u;
+          const size_t nip = size_t((next >> 7) & 1);
+          STEEL_PRAGMA_UNROLL
+          for (int p = 0; p < 2; ++p) {
+            if (w_live[p]) {
+              const device uint8_t* nblk = w_row[p] + nblk_off;
+              const device uint16_t* p_ql0 =
+                  reinterpret_cast<const device uint16_t*>(
+                      nblk + nip * 64u + l_off);
+              const device uint16_t* p_ql1 = p_ql0 + 16;
+              const device uint16_t* p_qh =
+                  reinterpret_cast<const device uint16_t*>(
+                      nblk + 128u + nip * 32u + l_off);
+              STEEL_PRAGMA_UNROLL
+              for (int i = 0; i < 4; ++i) {
+                ql0[p][i] = p_ql0[i];
+                ql1[p][i] = p_ql1[i];
+                qh[p][i] = p_qh[i];
+              }
+              const float d =
+                  float(*reinterpret_cast<const device half*>(nblk + 208u));
+              const device int8_t* scp =
+                  reinterpret_cast<const device int8_t*>(nblk + 192u) +
+                  nip * 8u + sc_off;
+              sc[p][0] = d * float(scp[0]);
+              sc[p][1] = d * float(scp[2]);
+              sc[p][2] = d * float(scp[4]);
+              sc[p][3] = d * float(scp[6]);
+            }
+          }
         }
       }
 
       if (valid_m > 0 && valid_n > 0) {
-        NAXTile<float, 1, 2> A;
-        NAXTile<float, 2, 2> B;
-        A.template load<float, PAD, 1>(As + tm * PAD);
-        B.template load<float, PAD, 1>(Bs + tn * PAD);
-        STEEL_PRAGMA_UNROLL
-        for (short k = 0; k < 2; ++k) {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < FE; ++e) {
-            ca[e] = A.frag_at(0, k)[e];
-            cb[e] = B.frag_at(0, k)[e];
-            cb[FE + e] = B.frag_at(1, k)[e];
-          }
-          op.run(ca, cb, cd);
-        }
+        NAXTile<half, 1, 4> A;
+        NAXTile<half, 2, 4> B;
+        A.template load<half, PAD, 1>(As + tm * PAD);
+        B.template load<half, PAD, 1>(Bs + tn * PAD);
+        tile_matmad_nax(cd, A, metal::false_type{}, B, metal::true_type{});
       }
     }
   }
 }
 
 if (valid_m > 0 && valid_n > 0) {
-  NAXTile<float, 1, 2> D;
-  STEEL_PRAGMA_UNROLL
-  for (short f = 0; f < 2; ++f) {
-    STEEL_PRAGMA_UNROLL
-    for (short e = 0; e < FE; ++e) {
-      D.val_frags[f][e] = cd[f * FE + e];
-    }
-  }
   device float* out_ptr =
       out + size_t(begin + uint(tm)) * size_t(H) + size_t(col + uint(tn));
   if (valid_m == 16 && valid_n == 32) {
-    D.store(out_ptr, H);
+    cd.store(out_ptr, H);
   } else {
-    D.store_slice(out_ptr, H, short2(0, 0), short2(valid_n, valid_m));
+    cd.store_slice(out_ptr, H, short2(0, 0), short2(valid_n, valid_m));
   }
 }
 )METAL"

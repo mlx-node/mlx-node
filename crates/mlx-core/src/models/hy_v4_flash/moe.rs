@@ -41,8 +41,9 @@ use super::bank::{DirectLayerArrays, KqBank, MmapProj, Prepared, ProjArrays};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{
-    gguf_prefill_indirect_down, gguf_prefill_indirect_gu, gguf_routed_decode, rms_norm, route,
-    route_pair, router_logits, router_scores, router_topk_gpu, try_q8_dual_down_add, try_router_mv,
+    gguf_prefill_indirect_down, gguf_prefill_indirect_gu, gguf_routed_decode,
+    moe_prefill_sort_tiles, rms_norm, route, route_pair, router_logits, router_scores,
+    router_topk_gpu, try_q8_dual_down_add, try_router_mv,
 };
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
@@ -852,9 +853,7 @@ impl Moe {
                             let f = self.finish_with_shared(w, x, &r, shared_gu)?;
                             return Ok((f, None));
                         }
-                        super::stats::eval(&[&gpu_ids], "hy_v4_flash router_topk")?;
-                        let ids_asc = gpu_ids.to_uint32()?;
-                        prof_end(Phase::Router, tp, &[])?;
+                        prof_end(Phase::Router, tp, &[&gpu_ids, &gpu_weights])?;
                         let tp_fill = prof_start();
                         let arrays = bank
                             .direct_layer_arrays(layer)?
@@ -863,19 +862,12 @@ impl Moe {
                         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
                         let tp_r = prof_start();
                         let r = match arrays {
-                            DirectLayerArrays::Repacked(arrays) => self.direct_prefill_sorted(
-                                &z,
-                                ids_asc.as_ref(),
-                                &gpu_weights,
-                                &arrays,
-                            )?,
-                            DirectLayerArrays::Mmap(projs) => self.mmap_prefill_sorted(
-                                &z,
-                                ids_asc.as_ref(),
-                                &gpu_ids,
-                                &gpu_weights,
-                                &projs,
-                            )?,
+                            DirectLayerArrays::Repacked(arrays) => {
+                                self.direct_prefill_sorted_gpu(&z, &gpu_ids, &gpu_weights, &arrays)?
+                            }
+                            DirectLayerArrays::Mmap(projs) => {
+                                self.mmap_prefill_sorted_gpu(&z, &gpu_ids, &gpu_weights, &projs)?
+                            }
                         };
                         prof_end(Phase::Routed, tp_r, &[&r])?;
                         let f = self.finish_with_shared(w, x, &r, shared_gu)?;
@@ -1393,19 +1385,16 @@ impl Moe {
         self.kq_prefill_indirect_gu_arrays(z, token_rows, tiles, &p.arrays)
     }
 
-    fn kq_prefill_indirect_gu_arrays(
+    fn kq_prefill_indirect_gu_gpu(
         &self,
         z: &MxArray,
-        token_rows: &[u32],
-        tiles: &[u32],
+        token_rows: &MxArray,
+        tiles: &MxArray,
         arrays: &[ProjArrays; 3],
     ) -> Result<Option<MxArray>> {
         if !prefill_indirect_gu_enabled()
             || arrays[0].format != KQuantFormat::Q4K
             || arrays[1].format != KQuantFormat::Q4K
-            || token_rows.is_empty()
-            || tiles.is_empty()
-            || !tiles.len().is_multiple_of(3)
         {
             return Ok(None);
         }
@@ -1414,15 +1403,13 @@ impl Moe {
         } else {
             z.astype(DType::Float32)?
         };
-        let tr = MxArray::from_uint32(token_rows, &[token_rows.len() as i64])?;
-        let tl = MxArray::from_uint32(tiles, &[(tiles.len() / 3) as i64, 3])?;
         let [g, u, _] = arrays;
         // SAFETY: all handles are live arrays owned by this call.
         let h = unsafe {
             mlx_sys::mlx_hy4_kq_prefill_indirect_gu(
                 zf.as_raw_ptr(),
-                tr.as_raw_ptr(),
-                tl.as_raw_ptr(),
+                token_rows.as_raw_ptr(),
+                tiles.as_raw_ptr(),
                 g.w.as_raw_ptr(),
                 g.s.as_raw_ptr(),
                 g.b.as_raw_ptr(),
@@ -1441,6 +1428,27 @@ impl Moe {
         )?))
     }
 
+    fn kq_prefill_indirect_gu_arrays(
+        &self,
+        z: &MxArray,
+        token_rows: &[u32],
+        tiles: &[u32],
+        arrays: &[ProjArrays; 3],
+    ) -> Result<Option<MxArray>> {
+        if !prefill_indirect_gu_enabled()
+            || arrays[0].format != KQuantFormat::Q4K
+            || arrays[1].format != KQuantFormat::Q4K
+            || token_rows.is_empty()
+            || tiles.is_empty()
+            || !tiles.len().is_multiple_of(3)
+        {
+            return Ok(None);
+        }
+        let tr = MxArray::from_uint32(token_rows, &[token_rows.len() as i64])?;
+        let tl = MxArray::from_uint32(tiles, &[(tiles.len() / 3) as i64, 3])?;
+        self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)
+    }
+
     pub(crate) fn kq_sorted_combine(
         down: &MxArray,
         weights: &[f32],
@@ -1452,12 +1460,10 @@ impl Moe {
         Self::kq_sorted_combine_gpu(down, &wa, inverse, rows, k)
     }
 
-    fn kq_sorted_combine_gpu(
+    fn kq_sorted_combine_arr(
         down: &MxArray,
         weights: &MxArray,
-        inverse: &[u32],
-        rows: i64,
-        k: i64,
+        inverse: &MxArray,
     ) -> Result<Option<MxArray>> {
         let df = if down.dtype()? == DType::Float32 {
             down.clone()
@@ -1469,10 +1475,13 @@ impl Moe {
         } else {
             weights.astype(DType::Float32)?
         };
-        let ia = MxArray::from_uint32(inverse, &[rows, k])?;
         // SAFETY: all handles are live arrays owned by this call.
         let h = unsafe {
-            mlx_sys::mlx_hy4_kq_sorted_combine(df.as_raw_ptr(), wf.as_raw_ptr(), ia.as_raw_ptr())
+            mlx_sys::mlx_hy4_kq_sorted_combine(
+                df.as_raw_ptr(),
+                wf.as_raw_ptr(),
+                inverse.as_raw_ptr(),
+            )
         };
         if h.is_null() {
             return Ok(None);
@@ -1481,6 +1490,17 @@ impl Moe {
             h,
             "hy_v4_flash kq_sorted_combine",
         )?))
+    }
+
+    fn kq_sorted_combine_gpu(
+        down: &MxArray,
+        weights: &MxArray,
+        inverse: &[u32],
+        rows: i64,
+        k: i64,
+    ) -> Result<Option<MxArray>> {
+        let ia = MxArray::from_uint32(inverse, &[rows, k])?;
+        Self::kq_sorted_combine_arr(down, weights, &ia)
     }
 
     /// Runs gate+up+clamped-SwiGLU and down over a slot-sorted group,
@@ -1535,6 +1555,67 @@ impl Moe {
             .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
             .astype(DType::Float32)?
             .reshape(&[m, latent])
+    }
+
+    fn direct_prefill_sorted_gpu(
+        &self,
+        z: &MxArray,
+        gpu_ids: &MxArray,
+        gpu_weights: &MxArray,
+        arrays: &[ProjArrays; 3],
+    ) -> Result<MxArray> {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used as i64;
+        let n_experts = self.moe.n_experts;
+        let pairs = rows * k;
+        if let Some((tr, tl, inv, sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts)? {
+            let y_tiles = (tl.shape_at(0)? as usize).min(i32::MAX as usize) as i32;
+            let max_group = n_experts.min(i32::MAX as usize) as i32;
+            let a = match self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)? {
+                Some(a2d) => a2d.reshape(&[pairs, 1, self.moe.ff as i64])?,
+                None => {
+                    let x = z.take(&tr, 0)?.reshape(&[pairs, 1, latent])?;
+                    let g = arrays[0].gather_sorted_nax_bounded(
+                        &x,
+                        &sorted_slots,
+                        y_tiles,
+                        max_group,
+                    )?;
+                    let u = arrays[1].gather_sorted_nax_bounded(
+                        &x,
+                        &sorted_slots,
+                        y_tiles,
+                        max_group,
+                    )?;
+                    let g = if g.dtype()? == DType::Float32 {
+                        g
+                    } else {
+                        g.astype(DType::Float32)?
+                    };
+                    let u = if u.dtype()? == DType::Float32 {
+                        u
+                    } else {
+                        u.astype(DType::Float32)?
+                    };
+                    Activations::swiglu_clamped_compiled(&g, &u, self.limit)?
+                }
+            };
+            let d = arrays[2]
+                .gather_sorted_nax_bounded(&a, &sorted_slots, y_tiles, max_group)?
+                .astype(DType::Float32)?
+                .reshape(&[pairs, latent])?;
+            if let Some(out) = Self::kq_sorted_combine_arr(&d, gpu_weights, &inv)? {
+                return Ok(out);
+            }
+            return d
+                .take(&inv.reshape(&[pairs])?, 0)?
+                .reshape(&[rows, k, latent])?
+                .mul(&gpu_weights.reshape(&[rows, k, 1])?)?
+                .sum(Some(&[1]), Some(false));
+        }
+        super::stats::eval(&[gpu_ids], "hy_v4_flash router_topk")?;
+        let ids_asc = gpu_ids.to_uint32()?;
+        self.direct_prefill_sorted(z, ids_asc.as_ref(), gpu_weights, arrays)
     }
 
     fn direct_prefill_sorted(
@@ -1642,6 +1723,64 @@ impl Moe {
             parts.push(run_one(&zc, &sc, &wc)?);
         }
         MxArray::concatenate_many(parts.iter().collect(), Some(0))
+    }
+
+    fn mmap_prefill_sorted_gpu(
+        &self,
+        z: &MxArray,
+        gpu_ids: &MxArray,
+        gpu_weights: &MxArray,
+        projs: &[MmapProj; 3],
+    ) -> Result<MxArray> {
+        let down_bits = Self::gguf_down_bits(projs)?;
+        if !prefill_indirect_gu_enabled() {
+            return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+        }
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used as i64;
+        let n_experts = self.moe.n_experts;
+        let pairs = rows * k;
+        if let Some((tr, tl, inv, _sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts)? {
+            let [g, u, d] = projs;
+            let Some(hidden) = gguf_prefill_indirect_gu(
+                z,
+                &tr,
+                &tl,
+                &g.buf,
+                g.base_offset,
+                &u.buf,
+                u.base_offset,
+                n_experts,
+                self.moe.ff,
+                self.limit,
+            )?
+            else {
+                return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+            };
+            let Some(down) = gguf_prefill_indirect_down(
+                &hidden,
+                &tl,
+                &d.buf,
+                d.base_offset,
+                n_experts,
+                self.moe.latent,
+                down_bits,
+            )?
+            else {
+                return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+            };
+            if let Some(out) = Self::kq_sorted_combine_arr(&down, gpu_weights, &inv)? {
+                return Ok(out);
+            }
+            return down
+                .take(&inv.reshape(&[pairs])?, 0)?
+                .reshape(&[rows, k, latent])?
+                .mul(&gpu_weights.reshape(&[rows, k, 1])?)?
+                .sum(Some(&[1]), Some(false));
+        }
+        super::stats::eval(&[gpu_ids], "hy_v4_flash router_topk")?;
+        let ids_asc = gpu_ids.to_uint32()?;
+        self.mmap_prefill_sorted(z, ids_asc.as_ref(), gpu_ids, gpu_weights, projs)
     }
 
     fn mmap_prefill_sorted(

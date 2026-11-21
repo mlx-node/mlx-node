@@ -1309,8 +1309,9 @@ pub fn gguf_prefill_indirect_gu(
 }
 
 /// Routed expert prefill down projection reading raw GGUF `block_q4_K` or
-/// `block_q6_K` directly via NAX TF32 MMA. Returns `Ok(None)` when NAX/Metal
-/// is unavailable or disabled (`MLX_HY4_PREFILL_NAX=0`).
+/// `block_q6_K` directly via FP16 NAX MMA. Accepts `Float16` or `Float32`
+/// `hidden` without casting `Float16` back to `Float32`. Returns `Ok(None)`
+/// when NAX/Metal is unavailable or disabled (`MLX_HY4_PREFILL_NAX=0`).
 #[allow(clippy::too_many_arguments)]
 pub fn gguf_prefill_indirect_down(
     hidden: &MxArray,
@@ -1324,7 +1325,10 @@ pub fn gguf_prefill_indirect_down(
     let (Ok(n_experts_i32), Ok(h_i32)) = (i32::try_from(n_experts), i32::try_from(h)) else {
         return Ok(None);
     };
-    let hf = as_f32(hidden)?;
+    let hf = match hidden.dtype()? {
+        DType::Float16 | DType::Float32 => hidden.clone(),
+        _ => hidden.astype(DType::Float32)?,
+    };
     // SAFETY: all handles are live arrays owned by this call.
     let handle = unsafe {
         mlx_sys::mlx_hy4_gguf_prefill_indirect_down(
@@ -1344,6 +1348,42 @@ pub fn gguf_prefill_indirect_down(
         handle,
         "hy_v4_flash gguf_prefill_indirect_down",
     )?))
+}
+
+/// GPU histogram, prefix sum, BM=32 tile emission, and scatter for MoE prefill
+/// routing (`ids [rows, k]` u32 -> `(token_rows [R], tiles [max_tiles, 3],
+/// inverse [rows, k], sorted_slots [R])` u32) with zero host synchronization.
+pub fn moe_prefill_sort_tiles(
+    ids: &MxArray,
+    n_experts: usize,
+) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
+    let Ok(ne_i32) = i32::try_from(n_experts) else {
+        return Ok(None);
+    };
+    let mut out_tr = std::ptr::null_mut();
+    let mut out_tl = std::ptr::null_mut();
+    let mut out_inv = std::ptr::null_mut();
+    let mut out_sl = std::ptr::null_mut();
+    // SAFETY: `ids` is live for the call; output handles are initialized on true.
+    let ok = unsafe {
+        mlx_sys::mlx_hy4_moe_prefill_sort_tiles(
+            ids.as_raw_ptr(),
+            ne_i32,
+            &mut out_tr,
+            &mut out_tl,
+            &mut out_inv,
+            &mut out_sl,
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    Ok(Some((
+        MxArray::from_handle(out_tr, "hy_v4_flash moe_prefill_sort_tiles token_rows")?,
+        MxArray::from_handle(out_tl, "hy_v4_flash moe_prefill_sort_tiles tiles")?,
+        MxArray::from_handle(out_inv, "hy_v4_flash moe_prefill_sort_tiles inverse")?,
+        MxArray::from_handle(out_sl, "hy_v4_flash moe_prefill_sort_tiles sorted_slots")?,
+    )))
 }
 
 /// Circular row write of `src [s, width]` into `buf [cap, width]` starting at

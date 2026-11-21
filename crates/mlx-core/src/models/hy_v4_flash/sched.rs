@@ -880,6 +880,7 @@ impl Run<'_> {
             cell.advance(r.ids)?;
         }
         if let Some(m) = self.mtp {
+            let tp_mtp = stats::prof_start();
             let _scope = stats::DeferScope::enter();
             for ((cell, r), (out, &start)) in
                 cells.iter_mut().zip(rows).zip(outs.iter().zip(starts))
@@ -905,6 +906,7 @@ impl Run<'_> {
             } else {
                 stats::flush("hy_v4_flash MTP lag")?;
             }
+            stats::prof_end(stats::Phase::Mtp, tp_mtp, &[])?;
         }
         Ok(outs)
     }
@@ -1231,6 +1233,8 @@ impl Inner {
         }
         if let (Ok(_), Some(clock)) = (&out, clock) {
             clock.record(store, rows, waves);
+        } else if out.is_ok() && kind == RowKind::Prefill {
+            stats::emit_profile("prefill");
         }
         if let Some(seq) = was
             && p.owners.contains(seq)
@@ -2046,6 +2050,7 @@ impl Inner {
         };
 
         let run_res: Result<()> = (|| {
+            let tp_mtp = stats::prof_start();
             let _scope = stats::DeferScope::enter();
             let m = self.mtp.as_ref().ok_or_else(no_mtp)?;
             let model = &self.store.model;
@@ -2173,6 +2178,7 @@ impl Inner {
                 eval_targets.extend(lane.step_dists.iter());
             }
             stats::eval(&eval_targets, "hy_v4_flash MTP proposal batch")?;
+            stats::prof_end(stats::Phase::Mtp, tp_mtp, &[])?;
             Ok(())
         })();
 

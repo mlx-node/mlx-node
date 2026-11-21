@@ -1554,6 +1554,23 @@ fn mmap_bank_maps_views_reports_zero_anon_and_toggles_in_turn() {
     assert!(bank.is_direct());
     assert!(bank.is_mmap());
     assert_eq!(bank.has_mmap_prewarm(), !bank.has_residency_set());
+    assert_eq!(
+        bank.has_rset_keepalive(),
+        bank.has_residency_set() && rset_keepalive_interval().is_some()
+    );
+    assert_eq!(
+        parse_rset_keepalive_ms(None),
+        Some(Duration::from_millis(DEFAULT_RSET_KEEPALIVE_MS))
+    );
+    assert_eq!(parse_rset_keepalive_ms(Some("0")), None);
+    assert_eq!(
+        parse_rset_keepalive_ms(Some("500")),
+        Some(Duration::from_millis(500))
+    );
+    assert_eq!(
+        parse_rset_keepalive_ms(Some("bad")),
+        Some(Duration::from_millis(DEFAULT_RSET_KEEPALIVE_MS))
+    );
     bank.keep_residency_alive();
     assert!(!bank.take_prefill_ran());
     bank.mark_prefill_wave();

@@ -750,14 +750,14 @@ fn q8_dense_prefill_nax_parity() {
         let y_nax = with_prefill_q8_nax(true, || read(&qlinear(&x, &sym).unwrap()));
         let rel_sym = rel_l2(&y_nax, &y_ref);
         assert!(
-            rel_sym < 1e-3,
+            rel_sym <= 5e-6,
             "dense prefill SymQ8 M={m} K={k} N={n}: rel_l2={rel_sym:e}"
         );
 
         let y_qmm = with_prefill_q8_nax(true, || read(&qlinear(&x, &qmm).unwrap()));
         let rel_qmm = rel_l2(&y_qmm, &y_ref);
         assert!(
-            rel_qmm < 1e-3,
+            rel_qmm <= 5e-6,
             "dense prefill Qmm M={m} K={k} N={n}: rel_l2={rel_qmm:e}"
         );
 

@@ -186,6 +186,26 @@ fn phase_names_are_distinct() {
     assert!(PHASES.iter().enumerate().all(|(i, &p)| p as usize == i));
 }
 
+#[test]
+fn profile_env_and_summary_formatting() {
+    assert!(!parse_profile_env(None));
+    assert!(!parse_profile_env(Some("")));
+    assert!(!parse_profile_env(Some("0")));
+    assert!(!parse_profile_env(Some("false")));
+    assert!(parse_profile_env(Some("1")));
+    assert!(parse_profile_env(Some("true")));
+    assert!(parse_profile_env(Some(" TRUE ")));
+
+    let ms = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0];
+    let line = format_profile_line("prefill", &ms);
+    assert_eq!(
+        line,
+        "[HY4_PROF] stage=prefill total_ms=66.00 engram=1.00 hc=2.00 attn_proj=3.00 \
+         indexer=4.00 sparse_attn=5.00 router=6.00 fill=7.00 routed=8.00 shared=9.00 \
+         head=10.00 mtp=11.00"
+    );
+}
+
 fn wave_counters(uses: u64, reads: u64) -> Counters {
     Counters {
         uses,

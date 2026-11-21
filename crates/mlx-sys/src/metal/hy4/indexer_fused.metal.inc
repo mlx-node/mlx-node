@@ -31,11 +31,9 @@ inline void hy4_indexer_score_decode_impl(
 
   const size_t q_s_off = size_t(s) * size_t(H) * 128u;
   const uint q_vec_total = uint(H) * 32u;
+  const device float4* q4 = reinterpret_cast<const device float4*>(q + q_s_off);
   for (uint i = tid; i < q_vec_total; i += 256u) {
-    const uint h = i >> 5;
-    const uint c4 = i & 31u;
-    const size_t off = q_s_off + size_t(h) * 128u + size_t(c4) * 4u;
-    q_tg[i] = float4(q[off], q[off + 1u], q[off + 2u], q[off + 3u]);
+    q_tg[i] = q4[i];
   }
   if (tid < uint(H)) {
     w_tg[tid] = w[size_t(s) * size_t(H) + size_t(tid)];
@@ -59,11 +57,7 @@ inline void hy4_indexer_score_decode_impl(
   }
 
   const size_t k_off = k_row * 128u + size_t(lane) * 4u;
-  const float4 kv = float4(
-      float(k_pool[k_off]),
-      float(k_pool[k_off + 1u]),
-      float(k_pool[k_off + 2u]),
-      float(k_pool[k_off + 3u]));
+  const float4 kv = float4(*reinterpret_cast<const device half4*>(k_pool + k_off));
 
   float acc = 0.0f;
   for (uint h = 0u; h < uint(H); ++h) {
@@ -213,6 +207,136 @@ inline void hy4_indexer_score_prefill_impl(
     }
   }
 }
+
+#ifdef HY4_INDEXER_NAX
+template <
+    bool PAGED,
+    int INDEX_ROWS,
+    typename QPtr,
+    typename WPtr,
+    typename KPtr,
+    typename PagePtr,
+    typename ParamsPtr>
+inline void hy4_indexer_score_prefill_nax_impl(
+    QPtr q,
+    WPtr w,
+    KPtr k_pool,
+    PagePtr page_ids,
+    ParamsPtr params,
+    device float* out,
+    threadgroup half* k_tile,
+    int H,
+    uint g_tile,
+    uint s_tile,
+    uint tid,
+    uint sg) {
+  constexpr uint PAD = 136u;
+
+  const uint S = params[0];
+  const uint N_g = params[1];
+  const uint start_g = params[2];
+  const uint s0 = s_tile * 64u;
+  const uint g0 = g_tile * 32u;
+  if (s0 >= S || g0 >= N_g) {
+    return;
+  }
+
+  for (uint i = tid; i < 32u * 16u; i += 128u) {
+    const uint r = i >> 4;
+    const uint c8 = i & 15u;
+    const uint g = g0 + r;
+    threadgroup float4* dst =
+        reinterpret_cast<threadgroup float4*>(k_tile + r * PAD + c8 * 8u);
+    if (g < N_g) {
+      const uint g_abs = start_g + g;
+      size_t k_row;
+      if constexpr (PAGED) {
+        const uint page_idx = g_abs / uint(INDEX_ROWS);
+        const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
+        const int phys_page = page_ids[page_idx];
+        k_row = size_t(phys_page) * size_t(INDEX_ROWS) + size_t(local_row);
+      } else {
+        k_row = size_t(g_abs);
+      }
+      *dst = *reinterpret_cast<const device float4*>(
+          k_pool + k_row * 128u + size_t(c8) * 8u);
+    } else {
+      *dst = float4(0.0f);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint s_sg = s0 + sg * 16u;
+  const short valid_s = short(max(0, min(16, int(S) - int(s_sg))));
+  const short valid_g = short(max(0, min(32, int(N_g) - int(g0))));
+  if (valid_s <= 0 || valid_g <= 0) {
+    return;
+  }
+
+  const short2 sc = mlx::steel::BaseNAXFrag::get_coord();
+  const uint sr0 = s_sg + uint(sc.y);
+  const uint sr1 = sr0 + 8u;
+  const bool ok0 = sr0 < S;
+  const bool ok1 = sr1 < S;
+  const int q_ld = H * 128;
+
+  mlx::steel::NAXTile<float, 1, 2> acc;
+  acc.clear();
+
+  for (uint h = 0u; h < uint(H); ++h) {
+    const float w0 = ok0 ? w[size_t(sr0) * size_t(H) + size_t(h)] : 0.0f;
+    const float w1 = ok1 ? w[size_t(sr1) * size_t(H) + size_t(h)] : 0.0f;
+    const device float* q_ptr =
+        q + (size_t(s_sg) * size_t(H) + size_t(h)) * 128u;
+
+    mlx::steel::NAXTile<float, 1, 2> dot_h;
+    dot_h.clear();
+
+    STEEL_PRAGMA_UNROLL
+    for (int d = 0; d < 128; d += 32) {
+      mlx::steel::NAXTile<float, 1, 2> q_f32;
+      if (valid_s == 16) {
+        q_f32.load(q_ptr + d, q_ld);
+      } else {
+        q_f32.load_rows(q_ptr + d, q_ld, valid_s);
+      }
+      mlx::steel::NAXTile<half, 1, 2> q_hi;
+      mlx::steel::NAXTile<half, 1, 2> q_lo;
+      STEEL_PRAGMA_UNROLL
+      for (short e = 0; e < mlx::steel::NAXTile<float, 1, 2>::kElemsPerTile; ++e) {
+        const float v = q_f32.elems()[e];
+        const half hi = half(v);
+        q_hi.elems()[e] = hi;
+        q_lo.elems()[e] = half(v - float(hi));
+      }
+      mlx::steel::NAXTile<half, 2, 2> kt;
+      kt.template load<half, PAD, 1>(k_tile + d);
+      mlx::steel::tile_matmad_nax(
+          dot_h, q_hi, metal::false_type{}, kt, metal::true_type{});
+      mlx::steel::tile_matmad_nax(
+          dot_h, q_lo, metal::false_type{}, kt, metal::true_type{});
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < 2; ++f) {
+      const thread auto& df = dot_h.frag_at(0, f);
+      thread auto& af = acc.frag_at(0, f);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 4; ++j) {
+        af[j] = metal::fma(w0, metal::max(df[j], 0.0f), af[j]);
+        af[4 + j] = metal::fma(w1, metal::max(df[4 + j], 0.0f), af[4 + j]);
+      }
+    }
+  }
+
+  device float* out_ptr = out + size_t(s_sg) * size_t(N_g) + size_t(g0);
+  if (valid_s == 16 && valid_g == 32) {
+    acc.store(out_ptr, N_g);
+  } else {
+    acc.store_slice(out_ptr, N_g, short2(0, 0), short2(valid_g, valid_s));
+  }
+}
+#endif
 
 // Order-preserving IEEE-754 float -> uint32 map. Canonicalizes -0.0f to +0.0f
 // so tie-breaking matches IEEE-754 equality (`-0.0f == +0.0f`); maps NaN to 0

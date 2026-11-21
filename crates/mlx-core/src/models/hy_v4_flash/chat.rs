@@ -642,6 +642,7 @@ impl Inner {
         }
         let resident = self.store.bank.resident_bytes().unwrap_or(0);
         self.publish(Some(resident));
+        stats::emit_profile("end_turn");
     }
 
     /// A new empty sequence in place of the conversation.
@@ -726,6 +727,7 @@ impl DecodeStep for Step<'_> {
                 .step(&inner.store.model, inner.mtp.as_ref(), token)?;
         inner.flat_tick();
         inner.emit_stats(&logits, false, t);
+        stats::emit_profile("decode");
         Ok((logits, false))
     }
 }
@@ -910,6 +912,7 @@ impl ChatBackend for Inner {
             .logits
             .ok_or_else(|| bad("the prefill returned no logits"))?;
         self.emit_stats(&logits, true, t0);
+        stats::emit_profile("prefill");
         Ok(logits)
     }
 

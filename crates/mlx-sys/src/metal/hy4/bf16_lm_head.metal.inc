@@ -11,7 +11,9 @@ const int row0 = int(threadgroup_position_in_grid.z) * R_TILE;
 if (first >= V || row0 >= M) return;
 
 float acc[R_TILE][RPS];
+#pragma unroll
 for (int r = 0; r < R_TILE; ++r) {
+#pragma unroll
   for (int o = 0; o < RPS; ++o) {
     acc[r][o] = 0.0f;
   }
@@ -21,21 +23,14 @@ if constexpr (FAST_K) {
   for (int base = 0; base < K; base += BLOCK) {
     const int col = base + int(lane) * 8;
     if constexpr (STREAM_X) {
+#pragma unroll
       for (int o = 0; o < RPS; ++o) {
         const int vrow = first + o;
         if (vrow < V) {
-          const uint4 w_raw = *reinterpret_cast<const device uint4*>(
+          const device bfloat4* wp = reinterpret_cast<const device bfloat4*>(
               w + size_t(vrow) * size_t(K) + col);
-          const float4 w0 = float4(
-              as_type<float>(w_raw.x << 16),
-              as_type<float>(w_raw.x & 0xFFFF0000u),
-              as_type<float>(w_raw.y << 16),
-              as_type<float>(w_raw.y & 0xFFFF0000u));
-          const float4 w1 = float4(
-              as_type<float>(w_raw.z << 16),
-              as_type<float>(w_raw.z & 0xFFFF0000u),
-              as_type<float>(w_raw.w << 16),
-              as_type<float>(w_raw.w & 0xFFFF0000u));
+          const float4 w0 = float4(wp[0]);
+          const float4 w1 = float4(wp[1]);
           for (int r = 0; r < R_TILE; ++r) {
             const int row = row0 + r;
             if (row < M) {
@@ -50,6 +45,7 @@ if constexpr (FAST_K) {
     } else {
       float4 x0[R_TILE];
       float4 x1[R_TILE];
+#pragma unroll
       for (int r = 0; r < R_TILE; ++r) {
         const int row = row0 + r;
         if (row < M) {
@@ -62,21 +58,15 @@ if constexpr (FAST_K) {
           x1[r] = float4(0.0f);
         }
       }
+#pragma unroll
       for (int o = 0; o < RPS; ++o) {
         const int vrow = first + o;
         if (vrow < V) {
-          const uint4 w_raw = *reinterpret_cast<const device uint4*>(
+          const device bfloat4* wp = reinterpret_cast<const device bfloat4*>(
               w + size_t(vrow) * size_t(K) + col);
-          const float4 w0 = float4(
-              as_type<float>(w_raw.x << 16),
-              as_type<float>(w_raw.x & 0xFFFF0000u),
-              as_type<float>(w_raw.y << 16),
-              as_type<float>(w_raw.y & 0xFFFF0000u));
-          const float4 w1 = float4(
-              as_type<float>(w_raw.z << 16),
-              as_type<float>(w_raw.z & 0xFFFF0000u),
-              as_type<float>(w_raw.w << 16),
-              as_type<float>(w_raw.w & 0xFFFF0000u));
+          const float4 w0 = float4(wp[0]);
+          const float4 w1 = float4(wp[1]);
+#pragma unroll
           for (int r = 0; r < R_TILE; ++r) {
             acc[r][o] += dot(x0[r], w0);
             acc[r][o] += dot(x1[r], w1);
@@ -90,16 +80,12 @@ if constexpr (FAST_K) {
     const int col = base + int(lane) * 4;
     if (col < K) {
       if constexpr (STREAM_X) {
+#pragma unroll
         for (int o = 0; o < RPS; ++o) {
           const int vrow = first + o;
           if (vrow < V) {
-            const uint2 w_raw = *reinterpret_cast<const device uint2*>(
-                w + size_t(vrow) * size_t(K) + col);
-            const float4 w0 = float4(
-                as_type<float>(w_raw.x << 16),
-                as_type<float>(w_raw.x & 0xFFFF0000u),
-                as_type<float>(w_raw.y << 16),
-                as_type<float>(w_raw.y & 0xFFFF0000u));
+            const float4 w0 = float4(*reinterpret_cast<const device bfloat4*>(
+                w + size_t(vrow) * size_t(K) + col));
             for (int r = 0; r < R_TILE; ++r) {
               const int row = row0 + r;
               if (row < M) {
@@ -112,6 +98,7 @@ if constexpr (FAST_K) {
         }
       } else {
         float4 x0[R_TILE];
+#pragma unroll
         for (int r = 0; r < R_TILE; ++r) {
           const int row = row0 + r;
           if (row < M) {
@@ -121,16 +108,13 @@ if constexpr (FAST_K) {
             x0[r] = float4(0.0f);
           }
         }
+#pragma unroll
         for (int o = 0; o < RPS; ++o) {
           const int vrow = first + o;
           if (vrow < V) {
-            const uint2 w_raw = *reinterpret_cast<const device uint2*>(
-                w + size_t(vrow) * size_t(K) + col);
-            const float4 w0 = float4(
-                as_type<float>(w_raw.x << 16),
-                as_type<float>(w_raw.x & 0xFFFF0000u),
-                as_type<float>(w_raw.y << 16),
-                as_type<float>(w_raw.y & 0xFFFF0000u));
+            const float4 w0 = float4(*reinterpret_cast<const device bfloat4*>(
+                w + size_t(vrow) * size_t(K) + col));
+#pragma unroll
             for (int r = 0; r < R_TILE; ++r) {
               acc[r][o] += dot(x0[r], w0);
             }
@@ -141,9 +125,11 @@ if constexpr (FAST_K) {
   }
 }
 
+#pragma unroll
 for (int r = 0; r < R_TILE; ++r) {
   const int row = row0 + r;
   if (row < M) {
+#pragma unroll
     for (int o = 0; o < RPS; ++o) {
       const int vrow = first + o;
       if (vrow < V) {
