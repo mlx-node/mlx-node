@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | BF16 routed experts `[E, rows, k]` | affine-4 g64, bf16 scales and biases, 32 experts per batch | n/2 + n/16 |
 //! | BF16 indexer compressor matrices | f32 array | 4n |
-//! | other BF16 | affine-8 g32, f32 scales and biases (`Dense::Qmm`) | n + n/4 |
+//! | other BF16 | symmetric Q8_0 g32, f16 scales (`Dense::SymQ8`) | n + n/16 |
 //! | F32 | f32 array | 4n |
 //!
 //! A drafted token is verified by the trunk, so the held precision moves
@@ -17,7 +17,7 @@ use super::moe::{AffineExperts, AffineProj};
 use super::scan::{ExpertClass, Located, Role, Scan};
 use super::weights::{
     AttnWeights, Dense, Ffn, Form, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader,
-    Residual, dense_from_raw,
+    Residual, dense_from_raw, held_shape, quantize_sym_q8_from_bf16_raw,
 };
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
@@ -42,8 +42,8 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// What one MTP tensor is held as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Held {
-    /// Affine-8 g32 codes, f32 scales and biases.
-    Qmm,
+    /// Symmetric Q8_0 g32 codes, f16 scales (derived `-128 * scale` bias).
+    SymQ8,
     /// An f32 array.
     F32,
     /// Affine-4 g64 codes, bf16 scales and biases (routed experts).
@@ -60,7 +60,7 @@ pub fn held(info: &GgufTensorInfo, expert: bool) -> Result<Held> {
     Ok(match (info.tensor_type, expert) {
         (BF16, true) => Held::Affine4,
         (BF16, false) if is_compressor_mat(&info.name) => Held::F32,
-        (BF16, false) => Held::Qmm,
+        (BF16, false) => Held::SymQ8,
         (F32, false) => Held::F32,
         (t, _) => {
             return Err(bad(format!(
@@ -77,7 +77,7 @@ pub fn held(info: &GgufTensorInfo, expert: bool) -> Result<Held> {
 pub fn held_bytes(info: &GgufTensorInfo, expert: bool) -> Result<u64> {
     let n = info.num_elements()?;
     let b = match held(info, expert)? {
-        Held::Qmm => n.checked_add(n / 4),
+        Held::SymQ8 => n.checked_add(n / 16),
         Held::F32 => n.checked_mul(4),
         Held::Affine4 => (n / 2).checked_add(n / 16),
     };
@@ -128,18 +128,18 @@ impl Loader<'_> {
             len: info.data_size()?,
         };
         let raw = self.shards.read_aligned(e, &mut self.buf)?;
-        let values = dense_from_raw(info, raw, Form::F32)?;
         let d = match held(info, false)? {
-            Held::Qmm => {
-                let p = AffineProj::quantize(&values.array()?, DENSE_GROUP, DENSE_BITS)?;
-                MxArray::eval_arrays_with_context(&[&p.w, &p.s, &p.b], "hy_v4_flash MTP requant")?;
-                Dense::Qmm {
-                    w: p.w,
-                    scales: p.s,
-                    biases: p.b,
-                }
+            Held::SymQ8 => {
+                let shape = held_shape(info)?;
+                let &[rows, k] = shape.as_slice() else {
+                    return Err(bad(format!(
+                        "'{}': SymQ8 requires 2-D held shape, got {shape:?}",
+                        info.name
+                    )));
+                };
+                quantize_sym_q8_from_bf16_raw(raw, rows as usize, k as usize)?
             }
-            _ => values,
+            _ => dense_from_raw(info, raw, Form::F32)?,
         };
         self.read += e.len;
         self.bytes += d.nbytes() as u64;

@@ -4993,14 +4993,27 @@ impl PagedKVCacheAdapter {
             }
             if state.dirty {
                 dirty_layers.push(layer_idx);
-                arrays.push(state.key.clone());
-                arrays.push(state.value.clone());
-                arrays.push(state.k_scale.clone());
-                arrays.push(state.v_scale.clone());
-                arrays.extend(state.index.clone());
+                let mut push_pending = |arr: &MxArray| {
+                    if !arr.is_available() {
+                        arrays.push(arr.clone());
+                    }
+                };
+                push_pending(&state.key);
+                push_pending(&state.value);
+                push_pending(&state.k_scale);
+                push_pending(&state.v_scale);
+                if let Some(idx_arr) = &state.index {
+                    push_pending(idx_arr);
+                }
             }
         }
+        if dirty_layers.is_empty() {
+            return Ok(());
+        }
         if arrays.is_empty() {
+            for state in self.native_pool_arrays.iter_mut().flatten() {
+                state.dirty = false;
+            }
             return Ok(());
         }
         let trace_enabled = inference_trace_enabled();
@@ -5053,15 +5066,21 @@ impl PagedKVCacheAdapter {
         if !state.dirty {
             return Ok(());
         }
-        let pending: Vec<MxArray> = [
-            state.key.clone(),
-            state.value.clone(),
-            state.k_scale.clone(),
-            state.v_scale.clone(),
-        ]
-        .into_iter()
-        .chain(state.index.clone())
-        .collect();
+        let mut pending: Vec<MxArray> = Vec::with_capacity(4 + usize::from(state.index.is_some()));
+        for arr in [&state.key, &state.value, &state.k_scale, &state.v_scale]
+            .into_iter()
+            .chain(state.index.iter())
+        {
+            if !arr.is_available() {
+                pending.push(arr.clone());
+            }
+        }
+        if pending.is_empty() {
+            if let Some(Some(state)) = self.native_pool_arrays.get_mut(idx) {
+                state.dirty = false;
+            }
+            return Ok(());
+        }
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(Instant::now);
         if trace_enabled {

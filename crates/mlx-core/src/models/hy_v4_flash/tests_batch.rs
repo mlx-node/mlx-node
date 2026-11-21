@@ -275,8 +275,8 @@ fn q8_dense_decode_row_invariant_and_f32_parity() {
     let nax_ms = [12usize, 16];
     let shapes = [
         (3072usize, 1024usize),
-        (3072, 576),
-        (3072, 128),
+        (1536, 576),
+        (13824, 64),
         (1024, 16384),
     ];
     for (k, n) in shapes {
@@ -362,7 +362,13 @@ fn q8_dense_sym_v2_parity_and_row_invariance() {
     let mut r = Rng(2026);
     let max_m = 12usize;
     let ms = [1usize, 2, 3, 4, 8, 12];
-    let shapes = [(1024usize, 256usize), (1536, 384), (3072, 261), (192, 67)];
+    let shapes = [
+        (1024usize, 256usize),
+        (1536, 384),
+        (3072, 261),
+        (13824, 64),
+        (192, 67),
+    ];
     for (k, n) in shapes {
         let w = sym_q8(&r.vec(n * k, 1.0 / (k as f32).sqrt()), n, k);
         assert!(matches!(w, Dense::SymQ8 { .. }));
@@ -476,43 +482,51 @@ fn router_mv_bitwise_row_invariant_and_f32_parity() {
     let mut r = Rng(2028);
     let max_m = 8usize;
     let ms = [1usize, 2, 3, 4, 8];
-    let cases = [(512usize, 3072usize), (509, 96)];
+    let cases = [(512usize, 3072usize), (509, 96), (7, 64), (16, 128)];
     for (e, k) in cases {
         let w_raw = r.vec(e * k, 1.0 / (k as f32).sqrt());
-        let w_arr = arr(&w_raw, &[e, k]);
-        let wt = w_arr.transpose(Some(&[1, 0])).unwrap();
-        let router = Dense::Array(w_arr);
+        let w_f32 = arr(&w_raw, &[e, k]);
+        let w_f16 = w_f32.astype(DType::Float16).unwrap();
         let x_all = r.vec(max_m * k, 1.25);
 
-        let alone: Vec<Vec<u32>> = (0..max_m)
-            .map(|row| {
-                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
-                read_bits(&router_logits(&xr, &router).unwrap())
-            })
-            .collect();
+        for (label, w_arr) in [("f32", w_f32), ("f16", w_f16)] {
+            let wt = w_arr
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+            let router = Dense::Array(w_arr);
 
-        for m in ms {
-            let xm = arr(&x_all[..m * k], &[m, k]);
-            let y = router_logits(&xm, &router).unwrap();
-            let got = read(&y);
-            let yb = read_bits(&y);
-            for (row, want_bits) in alone.iter().enumerate().take(m) {
-                assert_eq!(
-                    &yb[row * e..(row + 1) * e],
-                    &want_bits[..],
-                    "router_mv (E={e},K={k}) M={m} row {row} bit-exact vs M=1"
+            let alone: Vec<Vec<u32>> = (0..max_m)
+                .map(|row| {
+                    let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
+                    read_bits(&router_logits(&xr, &router).unwrap())
+                })
+                .collect();
+
+            for m in ms {
+                let xm = arr(&x_all[..m * k], &[m, k]);
+                let y = router_logits(&xm, &router).unwrap();
+                let got = read(&y);
+                let yb = read_bits(&y);
+                for (row, want_bits) in alone.iter().enumerate().take(m) {
+                    assert_eq!(
+                        &yb[row * e..(row + 1) * e],
+                        &want_bits[..],
+                        "router_mv[{label}] (E={e},K={k}) M={m} row {row} bit-exact vs M=1"
+                    );
+                }
+                let want = read(&xm.matmul(&wt).unwrap());
+                let max_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs <= 1e-5,
+                    "router_mv[{label}] (E={e},K={k}) M={m} max_abs={max_abs:e}"
                 );
             }
-            let want = read(&xm.matmul(&wt).unwrap());
-            let max_abs = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_abs <= 1e-5,
-                "router_mv (E={e},K={k}) M={m} max_abs={max_abs:e}"
-            );
         }
     }
 }

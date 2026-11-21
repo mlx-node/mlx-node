@@ -216,6 +216,13 @@ impl OwnerCell {
         self.draft.as_mut()
     }
 
+    /// Releases the draft state once a sequence takes a non-speculative decode
+    /// step so subsequent steps and truncations do not expect a synced draft.
+    pub fn drop_draft(&mut self) {
+        self.draft = None;
+        self.segments.clear();
+    }
+
     /// The last `max_ngram - 1` token ids (fewer near the start).
     pub fn recent(&self) -> &[u32] {
         &self.recent

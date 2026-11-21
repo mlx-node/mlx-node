@@ -265,6 +265,32 @@ impl Block {
         need_routes: bool,
         prev_out: Option<&mut Option<MxArray>>,
     ) -> Result<(HcCarry, Option<Routes>)> {
+        self.forward_carry_with_pos(
+            w,
+            carry,
+            wave,
+            None,
+            owners,
+            engram,
+            next,
+            need_routes,
+            prev_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_carry_with_pos(
+        &self,
+        w: &LayerWeights,
+        carry: HcCarry,
+        wave: &Wave,
+        pos_f32: Option<&MxArray>,
+        owners: &mut dyn Owners,
+        engram: Option<EngramIn<'_>>,
+        next: Option<(&Block, &LayerWeights)>,
+        need_routes: bool,
+        prev_out: Option<&mut Option<MxArray>>,
+    ) -> Result<(HcCarry, Option<Routes>)> {
         let Residual::Hc {
             attn: hc_attn,
             ffn: hc_ffn,
@@ -335,7 +361,7 @@ impl Block {
             }
         };
 
-        let a_raw = self.attend_normed_raw(w, &h_attn_norm, wave, owners)?;
+        let a_raw = self.attend_normed_raw(w, &h_attn_norm, wave, pos_f32, owners)?;
 
         let (x_mid, h_ffn_norm, post_ffn) = self.bridge(
             &a_raw,
@@ -376,11 +402,17 @@ impl Block {
         w: &LayerWeights,
         x_norm: &MxArray,
         wave: &Wave,
+        pos_f32: Option<&MxArray>,
         owners: &mut dyn Owners,
     ) -> Result<MxArray> {
-        let p = self
-            .mla
-            .project_normed_timed(&w.attn, x_norm, &wave.positions())?;
+        let p = match pos_f32 {
+            Some(pos) => self
+                .mla
+                .project_normed_timed_with_pos(&w.attn, x_norm, pos)?,
+            None => self
+                .mla
+                .project_normed_timed(&w.attn, x_norm, &wave.positions())?,
+        };
         let mut outs = Vec::with_capacity(wave.owners());
         for (i, s) in wave.spans().iter().enumerate() {
             let po = p.owner(wave, i)?;

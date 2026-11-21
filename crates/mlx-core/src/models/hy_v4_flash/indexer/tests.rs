@@ -1131,6 +1131,31 @@ fn decode_head_weights_run_per_row() {
     assert_eq!(pre.len(), 3 * h);
 }
 
+#[test]
+fn decode_head_weights_q8_runs_batched_bit_exact() {
+    use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
+
+    const Q8_D: usize = 32;
+    let g = small();
+    let (mut w, _) = indexer_weights(&g, 23);
+    let mut r = Rng(23);
+    let attn_k = arr(&r.vec(g.head_dim * Q8_D, 0.25), &[g.head_dim, Q8_D]);
+    let proj_arr = arr(&r.vec(g.n_heads * Q8_D, 0.25), &[g.n_heads, Q8_D]);
+    w.attn_k = quantize_sym_q8_array(&attn_k).unwrap();
+    w.proj = quantize_sym_q8_array(&proj_arr).unwrap();
+    let ix = Indexer::new(g.clone(), &w).unwrap();
+    let xs = inputs(4, Q8_D, 29);
+    let all = read(&ix.head_weights(&w, &rows_of(&xs), RowKind::Decode).unwrap());
+    let h = g.n_heads;
+    for (i, x) in xs.iter().enumerate() {
+        let one = read(
+            &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Decode)
+                .unwrap(),
+        );
+        assert_eq!(all[i * h..(i + 1) * h], one[..], "q8 row {i}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod fused_metal {
     use super::*;

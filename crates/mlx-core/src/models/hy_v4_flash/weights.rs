@@ -34,6 +34,7 @@ const COMPRESSOR_MATS: [&str; 2] = [
     "indexer_compressor_value.weight",
     "indexer_compressor_gate.weight",
 ];
+const ROUTER_MAT: &str = "ffn_gate_inp.weight";
 const Q8_0_VALUES: usize = 32;
 const Q8_0_BYTES: usize = 34;
 
@@ -237,6 +238,8 @@ pub enum Form {
     Qmm,
     /// An f32 array from F32, Q8_0 or BF16 data.
     F32,
+    /// An f16 array converted from F32 data.
+    F16,
     /// A bf16 array from BF16 data.
     Bf16,
 }
@@ -245,6 +248,16 @@ fn is_compressor_mat(name: &str) -> bool {
     COMPRESSOR_MATS
         .iter()
         .any(|s| name.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+}
+
+fn is_router_mat(name: &str) -> bool {
+    name.strip_suffix(ROUTER_MAT)
+        .is_some_and(|p| p.ends_with('.'))
+}
+
+pub(crate) fn router_f16_enabled() -> bool {
+    std::env::var("MLX_HY4_ROUTER_F16").as_deref() == Ok("1")
+        && std::env::var("MLX_HY4_ROUTER_F32").as_deref() != Ok("1")
 }
 
 /// The form of a resident tensor; refuses experts, the Engram table and any
@@ -257,6 +270,7 @@ pub fn form(role: Role, info: &GgufTensorInfo) -> Result<Form> {
         (Role::Dense, Q8_0) if name == TOKEN_EMBD => Form::Codes,
         (Role::Dense, Q8_0) if mat => Form::F32,
         (Role::Dense, Q8_0) => Form::Qmm,
+        (Role::Dense, F32) if is_router_mat(name) && router_f16_enabled() => Form::F16,
         (Role::Dense | Role::Mtp, F32) => Form::F32,
         (Role::Dense, BF16) if name == OUTPUT => Form::Bf16,
         (Role::Mtp, BF16) if mat => Form::F32,
@@ -279,7 +293,7 @@ pub fn resident_bytes(role: Role, info: &GgufTensorInfo) -> Result<u64> {
     let r = match form(role, info)? {
         Form::Codes | Form::Qmm => n.checked_add(n / 16),
         Form::F32 => n.checked_mul(4),
-        Form::Bf16 => n.checked_mul(2),
+        Form::F16 | Form::Bf16 => n.checked_mul(2),
     };
     r.ok_or_else(|| bad(format!("'{}': resident size overflows u64", info.name)))
 }
@@ -336,6 +350,15 @@ pub fn le_f32_into(raw: &[u8], out: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// Little-endian f32 values rounded to IEEE-754 f16 bits.
+pub fn le_f32_into_f16(raw: &[u8], out: &mut [u16]) -> Result<()> {
+    check_lens(raw.len(), out.len(), 4, "f32 values")?;
+    for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+        *o = half::f16::from_f32(f32::from_le_bytes(*c)).to_bits();
+    }
+    Ok(())
+}
+
 /// Little-endian bf16 values widened to f32 (exact).
 pub fn bf16_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
     check_lens(raw.len(), out.len(), 2, "bf16 values")?;
@@ -343,6 +366,244 @@ pub fn bf16_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
         *o = f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16);
     }
     Ok(())
+}
+
+/// Quantizes `n_groups` contiguous groups of 32 f32 values into symmetric Q8_0
+/// (`u32` packed biased bytes `(q_i8 as u8) ^ 0x80` + IEEE-754 `f16` scales).
+fn sym_q8_quantize_f32_slice(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) {
+    let groups = s_out.len();
+    debug_assert_eq!(src.len(), groups * 32);
+    debug_assert_eq!(w_out.len(), groups * 8);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16);
+    if threads <= 1 || groups < 4096 {
+        sym_q8_quantize_f32_range(src, w_out, s_out);
+        return;
+    }
+    let chunk_g = groups.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut s_rem = s_out;
+        let mut w_rem = w_out;
+        let mut x_rem = src;
+        while !s_rem.is_empty() {
+            let take = chunk_g.min(s_rem.len());
+            let (sc, sr) = s_rem.split_at_mut(take);
+            let (wc, wr) = w_rem.split_at_mut(take * 8);
+            let (xc, xr) = x_rem.split_at(take * 32);
+            s_rem = sr;
+            w_rem = wr;
+            x_rem = xr;
+            scope.spawn(move || sym_q8_quantize_f32_range(xc, wc, sc));
+        }
+    });
+}
+
+fn sym_q8_quantize_f32_range(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) {
+    for ((vals, w_grp), s_dst) in src
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(w_out.as_chunks_mut::<8>().0)
+        .zip(s_out.iter_mut())
+    {
+        let mut max_abs = 0.0f32;
+        for &v in vals {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let sf16 = half::f16::from_f32(max_abs / 127.0);
+        let scale = sf16.to_f32();
+        *s_dst = sf16.to_bits();
+        if scale == 0.0 {
+            w_grp.fill(0x8080_8080u32);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (j, dst) in w_grp.iter_mut().enumerate() {
+            let base = j * 4;
+            let q = |v: f32| -> u8 {
+                let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                (qi as u8) ^ 0x80
+            };
+            *dst = u32::from_le_bytes([
+                q(vals[base]),
+                q(vals[base + 1]),
+                q(vals[base + 2]),
+                q(vals[base + 3]),
+            ]);
+        }
+    }
+}
+
+fn sym_q8_quantize_bf16_range(raw: &[u8], w_out: &mut [u32], s_out: &mut [u16]) {
+    for ((blk, w_grp), s_dst) in raw
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(w_out.as_chunks_mut::<8>().0)
+        .zip(s_out.iter_mut())
+    {
+        let mut vals = [0.0f32; 32];
+        let mut max_abs = 0.0f32;
+        for (dst, pair) in vals.iter_mut().zip(blk.as_chunks::<2>().0) {
+            let v = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
+            *dst = v;
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let sf16 = half::f16::from_f32(max_abs / 127.0);
+        let scale = sf16.to_f32();
+        *s_dst = sf16.to_bits();
+        if scale == 0.0 {
+            w_grp.fill(0x8080_8080u32);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (j, dst) in w_grp.iter_mut().enumerate() {
+            let base = j * 4;
+            let q = |v: f32| -> u8 {
+                let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                (qi as u8) ^ 0x80
+            };
+            *dst = u32::from_le_bytes([
+                q(vals[base]),
+                q(vals[base + 1]),
+                q(vals[base + 2]),
+                q(vals[base + 3]),
+            ]);
+        }
+    }
+}
+
+/// Quantizes raw little-endian BF16 `[rows, k]` bytes directly into
+/// `Dense::SymQ8` without materializing an f32 GPU array. Model thread only.
+pub(crate) fn quantize_sym_q8_from_bf16_raw(raw: &[u8], rows: usize, k: usize) -> Result<Dense> {
+    if rows == 0 || k == 0 || !k.is_multiple_of(32) {
+        return Err(bad(format!(
+            "SymQ8 requant shape [{rows}, {k}] requires k > 0 divisible by 32"
+        )));
+    }
+    let n = rows
+        .checked_mul(k)
+        .ok_or_else(|| bad("SymQ8 requant size overflows"))?;
+    check_lens(raw.len(), n, 2, "SymQ8 bf16 values")?;
+    let groups = n / 32;
+    let (ri, ki) = (
+        i64::try_from(rows).map_err(|_| bad("row count exceeds i64"))?,
+        i64::try_from(k).map_err(|_| bad("col count exceeds i64"))?,
+    );
+    let (w_arr, w_ptr, w_bytes) = MxArray::alloc_uninit(&[ri, ki / 4], DType::Uint32)?;
+    let (s_arr, s_ptr, s_bytes) = MxArray::alloc_uninit(&[ri, ki / 32], DType::Float16)?;
+    let w_len = groups * 8;
+    if w_len.checked_mul(size_of::<u32>()) != Some(w_bytes)
+        || w_ptr.0.align_offset(align_of::<u32>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(s_bytes)
+        || s_ptr.0.align_offset(align_of::<u16>()) != 0
+    {
+        return Err(bad("SymQ8 alloc_uninit size or alignment mismatch"));
+    }
+    // SAFETY: `alloc_uninit` returned freshly allocated writable buffers alive
+    // for the lifetime of `w_arr`/`s_arr` with verified length and alignment.
+    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        .min(16);
+    if threads <= 1 || groups < 4096 {
+        sym_q8_quantize_bf16_range(raw, w_slice, s_slice);
+    } else {
+        let chunk_g = groups.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut s_rem = s_slice;
+            let mut w_rem = w_slice;
+            let mut r_rem = raw;
+            while !s_rem.is_empty() {
+                let take = chunk_g.min(s_rem.len());
+                let (sc, sr) = s_rem.split_at_mut(take);
+                let (wc, wr) = w_rem.split_at_mut(take * 8);
+                let (rc, rr) = r_rem.split_at(take * 64);
+                s_rem = sr;
+                w_rem = wr;
+                r_rem = rr;
+                scope.spawn(move || sym_q8_quantize_bf16_range(rc, wc, sc));
+            }
+        });
+    }
+    Ok(Dense::SymQ8 {
+        w: w_arr,
+        scales: s_arr,
+    })
+}
+
+/// Quantizes a 2-D `MxArray` `[rows, k]` (`k % 32 == 0`) into `Dense::SymQ8`
+/// in bounded row chunks so peak transient memory stays small. Model thread only.
+pub(crate) fn quantize_sym_q8_array(a: &MxArray) -> Result<Dense> {
+    if a.ndim()? != 2 {
+        return Err(bad("SymQ8 array requant requires a 2-D matrix"));
+    }
+    let rows_i = a.shape_at(0)?;
+    let k_i = a.shape_at(1)?;
+    if rows_i <= 0 || k_i <= 0 || k_i % 32 != 0 {
+        return Err(bad(format!(
+            "SymQ8 array requant shape [{rows_i}, {k_i}] requires k > 0 divisible by 32"
+        )));
+    }
+    let rows = rows_i as usize;
+    let k = k_i as usize;
+    let groups_per_row = k / 32;
+    let words_per_row = k / 4;
+    let groups = rows
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| bad("SymQ8 array requant overflows"))?;
+    let (w_arr, w_ptr, w_bytes) = MxArray::alloc_uninit(&[rows_i, k_i / 4], DType::Uint32)?;
+    let (s_arr, s_ptr, s_bytes) = MxArray::alloc_uninit(&[rows_i, k_i / 32], DType::Float16)?;
+    let w_len = groups * 8;
+    if w_len.checked_mul(size_of::<u32>()) != Some(w_bytes)
+        || w_ptr.0.align_offset(align_of::<u32>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(s_bytes)
+        || s_ptr.0.align_offset(align_of::<u16>()) != 0
+    {
+        return Err(bad("SymQ8 alloc_uninit size or alignment mismatch"));
+    }
+    // SAFETY: freshly allocated writable buffers of verified size/alignment.
+    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    const CHUNK_ROWS: usize = 4096;
+    let mut lo = 0usize;
+    while lo < rows {
+        let hi = (lo + CHUNK_ROWS).min(rows);
+        let sub = if lo == 0 && hi == rows {
+            a.clone()
+        } else {
+            a.slice(&[lo as i64, 0], &[hi as i64, k_i])?
+        };
+        let sub_f32 = if sub.dtype()? == DType::Float32 {
+            sub
+        } else {
+            sub.astype(DType::Float32)?
+        };
+        let vals = sub_f32.to_float32()?;
+        sym_q8_quantize_f32_slice(
+            vals.as_ref(),
+            &mut w_slice[lo * words_per_row..hi * words_per_row],
+            &mut s_slice[lo * groups_per_row..hi * groups_per_row],
+        );
+        lo = hi;
+    }
+    if rows > CHUNK_ROWS {
+        crate::array::clear_cache();
+    }
+    Ok(Dense::SymQ8 {
+        w: w_arr,
+        scales: s_arr,
+    })
 }
 
 /// Q8_0 blocks (f16 `d`, 32 × i8 `q`) as `d·q` in f32 (exact).
@@ -414,6 +675,19 @@ fn f32_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray
     })
 }
 
+fn f16_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray> {
+    if info.tensor_type != GgufTensorType::F32 {
+        return Err(bad(format!(
+            "'{}': no f16 decode for type {}",
+            info.name,
+            info.tensor_type.name()
+        )));
+    }
+    alloc_filled(shape, DType::Float16, elements(info)?, |out| {
+        le_f32_into_f16(raw, out)
+    })
+}
+
 fn bf16_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray> {
     if info.tensor_type != GgufTensorType::BF16 {
         return Err(bad(format!(
@@ -467,6 +741,7 @@ pub fn dense_from_raw(info: &GgufTensorInfo, raw: &[u8], form: Form) -> Result<D
     Ok(match form {
         Form::Codes | Form::Qmm => q8_dense(info, raw, form)?,
         Form::F32 => Dense::Array(f32_array(info, raw, &shape)?),
+        Form::F16 => Dense::Array(f16_array(info, raw, &shape)?),
         Form::Bf16 => Dense::Array(bf16_array(info, raw, &shape)?),
     })
 }

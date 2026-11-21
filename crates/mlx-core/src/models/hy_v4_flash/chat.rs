@@ -1063,8 +1063,9 @@ pub struct HyV4FlashResidencyInfo {
     /// still-valid staging copies), and the experts read into slots.
     pub slot_hits: f64,
     pub slot_misses: f64,
-    /// Bytes read from the GGUF shards since load: expert fills and Engram
-    /// rows; the page cache may serve part of them.
+    /// Expert fill bytes read from the GGUF shards since load (excluding Engram
+    /// rows, reported separately in `engram_bytes_read`); the page cache may
+    /// serve part of them.
     pub checkpoint_bytes_read: f64,
     pub engram_bytes_read: f64,
     /// Stored prefix states with a RAM copy, and their bytes.
@@ -1381,7 +1382,7 @@ impl HyV4FlashModel {
             in_turn: r.in_turn,
             slot_hits: c.uses.saturating_sub(c.fill_slots) as f64,
             slot_misses: c.fill_slots as f64,
-            checkpoint_bytes_read: (c.fill_bytes + c.engram_bytes) as f64,
+            checkpoint_bytes_read: c.fill_bytes as f64,
             engram_bytes_read: c.engram_bytes as f64,
             prefix_states: r.prefix[0] as f64,
             prefix_state_bytes: r.prefix[1] as f64,

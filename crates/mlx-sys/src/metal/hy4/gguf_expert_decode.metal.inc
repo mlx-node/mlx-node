@@ -163,6 +163,7 @@ inline void hy4_gguf_gate_up_swiglu_impl(
     const device float* x,
     RowIdsPtr row_ids,
     SlotsPtr slots,
+    const device uint* dedup,
     const device uint8_t* gate_buf,
     uint64_t gate_off,
     const device uint8_t* up_buf,
@@ -182,7 +183,6 @@ inline void hy4_gguf_gate_up_swiglu_impl(
   const int first = int(tile) * (NSG * RPS) + int(simd) * RPS;
   if (assign >= uint(N_ASSIGN) || first >= M) return;
 
-  const uint slot = slots[assign];
   const int nb = K / 256;
   const size_t row_bytes = size_t(nb) * 144u;
   const short ix = short(lane >> 4);
@@ -192,120 +192,188 @@ inline void hy4_gguf_gate_up_swiglu_impl(
   const size_t y_lane_off = size_t(64 * iq + 4 * ir);
 
   if constexpr (DEDUP) {
-    if (slot < uint(S)) {
-      for (uint b = 0; b < assign; ++b) {
-        if (slots[b] == slot) return;
-      }
+    // dedup4[0].x = n_uniq; dedup4[1 + u] = {expert, count(1..4), packed_assign, packed_row}.
+    const device uint4* dedup4 = reinterpret_cast<const device uint4*>(dedup);
+    const uint n_uniq = dedup4[0].x;
+    if (assign >= n_uniq) return;
 
-      const size_t base_off = (size_t(slot) * size_t(M) + size_t(first)) * row_bytes;
-      const device uint8_t* g_base = gate_buf + size_t(gate_off) + base_off;
-      const device uint8_t* u_base = up_buf + size_t(up_off) + base_off;
+    const uint4 ent = dedup4[1u + assign];
+    const uint slot = ent.x;
+    const uint cnt = ent.y;
+    const uint packed_a = ent.z;
+    const uint packed_r = ent.w;
 
-      uint cursor = assign;
-      while (cursor < uint(N_ASSIGN)) {
-        // Explicit uint4 scalars prevent dynamic-index thread-local stack spills.
-        uint4 m_assign = uint4(0u);
-        uint4 m_row = uint4(0u);
-        int n_match = 0;
-        for (; cursor < uint(N_ASSIGN) && n_match < MAX_MATCH; ++cursor) {
-          if (slots[cursor] == slot) {
-            const uint rid = row_ids[cursor];
-            if (n_match == 0) {
-              m_assign.x = cursor;
-              m_row.x = rid;
-            } else if (n_match == 1) {
-              m_assign.y = cursor;
-              m_row.y = rid;
-            } else if (n_match == 2) {
-              m_assign.z = cursor;
-              m_row.z = rid;
-            } else {
-              m_assign.w = cursor;
-              m_row.w = rid;
-            }
-            ++n_match;
-          }
-        }
-        if (n_match == 0) break;
-
-        float g[MAX_MATCH][RPS];
-        float u[MAX_MATCH][RPS];
-#pragma unroll
-        for (int m = 0; m < MAX_MATCH; ++m) {
-#pragma unroll
-          for (int r = 0; r < RPS; ++r) {
-            g[m][r] = 0.0f;
-            u[m][r] = 0.0f;
-          }
-        }
-
-        for (int ib = int(ix); ib < nb; ib += 2) {
-          const size_t blk_off = size_t(ib) * 144u;
-          Hy4GgufQ4kRow gw[RPS];
-          Hy4GgufQ4kRow uw[RPS];
+    if (slot >= uint(S)) {
+      if (lane == 0u) {
+        for (uint m = 0u; m < cnt; ++m) {
+          const uint dst_a = (packed_a >> (m * 8u)) & 0xFFu;
 #pragma unroll
           for (int r = 0; r < RPS; ++r) {
             if (FAST || first + r < M) {
-              gw[r] = hy4_gguf_q4k_load(g_base + size_t(r) * row_bytes + blk_off, iq, ir);
-              uw[r] = hy4_gguf_q4k_load(u_base + size_t(r) * row_bytes + blk_off, iq, ir);
-            }
-          }
-
-#pragma unroll
-          for (int m = 0; m < MAX_MATCH; ++m) {
-            if (m < n_match) {
-              const uint rid = m_row[m];
-              if (rid < uint(ROWS)) {
-                const device float* y4 =
-                    x + size_t(rid) * x_row_stride + size_t(ib) * 256u + y_lane_off;
-                const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
-                const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
-                const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
-                const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
-                const float4 sumy = float4(
-                    v0[0] + v0[1] + v0[2] + v0[3],
-                    v1[0] + v1[1] + v1[2] + v1[3],
-                    v2[0] + v2[1] + v2[2] + v2[3],
-                    v3[0] + v3[1] + v3[2] + v3[3]);
-#pragma unroll
-                for (int r = 0; r < RPS; ++r) {
-                  if (FAST || first + r < M) {
-                    g[m][r] += hy4_gguf_q4k_dot(gw[r], v0, v1, v2, v3, sumy);
-                    u[m][r] += hy4_gguf_q4k_dot(uw[r], v0, v1, v2, v3, sumy);
-                  }
-                }
-              }
-            }
-          }
-        }
-
-#pragma unroll
-        for (int m = 0; m < MAX_MATCH; ++m) {
-          if (m < n_match) {
-            const uint dst_assign = m_assign[m];
-#pragma unroll
-            for (int r = 0; r < RPS; ++r) {
-              if (FAST || first + r < M) {
-                float gv = simd_sum(g[m][r]);
-                float uv = simd_sum(u[m][r]);
-                if (lane == 0) {
-                  // Asymmetric clamp: never lower-clamp gate.
-                  if (lim > 0.0f) {
-                    gv = metal::min(gv, lim);
-                    uv = metal::clamp(uv, -lim, lim);
-                  }
-                  const float sig = 1.0f / (1.0f + metal::exp(-gv));
-                  out[size_t(dst_assign) * size_t(M) + size_t(first + r)] = (sig * gv) * uv;
-                }
-              }
+              out[size_t(dst_a) * size_t(M) + size_t(first + r)] = 0.0f;
             }
           }
         }
       }
       return;
     }
+
+    const size_t base_off = (size_t(slot) * size_t(M) + size_t(first)) * row_bytes;
+    const device uint8_t* g_base = gate_buf + size_t(gate_off) + base_off;
+    const device uint8_t* u_base = up_buf + size_t(up_off) + base_off;
+
+    if (cnt == 1u) {
+      const uint dst_a = packed_a & 0xFFu;
+      const uint rid = packed_r & 0xFFu;
+      float g[RPS];
+      float u_acc[RPS];
+#pragma unroll
+      for (int r = 0; r < RPS; ++r) {
+        g[r] = 0.0f;
+        u_acc[r] = 0.0f;
+      }
+
+      if (rid < uint(ROWS)) {
+        const device float* x_row = x + size_t(rid) * x_row_stride + y_lane_off;
+        for (int ib = int(ix); ib < nb; ib += 2) {
+          const device float* y4 = x_row + size_t(ib) * 256u;
+          const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
+          const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
+          const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
+          const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
+          const float4 sumy = float4(
+              v0[0] + v0[1] + v0[2] + v0[3],
+              v1[0] + v1[1] + v1[2] + v1[3],
+              v2[0] + v2[1] + v2[2] + v2[3],
+              v3[0] + v3[1] + v3[2] + v3[3]);
+          const size_t blk_off = size_t(ib) * 144u;
+#pragma unroll
+          for (int r = 0; r < RPS; ++r) {
+            if (FAST || first + r < M) {
+              const Hy4GgufQ4kRow gw =
+                  hy4_gguf_q4k_load(g_base + size_t(r) * row_bytes + blk_off, iq, ir);
+              g[r] += hy4_gguf_q4k_dot(gw, v0, v1, v2, v3, sumy);
+              const Hy4GgufQ4kRow uw =
+                  hy4_gguf_q4k_load(u_base + size_t(r) * row_bytes + blk_off, iq, ir);
+              u_acc[r] += hy4_gguf_q4k_dot(uw, v0, v1, v2, v3, sumy);
+            }
+          }
+        }
+      }
+
+#pragma unroll
+      for (int r = 0; r < RPS; ++r) {
+        if (FAST || first + r < M) {
+          float gv = simd_sum(g[r]);
+          float uv = simd_sum(u_acc[r]);
+          if (lane == 0u) {
+            // Asymmetric clamp: never lower-clamp gate.
+            if (lim > 0.0f) {
+              gv = metal::min(gv, lim);
+              uv = metal::clamp(uv, -lim, lim);
+            }
+            const float sig = 1.0f / (1.0f + metal::exp(-gv));
+            out[size_t(dst_a) * size_t(M) + size_t(first + r)] = (sig * gv) * uv;
+          }
+        }
+      }
+      return;
+    }
+
+    // Load one weight row at a time so gw/uw rows never overlap in registers.
+    float g[MAX_MATCH][RPS];
+    float u_acc[MAX_MATCH][RPS];
+#pragma unroll
+    for (int m = 0; m < MAX_MATCH; ++m) {
+#pragma unroll
+      for (int r = 0; r < RPS; ++r) {
+        g[m][r] = 0.0f;
+        u_acc[m][r] = 0.0f;
+      }
+    }
+
+    for (int ib = int(ix); ib < nb; ib += 2) {
+      const size_t blk_off = size_t(ib) * 144u;
+      const size_t x_ib_off = size_t(ib) * 256u + y_lane_off;
+#pragma unroll
+      for (int r = 0; r < RPS; ++r) {
+        if (FAST || first + r < M) {
+          {
+            const Hy4GgufQ4kRow gw =
+                hy4_gguf_q4k_load(g_base + size_t(r) * row_bytes + blk_off, iq, ir);
+#pragma unroll
+            for (int m = 0; m < MAX_MATCH; ++m) {
+              if (uint(m) < cnt) {
+                const uint rid = (packed_r >> (uint(m) * 8u)) & 0xFFu;
+                if (rid < uint(ROWS)) {
+                  const device float* y4 = x + size_t(rid) * x_row_stride + x_ib_off;
+                  const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
+                  const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
+                  const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
+                  const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
+                  const float4 sumy = float4(
+                      v0[0] + v0[1] + v0[2] + v0[3],
+                      v1[0] + v1[1] + v1[2] + v1[3],
+                      v2[0] + v2[1] + v2[2] + v2[3],
+                      v3[0] + v3[1] + v3[2] + v3[3]);
+                  g[m][r] += hy4_gguf_q4k_dot(gw, v0, v1, v2, v3, sumy);
+                }
+              }
+            }
+          }
+          {
+            const Hy4GgufQ4kRow uw =
+                hy4_gguf_q4k_load(u_base + size_t(r) * row_bytes + blk_off, iq, ir);
+#pragma unroll
+            for (int m = 0; m < MAX_MATCH; ++m) {
+              if (uint(m) < cnt) {
+                const uint rid = (packed_r >> (uint(m) * 8u)) & 0xFFu;
+                if (rid < uint(ROWS)) {
+                  const device float* y4 = x + size_t(rid) * x_row_stride + x_ib_off;
+                  const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
+                  const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
+                  const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
+                  const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
+                  const float4 sumy = float4(
+                      v0[0] + v0[1] + v0[2] + v0[3],
+                      v1[0] + v1[1] + v1[2] + v1[3],
+                      v2[0] + v2[1] + v2[2] + v2[3],
+                      v3[0] + v3[1] + v3[2] + v3[3]);
+                  u_acc[m][r] += hy4_gguf_q4k_dot(uw, v0, v1, v2, v3, sumy);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MAX_MATCH; ++m) {
+      if (uint(m) < cnt) {
+        const uint dst_a = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+#pragma unroll
+        for (int r = 0; r < RPS; ++r) {
+          if (FAST || first + r < M) {
+            float gv = simd_sum(g[m][r]);
+            float uv = simd_sum(u_acc[m][r]);
+            if (lane == 0u) {
+              // Asymmetric clamp: never lower-clamp gate.
+              if (lim > 0.0f) {
+                gv = metal::min(gv, lim);
+                uv = metal::clamp(uv, -lim, lim);
+              }
+              const float sig = 1.0f / (1.0f + metal::exp(-gv));
+              out[size_t(dst_a) * size_t(M) + size_t(first + r)] = (sig * gv) * uv;
+            }
+          }
+        }
+      }
+    }
+    return;
   }
 
+  const uint slot = slots[assign];
   const uint row_id = row_ids[assign];
   float g[RPS];
   float u[RPS];
@@ -386,14 +454,11 @@ inline void hy4_gguf_down_combine_impl(
     const device float* hidden,
     SlotsPtr slots,
     WeightsPtr weights,
+    const device uint* dedup,
     const device uint8_t* down_buf,
     uint64_t down_off,
     device float* out,
     threadgroup float* products,
-    threadgroup uint* tg_raw_slots,
-    threadgroup uint* tg_uniq_slots,
-    threadgroup uint8_t* tg_uniq_first,
-    threadgroup uint* tg_n_uniq_ptr,
     int ROWS,
     int M,
     int H,
@@ -413,55 +478,21 @@ inline void hy4_gguf_down_combine_impl(
   const size_t row_bytes = size_t(nb) * BLK_BYTES;
 
   if constexpr (DEDUP_ROWS) {
-    const uint tid = simd * 32u + lane;
-    const uint n_assign = uint(ROWS * TOP);
-    if (tid < n_assign) {
-      tg_raw_slots[tid] = slots[tid];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd == 0) {
-      uint base_u = 0u;
-      for (uint off = 0u; off < n_assign; off += 32u) {
-        const uint a = off + lane;
-        bool is_owner = false;
-        uint s = 0u;
-        if (a < n_assign) {
-          s = tg_raw_slots[a];
-          is_owner = true;
-          for (uint b = 0u; b < a; ++b) {
-            if (tg_raw_slots[b] == s) {
-              is_owner = false;
-              break;
-            }
-          }
-        }
-        const uint u_off = simd_prefix_exclusive_sum(uint(is_owner));
-        const uint chunk_u = simd_sum(uint(is_owner));
-        if (is_owner) {
-          tg_uniq_slots[base_u + u_off] = s;
-          tg_uniq_first[base_u + u_off] = uint8_t(a);
-        }
-        base_u += chunk_u;
-      }
-      if (lane == 0) {
-        *tg_n_uniq_ptr = base_u;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint n_uniq = *tg_n_uniq_ptr;
+    const device uint4* dedup4 = reinterpret_cast<const device uint4*>(dedup);
+    const uint n_uniq = dedup4[0].x;
     for (uint u = simd; u < n_uniq; u += uint(KSG)) {
-      const uint slot = tg_uniq_slots[u];
-      uint cursor = uint(tg_uniq_first[u]);
+      const uint4 ent = dedup4[1u + u];
+      const uint slot = ent.x;
+      const uint cnt = ent.y;
+      const uint packed_a = ent.z;
+
       if (slot >= uint(S)) {
-        if (lane == 0) {
-          for (; cursor < n_assign; ++cursor) {
-            if (tg_raw_slots[cursor] == slot) {
+        if (lane == 0u) {
+          for (uint m = 0u; m < cnt; ++m) {
+            const uint dst_a = (packed_a >> (m * 8u)) & 0xFFu;
 #pragma unroll
-              for (int r = 0; r < RPS; ++r) {
-                products[cursor * uint(RPS) + uint(r)] = 0.0f;
-              }
+            for (int r = 0; r < RPS; ++r) {
+              products[dst_a * uint(RPS) + uint(r)] = 0.0f;
             }
           }
         }
@@ -472,144 +503,106 @@ inline void hy4_gguf_down_combine_impl(
           down_buf + size_t(down_off) +
           (size_t(slot) * size_t(H) + size_t(first)) * row_bytes;
 
-      while (cursor < n_assign) {
-        uint4 m_assign = uint4(0u);
-        int n_match = 0;
-        for (; cursor < n_assign && n_match < MAX_MATCH; ++cursor) {
-          if (tg_raw_slots[cursor] == slot) {
-            if (n_match == 0) {
-              m_assign.x = cursor;
-            } else if (n_match == 1) {
-              m_assign.y = cursor;
-            } else if (n_match == 2) {
-              m_assign.z = cursor;
-            } else {
-              m_assign.w = cursor;
-            }
-            ++n_match;
-          }
-        }
-        if (n_match == 0) break;
-
-        if (n_match == 1) {
-          const uint a0 = m_assign.x;
-          const device float* h_row = hidden + size_t(a0) * size_t(M);
-          float acc[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
-          if constexpr (BITS == 4) {
-            const short ix = short(lane >> 4);
-            const short it = short(lane & 15u);
-            const short iq = it >> 3;
-            const short ir = it & 7;
-            const device float* x_lane = h_row + size_t(64 * iq + 4 * ir);
-            for (int ib = int(ix); ib < nb; ib += 2) {
-              const device float* y4 = x_lane + size_t(ib) * 256u;
-              const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
-              const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
-              const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
-              const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
-              const float4 sumy = float4(
-                  v0[0] + v0[1] + v0[2] + v0[3],
-                  v1[0] + v1[1] + v1[2] + v1[3],
-                  v2[0] + v2[1] + v2[2] + v2[3],
-                  v3[0] + v3[1] + v3[2] + v3[3]);
-              const size_t blk_off = size_t(ib) * 144u;
+      if (cnt == 1u) {
+        const uint a0 = packed_a & 0xFFu;
+        const device float* h_row = hidden + size_t(a0) * size_t(M);
+        float acc[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if constexpr (BITS == 4) {
+          const short ix = short(lane >> 4);
+          const short it = short(lane & 15u);
+          const short iq = it >> 3;
+          const short ir = it & 7;
+          const device float* x_lane = h_row + size_t(64 * iq + 4 * ir);
+          for (int ib = int(ix); ib < nb; ib += 2) {
+            const device float* y4 = x_lane + size_t(ib) * 256u;
+            const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
+            const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
+            const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
+            const float4 v3 = *reinterpret_cast<const device float4*>(y4 + 160);
+            const float4 sumy = float4(
+                v0[0] + v0[1] + v0[2] + v0[3],
+                v1[0] + v1[1] + v1[2] + v1[3],
+                v2[0] + v2[1] + v2[2] + v2[3],
+                v3[0] + v3[1] + v3[2] + v3[3]);
+            const size_t blk_off = size_t(ib) * 144u;
 #pragma unroll
-              for (int r = 0; r < RPS; r += 2) {
-                Hy4GgufQ4kRow dw0, dw1;
-                if (FAST || first + r < H) {
-                  dw0 = hy4_gguf_q4k_load(d_base + size_t(r) * row_bytes + blk_off, iq, ir);
-                }
-                if (FAST || first + r + 1 < H) {
-                  dw1 = hy4_gguf_q4k_load(d_base + size_t(r + 1) * row_bytes + blk_off, iq, ir);
-                }
-                if (FAST || first + r < H) {
-                  acc[r] += hy4_gguf_q4k_dot(dw0, v0, v1, v2, v3, sumy);
-                }
-                if (FAST || first + r + 1 < H) {
-                  acc[r + 1] += hy4_gguf_q4k_dot(dw1, v0, v1, v2, v3, sumy);
-                }
-              }
-            }
-          } else {
-            const short ix = short(lane >> 4);
-            const short tid_l = short(lane & 15u);
-            const short ip = tid_l >> 3;
-            const short il = tid_l & 7;
-            const short l0 = 4 * il;
-            const short is = 8 * ip + (l0 >> 4);
-            const device float* x_lane = h_row + size_t(128 * ip + l0);
-            for (int ib = int(ix); ib < nb; ib += 2) {
-              const device float* y = x_lane + size_t(ib) * 256u;
-              const float4 y0 = *reinterpret_cast<const device float4*>(y + 0);
-              const float4 y1 = *reinterpret_cast<const device float4*>(y + 32);
-              const float4 y2 = *reinterpret_cast<const device float4*>(y + 64);
-              const float4 y3 = *reinterpret_cast<const device float4*>(y + 96);
-              const float4 sumy = float4(
-                  y0[0] + y0[1] + y0[2] + y0[3],
-                  y1[0] + y1[1] + y1[2] + y1[3],
-                  y2[0] + y2[1] + y2[2] + y2[3],
-                  y3[0] + y3[1] + y3[2] + y3[3]);
-              const size_t blk_off = size_t(ib) * 210u;
-#pragma unroll
-              for (int r = 0; r < RPS; r += 2) {
-                Hy4GgufQ6kRow dw0, dw1;
-                if (FAST || first + r < H) {
-                  dw0 = hy4_gguf_q6k_load(d_base + size_t(r) * row_bytes + blk_off, ip, l0, is);
-                }
-                if (FAST || first + r + 1 < H) {
-                  dw1 = hy4_gguf_q6k_load(d_base + size_t(r + 1) * row_bytes + blk_off, ip, l0, is);
-                }
-                if (FAST || first + r < H) {
-                  acc[r] += hy4_gguf_q6k_dot(dw0, y0, y1, y2, y3, sumy);
-                }
-                if (FAST || first + r + 1 < H) {
-                  acc[r + 1] += hy4_gguf_q6k_dot(dw1, y0, y1, y2, y3, sumy);
-                }
-              }
-            }
-          }
-          const float weight = weights[a0];
-#pragma unroll
-          for (int r = 0; r < RPS; ++r) {
-            if (FAST || first + r < H) {
-              const float val = simd_sum(acc[r]);
-              if (lane == 0) {
-                products[a0 * uint(RPS) + uint(r)] = val * weight;
+            for (int r = 0; r < RPS; ++r) {
+              if (FAST || first + r < H) {
+                const Hy4GgufQ4kRow dw =
+                    hy4_gguf_q4k_load(d_base + size_t(r) * row_bytes + blk_off, iq, ir);
+                acc[r] += hy4_gguf_q4k_dot(dw, v0, v1, v2, v3, sumy);
               }
             }
           }
         } else {
-          float acc[MAX_MATCH][RPS];
-#pragma unroll
-          for (int m = 0; m < MAX_MATCH; ++m) {
+          const short ix = short(lane >> 4);
+          const short tid_l = short(lane & 15u);
+          const short ip = tid_l >> 3;
+          const short il = tid_l & 7;
+          const short l0 = 4 * il;
+          const short is = 8 * ip + (l0 >> 4);
+          const device float* x_lane = h_row + size_t(128 * ip + l0);
+          for (int ib = int(ix); ib < nb; ib += 2) {
+            const device float* y = x_lane + size_t(ib) * 256u;
+            const float4 y0 = *reinterpret_cast<const device float4*>(y + 0);
+            const float4 y1 = *reinterpret_cast<const device float4*>(y + 32);
+            const float4 y2 = *reinterpret_cast<const device float4*>(y + 64);
+            const float4 y3 = *reinterpret_cast<const device float4*>(y + 96);
+            const float4 sumy = float4(
+                y0[0] + y0[1] + y0[2] + y0[3],
+                y1[0] + y1[1] + y1[2] + y1[3],
+                y2[0] + y2[1] + y2[2] + y2[3],
+                y3[0] + y3[1] + y3[2] + y3[3]);
+            const size_t blk_off = size_t(ib) * 210u;
 #pragma unroll
             for (int r = 0; r < RPS; ++r) {
-              acc[m][r] = 0.0f;
+              if (FAST || first + r < H) {
+                const Hy4GgufQ6kRow dw =
+                    hy4_gguf_q6k_load(d_base + size_t(r) * row_bytes + blk_off, ip, l0, is);
+                acc[r] += hy4_gguf_q6k_dot(dw, y0, y1, y2, y3, sumy);
+              }
             }
           }
-          if constexpr (BITS == 4) {
-            const short ix = short(lane >> 4);
-            const short it = short(lane & 15u);
-            const short iq = it >> 3;
-            const short ir = it & 7;
-            const size_t x_lane_off = size_t(64 * iq + 4 * ir);
-            for (int ib = int(ix); ib < nb; ib += 2) {
-              const size_t blk_off = size_t(ib) * 144u;
-              const size_t y_ib_off = size_t(ib) * 256u + x_lane_off;
+        }
+        const float weight = weights[a0];
 #pragma unroll
-              for (int r = 0; r < RPS; r += 2) {
-                Hy4GgufQ4kRow dw0, dw1;
-                if (FAST || first + r < H) {
-                  dw0 = hy4_gguf_q4k_load(d_base + size_t(r) * row_bytes + blk_off, iq, ir);
-                }
-                if (FAST || first + r + 1 < H) {
-                  dw1 = hy4_gguf_q4k_load(d_base + size_t(r + 1) * row_bytes + blk_off, iq, ir);
-                }
+        for (int r = 0; r < RPS; ++r) {
+          if (FAST || first + r < H) {
+            const float val = simd_sum(acc[r]);
+            if (lane == 0u) {
+              products[a0 * uint(RPS) + uint(r)] = val * weight;
+            }
+          }
+        }
+      } else {
+        // Load one weight row at a time so multi-match accumulation stays spill-free.
+        float acc[MAX_MATCH][RPS];
+#pragma unroll
+        for (int m = 0; m < MAX_MATCH; ++m) {
+#pragma unroll
+          for (int r = 0; r < RPS; ++r) {
+            acc[m][r] = 0.0f;
+          }
+        }
+        if constexpr (BITS == 4) {
+          const short ix = short(lane >> 4);
+          const short it = short(lane & 15u);
+          const short iq = it >> 3;
+          const short ir = it & 7;
+          const size_t x_lane_off = size_t(64 * iq + 4 * ir);
+          for (int ib = int(ix); ib < nb; ib += 2) {
+            const size_t blk_off = size_t(ib) * 144u;
+            const size_t y_ib_off = size_t(ib) * 256u + x_lane_off;
+#pragma unroll
+            for (int r = 0; r < RPS; ++r) {
+              if (FAST || first + r < H) {
+                const Hy4GgufQ4kRow dw =
+                    hy4_gguf_q4k_load(d_base + size_t(r) * row_bytes + blk_off, iq, ir);
 #pragma unroll
                 for (int m = 0; m < MAX_MATCH; ++m) {
-                  if (m < n_match) {
-                    const device float* y4 =
-                        hidden + size_t(m_assign[m]) * size_t(M) + y_ib_off;
+                  if (uint(m) < cnt) {
+                    const uint a_m = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+                    const device float* y4 = hidden + size_t(a_m) * size_t(M) + y_ib_off;
                     const float4 v0 = *reinterpret_cast<const device float4*>(y4 + 0);
                     const float4 v1 = *reinterpret_cast<const device float4*>(y4 + 32);
                     const float4 v2 = *reinterpret_cast<const device float4*>(y4 + 128);
@@ -619,41 +612,33 @@ inline void hy4_gguf_down_combine_impl(
                         v1[0] + v1[1] + v1[2] + v1[3],
                         v2[0] + v2[1] + v2[2] + v2[3],
                         v3[0] + v3[1] + v3[2] + v3[3]);
-                    if (FAST || first + r < H) {
-                      acc[m][r] += hy4_gguf_q4k_dot(dw0, v0, v1, v2, v3, sumy);
-                    }
-                    if (FAST || first + r + 1 < H) {
-                      acc[m][r + 1] += hy4_gguf_q4k_dot(dw1, v0, v1, v2, v3, sumy);
-                    }
+                    acc[m][r] += hy4_gguf_q4k_dot(dw, v0, v1, v2, v3, sumy);
                   }
                 }
               }
             }
-          } else {
-            const short ix = short(lane >> 4);
-            const short tid_l = short(lane & 15u);
-            const short ip = tid_l >> 3;
-            const short il = tid_l & 7;
-            const short l0 = 4 * il;
-            const short is = 8 * ip + (l0 >> 4);
-            const size_t x_lane_off = size_t(128 * ip + l0);
-            for (int ib = int(ix); ib < nb; ib += 2) {
-              const size_t blk_off = size_t(ib) * 210u;
-              const size_t y_ib_off = size_t(ib) * 256u + x_lane_off;
+          }
+        } else {
+          const short ix = short(lane >> 4);
+          const short tid_l = short(lane & 15u);
+          const short ip = tid_l >> 3;
+          const short il = tid_l & 7;
+          const short l0 = 4 * il;
+          const short is = 8 * ip + (l0 >> 4);
+          const size_t x_lane_off = size_t(128 * ip + l0);
+          for (int ib = int(ix); ib < nb; ib += 2) {
+            const size_t blk_off = size_t(ib) * 210u;
+            const size_t y_ib_off = size_t(ib) * 256u + x_lane_off;
 #pragma unroll
-              for (int r = 0; r < RPS; r += 2) {
-                Hy4GgufQ6kRow dw0, dw1;
-                if (FAST || first + r < H) {
-                  dw0 = hy4_gguf_q6k_load(d_base + size_t(r) * row_bytes + blk_off, ip, l0, is);
-                }
-                if (FAST || first + r + 1 < H) {
-                  dw1 = hy4_gguf_q6k_load(d_base + size_t(r + 1) * row_bytes + blk_off, ip, l0, is);
-                }
+            for (int r = 0; r < RPS; ++r) {
+              if (FAST || first + r < H) {
+                const Hy4GgufQ6kRow dw =
+                    hy4_gguf_q6k_load(d_base + size_t(r) * row_bytes + blk_off, ip, l0, is);
 #pragma unroll
                 for (int m = 0; m < MAX_MATCH; ++m) {
-                  if (m < n_match) {
-                    const device float* y =
-                        hidden + size_t(m_assign[m]) * size_t(M) + y_ib_off;
+                  if (uint(m) < cnt) {
+                    const uint a_m = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+                    const device float* y = hidden + size_t(a_m) * size_t(M) + y_ib_off;
                     const float4 y0 = *reinterpret_cast<const device float4*>(y + 0);
                     const float4 y1 = *reinterpret_cast<const device float4*>(y + 32);
                     const float4 y2 = *reinterpret_cast<const device float4*>(y + 64);
@@ -663,29 +648,24 @@ inline void hy4_gguf_down_combine_impl(
                         y1[0] + y1[1] + y1[2] + y1[3],
                         y2[0] + y2[1] + y2[2] + y2[3],
                         y3[0] + y3[1] + y3[2] + y3[3]);
-                    if (FAST || first + r < H) {
-                      acc[m][r] += hy4_gguf_q6k_dot(dw0, y0, y1, y2, y3, sumy);
-                    }
-                    if (FAST || first + r + 1 < H) {
-                      acc[m][r + 1] += hy4_gguf_q6k_dot(dw1, y0, y1, y2, y3, sumy);
-                    }
+                    acc[m][r] += hy4_gguf_q6k_dot(dw, y0, y1, y2, y3, sumy);
                   }
                 }
               }
             }
           }
+        }
 #pragma unroll
-          for (int m = 0; m < MAX_MATCH; ++m) {
-            if (m < n_match) {
-              const uint dst_a = m_assign[m];
-              const float weight = weights[dst_a];
+        for (int m = 0; m < MAX_MATCH; ++m) {
+          if (uint(m) < cnt) {
+            const uint dst_a = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+            const float weight = weights[dst_a];
 #pragma unroll
-              for (int r = 0; r < RPS; ++r) {
-                if (FAST || first + r < H) {
-                  const float val = simd_sum(acc[m][r]);
-                  if (lane == 0) {
-                    products[dst_a * uint(RPS) + uint(r)] = val * weight;
-                  }
+            for (int r = 0; r < RPS; ++r) {
+              if (FAST || first + r < H) {
+                const float val = simd_sum(acc[m][r]);
+                if (lane == 0u) {
+                  products[dst_a * uint(RPS) + uint(r)] = val * weight;
                 }
               }
             }
@@ -697,19 +677,21 @@ inline void hy4_gguf_down_combine_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Match MLX col_reduce_small's 8-lane modulo fold.
-    if (simd < uint(ROWS) && lane < uint(RPS)) {
-      if (FAST || first + int(lane) < H) {
-        constexpr int LANES = (TOP < 8) ? TOP : 8;
-        const int row_base = int(simd) * TOP;
-        float totals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        for (int slot_idx = 0; slot_idx < TOP; ++slot_idx) {
-          totals[slot_idx % 8] += products[(row_base + slot_idx) * RPS + int(lane)];
+    for (uint r_idx = simd; r_idx < uint(ROWS); r_idx += uint(KSG)) {
+      if (lane < uint(RPS)) {
+        if (FAST || first + int(lane) < H) {
+          constexpr int LANES = (TOP < 8) ? TOP : 8;
+          const uint row_base = r_idx * uint(TOP);
+          float totals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+          for (int slot_idx = 0; slot_idx < TOP; ++slot_idx) {
+            totals[slot_idx % 8] += products[(row_base + uint(slot_idx)) * uint(RPS) + lane];
+          }
+          float total = totals[0];
+          for (int i = 1; i < LANES; ++i) {
+            total += totals[i];
+          }
+          out[size_t(r_idx) * size_t(H) + size_t(first) + size_t(lane)] = total;
         }
-        float total = totals[0];
-        for (int i = 1; i < LANES; ++i) {
-          total += totals[i];
-        }
-        out[size_t(simd) * size_t(H) + size_t(first) + size_t(lane)] = total;
       }
     }
     return;

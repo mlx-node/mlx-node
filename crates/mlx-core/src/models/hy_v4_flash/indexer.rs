@@ -895,14 +895,15 @@ impl Indexer {
         self.rope(&q, positions)
     }
 
-    /// Head weights `proj·x · (H·d)^-½` `[r, H]`; decode rows one per call.
+    /// Head weights `proj·x · (H·d)^-½` `[r, H]`; `qlinear` is strictly
+    /// row-invariant for quantized `proj` at decode widths (`M <= 16`).
     pub fn head_weights(&self, w: &IndexerWeights, x: &MxArray, kind: RowKind) -> Result<MxArray> {
         let one = |r: &MxArray| {
             qlinear(&r.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
         };
         match kind {
-            RowKind::Decode => per_row(x, one),
-            RowKind::Prefill => one(x),
+            RowKind::Decode if !w.proj.is_qmm() || x.shape_at(0)? > 16 => per_row(x, one),
+            _ => one(x),
         }
     }
 
@@ -1153,6 +1154,39 @@ impl Indexer {
         st: &mut IndexerState,
     ) -> Result<MxArray> {
         self.select_in(w, call, &mut st.pooled, &mut st.tail, None)
+    }
+
+    /// Single-row read-only selection without mutating `st` when `select_tail`
+    /// guarantees the new row never scores its own group (`visible(t) == t / kpool`).
+    /// Falls back to [`Self::select`] for multi-row calls or `!select_tail`.
+    pub fn select_readonly(
+        &self,
+        w: &IndexerWeights,
+        call: Call<'_>,
+        st: &mut IndexerState,
+    ) -> Result<MxArray> {
+        let n = call.x.shape_at(0)? as usize;
+        if n != 1 || !self.g.select_tail {
+            return self.select(w, call, st);
+        }
+        let start = call.start;
+        let groups_before = start / self.g.kpool;
+        if st.tail.len != start || st.pooled.groups() != groups_before {
+            return Err(bad(format!(
+                "select_readonly at {start} with {} positions and {} groups",
+                st.tail.len,
+                st.pooled.groups()
+            )));
+        }
+        let mut plan = self.g.plan(start, 1);
+        plan.cols = groups_before;
+        if !plan.dense.is_empty() {
+            return MxArray::from_int32(
+                &dense_rows(plan.dense.start, 1, plan.kmax)?,
+                &[1, plan.kmax as i64],
+            );
+        }
+        self.sparse_cells(w, call, &plan, &st.pooled, None)
     }
 
     /// `select` for a paged sequence: the pooled keys go to and come from

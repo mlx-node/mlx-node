@@ -398,8 +398,9 @@ fn routing_arch() -> Result<String> {
 }
 
 /// Resident bytes of the MTP layer as it is held: routed experts affine-4
-/// g64 (bf16 scales and biases), other BF16 matrices affine-8 g32
-/// (`Dense::Qmm`), the rest as `weights::resident_bytes`. 0 without one.
+/// g64 (bf16 scales and biases), other BF16 matrices symmetric Q8_0 g32
+/// (`Dense::SymQ8`), the rest as `weights::resident_bytes`, plus the optional
+/// draft-only SymQ8 LM head when enabled. 0 without an MTP layer.
 pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
     let add = |acc: u64, b: u64| {
         acc.checked_add(b)
@@ -410,7 +411,7 @@ pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
         let b = match form(Role::Mtp, &loc.info)? {
             Form::Bf16 => {
                 let v = loc.info.num_elements()?;
-                v + v / 4
+                v + v / 16
             }
             _ => resident_bytes(Role::Mtp, &loc.info)?,
         };
@@ -421,6 +422,9 @@ pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
             let v = loc.info.num_elements()?;
             n = add(n, v / 2 + v / 16)?;
         }
+    }
+    if n > 0 {
+        n = add(n, super::mtp::draft_head_bytes(scan)?)?;
     }
     Ok(n)
 }

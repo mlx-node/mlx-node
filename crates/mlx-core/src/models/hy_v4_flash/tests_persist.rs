@@ -719,3 +719,221 @@ fn hy4s_state_round_trips_wrapped_circular_window_ring() {
         }
     }
 }
+
+/// Fast (< `DELAY`) decode turns publish a deeper `Kind::Turn` state before
+/// the prompt-end replay state's `DELAY` expires; the prompt-end state must
+/// not be marked superseded so cross-restart restore of the same prompt still
+/// finds it, while linear `Turn -> Turn` superseding continues to work.
+#[test]
+fn fast_decode_turn_does_not_supersede_prompt_end_state() {
+    use super::ladder::Kind;
+    use super::prefix_state::resumes;
+
+    let root = Temp::new();
+    std::fs::create_dir_all(root.0.join("tmp")).unwrap();
+    let options = DiskTierOptions {
+        cache_disk: CacheDisk::Bytes(2 << 30),
+        persistent: true,
+        cache_dir: Some(root.0.join("cache")),
+        temp_root: Some(root.0.join("tmp")),
+    };
+    let cfg = super::tests_model::tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let identity = || {
+        let fp = ColdCacheFingerprint::from_components([b"hy4-fast-turn-restore".as_slice()]);
+        Some(PersistentIdentity {
+            namespace: "fedcba9876543210fedcba9876543210".to_string(),
+            state: fp,
+            kv: fp,
+        })
+    };
+
+    let prompt_row = MINIMUM_ROWS; // 2048 (64 blocks)
+    let prompt_len = prompt_row + 33;
+    let turn1_row = prompt_row + 256; // 2304 (72 blocks)
+    let turn2_row = turn1_row + 256; // 2560 (80 blocks)
+    let full_tokens = tokens(turn2_row + 16);
+    let prompt_tokens = &full_tokens[..prompt_len];
+    let pass: Vec<Vec<u64>> = (0..prompt_row / BLOCK_ROWS)
+        .map(|b| vec![0x5000_0000u64 + b as u64])
+        .collect();
+    let t1_keys = turn_keys(&full_tokens, &pass, turn1_row, 111);
+    let t2_keys = turn_keys(&full_tokens, &t1_keys, turn2_row, 222);
+
+    let make_state = |row: usize| -> PrefixState {
+        let mut cell = super::owner::OwnerCell::new(&cfg, None).unwrap();
+        let width = cfg.mla.kv_row();
+        let idx_layer = cfg
+            .trunk()
+            .iter()
+            .position(|l| l.attn == super::config::Attn::Indexed)
+            .unwrap();
+        let idx_g = super::indexer::IndexerGeometry::of(&cfg, idx_layer).unwrap();
+        let kv = crate::array::MxArray::zeros(
+            &[row as i64, width as i64],
+            Some(crate::array::DType::Float16),
+        )
+        .unwrap();
+        for part in cell.layers_mut() {
+            match part {
+                super::owner::CellLayer::Window(ring) => {
+                    ring.append(&kv, 0).unwrap();
+                }
+                super::owner::CellLayer::Index(ix) => {
+                    let held = (idx_g.kpool - 1 + super::cache::WINDOW_SLACK).min(row);
+                    let r = crate::array::MxArray::zeros(
+                        &[held as i64, idx_g.head_dim as i64],
+                        Some(crate::array::DType::Float32),
+                    )
+                    .unwrap();
+                    let tail = super::indexer::TokTail::of_rows(&idx_g, Some(r), row).unwrap();
+                    *ix = super::indexer::PagedIndexerState::at(ix.layer(), tail);
+                }
+            }
+        }
+        cell.advance(&full_tokens[..row]).unwrap();
+        cell.state().unwrap().unwrap()
+    };
+
+    // Session 1: publish prompt-end state at 2048, then immediately (< DELAY)
+    // publish Turn 1 at 2304, then flush on clean close.
+    {
+        let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
+        let telem = Arc::new(Telemetry::default());
+        let mut disk = Disk::open(tier, Arc::clone(&telem), shape.clone(), PAGE).unwrap();
+        let mut states = States::<PrefixState>::with_cap(8);
+
+        let p_hot = vec![0u64; prompt_row / BLOCK_ROWS];
+        disk.start(1, &full_tokens[..prompt_row], &pass, &p_hot, 0);
+        let p_id = states
+            .publish(
+                Key {
+                    tokens: &full_tokens[..prompt_row],
+                    keys: &pass,
+                    salt: 0,
+                },
+                make_state(prompt_row),
+                Kind::Prompt,
+            )
+            .unwrap()
+            .unwrap();
+        disk.published(states.store(), 1, prompt_row, None, Some(p_id));
+
+        // Fast decode finishes immediately (< DELAY) and publishes Turn 1.
+        let t1_hot = vec![0u64; turn1_row / BLOCK_ROWS];
+        disk.start(1, &full_tokens[..turn1_row], &t1_keys, &t1_hot, 0);
+        let t1_id = states
+            .publish(
+                Key {
+                    tokens: &full_tokens[..turn1_row],
+                    keys: &t1_keys,
+                    salt: 0,
+                },
+                make_state(turn1_row),
+                Kind::Turn,
+            )
+            .unwrap()
+            .unwrap();
+        disk.published(states.store(), 1, turn1_row, None, Some(t1_id));
+        assert!(
+            states.store().superseded(p_id),
+            "raw store.superseded(p_id) must be true so the regression exercises our fix"
+        );
+
+        assert!(disk.flush_points(
+            states.store_mut(),
+            &mut NumberedBlocks,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert_eq!(
+            telem.unneeded.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "prompt-end state must not be superseded by fast Turn 1 state"
+        );
+        assert!(
+            states
+                .store()
+                .get(p_id)
+                .and_then(|e| e.disk())
+                .is_some_and(|d| d.landed),
+            "prompt-end state at {prompt_row} must land on disk"
+        );
+        assert!(
+            states
+                .store()
+                .get(t1_id)
+                .and_then(|e| e.disk())
+                .is_some_and(|d| d.landed),
+            "turn state at {turn1_row} must land on disk"
+        );
+    }
+
+    // Session 2 (cross-restart): adopt from disk and verify repeating the
+    // original prompt of length `prompt_len` finds row `prompt_row`.
+    {
+        let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
+        let telem = Arc::new(Telemetry::default());
+        let mut disk = Disk::open(tier, Arc::clone(&telem), shape.clone(), PAGE).unwrap();
+        let mut states = States::<PrefixState>::with_cap(8);
+        disk.adopt(states.store_mut());
+
+        let prompt_key = Key {
+            tokens: prompt_tokens,
+            keys: &pass,
+            salt: 0,
+        };
+        let found: Vec<usize> = states
+            .store()
+            .entries()
+            .filter(|e| resumes(e, prompt_key))
+            .map(|e| e.depth())
+            .collect();
+        assert_eq!(
+            found,
+            vec![prompt_row],
+            "restarted store must find prompt-end state {prompt_row} for repeated prompt"
+        );
+
+        // Verify Turn 1 -> Turn 2 superseding still works when both are `Turn` states.
+        let t1_hot = vec![0u64; turn1_row / BLOCK_ROWS];
+        disk.start(2, &full_tokens[..turn1_row], &t1_keys, &t1_hot, 7);
+        let t1_id = states
+            .publish(
+                Key {
+                    tokens: &full_tokens[..turn1_row],
+                    keys: &t1_keys,
+                    salt: 7,
+                },
+                make_state(turn1_row),
+                Kind::Turn,
+            )
+            .unwrap()
+            .unwrap();
+        disk.published(states.store(), 2, turn1_row, None, Some(t1_id));
+        let t2_hot = vec![0u64; turn2_row / BLOCK_ROWS];
+        disk.start(2, &full_tokens[..turn2_row], &t2_keys, &t2_hot, 7);
+        let t2_id = states
+            .publish(
+                Key {
+                    tokens: &full_tokens[..turn2_row],
+                    keys: &t2_keys,
+                    salt: 7,
+                },
+                make_state(turn2_row),
+                Kind::Turn,
+            )
+            .unwrap()
+            .unwrap();
+        disk.published(states.store(), 2, turn2_row, None, Some(t2_id));
+        assert!(disk.flush_points(
+            states.store_mut(),
+            &mut NumberedBlocks,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert_eq!(
+            telem.unneeded.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "linear Turn 1 should still be superseded by Turn 2"
+        );
+    }
+}

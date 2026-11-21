@@ -115,16 +115,6 @@ if constexpr (USE_TG_X) {
     } else {
       const float bi0 = float(biases[wrow0 * size_t(n_groups) + size_t(grp)]);
       const float bi1 = float(biases[wrow1 * size_t(n_groups) + size_t(grp)]);
-      float xsum_r[M_TILE];
-#pragma unroll
-      for (int r = 0; r < M_TILE; ++r) {
-        float s = 0.0f;
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-          s += x_tg[r][j][lane];
-        }
-        xsum_r[r] = s;
-      }
       {
         const float4 q0 = float4(as_type<uchar4>(wu0.x));
         const float4 q1 = float4(as_type<uchar4>(wu0.y));
@@ -136,9 +126,12 @@ if constexpr (USE_TG_X) {
           const float4 x1 = float4(x_tg[r][4][lane], x_tg[r][5][lane], x_tg[r][6][lane], x_tg[r][7][lane]);
           const float4 x2 = float4(x_tg[r][8][lane], x_tg[r][9][lane], x_tg[r][10][lane], x_tg[r][11][lane]);
           const float4 x3 = float4(x_tg[r][12][lane], x_tg[r][13][lane], x_tg[r][14][lane], x_tg[r][15][lane]);
+          // Exact binary-tree reduction order matches the non-TG path bit-for-bit.
+          const float4 xs = (x0 + x1) + (x2 + x3);
+          const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
           const float d = metal::dot(x0, q0) + metal::dot(x1, q1) +
                           metal::dot(x2, q2) + metal::dot(x3, q3);
-          acc[r][0] = metal::fma(d, sc0, metal::fma(xsum_r[r], bi0, acc[r][0]));
+          acc[r][0] = metal::fma(d, sc0, metal::fma(xsum, bi0, acc[r][0]));
         }
       }
       {
@@ -152,9 +145,11 @@ if constexpr (USE_TG_X) {
           const float4 x1 = float4(x_tg[r][4][lane], x_tg[r][5][lane], x_tg[r][6][lane], x_tg[r][7][lane]);
           const float4 x2 = float4(x_tg[r][8][lane], x_tg[r][9][lane], x_tg[r][10][lane], x_tg[r][11][lane]);
           const float4 x3 = float4(x_tg[r][12][lane], x_tg[r][13][lane], x_tg[r][14][lane], x_tg[r][15][lane]);
+          const float4 xs = (x0 + x1) + (x2 + x3);
+          const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
           const float d = metal::dot(x0, q0) + metal::dot(x1, q1) +
                           metal::dot(x2, q2) + metal::dot(x3, q3);
-          acc[r][1] = metal::fma(d, sc1, metal::fma(xsum_r[r], bi1, acc[r][1]));
+          acc[r][1] = metal::fma(d, sc1, metal::fma(xsum, bi1, acc[r][1]));
         }
       }
     }

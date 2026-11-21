@@ -41,9 +41,9 @@ use super::bank::{DirectLayerArrays, KqBank, MmapProj, Prepared, ProjArrays};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{
-    gguf_prefill_indirect_down, gguf_prefill_indirect_gu, gguf_routed_decode,
-    moe_prefill_sort_tiles, rms_norm, route, route_pair, router_logits, router_scores,
-    router_topk_gpu, try_q8_dual_down_add, try_router_mv,
+    affine4_routed_decode, gguf_prefill_indirect_down, gguf_prefill_indirect_gu,
+    gguf_routed_decode, moe_prefill_sort_tiles, rms_norm, route, route_pair, router_logits,
+    router_scores, router_topk_gpu, try_q8_dual_down_add, try_router_mv,
 };
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
@@ -497,6 +497,18 @@ impl AffineExperts {
         self.projs.iter().map(AffineProj::nbytes).sum()
     }
 
+    pub(crate) fn projs(&self) -> &[AffineProj; 3] {
+        &self.projs
+    }
+
+    pub(crate) fn group_size(&self) -> i32 {
+        self.group_size
+    }
+
+    pub(crate) fn bits(&self) -> i32 {
+        self.bits
+    }
+
     /// Refuses unless gate and up map `latent` to `ff` and down maps `ff`
     /// to `latent`, for `n` experts.
     fn check(&self, n: usize, ff: usize, latent: usize) -> Result<()> {
@@ -678,6 +690,37 @@ impl Moe {
             bias_gpu,
             experts,
         })
+    }
+
+    fn affine4_routed_decode_gpu(
+        &self,
+        z: &MxArray,
+        ids: &MxArray,
+        weights: &MxArray,
+        a: &AffineExperts,
+    ) -> Result<Option<MxArray>> {
+        if a.group_size() != 64 || a.bits() != 4 || z.shape_at(0)? > 8 {
+            return Ok(None);
+        }
+        let projs = a.projs();
+        if projs[0].s.dtype()? != DType::BFloat16 {
+            return Ok(None);
+        }
+        affine4_routed_decode(
+            z,
+            ids,
+            weights,
+            &projs[0].w,
+            &projs[0].s,
+            &projs[0].b,
+            &projs[1].w,
+            &projs[1].s,
+            &projs[1].b,
+            &projs[2].w,
+            &projs[2].s,
+            &projs[2].b,
+            self.limit,
+        )
     }
 
     fn down_and_shared_gu(
@@ -885,9 +928,15 @@ impl Moe {
                         prof_end(Phase::Router, tp, &[&gpu_ids, &gpu_weights])?;
                         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
                         let tp_r = prof_start();
-                        let r = self.combine_gpu(&z, &gpu_ids, &gpu_weights, |pi, xi, idx| {
-                            a.gather(pi, xi, idx)
-                        })?;
+                        let r =
+                            match self.affine4_routed_decode_gpu(&z, &gpu_ids, &gpu_weights, a)? {
+                                Some(r) => r,
+                                None => {
+                                    self.combine_gpu(&z, &gpu_ids, &gpu_weights, |pi, xi, idx| {
+                                        a.gather(pi, xi, idx)
+                                    })?
+                                }
+                            };
                         prof_end(Phase::Routed, tp_r, &[&r])?;
                         let f = self.finish_with_shared(w, x, &r, shared_gu)?;
                         return Ok((f, None));
@@ -1211,7 +1260,17 @@ impl Moe {
         match &self.experts {
             ExpertSource::Resident(a) => {
                 let tp = prof_start();
-                let y = self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?;
+                let y = if kind.is_decode() && rows <= 8 {
+                    let k = self.moe.n_used as i64;
+                    let ids_arr = MxArray::from_uint32(&ids, &[rows, k])?;
+                    let w_arr = MxArray::from_float32(&w, &[rows, k])?;
+                    match self.affine4_routed_decode_gpu(z, &ids_arr, &w_arr, a)? {
+                        Some(y) => y,
+                        None => self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?,
+                    }
+                } else {
+                    self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?
+                };
                 prof_end(Phase::Routed, tp, &[&y])?;
                 Ok(y)
             }

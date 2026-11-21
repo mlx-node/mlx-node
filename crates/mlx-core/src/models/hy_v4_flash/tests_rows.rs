@@ -555,9 +555,9 @@ fn f8_row_cache_lru_hits_eviction_and_zero_capacity() {
     assert!(parse_cache_mb(Some("-1")).is_err());
     assert!(parse_cache_mb(Some("abc")).is_err());
 
-    // Default 64 MiB at head_dim = 96 fits 524,288 rows inside IO_FIXED.
+    // Default 256 MiB at head_dim = 96 fits 2,097,152 rows.
     let default_cache = F8RowCache::from_budget_bytes(DEFAULT_ENGRAM_CACHE_MB << 20, 96);
-    assert_eq!(default_cache.capacity(), 524_288);
+    assert_eq!(default_cache.capacity(), 2_097_152);
 
     // Capacity 0 disables caching completely.
     let mut disabled = F8RowCache::from_budget_bytes(0, 4);

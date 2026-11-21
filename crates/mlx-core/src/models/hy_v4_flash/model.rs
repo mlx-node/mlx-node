@@ -29,7 +29,8 @@ use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
 use super::ops::{
-    HEAD_CHUNK, hc_bridge_head, hc_head_norm, head_chunks, head_logits, try_bf16_lm_head,
+    HEAD_CHUNK, hc_bridge_head, hc_head_norm, head_chunks, head_logits, rope_positions_f32,
+    try_bf16_lm_head,
 };
 use super::prefix_state::StateLayer;
 use super::rows::{EngramRows, PrefetchHandle};
@@ -928,6 +929,7 @@ impl Model {
             && self.decode_prefetch_active();
         let keep_out = trace.as_deref().is_some_and(|t| t.keep_out);
         let mut pending_trace_out = false;
+        let wave_pos_f32 = rope_positions_f32(&wave.positions())?;
         for (l, blk) in self.blocks.iter().enumerate() {
             if cancel.is_some_and(|c| c(l)) {
                 return Err(bad(format!("cancelled before layer {l}")));
@@ -964,10 +966,11 @@ impl Model {
             let next = ((prefill_ahead || decode_ahead) && l + 1 < self.blocks.len())
                 .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
             let mut prev_out_slot = None;
-            let (next_carry, routes) = blk.forward_carry(
+            let (next_carry, routes) = blk.forward_carry_with_pos(
                 &w.layers()[l],
                 carry,
                 wave,
+                Some(&wave_pos_f32),
                 owners,
                 engram,
                 next,
@@ -993,7 +996,16 @@ impl Model {
                     }
                 }
                 RowKind::Prefill | RowKind::Decode => {
-                    if !direct || (l >= 2 && (l - 2).is_multiple_of(3)) {
+                    // Flush at layer 0 in direct decode so GPU layer 0 overlaps
+                    // layer 1's Engram SSD read, then every 10 layers.
+                    let flush = if !direct {
+                        true
+                    } else if wave.kind() == RowKind::Decode {
+                        l == 0 || l == 10 || l == 20 || l == 30
+                    } else {
+                        l >= 2 && (l - 2).is_multiple_of(3)
+                    };
+                    if flush {
                         match &next_carry {
                             HcCarry::Streams(y) => MxArray::async_eval_arrays(&[y]),
                             HcCarry::Pending { y, res, post, .. } => {

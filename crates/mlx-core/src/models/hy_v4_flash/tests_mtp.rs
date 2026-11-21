@@ -55,7 +55,7 @@ fn held_bytes_match_the_fixture() {
         let want = t["plan_form"]["bytes"].as_u64().unwrap();
         assert_eq!(held_bytes(&i, expert).unwrap(), want, "{}", i.name);
         let form = match held(&i, expert).unwrap() {
-            Held::Qmm => "qmm_affine8_g32_f32_scale_bias",
+            Held::SymQ8 => "symq8_g32_f16_scale",
             Held::F32 => "f32",
             Held::Affine4 => "affine4_g64_bf16_scale_bias",
         };
@@ -834,6 +834,411 @@ fn mtp_draft_batch_matches_serial_multi_lane_multi_depth() {
             "{label}: draft_batch tokens differ from serial draft"
         );
     }
+
+    // Verify skipping `d.index.update` on each lane's last draft step
+    // (`persist = step + 1 < depth`) gives bit-identical tokens and leaves
+    // `d.index` untouched on the final step while settling cleanly.
+    for &(label, hist_lens, depths) in scenarios {
+        let n = hist_lens.len();
+        let mut full_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
+        let mut skip_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
+        let mut seeds_h: Vec<MxArray> = Vec::with_capacity(n);
+        let mut anchors: Vec<u32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let hist_h = arr(&r.vec(hist_lens[i] * D, 1.0), &[hist_lens[i], D]);
+            let hist_ids = r.ids(hist_lens[i]);
+            mtp.commit(&model, &mut full_drafts[i], &hist_h, &hist_ids)
+                .unwrap();
+            mtp.commit(&model, &mut skip_drafts[i], &hist_h, &hist_ids)
+                .unwrap();
+            seeds_h.push(arr(&r.vec(D, 1.0), &[1, D]));
+            anchors.push(r.ids(1)[0]);
+        }
+
+        let run_batched = |drafts: &mut [Draft], skip_last: bool| -> Vec<Vec<u32>> {
+            let max_depth = depths.iter().copied().max().unwrap_or(0);
+            let mut h_states = seeds_h.clone();
+            let mut tok_states: Vec<MxArray> = anchors
+                .iter()
+                .map(|&t| MxArray::from_uint32(&[t], &[1]).unwrap())
+                .collect();
+            let mut step_toks: Vec<(Vec<usize>, MxArray)> = Vec::with_capacity(max_depth);
+            let _scope = DeferScope::enter();
+            for step in 0..max_depth {
+                let active: Vec<usize> = (0..n).filter(|&i| step < depths[i]).collect();
+                let h_refs: Vec<&MxArray> = active.iter().map(|&i| &h_states[i]).collect();
+                let t_refs: Vec<&MxArray> = active.iter().map(|&i| &tok_states[i]).collect();
+                let h_batch = if h_refs.len() == 1 {
+                    h_refs[0].clone()
+                } else {
+                    MxArray::concatenate_many(h_refs, Some(0)).unwrap()
+                };
+                let t_batch = if t_refs.len() == 1 {
+                    t_refs[0].clone()
+                } else {
+                    MxArray::concatenate_many(t_refs, Some(0)).unwrap()
+                };
+                let e_batch = model.weights().token_embd().rows(&t_batch).unwrap();
+                let mut lane_ptrs: Vec<&mut Draft> = drafts
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|&(i, _)| step < depths[i])
+                    .map(|(_, d)| d)
+                    .collect();
+                let persist: Vec<bool> = active
+                    .iter()
+                    .map(|&i| !skip_last || step + 1 < depths[i])
+                    .collect();
+                let (h_next, logits) = mtp
+                    .draft_batch_with_persist(&model, &mut lane_ptrs, &h_batch, &e_batch, &persist)
+                    .unwrap();
+                let next_ids = logits.argmax(-1, Some(false)).unwrap();
+                for (k, &lane) in active.iter().enumerate() {
+                    let lo = k as i64;
+                    let hi = lo + 1;
+                    h_states[lane] = h_next.slice(&[lo, 0], &[hi, D as i64]).unwrap();
+                    tok_states[lane] = next_ids.slice(&[lo], &[hi]).unwrap();
+                }
+                step_toks.push((active, next_ids));
+            }
+            let eval_refs: Vec<&MxArray> = step_toks.iter().map(|(_, t)| t).collect();
+            stats::eval(&eval_refs, "test mtp draft_batch persist").unwrap();
+            let mut out = vec![Vec::new(); n];
+            for (active, ids_arr) in &step_toks {
+                let vals = ids_arr.to_int32().unwrap();
+                for (k, &lane) in active.iter().enumerate() {
+                    out[lane].push(vals[k] as u32);
+                }
+            }
+            out
+        };
+
+        let full_toks = run_batched(&mut full_drafts, false);
+        let skip_toks = run_batched(&mut skip_drafts, true);
+        assert_eq!(
+            skip_toks, full_toks,
+            "{label}: persist=false last step changed drafted tokens"
+        );
+        for i in 0..n {
+            assert_eq!(
+                skip_drafts[i].index().len(),
+                hist_lens[i] + depths[i] - 1,
+                "{label} lane {i}: last draft step should skip index.update"
+            );
+            assert_eq!(skip_drafts[i].len(), hist_lens[i] + depths[i]);
+            skip_drafts[i].cut(hist_lens[i]).unwrap();
+            assert_eq!(skip_drafts[i].len(), hist_lens[i]);
+            assert_eq!(skip_drafts[i].index().len(), hist_lens[i]);
+        }
+    }
+}
+
+#[test]
+fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
+    use super::config::{
+        Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
+    };
+    use super::moe::{AffineExperts, AffineProj};
+    use super::mtp::{MtpHeadMode, MtpLayer, parse_mtp_head_mode, with_mtp_head};
+    use super::mtp_weights::MtpWeights;
+    use super::weights::{
+        AttnWeights, Dense, Ffn, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Residual,
+        quantize_sym_q8_array, quantize_sym_q8_from_bf16_raw,
+    };
+    use crate::array::DType;
+    use crate::cache_limit::coordinator;
+    use crate::models::deepseek_v41::EngramConfig;
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn step(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn next(&mut self) -> f32 {
+            ((self.step() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+        fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+            (0..n).map(|_| self.next() * scale).collect()
+        }
+    }
+    fn arr(v: &[f32], shape: &[usize]) -> MxArray {
+        let s: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+        MxArray::from_float32(v, &s).unwrap()
+    }
+
+    assert_eq!(parse_mtp_head_mode(None).unwrap(), MtpHeadMode::SymQ8);
+    assert_eq!(parse_mtp_head_mode(Some("")).unwrap(), MtpHeadMode::SymQ8);
+    assert_eq!(
+        parse_mtp_head_mode(Some("symq8")).unwrap(),
+        MtpHeadMode::SymQ8
+    );
+    assert_eq!(
+        parse_mtp_head_mode(Some(" SYMQ8 ")).unwrap(),
+        MtpHeadMode::SymQ8
+    );
+    assert_eq!(
+        parse_mtp_head_mode(Some("bf16")).unwrap(),
+        MtpHeadMode::Bf16
+    );
+    assert_eq!(
+        parse_mtp_head_mode(Some("BF16")).unwrap(),
+        MtpHeadMode::Bf16
+    );
+    assert!(parse_mtp_head_mode(Some("q4")).is_err());
+
+    // Direct raw BF16 -> SymQ8 matches array -> SymQ8 and keeps tight parity.
+    let (vocab, dim) = (128usize, 64usize);
+    let mut r = Rng::new(701);
+    let bf16_u16: Vec<u16> = r
+        .vec(vocab * dim, 0.5)
+        .into_iter()
+        .map(|v| (v.to_bits() >> 16) as u16)
+        .collect();
+    let bf16_raw: Vec<u8> = bf16_u16.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let bf16_f32: Vec<f32> = bf16_u16
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    let bf16_arr = MxArray::from_float32(&bf16_f32, &[vocab as i64, dim as i64])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+    let from_raw = quantize_sym_q8_from_bf16_raw(&bf16_raw, vocab, dim).unwrap();
+    let from_arr = quantize_sym_q8_array(&bf16_arr).unwrap();
+    assert_eq!(from_raw.nbytes(), vocab * dim + vocab * dim / 16);
+    assert_eq!(from_arr.nbytes(), from_raw.nbytes());
+
+    let x = arr(&r.vec(4 * dim, 1.0), &[4, dim]);
+    let bf16_dense = Dense::Array(bf16_arr);
+    let want = super::model::head_rows(&x, &bf16_dense).unwrap();
+    let got_raw = super::model::head_rows(&x, &from_raw).unwrap();
+    let got_arr = super::model::head_rows(&x, &from_arr).unwrap();
+    let w_v = want.to_float32().unwrap();
+    let r_v = got_raw.to_float32().unwrap();
+    let a_v = got_arr.to_float32().unwrap();
+    assert_eq!(
+        r_v.as_ref(),
+        a_v.as_ref(),
+        "raw vs array SymQ8 must match bit-for-bit"
+    );
+    let max_diff = w_v
+        .iter()
+        .zip(a_v.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 0.05,
+        "SymQ8 draft head max logit diff {max_diff}"
+    );
+    for row in 0..4 {
+        let argmax = |s: &[f32]| {
+            s[row * vocab..(row + 1) * vocab]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(
+            argmax(w_v.as_ref()),
+            argmax(a_v.as_ref()),
+            "row {row} argmax"
+        );
+    }
+
+    // Verify MtpLayer::new_with_head accounts for draft_head bytes under SymQ8 vs Bf16.
+    const V: usize = 32;
+    const D: usize = 64;
+    const Q_LORA: usize = 16;
+    const KV_LORA: usize = 16;
+    const ROPE: usize = 4;
+    const NOPE: usize = 4;
+    const HEAD_V: usize = 4;
+    const H: usize = 2;
+    const IX_D: usize = 8;
+    const IX_H: usize = 2;
+    const LAT: usize = 64;
+    const FF: usize = 64;
+    const SFF: usize = 32;
+    const E: usize = 4;
+    let cfg = HyV4FlashConfig {
+        n_layers: 1,
+        layers: vec![
+            LayerConfig {
+                attn: Attn::Sliding,
+                n_heads: H,
+                rope_theta: 1e4,
+                swiglu_limit: 0.0,
+                dense_ffn: true,
+                engram: None,
+                mtp: false,
+            },
+            LayerConfig {
+                attn: Attn::Indexed,
+                n_heads: H,
+                rope_theta: 1e7,
+                swiglu_limit: 10.0,
+                dense_ffn: false,
+                engram: None,
+                mtp: true,
+            },
+        ],
+        vocab_size: V,
+        context_length: 64,
+        dim: D,
+        dense_ff: 16,
+        n_dense_lead: 1,
+        norm_eps: 1e-5,
+        window: 4,
+        rope_theta: 1e7,
+        rope_theta_swa: 1e4,
+        mla: MlaConfig {
+            q_lora_rank: Q_LORA,
+            kv_lora_rank: KV_LORA,
+            qk_nope_dim: NOPE,
+            rope_dim: ROPE,
+            head_dim_qk: NOPE + ROPE,
+            head_dim_v: HEAD_V,
+            scale: ((NOPE + ROPE) as f32).sqrt().recip(),
+        },
+        moe: MoeConfig {
+            n_experts: E,
+            n_used: 2,
+            n_shared: 1,
+            ff: FF,
+            latent: LAT,
+            route_scale: 1.0,
+            norm_topk: true,
+        },
+        hc: HcConfig {
+            count: 2,
+            eps: 1e-6,
+            magnitude: 2.0,
+        },
+        indexer: IndexerConfig {
+            n_heads: IX_H,
+            head_dim: IX_D,
+            top_k: 4,
+            kpool: 2,
+            select_tail: true,
+        },
+        engram: EngramConfig {
+            layers: vec![],
+            max_ngram: 2,
+            n_heads: 0,
+            head_dim: 0,
+            multipliers: vec![],
+            head_offsets: vec![],
+            head_vocab_sizes: vec![],
+            pad_token_id: 0,
+            compressed_vocab_size: 0,
+            token_map: vec![],
+            vocab_size: None,
+        },
+    };
+    let make_mw = |seed: u64| {
+        let mut r = Rng::new(seed);
+        let mk = |r: &mut Rng, rows: usize, cols: usize| {
+            Dense::Array(arr(&r.vec(rows * cols, 0.2), &[rows, cols]))
+        };
+        let ones = |n: usize| MxArray::from_float32(&vec![1.0; n], &[n as i64]).unwrap();
+        let mtp_lw = LayerWeights {
+            attn: AttnWeights {
+                norm: ones(D),
+                sinks: arr(&r.vec(H, 0.2), &[H]),
+                q_a: mk(&mut r, Q_LORA, D),
+                q_a_norm: ones(Q_LORA),
+                q_b: mk(&mut r, H * (NOPE + ROPE), Q_LORA),
+                kv_a: mk(&mut r, KV_LORA + ROPE, D),
+                kv_a_norm: ones(KV_LORA),
+                k_b: mk(&mut r, H * KV_LORA, NOPE),
+                v_b: mk(&mut r, H * HEAD_V, KV_LORA),
+                output: mk(&mut r, D, H * HEAD_V),
+                gate: mk(&mut r, H * HEAD_V, D),
+                post_norm: ones(D),
+                q_kv: None,
+                q_kv_gate: None,
+            },
+            indexer: Some(IndexerWeights {
+                attn_k: mk(&mut r, IX_D, D),
+                k_norm: ones(IX_D),
+                q_b: mk(&mut r, IX_H * IX_D, Q_LORA),
+                proj: mk(&mut r, IX_H, D),
+                compressor_value: arr(&r.vec(IX_D * IX_D, 0.2), &[IX_D, IX_D]),
+                compressor_gate: arr(&r.vec(IX_D * IX_D, 0.2), &[IX_D, IX_D]),
+                compressor_ape: arr(&r.vec(2 * IX_D, 0.1), &[2, IX_D]),
+                compressor_norm: ones(IX_D),
+            }),
+            engram: None,
+            residual: Residual::Mtp(NextnWeights {
+                enorm: ones(D),
+                hnorm: ones(D),
+                eh_proj: mk(&mut r, D, 2 * D),
+                shared_head_norm: ones(D),
+            }),
+            ffn_norm: ones(D),
+            post_ffw_norm: ones(D),
+            ffn: Ffn::Moe(MoeWeights {
+                router: mk(&mut r, E, D),
+                router_bias: None,
+                routed_down: mk(&mut r, LAT, D),
+                routed_up: mk(&mut r, D, LAT),
+                shared_gate: mk(&mut r, SFF, D),
+                shared_up: mk(&mut r, SFF, D),
+                shared_down: mk(&mut r, D, SFF),
+                down_shared_gu: None,
+            }),
+        };
+        let qexp = |r: &mut Rng, rows: usize, k: usize| {
+            let w = arr(&r.vec(E * rows * k, 0.2), &[E, rows, k])
+                .astype(DType::BFloat16)
+                .unwrap();
+            AffineProj::quantize(&w, 64, 4).unwrap()
+        };
+        let experts = AffineExperts::new(
+            [
+                qexp(&mut r, FF, LAT),
+                qexp(&mut r, FF, LAT),
+                qexp(&mut r, LAT, FF),
+            ],
+            64,
+            4,
+        )
+        .unwrap();
+        MtpWeights {
+            layer: 1,
+            weights: mtp_lw,
+            experts,
+            read: 0,
+            bytes: 1234,
+            guard: coordinator().register(0),
+        }
+    };
+    let tok_embd = Dense::Array(arr(&r.vec(V * D, 0.2), &[V, D]));
+    let out_head = Dense::Array(
+        arr(&r.vec(V * D, 0.2), &[V, D])
+            .astype(DType::BFloat16)
+            .unwrap(),
+    );
+
+    let sym = with_mtp_head(MtpHeadMode::SymQ8, || {
+        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
+    });
+    assert!(matches!(sym.draft_head(), Some(Dense::SymQ8 { .. })));
+    let expected_head_bytes = (V * D + V * D / 16) as u64;
+    assert_eq!(sym.bytes(), 1234 + expected_head_bytes);
+
+    let bf16 = with_mtp_head(MtpHeadMode::Bf16, || {
+        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
+    });
+    assert!(bf16.draft_head().is_none());
+    assert_eq!(bf16.bytes(), 1234);
 }
 
 fn hy4_dir() -> PathBuf {
@@ -847,9 +1252,10 @@ fn real_held_layer_matches_the_fixture() {
     let opts = super::store::Options::from_env(Some(16_384), true).unwrap();
     let store = super::store::Store::open(&paths, &opts).unwrap();
     let m = super::mtp::MtpLayer::load(&store.scan, &store.shards, &store.model).unwrap();
+    let draft_head = super::mtp::draft_head_bytes(&store.scan).unwrap();
     assert_eq!(
         m.bytes(),
-        fixture()["totals"]["plan_bytes"].as_u64().unwrap()
+        fixture()["totals"]["plan_bytes"].as_u64().unwrap() + draft_head
     );
 }
 

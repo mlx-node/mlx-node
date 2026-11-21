@@ -1195,6 +1195,74 @@ fn router_topk_gpu_matches_route_select_fast_and_is_row_invariant() {
             assert!(row.windows(2).all(|w| w[0] < w[1]));
         }
     }
+
+    // Verify bit-exact parity against CPU route_host across edge E and K values
+    // including heavy multi-SG ties.
+    for &(ev, kv) in &[
+        (16usize, 16usize),
+        (32, 1),
+        (500, 16),
+        (512, 16),
+        (512, 24),
+        (1000, 32),
+        (1024, 16),
+    ] {
+        let rows = 4usize;
+        let mut lv = det_f32(1300 + (ev * 31 + kv) as u64, rows * ev, 3.0);
+        // Row 1: global tie across every expert (tests lowest-id tie-breaking across all 4 SGs).
+        for j in 0..ev {
+            lv[ev + j] = 1.25;
+        }
+        // Row 2: 24-way tie scattered across SG 0..3 above random background.
+        for t in 0..24.min(ev) {
+            let idx = (t * 37) % ev;
+            lv[2 * ev + idx] = 10.0;
+        }
+        let l_arr = MxArray::from_float32(&lv, &[rows as i64, ev as i64]).unwrap();
+        let bv = det_f32(1400 + ev as u64, ev, 0.25);
+        let b_arr = MxArray::from_float32(&bv, &[ev as i64]).unwrap();
+        let cfg = MoeConfig {
+            n_experts: ev,
+            n_used: kv,
+            n_shared: 1,
+            ff: 1536,
+            latent: 1536,
+            route_scale: 2.5,
+            norm_topk: true,
+        };
+        for use_bias in [false, true] {
+            let Some((gi, gw)) = router_topk_gpu(&l_arr, use_bias.then_some(&b_arr), &cfg).unwrap()
+            else {
+                return;
+            };
+            let got_ids = gi.to_uint32().unwrap().to_vec();
+            let got_w = read(&gw);
+            let scores = read(&Activations::sigmoid(&l_arr).unwrap());
+            let (ref_ids, ref_w) =
+                route_host(&scores, use_bias.then_some(bv.as_slice()), &cfg).unwrap();
+            let mut want_ids = Vec::with_capacity(rows * kv);
+            let mut want_w = Vec::with_capacity(rows * kv);
+            for r in 0..rows {
+                let mut pairs: Vec<(u32, f32)> = ref_ids[r * kv..(r + 1) * kv]
+                    .iter()
+                    .copied()
+                    .zip(ref_w[r * kv..(r + 1) * kv].iter().copied())
+                    .collect();
+                pairs.sort_by_key(|p| p.0);
+                want_ids.extend(pairs.iter().map(|p| p.0));
+                want_w.extend(pairs.iter().map(|p| p.1));
+            }
+            assert_eq!(
+                got_ids, want_ids,
+                "router_topk edge ids mismatch E={ev} K={kv} bias={use_bias}"
+            );
+            assert_eq!(
+                to_bits(&got_w),
+                to_bits(&want_w),
+                "router_topk edge weights bit mismatch E={ev} K={kv} bias={use_bias}"
+            );
+        }
+    }
 }
 
 #[test]

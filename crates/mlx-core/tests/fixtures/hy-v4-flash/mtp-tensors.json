@@ -45,17 +45,17 @@
   "file_gib": 6.972045063972473,
   "s3_bytes": 7486241920,
   "s3_gib": 6.972106099128723,
-  "plan_bytes": 2189929600,
-  "plan_gib": 2.039530873298645,
+  "plan_bytes": 2168182912,
+  "plan_gib": 2.0192776918411255,
   "routed_expert_file_bytes": 7247757312,
   "routed_expert_plan_bytes": 2038431744,
   "routed_expert_plan_gib": 1.8984375,
   "non_expert_file_bytes": 238419072,
   "non_expert_bf16_file_bytes": 232030208,
-  "non_expert_bf16_plan_bytes": 145108992,
+  "non_expert_bf16_plan_bytes": 123362304,
   "f32_file_bytes": 6388864,
-  "non_expert_plan_bytes": 151497856,
-  "non_expert_plan_gib": 0.14109337329864502
+  "non_expert_plan_bytes": 129751168,
+  "non_expert_plan_gib": 0.12084019184112549
  },
  "requant_batches": {
   "experts_per_batch": 32,
@@ -68,7 +68,7 @@
    "tensors": 7,
    "file_bytes": 141950976,
    "s3_bytes": 141950976,
-   "plan_bytes": 88719360
+   "plan_bytes": 75411456
   },
   "norm": {
    "tensors": 11,
@@ -98,25 +98,25 @@
    "tensors": 3,
    "file_bytes": 28311552,
    "s3_bytes": 28311552,
-   "plan_bytes": 17694720
+   "plan_bytes": 15040512
   },
   "latent_proj": {
    "tensors": 2,
    "file_bytes": 18874368,
    "s3_bytes": 18874368,
-   "plan_bytes": 11796480
+   "plan_bytes": 10027008
   },
   "indexer": {
    "tensors": 6,
    "file_bytes": 5146624,
    "s3_bytes": 5212160,
-   "plan_bytes": 3307520
+   "plan_bytes": 2831360
   },
   "nextn_proj": {
    "tensors": 1,
    "file_bytes": 37748736,
    "s3_bytes": 37748736,
-   "plan_bytes": 23592960
+   "plan_bytes": 20054016
   }
  },
  "tensors": [
@@ -142,11 +142,10 @@
     "bytes": 50331648
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 31457280,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 28311552
+    "bytes": 26738688
    }
   },
   {
@@ -173,11 +172,10 @@
     "bytes": 6291456
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 3932160,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 3538944
+    "bytes": 3342336
    }
   },
   {
@@ -202,11 +200,10 @@
     "bytes": 3538944
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 2211840,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 1990656
+    "bytes": 1880064
    }
   },
   {
@@ -279,11 +276,10 @@
     "bytes": 50331648
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 31457280,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 28311552
+    "bytes": 26738688
    }
   },
   {
@@ -308,11 +304,10 @@
     "bytes": 6291456
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 3932160,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 3538944
+    "bytes": 3342336
    }
   },
   {
@@ -361,11 +356,10 @@
     "bytes": 16777216
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 10485760,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 9437184
+    "bytes": 8912896
    }
   },
   {
@@ -416,11 +410,10 @@
     "bytes": 8388608
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5242880,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 4718592
+    "bytes": 4456448
    }
   },
   {
@@ -501,11 +494,10 @@
     "bytes": 9437184
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5898240,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 5308416
+    "bytes": 5013504
    }
   },
   {
@@ -588,11 +580,10 @@
     "bytes": 9437184
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5898240,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 5308416
+    "bytes": 5013504
    }
   },
   {
@@ -641,11 +632,10 @@
     "bytes": 9437184
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5898240,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 5308416
+    "bytes": 5013504
    }
   },
   {
@@ -670,11 +660,10 @@
     "bytes": 9437184
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5898240,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 5308416
+    "bytes": 5013504
    }
   },
   {
@@ -731,11 +720,10 @@
     "bytes": 9437184
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 5898240,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 5308416
+    "bytes": 5013504
    }
   },
   {
@@ -760,11 +748,10 @@
     "bytes": 786432
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 491520,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 442368
+    "bytes": 417792
    }
   },
   {
@@ -789,11 +776,10 @@
     "bytes": 4194304
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 2621440,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 2359296
+    "bytes": 2228224
    }
   },
   {
@@ -842,11 +828,10 @@
     "bytes": 98304
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 61440,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 55296
+    "bytes": 52224
    }
   },
   {
@@ -973,11 +958,10 @@
     "bytes": 37748736
    },
    "plan_form": {
-    "form": "qmm_affine8_g32_f32_scale_bias",
+    "form": "symq8_g32_f16_scale",
     "bits": 8,
     "group": 32,
-    "bytes": 23592960,
-    "alt_mlx_quantize_bf16_scale_bias_bytes": 21233664
+    "bytes": 20054016
    }
   },
   {
@@ -1103,7 +1087,7 @@
  ],
  "notes": [
   "plan_form non-expert = Dense::Qmm bytes rule n + n/4 (weights.rs:92); mlx_quantize returns scales and biases in the input dtype, so a bf16 requant without a cast is the alt_* figure (n + n/8)",
-  "PLAN-addons §2.2 and scripts/addons_admission.py treat all 238,419,072 non-expert file bytes as BF16 (x1.25 / 2); F32 tensors stay f32 here, so non_expert_plan_bytes differs from that estimate",
+  "PLAN-addons \u00a72.2 and scripts/addons_admission.py treat all 238,419,072 non-expert file bytes as BF16 (x1.25 / 2); F32 tensors stay f32 here, so non_expert_plan_bytes differs from that estimate",
   "s3_form is the form weights.rs gives Role::Mtp today, for comparison only"
  ]
 }

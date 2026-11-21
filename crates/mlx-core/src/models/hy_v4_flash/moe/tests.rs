@@ -2437,3 +2437,133 @@ fn resident_decode_gpu_router_matches_host_router_bitwise_without_eval() {
         );
     }
 }
+
+/// Fused 2-kernel `affine4_routed_decode` matches `AffineExperts::combine_gpu`
+/// within `1e-4` (and exact dequantized f32 reference within `1e-4`), supports
+/// `TOP = 16`, asymmetric clamp `limit`, both `512`-aligned fast and `64`-aligned
+/// general shapes, and is bit-exact row-invariant across `rows = 1, 2, 4, 8`.
+#[test]
+fn affine4_routed_decode_matches_combine_gpu_and_is_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(777);
+
+    // Test both 512-aligned fast path (TOP=16, K=512, M=512, H=512) and
+    // general 64-aligned path (TOP=16, K=128, M=192, H=128).
+    let cases: &[(&str, usize, usize, usize, usize, usize, f32)] = &[
+        ("fast_top16_clamp", 24, 16, 512, 512, 512, 10.0),
+        ("general_top16_clamp", 24, 16, 128, 192, 128, 10.0),
+        ("general_top8_noclamp", 16, 8, 64, 128, 64, 0.0),
+    ];
+
+    for &(label, e, top, k, m, h, limit) in cases {
+        let q = |r: &mut Rng, out_d: usize, in_d: usize, scale: f32| {
+            let vals = r.vec(e * out_d * in_d, scale);
+            let a = MxArray::from_float32(&vals, &[e as i64, out_d as i64, in_d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            AffineProj::quantize(&a, 64, 4).unwrap()
+        };
+        let projs = [
+            q(&mut rng, m, k, 0.03),
+            q(&mut rng, m, k, 0.03),
+            q(&mut rng, h, m, 0.03),
+        ];
+        let experts = AffineExperts::new(projs, 64, 4).unwrap();
+        let moe_cfg = moe_cfg(e, top, m, k);
+        let ffn_c = ffn_cfg(k, moe_cfg.clone(), limit);
+        let (w, _, _) = moe_weights(&mut rng, &ffn_c, 32);
+        let moe = Moe::new(&ffn_c, 1, &w, ExpertSource::Resident(experts)).unwrap();
+        let ExpertSource::Resident(a) = &moe.experts else {
+            unreachable!();
+        };
+
+        // Construct 8 rows with overlapping expert picks (exercising dedup cnt 1..4)
+        // and include large values to exercise asymmetric gate/up clamping.
+        let max_rows = 8usize;
+        let x_rows: Vec<Vec<f32>> = (0..max_rows).map(|_| rng.vec(k, 0.5)).collect();
+        let mut all_ids = Vec::with_capacity(max_rows * top);
+        let mut all_weights = Vec::with_capacity(max_rows * top);
+        for row in 0..max_rows {
+            let mut row_ids = Vec::with_capacity(top);
+            let start = (row * 2) % e;
+            for t in 0..top {
+                row_ids.push(((start + t) % e) as u32);
+            }
+            row_ids.sort_unstable();
+            all_ids.extend_from_slice(&row_ids);
+            let mut ws: Vec<f32> = (0..top).map(|t| 0.05 + (t as f32) * 0.01).collect();
+            let s: f32 = ws.iter().sum();
+            for wi in &mut ws {
+                *wi /= s;
+            }
+            all_weights.extend_from_slice(&ws);
+        }
+
+        // Single-row baselines via fused kernel and via `combine_gpu`.
+        let mut single_fused_bits: Vec<Vec<u32>> = Vec::with_capacity(max_rows);
+        for row in 0..max_rows {
+            let x1 = MxArray::from_float32(&x_rows[row], &[1, k as i64]).unwrap();
+            let ids1 = MxArray::from_uint32(&all_ids[row * top..(row + 1) * top], &[1, top as i64])
+                .unwrap();
+            let w1 =
+                MxArray::from_float32(&all_weights[row * top..(row + 1) * top], &[1, top as i64])
+                    .unwrap();
+            let got1 = moe
+                .affine4_routed_decode_gpu(&x1, &ids1, &w1, a)
+                .unwrap()
+                .expect("affine4_routed_decode must run on Metal");
+            let ref1 = moe
+                .combine_gpu(&x1, &ids1, &w1, |pi, xi, idx| a.gather(pi, xi, idx))
+                .unwrap();
+            let gv = read(&got1);
+            let rv = read(&ref1);
+            let max_diff = gv
+                .iter()
+                .zip(&rv)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1e-4,
+                "{label} row {row}: affine4_routed_decode vs combine_gpu max_diff={max_diff:.6}"
+            );
+            single_fused_bits.push(gv.into_iter().map(f32::to_bits).collect());
+        }
+
+        // Multi-row batches (2, 4, 8): bit-exact match with single-row calls.
+        for &rows in &[2usize, 4, 8] {
+            let flat_x: Vec<f32> = x_rows[..rows].iter().flatten().copied().collect();
+            let xb = MxArray::from_float32(&flat_x, &[rows as i64, k as i64]).unwrap();
+            let idsb =
+                MxArray::from_uint32(&all_ids[..rows * top], &[rows as i64, top as i64]).unwrap();
+            let wb = MxArray::from_float32(&all_weights[..rows * top], &[rows as i64, top as i64])
+                .unwrap();
+            let got = moe
+                .affine4_routed_decode_gpu(&xb, &idsb, &wb, a)
+                .unwrap()
+                .expect("affine4_routed_decode batch must run on Metal");
+            let ref_b = moe
+                .combine_gpu(&xb, &idsb, &wb, |pi, xi, idx| a.gather(pi, xi, idx))
+                .unwrap();
+            let gv = read(&got);
+            let rv = read(&ref_b);
+            let max_diff = gv
+                .iter()
+                .zip(&rv)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1e-4,
+                "{label} rows={rows}: batch affine4_routed_decode vs combine_gpu max_diff={max_diff:.6}"
+            );
+            let got_bits: Vec<u32> = gv.into_iter().map(f32::to_bits).collect();
+            for r in 0..rows {
+                assert_eq!(
+                    &got_bits[r * h..(r + 1) * h],
+                    &single_fused_bits[r][..],
+                    "{label} rows={rows} row={r}: not bit-exact with single-row call"
+                );
+            }
+        }
+    }
+}

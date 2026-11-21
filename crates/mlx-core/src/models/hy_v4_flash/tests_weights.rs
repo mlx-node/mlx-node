@@ -114,7 +114,7 @@ fn q8_0_decodes_to_scale_times_code() {
 #[test]
 fn forms_follow_role_and_type() {
     use GgufTensorType::{BF16, F32, Q4K, Q8_0};
-    let cases: [(Role, &str, GgufTensorType, Option<Form>); 14] = [
+    let cases: [(Role, &str, GgufTensorType, Option<Form>); 15] = [
         (Role::Dense, TOKEN_EMBD, Q8_0, Some(Form::Codes)),
         (Role::Dense, "blk.1.attn_q_b.weight", Q8_0, Some(Form::Qmm)),
         (
@@ -136,6 +136,12 @@ fn forms_follow_role_and_type() {
             Some(Form::Qmm),
         ),
         (Role::Dense, "blk.1.attn_norm.weight", F32, Some(Form::F32)),
+        (
+            Role::Dense,
+            "blk.1.ffn_gate_inp.weight",
+            F32,
+            Some(Form::F32),
+        ),
         (Role::Dense, OUTPUT, BF16, Some(Form::Bf16)),
         (Role::Dense, "blk.1.attn_q_b.weight", BF16, None),
         (Role::Dense, "blk.1.attn_q_b.weight", Q4K, None),
@@ -321,6 +327,21 @@ fn codes_f32_and_bf16_forms_hold_the_file_values() {
 
     assert!(dense_from_raw(&emb, &raw[..raw.len() - 1], Form::Codes).is_err());
     assert!(dense_from_raw(&out, &braw, Form::Qmm).is_err());
+
+    let rvals = lcg(9, 128);
+    let rraw: Vec<u8> = rvals.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let rinfo = info("blk.1.ffn_gate_inp.weight", &[32, 4], GgufTensorType::F32);
+    let rf16 = dense_from_raw(&rinfo, &rraw, Form::F16)
+        .unwrap()
+        .array()
+        .unwrap();
+    assert_eq!(rf16.dtype().unwrap(), DType::Float16);
+    assert_eq!(rf16.nbytes(), 128 * 2);
+    let want_f16: Vec<f32> = rvals
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_f32())
+        .collect();
+    assert_eq!(bits(&read(&rf16)), bits(&want_f16));
 }
 
 fn fixture(name: &str) -> Value {
@@ -344,6 +365,7 @@ fn form_key(role: Role, i: &GgufTensorInfo) -> &'static str {
         (Form::Qmm, _) => "qmm_affine8",
         (Form::F32, GgufTensorType::F32) => "f32",
         (Form::F32, _) => "f32_dequant",
+        (Form::F16, _) => "f16",
         (Form::Bf16, _) => "bf16",
     }
 }

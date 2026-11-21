@@ -5,6 +5,7 @@
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/primitives.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -253,6 +254,9 @@ enum Hy4KernelId : int {
   kKernelMlaPrefillSlidingNax = 30,
   kKernelIndexerScorePrefillNax = 31,
   kKernelMoePrefillSortTiles = 32,
+  kKernelGgufDedupSlots = 33,
+  kKernelAffine4GateUp = 34,
+  kKernelAffine4DownCombine = 35,
 };
 
 struct CachedPrimKey {
@@ -326,19 +330,12 @@ std::vector<array> dispatch_cached_kernel(
       tmpl_key,
       compute_const_mask(inputs),
   };
-  static std::mutex mutex;
-  static std::unordered_map<CachedPrimKey,
-                            std::shared_ptr<mlx::core::Primitive>,
-                            CachedPrimKeyHash>
+  thread_local std::unordered_map<CachedPrimKey,
+                                  std::shared_ptr<mlx::core::Primitive>,
+                                  CachedPrimKeyHash>
       cache;
-  std::shared_ptr<mlx::core::Primitive> prim;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (auto it = cache.find(key); it != cache.end()) {
-      prim = it->second;
-    }
-  }
-  if (prim) {
+  if (auto it = cache.find(key); it != cache.end()) {
+    auto prim = it->second;
     if (out_shapes.size() == 1) {
       return {array(out_shapes[0], out_dtypes[0], std::move(prim), inputs)};
     }
@@ -346,7 +343,6 @@ std::vector<array> dispatch_cached_kernel(
   }
   auto res = make_outputs();
   if (!res.empty() && res[0].has_primitive()) {
-    std::lock_guard<std::mutex> lock(mutex);
     if (cache.size() < 4096) {
       cache.emplace(key, res[0].primitive_ptr());
     }
@@ -362,9 +358,7 @@ uint32_t float_bits(float v) {
 
 array cached_f32_scalar(float v) {
   const uint32_t key = float_bits(v);
-  static std::mutex mutex;
-  static std::unordered_map<uint32_t, array> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<uint32_t, array> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -396,9 +390,7 @@ struct Float3KeyHash {
 array cached_i32_pair(int a, int b) {
   const uint64_t key =
       (uint64_t(uint32_t(a)) << 32) | uint64_t(uint32_t(b));
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, array> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<uint64_t, array> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -411,9 +403,7 @@ array cached_i32_pair(int a, int b) {
 }
 
 array cached_u64_scalar(uint64_t v) {
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, array> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<uint64_t, array> cache;
   if (auto it = cache.find(v); it != cache.end()) {
     return it->second;
   }
@@ -441,9 +431,7 @@ struct U64PairKeyHash {
 
 array cached_u64_pair(uint64_t a, uint64_t b) {
   const U64PairKey key{a, b};
-  static std::mutex mutex;
-  static std::unordered_map<U64PairKey, array, U64PairKeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<U64PairKey, array, U64PairKeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -503,9 +491,7 @@ struct Float4KeyHash {
 array cached_f32_quad(float a, float b, float c, float d) {
   const Float4Key key{float_bits(a), float_bits(b), float_bits(c),
                       float_bits(d)};
-  static std::mutex mutex;
-  static std::unordered_map<Float4Key, array, Float4KeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<Float4Key, array, Float4KeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -542,9 +528,7 @@ struct Float5KeyHash {
 array cached_f32_five(float a, float b, float c, float d, float e) {
   const Float5Key key{float_bits(a), float_bits(b), float_bits(c),
                       float_bits(d), float_bits(e)};
-  static std::mutex mutex;
-  static std::unordered_map<Float5Key, array, Float5KeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<Float5Key, array, Float5KeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -567,9 +551,7 @@ const array &cached_zero_f32() {
 array cached_f32_pair(float a, float b) {
   const uint64_t key =
       (uint64_t(float_bits(a)) << 32) | uint64_t(float_bits(b));
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, array> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<uint64_t, array> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -583,9 +565,7 @@ array cached_f32_pair(float a, float b) {
 
 array cached_f32_triple(float a, float b, float c) {
   const Float3Key key{float_bits(a), float_bits(b), float_bits(c)};
-  static std::mutex mutex;
-  static std::unordered_map<Float3Key, array, Float3KeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<Float3Key, array, Float3KeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -610,9 +590,7 @@ array cached_row_ids(int rows, int top) {
   }
   const uint64_t key =
       (uint64_t(uint32_t(rows)) << 32) | uint64_t(uint32_t(top));
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, array> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<uint64_t, array> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -650,11 +628,17 @@ const array &cached_zero_i32() {
   return arr;
 }
 
+const array &cached_zero_u32() {
+  static const array arr = [] {
+    const uint32_t zeros[16] = {0};
+    return array(zeros, {16}, mlx::core::uint32);
+  }();
+  return arr;
+}
+
 array cached_u32_triple(uint32_t a, uint32_t b, uint32_t c) {
   const Float3Key key{a, b, c};
-  static std::mutex mutex;
-  static std::unordered_map<Float3Key, array, Float3KeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<Float3Key, array, Float3KeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -668,9 +652,7 @@ array cached_u32_triple(uint32_t a, uint32_t b, uint32_t c) {
 
 array cached_u32_quad(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
   const Float4Key key{a, b, c, d};
-  static std::mutex mutex;
-  static std::unordered_map<Float4Key, array, Float4KeyHash> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  thread_local std::unordered_map<Float4Key, array, Float4KeyHash> cache;
   if (auto it = cache.find(key); it != cache.end()) {
     return it->second;
   }
@@ -1205,11 +1187,74 @@ const mlx::core::fast::CustomKernelFunction &hy4_kq_sorted_combine_kernel() {
   return kernel;
 }
 
+const std::string &hy4_router_topk_header() {
+  static const std::string header = R"METAL(
+template <bool HAS_BIAS, typename LogitsPtr, typename BiasPtr>
+inline void hy4_topk_load_one(
+    LogitsPtr logits,
+    BiasPtr bias,
+    threadgroup float* tg_s,
+    size_t row_off,
+    int E,
+    int e,
+    thread float& vo,
+    thread uint& io) {
+  if (e < E) {
+    const float lx = logits[row_off + size_t(e)];
+    // Match MLX Sigmoid (unary_ops.h) so GPU routing matches host routing bit-for-bit.
+    const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(lx)));
+    const float s = (lx < 0.0f) ? y : (1.0f - y);
+    float sel = HAS_BIAS ? (s + bias[e]) : s;
+    if (metal::isnan(sel)) {
+      sel = -INFINITY;
+    }
+    tg_s[e] = s;
+    vo = sel;
+    io = uint(e);
+  }
+}
+
+inline bool hy4_topk_better(float va, uint ia, float vb, uint ib) {
+  return (ia != 0xFFFFFFFFu) &&
+         (ib == 0xFFFFFFFFu || va > vb || (va == vb && ia < ib));
+}
+
+inline void hy4_topk_cswap(
+    thread float& va,
+    thread uint& ia,
+    thread float& vb,
+    thread uint& ib) {
+  if (hy4_topk_better(vb, ib, va, ia)) {
+    const float tv = va; va = vb; vb = tv;
+    const uint ti = ia; ia = ib; ib = ti;
+  }
+}
+
+inline void hy4_topk_bitonic_merge32(
+    thread float& val,
+    thread uint& id,
+    uint lane) {
+#pragma unroll
+  for (uint s = 16u; s >= 1u; s >>= 1u) {
+    const float ov = simd_shuffle_xor(val, ushort(s));
+    const uint oi = simd_shuffle_xor(id, ushort(s));
+    const bool upper = (lane & s) != 0u;
+    const bool o_better = hy4_topk_better(ov, oi, val, id);
+    if (upper ? !o_better : o_better) {
+      val = ov;
+      id = oi;
+    }
+  }
+}
+)METAL";
+  return header;
+}
+
 const mlx::core::fast::CustomKernelFunction &hy4_router_topk_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "hy4_router_topk", {"logits", "bias", "params"}, {"ids", "weights"},
 #include "metal/hy4/router_topk.metal.inc"
-  );
+      , hy4_router_topk_header());
   return kernel;
 }
 
@@ -1220,17 +1265,77 @@ const std::string &hy4_gguf_decode_header() {
   return header;
 }
 
+const mlx::core::fast::CustomKernelFunction &hy4_gguf_dedup_slots_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_gguf_dedup_slots", {"slots"}, {"dedup"},
+      R"METAL(
+      threadgroup uint tg_slots[128];
+      threadgroup uint tg_sg_counts[4];
+      const uint tid = thread_index_in_threadgroup;
+      const uint lane = thread_index_in_simdgroup;
+      const uint sg = simdgroup_index_in_threadgroup;
+      const uint n_assign = uint(slots_shape[0]);
+      if (tid < n_assign) {
+        tg_slots[tid] = slots[tid];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      uint my_slot = 0u;
+      uint rank = 0u;
+      if (tid < n_assign) {
+        my_slot = tg_slots[tid];
+        for (uint b = 0u; b < tid; ++b) {
+          rank += uint(tg_slots[b] == my_slot);
+        }
+      }
+
+      // Start a new chunk every 4 occurrences so every compacted entry has 1..=4 matches.
+      const uint is_chunk = (tid < n_assign && (rank & 3u) == 0u) ? 1u : 0u;
+      const uint sg_off = simd_prefix_exclusive_sum(is_chunk);
+      const uint sg_tot = simd_sum(is_chunk);
+      if (lane == 0u) {
+        tg_sg_counts[sg] = sg_tot;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      uint base = 0u;
+      for (uint s = 0u; s < sg; ++s) {
+        base += tg_sg_counts[s];
+      }
+      device uint4* out4 = reinterpret_cast<device uint4*>(dedup);
+      if (tid == 0u) {
+        const uint total_uniq =
+            tg_sg_counts[0] + tg_sg_counts[1] + tg_sg_counts[2] + tg_sg_counts[3];
+        out4[0] = uint4(total_uniq, 0u, 0u, 0u);
+      }
+      if (is_chunk != 0u) {
+        uint cnt = 0u;
+        uint packed_a = 0u;
+        uint packed_r = 0u;
+        for (uint b = tid; b < n_assign && cnt < 4u; ++b) {
+          if (tg_slots[b] == my_slot) {
+            packed_a |= (b & 0xFFu) << (cnt * 8u);
+            packed_r |= ((b / uint(TOP)) & 0xFFu) << (cnt * 8u);
+            ++cnt;
+          }
+        }
+        out4[1u + base + sg_off] = uint4(my_slot, cnt, packed_a, packed_r);
+      }
+      )METAL");
+  return kernel;
+}
+
 const mlx::core::fast::CustomKernelFunction &hy4_gguf_gate_up_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "hy4_gguf_gate_up_swiglu",
-      {"x", "row_ids", "slots", "gate_buf", "up_buf", "offsets", "dims",
-       "limit"},
+      {"x", "row_ids", "slots", "dedup", "gate_buf", "up_buf", "offsets",
+       "dims", "limit"},
       {"out"},
       R"METAL(
       const uint assign = threadgroup_position_in_grid.z;
       if (assign >= uint(slots_shape[0])) return;
       hy4_gguf_gate_up_swiglu_impl<FAST, DEDUP, MAX_MATCH, NSG, RPS>(
-          x, row_ids, slots, gate_buf, offsets[0], up_buf, offsets[1],
+          x, row_ids, slots, dedup, gate_buf, offsets[0], up_buf, offsets[1],
           limit[0], out, x_shape[0], slots_shape[0], x_shape[1],
           size_t(x_strides[0]), dims[1], dims[0], assign,
           threadgroup_position_in_grid.y, simdgroup_index_in_threadgroup,
@@ -1243,24 +1348,105 @@ const mlx::core::fast::CustomKernelFunction &hy4_gguf_gate_up_kernel() {
 const mlx::core::fast::CustomKernelFunction &hy4_gguf_down_combine_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "hy4_gguf_down_combine",
-      {"hidden", "slots", "weights", "down_buf", "down_off", "dims"}, {"out"},
+      {"hidden", "slots", "weights", "dedup", "down_buf", "down_off", "dims"},
+      {"out"},
       R"METAL(
-      constexpr int PROD_CAP = DEDUP_ROWS ? 64 : 32;
-      constexpr int DEDUP_CAP = DEDUP_ROWS ? 64 : 1;
+      constexpr int PROD_CAP = DEDUP_ROWS ? 128 : 32;
       threadgroup float products[PROD_CAP * 4];
-      threadgroup uint tg_raw_slots[DEDUP_CAP];
-      threadgroup uint tg_uniq_slots[DEDUP_CAP];
-      threadgroup uint8_t tg_uniq_first[DEDUP_CAP];
-      threadgroup uint tg_n_uniq;
       hy4_gguf_down_combine_impl<BITS, TOP, FAST, DEDUP_ROWS, MAX_MATCH>(
-          hidden, slots, weights, down_buf, down_off[0], out, products,
-          tg_raw_slots, tg_uniq_slots, tg_uniq_first, &tg_n_uniq,
+          hidden, slots, weights, dedup, down_buf, down_off[0], out, products,
           slots_shape[0], hidden_shape[1], dims[1], dims[0],
           threadgroup_position_in_grid.z, threadgroup_position_in_grid.y,
           simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
       )METAL",
       hy4_gguf_decode_header());
   return kernel;
+}
+
+const std::string &hy4_affine4_decode_header() {
+  static const std::string header =
+#include "metal/hy4/affine4_expert_decode.metal.inc"
+      ;
+  return header;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_affine4_gate_up_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_affine4_gate_up_swiglu",
+      {"x", "row_ids", "slots", "dedup", "wg", "sg", "bg", "wu", "su", "bu",
+       "limit"},
+      {"out"},
+      R"METAL(
+      const uint assign = threadgroup_position_in_grid.z;
+      if (assign >= uint(slots_shape[0])) return;
+      hy4_affine4_gate_up_swiglu_impl<FAST_K, FAST_M, DEDUP, MAX_MATCH, NSG, RPS>(
+          x, row_ids, slots, dedup, wg, sg, bg, wu, su, bu, limit[0], out,
+          x_shape[0], slots_shape[0], x_shape[1], size_t(x_strides[0]),
+          wg_shape[1], wg_shape[0], assign, threadgroup_position_in_grid.y,
+          simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+      )METAL",
+      hy4_affine4_decode_header(), /*ensure_row_contiguous=*/false);
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_affine4_down_combine_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_affine4_down_combine",
+      {"hidden", "slots", "weights", "dedup", "wd", "sd", "bd"},
+      {"out"},
+      R"METAL(
+      constexpr int PROD_CAP = DEDUP_ROWS ? 128 : 32;
+      threadgroup float products[PROD_CAP * 4];
+      hy4_affine4_down_combine_impl<TOP, FAST_M, FAST_H, DEDUP_ROWS, MAX_MATCH>(
+          hidden, slots, weights, dedup, wd, sd, bd, out, products,
+          slots_shape[0], hidden_shape[1], wd_shape[1], wd_shape[0],
+          threadgroup_position_in_grid.z, threadgroup_position_in_grid.y,
+          simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+      )METAL",
+      hy4_affine4_decode_header());
+  return kernel;
+}
+
+bool validate_affine4_experts(const array &wg, const array &sg, const array &bg,
+                              const array &wu, const array &su, const array &bu,
+                              const array &wd, const array &sd, const array &bd,
+                              int k, int &out_e, int &out_m, int &out_h) {
+  if (k < 64 || k % 64 != 0) {
+    return false;
+  }
+  if (wg.ndim() != 3 || sg.ndim() != 3 || bg.ndim() != 3 || wu.ndim() != 3 ||
+      su.ndim() != 3 || bu.ndim() != 3 || wd.ndim() != 3 || sd.ndim() != 3 ||
+      bd.ndim() != 3) {
+    return false;
+  }
+  if (wg.dtype() != mlx::core::uint32 || wu.dtype() != mlx::core::uint32 ||
+      wd.dtype() != mlx::core::uint32) {
+    return false;
+  }
+  if (sg.dtype() != mlx::core::bfloat16 || bg.dtype() != mlx::core::bfloat16 ||
+      su.dtype() != mlx::core::bfloat16 || bu.dtype() != mlx::core::bfloat16 ||
+      sd.dtype() != mlx::core::bfloat16 || bd.dtype() != mlx::core::bfloat16) {
+    return false;
+  }
+  const int e = wg.shape(0);
+  const int m = wg.shape(1);
+  const int h = wd.shape(1);
+  if (e < 1 || m < 64 || m % 64 != 0 || h < 1) {
+    return false;
+  }
+  const Shape gu_w{e, m, k / 8};
+  const Shape gu_s{e, m, k / 64};
+  const Shape d_w{e, h, m / 8};
+  const Shape d_s{e, h, m / 64};
+  if (wg.shape() != gu_w || wu.shape() != gu_w || sg.shape() != gu_s ||
+      bg.shape() != gu_s || su.shape() != gu_s || bu.shape() != gu_s ||
+      wd.shape() != d_w || sd.shape() != d_s || bd.shape() != d_s) {
+    return false;
+  }
+  out_e = e;
+  out_m = m;
+  out_h = h;
+  return true;
 }
 
 const std::string &hy4_gguf_nax_header() {
@@ -1712,8 +1898,7 @@ array hy4_mla_splitk_merge(const array &o_part, const array &max_part,
 }
 
 int hy4_mla_pipeline_threads(const array &output) {
-  static std::mutex mutex;
-  static std::unordered_map<std::string, int> cache;
+  thread_local std::unordered_map<std::string, int> cache;
   if (!output.has_primitive()) {
     return 0;
   }
@@ -1723,7 +1908,6 @@ int hy4_mla_pipeline_threads(const array &output) {
     return 0;
   }
   const std::string &key = custom->library_name();
-  std::lock_guard<std::mutex> lock(mutex);
   if (auto found = cache.find(key); found != cache.end()) {
     return found->second;
   }
@@ -1756,13 +1940,16 @@ struct MlaConfig {
   int bn;
 };
 
+std::unordered_map<uint64_t, MlaConfig> &mla_config_cache() {
+  thread_local std::unordered_map<uint64_t, MlaConfig> cache;
+  return cache;
+}
+
 bool lookup_mla_config(int h, bool split, bool splitk, MlaConfig &out_cfg) {
   const uint64_t key = uint64_t(uint32_t(h)) |
                        (uint64_t(split ? 1u : 0u) << 32) |
                        (uint64_t(splitk ? 1u : 0u) << 33);
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, MlaConfig> cache;
-  std::lock_guard<std::mutex> lock(mutex);
+  auto &cache = mla_config_cache();
   if (auto it = cache.find(key); it != cache.end()) {
     out_cfg = it->second;
     return true;
@@ -1774,10 +1961,7 @@ void store_mla_config(int h, bool split, bool splitk, MlaConfig cfg) {
   const uint64_t key = uint64_t(uint32_t(h)) |
                        (uint64_t(split ? 1u : 0u) << 32) |
                        (uint64_t(splitk ? 1u : 0u) << 33);
-  static std::mutex mutex;
-  static std::unordered_map<uint64_t, MlaConfig> cache;
-  std::lock_guard<std::mutex> lock(mutex);
-  cache.emplace(key, cfg);
+  mla_config_cache().emplace(key, cfg);
 }
 } // namespace
 #endif
@@ -2387,7 +2571,7 @@ mlx_array *mlx_hy4_q8_dense_decode(mlx_array *x, mlx_array *w,
     array sc = ensure_contiguous_aligned(sa, 1);
 
     const int m_tile = hy4_q8_decode_m_tile(m);
-    const bool use_tg_x = (m_tile == 4 && k >= 8192);
+    const bool use_tg_x = (m_tile >= 2 && k >= 1024);
     const bool fast_k = (k % 512 == 0);
     const int grid_y = 4 * ((n + 7) / 8);
     const int grid_z = (m + m_tile - 1) / m_tile;
@@ -2978,13 +3162,9 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
           std::min(max_splits_v2, (kmax + k_split_v2 - 1) / k_split_v2);
       array split_cfg_v2 = cached_i32_pair(n_splits_v2, k_split_v2);
 
-      static std::mutex v2_probe_mutex;
-      static int v2_ok[2] = {-1, -1};
-      int cached_v2 = -1;
-      {
-        std::lock_guard<std::mutex> lock(v2_probe_mutex);
-        cached_v2 = v2_ok[split ? 1 : 0];
-      }
+      static std::atomic<int> v2_ok[2]{{-1}, {-1}};
+      const int cached_v2 =
+          v2_ok[split ? 1 : 0].load(std::memory_order_acquire);
 
       auto run_v2_chunked =
           [&](std::optional<std::vector<array>> first_parts) -> array {
@@ -3040,10 +3220,7 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
                                              scale_arr, split_cfg_v2, split,
                                              n_splits_v2, stream);
         const bool ok = (hy4_mla_pipeline_threads(parts[0]) >= 256);
-        {
-          std::lock_guard<std::mutex> lock(v2_probe_mutex);
-          v2_ok[split ? 1 : 0] = ok ? 1 : 0;
-        }
+        v2_ok[split ? 1 : 0].store(ok ? 1 : 0, std::memory_order_release);
         if (ok) {
           auto result = run_v2_chunked(std::move(parts));
           return reinterpret_cast<mlx_array *>(new array(std::move(result)));
@@ -3562,8 +3739,10 @@ mlx_array *mlx_hy4_router_mv(mlx_array *x, mlx_array *w) {
     }
     const auto &xa = *reinterpret_cast<array *>(x);
     const auto &wa = *reinterpret_cast<array *>(w);
+    const bool w_f16 = (wa.dtype() == mlx::core::float16);
     if (xa.ndim() != 2 || wa.ndim() != 2 ||
-        xa.dtype() != mlx::core::float32 || wa.dtype() != mlx::core::float32) {
+        xa.dtype() != mlx::core::float32 ||
+        (!w_f16 && wa.dtype() != mlx::core::float32)) {
       return nullptr;
     }
     const int m = xa.shape(0);
@@ -3577,13 +3756,17 @@ mlx_array *mlx_hy4_router_mv(mlx_array *x, mlx_array *w) {
     array wc = ensure_contiguous_aligned(wa, 4);
     const int m_tile = hy4_q8_decode_m_tile(m);
     const bool fast_k = (k % 128 == 0);
-    const int n_etiles = (e + 3) / 4;
+    const bool use_tg_x = (m_tile >= 2);
+    constexpr int experts_per_tg = 8;
+    const int n_etiles = (e + experts_per_tg - 1) / experts_per_tg;
     const int n_mtiles = (m + m_tile - 1) / m_tile;
     const auto stream = default_stream(Device::gpu);
     const std::tuple<int, int, int> grid{32, 4, n_etiles * n_mtiles};
     const std::tuple<int, int, int> tg{32, 4, 1};
-    const uint64_t tmpl_key =
-        uint64_t(m_tile) | (uint64_t(fast_k ? 1 : 0) << 8);
+    const uint64_t tmpl_key = uint64_t(m_tile) |
+                              (uint64_t(fast_k ? 1 : 0) << 8) |
+                              (uint64_t(use_tg_x ? 1 : 0) << 9) |
+                              (uint64_t(w_f16 ? 1 : 0) << 10);
     const std::vector<array> inputs{xc, wc};
     const std::vector<Shape> out_shapes{{m, e}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
@@ -3592,8 +3775,11 @@ mlx_array *mlx_hy4_router_mv(mlx_array *x, mlx_array *w) {
         out_dtypes, [&] {
           return hy4_router_mv_kernel()(
               inputs, out_shapes, out_dtypes, grid, tg,
-              {{"M_TILE", m_tile}, {"FAST_K", fast_k}}, std::nullopt, false,
-              stream);
+              {{"M_TILE", m_tile},
+               {"FAST_K", fast_k},
+               {"USE_TG_X", use_tg_x},
+               {"W_F16", w_f16}},
+              std::nullopt, false, stream);
         });
     return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
   } catch (const std::exception &e) {
@@ -3858,8 +4044,25 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
     array dbc = ensure_contiguous_aligned(dba, static_cast<size_t>(d_align));
 
     array slots_flat = reshape(slc, {n_assign});
-    const bool dedup = (rows == 2) && (n_assign <= 256);
-    const int max_match = dedup ? 2 : 1;
+    const auto stream = default_stream(Device::gpu);
+    const bool dedup = (rows >= 2) && (n_assign <= 128);
+    array dedup_table = cached_zero_u32();
+    if (dedup) {
+      const std::tuple<int, int, int> dd_grid{128, 1, 1};
+      const std::tuple<int, int, int> dd_tg{128, 1, 1};
+      const std::vector<array> dd_inputs{slots_flat};
+      const std::vector<Shape> dd_shapes{{n_assign + 1, 4}};
+      const std::vector<Dtype> dd_dtypes{mlx::core::uint32};
+      dedup_table = dispatch_cached_kernel(
+          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, uint64_t(top),
+          dd_inputs, dd_shapes, dd_dtypes, [&] {
+            return hy4_gguf_dedup_slots_kernel()(
+                dd_inputs, dd_shapes, dd_dtypes, dd_grid, dd_tg,
+                {{"TOP", top}}, std::nullopt, false, stream);
+          })[0];
+    }
+
+    const int max_match = dedup ? 4 : 1;
     const int gu_rps = dedup ? 2 : 4;
     const int gu_nsg = 4;
     const int gu_rows_per_tg = gu_nsg * gu_rps;
@@ -3869,12 +4072,12 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
                              (uint64_t(max_match) << 4) |
                              (uint64_t(gu_rps) << 8) |
                              (uint64_t(gu_nsg) << 12);
-    const auto stream = default_stream(Device::gpu);
     const std::tuple<int, int, int> gu_grid{
         32, ((m + gu_rows_per_tg - 1) / gu_rows_per_tg) * gu_nsg, n_assign};
     const std::tuple<int, int, int> gu_tg{32, gu_nsg, 1};
-    const std::vector<array> gu_inputs{xc,  row_ids, slots_flat, gbc,
-                                       ubc, gu_offs, gu_dims,    limit_arr};
+    const std::vector<array> gu_inputs{xc,          row_ids, slots_flat,
+                                       dedup_table, gbc,     ubc,
+                                       gu_offs,     gu_dims, limit_arr};
     const std::vector<Shape> gu_out_shapes{{n_assign, m}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
     auto hidden = dispatch_cached_kernel(
@@ -3893,8 +4096,8 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
     array d_off_arr = cached_u64_scalar(down_off);
     array d_dims = cached_i32_pair(n_experts, h);
     const bool fast_d = (h % 4 == 0);
-    const bool dc_dedup = (rows == 2 && n_assign <= 64);
-    const int dc_max_match = dc_dedup ? 2 : 1;
+    const bool dc_dedup = dedup;
+    const int dc_max_match = dc_dedup ? 4 : 1;
     constexpr int rps = 4;
     constexpr int ksg = 8;
     const std::tuple<int, int, int> dc_grid{
@@ -3904,7 +4107,7 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
                              (uint64_t(fast_d ? 1 : 0) << 16) |
                              (uint64_t(dc_dedup ? 1 : 0) << 17) |
                              (uint64_t(dc_max_match) << 20);
-    const std::vector<array> dc_inputs{hidden, slc,       wc,
+    const std::vector<array> dc_inputs{hidden, slc,       wc,    dedup_table,
                                        dbc,    d_off_arr, d_dims};
     const std::vector<Shape> dc_out_shapes{{rows, h}};
     auto out = dispatch_cached_kernel(
@@ -4430,6 +4633,177 @@ bool mlx_hy4_moe_prefill_sort_tiles(mlx_array *ids, int n_experts,
   (void)ids;
   (void)n_experts;
   return false;
+#endif
+}
+
+mlx_array *mlx_hy4_affine4_routed_decode(mlx_array *x, mlx_array *slots,
+                                         mlx_array *weights, mlx_array *wg,
+                                         mlx_array *sg, mlx_array *bg,
+                                         mlx_array *wu, mlx_array *su,
+                                         mlx_array *bu, mlx_array *wd,
+                                         mlx_array *sd, mlx_array *bd,
+                                         float limit) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return nullptr;
+    }
+    if (!x || !slots || !weights || !wg || !sg || !bg || !wu || !su || !bu ||
+        !wd || !sd || !bd || !std::isfinite(limit)) {
+      return nullptr;
+    }
+    const auto &xa = *reinterpret_cast<array *>(x);
+    const auto &sla = *reinterpret_cast<array *>(slots);
+    const auto &wa = *reinterpret_cast<array *>(weights);
+    const auto &wga = *reinterpret_cast<array *>(wg);
+    const auto &sga = *reinterpret_cast<array *>(sg);
+    const auto &bga = *reinterpret_cast<array *>(bg);
+    const auto &wua = *reinterpret_cast<array *>(wu);
+    const auto &sua = *reinterpret_cast<array *>(su);
+    const auto &bua = *reinterpret_cast<array *>(bu);
+    const auto &wda = *reinterpret_cast<array *>(wd);
+    const auto &sda = *reinterpret_cast<array *>(sd);
+    const auto &bda = *reinterpret_cast<array *>(bd);
+
+    if (xa.ndim() != 2 || sla.ndim() != 2 || wa.ndim() != 2 ||
+        xa.dtype() != mlx::core::float32 || sla.dtype() != mlx::core::uint32 ||
+        wa.dtype() != mlx::core::float32) {
+      return nullptr;
+    }
+    const int rows = xa.shape(0);
+    const int k = xa.shape(1);
+    const int top = sla.shape(1);
+    if (rows < 1 || rows > 8 || top < 1 || top > 32 || sla.shape(0) != rows ||
+        wa.shape() != Shape{rows, top}) {
+      return nullptr;
+    }
+    int e = 0, m = 0, h = 0;
+    if (!validate_affine4_experts(wga, sga, bga, wua, sua, bua, wda, sda, bda,
+                                  k, e, m, h)) {
+      return nullptr;
+    }
+    (void)e;
+
+    const int n_assign = rows * top;
+    const bool fast_k = (k % 512 == 0);
+    const bool fast_m_down = (m % 512 == 0);
+    array row_ids = cached_row_ids(rows, top);
+    array limit_arr = cached_f32_scalar(limit);
+
+    array xc = ensure_strided_aligned(xa, 4);
+    array slc = ensure_contiguous_aligned(sla, 1);
+    array wc = ensure_contiguous_aligned(wa, 1);
+    array wgc = ensure_contiguous_aligned(wga, fast_k ? 2 : 1);
+    array sgc = ensure_contiguous_aligned(sga, 1);
+    array bgc = ensure_contiguous_aligned(bga, 1);
+    array wuc = ensure_contiguous_aligned(wua, fast_k ? 2 : 1);
+    array suc = ensure_contiguous_aligned(sua, 1);
+    array buc = ensure_contiguous_aligned(bua, 1);
+    array wdc = ensure_contiguous_aligned(wda, fast_m_down ? 2 : 1);
+    array sdc = ensure_contiguous_aligned(sda, 1);
+    array bdc = ensure_contiguous_aligned(bda, 1);
+
+    array slots_flat = reshape(slc, {n_assign});
+    const auto stream = default_stream(Device::gpu);
+    const bool dedup = (rows >= 2) && (n_assign <= 128);
+    array dedup_table = cached_zero_u32();
+    if (dedup) {
+      const std::tuple<int, int, int> dd_grid{128, 1, 1};
+      const std::tuple<int, int, int> dd_tg{128, 1, 1};
+      const std::vector<array> dd_inputs{slots_flat};
+      const std::vector<Shape> dd_shapes{{n_assign + 1, 4}};
+      const std::vector<Dtype> dd_dtypes{mlx::core::uint32};
+      dedup_table = dispatch_cached_kernel(
+          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, uint64_t(top),
+          dd_inputs, dd_shapes, dd_dtypes, [&] {
+            return hy4_gguf_dedup_slots_kernel()(
+                dd_inputs, dd_shapes, dd_dtypes, dd_grid, dd_tg,
+                {{"TOP", top}}, std::nullopt, false, stream);
+          })[0];
+    }
+
+    const int max_match = dedup ? 4 : 1;
+    const int gu_rps = dedup ? 2 : 4;
+    const int gu_nsg = 4;
+    const int gu_rows_per_tg = gu_nsg * gu_rps;
+    const bool fast_m = (m % gu_rows_per_tg == 0);
+    const uint64_t gu_tmpl = uint64_t(fast_k ? 1 : 0) |
+                             (uint64_t(fast_m ? 1 : 0) << 1) |
+                             (uint64_t(dedup ? 1 : 0) << 2) |
+                             (uint64_t(max_match) << 4) |
+                             (uint64_t(gu_rps) << 8) |
+                             (uint64_t(gu_nsg) << 12);
+    const std::tuple<int, int, int> gu_grid{
+        32, ((m + gu_rows_per_tg - 1) / gu_rows_per_tg) * gu_nsg, n_assign};
+    const std::tuple<int, int, int> gu_tg{32, gu_nsg, 1};
+    const std::vector<array> gu_inputs{xc,  row_ids, slots_flat, dedup_table,
+                                       wgc, sgc,     bgc,        wuc,
+                                       suc, buc,     limit_arr};
+    const std::vector<Shape> gu_out_shapes{{n_assign, m}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto hidden = dispatch_cached_kernel(
+        kKernelAffine4GateUp, stream, gu_grid, gu_tg, gu_tmpl, gu_inputs,
+        gu_out_shapes, out_dtypes, [&] {
+          return hy4_affine4_gate_up_kernel()(
+              gu_inputs, gu_out_shapes, out_dtypes, gu_grid, gu_tg,
+              {{"FAST_K", fast_k},
+               {"FAST_M", fast_m},
+               {"DEDUP", dedup},
+               {"MAX_MATCH", max_match},
+               {"NSG", gu_nsg},
+               {"RPS", gu_rps}},
+              std::nullopt, false, stream);
+        })[0];
+
+    const bool fast_h = (h % 4 == 0);
+    const bool dc_dedup = dedup;
+    const int dc_max_match = dc_dedup ? 4 : 1;
+    constexpr int rps = 4;
+    constexpr int ksg = 8;
+    const std::tuple<int, int, int> dc_grid{
+        32, ((h + rps - 1) / rps) * ksg, dc_dedup ? 1 : rows};
+    const std::tuple<int, int, int> dc_tg{32, ksg, 1};
+    const uint64_t dc_tmpl = uint64_t(top) |
+                             (uint64_t(fast_m_down ? 1 : 0) << 8) |
+                             (uint64_t(fast_h ? 1 : 0) << 9) |
+                             (uint64_t(dc_dedup ? 1 : 0) << 10) |
+                             (uint64_t(dc_max_match) << 12);
+    const std::vector<array> dc_inputs{hidden, slc, wc, dedup_table,
+                                       wdc,    sdc, bdc};
+    const std::vector<Shape> dc_out_shapes{{rows, h}};
+    auto out = dispatch_cached_kernel(
+        kKernelAffine4DownCombine, stream, dc_grid, dc_tg, dc_tmpl, dc_inputs,
+        dc_out_shapes, out_dtypes, [&] {
+          return hy4_affine4_down_combine_kernel()(
+              dc_inputs, dc_out_shapes, out_dtypes, dc_grid, dc_tg,
+              {{"TOP", top},
+               {"FAST_M", fast_m_down},
+               {"FAST_H", fast_h},
+               {"DEDUP_ROWS", dc_dedup},
+               {"MAX_MATCH", dc_max_match}},
+              std::nullopt, false, stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 affine4_routed_decode: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)x;
+  (void)slots;
+  (void)weights;
+  (void)wg;
+  (void)sg;
+  (void)bg;
+  (void)wu;
+  (void)su;
+  (void)bu;
+  (void)wd;
+  (void)sd;
+  (void)bd;
+  (void)limit;
+  return nullptr;
 #endif
 }
 

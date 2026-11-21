@@ -37,10 +37,9 @@ use super::prefill::{Runner, Seq, index_keeps, session_keeps};
 use super::prefix_state::PrefixState;
 use super::scan::Scan;
 use super::sparse::gather_sink_attention;
-use super::weights::Dense;
-use super::weights::{LayerWeights, NextnWeights, Residual};
+use super::weights::{Dense, LayerWeights, NextnWeights, OUTPUT, Residual, quantize_sym_q8_array};
 use crate::array::{DType, MxArray};
-use crate::cache_limit::CacheLimitGuard;
+use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::deepseek_v41::ops::inv_freqs;
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
@@ -52,6 +51,96 @@ const BLOCK_ROWS: usize = 32;
 pub const SEEDS: usize = 8;
 /// MTP rows a draft may hold past the trunk.
 pub const DRAFT_SLACK: usize = 4;
+/// Draft-only LM head format override (`symq8` default, `bf16` fallback).
+pub const MTP_HEAD_ENV: &str = "MLX_HY4_MTP_HEAD";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpHeadMode {
+    SymQ8,
+    Bf16,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MTP_HEAD: std::cell::Cell<Option<MtpHeadMode>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn parse_mtp_head_mode(raw: Option<&str>) -> Result<MtpHeadMode> {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(MtpHeadMode::SymQ8);
+    };
+    if v.eq_ignore_ascii_case("symq8") {
+        Ok(MtpHeadMode::SymQ8)
+    } else if v.eq_ignore_ascii_case("bf16") {
+        Ok(MtpHeadMode::Bf16)
+    } else {
+        Err(bad(format!(
+            "{MTP_HEAD_ENV}={v:?}: expected 'symq8' or 'bf16'"
+        )))
+    }
+}
+
+pub fn mtp_head_mode() -> Result<MtpHeadMode> {
+    #[cfg(test)]
+    if let Some(m) = TEST_MTP_HEAD.with(std::cell::Cell::get) {
+        return Ok(m);
+    }
+    parse_mtp_head_mode(std::env::var(MTP_HEAD_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+pub(crate) fn with_mtp_head<T>(mode: MtpHeadMode, f: impl FnOnce() -> T) -> T {
+    let prev = TEST_MTP_HEAD.with(|c| c.replace(Some(mode)));
+    struct Reset(Option<MtpHeadMode>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MTP_HEAD.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Extra resident bytes of the draft-only SymQ8 LM head (`output.weight`) when
+/// enabled via `MLX_HY4_MTP_HEAD`, or 0 when disabled or not applicable.
+pub fn draft_head_bytes(scan: &Scan) -> Result<u64> {
+    if mtp_head_mode()? != MtpHeadMode::SymQ8 {
+        return Ok(0);
+    }
+    let Some(entry) = scan.tensors.get(OUTPUT) else {
+        return Ok(0);
+    };
+    let shape = super::weights::held_shape(&entry.loc.info)?;
+    let &[_, k] = shape.as_slice() else {
+        return Ok(0);
+    };
+    if k <= 0 || k % 32 != 0 {
+        return Ok(0);
+    }
+    let n = entry.loc.info.num_elements()?;
+    n.checked_add(n / 16)
+        .ok_or_else(|| bad("draft LM head bytes overflow u64"))
+}
+
+fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
+    if mtp_head_mode()? != MtpHeadMode::SymQ8 {
+        return Ok(None);
+    }
+    let Dense::Array(a) = output else {
+        return Ok(None);
+    };
+    if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 32 != 0 {
+        return Ok(None);
+    }
+    let t0 = std::time::Instant::now();
+    let q = quantize_sym_q8_array(a)?;
+    tracing::info!(
+        "hy_v4_flash MTP draft head: SymQ8 {} bytes ({:.0} ms)",
+        q.nbytes(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(Some(q))
+}
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 MTP: {msg}"))
@@ -432,8 +521,12 @@ pub struct MtpLayer {
     inv_freqs: MxArray,
     /// `token_embd` as a packed embedding: the draft inputs.
     embedding: Embedding,
+    /// Optional draft-only SymQ8 copy of `output.weight`; trunk verification
+    /// always uses the lossless BF16 trunk head.
+    draft_head: Option<Dense>,
     bytes: u64,
     _guard: CacheLimitGuard,
+    _draft_head_guard: Option<CacheLimitGuard>,
 }
 
 /// The draft-input embedding over `token_embd`'s codes: rows equal to
@@ -470,13 +563,22 @@ impl MtpLayer {
     pub fn load(scan: &Scan, shards: &ShardSet, model: &Model) -> Result<Self> {
         let w = mtp_weights::load(scan, shards)?;
         let tok = model.weights().token_embd();
-        Self::new(model.cfg(), w, tok)
+        Self::new_with_head(model.cfg(), w, tok, Some(model.weights().output()))
     }
 
     pub fn new(
         cfg: &super::config::HyV4FlashConfig,
         mw: MtpWeights,
         token_embd: &Dense,
+    ) -> Result<Self> {
+        Self::new_with_head(cfg, mw, token_embd, None)
+    }
+
+    pub fn new_with_head(
+        cfg: &super::config::HyV4FlashConfig,
+        mw: MtpWeights,
+        token_embd: &Dense,
+        output_head: Option<&Dense>,
     ) -> Result<Self> {
         let MtpWeights {
             layer,
@@ -511,6 +613,16 @@ impl MtpLayer {
             Some(ExpertSource::Resident(experts)),
         )?;
         let embedding = draft_embedding(token_embd, cfg.vocab_size, cfg.dim)?;
+        let draft_head = match output_head {
+            Some(head) => build_draft_head(head)?,
+            None => None,
+        };
+        let draft_head_bytes = draft_head.as_ref().map_or(0, |h| h.nbytes() as u64);
+        let draft_head_guard =
+            (draft_head_bytes > 0).then(|| coordinator().register(draft_head_bytes));
+        let total_bytes = bytes
+            .checked_add(draft_head_bytes)
+            .ok_or_else(|| bad("MTP layer bytes overflow u64"))?;
         Ok(Self {
             layer,
             dim: cfg.dim as i64,
@@ -521,9 +633,15 @@ impl MtpLayer {
             ffn,
             inv_freqs,
             embedding,
-            bytes,
+            draft_head,
+            bytes: total_bytes,
             _guard: guard,
+            _draft_head_guard: draft_head_guard,
         })
+    }
+
+    pub fn draft_head(&self) -> Option<&Dense> {
+        self.draft_head.as_ref()
     }
 
     pub fn layer(&self) -> usize {
@@ -632,7 +750,7 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
-        self.draft_with_flush(model, d, h, emb, true)
+        self.draft_with_flush(model, d, h, emb, true, true)
     }
 
     /// Like [`Self::draft`], leaving deferred KV/indexer updates unevaluated so
@@ -644,7 +762,20 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
-        self.draft_with_flush(model, d, h, emb, false)
+        self.draft_with_flush(model, d, h, emb, false, true)
+    }
+
+    /// Like [`Self::draft_lazy`], skipping `d.index.update` when `persist_state`
+    /// is false (last draft step before `settle()`).
+    pub fn draft_lazy_with_persist(
+        &self,
+        model: &Model,
+        d: &mut Draft,
+        h: &MxArray,
+        emb: &MxArray,
+        persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
+        self.draft_with_flush(model, d, h, emb, false, persist_state)
     }
 
     fn draft_with_flush(
@@ -654,6 +785,7 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
         flush: bool,
+        persist_state: bool,
     ) -> Result<(MxArray, MxArray)> {
         let _scope = flush.then(super::stats::DeferScope::enter);
         let at = d.len();
@@ -663,24 +795,32 @@ impl MtpLayer {
         let x = self.eh(&emb.reshape(&[1, self.dim])?, &h.reshape(&[1, self.dim])?)?;
         let w = &self.w.attn;
         let p = self.mla.project(w, &x, at + 1)?;
-        let mark = d.index.mark();
+        let mark = persist_state.then(|| d.index.mark());
         let call = Call {
             x: &p.x,
             qr: &p.qr,
             start: at,
             kind: RowKind::Decode,
         };
-        let idx = self
-            .indexer
-            .select(self.indexer_weights()?, call, &mut d.index)?;
+        let idx = if persist_state {
+            self.indexer
+                .select(self.indexer_weights()?, call, &mut d.index)?
+        } else {
+            self.indexer
+                .select_readonly(self.indexer_weights()?, call, &mut d.index)?
+        };
         if let Err(e) = d.kv.write(&p.kv, at) {
-            d.index.restore(mark)?;
+            if let Some(m) = mark {
+                d.index.restore(m)?;
+            }
             return Err(e);
         }
         let out = self.finish_draft(model, d, &x, &p, &idx, flush);
         if out.is_err() {
             d.kv.truncate(at)?;
-            d.index.restore(mark)?;
+            if let Some(m) = mark {
+                d.index.restore(m)?;
+            }
         }
         out
     }
@@ -699,9 +839,29 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
+        let persist = vec![true; drafts.len()];
+        self.draft_batch_with_persist(model, drafts, h, emb, &persist)
+    }
+
+    /// Like [`Self::draft_batch`], skipping `d.index.update` for each lane
+    /// where `persist[i]` is false (the lane's last draft step before `settle()`).
+    pub fn draft_batch_with_persist(
+        &self,
+        model: &Model,
+        drafts: &mut [&mut Draft],
+        h: &MxArray,
+        emb: &MxArray,
+        persist: &[bool],
+    ) -> Result<(MxArray, MxArray)> {
         let b = drafts.len();
         if b == 0 {
             return Err(bad("draft_batch requires at least one lane"));
+        }
+        if persist.len() != b {
+            return Err(bad(format!(
+                "draft_batch got {} persist flags for {b} lanes",
+                persist.len()
+            )));
         }
         let bi = b as i64;
         let h2 = h.reshape(&[bi, self.dim])?;
@@ -732,12 +892,13 @@ impl MtpLayer {
         let pq_d = p.q.shape_at(2)?;
         let pkv_w = p.kv.shape_at(1)?;
 
-        let mut marks: Vec<IndexerMark> = Vec::with_capacity(b);
+        let mut marks: Vec<Option<IndexerMark>> = Vec::with_capacity(b);
         let mut kv_written = 0usize;
         let mut attn_parts: Vec<MxArray> = Vec::with_capacity(b);
         let core_res: Result<MxArray> = (|| {
             for (i, d) in drafts.iter_mut().enumerate() {
                 let at = ats[i];
+                let keep_idx = persist[i];
                 let lo = i as i64;
                 let hi = lo + 1;
                 let (px_i, pqr_i, pq_i, pkv_i) = if b == 1 {
@@ -750,15 +911,18 @@ impl MtpLayer {
                         p.kv.slice(&[lo, 0], &[hi, pkv_w])?,
                     )
                 };
-                let mark = d.index.mark();
-                marks.push(mark);
+                marks.push(keep_idx.then(|| d.index.mark()));
                 let call = Call {
                     x: &px_i,
                     qr: &pqr_i,
                     start: at,
                     kind: RowKind::Decode,
                 };
-                let idx = self.indexer.select(iw, call, &mut d.index)?;
+                let idx = if keep_idx {
+                    self.indexer.select(iw, call, &mut d.index)?
+                } else {
+                    self.indexer.select_readonly(iw, call, &mut d.index)?
+                };
                 d.kv.write(&pkv_i, at)?;
                 kv_written = i + 1;
                 let o_i = gather_sink_attention(
@@ -789,16 +953,22 @@ impl MtpLayer {
                 .forward_traced(&self.w, &x, RowKind::Decode, false)?;
             let x = x.add(&f)?;
             let h_out = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
-            let logits = head_rows(&h_out, model.weights().output())?;
+            let head = self
+                .draft_head
+                .as_ref()
+                .unwrap_or_else(|| model.weights().output());
+            let logits = head_rows(&h_out, head)?;
             Ok((h_out, logits))
         });
 
         if out.is_err() {
-            for j in 0..marks.len() {
+            for (j, mark) in marks.into_iter().enumerate() {
                 if j < kv_written {
                     let _ = drafts[j].kv.truncate(ats[j]);
                 }
-                let _ = drafts[j].index.restore(marks[j].clone());
+                if let Some(m) = mark {
+                    let _ = drafts[j].index.restore(m);
+                }
             }
         }
         out
@@ -827,7 +997,11 @@ impl MtpLayer {
             .forward_traced(&self.w, &x, RowKind::Decode, false)?;
         let x = x.add(&f)?;
         let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
-        let logits = head_rows(&h, model.weights().output())?;
+        let head = self
+            .draft_head
+            .as_ref()
+            .unwrap_or_else(|| model.weights().output());
+        let logits = head_rows(&h, head)?;
         if flush {
             super::stats::flush("hy_v4_flash MTP draft")?;
         }

@@ -461,6 +461,129 @@ fn gguf_routed_decode_matches_kq_decode_q4k_and_q6k() {
     }
 }
 
+#[test]
+fn gguf_routed_decode_multi_row_dedup_and_row_invariance() {
+    for down_bits in [4, 6] {
+        // Test ROWS=1,2,3,4,8 on both compact non-multiple-of-4 H (odd K blocks) and Hy4 dims.
+        let configs: &[(usize, usize, usize, usize, usize, u64)] = &[
+            (24, 768, 256, 259, 8, 7000),
+            (32, 1536, 1536, 1536, 16, 8000),
+        ];
+        for &(n_experts, k, m, h, top, base_seed) in configs {
+            let mut rng = Rng::new(base_seed + down_bits as u64);
+            let raw_g = gen_raw_q4k(&mut rng, n_experts, m, k);
+            let raw_u = gen_raw_q4k(&mut rng, n_experts, m, k);
+            let (down_ty, raw_d, down_off) = if down_bits == 6 {
+                // Odd 2-byte offset stresses 2-byte-only Q6_K alignment.
+                (
+                    GgufTensorType::Q6K,
+                    gen_raw_q6k(&mut rng, n_experts, h, m),
+                    66u64,
+                )
+            } else {
+                (
+                    GgufTensorType::Q4K,
+                    gen_raw_q4k(&mut rng, n_experts, h, m),
+                    64u64,
+                )
+            };
+            let gate_off = 32u64;
+            let up_off = 96u64;
+            let g_buf = make_padded_u8_buf(&raw_g, gate_off, true);
+            let u_buf = make_padded_u8_buf(&raw_u, up_off, true);
+            let d_buf = make_padded_u8_buf(&raw_d, down_off, true);
+            let g_kq = repack_to_proj_arrays(&raw_g, GgufTensorType::Q4K, n_experts, m, k);
+            let u_kq = repack_to_proj_arrays(&raw_u, GgufTensorType::Q4K, n_experts, m, k);
+            let d_kq = repack_to_proj_arrays(&raw_d, down_ty, n_experts, h, m);
+
+            let max_rows = 8usize;
+            let x_vals: Vec<f32> = (0..max_rows * k).map(|_| rng.next_f32(-5.0, 5.0)).collect();
+            let w_vals: Vec<f32> = (0..max_rows * top)
+                .map(|_| rng.next_f32(0.05, 0.35))
+                .collect();
+
+            // Craft routing across 8 rows with counts of 1, 2, 3, 4, 5, 6, and 8 copies
+            // of the same expert (forcing >4 chunk splitting), plus multiple OOB slots.
+            let mut slot_ids = vec![0u32; max_rows * top];
+            for r in 0..max_rows {
+                let row = &mut slot_ids[r * top..(r + 1) * top];
+                row[0] = 0; // 8 copies across rows 0..8 -> splits into 4 + 4
+                row[1] = if r < 6 { 1 } else { (10 + r) as u32 }; // 6 copies -> splits into 4 + 2
+                row[2] = if r < 5 { 2 } else { (12 + r) as u32 }; // 5 copies -> splits into 4 + 1
+                row[3] = if r < 4 { 3 } else { (14 + r) as u32 }; // 4 copies
+                row[4] = if r < 3 { 4 } else { (15 + r) as u32 }; // 3 copies
+                row[5] = if r < 2 { 5 } else { (16 + r) as u32 }; // 2 copies
+                for (j, slot) in row.iter_mut().enumerate().skip(6) {
+                    *slot = ((6 + r * 3 + j) % n_experts) as u32;
+                }
+                if r == 1 || r == 5 {
+                    row[top - 1] = n_experts as u32; // OOB slot
+                }
+            }
+
+            // Single-row baselines for strict bit-exact row invariance.
+            let mut single_bits = Vec::with_capacity(max_rows);
+            for r in 0..max_rows {
+                let xr =
+                    MxArray::from_float32(&x_vals[r * k..(r + 1) * k], &[1, k as i64]).unwrap();
+                let slr = MxArray::from_uint32(&slot_ids[r * top..(r + 1) * top], &[1, top as i64])
+                    .unwrap();
+                let wr = MxArray::from_float32(&w_vals[r * top..(r + 1) * top], &[1, top as i64])
+                    .unwrap();
+                let Some(got) = gguf_routed_decode(
+                    &xr, &slr, &wr, &g_buf, gate_off, &u_buf, up_off, &d_buf, down_off, n_experts,
+                    m, h, down_bits, 7.0,
+                )
+                .unwrap() else {
+                    assert!(!require_metal(), "Metal required");
+                    return;
+                };
+                let gv = eval_f32(&got);
+                single_bits.push(gv.iter().map(|v| v.to_bits()).collect::<Vec<u32>>());
+            }
+
+            for rows in [1usize, 2, 3, 4, 8] {
+                let xm =
+                    MxArray::from_float32(&x_vals[..rows * k], &[rows as i64, k as i64]).unwrap();
+                let slm = MxArray::from_uint32(&slot_ids[..rows * top], &[rows as i64, top as i64])
+                    .unwrap();
+                let wm = MxArray::from_float32(&w_vals[..rows * top], &[rows as i64, top as i64])
+                    .unwrap();
+
+                let ref_out =
+                    call_kq_routed_decode(&xm, &slm, &wm, &g_kq, &u_kq, &d_kq, down_bits, 7.0)
+                        .unwrap();
+                let got_out = gguf_routed_decode(
+                    &xm, &slm, &wm, &g_buf, gate_off, &u_buf, up_off, &d_buf, down_off, n_experts,
+                    m, h, down_bits, 7.0,
+                )
+                .unwrap()
+                .unwrap();
+
+                let ref_v = eval_f32(&ref_out);
+                let got_v = eval_f32(&got_out);
+                let (max_abs, rel_l2) = error_stats(&got_v, &ref_v);
+                assert!(
+                    rel_l2 <= 1e-5,
+                    "dedup parity bits={down_bits} K={k} M={m} H={h} ROWS={rows}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+                );
+
+                // Bit-exact row invariance against ROWS=1.
+                for r in 0..rows {
+                    let row_bits: Vec<u32> = got_v[r * h..(r + 1) * h]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    assert_eq!(
+                        row_bits, single_bits[r],
+                        "gguf_routed_decode row invariance bits={down_bits} H={h} ROWS={rows} row={r}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Explicitly verify asymmetric clamp: gate is upper-clamped at +lim, NEVER lower-clamped at -lim.
 #[test]
 fn gguf_decode_preserves_asymmetric_gate_clamp() {

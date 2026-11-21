@@ -742,6 +742,7 @@ struct PagedOwners<'a> {
     cells: &'a mut [OwnerCell],
     starts: &'a [usize],
     maps: &'a [SlotMap],
+    run_mtp: bool,
 }
 
 impl WaveOwners for PagedOwners<'_> {
@@ -765,7 +766,7 @@ impl WaveOwners for PagedOwners<'_> {
         match (self.rows.get(owner), self.cells.get(owner)) {
             (Some(r), Some(c)) => Want {
                 logits: r.logits,
-                hidden: c.draft().is_some(),
+                hidden: self.run_mtp && c.draft().is_some(),
             },
             _ => Want::STATE,
         }
@@ -870,6 +871,7 @@ impl Run<'_> {
                 cells: &mut *cells,
                 starts,
                 maps: &maps,
+                run_mtp: self.mtp.is_some(),
             },
             &wave,
             self.cancel,
@@ -1075,7 +1077,7 @@ fn forget_above(p: &mut Paged, seq: SeqId, len: usize) {
 
 /// A publishing turn of `seq` whose cell stands at a block row keeps the
 /// cell's state there as its turn state candidate.
-fn hold_turn_state(p: &mut Paged, seq: SeqId) {
+fn hold_turn_state(p: &mut Paged, seq: SeqId, mtp_loaded: bool) {
     let Some(plan) = p.turns.get_mut(&seq).filter(|t| t.publish) else {
         return;
     };
@@ -1086,8 +1088,8 @@ fn hold_turn_state(p: &mut Paged, seq: SeqId) {
         return;
     }
     match cell.state() {
-        Ok(Some(s)) => plan.turn.hold(s),
-        Ok(None) => {}
+        Ok(Some(s)) if !mtp_loaded || s.draft.is_some() => plan.turn.hold(s),
+        Ok(Some(_) | None) => {}
         Err(e) => tracing::warn!("hy_v4_flash turn state of owner {seq}: {}", e.reason),
     }
 }
@@ -1153,9 +1155,10 @@ impl Inner {
         &mut self,
         rows: &[Rows<'_>],
         kind: RowKind,
+        run_mtp: bool,
         cancel: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<Output>> {
-        let out = self.wave_once(rows, kind, cancel);
+        let out = self.wave_once(rows, kind, run_mtp, cancel);
         if kind.is_decode() {
             self.publish(None);
         }
@@ -1166,6 +1169,7 @@ impl Inner {
         &mut self,
         rows: &[Rows<'_>],
         kind: RowKind,
+        run_mtp: bool,
         cancel: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<Output>> {
         let mut seen = HashSet::new();
@@ -1187,7 +1191,7 @@ impl Inner {
             fresh.push(if p.owners.contains(r.seq) {
                 None
             } else {
-                Some(new_cell(store, mtp.as_ref())?)
+                Some(new_cell(store, run_mtp.then_some(mtp.as_ref()).flatten())?)
             });
         }
         let mut cells = Vec::with_capacity(rows.len());
@@ -1196,13 +1200,16 @@ impl Inner {
                 Some(c) => c,
                 None => return Err(bad(format!("owner {} lost its cell", r.seq))),
             };
+            if !run_mtp && cell.draft().is_some() {
+                cell.drop_draft();
+            }
             cell.hold_mark(r.ids.len());
             cells.push(cell);
         }
         let starts: Vec<usize> = cells.iter().map(OwnerCell::len).collect();
         let run = Run {
             model: &store.model,
-            mtp: mtp.as_ref(),
+            mtp: if run_mtp { mtp.as_ref() } else { None },
             kind,
             row_cap: p.row_cap,
             cancel,
@@ -1227,8 +1234,9 @@ impl Inner {
             lose(p, seq, was == Some(seq));
         }
         if out.is_ok() && kind == RowKind::Decode {
+            let mtp_loaded = mtp.is_some();
             for r in rows {
-                hold_turn_state(p, r.seq);
+                hold_turn_state(p, r.seq, mtp_loaded);
             }
         }
         if let (Ok(_), Some(clock)) = (&out, clock) {
@@ -1380,7 +1388,7 @@ impl Inner {
                     Logits::None
                 },
             }];
-            let outs = match self.wave_rows(&rows, RowKind::Prefill, Some(layer_cancel)) {
+            let outs = match self.wave_rows(&rows, RowKind::Prefill, true, Some(layer_cancel)) {
                 Ok(o) => o,
                 Err(_) if cancelled(&self.cancel) => {
                     return Err(Error::from_reason(PREFILL_CANCELLED));
@@ -1397,6 +1405,7 @@ impl Inner {
     /// At a prompt state row of a publishing turn: registers `seq`'s blocks
     /// below `row` and publishes its cell there. A refusal costs reuse only.
     fn publish_at(&mut self, seq: SeqId, row: usize) {
+        let mtp_loaded = self.mtp.is_some();
         let Some(p) = self.paged.as_mut() else {
             return;
         };
@@ -1411,7 +1420,7 @@ impl Inner {
             return;
         }
         let state = match p.owners.get_mut(seq).map(OwnerCell::state) {
-            Some(Ok(Some(s))) => s,
+            Some(Ok(Some(s))) if !mtp_loaded || s.draft.is_some() => s,
             Some(Err(e)) => {
                 tracing::warn!("hy_v4_flash state at {row}: {}", e.reason);
                 return;
@@ -1457,7 +1466,7 @@ impl Inner {
                 logits: Logits::Last,
             })
             .collect();
-        let outs = self.wave_rows(&wave, RowKind::Decode, None)?;
+        let outs = self.wave_rows(&wave, RowKind::Decode, false, None)?;
         let mut logits = Vec::with_capacity(outs.len());
         for o in outs {
             let l = o
@@ -1798,6 +1807,16 @@ impl Inner {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
+        self.draft_row_lazy_with_persist(seq, h, emb, true)
+    }
+
+    pub(super) fn draft_row_lazy_with_persist(
+        &mut self,
+        seq: SeqId,
+        h: &MxArray,
+        emb: &MxArray,
+        persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
         let Inner {
             store, mtp, paged, ..
         } = self;
@@ -1808,7 +1827,7 @@ impl Inner {
             .get_mut(seq)
             .and_then(OwnerCell::draft_mut)
             .ok_or_else(|| bad(format!("owner {seq} has no draft")))?;
-        m.draft_lazy(&store.model, d, h, emb)
+        m.draft_lazy_with_persist(&store.model, d, h, emb, persist_state)
     }
 
     /// `n` drafts after `anchor` on `seq`'s settled draft, drawn as the
@@ -1862,7 +1881,7 @@ impl Inner {
         let mut step_dists: Vec<MxArray> = Vec::new();
         for step in 0..n {
             let emb = self.store.model.weights().token_embd().rows(&tok)?;
-            let (next, logits) = self.draft_row_lazy(seq, &h, &emb)?;
+            let (next, logits) = self.draft_row_lazy_with_persist(seq, &h, &emb, step + 1 < n)?;
             let logits = logits.reshape(&[-1])?;
             let (id, dist) = if greedy {
                 (logits.argmax(-1, None)?.astype(DType::Int32)?, None)
@@ -2100,7 +2119,17 @@ impl Inner {
                     }
                 }
 
-                let (h_next, logits) = m.draft_batch(model, &mut drafts, &h_batch, &emb_batch)?;
+                let persist_lanes: Vec<bool> = step_indices
+                    .iter()
+                    .map(|&idx| step + 1 < active[idx].grant)
+                    .collect();
+                let (h_next, logits) = m.draft_batch_with_persist(
+                    model,
+                    &mut drafts,
+                    &h_batch,
+                    &emb_batch,
+                    &persist_lanes,
+                )?;
                 let all_greedy = step_indices.iter().all(|&idx| active[idx].greedy);
                 let vocab = logits.shape_at(1)?;
 
@@ -2246,7 +2275,7 @@ impl Inner {
             .iter()
             .map(|&(seq, ids)| Rows { seq, ids, logits })
             .collect();
-        self.wave_rows(&wave, RowKind::Decode, None)
+        self.wave_rows(&wave, RowKind::Decode, true, None)
     }
 
     /// `seq`'s pool rows and cell cut to `len`; an owner that cannot go

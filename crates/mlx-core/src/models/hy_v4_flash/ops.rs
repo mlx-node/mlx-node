@@ -113,40 +113,47 @@ pub fn rope_inv_freqs(inv_freqs: &[f32]) -> Result<MxArray> {
     MxArray::from_float32(inv_freqs, &[inv_freqs.len() as i64])
 }
 
-/// Fused interleaved (`traditional = true`) RoPE over the entire last axis of `x`
-/// (`[n, rd]` or `[n, H, rd]`), computed in f32 with precise sin/cos and cast back
-/// to `x`'s dtype.
-pub fn fast_rope(x: &MxArray, inv_freqs: &MxArray, positions: &[u64]) -> Result<MxArray> {
-    if inv_freqs.ndim()? != 1 {
-        return Err(bad(format!(
-            "rope inv_freqs must be 1-D, got {:?}",
-            dims(inv_freqs)?
-        )));
-    }
-    let half = inv_freqs.shape_at(0)?;
-    let rd = 2 * half;
-    if rd <= 0 {
-        return Err(bad(format!("rope inv_freqs must be non-empty, got {half}")));
-    }
-    let shape = dims(x)?;
-    let n = match *shape.as_slice() {
-        [n, d] if d == rd => n,
-        [n, _, d] if d == rd => n,
-        _ => {
-            return Err(bad(format!(
-                "fast_rope expects [n, {rd}] or [n, H, {rd}], got {shape:?}"
-            )));
-        }
-    };
-    if positions.len() as i64 != n {
-        return Err(bad(format!(
-            "fast_rope got {} positions for {n} rows",
-            positions.len()
-        )));
-    }
+/// Converts `positions` to a cached 1-D f32 `MxArray` `[n]` for RoPE calls,
+/// reusing the allocation across layers within the same wave.
+pub fn rope_positions_f32(positions: &[u64]) -> Result<MxArray> {
+    let n = positions.len();
     if n == 0 {
-        return Ok(x.clone());
+        return MxArray::from_float32(&[], &[0]);
     }
+    let is_contig = n > 32
+        && positions.last().copied() == Some(positions[0].saturating_add((n - 1) as u64))
+        && positions
+            .iter()
+            .enumerate()
+            .all(|(i, &p)| p == positions[0] + i as u64);
+
+    thread_local! {
+        static SMALL_CACHE: std::cell::RefCell<Vec<(Vec<u64>, MxArray)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static CONTIG_CACHE: std::cell::RefCell<Option<(u64, usize, MxArray)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    if n <= 32 {
+        if let Some(hit) = SMALL_CACHE.with(|c| {
+            let c = c.borrow();
+            c.iter()
+                .find(|(k, _)| k.as_slice() == positions)
+                .map(|(_, a)| a.clone())
+        }) {
+            return Ok(hit);
+        }
+    } else if is_contig
+        && let Some(hit) = CONTIG_CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|(s, len, _)| *s == positions[0] && *len == n)
+                .map(|(_, _, a)| a.clone())
+        })
+    {
+        return Ok(hit);
+    }
+
     let pos_f32: Vec<f32> = positions
         .iter()
         .map(|&p| {
@@ -155,13 +162,55 @@ pub fn fast_rope(x: &MxArray, inv_freqs: &MxArray, positions: &[u64]) -> Result<
                 .map_err(|_| bad(format!("rope position {p} exceeds i32")))
         })
         .collect::<Result<_>>()?;
+    let arr = MxArray::from_float32(&pos_f32, &[n as i64])?;
+
+    if n <= 32 {
+        SMALL_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= 8 {
+                c.remove(0);
+            }
+            c.push((positions.to_vec(), arr.clone()));
+        });
+    } else if is_contig {
+        CONTIG_CACHE.with(|c| {
+            *c.borrow_mut() = Some((positions[0], n, arr.clone()));
+        });
+    }
+    Ok(arr)
+}
+
+/// Fused precise-f32 RoPE using a pre-built 1-D f32 `pos_arr [n]`.
+pub fn fast_rope_with_pos(x: &MxArray, inv_freqs: &MxArray, pos_arr: &MxArray) -> Result<MxArray> {
+    if inv_freqs.ndim()? != 1 {
+        return Err(bad(format!(
+            "rope inv_freqs must be 1-D, got {:?}",
+            dims(inv_freqs)?
+        )));
+    }
+    let d = dims(x)?;
+    let rd = 2 * inv_freqs.shape_at(0)?;
+    let n = match d.as_slice() {
+        &[n, w] | &[n, _, w] if w == rd => n,
+        _ => {
+            return Err(bad(format!("fast_rope got shape {d:?} for rope_dim {rd}")));
+        }
+    };
+    if pos_arr.ndim()? != 1 || pos_arr.shape_at(0)? != n {
+        return Err(bad(format!(
+            "fast_rope_with_pos got pos shape {:?} for {n} rows",
+            dims(pos_arr)?
+        )));
+    }
+    if n == 0 {
+        return Ok(x.clone());
+    }
     let dt = x.dtype()?;
     let xf = if dt == DType::Float32 {
         x.clone()
     } else {
         x.astype(DType::Float32)?
     };
-    let pos_arr = MxArray::from_float32(&pos_f32, &[n])?;
     let handle = unsafe {
         mlx_sys::mlx_rope_precise_compiled(
             xf.as_raw_ptr(),
@@ -177,11 +226,29 @@ pub fn fast_rope(x: &MxArray, inv_freqs: &MxArray, positions: &[u64]) -> Result<
     }
 }
 
-/// Fused RoPE on the trailing `rd` dims of `x` (`[n, d]` or `[n, H, d]`).
-pub fn fast_partial_rope_tail(
+/// Fused precise-f32 RoPE on `x` (`[n, rd]` or `[n, H, rd]`) at `positions`.
+pub fn fast_rope(x: &MxArray, inv_freqs: &MxArray, positions: &[u64]) -> Result<MxArray> {
+    let d = dims(x)?;
+    let n = *d.first().ok_or_else(|| bad("fast_rope: scalar input"))?;
+    if positions.len() as i64 != n {
+        return Err(bad(format!(
+            "fast_rope got {} positions for {n} rows",
+            positions.len()
+        )));
+    }
+    if n == 0 {
+        return Ok(x.clone());
+    }
+    let pos_arr = rope_positions_f32(positions)?;
+    fast_rope_with_pos(x, inv_freqs, &pos_arr)
+}
+
+/// Fused RoPE on the trailing `rd` dims of `x` (`[n, d]` or `[n, H, d]`) using
+/// a pre-built 1-D f32 `pos_arr [n]`.
+pub fn fast_partial_rope_tail_with_pos(
     x: &MxArray,
     inv_freqs: &MxArray,
-    positions: &[u64],
+    pos_arr: &MxArray,
 ) -> Result<MxArray> {
     if inv_freqs.ndim()? != 1 {
         return Err(bad(format!(
@@ -200,12 +267,22 @@ pub fn fast_partial_rope_tail(
         )));
     }
     if rd == width {
-        return fast_rope(x, inv_freqs, positions);
+        return fast_rope_with_pos(x, inv_freqs, pos_arr);
     }
     let head = last(x, 0, width - rd)?;
     let tail = last(x, width - rd, width)?;
-    let rot = fast_rope(&tail, inv_freqs, positions)?;
+    let rot = fast_rope_with_pos(&tail, inv_freqs, pos_arr)?;
     MxArray::concatenate(&head, &rot, -1)
+}
+
+/// Fused RoPE on the trailing `rd` dims of `x` (`[n, d]` or `[n, H, d]`).
+pub fn fast_partial_rope_tail(
+    x: &MxArray,
+    inv_freqs: &MxArray,
+    positions: &[u64],
+) -> Result<MxArray> {
+    let pos_arr = rope_positions_f32(positions)?;
+    fast_partial_rope_tail_with_pos(x, inv_freqs, &pos_arr)
 }
 
 /// `(flat · fnᵀ) · rsqrt(mean(flat²) + eps)` with `flat = x [n, hc·d]`:
@@ -794,13 +871,14 @@ pub fn hc_bridge_head(
     }
 }
 
-/// Row-invariant f32 router GEMV for `1..=16` rows when `router` is a 2-D f32
-/// weight with `K % 32 == 0`. Returns `Ok(None)` when Metal or shape is unsupported.
+/// Row-invariant f32/f16 router GEMV for `1..=16` rows when `router` is a 2-D
+/// f32 or f16 weight with `K % 32 == 0`. Returns `Ok(None)` when Metal or shape
+/// is unsupported.
 pub(crate) fn try_router_mv(xf: &MxArray, router: &Dense) -> Result<Option<MxArray>> {
     let Dense::Array(w) = router else {
         return Ok(None);
     };
-    if xf.ndim()? != 2 || w.ndim()? != 2 || w.dtype()? != DType::Float32 {
+    if xf.ndim()? != 2 || w.ndim()? != 2 || !matches!(w.dtype()?, DType::Float32 | DType::Float16) {
         return Ok(None);
     }
     let m = xf.shape_at(0)?;
@@ -1261,6 +1339,54 @@ pub fn gguf_routed_decode(
     Ok(Some(MxArray::from_handle(
         handle,
         "hy_v4_flash gguf_routed_decode",
+    )?))
+}
+
+/// Fused 2-kernel routed expert decode for resident MLX affine-4 g64 bf16
+/// scales/biases (`rows <= 8`, `top <= 32`, asymmetric clamp `limit`).
+/// Returns `Ok(None)` when Metal is unavailable or shapes/dtypes are unsupported.
+#[allow(clippy::too_many_arguments)]
+pub fn affine4_routed_decode(
+    x: &MxArray,
+    slots: &MxArray,
+    weights: &MxArray,
+    wg: &MxArray,
+    sg: &MxArray,
+    bg: &MxArray,
+    wu: &MxArray,
+    su: &MxArray,
+    bu: &MxArray,
+    wd: &MxArray,
+    sd: &MxArray,
+    bd: &MxArray,
+    limit: f32,
+) -> Result<Option<MxArray>> {
+    let xf = as_f32(x)?;
+    let wf = as_f32(weights)?;
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_affine4_routed_decode(
+            xf.as_raw_ptr(),
+            slots.as_raw_ptr(),
+            wf.as_raw_ptr(),
+            wg.as_raw_ptr(),
+            sg.as_raw_ptr(),
+            bg.as_raw_ptr(),
+            wu.as_raw_ptr(),
+            su.as_raw_ptr(),
+            bu.as_raw_ptr(),
+            wd.as_raw_ptr(),
+            sd.as_raw_ptr(),
+            bd.as_raw_ptr(),
+            limit,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash affine4_routed_decode",
     )?))
 }
 

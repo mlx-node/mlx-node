@@ -45,7 +45,8 @@ use super::persist_codec::{
 use super::persist_writer::{Closer, Parker, SLOT_WAIT, Telemetry, Wake, object_bytes, run};
 use super::prefill::{BLOCK_ROWS, StateRow, turn_row};
 use super::prefix_state::{
-    DraftState, Held, Key, PrefixState, Segment, States, durable, prompt_keys, resumes, turn_keys,
+    DraftState, Held, Key, PrefixState, Segment, States, any_written, durable, prompt_keys,
+    resumes, turn_keys,
 };
 use crate::array::MxArray;
 use crate::disk_tier::{DiskTier, DiskTierOptions, PersistentIdentity, TierHandle};
@@ -81,6 +82,19 @@ pub(crate) type Store = HybridStateStore<Held<PrefixState>>;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 disk tier: {msg}"))
+}
+
+/// Cold prompt-end replay states (`!any_written`) are never superseded by
+/// deeper turn states: a turn state cannot resume the original prompt after
+/// a restart when decode finishes faster than `DELAY`.
+fn is_superseded(store: &Store, id: EntryId) -> bool {
+    let Some(entry) = store.get(id) else {
+        return false;
+    };
+    if !any_written(entry.extra_keys()) {
+        return false;
+    }
+    store.superseded(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +756,7 @@ impl Disk {
             for point in points {
                 let gone = store
                     .get(point.id)
-                    .is_none_or(|entry| entry.checkpoint() || store.superseded(point.id));
+                    .is_none_or(|entry| entry.checkpoint() || is_superseded(store, point.id));
                 if gone {
                     Telemetry::bump(&self.telemetry.unneeded);
                 } else {
@@ -1104,7 +1118,7 @@ impl Disk {
             Telemetry::bump(&self.telemetry.unneeded);
             return false;
         };
-        if entry.checkpoint() || store.superseded(id) {
+        if entry.checkpoint() || is_superseded(store, id) {
             Telemetry::bump(&self.telemetry.unneeded);
             return false;
         }

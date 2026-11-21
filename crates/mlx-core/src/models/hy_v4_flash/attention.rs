@@ -25,7 +25,7 @@ use super::cache::{LatentBuf, LayerCache, WindowKeys, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
 use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear};
-use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
+use super::ops::{fast_rope_with_pos, rms_norm, rope_inv_freqs, rope_positions_f32};
 use super::paged::{SlotMap, planes, write_latent};
 use super::sparse::{
     KeyRows, gather_sink_attention_for, gather_sink_attention_rows_for,
@@ -354,10 +354,25 @@ impl Mla {
         x: &MxArray,
         positions: &[u64],
     ) -> Result<Projected> {
+        let pos_arr = rope_positions_f32(positions)?;
+        self.project_normed_with_pos(w, x, &pos_arr)
+    }
+
+    /// `project_normed` reusing a wave-hoisted 1-D f32 `pos_arr [n]` for both
+    /// `q_pe` and `k_pe`.
+    pub(crate) fn project_normed_with_pos(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        pos_arr: &MxArray,
+    ) -> Result<Projected> {
         let g = &self.g;
         let n = x.shape_at(0)?;
-        if positions.len() as i64 != n {
-            return Err(bad(format!("{} positions for {n} rows", positions.len())));
+        if pos_arr.ndim()? != 1 || pos_arr.shape_at(0)? != n {
+            return Err(bad(format!(
+                "pos_arr shape {:?} for {n} rows",
+                pos_arr.shape()?.as_ref()
+            )));
         }
         let x = if x.dtype()? == DType::Float32 {
             x.clone()
@@ -393,19 +408,19 @@ impl Mla {
         let qr = rms_norm(&q_a_out, &w.q_a_norm, g.eps)?;
         let q = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
         let q_nope = q.slice(&[0, 0, 0], &[n, heads, nope])?;
-        let q_pe = fast_rope(
+        let q_pe = fast_rope_with_pos(
             &q.slice(&[0, 0, nope], &[n, heads, qk])?,
             &self.inv_freqs,
-            positions,
+            pos_arr,
         )?;
         let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
         let q = MxArray::concatenate(&q_abs, &q_pe, -1)?;
 
         let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
-        let k_pe = fast_rope(
+        let k_pe = fast_rope_with_pos(
             &ckv.slice(&[0, kv_lora], &[n, kv_row])?,
             &self.inv_freqs,
-            positions,
+            pos_arr,
         )?;
         let kv = MxArray::concatenate(&kv, &k_pe, -1)?;
         Ok(Projected {
@@ -441,8 +456,19 @@ impl Mla {
         x: &MxArray,
         positions: &[u64],
     ) -> Result<Projected> {
+        let pos_arr = rope_positions_f32(positions)?;
+        self.project_normed_timed_with_pos(w, x, &pos_arr)
+    }
+
+    /// `project_normed_with_pos` under the attention-projection clock.
+    pub(crate) fn project_normed_timed_with_pos(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        pos_arr: &MxArray,
+    ) -> Result<Projected> {
         let tp = prof_start();
-        let p = self.project_normed(w, x, positions)?;
+        let p = self.project_normed_with_pos(w, x, pos_arr)?;
         if let Some(g) = &p.gate_lin {
             prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g])?;
         } else {

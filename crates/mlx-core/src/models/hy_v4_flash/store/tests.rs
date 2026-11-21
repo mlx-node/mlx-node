@@ -980,9 +980,12 @@ fn real_sizes_match_the_oracle() {
     let addons = fixture("admission-addons.json");
     let inputs = &addons["inputs"];
     assert_eq!(sizes.dense_trunk, u(&inputs["dense_trunk"]));
-    assert_eq!(sizes.dense_mtp, u(&inputs["dense_mtp_plan"]));
     let mtp = fixture("mtp-tensors.json");
-    assert_eq!(sizes.dense_mtp, u(&mtp["totals"]["plan_bytes"]));
+    let draft_head = crate::models::hy_v4_flash::mtp::draft_head_bytes(&s).unwrap();
+    assert_eq!(
+        sizes.dense_mtp,
+        u(&mtp["totals"]["plan_bytes"]) + draft_head
+    );
     let adm = fixture("admission.json");
     assert_eq!(
         sizes.classes.slot,
@@ -993,7 +996,7 @@ fn real_sizes_match_the_oracle() {
     assert_eq!(
         (m.dense, m.slot, m.n_experts),
         (
-            u(&addons["variants"]["mtp_on"]["dense"]),
+            sizes.dense_trunk + sizes.dense_mtp,
             u(&inputs["slot"]),
             u(&inputs["n_experts"])
         )

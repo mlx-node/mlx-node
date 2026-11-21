@@ -3646,6 +3646,22 @@ unsafe extern "C" {
         limit: f32,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_affine4_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_gguf_prefill_indirect_gu(
         x: *mut mlx_array,
         token_rows: *mut mlx_array,

@@ -9,109 +9,170 @@ if (int(m) >= M) return;
 
 constexpr int MAX_ITERS = (MAX_E + 127) / 128;
 threadgroup float tg_s[MAX_E];
-threadgroup float tg_sg_val[4];
-threadgroup uint tg_sg_id[4];
+threadgroup float tg_cand_val[4 * K];
+threadgroup uint tg_cand_id[4 * K];
 
 const size_t row_off = size_t(m) * size_t(E);
-float my_sel[MAX_ITERS];
-bool my_taken[MAX_ITERS];
 
-for (int i = 0; i < MAX_ITERS; ++i) {
-  const int e = int(tid) + i * 128;
-  if (e < E) {
-    const float lx = logits[row_off + size_t(e)];
-    // Match MLX Sigmoid (unary_ops.h) so GPU routing matches host routing bit-for-bit.
-    const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(lx)));
-    const float s = (lx < 0.0f) ? y : (1.0f - y);
-    float sel = HAS_BIAS ? (s + bias[e]) : s;
-    if (metal::isnan(sel)) {
-      sel = -INFINITY;
+if constexpr (MAX_ITERS == 4) {
+  float v0 = -INFINITY, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY;
+  uint i0 = 0xFFFFFFFFu, i1 = 0xFFFFFFFFu, i2 = 0xFFFFFFFFu, i3 = 0xFFFFFFFFu;
+
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 0 * 128, v0, i0);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 1 * 128, v1, i1);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 2 * 128, v2, i2);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 3 * 128, v3, i3);
+
+  // 4-element sorting network in registers (best at slot 0).
+  hy4_topk_cswap(v0, i0, v1, i1);
+  hy4_topk_cswap(v2, i2, v3, i3);
+  hy4_topk_cswap(v0, i0, v2, i2);
+  hy4_topk_cswap(v1, i1, v3, i3);
+  hy4_topk_cswap(v1, i1, v2, i2);
+
+  // Each simdgroup extracts its local top-K in registers with zero TG barriers.
+  for (int k = 0; k < K; ++k) {
+    const float sg_max = simd_max(v0);
+    const uint cand = (i0 != 0xFFFFFFFFu && v0 == sg_max) ? i0 : 0xFFFFFFFFu;
+    const uint win_id = simd_min(cand);
+    if (lane == 0u) {
+      tg_cand_val[sg * uint(K) + uint(k)] = (win_id != 0xFFFFFFFFu) ? sg_max : -INFINITY;
+      tg_cand_id[sg * uint(K) + uint(k)] = win_id;
     }
-    tg_s[e] = s;
-    my_sel[i] = sel;
-    my_taken[i] = false;
-  } else {
-    my_sel[i] = -INFINITY;
-    my_taken[i] = true;
+    if (win_id != 0xFFFFFFFFu && i0 == win_id) {
+      v0 = v1; i0 = i1;
+      v1 = v2; i1 = i2;
+      v2 = v3; i2 = i3;
+      v3 = -INFINITY; i3 = 0xFFFFFFFFu;
+    }
+  }
+} else {
+  float v0 = -INFINITY, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY;
+  float v4 = -INFINITY, v5 = -INFINITY, v6 = -INFINITY, v7 = -INFINITY;
+  uint i0 = 0xFFFFFFFFu, i1 = 0xFFFFFFFFu, i2 = 0xFFFFFFFFu, i3 = 0xFFFFFFFFu;
+  uint i4 = 0xFFFFFFFFu, i5 = 0xFFFFFFFFu, i6 = 0xFFFFFFFFu, i7 = 0xFFFFFFFFu;
+
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 0 * 128, v0, i0);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 1 * 128, v1, i1);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 2 * 128, v2, i2);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 3 * 128, v3, i3);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 4 * 128, v4, i4);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 5 * 128, v5, i5);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 6 * 128, v6, i6);
+  hy4_topk_load_one<HAS_BIAS>(logits, bias, tg_s, row_off, E, int(tid) + 7 * 128, v7, i7);
+
+  // 8-element sorting network in registers (best at slot 0).
+  hy4_topk_cswap(v0, i0, v1, i1);
+  hy4_topk_cswap(v2, i2, v3, i3);
+  hy4_topk_cswap(v4, i4, v5, i5);
+  hy4_topk_cswap(v6, i6, v7, i7);
+  hy4_topk_cswap(v0, i0, v2, i2);
+  hy4_topk_cswap(v1, i1, v3, i3);
+  hy4_topk_cswap(v4, i4, v6, i6);
+  hy4_topk_cswap(v5, i5, v7, i7);
+  hy4_topk_cswap(v1, i1, v2, i2);
+  hy4_topk_cswap(v5, i5, v6, i6);
+  hy4_topk_cswap(v0, i0, v4, i4);
+  hy4_topk_cswap(v1, i1, v5, i5);
+  hy4_topk_cswap(v2, i2, v6, i6);
+  hy4_topk_cswap(v3, i3, v7, i7);
+  hy4_topk_cswap(v2, i2, v4, i4);
+  hy4_topk_cswap(v3, i3, v5, i5);
+  hy4_topk_cswap(v1, i1, v2, i2);
+  hy4_topk_cswap(v3, i3, v4, i4);
+  hy4_topk_cswap(v5, i5, v6, i6);
+
+  for (int k = 0; k < K; ++k) {
+    const float sg_max = simd_max(v0);
+    const uint cand = (i0 != 0xFFFFFFFFu && v0 == sg_max) ? i0 : 0xFFFFFFFFu;
+    const uint win_id = simd_min(cand);
+    if (lane == 0u) {
+      tg_cand_val[sg * uint(K) + uint(k)] = (win_id != 0xFFFFFFFFu) ? sg_max : -INFINITY;
+      tg_cand_id[sg * uint(K) + uint(k)] = win_id;
+    }
+    if (win_id != 0xFFFFFFFFu && i0 == win_id) {
+      v0 = v1; i0 = i1;
+      v1 = v2; i1 = i2;
+      v2 = v3; i2 = i3;
+      v3 = v4; i3 = i4;
+      v4 = v5; i4 = i5;
+      v5 = v6; i5 = i6;
+      v6 = v7; i6 = i7;
+      v7 = -INFINITY; i7 = 0xFFFFFFFFu;
+    }
   }
 }
+
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint chosen_id[K];
-float chosen_s[K];
+if (sg == 0u) {
+  const uint rev = 31u - lane;
 
-for (int k = 0; k < K; ++k) {
-  float best_sel = -INFINITY;
-  uint best_id = 0xFFFFFFFFu;
-  for (int i = 0; i < MAX_ITERS; ++i) {
-    if (!my_taken[i]) {
-      const float v = my_sel[i];
-      const uint id = tid + uint(i * 128);
-      if (best_id == 0xFFFFFFFFu || v > best_sel || (v == best_sel && id < best_id)) {
-        best_sel = v;
-        best_id = id;
+  // Merge SG 0 and SG 1 sorted top-K lists via bitonic half-cleaner + 32-lane merge.
+  float a_val = (int(lane) < K) ? tg_cand_val[lane] : -INFINITY;
+  uint a_id = (int(lane) < K) ? tg_cand_id[lane] : 0xFFFFFFFFu;
+  float b_val = (int(rev) < K) ? tg_cand_val[uint(K) + rev] : -INFINITY;
+  uint b_id = (int(rev) < K) ? tg_cand_id[uint(K) + rev] : 0xFFFFFFFFu;
+  const bool take_a01 = hy4_topk_better(a_val, a_id, b_val, b_id);
+  float m01_val = take_a01 ? a_val : b_val;
+  uint m01_id = take_a01 ? a_id : b_id;
+  hy4_topk_bitonic_merge32(m01_val, m01_id, lane);
+
+  // Merge SG 2 and SG 3 sorted top-K lists.
+  a_val = (int(lane) < K) ? tg_cand_val[2u * uint(K) + lane] : -INFINITY;
+  a_id = (int(lane) < K) ? tg_cand_id[2u * uint(K) + lane] : 0xFFFFFFFFu;
+  b_val = (int(rev) < K) ? tg_cand_val[3u * uint(K) + rev] : -INFINITY;
+  b_id = (int(rev) < K) ? tg_cand_id[3u * uint(K) + rev] : 0xFFFFFFFFu;
+  const bool take_a23 = hy4_topk_better(a_val, a_id, b_val, b_id);
+  float m23_val = take_a23 ? a_val : b_val;
+  uint m23_id = take_a23 ? a_id : b_id;
+  hy4_topk_bitonic_merge32(m23_val, m23_id, lane);
+
+  // Merge M01 and reversed M23 to obtain global top-K in exact descending rank order.
+  const float b23_val = simd_shuffle(m23_val, ushort(rev));
+  const uint b23_id = simd_shuffle(m23_id, ushort(rev));
+  const bool take_01 = hy4_topk_better(m01_val, m01_id, b23_val, b23_id);
+  float val = take_01 ? m01_val : b23_val;
+  uint id = take_01 ? m01_id : b23_id;
+  hy4_topk_bitonic_merge32(val, id, lane);
+
+  // Mask lanes >= K before ascending-ID sort so rank >= K never enters top-K.
+  float my_s = (int(lane) < K) ? tg_s[id] : 0.0f;
+  if (int(lane) >= K) {
+    id = 0xFFFFFFFFu;
+  }
+
+  // Rank-order summation preserves bitwise parity with host route_select.
+  float sum_s = 0.0f;
+  for (int i = 0; i < K; ++i) {
+    sum_s += simd_shuffle(my_s, ushort(i));
+  }
+  sum_s += params[1];
+
+  if constexpr (K > 1) {
+    constexpr uint N_SORT = (K <= 16) ? 16u : 32u;
+    for (uint size = 2u; size <= N_SORT; size <<= 1u) {
+      const bool dir_desc = (lane & size) != 0u;
+      for (uint stride = size >> 1u; stride >= 1u; stride >>= 1u) {
+        const uint oi = simd_shuffle_xor(id, ushort(stride));
+        const float os = simd_shuffle_xor(my_s, ushort(stride));
+        const bool upper = (lane & stride) != 0u;
+        const bool swap = (upper != dir_desc) ? (oi > id) : (oi < id);
+        if (swap) {
+          id = oi;
+          my_s = os;
+        }
       }
     }
   }
-  const float sg_max_val = simd_max(best_sel);
-  const uint cand_id =
-      (best_id != 0xFFFFFFFFu && best_sel == sg_max_val) ? best_id : 0xFFFFFFFFu;
-  const uint sg_win_id = simd_min(cand_id);
-  if (lane == 0) {
-    tg_sg_val[sg] = sg_max_val;
-    tg_sg_id[sg] = sg_win_id;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  float win_val = tg_sg_val[0];
-  uint win_id = tg_sg_id[0];
-  for (uint s = 1; s < 4; ++s) {
-    const float v = tg_sg_val[s];
-    const uint id = tg_sg_id[s];
-    if (id != 0xFFFFFFFFu &&
-        (win_id == 0xFFFFFFFFu || v > win_val || (v == win_val && id < win_id))) {
-      win_val = v;
-      win_id = id;
-    }
-  }
-  if (tid == 0) {
-    chosen_id[k] = win_id;
-    chosen_s[k] = tg_s[win_id];
-  }
-  if ((win_id & 127u) == tid) {
-    my_taken[win_id >> 7] = true;
-  }
-  if (k + 1 < K) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-}
-
-if (tid == 0) {
-  const float scale = params[0];
-  const float eps = params[1];
-  float sum_s = 0.0f;
-  for (int i = 0; i < K; ++i) {
-    sum_s += chosen_s[i];
-  }
-  sum_s += eps;
-  for (int i = 1; i < K; ++i) {
-    const uint key_id = chosen_id[i];
-    const float key_s = chosen_s[i];
-    int j = i - 1;
-    while (j >= 0 && chosen_id[j] > key_id) {
-      chosen_id[j + 1] = chosen_id[j];
-      chosen_s[j + 1] = chosen_s[j];
-      --j;
-    }
-    chosen_id[j + 1] = key_id;
-    chosen_s[j + 1] = key_s;
-  }
-  const size_t out_off = size_t(m) * size_t(K);
-  for (int i = 0; i < K; ++i) {
-    ids[out_off + size_t(i)] = chosen_id[i];
+  if (int(lane) < K) {
+    const float scale = params[0];
+    const size_t out_off = size_t(m) * size_t(K) + size_t(lane);
+    ids[out_off] = id;
     const float w =
-        (NORM && K > 1) ? metal::precise::divide(chosen_s[i], sum_s) : chosen_s[i];
-    weights[out_off + size_t(i)] = w * scale;
+        (NORM && K > 1) ? metal::precise::divide(my_s, sum_s) : my_s;
+    weights[out_off] = w * scale;
   }
 }
 )METAL"

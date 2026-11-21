@@ -32,11 +32,11 @@ const ALIGN: u64 = 16 << 10;
 pub(crate) const MAX_COALESCE_BYTES: u64 = 256 << 10;
 pub const DEFAULT_ENGRAM_THREADS: usize = 16;
 pub const ENGRAM_CACHE_ENV: &str = "MLX_HY4_ENGRAM_CACHE_MB";
-pub const DEFAULT_ENGRAM_CACHE_MB: usize = 64;
+pub const DEFAULT_ENGRAM_CACHE_MB: usize = 256;
 
 const NONE: u32 = u32::MAX;
 /// Per-entry index budget alongside `head_dim` raw bytes and `LruNode` (12 B):
-/// at `head_dim = 96`, 128 B/entry fits 524,288 rows inside 64 MiB.
+/// at `head_dim = 96`, 128 B/entry fits 2,097,152 rows inside 256 MiB.
 const CACHE_INDEX_OVERHEAD: usize = 20;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
