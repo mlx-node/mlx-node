@@ -3558,6 +3558,46 @@ unsafe extern "C" {
         out_ids: *mut *mut mlx_array,
         out_weights: *mut *mut mlx_array,
     ) -> bool;
+
+    pub fn mlx_hy4_gguf_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        gate_buf: *mut mlx_array,
+        gate_off: u64,
+        up_buf: *mut mlx_array,
+        up_off: u64,
+        down_buf: *mut mlx_array,
+        down_off: u64,
+        n_experts: i32,
+        m: i32,
+        h: i32,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_prefill_indirect_gu(
+        x: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        tiles: *mut mlx_array,
+        gate_buf: *mut mlx_array,
+        gate_off: u64,
+        up_buf: *mut mlx_array,
+        up_off: u64,
+        n_experts: i32,
+        m: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_prefill_indirect_down(
+        hidden: *mut mlx_array,
+        tiles: *mut mlx_array,
+        down_buf: *mut mlx_array,
+        down_off: u64,
+        n_experts: i32,
+        h: i32,
+        down_bits: i32,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C-unwind" {
@@ -3578,6 +3618,18 @@ unsafe extern "C-unwind" {
         ndim: usize,
         dtype: i32,
         out_data: *mut *mut std::ffi::c_void,
+        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    /// Zero-copy read-only uint8 `[n_pages, page_size]` array over a
+    /// page-aligned `PROT_READ` `MAP_SHARED` mmap slice (`mlx_array_alloc.cpp`).
+    /// Bypasses `MetalAllocator::make_buffer` so active memory and residency
+    /// sets stay untouched. Null on unsupported builds, invalid alignment,
+    /// length > `maxBufferLength`, or allocation failure; `release_fn(ctx)` is
+    /// not invoked on a null return.
+    pub fn mlx_array_from_mmap_readonly(
+        aligned_ptr: *mut std::ffi::c_void,
+        aligned_len: usize,
         release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
         ctx: *mut std::ffi::c_void,
     ) -> *mut mlx_array;

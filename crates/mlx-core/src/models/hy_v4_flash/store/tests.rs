@@ -1049,6 +1049,8 @@ fn real_store_admits_at_load() {
         plan: CachePlan::AdmitWith(Limits::default()),
         max_memory: None,
         direct: DirectMode::Off,
+        mmap: MmapMode::Off,
+        mmap_prewarm: MmapMode::Off,
     };
     let st = Store::open(&s.paths, &opts).unwrap();
     TEST_HOST.with(|c| c.set(None));
@@ -2162,4 +2164,455 @@ fn shard1_nocache_and_page_cache_flags() {
     );
     // Single-shard layout: Engram shard stays F_NOCACHE even when experts share it.
     assert_eq!(shard_page_cache_for(1, &experts, 0, false), vec![false]);
+}
+
+#[test]
+fn mmap_mode_and_prewarm_env_parsing() {
+    for parse in [mmap_mode, mmap_prewarm_mode] {
+        assert_eq!(parse(None).unwrap(), MmapMode::Auto);
+        assert_eq!(parse(Some("")).unwrap(), MmapMode::Auto);
+        assert_eq!(parse(Some("  ")).unwrap(), MmapMode::Auto);
+        assert_eq!(parse(Some("auto")).unwrap(), MmapMode::Auto);
+        assert_eq!(parse(Some("AUTO")).unwrap(), MmapMode::Auto);
+        assert_eq!(parse(Some("1")).unwrap(), MmapMode::On);
+        assert_eq!(parse(Some("true")).unwrap(), MmapMode::On);
+        assert_eq!(parse(Some("TRUE")).unwrap(), MmapMode::On);
+        assert_eq!(parse(Some("0")).unwrap(), MmapMode::Off);
+        assert_eq!(parse(Some("false")).unwrap(), MmapMode::Off);
+        assert_eq!(parse(Some("FALSE")).unwrap(), MmapMode::Off);
+    }
+    assert!(
+        mmap_mode(Some("yes"))
+            .unwrap_err()
+            .reason
+            .contains(MMAP_ENV)
+    );
+    assert!(
+        mmap_prewarm_mode(Some("no"))
+            .unwrap_err()
+            .reason
+            .contains(MMAP_PREWARM_ENV)
+    );
+}
+
+#[test]
+fn mmap_admission_on_128gb_host_with_50gb_others_and_precedence() {
+    let sizes = Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    };
+    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
+    let direct_bytes = sizes.direct_expert_bytes();
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let ws = 96 * G;
+    let busy_128 = HostMemory {
+        physical: 128 * G,
+        wired: 50 * G,
+        ..Default::default()
+    };
+    let quiet_128 = HostMemory {
+        physical: 128 * G,
+        wired: 20 * G,
+        ..Default::default()
+    };
+    let host_96 = HostMemory {
+        physical: 96 * G,
+        wired: 20 * G,
+        ..Default::default()
+    };
+
+    // 1. 128 GiB host with 50 GiB others + MLX_HY4_MMAP=auto admits Mmap at 8192 chunk,
+    //    wired_limit < 20 GiB, and computes a positive pre-warm budget without self-evicting.
+    let res = select_expert_mode(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &busy_128,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExpertResidency::Mmap { chunk, gate } = res else {
+        panic!("expected Mmap on 128 GiB host with 50 GiB others, got {res:?}");
+    };
+    assert_eq!(chunk, 8192);
+    assert!(gate.admitted);
+    assert!(
+        gate.need < 20 * G,
+        "mmap need {:.2} GiB",
+        gate.need as f64 / G as f64
+    );
+    assert!(direct_wired_limit(gate.need, ws) < 20 * G);
+    let mapped_bytes = 89_500_000_000u64;
+    let kv_initial = direct_kv_allowance(&p, ctx);
+    let warm = mmap_warm_budget(
+        MmapMode::Auto,
+        &busy_128,
+        dense_mtp,
+        kv_initial,
+        DIRECT_MARGIN,
+        mapped_bytes,
+    );
+    assert!(warm >= 50 * G && warm <= mapped_bytes);
+    assert_eq!(
+        mmap_warm_budget(
+            MmapMode::Off,
+            &busy_128,
+            dense_mtp,
+            kv_initial,
+            DIRECT_MARGIN,
+            mapped_bytes,
+        ),
+        0
+    );
+    // Tight host (< 8 GiB headroom) skips pre-warm.
+    let tight_warm = HostMemory {
+        physical: 128 * G,
+        wired: 108 * G,
+        ..Default::default()
+    };
+    assert_eq!(
+        mmap_warm_budget(
+            MmapMode::Auto,
+            &tight_warm,
+            dense_mtp,
+            kv_initial,
+            DIRECT_MARGIN,
+            mapped_bytes,
+        ),
+        0
+    );
+
+    // 2. MLX_HY4_MMAP=0 falls back cleanly to existing Direct (quiet) / Streamed (busy).
+    let res_off_quiet = select_expert_mode(
+        MmapMode::Off,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &quiet_128,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(res_off_quiet, ExpertResidency::Direct { .. }));
+
+    let res_off_busy = select_expert_mode(
+        MmapMode::Off,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &busy_128,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(res_off_busy, ExpertResidency::Streamed { .. }));
+
+    // 3. MLX_HY4_MMAP=auto precedence across DirectMode::{On, Auto, Off} and physical < 100 GiB.
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::On,
+            true,
+            &p,
+            ctx,
+            &quiet_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Direct { .. }
+    ));
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::On,
+            true,
+            &p,
+            ctx,
+            &busy_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Mmap { .. }
+    ));
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            true,
+            &p,
+            ctx,
+            &quiet_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Mmap { .. }
+    ));
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::Off,
+            true,
+            &p,
+            ctx,
+            &busy_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Mmap { .. }
+    ));
+    // Below MMAP_MIN_PHYSICAL (96 GiB), Auto skips Mmap and falls through to Direct/Streamed.
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            true,
+            &p,
+            ctx,
+            &host_96,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Streamed { .. }
+    ));
+    // Without Metal, Auto never selects Mmap.
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            false,
+            &p,
+            ctx,
+            &busy_128,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Streamed { .. }
+    ));
+
+    // 4. MLX_HY4_MMAP=1 admits even below 100 GiB if budget >= need, and fails loud
+    //    when mmap_need > budget or Metal is unavailable.
+    assert!(matches!(
+        select_expert_mode(
+            MmapMode::On,
+            DirectMode::Off,
+            true,
+            &p,
+            ctx,
+            &host_96,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        ExpertResidency::Mmap { .. }
+    ));
+    let squeezed = HostMemory {
+        physical: 128 * G,
+        wired: 118 * G,
+        ..Default::default()
+    };
+    let err = select_expert_mode(
+        MmapMode::On,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &squeezed,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.reason.contains("MLX_HY4_MMAP=1 refused"),
+        "{}",
+        err.reason
+    );
+    let err_metal = select_expert_mode(
+        MmapMode::On,
+        DirectMode::Auto,
+        false,
+        &p,
+        ctx,
+        &busy_128,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(err_metal.reason.contains("Metal"), "{}", err_metal.reason);
+}
+
+#[test]
+fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let m = moe();
+    let mut experts = Vec::new();
+    let mut off = 1024u64;
+    for (il, class) in [
+        (0, ExpertClass::Q6kDown),
+        (1, ExpertClass::Q4kDown),
+        (2, ExpertClass::Q4kDown),
+    ] {
+        let mut l = layer(&m, il, class);
+        let geo = geometry(&m, class).unwrap();
+        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
+            .into_iter()
+            .enumerate()
+        {
+            loc.data_offset = off;
+            off += geo[p].file_bytes() * m.n_experts as u64;
+            off = off.div_ceil(32) * 32;
+        }
+        experts.push(Some(l));
+    }
+    let dir = std::env::temp_dir().join(format!("hy4-store-mmap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _tmp = Temp(dir.clone());
+    let path = dir.join("experts.bin");
+    std::fs::write(&path, vec![0u8; off as usize]).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
+    let bank = KqBank::new_mmap(pool, &m, &experts, std::slice::from_ref(&path), 0).unwrap();
+
+    assert!(bank.is_direct());
+    assert!(bank.is_mmap());
+    assert_eq!(bank.nbytes(), 0);
+    assert_eq!(bank.resident_bytes().unwrap(), 0);
+    assert_eq!(
+        bank.residency().unwrap(),
+        Residency {
+            resident: 0,
+            volatile: 0,
+        }
+    );
+
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let dense = 10 * G;
+    let ws = 96 * G;
+    let kv_initial = direct_kv_allowance(&p, ctx);
+    let scratch = direct_scratch_bytes(&p, 8192, ctx);
+    let mmap_fixed = dense + kv_initial + scratch;
+    assert!(mmap_fixed < 20 * G);
+    let classes = Classes {
+        layers: [1, 2],
+        slot: bank.slot_bytes(),
+    };
+    let size = ModelSize {
+        dense,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: 8,
+        ctx: ctx as u64,
+    };
+    let mmap_adm = Admission {
+        physical: 128 * G,
+        host_used: 50 * G,
+        own: 0,
+        others: 50 * G,
+        reserve: DIRECT_MARGIN,
+        live: 74 * G,
+        ws,
+        terms: Terms {
+            dense,
+            staging_layer: 0,
+            kv: kv_initial,
+            compute: scratch,
+            io: 0,
+            driver: 0,
+            pool: 0,
+        },
+        staging_layers: 0,
+        fixed: mmap_fixed,
+        slot: size.slot,
+        cache_slots: 12,
+        bound: Bound::Live,
+    };
+    let lease = Lease::new(
+        p,
+        size,
+        8192,
+        classes,
+        Some(Limits::default()),
+        Some(mmap_adm),
+        &bank,
+    )
+    .with_direct_budget(Some(74 * G));
+
+    let wl = lease.wired_limit(&bank).unwrap();
+    assert_eq!(wl, mmap_fixed);
+    assert!(wl < 20 * G);
+
+    assert!(!bank.in_turn());
+    lease.begin_turn(&bank, dense, kv_initial).unwrap();
+    assert!(lease.in_turn() && bank.in_turn());
+    assert!(!lease.recheck(&bank, dense, kv_initial).unwrap());
+    assert_eq!(lease.end_turn_idle(&bank, dense, kv_initial).unwrap(), None);
+    assert!(!lease.in_turn() && !bank.in_turn());
+    assert!(bank.is_mmap());
+    assert!(lease.switches().is_empty());
 }

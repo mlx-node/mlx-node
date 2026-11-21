@@ -37,10 +37,13 @@ use napi::{Error, Result};
 
 #[cfg(test)]
 use super::bank::sorted_slot_bounds;
-use super::bank::{KqBank, Prepared, ProjArrays};
+use super::bank::{DirectLayerArrays, KqBank, MmapProj, Prepared, ProjArrays};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
-use super::ops::{rms_norm, route, route_pair, router_logits, router_scores, router_topk_gpu};
+use super::ops::{
+    gguf_prefill_indirect_down, gguf_prefill_indirect_gu, gguf_routed_decode, rms_norm, route,
+    route_pair, router_logits, router_scores, router_topk_gpu,
+};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
@@ -769,24 +772,35 @@ impl Moe {
                         if kind.is_decode() {
                             prof_end(Phase::Router, tp, &[&gpu_ids, &gpu_weights])?;
                             let tp_fill = prof_start();
-                            let arrays = bank.direct_layer(layer)?.ok_or_else(|| {
+                            let arrays = bank.direct_layer_arrays(layer)?.ok_or_else(|| {
                                 bad(format!("layer {layer}: direct bank missing"))
                             })?;
                             prof_end(Phase::Fill, tp_fill, &[])?;
                             let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
                             let tp_r = prof_start();
-                            let r = match self.kq_routed_decode_gpu(
-                                &z,
-                                &gpu_ids,
-                                &gpu_weights,
-                                &arrays,
-                            )? {
-                                Some(r) => r,
-                                None => {
-                                    self.combine_gpu(&z, &gpu_ids, &gpu_weights, |pi, xi, idx| {
-                                        arrays[pi].gather(xi, idx)
-                                    })?
+                            let r = match arrays {
+                                DirectLayerArrays::Repacked(arrays) => {
+                                    match self.kq_routed_decode_gpu(
+                                        &z,
+                                        &gpu_ids,
+                                        &gpu_weights,
+                                        &arrays,
+                                    )? {
+                                        Some(r) => r,
+                                        None => self.combine_gpu(
+                                            &z,
+                                            &gpu_ids,
+                                            &gpu_weights,
+                                            |pi, xi, idx| arrays[pi].gather(xi, idx),
+                                        )?,
+                                    }
                                 }
+                                DirectLayerArrays::Mmap(projs) => self.gguf_routed_decode_chunked(
+                                    &z,
+                                    &gpu_ids,
+                                    &gpu_weights,
+                                    &projs,
+                                )?,
                             };
                             prof_end(Phase::Routed, tp_r, &[&r])?;
                             let f = self.finish_with_shared(w, x, &r, shared_gu)?;
@@ -797,17 +811,26 @@ impl Moe {
                         prof_end(Phase::Router, tp, &[])?;
                         let tp_fill = prof_start();
                         let arrays = bank
-                            .direct_layer(layer)?
+                            .direct_layer_arrays(layer)?
                             .ok_or_else(|| bad(format!("layer {layer}: direct bank missing")))?;
                         prof_end(Phase::Fill, tp_fill, &[])?;
                         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
                         let tp_r = prof_start();
-                        let r = self.direct_prefill_sorted(
-                            &z,
-                            ids_asc.as_ref(),
-                            &gpu_weights,
-                            &arrays,
-                        )?;
+                        let r = match arrays {
+                            DirectLayerArrays::Repacked(arrays) => self.direct_prefill_sorted(
+                                &z,
+                                ids_asc.as_ref(),
+                                &gpu_weights,
+                                &arrays,
+                            )?,
+                            DirectLayerArrays::Mmap(projs) => self.mmap_prefill_sorted(
+                                &z,
+                                ids_asc.as_ref(),
+                                &gpu_ids,
+                                &gpu_weights,
+                                &projs,
+                            )?,
+                        };
                         prof_end(Phase::Routed, tp_r, &[&r])?;
                         let f = self.finish_with_shared(w, x, &r, shared_gu)?;
                         return Ok((f, None));
@@ -920,6 +943,7 @@ impl Moe {
         if kind.is_decode()
             && (rows >= 2 || split_m1_enabled())
             && let ExpertSource::Bank(bank) = &self.experts
+            && !bank.is_mmap()
             && bank.split()
         {
             let f = self.forward_split(
@@ -1152,6 +1176,25 @@ impl Moe {
                 let y = self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?;
                 prof_end(Phase::Routed, tp, &[&y])?;
                 Ok(y)
+            }
+            ExpertSource::Bank(bank) if bank.is_mmap() => {
+                let (used, _) = distinct_uses(&ids);
+                let tp = prof_start();
+                let projs = bank
+                    .mmap_layer(layer, used.len())?
+                    .ok_or_else(|| bad(format!("layer {layer}: mmap bank missing")))?;
+                prof_end(Phase::Fill, tp, &[])?;
+                let tp = prof_start();
+                let k = self.moe.n_used as i64;
+                let ids_arr = MxArray::from_uint32(&ids, &[rows, k])?;
+                let w_arr = MxArray::from_float32(&w, &[rows, k])?;
+                let out = if kind.is_decode() {
+                    self.gguf_routed_decode_chunked(z, &ids_arr, &w_arr, &projs)?
+                } else {
+                    self.mmap_prefill_sorted(z, &ids, &ids_arr, &w_arr, &projs)?
+                };
+                prof_end(Phase::Routed, tp, &[&out])?;
+                Ok(out)
             }
             ExpertSource::Bank(bank) => {
                 let (used, uses) = distinct_uses(&ids);
@@ -1491,6 +1534,147 @@ impl Moe {
             return Ok(out);
         }
         d.take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+            .reshape(&[rows, k as i64, latent])?
+            .mul(&gpu_weights.reshape(&[rows, k as i64, 1])?)?
+            .sum(Some(&[1]), Some(false))
+    }
+
+    fn gguf_down_bits(projs: &[MmapProj; 3]) -> Result<i32> {
+        if projs[0].format != KQuantFormat::Q4K || projs[1].format != KQuantFormat::Q4K {
+            return Err(bad(format!(
+                "mmap gate/up formats {:?}/{:?} are not Q4_K",
+                projs[0].format, projs[1].format
+            )));
+        }
+        match projs[2].format {
+            KQuantFormat::Q4K => Ok(4),
+            KQuantFormat::Q6K => Ok(6),
+            other => Err(bad(format!("mmap down format {other:?} is not supported"))),
+        }
+    }
+
+    fn gguf_routed_decode_chunked(
+        &self,
+        z: &MxArray,
+        slots: &MxArray,
+        weights: &MxArray,
+        projs: &[MmapProj; 3],
+    ) -> Result<MxArray> {
+        const DECODE_CHUNK_ROWS: usize = 32;
+        let down_bits = Self::gguf_down_bits(projs)?;
+        let rows = z.shape_at(0)? as usize;
+        let latent = z.shape_at(1)?;
+        let k = self.moe.n_used as i64;
+        let [g, u, d] = projs;
+        let run_one = |zc: &MxArray, sc: &MxArray, wc: &MxArray| -> Result<MxArray> {
+            gguf_routed_decode(
+                zc,
+                sc,
+                wc,
+                &g.buf,
+                g.base_offset,
+                &u.buf,
+                u.base_offset,
+                &d.buf,
+                d.base_offset,
+                self.moe.n_experts,
+                self.moe.ff,
+                self.moe.latent,
+                down_bits,
+                self.limit,
+            )?
+            .ok_or_else(|| bad("gguf_routed_decode unavailable for mmap experts"))
+        };
+        if rows <= DECODE_CHUNK_ROWS {
+            return run_one(z, slots, weights);
+        }
+        let mut parts = Vec::with_capacity(rows.div_ceil(DECODE_CHUNK_ROWS));
+        for (lo, hi) in chunks(rows, DECODE_CHUNK_ROWS) {
+            let zc = z.slice(&[lo as i64, 0], &[hi as i64, latent])?;
+            let sc = slots.slice(&[lo as i64, 0], &[hi as i64, k])?;
+            let wc = weights.slice(&[lo as i64, 0], &[hi as i64, k])?;
+            parts.push(run_one(&zc, &sc, &wc)?);
+        }
+        MxArray::concatenate_many(parts.iter().collect(), Some(0))
+    }
+
+    fn mmap_prefill_sorted(
+        &self,
+        z: &MxArray,
+        ids_asc: &[u32],
+        gpu_ids: &MxArray,
+        gpu_weights: &MxArray,
+        projs: &[MmapProj; 3],
+    ) -> Result<MxArray> {
+        let down_bits = Self::gguf_down_bits(projs)?;
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used;
+        let n_experts = self.moe.n_experts;
+        let pairs = (rows as usize) * k;
+        if ids_asc.len() != pairs || ids_asc.iter().any(|&e| e as usize >= n_experts) {
+            return Err(bad(format!(
+                "mmap prefill routes: {} ids for {rows} rows x {k} ({n_experts} experts)",
+                ids_asc.len()
+            )));
+        }
+        if !prefill_indirect_gu_enabled() {
+            return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+        }
+        let mut counts = vec![0usize; n_experts];
+        for &e in ids_asc {
+            counts[e as usize] += 1;
+        }
+        let mut offsets = vec![0usize; n_experts];
+        let mut total = 0usize;
+        for (e, &c) in counts.iter().enumerate() {
+            offsets[e] = total;
+            total += c;
+        }
+        let mut back = vec![0u32; pairs];
+        let mut row = vec![0u32; pairs];
+        let mut slot = vec![0u32; pairs];
+        for (pair_idx, &e) in ids_asc.iter().enumerate() {
+            let pos = offsets[e as usize];
+            offsets[e as usize] = pos + 1;
+            back[pair_idx] = pos as u32;
+            row[pos] = (pair_idx / k) as u32;
+            slot[pos] = e;
+        }
+        let tiles = build_prefill_tiles(&slot);
+        let tr = MxArray::from_uint32(&row, &[pairs as i64])?;
+        let tl = MxArray::from_uint32(&tiles, &[(tiles.len() / 3) as i64, 3])?;
+        let [g, u, d] = projs;
+        let Some(hidden) = gguf_prefill_indirect_gu(
+            z,
+            &tr,
+            &tl,
+            &g.buf,
+            g.base_offset,
+            &u.buf,
+            u.base_offset,
+            n_experts,
+            self.moe.ff,
+            self.limit,
+        )?
+        else {
+            return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+        };
+        let Some(down) = gguf_prefill_indirect_down(
+            &hidden,
+            &tl,
+            &d.buf,
+            d.base_offset,
+            n_experts,
+            self.moe.latent,
+            down_bits,
+        )?
+        else {
+            return self.gguf_routed_decode_chunked(z, gpu_ids, gpu_weights, projs);
+        };
+        if let Some(out) = Self::kq_sorted_combine_gpu(&down, gpu_weights, &back, rows, k as i64)? {
+            return Ok(out);
+        }
+        down.take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
             .reshape(&[rows, k as i64, latent])?
             .mul(&gpu_weights.reshape(&[rows, k as i64, 1])?)?
             .sum(Some(&[1]), Some(false))

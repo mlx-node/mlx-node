@@ -1786,6 +1786,303 @@ fn direct_mode_decode_wave_matches_partial_bitwise_with_single_eval() {
     direct_bank.end_turn().unwrap();
 }
 
+/// Mmap-mode synthetic model vs repacked DirectBank: decode (single-owner and
+/// multi-owner DEDUP wave with 1 eval/step), prefill (NAX and non-NAX 32-row
+/// fallback), and host-routed trace / forced routes all match closely.
+#[test]
+fn mmap_mode_decode_and_prefill_match_direct_bank() {
+    use super::bank::Residency;
+    use super::moe::{forced, with_prefill_indirect_gu};
+    use super::stats;
+
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+
+    let cfg = tiny_cfg();
+    let mut r = Rng::new(23);
+    // Align every tensor to a 32-byte boundary matching GGUF alignment.
+    let mut file = r.bytes(1024);
+    let experts: Vec<Option<ExpertLayer>> = CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| {
+            c.map(|class| {
+                let types = class_types(class).unwrap();
+                let geo = geometry(&cfg.moe, class).unwrap();
+                let dims = [
+                    [cfg.moe.latent, cfg.moe.ff, cfg.moe.n_experts],
+                    [cfg.moe.latent, cfg.moe.ff, cfg.moe.n_experts],
+                    [cfg.moe.ff, cfg.moe.latent, cfg.moe.n_experts],
+                ];
+                let mut locs = Vec::new();
+                for (p, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .iter()
+                    .enumerate()
+                {
+                    let pad = (32 - (file.len() % 32)) % 32;
+                    file.resize(file.len() + pad, 0);
+                    let at = file.len() as u64;
+                    locs.push(located(
+                        &format!("blk.{il}.{name}.weight"),
+                        dims[p],
+                        types[p],
+                        at,
+                    ));
+                    let g = geo[p];
+                    let blocks = cfg.moe.n_experts * g.rows * g.k / g.format.block_size();
+                    file.extend(kquant_bytes(&mut r, g.format, blocks));
+                }
+                let [gate, up, down]: [Located; 3] = locs.try_into().ok().unwrap();
+                ExpertLayer {
+                    class,
+                    gate,
+                    up,
+                    down,
+                }
+            })
+        })
+        .collect();
+    let dir = Temp::new();
+    let path = dir.0.join("experts.bin");
+    std::fs::write(&path, &file).unwrap();
+
+    let make_model = |mmap: bool| {
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let bank = if mmap {
+            Arc::new(
+                KqBank::new_mmap(
+                    pool,
+                    &cfg.moe,
+                    &experts,
+                    std::slice::from_ref(&path),
+                    file.len() as u64,
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(KqBank::new_direct(pool, &cfg.moe, &experts).unwrap())
+        };
+        let weights = tiny_weights(&cfg, 11);
+        let table = engram_table(&cfg.engram, 13);
+        let b = Arc::clone(&bank);
+        let model = Model::new(
+            cfg.clone(),
+            Box::new(weights),
+            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+            Box::new(table),
+        )
+        .unwrap();
+        (model, bank)
+    };
+
+    let (direct_model, direct_bank) = make_model(false);
+    let (mmap_model, mmap_bank) = make_model(true);
+    direct_bank.wait_direct_fill().unwrap();
+    mmap_bank.wait_direct_fill().unwrap();
+
+    assert!(mmap_bank.is_direct());
+    assert!(mmap_bank.is_mmap());
+    assert!(mmap_model.bank_is_direct());
+    assert_eq!(mmap_bank.nbytes(), 0);
+    assert_eq!(mmap_bank.residency().unwrap(), Residency::default());
+    assert!(mmap_bank.mapped_bytes() > 0);
+
+    let max_diff = |a: &MxArray, b: &MxArray| -> f32 {
+        let av = read(a);
+        let bv = read(b);
+        assert_eq!(av.len(), bv.len());
+        av.iter()
+            .zip(&bv)
+            .map(|(&x, &y)| {
+                assert!(x.is_finite() && y.is_finite());
+                (x - y).abs()
+            })
+            .fold(0.0f32, f32::max)
+    };
+
+    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
+        .iter()
+        .map(|&(seed, n)| Rng::new(seed).ids(n))
+        .collect();
+
+    // 1. Prefill (NAX enabled) matches DirectBank.
+    let mut d_sess = direct_model.new_session(CTX).unwrap();
+    let mut m_sess = mmap_model.new_session(CTX).unwrap();
+    let d_pre = direct_model
+        .forward(
+            &mut d_sess,
+            &prompts[0],
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let m_pre = mmap_model
+        .forward(
+            &mut m_sess,
+            &prompts[0],
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let pre_diff = max_diff(
+        m_pre.logits.as_ref().unwrap(),
+        d_pre.logits.as_ref().unwrap(),
+    );
+    assert!(pre_diff <= 1e-2, "mmap prefill max_diff={pre_diff}");
+
+    // 2. Prefill non-NAX fallback (32-row decode chunks) also matches DirectBank.
+    let mut d_fb_sess = direct_model.new_session(CTX).unwrap();
+    let mut m_fb_sess = mmap_model.new_session(CTX).unwrap();
+    let (d_fb, m_fb) = with_prefill_indirect_gu(false, || {
+        let d = direct_model
+            .forward(
+                &mut d_fb_sess,
+                &prompts[1],
+                RowKind::Prefill,
+                Want::LAST,
+                None,
+                None,
+            )
+            .unwrap();
+        let m = mmap_model
+            .forward(
+                &mut m_fb_sess,
+                &prompts[1],
+                RowKind::Prefill,
+                Want::LAST,
+                None,
+                None,
+            )
+            .unwrap();
+        (d, m)
+    });
+    let fb_diff = max_diff(m_fb.logits.as_ref().unwrap(), d_fb.logits.as_ref().unwrap());
+    assert!(fb_diff <= 1e-2, "mmap prefill fallback max_diff={fb_diff}");
+
+    // 3. 1-row Decode: 1 eval/tok and tight numeric match against DirectBank.
+    let d_dec1 = direct_model
+        .forward(&mut d_sess, &[7], RowKind::Decode, Want::LAST, None, None)
+        .unwrap();
+    let m_evals_before = stats::thread_evals();
+    let m_dec1 = mmap_model
+        .forward(&mut m_sess, &[7], RowKind::Decode, Want::LAST, None, None)
+        .unwrap();
+    let m_evals_1 = stats::thread_evals() - m_evals_before;
+    assert_eq!(
+        m_evals_1, 1,
+        "mmap 1-row decode must use exactly 1 eval, got {m_evals_1}"
+    );
+    let dec1_diff = max_diff(
+        m_dec1.logits.as_ref().unwrap(),
+        d_dec1.logits.as_ref().unwrap(),
+    );
+    assert!(dec1_diff <= 1e-2, "mmap 1-row decode max_diff={dec1_diff}");
+
+    // 4. Multi-owner + verify2 Decode wave (6 rows, 4 owners): 1 eval and matches DirectBank.
+    let mut d_sessions: Vec<Session> = prompts
+        .iter()
+        .map(|p| prefilled(&direct_model, p))
+        .collect();
+    let mut m_sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&mmap_model, p)).collect();
+    let wave_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
+    let wave_wants: [Want; 4] = [
+        Want::LAST,
+        Want::ALL,
+        Want::LAST,
+        Want {
+            logits: Logits::All,
+            hidden: true,
+        },
+    ];
+    let d_outs = {
+        let mut owners: Vec<OwnerRows<'_>> = d_sessions
+            .iter_mut()
+            .zip(wave_ids)
+            .zip(wave_wants)
+            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
+            .collect();
+        direct_model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+    let m_evals_before = stats::thread_evals();
+    let m_outs = {
+        let mut owners: Vec<OwnerRows<'_>> = m_sessions
+            .iter_mut()
+            .zip(wave_ids)
+            .zip(wave_wants)
+            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
+            .collect();
+        mmap_model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+    let m_evals_wave = stats::thread_evals() - m_evals_before;
+    assert_eq!(
+        m_evals_wave, 1,
+        "mmap multi-owner decode wave must use exactly 1 eval, got {m_evals_wave}"
+    );
+    for (i, (do_, mo)) in d_outs.iter().zip(&m_outs).enumerate() {
+        let ld = max_diff(mo.logits.as_ref().unwrap(), do_.logits.as_ref().unwrap());
+        assert!(ld <= 1e-2, "mmap wave owner {i} logits diff={ld}");
+        if let (Some(mh), Some(dh)) = (mo.hidden.as_ref(), do_.hidden.as_ref()) {
+            let hd = max_diff(mh, dh);
+            assert!(hd <= 1e-2, "mmap wave owner {i} hidden diff={hd}");
+        }
+    }
+
+    // 5. Host-routed trace (`need_routes == true`) + forced routes work in Mmap mode.
+    let mut forced_map = std::collections::HashMap::new();
+    for (il, c) in CLASSES.iter().enumerate() {
+        if c.is_some() {
+            forced_map.insert(il, vec![0u32, 3]);
+        }
+    }
+    let mut d_tr = Trace::default();
+    let mut m_tr = Trace::default();
+    let (d_forced, m_forced) = forced::with(forced_map, || {
+        let d = direct_model
+            .forward(
+                &mut d_sess,
+                &[21],
+                RowKind::Decode,
+                Want::LAST,
+                None,
+                Some(&mut d_tr),
+            )
+            .unwrap();
+        let m = mmap_model
+            .forward(
+                &mut m_sess,
+                &[21],
+                RowKind::Decode,
+                Want::LAST,
+                None,
+                Some(&mut m_tr),
+            )
+            .unwrap();
+        (d, m)
+    });
+    assert_eq!(m_tr.routes.len(), d_tr.routes.len());
+    let forced_diff = max_diff(
+        m_forced.logits.as_ref().unwrap(),
+        d_forced.logits.as_ref().unwrap(),
+    );
+    assert!(
+        forced_diff <= 1e-2,
+        "mmap host-routed forced decode max_diff={forced_diff}"
+    );
+
+    direct_bank.end_turn().unwrap();
+    mmap_bank.end_turn().unwrap();
+}
+
 /// A 16-token prompt through the real trunk: finite logits, the last row
 /// equal to the all-rows call, and (with `HY4_LLAMA_TOP1` = a JSON file
 /// `{"ids": [..16], "top1": [..16]}` of stored llama.cpp rows) the argmax

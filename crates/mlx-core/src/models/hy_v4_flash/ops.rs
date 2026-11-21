@@ -760,4 +760,143 @@ pub fn head_chunks(
 }
 
 #[cfg(test)]
+mod gguf_tests;
+#[cfg(test)]
 mod tests;
+
+/// Routed expert decode reading raw GGUF `block_q4_K` (gate/up) and
+/// `block_q4_K` or `block_q6_K` (down) bytes directly from `uint8` buffers.
+/// Returns `Ok(None)` when Metal is unavailable or the arguments are unsupported.
+#[allow(clippy::too_many_arguments)]
+pub fn gguf_routed_decode(
+    x: &MxArray,
+    slots: &MxArray,
+    weights: &MxArray,
+    gate_buf: &MxArray,
+    gate_off: u64,
+    up_buf: &MxArray,
+    up_off: u64,
+    down_buf: &MxArray,
+    down_off: u64,
+    n_experts: usize,
+    m: usize,
+    h: usize,
+    down_bits: i32,
+    limit: f32,
+) -> Result<Option<MxArray>> {
+    let (Ok(n_experts_i32), Ok(m_i32), Ok(h_i32)) =
+        (i32::try_from(n_experts), i32::try_from(m), i32::try_from(h))
+    else {
+        return Ok(None);
+    };
+    let xf = as_f32(x)?;
+    let wf = as_f32(weights)?;
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_gguf_routed_decode(
+            xf.as_raw_ptr(),
+            slots.as_raw_ptr(),
+            wf.as_raw_ptr(),
+            gate_buf.as_raw_ptr(),
+            gate_off,
+            up_buf.as_raw_ptr(),
+            up_off,
+            down_buf.as_raw_ptr(),
+            down_off,
+            n_experts_i32,
+            m_i32,
+            h_i32,
+            down_bits,
+            limit,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash gguf_routed_decode",
+    )?))
+}
+
+/// Routed expert prefill gate+up+asymmetric-SwiGLU reading raw GGUF `block_q4_K`
+/// directly via NAX TF32 MMA. Returns `Ok(None)` when NAX/Metal is unavailable
+/// or disabled (`MLX_HY4_PREFILL_NAX=0`).
+#[allow(clippy::too_many_arguments)]
+pub fn gguf_prefill_indirect_gu(
+    x: &MxArray,
+    token_rows: &MxArray,
+    tiles: &MxArray,
+    gate_buf: &MxArray,
+    gate_off: u64,
+    up_buf: &MxArray,
+    up_off: u64,
+    n_experts: usize,
+    m: usize,
+    limit: f32,
+) -> Result<Option<MxArray>> {
+    let (Ok(n_experts_i32), Ok(m_i32)) = (i32::try_from(n_experts), i32::try_from(m)) else {
+        return Ok(None);
+    };
+    let xf = as_f32(x)?;
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_gguf_prefill_indirect_gu(
+            xf.as_raw_ptr(),
+            token_rows.as_raw_ptr(),
+            tiles.as_raw_ptr(),
+            gate_buf.as_raw_ptr(),
+            gate_off,
+            up_buf.as_raw_ptr(),
+            up_off,
+            n_experts_i32,
+            m_i32,
+            limit,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash gguf_prefill_indirect_gu",
+    )?))
+}
+
+/// Routed expert prefill down projection reading raw GGUF `block_q4_K` or
+/// `block_q6_K` directly via NAX TF32 MMA. Returns `Ok(None)` when NAX/Metal
+/// is unavailable or disabled (`MLX_HY4_PREFILL_NAX=0`).
+#[allow(clippy::too_many_arguments)]
+pub fn gguf_prefill_indirect_down(
+    hidden: &MxArray,
+    tiles: &MxArray,
+    down_buf: &MxArray,
+    down_off: u64,
+    n_experts: usize,
+    h: usize,
+    down_bits: i32,
+) -> Result<Option<MxArray>> {
+    let (Ok(n_experts_i32), Ok(h_i32)) = (i32::try_from(n_experts), i32::try_from(h)) else {
+        return Ok(None);
+    };
+    let hf = as_f32(hidden)?;
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_gguf_prefill_indirect_down(
+            hf.as_raw_ptr(),
+            tiles.as_raw_ptr(),
+            down_buf.as_raw_ptr(),
+            down_off,
+            n_experts_i32,
+            h_i32,
+            down_bits,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash gguf_prefill_indirect_down",
+    )?))
+}

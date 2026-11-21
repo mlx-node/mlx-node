@@ -1509,6 +1509,139 @@ fn promote_to_direct_restores_partial_bank_on_alloc_failure() {
     bank.end_turn().unwrap();
 }
 
+/// Aligned version of `bank_fixture` (32-byte aligned offsets like GGUF).
+fn aligned_bank_fixture() -> (Temp, PathBuf, MoeConfig, Vec<Option<ExpertLayer>>, Vec<u8>) {
+    let m = moe(6, 256, 256);
+    let mut experts = vec![None];
+    let mut at = 1024u64;
+    for (il, class) in [
+        (1, ExpertClass::Q6kDown),
+        (2, ExpertClass::Q4kDown),
+        (3, ExpertClass::Q6kDown),
+    ] {
+        let (l, end) = layer(&m, il, class, at);
+        experts.push(Some(l));
+        at = end.div_ceil(32) * 32;
+    }
+    let file = random_bytes(at as usize, 19);
+    let dir = Temp::new();
+    let path = dir.file(&file);
+    (dir, path, m, experts, file)
+}
+
+#[test]
+fn mmap_bank_maps_views_reports_zero_anon_and_toggles_in_turn() {
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let (_dir, path, m, experts, file) = aligned_bank_fixture();
+    let expected_mapped: u64 = experts
+        .iter()
+        .flatten()
+        .map(|l| file_bytes(&m, l.class).unwrap() * m.n_experts as u64)
+        .sum();
+    let bank = KqBank::new_mmap(
+        pool_over(&path, 2),
+        &m,
+        &experts,
+        std::slice::from_ref(&path),
+        file.len() as u64,
+    )
+    .unwrap();
+
+    assert!(bank.is_direct());
+    assert!(bank.is_mmap());
+    assert_eq!(bank.nbytes(), 0);
+    assert_eq!(bank.resident_bytes().unwrap(), 0);
+    assert_eq!(
+        bank.residency().unwrap(),
+        Residency {
+            resident: 0,
+            volatile: 0,
+        }
+    );
+    assert_eq!(bank.mapped_bytes(), expected_mapped);
+    assert_eq!(bank.staging_layers(), 0);
+    assert_eq!(bank.cache_slots(), [2 * m.n_experts, m.n_experts]);
+    assert!(bank.direct_fill_complete());
+    bank.wait_direct_fill().unwrap();
+    assert!(bank.direct_layer_arrays(0).is_err());
+    assert!(bank.direct_layer(1).is_err());
+    assert!(bank.rebuild([0, 0], 1).is_err());
+    assert!(bank.prepare(1, &[0], &[], true).is_err());
+    bank.promote_to_direct().unwrap();
+    assert!(bank.is_mmap());
+
+    assert!(!bank.in_turn());
+    assert!(!bank.begin_turn().unwrap());
+    assert!(bank.in_turn());
+    bank.set_in_turn(false);
+    assert!(!bank.in_turn());
+    bank.set_in_turn(true);
+    assert!(bank.in_turn());
+    bank.end_turn().unwrap();
+    assert!(!bank.in_turn());
+
+    for il in [1usize, 2, 3] {
+        let l = experts[il].as_ref().unwrap();
+        let geo = geometry(&m, l.class).unwrap();
+        let Some(DirectLayerArrays::Mmap(projs)) = bank.direct_layer_arrays(il).unwrap() else {
+            panic!("expected Mmap layer arrays for layer {il}");
+        };
+        for (p, g) in projs.iter().zip(&geo) {
+            assert_eq!((p.format, p.rows, p.k), (g.format, g.rows, g.k));
+            assert_eq!(p.buf.dtype().unwrap(), DType::Uint8);
+            assert_eq!(p.buf.ndim().unwrap(), 2);
+        }
+    }
+    bank.record_direct_use(2, 3);
+    let st = bank.stats();
+    assert_eq!(st[0].uses, 2 * m.n_used);
+    assert_eq!(st[0].hits, st[0].uses);
+    assert_eq!(st[1].uses, m.n_used + 3);
+    assert_eq!(st[1].hits, st[1].uses);
+    assert_eq!(st[0].slots, 0);
+    assert_eq!(st[1].slots, 0);
+    drop(bank);
+}
+
+#[test]
+fn mmap_bank_rejects_misaligned_or_truncated_shard_cleanly() {
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let (_dir, path, m, mut experts, _file) = aligned_bank_fixture();
+    // Odd offset violates 4-byte Q4_K alignment.
+    experts[1].as_mut().unwrap().gate.data_offset += 1;
+    let err = KqBank::new_mmap(
+        pool_over(&path, 2),
+        &m,
+        &experts,
+        std::slice::from_ref(&path),
+        0,
+    );
+    assert!(err.is_err());
+
+    // Truncated file fails cleanly without leaking mappings.
+    let (_dir2, path2, m2, experts2, _file2) = aligned_bank_fixture();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path2)
+        .unwrap()
+        .set_len(2048)
+        .unwrap();
+    let err = KqBank::new_mmap(
+        pool_over(&path2, 2),
+        &m2,
+        &experts2,
+        std::slice::from_ref(&path2),
+        0,
+    );
+    assert!(err.is_err());
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

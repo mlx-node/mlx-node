@@ -22,12 +22,13 @@
 //! them `NonVolatile` again and, when Metal emptied a class's banks, forgets
 //! that class's tags and cache entries before a gather can read the slots.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use napi::{Error, Result};
 
@@ -851,6 +852,23 @@ pub struct ProjArrays {
     pub s: MxArray,
     pub b: MxArray,
     pub format: KQuantFormat,
+}
+
+/// One projection mapped read-only directly from a GGUF shard.
+#[derive(Clone)]
+pub struct MmapProj {
+    pub buf: MxArray,
+    pub base_offset: u64,
+    pub format: KQuantFormat,
+    pub rows: usize,
+    pub k: usize,
+}
+
+/// Resident per-layer expert weights served without staging or cache lookup.
+#[derive(Clone)]
+pub enum DirectLayerArrays {
+    Repacked([ProjArrays; 3]),
+    Mmap([MmapProj; 3]),
 }
 
 impl ProjArrays {
@@ -1677,10 +1695,447 @@ fn build_direct_bank(
     })
 }
 
+const MMAP_PREWARM_CHUNK: usize = 4 << 20;
+const MMAP_PREWARM_MERGE_GAP: u64 = 4096;
+
+#[cfg(unix)]
+struct MmapShard {
+    _file: std::fs::File,
+    ptr: *mut u8,
+    len: usize,
+    mapped_len: usize,
+    file_len: u64,
+}
+
+#[cfg(unix)]
+// SAFETY: the mapping is `PROT_READ` and immutable for its lifetime; `munmap`
+// runs only after the last `Arc<MmapShard>` (including all MLX buffers) drops.
+unsafe impl Send for MmapShard {}
+#[cfg(unix)]
+unsafe impl Sync for MmapShard {}
+
+#[cfg(unix)]
+impl MmapShard {
+    fn open(path: &std::path::Path, page: usize) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| bad(format!("open '{}' for mmap: {e}", path.display())))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| bad(format!("stat '{}' for mmap: {e}", path.display())))?
+            .len();
+        if file_len == 0 {
+            return Err(bad(format!("cannot mmap empty shard '{}'", path.display())));
+        }
+        let len = usize::try_from(file_len)
+            .map_err(|_| bad(format!("shard '{}' length overflows usize", path.display())))?;
+        let mapped_len = len
+            .checked_add(page - 1)
+            .map(|n| n & !(page - 1))
+            .ok_or_else(|| {
+                bad(format!(
+                    "shard '{}' mapped length overflows",
+                    path.display()
+                ))
+            })?;
+        // SAFETY: `file` is an open read-only descriptor with positive `len`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(bad(format!(
+                "mmap '{}' ({file_len} bytes): {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self {
+            _file: file,
+            ptr: ptr.cast::<u8>(),
+            len,
+            mapped_len,
+            file_len,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MmapShard {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` and `self.len` come from a successful `mmap` and
+        // every MLX view holding an `Arc<MmapShard>` has already dropped.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn release_mmap_shard(ctx: *mut std::ffi::c_void) {
+    // SAFETY: `ctx` was produced by `Arc::into_raw` for `MmapShard` when
+    // creating the MLX buffer; MLX invokes the deleter exactly once.
+    unsafe {
+        Arc::decrement_strong_count(ctx.cast::<MmapShard>());
+    }
+}
+
+#[cfg(not(unix))]
+struct MmapShard;
+
+#[cfg(unix)]
+fn os_page_size() -> Result<usize> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = usize::try_from(raw).unwrap_or(0);
+    if page == 0 || !page.is_power_of_two() {
+        return Err(bad(format!("invalid OS page size {raw}")));
+    }
+    Ok(page)
+}
+
+#[cfg(target_os = "macos")]
+fn set_background_io_qos() {
+    const QOS_CLASS_BACKGROUND: libc::c_uint = 0x09;
+    const IOPOL_TYPE_DISK: libc::c_int = 0;
+    const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+    const IOPOL_THROTTLE: libc::c_int = 3;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(
+            qos_class: libc::c_uint,
+            relative_priority: libc::c_int,
+        ) -> libc::c_int;
+        fn setiopolicy_np(
+            iotype: libc::c_int,
+            scope: libc::c_int,
+            policy: libc::c_int,
+        ) -> libc::c_int;
+    }
+    // SAFETY: best-effort QoS/IO-priority hints affecting only the current thread.
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+        let _ = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_background_io_qos() {}
+
+struct MmapWarmHandle {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for MmapWarmHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_mmap_prewarm(
+    spans: Vec<(PathBuf, u64, u64)>,
+    budget: u64,
+    stop: Arc<AtomicBool>,
+    in_turn: Arc<AtomicBool>,
+) {
+    use std::os::unix::fs::FileExt;
+
+    set_background_io_qos();
+    let t0 = Instant::now();
+    let mut buf = vec![0u8; MMAP_PREWARM_CHUNK];
+    let mut remaining = budget;
+    let mut warmed = 0u64;
+    let mut open_path: Option<(PathBuf, std::fs::File)> = None;
+
+    for (path, start, end) in spans {
+        if remaining == 0 || stop.load(Ordering::Acquire) {
+            break;
+        }
+        let reopen = open_path.as_ref().is_none_or(|(p, _)| p != &path);
+        if reopen {
+            match std::fs::File::open(&path) {
+                Ok(f) => open_path = Some((path.clone(), f)),
+                Err(e) => {
+                    tracing::warn!("hy_v4_flash mmap prewarm open '{}': {e}", path.display());
+                    continue;
+                }
+            }
+        }
+        let Some((_, file)) = open_path.as_ref() else {
+            continue;
+        };
+        let mut off = start;
+        while off < end && remaining > 0 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            while in_turn.load(Ordering::Acquire) {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let want = (end - off).min(remaining).min(buf.len() as u64) as usize;
+            match file.read_at(&mut buf[..want], off) {
+                Ok(0) => break,
+                Ok(n) => {
+                    off += n as u64;
+                    warmed += n as u64;
+                    remaining = remaining.saturating_sub(n as u64);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::warn!("hy_v4_flash mmap prewarm read '{}': {e}", path.display());
+                    return;
+                }
+            }
+        }
+    }
+    if warmed > 0 {
+        tracing::info!(
+            "hy_v4_flash mmap prewarm warmed {:.2} GiB in {:.2} s",
+            warmed as f64 / (1u64 << 30) as f64,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}
+
+struct MmapLayer {
+    ci: usize,
+    projs: [MmapProj; 3],
+}
+
+struct MmapExpertBank {
+    // Declared before `_shards` and `layers` so Drop stops and joins the
+    // pre-warmer thread before any mapped view or shard is released.
+    _warm: Option<MmapWarmHandle>,
+    _shards: Vec<Arc<MmapShard>>,
+    layers: Vec<MmapLayer>,
+    layer_to_idx: Vec<Option<usize>>,
+    uses: [AtomicUsize; 2],
+    slot_bytes: [u64; 2],
+    cache_slots: [usize; 2],
+    mapped_bytes: u64,
+    in_turn: Arc<AtomicBool>,
+}
+
+impl MmapExpertBank {
+    #[cfg(unix)]
+    fn new(
+        n_experts: usize,
+        layout: &ClassLayout,
+        geos: &[[ProjGeo; 3]; 2],
+        experts: &[Option<ExpertLayer>],
+        paths: &[PathBuf],
+        warm_budget_bytes: u64,
+    ) -> Result<Self> {
+        if n_experts == 0 || u32::try_from(n_experts).is_err() {
+            return Err(bad(format!("invalid mmap expert count {n_experts}")));
+        }
+        let page = os_page_size()?;
+        let page_u64 = page as u64;
+        let slot_bytes = [
+            geos[0].iter().map(ProjGeo::file_bytes).sum(),
+            geos[1].iter().map(ProjGeo::file_bytes).sum(),
+        ];
+        let cache_slots = [
+            layout.layers[0].len() * n_experts,
+            layout.layers[1].len() * n_experts,
+        ];
+        let n_moe_layers = layout.layers[0].len() + layout.layers[1].len();
+        let mut shards: Vec<Arc<MmapShard>> = Vec::new();
+        let mut shard_map: HashMap<usize, usize> = HashMap::new();
+        let mut layers = Vec::with_capacity(n_moe_layers);
+        let mut layer_to_idx = vec![None; layout.of_layer.len()];
+        let mut raw_spans: Vec<(usize, u64, u64)> = Vec::with_capacity(n_moe_layers * 3);
+        let mut mapped_bytes = 0u64;
+
+        for (il, opt) in layout.of_layer.iter().enumerate() {
+            let Some((ci, _)) = *opt else {
+                continue;
+            };
+            let class = CLASSES[ci];
+            let geo = &geos[ci];
+            let exp = experts[il]
+                .as_ref()
+                .ok_or_else(|| bad(format!("layer {il} has no experts")))?;
+            let tensors = check_layer(il, exp, class, geo, n_experts)?;
+            let mut projs_vec = Vec::with_capacity(3);
+            for (loc, g) in tensors.iter().zip(geo) {
+                let shard_slot = match shard_map.get(&loc.shard) {
+                    Some(&idx) => idx,
+                    None => {
+                        let path = paths
+                            .get(loc.shard)
+                            .ok_or_else(|| bad(format!("shard {} path missing", loc.shard)))?;
+                        let opened = Arc::new(MmapShard::open(path, page)?);
+                        let idx = shards.len();
+                        shards.push(opened);
+                        shard_map.insert(loc.shard, idx);
+                        idx
+                    }
+                };
+                let shard = &shards[shard_slot];
+                let abs_off = loc.abs_offset()?;
+                let tensor_bytes = loc.info.data_size()?;
+                let end_off = abs_off
+                    .checked_add(tensor_bytes)
+                    .ok_or_else(|| bad(format!("'{}' end offset overflows", loc.info.name)))?;
+                if end_off > shard.file_len {
+                    return Err(bad(format!(
+                        "'{}' ends at {end_off}, past shard length {}",
+                        loc.info.name, shard.file_len
+                    )));
+                }
+                let aligned_off = abs_off & !(page_u64 - 1);
+                let intra_off = abs_off - aligned_off;
+                let min_align = match g.format {
+                    KQuantFormat::Q6K => 2u64,
+                    _ => 4u64,
+                };
+                if !intra_off.is_multiple_of(min_align) {
+                    return Err(bad(format!(
+                        "'{}' offset {abs_off} is not {min_align}-byte aligned for {:?}",
+                        loc.info.name, g.format
+                    )));
+                }
+                let aligned_len_u64 = intra_off
+                    .checked_add(tensor_bytes)
+                    .and_then(|n| n.checked_add(page_u64 - 1))
+                    .map(|n| n & !(page_u64 - 1))
+                    .ok_or_else(|| bad(format!("'{}' aligned length overflows", loc.info.name)))?;
+                let aligned_end = aligned_off
+                    .checked_add(aligned_len_u64)
+                    .ok_or_else(|| bad(format!("'{}' aligned end overflows", loc.info.name)))?;
+                if aligned_end > shard.mapped_len as u64 {
+                    return Err(bad(format!(
+                        "'{}' aligned range ends at {aligned_end}, past mapping {}",
+                        loc.info.name, shard.mapped_len
+                    )));
+                }
+                let aligned_off_usize = usize::try_from(aligned_off)
+                    .map_err(|_| bad(format!("'{}' offset overflows usize", loc.info.name)))?;
+                let aligned_len = usize::try_from(aligned_len_u64)
+                    .map_err(|_| bad(format!("'{}' length overflows usize", loc.info.name)))?;
+                // SAFETY: `aligned_off + aligned_len <= shard.mapped_len`.
+                let aligned_ptr = unsafe { shard.ptr.add(aligned_off_usize) };
+                let raw_ctx = Arc::into_raw(Arc::clone(shard)) as *mut std::ffi::c_void;
+                // SAFETY: `shard` owns a read-only `MAP_SHARED` mapping that stays
+                // alive until `release_mmap_shard` decrements the refcount passed in
+                // `raw_ctx`; on `Err`, `from_mmap_readonly` never calls `release_fn`.
+                let buf = match unsafe {
+                    MxArray::from_mmap_readonly(
+                        aligned_ptr.cast(),
+                        aligned_len,
+                        release_mmap_shard,
+                        raw_ctx,
+                    )
+                } {
+                    Ok(arr) => arr,
+                    Err(err) => {
+                        // SAFETY: `raw_ctx` ownership was not taken on `Err`.
+                        unsafe { drop(Arc::from_raw(raw_ctx.cast::<MmapShard>())) };
+                        return Err(err);
+                    }
+                };
+                mapped_bytes = mapped_bytes
+                    .checked_add(tensor_bytes)
+                    .ok_or_else(|| bad("mmap expert bytes overflow u64"))?;
+                raw_spans.push((loc.shard, abs_off, end_off));
+                projs_vec.push(MmapProj {
+                    buf,
+                    base_offset: intra_off,
+                    format: g.format,
+                    rows: g.rows,
+                    k: g.k,
+                });
+            }
+            let projs: [MmapProj; 3] = projs_vec
+                .try_into()
+                .map_err(|_| bad("expected 3 mmap expert projections"))?;
+            let idx = layers.len();
+            layer_to_idx[il] = Some(idx);
+            layers.push(MmapLayer { ci, projs });
+        }
+
+        let in_turn = Arc::new(AtomicBool::new(false));
+        let warm = if warm_budget_bytes > 0 && !raw_spans.is_empty() {
+            raw_spans.sort_unstable_by_key(|&(s, start, _)| (s, start));
+            let mut merged: Vec<(PathBuf, u64, u64)> = Vec::new();
+            for (s, start, end) in raw_spans {
+                let path = &paths[s];
+                if let Some((prev_p, _, prev_end)) = merged.last_mut()
+                    && prev_p == path
+                    && start <= prev_end.saturating_add(MMAP_PREWARM_MERGE_GAP)
+                {
+                    *prev_end = (*prev_end).max(end);
+                } else {
+                    merged.push((path.clone(), start, end));
+                }
+            }
+            let budget = warm_budget_bytes.min(mapped_bytes);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_c = Arc::clone(&stop);
+            let turn_c = Arc::clone(&in_turn);
+            let worker = std::thread::Builder::new()
+                .name("hy4-mmap-prewarm".into())
+                .spawn(move || run_mmap_prewarm(merged, budget, stop_c, turn_c))
+                .map_err(|e| bad(format!("spawn mmap prewarm thread: {e}")))?;
+            Some(MmapWarmHandle {
+                stop,
+                worker: Some(worker),
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            _warm: warm,
+            _shards: shards,
+            layers,
+            layer_to_idx,
+            uses: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            slot_bytes,
+            cache_slots,
+            mapped_bytes,
+            in_turn,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn new(
+        _n_experts: usize,
+        _layout: &ClassLayout,
+        _geos: &[[ProjGeo; 3]; 2],
+        _experts: &[Option<ExpertLayer>],
+        _paths: &[PathBuf],
+        _warm_budget_bytes: u64,
+    ) -> Result<Self> {
+        Err(bad("mmap expert bank requires Unix"))
+    }
+}
+
+enum ResidentBank {
+    Direct(DirectBank),
+    Mmap(MmapExpertBank),
+}
+
 pub struct KqBank {
-    // Declared before `inner` and `pool` so direct fill and streamed in-flight
-    // reads finish before `pool` shuts down and before any PurgeableBank frees.
-    direct: OnceLock<DirectBank>,
+    // Declared before `inner` and `pool` so direct fill, mmap pre-warm, and
+    // streamed in-flight reads finish before `pool` shuts down and before any
+    // PurgeableBank or mmap shard frees.
+    direct: OnceLock<ResidentBank>,
     inner: Mutex<Inner>,
     pool: Arc<IoPool>,
     n_experts: usize,
@@ -1786,7 +2241,7 @@ impl KqBank {
             true,
         )?;
         Ok(Self {
-            direct: OnceLock::from(direct),
+            direct: OnceLock::from(ResidentBank::Direct(direct)),
             inner: Mutex::new(Inner {
                 ahead: [Vec::new(), Vec::new()],
                 inflight: Vec::new(),
@@ -1796,6 +2251,46 @@ impl KqBank {
                 retired: Vec::new(),
             }),
             pool,
+            n_experts: n,
+            n_used: moe.n_used,
+            layout,
+            split: AtomicBool::new(true),
+            prefetch: AtomicBool::new(true),
+            decode_prefetch: AtomicBool::new(decode_prefetch_enabled()),
+            stats: Mutex::new([KqStats::default(); 2]),
+        })
+    }
+
+    /// Zero-copy read-only mmap expert bank: maps each shard once and wraps
+    /// every trunk expert tensor as a page-aligned Metal buffer with 0 B
+    /// anonymous RAM. When `warm_budget_bytes > 0`, spawns a low-priority
+    /// background pre-warmer that pauses during active turns.
+    pub fn new_mmap(
+        pool: IoPool,
+        moe: &MoeConfig,
+        experts: &[Option<ExpertLayer>],
+        paths: &[PathBuf],
+        warm_budget_bytes: u64,
+    ) -> Result<Self> {
+        let n = moe.n_experts;
+        let classes: Vec<Option<ExpertClass>> = experts
+            .iter()
+            .map(|l| l.as_ref().map(|l| l.class))
+            .collect();
+        let layout = ClassLayout::new(&classes)?;
+        let geos = [geometry(moe, CLASSES[0])?, geometry(moe, CLASSES[1])?];
+        let mmap = MmapExpertBank::new(n, &layout, &geos, experts, paths, warm_budget_bytes)?;
+        Ok(Self {
+            direct: OnceLock::from(ResidentBank::Mmap(mmap)),
+            inner: Mutex::new(Inner {
+                ahead: [Vec::new(), Vec::new()],
+                inflight: Vec::new(),
+                ahead_left: [Vec::new(), Vec::new()],
+                classes: Vec::new(),
+                in_turn: false,
+                retired: Vec::new(),
+            }),
+            pool: Arc::new(pool),
             n_experts: n,
             n_used: moe.n_used,
             layout,
@@ -1862,7 +2357,7 @@ impl KqBank {
         );
         match built {
             Ok(direct) => {
-                if self.direct.set(direct).is_err() {
+                if self.direct.set(ResidentBank::Direct(direct)).is_err() {
                     return Err(bad("direct bank already installed"));
                 }
                 inner.classes.clear();
@@ -1905,28 +2400,108 @@ impl KqBank {
         self.direct.get().is_some()
     }
 
-    /// In direct mode, waits until `layer` has finished filling and returns its
-    /// `[ProjArrays; 3]` (`slot_id == expert_id`) without taking the bank lock.
+    pub fn is_mmap(&self) -> bool {
+        matches!(self.direct.get(), Some(ResidentBank::Mmap(_)))
+    }
+
+    pub fn mapped_bytes(&self) -> u64 {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => m.mapped_bytes,
+            _ => 0,
+        }
+    }
+
+    /// Records `count` routed-expert uses for `layer` in direct or mmap mode.
+    pub fn record_direct_use(&self, layer: usize, count: usize) {
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => {
+                if let Some(idx) = d.layer_to_idx.get(layer).copied().flatten() {
+                    d.uses[d.layers[idx].ci].fetch_add(count, Ordering::Relaxed);
+                }
+            }
+            Some(ResidentBank::Mmap(m)) => {
+                if let Some(idx) = m.layer_to_idx.get(layer).copied().flatten() {
+                    m.uses[m.layers[idx].ci].fetch_add(count, Ordering::Relaxed);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// In direct or mmap mode, returns `layer`'s resident expert views
+    /// (`slot_id == expert_id`) without taking the bank lock.
     /// Returns `Ok(None)` in streamed mode.
-    pub fn direct_layer(&self, layer: usize) -> Result<Option<[ProjArrays; 3]>> {
-        let Some(direct) = self.direct.get() else {
+    pub fn direct_layer_arrays(&self, layer: usize) -> Result<Option<DirectLayerArrays>> {
+        match self.direct.get() {
+            None => Ok(None),
+            Some(ResidentBank::Direct(direct)) => {
+                let dl = direct.wait_layer(layer)?;
+                direct.uses[dl.ci].fetch_add(self.n_used, Ordering::Relaxed);
+                Ok(Some(DirectLayerArrays::Repacked(dl.arrays.clone())))
+            }
+            Some(ResidentBank::Mmap(mmap)) => {
+                let idx = mmap
+                    .layer_to_idx
+                    .get(layer)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| bad(format!("layer {layer} has no mmap experts")))?;
+                let ml = &mmap.layers[idx];
+                mmap.uses[ml.ci].fetch_add(self.n_used, Ordering::Relaxed);
+                Ok(Some(DirectLayerArrays::Mmap(ml.projs.clone())))
+            }
+        }
+    }
+
+    /// In mmap mode, returns `layer`'s `[MmapProj; 3]` and records `uses`
+    /// distinct expert uses. Returns `Ok(None)` when not in mmap mode.
+    pub(crate) fn mmap_layer(&self, layer: usize, uses: usize) -> Result<Option<[MmapProj; 3]>> {
+        let Some(ResidentBank::Mmap(mmap)) = self.direct.get() else {
             return Ok(None);
         };
-        let dl = direct.wait_layer(layer)?;
-        direct.uses[dl.ci].fetch_add(self.n_used, Ordering::Relaxed);
-        Ok(Some(dl.arrays.clone()))
+        let idx = mmap
+            .layer_to_idx
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| bad(format!("layer {layer} has no mmap experts")))?;
+        let ml = &mmap.layers[idx];
+        mmap.uses[ml.ci].fetch_add(uses, Ordering::Relaxed);
+        Ok(Some(ml.projs.clone()))
+    }
+
+    /// In repacked direct mode, waits until `layer` has finished filling and
+    /// returns its `[ProjArrays; 3]` (`slot_id == expert_id`) without taking
+    /// the bank lock. Returns `Ok(None)` in streamed mode.
+    pub fn direct_layer(&self, layer: usize) -> Result<Option<[ProjArrays; 3]>> {
+        match self.direct.get() {
+            None => Ok(None),
+            Some(ResidentBank::Direct(direct)) => {
+                let dl = direct.wait_layer(layer)?;
+                direct.uses[dl.ci].fetch_add(self.n_used, Ordering::Relaxed);
+                Ok(Some(dl.arrays.clone()))
+            }
+            Some(ResidentBank::Mmap(_)) => Err(bad(format!(
+                "layer {layer}: mmap bank uses raw GGUF buffers, not repacked ProjArrays"
+            ))),
+        }
     }
 
     /// Whether the background direct fill has populated every MoE layer.
     pub fn direct_fill_complete(&self) -> bool {
-        self.direct.get().is_some_and(DirectBank::fill_complete)
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => d.fill_complete(),
+            Some(ResidentBank::Mmap(_)) => true,
+            None => false,
+        }
     }
 
-    /// Blocks until the background direct fill finishes all layers (no-op in streamed mode).
+    /// Blocks until the background direct fill finishes all layers (no-op in
+    /// mmap or streamed mode).
     pub fn wait_direct_fill(&self) -> Result<()> {
         match self.direct.get() {
-            Some(direct) => direct.wait_all(),
-            None => Ok(()),
+            Some(ResidentBank::Direct(direct)) => direct.wait_all(),
+            Some(ResidentBank::Mmap(_)) | None => Ok(()),
         }
     }
 
@@ -1983,8 +2558,10 @@ impl KqBank {
     }
 
     pub fn cache_slots(&self) -> [usize; 2] {
-        if let Some(direct) = self.direct.get() {
-            return direct.cache_slots;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => return d.cache_slots,
+            Some(ResidentBank::Mmap(m)) => return m.cache_slots,
+            None => {}
         }
         let g = lock(&self.inner);
         [
@@ -2002,24 +2579,30 @@ impl KqBank {
 
     /// Per class: bank bytes of one expert.
     pub fn slot_bytes(&self) -> [u64; 2] {
-        if let Some(direct) = self.direct.get() {
-            return direct.slot_bytes;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => return d.slot_bytes,
+            Some(ResidentBank::Mmap(m)) => return m.slot_bytes,
+            None => {}
         }
         let g = lock(&self.inner);
         let one = |c: &ClassBank| c.geo.iter().map(ProjGeo::slot_bytes).sum();
         [one(&g.classes[0]), one(&g.classes[1])]
     }
 
-    /// Bytes of every bank.
+    /// Anonymous bank bytes held in RAM (0 for mmap clean file-backed pages).
     pub fn nbytes(&self) -> u64 {
-        if let Some(direct) = self.direct.get() {
-            return direct
-                .layers
-                .iter()
-                .flat_map(|l| &l.proj)
-                .flat_map(ProjBank::banks)
-                .map(|b| b.nbytes() as u64)
-                .sum();
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                return direct
+                    .layers
+                    .iter()
+                    .flat_map(|l| &l.proj)
+                    .flat_map(ProjBank::banks)
+                    .map(|b| b.nbytes() as u64)
+                    .sum();
+            }
+            Some(ResidentBank::Mmap(_)) => return 0,
+            None => {}
         }
         lock(&self.inner)
             .classes
@@ -2030,16 +2613,20 @@ impl KqBank {
             .sum()
     }
 
-    /// Bytes of every bank resident in RAM now.
+    /// Anonymous bytes of every bank resident in RAM now (0 for mmap).
     pub fn resident_bytes(&self) -> Result<u64> {
-        if let Some(direct) = self.direct.get() {
-            let mut n = 0;
-            for p in direct.layers.iter().flat_map(|l| &l.proj) {
-                for b in p.banks() {
-                    n += b.resident_bytes()?;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                let mut n = 0;
+                for p in direct.layers.iter().flat_map(|l| &l.proj) {
+                    for b in p.banks() {
+                        n += b.resident_bytes()?;
+                    }
                 }
+                return Ok(n);
             }
-            return Ok(n);
+            Some(ResidentBank::Mmap(_)) => return Ok(0),
+            None => {}
         }
         let g = lock(&self.inner);
         let mut n = 0;
@@ -2054,20 +2641,25 @@ impl KqBank {
     /// Bytes of every bank resident in RAM now, and of those the bytes of
     /// banks the kernel holds volatile or empty, which the host counts
     /// purgeable. Without a kernel reading a bank is volatile outside a
-    /// turn.
+    /// turn. Always `{0, 0}` for mmap because clean file-backed pages are
+    /// excluded from `HostMemory::non_reclaimable()`.
     pub fn residency(&self) -> Result<Residency> {
-        if let Some(direct) = self.direct.get() {
-            let mut r = Residency::default();
-            for p in direct.layers.iter().flat_map(|l| &l.proj) {
-                for b in p.banks() {
-                    let n = b.resident_bytes()?;
-                    r.resident += n;
-                    if kernel_volatile(b).unwrap_or(false) {
-                        r.volatile += n;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                let mut r = Residency::default();
+                for p in direct.layers.iter().flat_map(|l| &l.proj) {
+                    for b in p.banks() {
+                        let n = b.resident_bytes()?;
+                        r.resident += n;
+                        if kernel_volatile(b).unwrap_or(false) {
+                            r.volatile += n;
+                        }
                     }
                 }
+                return Ok(r);
             }
-            return Ok(r);
+            Some(ResidentBank::Mmap(_)) => return Ok(Residency::default()),
+            None => {}
         }
         let g = lock(&self.inner);
         let mut r = Residency::default();
@@ -2086,9 +2678,13 @@ impl KqBank {
     /// Writes zeros over every bank so each of its pages is resident.
     #[cfg(test)]
     pub(crate) fn touch(&self) {
-        if let Some(direct) = self.direct.get() {
-            let _ = direct.wait_all();
-            return;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                let _ = direct.wait_all();
+                return;
+            }
+            Some(ResidentBank::Mmap(_)) => return,
+            None => {}
         }
         let g = lock(&self.inner);
         for b in g
@@ -2105,9 +2701,14 @@ impl KqBank {
     /// Per class index.
     pub fn stats(&self) -> [KqStats; 2] {
         let mut out = *lock(&self.stats);
-        if let Some(direct) = self.direct.get() {
+        let uses = match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => Some(&d.uses),
+            Some(ResidentBank::Mmap(m)) => Some(&m.uses),
+            None => None,
+        };
+        if let Some(uses) = uses {
             for (ci, s) in out.iter_mut().enumerate() {
-                let u = direct.uses[ci].load(Ordering::Relaxed);
+                let u = uses[ci].load(Ordering::Relaxed);
                 s.uses += u;
                 s.hits += u;
             }
@@ -2136,18 +2737,35 @@ impl KqBank {
     }
 
     pub fn in_turn(&self) -> bool {
-        if let Some(direct) = self.direct.get() {
-            return direct.in_turn.load(Ordering::Acquire);
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => d.in_turn.load(Ordering::Acquire),
+            Some(ResidentBank::Mmap(m)) => m.in_turn.load(Ordering::Acquire),
+            None => lock(&self.inner).in_turn,
         }
-        lock(&self.inner).in_turn
+    }
+
+    /// Updates the in-turn flag directly (pauses/resumes background mmap pre-warm).
+    pub fn set_in_turn(&self, active: bool) {
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => d.in_turn.store(active, Ordering::Release),
+            Some(ResidentBank::Mmap(m)) => m.in_turn.store(active, Ordering::Release),
+            None => lock(&self.inner).in_turn = active,
+        }
     }
 
     /// Makes the banks `NonVolatile` for a turn. Returns whether Metal had
     /// discarded any of them (that class's tags and cache are forgotten).
     pub fn begin_turn(&self) -> Result<bool> {
-        if let Some(direct) = self.direct.get() {
-            direct.in_turn.store(true, Ordering::Release);
-            return Ok(false);
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                direct.in_turn.store(true, Ordering::Release);
+                return Ok(false);
+            }
+            Some(ResidentBank::Mmap(mmap)) => {
+                mmap.in_turn.store(true, Ordering::Release);
+                return Ok(false);
+            }
+            None => {}
         }
         let mut g = lock(&self.inner);
         if g.in_turn {
@@ -2220,12 +2838,21 @@ impl KqBank {
     /// After the turn's last eval: staging copies served this turn move into
     /// cache slots, then the banks become `Volatile`.
     pub fn end_turn(&self) -> Result<()> {
-        if let Some(direct) = self.direct.get() {
-            if direct.in_turn.swap(false, Ordering::AcqRel) {
-                crate::array::synchronize();
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                if direct.in_turn.swap(false, Ordering::AcqRel) {
+                    crate::array::synchronize();
+                }
+                // Direct banks remain NonVolatile until KqBank drops.
+                return Ok(());
             }
-            // Direct banks remain NonVolatile until KqBank drops.
-            return Ok(());
+            Some(ResidentBank::Mmap(mmap)) => {
+                if mmap.in_turn.swap(false, Ordering::AcqRel) {
+                    crate::array::synchronize();
+                }
+                return Ok(());
+            }
+            None => {}
         }
         let mut g = lock(&self.inner);
         if !g.in_turn {
@@ -2376,21 +3003,27 @@ impl KqBank {
         uses: &[u32],
         decode: bool,
     ) -> Result<(Prepared, Option<Pending<'_>>)> {
-        if let Some(direct) = self.direct.get() {
-            check_direct_step(self.n_experts, experts, uses)?;
-            let dl = direct.wait_layer(layer)?;
-            direct.uses[dl.ci].fetch_add(experts.len(), Ordering::Relaxed);
-            return Ok((
-                Prepared {
-                    layer,
-                    class: dl.class,
-                    experts: experts.to_vec(),
-                    slots: experts.to_vec(),
-                    arrays: dl.arrays.clone(),
-                    reading: Vec::new(),
-                },
-                None,
-            ));
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                check_direct_step(self.n_experts, experts, uses)?;
+                let dl = direct.wait_layer(layer)?;
+                direct.uses[dl.ci].fetch_add(experts.len(), Ordering::Relaxed);
+                return Ok((
+                    Prepared {
+                        layer,
+                        class: dl.class,
+                        experts: experts.to_vec(),
+                        slots: experts.to_vec(),
+                        arrays: dl.arrays.clone(),
+                        reading: Vec::new(),
+                    },
+                    None,
+                ));
+            }
+            Some(ResidentBank::Mmap(_)) => {
+                return Err(bad("mmap expert bank does not support repacked prepare"));
+            }
+            None => {}
         }
         let (ci, local) = self
             .layout
@@ -2527,28 +3160,36 @@ impl KqBank {
         last_use_order: &[u32],
         subgroup_experts: usize,
     ) -> Result<(Prepared, Vec<u32>, PrefillSubgroups<'_>)> {
-        if let Some(direct) = self.direct.get() {
-            check_direct_step(self.n_experts, used, uses)?;
-            let dl = direct.wait_layer(layer)?;
-            direct.uses[dl.ci].fetch_add(used.len(), Ordering::Relaxed);
-            return Ok((
-                Prepared {
-                    layer,
-                    class: dl.class,
-                    experts: used.to_vec(),
-                    slots: used.to_vec(),
-                    arrays: dl.arrays.clone(),
-                    reading: Vec::new(),
-                },
-                used.to_vec(),
-                PrefillSubgroups {
-                    bank: self,
-                    ci: dl.ci,
-                    local: 0,
-                    active: None,
-                    queued: VecDeque::new(),
-                },
-            ));
+        match self.direct.get() {
+            Some(ResidentBank::Direct(direct)) => {
+                check_direct_step(self.n_experts, used, uses)?;
+                let dl = direct.wait_layer(layer)?;
+                direct.uses[dl.ci].fetch_add(used.len(), Ordering::Relaxed);
+                return Ok((
+                    Prepared {
+                        layer,
+                        class: dl.class,
+                        experts: used.to_vec(),
+                        slots: used.to_vec(),
+                        arrays: dl.arrays.clone(),
+                        reading: Vec::new(),
+                    },
+                    used.to_vec(),
+                    PrefillSubgroups {
+                        bank: self,
+                        ci: dl.ci,
+                        local: 0,
+                        active: None,
+                        queued: VecDeque::new(),
+                    },
+                ));
+            }
+            Some(ResidentBank::Mmap(_)) => {
+                return Err(bad(
+                    "mmap expert bank does not support repacked prefill subgroups",
+                ));
+            }
+            None => {}
         }
         let (ci, local) = self
             .layout
@@ -2840,13 +3481,24 @@ impl KqBank {
 
     /// `assert_slots` restricted to `experts`.
     pub fn assert_experts_slots(&self, p: &Prepared, experts: &[u32]) {
-        if let Some(direct) = self.direct.get() {
-            let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
-            assert!(
-                idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
-                "Hy4 expert bank: direct gather of layer {} before fill completed",
-                p.layer
-            );
+        if let Some(resident) = self.direct.get() {
+            match resident {
+                ResidentBank::Direct(direct) => {
+                    let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
+                    assert!(
+                        idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
+                        "Hy4 expert bank: direct gather of layer {} before fill completed",
+                        p.layer
+                    );
+                }
+                ResidentBank::Mmap(mmap) => {
+                    assert!(
+                        mmap.layer_to_idx.get(p.layer).copied().flatten().is_some(),
+                        "Hy4 expert bank: mmap gather of unmapped layer {}",
+                        p.layer
+                    );
+                }
+            }
             let stale = experts.iter().find_map(|&e| {
                 let s = p.slot(e)?;
                 (s != e || e as usize >= self.n_experts).then_some((e, s))
@@ -2880,13 +3532,24 @@ impl KqBank {
     }
 
     fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
-        if let Some(direct) = self.direct.get() {
-            let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
-            assert!(
-                idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
-                "Hy4 expert bank: direct gather of layer {} before fill completed",
-                p.layer
-            );
+        if let Some(resident) = self.direct.get() {
+            match resident {
+                ResidentBank::Direct(direct) => {
+                    let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
+                    assert!(
+                        idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
+                        "Hy4 expert bank: direct gather of layer {} before fill completed",
+                        p.layer
+                    );
+                }
+                ResidentBank::Mmap(mmap) => {
+                    assert!(
+                        mmap.layer_to_idx.get(p.layer).copied().flatten().is_some(),
+                        "Hy4 expert bank: mmap gather of unmapped layer {}",
+                        p.layer
+                    );
+                }
+            }
             let stale = p
                 .experts
                 .iter()
