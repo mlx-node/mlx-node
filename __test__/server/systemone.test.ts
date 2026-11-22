@@ -1,4 +1,5 @@
 import {
+  Agent,
   createServer,
   request as httpRequest,
   type IncomingMessage,
@@ -458,6 +459,77 @@ describe('Clairic System One', () => {
       error: { message: 'Request body too large' },
     });
     expect(native.extractRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes keep-alive connections after oversized bodies on /v1/responses, /v1/messages, and /v1/messages/count_tokens', async () => {
+    const registry = new ModelRegistry();
+    const base = await start(registry);
+    const elevenMiB = JSON.stringify({ data: 'x'.repeat(11 * 1024 * 1024) });
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      for (const route of ['/v1/responses', '/v1/messages', '/v1/messages/count_tokens']) {
+        const rejected = await new Promise<{ status: number; connection: string | undefined; body: unknown }>(
+          (resolve, reject) => {
+            let settled = false;
+            const req = httpRequest(
+              `${base}${route}`,
+              {
+                method: 'POST',
+                agent,
+                headers: { 'Content-Length': Buffer.byteLength(elevenMiB) },
+              },
+              (res) => {
+                let text = '';
+                res.on('data', (chunk) => {
+                  text += chunk;
+                });
+                res.on('error', (err) => {
+                  if (!settled) {
+                    settled = true;
+                    reject(err);
+                  }
+                });
+                res.on('end', () => {
+                  if (!settled) {
+                    settled = true;
+                    resolve({
+                      status: res.statusCode ?? 0,
+                      connection: res.headers.connection,
+                      body: JSON.parse(text),
+                    });
+                  }
+                });
+              },
+            );
+            req.on('error', (err: NodeJS.ErrnoException) => {
+              if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return;
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
+            });
+            req.end(elevenMiB);
+          },
+        );
+        expect(rejected.status).toBe(400);
+        expect(rejected.connection).toBe('close');
+        expect(rejected.body).toMatchObject({ error: { message: 'Request body too large' } });
+
+        // Follow-up request through the same keep-alive agent must not hang on unread body bytes.
+        const followup = await new Promise<number>((resolve, reject) => {
+          const req = httpRequest(`${base}/health`, { method: 'GET', agent }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          });
+          req.on('error', reject);
+          req.setTimeout(2000, () => req.destroy(new Error(`follow-up request hung after ${route}`)));
+          req.end();
+        });
+        expect(followup).toBe(200);
+      }
+    } finally {
+      agent.destroy();
+    }
   });
 
   it('includes resident decision models in registry.listResidentModels()', () => {

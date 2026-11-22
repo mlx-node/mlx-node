@@ -62,7 +62,7 @@ export function requestPathname(req: IncomingMessage): string {
   }
 }
 
-function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
+function readBody(req: IncomingMessage, res: ServerResponse, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
@@ -76,6 +76,9 @@ function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Prom
       if (totalBytes > maxBytes) {
         cleanup();
         req.pause();
+        // Pausing leaves unread request bytes on the wire, so close the socket
+        // after writing the 400 rather than leaving a poisoned keep-alive peer.
+        res.setHeader('Connection', 'close');
         reject(new Error('Request body too large'));
         return;
       }
@@ -185,11 +188,8 @@ export async function routeRequest(
     }
     let raw: string;
     try {
-      raw = await readBody(req, MAX_SYSTEMONE_BODY_BYTES);
+      raw = await readBody(req, res, MAX_SYSTEMONE_BODY_BYTES);
     } catch (error) {
-      if (error instanceof Error && error.message === 'Request body too large') {
-        res.setHeader('Connection', 'close');
-      }
       sendBadRequest(res, error instanceof Error ? error.message : 'Invalid request body');
       return;
     }
@@ -253,7 +253,7 @@ export async function routeRequest(
 
     let body: ResponsesAPIRequest;
     try {
-      const raw = await readBody(req);
+      const raw = await readBody(req, res);
       body = JSON.parse(raw) as ResponsesAPIRequest;
     } catch (err) {
       const msg =
@@ -287,7 +287,7 @@ export async function routeRequest(
 
     let body: AnthropicCountTokensRequest;
     try {
-      const raw = await readBody(req);
+      const raw = await readBody(req, res);
       body = JSON.parse(raw) as AnthropicCountTokensRequest;
     } catch (err) {
       const msg =
@@ -317,7 +317,7 @@ export async function routeRequest(
 
     let body: AnthropicMessagesRequest;
     try {
-      const raw = await readBody(req);
+      const raw = await readBody(req, res);
       body = JSON.parse(raw) as AnthropicMessagesRequest;
     } catch (err) {
       const msg =
