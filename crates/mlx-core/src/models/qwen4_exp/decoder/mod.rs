@@ -40,8 +40,6 @@ pub(super) use hidden_taps::TappedRows;
 pub(super) use hidden_taps::stream_means;
 pub(super) use lanes::{LANE_ROWS, Lane};
 pub(super) use prefill::GroupLimit;
-#[cfg(test)]
-pub(super) use prefill::PARTIAL_GROUP_WINDOWS;
 
 /// Slot banks for a window's expert groups: a lease per group, then the
 /// release of that group's output before the slots serve the next group.

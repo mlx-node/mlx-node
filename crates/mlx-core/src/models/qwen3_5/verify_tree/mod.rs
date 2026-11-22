@@ -30,11 +30,9 @@ pub(crate) use budget::VerifyBudget;
 #[cfg(test)]
 pub(crate) use budget::{BudgetAcceptance, BudgetLabel};
 pub(crate) use lattice::DraftLattice;
+#[cfg(test)]
+pub(crate) use sam::LookupMatchInfo;
 pub(crate) use sam::{LookupAcceptance, LookupAgreement, LookupIndex};
-#[cfg(test)]
-pub(crate) use sam::{LookupMatchInfo, LookupOutcome};
-#[cfg(test)]
-pub(crate) use tree::TreeWalkResult;
 pub(crate) use tree::{
     TreeCostModel, TreeDeviceViews, VerifyTree, build_verify_tree, build_verify_tree_cost_aware,
 };

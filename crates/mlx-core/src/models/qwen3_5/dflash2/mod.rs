@@ -31,7 +31,7 @@ use cache::kquant_rows_merge;
 #[cfg(test)]
 use cache::store_window_tail;
 #[cfg(test)]
-pub(crate) use cache::{DraftKvWindow, ProjectedContext, RING_ALLOCATIONS};
+pub(crate) use cache::{DraftKvWindow, RING_ALLOCATIONS};
 use compiled::CompiledDraft;
 pub(crate) use config::DFlash2Config;
 use config::DraftExecutionPolicy;
@@ -51,8 +51,6 @@ pub(crate) use selector::device_sampled_path;
 #[cfg(test)]
 use selector::normalized_selector_probs;
 use spanned_head::cuda_spanned_head_enabled;
-#[cfg(test)]
-pub(crate) use spanned_head::is_wide_vocab_token;
 #[cfg(test)]
 pub(crate) use test_helpers::{
     dflash2_config_with_context, tiny_dflash2_config, tiny_dflash2_model_for_stepper_test,
