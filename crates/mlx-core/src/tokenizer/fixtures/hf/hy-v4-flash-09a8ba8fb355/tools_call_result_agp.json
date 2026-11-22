@@ -1,0 +1,116 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Weather in 北京 for 3 days, and search 'Hy4 release'."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "Two independent calls.",
+      "tool_calls": [
+        {
+          "id": "call_a",
+          "name": "get_weather",
+          "arguments": {
+            "city": "北京",
+            "days": 3
+          },
+          "function": {
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京",
+              "days": 3
+            }
+          }
+        },
+        {
+          "id": "call_b",
+          "name": "web_search",
+          "arguments": {
+            "query": "Hy4 release",
+            "top_k": 5,
+            "filters": {
+              "lang": [
+                "en",
+                "zh"
+              ]
+            }
+          },
+          "function": {
+            "name": "web_search",
+            "arguments": {
+              "query": "Hy4 release",
+              "top_k": 5,
+              "filters": {
+                "lang": [
+                  "en",
+                  "zh"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "Hy4 was released in 2026.",
+      "name": "web_search",
+      "tool_call_id": "call_b"
+    },
+    {
+      "role": "tool",
+      "content": "{\"temp_c\": [3, 5, 4], \"sky\": \"晴\"}",
+      "name": "get_weather",
+      "tool_call_id": "call_a"
+    }
+  ],
+  "add_generation_prompt": true,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询城市天气 (weather lookup)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "城市名"
+            },
+            "days": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        },
+        "strict": true
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the web.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "top_k": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    }
+  ]
+}

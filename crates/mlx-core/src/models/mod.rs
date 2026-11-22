@@ -5,11 +5,13 @@
  */
 pub(crate) mod attention_core;
 pub(crate) mod chat_napi;
+pub mod clairic;
 pub mod clef;
 pub mod deepseek_v41;
 pub(crate) mod forward;
 pub mod gemma4;
 pub mod harrier;
+pub mod hy_v4_flash;
 pub mod int8_gemm;
 pub mod jina_reranker;
 pub mod k2_horizon;

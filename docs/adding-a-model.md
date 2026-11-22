@@ -191,6 +191,14 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
   native-MTP, publish through `LaneStateSink` / `LanePrefill` (`dflash2_turn.rs`), and
   `tests/qwen3_5_state_tier_restart.rs` is the restart gate. `ColdContextBacking::KvOnly` (plain full-attention families) gets
   KV capture/restore free from the finalize/lookup walks.
+- A family whose disk cache is the model's own SSD state tier
+  (`disk_tier.rs`: qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash) stays off
+  `COLD_RESTORE_FAMILIES`. Instead: one `COLD_TIER_STATE_FAMILIES` entry
+  (`packages/lm/src/cold-tier.ts`), so its trace rows carry `stateTier`;
+  `acceptsCacheDisk` on its family-data row, so the loader forwards
+  `cacheDisk` / `cacheDir`; and the native class's `stateTierMode()`,
+  `stateTierNamespace()` and `closeCache()`, which the host and the sampler
+  read by duck typing.
 
 ## Stage 4 — speculative
 
@@ -244,6 +252,17 @@ TS `instanceof` chains in `packages/trl` (`grpo-trainer.ts`,
 **Calibrate/eval (+2).** The `model_type` matches in `calibration/napi.rs`
 and `quality/napi.rs` (the default arm is a clean refusal, so skipping these
 degrades gracefully).
+
+**Memory budget (+1).** A row with `acceptsMaxMemory` joins the host's
+load-free context estimates (`startContextEstimates` in
+`packages/server/src/host/index.ts`). Give the family a branch in
+`nativeContextEstimate`; `null` when it has no estimator. Without one it
+falls through to the qwen3_5 estimator, which throws on its model type and
+drops the `--max-context` window the host seeded.
+
+**Memory floor (+1).** A catalog entry that no Mac below some RAM can load
+sets `minMemoryGb` (`packages/agent/src/catalog.ts`); the wizard, Models and
+Onboarding hide it below that.
 
 **Direct GGUF load (+2).** A `ggufArchitectures` entry on the family-data row
 (TS side) and the `general.architecture` → model_type map in

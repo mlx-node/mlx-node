@@ -109,6 +109,10 @@ function modeChanged(): ApiError {
   return new ApiError('E_CONFLICT', 'The permission mode could not be changed.', 'mode-changed');
 }
 
+function isDecisionModel(model: InferenceEndpoint['models'][number]): boolean {
+  return model.kind === 'decision' || model.modelType === 'clairic' || model.modelType === 'clef';
+}
+
 /** Where the agent binary comes from, for the host state and for each spawn. */
 export interface AgentResolution {
   launch: LaunchResolution;
@@ -941,7 +945,10 @@ export class ChatService {
     } else {
       const endpoint = await this.endpoint();
       if (this.deleting.has(id)) throw chatRouteError('conversation-busy');
-      const available = host.models()?.map((m) => m.modelId) ?? endpoint?.models.map((m) => m.name) ?? [];
+      const available =
+        host.models()?.map((m) => m.modelId) ??
+        endpoint?.models.filter((m) => !isDecisionModel(m)).map((m) => m.name) ??
+        [];
       if (!available.includes(modelId)) throw chatRouteError('model-unavailable');
     }
     if (modelId !== conversation.info.modelId) {
@@ -1507,7 +1514,7 @@ export class ChatService {
         : supervisor === 'starting' || supervisor === 'restarting'
           ? 'starting'
           : 'stopped';
-    const served = endpoint?.models ?? [];
+    const served = (endpoint?.models ?? []).filter((m) => !isDecisionModel(m));
     if (endpoint !== null && endpoint.pid !== this.sizesPid) {
       this.sizes.clear();
       this.sizesPid = endpoint.pid;

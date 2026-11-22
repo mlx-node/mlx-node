@@ -1,0 +1,67 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    }
+  ],
+  "add_generation_prompt": true,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询城市天气 (weather lookup)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "城市名"
+            },
+            "days": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        },
+        "strict": true
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the web.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "top_k": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hidden_tool",
+        "description": "Loaded later.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        },
+        "defer_loading": true
+      }
+    }
+  ]
+}

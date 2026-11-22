@@ -1,6 +1,8 @@
 /** Pure helpers for catalog cards (Models) and the first-model choice (Onboarding). */
 
-import type { CatalogItem } from './types';
+import type { CatalogItem, ModelsResponse } from './types';
+
+const GIB = 2 ** 30;
 
 const BUILD_NAMES = new Set(['mxfp', 'mxfp4', 'mxfp8', 'nvfp', 'nvfp4', 'nvfp8']);
 
@@ -25,6 +27,19 @@ export function catalogBuildLabel(item: Pick<CatalogItem, 'hfRepo' | 'globs'>): 
     if (BUILD_NAMES.has(lower)) return part.toUpperCase();
   }
   return null;
+}
+
+/**
+ * Whether the page offers `item` on this Mac: not hidden, and its memory floor met. An entry with a floor waits
+ * for the host reading.
+ */
+export function offeredOnHost(
+  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb'>,
+  host: ModelsResponse['host'] | undefined,
+): boolean {
+  if (item.hidden === true) return false;
+  if (item.minMemoryGb === undefined) return true;
+  return host !== undefined && host.totalMemBytes >= item.minMemoryGb * GIB;
 }
 
 /** One plain sentence about a catalog model. */

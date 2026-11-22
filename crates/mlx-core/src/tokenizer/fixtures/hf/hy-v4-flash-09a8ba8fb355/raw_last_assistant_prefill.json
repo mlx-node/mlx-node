@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    },
+    {
+      "role": "assistant",
+      "content": "Sure, the answer"
+    }
+  ],
+  "add_generation_prompt": false,
+  "raw_last_assistant": true
+}

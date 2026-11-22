@@ -396,9 +396,7 @@ describe('BUG 2: /v1/messages strict JSON', () => {
           text: '',
           done: true,
           finishReason: 'tool_calls',
-          toolCalls: [
-            { status: 'ok', id: 'call_bad', name: 'get_weather', arguments: badArgs },
-          ],
+          toolCalls: [{ status: 'ok', id: 'call_bad', name: 'get_weather', arguments: badArgs }],
           thinking: null,
           numTokens: 3,
           promptTokens: 2,
@@ -424,9 +422,7 @@ describe('BUG 2: /v1/messages strict JSON', () => {
       expect(getStatus()).toBe(200);
       const events = parseSSE(getBody());
       const jsonDelta = events.find(
-        (e) =>
-          e.event === 'content_block_delta' &&
-          (e.data['delta'] as { type?: string }).type === 'input_json_delta',
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as { type?: string }).type === 'input_json_delta',
       );
       expect(jsonDelta, `partial_json delta for ${badArgs}`).toBeDefined();
       expect((jsonDelta!.data['delta'] as { partial_json: string }).partial_json).toBe('{}');
@@ -466,7 +462,7 @@ describe('BUG 2: /v1/responses strict JSON', () => {
 
     await handleCreateResponse(
       res,
-      { model: 'test-model', input: 'weather?' } as never,
+      { model: 'test-model', input: 'weather?', tools: [{ type: 'function', name: 'get_weather' }] } as never,
       registry,
       null,
     );
@@ -495,12 +491,7 @@ describe('BUG 2: /v1/responses strict JSON', () => {
     );
     const { res, getStatus, getBody } = createMockRes();
 
-    await handleCreateResponse(
-      res,
-      { model: 'test-model', input: 'hi' } as never,
-      registry,
-      null,
-    );
+    await handleCreateResponse(res, { model: 'test-model', input: 'hi' } as never, registry, null);
 
     expect(getStatus()).toBe(200);
     const parsed = JSON.parse(getBody()) as {
@@ -541,7 +532,7 @@ describe('BUG 2: /v1/responses strict JSON', () => {
 
     await handleCreateResponse(
       res,
-      { model: 'test-model', input: 'hi', stream: true } as never,
+      { model: 'test-model', input: 'hi', stream: true, tools: [{ type: 'function', name: 'get_weather' }] } as never,
       registry,
       null,
     );

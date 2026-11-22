@@ -53,6 +53,12 @@ struct ShardedEmbedding {
     rows_per_shard: i64,
 }
 
+#[derive(Clone)]
+struct GgufQ8_0MmapEmbedding {
+    buf: MxArray,
+    byte_offset: u64,
+}
+
 pub struct Embedding {
     /// Dense (bf16) weight. For a plain bf16 embedding this is the lookup
     /// table. For a PACKED-quantized embedding (`quantized_packed` set) this is
@@ -75,6 +81,8 @@ pub struct Embedding {
     /// `forward` gathers across the sub-cap shards instead of reading the dense
     /// `weight`; used for tables too large to materialize as one Metal buffer.
     sharded: Option<ShardedEmbedding>,
+    /// Zero-copy read-only mmap GGUF Q8_0 table (set via `load_gguf_q8_0_mmap()`).
+    gguf_q8_0_mmap: Option<GgufQ8_0MmapEmbedding>,
     hadamard: Option<HadamardTransform>,
     /// Test-only tripwire shared by clones. Production inference must never
     /// call `get_weight()` on a packed embedding because that constructs a
@@ -95,6 +103,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            gguf_q8_0_mmap: None,
             hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
@@ -114,6 +123,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            gguf_q8_0_mmap: None,
             hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
@@ -129,6 +139,15 @@ impl Embedding {
     /// Otherwise uses the dense `weight` table (pre-dequantized for the legacy
     /// `load_quantized` path, or plain bf16).
     pub fn forward(&self, indices: &MxArray) -> Result<MxArray> {
+        if let Some(ref m) = self.gguf_q8_0_mmap {
+            return crate::models::hy_v4_flash::weights::mmap_q8_0_gather_rows(
+                indices,
+                &m.buf,
+                m.byte_offset,
+                i64::from(self.num_embeddings),
+                i64::from(self.embedding_dim),
+            );
+        }
         if let Some(ref q) = self.quantized_packed {
             // Gather the selected rows of EACH packed tensor on axis 0, then
             // dequantize the gathered rows along the last axis.
@@ -168,6 +187,11 @@ impl Embedding {
     /// `x @ get_weight().T` tied-head matmul, so callers can route uniformly
     /// through `as_linear`.
     pub fn as_linear(&self, x: &MxArray) -> Result<MxArray> {
+        if self.gguf_q8_0_mmap.is_some() {
+            return Err(Error::from_reason(
+                "as_linear is not supported for GGUF Q8_0 mmap embeddings",
+            ));
+        }
         let transformed = self
             .hadamard
             .as_ref()
@@ -218,6 +242,7 @@ impl Embedding {
         self.is_quantized_flag = false;
         self.quantized_packed = None;
         self.sharded = None;
+        self.gguf_q8_0_mmap = None;
         self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
@@ -286,6 +311,7 @@ impl Embedding {
         });
         self.is_quantized_flag = false;
         self.quantized_packed = None;
+        self.gguf_q8_0_mmap = None;
         self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
@@ -336,6 +362,7 @@ impl Embedding {
         self.weight = dequantized;
         self.is_quantized_flag = true;
         self.quantized_packed = None;
+        self.gguf_q8_0_mmap = None;
         self.hadamard = None;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
@@ -387,7 +414,49 @@ impl Embedding {
         // dequantizes on demand from the packed backend, so it never reads this
         // placeholder for packed embeddings.
         self.weight = MxArray::zeros(&[1, 1], Some(crate::array::DType::BFloat16))?;
+        self.gguf_q8_0_mmap = None;
         self.hadamard = None;
+        #[cfg(test)]
+        self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Install a zero-copy read-only mmap GGUF Q8_0 embedding table (`34 B` per
+    /// 32-element block, 2-byte aligned at `byte_offset`).
+    pub(crate) fn load_gguf_q8_0_mmap(&mut self, buf: &MxArray, byte_offset: u64) -> Result<()> {
+        if self.num_embeddings == 0
+            || self.embedding_dim == 0
+            || !self.embedding_dim.is_multiple_of(32)
+        {
+            return Err(Error::from_reason(format!(
+                "GGUF Q8_0 mmap embedding requires non-empty shape with dim % 32 == 0, got [{}, {}]",
+                self.num_embeddings, self.embedding_dim
+            )));
+        }
+        if buf.dtype()? != crate::array::DType::Uint8 || !byte_offset.is_multiple_of(2) {
+            return Err(Error::from_reason(
+                "GGUF Q8_0 mmap embedding requires a 2-byte-aligned uint8 buffer",
+            ));
+        }
+        let need = u64::from(self.num_embeddings)
+            .checked_mul(u64::from(self.embedding_dim / 32) * 34)
+            .and_then(|n| byte_offset.checked_add(n))
+            .ok_or_else(|| Error::from_reason("GGUF Q8_0 mmap embedding size overflows u64"))?;
+        if need > buf.nbytes() as u64 {
+            return Err(Error::from_reason(format!(
+                "GGUF Q8_0 mmap embedding needs {need} bytes, buffer has {}",
+                buf.nbytes()
+            )));
+        }
+        self.gguf_q8_0_mmap = Some(GgufQ8_0MmapEmbedding {
+            buf: buf.clone(),
+            byte_offset,
+        });
+        self.is_quantized_flag = true;
+        self.quantized_packed = None;
+        self.sharded = None;
+        self.hadamard = None;
+        self.weight = MxArray::zeros(&[1, 1], Some(crate::array::DType::BFloat16))?;
         #[cfg(test)]
         self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
@@ -504,6 +573,7 @@ impl Clone for Embedding {
                     mode: q.mode.clone(),
                 }),
             sharded: self.sharded.clone(),
+            gguf_q8_0_mmap: self.gguf_q8_0_mmap.clone(),
             hadamard: self.hadamard.clone(),
             #[cfg(test)]
             packed_full_dequant_calls: Arc::clone(&self.packed_full_dequant_calls),
@@ -532,6 +602,7 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            gguf_q8_0_mmap: None,
             hadamard: None,
             #[cfg(test)]
             packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),

@@ -108,6 +108,38 @@ describe('GET /api/models', () => {
     expect(served.unserved).toEqual([]);
   });
 
+  it('detects Clairic and CLEF sidecars, lists GGUF Clairic without config.json, and populates servedIds', async () => {
+    const clairicDir = join(modelsDir, 'clairic-flash-4bit');
+    mkdirSync(clairicDir, { recursive: true });
+    writeFileSync(join(clairicDir, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    writeFileSync(join(clairicDir, 'model.safetensors'), Buffer.alloc(64));
+    writeFileSync(join(clairicDir, 'clair_head_config.json'), '{}');
+    writeFileSync(join(clairicDir, 'clair_head.safetensors'), Buffer.alloc(32));
+
+    const clefDir = join(modelsDir, 'clef-local');
+    mkdirSync(clefDir, { recursive: true });
+    writeFileSync(join(clefDir, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    writeFileSync(join(clefDir, 'model.safetensors'), Buffer.alloc(64));
+    writeFileSync(join(clefDir, 'joint_head_config.json'), '{}');
+    writeFileSync(join(clefDir, 'joint_head.safetensors'), Buffer.alloc(32));
+
+    const ggufClairic = join(modelsDir, 'clairic-gguf');
+    mkdirSync(ggufClairic, { recursive: true });
+    writeFileSync(join(ggufClairic, 'clairic-UD-Q4_K_XL.gguf'), ggufHeader('qwen35'));
+    writeFileSync(join(ggufClairic, 'clair_head_config.json'), '{}');
+    writeFileSync(join(ggufClairic, 'clair_head.safetensors'), Buffer.alloc(32));
+
+    const body = await handleModels(paths(modelsDir));
+    const byName = Object.fromEntries(body.models.map((m) => [m.name, m]));
+    expect(byName['clairic-flash-4bit']?.modelType).toBe('clairic');
+    expect(byName['clairic-flash-4bit']?.servedIds).toEqual(['clairic-flash-4bit']);
+    expect(byName['clef-local']?.modelType).toBe('clef');
+    expect(byName['clef-local']?.servedIds).toEqual(['clef-local']);
+    expect(byName['clairic-gguf']?.modelType).toBe('clairic');
+    expect(byName['clairic-gguf']?.servedIds).toEqual(['clairic-UD-Q4_K_XL']);
+    expect(body.warnings.some((w) => w.includes('clairic-gguf'))).toBe(false);
+  });
+
   it('host reports memory and free disk', async () => {
     const body = await handleModels(paths(modelsDir));
     expect(body.host.totalMemBytes).toBe(totalmem());

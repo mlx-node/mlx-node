@@ -688,6 +688,48 @@ pub(crate) mod recipe {
             &["qwen3_5", "qwen3_5_moe"]
         }
 
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            target_dtype_str: &str,
+            tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            self.sanitize_with_options(
+                weights,
+                config,
+                target_dtype_str,
+                tie_word_embeddings,
+                verbose,
+                false,
+            )
+        }
+
+        fn owns_dtype_cast(&self) -> bool {
+            true
+        }
+
+        fn sym8_supported(&self) -> bool {
+            // Both dense qwen3_5 and qwen3_5_moe dispatch sym8. The MoE loader
+            // covers its non-expert sublayers (attention, GDN, shared-expert
+            // MLP body); 3-D stacked switch_mlp experts are forced to an
+            // affine-8 per-layer override by `sym8_eligible`, so the emitted
+            // checkpoint uses sym8 on the 2-D sublayers and affine-8 on the
+            // 3-D experts without crashing at load time.
+            true
+        }
+
+        fn has_mtp(&self) -> MtpPolicy {
+            if self.is_moe {
+                MtpPolicy::Inline
+            } else {
+                MtpPolicy::Sidecar
+            }
+        }
+    }
+
+    impl Qwen35Recipe {
         /// Sanitize Qwen3.5 / Qwen3.5-MoE model weights.
         ///
         /// Output matches mlx-vlm `format: "mlx"` convention (sanitize is skipped on load).
@@ -703,13 +745,19 @@ pub(crate) mod recipe {
         /// 3. FP8 E4M3 dequantization (weight + weight_scale_inv → target dtype)
         /// 4. Individual expert stacking (experts.{i}.{proj} → switch_mlp.{proj})
         /// 5. mlx-vlm sanitization: norm weight +1.0 shift, conv1d weight transpose
-        fn sanitize(
+        ///
+        /// When `preserve_fp32_norms` is true (Clairic checkpoints), language-model
+        /// RMSNorm weights are shifted in FP32 (`v.astype(Float32) + 1.0`) and kept in
+        /// FP32 instead of being cast to `target_dtype`, matching
+        /// `mlx-community/clairic-4bit/convert.py`.
+        pub(crate) fn sanitize_with_options(
             &self,
             weights: HashMap<String, MxArray>,
             config: &serde_json::Value,
             target_dtype_str: &str,
             _tie_word_embeddings: bool,
             _verbose: bool,
+            preserve_fp32_norms: bool,
         ) -> Result<HashMap<String, MxArray>> {
             // Both guards borrow the untouched source map and run before ANY
             // key remap, cast, dequantization, or stacking. This ordering is
@@ -916,6 +964,19 @@ pub(crate) mod recipe {
                 }
             }
 
+            let norm_suffixes = [
+                ".input_layernorm.weight",
+                ".post_attention_layernorm.weight",
+                "model.norm.weight",
+                ".q_norm.weight",
+                ".k_norm.weight",
+            ];
+            let is_lm_norm_key = |k: &str| -> bool {
+                !k.starts_with("mtp.")
+                    && !k.starts_with("vision_tower.")
+                    && norm_suffixes.iter().any(|sfx| k.ends_with(sfx))
+            };
+
             // Step 2: FP8 dequantization (in-place to avoid extra HashMap allocation)
             if has_fp8 {
                 let scale_keys: Vec<String> = new_weights
@@ -997,6 +1058,9 @@ pub(crate) mod recipe {
                     let v = new_weights.get(&k).ok_or_else(|| {
                         Error::from_reason(format!("weight key '{k}' vanished from weights"))
                     })?;
+                    if preserve_fp32_norms && is_lm_norm_key(&k) && v.ndim()? == 1 {
+                        continue;
+                    }
                     // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
                     // packed Uint32, Uint8 scales) are never astype'd.
                     let current_dtype = v.dtype()?;
@@ -1059,6 +1123,9 @@ pub(crate) mod recipe {
                     let v = new_weights.get(&k).ok_or_else(|| {
                         Error::from_reason(format!("weight key '{k}' vanished from weights"))
                     })?;
+                    if preserve_fp32_norms && is_lm_norm_key(&k) && v.ndim()? == 1 {
+                        continue;
+                    }
                     // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
                     // packed Uint32, Uint8 scales) are never astype'd.
                     let current_dtype = v.dtype()?;
@@ -1242,15 +1309,23 @@ pub(crate) mod recipe {
                 info!(
                     "  Model already sanitized (norms ~1.0), skipping norm shift + conv transpose"
                 );
+                if preserve_fp32_norms {
+                    let norm_keys: Vec<String> = new_weights
+                        .keys()
+                        .filter(|k| is_lm_norm_key(k))
+                        .cloned()
+                        .collect();
+                    for k in norm_keys {
+                        let v = new_weights.get(&k).ok_or_else(|| {
+                            Error::from_reason(format!("weight key '{k}' vanished from weights"))
+                        })?;
+                        if v.ndim()? == 1 && v.dtype()? != DType::Float32 {
+                            let f32_norm = v.astype(DType::Float32)?;
+                            new_weights.insert(k, f32_norm);
+                        }
+                    }
+                }
             }
-
-            let norm_suffixes = [
-                ".input_layernorm.weight",
-                ".post_attention_layernorm.weight",
-                "model.norm.weight",
-                ".q_norm.weight",
-                ".k_norm.weight",
-            ];
 
             let keys: Vec<String> = if already_sanitized {
                 Vec::new() // skip all sanitization transforms
@@ -1309,7 +1384,11 @@ pub(crate) mod recipe {
                         Error::from_reason(format!("weight key '{k}' vanished from weights"))
                     })?;
                     if v.ndim()? == 1 {
-                        let shifted = v.add_scalar(1.0)?;
+                        let shifted = if preserve_fp32_norms && is_lm_norm_key(&k) {
+                            v.astype(DType::Float32)?.add_scalar(1.0)?
+                        } else {
+                            v.add_scalar(1.0)?
+                        };
                         new_weights.insert(k, shifted);
                     }
                 }
@@ -1322,27 +1401,6 @@ pub(crate) mod recipe {
             info!("  After sanitization: {} tensors", new_weights.len());
 
             Ok(new_weights)
-        }
-
-        fn owns_dtype_cast(&self) -> bool {
-            true
-        }
-
-        fn sym8_supported(&self) -> bool {
-            // Both dense qwen3_5 and qwen3_5_moe dispatch sym8. The MoE loader
-            // covers its non-expert sublayers (attention, GDN, shared-expert
-            // MLP body); 3-D stacked switch_mlp experts are forced to an
-            // affine-8 per-layer override by `sym8_eligible`, so the emitted
-            // checkpoint always loads back.
-            true
-        }
-
-        fn has_mtp(&self) -> MtpPolicy {
-            if self.is_moe {
-                MtpPolicy::Inline
-            } else {
-                MtpPolicy::Sidecar
-            }
         }
     }
 
@@ -3355,6 +3413,18 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             "Incomplete CLEF checkpoint: both joint head assets are required",
         ));
     }
+    let clairic_config = input_dir.join("clair_head_config.json").is_file();
+    let clairic_weights = input_dir.join("clair_head.safetensors").is_file();
+    if clairic_config != clairic_weights {
+        return Err(Error::from_reason(
+            "Incomplete Clairic checkpoint: both clair_head_config.json and clair_head.safetensors are required",
+        ));
+    }
+    if clef_config && clairic_config {
+        return Err(Error::from_reason(
+            "Ambiguous checkpoint: cannot contain both CLEF (joint_head_*) and Clairic (clair_head_*) head assets",
+        ));
+    }
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
     let mut model_type = options.model_type;
@@ -4273,13 +4343,27 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             Some(mt) => match recipe::recipe_for(mt) {
                 Some(recipe) => {
                     info!("Applying {mt} weight sanitization via conversion recipe...");
-                    recipe.sanitize(
-                        converted_tensors,
-                        &config,
-                        &target_dtype,
-                        tie_word_embeddings,
-                        verbose,
-                    )?
+                    if clairic_config && matches!(mt, "qwen3_5" | "qwen3_5_moe") {
+                        recipe::Qwen35Recipe {
+                            is_moe: mt == "qwen3_5_moe",
+                        }
+                        .sanitize_with_options(
+                            converted_tensors,
+                            &config,
+                            &target_dtype,
+                            tie_word_embeddings,
+                            verbose,
+                            true,
+                        )?
+                    } else {
+                        recipe.sanitize(
+                            converted_tensors,
+                            &config,
+                            &target_dtype,
+                            tie_word_embeddings,
+                            verbose,
+                        )?
+                    }
                 }
                 None => {
                     return Err(Error::from_reason(format!(
@@ -4879,6 +4963,16 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // CLEF's classifier head is separate from the backbone shard index.
         "joint_head_config.json",
         "joint_head.safetensors",
+        // Clairic's typed head is separate from the backbone shard index.
+        "clair_head_config.json",
+        "clair_head.safetensors",
+    ];
+
+    const HEAD_SIDECAR_FILES: [&str; 4] = [
+        "joint_head_config.json",
+        "joint_head.safetensors",
+        "clair_head_config.json",
+        "clair_head.safetensors",
     ];
 
     for file_name in config_files.iter() {
@@ -4891,6 +4985,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             }
             fs::copy(&src, &dst)
                 .map_err(|e| Error::from_reason(format!("Failed to copy {}: {}", file_name, e)))?;
+        } else if HEAD_SIDECAR_FILES.contains(file_name) && dst.exists() {
+            if verbose {
+                info!("Removing stale {}", file_name);
+            }
+            fs::remove_file(&dst).map_err(|e| {
+                Error::from_reason(format!("Failed to remove stale {}: {}", file_name, e))
+            })?;
         } else if verbose {
             warn!("Skipping {} (not found)", file_name);
         }
@@ -22895,5 +22996,228 @@ mod tests {
             );
             std::fs::remove_dir_all(&base).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn clairic_sidecar_xor_and_clef_mutual_exclusion() {
+        let base = std::env::temp_dir().join(format!(
+            "clairic_convert_guard_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let run = |name: &str, files: &[&str]| {
+            let input = base.join(format!("{name}_in"));
+            let output = base.join(format!("{name}_out"));
+            std::fs::create_dir_all(&input).unwrap();
+            for f in files {
+                std::fs::write(input.join(f), b"{}").unwrap();
+            }
+            async move {
+                convert_model(ConversionOptions {
+                    input_dir: input.to_string_lossy().to_string(),
+                    output_dir: output.to_string_lossy().to_string(),
+                    dtype: None,
+                    verbose: Some(false),
+                    model_type: None,
+                    quantize: Some(false),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: None,
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    quant_mxfp: None,
+                    quant_mtp: None,
+                })
+                .await
+            }
+        };
+
+        let err_cfg_only = run("cfg_only", &["clair_head_config.json"])
+            .await
+            .err()
+            .expect("config-only clairic checkpoint must fail");
+        assert!(
+            err_cfg_only.reason.contains(
+                "Incomplete Clairic checkpoint: both clair_head_config.json and clair_head.safetensors are required"
+            ),
+            "unexpected error: {}",
+            err_cfg_only.reason
+        );
+
+        let err_weights_only = run("weights_only", &["clair_head.safetensors"])
+            .await
+            .err()
+            .expect("weights-only clairic checkpoint must fail");
+        assert!(
+            err_weights_only.reason.contains(
+                "Incomplete Clairic checkpoint: both clair_head_config.json and clair_head.safetensors are required"
+            ),
+            "unexpected error: {}",
+            err_weights_only.reason
+        );
+
+        let err_both = run(
+            "both_heads",
+            &[
+                "joint_head_config.json",
+                "joint_head.safetensors",
+                "clair_head_config.json",
+                "clair_head.safetensors",
+            ],
+        )
+        .await
+        .err()
+        .expect("checkpoint with both CLEF and Clairic heads must fail");
+        assert!(
+            err_both.reason.contains("Ambiguous checkpoint"),
+            "unexpected error: {}",
+            err_both.reason
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn qwen35_clairic_preserves_fp32_rmsnorm_weights() {
+        let cfg = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": { "num_hidden_layers": 1 }
+        });
+        let raw_norm_vals = vec![0.123_456_7_f32, 2.007_812_5, -0.333_333_34, 1.500_001];
+        let build = || {
+            let mut w = HashMap::new();
+            w.insert(
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                MxArray::from_float32(&raw_norm_vals, &[4])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            );
+            w.insert(
+                "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
+                MxArray::zeros(&[4, 4], Some(DType::Float32)).unwrap(),
+            );
+            w
+        };
+
+        // Standard Qwen3.5 keeps bfloat16 when target_dtype is bfloat16.
+        let standard = recipe::Qwen35Recipe { is_moe: false }
+            .sanitize_with_options(build(), &cfg, "bfloat16", false, false, false)
+            .unwrap();
+        let std_norm = &standard["language_model.model.layers.0.input_layernorm.weight"];
+        assert_eq!(std_norm.dtype().unwrap(), DType::BFloat16);
+
+        // Clairic mode computes exact fp32 (v.astype(f32) + 1.0) and preserves Float32 dtype,
+        // while non-norm weights still cast to bfloat16.
+        let clairic = recipe::Qwen35Recipe { is_moe: false }
+            .sanitize_with_options(build(), &cfg, "bfloat16", false, false, true)
+            .unwrap();
+        let cl_norm = &clairic["language_model.model.layers.0.input_layernorm.weight"];
+        assert_eq!(cl_norm.dtype().unwrap(), DType::Float32);
+        let expected: Vec<f32> = MxArray::from_float32(&raw_norm_vals, &[4])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .add_scalar(1.0)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let actual: Vec<f32> = cl_norm.to_float32().unwrap().to_vec();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            clairic["language_model.model.layers.0.self_attn.q_proj.weight"]
+                .dtype()
+                .unwrap(),
+            DType::BFloat16
+        );
+    }
+
+    #[tokio::test]
+    async fn clairic_stale_head_sidecars_removed_on_reused_output_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "clairic_stale_sidecar_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+
+        // Plain Qwen3.5 checkpoint (no Clairic or CLEF head sidecars).
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "num_hidden_layers": 1,
+            "tie_word_embeddings": false,
+        });
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut src: HashMap<String, MxArray> = HashMap::new();
+        src.insert(
+            "model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[1.0f32; 4], &[4])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        );
+        crate::utils::safetensors::save_safetensors(
+            input.join("model.safetensors"),
+            &mut src,
+            None,
+        )
+        .unwrap();
+
+        // Pre-populate output_dir with stale Clairic and CLEF head sidecars.
+        let stale_files = [
+            "clair_head_config.json",
+            "clair_head.safetensors",
+            "joint_head_config.json",
+            "joint_head.safetensors",
+        ];
+        for f in stale_files {
+            std::fs::write(output.join(f), b"stale").unwrap();
+            assert!(output.join(f).exists());
+        }
+
+        convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: None,
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("convert_model should succeed");
+
+        for f in stale_files {
+            assert!(
+                !output.join(f).exists(),
+                "stale sidecar {f} must be removed when absent from input_dir"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

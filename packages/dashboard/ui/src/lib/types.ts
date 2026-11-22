@@ -30,13 +30,18 @@ export interface ModelsResponse {
   host: { totalMemBytes: number; diskFreeBytes: number | null };
 }
 
+export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
+
 export interface CatalogItem {
   label: string;
   hfRepo: string;
   sizeGb: number;
   description: string;
+  category?: 'chat' | 'systemone';
   isDefault?: boolean;
   hidden?: boolean;
+  /** Physical RAM in GiB the model's load needs at least; the page leaves the entry out below it. */
+  minMemoryGb?: number;
   slug: string;
   /** A dashboard-owned (completion-marker) install of this model is present. */
   installed: boolean;
@@ -1156,4 +1161,52 @@ export interface HealthResponse {
   runtimeDir: string;
   /** The user's home folder: paths under it are shown as `~/…`. */
   homeDir: string;
+}
+
+/** One installed System One model (Clairic or CLEF). */
+export interface SystemOneModelInfo {
+  id: string;
+  name: string;
+  modelType: 'clairic' | 'clef';
+  format: string;
+  supportsImages: boolean;
+  contextWindow: number;
+  resident: boolean;
+  path: string;
+}
+
+/** One completed, failed, or cancelled System One run stored in history. */
+export interface SystemOneHistoryEntry {
+  id: string;
+  model: string;
+  mode: 'extract' | 'decide';
+  createdAt: number;
+  elapsedMs: number;
+  status: 'done' | 'error' | 'cancelled';
+  fieldCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  request: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
+/** `GET /api/systemone/state` */
+export interface SystemOneState {
+  sidecarRunning: boolean;
+  models: SystemOneModelInfo[];
+  activeJobId: string | null;
+  history: SystemOneHistoryEntry[];
+}
+
+/** `GET /api/systemone/jobs/:id` and push event payload for `subscribeSystemOne`. */
+export interface SystemOneJobSnapshot {
+  id: string;
+  status: 'running' | 'done' | 'error' | 'cancelled';
+  model: string;
+  mode: 'extract' | 'decide';
+  startedAt: number;
+  elapsedMs: number;
+  result?: Record<string, unknown>;
+  error?: string;
 }

@@ -117,8 +117,9 @@ button.legendItem {
 .unit {
   grid-column: 1;
   overflow: hidden;
-  margin-bottom: var(--space-1);
-  color: var(--text-secondary);
+  /* Top tick centers on y=0 (-50% of its height ≈ 5.5px upward); space-3 keeps a clean 6-7px gap. */
+  margin-bottom: var(--space-3);
+  color: var(--text-muted);
   font-size: var(--text-xs);
   line-height: 1.2;
   text-align: right;

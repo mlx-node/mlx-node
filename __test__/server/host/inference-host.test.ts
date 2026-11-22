@@ -1019,6 +1019,45 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     ]);
   });
 
+  // Mutation: drop `acceptsMaxMemory` or `acceptsCacheDisk` from the
+  // hy_v4_flash row → red (the Hy4 load gets no budget or no SSD cache size).
+  it('maxMemoryBytes and cacheDisk reach the Hy4-flash loader', async () => {
+    const modelsDir = await makeModelsDir(['hy4', 'gemma']);
+    await writeFile(join(modelsDir, 'hy4', 'config.json'), JSON.stringify({ model_type: 'hy_v4_flash' }));
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      maxMemoryBytes: 103_079_215_104,
+      cacheDisk: '0',
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    await host.loadModel('hy4');
+    await host.loadModel('gemma');
+    expect(calls.map((call) => call.options)).toEqual([{ maxMemoryBytes: 103_079_215_104, cacheDisk: '0' }, undefined]);
+  });
+
+  // Mutation: drop the hy_v4_flash branch in `nativeContextEstimate` → red
+  // (the Qwen3.5 estimator is asked to price a Hy4 entry).
+  it('asks no estimator for a Hy4-flash entry', async () => {
+    const asked: string[] = [];
+    const estimate = nativeContextEstimate(
+      async (_path, modelType) => {
+        asked.push(modelType);
+        return { windowTokens: 48_601, bound: 'memory' };
+      },
+      async () => {
+        asked.push('qwen4_exp');
+        return { windowTokens: 65_536, bound: 'memory' };
+      },
+    );
+    expect(await estimate('/hy4', 'hy_v4_flash', { maxMemoryBytes: 1_024, maxContextTokens: 131_072 })).toBeNull();
+    expect(asked).toEqual([]);
+  });
+
   // Mutation: drop `maxContextTokens` from the qwen4_exp estimator options in
   // `nativeContextEstimate` → red. Mutation: drop `kvFormat` from them → red.
   // Mutation: drop `draftModelPath` from them → red (the draft goes unpriced).

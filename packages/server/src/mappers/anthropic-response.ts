@@ -25,6 +25,7 @@ import type {
   AnthropicStopReason,
   MlxProgress,
 } from '../types-anthropic.js';
+import { hy4TagAt, type Hy4Tag } from './reasoning-close.js';
 import { genId } from './response.js';
 
 function parseArguments(args: Record<string, unknown> | string): Record<string, unknown> {
@@ -99,28 +100,40 @@ export function mapStopReason(
 }
 
 /**
- * The answer text a response shows: the parsed text, or the recovered markup
- * of tool calls the request did not allow, with the raw block of each call
+ * vLLM maps Messages `none` to chat `tool_choice: 'none'`, and
+ * `keeps_tool_calls` drops the calls of `none` or of a request with no tools.
+ */
+export function anthropicRequestAllowsToolUse(body: Pick<AnthropicMessagesRequest, 'tools' | 'tool_choice'>): boolean {
+  return Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice?.type !== 'none';
+}
+
+/**
+ * The answer text a response shows: the parsed text, or the raw text after
+ * the reasoning without the markup of tool calls the request did not allow
+ * (vLLM: the content after the reasoning, tool blocks removed), with the raw block of each call
  * that names no function read as text where the model wrote it (Splash
  * `StreamingToolCallProjector._begin_call`). Splash cuts the raw output at a
  * stop (`CallbackStreamer._emit`) before the projector reads it, so the block
  * must keep its place for the stop search to cut what follows it.
  */
 export function visibleAnswerText(
-  result: Pick<ChatResult, 'text' | 'rawText' | 'toolCalls'>,
+  result: Pick<ChatResult, 'text' | 'publicRawText' | 'toolCalls'>,
   allowToolUse: boolean,
 ): string {
+  // Never `rawText`: it holds the reasoning and its close tag. With no
+  // `publicRawText` (Gemma4) the parsed text is the answer without markup.
+  const answerRaw = result.publicRawText ?? result.text;
   const text =
     !allowToolUse &&
     result.text.length === 0 &&
     result.toolCalls.some((t) => t.status === 'ok') &&
-    containsToolCallMarkup(result.rawText)
-      ? recoverSuppressedToolCallText(result.rawText)
+    containsToolCallMarkup(answerRaw)
+      ? withoutWhitespaceOnly(recoverSuppressedToolCallText(answerRaw))
       : result.text;
   if (!result.toolCalls.some((call) => call.status === 'missing_name')) return text;
-  const placed = withNamelessCallsInPlace(text, result.rawText, result.toolCalls);
+  const placed = withNamelessCallsInPlace(text, answerRaw, result.toolCalls);
   if (placed !== null) return placed;
-  // The blocks cannot be placed in `rawText`: they go after the text.
+  // The blocks cannot be placed in the raw text: they go after the text.
   let nameless = '';
   for (const call of result.toolCalls) {
     if (call.status === 'missing_name') nameless += call.rawContent;
@@ -132,11 +145,16 @@ function isWhitespace(ch: string): boolean {
   return ch.trim().length === 0;
 }
 
+// vLLM `_strip_content_whitespace`: whitespace-only content beside a tool call is no text.
+function withoutWhitespaceOnly(text: string): string {
+  return text.trim().length === 0 ? '' : text;
+}
+
 /**
- * `text` with each nameless call's block put back at its place in `rawText`,
- * or null when `text` is not `rawText` without the `<tool_call>` blocks,
- * trimmed and cut after the reasoning (the native finalize), or a nameless
- * block falls before the text starts.
+ * `text` with each nameless call's block put back at its place in `rawText`
+ * (the raw text after the reasoning), or null when `text` is not `rawText`
+ * without the `<tool_call>` blocks, trimmed, or a nameless block falls before
+ * the text starts.
  */
 function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResult['toolCalls']): string | null {
   let stripped = '';
@@ -197,13 +215,158 @@ export function containsToolCallMarkup(rawText: string): boolean {
     rawText.includes('<tool_call') ||
     rawText.includes('</tool_call') ||
     rawText.includes('<|tool_call') ||
-    rawText.includes('<tool_call|>')
+    rawText.includes('<tool_call|>') ||
+    rawText.includes('｜DSML｜')
   );
+}
+
+interface Markup {
+  start: number;
+  end: number;
+  close: string | null;
+  value: readonly [string, string] | null;
+}
+
+type Scanner = (from: number) => Markup | null;
+
+/**
+ * Keeps the last hit of each search; the scans run once per stray tag, so a
+ * fresh search each time is quadratic in the text length.
+ */
+function memoized<T extends { start: number }>(find: (from: number) => T | null): (from: number) => T | null {
+  let searchedFrom = Number.POSITIVE_INFINITY;
+  let hit: T | null = null;
+  return (from) => {
+    if (from < searchedFrom || (hit !== null && hit.start < from)) {
+      hit = find(from);
+      searchedFrom = from;
+    }
+    return hit;
+  };
+}
+
+class TextSearch {
+  private readonly needles = new Map<string, (from: number) => { start: number } | null>();
+
+  constructor(readonly text: string) {}
+
+  indexOf(needle: string, from: number): number {
+    let find = this.needles.get(needle);
+    if (find === undefined) {
+      find = memoized((at) => {
+        const start = this.text.indexOf(needle, at);
+        return start < 0 ? null : { start };
+      });
+      this.needles.set(needle, find);
+    }
+    return find(from)?.start ?? -1;
+  }
+}
+
+function nextHy4Tag(text: string, from: number, head: string): Hy4Tag | null {
+  for (let at = text.indexOf(head, from); at >= 0; at = text.indexOf(head, at + 1)) {
+    const tag = hy4TagAt(text, at, head);
+    if (tag !== null) return tag;
+  }
+  return null;
+}
+
+const HY4_TAG_NAMES = ['tool_calls', 'tool_call', 'arg_key', 'arg_value'] as const;
+
+function hy4Scanner(search: TextSearch): Scanner {
+  const heads = HY4_TAG_NAMES.flatMap((name) =>
+    [false, true].map((closing) => {
+      const head = `${closing ? '</' : '<'}${name}:`;
+      return { name, closing, next: memoized((from) => nextHy4Tag(search.text, from, head)) };
+    }),
+  );
+  return (from) => {
+    let next: Markup | null = null;
+    for (const { name, closing, next: nextTag } of heads) {
+      const tag = nextTag(from);
+      if (tag === null || (next !== null && tag.start >= next.start)) continue;
+      const call = name === 'tool_calls' || name === 'tool_call';
+      next = {
+        start: tag.start,
+        end: tag.end,
+        close: closing ? null : `</${name}${tag.suffix}>`,
+        value: !closing && call ? [`<arg_value${tag.suffix}>`, `</arg_value${tag.suffix}>`] : null,
+      };
+    }
+    return next;
+  };
+}
+
+/**
+ * `text` without a leading empty `<think:X></think:X>`: the `no_think` prompt's
+ * own pair, which the model writes again (native `strip_empty_think`).
+ */
+function withoutLeadingEmptyHy4Think(text: string): string {
+  let at = 0;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  const open = hy4TagAt(text, at, '<think:');
+  if (open === null) return text;
+  at = open.end;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  const close = `</think${open.suffix}>`;
+  if (!text.startsWith(close, at)) return text;
+  at += close.length;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  return text.slice(at);
+}
+
+const DSML_VALUE = ['<｜DSML｜ parameter ', '</｜DSML｜ parameter>'] as const;
+
+const DSML_MARKUP: readonly { head: string; close: string | null; value: readonly [string, string] | null }[] = [
+  { head: '<｜DSML｜ calls>', close: '</｜DSML｜ calls>', value: DSML_VALUE },
+  { head: '<｜DSML｜ invoke ', close: '</｜DSML｜ invoke>', value: DSML_VALUE },
+  { head: '<｜DSML｜ parameter ', close: '</｜DSML｜ parameter>', value: null },
+  { head: '</｜DSML｜ calls>', close: null, value: null },
+  { head: '</｜DSML｜ invoke>', close: null, value: null },
+  { head: '</｜DSML｜ parameter>', close: null, value: null },
+];
+
+function dsmlScanner(search: TextSearch): Scanner {
+  return (from) => {
+    let next: Markup | null = null;
+    for (const markup of DSML_MARKUP) {
+      const at = search.indexOf(markup.head, from);
+      if (at < 0 || (next !== null && at >= next.start)) continue;
+      next = { start: at, end: at + markup.head.length, close: markup.close, value: markup.value };
+    }
+    return next;
+  };
+}
+
+/** The offset after the first `close` outside a value, or the text's end. */
+function blockEnd(search: TextSearch, from: number, close: string, value: readonly [string, string] | null): number {
+  const length = search.text.length;
+  let at = from;
+  for (;;) {
+    const end = search.indexOf(close, at);
+    const open = value === null ? -1 : search.indexOf(value[0], at);
+    if (value === null || open < 0 || (end >= 0 && end < open)) return end < 0 ? length : end + close.length;
+    const valueEnd = search.indexOf(value[1], open + value[0].length);
+    if (valueEnd < 0) return length;
+    at = valueEnd + value[1].length;
+  }
+}
+
+function withoutMarkup(text: string, scanner: (search: TextSearch) => Scanner): string {
+  const search = new TextSearch(text);
+  const next = scanner(search);
+  let out = '';
+  let from = 0;
+  for (let markup = next(0); markup !== null; markup = next(from)) {
+    out += text.slice(from, markup.start);
+    from = markup.close === null ? markup.end : blockEnd(search, markup.end, markup.close, markup.value);
+  }
+  return out + text.slice(from);
 }
 
 export function recoverSuppressedToolCallText(rawText: string): string {
   return (
-    rawText
+    withoutMarkup(withoutMarkup(withoutLeadingEmptyHy4Think(rawText), hy4Scanner), dsmlScanner)
       .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
       .replace(/<channel\|>/g, '')
       .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|$)/g, '')
@@ -247,8 +410,7 @@ export function buildAnthropicContent(
   const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
   const text = stopMatched ? result.text : visibleAnswerText(result, allowToolUse);
 
-  // Emit a text block unless tool calls exist and there is no text.
-  if (text || okToolCalls.length === 0) {
+  if (text) {
     content.push({ type: 'text', text });
   }
 
@@ -263,6 +425,11 @@ export function buildAnthropicContent(
       name: tc.name,
       input: parseArguments(tc.arguments),
     });
+  }
+
+  // vLLM `messages_full_converter`: one empty text block only when no other block exists.
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
   }
 
   return content;

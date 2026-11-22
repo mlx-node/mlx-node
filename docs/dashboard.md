@@ -203,15 +203,15 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 ## Pages
 
-Eleven routes. Nine sit in the sidebar (`⌘1`…`⌘9`, also in the `⌘K` command palette); one route table
+Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; all ten sit in the `⌘K` command palette); one route table
 (`ui/src/shell/routes.tsx`) feeds the router, the sidebar, the breadcrumb, the hotkeys and the palette.
 
 | Key       | Goes to                                                                       |
 | --------- | ----------------------------------------------------------------------------- |
 | `⌘1`      | Overview                                                                      |
 | `⌘2`      | Chat                                                                          |
-| `⌘3`…`⌘8` | Sessions, Metrics, Engine, Cache, Models, Coding Agents                       |
-| `⌘9`      | Web Search                                                                    |
+| `⌘3`      | System One                                                                    |
+| `⌘4`…`⌘9` | Sessions, Metrics, Engine, Cache, Models, Coding Agents                       |
 | `⌘⇧O`     | A new conversation in the last used mode                                      |
 | `⌘K`      | The command palette (it also lists the 20 newest conversations of both modes) |
 
@@ -219,6 +219,7 @@ Eleven routes. Nine sit in the sidebar (`⌘1`…`⌘9`, also in the `⌘K` comm
 | ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                   | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
 | `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer with model picker, web chip and (Work) folder chip; Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work)         | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
+| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                         | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
 | `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                 | `/sessions`                                                                                                  |
 | `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                      | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
 | `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                        | the six `/metrics/*` routes                                                                                  |
@@ -253,13 +254,13 @@ of its heartbeat: On, Off, or Unknown for an engine started before the field), t
 write (`coldCapture`: up to N prefix blocks, or "the whole prompt" from 63,125 blocks, and the walk's time cap; a
 walk the time cap ends early is picked up by the next turn; nothing for an older engine), and how many recorded
 turns ran with the tier on (`scope.enabledTurns`) and off (`scope.disabledTurns`). The turn counts cover every
-cache folder, not only the one the page shows. A Qwen3.5 dense or MoE or a Flash Next turn counts by its own disk
+cache folder, not only the one the page shows. A Qwen3.5 dense or MoE, Flash Next or Hy4-flash turn counts by its own disk
 cache, the SSD state tier its trace row carries as `stateTier`: on when `persistent`, off when `temp` or `off`. When more than one
 engine runs, the line names the one it reads.
 Neither the switch nor the turn counts prove a write: a turn with the tier on may write nothing. The written side is
 the rest of the page (bytes and blocks on disk, restores).
 
-Below that line, "Model caches" lists the stored-state caches of Qwen3.5 and Flash Next: one folder per model
+Below that line, "Model caches" lists the stored-state caches of Qwen3.5, Flash Next and Hy4-flash: one folder per model
 identity under `~/.mlx-node/cache/prefix-cache/`, named by 32 hex digits, plus the folder of each running engine
 started with `--cache-dir` (its heartbeat names it), one panel per folder. A row is a folder the engine itself counts
 (a real directory of this user, not a link) that holds a regular `lock` file: every engine open makes one, so a folder
@@ -272,7 +273,7 @@ it has. An unchanged folder is not read again. A root it cannot read says "could
 answer, not "No model cache yet". A cache whose namespace a running engine
 reports (`models[].stateNamespace` of its heartbeat) shows that model's name; any other shows its hash only. The tiles
 add the rows; "Size on disk" names the smallest limit a running engine reports for that folder, and none when no
-engine reports one (an engine with two or more Qwen3.5 models, or Flash Next alone). "Free on volume" is `statfs` of
+engine reports one (an engine with two or more Qwen3.5 models, or Flash Next or Hy4-flash alone). "Free on volume" is `statfs` of
 the folder.
 
 Delete removes one idle cache after a confirm at its row. It holds the folder open, takes the cache's existing lock
@@ -311,7 +312,11 @@ kept in `localStorage`, models 9–16 reuse the hues with a second encoding, lat
 Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
 the repo's dozens) plus the base-model tokenizer sidecars fetched from the
 entry's `assetsRepo`; the download runner glob-filters the manifest and stages
-the sidecars before publishing. No current entry carries a `draft` companion —
+the sidecars before publishing. Hy4-flash installs the `Q4_K_M` build of
+`AngelSlim/Hy4-flash-GGUF` instead. An entry with `minMemoryGb` is offered
+on Models and on Onboarding only once the host reading is in and the Mac's
+physical RAM reaches it (`offeredOnHost`); Hy4-flash needs 39 GiB. The setup
+wizard filters the same way (`visibleCatalog`). No current entry carries a `draft` companion —
 Qwen3.8-27B ships its MTP speculative weights inside the same repo and the
 native loader auto-detects them. The catalog still renders a draft companion
 (with its own install button, progress, cancel, and update controls)
@@ -765,17 +770,17 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 
 All state lives on disk; SQLite is only an index.
 
-| Source                              | Location                                                                                            | Written by                      | Kept                       |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------- | -------------------------- |
-| Trace records (v2)                  | `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`                                                     | inference process, one per turn | 30 days                    |
-| Runtime series                      | `~/.mlx-node/metrics/runtime/<date>-<pid>.jsonl`                                                    | inference process sampler       | 14 days                    |
-| Heartbeat                           | `~/.mlx-node/metrics/runtime/live-<pid>.json`                                                       | inference process sampler       | while the process runs     |
-| Supervisor state                    | `~/.mlx-node/desktop/supervisor.json`                                                               | desktop MAIN process            | latest only                |
-| Disposable SQLite index             | `~/.mlx-node/dashboard.db`                                                                          | Control Panel database worker   | rebuilt when needed        |
-| Local models                        | `--models-dir` → `MLX_MODELS_DIR` → `modelsDir` in `~/.mlx-node/config.json` → `~/.mlx-node/models` | downloads, `mlx convert`        | —                          |
-| Cold tier (paged prefix blocks)     | `~/.mlx-node/cache/paged/v1/` (`MLX_COLD_CACHE_DIR` override)                                       | inference process               | quota, LRU                 |
-| Stored states (Qwen3.5, Flash Next) | `~/.mlx-node/cache/prefix-cache/<namespace>/` (`--cache-dir` override)                              | inference process               | 14 days unused, root limit |
-| `mlx agent` sessions                | `<agentHome>/sessions/<encoded cwd>/<id>/` (`agentHome` = `GROK_HOME` or `~/.mlx-agent`)            | `mlx agent`                     | —                          |
+| Source                                         | Location                                                                                            | Written by                      | Kept                       |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------- | -------------------------- |
+| Trace records (v2)                             | `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`                                                     | inference process, one per turn | 30 days                    |
+| Runtime series                                 | `~/.mlx-node/metrics/runtime/<date>-<pid>.jsonl`                                                    | inference process sampler       | 14 days                    |
+| Heartbeat                                      | `~/.mlx-node/metrics/runtime/live-<pid>.json`                                                       | inference process sampler       | while the process runs     |
+| Supervisor state                               | `~/.mlx-node/desktop/supervisor.json`                                                               | desktop MAIN process            | latest only                |
+| Disposable SQLite index                        | `~/.mlx-node/dashboard.db`                                                                          | Control Panel database worker   | rebuilt when needed        |
+| Local models                                   | `--models-dir` → `MLX_MODELS_DIR` → `modelsDir` in `~/.mlx-node/config.json` → `~/.mlx-node/models` | downloads, `mlx convert`        | —                          |
+| Cold tier (paged prefix blocks)                | `~/.mlx-node/cache/paged/v1/` (`MLX_COLD_CACHE_DIR` override)                                       | inference process               | quota, LRU                 |
+| Stored states (Qwen3.5, Flash Next, Hy4-flash) | `~/.mlx-node/cache/prefix-cache/<namespace>/` (`--cache-dir` override)                              | inference process               | 14 days unused, root limit |
+| `mlx agent` sessions                           | `<agentHome>/sessions/<encoded cwd>/<id>/` (`agentHome` = `GROK_HOME` or `~/.mlx-agent`)            | `mlx agent`                     | —                          |
 
 Chat and Work add, under `~/.mlx-node/chat` (0700):
 
@@ -1129,10 +1134,10 @@ the Cache page lists it under Model caches (above).
   `null` when the cache is off). The dashboard live snapshot reads both per
   process; both are `null` from an engine that predates them. Whether a turn of a
   restore-allowlisted family used the cold tier is the trace row's `coldEnabled`;
-  the Cache page shows both. A Qwen3.5 or Flash Next turn's state tier is not in
+  the Cache page shows both. A Qwen3.5, Flash Next or Hy4-flash turn's state tier is not in
   `coldEnabled`: its row carries `stateTier` (Qwen3.5: `persistent`, `temp` or
   `off`, the most lasting mode over the engine's loaded models, with its numbers
-  in `/health` `memory_governor.dflash2_states`; Flash Next: the model's own
+  in `/health` `memory_governor.dflash2_states`; Flash Next and Hy4-flash: the model's own
   `stateTierMode()`, `persistent`, `temp` or `off`, with its numbers in
   `residencyInfo()`'s `prefixDisk*` counters; `prefixDiskAdopted` is what a
   restarted load took back from the SSD before any turn).

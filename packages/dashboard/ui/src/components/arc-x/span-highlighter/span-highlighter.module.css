@@ -1,0 +1,149 @@
+.root {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.legendBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.legendBtn:hover {
+  background: var(--row-hover);
+  color: var(--foreground);
+}
+
+.legendBtn[data-active='true'] {
+  border-color: var(--c, var(--accent));
+  background: color-mix(in oklab, var(--c, var(--accent)) 14%, var(--surface));
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--c, var(--accent));
+  flex: none;
+}
+
+.split {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.split[data-has-media='true'] {
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.9fr);
+}
+
+@media (max-width: 760px) {
+  .split[data-has-media='true'] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.textBox {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  color: var(--foreground);
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+.mark {
+  padding: 1px 3px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--c, var(--model-1)) 20%, transparent);
+  border-bottom: 2px solid var(--c, var(--model-1));
+  color: var(--foreground);
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
+}
+
+.mark[data-dim='true'] {
+  opacity: 0.25;
+}
+
+.mark[data-focused='true'] {
+  background: color-mix(in oklab, var(--c, var(--model-1)) 38%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--c, var(--model-1)) 45%, transparent);
+}
+
+.mediaCol {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2-5);
+  min-width: 0;
+}
+
+.mediaFrame {
+  display: grid;
+  gap: var(--space-1-5);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+}
+
+.mediaImgWrap {
+  display: grid;
+  place-items: center;
+  min-height: 8rem;
+  max-height: 18rem;
+  overflow: hidden;
+  border-radius: var(--radius-inset);
+  background: var(--surface-muted);
+}
+
+.mediaImg {
+  max-width: 100%;
+  max-height: 18rem;
+  object-fit: contain;
+}
+
+.mediaCaption {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .legendBtn,
+  .mark {
+    transition: none;
+  }
+}

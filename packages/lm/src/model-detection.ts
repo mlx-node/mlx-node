@@ -24,24 +24,69 @@ export async function readModelConfig(modelDir: string): Promise<unknown> {
   }
 }
 
+async function detectQwen35Sidecar(sidecarDir: string, allowClef: boolean): Promise<'clef' | 'clairic' | undefined> {
+  const checkSidecar = async (name: string, label: string): Promise<boolean> => {
+    try {
+      if (!(await stat(join(sidecarDir, name))).isFile()) {
+        throw new Error(`Invalid ${label} checkpoint: ${name} must be a regular file`);
+      }
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  const [clefAssets, clairicAssets] = await Promise.all([
+    allowClef
+      ? Promise.all(['joint_head_config.json', 'joint_head.safetensors'].map((name) => checkSidecar(name, 'CLEF')))
+      : Promise.resolve([false, false]),
+    Promise.all(['clair_head_config.json', 'clair_head.safetensors'].map((name) => checkSidecar(name, 'Clairic'))),
+  ]);
+  const hasAnyClef = clefAssets.some(Boolean);
+  const hasAnyClairic = clairicAssets.some(Boolean);
+  if (hasAnyClef && hasAnyClairic) {
+    throw new Error('Ambiguous checkpoint: both CLEF and Clairic head assets found');
+  }
+  if (hasAnyClef) {
+    if (!clefAssets.every(Boolean)) {
+      throw new Error('Incomplete CLEF checkpoint: both joint head assets are required');
+    }
+    return 'clef';
+  }
+  if (hasAnyClairic) {
+    if (!clairicAssets.every(Boolean)) {
+      throw new Error(
+        'Incomplete Clairic checkpoint: both clair_head_config.json and clair_head.safetensors are required',
+      );
+    }
+    return 'clairic';
+  }
+  return undefined;
+}
+
 /** The loader can supply its native header validator without changing family selection. */
 export async function detectModelType(
   modelPath: string,
   readArchitecture: (path: string) => string | Promise<string> = readGgufArchitecture,
 ): Promise<ModelType> {
   const isGguf = extname(modelPath).toLowerCase() === '.gguf';
+  const sidecarDir = isGguf ? dirname(modelPath) : modelPath;
   // A sibling config.json stays authoritative: discovery cross-checks it
   // against the GGUF header and rejects files that disagree. The header is
   // only consulted when no config exists (bare GGUF loads, staged clef
   // decision checkpoints reconstruct their own sidecars anyway).
   let config: unknown;
   try {
-    config = await readModelConfig(isGguf ? dirname(modelPath) : modelPath);
+    config = await readModelConfig(sidecarDir);
   } catch (error) {
     if (isGguf && (error as NodeJS.ErrnoException).code === 'ENOENT') {
       const architecture = await readArchitecture(modelPath);
       const type = GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
       if (type === undefined) throw new Error(`Unsupported GGUF architecture "${architecture}" in ${modelPath}`);
+      if (type === 'qwen3_5') {
+        const promoted = await detectQwen35Sidecar(sidecarDir, false);
+        if (promoted) return promoted;
+      }
       return type;
     }
     // `cause` preserves the real errno: an EACCES here is "couldn't look",
@@ -49,23 +94,9 @@ export async function detectModelType(
     throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`, { cause: error });
   }
   const family = matchFamily(modelPath, config);
-  if (family === 'qwen3_5' && !isGguf) {
-    const assets = await Promise.all(
-      ['joint_head_config.json', 'joint_head.safetensors'].map(async (name) => {
-        try {
-          if (!(await stat(join(modelPath, name))).isFile())
-            throw new Error(`Invalid CLEF checkpoint: ${name} must be a regular file`);
-          return true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-          throw error;
-        }
-      }),
-    );
-    if (assets.some(Boolean)) {
-      if (!assets.every(Boolean)) throw new Error('Incomplete CLEF checkpoint: both joint head assets are required');
-      return 'clef';
-    }
+  if (family === 'qwen3_5') {
+    const promoted = await detectQwen35Sidecar(sidecarDir, !isGguf);
+    if (promoted) return promoted;
   }
   return family;
 }

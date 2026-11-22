@@ -5,7 +5,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::attention::{PagedPass, PagedWaveLane, Qwen3_5Attention};
+use super::attention::{PagedPass, PagedWaveLane, Qwen3_5Attention, RopeMode};
 use super::config::Qwen3_5Config;
 use super::gated_delta_net::GatedDeltaNet;
 use super::gdn_blob::{GdnWaveCells, gdn_wave_layer};
@@ -182,6 +182,47 @@ impl DecoderLayer {
         Ok(Some((x, LayerResidual::Pending { h, delta: mlp_out })))
     }
 
+    /// Set the rotary position embedding mode for full-attention layers.
+    /// Linear (GDN) layers ignore this setting.
+    #[allow(dead_code)]
+    pub(crate) fn set_rope_mode(&mut self, mode: RopeMode) {
+        if let AttentionType::Full(attn) = &mut self.attn {
+            attn.set_rope_mode(mode);
+        }
+    }
+
+    /// Batched flat-cache forward pass with separate full-attention and linear
+    /// masks plus per-row valid lengths for right-padded GDN `conv_state`
+    /// updates.
+    ///
+    /// Routes `attn_mask` + `position_ids` to `Qwen3_5Attention::forward`, and
+    /// `linear_mask` + `linear_lengths` to
+    /// `GatedDeltaNet::forward_batched_masked`.
+    #[allow(dead_code)]
+    pub(crate) fn forward_batched_flat(
+        &self,
+        x: &MxArray,
+        attn_mask: Option<&MxArray>,
+        linear_mask: Option<&MxArray>,
+        linear_lengths: Option<&[i32]>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = match &self.attn {
+            AttentionType::Linear(gdn) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_batched_masked(&normed, linear_mask, linear_lengths, ac)?
+            }
+            AttentionType::Full(attn) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward(&normed, attn_mask, kvc, position_ids)?
+            }
+        };
+
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+        h.add(&self.mlp.forward(&normed)?)
+    }
     pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
         let is_linear = config.is_linear_layer(layer_idx);
 
@@ -845,6 +886,16 @@ impl DecoderLayer {
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
+    /// Enable Float32 RMSNorm evaluation on `input_layernorm`, `post_attention_layernorm`,
+    /// and (for full-attention layers) `q_norm` / `k_norm`.
+    pub(crate) fn set_precise_f32_norms(&mut self) {
+        self.input_layernorm.set_precise_f32();
+        self.post_attention_layernorm.set_precise_f32();
+        if let AttentionType::Full(attn) = &mut self.attn {
+            attn.set_precise_f32_norms();
+        }
+    }
+
     // ========== Weight getters (for training parameter extraction) ==========
 
     pub fn get_input_layernorm_weight(&self) -> MxArray {
@@ -936,5 +987,74 @@ mod tests {
                 _ => panic!("expected FullAttentionPaged at {i}"),
             }
         }
+    }
+
+    #[test]
+    fn forward_batched_flat_routes_linear_and_full_masks() {
+        let cfg = Qwen3_5Config {
+            rope_scaling: None,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            vocab_size: 32,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.5,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+        };
+        let mut linear_layer = DecoderLayer::new(&cfg, 0).unwrap();
+        let mut full_layer = DecoderLayer::new(&cfg, 1).unwrap();
+        assert!(linear_layer.is_linear());
+        assert!(!full_layer.is_linear());
+
+        // set_rope_mode is a no-op on linear layers and updates full layers.
+        linear_layer.set_rope_mode(RopeMode::Temporal);
+        full_layer.set_rope_mode(RopeMode::Temporal);
+
+        let x_data: Vec<f32> = (0..(2 * 4 * 64))
+            .map(|i| ((i as f32) * 0.031).sin() * 0.2)
+            .collect();
+        let x = MxArray::from_float32(&x_data, &[2, 4, 64]).unwrap();
+        let linear_mask = MxArray::from_int32(&[1, 1, 1, 0, 1, 1, 1, 1], &[2, 4])
+            .unwrap()
+            .greater(&MxArray::scalar_int(0).unwrap())
+            .unwrap();
+
+        let mut linear_cache = Qwen3_5LayerCache::new_linear();
+        let mut full_cache = Qwen3_5LayerCache::new_full_attention();
+        let out_lin = linear_layer
+            .forward_batched_flat(
+                &x,
+                None,
+                Some(&linear_mask),
+                Some(&[3, 4]),
+                Some(&mut linear_cache),
+                None,
+            )
+            .unwrap();
+        let out_full = full_layer
+            .forward_batched_flat(&out_lin, None, None, None, Some(&mut full_cache), None)
+            .unwrap();
+        assert_eq!(out_full.shape().unwrap().as_ref(), &[2, 4, 64]);
+        assert_eq!(full_cache.as_kv_cache_mut().unwrap().get_offset(), 4);
     }
 }

@@ -103,6 +103,19 @@ describe('Qwen3.8-Flash-Next launch preset', () => {
   });
 });
 
+describe('Hy4-flash launch preset', () => {
+  // `generation_config.json` and the GGUF's `general.sampling.*`: 0.9 / 1.0, top_k off.
+  it('samples at temperature 0.9, top_p 1.0, no top_k, no penalties', () => {
+    expect(launchPresetFor('hy_v4_flash')!.sampling).toEqual({
+      temperature: 0.9,
+      topP: 1.0,
+      minP: 0,
+      presencePenalty: 0,
+      repetitionPenalty: 1,
+    });
+  });
+});
+
 describe('scope lock: non-Qwen presets unchanged', () => {
   it('does not set the cutoff on the Gemma4 preset', () => {
     expect(GEMMA4_SAMPLING_DEFAULTS.maxConsecutiveTokens).toBeUndefined();

@@ -202,19 +202,20 @@ export interface InferenceHostOptions {
   kvFormat?: 'int8' | 'bf16';
   /**
    * Metal memory budget in bytes (`--max-memory`) for the families whose load
-   * plans its memory (qwen3_5 / qwen3_5_moe / qwen4_exp); it can only lower the automatic
+   * plans its memory (qwen3_5 / qwen3_5_moe / qwen4_exp / hy_v4_flash); it can only lower the automatic
    * budget. Other families never see it. Omitted ⇒ the automatic budget.
    */
   maxMemoryBytes?: number;
   /**
    * Context token limit (`--max-context`) for qwen3_5 / qwen3_5_moe /
    * qwen4_exp loads: every turn holds at most this many tokens, past the
-   * native window with YaRN, and a load whose plan holds fewer fails. Other
+   * native window with YaRN, and a load whose plan holds fewer fails.
+   * hy_v4_flash takes it too, capped at 262,144 with no YaRN. Other
    * families never see it. Omitted ⇒ the window the plan holds.
    */
   maxContextTokens?: number;
   /**
-   * SSD cache size (`--max-cache-disk`) for qwen3_5 / qwen3_5_moe / qwen4_exp loads:
+   * SSD cache size (`--max-cache-disk`) for qwen3_5 / qwen3_5_moe / qwen4_exp / hy_v4_flash loads:
    * `'auto'` or a byte count, `'0'` turns the cache off. Their memory plan
    * sets one DFlash2 state's staging aside while the cache is on. Other
    * families never see it. Omitted ⇒ `'auto'`.
@@ -223,8 +224,8 @@ export interface InferenceHostOptions {
   /**
    * The paged KV disk cache switch for every family: the cold tier of
    * `COLD_TIER_RESTORE_FAMILIES`, for qwen3_5 / qwen3_5_moe a persistent
-   * SSD state tier (off ⇒ a temporary one that goes at `close()`), and for
-   * qwen4_exp a persistent one (off ⇒ none). Resolved
+   * SSD state tier (off ⇒ a temporary one that goes at `close()`), likewise
+   * for hy_v4_flash, and for qwen4_exp a persistent one (off ⇒ none). Resolved
    * `flag` > `MLX_PERSIST_PAGED_CACHE` > `byDefault` and written to
    * `MLX_PERSIST_PAGED_CACHE` before any load. Omitted ⇒
    * {@link PERSIST_PAGED_CACHE_DEFAULT} (on).
@@ -232,7 +233,7 @@ export interface InferenceHostOptions {
   persistPagedCache?: PersistPagedCache;
   /**
    * The persistent SSD state tier's root (`--cache-dir`) for qwen3_5 /
-   * qwen3_5_moe / qwen4_exp loads; needs the switch on. Omitted ⇒
+   * qwen3_5_moe / qwen4_exp / hy_v4_flash loads; needs the switch on. Omitted ⇒
    * `~/.mlx-node/cache/prefix-cache`.
    */
   cacheDir?: string;
@@ -320,7 +321,7 @@ export interface InferenceHostOptions {
   collectGarbage?: Collector | null;
 }
 
-/** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe / qwen4_exp). */
+/** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe / qwen4_exp / hy_v4_flash). */
 interface CacheClosingModel {
   closeCache(deadlineMs: number): Promise<boolean>;
 }
@@ -477,7 +478,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       allModels.map((m) => m.name),
     );
   }
-  const boundEntry = requestedEntry ?? models.find((model) => model.modelType !== 'clef') ?? allModels[0];
+  const boundEntry =
+    requestedEntry ?? models.find((model) => familyDataFor(model.modelType)?.kind !== 'decision') ?? allModels[0];
 
   // `undefined` means "you pick"; `0` means "the kernel picks and I will read
   // it back". Only the former needs the up-front probe.
@@ -588,7 +590,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         {
           model: entry.name,
           modelType: String(entry.modelType),
-          capability: 'chat',
+          capability: familyDataFor(entry.modelType)?.kind === 'decision' ? 'decision' : 'chat',
           path: resolvedPath,
           warmupOf: readWarmupReport,
           residencyOf: readResidency,
@@ -885,13 +887,16 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
  * it. Every qwen4_exp turn (AR or MTP) takes its one window, which is the
  * estimate. qwen4_exp takes `draftModelPath`, `kvFormat`, `maxMemoryBytes`,
  * `maxContextTokens` and `cacheDisk`: the load sets its state staging aside only while its SSD
- * cache is on, so the estimate must decide that as the load does.
+ * cache is on, so the estimate must decide that as the load does. hy_v4_flash
+ * has no load-free estimate: its entry keeps the `--max-context` count or the
+ * trained window until the load reports its own.
  */
 export function nativeContextEstimate(
   qwen35: typeof estimateQwen35ContextWindow = estimateQwen35ContextWindow,
   qwen4Exp: typeof estimateQwen4ExpContextWindow = estimateQwen4ExpContextWindow,
 ): NonNullable<InferenceHostOptions['estimateContextWindow']> {
   return async (path, modelType, options) => {
+    if (modelType === 'hy_v4_flash') return null;
     if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
     const qwen4Options = {
       ...(options?.draftModelPath != null ? { draftModelPath: options.draftModelPath } : {}),

@@ -1,13 +1,22 @@
-import { createServer, type Server } from 'node:http';
+import {
+  Agent,
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import type { DecisionModel } from '@mlx-node/lm';
+import type { ClairicResult, DecisionModel, ExtractionModel } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { formatClefResult, validateClefRequest } from '../../packages/lm/src/clef-types.js';
 import { DecisionQueueFullError } from '../../packages/server/src/decision-registry.js';
+import { handleSystemOne } from '../../packages/server/src/endpoints/systemone.js';
 import { createHandler } from '../../packages/server/src/handler.js';
 import { makeSwapController } from '../../packages/server/src/host/swap.js';
+import type { MetricsTraceInput } from '../../packages/server/src/metrics-trace.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
@@ -260,5 +269,306 @@ describe('CLEF System One', () => {
     expect(score.confidence).toBeCloseTo(0.55);
     expect(formatted.answers.n).toEqual({ type: 'noul', noul: 0.3 });
     expect(() => validateClefRequest({ ...request, questions: { x: { type: 'made-up' } } })).toThrow();
+  });
+});
+
+const clairicResult: ClairicResult = {
+  model: 'clairic-flash',
+  answers: {
+    invoice_total: { value: 42.5, valid: true, complete: true, confidence: 0.99, p_null: 0.01, source: 'input' },
+  },
+  truncated: false,
+  usage: {
+    state_tokens: 100,
+    image_tokens: 0,
+    schema_tokens: 24,
+    input_tokens: 124,
+    output_tokens: 8,
+    passes: 1,
+  },
+};
+
+function clairicModel(): ExtractionModel & { extractRaw: ReturnType<typeof vi.fn> } {
+  return { kind: 'decision', extractRaw: vi.fn().mockResolvedValue(clairicResult) };
+}
+
+describe('Clairic System One', () => {
+  it('routes fields payloads to extractRaw with untouched raw JSON and request ID header', async () => {
+    const registry = new ModelRegistry();
+    const native = clairicModel();
+    registry.registerDecision('clairic-flash', native);
+    const base = await start(registry);
+    const raw =
+      '{"model":"clairic-flash","state":"Total: $42.50","fields":{"invoice_total":{"type":"number","decimals":2}}}';
+
+    const response = await fetch(`${base}/v1/systemone`, { method: 'POST', body: raw });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-typesafe-request-id')).toBeTruthy();
+    expect(await response.json()).toEqual(clairicResult);
+    expect(native.extractRaw).toHaveBeenCalledWith(raw, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it('rejects requests with both questions and fields, neither, or non-object fields', async () => {
+    const registry = new ModelRegistry();
+    const native = clairicModel();
+    registry.registerDecision('clairic-flash', native);
+    const base = await start(registry);
+
+    for (const body of [
+      { model: 'clairic-flash', state: 'x', questions: { q: { type: 'noul' } }, fields: { a: { type: 'text' } } },
+      { model: 'clairic-flash', state: 'x' },
+      { model: 'clairic-flash', state: 'x', fields: null },
+      { model: 'clairic-flash', state: 'x', fields: ['not-an-object'] },
+      { state: 'x', fields: { a: { type: 'text' } } },
+    ]) {
+      const response = await fetch(`${base}/v1/systemone`, { method: 'POST', body: JSON.stringify(body) });
+      expect(response.status).toBe(400);
+    }
+    expect(native.extractRaw).not.toHaveBeenCalled();
+  });
+
+  it('rejects capability mismatches between CLEF and Clairic models with 400', async () => {
+    const registry = new ModelRegistry();
+    const clef = model();
+    const clairic = clairicModel();
+    registry.registerDecision('clef-only', clef);
+    registry.registerDecision('clairic-only', clairic);
+    const base = await start(registry);
+
+    const fieldsToClef = await fetch(`${base}/v1/systemone`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'clef-only', state: 'x', fields: { a: { type: 'text' } } }),
+    });
+    expect(fieldsToClef.status).toBe(400);
+    expect(await fieldsToClef.json()).toMatchObject({
+      error: { message: expect.stringContaining('does not support extraction') },
+    });
+
+    const questionsToClairic = await fetch(`${base}/v1/systemone`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'clairic-only', state: 'x', questions: { q: { type: 'noul' } } }),
+    });
+    expect(questionsToClairic.status).toBe(400);
+    expect(await questionsToClairic.json()).toMatchObject({
+      error: { message: expect.stringContaining('does not support decisions') },
+    });
+
+    expect(clef.decideRaw).not.toHaveBeenCalled();
+    expect(clairic.extractRaw).not.toHaveBeenCalled();
+  });
+
+  it('maps Invalid Clairic request errors to 400 and DecisionQueueFullError to 429', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 0 });
+    const gate = deferred();
+    const started = deferred();
+    const native: ExtractionModel = {
+      kind: 'decision',
+      extractRaw: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Invalid Clairic request: unknown field type'))
+        .mockImplementationOnce(async () => {
+          started.resolve();
+          await gate.promise;
+          return clairicResult;
+        }),
+    };
+    registry.registerDecision('clairic-flash', native);
+    const base = await start(registry);
+
+    const bad = await fetch(`${base}/v1/systemone`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'clairic-flash', state: 'x', fields: { a: { type: 'bogus' } } }),
+    });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({
+      error: { message: expect.stringContaining('Invalid Clairic request:') },
+    });
+
+    const payload = JSON.stringify({ model: 'clairic-flash', state: 'x', fields: { a: { type: 'text' } } });
+    const inFlight = fetch(`${base}/v1/systemone`, { method: 'POST', body: payload });
+    await started.promise;
+
+    const rejected = await fetch(`${base}/v1/systemone`, { method: 'POST', body: payload });
+    expect(rejected.status).toBe(429);
+
+    gate.resolve();
+    expect((await inFlight).status).toBe(200);
+  });
+
+  it('accepts /v1/systemone payloads larger than 10 MiB up to 16 MiB and rejects > 16 MiB', async () => {
+    const registry = new ModelRegistry();
+    const native = clairicModel();
+    registry.registerDecision('clairic-flash', native);
+    const base = await start(registry);
+
+    const elevenMiB = JSON.stringify({
+      model: 'clairic-flash',
+      state: 'a'.repeat(11 * 1024 * 1024),
+      fields: { summary: { type: 'text' } },
+    });
+    const accepted = await fetch(`${base}/v1/systemone`, { method: 'POST', body: elevenMiB });
+    expect(accepted.status).toBe(200);
+    expect(native.extractRaw).toHaveBeenCalledTimes(1);
+
+    const seventeenMiB = JSON.stringify({
+      model: 'clairic-flash',
+      state: 'a'.repeat(17 * 1024 * 1024),
+      fields: { summary: { type: 'text' } },
+    });
+    const tooLarge = await fetch(`${base}/v1/systemone`, { method: 'POST', body: seventeenMiB });
+    expect(tooLarge.status).toBe(400);
+    expect(await tooLarge.json()).toMatchObject({
+      error: { message: 'Request body too large' },
+    });
+    expect(native.extractRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes keep-alive connections after oversized bodies on /v1/responses, /v1/messages, and /v1/messages/count_tokens', async () => {
+    const registry = new ModelRegistry();
+    const base = await start(registry);
+    const elevenMiB = JSON.stringify({ data: 'x'.repeat(11 * 1024 * 1024) });
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      for (const route of ['/v1/responses', '/v1/messages', '/v1/messages/count_tokens']) {
+        const rejected = await new Promise<{ status: number; connection: string | undefined; body: unknown }>(
+          (resolve, reject) => {
+            let settled = false;
+            const req = httpRequest(
+              `${base}${route}`,
+              {
+                method: 'POST',
+                agent,
+                headers: { 'Content-Length': Buffer.byteLength(elevenMiB) },
+              },
+              (res) => {
+                let text = '';
+                res.on('data', (chunk) => {
+                  text += chunk;
+                });
+                res.on('error', (err) => {
+                  if (!settled) {
+                    settled = true;
+                    reject(err);
+                  }
+                });
+                res.on('end', () => {
+                  if (!settled) {
+                    settled = true;
+                    resolve({
+                      status: res.statusCode ?? 0,
+                      connection: res.headers.connection,
+                      body: JSON.parse(text),
+                    });
+                  }
+                });
+              },
+            );
+            req.on('error', (err) => {
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
+            });
+            req.setTimeout(5000, () => req.destroy(new Error(`oversized request timed out on ${route}`)));
+            req.end(elevenMiB);
+          },
+        );
+        expect(rejected.status).toBe(400);
+        expect(rejected.connection).toBe('close');
+        expect(rejected.body).toMatchObject({ error: { message: 'Request body too large' } });
+
+        // Follow-up request through the same keep-alive agent must not hang on unread body bytes.
+        const followup = await new Promise<number>((resolve, reject) => {
+          const req = httpRequest(`${base}/health`, { method: 'GET', agent }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          });
+          req.on('error', reject);
+          req.setTimeout(2000, () => req.destroy(new Error(`follow-up request hung after ${route}`)));
+          req.end();
+        });
+        expect(followup).toBe(200);
+      }
+    } finally {
+      agent.destroy();
+    }
+  });
+
+  it('includes resident decision models in registry.listResidentModels()', () => {
+    const registry = new ModelRegistry();
+    const native = clairicModel();
+    registry.registerAny('clairic-flash', native, {
+      identity: { modelId: 'clairic-flash', modelType: 'clairic', contextWindow: 65536 },
+    });
+    registry.registerAny('clairic-alias', native);
+    const resident = registry.listResidentModels();
+    expect(resident).toHaveLength(1);
+    expect(resident[0]!.kind).toBe('decision');
+    expect(resident[0]!.names).toEqual(['clairic-flash', 'clairic-alias']);
+    expect(resident[0]!.sessions.identity).toEqual({
+      modelId: 'clairic-flash',
+      modelType: 'clairic',
+      contextWindow: 65536,
+    });
+    expect(resident[0]!.sessions.servedWindowTokens).toBe(65536);
+
+    registry.unregister('clairic-flash');
+    registry.unregister('clairic-alias');
+    expect(registry.listResidentModels()).toEqual([]);
+  });
+
+  it('emits a metrics-trace record for completed /v1/systemone requests and tolerates sink errors', async () => {
+    const registry = new ModelRegistry();
+    const native = clairicModel();
+    registry.registerAny('clairic-flash', native, {
+      identity: { modelId: 'clairic-flash', modelType: 'clairic', contextWindow: 65536 },
+    });
+    const recorded: MetricsTraceInput[] = [];
+    const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        void handleSystemOne(req, res, raw, registry, null, undefined, undefined, undefined, {
+          record: (rec) => {
+            recorded.push(rec);
+            if (recorded.length === 2) throw new Error('disk full');
+          },
+        });
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    const body = JSON.stringify({
+      model: 'clairic-flash',
+      state: 'Total: $42.50',
+      images: ['data:image/png;base64,AAAA'],
+      fields: { invoice_total: { type: 'number' } },
+    });
+    const first = await fetch(`${base}/v1/systemone`, { method: 'POST', body });
+    expect(first.status).toBe(200);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      model: 'clairic-flash',
+      modelId: 'clairic-flash',
+      modelType: 'clairic',
+      outcome: 'ok',
+      endpoint: 'systemone',
+      stream: false,
+      dispatch: 'start',
+      finishReason: 'stop',
+      promptTokens: 124,
+      outputTokens: 8,
+      ctxWindow: 65536,
+      imageCount: 1,
+      toolCount: 0,
+    });
+
+    // A throwing trace sink must not fail the response.
+    const second = await fetch(`${base}/v1/systemone`, { method: 'POST', body });
+    expect(second.status).toBe(200);
+    expect(recorded).toHaveLength(2);
   });
 });

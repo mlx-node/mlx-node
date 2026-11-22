@@ -4777,8 +4777,8 @@ impl PagedKVCacheAdapter {
         Ok((key, value))
     }
 
-    /// The index plane of `layer_idx` as a fresh bf16 view, `None` for a
-    /// pool without one.
+    /// The index plane of `layer_idx` as a fresh view in the pool's index
+    /// dtype, `None` for a pool without one.
     #[cfg(target_os = "macos")]
     fn raw_index_array(&self, layer_idx: u32) -> Result<Option<MxArray>, String> {
         if self.layer_kv_pool.layout().index_rows == 0 {
@@ -4993,14 +4993,27 @@ impl PagedKVCacheAdapter {
             }
             if state.dirty {
                 dirty_layers.push(layer_idx);
-                arrays.push(state.key.clone());
-                arrays.push(state.value.clone());
-                arrays.push(state.k_scale.clone());
-                arrays.push(state.v_scale.clone());
-                arrays.extend(state.index.clone());
+                let mut push_pending = |arr: &MxArray| {
+                    if !arr.is_available() {
+                        arrays.push(arr.clone());
+                    }
+                };
+                push_pending(&state.key);
+                push_pending(&state.value);
+                push_pending(&state.k_scale);
+                push_pending(&state.v_scale);
+                if let Some(idx_arr) = &state.index {
+                    push_pending(idx_arr);
+                }
             }
         }
+        if dirty_layers.is_empty() {
+            return Ok(());
+        }
         if arrays.is_empty() {
+            for state in self.native_pool_arrays.iter_mut().flatten() {
+                state.dirty = false;
+            }
             return Ok(());
         }
         let trace_enabled = inference_trace_enabled();
@@ -5053,15 +5066,21 @@ impl PagedKVCacheAdapter {
         if !state.dirty {
             return Ok(());
         }
-        let pending: Vec<MxArray> = [
-            state.key.clone(),
-            state.value.clone(),
-            state.k_scale.clone(),
-            state.v_scale.clone(),
-        ]
-        .into_iter()
-        .chain(state.index.clone())
-        .collect();
+        let mut pending: Vec<MxArray> = Vec::with_capacity(4 + usize::from(state.index.is_some()));
+        for arr in [&state.key, &state.value, &state.k_scale, &state.v_scale]
+            .into_iter()
+            .chain(state.index.iter())
+        {
+            if !arr.is_available() {
+                pending.push(arr.clone());
+            }
+        }
+        if pending.is_empty() {
+            if let Some(Some(state)) = self.native_pool_arrays.get_mut(idx) {
+                state.dirty = false;
+            }
+            return Ok(());
+        }
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(Instant::now);
         if trace_enabled {
@@ -9531,6 +9550,21 @@ impl PagedKVCacheAdapter {
         self.raw_value_pool_array(layer_idx)
     }
 
+    /// Wrap the index plane buffer for `layer_idx` (`[num_blocks, index_rows,
+    /// index_dim]`) as a zero-copy MxArray view, returning the last native
+    /// write's output while the pool generation matches.
+    #[cfg(target_os = "macos")]
+    pub fn index_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+            && let Some(index) = state.index.as_ref()
+        {
+            return Ok(index.clone());
+        }
+        self.raw_index_array(layer_idx)?
+            .ok_or_else(|| "the pool has no index plane".to_string())
+    }
+
     /// The K and V scale planes of `layer_idx` for a `&self` reader, like
     /// [`Self::key_pool_array`]: the last native write's outputs while the
     /// pool generation matches, else fresh views; the unit `[1]` array for a
@@ -9586,9 +9620,12 @@ impl PagedKVCacheAdapter {
             .map(|block| self.index_plane_row(block))
             .collect::<Result<Vec<_>, _>>()?;
         let slots = MxArray::from_int32(&slots, &[i64::from(count)]).map_err(|e| e.to_string())?;
-        let rows = rows
-            .astype(crate::array::DType::BFloat16)
-            .map_err(|e| e.to_string())?;
+        let target_dt = metal_io_dtype(self.layer_kv_pool.index_dtype())?;
+        let rows = if rows.dtype().map_err(|e| e.to_string())? == target_dt {
+            rows.clone()
+        } else {
+            rows.astype(target_dt).map_err(|e| e.to_string())?
+        };
         self.native_pool_arrays_for_layer(layer_idx)?;
         let idx = layer_idx as usize;
         let plane = self.native_pool_arrays[idx]
@@ -9618,8 +9655,8 @@ impl PagedKVCacheAdapter {
     }
 
     /// The pooled keys of the active request's first `blocks` complete index
-    /// blocks of `layer_idx`, `[blocks, index_dimension]` bf16, from the
-    /// index plane as last written.
+    /// blocks of `layer_idx`, `[blocks, index_dimension]` in the pool's index
+    /// dtype, from the index plane as last written.
     #[cfg(target_os = "macos")]
     pub fn index_rows(&self, layer_idx: u32, blocks: u32) -> Result<MxArray, String> {
         let layout = self.layer_kv_pool.layout();
@@ -9677,6 +9714,12 @@ impl PagedKVCacheAdapter {
     #[cfg(not(target_os = "macos"))]
     pub fn key_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
         Err("key_pool_array is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub for `index_pool_array`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn index_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        Err("index_pool_array is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Non-macOS stub for `value_pool_array`.

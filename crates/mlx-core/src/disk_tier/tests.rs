@@ -317,6 +317,22 @@ fn temp_tier_leaves_nothing_behind() {
     drop(live_lock);
 }
 
+/// Drops `tier` and waits until its writer lets its namespace go: a closed
+/// persistent tier keeps its lock until the writer thread returns.
+fn release(tier: Arc<DiskTier>) {
+    let dir = tier.persistent.then(|| tier.dir());
+    drop(tier);
+    let Some(dir) = dir else { return };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while matches!(take_lock(&dir), Taken::Held) {
+        assert!(
+            Instant::now() < deadline,
+            "the closed tier's writer keeps its namespace"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Splash `openDiskTier` / `CacheDirectory`: a held namespace keeps a
 /// temporary tier; idle namespaces count as held room, the stale ones go,
 /// and the oldest go first while the root is over its limit; a refused or
@@ -342,7 +358,7 @@ fn held_namespace_falls_back_to_temp() {
     );
     assert_ne!(second.dir(), first.dir());
     drop(second);
-    drop(first);
+    release(first);
 
     let day = Duration::from_secs(24 * 60 * 60);
     let stale = plant_namespace(&cache, NS_A, GIB, 15 * day);
@@ -351,18 +367,18 @@ fn held_namespace_falls_back_to_temp() {
     assert!(tier.persistent);
     assert!(!stale.exists(), "a namespace unused for 14 days goes");
     assert!(fresh.exists());
-    drop(tier);
+    release(tier);
 
     let older = plant_namespace(&cache, NS_A, 5 * GIB, 2 * day);
     let tier = open_disk_tier(&options, || identity(NS), 160).expect("persistent tier");
     assert_eq!(tier.held, 10 * GIB, "both idle siblings count");
-    drop(tier);
+    release(tier);
 
     let tight = persistent_options(&root, CacheDisk::Bytes(6 * GIB));
     let tier = open_disk_tier(&tight, || identity(NS), 160).expect("persistent tier");
     assert!(!older.exists(), "the oldest sibling goes first");
     assert!(fresh.exists());
-    drop(tier);
+    release(tier);
 
     set_volume(
         &cache,

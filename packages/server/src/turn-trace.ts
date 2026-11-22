@@ -172,6 +172,22 @@ function notifyEdge(): void {
   }
 }
 
+/** Notify the runtime sampler of a non-chat turn edge (e.g. System One). */
+export function notifyTurnEdge(): void {
+  notifyEdge();
+}
+
+/** Credit a non-chat turn (e.g. System One) to the process-wide turn counters and nudge the sampler. */
+export function recordExternalTurn(outcome: 'ok' | 'error' | 'cancelled', outputTokens = 0): void {
+  if (outcome === 'ok') COUNTERS.ok += 1;
+  else if (outcome === 'cancelled') COUNTERS.cancelled += 1;
+  else COUNTERS.error += 1;
+  if (typeof outputTokens === 'number' && Number.isFinite(outputTokens) && outputTokens > 0) {
+    COUNTERS.outputTokens += Math.floor(outputTokens);
+  }
+  notifyEdge();
+}
+
 /** One turn of this model in native flight. */
 export interface LiveTurn {
   traceId: string;
@@ -313,8 +329,8 @@ export interface TurnTraceDeps {
   sidecarStats?: () => ColdSidecarStats | undefined;
   /**
    * The SSD state tier's mode over the loaded models. Default: the wrapped
-   * model's own `stateTierMode()` where it has one (`qwen4_exp`, which the
-   * governor does not see), else the native addon's governor status.
+   * model's own `stateTierMode()` where it has one (`qwen4_exp`, `hy_v4_flash`,
+   * whose tiers the governor does not see), else the native addon's governor status.
    */
   stateTierMode?: () => string | undefined;
   /** Clock for `ts`, `durationMs`, and the trace filename. Default: `Date.now`. */
@@ -673,7 +689,7 @@ export class TurnTraceModel implements SessionCapableModel {
   }
 
   /**
-   * The wrapped model's own state tier reader (`qwen4_exp`'s `stateTierMode()`),
+   * The wrapped model's own state tier reader (`qwen4_exp`'s and `hy_v4_flash`'s `stateTierMode()`),
    * else the governor's, which only Qwen3.5 publishes to.
    */
   private modelStateTierMode(): () => string | undefined {

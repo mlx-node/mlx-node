@@ -579,6 +579,69 @@ impl KVCache {
         })
     }
 
+    /// Broadcast a batch-1 prefix cache `[1, Hkv, offset, D]` to `[batch, Hkv, offset, D]`.
+    ///
+    /// Returns an error if `batch < 1`, if only one of `keys`/`values` is populated,
+    /// or if the current cached batch dimension is not 1.
+    pub fn broadcast_batch(&self, batch: i64) -> Result<Self> {
+        let batch_i32 = i32::try_from(batch)
+            .ok()
+            .filter(|&b| b >= 1)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "KVCache::broadcast_batch requires batch in 1..=i32::MAX, got {batch}"
+                ))
+            })?;
+        match (&self.keys, &self.values) {
+            (None, None) => Ok(Self {
+                keys: None,
+                values: None,
+                offset: self.offset,
+                step: self.step,
+                pending_rows: self.pending_rows,
+            }),
+            (Some(keys), Some(values)) => {
+                let k_batch = keys.shape_at(0)?;
+                let v_batch = values.shape_at(0)?;
+                if k_batch != 1 || v_batch != 1 {
+                    return Err(Error::from_reason(format!(
+                        "KVCache::broadcast_batch requires batch=1, got keys={k_batch}, values={v_batch}"
+                    )));
+                }
+                if self.offset <= 0 {
+                    return Ok(Self {
+                        keys: None,
+                        values: None,
+                        offset: 0,
+                        step: self.step,
+                        pending_rows: self.pending_rows,
+                    });
+                }
+                let offset = i64::from(self.offset);
+                let k_valid = keys.slice_axis(2, 0, offset)?;
+                let v_valid = values.slice_axis(2, 0, offset)?;
+                let (new_k, new_v) = if batch == 1 {
+                    (k_valid.deep_copy()?, v_valid.deep_copy()?)
+                } else {
+                    (
+                        MxArray::tile(&k_valid, &[batch_i32, 1, 1, 1])?,
+                        MxArray::tile(&v_valid, &[batch_i32, 1, 1, 1])?,
+                    )
+                };
+                Ok(Self {
+                    keys: Some(new_k),
+                    values: Some(new_v),
+                    offset: self.offset,
+                    step: self.step,
+                    pending_rows: self.pending_rows,
+                })
+            }
+            _ => Err(Error::from_reason(
+                "KVCache::broadcast_batch found mismatched keys/values state",
+            )),
+        }
+    }
+
     /// Retain a bounded suffix. Position encodings must use a separate absolute
     /// cursor: this cache's offset counts resident rows only.
     pub(crate) fn retain_recent(&mut self, rows: usize) -> Result<()> {
