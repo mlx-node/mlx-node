@@ -2290,4 +2290,83 @@ mod fused_metal {
             assert_eq!(causal_pick, full_pick, "pick_groups ({label}) mismatch");
         }
     }
+
+    #[test]
+    #[ignore = "GPU microbenchmark for indexer prefill BN_G tiling"]
+    fn indexer_score_prefill_bench_timing() {
+        let h = 16usize;
+        let d = 128usize;
+        let index_rows = 8usize;
+        let iters = 15usize;
+        for (label, s, n_groups, vis_start) in [
+            ("C0_exact4k_causal", 4096usize, 1024usize, 0usize),
+            ("C6_mid_causal", 4096, 2048, 1024),
+            ("C32_causal", 4096, 7763, 7763 - 1024),
+            ("C32_full", 4096, 7763, 7763),
+        ] {
+            let mut rng = Rng(951 + n_groups as u64);
+            let q = arr(&rng.vec(s * h * d, 1.0), &[s, h, d]);
+            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
+            let keys_f16 = arr(&rng.vec(n_groups * d, 1.0), &[n_groups, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+            let n_pages = n_groups.div_ceil(index_rows);
+            let n_blocks = n_pages + 9;
+            let pages_u32 = scattered_pages(n_pages, n_blocks);
+            let pages_arr = page_ids(&pages_u32).unwrap();
+            let paged_pool =
+                pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
+            q.eval();
+            w.eval();
+            paged_pool.eval();
+            pages_arr.eval();
+
+            let vis_arr = if vis_start < n_groups {
+                let vis: Vec<i32> = (0..s)
+                    .map(|r| (vis_start + (r / 4) + 1).min(n_groups) as i32)
+                    .collect();
+                let a = MxArray::from_int32(&vis, &[s as i64]).unwrap();
+                a.eval();
+                Some(a)
+            } else {
+                None
+            };
+
+            for _ in 0..3 {
+                let o = try_indexer_score_causal(
+                    &q,
+                    &w,
+                    &paged_pool,
+                    Some(&pages_arr),
+                    vis_arr.as_ref(),
+                    n_groups,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+                o.eval();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let o = try_indexer_score_causal(
+                    &q,
+                    &w,
+                    &paged_pool,
+                    Some(&pages_arr),
+                    vis_arr.as_ref(),
+                    n_groups,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+                o.eval();
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            eprintln!(
+                "[indexer_prefill_bench] {label} (S={s} N_g={n_groups}): {ms:.3} ms/L (12L={:.2} ms)",
+                ms * 12.0
+            );
+        }
+    }
 }

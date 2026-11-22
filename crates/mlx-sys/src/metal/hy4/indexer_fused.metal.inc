@@ -247,7 +247,8 @@ inline void hy4_indexer_score_prefill_nax_impl(
     uint tid,
     uint lane,
     uint sg) {
-  constexpr uint BN_G = 128u;
+  constexpr uint BN_G = 64u;
+  constexpr uint N_SUB_MAX = BN_G / 32u;
   constexpr uint HALF_STRIDE = BN_G * 64u;
 
   const uint S = params[0];
@@ -273,20 +274,18 @@ inline void hy4_indexer_score_prefill_nax_impl(
     }
   }
 
-  const uint n_sub = metal::min(4u, (vis_max - g0 + 31u) >> 5);
+  const uint n_sub = metal::min(N_SUB_MAX, (vis_max - g0 + 31u) >> 5);
   const uint load_rows = n_sub * 32u;
+  const bool full_g = (g0 + BN_G) <= vis_max;
 
-  for (uint i = tid; i < load_rows * 16u; i += 128u) {
-    const uint r = i >> 4;
-    const uint c16 = i & 15u;
-    const uint half_idx = c16 >> 3;
-    const uint c8 = c16 & 7u;
-    const uint sw = uint(hy4_swz_c8(int(c8), int(r)));
-    const uint g = g0 + r;
-    threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
-        k_tile + half_idx * HALF_STRIDE + r * 64u + sw * 8u);
-    if (g < vis_max) {
-      const uint g_abs = start_g + g;
+  if (full_g) {
+    for (uint i = tid; i < BN_G * 16u; i += 128u) {
+      const uint r = i >> 4;
+      const uint c16 = i & 15u;
+      const uint half_idx = c16 >> 3;
+      const uint c8 = c16 & 7u;
+      const uint sw = uint(hy4_swz_c8(int(c8), int(r)));
+      const uint g_abs = start_g + g0 + r;
       size_t k_row;
       if constexpr (PAGED) {
         const uint page_idx = g_abs / uint(INDEX_ROWS);
@@ -296,10 +295,37 @@ inline void hy4_indexer_score_prefill_nax_impl(
       } else {
         k_row = size_t(g_abs);
       }
+      threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
+          k_tile + half_idx * HALF_STRIDE + r * 64u + sw * 8u);
       *dst = *reinterpret_cast<const device float4*>(
           k_pool + k_row * 128u + size_t(c16) * 8u);
-    } else {
-      *dst = float4(0.0f);
+    }
+  } else {
+    for (uint i = tid; i < load_rows * 16u; i += 128u) {
+      const uint r = i >> 4;
+      const uint c16 = i & 15u;
+      const uint half_idx = c16 >> 3;
+      const uint c8 = c16 & 7u;
+      const uint sw = uint(hy4_swz_c8(int(c8), int(r)));
+      const uint g = g0 + r;
+      threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(
+          k_tile + half_idx * HALF_STRIDE + r * 64u + sw * 8u);
+      if (g < vis_max) {
+        const uint g_abs = start_g + g;
+        size_t k_row;
+        if constexpr (PAGED) {
+          const uint page_idx = g_abs / uint(INDEX_ROWS);
+          const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
+          const int phys_page = page_ids[page_idx];
+          k_row = size_t(phys_page) * size_t(INDEX_ROWS) + size_t(local_row);
+        } else {
+          k_row = size_t(g_abs);
+        }
+        *dst = *reinterpret_cast<const device float4*>(
+            k_pool + k_row * 128u + size_t(c16) * 8u);
+      } else {
+        *dst = float4(0.0f);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -319,33 +345,31 @@ inline void hy4_indexer_score_prefill_nax_impl(
   const bool ok1 = sr1 < S;
   const int q_ld = H * 128;
 
-  mlx::steel::NAXTile<float, 1, 2> acc[4];
+  mlx::steel::NAXTile<float, 1, 2> acc[N_SUB_MAX];
   STEEL_PRAGMA_UNROLL
-  for (uint gb = 0u; gb < 4u; ++gb) {
-    if (gb < n_sub) {
-      acc[gb].clear();
-    }
+  for (uint gb = 0u; gb < N_SUB_MAX; ++gb) {
+    acc[gb].clear();
   }
 
-  for (uint h = 0u; h < uint(H); ++h) {
-    const float w0 = ok0 ? w[size_t(sr0) * size_t(H) + size_t(h)] : 0.0f;
-    const float w1 = ok1 ? w[size_t(sr1) * size_t(H) + size_t(h)] : 0.0f;
-    const device float* q_ptr =
-        q + (size_t(s_sg) * size_t(H) + size_t(h)) * 128u;
+  if (n_sub == N_SUB_MAX) {
+    for (uint h = 0u; h < uint(H); ++h) {
+      const float w0 = ok0 ? w[size_t(sr0) * size_t(H) + size_t(h)] : 0.0f;
+      const float w1 = ok1 ? w[size_t(sr1) * size_t(H) + size_t(h)] : 0.0f;
+      const device float* q_ptr =
+          q + (size_t(s_sg) * size_t(H) + size_t(h)) * 128u;
 
-    mlx::steel::NAXTile<half, 1, 4> q_h0;
-    mlx::steel::NAXTile<half, 1, 4> q_h1;
-    if (valid_s == 16) {
-      q_h0.load(q_ptr, q_ld);
-      q_h1.load(q_ptr + 64, q_ld);
-    } else {
-      q_h0.load_rows(q_ptr, q_ld, valid_s);
-      q_h1.load_rows(q_ptr + 64, q_ld, valid_s);
-    }
+      mlx::steel::NAXTile<half, 1, 4> q_h0;
+      mlx::steel::NAXTile<half, 1, 4> q_h1;
+      if (valid_s == 16) {
+        q_h0.load(q_ptr, q_ld);
+        q_h1.load(q_ptr + 64, q_ld);
+      } else {
+        q_h0.load_rows(q_ptr, q_ld, valid_s);
+        q_h1.load_rows(q_ptr + 64, q_ld, valid_s);
+      }
 
-    STEEL_PRAGMA_UNROLL
-    for (uint gb = 0u; gb < 4u; ++gb) {
-      if (gb < n_sub) {
+      STEEL_PRAGMA_UNROLL
+      for (uint gb = 0u; gb < N_SUB_MAX; ++gb) {
         mlx::steel::NAXTile<float, 1, 2> dot_h;
         dot_h.clear();
         mlx::steel::NAXTile<half, 2, 4> kt;
@@ -369,10 +393,54 @@ inline void hy4_indexer_score_prefill_nax_impl(
         }
       }
     }
+  } else {
+    for (uint h = 0u; h < uint(H); ++h) {
+      const float w0 = ok0 ? w[size_t(sr0) * size_t(H) + size_t(h)] : 0.0f;
+      const float w1 = ok1 ? w[size_t(sr1) * size_t(H) + size_t(h)] : 0.0f;
+      const device float* q_ptr =
+          q + (size_t(s_sg) * size_t(H) + size_t(h)) * 128u;
+
+      mlx::steel::NAXTile<half, 1, 4> q_h0;
+      mlx::steel::NAXTile<half, 1, 4> q_h1;
+      if (valid_s == 16) {
+        q_h0.load(q_ptr, q_ld);
+        q_h1.load(q_ptr + 64, q_ld);
+      } else {
+        q_h0.load_rows(q_ptr, q_ld, valid_s);
+        q_h1.load_rows(q_ptr + 64, q_ld, valid_s);
+      }
+
+      STEEL_PRAGMA_UNROLL
+      for (uint gb = 0u; gb < N_SUB_MAX; ++gb) {
+        if (gb < n_sub) {
+          mlx::steel::NAXTile<float, 1, 2> dot_h;
+          dot_h.clear();
+          mlx::steel::NAXTile<half, 2, 4> kt;
+          hy4_load_tile_swz64(kt, k_tile + size_t(gb * 32u) * 64u, fm, fn);
+          mlx::steel::tile_matmad_nax(
+              dot_h, q_h0, metal::false_type{}, kt, metal::true_type{});
+          hy4_load_tile_swz64(
+              kt, k_tile + HALF_STRIDE + size_t(gb * 32u) * 64u, fm, fn);
+          mlx::steel::tile_matmad_nax(
+              dot_h, q_h1, metal::false_type{}, kt, metal::true_type{});
+
+          STEEL_PRAGMA_UNROLL
+          for (short f = 0; f < 2; ++f) {
+            const thread auto& df = dot_h.frag_at(0, f);
+            thread auto& af = acc[gb].frag_at(0, f);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; ++j) {
+              af[j] = metal::fma(w0, metal::max(df[j], 0.0f), af[j]);
+              af[4 + j] = metal::fma(w1, metal::max(df[4 + j], 0.0f), af[4 + j]);
+            }
+          }
+        }
+      }
+    }
   }
 
   STEEL_PRAGMA_UNROLL
-  for (uint gb = 0u; gb < 4u; ++gb) {
+  for (uint gb = 0u; gb < N_SUB_MAX; ++gb) {
     if (gb < n_sub) {
       const uint g_sub = g0 + gb * 32u;
       const short valid_g = short(max(0, min(32, int(vis_max) - int(g_sub))));

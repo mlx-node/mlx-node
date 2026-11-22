@@ -1771,9 +1771,16 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
                     "mla_decode_v2 H={h} split={split} S={s} kmax={kmax}: max_abs={max_abs:e} > 1e-3"
                 );
 
-                // Exact bitwise equality between kmax=836 and kmax=837 with trailing -1.
-                if kmax == 836 {
-                    let kmax_pad = 837usize;
+                // Exact bitwise equality across split-count boundaries when
+                // trailing -1 padding extends kmax (SINGLE_SPLIT, sliding, and
+                // max_splits_nax boundaries).
+                let pad_delta = match kmax {
+                    64 | 512 | 836 => Some(1usize),
+                    2048 => Some(4usize),
+                    _ => None,
+                };
+                if let Some(delta) = pad_delta {
+                    let kmax_pad = kmax + delta;
                     let mut idx_pad = vec![-1i32; s * kmax_pad];
                     for row in 0..s {
                         idx_pad[row * kmax_pad..row * kmax_pad + kmax]
@@ -1786,7 +1793,7 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
                     assert_eq!(
                         bits(&got_arr),
                         bits(&pad_arr),
-                        "H={h} split={split} S={s}: kmax=836 vs padded kmax=837 bits differ"
+                        "H={h} split={split} S={s}: kmax={kmax} vs padded kmax={kmax_pad} bits differ"
                     );
                 }
             }
@@ -1956,7 +1963,10 @@ fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
         (64usize, false, 521u64),
     ] {
         for &s in &[1usize, 2usize, 4usize, 16usize] {
-            for &kmax in &[17usize, 512usize, 836usize] {
+            for &kmax in &[17usize, 64usize, 512usize, 836usize, 2048usize] {
+                if kmax == 2048 && s > 4 {
+                    continue;
+                }
                 let n = kmax + 19;
                 let mut r = Rng(seed_base + (s * 1009 + kmax * 37) as u64);
                 let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
@@ -2008,9 +2018,16 @@ fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
                     "H={h} split={split} S={s} kmax={kmax}: max_abs={max_abs:e} > 1e-3"
                 );
 
-                // Exact bitwise equality between kmax=836 and kmax=837 with trailing -1.
-                if kmax == 836 {
-                    let kmax_pad = 837usize;
+                // Exact bitwise equality across split-count boundaries when
+                // trailing -1 padding extends kmax (SINGLE_SPLIT, sliding, and
+                // max_splits_nax boundaries).
+                let pad_delta = match kmax {
+                    64 | 512 | 836 => Some(1usize),
+                    2048 => Some(4usize),
+                    _ => None,
+                };
+                if let Some(delta) = pad_delta {
+                    let kmax_pad = kmax + delta;
                     let mut idx_pad = vec![-1i32; s * kmax_pad];
                     for row in 0..s {
                         idx_pad[row * kmax_pad..row * kmax_pad + kmax]
@@ -2023,7 +2040,7 @@ fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
                     assert_eq!(
                         bits(&got_arr),
                         bits(&pad_arr),
-                        "H={h} split={split} S={s}: kmax=836 vs padded kmax=837 bits differ"
+                        "H={h} split={split} S={s}: kmax={kmax} vs padded kmax={kmax_pad} bits differ"
                     );
                 }
             }
@@ -2101,6 +2118,130 @@ fn mla_decode_bench_timing() {
     eprintln!(
         "[mla_decode_bench:{mode}] 42L est: M=1 {m1_42l:.3} ms, M=2 {m2_42l:.3} ms, M=4 {m4_42l:.3} ms"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "serialized cold-KV MLA decode microbenchmark"]
+fn mla_decode_bench_serialized_cold() {
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    let mode = if std::env::var("MLX_HY4_MLA_DECODE_NAX").as_deref() == Ok("0") {
+        "v2"
+    } else {
+        "nax"
+    };
+    let iters = 10usize;
+    let n_sl = 30usize;
+    let n_ix = 12usize;
+    let mut r = Rng(777);
+
+    // Distinct cold KV caches per layer (30 sliding + 12 indexed ~ 48 MiB > SLC).
+    let sl_keys: Vec<MxArray> = (0..n_sl)
+        .map(|_| {
+            let k = arr(&r.vec((512 + 64) * d, 0.5), &[512 + 64, d])
+                .astype(DType::Float16)
+                .unwrap();
+            k.eval();
+            k
+        })
+        .collect();
+    let ix_keys: Vec<(MxArray, MxArray)> = (0..n_ix)
+        .map(|_| {
+            let n = 2048 + 64;
+            let k = arr(&r.vec(n * d, 0.5), &[n, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let k0 = k.slice(&[0, 0], &[n as i64, 288]).unwrap();
+            let k1 = k.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+            k0.eval();
+            k1.eval();
+            (k0, k1)
+        })
+        .collect();
+    let zero_f32 = MxArray::from_float32(&[0.0], &[1]).unwrap();
+    zero_f32.eval();
+
+    for &s in &[1usize, 2, 4] {
+        let q_sl = arr(&r.vec(s * 64 * d, 0.5), &[s, 64, d]);
+        let q_ix = arr(&r.vec(s * 32 * d, 0.5), &[s, 32, d]);
+        let sinks_sl = arr(&r.vec(64, 1.0), &[64]);
+        let sinks_ix = arr(&r.vec(32, 1.0), &[32]);
+        let idx_sl_v: Vec<i32> = (0..s * 512)
+            .map(|i| (((i % 512) * 7 + (i / 512) * 13) % (512 + 64)) as i32)
+            .collect();
+        let idx_ix_v: Vec<i32> = (0..s * 2048)
+            .map(|i| (((i % 2048) * 7 + (i / 2048) * 13) % (2048 + 64)) as i32)
+            .collect();
+        let ia_sl = MxArray::from_int32(&idx_sl_v, &[s as i64, 512]).unwrap();
+        let ia_ix = MxArray::from_int32(&idx_ix_v, &[s as i64, 2048]).unwrap();
+        for a in [&q_sl, &q_ix, &sinks_sl, &sinks_ix, &ia_sl, &ia_ix] {
+            a.eval();
+        }
+
+        let run_sl = || {
+            let mut dep = zero_f32.clone();
+            let mut last = zero_f32.clone();
+            for k in &sl_keys {
+                let snk = sinks_sl.add(&dep).unwrap();
+                last =
+                    gather_sink_attention_rows(&q_sl, KeyRows::Whole(k), &ia_sl, vw, &snk, scale)
+                        .unwrap();
+                dep = last
+                    .slice(&[0, 0, 0], &[1, 1, 1])
+                    .unwrap()
+                    .reshape(&[1])
+                    .unwrap()
+                    .mul(&zero_f32)
+                    .unwrap();
+            }
+            last.eval();
+        };
+        let run_ix = || {
+            let mut dep = zero_f32.clone();
+            let mut last = zero_f32.clone();
+            for (k0, k1) in &ix_keys {
+                let snk = sinks_ix.add(&dep).unwrap();
+                last = gather_sink_attention_rows(
+                    &q_ix,
+                    KeyRows::Split(k0, k1),
+                    &ia_ix,
+                    vw,
+                    &snk,
+                    scale,
+                )
+                .unwrap();
+                dep = last
+                    .slice(&[0, 0, 0], &[1, 1, 1])
+                    .unwrap()
+                    .reshape(&[1])
+                    .unwrap()
+                    .mul(&zero_f32)
+                    .unwrap();
+            }
+            last.eval();
+        };
+        for _ in 0..3 {
+            run_sl();
+            run_ix();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            run_sl();
+        }
+        let sl_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            run_ix();
+        }
+        let ix_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "[mla_cold_serial:{mode}] M={s}: 30L_sl={sl_ms:.3} ms ({:.1} us/L), 12L_ix={ix_ms:.3} ms ({:.1} us/L), 42L={:.3} ms",
+            sl_ms * 1000.0 / n_sl as f64,
+            ix_ms * 1000.0 / n_ix as f64,
+            sl_ms + ix_ms
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

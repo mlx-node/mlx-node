@@ -1580,7 +1580,7 @@ hy4_indexer_score_prefill_nax_kernel() {
       "hy4_indexer_score_prefill_nax",
       {"q", "w", "k_pool", "page_ids", "vis", "params"}, {"out"},
       R"METAL(
-      alignas(16) threadgroup half k_tile[128 * 128];
+      alignas(16) threadgroup half k_tile[64 * 128];
       hy4_indexer_score_prefill_nax_impl<PAGED, INDEX_ROWS, HAS_VIS>(
           q, w, k_pool, page_ids, vis, params, out, k_tile,
           q_shape[1], threadgroup_position_in_grid.y,
@@ -4332,31 +4332,31 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
     constexpr int kSplitKMaxChunk = 64;
 
     if (try_nax) {
-      // Fixed per-split key blocks depend only on H (multiples of TR=16) so
+      // Fixed per-split key blocks depend only on H (multiples of TR=32) so
       // row batching and trailing -1 padding never shift split boundaries.
       static const int k_split_h64 = [] {
         const char *v = std::getenv("MLX_HY4_MLA_KSPLIT_H64");
         if (v && *v) {
           const int p = std::atoi(v);
-          if (p >= 16 && p <= 512 && (p % 16) == 0) {
+          if (p >= 32 && p <= 512 && (p % 32) == 0) {
             return p;
           }
         }
-        return 512;
+        return 64;
       }();
       static const int k_split_h32 = [] {
         const char *v = std::getenv("MLX_HY4_MLA_KSPLIT_H32");
         if (v && *v) {
           const int p = std::atoi(v);
-          if (p >= 16 && p <= 2048 && (p % 16) == 0) {
+          if (p >= 32 && p <= 2048 && (p % 32) == 0) {
             return p;
           }
         }
-        return 512;
+        return 128;
       }();
       const int k_split_nax = (h >= 64) ? k_split_h64 : k_split_h32;
       const int max_splits_nax =
-          std::min(16, std::max(8, 2048 / k_split_nax));
+          std::min(32, std::max(8, 2048 / k_split_nax));
       const int n_splits_nax =
           std::min(max_splits_nax, (kmax + k_split_nax - 1) / k_split_nax);
       const bool single_split = (n_splits_nax == 1);
@@ -5883,7 +5883,7 @@ mlx_array *mlx_hy4_indexer_score(mlx_array *q, mlx_array *w, mlx_array *k_pool,
       const uint64_t prefill_tmpl_key =
           tmpl_key | (uint64_t(has_vis ? 1 : 0) << 17);
       const std::tuple<int, int, int> nax_tg{32, 4, 1};
-      const std::tuple<int, int, int> grid{32, ((n_groups + 127) / 128) * 4,
+      const std::tuple<int, int, int> grid{32, ((n_groups + 63) / 64) * 4,
                                            (s + 63) / 64};
       out = dispatch_cached_kernel(
           kKernelIndexerScorePrefillNax, stream, grid, nax_tg, prefill_tmpl_key,
