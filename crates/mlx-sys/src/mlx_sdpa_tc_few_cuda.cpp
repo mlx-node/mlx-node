@@ -66,12 +66,12 @@ public:
     const int M_tile = (num_q_tiles == 1) ? M : (gqa * 8);
     const int num_warps = (M_tile + 15) / 16;
     if ((D != 128 && D != 256) || Q_len < 1 || Q_len > 16 || K_len < 1 ||
-        M < 1 || (num_q_tiles == 2 && (Q_len <= 8 || M_tile > 64)) ||
+        M < 1 || (num_q_tiles == 2 && (Q_len <= 8 || M_tile > 96)) ||
         num_warps < 1 || num_warps > 6) {
       throw std::invalid_argument("SdpaTcFewCuda: unsupported replay shape");
     }
     const int total_tiles = (K_len + 31) / 32;
-    const int max_splits = (Hkv >= 8) ? 6 : ((Hkv >= 4) ? 8 : 16);
+    const int max_splits = (Hkv >= 8) ? 6 : ((Hkv >= 4) ? 8 : ((num_q_tiles == 2) ? 12 : 16));
     const int num_splits = std::min(max_splits, std::max(1, total_tiles));
 
     array partial_o(Shape{B, Hkv, num_splits, M, D}, bfloat16, nullptr, {});
@@ -330,7 +330,7 @@ extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
     const int gqa = Hq / Hkv;
     const int M = gqa * Q_len;
     const bool ok_single = (M >= 1 && M <= 96);
-    const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 64);
+    const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 96);
     if (!ok_single && !ok_two_tile) {
       return nullptr;
     }
@@ -408,7 +408,7 @@ extern "C" mlx_array* mlx_sdpa_tc_tree_few_cuda(
     const int gqa = Hq / Hkv;
     const int M = gqa * Q_len;
     const bool ok_single = (M >= 1 && M <= 96);
-    const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 64);
+    const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 96);
     if (!ok_single && !ok_two_tile) {
       return nullptr;
     }

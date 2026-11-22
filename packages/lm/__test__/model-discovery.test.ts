@@ -64,6 +64,28 @@ describe('discoverLocalChatModels — GGUF variant folders', () => {
     expect(failures).toEqual([]);
   });
 
+  // Mutation: drop `split: true` from the hy_v4_flash row → red (no entry).
+  // Mutation: drop its `ggufArchitectures` → red.
+  it('lists a Hy4-flash split set by its header, with the 256K window and its preset', async () => {
+    const shards = [1, 2].map((i) => `Q4_K_M/Hy4-flash-Q4_K_M-0000${i}-of-00002.gguf`);
+    const dir = modelsDir('variant-hy4', {
+      'hy4/README.md': '# Hy4',
+      ...Object.fromEntries(shards.map((path, i) => [`hy4/${path}`, i === 0 ? minimalGguf('hy_v4_flash') : 'shard'])),
+    });
+    const failures: string[] = [];
+    const found = await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) });
+    expect(failures).toEqual([]);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({
+      path: join(dir, 'hy4', shards[0]!),
+      modelType: 'hy_v4_flash',
+      format: 'gguf',
+      contextWindow: 262_144,
+    });
+    expect(found[0]!.traits.thinkingLevelMap).toMatchObject({ medium: null, xhigh: null, max: 'max' });
+    expect(found[0]!.preset.sampling).toMatchObject({ temperature: 0.9, topP: 1.0 });
+  });
+
   it('keeps the id of a single file, and a split set beside it with the same stem takes its folder', async () => {
     const dir = modelsDir('split-beside-single', {
       'direct/X.gguf': minimalGguf('qwen4exp'),

@@ -26,7 +26,7 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   localAssetsRepo: null,
   localAssetsRevision: null,
 }));
-const visible = items.filter((item) => !item.hidden);
+const visible = items.filter((item) => !item.hidden && item.category !== 'systemone');
 let page: RenderedPage | undefined;
 let dispose: (() => void) | undefined;
 
@@ -96,6 +96,20 @@ describe('first model onboarding', () => {
     const selected = page.container.querySelector<HTMLInputElement>('input:checked');
     expect(selected?.value).toBe(visible.find((item) => item.isDefault)!.hfRepo);
     for (const item of items.filter((item) => item.hidden)) expect(page.text()).not.toContain(item.label);
+  });
+
+  it('offers a model with a memory floor only on a Mac that meets it', async () => {
+    const floored = visible.filter((item) => item.minMemoryGb !== undefined);
+    expect(floored.length).toBeGreaterThan(0);
+    const small = routes('/test/small-mac');
+    dispose = stubApi({
+      ...small,
+      '/models': { ...small['/models'], host: { totalMemBytes: 36 * 1024 ** 3, diskFreeBytes: null } },
+    });
+    page = await renderPage(createElement(App), (text) => text.includes('Download model'));
+    expect(page.container.querySelectorAll('input[type=radio]')).toHaveLength(visible.length - floored.length);
+    const offered = [...page.container.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((el) => el.value);
+    for (const item of floored) expect(offered).not.toContain(item.hfRepo);
   });
 
   it('keeps returning users in their existing workspace', async () => {

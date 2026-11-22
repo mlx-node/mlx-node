@@ -37,7 +37,7 @@ import type {
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
-import { blockerPhrase, CatalogDownloadAction, reinstallContent } from '@/pages/models/catalog';
+import { blockerPhrase, CatalogDownloadAction, hostNote, reinstallContent } from '@/pages/models/catalog';
 import Overview from '@/pages/overview';
 import { type AppCommand, usePageCommands } from '@/shell/commands';
 import { act, createElement, type ReactNode } from 'react';
@@ -940,6 +940,51 @@ describe('Models page — the Install affordance', () => {
     // free, or the blocked branch below could be "fixed" by never offering Install.
     await mount(createElement(MemoryRouter, null, createElement(Models)), catalogRoutes({}), LABEL);
     expect(buttonLabels()).toContain('Install');
+  });
+
+  /** {@link catalogRoutes} plus a streamed entry with a memory floor, on a Mac with `memGib` of RAM. */
+  function floorRoutes(memGib: number): Record<string, unknown> {
+    const routes = catalogRoutes({});
+    const catalog = routes['/catalog'] as CatalogResponse;
+    const streamed: CatalogItem = {
+      ...catalog.items[0]!,
+      label: 'Hy4-flash',
+      hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+      slug: 'hy4-flash-gguf',
+      sizeGb: 168.3,
+      description: '512-expert MoE streamed from SSD',
+      minMemoryGb: 39,
+    };
+    routes['/catalog'] = { items: [...catalog.items, streamed] };
+    routes['/models'] = {
+      ...(routes['/models'] as ModelsResponse),
+      host: { totalMemBytes: memGib * 1024 ** 3, diskFreeBytes: null },
+    };
+    return routes;
+  }
+
+  it('leaves out a recommended model whose memory floor this Mac misses', async () => {
+    await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(36), LABEL);
+    await settle();
+    expect(mounted!.container.querySelector(`[data-model="${SLUG}"]`)).not.toBeNull();
+    expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).toBeNull();
+  });
+
+  it('offers a streamed model at its memory floor, with no weights-larger-than-memory note', async () => {
+    const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(39), 'Hy4-flash');
+    expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).not.toBeNull();
+    expect(text).toContain(LABEL);
+    expect(text).not.toContain("larger than this Mac's memory");
+    const installs = Array.from(mounted!.container.querySelectorAll('button')).filter(
+      (button) => (button.textContent ?? '').trim() === 'Install',
+    );
+    expect(installs).toHaveLength(2);
+  });
+
+  it('hostNote keeps the weights note for entries without a memory floor only', () => {
+    const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null };
+    expect(hostNote({ sizeGb: 168.3, present: false }, host)).toContain("larger than this Mac's memory");
+    expect(hostNote({ sizeGb: 168.3, present: false, minMemoryGb: 39 }, host)).toBeNull();
   });
 
   function draftItem(present = false): NonNullable<CatalogItem['draft']> {

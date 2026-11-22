@@ -199,6 +199,15 @@ export const DEEPSEEK_V41_SAMPLING_DEFAULTS: ChatConfig = {
   repetitionPenalty: 1.0,
 };
 
+/** Hy4-flash `generation_config.json` and GGUF: temperature 0.9, top_p 1.0, no top_k. */
+export const HY_V4_FLASH_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 0.9,
+  topP: 1.0,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
 /**
  * Sampling defaults from Inkling-2-Mini GGUF metadata
  * (`general.sampling.temp` 1.0, `top_k` 0, `top_p` 1.0, `min_p` 0.0).
@@ -305,7 +314,7 @@ interface ModelFamilyDataBase {
   /**
    * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
    * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
-   * Flash Next prefix states) get the model's own SSD tier (Splash
+   * Flash Next and Hy4-flash prefix states) get the model's own SSD tier (Splash
    * `openDiskTier`), persistent under the paged KV disk cache switch
    * (`MLX_PERSIST_PAGED_CACHE`), else temporary.
    */
@@ -402,6 +411,12 @@ export const MODEL_FAMILY_DATA = [
     // header metadata, so a bare decision GGUF is admissible without siblings.
     ggufDiscovery: { variants: 'all' },
     match: { rawModelTypes: ['clef'] },
+  },
+  {
+    id: 'clairic',
+    kind: 'decision',
+    visionConfigKeys: ['vision_config'],
+    match: { rawModelTypes: ['clairic'] },
   },
   {
     id: 'gemma4',
@@ -561,6 +576,36 @@ export const MODEL_FAMILY_DATA = [
     /** v1 context limit (min(GGUF context, 16384)). */
     traits: { reasoning: true, fallbackContextWindow: 16384 },
     launchPreset: { sampling: DEEPSEEK_V41_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
+  },
+  {
+    id: 'hy_v4_flash',
+    kind: 'loadable',
+    match: { rawModelTypes: ['hy_v4_flash'] },
+    acceptsMaxMemory: true,
+    loadsAlone: true,
+    acceptsMaxContext: true,
+    acceptsCacheDisk: true,
+    /** The template and tokenizer live inside the GGUF; the native side enforces the context limit. */
+    streamOpts: { recordModelPath: false },
+    ggufArchitectures: ['hy_v4_flash'],
+    ggufDiscovery: { variants: 'all', split: true },
+    traits: {
+      reasoning: true,
+      /**
+       * The template takes `no_think`, `low`, `high` and `max`; the native
+       * side projects the rest (none→no_think, minimal→low, medium/xhigh→high).
+       */
+      thinkingLevelMap: {
+        minimal: 'low',
+        low: 'low',
+        medium: null,
+        high: 'high',
+        xhigh: null,
+        max: 'max',
+      },
+      fallbackContextWindow: 262144,
+    },
+    launchPreset: { sampling: HY_V4_FLASH_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
     id: 'inkling2',

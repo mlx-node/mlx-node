@@ -732,6 +732,7 @@ fn records_residency_info_reads_each_counter() {
         assets_path: String::new(),
         has_mtp: false,
         has_draft: false,
+        has_paged_cache: false,
         context_limits: Qwen4ExpContextLimits {
             effective_window_tokens: 0,
             paged_block_capacity: 0,

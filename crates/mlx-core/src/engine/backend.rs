@@ -1752,6 +1752,18 @@ pub(crate) trait MtpStepper {
     /// [1,vocab])`.
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)>;
 
+    /// Like [`Self::draft_step`], with `persist_state = false` on the final
+    /// draft step of a cycle when speculative state will be rolled back before
+    /// the next draft step.
+    fn draft_step_with_persist(
+        &mut self,
+        prev_h: &MxArray,
+        prev_emb: &MxArray,
+        _persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
+        self.draft_step(prev_h, prev_emb)
+    }
+
     /// MTP verify step returning verify logits `[1, depth+1, vocab]` +
     /// hiddens `[1, depth+1, hidden]`. RECORDS the GDN tape (consumed by
     /// [`Self::rollback`]). IDs are the authoritative host span the engine

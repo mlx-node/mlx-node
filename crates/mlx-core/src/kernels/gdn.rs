@@ -65,7 +65,7 @@ pub(crate) fn prepare(
     ]))
 }
 
-/// Fused GDN recurrence + gated RMSNorm + z-gate in one GPU dispatch.
+/// Fused GDN recurrence + gated RMSNorm + z-gate in one GPU dispatch (SiLU gate).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_step(
@@ -81,6 +81,42 @@ pub(crate) fn fused_step(
     tiled_heads: bool,
     state_dst: Option<&MxArray>,
 ) -> Result<Option<(MxArray, MxArray)>> {
+    fused_step_with_gate(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        z,
+        norm_weight,
+        eps,
+        tiled_heads,
+        false,
+        state_dst,
+    )
+}
+
+/// Fused GDN recurrence + gated RMSNorm + z-gate with explicit gate selector:
+/// `sigmoid_gate = false` uses SiLU (`z * sigmoid(z)`, Qwen3.5),
+/// `sigmoid_gate = true` uses Sigmoid (`sigmoid(z)`, Qwen3.8-Flash-Next / `qwen4_exp`, CUDA).
+/// On CUDA, both `beta` and `norm_weight` may be BF16 or FP32.
+#[inline]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn fused_step_with_gate(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    z: &MxArray,
+    norm_weight: &MxArray,
+    eps: f32,
+    tiled_heads: bool,
+    sigmoid_gate: bool,
+    state_dst: Option<&MxArray>,
+) -> Result<Option<(MxArray, MxArray)>> {
     let mut out = std::ptr::null_mut();
     let mut out_state = std::ptr::null_mut();
     let dst_ptr = state_dst
@@ -88,7 +124,7 @@ pub(crate) fn fused_step(
         .unwrap_or(std::ptr::null_mut());
     let ok = match active_backend() {
         ActiveBackend::CudaGpu => unsafe {
-            sys::mlx_gdn_fused_step_cuda(
+            sys::mlx_gdn_fused_step_cuda_ex(
                 q.as_raw_ptr(),
                 k.as_raw_ptr(),
                 v.as_raw_ptr(),
@@ -99,12 +135,13 @@ pub(crate) fn fused_step(
                 norm_weight.as_raw_ptr(),
                 eps,
                 i32::from(tiled_heads),
+                sigmoid_gate,
                 dst_ptr,
                 &mut out,
                 &mut out_state,
             )
         },
-        ActiveBackend::MetalGpu => unsafe {
+        ActiveBackend::MetalGpu if !sigmoid_gate => unsafe {
             sys::mlx_gdn_fused_step(
                 q.as_raw_ptr(),
                 k.as_raw_ptr(),
@@ -120,7 +157,7 @@ pub(crate) fn fused_step(
                 &mut out_state,
             )
         },
-        ActiveBackend::Cpu => false,
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => false,
     };
     if !ok || out.is_null() || out_state.is_null() {
         return Ok(None);
@@ -131,7 +168,7 @@ pub(crate) fn fused_step(
     )))
 }
 
-/// Deferred-fold CUDA fused GDN step: folds `prev_keep` accepted rows from the
+/// Deferred-fold CUDA fused GDN step (SiLU gate): folds `prev_keep` accepted rows from the
 /// prior cycle's `(prev_k, prev_v, prev_g, prev_beta)` into `state_base` before
 /// stepping the current verify window and applying gated RMSNorm + z-gate.
 ///
@@ -151,6 +188,40 @@ pub(crate) fn fused_step_deferred(
     norm_weight: &MxArray,
     eps: f32,
     tiled_heads: bool,
+) -> Result<Option<(MxArray, MxArray)>> {
+    fused_step_deferred_with_gate(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_base,
+        pending,
+        z,
+        norm_weight,
+        eps,
+        tiled_heads,
+        false,
+    )
+}
+
+/// Deferred-fold CUDA fused GDN step with explicit `sigmoid_gate` selector
+/// (`false` = SiLU, `true` = Qwen4 Sigmoid; BF16/FP32 `beta` and `norm_weight`).
+#[inline]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn fused_step_deferred_with_gate(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state_base: &MxArray,
+    pending: Option<(&MxArray, &MxArray, &MxArray, &MxArray, i32)>,
+    z: &MxArray,
+    norm_weight: &MxArray,
+    eps: f32,
+    tiled_heads: bool,
+    sigmoid_gate: bool,
 ) -> Result<Option<(MxArray, MxArray)>> {
     if active_backend() != ActiveBackend::CudaGpu {
         return Ok(None);
@@ -174,7 +245,7 @@ pub(crate) fn fused_step_deferred(
     let mut out_y = std::ptr::null_mut();
     let mut out_committed_state = std::ptr::null_mut();
     let ok = unsafe {
-        sys::mlx_gdn_fused_step_deferred_cuda(
+        sys::mlx_gdn_fused_step_deferred_cuda_ex(
             q.as_raw_ptr(),
             k.as_raw_ptr(),
             v.as_raw_ptr(),
@@ -190,6 +261,7 @@ pub(crate) fn fused_step_deferred(
             norm_weight.as_raw_ptr(),
             eps,
             i32::from(tiled_heads),
+            sigmoid_gate,
             &mut out_y,
             &mut out_committed_state,
         )
@@ -203,7 +275,7 @@ pub(crate) fn fused_step_deferred(
     )))
 }
 
-/// Tree-verify CUDA fused GDN step with deferred fold from the prior cycle.
+/// Tree-verify CUDA fused GDN step with deferred fold from the prior cycle (SiLU gate).
 /// `parent` is `int32[T]` (`parent[0] = -1`, `parent[t] < t`).
 /// `pending` optionally carries `(prev_k, prev_v, prev_g, prev_beta, prev_keep, prev_indices)`.
 #[inline]
@@ -229,6 +301,49 @@ pub(crate) fn tree_step_deferred(
     eps: f32,
     tiled_heads: bool,
 ) -> Result<Option<(MxArray, MxArray)>> {
+    tree_step_deferred_with_gate(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_base,
+        pending,
+        parent,
+        z,
+        norm_weight,
+        eps,
+        tiled_heads,
+        false,
+    )
+}
+
+/// Tree-verify CUDA fused GDN step with deferred fold and explicit `sigmoid_gate`
+/// selector (`false` = SiLU, `true` = Qwen4 Sigmoid; BF16/FP32 `beta` and `norm_weight`).
+#[inline]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn tree_step_deferred_with_gate(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state_base: &MxArray,
+    pending: Option<(
+        &MxArray,
+        &MxArray,
+        &MxArray,
+        &MxArray,
+        i32,
+        Option<&MxArray>,
+    )>,
+    parent: &MxArray,
+    z: &MxArray,
+    norm_weight: &MxArray,
+    eps: f32,
+    tiled_heads: bool,
+    sigmoid_gate: bool,
+) -> Result<Option<(MxArray, MxArray)>> {
     if active_backend() != ActiveBackend::CudaGpu {
         return Ok(None);
     }
@@ -253,7 +368,7 @@ pub(crate) fn tree_step_deferred(
     let mut out_y = std::ptr::null_mut();
     let mut out_committed_state = std::ptr::null_mut();
     let ok = unsafe {
-        sys::mlx_gdn_tree_step_cuda(
+        sys::mlx_gdn_tree_step_cuda_ex(
             q.as_raw_ptr(),
             k.as_raw_ptr(),
             v.as_raw_ptr(),
@@ -271,6 +386,7 @@ pub(crate) fn tree_step_deferred(
             norm_weight.as_raw_ptr(),
             eps,
             i32::from(tiled_heads),
+            sigmoid_gate,
             &mut out_y,
             &mut out_committed_state,
         )
@@ -371,7 +487,7 @@ pub(crate) fn prefill_chain(
 }
 
 /// Register-resident single-block-per-head CUDA GDN prefill recurrence with
-/// fused strided-`z` `RMSNormGated` epilogue (`[1, T, hv * 128]` BF16 output).
+/// fused strided-`z` `RMSNormGated` epilogue (`[1, T, hv * 128]` BF16 output, SiLU gate).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_chain_gated(
@@ -386,13 +502,46 @@ pub(crate) fn prefill_chain_gated(
     eps: f32,
     tiled_heads: bool,
 ) -> Result<Option<(MxArray, MxArray)>> {
+    prefill_chain_gated_with_gate(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        z,
+        norm_weight,
+        eps,
+        tiled_heads,
+        false,
+    )
+}
+
+/// Register-resident single-block-per-head CUDA GDN prefill recurrence with
+/// fused strided-`z` `RMSNormGated` epilogue and explicit `sigmoid_gate` selector
+/// (`false` = SiLU, `true` = Qwen4 Sigmoid; BF16/FP32 `beta` and `norm_weight`).
+#[inline]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prefill_chain_gated_with_gate(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    z: &MxArray,
+    norm_weight: &MxArray,
+    eps: f32,
+    tiled_heads: bool,
+    sigmoid_gate: bool,
+) -> Result<Option<(MxArray, MxArray)>> {
     if active_backend() != ActiveBackend::CudaGpu {
         return Ok(None);
     }
     let mut out_y = std::ptr::null_mut();
     let mut out_state = std::ptr::null_mut();
     let ok = unsafe {
-        sys::mlx_gdn_prefill_chain_gated_cuda(
+        sys::mlx_gdn_prefill_chain_gated_cuda_ex(
             q.as_raw_ptr(),
             k.as_raw_ptr(),
             v.as_raw_ptr(),
@@ -403,6 +552,7 @@ pub(crate) fn prefill_chain_gated(
             norm_weight.as_raw_ptr(),
             eps,
             i32::from(tiled_heads),
+            sigmoid_gate,
             &mut out_y,
             &mut out_state,
         )
@@ -458,7 +608,7 @@ pub(crate) fn replay(
                 || v.shape_at(3)? != 128
                 || k.dtype()? != DType::BFloat16
                 || v.dtype()? != DType::BFloat16
-                || beta.dtype()? != DType::BFloat16
+                || !matches!(beta.dtype()?, DType::BFloat16 | DType::Float32)
                 || g.dtype()? != DType::Float32
                 || start_state.dtype()? != DType::Float32
             {

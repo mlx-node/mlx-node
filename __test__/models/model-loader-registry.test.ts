@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 const RAW_MODEL_TYPE_ALIASES = {
   clef: ['clef'],
+  clairic: ['clairic'],
   harrier: ['harrier'],
   jina_reranker: ['jina_reranker'],
   xlm_roberta_reranker: [],
@@ -26,6 +27,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   qwen3_5_moe: ['qwen3_5_moe'],
   qwen4_exp: ['qwen4_exp', 'qwen4_exp_text'],
   deepseek_v41: ['deepseek_v41'],
+  hy_v4_flash: ['hy_v4_flash'],
   inkling2: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'],
   lfm2: ['lfm2'],
   lfm2_moe: ['lfm2_moe'],

@@ -47,7 +47,7 @@ pub(crate) fn bf16_matmul_few(
             }
             let k = input.shape_at(ndim - 1)?;
             let rows = if k > 0 { input.size()? as i64 / k } else { 0 };
-            if !(1..=16).contains(&rows) || k < 1024 || k % 8 != 0 || out_features < 256 {
+            if !(1..=16).contains(&rows) || k < 1024 || k % 8 != 0 || out_features < 1 {
                 return Ok(None);
             }
             let handle =

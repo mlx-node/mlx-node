@@ -23,14 +23,14 @@ const GIB = 2 ** 30;
 
 /** The one note a catalog card or an onboarding choice shows about room on this Mac, or null. */
 export function hostNote(
-  item: Pick<CatalogItem, 'sizeGb' | 'present'>,
+  item: Pick<CatalogItem, 'sizeGb' | 'present' | 'minMemoryGb'>,
   host: ModelsResponse['host'] | undefined,
 ): string | null {
   if (host === undefined) return null;
   if (!item.present && host.diskFreeBytes !== null && item.sizeGb * GB > host.diskFreeBytes) {
     return `Needs about ${item.sizeGb} GB. ${formatBytes(host.diskFreeBytes)} is free on this disk.`;
   }
-  if (item.sizeGb * GIB > host.totalMemBytes) {
+  if (item.minMemoryGb === undefined && item.sizeGb * GIB > host.totalMemBytes) {
     return `Weights are larger than this Mac's memory (${formatBytes(host.totalMemBytes)}).`;
   }
   return null;
@@ -48,6 +48,8 @@ export function HostNote({ text }: { text: string }): ReactElement {
 export interface CatalogDownloadActionProps extends CatalogDownloadProps {
   /** `/models?focus=…` when a local model is the installed one. */
   detailsTo?: string;
+  /** Optional direct workspace link (e.g. `/system-one?model=…`). */
+  openTo?: string;
   /** The DFlash2 draft block: only the Reinstall confirmation title differs. */
   companion?: boolean;
 }
@@ -163,6 +165,7 @@ export function CatalogDownloadAction({
   onCancelled,
   onCancel,
   detailsTo,
+  openTo,
   companion = false,
 }: CatalogDownloadActionProps): ReactElement {
   const [starting, setStarting] = useState(false);
@@ -220,6 +223,14 @@ export function CatalogDownloadAction({
             <span aria-hidden="true">·</span>
             <Link className="link" to={detailsTo}>
               Details
+            </Link>
+          </>
+        ) : null}
+        {openTo !== undefined ? (
+          <>
+            <span aria-hidden="true">·</span>
+            <Link className="link" to={openTo}>
+              Open
             </Link>
           </>
         ) : null}
@@ -315,6 +326,11 @@ export function CatalogCard({ item, draftDownload, host, ...download }: CatalogC
               <ExternalLink size={12} aria-hidden="true" className="shrink-0 text-muted" />
             </a>
             <span className="flex shrink-0 items-center gap-1">
+              {item.category === 'systemone' ? (
+                <Badge color="violet" size="sm">
+                  System One
+                </Badge>
+              ) : null}
               {item.isDefault === true ? (
                 <Badge tone="info" size="sm">
                   Default

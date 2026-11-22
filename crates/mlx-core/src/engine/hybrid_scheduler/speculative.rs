@@ -286,80 +286,67 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let zero_probe = probe
             .as_ref()
             .is_some_and(|shape| shape.iter().all(|&n| n == 0));
-        let mut proposed = Vec::with_capacity(work.len());
-        let mut raw_proposals: Vec<Result<engine::backend::DsparkProposal>> =
+        let mut proposals: Vec<Result<DsparkProposal>> =
             (0..work.len()).map(|_| Ok(empty_proposal())).collect();
-        if !zero_probe {
-            // Collect all capped rows into one batched proposal call (so multi-lane DSpark
-            // stacks `[N * 8, H]` through draft layers + target lm_head + folded Markov head!).
-            let mut batch_work_indices = Vec::with_capacity(work.len());
-            for (wi, item) in work.iter().enumerate() {
-                if item.cap == 0 {
-                    continue;
-                }
+        let mut eligible_work_indices = Vec::new();
+        for (wi, item) in work.iter().enumerate() {
+            if item.cap > 0 && !zero_probe {
                 if running[item.turn_index]
                     .payload
                     .scheduled_speculation
                     .is_some()
                 {
-                    batch_work_indices.push(wi);
+                    eligible_work_indices.push(wi);
                 } else {
-                    raw_proposals[wi] = Err(Error::from_reason(
+                    proposals[wi] = Err(Error::from_reason(
                         "scheduled speculation state missing for capped row",
                     ));
-                }
-            }
-            if !batch_work_indices.is_empty() {
-                // Borrow disjoint `running[turn_index]` entries safely via index-sorted split.
-                let mut turn_to_batch: Vec<(usize, usize)> = batch_work_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(bi, &wi)| (work[wi].turn_index, bi))
-                    .collect();
-                turn_to_batch.sort_unstable_by_key(|&(ti, _)| ti);
-
-                let mut split_refs = Vec::with_capacity(turn_to_batch.len());
-                let mut slice = &mut *running;
-                let mut base = 0usize;
-                for &(ti, bi) in &turn_to_batch {
-                    let rel = ti - base;
-                    let (_, rest) = slice.split_at_mut(rel);
-                    let (head, tail) = rest.split_at_mut(1);
-                    split_refs.push((bi, &mut head[0]));
-                    slice = tail;
-                    base = ti + 1;
-                }
-                split_refs.sort_unstable_by_key(|&(bi, _)| bi);
-
-                let mut requests: Vec<ScheduledProposalRequest<'_>> =
-                    Vec::with_capacity(split_refs.len());
-                for (bi, turn) in split_refs {
-                    let wi = batch_work_indices[bi];
-                    let item = &work[wi];
-                    let row = &plan.rows[item.plan_index];
-                    if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
-                        requests.push(ScheduledProposalRequest {
-                            seq_id: row.seq_id,
-                            anchor: item.anchor,
-                            max_drafts: item.cap,
-                            params: &turn.payload.params,
-                            rng,
-                            confidence: profiling,
-                        });
-                    }
-                }
-                let batch_results = self.inner.propose_scheduled_batch(&mut requests);
-                for (&wi, res) in batch_work_indices.iter().zip(batch_results) {
-                    let row = &plan.rows[work[wi].plan_index];
-                    timeline::lane_mark(row.seq_id, Mark::DraftSubmit);
-                    raw_proposals[wi] = res;
+                    timeline::lane_mark(plan.rows[item.plan_index].seq_id, Mark::DraftSubmit);
                 }
             }
         }
+        if !eligible_work_indices.is_empty() {
+            let mut by_turn: HashMap<usize, &mut TurnState<ScheduledTurn<B::PrefixState>>> =
+                running.iter_mut().enumerate().collect();
+            let mut batch_reqs = Vec::with_capacity(eligible_work_indices.len());
+            for &wi in &eligible_work_indices {
+                let item = &work[wi];
+                let row = &plan.rows[item.plan_index];
+                let turn = by_turn
+                    .remove(&item.turn_index)
+                    .ok_or_else(|| Error::from_reason("scheduled verifier duplicate turn"))?;
+                let payload = &mut turn.payload;
+                let rng = payload.scheduled_speculation.as_mut().ok_or_else(|| {
+                    Error::from_reason("scheduled speculation state missing for capped row")
+                })?;
+                batch_reqs.push(ScheduledProposalRequest {
+                    seq_id: row.seq_id,
+                    anchor: item.anchor,
+                    max_drafts: item.cap,
+                    params: &payload.params,
+                    rng,
+                    confidence: profiling,
+                });
+            }
+            let batch_out = if batch_reqs.len() == 1 {
+                let _focus = timeline::focus_lane(batch_reqs[0].seq_id);
+                self.inner.propose_scheduled_batch(&mut batch_reqs)
+            } else {
+                self.inner.propose_scheduled_batch(&mut batch_reqs)
+            };
+            let mut batch_iter = batch_out.into_iter();
+            for wi in eligible_work_indices {
+                timeline::lane_mark(plan.rows[work[wi].plan_index].seq_id, Mark::DraftSubmit);
+                proposals[wi] = batch_iter.next().unwrap_or_else(|| {
+                    Err(Error::from_reason("scheduled proposal width mismatch"))
+                });
+            }
+        }
+        let mut proposed = Vec::with_capacity(work.len());
         // Materialize ALL device-resident draft proposals in ONE single GPU sync instead of N!
         {
             let mut eval_refs: Vec<&MxArray> = Vec::new();
-            for prop in raw_proposals.iter().flatten() {
+            for prop in proposals.iter().flatten() {
                 if let Some(ref ids) = prop.device_draft_ids {
                     eval_refs.push(ids);
                 }
@@ -372,7 +359,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 && let Err(error) =
                     MxArray::eval_arrays_with_context(&eval_refs, "scheduled_draft_proposals")
             {
-                for res in &mut raw_proposals {
+                for res in &mut proposals {
                     if res.as_ref().is_ok_and(|p| {
                         p.device_draft_ids.is_some() || p.device_draft_sparse.is_some()
                     }) {
@@ -381,7 +368,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 }
             }
         }
-        for (mut item, proposal) in work.into_iter().zip(raw_proposals) {
+        for (mut item, proposal) in work.into_iter().zip(proposals) {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];
             // The scheduled verify wave is host-batched (`ScheduledVerifyRow`

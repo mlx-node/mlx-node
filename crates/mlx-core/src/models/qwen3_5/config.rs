@@ -244,9 +244,128 @@ impl Qwen3_5Config {
     }
 }
 
+/// Multimodal token IDs and M-RoPE section geometry parsed from a Qwen3.5 /
+/// Clairic checkpoint's `config.json`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Qwen3_5MultimodalTokens {
+    pub image_token_id: i32,
+    pub vision_end_token_id: i32,
+    pub mrope_section: Vec<i32>,
+}
+
+impl Default for Qwen3_5MultimodalTokens {
+    fn default() -> Self {
+        Self {
+            image_token_id: 248056,
+            vision_end_token_id: 248054,
+            mrope_section: vec![11, 11, 10],
+        }
+    }
+}
+
+/// Parse multimodal token IDs and M-RoPE section from raw `config.json` JSON.
+///
+/// Reads top-level `image_token_id` and `vision_end_token_id` (falling back to
+/// `Qwen3_5MultimodalTokens::default()`), and resolves `mrope_section` from
+/// `text_config.rope_parameters.mrope_section`,
+/// `text_config.rope_scaling.mrope_section`, `rope_parameters.mrope_section`,
+/// `rope_scaling.mrope_section`, or top-level `mrope_section`.
+#[allow(dead_code)]
+pub(crate) fn parse_multimodal_tokens(raw: &serde_json::Value) -> Qwen3_5MultimodalTokens {
+    let defaults = Qwen3_5MultimodalTokens::default();
+    let read_i32 = |v: &serde_json::Value, key: &str| -> Option<i32> {
+        v.get(key)
+            .and_then(|val| val.as_i64())
+            .and_then(|n| i32::try_from(n).ok())
+    };
+    let read_section = |v: &serde_json::Value| -> Option<Vec<i32>> {
+        let arr = v.as_array()?;
+        if arr.len() != 3 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(3);
+        for item in arr {
+            let n = i32::try_from(item.as_i64()?).ok()?;
+            out.push(n);
+        }
+        Some(out)
+    };
+
+    let image_token_id = read_i32(raw, "image_token_id")
+        .or_else(|| {
+            raw.get("text_config")
+                .and_then(|tc| read_i32(tc, "image_token_id"))
+        })
+        .unwrap_or(defaults.image_token_id);
+    let vision_end_token_id = read_i32(raw, "vision_end_token_id")
+        .or_else(|| {
+            raw.get("text_config")
+                .and_then(|tc| read_i32(tc, "vision_end_token_id"))
+        })
+        .unwrap_or(defaults.vision_end_token_id);
+
+    let mrope_section = raw
+        .get("text_config")
+        .and_then(|tc| tc.get("rope_parameters"))
+        .and_then(|rp| rp.get("mrope_section"))
+        .and_then(read_section)
+        .or_else(|| {
+            raw.get("text_config")
+                .and_then(|tc| tc.get("rope_scaling"))
+                .and_then(|rs| rs.get("mrope_section"))
+                .and_then(read_section)
+        })
+        .or_else(|| {
+            raw.get("rope_parameters")
+                .and_then(|rp| rp.get("mrope_section"))
+                .and_then(read_section)
+        })
+        .or_else(|| {
+            raw.get("rope_scaling")
+                .and_then(|rs| rs.get("mrope_section"))
+                .and_then(read_section)
+        })
+        .or_else(|| raw.get("mrope_section").and_then(read_section))
+        .unwrap_or(defaults.mrope_section);
+
+    Qwen3_5MultimodalTokens {
+        image_token_id,
+        vision_end_token_id,
+        mrope_section,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Qwen3_5Config;
+    use super::{Qwen3_5Config, Qwen3_5MultimodalTokens, parse_multimodal_tokens};
+
+    #[test]
+    fn parse_multimodal_tokens_defaults_and_overrides() {
+        let empty = serde_json::json!({});
+        assert_eq!(
+            parse_multimodal_tokens(&empty),
+            Qwen3_5MultimodalTokens::default()
+        );
+
+        let custom = serde_json::json!({
+            "image_token_id": 151655,
+            "vision_end_token_id": 151653,
+            "text_config": {
+                "rope_parameters": {
+                    "mrope_section": [16, 8, 8]
+                }
+            }
+        });
+        assert_eq!(
+            parse_multimodal_tokens(&custom),
+            Qwen3_5MultimodalTokens {
+                image_token_id: 151655,
+                vision_end_token_id: 151653,
+                mrope_section: vec![16, 8, 8],
+            }
+        );
+    }
 
     #[test]
     fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {

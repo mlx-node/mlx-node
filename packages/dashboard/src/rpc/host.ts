@@ -22,7 +22,7 @@ import { isRpcRequest, type ChatScope, type RpcReply } from './protocol.js';
  * `watchChat` out: a Chat stream on it stays silent.
  */
 export type RpcRuntime = Pick<DashboardRuntime, 'call' | 'subscribe' | 'watchLive'> &
-  Partial<Pick<DashboardRuntime, 'watchChat'>>;
+  Partial<Pick<DashboardRuntime, 'watchChat' | 'watchSystemOne'>>;
 
 /** One page call the runtime has not answered yet, by route pattern only. */
 export interface OpenCall {
@@ -250,6 +250,18 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort, options
             id,
             runtime.watchChat(scope, (event) => {
               post({ kind: 'chat', id, event });
+            }),
+          );
+          return;
+        }
+        case 'systemone': {
+          const id = data.id;
+          release(id);
+          if (runtime.watchSystemOne === undefined) return;
+          subscriptions.set(
+            id,
+            runtime.watchSystemOne(data.jobId, (event) => {
+              post({ kind: 'systemone', id, event });
             }),
           );
           return;

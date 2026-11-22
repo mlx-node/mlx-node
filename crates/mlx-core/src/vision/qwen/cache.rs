@@ -2,11 +2,13 @@
 
 use super::encoder::QwenVisionEncoder;
 use super::prompt::IMAGE_TOKEN_ID;
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::engine;
 use crate::engine::vision::VisionMerge;
 use crate::inference_trace::elapsed_ms;
-use crate::models::paddleocr_vl::processing::ProcessedImages;
+use crate::models::paddleocr_vl::processing::{
+    ProcessedImage, ProcessedImages, aggregate_processed_images,
+};
 use crate::nn::Embedding;
 use crate::stream::{Stream, StreamContext};
 use crate::vision::qwen::prompt::{get_rope_index, merge_input_ids_with_image_features};
@@ -651,6 +653,33 @@ pub(crate) fn vlm_prepare_vision_features(
     generation_stream: Stream,
     vision_cache: &VisionCache,
 ) -> Result<(VisionMerge, Vec<MxArray>)> {
+    vlm_prepare_vision_features_with_token_id(
+        input_ids,
+        per_image_hashes,
+        pre_processed,
+        vision_encoder,
+        spatial_merge_size,
+        text_model_embedding,
+        generation_stream,
+        vision_cache,
+        IMAGE_TOKEN_ID,
+    )
+}
+
+/// Like [`vlm_prepare_vision_features`], using a caller-specified `image_token_id`
+/// when merging vision embeddings and computing M-RoPE positions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vlm_prepare_vision_features_with_token_id(
+    input_ids: &MxArray,
+    per_image_hashes: &[engine::ImageCacheDigest],
+    pre_processed: &ProcessedImages,
+    vision_encoder: &QwenVisionEncoder,
+    spatial_merge_size: i32,
+    text_model_embedding: &Embedding,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+    image_token_id: i32,
+) -> Result<(VisionMerge, Vec<MxArray>)> {
     // Build the text-embedding graph once up front. The packed backend gathers
     // and dequantizes only the referenced rows; keeping this handle also gives
     // the vision cache planner the exact merge dtype without materializing the
@@ -659,7 +688,90 @@ pub(crate) fn vlm_prepare_vision_features(
         let _stream_ctx = StreamContext::new(generation_stream);
         text_model_embedding.forward(input_ids)?
     };
+    let embed_dtype = text_embeds.dtype()?;
+    let (vision_features, held) = encode_images_cached(
+        per_image_hashes,
+        pre_processed,
+        vision_encoder,
+        spatial_merge_size,
+        embed_dtype,
+        generation_stream,
+        vision_cache,
+    )?;
 
+    let inputs_embeds = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        let vf_cast = if vision_features.dtype()? != embed_dtype {
+            vision_features.astype(embed_dtype)?
+        } else {
+            vision_features
+        };
+        merge_input_ids_with_image_features(image_token_id, &vf_cast, &text_embeds, input_ids)?
+    };
+
+    let grid = pre_processed.grid_thw();
+    let (position_ids, rope_deltas) =
+        get_rope_index(input_ids, Some(&grid), spatial_merge_size, image_token_id)?;
+
+    tracing::debug!(
+        "VLM prefill: seq_len={}, rope_deltas={}",
+        inputs_embeds.shape_at(1)?,
+        rope_deltas
+    );
+
+    Ok((
+        VisionMerge {
+            inputs_embeds,
+            position_ids,
+            rope_deltas,
+        },
+        held,
+    ))
+}
+
+/// Encode and cache a single preprocessed image through `vision_encoder` +
+/// `vision_cache`, returning its feature tensor `[num_tokens, hidden_size]`
+/// in `cache_feature_dtype`.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_single_image_cached(
+    image_hash: engine::ImageCacheDigest,
+    pre_processed: &ProcessedImage,
+    vision_encoder: &QwenVisionEncoder,
+    spatial_merge_size: i32,
+    cache_feature_dtype: DType,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+) -> Result<MxArray> {
+    let aggregated = aggregate_processed_images(vec![ProcessedImage::new(
+        pre_processed.pixel_values(),
+        pre_processed.image_grid_thw(),
+    )])?;
+    let (features, _held) = encode_images_cached(
+        &[image_hash],
+        &aggregated,
+        vision_encoder,
+        spatial_merge_size,
+        cache_feature_dtype,
+        generation_stream,
+        vision_cache,
+    )?;
+    Ok(features)
+}
+
+/// Per-image vision cache lookup and bounded vision encoder miss execution.
+///
+/// Returns `(concatenated_features, held_per_image_features)` cast to
+/// `cache_feature_dtype`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_images_cached(
+    per_image_hashes: &[engine::ImageCacheDigest],
+    pre_processed: &ProcessedImages,
+    vision_encoder: &QwenVisionEncoder,
+    spatial_merge_size: i32,
+    cache_feature_dtype: DType,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+) -> Result<(MxArray, Vec<MxArray>)> {
     let grid = pre_processed.grid_thw();
     let grid_data = grid.to_int32()?;
     let pv = pre_processed.pixel_values();
@@ -681,7 +793,6 @@ pub(crate) fn vlm_prepare_vision_features(
     let (vision_hidden_size, vision_intermediate_size, vision_output_size) =
         vision_encoder.memory_widths();
     let activation_dtype_bytes = u64::try_from(pv.dtype()?.byte_size()).unwrap_or(u64::MAX);
-    let cache_feature_dtype = text_embeds.dtype()?;
     let cache_feature_dtype_bytes =
         u64::try_from(cache_feature_dtype.byte_size()).unwrap_or(u64::MAX);
     let raw_pixel_bytes_per_patch = pv_shape[1..]
@@ -1071,34 +1182,7 @@ pub(crate) fn vlm_prepare_vision_features(
         MxArray::concatenate_many(refs, Some(0))?
     };
 
-    let inputs_embeds = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let embed_dtype = text_embeds.dtype()?;
-        let vf_cast = if vision_features.dtype()? != embed_dtype {
-            vision_features.astype(embed_dtype)?
-        } else {
-            vision_features
-        };
-        merge_input_ids_with_image_features(IMAGE_TOKEN_ID, &vf_cast, &text_embeds, input_ids)?
-    };
-
-    let (position_ids, rope_deltas) =
-        get_rope_index(input_ids, Some(&grid), spatial_merge_size, IMAGE_TOKEN_ID)?;
-
-    tracing::debug!(
-        "VLM prefill: seq_len={}, rope_deltas={}",
-        inputs_embeds.shape_at(1)?,
-        rope_deltas
-    );
-
-    Ok((
-        VisionMerge {
-            inputs_embeds,
-            position_ids,
-            rope_deltas,
-        },
-        held,
-    ))
+    Ok((vision_features, held))
 }
 
 #[cfg(test)]

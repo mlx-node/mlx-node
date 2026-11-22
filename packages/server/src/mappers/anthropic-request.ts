@@ -484,9 +484,9 @@ export function mapAnthropicRequest(
       config.tools = matched.map(mapTool);
       disableThinkingForForcedToolCall(config);
     } else {
-      // `tool_choice` is undefined, `{type:'auto'}`, or `{type:'any'}` — all
-      // three let the model pick from any tool, so we forward the full tools
-      // array. `any` still forces a call.
+      // `tool_choice` is undefined, `auto`, `any` or `none`: the prompt gets
+      // the full tools array (`none` too, as in vLLM, whose response then
+      // drops the calls). `any` still forces a call.
       config.tools = req.tools.map(mapTool);
       if (toolChoice?.type === 'any') {
         disableThinkingForForcedToolCall(config);

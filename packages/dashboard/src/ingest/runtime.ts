@@ -35,7 +35,7 @@ const OCC_HIST_MAX = 512;
 
 const HEALTH = ['ok', 'loading', 'degraded', 'error'];
 const HOSTS = ['serve', 'launch', 'desktop', 'embedded'];
-const CAPABILITIES = ['chat', 'audio', 'rerank'];
+const CAPABILITIES = ['chat', 'audio', 'rerank', 'decision'];
 
 type Rec = Record<string, unknown>;
 type Bind = number | string | null;

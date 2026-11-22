@@ -5,7 +5,8 @@
 //! an MXFP4 extent repacks it straight into its slot, in row bands that idle
 //! readers help with. A failed or short read fails its ticket and never runs
 //! the repack, so the slot's bytes stay as they were and the caller does not
-//! publish it.
+//! publish it. A [`Read::repack`] hands the extent's bytes to the caller's
+//! CPU repack on the reader thread, under the same rule.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
@@ -64,6 +65,26 @@ pub fn open_nocache(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// `O_RDONLY` + `F_RDAHEAD` 0 without `F_NOCACHE` so clean file-backed pages
+/// remain in the OS page cache without speculative read-ahead.
+fn open_cached_no_rdahead(path: &Path) -> Result<File> {
+    let file = File::open(path).map_err(|e| bad(format!("open '{}': {e}", path.display())))?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` owns an open descriptor; `F_RDAHEAD` only disables
+        // speculative read-ahead.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } != 0 {
+            return Err(bad(format!(
+                "F_RDAHEAD on '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 struct Shard {
     path: PathBuf,
     file: File,
@@ -87,6 +108,44 @@ impl ShardSet {
         for p in paths {
             let path = p.as_ref().to_path_buf();
             let file = open_nocache(&path)?;
+            let meta = file
+                .metadata()
+                .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?;
+            shards.push(Shard {
+                len: meta.len(),
+                stat: ShardIdentity::from_metadata(&meta),
+                path,
+                file,
+            });
+        }
+        Ok(Self {
+            shards,
+            #[cfg(test)]
+            fault: Mutex::new(None),
+            #[cfg(test)]
+            delay_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Opens `paths` with per-shard OS page-cache policy: `allow_page_cache[i]`
+    /// omits `F_NOCACHE` (keeping `F_RDAHEAD 0`), while `false` sets both
+    /// `F_NOCACHE 1` and `F_RDAHEAD 0` like [`ShardSet::open`].
+    pub fn open_with_cache<P: AsRef<Path>>(paths: &[P], allow_page_cache: &[bool]) -> Result<Self> {
+        if paths.len() != allow_page_cache.len() {
+            return Err(bad(format!(
+                "{} shard paths for {} page-cache flags",
+                paths.len(),
+                allow_page_cache.len()
+            )));
+        }
+        let mut shards = Vec::with_capacity(paths.len());
+        for (p, &cached) in paths.iter().zip(allow_page_cache) {
+            let path = p.as_ref().to_path_buf();
+            let file = if cached {
+                open_cached_no_rdahead(&path)?
+            } else {
+                open_nocache(&path)?
+            };
             let meta = file
                 .metadata()
                 .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?;
@@ -273,9 +332,14 @@ impl Extent {
     }
 }
 
+/// A CPU repack of one extent's bytes, run on the reader thread that read
+/// them.
+pub type RepackFn = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
+
 enum Sink {
     Slot { repack: SlotRepack, slot: usize },
     Raw(SendPtr<u8>),
+    Repack(RepackFn),
 }
 
 /// One extent and where its bytes go.
@@ -305,6 +369,16 @@ impl Read {
         }
     }
 
+    /// The extent's bytes, read as whole `ALIGN` pages, passed to `f`; a
+    /// failed or short read never calls it, and an error or panic of `f`
+    /// fails the read.
+    pub fn repack(extent: Extent, f: RepackFn) -> Self {
+        Self {
+            extent,
+            sink: Sink::Repack(f),
+        }
+    }
+
     fn check(&self) -> Result<Option<(usize, usize)>> {
         match &self.sink {
             Sink::Slot { repack, slot } => {
@@ -319,7 +393,7 @@ impl Read {
                 Ok(Some(repack.key(*slot)))
             }
             Sink::Raw(p) if p.0.is_null() => Err(bad("null raw destination")),
-            Sink::Raw(_) => Ok(None),
+            Sink::Raw(_) | Sink::Repack(_) => Ok(None),
         }
     }
 }
@@ -587,7 +661,8 @@ impl IoPool {
     /// Every destination stays valid, and no one else reads or writes it,
     /// until the ticket is waited or dropped. Raw destinations of one batch
     /// do not overlap each other or any slot (two reads into one slot are
-    /// refused).
+    /// refused); the repack callbacks of one batch write disjoint memory
+    /// that no other read of the batch writes.
     pub unsafe fn submit(&self, reads: Vec<Read>, priority: Priority) -> Result<Ticket> {
         let mut seen = HashSet::new();
         for r in &reads {
@@ -818,6 +893,13 @@ fn run(shared: &Shared, read: &Read, buf: &mut AlignedBuf) -> Result<(u64, u64, 
             let read_ns = t0.elapsed().as_nanos() as u64;
             let repack_ns = repack_bands(shared, repack, *slot, bytes)?;
             Ok((e.len, read_ns, repack_ns))
+        }
+        Sink::Repack(f) => {
+            let bytes = shards.window(e, buf, io_err)?;
+            let read_ns = t0.elapsed().as_nanos() as u64;
+            let t = Instant::now();
+            f(bytes)?;
+            Ok((e.len, read_ns, t.elapsed().as_nanos() as u64))
         }
     }
 }

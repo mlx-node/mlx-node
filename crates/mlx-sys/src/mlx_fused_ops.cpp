@@ -12,6 +12,31 @@ std::vector<array> sigmoid_mul_impl(const std::vector<array>& inputs) {
   return {inputs[1] * sigmoid(inputs[0])};
 }
 
+// Gate is upper-clamped only (<= limit); up is symmetrically clamped [-limit, +limit].
+std::vector<array> swiglu_clamped_impl(const std::vector<array>& inputs) {
+  const auto& gate = inputs[0];
+  const auto& up = inputs[1];
+  const auto& limit = inputs[2];
+  auto gc = minimum(gate, limit);
+  auto uc = clip(up, std::optional<array>(negative(limit)),
+                 std::optional<array>(limit));
+  return {sigmoid(gc) * gc * uc};
+}
+
+// Interleaved (traditional) RoPE using precise sin/cos and direct inv_freq
+// without the reciprocal round-trip or fast-math trig of mlx::fast::rope.
+// Inputs: x0, x1 [n, h, half], pos [n, 1, 1], inv_freq [1, 1, half] (f32).
+std::vector<array> rope_precise_impl(const std::vector<array>& inputs) {
+  const auto& x0 = inputs[0];
+  const auto& x1 = inputs[1];
+  const auto& pos = inputs[2];
+  const auto& inv = inputs[3];
+  auto theta = pos * inv;
+  auto c = cos(theta);
+  auto s = sin(theta);
+  return {x0 * c - x1 * s, x0 * s + x1 * c};
+}
+
 #ifdef MLX_NODE_CUDA_ENABLED
 constexpr char add_rmsnorm_cuda_source[] =
 #include "cuda/add_rmsnorm.cu.inc"
@@ -208,7 +233,6 @@ class FusedGateBinaryCuda final : public mlx::core::UnaryPrimitive {
   bool is_swiglu_;
 };
 #endif
-
 }  // namespace
 
 extern "C" {
@@ -257,6 +281,42 @@ mlx_array* mlx_swiglu_compiled(mlx_array* gate_handle, mlx_array* up_handle) {
   }
 #endif
   auto output = qwen35_common::swiglu(gate, up);
+  return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+}
+
+mlx_array* mlx_swiglu_clamped_compiled(mlx_array* gate_handle,
+                                       mlx_array* up_handle,
+                                       float limit) {
+  if (!(limit > 0.0f)) {
+    return mlx_swiglu_compiled(gate_handle, up_handle);
+  }
+  const auto& gate = *reinterpret_cast<array*>(gate_handle);
+  const auto& up = *reinterpret_cast<array*>(up_handle);
+  auto dt = mlx::core::result_type({gate, up});
+  array lim(limit, dt);
+  static auto fn = mlx::core::compile(swiglu_clamped_impl, /*shapeless=*/true);
+  auto output = fn({gate, up, lim})[0];
+  return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+}
+
+mlx_array* mlx_rope_precise_compiled(mlx_array* x_handle,
+                                     mlx_array* pos_handle,
+                                     mlx_array* inv_freq_handle) {
+  const auto& x = *reinterpret_cast<array*>(x_handle);
+  const auto& pos = *reinterpret_cast<array*>(pos_handle);
+  const auto& inv = *reinterpret_cast<array*>(inv_freq_handle);
+  int n = x.shape(0);
+  int half = inv.shape(0);
+  int h = (x.ndim() == 3) ? x.shape(1) : 1;
+  auto xr = reshape(x, {n, h, half, 2});
+  auto x0 = squeeze(slice(xr, {0, 0, 0, 0}, {n, h, half, 1}), 3);
+  auto x1 = squeeze(slice(xr, {0, 0, 0, 1}, {n, h, half, 2}), 3);
+  auto p = reshape(pos, {n, 1, 1});
+  auto f = reshape(inv, {1, 1, half});
+  static auto fn = mlx::core::compile(rope_precise_impl, /*shapeless=*/true);
+  auto outs = fn({x0, x1, p, f});
+  auto stacked = stack({outs[0], outs[1]}, -1);
+  auto output = reshape(stacked, x.shape());
   return reinterpret_cast<mlx_array*>(new array(std::move(output)));
 }
 

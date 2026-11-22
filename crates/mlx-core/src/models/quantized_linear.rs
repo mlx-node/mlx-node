@@ -3229,7 +3229,7 @@ impl QuantizedLinear {
                         8,
                     )?
                 {
-                    if rows == 1 {
+                    if rows == 1 && !crate::accelerator::caps().is_unified_memory {
                         self.clear_cuda_dense_prefill();
                     }
                     return Ok(out);
@@ -3246,9 +3246,16 @@ impl QuantizedLinear {
                     if let Some(weight) = dense.as_deref().and_then(Option::as_ref) {
                         return x.matmul(&weight.array().transpose(Some(&[1, 0]))?);
                     }
-                    let weight = self
-                        .dequantize_current_weight()?
-                        .astype(crate::array::DType::BFloat16)?;
+                    let weight = if let Some(fast) = crate::kernels::qwen4::dequant_q8_bf16_cuda(
+                        &self.weight,
+                        &self.scales,
+                        biases,
+                    )? {
+                        fast
+                    } else {
+                        self.dequantize_current_weight()?
+                            .astype(crate::array::DType::BFloat16)?
+                    };
                     let weight_bytes = weight.size()?.saturating_mul(2);
                     let result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
                     if let Some(slot) = dense.as_deref_mut()
@@ -3261,7 +3268,9 @@ impl QuantizedLinear {
                     }
                     return Ok(result);
                 }
-                self.clear_cuda_dense_prefill();
+                if !crate::accelerator::caps().is_unified_memory {
+                    self.clear_cuda_dense_prefill();
+                }
             }
         }
 

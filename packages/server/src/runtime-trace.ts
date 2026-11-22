@@ -18,7 +18,7 @@ export type HostKind = 'serve' | 'launch' | 'desktop' | 'embedded';
 export const HOST_KINDS: readonly HostKind[] = ['serve', 'launch', 'desktop', 'embedded'];
 
 export type RuntimeHealth = 'ok' | 'loading' | 'degraded' | 'error';
-export type RuntimeCapability = 'chat' | 'audio' | 'rerank';
+export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
 
 /** Per file; beyond it only `load` and `exit` records are appended. */
 export const RUNTIME_FILE_MAX_BYTES = 16 * 1024 * 1024;

@@ -8,6 +8,7 @@ import {
   type LucideIcon,
   MessageCircle,
   MessagesSquare,
+  ScanSearch,
   TrendingUp,
 } from 'lucide-react';
 import type { ComponentType } from 'react';
@@ -22,6 +23,7 @@ import Overview from '../pages/overview';
 import Providers from '../pages/providers';
 import SessionDetail from '../pages/session-detail';
 import Sessions from '../pages/sessions';
+import SystemOne from '../pages/system-one';
 
 export type NavSection = 'top' | 'observe' | 'manage';
 
@@ -29,6 +31,7 @@ export interface AppRoute {
   id:
     | 'overview'
     | 'chat'
+    | 'system-one'
     | 'sessions'
     | 'session-detail'
     | 'metrics'
@@ -52,6 +55,7 @@ export interface AppRoute {
 export const APP_ROUTES: readonly AppRoute[] = [
   { id: 'overview', path: '/', label: 'Overview', icon: LayoutDashboard, section: 'top', element: Overview, end: true },
   { id: 'chat', path: '/chat', label: 'Chat', icon: MessageCircle, section: 'top', element: Chat },
+  { id: 'system-one', path: '/system-one', label: 'System One', icon: ScanSearch, section: 'top', element: SystemOne },
   { id: 'sessions', path: '/sessions', label: 'Sessions', icon: MessagesSquare, section: 'observe', element: Sessions },
   { id: 'session-detail', path: '/sessions/:id', label: 'Session', parent: 'sessions', element: SessionDetail },
   { id: 'metrics', path: '/metrics', label: 'Metrics', icon: TrendingUp, section: 'observe', element: Metrics },

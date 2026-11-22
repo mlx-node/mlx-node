@@ -20,7 +20,7 @@ mod hidden_taps;
 pub(super) use hidden_taps::TappedRows;
 #[path = "draft_view.rs"]
 mod draft_view;
-pub(super) use draft_view::{draft_target_shape_of, tapped_rows};
+pub(super) use draft_view::{draft_target_shape_of, tapped_rows, tapped_tree_rows};
 #[path = "draft_cycle.rs"]
 mod draft_cycle;
 #[cfg(test)]
@@ -35,6 +35,36 @@ mod lanes;
 #[path = "scheduled_batch.rs"]
 mod scheduled_batch;
 pub(super) use lanes::{LANE_ROWS, Lane};
+
+/// RAII guard that temporarily disables MLX CUDA Graph capture for large
+/// prefill passes (`M > 16`) and restores the previous state on drop.
+struct CudaGraphsGuard {
+    prev: Option<bool>,
+}
+
+impl CudaGraphsGuard {
+    fn disable_if(should_disable: bool) -> Self {
+        if !should_disable {
+            return Self { prev: None };
+        }
+        // SAFETY: FFI helper catches all C++ exceptions and returns previous flag.
+        let prev = unsafe { mlx_sys::mlx_cuda_set_use_graphs(false) };
+        Self {
+            prev: prev.then_some(true),
+        }
+    }
+}
+
+impl Drop for CudaGraphsGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev {
+            // SAFETY: FFI helper catches all C++ exceptions.
+            unsafe {
+                mlx_sys::mlx_cuda_set_use_graphs(prev);
+            }
+        }
+    }
+}
 
 /// Slot banks for a window's expert groups: a lease per group, then the
 /// release of that group's output before the slots serve the next group.
@@ -86,6 +116,10 @@ impl AttentionProjections {
 
 const DRAFT_HISTORY_STEP: usize = 256;
 const DRAFT_HEAD_ROWS: usize = 3;
+/// Preallocation growth quantum (tokens) for non-paged flat BF16 KV buffers.
+const FLAT_KV_STEP: usize = 256;
+/// Preallocation growth quantum (blocks) for non-paged flat indexer keys.
+const FLAT_INDEX_STEP: usize = 64;
 
 #[derive(Clone, Default)]
 pub struct LayerCache {
@@ -97,11 +131,17 @@ pub struct LayerCache {
     /// share one buffer and write in place past their own rows, so no cache
     /// may read past its own rows.
     draft_rows: Option<usize>,
+    /// Active token rows in preallocated non-paged flat `keys`/`values`
+    /// (`[1, kv_heads, cap, head_dim]`). `None` when paged, unallocated, or
+    /// managed by `draft_rows`.
+    flat_kv_rows: Option<usize>,
     index_tail: Vec<MxArray>,
-    /// `[blocks, indexer_head_dim]` of a cache without pages. Snapshots and
-    /// replay share handles, so appending must build a new array, never
-    /// write into this one.
+    /// `[cap_blocks, indexer_head_dim]` (or `[blocks, indexer_head_dim]`) of a
+    /// cache without pages. Active block count is `flat_index_blocks` when
+    /// `Some`, else `shape_at(0)`.
     index_keys: Option<MxArray>,
+    /// Active block rows in preallocated non-paged `index_keys`.
+    flat_index_blocks: Option<usize>,
     /// Complete indexer blocks of a paged sequence: their pooled keys live
     /// in the pool's index plane (Splash `PageStorage::indexOffset`).
     index_blocks: usize,
@@ -109,17 +149,198 @@ pub struct LayerCache {
 }
 impl LayerCache {
     fn index_block_count(&self) -> Result<usize> {
+        if let Some(blocks) = self.flat_index_blocks {
+            return Ok(blocks);
+        }
         match &self.index_keys {
             Some(keys) => Ok(keys.shape_at(0)? as usize),
             None => Ok(self.index_blocks),
         }
     }
-    fn append_index_keys(&mut self, keys: MxArray) -> Result<&MxArray> {
-        let keys = match &self.index_keys {
-            Some(old) => MxArray::concatenate(old, &keys, 0)?,
-            None => keys,
+    /// Active `[blocks, indexer_head_dim]` view of non-paged `index_keys`.
+    pub(super) fn active_index_keys(&self) -> Result<Option<MxArray>> {
+        let Some(keys) = &self.index_keys else {
+            return Ok(None);
         };
-        Ok(self.index_keys.insert(keys))
+        if let Some(blocks) = self.flat_index_blocks {
+            if blocks == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(keys.slice_axis(0, 0, blocks as i64)?));
+        }
+        Ok(Some(keys.clone()))
+    }
+    /// Append complete indexer block keys (`[n, indexer_head_dim]`) into a
+    /// preallocated growable buffer via `slice_assign_axis_inplace`, avoiding
+    /// O(T^2) concatenations during decode. Returns the backing buffer.
+    fn append_index_keys(&mut self, keys: MxArray) -> Result<&MxArray> {
+        let rows = self.index_block_count()?;
+        let add = keys.shape_at(0)? as usize;
+        let end = rows + add;
+        let capacity = match &self.index_keys {
+            Some(existing) => existing.shape_at(0)? as usize,
+            None => 0,
+        };
+        if end > capacity {
+            let target = end.next_multiple_of(FLAT_INDEX_STEP);
+            let dim = keys.shape_at(1)?;
+            let fresh = MxArray::zeros(&[(target - rows) as i64, dim], Some(keys.dtype()?))?;
+            let grown = match &self.index_keys {
+                Some(old) if rows > 0 => {
+                    MxArray::concatenate(&old.slice_axis(0, 0, rows as i64)?, &fresh, 0)?
+                }
+                _ => fresh,
+            };
+            self.index_keys = Some(grown);
+        }
+        let buf = self
+            .index_keys
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen4 flat indexer cache lost its buffer"))?;
+        buf.slice_assign_axis_inplace(0, rows as i64, end as i64, &keys)?;
+        self.flat_index_blocks = Some(end);
+        Ok(buf)
+    }
+    /// Active token rows stored in non-paged flat `keys`/`values`.
+    pub(super) fn flat_kv_len(&self) -> Result<usize> {
+        if let Some(rows) = self.flat_kv_rows {
+            return Ok(rows);
+        }
+        match &self.keys {
+            Some(keys) => Ok(keys.shape_at(2)? as usize),
+            None => Ok(0),
+        }
+    }
+    /// Append `k`/`v` (`[1, kv_heads, t, head_dim]`) into preallocated growable
+    /// flat buffers via `slice_assign_axis_inplace` (zero O(T^2) concat copies).
+    /// Returns active `[1, kv_heads, end, head_dim]` views.
+    pub(super) fn append_flat_kv(
+        &mut self,
+        k: &MxArray,
+        v: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let rows = self.flat_kv_len()?;
+        let add = k.shape_at(2)? as usize;
+        let end = rows + add;
+        let capacity = match &self.keys {
+            Some(keys) => keys.shape_at(2)? as usize,
+            None => 0,
+        };
+        if end > capacity {
+            let target = end.next_multiple_of(FLAT_KV_STEP);
+            let grow = |old: &Option<MxArray>, update: &MxArray| -> Result<MxArray> {
+                let shape = [
+                    update.shape_at(0)?,
+                    update.shape_at(1)?,
+                    (target - rows) as i64,
+                    update.shape_at(3)?,
+                ];
+                let fresh = MxArray::zeros(&shape, Some(update.dtype()?))?;
+                match old {
+                    Some(old) if rows > 0 => {
+                        MxArray::concatenate(&old.slice_axis(2, 0, rows as i64)?, &fresh, 2)
+                    }
+                    _ => Ok(fresh),
+                }
+            };
+            self.keys = Some(grow(&self.keys, k)?);
+            self.values = Some(grow(&self.values, v)?);
+        }
+        let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) else {
+            return Err(Error::from_reason("Qwen4 flat KV cache lost its buffer"));
+        };
+        keys.slice_assign_axis_inplace(2, rows as i64, end as i64, k)?;
+        values.slice_assign_axis_inplace(2, rows as i64, end as i64, v)?;
+        self.flat_kv_rows = Some(end);
+        Ok((
+            keys.slice_axis(2, 0, end as i64)?,
+            values.slice_axis(2, 0, end as i64)?,
+        ))
+    }
+    /// Ensure preallocated non-paged flat KV buffers have capacity for `add`
+    /// more tokens without mutating `flat_kv_rows` yet. Returns
+    /// `(offset, keys_buf, values_buf)` for fused in-place CUDA KV store.
+    pub(super) fn ensure_flat_kv_capacity(
+        &mut self,
+        kv_heads: i64,
+        head_dim: i64,
+        add: usize,
+        dtype: DType,
+    ) -> Result<(usize, MxArray, MxArray)> {
+        let rows = self.flat_kv_len()?;
+        let end = rows + add;
+        let capacity = match &self.keys {
+            Some(keys) => keys.shape_at(2)? as usize,
+            None => 0,
+        };
+        if end > capacity {
+            let target = end.next_multiple_of(FLAT_KV_STEP);
+            let grow = |old: &Option<MxArray>| -> Result<MxArray> {
+                let fresh = MxArray::zeros(
+                    &[1, kv_heads, (target - rows) as i64, head_dim],
+                    Some(dtype),
+                )?;
+                match old {
+                    Some(old) if rows > 0 => {
+                        MxArray::concatenate(&old.slice_axis(2, 0, rows as i64)?, &fresh, 2)
+                    }
+                    _ => Ok(fresh),
+                }
+            };
+            self.keys = Some(grow(&self.keys)?);
+            self.values = Some(grow(&self.values)?);
+            // Keep `flat_kv_len()` anchored at `rows` (critical when pre-reserving
+            // at `rows == 0` before chunk 0, otherwise `flat_kv_len()` would see
+            // `flat_kv_rows == None` and return the allocated capacity!).
+            self.flat_kv_rows = Some(rows);
+        }
+        let (Some(keys), Some(values)) = (&self.keys, &self.values) else {
+            return Err(Error::from_reason("Qwen4 flat KV cache lost its buffer"));
+        };
+        Ok((rows, keys.clone(), values.clone()))
+    }
+    /// Ensure preallocated non-paged flat `index_keys` has capacity for
+    /// `add_blocks` more indexer blocks without advancing `flat_index_blocks`.
+    /// Returns the newly allocated buffer if growth occurred.
+    pub(super) fn ensure_flat_index_capacity(
+        &mut self,
+        dim: i64,
+        add_blocks: usize,
+        dtype: DType,
+    ) -> Result<Option<MxArray>> {
+        let rows = self.index_block_count()?;
+        let end = rows + add_blocks;
+        let capacity = match &self.index_keys {
+            Some(existing) => existing.shape_at(0)? as usize,
+            None => 0,
+        };
+        if end <= capacity {
+            return Ok(None);
+        }
+        let target = end.next_multiple_of(FLAT_INDEX_STEP);
+        let fresh = MxArray::zeros(&[(target - rows) as i64, dim], Some(dtype))?;
+        let grown = match &self.index_keys {
+            Some(old) if rows > 0 => {
+                MxArray::concatenate(&old.slice_axis(0, 0, rows as i64)?, &fresh, 0)?
+            }
+            _ => fresh,
+        };
+        self.index_keys = Some(grown.clone());
+        self.flat_index_blocks = Some(rows);
+        Ok(Some(grown))
+    }
+    /// Trim non-paged flat KV / indexer cursors back to `rows` tokens (keeping
+    /// preallocated storage intact for subsequent decode or speculative verify).
+    #[allow(dead_code)]
+    pub(super) fn trim_flat(&mut self, rows: usize, compress_ratio: usize) {
+        if let Some(cur) = self.flat_kv_rows {
+            self.flat_kv_rows = Some(cur.min(rows));
+        }
+        if let Some(cur) = self.flat_index_blocks {
+            let keep_blocks = rows / compress_ratio.max(1);
+            self.flat_index_blocks = Some(cur.min(keep_blocks));
+        }
+        self.index_tail.clear();
     }
     /// Write draft K/V rows after this cache's rows. A buffer too small for
     /// them is replaced in this cache only: other holders keep reading theirs.
@@ -189,7 +410,7 @@ impl LayerCache {
         if to > self.draft_row_count()
             || !from.is_multiple_of(ratio)
             || !to.is_multiple_of(ratio)
-            || to / ratio > index.shape_at(0)? as usize
+            || to / ratio > self.index_block_count()?
         {
             return Ok(None);
         }
@@ -215,18 +436,20 @@ impl LayerCache {
             MxArray::concatenate_many(segments.iter().map(|s| &s.index).collect(), Some(0))?;
         MxArray::eval_arrays(&[&keys, &values, &index])?;
         let rows = keys.shape_at(2)? as usize;
+        let blocks = index.shape_at(0)? as usize;
         Ok(Self {
             keys: Some(keys),
             values: Some(values),
             draft_rows: Some(rows),
             index_keys: Some(index),
+            flat_index_blocks: Some(blocks),
             ..Self::default()
         })
     }
     /// The pooled indexer keys of a draft history.
     #[cfg(test)]
-    pub(super) fn draft_index(&self) -> Option<&MxArray> {
-        self.index_keys.as_ref()
+    pub(super) fn draft_index(&self) -> Option<MxArray> {
+        self.active_index_keys().ok().flatten()
     }
     /// (rows, K buffer, V buffer) of a draft history.
     #[cfg(test)]
@@ -236,7 +459,7 @@ impl LayerCache {
     /// (K/V rows, indexer blocks, indexer tail rows).
     #[cfg(test)]
     pub(super) fn history_shape(&self) -> (usize, usize, usize) {
-        let rows = self.draft_rows.unwrap_or_else(|| {
+        let rows = self.draft_rows.or(self.flat_kv_rows).unwrap_or_else(|| {
             self.keys
                 .as_ref()
                 .map_or(0, |keys| keys.shape_at(2).unwrap() as usize)
@@ -246,6 +469,10 @@ impl LayerCache {
             self.index_block_count().unwrap(),
             self.index_tail.len(),
         )
+    }
+    #[cfg(test)]
+    pub(super) fn gdn_state(&self) -> (Option<&MxArray>, Option<&MxArray>) {
+        (self.conv.as_ref(), self.recurrent.as_ref())
     }
     pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
         self.conv
@@ -326,6 +553,77 @@ impl GroupLimit {
     }
 }
 
+/// Pending CUDA deferred GDN recurrent-state update from the last committed
+/// flat speculative verify cycle: the next verify folds `keep` rows of
+/// `(k, v, g, beta)` into `cache.recurrent` in-register inside
+/// `fused_step_deferred_with_gate` / `tree_step_deferred_with_gate` before
+/// advancing its own verify rows.
+#[derive(Clone)]
+pub(super) struct CudaPendingGdn {
+    pub(super) k: MxArray,
+    pub(super) v: MxArray,
+    pub(super) g: MxArray,
+    pub(super) beta: MxArray,
+    pub(super) keep: usize,
+    /// `None` for contiguous prefix `0..keep`; `Some(int32[keep])` for
+    /// non-contiguous accepted branches from a speculative tree.
+    pub(super) prev_indices: Option<MxArray>,
+}
+
+/// Per-layer GDN tape captured during a deferred flat verify pass so
+/// `commit_deferred_verify` / `commit_tree_deferred` can roll back 2D
+/// `[3, 10240]` `cache.conv` and arm `cuda_pending_gdn[i]` without ever
+/// materializing intermediate speculative recurrent states.
+#[derive(Clone)]
+pub(super) struct VerifyGdnLayerTape {
+    pub(super) qkv: MxArray,
+    pub(super) pre_conv: Option<MxArray>,
+    pub(super) k: MxArray,
+    pub(super) v: MxArray,
+    pub(super) g: MxArray,
+    pub(super) beta: MxArray,
+}
+
+/// Per-layer PLE tape captured during a tree verify pass so
+/// `commit_tree_deferred` can rebuild exact `[9, 10240]` `cache.ple_conv`
+/// along any accepted branch (contiguous or non-contiguous).
+#[derive(Clone)]
+pub(super) struct VerifyPleLayerTape {
+    pub(super) pre_conv: Option<MxArray>,
+    pub(super) conv_in: MxArray,
+}
+
+/// Per-layer QSA full-attention tape captured during a tree verify pass so
+/// `commit_tree_deferred` can trim or compact flat KV rows and append committed
+/// 4-token indexer blocks.
+#[derive(Clone)]
+pub(super) struct VerifyAttnLayerTape {
+    pub(super) pre_kv_len: usize,
+    pub(super) pre_index_tail: Vec<MxArray>,
+    pub(super) ik_rows: MxArray,
+}
+
+/// Lightweight per-layer rollback snapshot for a flat CUDA deferred verify
+/// cycle (avoids building 4 full `DecoderState`s with 4×48 `LayerCache`s).
+pub(in super::super) struct DeferredVerifyTicket {
+    pub(in super::super) base_history_len: usize,
+    pub(in super::super) rows: usize,
+    pub(in super::super) gdn_tapes: Vec<Option<VerifyGdnLayerTape>>,
+    /// Per-row snapshots of non-GDN mutable metadata (`ple_conv`, `flat_kv_rows`,
+    /// `flat_index_blocks`, `index_tail`, `index_blocks`) indexed as `[row][layer]`.
+    pub(in super::super) row_caches: Vec<Vec<LayerCache>>,
+}
+
+/// Lightweight per-layer commit ticket for a flat CUDA deferred tree verify
+/// cycle (`T in 1..=16`).
+pub(in super::super) struct TreeVerifyTicket {
+    pub(in super::super) base_history_len: usize,
+    pub(in super::super) tree_tokens: Vec<u32>,
+    pub(in super::super) gdn_tapes: Vec<Option<VerifyGdnLayerTape>>,
+    pub(in super::super) ple_tapes: Vec<Option<VerifyPleLayerTape>>,
+    pub(in super::super) attn_tapes: Vec<Option<VerifyAttnLayerTape>>,
+}
+
 #[derive(Clone, Default)]
 pub struct DecoderState {
     caches: Vec<LayerCache>,
@@ -382,6 +680,26 @@ pub struct Decoder {
     scope: String,
     position_override: Option<usize>,
     rotary_tables: std::cell::RefCell<math::RotaryWindowCache>,
+    /// Cached `[head_dim]` BF16 Q/K norm weights for fused CUDA `qk_norm_rope_kv_store`
+    /// (avoids per-step F32->BF16 casts without altering residency accounting).
+    cuda_qk_norm_bf16: std::collections::HashMap<String, MxArray>,
+    /// Cached FP32 `(scale, dt)` per GDN layer so `gdn_mix`/`gdn_batch` never
+    /// repeat `dense().astype(F32)` on every token/verify cycle.
+    cuda_gdn_scale_dt: std::collections::HashMap<usize, (MxArray, MxArray)>,
+    /// Per-layer pending CUDA deferred GDN recurrent updates (flat speculative verify).
+    cuda_pending_gdn: Vec<Option<CudaPendingGdn>>,
+    /// Armed during `verify_chunk_deferred`; populated by `verify_layer`.
+    cuda_verify_gdn_tape: Option<Vec<Option<VerifyGdnLayerTape>>>,
+    /// Armed during `verify_chunk_deferred`; populated by `prefill_group_inner`.
+    cuda_verify_row_caches: Option<Vec<Vec<LayerCache>>>,
+    /// Carried final window + fused `output_hc_norm` output from a verify pass
+    /// so `verify_chunk*` avoids slicing+re-concatenating `last_chunk_hidden`.
+    cuda_verify_final_window: Option<MxArray>,
+    cuda_verify_final_normed: Option<MxArray>,
+    /// When true (set by `Step::forward_with_token` on flat CUDA AR), `decode_layers`
+    /// flushes `logits + state` asynchronously via `cuda_async_eval` and returns lazy
+    /// `logits` so `argmax` fuses into a single GPU sync per token.
+    pub(super) cuda_ar_lazy_logits: bool,
     /// The target's YaRN; `None` within the native window.
     pub(super) yarn: Option<math::Yarn>,
     verification: Option<Vec<DecoderState>>,
@@ -536,12 +854,38 @@ impl Decoder {
 
     /// The rows of a prefill pass that starts after `history_len` tokens.
     pub(super) fn prefill_rows_at(&self, history_len: usize) -> usize {
+        if self.paged.is_none()
+            && self.host_prefill_scratch.is_none()
+            && self.weights.plan.direct
+            && self.scope.is_empty()
+            && super::cuda_qwen4_fast_enabled()
+        {
+            return self.cuda_prefill_chunk_cap();
+        }
         let window = self.prefill_slice_size();
         window.min(super::memory::prefill_window(
             &self.config,
             self.host_prefill_scratch,
             history_len + window,
         ))
+    }
+
+    /// Flat CUDA direct prefill chunk size (defaults to 4096 so 73 GB of routed
+    /// experts stream 2× fewer times on long prompts; override via
+    /// `MLX_QWEN4_PREFILL_CHUNK` in `256..=8192`).
+    pub(super) fn cuda_prefill_chunk_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(pin) = self.prefill_window_pin {
+            return pin;
+        }
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("MLX_QWEN4_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(256, 8192))
+                .unwrap_or(4096)
+        })
     }
 
     /// The store changed its residency: the budget it registers and the
@@ -599,6 +943,13 @@ impl Decoder {
             caches: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
+            cuda_pending_gdn: vec![None; config.num_hidden_layers],
+            cuda_verify_gdn_tape: None,
+            cuda_verify_row_caches: None,
+            cuda_gdn_scale_dt: Default::default(),
+            cuda_verify_final_window: None,
+            cuda_verify_final_normed: None,
+            cuda_ar_lazy_logits: false,
             config: Arc::new(config),
             weights,
             history: Vec::new(),
@@ -612,6 +963,7 @@ impl Decoder {
             scope: String::new(),
             position_override: None,
             rotary_tables: Default::default(),
+            cuda_qk_norm_bf16: Default::default(),
             yarn,
             verification: None,
             device_routes: None,
@@ -738,9 +1090,10 @@ impl Decoder {
                 .map(Some)
                 .map_err(Error::from_reason);
         }
-        Ok(cache.index_keys.clone())
+        cache.active_index_keys()
     }
     pub fn take_state(&mut self) -> DecoderState {
+        let _ = self.settle_cuda_pending_gdn();
         let state = DecoderState {
             caches: std::mem::take(&mut self.caches),
             history: std::mem::take(&mut self.history),
@@ -756,6 +1109,7 @@ impl Decoder {
     }
     pub fn restore_state(&mut self, state: DecoderState) {
         self.rotary_tables.get_mut().clear();
+        self.clear_cuda_deferred_gdn();
         self.caches = state.caches;
         self.history = state.history;
         self.positions = state.positions;
@@ -835,6 +1189,7 @@ impl Decoder {
 
     pub fn reset(&mut self) {
         self.rotary_tables.get_mut().clear();
+        self.clear_cuda_deferred_gdn();
         self.verification = None;
         self.device_routes = None;
         self.layer_inputs = None;
@@ -851,6 +1206,94 @@ impl Decoder {
         self.caches = (0..self.config.num_hidden_layers)
             .map(|_| LayerCache::default())
             .collect();
+    }
+
+    pub(in super::super) fn clear_cuda_deferred_gdn(&mut self) {
+        for slot in &mut self.cuda_pending_gdn {
+            *slot = None;
+        }
+        self.cuda_verify_gdn_tape = None;
+        self.cuda_verify_row_caches = None;
+        self.cuda_verify_final_window = None;
+        self.cuda_verify_final_normed = None;
+    }
+
+    /// Fold any remaining pending CUDA deferred GDN updates into
+    /// `self.caches[i].recurrent` via `gdn::replay` and clear `cuda_pending_gdn`.
+    /// Must be called on turn finish, `Drop`, or before any non-deferred step.
+    pub(in super::super) fn settle_cuda_pending_gdn(&mut self) -> Result<()> {
+        if !self.cuda_pending_gdn.iter().any(Option::is_some) {
+            return Ok(());
+        }
+        let nh = self.config.linear_num_value_heads as i64;
+        let kd = self.config.linear_key_head_dim as i64;
+        let vd = self.config.linear_value_head_dim as i64;
+        let tiled = self.gguf();
+        let mut settled_states = Vec::new();
+        for (i, slot) in self.cuda_pending_gdn.iter_mut().enumerate() {
+            let Some(p) = slot.take() else {
+                continue;
+            };
+            if p.keep == 0 {
+                continue;
+            }
+            let start_state = match &self.caches[i].recurrent {
+                Some(s) => s.clone(),
+                None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
+            };
+            let (k, v, g, beta) = if let Some(ref idx) = p.prev_indices {
+                (
+                    p.k.take(idx, 1)?,
+                    p.v.take(idx, 1)?,
+                    p.g.take(idx, 1)?,
+                    p.beta.take(idx, 1)?,
+                )
+            } else {
+                (p.k, p.v, p.g, p.beta)
+            };
+            let settled =
+                crate::kernels::gdn::replay(&k, &v, &g, &beta, &start_state, p.keep as i32, tiled)?
+                    .ok_or_else(|| {
+                        Error::from_reason("Qwen4 CUDA deferred GDN settle replay failed")
+                    })?;
+            self.caches[i].recurrent = Some(settled.clone());
+            settled_states.push(settled);
+        }
+        if !settled_states.is_empty() {
+            let refs: Vec<&MxArray> = settled_states.iter().collect();
+            MxArray::eval_arrays_with_context(&refs, "qwen4::decoder::settle_gdn")?;
+        }
+        Ok(())
+    }
+
+    /// Cached FP32 `(scale, dt)` for GDN layer `i`.
+    pub(super) fn gdn_scale_dt(
+        &mut self,
+        i: usize,
+        p: &str,
+        g: &str,
+    ) -> Result<(MxArray, MxArray)> {
+        if self.scope.is_empty()
+            && let Some(pair) = self.cuda_gdn_scale_dt.get(&i)
+        {
+            return Ok(pair.clone());
+        }
+        let a_log = self
+            .dense(&format!("{p}.A_log"), &format!("{g}.ssm_a"))?
+            .astype(DType::Float32)?;
+        let scale = if self.gguf() {
+            a_log
+        } else {
+            a_log.exp()?.negative()?
+        };
+        let dt = self
+            .dense(&format!("{p}.dt_bias"), &format!("{g}.ssm_dt.bias"))?
+            .astype(DType::Float32)?;
+        if self.scope.is_empty() {
+            self.cuda_gdn_scale_dt
+                .insert(i, (scale.clone(), dt.clone()));
+        }
+        Ok((scale, dt))
     }
     /// Taps the outputs of `layers` on every pass from here on; `None`
     /// takes no tap.
@@ -1365,6 +1808,40 @@ impl Decoder {
         self.hyper_with_norm(x, hf, gg, inject, None)
     }
 
+    fn cuda_hc_inject_weight(
+        bank: &super::weights::Weight,
+    ) -> Option<crate::kernels::qwen4::Qwen4HcInjectWeight<'_>> {
+        if bank.mode == "affine"
+            && bank.bits == 8
+            && bank.group == 32
+            && let (Some(scales), Some(biases)) = (&bank.scales, &bank.biases)
+        {
+            return Some(crate::kernels::qwen4::Qwen4HcInjectWeight::Q8_0Bias {
+                weight: &bank.values,
+                scales,
+                biases,
+            });
+        }
+        if bank.scales.is_some() {
+            return None;
+        }
+        if let Some(bf16) = &bank.dense_bf16 {
+            return Some(crate::kernels::qwen4::Qwen4HcInjectWeight::DenseBf16(bf16));
+        }
+        match bank.values.dtype().ok()? {
+            DType::BFloat16 => Some(crate::kernels::qwen4::Qwen4HcInjectWeight::DenseBf16(
+                &bank.values,
+            )),
+            DType::Float16 => Some(crate::kernels::qwen4::Qwen4HcInjectWeight::DenseFp16(
+                &bank.values,
+            )),
+            DType::Float32 => Some(crate::kernels::qwen4::Qwen4HcInjectWeight::DenseFp32(
+                &bank.values,
+            )),
+            _ => None,
+        }
+    }
+
     fn hyper_with_norm(
         &mut self,
         x: &MxArray,
@@ -1374,8 +1851,36 @@ impl Decoder {
         normed: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let c = self.config.clone();
+        let rows = x.shape_at(1)?;
         let n = if let Some(normed) = normed {
             normed.clone()
+        } else if super::cuda_qwen4_fast_enabled()
+            && c.hc_count == 4
+            && c.hidden_size == 2560
+            && x.dtype()? == DType::BFloat16
+        {
+            let w = self.dense(
+                &format!("{hf}.hc_norm.weight"),
+                &format!("{gg}_norm.weight"),
+            )?;
+            let weight_offset = if self.gguf() { 0.0 } else { 1.0 };
+            if let Some((_, normed)) = crate::kernels::qwen4::inject_norm_cuda(
+                x,
+                None,
+                &w,
+                c.rms_norm_eps as f32,
+                weight_offset,
+            )? {
+                normed
+            } else {
+                self.norm(
+                    x,
+                    &format!("{hf}.hc_norm.weight"),
+                    &format!("{gg}_norm.weight"),
+                    c.hidden_size,
+                    true,
+                )?
+            }
         } else {
             self.norm(
                 x,
@@ -1385,57 +1890,128 @@ impl Decoder {
                 true,
             )?
         };
-        let activated = if self.gguf()
+        let mut gate_ready = false;
+        let cuda_down = if super::cuda_qwen4_fast_enabled()
             && c.hc_count == 4
             && c.hidden_size == 2560
-            && (x.shape()?[1] >= 1024 || x.shape()?[1] == 1)
+            && c.hc_lowrank == 320
+            && (rows <= 16 || rows > 512)
+            && rows >= 1
+            && n.dtype()? == DType::BFloat16
         {
             let down_key = self.key(
                 &format!("{hf}.input_mix_weight_down.weight"),
                 &format!("{gg}_down.weight"),
             );
-            self.weights
-                .resident_bank(&down_key)
-                .map(|w| w.mixer_act(&n))
-                .transpose()?
-                .flatten()
+            let inj_key = self.key(
+                &format!("{hf}.block_inject_weight.weight"),
+                &format!("{gg}_inject.weight"),
+            );
+            if let Some(down_bank) = self.weights.resident_bank(&down_key)
+                && down_bank.mode == "affine"
+                && down_bank.bits == 8
+                && down_bank.group == 32
+                && (rows <= 16 || down_bank.q8_symmetric_128)
+                && let (Some(s_down), Some(b_down)) = (&down_bank.scales, &down_bank.biases)
+            {
+                let inj_bank = if inject {
+                    self.weights.resident_bank(&inj_key)
+                } else {
+                    None
+                };
+                let inj_w = match inj_bank.as_deref() {
+                    Some(bank) => Self::cuda_hc_inject_weight(bank)
+                        .unwrap_or(crate::kernels::qwen4::Qwen4HcInjectWeight::None),
+                    None => crate::kernels::qwen4::Qwen4HcInjectWeight::None,
+                };
+                let fused_inj = !matches!(inj_w, crate::kernels::qwen4::Qwen4HcInjectWeight::None);
+                if let Some((down_act, inj_out)) = crate::kernels::qwen4::hc_down_act_cuda(
+                    &n,
+                    &down_bank.values,
+                    s_down,
+                    b_down,
+                    inj_w,
+                )? {
+                    let gate = if inject {
+                        if fused_inj {
+                            gate_ready = true;
+                            inj_out
+                        } else {
+                            Some(self.linear_rows(
+                                &n,
+                                &format!("{hf}.block_inject_weight.weight"),
+                                &format!("{gg}_inject.weight"),
+                            )?)
+                        }
+                    } else {
+                        None
+                    };
+                    Some((down_act, gate))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
-        let is_activated = activated.is_some();
-        let (down, inject_projection) = if let Some(activated) = activated {
-            let gate = if inject {
-                Some(self.linear(
-                    &n,
-                    &format!("{hf}.block_inject_weight.weight"),
-                    &format!("{gg}_inject.weight"),
-                )?)
+        let (is_activated, down, inject_projection) = if let Some((down_act, gate)) = cuda_down {
+            (true, down_act, gate)
+        } else {
+            let activated = if self.gguf()
+                && c.hc_count == 4
+                && c.hidden_size == 2560
+                && (rows >= 1024 || rows == 1)
+            {
+                let down_key = self.key(
+                    &format!("{hf}.input_mix_weight_down.weight"),
+                    &format!("{gg}_down.weight"),
+                );
+                self.weights
+                    .resident_bank(&down_key)
+                    .map(|w| w.mixer_act(&n))
+                    .transpose()?
+                    .flatten()
             } else {
                 None
             };
-            (activated, gate)
-        } else if inject {
-            let (down, gate) = self.linear_pair(
-                &n,
-                (
-                    &format!("{hf}.input_mix_weight_down.weight"),
-                    &format!("{gg}_down.weight"),
-                ),
-                (
-                    &format!("{hf}.block_inject_weight.weight"),
-                    &format!("{gg}_inject.weight"),
-                ),
-            )?;
-            (down, Some(gate))
-        } else {
-            (
-                self.linear(
+            let is_activated = activated.is_some();
+            let (down, inject_projection) = if let Some(activated) = activated {
+                let gate = if inject {
+                    Some(self.linear(
+                        &n,
+                        &format!("{hf}.block_inject_weight.weight"),
+                        &format!("{gg}_inject.weight"),
+                    )?)
+                } else {
+                    None
+                };
+                (activated, gate)
+            } else if inject {
+                let (down, gate) = self.linear_pair(
                     &n,
-                    &format!("{hf}.input_mix_weight_down.weight"),
-                    &format!("{gg}_down.weight"),
-                )?,
-                None,
-            )
+                    (
+                        &format!("{hf}.input_mix_weight_down.weight"),
+                        &format!("{gg}_down.weight"),
+                    ),
+                    (
+                        &format!("{hf}.block_inject_weight.weight"),
+                        &format!("{gg}_inject.weight"),
+                    ),
+                )?;
+                (down, Some(gate))
+            } else {
+                (
+                    self.linear(
+                        &n,
+                        &format!("{hf}.input_mix_weight_down.weight"),
+                        &format!("{gg}_down.weight"),
+                    )?,
+                    None,
+                )
+            };
+            (is_activated, down, inject_projection)
         };
         let down = if is_activated {
             down
@@ -1446,7 +2022,41 @@ impl Decoder {
             &format!("{hf}.input_mix_weight_up.weight"),
             &format!("{gg}_up.weight"),
         );
-        let fused = if self.gguf() && c.hc_count == 4 && c.hidden_size == 2560 {
+        let cuda_up = if super::cuda_qwen4_fast_enabled()
+            && c.hc_count == 4
+            && c.hidden_size == 2560
+            && c.hc_lowrank == 320
+            && down.dtype()? == DType::BFloat16
+            && n.dtype()? == DType::BFloat16
+        {
+            if let Some(up_bank) = self.weights.resident_bank(&key)
+                && up_bank.mode == "affine"
+                && up_bank.bits == 8
+                && up_bank.group == 32
+                && let (Some(s_up), Some(b_up)) = (&up_bank.scales, &up_bank.biases)
+            {
+                if (1..=128).contains(&rows) {
+                    crate::kernels::qwen4::hc_up_mix_cuda(&down, &n, &up_bank.values, s_up, b_up)?
+                } else if rows > 128 && up_bank.q8_symmetric_128 {
+                    crate::kernels::qwen4::hc_up_mix_prefill_cuda(
+                        &down,
+                        &n,
+                        &up_bank.values,
+                        s_up,
+                        b_up,
+                    )?
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let fused = if cuda_up.is_some() {
+            cuda_up
+        } else if self.gguf() && c.hc_count == 4 && c.hidden_size == 2560 {
             self.weights
                 .resident_bank(&key)
                 .map(|w| w.hyper_up(&down, &n))
@@ -1459,26 +2069,40 @@ impl Decoder {
             mixed
         } else {
             let up = self.weights.linear(&key, &down)?;
-            let combined = if self.gguf()
-                && crate::engine::persistence::compiled_forward_backend_available()
+            if super::cuda_qwen4_fast_enabled()
+                && c.hc_count == 4
+                && c.hidden_size == 2560
+                && up.dtype()? == DType::BFloat16
+                && n.dtype()? == DType::BFloat16
+                && let Some(out) = crate::kernels::qwen4::prefill_hc_mix_cuda(&up, &n)?
             {
-                unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(up.as_raw_ptr(), n.as_raw_ptr()) }
+                out
             } else {
-                std::ptr::null_mut()
-            };
-            if combined.is_null() {
-                math::sigmoid_mul(&up, &n)?
-                    .reshape(&[1, x.shape()?[1], c.hc_count as i64, c.hidden_size as i64])?
-                    .mean(Some(&[-2]), Some(false))?
-            } else {
-                MxArray::from_handle(combined, "Qwen4 prefill mixer combine")?
+                let combined = if self.gguf()
+                    && crate::engine::persistence::compiled_forward_backend_available()
+                {
+                    unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(up.as_raw_ptr(), n.as_raw_ptr()) }
+                } else {
+                    std::ptr::null_mut()
+                };
+                if combined.is_null() {
+                    math::sigmoid_mul(&up, &n)?
+                        .reshape(&[1, rows, c.hc_count as i64, c.hidden_size as i64])?
+                        .mean(Some(&[-2]), Some(false))?
+                } else {
+                    MxArray::from_handle(combined, "Qwen4 prefill mixer combine")?
+                }
             }
         };
         let gate = if inject {
             let w = inject_projection.ok_or_else(|| {
                 Error::from_reason("Qwen4 hyper-connection is missing its injection projection")
             })?;
-            Some(Activations::sigmoid(&w.div_scalar(c.hc_count as f64)?)?.mul_scalar(2.0)?)
+            if gate_ready {
+                Some(w)
+            } else {
+                Some(Activations::sigmoid(&w.div_scalar(c.hc_count as f64)?)?.mul_scalar(2.0)?)
+            }
         } else {
             None
         };
@@ -1515,6 +2139,24 @@ impl Decoder {
         normalize: bool,
     ) -> Result<(MxArray, Option<MxArray>)> {
         if normalize
+            && super::cuda_qwen4_fast_enabled()
+            && self.config.hidden_size == 2560
+            && self.config.hc_count == 4
+            && x.dtype()? == DType::BFloat16
+        {
+            let w = self.dense(hf, gg)?;
+            let weight_offset = if self.gguf() { 0.0 } else { 1.0 };
+            if let Some((stream, normed)) = crate::kernels::qwen4::inject_norm_cuda(
+                x,
+                Some((branch, gate)),
+                &w,
+                self.config.rms_norm_eps as f32,
+                weight_offset,
+            )? {
+                return Ok((stream, Some(normed)));
+            }
+        }
+        if normalize
             && self.gguf()
             && self.config.hidden_size == 2560
             && self.config.hc_count == 4
@@ -1544,11 +2186,59 @@ impl Decoder {
         }
         Ok((Self::inject(x, branch, gate)?, None))
     }
+    pub(super) fn cuda_async_eval(arrays: &[&MxArray]) {
+        if arrays.is_empty() {
+            return;
+        }
+        let mut handles: Vec<*mut mlx_sys::mlx_array> = arrays
+            .iter()
+            .map(|a| a.as_raw_ptr())
+            .filter(|&ptr| !unsafe { mlx_sys::mlx_array_is_available(ptr) })
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        unsafe {
+            mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
+    pub(super) fn flush_cuda_ar_step(
+        &self,
+        next_token: &MxArray,
+        logits: &MxArray,
+        budget_forced: bool,
+    ) {
+        let mut completed: Vec<&MxArray> = self.pending_state_arrays();
+        if let Some(taps) = &self.hidden_taps {
+            completed.extend(taps.last_pass_arrays().iter());
+        }
+        if budget_forced {
+            completed.push(logits);
+        }
+        completed.push(next_token);
+        Self::cuda_async_eval(&completed);
+    }
+    pub(super) fn sync_cuda_pending_states(&self) -> Result<()> {
+        let mut completed: Vec<&MxArray> = self.pending_state_arrays();
+        if let Some(taps) = &self.hidden_taps {
+            completed.extend(taps.last_pass_arrays().iter());
+        }
+        if !completed.is_empty() {
+            MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::end_decode")?;
+        }
+        Ok(())
+    }
+    fn cuda_deferred_state(&self) -> bool {
+        super::cuda_qwen4_fast_enabled() && self.weights.plan.direct && self.scope.is_empty()
+    }
     fn submit(&self, arrays: &[&MxArray], context: &str) -> Result<()> {
         #[cfg(test)]
         self.submit_log.borrow_mut().push(context.to_owned());
         if crate::engine::persistence::compiled_forward_backend_available() {
             MxArray::async_eval_arrays(arrays);
+            Ok(())
+        } else if super::cuda_qwen4_fast_enabled() {
+            Self::cuda_async_eval(arrays);
             Ok(())
         } else {
             MxArray::eval_arrays_with_context(arrays, context)
@@ -1558,13 +2248,23 @@ impl Decoder {
         // The reference submits whole layer groups. Inside a checked device
         // transaction, its final join also completes every auxiliary state
         // before bank readers are released or a failed window is replayed.
-        if self.deferred_state_submission() {
+        if self.deferred_state_submission() || self.cuda_deferred_state() {
             Ok(())
         } else {
             self.submit(arrays, context)
         }
     }
     fn inject(x: &MxArray, y: &MxArray, g: &MxArray) -> Result<MxArray> {
+        if super::cuda_qwen4_fast_enabled()
+            && x.dtype()? == DType::BFloat16
+            && y.dtype()? == DType::BFloat16
+            && g.dtype()? == DType::BFloat16
+            && x.ndim()? >= 2
+            && x.shape_at(x.ndim()? - 1)? == 10240
+            && let Some(out) = crate::kernels::qwen4::inject_only_cuda(x, y, g)?
+        {
+            return Ok(out);
+        }
         if crate::engine::persistence::compiled_forward_backend_available() {
             return MxArray::from_handle(
                 unsafe {
@@ -1597,20 +2297,37 @@ impl Decoder {
             self.config.linear_num_value_heads as i64,
             self.config.linear_value_head_dim as i64,
         ])?;
-        let a = self
-            .linear_rows(
+        let (a, b) = if super::cuda_qwen4_fast_enabled() && x.dtype()? == DType::BFloat16 {
+            // Pair ssm_alpha + ssm_beta ([96, 2560] BF16) into one `bf16_matmul_few`
+            // launch and pass BF16 directly into `GdnPrepareCuda` (no F32 cast!).
+            self.linear_pair_rows(
                 x,
-                &format!("{p}.in_proj_a.weight"),
-                &format!("{g}.ssm_alpha.weight"),
+                (
+                    &format!("{p}.in_proj_a.weight"),
+                    &format!("{g}.ssm_alpha.weight"),
+                ),
+                (
+                    &format!("{p}.in_proj_b.weight"),
+                    &format!("{g}.ssm_beta.weight"),
+                ),
             )?
-            .astype(DType::Float32)?;
-        let b = self
-            .linear_rows(
-                x,
-                &format!("{p}.in_proj_b.weight"),
-                &format!("{g}.ssm_beta.weight"),
-            )?
-            .astype(DType::Float32)?;
+        } else {
+            let a = self
+                .linear_rows(
+                    x,
+                    &format!("{p}.in_proj_a.weight"),
+                    &format!("{g}.ssm_alpha.weight"),
+                )?
+                .astype(DType::Float32)?;
+            let b = self
+                .linear_rows(
+                    x,
+                    &format!("{p}.in_proj_b.weight"),
+                    &format!("{g}.ssm_beta.weight"),
+                )?
+                .astype(DType::Float32)?;
+            (a, b)
+        };
         Ok(GdnProjections { qkv, z, a, b })
     }
 
@@ -1689,6 +2406,76 @@ impl Decoder {
             cache.conv = Some(history);
             return Ok(out);
         }
+        if super::cuda_qwen4_fast_enabled()
+            && (kh, nh, kd, vd) == (16, 48, 128, 128)
+            && c.linear_conv_kernel_dim == 4
+            && c.rms_norm_eps.is_finite()
+            && c.rms_norm_eps > 0.0
+            && qkv.dtype()? == DType::BFloat16
+            && z.dtype()? == DType::BFloat16
+            && conv.dtype()? == DType::Float32
+        {
+            let (scale, dt) = self.gdn_scale_dt(i, &p, &g)?;
+            let w = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
+            let old_conv = cache.conv.clone();
+            if let Some([q, k, v, decay, beta]) =
+                math::gdn_prepare(qkv, a, b, &conv, &mut cache.conv, &scale, &dt)?
+            {
+                let (state, can_alias) = match &cache.recurrent {
+                    Some(s) => {
+                        // In-place `state_dst` avoids 113.2 MB/tok allocation churn
+                        // and SM121 25 MB graph splits whenever no snapshot aliases `s`.
+                        let alias = self.verification.is_none()
+                            && self.paged.is_none()
+                            && std::sync::Arc::strong_count(&s.handle) == 1
+                            && unsafe { mlx_sys::mlx_array_is_available(s.as_raw_ptr()) }
+                            && s.shape()?.as_ref() == [1, nh, vd, kd]
+                            && s.dtype()? == DType::Float32;
+                        (s.clone(), alias)
+                    }
+                    None => (
+                        MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
+                        false,
+                    ),
+                };
+                if let Some((out, next_state)) = crate::kernels::gdn::fused_step_with_gate(
+                    &q,
+                    &k,
+                    &v,
+                    &decay,
+                    &beta,
+                    &state,
+                    z,
+                    &w,
+                    c.rms_norm_eps as f32,
+                    self.gguf(),
+                    c.output_gate_type == "sigmoid",
+                    can_alias.then_some(&state),
+                )? {
+                    if let Some(history) = &cache.conv {
+                        self.submit_state(
+                            &[&out, &next_state, history],
+                            "qwen4::decoder::complete_gdn",
+                        )?;
+                    } else {
+                        self.submit_state(&[&out, &next_state], "qwen4::decoder::complete_gdn")?;
+                    }
+                    cache.recurrent = Some(next_state);
+                    return Ok(out);
+                }
+                cache.conv = old_conv;
+            }
+        }
+        let a_f32 = if a.dtype()? == DType::Float32 {
+            a.clone()
+        } else {
+            a.astype(DType::Float32)?
+        };
+        let b_f32 = if b.dtype()? == DType::Float32 {
+            b.clone()
+        } else {
+            b.astype(DType::Float32)?
+        };
         let qkv = math::conv_with_completion(
             qkv,
             &conv,
@@ -1728,7 +2515,7 @@ impl Decoder {
         let dt = self
             .dense(&format!("{p}.dt_bias"), &format!("{g}.ssm_dt.bias"))?
             .astype(DType::Float32)?;
-        let (decay, beta) = math::gdn_gates(a, b, &a_scale, &dt)?;
+        let (decay, beta) = math::gdn_gates(&a_f32, &b_f32, &a_scale, &dt)?;
         let decay = decay.reshape(&[1, nh, 1, 1])?;
         let state = match &cache.recurrent {
             Some(s) => s.clone(),
@@ -1808,6 +2595,90 @@ impl Decoder {
         let nh = c.num_attention_heads as i64;
         let kh = c.num_key_value_heads as i64;
         let qg = projections.qg.reshape(&[1, 1, nh, 2 * hd])?;
+        if self.paged.is_none()
+            && cache.draft_rows.is_none()
+            && let Some((q, k_buf, v_buf, kv_len)) = self.cuda_flat_qk_rope_store(
+                &qg,
+                &projections.k,
+                &projections.v,
+                i,
+                cache,
+                pos,
+                1,
+                "qwen4::decoder::kv",
+            )?
+        {
+            let id = c.indexer_head_dim as i64;
+            cache.index_tail.push(projections.ik.reshape(&[1, id])?);
+            if cache.index_tail.len() == c.indexer_compress_ratio {
+                let raw = MxArray::concatenate_many(cache.index_tail.iter().collect(), Some(0))?
+                    .astype(DType::Float32)?
+                    .mean(Some(&[0]), Some(true))?
+                    .astype(x.dtype()?)?;
+                let raw = self.norm(
+                    &raw,
+                    &format!("{p}.indexer.k_layernorm.weight"),
+                    &format!("{g}.indexer.k_norm.weight"),
+                    c.indexer_head_dim,
+                    true,
+                )?;
+                let block = self.rope(&raw, pos + 1 - c.indexer_compress_ratio)?;
+                let keys = self.append_index_blocks(i, cache, block)?;
+                self.submit_state(&[&keys], "qwen4::decoder::block")?;
+                cache.index_tail.clear();
+            }
+            let topk = c.indexer_budget / c.indexer_compress_ratio;
+            let nb = cache.index_block_count()?;
+            let sparse = nb > topk;
+            let out = if let Some(cuda_out) = self.cuda_flat_sdpa(
+                &q,
+                &k_buf,
+                &v_buf,
+                kv_len,
+                &projections.iq,
+                i,
+                cache,
+                pos,
+                1,
+                sparse,
+            )? {
+                cuda_out
+            } else if sparse {
+                let (selected, query_ends) = self.qsa_select(i, cache, &projections.iq, pos, 1)?;
+                let k_active = k_buf.slice_axis(2, 0, kv_len as i64)?;
+                let v_active = v_buf.slice_axis(2, 0, kv_len as i64)?;
+                math::qsa_attention_flat(
+                    &q,
+                    &k_active,
+                    &v_active,
+                    &selected,
+                    &query_ends,
+                    pos,
+                    (c.head_dim as f64).powf(-0.5),
+                    c.indexer_compress_ratio,
+                )?
+            } else {
+                let k_active = k_buf.slice_axis(2, 0, kv_len as i64)?;
+                let v_active = v_buf.slice_axis(2, 0, kv_len as i64)?;
+                scaled_dot_product_attention(
+                    &q,
+                    &k_active,
+                    &v_active,
+                    (c.head_dim as f64).powf(-0.5),
+                    None,
+                )?
+            };
+            let out = math::attention_output(&out, &qg)?;
+            return if project_output {
+                self.linear(
+                    &out,
+                    &format!("{p}.o_proj.weight"),
+                    &format!("{g}.attn_output.weight"),
+                )
+            } else {
+                Ok(out)
+            };
+        }
         let q = qg.slice_axis(3, 0, hd)?;
         let q = self.attention_norm_rotary(
             &q.transpose(Some(&[0, 2, 1, 3]))?,
@@ -1850,19 +2721,26 @@ impl Decoder {
         };
         let (keys, values) = if stored {
             (k, v)
+        } else if cache.draft_rows.is_some() {
+            let (keys, values) = cache.append_draft_kv(&k, &v)?;
+            self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
+            cache.keys = Some(keys.clone());
+            cache.values = Some(values.clone());
+            (keys, values)
+        } else if self.paged.is_none() {
+            let (keys, values) = cache.append_flat_kv(&k, &v)?;
+            if let (Some(k_buf), Some(v_buf)) = (&cache.keys, &cache.values) {
+                self.submit_state(&[k_buf, v_buf], "qwen4::decoder::kv")?;
+            }
+            (keys, values)
         } else {
-            let (keys, values) = if cache.draft_rows.is_some() {
-                cache.append_draft_kv(&k, &v)?
-            } else {
-                let keys = match &cache.keys {
-                    Some(old) => MxArray::concatenate(old, &k, 2)?,
-                    None => k,
-                };
-                let values = match &cache.values {
-                    Some(old) => MxArray::concatenate(old, &v, 2)?,
-                    None => v,
-                };
-                (keys, values)
+            let keys = match &cache.keys {
+                Some(old) => MxArray::concatenate(old, &k, 2)?,
+                None => k,
+            };
+            let values = match &cache.values {
+                Some(old) => MxArray::concatenate(old, &v, 2)?,
+                None => v,
             };
             self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
             cache.keys = Some(keys.clone());
@@ -2004,6 +2882,11 @@ impl Decoder {
         if let Some(out) = self.tentative_shared_experts(x, &selected, &scores, i)? {
             return Ok(out);
         }
+        if self.device_routes.is_none()
+            && let Some(out) = self.cuda_fused_moe(x, &selected, &scores, i)?
+        {
+            return Ok(out);
+        }
         let device = self.tentative_experts(x, &selected, &scores, i)?;
         let resident = if device.is_some() {
             device
@@ -2099,16 +2982,6 @@ impl Decoder {
         Ok((shared, gate))
     }
 
-    fn ple(
-        &mut self,
-        x: &MxArray,
-        token: u32,
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        self.ple_window(x, &[token], i, cache)
-    }
-
     /// `hyper_with_norm` over a `[1, R, 4H]` verify window. The admitted
     /// mixer banks stream once through the row-batched kernels; any other
     /// configuration runs the single-row mixer per row.
@@ -2125,6 +2998,14 @@ impl Decoder {
             return self.hyper_with_norm(x, hf, gg, inject, normed);
         }
         let c = self.config.clone();
+        if super::cuda_qwen4_fast_enabled()
+            && (2..=16).contains(&rows)
+            && c.hc_count == 4
+            && c.hidden_size == 2560
+            && x.dtype()? == DType::BFloat16
+        {
+            return self.hyper_with_norm(x, hf, gg, inject, normed);
+        }
         let down_key = self.key(
             &format!("{hf}.input_mix_weight_down.weight"),
             &format!("{gg}_down.weight"),
@@ -2207,6 +3088,27 @@ impl Decoder {
                 &format!("layers.{i}.mlp.gate.weight"),
                 &format!("blk.{i}.ffn_gate_inp.weight"),
             )?;
+            if super::cuda_qwen4_fast_enabled() && (2..=16).contains(&rows) {
+                let (selected, scores) = if let Some(routes) =
+                    crate::kernels::qwen4::router_topk_cuda(&logits, c.num_experts_per_tok)?
+                {
+                    routes
+                } else {
+                    let probs = Activations::softmax_precise(&logits, Some(-1))?;
+                    let ne = c.num_experts as i64;
+                    let top = c.num_experts_per_tok as i64;
+                    let selected =
+                        probs
+                            .argpartition(-(top as i32), Some(-1))?
+                            .slice_axis(2, ne - top, ne)?;
+                    let scores = probs.take_along_axis(&selected, -1)?;
+                    let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
+                    (selected, scores)
+                };
+                if let Some(out) = self.cuda_fused_moe(x, &selected, &scores, i)? {
+                    return Ok(out);
+                }
+            }
             if let Some((selected, scores)) =
                 math::rows::singleton_routes(&logits, c.num_experts_per_tok)?
             {
@@ -2282,39 +3184,281 @@ impl Decoder {
         Ok(Some(out))
     }
 
+    /// Batched CUDA deferred GDN step for `verify_layer`: runs `gdn_prepare` ONCE
+    /// across all `R` verify rows and `fused_step_deferred_with_gate` ONCE, folding
+    /// any pending previous cycle's `prev_keep` accepted rows into `cache.recurrent`
+    /// in-register and returning `(out [1, R, 6144], VerifyGdnLayerTape)` without
+    /// materializing intermediate speculative recurrent states.
+    fn cuda_verify_gdn_deferred(
+        &mut self,
+        projections: &GdnProjections,
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<Option<(MxArray, VerifyGdnLayerTape)>> {
+        let c = self.config.clone();
+        let (nh, kh, kd, vd) = (
+            c.linear_num_value_heads as i64,
+            c.linear_num_key_heads as i64,
+            c.linear_key_head_dim as i64,
+            c.linear_value_head_dim as i64,
+        );
+        if !super::cuda_qwen4_fast_enabled()
+            || self.paged.is_some()
+            || (kh, nh, kd, vd) != (16, 48, 128, 128)
+            || c.linear_conv_kernel_dim != 4
+            || !c.rms_norm_eps.is_finite()
+            || c.rms_norm_eps <= 0.0
+            || projections.qkv.dtype()? != DType::BFloat16
+            || projections.z.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let p = format!("layers.{i}.linear_attn");
+        let g = format!("blk.{i}");
+        let conv = self.dense(
+            &format!("{p}.conv1d.weight"),
+            &format!("{g}.ssm_conv1d.weight"),
+        )?;
+        if conv.dtype()? != DType::Float32 {
+            return Ok(None);
+        }
+        let (scale, dt) = self.gdn_scale_dt(i, &p, &g)?;
+        let norm_w = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
+        let pre_conv = cache.conv.clone();
+        let Some([q, k, v, decay, beta]) = math::gdn_prepare(
+            &projections.qkv,
+            &projections.a,
+            &projections.b,
+            &conv,
+            &mut cache.conv,
+            &scale,
+            &dt,
+        )?
+        else {
+            cache.conv = pre_conv;
+            return Ok(None);
+        };
+        let state_base = match &cache.recurrent {
+            Some(s) => s.clone(),
+            None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
+        };
+        let prev_pending = self.cuda_pending_gdn[i].take();
+        let has_prev_indices = prev_pending
+            .as_ref()
+            .is_some_and(|p| p.keep > 0 && p.prev_indices.is_some());
+        let step_result = if has_prev_indices {
+            let rows = projections.qkv.shape_at(1)? as i32;
+            let chain_parent: Vec<i32> = (0..rows).map(|r| r - 1).collect();
+            let parent_arr = MxArray::from_int32(&chain_parent, &[rows as i64])?;
+            let pending_ref = prev_pending.as_ref().filter(|p| p.keep > 0).map(|p| {
+                (
+                    &p.k,
+                    &p.v,
+                    &p.g,
+                    &p.beta,
+                    p.keep as i32,
+                    p.prev_indices.as_ref(),
+                )
+            });
+            crate::kernels::gdn::tree_step_deferred_with_gate(
+                &q,
+                &k,
+                &v,
+                &decay,
+                &beta,
+                &state_base,
+                pending_ref,
+                &parent_arr,
+                &projections.z,
+                &norm_w,
+                c.rms_norm_eps as f32,
+                self.gguf(),
+                c.output_gate_type == "sigmoid",
+            )?
+        } else {
+            let pending_ref = prev_pending
+                .as_ref()
+                .filter(|p| p.keep > 0)
+                .map(|p| (&p.k, &p.v, &p.g, &p.beta, p.keep as i32));
+            crate::kernels::gdn::fused_step_deferred_with_gate(
+                &q,
+                &k,
+                &v,
+                &decay,
+                &beta,
+                &state_base,
+                pending_ref,
+                &projections.z,
+                &norm_w,
+                c.rms_norm_eps as f32,
+                self.gguf(),
+                c.output_gate_type == "sigmoid",
+            )?
+        };
+        let Some((out, next_state_base)) = step_result else {
+            self.cuda_pending_gdn[i] = prev_pending;
+            cache.conv = pre_conv;
+            return Ok(None);
+        };
+        cache.recurrent = Some(next_state_base);
+        Ok(Some((
+            out,
+            VerifyGdnLayerTape {
+                qkv: projections.qkv.clone(),
+                pre_conv,
+                k,
+                v,
+                g: decay,
+                beta,
+            },
+        )))
+    }
+
+    /// Tree-verify CUDA deferred GDN step: runs `gdn::prepare_tree` with
+    /// `views.conv_taps_i32` and `gdn::tree_step_deferred_with_gate` with
+    /// `views.parent_i32`, folding any pending previous cycle's accepted rows
+    /// (contiguous or non-contiguous `prev_indices`) into `cache.recurrent`
+    /// in-register without materializing intermediate speculative states.
+    fn cuda_verify_gdn_tree(
+        &mut self,
+        projections: &GdnProjections,
+        i: usize,
+        cache: &mut LayerCache,
+        views: &crate::models::qwen3_5::verify_tree::TreeDeviceViews,
+    ) -> Result<(MxArray, VerifyGdnLayerTape)> {
+        let c = self.config.clone();
+        let (nh, kh, kd, vd) = (
+            c.linear_num_value_heads as i64,
+            c.linear_num_key_heads as i64,
+            c.linear_key_head_dim as i64,
+            c.linear_value_head_dim as i64,
+        );
+        if !super::cuda_qwen4_fast_enabled()
+            || self.paged.is_some()
+            || (kh, nh, kd, vd) != (16, 48, 128, 128)
+            || c.linear_conv_kernel_dim != 4
+            || !c.rms_norm_eps.is_finite()
+            || c.rms_norm_eps <= 0.0
+            || projections.qkv.dtype()? != DType::BFloat16
+            || projections.z.dtype()? != DType::BFloat16
+        {
+            return Err(Error::from_reason(
+                "Qwen4 tree GDN verify requires flat CUDA BF16 (16/48/128/128, k=4)",
+            ));
+        }
+        let p = format!("layers.{i}.linear_attn");
+        let g = format!("blk.{i}");
+        let conv = self.dense(
+            &format!("{p}.conv1d.weight"),
+            &format!("{g}.ssm_conv1d.weight"),
+        )?;
+        let (scale, dt) = self.gdn_scale_dt(i, &p, &g)?;
+        let norm_w = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
+        let pre_conv = cache.conv.clone();
+        let old_conv = match &pre_conv {
+            Some(s) => s.clone(),
+            None => MxArray::zeros(&[3, 10240], Some(DType::BFloat16))?,
+        };
+        let [q, k, v, decay, beta, next_conv] = crate::kernels::gdn::prepare_tree(
+            &projections.qkv,
+            &projections.a,
+            &projections.b,
+            &conv,
+            &old_conv,
+            &scale,
+            &dt,
+            &views.conv_taps_i32,
+            false,
+            false,
+        )?
+        .ok_or_else(|| Error::from_reason("Qwen4 CUDA gdn::prepare_tree failed"))?;
+        let state_base = match &cache.recurrent {
+            Some(s) => s.clone(),
+            None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
+        };
+        let prev_pending = self.cuda_pending_gdn[i].take();
+        let pending_ref = prev_pending.as_ref().filter(|p| p.keep > 0).map(|p| {
+            (
+                &p.k,
+                &p.v,
+                &p.g,
+                &p.beta,
+                p.keep as i32,
+                p.prev_indices.as_ref(),
+            )
+        });
+        let Some((out, next_state_base)) = crate::kernels::gdn::tree_step_deferred_with_gate(
+            &q,
+            &k,
+            &v,
+            &decay,
+            &beta,
+            &state_base,
+            pending_ref,
+            &views.parent_i32,
+            &projections.z,
+            &norm_w,
+            c.rms_norm_eps as f32,
+            self.gguf(),
+            c.output_gate_type == "sigmoid",
+        )?
+        else {
+            self.cuda_pending_gdn[i] = prev_pending;
+            return Err(Error::from_reason(
+                "Qwen4 CUDA gdn::tree_step_deferred_with_gate failed",
+            ));
+        };
+        cache.conv = Some(next_conv);
+        cache.recurrent = Some(next_state_base);
+        Ok((
+            out,
+            VerifyGdnLayerTape {
+                qkv: projections.qkv.clone(),
+                pre_conv,
+                k,
+                v,
+                g: decay,
+                beta,
+            },
+        ))
+    }
+
     /// One decoder layer over the `[1, R, 4H]` verify window. Projections,
     /// mixers, router, experts and output projections read their weights
     /// once for all rows through the row-exact kernels; PLE, GDN and
-    /// attention state advance row by row. `saved[j]` is this layer's cache
-    /// after row `j`: the frontier a commit of `j + 1` tokens restores.
+    /// attention state advance row by row (or batched via CUDA deferred GDN /
+    /// batched QSA). `saved[j]` is this layer's cache after row `j`: the
+    /// frontier a commit of `j + 1` tokens restores.
     fn verify_layer(
         &mut self,
         x: &MxArray,
         tokens: &[u32],
         i: usize,
         cache: &mut LayerCache,
-    ) -> Result<(MxArray, Vec<LayerCache>)> {
+        attn_normed: Option<&MxArray>,
+    ) -> Result<(MxArray, Option<MxArray>, Vec<LayerCache>)> {
         let base = self.history.len();
         let rows = tokens.len();
         let mut saved = vec![LayerCache::default(); rows];
         let row = |a: &MxArray, j: usize| a.slice_axis(1, j as i64, j as i64 + 1);
-        let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
+        let has_ple = self.config.ple_layer_ids.contains(&(i + 1));
+        let x = if has_ple {
             let dtype = x.dtype()?;
-            let mut embeddings = Vec::with_capacity(rows);
-            for &token in tokens {
-                self.check_cancelled()?;
-                embeddings.push(self.ple_embeddings(&[token], i, dtype)?);
-                self.history.push(token);
-            }
-            self.history.truncate(base);
-            let embeddings = MxArray::concatenate_many(embeddings.iter().collect(), Some(1))?;
+            let embeddings = self.ple_embeddings(tokens, i, dtype)?;
             let (key, value) = self.ple_projections(&embeddings, i)?;
             let mut parts = Vec::with_capacity(rows);
             for (j, saved) in saved.iter_mut().enumerate() {
                 self.check_cancelled()?;
                 let input = row(x, j)?;
-                let ple = self.ple_mix(&input, &row(&key, j)?, &row(&value, j)?, i, cache)?;
-                parts.push(input.add(&ple)?);
+                let out = self.ple_mix_with_residual(
+                    &input,
+                    &row(&key, j)?,
+                    &row(&value, j)?,
+                    i,
+                    cache,
+                    true,
+                )?;
+                parts.push(out);
                 saved.ple_conv = cache.ple_conv.clone();
             }
             MxArray::concatenate_many(parts.iter().collect(), Some(1))?
@@ -2326,21 +3470,30 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            None,
+            if has_ple { None } else { attn_normed },
         )?;
         let branch = if self.config.linear(i) {
             let p = format!("layers.{i}.linear_attn");
             let g = format!("blk.{i}");
             let projections = self.gdn_projections(&mixed, &p, &g)?;
-            let dtype = mixed.dtype()?;
-            let mut outputs = Vec::with_capacity(rows);
-            for (j, saved) in saved.iter_mut().enumerate() {
-                self.check_cancelled()?;
-                outputs.push(self.gdn_mix(dtype, &projections.row(j)?, i, cache)?);
-                saved.conv = cache.conv.clone();
-                saved.recurrent = cache.recurrent.clone();
-            }
-            let out = MxArray::concatenate_many(outputs.iter().collect(), Some(1))?;
+            let out = if self.cuda_verify_gdn_tape.is_some()
+                && let Some((out, tape)) = self.cuda_verify_gdn_deferred(&projections, i, cache)?
+            {
+                if let Some(tapes) = &mut self.cuda_verify_gdn_tape {
+                    tapes[i] = Some(tape);
+                }
+                out
+            } else {
+                let dtype = mixed.dtype()?;
+                let mut outputs = Vec::with_capacity(rows);
+                for (j, saved) in saved.iter_mut().enumerate() {
+                    self.check_cancelled()?;
+                    outputs.push(self.gdn_mix(dtype, &projections.row(j)?, i, cache)?);
+                    saved.conv = cache.conv.clone();
+                    saved.recurrent = cache.recurrent.clone();
+                }
+                MxArray::concatenate_many(outputs.iter().collect(), Some(1))?
+            };
             self.linear_rows(
                 &out,
                 &format!("{p}.out_proj.weight"),
@@ -2348,28 +3501,36 @@ impl Decoder {
             )?
         } else {
             let projections = self.attention_projections(&mixed, i)?;
-            let mut outputs = Vec::with_capacity(rows);
-            for (j, (&token, saved)) in tokens.iter().zip(saved.iter_mut()).enumerate() {
-                self.check_cancelled()?;
-                outputs.push(self.attention_projected(
-                    &row(&mixed, j)?,
-                    i,
-                    cache,
-                    &projections.row(j)?,
-                    false,
-                    true,
-                )?);
-                self.history.push(token);
-                if self.paged.is_none() {
-                    saved.keys = cache.keys.clone();
-                    saved.values = cache.values.clone();
+            let out = if let Some(out) =
+                self.cuda_verify_attention_batch(&mixed, i, cache, &projections, &mut saved)?
+            {
+                out
+            } else {
+                let mut outputs = Vec::with_capacity(rows);
+                for (j, (&token, saved)) in tokens.iter().zip(saved.iter_mut()).enumerate() {
+                    self.check_cancelled()?;
+                    outputs.push(self.attention_projected(
+                        &row(&mixed, j)?,
+                        i,
+                        cache,
+                        &projections.row(j)?,
+                        false,
+                        true,
+                    )?);
+                    self.history.push(token);
+                    if self.paged.is_none() {
+                        saved.keys = cache.keys.clone();
+                        saved.values = cache.values.clone();
+                        saved.flat_kv_rows = cache.flat_kv_rows;
+                    }
+                    saved.index_tail = cache.index_tail.clone();
+                    saved.index_keys = cache.index_keys.clone();
+                    saved.flat_index_blocks = cache.flat_index_blocks;
+                    saved.index_blocks = cache.index_blocks;
                 }
-                saved.index_tail = cache.index_tail.clone();
-                saved.index_keys = cache.index_keys.clone();
-                saved.index_blocks = cache.index_blocks;
-            }
-            self.history.truncate(base);
-            let out = MxArray::concatenate_many(outputs.iter().collect(), Some(1))?;
+                self.history.truncate(base);
+                MxArray::concatenate_many(outputs.iter().collect(), Some(1))?
+            };
             self.linear_rows(
                 &out,
                 &format!("layers.{i}.self_attn.o_proj.weight"),
@@ -2389,7 +3550,35 @@ impl Decoder {
         let branch = self.moe_rows(&mixed, i)?;
         let gate =
             gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
-        Ok((Self::inject(&x, &branch, &gate)?, saved))
+        let next_layer = i + 1;
+        let cuda_fast = super::cuda_qwen4_fast_enabled();
+        let (stream, next_normed) = if cuda_fast && next_layer < self.config.num_hidden_layers {
+            if !self.config.ple_layer_ids.contains(&(next_layer + 1)) {
+                self.inject_for_hyper(
+                    &x,
+                    &branch,
+                    &gate,
+                    &format!("layers.{next_layer}.attn_hyper_connection.hc_norm.weight"),
+                    &format!("blk.{next_layer}.hc_attn_norm.weight"),
+                    true,
+                )?
+            } else {
+                (Self::inject(&x, &branch, &gate)?, None)
+            }
+        } else if cuda_fast && next_layer == self.config.num_hidden_layers && self.scope.is_empty()
+        {
+            self.inject_for_hyper(
+                &x,
+                &branch,
+                &gate,
+                "hyper_connection_mixer.hc_norm.weight",
+                "output_hc_norm.weight",
+                true,
+            )?
+        } else {
+            (Self::inject(&x, &branch, &gate)?, None)
+        };
+        Ok((stream, next_normed, saved))
     }
 
     /// `[multipliers, head sizes, head offsets]` of PLE layer `i`.
@@ -2443,6 +3632,69 @@ impl Decoder {
             previous.push(token);
         }
         Ok(ids)
+    }
+
+    /// Tree-aware n-gram hash ids for `tokens` with tree parents `parent`
+    /// (`parent[0] = -1`, `0 <= parent[j] < j`) following committed `history`.
+    /// Each node walks `ngram_size - 1` ancestors back through `parent` (and
+    /// into `history` past root) so branching paths compute exact AR hashes.
+    fn ple_hash_ids_tree(
+        &self,
+        i: usize,
+        history: &[u32],
+        tokens: &[u32],
+        parent: &[i32],
+    ) -> Result<Vec<u64>> {
+        let c = &self.config;
+        let [multipliers, sizes, offsets] = self.ple_constants(i)?;
+        let need = c.ngram_size.saturating_sub(1);
+        let mut ids = Vec::new();
+        let mut previous = Vec::with_capacity(need);
+        for (j, &token) in tokens.iter().enumerate() {
+            self.check_cancelled()?;
+            previous.clear();
+            let mut cur = parent[j];
+            for _ in 0..need {
+                if cur >= 0 {
+                    previous.push(tokens[cur as usize]);
+                    cur = parent[cur as usize];
+                } else {
+                    let back = (-cur) as usize;
+                    if back <= history.len() {
+                        previous.push(history[history.len() - back]);
+                    } else {
+                        break;
+                    }
+                    cur -= 1;
+                }
+            }
+            previous.reverse();
+            ids.extend(math::hash_ids(
+                token,
+                &previous,
+                c.eos_token_id,
+                c.ngram_size,
+                c.heads_per_ngram,
+                &multipliers,
+                &sizes,
+                &offsets,
+            )?);
+        }
+        Ok(ids)
+    }
+
+    /// Prefetch tree-aware PLE rows across every PLE layer before Layer 0 runs.
+    fn prefetch_tree_ple_rows(&mut self, tokens: &[u32], parent: &[i32]) -> Result<()> {
+        let history = self.history.clone();
+        let mut keys = Vec::new();
+        for &layer in &self.config.ple_layer_ids {
+            let Some(i) = layer.checked_sub(1) else {
+                continue;
+            };
+            let ids = self.ple_hash_ids_tree(i, &history, tokens, parent)?;
+            keys.extend(self.ple_row_keys(i, &ids)?);
+        }
+        self.weights.prefetch_rows(&keys)
     }
 
     /// The table row behind each hash id: the one GGUF table, or the
@@ -2507,27 +3759,35 @@ impl Decoder {
     /// embeddings (media) has no embedding rows to read.
     fn prefetch_window_rows(&mut self, tokens: &[u32], next: &[u32], embed: bool) -> Result<()> {
         let embedding = self.key("embed_tokens.weight", "token_embd.weight");
-        let mut keys = Vec::new();
         if embed {
-            keys.extend(tokens.iter().map(|&t| (embedding.clone(), t as usize)));
+            let embed_keys: Vec<_> = tokens
+                .iter()
+                .map(|&t| (embedding.clone(), t as usize))
+                .collect();
+            self.weights.prefetch_rows(&embed_keys)?;
         }
         let history = self.history.clone();
-        keys.extend(self.ple_row_keys_after(&history, tokens)?);
-        self.weights.prefetch_rows(&keys)?;
+        let ple_keys = self.ple_row_keys_after(&history, tokens)?;
+        self.weights.prefetch_rows(&ple_keys)?;
         if next.is_empty() {
             return Ok(());
         }
-        let mut keys = Vec::new();
         if embed {
-            keys.extend(next.iter().map(|&t| (embedding.clone(), t as usize)));
+            let next_embed: Vec<_> = next
+                .iter()
+                .map(|&t| (embedding.clone(), t as usize))
+                .collect();
+            self.weights.prefetch_rows(&next_embed)?;
         }
         let mut through = history;
         through.extend_from_slice(tokens);
-        keys.extend(self.ple_row_keys_after(&through, next)?);
-        self.weights.prefetch_rows(&keys)
+        let next_ple = self.ple_row_keys_after(&through, next)?;
+        self.weights.prefetch_rows(&next_ple)
     }
 
-    fn ple_window(
+    /// Compute PLE delta and add to `x` (`x + ple`), fusing the residual add into
+    /// `ple_gate_conv_cuda` on CUDA when eligible.
+    pub(super) fn ple_apply(
         &mut self,
         x: &MxArray,
         tokens: &[u32],
@@ -2536,17 +3796,38 @@ impl Decoder {
     ) -> Result<MxArray> {
         let embeddings = self.ple_embeddings(tokens, i, x.dtype()?)?;
         let (key, value) = self.ple_projections(&embeddings, i)?;
-        self.ple_mix(x, &key, &value, i, cache)
+        self.ple_mix_with_residual(x, &key, &value, i, cache, true)
     }
 
     /// The `[1, T, ple_embed_dim]` embeddings of `tokens` following the history.
     fn ple_embeddings(&mut self, tokens: &[u32], i: usize, dtype: DType) -> Result<MxArray> {
-        let c = self.config.clone();
-        let t = tokens.len() as i64;
         let ids = self.ple_hash_ids(i, tokens)?;
+        self.ple_embeddings_for_ids(&ids, tokens.len() as i64, i, dtype)
+    }
+
+    /// Tree-aware `[1, T, ple_embed_dim]` PLE embeddings for `tokens`/`parent`.
+    fn ple_embeddings_tree(
+        &mut self,
+        tokens: &[u32],
+        parent: &[i32],
+        i: usize,
+        dtype: DType,
+    ) -> Result<MxArray> {
+        let ids = self.ple_hash_ids_tree(i, &self.history, tokens, parent)?;
+        self.ple_embeddings_for_ids(&ids, tokens.len() as i64, i, dtype)
+    }
+
+    fn ple_embeddings_for_ids(
+        &mut self,
+        ids: &[u64],
+        t: i64,
+        i: usize,
+        dtype: DType,
+    ) -> Result<MxArray> {
+        let c = self.config.clone();
         let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
             Default::default();
-        for (position, (name, row)) in self.ple_row_keys(i, &ids)?.into_iter().enumerate() {
+        for (position, (name, row)) in self.ple_row_keys(i, ids)?.into_iter().enumerate() {
             let (rows, positions) = groups.entry(name).or_default();
             rows.push(row);
             positions.push(position);
@@ -2580,20 +3861,23 @@ impl Decoder {
     fn ple_projections(&mut self, emb: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
         let p = format!("layers.{i}.ple");
         let g = format!("blk.{i}");
-        let key = self.weights.linear_ple_window(
-            &self.key(
-                &format!("{p}.key_proj.weight"),
-                &format!("{g}.ple_key.weight"),
-            ),
-            emb,
-        )?;
-        let value = self.weights.linear_ple_window(
-            &self.key(
-                &format!("{p}.value_proj.weight"),
-                &format!("{g}.ple_value.weight"),
-            ),
-            emb,
-        )?;
+        let key_name = self.key(
+            &format!("{p}.key_proj.weight"),
+            &format!("{g}.ple_key.weight"),
+        );
+        let value_name = self.key(
+            &format!("{p}.value_proj.weight"),
+            &format!("{g}.ple_value.weight"),
+        );
+        if super::cuda_qwen4_fast_enabled() && self.verification.is_none() {
+            // On CUDA prefill (`M >= 17`), route directly through the batched cuBLAS
+            // dense prefill path instead of slicing into 64× M=16 `affine_q8_few` calls.
+            let key = self.weights.linear(&key_name, emb)?;
+            let value = self.weights.linear(&value_name, emb)?;
+            return Ok((key, value));
+        }
+        let key = self.weights.linear_ple_window(&key_name, emb)?;
+        let value = self.weights.linear_ple_window(&value_name, emb)?;
         Ok((key, value))
     }
 
@@ -2607,10 +3891,65 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
+        self.ple_mix_with_residual(x, key, value, i, cache, false)
+    }
+
+    fn ple_mix_with_residual(
+        &mut self,
+        x: &MxArray,
+        key: &MxArray,
+        value: &MxArray,
+        i: usize,
+        cache: &mut LayerCache,
+        fuse_residual: bool,
+    ) -> Result<MxArray> {
         let c = self.config.clone();
         let t = x.shape_at(1)?;
         let p = format!("layers.{i}.ple");
         let g = format!("blk.{i}");
+        if super::cuda_qwen4_fast_enabled()
+            && c.hidden_size == 2560
+            && c.hc_count == 4
+            && c.ple_conv_kernel_size == 4
+            && c.ngram_size == 3
+            && x.dtype()? == DType::BFloat16
+            && key.dtype()? == DType::BFloat16
+            && value.dtype()? == DType::BFloat16
+        {
+            let norm_key_w = self.dense(
+                &format!("{p}.norm_key.weight"),
+                &format!("{g}.ple_norm_key.weight"),
+            )?;
+            let norm_query_w = self.dense(
+                &format!("{p}.norm_query.weight"),
+                &format!("{g}.ple_norm_query.weight"),
+            )?;
+            let norm_conv_w = self.dense(
+                &format!("{p}.norm_conv.weight"),
+                &format!("{g}.ple_norm_conv.weight"),
+            )?;
+            let conv_w = self.dense(
+                &format!("{p}.conv1d.weight"),
+                &format!("{g}.ple_conv1d.weight"),
+            )?;
+            let weight_offset = if self.gguf() { 0.0 } else { 1.0 };
+            if let Some((out, next_hist)) = crate::kernels::qwen4::ple_gate_conv_cuda(
+                x,
+                key,
+                value,
+                &norm_key_w,
+                &norm_query_w,
+                &norm_conv_w,
+                &conv_w,
+                cache.ple_conv.as_ref(),
+                c.rms_norm_eps as f32,
+                weight_offset,
+                fuse_residual,
+            )? {
+                cache.ple_conv = Some(next_hist);
+                return Ok(out);
+            }
+        }
         let key = self
             .norm(
                 key,
@@ -2657,9 +3996,75 @@ impl Decoder {
             c.ple_conv_kernel_size,
             c.ngram_size,
         )?;
-        value.add(&convolved)
+        let ple = value.add(&convolved)?;
+        if fuse_residual { x.add(&ple) } else { Ok(ple) }
+    }
+
+    /// Tree-aware Layer-1 PLE gate + dilated depthwise conv (`k=4, d=3`) with
+    /// fused residual add (`x + ple`). Returns `(out_x [1, T, 10240], conv_in [T, 10240])`
+    /// without mutating `cache.ple_conv` so `commit_tree_deferred` can rebuild
+    /// exact `[9, 10240]` history along any accepted branch.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_mix_tree_cuda(
+        &mut self,
+        x: &MxArray,
+        key: &MxArray,
+        value: &MxArray,
+        i: usize,
+        pre_ple_conv: Option<&MxArray>,
+        conv_taps: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let c = self.config.clone();
+        if !super::cuda_qwen4_fast_enabled()
+            || c.hidden_size != 2560
+            || c.hc_count != 4
+            || c.ple_conv_kernel_size != 4
+            || c.ngram_size != 3
+            || x.dtype()? != DType::BFloat16
+            || key.dtype()? != DType::BFloat16
+            || value.dtype()? != DType::BFloat16
+        {
+            return Err(Error::from_reason(
+                "Qwen4 tree PLE requires flat CUDA BF16 (H=2560, HC=4, k=4, ngram=3)",
+            ));
+        }
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
+        let norm_key_w = self.dense(
+            &format!("{p}.norm_key.weight"),
+            &format!("{g}.ple_norm_key.weight"),
+        )?;
+        let norm_query_w = self.dense(
+            &format!("{p}.norm_query.weight"),
+            &format!("{g}.ple_norm_query.weight"),
+        )?;
+        let norm_conv_w = self.dense(
+            &format!("{p}.norm_conv.weight"),
+            &format!("{g}.ple_norm_conv.weight"),
+        )?;
+        let conv_w = self.dense(
+            &format!("{p}.conv1d.weight"),
+            &format!("{g}.ple_conv1d.weight"),
+        )?;
+        let weight_offset = if self.gguf() { 0.0 } else { 1.0 };
+        crate::kernels::qwen4::ple_gate_conv_tree_cuda(
+            x,
+            key,
+            value,
+            &norm_key_w,
+            &norm_query_w,
+            &norm_conv_w,
+            &conv_w,
+            pre_ple_conv,
+            Some(conv_taps),
+            c.rms_norm_eps as f32,
+            weight_offset,
+            true,
+        )?
+        .ok_or_else(|| Error::from_reason("Qwen4 CUDA ple_gate_conv_tree_cuda failed"))
     }
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
+        self.settle_cuda_pending_gdn()?;
         self.rotary_tables.get_mut().clear();
         let started = std::time::Instant::now();
         let pass = std::mem::replace(&mut self.decode_pass, true);
@@ -2676,14 +4081,17 @@ impl Decoder {
         result
     }
 
-    fn layer(
+    fn layer_with_norm(
         &mut self,
         x: MxArray,
         token: u32,
         i: usize,
         cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        let (x, normed) = self.attention_block_for_mlp(x, token, i, cache, true)?;
+        attn_normed: Option<&MxArray>,
+        fuse_next_norm: bool,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        let (x, normed) =
+            self.attention_block_for_mlp_with_norm(x, token, i, cache, true, attn_normed)?;
         let (mixed, gate) = self.hyper_with_norm(
             &x,
             &format!("layers.{i}.mlp_hyper_connection"),
@@ -2701,7 +4109,31 @@ impl Decoder {
         };
         let gate =
             gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
-        Self::inject(&x, &branch, &gate)
+        if fuse_next_norm {
+            let next_layer = i + 1;
+            if next_layer < self.config.num_hidden_layers {
+                if !self.config.ple_layer_ids.contains(&(next_layer + 1)) {
+                    return self.inject_for_hyper(
+                        &x,
+                        &branch,
+                        &gate,
+                        &format!("layers.{next_layer}.attn_hyper_connection.hc_norm.weight"),
+                        &format!("blk.{next_layer}.hc_attn_norm.weight"),
+                        true,
+                    );
+                }
+            } else if self.scope.is_empty() {
+                return self.inject_for_hyper(
+                    &x,
+                    &branch,
+                    &gate,
+                    "hyper_connection_mixer.hc_norm.weight",
+                    "output_hc_norm.weight",
+                    true,
+                );
+            }
+        }
+        Ok((Self::inject(&x, &branch, &gate)?, None))
     }
 
     fn attention_block(
@@ -2716,21 +4148,34 @@ impl Decoder {
 
     fn attention_block_for_mlp(
         &mut self,
-        mut x: MxArray,
+        x: MxArray,
         token: u32,
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
     ) -> Result<(MxArray, Option<MxArray>)> {
-        if self.config.ple_layer_ids.contains(&(i + 1)) {
-            x = x.add(&self.ple(&x, token, i, cache)?)?;
+        self.attention_block_for_mlp_with_norm(x, token, i, cache, normalize, None)
+    }
+
+    fn attention_block_for_mlp_with_norm(
+        &mut self,
+        mut x: MxArray,
+        token: u32,
+        i: usize,
+        cache: &mut LayerCache,
+        normalize: bool,
+        attn_normed: Option<&MxArray>,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        let has_ple = self.config.ple_layer_ids.contains(&(i + 1));
+        if has_ple {
+            x = self.ple_apply(&x, &[token], i, cache)?;
         }
         let (mixed, gate) = self.hyper_with_norm(
             &x,
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            None,
+            if has_ple { None } else { attn_normed },
         )?;
         let branch = if self.config.linear(i) {
             self.gdn(&mixed, i, cache)?
@@ -2793,7 +4238,10 @@ impl Decoder {
         if tokens.is_empty() || tokens.len() > 4 {
             return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
         }
+        self.settle_cuda_pending_gdn()?;
         self.rotary_tables.get_mut().clear();
+        self.cuda_verify_final_window = None;
+        self.cuda_verify_final_normed = None;
         let started = std::time::Instant::now();
         self.verification = Some(Vec::new());
         if self.verify_routes_on_device() {
@@ -2807,10 +4255,20 @@ impl Decoder {
             self.prefill_chunk_inner(tokens, &[], None, false)?;
             // The pass stays open through the head: these rows are row-exact
             // too, and `linear_rows` is batched outside a verification pass.
-            let window =
-                MxArray::concatenate_many(self.last_chunk_hidden.iter().collect(), Some(1))?;
-            let (mixed, _) =
-                self.hyper_rows(&window, "hyper_connection_mixer", "output_hc", false, None)?;
+            let window = match self.cuda_verify_final_window.take() {
+                Some(w) => w,
+                None => {
+                    MxArray::concatenate_many(self.last_chunk_hidden.iter().collect(), Some(1))?
+                }
+            };
+            let normed = self.cuda_verify_final_normed.take();
+            let (mixed, _) = self.hyper_rows(
+                &window,
+                "hyper_connection_mixer",
+                "output_hc",
+                false,
+                normed.as_ref(),
+            )?;
             let logits = self
                 .linear_rows(&mixed, "lm_head.weight", "output.weight")?
                 .reshape(&[tokens.len() as i64, -1])?;
@@ -2830,9 +4288,18 @@ impl Decoder {
             let completed: Vec<_> = std::iter::once(&logits)
                 .chain(states.iter().flat_map(DecoderState::arrays))
                 .chain(self.caches.iter().flat_map(LayerCache::arrays))
+                .chain(
+                    self.hidden_taps
+                        .iter()
+                        .flat_map(|taps| taps.last_pass_arrays().iter()),
+                )
                 .chain(tape.iter())
                 .collect();
-            MxArray::async_eval_arrays(&completed);
+            if super::cuda_qwen4_fast_enabled() {
+                Self::cuda_async_eval(&completed);
+            } else {
+                MxArray::async_eval_arrays(&completed);
+            }
             if let Some(adapter) = &mut self.paged {
                 adapter
                     .eval_pending_pool_writes()
@@ -2865,6 +4332,601 @@ impl Decoder {
                 Err(error)
             }
         }
+    }
+
+    /// Flat CUDA deferred-GDN verification pass: folds any pending previous
+    /// cycle's accepted GDN rows in-register via `fused_step_deferred_with_gate`,
+    /// avoids building `R` full `DecoderState`s, submits asynchronously, and
+    /// returns lazy `[R, vocab]` logits + a lightweight [`DeferredVerifyTicket`]
+    /// so `accept` evaluates logits + argmax in a single GPU sync.
+    pub(in super::super) fn verify_chunk_deferred(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(MxArray, DeferredVerifyTicket)> {
+        if tokens.is_empty() || tokens.len() > 4 {
+            return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
+        }
+        if self.paged.is_some() {
+            return Err(Error::from_reason(
+                "Qwen4 deferred CUDA verification requires flat KV",
+            ));
+        }
+        self.rotary_tables.get_mut().clear();
+        self.cuda_verify_final_window = None;
+        self.cuda_verify_final_normed = None;
+        let base_history_len = self.history.len();
+        let layers = self.config.num_hidden_layers;
+        let started = std::time::Instant::now();
+        self.verification = Some(Vec::new());
+        self.cuda_verify_gdn_tape = Some(vec![None; layers]);
+        self.cuda_verify_row_caches = Some(vec![vec![LayerCache::default(); layers]; tokens.len()]);
+        let pass = std::mem::replace(&mut self.decode_pass, true);
+        let result = (|| {
+            self.prefill_chunk_inner(tokens, &[], None, false)?;
+            let window = self.cuda_verify_final_window.take().ok_or_else(|| {
+                Error::from_reason("Qwen4 deferred verification lost its final window")
+            })?;
+            let normed = self.cuda_verify_final_normed.take();
+            let (mixed, _) = self.hyper_rows(
+                &window,
+                "hyper_connection_mixer",
+                "output_hc",
+                false,
+                normed.as_ref(),
+            )?;
+            let logits = self
+                .linear_rows(&mixed, "lm_head.weight", "output.weight")?
+                .reshape(&[tokens.len() as i64, -1])?;
+            self.verification = None;
+            let gdn_tapes = self.cuda_verify_gdn_tape.take().ok_or_else(|| {
+                Error::from_reason("Qwen4 deferred verification lost its GDN tapes")
+            })?;
+            let row_caches = self.cuda_verify_row_caches.take().ok_or_else(|| {
+                Error::from_reason("Qwen4 deferred verification lost its row caches")
+            })?;
+            // Submit all caches, GDN tapes, hidden taps, and logits in one
+            // non-blocking CUDA async batch (logits LAST so `accept`'s argmax
+            // eval drains the entire verify wave in a single GPU sync).
+            let mut completed: Vec<&MxArray> = Vec::new();
+            completed.extend(self.caches.iter().flat_map(LayerCache::arrays));
+            for tape in gdn_tapes.iter().flatten() {
+                completed.push(&tape.qkv);
+                completed.push(&tape.k);
+                completed.push(&tape.v);
+                completed.push(&tape.g);
+                completed.push(&tape.beta);
+            }
+            if let Some(taps) = &self.hidden_taps {
+                completed.extend(taps.last_pass_arrays().iter());
+            }
+            completed.push(&logits);
+            Self::cuda_async_eval(&completed);
+            Ok((
+                logits,
+                DeferredVerifyTicket {
+                    base_history_len,
+                    rows: tokens.len(),
+                    gdn_tapes,
+                    row_caches,
+                },
+            ))
+        })();
+        self.decode_pass = pass;
+        self.rotary_tables.get_mut().clear();
+        match result {
+            Ok(verified) => {
+                self.observe_pass(tokens.len(), started.elapsed());
+                Ok(verified)
+            }
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
+    }
+
+    /// Commit `keep` of `total_written` rows from a [`DeferredVerifyTicket`]:
+    /// rolls back `history`, non-GDN caches, and 2D `[3, 10240]` GDN conv
+    /// state (when `keep < total_written`), and arms `cuda_pending_gdn[i]` so
+    /// the next cycle folds the `keep` accepted GDN rows in-register.
+    pub(in super::super) fn commit_deferred_verify(
+        &mut self,
+        mut ticket: DeferredVerifyTicket,
+        keep: usize,
+        total_written: usize,
+    ) -> Result<()> {
+        if keep == 0 || keep > total_written || total_written != ticket.rows {
+            return Err(Error::from_reason(format!(
+                "Qwen4 deferred verify commit keeps {keep} of {total_written} rows (ticket has {})",
+                ticket.rows
+            )));
+        }
+        self.history.truncate(ticket.base_history_len + keep);
+        let kept_caches = ticket
+            .row_caches
+            .get(keep - 1)
+            .ok_or_else(|| Error::from_reason("Qwen4 deferred verify ticket missing kept row"))?;
+        let layers = self.config.num_hidden_layers;
+        let conv_hist = (self.config.linear_conv_kernel_dim.saturating_sub(1)) as i64;
+        for i in 0..layers {
+            let saved = &kept_caches[i];
+            let cache = &mut self.caches[i];
+            if self.config.ple_layer_ids.contains(&(i + 1)) {
+                cache.ple_conv = saved.ple_conv.clone();
+            }
+            if self.config.linear(i) {
+                if let Some(tape) = ticket.gdn_tapes[i].take() {
+                    if keep < total_written {
+                        let qkv_2d = tape.qkv.squeeze(Some(&[0]))?;
+                        let keep_i64 = keep as i64;
+                        let new_conv = if keep_i64 >= conv_hist {
+                            qkv_2d.slice_axis(0, keep_i64 - conv_hist, keep_i64)?
+                        } else {
+                            let old_conv = match tape.pre_conv {
+                                Some(prev) => prev,
+                                None => MxArray::zeros(
+                                    &[conv_hist, qkv_2d.shape_at(1)?],
+                                    Some(qkv_2d.dtype()?),
+                                )?,
+                            };
+                            let kept_old = old_conv.slice_axis(0, keep_i64, conv_hist)?;
+                            let kept_new = qkv_2d.slice_axis(0, 0, keep_i64)?;
+                            MxArray::concatenate(&kept_old, &kept_new, 0)?
+                        };
+                        cache.conv = Some(new_conv);
+                    }
+                    self.cuda_pending_gdn[i] = Some(CudaPendingGdn {
+                        k: tape.k,
+                        v: tape.v,
+                        g: tape.g,
+                        beta: tape.beta,
+                        keep,
+                        prev_indices: None,
+                    });
+                } else {
+                    cache.conv = saved.conv.clone();
+                    cache.recurrent = saved.recurrent.clone();
+                    self.cuda_pending_gdn[i] = None;
+                }
+            } else {
+                cache.keys = saved.keys.clone();
+                cache.values = saved.values.clone();
+                cache.flat_kv_rows = saved.flat_kv_rows;
+                cache.index_tail = saved.index_tail.clone();
+                cache.index_keys = saved.index_keys.clone();
+                cache.flat_index_blocks = saved.flat_index_blocks;
+                cache.index_blocks = saved.index_blocks;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flat CUDA deferred-GDN tree verification pass (`T in 1..=16`):
+    /// - Layer-1 PLE uses tree-aware n-gram hashing + dilated conv (`conv_taps`)
+    /// - 36L GDN uses `gdn::prepare_tree` + `gdn::tree_step_deferred_with_gate`
+    /// - 12L QSA FullAttn uses `qk_norm_rope_kv_store_tree` + `sdpa_tree_few` /
+    ///   `qsa_sparse_sdpa_cuda(mask_mode = 1)`
+    /// - 48L MoE + 97× mHC run natively for `M in 1..=16`
+    ///
+    /// Returns lazy `[T, vocab]` logits + [`TreeVerifyTicket`] submitted
+    /// asynchronously in one CUDA wave so `argmax` drains in a single GPU sync.
+    pub(in super::super) fn verify_tree_deferred(
+        &mut self,
+        tree: &crate::models::qwen3_5::verify_tree::VerifyTree,
+        views: &crate::models::qwen3_5::verify_tree::TreeDeviceViews,
+    ) -> Result<(MxArray, TreeVerifyTicket)> {
+        let t = tree.len();
+        if !(1..=crate::models::qwen3_5::verify_tree::MAX_TREE_NODES).contains(&t) {
+            return Err(Error::from_reason(format!(
+                "Qwen4 tree verification width {t} outside 1..={}",
+                crate::models::qwen3_5::verify_tree::MAX_TREE_NODES
+            )));
+        }
+        if views.tree_len != t {
+            return Err(Error::from_reason(format!(
+                "Qwen4 tree views len {} != tree len {t}",
+                views.tree_len
+            )));
+        }
+        if self.paged.is_some() || !super::cuda_qwen4_fast_enabled() {
+            return Err(Error::from_reason(
+                "Qwen4 deferred CUDA tree verification requires flat CUDA fast mode",
+            ));
+        }
+        self.rotary_tables.get_mut().clear();
+        let base_history_len = self.history.len();
+        let layers = self.config.num_hidden_layers;
+        let started = std::time::Instant::now();
+        self.verification = Some(Vec::new());
+        let pass = std::mem::replace(&mut self.decode_pass, true);
+        let result = (|| {
+            // Prefetch token embeddings and tree-aware PLE rows across 32 reader
+            // threads BEFORE Layer 0 runs so SSD I/O overlaps with GPU compute.
+            let emb_key = self.key("embed_tokens.weight", "token_embd.weight");
+            let emb_prefetch: Vec<(String, usize)> = tree
+                .tokens
+                .iter()
+                .map(|&tok| (emb_key.clone(), tok as usize))
+                .collect();
+            self.weights.prefetch_rows(&emb_prefetch)?;
+            self.prefetch_tree_ple_rows(&tree.tokens, &tree.parent)?;
+            let ple_taps_i32 = if self.config.ple_layer_ids.is_empty() {
+                None
+            } else {
+                Some(tree.ple_conv_taps_i32()?)
+            };
+
+            // Layer-0 token embeddings -> 4 hyper-connection streams [1, T, 4H] BF16.
+            let row_ids: Vec<usize> = tree.tokens.iter().map(|&tok| tok as usize).collect();
+            let emb = self.weights.lookup_rows(&emb_key, &row_ids)?.reshape(&[
+                1,
+                t as i64,
+                self.config.hidden_size as i64,
+            ])?;
+            let emb = if emb.dtype()? == DType::BFloat16 {
+                emb
+            } else {
+                emb.astype(DType::BFloat16)?
+            };
+            let mut x = MxArray::tile(&emb, &[1, 1, self.config.hc_count as i32])?;
+            let dtype = x.dtype()?;
+
+            let mut gdn_tapes: Vec<Option<VerifyGdnLayerTape>> = vec![None; layers];
+            let mut ple_tapes: Vec<Option<VerifyPleLayerTape>> = vec![None; layers];
+            let mut attn_tapes: Vec<Option<VerifyAttnLayerTape>> = vec![None; layers];
+            let mut attn_normed: Option<MxArray> = None;
+
+            self.begin_taps();
+            for i in 0..layers {
+                self.check_cancelled()?;
+                let has_ple = self.config.ple_layer_ids.contains(&(i + 1));
+                if has_ple {
+                    let ple_emb = self.ple_embeddings_tree(&tree.tokens, &tree.parent, i, dtype)?;
+                    let (pk, pv) = self.ple_projections(&ple_emb, i)?;
+                    let pre_ple_conv = self.caches[i].ple_conv.clone();
+                    let taps = ple_taps_i32.as_ref().ok_or_else(|| {
+                        Error::from_reason("Qwen4 tree PLE missing ple_conv_taps_i32")
+                    })?;
+                    let (out_x, conv_in) =
+                        self.ple_mix_tree_cuda(&x, &pk, &pv, i, pre_ple_conv.as_ref(), taps)?;
+                    ple_tapes[i] = Some(VerifyPleLayerTape {
+                        pre_conv: pre_ple_conv,
+                        conv_in,
+                    });
+                    x = out_x;
+                    attn_normed = None;
+                }
+
+                let (mixed, gate) = self.hyper_rows(
+                    &x,
+                    &format!("layers.{i}.attn_hyper_connection"),
+                    &format!("blk.{i}.hc_attn"),
+                    true,
+                    attn_normed.as_ref(),
+                )?;
+                let mut cache = std::mem::take(&mut self.caches[i]);
+                let branch = if self.config.linear(i) {
+                    let p = format!("layers.{i}.linear_attn");
+                    let g = format!("blk.{i}");
+                    let projections = self.gdn_projections(&mixed, &p, &g)?;
+                    let (out, tape) =
+                        self.cuda_verify_gdn_tree(&projections, i, &mut cache, views)?;
+                    gdn_tapes[i] = Some(tape);
+                    self.caches[i] = cache;
+                    self.linear_rows(
+                        &out,
+                        &format!("{p}.out_proj.weight"),
+                        &format!("{g}.ssm_out.weight"),
+                    )?
+                } else {
+                    let projections = self.attention_projections(&mixed, i)?;
+                    let (out, tape) = self.cuda_verify_attention_tree(
+                        &mixed,
+                        i,
+                        &mut cache,
+                        &projections,
+                        tree,
+                        views,
+                    )?;
+                    attn_tapes[i] = Some(tape);
+                    self.caches[i] = cache;
+                    self.linear_rows(
+                        &out,
+                        &format!("layers.{i}.self_attn.o_proj.weight"),
+                        &format!("blk.{i}.attn_output.weight"),
+                    )?
+                };
+                let gate = gate.ok_or_else(|| {
+                    Error::from_reason("Qwen4 tree attention is missing its injection gate")
+                })?;
+                let (x_mid, mlp_normed) = self.inject_for_mlp(&x, &branch, &gate, i, true)?;
+                let (mixed, gate) = self.hyper_rows(
+                    &x_mid,
+                    &format!("layers.{i}.mlp_hyper_connection"),
+                    &format!("blk.{i}.hc_ffn"),
+                    true,
+                    mlp_normed.as_ref(),
+                )?;
+                let branch = self.moe_rows(&mixed, i)?;
+                let gate = gate.ok_or_else(|| {
+                    Error::from_reason("Qwen4 tree MLP is missing its injection gate")
+                })?;
+                let next_layer = i + 1;
+                let (next_x, next_normed) = if next_layer < layers {
+                    if !self.config.ple_layer_ids.contains(&(next_layer + 1)) {
+                        self.inject_for_hyper(
+                            &x_mid,
+                            &branch,
+                            &gate,
+                            &format!("layers.{next_layer}.attn_hyper_connection.hc_norm.weight"),
+                            &format!("blk.{next_layer}.hc_attn_norm.weight"),
+                            true,
+                        )?
+                    } else {
+                        (Self::inject(&x_mid, &branch, &gate)?, None)
+                    }
+                } else if self.scope.is_empty() {
+                    self.inject_for_hyper(
+                        &x_mid,
+                        &branch,
+                        &gate,
+                        "hyper_connection_mixer.hc_norm.weight",
+                        "output_hc_norm.weight",
+                        true,
+                    )?
+                } else {
+                    (Self::inject(&x_mid, &branch, &gate)?, None)
+                };
+                // Match linear `verify_chunk_deferred`: submit Layer 0 immediately so
+                // GPU overlaps with Layer-1 PLE reads, Layer 3 to keep GPU saturated
+                // while Layers 4..11 build, then every 12 layers (5 async waves).
+                if i == 0 || i == 3 || ((i + 1).is_multiple_of(12) && i + 1 < layers) {
+                    if let Some(ref normed) = next_normed {
+                        self.submit(&[&next_x, normed], "qwen4::decoder::verify")?;
+                    } else {
+                        self.submit(&[&next_x], "qwen4::decoder::verify")?;
+                    }
+                }
+                self.tap_layer(i, std::slice::from_ref(&next_x))?;
+                x = next_x;
+                attn_normed = next_normed;
+            }
+            self.finish_taps(base_history_len)?;
+
+            let (mixed, _) = self.hyper_rows(
+                &x,
+                "hyper_connection_mixer",
+                "output_hc",
+                false,
+                attn_normed.as_ref(),
+            )?;
+            let logits = self
+                .linear_rows(&mixed, "lm_head.weight", "output.weight")?
+                .reshape(&[t as i64, -1])?;
+            self.verification = None;
+
+            // Submit all caches, GDN/PLE/QSA tapes, hidden taps, and logits in
+            // one non-blocking CUDA async batch (logits LAST so `argmax` drains
+            // the entire tree verify wave in a single GPU sync).
+            let mut completed: Vec<&MxArray> = Vec::new();
+            completed.extend(self.caches.iter().flat_map(LayerCache::arrays));
+            for tape in gdn_tapes.iter().flatten() {
+                completed.push(&tape.qkv);
+                completed.push(&tape.k);
+                completed.push(&tape.v);
+                completed.push(&tape.g);
+                completed.push(&tape.beta);
+            }
+            for tape in ple_tapes.iter().flatten() {
+                completed.push(&tape.conv_in);
+            }
+            for tape in attn_tapes.iter().flatten() {
+                completed.push(&tape.ik_rows);
+            }
+            if let Some(taps) = &self.hidden_taps {
+                completed.extend(taps.last_pass_arrays().iter());
+            }
+            completed.push(&logits);
+            Self::cuda_async_eval(&completed);
+
+            Ok((
+                logits,
+                TreeVerifyTicket {
+                    base_history_len,
+                    tree_tokens: tree.tokens.clone(),
+                    gdn_tapes,
+                    ple_tapes,
+                    attn_tapes,
+                },
+            ))
+        })();
+        self.verification = None;
+        self.decode_pass = pass;
+        self.rotary_tables.get_mut().clear();
+        match result {
+            Ok(verified) => {
+                self.observe_pass(t, started.elapsed());
+                Ok(verified)
+            }
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
+    }
+
+    /// Commit `accepted_nodes` (always starting with root `0`) from a
+    /// [`TreeVerifyTicket`]:
+    /// - Appends accepted tokens to `self.history`
+    /// - Rebuilds Layer-1 PLE `[9, 10240]` `ple_conv` from `pre_conv` + accepted `conv_in`
+    /// - Rebuilds 36L GDN `[3, 10240]` `conv` from `pre_conv` + accepted `qkv` and arms
+    ///   `cuda_pending_gdn[i]` with shared `prev_indices` (`None` when contiguous!)
+    /// - Trims (zero-copy) or compacts (`kv_compact_rows`) 12L QSA flat KV and updates
+    ///   `index_keys` & `index_tail` along the accepted branch.
+    pub(in super::super) fn commit_tree_deferred(
+        &mut self,
+        mut ticket: TreeVerifyTicket,
+        accepted_nodes: &[usize],
+        is_contiguous_prefix: bool,
+        is_chain: bool,
+    ) -> Result<()> {
+        let keep = accepted_nodes.len();
+        let total = ticket.tree_tokens.len();
+        if keep == 0 || keep > total || accepted_nodes[0] != 0 {
+            return Err(Error::from_reason(format!(
+                "Qwen4 tree commit invalid accepted_nodes {accepted_nodes:?} for T={total}"
+            )));
+        }
+        if self.history.len() != ticket.base_history_len {
+            return Err(Error::from_reason(format!(
+                "Qwen4 tree commit history len {} != base {}",
+                self.history.len(),
+                ticket.base_history_len
+            )));
+        }
+        for &node in accepted_nodes {
+            if node >= total {
+                return Err(Error::from_reason(format!(
+                    "Qwen4 tree commit node {node} >= T={total}"
+                )));
+            }
+            self.history.push(ticket.tree_tokens[node]);
+        }
+
+        let accepted_i32 = if is_contiguous_prefix {
+            None
+        } else {
+            let idx: Vec<i32> = accepted_nodes.iter().map(|&n| n as i32).collect();
+            Some(MxArray::from_int32(&idx, &[keep as i64])?)
+        };
+
+        let layers = self.config.num_hidden_layers;
+        let conv_hist = self.config.linear_conv_kernel_dim.saturating_sub(1);
+        let conv_hist_i64 = conv_hist as i64;
+        // Pre-build the shared tail index array for non-contiguous GDN conv rebuild
+        // when `keep >= conv_hist` so all 36 GDN layers share one 12-byte tensor.
+        let gdn_tail_i32 = if !is_contiguous_prefix && keep >= conv_hist && conv_hist > 0 {
+            let tail_idx: Vec<i32> = accepted_nodes[keep - conv_hist..keep]
+                .iter()
+                .map(|&n| n as i32)
+                .collect();
+            Some(MxArray::from_int32(&tail_idx, &[conv_hist_i64])?)
+        } else {
+            None
+        };
+        let ple_keep = self.config.ple_conv_kernel_size.saturating_sub(1) * self.config.ngram_size;
+        let ple_keep_i64 = ple_keep as i64;
+
+        for i in 0..layers {
+            if let Some(ple_tape) = ticket.ple_tapes[i].take() {
+                let keep_i64 = keep as i64;
+                let new_ple_conv = if keep >= ple_keep {
+                    if is_contiguous_prefix {
+                        ple_tape
+                            .conv_in
+                            .slice_axis(0, keep_i64 - ple_keep_i64, keep_i64)?
+                    } else {
+                        let tail_idx: Vec<i32> = accepted_nodes[keep - ple_keep..keep]
+                            .iter()
+                            .map(|&n| n as i32)
+                            .collect();
+                        let idx_arr = MxArray::from_int32(&tail_idx, &[ple_keep_i64])?;
+                        ple_tape.conv_in.take(&idx_arr, 0)?
+                    }
+                } else {
+                    let old_conv = match ple_tape.pre_conv {
+                        Some(prev) => prev,
+                        None => MxArray::zeros(
+                            &[ple_keep_i64, ple_tape.conv_in.shape_at(1)?],
+                            Some(ple_tape.conv_in.dtype()?),
+                        )?,
+                    };
+                    let kept_old = old_conv.slice_axis(0, keep_i64, ple_keep_i64)?;
+                    let kept_new = if is_contiguous_prefix {
+                        ple_tape.conv_in.slice_axis(0, 0, keep_i64)?
+                    } else {
+                        ple_tape.conv_in.take(
+                            accepted_i32.as_ref().ok_or_else(|| {
+                                Error::from_reason("Qwen4 PLE tree commit missing accepted_i32")
+                            })?,
+                            0,
+                        )?
+                    };
+                    MxArray::concatenate(&kept_old, &kept_new, 0)?
+                };
+                self.caches[i].ple_conv = Some(new_ple_conv);
+            }
+
+            if self.config.linear(i) {
+                let tape = ticket.gdn_tapes[i].take().ok_or_else(|| {
+                    Error::from_reason(format!("Qwen4 tree commit missing GDN tape at layer {i}"))
+                })?;
+                // `gdn::prepare_tree` already produced the exact `conv` state iff the
+                // entire linear chain was accepted contiguously; otherwise rebuild from
+                // `tape.pre_conv` + accepted rows of `tape.qkv`.
+                if !(is_chain && is_contiguous_prefix && keep == total) {
+                    let qkv_2d = tape.qkv.squeeze(Some(&[0]))?;
+                    let keep_i64 = keep as i64;
+                    let new_conv = if keep >= conv_hist {
+                        if is_contiguous_prefix {
+                            qkv_2d.slice_axis(0, keep_i64 - conv_hist_i64, keep_i64)?
+                        } else {
+                            qkv_2d.take(
+                                gdn_tail_i32.as_ref().ok_or_else(|| {
+                                    Error::from_reason("Qwen4 GDN tree commit missing tail_i32")
+                                })?,
+                                0,
+                            )?
+                        }
+                    } else {
+                        let old_conv = match tape.pre_conv {
+                            Some(prev) => prev,
+                            None => MxArray::zeros(
+                                &[conv_hist_i64, qkv_2d.shape_at(1)?],
+                                Some(qkv_2d.dtype()?),
+                            )?,
+                        };
+                        let kept_old = old_conv.slice_axis(0, keep_i64, conv_hist_i64)?;
+                        let kept_new = if is_contiguous_prefix {
+                            qkv_2d.slice_axis(0, 0, keep_i64)?
+                        } else {
+                            qkv_2d.take(
+                                accepted_i32.as_ref().ok_or_else(|| {
+                                    Error::from_reason("Qwen4 GDN tree commit missing accepted_i32")
+                                })?,
+                                0,
+                            )?
+                        };
+                        MxArray::concatenate(&kept_old, &kept_new, 0)?
+                    };
+                    self.caches[i].conv = Some(new_conv);
+                }
+                self.cuda_pending_gdn[i] = Some(CudaPendingGdn {
+                    k: tape.k,
+                    v: tape.v,
+                    g: tape.g,
+                    beta: tape.beta,
+                    keep,
+                    prev_indices: accepted_i32.clone(),
+                });
+            } else {
+                let tape = ticket.attn_tapes[i].take().ok_or_else(|| {
+                    Error::from_reason(format!("Qwen4 tree commit missing attn tape at layer {i}"))
+                })?;
+                let mut cache = std::mem::take(&mut self.caches[i]);
+                let res = self.commit_attn_tree_layer(
+                    i,
+                    &mut cache,
+                    tape,
+                    keep,
+                    is_contiguous_prefix,
+                    accepted_i32.as_ref(),
+                );
+                self.caches[i] = cache;
+                res?;
+            }
+        }
+        Ok(())
     }
 
     fn prefill_chunk_inner(
@@ -2950,11 +5012,76 @@ impl Decoder {
             .map(GroupLimit::Windows)
     }
 
+    /// Pre-reserve flat BF16 KV and QSA indexer key buffers ONCE per prompt
+    /// across all full-attention layers so multi-chunk prefills never trigger
+    /// repeated KV reallocation + `concatenate` copies mid-prompt.
+    fn pre_reserve_flat_kv_for_prefill(&mut self, prompt_len: usize) -> Result<()> {
+        if !super::cuda_qwen4_fast_enabled()
+            || self.paged.is_some()
+            || !self.weights.embedding_is_bf16()
+            || prompt_len < 64
+        {
+            return Ok(());
+        }
+        let kv_heads = self.config.num_key_value_heads as i64;
+        let head_dim = self.config.head_dim as i64;
+        let idx_dim = self.config.indexer_head_dim as i64;
+        let ratio = self.config.indexer_compress_ratio.max(1);
+        let add_tokens = prompt_len + 128;
+        let mut grown: Vec<MxArray> = Vec::new();
+        for (layer, cache) in self.caches.iter_mut().enumerate() {
+            if self.config.linear(layer) {
+                continue;
+            }
+            let old_kv_cap = match &cache.keys {
+                Some(k) => k.shape_at(2)? as usize,
+                None => 0,
+            };
+            let (_, k_buf, v_buf) =
+                cache.ensure_flat_kv_capacity(kv_heads, head_dim, add_tokens, DType::BFloat16)?;
+            if k_buf.shape_at(2)? as usize > old_kv_cap {
+                grown.push(k_buf);
+                grown.push(v_buf);
+            }
+            let add_blocks = (cache.index_tail.len() + add_tokens) / ratio + 1;
+            if let Some(idx_buf) =
+                cache.ensure_flat_index_capacity(idx_dim, add_blocks, DType::BFloat16)?
+            {
+                grown.push(idx_buf);
+            }
+        }
+        if !grown.is_empty() {
+            let refs: Vec<&MxArray> = grown.iter().collect();
+            self.submit_state(&refs, "qwen4::prefill::reserve_flat_kv")?;
+        }
+        Ok(())
+    }
+
+    /// Choose the next prefill chunk length, balancing the final two chunks on
+    /// flat CUDA direct prefill so a prompt never streams 48L of routed experts
+    /// for a tiny tail chunk (e.g. `remaining < cap + cap/3` splits evenly).
+    fn next_prefill_chunk_len(remaining: usize, window: usize, balance_tail: bool) -> usize {
+        if balance_tail && window >= 512 && remaining > window && remaining < window + window / 3 {
+            remaining.div_ceil(2)
+        } else {
+            remaining.min(window)
+        }
+    }
+
+    /// RAII guard that disables MLX CUDA Graph capture during large prefill
+    /// passes (`M > 16`) so prefill avoids graph-capture/update stalls while
+    /// preserving CUDA Graph capture for low-latency decode (`M <= 16`).
+    fn cuda_prefill_graphs_guard(active: bool) -> CudaGraphsGuard {
+        CudaGraphsGuard::disable_if(active && super::cuda_qwen4_fast_enabled())
+    }
+
     /// A whole prompt: layer-major groups (the last with the tail) when
     /// [`Decoder::group_limit`] allows them, else one window at a time with
     /// the next window's rows requested while this one runs. The admitted
     /// window is read before every pass.
     pub fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<MxArray> {
+        let _cuda_graphs_guard = Self::cuda_prefill_graphs_guard(tokens.len() > 16);
+        self.pre_reserve_flat_kv_for_prefill(tokens.len())?;
         if let Some(limit) = self.group_limit(self.history.len(), tokens.len()) {
             let (windows, tail) = self.group_windows(tokens);
             let groups: Vec<_> = windows.chunks(limit.per_group()).collect();
@@ -2966,12 +5093,18 @@ impl Decoder {
             }
             return logits.ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"));
         }
+        let balance_tail = crate::accelerator::cuda_ops_available()
+            && self.weights.plan.direct
+            && self.scope.is_empty()
+            && super::cuda_qwen4_fast_enabled();
         let mut logits = None;
         let mut start = 0;
         while start < tokens.len() {
             let window = self.prefill_pass_window();
-            let end = (start + window).min(tokens.len());
-            let next_end = (end + window).min(tokens.len());
+            let take = Self::next_prefill_chunk_len(tokens.len() - start, window, balance_tail);
+            let end = start + take;
+            let next_take = Self::next_prefill_chunk_len(tokens.len() - end, window, balance_tail);
+            let next_end = end + next_take;
             logits = Some(self.prefill_chunk_ahead(
                 &tokens[start..end],
                 &tokens[end..next_end],
@@ -3208,10 +5341,12 @@ impl Decoder {
         cache: &mut LayerCache,
         windows: &[&[u32]],
         streams: &mut Vec<MxArray>,
+        prefill_normed: &mut Option<MxArray>,
         pass: GroupPass,
     ) -> Result<()> {
         let group = windows.len() > 1;
         let union = self.union_lease(windows, i)?;
+        let carry_next_norm = !group && !union && super::cuda_qwen4_fast_enabled();
         let mut routed = Vec::new();
         let mut inputs = Vec::new();
         for (w, tokens_w) in windows.iter().enumerate() {
@@ -3235,10 +5370,30 @@ impl Decoder {
             } else {
                 streams[w].clone()
             };
-            let (stream, normed) =
-                self.attention_matrix_for_mlp(&input, tokens_w, i, cache, true)?;
+            let carried_in = if carry_next_norm {
+                prefill_normed.take()
+            } else {
+                None
+            };
+            let (stream, normed) = self.attention_matrix_for_mlp_with_norm(
+                &input,
+                tokens_w,
+                i,
+                cache,
+                true,
+                carried_in.as_ref(),
+            )?;
             if !union {
-                streams[w] = self.mlp_matrix_for_attention(&stream, i, normed.as_ref())?;
+                let (next_stream, next_norm) = self.mlp_matrix_for_attention_next(
+                    &stream,
+                    i,
+                    normed.as_ref(),
+                    carry_next_norm,
+                )?;
+                streams[w] = next_stream;
+                if carry_next_norm {
+                    *prefill_normed = next_norm;
+                }
             }
             let first = self.paged_chunk_start;
             self.write_window_kv(i, cache, tokens_w.len(), first, pass)?;
@@ -3254,6 +5409,7 @@ impl Decoder {
         if !union {
             return Ok(());
         }
+        *prefill_normed = None;
         let sums = match self.union_expert_rows(&inputs, i)? {
             Some(sums) => sums,
             None => {
@@ -3310,22 +5466,26 @@ impl Decoder {
         {
             return self.decode_token(*token, next, embeddings, true, project_logits);
         }
+        if self.verification.is_none() {
+            self.settle_cuda_pending_gdn()?;
+        }
         let base = self.history.len();
         let started = std::time::Instant::now();
+        let total: usize = windows.iter().map(|w| w.len()).sum();
+        let _cuda_graphs_guard =
+            Self::cuda_prefill_graphs_guard(self.verification.is_none() && total > 16);
         let rows = (self.weights.lookup.prefetched(), self.weights.lookup.late());
         let fills = self.fill_records();
         let group = windows.len() > 1;
         let tokens = *windows
             .first()
             .ok_or_else(|| Error::from_reason("Qwen4 prefill group has no windows"))?;
-        let total: usize = windows.iter().map(|w| w.len()).sum();
         let layers = self.config.num_hidden_layers;
         let submit_span = self.decode_submit_span();
         let async_window = windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
         let defer_final = self.deferred_forward_completion();
-        if windows
-            .iter()
-            .any(|w| w.is_empty() || w.len() > super::MAX_PREFILL_CHUNK)
+        let max_chunk = self.cuda_prefill_chunk_cap().max(super::MAX_PREFILL_CHUNK);
+        if windows.iter().any(|w| w.is_empty() || w.len() > max_chunk)
             || base + total > self.context_window
             || windows
                 .iter()
@@ -3396,6 +5556,10 @@ impl Decoder {
                 Error::from_reason("Qwen4 prefill window is missing its token embeddings")
             })?;
             streams.push(MxArray::tile(embeddings, &[1, 1, hc])?);
+        } else if self.verification.is_some()
+            && let Some(e) = embeddings.or(window_embedding.as_ref())
+        {
+            window = Some(MxArray::tile(e, &[1, 1, hc])?);
         } else {
             for (j, &token) in tokens.iter().enumerate() {
                 self.check_cancelled()?;
@@ -3405,8 +5569,17 @@ impl Decoder {
                 };
                 hidden.push(MxArray::tile(&row, &[1, 1, hc])?);
             }
+            if self.verification.is_some() {
+                window = if hidden.len() == 1 {
+                    hidden.pop()
+                } else {
+                    Some(MxArray::concatenate_many(hidden.iter().collect(), Some(1))?)
+                };
+                hidden.clear();
+            }
         }
-        if self.verification.is_some() {
+        let deferred_verify = self.cuda_verify_gdn_tape.is_some();
+        if self.verification.is_some() && !deferred_verify {
             self.verification = Some(
                 (0..tokens.len())
                     .map(|j| DecoderState {
@@ -3429,11 +5602,9 @@ impl Decoder {
                     .collect(),
             );
         }
-        if self.verification.is_some() {
-            window = Some(MxArray::concatenate_many(hidden.iter().collect(), Some(1))?);
-            hidden.clear();
-        }
         self.begin_taps();
+        let mut prefill_normed: Option<MxArray> = None;
+        let mut verify_normed: Option<MxArray> = None;
         for i in 0..layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
@@ -3444,7 +5615,14 @@ impl Decoder {
                     submit_span,
                     defer_final,
                 };
-                self.group_layer(i, &mut cache, windows, &mut streams, pass)?;
+                self.group_layer(
+                    i,
+                    &mut cache,
+                    windows,
+                    &mut streams,
+                    &mut prefill_normed,
+                    pass,
+                )?;
                 #[cfg(test)]
                 if let Some(passes) = &mut self.pass_outputs {
                     passes.push((i, streams.clone()));
@@ -3454,17 +5632,37 @@ impl Decoder {
                 let input = window
                     .take()
                     .ok_or_else(|| Error::from_reason("Qwen4 verification lost its window"))?;
-                let (stream, saved) = self.verify_layer(&input, tokens, i, &mut cache)?;
-                self.submit(&[&stream], "qwen4::decoder::verify")?;
+                let (stream, next_normed, saved) =
+                    self.verify_layer(&input, tokens, i, &mut cache, verify_normed.as_ref())?;
+                let should_submit = if deferred_verify {
+                    // Submit Layer 0 right away so GPU overlaps with Layer 1 PLE
+                    // reads, Layer 3 to keep GPU saturated while Layers 4..11
+                    // build, then every 12 layers (5 async batches vs 48).
+                    i == 0 || i == 3 || ((i + 1).is_multiple_of(12) && i + 1 < layers)
+                } else {
+                    true
+                };
+                if should_submit {
+                    if let Some(ref normed) = next_normed {
+                        self.submit(&[&stream, normed], "qwen4::decoder::verify")?;
+                    } else {
+                        self.submit(&[&stream], "qwen4::decoder::verify")?;
+                    }
+                }
                 #[cfg(test)]
                 if let Some(passes) = &mut self.pass_outputs {
                     passes.push((i, vec![stream.clone()]));
                 }
                 self.tap_layer(i, std::slice::from_ref(&stream))?;
                 window = Some(stream);
-                if let Some(states) = &mut self.verification {
-                    for (state, saved) in states.iter_mut().zip(saved) {
-                        state.caches[i] = saved;
+                verify_normed = next_normed;
+                if let Some(row_caches) = &mut self.cuda_verify_row_caches {
+                    for (caches_j, saved_j) in row_caches.iter_mut().zip(saved) {
+                        caches_j[i] = saved_j;
+                    }
+                } else if let Some(states) = &mut self.verification {
+                    for (state, saved_j) in states.iter_mut().zip(saved) {
+                        state.caches[i] = saved_j;
                     }
                 }
             }
@@ -3489,6 +5687,16 @@ impl Decoder {
         } else {
             window
         };
+        if self.verification.is_some() {
+            self.cuda_verify_final_window = final_window.clone();
+            self.cuda_verify_final_normed = verify_normed;
+            if deferred_verify {
+                let out = final_window
+                    .ok_or_else(|| Error::from_reason("Qwen4 deferred verify lost its window"))?;
+                self.history.extend_from_slice(tokens);
+                return Ok(out);
+            }
+        }
         if let Some(window) = final_window {
             // Only public/MTP frontier capture needs token views. Keep one
             // matrix across layer boundaries instead of rebuilding it twice
@@ -3518,7 +5726,16 @@ impl Decoder {
             mixed
         };
         if !defer_final {
-            MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
+            if super::cuda_qwen4_fast_enabled() {
+                let mut completed = vec![&logits];
+                completed.extend(self.pending_state_arrays());
+                if let Some(taps) = &self.hidden_taps {
+                    completed.extend(taps.last_pass_arrays().iter());
+                }
+                MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::logits")?;
+            } else {
+                MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
+            }
         }
         let filled = self.fill_records();
         tracing::debug!(
@@ -3664,6 +5881,9 @@ impl Decoder {
             }
             inputs.truncate(from);
         }
+        let cuda_fast = super::cuda_qwen4_fast_enabled();
+        let cuda_defer_last = self.cuda_deferred_state();
+        let mut next_normed: Option<MxArray> = None;
         for i in from..layers {
             self.check_cancelled()?;
             if let Some(inputs) = &mut self.layer_inputs {
@@ -3678,7 +5898,8 @@ impl Decoder {
                 return Ok(LayerPass::Stopped { at: i });
             }
             let mut cache = std::mem::take(&mut self.caches[i]);
-            let next = self.layer(x, token, i, &mut cache)?;
+            let (next, carried_normed) =
+                self.layer_with_norm(x, token, i, &mut cache, next_normed.as_ref(), cuda_fast)?;
             #[cfg(test)]
             if let Some(outputs) = &mut self.layer_outputs {
                 outputs.push((i, next.clone()));
@@ -3686,9 +5907,9 @@ impl Decoder {
             self.tap_layer(i, std::slice::from_ref(&next))?;
             let last = i + 1 == layers;
             let mut poll = None;
-            if defer_final && last {
-                // TrackFastModel returns a lazy final mixer/head. The
-                // checked route commit joins it with all state/readers.
+            if (defer_final || cuda_defer_last) && last {
+                // TrackFastModel and CUDA direct decode return/join at the
+                // final mixer/head with all state/taps in one sync.
             } else if (i + 1) % submit_span != 0 && !last {
                 if self.decode_should_submit(i + 1) {
                     #[cfg(test)]
@@ -3696,6 +5917,9 @@ impl Decoder {
                         crate::array::synchronize();
                     }
                     let mut group = vec![&next];
+                    if let Some(ref normed) = carried_normed {
+                        group.push(normed);
+                    }
                     if polls && let Some(routes) = &self.device_routes {
                         poll = Some(submitted);
                         group.extend(routes[submitted..].iter().map(|(_, ids)| ids));
@@ -3703,10 +5927,13 @@ impl Decoder {
                     }
                     self.submit(&group, "qwen4::decoder::next")?;
                 }
+            } else if let Some(ref normed) = carried_normed {
+                MxArray::eval_arrays_with_context(&[&next, normed], "qwen4::decoder::next")?;
             } else {
                 MxArray::eval_arrays_with_context(&[&next], "qwen4::decoder::next")?;
             }
             x = next;
+            next_normed = carried_normed;
             self.caches[i] = cache;
             #[cfg(test)]
             let poll = poll.map(|older| self.pinned_poll(older, submitted));
@@ -3728,14 +5955,32 @@ impl Decoder {
         }
         self.finish_taps(self.history.len())?;
         self.last_chunk_hidden = vec![x.clone()];
-        let (mixed, _) = self.hyper(&x, "hyper_connection_mixer", "output_hc", false)?;
+        let (mixed, _) = self.hyper_with_norm(
+            &x,
+            "hyper_connection_mixer",
+            "output_hc",
+            false,
+            next_normed.as_ref(),
+        )?;
         let out = if project {
             self.linear(&mixed, "lm_head.weight", "output.weight")?
         } else {
             mixed
         };
         if !defer_final {
-            MxArray::eval_arrays_with_context(&[&out], "qwen4::decoder::logits")?;
+            if cuda_fast && self.cuda_ar_lazy_logits && self.paged.is_none() {
+                // `Step::eval_step` submits pending states + taps + sampled token
+                // together via non-blocking `cuda_async_eval` so AR runs with 1 sync/tok.
+            } else if cuda_fast {
+                let mut completed = vec![&out];
+                completed.extend(self.pending_state_arrays());
+                if let Some(taps) = &self.hidden_taps {
+                    completed.extend(taps.last_pass_arrays().iter());
+                }
+                MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::logits")?;
+            } else {
+                MxArray::eval_arrays_with_context(&[&out], "qwen4::decoder::logits")?;
+            }
         }
         self.history.push(token);
         Ok(LayerPass::Done(out))

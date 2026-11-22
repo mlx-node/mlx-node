@@ -142,8 +142,10 @@ impl Weight {
             dense_bf16: self.dense_bf16.as_ref().map(slice).transpose()?,
             scales: self.scales.as_ref().map(slice).transpose()?,
             biases: self.biases.as_ref().map(slice).transpose()?,
+            qlinear: None,
             ..self.clone()
-        })
+        }
+        .with_cached_qlinear())
     }
 
     pub(in super::super) fn concatenate_rows(weights: &[Arc<Self>]) -> Result<Self> {
@@ -192,8 +194,11 @@ impl Weight {
                 .collect::<Option<Vec<_>>>()
                 .map(|arrays| MxArray::concatenate_many(arrays, Some(0)))
                 .transpose()?,
+            q8_symmetric_128: weights.iter().all(|w| w.q8_symmetric_128),
+            qlinear: None,
             ..first.as_ref().clone()
-        })
+        }
+        .with_cached_qlinear())
     }
 
     pub(in super::super) fn gather_rows(
@@ -290,6 +295,13 @@ impl Store {
         self.banks.get(name).cloned()
     }
 
+    pub(in super::super) fn resident_qlinear(
+        &self,
+        name: &str,
+    ) -> Option<&crate::models::quantized_linear::QuantizedLinear> {
+        self.banks.get(name)?.qlinear()
+    }
+
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
         if self.plan.direct || self.slot_bank_budget.is_some() {
             self.prepare_hot_with_policy(&mut super::super::memory::admit_direct)
@@ -354,6 +366,7 @@ impl Store {
         // model alongside it or count another owner's memory as ours.
         self.banks.clear();
         self.paired_banks.clear();
+        self.dense_cache.clear();
         self.cache.clear();
         self.window_banks.clear();
         self.row_bank.clear();
@@ -469,6 +482,34 @@ impl Store {
             .flatten()
             .collect();
             MxArray::eval_arrays_with_context(&arrays, "Qwen4 prepare resident bank")?;
+            if super::super::cuda_qwen4_fast_enabled() {
+                let mut promoted = false;
+                if let Some(dev_v) = bank.values.ensure_cuda_device()? {
+                    bank.values = dev_v;
+                    promoted = true;
+                }
+                if let Some(bf16) = &bank.dense_bf16
+                    && let Some(dev_b) = bf16.ensure_cuda_device()?
+                {
+                    bank.dense_bf16 = Some(dev_b);
+                    promoted = true;
+                }
+                if let Some(s) = &bank.scales
+                    && let Some(dev_s) = s.ensure_cuda_device()?
+                {
+                    bank.scales = Some(dev_s);
+                    promoted = true;
+                }
+                if let Some(b) = &bank.biases
+                    && let Some(dev_b) = b.ensure_cuda_device()?
+                {
+                    bank.biases = Some(dev_b);
+                    promoted = true;
+                }
+                if promoted {
+                    bank = bank.with_cached_qlinear();
+                }
+            }
             self.install_bank(name, bank)?;
             drop(chunks);
             super::super::memory::maintain_freelist(self.plan.physical_bytes);
@@ -501,6 +542,7 @@ impl Store {
             .resident_bank_bytes
             .store(self.bank_bytes, Ordering::Relaxed);
         self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
+        self.dense_cache.remove(&name);
         self.banks.insert(name, Arc::new(bank));
         Ok(())
     }
@@ -552,6 +594,8 @@ impl Weight {
             group: 32,
             bits: 8,
             mode: "affine".into(),
+            q8_symmetric_128: false,
+            qlinear: None,
         })
     }
 }
@@ -744,6 +788,8 @@ impl Store {
                         group: 0,
                         bits: 0,
                         mode: String::new(),
+                        q8_symmetric_128: false,
+                        qlinear: None,
                     }
                 };
                 let arrays: Vec<_> = [
@@ -836,7 +882,11 @@ impl Store {
         if first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight") {
             return Ok((self.linear(first, x)?, self.linear(second, x)?));
         }
-        if rows <= 8 || wide_shared {
+        if rows <= 8
+            || wide_shared
+            || (crate::accelerator::cuda_ops_available() && rows <= 16)
+            || (super::super::cuda_qwen4_fast_enabled() && rows >= 17)
+        {
             let key = (first.to_owned(), second.to_owned());
             if !self.paired_banks.contains_key(&key)
                 && let (Some(a), Some(b)) = (
@@ -867,7 +917,9 @@ impl Store {
                     if admitted.is_err() {
                         return Ok((self.linear(first, x)?, self.linear(second, x)?));
                     }
-                    let joined = Arc::new(Weight::concatenate_rows(&[a.clone(), b.clone()])?);
+                    let joined = Arc::new(
+                        Weight::concatenate_rows(&[a.clone(), b.clone()])?.with_cached_qlinear(),
+                    );
                     let arrays: Vec<_> = [
                         Some(&joined.values),
                         joined.dense_bf16.as_ref(),
@@ -882,11 +934,17 @@ impl Store {
                         "Qwen4 paired projection preparation",
                     )?;
                     let n = a.values.shape()?[0] as usize;
-                    self.banks
-                        .insert(first.into(), Arc::new(joined.slice_rows(0, n)?));
+                    self.banks.insert(
+                        first.into(),
+                        Arc::new(joined.slice_rows(0, n)?.with_cached_qlinear()),
+                    );
                     self.banks.insert(
                         second.into(),
-                        Arc::new(joined.slice_rows(n, b.values.shape()?[0] as usize)?),
+                        Arc::new(
+                            joined
+                                .slice_rows(n, b.values.shape()?[0] as usize)?
+                                .with_cached_qlinear(),
+                        ),
                     );
                     self.paired_banks.insert(key.clone(), joined);
                 }
@@ -1004,6 +1062,8 @@ mod tests {
                     group: 32,
                     bits: bits as i32,
                     mode: "affine".into(),
+                    q8_symmetric_128: false,
+                    qlinear: None,
                 };
                 let ids = MxArray::from_uint32(
                     &(0..rows).map(|i| (i % experts) as u32).collect::<Vec<_>>(),
@@ -1067,6 +1127,8 @@ mod tests {
             group: 0,
             bits: 0,
             mode: String::new(),
+            q8_symmetric_128: false,
+            qlinear: None,
         };
         let mut cached = original.clone();
         cached.dense_bf16 = Some(cached.values.astype(DType::BFloat16).unwrap());
@@ -1147,6 +1209,8 @@ mod tests {
                     group: 0,
                     bits: 0,
                     mode: String::new(),
+                    q8_symmetric_128: false,
+                    qlinear: None,
                 }
             };
             let a = Arc::new(make(phase));

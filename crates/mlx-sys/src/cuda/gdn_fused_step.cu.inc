@@ -44,9 +44,11 @@ __device__ __forceinline__ float gdn_load_beta(const void* ptr, long long idx) {
   }
 }
 
+template <bool SIGMOID_GATE>
 __device__ __forceinline__ void gdn_emit_rmsnorm_gated_warp(
     const nv_bfloat16* y_row,
-    const nv_bfloat16* w,
+    const void* w_ptr,
+    int w_is_f32,
     const nv_bfloat16* z_row,
     nv_bfloat16* out_row,
     float eps,
@@ -59,30 +61,51 @@ __device__ __forceinline__ void gdn_emit_rmsnorm_gated_warp(
     values[i] = __bfloat162float(y_row[lane * 4 + i]);
     sq += values[i] * values[i];
   }
-  const float inv = rsqrtf(gdn_warp_sum(sq) / D + eps);
+  if constexpr (SIGMOID_GATE) {
+    const float denom = sqrtf(gdn_warp_sum(sq) * (1.0f / static_cast<float>(D)) + eps);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const nv_bfloat16 scaled = __float2bfloat16(values[i] * inv);
-    const nv_bfloat16 normed = gdn_bf16_mul(w[lane * 4 + i], scaled);
-    const nv_bfloat16 zt = z_row[lane * 4 + i];
-    const nv_bfloat16 one = __float2bfloat16(1.0f);
-    const nv_bfloat16 sigmoid_y = one / (one + hexp(__habs(zt)));
-    const nv_bfloat16 sig = zt < __float2bfloat16(0.0f)
-        ? sigmoid_y
-        : one - sigmoid_y;
-    const nv_bfloat16 gated = gdn_bf16_mul(sig, zt);
-    out_row[lane * 4 + i] = gdn_bf16_mul(gated, normed);
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane * 4 + i;
+      const float wf = w_is_f32
+          ? reinterpret_cast<const float*>(w_ptr)[d]
+          : __bfloat162float(reinterpret_cast<const nv_bfloat16*>(w_ptr)[d]);
+      const nv_bfloat16 normed = __float2bfloat16((values[i] / denom) * wf);
+      const float zf = __bfloat162float(z_row[d]);
+      const float sy = 1.0f / (1.0f + expf(fabsf(zf)));
+      const float sig = (zf < 0.0f) ? sy : (1.0f - sy);
+      out_row[d] = __float2bfloat16(sig * __bfloat162float(normed));
+    }
+  } else {
+    const float inv = rsqrtf(gdn_warp_sum(sq) / D + eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane * 4 + i;
+      const nv_bfloat16 scaled = __float2bfloat16(values[i] * inv);
+      const nv_bfloat16 wt = w_is_f32
+          ? __float2bfloat16(reinterpret_cast<const float*>(w_ptr)[d])
+          : reinterpret_cast<const nv_bfloat16*>(w_ptr)[d];
+      const nv_bfloat16 normed = gdn_bf16_mul(wt, scaled);
+      const nv_bfloat16 zt = z_row[d];
+      const nv_bfloat16 one = __float2bfloat16(1.0f);
+      const nv_bfloat16 sigmoid_y = one / (one + hexp(__habs(zt)));
+      const nv_bfloat16 sig = zt < __float2bfloat16(0.0f)
+          ? sigmoid_y
+          : one - sigmoid_y;
+      const nv_bfloat16 gated = gdn_bf16_mul(sig, zt);
+      out_row[d] = gdn_bf16_mul(gated, normed);
+    }
   }
 }
 
-extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_kernel(
+template <bool BETA_BF16, bool SIGMOID_GATE>
+__global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_kernel(
     const nv_bfloat16* __restrict__ q, const nv_bfloat16* __restrict__ k,
     const nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-    const nv_bfloat16* __restrict__ beta, const float* __restrict__ state,
-    const nv_bfloat16* __restrict__ z, const nv_bfloat16* __restrict__ w,
+    const void* __restrict__ beta, const float* __restrict__ state,
+    const nv_bfloat16* __restrict__ z, const void* __restrict__ w,
     nv_bfloat16* __restrict__ out, float* __restrict__ state_out,
     int T, int Hk, int Hv, long long z_stride_b,
-    long long z_stride_t, float eps, int tiled_heads) {
+    long long z_stride_t, float eps, int tiled_heads, int w_is_f32) {
   constexpr int D = 128;
   const int h = blockIdx.x;
   const int b = blockIdx.y;
@@ -101,11 +124,6 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_ke
   __shared__ float s_beta[32];
   __shared__ nv_bfloat16 y_shared[32 * D];
 
-  float4 s[4];
-#pragma unroll
-  for (int r = 0; r < 4; ++r) {
-    s[r] = gdn_ldcs_f4(state + state_offset + (r * 8 + lane_in_col) * 4);
-  }
   for (int idx = tid; idx < T * 32; idx += 1024) {
     const int t = idx >> 5;
     const int c4 = idx & 31;
@@ -118,20 +136,25 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_ke
   if (tid < T) {
     const long long gate_off = ((long long)b * T + tid) * Hv + h;
     s_g[tid] = g[gate_off];
-    s_beta[tid] = __bfloat162float(beta[gate_off]);
+    s_beta[tid] = gdn_load_beta<BETA_BF16>(beta, gate_off);
   }
   __syncthreads();
+
+  float4 s[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    s[r] = gdn_ldcs_f4(state + state_offset + (r * 8 + lane_in_col) * 4);
+  }
 
   for (int t = 0; t < T; ++t) {
     const uint2* kt = s_k + t * 32;
     const uint2* qt = s_q + t * 32;
     float kv = 0.0f;
-    float4 kv4[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-      kv4[r] = gdn_widen_bf16x4(kt[r * 8 + lane_in_col]);
-      kv += s[r].x * kv4[r].x + s[r].y * kv4[r].y +
-            s[r].z * kv4[r].z + s[r].w * kv4[r].w;
+      const float4 kv4 = gdn_widen_bf16x4(kt[r * 8 + lane_in_col]);
+      kv += s[r].x * kv4.x + s[r].y * kv4.y +
+            s[r].z * kv4.z + s[r].w * kv4.w;
     }
     kv = gdn_sum8(kv);
     const float decay = s_g[t];
@@ -139,11 +162,12 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_ke
     float y = 0.0f;
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
+      const float4 kv4 = gdn_widen_bf16x4(kt[r * 8 + lane_in_col]);
       const float4 qv4 = gdn_widen_bf16x4(qt[r * 8 + lane_in_col]);
-      s[r].x = decay * s[r].x + kv4[r].x * delta;
-      s[r].y = decay * s[r].y + kv4[r].y * delta;
-      s[r].z = decay * s[r].z + kv4[r].z * delta;
-      s[r].w = decay * s[r].w + kv4[r].w * delta;
+      s[r].x = decay * s[r].x + kv4.x * delta;
+      s[r].y = decay * s[r].y + kv4.y * delta;
+      s[r].z = decay * s[r].z + kv4.z * delta;
+      s[r].w = decay * s[r].w + kv4.w * delta;
       y += s[r].x * qv4.x + s[r].y * qv4.y +
            s[r].z * qv4.z + s[r].w * qv4.w;
     }
@@ -159,8 +183,8 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_ke
   __syncthreads();
 
   if (warp < T) {
-    gdn_emit_rmsnorm_gated_warp(
-        y_shared + warp * D, w,
+    gdn_emit_rmsnorm_gated_warp<SIGMOID_GATE>(
+        y_shared + warp * D, w, w_is_f32,
         z + (long long)b * z_stride_b + (long long)warp * z_stride_t + h * D,
         out + ((long long)b * T + warp) * Hv * D + h * D, eps, lane);
   }
@@ -168,11 +192,12 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_ke
 
 // Split-Dv (ROW_BLOCKS=4, 256 threads/CTA, 4 CTAs/head) vectorized float4 replay.
 // Grid: dim3(Hv * 4, B, 1), Block: dim3(256, 1, 1).
-extern "C" __global__ __launch_bounds__(256, 4) void mlx_gdn_replay_cuda_kernel(
+template <bool BETA_BF16>
+__global__ __launch_bounds__(256, 4) void mlx_gdn_replay_cuda_kernel(
     const nv_bfloat16* __restrict__ k,
     const nv_bfloat16* __restrict__ v,
     const float* __restrict__ g,
-    const nv_bfloat16* __restrict__ beta,
+    const void* __restrict__ beta,
     const float* __restrict__ state,
     float* __restrict__ state_out,
     int accepted_steps, int window_stride, int Hk, int Hv, int tiled_heads) {
@@ -224,7 +249,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void mlx_gdn_replay_cuda_kernel(
       const long long gate_off =
           ((long long)b * window_stride + (t0 + tid)) * Hv + h;
       s_g[tid] = g[gate_off];
-      s_beta[tid] = __bfloat162float(beta[gate_off]);
+      s_beta[tid] = gdn_load_beta<BETA_BF16>(beta, gate_off);
     }
     __syncthreads();
 
@@ -268,9 +293,9 @@ R"cuda(
 // - Loads state_base once, folds prev_keep accepted steps -> writes out_committed_state
 //   once (skipped when out_committed_state == nullptr), continues in registers for
 //   T <= 16 verify steps without writing speculative state_T, then fuses
-//   RMSNorm(y) * w * SiLU(z) into out [B, T, Hv * 128] in one GPU dispatch.
+//   RMSNorm(y) * w * (SIGMOID_GATE ? sigmoid(z) : SiLU(z)) into out [B, T, Hv * 128].
 // Grid: dim3(Hv, B, 1), Block: dim3(512, 1, 1).
-template <bool BETA_BF16, bool PREV_BETA_BF16>
+template <bool BETA_BF16, bool PREV_BETA_BF16, bool SIGMOID_GATE>
 __global__ __launch_bounds__(512, 2) void mlx_gdn_deferred_step_cuda_kernel(
     const nv_bfloat16* __restrict__ q,
     const nv_bfloat16* __restrict__ k,
@@ -283,11 +308,11 @@ __global__ __launch_bounds__(512, 2) void mlx_gdn_deferred_step_cuda_kernel(
     const float* __restrict__ prev_g,
     const void* __restrict__ prev_beta,
     const nv_bfloat16* __restrict__ z,
-    const nv_bfloat16* __restrict__ w,
+    const void* __restrict__ w,
     nv_bfloat16* __restrict__ out,
     float* __restrict__ out_committed_state,
     int T, int prev_keep, int prev_stride, int Hk, int Hv,
-    long long z_stride_b, long long z_stride_t, float eps, int tiled_heads) {
+    long long z_stride_b, long long z_stride_t, float eps, int tiled_heads, int w_is_f32) {
   constexpr int D = 128;
   constexpr int CHUNK = 16;
   constexpr int THREADS = 512;
@@ -479,8 +504,8 @@ __global__ __launch_bounds__(512, 2) void mlx_gdn_deferred_step_cuda_kernel(
   __syncthreads();
 
   if (warp < T) {
-    gdn_emit_rmsnorm_gated_warp(
-        y_shared + warp * D, w,
+    gdn_emit_rmsnorm_gated_warp<SIGMOID_GATE>(
+        y_shared + warp * D, w, w_is_f32,
         z + (long long)b * z_stride_b + (long long)warp * z_stride_t + h * D,
         out + ((long long)b * T + warp) * Hv * D + h * D, eps, lane);
   }
@@ -494,7 +519,7 @@ R"cuda(
 // - When prev_indices != nullptr, folds prev_indices[0..prev_keep-1] directly
 //   from prev_{k,v,g,beta} without gather kernels; when nullptr, folds 0..prev_keep-1.
 // Grid: dim3(Hv, B, 1), Block: dim3(512, 1, 1).
-template <bool BETA_BF16, bool PREV_BETA_BF16>
+template <bool BETA_BF16, bool PREV_BETA_BF16, bool SIGMOID_GATE>
 __global__ __launch_bounds__(512, 2) void mlx_gdn_tree_step_cuda_kernel(
     const nv_bfloat16* __restrict__ q,
     const nv_bfloat16* __restrict__ k,
@@ -509,11 +534,11 @@ __global__ __launch_bounds__(512, 2) void mlx_gdn_tree_step_cuda_kernel(
     const int* __restrict__ prev_indices,
     const int* __restrict__ parent,
     const nv_bfloat16* __restrict__ z,
-    const nv_bfloat16* __restrict__ w,
+    const void* __restrict__ w,
     nv_bfloat16* __restrict__ out,
     float* __restrict__ out_committed_state,
     int T, int prev_keep, int prev_stride, int Hk, int Hv,
-    long long z_stride_b, long long z_stride_t, float eps, int tiled_heads) {
+    long long z_stride_b, long long z_stride_t, float eps, int tiled_heads, int w_is_f32) {
   constexpr int D = 128;
   constexpr int CHUNK = 16;
   constexpr int THREADS = 512;
@@ -740,8 +765,8 @@ __global__ __launch_bounds__(512, 2) void mlx_gdn_tree_step_cuda_kernel(
   __syncthreads();
 
   if (warp < T) {
-    gdn_emit_rmsnorm_gated_warp(
-        y_shared + warp * D, w,
+    gdn_emit_rmsnorm_gated_warp<SIGMOID_GATE>(
+        y_shared + warp * D, w, w_is_f32,
         z + (long long)b * z_stride_b + (long long)warp * z_stride_t + h * D,
         out + ((long long)b * T + warp) * Hv * D + h * D, eps, lane);
   }

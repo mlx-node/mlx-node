@@ -153,7 +153,7 @@ export const EXPERT_RESIDENCIES = [
 export type TurnOutcome = 'ok' | 'error' | 'cancelled';
 export type TurnErrorKind = 'finish_error' | 'exception';
 export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
-export type TurnEndpoint = 'messages' | 'responses' | 'other';
+export type TurnEndpoint = 'messages' | 'responses' | 'systemone' | 'other';
 export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
 /** Where a turn's thinking budget came from: the request, or the server's option. */
 export type TurnBudgetFrom = 'request' | 'server';
@@ -166,7 +166,7 @@ export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'
 export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
 /** The phases of a running native turn, in order; `done` is left out. */
 export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
-export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'other'];
+export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'systemone', 'other'];
 export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
 export const TURN_BUDGET_FROM: readonly TurnBudgetFrom[] = ['request', 'server'];
 export const TURN_REASONING_CLOSES: readonly TurnReasoningClose[] = ['model', 'budget', 'cycle', 'open'];
@@ -330,8 +330,8 @@ export interface MetricsTraceRecord
   coldEnabled?: boolean;
   /**
    * The SSD state tier's mode at the end of a qwen3_5 / qwen3_5_moe / qwen4_exp
-   * turn: their disk cache, which {@link coldEnabled} does not see. For
-   * qwen4_exp the model's own `stateTierMode()`; for the others the most
+   * / hy_v4_flash turn: their disk cache, which {@link coldEnabled} does not see. For
+   * qwen4_exp and hy_v4_flash the model's own `stateTierMode()`; for the others the most
    * lasting mode over the engine's loaded models
    * (`memoryGovernorStatus().dflash2States.disk`). Absent for every other family.
    */

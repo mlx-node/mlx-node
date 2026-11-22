@@ -21,8 +21,13 @@ constexpr char gdn_prefill_chain_source[] =
 
 class GdnFusedStepCuda : public Primitive {
 public:
-  GdnFusedStepCuda(Stream stream, float eps, bool tiled, bool has_dst)
-      : Primitive(stream), eps_(eps), tiled_(tiled), has_dst_(has_dst) {}
+  GdnFusedStepCuda(
+      Stream stream, float eps, bool tiled, bool has_dst, bool sigmoid_gate)
+      : Primitive(stream),
+        eps_(eps),
+        tiled_(tiled),
+        has_dst_(has_dst),
+        sigmoid_gate_(sigmoid_gate) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDN fused step CUDA requires a GPU");
@@ -36,12 +41,21 @@ public:
     owned.push_back(cu::ensure_row_contiguous_aligned<8>(inputs[1], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<8>(inputs[2], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder));
-    owned.push_back(cu::ensure_row_contiguous_aligned<2>(inputs[4], stream(), encoder));
+    owned.push_back(
+        inputs[4].dtype() == bfloat16
+            ? cu::ensure_row_contiguous_aligned<2>(inputs[4], stream(), encoder)
+            : cu::ensure_row_contiguous_aligned<4>(inputs[4], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<16>(inputs[5], stream(), encoder));
     owned.push_back(inputs[6]);
-    owned.push_back(cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder));
+    owned.push_back(
+        inputs[7].dtype() == bfloat16
+            ? cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder)
+            : cu::ensure_row_contiguous_aligned<4>(inputs[7], stream(), encoder));
     const auto& z = owned[6];
-    if (z.strides(-1) != 1) {
+    const bool z_strided_ok =
+        (z.ndim() == 3 && z.strides(2) == 1) ||
+        (z.ndim() == 4 && z.strides(3) == 1 && z.strides(2) == 128);
+    if (!z_strided_ok) {
       owned[6] = contiguous_copy_gpu(z, stream());
       encoder.add_temporary(owned[6]);
     }
@@ -69,7 +83,9 @@ public:
 
     const auto& v = owned[2];
     const auto& q = owned[0];
+    const auto& beta = owned[4];
     const auto& z_bound = owned[6];
+    const auto& w = owned[7];
     const int B = v.shape(0);
     const int T = v.shape(1);
     const int Hv = v.shape(2);
@@ -90,8 +106,15 @@ public:
     args.append<int64_t>(z_bound.strides(1));
     args.append<float>(eps_);
     args.append<int32_t>(tiled_ ? 1 : 0);
-    auto kernel = cu::jit_kernel(
-        encoder.device(), gdn_fused_step_source, "mlx_gdn_fused_step_cuda_kernel");
+    args.append<int32_t>(w.dtype() == float32 ? 1 : 0);
+    static constexpr const char* kEntries[2][2] = {
+        {"mlx_gdn_fused_step_cuda_kernel<false,false>",
+         "mlx_gdn_fused_step_cuda_kernel<false,true>"},
+        {"mlx_gdn_fused_step_cuda_kernel<true,false>",
+         "mlx_gdn_fused_step_cuda_kernel<true,true>"},
+    };
+    const char* entry = kEntries[beta.dtype() == bfloat16][sigmoid_gate_];
+    auto kernel = cu::jit_kernel(encoder.device(), gdn_fused_step_source, entry);
     encoder.add_kernel_node_raw(
         kernel, dim3(Hv, B, 1), dim3(1024, 1, 1), {}, 0, args.args());
   }
@@ -100,7 +123,7 @@ public:
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const GdnFusedStepCuda*>(&other);
     return rhs && rhs->eps_ == eps_ && rhs->tiled_ == tiled_ &&
-        rhs->has_dst_ == has_dst_;
+        rhs->has_dst_ == has_dst_ && rhs->sigmoid_gate_ == sigmoid_gate_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     const auto& v = inputs[2];
@@ -111,6 +134,7 @@ private:
   float eps_;
   bool tiled_;
   bool has_dst_;
+  bool sigmoid_gate_;
 };
 
 class GdnReplayCuda : public UnaryPrimitive {
@@ -131,7 +155,10 @@ public:
     owned.push_back(cu::ensure_row_contiguous_aligned<8>(inputs[0], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<2>(inputs[1], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<4>(inputs[2], stream(), encoder));
-    owned.push_back(cu::ensure_row_contiguous_aligned<2>(inputs[3], stream(), encoder));
+    owned.push_back(
+        inputs[3].dtype() == bfloat16
+            ? cu::ensure_row_contiguous_aligned<2>(inputs[3], stream(), encoder)
+            : cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder));
     owned.push_back(cu::ensure_row_contiguous_aligned<16>(inputs[4], stream(), encoder));
     for (const auto& input : owned) {
       encoder.set_input_array(input);
@@ -141,6 +168,7 @@ public:
 
     const auto& k = owned[0];
     const auto& v = owned[1];
+    const auto& beta = owned[3];
     const int B = v.shape(0);
     const int window_stride = v.shape(1);
     const int Hv = v.shape(2);
@@ -156,8 +184,10 @@ public:
     args.append<int32_t>(Hk);
     args.append<int32_t>(Hv);
     args.append<int32_t>(tiled_ ? 1 : 0);
-    auto kernel = cu::jit_kernel(
-        encoder.device(), gdn_fused_step_source, "mlx_gdn_replay_cuda_kernel");
+    const char* entry = (beta.dtype() == bfloat16)
+        ? "mlx_gdn_replay_cuda_kernel<true>"
+        : "mlx_gdn_replay_cuda_kernel<false>";
+    auto kernel = cu::jit_kernel(encoder.device(), gdn_fused_step_source, entry);
     encoder.add_kernel_node_raw(
         kernel, dim3(Hv * 4, B, 1), dim3(256, 1, 1), {}, 0, args.args());
   }
@@ -224,7 +254,20 @@ public:
          {"mlx_gdn_prepare_cuda_kernel<true,true,false>",
           "mlx_gdn_prepare_cuda_kernel<true,true,true>"}},
     };
-    const std::string_view entry = kPrepEntries[a_bf16][b_bf16][beta_bf16_];
+    static constexpr const char* kPrepTiledEntries[2][2][2] = {
+        {{"mlx_gdn_prepare_tiled_cuda_kernel<false,false,false>",
+          "mlx_gdn_prepare_tiled_cuda_kernel<false,false,true>"},
+         {"mlx_gdn_prepare_tiled_cuda_kernel<false,true,false>",
+          "mlx_gdn_prepare_tiled_cuda_kernel<false,true,true>"}},
+        {{"mlx_gdn_prepare_tiled_cuda_kernel<true,false,false>",
+          "mlx_gdn_prepare_tiled_cuda_kernel<true,false,true>"},
+         {"mlx_gdn_prepare_tiled_cuda_kernel<true,true,false>",
+          "mlx_gdn_prepare_tiled_cuda_kernel<true,true,true>"}},
+    };
+    const bool use_tiled = (T >= 16);
+    const std::string_view entry = use_tiled
+        ? kPrepTiledEntries[a_bf16][b_bf16][beta_bf16_]
+        : kPrepEntries[a_bf16][b_bf16][beta_bf16_];
     auto kernel = cu::jit_kernel(encoder.device(), gdn_prepare_source, entry);
 
     cu::KernelArgs args;
@@ -245,8 +288,11 @@ public:
     args.append<int64_t>(history.strides(1));
     args.append<int32_t>(mean_eps_ ? 1 : 0);
 
+    const uint32_t grid_y = use_tiled
+        ? static_cast<uint32_t>((T + 31) / 32)
+        : static_cast<uint32_t>(T);
     encoder.add_kernel_node_raw(
-        kernel, dim3(20, T, 1), dim3(32, 4, 1), {}, 0, args.args());
+        kernel, dim3(20, grid_y, 1), dim3(32, 4, 1), {}, 0, args.args());
   }
 
   DEFINE_NAME(GdnPrepareCuda)
@@ -268,11 +314,14 @@ private:
 
 class GdnPrefillChainCuda : public Primitive {
 public:
-  GdnPrefillChainCuda(Stream stream, int tiled_heads, bool fuse_gated_norm, float eps)
+  GdnPrefillChainCuda(
+      Stream stream, int tiled_heads, bool fuse_gated_norm, float eps,
+      bool sigmoid_gate = false)
       : Primitive(stream),
         tiled_heads_(tiled_heads),
         fuse_gated_norm_(fuse_gated_norm),
-        eps_(eps) {}
+        eps_(eps),
+        sigmoid_gate_(sigmoid_gate) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDN prefill chain CUDA requires a GPU");
@@ -284,7 +333,9 @@ public:
     array k = cu::ensure_row_contiguous_aligned<8>(inputs[1], stream(), encoder);
     array v = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
     array g = cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
-    array beta = cu::ensure_row_contiguous_aligned<2>(inputs[4], stream(), encoder);
+    array beta = inputs[4].dtype() == bfloat16
+        ? cu::ensure_row_contiguous_aligned<2>(inputs[4], stream(), encoder)
+        : cu::ensure_row_contiguous_aligned<4>(inputs[4], stream(), encoder);
     array state = cu::ensure_row_contiguous_aligned<16>(inputs[5], stream(), encoder);
 
     const int W = q.shape(1);
@@ -304,14 +355,9 @@ public:
     encoder.set_input_array(state);
 
     int64_t z_stride_t = 0;
-    cu::KernelArgs args;
-    args.append(q);
-    args.append(k);
-    args.append(v);
-    args.append(g);
-    args.append(beta);
-    args.append(state);
-
+    int32_t w_is_f32 = 0;
+    array z_owned(0.0f);
+    array w_owned(0.0f);
     if (fuse_gated_norm_) {
       array z = inputs[6];
       const bool z_strided_ok =
@@ -322,26 +368,45 @@ public:
         encoder.add_temporary(z);
       }
       z_stride_t = z.strides(1);
-      array w = cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder);
-      encoder.set_input_array(z);
-      encoder.set_input_array(w);
-      args.append(z);
-      args.append(w);
+      array w = inputs[7].dtype() == bfloat16
+          ? cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder)
+          : cu::ensure_row_contiguous_aligned<4>(inputs[7], stream(), encoder);
+      w_is_f32 = (w.dtype() == float32) ? 1 : 0;
+      z_owned = std::move(z);
+      w_owned = std::move(w);
+    }
+
+    cu::KernelArgs args;
+    args.append(q);
+    args.append(k);
+    args.append(v);
+    args.append(g);
+    args.append(beta);
+    args.append(state);
+    if (fuse_gated_norm_) {
+      encoder.set_input_array(z_owned);
+      encoder.set_input_array(w_owned);
+      args.append(z_owned);
+      args.append(w_owned);
     } else {
       args.append<CUdeviceptr>(0);
       args.append<CUdeviceptr>(0);
     }
-
     encoder.set_output_array(y_out);
     encoder.set_output_array(state_out);
 
-    static constexpr const char* kEntries[2][2] = {
-        {"mlx_gdn_prefill_chain_cuda_kernel<false,false>",
-         "mlx_gdn_prefill_chain_cuda_kernel<false,true>"},
-        {"mlx_gdn_prefill_chain_cuda_kernel<true,false>",
-         "mlx_gdn_prefill_chain_cuda_kernel<true,true>"},
+    static constexpr const char* kEntries[2][2][2] = {
+        {{"mlx_gdn_prefill_chain_cuda_kernel<false,false,false>",
+          "mlx_gdn_prefill_chain_cuda_kernel<false,false,true>"},
+         {"mlx_gdn_prefill_chain_cuda_kernel<false,true,false>",
+          "mlx_gdn_prefill_chain_cuda_kernel<false,true,true>"}},
+        {{"mlx_gdn_prefill_chain_cuda_kernel<true,false,false>",
+          "mlx_gdn_prefill_chain_cuda_kernel<true,false,true>"},
+         {"mlx_gdn_prefill_chain_cuda_kernel<true,true,false>",
+          "mlx_gdn_prefill_chain_cuda_kernel<true,true,true>"}},
     };
-    const char* entry = kEntries[beta.dtype() == bfloat16][fuse_gated_norm_];
+    const bool sg = fuse_gated_norm_ && sigmoid_gate_;
+    const char* entry = kEntries[beta.dtype() == bfloat16][fuse_gated_norm_][sg];
     auto kernel = cu::jit_kernel(encoder.device(), gdn_prefill_chain_source, entry);
     args.append(y_out);
     args.append(state_out);
@@ -351,6 +416,7 @@ public:
     args.append<int32_t>(tiled_heads_);
     args.append<int64_t>(z_stride_t);
     args.append<float>(eps_);
+    args.append<int32_t>(w_is_f32);
     encoder.add_kernel_node_raw(
         kernel, dim3(hv, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
   }
@@ -359,7 +425,8 @@ public:
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const GdnPrefillChainCuda*>(&other);
     return rhs && rhs->tiled_heads_ == tiled_heads_ &&
-        rhs->fuse_gated_norm_ == fuse_gated_norm_ && rhs->eps_ == eps_;
+        rhs->fuse_gated_norm_ == fuse_gated_norm_ && rhs->eps_ == eps_ &&
+        rhs->sigmoid_gate_ == sigmoid_gate_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     if (fuse_gated_norm_) {
@@ -373,12 +440,18 @@ private:
   int tiled_heads_;
   bool fuse_gated_norm_;
   float eps_;
+  bool sigmoid_gate_;
 };
 
 class GdnDeferredStepCuda : public Primitive {
 public:
-  GdnDeferredStepCuda(Stream stream, int prev_keep, float eps, bool tiled)
-      : Primitive(stream), prev_keep_(prev_keep), eps_(eps), tiled_(tiled) {}
+  GdnDeferredStepCuda(
+      Stream stream, int prev_keep, float eps, bool tiled, bool sigmoid_gate)
+      : Primitive(stream),
+        prev_keep_(prev_keep),
+        eps_(eps),
+        tiled_(tiled),
+        sigmoid_gate_(sigmoid_gate) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDN deferred step CUDA requires a GPU");
@@ -403,7 +476,9 @@ public:
       z = contiguous_copy_gpu(z, stream());
       encoder.add_temporary(z);
     }
-    array w = cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder);
+    array w = inputs[7].dtype() == bfloat16
+        ? cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder)
+        : cu::ensure_row_contiguous_aligned<4>(inputs[7], stream(), encoder);
 
     encoder.set_input_array(q);
     encoder.set_input_array(k);
@@ -479,14 +554,20 @@ public:
     args.append<int64_t>(z.strides(1));
     args.append<float>(eps_);
     args.append<int32_t>(tiled_ ? 1 : 0);
+    args.append<int32_t>(w.dtype() == float32 ? 1 : 0);
 
-    static constexpr const char* kEntries[2][2] = {
-        {"mlx_gdn_deferred_step_cuda_kernel<false,false>",
-         "mlx_gdn_deferred_step_cuda_kernel<false,true>"},
-        {"mlx_gdn_deferred_step_cuda_kernel<true,false>",
-         "mlx_gdn_deferred_step_cuda_kernel<true,true>"},
+    static constexpr const char* kEntries[2][2][2] = {
+        {{"mlx_gdn_deferred_step_cuda_kernel<false,false,false>",
+          "mlx_gdn_deferred_step_cuda_kernel<false,false,true>"},
+         {"mlx_gdn_deferred_step_cuda_kernel<false,true,false>",
+          "mlx_gdn_deferred_step_cuda_kernel<false,true,true>"}},
+        {{"mlx_gdn_deferred_step_cuda_kernel<true,false,false>",
+          "mlx_gdn_deferred_step_cuda_kernel<true,false,true>"},
+         {"mlx_gdn_deferred_step_cuda_kernel<true,true,false>",
+          "mlx_gdn_deferred_step_cuda_kernel<true,true,true>"}},
     };
-    const char* entry = kEntries[beta.dtype() == bfloat16][prev_beta_bf16];
+    const char* entry =
+        kEntries[beta.dtype() == bfloat16][prev_beta_bf16][sigmoid_gate_];
     auto kernel = cu::jit_kernel(encoder.device(), gdn_fused_step_source, entry);
     encoder.add_kernel_node_raw(
         kernel, dim3(Hv, B, 1), dim3(512, 1, 1), {}, 0, args.args());
@@ -496,7 +577,7 @@ public:
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const GdnDeferredStepCuda*>(&other);
     return rhs && rhs->prev_keep_ == prev_keep_ && rhs->eps_ == eps_ &&
-        rhs->tiled_ == tiled_;
+        rhs->tiled_ == tiled_ && rhs->sigmoid_gate_ == sigmoid_gate_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     const auto& v = inputs[2];
@@ -511,17 +592,20 @@ private:
   int prev_keep_;
   float eps_;
   bool tiled_;
+  bool sigmoid_gate_;
 };
 
 class GdnTreeStepCuda : public Primitive {
 public:
   GdnTreeStepCuda(
-      Stream stream, int prev_keep, bool has_prev_indices, float eps, bool tiled)
+      Stream stream, int prev_keep, bool has_prev_indices, float eps,
+      bool tiled, bool sigmoid_gate)
       : Primitive(stream),
         prev_keep_(prev_keep),
         has_prev_indices_(has_prev_indices),
         eps_(eps),
-        tiled_(tiled) {}
+        tiled_(tiled),
+        sigmoid_gate_(sigmoid_gate) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDN tree step CUDA requires a GPU");
@@ -546,7 +630,9 @@ public:
       z = contiguous_copy_gpu(z, stream());
       encoder.add_temporary(z);
     }
-    array w = cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder);
+    array w = inputs[7].dtype() == bfloat16
+        ? cu::ensure_row_contiguous_aligned<2>(inputs[7], stream(), encoder)
+        : cu::ensure_row_contiguous_aligned<4>(inputs[7], stream(), encoder);
     array parent = cu::ensure_row_contiguous_aligned<4>(inputs[8], stream(), encoder);
 
     encoder.set_input_array(q);
@@ -634,14 +720,20 @@ public:
     args.append<int64_t>(z.strides(1));
     args.append<float>(eps_);
     args.append<int32_t>(tiled_ ? 1 : 0);
+    args.append<int32_t>(w.dtype() == float32 ? 1 : 0);
 
-    static constexpr const char* kEntries[2][2] = {
-        {"mlx_gdn_tree_step_cuda_kernel<false,false>",
-         "mlx_gdn_tree_step_cuda_kernel<false,true>"},
-        {"mlx_gdn_tree_step_cuda_kernel<true,false>",
-         "mlx_gdn_tree_step_cuda_kernel<true,true>"},
+    static constexpr const char* kEntries[2][2][2] = {
+        {{"mlx_gdn_tree_step_cuda_kernel<false,false,false>",
+          "mlx_gdn_tree_step_cuda_kernel<false,false,true>"},
+         {"mlx_gdn_tree_step_cuda_kernel<false,true,false>",
+          "mlx_gdn_tree_step_cuda_kernel<false,true,true>"}},
+        {{"mlx_gdn_tree_step_cuda_kernel<true,false,false>",
+          "mlx_gdn_tree_step_cuda_kernel<true,false,true>"},
+         {"mlx_gdn_tree_step_cuda_kernel<true,true,false>",
+          "mlx_gdn_tree_step_cuda_kernel<true,true,true>"}},
     };
-    const char* entry = kEntries[beta.dtype() == bfloat16][prev_beta_bf16];
+    const char* entry =
+        kEntries[beta.dtype() == bfloat16][prev_beta_bf16][sigmoid_gate_];
     auto kernel = cu::jit_kernel(encoder.device(), gdn_fused_step_source, entry);
     encoder.add_kernel_node_raw(
         kernel, dim3(Hv, B, 1), dim3(512, 1, 1), {}, 0, args.args());
@@ -652,7 +744,8 @@ public:
     const auto* rhs = dynamic_cast<const GdnTreeStepCuda*>(&other);
     return rhs && rhs->prev_keep_ == prev_keep_ &&
         rhs->has_prev_indices_ == has_prev_indices_ &&
-        rhs->eps_ == eps_ && rhs->tiled_ == tiled_;
+        rhs->eps_ == eps_ && rhs->tiled_ == tiled_ &&
+        rhs->sigmoid_gate_ == sigmoid_gate_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     const auto& v = inputs[2];
@@ -668,16 +761,17 @@ private:
   bool has_prev_indices_;
   float eps_;
   bool tiled_;
+  bool sigmoid_gate_;
 };
 
 } // namespace
 } // namespace mlx::core
 #endif
 
-extern "C" bool mlx_gdn_fused_step_cuda(
+extern "C" bool mlx_gdn_fused_step_cuda_ex(
     mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
     mlx_array* state, mlx_array* z, mlx_array* w, float eps, int32_t tiled_heads,
-    mlx_array* state_dst, mlx_array** out, mlx_array** out_state) {
+    bool sigmoid_gate, mlx_array* state_dst, mlx_array** out, mlx_array** out_state) {
 #ifdef MLX_NODE_CUDA_ENABLED
   if (out) {
     *out = nullptr;
@@ -702,7 +796,7 @@ extern "C" bool mlx_gdn_fused_step_cuda(
     const auto& za = *reinterpret_cast<array*>(z);
     const auto& wa = *reinterpret_cast<array*>(w);
     if (qa.ndim() != 4 || ka.ndim() != 4 || va.ndim() != 4 || ga.ndim() != 3 ||
-        ba.ndim() != 3 || za.ndim() < 2 || wa.ndim() != 1) {
+        ba.ndim() != 3 || (za.ndim() != 3 && za.ndim() != 4) || wa.ndim() != 1) {
       return false;
     }
     const int B = va.shape(0);
@@ -711,15 +805,20 @@ extern "C" bool mlx_gdn_fused_step_cuda(
     const int Dv = va.shape(3);
     const int Hk = qa.shape(2);
     const int Dk = qa.shape(3);
+    const bool z_shape_ok =
+        (za.ndim() == 3 && za.shape(0) == B && za.shape(1) == T &&
+         za.shape(2) == Hv * Dv) ||
+        (za.ndim() == 4 && za.shape(0) == B && za.shape(1) == T &&
+         za.shape(2) == Hv && za.shape(3) == Dv);
     if (T < 1 || T > 32 || Dk != 128 || Dv != 128 || Hk <= 0 || Hv % Hk != 0 ||
         qa.shape() != Shape{B, T, Hk, Dk} || ka.shape() != qa.shape() ||
         ga.shape() != Shape{B, T, Hv} || ba.shape() != ga.shape() ||
-        sa.shape() != Shape{B, Hv, Dv, Dk} || za.shape(0) != B ||
-        za.shape(1) != T || za.shape(-1) != Hv * Dv || wa.shape() != Shape{Dv}) {
+        sa.shape() != Shape{B, Hv, Dv, Dk} || !z_shape_ok || wa.shape() != Shape{Dv}) {
       return false;
     }
     if (qa.dtype() != bfloat16 || ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
-        ba.dtype() != bfloat16 || za.dtype() != bfloat16 || wa.dtype() != bfloat16 ||
+        (ba.dtype() != bfloat16 && ba.dtype() != float32) || za.dtype() != bfloat16 ||
+        (wa.dtype() != bfloat16 && wa.dtype() != float32) ||
         ga.dtype() != float32 || sa.dtype() != float32) {
       return false;
     }
@@ -736,20 +835,31 @@ extern "C" bool mlx_gdn_fused_step_cuda(
     auto outputs = array::make_arrays(
         {Shape{B, T, Hv * Dv}, sa.shape()}, {bfloat16, float32},
         std::make_shared<GdnFusedStepCuda>(
-            stream, eps, tiled_heads != 0, state_dst != nullptr),
+            stream, eps, tiled_heads != 0, state_dst != nullptr, sigmoid_gate),
         std::move(inputs));
     *out = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
     *out_state = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));
     return true;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "mlx_gdn_fused_step_cuda: %s\n", error.what());
+    std::fprintf(stderr, "mlx_gdn_fused_step_cuda_ex: %s\n", error.what());
     return false;
   }
 #else
   (void)q; (void)k; (void)v; (void)g; (void)beta; (void)state; (void)z; (void)w;
-  (void)eps; (void)tiled_heads; (void)state_dst; (void)out; (void)out_state;
+  (void)eps; (void)tiled_heads; (void)sigmoid_gate; (void)state_dst;
+  if (out) { *out = nullptr; }
+  if (out_state) { *out_state = nullptr; }
   return false;
 #endif
+}
+
+extern "C" bool mlx_gdn_fused_step_cuda(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
+    mlx_array* state, mlx_array* z, mlx_array* w, float eps, int32_t tiled_heads,
+    mlx_array* state_dst, mlx_array** out, mlx_array** out_state) {
+  return mlx_gdn_fused_step_cuda_ex(
+      q, k, v, g, beta, state, z, w, eps, tiled_heads, false, state_dst, out,
+      out_state);
 }
 
 extern "C" bool mlx_gdn_replay_cuda(
@@ -788,7 +898,7 @@ extern "C" bool mlx_gdn_replay_cuda(
       return false;
     }
     if (ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
-        ba.dtype() != bfloat16 || ga.dtype() != float32 ||
+        (ba.dtype() != bfloat16 && ba.dtype() != float32) || ga.dtype() != float32 ||
         sa.dtype() != float32) {
       return false;
     }
@@ -805,7 +915,8 @@ extern "C" bool mlx_gdn_replay_cuda(
   }
 #else
   (void)k; (void)v; (void)g; (void)beta; (void)state;
-  (void)accepted_steps; (void)tiled_heads; (void)out_state;
+  (void)accepted_steps; (void)tiled_heads;
+  if (out_state) { *out_state = nullptr; }
   return false;
 #endif
 }
@@ -836,7 +947,7 @@ extern "C" bool mlx_gdn_prepare_cuda(
     }
     const auto& x = in[0];
     if (x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 1 ||
-        x.shape(1) > 4096 || x.shape(2) != 10240 || x.dtype() != bfloat16) {
+        x.shape(1) > 65535 || x.shape(2) != 10240 || x.dtype() != bfloat16) {
       return false;
     }
     const int T = x.shape(1);
@@ -922,7 +1033,8 @@ extern "C" bool mlx_gdn_prefill_chain_cuda(
     auto results = array::make_arrays(
         {va.shape(), sa.shape()},
         {bfloat16, float32},
-        std::make_shared<GdnPrefillChainCuda>(stream, tiled_heads ? 1 : 0, false, 0.0f),
+        std::make_shared<GdnPrefillChainCuda>(
+            stream, tiled_heads ? 1 : 0, false, 0.0f, false),
         {qa, ka, va, ga, ba, sa});
     *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
     *out_state = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
@@ -933,15 +1045,17 @@ extern "C" bool mlx_gdn_prefill_chain_cuda(
   }
 #else
   (void)q; (void)k; (void)v; (void)g; (void)beta; (void)state;
-  (void)tiled_heads; (void)out_y; (void)out_state;
+  (void)tiled_heads;
+  if (out_y) { *out_y = nullptr; }
+  if (out_state) { *out_state = nullptr; }
   return false;
 #endif
 }
 
-extern "C" bool mlx_gdn_prefill_chain_gated_cuda(
+extern "C" bool mlx_gdn_prefill_chain_gated_cuda_ex(
     mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
     mlx_array* state, mlx_array* z, mlx_array* norm_weight,
-    float eps, int32_t tiled_heads,
+    float eps, int32_t tiled_heads, bool sigmoid_gate,
     mlx_array** out_y, mlx_array** out_state) {
 #ifdef MLX_NODE_CUDA_ENABLED
   if (out_y) {
@@ -972,7 +1086,8 @@ extern "C" bool mlx_gdn_prefill_chain_gated_cuda(
         za.shape(0) != 1 ||
         qa.dtype() != bfloat16 || ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
         ga.dtype() != float32 || (ba.dtype() != bfloat16 && ba.dtype() != float32) ||
-        sa.dtype() != float32 || za.dtype() != bfloat16 || wa.dtype() != bfloat16) {
+        sa.dtype() != float32 || za.dtype() != bfloat16 ||
+        (wa.dtype() != bfloat16 && wa.dtype() != float32)) {
       return false;
     }
     const int W = qa.shape(1);
@@ -994,29 +1109,42 @@ extern "C" bool mlx_gdn_prefill_chain_gated_cuda(
     auto results = array::make_arrays(
         {Shape{1, W, hv * 128}, sa.shape()},
         {bfloat16, float32},
-        std::make_shared<GdnPrefillChainCuda>(stream, tiled_heads ? 1 : 0, true, eps),
+        std::make_shared<GdnPrefillChainCuda>(
+            stream, tiled_heads ? 1 : 0, true, eps, sigmoid_gate),
         {qa, ka, va, ga, ba, sa, za, wa});
     *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
     *out_state = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
     return true;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "mlx_gdn_prefill_chain_gated_cuda: %s\n", error.what());
+    std::fprintf(stderr, "mlx_gdn_prefill_chain_gated_cuda_ex: %s\n", error.what());
     return false;
   }
 #else
   (void)q; (void)k; (void)v; (void)g; (void)beta; (void)state;
-  (void)z; (void)norm_weight; (void)eps; (void)tiled_heads;
-  (void)out_y; (void)out_state;
+  (void)z; (void)norm_weight; (void)eps; (void)tiled_heads; (void)sigmoid_gate;
+  if (out_y) { *out_y = nullptr; }
+  if (out_state) { *out_state = nullptr; }
   return false;
 #endif
 }
 
-extern "C" bool mlx_gdn_fused_step_deferred_cuda(
+extern "C" bool mlx_gdn_prefill_chain_gated_cuda(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
+    mlx_array* state, mlx_array* z, mlx_array* norm_weight,
+    float eps, int32_t tiled_heads,
+    mlx_array** out_y, mlx_array** out_state) {
+  return mlx_gdn_prefill_chain_gated_cuda_ex(
+      q, k, v, g, beta, state, z, norm_weight, eps, tiled_heads, false,
+      out_y, out_state);
+}
+
+extern "C" bool mlx_gdn_fused_step_deferred_cuda_ex(
     mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
     mlx_array* state_base,
     mlx_array* prev_k, mlx_array* prev_v, mlx_array* prev_g, mlx_array* prev_beta,
     int32_t prev_keep,
     mlx_array* z, mlx_array* norm_weight, float eps, int32_t tiled_heads,
+    bool sigmoid_gate,
     mlx_array** out_y, mlx_array** out_committed_state) {
 #ifdef MLX_NODE_CUDA_ENABLED
   if (out_y) {
@@ -1067,7 +1195,8 @@ extern "C" bool mlx_gdn_fused_step_deferred_cuda(
     }
     if (qa.dtype() != bfloat16 || ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
         ga.dtype() != float32 || (ba.dtype() != bfloat16 && ba.dtype() != float32) ||
-        sa.dtype() != float32 || za.dtype() != bfloat16 || wa.dtype() != bfloat16) {
+        sa.dtype() != float32 || za.dtype() != bfloat16 ||
+        (wa.dtype() != bfloat16 && wa.dtype() != float32)) {
       return false;
     }
     std::vector<array> inputs{qa, ka, va, ga, ba, sa, za, wa};
@@ -1104,7 +1233,7 @@ extern "C" bool mlx_gdn_fused_step_deferred_cuda(
       auto results = array::make_arrays(
           {y_shape, sa.shape()}, {bfloat16, float32},
           std::make_shared<GdnDeferredStepCuda>(
-              stream, prev_keep, eps, tiled_heads != 0),
+              stream, prev_keep, eps, tiled_heads != 0, sigmoid_gate),
           std::move(inputs));
       *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
       *out_committed_state =
@@ -1112,26 +1241,42 @@ extern "C" bool mlx_gdn_fused_step_deferred_cuda(
     } else {
       auto results = array::make_arrays(
           {y_shape}, {bfloat16},
-          std::make_shared<GdnDeferredStepCuda>(stream, 0, eps, tiled_heads != 0),
+          std::make_shared<GdnDeferredStepCuda>(
+              stream, 0, eps, tiled_heads != 0, sigmoid_gate),
           std::move(inputs));
       *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
       *out_committed_state = reinterpret_cast<mlx_array*>(new array(sa));
     }
     return true;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "mlx_gdn_fused_step_deferred_cuda: %s\n", error.what());
+    std::fprintf(stderr, "mlx_gdn_fused_step_deferred_cuda_ex: %s\n", error.what());
     return false;
   }
 #else
   (void)q; (void)k; (void)v; (void)g; (void)beta; (void)state_base;
   (void)prev_k; (void)prev_v; (void)prev_g; (void)prev_beta;
   (void)prev_keep; (void)z; (void)norm_weight; (void)eps; (void)tiled_heads;
-  (void)out_y; (void)out_committed_state;
+  (void)sigmoid_gate;
+  if (out_y) { *out_y = nullptr; }
+  if (out_committed_state) { *out_committed_state = nullptr; }
   return false;
 #endif
 }
 
-extern "C" bool mlx_gdn_tree_step_cuda(
+extern "C" bool mlx_gdn_fused_step_deferred_cuda(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
+    mlx_array* state_base,
+    mlx_array* prev_k, mlx_array* prev_v, mlx_array* prev_g, mlx_array* prev_beta,
+    int32_t prev_keep,
+    mlx_array* z, mlx_array* norm_weight, float eps, int32_t tiled_heads,
+    mlx_array** out_y, mlx_array** out_committed_state) {
+  return mlx_gdn_fused_step_deferred_cuda_ex(
+      q, k, v, g, beta, state_base, prev_k, prev_v, prev_g, prev_beta,
+      prev_keep, z, norm_weight, eps, tiled_heads, false, out_y,
+      out_committed_state);
+}
+
+extern "C" bool mlx_gdn_tree_step_cuda_ex(
     mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
     mlx_array* state_base,
     mlx_array* prev_k, mlx_array* prev_v, mlx_array* prev_g, mlx_array* prev_beta,
@@ -1139,6 +1284,7 @@ extern "C" bool mlx_gdn_tree_step_cuda(
     mlx_array* prev_indices,
     mlx_array* parent,
     mlx_array* z, mlx_array* norm_weight, float eps, int32_t tiled_heads,
+    bool sigmoid_gate,
     mlx_array** out_y, mlx_array** out_committed_state) {
 #ifdef MLX_NODE_CUDA_ENABLED
   if (out_y) {
@@ -1191,7 +1337,7 @@ extern "C" bool mlx_gdn_tree_step_cuda(
     if (qa.dtype() != bfloat16 || ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
         ga.dtype() != float32 || (ba.dtype() != bfloat16 && ba.dtype() != float32) ||
         sa.dtype() != float32 || pa.dtype() != int32 || za.dtype() != bfloat16 ||
-        wa.dtype() != bfloat16) {
+        (wa.dtype() != bfloat16 && wa.dtype() != float32)) {
       return false;
     }
     std::vector<array> inputs{qa, ka, va, ga, ba, sa, za, wa, pa};
@@ -1238,7 +1384,8 @@ extern "C" bool mlx_gdn_tree_step_cuda(
       auto results = array::make_arrays(
           {y_shape, sa.shape()}, {bfloat16, float32},
           std::make_shared<GdnTreeStepCuda>(
-              stream, prev_keep, has_prev_indices, eps, tiled_heads != 0),
+              stream, prev_keep, has_prev_indices, eps, tiled_heads != 0,
+              sigmoid_gate),
           std::move(inputs));
       *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
       *out_committed_state =
@@ -1247,22 +1394,38 @@ extern "C" bool mlx_gdn_tree_step_cuda(
       auto results = array::make_arrays(
           {y_shape}, {bfloat16},
           std::make_shared<GdnTreeStepCuda>(
-              stream, 0, false, eps, tiled_heads != 0),
+              stream, 0, false, eps, tiled_heads != 0, sigmoid_gate),
           std::move(inputs));
       *out_y = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
       *out_committed_state = reinterpret_cast<mlx_array*>(new array(sa));
     }
     return true;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "mlx_gdn_tree_step_cuda: %s\n", error.what());
+    std::fprintf(stderr, "mlx_gdn_tree_step_cuda_ex: %s\n", error.what());
     return false;
   }
 #else
   (void)q; (void)k; (void)v; (void)g; (void)beta; (void)state_base;
   (void)prev_k; (void)prev_v; (void)prev_g; (void)prev_beta;
   (void)prev_keep; (void)prev_indices; (void)parent;
-  (void)z; (void)norm_weight; (void)eps; (void)tiled_heads;
-  (void)out_y; (void)out_committed_state;
+  (void)z; (void)norm_weight; (void)eps; (void)tiled_heads; (void)sigmoid_gate;
+  if (out_y) { *out_y = nullptr; }
+  if (out_committed_state) { *out_committed_state = nullptr; }
   return false;
 #endif
+}
+
+extern "C" bool mlx_gdn_tree_step_cuda(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
+    mlx_array* state_base,
+    mlx_array* prev_k, mlx_array* prev_v, mlx_array* prev_g, mlx_array* prev_beta,
+    int32_t prev_keep,
+    mlx_array* prev_indices,
+    mlx_array* parent,
+    mlx_array* z, mlx_array* norm_weight, float eps, int32_t tiled_heads,
+    mlx_array** out_y, mlx_array** out_committed_state) {
+  return mlx_gdn_tree_step_cuda_ex(
+      q, k, v, g, beta, state_base, prev_k, prev_v, prev_g, prev_beta,
+      prev_keep, prev_indices, parent, z, norm_weight, eps, tiled_heads, false,
+      out_y, out_committed_state);
 }

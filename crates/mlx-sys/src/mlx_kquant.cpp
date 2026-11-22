@@ -404,12 +404,15 @@ array quantized_matmul(const array &x, const array &w, const array &scales,
                std::move(inputs));
 }
 
-array gather_qmm(const array &x, const array &w, const array &scales,
-                 const std::optional<array> &biases,
-                 std::optional<array> lhs_indices_,
-                 std::optional<array> rhs_indices_, bool transpose,
-                 std::optional<int> group_size_, std::optional<int> bits_,
-                 Mode mode_, bool sorted_indices, StreamOrDevice s) {
+namespace {
+array gather_qmm_impl(const array &x, const array &w, const array &scales,
+                      const std::optional<array> &biases,
+                      std::optional<array> lhs_indices_,
+                      std::optional<array> rhs_indices_, bool transpose,
+                      std::optional<int> group_size_, std::optional<int> bits_,
+                      Mode mode_, bool sorted_indices, bool rhs_any_rows,
+                      bool allow_tf32, StreamOrDevice s, int max_y_tiles = 0,
+                      int max_group = 0) {
   const Mode mode = resolve_mode(mode_, bits_);
   if (!lhs_indices_ && !rhs_indices_) {
     return quantized_matmul(x, w, scales, biases, transpose, group_size_, bits_,
@@ -458,9 +461,39 @@ array gather_qmm(const array &x, const array &w, const array &scales,
                std::make_shared<KQuantGatherQMM>(
                    to_stream(s), group_size, bits, mode, transpose,
                    sorted_indices && !rhs_indices_,
-                   sorted_indices && !lhs_indices_),
+                   sorted_indices && !lhs_indices_, rhs_any_rows, allow_tf32,
+                   max_y_tiles, max_group),
                {astype(x, out_type, s), w, scales, *biases,
                 std::move(lhs_indices), std::move(rhs_indices)});
+}
+} // namespace
+
+array gather_qmm(const array &x, const array &w, const array &scales,
+                 const std::optional<array> &biases,
+                 std::optional<array> lhs_indices_,
+                 std::optional<array> rhs_indices_, bool transpose,
+                 std::optional<int> group_size_, std::optional<int> bits_,
+                 Mode mode_, bool sorted_indices, StreamOrDevice s) {
+  return gather_qmm_impl(x, w, scales, biases, std::move(lhs_indices_),
+                         std::move(rhs_indices_), transpose, group_size_,
+                         bits_, mode_, sorted_indices, false, false, s);
+}
+
+array gather_qmm_sorted_rhs(const array &x, const array &w,
+                            const array &scales,
+                            const std::optional<array> &biases,
+                            const array &rhs_indices,
+                            std::optional<int> group_size,
+                            std::optional<int> bits, Mode mode,
+                            StreamOrDevice s, bool allow_tf32,
+                            int max_y_tiles, int max_group) {
+  if (x.ndim() != rhs_indices.ndim() + 2 || x.shape(-2) != 1) {
+    throw std::invalid_argument(
+        "[gather_qmm_sorted_rhs] x must be rhs_indices' shape + [1, K].");
+  }
+  return gather_qmm_impl(x, w, scales, biases, std::nullopt, rhs_indices,
+                         true, group_size, bits, mode, true, true, allow_tf32,
+                         s, max_y_tiles, max_group);
 }
 
 array dequantize(const array &w, const array &scales,
@@ -523,7 +556,9 @@ bool KQuantGatherQMM::is_equivalent(const Primitive &other) const {
   const auto &o = static_cast<const KQuantGatherQMM &>(other);
   return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_ &&
          transpose_ == o.transpose_ && left_sorted_ == o.left_sorted_ &&
-         right_sorted_ == o.right_sorted_;
+         right_sorted_ == o.right_sorted_ && rhs_any_rows_ == o.rhs_any_rows_ &&
+         allow_tf32_ == o.allow_tf32_ && max_y_tiles_ == o.max_y_tiles_ &&
+         max_group_ == o.max_group_;
 }
 
 std::vector<Shape>
@@ -1441,6 +1476,38 @@ bool mlx_kquant_store_epilogue_route(const char *mode, int m, int n, int k) {
            kquant::store_epilogue_route(parsed->mode, m, n, k);
   } catch (const std::exception &) {
     return false;
+  }
+}
+
+mlx_array *mlx_kquant_gather_qmm_sorted_nax(mlx_array *x, mlx_array *w,
+                                            mlx_array *scales,
+                                            mlx_array *biases,
+                                            mlx_array *rhs_indices,
+                                            int group_size, int bits,
+                                            const char *mode, int max_y_tiles,
+                                            int max_group) {
+  using namespace mlx::core;
+  try {
+    if (!x || !w || !scales || !biases || !rhs_indices) {
+      return nullptr;
+    }
+    std::string mode_str(mode ? mode : "");
+    auto layout = kquant::parse_mode_layout(mode_str);
+    auto kmode = kquant::parse_mode(mode_str);
+    if (!layout || !kmode || layout->layout != kquant::Layout::RowMajor) {
+      throw std::invalid_argument(
+          "[gather_qmm_sorted_nax] needs a row-major K-quant mode, got '" +
+          mode_str + "'.");
+    }
+    auto result = kquant::gather_qmm_sorted_rhs(
+        *reinterpret_cast<array *>(x), *reinterpret_cast<array *>(w),
+        *reinterpret_cast<array *>(scales), *reinterpret_cast<array *>(biases),
+        *reinterpret_cast<array *>(rhs_indices), std::optional<int>(group_size),
+        std::optional<int>(bits), *kmode, {}, true, max_y_tiles, max_group);
+    return reinterpret_cast<mlx_array *>(new array(std::move(result)));
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_kquant_gather_qmm_sorted_nax: %s\n", e.what());
+    return nullptr;
   }
 }
 

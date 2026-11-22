@@ -18,6 +18,20 @@ export function disableThinkingForForcedToolCall(config: ChatConfig): void {
   config.includeReasoning = false;
 }
 
+/** vLLM `ResponsesRequest.check_tool_usage`: these choices are a 400. */
+export function validateToolChoice(req: Pick<ResponsesAPIRequest, 'tools' | 'tool_choice'>): void {
+  const choice = req.tool_choice;
+  const tools = req.tools ?? [];
+  if (choice === 'required' && tools.length === 0) {
+    throw new Error("Tool choice 'required' must be specified with 'tools' parameter.");
+  }
+  if (typeof choice === 'object' && choice !== null && choice.type === 'function') {
+    if (!choice.name || !tools.some((t) => t.name === choice.name)) {
+      throw new Error("Tool choice 'function' not found in 'tools' parameter.");
+    }
+  }
+}
+
 export function validateCacheSalt(cacheSalt: unknown): asserts cacheSalt is string {
   if (typeof cacheSalt !== 'string') {
     throw new Error('cache_salt must be a string');
@@ -307,16 +321,12 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
   if (req.reasoning?.effort) {
     config.reasoningEffort = req.reasoning.effort;
   }
+  validateToolChoice(req);
   if (req.tools && req.tools.length > 0) {
-    if (req.tool_choice === 'none') {
-      // Caller disabled tool use.
-    } else if (typeof req.tool_choice === 'object' && req.tool_choice?.type === 'function') {
+    if (typeof req.tool_choice === 'object' && req.tool_choice?.type === 'function') {
       const targetName = req.tool_choice.name;
-      const matched = req.tools.filter((t) => t.name === targetName);
-      if (matched.length > 0) {
-        config.tools = matched.map(mapTool);
-        disableThinkingForForcedToolCall(config);
-      }
+      config.tools = req.tools.filter((t) => t.name === targetName).map(mapTool);
+      disableThinkingForForcedToolCall(config);
     } else {
       config.tools = req.tools.map(mapTool);
       if (req.tool_choice === 'required') {

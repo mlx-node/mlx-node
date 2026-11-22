@@ -6,12 +6,16 @@
  * Hugging Face — use them verbatim.
  */
 
+import { totalmem } from 'node:os';
+
 import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+
+const GIB = 2 ** 30;
 
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /** HF slug for `mlx download model` — the UD-Q4_K_XL GGUF, every platform. */
+  /** HF slug for `mlx download model` — the GGUF build, every platform. */
   hfRepo: string;
   /**
    * HF slug on Linux + NVIDIA CUDA, when a platform-specific build exists.
@@ -54,10 +58,18 @@ export interface CatalogEntry {
   assetsRepo?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
+  /** Which product surface this catalog entry belongs to (default `'chat'`). */
+  category?: 'chat' | 'systemone';
   /** Optional companion, downloaded separately and never offered as a chat model. */
   draft?: { label: string; hfRepo: string; sizeGb: number };
   /** One line for the wizard. */
   description: string;
+  /**
+   * Physical RAM in GiB below which the model's load admission always
+   * refuses. Neither the wizard ({@link visibleCatalog}) nor the dashboard
+   * Models page offers the entry on a machine with less.
+   */
+  minMemoryGb?: number;
   /** Exactly one entry carries this. */
   isDefault?: boolean;
   /**
@@ -123,6 +135,20 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'MoE, fast decode',
   },
   {
+    // Shard 2 is the Engram table, read by row from SSD; the routed experts
+    // stream from SSD too, so the weights may exceed RAM. The loader reads the
+    // embedded GGUF tokenizer, never the sidecar files.
+    label: 'Hy4-flash',
+    hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+    globs: ['*Q4_K_M*'],
+    assetsRepo: 'tencent/Hy4-flash',
+    sizeGb: 168.3,
+    description: '512-expert MoE streamed from SSD, 256K context',
+    // The admission's fixed bytes at its floor (16K context, 2048-row chunk,
+    // MTP on, one staging layer): 26.52 GiB, plus the 12 GiB reserve.
+    minMemoryGb: 39,
+  },
+  {
     // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via
     // `mlx convert --q-recipe nvidia` on gemma-4-12b-it (coherent + tool
     // calling through `mlx agent`). Provisional slug — the user finalizes it
@@ -156,6 +182,36 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     sizeGb: 23,
     description: 'Hybrid Mamba-2 + MoE, native MTP, 1M context',
     hidden: true,
+  },
+  {
+    label: 'Clairic Flash (9B)',
+    hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic-flash',
+    sizeGb: 7.6,
+    category: 'systemone',
+    description: 'Fast 9B extraction, vision, PDF & forecasting (UD-Q4_K_XL)',
+  },
+  {
+    label: 'Clairic (27B)',
+    hfRepo: 'Brooooooklyn/Clairic-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic',
+    sizeGb: 18.9,
+    category: 'systemone',
+    description: 'High-accuracy 27B extraction, tables & PDFs (UD-Q4_K_XL)',
   },
 ];
 
@@ -265,9 +321,23 @@ export function catalogEntryForRepo(repo: string, platform: NodeJS.Platform): Ca
   return MODEL_CATALOG.find((entry) => catalogRepoFor(entry, platform) === repo);
 }
 
-/** Catalog entries the wizard offers (hidden entries filtered out). */
-export function visibleCatalog(): CatalogEntry[] {
-  return MODEL_CATALOG.filter((entry) => !entry.hidden);
+/** Whether `entry` can load on a machine with `totalMemBytes` of physical RAM. */
+export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, totalMemBytes: number): boolean {
+  return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
+}
+
+/** Catalog entries the wizard offers: visible chat entries loadable in `totalMemBytes` of RAM. */
+export function visibleCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
+  return MODEL_CATALOG.filter(
+    (entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat' && catalogFitsMemory(entry, totalMemBytes),
+  );
+}
+
+/** Visible System One (Clairic / CLEF) catalog entries loadable in `totalMemBytes` of RAM. */
+export function visibleSystemOneCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
+  return MODEL_CATALOG.filter(
+    (entry) => !entry.hidden && entry.category === 'systemone' && catalogFitsMemory(entry, totalMemBytes),
+  );
 }
 
 /**

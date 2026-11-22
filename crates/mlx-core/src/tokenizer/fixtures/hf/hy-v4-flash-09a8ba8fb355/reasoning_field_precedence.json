@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    },
+    {
+      "role": "assistant",
+      "content": "Hi.",
+      "reasoning": "from reasoning",
+      "reasoning_content": "from reasoning_content"
+    }
+  ],
+  "add_generation_prompt": false
+}

@@ -10,6 +10,7 @@
 #ifdef MLX_NODE_CUDA_ENABLED
 #include <cuda_runtime_api.h>
 #include "mlx/backend/cuda/cuda.h"
+#include "mlx/backend/cuda/device.h"
 #endif
 #ifdef MLX_NODE_METAL_ENABLED
 
@@ -574,6 +575,38 @@ int32_t mlx_set_cache_limit(uint64_t limit, uint64_t* out_old_limit) {
 // -1 follows MLX_ENABLE_TF32, 0 forces true f32, 1 allows TF32.
 void mlx_set_thread_tf32(int32_t mode) {
   mlx::core::env::set_thread_tf32(mode);
+}
+
+// Toggle MLX's CUDA graph capture dynamically (returns previous value).
+// Used to disable graph capture during large prefill passes while keeping it
+// enabled for low-latency decode. No-op (returns false) on non-CUDA builds.
+bool mlx_cuda_set_use_graphs(bool enable) {
+#ifdef MLX_NODE_CUDA_ENABLED
+  try {
+    return mlx::core::cu::set_use_cuda_graphs(enable);
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Exception in mlx_cuda_set_use_graphs: " << e.what()
+              << std::endl;
+    return false;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)enable;
+  return false;
+#endif
+}
+
+bool mlx_cuda_get_use_graphs() {
+#ifdef MLX_NODE_CUDA_ENABLED
+  try {
+    return mlx::core::cu::get_use_cuda_graphs();
+  } catch (...) {
+    return false;
+  }
+#else
+  return false;
+#endif
 }
 
 // Get the number of bytes in an array without evaluating it

@@ -452,6 +452,37 @@ impl crate::utils::gguf_read::ReadAt for DirectGgufReader<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CudaQ8PrefillMode {
+    /// Per-row INT8 activation quant (`gs_shift = 0`, peak ~113 TOPS).
+    Row,
+    /// Grouped INT8 activation quant (`gs_shift = -1` -> auto GS=256 / GS=128).
+    Grouped,
+    /// Bit-exact BF16 MMA (`gs_shift = -2`, zero X quantization).
+    Bf16,
+    /// Legacy cuBLAS dense BF16 cache fallback.
+    Cublas,
+}
+
+fn cuda_q8_prefill_mode() -> CudaQ8PrefillMode {
+    static MODE: std::sync::OnceLock<CudaQ8PrefillMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("MLX_QWEN4_Q8_PREFILL_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("row") => CudaQ8PrefillMode::Row,
+            Some("grp" | "group" | "grouped") => CudaQ8PrefillMode::Grouped,
+            Some("bf16") => CudaQ8PrefillMode::Bf16,
+            Some("cublas" | "off" | "0") => CudaQ8PrefillMode::Cublas,
+            _ => CudaQ8PrefillMode::Grouped,
+        }
+    })
+}
+
 #[derive(Clone)]
 pub struct Weight {
     pub values: MxArray,
@@ -463,8 +494,36 @@ pub struct Weight {
     pub(super) group: i32,
     pub(super) bits: i32,
     pub(super) mode: String,
+    /// True when this affine Q8_0 bank was imported from GGUF `Q8_0` where
+    /// every block's bias is strictly `-128 * scale` (enables symmetric INT8
+    /// `q8_prefill_cuda` and fused BF16 `hc_up_mix_prefill_cuda`).
+    pub(super) q8_symmetric_128: bool,
+    // Persistent CUDA `QuantizedLinear` wrapper so repeated `Weight::linear`
+    // calls share `cuda_dense_prefill` across prefill chunks instead of
+    // re-allocating a throwaway wrapper on every projection. `None` on Metal/CPU
+    // and on non-quantized or 3-D expert banks.
+    pub(super) qlinear: Option<Arc<QuantizedLinear>>,
 }
 impl Weight {
+    pub(super) fn with_cached_qlinear(mut self) -> Self {
+        if crate::accelerator::host_has_cuda()
+            && let Some(scales) = &self.scales
+        {
+            self.qlinear = Some(Arc::new(QuantizedLinear::new(
+                self.values.clone(),
+                scales.clone(),
+                self.biases.clone(),
+                None,
+                self.group,
+                self.bits,
+                self.mode.clone(),
+            )));
+        } else {
+            self.qlinear = None;
+        }
+        self
+    }
+
     pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
         let decode = x.shape_at(1)? == 1;
         if self.mode != "affine"
@@ -575,11 +634,61 @@ impl Weight {
             bits: first.bits,
             group: first.group,
             mode: first.mode.clone(),
+            q8_symmetric_128: weights.iter().all(|w| w.q8_symmetric_128),
+            qlinear: None,
         }))
     }
 
     pub fn linear(&self, x: &MxArray) -> Result<MxArray> {
-        if self.mode == "affine"
+        let on_cuda = crate::accelerator::cuda_ops_available();
+        self.linear_inner(x, on_cuda)
+    }
+
+    fn linear_inner(&self, x: &MxArray, on_cuda: bool) -> Result<MxArray> {
+        if on_cuda
+            && super::cuda_qwen4_fast_enabled()
+            && self.mode == "affine"
+            && self.bits == 8
+            && self.group == 32
+            && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
+            && x.dtype()? == DType::BFloat16
+            && scales.dtype()? == DType::Float16
+            && biases.dtype()? == DType::Float16
+        {
+            let mode = cuda_q8_prefill_mode();
+            if mode != CudaQ8PrefillMode::Cublas {
+                let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
+                let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
+                if rows >= 17 {
+                    // Below the GB10 roofline ridge (M < 128), Q8_0 GEMM is
+                    // memory-bandwidth bound at 1 B/weight: exact BF16 MMA
+                    // avoids the `quantize_x` launch AND keeps bit-exact BF16
+                    // accuracy while still allocating zero BF16 weight cache.
+                    let gs_shift = if rows < 128 {
+                        -2
+                    } else {
+                        match mode {
+                            CudaQ8PrefillMode::Row => 0,
+                            CudaQ8PrefillMode::Grouped => -1,
+                            CudaQ8PrefillMode::Bf16 => -2,
+                            CudaQ8PrefillMode::Cublas => unreachable!(),
+                        }
+                    };
+                    if let Some(out) = crate::kernels::qwen4::q8_prefill_cuda(
+                        x,
+                        &self.values,
+                        scales,
+                        biases,
+                        gs_shift,
+                        !self.q8_symmetric_128,
+                    )? {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        if !on_cuda
+            && self.mode == "affine"
             && self.bits == 8
             && self.group == 32
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
@@ -596,7 +705,7 @@ impl Weight {
                 return MxArray::from_handle(compact, "Qwen4 compact dense decode");
             }
         }
-        let compact = if self.mode == "affine" && self.bits == 8 && self.group == 32 {
+        let compact = if !on_cuda && self.mode == "affine" && self.bits == 8 && self.group == 32 {
             match (&self.scales, &self.biases) {
                 (Some(scales), Some(biases)) => unsafe {
                     mlx_sys::mlx_qwen4_dense_prefill(
@@ -613,6 +722,8 @@ impl Weight {
         };
         let y = if !compact.is_null() {
             MxArray::from_handle(compact, "Qwen4 compact dense prefill")?
+        } else if let Some(qlinear) = &self.qlinear {
+            qlinear.forward(x)?
         } else if let Some(scales) = &self.scales {
             QuantizedLinear::new(
                 self.values.clone(),
@@ -632,13 +743,24 @@ impl Weight {
             } else {
                 &self.values
             };
+            if values.ndim()? == 2
+                && x.dtype()? == DType::BFloat16
+                && values.dtype()? == DType::BFloat16
+                && let Some(out) =
+                    crate::kernels::linear::bf16_matmul_few(x, values, values.shape_at(0)?)?
+            {
+                return Ok(out);
+            }
             let weight = values.transpose(None)?.astype(x.dtype()?)?;
             let shape = x.shape()?;
             let (&width, outer_shape) = shape
                 .split_last()
                 .filter(|(width, _)| **width > 0)
                 .ok_or_else(|| err("Qwen4 projection input requires a positive final dimension"))?;
-            if x.dtype()? == DType::Float32 && x.size()? / width as u64 > 1 {
+            if crate::accelerator::host_has_metal()
+                && x.dtype()? == DType::Float32
+                && x.size()? / width as u64 > 1
+            {
                 // MLX enables TF32 GEMMs by default on NAX hardware. Preserve
                 // the F32 source's GEMV arithmetic without changing global
                 // process settings or lowering the fixture's accuracy gate.
@@ -668,6 +790,16 @@ impl Weight {
         let Some(scales) = &self.scales else {
             return Ok(self.values.clone());
         };
+        if super::cuda_qwen4_fast_enabled()
+            && self.mode == "affine"
+            && self.bits == 8
+            && self.group == 32
+            && let Some(biases) = &self.biases
+            && let Some(fast) =
+                crate::kernels::qwen4::dequant_q8_bf16_cuda(&self.values, scales, biases)?
+        {
+            return Ok(fast);
+        }
         let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
         let a = unsafe {
             mlx_sys::mlx_dequantize(
@@ -683,6 +815,9 @@ impl Weight {
             )
         };
         MxArray::from_handle(a, "SSD row dequantize")
+    }
+    pub(super) fn qlinear(&self) -> Option<&QuantizedLinear> {
+        self.qlinear.as_deref()
     }
     pub(super) fn bytes(&self) -> Result<u64> {
         let mut bytes = 0;
@@ -739,6 +874,16 @@ pub struct Store {
     /// bank admission honours them, the partial path leaves them at zero.
     draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
+    /// Cached reshaped dense arrays for resident banks so `Store::dense()` skips
+    /// per-call `slice_rows` + `Arc<Weight>` + `with_cached_qlinear()` + `reshape`.
+    dense_cache: HashMap<String, MxArray>,
+    /// Bounded host-RAM raw-row cache for CUDA batched `lookup_rows` (`token_embd`,
+    /// `per_layer_token_embd`): replaces 16,384 per-row GPU dequant/concat kernels
+    /// with ONE batched `import_bytes` + ONE `mlx_dequantize` launch.
+    cuda_raw_rows: HashMap<(String, usize), Vec<u8>>,
+    cuda_raw_rows_order: VecDeque<(String, usize)>,
+    cuda_raw_rows_bytes: u64,
+    file_paths: HashMap<PathBuf, Arc<PathBuf>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
     direct_fill: Option<expert_slots::DirectFill>,
     direct_fill_remaining: usize,
@@ -966,6 +1111,11 @@ impl Store {
             mtp_banks_declined: false,
             draft_bank_budget: 0,
             paired_banks: HashMap::new(),
+            dense_cache: HashMap::new(),
+            cuda_raw_rows: HashMap::new(),
+            cuda_raw_rows_order: VecDeque::new(),
+            cuda_raw_rows_bytes: 0,
+            file_paths: HashMap::new(),
             slots: HashMap::new(),
             direct_fill: None,
             direct_fill_remaining: 0,
@@ -1392,11 +1542,31 @@ impl Store {
     pub fn lookup_rows(&mut self, name: &str, ids: &[usize]) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let total_rows = d.rows()?;
-        if ids.is_empty()
-            || ids.len() > 65536
-            || ids.iter().any(|&id| id >= total_rows)
+        let width = d.width()?;
+        if ids.is_empty() || ids.iter().any(|&id| id >= total_rows) {
+            return Err(err("Lookup window exceeds tensor or staging bounds"));
+        }
+        if super::cuda_qwen4_fast_enabled()
+            && !self.banks.contains_key(name)
+            && (self.plan.direct || total_rows > 1024)
+        {
+            // Keep each GPU import/dequant staging batch within MAX_READ_BYTES
+            // and 65,535 rows so C=6144..8192 prefill chunks (e.g. PLE 16*M =
+            // 131,072 rows, token_embd 8192*2560*4 = 80 MiB) work seamlessly.
+            let max_rows = ((MAX_READ_BYTES / ((width as u64).saturating_mul(4).max(1))) as usize)
+                .clamp(1, 65535);
+            if ids.len() <= max_rows {
+                return self.lookup_rows_cuda_batched(name, ids);
+            }
+            let mut parts = Vec::with_capacity(ids.len().div_ceil(max_rows));
+            for chunk in ids.chunks(max_rows) {
+                parts.push(self.lookup_rows_cuda_batched(name, chunk)?);
+            }
+            return MxArray::concatenate_many(parts.iter().collect(), Some(0));
+        }
+        if ids.len() > 65536
             || (ids.len() as u64)
-                .saturating_mul(d.width()? as u64)
+                .saturating_mul(width as u64)
                 .saturating_mul(4)
                 > MAX_READ_BYTES
         {
@@ -1453,6 +1623,7 @@ impl Store {
             self.next_window_bank += 1;
             let mut rehomed = 0;
             let mut position = vec![0i32; rows.len()];
+            let mut is_imported = vec![false; rows.len()];
             for (i, &(row, slot)) in imported.iter().enumerate() {
                 let key = (name.to_string(), row, 1);
                 let view = fresh.slice_axis(0, i as i64, i as i64 + 1)?;
@@ -1469,9 +1640,12 @@ impl Store {
                     group: 0,
                     bits: 0,
                     mode: String::new(),
+                    q8_symmetric_128: false,
+                    qlinear: None,
                 });
                 self.row_bank.insert(key, id);
                 position[slot] = i as i32;
+                is_imported[slot] = true;
             }
             self.window_banks.insert(
                 id,
@@ -1484,7 +1658,7 @@ impl Store {
             self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
             let mut parts = vec![&fresh];
             for (slot, row) in rows.iter().enumerate() {
-                if !imported.iter().any(|&(_, s)| s == slot) {
+                if !is_imported[slot] {
                     position[slot] = (imported.len() + parts.len() - 1) as i32;
                     parts.push(row);
                 }
@@ -1501,6 +1675,182 @@ impl Store {
         window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
     }
 
+    /// CUDA batched row gather: collects raw quantized bytes for every unique
+    /// row (from the host raw-row cache, parallel `Fetcher::take_many`, or
+    /// ascending pread), packs them into ONE contiguous buffer, and runs ONE
+    /// `import_bytes` + ONE GPU `dequantize` (eliminating 16,384 per-row GPU
+    /// dequantize + `concatenate_many` kernels on 1024-token prefill chunks).
+    fn lookup_rows_cuda_batched(&mut self, name: &str, ids: &[usize]) -> Result<MxArray> {
+        let d = self.descriptor(name)?.clone();
+        let row_bytes = d.row_bytes()? as usize;
+        let mut unique_map: HashMap<usize, i32> = HashMap::with_capacity(ids.len());
+        let mut unique_ids: Vec<usize> = Vec::with_capacity(ids.len());
+        let mut order: Vec<i32> = Vec::with_capacity(ids.len());
+        let mut identity = true;
+        for (pos, &id) in ids.iter().enumerate() {
+            let slot = if let Some(&slot) = unique_map.get(&id) {
+                identity = false;
+                slot
+            } else {
+                let slot = unique_ids.len() as i32;
+                if slot as usize != pos {
+                    identity = false;
+                }
+                unique_ids.push(id);
+                unique_map.insert(id, slot);
+                slot
+            };
+            order.push(slot);
+        }
+
+        let mut missing: Vec<(usize, usize)> = Vec::new();
+        for (slot, &row_id) in unique_ids.iter().enumerate() {
+            LookupStats::count(&self.lookup.lookups);
+            if !self.cuda_raw_rows.contains_key(&(name.to_string(), row_id)) {
+                LookupStats::count(&self.lookup.misses);
+                missing.push((slot, row_id));
+            }
+        }
+
+        if !missing.is_empty() {
+            let fetched = if let Some(fetcher) = self.rows.as_ref() {
+                let keys: Vec<(String, usize)> = missing
+                    .iter()
+                    .map(|&(_, row_id)| (name.to_string(), row_id))
+                    .collect();
+                Some(fetcher.take_many(&keys))
+            } else {
+                None
+            };
+
+            let mut need_read: Vec<usize> = Vec::new();
+            let mut raw_limit = 256u64 << 20;
+            if self.cache_limit > 0 {
+                raw_limit = raw_limit.min((self.cache_limit / 4).max(16 << 20));
+            }
+
+            let mut ready_rows: Vec<(usize, Vec<u8>)> = Vec::with_capacity(missing.len());
+            if let Some(fetched) = fetched {
+                for ((_, row_id), item) in missing.iter().zip(fetched) {
+                    match item {
+                        Some((Ok(bytes), late)) if bytes.len() == row_bytes => {
+                            LookupStats::count(if late {
+                                &self.lookup.late
+                            } else {
+                                &self.lookup.prefetched
+                            });
+                            ready_rows.push((*row_id, bytes));
+                        }
+                        other => {
+                            if other.is_some() {
+                                LookupStats::count(&self.lookup.late);
+                            }
+                            need_read.push(*row_id);
+                        }
+                    }
+                }
+            } else {
+                need_read.extend(missing.iter().map(|&(_, row_id)| row_id));
+            }
+
+            if !need_read.is_empty() {
+                need_read.sort_unstable();
+                let mut used_workers = false;
+                #[cfg(not(test))]
+                let allow_workers = true;
+                #[cfg(test)]
+                let allow_workers = self.row_readers;
+                if allow_workers && need_read.len() >= 8 {
+                    if self.rows.is_none() {
+                        self.rows = Some(
+                            Fetcher::new(ROW_READERS, Arc::clone(&self.rows_pending))
+                                .map_err(err)?,
+                        );
+                    }
+                    let file = self.file(&d.path)?;
+                    let path = self.path_arc(&d.path);
+                    let mut jobs = Vec::with_capacity(need_read.len());
+                    let mut keys = Vec::with_capacity(need_read.len());
+                    for &row_id in &need_read {
+                        let (offset, len) = d.range(row_id, 1)?;
+                        let key = (name.to_string(), row_id);
+                        jobs.push(Job {
+                            key: key.clone(),
+                            file: Arc::clone(&file),
+                            path: Some(Arc::clone(&path)),
+                            offset,
+                            len: len as usize,
+                        });
+                        keys.push(key);
+                    }
+                    if let Some(fetcher) = self.rows.as_ref() {
+                        fetcher.request(jobs);
+                        let got = fetcher.take_many(&keys);
+                        let mut fallback = Vec::new();
+                        for (&row_id, item) in need_read.iter().zip(got) {
+                            match item {
+                                Some((Ok(bytes), _)) if bytes.len() == row_bytes => {
+                                    ready_rows.push((row_id, bytes));
+                                }
+                                _ => fallback.push(row_id),
+                            }
+                        }
+                        need_read = fallback;
+                        used_workers = true;
+                    }
+                }
+                if !need_read.is_empty() {
+                    let _ = used_workers;
+                    let file = self.file(&d.path)?;
+                    for row_id in need_read {
+                        let bytes = d.read_rows(&file, row_id, 1)?;
+                        ready_rows.push((row_id, bytes));
+                    }
+                }
+            }
+
+            let total_read_bytes = (ready_rows.len() as u64).saturating_mul(row_bytes as u64);
+            self.count_bytes_read(total_read_bytes);
+
+            for (row_id, bytes) in ready_rows {
+                let key = (name.to_string(), row_id);
+                if !self.cuda_raw_rows.contains_key(&key) {
+                    let b = bytes.len() as u64;
+                    while self.cuda_raw_rows_bytes.saturating_add(b) > raw_limit {
+                        let Some(evict) = self.cuda_raw_rows_order.pop_front() else {
+                            break;
+                        };
+                        if let Some(old) = self.cuda_raw_rows.remove(&evict) {
+                            self.cuda_raw_rows_bytes =
+                                self.cuda_raw_rows_bytes.saturating_sub(old.len() as u64);
+                        }
+                    }
+                    self.cuda_raw_rows.insert(key.clone(), bytes);
+                    self.cuda_raw_rows_order.push_back(key);
+                    self.cuda_raw_rows_bytes = self.cuda_raw_rows_bytes.saturating_add(b);
+                }
+            }
+        }
+
+        let mut flat = Vec::with_capacity(unique_ids.len().saturating_mul(row_bytes));
+        for &row_id in &unique_ids {
+            let key = (name.to_string(), row_id);
+            let bytes = self
+                .cuda_raw_rows
+                .get(&key)
+                .ok_or_else(|| err("CUDA batched lookup lost a cached raw row"))?;
+            flat.extend_from_slice(bytes);
+        }
+        let dense = d
+            .import_bytes_with_cache(&flat, unique_ids.len(), false)?
+            .dense_pending()?;
+        if identity {
+            Ok(dense)
+        } else {
+            dense.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
+        }
+    }
+
     /// Start reading rows `(tensor, row)` on the reader threads; rows the
     /// LRU or a bank already holds are skipped. `read_impl` takes the bytes
     /// when it imports the row.
@@ -1515,15 +1865,18 @@ impl Store {
             if !seen.insert((name.as_str(), *row))
                 || self.banks.contains_key(name)
                 || self.cache.contains_key(&(name.clone(), *row, 1))
+                || self.cuda_raw_rows.contains_key(&(name.clone(), *row))
             {
                 continue;
             }
             let d = self.descriptor(name)?.clone();
             let (offset, len) = d.range(*row, 1)?;
             let file = self.file(&d.path)?;
+            let path = self.path_arc(&d.path);
             jobs.push(Job {
                 key: (name.clone(), *row),
                 file,
+                path: Some(path),
                 offset,
                 len: len as usize,
             });
@@ -1561,6 +1914,15 @@ impl Store {
         let file = Arc::new(File::open(path).map_err(err)?);
         self.files.insert(path.to_path_buf(), Arc::clone(&file));
         Ok(file)
+    }
+
+    fn path_arc(&mut self, path: &Path) -> Arc<PathBuf> {
+        if let Some(arc) = self.file_paths.get(path) {
+            return Arc::clone(arc);
+        }
+        let arc = Arc::new(path.to_path_buf());
+        self.file_paths.insert(path.to_path_buf(), Arc::clone(&arc));
+        arc
     }
 
     /// Import `rows` rows of `d`: bytes a reader thread fetched for a single
@@ -1703,6 +2065,8 @@ impl Store {
                 group: 0,
                 bits: 0,
                 mode: String::new(),
+                q8_symmetric_128: false,
+                qlinear: None,
             }
         } else {
             weight
@@ -1758,6 +2122,15 @@ impl Tensor {
 
     /// Decode the checkpoint bytes of `rows` consecutive rows into lazy arrays.
     pub(super) fn import_bytes(&self, buf: &[u8], rows: usize) -> Result<Weight> {
+        self.import_bytes_with_cache(buf, rows, true)
+    }
+
+    pub(super) fn import_bytes_with_cache(
+        &self,
+        buf: &[u8],
+        rows: usize,
+        cache_qlinear: bool,
+    ) -> Result<Weight> {
         if rows == 0 || buf.len() as u64 != self.row_bytes()?.saturating_mul(rows as u64) {
             return Err(err("SSD row payload does not match its descriptor"));
         }
@@ -1804,6 +2177,8 @@ impl Tensor {
                     group: 0,
                     bits: 0,
                     mode: String::new(),
+                    q8_symmetric_128: false,
+                    qlinear: None,
                 }
             }
             Encoding::Gguf(ty) => {
@@ -1859,7 +2234,7 @@ impl Tensor {
                         "affine",
                     )
                 };
-                Weight {
+                let w = Weight {
                     dense_bf16: None,
                     values,
                     scales,
@@ -1867,6 +2242,13 @@ impl Tensor {
                     group,
                     bits,
                     mode: mode.into(),
+                    q8_symmetric_128: matches!(ty, GgufTensorType::Q8_0),
+                    qlinear: None,
+                };
+                if cache_qlinear {
+                    w.with_cached_qlinear()
+                } else {
+                    w
                 }
             }
         })
@@ -1874,11 +2256,34 @@ impl Tensor {
 }
 
 impl Store {
+    /// True when the checkpoint's token embedding produces BF16 activations
+    /// (GGUF quantized / BF16 or safetensors BF16), as opposed to FP32 fixtures.
+    pub(super) fn embedding_is_bf16(&self) -> bool {
+        let Some(d) = self
+            .tensors
+            .get("token_embd.weight")
+            .or_else(|| self.tensors.get("embed_tokens.weight"))
+        else {
+            return false;
+        };
+        match &d.encoding {
+            Encoding::Gguf(ty) => !matches!(ty, GgufTensorType::F32),
+            Encoding::Safe(dt) => dt == "BF16",
+        }
+    }
+
     pub fn dense(&mut self, name: &str) -> Result<MxArray> {
+        if let Some(cached) = self.dense_cache.get(name) {
+            return Ok(cached.clone());
+        }
         let d = self.descriptor(name)?;
         let shape = d.shape.iter().map(|&i| i as i64).collect::<Vec<_>>();
         let rows = d.rows()?;
-        self.read(name, 0, rows)?.dense()?.reshape(&shape)
+        let out = self.read(name, 0, rows)?.dense()?.reshape(&shape)?;
+        if self.banks.contains_key(name) {
+            self.dense_cache.insert(name.to_owned(), out.clone());
+        }
+        Ok(out)
     }
     pub fn linear(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
         self.linear_impl(name, x, false)
@@ -1933,8 +2338,32 @@ impl Store {
                 return MxArray::concatenate_many(parts.iter().collect(), Some(1))?
                     .reshape(&out_shape);
             }
+            if crate::accelerator::cuda_ops_available()
+                && x.dtype()? == DType::BFloat16
+                && ((w.mode == "affine"
+                    && w.bits == 8
+                    && w.group == 32
+                    && w.scales.is_some()
+                    && w.biases.is_some()
+                    && width >= 32
+                    && width % 32 == 0)
+                    || w.scales.is_none())
+            {
+                // Chunk in steps of 16 rows so CUDA stays on `mlx_affine_q8_few_cuda` /
+                // `mlx_bf16_gemm_few_cuda` (16x fewer weight reads than M=1 while
+                // matching singleton row rounding bit-for-bit).
+                const CUDA_FEW_STEP: i64 = 16;
+                let mut cuda_parts =
+                    Vec::with_capacity(((count + CUDA_FEW_STEP - 1) / CUDA_FEW_STEP) as usize);
+                for start in (0..count).step_by(CUDA_FEW_STEP as usize) {
+                    let rows = window.slice_axis(1, start, (start + CUDA_FEW_STEP).min(count))?;
+                    cuda_parts.push(w.linear(&rows)?);
+                }
+                return MxArray::concatenate_many(cuda_parts.iter().collect(), Some(1))?
+                    .reshape(&out_shape);
+            }
             let input = x.reshape(&[count, 1, width])?;
-            let output = if w.scales.is_some() {
+            let output = if w.scales.is_some() && !crate::accelerator::cuda_ops_available() {
                 // One shared bank, with every RHS id zero. Gather dispatches
                 // M=1 GEMV for each vector, not a wide prompt GEMM.
                 w.gather_rows(
@@ -1997,6 +2426,12 @@ impl Store {
             if let Some(out) = super::math::rows::dense_decode(w, x)? {
                 return Ok(out);
             }
+            if crate::accelerator::cuda_ops_available()
+                && (2..=16).contains(&count)
+                && (w.scales.is_some() || x.dtype()? == DType::BFloat16)
+            {
+                return w.linear(x);
+            }
             #[cfg(test)]
             single_rows.set(single_rows.get() + count as u64);
             let parts = (0..count)
@@ -2034,19 +2469,36 @@ impl Store {
         first: &str,
         second: &str,
     ) -> Result<(MxArray, MxArray)> {
-        if x.shape_at(1)? == 1 {
+        let count = x.shape_at(1)?;
+        if count == 1 {
             return self.linear_pair(x, first, second);
         }
         let key = (first.to_owned(), second.to_owned());
-        if let Some(bank) = self.paired_banks.get(&key)
-            && let Some(output) = super::math::rows::dense_decode(bank, x)?
+        if let Some(bank) = self.paired_banks.get(&key) {
+            let output = if let Some(output) = super::math::rows::dense_decode(bank, x)? {
+                Some(output)
+            } else if crate::accelerator::cuda_ops_available()
+                && (2..=16).contains(&count)
+                && (bank.scales.is_some() || x.dtype()? == DType::BFloat16)
+            {
+                Some(bank.linear(x)?)
+            } else {
+                None
+            };
+            if let Some(output) = output {
+                let n = self.descriptor(first)?.rows()? as i64;
+                let axis = output.ndim()? as usize - 1;
+                return Ok((
+                    output.slice_axis(axis, 0, n)?,
+                    output.slice_axis(axis, n, output.shape()?[axis])?,
+                ));
+            }
+        } else if crate::accelerator::cuda_ops_available()
+            && (2..=16).contains(&count)
+            && (x.dtype()? == DType::BFloat16
+                || self.banks.get(first).is_some_and(|w| w.scales.is_some()))
         {
-            let n = self.descriptor(first)?.rows()? as i64;
-            let axis = output.ndim()? as usize - 1;
-            return Ok((
-                output.slice_axis(axis, 0, n)?,
-                output.slice_axis(axis, n, output.shape()?[axis])?,
-            ));
+            return self.linear_pair(x, first, second);
         }
         Ok((self.linear_rows(first, x)?, self.linear_rows(second, x)?))
     }
@@ -2398,6 +2850,8 @@ mod cache_tests {
                 group: 32,
                 bits: 8,
                 mode: "affine".into(),
+                q8_symmetric_128: true,
+                qlinear: None,
             })
         };
         let banks = [make(13), make(97)];
@@ -2475,6 +2929,8 @@ mod cache_tests {
             group: 32,
             bits: 8,
             mode: "affine".into(),
+            q8_symmetric_128: true,
+            qlinear: None,
         });
         let name = "test.ple_key.weight";
         store.tensors.insert(
@@ -4424,5 +4880,239 @@ mod direct_tests {
             store.direct_fill.is_some(),
             "the direct fill starts after the draft banks"
         );
+    }
+
+    #[test]
+    fn cuda_phase0_weight_linear_persistent_qlinear_and_small_m_paths() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        let make_q8 = |n: usize, k: usize, next: &mut dyn FnMut() -> u32| -> Weight {
+            let codes: Vec<u32> = (0..n * k / 4).map(|_| next()).collect();
+            let scales: Vec<f32> = (0..n * k / 32)
+                .map(|_| ((next() % 97) as f32 + 1.) / 16384.)
+                .collect();
+            let biases: Vec<f32> = scales
+                .iter()
+                .map(|s| -s * (64 + next() % 129) as f32)
+                .collect();
+            Weight {
+                values: MxArray::from_uint32(&codes, &[n as i64, k as i64 / 4]).unwrap(),
+                dense_bf16: None,
+                scales: Some(
+                    MxArray::from_float32(&scales, &[n as i64, k as i64 / 32])
+                        .unwrap()
+                        .astype(DType::Float16)
+                        .unwrap(),
+                ),
+                biases: Some(
+                    MxArray::from_float32(&biases, &[n as i64, k as i64 / 32])
+                        .unwrap()
+                        .astype(DType::Float16)
+                        .unwrap(),
+                ),
+                group: 32,
+                bits: 8,
+                mode: "affine".into(),
+                q8_symmetric_128: false,
+                qlinear: None,
+            }
+            .with_cached_qlinear()
+        };
+
+        // 1. Persistent `qlinear` on CUDA, plus safe rebuild on slice_rows & concatenate_rows.
+        let (n, k) = (64usize, 256usize);
+        let q8_a = make_q8(n, k, &mut next);
+        let q8_b = make_q8(n, k, &mut next);
+        if crate::accelerator::host_has_cuda() {
+            assert!(q8_a.qlinear.is_some());
+        } else {
+            assert!(q8_a.qlinear.is_none());
+        }
+        let sliced = q8_a.slice_rows(16, 32).unwrap();
+        let joined =
+            Weight::concatenate_rows(&[Arc::new(q8_a.clone()), Arc::new(q8_b.clone())]).unwrap();
+        if crate::accelerator::host_has_cuda() {
+            assert!(sliced.qlinear.is_some());
+            assert!(joined.qlinear.is_some());
+            assert!(!Arc::ptr_eq(
+                sliced.qlinear.as_ref().unwrap(),
+                q8_a.qlinear.as_ref().unwrap()
+            ));
+        }
+
+        // Multi-row prefill (M=20) followed by M=1 decode matches dequantized reference.
+        let x20 = MxArray::from_float32(
+            &(0..20 * k)
+                .map(|i| ((i * 13 % 199) as f32 - 99.0) / 128.0)
+                .collect::<Vec<_>>(),
+            &[1, 20, k as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let x1 = x20.slice_axis(1, 0, 1).unwrap();
+        let ref_sliced_w = sliced.dense().unwrap().transpose(None).unwrap();
+        let y20 = sliced.linear(&x20).unwrap().to_float32().unwrap();
+        let ref20 = x20.matmul(&ref_sliced_w).unwrap().to_float32().unwrap();
+        let err20 = y20
+            .iter()
+            .zip(ref20.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(err20 < 2e-2, "sliced Q8 M=20 prefill mismatch: {err20}");
+        let y1 = sliced.linear(&x1).unwrap().to_float32().unwrap();
+        let ref1 = x1.matmul(&ref_sliced_w).unwrap().to_float32().unwrap();
+        let err1 = y1
+            .iter()
+            .zip(ref1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(err1 < 2e-2, "sliced Q8 M=1 decode mismatch: {err1}");
+
+        // 2. `linear_rows` and `linear_pair_rows` for M=4 (Q8_0 BF16) match M=1 bit-for-bit.
+        let mut store = Store::open_metadata(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
+            None,
+        )
+        .unwrap();
+        for (name, bank) in [("test.pair_a.weight", &q8_a), ("test.pair_b.weight", &q8_b)] {
+            store.tensors.insert(
+                name.into(),
+                Tensor {
+                    path: PathBuf::new(),
+                    shape: vec![n, k],
+                    offset: 0,
+                    bytes: (n * k) as u64,
+                    encoding: Encoding::Gguf(GgufTensorType::Q8_0),
+                },
+            );
+            store.banks.insert(name.into(), Arc::new(bank.clone()));
+        }
+        let x4 = x20.slice_axis(1, 0, 4).unwrap();
+        let got_a = store
+            .linear_rows("test.pair_a.weight", &x4)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let want_a = MxArray::concatenate_many(
+            (0..4)
+                .map(|r| q8_a.linear(&x4.slice_axis(1, r, r + 1).unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .iter()
+                .collect(),
+            Some(1),
+        )
+        .unwrap()
+        .to_float32()
+        .unwrap();
+        assert_eq!(
+            &*got_a, &*want_a,
+            "linear_rows M=4 must match M=1 bit-for-bit"
+        );
+
+        let (pair_a, pair_b) = store
+            .linear_pair_rows(&x4, "test.pair_a.weight", "test.pair_b.weight")
+            .unwrap();
+        assert_eq!(&*pair_a.to_float32().unwrap(), &*want_a);
+        let want_b = MxArray::concatenate_many(
+            (0..4)
+                .map(|r| q8_b.linear(&x4.slice_axis(1, r, r + 1).unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .iter()
+                .collect(),
+            Some(1),
+        )
+        .unwrap()
+        .to_float32()
+        .unwrap();
+        assert_eq!(&*pair_b.to_float32().unwrap(), &*want_b);
+
+        // 3. Unquantized F32 M=4 runs cleanly in a single matmul on non-Metal.
+        let f32_w = Weight {
+            values: MxArray::from_float32(
+                &(0..32 * 64)
+                    .map(|i| ((i * 7 % 101) as f32 - 50.0) / 64.0)
+                    .collect::<Vec<_>>(),
+                &[32, 64],
+            )
+            .unwrap(),
+            dense_bf16: None,
+            scales: None,
+            biases: None,
+            group: 0,
+            bits: 0,
+            mode: String::new(),
+            q8_symmetric_128: false,
+            qlinear: None,
+        };
+        let xf32 = MxArray::from_float32(
+            &(0..4 * 64)
+                .map(|i| ((i * 11 % 89) as f32 - 44.0) / 64.0)
+                .collect::<Vec<_>>(),
+            &[1, 4, 64],
+        )
+        .unwrap();
+        let yf32 = f32_w.linear(&xf32).unwrap().to_float32().unwrap();
+        let ref_f32 = xf32
+            .matmul(&f32_w.values.transpose(None).unwrap())
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let f32_diff = yf32
+            .iter()
+            .zip(ref_f32.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(f32_diff < 1e-4, "F32 M=4 linear mismatch: {f32_diff}");
+
+        // 4. `dense_bf16` router shape `[512, 2560]` at M=1 and M=4 via `bf16_matmul_few`.
+        let router_vals = MxArray::from_float32(
+            &(0..512 * 2560)
+                .map(|i| ((i * 17 % 251) as f32 - 125.0) / 4096.0)
+                .collect::<Vec<_>>(),
+            &[512, 2560],
+        )
+        .unwrap();
+        let router_bf16 = router_vals.astype(DType::BFloat16).unwrap();
+        let router = Weight {
+            values: router_vals,
+            dense_bf16: Some(router_bf16.clone()),
+            scales: None,
+            biases: None,
+            group: 0,
+            bits: 0,
+            mode: String::new(),
+            q8_symmetric_128: false,
+            qlinear: None,
+        };
+        for m in [1i64, 4] {
+            let xr = MxArray::from_float32(
+                &(0..m as usize * 2560)
+                    .map(|i| ((i * 23 % 211) as f32 - 105.0) / 256.0)
+                    .collect::<Vec<_>>(),
+                &[1, m, 2560],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let got = router.linear(&xr).unwrap().to_float32().unwrap();
+            let want = xr
+                .matmul(&router_bf16.transpose(None).unwrap())
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            let diff = got
+                .iter()
+                .zip(want.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                diff < 5e-2,
+                "dense_bf16 router [512, 2560] M={m} mismatch: {diff}"
+            );
+        }
     }
 }

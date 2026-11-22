@@ -147,13 +147,46 @@ pub(crate) fn refuse_scaled_gguf_rope(
     }
 }
 
+/// Returns `true` for Qwen3.5 / Clairic RMSNorm HF weight keys that must keep
+/// their original FP32 precision through GGUF preload for `PreciseF32` RMSNorm.
+fn is_clairic_fp32_norm_hf_key(key: &str) -> bool {
+    key.ends_with(".norm.weight")
+        || key.ends_with(".input_layernorm.weight")
+        || key.ends_with(".post_attention_layernorm.weight")
+        || key.ends_with(".self_attn.q_norm.weight")
+        || key.ends_with(".self_attn.k_norm.weight")
+}
+
 impl GgufCheckpoint {
     pub(crate) fn preload_input(&self, load_companion: bool) -> PreloadInput {
+        self.preload_input_with_preserved_norms(load_companion, false)
+    }
+
+    /// Build a [`PreloadInput`], optionally preserving original FP32 RMSNorm
+    /// weights (e.g. for Clairic's `PreciseF32` RMSNorm) so the BF16 dtype pass
+    /// does not round them before persistence installs them.
+    pub(crate) fn preload_input_with_preserved_norms(
+        &self,
+        load_companion: bool,
+        preserve_fp32_norms: bool,
+    ) -> PreloadInput {
+        let mut main_plan = self.plans.0.clone();
+        if preserve_fp32_norms {
+            for t in &self.main.header.tensors {
+                if let Some(hf_key) = crate::utils::gguf::gguf_name_to_hf_for_metadata(
+                    &t.name,
+                    &self.main.header.metadata,
+                ) && is_clairic_fp32_norm_hf_key(&hf_key)
+                {
+                    main_plan.preserve_dtype_keys.insert(hf_key);
+                }
+            }
+        }
         PreloadInput::new(
             PreloadMain {
                 parts: self.main.parts.clone(),
                 header: self.main.header.clone(),
-                plan: self.plans.0.clone(),
+                plan: main_plan,
             },
             self.companion.as_ref().zip(self.plans.1.as_ref()).map(
                 |((path, header, identity), plan)| {
@@ -997,6 +1030,56 @@ mod tests {
             single.release_lease();
             split.release_lease();
         }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn clairic_gguf_preload_preserves_fp32_rms_norm_weights() {
+        use crate::utils::gguf_import::GgufPreload;
+
+        let work = work_dir("clairic-fp32-norms");
+        let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
+        let source = CheckpointSource::resolve_in(
+            &fx.main,
+            NativeGgufFamily::Qwen35,
+            Some(&work.join("cache")),
+        )
+        .await
+        .expect("resolve qwen35 GGUF");
+        let CheckpointSource::Gguf(ckpt) = &source else {
+            panic!("expected GGUF checkpoint");
+        };
+
+        // Standard preload downcasts dense F32 norm weights to BFloat16.
+        let std_preload = GgufPreload::load(&ckpt.preload_input(false)).expect("std preload");
+        // Clairic preload preserves original F32 norm weights without BF16 rounding.
+        let clairic_preload =
+            GgufPreload::load(&ckpt.preload_input_with_preserved_norms(false, true))
+                .expect("clairic preload");
+
+        let norm_keys: Vec<&String> = clairic_preload
+            .main
+            .keys()
+            .filter(|k| is_clairic_fp32_norm_hf_key(k))
+            .collect();
+        assert!(
+            !norm_keys.is_empty(),
+            "qwen35-dense-untied fixture must have RMSNorm keys"
+        );
+        for key in norm_keys {
+            assert_eq!(
+                clairic_preload.main[key].dtype().unwrap(),
+                DType::Float32,
+                "{key} must stay Float32 under Clairic GGUF preload"
+            );
+            assert_eq!(
+                std_preload.main[key].dtype().unwrap(),
+                DType::BFloat16,
+                "{key} stays BFloat16 under standard Qwen3.5 preload"
+            );
+        }
+
+        source.release_lease();
         fs::remove_dir_all(&work).ok();
     }
 }

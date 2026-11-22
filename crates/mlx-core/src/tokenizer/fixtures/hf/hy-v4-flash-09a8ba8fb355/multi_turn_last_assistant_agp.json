@@ -1,0 +1,23 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    },
+    {
+      "role": "assistant",
+      "content": "I am Hy4, an assistant.",
+      "reasoning_content": "The user asks who I am. Answer briefly."
+    },
+    {
+      "role": "user",
+      "content": "What is 17 * 23?"
+    },
+    {
+      "role": "assistant",
+      "content": "17 * 23 = 391.",
+      "reasoning_content": "17*23 = 17*20 + 17*3 = 340 + 51 = 391."
+    }
+  ],
+  "add_generation_prompt": true
+}

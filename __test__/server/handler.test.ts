@@ -267,6 +267,13 @@ function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): Se
   } as unknown as SessionCapableModel;
 }
 
+// A turn's tool calls reach the response only when the request sends tools (vLLM `check_tool_usage`).
+const RESPONSE_TOOLS = [
+  { type: 'function' as const, name: 'get_weather' },
+  { type: 'function' as const, name: 'get_news' },
+  { type: 'function' as const, name: 'search' },
+];
+
 /**
  * Set up a handler whose first `chatSessionStart` response is a
  * two-ok-tool-call fan-out and whose follow-up turn produces a plain
@@ -953,6 +960,31 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('tool_call_id');
     });
 
+    // vLLM `ResponsesRequest.check_tool_usage`.
+    it.each([
+      {
+        name: 'a named function that matches no tool',
+        extra: { tools: RESPONSE_TOOLS, tool_choice: { type: 'function', name: 'nope' } },
+      },
+      { name: "'required' with no tools", extra: { tool_choice: 'required' } },
+    ])('returns 400 for tool_choice $name', async ({ extra }) => {
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi.fn();
+      registry.register('test-model', { ...createMockModel(), chatSessionStart } as unknown as SessionCapableModel);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello', ...extra });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.param).toBe('tool_choice');
+      expect(chatSessionStart).not.toHaveBeenCalled();
+    });
+
     it('returns 400 when max_output_tokens is zero', async () => {
       const registry = new ModelRegistry();
       registry.register('test-model', createMockModel());
@@ -1518,6 +1550,7 @@ describe('createHandler', () => {
 
       // Request 1 — normal cold path, produces the multi-call response.
       const req1 = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'test-model',
         input: 'What is happening in SF?',
       });
@@ -1612,6 +1645,7 @@ describe('createHandler', () => {
       const handler = createHandler(registry, { store: mockStore as any });
 
       const req1 = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'test-model',
         input: 'What is happening in SF?',
       });
@@ -1646,7 +1680,7 @@ describe('createHandler', () => {
       // continuation attempts that contain zero tool-result items.
       const { handler, chatSessionStart, chatSessionContinue, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1673,7 +1707,7 @@ describe('createHandler', () => {
     it('returns 400 on duplicate function_call_output call_ids', async () => {
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1701,7 +1735,7 @@ describe('createHandler', () => {
     it('returns 400 on unexpected (out-of-set) function_call_output call_ids', async () => {
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1744,7 +1778,7 @@ describe('createHandler', () => {
       // `tool_call_id` before gating runs.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1786,7 +1820,7 @@ describe('createHandler', () => {
       // a forged tail.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1822,7 +1856,7 @@ describe('createHandler', () => {
       // stored names/arguments, not the forged ones.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain('all good');
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1866,7 +1900,7 @@ describe('createHandler', () => {
       // echo and uses the stored payload unchanged.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain('all good');
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1913,7 +1947,7 @@ describe('createHandler', () => {
       // the multi-tool-call gate validate the outputs normally.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain('all good');
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -1967,7 +2001,7 @@ describe('createHandler', () => {
       // ([call_a, call_b]) before dispatching cold replay.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain('reordered ok');
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2018,7 +2052,7 @@ describe('createHandler', () => {
       // precedes a function_call_output in the continuation delta.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupMultiCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2046,6 +2080,85 @@ describe('createHandler', () => {
       expect(chatSessionContinueTool).not.toHaveBeenCalled();
     });
 
+    // vLLM `check_tool_usage` + `_extract_tool_calls`: no tools or `tool_choice:
+    // 'none'` returns no calls, and the text is the content after the reasoning
+    // without the tool blocks. The dropped calls stay in the session, so it is
+    // not kept warm. Mutation: keep the calls, or adopt the session → red.
+    it.each([
+      { name: 'no tools', extra: {} },
+      { name: "tool_choice 'none'", extra: { tools: RESPONSE_TOOLS, tool_choice: 'none' } },
+    ])('a request with $name gets no function_call and replays cold', async ({ extra }) => {
+      const block = '<tool_call>\n{"name":"get_weather","arguments":{"city":"SF"}}\n</tool_call>';
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: '',
+            thinking: 'plan',
+            finishReason: 'tool_calls',
+            toolCalls: [
+              { id: 'call_x', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok', rawContent: block },
+            ] as ToolCallResult[],
+            rawText: `plan</think>\n\nSure.\n${block}`,
+            publicRawText: `\n\nSure.\n${block}`,
+          }),
+        )
+        .mockResolvedValueOnce(makeChatResult({ text: 'next' }));
+      const chatSessionContinue = vi.fn().mockRejectedValue(new Error('the session must not be kept warm'));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('unexpected')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', ...extra });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.output.map((i: { type: string }) => i.type)).toEqual(['reasoning', 'message']);
+      expect(resp1.output_text).toBe('\n\nSure.\n');
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: 'and then?',
+      });
+      const { res: res2, getBody: getBody2, waitForEnd: wait2, getStatus: getStatus2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      expect(getStatus2()).toBe(200);
+      expect(JSON.parse(getBody2()).output_text).toBe('next');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
     it('returns 400 on forged function_call_output call_id after a single-call turn', async () => {
       // Single-call regression for the lowered `extractOutstandingToolCallIds`
       // threshold (was `> 1`, now `> 0`): a single-tool-call turn must
@@ -2055,7 +2168,7 @@ describe('createHandler', () => {
       // against a stored turn whose real outstanding id is `call_single`.
       const { handler, chatSessionStart, chatSessionContinue, chatSessionContinueTool } = setupSingleCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2085,7 +2198,7 @@ describe('createHandler', () => {
       // would silently bypass the gate and orphan the outstanding call.
       const { handler, chatSessionStart, chatSessionContinue, chatSessionContinueTool } = setupSingleCallChain();
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2164,7 +2277,7 @@ describe('createHandler', () => {
       // branch in `runSessionNonStreaming` fires.
       const { handler, chatSessionStart, chatSessionContinueTool } = setupSingleCallChain('single-ok');
 
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi', tools: RESPONSE_TOOLS });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2391,7 +2504,11 @@ describe('createHandler', () => {
       const handler = createHandler(registry, { store: mockStore as any });
 
       // Turn 1: plain user → assistant emits a single tool call.
-      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'what is the weather?' });
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'what is the weather?',
+        tools: RESPONSE_TOOLS,
+      });
       const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
       await handler(req1, res1);
       await wait1();
@@ -2437,7 +2554,8 @@ describe('createHandler', () => {
     });
 
     it('cold-replays an assistant turn whose text is empty but reasoning is present', async () => {
-      // A stored record with a non-empty `reasoning` item and empty `message` item
+      // A stored record with a non-empty `reasoning` item and no `message` item
+      // (vLLM `build_response_output_items` adds none for empty content)
       // must survive cold-replay reconstruction — dropping the turn would prime the
       // model with a history that silently skips the reasoning, making the cold
       // replay diverge from a hot-path resume of the same chain. Clearing the
@@ -2448,7 +2566,7 @@ describe('createHandler', () => {
         // Turn 1: empty text alongside reasoning-only output.
         // `thinking` surfaces the reasoning item in the stored
         // `outputJson` via `buildOutputItems`, and `text` is
-        // empty so the message item carries an empty string.
+        // empty so no message item is stored.
         .mockResolvedValueOnce(
           makeChatResult({
             text: '',
@@ -2504,14 +2622,12 @@ describe('createHandler', () => {
       expect(resp1.status).toBe('completed');
       expect(resp1.output_text).toBe('');
 
-      // Sanity: the stored record actually contains a reasoning
-      // item alongside the empty message item. Otherwise the
-      // regression we're testing would be vacuous.
+      // Sanity: the stored record holds only the reasoning item.
+      // Otherwise the regression we're testing would be vacuous.
       const stored = storedRecords.get(resp1.id);
       expect(stored).toBeDefined();
       const outputItems = JSON.parse(stored.outputJson) as Array<{ type: string }>;
-      expect(outputItems.some((i) => i.type === 'reasoning')).toBe(true);
-      expect(outputItems.some((i) => i.type === 'message')).toBe(true);
+      expect(outputItems.map((i) => i.type)).toEqual(['reasoning']);
 
       // Force cold replay by clearing the session cache so the
       // second turn falls through to `primeHistory` + full
@@ -2540,7 +2656,7 @@ describe('createHandler', () => {
       expect(chatSessionContinue).not.toHaveBeenCalled();
 
       // The reconstructed cold-replay history MUST include the assistant turn with
-      // its reasoning summary even though the message item's text was empty —
+      // its reasoning summary even though no message item was stored —
       // otherwise the model sees a silently different conversation.
       const [primedMessages2] = chatSessionStart.mock.calls[1] as [
         Array<{ role: string; content: string; reasoningContent?: string }>,
@@ -10535,6 +10651,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'What is the weather in SF?',
         stream: true,
@@ -10624,6 +10741,7 @@ describe('createHandler', () => {
       registry.register('stream-model', createMockStreamModel(streamEvents));
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'hi',
         stream: true,
@@ -10686,6 +10804,7 @@ describe('createHandler', () => {
       registry.register('stream-model', createMockStreamModel(streamEvents));
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'hi',
         stream: true,
@@ -10800,6 +10919,7 @@ describe('createHandler', () => {
       registry.register('stream-model', createMockStreamModel(streamEvents));
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'hi',
         stream: true,
@@ -10860,6 +10980,7 @@ describe('createHandler', () => {
       registry.register('stream-model', createMockStreamModel(streamEvents));
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'hi',
         stream: true,
@@ -10887,6 +11008,80 @@ describe('createHandler', () => {
       expect(doneText).toBe(allDeltaText);
     });
 
+    // vLLM `_extract_tool_calls` returns no calls without tools; the stream
+    // carries the same items as the non-streaming response, and an empty
+    // message stands in when no other item is left. Mutation: keep the calls → red.
+    it.each([
+      {
+        name: 'text before the call',
+        events: [
+          { done: false, text: 'Sure.', isReasoning: false },
+          { done: false, text: '\n<tool_call>\n{"name": "search", "arguments": {}}\n</tool_call>', isReasoning: false },
+        ],
+        doneText: 'Sure.',
+        publicRawText: 'Sure.\n<tool_call>\n{"name": "search", "arguments": {}}\n</tool_call>',
+        types: ['message'],
+      },
+      {
+        name: 'only the call',
+        events: [
+          { done: false, text: '<tool_call>\n{"name": "search", "arguments": {}}\n</tool_call>', isReasoning: false },
+        ],
+        doneText: '',
+        publicRawText: '<tool_call>\n{"name": "search", "arguments": {}}\n</tool_call>',
+        types: ['message'],
+      },
+    ])(
+      'streams no function_call for a request with no tools: $name',
+      async ({ events, doneText, publicRawText, types }) => {
+        const registry = new ModelRegistry();
+        registry.register(
+          'stream-model',
+          createMockStreamModel([
+            ...events,
+            {
+              done: true,
+              text: doneText,
+              finishReason: 'tool_calls',
+              toolCalls: [{ id: 'call_1', name: 'search', arguments: '{}', status: 'ok', rawContent: '' }],
+              thinking: null,
+              numTokens: 15,
+              promptTokens: 8,
+              reasoningTokens: 0,
+              rawText: publicRawText,
+              publicRawText,
+            },
+          ]),
+        );
+        const handler = createHandler(registry);
+        const req = createMockReq('POST', '/v1/responses', { model: 'stream-model', input: 'go', stream: true });
+        const { res, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        const sse: Array<{ event: string; data: Record<string, unknown> }> = [];
+        for (const line of getBody().split('\n')) {
+          if (line.startsWith('event: ')) {
+            sse.push({ event: line.slice(7), data: {} });
+          } else if (line.startsWith('data: ') && sse.length > 0) {
+            sse[sse.length - 1].data = JSON.parse(line.slice(6));
+          }
+        }
+        expect(sse.some((e) => e.event.startsWith('response.function_call_arguments'))).toBe(false);
+        const response = sse.find((e) => e.event === 'response.completed')!.data.response as {
+          output: Array<{ type: string }>;
+          output_text: string;
+        };
+        expect(response.output.map((i) => i.type)).toEqual(types);
+        expect(response.output_text).not.toContain('tool_call');
+        const deltas = sse
+          .filter((e) => e.event === 'response.output_text.delta')
+          .map((e) => e.data.delta as string)
+          .join('');
+        expect(deltas).toBe(response.output_text);
+      },
+    );
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [
@@ -10912,6 +11107,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'Search for test',
         stream: true,
@@ -10988,6 +11184,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'What time is it?',
         stream: true,
@@ -11080,6 +11277,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'What time is it?',
         stream: true,
@@ -11219,6 +11417,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'Weather in SF?',
         stream: true,
@@ -11439,6 +11638,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const reqBody = {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'use a tool',
         stream: true,
@@ -11569,6 +11769,7 @@ describe('createHandler', () => {
 
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/responses', {
+        tools: RESPONSE_TOOLS,
         model: 'stream-model',
         input: 'What is the weather?',
         stream: true,

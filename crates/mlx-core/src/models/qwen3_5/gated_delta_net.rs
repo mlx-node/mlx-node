@@ -750,7 +750,7 @@ impl GatedDeltaNet {
         tape_sink: Option<&mut Option<GdnLayerTape>>,
     ) -> Result<MxArray> {
         self.forward_with_tape_impl(
-            x, mask, cache, use_kernel, tape_sink, None, None, None, None,
+            x, mask, None, cache, use_kernel, tape_sink, None, None, None, None,
         )
     }
 
@@ -768,6 +768,7 @@ impl GatedDeltaNet {
         self.forward_with_tape_impl(
             x,
             mask,
+            None,
             cache,
             use_kernel,
             tape_sink,
@@ -793,6 +794,7 @@ impl GatedDeltaNet {
         self.forward_with_tape_impl(
             x,
             mask,
+            None,
             cache,
             use_kernel,
             tape_sink,
@@ -800,6 +802,40 @@ impl GatedDeltaNet {
             None,
             cuda_deferred,
             tree,
+        )
+    }
+
+    /// Batched forward pass supporting right-padded sequences with explicit
+    /// per-row valid lengths so the cached `conv_state` captures each row's
+    /// true last `conv_kernel_dim - 1` pre-conv tokens rather than trailing
+    /// zero-padded positions.
+    ///
+    /// * `x` - Input `[B, T, hidden_size]`
+    /// * `mask` - Optional boolean mask `[B, T]` (`true` for valid tokens,
+    ///   `false` for right-padded positions)
+    /// * `valid_lengths` - Optional per-row valid token counts of length `B`
+    ///   (`0 <= lengths[b] <= T`). When `Some` and `cache` is `Some`, row `b`'s
+    ///   cached `conv_state` is taken from `conv_input[b, lengths[b] .. lengths[b] + (K - 1), :]`.
+    /// * `cache` - Optional `ArraysCache` (`[conv_state, recurrent_state]`)
+    #[allow(dead_code)]
+    pub(crate) fn forward_batched_masked(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        valid_lengths: Option<&[i32]>,
+        cache: Option<&mut ArraysCache>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(
+            x,
+            mask,
+            valid_lengths,
+            cache,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -817,6 +853,7 @@ impl GatedDeltaNet {
         self.forward_with_tape_impl(
             x,
             mask,
+            None,
             cache,
             use_kernel,
             tape_sink,
@@ -841,6 +878,7 @@ impl GatedDeltaNet {
         self.forward_with_tape_impl(
             x,
             None,
+            None,
             cache,
             use_kernel,
             None,
@@ -864,6 +902,7 @@ impl GatedDeltaNet {
     ) -> Result<MxArray> {
         self.forward_with_tape_impl(
             x,
+            None,
             None,
             cache,
             true,
@@ -904,6 +943,7 @@ impl GatedDeltaNet {
         let mut captured = Vec::with_capacity(plan.rows.len());
         let out = self.forward_with_tape_impl(
             x,
+            None,
             None,
             cache,
             use_kernel,
@@ -972,6 +1012,7 @@ impl GatedDeltaNet {
         &self,
         x: &MxArray,
         mask: Option<&MxArray>,
+        valid_lengths: Option<&[i32]>,
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
@@ -994,10 +1035,26 @@ impl GatedDeltaNet {
                     tv.tree_len
                 )));
             }
-            if mask.is_some() {
+            if mask.is_some() || valid_lengths.is_some() {
                 return Err(Error::from_reason(
-                    "GatedDeltaNet tree forward does not support an explicit padding mask",
+                    "GatedDeltaNet tree forward does not support an explicit padding mask or valid_lengths",
                 ));
+            }
+        }
+        if let Some(lengths) = valid_lengths {
+            if lengths.len() != batch as usize {
+                return Err(Error::from_reason(format!(
+                    "GatedDeltaNet valid_lengths length {} does not match batch {}",
+                    lengths.len(),
+                    batch
+                )));
+            }
+            for (row, &len) in lengths.iter().enumerate() {
+                if len < 0 || i64::from(len) > seq_len {
+                    return Err(Error::from_reason(format!(
+                        "GatedDeltaNet valid_lengths[{row}]={len} out of range 0..={seq_len}"
+                    )));
+                }
             }
         }
         let rows = capture
@@ -1007,6 +1064,7 @@ impl GatedDeltaNet {
         if rows.is_some()
             && (batch != 1
                 || mask.is_some()
+                || valid_lengths.is_some()
                 || tape_sink.is_some()
                 || tree.is_some()
                 || cache.as_deref().and_then(|c| c.get(4)).is_some())
@@ -1045,7 +1103,11 @@ impl GatedDeltaNet {
         // unmasked batch-1 `T >= 64` window — bit-identical to the
         // `prep_via_conv` -> `gated_delta_update` -> tail chain it replaces.
         // Decode/verify (`T < 64`) and the tape path never see it.
-        let prefill_prep = if tape_sink.is_none() && cuda_deferred.is_none() && tree.is_none() {
+        let prefill_prep = if tape_sink.is_none()
+            && cuda_deferred.is_none()
+            && tree.is_none()
+            && valid_lengths.is_none()
+        {
             self.prefill_fused(
                 &qkv,
                 &z,
@@ -1083,6 +1145,7 @@ impl GatedDeltaNet {
         // fallback (as does the generic path after it).
         if cuda_deferred.is_none()
             && tree.is_none()
+            && valid_lengths.is_none()
             && let Some(complete) = self.forward_complete(
                 &qkv,
                 &z,
@@ -1146,6 +1209,7 @@ impl GatedDeltaNet {
             };
             if batch != 1
                 || seq_len >= max_prepare_seq
+                || valid_lengths.is_some()
                 || self.conv_kernel_dim != 4
                 || self.conv_dim != 10240
                 || self.num_k_heads != 16
@@ -1230,6 +1294,7 @@ impl GatedDeltaNet {
                     &qkv,
                     batch,
                     seq_len,
+                    valid_lengths,
                     cache.as_deref_mut(),
                     conv_state,
                     use_kernel,
@@ -2265,11 +2330,13 @@ impl GatedDeltaNet {
     /// `window_conv` when possible) → SiLU → q|k|v split → head reshape.
     /// Returns the PRE-NORM head tensors; the q/k RMS-norm+scale runs in
     /// `prep_via_conv` (or inside the fused-prefill kernel).
+    #[allow(clippy::too_many_arguments)]
     fn prep_conv_qkv(
         &self,
         qkv: &MxArray,
         batch: i64,
         seq_len: i64,
+        valid_lengths: Option<&[i32]>,
         mut cache: Option<&mut ArraysCache>,
         conv_state: Option<MxArray>,
         use_kernel: bool,
@@ -2281,6 +2348,7 @@ impl GatedDeltaNet {
         // the generic conv path below.
         let fused_conv = (|| -> Option<(MxArray, MxArray)> {
             if batch != 1
+                || valid_lengths.is_some()
                 || self.conv_kernel_dim != 4
                 || !use_kernel
                 || !crate::engine::persistence::compiled_forward_backend_available()
@@ -2359,10 +2427,34 @@ impl GatedDeltaNet {
 
             // Update conv_state in cache
             if let Some(cache) = cache {
-                // Save last (kernel_size - 1) timesteps as new conv_state
+                // Save last (kernel_size - 1) valid timesteps as new conv_state.
+                // For right-padded batches with explicit `valid_lengths`, row b's
+                // true last K-1 taps live at conv_input[b, lengths[b] .. lengths[b] + K - 1, :]
+                // rather than at the trailing padded end of conv_input.
                 let total_len = conv_input.shape_at(1)?;
                 let keep = (self.conv_kernel_dim - 1) as i64;
-                if total_len >= keep {
+                if let Some(lengths) = valid_lengths {
+                    if keep > 0 && total_len >= keep {
+                        let mut rows = Vec::with_capacity(lengths.len());
+                        for (b, &len) in lengths.iter().enumerate() {
+                            let start = i64::from(len);
+                            let row = conv_input
+                                .slice_axis(0, b as i64, b as i64 + 1)?
+                                .slice_axis(1, start, start + keep)?;
+                            rows.push(row);
+                        }
+                        let next_state = if rows.len() == 1 {
+                            rows.remove(0)
+                        } else {
+                            let refs: Vec<&MxArray> = rows.iter().collect();
+                            MxArray::concatenate_many(refs, Some(0))?
+                        };
+                        cache.set(0, next_state)?;
+                    } else if total_len >= keep {
+                        let parts = conv_input.split_sections(&[total_len - keep], 1)?;
+                        cache.set(0, parts[1].clone())?;
+                    }
+                } else if total_len >= keep {
                     let parts = conv_input.split_sections(&[total_len - keep], 1)?;
                     cache.set(0, parts[1].clone())?;
                 }
@@ -2445,16 +2537,26 @@ impl GatedDeltaNet {
     /// → SiLU → q|k|v split → head reshape → q/k RMS-norm+scale. Runs whenever
     /// the fully-fused `gdn_prepare` kernel is off-contract (batch > 1,
     /// seq ≥ 64, non-10240 geometry) or declines.
+    #[allow(clippy::too_many_arguments)]
     fn prep_via_conv(
         &self,
         qkv: &MxArray,
         batch: i64,
         seq_len: i64,
+        valid_lengths: Option<&[i32]>,
         cache: Option<&mut ArraysCache>,
         conv_state: Option<MxArray>,
         use_kernel: bool,
     ) -> Result<(MxArray, MxArray, MxArray)> {
-        let (q, k, v) = self.prep_conv_qkv(qkv, batch, seq_len, cache, conv_state, use_kernel)?;
+        let (q, k, v) = self.prep_conv_qkv(
+            qkv,
+            batch,
+            seq_len,
+            valid_lengths,
+            cache,
+            conv_state,
+            use_kernel,
+        )?;
         let (q, k) = self.norm_qk(&q, &k)?;
         Ok((q, k, v))
     }
@@ -2581,8 +2683,15 @@ impl GatedDeltaNet {
         }
         // Conv first: on a late kernel decline the prepared views feed the
         // shared chain instead of being recomputed.
-        let (q_raw, k_raw, v) =
-            self.prep_conv_qkv(qkv, batch, seq_len, cache, conv_state.cloned(), use_kernel)?;
+        let (q_raw, k_raw, v) = self.prep_conv_qkv(
+            qkv,
+            batch,
+            seq_len,
+            None,
+            cache,
+            conv_state.cloned(),
+            use_kernel,
+        )?;
         if [q_raw.dtype().ok(), k_raw.dtype().ok(), v.dtype().ok()]
             .iter()
             .any(|d| *d != Some(crate::array::DType::BFloat16))
@@ -3068,6 +3177,245 @@ mod tests {
         net.set_dt_bias(&weight(&[hv]));
         net.set_a_log(&weight(&[hv])).unwrap();
         net
+    }
+
+    #[test]
+    fn gdn_right_pad_conv_state_parity() {
+        fn check_geometry(head_dim: i32, lengths: [usize; 3]) {
+            let hidden = 64i32;
+            let cfg = Qwen3_5Config {
+                rope_scaling: None,
+                qwen35_gguf_gdn_layout: None,
+                kv_format: None,
+                vocab_size: 32,
+                hidden_size: hidden,
+                num_layers: 1,
+                num_heads: 4,
+                num_kv_heads: 2,
+                intermediate_size: 128,
+                rms_norm_eps: 1e-6,
+                head_dim: 16,
+                tie_word_embeddings: true,
+                attention_bias: false,
+                max_position_embeddings: 128,
+                pad_token_id: 0,
+                eos_token_id: 1,
+                bos_token_id: 2,
+                linear_num_value_heads: 4,
+                linear_num_key_heads: 2,
+                linear_key_head_dim: head_dim,
+                linear_value_head_dim: head_dim,
+                linear_conv_kernel_dim: 4,
+                full_attention_interval: 4,
+                partial_rotary_factor: 0.25,
+                rope_theta: 10_000.0,
+                paged_cache_memory_mb: None,
+                paged_block_size: None,
+                n_mtp_layers: 0,
+            };
+            let mut gdn = GatedDeltaNet::new(&cfg).unwrap();
+            let det = |shape: &[i64], salt: f32, scale: f32| -> MxArray {
+                let n: usize = shape.iter().map(|&d| d as usize).product();
+                let vals: Vec<f32> = (0..n)
+                    .map(|i| ((i as f32) * 0.4173 + salt).sin() * scale)
+                    .collect();
+                MxArray::from_float32(&vals, shape).unwrap()
+            };
+            let key_dim = cfg.linear_key_dim() as i64;
+            let val_dim = cfg.linear_value_dim() as i64;
+            let conv_dim = cfg.linear_conv_dim() as i64;
+            let hv = cfg.linear_num_value_heads as i64;
+            gdn.set_in_proj_qkvz_weight(&det(
+                &[2 * key_dim + 2 * val_dim, hidden as i64],
+                1.0,
+                0.12,
+            ))
+            .unwrap();
+            gdn.set_in_proj_ba_weight(&det(&[2 * hv, hidden as i64], 2.0, 0.12))
+                .unwrap();
+            gdn.set_conv1d_weight(&det(&[conv_dim, 4, 1], 3.0, 0.2), DType::Float32)
+                .unwrap();
+            gdn.set_out_proj_weight(&det(&[hidden as i64, val_dim], 4.0, 0.12))
+                .unwrap();
+
+            let hidden_usize = hidden as usize;
+            let max_len = *lengths.iter().max().unwrap();
+
+            // Build 3 unpadded sequences of lengths `lengths` + 2 continuation tokens each.
+            let mut seqs: Vec<Vec<f32>> = Vec::with_capacity(3);
+            let mut cont_steps: [Vec<Vec<f32>>; 2] = [Vec::new(), Vec::new()];
+            for (b, &len) in lengths.iter().enumerate() {
+                let seq: Vec<f32> = (0..(len * hidden_usize))
+                    .map(|i| (((b * 1009 + i) as f32) * 0.041).sin() * 0.3)
+                    .collect();
+                seqs.push(seq);
+                for (step, slot) in cont_steps.iter_mut().enumerate() {
+                    let tok: Vec<f32> = (0..hidden_usize)
+                        .map(|i| (((b * 733 + step * 197 + i) as f32) * 0.073).cos() * 0.3)
+                        .collect();
+                    slot.push(tok);
+                }
+            }
+
+            // Reference: run each sequence independently at B=1 unpadded + 2 decode steps.
+            let mut ref_prefill = Vec::with_capacity(3);
+            let mut ref_prefill_conv = Vec::with_capacity(3);
+            let mut ref_prefill_rec = Vec::with_capacity(3);
+            let mut ref_decode: [Vec<Vec<f32>>; 2] = [Vec::new(), Vec::new()];
+            for b in 0..3 {
+                let mut cache = ArraysCache::new(2);
+                let x_single =
+                    MxArray::from_float32(&seqs[b], &[1, lengths[b] as i64, hidden as i64])
+                        .unwrap();
+                let y = gdn
+                    .forward(&x_single, None, Some(&mut cache), true)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .to_vec();
+                ref_prefill.push(y);
+                ref_prefill_conv.push(cache.get(0).unwrap().to_float32().unwrap().to_vec());
+                ref_prefill_rec.push(cache.get(1).unwrap().to_float32().unwrap().to_vec());
+                for step in 0..2 {
+                    let x_step =
+                        MxArray::from_float32(&cont_steps[step][b], &[1, 1, hidden as i64])
+                            .unwrap();
+                    let y_step = gdn
+                        .forward(&x_step, None, Some(&mut cache), true)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap()
+                        .to_vec();
+                    ref_decode[step].push(y_step);
+                }
+            }
+
+            // Batched right-padded prefill (B=3, T=max_len) with mask + valid_lengths.
+            let mut padded_x = vec![0.0f32; 3 * max_len * hidden_usize];
+            let mut mask_vals = vec![0i32; 3 * max_len];
+            for (b, &len) in lengths.iter().enumerate() {
+                for t in 0..max_len {
+                    if t < len {
+                        mask_vals[b * max_len + t] = 1;
+                        let dst = (b * max_len + t) * hidden_usize;
+                        let src = t * hidden_usize;
+                        padded_x[dst..dst + hidden_usize]
+                            .copy_from_slice(&seqs[b][src..src + hidden_usize]);
+                    } else {
+                        // Put non-zero garbage in padded positions to prove masking +
+                        // valid_lengths completely isolate them from conv_state & state.
+                        let dst = (b * max_len + t) * hidden_usize;
+                        for v in &mut padded_x[dst..dst + hidden_usize] {
+                            *v = 7.5;
+                        }
+                    }
+                }
+            }
+            let x_batch =
+                MxArray::from_float32(&padded_x, &[3, max_len as i64, hidden as i64]).unwrap();
+            let mask_batch = MxArray::from_int32(&mask_vals, &[3, max_len as i64])
+                .unwrap()
+                .greater(&MxArray::scalar_int(0).unwrap())
+                .unwrap();
+            let valid_lengths: Vec<i32> = lengths.iter().map(|&l| l as i32).collect();
+
+            let mut batch_cache = ArraysCache::new(2);
+            let y_batch = gdn
+                .forward_batched_masked(
+                    &x_batch,
+                    Some(&mask_batch),
+                    Some(&valid_lengths),
+                    Some(&mut batch_cache),
+                )
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            // Check every valid prefill position AND cached conv_state / recurrent_state match B=1.
+            for (b, &len) in lengths.iter().enumerate() {
+                let mut max_diff = 0.0f32;
+                for t in 0..len {
+                    let b_off = (b * max_len + t) * hidden_usize;
+                    let r_off = t * hidden_usize;
+                    for d in 0..hidden_usize {
+                        max_diff = max_diff
+                            .max((y_batch.as_ref()[b_off + d] - ref_prefill[b][r_off + d]).abs());
+                    }
+                }
+                assert!(
+                    max_diff < 1e-4,
+                    "prefill mismatch (head_dim={head_dim}, row={b}, len={len}): max_diff={max_diff}"
+                );
+
+                let row_conv = batch_cache
+                    .get(0)
+                    .unwrap()
+                    .slice_axis(0, b as i64, b as i64 + 1)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                let conv_diff = row_conv
+                    .as_ref()
+                    .iter()
+                    .zip(&ref_prefill_conv[b])
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    conv_diff < 1e-5,
+                    "conv_state mismatch (head_dim={head_dim}, row={b}, len={len}): max_diff={conv_diff}"
+                );
+
+                let row_rec = batch_cache
+                    .get(1)
+                    .unwrap()
+                    .slice_axis(0, b as i64, b as i64 + 1)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                let rec_diff = row_rec
+                    .as_ref()
+                    .iter()
+                    .zip(&ref_prefill_rec[b])
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    rec_diff < 1e-5,
+                    "recurrent_state mismatch (head_dim={head_dim}, row={b}, len={len}): max_diff={rec_diff}"
+                );
+            }
+
+            // Continuation decode steps (B=3, T=1) without mask.
+            for step in 0..2 {
+                let mut flat_step = Vec::with_capacity(3 * hidden_usize);
+                for row in &cont_steps[step] {
+                    flat_step.extend_from_slice(row);
+                }
+                let x_step = MxArray::from_float32(&flat_step, &[3, 1, hidden as i64]).unwrap();
+                let y_step = gdn
+                    .forward_batched_masked(&x_step, None, None, Some(&mut batch_cache))
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+
+                for (b, ref_row) in ref_decode[step].iter().enumerate() {
+                    let off = b * hidden_usize;
+                    let max_diff = y_step.as_ref()[off..off + hidden_usize]
+                        .iter()
+                        .zip(ref_row)
+                        .map(|(a, c)| (a - c).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_diff < 1e-4,
+                        "decode step {step} mismatch (head_dim={head_dim}, row={b}): max_diff={max_diff}"
+                    );
+                }
+            }
+        }
+
+        // Exact prompt geometry (head_dim=16 -> ops path) with lengths [5, 9, 3]
+        check_geometry(16, [5, 9, 3]);
+        // Metal masked kernel geometry (head_dim=32) including len < conv_k - 1 (len=2)
+        check_geometry(32, [5, 9, 2]);
     }
 
     /// Probe the FFI directly so the parity test below can never pass
@@ -3833,6 +4181,7 @@ mod tests {
             net.forward_with_tape_impl(
                 &x,
                 None,
+                None,
                 Some(&mut ArraysCache::new(2)),
                 true,
                 Some(&mut taped),
@@ -3848,6 +4197,7 @@ mod tests {
             net.forward_with_tape_impl(
                 &x,
                 Some(&mask),
+                None,
                 Some(&mut ArraysCache::new(2)),
                 true,
                 None,

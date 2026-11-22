@@ -17,6 +17,7 @@ import { DashboardApiError, mutate } from '../../lib/api';
 import { formatBytes, formatCount, formatNumber, formatRelativeTime, formatTps } from '../../lib/format';
 import { modelColor } from '../../lib/model-colors';
 import { dailyTurns, matchesModel, usageKeys, type ModelUsage } from '../../lib/model-usage';
+import { formatModelFamily, isSystemOneModelType } from '../../lib/system-one';
 import { otherLabel } from '../../lib/timeseries';
 import { toast } from '../../lib/toast';
 import {
@@ -241,8 +242,15 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
       header: 'Family',
       width: 96,
       minTableWidth: 860,
-      sortValue: (model) => model.modelType,
-      cell: (model) => <span className="text-secondary">{model.modelType}</span>,
+      sortValue: (model) => formatModelFamily(model.modelType),
+      cell: (model) =>
+        isSystemOneModelType(model.modelType) ? (
+          <Badge size="sm" color="violet" outline>
+            {formatModelFamily(model.modelType)}
+          </Badge>
+        ) : (
+          <span className="text-secondary">{model.modelType}</span>
+        ),
     },
     {
       id: 'quant',

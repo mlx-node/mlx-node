@@ -43,12 +43,12 @@ import { bucketSql } from '../sql.js';
  *  - `disabledTurns` — the tier was off (`--no-persist-cache`, or a family off
  *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
- *    count, not a lookup bucket. A qwen3_5 / qwen3_5_moe / qwen4_exp turn counts
+ *    count, not a lookup bucket. A qwen3_5 / qwen3_5_moe / qwen4_exp / hy_v4_flash turn counts
  *    by its own disk cache, the SSD state tier (`state_tier`): off when that tier was
  *    `off` or only `temp` (gone at the engine's stop).
  *  - `enabledTurns` — the tier was on, whatever the root: with `disabledTurns`
  *    the measured answer to "did the turns run with the disk cache". A
- *    qwen3_5 / qwen3_5_moe / qwen4_exp turn counts here when its state tier was
+ *    qwen3_5 / qwen3_5_moe / qwen4_exp / hy_v4_flash turn counts here when its state tier was
  *    `persistent`.
  *  - `unrootedSidecarCaptures` — the one delta a rootless turn can still carry,
  *    and the reason "their deltas are all zero" is true of the BLOCK counters

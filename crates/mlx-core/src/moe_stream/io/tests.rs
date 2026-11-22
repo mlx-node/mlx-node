@@ -373,6 +373,60 @@ fn recheck_sees_atomic_replace() {
     assert!(set.recheck().is_err(), "missing path passed recheck");
 }
 
+#[test]
+fn open_with_cache_reads_identical_bytes_to_open() {
+    let f = fixture();
+    let shard2_dir = Temp::new();
+    let shard2_path = shard2_dir.0.join("engram.gguf");
+    let shard2_bytes = random_bytes(40_000, 99);
+    std::fs::write(&shard2_path, &shard2_bytes).unwrap();
+    let paths = [f.path.clone(), shard2_path];
+
+    assert!(ShardSet::open_with_cache(&paths, &[true]).is_err());
+
+    let nocache = Arc::new(ShardSet::open(&paths).unwrap());
+    let mixed = Arc::new(ShardSet::open_with_cache(&paths, &[true, false]).unwrap());
+    assert_eq!(mixed.len(), nocache.len());
+
+    let mut b0 = AlignedBuf::new();
+    let mut b1 = AlignedBuf::new();
+    for ext in [
+        Extent {
+            shard: 0,
+            offset: ABS + 17,
+            len: 20_000,
+        },
+        Extent {
+            shard: 1,
+            offset: 123,
+            len: 35_000,
+        },
+    ] {
+        let want = nocache.read_aligned(ext, &mut b0).unwrap().to_vec();
+        let got = mixed.read_aligned(ext, &mut b1).unwrap().to_vec();
+        assert_eq!(got, want, "read_aligned mismatch for {ext:?}");
+    }
+
+    let pool_open = IoPool::new(Arc::clone(&nocache), 3).unwrap();
+    let pool_cache = IoPool::new(Arc::clone(&mixed), 3).unwrap();
+    let b_open = bank(&f);
+    let b_cache = bank(&f);
+    // SAFETY: both banks outlive their tickets; one read per slot.
+    unsafe {
+        pool_open
+            .submit(expert_reads(&f, &b_open), Priority::High)
+            .unwrap()
+            .wait()
+            .unwrap();
+        pool_cache
+            .submit(expert_reads(&f, &b_cache), Priority::High)
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    assert_eq!(slots(&b_cache.dst), slots(&b_open.dst));
+}
+
 /// Independent MXFP4 -> MLX `mxfp4` packing: codes `j` / `j + 16` are the
 /// low / high nibble of byte `1 + j`, 8 codes per u32 LSB first; byte 0 is
 /// the E8M0 scale.

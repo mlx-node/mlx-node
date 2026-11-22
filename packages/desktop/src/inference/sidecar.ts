@@ -17,6 +17,7 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { familyDataFor } from '@mlx-node/lm/family-data';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
@@ -166,10 +167,24 @@ export interface SidecarHost {
 }
 
 /** The endpoint file's `models[]`, field by field: the host's entries carry more than the file may hold. */
-export function endpointModels(
-  models: SidecarHost['models'],
-): { name: string; path: string; base: string; variant: string; format: 'gguf' | 'mlx' }[] {
-  return models.map(({ name, path, base, variant, format }) => ({ name, path, base, variant, format }));
+export function endpointModels(models: SidecarHost['models']): {
+  name: string;
+  path: string;
+  base: string;
+  variant: string;
+  format: 'gguf' | 'mlx';
+  modelType: string;
+  kind: 'chat' | 'decision';
+}[] {
+  return models.map(({ name, path, base, variant, format, modelType }) => ({
+    name,
+    path,
+    base,
+    variant,
+    format,
+    modelType,
+    kind: familyDataFor(modelType)?.kind === 'decision' ? 'decision' : 'chat',
+  }));
 }
 
 /**

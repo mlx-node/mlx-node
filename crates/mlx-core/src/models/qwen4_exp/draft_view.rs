@@ -3,12 +3,13 @@
 //! `DFlashDraft::addDecode` runs after the draft's own final norm; no
 //! hyper-connection mix), and the tapped rows of finished passes.
 use super::*;
-use crate::models::quantized_linear::LinearProj;
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::models::qwen3_5::dflash2::{DFlash2TargetShape, DFlash2TargetView};
 use crate::nn::Embedding;
 
 pub(in super::super) struct TargetView<'a> {
     decoder: &'a mut Decoder,
+    head_limit: Option<usize>,
 }
 
 impl DFlash2TargetView for TargetView<'_> {
@@ -41,11 +42,34 @@ impl DFlash2TargetView for TargetView<'_> {
     fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)> {
         None
     }
+
+    fn target_lm_head_qlinear(&self) -> Option<&QuantizedLinear> {
+        if !super::super::cuda_qwen4_fast_enabled() {
+            return None;
+        }
+        let key = self.decoder.key("lm_head.weight", "output.weight");
+        self.decoder.weights.resident_qlinear(&key)
+    }
+
+    fn proposal_head_limit(&self) -> Option<usize> {
+        self.head_limit
+    }
 }
 
 impl Decoder {
+    #[cfg(test)]
     pub(in super::super) fn draft_view(&mut self) -> TargetView<'_> {
-        TargetView { decoder: self }
+        self.draft_view_with_limit(None)
+    }
+
+    pub(in super::super) fn draft_view_with_limit(
+        &mut self,
+        head_limit: Option<usize>,
+    ) -> TargetView<'_> {
+        TargetView {
+            decoder: self,
+            head_limit,
+        }
     }
 
     pub(in super::super) fn draft_target_shape(&self) -> DFlash2TargetShape {
@@ -104,4 +128,50 @@ pub(in super::super) fn tapped_rows(
             }
         })
         .collect()
+}
+
+/// Tree-verify counterpart to [`tapped_rows`]: reuses zero-copy slicing when
+/// `is_contiguous_prefix`, otherwise gathers `accepted_nodes` via `take(axis=1)`
+/// from the tree verify pass starting at `position`.
+pub(in super::super) fn tapped_tree_rows(
+    passes: &[TappedRows],
+    position: usize,
+    accepted_nodes: &[usize],
+    is_contiguous_prefix: bool,
+) -> Result<Vec<MxArray>> {
+    if accepted_nodes.is_empty() {
+        return Err(Error::from_reason(
+            "Qwen4 draft tree context: empty accepted path",
+        ));
+    }
+    if is_contiguous_prefix {
+        return tapped_rows(passes, position, position + accepted_nodes.len());
+    }
+    let pass = passes
+        .iter()
+        .rev()
+        .find(|p| p.first == position)
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Qwen4 draft tree context: missing tapped pass at position {position}"
+            ))
+        })?;
+    let total = pass.rows()?;
+    let indices: Vec<i32> = accepted_nodes
+        .iter()
+        .map(|&n| {
+            if n < total {
+                Ok(n as i32)
+            } else {
+                Err(Error::from_reason(format!(
+                    "Qwen4 draft tree context: accepted node {n} >= tapped rows {total}"
+                )))
+            }
+        })
+        .collect::<Result<_>>()?;
+    let idx = MxArray::from_int32(&indices, &[indices.len() as i64])?;
+    pass.hidden
+        .iter()
+        .map(|tap| tap.take(&idx, 1))
+        .collect::<Result<Vec<_>>>()
 }

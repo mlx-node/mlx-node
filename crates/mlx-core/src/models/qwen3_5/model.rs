@@ -175,6 +175,10 @@ pub(crate) struct Qwen35Inner {
     pub(crate) final_norm: RMSNorm,
     pub(crate) lm_head: Option<LinearProj>,
     pub(crate) clef_head: Option<crate::models::clef::head::JointHead>,
+    pub(crate) clairic_head: Option<crate::models::clairic::head::ClairicHead>,
+    pub(crate) clairic_grammar: Option<Arc<crate::grammar::GrammarEngine>>,
+    pub(crate) clairic_multimodal: crate::models::qwen3_5::config::Qwen3_5MultimodalTokens,
+    pub(crate) clairic_profile: Option<crate::models::clairic::profile::ClairicProfile>,
     pub(crate) prism_hadamard: Option<crate::quant::prism_hadamard::PrismHadamardRuntime>,
     /// Optional external DFlash2 companion. When installed it takes
     /// precedence over the target checkpoint's inline one-layer MTP head.
@@ -570,6 +574,7 @@ pub struct Qwen3_5Model {
     /// Actual merge size installed on the loaded inner model, paired with
     /// `image_processor` for exact preflight geometry.
     pub(crate) spatial_merge_size: i32,
+    pub(crate) clairic_profile: Option<crate::models::clairic::profile::ClairicProfile>,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// Directory containing tokenizer/config assets for this loaded model.
     /// For direct GGUF loads this is the lossless native-packed cache rather
@@ -919,6 +924,29 @@ impl Qwen3_5Model {
 }
 
 impl Qwen3_5Model {
+    /// Cached Clairic profile selected from `clair_head_config.json` at load time.
+    /// Returns `None` for standard chat and CLEF loads.
+    pub(crate) fn clairic_profile(
+        &self,
+    ) -> Option<crate::models::clairic::profile::ClairicProfile> {
+        self.clairic_profile
+    }
+
+    /// Execute a Clairic task directly on `&mut Qwen35Inner` inside the dedicated
+    /// model thread and await its serialized result.
+    pub(crate) async fn run_clairic<F>(&self, task: F) -> Result<String>
+    where
+        F: FnOnce(&mut Qwen35Inner) -> Result<String> + Send + 'static,
+    {
+        crate::model_thread::send_and_await(&self.thread, move |reply| {
+            Qwen35FamilyCommand::RunClairic {
+                task: Box::new(task),
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Joins the model thread once it has dropped the model's state, then
     /// releases the cache-limit debits. Requires exclusive command-sender
     /// ownership.

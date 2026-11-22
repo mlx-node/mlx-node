@@ -248,7 +248,9 @@ impl Decoder {
     }
 
     pub(super) fn decode_submit_span(&self) -> usize {
-        if self.device_routes.is_some() {
+        if self.device_routes.is_some()
+            || (super::super::cuda_qwen4_fast_enabled() && self.weights.plan.direct)
+        {
             self.config.num_hidden_layers
         } else {
             3
@@ -256,11 +258,22 @@ impl Decoder {
     }
 
     pub(super) fn decode_should_submit(&self, completed_layers: usize) -> bool {
+        // On CUDA direct decode: submit Layer 0 immediately so GPU overlaps
+        // with Layer 1's 16 PLE rows, then Layer 3 so GPU stays fed while
+        // Layers 4..11 build, then every 12 layers (5 async batches vs 16).
+        if self.device_routes.is_none()
+            && super::super::cuda_qwen4_fast_enabled()
+            && self.weights.plan.direct
+        {
+            return completed_layers == 1
+                || completed_layers == 4
+                || completed_layers.is_multiple_of(12);
+        }
         // Match the upstream overlap schedule: start the first two layers,
         // then submit groups of three while building the rest of this token.
         // Ordinary decoding retains its per-layer submission and short waits.
-        self.device_routes.is_none()
-            || (completed_layers >= 2 && (completed_layers - 2).is_multiple_of(3))
+        let async_direct = self.device_routes.is_some();
+        !async_direct || (completed_layers >= 2 && (completed_layers - 2).is_multiple_of(3))
     }
 
     pub(super) fn tentative_shared_experts(
@@ -313,6 +326,7 @@ impl Decoder {
     /// put one-row routes on the R-row tape.
     pub(super) fn verify_routes_on_device(&self) -> bool {
         self.gguf()
+            && crate::engine::persistence::compiled_forward_backend_available()
             && self.weights.plan.direct
             && self.config.hidden_size == 2560
             && self.config.moe_intermediate_size == 640
@@ -404,6 +418,7 @@ impl Decoder {
             return self.ordinary_token(token, project);
         }
         if !self.gguf()
+            || !crate::engine::persistence::compiled_forward_backend_available()
             || self.verification.is_some()
             || self.config.hidden_size != 2560
             || self.config.moe_intermediate_size != 640

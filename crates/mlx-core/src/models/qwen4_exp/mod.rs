@@ -38,6 +38,50 @@ fn tf32_enabled() -> bool {
     std::env::var_os("MLX_ENABLE_TF32").is_none_or(|value| value != "0")
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CUDA_QWEN4_FAST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Temporarily override [`cuda_qwen4_fast_enabled`] on the current test thread
+/// for deterministic in-process A/B parity tests (`MLX_QWEN4_CUDA_FAST=1` vs `0`).
+#[cfg(test)]
+pub(crate) fn with_cuda_qwen4_fast<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    struct Guard(Option<bool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CUDA_QWEN4_FAST_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = CUDA_QWEN4_FAST_OVERRIDE.with(|c| c.replace(Some(enabled)));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Whether Wave A fused CUDA kernels for `qwen4_exp` are enabled.
+///
+/// Default on whenever CUDA GPU execution is active; set `MLX_QWEN4_CUDA_FAST=0`
+/// to fall back to the Phase 0 generic MLX path for A/B parity testing.
+#[inline]
+pub(super) fn cuda_qwen4_fast_enabled() -> bool {
+    if !crate::accelerator::cuda_ops_available() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(val) = CUDA_QWEN4_FAST_OVERRIDE.with(|c| c.get()) {
+        return val;
+    }
+    #[cfg(test)]
+    {
+        std::env::var_os("MLX_QWEN4_CUDA_FAST").is_none_or(|v| v != "0")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("MLX_QWEN4_CUDA_FAST").is_none_or(|v| v != "0"))
+    }
+}
+
 use crate::array::MxArray;
 use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};
 use crate::engine::model_command::ModelCommand;
@@ -269,7 +313,41 @@ impl DecodeStep for Step<'_> {
         self.forward_with_token(ids, token)
     }
     fn forward_with_token(&mut self, _ids: &MxArray, token: u32) -> Result<(MxArray, bool)> {
-        Ok((self.0.decoder.step(token)?, true))
+        let lazy = self.0.decoder.paged.is_none() && cuda_qwen4_fast_enabled();
+        let prev = std::mem::replace(&mut self.0.decoder.cuda_ar_lazy_logits, lazy);
+        let res = self.0.decoder.step(token);
+        self.0.decoder.cuda_ar_lazy_logits = prev;
+        Ok((res?, true))
+    }
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        if self.0.decoder.paged.is_none() && cuda_qwen4_fast_enabled() {
+            self.0
+                .decoder
+                .flush_cuda_ar_step(next_token, logits, budget_forced);
+        } else if budget_forced {
+            MxArray::async_eval_arrays(&[next_token, logits]);
+        } else {
+            MxArray::async_eval_arrays(&[next_token]);
+        }
+    }
+    fn end_decode(&mut self) -> Result<()> {
+        if self.0.decoder.paged.is_none() && cuda_qwen4_fast_enabled() {
+            self.0.decoder.sync_cuda_pending_states()?;
+        }
+        Ok(())
+    }
+    fn maintain_cache(&mut self, step: i32) {
+        if (step + 1) % 256 == 0 {
+            let should_clear = if crate::accelerator::cuda_ops_available() {
+                crate::array::get_cache_memory()
+                    > crate::accelerator::cuda_cache_clear_threshold_bytes()
+            } else {
+                true
+            };
+            if should_clear {
+                crate::array::clear_cache();
+            }
+        }
     }
 }
 /// Paged lane: [`crate::engine::paged_stepper::PagedStepper`] wraps the
@@ -308,6 +386,25 @@ impl ChatBackend for Inner {
     }
     fn execution_plan(&self) -> crate::engine::plan::ExecutionPlan {
         use crate::engine::plan::*;
+        let speculative = if self.draft.is_some() {
+            Some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: self.decoder.paged.is_some(),
+                supports_streaming: true,
+            })
+        } else if self.has_mtp && self.decoder.paged.is_some() {
+            Some(SpeculativePlan {
+                kind: SpeculativeKind::NativeMtp,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: true,
+                supports_streaming: true,
+            })
+        } else {
+            None
+        };
         ExecutionPlan {
             media: MediaPlan::with_backend_validation(
                 if self.vision.available() {
@@ -320,18 +417,26 @@ impl ChatBackend for Inner {
             paged_attention: self.decoder.paged.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: (self.has_mtp || self.draft.is_some()).then_some(SpeculativePlan {
-                kind: if self.draft.is_some() {
-                    SpeculativeKind::DraftModel
-                } else {
-                    SpeculativeKind::NativeMtp
-                },
-                supported_input_media: MediaCapabilities::NONE,
-                supported_context_media: MediaCapabilities::NONE,
-                supports_paged_attention: true,
-                supports_streaming: true,
-            }),
+            speculative,
         }
+    }
+    fn run_speculative_turn(
+        &mut self,
+        args: &mut crate::engine::backend::WholeTurnArgs<'_>,
+    ) -> Result<crate::engine::backend::TurnOutput> {
+        if self.decoder.paged.is_none()
+            && matches!(
+                args.plan.decoder,
+                crate::engine::plan::DecoderPlan::Speculative(
+                    crate::engine::plan::SpeculativeKind::DraftModel
+                )
+            )
+        {
+            return self.flat_dflash2_turn(args);
+        }
+        Err(Error::from_reason(
+            "qwen4_exp flat speculative turn requires an attached DFlash2 draft model",
+        ))
     }
     fn run_paged_turn(
         &mut self,
@@ -444,6 +549,12 @@ impl ChatBackend for Inner {
         let mut v = self.defaults.eos_token_ids.clone();
         v.push(self.decoder.config.eos_token_id);
         v
+    }
+    fn context_window(&self) -> Option<u32> {
+        self.decoder
+            .paged
+            .is_none()
+            .then(|| self.decoder.context_window.min(u32::MAX as usize) as u32)
     }
     fn cached_token_history(&self) -> &[u32] {
         &self.saved_history
@@ -828,6 +939,9 @@ pub struct Qwen4ExpModel {
     has_mtp: bool,
     /// A DFlash2 draft is attached.
     has_draft: bool,
+    /// Whether this load owns a Metal block-paged KV pool (`false` on CUDA/CPU
+    /// flat BF16 KV execution).
+    has_paged_cache: bool,
     context_limits: Qwen4ExpContextLimits,
     residency: memory::Plan,
     live: Arc<live::Live>,
@@ -900,6 +1014,7 @@ impl Qwen4ExpModel {
                     });
                 let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
                 let (tier_options, disk) = disk_plan(LABEL, &options, env.as_deref())?;
+                let disk = disk && crate::accelerator::host_has_metal();
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
                 let tokenizer = Arc::new(Qwen3Tokenizer::load_from_file_sync(
@@ -922,11 +1037,12 @@ impl Qwen4ExpModel {
                     crate::engine::persistence::parse_generation_defaults(Path::new(&assets));
                 let live = memory::live_memory().ok_or_else(|| {
                     Error::from_reason(format!(
-                        "{LABEL} memory plan: the Metal working set is unreadable; refusing an unplanned load"
+                        "{LABEL} memory plan: the device working set is unreadable; refusing an unplanned load"
                     ))
                 })?;
+                let margin = load_plan::host_margin();
                 let inventory = weights.load_inventory(&config, supports_images)?;
-                let decision = load_plan::plan_store(
+                let decision = load_plan::plan_store_with_margin(
                     LABEL,
                     &config,
                     &inventory,
@@ -936,6 +1052,7 @@ impl Qwen4ExpModel {
                     has_mtp,
                     disk,
                     draft_price,
+                    margin,
                 )?;
                 weights.set_store_plan(decision.store, inventory.store_fixed_bytes);
                 let mut decoder = decoder::Decoder::new(config.clone(), weights)?;
@@ -956,10 +1073,10 @@ impl Qwen4ExpModel {
                     let engine = |held_back: u64| {
                         let live = memory::live_memory().ok_or_else(|| {
                             Error::from_reason(format!(
-                                "{LABEL} memory plan: the Metal working set is unreadable"
+                                "{LABEL} memory plan: the device working set is unreadable"
                             ))
                         })?;
-                        load_plan::plan_engine(
+                        load_plan::plan_engine_with_margin(
                             LABEL,
                             &config,
                             live,
@@ -969,6 +1086,7 @@ impl Qwen4ExpModel {
                             disk,
                             draft_price,
                             decision.states,
+                            margin,
                         )
                     };
                     let held_back = decoder.weights.held_back_bytes();
@@ -981,19 +1099,31 @@ impl Qwen4ExpModel {
                     let pool_plan = plan.pool.ok_or_else(|| {
                         Error::from_reason(format!("{LABEL} memory plan: the load planned no pool"))
                     })?;
-                    let adapter = paged::create(&config, &pool_plan, plan.ceiling_bytes())?;
-                    let pool_bytes = adapter.pool_allocated_bytes().map_err(Error::from_reason)?;
-                    tracing::info!(
-                        "{LABEL} pool: kv_format={}, {} B blocks",
-                        config.kv_format.as_str(),
-                        adapter.bytes_per_block().map_err(Error::from_reason)?
-                    );
-                    decoder.paged = Some(adapter);
-                    let guard = crate::cache_limit::coordinator().register_pool(pool_bytes);
-                    (guard, plan, pool_bytes)
+                    if crate::accelerator::host_has_metal() {
+                        let adapter = paged::create(&config, &pool_plan, plan.ceiling_bytes())?;
+                        let pool_bytes =
+                            adapter.pool_allocated_bytes().map_err(Error::from_reason)?;
+                        tracing::info!(
+                            "{LABEL} pool: kv_format={}, {} B blocks",
+                            config.kv_format.as_str(),
+                            adapter.bytes_per_block().map_err(Error::from_reason)?
+                        );
+                        decoder.paged = Some(adapter);
+                        let guard = crate::cache_limit::coordinator().register_pool(pool_bytes);
+                        (Some(guard), plan, pool_bytes)
+                    } else {
+                        tracing::info!(
+                            "{LABEL} flat KV cache: kv_format={}, window={} tokens",
+                            config.kv_format.as_str(),
+                            pool_plan.lane.window.maximum()
+                        );
+                        decoder.paged = None;
+                        (None, plan, 0)
+                    }
                 };
-                if let Some(adapter) = decoder.paged.as_mut() {
-                    let pool_id = pool_guard.id();
+                if let (Some(adapter), Some(guard)) = (decoder.paged.as_mut(), pool_guard.as_ref())
+                {
+                    let pool_id = guard.id();
                     adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
                         crate::cache_limit::coordinator().update_pool(pool_id, bytes);
                     })));
@@ -1004,11 +1134,15 @@ impl Qwen4ExpModel {
                     &memory_plan,
                     pool_bytes,
                 )?;
-                let context_limits = Qwen4ExpContextLimits::from_plan(
+                let has_paged_cache = decoder.paged.is_some();
+                let mut context_limits = Qwen4ExpContextLimits::from_plan(
                     &config,
                     &memory_plan,
                     max_context.unwrap_or_else(|| config.served_context_tokens()),
                 )?;
+                if !has_paged_cache {
+                    context_limits.paged_block_capacity = 0;
+                }
                 decoder
                     .weights
                     .set_active_ceiling(memory_plan.ceiling_bytes());
@@ -1019,7 +1153,6 @@ impl Qwen4ExpModel {
                     context_limits.effective_window_tokens as usize,
                     decision.allowance_tokens,
                 );
-                let pool_guard = Some(pool_guard);
                 let residency = decoder.weights.plan.clone();
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
@@ -1049,7 +1182,7 @@ impl Qwen4ExpModel {
                 };
                 let has_draft = draft.is_some();
                 inner.set_draft(draft)?;
-                if disk {
+                if disk && has_paged_cache {
                     let identity = inner
                         .decoder
                         .weights
@@ -1082,6 +1215,7 @@ impl Qwen4ExpModel {
                         assets,
                         has_mtp,
                         has_draft,
+                        has_paged_cache,
                         context_limits,
                         residency,
                         live,
@@ -1100,6 +1234,7 @@ impl Qwen4ExpModel {
             assets_path,
             has_mtp,
             has_draft,
+            has_paged_cache,
             context_limits,
             residency,
             live,
@@ -1150,6 +1285,7 @@ impl Qwen4ExpModel {
             assets_path,
             has_mtp,
             has_draft,
+            has_paged_cache,
             context_limits,
             residency,
             live,
@@ -1330,11 +1466,15 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
-        true
+        self.has_paged_cache
     }
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        scheduler_capacity()
+        if self.has_paged_cache {
+            scheduler_capacity()
+        } else {
+            1
+        }
     }
     #[napi]
     pub fn context_limits(&self) -> Qwen4ExpContextLimits {

@@ -23,6 +23,9 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/fast_primitives.h"
 #include "mlx_paged_metallib.h"
+#elif defined(MLX_NODE_CUDA_ENABLED)
+#include "mlx_cuda_ops.h"
+#include "mlx/primitives.h"
 #endif
 
 namespace {
@@ -76,12 +79,11 @@ void write_error(char* err, size_t cap, const std::string& msg) {
   err[n] = '\0';
 }
 
-#ifdef MLX_NODE_METAL_ENABLED
+#if defined(MLX_NODE_METAL_ENABLED) || defined(MLX_NODE_CUDA_ENABLED)
 using namespace mlx::core;
 
 constexpr uint32_t kValuesPerUnit = 32;
 constexpr uint32_t kTileRows = 64;
-constexpr uint32_t kThreadgroup = 256;
 
 // Mirrors `GgufRepackParams` in gguf_repack.metal.
 struct GgufRepackParams {
@@ -106,6 +108,77 @@ Dtype scale_dtype(const KernelInfo& info) {
   }
   return uint8;
 }
+
+void expect(bool ok, const std::string& what) {
+  if (!ok) throw std::invalid_argument(what);
+}
+
+// An evaluated array must be row-contiguous with no broadcast; a lazy one is
+// checked again in eval_gpu.
+void expect_dense(const array& a, const char* what) {
+  if (a.status() == array::Status::available) {
+    expect(a.flags().row_contiguous && a.data_size() == a.size(),
+           std::string(what) + " is not a dense row-contiguous array");
+  }
+}
+
+// Checks one destination array: dtype, last dim `cols`, and `rows * cols`
+// elements in all. Returns rows.
+uint64_t dst_rows(const array& a, Dtype dtype, uint64_t cols,
+                  const char* what) {
+  expect(a.dtype() == dtype, std::string(what) + " has the wrong dtype");
+  expect(a.ndim() >= 1 && uint64_t(a.shape(-1)) == cols,
+         std::string(what) + " last dimension must be " +
+             std::to_string(cols));
+  expect_dense(a, what);
+  return uint64_t(a.size()) / cols;
+}
+
+struct BandPlan {
+  GgufRepackParams params;
+  uint64_t src_bytes;
+};
+
+BandPlan plan_band(int kernel, uint32_t k, uint32_t row0, uint32_t rows,
+                   uint64_t src_offset) {
+  expect(kernel >= 0 && kernel < kKernelCount,
+         "unknown GGUF repack kernel id " + std::to_string(kernel));
+  const auto& info = kKernels[kernel];
+  expect(k > 0 && k % info.block_values == 0,
+         std::string(info.name) + ": K must be a positive multiple of " +
+             std::to_string(info.block_values) + ", got " + std::to_string(k));
+  expect(rows > 0, "band has no rows");
+  expect(src_offset % info.offset_rule == 0,
+         std::string(info.name) + ": staging offset " +
+             std::to_string(src_offset) + " is not a multiple of " +
+             std::to_string(info.offset_rule));
+  const uint32_t kb = k / info.block_values;
+  const uint64_t nb = uint64_t(rows) * kb;
+  expect(nb * info.threads_per_blk <= std::numeric_limits<uint32_t>::max(),
+         "band too large for one dispatch");
+  if (info.t64) {
+    expect(row0 % kTileRows == 0 && rows % kTileRows == 0,
+           "Tiled64 band rows must start and end on 64-row tiles");
+  }
+  // Block byte offsets inside the kernels are 32-bit.
+  expect(src_offset % 4 + nb * info.block_bytes <=
+             std::numeric_limits<uint32_t>::max(),
+         "band bytes too large for one dispatch");
+  BandPlan plan{};
+  plan.params.src_off = src_offset;
+  plan.params.nb = uint32_t(nb);
+  plan.params.kb = kb;
+  plan.params.ku = kb * (info.block_values / kValuesPerUnit);
+  plan.params.row0 = row0;
+  plan.params.rows = rows;
+  plan.params.tile0 = row0 / kTileRows;
+  plan.src_bytes = nb * info.block_bytes;
+  return plan;
+}
+#endif
+
+#ifdef MLX_NODE_METAL_ENABLED
+constexpr uint32_t kThreadgroup = 256;
 
 MTL::ComputePipelineState* repack_kernel(metal::Device& device, int kernel) {
   return fast::paged::get_prebuilt_kernel(device, "gguf_repack", "GGUF repack",
@@ -183,73 +256,6 @@ class GgufRepackBand final : public fast::Custom {
   GgufRepackParams params_;
 };
 
-void expect(bool ok, const std::string& what) {
-  if (!ok) throw std::invalid_argument(what);
-}
-
-// An evaluated array must be row-contiguous with no broadcast; a lazy one is
-// checked again in eval_gpu.
-void expect_dense(const array& a, const char* what) {
-  if (a.status() == array::Status::available) {
-    expect(a.flags().row_contiguous && a.data_size() == a.size(),
-           std::string(what) + " is not a dense row-contiguous array");
-  }
-}
-
-// Checks one destination array: dtype, last dim `cols`, and `rows * cols`
-// elements in all. Returns rows.
-uint64_t dst_rows(const array& a, Dtype dtype, uint64_t cols,
-                  const char* what) {
-  expect(a.dtype() == dtype, std::string(what) + " has the wrong dtype");
-  expect(a.ndim() >= 1 && uint64_t(a.shape(-1)) == cols,
-         std::string(what) + " last dimension must be " +
-             std::to_string(cols));
-  expect_dense(a, what);
-  return uint64_t(a.size()) / cols;
-}
-
-struct BandPlan {
-  GgufRepackParams params;
-  uint64_t src_bytes;
-};
-
-BandPlan plan_band(int kernel, uint32_t k, uint32_t row0, uint32_t rows,
-                   uint64_t src_offset) {
-  expect(kernel >= 0 && kernel < kKernelCount,
-         "unknown GGUF repack kernel id " + std::to_string(kernel));
-  const auto& info = kKernels[kernel];
-  expect(k > 0 && k % info.block_values == 0,
-         std::string(info.name) + ": K must be a positive multiple of " +
-             std::to_string(info.block_values) + ", got " + std::to_string(k));
-  expect(rows > 0, "band has no rows");
-  expect(src_offset % info.offset_rule == 0,
-         std::string(info.name) + ": staging offset " +
-             std::to_string(src_offset) + " is not a multiple of " +
-             std::to_string(info.offset_rule));
-  const uint32_t kb = k / info.block_values;
-  const uint64_t nb = uint64_t(rows) * kb;
-  expect(nb * info.threads_per_blk <= std::numeric_limits<uint32_t>::max(),
-         "band too large for one dispatch");
-  if (info.t64) {
-    expect(row0 % kTileRows == 0 && rows % kTileRows == 0,
-           "Tiled64 band rows must start and end on 64-row tiles");
-  }
-  // Block byte offsets inside the kernels are 32-bit.
-  expect(src_offset % 4 + nb * info.block_bytes <=
-             std::numeric_limits<uint32_t>::max(),
-         "band bytes too large for one dispatch");
-  BandPlan plan{};
-  plan.params.src_off = src_offset;
-  plan.params.nb = uint32_t(nb);
-  plan.params.kb = kb;
-  plan.params.ku = kb * (info.block_values / kValuesPerUnit);
-  plan.params.row0 = row0;
-  plan.params.rows = rows;
-  plan.params.tile0 = row0 / kTileRows;
-  plan.src_bytes = nb * info.block_bytes;
-  return plan;
-}
-
 // All kernel names in the table are functions of the loaded library.
 bool table_in_library() {
   static std::once_flag once;
@@ -279,6 +285,113 @@ array alloc_array(Shape shape, Dtype dtype) {
   for (auto d : shape) bytes *= size_t(d);
   return array(allocator::malloc(bytes), std::move(shape), dtype);
 }
+#elif defined(MLX_NODE_CUDA_ENABLED)
+constexpr char qwen4_gguf_repack_source[] =
+#include "cuda/qwen4_gguf_repack.cu.inc"
+    ;
+
+bool cuda_supports_kernel(int kernel) noexcept {
+  switch (kernel) {
+    case 0:   // mlx_node_gguf_repack_q4k
+    case 1:   // mlx_node_gguf_repack_q4k_t64
+    case 2:   // mlx_node_gguf_repack_q5k
+    case 3:   // mlx_node_gguf_repack_q5k_t64
+    case 14:  // mlx_node_gguf_repack_q8_0
+    case 17:  // mlx_node_gguf_repack_q5_1
+    case 18:  // mlx_node_gguf_repack_q8_0_bias
+      return true;
+    default:
+      return false;
+  }
+}
+
+class GgufRepackBandCuda final : public Primitive {
+ public:
+  GgufRepackBandCuda(Stream stream, int kernel, GgufRepackParams params)
+      : Primitive(stream), kernel_(kernel), params_(params) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("GgufRepackBandCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs,
+                std::vector<array>& outputs) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      const auto& dst = inputs[1 + i];
+      if (!dst.flags().row_contiguous || dst.data_size() != dst.size()) {
+        throw std::runtime_error(
+            "GgufRepackBandCuda: destination array is not row-contiguous");
+      }
+      outputs[i].copy_shared_buffer(dst);
+    }
+    if ((reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[0])) & 15u) != 0u) {
+      throw std::runtime_error(
+          "GgufRepackBandCuda: weight destination is not 16-byte aligned");
+    }
+    if (kernel_ <= 3) {
+      if ((reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[1])) & 15u) != 0u ||
+          (reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[2])) & 3u) != 0u) {
+        throw std::runtime_error(
+            "GgufRepackBandCuda: K-quant scales/biases destination alignment error");
+      }
+    }
+    array st = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    encoder.set_input_array(st);
+    for (const auto& out : outputs) {
+      encoder.set_output_array(out);
+    }
+
+    cu::KernelArgs args;
+    args.append(st);
+    for (const auto& out : outputs) {
+      args.append(out);
+    }
+    args.append<uint64_t>(params_.src_off);
+    args.append<uint32_t>(params_.nb);
+    args.append<uint32_t>(params_.kb);
+
+    uint32_t grid_x = 1;
+    if (kKernels[kernel_].t64) {
+      args.append<uint32_t>(params_.ku);
+      args.append<uint32_t>(params_.tile0);
+      grid_x = static_cast<uint32_t>((uint64_t(params_.nb) * 8ull + 255ull) / 256ull);
+    } else {
+      args.append<uint32_t>(params_.row0);
+      if (kernel_ == 0 || kernel_ == 2) {
+        grid_x = (params_.nb + 31u) / 32u;
+      } else {
+        grid_x = (params_.nb + 255u) / 256u;
+      }
+    }
+
+    auto fn = cu::jit_kernel(
+        encoder.device(), qwen4_gguf_repack_source, kKernels[kernel_].name);
+    encoder.add_kernel_node_raw(
+        fn, dim3(grid_x, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(GgufRepackBandCuda)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const GgufRepackBandCuda*>(&other);
+    return rhs && kernel_ == rhs->kernel_ &&
+        std::memcmp(&params_, &rhs->params_, sizeof(params_)) == 0;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    std::vector<Shape> shapes;
+    shapes.reserve(inputs.size() - 1);
+    for (size_t i = 1; i < inputs.size(); ++i) {
+      shapes.push_back(inputs[i].shape());
+    }
+    return shapes;
+  }
+
+ private:
+  int kernel_;
+  GgufRepackParams params_;
+};
 #endif
 
 }  // namespace
@@ -286,10 +399,12 @@ array alloc_array(Shape shape, Dtype dtype) {
 extern "C" {
 
 // Whether the GPU repack can run: Metal is available and every kernel of the
-// table is in paged_attn.metallib.
+// table is in paged_attn.metallib, or CUDA is available for supported kernels.
 bool mlx_gguf_repack_available() {
 #ifdef MLX_NODE_METAL_ENABLED
   return table_in_library();
+#elif defined(MLX_NODE_CUDA_ENABLED)
+  return mlx::core::cu::is_available();
 #else
   return false;
 #endif
@@ -313,10 +428,16 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
   if (out_s) *out_s = nullptr;
   if (out_b) *out_b = nullptr;
   write_error(err, err_cap, "");
-#ifdef MLX_NODE_METAL_ENABLED
+#if defined(MLX_NODE_METAL_ENABLED) || defined(MLX_NODE_CUDA_ENABLED)
   try {
     expect(staging && dst_w && dst_s && out_w && out_s, "null argument");
+#ifdef MLX_NODE_METAL_ENABLED
     expect(metal::is_available(), "requires the Metal device");
+#else
+    expect(cu::is_available(), "requires the CUDA device");
+    expect(kernel >= 0 && kernel < kKernelCount && cuda_supports_kernel(kernel),
+           "CUDA repack does not support kernel id " + std::to_string(kernel));
+#endif
     const BandPlan plan = plan_band(kernel, k, row0, rows, src_offset);
     const auto& info = kKernels[kernel];
     const bool has_biases = info.bias_bytes != 0;
@@ -351,7 +472,11 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
     }
 
     auto stream = default_stream(Device::gpu);
+#ifdef MLX_NODE_METAL_ENABLED
     auto primitive = std::make_shared<GgufRepackBand>(stream, kernel, plan.params);
+#else
+    auto primitive = std::make_shared<GgufRepackBandCuda>(stream, kernel, plan.params);
+#endif
     std::vector<Shape> shapes{w.shape(), s.shape()};
     std::vector<Dtype> dtypes{w.dtype(), s.dtype()};
     std::vector<array> inputs{st, w, s};
@@ -376,7 +501,7 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
 #else
   (void)staging; (void)src_offset; (void)kernel; (void)k; (void)row0;
   (void)rows; (void)dst_w; (void)dst_s; (void)dst_b;
-  write_error(err, err_cap, "mlx_gguf_repack_band: GPU repack is unavailable (no Metal)");
+  write_error(err, err_cap, "mlx_gguf_repack_band: GPU repack is unavailable (no GPU backend)");
   return 1;
 #endif
 }

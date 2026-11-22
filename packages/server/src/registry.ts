@@ -38,16 +38,16 @@
  */
 
 import type { ChatConfig } from '@mlx-node/core';
-import type { DecisionModel, SessionContextLimits } from '@mlx-node/lm';
+import type { SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { contextLane } from '@mlx-node/lm';
 
 import { AudioRegistry } from './audio-registry.js';
-import { DecisionRegistry } from './decision-registry.js';
+import { DecisionRegistry, type ResidentDecisionBinding, type SystemOneModel } from './decision-registry.js';
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { RerankRegistry } from './rerank-registry.js';
 import { SessionRegistry } from './session-registry.js';
-import type { ModelIdentity } from './turn-trace.js';
+import type { LiveTurn, ModelIdentity } from './turn-trace.js';
 
 interface ModelLoadAdmissionCoordinator {
   bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void;
@@ -180,27 +180,41 @@ export interface RegisterOptions {
   identity?: ModelIdentity;
 }
 
-/** One resident model binding, for the runtime sampler. */
+/** Minimal session/admission view read by the runtime sampler for any resident binding. */
+export interface ResidentSessionView {
+  liveTurns(): LiveTurn[];
+  turnStats(): { live: number; begun: number; lastSettleAt: number };
+  readonly activeDispatches: number;
+  readonly queueDepth: number;
+  readonly queueDepthLimit: number | undefined;
+  readonly concurrentAdmissionLimit: number;
+  readonly identity: ModelIdentity | undefined;
+  readonly servedWindowTokens: number | undefined;
+  tryIdleProbe<T>(call: () => Promise<T>): Promise<T> | null;
+}
+
+/** One resident model binding, for the runtime sampler (chat or decision). */
 export interface ResidentModel {
   names: string[];
-  model: ServableModel;
-  sessions: SessionRegistry;
+  model: ServableModel | SystemOneModel;
+  sessions: ResidentSessionView;
+  kind?: 'chat' | 'decision';
 }
 
 export class ModelRegistry {
   readonly decisions: DecisionRegistry;
   readonly audio: AudioRegistry;
   readonly rerank: RerankRegistry;
-  getAny(name: string): ServableModel | DecisionModel | undefined {
+  getAny(name: string): ServableModel | SystemOneModel | undefined {
     return this.get(name) ?? this.decisions.get(name);
   }
-  registerDecision(name: string, model: DecisionModel): void {
+  registerDecision(name: string, model: SystemOneModel, opts?: { identity?: ModelIdentity }): void {
     this.unregister(name);
-    this.decisions.register(name, model);
+    this.decisions.register(name, model, opts);
     this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, this.decisions.lane(name)!);
   }
-  registerAny(name: string, model: ServableModel | DecisionModel, opts?: RegisterOptions): void {
-    if ('kind' in model && model.kind === 'decision') this.registerDecision(name, model);
+  registerAny(name: string, model: ServableModel | SystemOneModel, opts?: RegisterOptions): void {
+    if ('kind' in model && model.kind === 'decision') this.registerDecision(name, model, opts);
     else this.register(name, model as ServableModel, opts);
   }
   private readonly maxQueueDepth: number | undefined;
@@ -454,7 +468,11 @@ export class ModelRegistry {
     const lane = this.decisions.lane(name);
     if (lane) {
       this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, lane);
-      return this.decisions.unregister(name);
+      const removed = this.decisions.unregister(name);
+      if (removed && opts?.dispose === true) {
+        this.bindingReleaseListener?.();
+      }
+      return removed;
     }
     const entry = this.models.get(name);
     if (!entry) return false;
@@ -806,7 +824,7 @@ export class ModelRegistry {
     return out;
   }
 
-  /** One entry per binding, with every registered name that resolves to it. */
+  /** One entry per resident binding (chat and decision), with every registered name that resolves to it. */
   listResidentModels(): ResidentModel[] {
     const out: ResidentModel[] = [];
     for (const [model, binding] of this.sessionRegistriesByModel) {
@@ -814,7 +832,10 @@ export class ModelRegistry {
       for (const [name, entry] of this.models) {
         if (entry.model === model) names.push(name);
       }
-      out.push({ names, model, sessions: binding.registry });
+      out.push({ names, model, sessions: binding.registry, kind: 'chat' });
+    }
+    for (const decision of this.decisions.listResidentBindings() as ResidentDecisionBinding[]) {
+      out.push(decision);
     }
     return out;
   }

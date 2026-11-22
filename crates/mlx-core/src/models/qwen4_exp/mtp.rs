@@ -108,7 +108,14 @@ impl State {
                 cached.extend(bits(&buffer.slice_axis(2, 0, rows as i64).unwrap()));
             }
         }
-        cached.extend(owner.cache.draft_index().map(bits).unwrap_or_default());
+        cached.extend(
+            owner
+                .cache
+                .draft_index()
+                .as_ref()
+                .map(bits)
+                .unwrap_or_default(),
+        );
         Some(DraftBits {
             rows,
             cached,

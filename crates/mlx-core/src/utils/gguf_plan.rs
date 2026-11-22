@@ -906,20 +906,70 @@ pub(crate) fn write_gguf_assets(
         info!("Reconstructed tokenizer.json from embedded GGUF GPT-2 metadata");
     }
 
-    if let Some((plan, companion_gguf)) = companion
-        && plan.muse_secondary
-    {
-        let config_path = out.join("config.json");
-        if let Some(merged) =
-            prepare_muse_secondary_config(&config_path, companion_gguf, plan.import_k_quants)?
+    if let Some((plan, companion_gguf)) = companion {
+        if plan.muse_secondary {
+            let config_path = out.join("config.json");
+            if let Some(merged) =
+                prepare_muse_secondary_config(&config_path, companion_gguf, plan.import_k_quants)?
+            {
+                fs::write(&config_path, merged).map_err(|error| {
+                    Error::from_reason(format!(
+                        "Failed to update {}: {error}",
+                        config_path.display()
+                    ))
+                })?;
+                info!("Merged Muse-Glimmer companion GGUF metadata into config.json");
+            }
+        } else if companion_gguf
+            .metadata
+            .get("clip.projector_type")
+            .and_then(|v| v.as_str())
+            == Some("qwen3vl_merger")
         {
-            fs::write(&config_path, merged).map_err(|error| {
-                Error::from_reason(format!(
-                    "Failed to update {}: {error}",
-                    config_path.display()
-                ))
-            })?;
-            info!("Merged Muse-Glimmer companion GGUF metadata into config.json");
+            let config_path = out.join("config.json");
+            let mut root: serde_json::Value =
+                serde_json::from_slice(&fs::read(&config_path).map_err(|e| {
+                    Error::from_reason(format!("Failed to read {}: {e}", config_path.display()))
+                })?)
+                .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?;
+            if let Some(obj) = root.as_object_mut()
+                && !obj.contains_key("vision_config")
+            {
+                let get_u64 = |k: &str| companion_gguf.metadata.get(k).and_then(|v| v.as_u64());
+                let mut vc = serde_json::Map::new();
+                if let Some(v) = get_u64("clip.vision.embedding_length") {
+                    vc.insert("hidden_size".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.feed_forward_length") {
+                    vc.insert("intermediate_size".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.attention.head_count") {
+                    vc.insert("num_heads".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.block_count") {
+                    vc.insert("depth".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.patch_size") {
+                    vc.insert("patch_size".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.spatial_merge_size") {
+                    vc.insert("spatial_merge_size".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.image_size") {
+                    vc.insert("image_size".to_string(), serde_json::json!(v));
+                }
+                if let Some(v) = get_u64("clip.vision.projection_dim") {
+                    vc.insert("out_hidden_size".to_string(), serde_json::json!(v));
+                }
+                obj.insert("vision_config".to_string(), serde_json::Value::Object(vc));
+                let updated = serde_json::to_string_pretty(&root).map_err(|e| {
+                    Error::from_reason(format!("Failed to serialize config.json: {e}"))
+                })?;
+                fs::write(&config_path, updated).map_err(|e| {
+                    Error::from_reason(format!("Failed to write {}: {e}", config_path.display()))
+                })?;
+                info!("Merged Qwen3.5 mmproj vision_config metadata into config.json");
+            }
         }
     }
     Ok(())
@@ -1746,6 +1796,159 @@ mod tests {
             "{}",
             e.reason
         );
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn qwen35_native_mmproj_preflight_and_vision_config_synthesis() {
+        use crate::utils::gguf::native_gguf_preflight;
+
+        let work = work_dir("qwen35-mmproj");
+        fs::create_dir_all(&work).unwrap();
+
+        // Build a minimal Qwen3.5 dense GGUF from the existing import fixture.
+        let src_dir = work.join("src");
+        let fixture = write_import_fixture("qwen35-dense-untied", &src_dir);
+        let main_path = fixture.main;
+
+        // Without any sibling mmproj-*.gguf, preflight returns companion = None.
+        let (parts_no_mm, mm_none) =
+            native_gguf_preflight(&main_path, NativeGgufFamily::Qwen35).unwrap();
+        assert_eq!(parts_no_mm.len(), 1);
+        assert!(mm_none.is_none());
+
+        // Read the fixture's backbone embedding_length so projector width validation matches.
+        let main_header = parse_gguf(&main_path).unwrap();
+        let backbone_hidden = main_header
+            .metadata
+            .get("qwen35.embedding_length")
+            .and_then(|v| v.as_u64())
+            .expect("qwen35-dense-untied must declare qwen35.embedding_length")
+            as u32;
+
+        // A mismatched-width projector (e.g. 27B projector beside a 9B backbone) must be ignored.
+        let wrong_meta: Vec<(&str, GgufMetaValue)> = vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            ("clip.has_vision_encoder", GgufMetaValue::Bool(true)),
+            (
+                "clip.projector_type",
+                GgufMetaValue::String("qwen3vl_merger".to_string()),
+            ),
+            (
+                "clip.vision.projection_dim",
+                GgufMetaValue::Uint32(backbone_hidden + 128),
+            ),
+        ];
+        let mm_wrong = src_dir.join("mmproj-wrong-BF16.gguf");
+        fs::write(
+            &mm_wrong,
+            crate::utils::gguf_test_fixtures::build_minimal_gguf(&wrong_meta, &[]),
+        )
+        .unwrap();
+        let (_, mm_mismatch) = native_gguf_preflight(&main_path, NativeGgufFamily::Qwen35).unwrap();
+        assert!(
+            mm_mismatch.is_none(),
+            "mismatched projection_dim projector must not attach"
+        );
+        fs::remove_file(&mm_wrong).unwrap();
+
+        // Write two matching Qwen3.5 mmproj companions (F16 and BF16); preflight should
+        // pick BF16 (higher dtype tier).
+        let mm_meta: Vec<(&str, GgufMetaValue)> = vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            ("clip.has_vision_encoder", GgufMetaValue::Bool(true)),
+            (
+                "clip.projector_type",
+                GgufMetaValue::String("qwen3vl_merger".to_string()),
+            ),
+            ("clip.vision.embedding_length", GgufMetaValue::Uint32(1152)),
+            (
+                "clip.vision.feed_forward_length",
+                GgufMetaValue::Uint32(4304),
+            ),
+            (
+                "clip.vision.attention.head_count",
+                GgufMetaValue::Uint32(16),
+            ),
+            ("clip.vision.block_count", GgufMetaValue::Uint32(27)),
+            ("clip.vision.patch_size", GgufMetaValue::Uint32(16)),
+            ("clip.vision.spatial_merge_size", GgufMetaValue::Uint32(2)),
+            ("clip.vision.image_size", GgufMetaValue::Uint32(768)),
+            (
+                "clip.vision.projection_dim",
+                GgufMetaValue::Uint32(backbone_hidden),
+            ),
+        ];
+        let mm_f16 = src_dir.join("mmproj-F16.gguf");
+        let mm_bf16 = src_dir.join("mmproj-BF16.gguf");
+        let mm_bytes = crate::utils::gguf_test_fixtures::build_minimal_gguf(&mm_meta, &[]);
+        fs::write(&mm_f16, &mm_bytes).unwrap();
+        fs::write(&mm_bf16, &mm_bytes).unwrap();
+
+        let (_, mm_picked) = native_gguf_preflight(&main_path, NativeGgufFamily::Qwen35).unwrap();
+        let mm_picked = mm_picked.expect("should discover qwen35 mmproj companion");
+        assert_eq!(
+            mm_picked.file_name().and_then(|s| s.to_str()),
+            Some("mmproj-BF16.gguf")
+        );
+
+        // Two matching projectors at the same best dtype tier must fail closed.
+        let mm_bf16_dup = src_dir.join("mmproj-alt-BF16.gguf");
+        fs::write(&mm_bf16_dup, &mm_bytes).unwrap();
+        let err = native_gguf_preflight(&main_path, NativeGgufFamily::Qwen35)
+            .expect_err("ambiguous tie at same dtype tier must fail closed");
+        assert!(
+            err.reason.contains("Ambiguous Qwen3.5 mmproj"),
+            "unexpected error: {}",
+            err.reason
+        );
+        fs::remove_file(&mm_bf16_dup).unwrap();
+
+        // Verify write_gguf_assets synthesizes vision_config into config.json.
+        let out_dir = work.join("assets");
+        fs::create_dir_all(&out_dir).unwrap();
+        let planned = plan_like_prepare(&main_path, true, Some((&mm_picked, "mmproj.safetensors")));
+        let (comp_gguf, comp_plan) = planned
+            .companion
+            .as_ref()
+            .expect("companion plan must be present");
+        write_gguf_assets(
+            &planned.plan,
+            Some((comp_plan, comp_gguf)),
+            &planned.gguf,
+            &out_dir,
+        )
+        .unwrap();
+
+        let cfg = read_json(&out_dir.join("config.json"));
+        let vc = cfg
+            .get("vision_config")
+            .and_then(|v| v.as_object())
+            .expect("vision_config must be synthesized from mmproj");
+        assert_eq!(vc.get("hidden_size").and_then(|v| v.as_u64()), Some(1152));
+        assert_eq!(
+            vc.get("intermediate_size").and_then(|v| v.as_u64()),
+            Some(4304)
+        );
+        assert_eq!(vc.get("num_heads").and_then(|v| v.as_u64()), Some(16));
+        assert_eq!(vc.get("depth").and_then(|v| v.as_u64()), Some(27));
+        assert_eq!(vc.get("patch_size").and_then(|v| v.as_u64()), Some(16));
+        assert_eq!(
+            vc.get("spatial_merge_size").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(vc.get("image_size").and_then(|v| v.as_u64()), Some(768));
+        assert_eq!(
+            vc.get("out_hidden_size").and_then(|v| v.as_u64()),
+            Some(u64::from(backbone_hidden))
+        );
+
         fs::remove_dir_all(&work).ok();
     }
 }

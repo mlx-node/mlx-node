@@ -106,6 +106,16 @@ unsafe extern "C-unwind" {
 
     // Shape-independent activation fusion; projection formats remain independent.
     pub fn mlx_swiglu_compiled(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_swiglu_clamped_compiled(
+        gate: *mut mlx_array,
+        up: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+    pub fn mlx_rope_precise_compiled(
+        x: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+    ) -> *mut mlx_array;
     pub fn mlx_sigmoid_mul_compiled(gate: *mut mlx_array, value: *mut mlx_array) -> *mut mlx_array;
 
     // Fused SwiGLU MLP forward: output = down(silu(gate(x)) * up(x))
@@ -670,6 +680,8 @@ unsafe extern "C-unwind" {
     // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_cuda_is_available() -> bool;
+    pub fn mlx_cuda_set_use_graphs(enable: bool) -> bool;
+    pub fn mlx_cuda_get_use_graphs() -> bool;
     pub fn mlx_cuda_compute_capability(out_major: *mut i32, out_minor: *mut i32) -> bool;
     pub fn mlx_device_static_memory_info(out_total: *mut u64, out_is_unified: *mut bool) -> i32;
     pub fn mlx_device_free_memory(out_free: *mut u64) -> i32;
@@ -2654,6 +2666,37 @@ unsafe extern "C-unwind" {
         sorted_indices: bool,
     ) -> *mut mlx_array;
 
+    /// Row-major K-quant experts: `x [..B, 1, K]` through `w[rhs_indices].T`
+    /// with `rhs_indices [..B]` ascending, on the sorted-rhs kernel at every
+    /// row and expert count (one fixed tile).
+    pub fn mlx_kquant_gather_qmm_sorted(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
+    /// Same as [`mlx_kquant_gather_qmm_sorted`] with per-op TF32 NAX enabled
+    /// on F32 activations without mutating thread-local TF32 state.
+    /// `max_y_tiles > 0` caps grid.y for the fixed BM=32 tile; `max_group > 0`
+    /// caps `num_groups` to `max_slot + 1` (0 = full `w.shape(0)`).
+    pub fn mlx_kquant_gather_qmm_sorted_nax(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        max_y_tiles: i32,
+        max_group: i32,
+    ) -> *mut mlx_array;
+
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);
@@ -2893,6 +2936,25 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Extended CUDA fused GDN step supporting `sigmoid_gate` (Qwen4 Sigmoid vs
+    /// Qwen3.5 SiLU), BF16/FP32 `beta`, and BF16/FP32 `w`.
+    pub fn mlx_gdn_fused_step_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
+        state_dst: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA deferred-fold fused GDN step: folds `prev_keep` accepted rows from
     /// `(prev_k, prev_v, prev_g, prev_beta)` into `state_base` before stepping
     /// the current window and returning `(out_y, out_committed_state)`.
@@ -2918,6 +2980,28 @@ unsafe extern "C-unwind" {
         out_committed_state: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Extended CUDA deferred-fold fused GDN step with `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_fused_step_deferred_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA tree-verify fused GDN step with deferred fold (`parent` is int32 `[T]`,
     /// `prev_indices` is nullable int32 `[prev_keep]`).
     pub fn mlx_gdn_tree_step_cuda(
@@ -2938,6 +3022,30 @@ unsafe extern "C-unwind" {
         norm_weight: *mut mlx_array,
         eps: f32,
         tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Extended CUDA tree-verify fused GDN step with `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_tree_step_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        prev_indices: *mut mlx_array,
+        parent: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
         out_y: *mut *mut mlx_array,
         out_committed_state: *mut *mut mlx_array,
     ) -> bool;
@@ -3006,6 +3114,24 @@ unsafe extern "C-unwind" {
         norm_weight: *mut mlx_array,
         eps: f32,
         tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Extended CUDA prefill GDN recurrence with fused RMSNormGated supporting
+    /// `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_prefill_chain_gated_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
         out_y: *mut *mut mlx_array,
         out_state: *mut *mut mlx_array,
     ) -> bool;
@@ -3215,9 +3341,10 @@ unsafe extern "C-unwind" {
         out: *mut *mut mlx_array,
     ) -> bool;
 
-    // Store bf16 `rows` `[n, dim]` into a page pool's bf16 index plane at
-    // plane rows `slots` (int32 `[n]`), in place; `out` is the plane handle
-    // to adopt. False without Metal or on a contract violation.
+    // Store `rows` `[n, dim]` into a page pool's bf16 or f16 index plane of
+    // the same dtype at plane rows `slots` (int32 `[n]`), in place; `out` is
+    // the plane handle to adopt. False without Metal or on a contract
+    // violation.
     pub fn mlx_paged_index_store(
         plane: *mut mlx_array,
         rows: *mut mlx_array,
@@ -4155,6 +4282,154 @@ unsafe extern "C" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    // Qwen3.8-Flash-Next (qwen4_exp) CUDA primitives (`mlx_qwen4_moe_cuda.cpp`,
+    // `mlx_qwen4_ops_cuda.cpp`). All return null/false on non-CUDA builds.
+    pub fn mlx_qwen4_moe_routed_shared_few_cuda(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        mode_gu: i32,
+        bits_dn: i32,
+        swg: *mut mlx_array,
+        ssg: *mut mlx_array,
+        sbg: *mut mlx_array,
+        swu: *mut mlx_array,
+        ssu: *mut mlx_array,
+        sbu: *mut mlx_array,
+        swd: *mut mlx_array,
+        ssd: *mut mlx_array,
+        sbd: *mut mlx_array,
+        shared_gate: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_moe_prefill_cuda(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        mode_gu: i32,
+        bits_dn: i32,
+        shared_out: *mut mlx_array,
+        shared_gate: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_inject_norm_cuda(
+        x: *mut mlx_array,
+        branch: *mut mlx_array,
+        gate: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        eps: f32,
+        weight_offset: f32,
+        out_x: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_hc_down_act_cuda(
+        normed: *mut mlx_array,
+        w_down: *mut mlx_array,
+        s_down: *mut mlx_array,
+        b_down: *mut mlx_array,
+        w_inj: *mut mlx_array,
+        s_inj: *mut mlx_array,
+        b_inj: *mut mlx_array,
+        inj_mode: i32,
+        out_down: *mut *mut mlx_array,
+        out_inj: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_hc_up_mix_cuda(
+        down_act: *mut mlx_array,
+        normed: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        b_up: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_router_topk_cuda(
+        logits: *mut mlx_array,
+        top_k: i32,
+        out_ids: *mut *mut mlx_array,
+        out_scores: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_qsa_sparse_sdpa_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        iq: *mut mlx_array,
+        pooled_k: *mut mlx_array,
+        tree_mask: *mut mlx_array,
+        kv_len: i32,
+        num_blocks: i32,
+        scale: f32,
+        idx_scale: f32,
+        mask_mode: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_ple_gate_conv_cuda(
+        x: *mut mlx_array,
+        key: *mut mlx_array,
+        value: *mut mlx_array,
+        norm_key_w: *mut mlx_array,
+        norm_query_w: *mut mlx_array,
+        norm_conv_w: *mut mlx_array,
+        conv_w: *mut mlx_array,
+        history: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        eps: f32,
+        weight_offset: f32,
+        fuse_residual: bool,
+        out_x: *mut *mut mlx_array,
+        out_hist: *mut *mut mlx_array,
+        out_conv_in: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_prefill_hc_mix_cuda(
+        up: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_stream_mean_cuda(x: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_dequant_q8_bf16_cuda(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_q8_prefill_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        gs_shift: i32,
+        general_bias: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_hc_up_mix_prefill_cuda(
+        down_act: *mut mlx_array,
+        normed: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        b_up: *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C" {
@@ -4187,6 +4462,455 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
 }
 
+unsafe extern "C" {
+    pub fn mlx_hy4_hc_mix_reduce(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scale: *mut mlx_array,
+        base: *mut mlx_array,
+        norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        has_post: bool,
+        out_h: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_hc_post_identity(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_mix_reduce_norm(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scale: *mut mlx_array,
+        base: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        hc_norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        out_norm_eps: f32,
+        head_only: bool,
+        out_h_norm: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_post_norm_hc_post(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post: *mut mlx_array,
+        post_norm_w: *mut mlx_array,
+        post_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_bridge(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post_prev: *mut mlx_array,
+        post_norm_w: *mut mlx_array,
+        next_weight: *mut mlx_array,
+        next_scale: *mut mlx_array,
+        next_base: *mut mlx_array,
+        next_norm_w: *mut mlx_array,
+        post_eps: f32,
+        hc_norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        next_eps: f32,
+        skip_next_norm: bool,
+        head_only: bool,
+        out_x: *mut *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+        out_post_next: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_bf16_lm_head(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_hy4_bf16_lm_head_mmap(
+        x: *mut mlx_array,
+        w_buf: *mut mlx_array,
+        byte_offset: u64,
+        vocab: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_q8_0_embed_rows(
+        ids: *mut mlx_array,
+        buf: *mut mlx_array,
+        byte_offset: u64,
+        vocab: i32,
+        dim: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dense_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_affine4_dense_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        gate: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dense_prefill(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dense_prefill_epilogue(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        aux: *mut mlx_array,
+        epilogue: i32,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_prefill(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_prefill_gated(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        gate: *mut mlx_array,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_routed_subset(
+        x: *mut mlx_array,
+        row_ids: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_sink_attention(
+        q: *mut mlx_array,
+        k0: *mut mlx_array,
+        k1: *mut mlx_array,
+        idx: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_prefill_nax(
+        q: *mut mlx_array,
+        q_pe: *mut mlx_array,
+        k0: *mut mlx_array,
+        k1: *mut mlx_array,
+        idx: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_prefill_sliding_nax(
+        q: *mut mlx_array,
+        q_pe: *mut mlx_array,
+        k: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
+        start_pos: i32,
+        is_ring: bool,
+        ring_cap: i32,
+        window_size: i32,
+        first_key: i32,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_prefill_indirect_gu(
+        x: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        tiles: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_prefill_indirect_down(
+        hidden: *mut mlx_array,
+        tiles: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_sorted_combine(
+        down: *mut mlx_array,
+        weights: *mut mlx_array,
+        inverse: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_router_mv(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dual_down_add(
+        routed_latent: *mut mlx_array,
+        shared_gu: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        w_sd: *mut mlx_array,
+        s_sd: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_router_topk(
+        logits: *mut mlx_array,
+        bias: *mut mlx_array,
+        scale: f32,
+        eps: f32,
+        k: i32,
+        norm: bool,
+        out_ids: *mut *mut mlx_array,
+        out_weights: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_gguf_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        gate_buf: *mut mlx_array,
+        gate_off: u64,
+        up_buf: *mut mlx_array,
+        up_off: u64,
+        down_buf: *mut mlx_array,
+        down_off: u64,
+        n_experts: i32,
+        m: i32,
+        h: i32,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_affine4_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_prefill_indirect_gu(
+        x: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        tiles: *mut mlx_array,
+        gate_buf: *mut mlx_array,
+        gate_off: u64,
+        up_buf: *mut mlx_array,
+        up_off: u64,
+        n_experts: i32,
+        m: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_gguf_prefill_indirect_down(
+        hidden: *mut mlx_array,
+        tiles: *mut mlx_array,
+        down_buf: *mut mlx_array,
+        down_off: u64,
+        n_experts: i32,
+        h: i32,
+        down_bits: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_ring_write(
+        buf: *mut mlx_array,
+        src: *mut mlx_array,
+        start_slot: i32,
+        cap: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_indexer_score(
+        q: *mut mlx_array,
+        w: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        page_ids: *mut mlx_array,
+        visible_groups: *mut mlx_array,
+        n_groups: i32,
+        start_g: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_indexer_topk_cells(
+        scores: *mut mlx_array,
+        visible_groups: *mut mlx_array,
+        tail_starts: *mut mlx_array,
+        tail_lens: *mut mlx_array,
+        page_ids: *mut mlx_array,
+        n_top: i32,
+        kpool: i32,
+        kmax: i32,
+        block_size: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_moe_prefill_sort_tiles(
+        ids: *mut mlx_array,
+        n_experts: i32,
+        tile_m: i32,
+        out_token_rows: *mut *mut mlx_array,
+        out_tiles: *mut *mut mlx_array,
+        out_inverse: *mut *mut mlx_array,
+        out_sorted_slots: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_mla_prep_q_kv(
+        all: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        kv_norm_w: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        q_lora: i32,
+        kv_lora: i32,
+        rope_dim: i32,
+        norm_eps: f32,
+        out_f16: bool,
+        split_out: bool,
+        out_qr: *mut *mut mlx_array,
+        out_kv0: *mut *mut mlx_array,
+        out_kv1: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_q8_grouped_k192_rope(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kpool_compress(
+        tail_buf: *mut mlx_array,
+        tok: *mut mlx_array,
+        w_val: *mut mlx_array,
+        w_gate: *mut mlx_array,
+        ape: *mut mlx_array,
+        comp_norm: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        n_groups: i32,
+        first_group: i32,
+        open_len: i32,
+        tail_start_slot: i32,
+        tail_cap: i32,
+        norm_eps: f32,
+        out_dtype_code: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_partial_rope_tail(
+        x: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        out_f16: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_engram_norm_rows(
+        rows: *mut mlx_array,
+        lookup_norm: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_engram_gate_add(
+        x: *mut mlx_array,
+        kv_raw: *mut mlx_array,
+        kv_b: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        pre_gamma: *mut mlx_array,
+        hc_scale: *mut mlx_array,
+        keep_mask: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_f32_head_weights(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mtp_eh_norm_concat(
+        e: *mut mlx_array,
+        h: *mut mlx_array,
+        enorm: *mut mlx_array,
+        hnorm: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_post_norm_add_rms_norm(
+        res: *mut mlx_array,
+        y: *mut mlx_array,
+        post_w: *mut mlx_array,
+        next_w: *mut mlx_array,
+        eps: f32,
+        need_x_out: bool,
+        out_x: *mut *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+    ) -> bool;
+}
+
 unsafe extern "C-unwind" {
     // Row-contiguous array over a fresh uninitialized allocator buffer
     // (`mlx_array_alloc.cpp`); `*out_data` receives its CPU-visible storage.
@@ -4197,6 +4921,9 @@ unsafe extern "C-unwind" {
         dtype: i32,
         out_data: *mut *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    pub fn mlx_array_alloc_gpu_uninit(shape: *const i64, ndim: usize, dtype: i32)
+    -> *mut mlx_array;
+    pub fn mlx_array_ensure_cuda_device(arr: *mut mlx_array) -> *mut mlx_array;
     /// Native Metal allocation with a CPU-visible pointer and a last-array
     /// lease (`mlx_array_alloc.cpp`). Null on unsupported builds or failure;
     /// `release_fn(ctx)` is not invoked on a null return.
@@ -4208,6 +4935,27 @@ unsafe extern "C-unwind" {
         release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
         ctx: *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    /// Zero-copy read-only uint8 `[n_pages, page_size]` array over a
+    /// page-aligned `PROT_READ` `MAP_SHARED` mmap slice (`mlx_array_alloc.cpp`).
+    /// Bypasses `MetalAllocator::make_buffer` so active memory and residency
+    /// sets stay untouched. Null on unsupported builds, invalid alignment,
+    /// length > `maxBufferLength`, or allocation failure; `release_fn(ctx)` is
+    /// not invoked on a null return.
+    pub fn mlx_array_from_mmap_readonly(
+        aligned_ptr: *mut std::ffi::c_void,
+        aligned_len: usize,
+        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    /// Standing Metal residency set over `arrays[0..count]` (`mlx_array_alloc.cpp`).
+    /// Must be destroyed before the backing buffers are freed. Null on failure
+    /// or non-Metal builds.
+    pub fn mlx_metal_residency_set_create(
+        arrays: *const *mut mlx_array,
+        count: usize,
+    ) -> *mut std::ffi::c_void;
+    pub fn mlx_metal_residency_set_request(handle: *mut std::ffi::c_void);
+    pub fn mlx_metal_residency_set_destroy(handle: *mut std::ffi::c_void);
     /// Set purgeability on an array's existing Metal allocation. `state` is 2
     /// (non-volatile), 3 (volatile), or 4 (empty); returns the previous state,
     /// or -1 on unsupported builds and invalid handles/states. Never evaluates.

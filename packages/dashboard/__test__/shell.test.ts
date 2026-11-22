@@ -181,11 +181,12 @@ function snapshot(status: EngineStatus, processes: RuntimeProcessLive[]): Runtim
 }
 
 describe('shell navigation', () => {
-  it('lists the nine nav items in table order and marks the current one', async () => {
+  it('lists the ten nav items in table order and marks the current one', async () => {
     const { container } = await mount('/engine', 'The inference process, live.');
     expect(navLabels(container)).toEqual([
       'Overview',
       'Chat',
+      'System One',
       'Sessions',
       'Metrics',
       'Engine',
@@ -226,7 +227,7 @@ describe('shell navigation', () => {
     expect(container.querySelector('aside[data-nav]')?.getAttribute('data-mode')).toBe('rail');
     expect(byRole(container, 'button', 'Collapse sidebar')).toBeNull();
     expect(byRole(container, 'button', 'Search')).not.toBeNull();
-    expect(navLabels(container)).toHaveLength(9);
+    expect(navLabels(container)).toHaveLength(10);
   });
 
   it('is expanded at 1180 px and the toggle turns it into a rail', async () => {
@@ -326,7 +327,7 @@ describe('keyboard', () => {
     await waitFor(() => document.activeElement === link);
   });
 
-  it('⌘2 goes to Chat and ⌘3 to Sessions', async () => {
+  it('⌘2 goes to Chat', async () => {
     const { container } = await mount('/engine', 'The inference process, live.');
     const link = sections(container).querySelector<HTMLAnchorElement>('a[href="/chat"]');
     expect((link?.textContent ?? '').trim()).toBe('Chat');
@@ -334,25 +335,31 @@ describe('keyboard', () => {
     expect(location).toBe('/chat');
   });
 
-  it('⌘3 goes to Sessions, the third nav item', async () => {
+  it('⌘3 goes to System One, the third nav item', async () => {
     await mount('/engine', 'The inference process, live.');
     await press('3');
+    expect(location).toBe('/system-one');
+  });
+
+  it('⌘4 goes to Sessions', async () => {
+    await mount('/engine', 'The inference process, live.');
+    await press('4');
     expect(location).toBe('/sessions');
   });
 
-  it('⌘4 goes to Metrics', async () => {
+  it('⌘5 goes to Metrics', async () => {
     await mount('/engine', 'The inference process, live.');
-    await press('4');
+    await press('5');
     expect(location).toBe('/metrics');
     expect(page!.text()).toContain('Metrics probe page');
   });
 
-  it('⌘9 goes to Web Search, the last nav item', async () => {
+  it('⌘9 goes to Coding Agents, the ninth nav item', async () => {
     const { container } = await mount('/engine', 'The inference process, live.');
-    const link = sections(container).querySelector<HTMLAnchorElement>('a[href="/providers"]');
-    expect((link?.textContent ?? '').trim()).toBe('Web Search');
+    const link = sections(container).querySelector<HTMLAnchorElement>('a[href="/coding-agents"]');
+    expect((link?.textContent ?? '').trim()).toBe('Coding Agents');
     await press('9');
-    expect(location).toBe('/providers');
+    expect(location).toBe('/coding-agents');
   });
 
   it('⌘⇧O opens a new conversation in the last used mode from any page', async () => {

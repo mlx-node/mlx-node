@@ -173,6 +173,20 @@ function nonEmptyRecord(value: unknown): value is Record<string, unknown> {
  * (e.g. a racing rewrite) lands on the context fallback and text-only input
  * instead of dropping the model or guessing a positive capability.
  */
+async function hasSiblingMmprojGguf(dir: string): Promise<boolean> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const lower = entry.name.toLowerCase();
+      if (!lower.startsWith('mmproj-') || !lower.endsWith('.gguf')) continue;
+      if ((await resolveDirentKind(dir, entry)) === 'file') return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function readDiscoveryMetadata(
   modelPath: string,
   modelType: ModelType,
@@ -294,18 +308,21 @@ export async function discoverLocalChatModels(
     splitFileId: string | undefined,
     naming: (config: unknown, id: string) => ModelVariantName,
   ): Promise<void> => {
-    const decision = modelType === 'clef' && opts?.includeDecisions === true;
+    const decision = familyDataFor(modelType)?.kind === 'decision' && opts?.includeDecisions === true;
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
 
     // Fail-closed guards: dead-by-construction for chat families (the
     // family-data row type requires traits + a preset), live for any foreign
     // string that slips through detection.
+    const decisionContextCap = modelType === 'clairic' ? 65536 : 16384;
     const preset = decision ? { sampling: {}, maxOutputTokens: 0 } : launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;
     }
-    const traits = decision ? { reasoning: false, fallbackContextWindow: 16384 } : familyTraitsFor(modelType);
+    const traits = decision
+      ? { reasoning: false, fallbackContextWindow: decisionContextCap }
+      : familyTraitsFor(modelType);
     if (!traits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
       return;
@@ -317,6 +334,14 @@ export async function discoverLocalChatModels(
       return;
     }
 
+    const supportsImages =
+      modelType === 'clef'
+        ? false
+        : metadata.supportsImages ||
+          (format === 'gguf' &&
+            (modelType === 'clairic' || modelType === 'qwen3_5') &&
+            (await hasSiblingMmprojGguf(metadataRoot)));
+
     // Automatic companions can be installed or removed after this startup
     // scan. The host resolves them on each load; draftModelPath is reserved
     // for caller-supplied paths that the loader must treat as authoritative.
@@ -326,8 +351,8 @@ export async function discoverLocalChatModels(
         modelType,
         preset,
         traits,
-        contextWindow: decision ? Math.min(16384, metadata.contextWindow) : metadata.contextWindow,
-        supportsImages: decision ? false : metadata.supportsImages,
+        contextWindow: decision ? Math.min(decisionContextCap, metadata.contextWindow) : metadata.contextWindow,
+        supportsImages,
         format,
       },
       preferredName,
@@ -358,8 +383,13 @@ export async function discoverLocalChatModels(
       const canonical = await realpath(path);
       const assetsRoot = dirname(canonical);
       const modelType = await detectModelType(canonical);
-      const family = familyDataFor(modelType);
-      if (!supportedGgufName(name, modelType)) return;
+      // Clairic GGUFs wrap a Qwen3.5 backbone (`general.architecture = "qwen35"`)
+      // promoted by sibling `clair_head.{safetensors,config.json}` assets.
+      // Validate filename and header against the Qwen3.5 backbone policy, then
+      // register under the promoted `clairic` family.
+      const ggufPolicyModelType: ModelType = modelType === 'clairic' ? 'qwen3_5' : modelType;
+      const family = familyDataFor(ggufPolicyModelType);
+      if (!supportedGgufName(name, ggufPolicyModelType)) return;
       // A sibling config must agree with the target header, never a projector.
       if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(canonical))) return;
       if (

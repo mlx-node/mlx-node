@@ -25,3 +25,8 @@ export function metricsRuntimeDir(): string {
 export function desktopSupervisorStatePath(): string {
   return join(mlxNodeHome(), 'desktop', 'supervisor.json');
 }
+
+/** Persisted System One run history for the desktop Control Panel. */
+export function systemOneHistoryPath(): string {
+  return join(mlxNodeHome(), 'desktop', 'systemone-history.json');
+}

@@ -517,7 +517,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
             modelWorkCoordinator.requestLoadAdmissionCount > 0 ||
             registry.dispatchLeaseCount > 0 ||
             registry.persistRetainCount > 0,
-          resident: () => registry.listSessionRegistries().length > 0,
+          resident: () => registry.listSessionRegistries().length > 0 || registry.decisions.list().length > 0,
         });
   // Chat requests and their loads also move the weights' clock; audio and
   // rerank keep the plain sweeper.

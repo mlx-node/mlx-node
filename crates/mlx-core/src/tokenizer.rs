@@ -2323,9 +2323,15 @@ impl Qwen3Tokenizer {
         //
         // Separators are Python's `json.dumps` defaults, not serde_json's compact
         // ones — see [`PythonDefaultFormatter`] for why that is prompt-visible.
-        env.add_filter("tojson", |value: minijinja::Value| -> String {
-            to_json_python_separators(&value).unwrap_or_else(|| "null".to_string())
-        });
+        env.add_filter(
+            "tojson",
+            |value: minijinja::Value,
+             kwargs: minijinja::value::Kwargs|
+             -> std::result::Result<String, minijinja::Error> {
+                check_tojson_kwargs(&kwargs)?;
+                Ok(to_json_python_separators(&value).unwrap_or_else(|| "null".to_string()))
+            },
+        );
 
         // Add Python-compatible string methods that Qwen3's template uses
         // These are called as methods on strings: content.startswith('prefix')
@@ -2403,6 +2409,7 @@ impl Qwen3Tokenizer {
                                 .collect::<Vec<_>>(),
                         ));
                     }
+                    "format" => return python_str_format(s, args).map(minijinja::Value::from),
                     _ => {
                         return Err(minijinja::Error::new(
                             minijinja::ErrorKind::UnknownMethod,
@@ -2548,6 +2555,7 @@ impl Qwen3Tokenizer {
         // spelling follow deepseek-recipe's dsv41 encoder, which the template
         // alone does not.
         let ds41 = template_str.contains("effort_map") && template_str.contains("｜DSML｜");
+        let hy4 = template_str.contains("reasoning_effort:") && template_str.contains("hy_start");
         if ds41 {
             env.add_filter("tojson", |value: minijinja::Value| -> String {
                 to_json_cpython_floats(&value).unwrap_or_else(|| "null".to_string())
@@ -2713,11 +2721,27 @@ impl Qwen3Tokenizer {
                     "max" => Some("max"),
                     _ => Some("high"),
                 }
+            } else if hy4 {
+                Some(hy4_reasoning_effort(effort))
             } else {
                 Some(effort)
             };
             if let Some(effort) = effort {
                 ctx_map.insert("reasoning_effort".into(), minijinja::Value::from(effort));
+            }
+        }
+        // Hy4's template raises on any effort outside max|high|low|no_think and
+        // reads `preserved_thinking` (with a d); unset, it keeps its own
+        // defaults (effort high; history reasoning kept only with tools).
+        if hy4 {
+            if enable_thinking == Some(false) {
+                ctx_map.insert(
+                    "reasoning_effort".into(),
+                    minijinja::Value::from("no_think"),
+                );
+            }
+            if render_ctx.preserve_thinking {
+                ctx_map.insert("preserved_thinking".into(), minijinja::Value::from(true));
             }
         }
         ctx_map.insert(
@@ -3301,7 +3325,7 @@ impl Qwen3Tokenizer {
         {
             return DEEPSEEK_V41_CONTROL_MARKERS;
         }
-        &[]
+        hy4_control_markers(tokenizer).unwrap_or(&[])
     }
 
     /// Detect think-end token from tokenizer vocabulary.
@@ -3313,7 +3337,13 @@ impl Qwen3Tokenizer {
                 return (Some(id), Some(tag.to_string()));
             }
         }
-        (None, None)
+        // Hy4 spells its close `</think:<suffix>>`, with a suffix that differs
+        // between the GGUF (`:6124c78e`) and HF (`:opensource`) vocabularies.
+        vocab
+            .iter()
+            .filter(|(token, _)| is_suffixed_think_end(token))
+            .min_by_key(|(_, id)| **id)
+            .map_or((None, None), |(token, &id)| (Some(id), Some(token.clone())))
     }
 
     /// Get the think-end token ID, if the tokenizer has thinking support.
@@ -3663,14 +3693,13 @@ impl RenderInputs {
 ///    nested containers, insertion key order — is byte-identical. Pre-existing,
 ///    unchanged by this formatter, and pinned both ways by
 ///    `tojson_float_spelling_is_the_only_known_divergence_from_cpython`.
-/// 2. **Arity.** The filter takes one positional value. HF's `tojson` also accepts
-///    `ensure_ascii` / `indent` / `separators` / `sort_keys`, so a template
-///    written as `tojson(indent=4)` fails to render for us with "too many
-///    arguments". Not live: the only installed template using the kwarg form is
-///    `step-3.7-flash`, which is not a supported family, and the
-///    pre-formatter `serde_json::to_string` filter had the same arity — so this
-///    is a standing gap, not a regression. Widening the closure to take
-///    `minijinja::value::Kwargs` is a separate change with its own blast radius.
+/// 2. **Arity.** The filter takes one positional value and, of HF's `tojson`
+///    kwargs (`ensure_ascii` / `indent` / `separators` / `sort_keys`), only the
+///    two that leave these bytes unchanged: `ensure_ascii=False` and
+///    `indent=None` ([`check_tojson_kwargs`]; Hy4-flash writes
+///    `tojson(ensure_ascii=False)`). Any other kwarg or value, e.g.
+///    `tojson(indent=4)`, fails to render with "too many arguments", as every
+///    kwarg did before.
 struct PythonDefaultFormatter;
 
 impl serde_json::ser::Formatter for PythonDefaultFormatter {
@@ -3788,6 +3817,161 @@ fn to_json_python_separators<T: Serialize + ?Sized>(value: &T) -> Option<String>
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonDefaultFormatter);
     value.serialize(&mut ser).ok()?;
     String::from_utf8(buf).ok()
+}
+
+/// HF's `tojson` kwargs that leave [`to_json_python_separators`]'s bytes as
+/// they are: `ensure_ascii=False` (HF's default) and `indent=None`. Any other
+/// value or kwarg is a render error, not a silently different JSON, of the
+/// kind ("too many arguments") the one-argument filter gave every kwarg: the
+/// cross-family gates record unrenderable templates by that text.
+fn check_tojson_kwargs(
+    kwargs: &minijinja::value::Kwargs,
+) -> std::result::Result<(), minijinja::Error> {
+    if kwargs.get::<Option<bool>>("ensure_ascii")? == Some(true) {
+        return Err(minijinja::Error::new(
+            minijinja::ErrorKind::TooManyArguments,
+            "tojson: ensure_ascii=True is not supported",
+        ));
+    }
+    if kwargs.get::<Option<minijinja::Value>>("indent")?.is_some() {
+        return Err(minijinja::Error::new(
+            minijinja::ErrorKind::TooManyArguments,
+            "tojson: only indent=None is supported",
+        ));
+    }
+    kwargs.assert_all_used()
+}
+
+/// Python `str.format` for automatic positional fields only: `{}` takes the
+/// next argument, `{{` and `}}` are literal braces. A numbered, named or
+/// formatted field, a lone brace, a keyword argument, too few arguments, or an
+/// argument other than a string or an integer (whose Python `str` minijinja
+/// does not reproduce) is an error. Extra arguments are ignored, as in Python.
+fn python_str_format(
+    template: &str,
+    args: &[minijinja::Value],
+) -> std::result::Result<String, minijinja::Error> {
+    let error = |detail: &str| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("format: {detail}"),
+        )
+    };
+    if args.iter().any(minijinja::Value::is_kwargs) {
+        return Err(error("keyword arguments are not supported"));
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut next = args.iter();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('{', Some('{')) | ('}', Some('}')) => {
+                chars.next();
+                out.push(c);
+            }
+            ('{', Some('}')) => {
+                chars.next();
+                let arg = next
+                    .next()
+                    .ok_or_else(|| error("more `{}` fields than arguments"))?;
+                out.push_str(&python_str_of(arg).ok_or_else(|| {
+                    error(&format!("unsupported argument of kind {}", arg.kind()))
+                })?);
+            }
+            ('{', _) | ('}', _) => {
+                return Err(error(
+                    "only `{}` fields and `{{`/`}}` escapes are supported",
+                ));
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// Python `str(value)` where minijinja's display agrees with it.
+fn python_str_of(value: &minijinja::Value) -> Option<String> {
+    if value.kind() == minijinja::value::ValueKind::String {
+        return value.as_str().map(str::to_string);
+    }
+    value.is_integer().then(|| value.to_string())
+}
+
+/// Hy4-flash's template accepts only `max`, `high`, `low` and `no_think`.
+fn hy4_reasoning_effort(effort: &str) -> &'static str {
+    match effort {
+        "none" => "no_think",
+        "minimal" | "low" => "low",
+        "max" => "max",
+        _ => "high",
+    }
+}
+
+/// `</think:<suffix>>` with a non-empty suffix and no other `<` or `>`.
+fn is_suffixed_think_end(token: &str) -> bool {
+    token
+        .strip_prefix("</think:")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains(['<', '>']))
+}
+
+/// Hy4-flash's named added tokens by id; the `<｜hy_place▁holder▁no▁N｜>` rows
+/// between them are inert and omitted. Their strings carry a build suffix
+/// (`:6124c78e` in the GGUF, `:opensource` in HF), so the markers are read
+/// from the vocabulary, never spelled here.
+const HY4_MARKER_IDS: &[u32] = &[
+    120000, 120001, 120002, 120003, 120004, 120005, 120008, 120025, 120029, 120030, 120033, 120034,
+    120035, 120036, 120037, 120038, 120039, 120040, 120041, 120042, 120043, 120118, 120119, 120120,
+    120121, 120122, 120123, 120124,
+];
+
+/// Ids whose tokens must open with these prefixes (and close `｜>`) for a
+/// vocabulary to be Hy4-flash's.
+const HY4_FINGERPRINT: [(u32, &str); 4] = [
+    (120000, "<｜hy_start"),
+    (120001, "<｜hy_middle"),
+    (120025, "<｜hy_end"),
+    (120039, "<｜reasoning_mode"),
+];
+
+fn hy4_control_markers(tokenizer: &Tokenizer) -> Option<&'static [&'static str]> {
+    let fingerprint = HY4_FINGERPRINT.iter().all(|&(id, prefix)| {
+        tokenizer
+            .id_to_token(id)
+            .is_some_and(|token| token.starts_with(prefix) && token.ends_with("｜>"))
+    });
+    if !fingerprint {
+        return None;
+    }
+    let markers = HY4_MARKER_IDS
+        .iter()
+        .map(|&id| tokenizer.id_to_token(id))
+        .collect::<Option<Vec<String>>>()?;
+    Some(intern_marker_set(markers))
+}
+
+/// A marker set read from a vocabulary, as `&'static` as the families'
+/// constant sets: each distinct set is leaked once and shared after that.
+fn intern_marker_set(markers: Vec<String>) -> &'static [&'static str] {
+    static INTERNED: std::sync::Mutex<Vec<&'static [&'static str]>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut interned = INTERNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&set) = interned
+        .iter()
+        .find(|set| set.iter().copied().eq(markers.iter().map(String::as_str)))
+    {
+        return set;
+    }
+    let set: &'static [&'static str] = Box::leak(
+        markers
+            .into_iter()
+            .map(|marker| &*Box::leak(marker.into_boxed_str()))
+            .collect::<Box<[&'static str]>>(),
+    );
+    interned.push(set);
+    set
 }
 
 /// Serialize a single `ChatMessage` into the shape Jinja chat templates
@@ -4000,6 +4184,9 @@ fn encoding_to_uint32_array<'env>(
 
 #[cfg(test)]
 mod muse_glimmer_golden;
+
+#[cfg(test)]
+mod hy4_golden;
 
 #[cfg(test)]
 pub(crate) fn audio_test_tokenizer() -> Qwen3Tokenizer {
@@ -5674,10 +5861,13 @@ mod tests {
     ///    behind it. Registering `strftime_now` therefore needs a decision about
     ///    where its date comes from, which is a plumbing change, not a filter fix.
     /// 2. `too many arguments` — HF's `tojson` takes `ensure_ascii` / `indent` /
-    ///    `separators` / `sort_keys` kwargs and ours takes one positional value.
-    ///    Only `step-3.7-flash` uses the kwarg form and it is not a supported
-    ///    family; the pre-formatter `serde_json::to_string` filter had the same
-    ///    arity, so this is not a regression. See [`PythonDefaultFormatter`].
+    ///    `separators` / `sort_keys` kwargs and ours only `ensure_ascii=False`
+    ///    and `indent=None`; any other kwarg or value still fails with this
+    ///    text. `step-3.7-flash` (not a supported family) failed here when no
+    ///    kwarg was accepted; which kwargs it writes is unverified (no local
+    ///    copy of its template), so if it now renders, compare it to its
+    ///    fixture and drop it from `KNOWN_UNRENDERABLE_FAMILIES`. See
+    ///    [`PythonDefaultFormatter`].
     const KNOWN_UNRENDERABLE_CAUSES: &[&str] =
         &["unknown function: strftime_now", "too many arguments"];
 

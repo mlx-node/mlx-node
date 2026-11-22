@@ -36,6 +36,11 @@ unicode-ident = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 zip = { workspace = true }
 unicode-normalization.workspace = true
+base64 = { workspace = true }
+bigdecimal = { workspace = true }
+fancy-regex = { workspace = true }
+llguidance = { workspace = true }
+toktrie = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true
