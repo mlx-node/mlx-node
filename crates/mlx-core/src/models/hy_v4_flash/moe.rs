@@ -1550,17 +1550,6 @@ impl Moe {
         Ok(out)
     }
 
-    #[cfg(test)]
-    fn kq_prefill_indirect_gu(
-        &self,
-        z: &MxArray,
-        token_rows: &[u32],
-        tiles: &[u32],
-        p: &Prepared,
-    ) -> Result<Option<MxArray>> {
-        self.kq_prefill_indirect_gu_arrays(z, token_rows, tiles, &p.arrays)
-    }
-
     fn kq_prefill_indirect_gu_gpu(
         &self,
         z: &MxArray,
@@ -1602,28 +1591,6 @@ impl Moe {
             h,
             "hy_v4_flash kq_prefill_indirect_gu",
         )?))
-    }
-
-    #[cfg(test)]
-    fn kq_prefill_indirect_gu_arrays(
-        &self,
-        z: &MxArray,
-        token_rows: &[u32],
-        tiles: &[u32],
-        arrays: &[ProjArrays; 3],
-    ) -> Result<Option<MxArray>> {
-        if !prefill_indirect_gu_enabled()
-            || arrays[0].format != KQuantFormat::Q4K
-            || arrays[1].format != KQuantFormat::Q4K
-            || token_rows.is_empty()
-            || tiles.is_empty()
-            || !tiles.len().is_multiple_of(3)
-        {
-            return Ok(None);
-        }
-        let tr = MxArray::from_uint32(token_rows, &[token_rows.len() as i64])?;
-        let tl = MxArray::from_uint32(tiles, &[(tiles.len() / 3) as i64, 3])?;
-        self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)
     }
 
     pub(crate) fn kq_sorted_combine(

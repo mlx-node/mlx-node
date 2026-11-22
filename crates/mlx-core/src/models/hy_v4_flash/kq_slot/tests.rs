@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use super::*;
 use crate::array::alloc::{OutLayout, SendPtr};
 use crate::utils::gguf::GgufTensorType;
@@ -141,36 +139,5 @@ fn bad_bands_are_refused() {
         no_scales.scales = None;
         assert!(rows_into(&t, &vec![0; row], 0, 1, &no_scales).is_err());
         rows_into(&t, &vec![0; 2 * row], 2, 2, &d).unwrap();
-    }
-}
-
-/// GGUF bytes per second of one thread, slot repack vs the CPU band repack,
-/// one 1536 x 1536 expert projection per call.
-#[test]
-#[ignore = "CPU rate probe"]
-fn slot_repack_rate() {
-    let (k, rows, reps) = (1536usize, 1536usize, 200usize);
-    for ty in [GgufTensorType::Q4K, GgufTensorType::Q6K] {
-        let format = ty.k_quant_format().unwrap();
-        let t = info(ty, k, rows);
-        let blocks = random_bytes(rows * format.row_bytes(k), 7);
-        let mut h = Host::new(format, rows, k, 0);
-        let d = h.dst();
-        let rate = |f: &dyn Fn() -> Result<()>| {
-            f().unwrap();
-            let t0 = Instant::now();
-            for _ in 0..reps {
-                f().unwrap();
-            }
-            (blocks.len() * reps) as f64 / t0.elapsed().as_secs_f64() / 1e9
-        };
-        let slot = rate(&|| rows_into(&t, &blocks, 0, rows, &d));
-        let band = rate(&|| cpu_kquant_band_into(&t, &blocks, 0, rows, &d));
-        println!(
-            "{{\"format\":\"{}\",\"bytes\":{},\"reps\":{reps},\"slot_gbps\":{slot:.3},\"band_gbps\":{band:.3},\"speedup\":{:.2}}}",
-            format.mlx_mode(),
-            blocks.len(),
-            slot / band
-        );
     }
 }

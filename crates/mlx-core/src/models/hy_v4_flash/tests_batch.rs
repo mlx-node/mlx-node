@@ -1,17 +1,23 @@
-//! The wave's op table, its row checks, and owner rows of a wave with Q8
-//! attention projections giving each owner's bits alone.
+//! The wave's op table, its row checks, owner rows of a wave with Q8
+//! attention projections, router_mv, and dual_down_add parity.
 
-use super::attention::{Geometry, Mla, grouped_mm_t_mgh};
+use super::attention::{Geometry, Mla};
 use super::batch::{Group, MIN_Q8_ROWS, OPS, Op, Span, Wave, decode_group, group};
 use super::cache::{WINDOW_SLACK, WindowRing};
 use super::config::Attn;
-use super::moe::{AffineProj, FFN_CHUNK_ROWS, RowKind, qlinear};
+use super::moe::{FFN_CHUNK_ROWS, RowKind, qlinear};
+use super::ops::{router_logits, try_q8_dual_down_add};
+use super::test_support::{
+    Rng, arr, assert_row_invariant, error_stats, make_qmm, make_sym_q8, max_abs_err, read_bits,
+    read_f32,
+};
 use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::store::Weight;
+use crate::nn::Activations;
 
 #[test]
-fn decode_groups_follow_the_op_table() {
+fn wave_op_table_spans_and_owner_rows() {
     let want = [
         (Op::Engram, Group::Fused),
         (Op::HcMix, Group::Fused),
@@ -25,115 +31,57 @@ fn decode_groups_follow_the_op_table() {
     ];
     assert_eq!(OPS.len(), want.len());
     for (op, (wop, g)) in OPS.iter().zip(want) {
-        assert_eq!(*op, wop);
-        assert_eq!(decode_group(*op), g, "{op:?}");
-        assert_eq!(group(*op, RowKind::Decode), g, "{op:?}");
-        let prefill = if *op == Op::AttnCore {
+        assert_eq!(
+            (*op, decode_group(*op), group(*op, RowKind::Decode)),
+            (wop, g, g)
+        );
+        let pf = if *op == Op::AttnCore {
             Group::Owner
         } else {
             Group::Fused
         };
-        assert_eq!(group(*op, RowKind::Prefill), prefill, "{op:?} prefill");
+        assert_eq!(group(*op, RowKind::Prefill), pf, "{op:?} prefill");
     }
-}
 
-#[test]
-fn waves_refuse_rows_they_cannot_hold() {
-    assert!(Wave::new(RowKind::Decode, &[], Some(12)).is_err());
-    assert!(Wave::new(RowKind::Decode, &[(3, 1), (5, 0)], Some(12)).is_err());
-    assert!(Wave::new(RowKind::Prefill, &[(0, 8), (0, 8)], None).is_err());
     let full = [(10, 3), (20, 3), (30, 3), (40, 3)];
-    assert!(Wave::new(RowKind::Decode, &full, Some(12)).is_ok());
-    assert!(Wave::new(RowKind::Decode, &full, Some(11)).is_err());
-    assert!(Wave::new(RowKind::Decode, &[(4, 1)], Some(1)).is_err());
-    assert!(Wave::new(RowKind::Decode, &[(4, 1)], Some(MIN_Q8_ROWS as usize)).is_ok());
-    assert!(Wave::new(RowKind::Decode, &[(0, FFN_CHUNK_ROWS)], None).is_ok());
-    assert!(Wave::new(RowKind::Decode, &[(0, FFN_CHUNK_ROWS + 1)], None).is_err());
-    let long = Wave::new(RowKind::Prefill, &[(0, 8192)], Some(12)).unwrap();
-    assert_eq!(long.rows(), 8192);
-}
+    let cases: &[(RowKind, &[(usize, usize)], Option<usize>, bool)] = &[
+        (RowKind::Decode, &[], Some(12), false),
+        (RowKind::Decode, &[(3, 1), (5, 0)], Some(12), false),
+        (RowKind::Prefill, &[(0, 8), (0, 8)], None, false),
+        (RowKind::Decode, &full, Some(12), true),
+        (RowKind::Decode, &full, Some(11), false),
+        (RowKind::Decode, &[(4, 1)], Some(1), false),
+        (RowKind::Decode, &[(4, 1)], Some(MIN_Q8_ROWS as usize), true),
+        (RowKind::Decode, &[(0, FFN_CHUNK_ROWS)], None, true),
+        (RowKind::Decode, &[(0, FFN_CHUNK_ROWS + 1)], None, false),
+    ];
+    for &(kind, spans, max_r, ok) in cases {
+        assert_eq!(Wave::new(kind, spans, max_r).is_ok(), ok);
+    }
+    assert_eq!(
+        Wave::new(RowKind::Prefill, &[(0, 8192)], Some(12))
+            .unwrap()
+            .rows(),
+        8192
+    );
 
-#[test]
-fn wave_spans_and_positions() {
+    let sp = |start, rows, lo| Span { start, rows, lo };
     let w = Wave::new(RowKind::Decode, &[(9, 1), (14, 2), (20, 1)], Some(12)).unwrap();
     assert_eq!((w.rows(), w.owners(), w.kind()), (4, 3, RowKind::Decode));
-    assert_eq!(
-        w.spans(),
-        &[
-            Span {
-                start: 9,
-                rows: 1,
-                lo: 0
-            },
-            Span {
-                start: 14,
-                rows: 2,
-                lo: 1
-            },
-            Span {
-                start: 20,
-                rows: 1,
-                lo: 3
-            },
-        ]
-    );
+    assert_eq!(w.spans(), &[sp(9, 1, 0), sp(14, 2, 1), sp(20, 1, 3)]);
     assert_eq!(w.positions(), vec![9, 14, 15, 20]);
     assert_eq!(w.group(Op::Router), Group::Fused);
-}
 
-#[test]
-fn owner_rows_split_a_wave() {
-    let w = Wave::new(RowKind::Decode, &[(9, 1), (14, 2), (20, 1)], None).unwrap();
-    let x = MxArray::from_float32(&(0..12).map(|v| v as f32).collect::<Vec<_>>(), &[4, 3]).unwrap();
-    let rows = |i| read(&w.owner_rows(&x, i).unwrap());
+    let x = arr(&(0..12).map(|v| v as f32).collect::<Vec<_>>(), &[4, 3]);
+    let rows = |i| read_f32(&w.owner_rows(&x, i).unwrap());
     assert_eq!(rows(0), vec![0.0, 1.0, 2.0]);
     assert_eq!(rows(1), vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     assert_eq!(rows(2), vec![9.0, 10.0, 11.0]);
     assert!(w.owner_rows(&x, 3).is_err());
-    let short = MxArray::zeros(&[3, 3], None).unwrap();
-    assert!(w.owner_rows(&short, 0).is_err());
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n).map(|_| self.next() * scale).collect()
-    }
-}
-
-fn arr(v: &[f32], shape: &[usize]) -> MxArray {
-    let s: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-    MxArray::from_float32(v, &s).unwrap()
-}
-
-fn read(x: &MxArray) -> Vec<f32> {
-    x.astype(DType::Float32)
-        .unwrap()
-        .to_float32()
-        .unwrap()
-        .to_vec()
-}
-
-/// Affine-8 g32 codes (`Dense::Qmm`) of `v [rows, cols]`.
-fn qmm(v: &[f32], rows: usize, cols: usize) -> Dense {
-    let q = AffineProj::quantize(&arr(v, &[1, rows, cols]), 32, 8).unwrap();
-    let sq = |a: &MxArray| {
-        a.reshape(&[a.shape_at(1).unwrap(), a.shape_at(2).unwrap()])
-            .unwrap()
-    };
-    Dense::Qmm {
-        w: sq(&q.w),
-        scales: sq(&q.s).astype(DType::Float32).unwrap(),
-        biases: sq(&q.b).astype(DType::Float32).unwrap(),
-    }
+    assert!(
+        w.owner_rows(&MxArray::zeros(&[3, 3], None).unwrap(), 0)
+            .is_err()
+    );
 }
 
 const DIM: usize = 64;
@@ -153,17 +101,15 @@ fn q8_layer() -> (Mla, AttnWeights) {
         window: 4,
     };
     let (h, l, v) = (g.n_heads, g.kv_lora, g.head_v);
-    let mut r = Rng(83);
-    let mat = |r: &mut Rng, rows: usize, cols: usize| {
-        qmm(&r.vec(rows * cols, 1.5 / (cols as f32).sqrt()), rows, cols)
-    };
-    let norm = |r: &mut Rng, n: usize| {
-        let v: Vec<f32> = r.vec(n, 0.5).into_iter().map(|x| 1.0 + x).collect();
-        arr(&v, &[n])
+    let mut r = Rng::new(83);
+    let mat = |r: &mut Rng, rows, cols| make_qmm(r, rows, cols, 1.5 / (cols as f32).sqrt());
+    let norm = |r: &mut Rng, n| {
+        let vals: Vec<f32> = r.vec_f32(n, 0.5).into_iter().map(|x| 1.0 + x).collect();
+        arr(&vals, &[n])
     };
     let w = AttnWeights {
         norm: norm(&mut r, DIM),
-        sinks: arr(&r.vec(h, 1.0), &[h]),
+        sinks: arr(&r.vec_f32(h, 1.0), &[h]),
         q_a: mat(&mut r, Q_LORA, DIM),
         q_a_norm: norm(&mut r, Q_LORA),
         q_b: mat(&mut r, h * g.head_qk(), Q_LORA),
@@ -177,445 +123,178 @@ fn q8_layer() -> (Mla, AttnWeights) {
         q_kv: None,
         q_kv_gate: None,
     };
-    let mla = Mla::new(g, &w).unwrap();
-    (mla, w)
+    (Mla::new(g, &w).unwrap(), w)
 }
 
-/// Three owners (one with two verify rows) through one fused projection,
-/// their own window cores and one fused finish give each owner the bits of
-/// its rows run alone, and leave each ring as the alone run does.
 #[test]
 fn q8_wave_rows_equal_each_owner_alone() {
     let (mla, w) = q8_layer();
     let g = mla.geometry().clone();
-    let mut r = Rng(91);
-    let prompts = [5usize, 3, 7];
-    let next = [1usize, 2, 1];
-    let rings: Vec<WindowRing> = prompts
+    let mut r = Rng::new(91);
+    let (prompts, next) = ([5usize, 3, 7], [1usize, 2, 1]);
+    let mut wave_rings: Vec<WindowRing> = prompts
         .iter()
         .map(|&n| {
             let mut ring = WindowRing::new(g.window, WINDOW_SLACK, g.row() as i64);
-            let h = arr(&r.vec(n * DIM, 2.0), &[n, DIM]);
+            let h = arr(&r.vec_f32(n * DIM, 2.0), &[n, DIM]);
             mla.forward_sliding(&w, &h, 0, &mut ring).unwrap();
             ring
         })
         .collect();
-    let inputs: Vec<Vec<f32>> = next.iter().map(|&n| r.vec(n * DIM, 2.0)).collect();
-
-    let mut alone_rings: Vec<WindowRing> = rings
+    let inputs: Vec<Vec<f32>> = next.iter().map(|&n| r.vec_f32(n * DIM, 2.0)).collect();
+    let mut alone_rings: Vec<WindowRing> = wave_rings
         .iter()
-        .map(|ring| WindowRing::from_snapshot(&ring.snapshot().unwrap(), WINDOW_SLACK).unwrap())
+        .map(|rg| WindowRing::from_snapshot(&rg.snapshot().unwrap(), WINDOW_SLACK).unwrap())
         .collect();
     let alone: Vec<Vec<f32>> = alone_rings
         .iter_mut()
         .zip(&inputs)
         .zip(prompts.iter().zip(next))
-        .map(|((ring, h), (&start, n))| {
-            read(
-                &mla.forward_sliding(&w, &arr(h, &[n, DIM]), start, ring)
-                    .unwrap(),
-            )
+        .map(|((rg, h), (&st, n))| {
+            read_f32(&mla.forward_sliding(&w, &arr(h, &[n, DIM]), st, rg).unwrap())
         })
         .collect();
 
     let spans: Vec<(usize, usize)> = prompts.iter().copied().zip(next).collect();
     let wave = Wave::new(RowKind::Decode, &spans, Some(12)).unwrap();
-    let all: Vec<f32> = inputs.concat();
-    let h = arr(&all, &[wave.rows(), DIM]);
-    let p = mla.project_at(&w, &h, &wave.positions()).unwrap();
-    let mut wave_rings = rings;
+    let cat = arr(&inputs.concat(), &[wave.rows(), DIM]);
+    let p = mla.project_at(&w, &cat, &wave.positions()).unwrap();
     let outs: Vec<MxArray> = wave_rings
         .iter_mut()
         .enumerate()
-        .map(|(i, ring)| {
-            let po = p.owner(&wave, i).unwrap();
-            mla.core_sliding(&w, &po, wave.spans()[i].start, ring)
+        .map(|(i, rg)| {
+            let own = p.owner(&wave, i).unwrap();
+            mla.core_sliding(&w, &own, wave.spans()[i].start, rg)
                 .unwrap()
         })
         .collect();
     let o = MxArray::concatenate_many(outs.iter().collect(), Some(0)).unwrap();
     let y = mla.finish(&w, &p.x, &o).unwrap();
     for (i, want) in alone.iter().enumerate() {
-        assert_eq!(&read(&wave.owner_rows(&y, i).unwrap()), want, "owner {i}");
+        assert_eq!(
+            &read_f32(&wave.owner_rows(&y, i).unwrap()),
+            want,
+            "owner {i}"
+        );
         assert_eq!(wave_rings[i].len(), alone_rings[i].len(), "owner {i} ring");
-    }
-}
-
-fn read_bits(x: &MxArray) -> Vec<u32> {
-    read(x).into_iter().map(f32::to_bits).collect()
-}
-
-fn assert_f32_close(got: &[f32], want: &[f32], rel: f64, label: &str) {
-    assert_eq!(got.len(), want.len(), "{label} len");
-    let rms = (want
-        .iter()
-        .map(|&v| f64::from(v) * f64::from(v))
-        .sum::<f64>()
-        / want.len().max(1) as f64)
-        .sqrt();
-    let max_abs = got
-        .iter()
-        .zip(want)
-        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
-        .fold(0.0f64, f64::max);
-    assert!(
-        max_abs <= rel * rms + 1e-5,
-        "{label}: max_abs={max_abs:e} rms={rms:e}"
-    );
-}
-
-#[test]
-fn q8_dense_decode_row_invariant_and_f32_parity() {
-    use super::moe::with_prefill_q8_nax;
-
-    crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(101);
-    let max_m = 16usize;
-    let decode_ms = [1usize, 2, 3, 4, 5, 8, 11];
-    let nax_ms = [12usize, 16];
-    let shapes = [
-        (3072usize, 1024usize),
-        (1536, 576),
-        (13824, 64),
-        (1024, 16384),
-    ];
-    for (k, n) in shapes {
-        let w = qmm(&r.vec(n * k, 1.5 / (k as f32).sqrt()), n, k);
-        let x_all = r.vec(max_m * k, 1.5);
-        let alone: Vec<Vec<u32>> = (0..max_m)
-            .map(|row| {
-                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
-                read_bits(&qlinear(&xr, &w).unwrap())
-            })
-            .collect();
-        let wf = w.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
-        for m in decode_ms {
-            let xm = arr(&x_all[..m * k], &[m, k]);
-            let y = qlinear(&xm, &w).unwrap();
-            let yb = read_bits(&y);
-            for row in 0..m {
-                assert_eq!(
-                    &yb[row * n..(row + 1) * n],
-                    &alone[row][..],
-                    "dense ({k},{n}) M={m} row {row} bit-exact vs M=1"
-                );
-            }
-            if m == 1 || m == 8 {
-                let y_ref = read(&xm.matmul(&wf).unwrap());
-                assert_f32_close(&read(&y), &y_ref, 1e-4, &format!("dense ({k},{n}) M={m}"));
-            }
-        }
-        for m in nax_ms {
-            let xm = arr(&x_all[..m * k], &[m, k]);
-            let y_nax = qlinear(&xm, &w).unwrap();
-            let y_ref = read(&xm.matmul(&wf).unwrap());
-            assert_f32_close(
-                &read(&y_nax),
-                &y_ref,
-                5e-3,
-                &format!("dense NAX ({k},{n}) M={m}"),
-            );
-            let y_dec = with_prefill_q8_nax(false, || qlinear(&xm, &w).unwrap());
-            let yb = read_bits(&y_dec);
-            for row in 0..m {
-                assert_eq!(
-                    &yb[row * n..(row + 1) * n],
-                    &alone[row][..],
-                    "dense decode fallback ({k},{n}) M={m} row {row} bit-exact vs M=1"
-                );
-            }
-        }
-    }
-}
-
-/// Builds a `Dense::SymQ8` weight from f32 values `[rows, k]` (`k % 32 == 0`).
-fn sym_q8(v: &[f32], rows: usize, k: usize) -> Dense {
-    use super::weights::{Form, dense_from_raw};
-    use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
-
-    assert_eq!(v.len(), rows * k);
-    assert_eq!(k % 32, 0);
-    let mut raw = Vec::with_capacity((rows * k / 32) * 34);
-    for blk in v.as_chunks::<32>().0 {
-        let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        let d = half::f16::from_f32((amax / 127.0).max(1e-6));
-        let df = d.to_f32();
-        raw.extend(d.to_bits().to_le_bytes());
-        for &x in blk {
-            let q = (x / df).round().clamp(-127.0, 127.0) as i8;
-            raw.extend(q.to_le_bytes());
-        }
-    }
-    let info = GgufTensorInfo {
-        name: "w".into(),
-        n_dims: 2,
-        dims: vec![k as u64, rows as u64],
-        tensor_type: GgufTensorType::Q8_0,
-        offset: 0,
-    };
-    dense_from_raw(&info, &raw, Form::Qmm).unwrap()
-}
-
-#[test]
-fn q8_dense_sym_v2_parity_and_row_invariance() {
-    crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(2026);
-    let max_m = 12usize;
-    let ms = [1usize, 2, 3, 4, 8, 12];
-    let shapes = [
-        (1024usize, 256usize),
-        (1536, 384),
-        (3072, 261),
-        (13824, 64),
-        (192, 67),
-    ];
-    for (k, n) in shapes {
-        let w = sym_q8(&r.vec(n * k, 1.0 / (k as f32).sqrt()), n, k);
-        assert!(matches!(w, Dense::SymQ8 { .. }));
-        let wf = w.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
-        let x_all = r.vec(max_m * k, 1.25);
-        let alone: Vec<Vec<u32>> = (0..8)
-            .map(|row| {
-                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
-                read_bits(&qlinear(&xr, &w).unwrap())
-            })
-            .collect();
-        for m in ms {
-            let xm = arr(&x_all[..m * k], &[m, k]);
-            let y = qlinear(&xm, &w).unwrap();
-            let got = read(&y);
-            let want = read(&xm.matmul(&wf).unwrap());
-            let max_abs = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            if m <= 8 {
-                assert!(
-                    max_abs <= 1e-5,
-                    "sym dense v2 ({k},{n}) M={m} max_abs={max_abs:e}"
-                );
-                let yb = read_bits(&y);
-                for (row, want_bits) in alone.iter().enumerate().take(m) {
-                    assert_eq!(
-                        &yb[row * n..(row + 1) * n],
-                        &want_bits[..],
-                        "sym dense v2 ({k},{n}) M={m} row {row} bit-exact vs M=1"
-                    );
-                }
-            } else {
-                assert_f32_close(&got, &want, 5e-3, &format!("sym dense M={m} NAX ({k},{n})"));
-            }
-        }
-    }
-}
-
-#[test]
-fn q8_grouped_short_row_sym_parity_and_row_invariance() {
-    crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(2027);
-    let max_m = 4usize;
-    let ms = [1usize, 2, 3, 4];
-    let shapes = [
-        (32usize, 192usize, 512usize),
-        (64, 192, 512),
-        (32, 512, 256),
-        (64, 512, 256),
-        (4, 192, 37),
-        (4, 512, 19),
-    ];
-    for (h, k, n) in shapes {
-        let w = sym_q8(&r.vec(h * n * k, 1.0 / (k as f32).sqrt()), h * n, k);
-        assert!(matches!(w, Dense::SymQ8 { .. }));
-        let wf = w
-            .f32()
-            .unwrap()
-            .reshape(&[h as i64, n as i64, k as i64])
-            .unwrap()
-            .transpose(Some(&[0, 2, 1]))
-            .unwrap();
-        let x_all = r.vec(max_m * h * k, 1.25);
-        let alone: Vec<Vec<u32>> = (0..max_m)
-            .map(|row| {
-                let xr = arr(&x_all[row * h * k..(row + 1) * h * k], &[1, h, k]);
-                read_bits(&grouped_mm_t_mgh(&w, &xr, h as i64).unwrap())
-            })
-            .collect();
-        for m in ms {
-            let xm = arr(&x_all[..m * h * k], &[m, h, k]);
-            let y = grouped_mm_t_mgh(&w, &xm, h as i64).unwrap();
-            let got = read(&y);
-            let want = read(
-                &xm.transpose(Some(&[1, 0, 2]))
-                    .unwrap()
-                    .matmul(&wf)
-                    .unwrap()
-                    .transpose(Some(&[1, 0, 2]))
-                    .unwrap(),
-            );
-            let max_abs = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_abs <= 1e-5,
-                "grouped short sym (H={h},K={k},N={n}) M={m} max_abs={max_abs:e}"
-            );
-            let yb = read_bits(&y);
-            for (row, want_bits) in alone.iter().enumerate().take(m) {
-                assert_eq!(
-                    &yb[row * h * n..(row + 1) * h * n],
-                    &want_bits[..],
-                    "grouped short sym (H={h},K={k},N={n}) M={m} row {row} bit-exact vs M=1"
-                );
-            }
-        }
     }
 }
 
 #[test]
 fn router_mv_bitwise_row_invariant_and_f32_parity() {
-    use super::ops::router_logits;
-
     crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(2028);
-    let max_m = 8usize;
-    let ms = [1usize, 2, 3, 4, 8];
-    let cases = [(512usize, 3072usize), (509, 96), (7, 64), (16, 128)];
-    for (e, k) in cases {
-        let w_raw = r.vec(e * k, 1.0 / (k as f32).sqrt());
-        let w_f32 = arr(&w_raw, &[e, k]);
+    let mut r = Rng::new(2028);
+    for (e, k) in [(512usize, 3072usize), (509, 96), (7, 64), (16, 128)] {
+        let w_f32 = arr(&r.vec_f32(e * k, 1.0 / (k as f32).sqrt()), &[e, k]);
         let w_f16 = w_f32.astype(DType::Float16).unwrap();
-        let x_all = r.vec(max_m * k, 1.25);
-
-        for (label, w_arr) in [("f32", w_f32), ("f16", w_f16)] {
+        let x_all = r.vec_f32(8 * k, 1.25);
+        for (tag, w_arr) in [("f32", w_f32), ("f16", w_f16)] {
             let wt = w_arr
                 .astype(DType::Float32)
                 .unwrap()
                 .transpose(Some(&[1, 0]))
                 .unwrap();
             let router = Dense::Array(w_arr);
-
-            let alone: Vec<Vec<u32>> = (0..max_m)
-                .map(|row| {
-                    let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
-                    read_bits(&router_logits(&xr, &router).unwrap())
-                })
-                .collect();
-
-            for m in ms {
-                let xm = arr(&x_all[..m * k], &[m, k]);
-                let y = router_logits(&xm, &router).unwrap();
-                let got = read(&y);
-                let yb = read_bits(&y);
-                for (row, want_bits) in alone.iter().enumerate().take(m) {
-                    assert_eq!(
-                        &yb[row * e..(row + 1) * e],
-                        &want_bits[..],
-                        "router_mv[{label}] (E={e},K={k}) M={m} row {row} bit-exact vs M=1"
-                    );
-                }
-                let want = read(&xm.matmul(&wt).unwrap());
-                let max_abs = got
-                    .iter()
-                    .zip(&want)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max);
-                assert!(
-                    max_abs <= 1e-5,
-                    "router_mv[{label}] (E={e},K={k}) M={m} max_abs={max_abs:e}"
-                );
-            }
+            assert_row_invariant(
+                |row| {
+                    router_logits(&arr(&x_all[row * k..(row + 1) * k], &[1, k]), &router).unwrap()
+                },
+                |m| {
+                    let xm = arr(&x_all[..m * k], &[m, k]);
+                    let y = router_logits(&xm, &router).unwrap();
+                    let err = max_abs_err(&read_f32(&y), &read_f32(&xm.matmul(&wt).unwrap()));
+                    assert!(err <= 1e-5, "router_mv[{tag}] ({e},{k}) M={m}: {err:e}");
+                    y
+                },
+                &[1, 2, 3, 4, 8],
+                &format!("router_mv[{tag}] ({e},{k})"),
+            );
         }
     }
 }
 
-#[test]
-fn q8_dual_down_add_parity_and_clamp_boundaries() {
-    use super::ops::try_q8_dual_down_add;
-    use crate::nn::Activations;
+const DUAL_G: [f32; 9] = [-25.0, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];
+const DUAL_U: [f32; 9] = [-25.0, -10.5, -10.0, -2.0, 0.0, 3.0, 10.0, 10.5, 25.0];
 
+fn dual_setup(
+    r: &mut Rng,
+    rows: usize,
+    k: usize,
+    n: usize,
+    sc_sgu: f32,
+) -> (Dense, Dense, Vec<f32>, Vec<f32>) {
+    let sc = 0.5 / (k as f32).sqrt();
+    let (w_up, w_sd) = (make_sym_q8(r, n, k, sc), make_sym_q8(r, n, k, sc));
+    let (rl, mut sgu) = (r.vec_f32(rows * k, 1.0), r.vec_f32(rows * 2 * k, sc_sgu));
+    for row in 0..rows {
+        let base = row * 2 * k;
+        for (i, (&g, &u)) in DUAL_G.iter().zip(&DUAL_U).enumerate() {
+            sgu[base + i] = g;
+            sgu[base + k + i] = u;
+        }
+    }
+    (w_up, w_sd, rl, sgu)
+}
+
+fn swiglu_sgu(sgu: &MxArray, m: usize, k: usize, lim: f32) -> MxArray {
+    let (mi, ki) = (m as i64, k as i64);
+    let (sg, su) = (
+        sgu.slice(&[0, 0], &[mi, ki]).unwrap(),
+        sgu.slice(&[0, ki], &[mi, 2 * ki]).unwrap(),
+    );
+    if lim > 0.0 {
+        Activations::swiglu_clamped_compiled(&sg, &su, lim).unwrap()
+    } else {
+        Activations::swiglu_compiled(&sg, &su).unwrap()
+    }
+}
+
+fn run_dual(rl: &MxArray, sgu: &MxArray, w_up: &Dense, w_sd: &Dense, lim: f32) -> MxArray {
+    try_q8_dual_down_add(rl, sgu, w_up, w_sd, lim)
+        .unwrap()
+        .expect("SymQ8 dual_down_add Metal")
+}
+
+#[test]
+fn q8_dual_down_add_decode_and_prefill_parity() {
     crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(2029);
-    let max_m = 4usize;
-    let ms = [1usize, 2, 4];
-    let cases = [(1536usize, 3072usize), (192, 71)];
-    let boundary_g = [-25.0f32, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];
-    let boundary_u = [-25.0f32, -10.5, -10.0, -2.0, 0.0, 3.0, 10.0, 10.5, 25.0];
+    let mut r = Rng::new(2029);
 
-    for (k, n) in cases {
-        let w_up = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
-        let w_sd = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
-        let rl_all = r.vec(max_m * k, 1.0);
-        let mut sgu_all = r.vec(max_m * 2 * k, 1.5);
-        // Inject explicit clamp boundary pairs into every row's sg/su halves.
-        for row in 0..max_m {
-            let base = row * 2 * k;
-            for (i, (&g, &u)) in boundary_g.iter().zip(&boundary_u).enumerate() {
-                sgu_all[base + i] = g;
-                sgu_all[base + k + i] = u;
-            }
-        }
-
-        for limit in [0.0f32, 10.0f32] {
-            let mut single_bits = Vec::with_capacity(max_m);
-            for row in 0..max_m {
-                let rl = arr(&rl_all[row * k..(row + 1) * k], &[1, k]);
-                let sgu = arr(&sgu_all[row * 2 * k..(row + 1) * 2 * k], &[1, 2 * k]);
-                let fused = try_q8_dual_down_add(&rl, &sgu, &w_up, &w_sd, limit)
-                    .unwrap()
-                    .expect("SymQ8 dual_down_add must run on Metal");
-                single_bits.push(read_bits(&fused));
-            }
-            for m in ms {
-                let rl = arr(&rl_all[..m * k], &[m, k]);
-                let sgu = arr(&sgu_all[..m * 2 * k], &[m, 2 * k]);
-                let fused = try_q8_dual_down_add(&rl, &sgu, &w_up, &w_sd, limit)
-                    .unwrap()
-                    .expect("SymQ8 dual_down_add must run on Metal");
-                let got = read(&fused);
-
-                let sg = sgu.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
-                let su = sgu
-                    .slice(&[0, k as i64], &[m as i64, 2 * k as i64])
-                    .unwrap();
-                let act = if limit > 0.0 {
-                    Activations::swiglu_clamped_compiled(&sg, &su, limit).unwrap()
-                } else {
-                    Activations::swiglu_compiled(&sg, &su).unwrap()
-                };
-                let up_ref = qlinear(&rl, &w_up).unwrap();
-                let sd_ref = qlinear(&act, &w_sd).unwrap();
-                let want = read(&up_ref.add(&sd_ref).unwrap());
-
-                let max_abs = got
-                    .iter()
-                    .zip(&want)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max);
-                assert!(
-                    max_abs <= 1e-5,
-                    "dual_down_add (K={k},N={n}) M={m} limit={limit} max_abs={max_abs:e}"
-                );
-                let fb = read_bits(&fused);
-                for (row, want_bits) in single_bits.iter().enumerate().take(m) {
-                    assert_eq!(
-                        &fb[row * n..(row + 1) * n],
-                        &want_bits[..],
-                        "dual_down_add (K={k},N={n}) M={m} limit={limit} row {row} bit-exact vs M=1"
+    // 1. Decode M=1,2,4: clamp boundaries + bit-exact row invariance.
+    for (k, n) in [(1536usize, 3072usize), (192, 71)] {
+        let (w_up, w_sd, rl_all, sgu_all) = dual_setup(&mut r, 4, k, n, 1.5);
+        for lim in [0.0f32, 10.0f32] {
+            assert_row_invariant(
+                |row| {
+                    let rl = arr(&rl_all[row * k..(row + 1) * k], &[1, k]);
+                    let sgu = arr(&sgu_all[row * 2 * k..(row + 1) * 2 * k], &[1, 2 * k]);
+                    run_dual(&rl, &sgu, &w_up, &w_sd, lim)
+                },
+                |m| {
+                    let (rl, sgu) = (
+                        arr(&rl_all[..m * k], &[m, k]),
+                        arr(&sgu_all[..m * 2 * k], &[m, 2 * k]),
                     );
-                }
-            }
+                    let fused = run_dual(&rl, &sgu, &w_up, &w_sd, lim);
+                    let act = swiglu_sgu(&sgu, m, k, lim);
+                    let want = qlinear(&rl, &w_up)
+                        .unwrap()
+                        .add(&qlinear(&act, &w_sd).unwrap())
+                        .unwrap();
+                    let err = max_abs_err(&read_f32(&fused), &read_f32(&want));
+                    assert!(
+                        err <= 1e-5,
+                        "dual_down_add ({k},{n}) M={m} lim={lim}: {err:e}"
+                    );
+                    fused
+                },
+                &[1, 2, 4],
+                &format!("dual_down_add ({k},{n}) lim={lim}"),
+            );
         }
     }
-}
 
-#[test]
-fn q8_dual_down_add_prefill_nax_parity_and_strided_inputs() {
-    use super::ops::try_q8_dual_down_add;
-    use crate::nn::Activations;
-
+    // 2. Prefill NAX + strided inputs (gated by Metal availability).
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
         assert!(
             std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1")
@@ -624,142 +303,54 @@ fn q8_dual_down_add_prefill_nax_parity_and_strided_inputs() {
         );
         return;
     }
-
-    crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(2030);
-    let boundary_g = [-25.0f32, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];
-    let boundary_u = [-25.0f32, -10.5, -10.0, -2.0, 0.0, 3.0, 10.0, 10.5, 25.0];
-
+    let tol = if std::env::var("MLX_HY4_Q8_PREFILL_1MMA").as_deref() == Ok("0") {
+        5e-6
+    } else {
+        5e-4
+    };
     for &(m, k, n) in &[
         (17usize, 192usize, 71usize),
         (45, 192, 160),
         (64, 512, 256),
         (77, 1536, 3072),
     ] {
-        let w_up = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
-        let w_sd = sym_q8(&r.vec(n * k, 0.5 / (k as f32).sqrt()), n, k);
-        let mut combined = r.vec(m * 3 * k, 1.0);
+        let (w_up, w_sd, rl_v, sgu_v) = dual_setup(&mut r, m, k, n, 1.0);
+        let mut combined = Vec::with_capacity(m * 3 * k);
         for row in 0..m {
-            let base = row * 3 * k + k;
-            for (i, (&g, &u)) in boundary_g.iter().zip(&boundary_u).enumerate() {
-                combined[base + i] = g;
-                combined[base + k + i] = u;
-            }
+            combined.extend_from_slice(&rl_v[row * k..(row + 1) * k]);
+            combined.extend_from_slice(&sgu_v[row * 2 * k..(row + 1) * 2 * k]);
         }
         let all = arr(&combined, &[m, 3 * k]);
-        let rl_strided = all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
-        let sgu_strided = all
-            .slice(&[0, k as i64], &[m as i64, (3 * k) as i64])
-            .unwrap();
-        let rl_contig = arr(&read(&rl_strided), &[m, k]);
-        let sgu_contig = arr(&read(&sgu_strided), &[m, 2 * k]);
-
+        let (mi, ki) = (m as i64, k as i64);
+        let (rl_s, sgu_s) = (
+            all.slice(&[0, 0], &[mi, ki]).unwrap(),
+            all.slice(&[0, ki], &[mi, 3 * ki]).unwrap(),
+        );
+        let (rl_c, sgu_c) = (arr(&rl_v, &[m, k]), arr(&sgu_v, &[m, 2 * k]));
         let wf_up = w_up.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
         let wf_sd = w_sd.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
 
-        for limit in [0.0f32, 10.0f32] {
-            let fused_strided =
-                try_q8_dual_down_add(&rl_strided, &sgu_strided, &w_up, &w_sd, limit)
-                    .unwrap()
-                    .expect("SymQ8 dual_down_add prefill must run on Metal");
-            let fused_contig = try_q8_dual_down_add(&rl_contig, &sgu_contig, &w_up, &w_sd, limit)
-                .unwrap()
-                .expect("SymQ8 dual_down_add prefill must run on Metal");
+        for lim in [0.0f32, 10.0f32] {
+            let (fs, fc) = (
+                run_dual(&rl_s, &sgu_s, &w_up, &w_sd, lim),
+                run_dual(&rl_c, &sgu_c, &w_up, &w_sd, lim),
+            );
             assert_eq!(
-                read_bits(&fused_strided),
-                read_bits(&fused_contig),
-                "dual_down_add prefill strided vs contig mismatch M={m} K={k} N={n} limit={limit}"
+                read_bits(&fs),
+                read_bits(&fc),
+                "prefill strided M={m} K={k} lim={lim}"
             );
-
-            let sg = sgu_contig.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
-            let su = sgu_contig
-                .slice(&[0, k as i64], &[m as i64, (2 * k) as i64])
+            let act = swiglu_sgu(&sgu_c, m, k, lim);
+            let want = rl_c
+                .matmul(&wf_up)
+                .unwrap()
+                .add(&act.matmul(&wf_sd).unwrap())
                 .unwrap();
-            let act = if limit > 0.0 {
-                Activations::swiglu_clamped_compiled(&sg, &su, limit).unwrap()
-            } else {
-                Activations::swiglu_compiled(&sg, &su).unwrap()
-            };
-            let want = read(
-                &rl_contig
-                    .matmul(&wf_up)
-                    .unwrap()
-                    .add(&act.matmul(&wf_sd).unwrap())
-                    .unwrap(),
-            );
-            let got = read(&fused_contig);
-            let mut err2 = 0.0f64;
-            let mut ref2 = 0.0f64;
-            for (&g, &w) in got.iter().zip(&want) {
-                assert!(g.is_finite(), "non-finite dual_down_add prefill output");
-                let d = f64::from(g - w);
-                err2 += d * d;
-                ref2 += f64::from(w) * f64::from(w);
-            }
-            let rel = (err2 / ref2.max(1e-30)).sqrt();
-            let tol = if std::env::var("MLX_HY4_Q8_PREFILL_1MMA").as_deref() == Ok("0") {
-                5e-6
-            } else {
-                5e-4
-            };
+            let (_, rel) = error_stats(&read_f32(&fc), &read_f32(&want));
             assert!(
                 rel <= tol,
-                "dual_down_add prefill M={m} K={k} N={n} limit={limit}: rel_l2={rel:e} > {tol:e}"
+                "prefill M={m} K={k} N={n} lim={lim}: {rel:e} > {tol:e}"
             );
-        }
-    }
-}
-
-#[test]
-fn q8_grouped_decode_row_invariant_and_f32_parity() {
-    crate::models::hy_v4_flash::exact_f32();
-    let mut r = Rng(103);
-    let max_m = 16usize;
-    let ms = [1usize, 2, 3, 4, 5, 12, 16];
-    let shapes = [(64usize, 192usize, 512usize), (64, 512, 256)];
-    for (g, k, n) in shapes {
-        let w = qmm(&r.vec(g * n * k, 1.5 / (k as f32).sqrt()), g * n, k);
-        let x_all = r.vec(max_m * g * k, 1.5);
-        let alone: Vec<Vec<u32>> = (0..max_m)
-            .map(|row| {
-                let xr = arr(&x_all[row * g * k..(row + 1) * g * k], &[1, g, k]);
-                read_bits(&grouped_mm_t_mgh(&w, &xr, g as i64).unwrap())
-            })
-            .collect();
-        let wf = w
-            .f32()
-            .unwrap()
-            .reshape(&[g as i64, n as i64, k as i64])
-            .unwrap()
-            .transpose(Some(&[0, 2, 1]))
-            .unwrap();
-        for m in ms {
-            let xm = arr(&x_all[..m * g * k], &[m, g, k]);
-            let y = grouped_mm_t_mgh(&w, &xm, g as i64).unwrap();
-            let yb = read_bits(&y);
-            for row in 0..m {
-                assert_eq!(
-                    &yb[row * g * n..(row + 1) * g * n],
-                    &alone[row][..],
-                    "grouped (G={g},K={k},N={n}) M={m} row {row} bit-exact vs M=1"
-                );
-            }
-            if m == 1 || m == 16 {
-                let y_ref = read(
-                    &xm.transpose(Some(&[1, 0, 2]))
-                        .unwrap()
-                        .matmul(&wf)
-                        .unwrap()
-                        .transpose(Some(&[1, 0, 2]))
-                        .unwrap(),
-                );
-                assert_f32_close(
-                    &read(&y),
-                    &y_ref,
-                    1e-4,
-                    &format!("grouped (G={g},K={k},N={n}) M={m}"),
-                );
-            }
         }
     }
 }

@@ -1,534 +1,227 @@
-//! Tiny synthetic trunk with every axis that can hide a wiring bug: latent
-//! != ff, sliding and indexed layers with different head counts, one Engram
-//! layer, kpool 4, top_k 16 and window 8 (a 24-token prompt crosses both),
-//! Q4_K and Q6_K expert downs through the K-quant bank, a dense first FFN
-//! and a BF16 head. Calls split as one prefill, prefill + decode, 1 + decode
-//! and uneven prefill chunks must give the one-call logits and routes.
+//! Tiny synthetic trunk covering sliding & indexed layers, Engram, Q4_K & Q6_K
+//! expert bank (streamed / direct / mmap / prefetch), BF16 head, multi-owner
+//! decode waves, rollback/restore, circular window wrap, and Engram lookahead.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use super::bank::{KqBank, class_types, geometry};
-use super::cache::with_row_dtype;
-use super::config::{
-    Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
-};
+use super::bank::{KqBank, KqStats, Residency};
+use super::cache::{WINDOW_SLACK, with_row_dtype};
+use super::config::HyV4FlashConfig;
 use super::engram::Hasher;
-use super::model::{
-    Logits, Model, Output, OwnerRows, Session, Trace, TrunkWeights, Want, call_engram_rows,
-};
-use super::moe::{ExpertSource, RowKind};
+use super::ladder::Ladder;
+use super::model::{Logits, Model, Output, OwnerRows, Session, Trace, Want, call_engram_rows};
+use super::moe::{ExpertSource, RowKind, forced, with_prefill_indirect_gu};
 use super::ops::head_logits;
-use super::rows::{F8Table, ResidentF8Table};
-use super::scan::{ExpertClass, ExpertLayer, Located, Scan};
-use super::stats::{PHASES, Phase, phase_seconds, set_profiling};
-use super::weights::{
-    AttnWeights, Dense, EngramWeights, Ffn, HcWeights, IndexerWeights, LayerWeights, MoeWeights,
-    Resident, Residual,
+use super::prefill::{Driver, Grid, Prefilled};
+use super::rows::{EngramRows, F8Table, PrefetchHandle};
+use super::scan::{ExpertLayer, Located};
+use super::stats::{self, PHASES, Phase, phase_seconds, set_profiling};
+#[allow(unused_imports)]
+pub(super) use super::test_support::tiny_cfg;
+use super::test_support::{
+    DenseKind, Rng, TINY_CLASSES, TINY_CTX, TINY_D, TINY_V, Temp, TinyModelFixture,
+    TinyWeightsOpts, arr, bank_fixture, fixture, kquant_layer, max_abs_err, read_bits, read_f32,
+    real_scan, tiny_engram_cfg, tiny_engram_table, tiny_model_fixture, tiny_q8_cfg,
+    tiny_weights_opts,
 };
+use super::weights::{Dense, Resident};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::EngramConfig;
 use crate::moe_stream::io::{IoPool, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
-use crate::utils::gguf_kquant::KQuantFormat;
 
-const V: usize = 96;
-const D: usize = 32;
-const HC: usize = 4;
-const Q_LORA: usize = 16;
-const KV_LORA: usize = 16;
-const NOPE: usize = 8;
-const ROPE: usize = 8;
-const HEAD_V: usize = 12;
-const IDX_HEADS: usize = 2;
-const IDX_DIM: usize = 16;
-const DENSE_FF: usize = 40;
-const SHARED_FF: usize = 24;
-const CTX: usize = 64;
-/// Layer kinds: S dense, I + Engram (Q6_K down), S (Q4_K down), I (Q6_K down).
-const KINDS: [(Attn, usize); 4] = [
-    (Attn::Sliding, 4),
-    (Attn::Indexed, 2),
-    (Attn::Sliding, 4),
-    (Attn::Indexed, 2),
-];
-const CLASSES: [Option<ExpertClass>; 4] = [
-    None,
-    Some(ExpertClass::Q6kDown),
-    Some(ExpertClass::Q4kDown),
-    Some(ExpertClass::Q6kDown),
-];
-
-/// Deterministic values in [-1, 1).
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn step(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn next(&mut self) -> f32 {
-        ((self.step() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-
-    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n).map(|_| self.next() * scale).collect()
-    }
-
-    fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| (self.step() >> 24) as u8).collect()
-    }
-
-    fn ids(&mut self, n: usize) -> Vec<u32> {
-        (0..n).map(|_| (self.step() % V as u64) as u32).collect()
-    }
+enum BankKind {
+    Streamed { cache: [usize; 2], staging: usize },
+    Direct,
+    Mmap,
 }
 
-fn arr(v: &[f32], shape: &[usize]) -> MxArray {
-    let s: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-    MxArray::from_float32(v, &s).unwrap()
+/// Shared synthetic K-quant shard file spawning streamed, direct, or mmap `ModelRig`s.
+struct ShardRig {
+    _dir: Temp,
+    path: PathBuf,
+    len: u64,
+    cfg: HyV4FlashConfig,
+    experts: Vec<Option<ExpertLayer>>,
 }
 
-fn mat(r: &mut Rng, rows: usize, cols: usize) -> Dense {
-    Dense::Array(arr(
-        &r.vec(rows * cols, 1.5 / (cols as f32).sqrt()),
-        &[rows, cols],
-    ))
-}
-
-fn norm(r: &mut Rng, n: usize) -> MxArray {
-    let v: Vec<f32> = r.vec(n, 0.5).into_iter().map(|x| 1.0 + x).collect();
-    arr(&v, &[n])
-}
-
-fn small(r: &mut Rng, shape: &[usize], scale: f32) -> MxArray {
-    arr(&r.vec(shape.iter().product(), scale), shape)
-}
-
-fn read(x: &MxArray) -> Vec<f32> {
-    x.astype(DType::Float32)
-        .unwrap()
-        .to_float32()
-        .unwrap()
-        .to_vec()
-}
-
-fn engram_cfg() -> EngramConfig {
-    let token_map: Vec<u32> = (0..V as u32).map(|i| (i * 7) % 61).collect();
-    EngramConfig {
-        layers: vec![1],
-        max_ngram: 3,
-        n_heads: 2,
-        head_dim: 8,
-        multipliers: vec![
-            0x9E37_79B9_7F4A_7C15 | 1,
-            0xBF58_476D_1CE4_E5B9 | 1,
-            0x94D0_49BB_1331_11EB | 1,
-        ],
-        head_offsets: vec![0, 11, 24, 31],
-        head_vocab_sizes: vec![11, 13, 7, 5],
-        pad_token_id: V - 1,
-        compressed_vocab_size: token_map.iter().max().map_or(0, |&x| x as usize + 1),
-        token_map,
-        vocab_size: None,
-    }
-}
-
-pub(super) fn tiny_cfg() -> HyV4FlashConfig {
-    let layers = KINDS
-        .iter()
-        .enumerate()
-        .map(|(il, &(attn, n_heads))| LayerConfig {
-            attn,
-            n_heads,
-            rope_theta: match attn {
-                Attn::Sliding => 1e4,
-                Attn::Indexed => 1e7,
-            },
-            swiglu_limit: 0.5,
-            dense_ffn: il == 0,
-            engram: (il == 1).then_some(0),
-            mtp: false,
-        })
-        .collect();
-    HyV4FlashConfig {
-        n_layers: KINDS.len(),
-        layers,
-        vocab_size: V,
-        context_length: CTX,
-        dim: D,
-        dense_ff: DENSE_FF,
-        n_dense_lead: 1,
-        norm_eps: 1e-5,
-        window: 8,
-        rope_theta: 1e7,
-        rope_theta_swa: 1e4,
-        mla: MlaConfig {
-            q_lora_rank: Q_LORA,
-            kv_lora_rank: KV_LORA,
-            qk_nope_dim: NOPE,
-            rope_dim: ROPE,
-            head_dim_qk: NOPE + ROPE,
-            head_dim_v: HEAD_V,
-            scale: ((NOPE + ROPE) as f32).sqrt().recip(),
-        },
-        moe: MoeConfig {
-            n_experts: 8,
-            n_used: 2,
-            n_shared: 1,
-            ff: 512,
-            latent: 256,
-            route_scale: 2.0,
-            norm_topk: true,
-        },
-        hc: HcConfig {
-            count: HC,
-            eps: 1e-6,
-            magnitude: 2.0,
-        },
-        indexer: IndexerConfig {
-            n_heads: IDX_HEADS,
-            head_dim: IDX_DIM,
-            top_k: 16,
-            kpool: 4,
-            select_tail: true,
-        },
-        engram: engram_cfg(),
-    }
-}
-
-struct Tiny {
-    token_embd: Dense,
-    output: Dense,
-    output_norm: MxArray,
-    output_hc: HcWeights,
-    layers: Vec<LayerWeights>,
-}
-
-impl TrunkWeights for Tiny {
-    fn token_embd(&self) -> &Dense {
-        &self.token_embd
-    }
-    fn output(&self) -> &Dense {
-        &self.output
-    }
-    fn output_norm(&self) -> &MxArray {
-        &self.output_norm
-    }
-    fn output_hc(&self) -> &HcWeights {
-        &self.output_hc
-    }
-    fn layers(&self) -> &[LayerWeights] {
-        &self.layers
-    }
-}
-
-fn hc_weights(r: &mut Rng, rows: usize, scales: usize) -> HcWeights {
-    HcWeights {
-        weight: small(r, &[rows, HC * D], 0.5 / ((HC * D) as f32).sqrt()),
-        base: small(r, &[rows], 0.5),
-        scale: small(r, &[scales], 1.0),
-    }
-}
-
-fn attn_weights(r: &mut Rng, h: usize) -> AttnWeights {
-    AttnWeights {
-        norm: norm(r, D),
-        sinks: small(r, &[h], 1.0),
-        q_a: mat(r, Q_LORA, D),
-        q_a_norm: norm(r, Q_LORA),
-        q_b: mat(r, h * (NOPE + ROPE), Q_LORA),
-        kv_a: mat(r, KV_LORA + ROPE, D),
-        kv_a_norm: norm(r, KV_LORA),
-        k_b: mat(r, h * KV_LORA, NOPE),
-        v_b: mat(r, h * HEAD_V, KV_LORA),
-        output: mat(r, D, h * HEAD_V),
-        gate: mat(r, h * HEAD_V, D),
-        post_norm: norm(r, D),
-        q_kv: None,
-        q_kv_gate: None,
-    }
-}
-
-fn indexer_weights(r: &mut Rng, kpool: usize) -> IndexerWeights {
-    IndexerWeights {
-        attn_k: mat(r, IDX_DIM, D),
-        k_norm: norm(r, IDX_DIM),
-        q_b: mat(r, IDX_HEADS * IDX_DIM, Q_LORA),
-        proj: mat(r, IDX_HEADS, D),
-        compressor_value: small(r, &[IDX_DIM, IDX_DIM], 0.25),
-        compressor_gate: small(r, &[IDX_DIM, IDX_DIM], 0.25),
-        compressor_ape: small(r, &[kpool, IDX_DIM], 0.5),
-        compressor_norm: norm(r, IDX_DIM),
-    }
-}
-
-fn engram_weights(r: &mut Rng, e: &EngramConfig) -> EngramWeights {
-    let cols = e.n_cols();
-    EngramWeights {
-        kv: mat(r, (HC + 1) * D, cols * e.head_dim),
-        kv_b: small(r, &[HC + 1, D], 0.2),
-        gate: small(r, &[HC, D], 1.0),
-        lookup_norm: small(r, &[cols, e.head_dim], 1.0),
-        pre_gamma: norm(r, D),
-        hc_scale: small(r, &[HC, D], 0.5),
-    }
-}
-
-fn tiny_weights(cfg: &HyV4FlashConfig, seed: u64) -> Tiny {
-    let mut r = Rng::new(seed);
-    let m = &cfg.moe;
-    let layers = cfg
-        .layers
-        .iter()
-        .map(|l| {
-            let ffn = if l.dense_ffn {
-                Ffn::Mlp {
-                    gate: mat(&mut r, DENSE_FF, D),
-                    up: mat(&mut r, DENSE_FF, D),
-                    down: mat(&mut r, D, DENSE_FF),
-                    gate_up: None,
-                }
-            } else {
-                Ffn::Moe(MoeWeights {
-                    router: mat(&mut r, m.n_experts, D),
-                    router_bias: Some(small(&mut r, &[m.n_experts], 0.1)),
-                    routed_down: mat(&mut r, m.latent, D),
-                    routed_up: mat(&mut r, D, m.latent),
-                    shared_gate: mat(&mut r, SHARED_FF, D),
-                    shared_up: mat(&mut r, SHARED_FF, D),
-                    shared_down: mat(&mut r, D, SHARED_FF),
-                    down_shared_gu: None,
-                })
-            };
-            LayerWeights {
-                attn: attn_weights(&mut r, l.n_heads),
-                indexer: (l.attn == Attn::Indexed)
-                    .then(|| indexer_weights(&mut r, cfg.indexer.kpool)),
-                engram: l.engram.map(|_| engram_weights(&mut r, &cfg.engram)),
-                residual: Residual::Hc {
-                    attn: hc_weights(&mut r, 2 * HC, 2),
-                    ffn: hc_weights(&mut r, 2 * HC, 2),
-                },
-                ffn_norm: norm(&mut r, D),
-                post_ffw_norm: norm(&mut r, D),
-                ffn,
-            }
-        })
-        .collect();
-    let output = arr(&r.vec(V * D, 1.5 / (D as f32).sqrt()), &[V, D])
-        .astype(DType::BFloat16)
-        .unwrap();
-    Tiny {
-        token_embd: mat(&mut r, V, D),
-        output: Dense::Array(output),
-        output_norm: norm(&mut r, D),
-        output_hc: hc_weights(&mut r, HC, 1),
-        layers,
-    }
-}
-
-/// F8_E4M3 codes with no NaN code (0x7F / 0xFF).
-fn engram_table(cfg: &EngramConfig, seed: u64) -> ResidentF8Table {
-    let mut r = Rng::new(seed);
-    let rows: u64 = cfg.head_vocab_sizes.iter().sum();
-    let codes = r
-        .bytes(rows as usize * cfg.head_dim)
-        .into_iter()
-        .map(|b| if b & 0x7F == 0x7F { b ^ 0x01 } else { b })
-        .collect();
-    ResidentF8Table::new(codes, cfg).unwrap()
-}
-
-fn located(name: &str, dims: [usize; 3], ty: GgufTensorType, at: u64) -> Located {
-    Located {
-        shard: 0,
-        data_offset: at,
-        info: GgufTensorInfo {
-            name: name.to_string(),
-            n_dims: 3,
-            dims: dims.iter().map(|&d| d as u64).collect(),
-            tensor_type: ty,
-            offset: 0,
-        },
-    }
-}
-
-/// K-quant blocks whose values stay within about ±0.5.
-fn kquant_bytes(r: &mut Rng, format: KQuantFormat, n_blocks: usize) -> Vec<u8> {
-    let bb = format.block_bytes();
-    let mut out = Vec::with_capacity(n_blocks * bb);
-    for _ in 0..n_blocks {
-        let mut b = r.bytes(bb);
-        match format {
-            KQuantFormat::Q4K => {
-                let d = half::f16::from_f32(0.5 / (63.0 * 15.0))
-                    .to_bits()
-                    .to_le_bytes();
-                let dmin = half::f16::from_f32(0.25 / 63.0).to_bits().to_le_bytes();
-                b[0..2].copy_from_slice(&d);
-                b[2..4].copy_from_slice(&dmin);
-            }
-            KQuantFormat::Q6K => {
-                let d = half::f16::from_f32(0.5 / (128.0 * 32.0))
-                    .to_bits()
-                    .to_le_bytes();
-                b[bb - 2..].copy_from_slice(&d);
-            }
-            f => panic!("no test blocks for {f:?}"),
+impl ShardRig {
+    fn new(cfg: HyV4FlashConfig, align: usize, seed: u64) -> Self {
+        let mut r = Rng::new(seed);
+        let mut file = r.bytes(if align > 1 { 1024 } else { 1000 });
+        let experts = TINY_CLASSES
+            .iter()
+            .enumerate()
+            .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, align, &mut file)))
+            .collect();
+        let dir = Temp::new("model");
+        let len = file.len() as u64;
+        let path = dir.write("experts.bin", &file);
+        Self {
+            _dir: dir,
+            path,
+            len,
+            cfg,
+            experts,
         }
-        out.extend(b);
     }
-    out
-}
 
-/// Expert tensors of layer `il` (loader dims: gate/up `{latent, ff, E}`,
-/// down `{ff, latent, E}`), appended to `file`.
-fn kquant_layer(
-    r: &mut Rng,
-    m: &MoeConfig,
-    il: usize,
-    class: ExpertClass,
-    file: &mut Vec<u8>,
-) -> ExpertLayer {
-    let types = class_types(class).unwrap();
-    let geo = geometry(m, class).unwrap();
-    let dims = [
-        [m.latent, m.ff, m.n_experts],
-        [m.latent, m.ff, m.n_experts],
-        [m.ff, m.latent, m.n_experts],
-    ];
-    let mut locs = Vec::new();
-    for (p, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-        .iter()
-        .enumerate()
-    {
-        file.extend(r.bytes(3));
-        let at = file.len() as u64;
-        locs.push(located(
-            &format!("blk.{il}.{name}.weight"),
-            dims[p],
-            types[p],
-            at,
-        ));
-        let g = geo[p];
-        let blocks = m.n_experts * g.rows * g.k / g.format.block_size();
-        file.extend(kquant_bytes(r, g.format, blocks));
+    fn model(
+        &self,
+        kind: BankKind,
+        opts: TinyWeightsOpts,
+        engram: Box<dyn EngramRows>,
+    ) -> ModelRig {
+        let shards = Arc::new(ShardSet::open(&[self.path.as_path()]).unwrap());
+        let pool = IoPool::new(shards, 4).unwrap();
+        let bank = Arc::new(match kind {
+            BankKind::Streamed { cache, staging } => {
+                KqBank::new(pool, &self.cfg.moe, &self.experts, cache, staging).unwrap()
+            }
+            BankKind::Direct => KqBank::new_direct(pool, &self.cfg.moe, &self.experts).unwrap(),
+            BankKind::Mmap => {
+                let ps = std::slice::from_ref(&self.path);
+                KqBank::new_mmap(pool, &self.cfg.moe, &self.experts, ps, self.len, false).unwrap()
+            }
+        });
+        let b = Arc::clone(&bank);
+        let w = Box::new(tiny_weights_opts(&self.cfg, opts));
+        let model = Model::new(
+            self.cfg.clone(),
+            w,
+            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+            engram,
+        )
+        .unwrap();
+        ModelRig {
+            model,
+            bank,
+            _dir: None,
+        }
     }
-    let [gate, up, down]: [Located; 3] = locs.try_into().ok().unwrap();
-    ExpertLayer {
-        class,
-        gate,
-        up,
-        down,
+
+    fn with_table(&self, kind: BankKind, opts: TinyWeightsOpts, table_seed: u64) -> ModelRig {
+        self.model(
+            kind,
+            opts,
+            Box::new(tiny_engram_table(&self.cfg.engram, table_seed)),
+        )
     }
 }
 
-struct Temp(PathBuf);
-
-impl Temp {
-    fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("hy4-model-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Fixture {
+struct ModelRig {
     model: Model,
     bank: Arc<KqBank>,
-    _dir: Temp,
+    _dir: Option<Temp>,
 }
 
-impl Drop for Fixture {
+impl ModelRig {
+    fn q8_bf16() -> Self {
+        let cfg = tiny_q8_cfg();
+        let (bank, _, dir, _) = bank_fixture(&cfg.moe, &TINY_CLASSES, [4, 4], 0, 29);
+        let opts = TinyWeightsOpts {
+            seed: 31,
+            dense: DenseKind::SymQ8,
+            shared_ff: 32,
+            router_bias: true,
+        };
+        let table = tiny_engram_table(&cfg.engram, 37);
+        let b = Arc::clone(&bank);
+        let model = Model::new(
+            cfg.clone(),
+            Box::new(tiny_weights_opts(&cfg, opts)),
+            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+            Box::new(table),
+        )
+        .unwrap();
+        Self {
+            model,
+            bank,
+            _dir: Some(dir),
+        }
+    }
+
+    fn pf_delta(&self, before: &[KqStats; 2]) -> [usize; 2] {
+        let a = self.bank.stats();
+        [
+            a[0].prefetch_slots - before[0].prefetch_slots,
+            a[1].prefetch_slots - before[1].prefetch_slots,
+        ]
+    }
+}
+
+impl Drop for ModelRig {
     fn drop(&mut self) {
         let _ = self.bank.end_turn();
     }
 }
 
-fn tiny_bank(cfg: &HyV4FlashConfig, seed: u64) -> (Arc<KqBank>, Temp) {
-    let mut r = Rng::new(seed);
-    let mut file = r.bytes(1000);
-    let experts: Vec<Option<ExpertLayer>> = CLASSES
-        .iter()
-        .enumerate()
-        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
-        .collect();
-    let dir = Temp::new();
-    let path = dir.0.join("experts.bin");
-    std::fs::write(&path, &file).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
-    let bank = Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 1).unwrap());
-    (bank, dir)
+fn model_fixture() -> TinyModelFixture {
+    tiny_model_fixture(13)
 }
-
-fn fixture() -> Fixture {
-    fixture_with_table(13)
-}
-
-fn fixture_with_table(table_seed: u64) -> Fixture {
-    let cfg = tiny_cfg();
-    let (bank, dir) = tiny_bank(&cfg, 7);
-    let weights = tiny_weights(&cfg, 11);
-    let table = engram_table(&cfg.engram, table_seed);
-    let b = Arc::clone(&bank);
-    let model = Model::new(
-        cfg,
-        Box::new(weights),
-        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-        Box::new(table),
-    )
-    .unwrap();
-    Fixture {
-        model,
-        bank,
-        _dir: dir,
-    }
-}
-
 fn prompt() -> Vec<u32> {
-    Rng::new(5).ids(24)
+    Rng::new(5).ids(24, TINY_V)
+}
+fn make_prompts(specs: &[(u64, usize)]) -> Vec<Vec<u32>> {
+    specs
+        .iter()
+        .map(|&(s, n)| Rng::new(s).ids(n, TINY_V))
+        .collect()
 }
 
-/// Logits rows and per-layer route ids of `ids` run as calls of `cuts`.
+fn fwd(m: &Model, s: &mut Session, ids: &[u32], kind: RowKind, want: Want) -> Output {
+    m.forward(s, ids, kind, want, None, None).unwrap()
+}
+
+fn fwd_traced(
+    m: &Model,
+    s: &mut Session,
+    ids: &[u32],
+    kind: RowKind,
+    want: Want,
+) -> (Output, Trace) {
+    let mut t = Trace::default();
+    let out = m.forward(s, ids, kind, want, None, Some(&mut t)).unwrap();
+    (out, t)
+}
+
+fn fwd_last(m: &Model, s: &mut Session, ids: &[u32], kind: RowKind) -> Vec<f32> {
+    read_f32(&m.forward_last(s, ids, kind, None).unwrap())
+}
+
+fn step_wave(
+    model: &Model,
+    sessions: &mut [Session],
+    ids: &[&[u32]],
+    wants: &[Want],
+    trace: Option<&mut Trace>,
+) -> (Vec<Output>, u64) {
+    let before = stats::thread_evals();
+    let mut owners: Vec<OwnerRows<'_>> = sessions
+        .iter_mut()
+        .zip(ids)
+        .zip(wants)
+        .map(|((sess, &ids), &want)| OwnerRows { sess, ids, want })
+        .collect();
+    let outs = model
+        .step(&mut owners, RowKind::Decode, None, trace)
+        .unwrap();
+    (outs, stats::thread_evals() - before)
+}
+
 fn run_split(model: &Model, ids: &[u32], cuts: &[usize]) -> (Vec<Vec<f32>>, Vec<Vec<u32>>) {
     assert_eq!(cuts.iter().sum::<usize>(), ids.len());
-    let mut sess = model.new_session(CTX).unwrap();
-    let mut rows = Vec::new();
-    let mut routes = vec![Vec::new(); model.cfg().n_layers];
-    let mut at = 0;
+    let mut sess = model.new_session(TINY_CTX).unwrap();
+    let (mut rows, mut routes, mut at) = (Vec::new(), vec![Vec::new(); model.cfg().n_layers], 0);
     for &n in cuts {
-        let mut t = Trace::default();
         let kind = if n == 1 && at > 0 {
             RowKind::Decode
         } else {
             RowKind::Prefill
         };
-        let out = model
-            .forward(
-                &mut sess,
-                &ids[at..at + n],
-                kind,
-                Want::ALL,
-                None,
-                Some(&mut t),
-            )
-            .unwrap();
-        let v = read(out.logits.as_ref().unwrap());
-        rows.extend(v.chunks(V).map(<[f32]>::to_vec));
+        let (out, t) = fwd_traced(model, &mut sess, &ids[at..at + n], kind, Want::ALL);
+        rows.extend(logit_rows(out.logits.as_ref().unwrap()));
         for (l, r) in t.routes.into_iter().enumerate() {
             if let Some(r) = r {
                 routes[l].extend(r.ids);
@@ -545,39 +238,36 @@ fn assert_close(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
     assert_within(got, want, what, 1e-4, 1e-4);
 }
 
-/// `|a - b| <= abs + rel · |b|` for every logit.
 fn assert_within(got: &[Vec<f32>], want: &[Vec<f32>], what: &str, abs: f32, rel: f32) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
     for (t, (g, w)) in got.iter().zip(want).enumerate() {
         for (j, (&a, &b)) in g.iter().zip(w).enumerate() {
             assert!(a.is_finite(), "{what}: row {t} col {j} not finite");
-            let tol = abs + rel * b.abs();
-            assert!((a - b).abs() <= tol, "{what}: row {t} col {j}: {a} vs {b}");
+            assert!(
+                (a - b).abs() <= abs + rel * b.abs(),
+                "{what}: row {t} col {j}: {a} vs {b}"
+            );
         }
     }
 }
 
+fn assert_near_arr(a: &MxArray, b: &MxArray, label: &str) {
+    let diff = max_abs_err(&read_f32(a), &read_f32(b));
+    assert!(diff <= 1e-2, "{label}: max_diff={diff}");
+}
+
 fn decode(model: &Model, sess: &mut Session, ids: &[u32]) -> Vec<Vec<f32>> {
     ids.iter()
-        .map(|&id| {
-            read(
-                &model
-                    .forward_last(sess, &[id], RowKind::Decode, None)
-                    .unwrap(),
-            )
-        })
+        .map(|&id| fwd_last(model, sess, &[id], RowKind::Decode))
         .collect()
 }
 
 fn prefilled(model: &Model, ids: &[u32]) -> Session {
-    let mut s = model.new_session(CTX).unwrap();
-    model
-        .forward(&mut s, ids, RowKind::Prefill, Want::STATE, None, None)
-        .unwrap();
+    let mut s = model.new_session(TINY_CTX).unwrap();
+    fwd(model, &mut s, ids, RowKind::Prefill, Want::STATE);
     s
 }
 
-/// Route ids per layer (empty on the dense one) of a traced step.
 fn routes_of(t: &Trace) -> Vec<Vec<u32>> {
     t.routes
         .iter()
@@ -586,53 +276,40 @@ fn routes_of(t: &Trace) -> Vec<Vec<u32>> {
 }
 
 fn logit_rows(x: &MxArray) -> Vec<Vec<f32>> {
-    read(x).chunks(V).map(<[f32]>::to_vec).collect()
+    read_f32(x).chunks(TINY_V).map(<[f32]>::to_vec).collect()
 }
 
-/// A decode wave of three owners (one with two verify rows) gives each
-/// owner the logits and routes of its rows run alone, and advances every
-/// session by its own rows.
+fn prefill_mma_tol() -> f32 {
+    let on = unsafe { mlx_sys::mlx_metal_is_available() }
+        && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+    if on { 5e-3 } else { 1e-4 }
+}
+
 #[test]
 fn decode_wave_matches_each_owner_alone() {
-    let f = fixture();
-    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 20)]
-        .iter()
-        .map(|&(seed, n)| Rng::new(seed).ids(n))
-        .collect();
+    let f = model_fixture();
+    let prompts = make_prompts(&[(5, 9), (6, 14), (8, 20)]);
     let next: [&[u32]; 3] = [&[7], &[3, 41], &[60]];
-    let alone: Vec<(Vec<Vec<f32>>, Vec<Vec<u32>>)> = prompts
+    let alone: Vec<_> = prompts
         .iter()
         .zip(next)
         .map(|(p, ids)| {
             let mut s = prefilled(&f.model, p);
-            let mut t = Trace::default();
-            let out = f
-                .model
-                .forward(&mut s, ids, RowKind::Decode, Want::ALL, None, Some(&mut t))
-                .unwrap();
+            let (out, t) = fwd_traced(&f.model, &mut s, ids, RowKind::Decode, Want::ALL);
             (logit_rows(out.logits.as_ref().unwrap()), routes_of(&t))
         })
         .collect();
     let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
     let mut t = Trace::default();
-    let outs = {
-        let mut owners: Vec<OwnerRows<'_>> = sessions
-            .iter_mut()
-            .zip(next)
-            .map(|(sess, ids)| OwnerRows {
-                sess,
-                ids,
-                want: Want::ALL,
-            })
-            .collect();
-        f.model
-            .step(&mut owners, RowKind::Decode, None, Some(&mut t))
-            .unwrap()
-    };
+    let (outs, _) = step_wave(
+        &f.model,
+        &mut sessions,
+        &next,
+        &[Want::ALL; 3],
+        Some(&mut t),
+    );
     assert_eq!(outs.len(), 3);
-    let wave = routes_of(&t);
-    let k = f.model.cfg().moe.n_used;
-    let mut row = 0;
+    let (wave, k, mut row) = (routes_of(&t), f.model.cfg().moe.n_used, 0);
     for (i, ((want, want_routes), out)) in alone.iter().zip(&outs).enumerate() {
         let n = next[i].len();
         assert_close(
@@ -655,19 +332,15 @@ fn decode_wave_matches_each_owner_alone() {
     }
 }
 
-/// A prefill with two owners, a bad id in one owner and a cancel mid-wave
-/// are refused and leave both sessions; the wave then runs as if they never
-/// happened.
 #[test]
 fn refused_waves_leave_every_session() {
-    let f = fixture();
-    let (pa, pb) = (Rng::new(5).ids(12), Rng::new(6).ids(10));
-    let mut a = prefilled(&f.model, &pa);
-    let mut b = prefilled(&f.model, &pb);
+    let f = model_fixture();
+    let (pa, pb) = (Rng::new(5).ids(12, TINY_V), Rng::new(6).ids(10, TINY_V));
+    let (mut a, mut b) = (prefilled(&f.model, &pa), prefilled(&f.model, &pb));
     let step = |a: &mut Session,
                 b: &mut Session,
                 ids: [&[u32]; 2],
-                kind: RowKind,
+                kind,
                 cancel: Option<&dyn Fn(usize) -> bool>| {
         let mut owners = [
             OwnerRows {
@@ -683,7 +356,7 @@ fn refused_waves_leave_every_session() {
         ];
         f.model.step(&mut owners, kind, cancel, None).map(|outs| {
             outs.iter()
-                .map(|o| read(o.logits.as_ref().unwrap()))
+                .map(|o| read_f32(o.logits.as_ref().unwrap()))
                 .collect::<Vec<_>>()
         })
     };
@@ -708,7 +381,7 @@ fn refused_waves_leave_every_session() {
         step(
             &mut a,
             &mut b,
-            [&[1][..], &[V as u32][..]],
+            [&[1][..], &[TINY_V as u32][..]],
             RowKind::Decode,
             None
         )
@@ -729,61 +402,51 @@ fn refused_waves_leave_every_session() {
     let got = step(&mut a, &mut b, [&[1][..], &[3][..]], RowKind::Decode, None).unwrap();
     for (i, (p, id)) in [(&pa, 1u32), (&pb, 3)].into_iter().enumerate() {
         let mut s = prefilled(&f.model, p);
-        let want = read(
-            &f.model
-                .forward_last(&mut s, &[id], RowKind::Decode, None)
-                .unwrap(),
+        assert_close(
+            &[got[i].clone()],
+            &[fwd_last(&f.model, &mut s, &[id], RowKind::Decode)],
+            &format!("owner {i}"),
         );
-        assert_close(&[got[i].clone()], &[want], &format!("owner {i}"));
     }
 }
 
-/// Pad positions get no Engram delta: a pad-only prompt's logits do not
-/// depend on the Engram table, a text prompt's do.
 #[test]
 fn pad_positions_ignore_the_engram_table() {
-    let (f13, f17) = (fixture_with_table(13), fixture_with_table(17));
-    let run = |f: &Fixture, ids: &[u32]| {
-        let mut s = f.model.new_session(CTX).unwrap();
-        read(
-            &f.model
-                .forward_last(&mut s, ids, RowKind::Prefill, None)
-                .unwrap(),
-        )
+    let (f13, f17) = (tiny_model_fixture(13), tiny_model_fixture(17));
+    let run = |f: &TinyModelFixture, ids: &[u32]| {
+        let mut s = f.model.new_session(TINY_CTX).unwrap();
+        fwd_last(&f.model, &mut s, ids, RowKind::Prefill)
     };
-    let pads = [(V - 1) as u32; 5];
+    let pads = [(TINY_V - 1) as u32; 5];
     assert_eq!(run(&f13, &pads), run(&f17, &pads));
-    let text = [3u32, 17, 40, 2, 61];
-    assert_ne!(run(&f13, &text), run(&f17, &text));
+    assert_ne!(
+        run(&f13, &[3, 17, 40, 2, 61]),
+        run(&f17, &[3, 17, 40, 2, 61])
+    );
 }
 
 #[test]
 fn engram_rows_hash_only_the_reach() {
-    let cfg = engram_cfg();
+    let cfg = tiny_engram_cfg(TINY_V);
     let hasher = Hasher::new(&cfg).unwrap();
-    let all = Rng::new(3).ids(30);
+    let all = Rng::new(3).ids(30, TINY_V);
     for s in [0usize, 1, 2, 3, 7, 29] {
         let got = call_engram_rows(&hasher, cfg.max_ngram - 1, &all[..s], &all[s..]).unwrap();
         assert_eq!(got, hasher.call_rows(&all, s).unwrap(), "split at {s}");
     }
 }
 
-/// The f32 matmuls of a call round by its row count. With f32 cache rows
-/// the splits stay within the f32 bound; with the f16 rows a latent value
-/// near an f16 midpoint rounds one f16 step the other way, so the bound is
-/// two f16 steps at |x| < 2.
 #[test]
 fn split_calls_match_one_call() {
-    let f = fixture();
-    let ids = prompt();
-    let decode_after = |k: usize| -> Vec<usize> {
+    let (f, ids) = (model_fixture(), prompt());
+    let dec = |k: usize| {
         std::iter::once(k)
             .chain(std::iter::repeat_n(1, 24 - k))
-            .collect()
+            .collect::<Vec<_>>()
     };
     let patterns = [
-        decode_after(12),
-        decode_after(1),
+        dec(12),
+        dec(1),
         vec![7, 9, 8],
         vec![16, 8],
         vec![8, 1, 15],
@@ -798,118 +461,65 @@ fn split_calls_match_one_call() {
             assert_eq!(routes, want_routes, "{what}: routes");
         }
     };
-    let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
-        && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-    let f32_tol = if prefill_mma { 5e-3 } else { 1e-4 };
+    let f32_tol = prefill_mma_tol();
     with_row_dtype(DType::Float32, || check("f32", f32_tol, f32_tol));
     let f16_step = 2f32.powi(-10);
-    let f16_abs = (2.0 * f16_step).max(f32_tol);
-    let f16_rel = f16_step.max(f32_tol);
-    check("f16", f16_abs, f16_rel);
+    check("f16", (2.0 * f16_step).max(f32_tol), f16_step.max(f32_tol));
 }
 
 #[test]
 fn last_row_and_hidden_rows() {
-    let f = fixture();
-    let ids = prompt();
+    let (f, ids) = (model_fixture(), prompt());
     let (all, _) = run_split(&f.model, &ids, &[24]);
 
-    let mut a = f.model.new_session(CTX).unwrap();
-    let last = read(
-        &f.model
-            .forward_last(&mut a, &ids, RowKind::Prefill, None)
-            .unwrap(),
-    );
+    let mut a = f.model.new_session(TINY_CTX).unwrap();
+    let last = fwd_last(&f.model, &mut a, &ids, RowKind::Prefill);
     assert_close(std::slice::from_ref(&last), &all[23..], "last row");
 
-    let mut b = f.model.new_session(CTX).unwrap();
-    let out = f
-        .model
-        .forward(
-            &mut b,
-            &ids,
-            RowKind::Prefill,
-            Want {
-                logits: Logits::Last,
-                hidden: true,
-            },
-            None,
-            None,
-        )
-        .unwrap();
+    let mut b = f.model.new_session(TINY_CTX).unwrap();
+    let want_lh = Want {
+        logits: Logits::Last,
+        hidden: true,
+    };
+    let out = fwd(&f.model, &mut b, &ids, RowKind::Prefill, want_lh);
     assert_eq!(
-        read(out.logits.as_ref().unwrap()),
+        read_f32(out.logits.as_ref().unwrap()),
         last,
-        "hidden changed the logits"
+        "hidden changed logits"
     );
     let hidden = out.hidden.unwrap();
-    assert_eq!(hidden.shape().unwrap().as_ref(), &[24, D as i64]);
-    let from_hidden = read(&head_logits(&hidden, f.model.weights().output()).unwrap());
-    let rows: Vec<Vec<f32>> = from_hidden.chunks(V).map(<[f32]>::to_vec).collect();
+    assert_eq!(hidden.shape().unwrap().as_ref(), &[24, TINY_D as i64]);
+    let rows = logit_rows(&head_logits(&hidden, f.model.weights().output()).unwrap());
     assert_close(&rows, &all, "head of the hidden rows");
 
-    let mut c = f.model.new_session(CTX).unwrap();
-    let Output { logits, hidden } = f
-        .model
-        .forward(
-            &mut c,
-            &ids[..20],
-            RowKind::Prefill,
-            Want::STATE,
-            None,
-            None,
-        )
-        .unwrap();
-    assert!(logits.is_none() && hidden.is_none());
-    assert_eq!(c.len(), 20);
+    let mut c = f.model.new_session(TINY_CTX).unwrap();
+    let Output { logits, hidden } =
+        fwd(&f.model, &mut c, &ids[..20], RowKind::Prefill, Want::STATE);
+    assert!(logits.is_none() && hidden.is_none() && c.len() == 20);
     let tail = decode(&f.model, &mut c, &ids[20..]);
-    let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
-        && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-    let tol = if prefill_mma { 5e-3 } else { 1e-4 };
-    assert_within(
-        &tail,
-        &all[20..],
-        "decode after a state-only call",
-        tol,
-        tol,
-    );
+    let tol = prefill_mma_tol();
+    assert_within(&tail, &all[20..], "decode after state-only", tol, tol);
 }
 
 #[test]
 fn failed_call_leaves_the_session() {
-    let f = fixture();
-    let ids = prompt();
-    let mut clean = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut clean, &ids[..20], RowKind::Prefill, None)
-        .unwrap();
-    let want = read(
-        &f.model
-            .forward_last(&mut clean, &ids[20..], RowKind::Prefill, None)
-            .unwrap(),
-    );
+    let (f, ids) = (model_fixture(), prompt());
+    let mut clean = prefilled(&f.model, &ids[..20]);
+    let want = fwd_last(&f.model, &mut clean, &ids[20..], RowKind::Prefill);
 
-    let mut sess = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut sess, &ids[..20], RowKind::Prefill, None)
-        .unwrap();
-    for stop in [0usize, 1, 2, 3] {
+    let mut sess = prefilled(&f.model, &ids[..20]);
+    for stop in 0..4usize {
         let cancel = move |l: usize| l == stop;
         assert!(
             f.model
                 .forward_last(&mut sess, &ids[20..], RowKind::Prefill, Some(&cancel))
-                .is_err(),
-            "cancel at layer {stop}"
+                .is_err()
         );
-        assert_eq!(sess.len(), 20);
-        assert!(
-            sess.layers().iter().all(|st| st.len() == 20),
-            "layer lens after cancel at {stop}"
-        );
+        assert!(sess.len() == 20 && sess.layers().iter().all(|st| st.len() == 20));
     }
     assert!(
         f.model
-            .forward_last(&mut sess, &[V as u32], RowKind::Decode, None)
+            .forward_last(&mut sess, &[TINY_V as u32], RowKind::Decode, None)
             .is_err()
     );
     assert!(
@@ -917,52 +527,38 @@ fn failed_call_leaves_the_session() {
             .forward_last(&mut sess, &[], RowKind::Prefill, None)
             .is_err()
     );
-    let past = vec![1u32; CTX - 19];
+    let past = vec![1u32; TINY_CTX - 19];
     assert!(
         f.model
             .forward_last(&mut sess, &past, RowKind::Prefill, None)
             .is_err()
     );
     assert_eq!(sess.len(), 20);
-    let got = read(
-        &f.model
-            .forward_last(&mut sess, &ids[20..], RowKind::Prefill, None)
-            .unwrap(),
+    assert_eq!(
+        fwd_last(&f.model, &mut sess, &ids[20..], RowKind::Prefill),
+        want
     );
-    assert_eq!(got, want, "a failed call changed the next call");
 }
 
 #[test]
 fn mark_restore_replays_exactly() {
-    let f = fixture();
-    let ids = prompt();
-    let mut sess = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut sess, &ids[..14], RowKind::Prefill, None)
-        .unwrap();
+    let (f, ids) = (model_fixture(), prompt());
+    let mut sess = prefilled(&f.model, &ids[..14]);
     let mark = sess.mark();
     assert_eq!(mark.len(), 14);
     let first = decode(&f.model, &mut sess, &ids[14..]);
     sess.restore(&mark).unwrap();
     assert_eq!(sess.len(), 14);
-    let again = decode(&f.model, &mut sess, &ids[14..]);
-    assert_eq!(again, first);
-
+    assert_eq!(decode(&f.model, &mut sess, &ids[14..]), first);
     let later = sess.mark();
     sess.restore(&mark).unwrap();
     assert!(sess.restore(&later).is_err(), "a mark past the session");
 }
 
-/// A mark whose rows were rewritten after a restore to an earlier mark is
-/// refused and leaves the session; the earlier mark still restores.
 #[test]
 fn restore_refuses_a_rewritten_mark() {
-    let f = fixture();
-    let ids = prompt();
-    let mut sess = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut sess, &ids[..14], RowKind::Prefill, None)
-        .unwrap();
+    let (f, ids) = (model_fixture(), prompt());
+    let mut sess = prefilled(&f.model, &ids[..14]);
     let early = sess.mark();
     decode(&f.model, &mut sess, &ids[14..]);
     let late = sess.mark();
@@ -971,36 +567,28 @@ fn restore_refuses_a_rewritten_mark() {
     let want = decode(&f.model, &mut sess, &other);
     assert_eq!(sess.len(), 24);
     assert!(sess.restore(&late).is_err(), "restored over rewritten rows");
-    assert_eq!(sess.len(), 24);
-    assert_eq!(&sess.tokens()[14..], &other[..]);
+    assert_eq!((sess.len(), &sess.tokens()[14..]), (24, other.as_slice()));
     sess.restore(&early).unwrap();
     assert_eq!(sess.len(), 14);
     assert_eq!(decode(&f.model, &mut sess, &other), want);
 }
 
-/// With the phase split on, a trunk call times every phase but the MTP
-/// layer's, and its logits stay those of an unprofiled call.
 #[test]
 fn profiled_call_times_every_trunk_phase() {
-    let f = fixture();
-    let ids = prompt();
-    let mut plain = f.model.new_session(CTX).unwrap();
-    let want = read(
-        &f.model
-            .forward_last(&mut plain, &ids, RowKind::Prefill, None)
-            .unwrap(),
-    );
+    let (f, ids) = (model_fixture(), prompt());
+    let mut plain = f.model.new_session(TINY_CTX).unwrap();
+    let want = fwd_last(&f.model, &mut plain, &ids, RowKind::Prefill);
     let before = phase_seconds();
     set_profiling(true);
-    let mut sess = f.model.new_session(CTX).unwrap();
+    let mut sess = f.model.new_session(TINY_CTX).unwrap();
     let got = f
         .model
         .forward_last(&mut sess, &ids, RowKind::Prefill, None);
     set_profiling(false);
     let after = phase_seconds();
-    assert_close(&[read(&got.unwrap())], &[want], "profiled logits");
-    for (i, p) in PHASES.iter().enumerate() {
-        if *p != Phase::Mtp {
+    assert_close(&[read_f32(&got.unwrap())], &[want], "profiled logits");
+    for (i, &p) in PHASES.iter().enumerate() {
+        if p != Phase::Mtp {
             assert!(after[i] > before[i], "{} not timed", p.name());
         }
     }
@@ -1008,238 +596,74 @@ fn profiled_call_times_every_trunk_phase() {
 
 #[test]
 fn truncate_within_the_slack_replays_exactly() {
-    let f = fixture();
-    let ids = prompt();
-    let mut sess = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut sess, &ids[..20], RowKind::Prefill, None)
-        .unwrap();
+    let (f, ids) = (model_fixture(), prompt());
+    let mut sess = prefilled(&f.model, &ids[..20]);
     let first = decode(&f.model, &mut sess, &ids[20..]);
 
     sess.truncate(21).unwrap();
-    assert_eq!(sess.len(), 21);
-    assert!(sess.layers().iter().all(|st| st.len() == 21));
-    let again = decode(&f.model, &mut sess, &ids[21..]);
-    assert_eq!(again, first[1..].to_vec());
+    assert!(sess.len() == 21 && sess.layers().iter().all(|st| st.len() == 21));
+    assert_eq!(decode(&f.model, &mut sess, &ids[21..]), first[1..].to_vec());
 
-    assert!(sess.truncate(10).is_err(), "past the window slack");
-    assert_eq!(sess.len(), 24);
-    assert!(sess.layers().iter().all(|st| st.len() == 24));
-    let mut clean = f.model.new_session(CTX).unwrap();
-    f.model
-        .forward_last(&mut clean, &ids[..20], RowKind::Prefill, None)
-        .unwrap();
+    assert!(sess.truncate(10).is_err(), "past window slack");
+    assert!(sess.len() == 24 && sess.layers().iter().all(|st| st.len() == 24));
+    let mut clean = prefilled(&f.model, &ids[..20]);
     decode(&f.model, &mut clean, &ids[20..]);
-    let next = [3u32];
     assert_eq!(
-        decode(&f.model, &mut sess, &next),
-        decode(&f.model, &mut clean, &next),
-        "a refused truncate changed the session"
+        decode(&f.model, &mut sess, &[3]),
+        decode(&f.model, &mut clean, &[3])
     );
 
     sess.truncate(0).unwrap();
     assert!(sess.is_empty());
-    let mut fresh = f.model.new_session(CTX).unwrap();
+    let mut fresh = f.model.new_session(TINY_CTX).unwrap();
     assert_eq!(
-        read(
-            &f.model
-                .forward_last(&mut sess, &ids, RowKind::Prefill, None)
-                .unwrap()
-        ),
-        read(
-            &f.model
-                .forward_last(&mut fresh, &ids, RowKind::Prefill, None)
-                .unwrap()
-        ),
-        "reuse of the buffers after truncate(0)"
+        fwd_last(&f.model, &mut sess, &ids, RowKind::Prefill),
+        fwd_last(&f.model, &mut fresh, &ids, RowKind::Prefill),
     );
 }
 
 #[test]
 fn new_refuses_mismatched_weights() {
     let cfg = tiny_cfg();
-    let (bank, _dir) = tiny_bank(&cfg, 7);
-    let build = |w: Tiny| {
+    let (bank, _, _dir, _) = bank_fixture(&cfg.moe, &TINY_CLASSES, [4, 4], 0, 7);
+    let build = |w| {
         let b = Arc::clone(&bank);
+        let tbl = Box::new(tiny_engram_table(&tiny_cfg().engram, 13));
         Model::new(
             tiny_cfg(),
             Box::new(w),
             move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-            Box::new(engram_table(&tiny_cfg().engram, 13)),
+            tbl,
         )
     };
-    let mut w = tiny_weights(&cfg, 11);
+    let fresh = || tiny_weights_opts(&cfg, TinyWeightsOpts::default());
+
+    let mut w = fresh();
     w.layers[1].engram = None;
-    assert!(build(w).is_err(), "Engram layer without its weights");
-
-    let mut w = tiny_weights(&cfg, 11);
-    let mut r = Rng::new(1);
-    w.layers[0].indexer = Some(indexer_weights(&mut r, cfg.indexer.kpool));
-    assert!(build(w).is_err(), "indexer on a sliding layer");
-
-    let mut w = tiny_weights(&cfg, 11);
+    assert!(build(w).is_err(), "Engram layer without weights");
+    let mut w = fresh();
+    w.layers[0].indexer = fresh().layers[1].indexer.take();
+    assert!(build(w).is_err(), "indexer on sliding layer");
+    let mut w = fresh();
     w.layers.pop();
     assert!(build(w).is_err(), "missing layer");
-
-    let mut w = tiny_weights(&cfg, 11);
-    w.output = mat(&mut r, V - 1, D);
+    let mut w = fresh();
+    w.output = Dense::Array(arr(
+        &vec![0.0; (TINY_V - 1) * TINY_D],
+        &[TINY_V - 1, TINY_D],
+    ));
     assert!(build(w).is_err(), "head rows != vocab");
 
-    let ok = build(tiny_weights(&cfg, 11)).unwrap();
-    assert!(ok.new_session(0).is_err());
-    assert!(ok.new_session(CTX + 1).is_err());
+    let ok = build(fresh()).unwrap();
+    assert!(ok.new_session(0).is_err() && ok.new_session(TINY_CTX + 1).is_err());
     bank.end_turn().unwrap();
-}
-
-fn qmm(v: &[f32], rows: usize, cols: usize) -> Dense {
-    let q = super::moe::AffineProj::quantize(&arr(v, &[1, rows, cols]), 32, 8).unwrap();
-    let sq = |a: &MxArray| {
-        a.reshape(&[a.shape_at(1).unwrap(), a.shape_at(2).unwrap()])
-            .unwrap()
-    };
-    Dense::Qmm {
-        w: sq(&q.w),
-        scales: sq(&q.s).astype(DType::Float32).unwrap(),
-        biases: sq(&q.b).astype(DType::Float32).unwrap(),
-    }
-}
-
-fn qmat(r: &mut Rng, rows: usize, cols: usize) -> Dense {
-    qmm(&r.vec(rows * cols, 1.5 / (cols as f32).sqrt()), rows, cols)
-}
-
-fn q8_bf16_head_fixture() -> Fixture {
-    const QD: usize = 32;
-    let mut cfg = tiny_cfg();
-    cfg.dense_ff = QD;
-    cfg.mla = MlaConfig {
-        q_lora_rank: QD,
-        kv_lora_rank: QD,
-        qk_nope_dim: QD,
-        rope_dim: ROPE,
-        head_dim_qk: QD + ROPE,
-        head_dim_v: QD,
-        scale: ((QD + ROPE) as f32).sqrt().recip(),
-    };
-    let (bank, dir) = tiny_bank(&cfg, 29);
-    let mut r = Rng::new(31);
-    let m = &cfg.moe;
-    let layers = cfg
-        .layers
-        .iter()
-        .map(|l| {
-            let h = l.n_heads;
-            let attn = AttnWeights {
-                norm: norm(&mut r, QD),
-                sinks: small(&mut r, &[h], 1.0),
-                q_a: qmat(&mut r, QD, QD),
-                q_a_norm: norm(&mut r, QD),
-                q_b: qmat(&mut r, h * (QD + ROPE), QD),
-                kv_a: qmat(&mut r, QD + ROPE, QD),
-                kv_a_norm: norm(&mut r, QD),
-                k_b: qmat(&mut r, h * QD, QD),
-                v_b: qmat(&mut r, h * QD, QD),
-                output: qmat(&mut r, QD, h * QD),
-                gate: qmat(&mut r, h * QD, QD),
-                post_norm: norm(&mut r, QD),
-                q_kv: None,
-                q_kv_gate: None,
-            };
-            let indexer = (l.attn == Attn::Indexed).then(|| IndexerWeights {
-                attn_k: qmat(&mut r, IDX_DIM, QD),
-                k_norm: norm(&mut r, IDX_DIM),
-                q_b: qmat(&mut r, IDX_HEADS * IDX_DIM, QD),
-                proj: qmat(&mut r, IDX_HEADS, QD),
-                compressor_value: small(&mut r, &[IDX_DIM, IDX_DIM], 0.25),
-                compressor_gate: small(&mut r, &[IDX_DIM, IDX_DIM], 0.25),
-                compressor_ape: small(&mut r, &[cfg.indexer.kpool, IDX_DIM], 0.5),
-                compressor_norm: norm(&mut r, IDX_DIM),
-            });
-            let engram = l.engram.map(|_| {
-                let cols = cfg.engram.n_cols();
-                EngramWeights {
-                    kv: qmat(&mut r, (HC + 1) * QD, cols * cfg.engram.head_dim),
-                    kv_b: small(&mut r, &[HC + 1, QD], 0.2),
-                    gate: small(&mut r, &[HC, QD], 1.0),
-                    lookup_norm: small(&mut r, &[cols, cfg.engram.head_dim], 1.0),
-                    pre_gamma: norm(&mut r, QD),
-                    hc_scale: small(&mut r, &[HC, QD], 0.5),
-                }
-            });
-            let ffn = if l.dense_ffn {
-                Ffn::Mlp {
-                    gate: qmat(&mut r, QD, QD),
-                    up: qmat(&mut r, QD, QD),
-                    down: qmat(&mut r, QD, QD),
-                    gate_up: None,
-                }
-            } else {
-                Ffn::Moe(MoeWeights {
-                    router: mat(&mut r, m.n_experts, QD),
-                    router_bias: Some(small(&mut r, &[m.n_experts], 0.1)),
-                    routed_down: qmat(&mut r, m.latent, QD),
-                    routed_up: qmat(&mut r, QD, m.latent),
-                    shared_gate: qmat(&mut r, QD, QD),
-                    shared_up: qmat(&mut r, QD, QD),
-                    shared_down: qmat(&mut r, QD, QD),
-                    down_shared_gu: None,
-                })
-            };
-            LayerWeights {
-                attn,
-                indexer,
-                engram,
-                residual: Residual::Hc {
-                    attn: hc_weights(&mut r, 2 * HC, 2),
-                    ffn: hc_weights(&mut r, 2 * HC, 2),
-                },
-                ffn_norm: norm(&mut r, QD),
-                post_ffw_norm: norm(&mut r, QD),
-                ffn,
-            }
-        })
-        .collect();
-    let output = arr(&r.vec(V * QD, 1.5 / (QD as f32).sqrt()), &[V, QD])
-        .astype(DType::BFloat16)
-        .unwrap();
-    let weights = Tiny {
-        token_embd: mat(&mut r, V, QD),
-        output: Dense::Array(output),
-        output_norm: norm(&mut r, QD),
-        output_hc: hc_weights(&mut r, HC, 1),
-        layers,
-    };
-    let table = engram_table(&cfg.engram, 37);
-    let b = Arc::clone(&bank);
-    let model = Model::new(
-        cfg,
-        Box::new(weights),
-        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-        Box::new(table),
-    )
-    .unwrap();
-    Fixture {
-        model,
-        bank,
-        _dir: dir,
-    }
-}
-
-fn bits(x: &MxArray) -> Vec<u32> {
-    read(x).into_iter().map(f32::to_bits).collect()
 }
 
 #[test]
 fn batched_bf16_head_four_owner_decode_wave_matches_alone_bitwise() {
-    use super::stats;
+    let f = ModelRig::q8_bf16();
+    let prompts = make_prompts(&[(5, 9), (6, 14), (8, 18), (9, 22)]);
 
-    let f = q8_bf16_head_fixture();
-    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
-        .iter()
-        .map(|&(seed, n)| Rng::new(seed).ids(n))
-        .collect();
-
-    // 4-owner Want::LAST decode wave vs each owner alone.
     let single: [&[u32]; 4] = [&[7], &[3], &[41], &[60]];
     let mut evals_1 = 0u64;
     let alone_last: Vec<Vec<u32>> = prompts
@@ -1248,51 +672,25 @@ fn batched_bf16_head_four_owner_decode_wave_matches_alone_bitwise() {
         .enumerate()
         .map(|(i, (p, ids))| {
             let mut s = prefilled(&f.model, p);
-            let before = stats::thread_evals();
-            let out = f
-                .model
-                .forward(&mut s, ids, RowKind::Decode, Want::LAST, None, None)
-                .unwrap();
+            let ev = stats::thread_evals();
+            let out = fwd(&f.model, &mut s, ids, RowKind::Decode, Want::LAST);
             if i == 0 {
-                evals_1 = stats::thread_evals() - before;
+                evals_1 = stats::thread_evals() - ev;
             }
-            bits(out.logits.as_ref().unwrap())
+            read_bits(out.logits.as_ref().unwrap())
         })
         .collect();
 
     let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
-    let before = stats::thread_evals();
-    let outs = {
-        let mut owners: Vec<OwnerRows<'_>> = sessions
-            .iter_mut()
-            .zip(single)
-            .map(|(sess, ids)| OwnerRows {
-                sess,
-                ids,
-                want: Want::LAST,
-            })
-            .collect();
-        f.model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-    let evals_4 = stats::thread_evals() - before;
-    assert_eq!(
-        evals_4, evals_1,
-        "4-owner BF16-head decode wave must use the same eval count as 1-owner"
-    );
+    let (outs, evals_4) = step_wave(&f.model, &mut sessions, &single, &[Want::LAST; 4], None);
+    assert_eq!(evals_4, evals_1, "4-owner BF16-head wave evals");
     for (i, (want, out)) in alone_last.iter().zip(&outs).enumerate() {
-        assert_eq!(
-            bits(out.logits.as_ref().unwrap()),
-            *want,
-            "Want::LAST owner {i} logits must match alone bitwise"
-        );
+        assert_eq!(read_bits(out.logits.as_ref().unwrap()), *want, "owner {i}");
         assert!(out.hidden.is_none());
     }
 
-    // Mixed wants across 4 owners (including multi-row verify and hidden reuse).
     let mixed_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
-    let mixed_wants: [Want; 4] = [
+    let mixed_wants = [
         Want::LAST,
         Want::ALL,
         Want::STATE,
@@ -1301,436 +699,259 @@ fn batched_bf16_head_four_owner_decode_wave_matches_alone_bitwise() {
             hidden: true,
         },
     ];
-    let alone_mixed: Vec<(Option<Vec<u32>>, Option<Vec<u32>>)> = prompts
+    let alone_mixed: Vec<_> = prompts
         .iter()
         .zip(mixed_ids)
         .zip(mixed_wants)
         .map(|((p, ids), want)| {
             let mut s = prefilled(&f.model, p);
-            let out = f
-                .model
-                .forward(&mut s, ids, RowKind::Decode, want, None, None)
-                .unwrap();
-            (out.logits.as_ref().map(bits), out.hidden.as_ref().map(bits))
+            let out = fwd(&f.model, &mut s, ids, RowKind::Decode, want);
+            (
+                out.logits.as_ref().map(read_bits),
+                out.hidden.as_ref().map(read_bits),
+            )
         })
         .collect();
-
     let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
-    let before = stats::thread_evals();
-    let outs = {
-        let mut owners: Vec<OwnerRows<'_>> = sessions
-            .iter_mut()
-            .zip(mixed_ids)
-            .zip(mixed_wants)
-            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
-            .collect();
-        f.model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-    let evals_mixed = stats::thread_evals() - before;
-    assert_eq!(
-        evals_mixed, evals_1,
-        "mixed-wants 4-owner decode wave must use the same eval count as 1-owner"
-    );
-    for (i, ((want_l, want_h), out)) in alone_mixed.iter().zip(&outs).enumerate() {
+    let (outs, evals_mixed) = step_wave(&f.model, &mut sessions, &mixed_ids, &mixed_wants, None);
+    assert_eq!(evals_mixed, evals_1, "mixed-wants 4-owner wave evals");
+    for (i, ((wl, wh), out)) in alone_mixed.iter().zip(&outs).enumerate() {
         assert_eq!(
-            out.logits.as_ref().map(bits),
-            *want_l,
+            out.logits.as_ref().map(read_bits),
+            *wl,
             "mixed owner {i} logits"
         );
         assert_eq!(
-            out.hidden.as_ref().map(bits),
-            *want_h,
+            out.hidden.as_ref().map(read_bits),
+            *wh,
             "mixed owner {i} hidden"
         );
     }
 }
 
-/// Prefill with read-ahead (`prefetch=true`, 2 staging layers, >= 256 rows)
-/// matches `prefetch=false` bit-for-bit and records `prefetch_slots > 0`.
 #[test]
 fn prefill_with_prefetch_matches_without_prefetch_bitwise() {
     let mut cfg = tiny_cfg();
     cfg.context_length = 300;
-    let mut r = Rng::new(7);
-    let mut file = r.bytes(1000);
-    let experts: Vec<Option<ExpertLayer>> = CLASSES
-        .iter()
-        .enumerate()
-        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
-        .collect();
-    let dir = Temp::new();
-    let path = dir.0.join("experts.bin");
-    std::fs::write(&path, &file).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
-    let bank = Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 2).unwrap());
-    let weights = tiny_weights(&cfg, 11);
-    let table = engram_table(&cfg.engram, 13);
-    let b = Arc::clone(&bank);
-    let model = Model::new(
-        cfg.clone(),
-        Box::new(weights),
-        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-        Box::new(table),
-    )
-    .unwrap();
+    let shard = ShardRig::new(cfg, 0, 7);
+    let rig = shard.with_table(
+        BankKind::Streamed {
+            cache: [4, 4],
+            staging: 2,
+        },
+        Default::default(),
+        13,
+    );
+    let ids = Rng::new(53).ids(super::block::READ_AHEAD_MIN_ROWS, TINY_V);
 
-    let ids = Rng::new(53).ids(super::block::READ_AHEAD_MIN_ROWS);
-
-    bank.set_prefetch(false);
-    bank.test_forget_where(|_, _| true);
-    let mut s_off = model.new_session(300).unwrap();
-    let mut t_off = Trace::default();
-    let out_off = model
-        .forward(
-            &mut s_off,
-            &ids,
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            Some(&mut t_off),
+    let run = |on: bool| {
+        rig.bank.end_turn().unwrap();
+        rig.bank.set_prefetch(on);
+        rig.bank.test_forget_where(|_, _| true);
+        let st = rig.bank.stats();
+        let mut s = rig.model.new_session(300).unwrap();
+        let (out, t) = fwd_traced(&rig.model, &mut s, &ids, RowKind::Prefill, Want::LAST);
+        (
+            read_bits(out.logits.as_ref().unwrap()),
+            routes_of(&t),
+            rig.pf_delta(&st),
         )
-        .unwrap();
-    let want_bits = bits(out_off.logits.as_ref().unwrap());
-    assert_eq!(
-        bank.stats().iter().map(|s| s.prefetch_slots).sum::<usize>(),
-        0
-    );
-
-    bank.end_turn().unwrap();
-    bank.set_prefetch(true);
-    bank.test_forget_where(|_, _| true);
-    let mut s_on = model.new_session(300).unwrap();
-    let mut t_on = Trace::default();
-    let out_on = model
-        .forward(
-            &mut s_on,
-            &ids,
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            Some(&mut t_on),
-        )
-        .unwrap();
-    let got_bits = bits(out_on.logits.as_ref().unwrap());
-
-    assert_eq!(
-        got_bits, want_bits,
-        "prefetch=true vs prefetch=false logits"
-    );
-    assert_eq!(
-        routes_of(&t_on),
-        routes_of(&t_off),
-        "prefetch=true vs prefetch=false routes"
-    );
-    let st = bank.stats();
-    assert!(
-        st[0].prefetch_slots > 0 && st[1].prefetch_slots > 0,
-        "both classes must record prefetch_slots > 0, got {st:?}"
-    );
-    bank.end_turn().unwrap();
-}
-
-/// Decode with read-ahead (`decode_prefetch=true`, 2 staging layers, rows <= 4)
-/// matches `decode_prefetch=false` bit-for-bit, uses identical `evals` (0 extra
-/// host syncs), and records `prefetch_slots > 0` for both classes.
-#[test]
-fn decode_with_prefetch_matches_without_prefetch_bitwise_and_zero_extra_evals() {
-    use super::stats;
-
-    let cfg = tiny_cfg();
-    let mut r = Rng::new(7);
-    let mut file = r.bytes(1000);
-    let experts: Vec<Option<ExpertLayer>> = CLASSES
-        .iter()
-        .enumerate()
-        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
-        .collect();
-    let dir = Temp::new();
-    let path = dir.0.join("experts.bin");
-    std::fs::write(&path, &file).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
-    let bank = Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 2).unwrap());
-    let weights = tiny_weights(&cfg, 11);
-    let table = engram_table(&cfg.engram, 13);
-    let b = Arc::clone(&bank);
-    let model = Model::new(
-        cfg,
-        Box::new(weights),
-        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-        Box::new(table),
-    )
-    .unwrap();
-
-    let prefill_ids = Rng::new(19).ids(12);
-    let decode_ids = [7u32, 23, 41, 60];
-
-    let run_decode_seq = |enabled: bool| {
-        bank.end_turn().unwrap();
-        bank.set_decode_prefetch(enabled);
-        let mut s = prefilled(&model, &prefill_ids);
-        bank.test_forget_where(|_, _| true);
-        let st_before = bank.stats();
-        let evals_before = stats::thread_evals();
-        let mut all_bits = Vec::new();
-        let mut all_routes = Vec::new();
-        for &id in &decode_ids {
-            let mut t = Trace::default();
-            let out = model
-                .forward(
-                    &mut s,
-                    &[id],
-                    RowKind::Decode,
-                    Want::LAST,
-                    None,
-                    Some(&mut t),
-                )
-                .unwrap();
-            all_bits.push(bits(out.logits.as_ref().unwrap()));
-            all_routes.push(routes_of(&t));
-        }
-        let evals = stats::thread_evals() - evals_before;
-        let st_after = bank.stats();
-        let pf = [
-            st_after[0].prefetch_slots - st_before[0].prefetch_slots,
-            st_after[1].prefetch_slots - st_before[1].prefetch_slots,
-        ];
-        (all_bits, all_routes, evals, pf)
     };
 
-    let (bits_off, routes_off, evals_off, pf_off) = run_decode_seq(false);
-    let (bits_on, routes_on, evals_on, pf_on) = run_decode_seq(true);
+    let (want_bits, routes_off, pf_off) = run(false);
     assert_eq!(pf_off, [0, 0]);
-    assert_eq!(
-        bits_on, bits_off,
-        "M=1 decode_prefetch logits must be bit-exact"
-    );
-    assert_eq!(
-        routes_on, routes_off,
-        "M=1 decode_prefetch routes must match"
-    );
-    assert_eq!(
-        evals_on, evals_off,
-        "M=1 decode_prefetch must add 0 extra evals"
-    );
+    let (got_bits, routes_on, pf_on) = run(true);
+    assert_eq!((got_bits, routes_on), (want_bits, routes_off));
     assert!(
         pf_on[0] > 0 && pf_on[1] > 0,
-        "M=1 decode_prefetch must prefetch both classes, got {pf_on:?}"
+        "both classes must prefetch, got {pf_on:?}"
+    );
+}
+
+#[test]
+fn decode_with_prefetch_matches_without_prefetch_bitwise_and_zero_extra_evals() {
+    let shard = ShardRig::new(tiny_cfg(), 0, 7);
+    let rig = shard.with_table(
+        BankKind::Streamed {
+            cache: [4, 4],
+            staging: 2,
+        },
+        Default::default(),
+        13,
+    );
+    let (prefill_ids, decode_ids) = (Rng::new(19).ids(12, TINY_V), [7u32, 23, 41, 60]);
+
+    let run_seq = |on: bool| {
+        rig.bank.end_turn().unwrap();
+        rig.bank.set_decode_prefetch(on);
+        let mut s = prefilled(&rig.model, &prefill_ids);
+        rig.bank.test_forget_where(|_, _| true);
+        let (st, ev) = (rig.bank.stats(), stats::thread_evals());
+        let (mut all_bits, mut all_routes) = (Vec::new(), Vec::new());
+        for &id in &decode_ids {
+            let (out, t) = fwd_traced(&rig.model, &mut s, &[id], RowKind::Decode, Want::LAST);
+            all_bits.push(read_bits(out.logits.as_ref().unwrap()));
+            all_routes.push(routes_of(&t));
+        }
+        (
+            all_bits,
+            all_routes,
+            stats::thread_evals() - ev,
+            rig.pf_delta(&st),
+        )
+    };
+    let (b_off, r_off, ev_off, pf_off) = run_seq(false);
+    let (b_on, r_on, ev_on, pf_on) = run_seq(true);
+    assert_eq!((pf_off, b_on, r_on, ev_on), ([0, 0], b_off, r_off, ev_off));
+    assert!(
+        pf_on[0] > 0 && pf_on[1] > 0,
+        "M=1 decode_prefetch: {pf_on:?}"
     );
 
     // Multi-row decode wave (3 rows <= 4, exercises `forward_split`).
-    let p_a = Rng::new(31).ids(10);
-    let p_b = Rng::new(37).ids(14);
-    let run_wave = |enabled: bool| {
-        bank.end_turn().unwrap();
-        bank.set_decode_prefetch(enabled);
-        let mut sa = prefilled(&model, &p_a);
-        let mut sb = prefilled(&model, &p_b);
-        bank.test_forget_where(|_, _| true);
-        let st_before = bank.stats();
-        let evals_before = stats::thread_evals();
-        let outs = {
-            let mut owners = [
-                OwnerRows {
-                    sess: &mut sa,
-                    ids: &[11],
-                    want: Want::LAST,
-                },
-                OwnerRows {
-                    sess: &mut sb,
-                    ids: &[12, 13],
-                    want: Want::ALL,
-                },
-            ];
-            model
-                .step(&mut owners, RowKind::Decode, None, None)
-                .unwrap()
-        };
-        let evals = stats::thread_evals() - evals_before;
-        let st_after = bank.stats();
-        let pf = [
-            st_after[0].prefetch_slots - st_before[0].prefetch_slots,
-            st_after[1].prefetch_slots - st_before[1].prefetch_slots,
-        ];
-        let out_bits: Vec<Vec<u32>> = outs
+    let wave_prompts = make_prompts(&[(31, 10), (37, 14)]);
+    let run_wave = |on: bool| {
+        rig.bank.end_turn().unwrap();
+        rig.bank.set_decode_prefetch(on);
+        let mut sess: Vec<Session> = wave_prompts
             .iter()
-            .map(|o| bits(o.logits.as_ref().unwrap()))
+            .map(|p| prefilled(&rig.model, p))
             .collect();
-        (out_bits, evals, pf)
+        rig.bank.test_forget_where(|_, _| true);
+        let st = rig.bank.stats();
+        let (outs, ev) = step_wave(
+            &rig.model,
+            &mut sess,
+            &[&[11][..], &[12, 13][..]],
+            &[Want::LAST, Want::ALL],
+            None,
+        );
+        let out_bits: Vec<_> = outs
+            .iter()
+            .map(|o| read_bits(o.logits.as_ref().unwrap()))
+            .collect();
+        (out_bits, ev, rig.pf_delta(&st))
     };
-    let (w_off, w_evals_off, w_pf_off) = run_wave(false);
-    let (w_on, w_evals_on, w_pf_on) = run_wave(true);
-    assert_eq!(w_pf_off, [0, 0]);
-    assert_eq!(w_on, w_off, "M=3 decode wave logits must be bit-exact");
-    assert_eq!(
-        w_evals_on, w_evals_off,
-        "M=3 decode wave must add 0 extra evals"
-    );
+    let (w_off, we_off, wpf_off) = run_wave(false);
+    let (w_on, we_on, wpf_on) = run_wave(true);
+    assert_eq!((wpf_off, w_on, we_on), ([0, 0], w_off, we_off));
     assert!(
-        w_pf_on[0] > 0 && w_pf_on[1] > 0,
-        "M=3 decode wave must prefetch both classes, got {w_pf_on:?}"
+        wpf_on[0] > 0 && wpf_on[1] > 0,
+        "M=3 wave prefetch: {wpf_on:?}"
     );
 
-    // Wide decode wave (5 rows > DECODE_READ_AHEAD_MAX_ROWS) must not prefetch.
-    bank.end_turn().unwrap();
-    bank.set_decode_prefetch(true);
-    let mut wide_s = prefilled(&model, &p_a);
-    bank.test_forget_where(|_, _| true);
-    let st_before = bank.stats();
-    model
-        .forward(
-            &mut wide_s,
-            &[1, 2, 3, 4, 5],
-            RowKind::Decode,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let st_after = bank.stats();
+    // Wide decode wave (5 rows > 4) must not prefetch.
+    rig.bank.end_turn().unwrap();
+    rig.bank.set_decode_prefetch(true);
+    let mut wide_s = prefilled(&rig.model, &wave_prompts[0]);
+    rig.bank.test_forget_where(|_, _| true);
+    let st = rig.bank.stats();
+    fwd(
+        &rig.model,
+        &mut wide_s,
+        &[1, 2, 3, 4, 5],
+        RowKind::Decode,
+        Want::LAST,
+    );
     assert_eq!(
-        (st_after[0].prefetch_slots - st_before[0].prefetch_slots)
-            + (st_after[1].prefetch_slots - st_before[1].prefetch_slots),
-        0,
-        "decode waves past 4 rows must skip decode read-ahead"
+        rig.pf_delta(&st),
+        [0, 0],
+        "waves past 4 rows must skip read-ahead"
     );
 
     // Single-staging bank (`staging_layers == 1`) must never decode-prefetch.
-    let single = fixture();
+    let single = model_fixture();
     single.bank.set_decode_prefetch(true);
     let mut ss = prefilled(&single.model, &prefill_ids);
     single.bank.test_forget_where(|_, _| true);
-    let st_before = single.bank.stats();
-    single
-        .model
-        .forward(&mut ss, &[7], RowKind::Decode, Want::LAST, None, None)
-        .unwrap();
-    let st_after = single.bank.stats();
+    let st = single.bank.stats();
+    fwd(&single.model, &mut ss, &[7], RowKind::Decode, Want::LAST);
+    let st2 = single.bank.stats();
     assert_eq!(
-        (st_after[0].prefetch_slots - st_before[0].prefetch_slots)
-            + (st_after[1].prefetch_slots - st_before[1].prefetch_slots),
-        0,
-        "staging_layers < 2 must never decode-prefetch"
+        (st2[0].prefetch_slots - st[0].prefetch_slots)
+            + (st2[1].prefetch_slots - st[1].prefetch_slots),
+        0
     );
-
-    bank.end_turn().unwrap();
 }
 
-/// Direct-mode model decode wave vs partial-mode model decode wave:
-/// bit-identical outputs on single-owner, multi-row verify, and 4-owner waves,
-/// and exactly 1 eval (the final head sync) per decode step in direct mode.
-/// Direct prefill also matches partial-mode prefill bit-for-bit.
 #[test]
 fn direct_mode_decode_wave_matches_partial_bitwise_with_single_eval() {
-    use super::stats;
-
-    let cfg = tiny_cfg();
-    let mut r = Rng::new(7);
-    let mut file = r.bytes(1000);
-    let experts: Vec<Option<ExpertLayer>> = CLASSES
-        .iter()
-        .enumerate()
-        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
-        .collect();
-    let dir = Temp::new();
-    let path = dir.0.join("experts.bin");
-    std::fs::write(&path, &file).unwrap();
-
-    let make_model = |direct: bool| {
-        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
-        let bank = if direct {
-            Arc::new(KqBank::new_direct(pool, &cfg.moe, &experts).unwrap())
-        } else {
-            Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 1).unwrap())
-        };
-        let weights = tiny_weights(&cfg, 11);
-        let table = engram_table(&cfg.engram, 13);
-        let b = Arc::clone(&bank);
-        let model = Model::new(
-            cfg.clone(),
-            Box::new(weights),
-            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-            Box::new(table),
-        )
-        .unwrap();
-        (model, bank)
-    };
-
-    let (partial_model, partial_bank) = make_model(false);
-    let (direct_model, direct_bank) = make_model(true);
-    direct_bank.wait_direct_fill().unwrap();
-    assert!(!partial_model.bank_is_direct());
-    assert!(direct_model.bank_is_direct());
-
-    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
-        .iter()
-        .map(|&(seed, n)| Rng::new(seed).ids(n))
-        .collect();
-
-    // Direct prefill matches partial prefill bit-for-bit.
-    let mut p_sess_0 = partial_model.new_session(CTX).unwrap();
-    let mut d_sess_0 = direct_model.new_session(CTX).unwrap();
-    let p_pre = partial_model
-        .forward(
-            &mut p_sess_0,
-            &prompts[0],
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let d_pre = direct_model
-        .forward(
-            &mut d_sess_0,
-            &prompts[0],
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    assert_eq!(
-        bits(d_pre.logits.as_ref().unwrap()),
-        bits(p_pre.logits.as_ref().unwrap()),
-        "direct prefill must match partial prefill bitwise"
+    let shard = ShardRig::new(tiny_cfg(), 0, 7);
+    let partial = shard.with_table(
+        BankKind::Streamed {
+            cache: [4, 4],
+            staging: 1,
+        },
+        Default::default(),
+        13,
     );
+    let direct = shard.with_table(BankKind::Direct, Default::default(), 13);
+    direct.bank.wait_direct_fill().unwrap();
+    assert!(!partial.model.bank_is_direct() && direct.model.bank_is_direct());
 
-    // 1-row decode: bit-identical and evals == 1 in direct mode.
-    let p_evals_before = stats::thread_evals();
-    let p_dec1 = partial_model
-        .forward(&mut p_sess_0, &[7], RowKind::Decode, Want::LAST, None, None)
-        .unwrap();
-    let p_evals_1 = stats::thread_evals() - p_evals_before;
-    assert!(p_evals_1 > 1, "partial mode must sync on router reads");
-
-    let d_evals_before = stats::thread_evals();
-    let d_dec1 = direct_model
-        .forward(&mut d_sess_0, &[7], RowKind::Decode, Want::LAST, None, None)
-        .unwrap();
-    let d_evals_1 = stats::thread_evals() - d_evals_before;
-    assert_eq!(
-        d_evals_1, 1,
-        "direct mode 1-row decode must use exactly 1 eval (head sync only), got {d_evals_1}"
+    let prompts = make_prompts(&[(5, 9), (6, 14), (8, 18), (9, 22)]);
+    let mut p_sess = partial.model.new_session(TINY_CTX).unwrap();
+    let mut d_sess = direct.model.new_session(TINY_CTX).unwrap();
+    let p_pre = fwd(
+        &partial.model,
+        &mut p_sess,
+        &prompts[0],
+        RowKind::Prefill,
+        Want::LAST,
+    );
+    let d_pre = fwd(
+        &direct.model,
+        &mut d_sess,
+        &prompts[0],
+        RowKind::Prefill,
+        Want::LAST,
     );
     assert_eq!(
-        bits(d_dec1.logits.as_ref().unwrap()),
-        bits(p_dec1.logits.as_ref().unwrap()),
-        "direct mode 1-row decode must match partial mode bitwise"
+        read_bits(d_pre.logits.as_ref().unwrap()),
+        read_bits(p_pre.logits.as_ref().unwrap())
     );
 
-    // Multi-owner + verify2 decode wave (6 total rows across 4 owners): bit-identical and evals == 1.
-    let mut p_sessions: Vec<Session> = prompts
+    let ev = stats::thread_evals();
+    let p_dec1 = fwd(
+        &partial.model,
+        &mut p_sess,
+        &[7],
+        RowKind::Decode,
+        Want::LAST,
+    );
+    assert!(
+        stats::thread_evals() - ev > 1,
+        "partial mode must sync on router reads"
+    );
+
+    let ev = stats::thread_evals();
+    let d_dec1 = fwd(
+        &direct.model,
+        &mut d_sess,
+        &[7],
+        RowKind::Decode,
+        Want::LAST,
+    );
+    assert_eq!(
+        stats::thread_evals() - ev,
+        1,
+        "direct 1-row decode must use 1 eval"
+    );
+    assert_eq!(
+        read_bits(d_dec1.logits.as_ref().unwrap()),
+        read_bits(p_dec1.logits.as_ref().unwrap())
+    );
+
+    let mut p_sesss: Vec<Session> = prompts
         .iter()
-        .map(|p| prefilled(&partial_model, p))
+        .map(|p| prefilled(&partial.model, p))
         .collect();
-    let mut d_sessions: Vec<Session> = prompts
+    let mut d_sesss: Vec<Session> = prompts
         .iter()
-        .map(|p| prefilled(&direct_model, p))
+        .map(|p| prefilled(&direct.model, p))
         .collect();
     let wave_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
-    let wave_wants: [Want; 4] = [
+    let wave_wants = [
         Want::LAST,
         Want::ALL,
         Want::LAST,
@@ -1739,295 +960,153 @@ fn direct_mode_decode_wave_matches_partial_bitwise_with_single_eval() {
             hidden: true,
         },
     ];
-
-    let p_outs = {
-        let mut owners: Vec<OwnerRows<'_>> = p_sessions
-            .iter_mut()
-            .zip(wave_ids)
-            .zip(wave_wants)
-            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
-            .collect();
-        partial_model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-
-    let d_evals_before = stats::thread_evals();
-    let d_outs = {
-        let mut owners: Vec<OwnerRows<'_>> = d_sessions
-            .iter_mut()
-            .zip(wave_ids)
-            .zip(wave_wants)
-            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
-            .collect();
-        direct_model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-    let d_evals_wave = stats::thread_evals() - d_evals_before;
+    let (p_outs, _) = step_wave(&partial.model, &mut p_sesss, &wave_ids, &wave_wants, None);
+    let (d_outs, d_ev) = step_wave(&direct.model, &mut d_sesss, &wave_ids, &wave_wants, None);
     assert_eq!(
-        d_evals_wave, 1,
-        "direct mode multi-owner decode wave must use exactly 1 eval, got {d_evals_wave}"
+        d_ev, 1,
+        "direct multi-owner wave must use 1 eval, got {d_ev}"
     );
     for (i, (po, do_)) in p_outs.iter().zip(&d_outs).enumerate() {
         assert_eq!(
-            do_.logits.as_ref().map(bits),
-            po.logits.as_ref().map(bits),
-            "direct vs partial wave owner {i} logits"
+            do_.logits.as_ref().map(read_bits),
+            po.logits.as_ref().map(read_bits),
+            "owner {i} logits"
         );
         assert_eq!(
-            do_.hidden.as_ref().map(bits),
-            po.hidden.as_ref().map(bits),
-            "direct vs partial wave owner {i} hidden"
+            do_.hidden.as_ref().map(read_bits),
+            po.hidden.as_ref().map(read_bits),
+            "owner {i} hidden"
         );
     }
-
-    partial_bank.end_turn().unwrap();
-    direct_bank.end_turn().unwrap();
 }
 
-/// Mmap-mode synthetic model vs repacked DirectBank: decode (single-owner and
-/// multi-owner DEDUP wave with 1 eval/step), prefill (NAX and non-NAX 32-row
-/// fallback), and host-routed trace / forced routes all match closely.
 #[test]
 fn mmap_mode_decode_and_prefill_match_direct_bank() {
-    use super::bank::Residency;
-    use super::moe::{forced, with_prefill_indirect_gu};
-    use super::stats;
-
     // SAFETY: pure process-wide Metal availability probe.
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
+    let shard = ShardRig::new(tiny_cfg(), 32, 23);
+    let direct = shard.with_table(BankKind::Direct, Default::default(), 13);
+    let mmap = shard.with_table(BankKind::Mmap, Default::default(), 13);
+    direct.bank.wait_direct_fill().unwrap();
+    mmap.bank.wait_direct_fill().unwrap();
 
-    let cfg = tiny_cfg();
-    let mut r = Rng::new(23);
-    // Align every tensor to a 32-byte boundary matching GGUF alignment.
-    let mut file = r.bytes(1024);
-    let experts: Vec<Option<ExpertLayer>> = CLASSES
-        .iter()
-        .enumerate()
-        .map(|(il, c)| {
-            c.map(|class| {
-                let types = class_types(class).unwrap();
-                let geo = geometry(&cfg.moe, class).unwrap();
-                let dims = [
-                    [cfg.moe.latent, cfg.moe.ff, cfg.moe.n_experts],
-                    [cfg.moe.latent, cfg.moe.ff, cfg.moe.n_experts],
-                    [cfg.moe.ff, cfg.moe.latent, cfg.moe.n_experts],
-                ];
-                let mut locs = Vec::new();
-                for (p, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-                    .iter()
-                    .enumerate()
-                {
-                    let pad = (32 - (file.len() % 32)) % 32;
-                    file.resize(file.len() + pad, 0);
-                    let at = file.len() as u64;
-                    locs.push(located(
-                        &format!("blk.{il}.{name}.weight"),
-                        dims[p],
-                        types[p],
-                        at,
-                    ));
-                    let g = geo[p];
-                    let blocks = cfg.moe.n_experts * g.rows * g.k / g.format.block_size();
-                    file.extend(kquant_bytes(&mut r, g.format, blocks));
-                }
-                let [gate, up, down]: [Located; 3] = locs.try_into().ok().unwrap();
-                ExpertLayer {
-                    class,
-                    gate,
-                    up,
-                    down,
-                }
-            })
-        })
-        .collect();
-    let dir = Temp::new();
-    let path = dir.0.join("experts.bin");
-    std::fs::write(&path, &file).unwrap();
+    assert!(mmap.bank.is_direct() && mmap.bank.is_mmap() && mmap.model.bank_is_direct());
+    assert_eq!(
+        (mmap.bank.nbytes(), mmap.bank.residency().unwrap()),
+        (0, Residency::default())
+    );
+    assert!(mmap.bank.mapped_bytes() > 0);
 
-    let make_model = |mmap: bool| {
-        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
-        let bank = if mmap {
-            Arc::new(
-                KqBank::new_mmap(
-                    pool,
-                    &cfg.moe,
-                    &experts,
-                    std::slice::from_ref(&path),
-                    file.len() as u64,
-                    false,
-                )
-                .unwrap(),
-            )
-        } else {
-            Arc::new(KqBank::new_direct(pool, &cfg.moe, &experts).unwrap())
-        };
-        let weights = tiny_weights(&cfg, 11);
-        let table = engram_table(&cfg.engram, 13);
-        let b = Arc::clone(&bank);
-        let model = Model::new(
-            cfg.clone(),
-            Box::new(weights),
-            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-            Box::new(table),
-        )
-        .unwrap();
-        (model, bank)
-    };
+    let prompts = make_prompts(&[(5, 9), (6, 14), (8, 18), (9, 22)]);
+    let mut d_sess = direct.model.new_session(TINY_CTX).unwrap();
+    let mut m_sess = mmap.model.new_session(TINY_CTX).unwrap();
 
-    let (direct_model, direct_bank) = make_model(false);
-    let (mmap_model, mmap_bank) = make_model(true);
-    direct_bank.wait_direct_fill().unwrap();
-    mmap_bank.wait_direct_fill().unwrap();
-
-    assert!(mmap_bank.is_direct());
-    assert!(mmap_bank.is_mmap());
-    assert!(mmap_model.bank_is_direct());
-    assert_eq!(mmap_bank.nbytes(), 0);
-    assert_eq!(mmap_bank.residency().unwrap(), Residency::default());
-    assert!(mmap_bank.mapped_bytes() > 0);
-
-    let max_diff = |a: &MxArray, b: &MxArray| -> f32 {
-        let av = read(a);
-        let bv = read(b);
-        assert_eq!(av.len(), bv.len());
-        av.iter()
-            .zip(&bv)
-            .map(|(&x, &y)| {
-                assert!(x.is_finite() && y.is_finite());
-                (x - y).abs()
-            })
-            .fold(0.0f32, f32::max)
-    };
-
-    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
-        .iter()
-        .map(|&(seed, n)| Rng::new(seed).ids(n))
-        .collect();
-
-    // 1. Prefill (<= 32 tiny-tail fastpath AND > 32 indirect NAX path) matches DirectBank.
-    let long_prompt = Rng::new(42).ids(40);
-    let mut d_sess = direct_model.new_session(CTX).unwrap();
-    let mut m_sess = mmap_model.new_session(CTX).unwrap();
-    let d_pre = direct_model
-        .forward(
-            &mut d_sess,
-            &prompts[0],
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let m_pre = mmap_model
-        .forward(
-            &mut m_sess,
-            &prompts[0],
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let pre_diff = max_diff(
+    // 1. Prefill (<= 32 tiny-tail AND > 32 indirect NAX) matches DirectBank.
+    let d_pre = fwd(
+        &direct.model,
+        &mut d_sess,
+        &prompts[0],
+        RowKind::Prefill,
+        Want::LAST,
+    );
+    let m_pre = fwd(
+        &mmap.model,
+        &mut m_sess,
+        &prompts[0],
+        RowKind::Prefill,
+        Want::LAST,
+    );
+    assert_near_arr(
         m_pre.logits.as_ref().unwrap(),
         d_pre.logits.as_ref().unwrap(),
-    );
-    assert!(
-        pre_diff <= 1e-2,
-        "mmap tiny-tail prefill max_diff={pre_diff}"
+        "tiny-tail prefill",
     );
 
-    let mut d_long = direct_model.new_session(CTX).unwrap();
-    let mut m_long = mmap_model.new_session(CTX).unwrap();
-    let d_pre_long = direct_model
-        .forward(
-            &mut d_long,
-            &long_prompt,
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let m_pre_long = mmap_model
-        .forward(
-            &mut m_long,
-            &long_prompt,
-            RowKind::Prefill,
-            Want::LAST,
-            None,
-            None,
-        )
-        .unwrap();
-    let long_diff = max_diff(
-        m_pre_long.logits.as_ref().unwrap(),
-        d_pre_long.logits.as_ref().unwrap(),
+    let long_p = Rng::new(42).ids(40, TINY_V);
+    let (mut d_long, mut m_long) = (
+        direct.model.new_session(TINY_CTX).unwrap(),
+        mmap.model.new_session(TINY_CTX).unwrap(),
     );
-    assert!(
-        long_diff <= 1e-2,
-        "mmap >32-row prefill max_diff={long_diff}"
+    let dl = fwd(
+        &direct.model,
+        &mut d_long,
+        &long_p,
+        RowKind::Prefill,
+        Want::LAST,
+    );
+    let ml = fwd(
+        &mmap.model,
+        &mut m_long,
+        &long_p,
+        RowKind::Prefill,
+        Want::LAST,
+    );
+    assert_near_arr(
+        ml.logits.as_ref().unwrap(),
+        dl.logits.as_ref().unwrap(),
+        ">32-row prefill",
     );
 
-    // 2. Prefill non-NAX fallback (32-row decode chunks) also matches DirectBank.
-    let mut d_fb_sess = direct_model.new_session(CTX).unwrap();
-    let mut m_fb_sess = mmap_model.new_session(CTX).unwrap();
-    let (d_fb, m_fb) = with_prefill_indirect_gu(false, || {
-        let d = direct_model
-            .forward(
-                &mut d_fb_sess,
+    // 2. Prefill non-NAX fallback (32-row decode chunks).
+    let (mut d_fb, mut m_fb) = (
+        direct.model.new_session(TINY_CTX).unwrap(),
+        mmap.model.new_session(TINY_CTX).unwrap(),
+    );
+    let (do_fb, mo_fb) = with_prefill_indirect_gu(false, || {
+        (
+            fwd(
+                &direct.model,
+                &mut d_fb,
                 &prompts[1],
                 RowKind::Prefill,
                 Want::LAST,
-                None,
-                None,
-            )
-            .unwrap();
-        let m = mmap_model
-            .forward(
-                &mut m_fb_sess,
+            ),
+            fwd(
+                &mmap.model,
+                &mut m_fb,
                 &prompts[1],
                 RowKind::Prefill,
                 Want::LAST,
-                None,
-                None,
-            )
-            .unwrap();
-        (d, m)
+            ),
+        )
     });
-    let fb_diff = max_diff(m_fb.logits.as_ref().unwrap(), d_fb.logits.as_ref().unwrap());
-    assert!(fb_diff <= 1e-2, "mmap prefill fallback max_diff={fb_diff}");
-
-    // 3. 1-row Decode: 1 eval/tok and tight numeric match against DirectBank.
-    let d_dec1 = direct_model
-        .forward(&mut d_sess, &[7], RowKind::Decode, Want::LAST, None, None)
-        .unwrap();
-    let m_evals_before = stats::thread_evals();
-    let m_dec1 = mmap_model
-        .forward(&mut m_sess, &[7], RowKind::Decode, Want::LAST, None, None)
-        .unwrap();
-    let m_evals_1 = stats::thread_evals() - m_evals_before;
-    assert_eq!(
-        m_evals_1, 1,
-        "mmap 1-row decode must use exactly 1 eval, got {m_evals_1}"
+    assert_near_arr(
+        mo_fb.logits.as_ref().unwrap(),
+        do_fb.logits.as_ref().unwrap(),
+        "prefill fallback",
     );
-    let dec1_diff = max_diff(
+
+    // 3. 1-row Decode: 1 eval and matches DirectBank.
+    let d_dec1 = fwd(
+        &direct.model,
+        &mut d_sess,
+        &[7],
+        RowKind::Decode,
+        Want::LAST,
+    );
+    let ev = stats::thread_evals();
+    let m_dec1 = fwd(&mmap.model, &mut m_sess, &[7], RowKind::Decode, Want::LAST);
+    assert_eq!(
+        stats::thread_evals() - ev,
+        1,
+        "mmap 1-row decode must use 1 eval"
+    );
+    assert_near_arr(
         m_dec1.logits.as_ref().unwrap(),
         d_dec1.logits.as_ref().unwrap(),
+        "1-row decode",
     );
-    assert!(dec1_diff <= 1e-2, "mmap 1-row decode max_diff={dec1_diff}");
 
     // 4. Multi-owner + verify2 Decode wave (6 rows, 4 owners): 1 eval and matches DirectBank.
-    let mut d_sessions: Vec<Session> = prompts
+    let mut d_sesss: Vec<Session> = prompts
         .iter()
-        .map(|p| prefilled(&direct_model, p))
+        .map(|p| prefilled(&direct.model, p))
         .collect();
-    let mut m_sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&mmap_model, p)).collect();
+    let mut m_sesss: Vec<Session> = prompts.iter().map(|p| prefilled(&mmap.model, p)).collect();
     let wave_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
-    let wave_wants: [Want; 4] = [
+    let wave_wants = [
         Want::LAST,
         Want::ALL,
         Want::LAST,
@@ -2036,99 +1115,50 @@ fn mmap_mode_decode_and_prefill_match_direct_bank() {
             hidden: true,
         },
     ];
-    let d_outs = {
-        let mut owners: Vec<OwnerRows<'_>> = d_sessions
-            .iter_mut()
-            .zip(wave_ids)
-            .zip(wave_wants)
-            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
-            .collect();
-        direct_model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-    let m_evals_before = stats::thread_evals();
-    let m_outs = {
-        let mut owners: Vec<OwnerRows<'_>> = m_sessions
-            .iter_mut()
-            .zip(wave_ids)
-            .zip(wave_wants)
-            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
-            .collect();
-        mmap_model
-            .step(&mut owners, RowKind::Decode, None, None)
-            .unwrap()
-    };
-    let m_evals_wave = stats::thread_evals() - m_evals_before;
-    assert_eq!(
-        m_evals_wave, 1,
-        "mmap multi-owner decode wave must use exactly 1 eval, got {m_evals_wave}"
-    );
+    let (d_outs, _) = step_wave(&direct.model, &mut d_sesss, &wave_ids, &wave_wants, None);
+    let (m_outs, m_ev) = step_wave(&mmap.model, &mut m_sesss, &wave_ids, &wave_wants, None);
+    assert_eq!(m_ev, 1, "mmap multi-owner wave must use 1 eval, got {m_ev}");
     for (i, (do_, mo)) in d_outs.iter().zip(&m_outs).enumerate() {
-        let ld = max_diff(mo.logits.as_ref().unwrap(), do_.logits.as_ref().unwrap());
-        assert!(ld <= 1e-2, "mmap wave owner {i} logits diff={ld}");
+        assert_near_arr(
+            mo.logits.as_ref().unwrap(),
+            do_.logits.as_ref().unwrap(),
+            &format!("wave {i} logits"),
+        );
         if let (Some(mh), Some(dh)) = (mo.hidden.as_ref(), do_.hidden.as_ref()) {
-            let hd = max_diff(mh, dh);
-            assert!(hd <= 1e-2, "mmap wave owner {i} hidden diff={hd}");
+            assert_near_arr(mh, dh, &format!("wave {i} hidden"));
         }
     }
 
-    // 5. Host-routed trace (`need_routes == true`) + forced routes work in Mmap mode.
-    let mut forced_map = std::collections::HashMap::new();
-    for (il, c) in CLASSES.iter().enumerate() {
-        if c.is_some() {
-            forced_map.insert(il, vec![0u32, 3]);
-        }
-    }
-    let mut d_tr = Trace::default();
-    let mut m_tr = Trace::default();
-    let (d_forced, m_forced) = forced::with(forced_map, || {
-        let d = direct_model
-            .forward(
+    // 5. Host-routed trace + forced routes work in Mmap mode.
+    let forced_map: HashMap<usize, Vec<u32>> = TINY_CLASSES
+        .iter()
+        .enumerate()
+        .filter_map(|(il, c)| c.map(|_| (il, vec![0u32, 3])))
+        .collect();
+    let ((df, d_tr), (mf, m_tr)) = forced::with(forced_map, || {
+        (
+            fwd_traced(
+                &direct.model,
                 &mut d_sess,
                 &[21],
                 RowKind::Decode,
                 Want::LAST,
-                None,
-                Some(&mut d_tr),
-            )
-            .unwrap();
-        let m = mmap_model
-            .forward(
-                &mut m_sess,
-                &[21],
-                RowKind::Decode,
-                Want::LAST,
-                None,
-                Some(&mut m_tr),
-            )
-            .unwrap();
-        (d, m)
+            ),
+            fwd_traced(&mmap.model, &mut m_sess, &[21], RowKind::Decode, Want::LAST),
+        )
     });
     assert_eq!(m_tr.routes.len(), d_tr.routes.len());
-    let forced_diff = max_diff(
-        m_forced.logits.as_ref().unwrap(),
-        d_forced.logits.as_ref().unwrap(),
+    assert_near_arr(
+        mf.logits.as_ref().unwrap(),
+        df.logits.as_ref().unwrap(),
+        "forced decode",
     );
-    assert!(
-        forced_diff <= 1e-2,
-        "mmap host-routed forced decode max_diff={forced_diff}"
-    );
-
-    direct_bank.end_turn().unwrap();
-    mmap_bank.end_turn().unwrap();
 }
 
-/// A 16-token prompt through the real trunk: finite logits, the last row
-/// equal to the all-rows call, and (with `HY4_LLAMA_TOP1` = a JSON file
-/// `{"ids": [..16], "top1": [..16]}` of stored llama.cpp rows) the argmax
-/// of every row.
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards and the GPU"]
 fn real_trunk_forward_last() {
-    let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
-    let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();
-    let scan = Scan::open(&paths).unwrap();
+    let scan = real_scan();
     let shards = Arc::new(ShardSet::open(&scan.paths).unwrap());
     let pool = IoPool::new(Arc::clone(&shards), 8).unwrap();
     let bank = Arc::new(KqBank::new(pool, &scan.cfg.moe, scan.trunk_experts(), [0, 0], 1).unwrap());
@@ -2154,24 +1184,18 @@ fn real_trunk_forward_last() {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect(),
-        None => {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/hy-v4-flash/tokenizer-cases.json");
-            let v: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-            v["cases"][1]["ids"].as_array().unwrap()[..16]
-                .iter()
-                .map(|x| x.as_u64().unwrap() as u32)
-                .collect()
-        }
+        None => fixture("tokenizer-cases.json")["cases"][1]["ids"]
+            .as_array()
+            .unwrap()[..16]
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect(),
     };
     assert_eq!(ids.len(), 16);
 
     let mut a = model.new_session(64).unwrap();
-    let all = read(
-        model
-            .forward(&mut a, &ids, RowKind::Prefill, Want::ALL, None, None)
-            .unwrap()
+    let all = read_f32(
+        fwd(&model, &mut a, &ids, RowKind::Prefill, Want::ALL)
             .logits
             .as_ref()
             .unwrap(),
@@ -2179,26 +1203,21 @@ fn real_trunk_forward_last() {
     assert!(all.iter().all(|v| v.is_finite()), "non-finite logits");
     let rows: Vec<Vec<f32>> = all.chunks(vocab).map(<[f32]>::to_vec).collect();
     let mut b2 = model.new_session(64).unwrap();
-    let last = read(
-        &model
-            .forward_last(&mut b2, &ids, RowKind::Prefill, None)
-            .unwrap(),
-    );
-    let tol = |w: f32| 2e-3 + 2e-3 * w.abs();
+    let last = fwd_last(&model, &mut b2, &ids, RowKind::Prefill);
     assert!(
         last.iter()
             .zip(&rows[15])
-            .all(|(&g, &w)| (g - w).abs() <= tol(w)),
-        "last row differs from the all-rows call"
+            .all(|(&g, &w)| (g - w).abs() <= 2e-3 + 2e-3 * w.abs())
     );
     let top1: Vec<u32> = rows
         .iter()
         .map(|r| {
             r.iter()
                 .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |m, (i, &v)| {
-                    if v > m.1 { (i, v) } else { m }
-                })
+                .fold(
+                    (0, f32::NEG_INFINITY),
+                    |m, (i, &v)| if v > m.1 { (i, v) } else { m },
+                )
                 .0 as u32
         })
         .collect();
@@ -2210,66 +1229,30 @@ fn real_trunk_forward_last() {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        assert_eq!(top1, want, "top-1 vs the stored llama.cpp rows");
+        assert_eq!(top1, want, "top-1 vs stored llama.cpp rows");
     }
     bank.end_turn().unwrap();
 }
 
-/// Circular `WindowRing` across wrapped decode steps (`> window + slack`),
-/// O(1) `truncate` rollback, and `mark` / `restore` gives bit-exact logits.
 #[test]
 fn circular_window_decode_wrap_truncate_and_restore_match_reference() {
-    let f = fixture();
-    let ids = prompt();
-    assert!(ids.len() > f.model.cfg().window + super::cache::WINDOW_SLACK);
+    let (f, ids) = (model_fixture(), prompt());
+    assert!(ids.len() > f.model.cfg().window + WINDOW_SLACK);
 
-    let mut prefill_sess = f.model.new_session(CTX).unwrap();
-    let want_prefill = read(
-        &f.model
-            .forward_last(&mut prefill_sess, &ids, RowKind::Prefill, None)
-            .unwrap(),
-    );
+    let mut pre = f.model.new_session(TINY_CTX).unwrap();
+    let want_prefill = fwd_last(&f.model, &mut pre, &ids, RowKind::Prefill);
+    let mut clean = f.model.new_session(TINY_CTX).unwrap();
+    let want_decode = decode(&f.model, &mut clean, &ids).pop().unwrap();
 
-    let mut clean_sess = f.model.new_session(CTX).unwrap();
-    let mut want_decode = Vec::new();
-    for &tok in &ids {
-        want_decode = read(
-            &f.model
-                .forward_last(&mut clean_sess, &[tok], RowKind::Decode, None)
-                .unwrap(),
-        );
-    }
-
-    // Step through single-token decode waves so sliding rings wrap around cap
-    // via in-place circular writes (StepMark::Short).
-    let mut sess = f.model.new_session(CTX).unwrap();
-    for &tok in &ids[..18] {
-        f.model
-            .forward_last(&mut sess, &[tok], RowKind::Decode, None)
-            .unwrap();
-    }
+    let mut sess = f.model.new_session(TINY_CTX).unwrap();
+    decode(&f.model, &mut sess, &ids[..18]);
     let mark = sess.mark();
-    // Append 3 speculative tokens (== WINDOW_SLACK), then truncate back to 18.
-    for &tok in &ids[18..21] {
-        f.model
-            .forward_last(&mut sess, &[tok], RowKind::Decode, None)
-            .unwrap();
-    }
+    decode(&f.model, &mut sess, &ids[18..21]);
     sess.truncate(18).unwrap();
     assert_eq!(sess.len(), 18);
 
-    let mut last = Vec::new();
-    for &tok in &ids[18..] {
-        last = read(
-            &f.model
-                .forward_last(&mut sess, &[tok], RowKind::Decode, None)
-                .unwrap(),
-        );
-    }
-    assert_eq!(
-        last, want_decode,
-        "wrapped circular ring + truncate diverged from clean decode"
-    );
+    let last = decode(&f.model, &mut sess, &ids[18..]).pop().unwrap();
+    assert_eq!(last, want_decode, "wrapped circular ring + truncate");
     assert_within(
         &[last],
         &[want_prefill],
@@ -2278,32 +1261,17 @@ fn circular_window_decode_wrap_truncate_and_restore_match_reference() {
         2e-3,
     );
 
-    // Restore mark from pos 18 and replay remaining tokens.
     sess.restore(&mark).unwrap();
-    let mut replayed = Vec::new();
-    for &tok in &ids[18..] {
-        replayed = read(
-            &f.model
-                .forward_last(&mut sess, &[tok], RowKind::Decode, None)
-                .unwrap(),
-        );
-    }
     assert_eq!(
-        replayed, want_decode,
-        "mark/restore replay diverged from clean decode"
+        decode(&f.model, &mut sess, &ids[18..]).pop().unwrap(),
+        want_decode
     );
 }
 
 #[test]
 fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
-    use super::ladder::Ladder;
-    use super::prefill::{Driver, Grid, Prefilled};
-    use super::rows::{EngramRows, PrefetchHandle};
-    use std::sync::Mutex;
-
     let mut cfg = tiny_cfg();
     cfg.context_length = 128;
-
     let head_dim = cfg.engram.head_dim;
     let total_rows = cfg
         .engram
@@ -2313,24 +1281,13 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
         .map(|(&o, &n)| o + n)
         .max()
         .unwrap();
-    let mut raw_f8 = Rng::new(77).bytes(total_rows as usize * head_dim);
-    // Clear bit 0 of 0x7F/0xFF so no byte is F8_E4M3 NaN.
-    for b in &mut raw_f8 {
-        if (*b & 0x7F) == 0x7F {
-            *b &= 0xFE;
-        }
-    }
-    let dir = std::env::temp_dir().join(format!("hy4-engram-la-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    struct DirGuard(PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _guard = DirGuard(dir.clone());
-    let path = dir.join("engram.bin");
-    std::fs::write(&path, &raw_f8).unwrap();
+    let raw_f8: Vec<u8> = Rng::new(77)
+        .bytes(total_rows as usize * head_dim)
+        .into_iter()
+        .map(|b| if (b & 0x7F) == 0x7F { b & 0xFE } else { b })
+        .collect();
+    let dir = Temp::new("engram-la");
+    let path = dir.write("engram.bin", &raw_f8);
     let loc = Located {
         shard: 0,
         data_offset: 0,
@@ -2342,7 +1299,6 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
             offset: 0,
         },
     };
-    let table = F8Table::open_at(&path, &loc, &cfg.engram).unwrap();
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Ev {
@@ -2350,18 +1306,15 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
         Take(usize),
         SyncRows(usize),
     }
-
     struct SpyRows {
         inner: F8Table,
         events: Arc<Mutex<Vec<Ev>>>,
     }
-
     impl EngramRows for SpyRows {
         fn rows(&self, layer: usize, ids: &[u32]) -> napi::Result<Vec<f32>> {
             self.events.lock().unwrap().push(Ev::SyncRows(layer));
             self.inner.rows(layer, ids)
         }
-
         fn prefetch(&self, layer: usize, ids: &[u32]) -> napi::Result<Option<PrefetchHandle>> {
             self.events
                 .lock()
@@ -2369,7 +1322,6 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
                 .push(Ev::Prefetch(layer, ids.len()));
             self.inner.prefetch(layer, ids)
         }
-
         fn take_prefetched(&self, handle: PrefetchHandle) -> napi::Result<Vec<f32>> {
             self.events.lock().unwrap().push(Ev::Take(0));
             self.inner.take_prefetched(handle)
@@ -2377,65 +1329,58 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
     }
 
     let events = Arc::new(Mutex::new(Vec::new()));
-    let make_model = |spy: Option<Arc<Mutex<Vec<Ev>>>>| -> (Model, Arc<KqBank>, Temp) {
-        let (bank, bank_dir) = tiny_bank(&cfg, 91);
-        let b = Arc::clone(&bank);
-        let weights = tiny_weights(&cfg, 19);
-        let tbl: Box<dyn EngramRows> = match spy {
-            Some(ev) => Box::new(SpyRows {
-                inner: F8Table::open_at(&path, &loc, &cfg.engram).unwrap(),
-                events: ev,
-            }),
-            None => Box::new(F8Table::open_at(&path, &loc, &cfg.engram).unwrap()),
-        };
-        let model = Model::new(
-            cfg.clone(),
-            Box::new(weights),
-            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
-            tbl,
-        )
-        .unwrap();
-        (model, bank, bank_dir)
+    let shard = ShardRig::new(cfg.clone(), 0, 91);
+    let opts = TinyWeightsOpts {
+        seed: 19,
+        ..Default::default()
     };
-    drop(table);
+    let bk = BankKind::Streamed {
+        cache: [4, 4],
+        staging: 1,
+    };
+    let la_rig = shard.model(
+        bk,
+        opts,
+        Box::new(SpyRows {
+            inner: F8Table::open_at(&path, &loc, &cfg.engram).unwrap(),
+            events: Arc::clone(&events),
+        }),
+    );
+    let ref_rig = shard.model(
+        BankKind::Streamed {
+            cache: [4, 4],
+            staging: 1,
+        },
+        opts,
+        Box::new(F8Table::open_at(&path, &loc, &cfg.engram).unwrap()),
+    );
+    let ids = Rng::new(123).ids(96, TINY_V);
 
-    let (model_la, bank_la, _bank_dir_la) = make_model(Some(Arc::clone(&events)));
-    let (model_ref, bank_ref, _bank_dir_ref) = make_model(None);
-    let ids = Rng::new(123).ids(96);
-
-    // Reference: manual chunked prefill without Driver lookahead (same 32-token chunks).
-    let mut ref_sess = model_ref.new_session(128).unwrap();
+    let mut ref_sess = ref_rig.model.new_session(128).unwrap();
     let mut ref_out = None;
     for chunk in ids.chunks(32) {
-        ref_out = Some(
-            model_ref
-                .forward(
-                    &mut ref_sess,
-                    chunk,
-                    RowKind::Prefill,
-                    Want::LAST,
-                    None,
-                    None,
-                )
-                .unwrap(),
-        );
+        ref_out = Some(fwd(
+            &ref_rig.model,
+            &mut ref_sess,
+            chunk,
+            RowKind::Prefill,
+            Want::LAST,
+        ));
     }
-    let want_bits: Vec<u32> = read(ref_out.unwrap().logits.as_ref().unwrap())
-        .into_iter()
-        .map(f32::to_bits)
-        .collect();
+    let want_bits = read_bits(ref_out.unwrap().logits.as_ref().unwrap());
 
-    // Driver multi-chunk prefill (3 chunks of 32 tokens) with lookahead active.
     let grid = Grid::new(32, Vec::new()).unwrap();
     let driver = Driver {
-        runner: &model_la,
+        runner: &la_rig.model,
         grid: &grid,
         hidden: false,
     };
-    let mut sess = model_la.new_session(128).unwrap();
-    let mut ladder = Ladder::new();
-    let mut ran_chunks = Vec::new();
-    let prefilled = driver
+    let (mut sess, mut ladder, mut ran) = (
+        la_rig.model.new_session(128).unwrap(),
+        Ladder::new(),
+        Vec::new(),
+    );
+    let Prefilled::Done { out, .. } = driver
         .prefill(
             &mut sess,
             &mut ladder,
@@ -2443,57 +1388,47 @@ fn cross_chunk_engram_lookahead_bit_exact_and_prefetches_next_chunk() {
             &ids,
             &|_| false,
             &mut |r, _| {
-                ran_chunks.push(r);
+                ran.push(r);
                 Ok(())
             },
         )
-        .unwrap();
-    let Prefilled::Done { out, .. } = prefilled else {
+        .unwrap()
+    else {
         panic!("expected Prefilled::Done");
     };
-    assert_eq!(ran_chunks, vec![0..32, 32..64, 64..96]);
-    let got_bits: Vec<u32> = read(out.logits.as_ref().unwrap())
-        .into_iter()
-        .map(f32::to_bits)
-        .collect();
+    assert_eq!(ran, vec![0..32, 32..64, 64..96]);
     assert_eq!(
-        got_bits, want_bits,
-        "lookahead multi-chunk prefill must be bit-exact vs manual chunks"
+        read_bits(out.logits.as_ref().unwrap()),
+        want_bits,
+        "lookahead vs manual chunks"
     );
 
-    // Verify cross-chunk interleaving: chunk 1's prefetch fires right after chunk 0's take,
-    // and chunk 2's prefetch fires right after chunk 1's take (zero sync fallbacks, no duplicates).
     let n_cols = cfg.engram.n_cols();
-    let log = events.lock().unwrap().clone();
+    let pf = Ev::Prefetch(0, 32 * n_cols);
     assert_eq!(
-        log,
+        *events.lock().unwrap(),
         vec![
-            Ev::Prefetch(0, 32 * n_cols),
+            pf.clone(),
             Ev::Take(0),
-            Ev::Prefetch(0, 32 * n_cols),
+            pf.clone(),
             Ev::Take(0),
-            Ev::Prefetch(0, 32 * n_cols),
-            Ev::Take(0),
-        ],
-        "expected prefetch(c0)->take(c0)->prefetch(c1)->take(c1)->prefetch(c2)->take(c2)"
+            pf,
+            Ev::Take(0)
+        ]
     );
-    assert!(!model_la.has_prefill_engram(&ids, 0));
+    assert!(!la_rig.model.has_prefill_engram(&ids, 0));
 
-    // Cancelling during chunk 0 after layer 1 drops chunk 1's prefetched handle cleanly.
-    let mut cancel_sess = model_la.new_session(128).unwrap();
-    let mut cancel_ladder = Ladder::new();
+    let (mut cs, mut cl) = (la_rig.model.new_session(128).unwrap(), Ladder::new());
     let res = driver
         .prefill(
-            &mut cancel_sess,
-            &mut cancel_ladder,
+            &mut cs,
+            &mut cl,
             None,
             &ids,
-            &|layer| layer >= 2,
+            &|l| l >= 2,
             &mut |_, _| Ok(()),
         )
         .unwrap();
     assert!(matches!(res, Prefilled::Cancelled { at: 0 }));
-    assert!(!model_la.has_prefill_engram(&ids, 32));
-    bank_la.end_turn().unwrap();
-    bank_ref.end_turn().unwrap();
+    assert!(!la_rig.model.has_prefill_engram(&ids, 32));
 }

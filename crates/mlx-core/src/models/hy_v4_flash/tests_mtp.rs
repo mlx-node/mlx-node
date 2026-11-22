@@ -1,74 +1,68 @@
-//! MTP head: held sizes against `mtp-tensors.json`, the prefill lag
-//! schedule, a lens model of the stepper's lengths over whole cycles at
-//! depth 1..3, the K/V buffer and seeds; real (`HY4_DIR`): the held layer
-//! size and a greedy MTP turn against the AR turn.
+//! MTP head: held sizes against `mtp-tensors.json`, prefill lag schedule,
+//! cycle lens model at depth 1..3, K/V buffer & seeds, batched drafting,
+//! draft head modes, and real-weight parity (`HY4_DIR`).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
 use super::cache::WINDOW_SLACK;
-use super::mtp::{KvRows, Lag, SEEDS, Seeds, lag};
-use super::mtp_weights::{Held, held, held_bytes};
+use super::mtp::{
+    Draft, KvRows, Lag, MtpHeadMode, MtpLayer, SEEDS, Seeds, lag, parse_mtp_head_mode,
+    with_mtp_head,
+};
+use super::mtp_weights::{
+    Held, MtpDenseMode, held, held_bytes, parse_mtp_dense_mode, with_mtp_dense,
+};
 use super::spec::{LOOKAHEAD_MAX, commit_row, cycle_rows, unemitted_keep, verify_keep};
-use crate::array::MxArray;
+use super::stats::{self, DeferScope};
+use super::test_support::{
+    MiniMtpFixture, Rng, arr, fixture, hy4_dir, j_u64, j_u64s, mini_mtp_cfg, mini_mtp_fixture,
+    mini_mtp_weights, read_bits, read_f32,
+};
+use super::weights::Dense;
+use crate::array::{DType, MxArray};
 use crate::engine::types::ChatConfig;
 use crate::models::qwen3_5::mtp_decode::MtpCommitAnchor;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
-fn fixture() -> Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hy-v4-flash/mtp-tensors.json");
-    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-}
-
 fn info(t: &Value) -> GgufTensorInfo {
-    let dims: Vec<u64> = t["ggml_dims"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_u64().unwrap())
-        .collect();
+    let dims = j_u64s(&t["ggml_dims"]);
+    let tensor_type = match t["type"].as_str().unwrap() {
+        "BF16" => GgufTensorType::BF16,
+        "F32" => GgufTensorType::F32,
+        other => panic!("unexpected type {other}"),
+    };
     GgufTensorInfo {
-        name: t["name"].as_str().unwrap().to_string(),
+        name: t["name"].as_str().unwrap().into(),
         n_dims: dims.len() as u32,
         dims,
-        tensor_type: match t["type"].as_str().unwrap() {
-            "BF16" => GgufTensorType::BF16,
-            "F32" => GgufTensorType::F32,
-            other => panic!("unexpected type {other}"),
-        },
+        tensor_type,
         offset: 0,
     }
 }
 
 #[test]
 fn held_bytes_match_the_fixture() {
-    use super::mtp_weights::{MtpDenseMode, parse_mtp_dense_mode, with_mtp_dense};
-
-    assert_eq!(parse_mtp_dense_mode(None).unwrap(), MtpDenseMode::SymQ8);
-    assert_eq!(parse_mtp_dense_mode(Some("")).unwrap(), MtpDenseMode::SymQ8);
-    assert_eq!(
-        parse_mtp_dense_mode(Some("symq8")).unwrap(),
-        MtpDenseMode::SymQ8
-    );
-    assert_eq!(parse_mtp_dense_mode(Some("q4")).unwrap(), MtpDenseMode::Q4);
-    assert_eq!(
-        parse_mtp_dense_mode(Some(" Q4 ")).unwrap(),
-        MtpDenseMode::Q4
-    );
+    for (raw, want) in [
+        (None, MtpDenseMode::SymQ8),
+        (Some(""), MtpDenseMode::SymQ8),
+        (Some("symq8"), MtpDenseMode::SymQ8),
+        (Some("q4"), MtpDenseMode::Q4),
+        (Some(" Q4 "), MtpDenseMode::Q4),
+    ] {
+        assert_eq!(parse_mtp_dense_mode(raw).unwrap(), want, "{raw:?}");
+    }
     assert!(parse_mtp_dense_mode(Some("bf16")).is_err());
 
-    let f = fixture();
+    let f = fixture("mtp-tensors.json");
+    let tensors = f["tensors"].as_array().unwrap();
     with_mtp_dense(MtpDenseMode::SymQ8, || {
-        let mut total = 0u64;
-        let mut experts = 0u64;
-        for t in f["tensors"].as_array().unwrap() {
-            let expert = t["category"] == "routed_expert";
-            let i = info(t);
-            let want = t["plan_form"]["bytes"].as_u64().unwrap();
+        let (mut total, mut experts) = (0u64, 0u64);
+        for t in tensors {
+            let (expert, i) = (t["category"] == "routed_expert", info(t));
+            let want = j_u64(&t["plan_form"]["bytes"]);
             assert_eq!(held_bytes(&i, expert).unwrap(), want, "{}", i.name);
             let form = match held(&i, expert).unwrap() {
                 Held::SymQ8 => "symq8_g32_f16_scale",
@@ -81,57 +75,51 @@ fn held_bytes_match_the_fixture() {
                 experts += want;
             }
         }
-        assert_eq!(total, f["totals"]["plan_bytes"].as_u64().unwrap());
-        assert_eq!(
-            experts,
-            f["totals"]["routed_expert_plan_bytes"].as_u64().unwrap()
-        );
+        assert_eq!(total, j_u64(&f["totals"]["plan_bytes"]));
+        assert_eq!(experts, j_u64(&f["totals"]["routed_expert_plan_bytes"]));
     });
 
     with_mtp_dense(MtpDenseMode::Q4, || {
         let mut q4_non_expert = 0u64;
-        for t in f["tensors"].as_array().unwrap() {
-            let expert = t["category"] == "routed_expert";
-            let i = info(t);
-            let n = i.num_elements().unwrap();
-            let got = held(&i, expert).unwrap();
-            let got_b = held_bytes(&i, expert).unwrap();
+        for t in tensors {
+            let (expert, i) = (t["category"] == "routed_expert", info(t));
+            let (n, got, got_b) = (
+                i.num_elements().unwrap(),
+                held(&i, expert).unwrap(),
+                held_bytes(&i, expert).unwrap(),
+            );
             if expert {
                 assert_eq!(got, Held::Affine4, "{}", i.name);
             } else if t["plan_form"]["form"] == "symq8_g32_f16_scale" {
-                assert_eq!(got, Held::Affine4, "{}", i.name);
-                assert_eq!(got_b, n / 2 + n / 16, "{}", i.name);
+                assert_eq!((got, got_b), (Held::Affine4, n / 2 + n / 16), "{}", i.name);
                 q4_non_expert += got_b;
             } else {
-                assert_eq!(got, Held::F32, "{}", i.name);
                 assert_eq!(
-                    got_b,
-                    t["plan_form"]["bytes"].as_u64().unwrap(),
+                    (got, got_b),
+                    (Held::F32, j_u64(&t["plan_form"]["bytes"])),
                     "{}",
                     i.name
                 );
                 q4_non_expert += got_b;
             }
         }
-        let sym_non_expert = f["totals"]["non_expert_plan_bytes"].as_u64().unwrap();
+        let sym_non_expert = j_u64(&f["totals"]["non_expert_plan_bytes"]);
         assert!(
             q4_non_expert + 50_000_000 < sym_non_expert,
-            "Q4 non-expert {q4_non_expert} should save >50 MB vs SymQ8 {sym_non_expert}"
+            "Q4 {q4_non_expert} vs {sym_non_expert}"
         );
     });
 }
 
 #[test]
 fn held_refuses_types_the_layer_does_not_use() {
-    let mut i = info(&fixture()["tensors"][0]);
+    let mut i = info(&fixture("mtp-tensors.json")["tensors"][0]);
     i.tensor_type = GgufTensorType::Q8_0;
     assert!(held(&i, false).is_err());
     i.tensor_type = GgufTensorType::F32;
     assert!(held(&i, true).is_err());
 }
 
-/// Every MTP row `p` pairs trunk output `p` with token `p + 1`, exactly
-/// once and in order, however the prompt is cut into chunks.
 #[test]
 fn lag_rows_pair_each_trunk_row_with_the_next_token() {
     assert_eq!(
@@ -158,15 +146,11 @@ fn lag_rows_pair_each_trunk_row_with_the_next_token() {
         vec![2048, 2048, 7],
         vec![32, 1, 31, 64],
     ] {
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        let mut start = 0;
-        for n in &cuts {
-            let l = lag(start, *n);
+        let (mut pairs, mut start) = (Vec::new(), 0);
+        for &n in &cuts {
+            let l = lag(start, n);
             assert_eq!(l.at, pairs.len(), "cuts {cuts:?}");
-            let mut hidden: Vec<usize> = Vec::new();
-            if l.seed {
-                hidden.push(start - 1);
-            }
+            let mut hidden: Vec<usize> = l.seed.then(|| start - 1).into_iter().collect();
             hidden.extend(start..start + n - 1);
             let ids: Vec<usize> = (start..start + n).skip(n - l.rows).collect();
             assert_eq!(hidden.len(), l.rows);
@@ -178,29 +162,24 @@ fn lag_rows_pair_each_trunk_row_with_the_next_token() {
     }
 }
 
-/// A draft row: `Some((hidden position, token position))` for an exact
-/// pair, `None` for a draft.
-type Row = Option<(usize, usize)>;
-
 /// The stepper's lengths through `run_mtp_cycle`'s calls.
 struct Lens {
     trunk: usize,
-    rows: Vec<Row>,
+    rows: Vec<Option<(usize, usize)>>,
     committed: usize,
     snap: usize,
 }
 
 impl Lens {
-    /// A settled sequence after a prompt of `t` tokens.
     fn new(t: usize) -> Self {
+        let rows = (0..t - 1).map(|p| Some((p, p + 1))).collect();
         Self {
             trunk: t,
-            rows: (0..t - 1).map(|p| Some((p, p + 1))).collect(),
+            rows,
             committed: t - 1,
             snap: 0,
         }
     }
-
     fn step_a(&mut self) {
         assert_eq!(self.rows.len(), self.committed);
         if self.rows.len() + 1 == self.trunk {
@@ -210,51 +189,33 @@ impl Lens {
         self.trunk += 1;
         self.committed = self.rows.len();
     }
-
     fn cut(&mut self, keep: usize) {
-        assert!(keep <= self.rows.len());
-        assert!(self.rows.len() - keep <= WINDOW_SLACK);
+        assert!(keep <= self.rows.len() && self.rows.len() - keep <= WINDOW_SLACK);
         self.rows.truncate(keep);
     }
-
     fn cycle(&mut self, depth: usize, accepted: usize, chained: bool) {
-        assert!(accepted <= depth);
+        assert!(accepted <= depth && depth < LOOKAHEAD_MAX);
         self.cut(cycle_rows(self.committed, chained).unwrap());
-        assert_eq!(
-            self.rows.len() + 1,
-            self.trunk,
-            "first draft row is trunk - 1"
-        );
+        assert_eq!(self.rows.len() + 1, self.trunk);
         self.rows.push(Some((self.trunk - 1, self.trunk)));
-        for _ in 1..depth {
-            self.rows.push(None);
-        }
+        self.rows.extend(std::iter::repeat_n(None, depth - 1));
         self.snap = self.trunk;
-        assert!(depth < LOOKAHEAD_MAX);
         self.trunk += depth + 1;
-        let anchor = if chained {
-            MtpCommitAnchor::SkipAlreadyCommittedAnchor
+        let (anchor, m) = if chained {
+            (MtpCommitAnchor::SkipAlreadyCommittedAnchor, accepted + 1)
         } else {
-            MtpCommitAnchor::IncludeAnchor
-        };
-        let m = match anchor {
-            MtpCommitAnchor::IncludeAnchor => accepted + 2,
-            MtpCommitAnchor::SkipAlreadyCommittedAnchor => accepted + 1,
+            (MtpCommitAnchor::IncludeAnchor, accepted + 2)
         };
         let at = commit_row(anchor, self.snap).unwrap();
         assert_eq!(at, self.committed);
         self.cut(at);
-        // the hiddens of rows at.. are the seed (Step A) or verify rows
-        for i in 0..m {
-            self.rows.push(Some((at + i, at + i + 1)));
-        }
+        self.rows.extend((0..m).map(|i| Some((at + i, at + i + 1))));
         self.committed = self.rows.len();
         let keep = verify_keep(self.snap, accepted);
         assert!(self.trunk - keep <= WINDOW_SLACK);
         self.trunk = keep;
         self.check(self.trunk);
     }
-
     fn unemitted(&mut self, u: usize) {
         self.trunk = unemitted_keep(self.trunk, u);
         let keep = self.rows.len().min(self.trunk - 1);
@@ -262,26 +223,18 @@ impl Lens {
         self.committed = keep;
         self.check(self.trunk - 1);
     }
-
     fn settle(&mut self) {
-        let keep = self.rows.len().min(self.trunk - 1);
-        self.rows.truncate(keep);
+        self.rows.truncate(self.rows.len().min(self.trunk - 1));
         self.check(self.trunk - 1);
     }
-
-    /// `len` rows, each the exact pair of its own position.
     fn check(&self, len: usize) {
         assert_eq!(self.rows.len(), len);
-        for (p, r) in self.rows.iter().enumerate() {
-            assert_eq!(*r, Some((p, p + 1)), "row {p} of {:?}", self.rows);
+        for (p, &r) in self.rows.iter().enumerate() {
+            assert_eq!(r, Some((p, p + 1)), "row {p}");
         }
     }
 }
 
-/// Step-A and chained cycles at depth 1..3 with every accept count, a
-/// near-tail skip (two Step A in a row) and a mid-cycle stop: the draft
-/// rows stay the exact pairs of their positions and every cut stays
-/// within the slack.
 #[test]
 fn lens_model_keeps_exact_rows_through_cycles() {
     for depth in 1..=3 {
@@ -312,8 +265,7 @@ fn lens_model_keeps_exact_rows_through_cycles() {
 fn trunk_cuts_fit_the_slack() {
     for depth in 1..=3 {
         for k in 0..=depth {
-            let snap = 100;
-            assert!(snap + depth + 1 - verify_keep(snap, k) <= WINDOW_SLACK);
+            assert!(100 + depth + 1 - verify_keep(100, k) <= WINDOW_SLACK);
         }
         for u in 1..=depth {
             assert!(100 - unemitted_keep(100, u) <= WINDOW_SLACK);
@@ -325,37 +277,27 @@ fn trunk_cuts_fit_the_slack() {
 
 fn rows(n: usize, from: usize) -> MxArray {
     let v: Vec<f32> = (from * 4..(from + n) * 4).map(|x| x as f32).collect();
-    MxArray::from_float32(&v, &[n as i64, 4]).unwrap()
+    arr(&v, &[n, 4])
 }
-
 fn read(x: &MxArray, n: usize) -> Vec<f32> {
-    x.slice(&[0, 0], &[n as i64, 4])
-        .unwrap()
-        .astype(crate::array::DType::Float32)
-        .unwrap()
-        .to_float32()
-        .unwrap()
-        .to_vec()
+    read_f32(&x.slice(&[0, 0], &[n as i64, 4]).unwrap())
+}
+fn kv_bits(x: &MxArray, n: usize) -> Vec<u32> {
+    read_bits(&x.slice(&[0, 0], &[n as i64, 4]).unwrap())
 }
 
-/// Writes past the buffer move the rows to one of twice the rows (a
-/// multiple of 32, at most the cap) and read back in order; a draft read is the buffer itself; a
-/// rollback rewrites in place; a deep cut shrinks it and a cut to 0 frees it.
 #[test]
 fn kv_rows_grow_cut_and_rewrite() {
     let mut b = KvRows::new(4, 300);
-    let mut caps = Vec::new();
-    let mut at = 0;
+    let (mut caps, mut at) = (Vec::new(), 0);
     for n in [1, 31, 40, 5, 200] {
         b.write(&rows(n, at), at).unwrap();
         at += n;
         caps.push(b.capacity());
     }
-    assert_eq!(caps, vec![32, 32, 96, 96, 288]);
-    assert_eq!(b.len(), at);
+    assert_eq!((caps, b.len()), (vec![32, 32, 96, 96, 288], at));
     assert_eq!(read(b.rows().unwrap(), at), read(&rows(at, 0), at));
-    assert!(b.write(&rows(24, at), at).is_err());
-    assert_eq!(b.len(), at);
+    assert!(b.write(&rows(24, at), at).is_err() && b.len() == at);
 
     b.truncate(at - 3).unwrap();
     assert_eq!(b.capacity(), 288);
@@ -365,21 +307,21 @@ fn kv_rows_grow_cut_and_rewrite() {
     b.truncate(70).unwrap();
     assert_eq!(b.capacity(), 288);
     b.truncate(40).unwrap();
-    assert_eq!(b.capacity(), 128);
-    assert_eq!(b.rows().unwrap().shape_at(0).unwrap(), 128);
+    assert_eq!(
+        (b.capacity(), b.rows().unwrap().shape_at(0).unwrap()),
+        (128, 128)
+    );
     b.write(&rows(3, 40), 40).unwrap();
     assert_eq!(read(b.rows().unwrap(), 43), read(&rows(43, 0), 43));
     b.truncate(0).unwrap();
     assert_eq!((b.capacity(), b.nbytes()), (0, 0));
-    assert!(b.rows().is_err());
-    assert!(b.write(&rows(1, 0), 1).is_err());
+    assert!(b.rows().is_err() && b.write(&rows(1, 0), 1).is_err());
 }
 
 #[test]
 fn seeds_keep_the_last_rows_by_position() {
-    let h = rows(12, 0);
     let mut s = Seeds::default();
-    s.extend(Seeds::copies(&h, 100).unwrap());
+    s.extend(Seeds::copies(&rows(12, 0), 100).unwrap());
     assert!(s.get(100 + 12 - SEEDS - 1).is_none());
     assert_eq!(read(s.get(111).unwrap(), 1), read(&rows(1, 11), 1));
     s.cut(110);
@@ -390,385 +332,166 @@ fn seeds_keep_the_last_rows_by_position() {
 
 #[test]
 fn kv_rows_and_seeds_defer_in_scope_and_stay_bit_identical_after_rollback() {
-    use super::stats::{self, DeferScope};
-
-    let kv_bits =
-        |x: &MxArray, n: usize| -> Vec<u32> { read(x, n).into_iter().map(f32::to_bits).collect() };
-
     let mut kv = KvRows::new(4, 128);
-    // Initial write outside DeferScope performs the synchronous buffer resize.
     kv.write(&rows(4, 0), 0).unwrap();
-
     let mut seeds = Seeds::default();
-    let want_kv = kv_bits(&rows(7, 0), 7);
-    let want_seed_10 = kv_bits(&rows(1, 10), 1);
-    let want_seed_11 = kv_bits(&rows(1, 11), 1);
+    let (want_kv, want_10, want_11) = (
+        kv_bits(&rows(7, 0), 7),
+        kv_bits(&rows(1, 10), 1),
+        kv_bits(&rows(1, 11), 1),
+    );
+    let check = |kv: &KvRows, seeds: &Seeds| {
+        assert_eq!(kv_bits(kv.rows().unwrap(), 7), want_kv);
+        assert_eq!(kv_bits(seeds.get(10).unwrap(), 1), want_10);
+        assert_eq!(kv_bits(seeds.get(11).unwrap(), 1), want_11);
+    };
 
-    {
-        let _scope = DeferScope::enter();
-        assert_eq!(stats::deferred(), 0);
-        let evals_before = stats::thread_evals();
+    for (seed_n, seed_from, do_rollback) in [(4usize, 8usize, true), (2, 10, false)] {
+        {
+            let _scope = DeferScope::enter();
+            let ev = stats::thread_evals();
+            kv.write(&rows(3, 4), 4).unwrap();
+            assert_eq!((stats::deferred(), stats::thread_evals()), (1, ev));
+            let copied = Seeds::copies(&rows(seed_n, seed_from), seed_from).unwrap();
+            assert_eq!(copied.len(), seed_n);
+            assert_eq!((stats::deferred(), stats::thread_evals()), (1 + seed_n, ev));
+            seeds.extend(copied);
+            stats::flush("test mtp defer").unwrap();
+            assert_eq!((stats::deferred(), stats::thread_evals()), (0, ev + 1));
+        }
+        check(&kv, &seeds);
+        if do_rollback {
+            {
+                let _scope = DeferScope::enter();
+                kv.write(&rows(2, 7).mul_scalar(99.0).unwrap(), 7).unwrap();
+                assert_eq!(stats::deferred(), 1);
+                kv.truncate(4).unwrap();
+            }
+            assert_eq!(stats::deferred(), 0);
+            seeds.cut(10);
+        }
+    }
+}
 
-        kv.write(&rows(3, 4), 4).unwrap();
-        assert_eq!(stats::deferred(), 1);
-        assert_eq!(stats::thread_evals(), evals_before);
+struct DraftRig(MiniMtpFixture);
 
-        let copied = Seeds::copies(&rows(4, 8), 8).unwrap();
-        assert_eq!(copied.len(), 4);
-        assert_eq!(stats::deferred(), 1 + copied.len());
-        assert_eq!(stats::thread_evals(), evals_before);
-        seeds.extend(copied);
-
-        stats::flush("test mtp defer flush").unwrap();
-        assert_eq!(stats::deferred(), 0);
-        assert_eq!(stats::thread_evals(), evals_before + 1);
+impl DraftRig {
+    fn init_pair(
+        &self,
+        r: &mut Rng,
+        hist_lens: &[usize],
+    ) -> (Vec<Draft>, Vec<Draft>, Vec<MxArray>, Vec<u32>) {
+        let (v, d, ctx) = (
+            self.0.cfg.vocab_size,
+            self.0.cfg.dim,
+            self.0.cfg.context_length,
+        );
+        let mut a: Vec<Draft> = (0..hist_lens.len())
+            .map(|_| self.0.mtp.new_draft(ctx))
+            .collect();
+        let mut b: Vec<Draft> = (0..hist_lens.len())
+            .map(|_| self.0.mtp.new_draft(ctx))
+            .collect();
+        let (mut seeds_h, mut anchors) = (Vec::new(), Vec::new());
+        for (i, &hl) in hist_lens.iter().enumerate() {
+            let (hh, hids) = (arr(&r.vec_f32(hl * d, 1.0), &[hl, d]), r.ids(hl, v));
+            self.0
+                .mtp
+                .commit(&self.0.model, &mut a[i], &hh, &hids)
+                .unwrap();
+            self.0
+                .mtp
+                .commit(&self.0.model, &mut b[i], &hh, &hids)
+                .unwrap();
+            seeds_h.push(arr(&r.vec_f32(d, 1.0), &[1, d]));
+            anchors.push(r.ids(1, v)[0]);
+        }
+        (a, b, seeds_h, anchors)
     }
 
-    assert_eq!(kv_bits(kv.rows().unwrap(), 7), want_kv);
-    assert_eq!(kv_bits(seeds.get(10).unwrap(), 1), want_seed_10);
-    assert_eq!(kv_bits(seeds.get(11).unwrap(), 1), want_seed_11);
-
-    // An unflushed scope clears deferred arrays on drop; rollback + rewrite stays bit-identical.
-    {
-        let _scope = DeferScope::enter();
-        kv.write(&rows(2, 7).mul_scalar(99.0).unwrap(), 7).unwrap();
-        assert_eq!(stats::deferred(), 1);
-        kv.truncate(4).unwrap();
+    fn run_batched(
+        &self,
+        drafts: &mut [Draft],
+        seeds_h: &[MxArray],
+        anchors: &[u32],
+        depths: &[usize],
+        skip_last: Option<bool>,
+    ) -> (Vec<Vec<u32>>, u64) {
+        let (n, d) = (drafts.len(), self.0.cfg.dim as i64);
+        let max_depth = depths.iter().copied().max().unwrap_or(0);
+        let mut hs = seeds_h.to_vec();
+        let mut ts: Vec<MxArray> = anchors
+            .iter()
+            .map(|&t| MxArray::from_uint32(&[t], &[1]).unwrap())
+            .collect();
+        let mut step_toks = Vec::with_capacity(max_depth);
+        let ev0 = stats::thread_evals();
+        {
+            let _scope = DeferScope::enter();
+            for step in 0..max_depth {
+                let active: Vec<usize> = (0..n).filter(|&i| step < depths[i]).collect();
+                let cat = |xs: Vec<&MxArray>| {
+                    if xs.len() == 1 {
+                        xs[0].clone()
+                    } else {
+                        MxArray::concatenate_many(xs, Some(0)).unwrap()
+                    }
+                };
+                let hb = cat(active.iter().map(|&i| &hs[i]).collect());
+                let tb = cat(active.iter().map(|&i| &ts[i]).collect());
+                let eb = self.0.model.weights().token_embd().rows(&tb).unwrap();
+                let mut lanes: Vec<&mut Draft> = drafts
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|&(i, _)| step < depths[i])
+                    .map(|(_, d)| d)
+                    .collect();
+                let (h_next, logits) = match skip_last {
+                    None => self
+                        .0
+                        .mtp
+                        .draft_batch(&self.0.model, &mut lanes, &hb, &eb)
+                        .unwrap(),
+                    Some(skip) => {
+                        let p: Vec<bool> = active
+                            .iter()
+                            .map(|&i| !skip || step + 1 < depths[i])
+                            .collect();
+                        self.0
+                            .mtp
+                            .draft_batch_with_persist(&self.0.model, &mut lanes, &hb, &eb, &p)
+                            .unwrap()
+                    }
+                };
+                let next_ids = logits.argmax(-1, Some(false)).unwrap();
+                for (k, &lane) in active.iter().enumerate() {
+                    let lo = k as i64;
+                    hs[lane] = h_next.slice(&[lo, 0], &[lo + 1, d]).unwrap();
+                    ts[lane] = next_ids.slice(&[lo], &[lo + 1]).unwrap();
+                }
+                step_toks.push((active, next_ids));
+            }
+            let refs: Vec<&MxArray> = step_toks.iter().map(|(_, t)| t).collect();
+            stats::eval(&refs, "test mtp draft_batch").unwrap();
+        }
+        let evals = stats::thread_evals() - ev0;
+        let mut out = vec![Vec::new(); n];
+        for (active, ids) in &step_toks {
+            let vals = ids.to_int32().unwrap();
+            for (k, &lane) in active.iter().enumerate() {
+                out[lane].push(vals[k] as u32);
+            }
+        }
+        (out, evals)
     }
-    assert_eq!(stats::deferred(), 0);
-    seeds.cut(10);
-
-    {
-        let _scope = DeferScope::enter();
-        let evals_before = stats::thread_evals();
-        kv.write(&rows(3, 4), 4).unwrap();
-        let copied = Seeds::copies(&rows(2, 10), 10).unwrap();
-        assert_eq!(stats::deferred(), 1 + copied.len());
-        assert_eq!(stats::thread_evals(), evals_before);
-        seeds.extend(copied);
-        stats::flush("test mtp rollback rewrite").unwrap();
-        assert_eq!(stats::deferred(), 0);
-        assert_eq!(stats::thread_evals(), evals_before + 1);
-    }
-
-    assert_eq!(kv_bits(kv.rows().unwrap(), 7), want_kv);
-    assert_eq!(kv_bits(seeds.get(10).unwrap(), 1), want_seed_10);
-    assert_eq!(kv_bits(seeds.get(11).unwrap(), 1), want_seed_11);
 }
 
 #[test]
 fn mtp_draft_batch_matches_serial_multi_lane_multi_depth() {
-    use super::config::{
-        Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
-    };
-    use super::model::{Model, TrunkWeights};
-    use super::moe::{AffineExperts, AffineProj};
-    use super::mtp::{Draft, MtpLayer};
-    use super::mtp_weights::{EXPERT_BITS, EXPERT_GROUP, MtpWeights};
-    use super::rows::ResidentF8Table;
-    use super::stats::{self, DeferScope};
-    use super::weights::{
-        AttnWeights, Dense, Ffn, HcWeights, IndexerWeights, LayerWeights, MoeWeights, NextnWeights,
-        Residual,
-    };
-    use crate::array::DType;
-    use crate::cache_limit::coordinator;
-    use crate::models::deepseek_v41::EngramConfig;
-
     crate::models::hy_v4_flash::exact_f32();
-
-    const V: usize = 96;
-    const D: usize = 32;
-    const HC: usize = 4;
-    const Q_LORA: usize = 16;
-    const KV_LORA: usize = 16;
-    const NOPE: usize = 8;
-    const ROPE: usize = 8;
-    const HEAD_V: usize = 12;
-    const N_HEADS: usize = 2;
-    const IDX_HEADS: usize = 2;
-    const IDX_DIM: usize = 16;
-    const DENSE_FF: usize = 40;
-    const SHARED_FF: usize = 24;
-    const E: usize = 8;
-    const MOE_FF: usize = 128;
-    const MOE_LATENT: usize = 64;
-    const CTX: usize = 64;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn step(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn next(&mut self) -> f32 {
-            ((self.step() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-        }
-        fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-            (0..n).map(|_| self.next() * scale).collect()
-        }
-        fn ids(&mut self, n: usize) -> Vec<u32> {
-            (0..n).map(|_| (self.step() % V as u64) as u32).collect()
-        }
-    }
-    fn arr(v: &[f32], shape: &[usize]) -> MxArray {
-        let s: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-        MxArray::from_float32(v, &s).unwrap()
-    }
-    fn mat(r: &mut Rng, rows: usize, cols: usize) -> Dense {
-        Dense::Array(arr(
-            &r.vec(rows * cols, 1.5 / (cols as f32).sqrt()),
-            &[rows, cols],
-        ))
-    }
-    fn norm(r: &mut Rng, n: usize) -> MxArray {
-        let v: Vec<f32> = r.vec(n, 0.4).into_iter().map(|x| 1.0 + x).collect();
-        arr(&v, &[n])
-    }
-    fn small(r: &mut Rng, shape: &[usize], scale: f32) -> MxArray {
-        arr(&r.vec(shape.iter().product(), scale), shape)
-    }
-    fn hc_w(r: &mut Rng, rows: usize, scales: usize) -> HcWeights {
-        HcWeights {
-            weight: small(r, &[rows, HC * D], 0.5 / ((HC * D) as f32).sqrt()),
-            base: small(r, &[rows], 0.5),
-            scale: small(r, &[scales], 1.0),
-        }
-    }
-    fn attn_w(r: &mut Rng) -> AttnWeights {
-        AttnWeights {
-            norm: norm(r, D),
-            sinks: small(r, &[N_HEADS], 1.0),
-            q_a: mat(r, Q_LORA, D),
-            q_a_norm: norm(r, Q_LORA),
-            q_b: mat(r, N_HEADS * (NOPE + ROPE), Q_LORA),
-            kv_a: mat(r, KV_LORA + ROPE, D),
-            kv_a_norm: norm(r, KV_LORA),
-            k_b: mat(r, N_HEADS * KV_LORA, NOPE),
-            v_b: mat(r, N_HEADS * HEAD_V, KV_LORA),
-            output: mat(r, D, N_HEADS * HEAD_V),
-            gate: mat(r, N_HEADS * HEAD_V, D),
-            post_norm: norm(r, D),
-            q_kv: None,
-            q_kv_gate: None,
-        }
-    }
-    fn idx_w(r: &mut Rng) -> IndexerWeights {
-        IndexerWeights {
-            attn_k: mat(r, IDX_DIM, D),
-            k_norm: norm(r, IDX_DIM),
-            q_b: mat(r, IDX_HEADS * IDX_DIM, Q_LORA),
-            proj: mat(r, IDX_HEADS, D),
-            compressor_value: small(r, &[IDX_DIM, IDX_DIM], 0.25),
-            compressor_gate: small(r, &[IDX_DIM, IDX_DIM], 0.25),
-            compressor_ape: small(r, &[4, IDX_DIM], 0.5),
-            compressor_norm: norm(r, IDX_DIM),
-        }
-    }
-
-    struct MiniTrunk {
-        token_embd: Dense,
-        output: Dense,
-        output_norm: MxArray,
-        output_hc: HcWeights,
-        layers: Vec<LayerWeights>,
-    }
-    impl TrunkWeights for MiniTrunk {
-        fn token_embd(&self) -> &Dense {
-            &self.token_embd
-        }
-        fn output(&self) -> &Dense {
-            &self.output
-        }
-        fn output_norm(&self) -> &MxArray {
-            &self.output_norm
-        }
-        fn output_hc(&self) -> &HcWeights {
-            &self.output_hc
-        }
-        fn layers(&self) -> &[LayerWeights] {
-            &self.layers
-        }
-    }
-
-    let token_map: Vec<u32> = (0..V as u32).map(|i| (i * 7) % 61).collect();
-    let engram = EngramConfig {
-        layers: vec![1],
-        max_ngram: 3,
-        n_heads: 2,
-        head_dim: 8,
-        multipliers: vec![
-            0x9E37_79B9_7F4A_7C15 | 1,
-            0xBF58_476D_1CE4_E5B9 | 1,
-            0x94D0_49BB_1331_11EB | 1,
-        ],
-        head_offsets: vec![0, 11, 24, 31],
-        head_vocab_sizes: vec![11, 13, 7, 5],
-        pad_token_id: V - 1,
-        compressed_vocab_size: token_map.iter().max().map_or(0, |&x| x as usize + 1),
-        token_map,
-        vocab_size: None,
-    };
-    let cfg = HyV4FlashConfig {
-        n_layers: 1,
-        layers: vec![
-            LayerConfig {
-                attn: Attn::Sliding,
-                n_heads: N_HEADS,
-                rope_theta: 1e4,
-                swiglu_limit: 0.5,
-                dense_ffn: true,
-                engram: None,
-                mtp: false,
-            },
-            LayerConfig {
-                attn: Attn::Indexed,
-                n_heads: N_HEADS,
-                rope_theta: 1e7,
-                swiglu_limit: 0.5,
-                dense_ffn: false,
-                engram: None,
-                mtp: true,
-            },
-        ],
-        vocab_size: V,
-        context_length: CTX,
-        dim: D,
-        dense_ff: DENSE_FF,
-        n_dense_lead: 1,
-        norm_eps: 1e-5,
-        window: 8,
-        rope_theta: 1e7,
-        rope_theta_swa: 1e4,
-        mla: MlaConfig {
-            q_lora_rank: Q_LORA,
-            kv_lora_rank: KV_LORA,
-            qk_nope_dim: NOPE,
-            rope_dim: ROPE,
-            head_dim_qk: NOPE + ROPE,
-            head_dim_v: HEAD_V,
-            scale: ((NOPE + ROPE) as f32).sqrt().recip(),
-        },
-        moe: MoeConfig {
-            n_experts: E,
-            n_used: 2,
-            n_shared: 1,
-            ff: MOE_FF,
-            latent: MOE_LATENT,
-            route_scale: 2.0,
-            norm_topk: true,
-        },
-        hc: HcConfig {
-            count: HC,
-            eps: 1e-6,
-            magnitude: 2.0,
-        },
-        indexer: IndexerConfig {
-            n_heads: IDX_HEADS,
-            head_dim: IDX_DIM,
-            top_k: 16,
-            kpool: 4,
-            select_tail: true,
-        },
-        engram: engram.clone(),
-    };
-
-    let mut r = Rng::new(777);
-    let trunk_layer = LayerWeights {
-        attn: attn_w(&mut r),
-        indexer: None,
-        engram: None,
-        residual: Residual::Hc {
-            attn: hc_w(&mut r, 2 * HC, 2),
-            ffn: hc_w(&mut r, 2 * HC, 2),
-        },
-        ffn_norm: norm(&mut r, D),
-        post_ffw_norm: norm(&mut r, D),
-        ffn: Ffn::Mlp {
-            gate: mat(&mut r, DENSE_FF, D),
-            up: mat(&mut r, DENSE_FF, D),
-            down: mat(&mut r, D, DENSE_FF),
-            gate_up: None,
-        },
-    };
-    let output_bf16 = arr(&r.vec(V * D, 1.5 / (D as f32).sqrt()), &[V, D])
-        .astype(DType::BFloat16)
-        .unwrap();
-    let trunk = MiniTrunk {
-        token_embd: mat(&mut r, V, D),
-        output: Dense::Array(output_bf16),
-        output_norm: norm(&mut r, D),
-        output_hc: hc_w(&mut r, HC, 1),
-        layers: vec![trunk_layer],
-    };
-    let table_rows: u64 = engram.head_vocab_sizes.iter().sum();
-    let table =
-        ResidentF8Table::new(vec![0u8; table_rows as usize * engram.head_dim], &engram).unwrap();
-    let model = Model::new(
-        cfg.clone(),
-        Box::new(trunk),
-        |_| Err(napi::Error::from_reason("unexpected trunk MoE")),
-        Box::new(table),
-    )
-    .unwrap();
-
-    let mtp_lw = LayerWeights {
-        attn: attn_w(&mut r),
-        indexer: Some(idx_w(&mut r)),
-        engram: None,
-        residual: Residual::Mtp(NextnWeights {
-            eh_proj: mat(&mut r, D, 2 * D),
-            enorm: norm(&mut r, D),
-            hnorm: norm(&mut r, D),
-            shared_head_norm: norm(&mut r, D),
-        }),
-        ffn_norm: norm(&mut r, D),
-        post_ffw_norm: norm(&mut r, D),
-        ffn: Ffn::Moe(MoeWeights {
-            router: mat(&mut r, E, D),
-            router_bias: Some(small(&mut r, &[E], 0.1)),
-            routed_down: mat(&mut r, MOE_LATENT, D),
-            routed_up: mat(&mut r, D, MOE_LATENT),
-            shared_gate: mat(&mut r, SHARED_FF, D),
-            shared_up: mat(&mut r, SHARED_FF, D),
-            shared_down: mat(&mut r, D, SHARED_FF),
-            down_shared_gu: None,
-        }),
-    };
-    let quant_exp = |r: &mut Rng, rows: usize, k: usize| -> AffineProj {
-        let raw = arr(&r.vec(E * rows * k, 1.0 / (k as f32).sqrt()), &[E, rows, k])
-            .astype(DType::BFloat16)
-            .unwrap();
-        let p = AffineProj::quantize(&raw, EXPERT_GROUP, EXPERT_BITS).unwrap();
-        MxArray::eval_arrays_with_context(&[&p.w, &p.s, &p.b], "test mtp exp").unwrap();
-        p
-    };
-    let experts = AffineExperts::new(
-        [
-            quant_exp(&mut r, MOE_FF, MOE_LATENT),
-            quant_exp(&mut r, MOE_FF, MOE_LATENT),
-            quant_exp(&mut r, MOE_LATENT, MOE_FF),
-        ],
-        EXPERT_GROUP,
-        EXPERT_BITS,
-    )
-    .unwrap();
-    let mw = MtpWeights {
-        layer: 1,
-        weights: mtp_lw,
-        experts,
-        read: 0,
-        bytes: 0,
-        guard: coordinator().register(0),
-    };
-    let mtp = MtpLayer::new(&cfg, mw, model.weights().token_embd()).unwrap();
-
-    // Test N = 2 and N = 4 lanes at uniform depth 1, 2, 3 and heterogeneous depths [3, 2, 1, 3].
+    let rig = DraftRig(mini_mtp_fixture(777));
+    let d = rig.0.cfg.dim as i64;
+    let mut r = Rng::new(779);
     let scenarios: &[(&str, &[usize], &[usize])] = &[
         ("n2_d1", &[6, 11], &[1, 1]),
         ("n2_d2", &[6, 11], &[2, 2]),
@@ -780,551 +503,98 @@ fn mtp_draft_batch_matches_serial_multi_lane_multi_depth() {
     ];
 
     for &(label, hist_lens, depths) in scenarios {
-        let n = hist_lens.len();
-        let mut serial_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
-        let mut batch_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
-        let mut seeds_h: Vec<MxArray> = Vec::with_capacity(n);
-        let mut anchors: Vec<u32> = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let hist_h = arr(&r.vec(hist_lens[i] * D, 1.0), &[hist_lens[i], D]);
-            let hist_ids = r.ids(hist_lens[i]);
-            mtp.commit(&model, &mut serial_drafts[i], &hist_h, &hist_ids)
-                .unwrap();
-            mtp.commit(&model, &mut batch_drafts[i], &hist_h, &hist_ids)
-                .unwrap();
-            seeds_h.push(arr(&r.vec(D, 1.0), &[1, D]));
-            anchors.push(r.ids(1)[0]);
-        }
-
-        // Serial baseline via MtpLayer::draft.
-        let mut serial_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for i in 0..n {
-            let mut h = seeds_h[i].clone();
-            let mut tok = anchors[i];
-            for _ in 0..depths[i] {
+        let (mut serial, mut batch, seeds_h, anchors) = rig.init_pair(&mut r, hist_lens);
+        let mut serial_toks = vec![Vec::new(); hist_lens.len()];
+        for (i, &depth) in depths.iter().enumerate() {
+            let (mut h, mut tok) = (seeds_h[i].clone(), anchors[i]);
+            for _ in 0..depth {
                 let idx = MxArray::from_uint32(&[tok], &[1]).unwrap();
-                let emb = model.weights().token_embd().rows(&idx).unwrap();
-                let (h_next, logits) = mtp.draft(&model, &mut serial_drafts[i], &h, &emb).unwrap();
+                let emb = rig.0.model.weights().token_embd().rows(&idx).unwrap();
+                let (h_next, logits) = rig
+                    .0
+                    .mtp
+                    .draft(&rig.0.model, &mut serial[i], &h, &emb)
+                    .unwrap();
                 let tid = logits.argmax(-1, Some(false)).unwrap();
                 tid.eval();
                 tok = tid.to_int32().unwrap()[0] as u32;
-                serial_tokens[i].push(tok);
-                h = h_next.reshape(&[1, D as i64]).unwrap();
+                serial_toks[i].push(tok);
+                h = h_next.reshape(&[1, d]).unwrap();
             }
         }
-
-        // Batched path via MtpLayer::draft_batch with lazy GPU token chaining and 1 eval.
-        let max_depth = depths.iter().copied().max().unwrap_or(0);
-        let mut batch_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut h_states: Vec<MxArray> = seeds_h.clone();
-        let mut tok_states: Vec<MxArray> = anchors
-            .iter()
-            .map(|&t| MxArray::from_uint32(&[t], &[1]).unwrap())
-            .collect();
-        let mut step_toks: Vec<(Vec<usize>, MxArray)> = Vec::with_capacity(max_depth);
-
-        let evals_before = stats::thread_evals();
-        {
-            let _scope = DeferScope::enter();
-            for step in 0..max_depth {
-                let active: Vec<usize> = (0..n).filter(|&i| step < depths[i]).collect();
-                let h_refs: Vec<&MxArray> = active.iter().map(|&i| &h_states[i]).collect();
-                let t_refs: Vec<&MxArray> = active.iter().map(|&i| &tok_states[i]).collect();
-                let h_batch = if h_refs.len() == 1 {
-                    h_refs[0].clone()
-                } else {
-                    MxArray::concatenate_many(h_refs, Some(0)).unwrap()
-                };
-                let t_batch = if t_refs.len() == 1 {
-                    t_refs[0].clone()
-                } else {
-                    MxArray::concatenate_many(t_refs, Some(0)).unwrap()
-                };
-                let e_batch = model.weights().token_embd().rows(&t_batch).unwrap();
-                let mut lane_ptrs: Vec<&mut Draft> = batch_drafts
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|&(i, _)| step < depths[i])
-                    .map(|(_, d)| d)
-                    .collect();
-                let (h_next, logits) = mtp
-                    .draft_batch(&model, &mut lane_ptrs, &h_batch, &e_batch)
-                    .unwrap();
-                let next_ids = logits.argmax(-1, Some(false)).unwrap();
-                for (k, &lane) in active.iter().enumerate() {
-                    let lo = k as i64;
-                    let hi = lo + 1;
-                    h_states[lane] = h_next.slice(&[lo, 0], &[hi, D as i64]).unwrap();
-                    tok_states[lane] = next_ids.slice(&[lo], &[hi]).unwrap();
-                }
-                step_toks.push((active, next_ids));
-            }
-            let eval_refs: Vec<&MxArray> = step_toks.iter().map(|(_, t)| t).collect();
-            stats::eval(&eval_refs, "test mtp draft_batch").unwrap();
-        }
-        let evals_after = stats::thread_evals();
-        assert_eq!(
-            evals_after - evals_before,
-            1,
-            "{label}: expected 1 single eval across all {max_depth} draft steps, got {}",
-            evals_after - evals_before
-        );
-
-        for (active, ids_arr) in &step_toks {
-            let vals = ids_arr.to_int32().unwrap();
-            for (k, &lane) in active.iter().enumerate() {
-                batch_tokens[lane].push(vals[k] as u32);
-            }
-        }
-
-        assert_eq!(
-            batch_tokens, serial_tokens,
-            "{label}: draft_batch tokens differ from serial draft"
-        );
+        let (batch_toks, evals) = rig.run_batched(&mut batch, &seeds_h, &anchors, depths, None);
+        assert_eq!(evals, 1, "{label}: expected 1 eval, got {evals}");
+        assert_eq!(batch_toks, serial_toks, "{label}: draft_batch vs serial");
     }
 
-    // Verify skipping `d.index.update` on each lane's last draft step
-    // (`persist = step + 1 < depth`) gives bit-identical tokens and leaves
-    // `d.index` untouched on the final step while settling cleanly.
+    // Skipping `d.index.update` on each lane's final step (`persist = step + 1 < depth`).
     for &(label, hist_lens, depths) in scenarios {
-        let n = hist_lens.len();
-        let mut full_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
-        let mut skip_drafts: Vec<Draft> = (0..n).map(|_| mtp.new_draft(CTX)).collect();
-        let mut seeds_h: Vec<MxArray> = Vec::with_capacity(n);
-        let mut anchors: Vec<u32> = Vec::with_capacity(n);
-        for i in 0..n {
-            let hist_h = arr(&r.vec(hist_lens[i] * D, 1.0), &[hist_lens[i], D]);
-            let hist_ids = r.ids(hist_lens[i]);
-            mtp.commit(&model, &mut full_drafts[i], &hist_h, &hist_ids)
-                .unwrap();
-            mtp.commit(&model, &mut skip_drafts[i], &hist_h, &hist_ids)
-                .unwrap();
-            seeds_h.push(arr(&r.vec(D, 1.0), &[1, D]));
-            anchors.push(r.ids(1)[0]);
-        }
-
-        let run_batched = |drafts: &mut [Draft], skip_last: bool| -> Vec<Vec<u32>> {
-            let max_depth = depths.iter().copied().max().unwrap_or(0);
-            let mut h_states = seeds_h.clone();
-            let mut tok_states: Vec<MxArray> = anchors
-                .iter()
-                .map(|&t| MxArray::from_uint32(&[t], &[1]).unwrap())
-                .collect();
-            let mut step_toks: Vec<(Vec<usize>, MxArray)> = Vec::with_capacity(max_depth);
-            let _scope = DeferScope::enter();
-            for step in 0..max_depth {
-                let active: Vec<usize> = (0..n).filter(|&i| step < depths[i]).collect();
-                let h_refs: Vec<&MxArray> = active.iter().map(|&i| &h_states[i]).collect();
-                let t_refs: Vec<&MxArray> = active.iter().map(|&i| &tok_states[i]).collect();
-                let h_batch = if h_refs.len() == 1 {
-                    h_refs[0].clone()
-                } else {
-                    MxArray::concatenate_many(h_refs, Some(0)).unwrap()
-                };
-                let t_batch = if t_refs.len() == 1 {
-                    t_refs[0].clone()
-                } else {
-                    MxArray::concatenate_many(t_refs, Some(0)).unwrap()
-                };
-                let e_batch = model.weights().token_embd().rows(&t_batch).unwrap();
-                let mut lane_ptrs: Vec<&mut Draft> = drafts
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|&(i, _)| step < depths[i])
-                    .map(|(_, d)| d)
-                    .collect();
-                let persist: Vec<bool> = active
-                    .iter()
-                    .map(|&i| !skip_last || step + 1 < depths[i])
-                    .collect();
-                let (h_next, logits) = mtp
-                    .draft_batch_with_persist(&model, &mut lane_ptrs, &h_batch, &e_batch, &persist)
-                    .unwrap();
-                let next_ids = logits.argmax(-1, Some(false)).unwrap();
-                for (k, &lane) in active.iter().enumerate() {
-                    let lo = k as i64;
-                    let hi = lo + 1;
-                    h_states[lane] = h_next.slice(&[lo, 0], &[hi, D as i64]).unwrap();
-                    tok_states[lane] = next_ids.slice(&[lo], &[hi]).unwrap();
-                }
-                step_toks.push((active, next_ids));
-            }
-            let eval_refs: Vec<&MxArray> = step_toks.iter().map(|(_, t)| t).collect();
-            stats::eval(&eval_refs, "test mtp draft_batch persist").unwrap();
-            let mut out = vec![Vec::new(); n];
-            for (active, ids_arr) in &step_toks {
-                let vals = ids_arr.to_int32().unwrap();
-                for (k, &lane) in active.iter().enumerate() {
-                    out[lane].push(vals[k] as u32);
-                }
-            }
-            out
-        };
-
-        let full_toks = run_batched(&mut full_drafts, false);
-        let skip_toks = run_batched(&mut skip_drafts, true);
+        let (mut full, mut skip, seeds_h, anchors) = rig.init_pair(&mut r, hist_lens);
+        let (full_toks, _) = rig.run_batched(&mut full, &seeds_h, &anchors, depths, Some(false));
+        let (skip_toks, _) = rig.run_batched(&mut skip, &seeds_h, &anchors, depths, Some(true));
         assert_eq!(
             skip_toks, full_toks,
-            "{label}: persist=false last step changed drafted tokens"
+            "{label}: persist=false changed tokens"
         );
-        for i in 0..n {
+        for i in 0..hist_lens.len() {
             assert_eq!(
-                skip_drafts[i].index().len(),
+                skip[i].index().len(),
                 hist_lens[i] + depths[i] - 1,
-                "{label} lane {i}: last draft step should skip index.update"
+                "{label} lane {i}"
             );
-            assert_eq!(skip_drafts[i].len(), hist_lens[i] + depths[i]);
-            skip_drafts[i].cut(hist_lens[i]).unwrap();
-            assert_eq!(skip_drafts[i].len(), hist_lens[i]);
-            assert_eq!(skip_drafts[i].index().len(), hist_lens[i]);
+            assert_eq!(skip[i].len(), hist_lens[i] + depths[i]);
+            skip[i].cut(hist_lens[i]).unwrap();
+            assert_eq!(
+                (skip[i].len(), skip[i].index().len()),
+                (hist_lens[i], hist_lens[i])
+            );
         }
     }
 }
 
 #[test]
 fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
-    use super::config::{
-        Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
-    };
-    use super::moe::{AffineExperts, AffineProj};
-    use super::mtp::{MtpHeadMode, MtpLayer, parse_mtp_head_mode, with_mtp_head};
-    use super::mtp_weights::MtpWeights;
-    use super::weights::{
-        AttnWeights, Dense, Ffn, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Residual,
-        quantize_affine4_array, quantize_affine4_from_bf16_raw, quantize_sym_q8_array,
-        quantize_sym_q8_from_bf16_raw,
-    };
-    use crate::array::DType;
-    use crate::cache_limit::coordinator;
-    use crate::models::deepseek_v41::EngramConfig;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-        }
-        fn step(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn next(&mut self) -> f32 {
-            ((self.step() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-        }
-        fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-            (0..n).map(|_| self.next() * scale).collect()
-        }
+    for (raw, want) in [
+        (None, MtpHeadMode::Q4),
+        (Some(""), MtpHeadMode::Q4),
+        (Some("q4"), MtpHeadMode::Q4),
+        (Some(" Q4 "), MtpHeadMode::Q4),
+        (Some("symq8"), MtpHeadMode::SymQ8),
+        (Some(" SYMQ8 "), MtpHeadMode::SymQ8),
+        (Some("bf16"), MtpHeadMode::Bf16),
+        (Some("BF16"), MtpHeadMode::Bf16),
+    ] {
+        assert_eq!(parse_mtp_head_mode(raw).unwrap(), want, "{raw:?}");
     }
-    fn arr(v: &[f32], shape: &[usize]) -> MxArray {
-        let s: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
-        MxArray::from_float32(v, &s).unwrap()
-    }
-
-    assert_eq!(parse_mtp_head_mode(None).unwrap(), MtpHeadMode::Q4);
-    assert_eq!(parse_mtp_head_mode(Some("")).unwrap(), MtpHeadMode::Q4);
-    assert_eq!(parse_mtp_head_mode(Some("q4")).unwrap(), MtpHeadMode::Q4);
-    assert_eq!(parse_mtp_head_mode(Some(" Q4 ")).unwrap(), MtpHeadMode::Q4);
-    assert_eq!(
-        parse_mtp_head_mode(Some("symq8")).unwrap(),
-        MtpHeadMode::SymQ8
-    );
-    assert_eq!(
-        parse_mtp_head_mode(Some(" SYMQ8 ")).unwrap(),
-        MtpHeadMode::SymQ8
-    );
-    assert_eq!(
-        parse_mtp_head_mode(Some("bf16")).unwrap(),
-        MtpHeadMode::Bf16
-    );
-    assert_eq!(
-        parse_mtp_head_mode(Some("BF16")).unwrap(),
-        MtpHeadMode::Bf16
-    );
     assert!(parse_mtp_head_mode(Some("q2")).is_err());
 
-    // Direct raw BF16 -> SymQ8 & Q4 g64 match array quantizers and keep tight parity.
-    let (vocab, dim) = (128usize, 64usize);
+    let mut cfg = mini_mtp_cfg();
+    cfg.dim = 64; // Q4 g64 draft head requires dim % 64 == 0
+    let (v, d) = (cfg.vocab_size, cfg.dim);
     let mut r = Rng::new(701);
-    let bf16_u16: Vec<u16> = r
-        .vec(vocab * dim, 0.5)
-        .into_iter()
-        .map(|v| (v.to_bits() >> 16) as u16)
-        .collect();
-    let bf16_raw: Vec<u8> = bf16_u16.iter().flat_map(|b| b.to_le_bytes()).collect();
-    let bf16_f32: Vec<f32> = bf16_u16
-        .iter()
-        .map(|&b| f32::from_bits(u32::from(b) << 16))
-        .collect();
-    let bf16_arr = MxArray::from_float32(&bf16_f32, &[vocab as i64, dim as i64])
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-    let from_raw = quantize_sym_q8_from_bf16_raw(&bf16_raw, vocab, dim).unwrap();
-    let from_arr = quantize_sym_q8_array(&bf16_arr).unwrap();
-    assert_eq!(from_raw.nbytes(), vocab * dim + vocab * dim / 16);
-    assert_eq!(from_arr.nbytes(), from_raw.nbytes());
-
-    let q4_from_raw = quantize_affine4_from_bf16_raw(&bf16_raw, vocab, dim).unwrap();
-    let q4_from_arr = quantize_affine4_array(&bf16_arr).unwrap();
-    assert_eq!(q4_from_raw.nbytes(), vocab * dim / 2 + vocab * dim / 16);
-    assert_eq!(q4_from_arr.nbytes(), q4_from_raw.nbytes());
-
-    let x = arr(&r.vec(4 * dim, 1.0), &[4, dim]);
-    let bf16_dense = Dense::Array(bf16_arr);
-    let want = super::model::head_rows(&x, &bf16_dense).unwrap();
-    let got_raw = super::model::head_rows(&x, &from_raw).unwrap();
-    let got_arr = super::model::head_rows(&x, &from_arr).unwrap();
-    let got_q4_raw = super::model::head_rows(&x, &q4_from_raw).unwrap();
-    let got_q4_arr = super::model::head_rows(&x, &q4_from_arr).unwrap();
-    let w_v = want.to_float32().unwrap();
-    let r_v = got_raw.to_float32().unwrap();
-    let a_v = got_arr.to_float32().unwrap();
-    let q4_r_v = got_q4_raw.to_float32().unwrap();
-    let q4_a_v = got_q4_arr.to_float32().unwrap();
-    assert_eq!(
-        r_v.as_ref(),
-        a_v.as_ref(),
-        "raw vs array SymQ8 must match bit-for-bit"
-    );
-    assert_eq!(
-        q4_r_v.as_ref(),
-        q4_a_v.as_ref(),
-        "raw vs array Q4 g64 must match bit-for-bit"
-    );
-    let max_diff_q4 = w_v
-        .iter()
-        .zip(q4_a_v.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_diff_q4 < 0.6,
-        "Q4 g64 draft head max logit diff {max_diff_q4}"
-    );
-    let max_diff = w_v
-        .iter()
-        .zip(a_v.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_diff < 0.05,
-        "SymQ8 draft head max logit diff {max_diff}"
-    );
-    for row in 0..4 {
-        let argmax = |s: &[f32]| {
-            s[row * vocab..(row + 1) * vocab]
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .unwrap()
-                .0
-        };
-        assert_eq!(
-            argmax(w_v.as_ref()),
-            argmax(a_v.as_ref()),
-            "row {row} argmax"
-        );
-    }
-
-    // Verify MtpLayer::new_with_head accounts for draft_head bytes under SymQ8 vs Bf16.
-    const V: usize = 32;
-    const D: usize = 64;
-    const Q_LORA: usize = 16;
-    const KV_LORA: usize = 16;
-    const ROPE: usize = 4;
-    const NOPE: usize = 4;
-    const HEAD_V: usize = 4;
-    const H: usize = 2;
-    const IX_D: usize = 8;
-    const IX_H: usize = 2;
-    const LAT: usize = 64;
-    const FF: usize = 64;
-    const SFF: usize = 32;
-    const E: usize = 4;
-    let cfg = HyV4FlashConfig {
-        n_layers: 1,
-        layers: vec![
-            LayerConfig {
-                attn: Attn::Sliding,
-                n_heads: H,
-                rope_theta: 1e4,
-                swiglu_limit: 0.0,
-                dense_ffn: true,
-                engram: None,
-                mtp: false,
-            },
-            LayerConfig {
-                attn: Attn::Indexed,
-                n_heads: H,
-                rope_theta: 1e7,
-                swiglu_limit: 10.0,
-                dense_ffn: false,
-                engram: None,
-                mtp: true,
-            },
-        ],
-        vocab_size: V,
-        context_length: 64,
-        dim: D,
-        dense_ff: 16,
-        n_dense_lead: 1,
-        norm_eps: 1e-5,
-        window: 4,
-        rope_theta: 1e7,
-        rope_theta_swa: 1e4,
-        mla: MlaConfig {
-            q_lora_rank: Q_LORA,
-            kv_lora_rank: KV_LORA,
-            qk_nope_dim: NOPE,
-            rope_dim: ROPE,
-            head_dim_qk: NOPE + ROPE,
-            head_dim_v: HEAD_V,
-            scale: ((NOPE + ROPE) as f32).sqrt().recip(),
-        },
-        moe: MoeConfig {
-            n_experts: E,
-            n_used: 2,
-            n_shared: 1,
-            ff: FF,
-            latent: LAT,
-            route_scale: 1.0,
-            norm_topk: true,
-        },
-        hc: HcConfig {
-            count: 2,
-            eps: 1e-6,
-            magnitude: 2.0,
-        },
-        indexer: IndexerConfig {
-            n_heads: IX_H,
-            head_dim: IX_D,
-            top_k: 4,
-            kpool: 2,
-            select_tail: true,
-        },
-        engram: EngramConfig {
-            layers: vec![],
-            max_ngram: 2,
-            n_heads: 0,
-            head_dim: 0,
-            multipliers: vec![],
-            head_offsets: vec![],
-            head_vocab_sizes: vec![],
-            pad_token_id: 0,
-            compressed_vocab_size: 0,
-            token_map: vec![],
-            vocab_size: None,
-        },
-    };
-    let make_mw = |seed: u64| {
-        let mut r = Rng::new(seed);
-        let mk = |r: &mut Rng, rows: usize, cols: usize| {
-            Dense::Array(arr(&r.vec(rows * cols, 0.2), &[rows, cols]))
-        };
-        let ones = |n: usize| MxArray::from_float32(&vec![1.0; n], &[n as i64]).unwrap();
-        let mtp_lw = LayerWeights {
-            attn: AttnWeights {
-                norm: ones(D),
-                sinks: arr(&r.vec(H, 0.2), &[H]),
-                q_a: mk(&mut r, Q_LORA, D),
-                q_a_norm: ones(Q_LORA),
-                q_b: mk(&mut r, H * (NOPE + ROPE), Q_LORA),
-                kv_a: mk(&mut r, KV_LORA + ROPE, D),
-                kv_a_norm: ones(KV_LORA),
-                k_b: mk(&mut r, H * KV_LORA, NOPE),
-                v_b: mk(&mut r, H * HEAD_V, KV_LORA),
-                output: mk(&mut r, D, H * HEAD_V),
-                gate: mk(&mut r, H * HEAD_V, D),
-                post_norm: ones(D),
-                q_kv: None,
-                q_kv_gate: None,
-            },
-            indexer: Some(IndexerWeights {
-                attn_k: mk(&mut r, IX_D, D),
-                k_norm: ones(IX_D),
-                q_b: mk(&mut r, IX_H * IX_D, Q_LORA),
-                proj: mk(&mut r, IX_H, D),
-                compressor_value: arr(&r.vec(IX_D * IX_D, 0.2), &[IX_D, IX_D]),
-                compressor_gate: arr(&r.vec(IX_D * IX_D, 0.2), &[IX_D, IX_D]),
-                compressor_ape: arr(&r.vec(2 * IX_D, 0.1), &[2, IX_D]),
-                compressor_norm: ones(IX_D),
-            }),
-            engram: None,
-            residual: Residual::Mtp(NextnWeights {
-                enorm: ones(D),
-                hnorm: ones(D),
-                eh_proj: mk(&mut r, D, 2 * D),
-                shared_head_norm: ones(D),
-            }),
-            ffn_norm: ones(D),
-            post_ffw_norm: ones(D),
-            ffn: Ffn::Moe(MoeWeights {
-                router: mk(&mut r, E, D),
-                router_bias: None,
-                routed_down: mk(&mut r, LAT, D),
-                routed_up: mk(&mut r, D, LAT),
-                shared_gate: mk(&mut r, SFF, D),
-                shared_up: mk(&mut r, SFF, D),
-                shared_down: mk(&mut r, D, SFF),
-                down_shared_gu: None,
-            }),
-        };
-        let qexp = |r: &mut Rng, rows: usize, k: usize| {
-            let w = arr(&r.vec(E * rows * k, 0.2), &[E, rows, k])
-                .astype(DType::BFloat16)
-                .unwrap();
-            AffineProj::quantize(&w, 64, 4).unwrap()
-        };
-        let experts = AffineExperts::new(
-            [
-                qexp(&mut r, FF, LAT),
-                qexp(&mut r, FF, LAT),
-                qexp(&mut r, LAT, FF),
-            ],
-            64,
-            4,
-        )
-        .unwrap();
-        MtpWeights {
-            layer: 1,
-            weights: mtp_lw,
-            experts,
-            read: 0,
-            bytes: 1234,
-            guard: coordinator().register(0),
-        }
-    };
-    let tok_embd = Dense::Array(arr(&r.vec(V * D, 0.2), &[V, D]));
-    let out_head = Dense::Array(
-        arr(&r.vec(V * D, 0.2), &[V, D])
+    let tok = Dense::Array(arr(&r.vec_f32(v * d, 0.2), &[v, d]));
+    let out = Dense::Array(
+        arr(&r.vec_f32(v * d, 0.2), &[v, d])
             .astype(DType::BFloat16)
             .unwrap(),
     );
+    let build = |mode| {
+        with_mtp_head(mode, || {
+            let mw = mini_mtp_weights(&cfg, 11, 32, 1234);
+            MtpLayer::new_with_head(&cfg, mw, &tok, Some(&out)).unwrap()
+        })
+    };
 
-    let q4 = with_mtp_head(MtpHeadMode::Q4, || {
-        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
-    });
+    let q4 = build(MtpHeadMode::Q4);
     assert!(matches!(q4.draft_head(), Some(Dense::Qmm4 { .. })));
-    let expected_q4_bytes = (V * D / 2 + V * D / 16) as u64;
-    assert_eq!(q4.bytes(), 1234 + expected_q4_bytes);
+    assert_eq!(q4.bytes(), 1234 + (v * d / 2 + v * d / 16) as u64);
 
-    let sym = with_mtp_head(MtpHeadMode::SymQ8, || {
-        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
-    });
+    let sym = build(MtpHeadMode::SymQ8);
     assert!(matches!(sym.draft_head(), Some(Dense::SymQ8 { .. })));
-    let expected_head_bytes = (V * D + V * D / 16) as u64;
-    assert_eq!(sym.bytes(), 1234 + expected_head_bytes);
+    assert_eq!(sym.bytes(), 1234 + (v * d + v * d / 16) as u64);
 
-    let bf16 = with_mtp_head(MtpHeadMode::Bf16, || {
-        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
-    });
-    assert!(bf16.draft_head().is_none());
-    assert_eq!(bf16.bytes(), 1234);
-}
-
-fn hy4_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards"))
+    let bf16 = build(MtpHeadMode::Bf16);
+    assert!(bf16.draft_head().is_none() && bf16.bytes() == 1234);
 }
 
 #[test]
@@ -1333,7 +603,7 @@ fn real_held_layer_matches_the_fixture() {
     let paths = crate::models::deepseek_v41::chat::shard_paths(&hy4_dir()).unwrap();
     let opts = super::store::Options::from_env(Some(16_384), true).unwrap();
     let store = super::store::Store::open(&paths, &opts).unwrap();
-    let m = super::mtp::MtpLayer::load(&store.scan, &store.shards, &store.model).unwrap();
+    let m = MtpLayer::load(&store.scan, &store.shards, &store.model).unwrap();
     assert_eq!(m.bytes(), super::store::mtp_bytes(&store.scan).unwrap());
 }
 
@@ -1369,22 +639,14 @@ fn real_greedy_mtp_matches_ar() {
         inner.reset_caches(ResetScope::Command).unwrap();
         let r = crate::engine::session::session_start(&mut inner, msgs(), cfg(true, depth), &flag)
             .unwrap();
+        let p = r.performance.as_ref();
         println!(
             "depth {depth}: {:?} perf {:?} tps={:.2}",
             r.text,
-            r.performance
-                .as_ref()
-                .map(|p| (p.mtp_cycles, p.mtp_mean_accepted_tokens)),
-            r.performance
-                .as_ref()
-                .map_or(0.0, |p| p.decode_tokens_per_second)
+            p.map(|p| (p.mtp_cycles, p.mtp_mean_accepted_tokens)),
+            p.map_or(0.0, |p| p.decode_tokens_per_second)
         );
         assert_eq!(r.text, ar.text, "depth {depth}");
-        assert!(
-            r.performance
-                .as_ref()
-                .and_then(|p| p.mtp_cycles)
-                .is_some_and(|c| c > 0)
-        );
+        assert!(p.and_then(|p| p.mtp_cycles).is_some_and(|c| c > 0));
     }
 }

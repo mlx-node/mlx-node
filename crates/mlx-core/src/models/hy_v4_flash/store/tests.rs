@@ -1,46 +1,525 @@
-use std::path::{Path, PathBuf};
+use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use super::*;
-use crate::models::hy_v4_flash::bank::{class_types, geometry};
 use crate::models::hy_v4_flash::config::MoeConfig;
-use crate::models::hy_v4_flash::scan::{ExpertClass, ExpertLayer, Located};
-use crate::moe_stream::budget::{Bound, Terms};
-use crate::utils::gguf::GgufTensorInfo;
+use crate::models::hy_v4_flash::scan::{ExpertClass, ExpertLayer};
+use crate::models::hy_v4_flash::test_support::{
+    Rng, Temp, fixture, j_u64, j_usize, j_usizes, kquant_layer, real_scan, tiny_cfg,
+};
+use crate::moe_stream::budget::{Bound, GROW_MIN, KEEP_SLACK, Terms};
 
 const G: u64 = 1 << 30;
+const STORE_CLASSES: [ExpertClass; 3] = [
+    ExpertClass::Q6kDown,
+    ExpertClass::Q4kDown,
+    ExpertClass::Q4kDown,
+];
 
-fn fixture(name: &str) -> Value {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hy-v4-flash")
-        .join(name);
-    serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
+fn host_mem(physical: u64, wired: u64) -> HostMemory {
+    HostMemory {
+        physical,
+        wired,
+        ..Default::default()
+    }
 }
 
-fn u(v: &Value) -> u64 {
-    v.as_u64().unwrap_or_else(|| panic!("not a u64: {v}"))
-}
-
-/// `admission-addons.json` host: `others` bytes in use, nothing of this model.
 fn host(inputs: &Value, others: u64) -> (HostMemory, u64) {
     (
-        HostMemory {
-            physical: u(&inputs["physical"]),
-            wired: others,
-            ..Default::default()
-        },
-        u(&inputs["ws"]),
+        host_mem(j_u64(&inputs["physical"]), others),
+        j_u64(&inputs["ws"]),
     )
 }
 
 fn base(inputs: &Value, variant: &Value) -> ModelSize {
     ModelSize {
-        dense: u(&variant["dense"]),
-        slot: u(&inputs["slot"]),
-        n_experts: u(&inputs["n_experts"]),
+        dense: j_u64(&variant["dense"]),
+        slot: j_u64(&inputs["slot"]),
+        n_experts: j_u64(&inputs["n_experts"]),
         ctx: 0,
+    }
+}
+
+fn real_sizes() -> Sizes {
+    Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    }
+}
+
+fn store_moe() -> MoeConfig {
+    MoeConfig {
+        n_experts: 4,
+        n_used: 2,
+        n_shared: 1,
+        ff: 256,
+        latent: 512,
+        route_scale: 1.0,
+        norm_topk: true,
+    }
+}
+
+struct TestEnvGuard;
+impl TestEnvGuard {
+    fn new() -> Self {
+        Self
+    }
+    fn host(&self, h: HostMemory, ws: u64) {
+        TEST_HOST.with(|c| c.set(Some((h, ws))));
+    }
+    fn pool(&self, bytes: u64) {
+        TEST_POOL.with(|c| c.set(Some(bytes)));
+    }
+    fn before_flip(&self, bytes: u64) {
+        TEST_BEFORE_FLIP.with(|c| c.set(Some(bytes)));
+    }
+}
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        TEST_HOST.with(|c| c.set(None));
+        TEST_POOL.with(|c| c.set(None));
+        TEST_BEFORE_FLIP.with(|c| c.set(None));
+    }
+}
+
+/// Fixture rig backed by `admission-addons.json` (`mtp_on`).
+struct AdmissionRig {
+    p: Profile,
+    base: ModelSize,
+    max_ctx: usize,
+    others: u64,
+    h0: HostMemory,
+    ws: u64,
+    load: Pick,
+    m: ModelSize,
+}
+
+impl AdmissionRig {
+    fn mtp_on(others_gib: u64) -> Self {
+        let f = fixture("admission-addons.json");
+        let (inputs, v) = (&f["inputs"], &f["variants"]["mtp_on"]);
+        let (p, b, others) = (
+            profile(j_u64(&v["kv_per_ctx"])),
+            base(inputs, v),
+            others_gib * G,
+        );
+        let (h0, ws) = host(inputs, others);
+        let max_ctx = j_usize(&inputs["max_context"]);
+        let load = pick(
+            &p,
+            &b,
+            max_ctx,
+            &Limits::default(),
+            &h0,
+            &Own::default(),
+            ws,
+        )
+        .unwrap();
+        let m = ModelSize {
+            ctx: load.ctx as u64,
+            ..b
+        };
+        Self {
+            p,
+            base: b,
+            max_ctx,
+            others,
+            h0,
+            ws,
+            load,
+            m,
+        }
+    }
+    fn admit(&self, h: &HostMemory, own: &Own) -> Result<Admission> {
+        admit_with(
+            &self.p,
+            &self.m,
+            self.load.chunk as u64,
+            &Limits::default(),
+            h,
+            own,
+            self.ws,
+        )
+    }
+    fn readmit(&self, h: &HostMemory, own: &Own) -> Turn {
+        let a = &self.load.admission;
+        readmit_with(
+            &self.p,
+            a,
+            &self.m,
+            self.load.chunk as u64,
+            &Limits::default(),
+            h,
+            own,
+            self.ws,
+        )
+        .unwrap()
+    }
+    fn readmit_settled(&self, h: HostMemory, resident: u64, volatile: u64, own: &Own) -> Turn {
+        self.readmit(&settled(h, Residency { resident, volatile }, true), own)
+    }
+}
+
+/// Synthetic 3-layer K-quant file (1 class A + 2 class B, 32-byte aligned).
+struct BankFiles {
+    moe: MoeConfig,
+    experts: Vec<Option<ExpertLayer>>,
+    _tmp: Temp,
+    path: PathBuf,
+}
+
+impl BankFiles {
+    fn new(seed: u64) -> Self {
+        let (moe, mut rng) = (store_moe(), Rng::new(seed));
+        let mut file = rng.bytes(1024);
+        let experts = STORE_CLASSES
+            .iter()
+            .enumerate()
+            .map(|(il, &c)| Some(kquant_layer(&mut rng, &moe, il, c, 32, &mut file)))
+            .collect();
+        let tmp = Temp::new("store");
+        let path = tmp.write("experts.bin", &file);
+        Self {
+            moe,
+            experts,
+            _tmp: tmp,
+            path,
+        }
+    }
+    fn pool(&self, threads: usize) -> IoPool {
+        IoPool::new(
+            Arc::new(ShardSet::open(&[self.path.as_path()]).unwrap()),
+            threads,
+        )
+        .unwrap()
+    }
+    fn streamed(&self, cache: [usize; 2], staging: usize) -> KqBank {
+        KqBank::new(self.pool(2), &self.moe, &self.experts, cache, staging).unwrap()
+    }
+    fn direct(&self) -> KqBank {
+        let b = KqBank::new_direct(self.pool(2), &self.moe, &self.experts).unwrap();
+        b.wait_direct_fill().unwrap();
+        b
+    }
+    fn mmap(&self) -> KqBank {
+        let ps = std::slice::from_ref(&self.path);
+        KqBank::new_mmap(self.pool(2), &self.moe, &self.experts, ps, 0, false).unwrap()
+    }
+    fn classes(&self, bank: &KqBank) -> Classes {
+        Classes {
+            layers: [1, 2],
+            slot: bank.slot_bytes(),
+        }
+    }
+}
+
+fn live_lease_rig(seed: u64) -> (BankFiles, KqBank, Lease, Classes, Admission, u64, u64, u64) {
+    let s = 64 << 20;
+    let classes = Classes {
+        layers: [1, 2],
+        slot: [s, s],
+    };
+    let (p, limits, ws, others) = (profile(100), Limits::default(), 96 * G, 10 * G);
+    let size = ModelSize {
+        dense: 0,
+        slot: s,
+        n_experts: 8,
+        ctx: 1024,
+    };
+    let physical = limits.reserve + others + Terms::with(&p, &size, ws, 1024).fixed(1) + 64 * s;
+    let loaded = admit_with(
+        &p,
+        &size,
+        1024,
+        &limits,
+        &host_mem(physical, others),
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    assert_eq!(loaded.bound, Bound::Live);
+    let files = BankFiles::new(seed);
+    let bank = files.streamed(
+        classes.split(loaded.cache_bytes()),
+        loaded.staging_layers as usize,
+    );
+    let lease = Lease::new(p, size, 1024, classes, Some(limits), Some(loaded), &bank);
+    (files, bank, lease, classes, loaded, physical, ws, others)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synth_adm(
+    physical: u64,
+    others: u64,
+    reserve: u64,
+    live: u64,
+    ws: u64,
+    terms: Terms,
+    staging_layers: u64,
+    fixed: u64,
+    slot: u64,
+    cache_slots: u64,
+) -> Admission {
+    Admission {
+        physical,
+        host_used: others,
+        own: 0,
+        others,
+        reserve,
+        live,
+        ws,
+        terms,
+        staging_layers,
+        fixed,
+        slot,
+        cache_slots,
+        bound: Bound::Live,
+    }
+}
+
+/// Collapses 10–17 arg calls to `direct_gate`, `pick_direct`, `select_expert_mode*`, etc.
+#[derive(Clone)]
+struct ModeRig {
+    sizes: Sizes,
+    p: Profile,
+    ctx: usize,
+    ws: u64,
+    dense_full: u64,
+    dense_mmap: u64,
+    direct_bytes: u64,
+    mapped_bytes: u64,
+    mmap_chunk_max: usize,
+    metal: bool,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+    cache_cap: Option<u64>,
+}
+
+impl ModeRig {
+    fn real() -> Self {
+        let sizes = real_sizes();
+        let dense_full = sizes.dense_trunk + sizes.dense_mtp;
+        Self {
+            direct_bytes: sizes.direct_expert_bytes(),
+            sizes,
+            p: profile(15_812),
+            ctx: 262_144,
+            ws: 96 * G,
+            dense_full,
+            dense_mmap: dense_full,
+            mapped_bytes: 89_500_000_000,
+            mmap_chunk_max: MMAP_PREFILL_CHUNK_MAX,
+            metal: true,
+            reserve_override: None,
+            max_memory: None,
+            cache_cap: None,
+        }
+    }
+    fn with_savings(mut self, saved: u64) -> Self {
+        self.dense_mmap = self.dense_full - saved;
+        self.mapped_bytes = 89_500_000_000 + saved;
+        self
+    }
+    fn gate(&self, mode: DirectMode, h: &HostMemory, kv: u64, sc: u64) -> DirectDecision {
+        direct_gate(
+            mode,
+            h,
+            &Own::default(),
+            self.dense_full,
+            self.direct_bytes,
+            kv,
+            sc,
+            DIRECT_MARGIN,
+            self.max_memory,
+            self.cache_cap,
+        )
+    }
+    fn pick_direct(&self, mode: DirectMode, h: &HostMemory) -> (usize, DirectDecision) {
+        pick_direct(
+            mode,
+            &self.p,
+            self.ctx,
+            h,
+            &Own::default(),
+            self.dense_full,
+            self.direct_bytes,
+            self.reserve_override,
+            self.max_memory,
+            self.cache_cap,
+        )
+    }
+    fn select(
+        &self,
+        mmap: MmapMode,
+        direct: DirectMode,
+        h: &HostMemory,
+    ) -> Result<ExpertResidency> {
+        select_expert_mode(
+            mmap,
+            direct,
+            self.metal,
+            &self.p,
+            self.ctx,
+            h,
+            &Own::default(),
+            self.dense_full,
+            self.direct_bytes,
+            self.mapped_bytes,
+            self.reserve_override,
+            self.max_memory,
+            self.cache_cap,
+        )
+    }
+    fn select_for(
+        &self,
+        mmap: MmapMode,
+        direct: DirectMode,
+        h: &HostMemory,
+    ) -> Result<ExpertResidency> {
+        select_expert_mode_for(
+            mmap,
+            direct,
+            self.metal,
+            &self.p,
+            self.ctx,
+            h,
+            &Own::default(),
+            self.dense_full,
+            self.dense_mmap,
+            self.direct_bytes,
+            self.mapped_bytes,
+            self.mmap_chunk_max,
+            self.reserve_override,
+            self.max_memory,
+            self.cache_cap,
+        )
+    }
+    fn retry(
+        &self,
+        mmap: MmapMode,
+        direct: DirectMode,
+        read_host: impl FnMut() -> Result<(HostMemory, u64)>,
+        pool_bytes: impl FnMut() -> u64,
+        clear_cache: impl FnMut(),
+    ) -> Result<(HostMemory, u64, ExpertResidency)> {
+        select_expert_mode_with_retry(
+            mmap,
+            direct,
+            self.metal,
+            &self.p,
+            self.ctx,
+            &Own::default(),
+            self.dense_full,
+            self.dense_mmap,
+            self.direct_bytes,
+            self.mapped_bytes,
+            self.mmap_chunk_max,
+            self.reserve_override,
+            self.max_memory,
+            self.cache_cap,
+            read_host,
+            pool_bytes,
+            clear_cache,
+        )
+    }
+    fn warm(&self, mode: MmapMode, h: &HostMemory) -> u64 {
+        let kv = direct_kv_allowance(&self.p, self.ctx);
+        mmap_warm_budget(
+            mode,
+            h,
+            self.dense_full,
+            kv,
+            DIRECT_MARGIN,
+            self.mapped_bytes,
+        )
+    }
+}
+
+/// Shared harness for idle-promotion tests.
+struct PromoRig {
+    files: BankFiles,
+    bank: KqBank,
+    reference: KqBank,
+    classes: Classes,
+    p: Profile,
+    ctx: usize,
+    dense: u64,
+    physical: u64,
+    ws: u64,
+}
+
+impl PromoRig {
+    fn new(physical: u64, ws: u64) -> Self {
+        let files = BankFiles::new(7);
+        let (bank, reference) = (files.streamed([2, 2], 1), files.streamed([0, 0], 1));
+        let classes = files.classes(&bank);
+        Self {
+            files,
+            bank,
+            reference,
+            classes,
+            p: profile(15_812),
+            ctx: 262_144,
+            dense: 10 * G,
+            physical,
+            ws,
+        }
+    }
+    fn promo(&self, mode: DirectMode, mmap: MmapMode) -> DirectPromotion {
+        DirectPromotion {
+            mode,
+            mmap,
+            metal_available: true,
+            physical: self.physical,
+            reserve_override: None,
+            n_experts: self.files.moe.n_experts,
+        }
+    }
+    fn direct_bytes(&self) -> u64 {
+        self.promo(DirectMode::Auto, MmapMode::Off)
+            .direct_expert_bytes(&self.classes)
+    }
+    fn need_2k(&self) -> (u64, u64, u64) {
+        let (kv, sc) = (
+            direct_kv_allowance(&self.p, self.ctx),
+            direct_scratch_bytes(&self.p, 2048, self.ctx),
+        );
+        (self.dense + self.direct_bytes() + kv + sc, kv, sc)
+    }
+    fn size(&self, n_experts: u64) -> ModelSize {
+        ModelSize {
+            dense: self.dense,
+            slot: self.classes.slot[0].max(self.classes.slot[1]),
+            n_experts,
+            ctx: self.ctx as u64,
+        }
+    }
+    fn lease(
+        &self,
+        mode: DirectMode,
+        mmap: MmapMode,
+        limits: Limits,
+        adm: Option<Admission>,
+        n_exp: u64,
+    ) -> Lease {
+        Lease::new(
+            self.p,
+            self.size(n_exp),
+            2048,
+            self.classes,
+            Some(limits),
+            adm,
+            &self.bank,
+        )
+        .with_direct_promotion(self.promo(mode, mmap), None)
     }
 }
 
@@ -48,76 +527,97 @@ fn base(inputs: &Value, variant: &Value) -> ModelSize {
 fn profile_is_the_fixture_profile() {
     let f = fixture("admission-addons.json");
     let pf = &f["profile"];
-    let p = profile(u(&pf["kv_per_ctx_mtp_on"]));
-    assert_eq!(p.kv_base, u(&pf["KV_BASE"]) + u(&pf["kv_fixed_ladder"]));
-    assert_eq!(p.compute_base, u(&pf["COMPUTE_BASE"]));
-    assert_eq!(p.compute_per_row, u(&pf["COMPUTE_PER_ROW"]));
-    assert_eq!(p.compute_fixed, u(&pf["compute_fixed"]));
-    assert_eq!(p.compute_per_ctx, u(&pf["compute_per_ctx"]));
-    assert_eq!(p.io_base, u(&pf["IO_BASE"]));
-    assert_eq!(p.io_per_row, u(&pf["IO_PER_ROW"]));
-    assert_eq!(p.io_fixed, u(&pf["io_fixed"]));
+    let p = profile(j_u64(&pf["kv_per_ctx_mtp_on"]));
     assert_eq!(
-        p.second_staging_min_cache,
-        u(&pf["SECOND_STAGING_MIN_CACHE"])
+        p.kv_base,
+        j_u64(&pf["KV_BASE"]) + j_u64(&pf["kv_fixed_ladder"])
     );
+    let got = [
+        p.compute_base,
+        p.compute_per_row,
+        p.compute_fixed,
+        p.compute_per_ctx,
+        p.io_base,
+        p.io_per_row,
+        p.io_fixed,
+        p.second_staging_min_cache,
+    ];
+    let want = [
+        "COMPUTE_BASE",
+        "COMPUTE_PER_ROW",
+        "compute_fixed",
+        "compute_per_ctx",
+        "IO_BASE",
+        "IO_PER_ROW",
+        "io_fixed",
+        "SECOND_STAGING_MIN_CACHE",
+    ]
+    .map(|k| j_u64(&pf[k]));
+    assert_eq!(got, want);
     assert_eq!((p.cache_env, p.reserve_env), (CACHE_ENV, RESERVE_ENV));
 }
 
-/// Every (ctx, chunk, others) row of both MTP variants: terms, refusal,
-/// staging layers, fixed, cache slots, wired limit and bound.
 #[test]
 fn admission_matches_the_fixture_rows() {
     let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let mut n = 0;
+    let (inputs, mut n) = (&f["inputs"], 0);
     for name in ["mtp_on", "mtp_off"] {
         let v = &f["variants"][name];
-        let p = profile(u(&v["kv_per_ctx"]));
+        let p = profile(j_u64(&v["kv_per_ctx"]));
         for r in v["rows"].as_array().unwrap() {
             let m = ModelSize {
-                ctx: u(&r["ctx"]),
+                ctx: j_u64(&r["ctx"]),
                 ..base(inputs, v)
             };
-            let rows = u(&r["chunk_rows"]);
-            let others = u(&r["others_gib"]) * G;
+            let (rows, others) = (j_u64(&r["chunk_rows"]), j_u64(&r["others_gib"]) * G);
             let (h, ws) = host(inputs, others);
             let case = format!("{name} ctx {} chunk {rows} others {others}", m.ctx);
             let t = Terms::with(&p, &m, ws, rows);
             let want = &r["terms"];
-            assert_eq!(
-                [
-                    t.dense,
-                    t.staging_layer,
-                    t.kv,
-                    t.compute,
-                    t.io,
-                    t.driver,
-                    t.pool
-                ],
-                [
-                    "dense",
-                    "staging_layer",
-                    "kv",
-                    "compute",
-                    "io",
-                    "driver",
-                    "pool"
-                ]
-                .map(|k| u(&want[k])),
-                "{case}"
-            );
+            let t_got = [
+                t.dense,
+                t.staging_layer,
+                t.kv,
+                t.compute,
+                t.io,
+                t.driver,
+                t.pool,
+            ];
+            let t_want = [
+                "dense",
+                "staging_layer",
+                "kv",
+                "compute",
+                "io",
+                "driver",
+                "pool",
+            ]
+            .map(|k| j_u64(&want[k]));
+            assert_eq!(t_got, t_want, "{case}");
             let got = admit_with(&p, &m, rows, &Limits::default(), &h, &Own::default(), ws);
             match (got, r["refused"].as_bool().unwrap()) {
                 (Err(e), true) => assert!(e.reason.contains("vs budget"), "{case}: {e}"),
                 (Ok(a), false) => {
-                    assert_eq!(a.live, u(&r["live"]), "{case}");
-                    assert_eq!(a.budget(), u(&r["budget"]), "{case}");
-                    assert_eq!(a.staging_layers, u(&r["staging_layers"]), "{case}");
-                    assert_eq!(a.fixed, u(&r["fixed"]), "{case}");
-                    assert_eq!(a.cache_slots, u(&r["cache_slots"]), "{case}");
-                    assert_eq!(a.cache_bytes(), u(&r["cache_bytes"]), "{case}");
-                    assert_eq!(a.wired_limit(), u(&r["wired_limit"]), "{case}");
+                    let a_got = [
+                        a.live,
+                        a.budget(),
+                        a.staging_layers,
+                        a.fixed,
+                        a.cache_slots,
+                        a.cache_bytes(),
+                        a.wired_limit(),
+                    ];
+                    let a_want = [
+                        "live",
+                        "budget",
+                        "staging_layers",
+                        "fixed",
+                        "cache_slots",
+                        "cache_bytes",
+                        "wired_limit",
+                    ]
+                    .map(|k| j_u64(&r[k]));
+                    assert_eq!(a_got, a_want, "{case}");
                     let bound = match r["bound"].as_str().unwrap() {
                         "Live" => Bound::Live,
                         "WorkingSet" => Bound::WorkingSet,
@@ -125,7 +625,7 @@ fn admission_matches_the_fixture_rows() {
                     };
                     assert_eq!(a.bound, bound, "{case}");
                 }
-                (a, refused) => panic!("{case}: got {a:?}, fixture refused {refused}"),
+                (a, refused) => panic!("{case}: got {a:?}, refused={refused}"),
             }
             n += 1;
         }
@@ -133,62 +633,53 @@ fn admission_matches_the_fixture_rows() {
     assert_eq!(n, 2 * 5 * 3 * 3);
 }
 
-/// The context ladder and chunk rule for every `ladder_others_gib` host.
 #[test]
 fn pick_matches_the_fixture_ladder() {
     let f = fixture("admission-addons.json");
     let inputs = &f["inputs"];
-    let max_ctx = u(&inputs["max_context"]) as usize;
+    let max_ctx = j_usize(&inputs["max_context"]);
     assert_eq!(max_ctx, crate::models::hy_v4_flash::DEFAULT_CONTEXT_CAP);
-    assert_eq!(u(&inputs["min_context"]) as usize, MIN_CONTEXT);
-    assert_eq!(
-        inputs["chunk_rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| u(c) as usize)
-            .collect::<Vec<_>>(),
-        CHUNKS
-    );
+    assert_eq!(j_usize(&inputs["min_context"]), MIN_CONTEXT);
+    assert_eq!(j_usizes(&inputs["chunk_rows"]), CHUNKS);
     for name in ["mtp_on", "mtp_off"] {
         let v = &f["variants"][name];
-        let p = profile(u(&v["kv_per_ctx"]));
-        let b = base(inputs, v);
+        let (p, b) = (profile(j_u64(&v["kv_per_ctx"])), base(inputs, v));
         for (others, want) in v["pick"].as_object().unwrap() {
-            let others = others.parse::<u64>().unwrap() * G;
-            let (h, ws) = host(inputs, others);
+            let (h, ws) = host(inputs, others.parse::<u64>().unwrap() * G);
             let case = format!("{name} others {others}");
             let got = pick(&p, &b, max_ctx, &Limits::default(), &h, &Own::default(), ws);
             if !want["admitted"].as_bool().unwrap() {
-                let e = got.unwrap_err().reason;
-                assert!(e.contains("refused at context 16384"), "{case}: {e}");
+                assert!(
+                    got.unwrap_err().reason.contains("refused at context 16384"),
+                    "{case}"
+                );
                 continue;
             }
             let got = got.unwrap();
-            assert_eq!(got.ctx, u(&want["ctx"]) as usize, "{case}");
-            assert_eq!(got.chunk, u(&want["chunk_rows"]) as usize, "{case}");
             let a = got.admission;
-            assert_eq!(a.cache_bytes(), u(&want["cache_bytes"]), "{case}");
-            assert_eq!(a.staging_layers, u(&want["staging_layers"]), "{case}");
-            assert_eq!(a.wired_limit(), u(&want["wired_limit"]), "{case}");
             assert_eq!(
-                a.terms,
-                Terms::with(
-                    &p,
-                    &ModelSize {
-                        ctx: got.ctx as u64,
-                        ..b
-                    },
-                    ws,
-                    got.chunk as u64
-                )
+                (got.ctx, got.chunk),
+                (j_usize(&want["ctx"]), j_usize(&want["chunk_rows"])),
+                "{case}"
             );
+            assert_eq!(
+                [a.cache_bytes(), a.staging_layers, a.wired_limit()],
+                [
+                    j_u64(&want["cache_bytes"]),
+                    j_u64(&want["staging_layers"]),
+                    j_u64(&want["wired_limit"])
+                ],
+                "{case}"
+            );
+            let m = ModelSize {
+                ctx: got.ctx as u64,
+                ..b
+            };
+            assert_eq!(a.terms, Terms::with(&p, &m, ws, got.chunk as u64));
         }
     }
 }
 
-/// A context below every chunk charges its own length; a refused context
-/// below the floor errs at once.
 #[test]
 fn pick_below_the_floor() {
     let p = profile(15_812);
@@ -198,200 +689,106 @@ fn pick_below_the_floor() {
         n_experts: 1024,
         ctx: 0,
     };
-    let h = HostMemory {
-        physical: 128 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
-    let ws = 96_000_000_000;
+    let (h, ws) = (host_mem(128 * G, 20 * G), 96_000_000_000);
     let got = pick(&p, &b, 4096, &Limits::default(), &h, &Own::default(), ws).unwrap();
     assert_eq!((got.ctx, got.chunk), (4096, 4096));
-    let m = ModelSize { ctx: 4096, ..b };
-    assert_eq!(got.admission.terms, Terms::with(&p, &m, ws, 4096));
-    let busy = HostMemory {
-        wired: 100 * G,
-        ..h
-    };
+    assert_eq!(
+        got.admission.terms,
+        Terms::with(&p, &ModelSize { ctx: 4096, ..b }, ws, 4096)
+    );
+    let busy = host_mem(128 * G, 100 * G);
     let e = pick(&p, &b, 8192, &Limits::default(), &busy, &Own::default(), ws)
         .unwrap_err()
         .reason;
     assert!(e.contains("refused at context 8192"), "{e}");
 }
 
-/// The second turn of a 256K load bound by live memory: the sessions' KV,
-/// allocated after the load's reading, is this model's and keeps the bank;
-/// read as others' it would drop the bank to staging only.
 #[test]
 fn readmission_counts_the_session_kv_as_own() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let others = 50 * G;
-    let (h0, ws) = host(inputs, others);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let load = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    assert_eq!(load.ctx, max_ctx);
-    assert_eq!(load.admission.bound, Bound::Live);
-    let m = ModelSize {
-        ctx: load.ctx as u64,
-        ..b
-    };
-    let kv = p.kv_per_ctx * load.ctx as u64;
-    assert!(kv > crate::moe_stream::budget::KEEP_SLACK);
-    let h1 = HostMemory {
-        wired: others + b.dense + kv,
-        ..h0
-    };
-    let turn = |own: Own| {
-        readmit_with(
-            &p,
-            &load.admission,
-            &m,
-            load.chunk as u64,
-            &Limits::default(),
-            &h1,
-            &own,
-            ws,
-        )
-        .unwrap()
-    };
-    assert_eq!(turn(own_of(b.dense, kv, 0, true, 0, 0)), Turn::Keep);
-    assert!(matches!(
-        turn(own_of(b.dense, 0, 0, true, 0, 0)),
-        Turn::StagingOnly(_)
-    ));
-}
-
-/// A load bound by live memory at a turn: the MLX free pool counts as own
-/// up to the admission's pool term, so it keeps the bank; read as others'
-/// with more than the slack in use elsewhere it drops it. Pool past the
-/// term and any other footprint of the process (another loaded model,
-/// scratch) are others'.
-#[test]
-fn readmission_counts_the_free_pool_up_to_its_term() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let others = 50 * G;
-    let (h0, ws) = host(inputs, others);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let load = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    assert_eq!(load.admission.bound, Bound::Live);
-    let m = ModelSize {
-        ctx: load.ctx as u64,
-        ..b
-    };
-    let a = load.admission;
-    let term = a.terms.pool;
-    assert_eq!(term, crate::moe_stream::budget::KEEP_SLACK);
-    let resident = a.cache_bytes();
-    let counted = b.dense + resident;
-    let turn = |in_use: u64, own: Own| {
-        let h = HostMemory {
-            wired: others + counted + in_use,
-            ..h0
-        };
-        readmit_with(
-            &p,
-            &a,
-            &m,
-            load.chunk as u64,
-            &Limits::default(),
-            &h,
-            &own,
-            ws,
-        )
-        .unwrap()
-    };
-    let elsewhere = G;
+    let rig = AdmissionRig::mtp_on(50);
     assert_eq!(
-        turn(
-            term + elsewhere,
-            own_of(b.dense, 0, resident, true, term, term)
-        ),
+        (rig.load.ctx, rig.load.admission.bound),
+        (rig.max_ctx, Bound::Live)
+    );
+    let kv = rig.p.kv_per_ctx * rig.load.ctx as u64;
+    assert!(kv > KEEP_SLACK);
+    let h1 = HostMemory {
+        wired: rig.others + rig.base.dense + kv,
+        ..rig.h0
+    };
+    assert_eq!(
+        rig.readmit(&h1, &own_of(rig.base.dense, kv, 0, true, 0, 0)),
         Turn::Keep
     );
     assert!(matches!(
-        turn(
-            term + elsewhere,
-            own_of(b.dense, 0, resident, true, term, 0)
-        ),
+        rig.readmit(&h1, &own_of(rig.base.dense, 0, 0, true, 0, 0)),
         Turn::StagingOnly(_)
     ));
-    let over = 3 * G;
-    assert!(matches!(
-        turn(
-            term + over,
-            own_of(b.dense, 0, resident, true, term + over, term)
-        ),
-        Turn::StagingOnly(_)
-    ));
-    let model = 3 * G;
-    assert!(matches!(
-        turn(model, own_of(b.dense, 0, resident, true, 0, term)),
-        Turn::StagingOnly(_)
-    ));
-    assert_eq!(
-        own_of(b.dense, 0, resident, true, term + over, term).bytes(),
-        counted + term
-    );
-    assert_eq!(
-        own_of(b.dense, 0, resident, false, 0, term).volatile,
-        resident
-    );
 }
 
-/// A turn start whose host still counts the bank purgeable after Metal made
-/// it non-volatile (measured readings, GB): `host_used` leaves purgeable
-/// pages out (from the anonymous ones), so others' pages vanished (bank
-/// wired) or the bank did (bank anonymous) and the bank grew past the host.
-/// Settled for the bank pages still counted, others read as at a normal
-/// turn start; other processes' volatile pages stay reclaimable.
+#[test]
+fn readmission_counts_the_free_pool_up_to_its_term() {
+    let rig = AdmissionRig::mtp_on(50);
+    let a = rig.load.admission;
+    assert_eq!((a.bound, a.terms.pool), (Bound::Live, KEEP_SLACK));
+    let (term, res, d) = (a.terms.pool, a.cache_bytes(), rig.base.dense);
+    let turn = |in_use: u64, own: Own| {
+        rig.readmit(
+            &HostMemory {
+                wired: rig.others + d + res + in_use,
+                ..rig.h0
+            },
+            &own,
+        )
+    };
+    assert_eq!(
+        turn(term + G, own_of(d, 0, res, true, term, term)),
+        Turn::Keep
+    );
+    assert!(matches!(
+        turn(term + G, own_of(d, 0, res, true, term, 0)),
+        Turn::StagingOnly(_)
+    ));
+    assert!(matches!(
+        turn(term + 3 * G, own_of(d, 0, res, true, term + 3 * G, term)),
+        Turn::StagingOnly(_)
+    ));
+    assert!(matches!(
+        turn(3 * G, own_of(d, 0, res, true, 0, term)),
+        Turn::StagingOnly(_)
+    ));
+    assert_eq!(
+        own_of(d, 0, res, true, term + 3 * G, term).bytes(),
+        d + res + term
+    );
+    assert_eq!(own_of(d, 0, res, false, 0, term).volatile, res);
+}
+
 #[test]
 fn readmission_settles_the_bank_pages_still_counted_purgeable() {
     let gb = |x: f64| (x * 1e9) as u64;
-    let hm = |wired, anonymous, purgeable| HostMemory {
+    let hm = |w, a, p| HostMemory {
         physical: gb(137.44),
         free: 0,
         file: 0,
-        anonymous: gb(anonymous),
-        purgeable: gb(purgeable),
-        wired: gb(wired),
+        anonymous: gb(a),
+        purgeable: gb(p),
+        wired: gb(w),
         compressor: gb(5.17),
     };
-    let resident = gb(54.94);
-    let held = Residency {
-        resident,
-        volatile: 0,
-    };
-    let listed = Residency {
-        resident,
-        volatile: resident,
-    };
-    let o = own_of(gb(11.35), gb(3.83), resident, true, 0, 0);
-    let others = |h: HostMemory, bank: Residency| {
+    let res = gb(54.94);
+    let (held, listed) = (
+        Residency {
+            resident: res,
+            volatile: 0,
+        },
+        Residency {
+            resident: res,
+            volatile: res,
+        },
+    );
+    let o = own_of(gb(11.35), gb(3.83), res, true, 0, 0);
+    let others = |h, bank| {
         settled(h, bank, true)
             .non_reclaimable()
             .saturating_sub(o.bytes()) as f64
@@ -399,117 +796,53 @@ fn readmission_settles_the_bank_pages_still_counted_purgeable() {
     };
     let normal = others(hm(79.75, 20.22, 0.47), held);
     for h in [hm(79.66, 20.15, 55.47), hm(8.94, 90.61, 55.47)] {
-        assert!(others(h, held) < normal - 15.0, "{}", others(h, held));
-        assert!(
-            (others(h, listed) - normal).abs() < 1.0,
-            "{}",
-            others(h, listed)
-        );
+        assert!(others(h, held) < normal - 15.0 && (others(h, listed) - normal).abs() < 1.0);
     }
-    let foreign = hm(79.75, 70.22, 50.47);
-    assert!((others(foreign, held) - normal).abs() < 0.01);
+    assert!((others(hm(79.75, 70.22, 50.47), held) - normal).abs() < 0.01);
     let h = hm(79.66, 20.15, 55.47);
     assert_eq!(settled(h, listed, false), h);
 
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let others = 50 * G;
-    let (h0, ws) = host(inputs, others);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let load = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    let a = load.admission;
-    let m = ModelSize {
-        ctx: load.ctx as u64,
-        ..b
-    };
-    let resident = a.cache_bytes();
-    assert!(resident > crate::moe_stream::budget::GROW_MIN);
+    let rig = AdmissionRig::mtp_on(50);
+    let res = rig.load.admission.cache_bytes();
+    assert!(res > GROW_MIN);
     let lagging = HostMemory {
-        wired: others - 20 * G + b.dense,
-        anonymous: 20 * G + resident,
-        purgeable: resident,
-        ..h0
+        wired: rig.others - 20 * G + rig.base.dense,
+        anonymous: 20 * G + res,
+        purgeable: res,
+        ..rig.h0
     };
-    let o = own_of(b.dense, 0, resident, true, 0, 0);
-    let turn = |volatile: u64| {
-        let h = settled(lagging, Residency { resident, volatile }, true);
-        readmit_with(
-            &p,
-            &a,
-            &m,
-            load.chunk as u64,
-            &Limits::default(),
-            &h,
-            &o,
-            ws,
-        )
-        .unwrap()
-    };
-    assert!(matches!(turn(0), Turn::Rebuild(_)));
-    assert_eq!(turn(resident), Turn::Keep);
-    assert_eq!(wary_growth(turn(0), || Ok(turn(resident))), Turn::Keep);
+    let o = own_of(rig.base.dense, 0, res, true, 0, 0);
+    let (t0, tr) = (
+        rig.readmit_settled(lagging, res, 0, &o),
+        rig.readmit_settled(lagging, res, res, &o),
+    );
+    assert!(matches!(t0, Turn::Rebuild(_)) && tr == Turn::Keep);
+    assert_eq!(wary_growth(t0, || Ok(tr)), Turn::Keep);
+
     let roomy = HostMemory {
-        wired: others - 30 * G + b.dense + resident,
+        wired: rig.others - 30 * G + rig.base.dense + res,
         anonymous: 20 * G,
         purgeable: G,
-        ..h0
+        ..rig.h0
     };
-    let at =
-        |h: &HostMemory| readmit_with(&p, &a, &m, load.chunk as u64, &Limits::default(), h, &o, ws);
-    let all = Residency {
-        resident,
-        volatile: resident,
+    let Turn::Rebuild(wary) = rig.readmit_settled(roomy, res, res, &o) else {
+        panic!("no room");
     };
-    let Turn::Rebuild(wary) = at(&settled(roomy, all, true)).unwrap() else {
-        panic!("no room on the wary reading");
-    };
-    assert!(matches!(at(&roomy).unwrap(), Turn::Rebuild(_)));
+    let r_raw = rig.readmit(&roomy, &o);
+    assert!(matches!(r_raw, Turn::Rebuild(_)));
     assert_eq!(
-        wary_growth(at(&roomy).unwrap(), || at(&settled(roomy, all, true))),
+        wary_growth(r_raw, || Ok(rig.readmit_settled(roomy, res, res, &o))),
         Turn::Rebuild(wary)
     );
     assert_eq!(
-        wary_growth(Turn::Keep, || panic!("no wary reading needed")),
+        wary_growth(Turn::Keep, || panic!("no wary needed")),
         Turn::Keep
     );
 }
 
-/// A bank the host has no room for shrinks to what the host admits now
-/// (staging only when that admits no cache), at a turn start and inside a
-/// turn; growth that would empty a bank holding cache slots waits for a
-/// turn start.
 #[test]
 fn next_bank_shrinks_to_what_the_host_admits() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let (h0, ws) = host(inputs, 50 * G);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let a = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap()
-    .admission;
+    let a = AdmissionRig::mtp_on(50).load.admission;
     assert!(a.cache_slots > 0);
     let smaller = Admission {
         cache_slots: a.cache_slots / 2,
@@ -523,11 +856,16 @@ fn next_bank_shrinks_to_what_the_host_admits() {
     };
     let never = || -> Result<Admission> { panic!("no reading needed") };
     for in_turn in [false, true] {
-        let next = |turn, cur: &Admission, lost| next_bank(turn, cur, lost, in_turn, never);
-        assert_eq!(next(Turn::Keep, &a, false), None);
-        assert_eq!(next(Turn::Keep, &a, true), Some(a));
-        assert_eq!(next(Turn::Rebuild(a), &staging, false), Some(a));
-        assert_eq!(next(Turn::Rebuild(a), &smaller, true), Some(a));
+        assert_eq!(next_bank(Turn::Keep, &a, false, in_turn, never), None);
+        assert_eq!(next_bank(Turn::Keep, &a, true, in_turn, never), Some(a));
+        assert_eq!(
+            next_bank(Turn::Rebuild(a), &staging, false, in_turn, never),
+            Some(a)
+        );
+        assert_eq!(
+            next_bank(Turn::Rebuild(a), &smaller, true, in_turn, never),
+            Some(a)
+        );
         assert_eq!(
             next_bank(Turn::Rebuild(a), &smaller, false, in_turn, never),
             (!in_turn).then_some(a)
@@ -549,195 +887,124 @@ fn next_bank_shrinks_to_what_the_host_admits() {
     }
 }
 
-/// The wary reading counts others' volatile pages as used, so it can refuse
-/// even the staging layer the host reading admitted: the turn (and every
-/// lane's step inside one) then runs staging only instead of failing.
 #[test]
 fn next_bank_runs_staging_only_when_the_wary_reading_refuses() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let (h0, ws) = host(inputs, 50 * G);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let load = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    let a = load.admission;
-    let m = ModelSize {
-        ctx: load.ctx as u64,
-        ..b
-    };
-    let resident = a.cache_bytes();
-    let one = a.terms.fixed(1);
-    // others' volatile pages the size of the bank; the host admits one
-    // staging layer, the wary reading (the bank resident, those pages used)
-    // not even that
-    let o = own_of(b.dense, 0, resident, true, 0, 0);
-    let room = one + G;
+    let rig = AdmissionRig::mtp_on(50);
+    let a = rig.load.admission;
+    let res = a.cache_bytes();
+    let o = own_of(rig.base.dense, 0, res, true, 0, 0);
     let h = HostMemory {
-        wired: h0.physical - Limits::default().reserve - room + b.dense,
-        anonymous: 2 * resident,
-        purgeable: resident,
-        ..h0
+        wired: rig.h0.physical - Limits::default().reserve - (a.terms.fixed(1) + G)
+            + rig.base.dense,
+        anonymous: 2 * res,
+        purgeable: res,
+        ..rig.h0
     };
     let all = Residency {
-        resident,
-        volatile: resident,
+        resident: res,
+        volatile: res,
     };
-    let at = |h: &HostMemory| admit_with(&p, &m, load.chunk as u64, &Limits::default(), h, &o, ws);
-    let host_turn = readmit_with(
-        &p,
-        &a,
-        &m,
-        load.chunk as u64,
-        &Limits::default(),
-        &h,
-        &o,
-        ws,
-    )
-    .unwrap();
+    let host_turn = rig.readmit(&h, &o);
     let Turn::StagingOnly(s) = host_turn else {
-        panic!("{host_turn:?}");
+        panic!("{host_turn:?}")
     };
     assert_eq!((s.cache_slots, s.staging_layers), (0, 1));
-    let e = at(&settled(h, all, true)).unwrap_err().reason;
-    assert!(e.contains("vs budget"), "{e}");
+    let wary = settled(h, all, true);
+    assert!(
+        rig.admit(&wary, &o)
+            .unwrap_err()
+            .reason
+            .contains("vs budget")
+    );
     for in_turn in [false, true] {
         assert_eq!(
-            next_bank(host_turn, &a, false, in_turn, || at(&settled(h, all, true))),
+            next_bank(host_turn, &a, false, in_turn, || rig.admit(&wary, &o)),
             Some(s)
         );
     }
 }
 
-/// A turn start's flip to non-volatile can leave the bank in the host's
-/// purgeable count (measured, GB: 55.47 right after the flip, the bank's
-/// 54.94 plus the usual 0.5; 0.3-0.5 at every in-turn reading). The count
-/// before the flip tells the bank's share from others' volatile pages.
 #[test]
 fn flip_lag_reads_the_bank_left_in_the_count() {
     let gb = |x: f64| (x * 1e9) as u64;
-    let bank = gb(54.94);
-    let before = gb(0.47) + bank;
-    assert_eq!(flip_lag(before, gb(55.47), bank), bank);
-    assert_eq!(flip_lag(before, gb(0.47), bank), 0);
-    assert_eq!(flip_lag(before, gb(0.40), bank), 0);
-    assert_eq!(flip_lag(before, gb(0.60), bank), gb(0.60) - gb(0.47));
-    assert_eq!(flip_lag(before, gb(30.47), bank), gb(30.47) - gb(0.47));
-    assert_eq!(flip_lag(gb(10.0), gb(55.47), bank), 0);
-    assert_eq!(flip_lag(gb(0.47), gb(0.47), 0), 0);
+    let (bank, before) = (gb(54.94), gb(0.47) + gb(54.94));
+    for (pre, post, vol, want) in [
+        (before, gb(55.47), bank, bank),
+        (before, gb(0.47), bank, 0),
+        (before, gb(0.40), bank, 0),
+        (before, gb(0.60), bank, gb(0.60) - gb(0.47)),
+        (before, gb(30.47), bank, gb(30.47) - gb(0.47)),
+        (gb(10.0), gb(55.47), bank, 0),
+        (gb(0.47), gb(0.47), 0, 0),
+    ] {
+        assert_eq!(flip_lag(pre, post, vol), want);
+    }
 }
 
-/// The shrink at a turn start reads the host with the bank the flip left in
-/// the purgeable count taken out: a stale count no longer hides others that
-/// grew past the slack, and others' own volatile pages stay reclaimable, so
-/// a host with room keeps a warm bank (the wary reading would empty it).
 #[test]
 fn turn_start_shrink_reads_the_flip_lag() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let others = 50 * G;
-    let (h0, ws) = host(inputs, others);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let load = pick(
-        &p,
-        &b,
-        max_ctx,
-        &Limits::default(),
-        &h0,
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    let a = load.admission;
-    assert_eq!(a.bound, Bound::Live);
-    let m = ModelSize {
-        ctx: load.ctx as u64,
-        ..b
-    };
-    let resident = a.cache_bytes();
-    let slack = crate::moe_stream::budget::KEEP_SLACK;
-    assert!(resident > 2 * slack);
-    let o = own_of(b.dense, 0, resident, true, 0, 0);
-    let turn = |h: &HostMemory, volatile: u64| {
-        let h = settled(*h, Residency { resident, volatile }, true);
-        readmit_with(
-            &p,
-            &a,
-            &m,
-            load.chunk as u64,
-            &Limits::default(),
-            &h,
-            &o,
-            ws,
-        )
-        .unwrap()
-    };
-    // bank anonymous, 20 GiB of others' anonymous pages, the count still
-    // holding the bank after the flip
-    let stale = |grown: u64| HostMemory {
-        wired: others + grown - 20 * G + b.dense,
-        anonymous: 20 * G + resident,
-        purgeable: resident,
-        ..h0
-    };
-    let before = resident;
-    for grown in [0, slack + 2 * G] {
-        let h = stale(grown);
-        let lag = flip_lag(before, h.purgeable, resident);
-        assert_eq!(lag, resident);
-        assert!(!matches!(turn(&h, 0), Turn::StagingOnly(_)));
-        let read = turn(&h, lag);
-        assert_eq!(matches!(read, Turn::StagingOnly(_)), grown > 0, "{read:?}");
+    let rig = AdmissionRig::mtp_on(50);
+    let res = rig.load.admission.cache_bytes();
+    assert!(rig.load.admission.bound == Bound::Live && res > 2 * KEEP_SLACK);
+    let o = own_of(rig.base.dense, 0, res, true, 0, 0);
+    for grown in [0, KEEP_SLACK + 2 * G] {
+        let h = HostMemory {
+            wired: rig.others + grown - 20 * G + rig.base.dense,
+            anonymous: 20 * G + res,
+            purgeable: res,
+            ..rig.h0
+        };
+        let lag = flip_lag(res, h.purgeable, res);
+        assert_eq!(lag, res);
+        assert!(!matches!(
+            rig.readmit_settled(h, res, 0, &o),
+            Turn::StagingOnly(_)
+        ));
+        assert_eq!(
+            matches!(rig.readmit_settled(h, res, lag, &o), Turn::StagingOnly(_)),
+            grown > 0
+        );
     }
-    // a current count holding others' volatile pages the size of the slack
-    // and more: no lag, the bank stays
-    let foreign = 3 * slack;
+    let foreign = 3 * KEEP_SLACK;
     let h = HostMemory {
-        wired: others - 20 * G + b.dense,
-        anonymous: 20 * G + foreign + resident,
+        wired: rig.others - 20 * G + rig.base.dense,
+        anonymous: 20 * G + foreign + res,
         purgeable: foreign,
-        ..h0
+        ..rig.h0
     };
-    let lag = flip_lag(foreign + resident, h.purgeable, resident);
-    assert_eq!(lag, 0);
-    assert_eq!(turn(&h, lag), Turn::Keep);
-    assert!(matches!(turn(&h, resident), Turn::StagingOnly(_)));
+    assert_eq!(flip_lag(foreign + res, h.purgeable, res), 0);
+    assert_eq!(rig.readmit_settled(h, res, 0, &o), Turn::Keep);
+    assert!(matches!(
+        rig.readmit_settled(h, res, res, &o),
+        Turn::StagingOnly(_)
+    ));
 }
 
 #[test]
 fn staging_charge_is_two_full_layers() {
     let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
+    let (inputs, v) = (&f["inputs"], &f["variants"]["mtp_on"]);
     let m = ModelSize {
         ctx: 262_144,
         ..base(inputs, v)
     };
-    let t = Terms::with(&profile(u(&v["kv_per_ctx"])), &m, u(&inputs["ws"]), 8192);
+    let t = Terms::with(
+        &profile(j_u64(&v["kv_per_ctx"])),
+        &m,
+        j_u64(&inputs["ws"]),
+        8192,
+    );
     assert_eq!(t.staging_layer * 2, 9_550_430_208);
-    let adm = fixture("admission.json");
-    let bank = 2 * 512 * (u(&adm["inputs"]["slot_a"]) + u(&adm["inputs"]["slot_b"]));
-    assert_eq!(bank, 8_965_324_800);
-    assert!(t.staging_layer * 2 >= bank);
+    let cls = fixture("expert-classes.json");
+    let a = j_u64(&cls["slots"]["A"]["mlx_slot_bytes"]);
+    let b = j_u64(&cls["slots"]["B"]["mlx_slot_bytes"]);
+    assert_eq!(2 * 512 * (a + b), 8_965_324_800);
+    assert!(t.staging_layer * 2 >= 2 * 512 * (a + b));
 }
 
-/// MLX's qmv batch limit per generation, size letter and shape class.
 #[test]
 fn qmv_batch_limit_follows_mlx() {
-    let cases = [
+    for (arch, want) in [
         ("applegpu_g17s", [33, 25, 13]),
         ("applegpu_g17g", [33, 25, 13]),
         ("applegpu_g17d", [32, 18, 12]),
@@ -750,8 +1017,7 @@ fn qmv_batch_limit_follows_mlx() {
         ("applegpu_g13d", [32, 18, 12]),
         ("applegpu_g12s", [18, 12, 10]),
         ("", [18, 12, 10]),
-    ];
-    for (arch, want) in cases {
+    ] {
         let got =
             [(2048, 2048), (4096, 1024), (3072, 8192)].map(|(k, n)| qmv_batch_limit(arch, k, n));
         assert_eq!(got, want, "{arch}");
@@ -760,8 +1026,6 @@ fn qmv_batch_limit_follows_mlx() {
     assert_eq!(qmv_batch_limit("applegpu_g17s", 16, 4097), 13);
 }
 
-/// Hy4's shape classes (small k_b / v_b, medium kv_a, large gate): 12 rows
-/// on M3-M5 Max, 11 on an Ultra, 5-6 on M1/M2; the env sets every limit.
 #[test]
 fn row_cap_is_one_below_the_smallest_limit() {
     let shapes = [
@@ -804,16 +1068,17 @@ fn splitk_env_reads_like_atoi() {
     }
 }
 
-/// Each lane past the first adds its floor to the KV base, nothing else.
 #[test]
 fn lanes_charge_their_floor() {
-    let cfg = crate::models::hy_v4_flash::tests_model::tiny_cfg();
+    let cfg = tiny_cfg();
     let floor = lane_floor(&cfg, false);
     assert_eq!(floor, 2 * 11 * 24 * 2 + 2 * 6 * 16 * 4);
     assert_eq!(lane_floor(&cfg, true) - floor, SEEDS as u64 * 32 * 4);
     let p = profile(15_812);
-    assert_eq!(lane_profile(&p, 1, floor), p);
-    assert_eq!(lane_profile(&p, 0, floor), p);
+    assert_eq!(
+        (lane_profile(&p, 1, floor), lane_profile(&p, 0, floor)),
+        (p, p)
+    );
     let four = lane_profile(&p, 4, floor);
     assert_eq!(four.kv_base, p.kv_base + 3 * floor);
     assert_eq!(
@@ -825,23 +1090,18 @@ fn lanes_charge_their_floor() {
     );
 }
 
-/// A lane past the first with the MTP layer also holds its draft's pooled
-/// keys for the whole context (f16, one row per group).
-/// Mutation: `lane_bytes` returns `lane_floor` → red.
 #[test]
 fn lane_bytes_price_the_draft_pooled_keys() {
-    let cfg = crate::models::hy_v4_flash::tests_model::tiny_cfg();
+    let cfg = tiny_cfg();
     for ctx in [0, 64, 262_144] {
         assert_eq!(lane_bytes(&cfg, false, ctx), lane_floor(&cfg, false));
         assert_eq!(
             lane_bytes(&cfg, true, ctx),
-            lane_floor(&cfg, true) + (ctx / 4) as u64 * 16 * 2,
-            "ctx {ctx}"
+            lane_floor(&cfg, true) + (ctx / 4) as u64 * 32
         );
     }
 }
 
-/// The most lanes that admit win; one lane's refusal is the error.
 #[test]
 fn plan_lanes_steps_down_to_what_fits() {
     let fits = |max: usize| {
@@ -853,71 +1113,53 @@ fn plan_lanes_steps_down_to_what_fits() {
             }
         }
     };
-    assert_eq!(plan_lanes(4, fits(4)).unwrap(), (4, 40));
-    assert_eq!(plan_lanes(4, fits(2)).unwrap(), (2, 20));
+    assert_eq!(
+        (
+            plan_lanes(4, fits(4)).unwrap(),
+            plan_lanes(4, fits(2)).unwrap()
+        ),
+        ((4, 40), (2, 20))
+    );
     assert_eq!(plan_lanes(0, fits(4)).unwrap(), (1, 10));
     assert_eq!(plan_lanes(3, fits(0)).unwrap_err().reason, "1 lanes");
 }
 
-/// Lanes are fitted at the one-lane context and chunk: for every lane
-/// floor the load keeps the one-lane pick's window and chunk and takes the
-/// most lanes that admit there; with the ladder run per lane count some
-/// floors would shrink the window or the chunk.
 #[test]
 fn lanes_keep_the_one_lane_window_and_chunk() {
-    let f = fixture("admission-addons.json");
-    let inputs = &f["inputs"];
-    let v = &f["variants"]["mtp_on"];
-    let p = profile(u(&v["kv_per_ctx"]));
-    let b = base(inputs, v);
-    let max_ctx = u(&inputs["max_context"]) as usize;
-    let (h, ws) = host(inputs, 50 * G);
-    let (l, own) = (Limits::default(), Own::default());
-    let one = pick(&p, &b, max_ctx, &l, &h, &own, ws).unwrap();
-    let at = ModelSize {
-        ctx: one.ctx as u64,
-        ..b
-    };
-    let mut shrunk = 0;
+    let rig = AdmissionRig::mtp_on(50);
+    let (l, own, one, mut shrunk) = (Limits::default(), Own::default(), rig.load, 0);
     for quarter in 1..=160u64 {
         let floor = quarter * G / 4;
         let admit = |n: usize| {
-            admit_with(
-                &lane_profile(&p, n, floor),
-                &at,
-                one.chunk as u64,
-                &l,
-                &h,
-                &own,
-                ws,
-            )
+            let lp = lane_profile(&rig.p, n, floor);
+            admit_with(&lp, &rig.m, one.chunk as u64, &l, &rig.h0, &own, rig.ws)
         };
         let (lanes, got) = lanes_at(one, LANES_MAX, admit);
-        assert_eq!((got.ctx, got.chunk), (one.ctx, one.chunk), "floor {floor}");
         let most = (1..=LANES_MAX)
             .rev()
             .find(|&n| n == 1 || admit(n).is_ok())
             .unwrap();
-        assert_eq!(lanes, most, "floor {floor}");
-        if lanes > 1 {
-            assert_eq!(got.admission, admit(lanes).unwrap(), "floor {floor}");
-        } else {
-            assert_eq!(got.admission, one.admission, "floor {floor}");
-        }
-        if let Ok(ladder) = pick(
-            &lane_profile(&p, LANES_MAX, floor),
-            &b,
-            max_ctx,
-            &l,
-            &h,
-            &own,
-            ws,
-        ) && (ladder.ctx, ladder.chunk) != (one.ctx, one.chunk)
+        assert_eq!(
+            (got.ctx, got.chunk, lanes),
+            (one.ctx, one.chunk, most),
+            "floor {floor}"
+        );
+        assert_eq!(
+            got.admission,
+            if lanes > 1 {
+                admit(lanes).unwrap()
+            } else {
+                one.admission
+            }
+        );
+        let lp_max = lane_profile(&rig.p, LANES_MAX, floor);
+        if let Ok(lad) = pick(&lp_max, &rig.base, rig.max_ctx, &l, &rig.h0, &own, rig.ws)
+            && (lad.ctx, lad.chunk) != (one.ctx, one.chunk)
         {
             shrunk += 1;
         }
     }
-    assert!(shrunk > 0, "no floor shrinks the window or the chunk");
+    assert!(shrunk > 0);
 }
 
 #[test]
@@ -929,47 +1171,56 @@ fn cache_split_follows_the_layer_counts() {
     for bytes in [0, 4_663_296, 17 * G, 48 * G + 12_345, 56_299_972_608] {
         let [a, b] = c.split(bytes);
         let used = a as u64 * c.slot[0] + b as u64 * c.slot[1];
-        assert!(used <= bytes, "{bytes}");
-        assert!(bytes - used < c.slot[1], "{bytes}: {a} {b}");
+        assert!(
+            used <= bytes && bytes - used < c.slot[1],
+            "{bytes}: {a} {b}"
+        );
         if bytes >= 17 * G {
-            // equal slots per layer within one round
-            let (pa, pb) = (a as f64 / 19.0, b as f64 / 22.0);
-            assert!((pa - pb).abs() < 1.0, "{bytes}: {pa} {pb}");
+            assert!((a as f64 / 19.0 - b as f64 / 22.0).abs() < 1.0);
         }
     }
-    let only_b = Classes {
-        layers: [0, 22],
-        ..c
-    };
-    assert_eq!(only_b.split(10 * c.slot[1] + 1), [0, 10]);
-    let only_a = Classes {
-        layers: [19, 0],
-        ..c
-    };
-    assert_eq!(only_a.split(10 * c.slot[0] + 1), [10, 0]);
-    let none = Classes {
-        layers: [0, 0],
-        ..c
-    };
-    assert_eq!(none.split(G), [0, 0]);
+    assert_eq!(
+        Classes {
+            layers: [0, 22],
+            ..c
+        }
+        .split(10 * c.slot[1] + 1),
+        [0, 10]
+    );
+    assert_eq!(
+        Classes {
+            layers: [19, 0],
+            ..c
+        }
+        .split(10 * c.slot[0] + 1),
+        [10, 0]
+    );
+    assert_eq!(
+        Classes {
+            layers: [0, 0],
+            ..c
+        }
+        .split(G),
+        [0, 0]
+    );
 }
 
 #[test]
 fn chunk_env_values() {
-    assert_eq!(chunk_cap(None).unwrap(), None);
-    assert_eq!(chunk_cap(Some(" ")).unwrap(), None);
-    assert_eq!(chunk_cap(Some("4096")).unwrap(), Some(4096));
-    assert_eq!(chunk_cap(Some(" 256 ")).unwrap(), Some(256));
-    for v in ["0", "128", "1000", "-256", "abc", "4096.0"] {
-        let e = chunk_cap(Some(v)).unwrap_err().reason;
-        assert!(e.contains(CHUNK_ENV), "{v}: {e}");
+    for (raw, want) in [
+        (None, None),
+        (Some(" "), None),
+        (Some("4096"), Some(4096)),
+        (Some(" 256 "), Some(256)),
+    ] {
+        assert_eq!(chunk_cap(raw).unwrap(), want, "{raw:?}");
     }
-}
-
-fn real_scan() -> Scan {
-    let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
-    let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();
-    Scan::open(&paths).unwrap()
+    for bad in ["0", "128", "1000", "-256", "abc", "4096.0"] {
+        assert!(
+            chunk_cap(Some(bad)).unwrap_err().reason.contains(CHUNK_ENV),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -979,36 +1230,36 @@ fn real_sizes_match_the_oracle() {
     let sizes = Sizes::of(&s).unwrap();
     let addons = fixture("admission-addons.json");
     let inputs = &addons["inputs"];
-    assert_eq!(sizes.dense_trunk, u(&inputs["dense_trunk"]));
+    assert_eq!(sizes.dense_trunk, j_u64(&inputs["dense_trunk"]));
     let mtp = fixture("mtp-tensors.json");
-    let draft_head = crate::models::hy_v4_flash::mtp::draft_head_bytes(&s).unwrap();
-    assert_eq!(
-        sizes.dense_mtp,
-        u(&mtp["totals"]["plan_bytes"]) + draft_head
-    );
-    let adm = fixture("admission.json");
+    let dh = crate::models::hy_v4_flash::mtp::draft_head_bytes(&s).unwrap();
+    assert_eq!(sizes.dense_mtp, j_u64(&mtp["totals"]["plan_bytes"]) + dh);
+    let cls = fixture("expert-classes.json");
     assert_eq!(
         sizes.classes.slot,
-        [u(&adm["inputs"]["slot_a"]), u(&adm["inputs"]["slot_b"])]
+        [
+            j_u64(&cls["slots"]["A"]["mlx_slot_bytes"]),
+            j_u64(&cls["slots"]["B"]["mlx_slot_bytes"])
+        ]
     );
     assert_eq!(sizes.classes.layers, [19, 22]);
     let m = sizes.model(true, 262_144);
     assert_eq!(
-        (m.dense, m.slot, m.n_experts),
-        (
-            sizes.dense_trunk + sizes.dense_mtp,
-            u(&inputs["slot"]),
-            u(&inputs["n_experts"])
-        )
+        (m.dense, m.slot),
+        (sizes.dense_trunk + sizes.dense_mtp, j_u64(&inputs["slot"]))
     );
-    assert_eq!(sizes.model(false, 1).dense, sizes.dense_trunk);
+    assert_eq!(
+        (m.n_experts, sizes.model(false, 1).dense),
+        (j_u64(&inputs["n_experts"]), sizes.dense_trunk)
+    );
     let pf = &addons["profile"];
-    assert_eq!(kv_per_token(&s.cfg, true), u(&pf["kv_per_ctx_mtp_on"]));
-    assert_eq!(kv_per_token(&s.cfg, false), u(&pf["kv_per_ctx_mtp_off"]));
+    assert_eq!(kv_per_token(&s.cfg, true), j_u64(&pf["kv_per_ctx_mtp_on"]));
+    assert_eq!(
+        kv_per_token(&s.cfg, false),
+        j_u64(&pf["kv_per_ctx_mtp_off"])
+    );
 }
 
-/// Real headers (CPU): the lane floor with the MTP layer and the Q8
-/// shapes the row cap is taken over.
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards"]
 fn real_lane_floor_and_wave_shapes() {
@@ -1031,7 +1282,7 @@ fn real_lane_floor_and_wave_shapes() {
         (13_824, 3072),
         (6144, 3072),
     ] {
-        assert!(shapes.contains(&want), "{want:?} in {shapes:?}");
+        assert!(shapes.contains(&want), "{want:?}");
     }
     assert!(!q8_shapes(&s, false).unwrap().contains(&(6144, 3072)));
     assert_eq!(row_cap("applegpu_g17s", None, &shapes).unwrap(), 12);
@@ -1043,7 +1294,9 @@ fn real_lane_floor_and_wave_shapes() {
 fn real_store_admits_at_load() {
     let s = real_scan();
     let inputs = fixture("admission-addons.json")["inputs"].clone();
-    TEST_HOST.with(|c| c.set(Some(host(&inputs, 20 * G))));
+    let env = TestEnvGuard::new();
+    let (h, ws) = host(&inputs, 20 * G);
+    env.host(h, ws);
     let opts = Options {
         max_context: None,
         mtp: true,
@@ -1057,292 +1310,128 @@ fn real_store_admits_at_load() {
         mmap_chunk_max: MMAP_PREFILL_CHUNK_MAX,
     };
     let st = Store::open(&s.paths, &opts).unwrap();
-    TEST_HOST.with(|c| c.set(None));
+    drop(env);
     assert_eq!((st.ctx, st.chunk, st.lanes), (262_144, 8192, LANES_MAX));
-    assert!(st.row_cap >= 2, "row cap {}", st.row_cap);
+    assert!(st.row_cap >= 2);
     let a = st.admission().unwrap();
     assert_eq!(st.cache_slots(), st.sizes.classes.split(a.cache_bytes()));
-    assert_eq!(st.bank.staging_layers() as u64, a.staging_layers);
-    assert_eq!(st.dense_bytes, st.sizes.dense_trunk);
+    assert_eq!(
+        (st.bank.staging_layers() as u64, st.dense_bytes),
+        (a.staging_layers, st.sizes.dense_trunk)
+    );
     assert!(st.model.new_session(st.ctx).is_ok());
 }
 
-struct Temp(PathBuf);
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn moe() -> MoeConfig {
-    MoeConfig {
-        n_experts: 4,
-        n_used: 2,
-        n_shared: 1,
-        ff: 256,
-        latent: 512,
-        route_scale: 1.0,
-        norm_topk: true,
-    }
-}
-
-fn layer(m: &MoeConfig, il: usize, class: ExpertClass) -> ExpertLayer {
-    let types = class_types(class).unwrap();
-    let dims = [
-        [m.latent, m.ff, m.n_experts],
-        [m.latent, m.ff, m.n_experts],
-        [m.ff, m.latent, m.n_experts],
-    ];
-    let loc = |p: usize, name: &str| Located {
-        shard: 0,
-        data_offset: 0,
-        info: GgufTensorInfo {
-            name: format!("blk.{il}.{name}.weight"),
-            n_dims: 3,
-            dims: dims[p].iter().map(|&d| d as u64).collect(),
-            tensor_type: types[p],
-            offset: 0,
-        },
-    };
-    ExpertLayer {
-        class,
-        gate: loc(0, "ffn_gate_exps"),
-        up: loc(1, "ffn_up_exps"),
-        down: loc(2, "ffn_down_exps"),
-    }
-}
-
-/// A two-class bank of 4 experts whose slots are never read.
-fn tiny_bank(cache: [usize; 2], staging: usize) -> (KqBank, Classes, Temp) {
-    let m = moe();
-    let experts = vec![
-        Some(layer(&m, 0, ExpertClass::Q6kDown)),
-        Some(layer(&m, 1, ExpertClass::Q4kDown)),
-        Some(layer(&m, 2, ExpertClass::Q4kDown)),
-    ];
-    let dir = std::env::temp_dir().join(format!("hy4-store-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("experts.bin");
-    std::fs::write(&path, [0u8; 64]).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 1).unwrap();
-    let bank = KqBank::new(pool, &m, &experts, cache, staging).unwrap();
-    let slot = CLASSES.map(|c| {
-        geometry(&m, c)
-            .unwrap()
-            .iter()
-            .map(|g| g.slot_bytes())
-            .sum::<u64>()
-    });
-    assert_eq!(slot, bank.slot_bytes());
-    (
-        bank,
-        Classes {
-            layers: [1, 2],
-            slot,
-        },
-        Temp(dir),
-    )
-}
-
-/// A staging-only bank is rebuilt at the first turn the host has room in,
-/// kept at the next, and a refused turn leaves the bank volatile.
 #[test]
 fn lease_rebuilds_keeps_and_refuses() {
-    let (bank, classes, _dir) = tiny_bank([0, 0], 1);
-    let p = profile(100);
+    let files = BankFiles::new(1);
+    let bank = files.streamed([0, 0], 1);
+    let (classes, p) = (files.classes(&bank), profile(100));
     let size = ModelSize {
         dense: 0,
         slot: classes.slot[0].max(classes.slot[1]),
         n_experts: 8,
         ctx: 1024,
     };
-    let rows = 1024;
-    let cap = 64 * size.slot;
     let limits = Limits {
-        cache_cap: Some(cap),
+        cache_cap: Some(64 * size.slot),
         ..Limits::default()
     };
-    let roomy = (
-        HostMemory {
-            physical: 64 * G,
-            wired: 10 * G,
-            ..Default::default()
-        },
-        48 * G,
-    );
-    let loaded = admit_with(&p, &size, rows, &limits, &roomy.0, &Own::default(), roomy.1).unwrap();
+    let (roomy_h, ws) = (host_mem(64 * G, 10 * G), 48 * G);
+    let loaded = admit_with(&p, &size, 1024, &limits, &roomy_h, &Own::default(), ws).unwrap();
     assert_eq!((loaded.cache_slots, loaded.bound), (64, Bound::Env));
-    let staging_only = Admission {
+    let staging = Admission {
         staging_layers: 1,
         fixed: loaded.terms.fixed(1),
         cache_slots: 0,
         ..loaded
     };
-    let lease = Lease::new(
-        p,
-        size,
-        rows,
-        classes,
-        Some(limits),
-        Some(staging_only),
-        &bank,
-    );
+    let lease = Lease::new(p, size, 1024, classes, Some(limits), Some(staging), &bank);
     bank.end_turn().unwrap();
-    TEST_HOST.with(|c| c.set(Some(roomy)));
+
+    let env = TestEnvGuard::new();
+    env.host(roomy_h, ws);
     lease.begin_turn(&bank, 0, 0).unwrap();
-    assert!(lease.in_turn() && bank.in_turn());
     let a = lease.admission().unwrap();
-    assert_eq!(a.cache_slots, 64);
-    assert_eq!(bank.cache_slots(), classes.split(a.cache_bytes()));
-    assert_eq!(bank.staging_layers() as u64, a.staging_layers);
-    assert_eq!(lease.switches().len(), 1);
-    lease.end_turn(&bank).unwrap();
-    assert!(!lease.in_turn() && !bank.in_turn());
-    lease.begin_turn(&bank, 0, 0).unwrap();
-    assert_eq!(lease.admission().unwrap(), a);
-    assert_eq!(lease.switches().len(), 1);
-    lease.end_turn(&bank).unwrap();
-    let full = (
-        HostMemory {
-            wired: 60 * G,
-            ..roomy.0
-        },
-        roomy.1,
+    assert!(
+        lease.in_turn() && bank.in_turn() && a.cache_slots == 64 && lease.switches().len() == 1
     );
-    TEST_HOST.with(|c| c.set(Some(full)));
-    let e = lease.begin_turn(&bank, 0, 0).unwrap_err().reason;
-    TEST_HOST.with(|c| c.set(None));
-    assert!(e.contains("vs budget"), "{e}");
+    assert_eq!(
+        (bank.cache_slots(), bank.staging_layers() as u64),
+        (classes.split(a.cache_bytes()), a.staging_layers)
+    );
+    lease.end_turn(&bank).unwrap();
     assert!(!lease.in_turn() && !bank.in_turn());
-    assert_eq!(lease.admission().unwrap(), a);
+
+    lease.begin_turn(&bank, 0, 0).unwrap();
+    assert_eq!((lease.admission().unwrap(), lease.switches().len()), (a, 1));
+    lease.end_turn(&bank).unwrap();
+
+    env.host(host_mem(64 * G, 60 * G), ws);
+    assert!(
+        lease
+            .begin_turn(&bank, 0, 0)
+            .unwrap_err()
+            .reason
+            .contains("vs budget")
+    );
+    assert!(!lease.in_turn() && !bank.in_turn() && lease.admission().unwrap() == a);
 }
 
-/// Inside a turn of a load bound by live memory the lease keeps the bank
-/// for the free pool within its term and for room that came back (growth
-/// waits for a turn start), and shrinks it to what the host admits when
-/// others grow past the slack. The kernel holds the banks non-volatile
-/// inside a turn and volatile after it. The admission prices 64 MiB slots
-/// over the tiny bank's real ones.
 #[test]
 fn lease_recheck_keeps_for_the_pool_and_shrinks_for_others() {
-    let s = 64 << 20;
-    let classes = Classes {
-        layers: [1, 2],
-        slot: [s, s],
-    };
-    let p = profile(100);
-    let size = ModelSize {
-        dense: 0,
-        slot: s,
-        n_experts: 8,
-        ctx: 1024,
-    };
-    let rows = 1024;
-    let limits = Limits::default();
-    let ws = 96 * G;
-    let one = Terms::with(&p, &size, ws, rows).fixed(1);
-    let others = 10 * G;
-    let host = |wired| HostMemory {
-        physical: limits.reserve + others + one + 64 * s,
-        wired,
-        ..Default::default()
-    };
-    let loaded = admit_with(&p, &size, rows, &limits, &host(others), &Own::default(), ws).unwrap();
-    assert_eq!(loaded.bound, Bound::Live);
-    assert!(loaded.cache_slots > 48, "{loaded}");
-    let (bank, _, _dir) = tiny_bank(
-        classes.split(loaded.cache_bytes()),
-        loaded.staging_layers as usize,
-    );
-    let lease = Lease::new(p, size, rows, classes, Some(limits), Some(loaded), &bank);
+    let (_files, bank, lease, classes, loaded, physical, ws, others) = live_lease_rig(2);
+    assert!(loaded.cache_slots > 48);
     bank.end_turn().unwrap();
     let r = bank.residency().unwrap();
     assert_eq!(r.volatile, r.resident);
-    TEST_HOST.with(|c| c.set(Some((host(others), ws))));
-    TEST_POOL.with(|c| c.set(Some(0)));
+
+    let env = TestEnvGuard::new();
+    env.host(host_mem(physical, others), ws);
+    env.pool(0);
     lease.begin_turn(&bank, 0, 0).unwrap();
-    assert_eq!(lease.admission().unwrap(), loaded);
-    assert!(lease.switches().is_empty());
+    assert_eq!(
+        (lease.admission().unwrap(), lease.switches().len()),
+        (loaded, 0)
+    );
     let r = bank.residency().unwrap();
     assert_eq!(r.volatile, 0);
+
     let pool = loaded.terms.pool;
-    TEST_HOST.with(|c| c.set(Some((host(others + r.resident + pool + G), ws))));
-    TEST_POOL.with(|c| c.set(Some(pool)));
+    env.host(host_mem(physical, others + r.resident + pool + G), ws);
+    env.pool(pool);
     assert!(!lease.recheck(&bank, 0, 0).unwrap());
-    TEST_POOL.with(|c| c.set(Some(0)));
-    TEST_HOST.with(|c| c.set(Some((host(r.resident), ws))));
+
+    env.pool(0);
+    env.host(host_mem(physical, r.resident), ws);
     assert!(!lease.recheck(&bank, 0, 0).unwrap());
-    assert_eq!(lease.admission().unwrap(), loaded);
-    assert!(lease.switches().is_empty());
-    TEST_HOST.with(|c| c.set(Some((host(others + r.resident + pool + G), ws))));
-    assert!(lease.recheck(&bank, 0, 0).unwrap());
-    TEST_HOST.with(|c| c.set(None));
-    TEST_POOL.with(|c| c.set(None));
-    let a = lease.admission().unwrap();
-    assert!(
-        a.cache_slots > 0 && a.cache_slots < loaded.cache_slots,
-        "{a}"
+    assert_eq!(
+        (lease.admission().unwrap(), lease.switches().len()),
+        (loaded, 0)
     );
-    assert_eq!(bank.cache_slots(), classes.split(a.cache_bytes()));
-    assert_eq!(lease.switches().len(), 1);
+
+    env.host(host_mem(physical, others + r.resident + pool + G), ws);
+    assert!(lease.recheck(&bank, 0, 0).unwrap());
+    let a = lease.admission().unwrap();
+    assert!(a.cache_slots > 0 && a.cache_slots < loaded.cache_slots);
+    assert_eq!(
+        (bank.cache_slots(), lease.switches().len()),
+        (classes.split(a.cache_bytes()), 1)
+    );
     assert!(lease.in_turn() && bank.in_turn());
     lease.end_turn(&bank).unwrap();
 }
 
-/// A turn start reads the purgeable count before and after its flip: with
-/// the count current (others' volatile pages the bank's size) the warm bank
-/// stays; with the bank left in it, the same reading after the flip finds
-/// others past the slack and shrinks the bank. The admission prices 64 MiB
-/// slots over the tiny bank's real ones.
 #[test]
 fn lease_turn_start_takes_the_flip_lag_out() {
-    let s = 64 << 20;
-    let classes = Classes {
-        layers: [1, 2],
-        slot: [s, s],
-    };
-    let p = profile(100);
-    let size = ModelSize {
-        dense: 0,
-        slot: s,
-        n_experts: 8,
-        ctx: 1024,
-    };
-    let rows = 1024;
-    let limits = Limits::default();
-    let ws = 96 * G;
-    let one = Terms::with(&p, &size, ws, rows).fixed(1);
-    let others = 10 * G;
-    let physical = limits.reserve + others + one + 64 * s;
-    let loaded = admit_with(
-        &p,
-        &size,
-        rows,
-        &limits,
-        &HostMemory {
-            physical,
-            wired: others,
-            ..Default::default()
-        },
-        &Own::default(),
-        ws,
-    )
-    .unwrap();
-    assert_eq!(loaded.bound, Bound::Live);
-    let (bank, _, _dir) = tiny_bank(
-        classes.split(loaded.cache_bytes()),
-        loaded.staging_layers as usize,
-    );
-    let lease = Lease::new(p, size, rows, classes, Some(limits), Some(loaded), &bank);
+    let (_files, bank, lease, _, loaded, physical, ws, _) = live_lease_rig(3);
     bank.touch();
     bank.end_turn().unwrap();
     let r = bank.residency().unwrap();
-    assert!(r.resident > 0 && r.volatile == r.resident, "{r:?}");
-    // others read exactly at the edge the held bank shrinks past once the
-    // bank's pages count as used
-    let held = loaded.fixed + loaded.cache_bytes();
-    let edge = physical - limits.reserve + crate::moe_stream::budget::KEEP_SLACK - held;
+    assert!(r.resident > 0 && r.volatile == r.resident);
+
+    let edge =
+        physical - Limits::default().reserve + KEEP_SLACK - (loaded.fixed + loaded.cache_bytes());
     let h = HostMemory {
         physical,
         wired: edge + 1,
@@ -1350,29 +1439,31 @@ fn lease_turn_start_takes_the_flip_lag_out() {
         purgeable: r.resident,
         ..Default::default()
     };
-    TEST_HOST.with(|c| c.set(Some((h, ws))));
-    TEST_POOL.with(|c| c.set(Some(0)));
-    TEST_BEFORE_FLIP.with(|c| c.set(Some(2 * r.resident)));
+    let env = TestEnvGuard::new();
+    env.host(h, ws);
+    env.pool(0);
+    env.before_flip(2 * r.resident);
     lease.begin_turn(&bank, 0, 0).unwrap();
-    assert_eq!(lease.admission().unwrap(), loaded);
-    assert!(lease.switches().is_empty());
+    assert_eq!(
+        (lease.admission().unwrap(), lease.switches().len()),
+        (loaded, 0)
+    );
     lease.end_turn(&bank).unwrap();
     assert_eq!(bank.residency().unwrap(), r);
-    TEST_BEFORE_FLIP.with(|c| c.set(Some(r.resident)));
+
+    env.before_flip(r.resident);
     lease.begin_turn(&bank, 0, 0).unwrap();
-    TEST_HOST.with(|c| c.set(None));
-    TEST_POOL.with(|c| c.set(None));
-    TEST_BEFORE_FLIP.with(|c| c.set(None));
-    let a = lease.admission().unwrap();
-    assert!(a.cache_slots < loaded.cache_slots, "{a}");
-    assert_eq!(lease.switches().len(), 1);
+    assert!(
+        lease.admission().unwrap().cache_slots < loaded.cache_slots && lease.switches().len() == 1
+    );
     lease.end_turn(&bank).unwrap();
 }
 
-/// Without limits the lease never re-admits or switches.
 #[test]
 fn lease_without_admission_only_flips_the_bank() {
-    let (bank, classes, _dir) = tiny_bank([2, 2], 1);
+    let files = BankFiles::new(4);
+    let bank = files.streamed([2, 2], 1);
+    let classes = files.classes(&bank);
     let size = ModelSize {
         dense: 0,
         slot: classes.slot[0],
@@ -1382,11 +1473,9 @@ fn lease_without_admission_only_flips_the_bank() {
     let lease = Lease::new(profile(100), size, 64, classes, None, None, &bank);
     bank.end_turn().unwrap();
     lease.begin_turn(&bank, 0, 0).unwrap();
-    assert!(bank.in_turn() && !lease.in_turn());
-    assert_eq!(bank.cache_slots(), [2, 2]);
+    assert!(bank.in_turn() && !lease.in_turn() && bank.cache_slots() == [2, 2]);
     lease.end_turn(&bank).unwrap();
-    assert!(!bank.in_turn());
-    assert!(lease.switches().is_empty());
+    assert!(!bank.in_turn() && lease.switches().is_empty());
 }
 
 #[test]
@@ -1398,334 +1487,137 @@ fn max_memory_caps_the_working_set_only_below_it() {
 
 #[test]
 fn direct_env_values() {
-    assert_eq!(direct_mode(None).unwrap(), DirectMode::Auto);
-    assert_eq!(direct_mode(Some("")).unwrap(), DirectMode::Auto);
-    assert_eq!(direct_mode(Some("  ")).unwrap(), DirectMode::Auto);
-    assert_eq!(direct_mode(Some("auto")).unwrap(), DirectMode::Auto);
-    assert_eq!(direct_mode(Some("AUTO")).unwrap(), DirectMode::Auto);
-    assert_eq!(direct_mode(Some("1")).unwrap(), DirectMode::On);
-    assert_eq!(direct_mode(Some("true")).unwrap(), DirectMode::On);
-    assert_eq!(direct_mode(Some("TRUE")).unwrap(), DirectMode::On);
-    assert_eq!(direct_mode(Some("0")).unwrap(), DirectMode::Off);
-    assert_eq!(direct_mode(Some("false")).unwrap(), DirectMode::Off);
-    assert_eq!(direct_mode(Some("FALSE")).unwrap(), DirectMode::Off);
+    use DirectMode as D;
+    for (raw, want) in [
+        (None, D::Auto),
+        (Some(""), D::Auto),
+        (Some("  "), D::Auto),
+        (Some("auto"), D::Auto),
+        (Some("AUTO"), D::Auto),
+        (Some("1"), D::On),
+        (Some("true"), D::On),
+        (Some("TRUE"), D::On),
+        (Some("0"), D::Off),
+        (Some("false"), D::Off),
+        (Some("FALSE"), D::Off),
+    ] {
+        assert_eq!(direct_mode(raw).unwrap(), want, "{raw:?}");
+    }
     for bad in ["2", "yes", "no", "maybe"] {
-        let e = direct_mode(Some(bad)).unwrap_err().reason;
-        assert!(e.contains(DIRECT_ENV), "{bad}: {e}");
+        assert!(
+            direct_mode(Some(bad))
+                .unwrap_err()
+                .reason
+                .contains(DIRECT_ENV),
+            "{bad}"
+        );
     }
 }
 
 #[test]
 fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
-    let sizes = Sizes {
-        dense_trunk: 8_003_184_948,
-        dense_mtp: 2_189_929_600,
-        classes: Classes {
-            layers: [19, 22],
-            slot: [4_663_296, 4_091_904],
-        },
-        n_experts: 512,
-    };
-    let direct_bytes = sizes.direct_expert_bytes();
-    assert_eq!(direct_bytes, 91_455_750_144);
-    assert_eq!(sizes.total_experts(), [9_728, 11_264]);
-
-    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let kv_initial = p.kv_base + p.kv_per_ctx * ctx as u64;
-    let scratch_8k = direct_scratch_bytes(&p, CHUNKS[0], ctx);
-    let quiet = HostMemory {
-        physical: 128 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
-    let d_auto = direct_gate(
-        DirectMode::Auto,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        kv_initial,
-        scratch_8k,
-        DIRECT_MARGIN,
-        None,
-        None,
-    );
-    assert!(d_auto.admitted, "quiet 128 GiB host must admit direct mode");
-    assert_eq!(d_auto.available, 128 * G - 20 * G - DIRECT_MARGIN);
-    assert_eq!(d_auto.margin, DIRECT_MARGIN);
-    assert_eq!(d_auto.scratch_bytes, scratch_8k);
-    assert_eq!(d_auto.kv_and_scratch, kv_initial + scratch_8k);
-
-    let d_on = direct_gate(
-        DirectMode::On,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        kv_initial,
-        scratch_8k,
-        DIRECT_MARGIN,
-        None,
-        None,
-    );
-    assert!(d_on.admitted);
-
-    // MLX_HY4_DIRECT=0 disables direct residency even on a quiet host.
-    let d_off = direct_gate(
-        DirectMode::Off,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        kv_initial,
-        scratch_8k,
-        DIRECT_MARGIN,
-        None,
-        None,
-    );
-    assert!(!d_off.admitted);
-
-    // Busy host falls back cleanly to partial streaming.
-    let busy = HostMemory {
-        physical: 128 * G,
-        wired: 45 * G,
-        ..Default::default()
-    };
-    assert!(
-        !direct_gate(
-            DirectMode::Auto,
-            &busy,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            kv_initial,
-            scratch_8k,
-            DIRECT_MARGIN,
-            None,
-            None,
-        )
-        .admitted
-    );
-    assert!(
-        !direct_gate(
-            DirectMode::On,
-            &busy,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            kv_initial,
-            scratch_8k,
-            DIRECT_MARGIN,
-            None,
-            None,
-        )
-        .admitted
+    use DirectMode as D;
+    let mut rig = ModeRig::real();
+    assert_eq!(
+        (rig.direct_bytes, rig.sizes.total_experts()),
+        (91_455_750_144, [9_728, 11_264])
     );
 
-    // max_memory_bytes or cache_cap below requirement disallows direct mode.
-    assert!(
-        !direct_gate(
-            DirectMode::Auto,
-            &quiet,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            kv_initial,
-            scratch_8k,
-            DIRECT_MARGIN,
-            Some(96 * G),
-            None,
-        )
-        .admitted
-    );
-    assert!(
-        !direct_gate(
-            DirectMode::Auto,
-            &quiet,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            kv_initial,
-            scratch_8k,
-            DIRECT_MARGIN,
-            None,
-            Some(direct_bytes - 1),
-        )
-        .admitted
-    );
-    assert!(
-        direct_gate(
-            DirectMode::Auto,
-            &quiet,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            kv_initial,
-            scratch_8k,
-            DIRECT_MARGIN,
-            None,
-            Some(direct_bytes),
-        )
-        .admitted
+    let kv = rig.p.kv_base + rig.p.kv_per_ctx * rig.ctx as u64;
+    let sc = direct_scratch_bytes(&rig.p, CHUNKS[0], rig.ctx);
+    let (quiet, busy) = (host_mem(128 * G, 20 * G), host_mem(128 * G, 45 * G));
+
+    let d_auto = rig.gate(D::Auto, &quiet, kv, sc);
+    assert!(d_auto.admitted && d_auto.available == 128 * G - 20 * G - DIRECT_MARGIN);
+    assert_eq!(
+        (d_auto.margin, d_auto.scratch_bytes, d_auto.kv_and_scratch),
+        (DIRECT_MARGIN, sc, kv + sc)
     );
 
-    // Wired limit request is always capped at working_set().
+    for (mode, h, max_m, cap, want) in [
+        (D::On, quiet, None, None, true),
+        (D::Off, quiet, None, None, false),
+        (D::Auto, busy, None, None, false),
+        (D::On, busy, None, None, false),
+        (D::Auto, quiet, Some(96 * G), None, false),
+        (D::Auto, quiet, None, Some(rig.direct_bytes - 1), false),
+        (D::Auto, quiet, None, Some(rig.direct_bytes), true),
+    ] {
+        rig.max_memory = max_m;
+        rig.cache_cap = cap;
+        assert_eq!(
+            rig.gate(mode, &h, kv, sc).admitted,
+            want,
+            "{mode:?} {max_m:?} {cap:?}"
+        );
+    }
+
     let ws = 96_000_000_000;
-    assert_eq!(direct_wired_limit(d_auto.need, ws), ws);
-    assert_eq!(direct_wired_limit(50 * G, ws), 50 * G);
+    assert_eq!(
+        (
+            direct_wired_limit(d_auto.need, ws),
+            direct_wired_limit(50 * G, ws)
+        ),
+        (ws, 50 * G)
+    );
 }
 
 #[test]
 fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
-    assert_eq!(parse_reserve_override(None), None);
-    assert_eq!(parse_reserve_override(Some("  ")), None);
-    assert_eq!(parse_reserve_override(Some("16")), Some(16 * G));
-    assert_eq!(direct_margin(None), DIRECT_MARGIN);
-    assert_eq!(direct_margin(Some(2 * G)), DIRECT_MARGIN);
-    assert_eq!(direct_margin(Some(16 * G)), 16 * G);
+    for (raw, want) in [(None, None), (Some("  "), None), (Some("16"), Some(16 * G))] {
+        assert_eq!(parse_reserve_override(raw), want);
+    }
+    assert_eq!(
+        [
+            direct_margin(None),
+            direct_margin(Some(2 * G)),
+            direct_margin(Some(16 * G))
+        ],
+        [DIRECT_MARGIN, DIRECT_MARGIN, 16 * G]
+    );
 
-    let sizes = Sizes {
-        dense_trunk: 8_003_184_948,
-        dense_mtp: 2_189_929_600,
-        classes: Classes {
-            layers: [19, 22],
-            slot: [4_663_296, 4_091_904],
-        },
-        n_experts: 512,
-    };
-    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
-    let direct_bytes = sizes.direct_expert_bytes();
-    let p_mtp = profile(15_812);
-    let p_ar = profile(14_596);
-    let ctx = 262_144usize;
-
-    // Direct KV allowance caps at 64K tokens while respecting smaller explicit max_context.
-    let kv_64k = direct_kv_allowance(&p_mtp, ctx);
+    let mut rig = ModeRig::real();
+    let kv_64k = direct_kv_allowance(&rig.p, rig.ctx);
     assert_eq!(
         kv_64k,
-        p_mtp.kv_base + p_mtp.kv_per_ctx * DIRECT_KV_ALLOWANCE_TOKENS as u64
+        rig.p.kv_base + rig.p.kv_per_ctx * DIRECT_KV_ALLOWANCE_TOKENS as u64
     );
     assert_eq!(
-        direct_kv_allowance(&p_mtp, 32_768),
-        p_mtp.kv_base + p_mtp.kv_per_ctx * 32_768
+        direct_kv_allowance(&rig.p, 32_768),
+        rig.p.kv_base + rig.p.kv_per_ctx * 32_768
     );
 
-    let s8 = direct_scratch_bytes(&p_mtp, 8192, ctx);
-    let s4 = direct_scratch_bytes(&p_mtp, 4096, ctx);
-    let s2 = direct_scratch_bytes(&p_mtp, 2048, ctx);
+    let [s8, s4, s2] = [8192, 4096, 2048].map(|c| direct_scratch_bytes(&rig.p, c, rig.ctx));
     assert!(s8 > s4 && s4 > s2);
+    let base_need = rig.dense_full + rig.direct_bytes + kv_64k;
+    let [need_8k, need_4k, need_2k] = [s8, s4, s2].map(|s| base_need + s);
 
-    let fixed_base = dense_mtp + direct_bytes + kv_64k;
-    let need_8k = fixed_base + s8;
-    let need_4k = fixed_base + s4;
-    let need_2k = fixed_base + s2;
+    // MTP-1 fits at 26 GiB others; AR fits at 28 GiB others.
+    let (mc, mg) = rig.pick_direct(DirectMode::Auto, &host_mem(128 * G, 26 * G));
+    assert!(mg.admitted && mc == 2048 && mg.kv_and_scratch == kv_64k + s2);
 
-    // With 64K direct KV allowance + chunk step-down, MTP-1 fits at 26 GiB others
-    // and AR fits at 28 GiB others on a 128 GiB host.
-    let (mtp_chunk, mtp_gate) = pick_direct(
-        DirectMode::Auto,
-        &p_mtp,
-        ctx,
-        &HostMemory {
-            physical: 128 * G,
-            wired: 26 * G,
-            ..Default::default()
-        },
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        None,
-        None,
-        None,
-    );
-    assert!(
-        mtp_gate.admitted,
-        "MTP-1 must admit direct at 26 GiB others"
-    );
-    assert_eq!(mtp_chunk, 2048);
-    assert_eq!(mtp_gate.kv_and_scratch, kv_64k + s2);
+    let mut ar = rig.clone();
+    ar.p = profile(14_596);
+    ar.dense_full = ar.sizes.dense_trunk;
+    let (ac, ag) = ar.pick_direct(DirectMode::Auto, &host_mem(128 * G, 28 * G));
+    assert!(ag.admitted && ac == 2048);
 
-    let (ar_chunk, ar_gate) = pick_direct(
-        DirectMode::Auto,
-        &p_ar,
-        ctx,
-        &HostMemory {
-            physical: 128 * G,
-            wired: 28 * G,
-            ..Default::default()
-        },
-        &Own::default(),
-        sizes.dense_trunk,
-        direct_bytes,
-        None,
-        None,
-        None,
-    );
-    assert!(ar_gate.admitted, "AR must admit direct at 28 GiB others");
-    assert_eq!(ar_chunk, 2048);
+    let quiet = host_mem(128 * G, 20 * G);
+    let (chunk, gate) = rig.pick_direct(DirectMode::Auto, &quiet);
+    assert!(gate.admitted && chunk == 8192 && gate.margin == DIRECT_MARGIN);
+    assert_eq!((gate.scratch_bytes, gate.kv_and_scratch), (s8, kv_64k + s8));
 
-    // Quiet host admits direct at 8192 when no reserve override is set.
-    let quiet = HostMemory {
-        physical: 128 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
-    let (chunk, gate) = pick_direct(
-        DirectMode::Auto,
-        &p_mtp,
-        ctx,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        None,
-        None,
-        None,
-    );
-    assert!(gate.admitted);
-    assert_eq!(chunk, 8192);
-    assert_eq!(gate.margin, DIRECT_MARGIN);
-    assert_eq!(gate.scratch_bytes, s8);
-    assert_eq!(gate.kv_and_scratch, kv_64k + s8);
+    // Explicit reserve override exact boundary forces streamed fallback.
+    let exact_res = quiet.physical - quiet.wired - need_2k;
+    rig.reserve_override = Some(exact_res);
+    let (c_ok, g_ok) = rig.pick_direct(DirectMode::Auto, &quiet);
+    assert!(g_ok.admitted && c_ok == 2048 && g_ok.margin == exact_res.max(DIRECT_MARGIN));
+    rig.reserve_override = Some(exact_res + 1);
+    let (_, g_no) = rig.pick_direct(DirectMode::Auto, &quiet);
+    assert!(!g_no.admitted && g_no.margin == (exact_res + 1).max(DIRECT_MARGIN));
+    rig.reserve_override = None;
 
-    // Raising the explicit reserve override pushes available just below 2048's need
-    // and forces streamed fallback at the exact boundary.
-    let exact_reserve = quiet.physical - quiet.wired - need_2k;
-    let (chunk_ok, gate_ok) = pick_direct(
-        DirectMode::Auto,
-        &p_mtp,
-        ctx,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        Some(exact_reserve),
-        None,
-        None,
-    );
-    assert!(gate_ok.admitted);
-    assert_eq!(chunk_ok, 2048);
-    assert_eq!(gate_ok.margin, exact_reserve.max(DIRECT_MARGIN));
-
-    let (_, gate_refused) = pick_direct(
-        DirectMode::Auto,
-        &p_mtp,
-        ctx,
-        &quiet,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        Some(exact_reserve + 1),
-        None,
-        None,
-    );
-    assert!(!gate_refused.admitted);
-    assert_eq!(gate_refused.margin, (exact_reserve + 1).max(DIRECT_MARGIN));
-
-    // Tight max_memory steps direct chunk down 8192 -> 4096 -> 2048 -> streamed.
-    for (cap, want_admitted, want_chunk, want_scratch) in [
+    for (cap, ok, wc, ws) in [
         (need_8k, true, 8192usize, s8),
         (need_8k - 1, true, 4096, s4),
         (need_4k, true, 4096, s4),
@@ -1733,443 +1625,227 @@ fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
         (need_2k, true, 2048, s2),
         (need_2k - 1, false, 2048, s2),
     ] {
-        let (got_chunk, got_gate) = pick_direct(
-            DirectMode::Auto,
-            &p_mtp,
-            ctx,
-            &quiet,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            None,
-            Some(cap),
-            None,
+        rig.max_memory = Some(cap);
+        let (gc, gg) = rig.pick_direct(DirectMode::Auto, &quiet);
+        assert_eq!(
+            (gg.admitted, gc, gg.scratch_bytes),
+            (ok, wc, ws),
+            "cap={cap}"
         );
-        assert_eq!(got_gate.admitted, want_admitted, "cap={cap}");
-        assert_eq!(got_chunk, want_chunk, "cap={cap}");
-        assert_eq!(got_gate.scratch_bytes, want_scratch, "cap={cap}");
     }
-}
-
-fn filled_fixture_bank(
-    cache: [usize; 2],
-    staging: usize,
-) -> (KqBank, KqBank, Classes, MoeConfig, Temp) {
-    let m = moe();
-    let mut experts = Vec::new();
-    let mut off = 0u64;
-    for (il, class) in [
-        (0, ExpertClass::Q6kDown),
-        (1, ExpertClass::Q4kDown),
-        (2, ExpertClass::Q4kDown),
-    ] {
-        let mut l = layer(&m, il, class);
-        let geo = geometry(&m, class).unwrap();
-        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
-            .into_iter()
-            .enumerate()
-        {
-            loc.data_offset = off;
-            off += geo[p].file_bytes() * m.n_experts as u64;
-        }
-        experts.push(Some(l));
-    }
-    let dir = std::env::temp_dir().join(format!("hy4-store-promo-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("experts.bin");
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
-    let payload: Vec<u8> = (0..off as usize)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 24) as u8
-        })
-        .collect();
-    std::fs::write(&path, &payload).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
-    let ref_pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
-    let bank = KqBank::new(pool, &m, &experts, cache, staging).unwrap();
-    let reference = KqBank::new(ref_pool, &m, &experts, [0, 0], 1).unwrap();
-    let classes = Classes {
-        layers: [1, 2],
-        slot: bank.slot_bytes(),
-    };
-    (bank, reference, classes, m, Temp(dir))
 }
 
 #[test]
 fn lease_end_turn_idle_promotes_partial_to_direct_when_others_drop() {
-    let (bank, reference, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let dense = 10 * G;
-    let kv_live = 2 * G;
-    let ws = 96 * G;
-    let physical = 40 * G;
-    let promo = DirectPromotion {
-        mode: DirectMode::Auto,
-        mmap: MmapMode::Off,
-        metal_available: true,
-        physical,
-        reserve_override: None,
-        n_experts: m.n_experts,
-    };
-    // Size the virtual admission using real-scale 41-layer direct bytes? Here the
-    // fixture has 3 tiny layers, so set physical so high-others refuses and
-    // low-others admits cleanly.
-    let direct_bytes = promo.direct_expert_bytes(&classes);
-    let kv_64k = direct_kv_allowance(&p, ctx);
-    let scratch_2k = direct_scratch_bytes(&p, 2048, ctx);
-    let need_2k = dense + direct_bytes + kv_64k + scratch_2k;
-    let size = ModelSize {
-        dense,
-        slot: classes.slot[0].max(classes.slot[1]),
-        n_experts: 8,
-        ctx: ctx as u64,
-    };
-    let limits = Limits::default();
-    let partial_adm = Admission {
-        physical,
-        host_used: physical - need_2k - DIRECT_MARGIN + 2 * G,
-        own: 0,
-        others: physical - need_2k - DIRECT_MARGIN + 2 * G,
-        reserve: limits.reserve,
-        live: 20 * G,
-        ws,
-        terms: Terms::with(&p, &size, ws, 2048),
-        staging_layers: 1,
-        fixed: dense + kv_64k + scratch_2k,
-        slot: size.slot,
-        cache_slots: 4,
-        bound: Bound::Live,
-    };
-    let lease = Lease::new(
-        p,
-        size,
-        2048,
-        classes,
-        Some(limits),
-        Some(partial_adm),
-        &bank,
-    )
-    .with_direct_promotion(promo, None);
+    let rig = PromoRig::new(40 * G, 96 * G);
+    let (kv_live, limits) = (2 * G, Limits::default());
+    let (need_2k, kv_64k, sc_2k) = rig.need_2k();
+    let size = rig.size(8);
+    let adm = synth_adm(
+        rig.physical,
+        rig.physical - need_2k - DIRECT_MARGIN + 2 * G,
+        limits.reserve,
+        20 * G,
+        rig.ws,
+        Terms::with(&rig.p, &size, rig.ws, 2048),
+        1,
+        rig.dense + kv_64k + sc_2k,
+        size.slot,
+        4,
+    );
+    let lease = rig.lease(DirectMode::Auto, MmapMode::Off, limits, Some(adm), 8);
+    let (env, r) = (TestEnvGuard::new(), rig.bank.residency().unwrap());
 
-    // Turn 1: others stay above the direct threshold -> end_turn_idle does NOT promote.
-    let r = bank.residency().unwrap();
-    let high_others = physical - need_2k - DIRECT_MARGIN + G;
-    TEST_HOST.with(|c| {
-        c.set(Some((
-            HostMemory {
-                physical,
-                wired: high_others + dense + r.resident + kv_live,
-                ..Default::default()
-            },
-            ws,
-        )))
-    });
-    assert_eq!(lease.end_turn_idle(&bank, dense, kv_live).unwrap(), None);
-    assert!(!bank.is_direct());
-    assert!(lease.switches().is_empty());
+    // Turn 1: others above threshold -> no promotion.
+    let high = rig.physical - need_2k - DIRECT_MARGIN + G;
+    env.host(
+        host_mem(rig.physical, high + rig.dense + r.resident + kv_live),
+        rig.ws,
+    );
+    assert_eq!(
+        lease.end_turn_idle(&rig.bank, rig.dense, kv_live).unwrap(),
+        None
+    );
+    assert!(!rig.bank.is_direct() && lease.switches().is_empty());
 
-    // Turn 2: others drop below threshold -> end_turn_idle promotes to Direct!
-    let low_others = 2 * G;
-    TEST_HOST.with(|c| {
-        c.set(Some((
-            HostMemory {
-                physical,
-                wired: low_others + dense + r.resident + kv_live,
-                ..Default::default()
-            },
-            ws,
-        )))
-    });
-    let promoted = lease.end_turn_idle(&bank, dense, kv_live).unwrap();
-    assert!(promoted.is_some());
-    assert!(bank.is_direct());
-    assert!(!bank.in_turn());
-    assert_eq!(lease.switches().len(), 1);
-    assert_eq!(lease.admission().unwrap().staging_layers, 0);
-    assert!(lease.direct_budget().is_some());
-    bank.wait_direct_fill().unwrap();
-    assert!(bank.direct_fill_complete());
+    // Turn 2: others drop -> promotes to Direct.
+    env.host(
+        host_mem(rig.physical, 2 * G + rig.dense + r.resident + kv_live),
+        rig.ws,
+    );
+    assert!(
+        lease
+            .end_turn_idle(&rig.bank, rig.dense, kv_live)
+            .unwrap()
+            .is_some()
+    );
+    assert!(rig.bank.is_direct() && !rig.bank.in_turn() && lease.direct_budget().is_some());
+    assert_eq!(
+        (
+            lease.switches().len(),
+            lease.admission().unwrap().staging_layers
+        ),
+        (1, 0)
+    );
+    rig.bank.wait_direct_fill().unwrap();
+    assert!(rig.bank.direct_fill_complete());
 
     // Promoted direct bank serves identical expert bytes across every layer.
-    let all_experts: Vec<u32> = (0..m.n_experts as u32).collect();
+    let ne = rig.files.moe.n_experts;
+    let all: Vec<u32> = (0..ne as u32).collect();
     for il in 0..3 {
-        let dir_p = bank.prepare(il, &all_experts, &[], true).unwrap();
-        let ref_p = reference.prepare(il, &all_experts, &[], false).unwrap();
-        assert_eq!(dir_p.slots, all_experts);
+        let dp = rig.bank.prepare(il, &all, &[], true).unwrap();
+        let rp = rig.reference.prepare(il, &all, &[], false).unwrap();
+        assert_eq!(dp.slots, all);
         for pi in 0..3 {
-            let dw = dir_p.arrays[pi].w.to_uint32().unwrap().to_vec();
-            let rw = ref_p.arrays[pi].w.to_uint32().unwrap().to_vec();
-            let cols = dw.len() / m.n_experts;
-            for (&e, &s) in ref_p.experts.iter().zip(&ref_p.slots) {
-                let de = e as usize * cols..(e as usize + 1) * cols;
-                let rs = s as usize * cols..(s as usize + 1) * cols;
-                assert_eq!(dw[de], rw[rs], "layer {il} proj {pi} expert {e}");
+            let (dw, rw) = (
+                dp.arrays[pi].w.to_uint32().unwrap().to_vec(),
+                rp.arrays[pi].w.to_uint32().unwrap().to_vec(),
+            );
+            let cols = dw.len() / ne;
+            for (&e, &s) in rp.experts.iter().zip(&rp.slots) {
+                assert_eq!(
+                    dw[e as usize * cols..(e as usize + 1) * cols],
+                    rw[s as usize * cols..(s as usize + 1) * cols]
+                );
             }
         }
-        reference.settle_all();
+        rig.reference.settle_all();
     }
 
-    // Subsequent turns stay direct and NonVolatile even if host memory spikes again.
-    TEST_HOST.with(|c| {
-        c.set(Some((
-            HostMemory {
-                physical,
-                wired: physical - G,
-                ..Default::default()
-            },
-            ws,
-        )))
-    });
-    lease.begin_turn(&bank, dense, kv_live).unwrap();
-    assert!(lease.in_turn() && bank.in_turn());
-    assert_eq!(lease.end_turn_idle(&bank, dense, kv_live).unwrap(), None);
-    assert_eq!(lease.switches().len(), 1);
-    assert_eq!(bank.residency().unwrap().volatile, 0);
-    TEST_HOST.with(|c| c.set(None));
-    reference.end_turn().unwrap();
+    // Subsequent turns stay Direct and NonVolatile even if host memory spikes.
+    env.host(host_mem(rig.physical, rig.physical - G), rig.ws);
+    lease.begin_turn(&rig.bank, rig.dense, kv_live).unwrap();
+    assert!(lease.in_turn() && rig.bank.in_turn());
+    assert_eq!(
+        lease.end_turn_idle(&rig.bank, rig.dense, kv_live).unwrap(),
+        None
+    );
+    assert_eq!(
+        (
+            lease.switches().len(),
+            rig.bank.residency().unwrap().volatile
+        ),
+        (1, 0)
+    );
+    rig.reference.end_turn().unwrap();
 }
 
 #[test]
 fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight() {
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let dense = 10 * G;
-    let physical = 40 * G;
-    let ws = 96 * G;
-    let quiet = (
-        HostMemory {
-            physical,
-            wired: 12 * G,
-            ..Default::default()
-        },
-        ws,
-    );
+    let env = TestEnvGuard::new();
 
-    // 1. MLX_HY4_DIRECT=0 (DirectMode::Off) never promotes even on a quiet host.
-    {
-        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-        let size = ModelSize {
-            dense,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: 8,
-            ctx: ctx as u64,
-        };
-        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
-            .with_direct_promotion(
-                DirectPromotion {
-                    mode: DirectMode::Off,
-                    mmap: MmapMode::Off,
-                    metal_available: true,
-                    physical,
-                    reserve_override: None,
-                    n_experts: m.n_experts,
-                },
-                None,
-            );
-        TEST_HOST.with(|c| c.set(Some(quiet)));
-        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
-        assert!(!bank.is_direct());
-        assert!(lease.switches().is_empty());
-    }
+    // 1. DirectMode::Off never promotes on a quiet host.
+    let rig = PromoRig::new(40 * G, 96 * G);
+    let lease = rig.lease(DirectMode::Off, MmapMode::Off, Limits::default(), None, 8);
+    env.host(host_mem(rig.physical, 12 * G), rig.ws);
+    assert_eq!(lease.end_turn_idle(&rig.bank, rig.dense, 0).unwrap(), None);
+    assert!(!rig.bank.is_direct() && lease.switches().is_empty());
 
     // 2. cache_cap below direct_expert_bytes never promotes.
-    {
-        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-        let promo = DirectPromotion {
-            mode: DirectMode::Auto,
-            mmap: MmapMode::Off,
-            metal_available: true,
-            physical,
-            reserve_override: None,
-            n_experts: m.n_experts,
-        };
-        let direct_bytes = promo.direct_expert_bytes(&classes);
-        let size = ModelSize {
-            dense,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: 8,
-            ctx: ctx as u64,
-        };
-        let limits = Limits {
-            cache_cap: Some(direct_bytes - 1),
-            ..Limits::default()
-        };
-        let lease = Lease::new(p, size, 2048, classes, Some(limits), None, &bank)
-            .with_direct_promotion(promo, None);
-        TEST_HOST.with(|c| c.set(Some(quiet)));
-        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
-        assert!(!bank.is_direct());
-    }
+    let rig = PromoRig::new(40 * G, 96 * G);
+    let lim = Limits {
+        cache_cap: Some(rig.direct_bytes() - 1),
+        ..Limits::default()
+    };
+    let lease = rig.lease(DirectMode::Auto, MmapMode::Off, lim, None, 8);
+    assert_eq!(lease.end_turn_idle(&rig.bank, rig.dense, 0).unwrap(), None);
+    assert!(!rig.bank.is_direct());
 
     // 3. Large live KV exceeding physical headroom blocks promotion before dropping partial bank.
-    {
-        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-        let old_nbytes = bank.nbytes();
-        let promo = DirectPromotion {
-            mode: DirectMode::Auto,
-            mmap: MmapMode::Off,
-            metal_available: true,
-            physical,
-            reserve_override: None,
-            n_experts: m.n_experts,
-        };
-        let direct_bytes = promo.direct_expert_bytes(&classes);
-        let size = ModelSize {
-            dense,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: 8,
-            ctx: ctx as u64,
-        };
-        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
-            .with_direct_promotion(promo, None);
-        // Live KV + dense + others leaves less than DIRECT_MARGIN + growth, even
-        // though subtracting own (dense + kv) makes pick_direct's 64K check pass.
-        let huge_kv = 26 * G;
-        TEST_HOST.with(|c| {
-            c.set(Some((
-                HostMemory {
-                    physical,
-                    wired: dense + huge_kv + G,
-                    ..Default::default()
-                },
-                ws,
-            )))
-        });
-        assert_eq!(lease.end_turn_idle(&bank, dense, huge_kv).unwrap(), None);
-        assert!(!bank.is_direct());
-        assert_eq!(bank.nbytes(), old_nbytes);
-        assert!(direct_bytes > 0);
-    }
-
-    TEST_HOST.with(|c| c.set(None));
+    let rig = PromoRig::new(40 * G, 96 * G);
+    let old = rig.bank.nbytes();
+    let lease = rig.lease(DirectMode::Auto, MmapMode::Off, Limits::default(), None, 8);
+    let huge_kv = 26 * G;
+    env.host(host_mem(rig.physical, rig.dense + huge_kv + G), rig.ws);
+    assert_eq!(
+        lease.end_turn_idle(&rig.bank, rig.dense, huge_kv).unwrap(),
+        None
+    );
+    assert!(!rig.bank.is_direct() && rig.bank.nbytes() == old && rig.direct_bytes() > 0);
 }
 
 #[test]
 fn lease_direct_bank_never_shrinks_or_flips_volatile() {
-    let m = moe();
-    let mut experts = Vec::new();
-    let mut off = 0u64;
-    for (il, class) in [
-        (0, ExpertClass::Q6kDown),
-        (1, ExpertClass::Q4kDown),
-        (2, ExpertClass::Q4kDown),
-    ] {
-        let mut l = layer(&m, il, class);
-        let geo = geometry(&m, class).unwrap();
-        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
-            .into_iter()
-            .enumerate()
-        {
-            loc.data_offset = off;
-            off += geo[p].file_bytes() * m.n_experts as u64;
-        }
-        experts.push(Some(l));
-    }
-    let dir = std::env::temp_dir().join(format!("hy4-store-direct-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _tmp = Temp(dir.clone());
-    let path = dir.join("experts.bin");
-    std::fs::write(&path, vec![0u8; off as usize]).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
-    let bank = KqBank::new_direct(pool, &m, &experts).unwrap();
-    bank.wait_direct_fill().unwrap();
-
-    let classes = Classes {
-        layers: [1, 2],
-        slot: bank.slot_bytes(),
-    };
-    let p = profile(100);
+    let files = BankFiles::new(5);
+    let (bank, p, ws) = (files.direct(), profile(100), 64 * G);
+    let classes = files.classes(&bank);
     let size = ModelSize {
         dense: 0,
         slot: classes.slot[0].max(classes.slot[1]),
         n_experts: 8,
         ctx: 1024,
     };
-    let ws = 64 * G;
-    let direct_adm = Admission {
-        physical: 128 * G,
-        host_used: 20 * G,
-        own: 0,
-        others: 20 * G,
-        reserve: DIRECT_MARGIN,
-        live: 104 * G,
-        ws,
-        terms: Terms {
-            dense: 10 * G,
-            staging_layer: 0,
-            kv: 4 * G,
-            compute: direct_scratch_bytes(&p, 1024, 1024),
-            io: 0,
-            driver: 0,
-            pool: 0,
-        },
-        staging_layers: 0,
-        fixed: 80 * G,
-        slot: size.slot,
-        cache_slots: 12,
-        bound: Bound::Live,
+    let terms = Terms {
+        dense: 10 * G,
+        staging_layer: 0,
+        kv: 4 * G,
+        compute: direct_scratch_bytes(&p, 1024, 1024),
+        io: 0,
+        driver: 0,
+        pool: 0,
     };
+    let adm = synth_adm(
+        128 * G,
+        20 * G,
+        DIRECT_MARGIN,
+        104 * G,
+        ws,
+        terms,
+        0,
+        80 * G,
+        size.slot,
+        12,
+    );
     let lease = Lease::new(
         p,
         size,
         1024,
         classes,
         Some(Limits::default()),
-        Some(direct_adm),
+        Some(adm),
         &bank,
     );
-    // Wired limit must be capped at ws even though fixed + bank.nbytes() > ws.
     assert_eq!(lease.wired_limit(&bank), Some(ws));
 
-    // Spiked host memory must NOT shrink, rebuild, or fail a direct bank.
-    let busy = (
-        HostMemory {
-            physical: 128 * G,
-            wired: 125 * G,
-            ..Default::default()
-        },
-        ws,
-    );
-    TEST_HOST.with(|c| c.set(Some(busy)));
+    let env = TestEnvGuard::new();
+    env.host(host_mem(128 * G, 125 * G), ws);
     lease.begin_turn(&bank, 10 * G, 4 * G).unwrap();
-    assert!(lease.in_turn() && bank.in_turn());
-    assert!(!lease.recheck(&bank, 10 * G, 4 * G).unwrap());
+    assert!(lease.in_turn() && bank.in_turn() && !lease.recheck(&bank, 10 * G, 4 * G).unwrap());
     assert!(lease.switches().is_empty());
 
-    // end_turn releases wired lease but NEVER flips direct banks to Volatile.
     lease.end_turn(&bank).unwrap();
-    assert!(!lease.in_turn() && !bank.in_turn());
     let r = bank.residency().unwrap();
-    assert!(r.resident > 0);
-    assert_eq!(
-        r.volatile, 0,
-        "direct banks must stay NonVolatile after end_turn"
-    );
+    assert!(!lease.in_turn() && !bank.in_turn() && r.resident > 0 && r.volatile == 0);
 
-    // Second turn on busy host still succeeds with zero switches.
     lease.begin_turn(&bank, 10 * G, 4 * G).unwrap();
-    assert!(lease.in_turn() && bank.in_turn());
-    assert!(lease.switches().is_empty());
+    assert!(lease.in_turn() && bank.in_turn() && lease.switches().is_empty());
     lease.end_turn(&bank).unwrap();
-    TEST_HOST.with(|c| c.set(None));
 }
 
 #[test]
 fn shard1_nocache_and_page_cache_flags() {
-    assert!(!shard1_nocache(None));
-    assert!(!shard1_nocache(Some("")));
-    assert!(!shard1_nocache(Some("0")));
-    assert!(!shard1_nocache(Some("false")));
-    assert!(shard1_nocache(Some("1")));
-    assert!(shard1_nocache(Some("true")));
-    assert!(shard1_nocache(Some(" TRUE ")));
-
-    let m = moe();
-    let experts = vec![None, Some(layer(&m, 1, ExpertClass::Q6kDown))];
+    for (raw, want) in [
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("1"), true),
+        (Some("true"), true),
+        (Some(" TRUE "), true),
+    ] {
+        assert_eq!(shard1_nocache(raw), want, "{raw:?}");
+    }
+    let m = store_moe();
+    let l1 = kquant_layer(
+        &mut Rng::new(1),
+        &m,
+        1,
+        ExpertClass::Q6kDown,
+        1,
+        &mut Vec::new(),
+    );
+    let experts = vec![None, Some(l1)];
     assert_eq!(
         shard_page_cache_for(2, &experts, 1, false),
         vec![true, false]
@@ -2178,24 +1854,28 @@ fn shard1_nocache_and_page_cache_flags() {
         shard_page_cache_for(2, &experts, 1, true),
         vec![false, false]
     );
-    // Single-shard layout: Engram shard stays F_NOCACHE even when experts share it.
     assert_eq!(shard_page_cache_for(1, &experts, 0, false), vec![false]);
 }
 
 #[test]
 fn mmap_mode_and_prewarm_env_parsing() {
-    for parse in [mmap_mode, mmap_prewarm_mode] {
-        assert_eq!(parse(None).unwrap(), MmapMode::Auto);
-        assert_eq!(parse(Some("")).unwrap(), MmapMode::Auto);
-        assert_eq!(parse(Some("  ")).unwrap(), MmapMode::Auto);
-        assert_eq!(parse(Some("auto")).unwrap(), MmapMode::Auto);
-        assert_eq!(parse(Some("AUTO")).unwrap(), MmapMode::Auto);
-        assert_eq!(parse(Some("1")).unwrap(), MmapMode::On);
-        assert_eq!(parse(Some("true")).unwrap(), MmapMode::On);
-        assert_eq!(parse(Some("TRUE")).unwrap(), MmapMode::On);
-        assert_eq!(parse(Some("0")).unwrap(), MmapMode::Off);
-        assert_eq!(parse(Some("false")).unwrap(), MmapMode::Off);
-        assert_eq!(parse(Some("FALSE")).unwrap(), MmapMode::Off);
+    use MmapMode as M;
+    let cases = [
+        (None, M::Auto),
+        (Some(""), M::Auto),
+        (Some("  "), M::Auto),
+        (Some("auto"), M::Auto),
+        (Some("AUTO"), M::Auto),
+        (Some("1"), M::On),
+        (Some("true"), M::On),
+        (Some("TRUE"), M::On),
+        (Some("0"), M::Off),
+        (Some("false"), M::Off),
+        (Some("FALSE"), M::Off),
+    ];
+    for (raw, want) in cases {
+        assert_eq!(mmap_mode(raw).unwrap(), want, "{raw:?}");
+        assert_eq!(mmap_prewarm_mode(raw).unwrap(), want, "{raw:?}");
     }
     assert!(
         mmap_mode(Some("yes"))
@@ -2213,375 +1893,97 @@ fn mmap_mode_and_prewarm_env_parsing() {
 
 #[test]
 fn mmap_admission_headroom_guard_and_precedence() {
-    let sizes = Sizes {
-        dense_trunk: 8_003_184_948,
-        dense_mtp: 2_189_929_600,
-        classes: Classes {
-            layers: [19, 22],
-            slot: [4_663_296, 4_091_904],
-        },
-        n_experts: 512,
-    };
-    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
-    let direct_bytes = sizes.direct_expert_bytes();
-    let mapped_bytes = 89_500_000_000u64;
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let ws = 96 * G;
-    let busy_128 = HostMemory {
-        physical: 128 * G,
-        wired: 50 * G,
-        ..Default::default()
-    };
-    let quiet_128 = HostMemory {
-        physical: 128 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
-    let busy_192 = HostMemory {
-        physical: 192 * G,
-        wired: 50 * G,
-        ..Default::default()
-    };
-    let host_96 = HostMemory {
-        physical: 96 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
+    use DirectMode as D;
+    use MmapMode as M;
+    let mut rig = ModeRig::real();
+    let (q128, b128) = (host_mem(128 * G, 20 * G), host_mem(128 * G, 50 * G));
+    let (b192, h96) = (host_mem(192 * G, 50 * G), host_mem(96 * G, 20 * G));
 
-    // 1. 128 GiB host with 20 GiB others + MLX_HY4_MMAP=auto admits Mmap at 4096 chunk
-    //    (budget 104 GiB >= dense + kv/scratch + 83.35 GiB mapped_bytes), wired_limit < 20 GiB.
-    let res = select_expert_mode(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &quiet_128,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let ExpertResidency::Mmap { chunk, gate } = res else {
-        panic!("expected Mmap on 128 GiB host with 20 GiB others, got {res:?}");
+    // 1. Quiet 128 GiB host + Auto/Auto admits Mmap at 4096 with wired_limit < 20 GiB.
+    let ExpertResidency::Mmap { chunk, gate } = rig.select(M::Auto, D::Auto, &q128).unwrap() else {
+        panic!("expected Mmap on 128 GiB quiet host");
     };
-    assert_eq!(chunk, MMAP_PREFILL_CHUNK_MAX);
-    assert!(gate.admitted);
-    assert_eq!(gate.mapped_bytes, mapped_bytes);
+    assert_eq!(
+        (chunk, gate.admitted, gate.mapped_bytes),
+        (MMAP_PREFILL_CHUNK_MAX, true, rig.mapped_bytes)
+    );
     assert_eq!(
         gate.need,
-        gate.dense_bytes + gate.kv_and_scratch + mapped_bytes
+        gate.dense_bytes + gate.kv_and_scratch + rig.mapped_bytes
     );
-    let wired_want = gate.dense_bytes + gate.kv_and_scratch;
-    assert!(
-        wired_want < 20 * G,
-        "mmap wired need {:.2} GiB",
-        wired_want as f64 / G as f64
-    );
-    assert!(direct_wired_limit(wired_want, ws) < 20 * G);
+    let wired = gate.dense_bytes + gate.kv_and_scratch;
+    assert!(wired < 20 * G && direct_wired_limit(wired, rig.ws) < 20 * G);
 
-    let kv_initial = direct_kv_allowance(&p, ctx);
-    let warm = mmap_warm_budget(
-        MmapMode::Auto,
-        &quiet_128,
-        dense_mtp,
-        kv_initial,
-        DIRECT_MARGIN,
-        mapped_bytes,
-    );
-    assert_eq!(warm, mapped_bytes);
-    assert_eq!(
-        mmap_warm_budget(
-            MmapMode::Off,
-            &quiet_128,
-            dense_mtp,
-            kv_initial,
-            DIRECT_MARGIN,
-            mapped_bytes,
-        ),
-        0
-    );
-    let tight_warm = HostMemory {
-        physical: 128 * G,
-        wired: 108 * G,
-        ..Default::default()
+    assert_eq!(rig.warm(M::Auto, &q128), rig.mapped_bytes);
+    assert_eq!(rig.warm(M::Off, &q128), 0);
+    assert_eq!(rig.warm(M::Auto, &host_mem(128 * G, 108 * G)), 0);
+
+    // 2. Forced MmapMode::On admits on busy 128 GiB host with base-only need (< 20 GiB).
+    let ExpertResidency::Mmap {
+        chunk: fc,
+        gate: fg,
+    } = rig.select(M::On, D::Auto, &b128).unwrap()
+    else {
+        panic!("expected MLX_HY4_MMAP=1 to force Mmap");
     };
     assert_eq!(
-        mmap_warm_budget(
-            MmapMode::Auto,
-            &tight_warm,
-            dense_mtp,
-            kv_initial,
-            DIRECT_MARGIN,
-            mapped_bytes,
-        ),
-        0
-    );
-
-    // 2. 128 GiB host with 50 GiB others: MLX_HY4_MMAP=auto falls back to Streamed
-    //    because budget (74 GiB) cannot hold 83.35 GiB clean file cache without thrashing.
-    for direct in [DirectMode::Auto, DirectMode::Off, DirectMode::On] {
-        let res_busy = select_expert_mode(
-            MmapMode::Auto,
-            direct,
+        (fc, fg.admitted, fg.need),
+        (
+            MMAP_PREFILL_CHUNK_MAX,
             true,
-            &p,
-            ctx,
-            &busy_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
+            fg.dense_bytes + fg.kv_and_scratch
         )
-        .unwrap();
-        assert!(
-            matches!(res_busy, ExpertResidency::Streamed { .. }),
-            "128 GiB host with 50 GiB others (direct={direct:?}) must fall back to Streamed, got {res_busy:?}"
+    );
+    assert!(fg.need < 20 * G);
+
+    // 3. Full mode precedence matrix.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Kind {
+        Mmap,
+        Direct,
+        Streamed,
+    }
+    let kind = |r| match r {
+        ExpertResidency::Mmap { .. } => Kind::Mmap,
+        ExpertResidency::Direct { .. } => Kind::Direct,
+        ExpertResidency::Streamed { .. } => Kind::Streamed,
+    };
+    for (m, d, metal, h, want) in [
+        (M::Auto, D::Auto, true, b128, Kind::Streamed),
+        (M::Auto, D::Off, true, b128, Kind::Streamed),
+        (M::Auto, D::On, true, b128, Kind::Streamed),
+        (M::Auto, D::Auto, true, b192, Kind::Mmap),
+        (M::Off, D::Auto, true, q128, Kind::Direct),
+        (M::Off, D::Auto, true, b128, Kind::Streamed),
+        (M::Auto, D::On, true, q128, Kind::Direct),
+        (M::Auto, D::Off, true, q128, Kind::Mmap),
+        (M::Auto, D::Auto, true, h96, Kind::Streamed),
+        (M::Auto, D::Off, false, q128, Kind::Streamed),
+        (M::On, D::Off, true, h96, Kind::Mmap),
+    ] {
+        rig.metal = metal;
+        assert_eq!(
+            kind(rig.select(m, d, &h).unwrap()),
+            want,
+            "{m:?} {d:?} metal={metal}"
         );
     }
 
-    // 3. MLX_HY4_MMAP=1 forces Mmap at others = 50 GiB (and on 96 GiB host) whenever
-    //    budget >= dense + kv_and_scratch.
-    let res_force_busy = select_expert_mode(
-        MmapMode::On,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &busy_128,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let ExpertResidency::Mmap {
-        chunk: force_chunk,
-        gate: force_gate,
-    } = res_force_busy
-    else {
-        panic!("expected MLX_HY4_MMAP=1 to force Mmap at 50 GiB others, got {res_force_busy:?}");
-    };
-    assert_eq!(force_chunk, MMAP_PREFILL_CHUNK_MAX);
-    assert!(force_gate.admitted);
-    assert_eq!(
-        force_gate.need,
-        force_gate.dense_bytes + force_gate.kv_and_scratch
-    );
-    assert!(force_gate.need < 20 * G);
-
-    // 4. 192 GiB host with 50 GiB others still auto-admits Mmap.
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Auto,
-            true,
-            &p,
-            ctx,
-            &busy_192,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Mmap { .. }
-    ));
-
-    // 5. MLX_HY4_MMAP=0 falls back cleanly to existing Direct (quiet) / Streamed (busy).
-    let res_off_quiet = select_expert_mode(
-        MmapMode::Off,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &quiet_128,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    assert!(matches!(res_off_quiet, ExpertResidency::Direct { .. }));
-
-    let res_off_busy = select_expert_mode(
-        MmapMode::Off,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &busy_128,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    assert!(matches!(res_off_busy, ExpertResidency::Streamed { .. }));
-
-    // 6. MLX_HY4_MMAP=auto precedence across DirectMode::{On, Auto, Off}, physical < 100 GiB,
-    //    and Metal unavailability.
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::On,
-            true,
-            &p,
-            ctx,
-            &quiet_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Direct { .. }
-    ));
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Off,
-            true,
-            &p,
-            ctx,
-            &quiet_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Mmap { .. }
-    ));
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Auto,
-            true,
-            &p,
-            ctx,
-            &host_96,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Streamed { .. }
-    ));
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::Auto,
-            DirectMode::Off,
-            false,
-            &p,
-            ctx,
-            &quiet_128,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Streamed { .. }
-    ));
-
-    // 7. MLX_HY4_MMAP=1 admits even below 100 GiB if budget >= base need, and fails loud
-    //    when base need > budget or Metal is unavailable.
-    assert!(matches!(
-        select_expert_mode(
-            MmapMode::On,
-            DirectMode::Off,
-            true,
-            &p,
-            ctx,
-            &host_96,
-            &Own::default(),
-            dense_mtp,
-            direct_bytes,
-            mapped_bytes,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-        ExpertResidency::Mmap { .. }
-    ));
-    let squeezed = HostMemory {
-        physical: 128 * G,
-        wired: 118 * G,
-        ..Default::default()
-    };
-    let err = select_expert_mode(
-        MmapMode::On,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &squeezed,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap_err();
+    // 4. Forced MmapMode::On fails loud when squeezed or without Metal.
+    rig.metal = true;
     assert!(
-        err.reason.contains("MLX_HY4_MMAP=1 refused"),
-        "{}",
-        err.reason
+        rig.select(M::On, D::Auto, &host_mem(128 * G, 118 * G))
+            .unwrap_err()
+            .reason
+            .contains("MLX_HY4_MMAP=1 refused")
     );
-    let err_metal = select_expert_mode(
-        MmapMode::On,
-        DirectMode::Auto,
-        false,
-        &p,
-        ctx,
-        &busy_128,
-        &Own::default(),
-        dense_mtp,
-        direct_bytes,
-        mapped_bytes,
-        None,
-        None,
-        None,
-    )
-    .unwrap_err();
-    assert!(err_metal.reason.contains("Metal"), "{}", err_metal.reason);
+    rig.metal = false;
+    assert!(
+        rig.select(M::On, D::Auto, &b128)
+            .unwrap_err()
+            .reason
+            .contains("Metal")
+    );
 }
 
 #[test]
@@ -2590,619 +1992,303 @@ fn lease_mmap_bank_has_zero_anon_wired_under_20gb_and_never_promotes() {
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
-    let m = moe();
-    let mut experts = Vec::new();
-    let mut off = 1024u64;
-    for (il, class) in [
-        (0, ExpertClass::Q6kDown),
-        (1, ExpertClass::Q4kDown),
-        (2, ExpertClass::Q4kDown),
-    ] {
-        let mut l = layer(&m, il, class);
-        let geo = geometry(&m, class).unwrap();
-        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
-            .into_iter()
-            .enumerate()
-        {
-            loc.data_offset = off;
-            off += geo[p].file_bytes() * m.n_experts as u64;
-            off = off.div_ceil(32) * 32;
-        }
-        experts.push(Some(l));
-    }
-    let dir = std::env::temp_dir().join(format!("hy4-store-mmap-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _tmp = Temp(dir.clone());
-    let path = dir.join("experts.bin");
-    std::fs::write(&path, vec![0u8; off as usize]).unwrap();
-    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
-    let bank = KqBank::new_mmap(pool, &m, &experts, std::slice::from_ref(&path), 0, false).unwrap();
-
-    assert!(bank.is_direct());
-    assert!(bank.is_mmap());
-    assert_eq!(bank.nbytes(), 0);
-    assert_eq!(bank.resident_bytes().unwrap(), 0);
+    let files = BankFiles::new(6);
+    let bank = files.mmap();
+    assert!(bank.is_direct() && bank.is_mmap() && bank.nbytes() == 0);
     assert_eq!(
-        bank.residency().unwrap(),
-        Residency {
-            resident: 0,
-            volatile: 0,
-        }
+        (bank.resident_bytes().unwrap(), bank.residency().unwrap()),
+        (0, Residency::default())
     );
 
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let dense = 10 * G;
-    let ws = 96 * G;
-    let kv_initial = direct_kv_allowance(&p, ctx);
-    let scratch = direct_scratch_bytes(&p, MMAP_PREFILL_CHUNK_MAX, ctx);
-    let mmap_fixed = dense + kv_initial + scratch;
-    assert!(mmap_fixed < 20 * G);
-    let classes = Classes {
-        layers: [1, 2],
-        slot: bank.slot_bytes(),
-    };
+    let (p, ctx, dense, ws) = (profile(15_812), 262_144usize, 10 * G, 96 * G);
+    let (kv, sc) = (
+        direct_kv_allowance(&p, ctx),
+        direct_scratch_bytes(&p, MMAP_PREFILL_CHUNK_MAX, ctx),
+    );
+    let fixed = dense + kv + sc;
+    assert!(fixed < 20 * G);
+    let classes = files.classes(&bank);
     let size = ModelSize {
         dense,
         slot: classes.slot[0].max(classes.slot[1]),
         n_experts: 8,
         ctx: ctx as u64,
     };
-    let mmap_adm = Admission {
-        physical: 128 * G,
-        host_used: 50 * G,
-        own: 0,
-        others: 50 * G,
-        reserve: DIRECT_MARGIN,
-        live: 74 * G,
-        ws,
-        terms: Terms {
-            dense,
-            staging_layer: 0,
-            kv: kv_initial,
-            compute: scratch,
-            io: 0,
-            driver: 0,
-            pool: 0,
-        },
-        staging_layers: 0,
-        fixed: mmap_fixed,
-        slot: size.slot,
-        cache_slots: 12,
-        bound: Bound::Live,
+    let terms = Terms {
+        dense,
+        staging_layer: 0,
+        kv,
+        compute: sc,
+        io: 0,
+        driver: 0,
+        pool: 0,
     };
+    let adm = synth_adm(
+        128 * G,
+        50 * G,
+        DIRECT_MARGIN,
+        74 * G,
+        ws,
+        terms,
+        0,
+        fixed,
+        size.slot,
+        12,
+    );
     let lease = Lease::new(
         p,
         size,
         MMAP_PREFILL_CHUNK_MAX as u64,
         classes,
         Some(Limits::default()),
-        Some(mmap_adm),
+        Some(adm),
         &bank,
     )
     .with_direct_budget(Some(74 * G));
 
     let wl = lease.wired_limit(&bank).unwrap();
-    assert_eq!(wl, mmap_fixed);
-    assert!(wl < 20 * G);
-
-    assert!(!bank.in_turn());
-    lease.begin_turn(&bank, dense, kv_initial).unwrap();
-    assert!(lease.in_turn() && bank.in_turn());
-    assert!(!lease.recheck(&bank, dense, kv_initial).unwrap());
-    assert_eq!(lease.end_turn_idle(&bank, dense, kv_initial).unwrap(), None);
-    assert!(!lease.in_turn() && !bank.in_turn());
-    assert!(bank.is_mmap());
-    assert!(lease.switches().is_empty());
+    assert!(wl == fixed && wl < 20 * G && !bank.in_turn());
+    lease.begin_turn(&bank, dense, kv).unwrap();
+    assert!(lease.in_turn() && bank.in_turn() && !lease.recheck(&bank, dense, kv).unwrap());
+    assert_eq!(lease.end_turn_idle(&bank, dense, kv).unwrap(), None);
+    assert!(!lease.in_turn() && !bank.in_turn() && bank.is_mmap() && lease.switches().is_empty());
 }
 
 #[test]
 fn mmap_chunk_max_override_fallback_and_dense_savings_accounting() {
     assert_eq!(MMAP_PREFILL_CHUNK_MAX, 4096);
-    assert_eq!(mmap_prefill_chunk_max(None).unwrap(), 4096);
-    assert_eq!(mmap_prefill_chunk_max(Some("")).unwrap(), 4096);
-    assert_eq!(mmap_prefill_chunk_max(Some("2048")).unwrap(), 2048);
-    assert_eq!(mmap_prefill_chunk_max(Some("3072")).unwrap(), 3072);
-    assert!(mmap_prefill_chunk_max(Some("0")).is_err());
-    assert!(mmap_prefill_chunk_max(Some("300")).is_err());
-    assert!(mmap_prefill_chunk_max(Some("abc")).is_err());
+    for (raw, want) in [
+        (None, 4096),
+        (Some(""), 4096),
+        (Some("2048"), 2048),
+        (Some("3072"), 3072),
+    ] {
+        assert_eq!(mmap_prefill_chunk_max(raw).unwrap(), want, "{raw:?}");
+    }
+    for bad in ["0", "300", "abc"] {
+        assert!(mmap_prefill_chunk_max(Some(bad)).is_err(), "{bad}");
+    }
 
-    let sizes = Sizes {
-        dense_trunk: 8_003_184_948,
-        dense_mtp: 2_189_929_600,
-        classes: Classes {
-            layers: [19, 22],
-            slot: [4_663_296, 4_091_904],
-        },
-        n_experts: 512,
+    let mut rig = ModeRig::real().with_savings(1_194_590_208);
+    let q128 = host_mem(128 * G, 20 * G);
+    let ExpertResidency::Mmap { chunk, gate } = rig
+        .select_for(MmapMode::Auto, DirectMode::Auto, &q128)
+        .unwrap()
+    else {
+        panic!("expected Mmap at 4096");
     };
-    let dense_full = sizes.dense_trunk + sizes.dense_mtp;
-    let saved = 1_194_590_208u64; // output.weight (BF16) + token_embd.weight (Q8_0)
-    let dense_mmap = dense_full - saved;
-    let direct_bytes = sizes.direct_expert_bytes();
-    let mapped_bytes = 89_500_000_000u64 + saved;
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let quiet_128 = HostMemory {
-        physical: 128 * G,
-        wired: 20 * G,
-        ..Default::default()
-    };
-
-    // Default cap selects 4096 and subtracts saved dense bytes from mmap gate & wired limit.
-    let res_default = select_expert_mode_for(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &quiet_128,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        MMAP_PREFILL_CHUNK_MAX,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let ExpertResidency::Mmap { chunk, gate } = res_default else {
-        panic!("expected Mmap at default 4096 cap, got {res_default:?}");
-    };
-    assert_eq!(chunk, 4096);
-    assert_eq!(gate.dense_bytes, dense_mmap);
+    assert_eq!((chunk, gate.dense_bytes), (4096, rig.dense_mmap));
     let wired_default = gate.dense_bytes + gate.kv_and_scratch;
 
-    // Explicit env override to 2048 caps mmap chunk at 2048.
-    let res_2048 = select_expert_mode_for(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &quiet_128,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        2048,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    rig.mmap_chunk_max = 2048;
     let ExpertResidency::Mmap {
-        chunk: chunk_2048,
-        gate: gate_2048,
-    } = res_2048
+        chunk: c2k,
+        gate: g2k,
+    } = rig
+        .select_for(MmapMode::Auto, DirectMode::Auto, &q128)
+        .unwrap()
     else {
-        panic!("expected Mmap at 2048 override, got {res_2048:?}");
+        panic!("expected Mmap at 2048");
     };
-    assert_eq!(chunk_2048, 2048);
-    assert_eq!(gate_2048.dense_bytes, dense_mmap);
-    assert!(gate_2048.scratch_bytes < gate.scratch_bytes);
+    assert!(
+        c2k == 2048 && g2k.dense_bytes == rig.dense_mmap && g2k.scratch_bytes < gate.scratch_bytes
+    );
 
-    // Tight budget between 2048 need and 4096 need falls back cleanly from 4096 -> 2048.
-    let mid_cap = gate_2048.need + (gate.need - gate_2048.need) / 2;
-    let (fb_chunk, fb_gate) = pick_mmap_with_max(
+    let mid = g2k.need + (gate.need - g2k.need) / 2;
+    let (fbc, fbg) = pick_mmap_with_max(
         MmapMode::Auto,
         true,
         true,
-        &p,
-        ctx,
-        &quiet_128,
+        &rig.p,
+        rig.ctx,
+        &q128,
         &Own::default(),
-        dense_mmap,
-        mapped_bytes,
+        rig.dense_mmap,
+        rig.mapped_bytes,
         4096,
         None,
-        Some(mid_cap),
+        Some(mid),
     );
-    assert!(fb_gate.admitted);
-    assert_eq!(fb_chunk, 2048);
+    assert!(fbg.admitted && fbc == 2048);
 
-    // Direct mode still charges full dense_bytes (not reduced by mmap savings).
-    let res_direct = select_expert_mode_for(
-        MmapMode::Off,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &quiet_128,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        4096,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let ExpertResidency::Direct { gate: d_gate, .. } = res_direct else {
-        panic!("expected Direct when MmapMode::Off, got {res_direct:?}");
+    rig.mmap_chunk_max = 4096;
+    let ExpertResidency::Direct { gate: dg, .. } = rig
+        .select_for(MmapMode::Off, DirectMode::Auto, &q128)
+        .unwrap()
+    else {
+        panic!("expected Direct");
     };
-    assert_eq!(d_gate.dense_bytes, dense_full);
-    assert!(wired_default < 15 * G);
+    assert!(dg.dense_bytes == rig.dense_full && wired_default < 15 * G);
 }
 
 #[test]
 fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
-    let above_floor = 128 * G;
-    let below_floor = 96 * G;
-    assert!(!should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        above_floor,
-        false
-    ));
-    assert!(!should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        above_floor,
-        true
-    ));
-    assert!(!should_enable_direct_promotion(
-        MmapMode::Off,
-        DirectMode::Off,
-        true,
-        above_floor,
-        false
-    ));
-    assert!(should_enable_direct_promotion(
-        MmapMode::Off,
-        DirectMode::Auto,
-        true,
-        above_floor,
-        false
-    ));
-    assert!(should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::On,
-        true,
-        above_floor,
-        false
-    ));
-    assert!(should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        false,
-        above_floor,
-        false
-    ));
-    assert!(should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        below_floor,
-        false
-    ));
-    assert!(!should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        below_floor,
-        true
-    ));
-    assert!(!should_enable_direct_promotion(
-        MmapMode::Auto,
-        DirectMode::Off,
-        true,
-        below_floor,
-        false
-    ));
+    use DirectMode as D;
+    use MmapMode as M;
+    let (above, below) = (128 * G, 96 * G);
+    for (m, d, metal, phys, is_mmap, want) in [
+        (M::Auto, D::Auto, true, above, false, false),
+        (M::Auto, D::Auto, true, above, true, false),
+        (M::Off, D::Off, true, above, false, false),
+        (M::Off, D::Auto, true, above, false, true),
+        (M::Auto, D::On, true, above, false, true),
+        (M::Auto, D::Auto, false, above, false, true),
+        (M::Auto, D::Auto, true, below, false, true),
+        (M::Auto, D::Auto, true, below, true, false),
+        (M::Auto, D::Off, true, below, false, false),
+    ] {
+        assert_eq!(
+            should_enable_direct_promotion(m, d, metal, phys, is_mmap),
+            want
+        );
+    }
 
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let dense = 10 * G;
-    let physical = 128 * G;
-    let ws = 96 * G;
-    let quiet = (
-        HostMemory {
-            physical,
-            wired: 12 * G,
-            ..Default::default()
-        },
-        ws,
+    let env = TestEnvGuard::new();
+    let rig = PromoRig::new(128 * G, 96 * G);
+    let lease = rig.lease(
+        D::Auto,
+        M::Auto,
+        Limits::default(),
+        None,
+        rig.files.moe.n_experts as u64,
     );
+    env.host(host_mem(rig.physical, 12 * G), rig.ws);
+    assert_eq!(lease.end_turn_idle(&rig.bank, rig.dense, 0).unwrap(), None);
+    assert!(!rig.bank.is_direct() && lease.switches().is_empty());
 
-    // Even if a Lease is constructed with DirectPromotion, Auto mmap + Auto direct on Metal
-    // with physical >= MMAP_MIN_PHYSICAL must NEVER silently promote a Streamed bank into
-    // anonymous Direct RAM.
-    {
-        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-        let size = ModelSize {
-            dense,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: m.n_experts as u64,
-            ctx: ctx as u64,
-        };
-        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
-            .with_direct_promotion(
-                DirectPromotion {
-                    mode: DirectMode::Auto,
-                    mmap: MmapMode::Auto,
-                    metal_available: true,
-                    physical,
-                    reserve_override: None,
-                    n_experts: m.n_experts,
-                },
-                None,
-            );
-        TEST_HOST.with(|c| c.set(Some(quiet)));
-        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
-        assert!(!bank.is_direct());
-        assert!(lease.switches().is_empty());
-    }
-
-    // Explicit DirectMode::On (MLX_HY4_DIRECT=1) still promotes when headroom opens up.
-    {
-        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-        let size = ModelSize {
-            dense,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: m.n_experts as u64,
-            ctx: ctx as u64,
-        };
-        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
-            .with_direct_promotion(
-                DirectPromotion {
-                    mode: DirectMode::On,
-                    mmap: MmapMode::Auto,
-                    metal_available: true,
-                    physical,
-                    reserve_override: None,
-                    n_experts: m.n_experts,
-                },
-                None,
-            );
-        TEST_HOST.with(|c| c.set(Some(quiet)));
-        assert!(lease.end_turn_idle(&bank, dense, 0).unwrap().is_some());
-        assert!(bank.is_direct());
-        bank.wait_direct_fill().unwrap();
-    }
-
-    TEST_HOST.with(|c| c.set(None));
+    let rig = PromoRig::new(128 * G, 96 * G);
+    let lease = rig.lease(
+        D::On,
+        M::Auto,
+        Limits::default(),
+        None,
+        rig.files.moe.n_experts as u64,
+    );
+    assert!(
+        lease
+            .end_turn_idle(&rig.bank, rig.dense, 0)
+            .unwrap()
+            .is_some()
+            && rig.bank.is_direct()
+    );
+    rig.bank.wait_direct_fill().unwrap();
 }
 
 #[test]
 fn below_mmap_floor_auto_metal_recovers_streamed_to_direct_on_idle() {
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let dense = 10 * G;
-    let physical = 96 * G;
-    assert!(physical < MMAP_MIN_PHYSICAL);
-    let ws = 72 * G;
+    let rig = PromoRig::new(96 * G, 72 * G);
+    assert!(rig.physical < MMAP_MIN_PHYSICAL);
+    let (db, (need_2k, _, _)) = (rig.direct_bytes(), rig.need_2k());
+    let high = rig.physical - need_2k - DIRECT_MARGIN + 2 * G;
 
-    let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
-    let promo = DirectPromotion {
-        mode: DirectMode::Auto,
-        mmap: MmapMode::Auto,
-        metal_available: true,
-        physical,
-        reserve_override: None,
-        n_experts: m.n_experts,
-    };
-    let direct_bytes = promo.direct_expert_bytes(&classes);
-    let kv_64k = direct_kv_allowance(&p, ctx);
-    let scratch_2k = direct_scratch_bytes(&p, 2048, ctx);
-    let need_2k = dense + direct_bytes + kv_64k + scratch_2k;
-    let high_others = physical - need_2k - DIRECT_MARGIN + 2 * G;
-
-    // On a < MMAP_MIN_PHYSICAL Metal host in Auto/Auto, mmap is structurally ineligible;
-    // when transient other-process usage blocks Direct at load, load selects Streamed and
-    // keeps idle Direct promotion enabled.
-    let busy_host = HostMemory {
-        physical,
-        wired: high_others,
-        ..Default::default()
-    };
-    let selected = select_expert_mode(
+    let busy = host_mem(rig.physical, high);
+    let sel = select_expert_mode(
         MmapMode::Auto,
         DirectMode::Auto,
         true,
-        &p,
-        ctx,
-        &busy_host,
+        &rig.p,
+        rig.ctx,
+        &busy,
         &Own::default(),
-        dense,
-        direct_bytes,
-        direct_bytes,
+        rig.dense,
+        db,
+        db,
         None,
         None,
         None,
     )
     .unwrap();
-    assert!(matches!(selected, ExpertResidency::Streamed { .. }));
+    assert!(matches!(sel, ExpertResidency::Streamed { .. }));
     assert!(should_enable_direct_promotion(
         MmapMode::Auto,
         DirectMode::Auto,
         true,
-        physical,
+        rig.physical,
         false
     ));
 
-    let size = ModelSize {
-        dense,
-        slot: classes.slot[0].max(classes.slot[1]),
-        n_experts: m.n_experts as u64,
-        ctx: ctx as u64,
-    };
-    let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
-        .with_direct_promotion(promo, None);
+    let lease = rig.lease(
+        DirectMode::Auto,
+        MmapMode::Auto,
+        Limits::default(),
+        None,
+        rig.files.moe.n_experts as u64,
+    );
+    let (env, r) = (TestEnvGuard::new(), rig.bank.residency().unwrap());
 
-    // Turn 1: others stay high -> stays Streamed.
-    let r = bank.residency().unwrap();
-    TEST_HOST.with(|c| {
-        c.set(Some((
-            HostMemory {
-                physical,
-                wired: high_others + dense + r.resident,
-                ..Default::default()
-            },
-            ws,
-        )))
-    });
-    assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
-    assert!(!bank.is_direct());
-    assert!(lease.switches().is_empty());
+    env.host(
+        host_mem(rig.physical, high + rig.dense + r.resident),
+        rig.ws,
+    );
+    assert_eq!(lease.end_turn_idle(&rig.bank, rig.dense, 0).unwrap(), None);
+    assert!(!rig.bank.is_direct() && lease.switches().is_empty());
 
-    // Turn 2: others drop -> idle promotion transitions Streamed -> Direct!
-    TEST_HOST.with(|c| {
-        c.set(Some((
-            HostMemory {
-                physical,
-                wired: 4 * G + dense + r.resident,
-                ..Default::default()
-            },
-            ws,
-        )))
-    });
-    assert!(lease.end_turn_idle(&bank, dense, 0).unwrap().is_some());
-    assert!(bank.is_direct());
-    assert_eq!(lease.switches().len(), 1);
-    bank.wait_direct_fill().unwrap();
-    TEST_HOST.with(|c| c.set(None));
+    env.host(
+        host_mem(rig.physical, 4 * G + rig.dense + r.resident),
+        rig.ws,
+    );
+    assert!(
+        lease
+            .end_turn_idle(&rig.bank, rig.dense, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(rig.bank.is_direct() && lease.switches().len() == 1);
+    rig.bank.wait_direct_fill().unwrap();
 }
 
 #[test]
 fn select_expert_mode_with_retry_recovers_mmap_after_clear_cache() {
-    let sizes = Sizes {
-        dense_trunk: 8_003_184_948,
-        dense_mtp: 2_189_929_600,
-        classes: Classes {
-            layers: [19, 22],
-            slot: [4_663_296, 4_091_904],
-        },
-        n_experts: 512,
-    };
-    let dense_full = sizes.dense_trunk + sizes.dense_mtp;
-    let saved = 1_194_590_208u64;
-    let dense_mmap = dense_full - saved;
-    let direct_bytes = sizes.direct_expert_bytes();
-    let mapped_bytes = 89_500_000_000u64 + saved;
-    let p = profile(15_812);
-    let ctx = 262_144usize;
-    let ws = 96 * G;
+    let rig = ModeRig::real().with_savings(1_194_590_208);
 
-    // Transient 12 GiB MLX pool pushes initial reading over the 128 GiB Mmap Auto edge;
-    // clearing cache drops wired by 12 GiB and admits Mmap cleanly.
-    let cleared = std::cell::Cell::new(0usize);
-    let reads = std::cell::Cell::new(0usize);
-    let (_, _, res) = select_expert_mode_with_retry(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        MMAP_PREFILL_CHUNK_MAX,
-        None,
-        None,
-        None,
-        || {
-            reads.set(reads.get() + 1);
-            let wired = if cleared.get() == 0 { 32 * G } else { 20 * G };
-            Ok((
-                HostMemory {
-                    physical: 128 * G,
-                    wired,
-                    ..Default::default()
-                },
-                ws,
-            ))
-        },
-        || if cleared.get() == 0 { 12 * G } else { 0 },
-        || cleared.set(cleared.get() + 1),
-    )
-    .unwrap();
-    assert_eq!(cleared.get(), 1);
-    assert_eq!(reads.get(), 2);
+    let (cl, rd) = (Cell::new(0usize), Cell::new(0usize));
+    let (_, _, res) = rig
+        .retry(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            || {
+                rd.set(rd.get() + 1);
+                Ok((
+                    host_mem(128 * G, if cl.get() == 0 { 32 * G } else { 20 * G }),
+                    rig.ws,
+                ))
+            },
+            || if cl.get() == 0 { 12 * G } else { 0 },
+            || cl.set(cl.get() + 1),
+        )
+        .unwrap();
+    assert_eq!((cl.get(), rd.get()), (1, 2));
     assert!(matches!(res, ExpertResidency::Mmap { chunk: 4096, .. }));
 
-    // When pool is empty (0 B), no redundant clear_cache() or re-read happens.
-    let cleared_empty = std::cell::Cell::new(0usize);
-    let reads_empty = std::cell::Cell::new(0usize);
-    let (_, _, res_streamed) = select_expert_mode_with_retry(
-        MmapMode::Auto,
-        DirectMode::Auto,
-        true,
-        &p,
-        ctx,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        MMAP_PREFILL_CHUNK_MAX,
-        None,
-        None,
-        None,
-        || {
-            reads_empty.set(reads_empty.get() + 1);
-            Ok((
-                HostMemory {
-                    physical: 128 * G,
-                    wired: 50 * G,
-                    ..Default::default()
-                },
-                ws,
-            ))
-        },
-        || 0,
-        || cleared_empty.set(cleared_empty.get() + 1),
-    )
-    .unwrap();
-    assert_eq!(cleared_empty.get(), 0);
-    assert_eq!(reads_empty.get(), 1);
-    assert!(matches!(res_streamed, ExpertResidency::Streamed { .. }));
+    let (cl, rd) = (Cell::new(0usize), Cell::new(0usize));
+    let (_, _, res) = rig
+        .retry(
+            MmapMode::Auto,
+            DirectMode::Auto,
+            || {
+                rd.set(rd.get() + 1);
+                Ok((host_mem(128 * G, 50 * G), rig.ws))
+            },
+            || 0,
+            || cl.set(cl.get() + 1),
+        )
+        .unwrap();
+    assert!((cl.get(), rd.get()) == (0, 1) && matches!(res, ExpertResidency::Streamed { .. }));
 
-    // Forced MmapMode::On also retries once after clear_cache() when pool is non-empty.
-    let cleared_on = std::cell::Cell::new(0usize);
-    let (_, _, res_on) = select_expert_mode_with_retry(
-        MmapMode::On,
-        DirectMode::Off,
-        true,
-        &p,
-        ctx,
-        &Own::default(),
-        dense_full,
-        dense_mmap,
-        direct_bytes,
-        mapped_bytes,
-        MMAP_PREFILL_CHUNK_MAX,
-        None,
-        None,
-        None,
-        || {
-            let wired = if cleared_on.get() == 0 {
-                118 * G
-            } else {
-                50 * G
-            };
-            Ok((
-                HostMemory {
-                    physical: 128 * G,
-                    wired,
-                    ..Default::default()
-                },
-                ws,
-            ))
-        },
-        || 8 * G,
-        || cleared_on.set(cleared_on.get() + 1),
-    )
-    .unwrap();
-    assert_eq!(cleared_on.get(), 1);
-    assert!(matches!(res_on, ExpertResidency::Mmap { .. }));
+    let cl = Cell::new(0usize);
+    let (_, _, res) = rig
+        .retry(
+            MmapMode::On,
+            DirectMode::Off,
+            || {
+                Ok((
+                    host_mem(128 * G, if cl.get() == 0 { 118 * G } else { 50 * G }),
+                    rig.ws,
+                ))
+            },
+            || 8 * G,
+            || cl.set(cl.get() + 1),
+        )
+        .unwrap();
+    assert!(cl.get() == 1 && matches!(res, ExpertResidency::Mmap { .. }));
 }

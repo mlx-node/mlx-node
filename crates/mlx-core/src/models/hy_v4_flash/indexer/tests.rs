@@ -1,49 +1,20 @@
-use std::path::PathBuf;
-
 use serde_json::Value;
 
 use super::*;
 use crate::models::deepseek_v41::ops::rope_angle;
 use crate::models::hy_v4_flash::attention::{Geometry, Mla};
 use crate::models::hy_v4_flash::cache::LayerCache;
+use crate::models::hy_v4_flash::test_support::{
+    Rng, arr, assert_close_f64, assert_row_invariant, error_stats, fixture, j_f32s as f32s,
+    j_usize as u, j_usizes as usizes, make_sym_q8, read_f32, read_i32,
+};
 use crate::models::hy_v4_flash::weights::AttnWeights;
 
-/// A prefill call of `x`/`qr` at `start`.
-fn prefill<'a>(x: &'a MxArray, qr: &'a MxArray, start: usize) -> Call<'a> {
-    Call {
-        x,
-        qr,
-        start,
-        kind: RowKind::Prefill,
-    }
-}
+const D: usize = 12;
+const Q_LORA: usize = 6;
 
-fn fixture(name: &str) -> Value {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hy-v4-flash")
-        .join(name);
-    serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
-}
-
-fn u(v: &Value) -> usize {
-    v.as_u64().unwrap() as usize
-}
-
-fn usizes(v: &Value) -> Vec<usize> {
-    v.as_array().unwrap().iter().map(u).collect()
-}
-
-fn f32s(v: &Value) -> Vec<f32> {
-    let mut out = Vec::new();
-    flatten(v, &mut out);
-    out
-}
-
-fn flatten(v: &Value, out: &mut Vec<f32>) {
-    match v {
-        Value::Array(a) => a.iter().for_each(|x| flatten(x, out)),
-        x => out.push(x.as_f64().unwrap() as f32),
-    }
+fn call<'a>(x: &'a MxArray, qr: &'a MxArray, start: usize, kind: RowKind) -> Call<'a> {
+    Call { x, qr, start, kind }
 }
 
 /// The real file's indexer (I layer: 16 heads of 128, rope 64, kpool 4).
@@ -61,404 +32,6 @@ fn real() -> IndexerGeometry {
     }
 }
 
-fn close(got: f32, want: f32, abs: f64, rel: f64, what: &str) {
-    let (g, w) = (f64::from(got), f64::from(want));
-    assert!((g - w).abs() <= abs + rel * w.abs(), "{what}: {g} vs {w}");
-}
-
-#[test]
-fn row_rules_match_kpool_splits_rows() {
-    let g = real();
-    let f = fixture("kpool-splits.json");
-    let check = |r: &Value| {
-        let t = u(&r["t"]);
-        assert_eq!(g.visible(t), u(&r["visible_groups"]), "t {t} visible");
-        assert_eq!(g.picked(t), u(&r["picked_groups"]), "t {t} picked");
-        assert_eq!(!g.is_dense(t), r["topk"].as_bool().unwrap(), "t {t} topk");
-        assert_eq!(g.is_dense(t), r["dense"].as_bool().unwrap(), "t {t} dense");
-        assert_eq!(t / g.kpool, u(&r["own_group"]), "t {t} own group");
-        assert_eq!(g.tail_cells(t).len(), u(&r["own_cells"]), "t {t} own cells");
-        assert_eq!(g.cells(t), u(&r["cells"]), "t {t} cells");
-        assert!(g.cells(t) <= g.kmax());
-    };
-    for r in f["rows"].as_array().unwrap() {
-        check(r);
-    }
-    let calls = f["chain"]["calls"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(
-            f["two_call_splits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|s| s["calls"].as_array().unwrap()),
-        )
-        .chain(f["decode_after_2045"].as_array().unwrap());
-    for c in calls {
-        for key in ["first_row", "last_row"] {
-            if !c[key].is_null() {
-                check(&c[key]);
-            }
-        }
-    }
-}
-
-fn check_call(g: &IndexerGeometry, c: &Value, budget: usize) {
-    let (s, e) = (u(&c["s"]), u(&c["e"]));
-    let what = format!("call [{s}, {e})");
-    let p = g.plan(s, e - s);
-    let closed = usizes(&c["groups_closed_by_call"]);
-    assert_eq!(vec![p.groups.start, p.groups.end], closed, "{what} groups");
-    assert_eq!(usizes(&c["pooled_write_range"]), closed, "{what} writes");
-    assert_eq!(p.groups.start, u(&c["groups_closed_before"]), "{what}");
-    assert_eq!(p.groups.end, u(&c["groups_closed_after"]), "{what}");
-    assert_eq!(
-        p.open_in.collect::<Vec<_>>(),
-        usizes(&c["tail_in"]),
-        "{what} tail in"
-    );
-    assert_eq!(
-        p.tail_out.clone().collect::<Vec<_>>(),
-        usizes(&c["tail_out"]),
-        "{what} tail out"
-    );
-    assert!(p.tail_out.len() < g.kpool);
-    assert_eq!(p.cols, u(&c["score_cols"]), "{what} cols");
-    assert_eq!(
-        score_row_bytes(g.n_heads, p.cols),
-        u(&c["score_row_bytes"]),
-        "{what} row bytes"
-    );
-    let rows = e - s;
-    let per = score_rows(g.n_heads, p.cols, budget).min(rows);
-    assert_eq!(
-        per,
-        u(&c["score_rows_per_sub_chunk"]),
-        "{what} sub-chunk rows"
-    );
-    assert_eq!(
-        rows.div_ceil(per),
-        u(&c["score_sub_chunks"]),
-        "{what} sub-chunks"
-    );
-    assert_eq!(
-        p.sparse.len(),
-        u(&c["rows_needing_topk"]),
-        "{what} top-k rows"
-    );
-    assert_eq!(p.dense.len() + p.sparse.len(), rows);
-    let max_cells = (s..e).map(|t| g.cells(t)).max().unwrap();
-    assert_eq!(max_cells, u(&c["max_cells"]), "{what} max cells");
-    assert!(max_cells <= p.kmax, "{what} width");
-    if p.sparse.is_empty() {
-        assert_eq!(p.kmax, e, "{what} dense width");
-    } else {
-        assert_eq!(p.kmax, g.kmax(), "{what} sparse width");
-    }
-}
-
-#[test]
-fn call_plans_match_kpool_splits() {
-    let g = real();
-    let f = fixture("kpool-splits.json");
-    let geo = &f["geometry"];
-    assert_eq!(u(&geo["kpool"]), g.kpool);
-    assert_eq!(u(&geo["n_top_pool"]), g.n_top);
-    assert_eq!(u(&geo["indexer_heads"]), g.n_heads);
-    let budget = u(&geo["score_sub_chunk_budget"]);
-    assert_eq!(budget, INDEX_CHUNK_BYTES);
-    for c in f["chain"]["calls"].as_array().unwrap() {
-        check_call(&g, c, budget);
-    }
-    for split in f["two_call_splits"].as_array().unwrap() {
-        let calls = split["calls"].as_array().unwrap();
-        for c in calls {
-            check_call(&g, c, budget);
-        }
-        let last = calls.last().unwrap();
-        let one = g.plan(0, u(&last["e"]));
-        assert_eq!(one.groups.end, u(&last["groups_closed_after"]));
-        assert_eq!(one.tail_out.collect::<Vec<_>>(), usizes(&last["tail_out"]));
-    }
-    for c in f["decode_after_2045"].as_array().unwrap() {
-        check_call(&g, c, budget);
-    }
-    for (len, st) in f["state_after_len"].as_object().unwrap() {
-        let len: usize = len.parse().unwrap();
-        let p = g.plan(0, len);
-        assert_eq!(p.groups.end, u(&st["closed"]), "len {len}");
-        assert_eq!(p.groups.end, u(&st["pooled_len"]), "len {len}");
-        assert_eq!(
-            p.tail_out.collect::<Vec<_>>(),
-            usizes(&st["tail"]),
-            "len {len}"
-        );
-    }
-}
-
-#[test]
-fn select_rules_match_ops_kpool_select() {
-    let g = real();
-    let o = fixture("ops.json");
-    let k = &o["kpool_select"];
-    assert_eq!(u(&k["top_pool"]), g.n_top);
-    assert_eq!(u(&k["kpool"]), g.kpool);
-    for c in k["cases"].as_array().unwrap() {
-        let t = u(&c["t"]);
-        assert_eq!(g.visible(t), u(&c["n_visible"]), "t {t}");
-        assert_eq!(g.picked(t), u(&c["n_picked"]), "t {t}");
-        assert_eq!(
-            g.tail_cells(t).collect::<Vec<_>>(),
-            usizes(&c["tail_cells"]),
-            "t {t}"
-        );
-        assert_eq!(g.cells(t), u(&c["n_cells"]), "t {t}");
-        let dense = c["all_earlier_visible"].as_bool().unwrap();
-        assert_eq!(g.is_dense(t), dense, "t {t}");
-        if dense {
-            assert_eq!(
-                usizes(&c["cells_sorted"]),
-                (0..=t).collect::<Vec<_>>(),
-                "t {t}"
-            );
-            let row = dense_rows(t, 1, g.kmax()).unwrap();
-            assert_eq!(row.iter().filter(|&&x| x >= 0).count(), t + 1);
-        }
-    }
-}
-
-#[test]
-fn plan_splits_dense_and_scored_rows() {
-    let g = real();
-    assert_eq!(g.first_sparse(), 2048);
-    assert_eq!((g.tail_slots(), g.kmax()), (4, 2048));
-    let p = g.plan(0, 8192);
-    assert_eq!(
-        (p.dense, p.sparse.clone(), p.kmax),
-        (0..2048, 2048..8192, 2048)
-    );
-    assert_eq!((p.groups, p.cols), (0..2048, 2048));
-    let p = g.plan(100, 50);
-    assert_eq!(
-        (p.dense, p.sparse.is_empty(), p.kmax),
-        (100..150, true, 150)
-    );
-    let p = g.plan(5000, 1);
-    assert_eq!(
-        (p.dense.is_empty(), p.sparse, p.kmax),
-        (true, 5000..5001, 2048)
-    );
-
-    let mut nt = real();
-    nt.select_tail = false;
-    nt.n_top = 512;
-    assert_eq!(nt.visible(3), 1);
-    assert_eq!(nt.tail_cells(3), 4..4);
-    assert_eq!(nt.tail_cells(6), 4..7);
-    assert_eq!(
-        (nt.first_sparse(), nt.tail_slots(), nt.kmax()),
-        (2051, 3, 2051)
-    );
-    for t in [0, 1, 2047, 2050, 2051, 5000] {
-        assert!(nt.cells(t) <= nt.kmax(), "t {t}");
-        assert_eq!(nt.is_dense(t), nt.cells(t) == t + 1, "t {t}");
-    }
-}
-
-#[test]
-fn dense_rows_pad_to_their_width() {
-    assert_eq!(
-        dense_rows(2, 3, 5).unwrap(),
-        vec![0, 1, 2, -1, -1, 0, 1, 2, 3, -1, 0, 1, 2, 3, 4]
-    );
-    assert_eq!(dense_rows(0, 1, 1).unwrap(), vec![0]);
-    assert!(dense_rows(4, 2, 5).is_err());
-}
-
-#[test]
-fn score_rows_stay_within_the_budget() {
-    assert_eq!(score_row_bytes(16, 65_536), 4 << 20);
-    assert_eq!(score_rows(16, 65_536, INDEX_CHUNK_BYTES), 64);
-    assert_eq!(score_rows(16, 0, INDEX_CHUNK_BYTES), INDEX_CHUNK_BYTES);
-    assert_eq!(score_rows(16, 1 << 30, 1), 1);
-}
-
-// Everything below builds MLX arrays.
-
-fn arr(v: &[f32], shape: &[usize]) -> MxArray {
-    let s: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
-    MxArray::from_float32(v, &s).unwrap()
-}
-
-fn dense(v: &[f32], rows: usize, cols: usize) -> Dense {
-    Dense::Array(arr(v, &[rows, cols]))
-}
-
-fn read(x: &MxArray) -> Vec<f32> {
-    x.astype(DType::Float32)
-        .unwrap()
-        .to_float32()
-        .unwrap()
-        .as_ref()
-        .to_vec()
-}
-
-fn read_i32(x: &MxArray) -> Vec<i32> {
-    x.astype(DType::Int32)
-        .unwrap()
-        .to_int32()
-        .unwrap()
-        .as_ref()
-        .to_vec()
-}
-
-/// Index rows `[n, width]` -> each row's valid cells, ascending.
-fn cell_sets(idx: &MxArray) -> Vec<Vec<i32>> {
-    let width = idx.shape_at(1).unwrap() as usize;
-    read_i32(idx)
-        .chunks(width)
-        .map(|r| {
-            let mut v: Vec<i32> = r.iter().copied().filter(|&c| c >= 0).collect();
-            v.sort_unstable();
-            v
-        })
-        .collect()
-}
-
-#[test]
-fn pool_rope_and_scores_match_ops_fixture() {
-    crate::models::hy_v4_flash::exact_f32();
-    let o = fixture("ops.json");
-    let k = &o["kpool_pool_score"];
-    let dm = &k["dims"];
-    let (t, d, h, kp, rd) = (
-        u(&dm["t"]),
-        u(&dm["head_dim"]),
-        u(&dm["heads"]),
-        u(&dm["kpool"]),
-        u(&dm["n_rot"]),
-    );
-    let g = IndexerGeometry {
-        n_heads: h,
-        head_dim: d,
-        rope_dim: rd,
-        kpool: kp,
-        n_top: 2,
-        select_tail: true,
-        eps: k["norm_eps"].as_f64().unwrap() as f32,
-        weight_scale: k["weight_scale"].as_f64().unwrap() as f32,
-        rope_theta: k["theta"].as_f64().unwrap() as f32,
-    };
-    let dim = 8;
-    let w = IndexerWeights {
-        attn_k: dense(&vec![0.0; d * dim], d, dim),
-        k_norm: arr(&vec![1.0; d], &[d]),
-        q_b: dense(&vec![0.0; h * d * dim], h * d, dim),
-        proj: dense(&vec![0.0; h * dim], h, dim),
-        compressor_value: arr(&f32s(&k["wv"]), &[d, d]),
-        compressor_gate: arr(&f32s(&k["wg"]), &[d, d]),
-        compressor_ape: arr(&f32s(&k["ape"]), &[kp, d]),
-        compressor_norm: arr(&f32s(&k["norm_w"]), &[d]),
-    };
-    let ix = Indexer::new(g.clone(), &w).unwrap();
-    let tok = f32s(&k["tok_k"]);
-    let n_groups = t / kp;
-    let grp = arr(&tok[..n_groups * kp * d], &[n_groups, kp, d]);
-    let keys = ix.pool(&w, &grp, 0).unwrap();
-    let want = f32s(&k["pooled_keys_roped_f32"]);
-    for (i, (a, b)) in read(&keys).iter().zip(&want).enumerate() {
-        close(*a, *b, 1e-5, 1e-4, &format!("pooled key {i}"));
-    }
-
-    let iq = arr(&f32s(&k["iq"]), &[t, h, d]);
-    let pos: Vec<u64> = (0..t as u64).collect();
-    let q = ix.rope(&iq, &pos).unwrap();
-    let want = f32s(&k["q_roped_f32"]);
-    for (i, (a, b)) in read(&q).iter().zip(&want).enumerate() {
-        close(*a, *b, 1e-5, 1e-5, &format!("roped query {i}"));
-    }
-
-    let wr: Vec<f32> = f32s(&k["w_raw"])
-        .into_iter()
-        .map(|x| x * g.weight_scale)
-        .collect();
-    let keys_f = arr(&f32s(&k["pooled_keys_roped_f32"]), &[n_groups, d]);
-    let qf = arr(&f32s(&k["q_roped_f32"]), &[t, h, d]);
-    let sc = read(&scores(&qf, &arr(&wr, &[t, h]), &keys_f).unwrap());
-    for (ti, row) in k["score"].as_array().unwrap().iter().enumerate() {
-        for (gi, v) in row.as_array().unwrap().iter().enumerate() {
-            assert_eq!(v.is_null(), gi >= g.visible(ti), "t {ti} group {gi}");
-            if let Some(want) = v.as_f64() {
-                close(
-                    sc[ti * n_groups + gi],
-                    want as f32,
-                    1e-4,
-                    1e-4,
-                    &format!("score t {ti} g {gi}"),
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn pick_groups_ties_to_the_lowest_group() {
-    let g = real();
-    let o = fixture("ops.json");
-    let k = &o["kpool_select"];
-    let gs = f32s(&k["group_scores"]);
-    let cols = gs.len();
-    let cases = k["cases"].as_array().unwrap();
-    let rows: Vec<f32> = cases.iter().flat_map(|_| gs.iter().copied()).collect();
-    let visible: Vec<i32> = cases.iter().map(|c| u(&c["n_visible"]) as i32).collect();
-    let sc = arr(&rows, &[cases.len(), cols]);
-    let ids = pick_groups(&sc, &visible, g.n_top).unwrap();
-    assert_eq!(ids.shape_at(1).unwrap() as usize, g.n_top);
-    let got = read_i32(&ids);
-    let cells = cell_sets(&group_cells(&ids, g.kpool).unwrap());
-    for (i, c) in cases.iter().enumerate() {
-        let t = u(&c["t"]);
-        let row = &got[i * g.n_top..(i + 1) * g.n_top];
-        let n = u(&c["n_picked"]);
-        let want: Vec<i32> = usizes(&c["picked_sorted"])
-            .into_iter()
-            .map(|x| x as i32)
-            .collect();
-        assert_eq!(row[..n].to_vec(), want, "t {t} picks");
-        assert!(row[n..].iter().all(|&x| x == -1), "t {t} padding");
-        let mut all: Vec<i32> = cells[i].clone();
-        all.extend(g.tail_cells(t).map(|x| x as i32));
-        all.sort_unstable();
-        let want: Vec<i32> = usizes(&c["cells_sorted"])
-            .into_iter()
-            .map(|x| x as i32)
-            .collect();
-        assert_eq!(all, want, "t {t} cells");
-    }
-    assert!(pick_groups(&sc, &visible[1..], g.n_top).is_err());
-    let narrow = arr(&gs[..100], &[1, 100]);
-    assert!(pick_groups(&narrow, &[100], g.n_top).is_err());
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n).map(|_| self.next() * scale).collect()
-    }
-}
-
-const D: usize = 12;
-const Q_LORA: usize = 6;
-
 /// kpool 4, 2 picked groups: queries from 12 on pick by score.
 fn small() -> IndexerGeometry {
     IndexerGeometry {
@@ -474,7 +47,338 @@ fn small() -> IndexerGeometry {
     }
 }
 
-/// Host copies of the indexer weights, row-major `[out, in]`.
+fn dense(v: &[f32], rows: usize, cols: usize) -> Dense {
+    Dense::Array(arr(v, &[rows, cols]))
+}
+
+fn assert_close(got: &[f32], want: &[f32], abs: f64, rel: f64, what: &str) {
+    let wf: Vec<f64> = want.iter().map(|&x| f64::from(x)).collect();
+    assert_close_f64(got, &wf, abs, rel, what);
+}
+
+#[test]
+fn row_rules_match_kpool_splits_rows() {
+    let (g, f) = (real(), fixture("kpool-splits.json"));
+    let check = |r: &Value| {
+        let t = u(&r["t"]);
+        assert_eq!(g.visible(t), u(&r["visible_groups"]), "t {t}");
+        assert_eq!(g.picked(t), u(&r["picked_groups"]), "t {t}");
+        assert_eq!(!g.is_dense(t), r["topk"].as_bool().unwrap());
+        assert_eq!(g.is_dense(t), r["dense"].as_bool().unwrap());
+        assert_eq!(
+            (t / g.kpool, g.tail_cells(t).len()),
+            (u(&r["own_group"]), u(&r["own_cells"]))
+        );
+        assert!(
+            g.cells(t) == u(&r["cells"]) && g.cells(t) <= g.kmax(),
+            "t {t}"
+        );
+    };
+    f["rows"].as_array().unwrap().iter().for_each(check);
+    let splits = f["two_call_splits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["calls"].as_array().unwrap());
+    let chain = f["chain"]["calls"].as_array().unwrap().iter();
+    let dec = f["decode_after_2045"].as_array().unwrap().iter();
+    for c in chain.chain(splits).chain(dec) {
+        for key in ["first_row", "last_row"] {
+            if !c[key].is_null() {
+                check(&c[key]);
+            }
+        }
+    }
+}
+
+fn check_call(g: &IndexerGeometry, c: &Value, budget: usize) {
+    let (s, e) = (u(&c["s"]), u(&c["e"]));
+    let (p, closed, rows) = (g.plan(s, e - s), usizes(&c["groups_closed_by_call"]), e - s);
+    assert_eq!([p.groups.start, p.groups.end], closed.as_slice());
+    assert_eq!(usizes(&c["pooled_write_range"]), closed);
+    assert_eq!(p.groups.start, u(&c["groups_closed_before"]));
+    assert_eq!(p.groups.end, u(&c["groups_closed_after"]));
+    assert_eq!(
+        p.open_in.collect::<Vec<_>>(),
+        usizes(&c["tail_in"]),
+        "[{s},{e}) tail_in"
+    );
+    assert_eq!(
+        p.tail_out.clone().collect::<Vec<_>>(),
+        usizes(&c["tail_out"]),
+        "[{s},{e})"
+    );
+    assert!(p.tail_out.len() < g.kpool);
+    assert_eq!(p.cols, u(&c["score_cols"]));
+    assert_eq!(score_row_bytes(g.n_heads, p.cols), u(&c["score_row_bytes"]));
+    let per = score_rows(g.n_heads, p.cols, budget).min(rows);
+    assert_eq!(per, u(&c["score_rows_per_sub_chunk"]));
+    assert_eq!(rows.div_ceil(per), u(&c["score_sub_chunks"]));
+    assert_eq!(
+        (p.sparse.len(), p.dense.len() + p.sparse.len()),
+        (u(&c["rows_needing_topk"]), rows)
+    );
+    let max_cells = (s..e).map(|t| g.cells(t)).max().unwrap();
+    assert!(max_cells == u(&c["max_cells"]) && max_cells <= p.kmax);
+    assert_eq!(p.kmax, if p.sparse.is_empty() { e } else { g.kmax() });
+}
+
+#[test]
+fn call_plans_match_kpool_splits() {
+    let (g, f) = (real(), fixture("kpool-splits.json"));
+    let (geo, budget) = (&f["geometry"], u(&f["geometry"]["score_sub_chunk_budget"]));
+    assert_eq!(
+        (u(&geo["kpool"]), u(&geo["n_top_pool"])),
+        (g.kpool, g.n_top)
+    );
+    assert_eq!(
+        (u(&geo["indexer_heads"]), budget),
+        (g.n_heads, INDEX_CHUNK_BYTES)
+    );
+    for c in f["chain"]["calls"].as_array().unwrap() {
+        check_call(&g, c, budget);
+    }
+    for split in f["two_call_splits"].as_array().unwrap() {
+        let calls = split["calls"].as_array().unwrap();
+        calls.iter().for_each(|c| check_call(&g, c, budget));
+        let last = calls.last().unwrap();
+        let one = g.plan(0, u(&last["e"]));
+        assert_eq!(one.groups.end, u(&last["groups_closed_after"]));
+        assert_eq!(one.tail_out.collect::<Vec<_>>(), usizes(&last["tail_out"]));
+    }
+    for c in f["decode_after_2045"].as_array().unwrap() {
+        check_call(&g, c, budget);
+    }
+    for (len, st) in f["state_after_len"].as_object().unwrap() {
+        let p = g.plan(0, len.parse().unwrap());
+        assert_eq!(p.groups.end, u(&st["closed"]), "len {len}");
+        assert_eq!(p.groups.end, u(&st["pooled_len"]), "len {len}");
+        assert_eq!(
+            p.tail_out.collect::<Vec<_>>(),
+            usizes(&st["tail"]),
+            "len {len}"
+        );
+    }
+}
+
+#[test]
+fn select_rules_match_ops_kpool_select() {
+    let (g, k) = (real(), &fixture("ops.json")["kpool_select"]);
+    assert_eq!((u(&k["top_pool"]), u(&k["kpool"])), (g.n_top, g.kpool));
+    for c in k["cases"].as_array().unwrap() {
+        let t = u(&c["t"]);
+        assert_eq!(g.visible(t), u(&c["n_visible"]));
+        assert_eq!(
+            (g.picked(t), g.cells(t)),
+            (u(&c["n_picked"]), u(&c["n_cells"]))
+        );
+        assert_eq!(
+            g.tail_cells(t).collect::<Vec<_>>(),
+            usizes(&c["tail_cells"]),
+            "t {t}"
+        );
+        let dense = c["all_earlier_visible"].as_bool().unwrap();
+        assert_eq!(g.is_dense(t), dense, "t {t}");
+        if dense {
+            assert_eq!(
+                usizes(&c["cells_sorted"]),
+                (0..=t).collect::<Vec<_>>(),
+                "t {t}"
+            );
+            let dr = dense_rows(t, 1, g.kmax()).unwrap();
+            assert_eq!(dr.iter().filter(|&&x| x >= 0).count(), t + 1);
+        }
+    }
+}
+
+#[test]
+fn plan_splits_dense_and_scored_rows() {
+    let g = real();
+    assert_eq!(
+        (g.first_sparse(), g.tail_slots(), g.kmax()),
+        (2048, 4, 2048)
+    );
+    let p = g.plan(0, 8192);
+    assert_eq!((p.dense, p.sparse, p.kmax), (0..2048, 2048..8192, 2048));
+    assert_eq!((p.groups, p.cols), (0..2048, 2048));
+    let p = g.plan(100, 50);
+    assert_eq!(
+        (p.dense, p.sparse.is_empty(), p.kmax),
+        (100..150, true, 150)
+    );
+    let p = g.plan(5000, 1);
+    assert_eq!(
+        (p.dense.is_empty(), p.sparse, p.kmax),
+        (true, 5000..5001, 2048)
+    );
+
+    let nt = IndexerGeometry {
+        select_tail: false,
+        n_top: 512,
+        ..real()
+    };
+    assert_eq!(
+        (nt.visible(3), nt.tail_cells(3), nt.tail_cells(6)),
+        (1, 4..4, 4..7)
+    );
+    assert_eq!(
+        (nt.first_sparse(), nt.tail_slots(), nt.kmax()),
+        (2051, 3, 2051)
+    );
+    for t in [0, 1, 2047, 2050, 2051, 5000] {
+        assert!(
+            nt.cells(t) <= nt.kmax() && nt.is_dense(t) == (nt.cells(t) == t + 1),
+            "t {t}"
+        );
+    }
+}
+
+#[test]
+fn dense_rows_pad_to_their_width() {
+    assert_eq!(
+        dense_rows(2, 3, 5).unwrap(),
+        [0, 1, 2, -1, -1, 0, 1, 2, 3, -1, 0, 1, 2, 3, 4]
+    );
+    assert_eq!(dense_rows(0, 1, 1).unwrap(), [0]);
+    assert!(dense_rows(4, 2, 5).is_err());
+}
+
+#[test]
+fn score_rows_stay_within_the_budget() {
+    assert_eq!(score_row_bytes(16, 65_536), 4 << 20);
+    assert_eq!(score_rows(16, 65_536, INDEX_CHUNK_BYTES), 64);
+    assert_eq!(score_rows(16, 0, INDEX_CHUNK_BYTES), INDEX_CHUNK_BYTES);
+    assert_eq!(score_rows(16, 1 << 30, 1), 1);
+}
+
+fn cell_sets(idx: &MxArray) -> Vec<Vec<i32>> {
+    let w = idx.shape_at(1).unwrap() as usize;
+    read_i32(idx)
+        .chunks(w)
+        .map(|r| {
+            let mut v: Vec<i32> = r.iter().copied().filter(|&c| c >= 0).collect();
+            v.sort_unstable();
+            v
+        })
+        .collect()
+}
+
+fn zero_weights(g: &IndexerGeometry, dim: usize, q_lora: usize) -> IndexerWeights {
+    let (h, d, kp) = (g.n_heads, g.head_dim, g.kpool);
+    IndexerWeights {
+        attn_k: dense(&vec![0.0; d * dim], d, dim),
+        k_norm: arr(&vec![1.0; d], &[d]),
+        q_b: dense(&vec![0.0; h * d * q_lora], h * d, q_lora),
+        proj: dense(&vec![0.0; h * dim], h, dim),
+        compressor_value: arr(&vec![0.0; d * d], &[d, d]),
+        compressor_gate: arr(&vec![0.0; d * d], &[d, d]),
+        compressor_ape: arr(&vec![0.0; kp * d], &[kp, d]),
+        compressor_norm: arr(&vec![1.0; d], &[d]),
+    }
+}
+
+#[test]
+fn pool_rope_and_scores_match_ops_fixture() {
+    crate::models::hy_v4_flash::exact_f32();
+    let k = &fixture("ops.json")["kpool_pool_score"];
+    let dm = &k["dims"];
+    let (t, d, h) = (u(&dm["t"]), u(&dm["head_dim"]), u(&dm["heads"]));
+    let (kp, rd) = (u(&dm["kpool"]), u(&dm["n_rot"]));
+    let g = IndexerGeometry {
+        n_heads: h,
+        head_dim: d,
+        rope_dim: rd,
+        kpool: kp,
+        n_top: 2,
+        select_tail: true,
+        eps: k["norm_eps"].as_f64().unwrap() as f32,
+        weight_scale: k["weight_scale"].as_f64().unwrap() as f32,
+        rope_theta: k["theta"].as_f64().unwrap() as f32,
+    };
+    let mut w = zero_weights(&g, 8, 8);
+    w.compressor_value = arr(&f32s(&k["wv"]), &[d, d]);
+    w.compressor_gate = arr(&f32s(&k["wg"]), &[d, d]);
+    w.compressor_ape = arr(&f32s(&k["ape"]), &[kp, d]);
+    w.compressor_norm = arr(&f32s(&k["norm_w"]), &[d]);
+    let (ix, ng, tok) = (
+        Indexer::new(g.clone(), &w).unwrap(),
+        t / kp,
+        f32s(&k["tok_k"]),
+    );
+    let keys = ix
+        .pool(&w, &arr(&tok[..ng * kp * d], &[ng, kp, d]), 0)
+        .unwrap();
+    let want_keys = f32s(&k["pooled_keys_roped_f32"]);
+    assert_close(&read_f32(&keys), &want_keys, 1e-5, 1e-4, "pooled key");
+
+    let pos: Vec<u64> = (0..t as u64).collect();
+    let q = ix.rope(&arr(&f32s(&k["iq"]), &[t, h, d]), &pos).unwrap();
+    let want_q = f32s(&k["q_roped_f32"]);
+    assert_close(&read_f32(&q), &want_q, 1e-5, 1e-5, "roped query");
+
+    let wr: Vec<f32> = f32s(&k["w_raw"])
+        .into_iter()
+        .map(|x| x * g.weight_scale)
+        .collect();
+    let sc_a = scores(
+        &arr(&want_q, &[t, h, d]),
+        &arr(&wr, &[t, h]),
+        &arr(&want_keys, &[ng, d]),
+    );
+    let sc = read_f32(&sc_a.unwrap());
+    for (ti, row) in k["score"].as_array().unwrap().iter().enumerate() {
+        for (gi, v) in row.as_array().unwrap().iter().enumerate() {
+            assert_eq!(v.is_null(), gi >= g.visible(ti), "t {ti} g {gi}");
+            if let Some(want) = v.as_f64() {
+                assert_close_f64(
+                    &[sc[ti * ng + gi]],
+                    &[want],
+                    1e-4,
+                    1e-4,
+                    &format!("{ti},{gi}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pick_groups_ties_to_the_lowest_group() {
+    let (g, k) = (real(), &fixture("ops.json")["kpool_select"]);
+    let (gs, cases) = (f32s(&k["group_scores"]), k["cases"].as_array().unwrap());
+    let rows: Vec<f32> = cases.iter().flat_map(|_| gs.iter().copied()).collect();
+    let visible: Vec<i32> = cases.iter().map(|c| u(&c["n_visible"]) as i32).collect();
+    let sc = arr(&rows, &[cases.len(), gs.len()]);
+    let ids = pick_groups(&sc, &visible, g.n_top).unwrap();
+    assert_eq!(ids.shape_at(1).unwrap() as usize, g.n_top);
+    let (got, cells) = (
+        read_i32(&ids),
+        cell_sets(&group_cells(&ids, g.kpool).unwrap()),
+    );
+    for (i, c) in cases.iter().enumerate() {
+        let (t, n) = (u(&c["t"]), u(&c["n_picked"]));
+        let row = &got[i * g.n_top..(i + 1) * g.n_top];
+        let want_p: Vec<i32> = usizes(&c["picked_sorted"])
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        assert!(
+            row[..n] == want_p && row[n..].iter().all(|&x| x == -1),
+            "t {t} picks"
+        );
+        let mut all = cells[i].clone();
+        all.extend(g.tail_cells(t).map(|x| x as i32));
+        all.sort_unstable();
+        let want_c: Vec<i32> = usizes(&c["cells_sorted"])
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        assert_eq!(all, want_c, "t {t}");
+    }
+    assert!(pick_groups(&sc, &visible[1..], g.n_top).is_err());
+    assert!(pick_groups(&arr(&gs[..100], &[1, 100]), &[100], g.n_top).is_err());
+}
+
 struct HostIx {
     attn_k: Vec<f32>,
     k_norm: Vec<f32>,
@@ -487,22 +391,24 @@ struct HostIx {
 }
 
 fn indexer_weights(g: &IndexerGeometry, seed: u64) -> (IndexerWeights, HostIx) {
-    let mut r = Rng(seed);
+    let mut r = Rng::new(seed);
     let (h, d, kp) = (g.n_heads, g.head_dim, g.kpool);
-    let mat =
-        |r: &mut Rng, rows: usize, cols: usize| r.vec(rows * cols, 1.5 / (cols as f32).sqrt());
-    let norm_w = |r: &mut Rng, n: usize| -> Vec<f32> {
-        r.vec(n, 0.5).into_iter().map(|x| 1.0 + x).collect()
+    let mat = |r: &mut Rng, rows, cols| r.vec_f32(rows * cols, 1.5 / (cols as f32).sqrt());
+    let nw = |r: &mut Rng, n| {
+        r.vec_f32(n, 0.5)
+            .into_iter()
+            .map(|x| 1.0 + x)
+            .collect::<Vec<_>>()
     };
     let hw = HostIx {
         attn_k: mat(&mut r, d, D),
-        k_norm: norm_w(&mut r, d),
+        k_norm: nw(&mut r, d),
         q_b: mat(&mut r, h * d, Q_LORA),
         proj: mat(&mut r, h, D),
         value: mat(&mut r, d, d),
         gate: mat(&mut r, d, d),
-        ape: r.vec(kp * d, 1.0),
-        norm: norm_w(&mut r, d),
+        ape: r.vec_f32(kp * d, 1.0),
+        norm: nw(&mut r, d),
     };
     let w = IndexerWeights {
         attn_k: dense(&hw.attn_k, d, D),
@@ -520,46 +426,32 @@ fn indexer_weights(g: &IndexerGeometry, seed: u64) -> (IndexerWeights, HostIx) {
 fn mv(w: &[f32], rows: usize, cols: usize, x: &[f64]) -> Vec<f64> {
     (0..rows)
         .map(|r| {
-            w[r * cols..(r + 1) * cols]
-                .iter()
-                .zip(x)
-                .map(|(&a, &b)| f64::from(a) * b)
-                .sum()
+            let sl = &w[r * cols..(r + 1) * cols];
+            sl.iter().zip(x).map(|(&a, &b)| f64::from(a) * b).sum()
         })
         .collect()
 }
 
 fn rms(x: &[f64], w: &[f32], eps: f32) -> Vec<f64> {
-    let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
-    let r = 1.0 / (ms + f64::from(eps)).sqrt();
+    let mean = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+    let r = 1.0 / (mean + f64::from(eps)).sqrt();
     x.iter()
         .zip(w)
         .map(|(&v, &g)| v * r * f64::from(g))
         .collect()
 }
 
-/// RoPE on the last `2·inv.len()` values of `v`, consecutive pairs.
 fn rope(v: &mut [f64], pos: usize, inv: &[f32]) {
     let off = v.len() - 2 * inv.len();
     for (i, &f) in inv.iter().enumerate() {
         let ang = f64::from(rope_angle(pos as u64, f));
         let (c, s) = (f64::from(ang.cos() as f32), f64::from(ang.sin() as f32));
         let (a, b) = (v[off + 2 * i], v[off + 2 * i + 1]);
-        v[off + 2 * i] = a * c - b * s;
-        v[off + 2 * i + 1] = a * s + b * c;
+        (v[off + 2 * i], v[off + 2 * i + 1]) = (a * c - b * s, a * s + b * c);
     }
 }
 
-fn f16r(v: f64) -> f64 {
-    half::f16::from_f64(v).to_f64()
-}
-
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// Each query's cells, f64 math with the pooled keys rounded to f16; picks
-/// by score descending, ties to the lowest group.
+/// Each query's cells, f64 math with pooled keys rounded to f16; score desc, ties to lowest group.
 fn host_cells(
     g: &IndexerGeometry,
     hw: &HostIx,
@@ -568,75 +460,78 @@ fn host_cells(
 ) -> Vec<Vec<i32>> {
     let (h, d, kp) = (g.n_heads, g.head_dim, g.kpool);
     let inv = inv_freqs(g.rope_dim, g.rope_theta, None);
-    let f64s = |v: &[f32]| -> Vec<f64> { v.iter().map(|&x| f64::from(x)).collect() };
-    let tok: Vec<Vec<f64>> = xs
+    let f64s = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let tok: Vec<_> = xs
         .iter()
         .map(|x| rms(&mv(&hw.attn_k, d, D, &f64s(x)), &hw.k_norm, g.eps))
         .collect();
-    let keys: Vec<Vec<f64>> = (0..xs.len() / kp)
-        .map(|gi| {
-            let members = &tok[gi * kp..(gi + 1) * kp];
-            let v: Vec<Vec<f64>> = members.iter().map(|m| mv(&hw.value, d, d, m)).collect();
-            let gt: Vec<Vec<f64>> = members
-                .iter()
-                .enumerate()
-                .map(|(s, m)| {
-                    mv(&hw.gate, d, d, m)
-                        .into_iter()
-                        .zip(&hw.ape[s * d..(s + 1) * d])
-                        .map(|(a, &b)| a + f64::from(b))
-                        .collect()
+    let mut keys = Vec::with_capacity(xs.len() / kp);
+    for gi in 0..xs.len() / kp {
+        let mem = &tok[gi * kp..(gi + 1) * kp];
+        let v: Vec<_> = mem.iter().map(|m| mv(&hw.value, d, d, m)).collect();
+        let gt: Vec<Vec<f64>> = mem
+            .iter()
+            .enumerate()
+            .map(|(s, m)| {
+                let ape = &hw.ape[s * d..(s + 1) * d];
+                mv(&hw.gate, d, d, m)
+                    .into_iter()
+                    .zip(ape)
+                    .map(|(a, &b)| a + f64::from(b))
+                    .collect()
+            })
+            .collect();
+        let pooled: Vec<f64> = (0..d)
+            .map(|c| {
+                let m = (0..kp).map(|s| gt[s][c]).fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = (0..kp).map(|s| (gt[s][c] - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                (0..kp).map(|s| v[s][c] * e[s] / z).sum()
+            })
+            .collect();
+        let mut k = rms(&pooled, &hw.norm, g.eps);
+        rope(&mut k, gi * kp, &inv);
+        keys.push(
+            k.into_iter()
+                .map(|x| half::f16::from_f64(x).to_f64())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let mut out = Vec::with_capacity(xs.len());
+    for t in 0..xs.len() {
+        let nv = g.visible(t);
+        let mut groups: Vec<usize> = (0..nv).collect();
+        if nv > g.n_top {
+            let (qr, wt) = (f64s(&qrs[t]), mv(&hw.proj, h, D, &f64s(&xs[t])));
+            let qs: Vec<Vec<f64>> = (0..h)
+                .map(|hh| {
+                    let qb = &hw.q_b[hh * d * Q_LORA..(hh + 1) * d * Q_LORA];
+                    let mut q = mv(qb, d, Q_LORA, &qr);
+                    rope(&mut q, t, &inv);
+                    q
                 })
                 .collect();
-            let pooled: Vec<f64> = (0..d)
-                .map(|c| {
-                    let m = (0..kp).map(|s| gt[s][c]).fold(f64::NEG_INFINITY, f64::max);
-                    let e: Vec<f64> = (0..kp).map(|s| (gt[s][c] - m).exp()).collect();
-                    let z: f64 = e.iter().sum();
-                    (0..kp).map(|s| v[s][c] * e[s] / z).sum()
+            let ws = f64::from(g.weight_scale);
+            let sc: Vec<f64> = (0..nv)
+                .map(|gi| {
+                    (0..h)
+                        .map(|hh| wt[hh] * ws * dot(&qs[hh], &keys[gi]).max(0.0))
+                        .sum()
                 })
                 .collect();
-            let mut k = rms(&pooled, &hw.norm, g.eps);
-            rope(&mut k, gi * kp, &inv);
-            k.into_iter().map(f16r).collect()
-        })
-        .collect();
-    (0..xs.len())
-        .map(|t| {
-            let nv = g.visible(t);
-            let mut groups: Vec<usize> = (0..nv).collect();
-            if nv > g.n_top {
-                let qr = f64s(&qrs[t]);
-                let x = f64s(&xs[t]);
-                let wt = mv(&hw.proj, h, D, &x);
-                let score: Vec<f64> = (0..nv)
-                    .map(|gi| {
-                        (0..h)
-                            .map(|hh| {
-                                let mut q = mv(
-                                    &hw.q_b[hh * d * Q_LORA..(hh + 1) * d * Q_LORA],
-                                    d,
-                                    Q_LORA,
-                                    &qr,
-                                );
-                                rope(&mut q, t, &inv);
-                                wt[hh] * f64::from(g.weight_scale) * dot(&q, &keys[gi]).max(0.0)
-                            })
-                            .sum()
-                    })
-                    .collect();
-                groups.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
-                groups.truncate(g.n_top);
-                groups.sort_unstable();
-            }
-            let mut cells: Vec<i32> = groups
-                .iter()
-                .flat_map(|&gi| (gi * kp..(gi + 1) * kp).map(|c| c as i32))
-                .collect();
-            cells.extend(g.tail_cells(t).map(|c| c as i32));
-            cells
-        })
-        .collect()
+            groups.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]).then(a.cmp(&b)));
+            groups.truncate(g.n_top);
+            groups.sort_unstable();
+        }
+        let mut cells: Vec<i32> = groups
+            .iter()
+            .flat_map(|&gi| (gi * kp..(gi + 1) * kp).map(|c| c as i32))
+            .collect();
+        cells.extend(g.tail_cells(t).map(|c| c as i32));
+        out.push(cells);
+    }
+    out
 }
 
 fn rows_of(v: &[Vec<f32>]) -> MxArray {
@@ -644,8 +539,15 @@ fn rows_of(v: &[Vec<f32>]) -> MxArray {
     arr(&flat, &[v.len(), v[0].len()])
 }
 
-/// Runs the indexer over `xs`/`qrs` in calls of `sizes`; returns each row's
-/// cells.
+fn inputs(n: usize, width: usize, seed: u64) -> Vec<Vec<f32>> {
+    let mut r = Rng::new(seed);
+    (0..n).map(|_| r.vec_f32(width, 2.0)).collect()
+}
+
+fn pooled_host(st: &IndexerState, d: usize) -> Vec<f32> {
+    read_f32(st.pooled_rows().unwrap())[..st.pooled_len() * d].to_vec()
+}
+
 fn select_split(
     ix: &Indexer,
     w: &IndexerWeights,
@@ -655,15 +557,19 @@ fn select_split(
     start: usize,
     sizes: &[usize],
 ) -> Vec<Vec<i32>> {
-    let mut out = Vec::new();
-    let mut at = 0;
+    let (mut out, mut at) = (Vec::new(), 0);
     for &n in sizes {
         let (x, qr) = (rows_of(&xs[at..at + n]), rows_of(&qrs[at..at + n]));
-        let idx = ix.select(w, prefill(&x, &qr, start + at), st).unwrap();
-        assert_eq!(idx.shape_at(0).unwrap() as usize, n);
+        let idx = ix
+            .select(w, call(&x, &qr, start + at, RowKind::Prefill), st)
+            .unwrap();
+        let want_w = ix.geometry().plan(start + at, n).kmax;
         assert_eq!(
-            idx.shape_at(1).unwrap() as usize,
-            ix.geometry().plan(start + at, n).kmax
+            (
+                idx.shape_at(0).unwrap() as usize,
+                idx.shape_at(1).unwrap() as usize
+            ),
+            (n, want_w)
         );
         out.extend(cell_sets(&idx));
         at += n;
@@ -672,30 +578,20 @@ fn select_split(
     out
 }
 
-fn inputs(n: usize, width: usize, seed: u64) -> Vec<Vec<f32>> {
-    let mut r = Rng(seed);
-    (0..n).map(|_| r.vec(width, 2.0)).collect()
-}
-
-fn pooled_host(st: &IndexerState, d: usize) -> Vec<f32> {
-    read(st.pooled_rows().unwrap())[..st.pooled_len() * d].to_vec()
-}
-
 #[test]
 fn split_calls_pick_what_one_call_picks() {
     let g = small();
     let (w, hw) = indexer_weights(&g, 41);
     let ix = Indexer::new(g.clone(), &w).unwrap();
-    let n = 23;
-    let xs = inputs(n, D, 3);
-    let qrs = inputs(n, Q_LORA, 4);
-    let want = host_cells(&g, &hw, &xs, &qrs);
-    let mut one = IndexerState::new(32, &g);
-    let got = select_split(&ix, &w, &mut one, &xs, &qrs, 0, &[n]);
-    assert_eq!(got, want, "one call vs host");
+    let (n, xs, qrs) = (23, inputs(23, D, 3), inputs(23, Q_LORA, 4));
+    let (want, mut one) = (host_cells(&g, &hw, &xs, &qrs), IndexerState::new(32, &g));
+    assert_eq!(
+        select_split(&ix, &w, &mut one, &xs, &qrs, 0, &[n]),
+        want,
+        "one call"
+    );
     let pooled = pooled_host(&one, g.head_dim);
-    assert_eq!(one.pooled_len(), n / g.kpool);
-    assert_eq!(one.open(), 20..23);
+    assert_eq!((one.pooled_len(), one.open()), (n / g.kpool, 20..23));
     assert_eq!(one.held(), g.kpool - 1 + WINDOW_SLACK);
     for sizes in [
         vec![1, 3, 4, 5, 10],
@@ -705,12 +601,19 @@ fn split_calls_pick_what_one_call_picks() {
         vec![1; n],
     ] {
         let mut st = IndexerState::new(32, &g);
-        let got = select_split(&ix, &w, &mut st, &xs, &qrs, 0, &sizes);
-        assert_eq!(got, want, "split {sizes:?}");
+        assert_eq!(
+            select_split(&ix, &w, &mut st, &xs, &qrs, 0, &sizes),
+            want,
+            "split {sizes:?}"
+        );
         assert_eq!((st.len(), st.pooled_len(), st.open()), (n, 5, 20..23));
-        for (a, b) in pooled_host(&st, g.head_dim).iter().zip(&pooled) {
-            close(*a, *b, 1e-3, 1e-3, &format!("pooled split {sizes:?}"));
-        }
+        assert_close(
+            &pooled_host(&st, g.head_dim),
+            &pooled,
+            1e-3,
+            1e-3,
+            &format!("{sizes:?}"),
+        );
     }
 }
 
@@ -719,70 +622,63 @@ fn truncate_and_restore_keep_the_picks() {
     let g = small();
     let (w, _) = indexer_weights(&g, 43);
     let ix = Indexer::new(g.clone(), &w).unwrap();
-    let n = 23;
-    let xs = inputs(n, D, 9);
-    let qrs = inputs(n, Q_LORA, 10);
+    let (n, xs, qrs) = (23, inputs(23, D, 9), inputs(23, Q_LORA, 10));
     let mut st = IndexerState::new(32, &g);
     let want = select_split(&ix, &w, &mut st, &xs, &qrs, 0, &[n]);
     let full = st.mark();
-    assert_eq!(full.len(), n);
-
-    assert!(st.truncate(15).is_err());
-    assert_eq!(st.len(), n);
+    assert!(full.len() == n && st.truncate(15).is_err() && st.len() == n);
     assert!(st.truncate(24).is_err());
+
     st.truncate(21).unwrap();
     assert_eq!((st.len(), st.pooled_len(), st.open()), (21, 5, 20..21));
-    let got = select_split(&ix, &w, &mut st, &xs[21..], &qrs[21..], 21, &[2]);
-    assert_eq!(got, want[21..].to_vec(), "replay after 21");
+    assert_eq!(
+        select_split(&ix, &w, &mut st, &xs[21..], &qrs[21..], 21, &[2]),
+        want[21..]
+    );
 
     st.truncate(16).unwrap();
     assert_eq!((st.len(), st.pooled_len(), st.held()), (16, 4, 0));
-    assert!(st.restore(full.clone()).is_err());
-    let got = select_split(&ix, &w, &mut st, &xs[16..], &qrs[16..], 16, &[3, 4]);
-    assert_eq!(got, want[16..].to_vec(), "replay after 16");
+    assert!(st.restore(full).is_err());
+    assert_eq!(
+        select_split(&ix, &w, &mut st, &xs[16..], &qrs[16..], 16, &[3, 4]),
+        want[16..]
+    );
 
-    let before = (st.len(), st.pooled_len(), st.open(), st.held());
-    let x = rows_of(&xs[..1]);
-    let qr = rows_of(&qrs[..1]);
-    assert!(ix.select(&w, prefill(&x, &qr, 5), &mut st).is_err());
-    assert_eq!((st.len(), st.pooled_len(), st.open(), st.held()), before);
+    let meta = |s: &IndexerState| (s.len(), s.pooled_len(), s.open(), s.held());
+    let before = meta(&st);
+    let (x0, q0) = (rows_of(&xs[..1]), rows_of(&qrs[..1]));
+    assert!(
+        ix.select(&w, call(&x0, &q0, 5, RowKind::Prefill), &mut st)
+            .is_err()
+    );
+    assert_eq!(meta(&st), before);
 
     let mut short = IndexerState::new(9, &g);
     select_split(&ix, &w, &mut short, &xs[..6], &qrs[..6], 0, &[6]);
-    let before = (short.len(), short.pooled_len(), short.open(), short.held());
-    let (x, qr) = (rows_of(&xs[6..12]), rows_of(&qrs[6..12]));
-    assert!(ix.select(&w, prefill(&x, &qr, 6), &mut short).is_err());
-    assert_eq!(
-        (short.len(), short.pooled_len(), short.open(), short.held()),
-        before
+    let before = meta(&short);
+    let (x1, q1) = (rows_of(&xs[6..12]), rows_of(&qrs[6..12]));
+    assert!(
+        ix.select(&w, call(&x1, &q1, 6, RowKind::Prefill), &mut short)
+            .is_err()
     );
+    assert_eq!(meta(&short), before);
 
     st.truncate(0).unwrap();
     assert!(st.is_empty());
-    let got = select_split(&ix, &w, &mut st, &xs, &qrs, 0, &[n]);
-    assert_eq!(got, want, "from empty");
+    assert_eq!(select_split(&ix, &w, &mut st, &xs, &qrs, 0, &[n]), want);
 }
 
-/// A flat `update` that fails after it pooled a group (the tail step)
-/// leaves the state as it was, and the same call then succeeds.
 #[test]
 fn a_failed_update_keeps_the_indexer_state() {
     let g = small();
     let (w, _) = indexer_weights(&g, 47);
     let ix = Indexer::new(g.clone(), &w).unwrap();
-    let xs = inputs(12, D, 21);
-    let mut st = IndexerState::new(32, &g);
+    let (xs, mut st) = (inputs(12, D, 21), IndexerState::new(32, &g));
     ix.update(&w, &rows_of(&xs[..8]), 0, &mut st).unwrap();
-    assert_eq!(
-        (st.len(), st.pooled_len(), st.held()),
-        (8, 2, g.kpool - 1 + WINDOW_SLACK)
-    );
     let before = (st.len(), st.pooled_len(), st.held());
+    assert_eq!(before, (8, 2, g.kpool - 1 + WINDOW_SLACK));
     {
-        let _armed = crate::array::fail_native_call_at(
-            "hy_v4_flash indexer tail",
-            "test: indexer tail eval failed",
-        );
+        let _a = crate::array::fail_native_call_at("hy_v4_flash indexer tail", "test: tail failed");
         assert!(ix.update(&w, &rows_of(&xs[8..12]), 8, &mut st).is_err());
     }
     assert_eq!((st.len(), st.pooled_len(), st.held()), before);
@@ -801,9 +697,16 @@ fn indexer_refuses_mismatched_weights() {
     w.q_b = dense(&hw.q_b, g.head_dim, g.n_heads * Q_LORA);
     assert!(Indexer::new(g.clone(), &w).is_err());
     let (w, _) = indexer_weights(&g, 47);
-    let mut bad_g = g;
-    bad_g.rope_dim = bad_g.head_dim;
-    assert!(Indexer::new(bad_g, &w).is_err());
+    assert!(
+        Indexer::new(
+            IndexerGeometry {
+                rope_dim: g.head_dim,
+                ..g
+            },
+            &w
+        )
+        .is_err()
+    );
 }
 
 fn attn_geometry() -> Geometry {
@@ -822,31 +725,28 @@ fn attn_geometry() -> Geometry {
 }
 
 fn attn_weights(g: &Geometry, seed: u64) -> AttnWeights {
-    let mut r = Rng(seed);
+    let mut r = Rng::new(seed);
     let (h, l, v) = (g.n_heads, g.kv_lora, g.head_v);
-    let mut mat = |rows: usize, cols: usize| {
-        dense(&r.vec(rows * cols, 1.5 / (cols as f32).sqrt()), rows, cols)
+    let mut mat = |rows, cols| {
+        dense(
+            &r.vec_f32(rows * cols, 1.5 / (cols as f32).sqrt()),
+            rows,
+            cols,
+        )
     };
-    let q_a = mat(Q_LORA, D);
-    let q_b = mat(h * g.head_qk(), Q_LORA);
-    let kv_a = mat(g.row(), D);
-    let k_b = mat(h * l, g.nope);
-    let v_b = mat(h * v, l);
-    let output = mat(D, h * v);
-    let gate = mat(h * v, D);
-    let ones = |n: usize| arr(&vec![1.0; n], &[n]);
+    let ones = |n| arr(&vec![1.0; n], &[n]);
     AttnWeights {
         norm: ones(D),
         sinks: arr(&[0.3, -0.2], &[h]),
-        q_a,
+        q_a: mat(Q_LORA, D),
         q_a_norm: ones(Q_LORA),
-        q_b,
-        kv_a,
+        q_b: mat(h * g.head_qk(), Q_LORA),
+        kv_a: mat(g.row(), D),
         kv_a_norm: ones(l),
-        k_b,
-        v_b,
-        output,
-        gate,
+        k_b: mat(h * l, g.nope),
+        v_b: mat(h * v, l),
+        output: mat(D, h * v),
+        gate: mat(h * v, D),
         post_norm: ones(D),
         q_kv: None,
         q_kv_gate: None,
@@ -856,57 +756,98 @@ fn attn_weights(g: &Geometry, seed: u64) -> AttnWeights {
 #[test]
 fn indexed_layer_past_top_k_gives_the_same_rows_for_every_split() {
     crate::models::hy_v4_flash::exact_f32();
-    let ag = attn_geometry();
-    let aw = attn_weights(&ag, 61);
+    let (ag, g) = (attn_geometry(), small());
+    let (aw, (w, _)) = (attn_weights(&ag, 61), indexer_weights(&g, 62));
     let mla = Mla::new(ag.clone(), &aw).unwrap();
-    let g = small();
-    let (w, _) = indexer_weights(&g, 62);
     let ix = Indexer::new(g.clone(), &w).unwrap();
-    let n = 24;
-    let hs = inputs(n, D, 63);
+    let (n, hs) = (24, inputs(24, D, 63));
     let run = |sizes: &[usize]| -> Vec<f32> {
         let mut cache = LayerCache::new(Attn::Indexed, ag.window, 32, ag.row() as i64);
-        let mut st = IndexerState::new(32, &g);
-        let mut out = Vec::new();
-        let mut at = 0;
+        let (mut st, mut out, mut at) = (IndexerState::new(32, &g), Vec::new(), 0);
         for &k in sizes {
-            let y = mla
-                .forward(
-                    &aw,
-                    &rows_of(&hs[at..at + k]),
-                    at,
-                    &mut cache,
-                    Some(Indexing {
-                        indexer: &ix,
-                        weights: &w,
-                        state: &mut st,
-                        kind: RowKind::Prefill,
-                    }),
-                )
-                .unwrap();
-            out.extend(read(&y));
+            let idx = Indexing {
+                indexer: &ix,
+                weights: &w,
+                state: &mut st,
+                kind: RowKind::Prefill,
+            };
+            let h = rows_of(&hs[at..at + k]);
+            out.extend(read_f32(
+                &mla.forward(&aw, &h, at, &mut cache, Some(idx)).unwrap(),
+            ));
             at += k;
         }
         assert_eq!((cache.len(), st.len()), (n, n));
         out
     };
     let want = run(&[n]);
-    assert_eq!(want.len(), n * D);
-    assert!(want.iter().all(|x| x.is_finite()));
+    assert!(want.len() == n * D && want.iter().all(|x| x.is_finite()));
     for sizes in [vec![12, 12], vec![1, 23], vec![1; n], vec![5, 7, 1, 11]] {
-        let got = run(&sizes);
-        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
-            close(*a, *b, 1e-4, 1e-4, &format!("split {sizes:?} value {i}"));
-        }
+        assert_close(&run(&sizes), &want, 1e-4, 1e-4, &format!("split {sizes:?}"));
     }
 }
 
-/// `attn_geometry` with a 64-column latent row: planes of 32, a pool head
-/// size.
-fn wide_geometry() -> Geometry {
-    Geometry {
-        kv_lora: 60,
-        ..attn_geometry()
+/// Parameterized decode head-weights bit-exactness across small F32, real dim=3072 F32, and SymQ8.
+#[test]
+fn decode_head_weights_bit_exact_across_dtypes_and_dims() {
+    crate::models::hy_v4_flash::exact_f32();
+    let cases = [
+        (
+            "small_f32",
+            small(),
+            D,
+            false,
+            &[3usize][..],
+            RowKind::Prefill,
+            false,
+        ),
+        (
+            "real_f32",
+            real(),
+            3072,
+            false,
+            &[2, 4, 8],
+            RowKind::Decode,
+            true,
+        ),
+        ("small_q8", small(), 32, true, &[4], RowKind::Decode, false),
+    ];
+    for (ci, (label, g, dim, q8, ms, skind, check_ref)) in cases.into_iter().enumerate() {
+        let (mut r, mut w) = (Rng::new(41 + ci as u64 * 17), zero_weights(&g, dim, Q_LORA));
+        if q8 {
+            w.attn_k = make_sym_q8(&mut r, g.head_dim, dim, 0.25);
+            w.proj = make_sym_q8(&mut r, g.n_heads, dim, 0.25);
+        } else {
+            w.proj = dense(&r.vec_f32(g.n_heads * dim, 0.25), g.n_heads, dim);
+        }
+        let (ix, max_m) = (
+            Indexer::new(g.clone(), &w).unwrap(),
+            *ms.iter().max().unwrap(),
+        );
+        let xs = inputs(max_m, dim, 17 + ci as u64 * 13);
+        let row_fn = |i| ix.head_weights(&w, &rows_of(&xs[i..i + 1]), skind).unwrap();
+        let batch_fn = |m| {
+            ix.head_weights(&w, &rows_of(&xs[..m]), RowKind::Decode)
+                .unwrap()
+        };
+        assert_row_invariant(row_fn, batch_fn, ms, label);
+        if skind == RowKind::Prefill {
+            let pre = ix
+                .head_weights(&w, &rows_of(&xs), RowKind::Prefill)
+                .unwrap();
+            assert_eq!(read_f32(&pre).len(), max_m * g.n_heads);
+        }
+        if check_ref {
+            for &m in ms {
+                let x = rows_of(&xs[..m]);
+                let got = read_f32(&ix.head_weights(&w, &x, RowKind::Decode).unwrap());
+                let mm = linear(&x, &w.proj)
+                    .unwrap()
+                    .mul_scalar(f64::from(g.weight_scale))
+                    .unwrap();
+                assert!(error_stats(&got, &read_f32(&mm)).0 <= 1e-4, "{label} M={m}");
+            }
+        }
     }
 }
 
@@ -915,6 +856,7 @@ mod paged {
     use super::*;
     use crate::models::hy_v4_flash::attention::PagedPool;
     use crate::models::hy_v4_flash::paged::{PageGeometry, SlotMap, create};
+    use crate::models::hy_v4_flash::test_support::read_bits;
     use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
     const OWNER: u32 = 1;
@@ -931,295 +873,142 @@ mod paged {
         hs: Vec<Vec<f32>>,
     }
 
-    fn case() -> Case {
-        let ag = wide_geometry();
-        let aw = attn_weights(&ag, 71);
-        let mla = Mla::new(ag.clone(), &aw).unwrap();
-        let g = small();
-        let (w, _) = indexer_weights(&g, 72);
-        let ix = Indexer::new(g.clone(), &w).unwrap();
-        let hs = inputs(N, D, 73);
-        Case {
-            ag,
-            aw,
-            mla,
-            g,
-            w,
-            ix,
-            hs,
-        }
-    }
-
-    /// A one-layer pool of this case's page, `None` without Metal.
-    fn pool(c: &Case) -> Option<PagedKVCacheAdapter> {
-        let pg = PageGeometry {
-            layers: 1,
-            half: (c.ag.row() / 2) as u32,
-            index_rows: (32 / c.g.kpool) as u32,
-            index_dim: c.g.head_dim as u32,
-        };
-        match create(&pg, 1024, 8, 8, u64::MAX) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                eprintln!("skipping Hy4 paged indexer test: {e}");
-                None
+    impl Case {
+        fn new() -> Self {
+            let (ag, g) = (
+                Geometry {
+                    kv_lora: 60,
+                    ..attn_geometry()
+                },
+                small(),
+            );
+            let (aw, (w, _)) = (attn_weights(&ag, 71), indexer_weights(&g, 72));
+            let mla = Mla::new(ag.clone(), &aw).unwrap();
+            let ix = Indexer::new(g.clone(), &w).unwrap();
+            Self {
+                ag,
+                aw,
+                mla,
+                g,
+                w,
+                ix,
+                hs: inputs(N, D, 73),
             }
         }
-    }
-
-    fn bits(x: &MxArray) -> Vec<u32> {
-        x.to_float32()
-            .unwrap()
-            .as_ref()
-            .iter()
-            .map(|v| v.to_bits())
-            .collect()
-    }
-
-    fn flat(c: &Case, sizes: &[usize]) -> (Vec<u32>, Vec<u16>) {
-        let mut cache = LayerCache::new(Attn::Indexed, c.ag.window, 64, c.ag.row() as i64);
-        let mut st = IndexerState::new(64, &c.g);
-        let mut out = Vec::new();
-        let mut at = 0;
-        for &k in sizes {
-            let y = c
-                .mla
-                .forward(
-                    &c.aw,
-                    &rows_of(&c.hs[at..at + k]),
-                    at,
-                    &mut cache,
-                    Some(Indexing {
-                        indexer: &c.ix,
-                        weights: &c.w,
-                        state: &mut st,
-                        kind: RowKind::Prefill,
-                    }),
-                )
-                .unwrap();
-            out.extend(bits(&y));
-            at += k;
+        fn pool(&self) -> Option<PagedKVCacheAdapter> {
+            let pg = PageGeometry {
+                layers: 1,
+                half: (self.ag.row() / 2) as u32,
+                index_rows: (32 / self.g.kpool) as u32,
+                index_dim: self.g.head_dim as u32,
+            };
+            create(&pg, 1024, 8, 8, u64::MAX).ok()
         }
-        let pooled = st.pooled_rows().unwrap().to_uint16_native().unwrap()
-            [..st.pooled_len() * c.g.head_dim]
-            .to_vec();
-        (out, pooled)
-    }
-
-    fn paged_call(
-        c: &Case,
-        adapter: &mut PagedKVCacheAdapter,
-        st: &mut PagedIndexerState,
-        slots: &SlotMap,
-        at: usize,
-        k: usize,
-    ) -> Result<MxArray> {
-        c.mla.forward_indexed_paged(
-            &c.aw,
-            &rows_of(&c.hs[at..at + k]),
-            at,
-            PagedPool {
+        fn flat(&self, sizes: &[usize]) -> (Vec<u32>, Vec<u16>) {
+            let mut cache =
+                LayerCache::new(Attn::Indexed, self.ag.window, 64, self.ag.row() as i64);
+            let (mut st, mut out, mut at) = (IndexerState::new(64, &self.g), Vec::new(), 0);
+            for &k in sizes {
+                let ix = Indexing {
+                    indexer: &self.ix,
+                    weights: &self.w,
+                    state: &mut st,
+                    kind: RowKind::Prefill,
+                };
+                let h = rows_of(&self.hs[at..at + k]);
+                out.extend(read_bits(
+                    &self
+                        .mla
+                        .forward(&self.aw, &h, at, &mut cache, Some(ix))
+                        .unwrap(),
+                ));
+                at += k;
+            }
+            let raw = st.pooled_rows().unwrap().to_uint16_native().unwrap();
+            (out, raw[..st.pooled_len() * self.g.head_dim].to_vec())
+        }
+        fn call_paged(
+            &self,
+            adapter: &mut PagedKVCacheAdapter,
+            st: &mut PagedIndexerState,
+            slots: &SlotMap,
+            at: usize,
+            k: usize,
+        ) -> Result<MxArray> {
+            let pool = PagedPool {
                 adapter,
                 floor: at as u32,
                 slots,
-            },
-            PagedIndexing {
-                indexer: &c.ix,
-                weights: &c.w,
+            };
+            let ix = PagedIndexing {
+                indexer: &self.ix,
+                weights: &self.w,
                 state: st,
                 kind: RowKind::Prefill,
-            },
-        )
-    }
-
-    /// `OWNER`'s rows in calls of `sizes`, with a page of `OTHER` taken
-    /// before its first and its second call.
-    fn paged(c: &Case, adapter: &mut PagedKVCacheAdapter, sizes: &[usize]) -> (Vec<u32>, Vec<u16>) {
-        let mut st = PagedIndexerState::new(0, &c.g);
-        let mut out = Vec::new();
-        let mut at = 0;
-        for (i, &k) in sizes.iter().enumerate() {
-            if i < 2 {
-                adapter.record_tokens_for(OTHER, &[3; 32]).unwrap();
-            }
-            adapter.record_tokens_for(OWNER, &vec![3; k]).unwrap();
-            let slots = SlotMap::of(adapter).unwrap();
-            let y = paged_call(c, adapter, &mut st, &slots, at, k).unwrap();
-            out.extend(bits(&y));
-            at += k;
+            };
+            let h = rows_of(&self.hs[at..at + k]);
+            self.mla.forward_indexed_paged(&self.aw, &h, at, pool, ix)
         }
-        assert_eq!((st.len(), st.pooled_len()), (N, N / c.g.kpool));
-        let pooled = adapter
-            .index_rows(0, st.pooled_len() as u32)
-            .unwrap()
-            .to_uint16_native()
-            .unwrap();
-        (out, pooled)
+        fn paged(
+            &self,
+            adapter: &mut PagedKVCacheAdapter,
+            sizes: &[usize],
+        ) -> (Vec<u32>, Vec<u16>) {
+            let (mut st, mut out, mut at) = (PagedIndexerState::new(0, &self.g), Vec::new(), 0);
+            for (i, &k) in sizes.iter().enumerate() {
+                if i < 2 {
+                    adapter.record_tokens_for(OTHER, &[3; 32]).unwrap();
+                }
+                adapter.record_tokens_for(OWNER, &vec![3; k]).unwrap();
+                let slots = SlotMap::of(adapter).unwrap();
+                out.extend(read_bits(
+                    &self.call_paged(adapter, &mut st, &slots, at, k).unwrap(),
+                ));
+                at += k;
+            }
+            assert_eq!((st.len(), st.pooled_len()), (N, N / self.g.kpool));
+            let pooled = adapter
+                .index_rows(0, st.pooled_len() as u32)
+                .unwrap()
+                .to_uint16_native()
+                .unwrap();
+            (out, pooled)
+        }
     }
 
-    /// One indexed layer over the paged pool (half rows in two planes,
-    /// pooled keys in the f16 index plane, scattered pages, rows past
-    /// `top_k` scored) gives the flat layer's outputs and pooled keys bit for
-    /// bit, for every split.
-    /// Mutation: the slot map ignores the block table (slot = row) → red.
     #[test]
     fn paged_indexed_layer_equals_the_flat_layer_bit_for_bit() {
-        let c = case();
+        let c = Case::new();
         for sizes in [vec![N], vec![12, 12, 16], vec![1; N], vec![5, 7, 1, 27]] {
-            let Some(mut adapter) = pool(&c) else {
-                return;
-            };
-            let (want, want_pooled) = flat(&c, &sizes);
-            let (got, got_pooled) = paged(&c, &mut adapter, &sizes);
+            let Some(mut adapter) = c.pool() else { return };
+            let ((want, want_p), (got, got_p)) = (c.flat(&sizes), c.paged(&mut adapter, &sizes));
             assert_eq!(adapter.active_seq_id(), Some(OWNER));
-            assert_ne!(adapter.block_table().unwrap().block_ids(), vec![0, 1]);
-            assert_eq!(got.len(), N * D, "split {sizes:?}");
-            assert!(got == want, "split {sizes:?} outputs differ");
-            assert_eq!(got_pooled, want_pooled, "split {sizes:?} pooled keys");
+            assert_ne!(adapter.block_table().unwrap().block_ids(), [0, 1]);
+            assert!(
+                got.len() == N * D && got == want && got_p == want_p,
+                "split {sizes:?}"
+            );
         }
     }
 
-    /// A call whose slot map was built on older pages fails after its
-    /// indexer update and leaves the indexer state as it was; the same call
-    /// with a fresh map then succeeds.
-    /// Mutation: no restore on error → the retry is refused → red.
     #[test]
     fn a_failed_paged_call_keeps_the_indexer_state() {
-        let c = case();
-        let Some(mut adapter) = pool(&c) else {
-            return;
-        };
+        let c = Case::new();
+        let Some(mut adapter) = c.pool() else { return };
         let mut st = PagedIndexerState::new(0, &c.g);
         adapter.record_tokens_for(OWNER, &[3; 30]).unwrap();
         let slots = SlotMap::of(&adapter).unwrap();
-        paged_call(&c, &mut adapter, &mut st, &slots, 0, 30).unwrap();
+        c.call_paged(&mut adapter, &mut st, &slots, 0, 30).unwrap();
         adapter.record_tokens_for(OWNER, &[3; 6]).unwrap();
         let before = (st.len(), st.pooled_len(), st.open(), st.tail().held());
-        assert!(paged_call(&c, &mut adapter, &mut st, &slots, 30, 6).is_err());
+        assert!(c.call_paged(&mut adapter, &mut st, &slots, 30, 6).is_err());
         assert_eq!(
             (st.len(), st.pooled_len(), st.open(), st.tail().held()),
             before
         );
         let fresh = SlotMap::of(&adapter).unwrap();
-        paged_call(&c, &mut adapter, &mut st, &fresh, 30, 6).unwrap();
+        c.call_paged(&mut adapter, &mut st, &fresh, 30, 6).unwrap();
         assert_eq!((st.len(), st.pooled_len()), (36, 9));
-    }
-}
-
-/// Decode rows take the head weights one row per call: each row of a
-/// 3-row decode call is that row's 1-row call bit for bit; a prefill call
-/// is one matmul over its rows.
-#[test]
-fn decode_head_weights_run_per_row() {
-    let g = small();
-    let (w, _) = indexer_weights(&g, 5);
-    let ix = Indexer::new(g.clone(), &w).unwrap();
-    let xs = inputs(3, D, 17);
-    let all = read(&ix.head_weights(&w, &rows_of(&xs), RowKind::Decode).unwrap());
-    let h = g.n_heads;
-    for (i, x) in xs.iter().enumerate() {
-        let one = read(
-            &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Prefill)
-                .unwrap(),
-        );
-        assert_eq!(all[i * h..(i + 1) * h], one[..], "row {i}");
-    }
-    let pre = read(
-        &ix.head_weights(&w, &rows_of(&xs), RowKind::Prefill)
-            .unwrap(),
-    );
-    assert_eq!(pre.len(), 3 * h);
-}
-
-#[test]
-fn decode_head_weights_f32_runs_batched_bit_exact_real_dim() {
-    crate::models::hy_v4_flash::exact_f32();
-    let g = real();
-    let d = 3072usize;
-    let mut r = Rng(41);
-    let proj_arr = arr(&r.vec(g.n_heads * d, 0.25), &[g.n_heads, d]);
-    let w = IndexerWeights {
-        attn_k: dense(&vec![0.0; g.head_dim * d], g.head_dim, d),
-        k_norm: arr(&vec![1.0; g.head_dim], &[g.head_dim]),
-        q_b: dense(
-            &vec![0.0; g.n_heads * g.head_dim * Q_LORA],
-            g.n_heads * g.head_dim,
-            Q_LORA,
-        ),
-        proj: Dense::Array(proj_arr),
-        compressor_value: arr(
-            &vec![0.0; g.head_dim * g.head_dim],
-            &[g.head_dim, g.head_dim],
-        ),
-        compressor_gate: arr(
-            &vec![0.0; g.head_dim * g.head_dim],
-            &[g.head_dim, g.head_dim],
-        ),
-        compressor_ape: arr(&vec![0.0; g.kpool * g.head_dim], &[g.kpool, g.head_dim]),
-        compressor_norm: arr(&vec![1.0; g.head_dim], &[g.head_dim]),
-    };
-    let ix = Indexer::new(g.clone(), &w).unwrap();
-    let xs = inputs(8, d, 43);
-    let h = g.n_heads;
-    let ones: Vec<Vec<u32>> = xs
-        .iter()
-        .map(|x| {
-            read(
-                &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Decode)
-                    .unwrap(),
-            )
-            .into_iter()
-            .map(f32::to_bits)
-            .collect()
-        })
-        .collect();
-    for m in [2usize, 4, 8] {
-        let all = read(
-            &ix.head_weights(&w, &rows_of(&xs[..m]), RowKind::Decode)
-                .unwrap(),
-        );
-        let ref_mm = read(
-            &linear(&rows_of(&xs[..m]), &w.proj)
-                .unwrap()
-                .mul_scalar(f64::from(g.weight_scale))
-                .unwrap(),
-        );
-        for i in 0..m {
-            let row = &all[i * h..(i + 1) * h];
-            let row_bits: Vec<u32> = row.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(row_bits, ones[i], "f32 M={m} row={i} invariance");
-            let max_diff = row
-                .iter()
-                .zip(&ref_mm[i * h..(i + 1) * h])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(max_diff <= 1e-4, "f32 M={m} row={i} diff {max_diff}");
-        }
-    }
-}
-
-#[test]
-fn decode_head_weights_q8_runs_batched_bit_exact() {
-    use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
-
-    const Q8_D: usize = 32;
-    let g = small();
-    let (mut w, _) = indexer_weights(&g, 23);
-    let mut r = Rng(23);
-    let attn_k = arr(&r.vec(g.head_dim * Q8_D, 0.25), &[g.head_dim, Q8_D]);
-    let proj_arr = arr(&r.vec(g.n_heads * Q8_D, 0.25), &[g.n_heads, Q8_D]);
-    w.attn_k = quantize_sym_q8_array(&attn_k).unwrap();
-    w.proj = quantize_sym_q8_array(&proj_arr).unwrap();
-    let ix = Indexer::new(g.clone(), &w).unwrap();
-    let xs = inputs(4, Q8_D, 29);
-    let all = read(&ix.head_weights(&w, &rows_of(&xs), RowKind::Decode).unwrap());
-    let h = g.n_heads;
-    for (i, x) in xs.iter().enumerate() {
-        let one = read(
-            &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Decode)
-                .unwrap(),
-        );
-        assert_eq!(all[i * h..(i + 1) * h], one[..], "q8 row {i}");
     }
 }
 
@@ -1229,530 +1018,420 @@ mod fused_metal {
     use crate::models::hy_v4_flash::ops::{
         try_indexer_score, try_indexer_score_causal, try_indexer_topk_cells,
     };
-    use crate::models::hy_v4_flash::paged::{BLOCK, page_ids, slot_ids};
+    use crate::models::hy_v4_flash::paged::{
+        BLOCK, PageGeometry, SlotMap, create, page_ids, slot_ids,
+    };
+    use crate::models::hy_v4_flash::test_support::read_bits;
 
-    /// Builds a scattered physical page table of `n_pages` distinct physical
-    /// blocks inside `n_blocks` total blocks (`n_blocks >= n_pages`).
+    const D_SCORE: usize = 128;
+    const INDEX_ROWS: usize = 8;
+
+    fn i32_arr(v: &[i32]) -> MxArray {
+        MxArray::from_int32(v, &[v.len() as i64]).unwrap()
+    }
+
     fn scattered_pages(n_pages: usize, n_blocks: usize) -> Vec<u32> {
-        let mut pages = Vec::with_capacity(n_pages);
+        let (mut pages, mut seen) = (Vec::with_capacity(n_pages), vec![false; n_blocks]);
         for i in 0..n_pages {
-            pages.push(((i * 7 + 3) % n_blocks) as u32);
-        }
-        // Guarantee uniqueness if stride shares a factor with n_blocks.
-        let mut seen = vec![false; n_blocks];
-        for p in &mut pages {
-            while seen[*p as usize] {
-                *p = ((*p as usize + 1) % n_blocks) as u32;
+            let mut p = (i * 7 + 3) % n_blocks;
+            while seen[p] {
+                p = (p + 1) % n_blocks;
             }
-            seen[*p as usize] = true;
+            seen[p] = true;
+            pages.push(p as u32);
         }
         pages
     }
 
-    /// Packs logical `[n_groups, 128]` f16 keys into a paged
-    /// `[n_blocks, index_rows, 128]` f16 pool at `(pages[(start_g + g)/index_rows], (start_g + g)%index_rows)`.
-    fn pack_paged_keys(
-        logical_f16: &[u16],
-        n_groups: usize,
-        start_g: usize,
-        pages: &[u32],
-        n_blocks: usize,
-        index_rows: usize,
-        d: usize,
-    ) -> MxArray {
-        let mut buf = vec![0u16; n_blocks * index_rows * d];
-        for g in 0..n_groups {
-            let g_abs = start_g + g;
-            let phys = pages[g_abs / index_rows] as usize;
-            let local = g_abs % index_rows;
-            let dst = (phys * index_rows + local) * d;
-            let src = g * d;
-            buf[dst..dst + d].copy_from_slice(&logical_f16[src..src + d]);
+    /// Packs logical `[ng, D_SCORE]` f16 keys into a scattered paged `[nb, 8, D_SCORE]` pool.
+    fn make_paged_pool(
+        keys_bits: &[u16],
+        ng: usize,
+        sg: usize,
+        pad_blocks: usize,
+    ) -> (MxArray, MxArray) {
+        let np = (sg + ng).div_ceil(INDEX_ROWS);
+        let nb = np + pad_blocks;
+        let pages_u32 = scattered_pages(np, nb);
+        let mut buf = vec![0u16; nb * INDEX_ROWS * D_SCORE];
+        for g in 0..ng {
+            let ga = sg + g;
+            let dst =
+                (pages_u32[ga / INDEX_ROWS] as usize * INDEX_ROWS + ga % INDEX_ROWS) * D_SCORE;
+            buf[dst..dst + D_SCORE].copy_from_slice(&keys_bits[g * D_SCORE..(g + 1) * D_SCORE]);
         }
-        MxArray::from_float16(&buf, &[n_blocks as i64, index_rows as i64, d as i64]).unwrap()
+        let shape = [nb as i64, INDEX_ROWS as i64, D_SCORE as i64];
+        (
+            MxArray::from_float16(&buf, &shape).unwrap(),
+            page_ids(&pages_u32).unwrap(),
+        )
+    }
+
+    fn topk_call(
+        sc: &MxArray,
+        vis: &MxArray,
+        ts: &MxArray,
+        tl: &MxArray,
+        pages: Option<&MxArray>,
+        spec: (usize, usize, usize),
+    ) -> Option<MxArray> {
+        try_indexer_topk_cells(
+            sc,
+            vis,
+            ts,
+            tl,
+            pages,
+            spec.0,
+            spec.1,
+            spec.2,
+            BLOCK as usize,
+        )
+        .unwrap()
+    }
+
+    fn rand_score_inputs(h: usize, s: usize, ng: usize, seed: u64) -> (MxArray, MxArray, MxArray) {
+        let mut rng = Rng::new(seed);
+        let q = arr(&rng.vec_f32(s * h * D_SCORE, 1.5), &[s, h, D_SCORE]);
+        let w = arr(&rng.vec_f32(s * h, 0.2), &[s, h]);
+        let k = arr(&rng.vec_f32(ng * D_SCORE, 1.5), &[ng, D_SCORE])
+            .astype(DType::Float16)
+            .unwrap();
+        (q, w, k)
+    }
+
+    /// Flat + paged `try_indexer_score` parity against `scores()`, flat == paged bit-exactness,
+    /// and optional `S == S × 1`-row invariance. Returns `false` if Metal is unavailable.
+    fn check_indexer_score_case(
+        h: usize,
+        s: usize,
+        ng: usize,
+        sg: usize,
+        seed: u64,
+        row_inv: bool,
+    ) -> bool {
+        let (q, w, keys_f16) = rand_score_inputs(h, s, ng, seed);
+        let want = read_f32(&scores(&q, &w, &keys_f16.astype(DType::Float32).unwrap()).unwrap());
+        let (cap_g, keys_bits) = (sg + ng + 13, keys_f16.to_uint16_native().unwrap().to_vec());
+        let mut flat_bits = vec![0u16; cap_g * D_SCORE];
+        flat_bits[sg * D_SCORE..(sg + ng) * D_SCORE].copy_from_slice(&keys_bits);
+        let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, D_SCORE as i64]).unwrap();
+
+        let Some(got_flat) = try_indexer_score(&q, &w, &flat_pool, None, ng, sg).unwrap() else {
+            return false;
+        };
+        let diff = error_stats(&read_f32(&got_flat), &want).0;
+        let tol = if s > 16 { 5e-3 } else { 1e-3 };
+        assert!(diff <= tol, "flat H={h} S={s} Ng={ng} sg={sg}: {diff:e}");
+
+        let (paged_pool, pages_arr) = make_paged_pool(&keys_bits, ng, sg, 9);
+        let got_paged = try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), ng, sg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_bits(&got_paged),
+            read_bits(&got_flat),
+            "paged vs flat H={h} S={s} Ng={ng}"
+        );
+        if row_inv {
+            let row_fn = |r: usize| {
+                let qr = q
+                    .slice(
+                        &[r as i64, 0, 0],
+                        &[(r + 1) as i64, h as i64, D_SCORE as i64],
+                    )
+                    .unwrap();
+                let wr = w
+                    .slice(&[r as i64, 0], &[(r + 1) as i64, h as i64])
+                    .unwrap();
+                try_indexer_score(&qr, &wr, &paged_pool, Some(&pages_arr), ng, sg)
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_row_invariant(
+                row_fn,
+                |_| got_paged.clone(),
+                &[s],
+                &format!("H={h} S={s} Ng={ng}"),
+            );
+        }
+        true
     }
 
     #[test]
-    fn indexer_score_decode_and_prefill_flat_and_paged_match_reference() {
+    fn indexer_score_decode_prefill_large_and_causal_match_reference() {
         crate::models::hy_v4_flash::exact_f32();
-        let h = 16usize;
-        let d = 128usize;
-        let index_rows = 8usize;
-
-        for (s, n_groups, start_g, seed) in [
-            (1usize, 37usize, 0usize, 101u64),
-            (1usize, 256usize, 11usize, 102u64),
-            (4usize, 193usize, 5usize, 103u64),
-            (19usize, 73usize, 0usize, 104u64),
-            (64usize, 260usize, 8usize, 105u64),
-        ] {
-            let mut rng = Rng(seed);
-            let q_vec = rng.vec(s * h * d, 1.5);
-            let w_vec = rng.vec(s * h, 0.2);
-            let k_f32_vec = rng.vec(n_groups * d, 1.5);
-
-            let q = arr(&q_vec, &[s, h, d]);
-            let w = arr(&w_vec, &[s, h]);
-            let keys_f16 = arr(&k_f32_vec, &[n_groups, d])
-                .astype(DType::Float16)
-                .unwrap();
-            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
-            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
-
-            // Flat mode (with leading padding of `start_g` rows + trailing slack).
-            let cap_g = start_g + n_groups + 13;
-            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-            let mut flat_bits = vec![0u16; cap_g * d];
-            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
-            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
-
-            let Some(got_flat_arr) =
-                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
-            else {
-                eprintln!("skipping hy4_indexer_score Metal test (no GPU)");
+        let cases = [
+            // Decode & prefill small/medium
+            (16usize, 1usize, 37usize, 0usize, 101u64, false),
+            (16, 1, 256, 11, 102, false),
+            (16, 4, 193, 5, 103, true),
+            (16, 19, 73, 0, 104, false),
+            (16, 64, 260, 8, 105, false),
+            // Decode NAX large contexts & SHARE_S (S=1, 2, 4)
+            (16, 1, 256, 0, 701, false),
+            (16, 2, 256, 7, 702, false),
+            (16, 4, 256, 13, 703, false),
+            (16, 1, 2048, 0, 704, false),
+            (16, 2, 2048, 9, 705, false),
+            (16, 4, 2048, 5, 706, true),
+            (16, 1, 7763, 3, 707, false),
+            (16, 1, 8192, 0, 708, false),
+            (16, 2, 8192, 11, 709, false),
+            (16, 4, 8192, 4, 710, false),
+            (8, 2, 256, 3, 711, false),
+            // Prefill BN_G=128 sub-tile boundaries (1..4 active 32-col sub-tiles) & S boundaries
+            (16, 17, 1, 0, 901, false),
+            (16, 19, 31, 0, 902, false),
+            (16, 32, 32, 3, 903, false),
+            (16, 63, 33, 0, 904, false),
+            (16, 64, 64, 5, 905, false),
+            (16, 65, 65, 0, 906, false),
+            (16, 64, 96, 7, 907, false),
+            (16, 64, 97, 0, 908, false),
+            (16, 65, 127, 0, 909, false),
+            (16, 64, 128, 4, 910, false),
+            (16, 129, 129, 0, 911, false),
+            (16, 128, 300, 9, 912, false),
+        ];
+        for (h, s, ng, sg, seed, inv) in cases {
+            if !check_indexer_score_case(h, s, ng, sg, seed, inv) {
                 return;
-            };
-            let got_flat = read(&got_flat_arr);
-            assert_eq!(got_flat.len(), want.len());
-            let mut max_diff_flat = 0.0f32;
-            for (g, wv) in got_flat.iter().zip(&want) {
-                max_diff_flat = max_diff_flat.max((g - wv).abs());
             }
-            let tol = if s > 16 { 5e-3 } else { 1e-3 };
-            assert!(
-                max_diff_flat <= tol,
-                "flat S={s} N_g={n_groups} start_g={start_g}: max_abs_diff={max_diff_flat} > {tol}"
-            );
+        }
 
-            // Paged mode with scattered non-monotonic physical blocks.
-            let n_pages = (start_g + n_groups).div_ceil(index_rows);
-            let n_blocks = n_pages + 9;
-            let pages_u32 = scattered_pages(n_pages, n_blocks);
-            let pages_arr = page_ids(&pages_u32).unwrap();
-            let paged_pool = pack_paged_keys(
-                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
-            );
-
-            let got_paged_arr =
-                try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
-                    .unwrap()
-                    .expect("paged indexer_score");
-            let got_paged = read(&got_paged_arr);
-            assert_eq!(
-                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                "paged vs flat bit mismatch for S={s} N_g={n_groups} start_g={start_g}"
-            );
-
-            // Decode multi-row invariance: S=4 matches 4 independent S=1 calls bit-for-bit.
-            if s == 4 {
-                for row in 0..s {
-                    let qr = q
-                        .slice(&[row as i64, 0, 0], &[(row + 1) as i64, h as i64, d as i64])
-                        .unwrap();
-                    let wr = w
-                        .slice(&[row as i64, 0], &[(row + 1) as i64, h as i64])
-                        .unwrap();
-                    let one = read(
-                        &try_indexer_score(
-                            &qr,
-                            &wr,
-                            &paged_pool,
-                            Some(&pages_arr),
-                            n_groups,
-                            start_g,
-                        )
-                        .unwrap()
-                        .unwrap(),
-                    );
-                    let row_got = &got_paged[row * n_groups..(row + 1) * n_groups];
-                    assert_eq!(
-                        row_got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                        one.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                        "decode row {row} invariance"
-                    );
-                }
+        // Causal g_tile skip: rows 0..192 with monotonically increasing visible_groups 40..520.
+        let (h, s, ng, spec) = (16usize, 192usize, 512usize, (16usize, 4usize, 68usize));
+        let (q, w, keys_f16) = rand_score_inputs(h, s, ng, 999);
+        let kbits = keys_f16.to_uint16_native().unwrap();
+        let (paged_pool, pages_arr) = make_paged_pool(&kbits, ng, 0, 7);
+        let visible: Vec<i32> = (0..s).map(|r| (40 + r * 5 / 2).min(ng) as i32).collect();
+        let ts: Vec<i32> = visible.iter().map(|&v| v * spec.1 as i32).collect();
+        let tl: Vec<i32> = (0..s).map(|r| ((r % 4) + 1) as i32).collect();
+        let (vis_a, ts_a, tl_a) = (i32_arr(&visible), i32_arr(&ts), i32_arr(&tl));
+        for (tag, pool, pages) in [
+            ("flat", &keys_f16, None),
+            ("paged", &paged_pool, Some(&pages_arr)),
+        ] {
+            let full = try_indexer_score(&q, &w, pool, pages, ng, 0)
+                .unwrap()
+                .unwrap();
+            let caus = try_indexer_score_causal(&q, &w, pool, pages, Some(&vis_a), ng, 0)
+                .unwrap()
+                .unwrap();
+            let (fb, cb) = (read_bits(&full), read_bits(&caus));
+            for (r, &v) in visible.iter().enumerate() {
+                let rng = r * ng..r * ng + v as usize;
+                assert_eq!(&cb[rng.clone()], &fb[rng], "{tag} r={r}");
             }
+            let tk =
+                |sc: &MxArray| read_i32(&topk_call(sc, &vis_a, &ts_a, &tl_a, pages, spec).unwrap());
+            assert_eq!(tk(&caus), tk(&full), "topk ({tag})");
+            let pk = |sc: &MxArray| read_i32(&pick_groups(sc, &visible, spec.0).unwrap());
+            assert_eq!(pk(&caus), pk(&full), "pick ({tag})");
         }
     }
 
-    /// Reference implementation matching `pick_groups + group_cells + tail + slot_ids`
-    /// for sparse rows (`vis > n_top`), and packed `0..vis*kpool + tail + -1` + `slot_ids`
-    /// for dense rows (`vis <= n_top`).
     fn ref_topk_cells(
         sc: &MxArray,
         visible: &[i32],
-        tail_starts: &[i32],
-        tail_lens: &[i32],
+        ts: &[i32],
+        tl: &[i32],
         pages: Option<&MxArray>,
-        n_top: usize,
-        kpool: usize,
-        kmax: usize,
+        (n_top, kpool, kmax): (usize, usize, usize),
     ) -> Vec<i32> {
         let s = visible.len();
-        let n_g = sc.shape_at(1).unwrap() as usize;
-        let can_pick = n_g >= n_top;
-        let picked_all = if can_pick {
-            Some(read_i32(&pick_groups(sc, visible, n_top).unwrap()))
-        } else {
-            None
-        };
+        let ok = sc.shape_at(1).unwrap() as usize >= n_top;
+        let picked = ok.then(|| read_i32(&pick_groups(sc, visible, n_top).unwrap()));
         let mut logical = vec![-1i32; s * kmax];
         for r in 0..s {
-            let vis = visible[r].max(0) as usize;
-            let row = &mut logical[r * kmax..(r + 1) * kmax];
-            let ts = tail_starts[r];
-            let tl = tail_lens[r].max(0) as usize;
-            if vis <= n_top {
-                let n_vis = vis * kpool;
-                for (i, slot) in row.iter_mut().enumerate().take(n_vis.min(kmax)) {
+            let (vis, row) = (
+                visible[r].max(0) as usize,
+                &mut logical[r * kmax..(r + 1) * kmax],
+            );
+            let base = if vis <= n_top {
+                let nv = vis * kpool;
+                for (i, slot) in row.iter_mut().enumerate().take(nv.min(kmax)) {
                     *slot = i as i32;
                 }
-                for off in 0..tl {
-                    if n_vis + off < kmax {
-                        row[n_vis + off] = ts + off as i32;
-                    }
-                }
+                nv
             } else {
-                let ids = &picked_all.as_ref().unwrap()[r * n_top..(r + 1) * n_top];
-                for (gi, &g_id) in ids.iter().enumerate() {
-                    if g_id >= 0 {
+                let pr = &picked.as_ref().unwrap()[r * n_top..(r + 1) * n_top];
+                for (gi, &gid) in pr.iter().enumerate() {
+                    if gid >= 0 {
                         for sub in 0..kpool {
-                            row[gi * kpool + sub] = g_id * kpool as i32 + sub as i32;
+                            row[gi * kpool + sub] = gid * kpool as i32 + sub as i32;
                         }
                     }
                 }
-                let base = n_top * kpool;
-                for off in 0..tl {
-                    if base + off < kmax {
-                        row[base + off] = ts + off as i32;
-                    }
+                n_top * kpool
+            };
+            for off in 0..tl[r].max(0) as usize {
+                if base + off < kmax {
+                    row[base + off] = ts[r] + off as i32;
                 }
             }
         }
-        let logical_arr = MxArray::from_int32(&logical, &[s as i64, kmax as i64]).unwrap();
-        match pages {
-            Some(p) => read_i32(&slot_ids(p, &logical_arr).unwrap()),
-            None => logical,
-        }
+        let a = MxArray::from_int32(&logical, &[s as i64, kmax as i64]).unwrap();
+        pages.map_or(logical, |p| read_i32(&slot_ids(p, &a).unwrap()))
     }
 
     fn check_topk_case(
         label: &str,
-        score_rows: &[Vec<f32>],
-        visible: &[i32],
-        tail_starts: &[i32],
-        tail_lens: &[i32],
-        n_top: usize,
-        kpool: usize,
-        kmax: usize,
+        rows: &[Vec<f32>],
+        vis: &[i32],
+        ts: &[i32],
+        tl: &[i32],
+        spec: (usize, usize, usize),
     ) {
-        let s = score_rows.len();
-        let n_g = score_rows[0].len();
-        let flat_scores: Vec<f32> = score_rows.iter().flatten().copied().collect();
-        let sc = arr(&flat_scores, &[s, n_g]);
-        let vis_arr = MxArray::from_int32(visible, &[s as i64]).unwrap();
-        let ts_arr = MxArray::from_int32(tail_starts, &[s as i64]).unwrap();
-        let tl_arr = MxArray::from_int32(tail_lens, &[s as i64]).unwrap();
-
-        let max_cell = visible
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let sc = arr(&flat, &[rows.len(), rows[0].len()]);
+        let (vis_a, ts_a, tl_a) = (i32_arr(vis), i32_arr(ts), i32_arr(tl));
+        let max_cell = vis
             .iter()
-            .zip(tail_starts)
-            .zip(tail_lens)
-            .map(|((&v, &ts), &tl)| ((v.max(0) as usize) * kpool).max((ts + tl).max(0) as usize))
+            .zip(ts)
+            .zip(tl)
+            .map(|((&v, &s), &l)| ((v.max(0) as usize) * spec.1).max((s + l).max(0) as usize))
             .max()
             .unwrap_or(1)
             .max(1);
-        let n_pages = max_cell.div_ceil(BLOCK as usize);
-        let n_blocks = n_pages + 11;
-        let pages_u32 = scattered_pages(n_pages, n_blocks);
-        let pages_arr = page_ids(&pages_u32).unwrap();
-
-        // Flat (PAGED=false)
-        let Some(got_flat_arr) = try_indexer_topk_cells(
-            &sc,
-            &vis_arr,
-            &ts_arr,
-            &tl_arr,
-            None,
-            n_top,
-            kpool,
-            kmax,
-            BLOCK as usize,
-        )
-        .unwrap() else {
-            eprintln!("skipping hy4_indexer_topk_cells Metal test (no GPU)");
-            return;
-        };
-        let got_flat = read_i32(&got_flat_arr);
-        let want_flat = ref_topk_cells(
-            &sc,
-            visible,
-            tail_starts,
-            tail_lens,
-            None,
-            n_top,
-            kpool,
-            kmax,
-        );
-        assert_eq!(got_flat, want_flat, "{label} (flat)");
-
-        // Paged (PAGED=true)
-        let got_paged_arr = try_indexer_topk_cells(
-            &sc,
-            &vis_arr,
-            &ts_arr,
-            &tl_arr,
-            Some(&pages_arr),
-            n_top,
-            kpool,
-            kmax,
-            BLOCK as usize,
-        )
-        .unwrap()
-        .expect("paged topk_cells");
-        let got_paged = read_i32(&got_paged_arr);
-        let want_paged = ref_topk_cells(
-            &sc,
-            visible,
-            tail_starts,
-            tail_lens,
-            Some(&pages_arr),
-            n_top,
-            kpool,
-            kmax,
-        );
-        assert_eq!(got_paged, want_paged, "{label} (paged)");
+        let np = max_cell.div_ceil(BLOCK as usize);
+        let pages_a = page_ids(&scattered_pages(np, np + 11)).unwrap();
+        for (mode, pages) in [("flat", None), ("paged", Some(&pages_a))] {
+            let Some(got) = topk_call(&sc, &vis_a, &ts_a, &tl_a, pages, spec) else {
+                return;
+            };
+            assert_eq!(
+                read_i32(&got),
+                ref_topk_cells(&sc, vis, ts, tl, pages, spec),
+                "{label} ({mode})"
+            );
+        }
     }
 
     #[test]
     fn indexer_topk_cells_dense_fast_path_and_distinct_large_contexts() {
-        let n_top = 511usize;
-        let kpool = 4usize;
-        let kmax = 2048usize;
-
-        // 1. Dense fast path: vis <= n_top (0, 1, 17, 510, 511)
-        let mut rng = Rng(201);
-        let dense_vis = vec![0i32, 1, 17, 510, 511];
-        let dense_ts: Vec<i32> = dense_vis.iter().map(|&v| v * kpool as i32).collect();
-        let dense_tl = vec![1i32, 4, 2, 3, 4];
-        let dense_scores: Vec<Vec<f32>> = (0..dense_vis.len()).map(|_| rng.vec(520, 5.0)).collect();
+        let (spec, mut rng) = ((511usize, 4usize, 2048usize), Rng::new(201));
+        let dvis = [0i32, 1, 17, 510, 511];
+        let dts: Vec<i32> = dvis.iter().map(|&v| v * 4).collect();
+        let dsc: Vec<Vec<f32>> = (0..dvis.len()).map(|_| rng.vec_f32(520, 5.0)).collect();
         check_topk_case(
             "dense vis <= n_top",
-            &dense_scores,
-            &dense_vis,
-            &dense_ts,
-            &dense_tl,
-            n_top,
-            kpool,
-            kmax,
+            &dsc,
+            &dvis,
+            &dts,
+            &[1, 4, 2, 3, 4],
+            spec,
         );
 
-        // 2. Large contexts: vis = 1024, 4096, 8192 with distinct scores
         for (vis, s, seed) in [(1024usize, 3usize, 202u64), (4096, 10, 203), (8192, 4, 204)] {
-            let mut r = Rng(seed);
-            let cols = vis + 17;
-            let mut rows_sc = Vec::with_capacity(s);
-            let mut vis_v = Vec::with_capacity(s);
-            let mut ts_v = Vec::with_capacity(s);
-            let mut tl_v = Vec::with_capacity(s);
-            for row in 0..s {
-                let v = vis - (row % 3);
-                vis_v.push(v as i32);
-                ts_v.push((v * kpool) as i32);
-                tl_v.push(((row % 4) + 1) as i32);
-                // Distinct scores with wide dynamic range (positive + negative)
-                rows_sc.push(
-                    (0..cols)
-                        .map(|g| r.next() * 50.0 + (g as f32) * 1e-5)
-                        .collect(),
-                );
-            }
+            let (mut r, cols) = (Rng::new(seed), vis + 17);
+            let vv: Vec<i32> = (0..s).map(|row| (vis - (row % 3)) as i32).collect();
+            let ts: Vec<i32> = vv.iter().map(|&v| v * 4).collect();
+            let tl: Vec<i32> = (0..s).map(|row| ((row % 4) + 1) as i32).collect();
+            let row_fn = |_| {
+                (0..cols)
+                    .map(|g| r.f32() * 50.0 + g as f32 * 1e-5)
+                    .collect()
+            };
+            let sc: Vec<Vec<f32>> = (0..s).map(row_fn).collect();
             check_topk_case(
                 &format!("distinct vis={vis} s={s}"),
-                &rows_sc,
-                &vis_v,
-                &ts_v,
-                &tl_v,
-                n_top,
-                kpool,
-                kmax,
+                &sc,
+                &vv,
+                &ts,
+                &tl,
+                spec,
             );
         }
     }
 
     #[test]
     fn indexer_topk_cells_heavy_ties_negatives_zeros_and_signed_zero_bit_exact() {
-        let n_top = 511usize;
-        let kpool = 4usize;
-        let kmax = 2048usize;
-        let vis = 2048usize;
+        let (vis, spec) = (2048usize, (511usize, 4usize, 2048usize));
         let cols = vis + 16;
-
-        // Row 0: all equal positive scores
         let r0 = vec![1.25f32; cols];
-
-        // Row 1: all equal negative scores
         let r1 = vec![-3.5f32; cols];
-
-        // Row 2: all zeros, alternating -0.0f and +0.0f (must tie and pick 0..511!)
         let r2: Vec<f32> = (0..cols)
-            .map(|g| if g % 2 == 0 { -0.0f32 } else { 0.0f32 })
+            .map(|g| if g % 2 == 0 { -0.0 } else { 0.0 })
             .collect();
-
-        // Row 3: 50% tied at threshold 0.0 (mixing -0.0f and +0.0f), 200 strictly
-        // above, rest strictly below
         let r3: Vec<f32> = (0..cols)
-            .map(|g| {
-                if g % 10 == 7 && g < 2000 {
-                    5.0 + (g as f32) * 1e-4
-                } else if g % 2 == 0 {
-                    if g % 4 == 0 { -0.0f32 } else { 0.0f32 }
-                } else {
-                    -1.0 - (g as f32) * 1e-3
-                }
+            .map(|g| match g {
+                _ if g % 10 == 7 && g < 2000 => 5.0 + g as f32 * 1e-4,
+                _ if g % 4 == 0 => -0.0,
+                _ if g % 2 == 0 => 0.0,
+                _ => -1.0 - g as f32 * 1e-3,
             })
             .collect();
-
-        // Row 4: 50% tied at negative threshold -2.5f, 300 strictly above (still negative!)
         let r4: Vec<f32> = (0..cols)
             .map(|g| {
                 if g % 7 == 3 && g < 2100 {
-                    -0.1 - (g as f32) * 1e-5
+                    -0.1 - g as f32 * 1e-5
                 } else if g % 2 == 1 {
-                    -2.5f32
+                    -2.5
                 } else {
-                    -50.0f32
+                    -50.0
                 }
             })
             .collect();
-
-        // Row 5: strictly negative distinct values with subnormals & -inf/+inf
         let mut r5: Vec<f32> = (0..cols).map(|g| -(g as f32) * 0.01 - 1e-30).collect();
-        r5[1500] = f32::INFINITY;
-        r5[1501] = f32::MAX;
-        r5[0] = f32::NEG_INFINITY;
-        r5[10] = -0.0f32;
-        r5[11] = 0.0f32;
-        r5[12] = -f32::from_bits(1); // negative min subnormal
-        r5[13] = f32::from_bits(1); // positive min subnormal
-
-        // Row 6: threshold strictly at -0.0f/+0.0f with > 511 zeros and some -0.0
-        // earlier than +0.0
+        (r5[1500], r5[1501], r5[0]) = (f32::INFINITY, f32::MAX, f32::NEG_INFINITY);
+        (r5[10], r5[11], r5[12], r5[13]) = (-0.0, 0.0, -f32::from_bits(1), f32::from_bits(1));
         let mut r6 = vec![-1.0f32; cols];
-        for g in 0..100 {
-            r6[cols - 1 - g] = 1.0f32; // invisible or late high values
-        }
-        for (g, v) in r6.iter_mut().enumerate().take(1500).skip(100) {
-            *v = if g < 800 { -0.0f32 } else { 0.0f32 };
-        }
-
-        // Row 7: every visible entry is -0.0f except 100 late entries are +0.0f
+        r6[cols - 100..].fill(1.0);
+        r6[100..800].fill(-0.0);
+        r6[800..1500].fill(0.0);
         let mut r7 = vec![-0.0f32; cols];
-        r7[1800..cols].fill(0.0f32);
-
-        let rows_sc = vec![r0, r1, r2, r3, r4, r5, r6, r7];
-        let visible = vec![vis as i32; rows_sc.len()];
-        let tail_starts = vec![(vis * kpool) as i32; rows_sc.len()];
-        let tail_lens = vec![1i32, 2, 3, 4, 1, 2, 3, 4];
-
-        check_topk_case(
-            "heavy ties & signed zero",
-            &rows_sc,
-            &visible,
-            &tail_starts,
-            &tail_lens,
-            n_top,
-            kpool,
-            kmax,
+        r7[1800..].fill(0.0);
+        let rows = [r0, r1, r2, r3, r4, r5, r6, r7];
+        let (vv, ts, tl) = (
+            [vis as i32; 8],
+            [(vis * 4) as i32; 8],
+            [1, 2, 3, 4, 1, 2, 3, 4],
         );
+        check_topk_case("heavy ties & signed zero", &rows, &vv, &ts, &tl, spec);
 
-        // Also test NaN handling explicitly: NaNs must rank strictly below -inf.
-        let mut nan_row = vec![f32::NAN; 1024];
-        nan_row[700] = f32::NEG_INFINITY;
-        nan_row[200] = -1000.0;
-        nan_row[900] = 0.0;
-        let sc = arr(&nan_row, &[1, 1024]);
-        let vis_arr = MxArray::from_int32(&[1024], &[1]).unwrap();
-        let ts_arr = MxArray::from_int32(&[4096], &[1]).unwrap();
-        let tl_arr = MxArray::from_int32(&[2], &[1]).unwrap();
-        if let Some(got_arr) = try_indexer_topk_cells(
+        // NaNs rank strictly below -inf with lowest-index tie-break.
+        let mut nan = vec![f32::NAN; 1024];
+        (nan[700], nan[200], nan[900]) = (f32::NEG_INFINITY, -1000.0, 0.0);
+        let sc = arr(&nan, &[1, 1024]);
+        if let Some(got) = topk_call(
             &sc,
-            &vis_arr,
-            &ts_arr,
-            &tl_arr,
+            &i32_arr(&[1024]),
+            &i32_arr(&[4096]),
+            &i32_arr(&[2]),
             None,
-            4,
-            4,
-            20,
-            BLOCK as usize,
-        )
-        .unwrap()
-        {
-            let got = read_i32(&got_arr);
-            // Groups 200, 700, 900 are finite/-inf; 4th pick is lowest-index NaN = group 0!
-            // Sorted ascending: groups [0, 200, 700, 900], plus tail [4096, 4097], padded -1.
-            let expected = vec![
+            (4, 4, 20),
+        ) {
+            let want = [
                 0, 1, 2, 3, 800, 801, 802, 803, 2800, 2801, 2802, 2803, 3600, 3601, 3602, 3603,
                 4096, 4097, -1, -1,
             ];
-            assert_eq!(
-                got, expected,
-                "NaN ranks below -inf with lowest-index tie-break"
-            );
+            assert_eq!(read_i32(&got), want, "NaN ranks below -inf");
         }
     }
 
     #[test]
     fn end_to_end_real_dim_128_flat_and_paged_slots_match_reference() {
-        use crate::models::hy_v4_flash::paged::{PageGeometry, SlotMap, create};
-
         crate::models::hy_v4_flash::exact_f32();
-        let g = IndexerGeometry {
-            n_heads: 16,
-            head_dim: 128,
-            rope_dim: 64,
-            kpool: 4,
-            n_top: 8,
-            select_tail: true,
-            eps: 1e-5,
-            weight_scale: (2048f32).sqrt().recip(),
-            rope_theta: 1e7,
-        };
+        let g = IndexerGeometry { n_top: 8, ..real() };
         let (w, hw) = indexer_weights(&g, 303);
         let ix = Indexer::new(g.clone(), &w).unwrap();
-        let n = 68usize; // 17 groups > n_top=8, crosses 2 pages of 32 tokens
-        let xs = inputs(n, D, 304);
-        let qrs = inputs(n, Q_LORA, 305);
-
+        let (n, xs, qrs) = (68usize, inputs(68, D, 304), inputs(68, Q_LORA, 305));
         let want = host_cells(&g, &hw, &xs, &qrs);
 
-        // Flat IndexerState (exercises hy4_indexer_score PAGED=false + hy4_indexer_topk_cells PAGED=false)
         let mut flat_st = IndexerState::new(128, &g);
-        let flat_prefill = ix
-            .select(
-                &w,
-                prefill(&rows_of(&xs[..64]), &rows_of(&qrs[..64]), 0),
-                &mut flat_st,
-            )
+        let (x0, q0) = (rows_of(&xs[..64]), rows_of(&qrs[..64]));
+        let (x1, q1) = (rows_of(&xs[64..]), rows_of(&qrs[64..]));
+        let flat_pre = ix
+            .select(&w, call(&x0, &q0, 0, RowKind::Prefill), &mut flat_st)
             .unwrap();
-        let flat_decode = ix
-            .select(
-                &w,
-                Call {
-                    x: &rows_of(&xs[64..]),
-                    qr: &rows_of(&qrs[64..]),
-                    start: 64,
-                    kind: RowKind::Decode,
-                },
-                &mut flat_st,
-            )
+        let flat_dec = ix
+            .select(&w, call(&x1, &q1, 64, RowKind::Decode), &mut flat_st)
             .unwrap();
-        let mut got_flat = cell_sets(&flat_prefill);
-        got_flat.extend(cell_sets(&flat_decode));
+        let mut got_flat = cell_sets(&flat_pre);
+        got_flat.extend(cell_sets(&flat_dec));
         assert_eq!(got_flat, want, "flat D=128 H=16 vs host");
 
-        // Paged IndexerState + select_paged_slots (exercises hy4_indexer_score PAGED=true + hy4_indexer_topk_cells PAGED=true)
         let pg = PageGeometry {
             layers: 1,
             half: 32,
@@ -1763,160 +1442,89 @@ mod fused_metal {
             return;
         };
         let mut paged_st = PagedIndexerState::new(0, &g);
-        // Interleave another sequence's pages so physical page IDs are scattered.
-        adapter.record_tokens_for(99, &[1; 32]).unwrap();
-        adapter.record_tokens_for(1, &[2; 64]).unwrap();
-        let slots0 = SlotMap::of(&adapter).unwrap();
-        let got_p0 = ix
-            .select_paged_slots(
-                &w,
-                prefill(&rows_of(&xs[..64]), &rows_of(&qrs[..64]), 0),
-                &mut paged_st,
-                &mut adapter,
-                &slots0,
-            )
-            .unwrap();
-        let want_p0 = slots0.slots(&adapter, &flat_prefill).unwrap();
-        assert_eq!(read_i32(&got_p0), read_i32(&want_p0), "paged prefill D=128");
-
-        adapter.record_tokens_for(99, &[1; 32]).unwrap();
-        adapter.record_tokens_for(1, &[2; 4]).unwrap();
-        let slots1 = SlotMap::of(&adapter).unwrap();
-        let got_p1 = ix
-            .select_paged_slots(
-                &w,
-                Call {
-                    x: &rows_of(&xs[64..]),
-                    qr: &rows_of(&qrs[64..]),
-                    start: 64,
-                    kind: RowKind::Decode,
-                },
-                &mut paged_st,
-                &mut adapter,
-                &slots1,
-            )
-            .unwrap();
-        let want_p1 = slots1.slots(&adapter, &flat_decode).unwrap();
-        assert_eq!(read_i32(&got_p1), read_i32(&want_p1), "paged decode D=128");
+        let phases = [
+            ("paged prefill", 0..64, RowKind::Prefill, &flat_pre),
+            ("paged decode", 64..n, RowKind::Decode, &flat_dec),
+        ];
+        for (tag, rng, kind, flat_idx) in phases {
+            adapter.record_tokens_for(99, &[1; 32]).unwrap();
+            adapter.record_tokens_for(1, &vec![2; rng.len()]).unwrap();
+            let slots = SlotMap::of(&adapter).unwrap();
+            let (xr, qr) = (rows_of(&xs[rng.clone()]), rows_of(&qrs[rng.clone()]));
+            let c = call(&xr, &qr, rng.start, kind);
+            let got = ix
+                .select_paged_slots(&w, c, &mut paged_st, &mut adapter, &slots)
+                .unwrap();
+            let want_p = slots.slots(&adapter, flat_idx).unwrap();
+            assert_eq!(read_i32(&got), read_i32(&want_p), "{tag}");
+        }
     }
 
     #[test]
     fn tok_tail_ring_wrap_truncate_rollback_and_snapshot_parity() {
         crate::models::hy_v4_flash::exact_f32();
-        let g = IndexerGeometry {
-            n_heads: 16,
-            head_dim: 128,
-            rope_dim: 64,
-            kpool: 4,
-            n_top: 8,
-            select_tail: true,
-            eps: 1e-5,
-            weight_scale: (2048f32).sqrt().recip(),
-            rope_theta: 1e7,
-        };
-        let keep = g.kpool - 1 + WINDOW_SLACK;
-        let all_rows = inputs(64, g.head_dim, 401);
+        let g = IndexerGeometry { n_top: 8, ..real() };
+        let (keep, all_rows) = (g.kpool - 1 + WINDOW_SLACK, inputs(64, g.head_dim, 401));
+        let flat_slice =
+            |r: Range<usize>| all_rows[r].iter().flatten().copied().collect::<Vec<_>>();
 
-        // Push across multiple circular ring wraps with M = 1, 2, 4, 3 steps.
-        let mut tail = TokTail::new(&g);
-        let mut pos = 0usize;
-        let steps = [
+        let (mut tail, mut pos) = (TokTail::new(&g), 0usize);
+        for n in [
             1usize, 2, 4, 3, 1, 1, 2, 4, 1, 3, 2, 4, 1, 2, 4, 1, 3, 2, 4, 3,
-        ];
-        for &n in &steps {
-            let chunk = rows_of(&all_rows[pos..pos + n]);
-            tail.push(&chunk).unwrap();
+        ] {
+            tail.push(&rows_of(&all_rows[pos..pos + n])).unwrap();
             pos += n;
-            assert_eq!(tail.len(), pos);
-            assert_eq!(tail.held(), pos.min(keep));
-            let snap = tail.snapshot().unwrap();
-            assert_eq!(snap.len(), pos);
-            assert_eq!(snap.held(), pos.min(keep));
-            let got = read(snap.rows().unwrap());
-            let start = pos - pos.min(keep);
-            let want: Vec<f32> = all_rows[start..pos].iter().flatten().copied().collect();
-            assert_eq!(got, want, "ring snapshot mismatch at pos={pos}");
-
-            // Roundtrip through of_rows produces identical linear snapshot.
+            let (held, snap) = (pos.min(keep), tail.snapshot().unwrap());
+            let want = flat_slice(pos - held..pos);
+            assert_eq!(
+                (tail.len(), tail.held(), snap.len(), snap.held()),
+                (pos, held, pos, held)
+            );
+            assert_eq!(read_f32(snap.rows().unwrap()), want, "ring snap pos={pos}");
             let rebuilt = TokTail::of_rows(&g, snap.rows().cloned(), pos).unwrap();
-            assert_eq!(read(rebuilt.rows().unwrap()), want);
+            assert_eq!(read_f32(rebuilt.rows().unwrap()), want);
         }
 
         // O(1) rollback within rollback_slack (1..=4) restores all `keep` retained rows.
         assert!(tail.rollback_slack() >= 4);
-        let before_pos = pos;
-        let before_held = tail.held();
-        let push4 = rows_of(&all_rows[pos..pos + 4]);
-        tail.push(&push4).unwrap();
-        assert_eq!(tail.len(), before_pos + 4);
-        tail.rollback_push(before_pos, before_held);
-        assert_eq!(tail.len(), before_pos);
-        assert_eq!(tail.held(), before_held);
-        let snap_after_rb = tail.snapshot().unwrap();
-        let want_after_rb: Vec<f32> = all_rows[before_pos - keep..before_pos]
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
-        assert_eq!(
-            read(snap_after_rb.rows().unwrap()),
-            want_after_rb,
-            "ring O(1) rollback corrupted retained rows"
-        );
+        let (bpos, bheld) = (pos, tail.held());
+        tail.push(&rows_of(&all_rows[pos..pos + 4])).unwrap();
+        assert_eq!(tail.len(), bpos + 4);
+        tail.rollback_push(bpos, bheld);
+        assert_eq!((tail.len(), tail.held()), (bpos, bheld));
+        let after = read_f32(tail.snapshot().unwrap().rows().unwrap());
+        assert_eq!(after, flat_slice(bpos - keep..bpos));
 
         // End-to-end real D=128 kpool=4 decode chunks crossing ring wraps and group closures.
         let (w, hw) = indexer_weights(&g, 409);
         let ix = Indexer::new(g.clone(), &w).unwrap();
-        let n = 40usize;
-        let xs = inputs(n, D, 410);
-        let qrs = inputs(n, Q_LORA, 411);
+        let (n, xs, qrs) = (40usize, inputs(40, D, 410), inputs(40, Q_LORA, 411));
         let want = host_cells(&g, &hw, &xs, &qrs);
-
-        let run_schedule = |sched: &[usize]| -> (Vec<Vec<i32>>, Vec<f32>) {
-            let mut st = IndexerState::new(64, &g);
-            let mut cells = Vec::new();
-            let mut at = 0usize;
+        let run_sched = |sched: &[usize]| -> (Vec<Vec<i32>>, Vec<f32>) {
+            let (mut st, mut cells, mut at) = (IndexerState::new(64, &g), Vec::new(), 0usize);
             for &m in sched {
-                let got = ix
-                    .select(
-                        &w,
-                        Call {
-                            x: &rows_of(&xs[at..at + m]),
-                            qr: &rows_of(&qrs[at..at + m]),
-                            start: at,
-                            kind: RowKind::Decode,
-                        },
-                        &mut st,
-                    )
+                let (xm, qm) = (rows_of(&xs[at..at + m]), rows_of(&qrs[at..at + m]));
+                let idx = ix
+                    .select(&w, call(&xm, &qm, at, RowKind::Decode), &mut st)
                     .unwrap();
-                cells.extend(cell_sets(&got));
+                cells.extend(cell_sets(&idx));
                 at += m;
             }
-            let pooled = read(st.pooled.rows().unwrap());
-            (cells, pooled)
+            (cells, read_f32(st.pooled.rows().unwrap()))
         };
-
+        let scheds = [
+            vec![2; n / 2],
+            vec![4; n / 4],
+            vec![3, 1, 2, 4, 1, 3, 2, 4, 1, 2, 3, 4, 2, 1, 3, 4],
+        ];
         for (dt, tol) in [(DType::Float32, 1e-5f64), (DType::Float16, 1e-3f64)] {
             crate::models::hy_v4_flash::cache::with_row_dtype(dt, || {
-                let (cells_1, pooled_1) = run_schedule(&vec![1; n]);
-                assert_eq!(cells_1, want, "D=128 {dt:?} M=1 schedule vs host");
-                for sched in [
-                    vec![2; n / 2],
-                    vec![4; n / 4],
-                    vec![3, 1, 2, 4, 1, 3, 2, 4, 1, 2, 3, 4, 2, 1, 3, 4],
-                ] {
-                    let (cells, pooled) = run_schedule(&sched);
-                    assert_eq!(cells, want, "D=128 {dt:?} schedule {sched:?} vs host");
-                    assert_eq!(pooled.len(), pooled_1.len());
-                    for (i, (a, b)) in pooled.iter().zip(&pooled_1).enumerate() {
-                        close(
-                            *a,
-                            *b,
-                            tol,
-                            tol,
-                            &format!("D=128 {dt:?} pooled {sched:?}[{i}]"),
-                        );
-                    }
+                let (c1, p1) = run_sched(&vec![1; n]);
+                assert_eq!(c1, want, "{dt:?} M=1");
+                for sched in &scheds {
+                    let (c, p) = run_sched(sched);
+                    assert_eq!(c, want, "{dt:?} {sched:?}");
+                    assert_close(&p, &p1, tol, tol, &format!("{dt:?} pooled {sched:?}"));
                 }
             });
         }
@@ -1924,449 +1532,26 @@ mod fused_metal {
         // Failed decode update on real D=128 fast-rollback path leaves state bit-exact.
         let mut st = IndexerState::new(64, &g);
         ix.update(&w, &rows_of(&xs[..18]), 0, &mut st).unwrap();
-        let snap_before = read(st.tail().snapshot().unwrap().rows().unwrap());
-        let live_pooled = |s: &IndexerState| {
-            read(
-                &s.pooled
-                    .rows()
-                    .unwrap()
-                    .slice(&[0, 0], &[s.pooled_len() as i64, g.head_dim as i64])
+        let snap_v = |s: &IndexerState| read_f32(s.tail().snapshot().unwrap().rows().unwrap());
+        let live_p = |s: &IndexerState| {
+            let r = s.pooled.rows().unwrap();
+            read_f32(
+                &r.slice(&[0, 0], &[s.pooled_len() as i64, g.head_dim as i64])
                     .unwrap(),
             )
         };
-        let pooled_before = live_pooled(&st);
-        let meta_before = (st.len(), st.pooled_len(), st.held());
+        let (snap0, pool0, meta0) = (
+            snap_v(&st),
+            live_p(&st),
+            (st.len(), st.pooled_len(), st.held()),
+        );
         {
-            let _armed = crate::array::fail_native_call_at(
-                "hy_v4_flash indexer tail",
-                "test: ring tail eval failed",
-            );
+            let _a = crate::array::fail_native_call_at("hy_v4_flash indexer tail", "test: fail");
             assert!(ix.update(&w, &rows_of(&xs[18..22]), 18, &mut st).is_err());
         }
-        assert_eq!((st.len(), st.pooled_len(), st.held()), meta_before);
-        assert_eq!(
-            read(st.tail().snapshot().unwrap().rows().unwrap()),
-            snap_before
-        );
-        assert_eq!(live_pooled(&st), pooled_before);
+        assert_eq!((st.len(), st.pooled_len(), st.held()), meta0);
+        assert_eq!((snap_v(&st), live_p(&st)), (snap0, pool0));
         ix.update(&w, &rows_of(&xs[18..22]), 18, &mut st).unwrap();
         assert_eq!((st.len(), st.pooled_len()), (22, 5));
-    }
-
-    #[test]
-    fn indexer_score_decode_nax_large_contexts_flat_and_paged_match_reference() {
-        crate::models::hy_v4_flash::exact_f32();
-        let d = 128usize;
-        let index_rows = 8usize;
-
-        for (h, s, n_groups, start_g, seed) in [
-            (16usize, 1usize, 256usize, 0usize, 701u64),
-            (16, 2, 256, 7, 702),
-            (16, 4, 256, 13, 703),
-            (16, 1, 2048, 0, 704),
-            (16, 2, 2048, 9, 705),
-            (16, 4, 2048, 5, 706),
-            (16, 1, 7763, 3, 707),
-            (16, 1, 8192, 0, 708),
-            (16, 2, 8192, 11, 709),
-            (16, 4, 8192, 4, 710),
-            (8, 2, 256, 3, 711),
-        ] {
-            let mut rng = Rng(seed);
-            let q_vec = rng.vec(s * h * d, 1.5);
-            let w_vec = rng.vec(s * h, 0.2);
-            let k_f32_vec = rng.vec(n_groups * d, 1.5);
-
-            let q = arr(&q_vec, &[s, h, d]);
-            let w = arr(&w_vec, &[s, h]);
-            let keys_f16 = arr(&k_f32_vec, &[n_groups, d])
-                .astype(DType::Float16)
-                .unwrap();
-            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
-            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
-
-            let cap_g = start_g + n_groups + 17;
-            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-            let mut flat_bits = vec![0u16; cap_g * d];
-            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
-            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
-
-            let Some(got_flat_arr) =
-                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
-            else {
-                eprintln!("skipping indexer_score large context test (no GPU)");
-                return;
-            };
-            let got_flat = read(&got_flat_arr);
-            assert_eq!(got_flat.len(), want.len());
-            let mut max_diff = 0.0f32;
-            for (&g, &wv) in got_flat.iter().zip(&want) {
-                assert!(g.is_finite(), "non-finite flat H={h} S={s} N_g={n_groups}");
-                max_diff = max_diff.max((g - wv).abs());
-            }
-            assert!(
-                max_diff <= 1e-3,
-                "flat H={h} S={s} N_g={n_groups} start_g={start_g}: max_abs={max_diff:e} > 1e-3"
-            );
-
-            let n_pages = (start_g + n_groups).div_ceil(index_rows);
-            let n_blocks = n_pages + 9;
-            let pages_u32 = scattered_pages(n_pages, n_blocks);
-            let pages_arr = page_ids(&pages_u32).unwrap();
-            let paged_pool = pack_paged_keys(
-                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
-            );
-            let got_paged_arr =
-                try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
-                    .unwrap()
-                    .expect("paged indexer_score");
-            let got_paged = read(&got_paged_arr);
-            assert_eq!(
-                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                "paged vs flat mismatch H={h} S={s} N_g={n_groups}"
-            );
-
-            if s == 4 && n_groups == 2048 {
-                for row in 0..s {
-                    let qr = q
-                        .slice(&[row as i64, 0, 0], &[(row + 1) as i64, h as i64, d as i64])
-                        .unwrap();
-                    let wr = w
-                        .slice(&[row as i64, 0], &[(row + 1) as i64, h as i64])
-                        .unwrap();
-                    let one = read(
-                        &try_indexer_score(
-                            &qr,
-                            &wr,
-                            &paged_pool,
-                            Some(&pages_arr),
-                            n_groups,
-                            start_g,
-                        )
-                        .unwrap()
-                        .unwrap(),
-                    );
-                    let row_got = &got_paged[row * n_groups..(row + 1) * n_groups];
-                    assert_eq!(
-                        row_got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                        one.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                        "row {row} invariance N_g={n_groups}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn indexer_score_decode_bench_timing() {
-        let h = 16usize;
-        let d = 128usize;
-        let index_rows = 8usize;
-        let mode = if std::env::var("MLX_HY4_INDEXER_DECODE_NAX").as_deref() == Ok("0") {
-            "scalar"
-        } else {
-            "nax"
-        };
-        let iters = 20usize;
-        let batch_calls = 36usize;
-
-        for (s, n_groups, paged) in [
-            (1usize, 2048usize, true),
-            (1, 7763, true),
-            (2, 7763, true),
-            (4, 7763, true),
-            (1, 8192, false),
-            (4, 8192, false),
-        ] {
-            let mut rng = Rng(801 + (s * 17 + n_groups) as u64);
-            let q = arr(&rng.vec(s * h * d, 1.0), &[s, h, d]);
-            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
-            let keys_f16 = arr(&rng.vec(n_groups * d, 1.0), &[n_groups, d])
-                .astype(DType::Float16)
-                .unwrap();
-            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-            let (pool, pages) = if paged {
-                let n_pages = n_groups.div_ceil(index_rows);
-                let n_blocks = n_pages + 9;
-                let pages_u32 = scattered_pages(n_pages, n_blocks);
-                let pages_arr = page_ids(&pages_u32).unwrap();
-                let paged_pool =
-                    pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
-                paged_pool.eval();
-                pages_arr.eval();
-                (paged_pool, Some(pages_arr))
-            } else {
-                keys_f16.eval();
-                (keys_f16, None)
-            };
-            q.eval();
-            w.eval();
-
-            for _ in 0..4 {
-                let Some(o) =
-                    try_indexer_score(&q, &w, &pool, pages.as_ref(), n_groups, 0).unwrap()
-                else {
-                    return;
-                };
-                o.eval();
-            }
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let mut outs = Vec::with_capacity(batch_calls);
-                for _ in 0..batch_calls {
-                    outs.push(
-                        try_indexer_score(&q, &w, &pool, pages.as_ref(), n_groups, 0)
-                            .unwrap()
-                            .unwrap(),
-                    );
-                }
-                let refs: Vec<&MxArray> = outs.iter().collect();
-                crate::models::hy_v4_flash::stats::eval(&refs, "indexer bench").unwrap();
-            }
-            let us = t0.elapsed().as_secs_f64() * 1e6 / (iters * batch_calls) as f64;
-            eprintln!(
-                "[indexer_score_bench:{mode}] S={s} N_g={n_groups} paged={paged}: {us:.2} us/layer (12L={:.2} ms)",
-                us * 12.0 / 1000.0
-            );
-        }
-    }
-
-    #[test]
-    fn indexer_score_prefill_bn128_and_causal_skip_match_reference() {
-        crate::models::hy_v4_flash::exact_f32();
-        let h = 16usize;
-        let d = 128usize;
-        let index_rows = 8usize;
-
-        // Sweep BN_G=128 sub-tile boundaries (1..4 active 32-col sub-tiles) and S boundaries.
-        for (s, n_groups, start_g, seed) in [
-            (17usize, 1usize, 0usize, 901u64),
-            (19, 31, 0, 902),
-            (32, 32, 3, 903),
-            (63, 33, 0, 904),
-            (64, 64, 5, 905),
-            (65, 65, 0, 906),
-            (64, 96, 7, 907),
-            (64, 97, 0, 908),
-            (65, 127, 0, 909),
-            (64, 128, 4, 910),
-            (129, 129, 0, 911),
-            (128, 300, 9, 912),
-        ] {
-            let mut rng = Rng(seed);
-            let q = arr(&rng.vec(s * h * d, 1.5), &[s, h, d]);
-            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
-            let keys_f16 = arr(&rng.vec(n_groups * d, 1.5), &[n_groups, d])
-                .astype(DType::Float16)
-                .unwrap();
-            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
-            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
-
-            let cap_g = start_g + n_groups + 11;
-            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-            let mut flat_bits = vec![0u16; cap_g * d];
-            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
-            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
-
-            let Some(got_flat_arr) =
-                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
-            else {
-                eprintln!("skipping indexer_score BN_G=128 test (no GPU)");
-                return;
-            };
-            let got_flat = read(&got_flat_arr);
-            let mut max_diff = 0.0f32;
-            for (&g, &wv) in got_flat.iter().zip(&want) {
-                max_diff = max_diff.max((g - wv).abs());
-            }
-            assert!(
-                max_diff <= 5e-3,
-                "BN_G=128 flat S={s} N_g={n_groups} start_g={start_g}: max_diff={max_diff:e}"
-            );
-
-            let n_pages = (start_g + n_groups).div_ceil(index_rows);
-            let n_blocks = n_pages + 7;
-            let pages_u32 = scattered_pages(n_pages, n_blocks);
-            let pages_arr = page_ids(&pages_u32).unwrap();
-            let paged_pool = pack_paged_keys(
-                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
-            );
-            let got_paged = read(
-                &try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
-                    .unwrap()
-                    .unwrap(),
-            );
-            assert_eq!(
-                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                "BN_G=128 paged vs flat S={s} N_g={n_groups}"
-            );
-        }
-
-        // Causal g_tile skip: rows 0..192 have monotonically increasing visible_groups from 40..520
-        // over N_g=512 (skipping >50% of g tiles on early s_tiles and hitting mid-128 partial n_sub).
-        let (s, n_groups, n_top, kpool, kmax) = (192usize, 512usize, 16usize, 4usize, 68usize);
-        let mut rng = Rng(999);
-        let q = arr(&rng.vec(s * h * d, 1.5), &[s, h, d]);
-        let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
-        let keys_f16 = arr(&rng.vec(n_groups * d, 1.5), &[n_groups, d])
-            .astype(DType::Float16)
-            .unwrap();
-        let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-        let n_pages = n_groups.div_ceil(index_rows);
-        let n_blocks = n_pages + 7;
-        let pages_u32 = scattered_pages(n_pages, n_blocks);
-        let pages_arr = page_ids(&pages_u32).unwrap();
-        let paged_pool =
-            pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
-
-        let visible: Vec<i32> = (0..s)
-            .map(|r| (40 + r * 5 / 2).min(n_groups) as i32)
-            .collect();
-        let tail_starts: Vec<i32> = visible.iter().map(|&v| v * kpool as i32).collect();
-        let tail_lens: Vec<i32> = (0..s).map(|r| ((r % 4) + 1) as i32).collect();
-        let vis_arr = MxArray::from_int32(&visible, &[s as i64]).unwrap();
-        let ts_arr = MxArray::from_int32(&tail_starts, &[s as i64]).unwrap();
-        let tl_arr = MxArray::from_int32(&tail_lens, &[s as i64]).unwrap();
-
-        for (label, pool, pages) in [
-            ("flat", &keys_f16, None),
-            ("paged", &paged_pool, Some(&pages_arr)),
-        ] {
-            let full_sc = try_indexer_score(&q, &w, pool, pages, n_groups, 0)
-                .unwrap()
-                .unwrap();
-            let causal_sc =
-                try_indexer_score_causal(&q, &w, pool, pages, Some(&vis_arr), n_groups, 0)
-                    .unwrap()
-                    .unwrap();
-            let full_v = read(&full_sc);
-            let causal_v = read(&causal_sc);
-            for (r, &v) in visible.iter().enumerate() {
-                for g in 0..(v as usize) {
-                    assert_eq!(
-                        causal_v[r * n_groups + g].to_bits(),
-                        full_v[r * n_groups + g].to_bits(),
-                        "causal vs full mismatch ({label}) r={r} g={g} vis={v}"
-                    );
-                }
-            }
-            let full_cells = read_i32(
-                &try_indexer_topk_cells(
-                    &full_sc,
-                    &vis_arr,
-                    &ts_arr,
-                    &tl_arr,
-                    pages,
-                    n_top,
-                    kpool,
-                    kmax,
-                    BLOCK as usize,
-                )
-                .unwrap()
-                .unwrap(),
-            );
-            let causal_cells = read_i32(
-                &try_indexer_topk_cells(
-                    &causal_sc,
-                    &vis_arr,
-                    &ts_arr,
-                    &tl_arr,
-                    pages,
-                    n_top,
-                    kpool,
-                    kmax,
-                    BLOCK as usize,
-                )
-                .unwrap()
-                .unwrap(),
-            );
-            assert_eq!(causal_cells, full_cells, "topk cells ({label}) mismatch");
-
-            // Fallback `pick_groups` must also match identically despite skipped columns.
-            let full_pick = read_i32(&pick_groups(&full_sc, &visible, n_top).unwrap());
-            let causal_pick = read_i32(&pick_groups(&causal_sc, &visible, n_top).unwrap());
-            assert_eq!(causal_pick, full_pick, "pick_groups ({label}) mismatch");
-        }
-    }
-
-    #[test]
-    #[ignore = "GPU microbenchmark for indexer prefill BN_G tiling"]
-    fn indexer_score_prefill_bench_timing() {
-        let h = 16usize;
-        let d = 128usize;
-        let index_rows = 8usize;
-        let iters = 15usize;
-        for (label, s, n_groups, vis_start) in [
-            ("C0_exact4k_causal", 4096usize, 1024usize, 0usize),
-            ("C6_mid_causal", 4096, 2048, 1024),
-            ("C32_causal", 4096, 7763, 7763 - 1024),
-            ("C32_full", 4096, 7763, 7763),
-        ] {
-            let mut rng = Rng(951 + n_groups as u64);
-            let q = arr(&rng.vec(s * h * d, 1.0), &[s, h, d]);
-            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
-            let keys_f16 = arr(&rng.vec(n_groups * d, 1.0), &[n_groups, d])
-                .astype(DType::Float16)
-                .unwrap();
-            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
-            let n_pages = n_groups.div_ceil(index_rows);
-            let n_blocks = n_pages + 9;
-            let pages_u32 = scattered_pages(n_pages, n_blocks);
-            let pages_arr = page_ids(&pages_u32).unwrap();
-            let paged_pool =
-                pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
-            q.eval();
-            w.eval();
-            paged_pool.eval();
-            pages_arr.eval();
-
-            let vis_arr = if vis_start < n_groups {
-                let vis: Vec<i32> = (0..s)
-                    .map(|r| (vis_start + (r / 4) + 1).min(n_groups) as i32)
-                    .collect();
-                let a = MxArray::from_int32(&vis, &[s as i64]).unwrap();
-                a.eval();
-                Some(a)
-            } else {
-                None
-            };
-
-            for _ in 0..3 {
-                let o = try_indexer_score_causal(
-                    &q,
-                    &w,
-                    &paged_pool,
-                    Some(&pages_arr),
-                    vis_arr.as_ref(),
-                    n_groups,
-                    0,
-                )
-                .unwrap()
-                .unwrap();
-                o.eval();
-            }
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                let o = try_indexer_score_causal(
-                    &q,
-                    &w,
-                    &paged_pool,
-                    Some(&pages_arr),
-                    vis_arr.as_ref(),
-                    n_groups,
-                    0,
-                )
-                .unwrap()
-                .unwrap();
-                o.eval();
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-            eprintln!(
-                "[indexer_prefill_bench] {label} (S={s} N_g={n_groups}): {ms:.3} ms/L (12L={:.2} ms)",
-                ms * 12.0
-            );
-        }
     }
 }

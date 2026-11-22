@@ -1,31 +1,39 @@
-//! The stored states' disk tier: the identity text, chain and segment keys,
-//! a block's bytes from either source, the record codec, the turn keys,
-//! the lookup bounds and a block's trip through a temporary tier. CPU only
-//! unless marked.
+//! The stored states' disk tier: identity text, chain/segment keys, block
+//! codec, turn keys, lookup bounds, pool blobs, and disk round-trips.
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
-    ColdCacheBlock, ColdCacheFingerprint, ColdGroup, ColdLayerBlock, ColdObject, hash_tokens,
+    ColdCacheBlock, ColdCacheFingerprint, ColdCacheKey, ColdCacheManager, ColdGroup,
+    ColdLayerBlock, ColdObject, hash_tokens,
 };
 
+use super::cache::WINDOW_SLACK;
+use super::config::{Attn, HyV4FlashConfig};
+use super::indexer::{IndexerGeometry, PagedIndexerState, TokTail};
 use super::ladder::Kind;
+use super::owner::{CellLayer, OwnerCell};
 use super::paged::PageGeometry;
 use super::persist::{
     Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, chain, disk_plan, fingerprint,
     identity_text, segment_key, segments_at,
 };
-use super::persist_codec::{StateShape, block_layout, join_block, split_block};
+use super::persist_codec::{
+    StateShape, block_layout, decode_state, encode_state_into, join_block, split_block,
+};
 use super::persist_writer::Telemetry;
 use super::prefill::BLOCK_ROWS;
 use super::prefix_state::{
-    Key, PrefixState, States, WRITE_TAG, any_written, is_written, prompt_keys, resumes, turn_keys,
-    written_key,
+    Key, PrefixState, StateLayer, States, WRITE_TAG, any_written, is_written, prompt_keys, resumes,
+    turn_keys, written_key,
 };
 use super::sched::lookup_bounds;
+use super::test_support::{Temp, arr, tiny_cfg};
+use crate::array::{DType, MxArray};
 use crate::disk_tier::{CacheDisk, DiskTierOptions, PersistentIdentity, open_disk_tier};
+use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 const PAGE: PageGeometry = PageGeometry {
     layers: 12,
@@ -33,22 +41,6 @@ const PAGE: PageGeometry = PageGeometry {
     index_rows: 8,
     index_dim: 128,
 };
-
-struct Temp(PathBuf);
-
-impl Temp {
-    fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("hy4-persist-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn tokens(n: usize) -> Vec<u32> {
     (0..n).map(|i| 11 + (i % 251) as u32).collect()
@@ -62,14 +54,166 @@ fn bare(row: usize) -> PrefixState {
     }
 }
 
-/// Review-3 D4: the identity text binds the f16 index plane, the MTP
-/// switch and the model; a change to any line is a new namespace.
+struct TierRig {
+    disk: Disk,
+    manager: Arc<ColdCacheManager>,
+    fp: ColdCacheFingerprint,
+    telem: Arc<Telemetry>,
+}
+
+impl TierRig {
+    fn open(root: &Temp, persist: Option<(&str, &[u8])>, shape: &StateShape) -> Self {
+        let tier = match persist {
+            None => {
+                let opts = DiskTierOptions {
+                    temp_root: Some(root.path().to_path_buf()),
+                    ..DiskTierOptions::from_load(Some(&(1u64 << 30).to_string()), false, None)
+                        .unwrap()
+                };
+                open_disk_tier(&opts, || None, shape.span_bytes()).unwrap()
+            }
+            Some((ns, seed)) => {
+                let tmp = root.join("tmp");
+                std::fs::create_dir_all(&tmp).unwrap();
+                let opts = DiskTierOptions {
+                    cache_disk: CacheDisk::Bytes(2 << 30),
+                    persistent: true,
+                    cache_dir: Some(root.join("cache")),
+                    temp_root: Some(tmp),
+                };
+                let fp = ColdCacheFingerprint::from_components([seed]);
+                let id = PersistentIdentity {
+                    namespace: ns.into(),
+                    state: fp,
+                    kv: fp,
+                };
+                let t = open_disk_tier(&opts, || Some(id), shape.span_bytes()).unwrap();
+                assert!(t.persistent);
+                t
+            }
+        };
+        let (manager, fp) = (Arc::clone(&tier.manager), tier.state_fingerprint);
+        let telem = Arc::new(Telemetry::default());
+        let disk = Disk::open(tier, Arc::clone(&telem), shape.clone(), PAGE).unwrap();
+        Self {
+            disk,
+            manager,
+            fp,
+            telem,
+        }
+    }
+
+    fn offer_block(&self, key: ColdCacheKey, tok: &[u32], layers: Vec<ColdLayerBlock>) {
+        let blk = ColdCacheBlock {
+            key,
+            fingerprint: self.fp,
+            tokens: tok.to_vec(),
+            layout: block_layout(&PAGE),
+            layers,
+        };
+        let ddl = Instant::now() + Duration::from_secs(5);
+        assert!(
+            self.manager
+                .offer(ColdObject::Block(blk), ddl)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish(
+        &mut self,
+        states: &mut States<PrefixState>,
+        seq: SeqId,
+        tok: &[u32],
+        keys: &[Vec<u64>],
+        salt: u64,
+        state: PrefixState,
+        kind: Kind,
+    ) -> u64 {
+        let row = tok.len();
+        let hot = vec![0u64; row / BLOCK_ROWS];
+        self.disk.start(seq, tok, keys, &hot, salt);
+        let k = Key {
+            tokens: tok,
+            keys,
+            salt,
+        };
+        let id = states.publish(k, state, kind).unwrap().unwrap();
+        self.disk
+            .published(states.store(), seq, row, None, Some(id));
+        id
+    }
+
+    fn flush(&mut self, states: &mut States<PrefixState>, secs: u64) -> bool {
+        let ddl = Instant::now() + Duration::from_secs(secs);
+        self.disk
+            .flush_points(states.store_mut(), &mut NumberedBlocks, ddl)
+    }
+}
+
+fn make_cell_state(
+    cfg: &HyV4FlashConfig,
+    tok: &[u32],
+    chunks: &[usize],
+    patterned: bool,
+) -> (OwnerCell, PrefixState) {
+    let width = cfg.mla.kv_row();
+    let il = cfg
+        .trunk()
+        .iter()
+        .position(|l| l.attn == Attn::Indexed)
+        .unwrap();
+    let idx_g = IndexerGeometry::of(cfg, il).unwrap();
+    let mut cell = OwnerCell::new(cfg, None).unwrap();
+    let mut pos = 0usize;
+    for &chunk in chunks {
+        let end = pos + chunk;
+        let kv = if patterned {
+            let bits: Vec<u16> = (pos..end)
+                .flat_map(|p| {
+                    (0..width).map(move |c| 0x3C00 | (((p * 29 + c * 7) & 0x03FF) as u16))
+                })
+                .collect();
+            MxArray::from_float16(&bits, &[chunk as i64, width as i64]).unwrap()
+        } else {
+            MxArray::zeros(&[chunk as i64, width as i64], Some(DType::Float16)).unwrap()
+        };
+        for part in cell.layers_mut() {
+            match part {
+                CellLayer::Window(ring) => {
+                    ring.append(&kv, pos).unwrap();
+                }
+                CellLayer::Index(ix) => {
+                    let held = (idx_g.kpool - 1 + WINDOW_SLACK).min(end);
+                    let r = if patterned {
+                        let v: Vec<f32> = (0..held * idx_g.head_dim)
+                            .map(|i| (end + i) as f32 * 0.25)
+                            .collect();
+                        arr(&v, &[held, idx_g.head_dim])
+                    } else {
+                        MxArray::zeros(&[held as i64, idx_g.head_dim as i64], Some(DType::Float32))
+                            .unwrap()
+                    };
+                    let tail = TokTail::of_rows(&idx_g, Some(r), end).unwrap();
+                    *ix = PagedIndexerState::at(ix.layer(), tail);
+                }
+            }
+        }
+        cell.advance(&tok[pos..end]).unwrap();
+        pos = end;
+    }
+    assert_eq!(pos, tok.len());
+    let state = cell.state().unwrap().unwrap();
+    (cell, state)
+}
+
 #[test]
 fn identity_text_is_pinned() {
-    let shards = vec!["aa".to_string(), "bb".to_string()];
+    let shards = vec!["aa".into(), "bb".into()];
     let id = Identity {
         shards: &shards,
-        config: "cc".to_string(),
+        config: "cc".into(),
         page: PAGE,
         window: 512,
         mtp: true,
@@ -89,11 +233,8 @@ fn identity_text_is_pinned() {
     );
     let off = identity_text(&Identity { mtp: false, ..id });
     assert!(off.contains("mtp off\n"));
-    let (a, fa) = fingerprint(&on).unwrap();
-    let (b, fb) = fingerprint(&off).unwrap();
-    assert_eq!(a.len(), 32);
-    assert_ne!(a, b);
-    assert_ne!(fa, fb);
+    let ((a, fa), (b, fb)) = (fingerprint(&on).unwrap(), fingerprint(&off).unwrap());
+    assert!(a.len() == 32 && a != b && fa != fb);
 }
 
 #[test]
@@ -108,36 +249,30 @@ fn chain_keys_follow_tokens_keys_and_salt() {
     let mut other = keys.clone();
     other[2] = vec![7];
     let b = chain(ColdGroup::Kv, fp, &t, &other, 9, 4);
-    assert_eq!(a[..2], b[..2]);
-    assert_ne!(a[2], b[2]);
-    assert_ne!(a[3], b[3]);
+    assert!(a[..2] == b[..2] && a[2] != b[2] && a[3] != b[3]);
     assert_ne!(a[0], chain(ColdGroup::Kv, fp, &t, &keys, 10, 1)[0]);
     assert_ne!(a[0], chain(ColdGroup::HybridDraft, fp, &t, &keys, 9, 1)[0]);
 }
 
-/// Segment `k` hangs off the draft chain below `32(k + 1)` and the token
-/// at that row; a lineage without that token has no key for it.
 #[test]
 fn segment_keys_need_the_next_token() {
     let fp = ColdCacheFingerprint::from_components([b"hy4".as_slice()]);
     let t = tokens(3 * BLOCK_ROWS);
     let draft = chain(ColdGroup::HybridDraft, fp, &t, &[], 0, 3);
-    let k0 = segment_key(fp, &draft, &t, 0).unwrap();
-    let k1 = segment_key(fp, &draft, &t, 1).unwrap();
-    assert_ne!(k0, k1);
-    assert!(segment_key(fp, &draft, &t, 2).is_none());
+    let (k0, k1) = (
+        segment_key(fp, &draft, &t, 0).unwrap(),
+        segment_key(fp, &draft, &t, 1).unwrap(),
+    );
+    assert!(k0 != k1 && segment_key(fp, &draft, &t, 2).is_none());
     let mut u = t.clone();
     u[BLOCK_ROWS] += 1;
     assert_ne!(Some(k0), segment_key(fp, &draft, &u, 0));
-    assert_eq!(segments_at(0), 0);
-    assert_eq!(segments_at(BLOCK_ROWS), 0);
-    assert_eq!(segments_at(2 * BLOCK_ROWS), 1);
-    assert_eq!(segments_at(2 * BLOCK_ROWS + 1), 2);
+    assert_eq!(
+        [0, BLOCK_ROWS, 2 * BLOCK_ROWS, 2 * BLOCK_ROWS + 1].map(segments_at),
+        [0, 0, 1, 2]
+    );
 }
 
-/// The pool's two 288-column planes: plane `h` of a row is columns
-/// `[288h, 288h + 288)` of its latent row, the index plane rides with the
-/// values; join gives the token-major rows back.
 #[test]
 fn split_and_join_round_trip_one_block() {
     let half = PAGE.half as usize;
@@ -146,89 +281,70 @@ fn split_and_join_round_trip_one_block() {
         .map(|i| 40_000 + i as u16)
         .collect();
     let layer = split_block(&latent, &pooled, half);
-    let layout = block_layout(&PAGE);
-    assert_eq!(layer.keys.len(), layout.key_bytes_per_layer);
-    assert_eq!(layer.values.len(), layout.value_bytes_per_layer);
-    let first_key = u16::from_ne_bytes([layer.keys[0], layer.keys[1]]);
-    let row1_key = u16::from_ne_bytes([layer.keys[2 * half], layer.keys[2 * half + 1]]);
-    let first_value = u16::from_ne_bytes([layer.values[0], layer.values[1]]);
-    assert_eq!(first_key, latent[0]);
-    assert_eq!(row1_key, latent[2 * half]);
-    assert_eq!(first_value, latent[half]);
-    let (rows, keys) = join_block(&layer, &PAGE).unwrap();
-    assert_eq!(rows, latent);
-    assert_eq!(keys, pooled);
+    let l = block_layout(&PAGE);
+    assert_eq!(
+        (layer.keys.len(), layer.values.len()),
+        (l.key_bytes_per_layer, l.value_bytes_per_layer)
+    );
+    let u16_at = |b: &[u8], i: usize| u16::from_ne_bytes([b[i], b[i + 1]]);
+    assert_eq!(u16_at(&layer.keys, 0), latent[0]);
+    assert_eq!(u16_at(&layer.keys, 2 * half), latent[2 * half]);
+    assert_eq!(u16_at(&layer.values, 0), latent[half]);
+    assert_eq!(join_block(&layer, &PAGE).unwrap(), (latent, pooled));
 }
 
 #[test]
 fn block_layout_matches_the_page() {
     let l = block_layout(&PAGE);
-    assert_eq!(l.block_size, BLOCK_ROWS as u32);
-    assert_eq!(l.num_layers, 12);
-    assert_eq!(l.head_size, 288);
+    assert_eq!(
+        (l.block_size, l.num_layers, l.head_size),
+        (BLOCK_ROWS as u32, 12, 288)
+    );
     assert_eq!(l.cache_dtype, "Float16");
     assert_eq!(l.key_bytes_per_layer, BLOCK_ROWS * 288 * 2);
     assert_eq!(l.value_bytes_per_layer, BLOCK_ROWS * 288 * 2 + 8 * 128 * 2);
 }
 
-/// A cold prefill keeps its pass keys; a prefill from a row no cold
-/// prefill cuts at writes write-path keys from the block holding it, and
-/// a turn's end covers its decode rows with them.
 #[test]
 fn prompt_and_turn_keys() {
     let t = tokens(6 * BLOCK_ROWS + 3);
     let pass: Vec<Vec<u64>> = (0..4).map(|i| vec![100 + i]).collect();
     assert_eq!(prompt_keys(&t, 0, &[], &pass, false, 5), pass);
     let line = vec![vec![100], vec![101]];
-    let cold = prompt_keys(&t, 2 * BLOCK_ROWS, &line, &pass, true, 5);
-    assert_eq!(cold, pass);
+    assert_eq!(prompt_keys(&t, 2 * BLOCK_ROWS, &line, &pass, true, 5), pass);
     let warm = prompt_keys(&t, 2 * BLOCK_ROWS + 7, &line, &pass, false, 5);
-    assert_eq!(warm.len(), 6);
-    assert_eq!(warm[..2], line[..]);
-    assert!(warm[2..].iter().all(|k| is_written(k)));
+    assert!(warm.len() == 6 && warm[..2] == line[..] && warm[2..].iter().all(|k| is_written(k)));
     assert_eq!(warm[2], written_key(&t, 2, 5));
     assert_ne!(written_key(&t, 2, 5), written_key(&t, 2, 6));
     let end = turn_keys(&t, &pass, 6 * BLOCK_ROWS, 5);
-    assert_eq!(end.len(), 6);
-    assert_eq!(end[..4], pass[..]);
-    assert_eq!(end[4], written_key(&t, 4, 5));
-    assert_eq!(written_key(&t, 4, 5)[0], WRITE_TAG);
-    assert!(any_written(&end));
-    assert!(!any_written(&pass));
+    assert!(end.len() == 6 && end[..4] == pass[..] && end[4] == written_key(&t, 4, 5));
+    assert!(written_key(&t, 4, 5)[0] == WRITE_TAG && any_written(&end) && !any_written(&pass));
     let h = hash_tokens(&t[4 * BLOCK_ROWS..5 * BLOCK_ROWS], 5, &[4]);
     assert_eq!(end[4], vec![WRITE_TAG, h]);
 }
 
-/// A state under write-path keys resumes the lineage that wrote it; one
-/// under pass keys only a prompt with those keys.
 #[test]
 fn write_path_states_resume_their_lineage() {
     let t = tokens(4 * BLOCK_ROWS + 9);
     let pass: Vec<Vec<u64>> = (0..4).map(|i| vec![100 + i]).collect();
     let mut s = States::<PrefixState>::new();
+    let k_p = Key {
+        tokens: &t[..2 * BLOCK_ROWS],
+        keys: &pass[..2],
+        salt: 3,
+    };
     let id = s
-        .publish(
-            Key {
-                tokens: &t[..2 * BLOCK_ROWS],
-                keys: &pass[..2],
-                salt: 3,
-            },
-            bare(2 * BLOCK_ROWS),
-            Kind::Prompt,
-        )
+        .publish(k_p, bare(2 * BLOCK_ROWS), Kind::Prompt)
         .unwrap()
         .unwrap();
     let written = turn_keys(&t, &pass[..1], 3 * BLOCK_ROWS, 8);
+    let k_t = Key {
+        tokens: &t[..3 * BLOCK_ROWS],
+        keys: &written,
+        salt: 3,
+    };
     let tid = s
-        .publish(
-            Key {
-                tokens: &t[..3 * BLOCK_ROWS],
-                keys: &written,
-                salt: 3,
-            },
-            bare(3 * BLOCK_ROWS),
-            Kind::Turn,
-        )
+        .publish(k_t, bare(3 * BLOCK_ROWS), Kind::Turn)
         .unwrap()
         .unwrap();
     let prompt = Key {
@@ -237,25 +353,24 @@ fn write_path_states_resume_their_lineage() {
         salt: 3,
     };
     let e = s.store().get(id).unwrap();
-    assert!(resumes(e, prompt));
     let other: Vec<Vec<u64>> = (0..4).map(|i| vec![200 + i]).collect();
-    assert!(!resumes(
-        e,
-        Key {
-            keys: &other,
-            ..prompt
-        }
-    ));
-    assert!(!resumes(e, Key { salt: 4, ..prompt }));
-    assert!(resumes(s.store().get(tid).unwrap(), prompt));
+    assert!(
+        resumes(e, prompt)
+            && !resumes(
+                e,
+                Key {
+                    keys: &other,
+                    ..prompt
+                }
+            )
+    );
+    assert!(!resumes(e, Key { salt: 4, ..prompt }) && resumes(s.store().get(tid).unwrap(), prompt));
     assert_eq!(s.lookup(prompt, &|_| true), Some((tid, 3 * BLOCK_ROWS)));
     assert_eq!(s.lookup(prompt, &|_| false), None);
     assert_eq!(s.keys_of(tid).unwrap(), written);
     assert!(s.disk_only_above(prompt, 0).is_empty());
 }
 
-/// No stored state, no pool lookup: a KV-only cold prefix has nothing to
-/// resume the out-of-pool state with; with one, never past its row.
 #[test]
 fn a_kv_only_prefix_is_never_admitted_without_a_state() {
     assert_eq!(lookup_bounds(None, 100), (true, 99));
@@ -265,139 +380,89 @@ fn a_kv_only_prefix_is_never_admitted_without_a_state() {
 #[test]
 fn disk_plan_follows_the_options() {
     let (tier, on) = disk_plan("Hy4", Some("0"), None, None, None).unwrap();
-    assert!(!on);
-    assert_eq!(tier.cache_disk, CacheDisk::Off);
+    assert!(!on && tier.cache_disk == CacheDisk::Off);
     let (tier, on) = disk_plan("Hy4", None, None, None, Some("1")).unwrap();
-    assert!(on);
-    assert!(tier.persistent);
+    assert!(on && tier.persistent);
     let (tier, _) = disk_plan("Hy4", None, Some(false), None, Some("1")).unwrap();
     assert!(!tier.persistent);
-    assert!(disk_plan("Hy4", None, None, Some("/x".to_string()), None).is_err());
+    assert!(disk_plan("Hy4", None, None, Some("/x".into()), None).is_err());
 }
 
-/// A block copied out through the tier comes back with the same bytes,
-/// under the chain key of its lineage.
 #[test]
 fn a_block_round_trips_through_a_temporary_tier() {
-    let root = Temp::new();
-    let options = DiskTierOptions {
-        temp_root: Some(root.0.clone()),
-        ..DiskTierOptions::from_load(Some(&(1u64 << 30).to_string()), false, None).unwrap()
-    };
-    let shape = StateShape::of(&super::tests_model::tiny_cfg(), false).unwrap();
-    let tier = open_disk_tier(&options, || None, shape.span_bytes()).unwrap();
-    let manager = Arc::clone(&tier.manager);
-    let fp = tier.state_fingerprint;
-    let disk = Disk::open(tier, Arc::new(Telemetry::default()), shape, PAGE).unwrap();
+    let root = Temp::new("persist");
+    let shape = StateShape::of(&tiny_cfg(), false).unwrap();
+    let rig = TierRig::open(&root, None, &shape);
     let half = PAGE.half as usize;
     let t = tokens(MINIMUM_ROWS);
-    let key = chain(ColdGroup::Kv, fp, &t, &[], 0, 1)[0];
+    let key = chain(ColdGroup::Kv, rig.fp, &t, &[], 0, 1)[0];
     let layers: Vec<_> = (0..PAGE.layers as usize)
         .map(|l| {
             let latent: Vec<u16> = (0..BLOCK_ROWS * 2 * half).map(|i| (i + l) as u16).collect();
-            let pooled: Vec<u16> = vec![l as u16; (PAGE.index_rows * PAGE.index_dim) as usize];
+            let pooled = vec![l as u16; (PAGE.index_rows * PAGE.index_dim) as usize];
             split_block(&latent, &pooled, half)
         })
         .collect();
-    let block = ColdCacheBlock {
-        key,
-        fingerprint: fp,
-        tokens: t[..BLOCK_ROWS].to_vec(),
-        layout: block_layout(&PAGE),
-        layers: layers.clone(),
-    };
-    let left = manager
-        .offer(
-            ColdObject::Block(block),
-            Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap();
-    assert!(left.is_none());
-    assert!(manager.drain(Duration::from_secs(5)));
-    assert!(manager.contains(&key));
-    let back = manager.load(key, fp).unwrap();
+    rig.offer_block(key, &t[..BLOCK_ROWS], layers.clone());
+    assert!(rig.manager.drain(Duration::from_secs(5)) && rig.manager.contains(&key));
+    let back = rig.manager.load(key, rig.fp).unwrap();
     assert_eq!(back.layers.len(), layers.len());
     for (a, b) in back.layers.iter().zip(&layers) {
-        assert_eq!(a.keys, b.keys);
-        assert_eq!(a.values, b.values);
+        assert_eq!((&a.keys, &a.values), (&b.keys, &b.values));
     }
-    drop(disk);
 }
 
-/// A flat restore reads a chain back a run at a time, rows and pooled keys
-/// in chain order, and a block missing from the tier ends the runs as a
-/// failure. Needs Metal for the arrays.
 #[test]
 fn block_runs_read_a_chain_back_in_runs() {
-    let root = Temp::new();
-    let options = DiskTierOptions {
-        temp_root: Some(root.0.clone()),
-        ..DiskTierOptions::from_load(Some(&(1u64 << 30).to_string()), false, None).unwrap()
-    };
-    let shape = StateShape::of(&super::tests_model::tiny_cfg(), false).unwrap();
-    let tier = open_disk_tier(&options, || None, shape.span_bytes()).unwrap();
-    let manager = Arc::clone(&tier.manager);
-    let fp = tier.state_fingerprint;
-    let disk = Disk::open(tier, Arc::new(Telemetry::default()), shape, PAGE).unwrap();
-    let half = PAGE.half as usize;
-    let pooled_len = (PAGE.index_rows * PAGE.index_dim) as usize;
+    let root = Temp::new("persist");
+    let shape = StateShape::of(&tiny_cfg(), false).unwrap();
+    let rig = TierRig::open(&root, None, &shape);
+    let (half, pooled_len) = (
+        PAGE.half as usize,
+        (PAGE.index_rows * PAGE.index_dim) as usize,
+    );
     let n = FLAT_RUN + 1;
     let t = tokens(n * BLOCK_ROWS);
-    let keys = chain(ColdGroup::Kv, fp, &t, &[], 0, n);
+    let keys = chain(ColdGroup::Kv, rig.fp, &t, &[], 0, n);
     let bit = |b: usize, l: usize, i: usize| 0x3C00 | ((b * 131 + l * 17 + i) % 1024) as u16;
     for (b, &key) in keys.iter().enumerate() {
         let layers = (0..PAGE.layers as usize)
             .map(|l| {
-                let latent: Vec<u16> = (0..BLOCK_ROWS * 2 * half).map(|i| bit(b, l, i)).collect();
-                let pooled: Vec<u16> = (0..pooled_len).map(|i| bit(b, l, i + 7)).collect();
-                split_block(&latent, &pooled, half)
+                let lat: Vec<u16> = (0..BLOCK_ROWS * 2 * half).map(|i| bit(b, l, i)).collect();
+                let pool: Vec<u16> = (0..pooled_len).map(|i| bit(b, l, i + 7)).collect();
+                split_block(&lat, &pool, half)
             })
             .collect();
-        let block = ColdCacheBlock {
-            key,
-            fingerprint: fp,
-            tokens: t[b * BLOCK_ROWS..(b + 1) * BLOCK_ROWS].to_vec(),
-            layout: block_layout(&PAGE),
-            layers,
-        };
-        let left = manager
-            .offer(
-                ColdObject::Block(block),
-                Instant::now() + Duration::from_secs(5),
-            )
-            .unwrap();
-        assert!(left.is_none());
+        rig.offer_block(key, &t[b * BLOCK_ROWS..(b + 1) * BLOCK_ROWS], layers);
     }
-    assert!(manager.drain(Duration::from_secs(5)));
-    let mut runs = disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
+    assert!(rig.manager.drain(Duration::from_secs(5)));
+    let mut runs = rig.disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
     let read: Vec<_> = runs.by_ref().collect();
-    assert!(!runs.failed());
-    assert_eq!(read.len(), 2);
+    assert!(!runs.failed() && read.len() == 2);
     let mut first = 0;
     for run in &read {
         assert_eq!(run.len(), PAGE.layers as usize);
         let blocks = run[0].0.shape_at(0).unwrap() as usize / BLOCK_ROWS;
         for (l, (rows, pooled)) in run.iter().enumerate() {
             assert_eq!(rows.shape_at(1).unwrap(), 2 * half as i64);
-            let rows = rows.to_uint16_native().unwrap();
-            let pooled = pooled.to_uint16_native().unwrap();
+            let (rows, pooled) = (
+                rows.to_uint16_native().unwrap(),
+                pooled.to_uint16_native().unwrap(),
+            );
             for b in 0..blocks {
-                let at = b * BLOCK_ROWS * 2 * half;
-                let want: Vec<u16> = (0..BLOCK_ROWS * 2 * half)
-                    .map(|i| bit(first + b, l, i))
-                    .collect();
+                let row_len = BLOCK_ROWS * 2 * half;
+                let want_r: Vec<u16> = (0..row_len).map(|i| bit(first + b, l, i)).collect();
                 assert_eq!(
-                    rows[at..at + want.len()],
-                    want[..],
-                    "block {} layer {l}",
+                    rows[b * row_len..(b + 1) * row_len],
+                    want_r[..],
+                    "b={} l={l}",
                     first + b
                 );
-                let at = b * pooled_len;
-                let want: Vec<u16> = (0..pooled_len).map(|i| bit(first + b, l, i + 7)).collect();
+                let want_p: Vec<u16> = (0..pooled_len).map(|i| bit(first + b, l, i + 7)).collect();
                 assert_eq!(
-                    pooled[at..at + pooled_len],
-                    want[..],
-                    "block {} layer {l}",
+                    pooled[b * pooled_len..(b + 1) * pooled_len],
+                    want_p[..],
+                    "b={} l={l}",
                     first + b
                 );
             }
@@ -405,27 +470,24 @@ fn block_runs_read_a_chain_back_in_runs() {
         first += blocks;
     }
     assert_eq!(first, n);
-    assert!(manager.remove(&keys[FLAT_RUN]));
-    let mut runs = disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
+    assert!(rig.manager.remove(&keys[FLAT_RUN]));
+    let mut runs = rig.disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
     assert_eq!(runs.by_ref().count(), 1);
     assert!(runs.failed());
-    drop(disk);
 }
 
 /// The pool's page of a block holds the bytes `split_block` makes of the
-/// same latent rows and pooled keys: the flat source and the pool source
-/// write one object. Needs Metal (skips without it).
+/// same latent rows and pooled keys. Needs Metal (skips without it).
 #[test]
 fn pool_blobs_are_split_block_of_the_rows() {
     use mlx_paged_attn::metal::MetalDtype;
     use mlx_paged_attn::{LayerKVPool, PageLayout, PagedAttentionConfig};
 
-    use crate::array::MxArray;
-
-    const BLOCKS: u32 = 4;
-    let half = PAGE.half as usize;
-    let dk = PAGE.index_dim as usize;
-    let per = PAGE.index_rows as usize;
+    let (half, dk, per) = (
+        PAGE.half as usize,
+        PAGE.index_dim as usize,
+        PAGE.index_rows as usize,
+    );
     let n = 2 * BLOCK_ROWS;
     let config = PagedAttentionConfig {
         block_size: BLOCK_ROWS as u32,
@@ -442,19 +504,15 @@ fn pool_blobs_are_split_block_of_the_rows() {
         index_rows: PAGE.index_rows,
         index_dimension: PAGE.index_dim,
     };
-    let pool = match LayerKVPool::new_with_index_dtype(
+    let Ok(pool) = LayerKVPool::new_with_index_dtype(
         config,
-        BLOCKS,
-        BLOCKS,
+        4,
+        4,
         MetalDtype::Float16,
         layout,
         MetalDtype::Float16,
-    ) {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("skipping the Hy4 pool blob test: {error}");
-            return;
-        }
+    ) else {
+        return;
     };
     let bit = |t: usize, c: usize| 0x3C00 | ((t * 37 + c * 11) % 1024) as u16;
     let latent: Vec<u16> = (0..n)
@@ -464,7 +522,7 @@ fn pool_blobs_are_split_block_of_the_rows() {
     let pooled: Vec<u16> = (0..groups * dk)
         .map(|i| 0x3800 | ((i * 5) % 1024) as u16)
         .collect();
-    let plane = |lo: usize| -> MxArray {
+    let plane = |lo: usize| {
         let bits: Vec<u16> = (0..n)
             .flat_map(|t| (lo..lo + half).map(move |c| bit(t, c)))
             .collect();
@@ -478,11 +536,10 @@ fn pool_blobs_are_split_block_of_the_rows() {
     let slots = MxArray::from_int64(&slots, &[n as i64]).unwrap();
     let k_pool = MxArray::from_handle(pool.key_cache_array_raw(0).unwrap(), "k pool").unwrap();
     let v_pool = MxArray::from_handle(pool.value_cache_array_raw(0).unwrap(), "v pool").unwrap();
-    let unit = MxArray::from_float32(&[1.0], &[1]).unwrap();
+    let unit = arr(&[1.0], &[1]);
     let mut out = [std::ptr::null_mut(); 4];
     let [ko, vo, kso, vso] = &mut out;
-    // SAFETY: every input is a live MLX array handle; each output is written
-    // only on success and is then owned here.
+    // SAFETY: live MLX array handles; outputs written on success and owned here.
     let ok = unsafe {
         mlx_sys::mlx_paged_kv_write_forward(
             k_pool.as_raw_ptr(),
@@ -505,20 +562,19 @@ fn pool_blobs_are_split_block_of_the_rows() {
     };
     assert!(ok);
     let written = out.map(|raw| MxArray::from_handle(raw, "store output").unwrap());
-    let index_slots: Vec<i32> = (0..groups)
+    let islots: Vec<i32> = (0..groups)
         .map(|g| (table[g / per] * per + g % per) as i32)
         .collect();
-    let index_slots = MxArray::from_int32(&index_slots, &[groups as i64]).unwrap();
+    let islots = MxArray::from_int32(&islots, &[groups as i64]).unwrap();
     let rows = MxArray::from_float16(&pooled, &[groups as i64, dk as i64]).unwrap();
     let index = MxArray::from_handle(pool.index_array_raw(0).unwrap(), "index plane").unwrap();
     let mut stored = std::ptr::null_mut();
-    // SAFETY: every input is a live MLX array handle; `stored` is written
-    // only on success and is then owned here.
+    // SAFETY: live MLX array handles; `stored` written on success and owned here.
     let ok = unsafe {
         mlx_sys::mlx_paged_index_store(
             index.as_raw_ptr(),
             rows.as_raw_ptr(),
-            index_slots.as_raw_ptr(),
+            islots.as_raw_ptr(),
             &mut stored,
         )
     };
@@ -536,16 +592,13 @@ fn pool_blobs_are_split_block_of_the_rows() {
             &pooled[b * per * dk..(b + 1) * per * dk],
             half,
         );
-        assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].0, want.keys, "block {b}: K plane");
         assert_eq!(
-            blobs[0].1, want.values,
-            "block {b}: V plane and index plane"
+            (blobs.len(), &blobs[0].0, &blobs[0].1),
+            (1, &want.keys, &want.values)
         );
     }
 }
 
-/// Every block a step asks for, made from its index.
 struct NumberedBlocks;
 
 impl NumberedBlocks {
@@ -553,11 +606,11 @@ impl NumberedBlocks {
         let half = PAGE.half as usize;
         (0..PAGE.layers as usize)
             .map(|l| {
-                let latent: Vec<u16> = (0..BLOCK_ROWS * 2 * half)
+                let lat: Vec<u16> = (0..BLOCK_ROWS * 2 * half)
                     .map(|r| ((i * 31 + l * 7 + r) % 4096) as u16)
                     .collect();
-                let pooled = vec![(i + l) as u16; (PAGE.index_rows * PAGE.index_dim) as usize];
-                split_block(&latent, &pooled, half)
+                let pool = vec![(i + l) as u16; (PAGE.index_rows * PAGE.index_dim) as usize];
+                split_block(&lat, &pool, half)
             })
             .collect()
     }
@@ -567,122 +620,54 @@ impl Blocks for NumberedBlocks {
     fn begin(&mut self, _: &[u32]) -> bool {
         true
     }
-
     fn block(&mut self, i: usize, _: u64) -> Option<Vec<ColdLayerBlock>> {
         Some(Self::layers(i))
     }
 }
 
-/// A clean stop on a persistent tier copies a chain longer than one host
-/// queue window a window at a time: every block is on disk when it
-/// reports success.
+/// Clean stop on a persistent tier copies chains past one host queue window.
 #[test]
 fn a_clean_stop_copies_every_block_past_the_queue_window() {
-    let root = Temp::new();
-    std::fs::create_dir_all(root.0.join("tmp")).unwrap();
-    let options = DiskTierOptions {
-        cache_disk: CacheDisk::Bytes(2 << 30),
-        persistent: true,
-        cache_dir: Some(root.0.join("cache")),
-        temp_root: Some(root.0.join("tmp")),
-    };
-    let shape = StateShape::of(&super::tests_model::tiny_cfg(), false).unwrap();
-    let identity = || {
-        let fp = ColdCacheFingerprint::from_components([b"hy4-flush-window".as_slice()]);
-        Some(PersistentIdentity {
-            namespace: "0123456789abcdef0123456789abcdef".to_string(),
-            state: fp,
-            kv: fp,
-        })
-    };
-    let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
-    assert!(tier.persistent);
-    let manager = Arc::clone(&tier.manager);
-    let fp = tier.state_fingerprint;
-    let mut disk = Disk::open(tier, Arc::new(Telemetry::default()), shape, PAGE).unwrap();
+    let root = Temp::new("persist");
+    let shape = StateShape::of(&tiny_cfg(), false).unwrap();
+    let mut rig = TierRig::open(
+        &root,
+        Some((
+            "0123456789abcdef0123456789abcdef",
+            b"hy4-flush-window".as_slice(),
+        )),
+        &shape,
+    );
     let block: u64 = NumberedBlocks::layers(0)
         .iter()
         .map(|l| (l.keys.len() + l.values.len()) as u64)
         .sum();
     let n = (QUEUE_BYTES / block) as usize + 3;
-    let t = tokens(n * BLOCK_ROWS);
-    let keys = vec![Vec::new(); n];
-    let hot = vec![0u64; n];
+    let (t, keys, hot) = (tokens(n * BLOCK_ROWS), vec![Vec::new(); n], vec![0u64; n]);
     let mut states = States::<PrefixState>::with_cap(4);
-    disk.start(1, &t, &keys, &hot, 0);
-    disk.published(states.store_mut(), 1, n * BLOCK_ROWS, None, None);
-    let flushed = disk.flush_points(
-        states.store_mut(),
-        &mut NumberedBlocks,
-        Instant::now() + Duration::from_secs(120),
+    rig.disk.start(1, &t, &keys, &hot, 0);
+    rig.disk
+        .published(states.store_mut(), 1, n * BLOCK_ROWS, None, None);
+    let flushed = rig.flush(&mut states, 120);
+    let cold = chain(ColdGroup::Kv, rig.fp, &t, &keys, 0, n);
+    let missing = cold.iter().filter(|k| !rig.manager.contains(k)).count();
+    assert!(
+        missing == 0 && flushed,
+        "{missing} of {n} blocks missing, flushed={flushed}"
     );
-    let cold = chain(ColdGroup::Kv, fp, &t, &keys, 0, n);
-    let missing = cold.iter().filter(|k| !manager.contains(k)).count();
-    assert_eq!(missing, 0, "{missing} of {n} blocks not on disk");
-    assert!(flushed);
-    drop(disk);
 }
 
-/// Circular `WindowRing` wrapped across many multiples of `cap` encodes into
-/// `HY4S` linear format and decodes back into an identical live `OwnerCell`.
+/// Circular `WindowRing` wrapped across many multiples of `cap` round-trips via `HY4S`.
 #[test]
 fn hy4s_state_round_trips_wrapped_circular_window_ring() {
-    use super::cache::WINDOW_SLACK;
-    use super::indexer::{IndexerGeometry, PagedIndexerState, TokTail};
-    use super::owner::{CellLayer, OwnerCell};
-    use super::persist_codec::{decode_state, encode_state_into};
-    use super::prefix_state::StateLayer;
-    use crate::array::MxArray;
-
-    let cfg = super::tests_model::tiny_cfg();
+    let cfg = tiny_cfg();
     let shape = StateShape::of(&cfg, false).unwrap();
-    let width = cfg.mla.kv_row();
-    let idx_layer = cfg
-        .trunk()
-        .iter()
-        .position(|l| l.attn == super::config::Attn::Indexed)
-        .unwrap();
-    let idx_g = IndexerGeometry::of(&cfg, idx_layer).unwrap();
-
-    let mut cell = OwnerCell::new(&cfg, None).unwrap();
     let total = 2 * BLOCK_ROWS;
     let tok: Vec<u32> = (0..total as u32).map(|i| 7 + i).collect();
+    let (cell, state) = make_cell_state(&cfg, &tok, &[19, 1, 3, 2, 1, 6, 32], true);
 
-    // Grow in mixed chunks so every sliding ring wraps multiple times (cap = 8 + 3 = 11).
-    let mut pos = 0usize;
-    for chunk in [19usize, 1, 3, 2, 1, 6, 32] {
-        let bits: Vec<u16> = (pos..pos + chunk)
-            .flat_map(|p| (0..width).map(move |c| 0x3C00 | (((p * 29 + c * 7) & 0x03FF) as u16)))
-            .collect();
-        let kv = MxArray::from_float16(&bits, &[chunk as i64, width as i64]).unwrap();
-        let end = pos + chunk;
-        for part in cell.layers_mut() {
-            match part {
-                CellLayer::Window(ring) => {
-                    ring.append(&kv, pos).unwrap();
-                }
-                CellLayer::Index(ix) => {
-                    let held = (idx_g.kpool - 1 + WINDOW_SLACK).min(end);
-                    let tail_vals: Vec<f32> = (0..held * idx_g.head_dim)
-                        .map(|i| (end + i) as f32 * 0.25)
-                        .collect();
-                    let r =
-                        MxArray::from_float32(&tail_vals, &[held as i64, idx_g.head_dim as i64])
-                            .unwrap();
-                    let tail = TokTail::of_rows(&idx_g, Some(r), end).unwrap();
-                    *ix = PagedIndexerState::at(ix.layer(), tail);
-                }
-            }
-        }
-        cell.advance(&tok[pos..end]).unwrap();
-        pos = end;
-    }
-    assert_eq!(pos, total);
-
-    let state = cell.state().unwrap().unwrap();
     let mut buf = vec![0u8; shape.span_bytes() as usize];
-    assert!(encode_state_into(&state, &mut buf).unwrap());
-    assert_eq!(&buf[..4], b"HY4S");
+    assert!(encode_state_into(&state, &mut buf).unwrap() && &buf[..4] == b"HY4S");
 
     let decoded = decode_state(&buf, &shape, Vec::new()).unwrap();
     assert_eq!(decoded.row, total);
@@ -708,232 +693,128 @@ fn hy4s_state_round_trips_wrapped_circular_window_ring() {
                 .unwrap()
                 .to_vec();
             assert_eq!(a_bits, b_bits, "layer {l} window bits");
-            if let StateLayer::Window(sw) = &decoded.layers[l] {
-                assert_eq!(
-                    sw.rows().unwrap().to_uint16_native().unwrap().to_vec(),
-                    a_bits
-                );
-            } else {
-                panic!("expected StateLayer::Window at layer {l}");
-            }
+            let StateLayer::Window(sw) = &decoded.layers[l] else {
+                panic!("expected Window at {l}");
+            };
+            assert_eq!(
+                sw.rows().unwrap().to_uint16_native().unwrap().to_vec(),
+                a_bits
+            );
         }
     }
 }
 
-/// Fast (< `DELAY`) decode turns publish a deeper `Kind::Turn` state before
-/// the prompt-end replay state's `DELAY` expires; the prompt-end state must
-/// not be marked superseded so cross-restart restore of the same prompt still
-/// finds it, while linear `Turn -> Turn` superseding continues to work.
+/// Fast (< `DELAY`) decode turns must not supersede the prompt-end replay state,
+/// while linear `Turn -> Turn` superseding continues to work.
 #[test]
 fn fast_decode_turn_does_not_supersede_prompt_end_state() {
-    use super::ladder::Kind;
-    use super::prefix_state::resumes;
-
-    let root = Temp::new();
-    std::fs::create_dir_all(root.0.join("tmp")).unwrap();
-    let options = DiskTierOptions {
-        cache_disk: CacheDisk::Bytes(2 << 30),
-        persistent: true,
-        cache_dir: Some(root.0.join("cache")),
-        temp_root: Some(root.0.join("tmp")),
-    };
-    let cfg = super::tests_model::tiny_cfg();
+    let root = Temp::new("persist");
+    let cfg = tiny_cfg();
     let shape = StateShape::of(&cfg, false).unwrap();
-    let identity = || {
-        let fp = ColdCacheFingerprint::from_components([b"hy4-fast-turn-restore".as_slice()]);
-        Some(PersistentIdentity {
-            namespace: "fedcba9876543210fedcba9876543210".to_string(),
-            state: fp,
-            kv: fp,
-        })
-    };
+    let pid = Some((
+        "fedcba9876543210fedcba9876543210",
+        b"hy4-fast-turn-restore".as_slice(),
+    ));
 
-    let prompt_row = MINIMUM_ROWS; // 2048 (64 blocks)
-    let prompt_len = prompt_row + 33;
-    let turn1_row = prompt_row + 256; // 2304 (72 blocks)
-    let turn2_row = turn1_row + 256; // 2560 (80 blocks)
-    let full_tokens = tokens(turn2_row + 16);
-    let prompt_tokens = &full_tokens[..prompt_len];
+    let (prompt_row, prompt_len) = (MINIMUM_ROWS, MINIMUM_ROWS + 33);
+    let (turn1_row, turn2_row) = (prompt_row + 256, prompt_row + 512);
+    let full = tokens(turn2_row + 16);
     let pass: Vec<Vec<u64>> = (0..prompt_row / BLOCK_ROWS)
-        .map(|b| vec![0x5000_0000u64 + b as u64])
+        .map(|b| vec![0x5000_0000 + b as u64])
         .collect();
-    let t1_keys = turn_keys(&full_tokens, &pass, turn1_row, 111);
-    let t2_keys = turn_keys(&full_tokens, &t1_keys, turn2_row, 222);
+    let t1_keys = turn_keys(&full, &pass, turn1_row, 111);
+    let t2_keys = turn_keys(&full, &t1_keys, turn2_row, 222);
+    let mk = |row: usize| make_cell_state(&cfg, &full[..row], &[row], false).1;
 
-    let make_state = |row: usize| -> PrefixState {
-        let mut cell = super::owner::OwnerCell::new(&cfg, None).unwrap();
-        let width = cfg.mla.kv_row();
-        let idx_layer = cfg
-            .trunk()
-            .iter()
-            .position(|l| l.attn == super::config::Attn::Indexed)
-            .unwrap();
-        let idx_g = super::indexer::IndexerGeometry::of(&cfg, idx_layer).unwrap();
-        let kv = crate::array::MxArray::zeros(
-            &[row as i64, width as i64],
-            Some(crate::array::DType::Float16),
-        )
-        .unwrap();
-        for part in cell.layers_mut() {
-            match part {
-                super::owner::CellLayer::Window(ring) => {
-                    ring.append(&kv, 0).unwrap();
-                }
-                super::owner::CellLayer::Index(ix) => {
-                    let held = (idx_g.kpool - 1 + super::cache::WINDOW_SLACK).min(row);
-                    let r = crate::array::MxArray::zeros(
-                        &[held as i64, idx_g.head_dim as i64],
-                        Some(crate::array::DType::Float32),
-                    )
-                    .unwrap();
-                    let tail = super::indexer::TokTail::of_rows(&idx_g, Some(r), row).unwrap();
-                    *ix = super::indexer::PagedIndexerState::at(ix.layer(), tail);
-                }
-            }
-        }
-        cell.advance(&full_tokens[..row]).unwrap();
-        cell.state().unwrap().unwrap()
-    };
-
-    // Session 1: publish prompt-end state at 2048, then immediately (< DELAY)
-    // publish Turn 1 at 2304, then flush on clean close.
+    // Session 1: publish prompt-end state at 2048, then fast Turn 1 at 2304, then flush.
     {
-        let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
-        let telem = Arc::new(Telemetry::default());
-        let mut disk = Disk::open(tier, Arc::clone(&telem), shape.clone(), PAGE).unwrap();
-        let mut states = States::<PrefixState>::with_cap(8);
-
-        let p_hot = vec![0u64; prompt_row / BLOCK_ROWS];
-        disk.start(1, &full_tokens[..prompt_row], &pass, &p_hot, 0);
-        let p_id = states
-            .publish(
-                Key {
-                    tokens: &full_tokens[..prompt_row],
-                    keys: &pass,
-                    salt: 0,
-                },
-                make_state(prompt_row),
-                Kind::Prompt,
-            )
-            .unwrap()
-            .unwrap();
-        disk.published(states.store(), 1, prompt_row, None, Some(p_id));
-
-        // Fast decode finishes immediately (< DELAY) and publishes Turn 1.
-        let t1_hot = vec![0u64; turn1_row / BLOCK_ROWS];
-        disk.start(1, &full_tokens[..turn1_row], &t1_keys, &t1_hot, 0);
-        let t1_id = states
-            .publish(
-                Key {
-                    tokens: &full_tokens[..turn1_row],
-                    keys: &t1_keys,
-                    salt: 0,
-                },
-                make_state(turn1_row),
-                Kind::Turn,
-            )
-            .unwrap()
-            .unwrap();
-        disk.published(states.store(), 1, turn1_row, None, Some(t1_id));
-        assert!(
-            states.store().superseded(p_id),
-            "raw store.superseded(p_id) must be true so the regression exercises our fix"
-        );
-
-        assert!(disk.flush_points(
-            states.store_mut(),
-            &mut NumberedBlocks,
-            Instant::now() + Duration::from_secs(30),
-        ));
-        assert_eq!(
-            telem.unneeded.load(std::sync::atomic::Ordering::Relaxed),
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(8);
+        let p_id = rig.publish(
+            &mut st,
+            1,
+            &full[..prompt_row],
+            &pass,
             0,
-            "prompt-end state must not be superseded by fast Turn 1 state"
+            mk(prompt_row),
+            Kind::Prompt,
+        );
+        let t1_id = rig.publish(
+            &mut st,
+            1,
+            &full[..turn1_row],
+            &t1_keys,
+            0,
+            mk(turn1_row),
+            Kind::Turn,
         );
         assert!(
-            states
-                .store()
-                .get(p_id)
-                .and_then(|e| e.disk())
-                .is_some_and(|d| d.landed),
-            "prompt-end state at {prompt_row} must land on disk"
+            st.store().superseded(p_id),
+            "raw store.superseded(p_id) must be true"
         );
-        assert!(
-            states
-                .store()
-                .get(t1_id)
-                .and_then(|e| e.disk())
-                .is_some_and(|d| d.landed),
-            "turn state at {turn1_row} must land on disk"
+        assert!(rig.flush(&mut st, 30));
+        assert_eq!(
+            rig.telem.unneeded.load(Ordering::Relaxed),
+            0,
+            "prompt-end must not be superseded"
         );
+        for (id, label) in [(p_id, "prompt-end"), (t1_id, "turn")] {
+            assert!(
+                st.store()
+                    .get(id)
+                    .and_then(|e| e.disk())
+                    .is_some_and(|d| d.landed),
+                "{label}"
+            );
+        }
     }
 
-    // Session 2 (cross-restart): adopt from disk and verify repeating the
-    // original prompt of length `prompt_len` finds row `prompt_row`.
+    // Session 2: adopt from disk, verify repeated prompt finds `prompt_row`, and Turn1->Turn2 supersedes.
     {
-        let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
-        let telem = Arc::new(Telemetry::default());
-        let mut disk = Disk::open(tier, Arc::clone(&telem), shape.clone(), PAGE).unwrap();
-        let mut states = States::<PrefixState>::with_cap(8);
-        disk.adopt(states.store_mut());
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(8);
+        rig.disk.adopt(st.store_mut());
 
-        let prompt_key = Key {
-            tokens: prompt_tokens,
+        let pk = Key {
+            tokens: &full[..prompt_len],
             keys: &pass,
             salt: 0,
         };
-        let found: Vec<usize> = states
+        let found: Vec<usize> = st
             .store()
             .entries()
-            .filter(|e| resumes(e, prompt_key))
+            .filter(|e| resumes(e, pk))
             .map(|e| e.depth())
             .collect();
         assert_eq!(
             found,
             vec![prompt_row],
-            "restarted store must find prompt-end state {prompt_row} for repeated prompt"
+            "restarted store must find prompt-end state"
         );
 
-        // Verify Turn 1 -> Turn 2 superseding still works when both are `Turn` states.
-        let t1_hot = vec![0u64; turn1_row / BLOCK_ROWS];
-        disk.start(2, &full_tokens[..turn1_row], &t1_keys, &t1_hot, 7);
-        let t1_id = states
-            .publish(
-                Key {
-                    tokens: &full_tokens[..turn1_row],
-                    keys: &t1_keys,
-                    salt: 7,
-                },
-                make_state(turn1_row),
-                Kind::Turn,
-            )
-            .unwrap()
-            .unwrap();
-        disk.published(states.store(), 2, turn1_row, None, Some(t1_id));
-        let t2_hot = vec![0u64; turn2_row / BLOCK_ROWS];
-        disk.start(2, &full_tokens[..turn2_row], &t2_keys, &t2_hot, 7);
-        let t2_id = states
-            .publish(
-                Key {
-                    tokens: &full_tokens[..turn2_row],
-                    keys: &t2_keys,
-                    salt: 7,
-                },
-                make_state(turn2_row),
-                Kind::Turn,
-            )
-            .unwrap()
-            .unwrap();
-        disk.published(states.store(), 2, turn2_row, None, Some(t2_id));
-        assert!(disk.flush_points(
-            states.store_mut(),
-            &mut NumberedBlocks,
-            Instant::now() + Duration::from_secs(30),
-        ));
+        rig.publish(
+            &mut st,
+            2,
+            &full[..turn1_row],
+            &t1_keys,
+            7,
+            mk(turn1_row),
+            Kind::Turn,
+        );
+        rig.publish(
+            &mut st,
+            2,
+            &full[..turn2_row],
+            &t2_keys,
+            7,
+            mk(turn2_row),
+            Kind::Turn,
+        );
+        assert!(rig.flush(&mut st, 30));
         assert_eq!(
-            telem.unneeded.load(std::sync::atomic::Ordering::Relaxed),
+            rig.telem.unneeded.load(Ordering::Relaxed),
             1,
-            "linear Turn 1 should still be superseded by Turn 2"
+            "linear Turn 1 should supersede"
         );
     }
 }

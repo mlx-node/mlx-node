@@ -38,6 +38,8 @@ pub mod store;
 pub mod weights;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests_batch;
 #[cfg(test)]
 mod tests_chat;
