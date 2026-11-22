@@ -3868,7 +3868,7 @@ export declare function estimateQwen35ContextWindow(
 /**
  * The load-free estimate behind `/v1/models`: the plan a load of
  * `model_path` with `options` would make, from the tensors' descriptors
- * (no payload read, no pack sweep, no asset written). `None` when the Metal
+ * (no payload read, no pack sweep, no asset written). `None` when the device
  * working set is unreadable.
  */
 export declare function estimateQwen4ExpContextWindow(
