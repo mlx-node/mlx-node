@@ -101,7 +101,7 @@ function NavItem({ route, badge, rail }: { route: AppRoute; badge: Badge | null;
   );
 }
 
-/** Nine nav items in three sections, then the live status footer. */
+/** Nav items in three sections, then the live status footer. */
 export function Sidebar({ status, rail, settingsOpen, onSettingsOpenChange }: SidebarProps): ReactElement {
   // Labels fade only after a mode switch, never on the first paint.
   const [shownRail, setShownRail] = useState(rail);

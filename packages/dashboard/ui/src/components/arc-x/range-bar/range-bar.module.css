@@ -1,0 +1,117 @@
+.root {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.medianText {
+  font-size: var(--text-lg);
+  font-weight: 500;
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.unit {
+  margin-left: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.intervalText {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.trackWrap {
+  position: relative;
+  height: 1.5rem;
+  display: flex;
+  align-items: center;
+}
+
+.track {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+}
+
+.band {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--c, var(--model-1)) 28%, transparent);
+  border: 1px solid color-mix(in oklab, var(--c, var(--model-1)) 65%, transparent);
+}
+
+.medianPin {
+  position: absolute;
+  top: 50%;
+  width: 4px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--c, var(--model-1));
+  transform: translate(-50%, -50%);
+}
+
+.meanDot {
+  position: absolute;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  border: 2px solid var(--foreground);
+  transform: translate(-50%, -50%);
+}
+
+.bounds {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+.quantTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.quantTable th,
+.quantTable td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+}
+
+.quantTable th {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.quantTable td:last-child,
+.quantTable th:last-child {
+  text-align: right;
+}

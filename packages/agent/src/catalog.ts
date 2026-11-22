@@ -58,6 +58,8 @@ export interface CatalogEntry {
   assetsRepo?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
+  /** Which product surface this catalog entry belongs to (default `'chat'`). */
+  category?: 'chat' | 'systemone';
   /** Optional companion, downloaded separately and never offered as a chat model. */
   draft?: { label: string; hfRepo: string; sizeGb: number };
   /** One line for the wizard. */
@@ -181,6 +183,36 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'Hybrid Mamba-2 + MoE, native MTP, 1M context',
     hidden: true,
   },
+  {
+    label: 'Clairic Flash (9B)',
+    hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic-flash',
+    sizeGb: 7.6,
+    category: 'systemone',
+    description: 'Fast 9B extraction, vision, PDF & forecasting (UD-Q4_K_XL)',
+  },
+  {
+    label: 'Clairic (27B)',
+    hfRepo: 'Brooooooklyn/Clairic-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic',
+    sizeGb: 18.9,
+    category: 'systemone',
+    description: 'High-accuracy 27B extraction, tables & PDFs (UD-Q4_K_XL)',
+  },
 ];
 
 /**
@@ -294,9 +326,18 @@ export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, tota
   return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
 }
 
-/** Catalog entries the wizard offers: not hidden, and loadable in `totalMemBytes` of RAM. */
+/** Catalog entries the wizard offers: visible chat entries loadable in `totalMemBytes` of RAM. */
 export function visibleCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
-  return MODEL_CATALOG.filter((entry) => !entry.hidden && catalogFitsMemory(entry, totalMemBytes));
+  return MODEL_CATALOG.filter(
+    (entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat' && catalogFitsMemory(entry, totalMemBytes),
+  );
+}
+
+/** Visible System One (Clairic / CLEF) catalog entries loadable in `totalMemBytes` of RAM. */
+export function visibleSystemOneCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
+  return MODEL_CATALOG.filter(
+    (entry) => !entry.hidden && entry.category === 'systemone' && catalogFitsMemory(entry, totalMemBytes),
+  );
 }
 
 /**

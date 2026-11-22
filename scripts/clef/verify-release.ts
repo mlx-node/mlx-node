@@ -32,7 +32,7 @@ try {
   await host.loadModel(basename(path));
   const loadMs = performance.now() - start;
   const model = host.server.registry.decisions.get(basename(path));
-  assert.ok(model, 'Host must discover and load the decision family');
+  assert.ok(model && 'decideRaw' in model, 'Host must discover and load the CLEF decision family');
   assert.equal(host.server.registry.listSessionRegistries().length, 0);
   const results: { id: string; milliseconds: number; result: ClefResult; expectedPassed: boolean }[] = [];
   for (const test of cases) {

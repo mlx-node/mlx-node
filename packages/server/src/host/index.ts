@@ -478,7 +478,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       allModels.map((m) => m.name),
     );
   }
-  const boundEntry = requestedEntry ?? models.find((model) => model.modelType !== 'clef') ?? allModels[0];
+  const boundEntry =
+    requestedEntry ?? models.find((model) => familyDataFor(model.modelType)?.kind !== 'decision') ?? allModels[0];
 
   // `undefined` means "you pick"; `0` means "the kernel picks and I will read
   // it back". Only the former needs the up-front probe.
@@ -589,7 +590,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         {
           model: entry.name,
           modelType: String(entry.modelType),
-          capability: 'chat',
+          capability: familyDataFor(entry.modelType)?.kind === 'decision' ? 'decision' : 'chat',
           path: resolvedPath,
           warmupOf: readWarmupReport,
           residencyOf: readResidency,

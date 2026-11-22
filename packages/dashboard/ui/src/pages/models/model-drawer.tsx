@@ -1,6 +1,6 @@
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, ScanSearch } from 'lucide-react';
 import { useLayoutEffect, useRef, useState, type ReactElement, type ReactNode, type RefObject } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 import type { ChartPoint, ChartSeries } from '../../components/arc-x/chart/types';
 import { CompactField } from '../../components/arc-x/compact-field/compact-field';
@@ -42,6 +42,7 @@ import { axisNumber, failPhaseText, outcomeText } from '../../lib/metrics-view';
 import { modelColor } from '../../lib/model-colors';
 import { usageKeys, type ModelUsage } from '../../lib/model-usage';
 import type { AlignedRange } from '../../lib/range';
+import { formatModelFamily, isSystemOneModelType } from '../../lib/system-one';
 import {
   LOW_SAMPLE_TAIL_N,
   type CatalogItem,
@@ -102,7 +103,9 @@ export function ModelDrawer(props: ModelDrawerProps): ReactElement {
       <DrawerContent
         side="right"
         title={shown === null ? 'Model' : truncateMiddle(shown.name, 40)}
-        description={shown === null ? undefined : `${shown.modelType} · ${shown.quant ?? 'full precision'}`}
+        description={
+          shown === null ? undefined : `${formatModelFamily(shown.modelType)} · ${shown.quant ?? 'full precision'}`
+        }
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           if (props.deletedRef.current === true) {
@@ -225,10 +228,12 @@ export const TURN_COLUMNS: DataColumn<TurnRow>[] = [
 
 function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): ReactElement {
   const { model, range } = props;
+  const navigate = useNavigate();
   const keys = usageKeys(model);
   const usage = props.usage.get(model.name);
   const [chosen, setChosen] = useState<string | null>(null);
   const usageId = chosen !== null && keys.includes(chosen) ? chosen : usageKeyOf(model, usage);
+  const systemOne = isSystemOneModelType(model.modelType);
   const scope = `from=${String(range.from)}&to=${String(range.to)}&model=${encodeURIComponent(usageId)}`;
   const summary = useJson<MetricsSummary>(`/metrics/summary?${scope}`, { live: true });
   const held = useHeld(summary);
@@ -322,13 +327,31 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
 
   return (
     <div className="grid min-w-0 gap-5">
-      {state.resident !== undefined || state.loading || update ? (
-        <div className="flex flex-wrap items-center gap-1.5">
-          <LiveBadge state={state} />
-          {update ? (
-            <Badge tone="warning" size="sm">
-              Update
-            </Badge>
+      {state.resident !== undefined || state.loading || update || systemOne ? (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <LiveBadge state={state} />
+            {systemOne ? (
+              <Badge color="violet" size="sm">
+                System One
+              </Badge>
+            ) : null}
+            {update ? (
+              <Badge tone="warning" size="sm">
+                Update
+              </Badge>
+            ) : null}
+          </div>
+          {systemOne ? (
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              onClick={() => void navigate(`/system-one?model=${encodeURIComponent(usageId)}`)}
+            >
+              <ScanSearch size={14} strokeWidth={1.75} aria-hidden="true" />
+              Open in System One
+            </Button>
           ) : null}
         </div>
       ) : null}

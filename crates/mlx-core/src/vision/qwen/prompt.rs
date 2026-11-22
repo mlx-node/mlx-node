@@ -34,6 +34,20 @@ pub(crate) fn expanded_image_prompt_len(
     tokens: &[u32],
     per_image_token_counts: &[usize],
 ) -> Result<usize> {
+    expanded_image_prompt_len_with_token_id(tokens, per_image_token_counts, IMAGE_TOKEN_ID)
+}
+
+/// Like [`expanded_image_prompt_len`], using a caller-specified `image_token_id`.
+pub(crate) fn expanded_image_prompt_len_with_token_id(
+    tokens: &[u32],
+    per_image_token_counts: &[usize],
+    image_token_id: i32,
+) -> Result<usize> {
+    let image_token = u32::try_from(image_token_id).map_err(|_| {
+        Error::from_reason(format!(
+            "image_token_id must be non-negative, got {image_token_id}"
+        ))
+    })?;
     let total = per_image_token_counts
         .iter()
         .try_fold(0usize, |sum, count| {
@@ -44,10 +58,7 @@ pub(crate) fn expanded_image_prompt_len(
         return Ok(tokens.len());
     }
 
-    let existing = tokens
-        .iter()
-        .filter(|&&token| token == IMAGE_TOKEN_ID as u32)
-        .count();
+    let existing = tokens.iter().filter(|&&token| token == image_token).count();
     if existing == per_image_token_counts.len() {
         return tokens
             .len()
@@ -108,18 +119,30 @@ pub(crate) fn inject_image_placeholders(
     tokens: &[u32],
     per_image_token_counts: &[usize],
 ) -> Result<Vec<u32>> {
-    let expanded_len = expanded_image_prompt_len(tokens, per_image_token_counts)?;
-    let existing = tokens
-        .iter()
-        .filter(|&&t| t == IMAGE_TOKEN_ID as u32)
-        .count();
+    inject_image_placeholders_with_token_id(tokens, per_image_token_counts, IMAGE_TOKEN_ID)
+}
+
+/// Like [`inject_image_placeholders`], using a caller-specified `image_token_id`.
+pub(crate) fn inject_image_placeholders_with_token_id(
+    tokens: &[u32],
+    per_image_token_counts: &[usize],
+    image_token_id: i32,
+) -> Result<Vec<u32>> {
+    let image_token = u32::try_from(image_token_id).map_err(|_| {
+        Error::from_reason(format!(
+            "image_token_id must be non-negative, got {image_token_id}"
+        ))
+    })?;
+    let expanded_len =
+        expanded_image_prompt_len_with_token_id(tokens, per_image_token_counts, image_token_id)?;
+    let existing = tokens.iter().filter(|&&t| t == image_token).count();
     if per_image_token_counts.iter().all(|&n| n == 0) || existing != per_image_token_counts.len() {
         return Ok(tokens.to_vec());
     }
     let mut expanded = Vec::with_capacity(expanded_len);
     let mut counts = per_image_token_counts.iter();
     for &token in tokens {
-        if token == IMAGE_TOKEN_ID as u32 {
+        if token == image_token {
             // The length validator established one placeholder per image.
             let count = *counts.next().ok_or_else(|| {
                 Error::from_reason("image placeholder has no matching image token count")
@@ -534,3 +557,36 @@ pub(crate) async fn expanded_prompt_token_count(
 mod image_placeholder_tests;
 #[cfg(test)]
 mod rope_index_tests;
+
+#[cfg(test)]
+mod custom_token_id_tests {
+    use super::{expanded_image_prompt_len_with_token_id, inject_image_placeholders_with_token_id};
+
+    #[test]
+    fn custom_image_token_id_expands_placeholders() {
+        let custom_id = 151655;
+        let tokens = vec![1u32, 2, custom_id as u32, 3, custom_id as u32, 4];
+        let counts = vec![3usize, 2usize];
+        assert_eq!(
+            expanded_image_prompt_len_with_token_id(&tokens, &counts, custom_id).unwrap(),
+            9
+        );
+        let expanded =
+            inject_image_placeholders_with_token_id(&tokens, &counts, custom_id).unwrap();
+        assert_eq!(
+            expanded,
+            vec![
+                1,
+                2,
+                custom_id as u32,
+                custom_id as u32,
+                custom_id as u32,
+                3,
+                custom_id as u32,
+                custom_id as u32,
+                4,
+            ]
+        );
+        assert!(expanded_image_prompt_len_with_token_id(&tokens, &counts, -1).is_err());
+    }
+}

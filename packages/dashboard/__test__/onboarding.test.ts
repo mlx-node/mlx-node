@@ -26,7 +26,7 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   localAssetsRepo: null,
   localAssetsRevision: null,
 }));
-const visible = items.filter((item) => !item.hidden);
+const visible = items.filter((item) => !item.hidden && item.category !== 'systemone');
 let page: RenderedPage | undefined;
 let dispose: (() => void) | undefined;
 

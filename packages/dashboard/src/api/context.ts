@@ -22,6 +22,7 @@ import type { CodingAgentsService } from '../coding-agents.js';
 import type { DashboardDb } from '../db/open.js';
 import type { DownloadManager } from '../download.js';
 import type { LiveWatcher } from '../live.js';
+import type { SystemOneService } from '../systemone.js';
 import { ApiError } from './errors.js';
 
 export interface IngestPassResult {
@@ -80,6 +81,8 @@ export interface MainApiContext extends ApiPaths {
   chat?: ChatService;
   /** Web search providers: selection, keys, skill folders. */
   providers?: ProvidersService;
+  /** System One (Clairic + CLEF) async job runner and history. */
+  systemone?: SystemOneService;
 }
 
 /**

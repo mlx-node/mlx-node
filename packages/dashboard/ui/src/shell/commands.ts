@@ -94,8 +94,11 @@ export function globalCommands(deps: GlobalCommandDeps): AppCommand[] {
     id: `go:${route.id}`,
     label: route.label,
     group: 'Go to',
-    keywords: route.section === undefined || route.section === 'top' ? [] : [route.section],
-    shortcut: `⌘ ${index + 1}`,
+    keywords: [
+      ...(route.section === undefined || route.section === 'top' ? [] : [route.section]),
+      ...(route.id === 'system-one' ? ['clairic', 'clef', 'extract', 'forecast', 'decide'] : []),
+    ],
+    shortcut: index < 9 ? `⌘ ${index + 1}` : undefined,
     icon: route.icon === undefined ? undefined : glyph(route.icon),
     run: () => deps.navigate(route.path),
   }));

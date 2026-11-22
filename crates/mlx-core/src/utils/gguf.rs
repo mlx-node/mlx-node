@@ -2290,7 +2290,7 @@ fn muse_glimmer_dflash_name_to_hf(name: &str) -> Option<String> {
     Some(result)
 }
 
-pub(super) fn gguf_name_to_hf_for_metadata(
+pub(crate) fn gguf_name_to_hf_for_metadata(
     name: &str,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Option<String> {
@@ -8144,17 +8144,115 @@ impl NativeGgufFamily {
     }
 }
 
+/// True when `metadata` describes a Qwen3-VL / Qwen3.5 vision projector GGUF
+/// (`mmproj-BF16.gguf` exported by `convert_hf_to_gguf.py --mmproj`).
+fn is_qwen35_mmproj_gguf(
+    metadata: &HashMap<String, GgufMetaValue>,
+    backbone_embedding_length: Option<u64>,
+) -> bool {
+    if metadata
+        .get("general.architecture")
+        .and_then(|value| value.as_str())
+        != Some("clip")
+        || !matches!(
+            metadata.get("clip.has_vision_encoder"),
+            Some(GgufMetaValue::Bool(true))
+        )
+        || metadata
+            .get("clip.projector_type")
+            .and_then(|value| value.as_str())
+            != Some("qwen3vl_merger")
+    {
+        return false;
+    }
+    if let Some(expected_dim) = backbone_embedding_length {
+        match metadata
+            .get("clip.vision.projection_dim")
+            .and_then(|value| value.as_u64())
+        {
+            Some(proj_dim) if proj_dim == expected_dim => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Opportunistically pick a Qwen3.5 `mmproj-*.gguf` sitting beside `input`.
+/// Prism-Hadamard sources remain text-only, mismatched projector widths are
+/// ignored, ambiguous ties at the same dtype tier fail closed, and plain
+/// text-only directories degrade cleanly to `None`.
+fn qwen35_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
+    let main_gguf = parse_gguf(input)?;
+    if prism_hadamard_config(&main_gguf)?.is_some() {
+        return Ok(None);
+    }
+    let backbone_embedding_length = main_gguf
+        .metadata
+        .get("qwen35.embedding_length")
+        .and_then(|value| value.as_u64());
+    let parent = input.parent().unwrap_or(Path::new("."));
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_file()
+            && name.to_ascii_lowercase().starts_with("mmproj-")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+            && is_qwen35_mmproj_gguf(&parse_gguf(&path)?.metadata, backbone_embedding_length)
+        {
+            candidates.push(path.canonicalize()?);
+        }
+    }
+    candidates.sort();
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => {
+            let best = candidates
+                .iter()
+                .map(|path| mmproj_dtype_tier(path))
+                .min()
+                .unwrap_or(u8::MAX);
+            let mut narrowed: Vec<PathBuf> = candidates
+                .into_iter()
+                .filter(|path| mmproj_dtype_tier(path) == best)
+                .collect();
+            if narrowed.len() > 1 {
+                let names: Vec<String> = narrowed
+                    .iter()
+                    .map(|p| {
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                return Err(Error::from_reason(format!(
+                    "Ambiguous Qwen3.5 mmproj companions beside '{}' (multiple projectors at the same dtype tier: {})",
+                    input.display(),
+                    names.join(", ")
+                )));
+            }
+            Ok(narrowed.pop())
+        }
+    }
+}
+
 /// Family checks that run before any cache work: the main GGUF's architecture,
 /// required sibling assets, and the companion pick (Gemma4 media projector,
-/// Muse-Glimmer DFlash draft). Returns the canonical main parts: every part
-/// of a split qwen35 / qwen35moe GGUF, one file otherwise.
+/// Muse-Glimmer DFlash draft, Qwen3.5 mmproj). Returns the canonical main parts:
+/// every part of a split qwen35 / qwen35moe GGUF, one file otherwise.
 pub(crate) fn native_gguf_preflight(
     input: &Path,
     family: NativeGgufFamily,
 ) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     use super::gguf_source::{merge_split_headers, resolve_main_parts};
     match family {
-        NativeGgufFamily::Qwen35 => Ok((resolve_main_parts(input)?, None)),
+        NativeGgufFamily::Qwen35 => {
+            let parts = resolve_main_parts(input)?;
+            let mmproj = qwen35_native_mmproj(&parts[0])?;
+            Ok((parts, mmproj))
+        }
         NativeGgufFamily::Qwen35Moe => {
             let parts = resolve_main_parts(input)?;
             let headers = parts.iter().map(parse_gguf).collect::<Result<Vec<_>>>()?;

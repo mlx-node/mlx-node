@@ -133,15 +133,16 @@ const staged = stageApp({
   roots: RUNTIME_ROOTS,
   autoUpdates: sign,
 });
-// The CLI adds keyring's NAPI binary. Like mlx-core, its upstream LC_ID_DYLIB
-// contains the builder's home directory. Rewrite only the staged copy, before
-// packager/codesign, and retain the binding needed by CLI credential commands.
-const keyringBinary = 'keyring.darwin-arm64.node';
-run('install_name_tool', [
-  '-id',
-  `@rpath/${keyringBinary}`,
-  join(STAGE_APP, 'node_modules', '@napi-rs', 'keyring-darwin-arm64', keyringBinary),
-]);
+// Upstream NAPI-RS binaries (@napi-rs/keyring for CLI credentials, @napi-rs/canvas
+// for Clairic PDF rasterization) bake the builder's `/Users/.../target/...` path into
+// LC_ID_DYLIB, which fails `verify-bundle.ts` step [3/5]. Rewrite only the staged
+// copies before packager/codesign.
+for (const [pkg, binary] of [
+  ['keyring-darwin-arm64', 'keyring.darwin-arm64.node'],
+  ['canvas-darwin-arm64', 'skia.darwin-arm64.node'],
+] as const) {
+  run('install_name_tool', ['-id', `@rpath/${binary}`, join(STAGE_APP, 'node_modules', '@napi-rs', pkg, binary)]);
+}
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);

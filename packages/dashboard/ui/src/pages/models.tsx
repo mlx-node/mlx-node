@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 
 import { StatGroup, StatTile } from '../components/arc-x/stat-tile/stat-tile';
 import { SwapText } from '../components/arc-x/swap-text/swap-text';
@@ -154,7 +154,10 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   const focused = focus === null ? undefined : localModels.find((model) => model.name === focus);
   const host = models.data?.host;
   const catalogItems = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
-  const present = catalogItems.filter((item) => item.present).length;
+  const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
+  const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
+  const present = chatCatalogItems.filter((item) => item.present).length;
+  const systemOnePresent = systemOneCatalogItems.filter((item) => item.present).length;
   const activeCount = Object.keys(downloads.active).length;
 
   const setFocus = (name: string | null): void => {
@@ -341,7 +344,7 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
             <span className="flex flex-wrap items-center justify-end gap-2">
               {catalog.data !== undefined ? (
                 <span className="text-body text-secondary tabular-nums">
-                  {`${formatCount(present)} of ${formatCount(catalogItems.length)} installed`}
+                  {`${formatCount(present)} of ${formatCount(chatCatalogItems.length)} installed`}
                 </span>
               ) : null}
               <Button
@@ -379,14 +382,14 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
                 ))}
               </CatalogGrid>
             )
-          ) : catalogItems.length === 0 ? (
+          ) : chatCatalogItems.length === 0 ? (
             <EmptyState
               title="Nothing to recommend yet"
               description="New models appear here when they are published."
             />
           ) : (
             <CatalogGrid>
-              {catalogItems.map((item) => (
+              {chatCatalogItems.map((item) => (
                 <CatalogCardEntry
                   key={item.hfRepo}
                   item={item}
@@ -403,6 +406,42 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           )}
         </PageSection>
       </div>
+
+      {systemOneCatalogItems.length > 0 ? (
+        <div id="system-one-models" className="min-w-0">
+          <PageSection
+            title="System One models"
+            description="Clairic & CLEF checkpoints for structured extraction, forecasting, and calibrated decisions."
+            actions={
+              <span className="flex flex-wrap items-center justify-end gap-3">
+                <span className="text-body text-secondary tabular-nums">
+                  {`${formatCount(systemOnePresent)} of ${formatCount(systemOneCatalogItems.length)} installed`}
+                </span>
+                <Link className="link text-body" to="/system-one">
+                  Open System One
+                </Link>
+              </span>
+            }
+          >
+            <CatalogGrid>
+              {systemOneCatalogItems.map((item) => (
+                <CatalogCardEntry
+                  key={item.hfRepo}
+                  item={item}
+                  downloads={downloads}
+                  host={host}
+                  detailsTo={
+                    localModels.some((model) => model.name === item.slug)
+                      ? `/models?focus=${encodeURIComponent(item.slug)}`
+                      : undefined
+                  }
+                  openTo={item.present ? `/system-one?model=${encodeURIComponent(item.slug)}` : undefined}
+                />
+              ))}
+            </CatalogGrid>
+          </PageSection>
+        </div>
+      ) : null}
 
       <ModelDrawer
         model={focused ?? null}
@@ -424,6 +463,7 @@ function CatalogCardEntry(props: {
   downloads: ReturnType<typeof useModelDownloads>;
   host: ModelsResponse['host'] | undefined;
   detailsTo: string | undefined;
+  openTo?: string | undefined;
 }): ReactElement {
   const { item, downloads } = props;
   const download = downloads.downloadProps(item);
@@ -435,7 +475,14 @@ function CatalogCardEntry(props: {
   const busy = download.job !== undefined || draft?.job !== undefined;
   return (
     <div className="min-w-0" data-downloading={busy ? '' : undefined}>
-      <CatalogCard {...download} item={item} draftDownload={draft} host={props.host} detailsTo={props.detailsTo} />
+      <CatalogCard
+        {...download}
+        item={item}
+        draftDownload={draft}
+        host={props.host}
+        detailsTo={props.detailsTo}
+        openTo={props.openTo}
+      />
     </div>
   );
 }

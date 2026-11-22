@@ -73,6 +73,34 @@ export declare class ChatStreamHandle {
   progress(): ChatStreamProgress;
 }
 
+/** Cooperative cancellation token for an in-flight Clairic extraction request. */
+export declare class ClairicCancellation {
+  constructor();
+  cancel(): void;
+}
+
+/** Native Clairic structured-extraction model sharing Qwen3.5's dedicated model thread. */
+export declare class ClairicModel {
+  /**
+   * Load a Clairic checkpoint directory or `.gguf` file (`clair_head_config.json`,
+   * `clair_head.safetensors`, `tokenizer.json`, and Qwen3.5-VL backbone weights).
+   */
+  static load(modelPath: string): Promise<ClairicModel>;
+  /**
+   * Execute a structured Clairic extraction request given raw JSON (preserving key order
+   * and numeric spelling) and optional pre-rendered PDF pages.
+   */
+  extractJson(
+    request: string,
+    renderedPdfPages?: Array<RenderedPdfPage> | undefined | null,
+    cancellation?: ClairicCancellation | undefined | null,
+  ): Promise<string>;
+  /** Public model identifier (`"clairic-flash"` or `"clairic-27b"`). */
+  get modelId(): string;
+  /** Maximum input prompt context length in tokens (`65_273`). */
+  get maxLength(): number;
+}
+
 export declare class ClefCancellation {
   constructor();
   cancel(): void;
@@ -6641,6 +6669,15 @@ export interface RecResult {
  * assets leased for the process lifetime. Unleasing an unleased path is a no-op.
  */
 export declare function releaseNativeGgufLease(dir: string): void;
+
+/** Pre-rendered RGB PDF page supplied from the host PDF renderer. */
+export interface RenderedPdfPage {
+  rgb: Buffer;
+  width: number;
+  height: number;
+  documentIndex: number;
+  pageIndex: number;
+}
 
 /**
  * Reset MLX's peak-memory counter to the current active level.

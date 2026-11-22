@@ -25,6 +25,7 @@ import type { ChatHostEvent, ConversationEvent } from '../chat/types.js';
 import type { DownloadEvent } from '../download.js';
 import type { LiveEvent } from '../live.js';
 import type { ApiCall } from '../runtime.js';
+import type { SystemOneJobSnapshot } from '../systemone.js';
 import type { RpcPort } from './port.js';
 import { isRpcReply, type ChatScope, type RpcRequest } from './protocol.js';
 
@@ -57,6 +58,8 @@ export interface RpcClient {
   watchLive(listener: (event: LiveEvent) => void): () => void;
   /** Open a Chat stream (host state, or one conversation); returns the unsubscribe. */
   watchChat(scope: ChatScope, listener: (event: ChatHostEvent | ConversationEvent) => void): () => void;
+  /** Subscribe to a System One job's status/result updates; returns the unsubscribe. */
+  watchSystemOne(jobId: string, listener: (event: SystemOneJobSnapshot) => void): () => void;
   /**
    * Stop new work and subscriptions, then drain in-flight calls to an
    * acknowledged cancellation or real result before closing the port.
@@ -82,6 +85,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
   const listeners = new Map<number, (event: DownloadEvent) => void>();
   const liveListeners = new Map<number, (event: LiveEvent) => void>();
   const chatListeners = new Map<number, (event: ChatHostEvent | ConversationEvent) => void>();
+  const systemOneListeners = new Map<number, (event: SystemOneJobSnapshot) => void>();
   let nextId = 1;
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
   let down: string | null = null;
@@ -121,6 +125,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
     listeners.clear();
     liveListeners.clear();
     chatListeners.clear();
+    systemOneListeners.clear();
     for (const entry of waiting) {
       clearTimeout(entry.timer);
       entry.settle(failure('E_UNAVAILABLE', `Dashboard runtime is unavailable: ${down}`));
@@ -144,6 +149,10 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       }
       if (data.kind === 'chat') {
         chatListeners.get(data.id)?.(data.event);
+        return;
+      }
+      if (data.kind === 'systemone') {
+        systemOneListeners.get(data.id)?.(data.event);
         return;
       }
       const entry = pending.get(data.id);
@@ -271,6 +280,10 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       return open(chatListeners, listener, (id) => ({ kind: 'chat', id, ...scope }));
     },
 
+    watchSystemOne(jobId: string, listener: (event: SystemOneJobSnapshot) => void): () => void {
+      return open(systemOneListeners, listener, (id) => ({ kind: 'systemone', id, jobId }));
+    },
+
     close(): void {
       if (closed) return;
       closed = true;
@@ -280,7 +293,12 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       // Subscriptions have no terminal acknowledgement to wait for. Drop local
       // delivery immediately and ask the host to release each registration
       // while the old port remains alive for pending calls.
-      for (const id of [...listeners.keys(), ...liveListeners.keys(), ...chatListeners.keys()]) {
+      for (const id of [
+        ...listeners.keys(),
+        ...liveListeners.keys(),
+        ...chatListeners.keys(),
+        ...systemOneListeners.keys(),
+      ]) {
         try {
           post({ kind: 'unsubscribe', id });
         } catch {
@@ -290,6 +308,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       listeners.clear();
       liveListeners.clear();
       chatListeners.clear();
+      systemOneListeners.clear();
 
       // A graceful reconnect is not permission to guess the outcome of old
       // mutations. Request cancellation and retain the port until each call gets

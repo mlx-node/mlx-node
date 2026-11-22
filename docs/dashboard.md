@@ -203,15 +203,15 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 ## Pages
 
-Eleven routes. Nine sit in the sidebar (`⌘1`…`⌘9`, also in the `⌘K` command palette); one route table
+Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; all ten sit in the `⌘K` command palette); one route table
 (`ui/src/shell/routes.tsx`) feeds the router, the sidebar, the breadcrumb, the hotkeys and the palette.
 
 | Key       | Goes to                                                                       |
 | --------- | ----------------------------------------------------------------------------- |
 | `⌘1`      | Overview                                                                      |
 | `⌘2`      | Chat                                                                          |
-| `⌘3`…`⌘8` | Sessions, Metrics, Engine, Cache, Models, Coding Agents                       |
-| `⌘9`      | Web Search                                                                    |
+| `⌘3`      | System One                                                                    |
+| `⌘4`…`⌘9` | Sessions, Metrics, Engine, Cache, Models, Coding Agents                       |
 | `⌘⇧O`     | A new conversation in the last used mode                                      |
 | `⌘K`      | The command palette (it also lists the 20 newest conversations of both modes) |
 
@@ -219,6 +219,7 @@ Eleven routes. Nine sit in the sidebar (`⌘1`…`⌘9`, also in the `⌘K` comm
 | ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                   | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
 | `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer with model picker, web chip and (Work) folder chip; Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work)         | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
+| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                         | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
 | `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                 | `/sessions`                                                                                                  |
 | `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                      | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
 | `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                        | the six `/metrics/*` routes                                                                                  |

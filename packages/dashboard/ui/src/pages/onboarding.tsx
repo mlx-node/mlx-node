@@ -51,7 +51,9 @@ export default function Onboarding({
   const navigate = useNavigate();
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const host = models.data?.host;
-  const items = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
+  const items = (catalog.data?.items ?? []).filter(
+    (item) => offeredOnHost(item, host) && item.category !== 'systemone',
+  );
   const activeRepo = activeRepos.find((repo) => items.some((item) => item.hfRepo === repo));
   const selected =
     items.find((item) => item.hfRepo === (activeRepo ?? selectedRepo)) ??

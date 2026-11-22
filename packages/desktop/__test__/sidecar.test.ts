@@ -323,7 +323,7 @@ describe('handleSidecarRequest', () => {
 });
 
 describe('endpointModels', () => {
-  it('writes each served model field by field, with its base, variant and format', () => {
+  it('writes each served model field by field, with its base, variant, format, modelType and kind', () => {
     const models = [
       { name: 'm-Q4_K_M', path: '/m.gguf', modelType: 'qwen4_exp', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
       {
@@ -335,11 +335,61 @@ describe('endpointModels', () => {
         format: 'mlx',
         preset: {},
       },
+      {
+        name: 'clairic-flash-4bit',
+        path: '/clairic-flash-4bit',
+        modelType: 'clairic',
+        base: 'clairic-flash-4bit',
+        variant: '4-bit',
+        format: 'mlx',
+      },
+      {
+        name: 'clef-flash',
+        path: '/clef-flash',
+        modelType: 'clef',
+        base: 'clef-flash',
+        variant: 'MLX',
+        format: 'mlx',
+      },
     ] as SidecarHost['models'];
     const value = endpointModels(models);
     expect(value).toEqual([
-      { name: 'm-Q4_K_M', path: '/m.gguf', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
-      { name: 'm-bf16', path: '/m-bf16', base: 'm', variant: 'BF16', format: 'mlx' },
+      {
+        name: 'm-Q4_K_M',
+        path: '/m.gguf',
+        base: 'm',
+        variant: 'Q4_K_M',
+        format: 'gguf',
+        modelType: 'qwen4_exp',
+        kind: 'chat',
+      },
+      {
+        name: 'm-bf16',
+        path: '/m-bf16',
+        base: 'm',
+        variant: 'BF16',
+        format: 'mlx',
+        modelType: 'qwen4_exp',
+        kind: 'chat',
+      },
+      {
+        name: 'clairic-flash-4bit',
+        path: '/clairic-flash-4bit',
+        base: 'clairic-flash-4bit',
+        variant: '4-bit',
+        format: 'mlx',
+        modelType: 'clairic',
+        kind: 'decision',
+      },
+      {
+        name: 'clef-flash',
+        path: '/clef-flash',
+        base: 'clef-flash',
+        variant: 'MLX',
+        format: 'mlx',
+        modelType: 'clef',
+        kind: 'decision',
+      },
     ]);
   });
 });

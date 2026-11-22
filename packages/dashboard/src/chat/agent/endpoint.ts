@@ -11,7 +11,15 @@ export interface InferenceEndpoint {
   pid: number;
   url: string;
   token: string;
-  models: Array<{ name: string; path: string; base: string; variant: string; format: 'gguf' | 'mlx' }>;
+  models: Array<{
+    name: string;
+    path: string;
+    base: string;
+    variant: string;
+    format: 'gguf' | 'mlx';
+    modelType?: string;
+    kind?: 'chat' | 'decision';
+  }>;
 }
 
 /** Reads the endpoint file; null when it is missing or fails any check. Never throws. */
