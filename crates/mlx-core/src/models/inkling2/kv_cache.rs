@@ -930,6 +930,22 @@ impl Inkling2KVCacheCoordinator {
         Ok(())
     }
 
+    /// Patch the trailing `tokens.len()` placeholder (`u32::MAX`) entries across every KV group
+    /// with their real verified token IDs (used when `verify_device` books KV slots before
+    /// device-resident draft IDs are materialized on the host).
+    pub fn patch_last_recorded_tokens_all(
+        &mut self,
+        seq_id: u32,
+        tokens: &[u32],
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            adapter.activate_request(seq_id)?;
+            adapter.patch_last_recorded_tokens(tokens)?;
+        }
+        Ok(())
+    }
+
     /// Reserve speculative lookahead rows atomically across every KV group (all or none).
     pub fn reserve_rows_all(&mut self, seq_id: u32, rows: u32) -> std::result::Result<u32, String> {
         for group_id in 0..self.inner.groups().len() {

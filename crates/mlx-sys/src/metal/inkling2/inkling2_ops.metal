@@ -29,9 +29,21 @@
 //         Fused optional inv_order unsort + FP32 weighted sum over top-K experts -> BF16/F32
 //   12. `inkling2_lm_head_softcap_f32` & `inkling2_lm_head_softcap_argmax_stage{1,2}`:
 //         Fused vocab slice + optional bias (with optional BF16 round) + 30*tanh(x/30) (+ 2-stage GPU argmax)
+//   13. `inkling2_markov_gate_bf16`:
+//         Fused DSpark Markov RNN gate (optional ctx add + BF16-rounded gate)
+//   14. `inkling2_moe_router_proj_f32`:
+//         Coalesced exact-FP32 MoE router projection for small T
+//   15. `inkling2_loop_ctrl_down_f32`:
+//         Fused pair RMSNorm + exact-FP32 LoopController down projection (`[S, T, 2*D] @ [S, 2*D, R]`)
+//   16. `inkling2_loop_ctrl_up_blend_f32` + `inkling2_rms_norm_from_sq_{bf16,f32}`:
+//         Fused exact-FP32 LoopController up projection + no-FMA loop blend + sublayer RMSNorm
+//   17. `inkling2_markov_fold_softcap_f32` & `inkling2_markov_fold_softcap_argmax_stage1`:
+//         Fused Q8_0 (group_size=32) folded Markov head matmul + fold_bias + base_logits + softcap (+ argmax)
 
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // Disable FMA contraction across all Inkling-2-Mini kernels so FP32 arithmetic matches
 // unfused MLX mul+add operations bit-for-bit (preserving BF16 rounding & loop blend parity).
@@ -54,6 +66,21 @@ inline float inkling2_read_f32(device const uchar *ptr, ulong idx, uint is_f32) 
     return reinterpret_cast<device const float *>(ptr)[idx];
   }
   return float(reinterpret_cast<device const bfloat *>(ptr)[idx]);
+}
+
+inline float4 inkling2_read_f4(device const uchar *ptr, ulong idx4, uint is_f32) {
+  if (is_f32 != 0u) {
+    return reinterpret_cast<device const float4 *>(ptr)[idx4];
+  }
+  return float4(reinterpret_cast<device const bfloat4 *>(ptr)[idx4]);
+}
+
+inline void inkling2_store_vec4(device bfloat *out, ulong idx4, float4 v) {
+  reinterpret_cast<device bfloat4 *>(out)[idx4] = bfloat4(v);
+}
+
+inline void inkling2_store_vec4(device float *out, ulong idx4, float4 v) {
+  reinterpret_cast<device float4 *>(out)[idx4] = v;
 }
 
 inline void inkling2_find_seq(
@@ -936,6 +963,26 @@ inline float inkling2_read_src(
   return v;
 }
 
+inline float4 inkling2_read_src4(
+    device const uchar *s0, device const uchar *s1, device const uchar *s2, device const uchar *s3,
+    device const uchar *s4, device const uchar *s5, device const uchar *s6, device const uchar *s7,
+    device const uchar *addend,
+    constant Inkling2BlockAttnResParams &params,
+    uint k,
+    uint row,
+    uint col4) {
+  device const uchar *p =
+      (k == 0u) ? s0 : (k == 1u) ? s1 : (k == 2u) ? s2 : (k == 3u) ? s3 :
+      (k == 4u) ? s4 : (k == 5u) ? s5 : (k == 6u) ? s6 : s7;
+  const uint is_f32 = (params.src_f32_mask >> k) & 1u;
+  float4 v = inkling2_read_f4(p, (ulong(row) * ulong(params.src_strides[k]) >> 2u) + col4, is_f32);
+  if (k == params.num_sources - 1u && ((params.flags & 1u) != 0u)) {
+    const uint add_f32 = (params.flags >> 1u) & 1u;
+    v += inkling2_read_f4(addend, (ulong(row) * ulong(params.addend_stride) >> 2u) + col4, add_f32);
+  }
+  return v;
+}
+
 template <typename OutT>
 inline void inkling2_block_attn_res_impl(
     device const uchar *s0, device const uchar *s1, device const uchar *s2, device const uchar *s3,
@@ -954,6 +1001,7 @@ inline void inkling2_block_attn_res_impl(
     uint simd_group) {
   constexpr uint THREADS = 256u;
   constexpr uint MAX_REGS = 10u; // covers D up to 2560 (2304 -> 9 regs)
+  constexpr uint MAX_VEC4_REGS = 3u; // covers D up to 3072 (2304 -> 576 float4s -> 3 regs)
 
   if (row >= params.rows) {
     return;
@@ -964,6 +1012,7 @@ inline void inkling2_block_attn_res_impl(
   const bool has_norm = ((params.flags >> 2u) & 1u) != 0u;
   const uint weight_f32 = (params.flags >> 3u) & 1u;
   const bool weight_bcast = ((params.flags >> 4u) & 1u) != 0u;
+  const bool vec4_ok = ((params.flags >> 5u) & 1u) != 0u;
 
   float sum_sq[8];
   float raw_dot[4][8];
@@ -974,6 +1023,206 @@ inline void inkling2_block_attn_res_impl(
     }
   }
 
+  // Vectorized float4/bfloat4 fast path (128B coalesced loads/stores + single-pass cache for K<=2)
+  if (vec4_ok) {
+    const uint D4 = D >> 2u;
+    const device float4 *q4 = reinterpret_cast<device const float4 *>(queries);
+    const bool cache_srcs = (K <= 2u) && (D4 <= THREADS * MAX_VEC4_REGS);
+    float4 src_cache[2][MAX_VEC4_REGS];
+
+    uint reg_i = 0u;
+    for (uint i4 = tid; i4 < D4; i4 += THREADS) {
+      float4 qv[4];
+      if (K > 1u) {
+        for (uint q = 0u; q < Q; ++q) {
+          qv[q] = q4[ulong(q) * ulong(D4) + i4];
+        }
+      }
+      for (uint k = 0u; k < K; ++k) {
+        const float4 v =
+            inkling2_read_src4(s0, s1, s2, s3, s4, s5, s6, s7, addend, params, k, row, i4);
+        if (cache_srcs) {
+          src_cache[k][reg_i] = v;
+        }
+        sum_sq[k] += (v.x * v.x + v.y * v.y) + (v.z * v.z + v.w * v.w);
+        if (K > 1u) {
+          for (uint q = 0u; q < Q; ++q) {
+            raw_dot[q][k] +=
+                (qv[q].x * v.x + qv[q].y * v.y) + (qv[q].z * v.z + qv[q].w * v.w);
+          }
+        }
+      }
+      ++reg_i;
+    }
+
+    for (uint k = 0u; k < K; ++k) {
+      const float s = simd_sum(sum_sq[k]);
+      if (simd_lane == 0u) {
+        tg_reduce[k * 8u + simd_group] = s;
+      }
+    }
+    if (K > 1u) {
+      for (uint q = 0u; q < Q; ++q) {
+        for (uint k = 0u; k < K; ++k) {
+          const float d = simd_sum(raw_dot[q][k]);
+          if (simd_lane == 0u) {
+            tg_reduce[(8u + q * 8u + k) * 8u + simd_group] = d;
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < K) {
+      float s = 0.0f;
+      for (uint sg = 0u; sg < 8u; ++sg) {
+        s += tg_reduce[tid * 8u + sg];
+      }
+      tg_inv_rms[tid] = rsqrt(s / float(D) + params.attn_res_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < Q) {
+      const uint q = tid;
+      if (K == 1u) {
+        tg_probs[q * 8u + 0u] = 1.0f;
+      } else {
+        float scores[8];
+        float max_s = -INFINITY;
+        for (uint k = 0u; k < K; ++k) {
+          float d = 0.0f;
+          for (uint sg = 0u; sg < 8u; ++sg) {
+            d += tg_reduce[(8u + q * 8u + k) * 8u + sg];
+          }
+          scores[k] = d * tg_inv_rms[k];
+          max_s = max(max_s, scores[k]);
+        }
+        float denom = 0.0f;
+        for (uint k = 0u; k < K; ++k) {
+          scores[k] = exp(scores[k] - max_s);
+          denom += scores[k];
+        }
+        const float inv_denom = 1.0f / denom;
+        for (uint k = 0u; k < K; ++k) {
+          tg_probs[q * 8u + k] = scores[k] * inv_denom;
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms[8];
+    float probs[4][8];
+    for (uint k = 0u; k < K; ++k) {
+      inv_rms[k] = tg_inv_rms[k];
+      for (uint q = 0u; q < Q; ++q) {
+        probs[q][k] = tg_probs[q * 8u + k];
+      }
+    }
+
+    if (!has_norm) {
+      reg_i = 0u;
+      for (uint i4 = tid; i4 < D4; i4 += THREADS) {
+        float4 mix[4];
+        for (uint q = 0u; q < Q; ++q) {
+          mix[q] = float4(0.0f);
+        }
+        for (uint k = 0u; k < K; ++k) {
+          const float4 raw_v = cache_srcs
+              ? src_cache[k][reg_i]
+              : inkling2_read_src4(s0, s1, s2, s3, s4, s5, s6, s7, addend, params, k, row, i4);
+          const float4 vk = raw_v * inv_rms[k];
+          for (uint q = 0u; q < Q; ++q) {
+            mix[q] = mix[q] + probs[q][k] * vk;
+          }
+        }
+        for (uint q = 0u; q < Q; ++q) {
+          const ulong out_idx4 = (ulong(q) * ulong(params.rows) + ulong(row)) * ulong(D4) + i4;
+          inkling2_store_vec4(out, out_idx4, mix[q]);
+        }
+        ++reg_i;
+      }
+      return;
+    }
+
+    const bool fits_regs = (D4 <= THREADS * MAX_VEC4_REGS);
+    float4 mix_regs[4][MAX_VEC4_REGS];
+    float mix_sq[4];
+    for (uint q = 0u; q < Q; ++q) {
+      mix_sq[q] = 0.0f;
+    }
+
+    reg_i = 0u;
+    for (uint i4 = tid; i4 < D4; i4 += THREADS) {
+      float4 mix[4];
+      for (uint q = 0u; q < Q; ++q) {
+        mix[q] = float4(0.0f);
+      }
+      for (uint k = 0u; k < K; ++k) {
+        const float4 raw_v = cache_srcs
+            ? src_cache[k][reg_i]
+            : inkling2_read_src4(s0, s1, s2, s3, s4, s5, s6, s7, addend, params, k, row, i4);
+        const float4 vk = raw_v * inv_rms[k];
+        for (uint q = 0u; q < Q; ++q) {
+          mix[q] = mix[q] + probs[q][k] * vk;
+        }
+      }
+      for (uint q = 0u; q < Q; ++q) {
+        if (fits_regs) {
+          mix_regs[q][reg_i] = mix[q];
+        }
+        const float4 m = mix[q];
+        mix_sq[q] += (m.x * m.x + m.y * m.y) + (m.z * m.z + m.w * m.w);
+      }
+      ++reg_i;
+    }
+
+    for (uint q = 0u; q < Q; ++q) {
+      const float ms = simd_sum(mix_sq[q]);
+      if (simd_lane == 0u) {
+        tg_reduce[q * 8u + simd_group] = ms;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < Q) {
+      float ms = 0.0f;
+      for (uint sg = 0u; sg < 8u; ++sg) {
+        ms += tg_reduce[tid * 8u + sg];
+      }
+      tg_inv_rms[tid] = rsqrt(ms / float(D) + params.norm_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mix_inv_rms[4];
+    for (uint q = 0u; q < Q; ++q) {
+      mix_inv_rms[q] = tg_inv_rms[q];
+    }
+
+    reg_i = 0u;
+    for (uint i4 = tid; i4 < D4; i4 += THREADS) {
+      for (uint q = 0u; q < Q; ++q) {
+        float4 mv;
+        if (fits_regs) {
+          mv = mix_regs[q][reg_i];
+        } else {
+          mv = float4(0.0f);
+          for (uint k = 0u; k < K; ++k) {
+            const float4 vk =
+                inkling2_read_src4(s0, s1, s2, s3, s4, s5, s6, s7, addend, params, k, row, i4) *
+                inv_rms[k];
+            mv = mv + probs[q][k] * vk;
+          }
+        }
+        const ulong w_idx4 = (weight_bcast ? 0ul : ulong(q) * ulong(D4)) + i4;
+        const float4 w = inkling2_read_f4(norm_weight, w_idx4, weight_f32);
+        const ulong out_idx4 = (ulong(q) * ulong(params.rows) + ulong(row)) * ulong(D4) + i4;
+        inkling2_store_vec4(out, out_idx4, (mv * mix_inv_rms[q]) * w);
+      }
+      ++reg_i;
+    }
+    return;
+  }
+
+  // Scalar fallback (unaligned or D % 4 != 0)
   // Pass 1: accumulate per-source sum_sq and query-source raw dots in FP32.
   for (uint i = tid; i < D; i += THREADS) {
     float qv[4];
@@ -1982,6 +2231,1346 @@ struct Inkling2MoeRouterProjParams {
     const float sum = simd_sum(acc[r]);
     if (lane == 0u) {
       logits[ulong(row0 + r) * ulong(params.num_experts) + expert] = sum;
+    }
+  }
+}
+
+// ============================================================================
+// 15. inkling2_loop_ctrl_down_f32
+//     Fuses pair_rms_norm + exact-FP32 LoopController down projection:
+//       h[s, t, r] = inv_rms(dest[s, t]) * dot(dest[s, t], down_w[s, r, 0..D])
+//                  + inv_rms(msg[s, t])  * dot(msg[s, t],  down_w[s, r, D..2D])
+//     Grid: (R, ceil(T / 8), S), TG: (128, 1, 1) -> sg 0,1 = dest half, sg 2,3 = msg half.
+//     Zero [S, T, 2D] intermediate DRAM traffic and zero 64x64 steel_matmul padding!
+// ============================================================================
+struct Inkling2LoopCtrlDownParams {
+  uint rows;               // T
+  uint dim;                // D (multiple of 4)
+  uint rank;               // R (64)
+  uint num_streams;        // S (1 or 3)
+  float eps;               // 1e-6f
+  uint dest_row_stride;    // in elements (multiple of 4)
+  uint dest_stream_stride; // 0 if broadcast across streams (multiple of 4)
+  uint msg_row_stride;     // in elements (multiple of 4)
+  uint msg_stream_stride;  // in elements (multiple of 4)
+  uint flags;              // bit0: dest_f32, bit1: msg_f32, bit2: w_is_bf16
+  uint _pad0;
+  uint _pad1;
+};
+
+inline float4 inkling2_load_w4(device const uchar *w_raw, ulong idx4, bool w_is_bf16) {
+  if (w_is_bf16) {
+    return float4(reinterpret_cast<device const bfloat4 *>(w_raw)[idx4]);
+  }
+  return reinterpret_cast<device const float4 *>(w_raw)[idx4];
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_loop_ctrl_down_f32(
+    device const uchar *dest_raw [[buffer(0)]],
+    device const uchar *msg_raw [[buffer(1)]],
+    device const uchar *down_w_raw [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant Inkling2LoopCtrlDownParams &params [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint r_idx = tgid.x;
+  const uint row0 = tgid.y * 8u;
+  const uint s = tgid.z;
+  if (r_idx >= params.rank || row0 >= params.rows || s >= params.num_streams) {
+    return;
+  }
+  const uint n_rows = min(8u, params.rows - row0);
+  const uint dim = params.dim;
+  const uint dim4 = dim >> 2u;
+  const uint half_id = sg >> 1u;              // 0 = dest (sg 0,1), 1 = msg (sg 2,3)
+  const uint local_tid = ((sg & 1u) << 5u) + lane; // 0..63
+  const bool w_is_bf16 = ((params.flags >> 2u) & 1u) != 0u;
+
+  const ulong w_row_base4 =
+      ((ulong(s) * ulong(params.rank) + ulong(r_idx)) * ulong(dim) * 2ul +
+       ulong(half_id) * ulong(dim)) >> 2u;
+
+  device const uchar *in_raw = (half_id == 0u) ? dest_raw : msg_raw;
+  const uint in_is_f32 = (half_id == 0u) ? (params.flags & 1u) : ((params.flags >> 1u) & 1u);
+  const uint rs = (half_id == 0u) ? params.dest_row_stride : params.msg_row_stride;
+  const uint ss = (half_id == 0u) ? params.dest_stream_stride : params.msg_stream_stride;
+  const ulong in_rs4 = ulong(rs) >> 2u;
+  const ulong in_s_base4 = (ulong(s) * ulong(ss) + ulong(row0) * ulong(rs)) >> 2u;
+
+  threadgroup float tg_sq[4][8];
+  threadgroup float tg_acc[4][8];
+
+  if (n_rows == 1u) {
+    float sq = 0.0f;
+    float ac = 0.0f;
+    if (in_is_f32 != 0u) {
+      const device float4 *in_f4 = reinterpret_cast<device const float4 *>(in_raw) + in_s_base4;
+      for (uint i = local_tid; i < dim4; i += 64u) {
+        const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+        const float4 xv = in_f4[i];
+        sq += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+        ac += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+      }
+    } else {
+      const device bfloat4 *in_b4 = reinterpret_cast<device const bfloat4 *>(in_raw) + in_s_base4;
+      for (uint i = local_tid; i < dim4; i += 64u) {
+        const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+        const float4 xv = float4(in_b4[i]);
+        sq += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+        ac += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+      }
+    }
+    sq = simd_sum(sq);
+    ac = simd_sum(ac);
+    if (lane == 0u) {
+      tg_sq[sg][0] = sq;
+      tg_acc[sg][0] = ac;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+      const float sq_d = tg_sq[0][0] + tg_sq[1][0];
+      const float sq_m = tg_sq[2][0] + tg_sq[3][0];
+      const float ac_d = tg_acc[0][0] + tg_acc[1][0];
+      const float ac_m = tg_acc[2][0] + tg_acc[3][0];
+      const float inv_d = rsqrt(sq_d / float(dim) + params.eps);
+      const float inv_m = rsqrt(sq_m / float(dim) + params.eps);
+      out[(ulong(s) * ulong(params.rows) + ulong(row0)) * ulong(params.rank) + r_idx] =
+          ac_d * inv_d + ac_m * inv_m;
+    }
+    return;
+  }
+
+  float sq[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float ac[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  if (in_is_f32 != 0u) {
+    const device float4 *in_f4 = reinterpret_cast<device const float4 *>(in_raw) + in_s_base4;
+    if (n_rows == 8u) {
+      for (uint i = local_tid; i < dim4; i += 64u) {
+        const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+        #pragma unroll
+        for (uint r = 0u; r < 8u; ++r) {
+          const float4 xv = in_f4[ulong(r) * in_rs4 + i];
+          sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+          ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+        }
+      }
+    } else {
+      for (uint i = local_tid; i < dim4; i += 64u) {
+        const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+        for (uint r = 0u; r < n_rows; ++r) {
+          const float4 xv = in_f4[ulong(r) * in_rs4 + i];
+          sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+          ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+        }
+      }
+    }
+  } else {
+    const device bfloat4 *in_b4 = reinterpret_cast<device const bfloat4 *>(in_raw) + in_s_base4;
+    for (uint i = local_tid; i < dim4; i += 64u) {
+      const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+      for (uint r = 0u; r < n_rows; ++r) {
+        const float4 xv = float4(in_b4[ulong(r) * in_rs4 + i]);
+        sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+        ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+      }
+    }
+  }
+
+  for (uint r = 0u; r < n_rows; ++r) {
+    const float sr = simd_sum(sq[r]);
+    const float ar = simd_sum(ac[r]);
+    if (lane == 0u) {
+      tg_sq[sg][r] = sr;
+      tg_acc[sg][r] = ar;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < n_rows) {
+    const float sq_d = tg_sq[0][tid] + tg_sq[1][tid];
+    const float sq_m = tg_sq[2][tid] + tg_sq[3][tid];
+    const float ac_d = tg_acc[0][tid] + tg_acc[1][tid];
+    const float ac_m = tg_acc[2][tid] + tg_acc[3][tid];
+    const float inv_d = rsqrt(sq_d / float(dim) + params.eps);
+    const float inv_m = rsqrt(sq_m / float(dim) + params.eps);
+    out[(ulong(s) * ulong(params.rows) + ulong(row0 + tid)) * ulong(params.rank) + r_idx] =
+        ac_d * inv_d + ac_m * inv_m;
+  }
+}
+
+// ============================================================================
+// 16. inkling2_loop_ctrl_up_blend_f32 + inkling2_rms_norm_from_sq_{bf16,f32}
+//     Stage 1: Coalesced sequential-DRAM exact-FP32 up projection
+//       (`h [S, T, R] @ gf_w^T`, where `gf_w` is contiguous `[S, 2*D, R]` with R % 4 == 0!)
+//       + no-FMA loop blend `(1 - tanh(forget)) * dest + tanh(gain) * msg`
+//       + per-tile `sum(blended^2)` reduction (zero [S, T, 2*D] DRAM traffic, only 2 KB TG mem!).
+//       Grid: (ceil(D / 32), ceil(T / 8), S), TG: (128, 1, 1):
+//       4 SGs x 8 contiguous cols/SG = 32 cols/TG; lanes 0..15 load gain_w[d, 0..R] as float4,
+//       lanes 16..31 load forget_w[d, 0..R] as float4 (2x256B sequential coalesced loads/col!).
+//       Bit-identical FP32 reduction order across M=1, M=4, M=8, M=32!
+//     Stage 2: Zero-barrier finalize RMSNorm over L2-resident `blended` + `partial_sum_sq`.
+//       Grid: (ceil(D / 128), T, S), TG: (128, 1, 1).
+// ============================================================================
+struct Inkling2LoopCtrlUpBlendParams {
+  uint rows;               // T
+  uint dim;                // D
+  uint rank;               // R (multiple of 4; fast path R == 64)
+  uint num_streams;        // S (1 or 3)
+  uint num_d_tiles;        // ceil(D / 32)
+  uint dest_row_stride;
+  uint dest_stream_stride; // 0 if broadcast
+  uint msg_row_stride;
+  uint msg_stream_stride;
+  uint flags;              // bit0: dest_f32, bit1: msg_f32, bit2: w_is_bf16
+  uint _pad0;
+  uint _pad1;
+};
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_loop_ctrl_up_blend_f32(
+    device const float *h [[buffer(0)]],
+    device const uchar *gf_w_raw [[buffer(1)]],
+    device const uchar *dest_raw [[buffer(2)]],
+    device const uchar *msg_raw [[buffer(3)]],
+    device float *blended [[buffer(4)]],
+    device float *partial_sum_sq [[buffer(5)]],
+    constant Inkling2LoopCtrlUpBlendParams &params [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)tid;
+  const uint d_tile = tgid.x;
+  const uint row0 = tgid.y * 8u;
+  const uint s = tgid.z;
+  if (d_tile >= params.num_d_tiles || row0 >= params.rows || s >= params.num_streams) {
+    return;
+  }
+  const uint D = params.dim;
+  const uint R = params.rank;
+  const uint R4 = R >> 2u;
+  const uint n_rows = min(8u, params.rows - row0);
+  const bool w_is_bf16 = ((params.flags >> 2u) & 1u) != 0u;
+
+  const uint half_id = lane >> 4u; // 0 = gain (lanes 0..15), 1 = forget (lanes 16..31)
+  const uint sub = lane & 15u;     // 0..15
+  const uint col_base = d_tile * 32u + sg * 8u;
+
+  const ulong h_s_base4 = (ulong(s) * ulong(params.rows) * ulong(R)) >> 2u;
+  const ulong w_half_base4 = (ulong(s) * 2ul + ulong(half_id)) * ulong(D) * ulong(R4);
+  const device float4 *h4 = reinterpret_cast<device const float4 *>(h) + h_s_base4;
+
+  threadgroup float tg_g[8][32];
+  threadgroup float tg_f[8][32];
+
+  if (R4 == 16u) {
+    // Fast path for R = 64: entire h row fits in 1 float4/lane in registers (zero tg_h!).
+    if (n_rows == 1u) {
+      const float4 hv0 = h4[ulong(row0) * 16ul + sub];
+      if (col_base + 7u < D) {
+        // 4-column unrolled sequential prefetch with exact same per-column reduction order!
+        for (uint c0 = 0u; c0 < 8u; c0 += 4u) {
+          const ulong b0 = w_half_base4 + ulong(col_base + c0) * 16ul + sub;
+          const float4 w0 = inkling2_load_w4(gf_w_raw, b0 + 0ul, w_is_bf16);
+          const float4 w1 = inkling2_load_w4(gf_w_raw, b0 + 16ul, w_is_bf16);
+          const float4 w2 = inkling2_load_w4(gf_w_raw, b0 + 32ul, w_is_bf16);
+          const float4 w3 = inkling2_load_w4(gf_w_raw, b0 + 48ul, w_is_bf16);
+
+          float p0 = (w0.x * hv0.x + w0.y * hv0.y) + (w0.z * hv0.z + w0.w * hv0.w);
+          float p1 = (w1.x * hv0.x + w1.y * hv0.y) + (w1.z * hv0.z + w1.w * hv0.w);
+          float p2 = (w2.x * hv0.x + w2.y * hv0.y) + (w2.z * hv0.z + w2.w * hv0.w);
+          float p3 = (w3.x * hv0.x + w3.y * hv0.y) + (w3.z * hv0.z + w3.w * hv0.w);
+
+          p0 += simd_shuffle_xor(p0, 8);
+          p1 += simd_shuffle_xor(p1, 8);
+          p2 += simd_shuffle_xor(p2, 8);
+          p3 += simd_shuffle_xor(p3, 8);
+          p0 += simd_shuffle_xor(p0, 4);
+          p1 += simd_shuffle_xor(p1, 4);
+          p2 += simd_shuffle_xor(p2, 4);
+          p3 += simd_shuffle_xor(p3, 4);
+          p0 += simd_shuffle_xor(p0, 2);
+          p1 += simd_shuffle_xor(p1, 2);
+          p2 += simd_shuffle_xor(p2, 2);
+          p3 += simd_shuffle_xor(p3, 2);
+          p0 += simd_shuffle_xor(p0, 1);
+          p1 += simd_shuffle_xor(p1, 1);
+          p2 += simd_shuffle_xor(p2, 1);
+          p3 += simd_shuffle_xor(p3, 1);
+
+          if (sub == 0u) {
+            const uint sc = sg * 8u + c0;
+            if (half_id == 0u) {
+              tg_g[0][sc + 0u] = p0;
+              tg_g[0][sc + 1u] = p1;
+              tg_g[0][sc + 2u] = p2;
+              tg_g[0][sc + 3u] = p3;
+            } else {
+              tg_f[0][sc + 0u] = p0;
+              tg_f[0][sc + 1u] = p1;
+              tg_f[0][sc + 2u] = p2;
+              tg_f[0][sc + 3u] = p3;
+            }
+          }
+        }
+      } else {
+        for (uint c = 0u; c < 8u; ++c) {
+          const uint col = col_base + c;
+          if (col >= D) {
+            break;
+          }
+          const float4 wv = inkling2_load_w4(gf_w_raw, w_half_base4 + ulong(col) * 16ul + sub, w_is_bf16);
+          float p = (wv.x * hv0.x + wv.y * hv0.y) + (wv.z * hv0.z + wv.w * hv0.w);
+          p += simd_shuffle_xor(p, 8);
+          p += simd_shuffle_xor(p, 4);
+          p += simd_shuffle_xor(p, 2);
+          p += simd_shuffle_xor(p, 1);
+          if (sub == 0u) {
+            if (half_id == 0u) {
+              tg_g[0][sg * 8u + c] = p;
+            } else {
+              tg_f[0][sg * 8u + c] = p;
+            }
+          }
+        }
+      }
+    } else if (n_rows == 8u) {
+      float4 hv[8];
+      #pragma unroll
+      for (uint r = 0u; r < 8u; ++r) {
+        hv[r] = h4[ulong(row0 + r) * 16ul + sub];
+      }
+      for (uint c = 0u; c < 8u; ++c) {
+        const uint col = col_base + c;
+        if (col >= D) {
+          break;
+        }
+        const float4 wv = inkling2_load_w4(gf_w_raw, w_half_base4 + ulong(col) * 16ul + sub, w_is_bf16);
+        #pragma unroll
+        for (uint r = 0u; r < 8u; ++r) {
+          float p = (wv.x * hv[r].x + wv.y * hv[r].y) + (wv.z * hv[r].z + wv.w * hv[r].w);
+          p += simd_shuffle_xor(p, 8);
+          p += simd_shuffle_xor(p, 4);
+          p += simd_shuffle_xor(p, 2);
+          p += simd_shuffle_xor(p, 1);
+          if (sub == 0u) {
+            if (half_id == 0u) {
+              tg_g[r][sg * 8u + c] = p;
+            } else {
+              tg_f[r][sg * 8u + c] = p;
+            }
+          }
+        }
+      }
+    } else {
+      float4 hv[8];
+      for (uint r = 0u; r < n_rows; ++r) {
+        hv[r] = h4[ulong(row0 + r) * 16ul + sub];
+      }
+      for (uint c = 0u; c < 8u; ++c) {
+        const uint col = col_base + c;
+        if (col >= D) {
+          break;
+        }
+        const float4 wv = inkling2_load_w4(gf_w_raw, w_half_base4 + ulong(col) * 16ul + sub, w_is_bf16);
+        for (uint r = 0u; r < n_rows; ++r) {
+          float p = (wv.x * hv[r].x + wv.y * hv[r].y) + (wv.z * hv[r].z + wv.w * hv[r].w);
+          p += simd_shuffle_xor(p, 8);
+          p += simd_shuffle_xor(p, 4);
+          p += simd_shuffle_xor(p, 2);
+          p += simd_shuffle_xor(p, 1);
+          if (sub == 0u) {
+            if (half_id == 0u) {
+              tg_g[r][sg * 8u + c] = p;
+            } else {
+              tg_f[r][sg * 8u + c] = p;
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // General R (multiple of 4)
+    for (uint c = 0u; c < 8u; ++c) {
+      const uint col = col_base + c;
+      if (col >= D) {
+        break;
+      }
+      float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      const ulong w_col_base4 = w_half_base4 + ulong(col) * ulong(R4);
+      for (uint k4 = sub; k4 < R4; k4 += 16u) {
+        const float4 wv = inkling2_load_w4(gf_w_raw, w_col_base4 + k4, w_is_bf16);
+        for (uint r = 0u; r < n_rows; ++r) {
+          const float4 hv = h4[ulong(row0 + r) * ulong(R4) + k4];
+          acc[r] += (wv.x * hv.x + wv.y * hv.y) + (wv.z * hv.z + wv.w * hv.w);
+        }
+      }
+      for (uint r = 0u; r < n_rows; ++r) {
+        float p = acc[r];
+        p += simd_shuffle_xor(p, 8);
+        p += simd_shuffle_xor(p, 4);
+        p += simd_shuffle_xor(p, 2);
+        p += simd_shuffle_xor(p, 1);
+        if (sub == 0u) {
+          if (half_id == 0u) {
+            tg_g[r][sg * 8u + c] = p;
+          } else {
+            tg_f[r][sg * 8u + c] = p;
+          }
+        }
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint col = d_tile * 32u + lane;
+  const bool valid_col = col < D;
+  const uint dest_f32 = params.flags & 1u;
+  const uint msg_f32 = (params.flags >> 1u) & 1u;
+  for (uint r = sg; r < n_rows; r += 4u) {
+    float sq = 0.0f;
+    if (valid_col) {
+      const float g = tg_g[r][lane];
+      const float f = tg_f[r][lane];
+      const ulong d_idx =
+          ulong(s) * ulong(params.dest_stream_stride) +
+          ulong(row0 + r) * ulong(params.dest_row_stride) + col;
+      const ulong m_idx =
+          ulong(s) * ulong(params.msg_stream_stride) +
+          ulong(row0 + r) * ulong(params.msg_row_stride) + col;
+      const float d_val = inkling2_read_f32(dest_raw, d_idx, dest_f32);
+      const float m_val = inkling2_read_f32(msg_raw, m_idx, msg_f32);
+      const float b = inkling2_loop_blend_scalar(d_val, m_val, g, f);
+      blended[(ulong(s) * ulong(params.rows) + ulong(row0 + r)) * ulong(D) + col] = b;
+      sq = b * b;
+    }
+    const float tile_sq = simd_sum(sq);
+    if (lane == 0u) {
+      partial_sum_sq[(ulong(s) * ulong(params.rows) + ulong(row0 + r)) *
+                         ulong(params.num_d_tiles) +
+                     d_tile] = tile_sq;
+    }
+  }
+}
+
+struct Inkling2RmsNormFromSqParams {
+  uint rows;                 // T
+  uint dim;                  // D
+  uint num_streams;          // S
+  uint num_d_tiles;          // ceil(D / 32)
+  float eps;
+  uint weight_stream_stride; // 0 if broadcast
+  uint weight_is_f32;
+  uint _pad;
+};
+
+template <typename OutT>
+inline void inkling2_rms_norm_from_sq_impl(
+    device const float *blended,
+    device const float *partial_sum_sq,
+    device const uchar *norm_weight_raw,
+    device OutT *out,
+    constant Inkling2RmsNormFromSqParams &params,
+    uint3 tgid,
+    uint tid,
+    uint lane) {
+  const uint row = tgid.y;
+  const uint s = tgid.z;
+  if (row >= params.rows || s >= params.num_streams) {
+    return;
+  }
+  const ulong row_flat = ulong(s) * ulong(params.rows) + ulong(row);
+  const ulong sq_base = row_flat * ulong(params.num_d_tiles);
+  float sq = 0.0f;
+  for (uint i = lane; i < params.num_d_tiles; i += 32u) {
+    sq += partial_sum_sq[sq_base + i];
+  }
+  sq = simd_sum(sq);
+  const float inv_rms = rsqrt(sq / float(params.dim) + params.eps);
+
+  const uint col = tgid.x * 128u + tid;
+  if (col < params.dim) {
+    const ulong idx = row_flat * ulong(params.dim) + col;
+    const float b = blended[idx];
+    const float w = inkling2_read_f32(
+        norm_weight_raw, ulong(s) * ulong(params.weight_stream_stride) + col, params.weight_is_f32);
+    out[idx] = OutT((b * inv_rms) * w);
+  }
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_rms_norm_from_sq_bf16(
+    device const float *blended [[buffer(0)]],
+    device const float *partial_sum_sq [[buffer(1)]],
+    device const uchar *norm_weight_raw [[buffer(2)]],
+    device bfloat *out [[buffer(3)]],
+    constant Inkling2RmsNormFromSqParams &params [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  inkling2_rms_norm_from_sq_impl<bfloat>(
+      blended, partial_sum_sq, norm_weight_raw, out, params, tgid, tid, lane);
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_rms_norm_from_sq_f32(
+    device const float *blended [[buffer(0)]],
+    device const float *partial_sum_sq [[buffer(1)]],
+    device const uchar *norm_weight_raw [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant Inkling2RmsNormFromSqParams &params [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  inkling2_rms_norm_from_sq_impl<float>(
+      blended, partial_sum_sq, norm_weight_raw, out, params, tgid, tid, lane);
+}
+
+// ============================================================================
+// 17. inkling2_markov_fold_softcap_{f32, argmax_stage1}
+//     Fused Q8_0 (group_size=32) folded Markov head:
+//       dot_v   = sum_{g=0..R/32-1} (scale[v,g] * dot(u8(w[v,g]), latent[b,g]) + bias[v,g] * sum(latent[b,g]))
+//       bias_v  = bf16(bf16(dot_v) + fold_bias[v])
+//       logit_v = softcap(bf16(base_logits[b, v] + bias_v), cap)
+//     kLanes = 8 -> 1 group of 32 weights per lane for R = 256 (0% divergence),
+//     4 vocab rows/SG x 8 SGs = 32 vocab rows/TG, sharing 1 Q8_0 weight read across
+//     up to 4 concurrent batch lanes!
+// ============================================================================
+struct Inkling2MarkovFoldParams {
+  uint batch;         // B
+  uint out_cols;      // V_unpadded (200058)
+  uint rank;          // R (multiple of 32; fast path R == 256)
+  uint latent_stride; // row stride of latent [B, R]
+  uint base_stride;   // row stride of base_logits [B, V_padded]
+  float softcap;      // 30.0f (<= 0 disables)
+  uint num_splits;    // stage1 splits for argmax (0 for logits mode)
+  uint flags;         // bit0: latent_f32, bit1: base_f32, bit2: fold_bias_f32,
+                      // bits[4:3]: sidecar dtype (0=bf16, 1=f32, 2=f16),
+                      // bit5: has_biases (1=affine, 0=no_bias unsigned)
+};
+
+inline float inkling2_read_sidecar_dt(device const uchar *ptr, ulong idx, uint dt_code) {
+  if (dt_code == 1u) {
+    return reinterpret_cast<device const float *>(ptr)[idx];
+  }
+  if (dt_code == 2u) {
+    return float(reinterpret_cast<device const half *>(ptr)[idx]);
+  }
+  return float(reinterpret_cast<device const bfloat *>(ptr)[idx]);
+}
+
+inline float inkling2_dot_q8_32_regs(uint4 p0, uint4 p1, const thread float4 (&x)[8]) {
+  float acc = 0.0f;
+  acc += dot(float4(as_type<uchar4>(p0.x)), x[0]);
+  acc += dot(float4(as_type<uchar4>(p0.y)), x[1]);
+  acc += dot(float4(as_type<uchar4>(p0.z)), x[2]);
+  acc += dot(float4(as_type<uchar4>(p0.w)), x[3]);
+  acc += dot(float4(as_type<uchar4>(p1.x)), x[4]);
+  acc += dot(float4(as_type<uchar4>(p1.y)), x[5]);
+  acc += dot(float4(as_type<uchar4>(p1.z)), x[6]);
+  acc += dot(float4(as_type<uchar4>(p1.w)), x[7]);
+  return acc;
+}
+
+inline float inkling2_dot_q8_32_tg(uint4 p0, uint4 p1, const threadgroup float *x) {
+  float acc = 0.0f;
+  acc += dot(float4(as_type<uchar4>(p0.x)), float4(x[0], x[1], x[2], x[3]));
+  acc += dot(float4(as_type<uchar4>(p0.y)), float4(x[4], x[5], x[6], x[7]));
+  acc += dot(float4(as_type<uchar4>(p0.z)), float4(x[8], x[9], x[10], x[11]));
+  acc += dot(float4(as_type<uchar4>(p0.w)), float4(x[12], x[13], x[14], x[15]));
+  acc += dot(float4(as_type<uchar4>(p1.x)), float4(x[16], x[17], x[18], x[19]));
+  acc += dot(float4(as_type<uchar4>(p1.y)), float4(x[20], x[21], x[22], x[23]));
+  acc += dot(float4(as_type<uchar4>(p1.z)), float4(x[24], x[25], x[26], x[27]));
+  acc += dot(float4(as_type<uchar4>(p1.w)), float4(x[28], x[29], x[30], x[31]));
+  return acc;
+}
+
+inline void inkling2_load_latent_32(
+    device const uchar *latent_raw,
+    ulong base_elem,
+    uint latent_f32,
+    thread float4 (&x)[8],
+    thread float &x_sum) {
+  float4 s4 = float4(0.0f);
+  if (latent_f32 != 0u) {
+    const device float *p = reinterpret_cast<device const float *>(latent_raw) + base_elem;
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+      x[i] = float4(p[i * 4u + 0u], p[i * 4u + 1u], p[i * 4u + 2u], p[i * 4u + 3u]);
+      s4 += x[i];
+    }
+  } else {
+    const device bfloat *p = reinterpret_cast<device const bfloat *>(latent_raw) + base_elem;
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+      x[i] = float4(
+          float(p[i * 4u + 0u]),
+          float(p[i * 4u + 1u]),
+          float(p[i * 4u + 2u]),
+          float(p[i * 4u + 3u]));
+      s4 += x[i];
+    }
+  }
+  x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+}
+
+inline float inkling2_markov_fold_finalize(
+    float dot_val,
+    float fb_val,
+    device const uchar *base_logits_raw,
+    ulong base_idx,
+    uint base_f32,
+    float softcap) {
+  const float bias_v = float(bfloat(float(bfloat(dot_val)) + fb_val));
+  const float base_v = inkling2_read_f32(base_logits_raw, base_idx, base_f32);
+  const float summed = float(bfloat(base_v + bias_v));
+  return inkling2_softcap(summed, softcap);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling2_markov_fold_softcap_argmax_stage1(
+    device const uchar *latent_raw [[buffer(0)]],
+    device const uint4 *fold_w_u4 [[buffer(1)]],
+    device const uchar *fold_scales [[buffer(2)]],
+    device const uchar *fold_biases [[buffer(3)]],
+    device const uchar *fold_bias_raw [[buffer(4)]],
+    device const uchar *base_logits_raw [[buffer(5)]],
+    device float *partial_vals [[buffer(6)]],
+    device int32_t *partial_idxs [[buffer(7)]],
+    constant Inkling2MarkovFoldParams &params [[buffer(8)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint split = tgid.x;
+  const uint b0 = tgid.y * 4u;
+  if (split >= params.num_splits || b0 >= params.batch) {
+    return;
+  }
+  const uint n_b = min(4u, params.batch - b0);
+  const uint cols = params.out_cols;
+  const uint chunk = (cols + params.num_splits - 1u) / params.num_splits;
+  const uint start = split * chunk;
+  const uint end = min(start + chunk, cols);
+
+  const uint R = params.rank;
+  const uint n_groups = R >> 5u;
+  const ulong row_u4_stride = ulong(n_groups) * 2ul;
+  const uint latent_f32 = (params.flags >> 0u) & 1u;
+  const uint base_f32 = (params.flags >> 1u) & 1u;
+  const uint fb_f32 = (params.flags >> 2u) & 1u;
+  const uint sidecar_dt = (params.flags >> 3u) & 3u;
+  const bool has_biases = ((params.flags >> 5u) & 1u) != 0u;
+
+  const uint k_lane = lane & 7u;
+  const uint r_id = lane >> 3u; // 0..3
+
+  float best_v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+  int32_t best_i[4] = {-1, -1, -1, -1};
+
+  if (n_b == 1u && R == 256u) {
+    // Specialized fast path for single-sequence DSpark (B=1, R=256):
+    // entire 32-element group of latent[0] stays in 32 float registers!
+    float4 xv[8];
+    float x_sum = 0.0f;
+    inkling2_load_latent_32(
+        latent_raw, ulong(b0) * ulong(params.latent_stride) + ulong(k_lane << 5u), latent_f32, xv, x_sum);
+
+    const ulong base_row_off = ulong(b0) * ulong(params.base_stride);
+    for (uint v_base = start; v_base < end; v_base += 32u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        const ulong w_off = ulong(v) * row_u4_stride + ulong(k_lane) * 2ul;
+        const uint4 p0 = fold_w_u4[w_off + 0ul];
+        const uint4 p1 = fold_w_u4[w_off + 1ul];
+        const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(k_lane);
+        const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+        const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+        float acc = sc * inkling2_dot_q8_32_regs(p0, p1, xv) + bi * x_sum;
+        acc += simd_shuffle_down(acc, 4);
+        acc += simd_shuffle_down(acc, 2);
+        acc += simd_shuffle_down(acc, 1);
+        if (k_lane == 0u) {
+          const float fb = inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32);
+          const float val = inkling2_markov_fold_finalize(
+              acc, fb, base_logits_raw, base_row_off + ulong(v), base_f32, params.softcap);
+          const int32_t ci = int32_t(v);
+          if (best_i[0] < 0 || val > best_v[0] || (val == best_v[0] && ci < best_i[0])) {
+            best_v[0] = val;
+            best_i[0] = ci;
+          }
+        }
+      }
+    }
+  } else if (R == 256u) {
+    // Specialized fast path for multi-lane DSpark (B=2..4, R=256):
+    // cooperatively cache latent[b0..b0+n_b, 0..256] in 4 KB threadgroup memory and read
+    // fold_w_q8 ONCE across all n_b concurrent lanes!
+    threadgroup float tg_x[4][256];
+    threadgroup float tg_xsum[4][8];
+    for (uint b = 0u; b < n_b; ++b) {
+      const float val = inkling2_read_f32(
+          latent_raw, ulong(b0 + b) * ulong(params.latent_stride) + ulong(tid), latent_f32);
+      tg_x[b][tid] = val;
+      const float gsum = simd_sum(val);
+      if (lane == 0u) {
+        tg_xsum[b][sg] = gsum;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint v_base = start; v_base < end; v_base += 32u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        const ulong w_off = ulong(v) * row_u4_stride + ulong(k_lane) * 2ul;
+        const uint4 p0 = fold_w_u4[w_off + 0ul];
+        const uint4 p1 = fold_w_u4[w_off + 1ul];
+        const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(k_lane);
+        const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+        const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+        const float fb = (k_lane == 0u) ? inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32) : 0.0f;
+        const int32_t ci = int32_t(v);
+        for (uint b = 0u; b < n_b; ++b) {
+          const float x_sum = tg_xsum[b][k_lane];
+          float acc = sc * inkling2_dot_q8_32_tg(p0, p1, &tg_x[b][k_lane << 5u]) + bi * x_sum;
+          acc += simd_shuffle_down(acc, 4);
+          acc += simd_shuffle_down(acc, 2);
+          acc += simd_shuffle_down(acc, 1);
+          if (k_lane == 0u) {
+            const float val = inkling2_markov_fold_finalize(
+                acc,
+                fb,
+                base_logits_raw,
+                ulong(b0 + b) * ulong(params.base_stride) + ulong(v),
+                base_f32,
+                params.softcap);
+            if (best_i[b] < 0 || val > best_v[b] || (val == best_v[b] && ci < best_i[b])) {
+              best_v[b] = val;
+              best_i[b] = ci;
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // General R (any multiple of 32)
+    for (uint v_base = start; v_base < end; v_base += 32u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint g = k_lane; g < n_groups; g += 8u) {
+          const ulong w_off = ulong(v) * row_u4_stride + ulong(g) * 2ul;
+          const uint4 p0 = fold_w_u4[w_off + 0ul];
+          const uint4 p1 = fold_w_u4[w_off + 1ul];
+          const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(g);
+          const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+          const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+          for (uint b = 0u; b < n_b; ++b) {
+            float4 xv[8];
+            float x_sum = 0.0f;
+            inkling2_load_latent_32(
+                latent_raw,
+                ulong(b0 + b) * ulong(params.latent_stride) + ulong(g << 5u),
+                latent_f32,
+                xv,
+                x_sum);
+            acc[b] += sc * inkling2_dot_q8_32_regs(p0, p1, xv) + bi * x_sum;
+          }
+        }
+        const float fb = (k_lane == 0u) ? inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32) : 0.0f;
+        const int32_t ci = int32_t(v);
+        for (uint b = 0u; b < n_b; ++b) {
+          float a = acc[b];
+          a += simd_shuffle_down(a, 4);
+          a += simd_shuffle_down(a, 2);
+          a += simd_shuffle_down(a, 1);
+          if (k_lane == 0u) {
+            const float val = inkling2_markov_fold_finalize(
+                a,
+                fb,
+                base_logits_raw,
+                ulong(b0 + b) * ulong(params.base_stride) + ulong(v),
+                base_f32,
+                params.softcap);
+            if (best_i[b] < 0 || val > best_v[b] || (val == best_v[b] && ci < best_i[b])) {
+              best_v[b] = val;
+              best_i[b] = ci;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Reduce per-SG winners across the 4 row slots (lanes 0, 8, 16, 24) then across 8 SGs.
+  threadgroup float tg_v[4][8];
+  threadgroup int32_t tg_i[4][8];
+  for (uint b = 0u; b < n_b; ++b) {
+    float bv = best_v[b];
+    int32_t bi = best_i[b];
+    {
+      const float ov = simd_shuffle_xor(bv, 16);
+      const int32_t oi = simd_shuffle_xor(bi, 16);
+      if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+        bv = ov;
+        bi = oi;
+      }
+    }
+    {
+      const float ov = simd_shuffle_xor(bv, 8);
+      const int32_t oi = simd_shuffle_xor(bi, 8);
+      if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+        bv = ov;
+        bi = oi;
+      }
+    }
+    if (lane == 0u) {
+      tg_v[b][sg] = bv;
+      tg_i[b][sg] = bi;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg == 0u) {
+    for (uint b = 0u; b < n_b; ++b) {
+      float v = lane < 8u ? tg_v[b][lane] : -INFINITY;
+      int32_t i = lane < 8u ? tg_i[b][lane] : -1;
+      for (ushort mask = 4; mask > 0; mask >>= 1) {
+        const float ov = simd_shuffle_xor(v, mask);
+        const int32_t oi = simd_shuffle_xor(i, mask);
+        if (oi >= 0 && (i < 0 || ov > v || (ov == v && oi < i))) {
+          v = ov;
+          i = oi;
+        }
+      }
+      if (lane == 0u) {
+        const ulong out_slot = ulong(b0 + b) * ulong(params.num_splits) + split;
+        partial_vals[out_slot] = v;
+        partial_idxs[out_slot] = i;
+      }
+    }
+  }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling2_markov_fold_softcap_f32(
+    device const uchar *latent_raw [[buffer(0)]],
+    device const uint4 *fold_w_u4 [[buffer(1)]],
+    device const uchar *fold_scales [[buffer(2)]],
+    device const uchar *fold_biases [[buffer(3)]],
+    device const uchar *fold_bias_raw [[buffer(4)]],
+    device const uchar *base_logits_raw [[buffer(5)]],
+    device float *out_logits [[buffer(6)]],
+    constant Inkling2MarkovFoldParams &params [[buffer(7)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint b0 = tgid.y * 4u;
+  if (b0 >= params.batch) {
+    return;
+  }
+  const uint n_b = min(4u, params.batch - b0);
+  const uint k_lane = lane & 7u;
+  const uint r_id = lane >> 3u;
+  const uint v = tgid.x * 32u + sg * 4u + r_id;
+
+  const uint R = params.rank;
+  const uint n_groups = R >> 5u;
+  const ulong row_u4_stride = ulong(n_groups) * 2ul;
+  const uint latent_f32 = (params.flags >> 0u) & 1u;
+  const uint base_f32 = (params.flags >> 1u) & 1u;
+  const uint fb_f32 = (params.flags >> 2u) & 1u;
+  const uint sidecar_dt = (params.flags >> 3u) & 3u;
+  const bool has_biases = ((params.flags >> 5u) & 1u) != 0u;
+
+  if (n_b == 1u && R == 256u) {
+    if (v >= params.out_cols) {
+      return;
+    }
+    float4 xv[8];
+    float x_sum = 0.0f;
+    inkling2_load_latent_32(
+        latent_raw, ulong(b0) * ulong(params.latent_stride) + ulong(k_lane << 5u), latent_f32, xv, x_sum);
+    const ulong w_off = ulong(v) * row_u4_stride + ulong(k_lane) * 2ul;
+    const uint4 p0 = fold_w_u4[w_off + 0ul];
+    const uint4 p1 = fold_w_u4[w_off + 1ul];
+    const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(k_lane);
+    const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+    const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+    float acc = sc * inkling2_dot_q8_32_regs(p0, p1, xv) + bi * x_sum;
+    acc += simd_shuffle_down(acc, 4);
+    acc += simd_shuffle_down(acc, 2);
+    acc += simd_shuffle_down(acc, 1);
+    if (k_lane == 0u) {
+      const float fb = inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32);
+      out_logits[ulong(b0) * ulong(params.out_cols) + ulong(v)] = inkling2_markov_fold_finalize(
+          acc,
+          fb,
+          base_logits_raw,
+          ulong(b0) * ulong(params.base_stride) + ulong(v),
+          base_f32,
+          params.softcap);
+    }
+    return;
+  }
+
+  if (R == 256u) {
+    threadgroup float tg_x[4][256];
+    threadgroup float tg_xsum[4][8];
+    for (uint b = 0u; b < n_b; ++b) {
+      const float val = inkling2_read_f32(
+          latent_raw, ulong(b0 + b) * ulong(params.latent_stride) + ulong(tid), latent_f32);
+      tg_x[b][tid] = val;
+      const float gsum = simd_sum(val);
+      if (lane == 0u) {
+        tg_xsum[b][sg] = gsum;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (v >= params.out_cols) {
+      return;
+    }
+    const ulong w_off = ulong(v) * row_u4_stride + ulong(k_lane) * 2ul;
+    const uint4 p0 = fold_w_u4[w_off + 0ul];
+    const uint4 p1 = fold_w_u4[w_off + 1ul];
+    const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(k_lane);
+    const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+    const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+    const float fb = (k_lane == 0u) ? inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32) : 0.0f;
+    for (uint b = 0u; b < n_b; ++b) {
+      float acc = sc * inkling2_dot_q8_32_tg(p0, p1, &tg_x[b][k_lane << 5u]) + bi * tg_xsum[b][k_lane];
+      acc += simd_shuffle_down(acc, 4);
+      acc += simd_shuffle_down(acc, 2);
+      acc += simd_shuffle_down(acc, 1);
+      if (k_lane == 0u) {
+        out_logits[ulong(b0 + b) * ulong(params.out_cols) + ulong(v)] = inkling2_markov_fold_finalize(
+            acc,
+            fb,
+            base_logits_raw,
+            ulong(b0 + b) * ulong(params.base_stride) + ulong(v),
+            base_f32,
+            params.softcap);
+      }
+    }
+    return;
+  }
+
+  if (v >= params.out_cols) {
+    return;
+  }
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (uint g = k_lane; g < n_groups; g += 8u) {
+    const ulong w_off = ulong(v) * row_u4_stride + ulong(g) * 2ul;
+    const uint4 p0 = fold_w_u4[w_off + 0ul];
+    const uint4 p1 = fold_w_u4[w_off + 1ul];
+    const ulong s_idx = ulong(v) * ulong(n_groups) + ulong(g);
+    const float sc = inkling2_read_sidecar_dt(fold_scales, s_idx, sidecar_dt);
+    const float bi = has_biases ? inkling2_read_sidecar_dt(fold_biases, s_idx, sidecar_dt) : 0.0f;
+    for (uint b = 0u; b < n_b; ++b) {
+      float4 xv[8];
+      float x_sum = 0.0f;
+      inkling2_load_latent_32(
+          latent_raw,
+          ulong(b0 + b) * ulong(params.latent_stride) + ulong(g << 5u),
+          latent_f32,
+          xv,
+          x_sum);
+      acc[b] += sc * inkling2_dot_q8_32_regs(p0, p1, xv) + bi * x_sum;
+    }
+  }
+  const float fb = (k_lane == 0u) ? inkling2_read_f32(fold_bias_raw, ulong(v), fb_f32) : 0.0f;
+  for (uint b = 0u; b < n_b; ++b) {
+    float a = acc[b];
+    a += simd_shuffle_down(a, 4);
+    a += simd_shuffle_down(a, 2);
+    a += simd_shuffle_down(a, 1);
+    if (k_lane == 0u) {
+      out_logits[ulong(b0 + b) * ulong(params.out_cols) + ulong(v)] = inkling2_markov_fold_finalize(
+          a,
+          fb,
+          base_logits_raw,
+          ulong(b0 + b) * ulong(params.base_stride) + ulong(v),
+          base_f32,
+          params.softcap);
+    }
+  }
+}
+
+// ============================================================================
+// 15. inkling2_bf16_linear + inkling2_bf16_lm_head_softcap_argmax
+//     Coalesced single-pass BF16 linear (`1 <= M <= 32`, `K % 4 == 0`) with
+//     128-bit `uint4` weight loads and exact 32-lane FP32 reduction order
+//     (0-ULP bit-exact batch-size invariance across ALL M in 1..=32!).
+// ============================================================================
+struct Inkling2Bf16LinearParams {
+  uint rows;        // M (1..=32)
+  uint out_dim;     // N (or out_cols for lm_head)
+  uint in_dim;      // K (% 4 == 0)
+  uint num_splits;  // stage1 TG count for lm_head argmax (0 for linear)
+  float softcap;    // softcap (> 0) for lm_head argmax
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+};
+
+inline float inkling2_reduce_32_ordered(float v) {
+  v += simd_shuffle_down(v, 16);
+  v += simd_shuffle_down(v, 8);
+  v += simd_shuffle_down(v, 4);
+  v += simd_shuffle_down(v, 2);
+  v += simd_shuffle_down(v, 1);
+  return v;
+}
+
+// Explicit FP32 FMA micro-step (8 ffma ops vs 16 fmul/fadd under fp contract(off),
+// identical instruction order across ALL M=1..=32 -> 0-ULP batch-size invariance!).
+inline float inkling2_bf16_fma8(float acc, float4 w0, float4 w1, uint4 xr) {
+  const float4 x0 = float4(as_type<bfloat4>(xr.xy));
+  acc = fma(w0.x, x0.x, acc);
+  acc = fma(w0.y, x0.y, acc);
+  acc = fma(w0.z, x0.z, acc);
+  acc = fma(w0.w, x0.w, acc);
+  const float4 x1 = float4(as_type<bfloat4>(xr.zw));
+  acc = fma(w1.x, x1.x, acc);
+  acc = fma(w1.y, x1.y, acc);
+  acc = fma(w1.z, x1.z, acc);
+  acc = fma(w1.w, x1.w, acc);
+  return acc;
+}
+
+inline float inkling2_bf16_fma4(float acc, float4 w0, ushort4 xr) {
+  const float4 x0 = float4(as_type<bfloat4>(xr));
+  acc = fma(w0.x, x0.x, acc);
+  acc = fma(w0.y, x0.y, acc);
+  acc = fma(w0.z, x0.z, acc);
+  acc = fma(w0.w, x0.w, acc);
+  return acc;
+}
+
+// Grid: (ceil(N / 4), 1, 1), TG: (128, 1, 1) -> 4 SGs x 1 output row/SG.
+// 4x in-flight uint4 loads (16 cachelines/SG) saturates M5 Max DRAM bandwidth while
+// preserving the exact sequential k-order of `inkling2_bf16_linear_batched` (0-ULP parity).
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_bf16_linear_m1(
+    device const bfloat *x [[buffer(0)]],
+    device const bfloat *w [[buffer(1)]],
+    device bfloat *out [[buffer(2)]],
+    constant Inkling2Bf16LinearParams &params [[buffer(3)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint n = tgid_x * 4u + sg;
+  if (n >= params.out_dim) {
+    return;
+  }
+  const uint K = params.in_dim;
+  const uint K_vec8 = K & ~7u;
+  const uint K_unroll = K_vec8 & ~1023u;
+  const device bfloat *w_row = w + ulong(n) * ulong(K);
+
+  float acc = 0.0f;
+  uint k = lane * 8u;
+  for (; k < K_unroll; k += 1024u) {
+    const uint4 wr0 = *reinterpret_cast<device const uint4 *>(w_row + k);
+    const uint4 wr1 = *reinterpret_cast<device const uint4 *>(w_row + k + 256u);
+    const uint4 wr2 = *reinterpret_cast<device const uint4 *>(w_row + k + 512u);
+    const uint4 wr3 = *reinterpret_cast<device const uint4 *>(w_row + k + 768u);
+    const uint4 xr0 = *reinterpret_cast<device const uint4 *>(x + k);
+    const uint4 xr1 = *reinterpret_cast<device const uint4 *>(x + k + 256u);
+    const uint4 xr2 = *reinterpret_cast<device const uint4 *>(x + k + 512u);
+    const uint4 xr3 = *reinterpret_cast<device const uint4 *>(x + k + 768u);
+    acc = inkling2_bf16_fma8(acc, float4(as_type<bfloat4>(wr0.xy)), float4(as_type<bfloat4>(wr0.zw)), xr0);
+    acc = inkling2_bf16_fma8(acc, float4(as_type<bfloat4>(wr1.xy)), float4(as_type<bfloat4>(wr1.zw)), xr1);
+    acc = inkling2_bf16_fma8(acc, float4(as_type<bfloat4>(wr2.xy)), float4(as_type<bfloat4>(wr2.zw)), xr2);
+    acc = inkling2_bf16_fma8(acc, float4(as_type<bfloat4>(wr3.xy)), float4(as_type<bfloat4>(wr3.zw)), xr3);
+  }
+  for (; k < K_vec8; k += 256u) {
+    const uint4 wr = *reinterpret_cast<device const uint4 *>(w_row + k);
+    const uint4 xr = *reinterpret_cast<device const uint4 *>(x + k);
+    acc = inkling2_bf16_fma8(acc, float4(as_type<bfloat4>(wr.xy)), float4(as_type<bfloat4>(wr.zw)), xr);
+  }
+  if (K_vec8 < K && lane == 0u) {
+    const ushort4 wr = *reinterpret_cast<device const ushort4 *>(w_row + K_vec8);
+    const ushort4 xr = *reinterpret_cast<device const ushort4 *>(x + K_vec8);
+    acc = inkling2_bf16_fma4(acc, float4(as_type<bfloat4>(wr)), xr);
+  }
+
+  acc = inkling2_reduce_32_ordered(acc);
+  if (lane == 0u) {
+    out[n] = bfloat(acc);
+  }
+}
+
+// Grid: (ceil(M / 32) * ceil(N / 16), 1, 1), TG: (128, 1, 1) -> 4 SGs split-K (KS=4).
+// Apple M5 Max hardware NAX (`mpp::tensor_ops::matmul2d`, TSM=32, TSN=16, BK=64, KS=4, 6 KB smem):
+// - Streams W directly from device memory at ~580 GB/s & 60+ TFLOPS in ONE DRAM pass for M=1..=32!
+// - Never shifts tile origins at M/N edges -> 0-ULP bit-exact batch-size invariance across ALL
+//   M = 1, 2, 4, 5, 6, 7, 8, 16, 20, 32, 38, 678, 2048!
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_bf16_linear_batched(
+    device const bfloat *x [[buffer(0)]],
+    device const bfloat *w [[buffer(1)]],
+    device bfloat *out [[buffer(2)]],
+    constant Inkling2Bf16LinearParams &params [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)lane;
+  using extents_t = metal::dextents<int32_t, 2>;
+  using strides_t = metal::array<int32_t, 2>;
+  using dev_tensor_t = metal::tensor<device bfloat, extents_t, metal::tensor_inline>;
+  using tg_tensor_t = metal::tensor<threadgroup float, extents_t, metal::tensor_inline>;
+
+  constexpr int TSM = 32;
+  constexpr int TSN = 16;
+  constexpr int BK = 64;
+  constexpr int KS = 4;
+
+  const int M = int(params.rows);
+  const int N = int(params.out_dim);
+  const int K = int(params.in_dim);
+  const int tiles_m = (M + TSM - 1) / TSM;
+  const int tgp = int(tgid.x);
+  const int tile_m = tgp % tiles_m;
+  const int tile_n = tgp / tiles_m;
+  const int m_off = tile_m * TSM;
+  const int n_off = tile_n * TSN;
+  if (m_off >= M || n_off >= N) {
+    return;
+  }
+
+  const int rows = min(TSM, M - m_off);
+  const int cols = min(TSN, N - n_off);
+  const bool full_mn = (rows == TSM && cols == TSN);
+  const int k_group = int(sg);
+
+  device bfloat *A = const_cast<device bfloat *>(x) + int64_t(m_off) * K;
+  device bfloat *B = const_cast<device bfloat *>(w) + int64_t(n_off) * K;
+  device bfloat *D = out + int64_t(m_off) * N + n_off;
+
+  dev_tensor_t tA(A, extents_t(K, rows), strides_t{1, K});
+  dev_tensor_t tB(B, extents_t(K, cols), strides_t{1, K});
+
+  auto a_chunk = [&](int k) { return tA.template slice<BK, TSM>(k, 0); };
+  auto b_chunk = [&](int k) { return tB.template slice<BK, TSN>(k, 0); };
+  using a_chunk_t = decltype(a_chunk(0));
+  using b_chunk_t = decltype(b_chunk(0));
+
+  constexpr auto desc = matmul2d_descriptor(
+      TSM,
+      TSN,
+      BK,
+      false,
+      true,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, metal::execution_simdgroup> op;
+
+  auto Dacc = op.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+  #pragma unroll
+  for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+    Dacc[i] = 0.0f;
+  }
+  auto Areg = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+
+  const int k_iters = ((K + BK - 1) / BK + KS - 1) / KS;
+  for (int it = 0; it < k_iters; ++it) {
+    if ((it & 3) == 0) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
+    const int k = (it * KS + k_group) * BK;
+    if (k >= K) {
+      continue;
+    }
+    if (full_mn && k + BK <= K) {
+      auto a = a_chunk(k);
+      Areg.load(a);
+      auto b = b_chunk(k);
+      op.run(Areg, b, Dacc);
+    } else {
+      const int kk = min(BK, K - k);
+      dev_tensor_t vA(A + k, extents_t(kk, rows), strides_t{1, K});
+      dev_tensor_t vB(B + k, extents_t(kk, cols), strides_t{1, K});
+      op.run(vA, vB, Dacc);
+    }
+  }
+
+  constexpr int kBlockSize = TSM * TSN; // 512 floats
+  threadgroup float partials[(KS - 1) * kBlockSize]; // 6 KB smem
+  if (k_group > 0) {
+    tg_tensor_t tP(partials + (k_group - 1) * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+    Dacc.store(tP);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (k_group != 0) {
+    return;
+  }
+
+  #pragma unroll
+  for (int g = 0; g < KS - 1; ++g) {
+    tg_tensor_t tP(partials + g * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+    auto part = op.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    part.load(tP);
+    #pragma unroll
+    for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+      Dacc[i] += part[i];
+    }
+  }
+
+  auto Dout = op.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, bfloat>();
+  #pragma unroll
+  for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+    Dout[i] = bfloat(Dacc[i]);
+  }
+  dev_tensor_t tD(D, extents_t(cols, rows), strides_t{1, N});
+  if (full_mn) {
+    Dout.store(tD.template slice<TSN, TSM>(0, 0));
+  } else {
+    Dout.store(tD);
+  }
+}
+
+// Fused NAX BF16 lm_head + softcap + Stage 1 argmax (ZERO [M, V] DRAM write, 1 DRAM pass!).
+// Grid: (num_splits = ceil(out_cols / 32), 1, 1), TG: (128, 1, 1) -> 4 SGs split-K (KS=4).
+// Uses exact same TSM=32, BK=64, KS=4 NAX reduction as `inkling2_bf16_linear_batched` ->
+// 0-ULP bit-exact parity across ALL M = 1..=32 AND ~1.7 ms for 926 MB lm_head!
+// Stage 2 reuses `inkling2_lm_head_softcap_argmax_stage2`!
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_bf16_lm_head_softcap_argmax_p1(
+    device const bfloat *x [[buffer(0)]],
+    device const bfloat *w [[buffer(1)]],
+    device float *partial_vals [[buffer(2)]],
+    device int32_t *partial_idxs [[buffer(3)]],
+    constant Inkling2Bf16LinearParams &params [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  using extents_t = metal::dextents<int32_t, 2>;
+  using strides_t = metal::array<int32_t, 2>;
+  using dev_tensor_t = metal::tensor<device bfloat, extents_t, metal::tensor_inline>;
+  using tg_tensor_t = metal::tensor<threadgroup float, extents_t, metal::tensor_inline>;
+
+  constexpr int TSM = 32;
+  constexpr int TSN = 32;
+  constexpr int BK = 64;
+  constexpr int KS = 4;
+
+  const uint split = tgid.x;
+  if (split >= params.num_splits) {
+    return;
+  }
+  const int M = int(params.rows);
+  const int V = int(params.out_dim);
+  const int K = int(params.in_dim);
+  const int n_off = int(split) * TSN;
+  if (n_off >= V || M <= 0) {
+    return;
+  }
+  const int rows = min(TSM, M);
+  const int cols = min(TSN, V - n_off);
+  const bool full_mn = (rows == TSM && cols == TSN);
+  const int k_group = int(sg);
+
+  device bfloat *A = const_cast<device bfloat *>(x);
+  device bfloat *B = const_cast<device bfloat *>(w) + int64_t(n_off) * K;
+
+  dev_tensor_t tA(A, extents_t(K, rows), strides_t{1, K});
+  dev_tensor_t tB(B, extents_t(K, cols), strides_t{1, K});
+
+  auto a_chunk = [&](int k) { return tA.template slice<BK, TSM>(k, 0); };
+  auto b_chunk = [&](int k) { return tB.template slice<BK, TSN>(k, 0); };
+  using a_chunk_t = decltype(a_chunk(0));
+  using b_chunk_t = decltype(b_chunk(0));
+
+  constexpr auto desc = matmul2d_descriptor(
+      TSM,
+      TSN,
+      BK,
+      false,
+      true,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, metal::execution_simdgroup> op;
+
+  auto Dacc = op.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+  #pragma unroll
+  for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+    Dacc[i] = 0.0f;
+  }
+  auto Areg = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+
+  const int k_iters = ((K + BK - 1) / BK + KS - 1) / KS;
+  for (int it = 0; it < k_iters; ++it) {
+    if ((it & 3) == 0) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
+    const int k = (it * KS + k_group) * BK;
+    if (k >= K) {
+      continue;
+    }
+    if (full_mn && k + BK <= K) {
+      auto a = a_chunk(k);
+      Areg.load(a);
+      auto b = b_chunk(k);
+      op.run(Areg, b, Dacc);
+    } else {
+      const int kk = min(BK, K - k);
+      dev_tensor_t vA(A + k, extents_t(kk, rows), strides_t{1, K});
+      dev_tensor_t vB(B + k, extents_t(kk, cols), strides_t{1, K});
+      op.run(vA, vB, Dacc);
+    }
+  }
+
+  constexpr int kBlockSize = TSM * TSN; // 1024 floats
+  threadgroup float partials[(KS - 1) * kBlockSize]; // 12 KB smem (reused for final logits!)
+  if (k_group > 0) {
+    tg_tensor_t tP(partials + (k_group - 1) * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+    Dacc.store(tP);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (k_group == 0) {
+    #pragma unroll
+    for (int g = 0; g < KS - 1; ++g) {
+      tg_tensor_t tP(partials + g * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+      auto part = op.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+      part.load(tP);
+      #pragma unroll
+      for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+        Dacc[i] += part[i];
+      }
+    }
+    tg_tensor_t tOut(partials, extents_t(TSN, TSM), strides_t{1, TSN});
+    Dacc.store(tOut);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // All 4 simdgroups cooperatively softcap + argmax `rows` rows x `cols` (<= 32) vocab cols!
+  const float cap = params.softcap;
+  for (uint r = sg; r < uint(rows); r += 4u) {
+    float bv = -INFINITY;
+    int32_t bi = -1;
+    if (lane < uint(cols)) {
+      float val = float(bfloat(partials[r * 32u + lane]));
+      if (cap > 0.0f) {
+        val = inkling2_softcap(val, cap);
+      }
+      bv = val;
+      bi = int32_t(n_off + int(lane));
+    }
+    #pragma unroll
+    for (ushort off = 16; off >= 1; off >>= 1) {
+      const float ov = simd_shuffle_down(bv, off);
+      const int32_t oi = simd_shuffle_down(bi, off);
+      if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+        bv = ov;
+        bi = oi;
+      }
+    }
+    if (lane == 0u) {
+      const ulong out_slot = ulong(r) * ulong(params.num_splits) + ulong(split);
+      partial_vals[out_slot] = bv;
+      partial_idxs[out_slot] = bi;
     }
   }
 }

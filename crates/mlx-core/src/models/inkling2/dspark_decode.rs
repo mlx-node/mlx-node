@@ -14,7 +14,7 @@ use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
 use crate::stream::{Stream, StreamContext};
 use crate::transformer::paged_kv_cache_adapter::{PagedRaggedRow, SeqId};
 
-use super::dspark::{Inkling2DsparkContext, Inkling2DsparkModel};
+use super::dspark::{AdaptiveDraftDepth, Inkling2DsparkContext, Inkling2DsparkModel};
 use super::model::Inkling2Inner;
 use super::short_conv::Inkling2ShortConvTape;
 
@@ -23,11 +23,13 @@ pub(crate) struct Inkling2DsparkStepper<'a> {
     inner: &'a mut Inkling2Inner,
     seq_id: SeqId,
     ctx: Inkling2DsparkContext,
+    adaptive_depth: AdaptiveDraftDepth,
     tap_visits: Vec<usize>,
     ar_fallback: bool,
     open_ticket: Option<VerifyTicket>,
     open_tape: Option<Inkling2ShortConvTape>,
     open_taps: Option<Vec<MxArray>>,
+    open_device_ids: Option<MxArray>,
     ar_probe_pending: bool,
     ar_probe_taps: Option<Vec<MxArray>>,
 }
@@ -37,6 +39,7 @@ impl Inkling2DsparkStepper<'_> {
         if self.open_ticket.is_some()
             || self.open_tape.is_some()
             || self.open_taps.is_some()
+            || self.open_device_ids.is_some()
             || self.ar_probe_pending
         {
             return Err(Error::from_reason(format!(
@@ -51,6 +54,281 @@ impl Inkling2DsparkStepper<'_> {
             .dspark
             .as_ref()
             .ok_or_else(|| Error::from_reason("Inkling2 DSpark draft model disappeared"))
+    }
+
+    fn verify_host_inner(&mut self, verify_ids: &[u32], greedy_argmax: bool) -> Result<MxArray> {
+        self.ensure_clean("verify")?;
+        if verify_ids.is_empty() {
+            return Err(Error::from_reason(
+                "Inkling2 DSpark verify_ids must not be empty",
+            ));
+        }
+
+        // Fast AR fallback path (post break-even decision): bypass verify/tape machinery cleanly.
+        if self.ar_fallback && verify_ids.len() == 1 {
+            return if greedy_argmax {
+                self.inner
+                    .paged_decode_step_greedy(self.seq_id, verify_ids[0])
+            } else {
+                let logits_2d = self.inner.paged_decode_step(self.seq_id, verify_ids[0])?;
+                let vocab = logits_2d.shape()?[1];
+                logits_2d.reshape(&[1, 1, vocab])
+            };
+        }
+
+        let (first_pos, ticket) = {
+            let rt = self.inner.paged.as_mut().ok_or_else(|| {
+                Error::from_reason("Inkling2 DSpark verify: paged runtime missing")
+            })?;
+            rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
+            let pos = rt
+                .coordinator
+                .request_token_count_all(self.seq_id)
+                .map_err(Error::from_reason)?;
+            let ticket = rt
+                .coordinator
+                .record_verify(self.seq_id, verify_ids)
+                .map_err(Error::from_reason)?;
+            (pos, ticket)
+        };
+
+        let row = PagedRaggedRow {
+            seq_id: self.seq_id,
+            first_logical_position: first_pos,
+            query_len: verify_ids.len() as u32,
+        };
+        let rows = [(row, verify_ids.to_vec())];
+        let tap_indices: &[usize] = if self.ar_fallback {
+            &[]
+        } else {
+            &self.tap_visits
+        };
+        let forward_res = if greedy_argmax {
+            self.inner
+                .paged_verify_ragged_taped_greedy(&rows, tap_indices)
+        } else {
+            self.inner.paged_verify_ragged_taped(&rows, tap_indices)
+        };
+        let (out_arr, taps, mut tapes) = match forward_res {
+            Ok(out) => out,
+            Err(err) => {
+                if let Some(rt) = self.inner.paged.as_mut() {
+                    let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
+                }
+                return Err(err);
+            }
+        };
+
+        let result_arr = if greedy_argmax {
+            out_arr
+        } else {
+            let total_rows = verify_ids.len() as i64;
+            let vocab = out_arr.shape()?[1];
+            out_arr.reshape(&[1, total_rows, vocab])?
+        };
+        let tape = tapes.pop().ok_or_else(|| {
+            Error::from_reason("Inkling2 DSpark verify did not produce a ShortConvTape")
+        })?;
+
+        self.open_ticket = Some(ticket);
+        self.open_tape = Some(tape);
+        self.open_taps = if self.ar_fallback { None } else { Some(taps) };
+        Ok(result_arr)
+    }
+
+    fn verify_device_inner(
+        &mut self,
+        verify_ids: &MxArray,
+        greedy_argmax: bool,
+    ) -> Result<MxArray> {
+        self.ensure_clean("verify_device")?;
+        let len = verify_ids.size()? as usize;
+        if len == 0 {
+            return Err(Error::from_reason(
+                "Inkling2 DSpark verify_device: verify_ids must not be empty",
+            ));
+        }
+        if self.ar_fallback && len == 1 {
+            let id = verify_ids.item_at_int32(0)? as u32;
+            return self.verify_host_inner(&[id], greedy_argmax);
+        }
+
+        let placeholders = vec![u32::MAX; len];
+        let (first_pos, ticket) = {
+            let rt = self.inner.paged.as_mut().ok_or_else(|| {
+                Error::from_reason("Inkling2 DSpark verify_device: paged runtime missing")
+            })?;
+            rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
+            let pos = rt
+                .coordinator
+                .request_token_count_all(self.seq_id)
+                .map_err(Error::from_reason)?;
+            let ticket = rt
+                .coordinator
+                .record_verify(self.seq_id, &placeholders)
+                .map_err(Error::from_reason)?;
+            (pos, ticket)
+        };
+
+        let row = PagedRaggedRow {
+            seq_id: self.seq_id,
+            first_logical_position: first_pos,
+            query_len: len as u32,
+        };
+        let tap_indices: &[usize] = if self.ar_fallback {
+            &[]
+        } else {
+            &self.tap_visits
+        };
+        let forward_res = self.inner.paged_verify_ragged_taped_device(
+            &[row],
+            verify_ids,
+            tap_indices,
+            greedy_argmax,
+        );
+        let (out_arr, taps, mut tapes) = match forward_res {
+            Ok(out) => out,
+            Err(err) => {
+                if let Some(rt) = self.inner.paged.as_mut() {
+                    let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
+                }
+                return Err(err);
+            }
+        };
+
+        let result_arr = if greedy_argmax {
+            out_arr
+        } else {
+            let total_rows = len as i64;
+            let vocab = out_arr.shape()?[1];
+            out_arr.reshape(&[1, total_rows, vocab])?
+        };
+        let tape = tapes.pop().ok_or_else(|| {
+            Error::from_reason("Inkling2 DSpark verify_device did not produce a ShortConvTape")
+        })?;
+
+        self.open_ticket = Some(ticket);
+        self.open_tape = Some(tape);
+        self.open_taps = if self.ar_fallback { None } else { Some(taps) };
+        self.open_device_ids = Some(verify_ids.clone());
+        Ok(result_arr)
+    }
+
+    fn commit_inner(
+        &mut self,
+        keep: usize,
+        total_written: usize,
+        verified_ids: Option<&[u32]>,
+    ) -> Result<()> {
+        if self.ar_fallback && self.open_ticket.is_none() {
+            let _ = self.inner.settle_paged_step(self.seq_id)?;
+            return Ok(());
+        }
+        let ticket = self.open_ticket.take().ok_or_else(|| {
+            Error::from_reason("Inkling2 DSpark commit without open verify ticket")
+        })?;
+        let tape = self
+            .open_tape
+            .take()
+            .ok_or_else(|| Error::from_reason("Inkling2 DSpark commit without ShortConvTape"))?;
+        let taps = self.open_taps.take();
+        let dev_ids = self.open_device_ids.take();
+
+        let ticket_rows = ticket.rows();
+        if keep == 0 || keep > total_written || total_written != ticket_rows {
+            if let Some(rt) = self.inner.paged.as_mut() {
+                let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
+                if let Some(conv) = rt.conv_states.get_mut(&self.seq_id) {
+                    let _ = tape.commit_prefix(0, conv);
+                }
+            }
+            return Err(Error::from_reason(format!(
+                "Inkling2 DSpark invalid commit keep={keep}, total_written={total_written}, ticket_rows={ticket_rows}"
+            )));
+        }
+
+        // If `verify_device` booked placeholder KV entries, patch them with exact token IDs
+        // BEFORE `commit_cycle` truncates the rejected tail.
+        let fallback_host_ids;
+        let patch_ids: Option<&[u32]> = if let Some(dev_arr) = dev_ids {
+            if let Some(host_ids) = verified_ids {
+                if host_ids.len() != total_written {
+                    if let Some(rt) = self.inner.paged.as_mut() {
+                        let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
+                        if let Some(conv) = rt.conv_states.get_mut(&self.seq_id) {
+                            let _ = tape.commit_prefix(0, conv);
+                        }
+                    }
+                    return Err(Error::from_reason(format!(
+                        "Inkling2 DSpark commit_with_provenance: verified_ids len {} != total_written {total_written}",
+                        host_ids.len()
+                    )));
+                }
+                Some(host_ids)
+            } else {
+                let raw = match dev_arr.to_int32() {
+                    Ok(r) => r,
+                    Err(err) => {
+                        if let Some(rt) = self.inner.paged.as_mut() {
+                            let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
+                            if let Some(conv) = rt.conv_states.get_mut(&self.seq_id) {
+                                let _ = tape.commit_prefix(0, conv);
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+                fallback_host_ids = raw.as_ref().iter().map(|&id| id as u32).collect::<Vec<_>>();
+                Some(&fallback_host_ids)
+            }
+        } else {
+            None
+        };
+
+        let committed_tokens = {
+            let rt = self.inner.paged.as_mut().ok_or_else(|| {
+                Error::from_reason("Inkling2 DSpark commit: paged runtime missing")
+            })?;
+            if let Some(ids) = patch_ids {
+                rt.coordinator
+                    .patch_last_recorded_tokens_all(self.seq_id, ids)
+                    .map_err(Error::from_reason)?;
+            }
+            // 1. Roll back rejected KV rows across both Global & SWA pools
+            rt.coordinator
+                .commit_cycle(self.seq_id, ticket, keep)
+                .map_err(Error::from_reason)?;
+
+            // 2. Roll back 48-visit ShortConv state to exact `keep`-token prefix via tape!
+            let conv = rt.conv_states.get_mut(&self.seq_id).ok_or_else(|| {
+                Error::from_reason("Inkling2 DSpark commit: missing ShortConv state")
+            })?;
+            tape.commit_prefix(keep, conv)?;
+
+            let committed = rt
+                .coordinator
+                .request_token_count_all(self.seq_id)
+                .map_err(Error::from_reason)?;
+            rt.coordinator
+                .settle_committed(self.seq_id, u64::from(committed))
+                .map_err(Error::from_reason)?;
+            rt.record_block_boundary_conv_from_tape(self.seq_id, committed, keep, &tape)?;
+            committed
+        };
+
+        // 3. Append ONLY the `keep` accepted tokens' tapped hiddens into the draft context!
+        if !self.ar_fallback
+            && let Some(taps) = taps
+            && let Some(ref draft) = self.inner.dspark
+        {
+            self.ctx.append_taps(draft, &taps, keep)?;
+            debug_assert_eq!(self.ctx.committed_len as u32, committed_tokens);
+        }
+        let drafted = total_written.saturating_sub(1);
+        if !self.ar_fallback && drafted > 0 {
+            self.adaptive_depth.observe(drafted, keep.saturating_sub(1));
+        }
+        Ok(())
     }
 }
 
@@ -101,6 +379,11 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
                 keep_probabilities: None,
             });
         }
+        let effective_len = if params.mtp_adaptive_depth {
+            self.adaptive_depth.current_depth(max_len)
+        } else {
+            max_len
+        };
         let draft = self.require_draft()?;
         self.ctx.propose_block(
             draft,
@@ -108,7 +391,7 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
             &self.inner.embed_norm,
             &self.inner.lm_head,
             anchor_id,
-            max_len,
+            effective_len,
             params,
             rng,
         )
@@ -172,134 +455,38 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
-        self.ensure_clean("verify")?;
-        if verify_ids.is_empty() {
-            return Err(Error::from_reason(
-                "Inkling2 DSpark verify_ids must not be empty",
-            ));
-        }
-
-        // Fast AR fallback path (post break-even decision): bypass verify/tape machinery cleanly.
-        if self.ar_fallback && verify_ids.len() == 1 {
-            let logits_2d = self.inner.paged_decode_step(self.seq_id, verify_ids[0])?;
-            let vocab = logits_2d.shape()?[1];
-            let logits = logits_2d.reshape(&[1, 1, vocab])?;
-            return Ok(DsparkVerifyOutput { logits });
-        }
-
-        let (first_pos, ticket) = {
-            let rt = self.inner.paged.as_mut().ok_or_else(|| {
-                Error::from_reason("Inkling2 DSpark verify: paged runtime missing")
-            })?;
-            rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
-            let pos = rt
-                .coordinator
-                .request_token_count_all(self.seq_id)
-                .map_err(Error::from_reason)?;
-            let ticket = rt
-                .coordinator
-                .record_verify(self.seq_id, verify_ids)
-                .map_err(Error::from_reason)?;
-            (pos, ticket)
-        };
-
-        let row = PagedRaggedRow {
-            seq_id: self.seq_id,
-            first_logical_position: first_pos,
-            query_len: verify_ids.len() as u32,
-        };
-        let rows = [(row, verify_ids.to_vec())];
-        let tap_indices: &[usize] = if self.ar_fallback {
-            &[]
-        } else {
-            &self.tap_visits
-        };
-        let forward_res = self.inner.paged_verify_ragged_taped(&rows, tap_indices);
-        let (logits_2d, taps, mut tapes) = match forward_res {
-            Ok(out) => out,
-            Err(err) => {
-                if let Some(rt) = self.inner.paged.as_mut() {
-                    let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
-                }
-                return Err(err);
-            }
-        };
-
-        let total_rows = verify_ids.len() as i64;
-        let vocab = logits_2d.shape()?[1];
-        let logits = logits_2d.reshape(&[1, total_rows, vocab])?;
-        let tape = tapes.pop().ok_or_else(|| {
-            Error::from_reason("Inkling2 DSpark verify did not produce a ShortConvTape")
-        })?;
-
-        self.open_ticket = Some(ticket);
-        self.open_tape = Some(tape);
-        self.open_taps = if self.ar_fallback { None } else { Some(taps) };
+        let logits = self.verify_host_inner(verify_ids, false)?;
         Ok(DsparkVerifyOutput { logits })
     }
 
+    fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        let logits = self.verify_device_inner(verify_ids, false)?;
+        Ok(DsparkVerifyOutput { logits })
+    }
+
+    fn supports_fused_greedy_verify(&self) -> bool {
+        true
+    }
+
+    fn verify_greedy(&mut self, verify_ids: &[u32]) -> Result<MxArray> {
+        self.verify_host_inner(verify_ids, true)
+    }
+
+    fn verify_device_greedy(&mut self, verify_ids: &MxArray) -> Result<MxArray> {
+        self.verify_device_inner(verify_ids, true)
+    }
+
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
-        if self.ar_fallback && self.open_ticket.is_none() {
-            let _ = self.inner.settle_paged_step(self.seq_id)?;
-            return Ok(());
-        }
-        let ticket = self.open_ticket.take().ok_or_else(|| {
-            Error::from_reason("Inkling2 DSpark commit without open verify ticket")
-        })?;
-        let tape = self
-            .open_tape
-            .take()
-            .ok_or_else(|| Error::from_reason("Inkling2 DSpark commit without ShortConvTape"))?;
-        let taps = self.open_taps.take();
+        self.commit_inner(keep, total_written, None)
+    }
 
-        let ticket_rows = ticket.rows();
-        if keep == 0 || keep > total_written || total_written != ticket_rows {
-            if let Some(rt) = self.inner.paged.as_mut() {
-                let _ = rt.coordinator.commit_cycle(self.seq_id, ticket, 0);
-                if let Some(conv) = rt.conv_states.get_mut(&self.seq_id) {
-                    let _ = tape.commit_prefix(0, conv);
-                }
-            }
-            return Err(Error::from_reason(format!(
-                "Inkling2 DSpark invalid commit keep={keep}, total_written={total_written}, ticket_rows={ticket_rows}"
-            )));
-        }
-
-        let committed_tokens = {
-            let rt = self.inner.paged.as_mut().ok_or_else(|| {
-                Error::from_reason("Inkling2 DSpark commit: paged runtime missing")
-            })?;
-            // 1. Roll back rejected KV rows across both Global & SWA pools
-            rt.coordinator
-                .commit_cycle(self.seq_id, ticket, keep)
-                .map_err(Error::from_reason)?;
-
-            // 2. Roll back 48-visit ShortConv state to exact `keep`-token prefix via tape!
-            let conv = rt.conv_states.get_mut(&self.seq_id).ok_or_else(|| {
-                Error::from_reason("Inkling2 DSpark commit: missing ShortConv state")
-            })?;
-            tape.commit_prefix(keep, conv)?;
-
-            let committed = rt
-                .coordinator
-                .request_token_count_all(self.seq_id)
-                .map_err(Error::from_reason)?;
-            rt.coordinator
-                .settle_committed(self.seq_id, u64::from(committed))
-                .map_err(Error::from_reason)?;
-            rt.record_block_boundary_conv_from_tape(self.seq_id, committed, keep, &tape)?;
-            committed
-        };
-
-        // 3. Append ONLY the `keep` accepted tokens' tapped hiddens into the draft context!
-        if !self.ar_fallback
-            && let Some(taps) = taps
-            && let Some(ref draft) = self.inner.dspark
-        {
-            self.ctx.append_taps(draft, &taps, keep)?;
-            debug_assert_eq!(self.ctx.committed_len as u32, committed_tokens);
-        }
-        Ok(())
+    fn commit_with_provenance(
+        &mut self,
+        keep: usize,
+        total_written: usize,
+        verified_ids: &[u32],
+    ) -> Result<()> {
+        self.commit_inner(keep, total_written, Some(verified_ids))
     }
 
     fn finish(self) -> Result<()> {
@@ -367,11 +554,13 @@ impl DsparkBackend for Inkling2Inner {
             inner: self,
             seq_id,
             ctx,
+            adaptive_depth: AdaptiveDraftDepth::new(expected),
             tap_visits,
             ar_fallback: false,
             open_ticket: None,
             open_tape: None,
             open_taps: None,
+            open_device_ids: None,
             ar_probe_pending: false,
             ar_probe_taps: None,
         })

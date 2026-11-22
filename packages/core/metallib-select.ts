@@ -163,6 +163,10 @@ export const BRIDGE_KERNEL_MARKERS = [
   'inkling2_sconv_k4_ragged_bf16',
   'inkling2_sconv_k4_ragged_f32',
   'inkling2_moe_router_proj_f32',
+  'inkling2_loop_ctrl_down_f32',
+  'inkling2_loop_ctrl_up_blend_f32',
+  'inkling2_rms_norm_from_sq_bf16',
+  'inkling2_rms_norm_from_sq_f32',
   'inkling2_moe_route_f32',
   'inkling2_moe_combine_bf16',
   'inkling2_moe_combine_f32',
@@ -170,16 +174,29 @@ export const BRIDGE_KERNEL_MARKERS = [
   'inkling2_lm_head_softcap_argmax_stage1',
   'inkling2_lm_head_softcap_argmax_stage2',
   'inkling2_markov_gate_bf16',
+  'inkling2_markov_fold_softcap_f32',
+  'inkling2_markov_fold_softcap_argmax_stage1',
+  'inkling2_bf16_linear_m1',
+  'inkling2_bf16_linear_batched',
+  'inkling2_bf16_lm_head_softcap_argmax_p1',
   'inkling2_moe_m1_gate_up_situ_nvfp4',
   'inkling2_moe_m1_gate_up_situ_q8',
+  'inkling2_moe_m1_gate_up_situ_mxfp8',
   'inkling2_moe_m1_down_combine_nvfp4',
+  'inkling2_moe_m1_down_combine_sconv_nvfp4',
   'inkling2_moe_m1_down_combine_q8',
+  'inkling2_moe_m1_down_combine_sconv_q8',
+  'inkling2_moe_m1_down_combine_mxfp8',
+  'inkling2_moe_m1_down_combine_sconv_mxfp8',
   'inkling2_moe_group',
+  'inkling2_moe_route_group_small',
   'inkling2_moe_gather',
   'inkling2_moe_simd_gate_up_situ_nvfp4',
   'inkling2_moe_simd_gate_up_situ_q8',
+  'inkling2_moe_simd_gate_up_situ_mxfp8',
   'inkling2_moe_simd_down_nvfp4',
   'inkling2_moe_simd_down_q8',
+  'inkling2_moe_simd_down_mxfp8',
   'inkling2_moe_gate_up_situ_nax_nvfp4_8',
   'inkling2_moe_gate_up_situ_nax_nvfp4_32',
   'inkling2_moe_gate_up_situ_nax_q8_8',
@@ -189,6 +206,7 @@ export const BRIDGE_KERNEL_MARKERS = [
   'inkling2_moe_down_nax_q8_8',
   'inkling2_moe_down_nax_q8_32',
   'inkling2_moe_grouped_combine_bf16',
+  'inkling2_moe_grouped_combine_sconv_bf16',
   ...GGUF_REPACK_KERNEL_MARKERS,
 ] as const;
 
@@ -689,14 +707,14 @@ export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: str
         `containing mlx-sys-*/out dir.`,
     );
   }
-  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => {
-    if ((GGUF_REPACK_KERNEL_MARKERS as readonly string[]).includes(name)) {
-      // Base repack names also prefix their _t64 variants, so substring checks
-      // can hide a missing base kernel. Repack symbols are exact NUL-delimited names.
-      return !metallib.includes(`\0${name}\0`, 'latin1');
-    }
-    return !metallib.includes(name);
-  });
+  const missingBridge = BRIDGE_KERNEL_MARKERS.filter(
+    // Bridge symbols can be prefixes of longer kernel names (e.g.
+    // `inkling2_moe_group` prefixes `inkling2_moe_grouped_combine_bf16`, and
+    // base GGUF repack names prefix their `_t64` variants), so bare substring
+    // checks hide a missing kernel. Metal function names in MTLB are exact
+    // NUL-delimited strings.
+    (name) => !metallib.includes(`\0${name}\0`, 'latin1'),
+  );
   if (missingBridge.length > 0) {
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) or ` +

@@ -137,6 +137,32 @@ thread_local! {
 ///
 /// `cut` decides the rows at and after a thinking cut: each selects its end
 /// token, with no draw.
+fn accept_dspark_greedy_argmax(
+    argmax_arr: &MxArray,
+    proposal: &mut DsparkProposal,
+    cut: Option<&ThinkingCut>,
+) -> Result<(usize, u32)> {
+    let draft_len = proposal.draft_len()?;
+    MxArray::eval_arrays_with_context(&[argmax_arr], "speculative_greedy_accept")?;
+    timeline::mark(Mark::VerifyWait);
+    // The verify graph (incl. a device-resident proposal path) is
+    // now materialized: the host back-fill below is a plain copy.
+    proposal.materialize_draft_ids()?;
+    let forced = cut_targets(cut, &proposal.draft_ids);
+    let mut target_argmax: Vec<i32> = Vec::with_capacity(draft_len + 1);
+    for i in 0..=draft_len {
+        target_argmax.push(match forced.as_ref().and_then(|f| f.at(i)) {
+            Some(token) => token as i32,
+            None => argmax_arr.item_at_int32(i)?,
+        });
+    }
+    let mut k = 0usize;
+    while k < draft_len && target_argmax[k] == proposal.draft_ids[k] {
+        k += 1;
+    }
+    Ok((k, target_argmax[k] as u32))
+}
+
 pub(crate) fn accept_dspark_proposal(
     logits: &MxArray,
     proposal: &mut DsparkProposal,
@@ -174,27 +200,8 @@ pub(crate) fn accept_dspark_proposal(
         // Greedy fast path (penalties no-op): ONE batched argmax over
         // all 1+L rows, a single eval, then CPU reads. No RNG consumed
         // (mirrors `accept_with_residual`'s T=0 shortcut).
-        (|| {
-            let argmax_arr = logits.argmax(-1, None)?;
-            MxArray::eval_arrays_with_context(&[&argmax_arr], "speculative_greedy_accept")?;
-            timeline::mark(Mark::VerifyWait);
-            // The verify graph (incl. a device-resident proposal path) is
-            // now materialized: the host back-fill below is a plain copy.
-            proposal.materialize_draft_ids()?;
-            let forced = cut_targets(cut, &proposal.draft_ids);
-            let mut target_argmax: Vec<i32> = Vec::with_capacity(draft_len + 1);
-            for i in 0..=draft_len {
-                target_argmax.push(match forced.as_ref().and_then(|f| f.at(i)) {
-                    Some(token) => token as i32,
-                    None => argmax_arr.item_at_int32(i)?,
-                });
-            }
-            let mut k = 0usize;
-            while k < draft_len && target_argmax[k] == proposal.draft_ids[k] {
-                k += 1;
-            }
-            Ok((k, target_argmax[k] as u32))
-        })()
+        let argmax_arr = logits.argmax(-1, None)?;
+        accept_dspark_greedy_argmax(&argmax_arr, proposal, cut)
     } else if greedy_temp {
         // Host ids feed the penalized history prefix before the eval, so a
         // device path (not produced under active penalties) must land first.
@@ -1390,81 +1397,107 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 // Teacher forcing: the reference continuation replaces the drafts as
                 // the verify input, through the same host verify path.
                 let tf_ids = tf.verify_ids(generated, anchor, draft_len)?;
-                let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
-                    step.verify_ar_probe(anchor)
-                } else if let Some(ids) = tf_ids.as_ref() {
-                    step.verify(ids)
-                } else if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
-                    // Device-resident proposal: anchor + draft path enter the target
-                    // graph without a host round-trip (the acceptance eval below
-                    // remains the cycle's single materialization point).
-                    let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
-                    let ids = MxArray::concatenate(&anchor_arr, device_ids, 0)?;
-                    step.verify_device(&ids)
-                } else {
-                    let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
-                    verify_ids.push(anchor);
-                    verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
-                    step.verify(&verify_ids)
-                };
-                profiler.end();
-                let verify_out = verify_res?;
-                let logits = verify_out.logits; // [1, 1+L, vocab]
+                let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+                let penalties_no_op = p.repetition_penalty == 1.0
+                    && p.presence_penalty == 0.0
+                    && p.frequency_penalty == 0.0;
+                let use_fused_greedy = step.supports_fused_greedy_verify()
+                    && measurement_cycle != DsparkMeasurementCycle::ArProbe
+                    && tf_ids.is_none()
+                    && !(!touched && step.device_verification_budget().is_some())
+                    && sampling::is_greedy_temperature(temperature)
+                    && penalties_no_op;
 
-                // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
-                // boundary token (bonus on full accept, residual on rejection).
-                profiler.begin("dspark_accept");
                 let mut device_budget_observation = None;
-                let accept_res = if tf_ids.is_some() {
-                    tf.accept(&logits, &mut proposal, generated)
-                } else if !touched && let Some(budget) = step.device_verification_budget() {
-                    let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
-                    if !sampling::is_greedy_temperature(temperature)
-                        || p.repetition_penalty != 1.0
-                        || p.presence_penalty != 0.0
-                        || p.frequency_penalty != 0.0
-                    {
-                        return Err(Error::from_reason(
-                            "device verification budgeting requires unpenalized greedy acceptance",
-                        ));
-                    }
-                    accept_device_budgeted_greedy(&logits, &mut proposal, budget).map(
-                        |(k, token, rows, raw)| {
-                            device_budget_observation = Some((rows, raw));
-                            (k, token)
-                        },
-                    )
-                } else {
-                    let rows_route = step.device_sampled_rows();
-                    let submitted = if rows_route {
-                        submit_sampled_rows(&logits, &proposal, p, rng)
+                let accept_res = if use_fused_greedy {
+                    let argmax_res = if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
+                        let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
+                        let ids = MxArray::concatenate(&anchor_arr, device_ids, 0)?;
+                        step.verify_device_greedy(&ids)
                     } else {
-                        Ok(None)
+                        let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
+                        verify_ids.push(anchor);
+                        verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+                        step.verify_greedy(&verify_ids)
                     };
-                    match submitted {
-                        Err(error) => Err(error),
-                        Ok(Some(rows)) => MxArray::eval_arrays_with_context(
-                            &[rows.records()],
-                            "speculative_sampled_rows",
-                        )
-                        .and_then(|()| {
-                            timeline::mark(Mark::VerifyWait);
-                            rows.accept(&mut proposal, cut.as_ref())
-                        }),
-                        Ok(None) if !touched && proposal.device_draft_sparse.is_some() => {
-                            accept_device_sampled(&logits, &mut proposal, p, rng)
+                    profiler.end();
+                    let argmax_arr = argmax_res?;
+                    profiler.begin("dspark_accept");
+                    let res = accept_dspark_greedy_argmax(&argmax_arr, &mut proposal, cut.as_ref());
+                    profiler.end();
+                    res
+                } else {
+                    let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+                        step.verify_ar_probe(anchor)
+                    } else if let Some(ids) = tf_ids.as_ref() {
+                        step.verify(ids)
+                    } else if let Some(device_ids) = proposal.device_draft_ids.as_ref() {
+                        // Device-resident proposal: anchor + draft path enter the target
+                        // graph without a host round-trip (the acceptance eval below
+                        // remains the cycle's single materialization point).
+                        let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1])?;
+                        let ids = MxArray::concatenate(&anchor_arr, device_ids, 0)?;
+                        step.verify_device(&ids)
+                    } else {
+                        let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
+                        verify_ids.push(anchor);
+                        verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+                        step.verify(&verify_ids)
+                    };
+                    profiler.end();
+                    let verify_out = verify_res?;
+                    let logits = verify_out.logits; // [1, 1+L, vocab]
+
+                    // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
+                    // boundary token (bonus on full accept, residual on rejection).
+                    profiler.begin("dspark_accept");
+                    let res = if tf_ids.is_some() {
+                        tf.accept(&logits, &mut proposal, generated)
+                    } else if !touched && let Some(budget) = step.device_verification_budget() {
+                        if !sampling::is_greedy_temperature(temperature) || !penalties_no_op {
+                            return Err(Error::from_reason(
+                                "device verification budgeting requires unpenalized greedy acceptance",
+                            ));
                         }
-                        Ok(None) => accept_dspark_proposal(
-                            &logits,
-                            &mut proposal,
-                            hist,
-                            p,
-                            rng,
-                            cut.as_ref(),
-                        ),
-                    }
+                        accept_device_budgeted_greedy(&logits, &mut proposal, budget).map(
+                            |(k, token, rows, raw)| {
+                                device_budget_observation = Some((rows, raw));
+                                (k, token)
+                            },
+                        )
+                    } else {
+                        let rows_route = step.device_sampled_rows();
+                        let submitted = if rows_route {
+                            submit_sampled_rows(&logits, &proposal, p, rng)
+                        } else {
+                            Ok(None)
+                        };
+                        match submitted {
+                            Err(error) => Err(error),
+                            Ok(Some(rows)) => MxArray::eval_arrays_with_context(
+                                &[rows.records()],
+                                "speculative_sampled_rows",
+                            )
+                            .and_then(|()| {
+                                timeline::mark(Mark::VerifyWait);
+                                rows.accept(&mut proposal, cut.as_ref())
+                            }),
+                            Ok(None) if !touched && proposal.device_draft_sparse.is_some() => {
+                                accept_device_sampled(&logits, &mut proposal, p, rng)
+                            }
+                            Ok(None) => accept_dspark_proposal(
+                                &logits,
+                                &mut proposal,
+                                hist,
+                                p,
+                                rng,
+                                cut.as_ref(),
+                            ),
+                        }
+                    };
+                    profiler.end();
+                    res
                 };
-                profiler.end();
                 let (accepted_drafts_k, boundary_id) = accept_res?;
                 timeline::mark(Mark::Accept);
                 // Acceptance has forced the verify graph. Back-fill a device proposal

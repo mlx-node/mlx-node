@@ -148,7 +148,11 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
         for (const auto& name : fast::paged::inkling2_kernel_names()) {
           if (lacks && name.rfind("inkling2_paged_prefill_", 0) == 0) continue;
           if (!q8q_ok && name.find("_q8q_") != std::string::npos) continue;
-          if (!nax_ok && name.find("_nax_") != std::string::npos) continue;
+          const bool is_nax_only =
+              name.find("_nax_") != std::string::npos ||
+              name == "inkling2_bf16_linear_batched" ||
+              name == "inkling2_bf16_lm_head_softcap_argmax_p1";
+          if (!nax_ok && is_nax_only) continue;
           fast::paged::get_prebuilt_kernel(d, "inkling2", "inkling2", name);
           ++built;
         }

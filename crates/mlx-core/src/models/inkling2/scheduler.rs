@@ -932,6 +932,10 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.dspark.is_some() && self.paged.is_some()
     }
 
+    fn supports_adaptive_scheduled_speculation(&self) -> bool {
+        self.dspark.is_some() && self.paged.is_some()
+    }
+
     fn scheduled_sampled_rows(&self) -> bool {
         self.dspark.is_some()
     }
@@ -1304,11 +1308,9 @@ mod tests {
     use crate::engine::cmd::ChatCmd;
     use crate::engine::types::{ChatConfig, ChatResult};
     use crate::models::inkling2::model::{Inkling2LoadOptions, Inkling2Model};
-    use crate::models::inkling2::persistence::load_from_dir;
+    use crate::models::inkling2::persistence::{load_from_dir, test_real_model_path};
     use crate::models::inkling2::scheduler::{Inkling2Cmd, Inkling2SchedulerState};
     use crate::tokenizer::ChatMessage;
-
-    const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
 
     fn greedy_config(owner: &str, max_tokens: i32, salt: &str) -> ChatConfig {
         ChatConfig {
@@ -1373,10 +1375,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires real Inkling-2-Mini GGUF on disk (~18 GB)"]
     async fn inkling2_concurrent_batched_parity() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(
             model_dir.exists(),
-            "Real model directory missing: {}",
+            "Real model path missing: {}",
             model_dir.display()
         );
 
@@ -1391,7 +1394,7 @@ mod tests {
         // 1. Load via full NAPI path (`ModelThread::spawn_with_scheduler` + `MemoryPlan` + `Governor`).
         let t0 = Instant::now();
         let model = Inkling2Model::load(
-            REAL_MODEL_DIR.to_string(),
+            model_path.clone(),
             Some(Inkling2LoadOptions {
                 kv_format: Some("int8".to_string()),
                 cache_disk: Some("0".to_string()),
@@ -1511,7 +1514,7 @@ mod tests {
         drop(model);
 
         // Quick check that `load_from_dir` + `Inkling2SchedulerState::new` works directly too.
-        let inner = load_from_dir(REAL_MODEL_DIR)
+        let inner = load_from_dir(&model_path)
             .await
             .expect("load_from_dir inner");
         let state = Inkling2SchedulerState::new(inner).expect("Inkling2SchedulerState::new");

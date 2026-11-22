@@ -2210,6 +2210,24 @@ pub(crate) trait DsparkStepper {
         self.verify(&ids)
     }
 
+    /// Whether this stepper overrides [`Self::verify_greedy`] and [`Self::verify_device_greedy`]
+    /// with a fused logits+argmax kernel (skipping full `[1+L, V]` FP32 logits materialization).
+    fn supports_fused_greedy_verify(&self) -> bool {
+        false
+    }
+
+    /// Fused greedy variant of [`Self::verify`]: returns `[1+L]` Int32 argmax token IDs directly.
+    fn verify_greedy(&mut self, verify_ids: &[u32]) -> Result<MxArray> {
+        let out = self.verify(verify_ids)?;
+        out.logits.argmax(-1, None)
+    }
+
+    /// Fused greedy variant of [`Self::verify_device`]: returns `[1+L]` Int32 argmax token IDs directly.
+    fn verify_device_greedy(&mut self, verify_ids: &MxArray) -> Result<MxArray> {
+        let out = self.verify_device(verify_ids)?;
+        out.logits.argmax(-1, None)
+    }
+
     /// Whether the target rows of this stepper's sampled, unpenalized cycles
     /// come from the device row kernels
     /// ([`crate::engine::dspark_turn::submit_sampled_rows`]). Every other

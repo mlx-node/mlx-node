@@ -24,8 +24,64 @@ inline float inkling2_decode_fp8_e4m3(uint8_t bits) {
   return float(as_type<half>(u) * 256.0h);
 }
 
+// Exact vectorized 4x FP8 E4M3FN decode WITHOUT the 256.0h factor (hoisted ONCE per 32-elem
+// group in FP32: bit-identical to 4x inkling2_decode_fp8_e4m3 while saving 8 vector half muls!).
+inline half4 decode_fp8_e4m3_4_half_unscaled(uint packed) {
+  const ushort4 b = ushort4(as_type<uchar4>(packed));
+  const ushort4 v = b & ushort4(127u);
+  const ushort4 sign_bit = (b & ushort4(128u)) << 8u;
+  const ushort4 u = (v << 7u) | (((v + 1u) >> 7u) << 14u) | sign_bit;
+  return as_type<half4>(u);
+}
+
+inline void decode_mxfp8_32_half_unscaled(const device uint4 *w_u4, thread half4 (&w)[8]) {
+  const uint4 p0 = w_u4[0];
+  const uint4 p1 = w_u4[1];
+  w[0] = decode_fp8_e4m3_4_half_unscaled(p0.x);
+  w[1] = decode_fp8_e4m3_4_half_unscaled(p0.y);
+  w[2] = decode_fp8_e4m3_4_half_unscaled(p0.z);
+  w[3] = decode_fp8_e4m3_4_half_unscaled(p0.w);
+  w[4] = decode_fp8_e4m3_4_half_unscaled(p1.x);
+  w[5] = decode_fp8_e4m3_4_half_unscaled(p1.y);
+  w[6] = decode_fp8_e4m3_4_half_unscaled(p1.z);
+  w[7] = decode_fp8_e4m3_4_half_unscaled(p1.w);
+}
+
+inline float dot_mxfp8_32_regs(const thread half4 (&w)[8], const thread float4 (&x)[8]) {
+  float acc = 0.0f;
+  acc += dot(float4(w[0]), x[0]);
+  acc += dot(float4(w[1]), x[1]);
+  acc += dot(float4(w[2]), x[2]);
+  acc += dot(float4(w[3]), x[3]);
+  acc += dot(float4(w[4]), x[4]);
+  acc += dot(float4(w[5]), x[5]);
+  acc += dot(float4(w[6]), x[6]);
+  acc += dot(float4(w[7]), x[7]);
+  return acc * 256.0f;
+}
+
+// Exact FP8 UE8M0 scale decode (matches mlx/backend/metal/kernels/fp8.h bit-for-bit).
+inline float inkling2_decode_fp8_e8m0(uint8_t bits) {
+  const uint u = (bits == 0u) ? 0x400000u : (uint(bits) << 23u);
+  return as_type<float>(u);
+}
+
+// Dot 32 FP8 E4M3FN weights (32 bytes = 2 x uint4) against 8 float4 activations in FP32.
+inline float dot_mxfp8_32(const device uint4 *w_u4, const thread float4 (&x)[8]) {
+  half4 w[8];
+  decode_mxfp8_32_half_unscaled(w_u4, w);
+  return dot_mxfp8_32_regs(w, x);
+}
+
 inline float inkling2_read_sidecar(device const uchar *ptr, ulong idx, bool is_f32) {
   if (is_f32) {
+    return reinterpret_cast<device const float *>(ptr)[idx];
+  }
+  return float(reinterpret_cast<device const bfloat *>(ptr)[idx]);
+}
+
+inline float inkling2_moe_read_f32(device const uchar *ptr, ulong idx, uint is_f32) {
+  if (is_f32 != 0u) {
     return reinterpret_cast<device const float *>(ptr)[idx];
   }
   return float(reinterpret_cast<device const bfloat *>(ptr)[idx]);
@@ -162,11 +218,14 @@ inkling2_moe_m1_gate_up_situ_nvfp4(
   const ulong row_w_stride = ulong(K >> 1u);
   const ulong row_s_stride = ulong(n_groups);
   const ulong exp_row_base = ulong(expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (p.intermediate + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + col) * row_w_stride;
-  const device uint8_t *gs_row = gu_s + (exp_row_base + col) * row_s_stride;
-  const device uchar *uw_row = gu_w + (exp_row_base + p.intermediate + col) * row_w_stride;
-  const device uint8_t *us_row = gu_s + (exp_row_base + p.intermediate + col) * row_s_stride;
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * row_w_stride;
+  const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * row_s_stride;
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * row_w_stride;
+  const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * row_s_stride;
 
   float acc_g = 0.0f;
   float acc_u = 0.0f;
@@ -223,11 +282,14 @@ inkling2_moe_m1_gate_up_situ_q8(
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
   const ulong exp_row_base = ulong(expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (p.intermediate + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + col) * ulong(K);
-  const ulong gs_base = (exp_row_base + col) * ulong(n_groups);
-  const device uchar *uw_row = gu_w + (exp_row_base + p.intermediate + col) * ulong(K);
-  const ulong us_base = (exp_row_base + p.intermediate + col) * ulong(n_groups);
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
+  const ulong gs_base = (exp_row_base + g_row) * ulong(n_groups);
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
+  const ulong us_base = (exp_row_base + u_row) * ulong(n_groups);
 
   float acc_g = 0.0f;
   float acc_u = 0.0f;
@@ -258,7 +320,70 @@ inkling2_moe_m1_gate_up_situ_q8(
   }
 }
 
+// Grid: (ceil(I / 8), top_k, 1), TG: (64, 1, 1) -> 2 SGs x 4 cols/SG = 8 cols/TG.
+// Native MXFP8 (E4M3FN weights + UE8M0 scales, group_size=32): k_lanes = 8 -> 256B coalesced loads!
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_m1_gate_up_situ_mxfp8(
+    device const bfloat *x [[buffer(0)]],
+    device const int32_t *indices [[buffer(1)]],
+    device const uchar *gu_w [[buffer(2)]],
+    device const uint8_t *gu_s [[buffer(3)]],
+    device bfloat *act_out [[buffer(4)]],
+    constant Inkling2MoeParams &p [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLanes = 8u;
+  const uint slot = group.y;
+  if (slot >= p.top_k) return;
+
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 3u; // 0..3
+  const uint col = group.x * 8u + sg * 4u + r_id;
+  if (col >= p.intermediate) return;
+
+  const uint expert = uint(indices[slot]);
+  const uint K = p.hidden;
+  const uint N2 = p.intermediate * 2u;
+  const uint n_groups = K >> 5u;
+  const ulong exp_row_base = ulong(expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (p.intermediate + col);
+
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
+  const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * ulong(n_groups);
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
+  const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * ulong(n_groups);
+
+  float acc_g = 0.0f;
+  float acc_u = 0.0f;
+  for (uint g = k_lane; g < n_groups; g += kLanes) {
+    float4 xv[8];
+    load_bf16_16(x + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+    load_bf16_16(x + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+
+    const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
+    const float gd = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), xv);
+    acc_g += gs * gd;
+
+    const float us = inkling2_decode_fp8_e8m0(us_row[g]);
+    const float ud = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), xv);
+    acc_u += us * ud;
+  }
+
+  acc_g = reduce_k_lanes<8>(acc_g);
+  acc_u = reduce_k_lanes<8>(acc_u);
+  if (k_lane == 0u) {
+    const bool round_bf16 = (p.flags & 8u) != 0u;
+    act_out[ulong(slot) * p.intermediate + col] = inkling2_moe_situ_epilogue(
+        acc_g, acc_u, 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
+  }
+}
+
 // Grid: (ceil(D / 4), 1, 1), TG: (64, 1, 1).
+// k_lanes = 8 -> 72 / 8 = 9 exact non-divergent iterations for I=1152 (0% warp divergence,
+// exact Pass A FP32 reduction order & 0-ULP M=1..32 parity).
 // Both SGs compute the same 4 output cols across interleaved top_k slots (sg=0: even, sg=1: odd),
 // then sg=0 sums all slots in exact 0..top_k-1 order!
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -295,9 +420,8 @@ inkling2_moe_m1_down_combine_nvfp4(
       const device uint8_t *s_row = dn_s + row_idx * row_s_stride;
       const device bfloat *a_row = act + ulong(slot) * K;
       for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[4];
+        float4 xv[4], wv[4];
         load_bf16_16(a_row + (g << 4u), xv);
-        float4 wv[4];
         const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
         decode_nvfp4_16(wp, wv);
         acc += inkling2_decode_fp8_e4m3(s_row[g]) * dot_4x4(wv, xv);
@@ -317,6 +441,100 @@ inkling2_moe_m1_down_combine_nvfp4(
       sum += gamma[slot] * slot_vals[slot][r_id];
     }
     out[col] = bfloat(sum);
+  }
+}
+
+// Fused M=1 NVFP4 down_proj + combine + static post_conv (k=4) + optional FP32 residual + hist_out.
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_m1_down_combine_sconv_nvfp4(
+    device const bfloat *act [[buffer(0)]],
+    device const int32_t *indices [[buffer(1)]],
+    device const float *gamma [[buffer(2)]],
+    device const uchar *dn_w [[buffer(3)]],
+    device const uint8_t *dn_s [[buffer(4)]],
+    device const uchar *post_w [[buffer(5)]],
+    device const uchar *hist_in [[buffer(6)]],
+    device const uchar *res_raw [[buffer(7)]],
+    device bfloat *out [[buffer(8)]],
+    device bfloat *hist_out [[buffer(9)]],
+    device bfloat *tape_out [[buffer(10)]],
+    constant Inkling2MoeParams &p [[buffer(11)]],
+    constant Inkling2MoePostConvParams &pc [[buffer(12)]],
+    uint group_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLanes = 8u;
+  threadgroup float slot_vals[16][4];
+
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 3u; // 0..3
+  const uint col = group_x * 4u + r_id;
+  const uint D = p.hidden;
+  const bool valid_col = col < D;
+
+  const uint K = p.intermediate;
+  const uint n_groups = K >> 4u;
+  const ulong row_w_stride = ulong(K >> 1u);
+  const ulong row_s_stride = ulong(n_groups);
+
+  for (uint slot = sg; slot < p.top_k; slot += 2u) {
+    float acc = 0.0f;
+    if (valid_col) {
+      const uint expert = uint(indices[slot]);
+      const ulong row_idx = ulong(expert) * ulong(D) + col;
+      const device uchar *w_row = dn_w + row_idx * row_w_stride;
+      const device uint8_t *s_row = dn_s + row_idx * row_s_stride;
+      const device bfloat *a_row = act + ulong(slot) * K;
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        float4 xv[4], wv[4];
+        load_bf16_16(a_row + (g << 4u), xv);
+        const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
+        decode_nvfp4_16(wp, wv);
+        acc += inkling2_decode_fp8_e4m3(s_row[g]) * dot_4x4(wv, xv);
+      }
+    }
+    acc = reduce_k_lanes<8>(acc);
+    if (k_lane == 0u) {
+      slot_vals[slot][r_id] = float(bfloat(acc));
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && k_lane == 0u && valid_col) {
+    float sum = 0.0f;
+    for (uint slot = 0u; slot < p.top_k; ++slot) {
+      sum += gamma[slot] * slot_vals[slot][r_id];
+    }
+    const bfloat moe_b = bfloat(sum);
+    if ((pc.flags & 8u) != 0u) {
+      tape_out[col] = moe_b;
+    }
+    const float x0 = float(moe_b);
+    const uint h_f32 = pc.hist_f32_mask & 1u;
+    const float x3 = inkling2_moe_read_f32(hist_in, 0ul * ulong(D) + col, h_f32);
+    const float x2 = inkling2_moe_read_f32(hist_in, 1ul * ulong(D) + col, h_f32);
+    const float x1 = inkling2_moe_read_f32(hist_in, 2ul * ulong(D) + col, h_f32);
+
+    const uint w_f32 = pc.flags & 1u;
+    const ulong wb = ulong(col) * 4ul;
+    const float w3 = inkling2_moe_read_f32(post_w, wb + 0ul, w_f32);
+    const float w2 = inkling2_moe_read_f32(post_w, wb + 1ul, w_f32);
+    const float w1 = inkling2_moe_read_f32(post_w, wb + 2ul, w_f32);
+    const float w0 = inkling2_moe_read_f32(post_w, wb + 3ul, w_f32);
+
+    const float scale = 0.44721359549995793f;
+    const float conv_acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+    const bfloat conv_val = bfloat(conv_acc * scale);
+    if ((pc.flags & 2u) != 0u) {
+      const uint r_f32 = (pc.flags >> 2u) & 1u;
+      const float rv = inkling2_moe_read_f32(res_raw, ulong(col), r_f32);
+      out[col] = bfloat(rv + float(conv_val));
+    } else {
+      out[col] = conv_val;
+    }
+    hist_out[0ul * ulong(D) + col] = bfloat(x2);
+    hist_out[1ul * ulong(D) + col] = bfloat(x1);
+    hist_out[2ul * ulong(D) + col] = moe_b;
   }
 }
 
@@ -384,6 +602,258 @@ inkling2_moe_m1_down_combine_q8(
   }
 }
 
+// Fused M=1 Q8_0 down_proj + combine + static post_conv (k=4) + optional FP32 residual + hist_out.
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_m1_down_combine_sconv_q8(
+    device const bfloat *act [[buffer(0)]],
+    device const int32_t *indices [[buffer(1)]],
+    device const float *gamma [[buffer(2)]],
+    device const uchar *dn_w [[buffer(3)]],
+    device const uchar *dn_s [[buffer(4)]],
+    device const uchar *dn_b [[buffer(5)]],
+    device const uchar *post_w [[buffer(6)]],
+    device const uchar *hist_in [[buffer(7)]],
+    device const uchar *res_raw [[buffer(8)]],
+    device bfloat *out [[buffer(9)]],
+    device bfloat *hist_out [[buffer(10)]],
+    device bfloat *tape_out [[buffer(11)]],
+    constant Inkling2MoeParams &p [[buffer(12)]],
+    constant Inkling2MoePostConvParams &pc [[buffer(13)]],
+    uint group_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLanes = 4u;
+  threadgroup float slot_vals[16][8];
+
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 2u; // 0..7
+  const uint col = group_x * 8u + r_id;
+  const uint D = p.hidden;
+  const bool valid_col = col < D;
+
+  const uint K = p.intermediate;
+  const uint n_groups = K >> 5u;
+  const bool sidecar_f32 = (p.flags & 4u) != 0u;
+
+  for (uint slot = sg; slot < p.top_k; slot += 2u) {
+    float acc = 0.0f;
+    if (valid_col) {
+      const uint expert = uint(indices[slot]);
+      const ulong row_idx = ulong(expert) * ulong(D) + col;
+      const device uchar *w_row = dn_w + row_idx * ulong(K);
+      const ulong s_base = row_idx * ulong(n_groups);
+      const device bfloat *a_row = act + ulong(slot) * K;
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        float4 xv[8];
+        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+        float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
+        const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+
+        const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+        const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+        const float dp = dot_q8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
+        acc += sc * dp + bi * x_sum;
+      }
+    }
+    acc = reduce_k_lanes<4>(acc);
+    if (k_lane == 0u) {
+      slot_vals[slot][r_id] = float(bfloat(acc));
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && k_lane == 0u && valid_col) {
+    float sum = 0.0f;
+    for (uint slot = 0u; slot < p.top_k; ++slot) {
+      sum += gamma[slot] * slot_vals[slot][r_id];
+    }
+    const bfloat moe_b = bfloat(sum);
+    if ((pc.flags & 8u) != 0u) {
+      tape_out[col] = moe_b;
+    }
+    const float x0 = float(moe_b);
+    const uint h_f32 = pc.hist_f32_mask & 1u;
+    const float x3 = inkling2_moe_read_f32(hist_in, 0ul * ulong(D) + col, h_f32);
+    const float x2 = inkling2_moe_read_f32(hist_in, 1ul * ulong(D) + col, h_f32);
+    const float x1 = inkling2_moe_read_f32(hist_in, 2ul * ulong(D) + col, h_f32);
+
+    const uint w_f32 = pc.flags & 1u;
+    const ulong wb = ulong(col) * 4ul;
+    const float w3 = inkling2_moe_read_f32(post_w, wb + 0ul, w_f32);
+    const float w2 = inkling2_moe_read_f32(post_w, wb + 1ul, w_f32);
+    const float w1 = inkling2_moe_read_f32(post_w, wb + 2ul, w_f32);
+    const float w0 = inkling2_moe_read_f32(post_w, wb + 3ul, w_f32);
+
+    const float scale = 0.44721359549995793f;
+    const float conv_acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+    const bfloat conv_val = bfloat(conv_acc * scale);
+    if ((pc.flags & 2u) != 0u) {
+      const uint r_f32 = (pc.flags >> 2u) & 1u;
+      const float rv = inkling2_moe_read_f32(res_raw, ulong(col), r_f32);
+      out[col] = bfloat(rv + float(conv_val));
+    } else {
+      out[col] = conv_val;
+    }
+    hist_out[0ul * ulong(D) + col] = bfloat(x2);
+    hist_out[1ul * ulong(D) + col] = bfloat(x1);
+    hist_out[2ul * ulong(D) + col] = moe_b;
+  }
+}
+
+// Grid: (ceil(D / 8), 1, 1), TG: (64, 1, 1).
+// Native MXFP8 M=1 down_proj + weighted combine (k_lanes = 4 -> 128B full cacheline!).
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_m1_down_combine_mxfp8(
+    device const bfloat *act [[buffer(0)]],
+    device const int32_t *indices [[buffer(1)]],
+    device const float *gamma [[buffer(2)]],
+    device const uchar *dn_w [[buffer(3)]],
+    device const uint8_t *dn_s [[buffer(4)]],
+    device bfloat *out [[buffer(5)]],
+    constant Inkling2MoeParams &p [[buffer(6)]],
+    uint group_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLanes = 4u;
+  threadgroup float slot_vals[16][8];
+
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 2u; // 0..7
+  const uint col = group_x * 8u + r_id;
+  const bool valid_col = col < p.hidden;
+
+  const uint K = p.intermediate;
+  const uint n_groups = K >> 5u;
+
+  for (uint slot = sg; slot < p.top_k; slot += 2u) {
+    float acc = 0.0f;
+    if (valid_col) {
+      const uint expert = uint(indices[slot]);
+      const ulong row_idx = ulong(expert) * ulong(p.hidden) + col;
+      const device uchar *w_row = dn_w + row_idx * ulong(K);
+      const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
+      const device bfloat *a_row = act + ulong(slot) * K;
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        float4 xv[8];
+        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+
+        const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
+        const float dp = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
+        acc += sc * dp;
+      }
+    }
+    acc = reduce_k_lanes<4>(acc);
+    if (k_lane == 0u) {
+      slot_vals[slot][r_id] = float(bfloat(acc));
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && k_lane == 0u && valid_col) {
+    float sum = 0.0f;
+    for (uint slot = 0u; slot < p.top_k; ++slot) {
+      sum += gamma[slot] * slot_vals[slot][r_id];
+    }
+    out[col] = bfloat(sum);
+  }
+}
+
+// Fused M=1 MXFP8 down_proj + combine + static post_conv (k=4) + optional FP32 residual + hist_out.
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_m1_down_combine_sconv_mxfp8(
+    device const bfloat *act [[buffer(0)]],
+    device const int32_t *indices [[buffer(1)]],
+    device const float *gamma [[buffer(2)]],
+    device const uchar *dn_w [[buffer(3)]],
+    device const uint8_t *dn_s [[buffer(4)]],
+    device const uchar *post_w [[buffer(5)]],
+    device const uchar *hist_in [[buffer(6)]],
+    device const uchar *res_raw [[buffer(7)]],
+    device bfloat *out [[buffer(8)]],
+    device bfloat *hist_out [[buffer(9)]],
+    device bfloat *tape_out [[buffer(10)]],
+    constant Inkling2MoeParams &p [[buffer(11)]],
+    constant Inkling2MoePostConvParams &pc [[buffer(12)]],
+    uint group_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLanes = 4u;
+  threadgroup float slot_vals[16][8];
+
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 2u; // 0..7
+  const uint col = group_x * 8u + r_id;
+  const uint D = p.hidden;
+  const bool valid_col = col < D;
+
+  const uint K = p.intermediate;
+  const uint n_groups = K >> 5u;
+
+  for (uint slot = sg; slot < p.top_k; slot += 2u) {
+    float acc = 0.0f;
+    if (valid_col) {
+      const uint expert = uint(indices[slot]);
+      const ulong row_idx = ulong(expert) * ulong(D) + col;
+      const device uchar *w_row = dn_w + row_idx * ulong(K);
+      const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
+      const device bfloat *a_row = act + ulong(slot) * K;
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        float4 xv[8];
+        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+
+        const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
+        const float dp = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
+        acc += sc * dp;
+      }
+    }
+    acc = reduce_k_lanes<4>(acc);
+    if (k_lane == 0u) {
+      slot_vals[slot][r_id] = float(bfloat(acc));
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && k_lane == 0u && valid_col) {
+    float sum = 0.0f;
+    for (uint slot = 0u; slot < p.top_k; ++slot) {
+      sum += gamma[slot] * slot_vals[slot][r_id];
+    }
+    const bfloat moe_b = bfloat(sum);
+    if ((pc.flags & 8u) != 0u) {
+      tape_out[col] = moe_b;
+    }
+    const float x0 = float(moe_b);
+    const uint h_f32 = pc.hist_f32_mask & 1u;
+    const float x3 = inkling2_moe_read_f32(hist_in, 0ul * ulong(D) + col, h_f32);
+    const float x2 = inkling2_moe_read_f32(hist_in, 1ul * ulong(D) + col, h_f32);
+    const float x1 = inkling2_moe_read_f32(hist_in, 2ul * ulong(D) + col, h_f32);
+
+    const uint w_f32 = pc.flags & 1u;
+    const ulong wb = ulong(col) * 4ul;
+    const float w3 = inkling2_moe_read_f32(post_w, wb + 0ul, w_f32);
+    const float w2 = inkling2_moe_read_f32(post_w, wb + 1ul, w_f32);
+    const float w1 = inkling2_moe_read_f32(post_w, wb + 2ul, w_f32);
+    const float w0 = inkling2_moe_read_f32(post_w, wb + 3ul, w_f32);
+
+    const float scale = 0.44721359549995793f;
+    const float conv_acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+    const bfloat conv_val = bfloat(conv_acc * scale);
+    if ((pc.flags & 2u) != 0u) {
+      const uint r_f32 = (pc.flags >> 2u) & 1u;
+      const float rv = inkling2_moe_read_f32(res_raw, ulong(col), r_f32);
+      out[col] = bfloat(rv + float(conv_val));
+    } else {
+      out[col] = conv_val;
+    }
+    hist_out[0ul * ulong(D) + col] = bfloat(x2);
+    hist_out[1ul * ulong(D) + col] = bfloat(x1);
+    hist_out[2ul * ulong(D) + col] = moe_b;
+  }
+}
+
 // ============================================================================
 // 2. Grouped Indirect-Dispatch Infrastructure (T >= 2: M=4, 8, 32, Prefill)
 // ============================================================================
@@ -407,15 +877,12 @@ inkling2_moe_group(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup atomic_uint counts[256];
-  threadgroup atomic_uint cursors[256];
-  threadgroup uint offsets[256];
   threadgroup uint totals[8];
   threadgroup uint16_t tg_sel[512];
   threadgroup atomic_uint simd_cnt;
   threadgroup atomic_uint nax_cnt;
 
   atomic_store_explicit(counts + tid, 0u, memory_order_relaxed);
-  atomic_store_explicit(cursors + tid, 0u, memory_order_relaxed);
   if (tid == 0u) {
     atomic_store_explicit(&simd_cnt, 0u, memory_order_relaxed);
     atomic_store_explicit(&nax_cnt, 0u, memory_order_relaxed);
@@ -423,10 +890,10 @@ inkling2_moe_group(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint total_routes = p.rows * p.top_k;
-  const bool deterministic_scatter = total_routes <= 512u;
+  const bool use_tg_sel = total_routes <= 512u;
   for (uint r = tid; r < total_routes; r += 256u) {
     const uint e = uint(selected[r]);
-    if (deterministic_scatter) {
+    if (use_tg_sel) {
       tg_sel[r] = uint16_t(e);
     }
     if (e < p.experts) {
@@ -447,7 +914,6 @@ inkling2_moe_group(
   for (uint i = 0u; i < sg; ++i) {
     start += totals[i];
   }
-  offsets[tid] = start;
 
   // Decide SIMD vs NAX per expert (not per tile) so a multi-tile expert never splits
   // across SIMD and NAX kernels.
@@ -474,11 +940,13 @@ inkling2_moe_group(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (deterministic_scatter) {
-    // 100% deterministic in-order route scatter per expert (zero atomics, ~0.002 ms).
-    if (tid < p.experts && count > 0u) {
-      uint slot = 0u;
-      const uint base_pos = start * p.tile_rows;
+  // 100% deterministic in-order route scatter per expert for ALL `total_routes` (zero atomics!).
+  // For `total_routes <= 512`, scan threadgroup `tg_sel`; for larger prefills, all threads
+  // broadcast-read `selected[r]` in lockstep from L1 cache.
+  if (tid < p.experts && count > 0u) {
+    uint slot = 0u;
+    const uint base_pos = start * p.tile_rows;
+    if (use_tg_sel) {
       for (uint r = 0u; r < total_routes; ++r) {
         if (uint(tg_sel[r]) == tid) {
           const uint pos = base_pos + slot;
@@ -487,17 +955,14 @@ inkling2_moe_group(
           ++slot;
         }
       }
-    }
-  } else {
-    for (uint r = tid; r < total_routes; r += 256u) {
-      const uint e = uint(selected[r]);
-      if (e < p.experts) {
-        const uint slot = atomic_fetch_add_explicit(cursors + e, 1u, memory_order_relaxed);
-        const uint pos = offsets[e] * p.tile_rows + slot;
-        routes[pos] = r;
-        inverse[r] = pos;
-      } else {
-        inverse[r] = ~0u;
+    } else {
+      for (uint r = 0u; r < total_routes; ++r) {
+        if (uint(selected[r]) == tid) {
+          const uint pos = base_pos + slot;
+          routes[pos] = r;
+          inverse[r] = pos;
+          ++slot;
+        }
       }
     }
   }
@@ -506,7 +971,7 @@ inkling2_moe_group(
     const uint live_tiles = start + nt;
     const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
     const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
-    const bool is_q8 = (p.flags & 1u) != 0u;
+    const bool is_8bit = (p.flags & (1u | 64u)) != 0u;
 
     tile_count->total_tiles = live_tiles;
     tile_count->simd_tiles = s_tiles;
@@ -517,8 +982,8 @@ inkling2_moe_group(
     tile_count->gather_grid[1] = (p.hidden + 255u) / 256u;
     tile_count->gather_grid[2] = 1u;
 
-    const uint simd_gu_x = is_q8 ? (p.intermediate / 8u) : (p.intermediate / 4u);
-    const uint simd_dn_x = is_q8 ? (p.hidden / 16u) : (p.hidden / 8u);
+    const uint simd_gu_x = is_8bit ? (p.intermediate / 8u) : (p.intermediate / 4u);
+    const uint simd_dn_x = is_8bit ? (p.hidden / 16u) : (p.hidden / 8u);
     tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
     tile_count->simd_gu_grid[1] = s_tiles;
     tile_count->simd_gu_grid[2] = 1u;
@@ -533,6 +998,214 @@ inkling2_moe_group(
     tile_count->nax_gu_grid[2] = 1u;
 
     tile_count->nax_dn_grid[0] = n_tiles > 0u ? (p.hidden / 64u) : 0u;
+    tile_count->nax_dn_grid[1] = n_tiles;
+    tile_count->nax_dn_grid[2] = 1u;
+  }
+}
+
+// Single-threadgroup fused `route + group` for T <= 32 (T*K <= 512, E <= 256).
+// 8 SGs (256 threads) compute exact top-K sigmoid+bias routing for rows t = sg, sg+8, ...
+// directly into threadgroup `tg_sel[512]` + histogram, then run prefix-sum, tile table,
+// deterministic route scatter, and indirect-grid emit in 1 TG with ZERO inter-kernel barrier!
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling2_moe_route_group_small(
+    device const uchar *logits_raw [[buffer(0)]],
+    device const uchar *bias_raw [[buffer(1)]],
+    device const uchar *down_scale_raw [[buffer(2)]],
+    device float *out_gamma [[buffer(3)]],
+    device Inkling2MoeTile *tiles [[buffer(4)]],
+    device Inkling2MoeTileCount *tile_count [[buffer(5)]],
+    device uint *routes [[buffer(6)]],
+    device uint *inverse [[buffer(7)]],
+    device uint *tile_lists [[buffer(8)]],
+    constant Inkling2MoeRouteGroupParams &rp [[buffer(9)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup atomic_uint counts[256];
+  threadgroup uint totals[8];
+  threadgroup uint16_t tg_sel[512];
+  threadgroup atomic_uint simd_cnt;
+  threadgroup atomic_uint nax_cnt;
+
+  atomic_store_explicit(counts + tid, 0u, memory_order_relaxed);
+  if (tid == 0u) {
+    atomic_store_explicit(&simd_cnt, 0u, memory_order_relaxed);
+    atomic_store_explicit(&nax_cnt, 0u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint E = rp.experts;
+  const uint K = rp.top_k;
+  const uint logits_f32 = (rp.flags >> 1u) & 1u;
+  const bool has_bias = ((rp.flags >> 2u) & 1u) != 0u;
+  const uint bias_f32 = (rp.flags >> 3u) & 1u;
+  const bool has_down_scale = ((rp.flags >> 4u) & 1u) != 0u;
+  const uint ds_f32 = (rp.flags >> 5u) & 1u;
+
+  for (uint row = sg; row < rp.rows; row += 8u) {
+    const ulong row_base = ulong(row) * ulong(rp.logits_stride);
+    constexpr uint MAX_SLOTS = 8u; // 8 * 32 = 256 experts
+    float local_s[MAX_SLOTS];
+    float local_p[MAX_SLOTS];
+    int32_t local_id[MAX_SLOTS];
+    uint cnt = 0u;
+
+    for (uint e = lane; e < E; e += 32u) {
+      const float z = inkling2_moe_read_f32(logits_raw, row_base + e, logits_f32);
+      const float prob = inkling2_moe_sigmoid(z);
+      const float sc = has_bias
+          ? (prob + inkling2_moe_read_f32(bias_raw, ulong(e), bias_f32))
+          : prob;
+      local_s[cnt] = sc;
+      local_p[cnt] = prob;
+      local_id[cnt] = int32_t(e);
+      ++cnt;
+    }
+
+    int32_t sel_idx[16];
+    float sel_p[16];
+    float sum_p = 0.0f;
+
+    for (uint k = 0u; k < K; ++k) {
+      float best_s = -INFINITY;
+      int32_t best_i = -1;
+      float best_p = 0.0f;
+      for (uint j = 0u; j < cnt; ++j) {
+        const int32_t cid = local_id[j];
+        if (cid >= 0) {
+          const float cs = local_s[j];
+          if (best_i < 0 || cs > best_s || (cs == best_s && cid < best_i)) {
+            best_s = cs;
+            best_i = cid;
+            best_p = local_p[j];
+          }
+        }
+      }
+
+      for (ushort mask = 16; mask > 0; mask >>= 1) {
+        const float os = simd_shuffle_xor(best_s, mask);
+        const int32_t oi = simd_shuffle_xor(best_i, mask);
+        const float op = simd_shuffle_xor(best_p, mask);
+        if (oi >= 0 && (best_i < 0 || os > best_s || (os == best_s && oi < best_i))) {
+          best_s = os;
+          best_i = oi;
+          best_p = op;
+        }
+      }
+
+      for (uint j = 0u; j < cnt; ++j) {
+        if (local_id[j] == best_i) {
+          local_id[j] = -1;
+        }
+      }
+
+      if (lane == 0u) {
+        sel_idx[k] = best_i;
+        sel_p[k] = best_p;
+        sum_p += best_p;
+      }
+    }
+
+    if (lane == 0u) {
+      const float denom = sum_p + 1e-20f;
+      const uint out_base = row * K;
+      for (uint k = 0u; k < K; ++k) {
+        const uint eid = uint(sel_idx[k]);
+        float w = (sel_p[k] / denom) * rp.route_scale;
+        if (has_down_scale) {
+          w *= inkling2_moe_read_f32(down_scale_raw, ulong(eid), ds_f32);
+        }
+        out_gamma[out_base + k] = w;
+        tg_sel[out_base + k] = uint16_t(eid);
+        if (eid < E) {
+          atomic_fetch_add_explicit(counts + eid, 1u, memory_order_relaxed);
+        }
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint count = tid < E
+      ? atomic_load_explicit(counts + tid, memory_order_relaxed)
+      : 0u;
+  const uint nt = (count + rp.tile_rows - 1u) / rp.tile_rows;
+  uint start = simd_prefix_exclusive_sum(nt);
+  if (lane == 31u) {
+    totals[sg] = start + nt;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = 0u; i < sg; ++i) {
+    start += totals[i];
+  }
+
+  const bool use_simd = (count <= rp.col_cutoff);
+  for (uint t = 0u; t < nt; ++t) {
+    const uint tile_idx = start + t;
+    const uint live = min(rp.tile_rows, count - t * rp.tile_rows);
+    tiles[tile_idx] = {tid, live};
+    if (use_simd) {
+      const uint pos = atomic_fetch_add_explicit(&simd_cnt, 1u, memory_order_relaxed);
+      tile_lists[pos] = tile_idx;
+    } else {
+      const uint pos = atomic_fetch_add_explicit(&nax_cnt, 1u, memory_order_relaxed);
+      tile_lists[rp.max_tiles + pos] = tile_idx;
+    }
+  }
+  if (nt != 0u) {
+    const uint last = start + nt - 1u;
+    const uint live = count - (nt - 1u) * rp.tile_rows;
+    const uint pad_end = last * rp.tile_rows + inkling2_matmul_rows(live, rp.tile_rows);
+    for (uint r = start * rp.tile_rows + count; r < pad_end; ++r) {
+      routes[r] = ~0u;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint total_routes = rp.rows * K;
+  if (tid < E && count > 0u) {
+    uint slot = 0u;
+    const uint base_pos = start * rp.tile_rows;
+    for (uint r = 0u; r < total_routes; ++r) {
+      if (uint(tg_sel[r]) == tid) {
+        const uint pos = base_pos + slot;
+        routes[pos] = r;
+        inverse[r] = pos;
+        ++slot;
+      }
+    }
+  }
+
+  if (tid == 255u) {
+    const uint live_tiles = start + nt;
+    const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
+    const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
+    const bool is_q8 = (rp.flags & 1u) != 0u;
+
+    tile_count->total_tiles = live_tiles;
+    tile_count->simd_tiles = s_tiles;
+    tile_count->nax_tiles = n_tiles;
+    tile_count->_pad0 = 0u;
+
+    tile_count->gather_grid[0] = live_tiles;
+    tile_count->gather_grid[1] = (rp.hidden + 255u) / 256u;
+    tile_count->gather_grid[2] = 1u;
+
+    const uint simd_gu_x = is_q8 ? (rp.intermediate / 8u) : (rp.intermediate / 4u);
+    const uint simd_dn_x = is_q8 ? (rp.hidden / 16u) : (rp.hidden / 8u);
+    tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
+    tile_count->simd_gu_grid[1] = s_tiles;
+    tile_count->simd_gu_grid[2] = 1u;
+
+    tile_count->simd_dn_grid[0] = s_tiles > 0u ? simd_dn_x : 0u;
+    tile_count->simd_dn_grid[1] = s_tiles;
+    tile_count->simd_dn_grid[2] = 1u;
+
+    tile_count->nax_gu_grid[0] = n_tiles > 0u ? (rp.intermediate / 32u) : 0u;
+    tile_count->nax_gu_grid[1] = n_tiles;
+    tile_count->nax_gu_grid[2] = 1u;
+
+    tile_count->nax_dn_grid[0] = n_tiles > 0u ? (rp.hidden / 64u) : 0u;
     tile_count->nax_dn_grid[1] = n_tiles;
     tile_count->nax_dn_grid[2] = 1u;
   }
@@ -586,30 +1259,35 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
   if (group.y >= count->simd_tiles) return;
-  constexpr uint kLanes = 16u;
-  const uint k_lane = lane & (kLanes - 1u);
-  const uint r_id = lane >> 4u; // 0..1
-  const uint col = group.x * 4u + sg * 2u + r_id;
-  if (col >= p.intermediate) return;
-
   const uint tile_idx = simd_list[group.y];
   const Inkling2MoeTile t = tiles[tile_idx];
   const uint n_rows = t.rows;
   const uint K = p.hidden;
   const uint I = p.intermediate;
+  const uint tile_row_base = tile_idx * p.tile_rows;
+
+  constexpr uint kLanes = 16u;
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 4u; // 0..1
+  const uint col = group.x * 4u + sg * 2u + r_id;
+  if (col >= I) return;
+
   const uint N2 = I * 2u;
   const uint n_groups = K >> 4u;
   const ulong row_w_stride = ulong(K >> 1u);
   const ulong row_s_stride = ulong(n_groups);
   const ulong exp_row_base = ulong(t.expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + col) * row_w_stride;
-  const device uint8_t *gs_row = gu_s + (exp_row_base + col) * row_s_stride;
-  const device uchar *uw_row = gu_w + (exp_row_base + I + col) * row_w_stride;
-  const device uint8_t *us_row = gu_s + (exp_row_base + I + col) * row_s_stride;
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * row_w_stride;
+  const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * row_s_stride;
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * row_w_stride;
+  const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * row_s_stride;
 
-  const device bfloat *x_tile = x + ulong(tile_idx) * p.tile_rows * K;
-  const ulong out_tile_base = ulong(tile_idx) * p.tile_rows * I;
+  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
+  const ulong out_tile_base = ulong(tile_row_base) * I;
   const float outer_s = (p.flags & 2u) ? gu_outer[t.expert] : 1.0f;
   const bool round_bf16 = (p.flags & 8u) != 0u;
 
@@ -638,9 +1316,34 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     return;
   }
 
+#define NVFP4_GU_ROW4(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    float4 xv[4]; \
+    load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
+    (AG) += sg_val * dot_4x4(w_g, xv); \
+    (AU) += su_val * dot_4x4(w_u, xv); \
+  }
+
+#define NVFP4_GU_ONE(IDX, ACC, SC) \
+  if ((IDX) < n_rows) { \
+    float4 xv[4]; \
+    load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
+    (ACC) += (SC) * dot_4x4(wv, xv); \
+  }
+
+#define NVFP4_GU_STORE(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    const float g_sum = reduce_k_lanes<16>((AG)); \
+    const float u_sum = reduce_k_lanes<16>((AU)); \
+    if (k_lane == 0u) { \
+      hidden[out_tile_base + ulong(IDX) * I + col] = inkling2_moe_situ_epilogue( \
+          g_sum, u_sum, outer_s, p.gate_softcap, p.up_softcap, round_bf16); \
+    } \
+  }
+
   if (n_rows <= 4u) {
-    float acc_g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc_u[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
       const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
       const float sg_val = inkling2_decode_fp8_e4m3(gs_row[g]);
@@ -651,55 +1354,60 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
       decode_nvfp4_16(up, w_u);
 
       const uint k0 = g << 4u;
-      for (uint r = 0u; r < n_rows; ++r) {
-        float4 xv[4];
-        load_bf16_16(x_tile + ulong(r) * K + k0, xv);
-        acc_g[r] += sg_val * dot_4x4(w_g, xv);
-        acc_u[r] += su_val * dot_4x4(w_u, xv);
-      }
+      NVFP4_GU_ROW4(0u, ag0, au0);
+      NVFP4_GU_ROW4(1u, ag1, au1);
+      NVFP4_GU_ROW4(2u, ag2, au2);
+      NVFP4_GU_ROW4(3u, ag3, au3);
     }
-    for (uint r = 0u; r < n_rows; ++r) {
-      acc_g[r] = reduce_k_lanes<16>(acc_g[r]);
-      acc_u[r] = reduce_k_lanes<16>(acc_u[r]);
-      if (k_lane == 0u) {
-        hidden[out_tile_base + ulong(r) * I + col] = inkling2_moe_situ_epilogue(
-            acc_g[r], acc_u[r], outer_s, p.gate_softcap, p.up_softcap, round_bf16);
-      }
-    }
+    NVFP4_GU_STORE(0u, ag0, au0);
+    NVFP4_GU_STORE(1u, ag1, au1);
+    NVFP4_GU_STORE(2u, ag2, au2);
+    NVFP4_GU_STORE(3u, ag3, au3);
     return;
   }
 
-  float acc_g[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  float acc_u[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+  float ag4 = 0.0f, ag5 = 0.0f, ag6 = 0.0f, ag7 = 0.0f;
+  float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+  float au4 = 0.0f, au5 = 0.0f, au6 = 0.0f, au7 = 0.0f;
   for (uint g = k_lane; g < n_groups; g += kLanes) {
     const uint k0 = g << 4u;
     float4 wv[4];
     const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
     const float sg_val = inkling2_decode_fp8_e4m3(gs_row[g]);
     decode_nvfp4_16(gp, wv);
-    for (uint r = 0u; r < n_rows; ++r) {
-      float4 xv[4];
-      load_bf16_16(x_tile + ulong(r) * K + k0, xv);
-      acc_g[r] += sg_val * dot_4x4(wv, xv);
-    }
+    NVFP4_GU_ONE(0u, ag0, sg_val);
+    NVFP4_GU_ONE(1u, ag1, sg_val);
+    NVFP4_GU_ONE(2u, ag2, sg_val);
+    NVFP4_GU_ONE(3u, ag3, sg_val);
+    NVFP4_GU_ONE(4u, ag4, sg_val);
+    NVFP4_GU_ONE(5u, ag5, sg_val);
+    NVFP4_GU_ONE(6u, ag6, sg_val);
+    NVFP4_GU_ONE(7u, ag7, sg_val);
 
     const uint2 up = *reinterpret_cast<device const uint2 *>(uw_row + ulong(g) * 8ul);
     const float su_val = inkling2_decode_fp8_e4m3(us_row[g]);
     decode_nvfp4_16(up, wv);
-    for (uint r = 0u; r < n_rows; ++r) {
-      float4 xv[4];
-      load_bf16_16(x_tile + ulong(r) * K + k0, xv);
-      acc_u[r] += su_val * dot_4x4(wv, xv);
-    }
+    NVFP4_GU_ONE(0u, au0, su_val);
+    NVFP4_GU_ONE(1u, au1, su_val);
+    NVFP4_GU_ONE(2u, au2, su_val);
+    NVFP4_GU_ONE(3u, au3, su_val);
+    NVFP4_GU_ONE(4u, au4, su_val);
+    NVFP4_GU_ONE(5u, au5, su_val);
+    NVFP4_GU_ONE(6u, au6, su_val);
+    NVFP4_GU_ONE(7u, au7, su_val);
   }
-  for (uint r = 0u; r < n_rows; ++r) {
-    acc_g[r] = reduce_k_lanes<16>(acc_g[r]);
-    acc_u[r] = reduce_k_lanes<16>(acc_u[r]);
-    if (k_lane == 0u) {
-      hidden[out_tile_base + ulong(r) * I + col] = inkling2_moe_situ_epilogue(
-          acc_g[r], acc_u[r], outer_s, p.gate_softcap, p.up_softcap, round_bf16);
-    }
-  }
+  NVFP4_GU_STORE(0u, ag0, au0);
+  NVFP4_GU_STORE(1u, ag1, au1);
+  NVFP4_GU_STORE(2u, ag2, au2);
+  NVFP4_GU_STORE(3u, ag3, au3);
+  NVFP4_GU_STORE(4u, ag4, au4);
+  NVFP4_GU_STORE(5u, ag5, au5);
+  NVFP4_GU_STORE(6u, ag6, au6);
+  NVFP4_GU_STORE(7u, ag7, au7);
+#undef NVFP4_GU_ROW4
+#undef NVFP4_GU_ONE
+#undef NVFP4_GU_STORE
 }
 
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -717,30 +1425,35 @@ inkling2_moe_simd_gate_up_situ_q8(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
   if (group.y >= count->simd_tiles) return;
-  constexpr uint kLanes = 8u;
-  const uint k_lane = lane & (kLanes - 1u);
-  const uint r_id = lane >> 3u; // 0..3
-  const uint col = group.x * 8u + sg * 4u + r_id;
-  if (col >= p.intermediate) return;
-
   const uint tile_idx = simd_list[group.y];
   const Inkling2MoeTile t = tiles[tile_idx];
   const uint n_rows = t.rows;
   const uint K = p.hidden;
   const uint I = p.intermediate;
+  const uint tile_row_base = tile_idx * p.tile_rows;
+
+  constexpr uint kLanes = 8u;
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 3u; // 0..3
+  const uint col = group.x * 8u + sg * 4u + r_id;
+  if (col >= I) return;
+
   const uint N2 = I * 2u;
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
   const bool round_bf16 = (p.flags & 8u) != 0u;
   const ulong exp_row_base = ulong(t.expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + col) * ulong(K);
-  const ulong gs_base = (exp_row_base + col) * ulong(n_groups);
-  const device uchar *uw_row = gu_w + (exp_row_base + I + col) * ulong(K);
-  const ulong us_base = (exp_row_base + I + col) * ulong(n_groups);
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
+  const ulong gs_base = (exp_row_base + g_row) * ulong(n_groups);
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
+  const ulong us_base = (exp_row_base + u_row) * ulong(n_groups);
 
-  const device bfloat *x_tile = x + ulong(tile_idx) * p.tile_rows * K;
-  const ulong out_tile_base = ulong(tile_idx) * p.tile_rows * I;
+  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
+  const ulong out_tile_base = ulong(tile_row_base) * I;
 
   if (n_rows <= 4u) {
     float acc_g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -755,8 +1468,9 @@ inkling2_moe_simd_gate_up_situ_q8(
       const uint k0 = g << 5u;
       for (uint r = 0u; r < n_rows; ++r) {
         float4 xv[8];
-        load_bf16_16(x_tile + ulong(r) * K + k0, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(x_tile + ulong(r) * K + k0 + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+        const device bfloat *xr = x_tile + ulong(r) * K + k0;
+        load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+        load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
         float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
         const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
         acc_g[r] += gs * dot_q8_32(gw_ptr, xv) + gb * x_sum;
@@ -786,8 +1500,9 @@ inkling2_moe_simd_gate_up_situ_q8(
     const uint k0 = g << 5u;
     for (uint r = 0u; r < n_rows; ++r) {
       float4 xv[8];
-      load_bf16_16(x_tile + ulong(r) * K + k0, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-      load_bf16_16(x_tile + ulong(r) * K + k0 + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+      const device bfloat *xr = x_tile + ulong(r) * K + k0;
+      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
       float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
       const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
       acc_g[r] += gs * dot_q8_32(gw_ptr, xv) + gb * x_sum;
@@ -802,6 +1517,165 @@ inkling2_moe_simd_gate_up_situ_q8(
           acc_g[r], acc_u[r], 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
     }
   }
+}
+
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_simd_gate_up_situ_mxfp8(
+    device const bfloat *x [[buffer(0)]],
+    device const Inkling2MoeTile *tiles [[buffer(1)]],
+    device const uint *simd_list [[buffer(2)]],
+    device const Inkling2MoeTileCount *count [[buffer(3)]],
+    device const uchar *gu_w [[buffer(4)]],
+    device const uint8_t *gu_s [[buffer(5)]],
+    device bfloat *hidden [[buffer(6)]],
+    constant Inkling2MoeParams &p [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (group.y >= count->simd_tiles) return;
+  const uint tile_idx = simd_list[group.y];
+  const Inkling2MoeTile t = tiles[tile_idx];
+  const uint n_rows = t.rows;
+  const uint K = p.hidden;
+  const uint I = p.intermediate;
+  const uint tile_row_base = tile_idx * p.tile_rows;
+
+  constexpr uint kLanes = 8u;
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 3u; // 0..3
+  const uint col = group.x * 8u + sg * 4u + r_id;
+  if (col >= I) return;
+
+  const uint N2 = I * 2u;
+  const uint n_groups = K >> 5u;
+  const bool round_bf16 = (p.flags & 8u) != 0u;
+  const ulong exp_row_base = ulong(t.expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
+
+  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
+  const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * ulong(n_groups);
+  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
+  const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * ulong(n_groups);
+
+  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
+  const ulong out_tile_base = ulong(tile_row_base) * I;
+
+  if (n_rows == 1u) {
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      float4 xv[8];
+      const device bfloat *xr = x_tile + (g << 5u);
+      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+
+      const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
+      acc_g += gs * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), xv);
+
+      const float us = inkling2_decode_fp8_e8m0(us_row[g]);
+      acc_u += us * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), xv);
+    }
+    acc_g = reduce_k_lanes<8>(acc_g);
+    acc_u = reduce_k_lanes<8>(acc_u);
+    if (k_lane == 0u) {
+      hidden[out_tile_base + col] = inkling2_moe_situ_epilogue(
+          acc_g, acc_u, 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
+    }
+    return;
+  }
+
+#define MXFP8_GU_ROW(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    float4 xv[8]; \
+    const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
+    load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
+    load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
+    (AG) += gs * dot_mxfp8_32_regs(gw, xv); \
+    (AU) += us * dot_mxfp8_32_regs(uw, xv); \
+  }
+
+#define MXFP8_GU_STORE(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    const float g_sum = reduce_k_lanes<8>((AG)); \
+    const float u_sum = reduce_k_lanes<8>((AU)); \
+    if (k_lane == 0u) { \
+      hidden[out_tile_base + ulong(IDX) * I + col] = inkling2_moe_situ_epilogue( \
+          g_sum, u_sum, 1.0f, p.gate_softcap, p.up_softcap, round_bf16); \
+    } \
+  }
+
+  if (n_rows <= 4u) {
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
+      const float us = inkling2_decode_fp8_e8m0(us_row[g]);
+      half4 gw[8], uw[8];
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), gw);
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), uw);
+      const uint k0 = g << 5u;
+      MXFP8_GU_ROW(0u, ag0, au0);
+      MXFP8_GU_ROW(1u, ag1, au1);
+      MXFP8_GU_ROW(2u, ag2, au2);
+      MXFP8_GU_ROW(3u, ag3, au3);
+    }
+    MXFP8_GU_STORE(0u, ag0, au0);
+    MXFP8_GU_STORE(1u, ag1, au1);
+    MXFP8_GU_STORE(2u, ag2, au2);
+    MXFP8_GU_STORE(3u, ag3, au3);
+    return;
+  }
+
+  float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+  float ag4 = 0.0f, ag5 = 0.0f, ag6 = 0.0f, ag7 = 0.0f;
+  float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+  float au4 = 0.0f, au5 = 0.0f, au6 = 0.0f, au7 = 0.0f;
+  for (uint g = k_lane; g < n_groups; g += kLanes) {
+    const uint k0 = g << 5u;
+    half4 w[8];
+    const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
+    decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), w);
+#define MXFP8_ONE_ROW(IDX, ACC, SC) \
+    if ((IDX) < n_rows) { \
+      float4 xv[8]; \
+      const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
+      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
+      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
+      (ACC) += (SC) * dot_mxfp8_32_regs(w, xv); \
+    }
+    MXFP8_ONE_ROW(0u, ag0, gs);
+    MXFP8_ONE_ROW(1u, ag1, gs);
+    MXFP8_ONE_ROW(2u, ag2, gs);
+    MXFP8_ONE_ROW(3u, ag3, gs);
+    MXFP8_ONE_ROW(4u, ag4, gs);
+    MXFP8_ONE_ROW(5u, ag5, gs);
+    MXFP8_ONE_ROW(6u, ag6, gs);
+    MXFP8_ONE_ROW(7u, ag7, gs);
+
+    const float us = inkling2_decode_fp8_e8m0(us_row[g]);
+    decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), w);
+    MXFP8_ONE_ROW(0u, au0, us);
+    MXFP8_ONE_ROW(1u, au1, us);
+    MXFP8_ONE_ROW(2u, au2, us);
+    MXFP8_ONE_ROW(3u, au3, us);
+    MXFP8_ONE_ROW(4u, au4, us);
+    MXFP8_ONE_ROW(5u, au5, us);
+    MXFP8_ONE_ROW(6u, au6, us);
+    MXFP8_ONE_ROW(7u, au7, us);
+#undef MXFP8_ONE_ROW
+  }
+  MXFP8_GU_STORE(0u, ag0, au0);
+  MXFP8_GU_STORE(1u, ag1, au1);
+  MXFP8_GU_STORE(2u, ag2, au2);
+  MXFP8_GU_STORE(3u, ag3, au3);
+  MXFP8_GU_STORE(4u, ag4, au4);
+  MXFP8_GU_STORE(5u, ag5, au5);
+  MXFP8_GU_STORE(6u, ag6, au6);
+  MXFP8_GU_STORE(7u, ag7, au7);
+#undef MXFP8_GU_ROW
+#undef MXFP8_GU_STORE
 }
 
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -853,48 +1727,68 @@ inkling2_moe_simd_down_nvfp4(
     return;
   }
 
+#define NVFP4_DN_ROW(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    float4 xv[4]; \
+    load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
+    (ACC) += sv * dot_4x4(wv, xv); \
+  }
+
+#define NVFP4_DN_STORE(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    const float sum = reduce_k_lanes<8>((ACC)); \
+    if (k_lane == 0u) { \
+      projected[out_tile_base + ulong(IDX) * D + col] = bfloat(sum); \
+    } \
+  }
+
   if (n_rows <= 4u) {
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
       float4 wv[4];
       const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
       decode_nvfp4_16(wp, wv);
       const float sv = inkling2_decode_fp8_e4m3(s_row[g]);
       const uint k0 = g << 4u;
-      for (uint r = 0u; r < n_rows; ++r) {
-        float4 xv[4];
-        load_bf16_16(x_tile + ulong(r) * K + k0, xv);
-        acc[r] += sv * dot_4x4(wv, xv);
-      }
+      NVFP4_DN_ROW(0u, a0);
+      NVFP4_DN_ROW(1u, a1);
+      NVFP4_DN_ROW(2u, a2);
+      NVFP4_DN_ROW(3u, a3);
     }
-    for (uint r = 0u; r < n_rows; ++r) {
-      acc[r] = reduce_k_lanes<8>(acc[r]);
-      if (k_lane == 0u) {
-        projected[out_tile_base + ulong(r) * D + col] = bfloat(acc[r]);
-      }
-    }
+    NVFP4_DN_STORE(0u, a0);
+    NVFP4_DN_STORE(1u, a1);
+    NVFP4_DN_STORE(2u, a2);
+    NVFP4_DN_STORE(3u, a3);
     return;
   }
 
-  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
   for (uint g = k_lane; g < n_groups; g += kLanes) {
     float4 wv[4];
     const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
     decode_nvfp4_16(wp, wv);
     const float sv = inkling2_decode_fp8_e4m3(s_row[g]);
     const uint k0 = g << 4u;
-    for (uint r = 0u; r < n_rows; ++r) {
-      float4 xv[4];
-      load_bf16_16(x_tile + ulong(r) * K + k0, xv);
-      acc[r] += sv * dot_4x4(wv, xv);
-    }
+    NVFP4_DN_ROW(0u, a0);
+    NVFP4_DN_ROW(1u, a1);
+    NVFP4_DN_ROW(2u, a2);
+    NVFP4_DN_ROW(3u, a3);
+    NVFP4_DN_ROW(4u, a4);
+    NVFP4_DN_ROW(5u, a5);
+    NVFP4_DN_ROW(6u, a6);
+    NVFP4_DN_ROW(7u, a7);
   }
-  for (uint r = 0u; r < n_rows; ++r) {
-    acc[r] = reduce_k_lanes<8>(acc[r]);
-    if (k_lane == 0u) {
-      projected[out_tile_base + ulong(r) * D + col] = bfloat(acc[r]);
-    }
-  }
+  NVFP4_DN_STORE(0u, a0);
+  NVFP4_DN_STORE(1u, a1);
+  NVFP4_DN_STORE(2u, a2);
+  NVFP4_DN_STORE(3u, a3);
+  NVFP4_DN_STORE(4u, a4);
+  NVFP4_DN_STORE(5u, a5);
+  NVFP4_DN_STORE(6u, a6);
+  NVFP4_DN_STORE(7u, a7);
+#undef NVFP4_DN_ROW
+#undef NVFP4_DN_STORE
 }
 
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -978,6 +1872,120 @@ inkling2_moe_simd_down_q8(
       projected[out_tile_base + ulong(r) * D + col] = bfloat(acc[r]);
     }
   }
+}
+
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_simd_down_mxfp8(
+    device const bfloat *hidden [[buffer(0)]],
+    device const Inkling2MoeTile *tiles [[buffer(1)]],
+    device const uint *simd_list [[buffer(2)]],
+    device const Inkling2MoeTileCount *count [[buffer(3)]],
+    device const uchar *dn_w [[buffer(4)]],
+    device const uint8_t *dn_s [[buffer(5)]],
+    device bfloat *projected [[buffer(6)]],
+    constant Inkling2MoeParams &p [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (group.y >= count->simd_tiles) return;
+  constexpr uint kLanes = 4u;
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 2u; // 0..7
+  const uint col = group.x * 16u + sg * 8u + r_id;
+  if (col >= p.hidden) return;
+
+  const uint tile_idx = simd_list[group.y];
+  const Inkling2MoeTile t = tiles[tile_idx];
+  const uint n_rows = t.rows;
+  const uint K = p.intermediate;
+  const uint D = p.hidden;
+  const uint n_groups = K >> 5u;
+  const ulong row_idx = ulong(t.expert) * ulong(D) + col;
+  const device uchar *w_row = dn_w + row_idx * ulong(K);
+  const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
+
+  const device bfloat *x_tile = hidden + ulong(tile_idx) * p.tile_rows * K;
+  const ulong out_tile_base = ulong(tile_idx) * p.tile_rows * D;
+
+  if (n_rows == 1u) {
+    float acc = 0.0f;
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      float4 xv[8];
+      const device bfloat *xr = x_tile + (g << 5u);
+      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
+      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
+      const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
+      acc += sc * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
+    }
+    acc = reduce_k_lanes<4>(acc);
+    if (k_lane == 0u) {
+      projected[out_tile_base + col] = bfloat(acc);
+    }
+    return;
+  }
+
+#define MXFP8_DN_ROW(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    float4 xv[8]; \
+    const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
+    load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
+    load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
+    (ACC) += sc * dot_mxfp8_32_regs(w, xv); \
+  }
+
+#define MXFP8_DN_STORE(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    const float sum = reduce_k_lanes<4>((ACC)); \
+    if (k_lane == 0u) { \
+      projected[out_tile_base + ulong(IDX) * D + col] = bfloat(sum); \
+    } \
+  }
+
+  if (n_rows <= 4u) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
+      half4 w[8];
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), w);
+      const uint k0 = g << 5u;
+      MXFP8_DN_ROW(0u, a0);
+      MXFP8_DN_ROW(1u, a1);
+      MXFP8_DN_ROW(2u, a2);
+      MXFP8_DN_ROW(3u, a3);
+    }
+    MXFP8_DN_STORE(0u, a0);
+    MXFP8_DN_STORE(1u, a1);
+    MXFP8_DN_STORE(2u, a2);
+    MXFP8_DN_STORE(3u, a3);
+    return;
+  }
+
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+  for (uint g = k_lane; g < n_groups; g += kLanes) {
+    const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
+    half4 w[8];
+    decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), w);
+    const uint k0 = g << 5u;
+    MXFP8_DN_ROW(0u, a0);
+    MXFP8_DN_ROW(1u, a1);
+    MXFP8_DN_ROW(2u, a2);
+    MXFP8_DN_ROW(3u, a3);
+    MXFP8_DN_ROW(4u, a4);
+    MXFP8_DN_ROW(5u, a5);
+    MXFP8_DN_ROW(6u, a6);
+    MXFP8_DN_ROW(7u, a7);
+  }
+  MXFP8_DN_STORE(0u, a0);
+  MXFP8_DN_STORE(1u, a1);
+  MXFP8_DN_STORE(2u, a2);
+  MXFP8_DN_STORE(3u, a3);
+  MXFP8_DN_STORE(4u, a4);
+  MXFP8_DN_STORE(5u, a5);
+  MXFP8_DN_STORE(6u, a6);
+  MXFP8_DN_STORE(7u, a7);
+#undef MXFP8_DN_ROW
+#undef MXFP8_DN_STORE
 }
 
 // ============================================================================
@@ -1165,7 +2173,10 @@ kernel void inkling2_moe_gate_up_situ_nax(
       ? reinterpret_cast<device const float *>(gu_aux)[t.expert]
       : 1.0f;
 
-  const uint row_in_expert = (is_up ? I : 0u) + origin + lane;
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint row_in_expert = interleaved
+      ? (2u * (origin + lane) + (is_up ? 1u : 0u))
+      : ((is_up ? I : 0u) + origin + lane);
   const ulong full_row_idx = exp_row_base + row_in_expert;
   const device uchar *w_row_base = gu_w + full_row_idx * ulong(IsQ8 ? K : (K >> 1u));
   const ulong s_row_base = full_row_idx * ulong(IsQ8 ? (K >> 5u) : (K >> 4u));
@@ -1341,6 +2352,131 @@ inkling2_moe_grouped_combine_bf16(
     sum += gamma[base + k] * float(projected[ulong(pos) * p.hidden + col]);
   }
   out[ulong(row) * p.hidden + col] = bfloat(sum);
+}
+
+// Fused grouped weighted combine + static post_conv (k=4, ragged multi-seq) + optional FP32
+// residual + hist_out + optional pre-conv tape write (for T <= 32 decode & speculative verify).
+// Grid: (ceil(D / 32), num_seqs, 1), TG: (256, 1, 1) -> 8 SGs combine & convolve up to 8 tokens
+// in parallel per chunk (72 TGs at M=8, 288 TGs at M=32; full M5 Max 40-core utilization!).
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+inkling2_moe_grouped_combine_sconv_bf16(
+    device const bfloat *projected [[buffer(0)]],
+    device const uint *inverse [[buffer(1)]],
+    device const float *gamma [[buffer(2)]],
+    device const uchar *post_w [[buffer(3)]],
+    device const int32_t *cu_seqlens [[buffer(4)]],
+    device const uchar *res_raw [[buffer(5)]],
+    device const uchar *h0 [[buffer(6)]],
+    device const uchar *h1 [[buffer(7)]],
+    device const uchar *h2 [[buffer(8)]],
+    device const uchar *h3 [[buffer(9)]],
+    device bfloat *y_out [[buffer(10)]],
+    device bfloat *hist_out [[buffer(11)]],
+    device bfloat *tape_out [[buffer(12)]],
+    constant Inkling2MoePostConvParams &pc [[buffer(13)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint seq_idx = group.y;
+  if (seq_idx >= pc.num_seqs) return;
+
+  const uint col = group.x * 32u + lane;
+  const uint D = pc.hidden;
+  const bool valid_col = col < D;
+
+  const uint seq_start = (pc.num_seqs == 1u) ? 0u : uint(cu_seqlens[seq_idx]);
+  const uint seq_end = (pc.num_seqs == 1u) ? pc.rows : uint(cu_seqlens[seq_idx + 1u]);
+
+  device const uchar *h_ptr;
+  ulong h_base;
+  uint h_f32;
+  if (pc.packed_hist != 0u) {
+    h_ptr = h0;
+    h_base = ulong(seq_idx) * 3ul * ulong(D);
+    h_f32 = pc.hist_f32_mask & 1u;
+  } else {
+    h_ptr = (seq_idx == 0u) ? h0 : (seq_idx == 1u) ? h1 : (seq_idx == 2u) ? h2 : h3;
+    h_base = 0ul;
+    h_f32 = (pc.hist_f32_mask >> seq_idx) & 1u;
+  }
+
+  // Rows 0..2 hold the rolling 3-row carry history; rows 3..10 hold up to 8 combined MoE rows.
+  threadgroup float tg_moe[11][32];
+  if (sg < 3u && valid_col) {
+    tg_moe[sg][lane] = inkling2_moe_read_f32(h_ptr, h_base + ulong(sg) * ulong(D) + col, h_f32);
+  }
+
+  const uint w_f32 = pc.flags & 1u;
+  const ulong wb = ulong(col) * 4ul;
+  const float w3 = valid_col ? inkling2_moe_read_f32(post_w, wb + 0ul, w_f32) : 0.0f;
+  const float w2 = valid_col ? inkling2_moe_read_f32(post_w, wb + 1ul, w_f32) : 0.0f;
+  const float w1 = valid_col ? inkling2_moe_read_f32(post_w, wb + 2ul, w_f32) : 0.0f;
+  const float w0 = valid_col ? inkling2_moe_read_f32(post_w, wb + 3ul, w_f32) : 0.0f;
+
+  const bool has_res = ((pc.flags >> 1u) & 1u) != 0u;
+  const uint res_f32 = (pc.flags >> 2u) & 1u;
+  const bool write_tape = ((pc.flags >> 3u) & 1u) != 0u;
+  const float scale = 0.44721359549995793f;
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint last_chunk_len = 0u;
+  for (uint chunk_start = seq_start; chunk_start < seq_end; chunk_start += 8u) {
+    const uint chunk_len = min(8u, seq_end - chunk_start);
+    if (sg < chunk_len && valid_col) {
+      const uint t = chunk_start + sg;
+      const uint base = t * pc.top_k;
+      float sum = 0.0f;
+      for (uint k = 0u; k < pc.top_k; ++k) {
+        const uint pos = inverse[base + k];
+        sum += gamma[base + k] * float(projected[ulong(pos) * ulong(D) + col]);
+      }
+      const bfloat moe_b = bfloat(sum);
+      if (write_tape) {
+        tape_out[ulong(t) * ulong(D) + col] = moe_b;
+      }
+      tg_moe[3u + sg][lane] = float(moe_b);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg < chunk_len && valid_col) {
+      const uint t = chunk_start + sg;
+      const float x3 = tg_moe[sg + 0u][lane];
+      const float x2 = tg_moe[sg + 1u][lane];
+      const float x1 = tg_moe[sg + 2u][lane];
+      const float x0 = tg_moe[sg + 3u][lane];
+      const float conv_acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+      const bfloat conv_val = bfloat(conv_acc * scale);
+      if (has_res) {
+        const float rv = inkling2_moe_read_f32(
+            res_raw, ulong(t) * ulong(pc.res_stride) + col, res_f32);
+        y_out[ulong(t) * ulong(D) + col] = bfloat(rv + float(conv_val));
+      } else {
+        y_out[ulong(t) * ulong(D) + col] = conv_val;
+      }
+    }
+
+    if (chunk_start + 8u < seq_end) {
+      // Stage into register before barrier so sg=0..2 never race when chunk_len < 3.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float carry = 0.0f;
+      if (sg < 3u && valid_col) {
+        carry = tg_moe[chunk_len + sg][lane];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg < 3u && valid_col) {
+        tg_moe[sg][lane] = carry;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+      last_chunk_len = chunk_len;
+    }
+  }
+
+  if (sg < 3u && valid_col) {
+    const ulong ho_base = ulong(seq_idx) * 3ul * ulong(D);
+    hist_out[ho_base + ulong(sg) * ulong(D) + col] = bfloat(tg_moe[last_chunk_len + sg][lane]);
+  }
 }
 
 // Explicit kernel instantiations for prebuilt metallib lookup.

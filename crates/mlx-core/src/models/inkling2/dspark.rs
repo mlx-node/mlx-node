@@ -189,6 +189,125 @@ impl Inkling2DsparkDraftConfig {
         })
     }
 
+    /// Parse and validate DSpark hyperparameters from the `mtp_config` block of a Thinking
+    /// Machines HuggingFace `config.json` (paired with `mtp.safetensors`).
+    pub fn from_mtp_config_json(
+        config_path: &Path,
+        target_config: &Inkling2Config,
+    ) -> Result<Self> {
+        let raw = fs::read_to_string(config_path).map_err(|e| {
+            Error::from_reason(format!(
+                "Inkling2 DSpark: failed to read {}: {e}",
+                config_path.display()
+            ))
+        })?;
+        let root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            Error::from_reason(format!(
+                "Inkling2 DSpark: failed to parse {}: {e}",
+                config_path.display()
+            ))
+        })?;
+        let mtp = root.get("mtp_config").ok_or_else(|| {
+            Error::from_reason(format!(
+                "Inkling2 DSpark: {} is missing `mtp_config`",
+                config_path.display()
+            ))
+        })?;
+        let get_u = |k: &str| mtp.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let get_f = |k: &str| mtp.get(k).and_then(|v| v.as_f64());
+
+        let hidden_size = get_u("hidden_size").unwrap_or(target_config.hidden_size);
+        let intermediate_size = get_u("intermediate_size").unwrap_or(hidden_size * 4);
+        let num_hidden_layers = get_u("num_hidden_layers").unwrap_or(3);
+        let num_attention_heads =
+            get_u("num_attention_heads").unwrap_or(target_config.num_attention_heads);
+        let num_key_value_heads =
+            get_u("num_key_value_heads").unwrap_or(target_config.num_key_value_heads);
+        let head_dim = get_u("head_dim").unwrap_or(target_config.head_dim);
+        let rope_theta = get_f("rope_theta").unwrap_or(1_000_000.0);
+        let rms_norm_eps = get_f("rms_norm_eps").unwrap_or(target_config.rms_norm_eps) as f32;
+        let vocab_size = target_config.effective_padded_vocab_size();
+        let unpadded_vocab_size = target_config.effective_unpadded_vocab_size();
+        let block_size = get_u("block_size").unwrap_or(DSPARK_BLOCK_SIZE);
+        let markov_rank = get_u("markov_rank").unwrap_or(256);
+        let sliding_window = get_u("sliding_window_size")
+            .or_else(|| get_u("sliding_window"))
+            .unwrap_or(target_config.sliding_window);
+        let final_logit_softcapping = target_config.final_logit_softcapping;
+        let max_position_embeddings =
+            get_u("max_position_embeddings").unwrap_or(target_config.max_position_embeddings);
+
+        let target_layer_ids: Vec<usize> = mtp
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::from_reason("Inkling2 DSpark mtp_config missing `target_layer_ids` array")
+            })?
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .map(|u| u as usize)
+                    .ok_or_else(|| Error::from_reason("Invalid target_layer_ids entry"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let sliding_window_pattern: Vec<bool> =
+            if let Some(arr) = mtp.get("local_layer_ids").and_then(|v| v.as_array()) {
+                let local_ids: Vec<usize> = arr
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|u| u as usize))
+                    .collect();
+                (0..num_hidden_layers)
+                    .map(|i| local_ids.contains(&i))
+                    .collect()
+            } else {
+                (0..num_hidden_layers)
+                    .map(|i| i != num_hidden_layers / 2)
+                    .collect()
+            };
+
+        if hidden_size != target_config.hidden_size {
+            return Err(Error::from_reason(format!(
+                "Inkling2 DSpark hidden_size ({hidden_size}) != target ({})",
+                target_config.hidden_size
+            )));
+        }
+        if block_size < 2 || num_hidden_layers == 0 || markov_rank == 0 {
+            return Err(Error::from_reason(format!(
+                "Inkling2 DSpark invalid geometry: block_size={block_size}, layers={num_hidden_layers}, rank={markov_rank}"
+            )));
+        }
+        let max_visit = target_config.num_layer_visits();
+        if target_layer_ids.is_empty()
+            || target_layer_ids.iter().any(|&v| v > max_visit)
+            || !target_layer_ids.windows(2).all(|w| w[0] < w[1])
+        {
+            return Err(Error::from_reason(format!(
+                "Inkling2 DSpark invalid target_layer_ids={target_layer_ids:?} for target visits={max_visit}"
+            )));
+        }
+
+        Ok(Self {
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            rope_theta,
+            rms_norm_eps,
+            vocab_size,
+            unpadded_vocab_size,
+            block_size,
+            target_layer_ids,
+            markov_rank,
+            sliding_window,
+            sliding_window_pattern,
+            final_logit_softcapping,
+            max_position_embeddings,
+        })
+    }
+
     /// Conservative per-sequence BF16 draft KV cache footprint in bytes for `total_tokens`.
     pub fn context_bytes_for_tokens(&self, total_tokens: u32) -> u64 {
         let kv_per_tok = (self.num_key_value_heads as u64)
@@ -208,11 +327,14 @@ impl Inkling2DsparkDraftConfig {
     }
 }
 
-/// Auto-discover a colocated Inkling2 DSpark GGUF (`dspark-*.gguf` or any `*.gguf` matching
-/// `is_inkling2_dspark_gguf`) inside `model_dir`.
-pub(crate) fn discover_inkling2_dspark_gguf(model_dir: &Path) -> Option<PathBuf> {
+/// Auto-discover all colocated Inkling2 DSpark GGUFs (`dspark-*.gguf` first, then any `*.gguf`
+/// matching `is_inkling2_dspark_gguf`) inside `model_dir`, sorted deterministically.
+pub(crate) fn discover_inkling2_dspark_ggufs(model_dir: &Path) -> Vec<PathBuf> {
     let dir = if model_dir.is_file() {
-        model_dir.parent()?
+        match model_dir.parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        }
     } else {
         model_dir
     };
@@ -223,6 +345,8 @@ pub(crate) fn discover_inkling2_dspark_gguf(model_dir: &Path) -> Option<PathBuf>
         dirs.push(canon);
     }
 
+    let mut out = Vec::new();
+    let mut seen_canon = std::collections::HashSet::new();
     for candidate_dir in dirs {
         let Ok(entries) = fs::read_dir(&candidate_dir) else {
             continue;
@@ -251,25 +375,169 @@ pub(crate) fn discover_inkling2_dspark_gguf(model_dir: &Path) -> Option<PathBuf>
         dspark_named.sort();
         other_ggufs.sort();
         for path in dspark_named.into_iter().chain(other_ggufs) {
+            let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen_canon.insert(key) {
+                continue;
+            }
             if let Ok(gguf) = parse_gguf(&path)
                 && is_inkling2_dspark_gguf(&gguf.metadata)
             {
-                return Some(path);
+                out.push(path);
             }
         }
     }
-    None
+    out
 }
 
-/// Resolve an explicit `draft_model_path` (file or directory) or auto-discover beside `asset_dir`.
+/// Auto-discover the first colocated Inkling2 DSpark GGUF (`dspark-*.gguf` or any `*.gguf`
+/// matching `is_inkling2_dspark_gguf`) inside `model_dir`.
+#[cfg(test)]
+pub(crate) fn discover_inkling2_dspark_gguf(model_dir: &Path) -> Option<PathBuf> {
+    discover_inkling2_dspark_ggufs(model_dir).into_iter().next()
+}
+
+/// Lightweight SafeTensors binary header check: verifies the file has an 8-byte little-endian
+/// header length, `8 + header_len <= file_len`, and a syntactically valid JSON object header.
+/// Rejects truncated or corrupt `mtp.safetensors` files during discovery before loading.
+fn has_valid_safetensors_header(path: &Path) -> bool {
+    use std::io::Read;
+    const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    let file_len = meta.len();
+    if !meta.is_file() || file_len < 10 {
+        return false;
+    }
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut len_buf = [0u8; 8];
+    if f.read_exact(&mut len_buf).is_err() {
+        return false;
+    }
+    let header_len = u64::from_le_bytes(len_buf);
+    if header_len == 0 || header_len > MAX_HEADER_BYTES {
+        return false;
+    }
+    let Some(header_end) = header_len.checked_add(8) else {
+        return false;
+    };
+    if header_end > file_len {
+        return false;
+    }
+    let Ok(header_usize) = usize::try_from(header_len) else {
+        return false;
+    };
+    let mut header_bytes = vec![0u8; header_usize];
+    if f.read_exact(&mut header_bytes).is_err() {
+        return false;
+    }
+    matches!(
+        serde_json::from_slice::<serde_json::Value>(&header_bytes),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
+/// True when `path` is a structurally valid `mtp.safetensors` paired with a sibling `config.json`
+/// declaring a valid `mtp_config` (`markov_rank > 0` and non-empty `target_layer_ids`).
+pub(crate) fn is_inkling2_mtp_safetensors(path: &Path) -> bool {
+    if !has_valid_safetensors_header(path) {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(parent.join("config.json")) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(mtp) = root.get("mtp_config") else {
+        return false;
+    };
+    let rank_ok = mtp
+        .get("markov_rank")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|r| r > 0);
+    let layers_ok = mtp
+        .get("target_layer_ids")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty());
+    rank_ok && layers_ok
+}
+
+/// Auto-discover all colocated Inkling2 DSpark checkpoint candidates inside `model_dir` in
+/// target-format priority order (deduplicated):
+/// - When `prefer_gguf == false` (SafeTensors target): `mtp.safetensors` first, then `dspark-*.gguf`.
+/// - When `prefer_gguf == true` (GGUF target): `dspark-*.gguf` first, then `mtp.safetensors`.
+pub(crate) fn discover_inkling2_dspark_candidates(
+    model_dir: &Path,
+    prefer_gguf: bool,
+) -> Vec<PathBuf> {
+    let dir = if model_dir.is_file() {
+        match model_dir.parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        }
+    } else {
+        model_dir
+    };
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Ok(canon) = fs::canonicalize(dir)
+        && canon != dir
+    {
+        dirs.push(canon);
+    }
+
+    let mut mtp_candidates = Vec::new();
+    let mut seen_mtp = std::collections::HashSet::new();
+    for candidate_dir in &dirs {
+        let mtp_path = candidate_dir.join("mtp.safetensors");
+        if is_inkling2_mtp_safetensors(&mtp_path) {
+            let key = fs::canonicalize(&mtp_path).unwrap_or_else(|_| mtp_path.clone());
+            if seen_mtp.insert(key) {
+                mtp_candidates.push(mtp_path);
+            }
+        }
+    }
+    let gguf_candidates = discover_inkling2_dspark_ggufs(model_dir);
+
+    if prefer_gguf {
+        gguf_candidates.into_iter().chain(mtp_candidates).collect()
+    } else {
+        mtp_candidates.into_iter().chain(gguf_candidates).collect()
+    }
+}
+
+/// Auto-discover the preferred colocated Inkling2 DSpark checkpoint inside `model_dir`:
+/// - For SafeTensors directories, prefers `mtp.safetensors` (with `config.json` `mtp_config`),
+///   falling back to `dspark-*.gguf`.
+/// - For GGUF file paths, prefers `dspark-*.gguf`, falling back to `mtp.safetensors`.
+#[cfg(test)]
+pub(crate) fn discover_inkling2_dspark(model_dir: &Path) -> Option<PathBuf> {
+    let is_gguf_file = model_dir
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    discover_inkling2_dspark_candidates(model_dir, is_gguf_file)
+        .into_iter()
+        .next()
+}
+
+/// Resolve an explicit `draft_model_path` (file or directory) or auto-discover ordered fallback
+/// candidates beside `source_dir` / `asset_dir`, preserving the target's `prefer_gguf` ordering.
 ///
 /// - `Some("")` or `Some("none")` / `Some("off")` explicitly disables DSpark loading.
-/// - `Some(path)` resolves a GGUF file or directory containing a DSpark GGUF (errors if missing).
-/// - `None` auto-discovers a matching DSpark GGUF in `asset_dir` (returns `Ok(None)` if absent).
-pub(crate) fn resolve_inkling2_dspark_path(
+/// - `Some(path)` resolves a GGUF/SafeTensors file or directory containing DSpark draft(s) (errors if missing).
+/// - `None` auto-discovers ordered matching DSpark draft candidates in `source_dir` then `asset_dir`.
+pub(crate) fn resolve_inkling2_dspark_candidates(
+    source_dir: &Path,
     asset_dir: &Path,
+    prefer_gguf: bool,
     explicit: Option<&str>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Vec<PathBuf>> {
     match explicit {
         Some(raw) => {
             let trimmed = raw.trim();
@@ -277,28 +545,45 @@ pub(crate) fn resolve_inkling2_dspark_path(
                 || trimmed.eq_ignore_ascii_case("none")
                 || trimmed.eq_ignore_ascii_case("off")
             {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             let p = PathBuf::from(trimmed);
             if p.is_file() {
-                return Ok(Some(p));
+                return Ok(vec![p]);
             }
             if p.is_dir() {
-                return discover_inkling2_dspark_gguf(&p)
-                    .ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "No Inkling2 DSpark GGUF found in draftModelPath directory {}",
-                            p.display()
-                        ))
-                    })
-                    .map(Some);
+                let candidates = discover_inkling2_dspark_candidates(&p, prefer_gguf);
+                if candidates.is_empty() {
+                    return Err(Error::from_reason(format!(
+                        "No Inkling2 DSpark draft (`mtp.safetensors` or `dspark-*.gguf`) found in draftModelPath directory {}",
+                        p.display()
+                    )));
+                }
+                return Ok(candidates);
             }
             Err(Error::from_reason(format!(
                 "Inkling2 draftModelPath does not exist: {}",
                 p.display()
             )))
         }
-        None => Ok(discover_inkling2_dspark_gguf(asset_dir)),
+        None => {
+            let mut out = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let search_dirs: &[&Path] = if asset_dir != source_dir {
+                &[source_dir, asset_dir]
+            } else {
+                &[source_dir]
+            };
+            for dir in search_dirs {
+                for cand in discover_inkling2_dspark_candidates(dir, prefer_gguf) {
+                    let key = fs::canonicalize(&cand).unwrap_or_else(|_| cand.clone());
+                    if seen.insert(key) {
+                        out.push(cand);
+                    }
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -363,7 +648,151 @@ impl Inkling2DsparkLayer {
     }
 }
 
-/// Recurrent Markov head with `dspark_hidden_out` folded into `lm_head` once in FP64 -> BF16.
+/// Q8_0 (`group_size=32, bits=8`, affine) quantized folded Markov projection weight `[V_unpadded, R]`.
+/// Cuts per-step DRAM traffic by ~1.8x (57.6 MB vs 102.9 MB BF16) and fuses matmul + `fold_bias` +
+/// `base_logits` + softcap + argmax into a single Metal dispatch!
+pub(crate) struct MarkovFoldQ8 {
+    pub weight: MxArray, // [V_q8, R/4] uint32
+    pub scales: MxArray, // [V_q8, R/32] BF16
+    pub biases: MxArray, // [V_q8, R/32] BF16
+}
+
+/// Schmitt-trigger EMA adaptive draft depth controller (`k in [min_k..=max_k]`, default `[3..=7]`)
+/// for Inkling-2-Mini DSpark.
+///
+/// Always runs all 8 tokens `[anchor, mask_1..mask_7]` through the 3 tiny draft transformer layers
+/// (preserving the exact draft distribution!) and adapts ONLY the number of Markov steps + verified
+/// draft tokens `k` to match observed acceptance:
+/// - Starts lean at `k = 3` (`M = 4` verify rows), the measured M5 Max 128-expert MoE latency sweet
+///   spot (~26.1 ms/cycle single-seq, ~52.3 ms/wave 4-lane vs ~35.6 / ~73.2 ms at `k = 7`).
+/// - Uses hysteresis deadbands on `ema_accept` plus `consecutive_full >= 2` / `consecutive_short >= 2`
+///   so `k` stays rock-steady on low-accept prompts (`k = 3`), ramps smoothly up to `k = 7` on
+///   high-accept / repetitive runs, and avoids single-cycle anti-correlated `3 <-> 4` thrashing.
+/// - Leaves `DsparkBreakEvenPolicy` active to guard fallback to AR on near-zero acceptance.
+#[derive(Debug, Clone)]
+pub(crate) struct AdaptiveDraftDepth {
+    min_k: usize,
+    max_k: usize,
+    current_k: usize,
+    ema_accept: f32,
+    ema_alpha: f32,
+    consecutive_full: u32,
+    consecutive_short: u32,
+    observations: u64,
+}
+
+impl AdaptiveDraftDepth {
+    /// Default minimum adaptive draft depth (`k = 3` -> `M = 4` verify rows).
+    pub(crate) const DEFAULT_MIN_K: usize = 3;
+    /// Default initial adaptive draft depth (`k = 3` -> `M = 4` verify rows; measured M5 Max MoE
+    /// sweep optimum at cold start across single-seq and 4-lane concurrent waves).
+    pub(crate) const DEFAULT_INIT_K: usize = 3;
+
+    pub(crate) fn new(max_spec: usize) -> Self {
+        let max_k = max_spec.max(1);
+        let min_k = Self::DEFAULT_MIN_K.min(max_k);
+        let current_k = Self::DEFAULT_INIT_K.clamp(min_k, max_k);
+        Self {
+            min_k,
+            max_k,
+            current_k,
+            ema_accept: 1.8,
+            ema_alpha: 0.30,
+            consecutive_full: 0,
+            consecutive_short: 0,
+            observations: 0,
+        }
+    }
+
+    /// Draft count to propose for the upcoming cycle, bounded by the caller's hard `cap`.
+    #[inline]
+    pub(crate) fn current_depth(&self, cap: usize) -> usize {
+        self.current_k.min(cap)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ema_accept(&self) -> f32 {
+        self.ema_accept
+    }
+
+    /// EMA threshold required to step UP from `k` to `k + 1`.
+    #[inline]
+    fn up_threshold(k: usize) -> f32 {
+        match k {
+            0..=3 => 2.25,
+            4 => 3.10,
+            5 => 4.00,
+            _ => 4.90,
+        }
+    }
+
+    /// EMA threshold below which `k` steps DOWN to `k - 1` (0.40 hysteresis deadband below `up`).
+    #[inline]
+    fn down_threshold(k: usize) -> f32 {
+        match k {
+            0..=4 => 1.85,
+            5 => 2.65,
+            6 => 3.55,
+            _ => 4.45,
+        }
+    }
+
+    /// Update the EMA and streaks after a completed speculative cycle (`drafted > 0`).
+    pub(crate) fn observe(&mut self, drafted: usize, accepted_drafts: usize) {
+        if drafted == 0 {
+            return;
+        }
+        let clamped_acc = accepted_drafts.min(drafted);
+        // Right-censored externally-capped tail cycle (e.g. `remaining - 1 < current_k`) that
+        // accepted every drafted token: do not pull `ema_accept` down or trigger a spurious
+        // full-block scale-up into the next multi-turn continuation.
+        if drafted < self.current_k && clamped_acc >= drafted {
+            return;
+        }
+
+        let acc = clamped_acc as f32;
+        if self.observations == 0 {
+            self.ema_accept = 0.5 * self.ema_accept + 0.5 * acc;
+        } else {
+            self.ema_accept = (1.0 - self.ema_alpha) * self.ema_accept + self.ema_alpha * acc;
+        }
+        self.observations = self.observations.saturating_add(1);
+
+        if drafted >= self.current_k && clamped_acc >= drafted {
+            self.consecutive_full = self.consecutive_full.saturating_add(1);
+            self.consecutive_short = 0;
+        } else if clamped_acc <= 1 {
+            self.consecutive_short = self.consecutive_short.saturating_add(1);
+            self.consecutive_full = 0;
+        } else {
+            self.consecutive_full = 0;
+            self.consecutive_short = 0;
+        }
+
+        // Hysteresis step-up: require either sustained full-accept streak (`>= 2`) or EMA above
+        // the calibrated `up_threshold(current_k)` so lone bursts don't cause anti-correlated
+        // `3 <-> 4` oscillation.
+        if self.current_k < self.max_k
+            && (self.consecutive_full >= 2 || self.ema_accept >= Self::up_threshold(self.current_k))
+        {
+            self.current_k += 1;
+            self.consecutive_full = 0;
+            return;
+        }
+
+        // Hysteresis step-down: require either repeated short accepts (`>= 2`) or EMA below
+        // `down_threshold(current_k)` (0.40 deadband below step-up).
+        if self.current_k > self.min_k
+            && (self.consecutive_short >= 2
+                || self.ema_accept < Self::down_threshold(self.current_k))
+        {
+            self.current_k -= 1;
+            self.consecutive_short = 0;
+        }
+    }
+}
+
+/// Recurrent Markov head with `dspark_hidden_out` folded into `lm_head` once in FP64 -> Q8_0/BF16.
 pub(crate) struct Inkling2MarkovHead {
     pub markov_rank: usize,
     pub dflare_norm: MxArray,      // [H] F32
@@ -371,23 +800,34 @@ pub(crate) struct Inkling2MarkovHead {
     pub rnn_bias_f32: MxArray,     // [1, 3*R] F32
     pub rnn_proj_rec_w_t: MxArray, // [2*R, 3*R] BF16 (`joint_proj.W[:, :2*R].T`)
     pub rnn_proj_ctx_w_t: MxArray, // [2*H, 3*R] BF16 (`joint_proj.W[:, 2*R:].T`)
-    pub fold_weight_t: MxArray,    // [R, padded_vocab] BF16 (`(lm_head @ hidden_out.W).T`)
-    pub fold_bias: MxArray,        // [1, padded_vocab] BF16 (`lm_head @ hidden_out.b`)
-    pub one_scalar: MxArray,       // Pre-allocated FP32 `1.0` scalar for `markov_gate`
+    /// Q8_0 (`group_size=32`) folded weight `[unpadded_vocab, R/4]` used by fused Metal kernels.
+    pub fold_weight_q8: Option<MarkovFoldQ8>,
+    /// Fallback BF16 `[R, padded_vocab]` transposed weight (retained only when `fold_weight_q8` is unused).
+    pub fold_weight_t: Option<MxArray>,
+    pub fold_bias: MxArray, // [1, padded_vocab] BF16 (`lm_head @ hidden_out.b`)
+    pub one_scalar: MxArray, // Pre-allocated FP32 `1.0` scalar for `markov_gate`
 }
 
 impl Inkling2MarkovHead {
     fn weight_arrays(&self) -> Vec<MxArray> {
-        vec![
+        let mut out = vec![
             self.dflare_norm.clone(),
             self.markov_w1.clone(),
             self.rnn_bias_f32.clone(),
             self.rnn_proj_rec_w_t.clone(),
             self.rnn_proj_ctx_w_t.clone(),
-            self.fold_weight_t.clone(),
             self.fold_bias.clone(),
             self.one_scalar.clone(),
-        ]
+        ];
+        if let Some(ref q8) = self.fold_weight_q8 {
+            out.push(q8.weight.clone());
+            out.push(q8.scales.clone());
+            out.push(q8.biases.clone());
+        }
+        if let Some(ref fw_t) = self.fold_weight_t {
+            out.push(fw_t.clone());
+        }
+        out
     }
 }
 
@@ -405,6 +845,264 @@ pub struct Inkling2DsparkModel {
 }
 
 impl Inkling2DsparkModel {
+    /// Auto-dispatch DSpark loader: `.safetensors` (`mtp.safetensors`) -> [`Self::load_safetensors`],
+    /// otherwise GGUF (`dspark-*.gguf`) -> [`Self::load_gguf`].
+    pub fn load_auto(
+        draft_path: &Path,
+        target_config: &Inkling2Config,
+        target_lm_head: &LinearProj,
+    ) -> Result<Self> {
+        let is_st = draft_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        if is_st {
+            Self::load_safetensors(draft_path, target_config, target_lm_head)
+        } else {
+            Self::load_gguf(draft_path, target_config, target_lm_head)
+        }
+    }
+
+    /// Load native BF16 `mtp.safetensors` paired with `config.json` (`mtp_config`), fuse BF16
+    /// QKV / KV_ctx / GateUp projections with zero weight duplication, fold its Markov head into
+    /// `target_lm_head` in FP64, and pack `fold_weight` into Q8_0 for fused Metal argmax.
+    pub fn load_safetensors(
+        draft_path: &Path,
+        target_config: &Inkling2Config,
+        target_lm_head: &LinearProj,
+    ) -> Result<Self> {
+        let parent = draft_path.parent().ok_or_else(|| {
+            Error::from_reason(format!(
+                "Inkling2 DSpark: cannot locate config.json parent for {}",
+                draft_path.display()
+            ))
+        })?;
+        let config = Inkling2DsparkDraftConfig::from_mtp_config_json(
+            &parent.join("config.json"),
+            target_config,
+        )?;
+        let tensors = crate::utils::safetensors::load_safetensors_lazy(draft_path)?;
+
+        let d = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let ffn = config.intermediate_size;
+        let rank = config.markov_rank;
+
+        // 1. Softmax fuse weights `[num_layers + 1, num_taps]`
+        let fuse_raw = require_draft_tensor(&tensors, "fuse_weight")?
+            .astype(DType::Float32)?
+            .to_float32()?;
+        let n_rows = config.num_hidden_layers + 1;
+        let n_taps = config.target_layer_ids.len();
+        if fuse_raw.len() != n_rows * n_taps {
+            return Err(Error::from_reason(format!(
+                "mtp.safetensors fuse_weight has {} elems, expected {n_rows}x{n_taps}",
+                fuse_raw.len()
+            )));
+        }
+        let mut fuse_alpha = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let row = &fuse_raw[r * n_taps..(r + 1) * n_taps];
+            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&v| (v - max_v).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            fuse_alpha.push(exps.into_iter().map(|e| e / sum).collect());
+        }
+
+        // Helper: slice a `[out_f, in_f]` BF16 backing tensor into a zero-copy `LinearProj::Standard`.
+        let slice_std_linear =
+            |w: &MxArray, start: i64, end: i64, in_f: i64| -> Result<LinearProj> {
+                let sub = w.slice(&[start, 0], &[end, in_f])?;
+                Ok(LinearProj::Standard(Linear::from_weights(&sub, None)?))
+            };
+
+        // 2. Load 3 BF16 transformer layers with fused QKV / KV_ctx / GateUp projections
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for (i, &is_local) in config.sliding_window_pattern.iter().enumerate() {
+            let p = format!("layers.{i}");
+            let mut q_proj =
+                load_draft_linear(&tensors, &format!("{p}.self_attn.q_proj"), d, q_dim)?;
+            let mut k_proj =
+                load_draft_linear(&tensors, &format!("{p}.self_attn.k_proj"), d, kv_dim)?;
+            let mut v_proj =
+                load_draft_linear(&tensors, &format!("{p}.self_attn.v_proj"), d, kv_dim)?;
+            let mut k_ctx_proj =
+                load_draft_linear(&tensors, &format!("{p}.self_attn.k_proj_ctx"), d, kv_dim)?;
+            let mut v_ctx_proj =
+                load_draft_linear(&tensors, &format!("{p}.self_attn.v_proj_ctx"), d, kv_dim)?;
+            let o_proj = load_draft_linear(&tensors, &format!("{p}.self_attn.o_proj"), q_dim, d)?;
+            let mut gate_proj = load_draft_linear(&tensors, &format!("{p}.mlp.gate_proj"), d, ffn)?;
+            let mut up_proj = load_draft_linear(&tensors, &format!("{p}.mlp.up_proj"), d, ffn)?;
+            let down_proj = load_draft_linear(&tensors, &format!("{p}.mlp.down_proj"), ffn, d)?;
+
+            let fused_qkv = match super::attention::concat_linear_proj_rows(&q_proj, &k_proj)? {
+                Some(qk) => super::attention::concat_linear_proj_rows(&qk, &v_proj)?,
+                None => None,
+            };
+            if let Some(LinearProj::Standard(ref lin)) = fused_qkv {
+                let w = lin.get_weight();
+                let d_i64 = d as i64;
+                let q_i64 = q_dim as i64;
+                let kv_i64 = kv_dim as i64;
+                q_proj = slice_std_linear(&w, 0, q_i64, d_i64)?;
+                k_proj = slice_std_linear(&w, q_i64, q_i64 + kv_i64, d_i64)?;
+                v_proj = slice_std_linear(&w, q_i64 + kv_i64, q_i64 + 2 * kv_i64, d_i64)?;
+            }
+
+            let fused_kv_ctx = super::attention::concat_linear_proj_rows(&k_ctx_proj, &v_ctx_proj)?;
+            if let Some(LinearProj::Standard(ref lin)) = fused_kv_ctx {
+                let w = lin.get_weight();
+                let d_i64 = d as i64;
+                let kv_i64 = kv_dim as i64;
+                k_ctx_proj = slice_std_linear(&w, 0, kv_i64, d_i64)?;
+                v_ctx_proj = slice_std_linear(&w, kv_i64, 2 * kv_i64, d_i64)?;
+            }
+
+            let fused_gate_up = super::attention::concat_linear_proj_rows(&gate_proj, &up_proj)?;
+            if let Some(LinearProj::Standard(ref lin)) = fused_gate_up {
+                let w = lin.get_weight();
+                let d_i64 = d as i64;
+                let ffn_i64 = ffn as i64;
+                gate_proj = slice_std_linear(&w, 0, ffn_i64, d_i64)?;
+                up_proj = slice_std_linear(&w, ffn_i64, 2 * ffn_i64, d_i64)?;
+            }
+
+            layers.push(Inkling2DsparkLayer {
+                is_local,
+                input_layernorm: require_draft_tensor(
+                    &tensors,
+                    &format!("{p}.input_layernorm.weight"),
+                )?
+                .astype(DType::Float32)?,
+                post_attention_layernorm: require_draft_tensor(
+                    &tensors,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                )?
+                .astype(DType::Float32)?,
+                dflare_norm: require_draft_tensor(&tensors, &format!("{p}.dflare_norm.weight"))?
+                    .astype(DType::Float32)?,
+                q_norm: require_draft_tensor(&tensors, &format!("{p}.self_attn.q_norm.weight"))?
+                    .astype(DType::Float32)?,
+                k_norm: require_draft_tensor(&tensors, &format!("{p}.self_attn.k_norm.weight"))?
+                    .astype(DType::Float32)?,
+                k_ctx_norm: require_draft_tensor(
+                    &tensors,
+                    &format!("{p}.self_attn.k_norm_ctx.weight"),
+                )?
+                .astype(DType::Float32)?,
+                fused_qkv,
+                q_proj,
+                k_proj,
+                v_proj,
+                fused_kv_ctx,
+                k_ctx_proj,
+                v_ctx_proj,
+                o_proj,
+                fused_gate_up,
+                gate_proj,
+                up_proj,
+                down_proj,
+            });
+        }
+
+        // 3. Global output norm + mask embedding
+        let output_norm = require_draft_tensor(&tensors, "norm.weight")?.astype(DType::Float32)?;
+        let mask_embd = require_draft_tensor(&tensors, "mask_embed")?
+            .astype(DType::BFloat16)?
+            .reshape(&[1, d as i64])?;
+
+        // 4. Markov RNN head + FP64 fold into target `lm_head` + Q8_0 fused fold_weight
+        let dspark_norm = require_draft_tensor(&tensors, "markov_head.dflare_norm.weight")?
+            .astype(DType::Float32)?;
+        let markov_w1 = require_draft_tensor(&tensors, "markov_head.markov_w1.weight")?
+            .astype(DType::BFloat16)?;
+        let joint_w = require_draft_tensor(&tensors, "markov_head.rnn_proj.weight")?
+            .astype(DType::BFloat16)?;
+        let joint_b = require_draft_tensor(&tensors, "markov_head.rnn_proj.bias")?
+            .astype(DType::Float32)?
+            .reshape(&[1, (3 * rank) as i64])?;
+
+        let jw_shape = joint_w.shape()?;
+        let expected_in = (2 * rank + 2 * d) as i64;
+        let expected_out = (3 * rank) as i64;
+        if jw_shape.as_ref() != [expected_out, expected_in] {
+            return Err(Error::from_reason(format!(
+                "Inkling2 DSpark markov_head.rnn_proj.weight shape {:?}, expected [{expected_out}, {expected_in}]",
+                jw_shape.as_ref()
+            )));
+        }
+        let split_col = (2 * rank) as i64;
+        let rnn_proj_rec_w_t = joint_w
+            .slice(&[0, 0], &[expected_out, split_col])?
+            .transpose(None)?;
+        let rnn_proj_ctx_w_t = joint_w
+            .slice(&[0, split_col], &[expected_out, expected_in])?
+            .transpose(None)?;
+
+        let hidden_out_w = require_draft_tensor(&tensors, "markov_head.hidden_out.weight")?;
+        let hidden_out_b = require_draft_tensor(&tensors, "markov_head.hidden_out.bias")?;
+        let (fold_weight_bf16_t, fold_bias) = fold_markov_head_f64(
+            target_lm_head,
+            hidden_out_w,
+            hidden_out_b,
+            config.vocab_size,
+            d,
+            rank,
+        )?;
+
+        let use_metal_q8 = {
+            #[cfg(target_os = "macos")]
+            {
+                rank.is_multiple_of(32) && unsafe { mlx_sys::mlx_metal_is_available() }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        let (fold_weight_q8, fold_weight_t) = if use_metal_q8 {
+            let unpadded_v = config.unpadded_vocab_size.min(config.vocab_size);
+            let fw_unpadded = fold_weight_bf16_t
+                .transpose(None)?
+                .slice(&[0, 0], &[unpadded_v as i64, rank as i64])?;
+            let q8 = quantize_fold_weight_q8(&fw_unpadded)?;
+            (Some(q8), None)
+        } else {
+            (None, Some(fold_weight_bf16_t))
+        };
+
+        let markov_head = Inkling2MarkovHead {
+            markov_rank: rank,
+            dflare_norm: dspark_norm,
+            markov_w1,
+            rnn_bias_f32: joint_b,
+            rnn_proj_rec_w_t,
+            rnn_proj_ctx_w_t,
+            fold_weight_q8,
+            fold_weight_t,
+            fold_bias,
+            one_scalar: MxArray::scalar_float(1.0)?,
+        };
+
+        let rope = RoPE::new(
+            config.head_dim as i32,
+            Some(false),
+            Some(config.rope_theta),
+            Some(1.0),
+        );
+
+        Ok(Self {
+            config,
+            layers,
+            output_norm,
+            mask_embd,
+            fuse_alpha,
+            markov_head,
+            rope,
+        })
+    }
+
     /// Load `dspark-Inkling-2-Mini-Q8_0.gguf` and fold its Markov head into `target_lm_head`
     /// in FP64 -> BF16 (chunked so peak RAM stays small).
     pub fn load_gguf(
@@ -531,7 +1229,7 @@ impl Inkling2DsparkModel {
 
         let hidden_out_w = require_draft_tensor(&tensors, "dspark_hidden_out.weight")?;
         let hidden_out_b = require_draft_tensor(&tensors, "dspark_hidden_out.bias")?;
-        let (fold_weight_t, fold_bias) = fold_markov_head_f64(
+        let (fold_weight_bf16_t, fold_bias) = fold_markov_head_f64(
             target_lm_head,
             hidden_out_w,
             hidden_out_b,
@@ -540,6 +1238,28 @@ impl Inkling2DsparkModel {
             rank,
         )?;
 
+        let use_metal_q8 = {
+            #[cfg(target_os = "macos")]
+            {
+                rank.is_multiple_of(32) && unsafe { mlx_sys::mlx_metal_is_available() }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        let (fold_weight_q8, fold_weight_t) = if use_metal_q8 {
+            let unpadded_v = config.unpadded_vocab_size.min(config.vocab_size);
+            let fw_unpadded = fold_weight_bf16_t
+                .transpose(None)?
+                .slice(&[0, 0], &[unpadded_v as i64, rank as i64])?;
+            let q8 = quantize_fold_weight_q8(&fw_unpadded)?;
+            // Drop the 103 MiB BF16 `fold_weight_t` now that the 57.6 MiB Q8_0 weight is materialized.
+            (Some(q8), None)
+        } else {
+            (None, Some(fold_weight_bf16_t))
+        };
+
         let markov_head = Inkling2MarkovHead {
             markov_rank: rank,
             dflare_norm: dspark_norm,
@@ -547,6 +1267,7 @@ impl Inkling2DsparkModel {
             rnn_bias_f32: joint_b,
             rnn_proj_rec_w_t,
             rnn_proj_ctx_w_t,
+            fold_weight_q8,
             fold_weight_t,
             fold_bias,
             one_scalar: MxArray::scalar_float(1.0)?,
@@ -694,7 +1415,7 @@ impl Inkling2DsparkContext {
                 draft.config.rms_norm_eps,
             )?;
             let (k_raw, v_raw) = if let Some(ref fused) = layer.fused_kv_ctx {
-                let kv = fused.forward(&ctx)?;
+                let kv = super::attention::forward_linear_proj_fast(fused, &ctx)?;
                 let mut parts = kv.split_sections(&[kv_dim], -1)?;
                 let v = parts
                     .pop()
@@ -705,8 +1426,8 @@ impl Inkling2DsparkContext {
                 (k, v)
             } else {
                 (
-                    layer.k_ctx_proj.forward(&ctx)?,
-                    layer.v_ctx_proj.forward(&ctx)?,
+                    super::attention::forward_linear_proj_fast(&layer.k_ctx_proj, &ctx)?,
+                    super::attention::forward_linear_proj_fast(&layer.v_ctx_proj, &ctx)?,
                 )
             };
 
@@ -849,7 +1570,7 @@ impl Inkling2DsparkContext {
                 draft.config.rms_norm_eps,
             )?;
             let (k_raw, v_raw) = if let Some(ref fused) = layer.fused_kv_ctx {
-                let kv = fused.forward(&ctx_all)?;
+                let kv = super::attention::forward_linear_proj_fast(fused, &ctx_all)?;
                 let mut parts = kv.split_sections(&[kv_dim], -1)?;
                 let v = parts
                     .pop()
@@ -860,8 +1581,8 @@ impl Inkling2DsparkContext {
                 (k, v)
             } else {
                 (
-                    layer.k_ctx_proj.forward(&ctx_all)?,
-                    layer.v_ctx_proj.forward(&ctx_all)?,
+                    super::attention::forward_linear_proj_fast(&layer.k_ctx_proj, &ctx_all)?,
+                    super::attention::forward_linear_proj_fast(&layer.v_ctx_proj, &ctx_all)?,
                 )
             };
 
@@ -995,7 +1716,7 @@ impl Inkling2DsparkContext {
             let h = apply_sublayer_rms_norm(&x, &layer.input_layernorm, eps, DType::BFloat16)?;
 
             let (q_raw, k_raw, v_raw) = if let Some(ref fused) = layer.fused_qkv {
-                let qkv = fused.forward(&h)?;
+                let qkv = super::attention::forward_linear_proj_fast(fused, &h)?;
                 let mut parts = qkv.split_sections(&[q_dim, q_dim + kv_dim], -1)?;
                 let v = parts
                     .pop()
@@ -1009,9 +1730,9 @@ impl Inkling2DsparkContext {
                 (q, k, v)
             } else {
                 (
-                    layer.q_proj.forward(&h)?,
-                    layer.k_proj.forward(&h)?,
-                    layer.v_proj.forward(&h)?,
+                    super::attention::forward_linear_proj_fast(&layer.q_proj, &h)?,
+                    super::attention::forward_linear_proj_fast(&layer.k_proj, &h)?,
+                    super::attention::forward_linear_proj_fast(&layer.v_proj, &h)?,
                 )
             };
 
@@ -1052,7 +1773,7 @@ impl Inkling2DsparkContext {
             let attn_out = scaled_dot_product_attention(&q_rot, &k_all, &v_all, attn_scale, None)?
                 .transpose(Some(&[0, 2, 1, 3]))?
                 .reshape(&[block_i64, q_dim])?;
-            let o = layer.o_proj.forward(&attn_out)?;
+            let o = super::attention::forward_linear_proj_fast(&layer.o_proj, &attn_out)?;
 
             // Residual add in FP32 -> round to BF16
             x = x
@@ -1064,7 +1785,7 @@ impl Inkling2DsparkContext {
             let h_mlp =
                 apply_sublayer_rms_norm(&x, &layer.post_attention_layernorm, eps, DType::BFloat16)?;
             let (gate, up) = if let Some(ref fused) = layer.fused_gate_up {
-                let gu = fused.forward(&h_mlp)?;
+                let gu = super::attention::forward_linear_proj_fast(fused, &h_mlp)?;
                 let mut parts = gu.split_sections(&[ffn], -1)?;
                 let u = parts
                     .pop()
@@ -1075,14 +1796,14 @@ impl Inkling2DsparkContext {
                 (g, u)
             } else {
                 (
-                    layer.gate_proj.forward(&h_mlp)?,
-                    layer.up_proj.forward(&h_mlp)?,
+                    super::attention::forward_linear_proj_fast(&layer.gate_proj, &h_mlp)?,
+                    super::attention::forward_linear_proj_fast(&layer.up_proj, &h_mlp)?,
                 )
             };
             let act = Activations::silu(&gate.astype(DType::Float32)?)?
                 .mul(&up.astype(DType::Float32)?)?
                 .astype(DType::BFloat16)?;
-            let mlp_out = layer.down_proj.forward(&act)?;
+            let mlp_out = super::attention::forward_linear_proj_fast(&layer.down_proj, &act)?;
             x = x
                 .astype(DType::Float32)?
                 .add(&mlp_out.astype(DType::Float32)?)?
@@ -1096,7 +1817,7 @@ impl Inkling2DsparkContext {
 
         // 4. Recurrent Markov head over `n_draft` steps
         let head = &draft.markov_head;
-        let base_raw = target_lm_head.forward_logits(&hidden)?;
+        let base_raw = super::attention::forward_linear_proj_fast(target_lm_head, &hidden)?;
         let base_logits = if base_raw.dtype()? == DType::BFloat16 {
             base_raw
         } else {
@@ -1126,38 +1847,55 @@ impl Inkling2DsparkContext {
             !greedy && sampled_rows_take(params) && (1..=DEVICE_SAMPLED_MAX_TOP_K).contains(&top_k);
         let softcap = draft.config.final_logit_softcapping;
 
+        let use_metal = {
+            #[cfg(target_os = "macos")]
+            {
+                unsafe { mlx_sys::mlx_metal_is_available() }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+
         if greedy {
-            // Fully on-device 7-step Markov loop: ZERO intermediate CPU syncs!
-            let use_metal = {
-                #[cfg(target_os = "macos")]
-                {
-                    unsafe { mlx_sys::mlx_metal_is_available() }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    false
-                }
-            };
+            // Fully on-device k-step Markov loop: ZERO intermediate CPU syncs!
             let mut token_parts = Vec::with_capacity(n_draft);
             for step in 0..n_draft {
                 let s_i64 = step as i64;
                 let ctx_i = ctx_all.slice(&[s_i64, 0], &[s_i64 + 1, 3 * rank_i64])?;
-                let (next_state, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
-                state = next_state;
-
                 let base_i = base_logits.slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])?;
-                let chosen = if use_metal {
-                    super::kernels::inkling2_lm_head_softcap_argmax(
+                let (next_state, chosen) = if use_metal && let Some(ref q8) = head.fold_weight_q8 {
+                    let (nst, latent) = markov_rnn_latent(head, &state, &prev_tok, &ctx_i)?;
+                    let ch = super::kernels::inkling2_markov_fold_softcap_argmax(
+                        &latent,
+                        &q8.weight,
+                        &q8.scales,
+                        Some(&q8.biases),
+                        &head.fold_bias,
                         &base_i,
-                        Some(&bias),
                         unpadded_vocab as usize,
                         softcap as f32,
-                        true,
-                    )?
+                    )?;
+                    (nst, ch)
                 } else {
-                    let logits = markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?;
-                    logits.argmax(-1, Some(false))?.astype(DType::Int32)?
+                    let (nst, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
+                    let ch = if use_metal {
+                        super::kernels::inkling2_lm_head_softcap_argmax(
+                            &base_i,
+                            Some(&bias),
+                            unpadded_vocab as usize,
+                            softcap as f32,
+                            true,
+                        )?
+                    } else {
+                        let logits =
+                            markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?;
+                        logits.argmax(-1, Some(false))?.astype(DType::Int32)?
+                    };
+                    (nst, ch)
                 };
+                state = next_state;
                 prev_tok = chosen.clone();
                 token_parts.push(chosen);
             }
@@ -1187,12 +1925,19 @@ impl Inkling2DsparkContext {
             for (step, &u) in uniforms.iter().enumerate() {
                 let s_i64 = step as i64;
                 let ctx_i = ctx_all.slice(&[s_i64, 0], &[s_i64 + 1, 3 * rank_i64])?;
-                let (next_state, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
-                state = next_state;
-
                 let base_i = base_logits.slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])?;
-                let logits_1d = markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?
-                    .squeeze(Some(&[0]))?;
+                let (next_state, logits_2d) = markov_step_logits(
+                    head,
+                    &state,
+                    &prev_tok,
+                    &ctx_i,
+                    &base_i,
+                    unpadded_vocab,
+                    softcap,
+                    use_metal,
+                )?;
+                state = next_state;
+                let logits_1d = logits_2d.squeeze(Some(&[0]))?;
                 let dist = sampling::sampling_distribution(&logits_1d, params.sampling_config)?
                     .astype(DType::Float32)?;
 
@@ -1252,12 +1997,19 @@ impl Inkling2DsparkContext {
         for step in 0..n_draft {
             let s_i64 = step as i64;
             let ctx_i = ctx_all.slice(&[s_i64, 0], &[s_i64 + 1, 3 * rank_i64])?;
-            let (next_state, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
-            state = next_state;
-
             let base_i = base_logits.slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])?;
-            let logits_1d = markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?
-                .squeeze(Some(&[0]))?;
+            let (next_state, logits_2d) = markov_step_logits(
+                head,
+                &state,
+                &prev_tok,
+                &ctx_i,
+                &base_i,
+                unpadded_vocab,
+                softcap,
+                use_metal,
+            )?;
+            state = next_state;
+            let logits_1d = logits_2d.squeeze(Some(&[0]))?;
             let dist = sampling::sampling_distribution(&logits_1d, params.sampling_config)?
                 .astype(DType::Float32)?;
             let sampled = sampling::sample_dense_distribution(&dist, rng)?;
@@ -1417,7 +2169,7 @@ impl Inkling2DsparkModel {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let h = apply_sublayer_rms_norm(&x, &layer.input_layernorm, eps, DType::BFloat16)?;
             let (q_raw, k_raw, v_raw) = if let Some(ref fused) = layer.fused_qkv {
-                let qkv = fused.forward(&h)?;
+                let qkv = super::attention::forward_linear_proj_fast(fused, &h)?;
                 let mut parts = qkv.split_sections(&[q_dim, q_dim + kv_dim], -1)?;
                 let v = parts
                     .pop()
@@ -1431,9 +2183,9 @@ impl Inkling2DsparkModel {
                 (q, k, v)
             } else {
                 (
-                    layer.q_proj.forward(&h)?,
-                    layer.k_proj.forward(&h)?,
-                    layer.v_proj.forward(&h)?,
+                    super::attention::forward_linear_proj_fast(&layer.q_proj, &h)?,
+                    super::attention::forward_linear_proj_fast(&layer.k_proj, &h)?,
+                    super::attention::forward_linear_proj_fast(&layer.v_proj, &h)?,
                 )
             };
 
@@ -1481,7 +2233,7 @@ impl Inkling2DsparkModel {
             }
             let attn_refs: Vec<&MxArray> = lane_attn_outs.iter().collect();
             let attn_out = MxArray::concatenate_many(attn_refs, Some(0))?; // [N * 8, q_dim]
-            let o = layer.o_proj.forward(&attn_out)?;
+            let o = super::attention::forward_linear_proj_fast(&layer.o_proj, &attn_out)?;
             x = x
                 .astype(DType::Float32)?
                 .add(&o.astype(DType::Float32)?)?
@@ -1491,7 +2243,7 @@ impl Inkling2DsparkModel {
             let h_mlp =
                 apply_sublayer_rms_norm(&x, &layer.post_attention_layernorm, eps, DType::BFloat16)?;
             let (gate, up) = if let Some(ref fused) = layer.fused_gate_up {
-                let gu = fused.forward(&h_mlp)?;
+                let gu = super::attention::forward_linear_proj_fast(fused, &h_mlp)?;
                 let mut parts = gu.split_sections(&[ffn], -1)?;
                 let u = parts
                     .pop()
@@ -1502,14 +2254,14 @@ impl Inkling2DsparkModel {
                 (g, u)
             } else {
                 (
-                    layer.gate_proj.forward(&h_mlp)?,
-                    layer.up_proj.forward(&h_mlp)?,
+                    super::attention::forward_linear_proj_fast(&layer.gate_proj, &h_mlp)?,
+                    super::attention::forward_linear_proj_fast(&layer.up_proj, &h_mlp)?,
                 )
             };
             let act = Activations::silu(&gate.astype(DType::Float32)?)?
                 .mul(&up.astype(DType::Float32)?)?
                 .astype(DType::BFloat16)?;
-            let mlp_out = layer.down_proj.forward(&act)?;
+            let mlp_out = super::attention::forward_linear_proj_fast(&layer.down_proj, &act)?;
             x = x
                 .astype(DType::Float32)?
                 .add(&mlp_out.astype(DType::Float32)?)?
@@ -1524,7 +2276,7 @@ impl Inkling2DsparkModel {
 
         // 4. Shared target `lm_head` ONCE for all `N * max_draft` draft rows!
         let head = &self.markov_head;
-        let base_raw = target_lm_head.forward_logits(&hidden_2d)?;
+        let base_raw = super::attention::forward_linear_proj_fast(target_lm_head, &hidden_2d)?;
         let base_2d = if base_raw.dtype()? == DType::BFloat16 {
             base_raw
         } else {
@@ -1569,24 +2321,39 @@ impl Inkling2DsparkModel {
             let ctx_i = ctx_all
                 .slice(&[0, s_i64, 0], &[n_i64, s_i64 + 1, 3 * rank_i64])?
                 .squeeze(Some(&[1]))?; // [N, 3*R] F32
-            let (next_state, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
-            state = next_state;
-
             let base_i = base_logits
                 .slice(&[0, s_i64, 0], &[n_i64, s_i64 + 1, padded_vocab])?
                 .squeeze(Some(&[1]))?; // [N, V] BF16
-            let chosen = if use_metal {
-                super::kernels::inkling2_lm_head_softcap_argmax(
+            let (next_state, chosen) = if use_metal && let Some(ref q8) = head.fold_weight_q8 {
+                let (nst, latent) = markov_rnn_latent(head, &state, &prev_tok, &ctx_i)?;
+                let ch = super::kernels::inkling2_markov_fold_softcap_argmax(
+                    &latent,
+                    &q8.weight,
+                    &q8.scales,
+                    Some(&q8.biases),
+                    &head.fold_bias,
                     &base_i,
-                    Some(&bias),
                     unpadded_vocab as usize,
                     softcap as f32,
-                    true,
-                )?
+                )?;
+                (nst, ch)
             } else {
-                let logits = markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?;
-                logits.argmax(-1, Some(false))?.astype(DType::Int32)?
+                let (nst, bias) = markov_rnn_step(head, &state, &prev_tok, &ctx_i)?;
+                let ch = if use_metal {
+                    super::kernels::inkling2_lm_head_softcap_argmax(
+                        &base_i,
+                        Some(&bias),
+                        unpadded_vocab as usize,
+                        softcap as f32,
+                        true,
+                    )?
+                } else {
+                    let logits = markov_add_softcap_slice(&base_i, &bias, unpadded_vocab, softcap)?;
+                    logits.argmax(-1, Some(false))?.astype(DType::Int32)?
+                };
+                (nst, ch)
             };
+            state = next_state;
             prev_tok = chosen.clone();
             step_tokens.push(chosen.reshape(&[n_i64, 1])?);
         }
@@ -1615,12 +2382,42 @@ impl Inkling2DsparkModel {
     }
 }
 
-/// One recurrent Markov head step matching `Inkling2MarkovHead::step` and `_markov_gate_kernel`:
-/// - `inputs = [state, markov_w1[prev_tok]]` (`[N, 512]` BF16)
-/// - `raw = context + f32(inputs @ rnn_proj_rec_w_t)` (`[N, 768]` FP32)
-/// - Round `raw` to BF16, split `(gate, cand, out)` -> BF16-rounded gate/cand/update/tanh(out)
-/// - `bias = bf16(fold_bias + bf16(latent @ fold_weight_t))` (`[N, padded_vocab]` BF16)
-pub(crate) fn markov_rnn_step(
+/// Quantize a `[V_unpadded, R]` BF16 folded Markov head weight into affine Q8_0 (`group_size=32`,
+/// `bits=8`) for fused `inkling2_markov_fold_softcap{_argmax}`.
+pub(crate) fn quantize_fold_weight_q8(fold_weight: &MxArray) -> Result<MarkovFoldQ8> {
+    let mut out_q = std::ptr::null_mut();
+    let mut out_s = std::ptr::null_mut();
+    let mut out_b = std::ptr::null_mut();
+    // SAFETY: `fold_weight` is a live 2D MxArray handle whose last dim is a multiple of 32.
+    let ok = unsafe {
+        mlx_sys::mlx_quantize(
+            fold_weight.as_raw_ptr(),
+            32,
+            8,
+            c"affine".as_ptr(),
+            &mut out_q,
+            &mut out_s,
+            &mut out_b,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "Inkling2 DSpark: mlx_quantize(affine Q8_0, gs=32) failed on fold_weight",
+        ));
+    }
+    let weight = MxArray::from_handle(out_q, "dspark.fold_weight_q8")?;
+    let scales = MxArray::from_handle(out_s, "dspark.fold_scales_q8")?;
+    let biases = MxArray::from_handle(out_b, "dspark.fold_biases_q8")?;
+    MxArray::eval_arrays(&[&weight, &scales, &biases])?;
+    Ok(MarkovFoldQ8 {
+        weight,
+        scales,
+        biases,
+    })
+}
+
+/// Recurrent Markov RNN gate returning `(next_state [N, R] BF16, latent [N, R] BF16)`.
+pub(crate) fn markov_rnn_latent(
     head: &Inkling2MarkovHead,
     state: &MxArray,
     prev_tok: &MxArray,
@@ -1631,28 +2428,65 @@ pub(crate) fn markov_rnn_step(
     let rec_in = MxArray::concatenate(state, &prev_emb, -1)?; // [N, 2*R] BF16
     let rec_mm = rec_in.matmul(&head.rnn_proj_rec_w_t)?; // [N, 3*R] BF16
 
-    let (next_state, latent) = {
-        #[cfg(target_os = "macos")]
-        {
-            if unsafe { mlx_sys::mlx_metal_is_available() } {
-                super::kernels::inkling2_markov_gate(&rec_mm, Some(context), state)?
-            } else {
-                let raw = rec_mm.astype(DType::Float32)?.add(context)?;
-                markov_gate_with_one(&raw, state, rank, &head.one_scalar)?
-            }
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { mlx_sys::mlx_metal_is_available() } {
+            return super::kernels::inkling2_markov_gate(&rec_mm, Some(context), state);
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let raw = rec_mm.astype(DType::Float32)?.add(context)?;
-            markov_gate_with_one(&raw, state, rank, &head.one_scalar)?
-        }
-    };
+    }
+    let raw = rec_mm.astype(DType::Float32)?.add(context)?;
+    markov_gate_with_one(&raw, state, rank, &head.one_scalar)
+}
+
+/// One recurrent Markov head step returning `(next_state [N, R] BF16, bias [N, V] BF16)` (fallback
+/// path when Q8_0 fused Metal kernel is unavailable).
+pub(crate) fn markov_rnn_step(
+    head: &Inkling2MarkovHead,
+    state: &MxArray,
+    prev_tok: &MxArray,
+    context: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let (next_state, latent) = markov_rnn_latent(head, state, prev_tok, context)?;
+    let fw_t = head.fold_weight_t.as_ref().ok_or_else(|| {
+        Error::from_reason("Inkling2 DSpark: fallback fold_weight_t missing without Q8_0 path")
+    })?;
     let bias = latent
-        .matmul(&head.fold_weight_t)?
+        .matmul(fw_t)?
         .astype(DType::BFloat16)?
         .add(&head.fold_bias)?
         .astype(DType::BFloat16)?;
     Ok((next_state, bias))
+}
+
+/// One sampled Markov head step returning `(next_state [N, R] BF16, logits [N, unpadded_vocab] FP32)`.
+#[allow(clippy::too_many_arguments)]
+fn markov_step_logits(
+    head: &Inkling2MarkovHead,
+    state: &MxArray,
+    prev_tok: &MxArray,
+    context: &MxArray,
+    base_logits: &MxArray,
+    unpadded_vocab: i64,
+    softcap: f64,
+    use_metal: bool,
+) -> Result<(MxArray, MxArray)> {
+    if use_metal && let Some(ref q8) = head.fold_weight_q8 {
+        let (next_state, latent) = markov_rnn_latent(head, state, prev_tok, context)?;
+        let logits = super::kernels::inkling2_markov_fold_softcap(
+            &latent,
+            &q8.weight,
+            &q8.scales,
+            Some(&q8.biases),
+            &head.fold_bias,
+            base_logits,
+            unpadded_vocab as usize,
+            softcap as f32,
+        )?;
+        return Ok((next_state, logits));
+    }
+    let (next_state, bias) = markov_rnn_step(head, state, prev_tok, context)?;
+    let logits = markov_add_softcap_slice(base_logits, &bias, unpadded_vocab, softcap)?;
+    Ok((next_state, logits))
 }
 
 /// BF16-rounded Markov RNN gate matching `vllm/models/inkling2/nvidia/ops/dspark.py::markov_gate`.
@@ -2190,5 +3024,151 @@ mod tests {
         assert_eq!(dcfg.target_layer_ids, vec![5, 23, 41, 48]);
         assert_eq!(dcfg.sliding_window, 1024);
         assert_eq!(dcfg.sliding_window_pattern, vec![true, false, true]);
+    }
+
+    #[test]
+    fn real_dspark_mtp_safetensors_auto_discovery_and_metadata() {
+        let dir = Path::new("/Users/brooklyn/.mlx-node/models/inkling-2-mini");
+        if !dir.join("mtp.safetensors").exists() {
+            return;
+        }
+        let found = discover_inkling2_dspark(dir).expect("should discover mtp.safetensors");
+        assert_eq!(
+            found.file_name().and_then(|s| s.to_str()),
+            Some("mtp.safetensors")
+        );
+        let config_raw = fs::read_to_string(dir.join("config.json")).unwrap();
+        let target_cfg = Inkling2Config::from_json_str(&config_raw, false).unwrap();
+        let dcfg =
+            Inkling2DsparkDraftConfig::from_mtp_config_json(&dir.join("config.json"), &target_cfg)
+                .unwrap();
+        assert_eq!(dcfg.num_hidden_layers, 3);
+        assert_eq!(dcfg.block_size, 8);
+        assert_eq!(dcfg.num_draft_tokens(), 7);
+        assert_eq!(dcfg.markov_rank, 256);
+        assert_eq!(dcfg.target_layer_ids, vec![5, 23, 41, 48]);
+        assert_eq!(dcfg.sliding_window, 1024);
+        assert_eq!(dcfg.sliding_window_pattern, vec![true, false, true]);
+    }
+
+    #[test]
+    fn adaptive_draft_depth_scales_up_down_and_respects_bounds() {
+        let mut ctrl = AdaptiveDraftDepth::new(7);
+        assert_eq!(ctrl.current_depth(7), 3);
+        assert_eq!(ctrl.current_depth(2), 2);
+
+        // Sustained full-accept streaks ramp smoothly up to max_k = 7.
+        ctrl.observe(3, 3);
+        ctrl.observe(3, 3);
+        assert_eq!(ctrl.current_depth(7), 4);
+        ctrl.observe(4, 4);
+        ctrl.observe(4, 4);
+        assert_eq!(ctrl.current_depth(7), 5);
+        ctrl.observe(5, 5);
+        ctrl.observe(5, 5);
+        assert_eq!(ctrl.current_depth(7), 6);
+        ctrl.observe(6, 6);
+        ctrl.observe(6, 6);
+        assert_eq!(ctrl.current_depth(7), 7);
+        // Never exceeds max_k.
+        ctrl.observe(7, 7);
+        ctrl.observe(7, 7);
+        assert_eq!(ctrl.current_depth(7), 7);
+
+        // Low-accept regime contracts smoothly back down to min_k = 3.
+        for _ in 0..8 {
+            ctrl.observe(ctrl.current_depth(7), 1);
+        }
+        assert_eq!(ctrl.current_depth(7), 3);
+        assert!(ctrl.ema_accept() < 1.85);
+
+        // Zero-drafted (AR tail/fallback) observations are ignored.
+        ctrl.observe(0, 0);
+        assert_eq!(ctrl.current_depth(7), 3);
+
+        // Externally-capped right-censored full-accept tail cycles do not perturb EMA or scale up.
+        let mut tail_ctrl = AdaptiveDraftDepth::new(7);
+        let ema_before = tail_ctrl.ema_accept();
+        tail_ctrl.observe(1, 1);
+        tail_ctrl.observe(2, 2);
+        assert_eq!(tail_ctrl.current_depth(7), 3);
+        assert_eq!(tail_ctrl.ema_accept(), ema_before);
+    }
+
+    #[test]
+    fn dspark_discovery_orders_by_target_format_and_skips_truncated_mtp_safetensors() {
+        fn build_dspark_gguf_header() -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"GGUF");
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            out.extend_from_slice(&4u64.to_le_bytes()); // kv_count
+            let write_str = |buf: &mut Vec<u8>, s: &str| {
+                buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            };
+            // general.architecture = "dflash"
+            write_str(&mut out, "general.architecture");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            write_str(&mut out, "dflash");
+            // dflash.dspark.markov_rank = 256
+            write_str(&mut out, "dflash.dspark.markov_rank");
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&256u32.to_le_bytes());
+            // tokenizer.ggml.pre = "inkling2"
+            write_str(&mut out, "tokenizer.ggml.pre");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            write_str(&mut out, "inkling2");
+            // dflash.target_layers = [5, 23, 41, 48]
+            write_str(&mut out, "dflash.target_layers");
+            out.extend_from_slice(&9u32.to_le_bytes()); // array
+            out.extend_from_slice(&4u32.to_le_bytes()); // u32 elem
+            out.extend_from_slice(&4u64.to_le_bytes()); // len
+            for &id in &[5u32, 23, 41, 48] {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "inkling2-dspark-discovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(
+            tmp.join("config.json"),
+            r#"{"model_type":"inkling2_loop","mtp_config":{"markov_rank":256,"target_layer_ids":[5,23,41,48]}}"#,
+        )
+        .unwrap();
+        let gguf_path = tmp.join("dspark-Inkling-2-Mini-Q8_0.gguf");
+        fs::write(&gguf_path, build_dspark_gguf_header()).unwrap();
+
+        // 1. Truncated/non-safetensors mtp.safetensors MUST NOT hide the valid GGUF companion!
+        let mtp_path = tmp.join("mtp.safetensors");
+        fs::write(&mtp_path, b"truncated-garbage").unwrap();
+        assert!(!is_inkling2_mtp_safetensors(&mtp_path));
+        let cands_st = discover_inkling2_dspark_candidates(&tmp, false);
+        assert_eq!(cands_st, vec![gguf_path.clone()]);
+
+        // 2. Structurally valid mtp.safetensors + valid GGUF:
+        //    - SafeTensors target (prefer_gguf=false) -> [mtp.safetensors, dspark-*.gguf]
+        //    - GGUF target (prefer_gguf=true) -> [dspark-*.gguf, mtp.safetensors]
+        let hdr = br#"{"fuse_weight":{"dtype":"BF16","shape":[4,4],"data_offsets":[0,32]}}"#;
+        let mut st_bytes = Vec::new();
+        st_bytes.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        st_bytes.extend_from_slice(hdr);
+        st_bytes.extend_from_slice(&[0u8; 32]);
+        fs::write(&mtp_path, st_bytes).unwrap();
+        assert!(is_inkling2_mtp_safetensors(&mtp_path));
+
+        let cands_prefer_st = resolve_inkling2_dspark_candidates(&tmp, &tmp, false, None).unwrap();
+        assert_eq!(cands_prefer_st, vec![mtp_path.clone(), gguf_path.clone()]);
+
+        let cands_prefer_gguf = resolve_inkling2_dspark_candidates(&tmp, &tmp, true, None).unwrap();
+        assert_eq!(cands_prefer_gguf, vec![gguf_path, mtp_path]);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

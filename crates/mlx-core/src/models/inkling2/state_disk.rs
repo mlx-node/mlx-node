@@ -1525,6 +1525,12 @@ impl Inkling2Restore {
     }
 }
 
+/// Forward arithmetic epoch for Inkling-2-Mini SSD prefix fingerprints.
+///
+/// Bump whenever fused Metal kernels or projection/norm rounding order change so cached SSD
+/// prefixes produced by an older build are never adopted and extended under different arithmetic.
+const INKLING2_FORWARD_ARITH_VERSION: &str = "v2";
+
 fn query_precision_tag(int8_query_from: Option<u32>) -> String {
     match int8_query_from {
         Some(from) => format!("int8@{from}"),
@@ -1532,8 +1538,88 @@ fn query_precision_tag(int8_query_from: Option<u32>) -> String {
     }
 }
 
+/// Snapshot of runtime Metal/precision toggles resolved once and shared between forward dispatch
+/// and SSD prefix fingerprinting so changing any toggle isolates the SSD namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardArithmeticSettings {
+    nax: u8,
+    loop_bf16: &'static str,
+    lctrl_min: i64,
+    lctrl_max: i64,
+    rtr_min: i64,
+    rtr_max: i64,
+    moe_fused: u8,
+    attn_res_vec4_max_t: u32,
+    moe_mode: u32,
+    moe_max_rows: u32,
+    moe_col_cutoff_override: i32,
+}
+
+impl ForwardArithmeticSettings {
+    fn current() -> Self {
+        let nax = {
+            #[cfg(target_os = "macos")]
+            {
+                u8::from(unsafe { mlx_sys::mlx_metal_is_nax_available() })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                0u8
+            }
+        };
+        let (lctrl_min, lctrl_max) = super::attn_res::fused_loop_ctrl_range();
+        let (rtr_min, rtr_max) = super::moe::moe_router_proj_range();
+        let moe_fused = u8::from(super::moe::moe_fused_enabled());
+        // SAFETY: pure read-only process-cached FFI getters returning scalar integers.
+        let (attn_res_vec4_max_t, moe_mode, moe_max_rows, moe_col_cutoff_override) = unsafe {
+            (
+                mlx_sys::mlx_inkling2_attn_res_vec4_max_t(),
+                mlx_sys::mlx_inkling2_moe_mode(),
+                mlx_sys::mlx_inkling2_moe_max_rows(),
+                mlx_sys::mlx_inkling2_moe_col_cutoff_override(),
+            )
+        };
+        Self {
+            nax,
+            loop_bf16: super::attn_res::loop_bf16_override_tag(),
+            lctrl_min,
+            lctrl_max,
+            rtr_min,
+            rtr_max,
+            moe_fused,
+            attn_res_vec4_max_t,
+            moe_mode,
+            moe_max_rows,
+            moe_col_cutoff_override,
+        }
+    }
+
+    fn tag(&self) -> String {
+        format!(
+            "{INKLING2_FORWARD_ARITH_VERSION}:nax={}:lbf16={}:lctrl={}-{}:rtr={}-{}:moef={}:arvec4={}:moem={}:moer={}:moec={}",
+            self.nax,
+            self.loop_bf16,
+            self.lctrl_min,
+            self.lctrl_max,
+            self.rtr_min,
+            self.rtr_max,
+            self.moe_fused,
+            self.attn_res_vec4_max_t,
+            self.moe_mode,
+            self.moe_max_rows,
+            self.moe_col_cutoff_override,
+        )
+    }
+}
+
+/// Deterministic tag capturing the forward arithmetic epoch + runtime Metal/precision toggles that
+/// can alter cached KV or ShortConv values.
+fn forward_arithmetic_tag() -> String {
+    ForwardArithmeticSettings::current().tag()
+}
+
 /// Compute deterministic `PersistentIdentity` for an Inkling-2-Mini checkpoint + KV/state geometry
-/// + resolved prefill query precision policy (`activations`).
+/// + resolved prefill query precision policy (`activations`) + forward arithmetic epoch.
 pub(crate) fn compute_persistent_identity(
     config: &Inkling2Config,
     coordinator: &Inkling2KVCacheCoordinator,
@@ -1562,13 +1648,14 @@ pub(crate) fn compute_persistent_identity(
         coordinator.kv_format(),
         activations,
     ));
+    let arith_tag = forward_arithmetic_tag();
     let tier_geo = ColdTierGeometry {
         block_size,
         num_layers: global_layers,
         num_kv_heads: kv_heads,
         head_size: head_dim,
         cache_dtype: format!(
-            "{}:{layout_tag}:q={q_tag}",
+            "{}:{layout_tag}:q={q_tag}:arith={arith_tag}",
             coordinator.kv_format().as_str()
         ),
     };
@@ -1578,7 +1665,7 @@ pub(crate) fn compute_persistent_identity(
     }
     let state_desc = geometry.geometry_string();
     let state_fp = ColdCacheFingerprint::from_components([
-        b"inkling2-state-fp:v1".as_slice(),
+        b"inkling2-state-fp:v2".as_slice(),
         kv_fp.as_bytes().as_slice(),
         state_desc.as_bytes(),
     ]);
@@ -1600,22 +1687,43 @@ pub(crate) fn compute_path_identity(
     geometry: &Inkling2StateGeometry,
     int8_query_from: Option<u32>,
 ) -> Option<PersistentIdentity> {
+    compute_path_identity_with_arith(
+        model_dir,
+        config,
+        coordinator,
+        geometry,
+        int8_query_from,
+        ForwardArithmeticSettings::current(),
+    )
+}
+
+#[cfg(test)]
+fn compute_path_identity_with_arith(
+    model_dir: &Path,
+    config: &Inkling2Config,
+    coordinator: &Inkling2KVCacheCoordinator,
+    geometry: &Inkling2StateGeometry,
+    int8_query_from: Option<u32>,
+    arith: ForwardArithmeticSettings,
+) -> Option<PersistentIdentity> {
     let config_json = serde_json::to_vec(config).ok()?;
     let canon = model_dir
         .canonicalize()
         .unwrap_or_else(|_| model_dir.to_path_buf());
     let q_tag = query_precision_tag(int8_query_from);
+    let arith_tag = arith.tag();
     let kv_fp = ColdCacheFingerprint::from_components([
-        b"inkling2-path-kv:v1".as_slice(),
+        b"inkling2-path-kv:v2".as_slice(),
         canon.to_string_lossy().as_bytes(),
         config_json.as_slice(),
         coordinator.kv_format().as_str().as_bytes(),
         q_tag.as_bytes(),
+        arith_tag.as_bytes(),
         &coordinator.block_size().to_le_bytes(),
     ]);
     let state_desc = geometry.geometry_string();
     let state_fp = ColdCacheFingerprint::from_components([
-        b"inkling2-path-state:v1".as_slice(),
+        b"inkling2-path-state:v2".as_slice(),
         kv_fp.as_bytes().as_slice(),
         state_desc.as_bytes(),
     ]);
@@ -1981,6 +2089,34 @@ mod tests {
         );
         drop(store_miss);
 
+        // Reopening with a different AttnRes vec4 threshold (`MLX_INKLING2_ATTN_RES_VEC4_MAX_T`)
+        // must also isolate the SSD namespace and reject the previous prefix!
+        let mut alt_arith = ForwardArithmeticSettings::current();
+        alt_arith.attn_res_vec4_max_t = if alt_arith.attn_res_vec4_max_t == 0 {
+            64
+        } else {
+            0
+        };
+        let id_alt_attn_res = compute_path_identity_with_arith(
+            &temp_root,
+            &cfg,
+            &coord2,
+            &geom2,
+            Some(1024),
+            alt_arith,
+        );
+        let (_ctx_ar_miss, disk_ar_miss) =
+            open_inkling2_state_disk(&cfg, &coord2, &disk_opts, move || id_alt_attn_res, 0)
+                .expect("open mismatched attn_res disk");
+        let mut store_ar_miss = Inkling2StateStore::new(coord2.block_size(), Arc::clone(&recency2));
+        store_ar_miss.disk = Some(disk_ar_miss);
+        assert_eq!(
+            store_ar_miss.adopt_all(),
+            0,
+            "different MLX_INKLING2_ATTN_RES_VEC4_MAX_T must NOT adopt old SSD cache"
+        );
+        drop(store_ar_miss);
+
         let id2 = compute_path_identity(&temp_root, &cfg, &coord2, &geom2, Some(1024));
         let (ctx2, disk2) = open_inkling2_state_disk(&cfg, &coord2, &disk_opts, move || id2, 0)
             .expect("reopen state disk");
@@ -2015,14 +2151,14 @@ mod tests {
         use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
         use crate::engine::types::ChatConfig;
         use crate::models::inkling2::model::Inkling2LoadOptions;
-        use crate::models::inkling2::persistence::load_from_dir;
+        use crate::models::inkling2::persistence::{load_from_dir, test_real_model_path};
         use crate::models::inkling2::scheduler::{Inkling2Cmd, Inkling2SchedulerState};
         use crate::tokenizer::ChatMessage;
 
-        const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
+        let model_path = test_real_model_path();
         assert!(
-            Path::new(REAL_MODEL_DIR).exists(),
-            "Real model directory missing: {REAL_MODEL_DIR}"
+            Path::new(&model_path).exists(),
+            "Real model path missing: {model_path}"
         );
         let load_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2089,7 +2225,7 @@ mod tests {
         // Phase 1: Fresh cold baseline (no reuse) on real model
         // =====================================================================
         let mut inner = load_rt
-            .block_on(load_from_dir(REAL_MODEL_DIR))
+            .block_on(load_from_dir(&model_path))
             .expect("load real Inkling-2-Mini");
         let disk_opts = DiskTierOptions {
             cache_disk: CacheDisk::Bytes(8u64 << 30),
@@ -2103,7 +2239,7 @@ mod tests {
         )
         .expect("geom");
         let id = compute_path_identity(
-            Path::new(REAL_MODEL_DIR),
+            Path::new(&model_path),
             &inner.config,
             &inner.paged.as_ref().expect("paged").coordinator,
             &geom,
@@ -2405,7 +2541,7 @@ mod tests {
         // Phase 5: Persistent Restart (`adopt_states`) -> exact parity vs fresh prefill!
         // =====================================================================
         let mut restarted = load_rt
-            .block_on(load_from_dir(REAL_MODEL_DIR))
+            .block_on(load_from_dir(&model_path))
             .expect("reload Inkling-2-Mini for restart adoption test");
         let geom2 = Inkling2StateGeometry::from_coordinator(
             &restarted.config,
@@ -2413,7 +2549,7 @@ mod tests {
         )
         .expect("geom2");
         let id2 = compute_path_identity(
-            Path::new(REAL_MODEL_DIR),
+            Path::new(&model_path),
             &restarted.config,
             &restarted.paged.as_ref().expect("paged").coordinator,
             &geom2,
@@ -2489,5 +2625,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_root);
         WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
         WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn persistent_fingerprint_v2_rejects_v1_and_tracks_arithmetic_mode() {
+        let cfg = tiny_inkling2_config();
+        let cfg_json = serde_json::to_vec(&cfg).unwrap();
+        let dir = Path::new("/tmp/inkling2-fp-v2-test");
+        let q_tag = query_precision_tag(Some(128));
+        let block_size = 32u32;
+
+        // Legacy v1 path KV/state fingerprints (commit 7e347dc0b format)
+        let v1_kv = ColdCacheFingerprint::from_components([
+            b"inkling2-path-kv:v1".as_slice(),
+            dir.to_string_lossy().as_bytes(),
+            cfg_json.as_slice(),
+            b"int8",
+            q_tag.as_bytes(),
+            &block_size.to_le_bytes(),
+        ]);
+        let v1_state = ColdCacheFingerprint::from_components([
+            b"inkling2-path-state:v1".as_slice(),
+            v1_kv.as_bytes().as_slice(),
+            b"geom",
+        ]);
+
+        // Current v2 fingerprints include forward arithmetic epoch + NAX/runtime tags.
+        let arith_tag = forward_arithmetic_tag();
+        assert!(arith_tag.starts_with(&format!("{INKLING2_FORWARD_ARITH_VERSION}:nax=")));
+        let v2_kv = ColdCacheFingerprint::from_components([
+            b"inkling2-path-kv:v2".as_slice(),
+            dir.to_string_lossy().as_bytes(),
+            cfg_json.as_slice(),
+            b"int8",
+            q_tag.as_bytes(),
+            arith_tag.as_bytes(),
+            &block_size.to_le_bytes(),
+        ]);
+        let v2_state = ColdCacheFingerprint::from_components([
+            b"inkling2-path-state:v2".as_slice(),
+            v2_kv.as_bytes().as_slice(),
+            b"geom",
+        ]);
+        assert_ne!(
+            v2_kv, v1_kv,
+            "v2 KV fingerprint must reject legacy v1 prefixes"
+        );
+        assert_ne!(
+            v2_state, v1_state,
+            "v2 state fingerprint must reject legacy v1 prefixes"
+        );
+
+        // Changing arithmetic mode (e.g., nax=0 vs nax=1) must produce distinct KV & state keys.
+        let alt_arith = if arith_tag.contains("nax=1") {
+            arith_tag.replace("nax=1", "nax=0")
+        } else {
+            arith_tag.replace("nax=0", "nax=1")
+        };
+        let alt_kv = ColdCacheFingerprint::from_components([
+            b"inkling2-path-kv:v2".as_slice(),
+            dir.to_string_lossy().as_bytes(),
+            cfg_json.as_slice(),
+            b"int8",
+            q_tag.as_bytes(),
+            alt_arith.as_bytes(),
+            &block_size.to_le_bytes(),
+        ]);
+        assert_ne!(
+            v2_kv, alt_kv,
+            "distinct NAX/arithmetic modes must not collide"
+        );
     }
 }

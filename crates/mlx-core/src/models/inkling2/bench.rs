@@ -22,18 +22,19 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRagge
 
 use super::attention::global_log_scale_tau_for_positions;
 use super::attn_res::{ATTN_RES_EPS, apply_sublayer_rms_norm};
-use super::dspark::{BatchedDsparkLane, Inkling2DsparkContext, Inkling2DsparkModel};
+use super::dspark::{
+    AdaptiveDraftDepth, BatchedDsparkLane, Inkling2DsparkContext, Inkling2DsparkModel,
+};
 use super::kernels::{
     Inkling2KvDtype, inkling2_block_attn_res, inkling2_gate_sink, inkling2_grouped_moe_available,
-    inkling2_lm_head_softcap, inkling2_lm_head_softcap_argmax, inkling2_markov_gate,
+    inkling2_lm_head_softcap_argmax, inkling2_markov_fold_softcap_argmax, inkling2_markov_gate,
     inkling2_moe_combine, inkling2_moe_route, inkling2_moe_router_proj, inkling2_paged_attention,
     inkling2_qr_clip, inkling2_sconv_k4_kv_prep, inkling2_sconv_k4_ragged, inkling2_situ,
 };
 use super::model::{AttnInputNorm, Inkling2Inner};
-use super::persistence::load_from_dir;
-use super::short_conv::{Inkling2ShortConvState, VisitShortConvState};
+use super::persistence::{load_from_dir, test_real_model_path};
+use super::short_conv::VisitShortConvState;
 
-const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
 const WARMUP_RUNS: usize = 2;
 const DECODE_OUT_TOKENS: usize = 128;
 
@@ -42,6 +43,16 @@ Write a complete, idiomatic Rust implementation of Dijkstra's shortest path algo
 `std::collections::BinaryHeap`. Include a `Graph` struct, edge relaxation, predecessor path \
 reconstruction, complexity analysis, and thorough unit tests covering disconnected graphs and \
 multi-edge shortest paths.";
+
+const CODE_COMPLETION_PROMPT: &str = "\
+Write a complete, idiomatic Rust function `fn binary_search(slice: &[i32], target: i32) -> Option<usize>` \
+using iterative bounds, with doc comments and a unit test.";
+
+#[derive(Debug, Clone, Copy)]
+enum DsparkDepthMode {
+    Fixed(usize),
+    Adaptive,
+}
 
 const FOUR_LANE_PROMPTS: [&str; 4] = [
     SINGLE_PROMPT,
@@ -65,17 +76,6 @@ fn eval_owned_sync(arrays: &[MxArray]) {
         MxArray::eval_arrays(&refs).expect("eval_arrays");
     }
     synchronize();
-}
-
-fn eval_conv_state(state: &Inkling2ShortConvState) {
-    let mut arrays: Vec<&MxArray> = Vec::with_capacity(state.visits.len() * 4);
-    for v in &state.visits {
-        arrays.push(&v.k);
-        arrays.push(&v.v);
-        arrays.push(&v.attn_post);
-        arrays.push(&v.mlp_post);
-    }
-    MxArray::eval_arrays(&arrays).expect("eval conv state");
 }
 
 fn render_prompt(inner: &Inkling2Inner, text: &str) -> Vec<u32> {
@@ -156,23 +156,23 @@ fn run_single_ar(
     let t_total = Instant::now();
     for step in 0..steps {
         let t_build = Instant::now();
-        let step_logits = inner.paged_decode_step(seq_id, next_tok).expect("ar step");
-        let argmax = step_logits.argmax(-1, Some(false)).expect("argmax");
+        let argmax = inner
+            .paged_decode_step_greedy(seq_id, next_tok)
+            .expect("ar step");
         host_build_ms += t_build.elapsed().as_secs_f64() * 1000.0;
 
         let t_eval = Instant::now();
         next_tok = argmax.item_at_int32(0).expect("item") as u32;
-        synchronize();
         gpu_eval_wait_ms += t_eval.elapsed().as_secs_f64() * 1000.0;
 
         let t_settle = Instant::now();
         let _ = inner.settle_paged_step(seq_id).expect("settle");
-        synchronize();
         settle_ms += t_settle.elapsed().as_secs_f64() * 1000.0;
 
         generated.push(next_tok);
         crate::array::maybe_clear_cache_for_paged_step(step as i32);
     }
+    synchronize();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
     ArSingleResult {
@@ -202,17 +202,20 @@ fn run_single_dspark(
     inner: &mut Inkling2Inner,
     prompt_ids: &[u32],
     out_tokens: usize,
+    depth_mode: DsparkDepthMode,
 ) -> DsparkSingleResult {
     let seq_id = 0u32;
     inner.reset_paged_sequence(seq_id).expect("reset seq 0");
-    let (tap_visits, n_draft_layers) = {
+    let (tap_visits, n_draft_layers, max_spec) = {
         let d = inner.dspark.as_ref().expect("dspark loaded");
         (
             d.config.target_layer_ids.clone(),
             d.config.num_hidden_layers,
+            d.config.num_draft_tokens(),
         )
     };
     let mut draft_ctx = Inkling2DsparkContext::new(n_draft_layers);
+    let mut adaptive_ctrl = AdaptiveDraftDepth::new(max_spec);
     let (first_logits, _) = inner
         .paged_prefill_sequence_with_taps(
             seq_id,
@@ -245,59 +248,98 @@ fn run_single_dspark(
     let t_total = Instant::now();
     while generated.len() < out_tokens {
         let remaining = out_tokens - generated.len();
-        let cap = 7usize.min(remaining.saturating_sub(1));
+        let hard_cap = max_spec.min(remaining.saturating_sub(1));
+        let cap = match depth_mode {
+            DsparkDepthMode::Fixed(k) => k.min(hard_cap),
+            DsparkDepthMode::Adaptive => adaptive_ctrl.current_depth(hard_cap),
+        };
 
+        // 1. Propose (stays device-resident; zero GPU->CPU sync before verify!)
         let t_prop = Instant::now();
-        let mut verify_ids = Vec::with_capacity(1 + cap);
-        verify_ids.push(anchor);
-        let mut proposal_ids = Vec::with_capacity(cap);
-        if cap > 0 {
+        let mut prop_opt = if cap > 0 {
             let draft = inner.dspark.as_ref().expect("dspark");
-            let mut prop = draft_ctx
-                .propose_block(
-                    draft,
-                    &inner.embed_tokens,
-                    &inner.embed_norm,
-                    &inner.lm_head,
-                    anchor,
-                    cap,
-                    &params,
-                    &mut rng,
-                )
-                .expect("propose_block");
-            prop.materialize_draft_ids().expect("materialize drafts");
-            for &id in &prop.draft_ids {
-                proposal_ids.push(id as u32);
-                verify_ids.push(id as u32);
-            }
-            synchronize();
-        }
+            Some(
+                draft_ctx
+                    .propose_block(
+                        draft,
+                        &inner.embed_tokens,
+                        &inner.embed_norm,
+                        &inner.lm_head,
+                        anchor,
+                        cap,
+                        &params,
+                        &mut rng,
+                    )
+                    .expect("propose_block"),
+            )
+        } else {
+            None
+        };
+        let verify_len = 1 + cap;
+        let device_verify_ids = if let Some(ref prop) = prop_opt
+            && let Some(ref dev_drafts) = prop.device_draft_ids
+        {
+            let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1]).expect("anchor");
+            Some(MxArray::concatenate(&anchor_arr, dev_drafts, 0).expect("concat"))
+        } else {
+            None
+        };
         propose_ms += t_prop.elapsed().as_secs_f64() * 1000.0;
 
+        // 2. Fused propose+verify GPU pipeline + fused `inkling2_lm_head_softcap_argmax`
+        //    (ONE single eval per cycle, mirroring production `Inkling2DsparkStepper::verify_device_greedy`!)
         let t_ver = Instant::now();
-        let (first_pos, ticket) = {
+        let (first_pos, ticket, used_placeholders) = {
             let rt = inner.paged.as_mut().expect("paged");
             let pos = rt.coordinator.request_token_count_all(seq_id).expect("pos");
+            let (rec_ids, placeholders) = if device_verify_ids.is_some() {
+                (vec![u32::MAX; verify_len], true)
+            } else {
+                let mut ids = Vec::with_capacity(verify_len);
+                ids.push(anchor);
+                if let Some(ref mut p) = prop_opt {
+                    p.materialize_draft_ids().expect("materialize");
+                    ids.extend(p.draft_ids.iter().map(|&id| id as u32));
+                }
+                (ids, false)
+            };
             let ticket = rt
                 .coordinator
-                .record_verify(seq_id, &verify_ids)
+                .record_verify(seq_id, &rec_ids)
                 .expect("record_verify");
-            (pos, ticket)
+            (pos, ticket, placeholders)
         };
         let row = PagedRaggedRow {
             seq_id,
             first_logical_position: first_pos,
-            query_len: verify_ids.len() as u32,
+            query_len: verify_len as u32,
         };
-        let (logits_2d, taps, mut tapes) = inner
-            .paged_verify_ragged_taped(&[(row, verify_ids.clone())], &tap_visits)
-            .expect("verify");
-        let argmax = logits_2d.argmax(-1, Some(false)).expect("argmax");
+        let (argmax, taps, mut tapes) = if let Some(ref dev_ids) = device_verify_ids {
+            inner
+                .paged_verify_ragged_taped_device(&[row], dev_ids, &tap_visits, true)
+                .expect("verify_device_greedy")
+        } else {
+            let mut host_ids = Vec::with_capacity(verify_len);
+            host_ids.push(anchor);
+            if let Some(ref p) = prop_opt {
+                host_ids.extend(p.draft_ids.iter().map(|&id| id as u32));
+            }
+            inner
+                .paged_verify_ragged_taped_greedy(&[(row, host_ids)], &tap_visits)
+                .expect("verify_greedy")
+        };
         argmax.eval();
-        synchronize();
         target_verify_ms += t_ver.elapsed().as_secs_f64() * 1000.0;
 
+        // 3. Accept + commit + async overlap (zero commit sync!)
         let t_com = Instant::now();
+        let mut proposal_ids = Vec::with_capacity(cap);
+        if let Some(ref mut prop) = prop_opt {
+            prop.materialize_draft_ids().expect("materialize drafts");
+            for &id in &prop.draft_ids {
+                proposal_ids.push(id as u32);
+            }
+        }
         let mut k = 0usize;
         while k < proposal_ids.len()
             && argmax.item_at_int32(k).expect("am") as u32 == proposal_ids[k]
@@ -314,12 +356,19 @@ fn run_single_dspark(
         let tape = tapes.pop().expect("tape");
         {
             let rt = inner.paged.as_mut().expect("paged");
+            if used_placeholders {
+                let mut verified_ids = Vec::with_capacity(verify_len);
+                verified_ids.push(anchor);
+                verified_ids.extend_from_slice(&proposal_ids);
+                rt.coordinator
+                    .patch_last_recorded_tokens_all(seq_id, &verified_ids)
+                    .expect("patch placeholders");
+            }
             rt.coordinator
                 .commit_cycle(seq_id, ticket, keep)
                 .expect("commit_cycle");
             let conv = rt.conv_states.get_mut(&seq_id).expect("conv");
             tape.commit_prefix(keep, conv).expect("tape commit");
-            eval_conv_state(conv);
             let committed = rt.coordinator.request_token_count_all(seq_id).expect("pos");
             rt.coordinator
                 .settle_committed(seq_id, u64::from(committed))
@@ -329,20 +378,39 @@ fn run_single_dspark(
         draft_ctx
             .append_taps(draft, &taps, keep)
             .expect("append_taps");
-        draft_ctx.eval_state().expect("eval draft ctx");
-        synchronize();
+        {
+            let mut async_refs: Vec<&MxArray> = Vec::new();
+            if let Some(ref rt) = inner.paged
+                && let Some(conv) = rt.conv_states.get(&seq_id)
+            {
+                for v in &conv.visits {
+                    async_refs.push(&v.k);
+                    async_refs.push(&v.v);
+                    async_refs.push(&v.attn_post);
+                    async_refs.push(&v.mlp_post);
+                }
+            }
+            draft_ctx.collect_arrays(&mut async_refs);
+            if !async_refs.is_empty() {
+                MxArray::async_eval_arrays(&async_refs);
+            }
+        }
         commit_ms += t_com.elapsed().as_secs_f64() * 1000.0;
 
         if cap > 0 {
             cycles += 1;
             total_drafted += cap;
             total_accepted_drafts += k;
+            if matches!(depth_mode, DsparkDepthMode::Adaptive) {
+                adaptive_ctrl.observe(cap, k);
+            }
         }
         for &tok in &emit[..emit_n] {
             generated.push(tok);
             anchor = tok;
         }
     }
+    synchronize();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
     let decoded_tokens = generated.len().saturating_sub(1);
 
@@ -397,10 +465,9 @@ fn run_4lane_ar(
     let t_total = Instant::now();
     for step in 0..steps {
         let batch_rows: Vec<(SeqId, u32)> = (0..n).map(|i| (i as SeqId, anchors[i])).collect();
-        let logits = inner
-            .paged_decode_step_batched(&batch_rows)
-            .expect("batched decode");
-        let argmax = logits.argmax(-1, Some(false)).expect("argmax");
+        let argmax = inner
+            .paged_decode_step_batched_greedy(&batch_rows)
+            .expect("batched decode greedy");
         argmax.eval();
         for i in 0..n {
             let tok = argmax.item_at_int32(i).expect("item") as u32;
@@ -412,17 +479,29 @@ fn run_4lane_ar(
             rt.coordinator
                 .eval_pending_pool_writes_all()
                 .expect("eval pool writes");
+            let mut conv_refs: Vec<&MxArray> = Vec::new();
             for i in 0..n {
                 let seq_id = i as SeqId;
                 if let Some(conv) = rt.conv_states.get(&seq_id) {
-                    eval_conv_state(conv);
+                    for v in &conv.visits {
+                        conv_refs.push(&v.k);
+                        conv_refs.push(&v.v);
+                        conv_refs.push(&v.attn_post);
+                        conv_refs.push(&v.mlp_post);
+                    }
                 }
+            }
+            if !conv_refs.is_empty() {
+                MxArray::async_eval_arrays(&conv_refs);
+            }
+            for i in 0..n {
+                let seq_id = i as SeqId;
                 let _ = rt.coordinator.prune_sliding_all(seq_id).expect("prune");
             }
         }
-        synchronize();
         crate::array::maybe_clear_cache_for_paged_step(step as i32);
     }
+    synchronize();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
     for i in 0..n {
         if let Some(rt) = inner.paged.as_mut() {
@@ -456,18 +535,22 @@ fn run_4lane_dspark(
     inner: &mut Inkling2Inner,
     prompts: &[Vec<u32>],
     out_tokens: usize,
+    depth_mode: DsparkDepthMode,
 ) -> Dspark4LaneResult {
     let n = prompts.len();
-    let (tap_visits, n_draft_layers) = {
+    let (tap_visits, n_draft_layers, max_spec) = {
         let d = inner.dspark.as_ref().expect("dspark loaded");
         (
             d.config.target_layer_ids.clone(),
             d.config.num_hidden_layers,
+            d.config.num_draft_tokens(),
         )
     };
     let mut draft_ctxs: Vec<Inkling2DsparkContext> = (0..n)
         .map(|_| Inkling2DsparkContext::new(n_draft_layers))
         .collect();
+    let mut lane_ctrls: Vec<AdaptiveDraftDepth> =
+        (0..n).map(|_| AdaptiveDraftDepth::new(max_spec)).collect();
     let mut anchors = Vec::with_capacity(n);
     let mut generated: Vec<Vec<u32>> = Vec::with_capacity(n);
 
@@ -517,14 +600,17 @@ fn run_4lane_dspark(
         }
         waves += 1;
 
-        // 1. Batched propose across all active lanes (1 draft pass, 1 lm_head, 1 GPU sync!)
+        // 1. Batched propose across all active lanes (stays device-resident, zero sync before verify!)
         let t_prop = Instant::now();
-        let mut lane_verify_ids: Vec<Vec<u32>> = Vec::with_capacity(active.len());
-        let mut lane_proposal_ids: Vec<Vec<u32>> = Vec::with_capacity(active.len());
         let mut lane_caps: Vec<usize> = Vec::with_capacity(active.len());
         for &lane_idx in &active {
             let remaining = out_tokens - generated[lane_idx].len();
-            lane_caps.push(7usize.min(remaining.saturating_sub(1)));
+            let hard_cap = max_spec.min(remaining.saturating_sub(1));
+            let cap = match depth_mode {
+                DsparkDepthMode::Fixed(k) => k.min(hard_cap),
+                DsparkDepthMode::Adaptive => lane_ctrls[lane_idx].current_depth(hard_cap),
+            };
+            lane_caps.push(cap);
         }
         let mut props = {
             let draft = inner.dspark.as_ref().expect("dspark");
@@ -554,75 +640,76 @@ fn run_4lane_dspark(
                 )
                 .expect("propose_blocks_batched")
         };
-        {
-            let eval_refs: Vec<&MxArray> = props
-                .iter()
-                .filter_map(|p| p.device_draft_ids.as_ref())
-                .collect();
-            if !eval_refs.is_empty() {
-                eval_sync(&eval_refs);
+        let mut lane_verify_lens: Vec<usize> = Vec::with_capacity(active.len());
+        let mut device_segments: Vec<MxArray> = Vec::with_capacity(active.len() * 2);
+        for (&lane_idx, (&cap, prop)) in active.iter().zip(lane_caps.iter().zip(props.iter())) {
+            let anchor_arr = MxArray::from_int32(&[anchors[lane_idx] as i32], &[1]).expect("anc");
+            device_segments.push(anchor_arr);
+            if let Some(ref dev_ids) = prop.device_draft_ids {
+                let dlen = dev_ids.size().expect("sz") as usize;
+                lane_verify_lens.push(1 + dlen);
+                device_segments.push(dev_ids.clone());
+            } else {
+                lane_verify_lens.push(1 + cap.min(prop.draft_ids.len()));
+                if !prop.draft_ids.is_empty() {
+                    let arr = MxArray::from_int32(&prop.draft_ids, &[prop.draft_ids.len() as i64])
+                        .expect("drafts");
+                    device_segments.push(arr);
+                }
             }
         }
-        for (&lane_idx, prop) in active.iter().zip(props.iter_mut()) {
-            prop.materialize_draft_ids().expect("materialize drafts");
-            let mut verify_ids = Vec::with_capacity(1 + prop.draft_ids.len());
-            verify_ids.push(anchors[lane_idx]);
-            let mut prop_ids = Vec::with_capacity(prop.draft_ids.len());
-            for &id in &prop.draft_ids {
-                prop_ids.push(id as u32);
-                verify_ids.push(id as u32);
-            }
-            lane_proposal_ids.push(prop_ids);
-            lane_verify_ids.push(verify_ids);
-        }
+        let seg_refs: Vec<&MxArray> = device_segments.iter().collect();
+        let stacked_verify_ids = MxArray::concatenate_many(seg_refs, Some(0)).expect("concat_many");
         propose_ms += t_prop.elapsed().as_secs_f64() * 1000.0;
 
-        // 2. Stacked [N * 8] target verify wave
+        // 2. Stacked [N * 8] target verify wave + fused `inkling2_lm_head_softcap_argmax`
+        //    (ONE single GPU sync per wave!)
         let t_ver = Instant::now();
-        let total_rows: usize = lane_verify_ids.iter().map(Vec::len).sum();
+        let total_rows: usize = lane_verify_lens.iter().sum();
         if total_rows == 32 {
             full_m32_waves += 1;
         }
-        let mut wave_rows = Vec::with_capacity(active.len());
+        let mut ragged_rows = Vec::with_capacity(active.len());
         let mut tickets = Vec::with_capacity(active.len());
         {
             let rt = inner.paged.as_mut().expect("paged");
             for (slot, &lane_idx) in active.iter().enumerate() {
                 let seq_id = lane_idx as SeqId;
                 let pos = rt.coordinator.request_token_count_all(seq_id).expect("pos");
+                let placeholders = vec![u32::MAX; lane_verify_lens[slot]];
                 let ticket = rt
                     .coordinator
-                    .record_verify(seq_id, &lane_verify_ids[slot])
+                    .record_verify(seq_id, &placeholders)
                     .expect("record_verify");
-                wave_rows.push((
-                    PagedRaggedRow {
-                        seq_id,
-                        first_logical_position: pos,
-                        query_len: lane_verify_ids[slot].len() as u32,
-                    },
-                    lane_verify_ids[slot].clone(),
-                ));
+                ragged_rows.push(PagedRaggedRow {
+                    seq_id,
+                    first_logical_position: pos,
+                    query_len: lane_verify_lens[slot] as u32,
+                });
                 tickets.push(ticket);
             }
         }
-        let (wave_logits, wave_taps, wave_tapes) = inner
-            .paged_verify_ragged_taped(&wave_rows, &tap_visits)
-            .expect("verify wave");
-        let wave_argmax = wave_logits.argmax(-1, Some(false)).expect("argmax");
+        let (wave_argmax, wave_taps, wave_tapes) = inner
+            .paged_verify_ragged_taped_device(&ragged_rows, &stacked_verify_ids, &tap_visits, true)
+            .expect("verify wave device greedy");
         wave_argmax.eval();
-        synchronize();
         verify_ms += t_ver.elapsed().as_secs_f64() * 1000.0;
 
-        // 3. Commit accepted prefixes + ShortConv tapes + batched draft taps across all active lanes
+        // 3. Commit accepted prefixes + ShortConv tapes + batched draft taps (async overlap!)
         let t_com = Instant::now();
         let mut row_off = 0usize;
         let mut pending_taps: Vec<(usize, Vec<MxArray>, usize)> = Vec::with_capacity(active.len());
-        for (((slot, &lane_idx), ticket), tape) in
-            active.iter().enumerate().zip(tickets).zip(wave_tapes)
+        for ((((slot, &lane_idx), prop), ticket), tape) in active
+            .iter()
+            .enumerate()
+            .zip(props.iter_mut())
+            .zip(tickets)
+            .zip(wave_tapes)
         {
+            prop.materialize_draft_ids().expect("materialize drafts");
             let seq_id = lane_idx as SeqId;
-            let len = lane_verify_ids[slot].len();
-            let prop_ids = &lane_proposal_ids[slot];
+            let len = lane_verify_lens[slot];
+            let prop_ids: Vec<u32> = prop.draft_ids.iter().map(|&id| id as u32).collect();
             let mut k = 0usize;
             while k < prop_ids.len()
                 && wave_argmax.item_at_int32(row_off + k).expect("am") as u32 == prop_ids[k]
@@ -638,8 +725,14 @@ fn run_4lane_dspark(
             let emit_n = emit.len().min(remaining);
             let keep = 1 + emit_n.min(k);
 
+            let mut verified_ids = Vec::with_capacity(len);
+            verified_ids.push(anchors[lane_idx]);
+            verified_ids.extend_from_slice(&prop_ids);
             {
                 let rt = inner.paged.as_mut().expect("paged");
+                rt.coordinator
+                    .patch_last_recorded_tokens_all(seq_id, &verified_ids)
+                    .expect("patch placeholders");
                 rt.coordinator
                     .commit_cycle(seq_id, ticket, keep)
                     .expect("commit_cycle");
@@ -662,6 +755,9 @@ fn run_4lane_dspark(
             if lane_caps[slot] > 0 {
                 total_drafted += lane_caps[slot];
                 total_accepted_drafts += k;
+                if matches!(depth_mode, DsparkDepthMode::Adaptive) {
+                    lane_ctrls[lane_idx].observe(lane_caps[slot], k);
+                }
             }
             for &tok in &emit[..emit_n] {
                 generated[lane_idx].push(tok);
@@ -705,11 +801,12 @@ fn run_4lane_dspark(
                 draft_ctxs[lane_idx].collect_arrays(&mut evals);
             }
             if !evals.is_empty() {
-                eval_sync(&evals);
+                MxArray::async_eval_arrays(&evals);
             }
         }
         commit_ms += t_com.elapsed().as_secs_f64() * 1000.0;
     }
+    synchronize();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
     let total_decoded_tokens: usize = generated.iter().map(|g| g.len().saturating_sub(1)).sum();
     for i in 0..n {
@@ -963,13 +1060,19 @@ fn profile_48_visits(
         let iters = 5usize;
         for it in 0..(WARMUP_RUNS + iters) {
             inner.restore_paged_conv_state(seq_id, base_conv.clone());
-            let ticket = inner
-                .paged
-                .as_mut()
-                .expect("paged")
-                .coordinator
-                .record_verify(seq_id, probe_tokens)
-                .expect("record_verify");
+            let ticket = if m_rows > 1 {
+                Some(
+                    inner
+                        .paged
+                        .as_mut()
+                        .expect("paged")
+                        .coordinator
+                        .record_verify(seq_id, probe_tokens)
+                        .expect("record_verify"),
+                )
+            } else {
+                None
+            };
             let row = PagedRaggedRow {
                 seq_id,
                 first_logical_position: base_pos,
@@ -977,22 +1080,38 @@ fn profile_48_visits(
             };
             synchronize();
             let t0 = Instant::now();
-            let (l, _, _) = inner
-                .paged_verify_ragged_taped(&[(row, probe_tokens.to_vec())], &[])
-                .expect("verify");
-            let am = l.argmax(-1, Some(false)).expect("argmax");
+            let am = if m_rows == 1 {
+                inner
+                    .paged_decode_step_greedy(seq_id, probe_tokens[0])
+                    .expect("ar greedy")
+            } else {
+                let (am, _, _) = inner
+                    .paged_verify_ragged_taped_greedy(&[(row, probe_tokens.to_vec())], &[])
+                    .expect("verify greedy");
+                am
+            };
             eval_sync(&[&am]);
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             if it >= WARMUP_RUNS {
                 total += dt;
             }
-            inner
-                .paged
-                .as_mut()
-                .expect("paged")
-                .coordinator
-                .commit_cycle(seq_id, ticket, 0)
-                .expect("rollback 0");
+            if let Some(ticket) = ticket {
+                inner
+                    .paged
+                    .as_mut()
+                    .expect("paged")
+                    .coordinator
+                    .commit_cycle(seq_id, ticket, 0)
+                    .expect("rollback 0");
+            } else {
+                inner
+                    .paged
+                    .as_mut()
+                    .expect("paged")
+                    .coordinator
+                    .rollback_last_tokens_all(seq_id, 1)
+                    .expect("rollback 1");
+            }
         }
         total / iters as f64
     };
@@ -1846,16 +1965,16 @@ fn profile_48_visits(
         eval_owned_sync(&outs);
     });
 
-    // Stage 2b: Dense Q8_0 o_proj (48 visits, 1 sync)
+    // Stage 2b: Dense Q8_0 / BF16 o_proj (48 visits, 1 sync)
     bd.o_proj_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(captures.len());
         for cap in &captures {
             outs.push(
-                inner.layers[cap.phys_layer]
-                    .self_attn
-                    .o_proj
-                    .forward(&cap.y)
-                    .expect("o"),
+                super::attention::forward_linear_proj_fast(
+                    &inner.layers[cap.phys_layer].self_attn.o_proj,
+                    &cap.y,
+                )
+                .expect("o"),
             );
         }
         eval_owned_sync(&outs);
@@ -1870,14 +1989,18 @@ fn profile_48_visits(
                 .x_k_v
                 .as_ref()
                 .map_or((&cap.x_q, &cap.x_q), |(k, v)| (k, v));
+            let dense_bf16 = matches!(
+                attn.q_proj,
+                crate::models::quantized_linear::LinearProj::Standard(_)
+            );
             let dk = attn.k_conv_proj.as_ref().map(|cp| {
-                cp.forward(xk_in)
+                super::attention::forward_linear_proj_fast_ex(cp, xk_in, dense_bf16)
                     .expect("k")
                     .reshape(&[t_i64, attn.num_kv_heads as i64, 4])
                     .expect("r")
             });
             let dv = attn.v_conv_proj.as_ref().map(|cp| {
-                cp.forward(xv_in)
+                super::attention::forward_linear_proj_fast_ex(cp, xv_in, dense_bf16)
                     .expect("v")
                     .reshape(&[t_i64, attn.num_kv_heads as i64, 4])
                     .expect("r")
@@ -2278,35 +2401,58 @@ fn profile_48_visits(
         eval_owned_sync(&outs);
     }) / epi_k as f64;
 
-    bd.lm_head_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(epi_k);
-        for _ in 0..epi_k {
-            let raw = inner
-                .lm_head
-                .forward_logits_keep_f32(&normed_out)
-                .expect("lm");
-            if raw.dtype().expect("dt") == DType::Float32 {
-                outs.push(raw);
-            } else {
-                outs.push(raw.astype(DType::Float32).expect("f"));
-            }
-        }
-        eval_owned_sync(&outs);
-    }) / epi_k as f64;
-
     let unpadded = inner.config.effective_unpadded_vocab_size();
     let vocab_cols = logits_full.shape().expect("s")[1] as usize;
     let out_cols = unpadded.min(vocab_cols);
     let cap_val = inner.config.final_logit_softcapping as f32;
-    bd.softcap_argmax_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(epi_k);
-        for _ in 0..epi_k {
-            let l =
-                inkling2_lm_head_softcap(&logits_full, None, out_cols, cap_val, false).expect("sc");
-            outs.push(l.argmax(-1, Some(false)).expect("am"));
-        }
-        eval_owned_sync(&outs);
-    }) / epi_k as f64;
+    if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = inner.lm_head
+        && m_rows <= 32
+    {
+        let w_bf16 = lin.get_weight();
+        bd.lm_head_ms = time_stage_ms(w, iters, || {
+            let mut outs = Vec::with_capacity(epi_k);
+            for _ in 0..epi_k {
+                outs.push(
+                    super::kernels::inkling2_bf16_lm_head_softcap_argmax(
+                        &normed_out,
+                        &w_bf16,
+                        out_cols,
+                        cap_val,
+                    )
+                    .expect("bf16_lm_am"),
+                );
+            }
+            eval_owned_sync(&outs);
+        }) / epi_k as f64;
+        bd.softcap_argmax_ms = 0.0;
+    } else {
+        bd.lm_head_ms = time_stage_ms(w, iters, || {
+            let mut outs = Vec::with_capacity(epi_k);
+            for _ in 0..epi_k {
+                let raw = inner
+                    .lm_head
+                    .forward_logits_keep_f32(&normed_out)
+                    .expect("lm");
+                if raw.dtype().expect("dt") == DType::Float32 {
+                    outs.push(raw);
+                } else {
+                    outs.push(raw.astype(DType::Float32).expect("f"));
+                }
+            }
+            eval_owned_sync(&outs);
+        }) / epi_k as f64;
+
+        bd.softcap_argmax_ms = time_stage_ms(w, iters, || {
+            let mut outs = Vec::with_capacity(epi_k);
+            for _ in 0..epi_k {
+                outs.push(
+                    inkling2_lm_head_softcap_argmax(&logits_full, None, out_cols, cap_val, false)
+                        .expect("sc_am"),
+                );
+            }
+            eval_owned_sync(&outs);
+        }) / epi_k as f64;
+    }
 
     // Roll back probe rows cleanly
     inner
@@ -2582,28 +2728,44 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
         let rec_in = MxArray::concatenate(&st, &prev_emb, -1).expect("c");
         let rec_mm = rec_in.matmul(&head.rnn_proj_rec_w_t).expect("m");
         let (nst, lat) = inkling2_markov_gate(&rec_mm, Some(&ctx_i), &st).expect("g");
-        let bias = lat
-            .matmul(&head.fold_weight_t)
-            .expect("m")
-            .astype(DType::BFloat16)
-            .expect("b")
-            .add(&head.fold_bias)
-            .expect("a")
-            .astype(DType::BFloat16)
-            .expect("b");
         let base_i = base_logits
             .slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])
             .expect("sl");
-        let chosen = inkling2_lm_head_softcap_argmax(
-            &base_i,
-            Some(&bias),
-            unpadded_vocab as usize,
-            softcap as f32,
-            true,
-        )
-        .expect("am");
+        let chosen = if let Some(ref q8) = head.fold_weight_q8 {
+            inkling2_markov_fold_softcap_argmax(
+                &lat,
+                &q8.weight,
+                &q8.scales,
+                Some(&q8.biases),
+                &head.fold_bias,
+                &base_i,
+                unpadded_vocab as usize,
+                softcap as f32,
+            )
+            .expect("fold_am")
+        } else {
+            let fw_t = head.fold_weight_t.as_ref().expect("fw_t");
+            let bias = lat
+                .matmul(fw_t)
+                .expect("m")
+                .astype(DType::BFloat16)
+                .expect("b")
+                .add(&head.fold_bias)
+                .expect("a")
+                .astype(DType::BFloat16)
+                .expect("b");
+            let ch = inkling2_lm_head_softcap_argmax(
+                &base_i,
+                Some(&bias),
+                unpadded_vocab as usize,
+                softcap as f32,
+                true,
+            )
+            .expect("am");
+            step_biases.push(bias);
+            ch
+        };
         step_latents.push(lat);
-        step_biases.push(bias);
         st = nst;
         pt = chosen;
     }
@@ -2643,7 +2805,7 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                 let h = apply_sublayer_rms_norm(xi, &layer.input_layernorm, eps, DType::BFloat16)
                     .expect("in");
                 let (q_raw, k_raw, v_raw) = if let Some(ref fused) = layer.fused_qkv {
-                    let qkv = fused.forward(&h).expect("qkv");
+                    let qkv = super::attention::forward_linear_proj_fast(fused, &h).expect("qkv");
                     let mut parts = qkv
                         .split_sections(&[q_dim, q_dim + kv_dim], -1)
                         .expect("sp");
@@ -2653,9 +2815,9 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                     (q, k, v)
                 } else {
                     (
-                        layer.q_proj.forward(&h).expect("q"),
-                        layer.k_proj.forward(&h).expect("k"),
-                        layer.v_proj.forward(&h).expect("v"),
+                        super::attention::forward_linear_proj_fast(&layer.q_proj, &h).expect("q"),
+                        super::attention::forward_linear_proj_fast(&layer.k_proj, &h).expect("k"),
+                        super::attention::forward_linear_proj_fast(&layer.v_proj, &h).expect("v"),
                     )
                 };
                 let qn = apply_sublayer_rms_norm(
@@ -2700,7 +2862,7 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                     .expect("t")
                     .reshape(&[block_i64, q_dim])
                     .expect("r");
-                let o = layer.o_proj.forward(&ao).expect("o");
+                let o = super::attention::forward_linear_proj_fast(&layer.o_proj, &ao).expect("o");
                 outs.push(
                     xi.astype(DType::Float32)
                         .expect("f")
@@ -2727,15 +2889,17 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                 )
                 .expect("pn");
                 let (gate, up) = if let Some(ref fused) = layer.fused_gate_up {
-                    let gu = fused.forward(&h_mlp).expect("gu");
+                    let gu = super::attention::forward_linear_proj_fast(fused, &h_mlp).expect("gu");
                     let mut parts = gu.split_sections(&[ffn], -1).expect("sp");
                     let u = parts.pop().expect("u");
                     let g = parts.pop().expect("g");
                     (g, u)
                 } else {
                     (
-                        layer.gate_proj.forward(&h_mlp).expect("g"),
-                        layer.up_proj.forward(&h_mlp).expect("u"),
+                        super::attention::forward_linear_proj_fast(&layer.gate_proj, &h_mlp)
+                            .expect("g"),
+                        super::attention::forward_linear_proj_fast(&layer.up_proj, &h_mlp)
+                            .expect("u"),
                     )
                 };
                 let act = Activations::silu(&gate.astype(DType::Float32).expect("f"))
@@ -2744,7 +2908,8 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                     .expect("m")
                     .astype(DType::BFloat16)
                     .expect("b");
-                let mo = layer.down_proj.forward(&act).expect("d");
+                let mo =
+                    super::attention::forward_linear_proj_fast(&layer.down_proj, &act).expect("d");
                 outs.push(
                     xi.astype(DType::Float32)
                         .expect("f")
@@ -2772,14 +2937,13 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
     let target_lm_head_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(k_rep);
         for _ in 0..k_rep {
-            outs.push(
-                inner
-                    .lm_head
-                    .forward_logits(&hidden)
-                    .expect("lm")
-                    .astype(DType::BFloat16)
-                    .expect("b"),
-            );
+            let raw =
+                super::attention::forward_linear_proj_fast(&inner.lm_head, &hidden).expect("lm");
+            outs.push(if raw.dtype().expect("dt") == DType::BFloat16 {
+                raw
+            } else {
+                raw.astype(DType::BFloat16).expect("b")
+            });
         }
         eval_owned_sync(&outs);
     }) / k_rep as f64;
@@ -2821,47 +2985,79 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
         eval_owned_sync(&outs);
     }) / k_rep as f64;
 
-    let markov_fold_matmul_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(k_rep * n_draft);
-        for _ in 0..k_rep {
-            for latent in step_latents.iter().take(n_draft) {
-                let bias = latent
-                    .matmul(&head.fold_weight_t)
-                    .expect("m")
-                    .astype(DType::BFloat16)
-                    .expect("b")
-                    .add(&head.fold_bias)
-                    .expect("a")
-                    .astype(DType::BFloat16)
-                    .expect("b");
-                outs.push(bias);
-            }
-        }
-        eval_owned_sync(&outs);
-    }) / k_rep as f64;
+    let (markov_fold_matmul_ms, markov_softcap_argmax_ms) =
+        if let Some(ref q8) = head.fold_weight_q8 {
+            let fused_ms = time_stage_ms(w, iters, || {
+                let mut outs = Vec::with_capacity(k_rep * n_draft);
+                for _ in 0..k_rep {
+                    for (step, latent) in step_latents.iter().enumerate().take(n_draft) {
+                        let s_i64 = step as i64;
+                        let base_i = base_logits
+                            .slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])
+                            .expect("sl");
+                        outs.push(
+                            inkling2_markov_fold_softcap_argmax(
+                                latent,
+                                &q8.weight,
+                                &q8.scales,
+                                Some(&q8.biases),
+                                &head.fold_bias,
+                                &base_i,
+                                unpadded_vocab as usize,
+                                softcap as f32,
+                            )
+                            .expect("fold_am"),
+                        );
+                    }
+                }
+                eval_owned_sync(&outs);
+            }) / k_rep as f64;
+            (fused_ms, 0.0)
+        } else {
+            let fw_t = head.fold_weight_t.as_ref().expect("fw_t");
+            let mm_ms = time_stage_ms(w, iters, || {
+                let mut outs = Vec::with_capacity(k_rep * n_draft);
+                for _ in 0..k_rep {
+                    for latent in step_latents.iter().take(n_draft) {
+                        let bias = latent
+                            .matmul(fw_t)
+                            .expect("m")
+                            .astype(DType::BFloat16)
+                            .expect("b")
+                            .add(&head.fold_bias)
+                            .expect("a")
+                            .astype(DType::BFloat16)
+                            .expect("b");
+                        outs.push(bias);
+                    }
+                }
+                eval_owned_sync(&outs);
+            }) / k_rep as f64;
 
-    let markov_softcap_argmax_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(k_rep * n_draft);
-        for _ in 0..k_rep {
-            for (step, step_bias) in step_biases.iter().enumerate().take(n_draft) {
-                let s_i64 = step as i64;
-                let base_i = base_logits
-                    .slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])
-                    .expect("sl");
-                outs.push(
-                    inkling2_lm_head_softcap_argmax(
-                        &base_i,
-                        Some(step_bias),
-                        unpadded_vocab as usize,
-                        softcap as f32,
-                        true,
-                    )
-                    .expect("am"),
-                );
-            }
-        }
-        eval_owned_sync(&outs);
-    }) / k_rep as f64;
+            let sa_ms = time_stage_ms(w, iters, || {
+                let mut outs = Vec::with_capacity(k_rep * n_draft);
+                for _ in 0..k_rep {
+                    for (step, step_bias) in step_biases.iter().enumerate().take(n_draft) {
+                        let s_i64 = step as i64;
+                        let base_i = base_logits
+                            .slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])
+                            .expect("sl");
+                        outs.push(
+                            inkling2_lm_head_softcap_argmax(
+                                &base_i,
+                                Some(step_bias),
+                                unpadded_vocab as usize,
+                                softcap as f32,
+                                true,
+                            )
+                            .expect("am"),
+                        );
+                    }
+                }
+                eval_owned_sync(&outs);
+            }) / k_rep as f64;
+            (mm_ms, sa_ms)
+        };
 
     DsparkProposeBreakdown {
         embed_mask_ms,
@@ -3086,7 +3282,8 @@ fn print_stage_table(label: &str, m_rows: usize, ctx_len: usize, bd: &StageBreak
 #[tokio::test]
 #[ignore = "Requires real Inkling-2-Mini + DSpark GGUF on disk (~18 GB); run with --release -- --ignored --nocapture"]
 async fn inkling2_roofline_profile() {
-    let model_dir = Path::new(REAL_MODEL_DIR);
+    let model_path = test_real_model_path();
+    let model_dir = Path::new(&model_path);
     assert!(
         model_dir.exists(),
         "Missing Inkling-2-Mini checkpoint at {}",
@@ -3095,7 +3292,7 @@ async fn inkling2_roofline_profile() {
 
     let _wired = WiredResidency::new(WiredResidency::working_set_minus_pools);
     let t_load = Instant::now();
-    let mut inner = load_from_dir(REAL_MODEL_DIR).await.expect("load_from_dir");
+    let mut inner = load_from_dir(&model_path).await.expect("load_from_dir");
     assert!(inner.paged.is_some(), "Expected paged runtime enabled");
     assert!(inner.dspark.is_some(), "Expected DSpark draft model loaded");
     let kv_dtype = inner.paged.as_ref().expect("paged").coordinator.kv_dtype();
@@ -3108,7 +3305,7 @@ async fn inkling2_roofline_profile() {
 
     eprintln!("\n================================================================================");
     eprintln!("  INKLING-2-MINI M5 MAX RELEASE ROOFLINE & MICRO-PROFILE BASELINE");
-    eprintln!("  Model: {REAL_MODEL_DIR}");
+    eprintln!("  Model: {model_path}");
     eprintln!(
         "  Loaded in {:.2}s | KV: {:?} | Weights: {:.2} GiB | DSpark: {:.1} MiB | Release: {}",
         t_load.elapsed().as_secs_f64(),
@@ -3155,13 +3352,81 @@ async fn inkling2_roofline_profile() {
     );
 
     // ========================================================================
-    // 1B. Single-seq DSpark (M=8, 128 output tokens, INT8-KTM)
+    // 1B. Single-seq DSpark Depth Sweep (k=3,4,5,6,7 + Adaptive) on BOTH prompts
     // ========================================================================
+    let code_comp_prompt_ids = render_prompt(&inner, CODE_COMPLETION_PROMPT);
+    let ar_code = run_single_ar(&mut inner, &code_comp_prompt_ids, DECODE_OUT_TOKENS);
+    let ar_code_tps = 1000.0 / (ar_code.total_ms / ar_code.steps as f64);
+
+    let sweep_modes: [(&str, DsparkDepthMode); 6] = [
+        ("fixed k=3 (M=4)", DsparkDepthMode::Fixed(3)),
+        ("fixed k=4 (M=5)", DsparkDepthMode::Fixed(4)),
+        ("fixed k=5 (M=6)", DsparkDepthMode::Fixed(5)),
+        ("fixed k=6 (M=7)", DsparkDepthMode::Fixed(6)),
+        ("fixed k=7 (M=8)", DsparkDepthMode::Fixed(7)),
+        ("adaptive k[3..7]", DsparkDepthMode::Adaptive),
+    ];
+
     for _ in 0..WARMUP_RUNS {
-        let _ = run_single_dspark(&mut inner, &single_prompt_ids, DECODE_OUT_TOKENS);
+        let _ = run_single_dspark(
+            &mut inner,
+            &single_prompt_ids,
+            DECODE_OUT_TOKENS,
+            DsparkDepthMode::Fixed(7),
+        );
     }
+
+    for (prompt_label, p_ids, ar_ref, ref_tps) in [
+        ("Dijkstra Coding", &single_prompt_ids, &ar1, ar1_tps),
+        (
+            "BinarySearch CodeComp",
+            &code_comp_prompt_ids,
+            &ar_code,
+            ar_code_tps,
+        ),
+    ] {
+        eprintln!(
+            "\n[1.2] Single-seq DSpark Sweep — {prompt_label} ({DECODE_OUT_TOKENS} out tok, AR={ref_tps:.2} tok/s):"
+        );
+        eprintln!(
+            "  {:<18} {:>9} {:>7} {:>8} {:>8} {:>8} {:>7} {:>9}",
+            "Mode", "tok/s", "vs AR", "ms/cyc", "accept", "avg_k", "cyc", "exact_ar"
+        );
+        for &(label, mode) in &sweep_modes {
+            clear_cache();
+            let dp = run_single_dspark(&mut inner, p_ids, DECODE_OUT_TOKENS, mode);
+            let tps = dp.decoded_tokens as f64 / (dp.total_ms / 1000.0);
+            let ms_cyc = dp.total_ms / dp.cycles.max(1) as f64;
+            let mean_acc = (dp.total_accepted_drafts + dp.cycles) as f64 / dp.cycles.max(1) as f64;
+            let avg_k = dp.total_drafted as f64 / dp.cycles.max(1) as f64;
+            let exact = dp
+                .tokens
+                .iter()
+                .zip(ar_ref.tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            eprintln!(
+                "  {:<18} {:>8.2}  {:>6.2}x {:>7.3}  {:>7.3}  {:>7.2}  {:>6}  {:>4}/{:<4}",
+                label,
+                tps,
+                tps / ref_tps.max(1e-6),
+                ms_cyc,
+                mean_acc,
+                avg_k,
+                dp.cycles,
+                exact,
+                ar_ref.tokens.len(),
+            );
+        }
+    }
+
     clear_cache();
-    let dp1 = run_single_dspark(&mut inner, &single_prompt_ids, DECODE_OUT_TOKENS);
+    let dp1 = run_single_dspark(
+        &mut inner,
+        &single_prompt_ids,
+        DECODE_OUT_TOKENS,
+        DsparkDepthMode::Adaptive,
+    );
     let dp1_tps = dp1.decoded_tokens as f64 / (dp1.total_ms / 1000.0);
     let dp1_ms_cycle = dp1.total_ms / dp1.cycles.max(1) as f64;
     let dp1_propose_cycle = dp1.propose_ms / dp1.cycles.max(1) as f64;
@@ -3176,7 +3441,9 @@ async fn inkling2_roofline_profile() {
         .take_while(|(a, b)| a == b)
         .count();
 
-    eprintln!("\n[1.2] Single-seq DSpark (M=8, {DECODE_OUT_TOKENS} output tokens, INT8-KTM):");
+    eprintln!(
+        "\n[1.2b] Single-seq DSpark Adaptive Detail ({DECODE_OUT_TOKENS} output tokens, INT8-KTM):"
+    );
     eprintln!(
         "  Throughput:  {dp1_tps:.2} tok/s  (speedup vs AR = {:.2}x, total={:.1} ms, cycles={}, exact_ar_prefix={}/{})",
         dp1_tps / ar1_tps.max(1e-6),
@@ -3219,42 +3486,70 @@ async fn inkling2_roofline_profile() {
     );
 
     // ========================================================================
-    // 1D. 4-lane concurrent DSpark (M=32, 128 output tokens/lane)
+    // 1D. 4-lane concurrent DSpark (Fixed k=3..7 vs Adaptive k, 128 output tokens/lane)
     // ========================================================================
     for _ in 0..WARMUP_RUNS {
-        let _ = run_4lane_dspark(&mut inner, &four_lane_prompt_ids, DECODE_OUT_TOKENS);
+        let _ = run_4lane_dspark(
+            &mut inner,
+            &four_lane_prompt_ids,
+            DECODE_OUT_TOKENS,
+            DsparkDepthMode::Fixed(7),
+        );
     }
-    clear_cache();
-    let dp4 = run_4lane_dspark(&mut inner, &four_lane_prompt_ids, DECODE_OUT_TOKENS);
-    let dp4_agg_tps = dp4.total_decoded_tokens as f64 / (dp4.total_ms / 1000.0);
-    let dp4_lane_tps = dp4_agg_tps / 4.0;
-    let dp4_ms_wave = dp4.total_ms / dp4.waves.max(1) as f64;
-    let dp4_prop_wave = dp4.propose_ms / dp4.waves.max(1) as f64;
-    let dp4_ver_wave = dp4.verify_ms / dp4.waves.max(1) as f64;
-    let dp4_com_wave = dp4.commit_ms / dp4.waves.max(1) as f64;
-    let dp4_exact_lanes = (0..4).filter(|&i| dp4.tokens[i] == ar4.tokens[i]).count();
-
     eprintln!(
-        "\n[1.4] 4-lane Concurrent DSpark (M=32, {DECODE_OUT_TOKENS} output tokens/lane, INT8-KTM):"
+        "\n[1.4] 4-lane Concurrent DSpark Sweep ({DECODE_OUT_TOKENS} out tok/lane, 4-lane AR={ar4_agg_tps:.2} agg tok/s):"
     );
     eprintln!(
-        "  Throughput:  aggregate = {dp4_agg_tps:.2} tok/s | per-lane = {dp4_lane_tps:.2} tok/s  (speedup vs 4-lane AR = {:.2}x, exact_ar_lanes={dp4_exact_lanes}/4)",
-        dp4_agg_tps / ar4_agg_tps.max(1e-6),
+        "  {:<18} {:>9} {:>9} {:>7} {:>8} {:>7} {:>8} {:>16}",
+        "Mode", "agg tok/s", "lane/s", "vs AR4", "ms/wave", "waves", "acc_rate", "exact/prefixes"
     );
-    eprintln!(
-        "  Wave stats:  waves={} (full M=32 waves={}), accepted_drafts={}/{} ({:.1}%)",
-        dp4.waves,
-        dp4.full_m32_waves,
-        dp4.total_accepted_drafts,
-        dp4.total_drafted,
-        100.0 * dp4.total_accepted_drafts as f64 / dp4.total_drafted.max(1) as f64,
-    );
-    eprintln!(
-        "  Wave split:  {dp4_ms_wave:.3} ms/wave = propose {dp4_prop_wave:.3} ms ({:.1}%) + verify {dp4_ver_wave:.3} ms ({:.1}%) + commit {dp4_com_wave:.3} ms ({:.1}%)",
-        100.0 * dp4.propose_ms / dp4.total_ms,
-        100.0 * dp4.verify_ms / dp4.total_ms,
-        100.0 * dp4.commit_ms / dp4.total_ms,
-    );
+    for &(label, mode) in &[
+        ("fixed k=3 (M<=16)", DsparkDepthMode::Fixed(3)),
+        ("fixed k=4 (M<=20)", DsparkDepthMode::Fixed(4)),
+        ("fixed k=5 (M<=24)", DsparkDepthMode::Fixed(5)),
+        ("fixed k=7 (M<=32)", DsparkDepthMode::Fixed(7)),
+        ("adaptive k[3..7]", DsparkDepthMode::Adaptive),
+    ] {
+        clear_cache();
+        let dp4 = run_4lane_dspark(&mut inner, &four_lane_prompt_ids, DECODE_OUT_TOKENS, mode);
+        let agg = dp4.total_decoded_tokens as f64 / (dp4.total_ms / 1000.0);
+        let lane = agg / 4.0;
+        let ms_w = dp4.total_ms / dp4.waves.max(1) as f64;
+        let acc_rate = 100.0 * dp4.total_accepted_drafts as f64 / dp4.total_drafted.max(1) as f64;
+        let exact_lanes = (0..4).filter(|&i| dp4.tokens[i] == ar4.tokens[i]).count();
+        let prefixes: Vec<usize> = (0..4)
+            .map(|i| {
+                dp4.tokens[i]
+                    .iter()
+                    .zip(ar4.tokens[i].iter())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .collect();
+        eprintln!(
+            "  {:<18} {:>8.2}  {:>8.2}  {:>6.2}x {:>7.3}  {:>6}  {:>6.1}%  {exact_lanes}/4 {prefixes:?}  (p={:.2} v={:.2} c={:.2} m32={})",
+            label,
+            agg,
+            lane,
+            agg / ar4_agg_tps.max(1e-6),
+            ms_w,
+            dp4.waves,
+            acc_rate,
+            dp4.propose_ms / dp4.waves.max(1) as f64,
+            dp4.verify_ms / dp4.waves.max(1) as f64,
+            dp4.commit_ms / dp4.waves.max(1) as f64,
+            dp4.full_m32_waves,
+        );
+        if matches!(mode, DsparkDepthMode::Fixed(7) | DsparkDepthMode::Adaptive) {
+            let prop_w = dp4.propose_ms / dp4.waves.max(1) as f64;
+            let ver_w = dp4.verify_ms / dp4.waves.max(1) as f64;
+            let com_w = dp4.commit_ms / dp4.waves.max(1) as f64;
+            eprintln!(
+                "    -> split: propose={prop_w:.3}ms + verify={ver_w:.3}ms + commit={com_w:.3}ms (full_m32_waves={})",
+                dp4.full_m32_waves
+            );
+        }
+    }
 
     // ========================================================================
     // 1E. Prefill Throughput at exact 2048 and 8192 tokens
@@ -3345,16 +3640,24 @@ async fn inkling2_roofline_profile() {
         dp_bd.markov_rnn_gate_ms,
         dp_pct(dp_bd.markov_rnn_gate_ms)
     );
+    let fold_label = if dp_bd.markov_softcap_argmax_ms == 0.0 {
+        "7x fused Q8_0 fold+softcap+argmax"
+    } else {
+        "7x folded lm_head ([1,256]@[256,V]+b)"
+    };
     eprintln!(
-        "       7x folded lm_head ([1,256]@[256,V]+b)    {:>8.3} ms {:>6.1}%",
+        "       {:<39}{:>8.3} ms {:>6.1}%",
+        fold_label,
         dp_bd.markov_fold_matmul_ms,
         dp_pct(dp_bd.markov_fold_matmul_ms)
     );
-    eprintln!(
-        "       7x add + slice + softcap + argmax        {:>8.3} ms {:>6.1}%",
-        dp_bd.markov_softcap_argmax_ms,
-        dp_pct(dp_bd.markov_softcap_argmax_ms)
-    );
+    if dp_bd.markov_softcap_argmax_ms > 0.0 {
+        eprintln!(
+            "       7x add + slice + softcap + argmax        {:>8.3} ms {:>6.1}%",
+            dp_bd.markov_softcap_argmax_ms,
+            dp_pct(dp_bd.markov_softcap_argmax_ms)
+        );
+    }
     eprintln!("  ------------------------------------------------------------------");
     eprintln!(
         "  Sum of isolated stage blocks                  {:>8.3} ms  100.0%",

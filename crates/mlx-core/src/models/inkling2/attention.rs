@@ -219,17 +219,128 @@ pub struct Inkling2Attention {
     pub one_scalar: MxArray,
 }
 
+/// Fast Metal NAX BF16 linear dispatch (`1 <= M <= 1024`, `K % 4 == 0`) for bias-free dense
+/// `Standard` projections: runs our single-pass 0-ULP batch-size-invariant `inkling2_bf16_linear`
+/// NAX kernel (`TSM=32, TSN=16, BK=64, KS=4`, zero edge tile shifting -> 0-ULP parity across ALL
+/// `M = 1..=1024`, covering AR `M=1`, DSpark `M=4..32`, and cold-tier prefix tails `M=38` vs
+/// `M=678` while keeping `2K/8K` prefill `M >= 2048` on MLX's large-tile NAX GEMM!).
+///
+/// When `include_tiny` is `false` (GGUF quantized models where only `sink_proj`/`k_conv_proj`/
+/// `v_conv_proj` are BF16), tiny projections (`N < 256`) stay on `proj.forward` so GGUF remains
+/// 100% bit-identical to Stage 1 GGUF. When `include_tiny` is `true` (dense BF16 SafeTensors
+/// attention), all BF16 projections share the exact same NAX reduction order.
+pub(crate) fn forward_linear_proj_fast_ex(
+    proj: &LinearProj,
+    x: &MxArray,
+    include_tiny: bool,
+) -> Result<MxArray> {
+    #[cfg(target_os = "macos")]
+    if let LinearProj::Standard(lin) = proj
+        && lin.get_bias().is_none()
+        && x.dtype()? == DType::BFloat16
+        && unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_metal_is_nax_available() }
+    {
+        let xs = x.shape()?;
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 1024 && xs[1] > 0 && xs[1] % 4 == 0 {
+            let w = lin.get_weight();
+            if w.dtype()? == DType::BFloat16 && (include_tiny || w.shape()?[0] >= 256) {
+                return super::kernels::inkling2_bf16_linear(x, &w);
+            }
+        }
+    }
+    proj.forward(x)
+}
+
+pub(crate) fn forward_linear_proj_fast(proj: &LinearProj, x: &MxArray) -> Result<MxArray> {
+    forward_linear_proj_fast_ex(proj, x, false)
+}
+
+/// Row-concatenate two compatible `LinearProj` weights (`Quantized` via `LinearProj::concat_rows`
+/// OR bias-free `Standard` dense BF16/F32 weights) into a single `[N1 + N2, K]` projection.
+pub(crate) fn concat_linear_proj_rows(
+    a: &LinearProj,
+    b: &LinearProj,
+) -> Result<Option<LinearProj>> {
+    match (a, b) {
+        (LinearProj::Quantized(_), LinearProj::Quantized(_)) => a.concat_rows(b),
+        (LinearProj::Standard(la), LinearProj::Standard(lb)) => {
+            if la.get_bias().is_some() || lb.get_bias().is_some() {
+                return Ok(None);
+            }
+            let wa = la.get_weight();
+            let wb = lb.get_weight();
+            if wa.dtype()? != wb.dtype()? {
+                return Ok(None);
+            }
+            let sa = wa.shape()?;
+            let sb = wb.shape()?;
+            if sa.len() != 2 || sb.len() != 2 || sa[1] != sb[1] {
+                return Ok(None);
+            }
+            let merged_w = MxArray::concatenate(&wa, &wb, 0)?;
+            Ok(Some(LinearProj::Standard(crate::nn::Linear::from_weights(
+                &merged_w, None,
+            )?)))
+        }
+        _ => Ok(None),
+    }
+}
+
 impl Inkling2Attention {
     /// Attempt to build fused `[Q, R, Gate]` and (for SWA) `[Q, R, Gate, K, V]` packed projections.
+    /// For dense `Standard` (BF16) projections, slices the individual views out of the fused backing
+    /// tensor so there is ZERO duplicate resident weight memory!
     pub fn try_fuse_projections(&mut self) -> Result<()> {
-        if let Some(qr) = self.q_proj.concat_rows(&self.rel_proj)?
-            && let Some(qrg) = qr.concat_rows(&self.gate_proj)?
+        if let Some(qr) = concat_linear_proj_rows(&self.q_proj, &self.rel_proj)?
+            && let Some(qrg) = concat_linear_proj_rows(&qr, &self.gate_proj)?
         {
             if self.is_local
-                && let Some(qrgk) = qrg.concat_rows(&self.k_proj)?
-                && let Some(qrgkv) = qrgk.concat_rows(&self.v_proj)?
+                && let Some(qrgk) = concat_linear_proj_rows(&qrg, &self.k_proj)?
+                && let Some(qrgkv) = concat_linear_proj_rows(&qrgk, &self.v_proj)?
             {
+                if let LinearProj::Standard(ref fused_lin) = qrgkv {
+                    let w = fused_lin.get_weight();
+                    let d = w.shape()?[1];
+                    let q_dim = (self.num_heads * self.head_dim) as i64;
+                    let r_dim = (self.num_heads * self.d_rel) as i64;
+                    let g_dim = q_dim;
+                    let kv_dim = (self.num_kv_heads * self.head_dim) as i64;
+                    let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
+                        let sub = w.slice(&[start, 0], &[end, d])?;
+                        Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
+                            &sub, None,
+                        )?))
+                    };
+                    let o1 = q_dim;
+                    let o2 = o1 + r_dim;
+                    let o3 = o2 + g_dim;
+                    let o4 = o3 + kv_dim;
+                    let o5 = o4 + kv_dim;
+                    self.q_proj = slice_lin(0, o1)?;
+                    self.rel_proj = slice_lin(o1, o2)?;
+                    self.gate_proj = slice_lin(o2, o3)?;
+                    self.k_proj = slice_lin(o3, o4)?;
+                    self.v_proj = slice_lin(o4, o5)?;
+                    self.fused_qrg = Some(slice_lin(0, o3)?);
+                    self.fused_qrgkv = Some(qrgkv);
+                    return Ok(());
+                }
                 self.fused_qrgkv = Some(qrgkv);
+            } else if let LinearProj::Standard(ref fused_lin) = qrg {
+                let w = fused_lin.get_weight();
+                let d = w.shape()?[1];
+                let q_dim = (self.num_heads * self.head_dim) as i64;
+                let r_dim = (self.num_heads * self.d_rel) as i64;
+                let g_dim = q_dim;
+                let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
+                    let sub = w.slice(&[start, 0], &[end, d])?;
+                    Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &sub, None,
+                    )?))
+                };
+                self.q_proj = slice_lin(0, q_dim)?;
+                self.rel_proj = slice_lin(q_dim, q_dim + r_dim)?;
+                self.gate_proj = slice_lin(q_dim + r_dim, q_dim + r_dim + g_dim)?;
             }
             self.fused_qrg = Some(qrg);
         }
@@ -251,7 +362,7 @@ impl Inkling2Attention {
         let (q_raw, r_raw, gate_raw, k_raw, v_raw) = if x_k_v.is_none()
             && let Some(ref fused) = self.fused_qrgkv
         {
-            let all = fused.forward(x_q)?;
+            let all = forward_linear_proj_fast(fused, x_q)?;
             let mut parts = all.split_sections(
                 &[
                     q_dim,
@@ -279,7 +390,7 @@ impl Inkling2Attention {
             (q_p, r_p, g_p, k_p, v_p)
         } else {
             let (q_p, r_p, g_p) = if let Some(ref fused) = self.fused_qrg {
-                let qrg = fused.forward(x_q)?;
+                let qrg = forward_linear_proj_fast(fused, x_q)?;
                 let mut parts = qrg.split_sections(&[q_dim, q_dim + r_dim], -1)?;
                 let g_p = parts
                     .pop()
@@ -293,17 +404,18 @@ impl Inkling2Attention {
                 (q_p, r_p, g_p)
             } else {
                 (
-                    self.q_proj.forward(x_q)?,
-                    self.rel_proj.forward(x_q)?,
-                    self.gate_proj.forward(x_q)?,
+                    forward_linear_proj_fast(&self.q_proj, x_q)?,
+                    forward_linear_proj_fast(&self.rel_proj, x_q)?,
+                    forward_linear_proj_fast(&self.gate_proj, x_q)?,
                 )
             };
             let (x_k, x_v) = x_k_v.unwrap_or((x_q, x_q));
-            let k_p = self.k_proj.forward(x_k)?;
-            let v_p = self.v_proj.forward(x_v)?;
+            let k_p = forward_linear_proj_fast(&self.k_proj, x_k)?;
+            let v_p = forward_linear_proj_fast(&self.v_proj, x_v)?;
             (q_p, r_p, g_p, k_p, v_p)
         };
-        let sink_raw = self.sink_proj.forward(x_q)?;
+        let dense_bf16 = matches!(self.q_proj, LinearProj::Standard(_));
+        let sink_raw = forward_linear_proj_fast_ex(&self.sink_proj, x_q, dense_bf16)?;
         Ok((q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw))
     }
 
@@ -334,8 +446,9 @@ impl Inkling2Attention {
 
         // 2. K & V ShortConv (static on SWA, dynamic on Global)
         let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
+        let dense_bf16 = matches!(self.q_proj, LinearProj::Standard(_));
         let k_conv_out = if let Some(ref k_cp) = self.k_conv_proj {
-            let dyn_k = k_cp.forward(x_k_inp)?.reshape(&[
+            let dyn_k = forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?.reshape(&[
                 t_i64,
                 self.num_kv_heads as i64,
                 self.k_conv.shape()?[1],
@@ -345,7 +458,7 @@ impl Inkling2Attention {
             static_short_conv(&k_raw, &self.k_conv, &mut conv_state.k)?
         };
         let v_conv_out = if let Some(ref v_cp) = self.v_conv_proj {
-            let dyn_v = v_cp.forward(x_v_inp)?.reshape(&[
+            let dyn_v = forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?.reshape(&[
                 t_i64,
                 self.num_kv_heads as i64,
                 self.v_conv.shape()?[1],
@@ -507,19 +620,33 @@ impl Inkling2Attention {
 
     pub fn weight_arrays(&self) -> Vec<MxArray> {
         let mut arrays = Vec::new();
-        push_linear_proj_arrays(&self.q_proj, &mut arrays);
-        push_linear_proj_arrays(&self.k_proj, &mut arrays);
-        push_linear_proj_arrays(&self.v_proj, &mut arrays);
-        push_linear_proj_arrays(&self.rel_proj, &mut arrays);
-        push_linear_proj_arrays(&self.gate_proj, &mut arrays);
+        if let Some(ref f) = self.fused_qrgkv
+            && matches!(f, LinearProj::Standard(_))
+        {
+            // All 5 individual views + `fused_qrg` alias this single backing buffer.
+            push_linear_proj_arrays(f, &mut arrays);
+        } else if let Some(ref f) = self.fused_qrg
+            && matches!(f, LinearProj::Standard(_))
+        {
+            // `q_proj`, `rel_proj`, `gate_proj` alias `fused_qrg`; `k_proj` & `v_proj` are separate.
+            push_linear_proj_arrays(f, &mut arrays);
+            push_linear_proj_arrays(&self.k_proj, &mut arrays);
+            push_linear_proj_arrays(&self.v_proj, &mut arrays);
+        } else {
+            push_linear_proj_arrays(&self.q_proj, &mut arrays);
+            push_linear_proj_arrays(&self.k_proj, &mut arrays);
+            push_linear_proj_arrays(&self.v_proj, &mut arrays);
+            push_linear_proj_arrays(&self.rel_proj, &mut arrays);
+            push_linear_proj_arrays(&self.gate_proj, &mut arrays);
+            if let Some(ref f) = self.fused_qrg {
+                push_linear_proj_arrays(f, &mut arrays);
+            }
+            if let Some(ref f) = self.fused_qrgkv {
+                push_linear_proj_arrays(f, &mut arrays);
+            }
+        }
         push_linear_proj_arrays(&self.sink_proj, &mut arrays);
         push_linear_proj_arrays(&self.o_proj, &mut arrays);
-        if let Some(ref f) = self.fused_qrg {
-            push_linear_proj_arrays(f, &mut arrays);
-        }
-        if let Some(ref f) = self.fused_qrgkv {
-            push_linear_proj_arrays(f, &mut arrays);
-        }
         arrays.push(self.k_conv.clone());
         arrays.push(self.v_conv.clone());
         arrays.push(self.post_conv.clone());

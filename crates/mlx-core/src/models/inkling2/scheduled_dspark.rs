@@ -21,12 +21,12 @@ use crate::engine::scheduled_verify::{ScheduledDraftVerify, ScheduledVerifyBatch
 use crate::engine::spec_paged::SpecPagedCache;
 use crate::transformer::paged_kv_cache_adapter::{PagedRaggedRow, SeqId};
 
-use super::dspark::{BatchedDsparkLane, DSPARK_BLOCK_SIZE, Inkling2DsparkContext};
+use super::dspark::{AdaptiveDraftDepth, BatchedDsparkLane, Inkling2DsparkContext};
 use super::kv_cache::Inkling2KVCacheCoordinator;
 use super::model::Inkling2Inner;
 use super::short_conv::Inkling2ShortConvTape;
 
-/// Maximum speculative lanes stacked into one `[N * 8]` verify wave (matches Qwen 3.8 `WAVE_LANES`).
+/// Maximum speculative lanes stacked into one ragged `[sum(1 + k_i)]` verify wave (matches Qwen 3.8 `WAVE_LANES`).
 pub(crate) const INKLING2_WAVE_LANES: usize = 4;
 
 fn missing_lane(seq: SeqId) -> Error {
@@ -44,11 +44,13 @@ pub(crate) struct OpenInkling2Verify {
     pub tape: Inkling2ShortConvTape,
     pub tapped: Vec<MxArray>,
     pub lanes_in_wave: usize,
+    pub drafted: usize,
 }
 
 /// Per-sequence scheduled DSpark lane state.
 pub(crate) struct Inkling2ScheduledDsparkLane {
     pub ctx: Inkling2DsparkContext,
+    pub adaptive_depth: AdaptiveDraftDepth,
     pub open: Option<OpenInkling2Verify>,
     pub total_verifies: u64,
     pub multi_lane_wave_verifies: u64,
@@ -145,12 +147,14 @@ impl Inkling2Inner {
         let Some(ref draft) = self.dspark else {
             return Ok(false);
         };
+        let max_spec = draft.config.num_draft_tokens();
         if position == 0 {
             let n_layers = draft.config.num_hidden_layers;
             self.scheduled_dspark.seq_lanes.insert(
                 seq_id,
                 Inkling2ScheduledDsparkLane {
                     ctx: Inkling2DsparkContext::new(n_layers),
+                    adaptive_depth: AdaptiveDraftDepth::new(max_spec),
                     open: None,
                     total_verifies: 0,
                     multi_lane_wave_verifies: 0,
@@ -173,6 +177,7 @@ impl Inkling2Inner {
                 seq_id,
                 Inkling2ScheduledDsparkLane {
                     ctx,
+                    adaptive_depth: AdaptiveDraftDepth::new(max_spec),
                     open: None,
                     total_verifies: 0,
                     multi_lane_wave_verifies: 0,
@@ -220,13 +225,18 @@ impl Inkling2Inner {
                 "scheduled Inkling2 DSpark propose: prior verify was not committed",
             ));
         }
+        let effective_drafts = if params.mtp_adaptive_depth {
+            lane.adaptive_depth.current_depth(max_drafts)
+        } else {
+            max_drafts
+        };
         lane.ctx.propose_block(
             draft,
             &self.embed_tokens,
             &self.embed_norm,
             &self.lm_head,
             anchor,
-            max_drafts,
+            effective_drafts,
             params,
             rng,
         )
@@ -271,11 +281,16 @@ impl Inkling2Inner {
                     )));
                 }
                 Some(lane) => {
+                    let effective_drafts = if req.params.mtp_adaptive_depth {
+                        lane.adaptive_depth.current_depth(req.max_drafts)
+                    } else {
+                        req.max_drafts
+                    };
                     valid_indices.push(i);
                     lanes.push(BatchedDsparkLane {
                         ctx: &lane.ctx,
                         anchor_id: req.anchor,
-                        max_drafts: req.max_drafts,
+                        max_drafts: effective_drafts,
                         params: req.params,
                     });
                 }
@@ -409,18 +424,24 @@ impl Inkling2Inner {
     }
 }
 
-/// Partition `rows` into groups of `2..=4` full 8-row speculative lanes that stack into one
-/// `[N * 8]` verify wave (matching Qwen 3.8 `scheduled_dflash2::wave_groups`).
+/// Partition `rows` into groups of `2..=4` speculative lanes (`ids.len() >= 2`, supporting ragged
+/// adaptive per-lane `k`) that stack into one `[sum(1 + k_i)]` verify wave!
 fn select_verify_wave_groups(
     inner: &Inkling2Inner,
     rows: &[(PagedRaggedRow, Vec<u32>)],
 ) -> Vec<Vec<usize>> {
-    let lanes = &inner.scheduled_dspark.seq_lanes;
+    select_verify_wave_groups_from_lanes(&inner.scheduled_dspark.seq_lanes, rows)
+}
+
+fn select_verify_wave_groups_from_lanes(
+    lanes: &HashMap<SeqId, Inkling2ScheduledDsparkLane>,
+    rows: &[(PagedRaggedRow, Vec<u32>)],
+) -> Vec<Vec<usize>> {
     let eligible: Vec<usize> = rows
         .iter()
         .enumerate()
         .filter(|(_, (row, ids))| {
-            ids.len() == DSPARK_BLOCK_SIZE
+            ids.len() >= 2
                 && lanes
                     .get(&row.seq_id)
                     .is_some_and(|lane| lane.open.is_none())
@@ -524,6 +545,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                     tape,
                     tapped: lane_taps,
                     lanes_in_wave: n_lanes,
+                    drafted: ids.len().saturating_sub(1),
                 });
                 outputs[orig_idx] = Some(lane_logits);
                 row_off += len;
@@ -561,6 +583,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                     tape,
                     tapped: taps,
                     lanes_in_wave: 1,
+                    drafted: ids.len().saturating_sub(1),
                 });
                 inner.scheduled_dspark.total_verify_waves += 1;
                 inner.scheduled_dspark.max_verify_wave_lanes =
@@ -716,6 +739,11 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                         if e.open.lanes_in_wave >= 2 {
                             e.lane.multi_lane_wave_verifies += 1;
                         }
+                        if e.open.drafted > 0 {
+                            e.lane
+                                .adaptive_depth
+                                .observe(e.open.drafted, e.keep.saturating_sub(1));
+                        }
                         self.0.scheduled_dspark.seq_lanes.insert(e.seq, e.lane);
                         results[e.orig_idx] = Some(Ok(()));
                     }
@@ -767,12 +795,120 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
         if open.lanes_in_wave >= 2 {
             lane.multi_lane_wave_verifies += 1;
         }
+        if open.drafted > 0 {
+            lane.adaptive_depth
+                .observe(open.drafted, keep.saturating_sub(1));
+        }
         Ok(())
     }
 
     fn discard_draft_owner(&mut self, seq: u32) {
         self.0.scheduled_dspark.seq_lanes.remove(&seq);
         self.0.scheduled_dspark.peer_tapes.remove(&seq);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn mk_lane(open: bool) -> Inkling2ScheduledDsparkLane {
+        Inkling2ScheduledDsparkLane {
+            ctx: Inkling2DsparkContext::new(3),
+            adaptive_depth: AdaptiveDraftDepth::new(7),
+            open: open.then(|| OpenInkling2Verify {
+                tape: Inkling2ShortConvTape::new(0),
+                tapped: Vec::new(),
+                lanes_in_wave: 1,
+                drafted: 0,
+            }),
+            total_verifies: 0,
+            multi_lane_wave_verifies: 0,
+        }
+    }
+
+    #[test]
+    fn select_verify_wave_groups_stacks_ragged_adaptive_depths() {
+        let mut lanes = HashMap::new();
+        lanes.insert(1, mk_lane(false)); // k=3 (4 rows)
+        lanes.insert(2, mk_lane(false)); // k=5 (6 rows)
+        lanes.insert(3, mk_lane(false)); // k=7 (8 rows)
+        lanes.insert(4, mk_lane(false)); // k=4 (5 rows)
+        lanes.insert(5, mk_lane(true)); // open -> excluded
+        lanes.insert(6, mk_lane(false)); // k=2 (3 rows)
+        lanes.insert(7, mk_lane(false)); // k=3 (4 rows)
+
+        let rows = vec![
+            (
+                PagedRaggedRow {
+                    seq_id: 100, // AR peer (len 1, not in lanes)
+                    first_logical_position: 10,
+                    query_len: 1,
+                },
+                vec![42],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 1,
+                    first_logical_position: 20,
+                    query_len: 4,
+                },
+                vec![1, 2, 3, 4],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 5,
+                    first_logical_position: 20,
+                    query_len: 5,
+                },
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 2,
+                    first_logical_position: 30,
+                    query_len: 6,
+                },
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 3,
+                    first_logical_position: 40,
+                    query_len: 8,
+                },
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 4,
+                    first_logical_position: 50,
+                    query_len: 5,
+                },
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 6,
+                    first_logical_position: 60,
+                    query_len: 3,
+                },
+                vec![1, 2, 3],
+            ),
+            (
+                PagedRaggedRow {
+                    seq_id: 7,
+                    first_logical_position: 70,
+                    query_len: 4,
+                },
+                vec![1, 2, 3, 4],
+            ),
+        ];
+
+        let groups = select_verify_wave_groups_from_lanes(&lanes, &rows);
+        // Indices: 0=AR(skip), 1=seq1, 2=seq5(open,skip), 3=seq2, 4=seq3, 5=seq4 -> chunk 1: [1,3,4,5]
+        //          6=seq6, 7=seq7 -> chunk 2: [6,7]
+        assert_eq!(groups, vec![vec![1, 3, 4, 5], vec![6, 7]]);
     }
 }
 
@@ -789,14 +925,13 @@ mod tests {
     use crate::engine::types::{ChatConfig, ChatResult};
     use crate::models::inkling2::model::{Inkling2LoadOptions, Inkling2Model};
     use crate::models::inkling2::persistence::load_from_dir;
+    use crate::models::inkling2::persistence::test_real_model_path;
     use crate::models::inkling2::scheduler::Inkling2Cmd;
     use crate::tokenizer::ChatMessage;
     use crate::tools::inkling::{
         CONTENT_MODEL_END_SAMPLING_ID, Inkling2RenderOptions, InklingMessage,
         render_inkling2_messages_to_ids,
     };
-
-    const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
 
     fn user_msg(text: &str) -> Vec<ChatMessage> {
         vec![ChatMessage {
@@ -867,12 +1002,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires real Inkling-2-Mini + DSpark GGUF on disk (~18 GB)"]
     async fn inkling2_dspark_greedy_parity() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(model_dir.exists(), "Missing {}", model_dir.display());
 
         let t_load = Instant::now();
         let model = Inkling2Model::load(
-            REAL_MODEL_DIR.to_string(),
+            model_path,
             Some(Inkling2LoadOptions {
                 kv_format: Some("int8".to_string()),
                 cache_disk: Some("0".to_string()),
@@ -1014,11 +1150,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires real Inkling-2-Mini + DSpark GGUF on disk (~18 GB)"]
     async fn inkling2_dspark_concurrent_wave_parity() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(model_dir.exists(), "Missing {}", model_dir.display());
 
         let model = Inkling2Model::load(
-            REAL_MODEL_DIR.to_string(),
+            model_path,
             Some(Inkling2LoadOptions {
                 kv_format: Some("int8".to_string()),
                 cache_disk: Some("0".to_string()),
@@ -1122,13 +1259,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires real Inkling-2-Mini + DSpark + mmproj GGUFs on disk (~18.7 GB)"]
     async fn inkling2_phase5_full_benchmark() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(model_dir.exists(), "Missing {}", model_dir.display());
 
         // ------------------------------------------------------------------
         // A. Direct inner benchmark: exact mean acceptance length, 2K & 8K prefill
         // ------------------------------------------------------------------
-        let mut inner = load_from_dir(REAL_MODEL_DIR).await.expect("load_from_dir");
+        let mut inner = load_from_dir(&model_path).await.expect("load_from_dir");
         assert!(inner.dspark.is_some(), "Expected auto-discovered DSpark");
         let tokenizer = inner.tokenizer.clone().expect("tokenizer");
 
@@ -1390,7 +1528,7 @@ mod tests {
             std::env::temp_dir().join(format!("inkling2_phase5_bench_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_cache_dir);
         let model = Inkling2Model::load(
-            REAL_MODEL_DIR.to_string(),
+            model_path.clone(),
             Some(Inkling2LoadOptions {
                 kv_format: Some("int8".to_string()),
                 cache_disk: Some("auto".to_string()),
@@ -1498,7 +1636,7 @@ mod tests {
         crate::array::synchronize_and_clear_cache();
 
         let model2 = Inkling2Model::load(
-            REAL_MODEL_DIR.to_string(),
+            model_path,
             Some(Inkling2LoadOptions {
                 kv_format: Some("int8".to_string()),
                 cache_disk: Some("auto".to_string()),
@@ -1575,5 +1713,80 @@ mod tests {
         drop(tx2);
         model2.dispose().await.expect("dispose");
         let _ = std::fs::remove_dir_all(&temp_cache_dir);
+    }
+}
+
+#[cfg(test)]
+mod wave_grouper_tests {
+    use std::collections::HashMap;
+
+    use crate::models::inkling2::dspark::{AdaptiveDraftDepth, Inkling2DsparkContext};
+    use crate::models::inkling2::short_conv::Inkling2ShortConvTape;
+    use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
+
+    use super::{
+        Inkling2ScheduledDsparkLane, OpenInkling2Verify, select_verify_wave_groups_from_lanes,
+    };
+
+    fn make_lane(open: bool) -> Inkling2ScheduledDsparkLane {
+        Inkling2ScheduledDsparkLane {
+            ctx: Inkling2DsparkContext::new(3),
+            adaptive_depth: AdaptiveDraftDepth::new(7),
+            open: open.then(|| OpenInkling2Verify {
+                tape: Inkling2ShortConvTape::new(0),
+                tapped: Vec::new(),
+                lanes_in_wave: 1,
+                drafted: 4,
+            }),
+            total_verifies: 0,
+            multi_lane_wave_verifies: 0,
+        }
+    }
+
+    fn make_row(seq_id: u32, len: usize) -> (PagedRaggedRow, Vec<u32>) {
+        (
+            PagedRaggedRow {
+                seq_id,
+                first_logical_position: 16,
+                query_len: len as u32,
+            },
+            vec![42u32; len],
+        )
+    }
+
+    #[test]
+    fn ragged_multi_lane_wave_grouper_stacks_adaptive_depths_and_filters_peers() {
+        let mut lanes = HashMap::new();
+        for seq_id in [1u32, 2, 3, 4, 5, 6] {
+            lanes.insert(seq_id, make_lane(false));
+        }
+        // Lane 7 already has an open verify -> excluded.
+        lanes.insert(7, make_lane(true));
+
+        // Mix ragged adaptive speculative lanes (`len` in 4..=8), a 1-row AR peer (seq 99),
+        // an open lane (seq 7), and a 1-row tail verify (seq 6 with len=1).
+        let rows = vec![
+            make_row(1, 4),  // idx 0: k=3 (eligible)
+            make_row(99, 1), // idx 1: AR peer (excluded)
+            make_row(2, 6),  // idx 2: k=5 (eligible)
+            make_row(7, 8),  // idx 3: already open (excluded)
+            make_row(3, 8),  // idx 4: k=7 (eligible)
+            make_row(4, 5),  // idx 5: k=4 (eligible)
+            make_row(6, 1),  // idx 6: len=1 tail (excluded)
+            make_row(5, 2),  // idx 7: k=1 (eligible, starts second chunk but lone -> ignored)
+        ];
+        let groups = select_verify_wave_groups_from_lanes(&lanes, &rows);
+        assert_eq!(groups, vec![vec![0, 2, 4, 5]]);
+
+        // Add one more eligible lane so the second chunk has 2 lanes and stacks too!
+        let mut rows2 = rows;
+        lanes.insert(8, make_lane(false));
+        rows2.push(make_row(8, 3)); // idx 8: k=2 (eligible)
+        let groups2 = select_verify_wave_groups_from_lanes(&lanes, &rows2);
+        assert_eq!(groups2, vec![vec![0, 2, 4, 5], vec![7, 8]]);
+
+        // A single eligible lane does not form a multi-lane wave group.
+        let solo = vec![make_row(1, 5), make_row(99, 1)];
+        assert!(select_verify_wave_groups_from_lanes(&lanes, &solo).is_empty());
     }
 }

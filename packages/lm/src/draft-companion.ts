@@ -219,8 +219,39 @@ export function isInkling2DSparkGguf(path: string): boolean {
 }
 
 /**
- * Discover a colocated DSpark GGUF companion (`dspark-*.gguf` carrying
- * `dflash` + Inkling2 metadata) inside an Inkling2 model's directory.
+ * True when `path` is a colocated Inkling2 `mtp.safetensors` DSpark draft paired
+ * with a sibling `config.json` declaring a valid `mtp_config` (positive
+ * `markov_rank` and non-empty `target_layer_ids`).
+ */
+export function isInkling2MtpSafetensors(path: string): boolean {
+  if (!regularFile(path)) return false;
+  const configPath = join(dirname(path), 'config.json');
+  if (!regularFile(configPath)) return false;
+  try {
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      mtp_config?: {
+        markov_rank?: unknown;
+        target_layer_ids?: unknown;
+      };
+    } | null;
+    const mtp = config?.mtp_config;
+    return (
+      typeof mtp?.markov_rank === 'number' &&
+      Number.isInteger(mtp.markov_rank) &&
+      mtp.markov_rank > 0 &&
+      Array.isArray(mtp.target_layer_ids) &&
+      mtp.target_layer_ids.length > 0 &&
+      mtp.target_layer_ids.every((v) => typeof v === 'number' && Number.isInteger(v) && v >= 0)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Discover a colocated DSpark companion (`mtp.safetensors` paired with
+ * `config.json` `mtp_config`, or `dspark-*.gguf` carrying `dflash` + Inkling2
+ * metadata) inside an Inkling2 model's directory.
  */
 export function findInkling2DSparkDraft(modelPath: string): string | undefined {
   const isGguf = modelPath.toLowerCase().endsWith('.gguf');
@@ -235,6 +266,10 @@ export function findInkling2DSparkDraft(modelPath: string): string | undefined {
   const dirs = resolvedDir !== modelDir ? [modelDir, resolvedDir] : [modelDir];
 
   for (const dir of dirs) {
+    if (!isGguf) {
+      const mtpPath = join(dir, 'mtp.safetensors');
+      if (isInkling2MtpSafetensors(mtpPath)) return mtpPath;
+    }
     try {
       const candidates = readdirSync(dir, { withFileTypes: true })
         .filter((entry) => direntKind(dir, entry) === 'file' && /^dspark-.*\.gguf$/i.test(entry.name))
@@ -245,6 +280,10 @@ export function findInkling2DSparkDraft(modelPath: string): string | undefined {
       }
     } catch {
       // An absent/unreadable directory leaves ordinary target loading available.
+    }
+    if (isGguf) {
+      const mtpPath = join(dir, 'mtp.safetensors');
+      if (isInkling2MtpSafetensors(mtpPath)) return mtpPath;
     }
   }
   return undefined;

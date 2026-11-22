@@ -56,7 +56,7 @@ use super::config::Inkling2Config;
 use super::dspark::Inkling2DsparkModel;
 use super::kernels::{
     Inkling2KvDtype, inkling2_block_attn_res, inkling2_gate_sink, inkling2_lm_head_softcap,
-    inkling2_paged_attention, inkling2_paged_prefill_attention,
+    inkling2_lm_head_softcap_argmax, inkling2_paged_attention, inkling2_paged_prefill_attention,
     inkling2_paged_prefill_mpp_supported, inkling2_qr_clip,
 };
 use super::kv_cache::{
@@ -310,6 +310,19 @@ pub(crate) fn device_int8_query_from() -> Option<u32> {
     }
 }
 
+/// Per-lane eligibility for MPP `Pass::Verify` on Global attention layers.
+///
+/// Kept independent of peer lanes in the same ragged wave so pairing a long-context lane
+/// (`first_logical_position >= 2048`, including `>= 7168` INT8-query MPP verify) with a
+/// short-context peer (`< 2048`) never changes either lane's attention kernel or arithmetic.
+#[inline]
+pub(crate) fn lane_uses_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) -> bool {
+    mpp_supported
+        && row.query_len > 1
+        && row.query_len <= prefill_plan::VERIFY_ROWS
+        && row.first_logical_position >= 2048
+}
+
 /// Resolve the active INT8-query prefill threshold for `(kv_format, activations)`.
 /// Returns `None` when queries stay BF16 (either BF16 KV cache, `activations == Bf16`,
 /// or GPU without INT8-query MPP support).
@@ -407,19 +420,78 @@ fn async_eval_conv_state(state: &Inkling2ShortConvState) {
     MxArray::async_eval_arrays(&arrays);
 }
 
-/// Queue early and periodic decode/verify visits onto Metal while the CPU builds later visits
-/// (mirroring Qwen3.5 `maybe_submit_paged_decode_layer`), hiding CPU graph-build latency behind
-/// GPU execution. `partial` carries data dependencies on KV writes, ShortConv updates, and blocks.
+#[derive(Clone, Copy)]
+enum SubmitSchedule {
+    None,
+    Mid16_32,
+    Early2_16_32,
+    Exp2_6_14_30,
+    Legacy,
+}
+
+#[inline]
+fn paged_submit_schedule() -> SubmitSchedule {
+    static MODE: std::sync::OnceLock<SubmitSchedule> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("MLX_INKLING2_SUBMIT_MODE").as_deref() {
+            Ok("none" | "0") => SubmitSchedule::None,
+            Ok("16_32") => SubmitSchedule::Mid16_32,
+            Ok("2_16_32") => SubmitSchedule::Early2_16_32,
+            Ok("legacy") => SubmitSchedule::Legacy,
+            _ => SubmitSchedule::Exp2_6_14_30,
+        },
+    )
+}
+
+/// Queue periodic decode/verify visits onto Metal while the CPU builds later visits,
+/// hiding CPU graph-build latency behind GPU execution without excessive command-buffer splits.
+/// Defaults to `Early2_16_32` (`visit_idx == 1, 15, 31`: 3 mid-forward splits, removing the 4x
+/// single-visit splits while keeping M=1, M=4, M=8, and M=32 GPU pipelines fed).
 #[inline]
 fn maybe_submit_paged_visit(visit_idx: usize, num_visits: usize, partial: &MxArray) {
     if visit_idx + 1 >= num_visits {
         return;
     }
-    if (visit_idx < 4 || visit_idx % 8 == 3)
-        && crate::engine::persistence::compiled_forward_backend_available()
-    {
+    let should_submit = match paged_submit_schedule() {
+        SubmitSchedule::None => false,
+        SubmitSchedule::Mid16_32 => visit_idx == 15 || visit_idx == 31,
+        SubmitSchedule::Early2_16_32 => visit_idx == 1 || visit_idx == 15 || visit_idx == 31,
+        SubmitSchedule::Exp2_6_14_30 => {
+            visit_idx == 1 || visit_idx == 5 || visit_idx == 13 || visit_idx == 29
+        }
+        SubmitSchedule::Legacy => visit_idx < 4 || visit_idx % 8 == 3,
+    };
+    if should_submit && crate::engine::persistence::compiled_forward_backend_available() {
         MxArray::async_eval_arrays(&[partial]);
     }
+}
+
+/// Token ID input source for [`Inkling2Inner::forward_paged_wave_inner`]:
+/// host slice (prefill / AR / host verify) or device-resident `[T]` Int32 `MxArray`
+/// (zero-sync DSpark `verify_device`).
+#[derive(Clone, Copy)]
+enum WaveTokenIds<'a> {
+    Host(&'a [u32]),
+    Device { ids: &'a MxArray, len: usize },
+}
+
+impl WaveTokenIds<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        match *self {
+            Self::Host(s) => s.len(),
+            Self::Device { len, .. } => len,
+        }
+    }
+}
+
+/// Output format of [`Inkling2Inner::compute_final_norm_and_logits`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogitsOutput {
+    /// Materialize `[T, unpadded_vocab]` FP32 softcapped logits.
+    FullSoftcap,
+    /// Fused vocab slice + softcap + 2-stage GPU argmax -> `[T]` Int32 (zero `[T, V]` DRAM write!).
+    GreedyArgmax,
 }
 
 /// Resumable 48-visit prefill unit for 100ms layer-chunked prefill interleaving.
@@ -929,6 +1001,7 @@ impl Inkling2Inner {
                     /* last_only */ true,
                     capture_final_norm,
                     run.compute_last_logits,
+                    LogitsOutput::FullSoftcap,
                     act_dtype,
                 )?;
                 if let Some(norm_all) = final_norm_opt {
@@ -1190,6 +1263,7 @@ impl Inkling2Inner {
         last_only: bool,
         capture_final_norm: bool,
         compute_logits: bool,
+        logits_output: LogitsOutput,
         act_dtype: DType,
     ) -> Result<(Option<MxArray>, Option<MxArray>)> {
         if !compute_logits && !capture_final_norm {
@@ -1250,15 +1324,72 @@ impl Inkling2Inner {
         };
         let _ = norm_rows;
 
+        // Fast fused single-pass BF16 `lm_head` + softcap + argmax (ZERO [M, V] DRAM write,
+        // 1 DRAM pass of 926 MB for M <= 16 instead of 2+ passes in MLX `gemv_wide`, 0-ULP
+        // batch-size invariant across M in 1..=32!).
+        let unpadded = self.config.effective_unpadded_vocab_size();
+        let cap = self.config.final_logit_softcapping as f32;
+        #[cfg(target_os = "macos")]
+        if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = self.lm_head
+            && lin.get_bias().is_none()
+            && lm_in.dtype()? == DType::BFloat16
+            && unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_metal_is_nax_available() }
+        {
+            let xs = lm_in.shape()?;
+            let w = lin.get_weight();
+            if xs.len() == 2
+                && xs[0] >= 1
+                && xs[0] <= 32
+                && xs[1] > 0
+                && xs[1] % 4 == 0
+                && w.dtype()? == DType::BFloat16
+            {
+                let vocab_cols = w.shape()?[0] as usize;
+                let out_cols = unpadded.min(vocab_cols);
+                let out = match logits_output {
+                    LogitsOutput::GreedyArgmax => {
+                        super::kernels::inkling2_bf16_lm_head_softcap_argmax(
+                            &lm_in, &w, out_cols, cap,
+                        )?
+                    }
+                    LogitsOutput::FullSoftcap => {
+                        let logits_bf16 = super::kernels::inkling2_bf16_linear(&lm_in, &w)?;
+                        inkling2_lm_head_softcap(&logits_bf16, None, out_cols, cap, false)?
+                    }
+                };
+                return Ok((Some(out), captured_norm));
+            }
+        }
+
         // Keep FP32 logits directly when `lm_head` already outputs FP32, then fuse vocab slice +
         // `30.0 * tanh(x / 30.0)` softcap in 1 Metal dispatch!
         let logits_full = self.lm_head.forward_logits_keep_f32(&lm_in)?;
-        let unpadded = self.config.effective_unpadded_vocab_size();
         let vocab_cols = logits_full.shape()?[1] as usize;
         let out_cols = unpadded.min(vocab_cols);
-        let cap = self.config.final_logit_softcapping as f32;
-        let logits = inkling2_lm_head_softcap(&logits_full, None, out_cols, cap, false)?;
-        Ok((Some(logits), captured_norm))
+        let out = match logits_output {
+            LogitsOutput::FullSoftcap => {
+                inkling2_lm_head_softcap(&logits_full, None, out_cols, cap, false)?
+            }
+            LogitsOutput::GreedyArgmax => {
+                let use_metal = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        unsafe { mlx_sys::mlx_metal_is_available() }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        false
+                    }
+                };
+                if use_metal {
+                    inkling2_lm_head_softcap_argmax(&logits_full, None, out_cols, cap, false)?
+                } else {
+                    inkling2_lm_head_softcap(&logits_full, None, out_cols, cap, false)?
+                        .argmax(-1, Some(false))?
+                }
+            }
+        };
+        Ok((Some(out), captured_norm))
     }
 
     /// Run chunked in-place paged prefill (up to `prefill_chunk_size = 2048` rows/chunk) for
@@ -1404,6 +1535,22 @@ impl Inkling2Inner {
     /// Records `token_id` atomically across both KV groups and returns `[1, unpadded_vocab_size]`
     /// FP32 softcapped logits.
     pub fn paged_decode_step(&mut self, seq_id: SeqId, token_id: u32) -> Result<MxArray> {
+        self.paged_decode_step_inner(seq_id, token_id, LogitsOutput::FullSoftcap, true)
+    }
+
+    /// Greedy variant of [`Self::paged_decode_step`]: fuses `lm_head_softcap_argmax` directly
+    /// (zero `[1, V]` FP32 logits DRAM write). Returns `[1]` Int32 argmax token ID.
+    pub fn paged_decode_step_greedy(&mut self, seq_id: SeqId, token_id: u32) -> Result<MxArray> {
+        self.paged_decode_step_inner(seq_id, token_id, LogitsOutput::GreedyArgmax, true)
+    }
+
+    fn paged_decode_step_inner(
+        &mut self,
+        seq_id: SeqId,
+        token_id: u32,
+        logits_output: LogitsOutput,
+        save_prev_snapshot: bool,
+    ) -> Result<MxArray> {
         let first_pos = {
             let rt = self.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2Model: paged runtime not initialized")
@@ -1413,8 +1560,8 @@ impl Inkling2Inner {
                 .coordinator
                 .request_token_count_all(seq_id)
                 .map_err(Error::from_reason)?;
-            // Save pre-step ShortConv snapshot so early-stop reconciliation can roll back cleanly.
-            if let Some(snap) = rt.conv_states.get(&seq_id).cloned() {
+            // Save pre-step ShortConv snapshot only when early-stop reconciliation may need it.
+            if save_prev_snapshot && let Some(snap) = rt.conv_states.get(&seq_id).cloned() {
                 rt.prev_conv_snapshots.insert(seq_id, (pos, snap));
             }
             rt.coordinator
@@ -1422,34 +1569,64 @@ impl Inkling2Inner {
                 .map_err(Error::from_reason)?;
             pos
         };
-        let logits =
-            match self.forward_paged_single_chunk(seq_id, &[token_id], None, first_pos, true) {
-                Ok(Some(l)) => l,
-                Ok(None) => {
-                    if let Some(rt) = self.paged.as_mut() {
-                        let _ = rt.coordinator.rollback_last_tokens_all(seq_id, 1);
-                        if let Some((snap_pos, snap)) = rt.prev_conv_snapshots.remove(&seq_id)
-                            && snap_pos == first_pos
-                        {
-                            rt.conv_states.insert(seq_id, snap);
-                        }
+        let chunk = [token_id];
+        let positions = [first_pos];
+        let cu_seqlens_q = [0usize, 1];
+        let seq_ids = [seq_id];
+        let seq_q_lens = [(seq_id, 1u32)];
+        let forward_res = self.forward_paged_wave_inner(
+            WaveTokenIds::Host(&chunk),
+            None,
+            &seq_ids,
+            &positions,
+            &cu_seqlens_q,
+            &seq_q_lens,
+            PagedWaveMode::Single {
+                seq_id,
+                first_pos,
+                floor: first_pos,
+                rows: 1,
+                use_mpp_prefill: false,
+                mpp_pass: Pass::Verify,
+                pages_per_split: device_pages_per_split(),
+                int8_q_from: None,
+            },
+            /* compute_logits */ true,
+            logits_output,
+            /* last_only */ true,
+            &[],
+            None,
+            /* save_pre_wave_convs */ true,
+        );
+        let logits = match forward_res {
+            Ok((Some(l), _)) => l,
+            Ok((None, _)) => {
+                if let Some(rt) = self.paged.as_mut() {
+                    let _ = rt.coordinator.rollback_last_tokens_all(seq_id, 1);
+                    if save_prev_snapshot
+                        && let Some((snap_pos, snap)) = rt.prev_conv_snapshots.remove(&seq_id)
+                        && snap_pos == first_pos
+                    {
+                        rt.conv_states.insert(seq_id, snap);
                     }
-                    return Err(Error::from_reason(
-                        "Inkling2Model::paged_decode_step produced no logits",
-                    ));
                 }
-                Err(err) => {
-                    if let Some(rt) = self.paged.as_mut() {
-                        let _ = rt.coordinator.rollback_last_tokens_all(seq_id, 1);
-                        if let Some((snap_pos, snap)) = rt.prev_conv_snapshots.remove(&seq_id)
-                            && snap_pos == first_pos
-                        {
-                            rt.conv_states.insert(seq_id, snap);
-                        }
+                return Err(Error::from_reason(
+                    "Inkling2Model::paged_decode_step produced no logits",
+                ));
+            }
+            Err(err) => {
+                if let Some(rt) = self.paged.as_mut() {
+                    let _ = rt.coordinator.rollback_last_tokens_all(seq_id, 1);
+                    if save_prev_snapshot
+                        && let Some((snap_pos, snap)) = rt.prev_conv_snapshots.remove(&seq_id)
+                        && snap_pos == first_pos
+                    {
+                        rt.conv_states.insert(seq_id, snap);
                     }
-                    return Err(err);
                 }
-            };
+                return Err(err);
+            }
+        };
         if let Some(rt) = self.paged.as_mut() {
             rt.record_block_boundary_conv(seq_id, first_pos.saturating_add(1));
         }
@@ -1462,17 +1639,31 @@ impl Inkling2Inner {
     /// groups (rolling back on error), updates each sequence's ShortConv state independently,
     /// and returns `[N, unpadded_vocab_size]` FP32 softcapped logits.
     pub fn paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.paged_decode_step_batched_inner(rows, LogitsOutput::FullSoftcap)
+    }
+
+    /// Greedy variant of [`Self::paged_decode_step_batched`]: fuses `lm_head_softcap_argmax`
+    /// directly and returns `[N]` Int32 argmax token IDs.
+    pub fn paged_decode_step_batched_greedy(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.paged_decode_step_batched_inner(rows, LogitsOutput::GreedyArgmax)
+    }
+
+    fn paged_decode_step_batched_inner(
+        &mut self,
+        rows: &[(SeqId, u32)],
+        logits_output: LogitsOutput,
+    ) -> Result<MxArray> {
         if rows.is_empty() {
             return Err(Error::from_reason(
                 "Inkling2Model::paged_decode_step_batched requires at least one row",
             ));
         }
         if let &[(seq_id, token_id)] = rows {
-            return self.paged_decode_step(seq_id, token_id);
+            return self.paged_decode_step_inner(seq_id, token_id, logits_output, true);
         }
 
         // 1. Validate uniqueness, gather current positions, check admission across both groups,
-        //    and record tokens atomically.
+        //    save pre-step ShortConv snapshots (for early-stop reconciliation), and record atomically.
         let planned_rows = {
             let rt = self.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2Model: paged runtime not initialized")
@@ -1521,8 +1712,8 @@ impl Inkling2Inner {
         let cu_seqlens_q: Vec<usize> = (0..=rows.len()).collect();
         let seq_q_lens: Vec<(SeqId, u32)> = seq_ids.iter().map(|&sid| (sid, 1)).collect();
 
-        let (logits, _) = match self.forward_paged_wave(
-            &token_ids,
+        let (logits_opt, _) = match self.forward_paged_wave_inner(
+            WaveTokenIds::Host(&token_ids),
             None,
             &seq_ids,
             &positions,
@@ -1531,8 +1722,12 @@ impl Inkling2Inner {
             PagedWaveMode::BatchedDecode {
                 planned_rows: &planned_rows,
             },
+            /* compute_logits */ true,
+            logits_output,
             /* last_only */ false,
             &[],
+            None,
+            /* save_pre_wave_convs */ true,
         ) {
             Ok(res) => res,
             Err(err) => {
@@ -1549,6 +1744,9 @@ impl Inkling2Inner {
                 return Err(err);
             }
         };
+        let logits = logits_opt.ok_or_else(|| {
+            Error::from_reason("Inkling2Model::paged_decode_step_batched produced no logits")
+        })?;
         if let Some(rt) = self.paged.as_mut() {
             for &(seq_id, pos) in &planned_rows {
                 rt.record_block_boundary_conv(seq_id, pos.saturating_add(1));
@@ -1579,36 +1777,116 @@ impl Inkling2Inner {
         rows: &[(PagedRaggedRow, Vec<u32>)],
         tap_visit_indices: &[usize],
     ) -> Result<(MxArray, Vec<MxArray>, Vec<Inkling2ShortConvTape>)> {
+        self.paged_verify_ragged_taped_inner(rows, tap_visit_indices, LogitsOutput::FullSoftcap)
+    }
+
+    /// Greedy variant of [`Self::paged_verify_ragged_taped`]: fuses `inkling2_lm_head_softcap_argmax`
+    /// directly and returns `[T]` Int32 argmax token IDs (zero `[T, V]` FP32 logits DRAM write!).
+    pub(crate) fn paged_verify_ragged_taped_greedy(
+        &mut self,
+        rows: &[(PagedRaggedRow, Vec<u32>)],
+        tap_visit_indices: &[usize],
+    ) -> Result<(MxArray, Vec<MxArray>, Vec<Inkling2ShortConvTape>)> {
+        self.paged_verify_ragged_taped_inner(rows, tap_visit_indices, LogitsOutput::GreedyArgmax)
+    }
+
+    fn paged_verify_ragged_taped_inner(
+        &mut self,
+        rows: &[(PagedRaggedRow, Vec<u32>)],
+        tap_visit_indices: &[usize],
+        logits_output: LogitsOutput,
+    ) -> Result<(MxArray, Vec<MxArray>, Vec<Inkling2ShortConvTape>)> {
         if rows.is_empty() {
             return Err(Error::from_reason(
                 "Inkling2Model::paged_verify_ragged_taped requires at least one row",
             ));
         }
         let mut token_ids = Vec::new();
-        let mut positions = Vec::new();
-        let mut seq_ids = Vec::with_capacity(rows.len());
-        let mut seq_q_lens = Vec::with_capacity(rows.len());
-        let mut cu_seqlens_q = Vec::with_capacity(rows.len() + 1);
         let mut ragged_rows = Vec::with_capacity(rows.len());
-        cu_seqlens_q.push(0usize);
-
-        let mut seen = HashSet::with_capacity(rows.len());
         for (row, tokens) in rows {
-            if !seen.insert(row.seq_id) {
-                return Err(Error::from_reason(format!(
-                    "Inkling2Model::paged_verify_ragged_taped: duplicate seq_id {}",
-                    row.seq_id
-                )));
-            }
             if tokens.is_empty() || tokens.len() != row.query_len as usize {
                 return Err(Error::from_reason(
                     "Inkling2Model::paged_verify_ragged_taped: row token length mismatch",
                 ));
             }
             ragged_rows.push(*row);
+            token_ids.extend_from_slice(tokens);
+        }
+        self.paged_verify_ragged_taped_wave(
+            &ragged_rows,
+            WaveTokenIds::Host(&token_ids),
+            tap_visit_indices,
+            logits_output,
+        )
+    }
+
+    /// Zero-sync device-resident ragged verify forward (`[sum(query_len)]` Int32 `verify_ids`).
+    /// Feeds `verify_ids` directly to `embed_tokens.forward` without GPU->CPU materialization.
+    /// When `greedy_argmax` is `true`, returns `[T]` Int32 argmax via `inkling2_lm_head_softcap_argmax`;
+    /// otherwise returns `[T, unpadded_vocab]` FP32 softcapped logits.
+    pub(crate) fn paged_verify_ragged_taped_device(
+        &mut self,
+        ragged_rows: &[PagedRaggedRow],
+        verify_ids: &MxArray,
+        tap_visit_indices: &[usize],
+        greedy_argmax: bool,
+    ) -> Result<(MxArray, Vec<MxArray>, Vec<Inkling2ShortConvTape>)> {
+        let total_len: usize = ragged_rows.iter().map(|r| r.query_len as usize).sum();
+        let arr_len = verify_ids.size()? as usize;
+        if total_len == 0 || arr_len != total_len {
+            return Err(Error::from_reason(format!(
+                "Inkling2Model::paged_verify_ragged_taped_device: verify_ids len {arr_len} != sum(query_len) {total_len}"
+            )));
+        }
+        let logits_output = if greedy_argmax {
+            LogitsOutput::GreedyArgmax
+        } else {
+            LogitsOutput::FullSoftcap
+        };
+        self.paged_verify_ragged_taped_wave(
+            ragged_rows,
+            WaveTokenIds::Device {
+                ids: verify_ids,
+                len: total_len,
+            },
+            tap_visit_indices,
+            logits_output,
+        )
+    }
+
+    fn paged_verify_ragged_taped_wave(
+        &mut self,
+        ragged_rows: &[PagedRaggedRow],
+        token_ids: WaveTokenIds<'_>,
+        tap_visit_indices: &[usize],
+        logits_output: LogitsOutput,
+    ) -> Result<(MxArray, Vec<MxArray>, Vec<Inkling2ShortConvTape>)> {
+        if ragged_rows.is_empty() {
+            return Err(Error::from_reason(
+                "Inkling2Model::paged_verify_ragged_taped requires at least one row",
+            ));
+        }
+        let mut positions = Vec::with_capacity(token_ids.len());
+        let mut seq_ids = Vec::with_capacity(ragged_rows.len());
+        let mut seq_q_lens = Vec::with_capacity(ragged_rows.len());
+        let mut cu_seqlens_q = Vec::with_capacity(ragged_rows.len() + 1);
+        cu_seqlens_q.push(0usize);
+
+        let mut seen = HashSet::with_capacity(ragged_rows.len());
+        for row in ragged_rows {
+            if !seen.insert(row.seq_id) {
+                return Err(Error::from_reason(format!(
+                    "Inkling2Model::paged_verify_ragged_taped: duplicate seq_id {}",
+                    row.seq_id
+                )));
+            }
+            if row.query_len == 0 {
+                return Err(Error::from_reason(
+                    "Inkling2Model::paged_verify_ragged_taped: empty query_len",
+                ));
+            }
             seq_ids.push(row.seq_id);
             seq_q_lens.push((row.seq_id, row.query_len));
-            token_ids.extend_from_slice(tokens);
             for offset in 0..row.query_len {
                 positions.push(
                     row.first_logical_position
@@ -1616,7 +1894,12 @@ impl Inkling2Inner {
                         .ok_or_else(|| Error::from_reason("verify position overflow"))?,
                 );
             }
-            cu_seqlens_q.push(token_ids.len());
+            cu_seqlens_q.push(positions.len());
+        }
+        if positions.len() != token_ids.len() {
+            return Err(Error::from_reason(
+                "Inkling2Model::paged_verify_ragged_taped: token length mismatch",
+            ));
         }
 
         {
@@ -1630,12 +1913,15 @@ impl Inkling2Inner {
 
         // Enable per-lane MPP verify on long-context Global layers (`first_pos >= 2048`) where
         // split-K + Apple10 `q8q` win; all 40 SWA layers (window 1024 <= 32 pages) and short
-        // Global layers run one-shot varlen `inkling2_paged_attention` (faster & AR-identical).
-        let use_mpp_verify = ragged_rows.iter().all(|r| {
-            r.query_len > 1
-                && r.query_len <= prefill_plan::VERIFY_ROWS
-                && r.first_logical_position >= 2048
-        }) && inkling2_paged_prefill_mpp_supported();
+        // Global layers run `inkling2_paged_attention` (faster & AR-identical).
+        //
+        // Eligibility is decided PER LANE (`any` here triggers per-lane dispatch on Global layers)
+        // so pairing a long-context lane with a short-context peer never alters either lane's
+        // attention kernel or INT8-query arithmetic!
+        let mpp_supported = inkling2_paged_prefill_mpp_supported();
+        let use_mpp_verify = ragged_rows
+            .iter()
+            .any(|r| lane_uses_mpp_verify(r, mpp_supported));
         let pages_per_split = device_pages_per_split();
         let int8_q_from = if self.activations == crate::transformer::Activations::Bf16 {
             None
@@ -1649,22 +1935,24 @@ impl Inkling2Inner {
             .collect();
 
         let (logits_opt, taps) = self.forward_paged_wave_inner(
-            &token_ids,
+            token_ids,
             None,
             &seq_ids,
             &positions,
             &cu_seqlens_q,
             &seq_q_lens,
             PagedWaveMode::RaggedVerify {
-                ragged_rows: &ragged_rows,
+                ragged_rows,
                 use_mpp_verify,
                 pages_per_split,
                 int8_q_from,
             },
             /* compute_logits */ true,
+            logits_output,
             /* last_only */ false,
             tap_visit_indices,
             Some(&mut tapes),
+            /* save_pre_wave_convs */ false,
         )?;
         let logits = logits_opt
             .ok_or_else(|| Error::from_reason("paged_verify_ragged_taped produced no logits"))?;
@@ -1700,8 +1988,8 @@ impl Inkling2Inner {
             if stop_token_ids.contains(&next_tok) || step + 1 == max_new_tokens {
                 break;
             }
-            let step_logits = self.paged_decode_step(seq_id, next_tok)?;
-            next_tok = step_logits.argmax(-1, Some(false))?.item_at_int32(0)? as u32;
+            let argmax = self.paged_decode_step_greedy(seq_id, next_tok)?;
+            next_tok = argmax.item_at_int32(0)? as u32;
             let pruned = self.settle_paged_step(seq_id)?;
             total_pruned = total_pruned.saturating_add(pruned);
             decode_steps += 1;
@@ -1726,25 +2014,6 @@ impl Inkling2Inner {
             swa_blocks_pruned: total_pruned,
         };
         Ok((generated, perf))
-    }
-
-    fn forward_paged_single_chunk(
-        &mut self,
-        seq_id: SeqId,
-        chunk: &[u32],
-        chunk_img: Option<&MxArray>,
-        first_pos: u32,
-        compute_last_logits: bool,
-    ) -> Result<Option<MxArray>> {
-        let (logits_opt, _) = self.forward_paged_single_chunk_with_taps(
-            seq_id,
-            chunk,
-            chunk_img,
-            first_pos,
-            compute_last_logits,
-            &[],
-        )?;
-        Ok(logits_opt)
     }
 
     pub(crate) fn forward_paged_single_chunk_with_taps(
@@ -1777,7 +2046,7 @@ impl Inkling2Inner {
         };
 
         self.forward_paged_wave_inner(
-            chunk,
+            WaveTokenIds::Host(chunk),
             chunk_img,
             &seq_ids,
             &positions,
@@ -1794,13 +2063,15 @@ impl Inkling2Inner {
                 int8_q_from,
             },
             compute_last_logits,
+            LogitsOutput::FullSoftcap,
             /* last_only */ true,
             tap_visit_indices,
             None,
+            /* save_pre_wave_convs */ true,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     fn forward_paged_wave(
         &mut self,
         token_ids: &[u32],
@@ -1814,7 +2085,7 @@ impl Inkling2Inner {
         tap_visit_indices: &[usize],
     ) -> Result<(MxArray, Vec<MxArray>)> {
         let (logits_opt, taps) = self.forward_paged_wave_inner(
-            token_ids,
+            WaveTokenIds::Host(token_ids),
             image_embeddings,
             seq_ids,
             positions,
@@ -1822,9 +2093,11 @@ impl Inkling2Inner {
             seq_q_lens,
             mode,
             /* compute_logits */ true,
+            LogitsOutput::FullSoftcap,
             last_only,
             tap_visit_indices,
             None,
+            /* save_pre_wave_convs */ true,
         )?;
         let logits = logits_opt
             .ok_or_else(|| Error::from_reason("forward_paged_wave produced no logits"))?;
@@ -1834,7 +2107,7 @@ impl Inkling2Inner {
     #[allow(clippy::too_many_arguments)]
     fn forward_paged_wave_inner(
         &mut self,
-        token_ids: &[u32],
+        token_ids: WaveTokenIds<'_>,
         image_embeddings: Option<&MxArray>,
         seq_ids: &[SeqId],
         positions: &[u32],
@@ -1842,17 +2115,26 @@ impl Inkling2Inner {
         seq_q_lens: &[(SeqId, u32)],
         mode: PagedWaveMode<'_>,
         compute_logits: bool,
+        logits_output: LogitsOutput,
         last_only: bool,
         tap_visit_indices: &[usize],
         mut conv_tapes: Option<&mut [Inkling2ShortConvTape]>,
+        save_pre_wave_convs: bool,
     ) -> Result<(Option<MxArray>, Vec<MxArray>)> {
         let act_dtype = DType::BFloat16;
         let t = token_ids.len();
-        let ids_i32: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
-        let ids_arr = MxArray::from_int32(&ids_i32, &[t as i64])?;
+        let ids_owned;
+        let ids_arr = match token_ids {
+            WaveTokenIds::Host(slice) => {
+                let ids_i32: Vec<i32> = slice.iter().map(|&id| id as i32).collect();
+                ids_owned = MxArray::from_int32(&ids_i32, &[t as i64])?;
+                &ids_owned
+            }
+            WaveTokenIds::Device { ids, .. } => ids,
+        };
 
         // 1. Token embeddings -> `embed_norm` -> BF16
-        let raw_emb = self.embed_tokens.forward(&ids_arr)?;
+        let raw_emb = self.embed_tokens.forward(ids_arr)?;
         let mut hidden = apply_sublayer_rms_norm(
             &raw_emb,
             &self.embed_norm,
@@ -1862,7 +2144,12 @@ impl Inkling2Inner {
 
         // 2. Overwrite IMAGE_PAD_ID positions AFTER `embed_norm`
         if let Some(img_emb) = image_embeddings {
-            let pad_positions: Vec<usize> = token_ids
+            let WaveTokenIds::Host(host_ids) = token_ids else {
+                return Err(Error::from_reason(
+                    "Inkling2 paged forward: image_embeddings require host token_ids",
+                ));
+            };
+            let pad_positions: Vec<usize> = host_ids
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, &tok)| (tok == IMAGE_PAD_ID).then_some(idx))
@@ -1929,6 +2216,9 @@ impl Inkling2Inner {
                 } => {
                     let mut max_floats = 0u64;
                     for r in ragged_rows {
+                        if !lane_uses_mpp_verify(r, true) {
+                            continue;
+                        }
                         let splits_needed = prefill_plan::splits(
                             Pass::Verify,
                             r.query_len,
@@ -1943,7 +2233,11 @@ impl Inkling2Inner {
                         );
                         max_floats = max_floats.max(floats);
                     }
-                    Some(MxArray::zeros(&[max_floats as i64], Some(DType::Float32))?)
+                    if max_floats > 0 {
+                        Some(MxArray::zeros(&[max_floats as i64], Some(DType::Float32))?)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -1979,15 +2273,21 @@ impl Inkling2Inner {
 
         // Extract active sequences' 48-visit ShortConv states ONCE before the 48-visit loop
         // (eliminates 48 x N `HashMap::remove` + `HashMap::insert` per decode/verify step!).
-        // Keep lightweight handle clones so a mid-wave error restores pre-wave state cleanly.
+        // Clone `pre_wave_convs` ONLY when requested (skipped on non-speculative AR decode and
+        // on taped verify where `conv_tapes` already holds every visited stream's `hist_before`).
         let mut active_convs: Vec<(SeqId, Inkling2ShortConvState)> =
             Vec::with_capacity(seq_ids.len());
-        let mut pre_wave_convs: Vec<(SeqId, Inkling2ShortConvState)> =
-            Vec::with_capacity(seq_ids.len());
+        let mut pre_wave_convs: Vec<(SeqId, Inkling2ShortConvState)> = if save_pre_wave_convs {
+            Vec::with_capacity(seq_ids.len())
+        } else {
+            Vec::new()
+        };
         for &sid in seq_ids {
             match rt.conv_states.remove(&sid) {
                 Some(st) => {
-                    pre_wave_convs.push((sid, st.clone()));
+                    if save_pre_wave_convs {
+                        pre_wave_convs.push((sid, st.clone()));
+                    }
                     active_convs.push((sid, st));
                 }
                 None => {
@@ -2171,8 +2471,17 @@ impl Inkling2Inner {
             for (sid, st) in active_convs {
                 rt.conv_states.insert(sid, st);
             }
-        } else {
+        } else if save_pre_wave_convs {
             for (sid, st) in pre_wave_convs {
+                rt.conv_states.insert(sid, st);
+            }
+        } else if let Some(all_tapes) = conv_tapes.as_deref() {
+            for ((sid, mut st), tape) in active_convs.into_iter().zip(all_tapes.iter()) {
+                let _ = tape.commit_prefix(0, &mut st);
+                rt.conv_states.insert(sid, st);
+            }
+        } else {
+            for (sid, st) in active_convs {
                 rt.conv_states.insert(sid, st);
             }
         }
@@ -2186,6 +2495,7 @@ impl Inkling2Inner {
             last_only,
             capture_final_norm,
             compute_logits,
+            logits_output,
             act_dtype,
         )?;
         if let Some(norm_all) = final_norm_opt {
@@ -2443,6 +2753,259 @@ fn forward_physical_layer_paged(
     Ok(())
 }
 
+/// Dispatch Inkling2 paged attention (single prefill/decode, per-lane MPP/varlen ragged verify,
+/// or varlen decode) over already-written KV pools.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_paged_attention_kernel(
+    q_cur: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    rel_bias: &MxArray,
+    group_meta: &GroupAttentionMeta,
+    kv_dtype: Inkling2KvDtype,
+    mode: &PagedWaveMode<'_>,
+    cu_seqlens_q: &[usize],
+    is_local: bool,
+    sliding_window: usize,
+    rel_extent: usize,
+    page_block_size: u32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mpp_workspace: Option<&mut MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let swa_i32 = if is_local { sliding_window as i32 } else { 0 };
+    let rel_extent_i32 = rel_extent as i32;
+    let bs_i32 = page_block_size as i32;
+    let n_q_i32 = num_heads as i32;
+    let n_kv_i32 = num_kv_heads as i32;
+    let hd_i32 = head_dim as i32;
+
+    match (mode, mpp_workspace) {
+        (
+            PagedWaveMode::Single {
+                first_pos,
+                rows,
+                use_mpp_prefill: true,
+                mpp_pass,
+                pages_per_split,
+                int8_q_from,
+                ..
+            },
+            Some(ws),
+        ) => {
+            let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
+                Error::from_reason("Inkling2 paged prefill: missing 1D block_table")
+            })?;
+            let active_history = if is_local {
+                (*first_pos).min((sliding_window as u32).saturating_sub(1))
+            } else {
+                *first_pos
+            };
+            let splits = prefill_plan::splits(*mpp_pass, *rows, active_history, *pages_per_split);
+            let use_int8_q = !is_local
+                && kv_dtype == Inkling2KvDtype::Int8
+                && int8_q_from.is_some_and(|from| *first_pos >= from);
+            let (out, lse, ws_next) = inkling2_paged_prefill_attention(
+                q_cur,
+                k_pool,
+                v_pool,
+                k_scale,
+                v_scale,
+                bt_1d,
+                ws,
+                Some(rel_bias),
+                *first_pos as i32,
+                splits as i32,
+                mpp_pass.max_splits() as i32,
+                bs_i32,
+                n_q_i32,
+                n_kv_i32,
+                hd_i32,
+                swa_i32,
+                rel_extent_i32,
+                kv_dtype,
+                use_int8_q,
+                scale,
+            )?;
+            *ws = ws_next;
+            Ok((out, lse))
+        }
+        (
+            PagedWaveMode::RaggedVerify {
+                ragged_rows,
+                use_mpp_verify: true,
+                pages_per_split,
+                int8_q_from,
+            },
+            Some(ws),
+        ) if !is_local => {
+            if ragged_rows.len() == 1 {
+                let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
+                    Error::from_reason("Inkling2 paged verify: missing 1D block_table")
+                })?;
+                let r0 = ragged_rows[0];
+                let splits = prefill_plan::splits(
+                    Pass::Verify,
+                    r0.query_len,
+                    r0.first_logical_position,
+                    *pages_per_split,
+                );
+                let use_int8_q = kv_dtype == Inkling2KvDtype::Int8
+                    && int8_q_from.is_some_and(|from| r0.first_logical_position >= from);
+                let (out, lse, ws_next) = inkling2_paged_prefill_attention(
+                    q_cur,
+                    k_pool,
+                    v_pool,
+                    k_scale,
+                    v_scale,
+                    bt_1d,
+                    ws,
+                    Some(rel_bias),
+                    r0.first_logical_position as i32,
+                    splits as i32,
+                    Pass::Verify.max_splits() as i32,
+                    bs_i32,
+                    n_q_i32,
+                    n_kv_i32,
+                    hd_i32,
+                    swa_i32,
+                    rel_extent_i32,
+                    kv_dtype,
+                    use_int8_q,
+                    scale,
+                )?;
+                *ws = ws_next;
+                Ok((out, lse))
+            } else {
+                // Dispatch each lane independently on Global layers so MPP-eligible lanes run
+                // the exact same `inkling2_paged_prefill_attention` (`Pass::Verify`, including
+                // `use_int8_q`) as when solo, while non-MPP peer lanes run `inkling2_paged_attention`
+                // identically to solo execution without forcing long-context peers onto fallback!
+                let ws_len = ws.shape()?[0];
+                let mut lane_outs = Vec::with_capacity(ragged_rows.len());
+                let mut lane_lses = Vec::with_capacity(ragged_rows.len());
+                let rb_ext = rel_bias.shape()?[2];
+                let mut shared_ws_used = false;
+                for (lane_idx, r) in ragged_rows.iter().enumerate() {
+                    let row_start = cu_seqlens_q[lane_idx] as i64;
+                    let row_end = cu_seqlens_q[lane_idx + 1] as i64;
+                    let q_lane = q_cur.slice(
+                        &[row_start, 0, 0],
+                        &[row_end, num_heads as i64, head_dim as i64],
+                    )?;
+                    let rb_lane =
+                        rel_bias.slice(&[row_start, 0, 0], &[row_end, num_heads as i64, rb_ext])?;
+                    let (out_l, lse_l) = if lane_uses_mpp_verify(r, true) {
+                        let bt_1d = &group_meta.per_seq_block_tables_1d[lane_idx];
+                        let splits = prefill_plan::splits(
+                            Pass::Verify,
+                            r.query_len,
+                            r.first_logical_position,
+                            *pages_per_split,
+                        );
+                        let use_int8_q = kv_dtype == Inkling2KvDtype::Int8
+                            && int8_q_from.is_some_and(|from| r.first_logical_position >= from);
+                        let lane_ws_owned;
+                        let lane_ws_ref = if !shared_ws_used {
+                            &*ws
+                        } else {
+                            lane_ws_owned = MxArray::zeros(&[ws_len], Some(DType::Float32))?;
+                            &lane_ws_owned
+                        };
+                        let (out_l, lse_l, ws_next) = inkling2_paged_prefill_attention(
+                            &q_lane,
+                            k_pool,
+                            v_pool,
+                            k_scale,
+                            v_scale,
+                            bt_1d,
+                            lane_ws_ref,
+                            Some(&rb_lane),
+                            r.first_logical_position as i32,
+                            splits as i32,
+                            Pass::Verify.max_splits() as i32,
+                            bs_i32,
+                            n_q_i32,
+                            n_kv_i32,
+                            hd_i32,
+                            swa_i32,
+                            rel_extent_i32,
+                            kv_dtype,
+                            use_int8_q,
+                            scale,
+                        )?;
+                        if !shared_ws_used {
+                            *ws = ws_next;
+                            shared_ws_used = true;
+                        }
+                        (out_l, lse_l)
+                    } else {
+                        let bt_1d = &group_meta.per_seq_block_tables_1d[lane_idx];
+                        let bt_lane = bt_1d.reshape(&[1, bt_1d.shape()?[0]])?;
+                        let sl_lane = MxArray::from_int32(
+                            &[(r.first_logical_position + r.query_len) as i32],
+                            &[1],
+                        )?;
+                        let cu_lane = MxArray::from_int32(&[0, r.query_len as i32], &[2])?;
+                        inkling2_paged_attention(
+                            &q_lane,
+                            k_pool,
+                            v_pool,
+                            &bt_lane,
+                            &sl_lane,
+                            &cu_lane,
+                            k_scale,
+                            v_scale,
+                            Some(&rb_lane),
+                            scale,
+                            swa_i32,
+                            rel_extent_i32,
+                            bs_i32,
+                            n_q_i32,
+                            n_kv_i32,
+                            hd_i32,
+                            kv_dtype,
+                            None,
+                        )?
+                    };
+                    lane_outs.push(out_l);
+                    lane_lses.push(lse_l);
+                }
+                let out_refs: Vec<&MxArray> = lane_outs.iter().collect();
+                let lse_refs: Vec<&MxArray> = lane_lses.iter().collect();
+                Ok((
+                    MxArray::concatenate_many(out_refs, Some(0))?,
+                    MxArray::concatenate_many(lse_refs, Some(0))?,
+                ))
+            }
+        }
+        _ => inkling2_paged_attention(
+            q_cur,
+            k_pool,
+            v_pool,
+            &group_meta.block_table_2d,
+            &group_meta.seq_lens,
+            &group_meta.cu_seqlens_q,
+            k_scale,
+            v_scale,
+            Some(rel_bias),
+            scale,
+            swa_i32,
+            rel_extent_i32,
+            bs_i32,
+            n_q_i32,
+            n_kv_i32,
+            hd_i32,
+            kv_dtype,
+            None,
+        ),
+    }
+}
+
 /// Paged self-attention using Stage 2 fused Metal kernels (`inkling2_qr_clip`,
 /// `inkling2_sconv_k4_kv_prep`, `inkling2_paged_prefill_attention` / `inkling2_paged_attention`,
 /// strided `inkling2_gate_sink`, and `inkling2_sconv_k4_ragged` with optional FP32 residual epilogue).
@@ -2474,21 +3037,23 @@ fn forward_attention_paged(
 
     // 2. Global dynamic ShortConv tap projections (only on the 8 Global visits)
     let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
+    let dense_bf16 = matches!(
+        attn.q_proj,
+        crate::models::quantized_linear::LinearProj::Standard(_)
+    );
     let dyn_k = if let Some(ref k_cp) = attn.k_conv_proj {
-        Some(k_cp.forward(x_k_inp)?.reshape(&[
-            t_i64,
-            attn.num_kv_heads as i64,
-            attn.k_conv.shape()?[1],
-        ])?)
+        Some(
+            super::attention::forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?
+                .reshape(&[t_i64, attn.num_kv_heads as i64, attn.k_conv.shape()?[1]])?,
+        )
     } else {
         None
     };
     let dyn_v = if let Some(ref v_cp) = attn.v_conv_proj {
-        Some(v_cp.forward(x_v_inp)?.reshape(&[
-            t_i64,
-            attn.num_kv_heads as i64,
-            attn.v_conv.shape()?[1],
-        ])?)
+        Some(
+            super::attention::forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?
+                .reshape(&[t_i64, attn.num_kv_heads as i64, attn.v_conv.shape()?[1]])?,
+        )
     } else {
         None
     };
@@ -2679,230 +3244,33 @@ fn forward_attention_paged(
         .scale_pool_arrays(phys_layer_ord)
         .map_err(Error::from_reason)?;
 
-    let scale = 1.0_f32 / (attn.head_dim as f32).sqrt();
-    let swa_i32 = if attn.is_local {
-        attn.sliding_window as i32
-    } else {
-        0
-    };
-    let rel_extent_i32 = attn.rel_extent as i32;
-    let bs_i32 = page_block_size as i32;
-    let n_q_i32 = attn.num_heads as i32;
-    let n_kv_i32 = attn.num_kv_heads as i32;
-    let hd_i32 = attn.head_dim as i32;
-
-    let (attn_o, lse) = match (mode, mpp_workspace) {
-        (
-            PagedWaveMode::Single {
-                first_pos,
-                rows,
-                use_mpp_prefill: true,
-                mpp_pass,
-                pages_per_split,
-                int8_q_from,
-                ..
-            },
-            Some(ws),
-        ) => {
-            let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
-                Error::from_reason("Inkling2 paged prefill: missing 1D block_table")
-            })?;
-            let active_history = if attn.is_local {
-                (*first_pos).min((attn.sliding_window as u32).saturating_sub(1))
-            } else {
-                *first_pos
-            };
-            let splits = prefill_plan::splits(*mpp_pass, *rows, active_history, *pages_per_split);
-            let use_int8_q = !attn.is_local
-                && kv_dtype == Inkling2KvDtype::Int8
-                && int8_q_from.is_some_and(|from| *first_pos >= from);
-            let (out, lse, ws_next) = inkling2_paged_prefill_attention(
-                &q_cur,
-                &k_pool,
-                &v_pool,
-                &k_scale,
-                &v_scale,
-                bt_1d,
-                ws,
-                Some(&rel_bias),
-                *first_pos as i32,
-                splits as i32,
-                mpp_pass.max_splits() as i32,
-                bs_i32,
-                n_q_i32,
-                n_kv_i32,
-                hd_i32,
-                swa_i32,
-                rel_extent_i32,
-                kv_dtype,
-                use_int8_q,
-                scale,
-            )?;
-            *ws = ws_next;
-            (out, lse)
-        }
-        (
-            PagedWaveMode::RaggedVerify {
-                ragged_rows,
-                use_mpp_verify: true,
-                pages_per_split,
-                int8_q_from,
-            },
-            Some(ws),
-        ) if !attn.is_local => {
-            // Run `inkling2_paged_prefill_attention` (`Pass::Verify`) PER LANE so every lane in a
-            // 2..=4 lane stacked `[N * 8]` wave executes the exact same attention kernel & split
-            // schedule as running solo (bit-exact!), while all dense Q8_0 and NVFP4 MoE
-            // projections remain stacked `[N * 8, 2304]`.
-            if ragged_rows.len() == 1 {
-                let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
-                    Error::from_reason("Inkling2 paged verify: missing 1D block_table")
-                })?;
-                let r0 = ragged_rows[0];
-                let active_history = if attn.is_local {
-                    r0.first_logical_position
-                        .min((attn.sliding_window as u32).saturating_sub(1))
-                } else {
-                    r0.first_logical_position
-                };
-                let splits = prefill_plan::splits(
-                    Pass::Verify,
-                    r0.query_len,
-                    active_history,
-                    *pages_per_split,
-                );
-                let use_int8_q = !attn.is_local
-                    && kv_dtype == Inkling2KvDtype::Int8
-                    && int8_q_from.is_some_and(|from| r0.first_logical_position >= from);
-                let (out, lse, ws_next) = inkling2_paged_prefill_attention(
-                    &q_cur,
-                    &k_pool,
-                    &v_pool,
-                    &k_scale,
-                    &v_scale,
-                    bt_1d,
-                    ws,
-                    Some(&rel_bias),
-                    r0.first_logical_position as i32,
-                    splits as i32,
-                    Pass::Verify.max_splits() as i32,
-                    bs_i32,
-                    n_q_i32,
-                    n_kv_i32,
-                    hd_i32,
-                    swa_i32,
-                    rel_extent_i32,
-                    kv_dtype,
-                    use_int8_q,
-                    scale,
-                )?;
-                *ws = ws_next;
-                (out, lse)
-            } else {
-                // Allocate independent per-lane MPP workspaces so all N lanes run without
-                // artificial cross-lane write-after-read serialization on a shared workspace!
-                let ws_len = ws.shape()?[0];
-                let mut lane_outs = Vec::with_capacity(ragged_rows.len());
-                let mut lane_lses = Vec::with_capacity(ragged_rows.len());
-                let rb_ext = rel_bias.shape()?[2];
-                for (lane_idx, r) in ragged_rows.iter().enumerate() {
-                    let row_start = cu_seqlens_q[lane_idx] as i64;
-                    let row_end = cu_seqlens_q[lane_idx + 1] as i64;
-                    let q_lane = q_cur.slice(
-                        &[row_start, 0, 0],
-                        &[row_end, attn.num_heads as i64, attn.head_dim as i64],
-                    )?;
-                    let rb_lane = rel_bias.slice(
-                        &[row_start, 0, 0],
-                        &[row_end, attn.num_heads as i64, rb_ext],
-                    )?;
-                    let bt_1d = &group_meta.per_seq_block_tables_1d[lane_idx];
-                    let active_history = if attn.is_local {
-                        r.first_logical_position
-                            .min((attn.sliding_window as u32).saturating_sub(1))
-                    } else {
-                        r.first_logical_position
-                    };
-                    let splits = prefill_plan::splits(
-                        Pass::Verify,
-                        r.query_len,
-                        active_history,
-                        *pages_per_split,
-                    );
-                    let use_int8_q = !attn.is_local
-                        && kv_dtype == Inkling2KvDtype::Int8
-                        && int8_q_from.is_some_and(|from| r.first_logical_position >= from);
-                    let lane_ws_owned;
-                    let lane_ws_ref = if lane_idx == 0 {
-                        &*ws
-                    } else {
-                        lane_ws_owned = MxArray::zeros(&[ws_len], Some(DType::Float32))?;
-                        &lane_ws_owned
-                    };
-                    let (out_l, lse_l, ws_next) = inkling2_paged_prefill_attention(
-                        &q_lane,
-                        &k_pool,
-                        &v_pool,
-                        &k_scale,
-                        &v_scale,
-                        bt_1d,
-                        lane_ws_ref,
-                        Some(&rb_lane),
-                        r.first_logical_position as i32,
-                        splits as i32,
-                        Pass::Verify.max_splits() as i32,
-                        bs_i32,
-                        n_q_i32,
-                        n_kv_i32,
-                        hd_i32,
-                        swa_i32,
-                        rel_extent_i32,
-                        kv_dtype,
-                        use_int8_q,
-                        scale,
-                    )?;
-                    if lane_idx == 0 {
-                        *ws = ws_next;
-                    }
-                    lane_outs.push(out_l);
-                    lane_lses.push(lse_l);
-                }
-                let out_refs: Vec<&MxArray> = lane_outs.iter().collect();
-                let lse_refs: Vec<&MxArray> = lane_lses.iter().collect();
-                (
-                    MxArray::concatenate_many(out_refs, Some(0))?,
-                    MxArray::concatenate_many(lse_refs, Some(0))?,
-                )
-            }
-        }
-        _ => inkling2_paged_attention(
-            &q_cur,
-            &k_pool,
-            &v_pool,
-            &group_meta.block_table_2d,
-            &group_meta.seq_lens,
-            &group_meta.cu_seqlens_q,
-            &k_scale,
-            &v_scale,
-            Some(&rel_bias),
-            scale,
-            swa_i32,
-            rel_extent_i32,
-            bs_i32,
-            n_q_i32,
-            n_kv_i32,
-            hd_i32,
-            kv_dtype,
-            None,
-        )?,
-    };
+    let (attn_o, lse) = dispatch_paged_attention_kernel(
+        &q_cur,
+        &k_pool,
+        &v_pool,
+        &k_scale,
+        &v_scale,
+        &rel_bias,
+        group_meta,
+        kv_dtype,
+        mode,
+        cu_seqlens_q,
+        attn.is_local,
+        attn.sliding_window,
+        attn.rel_extent,
+        page_block_size,
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        mpp_workspace,
+    )?;
 
     // 8. Fused Gate + Sink epilogue: `Y = O * sigmoid(gate) * sigmoid(lse - sink)`
     let y_3d = inkling2_gate_sink(&attn_o, &gate_raw, &lse, &sink_raw)?;
     let y = y_3d.reshape(&[t_i64, q_dim])?;
 
     // 9. Output projection + fused static `attn_post_conv` (+ optional FP32 residual epilogue)
-    let proj_out = attn.o_proj.forward(&y)?;
+    let proj_out = super::attention::forward_linear_proj_fast(&attn.o_proj, &y)?;
     if visit_convs.len() == 1 {
         let mut hists = [&mut visit_convs[0].attn_post];
         match visit_tapes {
@@ -3975,9 +4343,8 @@ mod tests {
     use crate::transformer::kv_cache::KvFormat;
     use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
 
+    use super::super::persistence::test_real_model_path;
     use super::*;
-
-    const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
 
     fn decode_and_parse(
         tokenizer: &Qwen3Tokenizer,
@@ -4025,10 +4392,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "loads real ~18 GB Inkling-2-Mini GGUF model from disk"]
     async fn inkling2_paged_vs_flat_parity() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(
             model_dir.exists(),
-            "Real model directory missing: {}",
+            "Real model path missing: {}",
             model_dir.display()
         );
 
@@ -4036,7 +4404,7 @@ mod tests {
         // Start with default INT8 32-token KTM config (sized for 4096 tokens so switching formats
         // during the test stays fast and lightweight in memory).
         let mut model = load_from_dir_with_paged_config(
-            REAL_MODEL_DIR,
+            &model_path,
             Some(Inkling2PagedConfig {
                 kv_format: KvFormat::Int8,
                 block_size: 32,
@@ -4910,5 +5278,314 @@ mod stream_emitter_tests {
             assert!(!streamed_content.contains("get_weather"));
             assert!(!streamed_content.contains("Tokyo"));
         }
+    }
+}
+
+#[cfg(test)]
+mod mpp_verify_tests {
+    use super::*;
+
+    #[test]
+    fn lane_uses_mpp_verify_checks_position_and_query_len_bounds() {
+        let short = PagedRaggedRow {
+            seq_id: 1,
+            first_logical_position: 2047,
+            query_len: 4,
+        };
+        let long = PagedRaggedRow {
+            seq_id: 2,
+            first_logical_position: 2048,
+            query_len: 4,
+        };
+        let decode_one = PagedRaggedRow {
+            seq_id: 3,
+            first_logical_position: 8192,
+            query_len: 1,
+        };
+        let too_wide = PagedRaggedRow {
+            seq_id: 4,
+            first_logical_position: 8192,
+            query_len: prefill_plan::VERIFY_ROWS + 1,
+        };
+        assert!(!lane_uses_mpp_verify(&short, true));
+        assert!(lane_uses_mpp_verify(&long, true));
+        assert!(!lane_uses_mpp_verify(&long, false));
+        assert!(!lane_uses_mpp_verify(&decode_one, true));
+        assert!(!lane_uses_mpp_verify(&too_wide, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mixed_context_ragged_verify_matches_solo_bit_exact() {
+        use std::sync::{Arc, Mutex};
+
+        use mlx_paged_attn::metal::MetalDtype;
+        use mlx_paged_attn::{BlockAllocator, LayerKVPool, PageLayout, PagedAttentionConfig};
+
+        if !unsafe { mlx_sys::mlx_metal_is_available() } || !inkling2_paged_prefill_mpp_supported()
+        {
+            return;
+        }
+
+        let block_size = 32usize;
+        let num_q_heads = 24usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let rel_extent = 1024usize;
+        let long_pos = 7200u32; // >= 7168 (INT8-query MPP verify on Apple10)
+        let short_pos = 64u32; // < 2048 (non-MPP varlen paged attention)
+        let q_len = 4u32;
+
+        let total_long = (long_pos + q_len) as usize;
+        let total_short = (short_pos + q_len) as usize;
+        let num_blocks = ((total_long + total_short + 256) / block_size) as u32;
+        let cfg = PagedAttentionConfig {
+            block_size: block_size as u32,
+            gpu_memory_mb: 512,
+            head_size: head_dim as u32,
+            num_kv_heads: num_kv_heads as u32,
+            num_layers: 1,
+            max_seq_len: Some((total_long + total_short + 128) as u32),
+            max_batch_size: Some(4),
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks,
+            num_blocks,
+            block_size as u32,
+        )));
+        let pool = LayerKVPool::new_with_layout(
+            cfg,
+            num_blocks,
+            num_blocks,
+            MetalDtype::Int8,
+            PageLayout {
+                keys_token_major: true,
+                ..PageLayout::default()
+            },
+        )
+        .expect("pool");
+        let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size as u32)
+            .expect("adapter");
+
+        // Deterministic PRNG for non-trivial INT8 KV, queries, and relative bias.
+        let mut seed = 0x5EED_1234_u64;
+        let mut next_vec = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = ((seed >> 33) as f32) / ((1u64 << 31) as f32);
+                    (u * 2.0 - 1.0) * scale
+                })
+                .collect()
+        };
+
+        // Populate both sequences in the INT8 KTM paged KV cache (long_pos + q_len and short_pos + q_len).
+        let seq_long: SeqId = 1;
+        let seq_short: SeqId = 2;
+        for (sid, total) in [(seq_long, total_long), (seq_short, total_short)] {
+            let dummy_tokens: Vec<u32> = (0..total as u32).map(|i| i + sid * 100_000).collect();
+            adapter.begin_request(sid).expect("begin_request");
+            adapter
+                .record_tokens_for(sid, &dummy_tokens)
+                .expect("record_tokens_for");
+            // Write KV in 512-token chunks to keep allocation tiny.
+            let mut offset = 0usize;
+            while offset < total {
+                let chunk = (total - offset).min(512);
+                let k = MxArray::from_float32(
+                    &next_vec(chunk * num_kv_heads * head_dim, 0.35),
+                    &[chunk as i64, num_kv_heads as i64, head_dim as i64],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                let v = MxArray::from_float32(
+                    &next_vec(chunk * num_kv_heads * head_dim, 0.35),
+                    &[chunk as i64, num_kv_heads as i64, head_dim as i64],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                adapter
+                    .update_keys_values_native_recorded(0, &k, &v, offset as u32, 0)
+                    .expect("write kv");
+                offset += chunk;
+            }
+        }
+
+        let k_pool = adapter.key_pool_array(0).expect("k_pool");
+        let v_pool = adapter.value_pool_array(0).expect("v_pool");
+        let (k_scale, v_scale) = adapter.scale_pool_arrays(0).expect("scales");
+
+        let q_long = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * head_dim, 0.5),
+            &[q_len as i64, num_q_heads as i64, head_dim as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let q_short = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * head_dim, 0.5),
+            &[q_len as i64, num_q_heads as i64, head_dim as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let rb_long = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * rel_extent, 0.25),
+            &[q_len as i64, num_q_heads as i64, rel_extent as i64],
+        )
+        .unwrap();
+        let rb_short = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * rel_extent, 0.25),
+            &[q_len as i64, num_q_heads as i64, rel_extent as i64],
+        )
+        .unwrap();
+
+        let row_long = PagedRaggedRow {
+            seq_id: seq_long,
+            first_logical_position: long_pos,
+            query_len: q_len,
+        };
+        let row_short = PagedRaggedRow {
+            seq_id: seq_short,
+            first_logical_position: short_pos,
+            query_len: q_len,
+        };
+        let pages_per_split = device_pages_per_split();
+        let int8_q_from = device_int8_query_from();
+
+        let make_ws = |rows: &[PagedRaggedRow]| -> Option<MxArray> {
+            let mut max_floats = 0u64;
+            for r in rows {
+                if !lane_uses_mpp_verify(r, true) {
+                    continue;
+                }
+                let splits = prefill_plan::splits(
+                    Pass::Verify,
+                    r.query_len,
+                    r.first_logical_position,
+                    pages_per_split,
+                );
+                let floats = prefill_plan::workspace_floats(
+                    r.query_len,
+                    splits,
+                    num_q_heads as u32,
+                    head_dim as u32,
+                );
+                max_floats = max_floats.max(floats);
+            }
+            (max_floats > 0)
+                .then(|| MxArray::zeros(&[max_floats as i64], Some(DType::Float32)).unwrap())
+        };
+
+        let run_case =
+            |rows: &[PagedRaggedRow], q: &MxArray, rb: &MxArray| -> (Vec<f32>, Vec<f32>) {
+                let seq_q_lens: Vec<(SeqId, u32)> =
+                    rows.iter().map(|r| (r.seq_id, r.query_len)).collect();
+                let mut cu = vec![0usize];
+                for r in rows {
+                    cu.push(cu.last().copied().unwrap_or(0) + r.query_len as usize);
+                }
+                let meta = build_group_attention_meta(&adapter, &seq_q_lens).expect("meta");
+                let use_mpp = rows.iter().any(|r| lane_uses_mpp_verify(r, true));
+                let mut ws = if use_mpp { make_ws(rows) } else { None };
+                let mode = PagedWaveMode::RaggedVerify {
+                    ragged_rows: rows,
+                    use_mpp_verify: use_mpp,
+                    pages_per_split,
+                    int8_q_from,
+                };
+                let (out, lse) = dispatch_paged_attention_kernel(
+                    q,
+                    &k_pool,
+                    &v_pool,
+                    &k_scale,
+                    &v_scale,
+                    rb,
+                    &meta,
+                    Inkling2KvDtype::Int8,
+                    &mode,
+                    &cu,
+                    false, // Global layer
+                    0,
+                    rel_extent,
+                    block_size as u32,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    ws.as_mut(),
+                )
+                .expect("dispatch_paged_attention_kernel");
+                (
+                    out.astype(DType::Float32)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap()
+                        .to_vec(),
+                    lse.astype(DType::Float32)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap()
+                        .to_vec(),
+                )
+            };
+
+        let (solo_long_o, solo_long_lse) = run_case(&[row_long], &q_long, &rb_long);
+        let (solo_short_o, solo_short_lse) = run_case(&[row_short], &q_short, &rb_short);
+
+        // Mixed wave: [long, short]
+        let q_ls = MxArray::concatenate(&q_long, &q_short, 0).unwrap();
+        let rb_ls = MxArray::concatenate(&rb_long, &rb_short, 0).unwrap();
+        let (mix_ls_o, mix_ls_lse) = run_case(&[row_long, row_short], &q_ls, &rb_ls);
+        let o_lane_len = solo_long_o.len();
+        let lse_lane_len = solo_long_lse.len();
+        assert_eq!(
+            &mix_ls_o[..o_lane_len],
+            solo_long_o.as_slice(),
+            "long-context lane output must be bit-exact when paired with short-context peer [long, short]"
+        );
+        assert_eq!(
+            &mix_ls_lse[..lse_lane_len],
+            solo_long_lse.as_slice(),
+            "long-context lane LSE must be bit-exact when paired with short-context peer [long, short]"
+        );
+        assert_eq!(
+            &mix_ls_o[o_lane_len..],
+            solo_short_o.as_slice(),
+            "short-context lane output must be bit-exact when paired with long-context peer [long, short]"
+        );
+        assert_eq!(
+            &mix_ls_lse[lse_lane_len..],
+            solo_short_lse.as_slice(),
+            "short-context lane LSE must be bit-exact when paired with long-context peer [long, short]"
+        );
+
+        // Mixed wave reversed: [short, long] (exercises MPP workspace handoff when lane_idx > 0!)
+        let q_sl = MxArray::concatenate(&q_short, &q_long, 0).unwrap();
+        let rb_sl = MxArray::concatenate(&rb_short, &rb_long, 0).unwrap();
+        let (mix_sl_o, mix_sl_lse) = run_case(&[row_short, row_long], &q_sl, &rb_sl);
+        assert_eq!(
+            &mix_sl_o[..o_lane_len],
+            solo_short_o.as_slice(),
+            "short-context lane output must be bit-exact in [short, long]"
+        );
+        assert_eq!(
+            &mix_sl_lse[..lse_lane_len],
+            solo_short_lse.as_slice(),
+            "short-context lane LSE must be bit-exact in [short, long]"
+        );
+        assert_eq!(
+            &mix_sl_o[o_lane_len..],
+            solo_long_o.as_slice(),
+            "long-context lane output must be bit-exact in [short, long]"
+        );
+        assert_eq!(
+            &mix_sl_lse[lse_lane_len..],
+            solo_long_lse.as_slice(),
+            "long-context lane LSE must be bit-exact in [short, long]"
+        );
     }
 }

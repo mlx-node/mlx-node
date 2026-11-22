@@ -61,6 +61,7 @@ unsafe extern "C-unwind" {
         ndim: usize,
     ) -> *mut mlx_array;
     pub fn mlx_array_astype(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
+    pub fn mlx_array_view(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_hadamard_transform(input: *mut mlx_array, scale: f32) -> *mut mlx_array;
     pub fn mlx_array_copy(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_deep_copy(handle: *mut mlx_array) -> *mut mlx_array;
@@ -1438,6 +1439,26 @@ unsafe extern "C-unwind" {
         weight: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    /// Fused pair RMSNorm + exact-FP32 LoopController down projection (`[S, T, 2*D] @ [S, 2*D, R] -> [S, T, R]` FP32).
+    pub fn mlx_inkling2_loop_ctrl_down(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        down_w: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    /// Fused exact-FP32 LoopController up projection + no-FMA blend + sublayer RMSNorm -> `[S, T, D]` BF16/FP32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_loop_ctrl_up_blend_norm(
+        h: *mut mlx_array,
+        gain_forget_w: *mut mlx_array,
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        output_f32: bool,
+    ) -> *mut mlx_array;
+
     /// Fused Inkling2 multi-sequence ragged k=4 ShortConv + optional FP32 residual epilogue.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_sconv_k4_ragged(
@@ -1500,10 +1521,47 @@ unsafe extern "C-unwind" {
         out_latent: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Fused Inkling2 Q8_0 (group_size=32) folded Markov head + `fold_bias` + `base_logits` + softcap -> `[B, out_cols]` FP32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_markov_fold_softcap(
+        latent: *mut mlx_array,
+        fold_w: *mut mlx_array,
+        fold_scales: *mut mlx_array,
+        fold_biases: *mut mlx_array,
+        fold_bias: *mut mlx_array,
+        base_logits: *mut mlx_array,
+        out_cols: u32,
+        softcap: f32,
+    ) -> *mut mlx_array;
+
+    /// Fused Inkling2 Q8_0 (group_size=32) folded Markov head + `fold_bias` + `base_logits` + softcap + 2-stage GPU argmax -> `[B]` Int32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_markov_fold_softcap_argmax(
+        latent: *mut mlx_array,
+        fold_w: *mut mlx_array,
+        fold_scales: *mut mlx_array,
+        fold_biases: *mut mlx_array,
+        fold_bias: *mut mlx_array,
+        base_logits: *mut mlx_array,
+        out_cols: u32,
+        softcap: f32,
+    ) -> *mut mlx_array;
+
+    /// Coalesced single-pass BF16 linear `x [M, K] @ w [N, K]^T -> [M, N] BF16` (`1 <= M <= 32`, `K % 4 == 0`, 0-ULP batch-size invariant).
+    pub fn mlx_inkling2_bf16_linear(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    /// Fused single-pass BF16 `lm_head` + softcap + 2-stage GPU argmax -> `[M]` Int32 (`1 <= M <= 32`, `K % 4 == 0`, 0-ULP batch-size invariant).
+    pub fn mlx_inkling2_bf16_lm_head_softcap_argmax(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        out_cols: u32,
+        softcap: f32,
+    ) -> *mut mlx_array;
+
     /// Check whether Inkling2 grouped/fused NVFP4/Q8_0 MoE Metal kernels are available for `rows`.
     pub fn mlx_inkling2_grouped_moe_available(rows: u32) -> bool;
 
-    /// Grouped/fused Inkling2 NVFP4 or Q8_0 MoE (`group -> gather -> fused gate_up+SiTU -> down -> combine`).
+    /// Grouped/fused Inkling2 NVFP4 (`quant_mode=0`), Q8_0 (`quant_mode=1`), or MXFP8 (`quant_mode=2`) MoE.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_grouped_moe(
         x: *mut mlx_array,
@@ -1515,11 +1573,56 @@ unsafe extern "C-unwind" {
         dn_w: *mut mlx_array,
         dn_s: *mut mlx_array,
         dn_aux: *mut mlx_array,
-        is_q8: bool,
+        quant_mode: u32,
+        interleaved_gate_up: bool,
         gate_softcap: f32,
         up_softcap: f32,
         round_bf16_before_situ: bool,
     ) -> *mut mlx_array;
+
+    /// End-to-end fused `T <= 32` Inkling2 MoE:
+    /// `route+group -> direct-gather gate_up+SiTU -> down -> combine+post_conv+residual (+ optional tape)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_grouped_moe_fused(
+        x: *mut mlx_array,
+        router_logits: *mut mlx_array,
+        router_bias: *mut mlx_array,
+        down_outer_scale: *mut mlx_array,
+        gu_w: *mut mlx_array,
+        gu_s: *mut mlx_array,
+        gu_aux: *mut mlx_array,
+        dn_w: *mut mlx_array,
+        dn_s: *mut mlx_array,
+        dn_aux: *mut mlx_array,
+        post_conv_w: *mut mlx_array,
+        residual: *mut mlx_array,
+        cu_seqlens_host: *const i32,
+        cu_seqlens_len: u32,
+        hists: *const *mut mlx_array,
+        num_hists: u32,
+        num_seqs: u32,
+        packed_hist: bool,
+        top_k: u32,
+        route_scale: f32,
+        quant_mode: u32,
+        interleaved_gate_up: bool,
+        gate_softcap: f32,
+        up_softcap: f32,
+        round_bf16_before_situ: bool,
+        emit_tape: bool,
+        out_y: *mut *mut mlx_array,
+        out_history: *mut *mut mlx_array,
+        out_tape: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Resolved `MLX_INKLING2_ATTN_RES_VEC4_MAX_T` threshold used by `mlx_inkling2_block_attn_res`.
+    pub fn mlx_inkling2_attn_res_vec4_max_t() -> u32;
+    /// Resolved `MLX_INKLING2_MOE_MODE` (`0` = default, `1` = off, `2` = grouped_only).
+    pub fn mlx_inkling2_moe_mode() -> u32;
+    /// Resolved `MLX_INKLING2_MOE_MAX_ROWS` threshold used by `mlx_inkling2_grouped_moe_available`.
+    pub fn mlx_inkling2_moe_max_rows() -> u32;
+    /// Resolved `MLX_INKLING2_MOE_COL_CUTOFF` override (`-1` = default, else explicit override).
+    pub fn mlx_inkling2_moe_col_cutoff_override() -> i32;
 
     /// Reset/read the in-place prefill attention launch probe (counted at
     /// every dispatch). `kind` 0 counts prefill launches, 1 verify launches,

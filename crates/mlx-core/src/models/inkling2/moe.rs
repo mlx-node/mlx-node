@@ -1,10 +1,44 @@
 use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::{DType, MxArray};
-use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, NVFP4_MODE, QuantizedSwitchLinear};
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_MODE, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear,
+};
 use crate::nn::Activations;
 
+use super::kernels::Inkling2MoeQuantMode;
 use super::short_conv::{VisitShortConvState, static_short_conv};
+
+/// Min/max token batch size `T` that uses the custom coalesced exact-FP32 MoE router kernel.
+/// Shared between forward dispatch and SSD cache fingerprinting.
+#[inline]
+pub(crate) fn moe_router_proj_range() -> (i64, i64) {
+    static RANGE: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let min_t = std::env::var("MLX_INKLING2_ROUTER_MIN_T")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(1);
+        let max_t = std::env::var("MLX_INKLING2_ROUTER_MAX_T")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(1024);
+        (min_t, max_t)
+    })
+}
+
+/// Whether the end-to-end fused `T <= 32` MoE + post_conv + residual Metal fast path is enabled.
+/// Shared between forward dispatch and SSD cache fingerprinting.
+#[inline]
+pub(crate) fn moe_fused_enabled() -> bool {
+    static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FUSED.get_or_init(|| {
+        !matches!(
+            std::env::var("MLX_INKLING2_MOE_FUSED").as_deref(),
+            Ok("0" | "off" | "false")
+        )
+    })
+}
 
 /// Expert projection backend: either packed quantized (`NVFP4`, `Q8_0` affine, K-quant, etc.)
 /// or dense FP/BF16 `[num_experts, out_features, in_features]`.
@@ -365,7 +399,7 @@ impl Inkling2MoE {
         mlp_post_histories: &mut [&mut MxArray],
         cu_seqlens_q: &[usize],
         cu_seqlens_arr: Option<&MxArray>,
-        mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
+        mut mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
     ) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 2 {
@@ -395,7 +429,8 @@ impl Inkling2MoE {
         //    For `t <= 32` (M=1, M=4, M=8 verify, M=32 4-lane verify), use our coalesced
         //    exact-FP32 `inkling2_moe_router_proj` (cuts M=8 router from 2.36 ms -> 0.50 ms and
         //    keeps M=1 and M=8 router arithmetic bit-for-bit identical!).
-        let router_logits = if use_metal && t <= 32 && d % 4 == 0 {
+        let (router_min_t, router_max_t) = moe_router_proj_range();
+        let router_logits = if use_metal && t >= router_min_t && t <= router_max_t && d % 4 == 0 {
             super::kernels::inkling2_moe_router_proj(x, &self.router_weight_f32)?
         } else {
             let x_f32 = if act_dtype == DType::Float32 {
@@ -405,6 +440,24 @@ impl Inkling2MoE {
             };
             x_f32.matmul(&self.router_weight_t_f32)?
         };
+
+        // Pass B fused T <= 32 fast path: fuses `route+group`, kills `gather`, uses 16 MiB
+        // persistent workspace, and fuses `combine + ffn_post_conv + FP32 residual (+ optional
+        // ShortConvTape)` in a single Metal primitive!
+        if use_metal
+            && moe_fused_enabled()
+            && let Some(y) = self.try_grouped_moe_fused(
+                x,
+                &router_logits,
+                residual,
+                mlp_post_histories,
+                cu_seqlens_q,
+                mlp_post_tapes.as_deref_mut(),
+            )?
+        {
+            return Ok(y);
+        }
+
         let (top_k_indices, mut gamma, down_scale_folded) = if use_metal {
             let (idx, w) = super::kernels::inkling2_moe_route(
                 &router_logits,
@@ -554,7 +607,7 @@ impl Inkling2MoE {
         gamma: &MxArray,
         down_scale_folded: bool,
     ) -> Result<Option<MxArray>> {
-        if self.gate_up_interleaved || !down_scale_folded || x.dtype()? != DType::BFloat16 {
+        if !down_scale_folded || x.dtype()? != DType::BFloat16 {
             return Ok(None);
         }
         let shape = x.shape()?;
@@ -611,14 +664,33 @@ impl Inkling2MoE {
                         .get_biases()
                         .is_some_and(|b| b.dtype().ok() == Some(s_dt))
             };
-        if !is_nvfp4 && !is_q8 {
-            return Ok(None);
-        }
-
-        let (gu_aux, dn_aux) = if is_nvfp4 {
-            (gu.outer_scale(), None)
+        let is_mxfp8 = gu.mode() == MXFP8_MODE
+            && dn.mode() == MXFP8_MODE
+            && gu.bits() == 8
+            && dn.bits() == 8
+            && gu.group_size() == 32
+            && dn.group_size() == 32
+            && gu.get_scales().dtype()? == DType::Uint8
+            && dn.get_scales().dtype()? == DType::Uint8
+            && gu.outer_scale().is_none()
+            && dn.outer_scale().is_none()
+            && gu.get_biases().is_none()
+            && dn.get_biases().is_none()
+            && t <= 32;
+        let quant_mode = if is_nvfp4 {
+            Inkling2MoeQuantMode::Nvfp4
+        } else if is_q8 {
+            Inkling2MoeQuantMode::Q8
+        } else if is_mxfp8 {
+            Inkling2MoeQuantMode::Mxfp8
         } else {
-            (gu.get_biases(), dn.get_biases())
+            return Ok(None);
+        };
+
+        let (gu_aux, dn_aux) = match quant_mode {
+            Inkling2MoeQuantMode::Nvfp4 => (gu.outer_scale(), None),
+            Inkling2MoeQuantMode::Q8 => (gu.get_biases(), dn.get_biases()),
+            Inkling2MoeQuantMode::Mxfp8 => (None, None),
         };
         let out = super::kernels::inkling2_grouped_moe(
             x,
@@ -630,12 +702,197 @@ impl Inkling2MoE {
             dn.get_weight(),
             dn.get_scales(),
             dn_aux,
-            is_q8,
+            quant_mode,
+            self.gate_up_interleaved,
             self.mlp_gate_softcap as f32,
             self.mlp_up_softcap as f32,
             true,
         )?;
         Ok(Some(out))
+    }
+
+    /// Pass B end-to-end fused `1 <= T <= 32` MoE + `route_group_small` + direct-gather +
+    /// `ffn_post_conv` + optional FP32 `residual` + optional `ShortConvTape`.
+    /// Returns `Ok(None)` cleanly if geometry/dtype/capabilities require the fallback path.
+    #[allow(clippy::too_many_arguments)]
+    fn try_grouped_moe_fused(
+        &self,
+        x: &MxArray,
+        router_logits: &MxArray,
+        residual: Option<&MxArray>,
+        mlp_post_histories: &mut [&mut MxArray],
+        cu_seqlens_q: &[usize],
+        mut mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
+    ) -> Result<Option<MxArray>> {
+        if x.dtype()? != DType::BFloat16 {
+            return Ok(None);
+        }
+        let shape = x.shape()?;
+        let t = shape[0] as usize;
+        let d = shape[1] as usize;
+        let num_seqs = mlp_post_histories.len();
+        if num_seqs == 0
+            || cu_seqlens_q.len() != num_seqs + 1
+            || cu_seqlens_q.first() != Some(&0)
+            || cu_seqlens_q.last() != Some(&t)
+            || !cu_seqlens_q.windows(2).all(|w| w[1] > w[0])
+        {
+            return Ok(None);
+        }
+        if t == 0
+            || t > 32
+            || (t == 1 && num_seqs != 1)
+            || d < 64
+            || !d.is_multiple_of(64)
+            || self.intermediate_size < 64
+            || !self.intermediate_size.is_multiple_of(64)
+            || self.num_experts == 0
+            || self.num_experts > 256
+            || self.top_k == 0
+            || self.top_k > 16
+            || t * self.top_k > 512
+            || !super::kernels::inkling2_grouped_moe_available(t)
+        {
+            return Ok(None);
+        }
+        let (ExpertSwitchProj::Quantized(gu), ExpertSwitchProj::Quantized(dn)) =
+            (&self.gate_up_proj, &self.down_proj)
+        else {
+            return Ok(None);
+        };
+
+        let is_nvfp4 = gu.mode() == NVFP4_MODE
+            && dn.mode() == NVFP4_MODE
+            && gu.bits() == 4
+            && dn.bits() == 4
+            && gu.group_size() == 16
+            && dn.group_size() == 16
+            && gu.get_scales().dtype()? == DType::Uint8
+            && dn.get_scales().dtype()? == DType::Uint8
+            && gu
+                .outer_scale()
+                .is_none_or(|s| s.dtype().ok() == Some(DType::Float32));
+        let is_q8 = gu.mode() == DEFAULT_QUANT_MODE
+            && dn.mode() == DEFAULT_QUANT_MODE
+            && gu.bits() == 8
+            && dn.bits() == 8
+            && gu.group_size() == 32
+            && dn.group_size() == 32
+            && gu.outer_scale().is_none()
+            && gu.get_biases().is_some()
+            && dn.get_biases().is_some()
+            && {
+                let s_dt = gu.get_scales().dtype()?;
+                (s_dt == DType::BFloat16 || s_dt == DType::Float32)
+                    && dn.get_scales().dtype()? == s_dt
+                    && gu
+                        .get_biases()
+                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
+                    && dn
+                        .get_biases()
+                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
+            };
+        let is_mxfp8 = gu.mode() == MXFP8_MODE
+            && dn.mode() == MXFP8_MODE
+            && gu.bits() == 8
+            && dn.bits() == 8
+            && gu.group_size() == 32
+            && dn.group_size() == 32
+            && gu.get_scales().dtype()? == DType::Uint8
+            && dn.get_scales().dtype()? == DType::Uint8
+            && gu.outer_scale().is_none()
+            && dn.outer_scale().is_none()
+            && gu.get_biases().is_none()
+            && dn.get_biases().is_none();
+        let quant_mode = if is_nvfp4 {
+            Inkling2MoeQuantMode::Nvfp4
+        } else if is_q8 {
+            Inkling2MoeQuantMode::Q8
+        } else if is_mxfp8 {
+            Inkling2MoeQuantMode::Mxfp8
+        } else {
+            return Ok(None);
+        };
+
+        let (gu_aux, dn_aux) = match quant_mode {
+            Inkling2MoeQuantMode::Nvfp4 => (gu.outer_scale(), None),
+            Inkling2MoeQuantMode::Q8 => (gu.get_biases(), dn.get_biases()),
+            Inkling2MoeQuantMode::Mxfp8 => (None, None),
+        };
+
+        let packed_hist = num_seqs > 4;
+        let stacked_hist;
+        let hist_refs: Vec<&MxArray> = if packed_hist {
+            let refs: Vec<&MxArray> = mlp_post_histories.iter().map(|h| &**h).collect();
+            stacked_hist = MxArray::stack(refs, Some(0))?;
+            vec![&stacked_hist]
+        } else {
+            mlp_post_histories.iter().map(|h| &**h).collect()
+        };
+
+        let emit_tape = mlp_post_tapes.is_some();
+        let (y, hist_out, tape_out) = super::kernels::inkling2_grouped_moe_fused(
+            x,
+            router_logits,
+            self.router_bias_f32.as_ref(),
+            self.down_proj.outer_scale(),
+            gu.get_weight(),
+            gu.get_scales(),
+            gu_aux,
+            dn.get_weight(),
+            dn.get_scales(),
+            dn_aux,
+            &self.post_conv,
+            residual,
+            cu_seqlens_q,
+            &hist_refs,
+            num_seqs,
+            packed_hist,
+            self.top_k,
+            self.route_scale as f32,
+            quant_mode,
+            self.gate_up_interleaved,
+            self.mlp_gate_softcap as f32,
+            self.mlp_up_softcap as f32,
+            true,
+            emit_tape,
+        )?;
+
+        if let Some(ref mut tapes) = mlp_post_tapes
+            && let Some(moe_rows) = tape_out
+        {
+            if num_seqs == 1 {
+                *tapes[0] = Some(super::short_conv::StreamShortConvTape {
+                    hist_before: mlp_post_histories[0].clone(),
+                    rows: moe_rows,
+                });
+            } else {
+                let d_i64 = d as i64;
+                for i in 0..num_seqs {
+                    let start = cu_seqlens_q[i] as i64;
+                    let end = cu_seqlens_q[i + 1] as i64;
+                    let rows = moe_rows.slice(&[start, 0], &[end, d_i64])?;
+                    *tapes[i] = Some(super::short_conv::StreamShortConvTape {
+                        hist_before: mlp_post_histories[i].clone(),
+                        rows,
+                    });
+                }
+            }
+        }
+
+        if num_seqs == 1 && !packed_hist {
+            *mlp_post_histories[0] = hist_out;
+        } else {
+            let d_i64 = d as i64;
+            for (i, hist) in mlp_post_histories.iter_mut().enumerate() {
+                let i64_idx = i as i64;
+                **hist = hist_out
+                    .slice(&[i64_idx, 0, 0], &[i64_idx + 1, 3, d_i64])?
+                    .squeeze(Some(&[0]))?;
+            }
+        }
+
+        Ok(Some(y))
     }
 
     #[allow(clippy::too_many_arguments)]

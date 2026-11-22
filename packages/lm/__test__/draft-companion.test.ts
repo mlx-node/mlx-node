@@ -9,6 +9,7 @@ import {
   findInkling2DSparkDraft,
   isDFlash2DraftDirectory,
   isInkling2DSparkGguf,
+  isInkling2MtpSafetensors,
 } from '../src/draft-companion.js';
 
 describe('DFlash2 companion discovery', () => {
@@ -351,6 +352,53 @@ describe('Inkling2 DSpark GGUF companion discovery', () => {
     if (!existsSync(targetGguf) || !existsSync(expectedDraft)) return;
     expect(isInkling2DSparkGguf(expectedDraft)).toBe(true);
     expect(findDFlash2Draft(targetGguf, 'inkling2')).toBe(expectedDraft);
+    expect(findInkling2DSparkDraft(modelDir)).toBe(expectedDraft);
+  });
+
+  it('discovers a colocated mtp.safetensors paired with config.json mtp_config', () => {
+    const mtpPath = join(root, 'mtp.safetensors');
+    writeFileSync(mtpPath, 'safetensors-bytes');
+    writeFileSync(
+      join(root, 'config.json'),
+      JSON.stringify({
+        model_type: 'inkling2_loop',
+        mtp_config: {
+          num_hidden_layers: 3,
+          block_size: 8,
+          markov_rank: 256,
+          target_layer_ids: [5, 23, 41, 48],
+        },
+      }),
+    );
+
+    expect(isInkling2MtpSafetensors(mtpPath)).toBe(true);
+    expect(findInkling2DSparkDraft(root)).toBe(mtpPath);
+    expect(findDFlash2Draft(root, 'inkling2')).toBe(mtpPath);
+  });
+
+  it('rejects mtp.safetensors without valid sibling mtp_config', () => {
+    const mtpPath = join(root, 'mtp.safetensors');
+    writeFileSync(mtpPath, 'safetensors-bytes');
+    expect(isInkling2MtpSafetensors(mtpPath)).toBe(false);
+    expect(findInkling2DSparkDraft(root)).toBeUndefined();
+
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ model_type: 'inkling2_loop' }));
+    expect(isInkling2MtpSafetensors(mtpPath)).toBe(false);
+    expect(findInkling2DSparkDraft(root)).toBeUndefined();
+
+    writeFileSync(
+      join(root, 'config.json'),
+      JSON.stringify({ mtp_config: { markov_rank: 0, target_layer_ids: [] } }),
+    );
+    expect(isInkling2MtpSafetensors(mtpPath)).toBe(false);
+  });
+
+  it('discovers the real on-disk mtp.safetensors in inkling-2-mini when present', () => {
+    const modelDir = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini');
+    const expectedDraft = join(modelDir, 'mtp.safetensors');
+    if (!existsSync(expectedDraft)) return;
+    expect(isInkling2MtpSafetensors(expectedDraft)).toBe(true);
+    expect(findDFlash2Draft(modelDir, 'inkling2')).toBe(expectedDraft);
     expect(findInkling2DSparkDraft(modelDir)).toBe(expectedDraft);
   });
 });

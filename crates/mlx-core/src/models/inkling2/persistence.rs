@@ -23,7 +23,7 @@ use crate::models::quant_dispatch::{
     load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk,
 };
 use crate::models::quantized_linear::{
-    DEFAULT_QUANT_MODE, LinearProj, QuantizedSwitchLinear,
+    DEFAULT_QUANT_MODE, LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear,
     try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_switch_linear,
 };
@@ -37,7 +37,7 @@ use crate::utils::gguf_import::{GgufPreload, PreloadInput};
 use super::attention::Inkling2Attention;
 use super::attn_res::{LoopController, LoopLayerControllers};
 use super::config::{Inkling2Config, Inkling2VisionConfig};
-use super::dspark::{Inkling2DsparkModel, resolve_inkling2_dspark_path};
+use super::dspark::{Inkling2DsparkModel, resolve_inkling2_dspark_candidates};
 use super::kv_cache::{Inkling2KVCacheCoordinator, Inkling2PagedConfig};
 use super::memory::{
     Inkling2ContextLimits, evaluate_inkling2_plan, inkling2_scheduler_lanes, resolve_activations,
@@ -146,17 +146,6 @@ pub(crate) async fn load_model_with_options(
     } else {
         path.to_path_buf()
     };
-    let resolved_draft_path = if draft_is_explicit {
-        resolve_inkling2_dspark_path(&source_dir, explicit_draft_path.as_deref())?
-    } else if auto_load_draft {
-        match resolve_inkling2_dspark_path(&source_dir, None)? {
-            Some(p) => Some(p),
-            None if asset_dir != source_dir => resolve_inkling2_dspark_path(&asset_dir, None)?,
-            None => None,
-        }
-    } else {
-        None
-    };
     let (preload_input, gguf_vision_meta, is_gguf) = match &source {
         CheckpointSource::Dir(_) => (None, None, false),
         CheckpointSource::Gguf(checkpoint) => {
@@ -167,6 +156,18 @@ pub(crate) async fn load_model_with_options(
                 .map(|(_, gguf, _)| gguf.metadata.clone());
             (Some(checkpoint.preload_input(true)), companion_meta, true)
         }
+    };
+    let draft_candidates = if draft_is_explicit {
+        resolve_inkling2_dspark_candidates(
+            &source_dir,
+            &asset_dir,
+            is_gguf,
+            explicit_draft_path.as_deref(),
+        )?
+    } else if auto_load_draft {
+        resolve_inkling2_dspark_candidates(&source_dir, &asset_dir, is_gguf, None)?
+    } else {
+        Vec::new()
     };
 
     struct InitMeta {
@@ -198,29 +199,41 @@ pub(crate) async fn load_model_with_options(
                 gguf_vision_meta.as_ref(),
                 is_gguf,
             )?;
-            if let Some(ref draft_path) = resolved_draft_path {
-                let t_draft = std::time::Instant::now();
-                match Inkling2DsparkModel::load_gguf(draft_path, &inner.config, &inner.lm_head) {
-                    Ok(draft) => {
-                        tracing::info!(
-                            "Inkling2 DSpark loaded from {} in {:.2}s (layers={}, block_size={}, markov_rank={}, taps={:?}, weights={:.1} MiB)",
-                            draft_path.display(),
-                            t_draft.elapsed().as_secs_f64(),
-                            draft.config.num_hidden_layers,
-                            draft.config.block_size,
-                            draft.config.markov_rank,
-                            draft.config.target_layer_ids,
-                            draft.weight_bytes() as f64 / (1024.0 * 1024.0),
-                        );
-                        inner.dspark = Some(draft);
+            if !draft_candidates.is_empty() {
+                let mut last_err: Option<Error> = None;
+                for draft_path in &draft_candidates {
+                    let t_draft = std::time::Instant::now();
+                    match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head)
+                    {
+                        Ok(draft) => {
+                            tracing::info!(
+                                "Inkling2 DSpark loaded from {} in {:.2}s (layers={}, block_size={}, markov_rank={}, taps={:?}, weights={:.1} MiB)",
+                                draft_path.display(),
+                                t_draft.elapsed().as_secs_f64(),
+                                draft.config.num_hidden_layers,
+                                draft.config.block_size,
+                                draft.config.markov_rank,
+                                draft.config.target_layer_ids,
+                                draft.weight_bytes() as f64 / (1024.0 * 1024.0),
+                            );
+                            inner.dspark = Some(draft);
+                            last_err = None;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Skipping Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
+                                draft_path.display()
+                            );
+                            last_err = Some(err);
+                        }
                     }
-                    Err(err) if draft_is_explicit => return Err(err),
-                    Err(err) => {
-                        tracing::warn!(
-                            "Skipping auto-discovered Inkling2 DSpark draft '{}' (falling back to target-only startup): {err}",
-                            draft_path.display()
-                        );
-                    }
+                }
+                if draft_is_explicit
+                    && inner.dspark.is_none()
+                    && let Some(err) = last_err
+                {
+                    return Err(err);
                 }
             }
             load_guard.record_read();
@@ -420,18 +433,19 @@ fn load_sync(
 ) -> Result<Inkling2Inner> {
     let mut model = load_weights_sync(asset_dir, preload_input, gguf_vision_meta, is_gguf)?;
 
-    // Auto-discover colocated DSpark GGUF (`dspark-*.gguf`) in the model directory (or asset_dir).
-    let draft_path = match resolve_inkling2_dspark_path(source_dir, None)? {
-        Some(p) => Some(p),
-        None if asset_dir != source_dir => resolve_inkling2_dspark_path(asset_dir, None)?,
-        None => None,
-    };
-    if let Some(draft_path) = draft_path {
-        match Inkling2DsparkModel::load_gguf(&draft_path, &model.config, &model.lm_head) {
-            Ok(draft) => model.dspark = Some(draft),
+    // Auto-discover colocated DSpark drafts (`mtp.safetensors` / `dspark-*.gguf`) in target-format
+    // priority order, falling through to the next candidate if an earlier draft fails to load.
+    let draft_candidates =
+        resolve_inkling2_dspark_candidates(source_dir, asset_dir, is_gguf, None)?;
+    for draft_path in &draft_candidates {
+        match Inkling2DsparkModel::load_auto(draft_path, &model.config, &model.lm_head) {
+            Ok(draft) => {
+                model.dspark = Some(draft);
+                break;
+            }
             Err(err) => {
                 tracing::warn!(
-                    "Skipping auto-discovered Inkling2 DSpark draft '{}' (falling back to target-only startup): {err}",
+                    "Skipping auto-discovered Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
                     draft_path.display()
                 );
             }
@@ -502,6 +516,12 @@ fn load_weights_sync(
             .map(ToOwned::to_owned)
             .unwrap_or(k);
         params.insert(norm_key, v);
+    }
+
+    // Normalize native Thinking Machines HuggingFace SafeTensors checkpoints (`llm.*` / `visual.*`)
+    // with ZERO unpacking of NVFP4 (L0-19) and MXFP8 (L20-23) expert weights.
+    if !is_gguf && normalize_inkling2_safetensors_params(&mut params, &config)? {
+        config.gate_up_interleaved = true;
     }
 
     let (default_bits, default_group_size, default_mode, per_layer_quant) =
@@ -913,7 +933,53 @@ fn load_expert_switch_proj(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
 ) -> Result<ExpertSwitchProj> {
-    if params.contains_key(&format!("{base}.scales")) {
+    if let Some(scales) = params.get(&format!("{base}.scales")) {
+        // Native SafeTensors NVFP4 / MXFP8 checkpoints (`quant_method: "modelopt"`) have no
+        // per-layer entries in `per_layer_quant`, store Uint8 FP8 scales (E4M3 for NVFP4,
+        // UE8M0 for MXFP8), and carry no `.biases`. Detect directly from tensor metadata & shapes
+        // so packed weights stay zero-copy!
+        let has_override = per_layer_quant.contains_key(base);
+        if !has_override
+            && scales.dtype()? == DType::Uint8
+            && !params.contains_key(&format!("{base}.biases"))
+        {
+            let w = require_tensor(params, &format!("{base}.weight"))?;
+            let w_shape = w.shape()?;
+            let s_shape = scales.shape()?;
+            if w_shape.len() == 3
+                && s_shape.len() == 3
+                && w_shape[0] == s_shape[0]
+                && w_shape[1] == s_shape[1]
+            {
+                if let Some(outer) = params.get(&format!("{base}.scale")) {
+                    // NVFP4: uint32 packed 4-bit weights (8 elems/u32) + uint8 E4M3 scales (16 elems/scale) -> w_last == s_last * 2
+                    if w_shape[2] == s_shape[2] * 2 {
+                        let q = QuantizedSwitchLinear::new(
+                            w,
+                            scales.clone(),
+                            None,
+                            16,
+                            4,
+                            NVFP4_MODE.to_string(),
+                        )
+                        .with_outer_scale(outer.clone());
+                        return Ok(ExpertSwitchProj::Quantized(q));
+                    }
+                } else if w_shape[2] == s_shape[2] * 8 {
+                    // MXFP8: uint32 packed FP8 E4M3 weights (4 elems/u32) + uint8 UE8M0 scales (32 elems/scale) -> w_last == s_last * 8
+                    let q = QuantizedSwitchLinear::new(
+                        w,
+                        scales.clone(),
+                        None,
+                        32,
+                        8,
+                        MXFP8_MODE.to_string(),
+                    );
+                    return Ok(ExpertSwitchProj::Quantized(q));
+                }
+            }
+        }
+
         let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
         let qsl = match plq.mode {
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, base),
@@ -1078,6 +1144,406 @@ fn require_tensor(params: &HashMap<String, MxArray>, key: &str) -> Result<MxArra
         .ok_or_else(|| Error::from_reason(format!("Inkling2: missing required tensor '{key}'")))
 }
 
+/// Normalize native Thinking Machines HuggingFace SafeTensors keys (`llm.*` / `visual.*`,
+/// after leading `model.` strip) into the canonical internal Inkling2 namespace used by
+/// `load_weights_sync` with ZERO unpacking of quantized NVFP4 (L0–19) and MXFP8 (L20–23)
+/// MoE expert weights.
+///
+/// Returns `Ok(true)` if the checkpoint used the Thinking Machines SafeTensors layout, or
+/// `Ok(false)` (leaving `params` untouched) for GGUF / pre-normalized checkpoints.
+fn normalize_inkling2_safetensors_params(
+    params: &mut HashMap<String, MxArray>,
+    config: &Inkling2Config,
+) -> Result<bool> {
+    if !params.contains_key("llm.embed.weight")
+        && !params.contains_key("llm.layers.0.attn.wq_du.weight")
+    {
+        return Ok(false);
+    }
+
+    let raw = std::mem::take(params);
+    let mut out: HashMap<String, MxArray> = HashMap::with_capacity(raw.len());
+
+    // Pair `weight_amax` and `weight_outer_scale_denominator` per `(layer, proj)` for NVFP4 outer scales.
+    let mut expert_amax: HashMap<(usize, &'static str), MxArray> = HashMap::new();
+    let mut expert_denom: HashMap<(usize, &'static str), MxArray> = HashMap::new();
+
+    // Reverse index `[3, 2, 1, 0]` to flip Global dynamic `static_w` from newest-to-oldest
+    // (`[4, C]` in SafeTensors) into oldest-to-newest (`[C, 4]` expected by `dynamic_short_conv`
+    // and `inkling2_sconv_k4_kv_prep`).
+    let rev_k4 = MxArray::from_int32(&[3, 2, 1, 0], &[4])?;
+    let vision_patch = config
+        .vision_config
+        .as_ref()
+        .map_or(20i64, |v| v.patch_size as i64);
+
+    for (key, tensor) in raw {
+        // 1. Top-level LLM weights
+        match key.as_str() {
+            "llm.embed.weight" => {
+                out.insert("embed_tokens.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.embed_norm.weight" => {
+                out.insert("embed_norm.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.norm.weight" => {
+                out.insert("norm.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.unembed.weight" => {
+                out.insert("lm_head.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.attn_res.output_query" => {
+                out.insert("output_res_query.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.middle_cycle_cross_pass_queries" => {
+                out.insert("loop_res_query.weight".to_string(), tensor);
+                continue;
+            }
+            "llm.middle_cycle_cross_pass_kv_queries" => {
+                out.insert("loop_kv_res_query.weight".to_string(), tensor);
+                continue;
+            }
+            _ => {}
+        }
+
+        // 2. AttnRes queries (`attn_queries.{idx}` -> physical layer `idx + 1`, since phys 0 has none)
+        if let Some(rest) = key.strip_prefix("llm.attn_res.attn_queries.") {
+            let idx: usize = rest.parse().map_err(|e| {
+                Error::from_reason(format!(
+                    "Inkling2 ST: invalid attn_queries index '{rest}': {e}"
+                ))
+            })?;
+            out.insert(format!("layers.{}.attn_res_query.weight", idx + 1), tensor);
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("llm.attn_res.mlp_queries.") {
+            let idx: usize = rest.parse().map_err(|e| {
+                Error::from_reason(format!(
+                    "Inkling2 ST: invalid mlp_queries index '{rest}': {e}"
+                ))
+            })?;
+            out.insert(format!("layers.{idx}.ffn_res_query.weight"), tensor);
+            continue;
+        }
+
+        // 3. Per-layer LLM weights (`llm.layers.{L}.*`)
+        if let Some(rest) = key.strip_prefix("llm.layers.")
+            && let Some((layer_str, suffix)) = rest.split_once('.')
+        {
+            let layer_idx: usize = layer_str.parse().map_err(|e| {
+                Error::from_reason(format!(
+                    "Inkling2 ST: invalid layer index '{layer_str}': {e}"
+                ))
+            })?;
+            let lp = format!("layers.{layer_idx}");
+            match suffix {
+                "attn_norm.weight" => {
+                    out.insert(format!("{lp}.input_layernorm.weight"), tensor);
+                }
+                "q_input_norm.weight" => {
+                    out.insert(format!("{lp}.self_attn.q_inp_norm.weight"), tensor);
+                }
+                "k_input_norm.weight" => {
+                    out.insert(format!("{lp}.self_attn.k_inp_norm.weight"), tensor);
+                }
+                "v_input_norm.weight" => {
+                    out.insert(format!("{lp}.self_attn.v_inp_norm.weight"), tensor);
+                }
+                "mlp_norm.weight" => {
+                    out.insert(format!("{lp}.post_attention_layernorm.weight"), tensor);
+                }
+                "attn.wq_du.weight" => {
+                    out.insert(format!("{lp}.self_attn.q_proj.weight"), tensor);
+                }
+                "attn.wk_dv.weight" => {
+                    out.insert(format!("{lp}.self_attn.k_proj.weight"), tensor);
+                }
+                "attn.wv_dv.weight" => {
+                    out.insert(format!("{lp}.self_attn.v_proj.weight"), tensor);
+                }
+                "attn.wr_du.weight" => {
+                    out.insert(format!("{lp}.self_attn.rel_proj.weight"), tensor);
+                }
+                "attn.gate_attn.weight" => {
+                    out.insert(format!("{lp}.self_attn.gate_proj.weight"), tensor);
+                }
+                "attn.attn_sink_proj.weight" => {
+                    out.insert(format!("{lp}.self_attn.sink_proj.weight"), tensor);
+                }
+                "attn.wo_ud.weight" => {
+                    out.insert(format!("{lp}.self_attn.o_proj.weight"), tensor);
+                }
+                "attn.q_l2_clip.scale" => {
+                    out.insert(format!("{lp}.self_attn.q_clip.weight"), tensor);
+                }
+                "attn.rel_l2_clip.scale" => {
+                    out.insert(format!("{lp}.self_attn.rel_clip.weight"), tensor);
+                }
+                "attn.rel_logits_proj.proj" => {
+                    out.insert(format!("{lp}.self_attn.rel_bias.weight"), tensor);
+                }
+                // Static ShortConv (`[C, 1, 4]` oldest-to-newest -> `[C, 4]`)
+                "attn.k_sconv.weight" => {
+                    let w = if tensor.ndim()? == 3 {
+                        tensor.squeeze(Some(&[1]))?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                }
+                "attn.v_sconv.weight" => {
+                    let w = if tensor.ndim()? == 3 {
+                        tensor.squeeze(Some(&[1]))?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                }
+                "attn_sconv.weight" => {
+                    let w = if tensor.ndim()? == 3 {
+                        tensor.squeeze(Some(&[1]))?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.self_attn.post_conv.weight"), w);
+                }
+                "mlp_sconv.weight" => {
+                    let w = if tensor.ndim()? == 3 {
+                        tensor.squeeze(Some(&[1]))?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.mlp.post_conv.weight"), w);
+                }
+                // Dynamic Global ShortConv (`static_w` `[4, C]` newest-to-oldest -> `[C, 4]` oldest-to-newest)
+                "attn.k_sconv.static_w" => {
+                    let w = tensor.transpose(None)?.take(&rev_k4, 1)?;
+                    out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                }
+                "attn.v_sconv.static_w" => {
+                    let w = tensor.transpose(None)?.take(&rev_k4, 1)?;
+                    out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                }
+                "attn.k_sconv.weight_proj" => {
+                    out.insert(format!("{lp}.self_attn.k_conv_proj.weight"), tensor);
+                }
+                "attn.v_sconv.weight_proj" => {
+                    out.insert(format!("{lp}.self_attn.v_conv_proj.weight"), tensor);
+                }
+                // MoE router
+                "mlp.gate.weight" => {
+                    out.insert(format!("{lp}.mlp.gate.weight"), tensor);
+                }
+                "mlp.gate.bias" => {
+                    out.insert(format!("{lp}.mlp.gate.e_score_correction_bias"), tensor);
+                }
+                // MoE experts: ZERO-COPY `view(DType::Uint32)` for NVFP4 (L0–19) & MXFP8 (L20–23)!
+                "mlp.experts.w13_weight" => {
+                    let w = if tensor.dtype()? == DType::Uint8 {
+                        tensor.view(DType::Uint32)?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.mlp.experts.gate_up_proj.weight"), w);
+                }
+                "mlp.experts.w13_weight_scale" => {
+                    out.insert(format!("{lp}.mlp.experts.gate_up_proj.scales"), tensor);
+                }
+                "mlp.experts.w13_weight_amax" => {
+                    expert_amax.insert((layer_idx, "gate_up_proj"), tensor);
+                }
+                "mlp.experts.w13_weight_outer_scale_denominator" => {
+                    expert_denom.insert((layer_idx, "gate_up_proj"), tensor);
+                }
+                "mlp.experts.w2_weight" => {
+                    let w = if tensor.dtype()? == DType::Uint8 {
+                        tensor.view(DType::Uint32)?
+                    } else {
+                        tensor
+                    };
+                    out.insert(format!("{lp}.mlp.experts.down_proj.weight"), w);
+                }
+                "mlp.experts.w2_weight_scale" => {
+                    out.insert(format!("{lp}.mlp.experts.down_proj.scales"), tensor);
+                }
+                "mlp.experts.w2_weight_amax" => {
+                    expert_amax.insert((layer_idx, "down_proj"), tensor);
+                }
+                "mlp.experts.w2_weight_outer_scale_denominator" => {
+                    expert_denom.insert((layer_idx, "down_proj"), tensor);
+                }
+                // Loop controllers (`controllers.{attn->q, k->k, v->v, mlp->mlp}.{down,gain,forget}_weight`)
+                _ if suffix.starts_with("controllers.") => {
+                    if let Some(ctrl_rest) = suffix.strip_prefix("controllers.")
+                        && let Some((stream_raw, proj_raw)) = ctrl_rest.split_once('.')
+                    {
+                        let stream = match stream_raw {
+                            "attn" => "q",
+                            "k" => "k",
+                            "v" => "v",
+                            "mlp" => "mlp",
+                            other => {
+                                return Err(Error::from_reason(format!(
+                                    "Inkling2 ST: unknown controller stream '{other}' in '{key}'"
+                                )));
+                            }
+                        };
+                        let proj = match proj_raw {
+                            "down_weight" => "down_proj.weight",
+                            "gain_weight" => "gain_proj.weight",
+                            "forget_weight" => "forget_proj.weight",
+                            other => {
+                                return Err(Error::from_reason(format!(
+                                    "Inkling2 ST: unknown controller weight '{other}' in '{key}'"
+                                )));
+                            }
+                        };
+                        out.insert(format!("{lp}.loop_ctrl.{stream}.{proj}"), tensor);
+                    } else {
+                        out.insert(key, tensor);
+                    }
+                }
+                _ => {
+                    out.insert(key, tensor);
+                }
+            }
+            continue;
+        }
+
+        // 4. Vision tower + projector (`visual.*`)
+        if let Some(vrest) = key.strip_prefix("visual.") {
+            match vrest {
+                "backbone.embeddings.class_embedding" => {
+                    out.insert("vision_tower.class_embedding".to_string(), tensor);
+                }
+                "backbone.embeddings.cls_position_embedding" => {
+                    out.insert(
+                        "vision_tower.class_position_embedding.weight".to_string(),
+                        tensor,
+                    );
+                }
+                "backbone.embeddings.position_embedding" => {
+                    out.insert("vision_tower.position_embedding.weight".to_string(), tensor);
+                }
+                "backbone.embeddings.patch_embedding.weight" => {
+                    // SafeTensors stores `[D, P*P*3]` in HWC `(P, P, 3)` flattened order;
+                    // `Inkling2VisionEncoder` expects CHW `(3, P, P)` flattened `[D, 3*P*P]`.
+                    let shape = tensor.shape()?;
+                    let converted =
+                        if shape.len() == 2 && shape[1] == 3 * vision_patch * vision_patch {
+                            let d_vis = shape[0];
+                            tensor
+                                .reshape(&[d_vis, vision_patch, vision_patch, 3])?
+                                .transpose(Some(&[0, 3, 1, 2]))?
+                                .reshape(&[d_vis, 3 * vision_patch * vision_patch])?
+                        } else {
+                            tensor
+                        };
+                    out.insert("vision_tower.patch_embed.weight".to_string(), converted);
+                }
+                "backbone.ln_pre.weight" => {
+                    out.insert("vision_tower.pre_ln.weight".to_string(), tensor);
+                }
+                "backbone.ln_pre.bias" => {
+                    out.insert("vision_tower.pre_ln.bias".to_string(), tensor);
+                }
+                "proj_in.weight" => {
+                    out.insert("vision_projector.fc1.weight".to_string(), tensor);
+                }
+                "proj_in.bias" => {
+                    out.insert("vision_projector.fc1.bias".to_string(), tensor);
+                }
+                "proj_out.weight" => {
+                    out.insert("vision_projector.fc2.weight".to_string(), tensor);
+                }
+                "proj_out.bias" => {
+                    out.insert("vision_projector.fc2.bias".to_string(), tensor);
+                }
+                _ if vrest.starts_with("backbone.layers.") => {
+                    if let Some(lrest) = vrest.strip_prefix("backbone.layers.")
+                        && let Some((blk_str, sub)) = lrest.split_once('.')
+                    {
+                        let bp = format!("vision_tower.blocks.{blk_str}");
+                        let mapped = match sub {
+                            "ln_1.weight" => Some("norm1.weight"),
+                            "ln_1.bias" => Some("norm1.bias"),
+                            "ln_2.weight" => Some("norm2.weight"),
+                            "ln_2.bias" => Some("norm2.bias"),
+                            "ls_1.gamma" => Some("ls1.weight"),
+                            "ls_2.gamma" => Some("ls2.weight"),
+                            "self_attn.q_proj.weight" => Some("attn.q_proj.weight"),
+                            "self_attn.q_proj.bias" => Some("attn.q_proj.bias"),
+                            "self_attn.k_proj.weight" => Some("attn.k_proj.weight"),
+                            "self_attn.k_proj.bias" => Some("attn.k_proj.bias"),
+                            "self_attn.v_proj.weight" => Some("attn.v_proj.weight"),
+                            "self_attn.v_proj.bias" => Some("attn.v_proj.bias"),
+                            "self_attn.out_proj.weight" => Some("attn.o_proj.weight"),
+                            "self_attn.out_proj.bias" => Some("attn.o_proj.bias"),
+                            "mlp.c_fc.weight" => Some("mlp.fc1.weight"),
+                            "mlp.c_fc.bias" => Some("mlp.fc1.bias"),
+                            "mlp.c_proj.weight" => Some("mlp.fc2.weight"),
+                            "mlp.c_proj.bias" => Some("mlp.fc2.bias"),
+                            _ => None,
+                        };
+                        if let Some(m) = mapped {
+                            out.insert(format!("{bp}.{m}"), tensor);
+                        } else {
+                            out.insert(key, tensor);
+                        }
+                    } else {
+                        out.insert(key, tensor);
+                    }
+                }
+                _ => {
+                    out.insert(key, tensor);
+                }
+            }
+            continue;
+        }
+
+        out.insert(key, tensor);
+    }
+
+    // Materialize per-expert NVFP4 `outer_scale = amax / outer_scale_denominator` (`[E]` F32).
+    for ((layer_idx, proj_name), amax) in expert_amax {
+        let denom = expert_denom.remove(&(layer_idx, proj_name)).ok_or_else(|| {
+            Error::from_reason(format!(
+                "Inkling2 ST: missing outer_scale_denominator for layers.{layer_idx}.mlp.experts.{proj_name}"
+            ))
+        })?;
+        let outer = amax
+            .astype(DType::Float32)?
+            .div(&denom.astype(DType::Float32)?)?;
+        out.insert(
+            format!("layers.{layer_idx}.mlp.experts.{proj_name}.scale"),
+            outer,
+        );
+    }
+
+    *params = out;
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn test_real_model_path() -> String {
+    if let Ok(p) =
+        std::env::var("INKLING2_MODEL_DIR").or_else(|_| std::env::var("INKLING2_MODEL_PATH"))
+        && !p.trim().is_empty()
+    {
+        return p;
+    }
+    let xl = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf/Inkling-2-Mini-UD-Q4_K_XL.gguf";
+    if Path::new(xl).exists() {
+        return xl.to_string();
+    }
+    "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -1089,22 +1555,21 @@ mod tests {
         InklingStreamParser, render_inkling2_messages_to_ids,
     };
 
-    const REAL_MODEL_DIR: &str = "/Users/brooklyn/.mlx-node/models/inkling-2-mini-gguf";
-
     #[tokio::test]
-    #[ignore = "Requires real Inkling-2-Mini GGUF + mmproj on disk (~18 GB)"]
+    #[ignore = "Requires real Inkling-2-Mini GGUF + mmproj or SafeTensors on disk (~18-20 GB)"]
     async fn inkling2_real_flat_smoke() {
-        let model_dir = Path::new(REAL_MODEL_DIR);
+        let model_path = test_real_model_path();
+        let model_dir = Path::new(&model_path);
         assert!(
             model_dir.exists(),
-            "Real model directory missing: {}",
+            "Real model path missing: {}",
             model_dir.display()
         );
 
         let t0 = Instant::now();
-        let model = load_from_dir(REAL_MODEL_DIR)
+        let model = load_from_dir(&model_path)
             .await
-            .expect("load Inkling-2-Mini GGUF + mmproj");
+            .expect("load Inkling-2-Mini");
         let load_secs = t0.elapsed().as_secs_f64();
         eprintln!(
             "[inkling2_real_flat_smoke] Loaded model in {load_secs:.2}s (phys={}, visits={}, vision={})",

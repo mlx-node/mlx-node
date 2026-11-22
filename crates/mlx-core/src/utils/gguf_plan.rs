@@ -935,14 +935,16 @@ mod tests {
     #[cfg(debug_assertions)]
     use crate::utils::gguf::{GgufConversionOptions, convert_gguf_to_safetensors};
     use crate::utils::gguf::{GgufTensorType, NativeGgufFamily, preflight_muse_dflash_gguf};
+    use crate::utils::gguf_test_fixtures::write_split_gguf;
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
         import_golden_root as golden_root, safetensors_manifest, sha256_hex, t64_prefixes,
         write_import_fixture,
     };
     #[cfg(debug_assertions)]
-    use crate::utils::gguf_test_fixtures::{build_minimal_gguf, fixture_payload};
-    use crate::utils::gguf_test_fixtures::{write_merged_gguf, write_split_gguf};
+    use crate::utils::gguf_test_fixtures::{
+        build_minimal_gguf, fixture_payload, write_merged_gguf,
+    };
 
     fn work_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mlx-gguf-plan-{tag}-{}", uuid::Uuid::new_v4()))

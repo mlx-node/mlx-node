@@ -52,11 +52,14 @@ pub struct Inkling2VisionConfig {
     pub num_attention_heads: usize,
     #[serde(default = "default_vision_image_size")]
     pub image_size: usize,
-    #[serde(default = "default_vision_patch_size")]
+    #[serde(default = "default_vision_patch_size", alias = "native_patch_size")]
     pub patch_size: usize,
-    #[serde(default = "default_vision_spatial_merge_size")]
+    #[serde(
+        default = "default_vision_spatial_merge_size",
+        alias = "adapter_merge_size"
+    )]
     pub spatial_merge_size: usize,
-    #[serde(default = "default_vision_projection_dim")]
+    #[serde(default = "default_vision_projection_dim", alias = "text_hidden_size")]
     pub projection_dim: usize,
     #[serde(default = "default_vision_layer_norm_eps")]
     pub layer_norm_eps: f64,
@@ -240,7 +243,10 @@ pub struct Inkling2Config {
     pub unpadded_vocab_size: Option<usize>,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
-    #[serde(default = "default_max_position_embeddings")]
+    #[serde(
+        default = "default_max_position_embeddings",
+        alias = "model_max_length"
+    )]
     pub max_position_embeddings: usize,
     #[serde(default = "default_sliding_window", alias = "sliding_window_size")]
     pub sliding_window: usize,
@@ -394,9 +400,36 @@ impl Inkling2Config {
         if cfg.vision_config.is_none()
             && let Some(vc) = root.get("vision_config")
             && !vc.is_null()
-            && let Ok(parsed) = serde_json::from_value::<Inkling2VisionConfig>(vc.clone())
+            && let Ok(mut parsed) = serde_json::from_value::<Inkling2VisionConfig>(vc.clone())
         {
+            if vc.get("image_size").is_none()
+                && let Some(grid) = vc.get("posemb_grid_size").and_then(|v| v.as_u64())
+                && grid > 0
+            {
+                parsed.image_size = (grid as usize).saturating_mul(parsed.patch_size);
+            }
+            if vc.get("intermediate_size").is_none()
+                && let Some(ratio) = vc.get("mlp_ratio").and_then(|v| v.as_f64())
+                && ratio > 0.0
+            {
+                parsed.intermediate_size = (parsed.hidden_size as f64 * ratio).round() as usize;
+            }
             cfg.vision_config = Some(parsed);
+        }
+
+        if text_val.get("eos_token_id").is_none()
+            && let Some(eos) = root.get("eos_token_id").and_then(|v| v.as_u64())
+            && let Ok(eos_u32) = u32::try_from(eos)
+        {
+            cfg.eos_token_id = eos_u32;
+        }
+
+        if cfg.dspark_config.is_none()
+            && let Some(mtp) = root.get("mtp_config")
+            && !mtp.is_null()
+            && let Ok(parsed) = serde_json::from_value::<Inkling2DsparkConfig>(mtp.clone())
+        {
+            cfg.dspark_config = Some(parsed);
         }
 
         // HF checkpoints have `num_hidden_layers = 24` (physical) with `loop_config`
@@ -725,5 +758,75 @@ mod tests {
         assert_eq!(cfg.num_layer_visits(), 48);
         assert!(cfg.gate_up_interleaved);
         assert_eq!(cfg.vision_config.as_ref().unwrap().num_hidden_layers, 23);
+    }
+
+    #[test]
+    fn hf_original_safetensors_config_parses_vision_mtp_and_max_length() {
+        let raw = serde_json::json!({
+            "model_type": "inkling2_loop",
+            "eos_token_id": 200006,
+            "text_config": {
+                "model_type": "inkling2_loop_text",
+                "model_max_length": 1048576,
+                "hidden_size": 2304,
+                "num_hidden_layers": 24,
+                "vocab_size": 201024,
+                "unpadded_vocab_size": 200058,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "sliding_window_size": 1024,
+                "n_routed_experts": 128,
+                "num_experts_per_tok": 8,
+                "intermediate_size": 1152,
+                "loop_config": {
+                    "core_start": 6,
+                    "core_end": 18,
+                    "num_passes": 3,
+                    "gate_rank": 64,
+                    "is_varloop": false
+                }
+            },
+            "vision_config": {
+                "model_type": "inkling2_vision",
+                "text_hidden_size": 2304,
+                "native_patch_size": 20,
+                "adapter_merge_size": 2,
+                "hidden_size": 1024,
+                "num_hidden_layers": 23,
+                "num_attention_heads": 16,
+                "mlp_ratio": 4.0,
+                "posemb_grid_size": 32,
+                "layer_norm_eps": 1e-5
+            },
+            "mtp_config": {
+                "num_hidden_layers": 3,
+                "block_size": 8,
+                "markov_rank": 256,
+                "target_layer_ids": [5, 23, 41, 48]
+            }
+        })
+        .to_string();
+
+        let cfg = Inkling2Config::from_json_str(&raw, false).unwrap();
+        assert_eq!(cfg.num_physical_layers(), 24);
+        assert_eq!(cfg.num_layer_visits(), 48);
+        assert_eq!(cfg.max_position_embeddings, 1_048_576);
+        assert_eq!(cfg.eos_token_id, 200_006);
+        assert!(cfg.gate_up_interleaved);
+
+        let vc = cfg.vision_config.as_ref().unwrap();
+        assert_eq!(vc.projection_dim, 2304);
+        assert_eq!(vc.patch_size, 20);
+        assert_eq!(vc.spatial_merge_size, 2);
+        assert_eq!(vc.image_size, 640);
+        assert_eq!(vc.intermediate_size, 4096);
+        assert_eq!(vc.posemb_grid_size(), 32);
+
+        let dc = cfg.dspark_config.as_ref().unwrap();
+        assert_eq!(dc.num_hidden_layers, 3);
+        assert_eq!(dc.block_size, 8);
+        assert_eq!(dc.markov_rank, 256);
+        assert_eq!(dc.target_layer_ids, vec![5, 23, 41, 48]);
     }
 }

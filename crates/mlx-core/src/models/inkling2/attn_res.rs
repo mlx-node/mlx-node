@@ -204,41 +204,103 @@ pub fn apply_sublayer_rms_norm(
     }
 }
 
+/// Min/max token batch size `T` that uses the custom coalesced exact-FP32 LoopController Metal kernels.
+#[inline]
+pub(crate) fn fused_loop_ctrl_range() -> (i64, i64) {
+    static RANGE: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let min_t = std::env::var("MLX_INKLING2_LOOP_CTRL_MIN_T")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(1);
+        let max_t = std::env::var("MLX_INKLING2_LOOP_CTRL_MAX_T")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(1024);
+        (min_t, max_t)
+    })
+}
+
+/// Resolved `MLX_INKLING2_LOOP_BF16` policy shared between `LoopController` loading and SSD
+/// cache fingerprinting (`"bf16"`, `"f32"`, or `"auto"`).
+#[inline]
+pub(crate) fn loop_bf16_override_tag() -> &'static str {
+    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MODE.get_or_init(
+        || match std::env::var("MLX_INKLING2_LOOP_BF16").as_deref() {
+            Ok("1") | Ok("true") | Ok("bf16") => "bf16",
+            Ok("0") | Ok("false") | Ok("f32") => "f32",
+            _ => "auto",
+        },
+    )
+}
+
 /// Rank-64 low-rank loop controller for one stream (`q`/`attn`, `k`, `v`, or `mlp`).
 ///
-/// Pre-transposed & fused at load time in FP32 so the hot path executes ONE down matmul
-/// (`[T, 2D] @ [2D, rank]`) and ONE fused `[gain; forget]` matmul (`[T, rank] @ [rank, 2D]`)
-/// with zero per-step casts or transposes!
+/// Stores contiguous row-major `[rank, 2 * D]` (`down_proj_w`) and `[2 * D, rank]`
+/// (`gain_forget_w`) FP32 weights for sequential 256B-aligned `float4` loads in the
+/// fused Metal LoopController kernels, plus zero-copy transpose views (`down_proj_t` and
+/// `gain_forget_proj_t`) for large-T prefill fallback!
 pub struct LoopController {
-    /// Pre-transposed `[2 * D, rank]` FP32 (`down_proj.T`).
+    /// Row-major `[rank, 2 * D]` FP32 (`down_proj`, coalesced for `inkling2_loop_ctrl_down_f32`).
+    pub down_proj_w: MxArray,
+    /// Pre-transposed `[2 * D, rank]` FP32 (`down_proj_w.T`, zero-copy view).
     pub down_proj_t: MxArray,
-    /// Pre-transposed & fused `[rank, 2 * D]` FP32 (`concat([gain_proj.T, forget_proj.T], axis=1)`).
+    /// Row-major fused `[2 * D, rank]` FP32 (`concat([gain_proj, forget_proj], axis=0)`),
+    /// sequential 256B `float4` layout for `inkling2_loop_ctrl_up_blend_f32`.
+    pub gain_forget_w: MxArray,
+    /// Pre-transposed fused `[rank, 2 * D]` FP32 (`gain_forget_w.T`, zero-copy view).
     pub gain_forget_proj_t: MxArray,
     pub dim: i64,
 }
 
-/// LoopController weight dtype: FP32 by default (evaluated BF16 on M5 Max: BF16 broke
-/// `inkling2_cold_tier_parity` RAM-hit greedy parity and was slower than FP32 on release M=1/M=8/M=32;
-/// kept as `MLX_INKLING2_LOOP_BF16=1` opt-in for experimentation).
-pub(crate) fn loop_controller_weight_dtype() -> DType {
-    match std::env::var("MLX_INKLING2_LOOP_BF16").as_deref() {
-        Ok("1") | Ok("true") | Ok("bf16") => DType::BFloat16,
-        _ => DType::Float32,
+/// LoopController weight dtype: preserves the checkpoint's native precision (BF16 for original
+/// SafeTensors where controllers are natively BF16 -> 2x less DRAM with zero precision loss;
+/// FP32 for GGUF where controllers are natively FP32). Honors explicit `MLX_INKLING2_LOOP_BF16`
+/// override when set (`1`/`true`/`bf16` or `0`/`false`/`f32`).
+pub(crate) fn loop_controller_weight_dtype(source_dtype: DType) -> DType {
+    match loop_bf16_override_tag() {
+        "bf16" => DType::BFloat16,
+        "f32" => DType::Float32,
+        _ => {
+            if source_dtype == DType::BFloat16 {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            }
+        }
     }
 }
 
 impl LoopController {
     pub fn new(down_proj: MxArray, gain_proj: MxArray, forget_proj: MxArray) -> Result<Self> {
         let dim = gain_proj.shape()?[0];
-        let w_dtype = loop_controller_weight_dtype();
-        let down_proj_t = down_proj.astype(w_dtype)?.transpose(None)?;
-        // Concatenate along axis 0 (`[2*D, rank]`) then transpose so `b_transposed == true`
-        // (enables exact FP32 `gemv_wide` for `M = 2..=5` instead of padded TF32 `steel_matmul`).
-        let gain_w = gain_proj.astype(w_dtype)?;
-        let forget_w = forget_proj.astype(w_dtype)?;
-        let gain_forget_proj_t = MxArray::concatenate(&gain_w, &forget_w, 0)?.transpose(None)?;
+        let w_dtype = loop_controller_weight_dtype(down_proj.dtype()?);
+        let down_proj_w = if down_proj.dtype()? == w_dtype {
+            down_proj
+        } else {
+            down_proj.astype(w_dtype)?
+        };
+        let down_proj_t = down_proj_w.transpose(None)?;
+        // Row-major `[2 * D, rank]` (`concat([gain, forget], axis=0)`): sequential coalesced
+        // loads per output channel in `inkling2_loop_ctrl_up_blend_f32` AND zero-copy transpose
+        // view `[rank, 2 * D]` for large-T prefill matmul (0 extra RAM!).
+        let gain_w = if gain_proj.dtype()? == w_dtype {
+            gain_proj
+        } else {
+            gain_proj.astype(w_dtype)?
+        };
+        let forget_w = if forget_proj.dtype()? == w_dtype {
+            forget_proj
+        } else {
+            forget_proj.astype(w_dtype)?
+        };
+        let gain_forget_w = MxArray::concatenate(&gain_w, &forget_w, 0)?;
+        let gain_forget_proj_t = gain_forget_w.transpose(None)?;
         Ok(Self {
+            down_proj_w,
             down_proj_t,
+            gain_forget_w,
             gain_forget_proj_t,
             dim,
         })
@@ -343,9 +405,10 @@ impl LoopController {
         kept.add(&added)
     }
 
-    /// Fused Metal path: compute `[rms(dest), rms(msg)]` via `inkling2_pair_rms_norm`,
-    /// run `down_proj` + `gain_forget_proj`, then run zero-copy strided `inkling2_loop_blend_rms_norm`
-    /// (FP32 no-FMA blend + sublayer RMSNorm -> `out_dtype`). Falls back cleanly on non-Metal.
+    /// Fused Metal path: for `T <= 32` with FP32 weights, runs coalesced exact-FP32
+    /// `inkling2_loop_ctrl_down` + `inkling2_loop_ctrl_up_blend_norm` (zero `[T, 2D]` DRAM
+    /// intermediates and zero 64x64-padded FP32 `steel_matmul`!). Falls back to MLX matmul
+    /// for large prefill (`T > 32`) or BF16 weights, and cleanly on non-Metal.
     pub fn forward_fused_rms_norm(
         &self,
         dest: &MxArray,
@@ -359,7 +422,31 @@ impl LoopController {
             if unsafe { mlx_sys::mlx_metal_is_available() } {
                 let t = msg.shape()?[0];
                 let d = self.dim;
-                let w_dtype = self.down_proj_t.dtype()?;
+                let rank = self.down_proj_w.shape()?[0];
+                let w_dtype = self.down_proj_w.dtype()?;
+                let (min_t, max_t) = fused_loop_ctrl_range();
+                if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
+                    && t >= min_t
+                    && t <= max_t
+                    && d % 4 == 0
+                    && rank % 4 == 0
+                {
+                    let h = super::kernels::inkling2_loop_ctrl_down(
+                        dest,
+                        msg,
+                        &self.down_proj_w,
+                        ATTN_RES_EPS,
+                    )?;
+                    return super::kernels::inkling2_loop_ctrl_up_blend_norm(
+                        &h,
+                        &self.gain_forget_w,
+                        dest,
+                        msg,
+                        norm_weight,
+                        eps,
+                        out_dtype,
+                    );
+                }
                 let pair =
                     super::kernels::inkling2_pair_rms_norm(dest, msg, ATTN_RES_EPS, w_dtype)?;
                 let h = pair.matmul(&self.down_proj_t)?;
@@ -427,7 +514,7 @@ impl LoopController {
     }
 
     pub fn weight_refs(&self) -> [&MxArray; 2] {
-        [&self.down_proj_t, &self.gain_forget_proj_t]
+        [&self.down_proj_w, &self.gain_forget_w]
     }
 }
 
@@ -440,9 +527,13 @@ pub struct LoopLayerControllers {
     pub msg_queries: MxArray,
     /// Pre-scaled (`* D^-0.5`) & pre-transposed FP32 message queries `[D, 4]` (flat fallback).
     pub msg_queries_t: MxArray,
-    /// Batched Q/K/V down projections `[3, 2 * D, rank]` FP32 (shares storage with `q_ctrl`/`k_ctrl`/`v_ctrl`).
+    /// Batched row-major Q/K/V down projections `[3, rank, 2 * D]` FP32 (coalesced for fused Metal kernel).
+    pub qkv_down_w: MxArray,
+    /// Batched Q/K/V down projections `[3, 2 * D, rank]` FP32 (zero-copy view of `qkv_down_w`).
     pub qkv_down_proj_t: MxArray,
-    /// Batched Q/K/V gain+forget projections `[3, rank, 2 * D]` FP32 (shares storage with `q_ctrl`/`k_ctrl`/`v_ctrl`).
+    /// Batched row-major Q/K/V gain+forget projections `[3, 2 * D, rank]` FP32 (sequential 256B `float4` layout).
+    pub qkv_gain_forget_w: MxArray,
+    /// Batched Q/K/V gain+forget projections `[3, rank, 2 * D]` FP32 (zero-copy view of `qkv_gain_forget_w`).
     pub qkv_gain_forget_proj_t: MxArray,
     pub q_ctrl: LoopController,
     pub k_ctrl: LoopController,
@@ -452,8 +543,7 @@ pub struct LoopLayerControllers {
 
 impl LoopLayerControllers {
     /// Construct from pre-scaled `[4, D]` `msg_queries` and the 4 stream controllers, packing
-    /// `[q, k, v]` into contiguous batched `[3, ...]` weights so Q/K/V execute in 1 batched
-    /// `pair_rms_norm` + 2 batched matmuls + 1 3-stream `loop_blend_rms_norm` (0 extra RAM!).
+    /// `[q, k, v]` into contiguous batched `[3, rank, 2 * D]` / `[3, 2 * D, rank]` weights (0 extra RAM!).
     pub fn new(
         msg_queries: MxArray,
         q_ctrl: LoopController,
@@ -462,36 +552,43 @@ impl LoopLayerControllers {
         mlp_ctrl: LoopController,
     ) -> Result<Self> {
         let msg_queries_t = msg_queries.transpose(None)?;
-        // Stack row-major `[rank, 2*D]` and `[2*D, rank]` then transpose last two dims so
-        // `b_transposed == true` on the batched 3D matmuls (enables MLX `gemv_wide` exact FP32
-        // for `M = 2..=5` instead of falling back to padded TF32 `steel_matmul`!).
-        let q_d = q_ctrl.down_proj_t.transpose(None)?;
-        let k_d = k_ctrl.down_proj_t.transpose(None)?;
-        let v_d = v_ctrl.down_proj_t.transpose(None)?;
-        let qkv_down_raw = MxArray::stack(vec![&q_d, &k_d, &v_d], Some(0))?;
-        let qkv_down_proj_t = qkv_down_raw.transpose(Some(&[0, 2, 1]))?;
+        let qkv_down_w = MxArray::stack(
+            vec![
+                &q_ctrl.down_proj_w,
+                &k_ctrl.down_proj_w,
+                &v_ctrl.down_proj_w,
+            ],
+            Some(0),
+        )?;
+        let qkv_down_proj_t = qkv_down_w.transpose(Some(&[0, 2, 1]))?;
 
-        let q_gf = q_ctrl.gain_forget_proj_t.transpose(None)?;
-        let k_gf = k_ctrl.gain_forget_proj_t.transpose(None)?;
-        let v_gf = v_ctrl.gain_forget_proj_t.transpose(None)?;
-        let qkv_gf_raw = MxArray::stack(vec![&q_gf, &k_gf, &v_gf], Some(0))?;
-        let qkv_gain_forget_proj_t = qkv_gf_raw.transpose(Some(&[0, 2, 1]))?;
+        let qkv_gain_forget_w = MxArray::stack(
+            vec![
+                &q_ctrl.gain_forget_w,
+                &k_ctrl.gain_forget_w,
+                &v_ctrl.gain_forget_w,
+            ],
+            Some(0),
+        )?;
+        let qkv_gain_forget_proj_t = qkv_gain_forget_w.transpose(Some(&[0, 2, 1]))?;
 
         let dim = q_ctrl.dim;
-        let down_shape = qkv_down_raw.shape()?;
-        let gf_shape = qkv_gf_raw.shape()?;
+        let down_shape = qkv_down_w.shape()?;
+        let gf_shape = qkv_gain_forget_w.shape()?;
         let slice_stream = |idx: i64| -> Result<LoopController> {
-            let down = qkv_down_raw
+            let down_w = qkv_down_w
                 .slice(&[idx, 0, 0], &[idx + 1, down_shape[1], down_shape[2]])?
-                .squeeze(Some(&[0]))?
-                .transpose(None)?;
-            let gf = qkv_gf_raw
+                .squeeze(Some(&[0]))?;
+            let down_t = down_w.transpose(None)?;
+            let gf_w = qkv_gain_forget_w
                 .slice(&[idx, 0, 0], &[idx + 1, gf_shape[1], gf_shape[2]])?
-                .squeeze(Some(&[0]))?
-                .transpose(None)?;
+                .squeeze(Some(&[0]))?;
+            let gf_t = gf_w.transpose(None)?;
             Ok(LoopController {
-                down_proj_t: down,
-                gain_forget_proj_t: gf,
+                down_proj_w: down_w,
+                down_proj_t: down_t,
+                gain_forget_w: gf_w,
+                gain_forget_proj_t: gf_t,
                 dim,
             })
         };
@@ -501,7 +598,9 @@ impl LoopLayerControllers {
             q_ctrl: slice_stream(0)?,
             k_ctrl: slice_stream(1)?,
             v_ctrl: slice_stream(2)?,
+            qkv_down_w,
             qkv_down_proj_t,
+            qkv_gain_forget_w,
             qkv_gain_forget_proj_t,
             mlp_ctrl,
         })
@@ -513,7 +612,7 @@ impl LoopLayerControllers {
         block_attn_res_mix_prenormed(bank_v_tnd, &self.msg_queries_t)
     }
 
-    /// Batched fused Q/K/V loop controllers + sublayer RMSNorm -> `(x_q, x_k, x_v)` in 4 GPU dispatches!
+    /// Batched fused Q/K/V loop controllers + sublayer RMSNorm -> `(x_q, x_k, x_v)`!
     ///
     /// - `dest`: `[T, D]` (SWA broadcast across Q/K/V) or `[3, T, D]` (Global) FP32
     /// - `msgs_qkv`: `[3, T, D]` FP32 (`msgs[0..3]`)
@@ -532,22 +631,51 @@ impl LoopLayerControllers {
         #[cfg(target_os = "macos")]
         {
             if unsafe { mlx_sys::mlx_metal_is_available() } {
-                let w_dtype = self.qkv_down_proj_t.dtype()?;
-                let pair_3 =
-                    super::kernels::inkling2_pair_rms_norm(dest, msgs_qkv, ATTN_RES_EPS, w_dtype)?;
-                let h_3 = pair_3.matmul(&self.qkv_down_proj_t)?;
-                let gf_3 = h_3.matmul(&self.qkv_gain_forget_proj_t)?;
-                let gain_3 = gf_3.slice(&[0, 0, 0], &[3, t, d])?;
-                let forget_3 = gf_3.slice(&[0, 0, d], &[3, t, 2 * d])?;
-                let out_3 = super::kernels::inkling2_loop_blend_rms_norm(
-                    dest,
-                    msgs_qkv,
-                    &gain_3,
-                    &forget_3,
-                    norm_weight,
-                    eps,
-                    out_dtype,
-                )?;
+                let rank = self.qkv_down_w.shape()?[1];
+                let w_dtype = self.qkv_down_w.dtype()?;
+                let (min_t, max_t) = fused_loop_ctrl_range();
+                let out_3 = if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
+                    && t >= min_t
+                    && t <= max_t
+                    && d % 4 == 0
+                    && rank % 4 == 0
+                {
+                    let h_3 = super::kernels::inkling2_loop_ctrl_down(
+                        dest,
+                        msgs_qkv,
+                        &self.qkv_down_w,
+                        ATTN_RES_EPS,
+                    )?;
+                    super::kernels::inkling2_loop_ctrl_up_blend_norm(
+                        &h_3,
+                        &self.qkv_gain_forget_w,
+                        dest,
+                        msgs_qkv,
+                        norm_weight,
+                        eps,
+                        out_dtype,
+                    )?
+                } else {
+                    let pair_3 = super::kernels::inkling2_pair_rms_norm(
+                        dest,
+                        msgs_qkv,
+                        ATTN_RES_EPS,
+                        w_dtype,
+                    )?;
+                    let h_3 = pair_3.matmul(&self.qkv_down_proj_t)?;
+                    let gf_3 = h_3.matmul(&self.qkv_gain_forget_proj_t)?;
+                    let gain_3 = gf_3.slice(&[0, 0, 0], &[3, t, d])?;
+                    let forget_3 = gf_3.slice(&[0, 0, d], &[3, t, 2 * d])?;
+                    super::kernels::inkling2_loop_blend_rms_norm(
+                        dest,
+                        msgs_qkv,
+                        &gain_3,
+                        &forget_3,
+                        norm_weight,
+                        eps,
+                        out_dtype,
+                    )?
+                };
                 let x_q = out_3.slice(&[0, 0, 0], &[1, t, d])?.squeeze(Some(&[0]))?;
                 let x_k = out_3.slice(&[1, 0, 0], &[2, t, d])?.squeeze(Some(&[0]))?;
                 let x_v = out_3.slice(&[2, 0, 0], &[3, t, d])?.squeeze(Some(&[0]))?;
@@ -599,8 +727,8 @@ impl LoopLayerControllers {
         let mut refs = Vec::with_capacity(6);
         refs.push(&self.msg_queries);
         refs.push(&self.msg_queries_t);
-        refs.push(&self.qkv_down_proj_t);
-        refs.push(&self.qkv_gain_forget_proj_t);
+        refs.push(&self.qkv_down_w);
+        refs.push(&self.qkv_gain_forget_w);
         refs.extend_from_slice(&self.mlp_ctrl.weight_refs());
         refs
     }

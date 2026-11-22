@@ -219,6 +219,18 @@ mlx_array* mlx_array_astype(mlx_array* handle, int32_t dtype) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+mlx_array* mlx_array_view(mlx_array* handle, int32_t dtype) {
+  if (!handle) return nullptr;
+  try {
+    auto arr = reinterpret_cast<array*>(handle);
+    array result = mlx::core::view(*arr, to_mlx_dtype(dtype));
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("mlx_array_view", e.what());
+    return nullptr;
+  }
+}
+
 mlx_array* mlx_array_hadamard_transform(mlx_array* input, float scale) {
   try {
     auto& x = *reinterpret_cast<mlx::core::array*>(input);

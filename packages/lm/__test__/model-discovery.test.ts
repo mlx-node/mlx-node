@@ -825,12 +825,59 @@ describe('discoverLocalChatModels', () => {
     symlinkSync(repo, join(dir, 'inkling-2-mini-gguf'));
 
     const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'Inkling-2-Mini-UD-Q4_K_XL',
+          modelType: 'inkling2',
+          contextWindow: 1048576,
+          format: 'gguf',
+        }),
+      ]),
+    );
+  });
+
+  it('discovers native SafeTensors inkling2_loop checkpoints with model_max_length and vision_config', async () => {
+    const dir = modelsDir('inkling2-safetensors', {
+      'inkling-2-mini/config.json': JSON.stringify({
+        model_type: 'inkling2_loop',
+        architectures: ['Inkling2LoopForConditionalGeneration'],
+        text_config: { model_type: 'inkling2_loop_text', model_max_length: 1048576 },
+        vision_config: { model_type: 'inkling2_vision', hidden_size: 1024 },
+        mtp_config: { markov_rank: 256, target_layer_ids: [5, 23, 41, 48] },
+      }),
+      'inkling-2-mini/model-00001-of-00001.safetensors': 'weights',
+      'inkling-2-mini/mtp.safetensors': 'draft',
+    });
+
+    const models = await discoverLocalChatModels(dir);
     expect(models).toEqual([
       expect.objectContaining({
-        name: 'Inkling-2-Mini-UD-Q4_K_XL',
+        name: 'inkling-2-mini',
         modelType: 'inkling2',
         contextWindow: 1048576,
-        format: 'gguf',
+        supportsImages: true,
+        format: 'mlx',
+      }),
+    ]);
+  });
+
+  it('discovers the real ~/.mlx-node/models/inkling-2-mini SafeTensors checkpoint when present', async () => {
+    const repo = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini');
+    if (!existsSync(join(repo, 'config.json'))) return;
+
+    const dir = join(tmp, 'inkling2-st-real-symlink');
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(repo, join(dir, 'inkling-2-mini'));
+
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([
+      expect.objectContaining({
+        name: 'inkling-2-mini',
+        modelType: 'inkling2',
+        contextWindow: 1048576,
+        supportsImages: true,
+        format: 'mlx',
       }),
     ]);
   });
