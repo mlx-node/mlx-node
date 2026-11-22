@@ -594,9 +594,17 @@ mod tests {
             let arr2 = unsafe { MxArray::from_mmap_readonly(ptr2, len, release_mmap_lease, ctx2) }
                 .unwrap();
 
-            let rset = MetalResidencySet::create(&[&arr1, &arr2])
-                .expect("MetalResidencySet::create should succeed on Metal");
-            rset.request();
+            let rset = MetalResidencySet::create(&[&arr1, &arr2]);
+            if let Some(ref rset) = rset {
+                rset.request();
+            } else {
+                // Paravirtualized macOS CI VMs do not support MTL::ResidencySet;
+                // still verify mmap arrays compute and release cleanly below.
+                assert!(
+                    !unsafe { sys::mlx_kv_store_batched_available() },
+                    "MetalResidencySet::create should succeed when Metal residency sets are supported"
+                );
+            }
 
             let s1 = arr1
                 .astype(DType::Float32)
@@ -613,7 +621,9 @@ mod tests {
             assert_eq!(s1.to_float32().unwrap()[0], want1);
             assert_eq!(s2.to_float32().unwrap()[0], want2);
 
-            rset.request();
+            if let Some(ref rset) = rset {
+                rset.request();
+            }
             drop(s1);
             drop(s2);
             synchronize();

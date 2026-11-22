@@ -149,6 +149,11 @@ fn require_metal() -> bool {
     std::env::var("MLX_TEST_REQUIRE_METAL").as_deref() == Ok("1")
 }
 
+fn require_nax() -> bool {
+    std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() == Ok("1")
+        || (require_metal() && unsafe { mlx_sys::mlx_metal_is_nax_available() })
+}
+
 fn eval_f32(a: &MxArray) -> Vec<f32> {
     a.astype(DType::Float32)
         .unwrap()
@@ -817,7 +822,7 @@ fn run_prefill_parity_case(
         call_kq_prefill_indirect_gu(&x_arr, &tr_arr, &tiles_arr, &g_kq, &u_kq, limit)
     else {
         assert!(
-            !require_metal(),
+            !require_nax(),
             "Metal/NAX required but kq_prefill_indirect_gu returned None"
         );
         return;
@@ -1009,7 +1014,7 @@ fn gguf_prefill_oob_slot_writes_zeros() {
         gguf_prefill_indirect_gu(&x, &tr, &tiles, &g_buf, 32, &u_buf, 32, n_experts, m, 7.0)
             .unwrap()
     else {
-        assert!(!require_metal(), "Metal/NAX required");
+        assert!(!require_nax(), "Metal/NAX required");
         return;
     };
     let gu_v = eval_f32(&gu);
@@ -1087,7 +1092,7 @@ fn gguf_prefill_non_multiple_of_64_tail_matches_decode() {
             gguf_prefill_indirect_gu(&x, &tr, &tl, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0)
                 .unwrap()
         else {
-            assert!(!require_metal(), "Metal/NAX required");
+            assert!(!require_nax(), "Metal/NAX required");
             return;
         };
         let dn = gguf_prefill_indirect_down(&gu, &tl, &d_buf, down_off, n_experts, h, down_bits)
@@ -1231,31 +1236,36 @@ fn gguf_prefill_strided_x_and_kq_sorted_combine_f16_tail() {
     let tr = MxArray::from_uint32(&token_rows, &[pairs as i64]).unwrap();
     let tl = MxArray::from_uint32(&tiles, &[(tiles.len() / 3) as i64, 3]).unwrap();
 
-    let Some(gu_strided) = gguf_prefill_indirect_gu(
+    if let Some(gu_strided) = gguf_prefill_indirect_gu(
         &x_strided, &tr, &tl, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0,
     )
-    .unwrap() else {
-        assert!(!require_metal(), "Metal/NAX required");
-        return;
-    };
-    let gu_contig = gguf_prefill_indirect_gu(
-        &x_contig, &tr, &tl, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0,
-    )
     .unwrap()
-    .unwrap();
-    assert_eq!(
-        eval_f32(&gu_strided)
-            .into_iter()
-            .map(f32::to_bits)
-            .collect::<Vec<_>>(),
-        eval_f32(&gu_contig)
-            .into_iter()
-            .map(f32::to_bits)
-            .collect::<Vec<_>>(),
-        "gguf_prefill_indirect_gu strided vs contiguous x mismatch"
-    );
+    {
+        let gu_contig = gguf_prefill_indirect_gu(
+            &x_contig, &tr, &tl, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            eval_f32(&gu_strided)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            eval_f32(&gu_contig)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            "gguf_prefill_indirect_gu strided vs contiguous x mismatch"
+        );
+    } else {
+        assert!(!require_nax(), "Metal/NAX required");
+    }
 
     // kq_sorted_combine with F16 input matches F32 input on both VEC4 (H=256) and tail (H=259).
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        assert!(!require_metal(), "Metal required");
+        return;
+    }
     let weights_vals: Vec<f32> = (0..pairs).map(|_| rng.next_f32(0.05, 0.4)).collect();
     let weights = MxArray::from_float32(&weights_vals, &[n_tok as i64, top as i64]).unwrap();
     let inv = MxArray::from_uint32(&inverse, &[n_tok as i64, top as i64]).unwrap();
@@ -1417,59 +1427,62 @@ fn gguf_prefill_bm64_multi_tile_and_m32_unchunked_dedup_parity() {
         let tl_arr = MxArray::from_uint32(&tiles64, &[(tiles64.len() / 3) as i64, 3]).unwrap();
         let slots_2d = MxArray::from_uint32(&sorted_slots, &[pairs as i64, 1]).unwrap();
 
-        let Some(got_gu) = gguf_prefill_indirect_gu(
+        if let Some(got_gu) = gguf_prefill_indirect_gu(
             &x_arr, &tr_arr, &tl_arr, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0,
         )
-        .unwrap() else {
-            assert!(!require_metal(), "Metal/NAX required");
-            return;
-        };
-        let got_dn =
-            gguf_prefill_indirect_down(&got_gu, &tl_arr, &d_buf, down_off, n_experts, h, down_bits)
-                .unwrap()
-                .unwrap();
-
-        let x_sorted = x_arr
-            .take(&tr_arr, 0)
-            .unwrap()
-            .reshape(&[pairs as i64, 1, 1, k as i64])
-            .unwrap();
-        let ref_g = g_kq
-            .gather(&x_sorted, &slots_2d)
-            .unwrap()
-            .astype(DType::Float32)
-            .unwrap()
-            .reshape(&[pairs as i64, m as i64])
-            .unwrap();
-        let ref_u = u_kq
-            .gather(&x_sorted, &slots_2d)
-            .unwrap()
-            .astype(DType::Float32)
-            .unwrap()
-            .reshape(&[pairs as i64, m as i64])
-            .unwrap();
-        let ref_gu = crate::nn::Activations::swiglu_clamped_compiled(&ref_g, &ref_u, 7.0).unwrap();
-        let ref_dn = d_kq
-            .gather(
-                &ref_gu.reshape(&[pairs as i64, 1, 1, m as i64]).unwrap(),
-                &slots_2d,
+        .unwrap()
+        {
+            let got_dn = gguf_prefill_indirect_down(
+                &got_gu, &tl_arr, &d_buf, down_off, n_experts, h, down_bits,
             )
             .unwrap()
-            .astype(DType::Float32)
-            .unwrap()
-            .reshape(&[pairs as i64, h as i64])
             .unwrap();
 
-        let (gu_max, gu_rel) = error_stats(&eval_f32(&got_gu), &eval_f32(&ref_gu));
-        let (dn_max, dn_rel) = error_stats(&eval_f32(&got_dn), &eval_f32(&ref_dn));
-        assert!(
-            gu_rel <= 2e-3,
-            "BM=64 GU bits={down_bits}: max_abs={gu_max:e} rel_l2={gu_rel:e}"
-        );
-        assert!(
-            dn_rel <= 2.5e-3,
-            "BM=64 DOWN bits={down_bits}: max_abs={dn_max:e} rel_l2={dn_rel:e}"
-        );
+            let x_sorted = x_arr
+                .take(&tr_arr, 0)
+                .unwrap()
+                .reshape(&[pairs as i64, 1, 1, k as i64])
+                .unwrap();
+            let ref_g = g_kq
+                .gather(&x_sorted, &slots_2d)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .reshape(&[pairs as i64, m as i64])
+                .unwrap();
+            let ref_u = u_kq
+                .gather(&x_sorted, &slots_2d)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .reshape(&[pairs as i64, m as i64])
+                .unwrap();
+            let ref_gu =
+                crate::nn::Activations::swiglu_clamped_compiled(&ref_g, &ref_u, 7.0).unwrap();
+            let ref_dn = d_kq
+                .gather(
+                    &ref_gu.reshape(&[pairs as i64, 1, 1, m as i64]).unwrap(),
+                    &slots_2d,
+                )
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .reshape(&[pairs as i64, h as i64])
+                .unwrap();
+
+            let (gu_max, gu_rel) = error_stats(&eval_f32(&got_gu), &eval_f32(&ref_gu));
+            let (dn_max, dn_rel) = error_stats(&eval_f32(&got_dn), &eval_f32(&ref_dn));
+            assert!(
+                gu_rel <= 2e-3,
+                "BM=64 GU bits={down_bits}: max_abs={gu_max:e} rel_l2={gu_rel:e}"
+            );
+            assert!(
+                dn_rel <= 2.5e-3,
+                "BM=64 DOWN bits={down_bits}: max_abs={dn_max:e} rel_l2={dn_rel:e}"
+            );
+        } else {
+            assert!(!require_nax(), "Metal/NAX required");
+        }
 
         // Single-pass unchunked M=32, top=16 (n_assign=512) dedup decode parity vs M=1 rows.
         let (rows, top) = (32usize, 16usize);
@@ -1484,12 +1497,14 @@ fn gguf_prefill_bm64_multi_tile_and_m32_unchunked_dedup_parity() {
         let x32 = x_arr.slice(&[0, 0], &[rows as i64, k as i64]).unwrap();
         let s32 = MxArray::from_uint32(&sids, &[rows as i64, top as i64]).unwrap();
         let w32 = MxArray::from_float32(&ws, &[rows as i64, top as i64]).unwrap();
-        let got_dec = gguf_routed_decode(
+        let Some(got_dec) = gguf_routed_decode(
             &x32, &s32, &w32, &g_buf, 32, &u_buf, 96, &d_buf, down_off, n_experts, m, h, down_bits,
             7.0,
         )
-        .unwrap()
-        .unwrap();
+        .unwrap() else {
+            assert!(!require_metal(), "Metal required");
+            return;
+        };
         let got_dec_v = eval_f32(&got_dec);
         for r in [0usize, 15, 31] {
             let xr = x32
@@ -1663,10 +1678,7 @@ fn gguf_prefill_indirect_no_fp16_early_narrowing_nan() {
             &x_arr, &tr_arr, &tl_arr, &g_buf, 32, &u_buf, 64, n_experts, m, 7.0,
         )
         .unwrap() else {
-            if require_metal() && unsafe { mlx_sys::mlx_metal_is_available() } {
-                // NAX may still be unavailable on non-M5 Apple Silicon; skip only when NAX is absent.
-                return;
-            }
+            assert!(!require_nax(), "Metal/NAX required");
             return;
         };
         let got_gu = eval_f32(&got_gu_arr);

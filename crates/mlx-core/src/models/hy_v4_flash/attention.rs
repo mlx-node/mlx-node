@@ -183,7 +183,23 @@ fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
 
 pub(crate) fn attn_prefill_f16_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_ATTN_PREFILL_F16").as_deref() != Ok("0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_HY4_ATTN_PREFILL_F16").as_deref() != Ok("0")
+            && unsafe { mlx_sys::mlx_metal_is_nax_available() }
+    })
+}
+
+fn cast_grouped_out(y: MxArray, out_f16: bool) -> Result<MxArray> {
+    let want = if out_f16 {
+        DType::Float16
+    } else {
+        DType::Float32
+    };
+    if y.dtype()? == want {
+        Ok(y)
+    } else {
+        y.astype(want)
+    }
 }
 
 /// `x_mgh [m, g, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
@@ -223,7 +239,10 @@ pub(crate) fn grouped_mm_t_mgh_out(
                 )
             };
             if !h.is_null() {
-                return MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode");
+                return cast_grouped_out(
+                    MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode")?,
+                    out_f16,
+                );
             }
         } else if m > 16 && prefill_q8_grouped_nax_enabled() {
             let xf = match x_mgh.dtype()? {
@@ -246,7 +265,13 @@ pub(crate) fn grouped_mm_t_mgh_out(
             }
         }
     }
-    grouped_mm_t(w, &x_mgh.transpose(Some(&[1, 0, 2]))?, g)?.transpose(Some(&[1, 0, 2]))
+    let xf = if x_mgh.dtype()? == DType::Float32 {
+        x_mgh.clone()
+    } else {
+        x_mgh.astype(DType::Float32)?
+    };
+    let y = grouped_mm_t(w, &xf.transpose(Some(&[1, 0, 2]))?, g)?.transpose(Some(&[1, 0, 2]))?;
+    cast_grouped_out(y, out_f16)
 }
 
 /// One call's projections.

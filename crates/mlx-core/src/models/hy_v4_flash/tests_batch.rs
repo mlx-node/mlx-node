@@ -616,6 +616,14 @@ fn q8_dual_down_add_prefill_nax_parity_and_strided_inputs() {
     use super::ops::try_q8_dual_down_add;
     use crate::nn::Activations;
 
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        assert!(
+            std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1"),
+            "NAX required for q8_dual_down_add prefill test"
+        );
+        return;
+    }
+
     crate::models::hy_v4_flash::exact_f32();
     let mut r = Rng(2030);
     let boundary_g = [-25.0f32, -10.5, -10.0, -1.5, 0.0, 2.5, 10.0, 10.5, 25.0];

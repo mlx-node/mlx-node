@@ -2257,51 +2257,55 @@ fn mla_prefill_split_q_matches_combined_bitwise_sliding_and_indexed() {
     let window = 512usize;
 
     // Sliding NAX: cover partial BH=4 head tiles (H=6), H=32, H=64, Ring & Linear.
-    for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in &[
-        (17usize, 6usize, 500usize, true, 540usize, 0usize, 701u64),
-        (35, 32, 600, true, 650, 0, 709),
-        (64, 64, 512, false, 0, 12, 719),
-    ] {
-        let mut r = Rng(seed);
-        let q_abs = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v]);
-        let q_pe = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r]);
-        let q_full = MxArray::concatenate(&q_abs, &q_pe, -1).unwrap();
-        let key_rows = if is_ring {
-            ring_cap
-        } else {
-            start_pos + s - first_key
-        };
-        let keys = arr(&r.vec(key_rows * d, 1.0), &[key_rows, d])
-            .astype(DType::Float16)
-            .unwrap();
-        let sinks = arr(&r.vec(h, 2.0), &[h]);
+    if unsafe { mlx_sys::mlx_metal_is_nax_available() }
+        || std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() == Ok("1")
+    {
+        for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in &[
+            (17usize, 6usize, 500usize, true, 540usize, 0usize, 701u64),
+            (35, 32, 600, true, 650, 0, 709),
+            (64, 64, 512, false, 0, 12, 719),
+        ] {
+            let mut r = Rng(seed);
+            let q_abs = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v]);
+            let q_pe = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r]);
+            let q_full = MxArray::concatenate(&q_abs, &q_pe, -1).unwrap();
+            let key_rows = if is_ring {
+                ring_cap
+            } else {
+                start_pos + s - first_key
+            };
+            let keys = arr(&r.vec(key_rows * d, 1.0), &[key_rows, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let sinks = arr(&r.vec(h, 2.0), &[h]);
 
-        let out_full = try_sliding_sink_attention_prefill(
-            &q_full, None, &keys, &sinks, d_v as i64, scale, start_pos, is_ring, ring_cap, window,
-            first_key,
-        )
-        .unwrap()
-        .expect("sliding combined");
-        let out_split = try_sliding_sink_attention_prefill(
-            &q_abs,
-            Some(&q_pe),
-            &keys,
-            &sinks,
-            d_v as i64,
-            scale,
-            start_pos,
-            is_ring,
-            ring_cap,
-            window,
-            first_key,
-        )
-        .unwrap()
-        .expect("sliding split-Q");
-        assert_eq!(
-            bits(&out_split),
-            bits(&out_full),
-            "sliding split-Q vs combined mismatch S={s} H={h} ring={is_ring}"
-        );
+            let out_full = try_sliding_sink_attention_prefill(
+                &q_full, None, &keys, &sinks, d_v as i64, scale, start_pos, is_ring, ring_cap,
+                window, first_key,
+            )
+            .unwrap()
+            .expect("sliding combined");
+            let out_split = try_sliding_sink_attention_prefill(
+                &q_abs,
+                Some(&q_pe),
+                &keys,
+                &sinks,
+                d_v as i64,
+                scale,
+                start_pos,
+                is_ring,
+                ring_cap,
+                window,
+                first_key,
+            )
+            .unwrap()
+            .expect("sliding split-Q");
+            assert_eq!(
+                bits(&out_split),
+                bits(&out_full),
+                "sliding split-Q vs combined mismatch S={s} H={h} ring={is_ring}"
+            );
+        }
     }
 
     // Indexed NAX: Whole & Split KV planes, partial & full tiles.

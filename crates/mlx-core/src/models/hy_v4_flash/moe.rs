@@ -237,8 +237,21 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
     qlinear_out(x, w, false)
 }
 
-/// `qlinear` accepting `Float16` or `Float32` `x` on the Q8 prefill path and
-/// writing `Float16` when `out_f16` is set and the prefill kernel runs.
+fn cast_qlinear_out(y: MxArray, out_f16: bool) -> Result<MxArray> {
+    let want = if out_f16 {
+        DType::Float16
+    } else {
+        DType::Float32
+    };
+    if y.dtype()? == want {
+        Ok(y)
+    } else {
+        y.astype(want)
+    }
+}
+
+/// `qlinear` accepting `Float16` or `Float32` `x` and returning `Float16`
+/// when `out_f16` is set and `Float32` otherwise.
 pub(crate) fn qlinear_out(x: &MxArray, w: &Dense, out_f16: bool) -> Result<MxArray> {
     if let Some((qw, scales, biases)) = w.qmm_parts()
         && x.ndim()? == 2
@@ -261,7 +274,10 @@ pub(crate) fn qlinear_out(x: &MxArray, w: &Dense, out_f16: bool) -> Result<MxArr
                 )
             };
             if !h.is_null() {
-                return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
+                return cast_qlinear_out(
+                    MxArray::from_handle(h, "hy_v4_flash q8_dense_decode")?,
+                    out_f16,
+                );
             }
         } else if n >= 12 {
             let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
@@ -300,16 +316,29 @@ pub(crate) fn qlinear_out(x: &MxArray, w: &Dense, out_f16: bool) -> Result<MxArr
                     )
                 };
                 if !h.is_null() {
-                    return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
+                    return cast_qlinear_out(
+                        MxArray::from_handle(h, "hy_v4_flash q8_dense_decode")?,
+                        out_f16,
+                    );
                 }
             }
         }
         if n > 0 && n < MIN_Q8_ROWS {
-            let y = linear(&x.pad(&[0, (MIN_Q8_ROWS - n) as i32, 0, 0], 0.0)?, w)?;
-            return y.slice(&[0, 0], &[n, y.shape_at(1)?]);
+            let xf = if x.dtype()? == DType::Float32 {
+                x.clone()
+            } else {
+                x.astype(DType::Float32)?
+            };
+            let y = linear(&xf.pad(&[0, (MIN_Q8_ROWS - n) as i32, 0, 0], 0.0)?, w)?;
+            return cast_qlinear_out(y.slice(&[0, 0], &[n, y.shape_at(1)?])?, out_f16);
         }
     }
-    linear(x, w)
+    let xf = if x.dtype()? == DType::Float32 {
+        x.clone()
+    } else {
+        x.astype(DType::Float32)?
+    };
+    cast_qlinear_out(linear(&xf, w)?, out_f16)
 }
 
 /// `sigmoid(x · wᵀ) * mul_in` fused in the Q8 NAX prefill epilogue.
