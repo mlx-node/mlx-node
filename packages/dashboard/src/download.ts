@@ -33,14 +33,41 @@
  * Both swaps go through a temp backup so a crash mid-rename rolls back to the original; an orphaned backup a
  * crash leaves behind is recovered (or reaped) by a best-effort sweep at the
  * start of the next download, and a Reinstall's backup also when the manager starts.
+ * The old folder of an install that Update adopted is not removed with `rm -rf`: `removeOwnedBackup` deletes only
+ * the files its marker's `adopted` record proves and keeps the rest in `.staging/<slug>.kept-<uuid>`.
  *
  * Pure disk + network — never the native addon.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { accessSync, constants, createReadStream, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
-import { copyFile, mkdir, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import {
+  accessSync,
+  type BigIntStats,
+  constants,
+  createReadStream,
+  type Dir,
+  type Dirent,
+  existsSync,
+  lstatSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import {
+  copyFile,
+  link,
+  lstat,
+  mkdir,
+  open,
+  opendir,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
@@ -75,6 +102,7 @@ import {
   type ForeignEntrySummary,
   holdsModelFiles,
   isDownloaderOwned,
+  isModelFileName,
   isModelInstalled,
   isPathOccupied,
   isSafeRelPath,
@@ -226,6 +254,18 @@ function hasModelPayload(files: ListFileEntry[], waivesConfigRequirement: boolea
   return hasConfig && files.some((file) => isWeightFile(file.path));
 }
 
+function assertModelPayload(repoName: string, files: ListFileEntry[], assetsRepo: string | undefined): void {
+  if (hasModelPayload(files, assetsRepo !== undefined)) return;
+  const need =
+    assetsRepo !== undefined
+      ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
+      : 'both a config.json and a weight file';
+  throw new Error(`Repo "${repoName}" is not a complete model (needs ${need})`);
+}
+
+/** The tokenizer/config sidecars one job fetches from the entry's `assetsRepo`, pinned to one commit. */
+type SidecarPlan = { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] };
+
 /** Streaming hex digest of a file's raw bytes (no git header). */
 async function hashFile(path: string, algo: 'sha1' | 'sha256'): Promise<string> {
   const hash = createHash(algo);
@@ -305,6 +345,127 @@ async function listStagedFiles(dir: string): Promise<string[]> {
 }
 
 /**
+ * Remove the entry at `full`, which a check just found to be one the caller may delete, without unlinking by name:
+ * a writer could rename another file onto the name between that check and the unlink. The entry is renamed to `aside`
+ * (a private path) and `owned` checks it there, where no path of the folder reaches it. An entry it rejects goes
+ * back with `link`, which never overwrites (a folder with `rename`). Returns `gone` when the name no longer holds the
+ * owned entry, `stays` when nothing was moved, `restored` when a rejected entry is back at its name, and `aside` when
+ * something is left at `aside`.
+ */
+async function unlinkIfStillOwned(
+  full: string,
+  aside: string,
+  owned: (stat: BigIntStats) => boolean,
+): Promise<'gone' | 'stays' | 'restored' | 'aside'> {
+  try {
+    await mkdir(dirname(aside), { recursive: true });
+  } catch {
+    return 'stays';
+  }
+  try {
+    await rename(full, aside);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'gone' : 'stays';
+  }
+  let stat: BigIntStats;
+  try {
+    stat = await lstat(aside, { bigint: true });
+  } catch {
+    return 'aside';
+  }
+  if (owned(stat)) {
+    try {
+      await unlink(aside);
+      return 'gone';
+    } catch {
+      return 'aside';
+    }
+  }
+  try {
+    if (stat.isDirectory()) {
+      await rename(aside, full);
+      return 'restored';
+    }
+    if (!stat.isFile()) return 'aside';
+    await link(aside, full);
+  } catch {
+    return 'aside';
+  }
+  try {
+    await unlink(aside);
+    return 'restored';
+  } catch {
+    return 'aside';
+  }
+}
+
+/** Remove `dir` and every folder under it that holds no file, bottom up. Returns whether `dir` is still there. */
+async function removeEmptyDirs(dir: string): Promise<boolean> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+  for (const entry of entries) if (entry.isDirectory()) await removeEmptyDirs(join(dir, entry.name));
+  try {
+    await rmdir(dir);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Unlink each regular file under `dir` that the marker lists and whose `lstat` size and `mtimeNs` still equal its
+ * `adopted` record, then remove the sub-folders left empty. Each file is moved to `<aside>/<path>` and checked there
+ * before the unlink ({@link unlinkIfStillOwned}); a file that cannot go back to its name stays under `aside`. Anything
+ * else stays: other files, links, special files, and the root marker, which must stay while anything else does so
+ * that a second pass reads the same record. A file that cannot be read or unlinked stays too.
+ */
+async function removeProvenFiles(
+  dir: string,
+  prefix: string,
+  listed: ReadonlySet<string>,
+  adopted: Readonly<Record<string, { size: number; mtimeNs: string }>>,
+  aside: string,
+): Promise<void> {
+  const names: string[] = [];
+  try {
+    for await (const entry of await opendir(dir)) names.push(entry.name);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const rel = prefix === '' ? name : `${prefix}/${name}`;
+    if (rel === DOWNLOAD_COMPLETE_MARKER) continue;
+    const full = join(dir, name);
+    let stat;
+    try {
+      stat = await lstat(full, { bigint: true });
+    } catch {
+      continue;
+    }
+    if (stat.isDirectory()) {
+      await removeProvenFiles(full, rel, listed, adopted, aside);
+      await rmdir(full).catch(() => {});
+      continue;
+    }
+    if (!stat.isFile() || !listed.has(rel) || !Object.hasOwn(adopted, rel)) continue;
+    const record = adopted[rel];
+    const proven = (s: BigIntStats): boolean =>
+      s.isFile() && s.size === BigInt(record.size) && s.mtimeNs.toString() === record.mtimeNs;
+    if (!proven(stat)) continue;
+    const checked = stat;
+    await unlinkIfStillOwned(
+      full,
+      join(aside, rel),
+      (moved) => moved.dev === checked.dev && moved.ino === checked.ino && proven(moved),
+    );
+  }
+}
+
+/**
  * Best-effort `fsync` of a directory fd so a rename into it is durable before the
  * backup is removed. Filesystems that reject a directory fsync are tolerated —
  * durability is a nicety here, not a correctness gate.
@@ -364,8 +525,16 @@ export type DownloadEvent =
       totalBytes: number;
       fileIndex: number;
       fileCount: number;
+      /** Set while Update hashes a file that is already in the folder; absent while a file downloads. */
+      phase?: 'check';
     }
-  | { type: 'done'; id: string; outputDir: string }
+  | {
+      type: 'done';
+      id: string;
+      outputDir: string;
+      /** Where the files of the old folder that the app may not delete were moved; set only when there were some. */
+      keptDir?: string;
+    }
   | { type: 'error'; id: string; message: string }
   | { type: 'cancelled'; id: string };
 
@@ -497,6 +666,442 @@ function assertStillReplaceable(kept: ForeignEntrySummary, finalDir: string, slu
   }
 }
 
+const NOTHING_CHANGED = 'Nothing was changed.';
+
+/** The failure text of an Update that stopped before the folder gained a file: it says the folder is as it was. */
+function withNothingChanged(message: string): string {
+  if (message.includes(NOTHING_CHANGED)) return message;
+  return message.endsWith('.') ? `${message} ${NOTHING_CHANGED}` : `${message}. ${NOTHING_CHANGED}`;
+}
+
+/** Entries {@link scanFolder} reads before it refuses a folder for Update. */
+const ADOPT_SCAN_MAX_ENTRIES = 2_000;
+
+/** Shortest gap between two `progress` frames of one file that Update hashes in the folder. */
+const CHECK_PROGRESS_INTERVAL_MS = 100;
+
+/** The `stat` fields that change when a file is rewritten in place or replaced. */
+export interface FileFingerprint {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function fingerprintOf(stat: BigIntStats): FileFingerprint {
+  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+}
+
+function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+/**
+ * The digest that proves a manifest entry's bytes, by the same two branches as {@link isStagedCopyComplete}: the LFS
+ * sha256, or the git-blob sha1 of a plain file. `null` when the entry has neither, and then Update cannot prove it.
+ */
+function checksumOf(file: ListFileEntry): { algo: 'sha256' | 'git-blob-sha1'; oid: string } | null {
+  if (file.lfs?.oid !== undefined) return { algo: 'sha256', oid: file.lfs.oid };
+  if (file.lfs === undefined && file.xetHash === undefined && file.oid !== undefined) {
+    return { algo: 'git-blob-sha1', oid: file.oid };
+  }
+  return null;
+}
+
+/** One entry of a folder Update looks at, by its posix path inside the folder. */
+interface FolderEntry {
+  path: string;
+  isDirectory: boolean;
+  stat: FileFingerprint;
+}
+
+/** A file in the folder that Update proves by hash, with the `lstat` the plan saw. */
+interface AdoptCheck {
+  file: ListFileEntry;
+  size: number;
+  mtimeNs: bigint;
+  ino: bigint;
+}
+
+/** A wanted file, with the repo and pinned revision it comes from. */
+interface AdoptWanted {
+  file: ListFileEntry;
+  repo: string;
+  revision: string;
+}
+
+/** A plan of Update for one repo: what the job checks, downloads and leaves, and the token that names it. */
+interface AdoptPlan {
+  token: string;
+  revision: string;
+  assetsRepo: string | null;
+  assetsRevision: string | null;
+  folder: { dev: bigint; ino: bigint };
+  /** Every file the catalog entry installs, primary files first, in manifest order. */
+  wanted: AdoptWanted[];
+  check: AdoptCheck[];
+  download: AdoptWanted[];
+  other: { count: number; bytes: number; names: string[] };
+}
+
+/** The body of `POST /api/downloads/adopt-plan`. */
+export interface AdoptPlanSummary {
+  repo: string;
+  slug: string;
+  token: string;
+  revision: string;
+  assetsRevision: string | null;
+  check: { count: number; bytes: number };
+  download: { count: number; bytes: number };
+  other: { count: number; bytes: number; names: string[] };
+}
+
+/** A file whose hash did not match the catalog, as it was when it was hashed. */
+interface MismatchRecord {
+  size: number;
+  mtimeNs: bigint;
+  ino: bigint;
+  oid: string;
+}
+
+function changedOnDiskMessage(slug: string): string {
+  return `"${slug}" changed on disk. Check it, then try again.`;
+}
+
+/**
+ * Every entry under `dir` by `lstat`, without opening a file or following a link. A link or a special file, or more
+ * than {@link ADOPT_SCAN_MAX_ENTRIES} entries, refuses the folder.
+ */
+async function scanFolder(
+  dir: string,
+  slug: string,
+): Promise<{ folder: { dev: bigint; ino: bigint }; entries: FolderEntry[] }> {
+  const isGone = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === 'ENOENT';
+  let root: BigIntStats;
+  try {
+    root = await lstat(dir, { bigint: true });
+  } catch (error) {
+    if (isGone(error)) throw new DownloadConflictError(changedOnDiskMessage(slug));
+    throw error;
+  }
+  if (!root.isDirectory()) throw new DownloadConflictError(changedOnDiskMessage(slug));
+  const entries: FolderEntry[] = [];
+  const pending: string[] = [''];
+  // An entry that goes away during the scan is left out, not refused: a wanted path that is gone then reads as a
+  // download, which classifyFolder and the commit barrier compare against the plan.
+  while (pending.length > 0) {
+    const prefix = pending.pop()!;
+    let handle: Dir;
+    try {
+      handle = await opendir(prefix === '' ? dir : join(dir, prefix));
+    } catch (error) {
+      if (prefix !== '' && isGone(error)) continue;
+      throw error;
+    }
+    for await (const dirent of handle) {
+      if (entries.length >= ADOPT_SCAN_MAX_ENTRIES) {
+        throw new DownloadConflictError(
+          `"${slug}" holds more than ${ADOPT_SCAN_MAX_ENTRIES.toLocaleString('en-US')} files. Update cannot check it.`,
+        );
+      }
+      const path = prefix === '' ? dirent.name : `${prefix}/${dirent.name}`;
+      let stat: BigIntStats;
+      try {
+        stat = await lstat(join(dir, path), { bigint: true });
+      } catch (error) {
+        if (isGone(error)) continue;
+        throw error;
+      }
+      if (stat.isDirectory()) pending.push(path);
+      else if (!stat.isFile()) {
+        throw new DownloadConflictError(`"${slug}" holds links or special files. Update cannot check it.`);
+      }
+      entries.push({ path, isDirectory: stat.isDirectory(), stat: fingerprintOf(stat) });
+    }
+  }
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { folder: { dev: root.dev, ino: root.ino }, entries };
+}
+
+function notCatalogFileMessage(path: string, slug: string): string {
+  return `"${path}" in "${slug}" is not the catalog file. Move it out of the folder, then use Update again.`;
+}
+
+/**
+ * Sort the folder's entries into the files Update checks by hash, the wanted files it downloads, and the other files
+ * it leaves where they are, or refuse the folder with a {@link DownloadConflictError} that names the file. The plan and
+ * the job both run this, so they cannot disagree.
+ */
+function classifyFolder(
+  entries: readonly FolderEntry[],
+  wanted: readonly AdoptWanted[],
+  memo: ReadonlyMap<string, MismatchRecord>,
+  slug: string,
+): { check: AdoptCheck[]; download: AdoptWanted[]; other: { count: number; bytes: number; names: string[] } } {
+  const wantedPaths = new Set(wanted.map((item) => item.file.path));
+  const wantedByLower = new Map(wanted.map((item) => [item.file.path.toLowerCase(), item.file.path]));
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  const otherNames: string[] = [];
+  let otherBytes = 0;
+  for (const entry of entries) {
+    if (wantedPaths.has(entry.path)) {
+      if (entry.isDirectory) throw new DownloadConflictError(notCatalogFileMessage(entry.path, slug));
+      continue;
+    }
+    if (entry.isDirectory) continue;
+    if (entry.path === DOWNLOAD_COMPLETE_MARKER) {
+      throw new DownloadConflictError(
+        `"${slug}" holds a download record that the app cannot read (${DOWNLOAD_COMPLETE_MARKER}). ` +
+          `Move it out of the folder, then use Update again.`,
+      );
+    }
+    // On a case-insensitive volume the link of the catalog name would land on this file.
+    const catalogName = wantedByLower.get(entry.path.toLowerCase());
+    if (catalogName !== undefined) {
+      throw new DownloadConflictError(
+        `"${entry.path}" in "${slug}" differs from the catalog name "${catalogName}" only in letter case. ` +
+          `Rename it, then use Update again.`,
+      );
+    }
+    if (isModelFileName(basename(entry.path))) {
+      throw new DownloadConflictError(
+        `"${entry.path}" in "${slug}" is a model file that is not part of the catalog model. ` +
+          `Move it out of the folder, then use Update again.`,
+      );
+    }
+    otherNames.push(entry.path);
+    otherBytes += Number(entry.stat.size);
+  }
+  const check: AdoptCheck[] = [];
+  const download: AdoptWanted[] = [];
+  for (const item of wanted) {
+    const entry = byPath.get(item.file.path);
+    if (entry === undefined) {
+      // The staged copy of a file with no digest would be checked by its size alone.
+      if (checksumOf(item.file) === null) {
+        throw new DownloadConflictError(
+          `The catalog gives no checksum for "${item.file.path}", so Update cannot check what it downloads.`,
+        );
+      }
+      download.push(item);
+      continue;
+    }
+    const size = Number(entry.stat.size);
+    if (size !== item.file.size) {
+      throw new DownloadConflictError(
+        `"${item.file.path}" in "${slug}" is not the catalog file. Its size is different. ` +
+          `Move it out of the folder, then use Update again. ` +
+          `Update then downloads the catalog file (${item.file.size.toLocaleString('en-US')} bytes).`,
+      );
+    }
+    // A same-size file is never taken on its size: only its hash proves it.
+    const sum = checksumOf(item.file);
+    if (sum === null) {
+      throw new DownloadConflictError(
+        `The catalog gives no checksum for "${item.file.path}", so Update cannot check it. ` +
+          `Move it out of the folder, then use Update again.`,
+      );
+    }
+    const failed = memo.get(`${slug}\0${item.file.path}`);
+    if (
+      failed !== undefined &&
+      failed.size === size &&
+      failed.mtimeNs === entry.stat.mtimeNs &&
+      failed.ino === entry.stat.ino &&
+      failed.oid === sum.oid
+    ) {
+      throw new DownloadConflictError(notCatalogFileMessage(item.file.path, slug));
+    }
+    check.push({ file: item.file, size, mtimeNs: entry.stat.mtimeNs, ino: entry.stat.ino });
+  }
+  return { check, download, other: { count: otherNames.length, bytes: otherBytes, names: otherNames.slice(0, 3) } };
+}
+
+/**
+ * The token of an Update plan: a sha256 over what the job must find again before it may touch the folder. The other
+ * files are left out on purpose, so a `.DS_Store` that Finder writes does not break the confirm.
+ */
+function adoptToken(plan: {
+  repo: string;
+  revision: string;
+  assetsRepo: string | null;
+  assetsRevision: string | null;
+  wanted: readonly AdoptWanted[];
+  check: readonly AdoptCheck[];
+  download: readonly AdoptWanted[];
+  folder: { dev: bigint; ino: bigint };
+}): string {
+  const byFirst = (a: unknown[], b: unknown[]): number => {
+    const [x, y] = [String(a[0]), String(b[0])];
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+  const body = {
+    repo: plan.repo,
+    revision: plan.revision,
+    assetsRepo: plan.assetsRepo,
+    assetsRevision: plan.assetsRevision,
+    wanted: plan.wanted
+      .map((item) => [item.file.path, item.file.size, checksumOf(item.file)?.oid ?? null])
+      .sort(byFirst),
+    check: plan.check
+      .map((item) => [item.file.path, item.size, item.mtimeNs.toString(), item.ino.toString()])
+      .sort(byFirst),
+    download: plan.download.map((item) => item.file.path).sort(),
+    folder: `${plan.folder.dev}:${plan.folder.ino}`,
+  };
+  return createHash('sha256').update(JSON.stringify(body)).digest('hex');
+}
+
+/**
+ * Hash a file in the folder where it is, and say whether its bytes are the catalog file. The fd is opened without
+ * following a link, and its `fstat` must equal `expect` before the read and be unchanged after it, so bytes that were
+ * rewritten during the read are never taken as proven. Throws when `hooks.cancelled()` turns true between chunks.
+ */
+export async function proveInPlace(
+  dir: string,
+  file: ListFileEntry,
+  expect: { size: number; mtimeNs: bigint; ino: bigint },
+  hooks: { cancelled(): boolean; onBytes(n: number): void },
+): Promise<{ match: boolean; fingerprint: FileFingerprint }> {
+  const sum = checksumOf(file);
+  if (sum === null) throw new Error(`The catalog gives no checksum for "${file.path}", so Update cannot check it.`);
+  const changed = (): Error =>
+    new Error(`"${file.path}" in "${basename(dir)}" changed during the check. ${NOTHING_CHANGED} Use Update again.`);
+  // O_NONBLOCK so that a FIFO swapped in after the plan cannot block the open.
+  const handle = await open(join(dir, file.path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const before = fingerprintOf(opened);
+    if (
+      !opened.isFile() ||
+      before.size !== BigInt(expect.size) ||
+      before.mtimeNs !== expect.mtimeNs ||
+      before.ino !== expect.ino
+    ) {
+      throw changed();
+    }
+    const hash = createHash(sum.algo === 'sha256' ? 'sha256' : 'sha1');
+    if (sum.algo === 'git-blob-sha1') hash.update(`blob ${before.size}\0`);
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      if (hooks.cancelled()) throw new Error('Download cancelled');
+      const bytes = chunk as Buffer;
+      hash.update(bytes);
+      hooks.onBytes(bytes.length);
+    }
+    const after = fingerprintOf(await handle.stat({ bigint: true }));
+    if (!sameFingerprint(before, after)) throw changed();
+    return { match: hash.digest('hex') === sum.oid, fingerprint: before };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** A name that Update added to the folder: a second name of the staged file with this `dev:ino`. */
+interface AddedName {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+/**
+ * Add the staged file `from` to the folder `dir` at `path`. Only `link` may do this: it fails with EEXIST when
+ * anything is at the path, so a file that the user put there is never overwritten. A parent folder that is missing is
+ * made with a plain `mkdir` and recorded in `madeDirs`; the name is recorded in `added` as soon as it exists.
+ */
+async function linkInto(
+  dir: string,
+  slug: string,
+  path: string,
+  from: string,
+  staged: FileFingerprint,
+  added: AddedName[],
+  madeDirs: string[],
+): Promise<void> {
+  const changed = (): Error => new Error(`"${slug}" changed on disk during the update.`);
+  const segments = path.split('/');
+  let parent = dir;
+  for (const segment of segments.slice(0, -1)) {
+    parent = join(parent, segment);
+    try {
+      await mkdir(parent);
+      madeDirs.push(parent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (!(await lstat(parent)).isDirectory()) throw changed();
+    }
+  }
+  const to = join(dir, path);
+  try {
+    await link(from, to);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') throw new Error(`"${path}" appeared in "${slug}" during the update.`);
+    throw new Error(
+      `The app could not add "${path}" to "${slug}" (${code ?? String(error)}). Update needs a volume that can link files.`,
+    );
+  }
+  added.push({ path, dev: staged.dev, ino: staged.ino });
+  const now = await lstat(to, { bigint: true });
+  if (!now.isFile() || now.dev !== staged.dev || now.ino !== staged.ino) throw changed();
+}
+
+/**
+ * Undo the adds of an Update that failed, newest first. A name is removed only while `lstat` shows the job's own
+ * staged file there, and through {@link unlinkIfStillOwned} with `<keptDir>/<path>` as its private path, so a file
+ * renamed onto the name meanwhile is put back, or left in `keptDir` when its name was taken again. Whatever else took
+ * the path is not the job's and stays. When `config.json` or the marker cannot be removed, every name not yet reached
+ * stays as well: a config.json without the files added beside it reads as installed and missing its tokenizer.
+ * Folders the job made are removed with `rmdir`, so one that something came into stays too. Returns the names of the
+ * job's files that are still there, and `keptDir` when anything is left in it.
+ */
+async function removeAddedNames(
+  dir: string,
+  added: readonly AddedName[],
+  madeDirs: readonly string[],
+  keptDir: string,
+): Promise<{ stays: string[]; kept?: string }> {
+  const stays: string[] = [];
+  const newestFirst = [...added].reverse();
+  for (let index = 0; index < newestFirst.length; index++) {
+    const name = newestFirst[index];
+    const full = join(dir, name.path);
+    let stat: BigIntStats | null = null;
+    let removed = true;
+    try {
+      stat = await lstat(full, { bigint: true });
+    } catch (error) {
+      removed = (error as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+    if (stat !== null && stat.isFile() && stat.dev === name.dev && stat.ino === name.ino) {
+      const result = await unlinkIfStillOwned(
+        full,
+        join(keptDir, name.path),
+        (moved) => moved.isFile() && moved.dev === name.dev && moved.ino === name.ino,
+      );
+      removed = result !== 'stays';
+    }
+    if (removed) continue;
+    if (name.path === 'config.json' || name.path === DOWNLOAD_COMPLETE_MARKER) {
+      stays.push(...newestFirst.slice(index).map((rest) => rest.path));
+      return { stays, ...((await removeEmptyDirs(keptDir)) ? { kept: keptDir } : {}) };
+    }
+    stays.push(name.path);
+  }
+  for (const made of [...madeDirs].reverse()) await rmdir(made).catch(() => {});
+  return { stays, ...((await removeEmptyDirs(keptDir)) ? { kept: keptDir } : {}) };
+}
+
+/** `fsync` of a regular file, so its bytes are on disk before a name of it is added to the folder. */
+async function fsyncFile(path: string): Promise<void> {
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * `committing` is the brief, non-cancellable window from just before `publish`
  * until the job settles: `cancel()`'s `state !== 'running'` gate rejects it, so a
@@ -523,7 +1128,15 @@ interface JobState {
    * `null` for a plain install, which never replaces an unowned entry.
    */
   replace: ForeignEntrySummary | null;
-  /** From just before the final entry is moved aside until a rollback put it back: the old entry is not in place. */
+  /**
+   * An Update: the plan the user confirmed, for the folder at the slug that holds a model the app did not create.
+   * `null` for every other job.
+   */
+  adopt: AdoptPlan | null;
+  /**
+   * From just before the final entry is moved aside until a rollback put it back: the old entry is not in place. For
+   * an Update, from the first add until a rollback removed every added name: the folder holds files the job added.
+   */
   swapStarted: boolean;
   /**
    * Set by {@link DownloadManager.cancel}. An in-flight `processJob` unwinds at
@@ -614,6 +1227,13 @@ export class DownloadManager {
   private currentFile: FileContext | null = null;
   /** The sweep of crashed Reinstall backups started with the manager; every job waits for it. */
   private readonly reinstallRecovery: Promise<void>;
+  /** The last Update plan per repo; a request must carry its token. */
+  private readonly adoptPlans = new Map<string, AdoptPlan>();
+  /**
+   * Files whose hash did not match, keyed `<slug>\0<path>`, so the next plan refuses an unchanged file without hashing
+   * it again. In memory only.
+   */
+  private readonly mismatchMemo = new Map<string, MismatchRecord>();
 
   constructor(opts: { modelsDir: string; cacheDir?: string; fetchImpl?: typeof fetch; probeTimeoutMs?: number }) {
     this.modelsDir = opts.modelsDir;
@@ -646,8 +1266,12 @@ export class DownloadManager {
    * an already-published repo+revision short-circuits to `done` rather than
    * erroring. A Reinstall request while a plain job holds the repo is refused instead: that job would not replace
    * the entry the user asked to replace.
+   *
+   * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the repo, which the
+   * request uses up. A repeat Update request while the Update job is active hands back its id; one while another job
+   * holds the repo is refused.
    */
-  start(repo: string, opts?: { replaceBlocker?: ReplaceBlocker }): string {
+  start(repo: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): string {
     if (this.closed) throw new DownloadsClosedError();
     // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
@@ -659,8 +1283,14 @@ export class DownloadManager {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
     const asked = opts?.replaceBlocker;
+    const token = opts?.adopt;
     const active = this.activeJobFor(repo);
     if (active !== undefined) {
+      if (token !== undefined && active.adopt === null) {
+        throw new DownloadConflictError(
+          'A download of this model is already in the queue. Cancel it, then use Update.',
+        );
+      }
       if (asked !== undefined && active.replace === null) {
         throw new DownloadConflictError(
           'A download of this model is already in the queue. Cancel it, then use Reinstall.',
@@ -669,6 +1299,7 @@ export class DownloadManager {
       return active.id;
     }
     const replace = asked === undefined ? null : this.acceptReplace(repo, asked);
+    const adopt = token === undefined ? null : this.acceptAdopt(repo, token);
     const id = randomUUID();
     this.jobsById.set(id, {
       id,
@@ -677,6 +1308,7 @@ export class DownloadManager {
       receivedBytes: 0,
       totalBytes: 0,
       replace,
+      adopt,
       swapStarted: false,
       cancelled: false,
       controller: new AbortController(),
@@ -707,6 +1339,87 @@ export class DownloadManager {
       throw new DownloadConflictError(`"${slug}" changed on disk. Check it, then try again.`);
     }
     return now;
+  }
+
+  /** The plan an Update request confirmed, taken out of `adoptPlans`: it must be the server's last plan for the repo. */
+  private acceptAdopt(repo: string, token: string): AdoptPlan {
+    const plan = this.adoptPlans.get(repo);
+    if (plan === undefined || plan.token !== token) {
+      const slug = repo.split('/').pop()!.toLowerCase();
+      throw new DownloadConflictError(`"${slug}" changed on disk. Close this, then use Update again.`);
+    }
+    this.adoptPlans.delete(repo);
+    return plan;
+  }
+
+  /**
+   * Plan an Update of the folder at the repo's slug that holds a model the app did not create: which catalog files are
+   * there to be checked by hash, which are missing and will be downloaded, and which other files stay. Reads only
+   * `lstat` data and the remote manifests, through the raw fetch with a deadline, so a running job neither counts its
+   * bytes nor cancels it. The plan is kept per repo, and a request to start the Update must carry its token. A folder
+   * Update cannot take is refused with a {@link DownloadConflictError} that names the file.
+   */
+  async planAdoption(repo: string): Promise<AdoptPlanSummary> {
+    if (this.closed) throw new DownloadsClosedError();
+    if (!catalogDownloadRepos().includes(repo)) {
+      throw new Error(`Repo "${repo}" is not in the model catalog`);
+    }
+    if (this.activeJobFor(repo) !== undefined) {
+      throw new DownloadConflictError('A download of this model is already in the queue. Cancel it, then use Update.');
+    }
+    await this.reinstallRecovery;
+    const slug = repo.split('/').pop()!.toLowerCase();
+    let plan: AdoptPlan;
+    try {
+      plan = await this.computeAdoptPlan(repo, slug, this.deadlineFetch());
+    } catch (error) {
+      if (error instanceof DownloadConflictError) throw error;
+      throw new Error(`Could not check the folder: ${describeFailure(error)}`);
+    }
+    this.adoptPlans.set(repo, plan);
+    const bytesOf = (items: ReadonlyArray<{ file: ListFileEntry }>): number =>
+      items.reduce((sum, item) => sum + (item.file.size > 0 ? item.file.size : 0), 0);
+    return {
+      repo,
+      slug,
+      token: plan.token,
+      revision: plan.revision,
+      assetsRevision: plan.assetsRevision,
+      check: { count: plan.check.length, bytes: bytesOf(plan.check) },
+      download: { count: plan.download.length, bytes: bytesOf(plan.download) },
+      other: plan.other,
+    };
+  }
+
+  /** The folder gates and the whole plan of an Update, read through `fetchImpl`. */
+  private async computeAdoptPlan(repo: string, slug: string, fetchImpl: typeof fetch): Promise<AdoptPlan> {
+    const target = modelsChildPath(this.modelsDir, slug, 'update');
+    if (!isRealDirectory(target) || isDownloaderOwned(target)) {
+      throw new DownloadConflictError(changedOnDiskMessage(slug));
+    }
+    if (!canWrite(target)) {
+      throw new DownloadConflictError(
+        `The app cannot add files to "${slug}": it has no write permission on it. Change its permissions, then try again.`,
+      );
+    }
+    const { revision, selection, files, sidecarPlan } = await this.resolveWanted(repo, fetchImpl);
+    const wanted: AdoptWanted[] = files.map((file) => ({ file, repo, revision }));
+    if (sidecarPlan !== null) {
+      for (const file of sidecarPlan.files) {
+        wanted.push({ file, repo: sidecarPlan.repo.name, revision: sidecarPlan.revision });
+      }
+    }
+    if (!wanted.some((item) => item.file.path === 'config.json')) {
+      throw new Error(
+        `Repo "${repo}" is not a complete model (neither it nor its assets repo "${selection.assetsRepo}" provides a config.json)`,
+      );
+    }
+    const { folder, entries } = await scanFolder(target, slug);
+    const { check, download, other } = classifyFolder(entries, wanted, this.mismatchMemo, slug);
+    const assetsRepo = sidecarPlan?.repo.name ?? null;
+    const assetsRevision = sidecarPlan?.revision ?? null;
+    const token = adoptToken({ repo, revision, assetsRepo, assetsRevision, wanted, check, download, folder });
+    return { token, revision, assetsRepo, assetsRevision, folder, wanted, check, download, other };
   }
 
   /**
@@ -963,16 +1676,22 @@ export class DownloadManager {
     return this.catalogSweep;
   }
 
-  private async sweepCatalogShas(now: number): Promise<ReadonlyMap<string, string | null>> {
-    const seq = ++this.catalogSweepSeq;
-    // Every probe carries its own deadline. `AbortSignal.any` keeps whatever
-    // signal the hub client supplies rather than replacing it.
-    const probeFetch: typeof fetch = (input, init) => {
+  /**
+   * The raw fetch with a deadline per request. `AbortSignal.any` keeps whatever signal the hub client supplies rather
+   * than replacing it.
+   */
+  private deadlineFetch(): typeof fetch {
+    return (input, init) => {
       const deadline = AbortSignal.timeout(this.probeTimeoutMs);
       const existing = init?.signal ?? undefined;
       const signal = existing !== undefined ? AbortSignal.any([existing, deadline]) : deadline;
       return this.fetchImpl(input, { ...init, signal });
     };
+  }
+
+  private async sweepCatalogShas(now: number): Promise<ReadonlyMap<string, string | null>> {
+    const seq = ++this.catalogSweepSeq;
+    const probeFetch = this.deadlineFetch();
     const shas = new Map<string, string | null>();
     const reads = new Map<string, number>();
     await Promise.all(
@@ -1040,6 +1759,72 @@ export class DownloadManager {
     return sha;
   }
 
+  /**
+   * Fold a revision a job read upstream into the update-check cache. Without it a sweep cached before upstream
+   * advanced keeps serving the older sha for up to its full TTL, so the card re-offers an update for a revision
+   * already installed and every click completes as a no-op. `at` is the job's place in {@link resolveSeq}, taken
+   * before the read was issued.
+   */
+  private noteJobRevision(repoName: string, revision: string, at: number): void {
+    this.jobResolvedShas.set(repoName, { revision, seq: this.catalogSweepSeq, at });
+    // The overlay guards a sweep that commits AFTER this. A sweep that already
+    // committed is past it, so the same ordering test has to run here too.
+    if (at > (this.catalogReadAt.get(repoName) ?? 0)) {
+      this.catalogShaCache?.shas.set(repoName, revision);
+      this.catalogReadAt.set(repoName, at);
+    }
+  }
+
+  /** The manifest entries of `repoName` at `revision` that this catalog entry installs, in listing order. */
+  private async listWantedFiles(
+    repoName: string,
+    revision: string,
+    globs: RegExp[] | undefined,
+    fetchImpl: typeof fetch,
+  ): Promise<ListFileEntry[]> {
+    const repo = { type: 'model' as const, name: repoName };
+    const files: ListFileEntry[] = [];
+    for await (const file of listFiles({ repo, recursive: true, revision, fetch: fetchImpl })) {
+      if (file.type !== 'directory' && isWantedFileFor(file.path, globs)) {
+        // Defense-in-depth: `file.path` is a third-party string about to become
+        // a `join(stagingDir, file.path)` write/read/verify/publish target (every
+        // downstream site derives from this `files[]` array). Refuse — fail
+        // closed — any entry that could escape the staging dir before it is
+        // admitted. Unreachable for the curated 4-repo catalog (git/HF tree
+        // paths cannot express `..`/absolute), but never trust the boundary.
+        if (!isSafeRelPath(file.path)) {
+          throw new Error(`Refusing to download "${file.path}" from "${repoName}": path is not a safe relative path`);
+        }
+        files.push(file);
+      }
+    }
+    return files;
+  }
+
+  /**
+   * Everything a job installs for `repoName`, read through `fetchImpl`: one pinned revision, the glob-filtered
+   * manifest (which must carry a weight payload), and the sidecar plan. `processJob` runs the same steps one by one,
+   * because it records the revision in the update cache before it lists anything.
+   */
+  private async resolveWanted(
+    repoName: string,
+    fetchImpl: typeof fetch,
+  ): Promise<{
+    revision: string;
+    selection: { globs?: readonly string[]; assetsRepo?: string };
+    files: ListFileEntry[];
+    sidecarPlan: SidecarPlan | null;
+  }> {
+    const revision = await this.resolveRevision(repoName, fetchImpl);
+    const catalogEntry = catalogEntryForRepo(repoName, process.platform);
+    const selection = catalogEntry === undefined ? {} : catalogSelectionForRepo(catalogEntry, repoName);
+    const files = await this.listWantedFiles(repoName, revision, selection.globs?.map(globToRegex), fetchImpl);
+    assertModelPayload(repoName, files, selection.assetsRepo);
+    const sidecarPlan =
+      selection.assetsRepo === undefined ? null : await this.planAssetSidecars(selection.assetsRepo, files, fetchImpl);
+    return { revision, selection, files, sidecarPlan };
+  }
+
   private async processJob(job: JobState): Promise<void> {
     // Resolved per platform, matching the allowlist gate in `start` — a job can
     // only exist for THIS platform's repo, so the lookup cannot miss.
@@ -1095,6 +1880,13 @@ export class DownloadManager {
       // trees (never finalDir), so it is safe to run before the finalDir preflight.
       await this.reapDeadStagingTrees();
 
+      if (job.adopt !== null) {
+        await this.adoptInPlace(job, job.adopt, slug, (dir) => {
+          stagingDir = dir;
+        });
+        return;
+      }
+
       // Ownership preflight: refuse an unowned/foreign finalDir up front (no bytes
       // move for a doomed job).
       refuseIfUnownedFinal();
@@ -1112,17 +1904,7 @@ export class DownloadManager {
 
       const at = ++this.resolveSeq;
       const revision = await this.resolveRevision(job.repo);
-      // This IS a fresh upstream read, so fold it into the update-check cache.
-      // Without it a sweep cached before upstream advanced keeps serving the
-      // older sha for up to its full TTL, so the card re-offers an update for a
-      // revision already installed and every click completes as a no-op.
-      this.jobResolvedShas.set(job.repo, { revision, seq: this.catalogSweepSeq, at });
-      // The overlay guards a sweep that commits AFTER this. A sweep that already
-      // committed is past it, so the same ordering test has to run here too.
-      if (at > (this.catalogReadAt.get(job.repo) ?? 0)) {
-        this.catalogShaCache?.shas.set(job.repo, revision);
-        this.catalogReadAt.set(job.repo, at);
-      }
+      this.noteJobRevision(job.repo, revision, at);
 
       // Job-private staging: keyed by the IMMUTABLE revision (a different
       // revision never reuses another's staged bytes) and unique per invocation
@@ -1142,31 +1924,11 @@ export class DownloadManager {
       const selection = catalogEntry === undefined ? {} : catalogSelectionForRepo(catalogEntry, job.repo);
       const globs = selection.globs?.map(globToRegex);
 
-      const files: ListFileEntry[] = [];
+      const files = await this.listWantedFiles(job.repo, revision, globs, this.wrappedFetch);
       let totalBytes = 0;
-      for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
-        if (file.type !== 'directory' && isWantedFileFor(file.path, globs)) {
-          // Defense-in-depth: `file.path` is a third-party string about to become
-          // a `join(stagingDir, file.path)` write/read/verify/publish target (every
-          // downstream site derives from this `files[]` array). Refuse — fail
-          // closed — any entry that could escape the staging dir before it is
-          // admitted. Unreachable for the curated 4-repo catalog (git/HF tree
-          // paths cannot express `..`/absolute), but never trust the boundary.
-          if (!isSafeRelPath(file.path)) {
-            throw new Error(`Refusing to download "${file.path}" from "${job.repo}": path is not a safe relative path`);
-          }
-          files.push(file);
-          if (file.size > 0) totalBytes += file.size;
-        }
-      }
+      for (const file of files) if (file.size > 0) totalBytes += file.size;
 
-      if (!hasModelPayload(files, selection.assetsRepo !== undefined)) {
-        const need =
-          selection.assetsRepo !== undefined
-            ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
-            : 'both a config.json and a weight file';
-        throw new Error(`Repo "${job.repo}" is not a complete model (needs ${need})`);
-      }
+      assertModelPayload(job.repo, files, selection.assetsRepo);
 
       // Resolve the sidecar manifest BEFORE `start` so the emitted total and
       // file count cover everything this job will fetch. The UI keeps the
@@ -1327,10 +2089,10 @@ export class DownloadManager {
       }
       job.state = 'committing';
 
-      await this.publish(stagingDir, finalDir, job, revision, files, sidecarPlan);
+      const keptDir = await this.publish(stagingDir, finalDir, job, revision, files, sidecarPlan);
 
       job.state = 'done';
-      this.emit({ type: 'done', id: job.id, outputDir: finalDir });
+      this.emit({ type: 'done', id: job.id, outputDir: finalDir, ...(keptDir !== undefined ? { keptDir } : {}) });
     } catch (error) {
       // A cancelled job unwinds via a boundary check or an aborted in-flight
       // fetch: classify EITHER as a clean `cancelled` terminal (not a red error),
@@ -1349,12 +2111,10 @@ export class DownloadManager {
           `[downloads] job ${job.id} (${job.repo}) failed:`,
           truncateMessage(error instanceof Error ? (error.stack ?? error.message) : String(error)),
         );
-        const message = truncateMessage(describeFailure(error));
-        this.emit({
-          type: 'error',
-          id: job.id,
-          message: job.replace !== null && !job.swapStarted ? withNothingRemoved(message) : message,
-        });
+        let message = truncateMessage(describeFailure(error));
+        if (job.replace !== null && !job.swapStarted) message = withNothingRemoved(message);
+        if (job.adopt !== null && !job.swapStarted) message = withNothingChanged(message);
+        this.emit({ type: 'error', id: job.id, message });
       }
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it
@@ -1368,6 +2128,255 @@ export class DownloadManager {
       }
       this.currentJob = null;
       this.currentFile = null;
+    }
+  }
+
+  /**
+   * Run an Update of the folder at `slug`. It never moves, renames, deletes or overwrites a file that was in the
+   * folder: it reads the catalog files there, downloads the missing ones into its own staging tree, and adds them,
+   * then the marker, with `link`. In order:
+   *
+   *   1. compute the plan again through the job's fetch; its token must be the one the user confirmed;
+   *   2. hash every file to check where it is ({@link proveInPlace}); a file that is not the catalog file is
+   *      remembered, so the next plan refuses it without a new hash, and fails the job once all are checked;
+   *   3. download the missing files into staging and verify them;
+   *   4. commit barrier: the folder is scanned again and must hold the checked files with the fingerprints the hash
+   *      saw, nothing at a path the job adds, and nothing the plan would refuse; the marker, with its `adopted`
+   *      record, is written and synced in staging;
+   *   5. add each staged file, `config.json` last, then the marker; any failure removes the added names that are still
+   *      the job's own files.
+   *
+   * A crash leaves complete added files and no marker, so the folder stays unowned and the next Update checks them.
+   * `setStaging` hands the staging tree to `processJob`, whose `finally` removes it; that unlinks only second names.
+   */
+  private async adoptInPlace(
+    job: JobState,
+    confirmed: AdoptPlan,
+    slug: string,
+    setStaging: (dir: string) => void,
+  ): Promise<void> {
+    const target = modelsChildPath(this.modelsDir, slug, 'update');
+    const at = ++this.resolveSeq;
+    const plan = await this.computeAdoptPlan(job.repo, slug, this.wrappedFetch);
+    this.noteJobRevision(job.repo, plan.revision, at);
+    if (plan.token !== confirmed.token) {
+      throw new Error(`"${slug}" or the catalog changed after you confirmed. ${NOTHING_CHANGED} Use Update again.`);
+    }
+
+    const sizeOf = (file: ListFileEntry): number => (file.size > 0 ? file.size : 0);
+    const fileCount = plan.check.length + plan.download.length;
+    job.totalBytes =
+      plan.check.reduce((sum, item) => sum + sizeOf(item.file), 0) +
+      plan.download.reduce((sum, item) => sum + sizeOf(item.file), 0);
+    this.emit({ type: 'start', id: job.id, repo: job.repo, totalBytes: job.totalBytes, fileCount });
+
+    const proven = new Map<string, FileFingerprint>();
+    const mismatched: string[] = [];
+    for (let index = 0; index < plan.check.length; index++) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      const item = plan.check[index];
+      const size = sizeOf(item.file);
+      const base = job.receivedBytes;
+      let read = 0;
+      let shownAt = 0;
+      const proof = await proveInPlace(target, item.file, item, {
+        cancelled: () => job.cancelled,
+        onBytes: (n) => {
+          read = Math.min(size, read + n);
+          job.receivedBytes = base + read;
+          const now = Date.now();
+          if (now - shownAt < CHECK_PROGRESS_INTERVAL_MS) return;
+          shownAt = now;
+          this.emitFileProgress(job, item.file.path, read, item.file.size, index, fileCount, 'check');
+        },
+      });
+      if (proof.match) {
+        proven.set(item.file.path, proof.fingerprint);
+      } else {
+        mismatched.push(item.file.path);
+        this.mismatchMemo.set(`${slug}\0${item.file.path}`, {
+          size: item.size,
+          mtimeNs: item.mtimeNs,
+          ino: item.ino,
+          oid: checksumOf(item.file)!.oid,
+        });
+      }
+      job.receivedBytes = base + size;
+      this.emitFileProgress(job, item.file.path, size, item.file.size, index, fileCount, 'check');
+    }
+    if (mismatched.length > 0) {
+      throw new Error(
+        `"${mismatched.join('", "')}" in "${slug}" is not the catalog file. ${NOTHING_CHANGED} ` +
+          `Move it out of the folder, then use Update again.`,
+      );
+    }
+
+    const stagingDir = join(this.modelsDir, '.staging', `${slug}@${plan.revision}.${process.pid}.${randomUUID()}`);
+    setStaging(stagingDir);
+    await mkdir(stagingDir, { recursive: true });
+    const stagingReal = realpathSync(stagingDir);
+    for (let n = 0; n < plan.download.length; n++) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      const item = plan.download[n];
+      const destResolved = resolve(stagingReal, item.file.path);
+      if (destResolved !== stagingReal && !destResolved.startsWith(stagingReal + sep)) {
+        throw new Error(`Refusing to write "${item.file.path}" outside the staging directory`);
+      }
+      const jobBaseBytes = job.receivedBytes;
+      const fileIndex = plan.check.length + n;
+      const context = await this.downloadVerifiedFile(
+        { type: 'model', name: item.repo },
+        item.revision,
+        item.file,
+        join(stagingDir, item.file.path),
+        { jobBaseBytes, fileIndex, fileCount },
+      );
+      const fileBytes = item.file.size > 0 ? item.file.size : context.received;
+      job.receivedBytes = jobBaseBytes + fileBytes;
+      this.emitFileProgress(job, item.file.path, fileBytes, item.file.size, fileIndex, fileCount);
+    }
+    for (const item of plan.download) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      if (!(await isStagedCopyComplete(join(stagingDir, item.file.path), item.file))) {
+        throw new Error(`Staged file "${item.file.path}" failed content verification before publish`);
+      }
+    }
+
+    // Same commit barrier as an install: checked, then `committing` with no await between, so a cancel cannot
+    // report success while files are being added.
+    if (job.cancelled) throw new Error('Download cancelled');
+    job.state = 'committing';
+    await this.assertFolderAsChecked(target, slug, plan, proven);
+
+    const staged = new Map<string, FileFingerprint>();
+    const adopted: Record<string, { size: number; mtimeNs: string }> = {};
+    for (const [path, fingerprint] of proven) {
+      adopted[path] = { size: Number(fingerprint.size), mtimeNs: fingerprint.mtimeNs.toString() };
+    }
+    for (const item of plan.download) {
+      const fingerprint = fingerprintOf(await lstat(join(stagingDir, item.file.path), { bigint: true }));
+      staged.set(item.file.path, fingerprint);
+      adopted[item.file.path] = { size: Number(fingerprint.size), mtimeNs: fingerprint.mtimeNs.toString() };
+    }
+    const marker: DownloadCompletion = {
+      repo: job.repo,
+      revision: plan.revision,
+      files: plan.wanted.map((item) => item.file.path),
+      scope: 'full',
+      ...(plan.assetsRepo !== null && plan.assetsRevision !== null
+        ? { assetsRepo: plan.assetsRepo, assetsRevision: plan.assetsRevision }
+        : {}),
+      completedAt: new Date().toISOString(),
+      adopted,
+    };
+    const stagedMarker = join(stagingDir, DOWNLOAD_COMPLETE_MARKER);
+    await writeFile(stagedMarker, `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx' });
+    await fsyncFile(stagedMarker);
+    const markerFingerprint = fingerprintOf(await lstat(stagedMarker, { bigint: true }));
+
+    // The marker must go last: until it is there the folder is not owned, so a crash or a failed add leaves it to
+    // the next Update and never to an owned swap that deletes from it. config.json goes last of the files, so a
+    // config.json the job adds always has the other added files beside it.
+    const order = [
+      ...plan.download.filter((item) => item.file.path !== 'config.json'),
+      ...plan.download.filter((item) => item.file.path === 'config.json'),
+    ];
+    const added: AddedName[] = [];
+    const madeDirs: string[] = [];
+    job.swapStarted = true;
+    try {
+      for (const item of order) {
+        const path = item.file.path;
+        await linkInto(target, slug, path, join(stagingDir, path), staged.get(path)!, added, madeDirs);
+      }
+      if (job.repo === QWEN38_DFLASH2.hfRepo && !isDFlash2Companion(target)) {
+        throw new Error('DFlash2 download requires a DFlash2DraftModel config and model.safetensors');
+      }
+      // The adds and the fsync above take milliseconds; a checked file changed in that time must not get a marker.
+      const [root, ...checked] = await Promise.all(
+        [target, ...plan.check.map((item) => join(target, item.file.path))].map((path) =>
+          lstat(path, { bigint: true }).catch(() => null),
+        ),
+      );
+      if (
+        root === null ||
+        root.dev !== plan.folder.dev ||
+        root.ino !== plan.folder.ino ||
+        checked.some(
+          (stat, i) =>
+            stat === null ||
+            !stat.isFile() ||
+            !sameFingerprint(fingerprintOf(stat), proven.get(plan.check[i].file.path)!),
+        )
+      ) {
+        throw new Error(`"${slug}" changed on disk during the update.`);
+      }
+      await linkInto(target, slug, DOWNLOAD_COMPLETE_MARKER, stagedMarker, markerFingerprint, added, madeDirs);
+      await fsyncDir(target);
+      if (!isModelInstalled(target)) throw new Error(`"${slug}" changed on disk during the update.`);
+    } catch (error) {
+      const keptDir = join(this.modelsDir, '.staging', `${slug}${KEPT_MARK}${randomUUID()}`);
+      const { stays, kept } = await removeAddedNames(target, added, madeDirs, keptDir);
+      if (stays.length > 0 || kept !== undefined) {
+        // With config.json or the marker in it the folder reads as installed, and its card offers no Update.
+        const blocking = stays.filter((path) => path === 'config.json' || path === DOWNLOAD_COMPLETE_MARKER);
+        const next =
+          blocking.length > 0
+            ? `Remove ${blocking.join(' and ')} from the folder, then use Update again.`
+            : 'Use Update again.';
+        const left = stays.length > 0 ? `These files that it added stay in "${slug}": ${stays.join(', ')}. ` : '';
+        const yours =
+          kept === undefined
+            ? 'No file of yours was changed. '
+            : `A file that something put at one of the names it added while it removed them is now in "${kept}". ` +
+              `Move it back if it is yours. `;
+        throw new Error(`Update stopped. ${left}${yours}${next}`);
+      }
+      job.swapStarted = false;
+      throw error;
+    }
+
+    job.receivedBytes = job.totalBytes;
+    job.state = 'done';
+    this.emit({ type: 'done', id: job.id, outputDir: target });
+  }
+
+  /**
+   * The commit barrier of an Update: the folder is the one the plan saw, still not owned, holds every checked file
+   * with the fingerprint its hash saw, holds nothing at a path the job adds, and holds nothing the plan refuses.
+   * Other files may have come or gone.
+   */
+  private async assertFolderAsChecked(
+    target: string,
+    slug: string,
+    plan: AdoptPlan,
+    proven: ReadonlyMap<string, FileFingerprint>,
+  ): Promise<void> {
+    const changed = (): Error => new Error(`"${slug}" changed on disk during the update.`);
+    if (!isRealDirectory(target) || isDownloaderOwned(target)) throw changed();
+    let scan: Awaited<ReturnType<typeof scanFolder>>;
+    try {
+      scan = await scanFolder(target, slug);
+    } catch (error) {
+      throw error instanceof DownloadConflictError ? changed() : error;
+    }
+    const { folder, entries } = scan;
+    if (folder.dev !== plan.folder.dev || folder.ino !== plan.folder.ino) throw changed();
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+    for (const item of plan.download) {
+      if (byPath.has(item.file.path)) throw new Error(`"${item.file.path}" appeared in "${slug}" during the update.`);
+    }
+    for (const item of plan.check) {
+      const entry = byPath.get(item.file.path);
+      const seen = proven.get(item.file.path);
+      if (entry === undefined || entry.isDirectory || seen === undefined || !sameFingerprint(entry.stat, seen)) {
+        throw changed();
+      }
+    }
+    try {
+      classifyFolder(entries, plan.wanted, this.mismatchMemo, slug);
+    } catch (error) {
+      throw error instanceof DownloadConflictError ? changed() : error;
     }
   }
 
@@ -1456,7 +2465,8 @@ export class DownloadManager {
       }
       try {
         if (finalOwnedComplete) {
-          await rm(backupPath, { recursive: true, force: true }); // redundant backup
+          const kept = await this.removeOwnedBackup(backupPath, slug); // redundant backup
+          if (kept !== undefined) console.error(`[downloads] files of an old "${slug}" were kept in "${kept}"`);
         } else if (finalAbsent && isDownloaderOwned(backupPath)) {
           // Restore a crashed swap. `isDownloaderOwned` stat-follows a symlink
           // backup into the marked install it points at — the same proof that
@@ -1613,11 +2623,12 @@ export class DownloadManager {
   private async planAssetSidecars(
     assetsRepo: string,
     primaryFiles: readonly ListFileEntry[],
-  ): Promise<{ repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] }> {
+    fetchImpl: typeof fetch = this.wrappedFetch,
+  ): Promise<SidecarPlan> {
     const repo = { type: 'model' as const, name: assetsRepo };
-    const revision = await this.resolveRevision(assetsRepo);
+    const revision = await this.resolveRevision(assetsRepo, fetchImpl);
     const byName = new Map<string, ListFileEntry>();
-    for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
+    for await (const file of listFiles({ repo, recursive: true, revision, fetch: fetchImpl })) {
       if (file.type === 'directory') continue;
       // Candidates are all root-level names; a nested same-named file is not
       // the base model's tokenizer/config.
@@ -1702,6 +2713,9 @@ export class DownloadManager {
       finalIsLink = true;
     }
     if (finalIsLink) return false;
+    // A folder Update adopted may hold the user's own file at a stale sidecar's name. The full path re-downloads, and
+    // its swap deletes from the old folder only what the `adopted` record proves.
+    if (stale.length > 0 && installed.adopted !== undefined) return false;
     if (stale.length > 0) {
       // Pruning must never destroy the install. The resulting manifest has to
       // stay loadable — a config and a weight — and the case that matters is
@@ -1843,6 +2857,51 @@ export class DownloadManager {
   }
 
   /**
+   * Remove the old entry that an owned swap or a crashed one left at `backupDir`. A link, or a folder whose marker
+   * has no `adopted` record, is removed whole. A folder that Update adopted loses only the files its record proves
+   * unchanged ({@link removeProvenFiles}); when anything else is left, the rest, marker included, is moved to
+   * `.staging/<slug>.kept-<uuid>`, which nothing removes. A folder whose marker cannot be read is moved there whole,
+   * since nothing proves which of its files the app may delete. Returns where the kept files are (`backupDir` itself
+   * when that move fails), or `undefined` when nothing was kept.
+   */
+  private async removeOwnedBackup(backupDir: string, slug: string): Promise<string | undefined> {
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(backupDir)).isSymbolicLink();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const marker = isLink ? undefined : readCompletion(backupDir);
+    if (isLink || (marker !== undefined && marker.adopted === undefined)) {
+      await rm(backupDir, { recursive: true, force: true });
+      return undefined;
+    }
+    if (marker?.adopted !== undefined) {
+      const aside = join(backupDir, `.${randomUUID()}`);
+      await removeProvenFiles(backupDir, '', new Set(marker.files), marker.adopted, aside);
+      await removeEmptyDirs(aside);
+      const left = await readdir(backupDir).catch(() => null);
+      if (left !== null && left.every((name) => name === DOWNLOAD_COMPLETE_MARKER)) {
+        try {
+          await unlink(join(backupDir, DOWNLOAD_COMPLETE_MARKER));
+          await rmdir(backupDir);
+          return undefined;
+        } catch {
+          // Something came in, or the marker could not go: keep what is there.
+        }
+      }
+    }
+    const keptDir = join(this.modelsDir, '.staging', `${slug}${KEPT_MARK}${randomUUID()}`);
+    try {
+      await rename(backupDir, keptDir);
+      return keptDir;
+    } catch {
+      return backupDir;
+    }
+  }
+
+  /**
    * Publish staging onto the final path without ever destroying a checkpoint the
    * downloader does not own. The completion marker is written as the LAST staged
    * step (so it travels with the rename and only coexists with a full, verified
@@ -1852,7 +2911,9 @@ export class DownloadManager {
    *     its files untouched, unless the job is a Reinstall whose entry still
    *     matches what the user confirmed;
    *   - otherwise → rollback-safe swap: move the existing entry to a temp backup,
-   *     rename staging → final, fsync the parent, and only then remove the backup;
+   *     rename staging → final, fsync the parent, and only then remove the backup
+   *     with {@link removeOwnedBackup}, which keeps the files of an adopted folder
+   *     that its record does not prove and returns where it moved them;
    *     if the swap rename fails, restore the backup so a crash never leaves the
    *     model missing.
    */
@@ -1863,7 +2924,7 @@ export class DownloadManager {
     revision: string,
     files: ListFileEntry[],
     sidecarPlan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] } | null,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const repo = job.repo;
     const slug = basename(finalDir);
     await mkdir(dirname(finalDir), { recursive: true });
@@ -1894,7 +2955,7 @@ export class DownloadManager {
     if (!isPathOccupied(finalDir)) {
       await rename(stagingDir, finalDir);
       await fsyncDir(dirname(finalDir));
-      return;
+      return undefined;
     }
 
     // Re-check ownership adjacent to the destructive swap: the first guard is a
@@ -1961,7 +3022,12 @@ export class DownloadManager {
     }
     await fsyncDir(dirname(finalDir));
     try {
-      await rm(backupDir, { recursive: true, force: true });
+      // The entry a Reinstall replaced has no marker by definition, and is removed whole as it always was.
+      if (foreign !== null) {
+        await rm(backupDir, { recursive: true, force: true });
+        return undefined;
+      }
+      return await this.removeOwnedBackup(backupDir, slug);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -1982,6 +3048,7 @@ export class DownloadManager {
     totalBytes: number,
     fileIndex: number,
     fileCount: number,
+    phase?: 'check',
   ): void {
     this.emit({
       type: 'progress',
@@ -1992,6 +3059,7 @@ export class DownloadManager {
       totalBytes,
       fileIndex,
       fileCount,
+      ...(phase !== undefined ? { phase } : {}),
     });
   }
 }

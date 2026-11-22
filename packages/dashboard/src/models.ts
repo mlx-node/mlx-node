@@ -102,6 +102,41 @@ export interface DownloadCompletion {
   assetsRevision?: string;
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
+  /**
+   * Written only by Update, which adds a marker to a folder the app did not create: the `lstat` size and
+   * `mtimeNs` (decimal digits) of every listed file as Update proved it. Any other file in that folder is the
+   * user's. A later owned update, backup recovery and the sidecar refresh read it: they delete a file of such a
+   * folder only when this record lists it and its size and `mtimeNs` still match, and keep everything else. A
+   * record in any other shape reads as `{}`, which proves nothing, so nothing is deleted. The mlx CLI carries it
+   * when it rewrites the marker.
+   */
+  adopted?: Record<string, { size: number; mtimeNs: string }>;
+}
+
+/** The `adopted` record of a marker: `undefined` when absent, `{}` when present in any shape but the one Update writes. */
+function readAdopted(value: unknown): DownloadCompletion['adopted'] {
+  if (value === undefined) return undefined;
+  const record = asObject(value);
+  if (record === undefined) return {};
+  const entries: [string, { size: number; mtimeNs: string }][] = [];
+  for (const [path, entry] of Object.entries(record)) {
+    const fields = asObject(entry);
+    if (fields === undefined) return {};
+    const { size, mtimeNs } = fields;
+    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return {};
+    if (typeof mtimeNs !== 'string' || !isDecimalDigits(mtimeNs)) return {};
+    entries.push([path, { size, mtimeNs }]);
+  }
+  // `fromEntries` defines own properties, so a path named `__proto__` stays a key and never sets the prototype.
+  return Object.fromEntries(entries);
+}
+
+function isDecimalDigits(text: string): boolean {
+  if (text.length === 0) return false;
+  for (const ch of text) {
+    if (ch < '0' || ch > '9') return false;
+  }
+  return true;
 }
 
 /**
@@ -203,7 +238,7 @@ export const HELD_SCAN_MAX_ENTRIES = 20_000;
 /** File name endings of weights that discovery, the loaders or `mlx convert` read, compared in lower case. */
 const MODEL_FILE_SUFFIXES = ['.safetensors', '.gguf', '.pdiparams', '.pdparams', '.npz', '.bin', '.pt', '.pth', '.pkl'];
 
-function isModelFileName(name: string): boolean {
+export function isModelFileName(name: string): boolean {
   // Lower case: on a case-insensitive volume discovery and Delete open `Config.json` as `config.json`.
   const lower = name.toLowerCase();
   if (lower === 'config.json') return true;
@@ -321,6 +356,7 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
   ) {
     return undefined;
   }
+  const adopted = readAdopted(marker.adopted);
   return {
     repo: marker.repo,
     revision: marker.revision,
@@ -332,6 +368,7 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
     ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
+    ...(adopted !== undefined ? { adopted } : {}),
   };
 }
 

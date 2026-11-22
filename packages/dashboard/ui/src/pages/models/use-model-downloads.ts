@@ -6,6 +6,7 @@ import { getConnectionGeneration, subscribeConnection } from '../../lib/connecti
 import { errMessage } from '../../lib/errors';
 import { toast } from '../../lib/toast';
 import type {
+  AdoptPlanResponse,
   CancelDownloadResponse,
   CatalogItem,
   CatalogResponse,
@@ -16,6 +17,20 @@ import type {
   ModelsResponse,
 } from '../../lib/types';
 import { type AsyncState, useJson } from '../../lib/use-api';
+
+/** The card of `item` offers Update in place, so its job is an Update: Reinstall refuses a folder that holds a model. */
+function isUpdateInPlace(item: Pick<DownloadItem, 'blocker'>): boolean {
+  return item.blocker?.holdsModel === true;
+}
+
+/** The card of `repo` in a catalog body: an entry or the draft block of one. */
+function catalogItemOf(body: CatalogResponse | undefined, repo: string): Pick<DownloadItem, 'blocker'> | undefined {
+  for (const item of body?.items ?? []) {
+    if (item.hfRepo === repo) return item;
+    if (item.draft?.hfRepo === repo) return item.draft;
+  }
+  return undefined;
+}
 
 export interface ModelDownloadError {
   repo: string;
@@ -86,9 +101,13 @@ export interface CatalogDownloadProps {
   onInstall: () => Promise<void>;
   /** Reinstall over `item.blocker`: posts the numbers the user saw and keeps the job id. Rejects with the server text. */
   onReinstall: () => Promise<void>;
-  /** After the confirmation's success pill: the card follows the kept job. */
+  /** After the confirmation's success pill: the card follows the kept job (Reinstall or Update). */
   onReinstallStarted: () => void;
-  onDone: () => void;
+  /** Update of a folder that holds a model the app did not create: loads what it would do. Rejects with the server text. */
+  onPlanUpdate: () => Promise<AdoptPlanResponse>;
+  /** Starts the Update the plan with `token` describes and keeps the job id. Rejects with the server text. */
+  onUpdateInPlace: (token: string) => Promise<void>;
+  onDone: (keptDir: string | undefined) => void;
   onError: (message: string) => void;
   onCancelled: () => void;
   onCancel: (id: string) => void;
@@ -134,6 +153,8 @@ export function useModelDownloads(
 
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
   const [downloadError, setDownloadError] = useState<ModelDownloadError | null>(null);
+  /** Repos whose job failed while this page was unmounted, announced once the catalog body is here. */
+  const [failedAway, setFailedAway] = useState<readonly string[]>([]);
   // `useJson` keeps the old body on screen across a reconnect until the new runtime answers. Remember that exact
   // object so the reconcile effect does not read it as the new runtime's registry.
   const seenConnection = useRef(connection);
@@ -177,14 +198,16 @@ export function useModelDownloads(
     // A job that settled while this page was unmounted got no terminal-dismiss DELETE. Dismiss it here; announce a
     // failure first (its card reverts to Install, so the toast is its only trace). A duplicate dismiss answers 404.
     let settled = false;
+    const failed: string[] = [];
     for (const job of jobs) {
       if (!isTerminalJob(job.state)) continue;
-      if (job.state === 'error') toast.error('Download failed', { description: job.repo });
+      if (job.state === 'error') failed.push(job.repo);
       settled = true;
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
     }
     // Any terminal state can have installed (publish renames before its last rm; recoverBackup runs before the first
     // cancel boundary), and the snapshots may predate the publish: reload all three, inside a settle window.
+    if (failed.length > 0) setFailedAway((prev) => [...prev, ...failed]);
     if (settled) {
       setSettledOn((prev) => {
         const next = new Map(prev);
@@ -199,6 +222,19 @@ export function useModelDownloads(
       reloadUpdates();
     }
   }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates]);
+
+  // The toast title needs the card's blocker, and `/catalog` (a worker route) can answer after `/downloads`.
+  useEffect(() => {
+    if (failedAway.length === 0) return;
+    if (catalog.data === undefined && catalog.error === undefined) return;
+    for (const repo of failedAway) {
+      const item = catalogItemOf(catalog.data, repo);
+      toast.error(item !== undefined && isUpdateInPlace(item) ? 'Update failed' : 'Download failed', {
+        description: repo,
+      });
+    }
+    setFailedAway([]);
+  }, [failedAway, catalog.data, catalog.error]);
 
   const starting = useRef(new Set<string>());
   const install = async (repo: string): Promise<void> => {
@@ -221,7 +257,7 @@ export function useModelDownloads(
     }
   };
 
-  /** Reinstall jobs the server accepted, held until the confirmation hands over (setting `active` would unmount it). */
+  /** Reinstall and Update jobs the server accepted, held until the confirmation hands over (setting `active` would unmount it). */
   const reinstalls = useRef(new Map<string, { id: string; connection: number }>());
   const reinstall = async (item: DownloadItem): Promise<void> => {
     const blocker = item.blocker;
@@ -243,6 +279,18 @@ export function useModelDownloads(
       throw err;
     }
   };
+  const planUpdate = (item: DownloadItem): Promise<AdoptPlanResponse> =>
+    mutate<AdoptPlanResponse>('POST', '/downloads/adopt-plan', { repo: item.hfRepo });
+  const updateInPlace = async (item: DownloadItem, token: string): Promise<void> => {
+    const startedConnection = connection;
+    try {
+      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo: item.hfRepo, adopt: token });
+      reinstalls.current.set(item.hfRepo, { id: res.id, connection: startedConnection });
+    } catch (err) {
+      reloadCatalog();
+      throw err;
+    }
+  };
   const reinstallStarted = (repo: string): void => {
     const kept = reinstalls.current.get(repo);
     reinstalls.current.delete(repo);
@@ -258,8 +306,12 @@ export function useModelDownloads(
     );
   };
 
-  const onDownloadDone = (repo: string): void => {
-    toast.success('Download complete', { description: repo });
+  const onDownloadDone = (item: DownloadItem, keptDir: string | undefined): void => {
+    const repo = item.hfRepo;
+    toast.success(isUpdateInPlace(item) ? 'Update complete' : 'Download complete', {
+      description:
+        keptDir === undefined ? repo : `Files that were added or changed in the old folder are in ${keptDir}.`,
+    });
     const id = active[repo]?.id;
     setActive((prev) => {
       const next = { ...prev };
@@ -276,9 +328,10 @@ export function useModelDownloads(
     updates.reload();
   };
 
-  const onDownloadError = (repo: string, message: string): void => {
+  const onDownloadError = (item: DownloadItem, message: string): void => {
+    const repo = item.hfRepo;
     setDownloadError({ repo, message });
-    toast.error('Download failed', { description: message });
+    toast.error(isUpdateInPlace(item) ? 'Update failed' : 'Download failed', { description: message });
     // `error` can still have installed: refresh both halves of the update verdict.
     setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
     models.reload();
@@ -340,8 +393,10 @@ export function useModelDownloads(
     onInstall: () => install(item.hfRepo),
     onReinstall: () => reinstall(item),
     onReinstallStarted: () => reinstallStarted(item.hfRepo),
-    onDone: () => onDownloadDone(item.hfRepo),
-    onError: (message) => onDownloadError(item.hfRepo, message),
+    onPlanUpdate: () => planUpdate(item),
+    onUpdateInPlace: (token) => updateInPlace(item, token),
+    onDone: (keptDir) => onDownloadDone(item, keptDir),
+    onError: (message) => onDownloadError(item, message),
     onCancelled: () => onDownloadCancelled(item.hfRepo),
     onCancel: (id) => void cancel(item.hfRepo, id),
   });

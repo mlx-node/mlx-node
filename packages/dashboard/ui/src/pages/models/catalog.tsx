@@ -1,5 +1,5 @@
 import { AlertTriangle, Download, ExternalLink } from 'lucide-react';
-import { useState, type ReactElement, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
 import { ConfirmPopover, type ConfirmContent } from '../../components/arc-x/confirm-popover/confirm-popover';
@@ -11,11 +11,13 @@ import { Rule } from '../../components/arc-x/rule/rule';
 import { Alert } from '../../components/arc/alert/alert';
 import { Badge } from '../../components/arc/badge/badge';
 import { Button } from '../../components/arc/button/button';
+import { Tooltip } from '../../components/arc/tooltip/tooltip';
 import { DownloadProgress } from '../../components/download-progress';
 import { catalogBuildLabel } from '../../lib/catalog';
-import { formatBytes, formatBytesParts, formatCount } from '../../lib/format';
+import { errMessage } from '../../lib/errors';
+import { formatBytes, formatBytesParts, formatCount, formatCountNoun } from '../../lib/format';
 import { truncateMiddle } from '../../lib/labels';
-import type { CatalogBlocker, CatalogItem, ModelsResponse } from '../../lib/types';
+import type { AdoptPlanResponse, CatalogBlocker, CatalogItem, ModelsResponse } from '../../lib/types';
 import type { CatalogDownloadProps } from './use-model-downloads';
 
 const GB = 1e9;
@@ -36,12 +38,13 @@ export function hostNote(
   return null;
 }
 
-export function HostNote({ text }: { text: string }): ReactElement {
+/** `as="span"` inside an Alert, whose body is a `<p>`. */
+export function HostNote({ text, as: Tag = 'p' }: { text: string; as?: 'p' | 'span' }): ReactElement {
   return (
-    <p className="m-0 flex items-start gap-1.5 text-caption text-warning">
+    <Tag className="m-0 flex items-start gap-1.5 text-caption text-warning">
       <AlertTriangle size={12} aria-hidden="true" className="mt-0.5 shrink-0" />
       <span>{text}</span>
-    </p>
+    </Tag>
   );
 }
 
@@ -147,6 +150,162 @@ export function reinstallContent(
   };
 }
 
+export interface UpdateHandlers {
+  companion?: boolean;
+  onUpdateInPlace: (token: string) => Promise<void>;
+  onReinstallStarted: () => void;
+}
+
+function filesText(count: number): string {
+  return formatCountNoun(count, 'file', 'files', formatCount);
+}
+
+/** The confirmation of an Update of `slug` in place, in the numbers of `plan`; a part with a zero count is left out. */
+export function updateContent(slug: string, plan: AdoptPlanResponse, handlers: UpdateHandlers): ConfirmContent {
+  const { check, download, other } = plan;
+  const name = <span className="font-medium text-foreground">{slug}</span>;
+  return {
+    title: handlers.companion === true ? 'Update companion weights?' : 'Update model?',
+    description: (
+      <>
+        {check.count > 0 ? (
+          <>
+            Update checks {filesText(check.count)} ({sizeText(check.bytes)}) in {name} against the catalog.{' '}
+          </>
+        ) : null}
+        {download.count > 0 ? (
+          <>
+            {check.count > 0 ? 'It' : 'Update'} downloads {filesText(download.count)} ({sizeText(download.bytes)}) and
+            adds {download.count === 1 ? 'it' : 'them'} to the folder.{' '}
+          </>
+        ) : null}
+        {other.count > 0 ? (
+          <>
+            {other.count === 1
+              ? '1 other file stays where it is'
+              : `${formatCount(other.count)} other files stay where they are`}
+            {other.names.length > 0 ? (
+              <>
+                {': '}
+                {other.names.map((file, index) => (
+                  <span key={file} title={file}>
+                    {index > 0 ? ', ' : ''}
+                    {truncateMiddle(file, NAME_MAX_CHARS)}
+                  </span>
+                ))}
+              </>
+            ) : null}
+            .{' '}
+          </>
+        ) : null}
+        Update deletes nothing and moves nothing. If a file is not the catalog file, Update stops and changes nothing.
+      </>
+    ),
+    notice:
+      'After Update the app manages this folder. A later update replaces it. Files that you add or change in it are then moved to .staging in the models folder. The app does not delete them.',
+    confirmLabel: 'Update',
+    workingLabel: 'Starting…',
+    successLabel: 'Started',
+    tone: 'neutral',
+    errorTitle: 'Could not start the update',
+    onConfirm: () => handlers.onUpdateInPlace(plan.token),
+    onDone: handlers.onReinstallStarted,
+  };
+}
+
+interface UpdateInPlaceActionProps extends UpdateHandlers {
+  slug: string;
+  settling: boolean;
+  onPlanUpdate: () => Promise<AdoptPlanResponse>;
+}
+
+/**
+ * Update over a real folder that holds a model the app did not create. The plan is loaded on the click and the
+ * confirmation opens only with it; closing the confirmation drops it, so the next click loads a new one.
+ */
+function UpdateInPlaceAction({
+  slug,
+  settling,
+  companion,
+  onPlanUpdate,
+  onUpdateInPlace,
+  onReinstallStarted,
+}: UpdateInPlaceActionProps): ReactElement {
+  const [loading, setLoading] = useState(false);
+  const [plan, setPlan] = useState<AdoptPlanResponse | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (plan !== null || !refocus.current) return;
+    refocus.current = false;
+    buttonRef.current?.focus({ preventScroll: true });
+  }, [plan]);
+  const load = async (): Promise<void> => {
+    if (loading || settling) return;
+    setLoading(true);
+    setPlanError(null);
+    try {
+      setPlan(await onPlanUpdate());
+    } catch (err) {
+      setPlanError(errMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+  const button = (
+    <Button
+      ref={buttonRef}
+      type="button"
+      variant="secondary"
+      size="sm"
+      loading={loading}
+      disabled={loading}
+      aria-disabled={settling ? true : undefined}
+      onClick={() => void load()}
+    >
+      {loading ? null : <Download size={16} aria-hidden="true" />}
+      {loading ? 'Checking…' : 'Update'}
+    </Button>
+  );
+  return (
+    <Alert tone="warning" title="Needs update">
+      <span className="grid justify-items-start gap-2">
+        <span>
+          <span className="font-mono">{slug}</span> holds a model that the app did not create. Update checks its files
+          against the catalog and downloads the files that are missing. It deletes nothing.
+        </span>
+        {planError !== null ? <HostNote text={planError} as="span" /> : null}
+        {plan === null ? (
+          settling ? (
+            <Tooltip content="Checking the last download.">{button}</Tooltip>
+          ) : (
+            button
+          )
+        ) : (
+          <ConfirmPopover
+            trigger={{
+              kind: 'button',
+              label: 'Update',
+              variant: 'secondary',
+              size: 'sm',
+              icon: <Download size={16} aria-hidden="true" />,
+            }}
+            align="start"
+            open
+            onOpenChange={(open) => {
+              if (open) return;
+              refocus.current = true;
+              setPlan(null);
+            }}
+            {...updateContent(slug, plan, { companion, onUpdateInPlace, onReinstallStarted })}
+          />
+        )}
+      </span>
+    </Alert>
+  );
+}
+
 /** The action of one catalog entry: progress, Update, the Installed status, the cleanup note, or Install. */
 export function CatalogDownloadAction({
   item,
@@ -160,6 +319,8 @@ export function CatalogDownloadAction({
   onInstall,
   onReinstall,
   onReinstallStarted,
+  onPlanUpdate,
+  onUpdateInPlace,
   onDone,
   onError,
   onCancelled,
@@ -186,7 +347,9 @@ export function CatalogDownloadAction({
         <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
         {item.blocker !== null ? (
           <p className="m-0 text-caption text-secondary">
-            {`Replaces the old ${blockerPhrase(item.blocker).noun} when the download is complete.`}
+            {item.blocker.holdsModel
+              ? `Checks the files in ${item.slug}. Nothing is deleted.`
+              : `Replaces the old ${blockerPhrase(item.blocker).noun} when the download is complete.`}
           </p>
         ) : null}
         {/* cancel() refuses a committing job, and a second cancel answers 404. */}
@@ -235,6 +398,18 @@ export function CatalogDownloadAction({
           </>
         ) : null}
       </p>
+    );
+  }
+  if (item.blocker?.holdsModel === true && item.blocker.kind === 'directory' && !item.blocker.truncated) {
+    return (
+      <UpdateInPlaceAction
+        slug={item.slug}
+        settling={settling}
+        companion={companion}
+        onPlanUpdate={onPlanUpdate}
+        onUpdateInPlace={onUpdateInPlace}
+        onReinstallStarted={onReinstallStarted}
+      />
     );
   }
   if (item.blocker?.holdsModel === true) {

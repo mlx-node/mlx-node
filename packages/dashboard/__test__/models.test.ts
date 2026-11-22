@@ -708,6 +708,65 @@ describe('isDownloaderOwned', () => {
   });
 });
 
+describe('readCompletion — the adopted record', () => {
+  const BASE = {
+    repo: 'owner/repo',
+    revision: 'a'.repeat(40),
+    files: ['config.json', 'model.safetensors'],
+    scope: 'full',
+    completedAt: 'x',
+  };
+
+  function writeMarker(dir: string, body: unknown): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), JSON.stringify(body));
+  }
+
+  // A record lost in the reader would make a later owned update delete the whole old folder.
+  it('reads the adopted record of a marker', () => {
+    const dir = join(modelsDir, 'adopted');
+    const adopted = {
+      'config.json': { size: 12, mtimeNs: '1763700000123456789' },
+      'model.safetensors': { size: 0, mtimeNs: '0' },
+    };
+    writeMarker(dir, { ...BASE, adopted });
+    expect(readCompletion(dir)).toEqual({ ...BASE, adopted });
+  });
+
+  // A bad record must never unlock a delete, and must never cost the folder its owner.
+  it('reads a malformed adopted record as empty, and the marker still counts as owned', () => {
+    const good = { size: 12, mtimeNs: '1' };
+    const cases: [string, unknown][] = [
+      ['string', 'yes'],
+      ['array', [good]],
+      ['null', null],
+      ['entry-not-object', { 'config.json': 12 }],
+      ['size-string', { 'config.json': { size: '12', mtimeNs: '1' } }],
+      ['size-negative', { 'config.json': { size: -1, mtimeNs: '1' } }],
+      ['size-fraction', { 'config.json': { size: 1.5, mtimeNs: '1' } }],
+      ['size-unsafe', { 'config.json': { size: 2 ** 53, mtimeNs: '1' } }],
+      ['mtime-number', { 'config.json': { size: 12, mtimeNs: 1 } }],
+      ['mtime-empty', { 'config.json': { size: 12, mtimeNs: '' } }],
+      ['mtime-not-digits', { 'config.json': { size: 12, mtimeNs: '1e9' } }],
+      ['one-bad-entry', { 'config.json': good, 'model.safetensors': { size: 4 } }],
+    ];
+    for (const [name, adopted] of cases) {
+      const dir = join(modelsDir, `malformed-${name}`);
+      writeMarker(dir, { ...BASE, adopted });
+      expect([name, readCompletion(dir)?.adopted]).toEqual([name, {}]);
+      expect([name, isDownloaderOwned(dir)]).toEqual([name, true]);
+    }
+  });
+
+  it('a marker without the record reads as before', () => {
+    const dir = join(modelsDir, 'plain');
+    writeMarker(dir, BASE);
+    const read = readCompletion(dir);
+    expect(read).toEqual(BASE);
+    expect(read !== undefined && 'adopted' in read).toBe(false);
+  });
+});
+
 describe('catalog companion state', () => {
   it('recognizes a manual shared companion without claiming ownership or installing the target', () => {
     writeModel(modelsDir, 'qwen3.8-27b-dflash2', JSON.stringify({ architectures: ['DFlash2DraftModel'] }), 32);

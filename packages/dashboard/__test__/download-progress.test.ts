@@ -223,6 +223,16 @@ describe('DownloadProgress — rate, glyph and stall', () => {
     expect(glyph()).toBe('success');
   });
 
+  it('shows Checking <file> for a check frame', async () => {
+    const source = await mountCard();
+    await deliver(source, startEvent, { ...latestEvent, file: 'Clairic-Flash-UD-Q4_K_XL.gguf', phase: 'check' });
+    expect(mounted!.text()).toContain('Checking Clairic-Flash-UD-Q4_K_XL.gguf');
+    expect(mounted!.text()).toContain('4.0 MB / 7.0 MB');
+    await deliver(source, { ...latestEvent, file: 'mmproj-BF16.gguf' });
+    expect(mounted!.text()).toContain('mmproj-BF16.gguf');
+    expect(mounted!.text()).not.toContain('Checking');
+  });
+
   it("the glyph's data-status goes loading -> error on error", async () => {
     const source = await mountCard();
     await deliver(source, startEvent, latestEvent, { type: 'error', id: 'job-1', message: 'disk full' });

@@ -30,16 +30,39 @@ function parseReplaceBlocker(value: unknown): ReplaceBlocker | undefined {
   return { kind, fileCount, sizeBytes, truncated };
 }
 
+/** `adopt` of the body: absent, or the token of an Update plan, 64 lower-case hex characters. */
+function parseAdoptToken(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  let hex = typeof value === 'string' && value.length === 64;
+  if (hex) {
+    for (const ch of value as string) {
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+        hex = false;
+        break;
+      }
+    }
+  }
+  if (!hex) throw ApiError.badRequest('"adopt" must be the 64-character token of an Update plan');
+  return value as string;
+}
+
 export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unknown {
   const body = requireBody(req);
-  const fields = (body ?? {}) as { repo?: unknown; replaceBlocker?: unknown };
+  const fields = (body ?? {}) as { repo?: unknown; replaceBlocker?: unknown; adopt?: unknown };
   const repo = fields.repo;
   if (typeof repo !== 'string' || repo === '') {
     throw ApiError.badRequest('Body must include a "repo" string');
   }
   const replaceBlocker = parseReplaceBlocker(fields.replaceBlocker);
+  const adopt = parseAdoptToken(fields.adopt);
+  if (adopt !== undefined && replaceBlocker !== undefined) {
+    throw ApiError.badRequest('"adopt" and "replaceBlocker" cannot come together');
+  }
   try {
-    const id = ctx.downloads.start(repo, replaceBlocker === undefined ? undefined : { replaceBlocker });
+    const id = ctx.downloads.start(
+      repo,
+      replaceBlocker !== undefined ? { replaceBlocker } : adopt !== undefined ? { adopt } : undefined,
+    );
     // Accepted, not done: the route declares `successStatus: 202` so the HTTP
     // adapter still answers 202 for a job that is only queued.
     return { id, repo };
@@ -49,6 +72,22 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
     if (err instanceof DownloadsClosedError) throw ApiError.unavailable(err.message);
     if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Failed to start download');
+  }
+}
+
+/** `POST /api/downloads/adopt-plan`: the plan of an Update for `repo`, whose token a later start must carry. */
+export async function handleDownloadAdoptPlan(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  const body = requireBody(req);
+  const repo = ((body ?? {}) as { repo?: unknown }).repo;
+  if (typeof repo !== 'string' || repo === '') {
+    throw ApiError.badRequest('Body must include a "repo" string');
+  }
+  try {
+    return await ctx.downloads.planAdoption(repo);
+  } catch (err) {
+    if (err instanceof DownloadsClosedError) throw ApiError.unavailable(err.message);
+    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
+    throw ApiError.badRequest(err instanceof Error ? err.message : 'Could not check the folder');
   }
 }
 

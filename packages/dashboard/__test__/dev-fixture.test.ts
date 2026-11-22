@@ -24,6 +24,7 @@ import {
   assertFixtureHome,
   CATALOG_BLOCKED,
   CATALOG_INSTALL,
+  CATALOG_UPDATE,
   fixtureArgs,
   fixturePaths,
   FIXTURE_MODELS,
@@ -269,11 +270,11 @@ describe('dev fixture home', () => {
     expect(read(now, { ...flight, chatModels: [] }).turns).toEqual([]);
   });
 
-  it('holds seven models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
+  it('holds eight models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
     writeFixtureHome(home, { now });
     const paths = fixturePaths(home);
     const models = discoverLocalModels(paths.modelsDir);
-    expect(models.models).toHaveLength(7);
+    expect(models.models).toHaveLength(8);
     expect(models.companions).toHaveLength(2);
     expect([...models.warnings].sort()).toEqual([
       'partial-download: no readable config.json; skipped',
@@ -321,6 +322,15 @@ describe('dev fixture content for the manage pages', () => {
       linkTarget: null,
       dangling: false,
     });
+  });
+
+  it('holds one catalog slug with a GGUF folder that Update can adopt', () => {
+    writeFixtureHome(home, { now });
+    const catalog = catalogWithState(fixturePaths(home).modelsDir);
+    const entry = catalog.find((item) => item.slug === CATALOG_UPDATE.slug);
+    expect(entry).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
+    expect(entry?.blocker).toMatchObject({ kind: 'directory', fileCount: 4, truncated: false, holdsModel: true });
+    expect(catalog.find((item) => item.slug === CATALOG_BLOCKED.slug)?.blocker?.holdsModel).toBe(false);
   });
 
   it('installs one catalog entry that reads as installed with an update, with no network', () => {

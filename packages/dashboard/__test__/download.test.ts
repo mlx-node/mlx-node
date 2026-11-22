@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -11,11 +12,14 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import type { ListFileEntry } from '@huggingface/hub';
 import { catalogUpdateRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
@@ -29,6 +33,7 @@ import {
   type DownloadEvent,
   DownloadManager,
   pidAlive,
+  proveInPlace,
   type ReplaceBlocker,
 } from '../src/download.js';
 import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled } from '../src/models.js';
@@ -139,6 +144,8 @@ const renameFault = vi.hoisted(() => ({
   failFromPrefix: null as string | null,
   /** A second prefix, so a test can fail the swap AND its rollback. */
   alsoFailFromPrefix: null as string | null,
+  /** A target prefix, so a test can fail one move by where it goes. */
+  failToPrefix: null as string | null,
 }));
 
 // Fires once around the first rename whose source is `from`: `before` runs just before the real rename, `after`
@@ -160,6 +167,20 @@ const raceHook = vi.hoisted(() => ({ onMarkerWrite: null as (() => void) | null 
 // (Finding E), the window where cancellation used to be ignored.
 const stagingHook = vi.hoisted(() => ({ onVerifyWindow: null as (() => void) | null }));
 
+// Runs before every `link` with its target, so a test can act like a writer in the folder during the adds, or make
+// the link fail by throwing.
+const linkHook = vi.hoisted(() => ({ before: null as ((to: string) => void) | null }));
+
+// Runs before every async `unlink` with its path, so a test can make the unlink fail by throwing.
+const unlinkHook = vi.hoisted(() => ({ before: null as ((path: string) => void) | null }));
+
+// Runs before every async `lstat` with its path, so a test can remove an entry between a folder listing and its stat.
+// `after` runs once the real `lstat` has returned, so a test can act like a writer between a check and the next call.
+const lstatHook = vi.hoisted(() => ({
+  before: null as ((path: string) => void) | null,
+  after: null as ((path: string) => void) | null,
+}));
+
 vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
   return {
@@ -169,7 +190,8 @@ vi.mock('node:fs/promises', async (importActual) => {
       if (
         (renameFault.failFromPath !== null && f === renameFault.failFromPath) ||
         (renameFault.failFromPrefix !== null && f.startsWith(renameFault.failFromPrefix)) ||
-        (renameFault.alsoFailFromPrefix !== null && f.startsWith(renameFault.alsoFailFromPrefix))
+        (renameFault.alsoFailFromPrefix !== null && f.startsWith(renameFault.alsoFailFromPrefix)) ||
+        (renameFault.failToPrefix !== null && String(to).startsWith(renameFault.failToPrefix))
       ) {
         throw new Error(`simulated rename failure moving ${f}`);
       }
@@ -183,7 +205,7 @@ vi.mock('node:fs/promises', async (importActual) => {
       }
       return actual.rename(from, to);
     },
-    writeFile: async (path: string, data: string | Uint8Array) => {
+    writeFile: async (path: string, data: string | Uint8Array, options?: { flag?: string }) => {
       // `includes` catches the atomic writer too: `writeMarkerAtomically` puts
       // the marker's bytes in `<marker>.<pid>.<uuid>.tmp` before the rename, so
       // a refresh-time hook fires on the temp write, not the final path.
@@ -192,7 +214,21 @@ vi.mock('node:fs/promises', async (importActual) => {
         raceHook.onMarkerWrite = null;
         hook();
       }
-      return actual.writeFile(path, data);
+      return actual.writeFile(path, data, options);
+    },
+    link: async (from: string, to: string) => {
+      linkHook.before?.(String(to));
+      return actual.link(from, to);
+    },
+    unlink: async (path: string) => {
+      unlinkHook.before?.(String(path));
+      return actual.unlink(path);
+    },
+    lstat: async (path: string, options?: { bigint?: boolean }) => {
+      lstatHook.before?.(String(path));
+      const stat = await actual.lstat(path, options as never);
+      lstatHook.after?.(String(path));
+      return stat;
     },
     readdir: async (path: string, options?: { recursive?: boolean }) => {
       if (stagingHook.onVerifyWindow !== null && options?.recursive === true && path.includes('.staging')) {
@@ -424,11 +460,16 @@ beforeEach(() => {
   renameFault.failFromPath = null;
   renameFault.failFromPrefix = null;
   renameFault.alsoFailFromPrefix = null;
+  renameFault.failToPrefix = null;
   renameHook.from = null;
   renameHook.before = null;
   renameHook.after = null;
   raceHook.onMarkerWrite = null;
   stagingHook.onVerifyWindow = null;
+  linkHook.before = null;
+  lstatHook.before = null;
+  lstatHook.after = null;
+  unlinkHook.before = null;
   hub.modelInfoRepos = [];
   hub.modelInfoError = null;
   hub.modelInfoFailRepos = [];
@@ -4040,5 +4081,1424 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       // The stub download writes zero bytes, so the new config.json does not parse and the listing cannot show it.
       expect(readdirSync(finalDir())).not.toContain(LEFTOVER);
     });
+  });
+});
+
+describe('owned update of a folder that Update adopted', () => {
+  type DoneEvent = Extract<DownloadEvent, { type: 'done' }>;
+
+  /** The `adopted` record entry of a file as it is on disk now. */
+  function recordOf(path: string): { size: number; mtimeNs: string } {
+    const stat = lstatSync(path, { bigint: true });
+    return { size: Number(stat.size), mtimeNs: stat.mtimeNs.toString() };
+  }
+
+  /**
+   * A folder Update adopted: `listed` files the marker names with a record taken now (or `adopted` when given), plus
+   * `extra` files that only the user put there.
+   */
+  function writeAdoptedFolder(
+    dir: string,
+    listed: Record<string, Buffer>,
+    opts: { extra?: Record<string, string>; adopted?: unknown; revision?: string; marker?: object } = {},
+  ): void {
+    mkdirSync(dir, { recursive: true });
+    const record: Record<string, { size: number; mtimeNs: string }> = {};
+    for (const [path, bytes] of Object.entries(listed)) {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), bytes);
+      record[path] = recordOf(join(dir, path));
+    }
+    for (const [path, text] of Object.entries(opts.extra ?? {})) writeFileSync(join(dir, path), text);
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({
+        repo: REPO,
+        revision: opts.revision ?? SHA_OLD,
+        files: Object.keys(listed),
+        scope: 'full',
+        completedAt: 'x',
+        adopted: opts.adopted ?? record,
+        ...opts.marker,
+      }),
+    );
+  }
+
+  const OLD_FILES = (): Record<string, Buffer> => ({
+    'config.json': Buffer.alloc(12, 0xab),
+    [WEIGHT]: Buffer.alloc(300, 0xab),
+  });
+
+  /** `.staging/<slug>.kept-<uuid>` folders, by name. */
+  function keptDirs(): string[] {
+    return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`)) : [];
+  }
+
+  async function runJob(): Promise<DoneEvent> {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300, 'tokenizer.json': 20 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    await manager.shutdown();
+    expect(events.find((event) => event.type === 'error')).toBeUndefined();
+    return events.find((event): event is DoneEvent => event.type === 'done')!;
+  }
+
+  it('deletes the files that still match the record and leaves no kept folder', async () => {
+    writeAdoptedFolder(finalDir(), { ...OLD_FILES(), 'sub/extra.json': Buffer.from('{}') });
+
+    const done = await runJob();
+
+    expect(done.keptDir).toBeUndefined();
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toEqual([]);
+    expect(hub.downloaded).toContain(WEIGHT);
+    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
+    expect(existsSync(join(finalDir(), 'sub'))).toBe(false);
+  });
+
+  it('keeps a file the user added and names the kept folder on done', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+
+    const done = await runJob();
+
+    expect(keptDirs()).toHaveLength(1);
+    const kept = join(stagingRoot(), keptDirs()[0]!);
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+    expect(existsSync(join(finalDir(), 'README.md'))).toBe(false);
+    expect(backupDirs()).toEqual([]);
+  });
+
+  it('keeps a listed file that was rewritten in place with the same size', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES());
+    const rewritten = Buffer.alloc(300, 0xcd);
+    writeFileSync(join(finalDir(), WEIGHT), rewritten);
+    utimesSync(join(finalDir(), WEIGHT), 1_000_000, 1_000_000);
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT))).toEqual(rewritten);
+  });
+
+  it('keeps everything when the record is malformed', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { adopted: { 'config.json': { size: '12', mtimeNs: '1' } } });
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'config.json', WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+  });
+
+  it('a second pass over a backup that could not be renamed keeps the same files', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    renameFault.failToPrefix = join(stagingRoot(), `${SLUG}.kept-`);
+
+    const done = await runJob();
+
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toHaveLength(1);
+    const backup = join(stagingRoot(), backupDirs()[0]!);
+    expect(done.keptDir).toBe(backup);
+    expect(readdirSync(backup).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+
+    // As if the app had died: the backup's owner pid is gone, so the next job's recovery takes it.
+    renameFault.failToPrefix = null;
+    renameSync(backup, join(stagingRoot(), `${SLUG}.backup-999999999.33333333-3333-3333-3333-333333333333`));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(backupDirs()).toEqual([]);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+  });
+
+  it('recovery of a dead-pid backup uses the same rule', async () => {
+    await runJob();
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);
+    writeAdoptedFolder(backup, OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(existsSync(backup)).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(errors.mock.calls.some((call) => String(call[0]).includes(kept))).toBe(true);
+  });
+
+  it('a stale sidecar in an adopted folder is not deleted in place', async () => {
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    const users = Buffer.alloc(20, 0x75);
+    writeAdoptedFolder(
+      finalDir(),
+      { [WEIGHT]: Buffer.alloc(300), 'config.json': Buffer.alloc(12), 'tokenizer.json': users },
+      { revision: hub.sha, marker: { assetsRepo: ASSETS_REPO, assetsRevision: SHA_NEW } },
+    );
+    // The user rewrote the file after Update, so its record no longer proves it.
+    utimesSync(join(finalDir(), 'tokenizer.json'), 1_000_000, 1_000_000);
+
+    const done = await runJob();
+
+    expect(hub.downloaded).toContain(WEIGHT);
+    expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readFileSync(join(kept, 'tokenizer.json'))).toEqual(users);
+  });
+
+  it('a file renamed onto a proven name between the check and the removal is kept and named', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    lstatHook.after = (path) => {
+      if (!path.includes(`${SLUG}.backup-`) || !path.endsWith(`/${WEIGHT}`)) return;
+      lstatHook.after = null;
+      renameSync(join(dirname(path), 'README.md'), path);
+    };
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT), 'utf-8')).toBe('# my notes');
+  });
+
+  it('a file that cannot be put back at its name stays in the kept folder', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    let backupWeight = '';
+    lstatHook.after = (path) => {
+      if (!path.includes(`${SLUG}.backup-`) || !path.endsWith(`/${WEIGHT}`)) return;
+      lstatHook.after = null;
+      backupWeight = path;
+      renameSync(join(dirname(path), 'README.md'), path);
+    };
+    linkHook.before = (to) => {
+      if (backupWeight !== '' && to === backupWeight) writeFileSync(to, 'later');
+    };
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    const files = (readdirSync(kept, { recursive: true }) as string[]).filter((rel) =>
+      lstatSync(join(kept, rel)).isFile(),
+    );
+    const texts = files.map((rel) => readFileSync(join(kept, rel), 'utf-8'));
+    expect(texts).toContain('# my notes');
+    expect(texts).toContain('later');
+  });
+
+  it('a backup whose marker cannot be read is kept whole', async () => {
+    await runJob();
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.55555555-5555-5555-5555-555555555555`);
+    writeAdoptedFolder(backup, OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    writeFileSync(join(backup, MARKER_FILE), '{"truncated');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(existsSync(backup)).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md', 'config.json', WEIGHT].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+  });
+
+  it('an install without the record is removed as before', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), {
+      extra: { 'README.md': '# my notes' },
+      marker: { adopted: undefined },
+    });
+
+    const done = await runJob();
+
+    expect(done.keptDir).toBeUndefined();
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toEqual([]);
+    expect(existsSync(join(finalDir(), 'README.md'))).toBe(false);
+  });
+});
+
+const FLASH_ENTRY = MODEL_CATALOG.find((entry) => entry.hfRepo === 'Brooooooklyn/Clairic-Flash-GGUF')!;
+const FLASH = catalogRepo(FLASH_ENTRY);
+const FLASH_ASSETS = FLASH_ENTRY.assetsRepo!;
+const FLASH_SLUG = FLASH.split('/').pop()!.toLowerCase();
+const FLASH_WEIGHT = 'Clairic-Flash-UD-Q4_K_XL.gguf';
+const ASSETS_SHA = SHA_NEW;
+
+/** The files of the user's folder, the five the catalog wants from the GGUF repo. */
+const USER_FILES: Record<string, Buffer> = {
+  [FLASH_WEIGHT]: Buffer.alloc(64, 0x11),
+  'mmproj-BF16.gguf': Buffer.alloc(32, 0x22),
+  'clair_head.safetensors': Buffer.alloc(48, 0x33),
+  'clair_head_config.json': Buffer.from('{"head":1}'),
+  'preprocessor_config.json': Buffer.from('{"size":448}'),
+};
+/** The files of the assets repo, in its listing order. */
+const ASSET_FILES: Record<string, Buffer> = {
+  'clairic_runtime/api.py': Buffer.from('pass'),
+  LICENSE: Buffer.from('license'),
+  'chat_template.jinja': Buffer.from('{{ messages }}'),
+  'config.json': Buffer.from('{"model_type":"clairic"}'),
+  'generation_config.json': Buffer.from('{}'),
+  'merges.txt': Buffer.from('a b'),
+  'preprocessor_config.json': Buffer.from('{"size":448}'),
+  'tokenizer.json': Buffer.alloc(40, 0x44),
+  'tokenizer_config.json': Buffer.from('{"t":1}'),
+  'video_preprocessor_config.json': Buffer.from('{"v":1}'),
+};
+const LFS = new Set([FLASH_WEIGHT, 'mmproj-BF16.gguf', 'clair_head.safetensors', 'tokenizer.json']);
+
+/** A manifest entry for `bytes` as Hugging Face lists it: LFS (with Xet) for weights, a git blob for small files. */
+function entryOf(path: string, bytes: Buffer): ManifestEntry {
+  const blob = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+  if (!LFS.has(path)) return { type: 'file', path, size: bytes.length, oid: blob };
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  return {
+    type: 'file',
+    path,
+    size: bytes.length,
+    oid: blob,
+    lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    xetHash: sha256.slice(0, 32),
+  };
+}
+
+/** The two repos the catalog entry reads, shaped like their real listings, and the user's folder. */
+function flashFolder(): string {
+  hub.manifests[FLASH] = [
+    entryOf('.gitattributes', Buffer.from('*.gguf filter=lfs')),
+    ...Object.entries(USER_FILES).map(([path, bytes]) => entryOf(path, bytes)),
+    entryOf('README.md', Buffer.from('# Clairic Flash')),
+  ];
+  hub.manifests[FLASH_ASSETS] = [
+    { type: 'directory', path: 'clairic_runtime', size: 0 },
+    ...Object.entries(ASSET_FILES).map(([path, bytes]) => entryOf(path, bytes)),
+  ];
+  hub.shaByRepo[FLASH_ASSETS] = ASSETS_SHA;
+  const dir = join(modelsDir, FLASH_SLUG);
+  mkdirSync(dir, { recursive: true });
+  for (const [path, bytes] of Object.entries(USER_FILES)) writeFileSync(join(dir, path), bytes);
+  writeFileSync(join(dir, 'README.md'), 'notes');
+  return dir;
+}
+
+describe('Update: plan for a folder the app did not create', () => {
+  function manager(opts: { fetchImpl?: typeof fetch; probeTimeoutMs?: number } = {}): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, ...opts });
+  }
+
+  /** The text of the plan's refusal, which must be a conflict. */
+  async function refusal(m: DownloadManager): Promise<string> {
+    const error = await m.planAdoption(FLASH).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(DownloadConflictError);
+    return (error as Error).message;
+  }
+
+  it("plans a folder like the user's: 5 to check, 6 to download, README.md stays", async () => {
+    flashFolder();
+    const plan = await manager().planAdoption(FLASH);
+    const sizes = (paths: string[]): number =>
+      paths.reduce(
+        (sum, path) =>
+          sum + (hub.manifests[FLASH]!.concat(hub.manifests[FLASH_ASSETS]!).find((e) => e.path === path)?.size ?? 0),
+        0,
+      );
+    expect(plan).toEqual({
+      repo: FLASH,
+      slug: FLASH_SLUG,
+      token: plan.token,
+      revision: hub.sha,
+      assetsRevision: ASSETS_SHA,
+      check: { count: 5, bytes: sizes(Object.keys(USER_FILES)) },
+      download: {
+        count: 6,
+        bytes: sizes([
+          'config.json',
+          'tokenizer.json',
+          'tokenizer_config.json',
+          'chat_template.jinja',
+          'generation_config.json',
+          'video_preprocessor_config.json',
+        ]),
+      },
+      other: { count: 1, bytes: 5, names: ['README.md'] },
+    });
+    expect(plan.token.length).toBe(64);
+    expect(plan.token.split('').every((ch) => (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))).toBe(true);
+    expect(hub.revisionsByRepo[FLASH]).toEqual([hub.sha]);
+    expect(hub.revisionsByRepo[FLASH_ASSETS]).toEqual([ASSETS_SHA]);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it('reads no file content', async () => {
+    const dir = flashFolder();
+    const paths = [...Object.keys(USER_FILES), 'README.md'].map((path) => join(dir, path));
+    for (const path of paths) chmodSync(path, 0o000);
+    const plan = await manager()
+      .planAdoption(FLASH)
+      .finally(() => {
+        for (const path of paths) chmodSync(path, 0o644);
+      });
+    expect(plan.check.count).toBe(5);
+    expect(plan.other.names).toEqual(['README.md']);
+  });
+
+  it('refuses a file with the catalog name and another size, and names it', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, FLASH_WEIGHT), Buffer.alloc(65, 0x11));
+    expect(await refusal(manager())).toBe(
+      `"${FLASH_WEIGHT}" in "${FLASH_SLUG}" is not the catalog file. Its size is different. ` +
+        `Move it out of the folder, then use Update again. Update then downloads the catalog file (64 bytes).`,
+    );
+  });
+
+  it('refuses a catalog file that has no checksum in the manifest', async () => {
+    flashFolder();
+    hub.manifests[FLASH] = hub.manifests[FLASH]!.map((entry) =>
+      entry.path === 'clair_head_config.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+    );
+    const m = manager();
+    expect(await refusal(m)).toBe(
+      `The catalog gives no checksum for "clair_head_config.json", so Update cannot check it. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+  });
+
+  it('refuses a missing catalog file that has no checksum in the manifest, and names it', async () => {
+    flashFolder();
+    hub.manifests[FLASH_ASSETS] = hub.manifests[FLASH_ASSETS]!.map((entry) =>
+      entry.path === 'tokenizer.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+    );
+    expect(await refusal(manager())).toBe(
+      `The catalog gives no checksum for "tokenizer.json", so Update cannot check what it downloads.`,
+    );
+  });
+
+  it('refuses an extra model file', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, 'Clairic-Flash-Q8_0.gguf'), 'q8');
+    expect(await refusal(manager())).toBe(
+      `"Clairic-Flash-Q8_0.gguf" in "${FLASH_SLUG}" is a model file that is not part of the catalog model. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+  });
+
+  it('refuses a name that differs only in letter case', async () => {
+    const dir = flashFolder();
+    rmSync(join(dir, 'clair_head_config.json'));
+    writeFileSync(join(dir, 'Clair_Head_Config.json'), USER_FILES['clair_head_config.json']!);
+    expect(await refusal(manager())).toBe(
+      `"Clair_Head_Config.json" in "${FLASH_SLUG}" differs from the catalog name "clair_head_config.json" only in ` +
+        `letter case. Rename it, then use Update again.`,
+    );
+  });
+
+  it.each<[string, (dir: string) => void, string]>([
+    ['a link', (dir) => symlinkSync(join(dir, 'README.md'), join(dir, 'notes.md')), 'holds links or special files'],
+    ['a special file', (dir) => execFileSync('/usr/bin/mkfifo', [join(dir, 'pipe')]), 'holds links or special files'],
+    [
+      'more than 2,000 entries',
+      (dir) => {
+        mkdirSync(join(dir, 'pages'));
+        for (let n = 0; n < 1_995; n++) writeFileSync(join(dir, 'pages', `${n}.txt`), '');
+      },
+      'holds more than 2,000 files',
+    ],
+    ['a folder with no write permission', (dir) => chmodSync(dir, 0o555), 'no write permission'],
+    [
+      'an owned folder',
+      (dir) =>
+        writeFileSync(
+          join(dir, MARKER_FILE),
+          JSON.stringify({ repo: FLASH, revision: SHA_OLD, files: Object.keys(USER_FILES), completedAt: 'x' }),
+        ),
+      'changed on disk',
+    ],
+    [
+      'a linked slug',
+      (dir) => {
+        const elsewhere = join(modelsDir, 'elsewhere');
+        renameSync(dir, elsewhere);
+        symlinkSync(elsewhere, dir);
+      },
+      'changed on disk',
+    ],
+    ['an unreadable marker file', (dir) => writeFileSync(join(dir, MARKER_FILE), '{'), 'cannot read'],
+  ])('refuses %s', async (_name, plant, words) => {
+    const dir = flashFolder();
+    plant(dir);
+    const texts: Record<string, string> = {
+      'holds links or special files': `"${FLASH_SLUG}" holds links or special files. Update cannot check it.`,
+      'holds more than 2,000 files': `"${FLASH_SLUG}" holds more than 2,000 files. Update cannot check it.`,
+      'no write permission':
+        `The app cannot add files to "${FLASH_SLUG}": it has no write permission on it. ` +
+        `Change its permissions, then try again.`,
+      'changed on disk': `"${FLASH_SLUG}" changed on disk. Check it, then try again.`,
+      'cannot read':
+        `"${FLASH_SLUG}" holds a download record that the app cannot read (${MARKER_FILE}). ` +
+        `Move it out of the folder, then use Update again.`,
+    };
+    try {
+      expect(await refusal(manager())).toBe(texts[words]);
+    } finally {
+      if (lstatSync(dir).isDirectory()) chmodSync(dir, 0o755);
+    }
+  });
+
+  it('plans a folder of exactly 2,000 entries', async () => {
+    const dir = flashFolder();
+    mkdirSync(join(dir, 'pages'));
+    // 6 files and the folder itself are already 7 entries.
+    for (let n = 0; n < 1_993; n++) writeFileSync(join(dir, 'pages', `${n}.txt`), '');
+    expect((await manager().planAdoption(FLASH)).other.count).toBe(1_994);
+  });
+
+  it('a new .DS_Store does not change the token; a touched check file does', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    const first = await m.planAdoption(FLASH);
+    writeFileSync(join(dir, '.DS_Store'), Buffer.alloc(6148));
+    const second = await m.planAdoption(FLASH);
+    expect(second.other.names).toEqual(['.DS_Store', 'README.md']);
+    expect(second.token).toBe(first.token);
+    utimesSync(join(dir, FLASH_WEIGHT), 1_000_000, 1_000_000);
+    expect((await m.planAdoption(FLASH)).token).not.toBe(first.token);
+  });
+
+  it('uses the raw fetch with a deadline while another job downloads', async () => {
+    flashFolder();
+    hub.modelInfoUsesFetch = true;
+    const stalling = makeStallingFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, 100);
+    let cancelJob = (): void => {};
+    const fetchImpl: typeof fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith(`/api/models/${FLASH}`)) return stalling(input, init);
+      // The plan's metadata read hangs; the running job is cancelled while it waits.
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init!.signal!;
+        signal.addEventListener('abort', () => reject(signal.reason as Error));
+        cancelJob();
+      });
+    };
+    const m = manager({ fetchImpl, probeTimeoutMs: 200 });
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'progress' && event.file === WEIGHT));
+    const received = m.jobs().find((job) => job.id === id)!.receivedBytes;
+    cancelJob = () => {
+      expect(m.jobs().find((job) => job.id === id)!.receivedBytes).toBe(received);
+      m.cancel(id);
+    };
+
+    const error = await m.planAdoption(FLASH).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error?.message).toBe('Could not check the folder: The operation was aborted due to timeout');
+    await waitFor(() => events.some((event) => event.type === 'cancelled'));
+  });
+
+  it('says it could not check the folder when Hugging Face does not answer', async () => {
+    flashFolder();
+    hub.modelInfoError = 'getaddrinfo ENOTFOUND huggingface.co';
+    await expect(manager().planAdoption(FLASH)).rejects.toThrow(
+      'Could not check the folder: getaddrinfo ENOTFOUND huggingface.co',
+    );
+  });
+
+  it('answers 409 while a job holds the repo', async () => {
+    flashFolder();
+    const m = manager({ fetchImpl: makeStallingFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, 100) });
+    const running = m.start(REPO);
+    const events: DownloadEvent[] = [];
+    m.subscribe(running, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'progress'));
+    m.start(FLASH);
+    expect(await refusal(m)).toBe('A download of this model is already in the queue. Cancel it, then use Update.');
+    await m.shutdown();
+  });
+});
+
+describe('Update: proof in place', () => {
+  const NAME = 'weights.gguf';
+  const BYTES = Buffer.alloc(1024 * 1024, 0x5a);
+
+  function lfs(bytes: Buffer, path = NAME): ManifestEntry {
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return {
+      type: 'file',
+      path,
+      size: bytes.length,
+      oid: 'f'.repeat(40),
+      lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    };
+  }
+
+  function expected(path: string): { size: number; mtimeNs: bigint; ino: bigint } {
+    const stat = lstatSync(path, { bigint: true });
+    return { size: Number(stat.size), mtimeNs: stat.mtimeNs, ino: stat.ino };
+  }
+
+  function folder(): string {
+    const dir = join(modelsDir, 'user-folder');
+    mkdirSync(dir);
+    writeFileSync(join(dir, NAME), BYTES);
+    return dir;
+  }
+
+  const quiet = { cancelled: () => false, onBytes: () => {} };
+
+  it('proves a file by sha256 and by git-blob sha1', async () => {
+    const dir = folder();
+    const config = Buffer.from('{"model_type":"clairic"}');
+    writeFileSync(join(dir, 'config.json'), config);
+    const blob: ManifestEntry = {
+      type: 'file',
+      path: 'config.json',
+      size: config.length,
+      oid: createHash('sha1').update(`blob ${config.length}\0`).update(config).digest('hex'),
+    };
+
+    const weights = await proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), quiet);
+    const small = await proveInPlace(dir, blob as ListFileEntry, expected(join(dir, 'config.json')), quiet);
+    const wrong = await proveInPlace(
+      dir,
+      lfs(Buffer.alloc(BYTES.length, 0x5b)) as ListFileEntry,
+      expected(join(dir, NAME)),
+      quiet,
+    );
+
+    expect(weights.match).toBe(true);
+    expect(weights.fingerprint.ino).toBe(lstatSync(join(dir, NAME), { bigint: true }).ino);
+    expect(small.match).toBe(true);
+    expect(wrong.match).toBe(false);
+  });
+
+  it('does not follow a link', async () => {
+    const dir = folder();
+    symlinkSync(join(dir, NAME), join(dir, 'linked.gguf'));
+    const error = await proveInPlace(
+      dir,
+      lfs(BYTES, 'linked.gguf') as ListFileEntry,
+      expected(join(dir, NAME)),
+      quiet,
+    ).then(
+      () => null,
+      (e: unknown) => e as NodeJS.ErrnoException,
+    );
+    expect(error?.code).toBe('ELOOP');
+  });
+
+  it('refuses a file that is not the one the plan saw', async () => {
+    const dir = folder();
+    const plan = expected(join(dir, NAME));
+    utimesSync(join(dir, NAME), 1_000_000, 1_000_000);
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, plan, quiet)).rejects.toThrow(
+      `"${NAME}" in "user-folder" changed during the check. Nothing was changed. Use Update again.`,
+    );
+  });
+
+  it('fails when the file is rewritten with the same size during the read', async () => {
+    const dir = folder();
+    // Only the first chunk differs, and it is read before the rewrite, so the bytes read hash to the catalog file.
+    const rewritten = Buffer.from(BYTES);
+    rewritten[0] = 0x00;
+    let first = true;
+    const hooks = {
+      cancelled: () => false,
+      onBytes: () => {
+        if (!first) return;
+        first = false;
+        writeFileSync(join(dir, NAME), rewritten);
+      },
+    };
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks)).rejects.toThrow(
+      `"${NAME}" in "user-folder" changed during the check. Nothing was changed. Use Update again.`,
+    );
+  });
+
+  it('stops inside a file when cancelled', async () => {
+    const dir = folder();
+    let read = 0;
+    const hooks = { cancelled: () => read > 0, onBytes: (n: number) => void (read += n) };
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks)).rejects.toThrow(
+      'Download cancelled',
+    );
+    expect(read).toBeGreaterThan(0);
+    expect(read).toBeLessThan(BYTES.length);
+  });
+
+  it('reports every byte once', async () => {
+    const dir = folder();
+    const chunks: number[] = [];
+    const hooks = { cancelled: () => false, onBytes: (n: number) => void chunks.push(n) };
+    const proof = await proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks);
+    expect(proof.match).toBe(true);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.reduce((sum, n) => sum + n, 0)).toBe(BYTES.length);
+  });
+});
+
+describe('Update: adopt a folder the app did not create, in place', () => {
+  /** What the job downloads for the user's folder, in the order it adds them: config.json last. */
+  const DOWNLOADED = [
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'chat_template.jinja',
+    'generation_config.json',
+    'video_preprocessor_config.json',
+    'config.json',
+  ];
+  const BYTES: Record<string, Buffer> = { ...ASSET_FILES, ...USER_FILES };
+  let fetched: string[] = [];
+
+  beforeEach(() => {
+    fetched = [];
+  });
+
+  /**
+   * A fetch that serves each file's own bytes, so its download verifies, and logs the path. `hold` may answer a path
+   * itself, for a download that waits.
+   */
+  function manager(hold?: (path: string, init?: RequestInit) => Promise<Response> | undefined): DownloadManager {
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const path = url.split('/').slice(3).join('/');
+      fetched.push(path);
+      const held = hold?.(path, init);
+      if (held !== undefined) return held;
+      return new Response(new Uint8Array(BYTES[path] ?? Buffer.alloc(0)), { status: 200 });
+    };
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl });
+  }
+
+  /** A download that only ends when the job's fetch is aborted. */
+  function waitForAbort(init: RequestInit | undefined): Promise<Response> {
+    return new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new DOMException('The operation was aborted', 'AbortError'));
+      if (init?.signal?.aborted) abort();
+      else init?.signal?.addEventListener('abort', abort);
+    });
+  }
+
+  interface FileState {
+    ino: bigint;
+    mtimeNs: bigint;
+    bytes: Buffer;
+  }
+
+  /** Every file under `dir` by path, with its inode, mtime and bytes. */
+  function filesOf(dir: string): Map<string, FileState> {
+    const out = new Map<string, FileState>();
+    for (const rel of readdirSync(dir, { recursive: true }) as string[]) {
+      const stat = lstatSync(join(dir, rel), { bigint: true });
+      if (stat.isFile()) out.set(rel, { ino: stat.ino, mtimeNs: stat.mtimeNs, bytes: readFileSync(join(dir, rel)) });
+    }
+    return out;
+  }
+
+  /** Every file that was in the folder is still there at the same inode, with the same mtime and bytes. */
+  function expectKept(before: Map<string, FileState>, dir: string): void {
+    const now = filesOf(dir);
+    for (const [path, state] of before) expect(now.get(path), path).toEqual(state);
+  }
+
+  /** The names the folder has now that it did not have in `before`. */
+  function addedNames(before: Map<string, FileState>, dir: string): string[] {
+    return [...filesOf(dir).keys()].filter((path) => !before.has(path)).sort();
+  }
+
+  function flashStagingDirs(): string[] {
+    return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${FLASH_SLUG}@`)) : [];
+  }
+
+  function errorOf(events: DownloadEvent[]): string | undefined {
+    const error = events.find((event) => event.type === 'error');
+    return error?.type === 'error' ? error.message : undefined;
+  }
+
+  /**
+   * Plan an Update, run `between` (a change after the confirm), start the job with the plan's token, and wait for its
+   * last event. `onEvent` sees every event as it comes.
+   */
+  async function runUpdate(
+    m: DownloadManager,
+    opts: { between?: () => void; onEvent?: (event: DownloadEvent, id: string) => void } = {},
+  ): Promise<{ id: string; events: DownloadEvent[]; last: DownloadEvent }> {
+    const plan = await m.planAdoption(FLASH);
+    opts.between?.();
+    const id = m.start(FLASH, { adopt: plan.token });
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => {
+      events.push(event);
+      opts.onEvent?.(event, id);
+    });
+    await waitFor(() =>
+      events.some((event) => event.type === 'done' || event.type === 'error' || event.type === 'cancelled'),
+    );
+    return { id, events, last: events.at(-1)! };
+  }
+
+  it('keeps every checked file at its inode, adds only the missing files, writes the marker last, and the catalog says installed', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const order: string[] = [];
+    linkHook.before = (to) => void order.push(to.slice(dir.length + 1));
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last).toEqual({ type: 'done', id: last.id, outputDir: dir });
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED, MARKER_FILE].sort());
+    expect(order).toEqual([...DOWNLOADED, MARKER_FILE]);
+    expect(fetched.sort()).toEqual([...DOWNLOADED].sort());
+    for (const path of DOWNLOADED) {
+      expect(readFileSync(join(dir, path))).toEqual(ASSET_FILES[path]);
+      // The staging tree is gone, so the folder holds the only name of each added file.
+      expect(lstatSync(join(dir, path), { bigint: true }).nlink).toBe(1n);
+    }
+    expect(flashStagingDirs()).toEqual([]);
+    expect(isModelInstalled(dir)).toBe(true);
+    expect(catalogWithState(modelsDir).find((item) => item.slug === FLASH_SLUG)).toMatchObject({
+      installed: true,
+      blocker: null,
+    });
+  });
+
+  it('a crash at any add leaves a folder the app does not own', async () => {
+    const dir = flashFolder();
+    const ownedAtAdd: Array<[string, boolean]> = [];
+    linkHook.before = (to) => {
+      const path = to.slice(dir.length + 1);
+      if (path !== MARKER_FILE) ownedAtAdd.push([path, existsSync(join(dir, MARKER_FILE))]);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(ownedAtAdd).toEqual(DOWNLOADED.map((path) => [path, false]));
+  });
+
+  it('leaves README.md in place and records every listed file in adopted', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager();
+
+    expect((await runUpdate(m)).last.type).toBe('done');
+    await m.shutdown();
+
+    expectKept(before, dir);
+    expect(readFileSync(join(dir, 'README.md'), 'utf-8')).toBe('notes');
+    const marker = JSON.parse(readFileSync(join(dir, MARKER_FILE), 'utf-8')) as {
+      repo: string;
+      revision: string;
+      files: string[];
+      scope: string;
+      assetsRepo: string;
+      assetsRevision: string;
+      adopted: Record<string, { size: number; mtimeNs: string }>;
+    };
+    const wanted = [...Object.keys(USER_FILES), ...DOWNLOADED].sort();
+    expect(marker).toMatchObject({
+      repo: FLASH,
+      revision: hub.sha,
+      scope: 'full',
+      assetsRepo: FLASH_ASSETS,
+      assetsRevision: ASSETS_SHA,
+    });
+    expect([...marker.files].sort()).toEqual(wanted);
+    expect(Object.keys(marker.adopted).sort()).toEqual(wanted);
+    for (const path of wanted) {
+      const stat = lstatSync(join(dir, path), { bigint: true });
+      expect(marker.adopted[path], path).toEqual({ size: Number(stat.size), mtimeNs: stat.mtimeNs.toString() });
+    }
+  });
+
+  it('stops and changes nothing when a same-size file is not the catalog file; the next plan refuses it without a new hash', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, 'clair_head.safetensors'), Buffer.alloc(48, 0x34));
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `"clair_head.safetensors" in "${FLASH_SLUG}" is not the catalog file. Nothing was changed. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+    // No file is read while planning, so the refusal comes from what the job's hash found.
+    chmodSync(join(dir, 'clair_head.safetensors'), 0o000);
+    const refused = await m.planAdoption(FLASH).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    chmodSync(join(dir, 'clair_head.safetensors'), 0o644);
+    expect(refused).toBeInstanceOf(DownloadConflictError);
+    expect(refused?.message).toBe(
+      `"clair_head.safetensors" in "${FLASH_SLUG}" is not the catalog file. Move it out of the folder, then use Update again.`,
+    );
+    await m.shutdown();
+  });
+
+  it('downloads a catalog file that is missing from the folder', async () => {
+    const dir = flashFolder();
+    rmSync(join(dir, FLASH_WEIGHT));
+    const before = filesOf(dir);
+    const m = manager();
+    expect((await m.planAdoption(FLASH)).download.count).toBe(7);
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED, FLASH_WEIGHT, MARKER_FILE].sort());
+    expect(hub.downloadedFrom).toContain(`${FLASH}/${FLASH_WEIGHT}`);
+    expect(readFileSync(join(dir, FLASH_WEIGHT))).toEqual(USER_FILES[FLASH_WEIGHT]);
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('refuses a token that is not the last plan (409) and queues nothing', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    const first = await m.planAdoption(FLASH);
+    const refusedText = `"${FLASH_SLUG}" changed on disk. Close this, then use Update again.`;
+
+    expect(() => m.start(FLASH, { adopt: 'f'.repeat(64) })).toThrow(refusedText);
+    utimesSync(join(dir, FLASH_WEIGHT), 1_000_000, 1_000_000);
+    const second = await m.planAdoption(FLASH);
+    expect(second.token).not.toBe(first.token);
+    expect(() => m.start(FLASH, { adopt: first.token })).toThrow(DownloadConflictError);
+    expect(() => m.start(FLASH, { adopt: first.token })).toThrow(refusedText);
+    expect(m.jobs()).toEqual([]);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+
+    const id = m.start(FLASH, { adopt: second.token });
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+    // A token starts one job only.
+    expect(() => m.start(FLASH, { adopt: second.token })).toThrow(refusedText);
+    await m.shutdown();
+  });
+
+  it.each<[string, (dir: string) => void]>([
+    ['upstream moved', () => void (hub.sha = SHA_NEW)],
+    ['the assets repo moved', () => void (hub.shaByRepo[FLASH_ASSETS] = SHA_A)],
+    ['a check file was touched', (dir) => utimesSync(join(dir, 'clair_head.safetensors'), 1_000_000, 1_000_000)],
+  ])('fails at job start when %s after the confirm', async (_name, change) => {
+    const dir = flashFolder();
+    let before = new Map<string, FileState>();
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      between: () => {
+        change(dir);
+        before = filesOf(dir);
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `"${FLASH_SLUG}" or the catalog changed after you confirmed. Nothing was changed. Use Update again.`,
+    );
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+  });
+
+  it('fails at the commit when a check file was touched after its hash', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager((path) => {
+      if (path === 'tokenizer.json') utimesSync(join(dir, 'clair_head_config.json'), 1_000_000, 1_000_000);
+      return undefined;
+    });
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(readFileSync(join(dir, 'clair_head_config.json'))).toEqual(USER_FILES['clair_head_config.json']);
+    expect(lstatSync(join(dir, 'clair_head_config.json'), { bigint: true }).ino).toBe(
+      before.get('clair_head_config.json')!.ino,
+    );
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('an other file that goes away during the commit scan does not stop the Update', async () => {
+    const dir = flashFolder();
+    const notes = join(dir, 'notes.txt');
+    writeFileSync(notes, 'temp');
+    let scans = 0;
+    // The 1st lstat is the plan's scan, the 2nd the job's own plan, the 3rd the commit scan: the file is gone after
+    // the scan listed it and before its lstat.
+    lstatHook.before = (path) => {
+      if (path === notes && ++scans === 3) rmSync(notes);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(scans).toBe(3);
+    expect(last).toEqual({ type: 'done', id: last.id, outputDir: dir });
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('a check file that goes away during the commit scan still fails the Update', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const head = join(dir, 'clair_head_config.json');
+    const kept = join(modelsDir, 'clair_head_config.json');
+    let scans = 0;
+    lstatHook.before = (path) => {
+      if (path === head && ++scans === 3) renameSync(head, kept);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    renameSync(kept, head);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+  });
+
+  it('a file that appears at a path the job adds makes link fail, and the job removes what it added', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const mine = Buffer.from('{"model_type":"mine"}');
+    // Lands after the commit scan, while the marker is written into staging.
+    raceHook.onMarkerWrite = () => writeFileSync(join(dir, 'config.json'), mine);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"config.json" appeared in "${FLASH_SLUG}" during the update. Nothing was changed.`);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual(['config.json']);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(mine);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it("never removes an added name that is no longer the job's inode", async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const mine = Buffer.from('my tokenizer');
+    linkHook.before = (to) => {
+      if (to !== join(dir, 'config.json')) return;
+      // The user replaces a file the job added, and puts a config.json where the job adds one.
+      rmSync(join(dir, 'tokenizer.json'));
+      writeFileSync(join(dir, 'tokenizer.json'), mine);
+      writeFileSync(to, '{}');
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"config.json" appeared in "${FLASH_SLUG}" during the update. Nothing was changed.`);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual(['config.json', 'tokenizer.json']);
+    expect(readFileSync(join(dir, 'tokenizer.json'))).toEqual(mine);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+  });
+
+  it('keeps every added file when it cannot remove the added config.json, and says to remove it', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) throw Object.assign(new Error('simulated'), { code: 'EIO' });
+    };
+    renameFault.failFromPath = join(dir, 'config.json');
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    const stays = [...DOWNLOADED].reverse();
+    expect(errorOf(events)).toBe(
+      `Update stopped. These files that it added stay in "${FLASH_SLUG}": ${stays.join(', ')}. ` +
+        `No file of yours was changed. Remove config.json from the folder, then use Update again.`,
+    );
+    expectKept(before, dir);
+    // A config.json without its tokenizer would read as installed; with every added file beside it the folder is whole.
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED].sort());
+    for (const path of DOWNLOADED) expect(readFileSync(join(dir, path))).toEqual(ASSET_FILES[path]);
+    expect(catalogWithState(modelsDir).find((item) => item.slug === FLASH_SLUG)).toMatchObject({
+      present: true,
+      installed: false,
+      blocker: null,
+    });
+    rmSync(join(dir, 'config.json'));
+    expect(catalogWithState(modelsDir).find((item) => item.slug === FLASH_SLUG)?.blocker).toMatchObject({
+      holdsModel: true,
+      kind: 'directory',
+    });
+  });
+
+  it('a file renamed onto an added name between the check and the removal is not deleted', async () => {
+    const dir = flashFolder();
+    const notes = Buffer.from('my notes');
+    writeFileSync(join(dir, 'my-notes.txt'), notes);
+    let rollingBack = false;
+    linkHook.before = (to) => {
+      if (to !== join(dir, MARKER_FILE)) return;
+      rollingBack = true;
+      throw Object.assign(new Error('simulated'), { code: 'EIO' });
+    };
+    lstatHook.after = (path) => {
+      if (!rollingBack || path !== join(dir, 'config.json')) return;
+      lstatHook.after = null;
+      renameSync(join(dir, 'my-notes.txt'), path);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toContain(`The app could not add "${MARKER_FILE}" to "${FLASH_SLUG}" (EIO).`);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(notes);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    for (const path of DOWNLOADED.filter((path) => path !== 'config.json')) {
+      expect(existsSync(join(dir, path)), path).toBe(false);
+    }
+    expect(readdirSync(stagingRoot()).filter((name) => name.startsWith(`${FLASH_SLUG}.kept-`))).toEqual([]);
+  });
+
+  it('a file that cannot be put back at its name is kept, and the error names where', async () => {
+    const dir = flashFolder();
+    const notes = Buffer.from('my notes');
+    const later = Buffer.from('{"later":1}');
+    writeFileSync(join(dir, 'my-notes.txt'), notes);
+    let rollingBack = false;
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) {
+        rollingBack = true;
+        throw Object.assign(new Error('simulated'), { code: 'EIO' });
+      }
+      // Something takes the name while the moved file is checked, so it cannot go back.
+      if (rollingBack && to === join(dir, 'config.json')) writeFileSync(to, later);
+    };
+    lstatHook.after = (path) => {
+      if (!rollingBack || path !== join(dir, 'config.json')) return;
+      lstatHook.after = null;
+      renameSync(join(dir, 'my-notes.txt'), path);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    const kept = readdirSync(stagingRoot()).filter((name) => name.startsWith(`${FLASH_SLUG}.kept-`));
+    expect(kept).toHaveLength(1);
+    const keptDir = join(stagingRoot(), kept[0]!);
+    expect(readFileSync(join(keptDir, 'config.json'))).toEqual(notes);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(later);
+    const message = errorOf(events)!;
+    expect(message).toContain(`"${keptDir}"`);
+    expect(message).not.toContain('No file of yours was changed');
+    expect(message).not.toContain('Nothing was changed');
+  });
+
+  it('a checked file that changes while the files are added stops the Update before the marker', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = (to) => {
+      if (to === join(dir, 'config.json')) truncateSync(join(dir, FLASH_WEIGHT), 3);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    expect(addedNames(before, dir)).toEqual([]);
+    before.delete(FLASH_WEIGHT);
+    expectKept(before, dir);
+  });
+
+  it('a change to a checked file at the marker link itself is not seen (accepted)', async () => {
+    const dir = flashFolder();
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) truncateSync(join(dir, FLASH_WEIGHT), 3);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(lstatSync(join(dir, FLASH_WEIGHT)).size).toBe(3);
+  });
+
+  it('a missing file whose checksum leaves the manifest after the confirm stops the job before any download', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      between: () => {
+        hub.manifests[FLASH_ASSETS] = hub.manifests[FLASH_ASSETS]!.map((entry) =>
+          entry.path === 'tokenizer.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+        );
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toContain(`The catalog gives no checksum for "tokenizer.json"`);
+    expect(fetched).toEqual([]);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('stops with a clear text when the volume cannot link', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = () => {
+      throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' });
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `The app could not add "tokenizer.json" to "${FLASH_SLUG}" (ENOTSUP). Update needs a volume that can link ` +
+        `files. Nothing was changed.`,
+    );
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('cancel during the check stops inside the file and leaves the folder as it was', async () => {
+    const dir = flashFolder();
+    const big = Buffer.alloc(1024 * 1024, 0x11);
+    writeFileSync(join(dir, FLASH_WEIGHT), big);
+    hub.manifests[FLASH] = hub.manifests[FLASH]!.map((entry) =>
+      entry.path === FLASH_WEIGHT ? entryOf(FLASH_WEIGHT, big) : entry,
+    );
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      onEvent: (event, id) => {
+        if (event.type === 'progress' && event.phase === 'check') m.cancel(id);
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('cancelled');
+    const read = events.flatMap((event) => (event.type === 'progress' ? [event.receivedBytes] : []));
+    expect(read.length).toBeGreaterThan(0);
+    expect(Math.max(...read)).toBeLessThan(big.length);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('cancel during the sidecar download leaves the folder as it was', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    let cancel = (): void => {};
+    const m = manager((path, init) => {
+      if (path !== 'tokenizer_config.json') return undefined;
+      cancel();
+      return waitForAbort(init);
+    });
+
+    const { last } = await runUpdate(m, { onEvent: (_event, id) => void (cancel = () => void m.cancel(id)) });
+    await m.shutdown();
+
+    expect(last.type).toBe('cancelled');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('refuses to cancel once committing and still finishes', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    let cancelled: boolean | null = null;
+    let jobId = '';
+    raceHook.onMarkerWrite = () => {
+      cancelled = m.cancel(jobId);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m, { onEvent: (_event, id) => void (jobId = id) });
+    await m.shutdown();
+
+    expect(cancelled).toBe(false);
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('after a crash in the middle of the adds, the next Update finishes', async () => {
+    const dir = flashFolder();
+    // What an Update that died after two adds leaves: two complete catalog files and no marker.
+    writeFileSync(join(dir, 'tokenizer.json'), ASSET_FILES['tokenizer.json']!);
+    writeFileSync(join(dir, 'tokenizer_config.json'), ASSET_FILES['tokenizer_config.json']!);
+    const before = filesOf(dir);
+    const m = manager();
+    const plan = await m.planAdoption(FLASH);
+    expect([plan.check.count, plan.download.count]).toEqual([7, 4]);
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED.slice(2), MARKER_FILE].sort());
+    expect(fetched.sort()).toEqual(DOWNLOADED.slice(2).sort());
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it("a dead job's staging tree with second names is reaped and the folder keeps its files", async () => {
+    const dir = flashFolder();
+    const dead = join(stagingRoot(), `${FLASH_SLUG}@${hub.sha}.999999999.55555555-5555-5555-5555-555555555555`);
+    mkdirSync(dead, { recursive: true });
+    writeFileSync(join(dead, 'tokenizer.json'), ASSET_FILES['tokenizer.json']!);
+    linkSync(join(dead, 'tokenizer.json'), join(dir, 'tokenizer.json'));
+    const ino = lstatSync(join(dir, 'tokenizer.json'), { bigint: true }).ino;
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(existsSync(dead)).toBe(false);
+    const stat = lstatSync(join(dir, 'tokenizer.json'), { bigint: true });
+    expect([stat.ino, stat.nlink]).toEqual([ino, 1n]);
+    expect(readFileSync(join(dir, 'tokenizer.json'))).toEqual(ASSET_FILES['tokenizer.json']);
+    expect(fetched).not.toContain('tokenizer.json');
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('the start total covers checked and downloaded bytes and no frame passes it; check frames carry phase check', async () => {
+    flashFolder();
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    const sum = (paths: string[]): number => paths.reduce((total, path) => total + BYTES[path]!.length, 0);
+    const total = sum([...Object.keys(USER_FILES), ...DOWNLOADED]);
+    expect(events[0]).toEqual({ type: 'start', id: last.id, repo: FLASH, totalBytes: total, fileCount: 11 });
+    const frames = events.filter((event) => event.type === 'progress');
+    for (const frame of frames) {
+      expect(frame.jobReceivedBytes).toBeLessThanOrEqual(total);
+      expect(frame.receivedBytes).toBeLessThanOrEqual(frame.totalBytes);
+      expect(frame.fileCount).toBe(11);
+      expect(frame.phase, frame.file).toBe(Object.hasOwn(USER_FILES, frame.file) ? 'check' : undefined);
+    }
+    expect(new Set(frames.map((frame) => frame.file))).toEqual(new Set([...Object.keys(USER_FILES), ...DOWNLOADED]));
+    expect(frames.at(-1)!.jobReceivedBytes).toBe(total);
+  });
+
+  it('hands back a running Update and refuses one while a plain job holds the repo', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager((path, init) => (path === 'tokenizer.json' ? waitForAbort(init) : undefined));
+    const plan = await m.planAdoption(FLASH);
+    const id = m.start(FLASH, { adopt: plan.token });
+    expect(m.start(FLASH, { adopt: plan.token })).toBe(id);
+    expect(() =>
+      m.start(FLASH, { replaceBlocker: { kind: 'directory', fileCount: 6, sizeBytes: 1, truncated: false } }),
+    ).toThrow('A download of this model is already in the queue. Cancel it, then use Reinstall.');
+    await m.shutdown();
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+
+    const other = manager();
+    const second = await other.planAdoption(FLASH);
+    const plain = other.start(FLASH);
+    expect(() => other.start(FLASH, { adopt: second.token })).toThrow(
+      'A download of this model is already in the queue. Cancel it, then use Update.',
+    );
+    const events: DownloadEvent[] = [];
+    other.subscribe(plain, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+    await other.shutdown();
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('a later Update available job on the adopted folder keeps what was added after Update', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    expect((await runUpdate(m)).last.type).toBe('done');
+    writeFileSync(join(dir, 'notes.txt'), 'mine');
+    hub.sha = SHA_NEW;
+
+    const id = m.start(FLASH);
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    await m.shutdown();
+
+    expect(errorOf(events)).toBeUndefined();
+    const done = events.find((event) => event.type === 'done');
+    const keptDir = done?.type === 'done' ? done.keptDir : undefined;
+    expect(keptDir).toBeDefined();
+    expect(readdirSync(keptDir!).sort()).toEqual([MARKER_FILE, 'README.md', 'notes.txt'].sort());
+    expect(readFileSync(join(keptDir!, 'README.md'), 'utf-8')).toBe('notes');
+    expect(readFileSync(join(keptDir!, 'notes.txt'), 'utf-8')).toBe('mine');
+    expect(readdirSync(dir).sort()).toEqual([...Object.keys(USER_FILES), ...DOWNLOADED, MARKER_FILE].sort());
+    expect(JSON.parse(readFileSync(join(dir, MARKER_FILE), 'utf-8'))).toMatchObject({ revision: SHA_NEW });
+    expect(isModelInstalled(dir)).toBe(true);
   });
 });

@@ -144,6 +144,22 @@ export interface DownloadStartResponse {
   repo: string;
 }
 
+/**
+ * Result of `POST /api/downloads/adopt-plan`: what Update would check, download and leave in a folder the app did not
+ * create. `token` is posted back as `adopt` to start that exact plan.
+ */
+export interface AdoptPlanResponse {
+  repo: string;
+  slug: string;
+  token: string;
+  revision: string;
+  assetsRevision: string | null;
+  check: { count: number; bytes: number };
+  download: { count: number; bytes: number };
+  /** Files that stay in the folder; `names` holds at most 3, sorted. */
+  other: { count: number; bytes: number; names: string[] };
+}
+
 /** Result of `DELETE /api/downloads/:id` (cancel an in-flight/queued download). */
 export interface CancelDownloadResponse {
   cancelled: boolean;

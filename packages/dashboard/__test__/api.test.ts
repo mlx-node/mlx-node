@@ -33,9 +33,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
 import { quantilesOf } from '../src/api/quantiles.js';
+import { ROUTES } from '../src/api/routes.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
 import { openDashboardDb } from '../src/db/open.js';
-import { DownloadsClosedError } from '../src/download.js';
+import { DownloadConflictError, DownloadsClosedError } from '../src/download.js';
 import { ingestTraces, TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
@@ -1906,6 +1907,94 @@ describe('dashboard api — start download route', () => {
     });
     expect(res.status).toBe(400);
     expect(res.ok ? '' : res.code).toBe('E_BAD_REQUEST');
+  });
+});
+
+describe('dashboard api — Update plan route', () => {
+  function postPlan(planAdoption: (repo: string) => Promise<unknown>, body: unknown = { repo: 'org/model' }) {
+    const ctx = { downloads: { planAdoption } } as unknown as ApiContext;
+    return call(ctx, 'POST', '/api/downloads/adopt-plan', body);
+  }
+
+  it('adopt-plan is a main route and maps a conflict to 409', async () => {
+    const route = ROUTES.find((r) => r.method === 'POST' && r.segments.join('/') === 'api/downloads/adopt-plan');
+    expect(route?.thread).toBe('main');
+
+    const seen: string[] = [];
+    const ok = await postPlan(async (repo) => {
+      seen.push(repo);
+      return { repo, token: 'a'.repeat(64) };
+    });
+    expect(seen).toEqual(['org/model']);
+    expect(ok.status).toBe(200);
+    expect(ok.ok ? ok.body : null).toEqual({ repo: 'org/model', token: 'a'.repeat(64) });
+
+    const text = '"model" holds links or special files. Update cannot check it.';
+    const conflict = await postPlan(() => Promise.reject(new DownloadConflictError(text)));
+    expect(conflict.status).toBe(409);
+    expect(conflict.ok ? '' : conflict.message).toBe(text);
+  });
+
+  it('answers 503 while shutting down, and 400 for a bad body or a failed check', async () => {
+    expect((await postPlan(() => Promise.reject(new DownloadsClosedError()))).status).toBe(503);
+    const offline = await postPlan(() => Promise.reject(new Error('Could not check the folder: fetch failed')));
+    expect(offline.status).toBe(400);
+    expect(offline.ok ? '' : offline.message).toBe('Could not check the folder: fetch failed');
+    let called = false;
+    const bad = await postPlan(async () => {
+      called = true;
+      return {};
+    }, {});
+    expect(bad.status).toBe(400);
+    expect(called).toBe(false);
+  });
+});
+
+describe('dashboard api — Update start', () => {
+  function postStart(body: unknown): { res: ReturnType<typeof dispatch>; calls: unknown[][] } {
+    const calls: unknown[][] = [];
+    const ctx = {
+      downloads: {
+        start: (...args: unknown[]) => {
+          calls.push(args);
+          return 'job-1';
+        },
+      },
+    } as unknown as ApiContext;
+    return { res: call(ctx, 'POST', '/api/downloads', body), calls };
+  }
+
+  it('passes the token of the plan to the manager', async () => {
+    const { res, calls } = postStart({ repo: 'org/model', adopt: '0123456789abcdef'.repeat(4) });
+    expect((await res).status).toBe(202);
+    expect(calls).toEqual([['org/model', { adopt: '0123456789abcdef'.repeat(4) }]]);
+  });
+
+  it('rejects adopt with replaceBlocker', async () => {
+    const { res, calls } = postStart({
+      repo: 'org/model',
+      adopt: 'a'.repeat(64),
+      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 1, truncated: false },
+    });
+    const answer = await res;
+    expect(answer.status).toBe(400);
+    expect(answer.ok ? '' : answer.message).toBe('"adopt" and "replaceBlocker" cannot come together');
+    expect(calls).toEqual([]);
+  });
+
+  it.each<[string, unknown]>([
+    ['63 chars', 'a'.repeat(63)],
+    ['65 chars', 'a'.repeat(65)],
+    ['upper case', 'A'.repeat(64)],
+    ['a char past f', `g${'a'.repeat(63)}`],
+    ['a number', 42],
+    ['null', null],
+  ])('rejects a token that is not 64 hex chars: %s', async (_name, adopt) => {
+    const { res, calls } = postStart({ repo: 'org/model', adopt });
+    const answer = await res;
+    expect(answer.status).toBe(400);
+    expect(answer.ok ? '' : answer.message).toBe('"adopt" must be the 64-character token of an Update plan');
+    expect(calls).toEqual([]);
   });
 });
 

@@ -33,6 +33,7 @@ import {
 } from './handlers/chat.js';
 import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
+  handleDownloadAdoptPlan,
   handleDownloadCancel,
   handleDownloadEventsUnsupported,
   handleDownloadStart,
@@ -155,6 +156,7 @@ export const ROUTES: Route[] = [
   // be RECEIVED while one is running.
   mainRoute('GET', '/api/downloads', handleDownloadsList),
   mainRoute('POST', '/api/downloads', handleDownloadStart, { successStatus: 202 }),
+  mainRoute('POST', '/api/downloads/adopt-plan', handleDownloadAdoptPlan),
   mainRoute('DELETE', '/api/downloads/:id', handleDownloadCancel),
   mainRoute('GET', '/api/downloads/:id/events', handleDownloadEventsUnsupported, { stream: true }),
   workerRoute('GET', '/api/metrics/models', handleMetricsModels),

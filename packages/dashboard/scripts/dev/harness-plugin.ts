@@ -57,6 +57,7 @@ function isGalleryUrl(url: string | undefined): boolean {
  */
 const GUARDED: ReadonlyArray<{ method: string; path: string }> = [
   { method: 'POST', path: '/api/downloads' },
+  { method: 'POST', path: '/api/downloads/adopt-plan' },
   { method: 'GET', path: '/api/catalog/updates' },
 ];
 

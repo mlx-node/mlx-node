@@ -1722,6 +1722,7 @@ export async function run(argv: string[]) {
           ? { assetsRepo: previousCompletion.assetsRepo, assetsRevision: previousCompletion.assetsRevision }
           : {}),
       completedAt: new Date().toISOString(),
+      ...(previousCompletion?.adopted !== undefined ? { adopted: previousCompletion.adopted } : {}),
     });
   };
 

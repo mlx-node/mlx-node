@@ -2226,6 +2226,34 @@ function writeCatalogBlocked(home: string): void {
   truncateSync(file, CATALOG_BLOCKED.sizeBytes);
 }
 
+/**
+ * A catalog slug holding a Clairic GGUF folder that the app did not create (weights, the two head files and a README,
+ * no marker): the card shows "Needs update" with Update. The files are small, so a plan against Hugging Face refuses
+ * the GGUF for its size; the fixture is for the idle card.
+ */
+export const CATALOG_UPDATE = {
+  slug: 'clairic-flash-gguf',
+  weights: 'Clairic-Flash-UD-Q4_K_XL.gguf',
+  weightsBytes: 4 * MIB,
+  head: 'clair_head.safetensors',
+  headBytes: MIB,
+} as const;
+
+function writeCatalogUpdate(home: string): void {
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_UPDATE.slug);
+  mkdirSync(dir, { recursive: true });
+  for (const [name, bytes] of [
+    [CATALOG_UPDATE.weights, CATALOG_UPDATE.weightsBytes],
+    [CATALOG_UPDATE.head, CATALOG_UPDATE.headBytes],
+  ] as const) {
+    const file = join(dir, name);
+    writeFileSync(file, '');
+    truncateSync(file, bytes);
+  }
+  writeJson(join(dir, 'clair_head_config.json'), {});
+  writeFileSync(join(dir, 'README.md'), '# Clairic Flash\n\nCopied from another Mac.\n');
+}
+
 export interface FixtureSummary {
   traces: number;
   sessions: number;
@@ -2255,6 +2283,7 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   writeAgentWork(home, random, now, process.pid);
   writeCatalogInstall(home, now);
   writeCatalogBlocked(home);
+  writeCatalogUpdate(home);
   writeCodingAgents(home);
   return { traces, sessions, live };
 }

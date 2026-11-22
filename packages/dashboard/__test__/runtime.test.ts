@@ -230,6 +230,7 @@ describe('dashboard runtime — route ownership', () => {
       'GET /api/catalog/updates',
       'GET /api/downloads',
       'POST /api/downloads',
+      'POST /api/downloads/adopt-plan',
       'DELETE /api/downloads/:id',
       'GET /api/downloads/:id/events',
       'GET /api/runtime/live',

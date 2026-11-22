@@ -130,6 +130,19 @@ describe('dev harness plugin', () => {
     expect([...socket.listeners.values()].every((set) => set.size === 0)).toBe(true);
   });
 
+  it('the plan route is guarded offline', async () => {
+    const runtime = fakeRuntime();
+    const call = { method: 'POST', path: '/api/downloads/adopt-plan', body: { repo: 'x/y' } };
+    expect(await guardRuntime(runtime, false).call(call)).toMatchObject({
+      ok: false,
+      code: 'E_UNAVAILABLE',
+      message: 'Disabled in the dev harness',
+    });
+    expect(runtime.calls).toEqual([]);
+    expect((await guardRuntime(runtime, true).call(call)).ok).toBe(true);
+    expect(runtime.calls.map((c) => `${c.method} ${c.path}`)).toEqual(['POST /api/downloads/adopt-plan']);
+  });
+
   it('answers the two network routes locally unless the network is allowed', async () => {
     const runtime = fakeRuntime();
     const guarded = guardRuntime(runtime, false);

@@ -27,6 +27,8 @@ export interface ProgressState {
   fileCount: number;
   fileIndex: number;
   currentFile: string;
+  /** The latest frame hashes a file already in the folder (Update) instead of downloading it. */
+  checking: boolean;
   /** Aggregate bytes across all files, as reported by the latest frame. */
   receivedBytes: number;
   /** Job total from the `start` event; 0 until it arrives. */
@@ -43,6 +45,7 @@ export const INITIAL_PROGRESS: ProgressState = {
   fileCount: 0,
   fileIndex: 0,
   currentFile: '',
+  checking: false,
   receivedBytes: 0,
   totalBytes: 0,
   rate: null,
@@ -90,6 +93,7 @@ export function reduceProgress(
         fileCount: event.fileCount > 0 ? event.fileCount : prev.fileCount,
         fileIndex: event.fileIndex,
         currentFile: event.file,
+        checking: event.phase === 'check',
         receivedBytes: event.jobReceivedBytes,
         rate: nextRate(prev.rate, event.jobReceivedBytes, now),
         stalled: false,
@@ -118,7 +122,8 @@ export function reduceProgress(
 export interface DownloadProgressProps {
   /** Download job id from `POST /api/downloads`. */
   id: string;
-  onDone?: () => void;
+  /** `keptDir`: where a later update put the files of the old folder that the app may not delete. */
+  onDone?: (keptDir: string | undefined) => void;
   onError?: (message: string) => void;
   /**
    * The job stopped without finishing. Distinct from {@link onError}: a cancel is
@@ -179,7 +184,7 @@ export function DownloadProgress({ id, onDone, onError, onCancelled, className }
       setState((prev) => reduceProgress(prev, event, now));
       if (event.type === 'start' || event.type === 'progress') armStall();
       else clearTimeout(stallTimer);
-      if (event.type === 'done') doneCb.current?.();
+      if (event.type === 'done') doneCb.current?.(event.keptDir);
       if (event.type === 'error') errorCb.current?.(event.message);
       // A terminal event the owner cannot have been waiting for. The host answers
       // a cancel while the job is still `running` — it lets `processJob` emit this
@@ -205,7 +210,7 @@ export function DownloadProgress({ id, onDone, onError, onCancelled, className }
 /** The card for one state of {@link reduceProgress}: status line, bar, and file / rate line. */
 export function DownloadProgressView({ state, className }: { state: ProgressState; className?: string }): ReactElement {
   const staticMotion = useStaticMotion();
-  const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, message, stalled } = state;
+  const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, checking, message, stalled } = state;
   const fraction =
     phase === 'done'
       ? 1
@@ -225,7 +230,9 @@ export function DownloadProgressView({ state, className }: { state: ProgressStat
         ? (message ?? 'Download failed')
         : phase === 'connecting'
           ? 'Starting…'
-          : currentFile || 'Downloading…';
+          : checking
+            ? `Checking ${currentFile}`
+            : currentFile || 'Downloading…';
   const bytes =
     phase === 'error' || phase === 'connecting'
       ? null
