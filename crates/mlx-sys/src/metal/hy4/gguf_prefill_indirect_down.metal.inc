@@ -165,10 +165,10 @@ if (slot < uint(S)) {
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g0, d0, m0);
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g1, d1, m1);
         }
-        const half hd0 = half(simd_shuffle(d0, quad_base));
-        const half hm0 = half(simd_shuffle(m0, quad_base));
-        const half hd1 = half(simd_shuffle(d1, quad_base));
-        const half hm1 = half(simd_shuffle(m1, quad_base));
+        const float d0_f = simd_shuffle(d0, quad_base);
+        const float m0_f = simd_shuffle(m0, quad_base);
+        const float d1_f = simd_shuffle(d1, quad_base);
+        const float m1_f = simd_shuffle(m1, quad_base);
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
           threadgroup half4* d_lo =
@@ -178,8 +178,8 @@ if (slot < uint(S)) {
           STEEL_PRAGMA_UNROLL
           for (int i = 0; i < 2; ++i) {
             const uchar4 b = as_type<uchar4>(qs_w[p][i]);
-            d_lo[i] = metal::fma(half4(b & uchar4(0x0Fu)), hd0, hm0);
-            d_hi[i] = metal::fma(half4(b >> 4), hd1, hm1);
+            d_lo[i] = half4(metal::fma(float4(b & uchar4(0x0Fu)), d0_f, m0_f));
+            d_hi[i] = half4(metal::fma(float4(b >> 4), d1_f, m1_f));
           }
         }
       }
@@ -251,7 +251,7 @@ if (slot < uint(S)) {
     uchar4 ql0_v[2][2];
     uchar4 ql1_v[2][2];
     uchar4 qh_v[2][2];
-    half4 sc[2];
+    float4 sc[2];
     const size_t l_off = size_t(lane4) * 8u;
 
     STEEL_PRAGMA_UNROLL
@@ -286,7 +286,7 @@ if (slot < uint(S)) {
         const float4 sv = ((lane4 & 2u) == 0u)
             ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
             : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
-        sc[p] = half4(sv * d_val);
+        sc[p] = sv * d_val;
       }
     }
 
@@ -316,8 +316,8 @@ if (slot < uint(S)) {
       for (int p = 0; p < 2; ++p) {
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
-          const half sc_a = hi_half ? sc[p].z : sc[p].x;
-          const half sc_b = hi_half ? sc[p].w : sc[p].y;
+          const float sc_a = hi_half ? sc[p].z : sc[p].x;
+          const float sc_b = hi_half ? sc[p].w : sc[p].y;
           threadgroup half4* d_lo =
               reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_lo * 8u);
           threadgroup half4* d_hi =
@@ -327,11 +327,11 @@ if (slot < uint(S)) {
             const uchar4 q0 =
                 ((ql0_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
                 (((qh_v[p][i] >> qh_sh_a) & uchar4(0x03u)) << 4);
-            d_lo[i] = half4(char4(q0) - char4(32)) * sc_a;
+            d_lo[i] = half4(float4(char4(q0) - char4(32)) * sc_a);
             const uchar4 q1 =
                 ((ql1_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
                 (((qh_v[p][i] >> qh_sh_b) & uchar4(0x03u)) << 4);
-            d_hi[i] = half4(char4(q1) - char4(32)) * sc_b;
+            d_hi[i] = half4(float4(char4(q1) - char4(32)) * sc_b);
           }
         }
       }
@@ -401,7 +401,7 @@ if (slot < uint(S)) {
               const float4 sv = ((lane4 & 2u) == 0u)
                   ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
                   : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
-              sc[p] = half4(sv * d_val);
+              sc[p] = sv * d_val;
             }
           }
         }

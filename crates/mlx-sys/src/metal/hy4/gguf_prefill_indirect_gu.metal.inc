@@ -168,10 +168,10 @@ if (slot < uint(S)) {
           hy4_gguf_q4k_group_scale(w_sc[p], w_d[p], w_dmin[p], g0, d0, m0);
           hy4_gguf_q4k_group_scale(w_sc[p], w_d[p], w_dmin[p], g1, d1, m1);
         }
-        const half hd0 = half(simd_shuffle(d0, quad_base));
-        const half hm0 = half(simd_shuffle(m0, quad_base));
-        const half hd1 = half(simd_shuffle(d1, quad_base));
-        const half hm1 = half(simd_shuffle(m1, quad_base));
+        const float d0_f = simd_shuffle(d0, quad_base);
+        const float m0_f = simd_shuffle(m0, quad_base);
+        const float d1_f = simd_shuffle(d1, quad_base);
+        const float m1_f = simd_shuffle(m1, quad_base);
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
           threadgroup half4* d_lo = reinterpret_cast<threadgroup half4*>(
@@ -181,8 +181,8 @@ if (slot < uint(S)) {
           STEEL_PRAGMA_UNROLL
           for (int i = 0; i < 2; ++i) {
             const uchar4 b = as_type<uchar4>(w_qs[p][i]);
-            d_lo[i] = metal::fma(half4(b & uchar4(0x0Fu)), hd0, hm0);
-            d_hi[i] = metal::fma(half4(b >> 4), hd1, hm1);
+            d_lo[i] = half4(metal::fma(float4(b & uchar4(0x0Fu)), d0_f, m0_f));
+            d_hi[i] = half4(metal::fma(float4(b >> 4), d1_f, m1_f));
           }
         }
       }

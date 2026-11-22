@@ -1518,6 +1518,281 @@ fn gguf_prefill_bm64_multi_tile_and_m32_unchunked_dedup_parity() {
     }
 }
 
+/// Exact CPU f32 dequantization of a single raw GGUF `block_q4_K` (144 bytes -> 256 f32).
+fn cpu_dequant_q4k_block(blk: &[u8]) -> [f32; 256] {
+    let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
+    let sc_b = &blk[4..16];
+    let qs = &blk[16..144];
+    let mut out = [0.0f32; 256];
+    for c in 0..4 {
+        let g0 = 2 * c;
+        let g1 = g0 + 1;
+        let group_sm = |g: usize| -> (f32, f32) {
+            let (sc, m) = if g < 4 {
+                (sc_b[g] & 63, sc_b[g + 4] & 63)
+            } else {
+                let q4 = sc_b[g + 4];
+                (
+                    (q4 & 0x0F) | ((sc_b[g - 4] >> 6) << 4),
+                    (q4 >> 4) | ((sc_b[g] >> 6) << 4),
+                )
+            };
+            (d * f32::from(sc), -dmin * f32::from(m))
+        };
+        let (d0, m0) = group_sm(g0);
+        let (d1, m1) = group_sm(g1);
+        for l in 0..32 {
+            let byte = qs[c * 32 + l];
+            out[c * 64 + l] = f32::from(byte & 0x0F).mul_add(d0, m0);
+            out[c * 64 + 32 + l] = f32::from(byte >> 4).mul_add(d1, m1);
+        }
+    }
+    out
+}
+
+/// Exact CPU f32 dequantization of a single raw GGUF `block_q6_K` (210 bytes -> 256 f32).
+fn cpu_dequant_q6k_block(blk: &[u8]) -> [f32; 256] {
+    let d = half::f16::from_bits(u16::from_le_bytes([blk[208], blk[209]])).to_f32();
+    let mut out = [0.0f32; 256];
+    for ip in 0..2 {
+        let ql = &blk[ip * 64..ip * 64 + 64];
+        let qh = &blk[128 + ip * 32..128 + ip * 32 + 32];
+        let sc = &blk[192 + ip * 8..192 + ip * 8 + 8];
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = i32::from((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) - 32;
+            let q2 = i32::from((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) - 32;
+            let q3 = i32::from((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) - 32;
+            let q4 = i32::from((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) - 32;
+            let s0 = d * f32::from(sc[is] as i8);
+            let s1 = d * f32::from(sc[is + 2] as i8);
+            let s2 = d * f32::from(sc[is + 4] as i8);
+            let s3 = d * f32::from(sc[is + 6] as i8);
+            out[ip * 128 + l] = (q1 as f32) * s0;
+            out[ip * 128 + 32 + l] = (q2 as f32) * s1;
+            out[ip * 128 + 64 + l] = (q3 as f32) * s2;
+            out[ip * 128 + 96 + l] = (q4 as f32) * s3;
+        }
+    }
+    out
+}
+
+/// Regression test for FP16 early-narrowing NaNs in `gguf_prefill_indirect_gu`
+/// and `gguf_prefill_indirect_down`:
+/// - Q4_K finite cancellation (`d = dmin = 2048.0, sc = 63, m = 63, q = 1 -> 0.0`)
+///   must stay finite (`0.0`, never `+inf - inf = NaN`) in both `gu` and `down`.
+/// - Q6_K zero-code block with large scale (`d = 2048.0, sc = 64, q = 0 -> 0.0`)
+///   must stay finite (`0.0`, never `0 * +inf = NaN`) in `down`.
+#[test]
+fn gguf_prefill_indirect_no_fp16_early_narrowing_nan() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(20261123);
+
+    let d_2048 = half::f16::from_f32(2048.0).to_bits().to_le_bytes();
+    let mut q4k_cancel_blk = [0u8; 144];
+    q4k_cancel_blk[0..2].copy_from_slice(&d_2048);
+    q4k_cancel_blk[2..4].copy_from_slice(&d_2048);
+    // All 12 scale bytes = 0xFF => sc = 63 and m = 63 for every group g=0..8.
+    q4k_cancel_blk[4..16].fill(0xFF);
+    // Every nibble = 1 => 1 * (2048*63) - (2048*63) = 0.0 in f32.
+    q4k_cancel_blk[16..144].fill(0x11);
+    assert!(
+        cpu_dequant_q4k_block(&q4k_cancel_blk)
+            .iter()
+            .all(|&v| v == 0.0)
+    );
+
+    let mut q6k_zero_blk = [0u8; 210];
+    // ql = 0, qh = 0xAA (every 2-bit field = 0b10) => raw 6-bit code = 32 => signed q = 0.
+    q6k_zero_blk[0..128].fill(0x00);
+    q6k_zero_blk[128..192].fill(0xAA);
+    q6k_zero_blk[192..208].fill(64u8);
+    q6k_zero_blk[208..210].copy_from_slice(&d_2048);
+    assert!(
+        cpu_dequant_q6k_block(&q6k_zero_blk)
+            .iter()
+            .all(|&v| v == 0.0)
+    );
+
+    let (n_experts, m, h, n_tok) = (2usize, 64usize, 64usize, 16usize);
+    let pairs = n_tok * 2;
+    let mut sorted_slots = Vec::with_capacity(pairs);
+    let mut token_rows_v = Vec::with_capacity(pairs);
+    for e in 0..n_experts {
+        for j in 0..n_tok {
+            sorted_slots.push(e as u32);
+            token_rows_v.push(((e * 7 + j) % n_tok) as u32);
+        }
+    }
+    let tiles_v = build_prefill_tiles_bm(&sorted_slots, 64);
+    let tr_arr = MxArray::from_uint32(&token_rows_v, &[pairs as i64]).unwrap();
+    let tl_arr = MxArray::from_uint32(&tiles_v, &[(tiles_v.len() / 3) as i64, 3]).unwrap();
+
+    // 1. Q4_K finite cancellation (both pure-cancellation K=256 and mixed K=512).
+    for &k in &[256usize, 512usize] {
+        let nb_per_row = k / 256;
+        let build_q4k = |rng: &mut Rng, rows: usize| -> (Vec<u8>, Vec<f32>) {
+            let mut raw = vec![0u8; n_experts * rows * nb_per_row * 144];
+            let mut ref_w = vec![0.0f32; n_experts * rows * k];
+            let normal = gen_raw_q4k(rng, n_experts, rows, 256);
+            for er in 0..n_experts * rows {
+                for b in 0..nb_per_row {
+                    let dst =
+                        &mut raw[(er * nb_per_row + b) * 144..(er * nb_per_row + b + 1) * 144];
+                    if b == 0 {
+                        dst.copy_from_slice(&q4k_cancel_blk);
+                    } else {
+                        dst.copy_from_slice(&normal[er * 144..(er + 1) * 144]);
+                    }
+                    let dec = cpu_dequant_q4k_block(dst);
+                    ref_w[er * k + b * 256..er * k + (b + 1) * 256].copy_from_slice(&dec);
+                }
+            }
+            (raw, ref_w)
+        };
+
+        let (raw_g, ref_g) = build_q4k(&mut rng, m);
+        let (raw_u, ref_u) = build_q4k(&mut rng, m);
+        let g_buf = make_padded_u8_buf(&raw_g, 32, false);
+        let u_buf = make_padded_u8_buf(&raw_u, 64, false);
+        let x_vec: Vec<f32> = (0..n_tok * k).map(|_| rng.next_f32(-1.5, 1.5)).collect();
+        let x_arr = MxArray::from_float32(&x_vec, &[n_tok as i64, k as i64]).unwrap();
+
+        let Some(got_gu_arr) = gguf_prefill_indirect_gu(
+            &x_arr, &tr_arr, &tl_arr, &g_buf, 32, &u_buf, 64, n_experts, m, 7.0,
+        )
+        .unwrap() else {
+            if require_metal() && unsafe { mlx_sys::mlx_metal_is_available() } {
+                // NAX may still be unavailable on non-M5 Apple Silicon; skip only when NAX is absent.
+                return;
+            }
+            return;
+        };
+        let got_gu = eval_f32(&got_gu_arr);
+        assert!(
+            got_gu.iter().all(|v| v.is_finite()),
+            "Q4_K gu K={k}: produced non-finite value"
+        );
+
+        let mut want_gu = vec![0.0f32; pairs * m];
+        for tile in tiles_v.as_chunks::<3>().0 {
+            let (begin, end, slot) = (tile[0] as usize, tile[1] as usize, tile[2] as usize);
+            for p in begin..end {
+                let tok = token_rows_v[p] as usize;
+                let xr = &x_vec[tok * k..(tok + 1) * k];
+                for o in 0..m {
+                    let gw = &ref_g[(slot * m + o) * k..(slot * m + o + 1) * k];
+                    let uw = &ref_u[(slot * m + o) * k..(slot * m + o + 1) * k];
+                    let mut gv: f32 = xr.iter().zip(gw).map(|(a, b)| a * b).sum();
+                    let mut uv: f32 = xr.iter().zip(uw).map(|(a, b)| a * b).sum();
+                    gv = gv.min(7.0);
+                    uv = uv.clamp(-7.0, 7.0);
+                    want_gu[p * m + o] = (gv / (1.0 + (-gv).exp())) * uv;
+                }
+            }
+        }
+        let (max_abs, rel_l2) = error_stats(&got_gu, &want_gu);
+        if k == 256 {
+            assert_eq!(max_abs, 0.0, "Q4_K pure cancellation gu must be exact 0.0");
+        } else {
+            assert!(
+                rel_l2 <= 5e-3,
+                "Q4_K mixed cancellation gu K={k}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+            );
+        }
+
+        // Now test Q4_K down with the same finite cancellation pattern.
+        let (raw_d4, ref_d4) = build_q4k(&mut rng, h);
+        let d4_buf = make_padded_u8_buf(&raw_d4, 48, false);
+        let hid_vec: Vec<f32> = (0..pairs * k).map(|_| rng.next_f32(-1.5, 1.5)).collect();
+        let hid_arr = MxArray::from_float32(&hid_vec, &[pairs as i64, k as i64]).unwrap();
+        let got_d4_arr =
+            gguf_prefill_indirect_down(&hid_arr, &tl_arr, &d4_buf, 48, n_experts, h, 4)
+                .unwrap()
+                .expect("gguf_prefill_indirect_down Q4_K must run when gu ran");
+        let got_d4 = eval_f32(&got_d4_arr);
+        assert!(
+            got_d4.iter().all(|v| v.is_finite()),
+            "Q4_K down K={k}: produced non-finite value"
+        );
+        let mut want_d4 = vec![0.0f32; pairs * h];
+        for tile in tiles_v.as_chunks::<3>().0 {
+            let (begin, end, slot) = (tile[0] as usize, tile[1] as usize, tile[2] as usize);
+            for p in begin..end {
+                let hr = &hid_vec[p * k..(p + 1) * k];
+                for o in 0..h {
+                    let dw = &ref_d4[(slot * h + o) * k..(slot * h + o + 1) * k];
+                    want_d4[p * h + o] = hr.iter().zip(dw).map(|(a, b)| a * b).sum();
+                }
+            }
+        }
+        let (max_abs, rel_l2) = error_stats(&got_d4, &want_d4);
+        if k == 256 {
+            assert_eq!(
+                max_abs, 0.0,
+                "Q4_K pure cancellation down must be exact 0.0"
+            );
+        } else {
+            assert!(
+                rel_l2 <= 5e-3,
+                "Q4_K mixed cancellation down K={k}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+            );
+        }
+
+        // 2. Q6_K zero-code block with large scale (d=2048, sc=64, q=0 -> 0.0).
+        let mut raw_d6 = vec![0u8; n_experts * h * nb_per_row * 210];
+        let mut ref_d6 = vec![0.0f32; n_experts * h * k];
+        let normal_q6 = gen_raw_q6k(&mut rng, n_experts, h, 256);
+        for er in 0..n_experts * h {
+            for b in 0..nb_per_row {
+                let dst = &mut raw_d6[(er * nb_per_row + b) * 210..(er * nb_per_row + b + 1) * 210];
+                if b == 0 {
+                    dst.copy_from_slice(&q6k_zero_blk);
+                } else {
+                    dst.copy_from_slice(&normal_q6[er * 210..(er + 1) * 210]);
+                }
+                let dec = cpu_dequant_q6k_block(dst);
+                ref_d6[er * k + b * 256..er * k + (b + 1) * 256].copy_from_slice(&dec);
+            }
+        }
+        // Strictly 2-byte aligned offset (66 % 4 == 2) to also exercise alignment safety.
+        let d6_buf = make_padded_u8_buf(&raw_d6, 66, false);
+        let got_d6_arr =
+            gguf_prefill_indirect_down(&hid_arr, &tl_arr, &d6_buf, 66, n_experts, h, 6)
+                .unwrap()
+                .expect("gguf_prefill_indirect_down Q6_K must run when gu ran");
+        let got_d6 = eval_f32(&got_d6_arr);
+        assert!(
+            got_d6.iter().all(|v| v.is_finite()),
+            "Q6_K down K={k}: produced non-finite value"
+        );
+        let mut want_d6 = vec![0.0f32; pairs * h];
+        for tile in tiles_v.as_chunks::<3>().0 {
+            let (begin, end, slot) = (tile[0] as usize, tile[1] as usize, tile[2] as usize);
+            for p in begin..end {
+                let hr = &hid_vec[p * k..(p + 1) * k];
+                for o in 0..h {
+                    let dw = &ref_d6[(slot * h + o) * k..(slot * h + o + 1) * k];
+                    want_d6[p * h + o] = hr.iter().zip(dw).map(|(a, b)| a * b).sum();
+                }
+            }
+        }
+        let (max_abs, rel_l2) = error_stats(&got_d6, &want_d6);
+        if k == 256 {
+            assert_eq!(
+                max_abs, 0.0,
+                "Q6_K zero-code large-scale down must be exact 0.0"
+            );
+        } else {
+            assert!(
+                rel_l2 <= 5e-3,
+                "Q6_K mixed zero-code down K={k}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "GPU microbenchmark for Hy4 decode BW kernels (M=1,2,4)"]
 fn bench_decode_bw_kernels() {

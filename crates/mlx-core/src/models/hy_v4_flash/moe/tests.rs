@@ -2567,3 +2567,111 @@ fn affine4_routed_decode_matches_combine_gpu_and_is_row_invariant() {
         }
     }
 }
+
+/// Streamed split mode (`!bank.is_direct() && bank.split()`) with `SymQ8`
+/// `routed_up`/`shared_down` and fused `down_shared_gu: Some(...)` must produce
+/// bitwise identical outputs across `M=1` (skips `forward_split`, calls
+/// `finish_with_shared`) and `M=2, 4` (`forward_split`).
+#[test]
+fn streamed_split_symq8_down_shared_gu_is_bitwise_row_invariant() {
+    use super::super::weights::{fuse_qmm_rows, quantize_sym_q8_array};
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(808);
+    let m = moe_cfg(8, 2, 256, 256);
+    let c = ffn_cfg(64, m.clone(), 0.5);
+    let sff = m.latent; // matches `try_q8_dual_down_add` requirement: shared_gu width == 2 * latent.
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [8, 0], 1).unwrap());
+    assert!(!bank.is_direct());
+    bank.set_split(true);
+
+    let sym = |r: &mut Rng, rows: usize, cols: usize, scale: f32| {
+        let a =
+            MxArray::from_float32(&r.vec(rows * cols, scale), &[rows as i64, cols as i64]).unwrap();
+        quantize_sym_q8_array(&a).unwrap()
+    };
+    let sd = 1.0 / (c.dim as f32).sqrt();
+    let routed_down = sym(&mut rng, m.latent, c.dim, 1.5 * sd);
+    let shared_gate = sym(&mut rng, sff, c.dim, sd);
+    let shared_up = sym(&mut rng, sff, c.dim, sd);
+    let (fused, mut views) = fuse_qmm_rows(&[&routed_down, &shared_gate, &shared_up])
+        .unwrap()
+        .expect("SymQ8 projections must fuse");
+    let shared_up = views.pop().unwrap();
+    let shared_gate = views.pop().unwrap();
+    let routed_down = views.pop().unwrap();
+    let w = MoeWeights {
+        router: dense(rng.vec(m.n_experts * c.dim, 2.0 * sd), m.n_experts, c.dim),
+        router_bias: Some(vector(rng.vec(m.n_experts, 0.05))),
+        routed_down,
+        routed_up: sym(&mut rng, c.dim, m.latent, 1.0 / (m.latent as f32).sqrt()),
+        shared_gate,
+        shared_up,
+        shared_down: sym(&mut rng, c.dim, sff, 1.0 / (sff as f32).sqrt()),
+        down_shared_gu: Some(fused),
+    };
+    let norm = vector(rng.vec(c.dim, 0.3).into_iter().map(|v| 1.0 + v).collect());
+    let post = vector(rng.vec(c.dim, 0.3).into_iter().map(|v| 1.0 + v).collect());
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+
+    let h_rows = inputs(&mut rng, 4, c.dim);
+    let h_all = rows_arr(&h_rows);
+    let mut single_bits = Vec::with_capacity(4);
+    TEST_SPLIT_M1.with(|cell| cell.set(false));
+    for r in 0..4 {
+        let steps_before = bank.stats()[0].split_steps;
+        let hr = h_all
+            .slice(&[r as i64, 0], &[(r + 1) as i64, c.dim as i64])
+            .unwrap();
+        let (out1, _) = layer
+            .forward_chunked(&ffn, &norm, &post, &hr, FFN_CHUNK_ROWS, RowKind::Decode)
+            .unwrap();
+        assert_eq!(
+            bank.stats()[0].split_steps,
+            steps_before,
+            "M=1 must take finish_with_shared, not forward_split"
+        );
+        single_bits.push(bits(&out1));
+        bank.settle_all();
+    }
+
+    for &rows in &[2usize, 4] {
+        bank.test_forget_where(|_, _| true);
+        let steps_before = bank.stats()[0].split_steps;
+        let hm = h_all.slice(&[0, 0], &[rows as i64, c.dim as i64]).unwrap();
+        let (outm, _) = layer
+            .forward_chunked(&ffn, &norm, &post, &hm, FFN_CHUNK_ROWS, RowKind::Decode)
+            .unwrap();
+        assert_eq!(
+            bank.stats()[0].split_steps,
+            steps_before + 1,
+            "M={rows} must take forward_split"
+        );
+        let mb = bits(&outm);
+        bank.settle_all();
+        for r in 0..rows {
+            assert_eq!(
+                &mb[r * c.dim..(r + 1) * c.dim],
+                single_bits[r].as_slice(),
+                "Streamed split SymQ8 M={rows} row={r} must match M=1 bit-for-bit"
+            );
+        }
+    }
+    bank.end_turn().unwrap();
+}

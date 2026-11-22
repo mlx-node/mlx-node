@@ -1806,10 +1806,12 @@ fn lease_end_turn_idle_promotes_partial_to_direct_when_others_drop() {
     let dense = 10 * G;
     let kv_live = 2 * G;
     let ws = 96 * G;
+    let physical = 40 * G;
     let promo = DirectPromotion {
         mode: DirectMode::Auto,
         mmap: MmapMode::Off,
         metal_available: true,
+        physical,
         reserve_override: None,
         n_experts: m.n_experts,
     };
@@ -1819,7 +1821,6 @@ fn lease_end_turn_idle_promotes_partial_to_direct_when_others_drop() {
     let direct_bytes = promo.direct_expert_bytes(&classes);
     let kv_64k = direct_kv_allowance(&p, ctx);
     let scratch_2k = direct_scratch_bytes(&p, 2048, ctx);
-    let physical = 40 * G;
     let need_2k = dense + direct_bytes + kv_64k + scratch_2k;
     let size = ModelSize {
         dense,
@@ -1963,6 +1964,7 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
                     mode: DirectMode::Off,
                     mmap: MmapMode::Off,
                     metal_available: true,
+                    physical,
                     reserve_override: None,
                     n_experts: m.n_experts,
                 },
@@ -1981,6 +1983,7 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
             mode: DirectMode::Auto,
             mmap: MmapMode::Off,
             metal_available: true,
+            physical,
             reserve_override: None,
             n_experts: m.n_experts,
         };
@@ -2010,6 +2013,7 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
             mode: DirectMode::Auto,
             mmap: MmapMode::Off,
             metal_available: true,
+            physical,
             reserve_override: None,
             n_experts: m.n_experts,
         };
@@ -2828,40 +2832,69 @@ fn mmap_chunk_max_override_fallback_and_dense_savings_accounting() {
 
 #[test]
 fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
+    let above_floor = 128 * G;
+    let below_floor = 96 * G;
     assert!(!should_enable_direct_promotion(
         MmapMode::Auto,
         DirectMode::Auto,
         true,
+        above_floor,
         false
     ));
     assert!(!should_enable_direct_promotion(
         MmapMode::Auto,
         DirectMode::Auto,
         true,
+        above_floor,
         true
     ));
     assert!(!should_enable_direct_promotion(
         MmapMode::Off,
         DirectMode::Off,
         true,
+        above_floor,
         false
     ));
     assert!(should_enable_direct_promotion(
         MmapMode::Off,
         DirectMode::Auto,
         true,
+        above_floor,
         false
     ));
     assert!(should_enable_direct_promotion(
         MmapMode::Auto,
         DirectMode::On,
         true,
+        above_floor,
         false
     ));
     assert!(should_enable_direct_promotion(
         MmapMode::Auto,
         DirectMode::Auto,
         false,
+        above_floor,
+        false
+    ));
+    assert!(should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        below_floor,
+        false
+    ));
+    assert!(!should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        below_floor,
+        true
+    ));
+    assert!(!should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Off,
+        true,
+        below_floor,
         false
     ));
 
@@ -2880,7 +2913,8 @@ fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
     );
 
     // Even if a Lease is constructed with DirectPromotion, Auto mmap + Auto direct on Metal
-    // must NEVER silently promote a Streamed bank into anonymous Direct RAM.
+    // with physical >= MMAP_MIN_PHYSICAL must NEVER silently promote a Streamed bank into
+    // anonymous Direct RAM.
     {
         let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
         let size = ModelSize {
@@ -2895,6 +2929,7 @@ fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
                     mode: DirectMode::Auto,
                     mmap: MmapMode::Auto,
                     metal_available: true,
+                    physical,
                     reserve_override: None,
                     n_experts: m.n_experts,
                 },
@@ -2921,6 +2956,7 @@ fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
                     mode: DirectMode::On,
                     mmap: MmapMode::Auto,
                     metal_available: true,
+                    physical,
                     reserve_override: None,
                     n_experts: m.n_experts,
                 },
@@ -2932,6 +2968,106 @@ fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
         bank.wait_direct_fill().unwrap();
     }
 
+    TEST_HOST.with(|c| c.set(None));
+}
+
+#[test]
+fn below_mmap_floor_auto_metal_recovers_streamed_to_direct_on_idle() {
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let dense = 10 * G;
+    let physical = 96 * G;
+    assert!(physical < MMAP_MIN_PHYSICAL);
+    let ws = 72 * G;
+
+    let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+    let promo = DirectPromotion {
+        mode: DirectMode::Auto,
+        mmap: MmapMode::Auto,
+        metal_available: true,
+        physical,
+        reserve_override: None,
+        n_experts: m.n_experts,
+    };
+    let direct_bytes = promo.direct_expert_bytes(&classes);
+    let kv_64k = direct_kv_allowance(&p, ctx);
+    let scratch_2k = direct_scratch_bytes(&p, 2048, ctx);
+    let need_2k = dense + direct_bytes + kv_64k + scratch_2k;
+    let high_others = physical - need_2k - DIRECT_MARGIN + 2 * G;
+
+    // On a < MMAP_MIN_PHYSICAL Metal host in Auto/Auto, mmap is structurally ineligible;
+    // when transient other-process usage blocks Direct at load, load selects Streamed and
+    // keeps idle Direct promotion enabled.
+    let busy_host = HostMemory {
+        physical,
+        wired: high_others,
+        ..Default::default()
+    };
+    let selected = select_expert_mode(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &busy_host,
+        &Own::default(),
+        dense,
+        direct_bytes,
+        direct_bytes,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(selected, ExpertResidency::Streamed { .. }));
+    assert!(should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        physical,
+        false
+    ));
+
+    let size = ModelSize {
+        dense,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: m.n_experts as u64,
+        ctx: ctx as u64,
+    };
+    let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
+        .with_direct_promotion(promo, None);
+
+    // Turn 1: others stay high -> stays Streamed.
+    let r = bank.residency().unwrap();
+    TEST_HOST.with(|c| {
+        c.set(Some((
+            HostMemory {
+                physical,
+                wired: high_others + dense + r.resident,
+                ..Default::default()
+            },
+            ws,
+        )))
+    });
+    assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
+    assert!(!bank.is_direct());
+    assert!(lease.switches().is_empty());
+
+    // Turn 2: others drop -> idle promotion transitions Streamed -> Direct!
+    TEST_HOST.with(|c| {
+        c.set(Some((
+            HostMemory {
+                physical,
+                wired: 4 * G + dense + r.resident,
+                ..Default::default()
+            },
+            ws,
+        )))
+    });
+    assert!(lease.end_turn_idle(&bank, dense, 0).unwrap().is_some());
+    assert!(bank.is_direct());
+    assert_eq!(lease.switches().len(), 1);
+    bank.wait_direct_fill().unwrap();
     TEST_HOST.with(|c| c.set(None));
 }
 

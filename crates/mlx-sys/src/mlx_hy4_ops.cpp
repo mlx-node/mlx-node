@@ -274,6 +274,7 @@ enum Hy4KernelId : int {
   kKernelMoePrefillSortHist = 50,
   kKernelMoePrefillSortScanTiles = 51,
   kKernelMoePrefillSortScatter = 52,
+  kKernelAffine4DenseDecode = 53,
 };
 
 struct CachedPrimKey {
@@ -1403,6 +1404,28 @@ const mlx::core::fast::CustomKernelFunction &hy4_q8_decode_kernel() {
       "hy4_q8_dense_decode", {"x", "w", "scales", "biases"}, {"out"},
 #include "metal/hy4/q8_dense_decode.metal.inc"
   );
+  return kernel;
+}
+
+const std::string &hy4_affine4_dense_decode_header() {
+  static const std::string header =
+#include "metal/hy4/affine4_dense_decode.metal.inc"
+      ;
+  return header;
+}
+
+const mlx::core::fast::CustomKernelFunction &
+hy4_affine4_dense_decode_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_affine4_dense_decode", {"x", "w", "scales", "biases"}, {"out"},
+      R"METAL(
+      hy4_affine4_dense_decode_impl<M_TILE, ROWS_PER_SG, FAST_K>(
+          x, w, scales, biases, out,
+          x_shape[0], w_shape[0], x_shape[1],
+          threadgroup_position_in_grid.y, threadgroup_position_in_grid.z,
+          simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+      )METAL",
+      hy4_affine4_dense_decode_header(), /*ensure_row_contiguous=*/false);
   return kernel;
 }
 
@@ -3735,6 +3758,79 @@ mlx_array *mlx_hy4_q8_dense_decode(mlx_array *x, mlx_array *w,
     return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
   } catch (const std::exception &e) {
     std::cerr << "Hy4 q8_dense_decode: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)x;
+  (void)w;
+  (void)scales;
+  (void)biases;
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_affine4_dense_decode(mlx_array *x, mlx_array *w,
+                                        mlx_array *scales, mlx_array *biases) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return nullptr;
+    }
+    if (!x || !w || !scales || !biases) {
+      return nullptr;
+    }
+    const auto &xa = *reinterpret_cast<array *>(x);
+    const auto &wa = *reinterpret_cast<array *>(w);
+    const auto &sa = *reinterpret_cast<array *>(scales);
+    const auto &ba = *reinterpret_cast<array *>(biases);
+    if (xa.ndim() != 2 || wa.ndim() != 2 || sa.ndim() != 2 || ba.ndim() != 2) {
+      return nullptr;
+    }
+    if (xa.dtype() != mlx::core::float32 || wa.dtype() != mlx::core::uint32 ||
+        sa.dtype() != mlx::core::bfloat16 ||
+        ba.dtype() != mlx::core::bfloat16) {
+      return nullptr;
+    }
+    const int m = xa.shape(0);
+    const int k = xa.shape(1);
+    const int n = wa.shape(0);
+    if (m < 1 || m > 8 || k < 64 || k % 64 != 0 || n < 1 ||
+        wa.shape(1) != k / 8 || sa.shape() != Shape{n, k / 64} ||
+        ba.shape() != Shape{n, k / 64}) {
+      return nullptr;
+    }
+    array xc = ensure_contiguous_aligned(xa, 4);
+    array wc = ensure_contiguous_aligned(wa, 4);
+    array sc = ensure_contiguous_aligned(sa, 1);
+    array bc = ensure_contiguous_aligned(ba, 1);
+
+    const int m_tile = hy4_q8_short_m_tile(m);
+    const int rps = (m_tile == 1) ? 4 : 2;
+    const int rows_per_tg = 4 * rps;
+    const bool fast_k = (k % 512 == 0);
+    const int grid_y = 4 * ((n + rows_per_tg - 1) / rows_per_tg);
+    const int grid_z = (m + m_tile - 1) / m_tile;
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{32, grid_y, grid_z};
+    const std::tuple<int, int, int> tg{32, 4, 1};
+    const uint64_t tmpl_key = uint64_t(m_tile) | (uint64_t(rps) << 8) |
+                              (uint64_t(fast_k ? 1 : 0) << 16);
+    const std::vector<array> inputs{xc, wc, sc, bc};
+    const std::vector<Shape> out_shapes{{m, n}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+
+    auto out = dispatch_cached_kernel(
+        kKernelAffine4DenseDecode, stream, grid, tg, tmpl_key, inputs,
+        out_shapes, out_dtypes, [&] {
+          return hy4_affine4_dense_decode_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"M_TILE", m_tile}, {"ROWS_PER_SG", rps}, {"FAST_K", fast_k}},
+              std::nullopt, false, stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 affine4_dense_decode: " << e.what() << std::endl;
     return nullptr;
   }
 #else

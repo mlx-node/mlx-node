@@ -14,6 +14,7 @@
 //! `Dense::grouped_qmm_t(x, H)` splits back into heads.
 
 use std::ffi::CString;
+use std::mem::MaybeUninit;
 
 use napi::{Error, Result};
 
@@ -146,10 +147,10 @@ pub(crate) fn mmap_q8_0_gather_rows(
         for (i, &id) in ids.iter().enumerate() {
             let dst = &mut out[i * cols_u..(i + 1) * cols_u];
             if id < 0 || (id as usize) >= rows_u {
-                dst.fill(0.0);
+                dst.fill(MaybeUninit::new(0.0));
             } else {
                 let r = id as usize;
-                q8_0_into_f32(&raw[r * row_bytes..(r + 1) * row_bytes], dst)?;
+                q8_0_into_f32_slots(&raw[r * row_bytes..(r + 1) * row_bytes], dst)?;
             }
         }
         Ok(())
@@ -231,6 +232,16 @@ fn qmm_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> 
 }
 
 fn qmm4_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    if let Some(out) = super::ops::try_affine4_dense_decode(x, w, s, b)? {
+        return Ok(out);
+    }
+    if x.ndim()? == 2 && (2..=8).contains(&x.shape_at(0)?) {
+        return super::moe::per_row(x, |r| qmm4_t_mlx(r, w, s, b));
+    }
+    qmm4_t_mlx(x, w, s, b)
+}
+
+fn qmm4_t_mlx(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
     let dt = s.dtype()?;
     let xq = if x.dtype()? == dt {
         x.clone()
@@ -284,7 +295,7 @@ impl Weight for Dense {
                     .ok_or_else(|| bad("mmap bf16 bytes overflow"))?;
                 let raw = mmap_raw_slice(buf, *byte_offset, bytes)?;
                 alloc_filled(&[*rows, *cols], DType::Float32, n, |out| {
-                    bf16_into_f32(raw, out)
+                    bf16_into_f32_slots(raw, out)
                 })
             }
             Self::MmapQ8_0 {
@@ -308,7 +319,7 @@ impl Weight for Dense {
                     .ok_or_else(|| bad("mmap q8_0 bytes overflow"))?;
                 let raw = mmap_raw_slice(buf, *byte_offset, bytes)?;
                 alloc_filled(&[*rows, *cols], DType::Float32, n, |out| {
-                    q8_0_into_f32(raw, out)
+                    q8_0_into_f32_slots(raw, out)
                 })
             }
         }
@@ -699,45 +710,83 @@ fn check_lens(raw: usize, out: usize, width: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Little-endian u16 words.
-pub fn le_u16_into(raw: &[u8], out: &mut [u16]) -> Result<()> {
+trait WriteSlot<T> {
+    fn write_val(&mut self, v: T);
+}
+
+impl<T> WriteSlot<T> for T {
+    #[inline]
+    fn write_val(&mut self, v: T) {
+        *self = v;
+    }
+}
+
+impl<T> WriteSlot<T> for MaybeUninit<T> {
+    #[inline]
+    fn write_val(&mut self, v: T) {
+        self.write(v);
+    }
+}
+
+fn le_u16_into_slots<S: WriteSlot<u16>>(raw: &[u8], out: &mut [S]) -> Result<()> {
     check_lens(raw.len(), out.len(), 2, "u16 words")?;
     for (o, c) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
-        *o = u16::from_le_bytes(*c);
+        o.write_val(u16::from_le_bytes(*c));
+    }
+    Ok(())
+}
+
+/// Little-endian u16 words.
+pub fn le_u16_into(raw: &[u8], out: &mut [u16]) -> Result<()> {
+    le_u16_into_slots(raw, out)
+}
+
+fn le_f32_into_slots<S: WriteSlot<f32>>(raw: &[u8], out: &mut [S]) -> Result<()> {
+    check_lens(raw.len(), out.len(), 4, "f32 values")?;
+    for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+        o.write_val(f32::from_le_bytes(*c));
     }
     Ok(())
 }
 
 /// Little-endian f32 values.
 pub fn le_f32_into(raw: &[u8], out: &mut [f32]) -> Result<()> {
+    le_f32_into_slots(raw, out)
+}
+
+fn le_f32_into_f16_slots<S: WriteSlot<u16>>(raw: &[u8], out: &mut [S]) -> Result<()> {
     check_lens(raw.len(), out.len(), 4, "f32 values")?;
     for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
-        *o = f32::from_le_bytes(*c);
+        o.write_val(half::f16::from_f32(f32::from_le_bytes(*c)).to_bits());
     }
     Ok(())
 }
 
 /// Little-endian f32 values rounded to IEEE-754 f16 bits.
 pub fn le_f32_into_f16(raw: &[u8], out: &mut [u16]) -> Result<()> {
-    check_lens(raw.len(), out.len(), 4, "f32 values")?;
-    for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
-        *o = half::f16::from_f32(f32::from_le_bytes(*c)).to_bits();
+    le_f32_into_f16_slots(raw, out)
+}
+
+fn bf16_into_f32_slots<S: WriteSlot<f32>>(raw: &[u8], out: &mut [S]) -> Result<()> {
+    check_lens(raw.len(), out.len(), 2, "bf16 values")?;
+    for (o, c) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+        o.write_val(f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16));
     }
     Ok(())
 }
 
 /// Little-endian bf16 values widened to f32 (exact).
 pub fn bf16_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
-    check_lens(raw.len(), out.len(), 2, "bf16 values")?;
-    for (o, c) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
-        *o = f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16);
-    }
-    Ok(())
+    bf16_into_f32_slots(raw, out)
 }
 
 /// Quantizes `n_groups` contiguous groups of 32 f32 values into symmetric Q8_0
 /// (`u32` packed biased bytes `(q_i8 as u8) ^ 0x80` + IEEE-754 `f16` scales).
-fn sym_q8_quantize_f32_slice(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) {
+fn sym_q8_quantize_f32_slice(
+    src: &[f32],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+) {
     let groups = s_out.len();
     debug_assert_eq!(src.len(), groups * 32);
     debug_assert_eq!(w_out.len(), groups * 8);
@@ -767,7 +816,11 @@ fn sym_q8_quantize_f32_slice(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) 
     });
 }
 
-fn sym_q8_quantize_f32_range(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) {
+fn sym_q8_quantize_f32_range(
+    src: &[f32],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+) {
     for ((vals, w_grp), s_dst) in src
         .as_chunks::<32>()
         .0
@@ -784,9 +837,9 @@ fn sym_q8_quantize_f32_range(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) 
         }
         let sf16 = half::f16::from_f32(max_abs / 127.0);
         let scale = sf16.to_f32();
-        *s_dst = sf16.to_bits();
+        s_dst.write(sf16.to_bits());
         if scale == 0.0 {
-            w_grp.fill(0x8080_8080u32);
+            w_grp.fill(MaybeUninit::new(0x8080_8080u32));
             continue;
         }
         let inv = 1.0 / scale;
@@ -796,17 +849,21 @@ fn sym_q8_quantize_f32_range(src: &[f32], w_out: &mut [u32], s_out: &mut [u16]) 
                 let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
                 (qi as u8) ^ 0x80
             };
-            *dst = u32::from_le_bytes([
+            dst.write(u32::from_le_bytes([
                 q(vals[base]),
                 q(vals[base + 1]),
                 q(vals[base + 2]),
                 q(vals[base + 3]),
-            ]);
+            ]));
         }
     }
 }
 
-fn sym_q8_quantize_bf16_range(raw: &[u8], w_out: &mut [u32], s_out: &mut [u16]) {
+fn sym_q8_quantize_bf16_range(
+    raw: &[u8],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+) {
     for ((blk, w_grp), s_dst) in raw
         .as_chunks::<64>()
         .0
@@ -826,9 +883,9 @@ fn sym_q8_quantize_bf16_range(raw: &[u8], w_out: &mut [u32], s_out: &mut [u16]) 
         }
         let sf16 = half::f16::from_f32(max_abs / 127.0);
         let scale = sf16.to_f32();
-        *s_dst = sf16.to_bits();
+        s_dst.write(sf16.to_bits());
         if scale == 0.0 {
-            w_grp.fill(0x8080_8080u32);
+            w_grp.fill(MaybeUninit::new(0x8080_8080u32));
             continue;
         }
         let inv = 1.0 / scale;
@@ -838,12 +895,12 @@ fn sym_q8_quantize_bf16_range(raw: &[u8], w_out: &mut [u32], s_out: &mut [u16]) 
                 let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
                 (qi as u8) ^ 0x80
             };
-            *dst = u32::from_le_bytes([
+            dst.write(u32::from_le_bytes([
                 q(vals[base]),
                 q(vals[base + 1]),
                 q(vals[base + 2]),
                 q(vals[base + 3]),
-            ]);
+            ]));
         }
     }
 }
@@ -876,9 +933,12 @@ pub(crate) fn quantize_sym_q8_from_bf16_raw(raw: &[u8], rows: usize, k: usize) -
         return Err(bad("SymQ8 alloc_uninit size or alignment mismatch"));
     }
     // SAFETY: `alloc_uninit` returned freshly allocated writable buffers alive
-    // for the lifetime of `w_arr`/`s_arr` with verified length and alignment.
-    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
-    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    // for the lifetime of `w_arr`/`s_arr` with verified length and alignment;
+    // `MaybeUninit<T>` has no initialization invariant.
+    let w_slice =
+        unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<MaybeUninit<u32>>(), w_len) };
+    let s_slice =
+        unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1)
@@ -939,9 +999,12 @@ pub(crate) fn quantize_sym_q8_array(a: &MxArray) -> Result<Dense> {
     {
         return Err(bad("SymQ8 alloc_uninit size or alignment mismatch"));
     }
-    // SAFETY: freshly allocated writable buffers of verified size/alignment.
-    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
-    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    // SAFETY: freshly allocated writable buffers of verified size/alignment;
+    // `MaybeUninit<T>` has no initialization invariant.
+    let w_slice =
+        unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<MaybeUninit<u32>>(), w_len) };
+    let s_slice =
+        unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
     const CHUNK_ROWS: usize = 4096;
     let mut lo = 0usize;
     while lo < rows {
@@ -990,9 +1053,9 @@ fn f32_to_bf16_bits(v: f32) -> u16 {
 
 fn affine4_quantize_f32_range(
     src: &[f32],
-    w_out: &mut [u32],
-    s_out: &mut [u16],
-    b_out: &mut [u16],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+    b_out: &mut [MaybeUninit<u16>],
 ) {
     for (((vals, w_grp), s_dst), b_dst) in src
         .as_chunks::<64>()
@@ -1016,10 +1079,10 @@ fn affine4_quantize_f32_range(
         let bias = f32::from_bits(u32::from(bias_bits) << 16);
         let scale_bits = f32_to_bf16_bits((max_v - bias) / 15.0);
         let scale = f32::from_bits(u32::from(scale_bits) << 16);
-        *s_dst = scale_bits;
-        *b_dst = bias_bits;
+        s_dst.write(scale_bits);
+        b_dst.write(bias_bits);
         if scale == 0.0 || !scale.is_finite() {
-            w_grp.fill(0);
+            w_grp.fill(MaybeUninit::new(0));
             continue;
         }
         let inv = 1.0 / scale;
@@ -1030,16 +1093,16 @@ fn affine4_quantize_f32_range(
                 let q = ((vals[base + lane] - bias) * inv).round().clamp(0.0, 15.0) as u32;
                 word |= q << (lane * 4);
             }
-            *dst = word;
+            dst.write(word);
         }
     }
 }
 
 fn affine4_quantize_f32_slice(
     src: &[f32],
-    w_out: &mut [u32],
-    s_out: &mut [u16],
-    b_out: &mut [u16],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+    b_out: &mut [MaybeUninit<u16>],
 ) {
     let groups = s_out.len();
     debug_assert_eq!(src.len(), groups * 64);
@@ -1076,9 +1139,9 @@ fn affine4_quantize_f32_slice(
 
 fn affine4_quantize_bf16_range(
     raw: &[u8],
-    w_out: &mut [u32],
-    s_out: &mut [u16],
-    b_out: &mut [u16],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+    b_out: &mut [MaybeUninit<u16>],
 ) {
     for (((blk, w_grp), s_dst), b_dst) in raw
         .as_chunks::<128>()
@@ -1105,10 +1168,10 @@ fn affine4_quantize_bf16_range(
         let bias = f32::from_bits(u32::from(bias_bits) << 16);
         let scale_bits = f32_to_bf16_bits((max_v - bias) / 15.0);
         let scale = f32::from_bits(u32::from(scale_bits) << 16);
-        *s_dst = scale_bits;
-        *b_dst = bias_bits;
+        s_dst.write(scale_bits);
+        b_dst.write(bias_bits);
         if scale == 0.0 || !scale.is_finite() {
-            w_grp.fill(0);
+            w_grp.fill(MaybeUninit::new(0));
             continue;
         }
         let inv = 1.0 / scale;
@@ -1119,7 +1182,7 @@ fn affine4_quantize_bf16_range(
                 let q = ((vals[base + lane] - bias) * inv).round().clamp(0.0, 15.0) as u32;
                 word |= q << (lane * 4);
             }
-            *dst = word;
+            dst.write(word);
         }
     }
 }
@@ -1155,10 +1218,14 @@ pub(crate) fn quantize_affine4_from_bf16_raw(raw: &[u8], rows: usize, k: usize) 
         return Err(bad("Affine4 alloc_uninit size or alignment mismatch"));
     }
     // SAFETY: `alloc_uninit` returned freshly allocated writable buffers alive
-    // for the lifetime of `w_arr`/`s_arr`/`b_arr` with verified size/alignment.
-    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
-    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
-    let b_slice = unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<u16>(), groups) };
+    // for the lifetime of `w_arr`/`s_arr`/`b_arr` with verified size/alignment;
+    // `MaybeUninit<T>` has no initialization invariant.
+    let w_slice =
+        unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<MaybeUninit<u32>>(), w_len) };
+    let s_slice =
+        unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
+    let b_slice =
+        unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1)
@@ -1226,10 +1293,14 @@ pub(crate) fn quantize_affine4_array(a: &MxArray) -> Result<Dense> {
     {
         return Err(bad("Affine4 alloc_uninit size or alignment mismatch"));
     }
-    // SAFETY: freshly allocated writable buffers of verified size/alignment.
-    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
-    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
-    let b_slice = unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<u16>(), groups) };
+    // SAFETY: freshly allocated writable buffers of verified size/alignment;
+    // `MaybeUninit<T>` has no initialization invariant.
+    let w_slice =
+        unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<MaybeUninit<u32>>(), w_len) };
+    let s_slice =
+        unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
+    let b_slice =
+        unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
     const CHUNK_ROWS: usize = 4096;
     let mut lo = 0usize;
     while lo < rows {
@@ -1263,8 +1334,7 @@ pub(crate) fn quantize_affine4_array(a: &MxArray) -> Result<Dense> {
     })
 }
 
-/// Q8_0 blocks (f16 `d`, 32 × i8 `q`) as `d·q` in f32 (exact).
-pub fn q8_0_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
+fn q8_0_into_f32_slots<S: WriteSlot<f32>>(raw: &[u8], out: &mut [S]) -> Result<()> {
     let blocks = raw.len() / Q8_0_BYTES;
     if !raw.len().is_multiple_of(Q8_0_BYTES) || blocks.checked_mul(Q8_0_VALUES) != Some(out.len()) {
         return Err(bad(format!(
@@ -1281,10 +1351,15 @@ pub fn q8_0_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
     {
         let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
         for (v, &q) in o.iter_mut().zip(&b[2..]) {
-            *v = d * f32::from(i8::from_le_bytes([q]));
+            v.write_val(d * f32::from(i8::from_le_bytes([q])));
         }
     }
     Ok(())
+}
+
+/// Q8_0 blocks (f16 `d`, 32 × i8 `q`) as `d·q` in f32 (exact).
+pub fn q8_0_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
+    q8_0_into_f32_slots(raw, out)
 }
 
 /// A fresh `shape` / `dtype` array of `n` values of `T`, written by `fill`.
@@ -1293,7 +1368,7 @@ fn alloc_filled<T>(
     shape: &[i64],
     dtype: DType,
     n: usize,
-    fill: impl FnOnce(&mut [T]) -> Result<()>,
+    fill: impl FnOnce(&mut [MaybeUninit<T>]) -> Result<()>,
 ) -> Result<MxArray> {
     let (a, ptr, bytes) = MxArray::alloc_uninit(shape, dtype)?;
     if n.checked_mul(size_of::<T>()) != Some(bytes) || ptr.0.align_offset(align_of::<T>()) != 0 {
@@ -1302,9 +1377,9 @@ fn alloc_filled<T>(
         )));
     }
     // SAFETY: `alloc_uninit` returned `bytes` writable bytes at `ptr`, alive
-    // while `a` is; size and alignment are checked above, and no other user
-    // of the buffer exists before `a` is returned.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr.0.cast::<T>(), n) };
+    // while `a` is; size and alignment are checked above, `MaybeUninit<T>` has
+    // no initialization invariant, and no other user exists before `a` is returned.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr.0.cast::<MaybeUninit<T>>(), n) };
     fill(out)?;
     Ok(a)
 }
@@ -1315,10 +1390,10 @@ fn elements(info: &GgufTensorInfo) -> Result<usize> {
 }
 
 fn f32_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray> {
-    let decode: fn(&[u8], &mut [f32]) -> Result<()> = match info.tensor_type {
-        GgufTensorType::F32 => le_f32_into,
-        GgufTensorType::BF16 => bf16_into_f32,
-        GgufTensorType::Q8_0 => q8_0_into_f32,
+    let decode: fn(&[u8], &mut [MaybeUninit<f32>]) -> Result<()> = match info.tensor_type {
+        GgufTensorType::F32 => le_f32_into_slots,
+        GgufTensorType::BF16 => bf16_into_f32_slots,
+        GgufTensorType::Q8_0 => q8_0_into_f32_slots,
         t => {
             return Err(bad(format!(
                 "'{}': no f32 decode for type {}",
@@ -1341,7 +1416,7 @@ fn f16_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray
         )));
     }
     alloc_filled(shape, DType::Float16, elements(info)?, |out| {
-        le_f32_into_f16(raw, out)
+        le_f32_into_f16_slots(raw, out)
     })
 }
 
@@ -1354,7 +1429,7 @@ fn bf16_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArra
         )));
     }
     alloc_filled(shape, DType::BFloat16, elements(info)?, |out| {
-        le_u16_into(raw, out)
+        le_u16_into_slots(raw, out)
     })
 }
 
@@ -1514,7 +1589,9 @@ impl<'a> Reader<'a> {
         let dim = |x: u64| i64::try_from(x).map_err(|_| bad("expert dim exceeds i64"));
         let shape = [dim((hi - lo) as u64)?, dim(rows)?, dim(k)?];
         let n_vals = usize::try_from(e.len / 2).map_err(|_| bad("expert span exceeds usize"))?;
-        let a = alloc_filled(&shape, DType::BFloat16, n_vals, |out| le_u16_into(raw, out))?;
+        let a = alloc_filled(&shape, DType::BFloat16, n_vals, |out| {
+            le_u16_into_slots(raw, out)
+        })?;
         self.read += e.len;
         Ok(a)
     }

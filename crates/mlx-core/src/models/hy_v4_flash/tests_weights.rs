@@ -1350,3 +1350,113 @@ fn mmap_q8_0_embed_rows_matches_dense_q8_bit_exact() {
     let probe = MxArray::from_float32(&vec![0.0; dim], &[1, dim as i64]).unwrap();
     assert!(emb.as_linear(&probe).is_err());
 }
+
+#[test]
+fn dense_qmm4_strict_bitwise_row_invariant_and_counterexample() {
+    use super::ops::head_logits;
+    use super::weights::{quantize_affine4_array, quantize_affine4_from_bf16_raw};
+
+    crate::models::hy_v4_flash::exact_f32();
+
+    // 1. Exact Codex counterexample through Dense::Qmm4::mm_t and head_logits:
+    // scale=1, bias=2^-24, codes=[1, 2, 0..], inputs=[2, -1, 0..].
+    {
+        let mut w_words = vec![0u32; 8];
+        w_words[0] = 1u32 | (2u32 << 4);
+        let q4 = Dense::Qmm4 {
+            w: MxArray::from_uint32(&w_words, &[1, 8]).unwrap(),
+            scales: MxArray::from_float32(&[1.0f32], &[1, 1])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap(),
+            biases: MxArray::from_float32(&[2.0f32.powi(-24)], &[1, 1])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        };
+        let mut x_rows = vec![0.0f32; 4 * 64];
+        x_rows[0] = 2.0;
+        x_rows[1] = -1.0;
+        for r in 1..4 {
+            x_rows[r * 64] = (r as f32) + 0.5;
+            x_rows[r * 64 + 1] = -(r as f32) * 0.25;
+        }
+        let x_all = MxArray::from_float32(&x_rows, &[4, 64]).unwrap();
+
+        let mut single_mm = Vec::with_capacity(4);
+        let mut single_hl = Vec::with_capacity(4);
+        for r in 0..4 {
+            let xr = x_all.slice(&[r as i64, 0], &[(r + 1) as i64, 64]).unwrap();
+            single_mm.push(bits(&read(&q4.mm_t(&xr).unwrap())));
+            single_hl.push(bits(&read(&head_logits(&xr, &q4).unwrap())));
+        }
+        for &m in &[2usize, 4] {
+            let xm = x_all.slice(&[0, 0], &[m as i64, 64]).unwrap();
+            let got_mm = bits(&read(&q4.mm_t(&xm).unwrap()));
+            let got_hl = bits(&read(&head_logits(&xm, &q4).unwrap()));
+            for r in 0..m {
+                assert_eq!(
+                    &got_mm[r..r + 1],
+                    single_mm[r].as_slice(),
+                    "Dense::Qmm4 mm_t counterexample M={m} row={r}"
+                );
+                assert_eq!(
+                    &got_hl[r..r + 1],
+                    single_hl[r].as_slice(),
+                    "Dense::Qmm4 head_logits counterexample M={m} row={r}"
+                );
+            }
+        }
+    }
+
+    // 2. Both raw-BF16 and array Affine4 quantizers across non-FAST_K (K=64, 192) and FAST_K (K=512).
+    for (ci, &(rows, k)) in [(35usize, 64usize), (47, 192), (51, 512)]
+        .iter()
+        .enumerate()
+    {
+        let bf16_u16: Vec<u16> = lcg(3100 + ci as u64, rows * k)
+            .into_iter()
+            .map(|v| ((v * 0.5).to_bits() >> 16) as u16)
+            .collect();
+        let bf16_raw: Vec<u8> = bf16_u16.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let bf16_f32: Vec<f32> = bf16_u16
+            .iter()
+            .map(|&w| f32::from_bits(u32::from(w) << 16))
+            .collect();
+        let bf16_arr = MxArray::from_float32(&bf16_f32, &[rows as i64, k as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let q4_raw = quantize_affine4_from_bf16_raw(&bf16_raw, rows, k).unwrap();
+        let q4_arr = quantize_affine4_array(&bf16_arr).unwrap();
+        assert_eq!(
+            bits(&read(&q4_raw.f32().unwrap())),
+            bits(&read(&q4_arr.f32().unwrap())),
+            "raw vs array Affine4 dequant rows={rows} k={k}"
+        );
+
+        let x_all = MxArray::from_float32(&lcg(3200 + ci as u64, 4 * k), &[4, k as i64]).unwrap();
+        let mut single_bits = Vec::with_capacity(4);
+        for r in 0..4 {
+            let xr = x_all
+                .slice(&[r as i64, 0], &[(r + 1) as i64, k as i64])
+                .unwrap();
+            let b_raw = bits(&read(&q4_raw.mm_t(&xr).unwrap()));
+            let b_arr = bits(&read(&q4_arr.mm_t(&xr).unwrap()));
+            assert_eq!(b_raw, b_arr, "raw vs array Qmm4 M=1 rows={rows} k={k}");
+            single_bits.push(b_raw);
+        }
+        for &m in &[2usize, 4] {
+            let xm = x_all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+            let gm = bits(&read(&q4_raw.mm_t(&xm).unwrap()));
+            for r in 0..m {
+                assert_eq!(
+                    &gm[r * rows..(r + 1) * rows],
+                    single_bits[r].as_slice(),
+                    "Dense::Qmm4 rows={rows} k={k} M={m} row={r}"
+                );
+            }
+        }
+    }
+}

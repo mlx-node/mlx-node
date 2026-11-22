@@ -3879,6 +3879,13 @@ unsafe extern "C" {
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_affine4_dense_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_q8_grouped_decode(
         x: *mut mlx_array,
         w: *mut mlx_array,

@@ -2856,3 +2856,162 @@ fn hc_bridge_prefill_reg_and_row2_match_unfused_and_row1() {
         );
     }
 }
+
+#[test]
+fn affine4_dense_decode_row_invariant_and_codex_counterexample() {
+    use super::super::weights::quantize_affine4_array;
+
+    // SAFETY: pure process-wide Metal availability probe.
+    let has_metal = unsafe { mlx_sys::mlx_metal_is_available() };
+    if !has_metal {
+        assert_ne!(
+            std::env::var("MLX_TEST_REQUIRE_METAL").as_deref(),
+            Ok("1"),
+            "MLX_TEST_REQUIRE_METAL=1 requires Metal"
+        );
+        return;
+    }
+    crate::models::hy_v4_flash::exact_f32();
+    let to_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|&x| x.to_bits()).collect() };
+
+    // 1. Exact Codex counterexample: scale=1, bias=2^-24, codes=[1, 2, 0..], inputs=[2, -1, 0..].
+    // Under MLX quantized_matmul, B=1 (qmv) yields 2^-24 while B>=2 (qmv_wide) yields 0.0.
+    // Our hy4_affine4_dense_decode kernel must be strictly bitwise identical across M=1..8.
+    {
+        let mut w_words = vec![0u32; 8];
+        w_words[0] = 1u32 | (2u32 << 4);
+        let w = MxArray::from_uint32(&w_words, &[1, 8]).unwrap();
+        let s = MxArray::from_float32(&[1.0f32], &[1, 1])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let b_val = 2.0f32.powi(-24);
+        let b = MxArray::from_float32(&[b_val], &[1, 1])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let mut x_rows = vec![0.0f32; 8 * 64];
+        x_rows[0] = 2.0;
+        x_rows[1] = -1.0;
+        for r in 1..8 {
+            let base = r * 64;
+            x_rows[base] = (r as f32) * 0.75 + 1.0;
+            x_rows[base + 1] = -(r as f32) * 0.5;
+            x_rows[base + 5] = 0.25 * (r as f32);
+        }
+        let x_all = MxArray::from_float32(&x_rows, &[8, 64]).unwrap();
+
+        let mut row1_bits = Vec::with_capacity(8);
+        for r in 0..8 {
+            let xr = x_all.slice(&[r as i64, 0], &[(r + 1) as i64, 64]).unwrap();
+            let y1 = try_affine4_dense_decode(&xr, &w, &s, &b)
+                .unwrap()
+                .expect("affine4_dense_decode must run on Metal");
+            row1_bits.push(to_bits(&read(&y1)));
+        }
+        assert_eq!(row1_bits[0], vec![b_val.to_bits()]);
+
+        for &m in &[2usize, 3, 4, 5, 8] {
+            let xm = x_all.slice(&[0, 0], &[m as i64, 64]).unwrap();
+            let ym = try_affine4_dense_decode(&xm, &w, &s, &b)
+                .unwrap()
+                .expect("affine4_dense_decode batch must run on Metal");
+            let yb = to_bits(&read(&ym));
+            for r in 0..m {
+                assert_eq!(
+                    &yb[r..r + 1],
+                    row1_bits[r].as_slice(),
+                    "counterexample M={m} row={r}"
+                );
+            }
+        }
+    }
+
+    // 2. General shapes: non-FAST_K (K=64, 192, 576) and FAST_K (K=512, 1024) with odd N.
+    for (ci, &(n, k)) in [
+        (37usize, 64usize),
+        (53, 192),
+        (67, 512),
+        (29, 576),
+        (41, 1024),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let w_f32 = MxArray::from_float32(
+            &det_f32(9600 + ci as u64, n * k, 0.25),
+            &[n as i64, k as i64],
+        )
+        .unwrap();
+        let q4 = quantize_affine4_array(&w_f32).unwrap();
+        let Dense::Qmm4 {
+            ref w,
+            ref scales,
+            ref biases,
+        } = q4
+        else {
+            panic!("expected Dense::Qmm4");
+        };
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let sf32 = scales.astype(DType::Float32).unwrap();
+        let bf32 = biases.astype(DType::Float32).unwrap();
+        // Dequantize in f32 (not BF16) to match exact f32 kernel arithmetic.
+        // SAFETY: live array handles; returns a new f32 array.
+        let deq_h = unsafe {
+            mlx_sys::mlx_dequantize(
+                w.as_raw_ptr(),
+                sf32.as_raw_ptr(),
+                bf32.as_raw_ptr(),
+                64,
+                4,
+                DType::Float32 as i32,
+                mode.as_ptr(),
+            )
+        };
+        let deq = MxArray::from_handle(deq_h, "test affine4 f32 dequant").unwrap();
+        let x_all =
+            MxArray::from_float32(&det_f32(9700 + ci as u64, 8 * k, 1.0), &[8, k as i64]).unwrap();
+        let want_all = read(
+            &x_all
+                .matmul(&deq.transpose(Some(&[1, 0])).unwrap())
+                .unwrap(),
+        );
+
+        let mut single_bits = Vec::with_capacity(8);
+        for r in 0..8 {
+            let xr = x_all
+                .slice(&[r as i64, 0], &[(r + 1) as i64, k as i64])
+                .unwrap();
+            let y1 = try_affine4_dense_decode(&xr, w, scales, biases)
+                .unwrap()
+                .expect("affine4_dense_decode must run on Metal");
+            let y1v = read(&y1);
+            let max_diff = y1v
+                .iter()
+                .zip(&want_all[r * n..(r + 1) * n])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1e-4,
+                "N={n} K={k} row={r}: affine4_dense_decode vs f32 dequant max_diff={max_diff:e}"
+            );
+            single_bits.push(to_bits(&y1v));
+        }
+
+        for &m in &[2usize, 3, 4, 5, 8] {
+            let xm = x_all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+            let ym = try_affine4_dense_decode(&xm, w, scales, biases)
+                .unwrap()
+                .expect("affine4_dense_decode batch must run on Metal");
+            let yb = to_bits(&read(&ym));
+            for r in 0..m {
+                assert_eq!(
+                    &yb[r * n..(r + 1) * n],
+                    single_bits[r].as_slice(),
+                    "N={n} K={k} M={m} row={r}: not bit-exact with M=1"
+                );
+            }
+        }
+    }
+}

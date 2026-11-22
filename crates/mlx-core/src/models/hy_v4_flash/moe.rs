@@ -875,7 +875,9 @@ impl Moe {
         r: &MxArray,
         shared_gu: Option<MxArray>,
     ) -> Result<MxArray> {
-        if let Some(ref sgu) = shared_gu {
+        let skip_dual_down =
+            matches!(&self.experts, ExpertSource::Bank(b) if !b.is_direct() && b.split());
+        if !skip_dual_down && let Some(ref sgu) = shared_gu {
             let tp = prof_start();
             if let Some(f) = try_q8_dual_down_add(r, sgu, &w.routed_up, &w.shared_down, 0.0)? {
                 prof_end(Phase::Shared, tp, &[&f])?;

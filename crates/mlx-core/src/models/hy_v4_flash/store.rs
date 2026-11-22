@@ -1116,19 +1116,23 @@ pub fn select_expert_mode_for(
 }
 
 /// Whether idle-gap promotion from `Streamed` to anonymous `Direct` is enabled.
-/// Suppressed when `MmapMode::Auto` is active on Metal with `DirectMode::Auto`
-/// so a transient load-time fallback never silently copies full experts into
-/// anonymous RAM.
+/// Suppressed when `MmapMode::Auto` is structurally eligible on Metal
+/// (`physical >= MMAP_MIN_PHYSICAL`) with `DirectMode::Auto` so a transient
+/// load-time fallback never silently copies full experts into anonymous RAM.
 pub fn should_enable_direct_promotion(
     mmap: MmapMode,
     direct: DirectMode,
     metal_available: bool,
+    physical: u64,
     is_mmap: bool,
 ) -> bool {
     if is_mmap || direct == DirectMode::Off {
         return false;
     }
-    !(mmap == MmapMode::Auto && direct == DirectMode::Auto && metal_available)
+    !(mmap == MmapMode::Auto
+        && direct == DirectMode::Auto
+        && metal_available
+        && physical >= MMAP_MIN_PHYSICAL)
 }
 
 /// Evaluates [`select_expert_mode_for`] at load, retrying once after
@@ -1539,6 +1543,7 @@ pub struct DirectPromotion {
     pub mode: DirectMode,
     pub mmap: MmapMode,
     pub metal_available: bool,
+    pub physical: u64,
     pub reserve_override: Option<u64>,
     pub n_experts: usize,
 }
@@ -1846,10 +1851,9 @@ impl Lease {
             bank.end_turn()?;
             return Ok(None);
         }
-        let Some(promo) = self
-            .direct_promotion
-            .filter(|p| should_enable_direct_promotion(p.mmap, p.mode, p.metal_available, false))
-        else {
+        let Some(promo) = self.direct_promotion.filter(|p| {
+            should_enable_direct_promotion(p.mmap, p.mode, p.metal_available, p.physical, false)
+        }) else {
             bank.end_turn()?;
             return Ok(None);
         };
@@ -1889,7 +1893,15 @@ impl Lease {
                 limits.cache_cap,
             );
             let growth = direct_expert_bytes.saturating_sub(current_bank_bytes);
-            let headroom_ok = gate.admitted
+            let policy_ok = should_enable_direct_promotion(
+                promo.mmap,
+                promo.mode,
+                promo.metal_available,
+                h.physical,
+                false,
+            );
+            let headroom_ok = policy_ok
+                && gate.admitted
                 && h.non_reclaimable()
                     .saturating_add(growth)
                     .saturating_add(gate.margin)
@@ -2456,23 +2468,30 @@ impl Store {
                 return Err(e);
             }
         };
+        let load_physical = admission.map_or(0, |a| a.physical);
         let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank)
             .with_max_memory(opts.max_memory);
-        let lease =
-            if should_enable_direct_promotion(opts.mmap, opts.direct, metal_available, is_mmap) {
-                lease.with_direct_promotion(
-                    DirectPromotion {
-                        mode: opts.direct,
-                        mmap: opts.mmap,
-                        metal_available,
-                        reserve_override,
-                        n_experts: sizes.n_experts,
-                    },
-                    direct_budget,
-                )
-            } else {
-                lease.with_direct_budget(direct_budget)
-            };
+        let lease = if should_enable_direct_promotion(
+            opts.mmap,
+            opts.direct,
+            metal_available,
+            load_physical,
+            is_mmap,
+        ) {
+            lease.with_direct_promotion(
+                DirectPromotion {
+                    mode: opts.direct,
+                    mmap: opts.mmap,
+                    metal_available,
+                    physical: load_physical,
+                    reserve_override,
+                    n_experts: sizes.n_experts,
+                },
+                direct_budget,
+            )
+        } else {
+            lease.with_direct_budget(direct_budget)
+        };
         Ok(Self {
             model,
             bank,

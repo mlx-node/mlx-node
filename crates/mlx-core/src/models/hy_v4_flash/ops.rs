@@ -1216,6 +1216,47 @@ pub fn route_pair(
     ))
 }
 
+/// Single-dispatch row-invariant affine-4 g64 (bf16 scales/biases) dense matmul
+/// for `1..=8` rows (`K % 64 == 0`). Returns `Ok(None)` when Metal or shape is
+/// unsupported.
+pub(crate) fn try_affine4_dense_decode(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+) -> Result<Option<MxArray>> {
+    if x.ndim()? != 2 || w.ndim()? != 2 || scales.ndim()? != 2 || biases.ndim()? != 2 {
+        return Ok(None);
+    }
+    let m = x.shape_at(0)?;
+    let k = x.shape_at(1)?;
+    if !(1..=8).contains(&m)
+        || k < 64
+        || k % 64 != 0
+        || scales.dtype()? != DType::BFloat16
+        || biases.dtype()? != DType::BFloat16
+    {
+        return Ok(None);
+    }
+    let xf = as_f32(x)?;
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe {
+        mlx_sys::mlx_hy4_affine4_dense_decode(
+            xf.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+        )
+    };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash affine4_dense_decode",
+    )?))
+}
+
 /// Single-dispatch BF16-weight / F32-accumulation LM head for 1..=16 rows,
 /// supporting both resident `Dense::Array(bf16)` and zero-copy `Dense::MmapBf16`.
 pub(crate) fn try_bf16_lm_head(xf: &MxArray, head: &Dense) -> Result<Option<MxArray>> {
