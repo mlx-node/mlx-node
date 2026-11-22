@@ -1612,6 +1612,42 @@ pub fn gguf_prefill_indirect_down(
     )?))
 }
 
+/// Routed expert prefill down projection on repacked `ProjArrays` (`Q4_K` or
+/// `Q6_K`) via Metal 3 `simdgroup_half8x8` MMA reading `tile_m = 32` tiles.
+/// Returns `[R, H]` F32, or `Ok(None)` when Metal/shapes are unsupported or
+/// disabled (`MLX_HY4_PREFILL_NAX=0`).
+pub(crate) fn kq_prefill_indirect_down(
+    hidden: &MxArray,
+    tiles: &MxArray,
+    wd: &MxArray,
+    sd: &MxArray,
+    bd: &MxArray,
+    down_bits: i32,
+) -> Result<Option<MxArray>> {
+    let hf = match hidden.dtype()? {
+        DType::Float16 | DType::Float32 => hidden.clone(),
+        _ => hidden.astype(DType::Float32)?,
+    };
+    // SAFETY: all handles are live arrays owned by this call.
+    let handle = unsafe {
+        mlx_sys::mlx_hy4_kq_prefill_indirect_down(
+            hf.as_raw_ptr(),
+            tiles.as_raw_ptr(),
+            wd.as_raw_ptr(),
+            sd.as_raw_ptr(),
+            bd.as_raw_ptr(),
+            down_bits,
+        )
+    };
+    if handle.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        handle,
+        "hy_v4_flash kq_prefill_indirect_down",
+    )?))
+}
+
 /// GPU histogram, prefix sum, `tile_m` (32 or 64) tile emission, and scatter
 /// for MoE prefill routing (`ids [rows, k]` u32 -> `(token_rows [R],
 /// tiles [max_tiles, 3], inverse [rows, k], sorted_slots [R])` u32) with zero

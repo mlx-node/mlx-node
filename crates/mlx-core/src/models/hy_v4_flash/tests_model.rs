@@ -798,9 +798,9 @@ fn split_calls_match_one_call() {
             assert_eq!(routes, want_routes, "{what}: routes");
         }
     };
-    let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+    let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
         && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-    let f32_tol = if prefill_nax { 5e-3 } else { 1e-4 };
+    let f32_tol = if prefill_mma { 5e-3 } else { 1e-4 };
     with_row_dtype(DType::Float32, || check("f32", f32_tol, f32_tol));
     let f16_step = 2f32.powi(-10);
     let f16_abs = (2.0 * f16_step).max(f32_tol);
@@ -863,9 +863,9 @@ fn last_row_and_hidden_rows() {
     assert!(logits.is_none() && hidden.is_none());
     assert_eq!(c.len(), 20);
     let tail = decode(&f.model, &mut c, &ids[20..]);
-    let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+    let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
         && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-    let tol = if prefill_nax { 5e-3 } else { 1e-4 };
+    let tol = if prefill_mma { 5e-3 } else { 1e-4 };
     assert_within(
         &tail,
         &all[20..],

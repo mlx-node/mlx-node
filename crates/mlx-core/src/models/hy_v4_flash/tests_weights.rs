@@ -942,9 +942,9 @@ fn q8_dense_and_grouped_prefill_strided_and_epilogue_parity() {
             );
         } else {
             assert!(
-                !unsafe { mlx_sys::mlx_metal_is_nax_available() }
+                !unsafe { mlx_sys::mlx_metal_is_available() }
                     && std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1"),
-                "expected q8_dense_prefill_epilogue when NAX is available"
+                "expected q8_dense_prefill_epilogue when Metal is available"
             );
         }
     }
@@ -1016,9 +1016,9 @@ fn q8_dense_and_grouped_prefill_strided_and_epilogue_parity() {
             );
         } else {
             assert!(
-                !unsafe { mlx_sys::mlx_metal_is_nax_available() }
+                !unsafe { mlx_sys::mlx_metal_is_available() }
                     && std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1"),
-                "expected q8_grouped_prefill_gated when NAX is available"
+                "expected q8_grouped_prefill_gated when Metal is available"
             );
         }
     }
@@ -1111,9 +1111,9 @@ fn q8_prefill_f16_io_and_epilogue_parity() {
                     );
                 } else {
                     assert!(
-                        !unsafe { mlx_sys::mlx_metal_is_nax_available() }
+                        !unsafe { mlx_sys::mlx_metal_is_available() }
                             && std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1"),
-                        "expected FP16 epilogue when NAX is available"
+                        "expected FP16 epilogue when Metal is available"
                     );
                 }
             }

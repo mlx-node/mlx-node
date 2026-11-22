@@ -185,7 +185,7 @@ pub(crate) fn attn_prefill_f16_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("MLX_HY4_ATTN_PREFILL_F16").as_deref() != Ok("0")
-            && unsafe { mlx_sys::mlx_metal_is_nax_available() }
+            && unsafe { mlx_sys::mlx_metal_is_available() }
     })
 }
 

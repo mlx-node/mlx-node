@@ -860,9 +860,9 @@ fn bank_moe_matches_dequantized_experts() {
                 RowKind::Prefill,
             )
             .unwrap();
-        let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+        let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
             && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-        let prefill_rel = if prefill_nax { 5e-3 } else { 1e-4 };
+        let prefill_rel = if prefill_mma { 5e-3 } else { 1e-4 };
         let what = format!("bank layer {il}");
         check_moe(
             &c,
@@ -1029,9 +1029,9 @@ fn decode_wave_takes_victims_at_any_row_count() {
         .chunks_exact(c.dim)
         .map(|r| r.iter().map(|&v| f64::from(v)).collect())
         .collect();
-    let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+    let prefill_mma = unsafe { mlx_sys::mlx_metal_is_available() }
         && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
-    let dec_vs_pre_rel = if prefill_nax { 5e-3 } else { 1e-5 };
+    let dec_vs_pre_rel = if prefill_mma { 5e-3 } else { 1e-5 };
     assert_rows(&read(&dec), &want, dec_vs_pre_rel, "decode wave vs prefill");
 }
 
@@ -1122,15 +1122,20 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
         // SAFETY: test-only counters of this thread.
         unsafe { mlx_sys::mlx_test_kquant_counting(true) };
         let full = run(&all, RowKind::Prefill);
-        let nax_avail = unsafe { mlx_sys::mlx_metal_is_nax_available() }
-            && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+        let prefill_enabled = std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+        let metal_avail = unsafe { mlx_sys::mlx_metal_is_available() };
+        let nax_avail = unsafe { mlx_sys::mlx_metal_is_nax_available() } && prefill_enabled;
+        let force_m3 = std::env::var("MLX_HY4_FORCE_METAL3").as_deref() == Ok("1");
+        let m3_down = metal_avail && prefill_enabled && (!nax_avail || force_m3);
         let rhs_nt =
             unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nt".as_ptr()) };
         let rhs_nax =
             unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nax_nt".as_ptr()) };
         unsafe { mlx_sys::mlx_test_kquant_counting(false) };
         let rhs = if nax_avail { rhs_nax } else { rhs_nt };
-        let expected_rhs = if nax_avail && prefill_indirect_gu_enabled() {
+        let expected_rhs = if m3_down {
+            if prefill_indirect_gu_enabled() { 0 } else { 2 }
+        } else if nax_avail && prefill_indirect_gu_enabled() {
             1
         } else {
             3
@@ -1164,7 +1169,11 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
             .flatten()
             .map(f32::from_bits)
             .collect();
-        let dec_rel = if nax_avail { 1e-2 } else { 1e-5 };
+        let dec_rel = if metal_avail && prefill_enabled {
+            1e-2
+        } else {
+            1e-5
+        };
         assert_rows(&dec, &want, dec_rel, "decode vs sorted prefill");
     }
 }
@@ -1925,9 +1934,16 @@ fn kq_prefill_indirect_gu_and_sorted_combine_parity() {
                     .sum();
                 let ref_sq: f64 = ref_out.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
                 let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
+                let tol = if !unsafe { mlx_sys::mlx_metal_is_nax_available() }
+                    || std::env::var("MLX_HY4_FORCE_METAL3").as_deref() == Ok("1")
+                {
+                    2.5e-3
+                } else {
+                    1e-3
+                };
                 assert!(
-                    rel_l2 < 1e-3,
-                    "{class:?} limit={limit} {mode_name}: rel_l2={rel_l2:e} >= 1e-3"
+                    rel_l2 < tol,
+                    "{class:?} limit={limit} {mode_name}: rel_l2={rel_l2:e} >= {tol:e}"
                 );
             }
 
@@ -2073,7 +2089,14 @@ fn kq_prefill_indirect_gu_bench_2048() {
         .sum();
     let ref_sq: f64 = ref_out.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
     let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
-    assert!(rel_l2 < 1e-3, "rows=2048 rel_l2={rel_l2:e} >= 1e-3");
+    let tol = if !unsafe { mlx_sys::mlx_metal_is_nax_available() }
+        || std::env::var("MLX_HY4_FORCE_METAL3").as_deref() == Ok("1")
+    {
+        3e-3
+    } else {
+        1e-3
+    };
+    assert!(rel_l2 < tol, "rows=2048 rel_l2={rel_l2:e} >= {tol:e}");
 
     // Warmup + timed runs at rows=2048.
     let iters = 3usize;

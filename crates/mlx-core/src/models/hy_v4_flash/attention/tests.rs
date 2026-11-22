@@ -1360,7 +1360,7 @@ fn call_mla_prefill_nax(
 #[cfg(target_os = "macos")]
 #[test]
 fn mla_prefill_nax_matches_reference_full_geometry() {
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     crate::models::hy_v4_flash::exact_f32();
@@ -1469,7 +1469,7 @@ fn mla_prefill_nax_matches_reference_full_geometry() {
 #[cfg(target_os = "macos")]
 #[test]
 fn mla_prefill_nax_keyless_nan_slot_zero_and_whole_vs_split_and_row_invariance() {
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     let (d, vw) = (576usize, 512i64);
@@ -1627,7 +1627,7 @@ fn mla_prefill_nax_keyless_nan_slot_zero_and_whole_vs_split_and_row_invariance()
 #[cfg(target_os = "macos")]
 #[test]
 fn mla_prefill_nax_bench_s2048() {
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     let (d, vw) = (576usize, 512i64);
@@ -1722,7 +1722,7 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
 
     for (h, split, seed_base) in [(64usize, false, 311u64), (32usize, true, 331u64)] {
         for &s in &[1usize, 4usize] {
-            for &kmax in &[17usize, 128usize, 512usize, 836usize] {
+            for &kmax in &[17usize, 64usize, 128usize, 512usize, 836usize] {
                 let n = kmax + 19;
                 let mut r = Rng(seed_base + (s * 1009 + kmax * 37) as u64);
                 let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
@@ -1775,7 +1775,7 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
                 // trailing -1 padding extends kmax (SINGLE_SPLIT, sliding, and
                 // max_splits_nax boundaries).
                 let pad_delta = match kmax {
-                    64 | 512 | 836 => Some(1usize),
+                    64 | 128 | 512 | 836 => Some(1usize),
                     2048 => Some(4usize),
                     _ => None,
                 };
@@ -1806,7 +1806,7 @@ fn mla_decode_v2_matches_reference_and_trailing_unlisted_determinism() {
 fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
     use crate::models::hy_v4_flash::sparse::try_sliding_sink_attention_prefill;
 
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     crate::models::hy_v4_flash::exact_f32();
@@ -2022,7 +2022,7 @@ fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
                 // trailing -1 padding extends kmax (SINGLE_SPLIT, sliding, and
                 // max_splits_nax boundaries).
                 let pad_delta = match kmax {
-                    64 | 512 | 836 => Some(1usize),
+                    64 | 128 | 512 | 836 => Some(1usize),
                     2048 => Some(4usize),
                     _ => None,
                 };
@@ -2257,7 +2257,7 @@ fn mla_prefill_split_q_matches_combined_bitwise_sliding_and_indexed() {
     let window = 512usize;
 
     // Sliding NAX: cover partial BH=4 head tiles (H=6), H=32, H=64, Ring & Linear.
-    if unsafe { mlx_sys::mlx_metal_is_nax_available() }
+    if unsafe { mlx_sys::mlx_metal_is_available() }
         || std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() == Ok("1")
     {
         for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in &[
@@ -2401,7 +2401,7 @@ fn mla_prefill_split_q_matches_combined_bitwise_sliding_and_indexed() {
 fn mla_prefill_f16_io_matches_f32_cast() {
     use super::super::sparse::gather_sink_attention_rows_split_q_for;
 
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     crate::models::hy_v4_flash::exact_f32();

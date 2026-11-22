@@ -1806,6 +1806,78 @@ fn gguf_prefill_indirect_no_fp16_early_narrowing_nan() {
 }
 
 #[test]
+fn kq_prefill_indirect_down_m3_q4k_q6k_tail_and_oob_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        assert!(!require_metal(), "Metal required");
+        return;
+    }
+
+    for (down_bits, n_experts, m, h, r) in [
+        (4, 4usize, 512usize, 256usize, 53usize),
+        (6, 4, 512, 256, 53),
+        (4, 4, 512, 260, 53),
+        (6, 4, 512, 260, 53),
+        (6, 1, 256, 1, 5), // bd.size() == 1 < 8 exercises constant address space
+    ] {
+        let mut rng = Rng::new(9300 + (down_bits as u64) * 97 + h as u64);
+        let (ty, raw_d) = if down_bits == 6 {
+            (GgufTensorType::Q6K, gen_raw_q6k(&mut rng, n_experts, h, m))
+        } else {
+            (GgufTensorType::Q4K, gen_raw_q4k(&mut rng, n_experts, h, m))
+        };
+        let d_kq = repack_to_proj_arrays(&raw_d, ty, n_experts, h, m);
+
+        let hid_vals: Vec<f32> = (0..r * m).map(|_| rng.next_f32(-3.0, 3.0)).collect();
+        let hid_f32 = MxArray::from_float32(&hid_vals, &[r as i64, m as i64]).unwrap();
+        let hid_f16 = hid_f32.astype(DType::Float16).unwrap();
+
+        let mut sorted_slots = Vec::with_capacity(r);
+        for i in 0..r {
+            sorted_slots.push(((i * n_experts) / r) as u32);
+        }
+        let tiles_v = build_prefill_tiles(&sorted_slots);
+        let tl = MxArray::from_uint32(&tiles_v, &[(tiles_v.len() / 3) as i64, 3]).unwrap();
+        let slots_2d = MxArray::from_uint32(&sorted_slots, &[r as i64, 1]).unwrap();
+
+        let ref_dn = d_kq
+            .gather(
+                &hid_f32.reshape(&[r as i64, 1, 1, m as i64]).unwrap(),
+                &slots_2d,
+            )
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .reshape(&[r as i64, h as i64])
+            .unwrap();
+        let ref_v = eval_f32(&ref_dn);
+
+        for (label, hid) in [("f32", &hid_f32), ("f16", &hid_f16)] {
+            let got = kq_prefill_indirect_down(hid, &tl, &d_kq.w, &d_kq.s, &d_kq.b, down_bits)
+                .unwrap()
+                .expect("kq_prefill_indirect_down must run on Metal");
+            assert_eq!(got.dtype().unwrap(), DType::Float32);
+            let (max_abs, rel_l2) = error_stats(&eval_f32(&got), &ref_v);
+            assert!(
+                rel_l2 <= 2e-3,
+                "kq_prefill_indirect_down bits={down_bits} H={h} in={label}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+            );
+        }
+
+        // OOB slot must write exact zeros.
+        let oob_tl = MxArray::from_uint32(&[0, 4, 99], &[1, 3]).unwrap();
+        let h4 = hid_f32.slice(&[0, 0], &[4, m as i64]).unwrap();
+        let oob = kq_prefill_indirect_down(&h4, &oob_tl, &d_kq.w, &d_kq.s, &d_kq.b, down_bits)
+            .unwrap()
+            .unwrap();
+        assert!(
+            eval_f32(&oob).iter().all(|&v| v == 0.0),
+            "kq_prefill_indirect_down OOB slot not zero (bits={down_bits} H={h})"
+        );
+    }
+}
+
+#[test]
 #[ignore = "GPU microbenchmark for Hy4 decode BW kernels (M=1,2,4)"]
 fn bench_decode_bw_kernels() {
     use crate::models::hy_v4_flash::attention::grouped_mm_t_mgh;
@@ -2177,6 +2249,259 @@ fn bench_decode_bw_kernels() {
             });
             let gbs = (bytes_per / 1e9) / (med_us / 1e6);
             eprintln!("BENCH bf16_lm_head[120832x3072] M={m}: {med_us:.1} us/call ({gbs:.1} GB/s)");
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU microbenchmark for Metal 3 Hy4 prefill kernels"]
+fn bench_m3_prefill_kernels() {
+    use crate::models::hy_v4_flash::attention::grouped_mm_t_mgh;
+    use crate::models::hy_v4_flash::moe::qlinear;
+    use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
+    use std::time::Instant;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(20261124);
+
+    fn time_median_ms(iters: usize, warmup: usize, mut f: impl FnMut()) -> f64 {
+        for _ in 0..warmup {
+            f();
+        }
+        let mut ts = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            f();
+            ts.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts[ts.len() / 2]
+    }
+
+    // 1. q8_dense_prefill (dense)
+    for &(m, k, n) in &[
+        (4096usize, 2560usize, 2560usize),
+        (4096, 2560, 3072),
+        (4096, 1536, 4096),
+    ] {
+        let wv: Vec<f32> = (0..n * k)
+            .map(|i| (((i * 19) % 89) as f32 - 44.0) * 0.001)
+            .collect();
+        let w = MxArray::from_float32(&wv, &[n as i64, k as i64]).unwrap();
+        let sym = quantize_sym_q8_array(&w).unwrap();
+        let xv: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 13) % 71) as f32 - 35.0) * 0.02)
+            .collect();
+        let x = MxArray::from_float32(&xv, &[m as i64, k as i64]).unwrap();
+        MxArray::eval_arrays_with_context(&[&x], "bench q8 dense in").unwrap();
+        let ms = time_median_ms(7, 3, || {
+            let y = qlinear(&x, &sym).unwrap();
+            MxArray::eval_arrays_with_context(&[&y], "bench q8 dense").unwrap();
+        });
+        let tflops = (2.0 * m as f64 * k as f64 * n as f64) / (ms * 1e9);
+        eprintln!("BENCH q8_dense[M={m},K={k},N={n}]: {ms:.3} ms ({tflops:.2} TFLOPS)");
+    }
+
+    // 2. q8_grouped_prefill
+    for &(m, g, k, n) in &[
+        (4096usize, 64usize, 128usize, 512usize),
+        (4096, 64, 512, 128),
+    ] {
+        let wv: Vec<f32> = (0..g * n * k)
+            .map(|i| (((i * 23) % 97) as f32 - 48.0) * 0.001)
+            .collect();
+        let w = MxArray::from_float32(&wv, &[(g * n) as i64, k as i64]).unwrap();
+        let sym = quantize_sym_q8_array(&w).unwrap();
+        let xv: Vec<f32> = (0..m * g * k)
+            .map(|i| (((i * 17) % 83) as f32 - 41.0) * 0.02)
+            .collect();
+        let x = MxArray::from_float32(&xv, &[m as i64, g as i64, k as i64]).unwrap();
+        MxArray::eval_arrays_with_context(&[&x], "bench q8 grouped in").unwrap();
+        let ms = time_median_ms(7, 3, || {
+            let y = grouped_mm_t_mgh(&sym, &x, g as i64).unwrap();
+            MxArray::eval_arrays_with_context(&[&y], "bench q8 grouped").unwrap();
+        });
+        let tflops = (2.0 * m as f64 * g as f64 * k as f64 * n as f64) / (ms * 1e9);
+        eprintln!("BENCH q8_grouped[M={m},G={g},K={k},N={n}]: {ms:.3} ms ({tflops:.2} TFLOPS)");
+    }
+
+    // 3. q8_dual_down_prefill
+    {
+        let (m, k, n) = (4096usize, 1024usize, 2560usize);
+        let wv: Vec<f32> = (0..n * k)
+            .map(|i| (((i * 29) % 97) as f32 - 48.0) * 0.001)
+            .collect();
+        let w_up =
+            quantize_sym_q8_array(&MxArray::from_float32(&wv, &[n as i64, k as i64]).unwrap())
+                .unwrap();
+        let w_sd =
+            quantize_sym_q8_array(&MxArray::from_float32(&wv, &[n as i64, k as i64]).unwrap())
+                .unwrap();
+        let rlv: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 11) % 61) as f32 - 30.0) * 0.02)
+            .collect();
+        let sguv: Vec<f32> = (0..m * 2 * k)
+            .map(|i| (((i * 13) % 67) as f32 - 33.0) * 0.02)
+            .collect();
+        let rl = MxArray::from_float32(&rlv, &[m as i64, k as i64]).unwrap();
+        let sgu = MxArray::from_float32(&sguv, &[m as i64, (2 * k) as i64]).unwrap();
+        MxArray::eval_arrays_with_context(&[&rl, &sgu], "bench dual in").unwrap();
+        let ms = time_median_ms(7, 3, || {
+            let y = try_q8_dual_down_add(&rl, &sgu, &w_up, &w_sd, 0.0)
+                .unwrap()
+                .unwrap();
+            MxArray::eval_arrays_with_context(&[&y], "bench dual").unwrap();
+        });
+        let tflops = (4.0 * m as f64 * k as f64 * n as f64) / (ms * 1e9);
+        eprintln!("BENCH q8_dual_down[M={m},K={k},N={n}]: {ms:.3} ms ({tflops:.2} TFLOPS)");
+    }
+
+    // 4. gguf_prefill_indirect_gu & gguf_prefill_indirect_down (Q4_K & Q6_K)
+    // R=24576, 512 experts x 48 rows/tile, K=2560, M=1024, H=2560
+    {
+        let (n_experts, rows_per_exp, k, m_ff, h) =
+            (512usize, 48usize, 2560usize, 1024usize, 2560usize);
+        let r = n_experts * rows_per_exp;
+        let n_tok = r / 16;
+        let mut sorted_slots = Vec::with_capacity(r);
+        let mut token_rows_v = Vec::with_capacity(r);
+        for e in 0..n_experts {
+            for j in 0..rows_per_exp {
+                sorted_slots.push(e as u32);
+                token_rows_v.push(((e * 7 + j * 13) % n_tok) as u32);
+            }
+        }
+        let tiles64 = build_prefill_tiles_bm(&sorted_slots, 64);
+        let tr = MxArray::from_uint32(&token_rows_v, &[r as i64]).unwrap();
+        let tl64 = MxArray::from_uint32(&tiles64, &[(tiles64.len() / 3) as i64, 3]).unwrap();
+        let xv: Vec<f32> = (0..n_tok * k)
+            .map(|i| (((i * 17) % 73) as f32 - 36.0) * 0.02)
+            .collect();
+        let x = MxArray::from_float32(&xv, &[n_tok as i64, k as i64]).unwrap();
+
+        let one_q4_gu = gen_raw_q4k(&mut rng, 1, m_ff, k);
+        let mut raw_g = Vec::with_capacity(n_experts * one_q4_gu.len());
+        for _ in 0..n_experts {
+            raw_g.extend_from_slice(&one_q4_gu);
+        }
+        let g_buf = make_padded_u8_buf(&raw_g, 64, false);
+        let u_buf = make_padded_u8_buf(&raw_g, 64, false);
+        MxArray::eval_arrays_with_context(&[&x, &tr, &tl64, &g_buf, &u_buf], "bench gguf gu in")
+            .unwrap();
+
+        let gu_ms = time_median_ms(5, 2, || {
+            let y = gguf_prefill_indirect_gu(
+                &x, &tr, &tl64, &g_buf, 64, &u_buf, 64, n_experts, m_ff, 7.0,
+            )
+            .unwrap()
+            .unwrap();
+            MxArray::eval_arrays_with_context(&[&y], "bench gguf gu").unwrap();
+        });
+        let gu_tflops = (4.0 * r as f64 * k as f64 * m_ff as f64) / (gu_ms * 1e9);
+        eprintln!(
+            "BENCH gguf_indirect_gu[R={r},E={n_experts},K={k},M={m_ff}]: {gu_ms:.3} ms ({gu_tflops:.2} TFLOPS)"
+        );
+
+        let hid =
+            gguf_prefill_indirect_gu(&x, &tr, &tl64, &g_buf, 64, &u_buf, 64, n_experts, m_ff, 7.0)
+                .unwrap()
+                .unwrap();
+        MxArray::eval_arrays_with_context(&[&hid], "bench gguf hid").unwrap();
+
+        for down_bits in [4, 6] {
+            let one_d = if down_bits == 6 {
+                gen_raw_q6k(&mut rng, 1, h, m_ff)
+            } else {
+                gen_raw_q4k(&mut rng, 1, h, m_ff)
+            };
+            let mut raw_d = Vec::with_capacity(n_experts * one_d.len());
+            for _ in 0..n_experts {
+                raw_d.extend_from_slice(&one_d);
+            }
+            let off = if down_bits == 6 { 66u64 } else { 64u64 };
+            let d_buf = make_padded_u8_buf(&raw_d, off, false);
+            MxArray::eval_arrays_with_context(&[&d_buf], "bench gguf dn in").unwrap();
+            let dn_ms = time_median_ms(5, 2, || {
+                let y =
+                    gguf_prefill_indirect_down(&hid, &tl64, &d_buf, off, n_experts, h, down_bits)
+                        .unwrap()
+                        .unwrap();
+                MxArray::eval_arrays_with_context(&[&y], "bench gguf dn").unwrap();
+            });
+            let dn_tflops = (2.0 * r as f64 * m_ff as f64 * h as f64) / (dn_ms * 1e9);
+            eprintln!(
+                "BENCH gguf_indirect_down[Q{down_bits}K,R={r},E={n_experts},M={m_ff},H={h}]: {dn_ms:.3} ms ({dn_tflops:.2} TFLOPS)"
+            );
+        }
+    }
+
+    // 5. kq_prefill_indirect_gu & kq_prefill_indirect_down (Q4_K & Q6_K)
+    {
+        let (n_experts, rows_per_exp, k, m_ff, h) =
+            (128usize, 192usize, 1536usize, 1536usize, 1536usize);
+        let r = n_experts * rows_per_exp;
+        let n_tok = r / 16;
+        let mut sorted_slots = Vec::with_capacity(r);
+        let mut token_rows_v = Vec::with_capacity(r);
+        for e in 0..n_experts {
+            for j in 0..rows_per_exp {
+                sorted_slots.push(e as u32);
+                token_rows_v.push(((e * 7 + j * 13) % n_tok) as u32);
+            }
+        }
+        let tiles32 = build_prefill_tiles(&sorted_slots);
+        let tr = MxArray::from_uint32(&token_rows_v, &[r as i64]).unwrap();
+        let tl32 = MxArray::from_uint32(&tiles32, &[(tiles32.len() / 3) as i64, 3]).unwrap();
+        let xv: Vec<f32> = (0..n_tok * k)
+            .map(|i| (((i * 19) % 79) as f32 - 39.0) * 0.02)
+            .collect();
+        let x = MxArray::from_float32(&xv, &[n_tok as i64, k as i64]).unwrap();
+
+        let one_q4 = gen_raw_q4k(&mut rng, 1, m_ff, k);
+        let mut raw_q4 = Vec::with_capacity(n_experts * one_q4.len());
+        for _ in 0..n_experts {
+            raw_q4.extend_from_slice(&one_q4);
+        }
+        let g_kq = repack_to_proj_arrays(&raw_q4, GgufTensorType::Q4K, n_experts, m_ff, k);
+        let u_kq = repack_to_proj_arrays(&raw_q4, GgufTensorType::Q4K, n_experts, m_ff, k);
+        MxArray::eval_arrays_with_context(&[&x, &tr, &tl32, &g_kq.w, &u_kq.w], "bench kq gu in")
+            .unwrap();
+
+        let gu_ms = time_median_ms(5, 2, || {
+            let y = call_kq_prefill_indirect_gu(&x, &tr, &tl32, &g_kq, &u_kq, 7.0).unwrap();
+            MxArray::eval_arrays_with_context(&[&y], "bench kq gu").unwrap();
+        });
+        let gu_tflops = (4.0 * r as f64 * k as f64 * m_ff as f64) / (gu_ms * 1e9);
+        eprintln!(
+            "BENCH kq_indirect_gu[R={r},E={n_experts},K={k},M={m_ff}]: {gu_ms:.3} ms ({gu_tflops:.2} TFLOPS)"
+        );
+
+        let hid = call_kq_prefill_indirect_gu(&x, &tr, &tl32, &g_kq, &u_kq, 7.0).unwrap();
+        MxArray::eval_arrays_with_context(&[&hid], "bench kq hid").unwrap();
+
+        for down_bits in [4, 6] {
+            let (ty, one_d) = if down_bits == 6 {
+                (GgufTensorType::Q6K, gen_raw_q6k(&mut rng, 1, h, m_ff))
+            } else {
+                (GgufTensorType::Q4K, gen_raw_q4k(&mut rng, 1, h, m_ff))
+            };
+            let mut raw_d = Vec::with_capacity(n_experts * one_d.len());
+            for _ in 0..n_experts {
+                raw_d.extend_from_slice(&one_d);
+            }
+            let d_kq = repack_to_proj_arrays(&raw_d, ty, n_experts, h, m_ff);
+            MxArray::eval_arrays_with_context(&[&d_kq.w, &d_kq.s, &d_kq.b], "bench kq dn in")
+                .unwrap();
+            let dn_ms = time_median_ms(5, 2, || {
+                let y = kq_prefill_indirect_down(&hid, &tl32, &d_kq.w, &d_kq.s, &d_kq.b, down_bits)
+                    .unwrap()
+                    .unwrap();
+                MxArray::eval_arrays_with_context(&[&y], "bench kq dn").unwrap();
+            });
+            let dn_tflops = (2.0 * r as f64 * m_ff as f64 * h as f64) / (dn_ms * 1e9);
+            eprintln!(
+                "BENCH kq_indirect_down[Q{down_bits}K,R={r},E={n_experts},M={m_ff},H={h}]: {dn_ms:.3} ms ({dn_tflops:.2} TFLOPS)"
+            );
         }
     }
 }

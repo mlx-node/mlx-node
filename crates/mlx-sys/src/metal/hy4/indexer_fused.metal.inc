@@ -1,7 +1,23 @@
 R"METAL(
+inline void hy4_idx_m3_mma(
+    thread float2& acc,
+    const half2 a_val,
+    thread const simdgroup_half8x8& b_mat) {
+  simdgroup_half8x8 a_mat;
+  simdgroup_float8x8 c_mat;
+  a_mat.thread_elements()[0] = a_val.x;
+  a_mat.thread_elements()[1] = a_val.y;
+  c_mat.thread_elements()[0] = acc.x;
+  c_mat.thread_elements()[1] = acc.y;
+  simdgroup_multiply_accumulate(c_mat, a_mat, b_mat, c_mat);
+  acc.x = c_mat.thread_elements()[0];
+  acc.y = c_mat.thread_elements()[1];
+}
+
 template <
     bool PAGED,
     int INDEX_ROWS,
+    bool SHARE_S,
     typename QPtr,
     typename WPtr,
     typename KPtr,
@@ -14,61 +30,134 @@ inline void hy4_indexer_score_decode_impl(
     PagePtr page_ids,
     ParamsPtr params,
     device float* out,
-    threadgroup float4* q_tg,
-    threadgroup float* w_tg,
+    threadgroup half* k_tile,
     int H,
-    uint s,
+    uint s_grid,
     uint g_tile,
-    uint tid,
-    uint lane,
-    uint sg) {
+    uint lane) {
+  constexpr uint PAD = 136u;
+
   const uint S = params[0];
   const uint N_g = params[1];
   const uint start_g = params[2];
-  if (s >= S) {
+  const uint g0 = g_tile * 32u;
+  if ((!SHARE_S && s_grid >= S) || g0 >= N_g) {
     return;
   }
 
-  const size_t q_s_off = size_t(s) * size_t(H) * 128u;
-  const uint q_vec_total = uint(H) * 32u;
-  const device float4* q4 = reinterpret_cast<const device float4*>(q + q_s_off);
-  for (uint i = tid; i < q_vec_total; i += 256u) {
-    q_tg[i] = q4[i];
-  }
-  if (tid < uint(H)) {
-    w_tg[tid] = w[size_t(s) * size_t(H) + size_t(tid)];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const uint g = g_tile * 8u + sg;
-  if (g >= N_g) {
-    return;
-  }
-
-  const uint g_abs = start_g + g;
-  size_t k_row;
-  if constexpr (PAGED) {
-    const uint page_idx = g_abs / uint(INDEX_ROWS);
-    const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
-    const int phys_page = page_ids[page_idx];
-    k_row = size_t(phys_page) * size_t(INDEX_ROWS) + size_t(local_row);
-  } else {
-    k_row = size_t(g_abs);
-  }
-
-  const size_t k_off = k_row * 128u + size_t(lane) * 4u;
-  const float4 kv = float4(*reinterpret_cast<const device half4*>(k_pool + k_off));
-
-  float acc = 0.0f;
-  for (uint h = 0u; h < uint(H); ++h) {
-    const float4 qv = q_tg[h * 32u + lane];
-    const float d = simd_sum(metal::dot(qv, kv));
-    if (lane == 0u) {
-      acc = metal::fma(w_tg[h], metal::max(d, 0.0f), acc);
+  // Each half-simdgroup (16 lanes) loads one 256-byte key row via float4 (half8).
+  const uint lane_r = lane >> 4;
+  const uint c8 = lane & 15u;
+  #pragma unroll
+  for (uint rb = 0u; rb < 32u; rb += 2u) {
+    const uint r = rb + lane_r;
+    const uint g = g0 + r;
+    threadgroup float4* dst =
+        reinterpret_cast<threadgroup float4*>(k_tile + r * PAD + c8 * 8u);
+    if (g < N_g) {
+      const uint g_abs = start_g + g;
+      size_t k_row;
+      if (PAGED) {
+        const uint page_idx = g_abs / uint(INDEX_ROWS);
+        const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
+        const int phys_page = page_ids[page_idx];
+        k_row = size_t(phys_page) * size_t(INDEX_ROWS) + size_t(local_row);
+      } else {
+        k_row = size_t(g_abs);
+      }
+      *dst = *reinterpret_cast<const device float4*>(
+          k_pool + k_row * 128u + size_t(c8) * 8u);
+    } else {
+      *dst = float4(0.0f);
     }
   }
-  if (lane == 0u) {
-    out[size_t(s) * size_t(N_g) + size_t(g)] = acc;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+  const uint fn = ((qid & 2u) << 1) + ((lane & 1u) << 1);
+  const bool ok0 = int(fm) < H;
+  const bool ok1 = (int(fm) + 8) < H;
+  const bool has_hi_heads = (H > 8);
+
+  const uint s_lo = SHARE_S ? 0u : s_grid;
+  const uint s_hi = SHARE_S ? S : (s_grid + 1u);
+
+  for (uint s = s_lo; s < s_hi; ++s) {
+    const device float* q_s = q + size_t(s) * size_t(H) * 128u;
+    float2 dot0[4];
+    float2 dot1[4];
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      dot0[kg] = float2(0.0f);
+      dot1[kg] = float2(0.0f);
+    }
+
+    // Split F32 Q into FP16 hi + residual to preserve <= 1e-3 accuracy across D=128.
+    #pragma unroll
+    for (uint d = 0u; d < 128u; d += 8u) {
+      const float2 q0_f = ok0
+          ? float2(
+                q_s[size_t(fm) * 128u + size_t(d + fn)],
+                q_s[size_t(fm) * 128u + size_t(d + fn + 1u)])
+          : float2(0.0f);
+      const half2 q0_hi = half2(q0_f);
+      const half2 q0_lo = half2(q0_f - float2(q0_hi));
+
+      half2 q1_hi = half2(0.0h);
+      half2 q1_lo = half2(0.0h);
+      if (has_hi_heads) {
+        const float2 q1_f = ok1
+            ? float2(
+                  q_s[size_t(fm + 8u) * 128u + size_t(d + fn)],
+                  q_s[size_t(fm + 8u) * 128u + size_t(d + fn + 1u)])
+            : float2(0.0f);
+        q1_hi = half2(q1_f);
+        q1_lo = half2(q1_f - float2(q1_hi));
+      }
+
+      #pragma unroll
+      for (uint kg = 0u; kg < 4u; ++kg) {
+        simdgroup_half8x8 mk;
+        simdgroup_load(mk, k_tile + (kg * 8u) * PAD + d, PAD, ulong2(0), true);
+        hy4_idx_m3_mma(dot0[kg], q0_hi, mk);
+        hy4_idx_m3_mma(dot0[kg], q0_lo, mk);
+        if (has_hi_heads) {
+          hy4_idx_m3_mma(dot1[kg], q1_hi, mk);
+          hy4_idx_m3_mma(dot1[kg], q1_lo, mk);
+        }
+      }
+    }
+
+    const float w0 = ok0 ? w[size_t(s) * size_t(H) + size_t(fm)] : 0.0f;
+    const float w1 = ok1 ? w[size_t(s) * size_t(H) + size_t(fm + 8u)] : 0.0f;
+    device float* out_row = out + size_t(s) * size_t(N_g);
+
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      float2 sk(
+          metal::fma(
+              w0,
+              metal::max(dot0[kg].x, 0.0f),
+              w1 * metal::max(dot1[kg].x, 0.0f)),
+          metal::fma(
+              w0,
+              metal::max(dot0[kg].y, 0.0f),
+              w1 * metal::max(dot1[kg].y, 0.0f)));
+      // Lanes sharing the same fn differ only in bits 1, 2, 4 (fm = [b4 b2 b1]).
+      sk += simd_shuffle_xor(sk, ushort(2));
+      sk += simd_shuffle_xor(sk, ushort(4));
+      sk += simd_shuffle_xor(sk, ushort(16));
+      if (fm == 0u) {
+        const uint gc = g0 + kg * 8u + fn;
+        if (gc < N_g) {
+          out_row[gc] = sk.x;
+        }
+        if (gc + 1u < N_g) {
+          out_row[gc + 1u] = sk.y;
+        }
+      }
+    }
   }
 }
 
@@ -90,56 +179,49 @@ inline void hy4_indexer_score_prefill_impl(
     VisPtr visible_groups,
     ParamsPtr params,
     device float* out,
-    threadgroup float4* k_tile_buf,
-    threadgroup float4* q_tile_buf,
-    threadgroup float* s_dot,
-    threadgroup float* w_tg,
+    threadgroup half* k_tile,
     int H,
     uint g_tile,
     uint s_tile,
     uint tid,
     uint lane,
     uint sg) {
-  // Padded stride (132 = 128 + 4) stays 16-byte aligned and reduces TG bank
-  // conflicts during transposed simdgroup_load.
-  constexpr uint STRIDE = 132u;
-  constexpr uint STRIDE4 = STRIDE / 4u;
+  constexpr uint PAD = 136u;
 
   const uint S = params[0];
   const uint N_g = params[1];
   const uint start_g = params[2];
-  const uint s0 = s_tile * 16u;
+  const uint s0 = s_tile * 64u;
   const uint g0 = g_tile * 32u;
   if (s0 >= S || g0 >= N_g) {
     return;
   }
 
+  // Every SG computes the identical tile-max visibility via one simd_max (no barrier).
   uint vis_max = N_g;
-  if constexpr (HAS_VIS) {
-    const uint r = s0 + (lane & 15u);
-    const int mv = simd_max((r < S) ? visible_groups[r] : 0);
+  if (HAS_VIS) {
+    const uint r0 = s0 + lane;
+    const uint r1 = s0 + 32u + lane;
+    const int m0 = (r0 < S) ? visible_groups[r0] : 0;
+    const int m1 = (r1 < S) ? visible_groups[r1] : 0;
+    const int mv = simd_max(metal::max(m0, m1));
     vis_max = (mv > 0) ? metal::min(uint(mv), N_g) : 0u;
     if (g0 >= vis_max) {
       return;
     }
   }
 
-  if (tid < uint(H) * 16u) {
-    const uint h = tid >> 4;
-    const uint r = tid & 15u;
-    const uint s_row = s0 + r;
-    w_tg[tid] = (s_row < S) ? w[size_t(s_row) * size_t(H) + size_t(h)] : 0.0f;
-  }
-
-  for (uint i = tid; i < 32u * 32u; i += 256u) {
-    const uint r = i >> 5;
-    const uint c4 = i & 31u;
+  // 128 threads cooperatively load 32 x 128 halves (512 float4s = 4 per thread).
+  for (uint i = tid; i < 32u * 16u; i += 128u) {
+    const uint r = i >> 4;
+    const uint c8 = i & 15u;
     const uint g = g0 + r;
-    float4 kv = float4(0.0f);
+    threadgroup float4* dst =
+        reinterpret_cast<threadgroup float4*>(k_tile + r * PAD + c8 * 8u);
     if (g < vis_max) {
       const uint g_abs = start_g + g;
       size_t k_row;
-      if constexpr (PAGED) {
+      if (PAGED) {
         const uint page_idx = g_abs / uint(INDEX_ROWS);
         const uint local_row = g_abs - page_idx * uint(INDEX_ROWS);
         const int phys_page = page_ids[page_idx];
@@ -147,76 +229,105 @@ inline void hy4_indexer_score_prefill_impl(
       } else {
         k_row = size_t(g_abs);
       }
-      const size_t k_off = k_row * 128u + size_t(c4) * 4u;
-      kv = float4(
-          float(k_pool[k_off]),
-          float(k_pool[k_off + 1u]),
-          float(k_pool[k_off + 2u]),
-          float(k_pool[k_off + 3u]));
+      *dst = *reinterpret_cast<const device float4*>(
+          k_pool + k_row * 128u + size_t(c8) * 8u);
+    } else {
+      *dst = float4(0.0f);
     }
-    k_tile_buf[r * STRIDE4 + c4] = kv;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint s_sg = s0 + sg * 16u;
+  if (s_sg >= S) {
+    return;
   }
 
-  threadgroup float* k_tile = reinterpret_cast<threadgroup float*>(k_tile_buf);
-  threadgroup float* q_tile = reinterpret_cast<threadgroup float*>(q_tile_buf);
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4u) + ((lane >> 1) & 3u);
+  const uint fn = ((qid & 2u) << 1) + ((lane & 1u) << 1);
+  const uint sr0 = s_sg + fm;
+  const uint sr1 = sr0 + 8u;
+  const bool ok0 = (sr0 < S);
+  const bool ok1 = (sr1 < S);
 
-  const uint sg_q = sg >> 2;
-  const uint sg_k = sg & 3u;
-  const uint r0 = lane >> 3;
-  const uint c0 = lane & 7u;
-  const uint r1 = r0 + 4u;
-  const threadgroup float* q_sg = q_tile + (sg_q * 8u) * STRIDE;
-  const threadgroup float* k_sg = k_tile + (sg_k * 8u) * STRIDE;
-  threadgroup float* sd = s_dot + sg * 64u;
-
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
+  float2 acc0[4];
+  float2 acc1[4];
+  #pragma unroll
+  for (uint kg = 0u; kg < 4u; ++kg) {
+    acc0[kg] = float2(0.0f);
+    acc1[kg] = float2(0.0f);
+  }
 
   for (uint h = 0u; h < uint(H); ++h) {
-    for (uint i = tid; i < 16u * 32u; i += 256u) {
-      const uint r = i >> 5;
-      const uint c4 = i & 31u;
-      const uint s_row = s0 + r;
-      float4 qv = float4(0.0f);
-      if (s_row < S) {
-        const size_t q_off =
-            (size_t(s_row) * size_t(H) + size_t(h)) * 128u + size_t(c4) * 4u;
-        qv = float4(q[q_off], q[q_off + 1u], q[q_off + 2u], q[q_off + 3u]);
-      }
-      q_tile_buf[r * STRIDE4 + c4] = qv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float w0 = ok0 ? w[size_t(sr0) * size_t(H) + size_t(h)] : 0.0f;
+    const float w1 = ok1 ? w[size_t(sr1) * size_t(H) + size_t(h)] : 0.0f;
+    const device float* q_ptr0 =
+        q + (size_t(ok0 ? sr0 : 0u) * size_t(H) + size_t(h)) * 128u;
+    const device float* q_ptr1 =
+        q + (size_t(ok1 ? sr1 : 0u) * size_t(H) + size_t(h)) * 128u;
 
-    simdgroup_float8x8 dot_h = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    float2 dot0[4];
+    float2 dot1[4];
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      dot0[kg] = float2(0.0f);
+      dot1[kg] = float2(0.0f);
+    }
+
+    #pragma unroll
     for (uint d = 0u; d < 128u; d += 8u) {
-      simdgroup_float8x8 mq;
-      simdgroup_float8x8 mk;
-      simdgroup_load(mq, q_sg + d, STRIDE);
-      simdgroup_load(mk, k_sg + d, STRIDE, ulong2(0), true);
-      simdgroup_multiply_accumulate(dot_h, mq, mk, dot_h);
+      const half2 q0 = ok0
+          ? half2(half(q_ptr0[d + fn]), half(q_ptr0[d + fn + 1u]))
+          : half2(0.0h);
+      const half2 q1 = ok1
+          ? half2(half(q_ptr1[d + fn]), half(q_ptr1[d + fn + 1u]))
+          : half2(0.0h);
+      #pragma unroll
+      for (uint kg = 0u; kg < 4u; ++kg) {
+        if (g0 + kg * 8u < vis_max) {
+          simdgroup_half8x8 mk;
+          simdgroup_load(mk, k_tile + (kg * 8u) * PAD + d, PAD, ulong2(0), true);
+          hy4_idx_m3_mma(dot0[kg], q0, mk);
+          hy4_idx_m3_mma(dot1[kg], q1, mk);
+        }
+      }
     }
-    simdgroup_store(dot_h, sd, 8u);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float w0 = w_tg[h * 16u + sg_q * 8u + r0];
-    const float w1 = w_tg[h * 16u + sg_q * 8u + r1];
-    acc0 = metal::fma(w0, metal::max(sd[r0 * 8u + c0], 0.0f), acc0);
-    acc1 = metal::fma(w1, metal::max(sd[r1 * 8u + c0], 0.0f), acc1);
-
-    if (h + 1u < uint(H)) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      if (g0 + kg * 8u < vis_max) {
+        acc0[kg].x = metal::fma(w0, metal::max(dot0[kg].x, 0.0f), acc0[kg].x);
+        acc0[kg].y = metal::fma(w0, metal::max(dot0[kg].y, 0.0f), acc0[kg].y);
+        acc1[kg].x = metal::fma(w1, metal::max(dot1[kg].x, 0.0f), acc1[kg].x);
+        acc1[kg].y = metal::fma(w1, metal::max(dot1[kg].y, 0.0f), acc1[kg].y);
+      }
     }
   }
 
-  const uint g_col = g0 + sg_k * 8u + c0;
-  if (g_col < vis_max) {
-    const uint s_row0 = s0 + sg_q * 8u + r0;
-    if (s_row0 < S) {
-      out[size_t(s_row0) * size_t(N_g) + size_t(g_col)] = acc0;
+  if (ok0) {
+    device float* out0 = out + size_t(sr0) * size_t(N_g);
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      const uint gc = g0 + kg * 8u + fn;
+      if (gc < vis_max) {
+        out0[gc] = acc0[kg].x;
+      }
+      if (gc + 1u < vis_max) {
+        out0[gc + 1u] = acc0[kg].y;
+      }
     }
-    const uint s_row1 = s0 + sg_q * 8u + r1;
-    if (s_row1 < S) {
-      out[size_t(s_row1) * size_t(N_g) + size_t(g_col)] = acc1;
+  }
+  if (ok1) {
+    device float* out1 = out + size_t(sr1) * size_t(N_g);
+    #pragma unroll
+    for (uint kg = 0u; kg < 4u; ++kg) {
+      const uint gc = g0 + kg * 8u + fn;
+      if (gc < vis_max) {
+        out1[gc] = acc1[kg].x;
+      }
+      if (gc + 1u < vis_max) {
+        out1[gc + 1u] = acc1[kg].y;
+      }
     }
   }
 }

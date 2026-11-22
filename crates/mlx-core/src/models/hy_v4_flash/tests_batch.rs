@@ -616,10 +616,11 @@ fn q8_dual_down_add_prefill_nax_parity_and_strided_inputs() {
     use super::ops::try_q8_dual_down_add;
     use crate::nn::Activations;
 
-    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
         assert!(
-            std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1"),
-            "NAX required for q8_dual_down_add prefill test"
+            std::env::var("MLX_TEST_REQUIRE_NAX").as_deref() != Ok("1")
+                && std::env::var("MLX_TEST_REQUIRE_METAL").as_deref() != Ok("1"),
+            "Metal required for q8_dual_down_add prefill test"
         );
         return;
     }

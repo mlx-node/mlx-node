@@ -4014,6 +4014,15 @@ unsafe extern "C" {
         limit: f32,
     ) -> *mut mlx_array;
 
+    pub fn mlx_hy4_kq_prefill_indirect_down(
+        hidden: *mut mlx_array,
+        tiles: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_hy4_kq_sorted_combine(
         down: *mut mlx_array,
         weights: *mut mlx_array,

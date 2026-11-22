@@ -42,8 +42,8 @@ use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{
     affine4_routed_decode, gguf_prefill_indirect_down, gguf_prefill_indirect_gu,
-    gguf_routed_decode, moe_prefill_sort_tiles, rms_norm, route, route_pair, router_logits,
-    router_scores, router_topk_gpu, try_q8_dual_down_add, try_router_mv,
+    gguf_routed_decode, kq_prefill_indirect_down, moe_prefill_sort_tiles, rms_norm, route,
+    route_pair, router_logits, router_scores, router_topk_gpu, try_q8_dual_down_add, try_router_mv,
 };
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
@@ -86,6 +86,18 @@ pub(crate) fn prefill_indirect_gu_enabled() -> bool {
         std::env::var("MLX_HY4_PREFILL_INDIRECT_GU").as_deref() != Ok("0")
             && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0")
     })
+}
+
+fn force_metal3_enabled() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("MLX_HY4_FORCE_METAL3").as_deref() == Ok("1"))
+}
+
+fn use_m3_kq_down() -> bool {
+    static PREFILL_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let prefill_on =
+        *PREFILL_ENABLED.get_or_init(|| std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0"));
+    prefill_on && (!unsafe { mlx_sys::mlx_metal_is_nax_available() } || force_metal3_enabled())
 }
 
 #[cfg(test)]
@@ -1592,6 +1604,7 @@ impl Moe {
         )?))
     }
 
+    #[cfg(test)]
     fn kq_prefill_indirect_gu_arrays(
         &self,
         z: &MxArray,
@@ -1678,6 +1691,23 @@ impl Moe {
         self.prefill_sorted_down_arrays(z, row, slot, &p.arrays)
     }
 
+    fn kq_prefill_indirect_down_gpu(
+        &self,
+        hidden: &MxArray,
+        tiles: &MxArray,
+        down: &ProjArrays,
+    ) -> Result<Option<MxArray>> {
+        if !use_m3_kq_down() {
+            return Ok(None);
+        }
+        let down_bits = match down.format {
+            KQuantFormat::Q4K => 4,
+            KQuantFormat::Q6K => 6,
+            _ => return Ok(None),
+        };
+        kq_prefill_indirect_down(hidden, tiles, &down.w, &down.s, &down.b, down_bits)
+    }
+
     fn prefill_sorted_down_arrays(
         &self,
         z: &MxArray,
@@ -1692,10 +1722,30 @@ impl Moe {
         let max_group = slot
             .last()
             .map_or(0, |&s| (s as usize + 1).min(i32::MAX as usize) as i32);
-        let si = MxArray::from_uint32(slot, &[m])?;
-        let a = match self.kq_prefill_indirect_gu_arrays(z, row, &tiles, arrays)? {
-            Some(a2d) => a2d.reshape(&[m, 1, self.moe.ff as i64])?,
+        let want_m3_down = use_m3_kq_down() && !tiles.is_empty();
+        let tl_arr = if !tiles.is_empty() && (prefill_indirect_gu_enabled() || want_m3_down) {
+            Some(MxArray::from_uint32(
+                &tiles,
+                &[(tiles.len() / 3) as i64, 3],
+            )?)
+        } else {
+            None
+        };
+        let gu_2d = match (&tl_arr, row.is_empty()) {
+            (Some(tl), false)
+                if prefill_indirect_gu_enabled()
+                    && arrays[0].format == KQuantFormat::Q4K
+                    && arrays[1].format == KQuantFormat::Q4K =>
+            {
+                let tr = MxArray::from_uint32(row, &[row.len() as i64])?;
+                self.kq_prefill_indirect_gu_gpu(z, &tr, tl, arrays)?
+            }
+            _ => None,
+        };
+        let (a_2d, si_opt) = match gu_2d {
+            Some(a2d) => (a2d, None),
             None => {
+                let si = MxArray::from_uint32(slot, &[m])?;
                 let x = z
                     .take(&MxArray::from_uint32(row, &[m])?, 0)?
                     .reshape(&[m, 1, latent])?;
@@ -1711,9 +1761,20 @@ impl Moe {
                 } else {
                     u.astype(DType::Float32)?
                 };
-                Activations::swiglu_clamped_compiled(&g, &u, self.limit)?
+                let a3d = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
+                (a3d.reshape(&[m, self.moe.ff as i64])?, Some(si))
             }
         };
+        if let Some(tl) = &tl_arr
+            && let Some(d) = self.kq_prefill_indirect_down_gpu(&a_2d, tl, &arrays[2])?
+        {
+            return Ok(d);
+        }
+        let si = match si_opt {
+            Some(si) => si,
+            None => MxArray::from_uint32(slot, &[m])?,
+        };
+        let a = a_2d.reshape(&[m, 1, self.moe.ff as i64])?;
         arrays[2]
             .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
             .astype(DType::Float32)?
@@ -1734,8 +1795,8 @@ impl Moe {
         if let Some((tr, tl, inv, sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts, 32)? {
             let y_tiles = (tl.shape_at(0)? as usize).min(i32::MAX as usize) as i32;
             let max_group = n_experts.min(i32::MAX as usize) as i32;
-            let a = match self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)? {
-                Some(a2d) => a2d.reshape(&[pairs, 1, self.moe.ff as i64])?,
+            let a_2d = match self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)? {
+                Some(a2d) => a2d,
                 None => {
                     let x = z.take(&tr, 0)?.reshape(&[pairs, 1, latent])?;
                     let g = arrays[0].gather_sorted_nax_bounded(
@@ -1761,12 +1822,19 @@ impl Moe {
                         u.astype(DType::Float32)?
                     };
                     Activations::swiglu_clamped_compiled(&g, &u, self.limit)?
+                        .reshape(&[pairs, self.moe.ff as i64])?
                 }
             };
-            let d = arrays[2]
-                .gather_sorted_nax_bounded(&a, &sorted_slots, y_tiles, max_group)?
-                .astype(DType::Float32)?
-                .reshape(&[pairs, latent])?;
+            let d = match self.kq_prefill_indirect_down_gpu(&a_2d, &tl, &arrays[2])? {
+                Some(d) => d,
+                None => {
+                    let a = a_2d.reshape(&[pairs, 1, self.moe.ff as i64])?;
+                    arrays[2]
+                        .gather_sorted_nax_bounded(&a, &sorted_slots, y_tiles, max_group)?
+                        .astype(DType::Float32)?
+                        .reshape(&[pairs, latent])?
+                }
+            };
             if let Some(out) = Self::kq_sorted_combine_arr(&d, gpu_weights, &inv)? {
                 return Ok(out);
             }
