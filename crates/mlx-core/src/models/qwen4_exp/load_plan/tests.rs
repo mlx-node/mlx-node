@@ -553,18 +553,36 @@ fn flash_next_pool_block_is_the_priced_page() {
     }
 }
 
-/// Unset `kvFormat` is int8 where the int8 page kernels serve the head
-/// (128, 256) and bf16 elsewhere; an explicit int8 they cannot serve and an
-/// unknown format fail. Mutation D2: unset resolves to bf16 → red.
+/// Unset `kvFormat` is int8 on Metal where the int8 page kernels serve the head
+/// (128, 256) and bf16 elsewhere (including all non-Metal/CUDA backends); an
+/// explicit int8 they cannot serve and an unknown format fail.
 #[test]
 fn flash_next_kv_format_defaults_to_int8_where_pages_serve() {
     let mut c = flash_next_config();
-    assert_eq!(resolve_kv_format("Q", None, &c).unwrap(), KvFormat::Int8);
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", None, &c, true).unwrap(),
+        KvFormat::Int8
+    );
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", None, &c, false).unwrap(),
+        KvFormat::Bf16
+    );
+    assert!(resolve_kv_format_for_metal("Q", Some("int8"), &c, false).is_err());
     c.head_dim = 128;
-    assert_eq!(resolve_kv_format("Q", None, &c).unwrap(), KvFormat::Int8);
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", None, &c, true).unwrap(),
+        KvFormat::Int8
+    );
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", None, &c, false).unwrap(),
+        KvFormat::Bf16
+    );
     c.head_dim = 32;
-    assert_eq!(resolve_kv_format("Q", None, &c).unwrap(), KvFormat::Bf16);
-    let error = resolve_kv_format("Q", Some("int8"), &c).unwrap_err();
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", None, &c, true).unwrap(),
+        KvFormat::Bf16
+    );
+    let error = resolve_kv_format_for_metal("Q", Some("int8"), &c, true).unwrap_err();
     assert!(
         error
             .reason
@@ -572,6 +590,10 @@ fn flash_next_kv_format_defaults_to_int8_where_pages_serve() {
         "{error}"
     );
     c.head_dim = 256;
+    assert_eq!(
+        resolve_kv_format_for_metal("Q", Some("bf16"), &c, true).unwrap(),
+        KvFormat::Bf16
+    );
     assert_eq!(
         resolve_kv_format("Q", Some("bf16"), &c).unwrap(),
         KvFormat::Bf16

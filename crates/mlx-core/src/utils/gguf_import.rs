@@ -2350,7 +2350,17 @@ mod tests {
         .unwrap();
         assert_maps_equal(&raw.map, &oracle(&fx, &plan), "staged read");
         let n = every_type_specs().len();
-        let want_gpu = if gpu { GPU_SPECS } else { 0 };
+        let want_gpu = if gpu_repack_available() {
+            every_type_specs()
+                .iter()
+                .filter(|(_, _, ty)| gpu_kind_for(*ty).is_some())
+                .count()
+        } else {
+            0
+        };
+        if gpu {
+            assert_eq!(want_gpu, GPU_SPECS);
+        }
         assert_eq!(
             (raw.stats.gpu_tensors, raw.stats.cpu_tensors),
             (want_gpu, n - want_gpu),

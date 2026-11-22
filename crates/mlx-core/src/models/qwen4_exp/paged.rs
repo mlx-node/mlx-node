@@ -254,6 +254,13 @@ impl PagedBackend for Inner {
             self.decoder.reset();
             self.saved_history.clear();
         }
+        if self.decoder.paged.is_none() {
+            let cached = if warm { self.decoder.history.len() } else { 0 };
+            return Ok(Prefix {
+                cached,
+                suffix: tokens.len() - cached,
+            });
+        }
         // Token ids do not identify an image: an image row neither resumes
         // nor publishes, and keeps the plain window walk.
         let text =
@@ -1389,11 +1396,9 @@ impl HybridSchedulerBackend for Inner {
     }
     fn activate_paged_seq(&mut self, seq: SeqId) -> Result<()> {
         self.activate_row(seq)?;
-        let adapter = self
-            .decoder
-            .paged
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("Qwen4 paged cache unavailable"))?;
+        let Some(adapter) = self.decoder.paged.as_mut() else {
+            return Ok(());
+        };
         if adapter.block_table_for(seq).is_some() {
             adapter.activate_request(seq)
         } else {

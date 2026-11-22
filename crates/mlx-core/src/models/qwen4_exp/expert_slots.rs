@@ -2,10 +2,13 @@
 //! mutated only after their last lazy reader has completed. The ordinary LRU
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
-use crate::array::alloc::{OutLayout, SendPtr};
+use crate::array::alloc::{DstPtrs, OutLayout, SendPtr};
+#[cfg(target_os = "macos")]
 use crate::array::purgeable::PurgeableBank;
+use crate::utils::gguf_cpu_repack::{cpu_kquant_band_into, decode_affine_band_into};
 use crate::utils::gguf_gpu::{
-    GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available, gpu_repack_band,
+    GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available,
+    gpu_repack_band, gpu_repack_supports_kind,
 };
 use crate::utils::gguf_read::{
     ALIGN, Batch, PageCacheMode, READ_THREADS, ReadQueue, Reader, ReaderPool, Span, plan_ranges,
@@ -15,6 +18,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Whether this host supports GPU-resident direct expert banks (Metal and CUDA
+/// both use GPU repack kernels for `Q4_K`, `Q5_K`, `Q5_1`, `Q8_0Bias`, falling
+/// back to parallel CPU repack only if GPU repack is unavailable).
+pub(in super::super) fn direct_residency_available() -> bool {
+    crate::engine::persistence::compiled_forward_backend_available()
+        || crate::accelerator::host_has_cuda()
+}
+
+/// Owns the aligned staging allocation backing one read slot (kept alive until drop).
+#[allow(dead_code)]
+enum StagingOwner {
+    #[cfg(target_os = "macos")]
+    Purgeable(PurgeableBank),
+    #[cfg(not(target_os = "macos"))]
+    Array(MxArray),
+}
 
 const DIRECT_READ_BYTES: usize = 8 << 20;
 const DIRECT_STAGING_SLOTS: usize = 4;
@@ -55,16 +75,23 @@ pub(super) struct ExpertSlots {
 
 impl Weight {
     #[cfg(not(target_os = "macos"))]
-    fn empty_slots(&self, capacity: usize) -> Result<Self> {
-        let allocate = |a: &MxArray| {
+    fn empty_slots(&self, capacity: usize, prefer_cuda_gpu: bool) -> Result<Self> {
+        let allocate = |a: &MxArray| -> Result<MxArray> {
             let shape = a.shape()?;
-            MxArray::zeros(&[shape[0] * capacity as i64, shape[1]], Some(a.dtype()?))
+            let dims = [shape[0] * capacity as i64, shape[1]];
+            let dtype = a.dtype()?;
+            if prefer_cuda_gpu && let Some(array) = MxArray::alloc_gpu_uninit(&dims, dtype)? {
+                return Ok(array);
+            }
+            let (array, _, _) = MxArray::alloc_uninit(&dims, dtype)?;
+            Ok(array)
         };
         Ok(Self {
             values: allocate(&self.values)?,
             dense_bf16: None,
             scales: self.scales.as_ref().map(allocate).transpose()?,
             biases: self.biases.as_ref().map(allocate).transpose()?,
+            qlinear: None,
             ..self.clone()
         })
     }
@@ -81,6 +108,7 @@ impl Weight {
             dense_bf16: None,
             scales: self.scales.as_ref().map(allocate).transpose()?,
             biases: self.biases.as_ref().map(allocate).transpose()?,
+            qlinear: None,
             ..self.clone()
         })
     }
@@ -129,6 +157,8 @@ impl Tensor {
             group,
             bits,
             mode: mode.into(),
+            q8_symmetric_128: ty == GgufTensorType::Q8_0,
+            qlinear: None,
         })
     }
 }
@@ -280,7 +310,7 @@ impl DirectRun<'_> {
         }
         let mut pending: Vec<MxArray> = Vec::new();
         for w in 0..n {
-            if w > 0 {
+            if w > 0 && !pending.is_empty() {
                 self.complete(w - 1, &std::mem::take(&mut pending))?;
             }
             // Batch `next` reads into the buffer batch `w - 1` repacked
@@ -291,10 +321,15 @@ impl DirectRun<'_> {
             }
             self.wait(w)?;
             pending = self.batch(w)?;
-            let refs: Vec<&MxArray> = pending.iter().collect();
-            MxArray::async_eval_arrays(&refs);
+            if !pending.is_empty() {
+                let refs: Vec<&MxArray> = pending.iter().collect();
+                MxArray::async_eval_arrays(&refs);
+            }
         }
-        self.complete(n - 1, &pending)
+        if !pending.is_empty() {
+            self.complete(n - 1, &pending)?;
+        }
+        Ok(())
     }
 
     fn wait(&self, w: usize) -> Result<()> {
@@ -322,6 +357,14 @@ impl DirectRun<'_> {
     }
 
     fn batch(&mut self, w: usize) -> Result<Vec<MxArray>> {
+        if !gpu_repack_available()
+            || self.batches[w]
+                .bands
+                .iter()
+                .any(|b| !gpu_repack_supports_kind(self.requests[b.tensor].kind))
+        {
+            return self.cpu_repack_batch(w);
+        }
         let (staging, _) = &self.staging[w % self.staging.len()];
         let mut outputs = Vec::new();
         for band in &self.batches[w].bands {
@@ -369,6 +412,191 @@ impl DirectRun<'_> {
             self.slots.banks[request.part] = Arc::new(weight);
         }
         Ok(outputs)
+    }
+
+    /// Parallel CPU repack fallback for non-Metal hosts (Windows CUDA Phase 0;
+    /// Phase 2 hook point: once CUDA GPU repack kernels implement
+    /// `gpu_repack_band`, `gpu_repack_available()` routes `batch()` there).
+    fn cpu_repack_batch(&mut self, w: usize) -> Result<Vec<MxArray>> {
+        const STRIPE_ROWS: usize = 64;
+        struct StripeJob {
+            name: String,
+            kind: GpuRepackKind,
+            k: usize,
+            row0: usize,
+            rows: usize,
+            src: SendPtr<u8>,
+            src_len: usize,
+            dst: DstPtrs,
+        }
+
+        // Ensure no prior GPU kernel is still reading partial-slot banks
+        // before overwriting their managed/unified storage from CPU threads.
+        crate::array::memory::synchronize();
+
+        let (_, staging_ptr) = &self.staging[w % self.staging.len()];
+        let batch = &self.batches[w];
+        let mut bank_ptrs: [Option<DstPtrs>; 3] = [None, None, None];
+        let mut jobs = Vec::with_capacity(batch.bands.len());
+
+        for band in &batch.bands {
+            let request = &self.requests[band.tensor];
+            let part = request.part;
+            let dst = match bank_ptrs[part] {
+                Some(ptrs) => ptrs,
+                None => {
+                    let ptrs = bank_dst_ptrs(&self.slots.banks[part], request.k)?;
+                    bank_ptrs[part] = Some(ptrs);
+                    ptrs
+                }
+            };
+            let base_row0 = request
+                .slot
+                .checked_mul(request.rows)
+                .and_then(|row| row.checked_add(band.row0))
+                .ok_or_else(|| err("Qwen4 direct GGUF destination row overflow"))?;
+            let ty = request.kind.gguf_type();
+            let block_values = ty.block_size();
+            if request.k == 0 || !request.k.is_multiple_of(block_values) {
+                return Err(err(format!(
+                    "Qwen4 direct GGUF {} row width {} is not a multiple of {}",
+                    self.slots.names[part], request.k, block_values
+                )));
+            }
+            let row_bytes = (request.k / block_values) * ty.type_size();
+            if band.bytes != band.rows * row_bytes
+                || band.src_off.saturating_add(band.bytes) > batch.len
+            {
+                return Err(err(format!(
+                    "Qwen4 direct GGUF {} band byte length {} mismatches {} rows x {} B",
+                    self.slots.names[part], band.bytes, band.rows, row_bytes
+                )));
+            }
+            let mut done = 0usize;
+            while done < band.rows {
+                let take = STRIPE_ROWS.min(band.rows - done);
+                let byte_off = band.src_off + done * row_bytes;
+                let byte_len = take * row_bytes;
+                jobs.push(StripeJob {
+                    name: self.slots.names[part].clone(),
+                    kind: request.kind,
+                    k: request.k,
+                    row0: base_row0 + done,
+                    rows: take,
+                    src: SendPtr(staging_ptr.0.wrapping_add(byte_off)),
+                    src_len: byte_len,
+                    dst,
+                });
+                done += take;
+            }
+        }
+
+        let run_job = |job: &StripeJob| -> Result<()> {
+            // SAFETY: `staging_ptr` stays alive and immutable while `batch`
+            // runs; `byte_off + byte_len <= batch.len` was checked above.
+            let src = unsafe { std::slice::from_raw_parts(job.src.0, job.src_len) };
+            if job.kind.is_kquant() {
+                let info = GgufTensorInfo {
+                    name: job.name.clone(),
+                    n_dims: 2,
+                    dims: vec![job.k as u64, job.dst.rows as u64],
+                    tensor_type: job.kind.gguf_type(),
+                    offset: 0,
+                };
+                cpu_kquant_band_into(&info, src, job.row0, job.rows, &job.dst)
+            } else if job.kind == GpuRepackKind::Q8_0Bias {
+                let scales_dst = job
+                    .dst
+                    .scales
+                    .ok_or_else(|| err("Qwen4 Q8_0 direct bank missing scales"))?;
+                let biases_dst = job
+                    .dst
+                    .biases
+                    .ok_or_else(|| err("Qwen4 Q8_0 direct bank missing biases"))?;
+                let affine_dst = DstPtrs {
+                    biases: None,
+                    ..job.dst
+                };
+                decode_affine_band_into(
+                    GgufTensorType::Q8_0,
+                    src,
+                    job.row0,
+                    job.rows,
+                    job.k,
+                    &affine_dst,
+                )?;
+                let per_row = job.k / 32;
+                let first = job.row0 * per_row;
+                let count = job.rows * per_row;
+                // SAFETY: `scales_dst` and `biases_dst` hold
+                // `job.dst.rows * per_row` f16 values; `[first, first + count)`
+                // belongs exclusively to this stripe.
+                unsafe {
+                    let scales =
+                        std::slice::from_raw_parts(scales_dst.0.cast::<u16>().add(first), count);
+                    let biases = std::slice::from_raw_parts_mut(
+                        biases_dst.0.cast::<u16>().add(first),
+                        count,
+                    );
+                    for (bias, &scale) in biases.iter_mut().zip(scales) {
+                        *bias = half::f16::from_f32(half::f16::from_bits(scale).to_f32() * -128.0)
+                            .to_bits();
+                    }
+                }
+                Ok(())
+            } else {
+                decode_affine_band_into(
+                    job.kind.gguf_type(),
+                    src,
+                    job.row0,
+                    job.rows,
+                    job.k,
+                    &job.dst,
+                )
+            }
+        };
+
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(jobs.len());
+        if workers <= 1 {
+            for job in &jobs {
+                run_job(job)?;
+            }
+        } else {
+            let next = AtomicUsize::new(0);
+            let failed = AtomicBool::new(false);
+            let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        while !failed.load(Ordering::Acquire) {
+                            let idx = next.fetch_add(1, Ordering::AcqRel);
+                            let Some(job) = jobs.get(idx) else {
+                                break;
+                            };
+                            if let Err(error) = run_job(job) {
+                                failed.store(true, Ordering::Release);
+                                if let Ok(mut slot) = first_err.lock()
+                                    && slot.is_none()
+                                {
+                                    *slot = Some(error);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(error) = first_err
+                .into_inner()
+                .map_err(|_| err("Qwen4 direct GGUF repack worker panicked"))?
+            {
+                return Err(error);
+            }
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -607,9 +835,43 @@ fn direct_requests(
     Ok((requests, infos, stats))
 }
 
+/// Extract writable destination pointers for a settled expert bank allocated
+/// via `MxArray::alloc_uninit` (non-Metal direct residency).
+fn bank_dst_ptrs(bank: &Weight, k: usize) -> Result<DstPtrs> {
+    let rows = bank.values.shape_at(0)? as usize;
+    let ptr_of = |a: &MxArray, label: &str| -> Result<SendPtr<u8>> {
+        // SAFETY: `a` is a live `MxArray` handle; `mlx_array_data_ptr` returns
+        // its settled storage pointer or null.
+        let p = unsafe { mlx_sys::mlx_array_data_ptr(a.as_raw_ptr()) };
+        if p.is_null() {
+            return Err(err(format!(
+                "Qwen4 direct expert bank {label} has no settled storage"
+            )));
+        }
+        Ok(SendPtr(p.cast_mut().cast::<u8>()))
+    };
+    Ok(DstPtrs {
+        weight: ptr_of(&bank.values, "weight")?,
+        scales: bank
+            .scales
+            .as_ref()
+            .map(|a| ptr_of(a, "scales"))
+            .transpose()?,
+        biases: bank
+            .biases
+            .as_ref()
+            .map(|a| ptr_of(a, "biases"))
+            .transpose()?,
+        rows,
+        k,
+        layout: OutLayout::RowMajor,
+    })
+}
+
 /// One aligned staging buffer of `len` bytes: its owner, the array the
 /// repack reads and the pointer the readers write.
-fn staging_buffer(len: usize) -> Result<(PurgeableBank, MxArray, SendPtr<u8>)> {
+#[cfg(target_os = "macos")]
+fn staging_buffer(len: usize) -> Result<(StagingOwner, MxArray, SendPtr<u8>)> {
     let allocation = len
         .checked_add(ALIGN as usize)
         .ok_or_else(|| err("Qwen4 direct GGUF staging size overflows usize"))?;
@@ -623,7 +885,32 @@ fn staging_buffer(len: usize) -> Result<(PurgeableBank, MxArray, SendPtr<u8>)> {
     if !(ptr.0 as usize).is_multiple_of(ALIGN as usize) {
         return Err(err("Qwen4 direct GGUF staging is not 16 KiB aligned"));
     }
-    Ok((bank, array, ptr))
+    Ok((StagingOwner::Purgeable(bank), array, ptr))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn staging_buffer(len: usize) -> Result<(StagingOwner, MxArray, SendPtr<u8>)> {
+    let allocation = len
+        .checked_add(ALIGN as usize)
+        .ok_or_else(|| err("Qwen4 direct GGUF staging size overflows usize"))?;
+    let (backing, base, _) = MxArray::alloc_uninit(&[allocation as i64], DType::Uint8)?;
+    let padding = (ALIGN as usize - (base.0 as usize % ALIGN as usize)) % ALIGN as usize;
+    let array = backing.slice_axis(0, padding as i64, (padding + len) as i64)?;
+    // Settle the zero-copy view before reader threads write into `ptr` so the
+    // slice offset is validated upfront by `mlx_gguf_repack_band` and never
+    // races with host staging writes.
+    array.eval();
+    let ptr = SendPtr(base.0.wrapping_add(padding));
+    if !(ptr.0 as usize).is_multiple_of(ALIGN as usize) {
+        return Err(err("Qwen4 direct GGUF staging is not 16 KiB aligned"));
+    }
+    let settled = unsafe { mlx_sys::mlx_array_data_ptr(array.as_raw_ptr()) };
+    if settled != ptr.0.cast() {
+        return Err(err(
+            "Qwen4 direct GGUF staging view did not share its backing buffer",
+        ));
+    }
+    Ok((StagingOwner::Array(backing), array, ptr))
 }
 
 /// The whole-store fill of selected slots through its own bounded reader
@@ -708,7 +995,7 @@ fn fill_direct(
 pub(super) struct SlotFill {
     pool: ReaderPool,
     files: Vec<Arc<File>>,
-    ring: Vec<(PurgeableBank, MxArray, SendPtr<u8>)>,
+    ring: Vec<(StagingOwner, MxArray, SendPtr<u8>)>,
     batch_bytes: usize,
 }
 
@@ -1090,7 +1377,7 @@ impl Store {
             + crate::array::memory::get_cache_memory()) as u64;
         if !self.gguf
             || experts == 0
-            || !crate::engine::persistence::compiled_forward_backend_available()
+            || !direct_residency_available()
             || !self.slots.is_empty()
             || !self.banks.is_empty()
             || self.plan.direct
@@ -1829,7 +2116,7 @@ impl Store {
         self.gguf
             && !self.plan.direct
             && self.slot_capacity.is_some_and(|slots| slots > 0)
-            && crate::engine::persistence::compiled_forward_backend_available()
+            && direct_residency_available()
     }
 
     #[cfg(test)]
@@ -1886,7 +2173,7 @@ impl Store {
         if self.full_residency() {
             return Ok(experts);
         }
-        if !self.gguf || !crate::engine::persistence::compiled_forward_backend_available() {
+        if !self.gguf || !direct_residency_available() {
             return Ok(0);
         }
         if let Some(n) = self.slot_capacity {
@@ -2025,7 +2312,8 @@ impl Store {
         if !self.direct_gguf {
             return false;
         }
-        if !gpu_repack_available() {
+        let gpu_repack = gpu_repack_available();
+        if !gpu_repack && !crate::accelerator::host_has_cuda() {
             return false;
         }
         let Some(source) = &self.gguf_source else {
@@ -2036,9 +2324,10 @@ impl Store {
                 source.has_path(&tensor.path)
                     && tensor.direct_kind().is_some_and(|(_, kind)| {
                         let rule = band_offset_rule(kind) as u64;
-                        tensor.offset.is_multiple_of(rule)
+                        (!gpu_repack || tensor.offset.is_multiple_of(rule))
                             && tensor.row_bytes().is_ok_and(|n| {
-                                n <= DIRECT_READ_BYTES as u64 && n.is_multiple_of(rule)
+                                n <= DIRECT_READ_BYTES as u64
+                                    && (!gpu_repack || n.is_multiple_of(rule))
                             })
                     })
             })
@@ -2112,10 +2401,19 @@ impl Store {
             banks
         };
         #[cfg(not(target_os = "macos"))]
+        let prefer_cuda_gpu = crate::accelerator::cuda_ops_available()
+            && gpu_repack_available()
+            && names.iter().all(|name| {
+                self.descriptor(name)
+                    .ok()
+                    .and_then(|d| d.direct_kind())
+                    .is_some_and(|(_, kind)| gpu_repack_supports_kind(kind))
+            });
+        #[cfg(not(target_os = "macos"))]
         let banks = [
-            Arc::new(prototypes[0].empty_slots(capacity)?),
-            Arc::new(prototypes[1].empty_slots(capacity)?),
-            Arc::new(prototypes[2].empty_slots(capacity)?),
+            Arc::new(prototypes[0].empty_slots(capacity, prefer_cuda_gpu)?),
+            Arc::new(prototypes[1].empty_slots(capacity, prefer_cuda_gpu)?),
+            Arc::new(prototypes[2].empty_slots(capacity, prefer_cuda_gpu)?),
         ];
         self.slot_bytes += bytes;
         self.cache_bytes += bytes;
@@ -2782,6 +3080,8 @@ mod tests {
             group: 0,
             bits: 0,
             mode: String::new(),
+            q8_symmetric_128: false,
+            qlinear: None,
         });
         for (layer, mapping) in [vec![Some(0)], vec![None, Some(2)]].into_iter().enumerate() {
             store.slots.insert(
@@ -2822,6 +3122,8 @@ mod tests {
             group: 0,
             bits: 0,
             mode: String::new(),
+            q8_symmetric_128: false,
+            qlinear: None,
         });
         store.slots.insert(
             0,
@@ -3085,6 +3387,8 @@ mod tests {
                     group: 32,
                     bits: 8,
                     mode: "affine".into(),
+                    q8_symmetric_128: false,
+                    qlinear: None,
                 }),
             );
         }

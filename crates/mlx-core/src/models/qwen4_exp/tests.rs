@@ -3759,6 +3759,8 @@ fn fused_routed_experts_preserve_mixed_formats_and_changing_inputs() {
                             "q5k"
                         }
                         .into(),
+                        q8_symmetric_128: false,
+                        qlinear: None,
                     })
                 };
                 let banks = [
@@ -3943,6 +3945,8 @@ fn kquant_nax_gathers_match_dequantized_experts_with_tail_tiles() {
             group: group as i32,
             bits: bits as i32,
             mode: mode.into(),
+            q8_symmetric_128: false,
+            qlinear: None,
         };
         let w = weight
             .values
@@ -3971,6 +3975,7 @@ fn kquant_nax_gathers_match_dequantized_experts_with_tail_tiles() {
                 values: reshape(&weight.values),
                 scales: weight.scales.as_ref().map(reshape),
                 biases: weight.biases.as_ref().map(reshape),
+                qlinear: None,
                 ..weight.clone()
             };
             let ids = MxArray::from_uint32(&[2, 1, 0, 2, 1, 0, 2, 0, 0, 1], &[10]).unwrap();
@@ -4208,6 +4213,8 @@ fn expert_aligned_prefill_preserves_quantized_projections_and_tile_tails() {
             group: 32,
             bits: bits as i32,
             mode: mode.into(),
+            q8_symmetric_128: false,
+            qlinear: None,
         };
         let x = MxArray::from_float32(
             &(0..rows * k)
@@ -5522,6 +5529,8 @@ fn quantized_expert_bank(
         } else {
             format!("q{bits}k")
         },
+        q8_symmetric_128: false,
+        qlinear: None,
     })
 }
 
@@ -5918,6 +5927,7 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
                     values: take(&w.values),
                     scales: w.scales.as_ref().map(take),
                     biases: w.biases.as_ref().map(take),
+                    qlinear: None,
                     ..w.clone()
                 })
             };
@@ -8044,6 +8054,8 @@ fn q8_bank(n: usize, k: usize, next: &mut impl FnMut() -> u32) -> weights::Weigh
         group: 32,
         bits: 8,
         mode: "affine".into(),
+        q8_symmetric_128: false,
+        qlinear: None,
     }
 }
 
@@ -8095,6 +8107,8 @@ fn expert_banks(
                 "q5k"
             }
             .into(),
+            q8_symmetric_128: false,
+            qlinear: None,
         })
     };
     (
@@ -9973,4 +9987,1699 @@ fn load_refuses_tokenizers_that_lose_the_tags() {
     }
     let error = check_tokenizer_tags(&tag_tokenizer(&[("<|im_end|>", 5)])).unwrap_err();
     assert!(error.reason.contains("<|im_end|>"), "{}", error.reason);
+}
+
+#[test]
+fn cuda_phase0_memory_planning_and_direct_residency_on_102gib_host() {
+    use crate::engine::memory_plan::{LiveMemory, Margin, StreamedPart};
+    use crate::models::qwen4_exp::load_plan::{
+        DraftPrice, LoadInventory, host_margin, plan_engine_with_margin, plan_store_with_margin,
+        resolve_kv_format, row_cache_share,
+    };
+    use crate::transformer::KvFormat;
+
+    let mut c = memory::flash_next_config();
+
+    if crate::accelerator::host_has_cuda() {
+        let live = memory::live_memory().expect("CUDA live_memory must succeed");
+        assert!(live.working_set_bytes > 0, "working_set_bytes must be > 0");
+        let host = memory::host_memory().expect("host_memory must succeed on Windows CUDA");
+        assert!(host.physical > 0);
+        assert!(host.available() > 0 && host.available() <= host.physical);
+        assert_eq!(
+            crate::utils::host::physical_memory().unwrap(),
+            host.physical
+        );
+        if crate::accelerator::caps().is_unified_memory {
+            assert_eq!(host_margin(), Margin::Ledger);
+        }
+    }
+
+    if !crate::accelerator::host_has_metal() {
+        assert_eq!(
+            resolve_kv_format("Qwen4Exp", None, &c).unwrap(),
+            KvFormat::Bf16
+        );
+        assert!(resolve_kv_format("Qwen4Exp", Some("int8"), &c).is_err());
+    }
+
+    // Simulated RTX Spark N1X: 102.03 GiB unified CUDA working set with
+    // Flash-Next 78.03 GiB routed experts (48 layers x 512 experts) + 4.74 GiB fixed.
+    const MIB: u64 = 1 << 20;
+    const N1X_WORKING_SET: u64 = 109_553_909_760;
+    const FLASH_NEXT_ROUTED_78G: u64 = 83_784_073_216;
+    const FLASH_NEXT_FIXED_4_74G: u64 = 5_089_536_000;
+
+    c.kv_format = KvFormat::Bf16;
+    let inventory = LoadInventory {
+        store_fixed_bytes: FLASH_NEXT_FIXED_4_74G,
+        vision_bytes: 0,
+        experts: StreamedPart {
+            all: FLASH_NEXT_ROUTED_78G,
+            minimum: 10 * (FLASH_NEXT_ROUTED_78G + FLASH_NEXT_ROUTED_78G / 48) / 512,
+        },
+        rows: row_cache_share(&c, 6 * 64 * MIB),
+    };
+    let live = LiveMemory {
+        working_set_bytes: N1X_WORKING_SET,
+        active_bytes: 0,
+        registered_pool_bytes: 0,
+    };
+    let decision = plan_store_with_margin(
+        "Qwen4Exp",
+        &c,
+        &inventory,
+        live,
+        None,
+        None,
+        false,
+        false,
+        DraftPrice::default(),
+        Margin::Ledger,
+    )
+    .expect("102 GiB N1X must admit Flash-Next store plan");
+    assert!(
+        decision.store.whole,
+        "102 GiB N1X must admit whole direct store (got cap={} vs all={})",
+        decision.store.expert_cap_bytes, FLASH_NEXT_ROUTED_78G
+    );
+    assert_eq!(
+        decision.store.expert_cap_bytes, FLASH_NEXT_ROUTED_78G,
+        "102 GiB N1X must admit 100% direct expert residency (got {} vs {})",
+        decision.store.expert_cap_bytes, FLASH_NEXT_ROUTED_78G
+    );
+    let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
+    let plan = plan_engine_with_margin(
+        "Qwen4Exp",
+        &c,
+        LiveMemory {
+            active_bytes: FLASH_NEXT_FIXED_4_74G,
+            ..live
+        },
+        held_back,
+        None,
+        false,
+        false,
+        DraftPrice::default(),
+        decision.states,
+        Margin::Ledger,
+    )
+    .expect("102 GiB N1X must admit engine plan with BF16 KV");
+    assert!(plan.pool.unwrap().lane.window.maximum() >= 16_384);
+
+    // Real direct GGUF residency check using the Q5_1 routed-expert fixture.
+    if crate::accelerator::host_has_cuda() || crate::accelerator::host_has_metal() {
+        let _host = memory::scoped_fixture_host();
+        let dir = Temp::new();
+        let gguf = dir.0.join("model.gguf");
+        let config = write_direct_gguf_fixture(&gguf);
+        let store = weights::Store::open_fixture(&gguf, None).unwrap();
+        let mut decoder = decoder::Decoder::new(config, store).unwrap();
+        go_live(&mut decoder, 0);
+        assert!(
+            decoder.weights.plan.direct,
+            "direct residency must be active on GPU host"
+        );
+    }
+}
+
+#[test]
+fn cuda_phase0_flat_kv_end_to_end_prefill_decode_sparse_qsa_and_rollback() {
+    let _host = memory::scoped_fixture_host();
+    let dir = Temp::new();
+    let gguf = dir.0.join("model.gguf");
+    let mut config = write_direct_gguf_fixture(&gguf);
+    // Lower indexer_budget so a 20-token prompt crosses both dense (<=8) and
+    // sparse (>8) QSA paths through `attention_window` -> `qsa_attention_flat`.
+    config.indexer_budget = 8;
+    config.indexer_compress_ratio = 4;
+
+    let make_decoder = |direct: bool| {
+        let store = weights::Store::open_fixture(&gguf, None).unwrap();
+        let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+        assert!(decoder.paged.is_none(), "flat-KV path must have paged=None");
+        if direct {
+            go_live(&mut decoder, 0);
+        } else {
+            decoder.weights.prepare_fixture_hot().unwrap();
+        }
+        decoder
+    };
+
+    let mut fast = make_decoder(true);
+    let mut reference = make_decoder(false);
+    if crate::accelerator::host_has_cuda() || crate::accelerator::host_has_metal() {
+        assert!(fast.weights.plan.direct);
+    }
+
+    let prompt: Vec<u32> = (0..20)
+        .map(|i| (i * 5 + 3) % config.vocab_size as u32)
+        .collect();
+
+    // Windowed flat-KV prefill (dense + sparse QSA + GDN + mHC + direct MoE + PLE).
+    let fast_prefill = fast.prefill_chunk(&prompt, None, true).unwrap();
+    let mut ref_prefill = None;
+    for &tok in &prompt {
+        ref_prefill = Some(reference.step(tok).unwrap());
+    }
+    let ref_prefill = ref_prefill.unwrap();
+    let fp = fast_prefill.to_float32().unwrap();
+    let rp = ref_prefill.to_float32().unwrap();
+    assert_eq!(fp.len(), config.vocab_size);
+    assert!(
+        fp.iter().all(|v| v.is_finite()),
+        "prefill logits must be finite"
+    );
+    let prefill_diff = fp
+        .iter()
+        .zip(rp.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        prefill_diff < 5e-2,
+        "flat-KV prefill (dense+sparse QSA) diverged from token-by-token ref: max diff {prefill_diff}"
+    );
+    assert_eq!(argmax(&fast_prefill), argmax(&ref_prefill));
+
+    // Multi-step flat-KV decode (exercises preallocated growable K/V + index_keys + sparse QSA).
+    let mut next_tok = argmax(&fast_prefill);
+    for step_idx in 0..4 {
+        let f_logits = fast.step(next_tok).unwrap();
+        let r_logits = reference.step(next_tok).unwrap();
+        let fl = f_logits.to_float32().unwrap();
+        let rl = r_logits.to_float32().unwrap();
+        assert!(fl.iter().all(|v| v.is_finite()));
+        let diff = fl
+            .iter()
+            .zip(rl.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff < 5e-2,
+            "decode step {step_idx} diverged from token-by-token ref: max diff {diff}"
+        );
+        assert_eq!(
+            argmax(&f_logits),
+            argmax(&r_logits),
+            "decode step {step_idx} argmax mismatch"
+        );
+        next_tok = argmax(&f_logits);
+    }
+
+    // Speculative verify_chunk + flat-KV rollback via restore_state.
+    let saved_len = fast.history.len();
+    let snap = fast.snapshot();
+    let spec_tokens = [
+        next_tok,
+        (next_tok + 1) % config.vocab_size as u32,
+        (next_tok + 2) % config.vocab_size as u32,
+        (next_tok + 3) % config.vocab_size as u32,
+    ];
+    let (verify_logits, verify_states) = fast.verify_chunk(&spec_tokens).unwrap();
+    assert_eq!(verify_states.len(), spec_tokens.len());
+    assert!(
+        verify_logits
+            .to_float32()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite())
+    );
+    assert_eq!(fast.history.len(), saved_len + spec_tokens.len());
+
+    fast.restore_state(snap);
+    assert_eq!(fast.history.len(), saved_len);
+    let mut checked_full_attn = 0usize;
+    for cache in &fast.caches {
+        let rows = cache.flat_kv_len().unwrap();
+        if rows > 0 {
+            assert_eq!(
+                rows, saved_len,
+                "flat KV rows must roll back on restore_state"
+            );
+            checked_full_attn += 1;
+        }
+    }
+    assert!(
+        checked_full_attn > 0,
+        "at least one full-attention layer must hold flat KV"
+    );
+
+    // Continuing after rollback must match the untouched reference decoder.
+    let after_fast = fast.step(next_tok).unwrap();
+    let after_ref = reference.step(next_tok).unwrap();
+    let diff = after_fast
+        .to_float32()
+        .unwrap()
+        .iter()
+        .zip(after_ref.to_float32().unwrap().iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        diff < 5e-2,
+        "post-rollback decode diverged from reference: max diff {diff}"
+    );
+    assert_eq!(argmax(&after_fast), argmax(&after_ref));
+}
+
+fn build_cuda_full_geometry_fixture() -> (Temp, std::path::PathBuf) {
+    use crate::utils::gguf::{GgufMetaValue, GgufTensorType};
+    use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+
+    // Deterministic xorshift64 helper producing small well-conditioned values.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn f32(&mut self, scale: f32) -> f32 {
+            let u = ((self.next_u64() >> 40) as f32) / ((1u32 << 24) as f32);
+            (u * 2.0 - 1.0) * scale
+        }
+    }
+    let mut rng = Rng(0x2026_022B_CAFE_BABEu64);
+
+    let f32_bytes = |rng: &mut Rng, n: usize, scale: f32, bias: f32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            out.extend_from_slice(&(bias + rng.f32(scale)).to_le_bytes());
+        }
+        out
+    };
+    let bf16_bytes = |rng: &mut Rng, n: usize, scale: f32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            out.extend_from_slice(&half::bf16::from_f32(rng.f32(scale)).to_bits().to_le_bytes());
+        }
+        out
+    };
+    let q8_0_bytes = |rng: &mut Rng, rows: usize, cols: usize, scale: f32| -> Vec<u8> {
+        let blocks = rows * (cols / 32);
+        let mut out = Vec::with_capacity(blocks * 34);
+        for _ in 0..blocks {
+            let d = half::f16::from_f32((rng.f32(0.5).abs() + 0.1) * scale);
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+            for _ in 0..32 {
+                let q = ((rng.next_u64() % 21) as i8) - 10;
+                out.push(q as u8);
+            }
+        }
+        out
+    };
+    let q5_1_bytes = |rng: &mut Rng, rows: usize, cols: usize, scale: f32| -> Vec<u8> {
+        let blocks = rows * (cols / 32);
+        let mut out = Vec::with_capacity(blocks * 24);
+        for _ in 0..blocks {
+            let d = half::f16::from_f32((rng.f32(0.5).abs() + 0.1) * scale);
+            let m = half::f16::from_f32(-16.0 * d.to_f32());
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+            out.extend_from_slice(&m.to_bits().to_le_bytes());
+            out.extend_from_slice(&(rng.next_u64() as u32).to_le_bytes());
+            for _ in 0..16 {
+                out.push(rng.next_u64() as u8);
+            }
+        }
+        out
+    };
+    let q4_k_bytes = |rng: &mut Rng, rows: usize, cols: usize, scale: f32| -> Vec<u8> {
+        let blocks = rows * (cols / 256);
+        let mut out = Vec::with_capacity(blocks * 144);
+        for _ in 0..blocks {
+            let d_val = (rng.f32(0.5).abs() + 0.1) * scale;
+            let d = half::f16::from_f32(d_val);
+            let dmin = half::f16::from_f32(7.5 * d_val);
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+            out.extend_from_slice(&dmin.to_bits().to_le_bytes());
+            for _ in 0..12 {
+                out.push((rng.next_u64() & 0x3F) as u8);
+            }
+            for _ in 0..128 {
+                out.push(rng.next_u64() as u8);
+            }
+        }
+        out
+    };
+    let q5_k_bytes = |rng: &mut Rng, rows: usize, cols: usize, scale: f32| -> Vec<u8> {
+        let blocks = rows * (cols / 256);
+        let mut out = Vec::with_capacity(blocks * 176);
+        for _ in 0..blocks {
+            let d_val = (rng.f32(0.5).abs() + 0.1) * scale;
+            let d = half::f16::from_f32(d_val);
+            let dmin = half::f16::from_f32(15.5 * d_val);
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+            out.extend_from_slice(&dmin.to_bits().to_le_bytes());
+            for _ in 0..12 {
+                out.push((rng.next_u64() & 0x3F) as u8);
+            }
+            for _ in 0..32 {
+                out.push(rng.next_u64() as u8);
+            }
+            for _ in 0..128 {
+                out.push(rng.next_u64() as u8);
+            }
+        }
+        out
+    };
+
+    const H: usize = 2560;
+    const HC: usize = 4;
+    const W: usize = H * HC; // 10240
+    const RANK: usize = 320;
+    const D_FF: usize = 640;
+    const EXPERTS: usize = 16;
+    const TOP_K: usize = 10;
+    const VOCAB: usize = 64;
+    const PLE_HEAD_DIM: usize = 32;
+    const PLE_DIM: usize = PLE_HEAD_DIM * 2; // ngram=3, heads_per_ngram=1 -> 2 heads
+
+    let mut tensors: Vec<(String, Vec<u64>, GgufTensorType, Vec<u8>)> = Vec::new();
+    // Embeddings + output head + final mixer
+    let mut tok_embd = Vec::with_capacity(VOCAB * H * 2);
+    for v_idx in 0..VOCAB {
+        for col in 0..H {
+            let mut val = rng.f32(0.2);
+            if col < 32 {
+                val += 0.15 + 0.01 * ((v_idx % 4) as f32);
+            }
+            tok_embd.extend_from_slice(&half::bf16::from_f32(val).to_bits().to_le_bytes());
+        }
+    }
+    tensors.push((
+        "token_embd.weight".into(),
+        vec![H as u64, VOCAB as u64],
+        GgufTensorType::BF16,
+        tok_embd,
+    ));
+    tensors.push((
+        "output.weight".into(),
+        vec![H as u64, VOCAB as u64],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, VOCAB * H, 0.05),
+    ));
+    tensors.push((
+        "per_layer_token_embd.weight".into(),
+        vec![PLE_HEAD_DIM as u64, 32],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, 32 * PLE_HEAD_DIM, 0.2),
+    ));
+    tensors.push((
+        "output_hc_norm.weight".into(),
+        vec![W as u64],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, W, 0.05, 1.0),
+    ));
+    tensors.push((
+        "output_hc_down.weight".into(),
+        vec![W as u64, RANK as u64],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, RANK, W, 0.001),
+    ));
+    tensors.push((
+        "output_hc_up.weight".into(),
+        vec![RANK as u64, W as u64],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, W, RANK, 0.002),
+    ));
+
+    // Layer 0: PLE + GDN-Sigmoid + MoE (Q4_K gate/up + Q5_1 down + Q8_0 shared)
+    tensors.push((
+        "blk.0.ple_key.weight".into(),
+        vec![PLE_DIM as u64, W as u64],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, W * PLE_DIM, 0.05),
+    ));
+    tensors.push((
+        "blk.0.ple_value.weight".into(),
+        vec![PLE_DIM as u64, H as u64],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, H * PLE_DIM, 0.05),
+    ));
+    for name in [
+        "blk.0.ple_norm_key.weight",
+        "blk.0.ple_norm_query.weight",
+        "blk.0.ple_norm_conv.weight",
+    ] {
+        tensors.push((
+            name.into(),
+            vec![W as u64],
+            GgufTensorType::F32,
+            f32_bytes(&mut rng, W, 0.05, 1.0),
+        ));
+    }
+    tensors.push((
+        "blk.0.ple_conv1d.weight".into(),
+        vec![4, W as u64],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, W * 4, 0.05, 0.0),
+    ));
+    tensors.push((
+        "blk.0.attn_qkv.weight".into(),
+        vec![H as u64, W as u64],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, W, H, 0.002),
+    ));
+    tensors.push((
+        "blk.0.attn_gate.weight".into(),
+        vec![H as u64, 6144],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, 6144, H, 0.002),
+    ));
+    tensors.push((
+        "blk.0.ssm_alpha.weight".into(),
+        vec![H as u64, 48],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, 48 * H, 0.02),
+    ));
+    tensors.push((
+        "blk.0.ssm_beta.weight".into(),
+        vec![H as u64, 48],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, 48 * H, 0.02),
+    ));
+    tensors.push((
+        "blk.0.ssm_out.weight".into(),
+        vec![6144, H as u64],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, H, 6144, 0.001),
+    ));
+    tensors.push((
+        "blk.0.ssm_conv1d.weight".into(),
+        vec![4, W as u64],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, W * 4, 0.05, 0.0),
+    ));
+    tensors.push((
+        "blk.0.ssm_a".into(),
+        vec![48],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 48, 0.2, -0.5),
+    ));
+    tensors.push((
+        "blk.0.ssm_dt.bias".into(),
+        vec![48],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 48, 0.2, -0.2),
+    ));
+    tensors.push((
+        "blk.0.ssm_norm.weight".into(),
+        vec![128],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 128, 0.05, 1.0),
+    ));
+
+    // Layer 1: FullAttn (24/2/256 + QSA 4/128) + MoE (Q5_K gate/up + Q8_0 down + Q8_0 shared)
+    tensors.push((
+        "blk.1.attn_q.weight".into(),
+        vec![H as u64, 12288],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, 12288, H, 0.002),
+    ));
+    tensors.push((
+        "blk.1.attn_k.weight".into(),
+        vec![H as u64, 512],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, 512, H, 0.002),
+    ));
+    tensors.push((
+        "blk.1.attn_v.weight".into(),
+        vec![H as u64, 512],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, 512, H, 0.002),
+    ));
+    tensors.push((
+        "blk.1.attn_output.weight".into(),
+        vec![6144, H as u64],
+        GgufTensorType::Q8_0,
+        q8_0_bytes(&mut rng, H, 6144, 0.001),
+    ));
+    tensors.push((
+        "blk.1.attn_q_norm.weight".into(),
+        vec![256],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 256, 0.05, 1.0),
+    ));
+    tensors.push((
+        "blk.1.attn_k_norm.weight".into(),
+        vec![256],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 256, 0.05, 1.0),
+    ));
+    tensors.push((
+        "blk.1.indexer.q_proj.weight".into(),
+        vec![H as u64, 512],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, 512 * H, 0.02),
+    ));
+    tensors.push((
+        "blk.1.indexer.k_proj.weight".into(),
+        vec![H as u64, 128],
+        GgufTensorType::BF16,
+        bf16_bytes(&mut rng, 128 * H, 0.02),
+    ));
+    tensors.push((
+        "blk.1.indexer.q_norm.weight".into(),
+        vec![128],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 128, 0.05, 1.0),
+    ));
+    tensors.push((
+        "blk.1.indexer.k_norm.weight".into(),
+        vec![128],
+        GgufTensorType::F32,
+        f32_bytes(&mut rng, 128, 0.05, 1.0),
+    ));
+
+    // Per-layer mHC mixers + MoE banks (Layer 0: Q4_K+Q5_1, Layer 1: Q5_K+Q8_0)
+    for layer in 0..2usize {
+        for kind in ["hc_attn", "hc_ffn"] {
+            tensors.push((
+                format!("blk.{layer}.{kind}_norm.weight"),
+                vec![W as u64],
+                GgufTensorType::F32,
+                f32_bytes(&mut rng, W, 0.05, 1.0),
+            ));
+            tensors.push((
+                format!("blk.{layer}.{kind}_down.weight"),
+                vec![W as u64, RANK as u64],
+                GgufTensorType::Q8_0,
+                q8_0_bytes(&mut rng, RANK, W, 0.001),
+            ));
+            tensors.push((
+                format!("blk.{layer}.{kind}_up.weight"),
+                vec![RANK as u64, W as u64],
+                GgufTensorType::Q8_0,
+                q8_0_bytes(&mut rng, W, RANK, 0.002),
+            ));
+            tensors.push((
+                format!("blk.{layer}.{kind}_inject.weight"),
+                vec![W as u64, HC as u64],
+                GgufTensorType::F32,
+                f32_bytes(&mut rng, HC * W, 0.01, 0.0),
+            ));
+        }
+        // Realistic router weights (scale 0.02) with clear top-10 separation so 1-ULP BF16
+        // input differences don't trigger discontinuous top-10 tie-flips on random weights.
+        let mut router = Vec::with_capacity(EXPERTS * H * 2);
+        for e in 0..EXPERTS {
+            for col in 0..H {
+                let mut v = rng.f32(0.02);
+                if col < 32 {
+                    v += if (e + layer * 3) % EXPERTS < TOP_K {
+                        0.08
+                    } else {
+                        -0.08
+                    };
+                }
+                router.extend_from_slice(&half::bf16::from_f32(v).to_bits().to_le_bytes());
+            }
+        }
+        tensors.push((
+            format!("blk.{layer}.ffn_gate_inp.weight"),
+            vec![H as u64, EXPERTS as u64],
+            GgufTensorType::BF16,
+            router,
+        ));
+        if layer == 0 {
+            tensors.push((
+                "blk.0.ffn_gate_exps.weight".into(),
+                vec![H as u64, D_FF as u64, EXPERTS as u64],
+                GgufTensorType::Q4K,
+                q4_k_bytes(&mut rng, EXPERTS * D_FF, H, 0.001),
+            ));
+            tensors.push((
+                "blk.0.ffn_up_exps.weight".into(),
+                vec![H as u64, D_FF as u64, EXPERTS as u64],
+                GgufTensorType::Q4K,
+                q4_k_bytes(&mut rng, EXPERTS * D_FF, H, 0.001),
+            ));
+            tensors.push((
+                "blk.0.ffn_down_exps.weight".into(),
+                vec![D_FF as u64, H as u64, EXPERTS as u64],
+                GgufTensorType::Q5_1,
+                q5_1_bytes(&mut rng, EXPERTS * H, D_FF, 0.001),
+            ));
+        } else {
+            tensors.push((
+                "blk.1.ffn_gate_exps.weight".into(),
+                vec![H as u64, D_FF as u64, EXPERTS as u64],
+                GgufTensorType::Q5K,
+                q5_k_bytes(&mut rng, EXPERTS * D_FF, H, 0.001),
+            ));
+            tensors.push((
+                "blk.1.ffn_up_exps.weight".into(),
+                vec![H as u64, D_FF as u64, EXPERTS as u64],
+                GgufTensorType::Q5K,
+                q5_k_bytes(&mut rng, EXPERTS * D_FF, H, 0.001),
+            ));
+            tensors.push((
+                "blk.1.ffn_down_exps.weight".into(),
+                vec![D_FF as u64, H as u64, EXPERTS as u64],
+                GgufTensorType::Q8_0,
+                q8_0_bytes(&mut rng, EXPERTS * H, D_FF, 0.001),
+            ));
+        }
+        tensors.push((
+            format!("blk.{layer}.ffn_gate_shexp.weight"),
+            vec![H as u64, D_FF as u64],
+            GgufTensorType::Q8_0,
+            q8_0_bytes(&mut rng, D_FF, H, 0.001),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_up_shexp.weight"),
+            vec![H as u64, D_FF as u64],
+            GgufTensorType::Q8_0,
+            q8_0_bytes(&mut rng, D_FF, H, 0.001),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_down_shexp.weight"),
+            vec![D_FF as u64, H as u64],
+            GgufTensorType::Q8_0,
+            q8_0_bytes(&mut rng, H, D_FF, 0.001),
+        ));
+        tensors.push((
+            format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+            vec![H as u64],
+            GgufTensorType::BF16,
+            bf16_bytes(&mut rng, H, 0.02),
+        ));
+    }
+
+    let metadata: Vec<(String, GgufMetaValue)> = vec![
+        (
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen4exp".into()),
+        ),
+        (
+            "qwen4exp.embedding_length".into(),
+            GgufMetaValue::Uint32(H as u32),
+        ),
+        ("qwen4exp.block_count".into(), GgufMetaValue::Uint32(2)),
+        (
+            "qwen4exp.attention.head_count".into(),
+            GgufMetaValue::Uint32(24),
+        ),
+        (
+            "qwen4exp.attention.head_count_kv".into(),
+            GgufMetaValue::Uint32(2),
+        ),
+        (
+            "qwen4exp.attention.key_length".into(),
+            GgufMetaValue::Uint32(256),
+        ),
+        (
+            "qwen4exp.expert_count".into(),
+            GgufMetaValue::Uint32(EXPERTS as u32),
+        ),
+        (
+            "qwen4exp.expert_used_count".into(),
+            GgufMetaValue::Uint32(TOP_K as u32),
+        ),
+        (
+            "qwen4exp.expert_feed_forward_length".into(),
+            GgufMetaValue::Uint32(D_FF as u32),
+        ),
+        (
+            "qwen4exp.expert_shared_feed_forward_length".into(),
+            GgufMetaValue::Uint32(D_FF as u32),
+        ),
+        ("qwen4exp.ssm.group_count".into(), GgufMetaValue::Uint32(16)),
+        (
+            "qwen4exp.ssm.time_step_rank".into(),
+            GgufMetaValue::Uint32(48),
+        ),
+        ("qwen4exp.ssm.state_size".into(), GgufMetaValue::Uint32(128)),
+        (
+            "qwen4exp.ssm.inner_size".into(),
+            GgufMetaValue::Uint32(48 * 128),
+        ),
+        ("qwen4exp.ssm.conv_kernel".into(), GgufMetaValue::Uint32(4)),
+        (
+            "qwen4exp.hyper_connection.count".into(),
+            GgufMetaValue::Uint32(HC as u32),
+        ),
+        (
+            "qwen4exp.hyper_connection.low_rank".into(),
+            GgufMetaValue::Uint32(RANK as u32),
+        ),
+        (
+            "qwen4exp.context_length".into(),
+            GgufMetaValue::Uint32(4096),
+        ),
+        (
+            "qwen4exp.full_attention_interval".into(),
+            GgufMetaValue::Uint32(2),
+        ),
+        (
+            "qwen4exp.attention.indexer.head_count".into(),
+            GgufMetaValue::Uint32(4),
+        ),
+        (
+            "qwen4exp.attention.indexer.key_length".into(),
+            GgufMetaValue::Uint32(128),
+        ),
+        (
+            "qwen4exp.attention.indexer.top_k".into(),
+            GgufMetaValue::Uint32(2048),
+        ),
+        (
+            "qwen4exp.attention.compress_ratios".into(),
+            GgufMetaValue::ArrayU32(vec![0, 4]),
+        ),
+        (
+            "qwen4exp.attention.layer_norm_rms_epsilon".into(),
+            GgufMetaValue::Float32(1e-6),
+        ),
+        (
+            "qwen4exp.rope.dimension_count".into(),
+            GgufMetaValue::Uint32(64),
+        ),
+        (
+            "qwen4exp.rope.freq_base".into(),
+            GgufMetaValue::Float32(1_000_000.0),
+        ),
+        ("qwen4exp.ple.conv_kernel".into(), GgufMetaValue::Uint32(4)),
+        ("qwen4exp.ple.ngram_size".into(), GgufMetaValue::Uint32(3)),
+        (
+            "qwen4exp.ple.heads_per_ngram".into(),
+            GgufMetaValue::Uint32(1),
+        ),
+        ("qwen4exp.ple.eos_token_id".into(), GgufMetaValue::Uint32(1)),
+        (
+            "qwen4exp.ple.layers".into(),
+            GgufMetaValue::ArrayU32(vec![0]),
+        ),
+        (
+            "qwen4exp.ple.layer_multipliers".into(),
+            GgufMetaValue::ArrayU64(vec![1, 7, 13]),
+        ),
+        (
+            "qwen4exp.ple.head_vocab_sizes".into(),
+            GgufMetaValue::ArrayU64(vec![16, 16]),
+        ),
+        (
+            "qwen4exp.ple.head_offsets".into(),
+            GgufMetaValue::ArrayU64(vec![0, 16]),
+        ),
+    ];
+
+    let dir = Temp::new();
+    let gguf_path = dir.0.join("full_geom.gguf");
+    let tensor_refs: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
+        .iter()
+        .map(|(n, d, t, b)| (n.as_str(), d.as_slice(), *t, b.as_slice()))
+        .collect();
+    let meta_refs: Vec<(&str, GgufMetaValue)> = metadata
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    std::fs::write(&gguf_path, build_minimal_gguf(&meta_refs, &tensor_refs)).unwrap();
+    (dir, gguf_path)
+}
+
+#[test]
+fn cuda_phase2b_full_geometry_fast_vs_ref_parity() {
+    use crate::array::DType;
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    const VOCAB: usize = 64;
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn f32(&mut self, scale: f32) -> f32 {
+            let u = ((self.next_u64() >> 40) as f32) * (1.0 / ((1u64 << 24) as f32));
+            (u * 2.0 - 1.0) * scale
+        }
+    }
+    let mut rng = Rng(0x2B00_2026_1121_55AA);
+    let (_dir, gguf_path) = build_cuda_full_geometry_fixture();
+
+    let open_decoder = || {
+        let store = weights::Store::open_fixture(&gguf_path, None).unwrap();
+        let config = gguf::config(&store).unwrap();
+        let mut decoder = decoder::Decoder::new(config, store).unwrap();
+        go_live(&mut decoder, 0);
+        assert!(
+            decoder.weights.plan.direct,
+            "full-geometry CUDA fixture must activate direct GGUF residency"
+        );
+        decoder
+    };
+
+    let mut fast = open_decoder();
+    let mut reference = open_decoder();
+
+    let assert_logits_close = |label: &str, got: &MxArray, want: &MxArray, rel_tol: f32| {
+        let g = got.to_float32().unwrap();
+        let w = want.to_float32().unwrap();
+        assert_eq!(g.len(), w.len(), "{label}: len mismatch");
+        assert!(g.iter().all(|v| v.is_finite()), "{label}: non-finite fast");
+        assert!(w.iter().all(|v| v.is_finite()), "{label}: non-finite ref");
+        let mut max_diff = 0.0f32;
+        let mut max_ref = 0.0f32;
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&a, &b) in g.iter().zip(w.iter()) {
+            let d = (a - b).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            if b.abs() > max_ref {
+                max_ref = b.abs();
+            }
+            diff_sq += f64::from(d) * f64::from(d);
+            ref_sq += f64::from(b) * f64::from(b);
+        }
+        let rel = (diff_sq / (ref_sq + 1e-12)).sqrt() as f32;
+        let norm_max = max_diff / max_ref.max(1.0);
+        eprintln!(
+            "[phase2b-parity] {label}: max_diff={max_diff:.5}, max_ref={max_ref:.3}, norm_max={norm_max:.5}, rel={rel:.5}, argmax=({},{})",
+            argmax(got),
+            argmax(want)
+        );
+        assert!(
+            rel <= rel_tol && norm_max <= rel_tol * 2.0,
+            "{label}: max_diff={max_diff:.5}, max_ref={max_ref:.3}, norm_max={norm_max:.5}, rel={rel:.5} > tol={rel_tol}"
+        );
+        assert_eq!(argmax(got), argmax(want), "{label}: argmax mismatch");
+    };
+
+    // 1. Dense prefill (M = 20 >= 17): exercises ple_gate_conv_cuda, inject_norm_cuda,
+    //    hc_up_mix_cuda, gdn::prepare + prefill_chain_gated_with_gate, qk_norm_rope_kv_store,
+    //    sdpa_prefill_d256, and moe_prefill_cuda (Q4_K+Q5_1 and Q5_K+Q8_0Bias).
+    let prompt: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
+    let fast_pf = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&prompt, None, true)).unwrap();
+    let ref_pf =
+        with_cuda_qwen4_fast(false, || reference.prefill_chunk(&prompt, None, true)).unwrap();
+    assert_logits_close("dense prefill (M=20)", &fast_pf, &ref_pf, 0.02);
+
+    // 2. Multi-step AR decode (M = 1, 4 steps): exercises fused inter-layer inject_norm_cuda,
+    //    hc_down_act_cuda, hc_up_mix_cuda, gdn::fused_step_with_gate, sdpa_causal_few_q1_to_16,
+    //    moe_routed_shared_few_cuda, and ple_gate_conv_cuda.
+    let mut tok = argmax(&ref_pf);
+    for step_idx in 0..4 {
+        let fl = with_cuda_qwen4_fast(true, || fast.step(tok)).unwrap();
+        let rl = with_cuda_qwen4_fast(false, || reference.step(tok)).unwrap();
+        assert_logits_close(&format!("dense decode step {step_idx}"), &fl, &rl, 0.02);
+        tok = argmax(&rl);
+    }
+
+    // 3. Speculative verify_chunk (M = 4) + partial rollback to row 1 + continued decode.
+    let spec = [
+        tok,
+        (tok + 3) % VOCAB as u32,
+        (tok + 7) % VOCAB as u32,
+        (tok + 11) % VOCAB as u32,
+    ];
+    let (fv_logits, fv_states) = with_cuda_qwen4_fast(true, || fast.verify_chunk(&spec)).unwrap();
+    let (rv_logits, rv_states) =
+        with_cuda_qwen4_fast(false, || reference.verify_chunk(&spec)).unwrap();
+    assert_logits_close("dense verify_chunk (M=4)", &fv_logits, &rv_logits, 0.02);
+    fast.restore_state(fv_states[1].clone());
+    reference.restore_state(rv_states[1].clone());
+    let follow = (tok + 17) % VOCAB as u32;
+    let fl_post = with_cuda_qwen4_fast(true, || fast.step(follow)).unwrap();
+    let rl_post = with_cuda_qwen4_fast(false, || reference.step(follow)).unwrap();
+    assert_logits_close("post-rollback decode", &fl_post, &rl_post, 0.02);
+
+    // 4. Sparse QSA (kv_len > 2048): prefill 2068 tokens (1024 + 1024 + 20) into both decoders,
+    //    then test sparse prefill (M=20), sparse AR decode (M=1), and sparse verify (M=4)+rollback!
+    fast.reset();
+    reference.reset();
+    let long_a: Vec<u32> = (0..1024).map(|i| ((i * 11 + 5) % VOCAB) as u32).collect();
+    let long_b: Vec<u32> = (0..1024).map(|i| ((i * 13 + 2) % VOCAB) as u32).collect();
+    let long_c: Vec<u32> = (0..20).map(|i| ((i * 17 + 1) % VOCAB) as u32).collect();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_a, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_b, None, false)).unwrap();
+    let fast_sp_pf =
+        with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_c, None, true)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_a, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_b, None, false)).unwrap();
+    let ref_sp_pf =
+        with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_c, None, true)).unwrap();
+    assert_logits_close(
+        "sparse QSA prefill (kv=2068)",
+        &fast_sp_pf,
+        &ref_sp_pf,
+        0.035,
+    );
+
+    let sp_tok = argmax(&ref_sp_pf);
+    let fl_sp = with_cuda_qwen4_fast(true, || fast.step(sp_tok)).unwrap();
+    let rl_sp = with_cuda_qwen4_fast(false, || reference.step(sp_tok)).unwrap();
+    assert_logits_close("sparse QSA decode (M=1)", &fl_sp, &rl_sp, 0.035);
+
+    let sp_spec = [
+        argmax(&rl_sp),
+        (sp_tok + 1) % VOCAB as u32,
+        (sp_tok + 2) % VOCAB as u32,
+        (sp_tok + 3) % VOCAB as u32,
+    ];
+    let (fsv_logits, fsv_states) =
+        with_cuda_qwen4_fast(true, || fast.verify_chunk(&sp_spec)).unwrap();
+    let (rsv_logits, rsv_states) =
+        with_cuda_qwen4_fast(false, || reference.verify_chunk(&sp_spec)).unwrap();
+    assert_logits_close(
+        "sparse QSA verify_chunk (M=4)",
+        &fsv_logits,
+        &rsv_logits,
+        0.035,
+    );
+    fast.restore_state(fsv_states[2].clone());
+    reference.restore_state(rsv_states[2].clone());
+    let fl_sp_post = with_cuda_qwen4_fast(true, || fast.step(follow)).unwrap();
+    let rl_sp_post = with_cuda_qwen4_fast(false, || reference.step(follow)).unwrap();
+    assert_logits_close(
+        "sparse QSA post-rollback decode",
+        &fl_sp_post,
+        &rl_sp_post,
+        0.035,
+    );
+
+    // 5. Verify kernels::gdn::replay with FP32 beta and tiled_heads = true matches stepwise ref.
+    let s0 = MxArray::from_float32(
+        &(0..48 * 128 * 128)
+            .map(|_| rng.f32(0.05))
+            .collect::<Vec<_>>(),
+        &[1, 48, 128, 128],
+    )
+    .unwrap();
+    let k_bf = MxArray::from_float32(
+        &(0..4 * 16 * 128).map(|_| rng.f32(0.1)).collect::<Vec<_>>(),
+        &[1, 4, 16, 128],
+    )
+    .unwrap()
+    .astype(DType::BFloat16)
+    .unwrap();
+    let v_bf = MxArray::from_float32(
+        &(0..4 * 48 * 128).map(|_| rng.f32(0.1)).collect::<Vec<_>>(),
+        &[1, 4, 48, 128],
+    )
+    .unwrap()
+    .astype(DType::BFloat16)
+    .unwrap();
+    let g_f32 = MxArray::from_float32(
+        &(0..4 * 48)
+            .map(|_| 0.7 + rng.f32(0.2).abs())
+            .collect::<Vec<_>>(),
+        &[1, 4, 48],
+    )
+    .unwrap();
+    let beta_f32 = MxArray::from_float32(
+        &(0..4 * 48)
+            .map(|_| 0.3 + rng.f32(0.2).abs())
+            .collect::<Vec<_>>(),
+        &[1, 4, 48],
+    )
+    .unwrap();
+    for accepted in 1..=4i32 {
+        let replayed =
+            crate::kernels::gdn::replay(&k_bf, &v_bf, &g_f32, &beta_f32, &s0, accepted, true)
+                .unwrap()
+                .expect("CUDA gdn::replay with FP32 beta and tiled_heads=true must admit");
+        let q_zero = MxArray::zeros(&[1, accepted as i64, 16, 128], Some(DType::Float32)).unwrap();
+        let (_, expected) = math::recurrent_sequence(
+            &q_zero,
+            &k_bf
+                .slice_axis(1, 0, accepted as i64)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap(),
+            &v_bf
+                .slice_axis(1, 0, accepted as i64)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap(),
+            &g_f32.slice_axis(1, 0, accepted as i64).unwrap(),
+            &beta_f32.slice_axis(1, 0, accepted as i64).unwrap(),
+            &s0,
+        )
+        .unwrap();
+        let got = replayed.to_float32().unwrap();
+        let want = expected.to_float32().unwrap();
+        let max_diff = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "gdn::replay(FP32 beta, accepted={accepted}) max_diff={max_diff}"
+        );
+    }
+}
+
+#[test]
+fn cuda_phase3a_deferred_gdn_settle_rollback_parity() {
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    const VOCAB: usize = 64;
+    let (_dir, gguf_path) = build_cuda_full_geometry_fixture();
+    let open_decoder = || {
+        let store = weights::Store::open_fixture(&gguf_path, None).unwrap();
+        let config = gguf::config(&store).unwrap();
+        let mut decoder = decoder::Decoder::new(config, store).unwrap();
+        go_live(&mut decoder, 0);
+        assert!(decoder.weights.plan.direct);
+        decoder
+    };
+    let mut fast = open_decoder();
+    let mut reference = open_decoder();
+
+    let assert_rows_close = |label: &str, got: &MxArray, want: &MxArray, rel_tol: f32| {
+        let g = got.to_float32().unwrap();
+        let w = want.to_float32().unwrap();
+        assert_eq!(g.len(), w.len(), "{label}: len mismatch");
+        assert!(g.iter().all(|v| v.is_finite()), "{label}: non-finite fast");
+        let mut max_diff = 0.0f32;
+        let mut max_ref = 0.0f32;
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&a, &b) in g.iter().zip(w.iter()) {
+            let d = (a - b).abs();
+            max_diff = max_diff.max(d);
+            max_ref = max_ref.max(b.abs());
+            diff_sq += f64::from(d) * f64::from(d);
+            ref_sq += f64::from(b) * f64::from(b);
+        }
+        let rel = (diff_sq / (ref_sq + 1e-12)).sqrt() as f32;
+        let norm_max = max_diff / max_ref.max(1.0);
+        let rows = g.len() / VOCAB;
+        eprintln!(
+            "[phase3a-deferred] {label}: rows={rows} max_diff={max_diff:.5} max_ref={max_ref:.3} norm_max={norm_max:.5} rel={rel:.5}"
+        );
+        assert!(
+            rel <= rel_tol && norm_max <= rel_tol * 2.0,
+            "{label}: max_diff={max_diff:.5} norm_max={norm_max:.5} rel={rel:.5} > {rel_tol}"
+        );
+        for r in 0..rows {
+            let ga = g[r * VOCAB..(r + 1) * VOCAB]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            let wa = w[r * VOCAB..(r + 1) * VOCAB]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            if ga != wa {
+                let g_val_wa = g[r * VOCAB + wa];
+                let g_val_ga = g[r * VOCAB + ga];
+                let w_val_wa = w[r * VOCAB + wa];
+                let w_val_ga = w[r * VOCAB + ga];
+                let gap = (w_val_wa - w_val_ga).abs();
+                eprintln!(
+                    "  [row {r} near-tie?] got={ga}({g_val_ga:.4} vs ref {w_val_ga:.4}) want={wa}({g_val_wa:.4} vs ref {w_val_wa:.4}) ref_gap={gap:.5}"
+                );
+                assert!(
+                    gap <= max_diff * 2.0,
+                    "{label} row {r}: real argmax mismatch ({ga} vs {wa}), ref_gap={gap:.5}, max_diff={max_diff:.5}"
+                );
+            }
+        }
+    };
+
+    // 1. Seed both decoders with identical prompt prefill (M = 24).
+    let prompt: Vec<u32> = (0..24).map(|i| ((i * 5 + 1) % VOCAB) as u32).collect();
+    let fp = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&prompt, None, true)).unwrap();
+    let rp = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&prompt, None, true)).unwrap();
+    assert_rows_close("prefill", &fp, &rp, 0.025);
+
+    // 2. Run 4 consecutive deferred verify cycles exercising EVERY rollback case:
+    //    keep = 1 (< conv_hist=3), keep = 2 (< conv_hist=3), keep = 4 (== R), keep = 3 (== conv_hist).
+    let mut tok = argmax(&rp);
+    for (cyc, keep) in [1usize, 2, 4, 3].into_iter().enumerate() {
+        let verify_ids = [
+            tok,
+            (tok + 3 + cyc as u32) % VOCAB as u32,
+            (tok + 7 + cyc as u32) % VOCAB as u32,
+            (tok + 11 + cyc as u32) % VOCAB as u32,
+        ];
+        let (fl, ticket) =
+            with_cuda_qwen4_fast(true, || fast.verify_chunk_deferred(&verify_ids)).unwrap();
+        let (rl, r_states) =
+            with_cuda_qwen4_fast(false, || reference.verify_chunk(&verify_ids)).unwrap();
+        assert_rows_close(
+            &format!("deferred cycle {cyc} (keep={keep})"),
+            &fl,
+            &rl,
+            0.025,
+        );
+        with_cuda_qwen4_fast(true, || fast.commit_deferred_verify(ticket, keep, 4)).unwrap();
+        reference.restore_state(r_states[keep - 1].clone());
+        assert_eq!(fast.history, reference.history, "cycle {cyc} history");
+        tok = (tok + 13 + cyc as u32) % VOCAB as u32;
+    }
+
+    // 3. Explicit settle + verify GDN conv & recurrent state match reference,
+    //    then continue with lazy AR decode steps (`cuda_ar_lazy_logits` + `flush_cuda_ar_step`).
+    with_cuda_qwen4_fast(true, || fast.settle_cuda_pending_gdn()).unwrap();
+    for layer in 0..fast.config.num_hidden_layers {
+        if fast.config.linear(layer) {
+            let (f_conv, f_rec) = fast.caches[layer].gdn_state();
+            let (r_conv, r_rec) = reference.caches[layer].gdn_state();
+            let fc = f_conv.unwrap().to_float32().unwrap();
+            let rc = r_conv.unwrap().to_float32().unwrap();
+            let c_diff = fc
+                .iter()
+                .zip(rc.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(c_diff < 0.05, "layer {layer} conv max_diff={c_diff}");
+            let fs = f_rec.unwrap().to_float32().unwrap();
+            let rs = r_rec.unwrap().to_float32().unwrap();
+            let s_diff = fs
+                .iter()
+                .zip(rs.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(s_diff < 0.05, "layer {layer} recurrent max_diff={s_diff}");
+        }
+    }
+    for step_idx in 0..2 {
+        let fl = with_cuda_qwen4_fast(true, || {
+            fast.cuda_ar_lazy_logits = true;
+            let out = fast.step(tok)?;
+            fast.cuda_ar_lazy_logits = false;
+            let next_tok = out.squeeze(Some(&[1]))?.argmax(-1, None)?;
+            fast.flush_cuda_ar_step(&next_tok, &out, false);
+            next_tok.eval();
+            Ok::<_, Error>(out)
+        })
+        .unwrap();
+        let rl = with_cuda_qwen4_fast(false, || reference.step(tok)).unwrap();
+        assert_rows_close(&format!("post-settle lazy AR {step_idx}"), &fl, &rl, 0.025);
+        tok = argmax(&rl);
+    }
+    with_cuda_qwen4_fast(true, || fast.sync_cuda_pending_states()).unwrap();
+
+    // 4. Unwind without explicit finish: commit deferred verify -> take_state() must settle implicitly!
+    let tail_ids = [
+        tok,
+        (tok + 1) % VOCAB as u32,
+        (tok + 2) % VOCAB as u32,
+        (tok + 3) % VOCAB as u32,
+    ];
+    let (fl_t, ticket_t) =
+        with_cuda_qwen4_fast(true, || fast.verify_chunk_deferred(&tail_ids)).unwrap();
+    let (rl_t, r_states_t) =
+        with_cuda_qwen4_fast(false, || reference.verify_chunk(&tail_ids)).unwrap();
+    assert_rows_close("pre-take_state deferred verify", &fl_t, &rl_t, 0.025);
+    with_cuda_qwen4_fast(true, || fast.commit_deferred_verify(ticket_t, 2, 4)).unwrap();
+    reference.restore_state(r_states_t[1].clone());
+    let snap = with_cuda_qwen4_fast(true, || fast.take_state());
+    let mut restored = open_decoder();
+    restored.restore_state(snap);
+    let follow = (tok + 19) % VOCAB as u32;
+    let fl_r = with_cuda_qwen4_fast(true, || restored.step(follow)).unwrap();
+    let rl_r = with_cuda_qwen4_fast(false, || reference.step(follow)).unwrap();
+    assert_rows_close(
+        "post-take_state implicit settle decode",
+        &fl_r,
+        &rl_r,
+        0.025,
+    );
+
+    // 5. Batched CUDA lookup_rows vs reference lookup_rows (cold + warm + duplicate rows).
+    let rows_query = [3usize, 17, 3, 0, 63, 17, 42, 3];
+    let fast_cold = with_cuda_qwen4_fast(true, || {
+        fast.weights.lookup_rows("token_embd.weight", &rows_query)
+    })
+    .unwrap();
+    let fast_warm = with_cuda_qwen4_fast(true, || {
+        fast.weights.lookup_rows("token_embd.weight", &rows_query)
+    })
+    .unwrap();
+    let ref_rows = with_cuda_qwen4_fast(false, || {
+        reference
+            .weights
+            .lookup_rows("token_embd.weight", &rows_query)
+    })
+    .unwrap();
+    assert_eq!(
+        fast_cold.to_uint16_native().unwrap(),
+        ref_rows.to_uint16_native().unwrap(),
+        "batched CUDA lookup_rows cold must match reference bit-for-bit"
+    );
+    assert_eq!(
+        fast_warm.to_uint16_native().unwrap(),
+        ref_rows.to_uint16_native().unwrap(),
+        "batched CUDA lookup_rows warm must match reference bit-for-bit"
+    );
+}
+
+#[test]
+fn cuda_phase3a_new_kernels_parity() {
+    use crate::array::DType;
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    const W: i64 = 10240;
+    const H: i64 = 2560;
+    // 1. prefill_hc_mix_cuda & stream_mean_cuda
+    for m in [1i64, 4, 17, 64] {
+        let up = MxArray::random_normal(&[1, m, W], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let normed = MxArray::random_normal(&[1, m, W], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+        let got_mix = crate::kernels::qwen4::prefill_hc_mix_cuda(&up, &normed)
+            .unwrap()
+            .expect("prefill_hc_mix_cuda must admit");
+        let want_mix = math::sigmoid_mul(&up, &normed)
+            .unwrap()
+            .reshape(&[1, m, 4, H])
+            .unwrap()
+            .mean(Some(&[-2]), Some(false))
+            .unwrap();
+        let gm = got_mix.to_float32().unwrap();
+        let wm = want_mix.to_float32().unwrap();
+        let max_d = gm
+            .iter()
+            .zip(wm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_d < 0.02, "prefill_hc_mix_cuda m={m} max_d={max_d}");
+
+        let got_mean = crate::kernels::qwen4::stream_mean_cuda(&up)
+            .unwrap()
+            .expect("stream_mean_cuda must admit");
+        let want_mean = up
+            .reshape(&[1, m, 4, H])
+            .unwrap()
+            .mean(Some(&[-2]), Some(false))
+            .unwrap();
+        let gs = got_mean.to_float32().unwrap();
+        let ws = want_mean.to_float32().unwrap();
+        let mean_d = gs
+            .iter()
+            .zip(ws.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(mean_d < 0.02, "stream_mean_cuda m={m} mean_d={mean_d}");
+    }
+
+    // 2. dequant_q8_bf16_cuda across all 3 sidecar dtypes (F16, BF16, F32).
+    let (n, k) = (128i64, 2560i64);
+    let packed_w = MxArray::from_uint32(
+        &(0..(n * (k / 4)) as usize)
+            .map(|i| (i as u32).wrapping_mul(0x9e3779b9).wrapping_add(17))
+            .collect::<Vec<_>>(),
+        &[n, k / 4],
+    )
+    .unwrap();
+    let scales_f32 = MxArray::random_normal(&[n, k / 32], 0.0, 0.01, Some(DType::Float32)).unwrap();
+    let biases_f32 = MxArray::random_normal(&[n, k / 32], 0.0, 0.5, Some(DType::Float32)).unwrap();
+    for sb_dtype in [DType::Float16, DType::BFloat16, DType::Float32] {
+        let sc = scales_f32.astype(sb_dtype).unwrap();
+        let bi = biases_f32.astype(sb_dtype).unwrap();
+        let got = crate::kernels::qwen4::dequant_q8_bf16_cuda(&packed_w, &sc, &bi)
+            .unwrap()
+            .expect("dequant_q8_bf16_cuda must admit");
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let raw_ref = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed_w.as_raw_ptr(),
+                sc.as_raw_ptr(),
+                bi.as_raw_ptr(),
+                32,
+                8,
+                DType::BFloat16 as i32,
+                mode.as_ptr(),
+            )
+        };
+        let want = MxArray::from_handle(raw_ref, "dequant ref").unwrap();
+        let g = got.to_float32().unwrap();
+        let w = want.to_float32().unwrap();
+        let max_d = g
+            .iter()
+            .zip(w.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_rel = g
+            .iter()
+            .zip(w.iter())
+            .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_rel < 0.01,
+            "dequant_q8_bf16_cuda dtype={sb_dtype:?} max_d={max_d} max_rel={max_rel}"
+        );
+    }
+}
+
+#[test]
+fn cuda_phase3b_tree_verify_noncontig_and_sparse_parity() {
+    use crate::models::qwen3_5::verify_tree::VerifyTree;
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    const VOCAB: usize = 64;
+    let (_dir, gguf_path) = build_cuda_full_geometry_fixture();
+    let open_decoder = || {
+        let store = weights::Store::open_fixture(&gguf_path, None).unwrap();
+        let config = gguf::config(&store).unwrap();
+        let mut decoder = decoder::Decoder::new(config, store).unwrap();
+        go_live(&mut decoder, 0);
+        assert!(decoder.weights.plan.direct);
+        decoder
+    };
+    let mut fast = open_decoder();
+    let mut fast_ar = open_decoder();
+    let mut reference = open_decoder();
+
+    let make_tree = |tokens: Vec<u32>, parent: Vec<i32>| -> VerifyTree {
+        let n = tokens.len();
+        let mut depth = vec![0i32; n];
+        let mut mask = vec![1u32; n];
+        let mut conv_taps = Vec::with_capacity(n);
+        let step_back = |idx: i32| -> i32 {
+            if idx >= 0 {
+                parent[idx as usize]
+            } else {
+                idx - 1
+            }
+        };
+        for i in 0..n {
+            if i > 0 {
+                let p = parent[i] as usize;
+                depth[i] = depth[p] + 1;
+                mask[i] = mask[p] | (1u32 << i);
+            }
+            let t3 = i as i32;
+            let t2 = step_back(t3);
+            let t1 = step_back(t2);
+            let t0 = step_back(t1);
+            conv_taps.push([t0, t1, t2, t3]);
+        }
+        VerifyTree {
+            tokens,
+            parent,
+            depth,
+            ancestors_mask: mask,
+            conv_taps,
+            draft_probs: vec![1.0; n],
+            estimates: vec![1.0; n],
+            caps: vec![1.0; n],
+            on_chain: vec![false; n],
+        }
+    };
+
+    let assert_row_close = |label: &str, got: &[f32], want: &[f32], rel_tol: f32| {
+        assert_eq!(got.len(), want.len(), "{label}: len mismatch");
+        assert!(got.iter().all(|v| v.is_finite()), "{label}: non-finite");
+        let mut max_diff = 0.0f32;
+        let mut max_ref = 0.0f32;
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&a, &b) in got.iter().zip(want.iter()) {
+            let d = (a - b).abs();
+            max_diff = max_diff.max(d);
+            max_ref = max_ref.max(b.abs());
+            diff_sq += f64::from(d) * f64::from(d);
+            ref_sq += f64::from(b) * f64::from(b);
+        }
+        let rel = (diff_sq / (ref_sq + 1e-12)).sqrt() as f32;
+        let norm_max = max_diff / max_ref.max(1.0);
+        assert!(
+            rel <= rel_tol && norm_max <= rel_tol * 2.0,
+            "{label}: max_diff={max_diff:.5} norm_max={norm_max:.5} rel={rel:.5} > {rel_tol}"
+        );
+    };
+
+    // Helper: run `dec` along every root-to-node path of `tree`, restoring
+    // `base_snap` between paths, returning expected `[T * VOCAB]` f32 logits.
+    let step_tree_logits = |dec: &mut decoder::Decoder,
+                            tree: &VerifyTree,
+                            use_fast: bool|
+     -> Vec<f32> {
+        let base_snap = dec.snapshot();
+        let mut out = vec![0.0f32; tree.len() * VOCAB];
+        for node in 0..tree.len() {
+            dec.restore_state(base_snap.clone());
+            let mut path = Vec::new();
+            let mut cur = node as i32;
+            while cur >= 0 {
+                path.push(cur as usize);
+                cur = tree.parent[cur as usize];
+            }
+            path.reverse();
+            let mut last = None;
+            for &idx in &path {
+                last = Some(with_cuda_qwen4_fast(use_fast, || dec.step(tree.tokens[idx])).unwrap());
+            }
+            let row = last.unwrap().to_float32().unwrap();
+            out[node * VOCAB..(node + 1) * VOCAB].copy_from_slice(&row);
+        }
+        dec.restore_state(base_snap);
+        out
+    };
+
+    // 1. Dense prompt prefill (M = 20).
+    let prompt: Vec<u32> = (0..20).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&prompt, None, true)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast_ar.prefill_chunk(&prompt, None, true)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&prompt, None, true)).unwrap();
+
+    // 2. Cycle 1: 12-node branching tree -> verify EVERY node vs both fast AR and FP32 ref -> commit
+    //    NON-CONTIGUOUS branch `[0, 5, 6, 7]` (tests kv_compact_rows, PLE conv
+    //    history rebuild, GDN conv rebuild, prev_indices arming, QSA index block!).
+    //    Tree: 0 -> 1 -> 2 -> 3 -> 4; 0 -> 5 -> 6 -> 7 -> 8; 1 -> 9 -> 10; 5 -> 11
+    let tree1 = make_tree(
+        vec![5, 11, 17, 23, 29, 31, 37, 41, 43, 47, 53, 59],
+        vec![-1, 0, 1, 2, 3, 0, 5, 6, 7, 1, 9, 5],
+    );
+    let views1 = tree1.to_device_views().unwrap();
+    let (fl1, ticket1) =
+        with_cuda_qwen4_fast(true, || fast.verify_tree_deferred(&tree1, &views1)).unwrap();
+    let got1 = fl1.to_float32().unwrap();
+    let fast_want1 = step_tree_logits(&mut fast_ar, &tree1, true);
+    let want1 = step_tree_logits(&mut reference, &tree1, false);
+    for node in 0..tree1.len() {
+        assert_row_close(
+            &format!("dense tree1 vs fast_ar node {node}"),
+            &got1[node * VOCAB..(node + 1) * VOCAB],
+            &fast_want1[node * VOCAB..(node + 1) * VOCAB],
+            0.015,
+        );
+        assert_row_close(
+            &format!("dense tree1 vs ref node {node}"),
+            &got1[node * VOCAB..(node + 1) * VOCAB],
+            &want1[node * VOCAB..(node + 1) * VOCAB],
+            0.035,
+        );
+    }
+    let branch1 = [0usize, 5, 6, 7];
+    with_cuda_qwen4_fast(true, || {
+        fast.commit_tree_deferred(ticket1, &branch1, false, false)
+    })
+    .unwrap();
+    for &idx in &branch1 {
+        let _ = with_cuda_qwen4_fast(true, || fast_ar.step(tree1.tokens[idx])).unwrap();
+        let _ = with_cuda_qwen4_fast(false, || reference.step(tree1.tokens[idx])).unwrap();
+    }
+    assert_eq!(fast.history, reference.history, "after branch1 commit");
+
+    // 3. Cycle 2: 10-node branching tree folding NON-CONTIGUOUS `prev_indices` from
+    //    cycle 1 in-register -> verify EVERY node -> commit CONTIGUOUS prefix `[0, 1, 2]`.
+    let tree2 = make_tree(
+        vec![2, 8, 14, 20, 26, 32, 38, 44, 50, 56],
+        vec![-1, 0, 1, 2, 3, 0, 5, 6, 1, 8],
+    );
+    let views2 = tree2.to_device_views().unwrap();
+    let (fl2, ticket2) =
+        with_cuda_qwen4_fast(true, || fast.verify_tree_deferred(&tree2, &views2)).unwrap();
+    let got2 = fl2.to_float32().unwrap();
+    let fast_want2 = step_tree_logits(&mut fast_ar, &tree2, true);
+    let want2 = step_tree_logits(&mut reference, &tree2, false);
+    for node in 0..tree2.len() {
+        assert_row_close(
+            &format!("dense tree2 vs fast_ar node {node}"),
+            &got2[node * VOCAB..(node + 1) * VOCAB],
+            &fast_want2[node * VOCAB..(node + 1) * VOCAB],
+            0.015,
+        );
+        assert_row_close(
+            &format!("dense tree2 (post noncontig fold) vs ref node {node}"),
+            &got2[node * VOCAB..(node + 1) * VOCAB],
+            &want2[node * VOCAB..(node + 1) * VOCAB],
+            0.035,
+        );
+    }
+    let branch2 = [0usize, 1, 2];
+    with_cuda_qwen4_fast(true, || {
+        fast.commit_tree_deferred(ticket2, &branch2, true, false)
+    })
+    .unwrap();
+    for &idx in &branch2 {
+        let _ = with_cuda_qwen4_fast(true, || fast_ar.step(tree2.tokens[idx])).unwrap();
+        let _ = with_cuda_qwen4_fast(false, || reference.step(tree2.tokens[idx])).unwrap();
+    }
+    assert_eq!(fast.history, reference.history, "after branch2 commit");
+
+    // 4. Cycle 3: 16-node branching tree with a depth-10 branch -> commit long
+    //    NON-CONTIGUOUS branch of length 10 (`>= ple_keep = 9`!) -> transition
+    //    directly into linear `verify_chunk_deferred(&[anchor])` (tests
+    //    remaining==1 end-of-turn fold of `prev_indices`) -> settle + AR steps!
+    let tree3 = make_tree(
+        (0..16u32).map(|i| (i * 3 + 1) % VOCAB as u32).collect(),
+        vec![-1, 0, 1, 2, 3, 4, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    );
+    let views3 = tree3.to_device_views().unwrap();
+    let (fl3, ticket3) =
+        with_cuda_qwen4_fast(true, || fast.verify_tree_deferred(&tree3, &views3)).unwrap();
+    let got3 = fl3.to_float32().unwrap();
+    let fast_want3 = step_tree_logits(&mut fast_ar, &tree3, true);
+    let want3 = step_tree_logits(&mut reference, &tree3, false);
+    for node in 0..tree3.len() {
+        assert_row_close(
+            &format!("dense tree3 (T=16) vs fast_ar node {node}"),
+            &got3[node * VOCAB..(node + 1) * VOCAB],
+            &fast_want3[node * VOCAB..(node + 1) * VOCAB],
+            0.015,
+        );
+        assert_row_close(
+            &format!("dense tree3 (T=16) vs ref node {node}"),
+            &got3[node * VOCAB..(node + 1) * VOCAB],
+            &want3[node * VOCAB..(node + 1) * VOCAB],
+            0.035,
+        );
+    }
+    let branch3 = [0usize, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    with_cuda_qwen4_fast(true, || {
+        fast.commit_tree_deferred(ticket3, &branch3, false, false)
+    })
+    .unwrap();
+    for &idx in &branch3 {
+        let _ = with_cuda_qwen4_fast(true, || fast_ar.step(tree3.tokens[idx])).unwrap();
+        let _ = with_cuda_qwen4_fast(false, || reference.step(tree3.tokens[idx])).unwrap();
+    }
+    assert_eq!(fast.history, reference.history, "after branch3 commit");
+
+    // Linear 1-row verify directly after non-contiguous tree commit!
+    let tail_tok = 27u32;
+    let (fl_lin, lin_ticket) =
+        with_cuda_qwen4_fast(true, || fast.verify_chunk_deferred(&[tail_tok])).unwrap();
+    let fa_lin = with_cuda_qwen4_fast(true, || fast_ar.step(tail_tok)).unwrap();
+    let rl_lin = with_cuda_qwen4_fast(false, || reference.step(tail_tok)).unwrap();
+    assert_row_close(
+        "linear verify after noncontig tree commit vs fast_ar",
+        &fl_lin.to_float32().unwrap(),
+        &fa_lin.to_float32().unwrap(),
+        0.015,
+    );
+    assert_row_close(
+        "linear verify after noncontig tree commit vs ref",
+        &fl_lin.to_float32().unwrap(),
+        &rl_lin.to_float32().unwrap(),
+        0.035,
+    );
+    with_cuda_qwen4_fast(true, || fast.commit_deferred_verify(lin_ticket, 1, 1)).unwrap();
+
+    // Settle + AR step parity!
+    with_cuda_qwen4_fast(true, || fast.settle_cuda_pending_gdn()).unwrap();
+    for step_tok in [19u32, 42u32] {
+        let fl_ar = with_cuda_qwen4_fast(true, || fast.step(step_tok)).unwrap();
+        let fa_ar = with_cuda_qwen4_fast(true, || fast_ar.step(step_tok)).unwrap();
+        let rl_ar = with_cuda_qwen4_fast(false, || reference.step(step_tok)).unwrap();
+        assert_row_close(
+            &format!("post-tree settle AR vs fast_ar tok={step_tok}"),
+            &fl_ar.to_float32().unwrap(),
+            &fa_ar.to_float32().unwrap(),
+            0.015,
+        );
+        assert_row_close(
+            &format!("post-tree settle AR vs ref tok={step_tok}"),
+            &fl_ar.to_float32().unwrap(),
+            &rl_ar.to_float32().unwrap(),
+            0.035,
+        );
+    }
+
+    // 5. Sparse QSA tree verify (`pre_kv_len = 2068 > indexer_budget = 2048`):
+    //    exercises `qsa_sparse_sdpa_cuda(mask_mode=1)` + tree-depth RoPE'd `iq` +
+    //    non-contiguous branch commit + post-commit sparse AR step!
+    fast.reset();
+    fast_ar.reset();
+    reference.reset();
+    let long_a: Vec<u32> = (0..1024).map(|i| ((i * 11 + 5) % VOCAB) as u32).collect();
+    let long_b: Vec<u32> = (0..1024).map(|i| ((i * 13 + 2) % VOCAB) as u32).collect();
+    let long_c: Vec<u32> = (0..20).map(|i| ((i * 17 + 1) % VOCAB) as u32).collect();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_a, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_b, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast.prefill_chunk(&long_c, None, true)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast_ar.prefill_chunk(&long_a, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast_ar.prefill_chunk(&long_b, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(true, || fast_ar.prefill_chunk(&long_c, None, true)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_a, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_b, None, false)).unwrap();
+    let _ = with_cuda_qwen4_fast(false, || reference.prefill_chunk(&long_c, None, true)).unwrap();
+
+    // Depth <= 2 tree (`pre_kv_len = 2068`, `2068 % 4 == 0`), so ALL nodes have
+    // identical `complete = 517` blocks to AR (100% exact sparse QSA equivalence!).
+    let sp_tree = make_tree(
+        vec![4, 9, 15, 21, 27, 33, 39, 45],
+        vec![-1, 0, 1, 0, 3, 0, 5, 3],
+    );
+    let sp_views = sp_tree.to_device_views().unwrap();
+    let (fl_sp, ticket_sp) =
+        with_cuda_qwen4_fast(true, || fast.verify_tree_deferred(&sp_tree, &sp_views)).unwrap();
+    let got_sp = fl_sp.to_float32().unwrap();
+    let fast_want_sp = step_tree_logits(&mut fast_ar, &sp_tree, true);
+    let want_sp = step_tree_logits(&mut reference, &sp_tree, false);
+    for node in 0..sp_tree.len() {
+        assert_row_close(
+            &format!("sparse QSA tree vs fast_ar (kv=2068) node {node}"),
+            &got_sp[node * VOCAB..(node + 1) * VOCAB],
+            &fast_want_sp[node * VOCAB..(node + 1) * VOCAB],
+            0.015,
+        );
+        assert_row_close(
+            &format!("sparse QSA tree vs ref (kv=2068) node {node}"),
+            &got_sp[node * VOCAB..(node + 1) * VOCAB],
+            &want_sp[node * VOCAB..(node + 1) * VOCAB],
+            0.035,
+        );
+    }
+    // Commit non-contiguous branch `[0, 3, 7]` across sparse QSA, settle (with
+    // non-contiguous `prev_indices`!), and verify 2 sparse AR steps match exact!
+    let sp_branch = [0usize, 3, 7];
+    with_cuda_qwen4_fast(true, || {
+        fast.commit_tree_deferred(ticket_sp, &sp_branch, false, false)
+    })
+    .unwrap();
+    for &idx in &sp_branch {
+        let _ = with_cuda_qwen4_fast(true, || fast_ar.step(sp_tree.tokens[idx])).unwrap();
+        let _ = with_cuda_qwen4_fast(false, || reference.step(sp_tree.tokens[idx])).unwrap();
+    }
+    with_cuda_qwen4_fast(true, || fast.settle_cuda_pending_gdn()).unwrap();
+    for step_tok in [11u32, 55u32] {
+        let fl_ar = with_cuda_qwen4_fast(true, || fast.step(step_tok)).unwrap();
+        let fa_ar = with_cuda_qwen4_fast(true, || fast_ar.step(step_tok)).unwrap();
+        let rl_ar = with_cuda_qwen4_fast(false, || reference.step(step_tok)).unwrap();
+        assert_row_close(
+            &format!("post-sparse-tree AR vs fast_ar tok={step_tok}"),
+            &fl_ar.to_float32().unwrap(),
+            &fa_ar.to_float32().unwrap(),
+            0.015,
+        );
+        assert_row_close(
+            &format!("post-sparse-tree AR vs ref tok={step_tok}"),
+            &fl_ar.to_float32().unwrap(),
+            &rl_ar.to_float32().unwrap(),
+            0.035,
+        );
+    }
 }

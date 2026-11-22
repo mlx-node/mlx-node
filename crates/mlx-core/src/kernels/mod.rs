@@ -12,3 +12,4 @@ pub(crate) mod dflash2;
 pub(crate) mod gdn;
 pub(crate) mod kv;
 pub(crate) mod linear;
+pub(crate) mod qwen4;
