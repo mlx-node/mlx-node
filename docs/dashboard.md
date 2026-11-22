@@ -37,9 +37,9 @@ during a 1.5 s query used to wait 1449 ms. With the split, a download-progress c
 made during a heavy query returns in 0.2 ms instead of 296 ms.
 
 Route ownership is data on the route (`mainRoute` / `workerRoute`), so a new route
-cannot silently land on the wrong thread. The transport thread keeps the four download
-routes, the catalog update check, the two coding-agent action routes and
-`/api/runtime/live`: network I/O, progress events and the live snapshot must never
+cannot silently land on the wrong thread. The transport thread keeps the five download
+routes (the Update plan is one), the catalog update check, the two coding-agent action
+routes and `/api/runtime/live`: network I/O, progress events and the live snapshot must never
 queue behind a synchronous query. `/api/runtime/live` lists the runtime directory and
 reads each small heartbeat file and `supervisor.json` with async fs; none of the others
 touches the database.
@@ -218,7 +218,7 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | Route            | Page           | What it shows                                                                                                                                                                                                                                                                                | Data                                                                                                         |
 | ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                   | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
-| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer with model picker, web chip and (Work) folder chip; Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work)         | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
+| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer: model picker, web chip, (Work) folder chip (bar once set); Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work) | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
 | `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                         | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
 | `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                 | `/sessions`                                                                                                  |
 | `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                      | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
@@ -229,6 +229,14 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                         | `/coding-agents`                                                                                             |
 | `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the Firecrawl switch, with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry)               | `/providers`                                                                                                 |
 | `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                          | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
+
+A System One run changes only the Output card. The four metric tiles are always there and show "—" when the mode
+on screen has no result. The Output status line is always there too, with three faces in one box: rest ("No run yet"
+or "Last run · model · time"), running, and failed. A failed run puts its text in that line, removes the answers and
+shows each requested row with "—", so answers of an earlier input never sit under an error; a toast is added only
+when the line is not in view. Nothing in the card reacts before `--duration-hold`, so a run that fails at once
+changes nothing on a repeat. The Highlights tab marks character ranges in the request text only: a run with only an
+image or PDF has no text to mark, and the tab says so and shows the image.
 
 The Engine "In flight" card is a table with fixed columns (Model, Phase, Progress, Started, Context) under a
 header that counts turns per served model ("2 turns on 1 model"). A row names the model that serves the turn
@@ -343,11 +351,14 @@ tell whether Local models lists the entry) and a **Reinstall** button. Reinstall
 downloads and verifies the model first and only then moves the old entry aside through the downloader's swap and
 deletes it; a failed or cancelled download removes nothing. The request echoes the numbers the user confirmed, and
 the server refuses (409) when the entry no longer matches them, at the request, at job start and right before the
-swap. An entry that holds model files is never replaced and its card shows no Reinstall: anywhere in it, at any depth
-(links to folders followed), an entry named `config.json` or named like weights (`.safetensors`, `.gguf` including
-companions, `.pdiparams`, `.pdparams`, `.npz`, `.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more
-than 20,000 entries to look through. A directory the app has no write permission on is refused at the request, before
-any download. A link is removed as a link; its target is not touched.
+swap. Reinstall never replaces an entry that holds model files, and the card of such an entry shows no Reinstall. An
+entry holds model files when it has, anywhere in it, at any depth (links to folders followed), an entry named
+`config.json` or named like weights (`.safetensors`, `.gguf` including companions, `.pdiparams`, `.pdparams`, `.npz`,
+`.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more than 20,000 entries to look through. When that
+entry is a real folder its card shows **Needs update** and an **Update** button, which adds the missing files and the
+marker and deletes nothing (below). A link, or a folder with more than 2,000 entries, keeps **Needs cleanup** with no
+button. A directory the app has no write permission on is refused at the request, before any download. A link is
+removed as a link; its target is not touched.
 
 The old entry is moved to `.staging/<slug>.reinstall-<pid>.<uuid>`. Before it is deleted, the moved entry is checked
 again: the same `dev:ino` as at the last check and, unless it is a link, still no model files and the same numbers. A
@@ -356,7 +367,72 @@ its path; if something else took the path meanwhile, the entry is kept at `.stag
 removes, and the error names it. When the process dies between moving the entry aside and deleting it, recovery (when
 the download manager starts, and before every job for the slug) puts the entry back when the path is empty, deletes it
 when a complete model installed by the app is in place and the backup holds no model files, and otherwise keeps it.
-Delete in Local models and Reinstall never reach the same entry: Delete needs a `config.json`, which Reinstall refuses.
+
+**Update** makes the app own a folder that holds the catalog model but was not made by the app, by adding what is
+missing. It never moves, renames, deletes or overwrites a file that was in the folder. A click asks for a plan
+(`POST /api/downloads/adopt-plan`): the server pins one 40-hex sha for the repo and one for the `assetsRepo`, lists the
+wanted files the same way an install does (the wanted set must hold `config.json`), and scans the folder with `lstat`
+only, opening no file, at most 2,000 entries. A wanted file is **checked** when a regular file of the manifest size is
+at its path, and **downloaded** when nothing is there; any other file that is not a model file stays where it is. The
+plan is refused (409, the text names the file and shows under the card note) for a wanted file of another size, a
+wanted file the manifest gives no checksum for (in the folder or missing from it), a file that failed the hash in an earlier Update since the app
+started, a model file that is not part of the catalog model, a name that differs from a wanted name only in letter
+case, links or special files, a `.mlx-download-complete.json` at the root (the app cannot read it), more than 2,000
+entries, or no write permission. The plan, and the commit scan, read a `.mlx-download-complete.json` at the root on
+the transport thread with no size limit, as the catalog, Reinstall and every install already do: a file of hundreds of
+MB there stalls download progress and Cancel for as long as the read takes (seconds on a slow disk), and then the
+folder is refused. The plan reads Hugging Face with a deadline and outside any job, so it neither adds
+bytes to a running download nor dies with its cancel. Its token is a sha256 over the repo, both shas, the wanted files
+with their checksums, the checked files with size, `mtimeNs` and inode, the downloaded paths and the folder's
+`dev:ino`; other files are not in it, so a new `.DS_Store` does not break the confirm. The confirm shows the counts,
+the sizes and up to 3 other names. The start request carries the token, and a token starts one job only: a token that
+is not the last plan's, or one already used, gets 409. The job computes the plan again before it does anything and
+stops with "Nothing was changed." when the token differs.
+
+The job hashes each checked file where it is. It opens the file with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, the `fstat`
+of the descriptor must match the plan, the sha256 must equal the manifest's `lfs.oid` (or the git blob sha1 its
+`oid`), and a second `fstat` must give the same `dev`, inode, size, `mtimeNs` and `ctimeNs`. Size or name alone never
+proves a file. The progress frames of this step carry `phase: 'check'` and the bar reads "Checking <file>". A file
+that does not match fails the job after the loop, which names every such file and changes nothing; the user moves the
+file out, and the next Update downloads the catalog file in its place. The missing files are downloaded and verified
+into the job's own `.staging/<slug>@<sha>.<pid>.<uuid>` tree. At the commit, the last point where Cancel works, the
+folder is scanned again and must be the same folder, still not owned, with the same fingerprints and the same missing
+paths. The marker is written and fsynced in staging. Then each file is added with `link()`, `config.json` last: link
+fails with `EEXIST` when anything is at the path, so an add cannot overwrite a file, and no `rename` or `copyFile`
+targets the folder. The marker is linked last, and only when every wanted file is in the folder as a hashed or
+downloaded file. Just before the marker link every checked file is read again with `lstat` (same `dev`, inode, size,
+`mtimeNs` and `ctimeNs`) and the folder must keep its `dev:ino`; a change during the adds fails the job. A change in
+the microseconds after that check, after the marker, or through a descriptor or `mmap` opened before the job is not
+seen, as for any installed folder. A failed add is undone newest first, and only while `lstat` shows the job's own
+staged inode at the name. The name is not unlinked in place: it is renamed into `.staging/<slug>.kept-<uuid>` and
+checked again there, so a file another process renamed onto the name in between is put back with `link()`, or stays
+in that folder when something took its name again, and the error names the folder. Folders the job made go with a
+plain `rmdir`, and the error names any added file that stays. When the added `config.json` (or the marker) cannot be
+removed, the undo stops there and every added file not yet removed stays beside it. A volume that
+cannot hard-link (exFAT) stops the job with nothing changed. There is no recovery step. A crash before the first add
+leaves the folder as it was, and the dead staging tree is reaped by its pid. A crash during the adds leaves complete
+added files and no marker, so the folder still reads as not owned, and the next Update checks those files by hash and
+finishes. That holds until `config.json`, the last file, is in: with `config.json` and no marker (a crash between the
+two links, or a rollback that could not remove it) the folder reads as present, the card shows Installed and no Update,
+and the app does not manage it. The other added files are then all there, so the folder is never Installed without
+its tokenizer. A failed rollback says so and tells the user to remove `config.json`; with it gone the card shows
+Update again.
+
+A marker that Update writes has an `adopted` record: the `lstat` size and `mtimeNs` of each wanted file as the job
+proved it. It decides what the app may delete later. When **Update available** replaces such a folder, or backup
+recovery removes its old copy, only regular files that the marker lists and whose size and `mtimeNs` still equal the
+record are unlinked, and the folders left empty are removed with `rmdir`. Each such file is first renamed to a private
+folder inside the old copy and checked there (the same inode, size and `mtimeNs`), so a file renamed onto its name in
+between is put back and kept; a writer that already holds the file open can still change it after that check. Everything else, the marker included, is
+moved to `.staging/<slug>.kept-<uuid>`, which nothing removes; the `done` event carries that path as `keptDir` and the
+toast names it. When a sidecar refresh would delete an old sidecar from such a folder, it downloads the model again
+and swaps instead. A record in any other shape reads as empty and proves nothing, so nothing is deleted. An old copy
+whose marker cannot be read is kept whole in `.staging/<slug>.kept-<uuid>`. The `mlx` CLI keeps the record when it
+rewrites the marker; a file it downloaded again no longer matches the record, so it is kept, not deleted.
+
+Delete in Local models and Reinstall never reach the same entry: Delete needs a `config.json` or a Clairic GGUF folder,
+and Reinstall refuses both. Update and Delete can reach the same folder; a Delete during an Update makes the Update
+stop.
 
 ## Chat and Work
 
@@ -470,8 +546,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   carries the smaller `totalTokens`.
 
 - Picker: the pill shows the base model and a badge with its quantization (`Qwen3.8-27B` `UD-Q4_K_XL`; the badge hides
-  under 520 px of composer, and in Work it is drawn whenever the row has room for it with the folder and web labels
-  at their floors, else not at all; the picker, its title and its name always say it),
+  under 520 px of composer, and in Work it is drawn whenever the row has room for it with the web label (and, while no
+  folder is chosen, the folder label) at their floors, else not at all; the picker, its title and its name always say
+  it),
   the title the full id. The popover has two lists: one row per base on the left, the
   quantizations of the open base on the right. A base opens on a click, `Enter`, `Space` or `→`, never on hover; a base
   with one quantization picks it at once. Both lists put the model in memory first, then the model in load, then the
@@ -522,9 +599,13 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 
 ### Work
 
-- **Folder.** Work runs in one folder per conversation, fixed for its life. On the New screen the folder chip offers
-  the newest folders of the Work list and "Choose another folder…", which opens the native folder dialog
-  (`ui/src/lib/pick-folder.ts`); the newest folder is preselected, a choice made in this window wins. The server
+- **Folder.** Work runs in one folder per conversation, fixed for its life. On the New screen, while no folder is
+  chosen, the composer's tool row holds a "Choose folder…" chip; once one is chosen the chip leaves the composer (focus
+  stays in the text field) and shows the folder at the top right of the bar. Until the first message lands that chip
+  offers the newest folders of the Work list and "Choose another folder…", which opens the native folder dialog
+  (`ui/src/lib/pick-folder.ts`); with no recent folder a click opens the dialog at once. The newest folder is
+  preselected, a choice made in this window wins. An open conversation's chip sits at the same place and only shows
+  the folder: its popover has the whole path and Copy path. The server
   checks the folder (`src/chat/work-folder.ts`): not absolute, missing, not a folder, unreadable, `/` or the top of the
   data volume, the home folder or a folder that holds it (as written or where its links lead), and a folder inside,
   holding or picked through the app data folders are refused (compared by disk identity, so another path to the same
@@ -1269,9 +1350,10 @@ Common params of the metrics routes, parsed by hand: `from`, `to` (epoch ms), `m
 | `/api/models/:name`            | DELETE       | worker    | Delete a model dir (path-checked)                                                                                                                                          |
 | `/api/catalog`                 | GET          | worker    | Recommended catalog + installed/installable state; `blocker` names what holds a blocked slug                                                                               |
 | `/api/catalog/updates`         | GET          | transport | Upstream sha per catalog repo; the page joins it against `/api/catalog`                                                                                                    |
-| `/api/downloads`               | GET / POST   | transport | List active jobs / start a catalog download; `replaceBlocker: { kind, fileCount, sizeBytes, truncated }` is a Reinstall (409 on change)                                    |
+| `/api/downloads`               | GET / POST   | transport | List active jobs / start a catalog download; `replaceBlocker: { kind, fileCount, sizeBytes, truncated }` is a Reinstall, `adopt: <token>` an Update (409 on change)        |
+| `/api/downloads/adopt-plan`    | POST         | transport | `{repo}` → Update plan: `token`, `revision`, `assetsRevision`, `check` / `download` / `other` counts and bytes, up to 3 other names; 409 names the file it refuses         |
 | `/api/downloads/:id`           | DELETE       | transport | Cancel a download                                                                                                                                                          |
-| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503                                                                                                 |
+| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503. `progress.phase: 'check'` while Update hashes a file; `done.keptDir` names kept files          |
 | `/api/coding-agents`           | GET / POST   | transport | Coding agent state with the managed instruction `block` / body `{action: 'refresh'}` or `{action: 'install', agent}`                                                       |
 | `/api/coding-agents/models`    | GET          | worker    | Local model ids the coding agents can be pointed at                                                                                                                        |
 | `/api/metrics/models`          | GET          | worker    | Model keys in first-seen order (color registry seed, model filter)                                                                                                         |
