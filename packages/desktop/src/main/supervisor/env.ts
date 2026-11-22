@@ -23,7 +23,7 @@ import { QUARANTINED_ENV, TURN_JOURNAL_ENV } from '../../inference/turn-journal.
  * `MLX_INFERENCE_TRACE` and `MLX_INFERENCE_TRACE_FILE` together are the ONLY
  * way a class-(b) failure is observable.
  *
- * `mlx_trace_native_error` (crates/mlx-sys/src/mlx_common.h) is a no-op unless
+ * `mlx_trace_native_error` (crates/mlx-sys/src/common/mlx_common.h) is a no-op unless
  * both are set: it checks the flag, checks the path, and returns. With them
  * unset, `mlx_array_eval` / `mlx_synchronize` / `mlx_clear_cache` catch the C++
  * exception, write nothing, and hand back arrays whose contents are wrong while

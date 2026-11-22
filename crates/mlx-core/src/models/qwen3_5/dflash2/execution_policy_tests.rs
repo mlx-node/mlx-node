@@ -437,11 +437,10 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
     )
     .unwrap();
     for (case, (live, position)) in [(3, 3), (7, 100), (2047, 32768), (2047, 33001)]
-            .into_iter()
-            .enumerate()
+        .into_iter()
+        .enumerate()
     {
-        let (mut eager, mut compiled) =
-            source_conv_test_caches(&model.config, live, position);
+        let (mut eager, mut compiled) = source_conv_test_caches(&model.config, live, position);
         let original_k = bits(&compiled.layers[0].view().unwrap().0);
         let original_v = bits(&compiled.layers[0].view().unwrap().1);
         let mut confidence = None;

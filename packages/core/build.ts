@@ -84,7 +84,7 @@ if (process.platform === 'win32' && process.arch === 'arm64') {
 }
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
-// Also copy paged_attn.metallib, which mlx_paged_dispatch.cpp loads via a
+// Also copy paged_attn.metallib, which metal/mlx_paged_dispatch.cpp loads via a
 // `dladdr`-based colocated lookup at runtime.
 //
 // Both metallibs are copied to TWO destinations:
@@ -95,7 +95,7 @@ if (process.platform === 'win32' && process.arch === 'arm64') {
 //      optional package that gets published to npm. The user-facing
 //      install path resolves the .node addon from this package, so
 //      the metallibs MUST ship here too — otherwise the
-//      `dladdr`-based runtime lookup in `mlx_paged_dispatch.cpp`
+//      `dladdr`-based runtime lookup in `metal/mlx_paged_dispatch.cpp`
 //      lands in the published package directory and finds no
 //      `paged_attn.metallib`, throwing on first use.
 //

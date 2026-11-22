@@ -12,14 +12,14 @@
  * There are TWO swallow channels in the tree, not one, and they need different
  * detectors:
  *
- *   A. `mlx_trace_native_error` (crates/mlx-sys/src/mlx_common.h) — appends one
+ *   A. `mlx_trace_native_error` (crates/mlx-sys/src/common/mlx_common.h) — appends one
  *      line to `MLX_INFERENCE_TRACE_FILE`, and ONLY when both that and
  *      `MLX_INFERENCE_TRACE` are set. Covers the eval paths: `array_eval`,
  *      `async_eval`, `eval`, `ensure_readable`'s scalar reads,
  *      `fast_scaled_dot_product_attention`, `paged_attention_*`.
  *
- *   B. `std::cerr << "[MLX] Exception in ..."` (mlx_misc_ops.cpp,
- *      mlx_stream.cpp, mlx_nn_ops.cpp) — always on, no env var needed, and
+ *   B. `std::cerr << "[MLX] Exception in ..."` (common/mlx_misc_ops.cpp,
+ *      common/mlx_stream.cpp, common/mlx_nn_ops.cpp) — always on, no env var needed, and
  *      therefore the only class-(b) signal that survives a misconfigured fork.
  *      Covers `synchronize`, `stream_synchronize`, `clear_cache` and the array
  *      destructor.

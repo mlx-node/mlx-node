@@ -1,7 +1,18 @@
 //! The Flash Next draft (`incoai/Qwen3.8-Flash-Next-DFlash2`, revision
 //! `a22a1744`): its config and safetensors header, and a tiny checkpoint of
 //! the same layout.
-use super::*;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use mlx_sys as sys;
+use napi::bindgen_prelude::*;
+
+use super::loader::{expected_tensor_shapes, resolve_safetensors};
+use super::{
+    DFLASH2_DRAFT_PROPOSALS, DFlash2Config, DFlash2TargetShape, dflash2_file_bytes, load_dflash2,
+    read_dflash2_config,
+};
+use crate::array::{DType, MxArray};
 
 /// The validated config of the DFlash2 checkpoint directory `path` whose
 /// safetensors header names exactly the tensors `load_dflash2` takes, at

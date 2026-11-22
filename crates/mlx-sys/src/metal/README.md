@@ -21,7 +21,7 @@ Organize them by their mathematical and storage contracts:
   builders must match the lists; `kquant_metallib_names` checks both ways.
   `build.rs` also turns each header into a `quantized_preamble::` function for
   the custom kernels that reuse its decoders. Two in-memory weight layouts
-  (`mlx_kquant.h`): the on-disk row-major one, and `Tiled64` (mode suffix
+  (`crates/mlx-sys/src/common/mlx_kquant.h`): the on-disk row-major one, and `Tiled64` (mode suffix
   `@t64`, set at load by `QuantizedLinear::tile_kquant_layout` for every 2-D
   weight with N % 64 == 0 and K % 256 == 0 on a Metal host), where 64 rows
   interleave per 32-code unit and per super-block so a 64-column threadgroup
