@@ -85,7 +85,7 @@ fn real_default_load_attaches_the_plan_of_record() -> Result<()> {
             cache_disk: crate::disk_tier::CacheDisk::Off,
             ..Default::default()
         },
-        false,
+        LoadKind::Standard,
         false,
         crate::engine::load_progress::LoadProgressCell::detached(),
     ));
@@ -190,7 +190,7 @@ fn load_real_with(hook: LoadedHook) -> Result<()> {
             cache_disk: crate::disk_tier::CacheDisk::Off,
             ..Default::default()
         },
-        false,
+        LoadKind::Standard,
         false,
         crate::engine::load_progress::LoadProgressCell::detached(),
     ));

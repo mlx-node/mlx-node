@@ -3,6 +3,7 @@ import { totalmem } from 'node:os';
 import { isAbsolute, relative, sep } from 'node:path';
 
 import { discoverMlxModels } from '@mlx-node/agent/models';
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 
 import { catalogWithState } from '../../catalog.js';
 import {
@@ -28,11 +29,11 @@ async function servedIdsByEntry(modelsDir: string): Promise<Map<string, string[]
   const out = new Map<string, string[]>();
   let discovered;
   try {
-    discovered = await discoverMlxModels(modelsDir);
+    discovered = await discoverLocalChatModels(modelsDir, { includeDecisions: true });
   } catch {
     return out;
   }
-  for (const { discovered: model } of discovered) {
+  for (const model of discovered) {
     const entry = firstSegmentUnder(modelsDir, model.path);
     if (entry === null) continue;
     const list = out.get(entry);

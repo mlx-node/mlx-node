@@ -37,14 +37,25 @@ pub(crate) fn parse_vision_config(raw: &Value) -> QwenVisionConfig {
     }
 }
 
-/// Collapse a 5D Conv3d patch-embed weight `[out, kD, kH, kW, in]` into a 2D
-/// Conv2d kernel `[out, kH, kW, in]` by summing over the temporal axis.
+/// Collapse a 5D Conv3d patch-embed weight into a 2D MLX Conv2d kernel
+/// `[out, kH, kW, in]` by summing over the temporal axis (`kD`).
+///
+/// Supports both:
+/// - MLX NDHWC layout `[out, kD, kH, kW, in]` (sum axis 1), and
+/// - PyTorch / HuggingFace NCDHW layout `[out, in, kD, kH, kW]` (transpose to
+///   NDHWC first, then sum axis 1).
 ///
 /// The image processor duplicates the static frame across the temporal axis, so
 /// the effective 2D kernel is the sum of the temporal slices (matches mlx-vlm
 /// `qwen3_vl/vision.py`). Summing all `kD` slices keeps this robust if `kD != 2`.
 fn collapse_patch_embed_conv3d(pe_weight: &MxArray) -> Result<MxArray> {
-    pe_weight.sum(Some(&[1]), None)
+    let shape = pe_weight.shape()?;
+    let ndhwc = if shape.len() == 5 && shape[1] == 3 && shape[4] != 3 {
+        pe_weight.transpose(Some(&[0, 2, 3, 4, 1]))?
+    } else {
+        pe_weight.clone()
+    };
+    ndhwc.sum(Some(&[1]), None)
 }
 
 /// Load vision encoder weights from params.
@@ -74,8 +85,27 @@ pub(crate) fn load_vision_weights(
     if ndim == 5 {
         let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
         encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
+    } else if let Some(pe_weight_1) = get_opt("patch_embed.proj.weight.1") {
+        // llama.cpp exports Qwen3-VL / Qwen3.5 Conv3d patch_embed as two 4D NCHW
+        // temporal slices (`v.patch_embd.weight` + `v.patch_embd.weight.1`, each
+        // `[out, 3, kH, kW]` after GGUF dimension reversal). Sum both temporal
+        // slices and convert NCHW -> MLX NHWC `[out, kH, kW, 3]`.
+        let summed = pe_weight.add(pe_weight_1)?;
+        let shape = summed.shape()?;
+        let conv2d_weight = if shape.len() == 4 && shape[1] == 3 && shape[3] != 3 {
+            summed.transpose(Some(&[0, 2, 3, 1]))?
+        } else {
+            summed
+        };
+        encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
     } else {
-        encoder.set_patch_embed(pe_weight, pe_bias)?;
+        let shape = pe_weight.shape()?;
+        if shape.len() == 4 && shape[1] == 3 && shape[3] != 3 {
+            let conv2d_weight = pe_weight.transpose(Some(&[0, 2, 3, 1]))?;
+            encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
+        } else {
+            encoder.set_patch_embed(pe_weight, pe_bias)?;
+        }
     }
 
     // Position embedding
@@ -191,6 +221,88 @@ mod tests {
                 "element {i}: collapsed {g} != slice0+slice1 {e}"
             );
         }
+    }
+
+    #[test]
+    fn collapse_patch_embed_conv3d_handles_pytorch_ncdhw_layout() {
+        // PyTorch HuggingFace Conv3d layout: [out=2, in=3, kD=2, kH=2, kW=2].
+        let out_c = 2i64;
+        let in_c = 3i64;
+        let kd = 2i64;
+        let kh = 2i64;
+        let kw = 2i64;
+        let n = (out_c * in_c * kd * kh * kw) as usize;
+        let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.25 - 2.0).collect();
+        let hf_weight = MxArray::from_float32(&data, &[out_c, in_c, kd, kh, kw]).unwrap();
+
+        let collapsed = collapse_patch_embed_conv3d(&hf_weight).unwrap();
+        collapsed.eval();
+        let shape: Vec<i64> = collapsed.shape().unwrap().as_ref().to_vec();
+        assert_eq!(shape, vec![out_c, kh, kw, in_c]);
+
+        let expected = hf_weight
+            .transpose(Some(&[0, 2, 3, 4, 1]))
+            .unwrap()
+            .sum(Some(&[1]), None)
+            .unwrap();
+        expected.eval();
+        let got: Vec<f32> = collapsed.to_float32().unwrap().to_vec();
+        let exp: Vec<f32> = expected.to_float32().unwrap().to_vec();
+        assert_eq!(got.len(), exp.len());
+        for (i, (g, e)) in got.iter().zip(exp.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-5, "element {i}: {g} != {e}");
+        }
+    }
+
+    #[test]
+    fn load_vision_weights_merges_split_gguf_nchw_patch_embed() {
+        let config = QwenVisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_heads: 1,
+            num_layers: 0,
+            patch_size: 2,
+            spatial_merge_size: 1,
+            image_size: 2,
+            out_hidden_size: 4,
+        };
+        let w0_data: Vec<f32> = (0..(4 * 3 * 2 * 2)).map(|i| i as f32).collect();
+        let w1_data: Vec<f32> = (0..(4 * 3 * 2 * 2))
+            .map(|i| (i as f32) * 0.5 + 1.0)
+            .collect();
+        let w0 = MxArray::from_float32(&w0_data, &[4, 3, 2, 2]).unwrap();
+        let w1 = MxArray::from_float32(&w1_data, &[4, 3, 2, 2]).unwrap();
+
+        let array = |shape: &[i64]| {
+            let len = shape.iter().map(|dim| *dim as usize).product();
+            MxArray::from_float32(&vec![0.0; len], shape).expect("construct tiny vision weight")
+        };
+        let mut params = HashMap::new();
+        params.insert("patch_embed.proj.weight".to_string(), w0.clone());
+        params.insert("patch_embed.proj.weight.1".to_string(), w1.clone());
+        params.insert("merger.norm.weight".to_string(), array(&[4]));
+        params.insert("merger.norm.bias".to_string(), array(&[4]));
+        params.insert("merger.linear_fc1.weight".to_string(), array(&[4, 4]));
+        params.insert("merger.linear_fc1.bias".to_string(), array(&[4]));
+        params.insert("merger.linear_fc2.weight".to_string(), array(&[4, 4]));
+        params.insert("merger.linear_fc2.bias".to_string(), array(&[4]));
+
+        let mut encoder = QwenVisionEncoder::new(config.clone()).unwrap();
+        load_vision_weights(&mut encoder, &params, &config).unwrap();
+
+        let loaded = encoder
+            .get_parameters()
+            .remove("visual.patch_embed.proj.weight")
+            .expect("loaded patch_embed weight");
+        loaded.eval();
+        assert_eq!(loaded.shape().unwrap().as_ref(), &[4, 2, 2, 3]);
+
+        let expected = w0.add(&w1).unwrap().transpose(Some(&[0, 2, 3, 1])).unwrap();
+        expected.eval();
+        assert_eq!(
+            loaded.to_float32().unwrap().to_vec(),
+            expected.to_float32().unwrap().to_vec()
+        );
     }
 
     #[test]

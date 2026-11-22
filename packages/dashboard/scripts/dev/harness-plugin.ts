@@ -326,6 +326,7 @@ export function guardRuntime(runtime: RpcRuntime, allowNetwork: boolean): RpcRun
     subscribe: (jobId, listener) => runtime.subscribe(jobId, listener),
     watchLive: (listener) => runtime.watchLive(listener),
     ...(runtime.watchChat === undefined ? {} : { watchChat: runtime.watchChat.bind(runtime) }),
+    ...(runtime.watchSystemOne === undefined ? {} : { watchSystemOne: runtime.watchSystemOne.bind(runtime) }),
   };
   return guarded;
 }

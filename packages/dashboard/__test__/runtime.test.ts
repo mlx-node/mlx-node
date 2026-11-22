@@ -251,6 +251,12 @@ describe('dashboard runtime — route ownership', () => {
       'PUT /api/providers/:id/key',
       'DELETE /api/providers/:id/key',
       'POST /api/providers/:id/validate',
+      'GET /api/systemone/state',
+      'POST /api/systemone/run',
+      'GET /api/systemone/jobs/:id',
+      'POST /api/systemone/jobs/:id/cancel',
+      'DELETE /api/systemone/history',
+      'POST /api/systemone/unload',
     ]);
   });
 

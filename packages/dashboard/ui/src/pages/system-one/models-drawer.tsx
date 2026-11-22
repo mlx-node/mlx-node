@@ -1,0 +1,146 @@
+import type { ReactElement } from 'react';
+import { Link } from 'react-router-dom';
+
+import { Alert } from '../../components/arc/alert/alert';
+import { Button } from '../../components/arc/button/button';
+import { Drawer, DrawerContent } from '../../components/arc/drawer/drawer';
+import { EmptyState } from '../../components/arc/empty-state/empty-state';
+import type { CatalogItem, CatalogResponse, CatalogUpdatesResponse, ModelsResponse } from '../../lib/types';
+import type { AsyncState } from '../../lib/use-api';
+import { PageSection } from '../../shell/page';
+import { CatalogCard, CatalogCardPlaceholder, CatalogGrid } from '../models/catalog';
+import type { ModelDownloads } from '../models/use-model-downloads';
+
+export function isSystemOneCatalogItem(item: CatalogItem): boolean {
+  if (item.category === 'systemone') return true;
+  const hay = `${item.label} ${item.hfRepo} ${item.slug}`.toLowerCase();
+  return hay.includes('clairic') || hay.includes('clef');
+}
+
+export interface SystemOneModelsDrawerProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  models: AsyncState<ModelsResponse>;
+  catalog: AsyncState<CatalogResponse>;
+  updates: AsyncState<CatalogUpdatesResponse>;
+  downloads: ModelDownloads;
+}
+
+/** Drawer reusing the exact `Models` CatalogCard + download progress flow for System One models. */
+export function SystemOneModelsDrawer({
+  open,
+  onOpenChange,
+  models,
+  catalog,
+  downloads,
+}: SystemOneModelsDrawerProps): ReactElement {
+  const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
+  const localModels = models.data?.models ?? [];
+  const host = models.data?.host;
+
+  return (
+    <Drawer open={open} onOpenChange={onOpenChange}>
+      <DrawerContent
+        side="right"
+        title="System One models"
+        description="Download Clairic Flash (9B), Clairic (27B), or CLEF checkpoints directly to this Mac."
+      >
+        <div className="grid min-w-0 gap-4">
+          {catalog.error !== undefined ? (
+            <Alert tone="danger" title="Could not load catalog">
+              <span className="grid justify-items-start gap-2">
+                <span>{catalog.error.message}</span>
+                <Button variant="secondary" size="sm" onClick={catalog.reload}>
+                  Try again
+                </Button>
+              </span>
+            </Alert>
+          ) : null}
+
+          {catalog.data === undefined ? (
+            catalog.error !== undefined ? null : (
+              <div className="grid gap-3">
+                <CatalogCardPlaceholder />
+                <CatalogCardPlaceholder />
+              </div>
+            )
+          ) : items.length === 0 ? (
+            <EmptyState
+              title="No System One catalog entries"
+              description="Check the Models page or install a Clairic checkpoint via the CLI."
+              action={
+                <Link className="link" to="/models">
+                  Go to Models
+                </Link>
+              }
+            />
+          ) : (
+            <div className="grid gap-3">
+              {items.map((item) => {
+                const props = downloads.downloadProps(item);
+                return (
+                  <CatalogCard
+                    key={item.hfRepo}
+                    {...props}
+                    item={item}
+                    host={host}
+                    detailsTo={
+                      localModels.some((model) => model.name === item.slug)
+                        ? `/models?focus=${encodeURIComponent(item.slug)}`
+                        : undefined
+                    }
+                  />
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </DrawerContent>
+    </Drawer>
+  );
+}
+
+/** Inline onboarding card displayed when 0 System One models are installed. */
+export function NoSystemOneModelsCard({
+  models,
+  catalog,
+  downloads,
+}: {
+  models: AsyncState<ModelsResponse>;
+  catalog: AsyncState<CatalogResponse>;
+  downloads: ModelDownloads;
+}): ReactElement {
+  const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
+  const host = models.data?.host;
+
+  return (
+    <PageSection
+      title="Install a System One model to get started"
+      description="Download Clairic Flash (9B) for fast structured extraction or Clairic (27B) for highest accuracy and forecasting."
+    >
+      {catalog.data === undefined && catalog.error === undefined ? (
+        <CatalogGrid>
+          <CatalogCardPlaceholder />
+          <CatalogCardPlaceholder />
+        </CatalogGrid>
+      ) : items.length > 0 ? (
+        <CatalogGrid>
+          {items.map((item) => {
+            const props = downloads.downloadProps(item);
+            return <CatalogCard key={item.hfRepo} {...props} item={item} host={host} />;
+          })}
+        </CatalogGrid>
+      ) : (
+        <EmptyState
+          title="No System One models installed"
+          description="Install a Clairic or CLEF checkpoint from Models or via `mlx download`."
+          action={
+            <Link className="link" to="/models">
+              Open Models
+            </Link>
+          }
+        />
+      )}
+    </PageSection>
+  );
+}

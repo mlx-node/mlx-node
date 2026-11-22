@@ -84,6 +84,10 @@ impl Qwen35Inner {
             final_norm,
             lm_head,
             clef_head: None,
+            clairic_head: None,
+            clairic_grammar: None,
+            clairic_multimodal: crate::models::qwen3_5::config::Qwen3_5MultimodalTokens::default(),
+            clairic_profile: None,
             prism_hadamard: None,
             dflash2: None,
             dflash2_context: None,
@@ -163,7 +167,10 @@ impl Qwen35Inner {
         // the old one.
         self.dflash2_states.clear();
         let recurrent = self.config.recurrent_state_bytes();
-        if self.clef_head.is_some() || !crate::models::qwen3_5::load_plan::qwen35_pool_backend() {
+        if self.clef_head.is_some()
+            || self.clairic_head.is_some()
+            || !crate::models::qwen3_5::load_plan::qwen35_pool_backend()
+        {
             crate::models::qwen3_5::load_plan::qwen35_no_pool_format(
                 "Qwen3.5",
                 self.config.kv_format(),
@@ -1760,5 +1767,15 @@ impl Qwen35Inner {
             }
         }
         Ok(())
+    }
+
+    /// Set the rotary position embedding mode on all decoder layers.
+    pub(crate) fn set_rope_mode_layers(
+        &mut self,
+        mode: crate::models::qwen3_5::attention::RopeMode,
+    ) {
+        for layer in self.layers.iter_mut() {
+            layer.set_rope_mode(mode);
+        }
     }
 }

@@ -25,6 +25,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
+import { ClairicModel } from '../clairic.js';
 import { ClefModel } from '../clef.js';
 import { findDFlash2Draft } from '../draft-companion.js';
 import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family-data.js';
@@ -205,6 +206,7 @@ const LOADER_BINDINGS = {
   },
   jina_reranker: { load: (path: string) => JinaRerankerModel.load(path), nativeModelClass: JinaRerankerModel },
   clef: { load: (path: string) => ClefModel.load(path), nativeModelClass: ClefModel },
+  clairic: { load: (path: string) => ClairicModel.load(path), nativeModelClass: ClairicModel },
   gemma4: {
     load: (modelPath: string, options?: LoadModelOptions) =>
       Gemma4Model.load(

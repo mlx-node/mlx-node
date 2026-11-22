@@ -54,6 +54,8 @@ export interface CatalogEntry {
   assetsRepo?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
+  /** Which product surface this catalog entry belongs to (default `'chat'`). */
+  category?: 'chat' | 'systemone';
   /** Optional companion, downloaded separately and never offered as a chat model. */
   draft?: { label: string; hfRepo: string; sizeGb: number };
   /** One line for the wizard. */
@@ -156,6 +158,36 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     sizeGb: 23,
     description: 'Hybrid Mamba-2 + MoE, native MTP, 1M context',
     hidden: true,
+  },
+  {
+    label: 'Clairic Flash (9B)',
+    hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic-flash',
+    sizeGb: 7.6,
+    category: 'systemone',
+    description: 'Fast 9B extraction, vision, PDF & forecasting (UD-Q4_K_XL)',
+  },
+  {
+    label: 'Clairic (27B)',
+    hfRepo: 'Brooooooklyn/Clairic-GGUF',
+    globs: [
+      '*UD-Q4_K_XL*',
+      'mmproj-BF16.gguf',
+      'clair_head.safetensors',
+      'clair_head_config.json',
+      'preprocessor_config.json',
+    ],
+    assetsRepo: 'Cloudflare/clairic',
+    sizeGb: 18.9,
+    category: 'systemone',
+    description: 'High-accuracy 27B extraction, tables & PDFs (UD-Q4_K_XL)',
   },
 ];
 
@@ -265,9 +297,14 @@ export function catalogEntryForRepo(repo: string, platform: NodeJS.Platform): Ca
   return MODEL_CATALOG.find((entry) => catalogRepoFor(entry, platform) === repo);
 }
 
-/** Catalog entries the wizard offers (hidden entries filtered out). */
+/** Catalog entries the wizard offers (visible chat entries only). */
 export function visibleCatalog(): CatalogEntry[] {
-  return MODEL_CATALOG.filter((entry) => !entry.hidden);
+  return MODEL_CATALOG.filter((entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat');
+}
+
+/** Visible System One (Clairic / CLEF) catalog entries. */
+export function visibleSystemOneCatalog(): CatalogEntry[] {
+  return MODEL_CATALOG.filter((entry) => !entry.hidden && entry.category === 'systemone');
 }
 
 /**

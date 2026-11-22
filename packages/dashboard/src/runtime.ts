@@ -43,8 +43,15 @@ import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
 import { createLiveWatcher, type LiveEvent } from './live.js';
 import { defaultModelsDir } from './models.js';
-import { dashboardDbPath, desktopSupervisorStatePath, metricsRuntimeDir, metricsTraceDir } from './paths.js';
+import {
+  dashboardDbPath,
+  desktopSupervisorStatePath,
+  metricsRuntimeDir,
+  metricsTraceDir,
+  systemOneHistoryPath,
+} from './paths.js';
 import type { ChatScope } from './rpc/protocol.js';
+import { SystemOneService, type SystemOneJobSnapshot } from './systemone.js';
 import { startDbWorker, type DbWorkerLifecycle, type WorkerQueue } from './worker/client.js';
 
 /** Incremental rescan cadence while the runtime is alive. */
@@ -124,6 +131,8 @@ export interface DashboardRuntimeOptions {
   /** Where coding-agent instruction files are looked up. Tests and the dev harness pass a sandbox. */
   codingAgents?: Pick<CodingAgentsOptions, 'home' | 'env'>;
   chat?: ChatRuntimeOptions;
+  /** System One history file override (tests / dev harness). Default `~/.mlx-node/desktop/systemone-history.json`. */
+  systemOneHistoryPath?: string;
 }
 
 /** One API call, addressed the way `fetch` would address it. */
@@ -166,6 +175,8 @@ export interface DashboardRuntime {
   watchLive(listener: (event: LiveEvent) => void): () => void;
   /** Open a Chat stream: the host state, or one conversation. Returns the unsubscribe. */
   watchChat(scope: ChatScope, send: (event: ChatHostEvent | ConversationEvent) => void): () => void;
+  /** Subscribe to a System One job's status/result updates. Returns the unsubscribe. */
+  watchSystemOne(jobId: string, listener: (event: SystemOneJobSnapshot) => void): () => void;
   /** The conversations with a turn running, both modes. Synchronous: no worker, no fs. */
   busyConversations(): string[];
   /** The running turns a close would stop: those not already stopping for another cause. Synchronous. */
@@ -324,9 +335,10 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     secrets: chatOpts.secrets ?? new KeyringSecretStore(),
     baseUrls: chatOpts.providerBaseUrls,
   });
+  const readEndpoint = chatOpts.readEndpoint ?? (() => readDesktopEndpoint());
   const chat = new ChatService({
     paths,
-    readEndpoint: chatOpts.readEndpoint ?? (() => readDesktopEndpoint()),
+    readEndpoint,
     modelSize: chatOpts.modelSize,
     resolveAgent: () => resolveAgent(chatOpts.agentCommand),
     readSession: async (id: string): Promise<SessionDetailResponse | null> => {
@@ -354,6 +366,12 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     appEnds: chatOpts.appEnds,
     onBusyChange: chatOpts.onBusyChange,
   });
+  const systemone = new SystemOneService({
+    modelsDir,
+    readEndpoint,
+    live,
+    historyPath: opts.systemOneHistoryPath ?? systemOneHistoryPath(),
+  });
   const context: MainApiContext = {
     modelsDir,
     tracesDir,
@@ -365,6 +383,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     live,
     chat,
     providers,
+    systemone,
   };
 
   // The boot ingest runs inside the worker; only the periodic rescan is driven
@@ -384,7 +403,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       // (SIGINT/SIGTERM → `process.exit`) can't kill the process mid-write and
       // orphan a partial, potentially multi-GB `.staging` tree, nor let a
       // background job publish a model after the runtime is considered closed.
-      await Promise.all([downloads.shutdown(), codingAgents.close(), chat.close()]);
+      await Promise.all([downloads.shutdown(), codingAgents.close(), chat.close(), systemone.close()]);
       // `clearInterval` only stops FUTURE ticks: a rescan already in flight kept
       // running while the database closed underneath it, which only ever looked
       // harmless because the ingest catch swallowed the resulting "database is
@@ -468,6 +487,9 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     },
     watchChat(scope: ChatScope, send: (event: ChatHostEvent | ConversationEvent) => void): () => void {
       return chat.watch(scope, send);
+    },
+    watchSystemOne(jobId: string, listener: (event: SystemOneJobSnapshot) => void): () => void {
+      return systemone.watch(jobId, listener);
     },
     busyConversations(): string[] {
       return chat.busyConversations();

@@ -57,7 +57,7 @@ pub(crate) fn merged_image_token_count(
 }
 
 /// Qwen3.5-VL image processor configuration
-fn qwen35_vl_processor_config() -> ImageProcessorConfig {
+pub(crate) fn qwen35_vl_processor_config() -> ImageProcessorConfig {
     ImageProcessorConfig {
         min_pixels: 147384,
         max_pixels: 2822400,
@@ -173,6 +173,30 @@ impl QwenImageProcessor {
         })
     }
 
+    /// Process a single already-decoded RGB image without re-encoding.
+    #[allow(dead_code)]
+    pub(crate) fn process_rgb_image(&self, img: &RgbImage) -> Result<ProcessedImage> {
+        let (orig_width, orig_height) = img.dimensions();
+        let geometry = self.plan_geometry(orig_width, orig_height)?;
+        let rgb_img = image::imageops::resize(
+            img,
+            geometry.resized_width as u32,
+            geometry.resized_height as u32,
+            FilterType::CatmullRom,
+        );
+        self.process_resized_rgb(&rgb_img, geometry)
+    }
+
+    /// Process multiple already-decoded RGB images without re-encoding.
+    #[allow(dead_code)]
+    pub(crate) fn process_many_rgb(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
+        let processed: Vec<ProcessedImage> = images
+            .iter()
+            .map(|img| self.process_rgb_image(img))
+            .collect::<Result<_>>()?;
+        aggregate_processed_images(processed)
+    }
+
     /// Internal: Process a loaded image
     fn process_image(&self, img: DynamicImage) -> Result<ProcessedImage> {
         let (orig_width, orig_height) = img.dimensions();
@@ -183,6 +207,16 @@ impl QwenImageProcessor {
 
         let resized = img.resize_exact(new_width as u32, new_height as u32, FilterType::CatmullRom);
         let rgb_img: RgbImage = resized.to_rgb8();
+        self.process_resized_rgb(&rgb_img, geometry)
+    }
+
+    fn process_resized_rgb(
+        &self,
+        rgb_img: &RgbImage,
+        geometry: QwenImageGeometry,
+    ) -> Result<ProcessedImage> {
+        let new_height = geometry.resized_height;
+        let new_width = geometry.resized_width;
 
         // Convert to float and normalize
         let (height, width) = (new_height, new_width);
@@ -328,5 +362,46 @@ mod tests {
         assert_eq!(wide_processed.image_grid_thw(), vec![1, 2, 4]);
         assert_eq!(square_processed.image_grid_thw(), vec![1, 2, 2]);
         assert_eq!(planned, vec![2, 1]);
+    }
+
+    #[test]
+    fn process_rgb_matches_encoded_png() {
+        let processor = QwenImageProcessor::new(Some(ImageProcessorConfig {
+            min_pixels: 32 * 32,
+            max_pixels: 64 * 64,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 2,
+            image_mean: vec![0.5; 3],
+            image_std: vec![0.5; 3],
+            do_rescale: true,
+            do_normalize: true,
+        }));
+        let mut rgb = RgbImage::new(64, 32);
+        for (x, y, p) in rgb.enumerate_pixels_mut() {
+            *p = image::Rgb([(x * 3) as u8, (y * 7) as u8, ((x + y) * 5) as u8]);
+        }
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(rgb.clone())
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode PNG");
+        let from_png = processor
+            .process_bytes(&encoded.into_inner())
+            .expect("process PNG");
+        let from_rgb = processor.process_rgb_image(&rgb).expect("process RGB");
+
+        assert_eq!(from_png.image_grid_thw(), from_rgb.image_grid_thw());
+        assert_eq!(
+            from_png.pixel_values().to_float32().unwrap().as_ref(),
+            from_rgb.pixel_values().to_float32().unwrap().as_ref()
+        );
+
+        let batch = processor
+            .process_many_rgb(&[rgb.clone(), rgb])
+            .expect("process many RGB");
+        assert_eq!(
+            batch.grid_thw().to_int32().unwrap().as_ref(),
+            &[1, 2, 4, 1, 2, 4]
+        );
     }
 }

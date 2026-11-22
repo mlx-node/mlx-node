@@ -19,7 +19,7 @@ import type { RpcPort } from '../../../src/rpc/port.js';
 import type { ChatHostEvent, ConversationEvent } from './chat-types';
 import { bumpConnectionGeneration, markTransportDown } from './connection';
 import { cacheEpoch, clearCache } from './json-cache';
-import type { LiveEvent } from './types';
+import type { LiveEvent, SystemOneJobSnapshot } from './types';
 
 /**
  * Error thrown for any failed API call.
@@ -228,4 +228,43 @@ export function subscribeConversation(id: string, onEvent: (event: ConversationE
     onEvent(event as ConversationEvent),
   );
   return { close: unsubscribe };
+}
+
+function isTerminalSystemOneStatus(status: SystemOneJobSnapshot['status']): boolean {
+  return status === 'done' || status === 'error' || status === 'cancelled';
+}
+
+/** Subscribe to live snapshots for one System One job; calls `onEnd` once a terminal state arrives. */
+export function subscribeSystemOne(
+  jobId: string,
+  onEvent: (snap: SystemOneJobSnapshot) => void,
+  onEnd?: () => void,
+): Subscription {
+  let closed = false;
+  let ended = false;
+  let unsubscribe: (() => void) | null = null;
+  const finish = (): void => {
+    if (ended) return;
+    ended = true;
+    onEnd?.();
+  };
+  unsubscribe = requireClient().watchSystemOne(jobId, (snap) => {
+    if (closed) return;
+    onEvent(snap);
+    if (isTerminalSystemOneStatus(snap.status)) {
+      closed = true;
+      unsubscribe?.();
+      finish();
+    }
+  });
+  if (closed) {
+    unsubscribe();
+  }
+  return {
+    close(): void {
+      if (closed) return;
+      closed = true;
+      unsubscribe?.();
+    },
+  };
 }

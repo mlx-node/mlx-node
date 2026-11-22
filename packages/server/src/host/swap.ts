@@ -11,8 +11,9 @@
  * without it is freed by garbage collection, which this wait does not cover.
  */
 
-import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-node/lm';
+import type { LoadableModel, SessionCapableModel } from '@mlx-node/lm';
 
+import type { SystemOneModel } from '../decision-registry.js';
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
 import { FLUSH_MS } from '../supervision.js';
@@ -39,6 +40,10 @@ export interface SwapController {
 
 function identityOf(entry: DiscoveredModel): ModelIdentity {
   return { modelId: entry.name, modelType: String(entry.modelType), contextWindow: entry.contextWindow };
+}
+
+function isDecisionEntry(entry: DiscoveredModel | undefined): boolean {
+  return entry !== undefined && (entry.modelType === 'clairic' || entry.modelType === 'clef');
 }
 
 /** A model whose SSD state cache holds its directory's lock until it closes. */
@@ -160,7 +165,8 @@ export function makeSwapController(
       // the user's switch when its turn finally comes around.
       const knownEntry = byName.get(name);
       const targetEntry = knownEntry ?? selectedEntry;
-      const isAlias = targetEntry.name !== name;
+      const targetIsDecision = isDecisionEntry(targetEntry);
+      const isAlias = targetEntry.name !== name && (!targetIsDecision || isDecisionEntry(selectedEntry));
 
       // Swap out any stale resident that isn't the target.
       //
@@ -170,8 +176,10 @@ export function makeSwapController(
       // window yields a spurious 404. Instead we carry the alias set
       // across the swap and re-point them to the new resident below,
       // so the name always resolves to *some* live instance.
+      // Never carry Chat aliases across into a decision model (Clairic/CLEF).
       const oldResident = resident;
-      const carriedAliases = new Set(aliases);
+      const carriedAliases = targetIsDecision ? new Set<string>() : new Set(aliases);
+      const droppedCrossKindAliases = targetIsDecision ? new Set(aliases) : new Set<string>();
       // A busy old model would defer its teardown behind a request that
       // waits for this load, so it keeps its aliases until the new model is
       // in hand. A request between its resolve and its dispatch lease holds
@@ -201,6 +209,9 @@ export function makeSwapController(
         drop(oldResident.name, { dispose: true });
         if (freeFirst) {
           for (const aliasName of carriedAliases) if (registry.getAny(aliasName)) drop(aliasName, { dispose: true });
+        }
+        for (const aliasName of droppedCrossKindAliases) {
+          if (registry.getAny(aliasName)) drop(aliasName, { dispose: true });
         }
         resident = null;
         // With no aliases this joins the old model thread before the new load.
@@ -239,7 +250,7 @@ export function makeSwapController(
           // alone disposed the old model first: nothing is left to restore.
           if (!freeFirst) for (const aliasName of carriedAliases) aliases.add(aliasName);
           if (oldResident && !freeFirst) {
-            let oldInstance: SessionCapableModel | DecisionModel | undefined;
+            let oldInstance: SessionCapableModel | SystemOneModel | undefined;
             for (const aliasName of carriedAliases) {
               const probe = registry.getAny(aliasName);
               if (probe) {
@@ -259,7 +270,7 @@ export function makeSwapController(
           }
           throw err;
         }
-        instance = loaded as unknown as SessionCapableModel | DecisionModel;
+        instance = loaded as unknown as SessionCapableModel | SystemOneModel;
         registry.registerAny(targetEntry.name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
           maxOutputTokens: targetEntry.preset.maxOutputTokens,
@@ -269,7 +280,11 @@ export function makeSwapController(
       } else if (!resident) {
         resident = { name: targetEntry.name };
       }
-      selectedEntry = targetEntry;
+      // Preserve Chat's fallback `selectedEntry` across decision-model swaps so
+      // unknown Chat aliases never silently route to Clairic/CLEF.
+      if (!targetIsDecision || isDecisionEntry(selectedEntry)) {
+        selectedEntry = targetEntry;
+      }
 
       // Re-point any aliases carried across the swap onto the new
       // resident. `registry.registerAny(sameName, differentModel)` drops

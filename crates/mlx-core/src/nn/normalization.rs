@@ -32,6 +32,9 @@ pub fn rms_norm_scaled(x: &MxArray, weight: &MxArray, eps: f32) -> Result<MxArra
 enum RmsNormOutputPolicy {
     #[default]
     Native,
+    /// Compute RMSNorm in Float32 and cast the output back to the input dtype
+    /// (matching `mlx_engine.py::PreciseRMSNorm` for Clairic checkpoints).
+    PreciseF32,
     SourceF32ReferenceBf16,
     SourceF32SplashBf16,
 }
@@ -58,6 +61,27 @@ impl RMSNorm {
     /// Forward pass: RMSNorm(x) = x * weight / sqrt(mean(x^2) + eps)
     /// Uses mx.fast.rms_norm for optimal performance (single fused Metal kernel)
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
+        if matches!(self.output_policy, RmsNormOutputPolicy::PreciseF32) {
+            let in_dtype = input.dtype()?;
+            let x_f32 = if in_dtype == crate::array::DType::Float32 {
+                input.clone()
+            } else {
+                input.astype(crate::array::DType::Float32)?
+            };
+            let w_f32 = if self.weight.dtype()? == crate::array::DType::Float32 {
+                self.weight.clone()
+            } else {
+                self.weight.astype(crate::array::DType::Float32)?
+            };
+            let handle =
+                unsafe { sys::mlx_fast_rms_norm(x_f32.handle.0, w_f32.handle.0, self.eps as f32) };
+            let out = MxArray::from_handle(handle, "precise_f32_rms_norm")?;
+            return if in_dtype == crate::array::DType::Float32 {
+                Ok(out)
+            } else {
+                out.astype(in_dtype)
+            };
+        }
         if matches!(
             self.output_policy,
             RmsNormOutputPolicy::SourceF32ReferenceBf16 | RmsNormOutputPolicy::SourceF32SplashBf16
@@ -115,7 +139,9 @@ impl RMSNorm {
             return None;
         }
         match self.output_policy {
-            RmsNormOutputPolicy::SourceF32ReferenceBf16 => return None,
+            RmsNormOutputPolicy::PreciseF32 | RmsNormOutputPolicy::SourceF32ReferenceBf16 => {
+                return None;
+            }
             RmsNormOutputPolicy::SourceF32SplashBf16 => {
                 let mut hidden = std::ptr::null_mut();
                 let mut normalized = std::ptr::null_mut();
@@ -162,6 +188,12 @@ impl RMSNorm {
         let h = MxArray::from_handle(h, "add_rmsnorm:h").ok()?;
         let normed = MxArray::from_handle(normed, "add_rmsnorm:normed").ok()?;
         Some((h, normed))
+    }
+
+    /// Evaluate RMSNorm in Float32 (casting input and weight to Float32) and
+    /// cast the result back to the input dtype.
+    pub fn set_precise_f32(&mut self) {
+        self.output_policy = RmsNormOutputPolicy::PreciseF32;
     }
 
     /// Load-only diagnostic policy; callers validate original GGUF identity.
@@ -699,5 +731,54 @@ mod tests {
         // Shape mismatch between x and res → decline.
         let res_bad = MxArray::from_float32(&vec![0.1; 4 * 32], &[4, 32]).unwrap();
         assert!(norm.forward_residual_add(&x, &res_bad).is_none());
+    }
+
+    #[test]
+    fn test_rms_norm_precise_f32_bf16_input_matches_reference() {
+        let eps = 1e-6f64;
+        let hidden = 16i64;
+        let mut norm = RMSNorm::new(hidden as u32, Some(eps)).unwrap();
+        // High-precision FP32 weight values that would lose precision if downcast to BF16.
+        let w_vals: Vec<f32> = (0..hidden)
+            .map(|i| 1.0 + (i as f32 + 1.0) * 0.001_357_9)
+            .collect();
+        let w_f32 = MxArray::from_float32(&w_vals, &[hidden]).unwrap();
+        norm.set_weight(&w_f32).unwrap();
+        norm.set_precise_f32();
+
+        assert_eq!(norm.weight().dtype().unwrap(), DType::Float32);
+
+        let x_vals: Vec<f32> = (0..2 * hidden)
+            .map(|i| ((i as f32) * 0.37).sin() * 2.5)
+            .collect();
+        let x_bf16 = MxArray::from_float32(&x_vals, &[2, hidden])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let res_bf16 = MxArray::from_float32(&vec![0.25; (2 * hidden) as usize], &[2, hidden])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // PreciseF32 must decline the fused residual-add kernel so callers fall back.
+        assert!(norm.forward_residual_add(&x_bf16, &res_bf16).is_none());
+
+        let out = norm.forward(&x_bf16).unwrap();
+        assert_eq!(out.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(out.shape().unwrap().as_ref(), &[2, hidden]);
+
+        // Explicit FP32 reference: rms_norm(x.astype(f32), w_f32, eps).astype(bf16)
+        let x_f32 = x_bf16.astype(DType::Float32).unwrap();
+        let ref_handle =
+            unsafe { sys::mlx_fast_rms_norm(x_f32.handle.0, w_f32.handle.0, eps as f32) };
+        let expected = MxArray::from_handle(ref_handle, "ref_precise_f32")
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        assert_eq!(
+            out.to_float32().unwrap().to_vec(),
+            expected.to_float32().unwrap().to_vec()
+        );
     }
 }

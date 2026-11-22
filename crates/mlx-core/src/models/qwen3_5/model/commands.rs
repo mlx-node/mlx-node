@@ -11,6 +11,11 @@ pub(crate) enum Qwen35FamilyCommand {
         cancelled: Arc<AtomicBool>,
         reply: ResponseTx<String>,
     },
+    /// Execute a Clairic extraction / readout closure directly on the model thread.
+    RunClairic {
+        task: Box<dyn FnOnce(&mut Qwen35Inner) -> Result<String> + Send>,
+        reply: ResponseTx<String>,
+    },
     /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
     /// `MaxCalibrator`). For each raw text: tokenize WITHOUT the chat template,
     /// truncate to `calib_seq` tokens, then run PREFILL ONLY (no generation, no
@@ -155,6 +160,9 @@ impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCo
                 reply,
             } => {
                 let _ = reply.send(inner.decide_clef(&request, &cancelled));
+            }
+            Qwen35FamilyCommand::RunClairic { task, reply } => {
+                let _ = reply.send(task(inner));
             }
             Qwen35FamilyCommand::CalibratePrefillRaw {
                 texts,

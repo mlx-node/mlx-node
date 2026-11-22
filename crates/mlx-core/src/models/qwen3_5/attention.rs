@@ -20,6 +20,19 @@ use napi::bindgen_prelude::*;
 use super::config::Qwen3_5Config;
 use crate::models::quantized_linear::{LinearProj, MixerResidual, QuantizedLinear};
 
+/// Rotary position embedding mode for full-attention layers when 3D M-RoPE
+/// `position_ids` (`[3, B, T]`) are provided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeMode {
+    /// Standard Qwen3.5-VL interleaved 3D M-RoPE across `(temporal, height, width)`.
+    #[default]
+    MRoPE,
+    /// Temporal-only RoPE: all rotary frequencies use axis 0 (`position_ids[0]`),
+    /// so image tokens share their temporal axis-0 rotary position while text
+    /// tokens remain identical.
+    Temporal,
+}
+
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
 /// Key differences from standard Qwen3 attention:
@@ -40,6 +53,8 @@ pub struct Qwen3_5Attention {
     rope: RoPE,
     /// Optional M-RoPE for VLM mode (3D position encoding: temporal, height, width)
     mrope: Option<MultimodalRoPE>,
+    /// Rotary embedding mode when 3D `position_ids` + `mrope` are active.
+    rope_mode: RopeMode,
 
     num_heads: i32,
     num_kv_heads: i32,
@@ -661,6 +676,7 @@ impl Qwen3_5Attention {
             source_qk: None,
             rope,
             mrope: None,
+            rope_mode: RopeMode::MRoPE,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -1081,13 +1097,27 @@ impl Qwen3_5Attention {
                         // Transpose to [B, H, T, D] for the rotary apply.
                         let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
                         let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-                        let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
-                            &q_t,
-                            &k_t,
-                            &cos,
-                            &sin,
-                            mrope.mrope_section_arr().to_vec(),
-                        )?;
+                        let (q_out, k_out) = match self.rope_mode {
+                            RopeMode::MRoPE => apply_multimodal_rotary_pos_emb_interleaved(
+                                &q_t,
+                                &k_t,
+                                &cos,
+                                &sin,
+                                mrope.mrope_section_arr().to_vec(),
+                            )?,
+                            RopeMode::Temporal => {
+                                let cos_batch = cos.shape_at(1)?;
+                                let cos_seq = cos.shape_at(2)?;
+                                let rope_dim = cos.shape_at(3)?;
+                                let cos_t = cos
+                                    .slice_axis(0, 0, 1)?
+                                    .reshape(&[cos_batch, 1, cos_seq, rope_dim])?;
+                                let sin_t = sin
+                                    .slice_axis(0, 0, 1)?
+                                    .reshape(&[cos_batch, 1, cos_seq, rope_dim])?;
+                                apply_interleaved_rotary(&q_t, &k_t, &cos_t, &sin_t)?
+                            }
+                        };
                         // Transpose back to [B, T, H, D]
                         let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
                         let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
@@ -1503,8 +1533,22 @@ impl Qwen3_5Attention {
                 Some(cached) => cached.clone(),
                 None => {
                     let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-                    let selected =
-                        select_interleaved_cos_sin(&cos, &sin, mrope.mrope_section_arr())?;
+                    let selected = match self.rope_mode {
+                        RopeMode::MRoPE => {
+                            select_interleaved_cos_sin(&cos, &sin, mrope.mrope_section_arr())?
+                        }
+                        RopeMode::Temporal => {
+                            let cos_batch = cos.shape_at(1)?;
+                            let cos_seq = cos.shape_at(2)?;
+                            let rope_dim = cos.shape_at(3)?;
+                            (
+                                cos.slice_axis(0, 0, 1)?
+                                    .reshape(&[cos_batch, 1, cos_seq, rope_dim])?,
+                                sin.slice_axis(0, 0, 1)?
+                                    .reshape(&[cos_batch, 1, cos_seq, rope_dim])?,
+                            )
+                        }
+                    };
                     *mrope_cache = Some(selected.clone());
                     selected
                 }
@@ -1960,6 +2004,13 @@ impl Qwen3_5Attention {
         Ok(())
     }
 
+    /// Set the rotary position embedding mode used when 3D `position_ids` +
+    /// `mrope` are active.
+    #[allow(dead_code)]
+    pub(crate) fn set_rope_mode(&mut self, mode: RopeMode) {
+        self.rope_mode = mode;
+    }
+
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_q_proj_weight(&mut self, w: &MxArray) -> Result<()> {
@@ -2011,6 +2062,12 @@ impl Qwen3_5Attention {
         }
         self.k_norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
+    }
+
+    /// Enable Float32 RMSNorm evaluation on `q_norm` and `k_norm`.
+    pub(crate) fn set_precise_f32_norms(&mut self) {
+        self.q_norm.set_precise_f32();
+        self.k_norm.set_precise_f32();
     }
 
     /// Precompute the block-ordered `[hidden, 2*H*D]` q_proj weight (queries
@@ -3324,7 +3381,140 @@ mod tests {
         }
     }
 
-    /// RoPE token-axis regression test. Prefills one KV cache with a single
+    #[test]
+    fn temporal_rope_matches_axis0() {
+        let mut cfg = tiny_cfg();
+        cfg.head_dim = 16;
+        cfg.partial_rotary_factor = 0.5; // rope_dims = 8 -> half_dim = 4
+        let mut attn = Qwen3_5Attention::new(&cfg).unwrap();
+        attn.init_mrope(
+            vec![2, 1, 1],
+            cfg.rope_theta,
+            cfg.max_position_embeddings,
+            cfg.rope_dims(),
+            &RopeScaling::default(),
+        )
+        .unwrap();
+
+        let batch = 2i64;
+        let seq_len = 6i64;
+        let hidden = cfg.hidden_size as i64;
+        let x_data: Vec<f32> = (0..(batch * seq_len * hidden) as usize)
+            .map(|i| ((i as f32) * 0.053).sin() * 0.4)
+            .collect();
+        let x = MxArray::from_float32(&x_data, &[batch, seq_len, hidden]).unwrap();
+
+        // Spatial 3D position_ids [3, B, T]: axes 1 & 2 diverge from axis 0 on image tokens.
+        let axis0: Vec<i32> = vec![
+            0, 1, 2, 2, 2, 5, // row 0
+            0, 1, 1, 1, 1, 4, // row 1
+        ];
+        let axis1: Vec<i32> = vec![
+            0, 1, 2, 3, 4, 5, // row 0
+            0, 1, 2, 3, 4, 4, // row 1
+        ];
+        let axis2: Vec<i32> = vec![
+            0, 1, 2, 4, 7, 5, // row 0
+            0, 1, 5, 6, 7, 4, // row 1
+        ];
+        let mut spatial_flat = Vec::with_capacity(3 * (batch * seq_len) as usize);
+        spatial_flat.extend_from_slice(&axis0);
+        spatial_flat.extend_from_slice(&axis1);
+        spatial_flat.extend_from_slice(&axis2);
+        let pos_spatial = MxArray::from_int32(&spatial_flat, &[3, batch, seq_len]).unwrap();
+
+        let mut axis0_flat = Vec::with_capacity(3 * (batch * seq_len) as usize);
+        axis0_flat.extend_from_slice(&axis0);
+        axis0_flat.extend_from_slice(&axis0);
+        axis0_flat.extend_from_slice(&axis0);
+        let pos_axis0 = MxArray::from_int32(&axis0_flat, &[3, batch, seq_len]).unwrap();
+
+        // In default MRoPE mode, differing axes 1 & 2 produce a distinct output.
+        let mrope_spatial = attn
+            .forward(&x, None, None, Some(&pos_spatial))
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let mrope_axis0 = attn
+            .forward(&x, None, None, Some(&pos_axis0))
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let mrope_diff = mrope_spatial
+            .as_ref()
+            .iter()
+            .zip(mrope_axis0.as_ref())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mrope_diff > 1e-4,
+            "expected MRoPE to depend on spatial axes 1 & 2, got max_diff={mrope_diff}"
+        );
+
+        // In Temporal mode, spatial axes 1 & 2 are ignored: output and cached rotated K
+        // match [pos0, pos0, pos0] identically.
+        attn.set_rope_mode(RopeMode::Temporal);
+        let mut kv_spatial = KVCache::new();
+        let mut kv_axis0 = KVCache::new();
+        let temp_spatial = attn
+            .forward(&x, None, Some(&mut kv_spatial), Some(&pos_spatial))
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let temp_axis0 = attn
+            .forward(&x, None, Some(&mut kv_axis0), Some(&pos_axis0))
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        let out_diff = temp_spatial
+            .as_ref()
+            .iter()
+            .zip(temp_axis0.as_ref())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            out_diff < 1e-6,
+            "Temporal RoPE output mismatch vs [pos0, pos0, pos0]: max_diff={out_diff}"
+        );
+
+        let k_spatial = kv_spatial
+            .keys_ref()
+            .unwrap()
+            .slice_axis(2, 0, seq_len)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let k_axis0 = kv_axis0
+            .keys_ref()
+            .unwrap()
+            .slice_axis(2, 0, seq_len)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let k_diff = k_spatial
+            .as_ref()
+            .iter()
+            .zip(k_axis0.as_ref())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            k_diff < 1e-6,
+            "Temporal RoPE cached K mismatch vs [pos0, pos0, pos0]: max_diff={k_diff}"
+        );
+
+        // Text-only positions (all 3 axes equal) match MRoPE identically.
+        let text_diff = temp_axis0
+            .as_ref()
+            .iter()
+            .zip(mrope_axis0.as_ref())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            text_diff < 1e-6,
+            "Text-only positions should match between Temporal and MRoPE: max_diff={text_diff}"
+        );
+    }
     /// 4-token forward (chunk) and another with 4 single-token forwards
     /// (stepwise), then runs the same probe token through both caches and
     /// compares the outputs.

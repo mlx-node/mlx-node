@@ -484,7 +484,10 @@ class Sampler implements RuntimeSampler {
       const ctxWindow = entry.sessions.servedWindowTokens;
       let paged = false;
       try {
-        paged = entry.model.hasBlockPagedCache?.() === true;
+        paged =
+          'hasBlockPagedCache' in entry.model && typeof entry.model.hasBlockPagedCache === 'function'
+            ? entry.model.hasBlockPagedCache() === true
+            : false;
       } catch {
         // Facts stay at their defaults.
       }
@@ -536,7 +539,7 @@ class Sampler implements RuntimeSampler {
     let inFlight = 0;
     let queued = 0;
     for (const view of views) {
-      inFlight += view.turns.length;
+      inFlight += view.entry.kind === 'decision' ? view.active : view.turns.length;
       queued += view.queued;
     }
     const busyMs = this.busyAccumMs + (this.busySince !== null ? now - this.busySince : 0);
@@ -685,7 +688,7 @@ class Sampler implements RuntimeSampler {
       maxConcurrent: sessions.concurrentAdmissionLimit,
       loadedAt: loaded?.loadedAt ?? null,
       loadMs: loaded?.loadMs ?? null,
-      inFlight: view.turns.length,
+      inFlight: view.entry.kind === 'decision' ? view.active : view.turns.length,
       queued: view.queued,
       queueLimit: sessions.queueDepthLimit ?? null,
       pool: schedState?.pool ?? null,
@@ -729,7 +732,7 @@ class Sampler implements RuntimeSampler {
     const mem = this.memory();
     const counters = turnCounters();
     let inFlight = 0;
-    for (const view of views) inFlight += view.turns.length;
+    for (const view of views) inFlight += view.entry.kind === 'decision' ? view.active : view.turns.length;
     let decodeTps: number | null = null;
     if (inFlight > 0 && this.lastLiveAt !== null && now > this.lastLiveAt) {
       const rate = ((counters.streamedTokens - this.lastLiveTokens) * 1000) / (now - this.lastLiveAt);

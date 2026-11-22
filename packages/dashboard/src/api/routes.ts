@@ -72,6 +72,14 @@ import {
   handleSessionsList,
   handleSessionTimeline,
 } from './handlers/sessions.js';
+import {
+  handleSystemOneHistoryDelete,
+  handleSystemOneJobCancel,
+  handleSystemOneJobGet,
+  handleSystemOneRun,
+  handleSystemOneState,
+  handleSystemOneUnload,
+} from './handlers/systemone.js';
 
 /** Which thread answers a route. */
 export type RouteThread = 'main' | 'worker';
@@ -190,4 +198,11 @@ export const ROUTES: Route[] = [
   mainRoute('PUT', '/api/providers/:id/key', handleProviderKeyPut),
   mainRoute('DELETE', '/api/providers/:id/key', handleProviderKeyDelete),
   mainRoute('POST', '/api/providers/:id/validate', handleProviderValidate),
+  // System One (Clairic + CLEF) async job proxy and history live on the transport thread.
+  mainRoute('GET', '/api/systemone/state', handleSystemOneState),
+  mainRoute('POST', '/api/systemone/run', handleSystemOneRun, { successStatus: 202 }),
+  mainRoute('GET', '/api/systemone/jobs/:id', handleSystemOneJobGet),
+  mainRoute('POST', '/api/systemone/jobs/:id/cancel', handleSystemOneJobCancel),
+  mainRoute('DELETE', '/api/systemone/history', handleSystemOneHistoryDelete),
+  mainRoute('POST', '/api/systemone/unload', handleSystemOneUnload),
 ];

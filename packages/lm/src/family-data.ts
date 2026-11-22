@@ -391,6 +391,12 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['clef'] },
   },
   {
+    id: 'clairic',
+    kind: 'decision',
+    visionConfigKeys: ['vision_config'],
+    match: { rawModelTypes: ['clairic'] },
+  },
+  {
     id: 'gemma4',
     visionConfigKeys: ['vision_config', 'unified_vision_config'],
     kind: 'loadable',

@@ -153,7 +153,7 @@ export const EXPERT_RESIDENCIES = [
 export type TurnOutcome = 'ok' | 'error' | 'cancelled';
 export type TurnErrorKind = 'finish_error' | 'exception';
 export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
-export type TurnEndpoint = 'messages' | 'responses' | 'other';
+export type TurnEndpoint = 'messages' | 'responses' | 'systemone' | 'other';
 export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
 /** Where a turn's thinking budget came from: the request, or the server's option. */
 export type TurnBudgetFrom = 'request' | 'server';
@@ -166,7 +166,7 @@ export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'
 export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
 /** The phases of a running native turn, in order; `done` is left out. */
 export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
-export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'other'];
+export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'systemone', 'other'];
 export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
 export const TURN_BUDGET_FROM: readonly TurnBudgetFrom[] = ['request', 'server'];
 export const TURN_REASONING_CLOSES: readonly TurnReasoningClose[] = ['model', 'budget', 'cycle', 'open'];
