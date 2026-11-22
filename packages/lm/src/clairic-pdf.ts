@@ -30,7 +30,41 @@ interface PdfjsAssetUrls {
   wasmUrl: string;
 }
 
+type CanvasModule = typeof import('@napi-rs/canvas');
+
 let cachedAssetUrls: PdfjsAssetUrls | undefined;
+let cachedCanvasModule: CanvasModule | undefined;
+
+/**
+ * Load `@napi-rs/canvas` via CJS `require` while temporarily hiding
+ * `NAPI_RS_NATIVE_LIBRARY_PATH`.
+ *
+ * Hosts such as the desktop inference sidecar set `NAPI_RS_NATIVE_LIBRARY_PATH`
+ * for `@mlx-node/core`. Because `@napi-rs/canvas` is also a NAPI-RS addon that
+ * checks the same generic variable first, leaving it visible causes Canvas to
+ * `require()` `mlx-core.*.node` instead of its own `skia.*.node` binary.
+ * Synchronous `createRequire` avoids any async window where concurrent work
+ * could observe the temporarily cleared env var.
+ */
+function loadCanvasModule(): CanvasModule {
+  if (cachedCanvasModule !== undefined) {
+    return cachedCanvasModule;
+  }
+  const require = createRequire(import.meta.url);
+  const hadOverride = Object.hasOwn(process.env, 'NAPI_RS_NATIVE_LIBRARY_PATH');
+  const savedOverride = process.env.NAPI_RS_NATIVE_LIBRARY_PATH;
+  if (hadOverride) {
+    delete process.env.NAPI_RS_NATIVE_LIBRARY_PATH;
+  }
+  try {
+    cachedCanvasModule = require('@napi-rs/canvas') as CanvasModule;
+    return cachedCanvasModule;
+  } finally {
+    if (hadOverride) {
+      process.env.NAPI_RS_NATIVE_LIBRARY_PATH = savedOverride;
+    }
+  }
+}
 
 function toTrailingSlashPath(dir: string): string {
   const normalized = dir.replaceAll('\\', '/');
@@ -215,14 +249,14 @@ export async function renderClairicDocuments(
 
   signal?.throwIfAborted();
 
-  const [pdfjs, canvasModule] = await Promise.all([
-    import('pdfjs-dist/legacy/build/pdf.mjs'),
-    import('@napi-rs/canvas'),
-  ]);
+  // Load `@napi-rs/canvas` BEFORE `pdfjs-dist`: pdfjs internally requires
+  // `@napi-rs/canvas` during module initialization to polyfill DOMMatrix/Path2D,
+  // so priming the module cache with `NAPI_RS_NATIVE_LIBRARY_PATH` hidden ensures
+  // both pdfjs and our renderer get Skia rather than `@mlx-node/core`.
+  const { createCanvas } = loadCanvasModule();
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
   signal?.throwIfAborted();
-
-  const { createCanvas } = canvasModule;
   const assetUrls = resolvePdfjsAssetUrls();
 
   const loadingTasks: ReturnType<typeof pdfjs.getDocument>[] = [];

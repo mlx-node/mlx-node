@@ -89,3 +89,10 @@
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .box,
+  .remove {
+    transition: none;
+  }
+}

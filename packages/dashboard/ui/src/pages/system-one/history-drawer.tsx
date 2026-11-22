@@ -171,7 +171,7 @@ export function HistoryDrawer({
                           <td>
                             <div className="grid gap-0.5">
                               <span>{row.valA}</span>
-                              <span className="text-[11px] text-muted tabular-nums">
+                              <span className="text-caption text-muted tabular-nums">
                                 {row.confA !== null ? `conf ${formatPercent(row.confA)}` : ''}
                                 {row.pNullA !== null ? ` · p_null ${formatPercent(row.pNullA)}` : ''}
                               </span>
@@ -180,7 +180,7 @@ export function HistoryDrawer({
                           <td>
                             <div className="grid gap-0.5">
                               <span>{row.valB}</span>
-                              <span className="text-[11px] text-muted tabular-nums">
+                              <span className="text-caption text-muted tabular-nums">
                                 {row.confB !== null ? `conf ${formatPercent(row.confB)}` : ''}
                                 {row.pNullB !== null ? ` · p_null ${formatPercent(row.pNullB)}` : ''}
                               </span>

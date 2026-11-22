@@ -366,6 +366,40 @@ describe('renderClairicDocuments', () => {
     ).rejects.toThrow(/cancelled by test/);
   });
 
+  it('loads @napi-rs/canvas cleanly even when NAPI_RS_NATIVE_LIBRARY_PATH points at another addon', () => {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+    const pdfModulePath = resolve(root, 'packages/lm/src/clairic-pdf.ts');
+    const fakeAddon = resolve(root, 'packages/lm/package.json');
+    const docUri = `data:application/pdf;base64,${makeOnePagePdf().toString('base64')}`;
+    const probe = `
+      const { registerHooks } = await import('node:module');
+      registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier === './clairic-types.js') {
+            return nextResolve('./clairic-types.ts', context);
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+      const { renderClairicDocuments } = await import(${JSON.stringify(pdfModulePath)});
+      const before = process.env.NAPI_RS_NATIVE_LIBRARY_PATH;
+      const pages = await renderClairicDocuments({ documents: [${JSON.stringify(docUri)}], fields: {} });
+      if (!Array.isArray(pages) || pages.length !== 1) throw new Error('expected 1 rendered page');
+      if (pages[0].width <= 0 || pages[0].height <= 0 || pages[0].rgb.length !== pages[0].width * pages[0].height * 3) {
+        throw new Error('invalid RGB24 buffer');
+      }
+      if (process.env.NAPI_RS_NATIVE_LIBRARY_PATH !== before) {
+        throw new Error('NAPI_RS_NATIVE_LIBRARY_PATH was not restored');
+      }
+      console.log('CANVAS-OVERRIDE-ISOLATED-OK');
+    `;
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', probe], {
+      encoding: 'utf-8',
+      env: { ...process.env, NAPI_RS_NATIVE_LIBRARY_PATH: fakeAddon },
+    });
+    expect(output).toContain('CANVAS-OVERRIDE-ISOLATED-OK');
+  });
+
   it('keeps clairic-types.ts 100% native-free', () => {
     const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
     const typesModulePath = resolve(root, 'packages/lm/src/clairic-types.ts');

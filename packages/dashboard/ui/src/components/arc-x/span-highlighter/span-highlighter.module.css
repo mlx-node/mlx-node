@@ -140,3 +140,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .legendBtn,
+  .mark {
+    transition: none;
+  }
+}

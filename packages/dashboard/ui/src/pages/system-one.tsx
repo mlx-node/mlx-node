@@ -21,10 +21,11 @@ import { Input } from '../components/arc/input/input';
 import SegmentedControl from '../components/arc/segmented-control/segmented-control';
 import { Switch } from '../components/arc/switch/switch';
 import { Tooltip } from '../components/arc/tooltip/tooltip';
+import { WaitClock } from '../components/wait-clock';
 import { DashboardApiError, getJson, mutate, subscribeSystemOne, type Subscription } from '../lib/api';
 import { getConnectionGeneration, subscribeConnection } from '../lib/connection';
 import { errMessage } from '../lib/errors';
-import { formatCount, formatDuration, formatDurationParts, formatPercent } from '../lib/format';
+import { formatCount, formatDurationParts, formatPercent } from '../lib/format';
 import { useRuntimeLive } from '../lib/live';
 import {
   type BatchRow,
@@ -522,15 +523,6 @@ export default function SystemOne(): ReactElement {
       }
     };
   }, [closeSubscription]);
-
-  // Tick elapsed timer smoothly while running
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    if (!isRunning) return;
-    setNowMs(Date.now());
-    const id = setInterval(() => setNowMs(Date.now()), 120);
-    return () => clearInterval(id);
-  }, [isRunning]);
 
   const applyRawJson = (text: string): void => {
     setRawJsonDraft(text);
@@ -1419,8 +1411,6 @@ export default function SystemOne(): ReactElement {
     setRightTab('evidence');
   };
 
-  const liveElapsedMs = activeJob !== null ? Math.max(activeJob.elapsedMs, nowMs - activeJob.startedAt) : 0;
-
   const missingModelForMode = installedModels.length > 0 && modelsForMode.length === 0;
   const showEmptyInstallCard = stateQuery.data !== undefined && installedModels.length === 0;
   const runnableBatchCount = batchRows.filter(
@@ -1943,7 +1933,7 @@ export default function SystemOne(): ReactElement {
                       }
                       enter
                     />
-                    <span className="text-caption text-secondary tabular-nums">{formatDuration(liveElapsedMs)}</span>
+                    {activeJob !== null ? <WaitClock since={activeJob.startedAt} /> : null}
                   </div>
                 ) : null}
 
