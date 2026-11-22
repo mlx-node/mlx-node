@@ -536,23 +536,10 @@ impl Weight {
         let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
             return Ok(None);
         };
-        let raw = unsafe {
-            let kernel = if decode {
-                mlx_sys::mlx_qwen4_decode_mixer_act
-            } else {
-                mlx_sys::mlx_qwen4_prefill_mixer_act
-            };
-            kernel(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            Ok(None)
+        if decode {
+            crate::kernels::qwen4::metal::decode_mixer_act(x, &self.values, scales, biases)
         } else {
-            MxArray::from_handle(raw, "Qwen4 reference mixer activation").map(Some)
+            crate::kernels::qwen4::metal::prefill_mixer_act(x, &self.values, scales, biases)
         }
     }
 
@@ -563,20 +550,7 @@ impl Weight {
         let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
             return Ok(None);
         };
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_hyper_up(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                normed.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(raw, "Qwen4 hyper up").map(Some)
-        }
+        crate::kernels::qwen4::metal::hyper_up(x, &self.values, scales, biases, normed)
     }
 
     pub(super) fn stack(weights: &[Arc<Self>]) -> Result<Option<Self>> {
@@ -692,36 +666,23 @@ impl Weight {
             && self.bits == 8
             && self.group == 32
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
+            && let Some(compact) =
+                crate::kernels::qwen4::metal::dense_decode(x, &self.values, scales, biases)?
         {
-            let compact = unsafe {
-                mlx_sys::mlx_qwen4_dense_decode(
-                    x.as_raw_ptr(),
-                    self.values.as_raw_ptr(),
-                    scales.as_raw_ptr(),
-                    biases.as_raw_ptr(),
-                )
-            };
-            if !compact.is_null() {
-                return MxArray::from_handle(compact, "Qwen4 compact dense decode");
-            }
+            return Ok(compact);
         }
-        let compact = if !on_cuda && self.mode == "affine" && self.bits == 8 && self.group == 32 {
-            match (&self.scales, &self.biases) {
-                (Some(scales), Some(biases)) => unsafe {
-                    mlx_sys::mlx_qwen4_dense_prefill(
-                        x.as_raw_ptr(),
-                        self.values.as_raw_ptr(),
-                        scales.as_raw_ptr(),
-                        biases.as_raw_ptr(),
-                    )
-                },
-                _ => std::ptr::null_mut(),
-            }
+        let compact = if !on_cuda
+            && self.mode == "affine"
+            && self.bits == 8
+            && self.group == 32
+            && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
+        {
+            crate::kernels::qwen4::metal::dense_prefill(x, &self.values, scales, biases)?
         } else {
-            std::ptr::null_mut()
+            None
         };
-        let y = if !compact.is_null() {
-            MxArray::from_handle(compact, "Qwen4 compact dense prefill")?
+        let y = if let Some(compact) = compact {
+            compact
         } else if let Some(qlinear) = &self.qlinear {
             qlinear.forward(x)?
         } else if let Some(scales) = &self.scales {

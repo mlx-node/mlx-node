@@ -49,27 +49,20 @@ pub(super) fn routed_experts(
         return Ok(None);
     };
     let indices = ids.reshape(&[-1])?;
-    let raw = unsafe {
-        mlx_sys::mlx_qwen4_routed_experts(
-            x.as_raw_ptr(),
-            indices.as_raw_ptr(),
-            scores.as_raw_ptr(),
-            gate.values.as_raw_ptr(),
-            gate_scales.as_raw_ptr(),
-            gate_biases.as_raw_ptr(),
-            up.values.as_raw_ptr(),
-            up_scales.as_raw_ptr(),
-            up_biases.as_raw_ptr(),
-            down.values.as_raw_ptr(),
-            down_scales.as_raw_ptr(),
-            down_biases.as_raw_ptr(),
-        )
-    };
-    if raw.is_null() {
-        Ok(None)
-    } else {
-        MxArray::from_handle(raw, "Qwen4 fused routed experts").map(Some)
-    }
+    crate::kernels::qwen4::metal::routed_experts(
+        x,
+        &indices,
+        scores,
+        &gate.values,
+        gate_scales,
+        gate_biases,
+        &up.values,
+        up_scales,
+        up_biases,
+        &down.values,
+        down_scales,
+        down_biases,
+    )
 }
 
 /// The shared Q8 branch joins the two routed kernels without changing either
@@ -101,23 +94,53 @@ pub(super) fn routed_shared_experts(
         return Ok(None);
     }
     let ids = ids.reshape(&[-1])?;
-    let mut inputs = vec![x.as_raw_ptr(), ids.as_raw_ptr(), scores.as_raw_ptr()];
-    for bank in banks.iter().chain(shared) {
-        let (Some(scales), Some(biases)) = (&bank.scales, &bank.biases) else {
-            return Ok(None);
-        };
-        inputs.extend([
-            bank.values.as_raw_ptr(),
-            scales.as_raw_ptr(),
-            biases.as_raw_ptr(),
-        ]);
-    }
-    inputs.push(shared_gate.as_raw_ptr());
-    let raw = unsafe { mlx_sys::mlx_qwen4_routed_shared_experts(inputs.as_ptr(), inputs.len()) };
-    if raw.is_null() {
+    let [rg, ru, rd] = banks;
+    let [sg, su, sd] = shared;
+    let (
+        Some(rg_s),
+        Some(rg_b),
+        Some(ru_s),
+        Some(ru_b),
+        Some(rd_s),
+        Some(rd_b),
+        Some(sg_s),
+        Some(sg_b),
+        Some(su_s),
+        Some(su_b),
+        Some(sd_s),
+        Some(sd_b),
+    ) = (
+        &rg.scales, &rg.biases, &ru.scales, &ru.biases, &rd.scales, &rd.biases, &sg.scales,
+        &sg.biases, &su.scales, &su.biases, &sd.scales, &sd.biases,
+    )
+    else {
         return Ok(None);
-    }
-    MxArray::from_handle(raw, "Qwen4 fused routed/shared experts").map(Some)
+    };
+    let inputs: [&MxArray; 22] = [
+        x,
+        &ids,
+        scores,
+        &rg.values,
+        rg_s,
+        rg_b,
+        &ru.values,
+        ru_s,
+        ru_b,
+        &rd.values,
+        rd_s,
+        rd_b,
+        &sg.values,
+        sg_s,
+        sg_b,
+        &su.values,
+        su_s,
+        su_b,
+        &sd.values,
+        sd_s,
+        sd_b,
+        shared_gate,
+    ];
+    crate::kernels::qwen4::metal::routed_shared_experts(&inputs)
 }
 
 /// Fused CUDA MoE decode/verify primitive (`M in 1..=16`, `H=2560`, `D_FF=640`, `top_k <= 10`).
@@ -336,28 +359,21 @@ pub(super) fn prefill_indirect(
     else {
         return Ok(None);
     };
-    let raw = unsafe {
-        mlx_sys::mlx_qwen4_prefill_indirect(
-            x.as_raw_ptr(),
-            ids.as_raw_ptr(),
-            token_rows.as_raw_ptr(),
-            gate.values.as_raw_ptr(),
-            gate_scales.as_raw_ptr(),
-            gate_biases.as_raw_ptr(),
-            up.values.as_raw_ptr(),
-            up_scales.as_raw_ptr(),
-            up_biases.as_raw_ptr(),
-            down.values.as_raw_ptr(),
-            down_scales.as_raw_ptr(),
-            down_biases.as_raw_ptr(),
-            experts as i32,
-        )
-    };
-    if raw.is_null() {
-        Ok(None)
-    } else {
-        MxArray::from_handle(raw, "Qwen4 indirect expert prefill").map(Some)
-    }
+    crate::kernels::qwen4::metal::prefill_indirect(
+        x,
+        ids,
+        token_rows,
+        &gate.values,
+        gate_scales,
+        gate_biases,
+        &up.values,
+        up_scales,
+        up_biases,
+        &down.values,
+        down_scales,
+        down_biases,
+        experts,
+    )
 }
 
 /// The expert kernel a prompt window runs, chosen from the window's
@@ -391,12 +407,7 @@ pub(super) fn expert_tiles(ids: &MxArray, experts: usize) -> Result<Option<MxArr
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return Ok(None);
     }
-    let raw = unsafe { mlx_sys::mlx_qwen4_expert_tiles(ids.as_raw_ptr(), experts as i32) };
-    if raw.is_null() {
-        Ok(None)
-    } else {
-        MxArray::from_handle(raw, "Qwen4 expert tile table").map(Some)
-    }
+    crate::kernels::qwen4::metal::expert_tiles(ids, experts)
 }
 
 pub(super) fn combine_expert_rows(
@@ -410,18 +421,10 @@ pub(super) fn combine_expert_rows(
     if let Some(inverse) = inverse
         && tokens > 8
         && crate::engine::persistence::compiled_forward_backend_available()
+        && let Some(out) =
+            crate::kernels::qwen4::metal::sorted_combine(values, scores, inverse, top)?
     {
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_sorted_combine(
-                values.as_raw_ptr(),
-                scores.as_raw_ptr(),
-                inverse.as_raw_ptr(),
-                top as i32,
-            )
-        };
-        if !raw.is_null() {
-            return MxArray::from_handle(raw, "Qwen4 sorted expert combine");
-        }
+        return Ok(out);
     }
     let values = match inverse {
         Some(inverse) => values.take(inverse, 0)?,
@@ -449,37 +452,9 @@ pub(super) fn complete_gdn(
     norm: &MxArray,
     eps: f64,
 ) -> Result<(MxArray, MxArray, MxArray)> {
-    let (mut out, mut next, mut next_history) = (
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    );
-    let ok = unsafe {
-        mlx_sys::mlx_qwen4_complete_gdn(
-            qkv.as_raw_ptr(),
-            z.as_raw_ptr(),
-            a.as_raw_ptr(),
-            b.as_raw_ptr(),
-            conv.as_raw_ptr(),
-            history.as_raw_ptr(),
-            scale.as_raw_ptr(),
-            dt.as_raw_ptr(),
-            state.as_raw_ptr(),
-            norm.as_raw_ptr(),
-            eps,
-            &mut out,
-            &mut next,
-            &mut next_history,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 complete GDN graph failed"));
-    }
-    Ok((
-        MxArray::from_handle(out, "Qwen4 complete GDN output")?,
-        MxArray::from_handle(next, "Qwen4 complete GDN state")?,
-        MxArray::from_handle(next_history, "Qwen4 complete GDN history")?,
-    ))
+    crate::kernels::qwen4::metal::complete_gdn(
+        qkv, z, a, b, conv, history, scale, dt, state, norm, eps,
+    )
 }
 
 /// F32 recurrent state is retained across steps and speculative snapshots.
@@ -512,28 +487,10 @@ pub(super) fn recurrent_step(
         let v = v.reshape(&[1, 1, heads, -1])?;
         let decay = decay.reshape(&[1, 1, heads])?;
         let beta = beta.reshape(&[1, 1, heads])?;
-        let mut out = std::ptr::null_mut();
-        let mut next = std::ptr::null_mut();
-        let ok = unsafe {
-            mlx_sys::mlx_qwen4_gated_delta_kernel(
-                q.as_raw_ptr(),
-                k.as_raw_ptr(),
-                v.as_raw_ptr(),
-                decay.as_raw_ptr(),
-                beta.as_raw_ptr(),
-                state.as_raw_ptr(),
-                std::ptr::null_mut(),
-                &mut out,
-                &mut next,
-            )
-        };
-        if !ok {
-            return Err(Error::from_reason("Qwen4 fused recurrent kernel failed"));
-        }
-        return Ok((
-            MxArray::from_handle(out, "Qwen4 recurrent output")?,
-            MxArray::from_handle(next, "Qwen4 recurrent state")?,
-        ));
+        return crate::kernels::qwen4::metal::gated_delta_kernel(
+            &q, &k, &v, &decay, &beta, state, None,
+        )?
+        .ok_or_else(|| Error::from_reason("Qwen4 fused recurrent kernel failed"));
     }
     let repeats = state.shape_at(1)? / query_heads;
     recurrent_step_reference(
@@ -577,28 +534,10 @@ pub(super) fn recurrent_sequence(
     let (tokens, heads, kd) = (shape[1], shape[2], shape[3]);
     if kd >= 32 && kd % 32 == 0 && crate::engine::persistence::compiled_forward_backend_available()
     {
-        let mut out = std::ptr::null_mut();
-        let mut next = std::ptr::null_mut();
-        let ok = unsafe {
-            mlx_sys::mlx_qwen4_gated_delta_kernel(
-                q.as_raw_ptr(),
-                k.as_raw_ptr(),
-                v.as_raw_ptr(),
-                decay.as_raw_ptr(),
-                beta.as_raw_ptr(),
-                state.as_raw_ptr(),
-                std::ptr::null_mut(),
-                &mut out,
-                &mut next,
-            )
-        };
-        if !ok {
-            return Err(Error::from_reason("Qwen4 fused recurrent sequence failed"));
-        }
-        return Ok((
-            MxArray::from_handle(out, "Qwen4 recurrent sequence")?,
-            MxArray::from_handle(next, "Qwen4 recurrent sequence state")?,
-        ));
+        return crate::kernels::qwen4::metal::gated_delta_kernel(
+            q, k, v, decay, beta, state, None,
+        )?
+        .ok_or_else(|| Error::from_reason("Qwen4 fused recurrent sequence failed"));
     }
     let repeats = state.shape()?[1] / heads;
     let q = MxArray::tile(q, &[1, 1, repeats as i32, 1])?;
@@ -654,35 +593,15 @@ pub(super) fn gdn_prepare(
         *state = Some(history);
         return Ok(Some([q, k, v, decay, beta]));
     }
-    let mut outputs = [std::ptr::null_mut(); 6];
-    if !unsafe {
-        // qwen4 semantics: L2-style norm (eps on the sum) and f32 beta —
-        // matches this family's `math::l2` reference exactly.
-        mlx_sys::mlx_qwen4_gdn_prepare(
-            qkv.as_raw_ptr(),
-            a.as_raw_ptr(),
-            b.as_raw_ptr(),
-            conv.as_raw_ptr(),
-            old.as_raw_ptr(),
-            scale.as_raw_ptr(),
-            dt.as_raw_ptr(),
-            false,
-            false,
-            outputs.as_mut_ptr(),
-        )
-    } {
+    // qwen4 semantics: L2-style norm (eps on the sum) and f32 beta —
+    // matches this family's `math::l2` reference exactly.
+    let Some([q, k, v, decay, beta, history]) =
+        crate::kernels::qwen4::metal::gdn_prepare(qkv, a, b, conv, &old, scale, dt, false, false)?
+    else {
         return Ok(None);
-    }
-    let [q, k, v, decay, beta, history] = outputs;
-    let values = [
-        MxArray::from_handle(q, "GDN prepared Q")?,
-        MxArray::from_handle(k, "GDN prepared K")?,
-        MxArray::from_handle(v, "GDN prepared V")?,
-        MxArray::from_handle(decay, "GDN prepared decay")?,
-        MxArray::from_handle(beta, "GDN prepared beta")?,
-    ];
-    *state = Some(MxArray::from_handle(history, "GDN prepared history")?);
-    Ok(Some(values))
+    };
+    *state = Some(history);
+    Ok(Some([q, k, v, decay, beta]))
 }
 
 pub(super) fn conv_sequence(
@@ -700,20 +619,7 @@ pub(super) fn conv_sequence(
             Some(s) => s.clone(),
             None => MxArray::zeros(&[3, x.shape_at(2)?], Some(x.dtype()?))?,
         };
-        let mut out = std::ptr::null_mut();
-        let mut history = std::ptr::null_mut();
-        let ok = unsafe {
-            mlx_sys::mlx_qwen4_window_conv(
-                x.as_raw_ptr(),
-                old.as_raw_ptr(),
-                weight.as_raw_ptr(),
-                &mut out,
-                &mut history,
-            )
-        };
-        if ok {
-            let out = MxArray::from_handle(out, "Qwen4 window convolution")?;
-            let history = MxArray::from_handle(history, "Qwen4 convolution history")?;
+        if let Some((out, history)) = crate::kernels::qwen4::metal::window_conv(x, &old, weight)? {
             MxArray::eval_arrays_with_context(&[&history], "qwen4::batch::conv_state")?;
             *state = Some(history);
             return Ok(out);
@@ -771,21 +677,12 @@ pub(super) fn gdn_epilogue(
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return Ok(None);
     }
-    let handle = unsafe {
-        mlx_sys::mlx_qwen4_gdn_epilogue(out.as_raw_ptr(), z.as_raw_ptr(), weight.as_raw_ptr(), eps)
-    };
-    if handle.is_null() {
-        return Ok(None);
-    }
-    MxArray::from_handle(handle, "Qwen4 prefill GDN epilogue").map(Some)
+    crate::kernels::qwen4::common::gdn_epilogue(out, z, weight, eps)
 }
 
 pub fn norm(x: &MxArray, w: &MxArray, group: usize, eps: f64, centered: bool) -> Result<MxArray> {
     if crate::engine::persistence::compiled_forward_backend_available() {
-        let out = unsafe {
-            mlx_sys::mlx_qwen4_norm(x.as_raw_ptr(), w.as_raw_ptr(), group as i32, eps, centered)
-        };
-        return MxArray::from_handle(out, "Qwen4 compiled normalization");
+        return crate::kernels::qwen4::common::norm(x, w, group, eps, centered);
     }
     let shape = x.shape()?;
     let y = x.astype(DType::Float32)?.reshape(&[-1, group as i64])?;
@@ -1505,20 +1402,7 @@ pub(super) fn conv_window(
         && weight.dtype()? == DType::Float32
         && crate::engine::persistence::compiled_forward_backend_available()
     {
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_prefill_ple_conv(
-                input.as_raw_ptr(),
-                weight.reshape(&[width, 4])?.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            None
-        } else {
-            Some(MxArray::from_handle(
-                raw,
-                "Qwen4 reference PLE convolution",
-            )?)
-        }
+        crate::kernels::qwen4::metal::prefill_ple_conv(&input, &weight.reshape(&[width, 4])?)?
     } else {
         None
     };
@@ -1609,16 +1493,7 @@ pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(M
     {
         return Ok(None);
     }
-    let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
-    let ok =
-        unsafe { mlx_sys::mlx_qwen4_singleton_routes(logits.as_raw_ptr(), &mut ids, &mut scores) };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 singleton routing kernel failed"));
-    }
-    Ok(Some((
-        MxArray::from_handle(ids, "singleton route IDs")?,
-        MxArray::from_handle(scores, "singleton route scores")?,
-    )))
+    crate::kernels::qwen4::metal::singleton_routes(logits).map(Some)
 }
 
 pub(super) fn prefill_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
@@ -1642,16 +1517,9 @@ pub(super) fn prefill_routes(logits: &MxArray, top: usize) -> Result<Option<(MxA
     {
         return Ok(None);
     }
-    let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
-    let ok =
-        unsafe { mlx_sys::mlx_qwen4_prefill_routes(logits.as_raw_ptr(), &mut ids, &mut scores) };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 prefill routing kernel failed"));
-    }
-    Ok(Some((
-        MxArray::from_handle(ids, "prefill route IDs")?,
-        MxArray::from_handle(scores, "prefill route scores")?,
-    )))
+    crate::kernels::qwen4::metal::prefill_routes(logits)?
+        .ok_or_else(|| Error::from_reason("Qwen4 prefill routing kernel failed"))
+        .map(Some)
 }
 
 pub(super) fn route_sort(
@@ -1667,28 +1535,7 @@ pub(super) fn route_sort(
     {
         return Ok(None);
     }
-    let (mut order, mut inverse, mut sorted) = (
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    );
-    let ok = unsafe {
-        mlx_sys::mlx_qwen4_route_sort(
-            ids.as_raw_ptr(),
-            experts as i32,
-            &mut order,
-            &mut inverse,
-            &mut sorted,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 stable routing kernel failed"));
-    }
-    Ok(Some((
-        MxArray::from_handle(order, "route order")?,
-        MxArray::from_handle(inverse, "route inverse")?,
-        MxArray::from_handle(sorted, "sorted routes")?,
-    )))
+    crate::kernels::qwen4::metal::route_sort(ids, experts).map(Some)
 }
 
 pub(super) fn gdn_gates(
@@ -1702,24 +1549,7 @@ pub(super) fn gdn_gates(
     let a = a.astype(DType::Float32)?;
     let b = b.astype(DType::Float32)?;
     if crate::engine::persistence::compiled_forward_backend_available() {
-        let (mut decay, mut beta) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let ok = unsafe {
-            mlx_sys::mlx_qwen4_gdn_gates(
-                a.as_raw_ptr(),
-                b.as_raw_ptr(),
-                scale.as_raw_ptr(),
-                dt.as_raw_ptr(),
-                &mut decay,
-                &mut beta,
-            )
-        };
-        if !ok {
-            return Err(Error::from_reason("Qwen4 compiled GDN gates failed"));
-        }
-        return Ok((
-            MxArray::from_handle(decay, "GDN decay")?,
-            MxArray::from_handle(beta, "GDN beta")?,
-        ));
+        return crate::kernels::qwen4::common::gdn_gates(&a, &b, scale, dt);
     }
     Ok((
         Activations::softplus(&a.add(dt)?)?.mul(scale)?.exp()?,
@@ -1974,25 +1804,18 @@ pub(super) fn qsa_dispatch(
     block_size: usize,
     kernel: QsaKernel,
 ) -> Result<(MxArray, i32)> {
-    let mut out = std::ptr::null_mut();
-    let heads = unsafe {
-        mlx_sys::mlx_qwen4_qsa_attention(
-            q.as_raw_ptr(),
-            keys.as_raw_ptr(),
-            values.as_raw_ptr(),
-            selected.as_raw_ptr(),
-            query_ends.as_raw_ptr(),
-            scale as f32,
-            block_size as i32,
-            kernel.heads_per_group(),
-            &mut out,
-        )
-    };
-    if heads == 0 {
-        return Err(Error::from_reason("Qwen4 sparse attention kernel failed"));
-    }
+    let (out, heads) = crate::kernels::qwen4::metal::qsa_attention(
+        q,
+        keys,
+        values,
+        selected,
+        query_ends,
+        scale as f32,
+        block_size,
+        kernel.heads_per_group(),
+    )?;
     tracing::debug!(heads_per_kv_read = heads, "Qwen4 sparse attention kernel");
-    Ok((MxArray::from_handle(out, "Qwen4 sparse attention")?, heads))
+    Ok((out, heads))
 }
 
 /// `maxTotalThreadsPerThreadgroup` of `kernel`'s pipeline (`SingleHead` or
@@ -2007,17 +1830,15 @@ pub(super) fn qsa_pipeline_threads(
     block_size: usize,
     kernel: QsaKernel,
 ) -> i32 {
-    unsafe {
-        mlx_sys::mlx_qwen4_qsa_attention_pipeline_threads(
-            q.as_raw_ptr(),
-            keys.as_raw_ptr(),
-            values.as_raw_ptr(),
-            selected.as_raw_ptr(),
-            query_ends.as_raw_ptr(),
-            block_size as i32,
-            kernel.heads_per_group(),
-        )
-    }
+    crate::kernels::qwen4::metal::qsa_attention_pipeline_threads(
+        q,
+        keys,
+        values,
+        selected,
+        query_ends,
+        block_size,
+        kernel.heads_per_group(),
+    )
 }
 
 /// Makes this thread's next `count` QSA pipeline probes that miss the cache
@@ -2087,19 +1908,10 @@ mod attention_gate_tests {
                 let want = conv_sequence_reference(&input, &w, &mut expected, 4).unwrap();
                 // Call the primitive directly so an unsupported/fallback
                 // dispatch cannot make a kernel regression pass silently.
-                let mut out = std::ptr::null_mut();
-                let mut history = std::ptr::null_mut();
-                assert!(unsafe {
-                    mlx_sys::mlx_qwen4_window_conv(
-                        input.as_raw_ptr(),
-                        actual.as_ref().unwrap().as_raw_ptr(),
-                        w.as_raw_ptr(),
-                        &mut out,
-                        &mut history,
-                    )
-                });
-                let got = MxArray::from_handle(out, "test window conv").unwrap();
-                let next = MxArray::from_handle(history, "test window history").unwrap();
+                let (got, next) =
+                    crate::kernels::qwen4::metal::window_conv(&input, actual.as_ref().unwrap(), &w)
+                        .unwrap()
+                        .expect("test window conv");
                 equal(&got, &want);
                 equal(&next, expected.as_ref().unwrap());
                 actual = Some(next);
@@ -2203,19 +2015,7 @@ pub(super) mod rows {
         if row_count(x, None)?.is_none() || !backend() {
             return Ok(None);
         }
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_dense_decode_rows(
-                x.as_raw_ptr(),
-                w.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(raw, "Qwen4 row-batched dense decode").map(Some)
-        }
+        crate::kernels::qwen4::metal::dense_decode_rows(x, &w.values, scales, biases)
     }
 
     /// `x` is `[1, R, 10240]`; the result is the `[1, R, 320]` mixer activation.
@@ -2226,19 +2026,7 @@ pub(super) mod rows {
         if row_count(x, Some(10240))?.is_none() || !backend() {
             return Ok(None);
         }
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_decode_mixer_act_rows(
-                x.as_raw_ptr(),
-                w.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(raw, "Qwen4 row-batched mixer activation").map(Some)
-        }
+        crate::kernels::qwen4::metal::decode_mixer_act_rows(x, &w.values, scales, biases)
     }
 
     /// `x` is `[1, R, 320]`, `normed` is `[1, R, 10240]`; the result is `[1, R, 2560]`.
@@ -2249,20 +2037,7 @@ pub(super) mod rows {
         if row_count(x, Some(320))?.is_none() || !backend() {
             return Ok(None);
         }
-        let raw = unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_rows(
-                x.as_raw_ptr(),
-                w.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                normed.as_raw_ptr(),
-            )
-        };
-        if raw.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(raw, "Qwen4 row-batched hyper up").map(Some)
-        }
+        crate::kernels::qwen4::metal::hyper_up_rows(x, &w.values, scales, biases, normed)
     }
 
     /// `x` is `[1, R, 2560]`, `ids` holds `10 R` routes, `scores` `10 R`
@@ -2291,25 +2066,53 @@ pub(super) mod rows {
             return Ok(None);
         }
         let ids = ids.reshape(&[-1])?;
-        let mut inputs = vec![x.as_raw_ptr(), ids.as_raw_ptr(), scores.as_raw_ptr()];
-        for bank in banks.iter().chain(shared) {
-            let (Some(scales), Some(biases)) = (&bank.scales, &bank.biases) else {
-                return Ok(None);
-            };
-            inputs.extend([
-                bank.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            ]);
-        }
-        inputs.push(shared_gate.as_raw_ptr());
-        let raw =
-            unsafe { mlx_sys::mlx_qwen4_routed_shared_experts_rows(inputs.as_ptr(), inputs.len()) };
-        if raw.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(raw, "Qwen4 row-batched routed/shared experts").map(Some)
-        }
+        let [rg, ru, rd] = banks;
+        let [sg, su, sd] = shared;
+        let (
+            Some(rg_s),
+            Some(rg_b),
+            Some(ru_s),
+            Some(ru_b),
+            Some(rd_s),
+            Some(rd_b),
+            Some(sg_s),
+            Some(sg_b),
+            Some(su_s),
+            Some(su_b),
+            Some(sd_s),
+            Some(sd_b),
+        ) = (
+            &rg.scales, &rg.biases, &ru.scales, &ru.biases, &rd.scales, &rd.biases, &sg.scales,
+            &sg.biases, &su.scales, &su.biases, &sd.scales, &sd.biases,
+        )
+        else {
+            return Ok(None);
+        };
+        let inputs: [&MxArray; 22] = [
+            x,
+            &ids,
+            scores,
+            &rg.values,
+            rg_s,
+            rg_b,
+            &ru.values,
+            ru_s,
+            ru_b,
+            &rd.values,
+            rd_s,
+            rd_b,
+            &sg.values,
+            sg_s,
+            sg_b,
+            &su.values,
+            su_s,
+            su_b,
+            &sd.values,
+            sd_s,
+            sd_b,
+            shared_gate,
+        ];
+        crate::kernels::qwen4::metal::routed_shared_experts_rows(&inputs)
     }
 
     /// `logits` is `[1, R, 512]`; returns (`[1, R, 10]` ids, `[1, R, 10]` scores)
@@ -2325,19 +2128,9 @@ pub(super) mod rows {
         {
             return Ok(None);
         }
-        let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let ok = unsafe {
-            mlx_sys::mlx_qwen4_prefill_routes(logits.as_raw_ptr(), &mut ids, &mut scores)
-        };
-        if !ok {
-            return Err(Error::from_reason(
-                "Qwen4 row-batched routing kernel failed",
-            ));
-        }
-        Ok(Some((
-            MxArray::from_handle(ids, "row-batched route IDs")?,
-            MxArray::from_handle(scores, "row-batched route scores")?,
-        )))
+        crate::kernels::qwen4::metal::prefill_routes(logits)?
+            .ok_or_else(|| Error::from_reason("Qwen4 row-batched routing kernel failed"))
+            .map(Some)
     }
 }
 
@@ -2467,43 +2260,29 @@ mod pass_length_tests {
 
         /// q, k, v, decay, beta, next history.
         fn run(&self, [qkv, a, b]: &[MxArray; 3], history: &MxArray) -> Vec<MxArray> {
-            let mut outputs = [std::ptr::null_mut(); 6];
-            assert!(unsafe {
-                mlx_sys::mlx_qwen4_gdn_prepare(
-                    qkv.as_raw_ptr(),
-                    a.as_raw_ptr(),
-                    b.as_raw_ptr(),
-                    self.conv.as_raw_ptr(),
-                    history.as_raw_ptr(),
-                    self.scale.as_raw_ptr(),
-                    self.dt.as_raw_ptr(),
-                    self.mean_eps,
-                    self.beta_input_dtype,
-                    outputs.as_mut_ptr(),
-                )
-            });
-            outputs
-                .into_iter()
-                .map(|p| MxArray::from_handle(p, "test GDN preparation").unwrap())
-                .collect()
+            crate::kernels::qwen4::metal::gdn_prepare(
+                qkv,
+                a,
+                b,
+                &self.conv,
+                history,
+                &self.scale,
+                &self.dt,
+                self.mean_eps,
+                self.beta_input_dtype,
+            )
+            .unwrap()
+            .expect("test GDN preparation")
+            .into_iter()
+            .collect()
         }
     }
 
     fn conv_run(x: &MxArray, history: &MxArray, weight: &MxArray) -> Vec<MxArray> {
-        let (mut out, mut next) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert!(unsafe {
-            mlx_sys::mlx_qwen4_window_conv(
-                x.as_raw_ptr(),
-                history.as_raw_ptr(),
-                weight.as_raw_ptr(),
-                &mut out,
-                &mut next,
-            )
-        });
-        vec![
-            MxArray::from_handle(out, "test window conv").unwrap(),
-            MxArray::from_handle(next, "test window history").unwrap(),
-        ]
+        let (out, next) = crate::kernels::qwen4::metal::window_conv(x, history, weight)
+            .unwrap()
+            .expect("test window conv");
+        vec![out, next]
     }
 
     /// Splitting a pass in two, the second piece starting from the first

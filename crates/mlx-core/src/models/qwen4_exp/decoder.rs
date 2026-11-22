@@ -2081,16 +2081,16 @@ impl Decoder {
                 let combined = if self.gguf()
                     && crate::engine::persistence::compiled_forward_backend_available()
                 {
-                    unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(up.as_raw_ptr(), n.as_raw_ptr()) }
+                    crate::kernels::qwen4::metal::prefill_hc_mix(&up, &n)?
                 } else {
-                    std::ptr::null_mut()
+                    None
                 };
-                if combined.is_null() {
+                if let Some(combined) = combined {
+                    combined
+                } else {
                     math::sigmoid_mul(&up, &n)?
                         .reshape(&[1, rows, c.hc_count as i64, c.hidden_size as i64])?
                         .mean(Some(&[-2]), Some(false))?
-                } else {
-                    MxArray::from_handle(combined, "Qwen4 prefill mixer combine")?
                 }
             }
         };
@@ -2163,25 +2163,14 @@ impl Decoder {
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let w = self.dense(hf, gg)?;
-            let (mut stream, mut normed) = (std::ptr::null_mut(), std::ptr::null_mut());
-            if unsafe {
-                mlx_sys::mlx_qwen4_inject_norm(
-                    x.as_raw_ptr(),
-                    branch.as_raw_ptr(),
-                    gate.as_raw_ptr(),
-                    w.as_raw_ptr(),
-                    self.config.rms_norm_eps,
-                    &mut stream,
-                    &mut normed,
-                )
-            } {
-                return Ok((
-                    MxArray::from_handle(stream, "Qwen4 fused injection stream")?,
-                    Some(MxArray::from_handle(
-                        normed,
-                        "Qwen4 fused injection normalization",
-                    )?),
-                ));
+            if let Some((stream, normed)) = crate::kernels::qwen4::metal::inject_norm(
+                x,
+                branch,
+                gate,
+                &w,
+                self.config.rms_norm_eps,
+            )? {
+                return Ok((stream, Some(normed)));
             }
         }
         Ok((Self::inject(x, branch, gate)?, None))
@@ -2266,12 +2255,7 @@ impl Decoder {
             return Ok(out);
         }
         if crate::engine::persistence::compiled_forward_backend_available() {
-            return MxArray::from_handle(
-                unsafe {
-                    mlx_sys::mlx_qwen4_inject(x.as_raw_ptr(), y.as_raw_ptr(), g.as_raw_ptr())
-                },
-                "Qwen4 compiled residual injection",
-            );
+            return crate::kernels::qwen4::common::inject(x, y, g);
         }
         x.add(
             &y.expand_dims(-2)?

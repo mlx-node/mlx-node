@@ -111,26 +111,18 @@ impl Weight {
         let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
             return Ok(None);
         };
-        let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
-        let out = unsafe {
-            mlx_sys::mlx_qwen4_expert_prefill(
-                x.as_raw_ptr(),
-                ids.as_raw_ptr(),
-                tiles.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                experts as i32,
-                self.group,
-                self.bits,
-                mode.as_ptr(),
-            )
-        };
-        if out.is_null() {
-            Ok(None)
-        } else {
-            MxArray::from_handle(out, "Qwen4 expert-aligned prefill").map(Some)
-        }
+        crate::kernels::qwen4::metal::expert_prefill(
+            x,
+            ids,
+            tiles,
+            &self.values,
+            scales,
+            biases,
+            experts,
+            self.group,
+            self.bits,
+            &self.mode,
+        )
     }
 
     pub(super) fn slice_rows(&self, start: usize, rows: usize) -> Result<Self> {
@@ -986,40 +978,33 @@ impl Weight {
                 .is_some_and(|&k| Self::affine_gemv_takes(k as usize))
             && crate::engine::persistence::compiled_forward_backend_available()
         {
-            let out = unsafe {
-                mlx_sys::mlx_qwen4_affine_expert_gemv(
-                    x.as_raw_ptr(),
-                    ids.as_raw_ptr(),
-                    self.values.as_raw_ptr(),
-                    scales.as_raw_ptr(),
-                    biases.as_raw_ptr(),
-                    experts as i32,
-                    self.group,
-                    self.bits,
-                )
-            };
-            return MxArray::from_handle(out, "Qwen4 affine expert GEMV");
+            return crate::kernels::qwen4::metal::affine_expert_gemv(
+                x,
+                ids,
+                &self.values,
+                scales,
+                biases,
+                experts,
+                self.group,
+                self.bits,
+            );
         }
         if self.mode != "affine"
             && ids.size()? <= 80
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && crate::engine::persistence::compiled_forward_backend_available()
         {
-            let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
-            let out = unsafe {
-                mlx_sys::mlx_qwen4_expert_gemv(
-                    x.as_raw_ptr(),
-                    ids.as_raw_ptr(),
-                    self.values.as_raw_ptr(),
-                    scales.as_raw_ptr(),
-                    biases.as_raw_ptr(),
-                    experts as i32,
-                    self.group,
-                    self.bits,
-                    mode.as_ptr(),
-                )
-            };
-            return MxArray::from_handle(out, "Qwen4 direct expert GEMV");
+            return crate::kernels::qwen4::metal::expert_gemv(
+                x,
+                ids,
+                &self.values,
+                scales,
+                biases,
+                experts,
+                self.group,
+                self.bits,
+                &self.mode,
+            );
         }
         self.gather_rows(x, ids, experts, sorted)
     }

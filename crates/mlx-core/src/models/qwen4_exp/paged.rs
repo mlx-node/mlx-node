@@ -193,29 +193,7 @@ pub fn gather_selected(
     let (ks, vs) = adapter
         .scale_pool_arrays(layer)
         .map_err(Error::from_reason)?;
-    let mut ko = std::ptr::null_mut();
-    let mut vo = std::ptr::null_mut();
-    let ok = unsafe {
-        mlx_sys::mlx_qwen4_gather_pages(
-            k.as_raw_ptr(),
-            v.as_raw_ptr(),
-            ks.as_raw_ptr(),
-            vs.as_raw_ptr(),
-            slots.as_raw_ptr(),
-            heads as i32,
-            dim as i32,
-            bs as i32,
-            &mut ko,
-            &mut vo,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 native page gather failed"));
-    }
-    Ok((
-        MxArray::from_handle(ko, "Qwen4 gathered keys")?,
-        MxArray::from_handle(vo, "Qwen4 gathered values")?,
-    ))
+    crate::kernels::qwen4::metal::gather_pages(&k, &v, &ks, &vs, &slots, heads, dim, bs)
 }
 
 pub struct Prefix {
@@ -1574,30 +1552,18 @@ pub(super) fn gather_window(
     let (ks, vs) = adapter
         .scale_pool_arrays(layer)
         .map_err(Error::from_reason)?;
-    let (mut k, mut v) = (std::ptr::null_mut(), std::ptr::null_mut());
-    let ok = unsafe {
-        mlx_sys::mlx_qwen4_gather_window(
-            kp.as_raw_ptr(),
-            vp.as_raw_ptr(),
-            ks.as_raw_ptr(),
-            vs.as_raw_ptr(),
-            blocks.as_raw_ptr(),
-            tokens.as_raw_ptr(),
-            keys.as_raw_ptr(),
-            values.as_raw_ptr(),
-            base as i32,
-            adapter.block_size() as i32,
-            &mut k,
-            &mut v,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason("Qwen4 GPU sparse page gather failed"));
-    }
-    Ok((
-        MxArray::from_handle(k, "sparse page keys")?,
-        MxArray::from_handle(v, "sparse page values")?,
-    ))
+    crate::kernels::qwen4::metal::gather_window(
+        &kp,
+        &vp,
+        &ks,
+        &vs,
+        &blocks,
+        tokens,
+        keys,
+        values,
+        base,
+        adapter.block_size() as usize,
+    )
 }
 
 impl Inner {
