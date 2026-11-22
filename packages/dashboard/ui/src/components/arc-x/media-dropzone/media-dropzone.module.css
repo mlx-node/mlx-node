@@ -13,7 +13,8 @@
   background: var(--surface-muted);
   transition:
     border-color var(--duration-fast) var(--ease-standard),
-    background-color var(--duration-fast) var(--ease-standard);
+    background-color var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
 }
 
 .composer:focus-within {
@@ -26,8 +27,10 @@
   background: color-mix(in oklab, var(--accent) 8%, var(--surface));
 }
 
+/* The delay keeps a run that ends at once from a blink of the card. */
 .composer[data-disabled='true'] {
   opacity: 0.6;
+  transition-delay: var(--duration-hold);
 }
 
 .composerTextarea {
@@ -247,7 +250,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .bar,
-  .thumb {
+  .thumb,
+  .composer {
     transition-duration: var(--duration-instant);
   }
 }

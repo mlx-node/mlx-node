@@ -3,6 +3,7 @@ import type { CSSProperties, ReactElement } from 'react';
 
 import type { ChartPoint } from '../../components/arc-x/chart/types';
 import { KeyValue, type KeyValueItem } from '../../components/arc-x/key-value/key-value';
+import { Placeholder } from '../../components/arc-x/placeholder/placeholder';
 import { RangeBar } from '../../components/arc-x/range-bar/range-bar';
 import { Meter } from '../../components/arc-x/split-bar/split-bar';
 import { TrendChart } from '../../components/arc-x/trend-chart/trend-chart';
@@ -10,7 +11,7 @@ import { Badge, type BadgeTone } from '../../components/arc/badge/badge';
 import { Button } from '../../components/arc/button/button';
 import { EmptyState } from '../../components/arc/empty-state/empty-state';
 import { Tooltip } from '../../components/arc/tooltip/tooltip';
-import { formatPercent } from '../../lib/format';
+import { NO_VALUE, formatPercent } from '../../lib/format';
 import {
   type ClairicForecastAnswer,
   clampUnit,
@@ -33,6 +34,12 @@ import styles from './system-one.module.css';
 
 export interface ResultsViewProps {
   result: Record<string, unknown> | undefined;
+  /** A run for this mode is in flight: its fields are listed as loading rows, and answers of an earlier run dim. */
+  pending?: boolean;
+  /** The last run failed: the requested rows show with no value. */
+  failed?: boolean;
+  /** The field or question names of the request in flight, in order. */
+  pendingNames?: readonly string[];
   /** Original request fields map so estimate/forecast can show configured min/max/unit/interval. */
   requestFields: Record<string, unknown>;
   mode: SystemOneMode;
@@ -49,6 +56,11 @@ export interface ResultsViewProps {
   /** Local API endpoint URL shown in onboarding API tip. */
   apiEndpointUrl?: string;
 }
+
+const NO_ANSWERS: Record<string, unknown> = { answers: {} };
+
+/** Value bar widths of the loading rows, so the list does not read as one block. */
+const PENDING_WIDTHS = ['46%', '24%', '32%', '58%', '20%'] as const;
 
 function friendlyFieldType(rawType: string | undefined): string | undefined {
   if (rawType === undefined) return undefined;
@@ -471,6 +483,9 @@ function ClefAnswerRow({
 /** Flat hairline-separated structured answers for Clairic and CLEF results. */
 export function ResultsView({
   result,
+  pending = false,
+  failed = false,
+  pendingNames = [],
   requestFields,
   mode,
   presets,
@@ -484,6 +499,49 @@ export function ResultsView({
   onOpenApiGuide,
   apiEndpointUrl = 'http://127.0.0.1:8080/v1/systemone',
 }: ResultsViewProps): ReactElement {
+  if ((result === undefined || !isPlainObject(result.answers)) && (pending || failed) && pendingNames.length > 0) {
+    return (
+      <>
+        {/* Extract has one policy control for every result, so it holds its place before the answers come. The
+            controls of Decide depend on the answer types. */}
+        {mode === 'extract' && !hidePolicyBar ? (
+          <PolicyStrip result={NO_ANSWERS} policy={policy} onPolicyChange={onPolicyChange} />
+        ) : null}
+        <div
+          className={styles.answerList}
+          aria-busy={pending ? 'true' : undefined}
+          data-held={pending && failed ? '' : undefined}
+        >
+          {pendingNames.map((name, index) => {
+            const spec = isPlainObject(requestFields[name]) ? requestFields[name] : null;
+            const fieldType = friendlyFieldType(typeof spec?.type === 'string' ? spec.type : undefined);
+            return (
+              <article key={name} className={styles.answerRow}>
+                <div className={styles.answerHead}>
+                  <div className={styles.answerTitleGroup}>
+                    <span
+                      className={styles.rowDot}
+                      style={{ background: fieldAccentColor(index) }}
+                      aria-hidden="true"
+                    />
+                    <span className={styles.answerName}>{name}</span>
+                    {fieldType !== undefined ? <span className={styles.answerType}>{fieldType}</span> : null}
+                  </div>
+                  {failed ? null : <Placeholder width="4ch" />}
+                </div>
+                {failed ? (
+                  <span className={styles.answerNoValue}>{NO_VALUE}</span>
+                ) : (
+                  <Placeholder width={PENDING_WIDTHS[index % PENDING_WIDTHS.length]} />
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </>
+    );
+  }
+
   if (result === undefined || !isPlainObject(result.answers)) {
     const orderedPresets = [...presets].sort((a, b) => Number(b.mode === mode) - Number(a.mode === mode));
     return (
@@ -589,7 +647,7 @@ export function ResultsView({
     return (
       <>
         {!hidePolicyBar ? <PolicyStrip result={result} policy={policy} onPolicyChange={onPolicyChange} /> : null}
-        <div className={styles.answerList}>
+        <div className={styles.answerList} data-held={pending ? '' : undefined}>
           {entries.map(([name, ans], index) => (
             <ClefAnswerRow key={name} name={name} answer={ans as ClefAnswer} index={index} policy={policy} />
           ))}
@@ -601,7 +659,7 @@ export function ResultsView({
   return (
     <>
       {!hidePolicyBar ? <PolicyStrip result={result} policy={policy} onPolicyChange={onPolicyChange} /> : null}
-      <div className={styles.answerList}>
+      <div className={styles.answerList} data-held={pending ? '' : undefined}>
         {entries.map(([name, rawAnswer], index) => {
           const spec = isPlainObject(requestFields[name]) ? (requestFields[name] as Record<string, unknown>) : null;
           const color = fieldAccentColor(index);

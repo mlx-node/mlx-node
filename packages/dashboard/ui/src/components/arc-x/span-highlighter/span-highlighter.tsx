@@ -17,6 +17,8 @@ export interface HighlightSpanEntry {
 export interface SpanHighlighterProps {
   text: string;
   entries: readonly HighlightSpanEntry[];
+  /** False before the first run: draft text is not evidence, so the view shows the empty state. */
+  hasResult: boolean;
   focusedField: string | null;
   onFocusField: (field: string | null) => void;
   attachments?: readonly MediaAttachment[];
@@ -85,6 +87,7 @@ function buildSegments(text: string, entries: readonly HighlightSpanEntry[]): Te
 export function SpanHighlighter({
   text,
   entries,
+  hasResult,
   focusedField,
   onFocusField,
   attachments = [],
@@ -101,12 +104,58 @@ export function SpanHighlighter({
     mark?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }, [focusedField]);
 
-  if (text.trim() === '' && imageAttachments.length === 0) {
+  if (!hasResult) {
     return (
       <EmptyState
         title="No highlights yet"
-        description="Run an extraction with text input to see where each answer came from in your document."
+        description="Run an extraction on text to see where each answer came from."
       />
+    );
+  }
+
+  const media =
+    imageAttachments.length > 0 ? (
+      <div
+        className={styles.mediaCol}
+        data-large={text.trim() === '' ? 'true' : undefined}
+        aria-label="Attached evidence images"
+      >
+        {imageAttachments.map((img) => (
+          <figure key={img.id} className={styles.mediaFrame}>
+            <div className={styles.mediaImgWrap}>
+              <img
+                src={img.dataUrl}
+                alt={img.name}
+                className={styles.mediaImg}
+                style={{ transform: `rotate(${String(img.rotation)}deg)` }}
+              />
+            </div>
+            <figcaption className={styles.mediaCaption}>
+              {img.name}
+              {img.rotation !== 0 ? ` · ${String(img.rotation)}°` : ''}
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+    ) : null;
+
+  // The model returns positions in the request text only. A run with no text has nothing to mark.
+  if (text.trim() === '') {
+    if (media === null) {
+      return (
+        <EmptyState
+          title="No text to highlight"
+          description="This run had only an image or PDF. The model marks answers in text only."
+        />
+      );
+    }
+    return (
+      <div className={cn(styles.root, className)}>
+        <p className={styles.note}>
+          <strong>No text to highlight.</strong> This run had only an image. The model marks answers in text only.
+        </p>
+        {media}
+      </div>
     );
   }
 
@@ -139,7 +188,12 @@ export function SpanHighlighter({
             );
           })}
         </div>
-      ) : null}
+      ) : (
+        <p className={styles.note}>
+          <strong>No answer has a highlight.</strong> The model marks a value only when it finds the value at one place
+          in the text{imageAttachments.length > 0 ? ', so a value that is only in the image has none' : ''}.
+        </p>
+      )}
 
       <div className={styles.split} data-has-media={imageAttachments.length > 0 ? 'true' : undefined}>
         <pre ref={containerRef} className={styles.textBox} aria-label="Source text with highlighted spans">
@@ -172,26 +226,7 @@ export function SpanHighlighter({
           })}
         </pre>
 
-        {imageAttachments.length > 0 ? (
-          <div className={styles.mediaCol} aria-label="Attached evidence images">
-            {imageAttachments.map((img) => (
-              <figure key={img.id} className={styles.mediaFrame}>
-                <div className={styles.mediaImgWrap}>
-                  <img
-                    src={img.dataUrl}
-                    alt={img.name}
-                    className={styles.mediaImg}
-                    style={{ transform: `rotate(${String(img.rotation)}deg)` }}
-                  />
-                </div>
-                <figcaption className={styles.mediaCaption}>
-                  {img.name}
-                  {img.rotation !== 0 ? ` · ${String(img.rotation)}°` : ''}
-                </figcaption>
-              </figure>
-            ))}
-          </div>
-        ) : null}
+        {media}
       </div>
     </div>
   );

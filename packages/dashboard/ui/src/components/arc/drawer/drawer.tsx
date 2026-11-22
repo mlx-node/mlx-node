@@ -90,11 +90,12 @@ export function DrawerContent({
   const drawer = useContext(DrawerContext);
   const reduced = useReducedMotion();
   const panelRef = useRef<HTMLDivElement>(null);
-  const offset = useMotionValue<number | string>(0);
   const pan = useRef<number | null>(null);
   const axis = side === "left" || side === "right" ? "x" : "y";
   const sign = side === "right" || side === "bottom" ? 1 : -1;
   const offscreen = { [axis]: `${sign * 100}%` };
+  // Starts at the closed position. Motion writes the entrance's first frame into this value, and a jump from 0 reads as velocity that throws the first open past its resting edge.
+  const offset = useMotionValue<number | string>(reduced ? 0 : `${sign * 100}%`);
   const classes = [styles.content, className].filter(Boolean).join(" ");
   const draggable = drawer !== null && !reduced;
 

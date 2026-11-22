@@ -200,6 +200,9 @@ export function MediaDropzone({
       ? 'Drop images or PDF (up to 4, 8 MB max)'
       : `${String(attachments.length)}/${String(CLAIRIC_MAX_IMAGES)} attached · ${formatBytes(totalBytes)} / 8 MB`;
 
+  // The rows measure their place only when the list changes. A move of the page around them is not a layout change
+  // of the list, and a measure at that time draws a row over the content below it.
+  const attachmentIds = attachments.map((item) => item.id).join(' ');
   const attachmentStrip =
     attachments.length > 0 ? (
       <div className={styles.strip} role="list" aria-label="Attached media">
@@ -209,6 +212,7 @@ export function MediaDropzone({
               key={item.id}
               role="listitem"
               layout={!staticMotion}
+              layoutDependency={attachmentIds}
               initial={staticMotion ? false : { opacity: 0, scale: 0.97 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={staticMotion ? { opacity: 0, transition: { duration: 0 } } : { opacity: 0, scale: 0.95 }}

@@ -1,6 +1,7 @@
 import { GitCompareArrows, RotateCcw, Trash2 } from 'lucide-react';
 import { type ReactElement, useMemo, useState } from 'react';
 
+import { IconButton } from '../../components/arc-x/icon-button/icon-button';
 import { Rule } from '../../components/arc-x/rule/rule';
 import { Badge, type BadgeTone } from '../../components/arc/badge/badge';
 import { Button } from '../../components/arc/button/button';
@@ -235,7 +236,9 @@ export function HistoryDrawer({
                     </label>
                     <div className={styles.historyInfo}>
                       <div className={styles.historyHead}>
-                        <span className="truncate font-mono text-body font-medium text-foreground">{entry.model}</span>
+                        <span className="truncate font-mono text-body font-medium text-foreground" title={entry.model}>
+                          {entry.model}
+                        </span>
                         <Badge size="sm" outline>
                           {entry.mode}
                         </Badge>
@@ -263,18 +266,15 @@ export function HistoryDrawer({
                       </div>
                       {entry.error !== undefined ? <p className="m-0 text-caption text-danger">{entry.error}</p> : null}
                     </div>
-                    <Button
-                      type="button"
+                    <IconButton
+                      label="Restore this run"
                       variant="secondary"
-                      size="sm"
+                      icon={<RotateCcw size={14} strokeWidth={1.75} aria-hidden="true" />}
                       onClick={() => {
                         onRestore(entry);
                         onOpenChange(false);
                       }}
-                    >
-                      <RotateCcw size={13} strokeWidth={1.75} aria-hidden="true" />
-                      Restore
-                    </Button>
+                    />
                   </div>
                 );
               })}
