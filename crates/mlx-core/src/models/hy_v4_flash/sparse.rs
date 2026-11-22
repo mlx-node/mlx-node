@@ -55,13 +55,18 @@ pub(crate) fn try_sliding_sink_attention_prefill(
     ) else {
         return Ok(None);
     };
-    let qf = if q.dtype()? == DType::Float32 {
+    let q_is_f16 = q.dtype()? == DType::Float16
+        && match q_pe {
+            Some(pe) => pe.dtype()? == DType::Float16,
+            None => true,
+        };
+    let qf = if q_is_f16 || q.dtype()? == DType::Float32 {
         q.clone()
     } else {
         q.astype(DType::Float32)?
     };
     let qpef = match q_pe {
-        Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
+        Some(pe) if q_is_f16 || pe.dtype()? == DType::Float32 => Some(pe.clone()),
         Some(pe) => Some(pe.astype(DType::Float32)?),
         None => None,
     };
@@ -87,6 +92,7 @@ pub(crate) fn try_sliding_sink_attention_prefill(
             rc,
             ws,
             fk,
+            q_is_f16,
         )
     };
     if handle.is_null() {
@@ -336,16 +342,6 @@ fn gather_rows_in(
     } else {
         idx.astype(DType::Int32)?
     };
-    let qf = if q.dtype()? == DType::Float32 {
-        q.clone()
-    } else {
-        q.astype(DType::Float32)?
-    };
-    let qpef = match q_pe {
-        Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
-        Some(pe) => Some(pe.astype(DType::Float32)?),
-        None => None,
-    };
     if let Ok(vw) = i32::try_from(v_width) {
         let sf = if sinks.dtype()? == DType::Float32 {
             sinks.clone()
@@ -357,13 +353,28 @@ fn gather_rows_in(
             KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
         };
         if kind == RowKind::Prefill && s >= PREFILL_NAX_MIN_ROWS && mla_prefill_nax_enabled() {
-            let qpe_ptr = qpef
+            let q_is_f16 = q.dtype()? == DType::Float16
+                && match q_pe {
+                    Some(pe) => pe.dtype()? == DType::Float16,
+                    None => true,
+                };
+            let qn = if q_is_f16 || q.dtype()? == DType::Float32 {
+                q.clone()
+            } else {
+                q.astype(DType::Float32)?
+            };
+            let qpen = match q_pe {
+                Some(pe) if q_is_f16 || pe.dtype()? == DType::Float32 => Some(pe.clone()),
+                Some(pe) => Some(pe.astype(DType::Float32)?),
+                None => None,
+            };
+            let qpe_ptr = qpen
                 .as_ref()
                 .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
             // SAFETY: all handles are live arrays owned by this call; k1_ptr/qpe_ptr may be null.
             let handle = unsafe {
                 mlx_sys::mlx_hy4_mla_prefill_nax(
-                    qf.as_raw_ptr(),
+                    qn.as_raw_ptr(),
                     qpe_ptr,
                     k0_ptr,
                     k1_ptr,
@@ -371,12 +382,23 @@ fn gather_rows_in(
                     sf.as_raw_ptr(),
                     vw,
                     scale,
+                    q_is_f16,
                 )
             };
             if !handle.is_null() {
                 return MxArray::from_handle(handle, "hy_v4_flash mla_prefill_nax");
             }
         }
+        let qf = if q.dtype()? == DType::Float32 {
+            q.clone()
+        } else {
+            q.astype(DType::Float32)?
+        };
+        let qpef = match q_pe {
+            Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
+            Some(pe) => Some(pe.astype(DType::Float32)?),
+            None => None,
+        };
         let q_whole = match &qpef {
             Some(pe) => MxArray::concatenate(&qf, pe, -1)?,
             None => qf.clone(),
@@ -400,6 +422,16 @@ fn gather_rows_in(
             &q_whole, keys, &idx, s, h, d, kmax, v_width, sinks, scale, budget,
         );
     }
+    let qf = if q.dtype()? == DType::Float32 {
+        q.clone()
+    } else {
+        q.astype(DType::Float32)?
+    };
+    let qpef = match q_pe {
+        Some(pe) if pe.dtype()? == DType::Float32 => Some(pe.clone()),
+        Some(pe) => Some(pe.astype(DType::Float32)?),
+        None => None,
+    };
     let q_whole = match &qpef {
         Some(pe) => MxArray::concatenate(&qf, pe, -1)?,
         None => qf,

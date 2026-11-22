@@ -1,8 +1,8 @@
 R"METAL(
-constexpr int BM = 32;
+constexpr int BM = 64;
 constexpr int BN = 64;
 constexpr int BK = 64;
-constexpr int PAD = 72;
+constexpr int PAD = 64;
 
 const int R = hidden_shape[0];
 const int M = hidden_shape[1];
@@ -21,52 +21,69 @@ if (col >= uint(H)) return;
 const uint sg_idx = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
 const uint tid = sg_idx * 32u + lane;
-const short tm = short((sg_idx / 2u) * 16u);
+const short tm = short((sg_idx / 2u) * 32u);
 const short tn = short((sg_idx % 2u) * 32u);
-const short valid_m = short(max(0, min(16, int(end - begin) - int(tm))));
+const short valid_m = short(max(0, min(32, int(end - begin) - int(tm))));
 const short valid_n = short(max(0, min(32, int(H) - int(col + uint(tn)))));
 
-// As (4,608 B) + Bs (9,216 B) = 13,824 B <= 16 KiB (2 TGs/core).
+// As (8 KiB) + Bs (8 KiB) = 16 KiB (2 TGs/core).
 alignas(16) threadgroup half As[BM * PAD];
 alignas(16) threadgroup half Bs[BN * PAD];
 
-NAXTile<float, 1, 2> cd;
+NAXTile<float, 2, 2> cd;
 cd.clear();
 
 if (slot < uint(S)) {
-  const uint ar = tid >> 2;
-  const uint ac = (tid & 3u) * 16u;
-  const bool live = (begin + ar) < end;
-  half4 av[4];
-  if (live) {
-    if constexpr (IN_F16) {
-      const device half4* src = reinterpret_cast<const device half4*>(
-          hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
-      av[0] = src[0];
-      av[1] = src[1];
-      av[2] = src[2];
-      av[3] = src[3];
+  const uint ar0 = tid >> 2;
+  const uint ac4 = tid & 3u;
+  const uint ac = ac4 * 16u;
+  const bool a_live[2] = {
+      (begin + ar0) < end,
+      (begin + ar0 + 32u) < end,
+  };
+  const uint sw_a0 = uint(hy4_swz_c8(int(ac4 * 2u), int(ar0)));
+  const uint sw_a1 = uint(hy4_swz_c8(int(ac4 * 2u + 1u), int(ar0)));
+
+  half4 av[2][4];
+  STEEL_PRAGMA_UNROLL
+  for (int p = 0; p < 2; ++p) {
+    const uint ar = ar0 + uint(p) * 32u;
+    if (a_live[p]) {
+      if constexpr (IN_F16) {
+        const device float4* src = reinterpret_cast<const device float4*>(
+            hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
+        const float4 r0 = src[0];
+        const float4 r1 = src[1];
+        av[p][0] = as_type<half4>(r0.xy);
+        av[p][1] = as_type<half4>(r0.zw);
+        av[p][2] = as_type<half4>(r1.xy);
+        av[p][3] = as_type<half4>(r1.zw);
+      } else {
+        const device float4* src = reinterpret_cast<const device float4*>(
+            hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
+        av[p][0] = half4(src[0]);
+        av[p][1] = half4(src[1]);
+        av[p][2] = half4(src[2]);
+        av[p][3] = half4(src[3]);
+      }
     } else {
-      const device float4* src = reinterpret_cast<const device float4*>(
-          hidden + size_t(begin + ar) * size_t(M) + size_t(ac));
-      av[0] = half4(src[0]);
-      av[1] = half4(src[1]);
-      av[2] = half4(src[2]);
-      av[3] = half4(src[3]);
+      threadgroup half4* d0 =
+          reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a0 * 8u);
+      threadgroup half4* d1 =
+          reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a1 * 8u);
+      d0[0] = half4(0.0h);
+      d0[1] = half4(0.0h);
+      d1[0] = half4(0.0h);
+      d1[1] = half4(0.0h);
     }
-  } else {
-    threadgroup half4* dst =
-        reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
-    dst[0] = half4(0.0h);
-    dst[1] = half4(0.0h);
-    dst[2] = half4(0.0h);
-    dst[3] = half4(0.0h);
   }
 
   // 4 threads per weight row cooperatively load 8 consecutive bytes each = 32 B.
   const uint row0 = tid >> 2;
   const uint lane4 = tid & 3u;
   const ushort quad_base = ushort(lane & ~3u);
+  const uint sw_lo = uint(hy4_swz_c8(int(lane4), int(row0)));
+  const uint sw_hi = uint(hy4_swz_c8(int(4u + lane4), int(row0)));
   const bool w_live[2] = {
       (col + row0) < uint(H),
       (col + row0 + 32u) < uint(H),
@@ -81,15 +98,20 @@ if (slot < uint(S)) {
         (size_t(slot) * size_t(H) + size_t(col + wr)) * row_bytes;
     if (!w_live[p]) {
       threadgroup half4* d_lo =
-          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_lo * 8u);
       threadgroup half4* d_hi =
-          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+          reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_hi * 8u);
       d_lo[0] = half4(0.0h);
       d_lo[1] = half4(0.0h);
       d_hi[0] = half4(0.0h);
       d_hi[1] = half4(0.0h);
     }
   }
+
+  const bool active = (valid_m > 0 && valid_n > 0);
+  const short2 coord = BaseNAXFrag::get_coord();
+  const short fm = coord.y;
+  const short fn = coord.x;
 
   if constexpr (BITS == 4) {
     float blk_d[2], blk_dmin[2];
@@ -119,13 +141,19 @@ if (slot < uint(S)) {
       if (base > 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
-      if (live) {
-        threadgroup half4* dst =
-            reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
-        dst[0] = av[0];
-        dst[1] = av[1];
-        dst[2] = av[2];
-        dst[3] = av[3];
+      STEEL_PRAGMA_UNROLL
+      for (int p = 0; p < 2; ++p) {
+        if (a_live[p]) {
+          const uint ar = ar0 + uint(p) * 32u;
+          threadgroup half4* d0 =
+              reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a0 * 8u);
+          threadgroup half4* d1 =
+              reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a1 * 8u);
+          d0[0] = av[p][0];
+          d0[1] = av[p][1];
+          d1[0] = av[p][2];
+          d1[1] = av[p][3];
+        }
       }
       const int c = (base >> 6) & 3;
       const int g0 = 2 * c;
@@ -137,30 +165,21 @@ if (slot < uint(S)) {
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g0, d0, m0);
           hy4_gguf_q4k_group_scale(sc_w[p], blk_d[p], blk_dmin[p], g1, d1, m1);
         }
-        d0 = simd_shuffle(d0, quad_base);
-        m0 = simd_shuffle(m0, quad_base);
-        d1 = simd_shuffle(d1, quad_base);
-        m1 = simd_shuffle(m1, quad_base);
+        const half hd0 = half(simd_shuffle(d0, quad_base));
+        const half hm0 = half(simd_shuffle(m0, quad_base));
+        const half hd1 = half(simd_shuffle(d1, quad_base));
+        const half hm1 = half(simd_shuffle(m1, quad_base));
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
           threadgroup half4* d_lo =
-              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_lo * 8u);
           threadgroup half4* d_hi =
-              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_hi * 8u);
           STEEL_PRAGMA_UNROLL
           for (int i = 0; i < 2; ++i) {
-            const uint32_t w = qs_w[p][i];
-            d_lo[i] = half4(
-                fma(float(w & 0x0Fu), d0, m0),
-                fma(float((w >> 8) & 0x0Fu), d0, m0),
-                fma(float((w >> 16) & 0x0Fu), d0, m0),
-                fma(float((w >> 24) & 0x0Fu), d0, m0));
-            const uint32_t wh = w >> 4;
-            d_hi[i] = half4(
-                fma(float(wh & 0x0Fu), d1, m1),
-                fma(float((wh >> 8) & 0x0Fu), d1, m1),
-                fma(float((wh >> 16) & 0x0Fu), d1, m1),
-                fma(float((wh >> 24) & 0x0Fu), d1, m1));
+            const uchar4 b = as_type<uchar4>(qs_w[p][i]);
+            d_lo[i] = metal::fma(half4(b & uchar4(0x0Fu)), hd0, hm0);
+            d_hi[i] = metal::fma(half4(b >> 4), hd1, hm1);
           }
         }
       }
@@ -168,21 +187,29 @@ if (slot < uint(S)) {
 
       const int next = base + BK;
       if (next < M) {
-        if (live) {
-          if constexpr (IN_F16) {
-            const device half4* src = reinterpret_cast<const device half4*>(
-                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-            av[0] = src[0];
-            av[1] = src[1];
-            av[2] = src[2];
-            av[3] = src[3];
-          } else {
-            const device float4* src = reinterpret_cast<const device float4*>(
-                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-            av[0] = half4(src[0]);
-            av[1] = half4(src[1]);
-            av[2] = half4(src[2]);
-            av[3] = half4(src[3]);
+        STEEL_PRAGMA_UNROLL
+        for (int p = 0; p < 2; ++p) {
+          if (a_live[p]) {
+            const uint ar = ar0 + uint(p) * 32u;
+            if constexpr (IN_F16) {
+              const device float4* src = reinterpret_cast<const device float4*>(
+                  hidden + size_t(begin + ar) * size_t(M) + size_t(next) +
+                  size_t(ac));
+              const float4 r0 = src[0];
+              const float4 r1 = src[1];
+              av[p][0] = as_type<half4>(r0.xy);
+              av[p][1] = as_type<half4>(r0.zw);
+              av[p][2] = as_type<half4>(r1.xy);
+              av[p][3] = as_type<half4>(r1.zw);
+            } else {
+              const device float4* src = reinterpret_cast<const device float4*>(
+                  hidden + size_t(begin + ar) * size_t(M) + size_t(next) +
+                  size_t(ac));
+              av[p][0] = half4(src[0]);
+              av[p][1] = half4(src[1]);
+              av[p][2] = half4(src[2]);
+              av[p][3] = half4(src[3]);
+            }
           }
         }
         const size_t nblk_off = size_t(next >> 8) * 144u;
@@ -211,11 +238,11 @@ if (slot < uint(S)) {
         }
       }
 
-      if (valid_m > 0 && valid_n > 0) {
-        NAXTile<half, 1, 4> A;
+      if (active) {
+        NAXTile<half, 2, 4> A;
         NAXTile<half, 2, 4> B;
-        A.template load<half, PAD, 1>(As + tm * PAD);
-        B.template load<half, PAD, 1>(Bs + tn * PAD);
+        hy4_load_tile_swz64(A, As + size_t(tm) * PAD, fm, fn);
+        hy4_load_tile_swz64(B, Bs + size_t(tn) * PAD, fm, fn);
         tile_matmad_nax(cd, A, metal::false_type{}, B, metal::true_type{});
       }
     }
@@ -224,7 +251,7 @@ if (slot < uint(S)) {
     uchar4 ql0_v[2][2];
     uchar4 ql1_v[2][2];
     uchar4 qh_v[2][2];
-    float4 sc[2];
+    half4 sc[2];
     const size_t l_off = size_t(lane4) * 8u;
 
     STEEL_PRAGMA_UNROLL
@@ -259,7 +286,7 @@ if (slot < uint(S)) {
         const float4 sv = ((lane4 & 2u) == 0u)
             ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
             : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
-        sc[p] = sv * d_val;
+        sc[p] = half4(sv * d_val);
       }
     }
 
@@ -267,13 +294,19 @@ if (slot < uint(S)) {
       if (base > 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
-      if (live) {
-        threadgroup half4* dst =
-            reinterpret_cast<threadgroup half4*>(As + ar * PAD + ac);
-        dst[0] = av[0];
-        dst[1] = av[1];
-        dst[2] = av[2];
-        dst[3] = av[3];
+      STEEL_PRAGMA_UNROLL
+      for (int p = 0; p < 2; ++p) {
+        if (a_live[p]) {
+          const uint ar = ar0 + uint(p) * 32u;
+          threadgroup half4* d0 =
+              reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a0 * 8u);
+          threadgroup half4* d1 =
+              reinterpret_cast<threadgroup half4*>(As + ar * PAD + sw_a1 * 8u);
+          d0[0] = av[p][0];
+          d0[1] = av[p][1];
+          d1[0] = av[p][2];
+          d1[1] = av[p][3];
+        }
       }
       const int hi_half = (base >> 6) & 1;
       const uchar ql_sh = hi_half ? 4u : 0u;
@@ -283,22 +316,22 @@ if (slot < uint(S)) {
       for (int p = 0; p < 2; ++p) {
         if (w_live[p]) {
           const uint wr = row0 + uint(p) * 32u;
-          const float sc_a = hi_half ? sc[p].z : sc[p].x;
-          const float sc_b = hi_half ? sc[p].w : sc[p].y;
+          const half sc_a = hi_half ? sc[p].z : sc[p].x;
+          const half sc_b = hi_half ? sc[p].w : sc[p].y;
           threadgroup half4* d_lo =
-              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + lane4 * 8u);
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_lo * 8u);
           threadgroup half4* d_hi =
-              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + 32u + lane4 * 8u);
+              reinterpret_cast<threadgroup half4*>(Bs + wr * PAD + sw_hi * 8u);
           STEEL_PRAGMA_UNROLL
           for (int i = 0; i < 2; ++i) {
             const uchar4 q0 =
                 ((ql0_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
                 (((qh_v[p][i] >> qh_sh_a) & uchar4(0x03u)) << 4);
-            d_lo[i] = half4(float4(int4(q0) - 32) * sc_a);
+            d_lo[i] = half4(char4(q0) - char4(32)) * sc_a;
             const uchar4 q1 =
                 ((ql1_v[p][i] >> ql_sh) & uchar4(0x0Fu)) |
                 (((qh_v[p][i] >> qh_sh_b) & uchar4(0x03u)) << 4);
-            d_hi[i] = half4(float4(int4(q1) - 32) * sc_b);
+            d_hi[i] = half4(char4(q1) - char4(32)) * sc_b;
           }
         }
       }
@@ -306,21 +339,29 @@ if (slot < uint(S)) {
 
       const int next = base + BK;
       if (next < M) {
-        if (live) {
-          if constexpr (IN_F16) {
-            const device half4* src = reinterpret_cast<const device half4*>(
-                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-            av[0] = src[0];
-            av[1] = src[1];
-            av[2] = src[2];
-            av[3] = src[3];
-          } else {
-            const device float4* src = reinterpret_cast<const device float4*>(
-                hidden + size_t(begin + ar) * size_t(M) + size_t(next) + size_t(ac));
-            av[0] = half4(src[0]);
-            av[1] = half4(src[1]);
-            av[2] = half4(src[2]);
-            av[3] = half4(src[3]);
+        STEEL_PRAGMA_UNROLL
+        for (int p = 0; p < 2; ++p) {
+          if (a_live[p]) {
+            const uint ar = ar0 + uint(p) * 32u;
+            if constexpr (IN_F16) {
+              const device float4* src = reinterpret_cast<const device float4*>(
+                  hidden + size_t(begin + ar) * size_t(M) + size_t(next) +
+                  size_t(ac));
+              const float4 r0 = src[0];
+              const float4 r1 = src[1];
+              av[p][0] = as_type<half4>(r0.xy);
+              av[p][1] = as_type<half4>(r0.zw);
+              av[p][2] = as_type<half4>(r1.xy);
+              av[p][3] = as_type<half4>(r1.zw);
+            } else {
+              const device float4* src = reinterpret_cast<const device float4*>(
+                  hidden + size_t(begin + ar) * size_t(M) + size_t(next) +
+                  size_t(ac));
+              av[p][0] = half4(src[0]);
+              av[p][1] = half4(src[1]);
+              av[p][2] = half4(src[2]);
+              av[p][3] = half4(src[3]);
+            }
           }
         }
         if ((next & 127) == 0) {
@@ -360,17 +401,17 @@ if (slot < uint(S)) {
               const float4 sv = ((lane4 & 2u) == 0u)
                   ? float4(float(c0.x), float(c0.z), float(c1.x), float(c1.z))
                   : float4(float(c0.y), float(c0.w), float(c1.y), float(c1.w));
-              sc[p] = sv * d_val;
+              sc[p] = half4(sv * d_val);
             }
           }
         }
       }
 
-      if (valid_m > 0 && valid_n > 0) {
-        NAXTile<half, 1, 4> A;
+      if (active) {
+        NAXTile<half, 2, 4> A;
         NAXTile<half, 2, 4> B;
-        A.template load<half, PAD, 1>(As + tm * PAD);
-        B.template load<half, PAD, 1>(Bs + tn * PAD);
+        hy4_load_tile_swz64(A, As + size_t(tm) * PAD, fm, fn);
+        hy4_load_tile_swz64(B, Bs + size_t(tn) * PAD, fm, fn);
         tile_matmad_nax(cd, A, metal::false_type{}, B, metal::true_type{});
       }
     }
@@ -380,7 +421,7 @@ if (slot < uint(S)) {
 if (valid_m > 0 && valid_n > 0) {
   auto out_ptr =
       out + size_t(begin + uint(tm)) * size_t(H) + size_t(col + uint(tn));
-  if (valid_m == 16 && valid_n == 32) {
+  if (valid_m == 32 && valid_n == 32) {
     cd.store(out_ptr, H);
   } else {
     cd.store_slice(out_ptr, H, short2(0, 0), short2(valid_n, valid_m));

@@ -1351,13 +1351,26 @@ impl Indexer {
                     hw.slice(&[lo as i64, 0], &[hi as i64, h])?,
                 )
             };
+            let vis_arr = MxArray::from_int32(&visible[lo..hi], &[c])?;
             let sc = match score_keys.as_ref() {
-                Some(ScoreKeys::Flat { pool }) => {
-                    super::ops::try_indexer_score(&qc, &wc, pool, None, plan.cols, 0)?
-                }
-                Some(ScoreKeys::Paged { pool, pages }) => {
-                    super::ops::try_indexer_score(&qc, &wc, pool, Some(pages), plan.cols, 0)?
-                }
+                Some(ScoreKeys::Flat { pool }) => super::ops::try_indexer_score_causal(
+                    &qc,
+                    &wc,
+                    pool,
+                    None,
+                    Some(&vis_arr),
+                    plan.cols,
+                    0,
+                )?,
+                Some(ScoreKeys::Paged { pool, pages }) => super::ops::try_indexer_score_causal(
+                    &qc,
+                    &wc,
+                    pool,
+                    Some(pages),
+                    Some(&vis_arr),
+                    plan.cols,
+                    0,
+                )?,
                 None => None,
             };
             let sc = match sc {
@@ -1372,7 +1385,6 @@ impl Indexer {
                     scores(&qc, &wc, keys)?
                 }
             };
-            let vis_arr = MxArray::from_int32(&visible[lo..hi], &[c])?;
             let ts_arr = MxArray::from_int32(&tail_starts[lo..hi], &[c])?;
             let tl_arr = MxArray::from_int32(&tail_lens[lo..hi], &[c])?;
             let idx = match super::ops::try_indexer_topk_cells(

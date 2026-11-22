@@ -1226,7 +1226,9 @@ fn decode_head_weights_q8_runs_batched_bit_exact() {
 #[cfg(target_os = "macos")]
 mod fused_metal {
     use super::*;
-    use crate::models::hy_v4_flash::ops::{try_indexer_score, try_indexer_topk_cells};
+    use crate::models::hy_v4_flash::ops::{
+        try_indexer_score, try_indexer_score_causal, try_indexer_topk_cells,
+    };
     use crate::models::hy_v4_flash::paged::{BLOCK, page_ids, slot_ids};
 
     /// Builds a scattered physical page table of `n_pages` distinct physical
@@ -2127,6 +2129,165 @@ mod fused_metal {
                 "[indexer_score_bench:{mode}] S={s} N_g={n_groups} paged={paged}: {us:.2} us/layer (12L={:.2} ms)",
                 us * 12.0 / 1000.0
             );
+        }
+    }
+
+    #[test]
+    fn indexer_score_prefill_bn128_and_causal_skip_match_reference() {
+        crate::models::hy_v4_flash::exact_f32();
+        let h = 16usize;
+        let d = 128usize;
+        let index_rows = 8usize;
+
+        // Sweep BN_G=128 sub-tile boundaries (1..4 active 32-col sub-tiles) and S boundaries.
+        for (s, n_groups, start_g, seed) in [
+            (17usize, 1usize, 0usize, 901u64),
+            (19, 31, 0, 902),
+            (32, 32, 3, 903),
+            (63, 33, 0, 904),
+            (64, 64, 5, 905),
+            (65, 65, 0, 906),
+            (64, 96, 7, 907),
+            (64, 97, 0, 908),
+            (65, 127, 0, 909),
+            (64, 128, 4, 910),
+            (129, 129, 0, 911),
+            (128, 300, 9, 912),
+        ] {
+            let mut rng = Rng(seed);
+            let q = arr(&rng.vec(s * h * d, 1.5), &[s, h, d]);
+            let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
+            let keys_f16 = arr(&rng.vec(n_groups * d, 1.5), &[n_groups, d])
+                .astype(DType::Float16)
+                .unwrap();
+            let keys_ref_f32 = keys_f16.astype(DType::Float32).unwrap();
+            let want = read(&scores(&q, &w, &keys_ref_f32).unwrap());
+
+            let cap_g = start_g + n_groups + 11;
+            let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+            let mut flat_bits = vec![0u16; cap_g * d];
+            flat_bits[start_g * d..(start_g + n_groups) * d].copy_from_slice(&keys_bits);
+            let flat_pool = MxArray::from_float16(&flat_bits, &[cap_g as i64, d as i64]).unwrap();
+
+            let Some(got_flat_arr) =
+                try_indexer_score(&q, &w, &flat_pool, None, n_groups, start_g).unwrap()
+            else {
+                eprintln!("skipping indexer_score BN_G=128 test (no GPU)");
+                return;
+            };
+            let got_flat = read(&got_flat_arr);
+            let mut max_diff = 0.0f32;
+            for (&g, &wv) in got_flat.iter().zip(&want) {
+                max_diff = max_diff.max((g - wv).abs());
+            }
+            assert!(
+                max_diff <= 5e-3,
+                "BN_G=128 flat S={s} N_g={n_groups} start_g={start_g}: max_diff={max_diff:e}"
+            );
+
+            let n_pages = (start_g + n_groups).div_ceil(index_rows);
+            let n_blocks = n_pages + 7;
+            let pages_u32 = scattered_pages(n_pages, n_blocks);
+            let pages_arr = page_ids(&pages_u32).unwrap();
+            let paged_pool = pack_paged_keys(
+                &keys_bits, n_groups, start_g, &pages_u32, n_blocks, index_rows, d,
+            );
+            let got_paged = read(
+                &try_indexer_score(&q, &w, &paged_pool, Some(&pages_arr), n_groups, start_g)
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(
+                got_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                got_flat.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "BN_G=128 paged vs flat S={s} N_g={n_groups}"
+            );
+        }
+
+        // Causal g_tile skip: rows 0..192 have monotonically increasing visible_groups from 40..520
+        // over N_g=512 (skipping >50% of g tiles on early s_tiles and hitting mid-128 partial n_sub).
+        let (s, n_groups, n_top, kpool, kmax) = (192usize, 512usize, 16usize, 4usize, 68usize);
+        let mut rng = Rng(999);
+        let q = arr(&rng.vec(s * h * d, 1.5), &[s, h, d]);
+        let w = arr(&rng.vec(s * h, 0.2), &[s, h]);
+        let keys_f16 = arr(&rng.vec(n_groups * d, 1.5), &[n_groups, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let keys_bits = keys_f16.to_uint16_native().unwrap().to_vec();
+        let n_pages = n_groups.div_ceil(index_rows);
+        let n_blocks = n_pages + 7;
+        let pages_u32 = scattered_pages(n_pages, n_blocks);
+        let pages_arr = page_ids(&pages_u32).unwrap();
+        let paged_pool =
+            pack_paged_keys(&keys_bits, n_groups, 0, &pages_u32, n_blocks, index_rows, d);
+
+        let visible: Vec<i32> = (0..s)
+            .map(|r| (40 + r * 5 / 2).min(n_groups) as i32)
+            .collect();
+        let tail_starts: Vec<i32> = visible.iter().map(|&v| v * kpool as i32).collect();
+        let tail_lens: Vec<i32> = (0..s).map(|r| ((r % 4) + 1) as i32).collect();
+        let vis_arr = MxArray::from_int32(&visible, &[s as i64]).unwrap();
+        let ts_arr = MxArray::from_int32(&tail_starts, &[s as i64]).unwrap();
+        let tl_arr = MxArray::from_int32(&tail_lens, &[s as i64]).unwrap();
+
+        for (label, pool, pages) in [
+            ("flat", &keys_f16, None),
+            ("paged", &paged_pool, Some(&pages_arr)),
+        ] {
+            let full_sc = try_indexer_score(&q, &w, pool, pages, n_groups, 0)
+                .unwrap()
+                .unwrap();
+            let causal_sc =
+                try_indexer_score_causal(&q, &w, pool, pages, Some(&vis_arr), n_groups, 0)
+                    .unwrap()
+                    .unwrap();
+            let full_v = read(&full_sc);
+            let causal_v = read(&causal_sc);
+            for (r, &v) in visible.iter().enumerate() {
+                for g in 0..(v as usize) {
+                    assert_eq!(
+                        causal_v[r * n_groups + g].to_bits(),
+                        full_v[r * n_groups + g].to_bits(),
+                        "causal vs full mismatch ({label}) r={r} g={g} vis={v}"
+                    );
+                }
+            }
+            let full_cells = read_i32(
+                &try_indexer_topk_cells(
+                    &full_sc,
+                    &vis_arr,
+                    &ts_arr,
+                    &tl_arr,
+                    pages,
+                    n_top,
+                    kpool,
+                    kmax,
+                    BLOCK as usize,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            let causal_cells = read_i32(
+                &try_indexer_topk_cells(
+                    &causal_sc,
+                    &vis_arr,
+                    &ts_arr,
+                    &tl_arr,
+                    pages,
+                    n_top,
+                    kpool,
+                    kmax,
+                    BLOCK as usize,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            assert_eq!(causal_cells, full_cells, "topk cells ({label}) mismatch");
+
+            // Fallback `pick_groups` must also match identically despite skipped columns.
+            let full_pick = read_i32(&pick_groups(&full_sc, &visible, n_top).unwrap());
+            let causal_pick = read_i32(&pick_groups(&causal_sc, &visible, n_top).unwrap());
+            assert_eq!(causal_pick, full_pick, "pick_groups ({label}) mismatch");
         }
     }
 }

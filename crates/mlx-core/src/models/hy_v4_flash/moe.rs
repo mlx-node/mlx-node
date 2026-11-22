@@ -101,10 +101,9 @@ pub(crate) fn with_prefill_indirect_gu<T>(enabled: bool, f: impl FnOnce() -> T) 
     f()
 }
 
-/// Builds exact BM=32 `(begin, end, bank_slot)` tiles for contiguous runs of
+/// Builds exact `bm`-row `(begin, end, bank_slot)` tiles for contiguous runs of
 /// ascending bank slot ids.
-pub(crate) fn build_prefill_tiles(sorted_slots: &[u32]) -> Vec<u32> {
-    const BM: usize = 32;
+pub(crate) fn build_prefill_tiles_bm(sorted_slots: &[u32], bm: usize) -> Vec<u32> {
     let mut tiles = Vec::new();
     let mut i = 0usize;
     while i < sorted_slots.len() {
@@ -115,7 +114,7 @@ pub(crate) fn build_prefill_tiles(sorted_slots: &[u32]) -> Vec<u32> {
         }
         let mut begin = i;
         while begin < j {
-            let end = (begin + BM).min(j);
+            let end = (begin + bm).min(j);
             tiles.push(begin as u32);
             tiles.push(end as u32);
             tiles.push(slot);
@@ -124,6 +123,12 @@ pub(crate) fn build_prefill_tiles(sorted_slots: &[u32]) -> Vec<u32> {
         i = j;
     }
     tiles
+}
+
+/// Builds exact BM=32 `(begin, end, bank_slot)` tiles for contiguous runs of
+/// ascending bank slot ids.
+pub(crate) fn build_prefill_tiles(sorted_slots: &[u32]) -> Vec<u32> {
+    build_prefill_tiles_bm(sorted_slots, 32)
 }
 
 pub(crate) fn prefill_q8_nax_enabled() -> bool {
@@ -229,6 +234,12 @@ impl RowKind {
 /// decode for 12..=16 when NAX is unavailable/disabled, and then to MLX
 /// `quantized_matmul` (with `MIN_Q8_ROWS` padding when needed).
 pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
+    qlinear_out(x, w, false)
+}
+
+/// `qlinear` accepting `Float16` or `Float32` `x` on the Q8 prefill path and
+/// writing `Float16` when `out_f16` is set and the prefill kernel runs.
+pub(crate) fn qlinear_out(x: &MxArray, w: &Dense, out_f16: bool) -> Result<MxArray> {
     if let Some((qw, scales, biases)) = w.qmm_parts()
         && x.ndim()? == 2
     {
@@ -253,20 +264,20 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
                 return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
             }
         } else if n >= 12 {
-            let xf = if x.dtype()? == DType::Float32 {
-                x.clone()
-            } else {
-                x.astype(DType::Float32)?
-            };
             let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
             if prefill_q8_nax_enabled() {
+                let xp = match x.dtype()? {
+                    DType::Float16 | DType::Float32 => x.clone(),
+                    _ => x.astype(DType::Float32)?,
+                };
                 // SAFETY: all handles are live arrays owned by this call.
                 let h = unsafe {
                     mlx_sys::mlx_hy4_q8_dense_prefill(
-                        xf.as_raw_ptr(),
+                        xp.as_raw_ptr(),
                         qw.as_raw_ptr(),
                         scales.as_raw_ptr(),
                         biases_ptr,
+                        out_f16,
                     )
                 };
                 if !h.is_null() {
@@ -274,6 +285,11 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
                 }
             }
             if n <= 16 {
+                let xf = if x.dtype()? == DType::Float32 {
+                    x.clone()
+                } else {
+                    x.astype(DType::Float32)?
+                };
                 // SAFETY: all handles are live arrays owned by this call.
                 let h = unsafe {
                     mlx_sys::mlx_hy4_q8_dense_decode(
@@ -298,25 +314,35 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
 
 /// `sigmoid(x · wᵀ) * mul_in` fused in the Q8 NAX prefill epilogue.
 /// Returns `Ok(None)` when the kernel is unavailable or `M < 12`.
+#[cfg(test)]
 pub(crate) fn try_qlinear_sigmoid_mul(
     x: &MxArray,
     w: &Dense,
     mul_in: &MxArray,
+) -> Result<Option<MxArray>> {
+    try_qlinear_sigmoid_mul_out(x, w, mul_in, false)
+}
+
+/// `try_qlinear_sigmoid_mul` accepting `Float16` or `Float32` `x`/`mul_in` and
+/// writing `Float16` when `out_f16` is set.
+pub(crate) fn try_qlinear_sigmoid_mul_out(
+    x: &MxArray,
+    w: &Dense,
+    mul_in: &MxArray,
+    out_f16: bool,
 ) -> Result<Option<MxArray>> {
     if let Some((qw, scales, biases)) = w.qmm_parts()
         && x.ndim()? == 2
         && x.shape_at(0)? >= 12
         && prefill_q8_nax_enabled()
     {
-        let xf = if x.dtype()? == DType::Float32 {
-            x.clone()
-        } else {
-            x.astype(DType::Float32)?
+        let xf = match x.dtype()? {
+            DType::Float16 | DType::Float32 => x.clone(),
+            _ => x.astype(DType::Float32)?,
         };
-        let mf = if mul_in.dtype()? == DType::Float32 {
-            mul_in.clone()
-        } else {
-            mul_in.astype(DType::Float32)?
+        let mf = match mul_in.dtype()? {
+            DType::Float16 | DType::Float32 => mul_in.clone(),
+            _ => mul_in.astype(DType::Float32)?,
         };
         let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
         // SAFETY: all handles are live arrays owned by this call.
@@ -328,6 +354,7 @@ pub(crate) fn try_qlinear_sigmoid_mul(
                 biases_ptr,
                 mf.as_raw_ptr(),
                 1,
+                out_f16,
             )
         };
         if !h.is_null() {
@@ -1673,7 +1700,7 @@ impl Moe {
         let k = self.moe.n_used as i64;
         let n_experts = self.moe.n_experts;
         let pairs = rows * k;
-        if let Some((tr, tl, inv, sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts)? {
+        if let Some((tr, tl, inv, sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts, 32)? {
             let y_tiles = (tl.shape_at(0)? as usize).min(i32::MAX as usize) as i32;
             let max_group = n_experts.min(i32::MAX as usize) as i32;
             let a = match self.kq_prefill_indirect_gu_gpu(z, &tr, &tl, arrays)? {
@@ -1846,7 +1873,8 @@ impl Moe {
         let k = self.moe.n_used as i64;
         let n_experts = self.moe.n_experts;
         let pairs = rows * k;
-        if let Some((tr, tl, inv, _sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts)? {
+        if let Some((tr, tl, inv, _sorted_slots)) = moe_prefill_sort_tiles(gpu_ids, n_experts, 64)?
+        {
             let [g, u, d] = projs;
             let Some(hidden) = gguf_prefill_indirect_gu(
                 z,
@@ -1936,7 +1964,7 @@ impl Moe {
             row[pos] = (pair_idx / k) as u32;
             slot[pos] = e;
         }
-        let tiles = build_prefill_tiles(&slot);
+        let tiles = build_prefill_tiles_bm(&slot, 64);
         let tr = MxArray::from_uint32(&row, &[pairs as i64])?;
         let tl = MxArray::from_uint32(&tiles, &[(tiles.len() / 3) as i64, 3])?;
         let [g, u, d] = projs;

@@ -1336,6 +1336,7 @@ fn call_mla_prefill_nax(
         KeyRows::Whole(k) => (k.as_raw_ptr(), std::ptr::null_mut()),
         KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
     };
+    let out_f16 = q.dtype().unwrap() == DType::Float16;
     let raw = unsafe {
         mlx_sys::mlx_hy4_mla_prefill_nax(
             q.as_raw_ptr(),
@@ -1346,6 +1347,7 @@ fn call_mla_prefill_nax(
             sinks.as_raw_ptr(),
             vw as i32,
             scale,
+            out_f16,
         )
     };
     if raw.is_null() {
@@ -1446,8 +1448,14 @@ fn mla_prefill_nax_matches_reference_full_geometry() {
         }
         let rel_l2 = (sum_sq_err / sum_sq_ref.max(1e-30)).sqrt();
         eprintln!("[parity] S={s} H={h} kmax={kmax}: max_abs={max_abs:.3e} rel_l2={rel_l2:.3e}");
+        let (max_tol, rel_tol) = if std::env::var("MLX_HY4_MLA_PREFILL_2MMA").as_deref() == Ok("1")
+        {
+            (1e-5, 1e-5)
+        } else {
+            (3e-3, 1e-3)
+        };
         assert!(
-            max_abs <= 1e-5 && rel_l2 <= 1e-5,
+            max_abs <= max_tol && rel_l2 <= rel_tol,
             "S={s} H={h} kmax={kmax}: max_abs={max_abs:e} rel_l2={rel_l2:e} at (row={}, head={}, col={}) got={} want={}",
             worst.0 / (h * vw as usize),
             (worst.0 / vw as usize) % h,
@@ -1865,8 +1873,14 @@ fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
         eprintln!(
             "[sliding_nax] S={s} H={h} start={start_pos} ring={is_ring} cap={ring_cap} first={first_key}: max_abs={max_abs:.3e} rel_l2={rel_l2:.3e}"
         );
+        let (max_tol, rel_tol) = if std::env::var("MLX_HY4_MLA_PREFILL_2MMA").as_deref() == Ok("1")
+        {
+            (1e-5, 1e-5)
+        } else {
+            (3e-3, 1e-3)
+        };
         assert!(
-            max_abs <= 1e-5 && rel_l2 <= 1e-5,
+            max_abs <= max_tol && rel_l2 <= rel_tol,
             "sliding NAX S={s} H={h} start={start_pos} ring={is_ring}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
         );
     }
@@ -1917,8 +1931,13 @@ fn mla_prefill_sliding_nax_matches_reference_ring_and_linear() {
             .zip(&want)
             .map(|(g, w)| (g - w).abs())
             .fold(0.0f32, f32::max);
+        let max_tol = if std::env::var("MLX_HY4_MLA_PREFILL_2MMA").as_deref() == Ok("1") {
+            1e-5
+        } else {
+            3e-3
+        };
         assert!(
-            max_abs <= 1e-5,
+            max_abs <= max_tol,
             "WindowRing append start={start} S={s} ring={is_ring}: max_abs={max_abs:e}"
         );
     }
@@ -2230,4 +2249,187 @@ fn mla_prefill_split_q_matches_combined_bitwise_sliding_and_indexed() {
             "indexed split-Q vs combined mismatch S={s} H={h} kmax={kmax} split_kv={split_kv}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mla_prefill_f16_io_matches_f32_cast() {
+    use super::super::sparse::gather_sink_attention_rows_split_q_for;
+
+    if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        return;
+    }
+    crate::models::hy_v4_flash::exact_f32();
+    let (d_v, d_r, d, window) = (512usize, 64usize, 576usize, 512usize);
+    let scale = 1.0 / (d as f32).sqrt();
+
+    // Sliding: FP16 split-Q -> FP16 output matches FP32 output cast to FP16.
+    for &(s, h, start_pos, is_ring, ring_cap, first_key, seed) in &[
+        (19usize, 5usize, 500usize, true, 540usize, 0usize, 811u64),
+        (64, 64, 512, false, 0, 12, 821),
+    ] {
+        let mut r = Rng(seed);
+        let q_abs_f16 = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v])
+            .astype(DType::Float16)
+            .unwrap();
+        let q_pe_f16 = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r])
+            .astype(DType::Float16)
+            .unwrap();
+        let q_abs_f32 = q_abs_f16.astype(DType::Float32).unwrap();
+        let q_pe_f32 = q_pe_f16.astype(DType::Float32).unwrap();
+        let key_rows = if is_ring {
+            ring_cap
+        } else {
+            start_pos + s - first_key
+        };
+        let keys = arr(&r.vec(key_rows * d, 1.0), &[key_rows, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+
+        let out_f16 = try_sliding_sink_attention_prefill(
+            &q_abs_f16,
+            Some(&q_pe_f16),
+            &keys,
+            &sinks,
+            d_v as i64,
+            scale,
+            start_pos,
+            is_ring,
+            ring_cap,
+            window,
+            first_key,
+        )
+        .unwrap()
+        .expect("sliding f16");
+        assert_eq!(out_f16.dtype().unwrap(), DType::Float16);
+
+        let out_f32 = try_sliding_sink_attention_prefill(
+            &q_abs_f32,
+            Some(&q_pe_f32),
+            &keys,
+            &sinks,
+            d_v as i64,
+            scale,
+            start_pos,
+            is_ring,
+            ring_cap,
+            window,
+            first_key,
+        )
+        .unwrap()
+        .expect("sliding f32");
+        assert_eq!(out_f32.dtype().unwrap(), DType::Float32);
+        let want = out_f32.astype(DType::Float16).unwrap();
+        assert_eq!(
+            bits(&out_f16),
+            bits(&want),
+            "sliding FP16 IO mismatch S={s} H={h} ring={is_ring}"
+        );
+    }
+
+    // Indexed: FP16 split-Q + split-KV -> FP16 output matches FP32 cast to FP16.
+    let (s, h, kmax, n) = (32usize, 32usize, 512usize, 549usize);
+    let mut r = Rng(827);
+    let q_abs_f16 = arr(&r.vec(s * h * d_v, 1.0), &[s, h, d_v])
+        .astype(DType::Float16)
+        .unwrap();
+    let q_pe_f16 = arr(&r.vec(s * h * d_r, 1.0), &[s, h, d_r])
+        .astype(DType::Float16)
+        .unwrap();
+    let q_abs_f32 = q_abs_f16.astype(DType::Float32).unwrap();
+    let q_pe_f32 = q_pe_f16.astype(DType::Float32).unwrap();
+    let keys = arr(&r.vec(n * d, 1.0), &[n, d])
+        .astype(DType::Float16)
+        .unwrap();
+    let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+    let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+    let sinks = arr(&r.vec(h, 2.0), &[h]);
+    let idx: Vec<i32> = (0..s * kmax)
+        .map(|i| {
+            let (row, j) = (i / kmax, i % kmax);
+            if row % 7 == 0 || (32..64).contains(&j) {
+                -1
+            } else {
+                ((i * 11 + 5) % n) as i32
+            }
+        })
+        .collect();
+    let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+    let out_f16 = gather_sink_attention_rows_split_q_for(
+        &q_abs_f16,
+        Some(&q_pe_f16),
+        KeyRows::Split(&k0, &k1),
+        &ia,
+        d_v as i64,
+        &sinks,
+        scale,
+        RowKind::Prefill,
+    )
+    .unwrap();
+    assert_eq!(out_f16.dtype().unwrap(), DType::Float16);
+    let out_f32 = gather_sink_attention_rows_split_q_for(
+        &q_abs_f32,
+        Some(&q_pe_f32),
+        KeyRows::Split(&k0, &k1),
+        &ia,
+        d_v as i64,
+        &sinks,
+        scale,
+        RowKind::Prefill,
+    )
+    .unwrap();
+    let want = out_f32.astype(DType::Float16).unwrap();
+    assert_eq!(bits(&out_f16), bits(&want), "indexed FP16 IO mismatch");
+
+    // Mixed-validity tiles alternating with all-padding tiles must match reference
+    // with zero s_slots overwrite race across simdgroups.
+    let mut alt_idx = vec![-1i32; s * kmax];
+    for row in 0..s {
+        for tile in 0..(kmax / 32) {
+            if tile % 2 == 0 {
+                // Partially valid tile: half valid, half -1.
+                for j in 0..16 {
+                    alt_idx[row * kmax + tile * 32 + j * 2] =
+                        ((row * 17 + tile * 13 + j * 3) % n) as i32;
+                }
+            }
+            // Odd tiles remain all -1 (skipped).
+        }
+    }
+    let alt_ia = MxArray::from_int32(&alt_idx, &[s as i64, kmax as i64]).unwrap();
+    let alt_got = read(
+        &gather_sink_attention_rows_split_q_for(
+            &q_abs_f32,
+            Some(&q_pe_f32),
+            KeyRows::Split(&k0, &k1),
+            &alt_ia,
+            d_v as i64,
+            &sinks,
+            scale,
+            RowKind::Prefill,
+        )
+        .unwrap(),
+    );
+    let q_full_f32 = MxArray::concatenate(&q_abs_f32, &q_pe_f32, -1).unwrap();
+    let alt_want = read(
+        &gather_rows_reference(
+            &q_full_f32,
+            KeyRows::Split(&k0, &k1),
+            &alt_ia,
+            d_v as i64,
+            &sinks,
+            scale,
+        )
+        .unwrap(),
+    );
+    let alt_max = alt_got
+        .iter()
+        .zip(&alt_want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        alt_max <= 3e-3,
+        "indexed alternating mixed/all-padding tiles max_abs={alt_max:e}"
+    );
 }

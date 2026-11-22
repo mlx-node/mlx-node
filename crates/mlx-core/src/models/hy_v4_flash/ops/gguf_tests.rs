@@ -2,7 +2,7 @@ use super::*;
 use crate::array::alloc::{DstPtrs, OutLayout};
 use crate::models::hy_v4_flash::bank::ProjArrays;
 use crate::models::hy_v4_flash::kq_slot;
-use crate::models::hy_v4_flash::moe::build_prefill_tiles;
+use crate::models::hy_v4_flash::moe::{build_prefill_tiles, build_prefill_tiles_bm};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
 struct Rng(u64);
@@ -1277,6 +1277,244 @@ fn gguf_prefill_strided_x_and_kq_sorted_combine_f16_tail() {
             max_abs <= 1e-6 && rel_l2 <= 1e-6,
             "kq_sorted_combine F16 vs F32 H={h}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
         );
+    }
+}
+
+#[test]
+fn moe_prefill_sort_tiles_single_and_multi_tg_bm32_and_bm64() {
+    let cases: &[(usize, usize, usize, bool)] = &[
+        (16, 4, 17, false),     // R=64 (single-TG)
+        (128, 16, 64, true),    // R=2048 (single-TG boundary + OOB ids)
+        (129, 16, 64, false),   // R=2064 (multi-TG boundary)
+        (256, 16, 128, true),   // R=4096 (multi-TG + OOB ids)
+        (4096, 16, 512, false), // R=65536 (32-TG full 4K prefill scale)
+    ];
+
+    for &(rows, k, n_experts, with_oob) in cases {
+        let mut rng = Rng::new(7700 + (rows * 31 + n_experts) as u64);
+        let r = rows * k;
+        let mut ids = Vec::with_capacity(r);
+        for i in 0..r {
+            if with_oob && i % 97 == 13 {
+                ids.push(n_experts as u32 + (i as u32 % 5));
+            } else if i % 11 == 0 {
+                // Force hot experts spanning >64 and >128 rows.
+                ids.push((i % 3) as u32);
+            } else {
+                ids.push((rng.next_u64() as usize % n_experts) as u32);
+            }
+        }
+        let ids_arr = MxArray::from_uint32(&ids, &[rows as i64, k as i64]).unwrap();
+
+        for &tile_m in &[32usize, 64usize] {
+            let Some((tr_arr, tl_arr, inv_arr, sl_arr)) =
+                moe_prefill_sort_tiles(&ids_arr, n_experts, tile_m).unwrap()
+            else {
+                assert!(!require_metal(), "Metal required");
+                return;
+            };
+            let tr = tr_arr.to_uint32().unwrap().to_vec();
+            let tl = tl_arr.to_uint32().unwrap().to_vec();
+            let inv = inv_arr.to_uint32().unwrap().to_vec();
+            let sl = sl_arr.to_uint32().unwrap().to_vec();
+
+            assert_eq!(tr.len(), r);
+            assert_eq!(inv.len(), r);
+            assert_eq!(sl.len(), r);
+            let max_tiles = r.min(r.div_ceil(tile_m) + n_experts);
+            assert_eq!(tl.len(), max_tiles * 3);
+
+            let valid_count = ids.iter().filter(|&&e| (e as usize) < n_experts).count();
+            let mut seen = vec![false; valid_count];
+            for (i, &e) in ids.iter().enumerate() {
+                let pos = inv[i] as usize;
+                if (e as usize) < n_experts {
+                    assert!(
+                        pos < valid_count,
+                        "rows={rows} tile_m={tile_m}: pos {pos} >= {valid_count}"
+                    );
+                    assert!(
+                        !seen[pos],
+                        "rows={rows} tile_m={tile_m}: duplicate pos {pos}"
+                    );
+                    seen[pos] = true;
+                    assert_eq!(tr[pos], (i / k) as u32);
+                    assert_eq!(sl[pos], e);
+                } else {
+                    assert_eq!(pos, r, "OOB id must map to R");
+                }
+            }
+            assert!(seen.iter().all(|&s| s));
+            assert!(
+                sl[..valid_count].windows(2).all(|w| w[0] <= w[1]),
+                "sorted_slots not non-decreasing"
+            );
+            for pos in valid_count..r {
+                assert_eq!(tr[pos], 0);
+                assert_eq!(sl[pos], 0);
+            }
+
+            let expected_tiles = build_prefill_tiles_bm(&sl[..valid_count], tile_m);
+            assert!(expected_tiles.len() <= tl.len());
+            assert_eq!(
+                &tl[..expected_tiles.len()],
+                expected_tiles.as_slice(),
+                "tiles mismatch rows={rows} tile_m={tile_m}"
+            );
+            assert!(
+                tl[expected_tiles.len()..].iter().all(|&v| v == 0),
+                "trailing tiles not zeroed rows={rows} tile_m={tile_m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gguf_prefill_bm64_multi_tile_and_m32_unchunked_dedup_parity() {
+    // Exercise BM=64 runs spanning 1, 17, 32, 33, 63, 64, 65, and 130 rows per expert.
+    let run_lens = [1usize, 17, 32, 33, 63, 64, 65, 130];
+    let n_experts = run_lens.len();
+    let pairs: usize = run_lens.iter().sum();
+    let (k, m, h, n_tok) = (512usize, 256usize, 256usize, 64usize);
+
+    for down_bits in [4, 6] {
+        let mut rng = Rng::new(8200 + down_bits as u64);
+        let raw_g = gen_raw_q4k(&mut rng, n_experts, m, k);
+        let raw_u = gen_raw_q4k(&mut rng, n_experts, m, k);
+        let (down_ty, raw_d, down_off) = if down_bits == 6 {
+            (
+                GgufTensorType::Q6K,
+                gen_raw_q6k(&mut rng, n_experts, h, m),
+                66u64,
+            )
+        } else {
+            (
+                GgufTensorType::Q4K,
+                gen_raw_q4k(&mut rng, n_experts, h, m),
+                64u64,
+            )
+        };
+        let g_buf = make_padded_u8_buf(&raw_g, 32, true);
+        let u_buf = make_padded_u8_buf(&raw_u, 96, true);
+        let d_buf = make_padded_u8_buf(&raw_d, down_off, true);
+        let g_kq = repack_to_proj_arrays(&raw_g, GgufTensorType::Q4K, n_experts, m, k);
+        let u_kq = repack_to_proj_arrays(&raw_u, GgufTensorType::Q4K, n_experts, m, k);
+        let d_kq = repack_to_proj_arrays(&raw_d, down_ty, n_experts, h, m);
+
+        let x_vals: Vec<f32> = (0..n_tok * k).map(|_| rng.next_f32(-5.0, 5.0)).collect();
+        let x_arr = MxArray::from_float32(&x_vals, &[n_tok as i64, k as i64]).unwrap();
+
+        let mut sorted_slots = Vec::with_capacity(pairs);
+        let mut token_rows = Vec::with_capacity(pairs);
+        for (e, &len) in run_lens.iter().enumerate() {
+            for j in 0..len {
+                sorted_slots.push(e as u32);
+                token_rows.push(((e * 13 + j * 5) % n_tok) as u32);
+            }
+        }
+        let tiles64 = build_prefill_tiles_bm(&sorted_slots, 64);
+        let tr_arr = MxArray::from_uint32(&token_rows, &[pairs as i64]).unwrap();
+        let tl_arr = MxArray::from_uint32(&tiles64, &[(tiles64.len() / 3) as i64, 3]).unwrap();
+        let slots_2d = MxArray::from_uint32(&sorted_slots, &[pairs as i64, 1]).unwrap();
+
+        let Some(got_gu) = gguf_prefill_indirect_gu(
+            &x_arr, &tr_arr, &tl_arr, &g_buf, 32, &u_buf, 96, n_experts, m, 7.0,
+        )
+        .unwrap() else {
+            assert!(!require_metal(), "Metal/NAX required");
+            return;
+        };
+        let got_dn =
+            gguf_prefill_indirect_down(&got_gu, &tl_arr, &d_buf, down_off, n_experts, h, down_bits)
+                .unwrap()
+                .unwrap();
+
+        let x_sorted = x_arr
+            .take(&tr_arr, 0)
+            .unwrap()
+            .reshape(&[pairs as i64, 1, 1, k as i64])
+            .unwrap();
+        let ref_g = g_kq
+            .gather(&x_sorted, &slots_2d)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .reshape(&[pairs as i64, m as i64])
+            .unwrap();
+        let ref_u = u_kq
+            .gather(&x_sorted, &slots_2d)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .reshape(&[pairs as i64, m as i64])
+            .unwrap();
+        let ref_gu = crate::nn::Activations::swiglu_clamped_compiled(&ref_g, &ref_u, 7.0).unwrap();
+        let ref_dn = d_kq
+            .gather(
+                &ref_gu.reshape(&[pairs as i64, 1, 1, m as i64]).unwrap(),
+                &slots_2d,
+            )
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .reshape(&[pairs as i64, h as i64])
+            .unwrap();
+
+        let (gu_max, gu_rel) = error_stats(&eval_f32(&got_gu), &eval_f32(&ref_gu));
+        let (dn_max, dn_rel) = error_stats(&eval_f32(&got_dn), &eval_f32(&ref_dn));
+        assert!(
+            gu_rel <= 2e-3,
+            "BM=64 GU bits={down_bits}: max_abs={gu_max:e} rel_l2={gu_rel:e}"
+        );
+        assert!(
+            dn_rel <= 2.5e-3,
+            "BM=64 DOWN bits={down_bits}: max_abs={dn_max:e} rel_l2={dn_rel:e}"
+        );
+
+        // Single-pass unchunked M=32, top=16 (n_assign=512) dedup decode parity vs M=1 rows.
+        let (rows, top) = (32usize, 16usize);
+        let mut sids = Vec::with_capacity(rows * top);
+        let mut ws = Vec::with_capacity(rows * top);
+        for r in 0..rows {
+            for t in 0..top {
+                sids.push(((r * 3 + t) % n_experts) as u32);
+                ws.push(rng.next_f32(0.02, 0.12));
+            }
+        }
+        let x32 = x_arr.slice(&[0, 0], &[rows as i64, k as i64]).unwrap();
+        let s32 = MxArray::from_uint32(&sids, &[rows as i64, top as i64]).unwrap();
+        let w32 = MxArray::from_float32(&ws, &[rows as i64, top as i64]).unwrap();
+        let got_dec = gguf_routed_decode(
+            &x32, &s32, &w32, &g_buf, 32, &u_buf, 96, &d_buf, down_off, n_experts, m, h, down_bits,
+            7.0,
+        )
+        .unwrap()
+        .unwrap();
+        let got_dec_v = eval_f32(&got_dec);
+        for r in [0usize, 15, 31] {
+            let xr = x32
+                .slice(&[r as i64, 0], &[(r + 1) as i64, k as i64])
+                .unwrap();
+            let sr = s32
+                .slice(&[r as i64, 0], &[(r + 1) as i64, top as i64])
+                .unwrap();
+            let wr = w32
+                .slice(&[r as i64, 0], &[(r + 1) as i64, top as i64])
+                .unwrap();
+            let one = eval_f32(
+                &gguf_routed_decode(
+                    &xr, &sr, &wr, &g_buf, 32, &u_buf, 96, &d_buf, down_off, n_experts, m, h,
+                    down_bits, 7.0,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            let (mabs, rl2) = error_stats(&got_dec_v[r * h..(r + 1) * h], &one);
+            assert!(
+                mabs <= 1e-4 && rl2 <= 1e-4,
+                "M=32 dedup(512) row={r} bits={down_bits}: max_abs={mabs:e} rel_l2={rl2:e}"
+            );
+        }
     }
 }
 

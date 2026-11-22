@@ -24,10 +24,13 @@ use super::batch::{MIN_Q8_ROWS, Wave};
 use super::cache::{LatentBuf, LayerCache, WindowKeys, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
-use super::moe::{RowKind, prefill_q8_grouped_nax_enabled, qlinear, try_qlinear_sigmoid_mul};
+use super::moe::{
+    RowKind, prefill_q8_grouped_nax_enabled, prefill_q8_nax_enabled, qlinear, qlinear_out,
+    try_qlinear_sigmoid_mul_out,
+};
 use super::ops::{
     fast_rope_with_pos, rms_norm, rope_inv_freqs, rope_positions_f32, try_mla_prep_q_kv,
-    try_q8_grouped_k192_rope,
+    try_partial_rope_tail_out, try_q8_grouped_k192_rope,
 };
 use super::paged::{SlotMap, planes, write_latent, write_latent_split};
 use super::sparse::{
@@ -178,10 +181,25 @@ fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
         .matmul(&wf.transpose(Some(&[0, 2, 1]))?)
 }
 
+pub(crate) fn attn_prefill_f16_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_ATTN_PREFILL_F16").as_deref() != Ok("0"))
+}
+
 /// `x_mgh [m, g, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
 /// -> `[m, g, r]`, using the row-invariant Metal kernel for Q8 decode and the
 /// NAX tensor-op kernel directly on `[m, g, k]` for Q8 prefill.
+#[cfg(test)]
 pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxArray> {
+    grouped_mm_t_mgh_out(w, x_mgh, g, false)
+}
+
+pub(crate) fn grouped_mm_t_mgh_out(
+    w: &Dense,
+    x_mgh: &MxArray,
+    g: i64,
+    out_f16: bool,
+) -> Result<MxArray> {
     let m = x_mgh.shape_at(0)?;
     if let Some((qw, scales, biases)) = w.qmm_parts()
         && x_mgh.ndim()? == 3
@@ -208,10 +226,9 @@ pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxA
                 return MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode");
             }
         } else if m > 16 && prefill_q8_grouped_nax_enabled() {
-            let xf = if x_mgh.dtype()? == DType::Float32 {
-                x_mgh.clone()
-            } else {
-                x_mgh.astype(DType::Float32)?
+            let xf = match x_mgh.dtype()? {
+                DType::Float16 | DType::Float32 => x_mgh.clone(),
+                _ => x_mgh.astype(DType::Float32)?,
             };
             let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
             // SAFETY: all handles are live arrays owned by this call.
@@ -221,6 +238,7 @@ pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxA
                     qw.as_raw_ptr(),
                     scales.as_raw_ptr(),
                     biases_ptr,
+                    out_f16,
                 )
             };
             if !h.is_null() {
@@ -475,7 +493,16 @@ impl Mla {
             (qr, kv, None)
         };
 
-        let q_raw = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
+        let prefill_f16 = split_q
+            && n > 16
+            && kv_lora == 512
+            && rd == 64
+            && attn_prefill_f16_enabled()
+            && prefill_q8_nax_enabled()
+            && prefill_q8_grouped_nax_enabled()
+            && w.q_b.qmm_parts().is_some()
+            && w.k_b.qmm_parts().is_some();
+        let q_raw = qlinear_out(&qr, &w.q_b, prefill_f16)?.reshape(&[n, heads, qk])?;
         let (q, q_pe) = if (1..=16).contains(&n)
             && nope == 192
             && let Some(fused_q) =
@@ -483,13 +510,25 @@ impl Mla {
         {
             (fused_q, None)
         } else {
+            let q_f16 = prefill_f16 && q_raw.dtype()? == DType::Float16;
             let q_nope = q_raw.slice(&[0, 0, 0], &[n, heads, nope])?;
-            let q_pe = fast_rope_with_pos(
-                &q_raw.slice(&[0, 0, nope], &[n, heads, qk])?,
-                &self.inv_freqs,
-                pos_arr,
-            )?;
-            let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
+            let q_abs = grouped_mm_t_mgh_out(&w.k_b, &q_nope, heads, q_f16)?;
+            let pe_f16 = q_f16 && q_abs.dtype()? == DType::Float16;
+            let q_pe_in = q_raw.slice(&[0, 0, nope], &[n, heads, qk])?;
+            let q_pe = match try_partial_rope_tail_out(&q_pe_in, pos_arr, &self.inv_freqs, pe_f16)?
+            {
+                Some(rot) => rot,
+                None => {
+                    let rot = fast_rope_with_pos(&q_pe_in, &self.inv_freqs, pos_arr)?;
+                    if pe_f16 && rot.dtype()? != DType::Float16 {
+                        rot.astype(DType::Float16)?
+                    } else if !pe_f16 && rot.dtype()? != DType::Float32 {
+                        rot.astype(DType::Float32)?
+                    } else {
+                        rot
+                    }
+                }
+            };
             if split_q && n >= 16 && kv_lora == 512 && rd == 64 {
                 (q_abs, Some(q_pe))
             } else {
@@ -563,6 +602,11 @@ impl Mla {
         let n = o_lat.shape_at(0)?;
         let heads = g.n_heads as i64;
         let width = heads * g.head_v as i64;
+        let prefill_f16 = o_lat.dtype()? == DType::Float16
+            && n > 16
+            && attn_prefill_f16_enabled()
+            && prefill_q8_nax_enabled()
+            && prefill_q8_grouped_nax_enabled();
         if let Some(gl) = gate_lin
             && let Some((qw, scales, biases)) = w.v_b.qmm_parts()
             && o_lat.ndim()? == 3
@@ -595,15 +639,13 @@ impl Mla {
                     return qlinear(&gated, &w.output);
                 }
             } else if n > 16 && prefill_q8_grouped_nax_enabled() {
-                let xf = if o_lat.dtype()? == DType::Float32 {
-                    o_lat.clone()
-                } else {
-                    o_lat.astype(DType::Float32)?
+                let xf = match o_lat.dtype()? {
+                    DType::Float16 | DType::Float32 => o_lat.clone(),
+                    _ => o_lat.astype(DType::Float32)?,
                 };
-                let glf = if gl.dtype()? == DType::Float32 {
-                    gl.clone()
-                } else {
-                    gl.astype(DType::Float32)?
+                let glf = match gl.dtype()? {
+                    DType::Float16 | DType::Float32 => gl.clone(),
+                    _ => gl.astype(DType::Float32)?,
                 };
                 let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
                 // SAFETY: all handles are live arrays owned by this call.
@@ -614,6 +656,7 @@ impl Mla {
                         scales.as_raw_ptr(),
                         biases_ptr,
                         glf.as_raw_ptr(),
+                        prefill_f16,
                     )
                 };
                 if !h.is_null() {
@@ -622,9 +665,9 @@ impl Mla {
                 }
             }
         }
-        let o = grouped_mm_t_mgh(&w.v_b, o_lat, heads)?.reshape(&[n, width])?;
+        let o = grouped_mm_t_mgh_out(&w.v_b, o_lat, heads, prefill_f16)?.reshape(&[n, width])?;
         if gate_lin.is_none()
-            && let Some(gated) = try_qlinear_sigmoid_mul(x, &w.gate, &o)?
+            && let Some(gated) = try_qlinear_sigmoid_mul_out(x, &w.gate, &o, prefill_f16)?
         {
             return qlinear(&gated, &w.output);
         }
@@ -632,7 +675,12 @@ impl Mla {
             Some(gl) => gl.clone(),
             None => qlinear(x, &w.gate)?,
         };
-        let gated = Activations::sigmoid_mul_compiled(&gate_lin, &o)?;
+        let o_f32 = if o.dtype()? == DType::Float32 {
+            o
+        } else {
+            o.astype(DType::Float32)?
+        };
+        let gated = Activations::sigmoid_mul_compiled(&gate_lin, &o_f32)?;
         qlinear(&gated, &w.output)
     }
 

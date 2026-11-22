@@ -1808,6 +1808,8 @@ fn lease_end_turn_idle_promotes_partial_to_direct_when_others_drop() {
     let ws = 96 * G;
     let promo = DirectPromotion {
         mode: DirectMode::Auto,
+        mmap: MmapMode::Off,
+        metal_available: true,
         reserve_override: None,
         n_experts: m.n_experts,
     };
@@ -1959,6 +1961,8 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
             .with_direct_promotion(
                 DirectPromotion {
                     mode: DirectMode::Off,
+                    mmap: MmapMode::Off,
+                    metal_available: true,
                     reserve_override: None,
                     n_experts: m.n_experts,
                 },
@@ -1975,6 +1979,8 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
         let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
         let promo = DirectPromotion {
             mode: DirectMode::Auto,
+            mmap: MmapMode::Off,
+            metal_available: true,
             reserve_override: None,
             n_experts: m.n_experts,
         };
@@ -2002,6 +2008,8 @@ fn lease_end_turn_idle_does_not_promote_when_disabled_capped_or_headroom_tight()
         let old_nbytes = bank.nbytes();
         let promo = DirectPromotion {
             mode: DirectMode::Auto,
+            mmap: MmapMode::Off,
+            metal_available: true,
             reserve_override: None,
             n_experts: m.n_experts,
         };
@@ -2816,4 +2824,249 @@ fn mmap_chunk_max_override_fallback_and_dense_savings_accounting() {
     };
     assert_eq!(d_gate.dense_bytes, dense_full);
     assert!(wired_default < 15 * G);
+}
+
+#[test]
+fn auto_mmap_on_metal_never_promotes_streamed_to_direct() {
+    assert!(!should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        false
+    ));
+    assert!(!should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        true
+    ));
+    assert!(!should_enable_direct_promotion(
+        MmapMode::Off,
+        DirectMode::Off,
+        true,
+        false
+    ));
+    assert!(should_enable_direct_promotion(
+        MmapMode::Off,
+        DirectMode::Auto,
+        true,
+        false
+    ));
+    assert!(should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::On,
+        true,
+        false
+    ));
+    assert!(should_enable_direct_promotion(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        false,
+        false
+    ));
+
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let dense = 10 * G;
+    let physical = 128 * G;
+    let ws = 96 * G;
+    let quiet = (
+        HostMemory {
+            physical,
+            wired: 12 * G,
+            ..Default::default()
+        },
+        ws,
+    );
+
+    // Even if a Lease is constructed with DirectPromotion, Auto mmap + Auto direct on Metal
+    // must NEVER silently promote a Streamed bank into anonymous Direct RAM.
+    {
+        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+        let size = ModelSize {
+            dense,
+            slot: classes.slot[0].max(classes.slot[1]),
+            n_experts: m.n_experts as u64,
+            ctx: ctx as u64,
+        };
+        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
+            .with_direct_promotion(
+                DirectPromotion {
+                    mode: DirectMode::Auto,
+                    mmap: MmapMode::Auto,
+                    metal_available: true,
+                    reserve_override: None,
+                    n_experts: m.n_experts,
+                },
+                None,
+            );
+        TEST_HOST.with(|c| c.set(Some(quiet)));
+        assert_eq!(lease.end_turn_idle(&bank, dense, 0).unwrap(), None);
+        assert!(!bank.is_direct());
+        assert!(lease.switches().is_empty());
+    }
+
+    // Explicit DirectMode::On (MLX_HY4_DIRECT=1) still promotes when headroom opens up.
+    {
+        let (bank, _r, classes, m, _tmp) = filled_fixture_bank([2, 2], 1);
+        let size = ModelSize {
+            dense,
+            slot: classes.slot[0].max(classes.slot[1]),
+            n_experts: m.n_experts as u64,
+            ctx: ctx as u64,
+        };
+        let lease = Lease::new(p, size, 2048, classes, Some(Limits::default()), None, &bank)
+            .with_direct_promotion(
+                DirectPromotion {
+                    mode: DirectMode::On,
+                    mmap: MmapMode::Auto,
+                    metal_available: true,
+                    reserve_override: None,
+                    n_experts: m.n_experts,
+                },
+                None,
+            );
+        TEST_HOST.with(|c| c.set(Some(quiet)));
+        assert!(lease.end_turn_idle(&bank, dense, 0).unwrap().is_some());
+        assert!(bank.is_direct());
+        bank.wait_direct_fill().unwrap();
+    }
+
+    TEST_HOST.with(|c| c.set(None));
+}
+
+#[test]
+fn select_expert_mode_with_retry_recovers_mmap_after_clear_cache() {
+    let sizes = Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    };
+    let dense_full = sizes.dense_trunk + sizes.dense_mtp;
+    let saved = 1_194_590_208u64;
+    let dense_mmap = dense_full - saved;
+    let direct_bytes = sizes.direct_expert_bytes();
+    let mapped_bytes = 89_500_000_000u64 + saved;
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let ws = 96 * G;
+
+    // Transient 12 GiB MLX pool pushes initial reading over the 128 GiB Mmap Auto edge;
+    // clearing cache drops wired by 12 GiB and admits Mmap cleanly.
+    let cleared = std::cell::Cell::new(0usize);
+    let reads = std::cell::Cell::new(0usize);
+    let (_, _, res) = select_expert_mode_with_retry(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        None,
+        None,
+        None,
+        || {
+            reads.set(reads.get() + 1);
+            let wired = if cleared.get() == 0 { 32 * G } else { 20 * G };
+            Ok((
+                HostMemory {
+                    physical: 128 * G,
+                    wired,
+                    ..Default::default()
+                },
+                ws,
+            ))
+        },
+        || if cleared.get() == 0 { 12 * G } else { 0 },
+        || cleared.set(cleared.get() + 1),
+    )
+    .unwrap();
+    assert_eq!(cleared.get(), 1);
+    assert_eq!(reads.get(), 2);
+    assert!(matches!(res, ExpertResidency::Mmap { chunk: 4096, .. }));
+
+    // When pool is empty (0 B), no redundant clear_cache() or re-read happens.
+    let cleared_empty = std::cell::Cell::new(0usize);
+    let reads_empty = std::cell::Cell::new(0usize);
+    let (_, _, res_streamed) = select_expert_mode_with_retry(
+        MmapMode::Auto,
+        DirectMode::Auto,
+        true,
+        &p,
+        ctx,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        None,
+        None,
+        None,
+        || {
+            reads_empty.set(reads_empty.get() + 1);
+            Ok((
+                HostMemory {
+                    physical: 128 * G,
+                    wired: 50 * G,
+                    ..Default::default()
+                },
+                ws,
+            ))
+        },
+        || 0,
+        || cleared_empty.set(cleared_empty.get() + 1),
+    )
+    .unwrap();
+    assert_eq!(cleared_empty.get(), 0);
+    assert_eq!(reads_empty.get(), 1);
+    assert!(matches!(res_streamed, ExpertResidency::Streamed { .. }));
+
+    // Forced MmapMode::On also retries once after clear_cache() when pool is non-empty.
+    let cleared_on = std::cell::Cell::new(0usize);
+    let (_, _, res_on) = select_expert_mode_with_retry(
+        MmapMode::On,
+        DirectMode::Off,
+        true,
+        &p,
+        ctx,
+        &Own::default(),
+        dense_full,
+        dense_mmap,
+        direct_bytes,
+        mapped_bytes,
+        MMAP_PREFILL_CHUNK_MAX,
+        None,
+        None,
+        None,
+        || {
+            let wired = if cleared_on.get() == 0 {
+                118 * G
+            } else {
+                50 * G
+            };
+            Ok((
+                HostMemory {
+                    physical: 128 * G,
+                    wired,
+                    ..Default::default()
+                },
+                ws,
+            ))
+        },
+        || 8 * G,
+        || cleared_on.set(cleared_on.get() + 1),
+    )
+    .unwrap();
+    assert_eq!(cleared_on.get(), 1);
+    assert!(matches!(res_on, ExpertResidency::Mmap { .. }));
 }

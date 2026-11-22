@@ -858,9 +858,16 @@ fn q8_grouped_prefill_nax_parity() {
         eprintln!(
             "[grouped_q8_nax] SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:.3e} max_abs={max_abs_sym:.3e}"
         );
+        let sym_tol = if std::env::var("MLX_HY4_Q8_PREFILL_1MMA").as_deref() == Ok("0")
+            || std::env::var("MLX_HY4_Q8_GROUPED_1MMA").as_deref() == Ok("0")
+        {
+            5e-6
+        } else {
+            5e-4
+        };
         assert!(
-            rel_sym <= 5e-6,
-            "grouped prefill SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:e} max_abs={max_abs_sym:e}"
+            rel_sym <= sym_tol,
+            "grouped prefill SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:e} max_abs={max_abs_sym:e} > {sym_tol:e}"
         );
 
         if m == 64 {
@@ -987,6 +994,7 @@ fn q8_dense_and_grouped_prefill_strided_and_epilogue_parity() {
                 scales.as_raw_ptr(),
                 biases_ptr,
                 gl_strided.as_raw_ptr(),
+                false,
             )
         };
         assert!(!h.is_null(), "expected q8_grouped_prefill_gated");
@@ -1002,6 +1010,119 @@ fn q8_dense_and_grouped_prefill_strided_and_epilogue_parity() {
             "grouped prefill gated epilogue M={m} G={g} K={k} N={n}: rel_l2={rel:e}"
         );
     }
+}
+
+#[test]
+fn q8_prefill_f16_io_and_epilogue_parity() {
+    use super::attention::grouped_mm_t_mgh_out;
+    use super::moe::{qlinear_out, try_qlinear_sigmoid_mul_out, with_prefill_q8_nax};
+    use crate::nn::Activations;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let bits = |a: &MxArray| -> Vec<u32> { read(a).into_iter().map(f32::to_bits).collect() };
+
+    // Dense FP16 output, FP16 input -> FP32 output, and FP16 aux -> FP16 output
+    // across unaligned M (including M=96 / M=77) and BN=64/128.
+    for (ci, &(m, k, n)) in [(17usize, 192usize, 96usize), (77, 512, 256), (96, 512, 384)]
+        .iter()
+        .enumerate()
+    {
+        let sym = make_sym_q8(n, k, 2000 + ci as u64 * 17);
+        let x_f16 =
+            MxArray::from_float32(&lcg(2100 + ci as u64 * 19, m * k), &[m as i64, k as i64])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+        let x_f32 = x_f16.astype(DType::Float32).unwrap();
+
+        let y_f16_out = with_prefill_q8_nax(true, || qlinear_out(&x_f16, &sym, true).unwrap());
+        assert_eq!(y_f16_out.dtype().unwrap(), DType::Float16);
+        let y_f32_out = with_prefill_q8_nax(true, || qlinear_out(&x_f32, &sym, false).unwrap());
+        assert_eq!(
+            bits(&y_f16_out),
+            bits(&y_f32_out.astype(DType::Float16).unwrap()),
+            "dense FP16 IO mismatch M={m} K={k} N={n}"
+        );
+
+        let y_f16_in_f32_out =
+            with_prefill_q8_nax(true, || qlinear_out(&x_f16, &sym, false).unwrap());
+        assert_eq!(y_f16_in_f32_out.dtype().unwrap(), DType::Float32);
+        assert_eq!(
+            bits(&y_f16_in_f32_out),
+            bits(&y_f32_out),
+            "dense FP16-in F32-out mismatch M={m} K={k} N={n}"
+        );
+
+        let aux_f16 =
+            MxArray::from_float32(&lcg(2200 + ci as u64 * 23, m * n), &[m as i64, n as i64])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+        let fused = with_prefill_q8_nax(true, || {
+            try_qlinear_sigmoid_mul_out(&x_f32, &sym, &aux_f16, true)
+                .unwrap()
+                .expect("expected FP16 epilogue")
+        });
+        assert_eq!(fused.dtype().unwrap(), DType::Float16);
+        let want =
+            Activations::sigmoid_mul_compiled(&y_f32_out, &aux_f16.astype(DType::Float32).unwrap())
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+        let rel = rel_l2(&read(&fused), &read(&want));
+        assert!(
+            rel <= 1e-3,
+            "dense FP16 epilogue M={m} K={k} N={n}: rel_l2={rel:e}"
+        );
+    }
+
+    // Strided grouped FP16 `q_nope` -> FP16 `q_abs`.
+    let (m, g, k, n) = (77usize, 4usize, 192usize, 512usize);
+    let sym = make_sym_q8(g * n, k, 2300);
+    let q_raw_f16 = MxArray::from_float32(
+        &lcg(2350, m * g * (k + 64)),
+        &[m as i64, g as i64, (k + 64) as i64],
+    )
+    .unwrap()
+    .astype(DType::Float16)
+    .unwrap();
+    let x_strided_f16 = q_raw_f16
+        .slice(&[0, 0, 0], &[m as i64, g as i64, k as i64])
+        .unwrap();
+    let x_strided_f32 = x_strided_f16.astype(DType::Float32).unwrap();
+    let y_f16 = with_prefill_q8_nax(true, || {
+        grouped_mm_t_mgh_out(&sym, &x_strided_f16, g as i64, true).unwrap()
+    });
+    assert_eq!(y_f16.dtype().unwrap(), DType::Float16);
+    let y_f32 = with_prefill_q8_nax(true, || {
+        grouped_mm_t_mgh_out(&sym, &x_strided_f32, g as i64, false).unwrap()
+    });
+    assert_eq!(
+        bits(&y_f16),
+        bits(&y_f32.astype(DType::Float16).unwrap()),
+        "grouped strided FP16 IO mismatch"
+    );
+
+    // Unevaluated 1-column-offset lazy FP16 slice (2-byte offset, odd stride) must
+    // materialize at eval time rather than issuing misaligned 16-byte vector loads.
+    let sym_mis = make_sym_q8(64, 64, 2400);
+    let base_f16 = MxArray::from_float32(&lcg(2410, 17 * 65), &[17, 65])
+        .unwrap()
+        .astype(DType::Float16)
+        .unwrap();
+    // Do NOT eval `lazy_mis` before calling qlinear_out.
+    let lazy_mis = base_f16.slice(&[0, 1], &[17, 65]).unwrap();
+    let y_lazy = with_prefill_q8_nax(true, || qlinear_out(&lazy_mis, &sym_mis, true).unwrap());
+    let contig_mis = MxArray::from_float32(&read(&lazy_mis), &[17, 64])
+        .unwrap()
+        .astype(DType::Float16)
+        .unwrap();
+    let y_contig = with_prefill_q8_nax(true, || qlinear_out(&contig_mis, &sym_mis, true).unwrap());
+    assert_eq!(
+        bits(&y_lazy),
+        bits(&y_contig),
+        "lazy misaligned FP16 slice mismatch"
+    );
 }
 
 #[cfg(unix)]

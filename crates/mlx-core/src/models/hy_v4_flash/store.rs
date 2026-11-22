@@ -1115,6 +1115,86 @@ pub fn select_expert_mode_for(
     }
 }
 
+/// Whether idle-gap promotion from `Streamed` to anonymous `Direct` is enabled.
+/// Suppressed when `MmapMode::Auto` is active on Metal with `DirectMode::Auto`
+/// so a transient load-time fallback never silently copies full experts into
+/// anonymous RAM.
+pub fn should_enable_direct_promotion(
+    mmap: MmapMode,
+    direct: DirectMode,
+    metal_available: bool,
+    is_mmap: bool,
+) -> bool {
+    if is_mmap || direct == DirectMode::Off {
+        return false;
+    }
+    !(mmap == MmapMode::Auto && direct == DirectMode::Auto && metal_available)
+}
+
+/// Evaluates [`select_expert_mode_for`] at load, retrying once after
+/// `clear_cache()` when transient MLX free-pool memory prevented `Mmap`
+/// admission on Metal.
+#[allow(clippy::too_many_arguments)]
+pub fn select_expert_mode_with_retry<ReadHost, PoolBytes, ClearCache>(
+    mmap: MmapMode,
+    direct: DirectMode,
+    metal_available: bool,
+    p: &Profile,
+    ctx: usize,
+    own: &Own,
+    dense_bytes: u64,
+    mmap_dense_bytes: u64,
+    direct_expert_bytes: u64,
+    mapped_bytes: u64,
+    mmap_chunk_max: usize,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+    cache_cap: Option<u64>,
+    mut read_host: ReadHost,
+    mut pool_bytes: PoolBytes,
+    mut clear_cache: ClearCache,
+) -> Result<(HostMemory, u64, ExpertResidency)>
+where
+    ReadHost: FnMut() -> Result<(HostMemory, u64)>,
+    PoolBytes: FnMut() -> u64,
+    ClearCache: FnMut(),
+{
+    let (h, ws) = read_host()?;
+    let run = |host: &HostMemory| {
+        select_expert_mode_for(
+            mmap,
+            direct,
+            metal_available,
+            p,
+            ctx,
+            host,
+            own,
+            dense_bytes,
+            mmap_dense_bytes,
+            direct_expert_bytes,
+            mapped_bytes,
+            mmap_chunk_max,
+            reserve_override,
+            max_memory,
+            cache_cap,
+        )
+    };
+    let first = run(&h);
+    let wants_mmap_retry = mmap != MmapMode::Off
+        && metal_available
+        && !matches!(first, Ok(ExpertResidency::Mmap { .. }))
+        && !(mmap == MmapMode::Auto
+            && direct == DirectMode::On
+            && matches!(first, Ok(ExpertResidency::Direct { .. })));
+    if wants_mmap_retry && pool_bytes() > 0 {
+        clear_cache();
+        let (h2, ws2) = read_host()?;
+        let second = run(&h2)?;
+        return Ok((h2, ws2, second));
+    }
+    Ok((h, ws, first?))
+}
+
 /// Computes the clean page-cache pre-warm budget for mmap experts; returns 0
 /// when disabled or when headroom is below [`MMAP_PREWARM_MIN_BUDGET`].
 pub fn mmap_warm_budget(
@@ -1457,6 +1537,8 @@ pub fn own_of(dense: u64, kv: u64, resident: u64, in_turn: bool, free_pool: u64,
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectPromotion {
     pub mode: DirectMode,
+    pub mmap: MmapMode,
+    pub metal_available: bool,
     pub reserve_override: Option<u64>,
     pub n_experts: usize,
 }
@@ -1764,7 +1846,10 @@ impl Lease {
             bank.end_turn()?;
             return Ok(None);
         }
-        let Some(promo) = self.direct_promotion.filter(|p| p.mode != DirectMode::Off) else {
+        let Some(promo) = self
+            .direct_promotion
+            .filter(|p| should_enable_direct_promotion(p.mmap, p.mode, p.metal_available, false))
+        else {
             bank.end_turn()?;
             return Ok(None);
         };
@@ -2038,25 +2123,23 @@ impl Store {
         }
         let (mmap_dense_saved, mmap_dense_file) = mmap_dense_saved_bytes(&scan)?;
         let mmap_dense_bytes = base.dense.saturating_sub(mmap_dense_saved);
+        // SAFETY: pure process-wide Metal availability probe.
+        let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
         let (lanes, ctx, admitted, admission, direct_budget, bank_init) = match (
             &limits, &opts.plan,
         ) {
             (Some(l), _) => {
-                let (h, ws) = host_reading(opts.max_memory)?;
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
                 let direct_expert_bytes = sizes.direct_expert_bytes();
                 let mapped_bytes = mmap_expert_bytes(&scan)?.saturating_add(mmap_dense_file);
                 let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
-                // SAFETY: pure process-wide Metal availability probe.
-                let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
-                let selected = select_expert_mode_for(
+                let (h, ws, selected) = select_expert_mode_with_retry(
                     opts.mmap,
                     opts.direct,
                     metal_available,
                     &one_lane,
                     max_ctx,
-                    &h,
                     &own,
                     base.dense,
                     mmap_dense_bytes,
@@ -2066,6 +2149,9 @@ impl Store {
                     reserve_override,
                     opts.max_memory,
                     l.cache_cap,
+                    || host_reading(opts.max_memory),
+                    free_pool,
+                    crate::array::clear_cache,
                 )?;
                 match selected {
                     ExpertResidency::Mmap { chunk, gate } => {
@@ -2372,18 +2458,21 @@ impl Store {
         };
         let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank)
             .with_max_memory(opts.max_memory);
-        let lease = if is_mmap {
-            lease.with_direct_budget(direct_budget)
-        } else {
-            lease.with_direct_promotion(
-                DirectPromotion {
-                    mode: opts.direct,
-                    reserve_override,
-                    n_experts: sizes.n_experts,
-                },
-                direct_budget,
-            )
-        };
+        let lease =
+            if should_enable_direct_promotion(opts.mmap, opts.direct, metal_available, is_mmap) {
+                lease.with_direct_promotion(
+                    DirectPromotion {
+                        mode: opts.direct,
+                        mmap: opts.mmap,
+                        metal_available,
+                        reserve_override,
+                        n_experts: sizes.n_experts,
+                    },
+                    direct_budget,
+                )
+            } else {
+                lease.with_direct_budget(direct_budget)
+            };
         Ok(Self {
             model,
             bank,

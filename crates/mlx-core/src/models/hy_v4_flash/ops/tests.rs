@@ -2094,6 +2094,48 @@ fn kpool_compress_and_partial_rope_tail_match_unfused() {
             );
         }
     }
+
+    // Strided q_pe slice (head_w=0, rope_dim=64) in both FP32 and FP16 IO.
+    for &(m, h) in &[(17usize, 32usize), (32, 64)] {
+        let pos_v: Vec<u64> = (0..m).map(|i| 100 + i as u64).collect();
+        let pos_m = rope_positions_f32(&pos_v).unwrap();
+        let q_raw = MxArray::from_float32(
+            &det_f32(3690 + h as u64, m * h * 256, 1.5),
+            &[m as i64, h as i64, 256],
+        )
+        .unwrap();
+        let q_pe_f32 = q_raw
+            .slice(&[0, 0, 192], &[m as i64, h as i64, 256])
+            .unwrap();
+        let got_f32 = try_partial_rope_tail_out(&q_pe_f32, &pos_m, &inv_arr, false)
+            .unwrap()
+            .unwrap();
+        let want_f32 = fast_rope_with_pos(&q_pe_f32, &inv_arr, &pos_m).unwrap();
+        let err_f32 = max_err(&read(&got_f32), &read(&want_f32));
+        assert!(
+            err_f32 <= 1e-5,
+            "strided q_pe partial_rope_tail F32 M={m} H={h}: err={err_f32:e}"
+        );
+
+        let q_raw_f16 = q_raw.astype(DType::Float16).unwrap();
+        let q_pe_f16 = q_raw_f16
+            .slice(&[0, 0, 192], &[m as i64, h as i64, 256])
+            .unwrap();
+        let got_f16 = try_partial_rope_tail_out(&q_pe_f16, &pos_m, &inv_arr, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_f16.dtype().unwrap(), DType::Float16);
+        let want_f16 =
+            fast_rope_with_pos(&q_pe_f16.astype(DType::Float32).unwrap(), &inv_arr, &pos_m)
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+        let err_f16 = max_err(&read(&got_f16), &read(&want_f16));
+        assert!(
+            err_f16 <= 2e-3,
+            "strided q_pe partial_rope_tail F16 M={m} H={h}: err={err_f16:e}"
+        );
+    }
 }
 
 #[test]

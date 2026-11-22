@@ -3892,6 +3892,7 @@ unsafe extern "C" {
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_dense_prefill_epilogue(
@@ -3901,6 +3902,7 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         aux: *mut mlx_array,
         epilogue: i32,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_grouped_prefill(
@@ -3908,6 +3910,7 @@ unsafe extern "C" {
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_grouped_prefill_gated(
@@ -3916,6 +3919,7 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
         gate: *mut mlx_array,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_kq_routed_decode(
@@ -3972,6 +3976,7 @@ unsafe extern "C" {
         sinks: *mut mlx_array,
         v_width: i32,
         scale: f32,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_mla_prefill_sliding_nax(
@@ -3986,6 +3991,7 @@ unsafe extern "C" {
         ring_cap: i32,
         window_size: i32,
         first_key: i32,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_kq_prefill_indirect_gu(
@@ -4098,6 +4104,7 @@ unsafe extern "C" {
         w: *mut mlx_array,
         k_pool: *mut mlx_array,
         page_ids: *mut mlx_array,
+        visible_groups: *mut mlx_array,
         n_groups: i32,
         start_g: i32,
     ) -> *mut mlx_array;
@@ -4117,6 +4124,7 @@ unsafe extern "C" {
     pub fn mlx_hy4_moe_prefill_sort_tiles(
         ids: *mut mlx_array,
         n_experts: i32,
+        tile_m: i32,
         out_token_rows: *mut *mut mlx_array,
         out_tiles: *mut *mut mlx_array,
         out_inverse: *mut *mut mlx_array,
@@ -4170,6 +4178,7 @@ unsafe extern "C" {
         x: *mut mlx_array,
         pos: *mut mlx_array,
         inv_freq: *mut mlx_array,
+        out_f16: bool,
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_engram_norm_rows(

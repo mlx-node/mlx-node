@@ -1571,14 +1571,16 @@ pub fn gguf_prefill_indirect_down(
     )?))
 }
 
-/// GPU histogram, prefix sum, BM=32 tile emission, and scatter for MoE prefill
-/// routing (`ids [rows, k]` u32 -> `(token_rows [R], tiles [max_tiles, 3],
-/// inverse [rows, k], sorted_slots [R])` u32) with zero host synchronization.
+/// GPU histogram, prefix sum, `tile_m` (32 or 64) tile emission, and scatter
+/// for MoE prefill routing (`ids [rows, k]` u32 -> `(token_rows [R],
+/// tiles [max_tiles, 3], inverse [rows, k], sorted_slots [R])` u32) with zero
+/// host synchronization.
 pub fn moe_prefill_sort_tiles(
     ids: &MxArray,
     n_experts: usize,
+    tile_m: usize,
 ) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
-    let Ok(ne_i32) = i32::try_from(n_experts) else {
+    let (Ok(ne_i32), Ok(tm_i32)) = (i32::try_from(n_experts), i32::try_from(tile_m)) else {
         return Ok(None);
     };
     let mut out_tr = std::ptr::null_mut();
@@ -1590,6 +1592,7 @@ pub fn moe_prefill_sort_tiles(
         mlx_sys::mlx_hy4_moe_prefill_sort_tiles(
             ids.as_raw_ptr(),
             ne_i32,
+            tm_i32,
             &mut out_tr,
             &mut out_tl,
             &mut out_inv,
@@ -1632,11 +1635,28 @@ pub fn ring_write(buf: &MxArray, src: &MxArray, start_slot: usize, cap: usize) -
 /// Fused indexer group scoring directly from a flat `[cap_g, 128]` f16 or
 /// paged `[n_blocks, index_rows, 128]` f16 pool. Returns `[S, n_groups]` f32,
 /// or `Ok(None)` when Metal or shape is unsupported.
+#[cfg(test)]
 pub(crate) fn try_indexer_score(
     q: &MxArray,
     w: &MxArray,
     k_pool: &MxArray,
     page_ids: Option<&MxArray>,
+    n_groups: usize,
+    start_g: usize,
+) -> Result<Option<MxArray>> {
+    try_indexer_score_causal(q, w, k_pool, page_ids, None, n_groups, start_g)
+}
+
+/// Like [`try_indexer_score`], skipping prefill `g` tiles strictly past the
+/// tile's max `visible_groups` entry when `visible_groups` (`[S]` i32) is set.
+/// Columns `g >= visible_groups[r]` may be left uncomputed; callers must mask
+/// them (as `try_indexer_topk_cells` and `pick_groups` do).
+pub(crate) fn try_indexer_score_causal(
+    q: &MxArray,
+    w: &MxArray,
+    k_pool: &MxArray,
+    page_ids: Option<&MxArray>,
+    visible_groups: Option<&MxArray>,
     n_groups: usize,
     start_g: usize,
 ) -> Result<Option<MxArray>> {
@@ -1649,6 +1669,7 @@ pub(crate) fn try_indexer_score(
     let qf = as_f32(q)?;
     let wf = as_f32(w)?;
     let pages_ptr = page_ids.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    let vis_ptr = visible_groups.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
     // SAFETY: all handles are live for the call; returns a new array or null.
     let handle = unsafe {
         mlx_sys::mlx_hy4_indexer_score(
@@ -1656,6 +1677,7 @@ pub(crate) fn try_indexer_score(
             wf.as_raw_ptr(),
             k_pool.as_raw_ptr(),
             pages_ptr,
+            vis_ptr,
             ng_i32,
             sg_i32,
         )
@@ -1914,11 +1936,25 @@ pub(crate) fn try_partial_rope_tail(
     pos: &MxArray,
     inv_freq: &MxArray,
 ) -> Result<Option<MxArray>> {
+    try_partial_rope_tail_out(x, pos, inv_freq, false)
+}
+
+/// `try_partial_rope_tail` accepting `Float16` or `Float32` `x` without casting
+/// `Float16` inputs and writing `Float16` when `out_f16` is set.
+pub(crate) fn try_partial_rope_tail_out(
+    x: &MxArray,
+    pos: &MxArray,
+    inv_freq: &MxArray,
+    out_f16: bool,
+) -> Result<Option<MxArray>> {
     let nd = x.ndim()?;
     if nd != 2 && nd != 3 {
         return Ok(None);
     }
-    let xf = as_f32(x)?;
+    let xf = match x.dtype()? {
+        DType::Float16 | DType::Float32 => x.clone(),
+        _ => x.astype(DType::Float32)?,
+    };
     let invf = as_f32(inv_freq)?;
     let pos_arr = if matches!(pos.dtype()?, DType::Float32 | DType::Int32) {
         pos.clone()
@@ -1927,7 +1963,12 @@ pub(crate) fn try_partial_rope_tail(
     };
     // SAFETY: all handles are live for the call; returns a new array or null.
     let h = unsafe {
-        mlx_sys::mlx_hy4_partial_rope_tail(xf.as_raw_ptr(), pos_arr.as_raw_ptr(), invf.as_raw_ptr())
+        mlx_sys::mlx_hy4_partial_rope_tail(
+            xf.as_raw_ptr(),
+            pos_arr.as_raw_ptr(),
+            invf.as_raw_ptr(),
+            out_f16,
+        )
     };
     if h.is_null() {
         return Ok(None);
