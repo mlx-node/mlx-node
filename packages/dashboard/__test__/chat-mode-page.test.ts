@@ -236,6 +236,15 @@ function chip(place: 'composer' | 'header' = 'composer'): HTMLButtonElement {
   return found;
 }
 
+/** The page bar: the header that holds the page's h1. */
+function bar(): HTMLElement {
+  const found = [...page!.container.querySelectorAll<HTMLElement>('header')].find(
+    (h) => h.querySelector('h1') !== null,
+  );
+  if (found === undefined) throw new Error('no bar');
+  return found;
+}
+
 function menu(): HTMLElement | null {
   return document.querySelector<HTMLElement>(`[role="dialog"][aria-label="${P.name}"]`);
 }
@@ -1870,19 +1879,30 @@ describe('the New Work screen: a mode picked before the first message', () => {
     ];
     await openNew({ rows, conversations: { 'pm-new-a': sync('pm-new-a') } });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => page!.container.querySelector(label) !== null);
+    await waitFor(() => bar().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'auto') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
-    click(page!.container.querySelector<HTMLElement>(label)!);
+    click(bar().querySelector<HTMLElement>(label)!);
     const options = (): HTMLElement[] => [
       ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
     ];
     await waitFor(() => options().length === 2);
+    const popover = document.querySelector(`[role="dialog"][aria-label="${CHAT.folderRecent}"]`)!;
+    expect([popover.getAttribute('data-side'), popover.getAttribute('data-align')]).toEqual(['bottom', 'end']);
+    expect(options().map((o) => o.textContent ?? '')).toEqual([
+      expect.stringContaining('proj'),
+      expect.stringContaining('other'),
+    ]);
     click(options().find((o) => (o.textContent ?? '').includes('other'))!);
     await waitFor(() => posts().length === 1);
     expect(posts()).toEqual([`${draftPath(first)} ${JSON.stringify({ mode: 'ask', up: false })}`]);
     expect(chip().getAttribute('data-permission-mode')).toBe('ask');
+    expect(page!.container.querySelector('textarea')!.placeholder).toBe(
+      fill(CHAT.placeholderWork, { folder: 'other' }),
+    );
+    expect(bar().querySelector(`[aria-label="${fill(CHAT.folderLabel, { folder: OTHER })}"]`)).not.toBeNull();
+    await waitFor(() => document.activeElement === page!.container.querySelector('textarea'));
 
     const second = made.at(-1)!;
     expect(second).not.toBe(first);
@@ -1951,7 +1971,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       conversations: { 'pm-new-a': sync('pm-new-a'), 'pm-made': sync('pm-made') },
     });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => page!.container.querySelector(label) !== null);
+    await waitFor(() => bar().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'bypass') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
@@ -1959,7 +1979,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     sendNow();
     await waitFor(() => creates().length === 1);
     act(() => api!.emitChatHost({ type: 'state', state: READY_CHAT_HOST }));
-    click(page!.container.querySelector<HTMLElement>(label)!);
+    click(bar().querySelector<HTMLElement>(label)!);
     const options = (): HTMLElement[] => [
       ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
     ];
@@ -2061,7 +2081,6 @@ describe('the New Work screen: a mode picked before the first message', () => {
   });
 
   it('the tools row: the folder and web chips carry their tier, the mode chip none, the picker wrapper 3', async () => {
-    chooseFolder('/tmp/work/a-twenty-char-folder');
     await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
       host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
     });
@@ -2069,5 +2088,15 @@ describe('the New Work screen: a mode picked before the first message', () => {
     const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
     expect(tiers).toEqual(['3', '1', '2', null]);
     expect(chip().getAttribute('data-give')).toBeNull();
+  });
+
+  it('the tools row once a folder is chosen: the picker, the web chip, the mode chip', async () => {
+    chooseFolder('/tmp/work/a-twenty-char-folder');
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
+    });
+    const start = chip().parentElement!;
+    const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
+    expect(tiers).toEqual(['3', '2', null]);
   });
 });

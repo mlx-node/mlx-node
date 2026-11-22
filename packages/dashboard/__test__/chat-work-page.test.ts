@@ -18,6 +18,7 @@ import type {
   PlanInteraction,
 } from '../ui/src/lib/chat-types.js';
 import { flagLines, folderName } from '../ui/src/lib/permission-text.js';
+import { FOLDER_PICKED_MESSAGE, PICK_FOLDER_MESSAGE } from '../ui/src/lib/pick-folder.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
 import { toast } from '../ui/src/lib/toast.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
@@ -193,6 +194,29 @@ function button(label: string, scope: ParentNode = document.body): HTMLButtonEle
 
 function click(element: HTMLElement): void {
   act(() => element.click());
+}
+
+/** The page bar: the header that holds the page's h1. */
+function bar(): HTMLElement {
+  const found = [...page!.container.querySelectorAll<HTMLElement>('header')].find(
+    (h) => h.querySelector('h1') !== null,
+  );
+  if (found === undefined) throw new Error('no bar');
+  return found;
+}
+
+function composerForm(): HTMLFormElement {
+  const found = page!.container.querySelector<HTMLFormElement>(`form[aria-label="${CHAT.composerLabel}"]`);
+  if (found === null) throw new Error('no composer form');
+  return found;
+}
+
+/** The folder chips in a scope: any button named "Choose folder…" or "Folder: …". */
+function folderChips(scope: ParentNode): string[] {
+  const prefix = fill(CHAT.folderLabel, { folder: '' });
+  return reachable(scope)
+    .map((b) => accessibleName(b))
+    .filter((name) => name === CHAT.folderChoose || name.startsWith(prefix));
 }
 
 /** A click once the card has been on screen long enough for its allow buttons to count. */
@@ -787,8 +811,7 @@ describe('Work folder', () => {
 
   it('with no folder the chip asks for one and nothing can be sent', async () => {
     await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
-    const chip = reachable().filter((b) => accessibleName(b) === CHAT.folderChoose);
-    expect(chip.length).toBeGreaterThan(0);
+    expect(folderChips(composerForm())).toEqual([CHAT.folderChoose]);
     for (const text of CHAT.startersWork) expect(button(text).disabled).toBe(true);
     type('Run the tests');
     expect(sendFace().disabled).toBe(true);
@@ -799,7 +822,7 @@ describe('Work folder', () => {
       rows: [row('p-old', { updatedAt: NOW - 120_000 })],
       routes: { 'POST /chat/conversations': { conversation: info('p-made'), turnId: 't1' } },
     });
-    await waitFor(() => reachable().some((b) => accessibleName(b) === fill(CHAT.folderLabel, { folder: FOLDER })));
+    await waitFor(() => folderChips(bar()).includes(fill(CHAT.folderLabel, { folder: FOLDER })));
     expect(composer().placeholder).toBe(fill(CHAT.placeholderWork, { folder: folderName(FOLDER) }));
     for (const text of CHAT.startersWork) expect(button(text).disabled).toBe(false);
     type('Run the tests');
@@ -818,7 +841,7 @@ describe('Work folder', () => {
       rows: [row('p-old', { updatedAt: NOW - 120_000 })],
       routes: { 'POST /chat/conversations': create.body },
     });
-    await waitFor(() => reachable().some((b) => accessibleName(b) === fill(CHAT.folderLabel, { folder: FOLDER })));
+    await waitFor(() => folderChips(bar()).includes(fill(CHAT.folderLabel, { folder: FOLDER })));
     type('Run the tests');
     act(() => sendFace().click());
     await waitFor(() => writes().length === 1);
@@ -856,6 +879,117 @@ describe('Work folder', () => {
       true,
     );
     expect(where.search).toBe('?mode=work');
+  });
+});
+
+describe('Work folder chip: composer or bar', () => {
+  const label = fill(CHAT.folderLabel, { folder: FOLDER });
+
+  it('a new Work conversation with a folder: no chip in the composer, the folder in the bar', async () => {
+    chooseFolder(FOLDER);
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
+    await waitFor(() => folderChips(bar()).length > 0);
+    expect(folderChips(composerForm())).toEqual([]);
+    expect(folderChips(bar())).toEqual([label]);
+    expect(composer().placeholder).toBe(fill(CHAT.placeholderWork, { folder: folderName(FOLDER) }));
+  });
+
+  it('a new Work conversation with no folder: "Choose folder…" in the composer, nothing in the bar', async () => {
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
+    expect(folderChips(composerForm())).toEqual([CHAT.folderChoose]);
+    expect(folderChips(bar())).toEqual([]);
+  });
+
+  it('an open Work conversation: no chip in the composer, the read-only one in the bar', async () => {
+    await open('/chat?c=p-open', (text) => text.includes('Hi there'), {
+      rows: [row('p-open')],
+      conversations: { 'p-open': sync('p-open', { turn: null }) },
+    });
+    await waitFor(() => folderChips(bar()).length > 0);
+    expect(folderChips(composerForm())).toEqual([]);
+    expect(folderChips(bar())).toEqual([label]);
+    click(button(label, bar()));
+    await waitFor(() => document.querySelector(`[aria-label="${CHAT.folderPath}"]`) !== null);
+    const popover = document.querySelector<HTMLElement>(`[aria-label="${CHAT.folderPath}"]`)!;
+    expect(reachable(popover).some((b) => accessibleName(b) === CHAT.folderCopy)).toBe(true);
+    expect(popover.querySelector('[role="radio"]')).toBeNull();
+  });
+
+  const OTHER = '/tmp/work/other';
+  const otherLabel = fill(CHAT.folderLabel, { folder: OTHER });
+
+  /** The native dialog: every request is answered with `path`. Returns the undo. */
+  function answerPicks(path: string): () => void {
+    const onMessage = (event: MessageEvent): void => {
+      const data = event.data as { type?: unknown; requestId?: unknown };
+      if (data?.type !== PICK_FOLDER_MESSAGE) return;
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: FOLDER_PICKED_MESSAGE, requestId: data.requestId, path },
+          source: window,
+        }),
+      );
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }
+
+  it('a folder chosen from the composer chip moves the chip to the bar and leaves focus in the composer', async () => {
+    const undo = answerPicks(FOLDER);
+    try {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
+      const chip = button(CHAT.folderChoose, composerForm());
+      act(() => chip.focus());
+      expect(document.activeElement).toBe(chip);
+      click(chip);
+      await waitFor(() => folderChips(bar()).includes(label));
+      expect(folderChips(composerForm())).toEqual([]);
+      await waitFor(() => document.activeElement === composer());
+    } finally {
+      undo();
+    }
+  });
+
+  it('the bar chip with an empty Work list opens the dialog at once and shows the folder picked there', async () => {
+    chooseFolder(FOLDER);
+    const undo = answerPicks(OTHER);
+    try {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
+      await waitFor(() => folderChips(bar()).includes(label));
+      click(button(label, bar()));
+      await waitFor(() => folderChips(bar()).includes(otherLabel));
+      expect(document.querySelector(`[aria-label="${CHAT.folderRecent}"]`)).toBeNull();
+      expect(composer().placeholder).toBe(fill(CHAT.placeholderWork, { folder: folderName(OTHER) }));
+      expect(folderChips(composerForm())).toEqual([]);
+      await waitFor(() => document.activeElement === composer());
+    } finally {
+      undo();
+    }
+  });
+
+  it('a recent folder picked from the bar chip leaves focus in the composer, even with a frame that lands late', async () => {
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      rows: [row('p-a', { updatedAt: NOW - 1_000 }), row('p-b', { cwd: OTHER, updatedAt: NOW - 2_000 })],
+    });
+    await waitFor(() => folderChips(bar()).includes(label));
+    const chip = button(label, bar());
+    act(() => chip.focus());
+    click(chip);
+    const option = (): HTMLElement | undefined =>
+      [...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`)].find((o) =>
+        (o.textContent ?? '').includes('other'),
+      );
+    await waitFor(() => option() !== undefined);
+    // The frame lands after the popover unmounts and before Radix's restore-focus timer (a slow frame in a browser).
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      queueMicrotask(() => callback(performance.now()));
+      return 0;
+    });
+    click(option()!);
+    await waitFor(() => folderChips(bar()).includes(otherLabel));
+    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
+    expect(document.querySelector(`[aria-label="${CHAT.folderRecent}"]`)).toBeNull();
+    expect(document.activeElement).toBe(composer());
   });
 });
 

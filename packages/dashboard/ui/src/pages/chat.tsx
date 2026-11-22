@@ -1282,10 +1282,14 @@ export default function Chat(): ReactElement {
           memory={memory}
         />
       </span>
-      {mode !== 'work' ? null : isNew ? (
-        <NewFolderChip folder={newFolder} recent={recent} onChoose={chooseRecent} onPick={() => void pickAndChoose()} />
-      ) : openFolder !== null ? (
-        <OpenFolderChip folder={openFolder} />
+      {mode === 'work' && isNew && newFolder === null ? (
+        <NewFolderChip
+          place="composer"
+          folder={null}
+          recent={recent}
+          onChoose={chooseRecent}
+          onPick={() => void pickAndChoose()}
+        />
       ) : null}
       {host !== null ? <WebChip providers={host.providers} mode={mode} /> : null}
       {mode === 'work' ? (
@@ -1326,7 +1330,19 @@ export default function Chat(): ReactElement {
               if (conversationId !== null) renameItem({ id: conversationId, title });
             }}
             trailing={docked ? null : newButton}
-            folder={openFolder !== null ? <OpenFolderChip folder={openFolder} /> : null}
+            folder={
+              openFolder !== null ? (
+                <OpenFolderChip folder={openFolder} />
+              ) : mode === 'work' && isNew && newFolder !== null ? (
+                <NewFolderChip
+                  place="header"
+                  folder={newFolder}
+                  recent={recent}
+                  onChoose={chooseRecent}
+                  onPick={() => void pickAndChoose()}
+                />
+              ) : null
+            }
             permission={
               subject?.kind === 'conversation' && permissionMode !== 'ask' ? (
                 <PermissionModeChip
