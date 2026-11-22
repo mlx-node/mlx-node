@@ -415,47 +415,9 @@ describe('Clairic System One', () => {
       state: 'a'.repeat(17 * 1024 * 1024),
       fields: { summary: { type: 'text' } },
     });
-    // Use http.request so a server early-reject with Connection: close (which can RST
-    // the upload socket mid-write under undici fetch) still delivers the 400 response.
-    const tooLarge = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
-      let settled = false;
-      const req = httpRequest(
-        `${base}/v1/systemone`,
-        {
-          method: 'POST',
-          headers: { 'Content-Length': Buffer.byteLength(seventeenMiB) },
-        },
-        (res) => {
-          let text = '';
-          res.on('data', (chunk) => {
-            text += chunk;
-          });
-          res.on('error', (err) => {
-            if (!settled) {
-              settled = true;
-              reject(err);
-            }
-          });
-          res.on('end', () => {
-            if (!settled) {
-              settled = true;
-              resolve({ status: res.statusCode ?? 0, body: JSON.parse(text) });
-            }
-          });
-        },
-      );
-      req.on('error', (err: NodeJS.ErrnoException) => {
-        // Expected when the server rejects at 16 MiB and closes before the remaining 1 MiB flushes.
-        if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return;
-        if (!settled) {
-          settled = true;
-          reject(err);
-        }
-      });
-      req.end(seventeenMiB);
-    });
+    const tooLarge = await fetch(`${base}/v1/systemone`, { method: 'POST', body: seventeenMiB });
     expect(tooLarge.status).toBe(400);
-    expect(tooLarge.body).toMatchObject({
+    expect(await tooLarge.json()).toMatchObject({
       error: { message: 'Request body too large' },
     });
     expect(native.extractRaw).toHaveBeenCalledTimes(1);
@@ -501,13 +463,13 @@ describe('Clairic System One', () => {
                 });
               },
             );
-            req.on('error', (err: NodeJS.ErrnoException) => {
-              if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return;
+            req.on('error', (err) => {
               if (!settled) {
                 settled = true;
                 reject(err);
               }
             });
+            req.setTimeout(5000, () => req.destroy(new Error(`oversized request timed out on ${route}`)));
             req.end(elevenMiB);
           },
         );

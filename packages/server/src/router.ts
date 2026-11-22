@@ -34,6 +34,18 @@ import type { ResponsesAPIRequest } from './types.js';
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 /** Max request body size for /v1/systemone (16 MiB — accommodates Clairic embedded media). */
 const MAX_SYSTEMONE_BODY_BYTES = 16 * 1024 * 1024;
+/**
+ * Bounded discard window after a request crosses `maxBytes`.
+ *
+ * Closing a socket immediately while unread body bytes still sit in the kernel
+ * receive buffer triggers a TCP RST on macOS/Linux that races with the 400 JSON
+ * response and surfaces as `ECONNRESET` in `fetch()` / pooled HTTP clients.
+ * Discarding a small tail (with 0 bytes buffered) lets typical oversized uploads
+ * read the 400 + `Connection: close` cleanly, while huge or stalled uploads still
+ * cut off promptly.
+ */
+const MAX_OVERSIZE_DRAIN_BYTES = 4 * 1024 * 1024;
+const MAX_OVERSIZE_DRAIN_MS = 500;
 
 /**
  * The request's pathname, parsed against a CONSTANT base.
@@ -66,35 +78,90 @@ function readBody(req: IncomingMessage, res: ServerResponse, maxBytes: number = 
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
+    let draining = false;
+    let drainedBytes = 0;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+
     const cleanup = () => {
       req.off('data', onData);
       req.off('end', onEnd);
       req.off('error', onError);
+      req.off('aborted', onAborted);
+      if (drainTimer !== null) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
     };
+
+    const failTooLarge = (pause: boolean) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (pause) req.pause();
+      // Always close after rejecting an oversized body so unread bytes (when
+      // cut off early) can never poison a keep-alive connection.
+      res.setHeader('Connection', 'close');
+      reject(new Error('Request body too large'));
+    };
+
     const onData = (chunk: Buffer) => {
+      if (draining) {
+        drainedBytes += chunk.length;
+        if (drainedBytes >= MAX_OVERSIZE_DRAIN_BYTES) {
+          failTooLarge(true);
+        }
+        return;
+      }
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
-        cleanup();
-        req.pause();
-        // Pausing leaves unread request bytes on the wire, so close the socket
-        // after writing the 400 rather than leaving a poisoned keep-alive peer.
-        res.setHeader('Connection', 'close');
-        reject(new Error('Request body too large'));
+        chunks.length = 0;
+        draining = true;
+        drainedBytes = totalBytes - maxBytes;
+        if (drainedBytes >= MAX_OVERSIZE_DRAIN_BYTES) {
+          failTooLarge(true);
+          return;
+        }
+        drainTimer = setTimeout(() => failTooLarge(true), MAX_OVERSIZE_DRAIN_MS);
+        drainTimer.unref?.();
         return;
       }
       chunks.push(chunk);
     };
     const onEnd = () => {
+      if (draining) {
+        failTooLarge(false);
+        return;
+      }
+      if (settled) return;
+      settled = true;
       cleanup();
       resolve(Buffer.concat(chunks).toString('utf-8'));
     };
+    const onAborted = () => {
+      if (draining) {
+        failTooLarge(true);
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('Request aborted'));
+    };
     const onError = (err: Error) => {
+      if (draining) {
+        failTooLarge(true);
+        return;
+      }
+      if (settled) return;
+      settled = true;
       cleanup();
       reject(err);
     };
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);
+    req.on('aborted', onAborted);
   });
 }
 
