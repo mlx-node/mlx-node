@@ -59,6 +59,41 @@ impl MxArray {
         Ok((array, SendPtr(data.cast::<u8>()), bytes))
     }
 
+    /// Allocate a row-contiguous uninitialized leaf array directly in CUDA
+    /// device memory (`device == 0`, `cudaMallocAsync`) so GPU repack and
+    /// inference kernels get full L2 cache and unified-memory bandwidth on
+    /// Windows WDDM. Returns `Ok(None)` on non-CUDA builds or when CUDA is
+    /// unavailable so callers fall back cleanly to `alloc_uninit`.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(crate) fn alloc_gpu_uninit(shape: &[i64], dtype: DType) -> Result<Option<MxArray>> {
+        // SAFETY: `shape` is valid for `shape.len()` elements.
+        let handle =
+            unsafe { sys::mlx_array_alloc_gpu_uninit(shape.as_ptr(), shape.len(), dtype.code()) };
+        if handle.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "array_alloc_gpu_uninit",
+        )?))
+    }
+
+    /// If this settled row-contiguous array resides in CUDA pinned-host memory
+    /// (`device == -1`), copy it into CUDA device memory (`device >= 0`) and
+    /// return the new GPU-resident array. Returns `Ok(None)` when already on
+    /// GPU device or on non-CUDA builds (caller keeps the original array).
+    pub(crate) fn ensure_cuda_device(&self) -> Result<Option<MxArray>> {
+        // SAFETY: `self.handle.0` is a live `mlx_array` handle.
+        let handle = unsafe { sys::mlx_array_ensure_cuda_device(self.handle.0) };
+        if handle.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "array_ensure_cuda_device",
+        )?))
+    }
+
     pub(crate) fn astype_cpu(&self, dtype: DType) -> Result<MxArray> {
         // SAFETY: the handle is a live array.
         let handle = unsafe { sys::mlx_array_astype_cpu(self.handle.0, dtype.code()) };

@@ -2,14 +2,15 @@ R"cuda(
 #include <cuda_bf16.h>
 
 // Register-resident single-block-per-head GDN prefill recurrence with optional
-// fused strided-z RMSNormGated epilogue:
+// fused strided-z RMSNormGated epilogue (supports both SiLU and Qwen4 Sigmoid gates,
+// BF16 or FP32 norm_weight, and BF16 or FP32 beta):
 // Holds 64 FP32 state elements per thread across the entire chunk (1 float4
 // state read + 1 float4 state write per chunk), software-pipelining STEPS=32
 // tokens of q/k/v/g/beta into shared memory with 1-hop warp shuffle reductions.
 // When FUSE_GATED_NORM=true, each token's BF16 recurrence output y_bf is staged
 // in-place into vs[tt][row] (0 syncs inside the recurrence loop), then all 8
 // warps process the chunk's 32 tokens in parallel using pure warp-shuffle
-// RMSNorm + strided-z SiLU gating and coalesced writes to [1, T, hv * 128].
+// RMSNorm + strided-z gating and coalesced writes to [1, T, hv * 128].
 //
 // Shapes (row-contiguous except z which may be strided along T with stride(-1)==1,
 // B=1, DK=DV=128):
@@ -19,7 +20,7 @@ R"cuda(
 //   beta:        [1, T, hv]      bf16 or f32 (template BETA_BF16)
 //   state_in:    [1, hv, 128, 128] f32
 //   z:           [1, T, hv * 128] bf16 (used when FUSE_GATED_NORM=true)
-//   norm_weight: [128] bf16 (used when FUSE_GATED_NORM=true)
+//   norm_weight: [128] bf16 or f32 (w_is_f32 flag, used when FUSE_GATED_NORM=true)
 //   y_out:       [1, T, hv * 128] (or [1, T, hv, 128]) bf16
 //   state_out:   [1, hv, 128, 128] f32
 // Grid: dim3(hv, 1, 1), Block: dim3(256, 1, 1) -> 128 dv rows/block, 2 threads/row.
@@ -38,17 +39,27 @@ __device__ __forceinline__ float4 widen_bf16x4(uint2 w) {
       __low2float(a), __high2float(a), __low2float(b), __high2float(b));
 }
 
+template <bool SIGMOID_GATE>
 __device__ __forceinline__ nv_bfloat16 gate_norm_elem(
-    float yv, float wv, float zval, float inv_rms) {
-  const nv_bfloat16 sc = __float2bfloat16_rn(yv * inv_rms);
-  const nv_bfloat16 normed = __float2bfloat16_rn(wv * __bfloat162float(sc));
-  const float sig_y = 1.0f / (1.0f + expf(fabsf(zval)));
-  const nv_bfloat16 sig =
-      __float2bfloat16_rn(zval < 0.0f ? sig_y : (1.0f - sig_y));
-  const nv_bfloat16 silu =
-      __float2bfloat16_rn(zval * __bfloat162float(sig));
-  return __float2bfloat16_rn(
-      __bfloat162float(silu) * __bfloat162float(normed));
+    float yv, float wv, float zval, float rms_factor) {
+  if constexpr (SIGMOID_GATE) {
+    // rms_factor is denom = sqrtf(mean_sq + eps); matches qwen4_exp exact boundary.
+    const nv_bfloat16 normed = __float2bfloat16_rn((yv / rms_factor) * wv);
+    const float sig_y = 1.0f / (1.0f + expf(fabsf(zval)));
+    const float sig = (zval < 0.0f) ? sig_y : (1.0f - sig_y);
+    return __float2bfloat16_rn(sig * __bfloat162float(normed));
+  } else {
+    // rms_factor is inv_rms = rsqrtf(mean_sq + eps); matches qwen3.5 SiLU boundary.
+    const nv_bfloat16 sc = __float2bfloat16_rn(yv * rms_factor);
+    const nv_bfloat16 normed = __float2bfloat16_rn(wv * __bfloat162float(sc));
+    const float sig_y = 1.0f / (1.0f + expf(fabsf(zval)));
+    const nv_bfloat16 sig =
+        __float2bfloat16_rn(zval < 0.0f ? sig_y : (1.0f - sig_y));
+    const nv_bfloat16 silu =
+        __float2bfloat16_rn(zval * __bfloat162float(sig));
+    return __float2bfloat16_rn(
+        __bfloat162float(silu) * __bfloat162float(normed));
+  }
 }
 
 template <bool BETA_BF16>
@@ -123,7 +134,7 @@ struct Prefetch {
 
 } // namespace gdn_pf
 
-template <bool BETA_BF16, bool FUSE_GATED_NORM>
+template <bool BETA_BF16, bool FUSE_GATED_NORM, bool SIGMOID_GATE = false>
 __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
     const nv_bfloat16* __restrict__ q,
     const nv_bfloat16* __restrict__ k,
@@ -132,19 +143,19 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
     const void* __restrict__ beta,
     const float* state_in,
     const nv_bfloat16* __restrict__ z,
-    const nv_bfloat16* __restrict__ norm_weight,
+    const void* __restrict__ norm_weight,
     nv_bfloat16* __restrict__ y_out,
     float* state_out,
     int W, int hk, int hv, int tiled_heads,
-    long long z_stride_t, float eps) {
+    long long z_stride_t, float eps, int w_is_f32 = 0) {
   using namespace gdn_pf;
-  // Static SMEM: 16384 + 16384 + 128 + 128 + 8192 + 256 = 41472 bytes (<= 48 KB).
+  // Static SMEM: 16384 + 16384 + 128 + 128 + 8192 + 512 = 41728 bytes (<= 48 KB).
   __shared__ float4 ks[STEPS][DK / 4];
   __shared__ float4 qs[STEPS][DK / 4];
   __shared__ float gs[STEPS];
   __shared__ float bs[STEPS];
   __shared__ __align__(16) nv_bfloat16 vs[STEPS][ROWS];
-  [[maybe_unused]] __shared__ __align__(8) nv_bfloat16 ws[DV];
+  [[maybe_unused]] __shared__ __align__(16) float ws[DV];
 
   const int head = blockIdx.x;
   const int row = threadIdx.x >> 1;
@@ -153,7 +164,9 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
 
   if constexpr (FUSE_GATED_NORM) {
     if (threadIdx.x < DV) {
-      ws[threadIdx.x] = norm_weight[threadIdx.x];
+      ws[threadIdx.x] = w_is_f32
+          ? reinterpret_cast<const float*>(norm_weight)[threadIdx.x]
+          : __bfloat162float(reinterpret_cast<const nv_bfloat16*>(norm_weight)[threadIdx.x]);
     }
   }
 
@@ -254,7 +267,7 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
           }
         }
       }
-      const float4 wf = widen_bf16x4(reinterpret_cast<const uint2*>(ws)[lane]);
+      const float4 wf = reinterpret_cast<const float4*>(ws)[lane];
 #pragma unroll
       for (int m = 0; m < 4; ++m) {
         const int tt = warp + m * 8;
@@ -265,13 +278,15 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
           for (int off = 16; off > 0; off >>= 1) {
             sq += __shfl_xor_sync(0xffffffffu, sq, off);
           }
-          const float inv_rms = rsqrtf(sq * (1.0f / 128.0f) + eps);
+          const float rms_factor = SIGMOID_GATE
+              ? sqrtf(sq * (1.0f / 128.0f) + eps)
+              : rsqrtf(sq * (1.0f / 128.0f) + eps);
           const float4 zf = widen_bf16x4(zv[m]);
           nv_bfloat16 out4[4];
-          out4[0] = gate_norm_elem(yf.x, wf.x, zf.x, inv_rms);
-          out4[1] = gate_norm_elem(yf.y, wf.y, zf.y, inv_rms);
-          out4[2] = gate_norm_elem(yf.z, wf.z, zf.z, inv_rms);
-          out4[3] = gate_norm_elem(yf.w, wf.w, zf.w, inv_rms);
+          out4[0] = gate_norm_elem<SIGMOID_GATE>(yf.x, wf.x, zf.x, rms_factor);
+          out4[1] = gate_norm_elem<SIGMOID_GATE>(yf.y, wf.y, zf.y, rms_factor);
+          out4[2] = gate_norm_elem<SIGMOID_GATE>(yf.z, wf.z, zf.z, rms_factor);
+          out4[3] = gate_norm_elem<SIGMOID_GATE>(yf.w, wf.w, zf.w, rms_factor);
           const size_t y_row = ((size_t)(t0 + tt) * hv + head) * DV;
           reinterpret_cast<uint2*>(y_out + y_row)[lane] =
               *reinterpret_cast<const uint2*>(out4);

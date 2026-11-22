@@ -7,9 +7,28 @@ use crate::accelerator::{ActiveBackend, active_backend};
 use crate::array::{DType, MxArray};
 
 /// Small-query (`Q in 2..=16`) causal Flash-Decoding SDPA fast path on CUDA
-/// (`D=256`, `GQA > 1`, `M = gqa * Q <= 96` or two-tile `Q > 8 && gqa * 8 <= 64`, BF16).
+/// (`D=256`, `GQA > 1`, `M = gqa * Q <= 96` or two-tile `Q > 8 && gqa * 8 <= 96`, BF16).
 #[inline]
 pub(crate) fn sdpa_causal_few(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    head_dim: i64,
+    gqa: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    if !(2..=16).contains(&seq_len) {
+        return Ok(None);
+    }
+    sdpa_causal_few_q1_to_16(queries, keys, values, head_dim, gqa, seq_len, scale)
+}
+
+/// Small-query (`Q in 1..=16`) causal Flash-Decoding SDPA fast path on CUDA
+/// (`D=256`, `GQA > 1`, `M = gqa * Q <= 96` or two-tile `Q > 8 && gqa * 8 <= 96`, BF16).
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn sdpa_causal_few_q1_to_16(
     queries: &MxArray,
     keys: &MxArray,
     values: &MxArray,
@@ -22,8 +41,8 @@ pub(crate) fn sdpa_causal_few(
         ActiveBackend::CudaGpu => {
             let m = gqa * seq_len;
             let ok_single = (1..=96).contains(&m);
-            let ok_two_tile = seq_len > 8 && gqa * 8 <= 64;
-            if !(2..=16).contains(&seq_len)
+            let ok_two_tile = seq_len > 8 && gqa * 8 <= 96;
+            if !(1..=16).contains(&seq_len)
                 || head_dim != 256
                 || gqa <= 1
                 || (!ok_single && !ok_two_tile)
@@ -138,7 +157,7 @@ pub(crate) fn sdpa_draft_masked(
             let gqa = num_heads / num_kv_heads;
             let m = gqa * seq_len;
             let ok_single = (1..=96).contains(&m);
-            let ok_two_tile = seq_len > 8 && gqa * 8 <= 64;
+            let ok_two_tile = seq_len > 8 && gqa * 8 <= 96;
             if !(1..=16).contains(&seq_len)
                 || !(head_dim == 128 || head_dim == 256)
                 || (!ok_single && !ok_two_tile)
@@ -261,7 +280,7 @@ pub(crate) fn sdpa_tree_few(
     }
     let m = gqa * seq_len;
     let ok_single = (1..=96).contains(&m);
-    let ok_two_tile = seq_len > 8 && gqa * 8 <= 64;
+    let ok_two_tile = seq_len > 8 && gqa * 8 <= 96;
     if !(1..=16).contains(&seq_len)
         || !(head_dim == 128 || head_dim == 256)
         || cache_len < 0

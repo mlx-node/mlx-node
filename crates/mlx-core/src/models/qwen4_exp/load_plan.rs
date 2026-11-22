@@ -39,15 +39,24 @@ pub(super) fn flash_next_layout(c: &Config) -> KvLayout {
 }
 
 /// The page format of a load: `requested` (`kvFormat`), else int8 where the
-/// int8 page store and dequantize serve the head (128 or 256 wide), else
-/// bf16. Splash `RuntimeResources::create` takes `kvFormat` (int8 by default)
-/// for every target and `storeSuffix` refuses a layout it has no kernel for.
+/// Metal int8 page store and dequantize serve the head (128 or 256 wide), else
+/// bf16. On non-Metal backends (CUDA/CPU), always defaults to bf16 because the
+/// paged int8 KV pool is Metal-only.
 pub(super) fn resolve_kv_format(
     label: &str,
     requested: Option<&str>,
     c: &Config,
 ) -> Result<KvFormat> {
-    let served = matches!(c.head_dim, 128 | 256);
+    resolve_kv_format_for_metal(label, requested, c, crate::accelerator::host_has_metal())
+}
+
+fn resolve_kv_format_for_metal(
+    label: &str,
+    requested: Option<&str>,
+    c: &Config,
+    has_metal: bool,
+) -> Result<KvFormat> {
+    let served = has_metal && matches!(c.head_dim, 128 | 256);
     let Some(requested) = requested else {
         return Ok(if served {
             KvFormat::Int8
@@ -58,10 +67,14 @@ pub(super) fn resolve_kv_format(
     let format = KvFormat::parse(Some(requested))
         .map_err(|e| Error::from_reason(format!("{label}: {e}")))?;
     if format == KvFormat::Int8 && !served {
-        return Err(Error::from_reason(format!(
-            "{label}: no int8 page kernels for head_dim {}; load with kvFormat 'bf16'",
-            c.head_dim
-        )));
+        return Err(Error::from_reason(if !has_metal {
+            format!("{label}: int8 KV pages require Metal; load with kvFormat 'bf16'")
+        } else {
+            format!(
+                "{label}: no int8 page kernels for head_dim {}; load with kvFormat 'bf16'",
+                c.head_dim
+            )
+        }));
     }
     Ok(format)
 }
@@ -292,6 +305,26 @@ pub(super) fn states_reserve(c: &Config, has_mtp: bool, tokens: u32) -> u64 {
     STORED_STATES.saturating_mul(one)
 }
 
+/// Hard-budget margin below the reported device working set.
+///
+/// Metal keeps `Margin::Unguarded` (15% + 1 GiB) unchanged. Unified-memory
+/// CUDA hosts (e.g. RTX Spark N1X 102.03 GiB pool carved from 118.49 GiB
+/// physical RAM) already exclude the OS share from `total_device_bytes` and
+/// still pass `direct_gate`'s 4 GiB live-RAM margin, so `Margin::Ledger`
+/// (`max(1 GiB, 2%)`) avoids double-subtracting ~16 GiB and admits 100%
+/// direct expert residency. Discrete CUDA keeps `Margin::Unguarded`.
+pub(super) fn host_margin() -> crate::engine::memory_plan::Margin {
+    let c = crate::accelerator::caps();
+    if !crate::accelerator::host_has_metal()
+        && crate::accelerator::host_has_cuda()
+        && c.is_unified_memory
+    {
+        crate::engine::memory_plan::Margin::Ledger
+    } else {
+        crate::engine::memory_plan::Margin::Unguarded
+    }
+}
+
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
 /// allowance of the requested context, else `min(trained,
 /// kResidentAllowanceTokens)`, on the load's one lane (with MTP weights it
@@ -300,6 +333,7 @@ pub(super) fn states_reserve(c: &Config, has_mtp: bool, tokens: u32) -> u64 {
 /// streamed store takes everything the allowance leaves, and a whole store's
 /// pool grows into all its slack, so without the reserve neither leaves a
 /// state room. A whole store whose slack is under the reserve streams.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_store(
     label: &str,
     c: &Config,
@@ -311,8 +345,35 @@ pub(super) fn plan_store(
     disk: bool,
     draft: DraftPrice,
 ) -> Result<StoreDecision> {
+    plan_store_with_margin(
+        label,
+        c,
+        inventory,
+        live,
+        max_memory,
+        max_context,
+        has_mtp,
+        disk,
+        draft,
+        crate::engine::memory_plan::Margin::Unguarded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_store_with_margin(
+    label: &str,
+    c: &Config,
+    inventory: &LoadInventory,
+    live: LiveMemory,
+    max_memory: Option<u64>,
+    max_context: Option<u32>,
+    has_mtp: bool,
+    disk: bool,
+    draft: DraftPrice,
+    margin: crate::engine::memory_plan::Margin,
+) -> Result<StoreDecision> {
     let plan = |states: u64| {
-        plan_lanes(
+        plan_lanes_with_margin(
             label,
             c,
             inventory,
@@ -323,6 +384,7 @@ pub(super) fn plan_store(
             disk,
             draft,
             states,
+            margin,
         )
     };
     let base = plan(0)?;
@@ -338,6 +400,8 @@ pub(super) fn plan_store(
 }
 
 /// [`plan_store`] with `states` bytes beside the pool in the allowance.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn plan_lanes(
     label: &str,
     c: &Config,
@@ -350,6 +414,36 @@ fn plan_lanes(
     draft: DraftPrice,
     states: u64,
 ) -> Result<StoreDecision> {
+    plan_lanes_with_margin(
+        label,
+        c,
+        inventory,
+        live,
+        max_memory,
+        max_context,
+        has_mtp,
+        disk,
+        draft,
+        states,
+        crate::engine::memory_plan::Margin::Unguarded,
+    )
+}
+
+/// [`plan_store_with_margin`] with `states` bytes beside the pool in the allowance.
+#[allow(clippy::too_many_arguments)]
+fn plan_lanes_with_margin(
+    label: &str,
+    c: &Config,
+    inventory: &LoadInventory,
+    live: LiveMemory,
+    max_memory: Option<u64>,
+    max_context: Option<u32>,
+    has_mtp: bool,
+    disk: bool,
+    draft: DraftPrice,
+    states: u64,
+    margin: crate::engine::memory_plan::Margin,
+) -> Result<StoreDecision> {
     let transient = |window: u32| transient(c, window);
     let state = lane_state(c, has_mtp, draft);
     let pool = pool_input(c, &transient, &state);
@@ -358,11 +452,7 @@ fn plan_lanes(
     let allowance_tokens = max_context.unwrap_or(automatic);
     let allowance = allowance_dynamic_bytes(&[&lane], allowance_tokens).saturating_add(states);
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
-    let hard = hard_budget_bytes(
-        live.working_set_bytes,
-        max_memory,
-        crate::engine::memory_plan::Margin::Unguarded,
-    );
+    let hard = hard_budget_bytes(live.working_set_bytes, max_memory, margin);
     let fixed = live
         .active_bytes
         .saturating_add(live.registered_pool_bytes)
@@ -391,6 +481,7 @@ fn plan_lanes(
 /// with `held_back` bytes of the stores and the vision tower above it, and
 /// the store decision's `states` held beside the pool, which the pool never
 /// grows into.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_engine(
     label: &str,
     c: &Config,
@@ -401,6 +492,33 @@ pub(super) fn plan_engine(
     disk: bool,
     draft: DraftPrice,
     states: u64,
+) -> Result<MemoryPlan> {
+    plan_engine_with_margin(
+        label,
+        c,
+        live,
+        held_back,
+        max_memory,
+        has_mtp,
+        disk,
+        draft,
+        states,
+        crate::engine::memory_plan::Margin::Unguarded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_engine_with_margin(
+    label: &str,
+    c: &Config,
+    live: LiveMemory,
+    held_back: u64,
+    max_memory: Option<u64>,
+    has_mtp: bool,
+    disk: bool,
+    draft: DraftPrice,
+    states: u64,
+    margin: crate::engine::memory_plan::Margin,
 ) -> Result<MemoryPlan> {
     let transient = |window: u32| transient(c, window);
     let lane = lane_state(c, has_mtp, draft);
@@ -414,7 +532,7 @@ pub(super) fn plan_engine(
         state_staging_bytes: state_staging(c, has_mtp, disk),
         draft_weights_bytes: draft.weights,
         held_back_bytes: held_back,
-        margin: crate::engine::memory_plan::Margin::Unguarded,
+        margin,
     };
     MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient, &state)))
         .map_err(|error| Error::from_reason(error.message(label)))
@@ -483,6 +601,7 @@ pub struct Qwen4ExpContextEstimate {
 
 /// The plan a load makes, from the descriptors: the store plan, then the
 /// engine plan with the fixed weights loaded and the stores at their cap.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn estimate(
     label: &str,
     c: &Config,
@@ -494,11 +613,7 @@ pub(super) fn estimate(
     disk: bool,
     draft: DraftPrice,
 ) -> Result<Qwen4ExpContextEstimate> {
-    let live = LiveMemory {
-        active_bytes: live.active_bytes.saturating_add(draft.weights),
-        ..live
-    };
-    let decision = plan_store(
+    estimate_with_margin(
         label,
         c,
         inventory,
@@ -508,6 +623,38 @@ pub(super) fn estimate(
         has_mtp,
         disk,
         draft,
+        crate::engine::memory_plan::Margin::Unguarded,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn estimate_with_margin(
+    label: &str,
+    c: &Config,
+    inventory: &LoadInventory,
+    live: LiveMemory,
+    max_memory: Option<u64>,
+    max_context: Option<u32>,
+    has_mtp: bool,
+    disk: bool,
+    draft: DraftPrice,
+    margin: crate::engine::memory_plan::Margin,
+) -> Result<Qwen4ExpContextEstimate> {
+    let live = LiveMemory {
+        active_bytes: live.active_bytes.saturating_add(draft.weights),
+        ..live
+    };
+    let decision = plan_store_with_margin(
+        label,
+        c,
+        inventory,
+        live,
+        max_memory,
+        max_context,
+        has_mtp,
+        disk,
+        draft,
+        margin,
     )?;
     let loaded = LiveMemory {
         active_bytes: live
@@ -520,7 +667,7 @@ pub(super) fn estimate(
         .expert_cap_bytes
         .saturating_add(decision.store.row_cache_bytes)
         .saturating_add(inventory.vision_bytes);
-    let plan = plan_engine(
+    let plan = plan_engine_with_margin(
         label,
         c,
         loaded,
@@ -530,6 +677,7 @@ pub(super) fn estimate(
         disk,
         draft,
         decision.states,
+        margin,
     )?;
     check_context(label, &plan, max_context)?;
     let pool = plan.pool.as_ref().ok_or_else(|| {
@@ -544,7 +692,7 @@ pub(super) fn estimate(
 
 /// The load-free estimate behind `/v1/models`: the plan a load of
 /// `model_path` with `options` would make, from the tensors' descriptors
-/// (no payload read, no pack sweep, no asset written). `None` when the Metal
+/// (no payload read, no pack sweep, no asset written). `None` when the device
 /// working set is unreadable.
 #[napi]
 pub async fn estimate_qwen4_exp_context_window(
@@ -558,7 +706,7 @@ pub async fn estimate_qwen4_exp_context_window(
     let max_context =
         crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?;
     napi::bindgen_prelude::spawn_blocking(move || {
-        let Some(live) = crate::engine::memory_plan::live_memory() else {
+        let Some(live) = super::memory::live_memory() else {
             return Ok(None);
         };
         let path = Path::new(&model_path);
@@ -577,12 +725,16 @@ pub async fn estimate_qwen4_exp_context_window(
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
         let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
-        let disk = super::disk_plan(LABEL, &options, env.as_deref())?.1;
+        let disk = if crate::accelerator::host_has_metal() {
+            super::disk_plan(LABEL, &options, env.as_deref())?.1
+        } else {
+            false
+        };
         let draft = match options.draft_model_path.as_deref() {
             Some(dir) => DraftPrice::of_checkpoint(LABEL, &config, Path::new(dir))?,
             None => DraftPrice::default(),
         };
-        estimate(
+        estimate_with_margin(
             LABEL,
             &config,
             &inventory,
@@ -592,6 +744,7 @@ pub async fn estimate_qwen4_exp_context_window(
             has_mtp,
             disk,
             draft,
+            host_margin(),
         )
         .map(Some)
     })

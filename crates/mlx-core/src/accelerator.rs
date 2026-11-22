@@ -277,6 +277,20 @@ pub(crate) fn query_free_device_memory() -> Option<u64> {
     (rc == 0 && free > 0).then_some(free)
 }
 
+/// Cache-memory threshold above which periodic CUDA decode cache clears run.
+/// On large unified-memory CUDA systems (e.g. 128 GB GB10 Spark), MLX's
+/// allocator pool legitimately holds several GiB of recycled prefill/decode
+/// scratch buffers, so trimming at 1 GiB triggers ~500 ms `cudaMemPoolTrimTo`
+/// stalls every 256 tokens. Discrete GPUs retain the 1 GiB cap.
+pub(crate) fn cuda_cache_clear_threshold_bytes() -> f64 {
+    let c = caps();
+    if c.is_unified_memory && c.total_device_bytes > 0 {
+        (c.total_device_bytes / 12).max(8u64 << 30) as f64
+    } else {
+        1024.0 * 1024.0 * 1024.0
+    }
+}
+
 /// RAII handle for a retained BF16 dense prefill weight on CUDA.
 ///
 /// Tracks the total pending + materialized retained dense weight footprint
@@ -433,26 +447,33 @@ mod tests {
         if !cuda_ops_available() {
             return;
         }
-        // 1. D=256 SDPA must decline M > 48 (would exceed 48 KB static smem).
-        // gqa = 32 / 4 = 8, Q_len = 8 => M = 64 > 48.
-        let q = MxArray::zeros(&[1, 32, 8, 256], Some(DType::BFloat16)).unwrap();
+        // 1. D=256 SDPA supports single-tile M <= 96 and two-tile Q_len <= 16 (gqa * 8 <= 96).
+        // gqa = 52 / 4 = 13, Q_len = 8 => M = 104 > 96 (and gqa * 8 = 104 > 96).
+        let q = MxArray::zeros(&[1, 52, 8, 256], Some(DType::BFloat16)).unwrap();
         let k = MxArray::zeros(&[1, 4, 32, 256], Some(DType::BFloat16)).unwrap();
         let v = MxArray::zeros(&[1, 4, 32, 256], Some(DType::BFloat16)).unwrap();
         let declined = unsafe {
             mlx_sys::mlx_sdpa_tc_few_cuda(q.as_raw_ptr(), k.as_raw_ptr(), v.as_raw_ptr(), 0.0625)
         };
-        assert!(declined.is_null(), "D=256 with M=64 must decline cleanly");
+        assert!(declined.is_null(), "D=256 with M=104 must decline cleanly");
 
-        // 2. KQuantFew must decline M > 8 (kernel is specialized for M in 2..=8).
-        let x9 = MxArray::zeros(&[9, 2048], Some(DType::BFloat16)).unwrap();
+        // 2. KQuantFew supports M in 1..=16 and must decline M > 16.
+        let x16 = MxArray::zeros(&[16, 2048], Some(DType::BFloat16)).unwrap();
+        let x17 = MxArray::zeros(&[17, 2048], Some(DType::BFloat16)).unwrap();
         let w = MxArray::zeros(&[64, 2048 * 4 / 32], Some(DType::Uint32)).unwrap();
         let s = MxArray::zeros(&[64, 2048 / 16], Some(DType::Uint8)).unwrap();
         let b = MxArray::zeros(&[64, 2048 / 128], Some(DType::Float16)).unwrap();
+        let kq_accepted =
+            crate::kernels::linear::kquant_matmul_few(&x16, &w, &s, &b, "q4k").unwrap();
+        assert!(
+            kq_accepted.is_some(),
+            "KQuantFew with M=16 must be accepted"
+        );
         let kq_declined =
-            crate::kernels::linear::kquant_matmul_few(&x9, &w, &s, &b, "q4_k").unwrap();
+            crate::kernels::linear::kquant_matmul_few(&x17, &w, &s, &b, "q4k").unwrap();
         assert!(
             kq_declined.is_none(),
-            "KQuantFew with M=9 must decline cleanly"
+            "KQuantFew with M=17 must decline cleanly"
         );
 
         // 3. Sliced non-16B-aligned BF16 view must not fault in Bf16GemmFew.

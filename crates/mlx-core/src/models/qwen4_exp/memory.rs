@@ -165,7 +165,31 @@ fn test_host_override() -> Option<HostMemory> {
 /// The device a load plans against; a fixture-host child gets the working set
 /// of [`fixture_host`], not the runner's.
 pub(super) fn live_memory() -> Option<crate::engine::memory_plan::LiveMemory> {
-    let live = crate::engine::memory_plan::live_memory()?;
+    let live = if let Some(live) = crate::engine::memory_plan::live_memory() {
+        live
+    } else if !crate::accelerator::host_has_metal() && crate::accelerator::host_has_cuda() {
+        #[cfg(test)]
+        if crate::engine::memory_plan::LIVE_MEMORY_UNREADABLE.with(std::cell::Cell::get) {
+            return None;
+        }
+        let working_set_bytes = crate::accelerator::caps().total_device_bytes;
+        if working_set_bytes == 0 {
+            return None;
+        }
+        let mut active_bytes = 0u64;
+        // SAFETY: the probe writes one u64 through a valid pointer and reports
+        // failure through its return code.
+        if unsafe { mlx_sys::mlx_get_active_memory(&mut active_bytes) } != 0 {
+            return None;
+        }
+        crate::engine::memory_plan::LiveMemory {
+            working_set_bytes,
+            active_bytes,
+            registered_pool_bytes: crate::cache_limit::coordinator().registered_pool_bytes(),
+        }
+    } else {
+        return None;
+    };
     #[cfg(test)]
     if std::env::var_os(FIXTURE_HOST_ENV).is_some() {
         return Some(crate::engine::memory_plan::LiveMemory {
@@ -213,9 +237,9 @@ pub(super) fn bank_gate_beside(
 }
 
 /// Record the live host in `plan`: the gates that follow read it, never the
-/// plan's sizes. Fixtures and other platforms have no snapshot.
+/// plan's sizes. Fixtures and unsupported platforms have no snapshot.
 pub(super) fn host_snapshot(plan: &mut Plan) -> Result<()> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
         return Ok(());
     }
     let host = host_memory()?;
@@ -330,6 +354,12 @@ fn workspace_cache_bytes(physical: Option<u64>) -> u64 {
 }
 
 pub(super) fn maintain_freelist(physical: Option<u64>) {
+    // On CUDA, `clear_cache()` calls `cudaStreamSynchronize + cudaMemPoolTrimTo(0)`
+    // (~70 ms stall per hit), while MLX's CudaAllocator already bounds its pool
+    // automatically on allocation pressure. Keep Metal's wired freelist trim untouched.
+    if crate::accelerator::cuda_ops_available() {
+        return;
+    }
     let limit = workspace_cache_bytes(physical);
     if crate::array::memory::get_cache_memory() > limit as f64 {
         crate::array::memory::clear_cache();
@@ -354,22 +384,20 @@ pub(super) fn check_growth_headroom_with(host: &HostMemory, direct_gate: bool) -
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn physical_memory() -> Result<u64> {
     #[cfg(test)]
     if let Some(host) = test_host_override() {
         return Ok(host.physical);
     }
-    crate::utils::host::physical_memory()
-        .ok_or_else(|| Error::from_reason("Cannot read physical memory for Qwen4 residency"))
-}
-#[cfg(not(target_os = "macos"))]
-fn physical_memory() -> Result<u64> {
-    #[cfg(test)]
-    if let Some(host) = test_host_override() {
-        return Ok(host.physical);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        crate::utils::host::physical_memory()
+            .ok_or_else(|| Error::from_reason("Cannot read physical memory for Qwen4 residency"))
     }
-    Ok(0)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(crate::utils::host::physical_memory().unwrap_or(0))
+    }
 }
 
 fn system_reserve(physical: u64) -> u64 {
@@ -457,14 +485,47 @@ pub(super) fn host_memory() -> Result<HostMemory> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(super) fn host_memory() -> Result<HostMemory> {
+    #[cfg(test)]
+    if let Some(host) = test_host_override() {
+        return Ok(host);
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is a plain Win32 POD struct; zeroed with
+    // `dwLength` initialized before calling `GlobalMemoryStatusEx`.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return Err(Error::from_reason(
+            "Cannot establish Qwen4 larger-cache memory headroom",
+        ));
+    }
+    let physical = status.ullTotalPhys;
+    // Windows `ullAvailPhys` includes free and standby (reclaimable) pages,
+    // matching macOS's `free + file`.
+    let free = status.ullAvailPhys.min(physical);
+    let non_reclaimable = physical.saturating_sub(free);
+    Ok(HostMemory {
+        physical,
+        free,
+        file: 0,
+        anonymous: non_reclaimable,
+        purgeable: 0,
+        wired: 0,
+        compressor: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(super) fn host_memory() -> Result<HostMemory> {
     #[cfg(test)]
     if let Some(host) = test_host_override() {
         return Ok(host);
     }
     Err(Error::from_reason(
-        "Qwen4 larger-cache admission is currently available only on macOS",
+        "Qwen4 larger-cache admission is currently available only on macOS and Windows",
     ))
 }
 

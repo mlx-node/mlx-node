@@ -128,11 +128,23 @@ impl HiddenTaps {
             }
             self.passes.drain(..dropped);
         }
-        // A lazy tap holds its layer's whole output until evaluated.
-        if let Some(pass) = self.passes.last().filter(|pass| pass.first == first) {
+        // A lazy tap holds its layer's whole output until evaluated. On CUDA
+        // fast mode, `prefill_group_inner` / `decode_layers` / `verify_chunk`
+        // already include `last_pass_arrays()` in their pass-end flush/eval, so
+        // skipping a duplicate `mlx_async_eval` avoids an extra graph split.
+        if !super::super::cuda_qwen4_fast_enabled()
+            && let Some(pass) = self.passes.last().filter(|pass| pass.first == first)
+        {
             MxArray::async_eval_arrays(&pass.hidden.iter().collect::<Vec<_>>());
         }
         Ok(())
+    }
+
+    /// Tapped arrays of the newest finished pass, for end-of-pass synchronization.
+    pub(super) fn last_pass_arrays(&self) -> &[MxArray] {
+        self.passes
+            .last()
+            .map_or(&[], |pass| pass.hidden.as_slice())
     }
 
     #[cfg(test)]
@@ -168,6 +180,14 @@ impl HiddenTaps {
 fn stream_mean(x: &MxArray, hc: usize, hidden: usize) -> Result<MxArray> {
     #[cfg(test)]
     STREAM_MEANS.with(|n| n.set(n.get() + 1));
+    if super::super::cuda_qwen4_fast_enabled()
+        && hc == 4
+        && hidden == 2560
+        && x.dtype()? == DType::BFloat16
+        && let Some(out) = crate::kernels::qwen4::stream_mean_cuda(x)?
+    {
+        return Ok(out);
+    }
     let stream = |s: usize| {
         x.slice_axis(2, (s * hidden) as i64, ((s + 1) * hidden) as i64)?
             .astype(DType::Float32)

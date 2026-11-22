@@ -6,12 +6,19 @@
 //! Greedy text equals the target's own: every verify row carries the bits
 //! of the one-row step at its position.
 use super::*;
-use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput};
+use crate::engine::backend::{
+    DsparkProposal, DsparkStepper, DsparkTreeGreedyResult, DsparkVerifyOutput,
+};
 use crate::engine::params::ChatParams;
 use crate::engine::verification_budget::choose_verification_lengths;
 use crate::models::qwen3_5::dflash2::{
     DFLASH2_DRAFT_PROPOSALS, DFlash2ContextCache, DFlash2Model, SelectorPath, load_dflash2,
     read_dflash2_config,
+};
+use crate::models::qwen3_5::verify_tree::{
+    DRAFT_SLOTS, LookupAcceptance, LookupAgreement, LookupIndex, MAX_LOOKUP_CHAIN, MAX_TREE_NODES,
+    TreeCostModel, TreeDeviceViews, VerifyBudget, VerifyTree, build_verify_tree,
+    build_verify_tree_cost_aware,
 };
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::transformer::paged_kv_cache_adapter::SeqId;
@@ -262,10 +269,78 @@ impl Decoder {
 }
 
 /// The verify a commit closes.
-struct Verified {
-    position: usize,
-    tokens: Vec<u32>,
-    states: Vec<DecoderState>,
+enum Verified {
+    States {
+        position: usize,
+        tokens: Vec<u32>,
+        states: Vec<DecoderState>,
+    },
+    Deferred {
+        position: usize,
+        tokens: Vec<u32>,
+        ticket: DeferredVerifyTicket,
+    },
+    TreeDeferred {
+        position: usize,
+        is_chain: bool,
+        ticket: TreeVerifyTicket,
+    },
+}
+
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("0")
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("off")
+                || trimmed.eq_ignore_ascii_case("no")
+            {
+                false
+            } else if trimmed.eq_ignore_ascii_case("1")
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("on")
+                || trimmed.eq_ignore_ascii_case("yes")
+            {
+                true
+            } else {
+                default
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_qwen4_tree_cost_model() -> TreeCostModel {
+    let mut model = TreeCostModel::QWEN4_MOE_DEFAULT;
+    if let Ok(v) = std::env::var("MLX_QWEN4_TREE_COST_BASE")
+        && let Ok(parsed) = v.trim().parse::<f64>()
+        && parsed.is_finite()
+        && parsed >= 0.0
+    {
+        model.base_ms = parsed;
+    }
+    if let Ok(v) = std::env::var("MLX_QWEN4_TREE_COST_SLOPE")
+        && let Ok(parsed) = v.trim().parse::<f64>()
+        && parsed.is_finite()
+        && parsed > 0.0
+    {
+        model.slope_ms = parsed;
+    }
+    if let Ok(v) = std::env::var("MLX_QWEN4_TREE_MIN_NODES")
+        && let Ok(parsed) = v.trim().parse::<usize>()
+    {
+        model.min_nodes = parsed.clamp(1, MAX_TREE_NODES);
+    }
+    model.bucketed = env_flag_default("MLX_QWEN4_TREE_BUCKETED", model.bucketed);
+    model
+}
+
+fn env_qwen4_tree_fixed_max_nodes() -> Option<usize> {
+    std::env::var("MLX_QWEN4_TREE_MAX_NODES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, MAX_TREE_NODES))
 }
 
 /// One sequence's draft cycle over the decoder's active sequence; the
@@ -277,6 +352,27 @@ pub(in super::super) struct DraftStepper<'a> {
     context: &'a mut DFlash2ContextCache,
     rows: usize,
     verified: Option<Verified>,
+    /// Enable Wave B MoE-cost-aware `M <= 16` tree verification + SAM prompt
+    /// lookup on flat CUDA fast mode (`MLX_QWEN4_TREE`, default `true`).
+    tree_enabled: bool,
+    /// Enable suffix-automaton prompt lookup (`MLX_QWEN4_LOOKUP`, default `true`).
+    lookup_enabled: bool,
+    /// Optional fixed tree width (`MLX_QWEN4_TREE_MAX_NODES=N`); `None` uses
+    /// MoE-cost-aware adaptive `T* in 2..=16`.
+    tree_fixed_max_nodes: Option<usize>,
+    /// Use GPU `select_tree_cuda` when fixed width is pinned (`MLX_QWEN4_GPU_TREE=1`).
+    gpu_tree_enabled: bool,
+    tree_cost_model: TreeCostModel,
+    lookup_index: LookupIndex,
+    lookup_acceptance: LookupAcceptance,
+    verify_budget: VerifyBudget,
+    tree_cycles: usize,
+    tree_nodes_sum: usize,
+    tree_accepted_sum: usize,
+    tree_noncontig_commits: usize,
+    tree_lookup_accepted: usize,
+    tree_propose_us: u64,
+    tree_verify_us: u64,
     /// Tests put their proposals in place of the draft's: (the anchor's
     /// row, the draft's proposals) -> the proposals.
     #[cfg(test)]
@@ -286,6 +382,16 @@ pub(in super::super) struct DraftStepper<'a> {
     #[cfg(test)]
     pub(in super::super) drawn:
         Option<Box<dyn FnMut(u32) -> (Vec<u32>, Vec<SparseDistribution>) + 'a>>,
+}
+
+impl Drop for DraftStepper<'_> {
+    fn drop(&mut self) {
+        let _ = self.decoder.settle_cuda_pending_gdn();
+        if self.decoder.paged.is_none() && super::super::cuda_qwen4_fast_enabled() {
+            let _ = self.decoder.sync_cuda_pending_states();
+            let _ = self.context.eval();
+        }
+    }
 }
 
 impl<'a> DraftStepper<'a> {
@@ -308,12 +414,46 @@ impl<'a> DraftStepper<'a> {
             ));
         }
         decoder.draft_follow(draft, context)?;
+        let c = &decoder.config;
+        let flat_cuda_tree_capable = decoder.paged.is_none()
+            && super::super::cuda_qwen4_fast_enabled()
+            && decoder.positions.is_empty()
+            && decoder.yarn.is_none()
+            && c.hidden_size == 2560
+            && c.hc_count == 4
+            && c.head_dim == 256
+            && c.linear_num_key_heads == 16
+            && c.linear_num_value_heads == 48
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128
+            && c.linear_conv_kernel_dim == 4
+            && (c.ple_layer_ids.is_empty() || (c.ple_conv_kernel_size == 4 && c.ngram_size == 3));
+        let tree_enabled = flat_cuda_tree_capable && env_flag_default("MLX_QWEN4_TREE", true);
+        let lookup_enabled = env_flag_default("MLX_QWEN4_LOOKUP", true);
+        let tree_fixed_max_nodes = env_qwen4_tree_fixed_max_nodes();
+        let gpu_tree_enabled = env_flag_default("MLX_QWEN4_GPU_TREE", false);
+        let tree_cost_model = env_qwen4_tree_cost_model();
         Ok(Self {
             decoder,
             draft,
             context,
             rows,
             verified: None,
+            tree_enabled,
+            lookup_enabled,
+            tree_fixed_max_nodes,
+            gpu_tree_enabled,
+            tree_cost_model,
+            lookup_index: LookupIndex::new(),
+            lookup_acceptance: LookupAcceptance::new(),
+            verify_budget: VerifyBudget::new(),
+            tree_cycles: 0,
+            tree_nodes_sum: 0,
+            tree_accepted_sum: 0,
+            tree_noncontig_commits: 0,
+            tree_lookup_accepted: 0,
+            tree_propose_us: 0,
+            tree_verify_us: 0,
             #[cfg(test)]
             forced: None,
             #[cfg(test)]
@@ -334,6 +474,17 @@ impl<'a> DraftStepper<'a> {
         params: &ChatParams,
         rng: &mut dyn rand::Rng,
         confident: bool,
+    ) -> Result<Proposed> {
+        self.propose_block_limited(anchor, params, rng, confident, None)
+    }
+
+    fn propose_block_limited(
+        &mut self,
+        anchor: u32,
+        params: &ChatParams,
+        rng: &mut dyn rand::Rng,
+        confident: bool,
+        head_limit: Option<usize>,
     ) -> Result<Proposed> {
         let position = self.decoder.history.len();
         if self.verified.is_some() {
@@ -358,8 +509,9 @@ impl<'a> DraftStepper<'a> {
             && params.presence_penalty == 0.0
             && params.frequency_penalty == 0.0;
         let mut confidence = None;
+        let limit = head_limit.filter(|_| super::super::cuda_qwen4_fast_enabled());
         let (path, mut rows) = self.draft.propose_with(
-            &mut self.decoder.draft_view(),
+            &mut self.decoder.draft_view_with_limit(limit),
             self.context,
             anchor,
             DFLASH2_DRAFT_PROPOSALS,
@@ -416,8 +568,10 @@ impl DsparkStepper for DraftStepper<'_> {
         params: &ChatParams,
         rng: &mut dyn rand::Rng,
     ) -> Result<DsparkProposal> {
-        let block = self.propose_block(anchor_id, params, rng, false)?;
-        Ok(block.proposal(max_len.min(self.rows - 1)))
+        let want = max_len.min(self.rows - 1);
+        let limit = (want > 0 && want < DFLASH2_DRAFT_PROPOSALS).then_some(want);
+        let block = self.propose_block_limited(anchor_id, params, rng, false, limit)?;
+        Ok(block.proposal(want))
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
@@ -434,12 +588,23 @@ impl DsparkStepper for DraftStepper<'_> {
             )));
         }
         let position = self.decoder.history.len();
-        let (logits, states) = self.decoder.verify_chunk(verify_ids)?;
-        self.verified = Some(Verified {
-            position,
-            tokens: verify_ids.to_vec(),
-            states,
-        });
+        let logits = if self.decoder.paged.is_none() && super::super::cuda_qwen4_fast_enabled() {
+            let (logits, ticket) = self.decoder.verify_chunk_deferred(verify_ids)?;
+            self.verified = Some(Verified::Deferred {
+                position,
+                tokens: verify_ids.to_vec(),
+                ticket,
+            });
+            logits
+        } else {
+            let (logits, states) = self.decoder.verify_chunk(verify_ids)?;
+            self.verified = Some(Verified::States {
+                position,
+                tokens: verify_ids.to_vec(),
+                states,
+            });
+            logits
+        };
         Ok(DsparkVerifyOutput {
             logits: logits.expand_dims(0)?,
         })
@@ -453,34 +618,91 @@ impl DsparkStepper for DraftStepper<'_> {
             .verified
             .take()
             .ok_or_else(|| Error::from_reason("Qwen4 draft commit has no verify"))?;
-        if keep == 0 || keep > total_written || total_written != verified.tokens.len() {
-            return Err(Error::from_reason(format!(
-                "Qwen4 draft commit keeps {keep} of {total_written} rows of a {}-row verify",
-                verified.tokens.len()
-            )));
+        match verified {
+            Verified::Deferred {
+                position,
+                tokens,
+                ticket,
+            } => {
+                if keep == 0 || keep > total_written || total_written != tokens.len() {
+                    return Err(Error::from_reason(format!(
+                        "Qwen4 draft commit keeps {keep} of {total_written} rows of a {}-row verify",
+                        tokens.len()
+                    )));
+                }
+                let passes = self.decoder.take_hidden_taps();
+                let rows = tapped_rows(&passes, position, position + keep)?;
+                drop(passes);
+                self.decoder
+                    .commit_deferred_verify(ticket, keep, total_written)?;
+                let fused = self.draft.fuse_context(&rows)?;
+                self.context
+                    .append(self.draft, &fused, position as i32, &tokens[..keep])?;
+                // Leave context append lazy on CUDA: `eval_boundary` flushes
+                // caches + context + boundary token asynchronously via
+                // `cuda_async_eval`, overlapping commit with next `propose`.
+                Ok(())
+            }
+            Verified::States {
+                position,
+                tokens,
+                states,
+            } => {
+                if keep == 0 || keep > total_written || total_written != tokens.len() {
+                    return Err(Error::from_reason(format!(
+                        "Qwen4 draft commit keeps {keep} of {total_written} rows of a {}-row verify",
+                        tokens.len()
+                    )));
+                }
+                let passes = self.decoder.take_hidden_taps();
+                let rows = tapped_rows(&passes, position, position + keep)?;
+                drop(passes);
+                let state = states.into_iter().nth(keep - 1).ok_or_else(|| {
+                    Error::from_reason("Qwen4 draft verify returned too few states")
+                })?;
+                if let Some(adapter) = self.decoder.paged.as_mut() {
+                    adapter
+                        .rollback_last_tokens((total_written - keep) as u32)
+                        .map_err(Error::from_reason)?;
+                }
+                self.decoder.restore_state(state);
+                let fused = self.draft.fuse_context(&rows)?;
+                self.context
+                    .append(self.draft, &fused, position as i32, &tokens[..keep])?;
+                self.context.eval()
+            }
+            Verified::TreeDeferred { .. } => Err(Error::from_reason(
+                "Qwen4 draft linear commit called on a pending tree verify",
+            )),
         }
-        let passes = self.decoder.take_hidden_taps();
-        let rows = tapped_rows(&passes, verified.position, verified.position + keep)?;
-        drop(passes);
-        let state = verified
-            .states
-            .into_iter()
-            .nth(keep - 1)
-            .ok_or_else(|| Error::from_reason("Qwen4 draft verify returned too few states"))?;
-        if let Some(adapter) = self.decoder.paged.as_mut() {
-            adapter
-                .rollback_last_tokens((total_written - keep) as u32)
-                .map_err(Error::from_reason)?;
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.tree_cycles > 0
+            && (std::env::var("MLX_QWEN4_TREE_STATS").is_ok()
+                || std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok())
+        {
+            let c = self.tree_cycles as f64;
+            eprintln!(
+                "[qwen4-tree-stats] cycles={} mean_T={:.2} mean_acc={:.2} noncontig={} lookup_acc={} propose_ms={:.2} verify_ms={:.2} cost=({:.1}+{:.2}*T) fixed={:?}",
+                self.tree_cycles,
+                self.tree_nodes_sum as f64 / c,
+                self.tree_accepted_sum as f64 / c,
+                self.tree_noncontig_commits,
+                self.tree_lookup_accepted,
+                (self.tree_propose_us as f64 / c) / 1000.0,
+                (self.tree_verify_us as f64 / c) / 1000.0,
+                self.tree_cost_model.base_ms,
+                self.tree_cost_model.slope_ms,
+                self.tree_fixed_max_nodes,
+            );
         }
-        self.decoder.restore_state(state);
-        let fused = self.draft.fuse_context(&rows)?;
-        self.context.append(
-            self.draft,
-            &fused,
-            verified.position as i32,
-            &verified.tokens[..keep],
-        )?;
-        self.context.eval()
+        self.decoder.settle_cuda_pending_gdn()?;
+        if self.decoder.paged.is_none() && super::super::cuda_qwen4_fast_enabled() {
+            self.decoder.sync_cuda_pending_states()?;
+            self.context.eval()?;
+        }
+        Ok(())
     }
 
     fn eval_boundary(&self, token: &MxArray) {
@@ -492,7 +714,306 @@ impl DsparkStepper for DraftStepper<'_> {
             .collect();
         self.context.collect_arrays(&mut arrays);
         arrays.push(token);
-        MxArray::async_eval_arrays(&arrays);
+        if self.decoder.paged.is_none() && super::super::cuda_qwen4_fast_enabled() {
+            Decoder::cuda_async_eval(&arrays);
+        } else {
+            MxArray::async_eval_arrays(&arrays);
+        }
+    }
+
+    fn supports_tree_verify(&self) -> bool {
+        self.tree_enabled
+    }
+
+    fn observe_emitted_tokens(&mut self, tokens: &[u32]) {
+        if self.tree_enabled && self.lookup_enabled && !tokens.is_empty() {
+            self.lookup_index.append(tokens);
+        }
+    }
+
+    fn verify_tree_greedy(
+        &mut self,
+        anchor: u32,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<DsparkTreeGreedyResult> {
+        if !self.tree_enabled {
+            return Err(Error::from_reason(
+                "Qwen4 DFlash2 tree verification is not enabled on this stepper",
+            ));
+        }
+        if self.verified.is_some() {
+            return Err(Error::from_reason(
+                "Qwen4 draft: the last verify was not committed",
+            ));
+        }
+        let position = self.decoder.history.len();
+        if usize::try_from(self.context.logical_len()).ok() != Some(position) {
+            return Err(Error::from_reason(format!(
+                "Qwen4 draft tree: context ends at {}, target at {position}",
+                self.context.logical_len()
+            )));
+        }
+
+        let t_propose = std::time::Instant::now();
+        let draft_slots = self.draft.config.block_size;
+        let (candidates, scores) = self.draft.propose_tree_lattice_arrays_embedded(
+            &mut self.decoder.draft_view_with_limit(None),
+            self.context,
+            anchor,
+            draft_slots,
+        )?;
+
+        let lookup_info = self.lookup_index.match_info();
+        let eff_max_depth = max_depth.min(MAX_LOOKUP_CHAIN);
+        let max_cap = max_nodes.clamp(1, MAX_TREE_NODES);
+        let lookup_cap = MAX_LOOKUP_CHAIN.min(eff_max_depth);
+        let lookup_proposals = if self.lookup_enabled && lookup_cap > 0 {
+            self.lookup_index.proposals(lookup_cap)
+        } else {
+            Vec::new()
+        };
+        let lookup_len = if lookup_info.match_len >= LookupIndex::MIN_MATCH {
+            lookup_proposals.len().min(MAX_LOOKUP_CHAIN)
+        } else {
+            0
+        };
+
+        // Optional GPU `select_tree_cuda` when a fixed tree width is pinned and
+        // `MLX_QWEN4_GPU_TREE=1`; otherwise evaluate the 7.6 KB lattice on host
+        // and run MoE-cost-aware adaptive sizing `T* = argmax E[T] / Cost(T)`
+        // (or fixed-width `build_verify_tree` when `MLX_QWEN4_TREE_MAX_NODES` is set).
+        let (tree, views, lattice_opt, agreements_opt) = if let Some(fixed) =
+            self.tree_fixed_max_nodes
+            && self.gpu_tree_enabled
+            && crate::accelerator::cuda_ops_available()
+        {
+            let node_budget = max_cap.min(fixed);
+            let mut lt = [0i32; MAX_TREE_NODES];
+            for (dst, &tok) in lt.iter_mut().zip(lookup_proposals.iter().take(lookup_len)) {
+                *dst = tok as i32;
+            }
+            let mut lr = [0.0f32; MAX_TREE_NODES * 4];
+            if lookup_len > 0 {
+                let agreements = [
+                    LookupAgreement::Top,
+                    LookupAgreement::Candidate,
+                    LookupAgreement::Absent,
+                    LookupAgreement::Unknown,
+                ];
+                for d in 0..lookup_len {
+                    for &ag in &agreements {
+                        lr[d * 4 + ag as usize] =
+                            self.lookup_acceptance
+                                .rate(false, lookup_info.match_len, d, ag);
+                    }
+                }
+            }
+            let budget_acc = self.verify_budget.acceptance(false);
+            let mut bi = [0.0f32; 8];
+            bi[..DRAFT_SLOTS].copy_from_slice(&budget_acc.intercepts);
+            let lookup_tokens_arr = MxArray::from_int32(&lt, &[MAX_TREE_NODES as i64])?;
+            let lookup_rates_arr = MxArray::from_float32(&lr, &[MAX_TREE_NODES as i64, 4])?;
+            let budget_intercepts_arr = MxArray::from_float32(&bi, &[8])?;
+            if let Some(sel) = crate::kernels::dflash2::select_tree_cuda(
+                &candidates,
+                &scores,
+                &lookup_tokens_arr,
+                &lookup_rates_arr,
+                &budget_intercepts_arr,
+                anchor,
+                lookup_len as i32,
+                node_budget as i32,
+                eff_max_depth as i32,
+                budget_acc.slope,
+            )? {
+                MxArray::eval_arrays_with_context(
+                    &[&sel.tree_tokens, &sel.parent, &sel.node_meta],
+                    "qwen4::gpu_tree_select",
+                )?;
+                let raw_tokens = sel.tree_tokens.to_uint32()?.to_vec();
+                let raw_parent = sel.parent.to_int32()?.to_vec();
+                let raw_meta = sel.node_meta.to_float32()?.to_vec();
+                let (tree, agreements, _) =
+                    VerifyTree::from_gpu_readback(&raw_tokens, &raw_parent, &raw_meta)?;
+                let views = if tree.len() == node_budget {
+                    TreeDeviceViews {
+                        depths_i32: sel.depths,
+                        mask_u32: sel.ancestors_mask,
+                        parent_i32: sel.parent,
+                        conv_taps_i32: sel.conv_taps,
+                        tree_len: node_budget,
+                    }
+                } else {
+                    tree.to_device_views()?
+                };
+                (tree, views, None, Some(agreements))
+            } else {
+                let lattice = self
+                    .draft
+                    .lattice_from_arrays(&candidates, &scores, draft_slots)?;
+                let tree = build_verify_tree(
+                    anchor,
+                    &lattice,
+                    &lookup_proposals,
+                    lookup_info.match_len,
+                    node_budget,
+                    Some(eff_max_depth),
+                    false,
+                    &self.verify_budget,
+                    &self.lookup_acceptance,
+                );
+                let views = tree.to_device_views()?;
+                (tree, views, Some(lattice), None)
+            }
+        } else {
+            let lattice = self
+                .draft
+                .lattice_from_arrays(&candidates, &scores, draft_slots)?;
+            let tree = if let Some(fixed) = self.tree_fixed_max_nodes {
+                build_verify_tree(
+                    anchor,
+                    &lattice,
+                    &lookup_proposals,
+                    lookup_info.match_len,
+                    max_cap.min(fixed),
+                    Some(eff_max_depth),
+                    false,
+                    &self.verify_budget,
+                    &self.lookup_acceptance,
+                )
+            } else {
+                build_verify_tree_cost_aware(
+                    anchor,
+                    &lattice,
+                    &lookup_proposals,
+                    lookup_info.match_len,
+                    max_cap,
+                    Some(eff_max_depth),
+                    false,
+                    &self.verify_budget,
+                    &self.lookup_acceptance,
+                    &self.tree_cost_model,
+                )
+            };
+            let views = tree.to_device_views()?;
+            (tree, views, Some(lattice), None)
+        };
+        let propose_us = t_propose.elapsed().as_micros() as u64;
+
+        let t_verify = std::time::Instant::now();
+        let (logits, ticket) = self.decoder.verify_tree_deferred(&tree, &views)?;
+        let argmax = logits.argmax(-1, None)?;
+        MxArray::eval_arrays_with_context(&[&argmax], "qwen4::tree_greedy_accept")?;
+        let verify_us = t_verify.elapsed().as_micros() as u64;
+
+        let target_argmax: Vec<u32> = argmax.to_uint32()?.to_vec();
+        if target_argmax.len() != tree.len() {
+            return Err(Error::from_reason(format!(
+                "Qwen4 DFlash2 tree argmax length {} != tree length {}",
+                target_argmax.len(),
+                tree.len()
+            )));
+        }
+        let walk = tree.greedy_walk(&target_argmax);
+
+        let labels = tree.budget_labels(&walk.emitted_tokens);
+        self.verify_budget.observe(false, &labels);
+        if lookup_len > 0 {
+            let outcome = if let Some(ref lattice) = lattice_opt {
+                tree.lookup_outcome(
+                    &lookup_proposals[..lookup_len],
+                    &walk.emitted_tokens,
+                    lattice,
+                )
+            } else if let Some(ref agreements) = agreements_opt {
+                tree.lookup_outcome_with_agreements(
+                    &lookup_proposals[..lookup_len],
+                    &walk.emitted_tokens,
+                    agreements,
+                )
+            } else {
+                Default::default()
+            };
+            self.lookup_acceptance.observe(
+                false,
+                lookup_info.match_len,
+                &outcome.verified,
+                outcome.accepted,
+            );
+            self.tree_lookup_accepted += outcome.accepted;
+        }
+
+        let is_chain = tree.is_chain();
+        let draft_count = tree.depth.iter().copied().max().unwrap_or(0).max(0) as usize;
+        let accepted_draft_count = walk.accepted_nodes.len().saturating_sub(1);
+        let tree_nodes = tree.len();
+        self.tree_cycles += 1;
+        self.tree_nodes_sum += tree_nodes;
+        self.tree_accepted_sum += walk.emitted_tokens.len();
+        self.tree_propose_us += propose_us;
+        self.tree_verify_us += verify_us;
+
+        self.verified = Some(Verified::TreeDeferred {
+            position,
+            is_chain,
+            ticket,
+        });
+        Ok(DsparkTreeGreedyResult {
+            accepted_nodes: walk.accepted_nodes,
+            emitted_tokens: walk.emitted_tokens,
+            is_contiguous_prefix: walk.is_contiguous_prefix,
+            draft_count,
+            tree_nodes,
+            accepted_draft_count,
+        })
+    }
+
+    fn commit_tree(&mut self, accepted_nodes: &[usize], is_contiguous_prefix: bool) -> Result<()> {
+        let verified = self
+            .verified
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen4 draft tree commit has no verify"))?;
+        let Verified::TreeDeferred {
+            position,
+            is_chain,
+            ticket,
+        } = verified
+        else {
+            return Err(Error::from_reason(
+                "Qwen4 draft tree commit called on a non-tree verify",
+            ));
+        };
+        let keep = accepted_nodes.len();
+        let total = ticket.tree_tokens.len();
+        if keep == 0 || keep > total || accepted_nodes[0] != 0 {
+            return Err(Error::from_reason(format!(
+                "Qwen4 draft tree commit invalid accepted_nodes {accepted_nodes:?} for T={total}"
+            )));
+        }
+        let accepted_tokens: Vec<u32> = accepted_nodes
+            .iter()
+            .map(|&idx| ticket.tree_tokens[idx])
+            .collect();
+        if !is_contiguous_prefix {
+            self.tree_noncontig_commits += 1;
+        }
+        let passes = self.decoder.take_hidden_taps();
+        let rows = tapped_tree_rows(&passes, position, accepted_nodes, is_contiguous_prefix)?;
+        drop(passes);
+        self.decoder.commit_tree_deferred(
+            ticket,
+            accepted_nodes,
+            is_contiguous_prefix,
+            is_chain,
+        )?;
+        let fused = self.draft.fuse_context(&rows)?;
+        self.context
+            .append(self.draft, &fused, position as i32, &accepted_tokens)?;
+        // Leave commit + context append lazy on CUDA: `eval_boundary` flushes
+        // caches + context + boundary token asynchronously via `cuda_async_eval`,
+        // overlapping commit with the next cycle's draft proposal.
+        Ok(())
     }
 }
 
@@ -525,10 +1046,11 @@ pub(in super::super) fn load_draft(dir: &Path, c: &Config) -> Result<Arc<DFlash2
     config
         .validate_target(shape)
         .map_err(|error| refused(error.reason))?;
-    let (model, _) = load_dflash2(dir).map_err(|error| refused(error.reason))?;
+    let (mut model, _) = load_dflash2(dir).map_err(|error| refused(error.reason))?;
     model
         .validate_target(shape)
         .map_err(|error| refused(error.reason))?;
+    model.configure_dense_execution();
     Ok(Arc::new(model))
 }
 
@@ -645,23 +1167,17 @@ impl super::super::Inner {
             slot.context.reset();
             slot.seq = self.active_seq;
         }
-        let stepper = DraftStepper::new(&mut self.decoder, &slot.model, &mut slot.context, rows)?;
+        #[allow(unused_mut)]
+        let mut stepper =
+            DraftStepper::new(&mut self.decoder, &slot.model, &mut slot.context, rows)?;
         #[cfg(test)]
-        let stepper = match slot.forced.as_mut() {
-            Some(forced) => DraftStepper {
-                forced: Some(Box::new(move |position, ids: &[u32]| forced(position, ids))),
-                ..stepper
-            },
-            None => stepper,
-        };
+        if let Some(forced) = slot.forced.as_mut() {
+            stepper.forced = Some(Box::new(move |position, ids: &[u32]| forced(position, ids)));
+        }
         #[cfg(test)]
-        let stepper = match slot.drawn.as_mut() {
-            Some(drawn) => DraftStepper {
-                drawn: Some(Box::new(drawn)),
-                ..stepper
-            },
-            None => stepper,
-        };
+        if let Some(drawn) = slot.drawn.as_mut() {
+            stepper.drawn = Some(Box::new(drawn));
+        }
         Ok(Some(stepper))
     }
 
@@ -836,5 +1352,240 @@ impl super::super::Inner {
     #[cfg(test)]
     pub(in super::super) fn draft_slot(&mut self) -> Option<&mut DraftSlot> {
         self.draft.as_mut()
+    }
+
+    fn flat_dflash2_fail_closed(&mut self, error: Error) -> Error {
+        self.decoder.draft_taps_off();
+        self.decoder.reset();
+        self.saved_history.clear();
+        if let Some(slot) = self.draft.as_mut() {
+            slot.context.reset();
+            slot.seq = None;
+            slot.turn = None;
+        }
+        error
+    }
+
+    /// Off-Metal (Windows CUDA) flat-KV DFlash2 speculative turn: tapped
+    /// prefill into the preallocated flat BF16 KV cache + eager verify/rollback
+    /// via `DraftStepper` and `run_dspark_turn`.
+    pub(in super::super) fn flat_dflash2_turn(
+        &mut self,
+        args: &mut crate::engine::backend::WholeTurnArgs<'_>,
+    ) -> Result<crate::engine::backend::TurnOutput> {
+        use crate::decode_profiler::DecodeProfiler;
+        use crate::engine::backend::{ChatBackend, FinalizeArgs, TurnOutput};
+        use crate::engine::decode::TurnStreaming;
+        use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
+        use crate::engine::finalize::compute_performance_metrics;
+        use crate::engine::params::generated_capacity_hint;
+        use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+        use crate::stream::{Stream, StreamContext};
+        use std::time::Instant;
+
+        let tokenizer = args.tokenizer.clone();
+        let tokens = args.tokens.to_vec();
+        if tokens.is_empty() {
+            return Err(Error::from_reason(
+                "qwen4_exp flat DFlash2 turn requires at least one prompt token",
+            ));
+        }
+        if tokens.len() > self.decoder.context_window {
+            return Err(Error::from_reason(format!(
+                "qwen4_exp prompt exceeds the {}-token window of the memory plan",
+                self.decoder.context_window
+            )));
+        }
+        let is_delta = args.plan.is_delta;
+        let is_streaming = args.sink.is_some();
+        let mut params = ChatBackend::resolve_params(self, args.config);
+        params.extra_eos_ids = ChatBackend::extra_eos_ids(self);
+        let reuse_cache = params.reuse_cache;
+        let report_performance = params.report_performance;
+
+        let draft_model = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| {
+                Error::from_reason("qwen4_exp flat DFlash2 turn requires an attached draft")
+            })?
+            .model
+            .clone();
+
+        // Start cold so flat target state and DFlash2 context stay aligned.
+        self.decoder.reset();
+        self.saved_history.clear();
+        if let Some(slot) = self.draft.as_mut() {
+            slot.context.reset();
+            slot.seq = self.active_seq;
+            slot.turn = self.active_seq;
+            slot.record = DraftRecord::new();
+        }
+        if let Err(error) = self.decoder.draft_taps_on(&draft_model) {
+            return Err(self.flat_dflash2_fail_closed(error));
+        }
+
+        let generation_start = report_performance.then(Instant::now);
+        let mut profiler = DecodeProfiler::new(
+            ChatBackend::profiler_label(self, is_delta, is_streaming),
+            ChatBackend::family_name(self),
+        );
+        profiler.set_prompt_tokens(tokens.len() as u32);
+        profiler.snapshot_memory_before();
+        let progress = args.sink.and_then(|sink| sink.progress());
+        if let Some(progress) = progress {
+            progress.begin_prefill(tokens.len() as u32, 0);
+        }
+        profiler.begin_prefill();
+        let generation_stream = Stream::generation();
+        let last_logits = {
+            let _context = StreamContext::new(generation_stream);
+            self.decoder
+                .prefill_prompt(&tokens)
+                .and_then(|logits| logits.squeeze(Some(&[1])))
+        };
+        let last_logits = match last_logits {
+            Ok(logits) => logits,
+            Err(error) => return Err(self.flat_dflash2_fail_closed(error)),
+        };
+        if let Some(slot) = self.draft.as_mut()
+            && let Err(error) = self.decoder.draft_follow(&draft_model, &mut slot.context)
+        {
+            return Err(self.flat_dflash2_fail_closed(error));
+        }
+        profiler.end_prefill();
+
+        let mut token_history = tokens.clone();
+        let y = match apply_all_penalties(last_logits, &token_history, &params)
+            .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
+        {
+            Ok(token) => token,
+            Err(error) => return Err(self.flat_dflash2_fail_closed(error)),
+        };
+        y.eval();
+        if let Some(progress) = progress {
+            progress.first_token();
+        }
+        let mut first_token_instant = report_performance.then(Instant::now);
+
+        let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
+        let mut finish_reason = String::from("length");
+        let close = tokenizer.think_end(args.config);
+        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, &close);
+        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
+        let mut turn_streaming = args.sink.map(|_| {
+            TurnStreaming::new(
+                self,
+                tokenizer.inner(),
+                args.thinking.enabled,
+                stream_skip_special,
+            )
+        });
+        let turn_token_observer = ChatBackend::turn_token_observer(self);
+        let block_size = (DRAFT_VERIFY_ROWS - 1).min(draft_model.config.block_size.max(1));
+        let mut rng = rand::rng();
+        let outcome = {
+            let streaming = turn_streaming
+                .as_mut()
+                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
+            run_dspark_turn(
+                self,
+                &mut rng,
+                DsparkTurnArgs {
+                    y,
+                    block_size,
+                    params: &params,
+                    reasoning_tracker: &mut reasoning,
+                    profiler: &mut profiler,
+                    max_new_tokens: params.max_new_tokens,
+                    eos_id: args.eos_id,
+                    generated_tokens: &mut generated,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: report_performance,
+                    generation_stream,
+                    cancel_flag: args.cancelled,
+                    turn_token_observer,
+                },
+                streaming,
+            )
+        };
+        if let Err(error) = outcome {
+            return Err(self.flat_dflash2_fail_closed(error));
+        }
+        self.decoder.draft_taps_off();
+        if let Some(slot) = self.draft.as_mut() {
+            slot.turn = None;
+        }
+        let performance = if report_performance {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                tokens.len(),
+                generated.len(),
+            )
+            .map(|mut metrics| {
+                ChatBackend::augment_performance(self, &profiler, &mut metrics);
+                metrics
+            })
+        } else {
+            None
+        };
+        if reuse_cache {
+            self.saved_history = self.decoder.history.clone();
+        } else {
+            self.decoder.reset();
+            self.saved_history.clear();
+            if let Some(slot) = self.draft.as_mut() {
+                slot.context.reset();
+                slot.seq = None;
+            }
+        }
+
+        let reasoning = reasoning.outcome();
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+            let decoded = tokenizer
+                .decode_sync(&generated, stream_skip_special)
+                .unwrap_or_default();
+            ts.flush_residual(&decoded, params.include_reasoning, sink);
+        }
+        let mut result = ChatBackend::finalize_turn(
+            self,
+            FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &generated,
+                finish_reason,
+                think_end_id: close.think_end_id,
+                think_end_str: close.think_end_str.as_deref(),
+                think_end_extra_ids: &close.think_end_extra_ids,
+                performance,
+                include_reasoning: params.include_reasoning,
+                thinking_enabled: args.thinking.enabled,
+                prompt_tokens: tokens.len() as u32,
+                reasoning,
+            },
+        )?;
+        result.cached_tokens = 0;
+        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+            ts.emitter.finish(&result, sink);
+            Ok(TurnOutput::Streamed)
+        } else {
+            Ok(TurnOutput::Complete(Box::new(result)))
+        }
+    }
+}
+
+impl crate::engine::backend::DsparkBackend for super::super::Inner {
+    type DsparkDecode<'a>
+        = DraftStepper<'a>
+    where
+        Self: 'a;
+
+    fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>> {
+        let rows = (block_size + 1).clamp(2, DRAFT_VERIFY_ROWS);
+        self.draft_stepper(rows)?.ok_or_else(|| {
+            Error::from_reason("qwen4_exp flat DFlash2 turn requires an attached draft")
+        })
     }
 }

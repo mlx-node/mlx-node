@@ -1320,6 +1320,45 @@ impl VerifyTree {
         })
     }
 
+    /// Compute dilated depthwise conv taps (`k=4, dilation=3`, Qwen4 Layer-1 PLE)
+    /// for every node in this tree.
+    ///
+    /// For node `i`: `t3 = i`, `t2 = back3(t3)`, `t1 = back3(t2)`, `t0 = back3(t1)`
+    /// where `step_back(x) = if x >= 0 { parent[x] } else { x - 1 }` applied 3 times.
+    /// Negative values `-k` read `history[9 - k]` (`< -9` reads `0.0`).
+    /// On a linear chain, `ple_conv_taps[i] == [i - 9, i - 6, i - 3, i]`.
+    pub(crate) fn ple_conv_taps(&self) -> Vec<[i32; 4]> {
+        let step_back = |idx: i32| -> i32 {
+            if idx >= 0 {
+                self.parent[idx as usize]
+            } else {
+                idx - 1
+            }
+        };
+        let back3 = |idx: i32| -> i32 { step_back(step_back(step_back(idx))) };
+        let mut out = Vec::with_capacity(self.parent.len());
+        for i in 0..self.parent.len() {
+            let t3 = i as i32;
+            let t2 = back3(t3);
+            let t1 = back3(t2);
+            let t0 = back3(t1);
+            out.push([t0, t1, t2, t3]);
+        }
+        out
+    }
+
+    /// Upload [`Self::ple_conv_taps`] as an `[T, 4]` `Int32` tensor for
+    /// `kernels::qwen4::ple_gate_conv_tree_cuda`.
+    pub(crate) fn ple_conv_taps_i32(&self) -> Result<MxArray> {
+        let taps = self.ple_conv_taps();
+        let t = taps.len();
+        let mut flat = Vec::with_capacity(t * 4);
+        for row in &taps {
+            flat.extend_from_slice(row);
+        }
+        MxArray::from_int32(&flat, &[t as i64, 4])
+    }
+
     /// Walk the tree greedily given `target_argmax[i]` (the target model's
     /// argmax next-token prediction at tree node `i`).
     pub(crate) fn greedy_walk(&self, target_argmax: &[u32]) -> TreeWalkResult {
@@ -1670,6 +1709,82 @@ fn expand_draft_children(
     }
 }
 
+/// Linear per-cycle verify cost model `Cost(T) = base_ms + slope_ms * T` used
+/// for MoE-cost-aware adaptive tree sizing (Splash `rising=true` step costs).
+///
+/// On 512-expert top-10 MoE (`qwen4_exp`), unique active experts grow almost
+/// linearly with tree size `T`, so blindly verifying 16 nodes wastes bandwidth
+/// on low-confidence prose while under-verifying `M=4` starves high-confidence
+/// coding and prompt-lookup stretches. Selecting
+/// `T* = argmax_{T in min_nodes..=max_nodes} E[T] / Cost(T)` over the best-first
+/// prefix before DFS renumbering dynamically picks the throughput-optimal tree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeCostModel {
+    pub base_ms: f64,
+    pub slope_ms: f64,
+    pub min_nodes: usize,
+    /// When true, restrict candidate `T*` to [`Self::CANONICAL_BUCKETS`] so
+    /// CUDA NVRTC compiles at most 5 tree widths (`4, 6, 8, 12, 16`) instead
+    /// of every integer `2..=16`.
+    pub bucketed: bool,
+}
+
+impl TreeCostModel {
+    /// Canonical verify widths aligned with CUDA `sdpa_tc_few` (`NUM_WARPS`)
+    /// and `qwen4_moe_few` (`ALLOW_HI`) specializations.
+    pub(crate) const CANONICAL_BUCKETS: [usize; 6] = [2, 4, 6, 8, 12, 16];
+
+    /// Calibrated from live 125B-A6B (`qwen4_exp`) 512-expert top-10 MoE
+    /// `M in {4, 6, 8, 12, 16}` sweeps at 9400 MHz (`Cost(T) ≈ 48.0 + 3.5 * T`).
+    pub(crate) const QWEN4_MOE_DEFAULT: Self = Self {
+        base_ms: 48.0,
+        slope_ms: 3.5,
+        min_nodes: 4,
+        bucketed: true,
+    };
+
+    #[inline]
+    pub(crate) fn cost_ms(&self, nodes: usize) -> f64 {
+        (self.base_ms + self.slope_ms * (nodes as f64)).max(1.0e-3)
+    }
+
+    #[inline]
+    fn is_allowed_size(&self, t: usize) -> bool {
+        !self.bucketed || Self::CANONICAL_BUCKETS.contains(&t)
+    }
+
+    /// Pick `T* in min_nodes.min(n)..=n` maximizing expected tokens per ms
+    /// `E[T] / Cost(T)` where `estimates[0..n]` are in best-first insertion order.
+    pub(crate) fn choose_tree_size(&self, estimates: &[f32]) -> usize {
+        let n = estimates.len();
+        if n <= 1 {
+            return n;
+        }
+        let lo = self.min_nodes.clamp(1, n);
+        let mut expected = 0.0f64;
+        let mut best_t = 0usize;
+        let mut best_rate = f64::NEG_INFINITY;
+        for (idx, &e) in estimates.iter().enumerate() {
+            expected += f64::from(e.max(0.0));
+            let t = idx + 1;
+            if t < lo || !self.is_allowed_size(t) {
+                continue;
+            }
+            let rate = expected / self.cost_ms(t);
+            if rate > best_rate {
+                best_rate = rate;
+                best_t = t;
+            }
+        }
+        if best_t == 0 {
+            // Tail of turn where `n` falls below the smallest bucket >= `lo`.
+            n
+        } else {
+            best_t
+        }
+    }
+}
+
 /// Build a DFS-preorder speculative verification tree (up to `max_nodes <= 16`)
 /// combining DFlash2's candidate `lattice` and suffix-automaton
 /// `lookup_proposals`.
@@ -1695,6 +1810,63 @@ pub(crate) fn build_verify_tree(
     samples: bool,
     budget: &VerifyBudget,
     lookup_acc: &LookupAcceptance,
+) -> VerifyTree {
+    build_verify_tree_inner(
+        anchor,
+        lattice,
+        lookup_proposals,
+        lookup_match_len,
+        max_nodes,
+        max_depth,
+        samples,
+        budget,
+        lookup_acc,
+        None,
+    )
+}
+
+/// Like [`build_verify_tree`], but truncates the best-first candidate tree to
+/// the throughput-optimal size `T* = argmax E[T] / Cost(T)` under `cost_model`
+/// BEFORE DFS preorder renumbering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_verify_tree_cost_aware(
+    anchor: u32,
+    lattice: &DraftLattice,
+    lookup_proposals: &[u32],
+    lookup_match_len: usize,
+    max_nodes: usize,
+    max_depth: Option<usize>,
+    samples: bool,
+    budget: &VerifyBudget,
+    lookup_acc: &LookupAcceptance,
+    cost_model: &TreeCostModel,
+) -> VerifyTree {
+    build_verify_tree_inner(
+        anchor,
+        lattice,
+        lookup_proposals,
+        lookup_match_len,
+        max_nodes,
+        max_depth,
+        samples,
+        budget,
+        lookup_acc,
+        Some(cost_model),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_verify_tree_inner(
+    anchor: u32,
+    lattice: &DraftLattice,
+    lookup_proposals: &[u32],
+    lookup_match_len: usize,
+    max_nodes: usize,
+    max_depth: Option<usize>,
+    samples: bool,
+    budget: &VerifyBudget,
+    lookup_acc: &LookupAcceptance,
+    cost_model: Option<&TreeCostModel>,
 ) -> VerifyTree {
     let most = max_nodes.clamp(1, MAX_TREE_NODES);
     let deepest = max_depth
@@ -1875,6 +2047,15 @@ pub(crate) fn build_verify_tree(
                 });
             }
         }
+    }
+
+    // MoE-cost-aware truncation BEFORE DFS preorder renumbering: `grown` is in
+    // strictly best-first order and every node's parent appears earlier, so any
+    // prefix `grown[..best_t]` is a valid rooted subtree with highest `E[T]`.
+    if let Some(cost) = cost_model {
+        let best_estimates: Vec<f32> = grown.iter().map(|n| n.estimate).collect();
+        let best_t = cost.choose_tree_size(&best_estimates);
+        grown.truncate(best_t);
     }
 
     // DFS preorder renumbering with highest-probability child visited first.
@@ -3113,6 +3294,128 @@ mod tests {
             15,
             &budget,
             &lookup_acc,
+        );
+    }
+
+    #[test]
+    fn ple_conv_taps_match_linear_chain_and_branching_ancestors() {
+        // Linear chain: taps[i] == [i-9, i-6, i-3, i].
+        let chain = VerifyTree::from_chain(&(0..12u32).collect::<Vec<_>>()).unwrap();
+        let taps = chain.ple_conv_taps();
+        assert_eq!(taps.len(), 12);
+        for (i, &row) in taps.iter().enumerate() {
+            let ii = i as i32;
+            assert_eq!(row, [ii - 9, ii - 6, ii - 3, ii], "chain node {i}");
+        }
+
+        // Branching tree:
+        // 0(-1) -> 1(0) -> 2(1) -> 3(2) -> 4(3)
+        //       -> 5(0) -> 6(5) -> 7(6) -> 8(7)
+        let parent = vec![-1i32, 0, 1, 2, 3, 0, 5, 6, 7];
+        let tree = VerifyTree {
+            tokens: (0..9u32).collect(),
+            parent: parent.clone(),
+            depth: vec![0, 1, 2, 3, 4, 1, 2, 3, 4],
+            ancestors_mask: vec![1; 9],
+            conv_taps: compute_conv_taps(&parent),
+            draft_probs: vec![1.0; 9],
+            estimates: vec![1.0; 9],
+            caps: vec![1.0; 9],
+            on_chain: vec![false; 9],
+        };
+        let btaps = tree.ple_conv_taps();
+        assert_eq!(btaps[0], [-9, -6, -3, 0]);
+        assert_eq!(btaps[3], [-6, -3, 0, 3]);
+        assert_eq!(btaps[4], [-5, -2, 1, 4]);
+        // Second branch node 8: path 0 -> 5 -> 6 -> 7 -> 8, so 3 back = 5, 6 back = -2, 9 back = -5.
+        assert_eq!(btaps[5], [-8, -5, -2, 5]);
+        assert_eq!(btaps[7], [-6, -3, 0, 7]);
+        assert_eq!(btaps[8], [-5, -2, 5, 8]);
+    }
+
+    #[test]
+    fn cost_aware_tree_sizing_adapts_from_prose_to_high_confidence_lookup() {
+        let cost = TreeCostModel::QWEN4_MOE_DEFAULT;
+        let budget = VerifyBudget::new();
+        let lookup_acc = LookupAcceptance::new();
+
+        // 1. Low-confidence prose: flat softmax (high entropy) -> picks small T* <= 6.
+        let slots = DRAFT_SLOTS;
+        let top_k = DRAFT_CANDIDATES;
+        let mut prose_cands = Vec::with_capacity(slots * top_k);
+        let mut prose_scores = vec![0.0f32; slots * top_k * top_k];
+        for pos in 0..slots {
+            for c in 0..top_k {
+                prose_cands.push((100 + pos * 32 + c) as u32);
+            }
+            let num_pred = if pos == 0 { 1 } else { top_k };
+            for pred in 0..num_pred {
+                let row = (pos * top_k + pred) * top_k;
+                // Modest top-1 margin (~0.45 prob), flat tail.
+                prose_scores[row] = 2.0;
+                prose_scores[row + 1] = 1.0;
+                for c in 2..top_k {
+                    prose_scores[row + c] = 0.0;
+                }
+            }
+        }
+        let prose_lattice =
+            DraftLattice::from_selector_scores(&prose_cands, &prose_scores, slots, top_k);
+        let prose_tree = build_verify_tree_cost_aware(
+            1,
+            &prose_lattice,
+            &[],
+            0,
+            16,
+            Some(15),
+            false,
+            &budget,
+            &lookup_acc,
+            &cost,
+        );
+        assert_tree_invariants(&prose_tree);
+        assert!(
+            (4..=6).contains(&prose_tree.len())
+                && TreeCostModel::CANONICAL_BUCKETS.contains(&prose_tree.len()),
+            "high-entropy prose should pick compact canonical bucket in 4..=6, got {}",
+            prose_tree.len()
+        );
+
+        // 2. High-confidence coding + long verbatim SAM lookup match (match_len=40):
+        //    picks wide T* >= 10 up to 16!
+        let mut code_scores = vec![-10.0f32; slots * top_k * top_k];
+        for pos in 0..slots {
+            let num_pred = if pos == 0 { 1 } else { top_k };
+            for pred in 0..num_pred {
+                let row = (pos * top_k + pred) * top_k;
+                code_scores[row] = 8.0; // ~0.999 probability on top-1 chain
+            }
+        }
+        let code_lattice =
+            DraftLattice::from_selector_scores(&prose_cands, &code_scores, slots, top_k);
+        let mut lookup: Vec<u32> = (0..slots)
+            .map(|d| code_lattice.token(d, code_lattice.top_candidate[d]))
+            .collect();
+        for extra in 0..8u32 {
+            lookup.push(9000 + extra);
+        }
+        let code_tree = build_verify_tree_cost_aware(
+            1,
+            &code_lattice,
+            &lookup,
+            40,
+            16,
+            Some(15),
+            false,
+            &budget,
+            &lookup_acc,
+            &cost,
+        );
+        assert_tree_invariants(&code_tree);
+        assert!(
+            code_tree.len() >= 12 && TreeCostModel::CANONICAL_BUCKETS.contains(&code_tree.len()),
+            "high-confidence coding + SAM lookup should expand to canonical bucket >= 12, got {}",
+            code_tree.len()
         );
     }
 }

@@ -63,14 +63,38 @@ impl GpuRepackKind {
     }
 }
 
-/// Metal is available and `paged_attn.metallib` holds every repack kernel.
+/// Metal (`paged_attn.metallib`) or CUDA (`qwen4_gguf_repack.cu.inc`) GPU repack
+/// is available on this host.
 pub(crate) fn gpu_repack_available() -> bool {
     // SAFETY: nullary predicates that catch internally.
-    unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_gguf_repack_available() }
+    unsafe {
+        (mlx_sys::mlx_metal_is_available() || mlx_sys::mlx_cuda_is_available())
+            && mlx_sys::mlx_gguf_repack_available()
+    }
+}
+
+/// Whether the active GPU backend implements a repack kernel for `kind`.
+/// Metal supports all 12 kinds; CUDA implements the 5 Qwen3.8/GGUF kinds
+/// (`Q4K`, `Q5K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
+pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
+    if crate::accelerator::host_has_metal() {
+        true
+    } else if crate::accelerator::host_has_cuda() {
+        matches!(
+            kind,
+            GpuRepackKind::Q4K
+                | GpuRepackKind::Q5K
+                | GpuRepackKind::Q5_1
+                | GpuRepackKind::Q8_0
+                | GpuRepackKind::Q8_0Bias
+        )
+    } else {
+        false
+    }
 }
 
 pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
-    match t {
+    let kind = match t {
         GgufTensorType::Q4K => Some(GpuRepackKind::Q4K),
         GgufTensorType::Q5K => Some(GpuRepackKind::Q5K),
         GgufTensorType::Q6K => Some(GpuRepackKind::Q6K),
@@ -83,6 +107,11 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
         GgufTensorType::Q4_0 => Some(GpuRepackKind::Q4_0),
         GgufTensorType::Q5_1 => Some(GpuRepackKind::Q5_1),
         _ => None,
+    };
+    if crate::accelerator::host_has_cuda() && !crate::accelerator::host_has_metal() {
+        kind.filter(|&k| gpu_repack_supports_kind(k))
+    } else {
+        kind
     }
 }
 

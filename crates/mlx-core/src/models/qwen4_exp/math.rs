@@ -120,6 +120,184 @@ pub(super) fn routed_shared_experts(
     MxArray::from_handle(raw, "Qwen4 fused routed/shared experts").map(Some)
 }
 
+/// Fused CUDA MoE decode/verify primitive (`M in 1..=16`, `H=2560`, `D_FF=640`, `top_k <= 10`).
+///
+/// Accepts routed banks in `Q4_K`/`Q5_K` (gate/up) + `Q5_1`/`Q8_0Bias` (down) and optional
+/// shared expert `Q8_0Bias` banks with pre-sigmoid BF16 `shared_gate`.
+pub(super) fn cuda_moe_routed_shared_few(
+    x: &MxArray,
+    ids: &MxArray,
+    scores: &MxArray,
+    banks: &[std::sync::Arc<super::weights::Weight>; 3],
+    shared: Option<(&[std::sync::Arc<super::weights::Weight>; 3], &MxArray)>,
+) -> Result<Option<MxArray>> {
+    if !super::cuda_qwen4_fast_enabled() {
+        return Ok(None);
+    }
+    let shape = x.shape()?;
+    if x.dtype()? != DType::BFloat16
+        || shape.len() != 3
+        || shape[0] != 1
+        || !(1..=16).contains(&shape[1])
+        || shape[2] != 2560
+    {
+        return Ok(None);
+    }
+    let [gate, up, down] = banks;
+    let mode_gu = match gate.mode.as_str() {
+        "q4k" => 0,
+        "q5k" => 1,
+        _ => return Ok(None),
+    };
+    if gate.mode != up.mode
+        || gate.bits != up.bits
+        || down.mode != "affine"
+        || !matches!(down.bits, 5 | 8)
+        || banks.iter().any(|w| w.group != 32)
+    {
+        return Ok(None);
+    }
+    let (Some(gate_s), Some(gate_b), Some(up_s), Some(up_b), Some(down_s), Some(down_b)) = (
+        &gate.scales,
+        &gate.biases,
+        &up.scales,
+        &up.biases,
+        &down.scales,
+        &down.biases,
+    ) else {
+        return Ok(None);
+    };
+    let routed = crate::kernels::qwen4::Qwen4MoeRoutedWeights {
+        gate_w: &gate.values,
+        gate_s,
+        gate_b,
+        up_w: &up.values,
+        up_s,
+        up_b,
+        down_w: &down.values,
+        down_s,
+        down_b,
+        mode_gu,
+        bits_dn: down.bits,
+    };
+    let ids = if matches!(ids.dtype()?, DType::Int32 | DType::Uint32) {
+        ids.reshape(&[-1])?
+    } else {
+        ids.reshape(&[-1])?.astype(DType::Uint32)?
+    };
+    let scores_f32 = if scores.dtype()? == DType::Float32 {
+        scores.clone()
+    } else {
+        scores.astype(DType::Float32)?
+    };
+    let shared_weights = match shared {
+        Some(([sg, su, sd], sgate)) => {
+            if [sg, su, sd]
+                .iter()
+                .any(|w| w.mode != "affine" || w.bits != 8 || w.group != 32)
+                || sgate.dtype()? != DType::BFloat16
+            {
+                return Ok(None);
+            }
+            let (Some(ssg), Some(sbg), Some(ssu), Some(sbu), Some(ssd), Some(sbd)) = (
+                &sg.scales, &sg.biases, &su.scales, &su.biases, &sd.scales, &sd.biases,
+            ) else {
+                return Ok(None);
+            };
+            Some(crate::kernels::qwen4::Qwen4MoeSharedWeights {
+                gate_w: &sg.values,
+                gate_s: ssg,
+                gate_b: sbg,
+                up_w: &su.values,
+                up_s: ssu,
+                up_b: sbu,
+                down_w: &sd.values,
+                down_s: ssd,
+                down_b: sbd,
+                shared_gate: sgate,
+            })
+        }
+        None => None,
+    };
+    crate::kernels::qwen4::moe_routed_shared_few_cuda(
+        x,
+        &ids,
+        &scores_f32,
+        &routed,
+        shared_weights.as_ref(),
+    )
+}
+
+/// Fused CUDA MoE prefill primitive (`M >= 1`, routed + optional `sigmoid(shared_gate) * shared_out`).
+pub(super) fn cuda_moe_prefill(
+    x: &MxArray,
+    ids: &MxArray,
+    scores: &MxArray,
+    banks: &[std::sync::Arc<super::weights::Weight>; 3],
+    shared: Option<(&MxArray, &MxArray)>,
+) -> Result<Option<MxArray>> {
+    if !super::cuda_qwen4_fast_enabled() {
+        return Ok(None);
+    }
+    let shape = x.shape()?;
+    if x.dtype()? != DType::BFloat16 || shape.len() != 3 || shape[0] != 1 || shape[2] != 2560 {
+        return Ok(None);
+    }
+    let [gate, up, down] = banks;
+    let mode_gu = match gate.mode.as_str() {
+        "q4k" => 0,
+        "q5k" => 1,
+        _ => return Ok(None),
+    };
+    if gate.mode != up.mode
+        || gate.bits != up.bits
+        || down.mode != "affine"
+        || !matches!(down.bits, 5 | 8)
+        || banks.iter().any(|w| w.group != 32)
+    {
+        return Ok(None);
+    }
+    let (Some(gate_s), Some(gate_b), Some(up_s), Some(up_b), Some(down_s), Some(down_b)) = (
+        &gate.scales,
+        &gate.biases,
+        &up.scales,
+        &up.biases,
+        &down.scales,
+        &down.biases,
+    ) else {
+        return Ok(None);
+    };
+    if let Some((so, sg)) = shared
+        && (so.dtype()? != DType::BFloat16 || sg.dtype()? != DType::BFloat16)
+    {
+        return Ok(None);
+    }
+    let routed = crate::kernels::qwen4::Qwen4MoeRoutedWeights {
+        gate_w: &gate.values,
+        gate_s,
+        gate_b,
+        up_w: &up.values,
+        up_s,
+        up_b,
+        down_w: &down.values,
+        down_s,
+        down_b,
+        mode_gu,
+        bits_dn: down.bits,
+    };
+    let ids = if matches!(ids.dtype()?, DType::Int32 | DType::Uint32) {
+        ids.reshape(&[-1])?
+    } else {
+        ids.reshape(&[-1])?.astype(DType::Uint32)?
+    };
+    let scores_f32 = if scores.dtype()? == DType::Float32 {
+        scores.clone()
+    } else {
+        scores.astype(DType::Float32)?
+    };
+    crate::kernels::qwen4::moe_prefill_cuda(x, &ids, &scores_f32, &routed, shared)
+}
+
 /// Wide sorted assignments read the original token matrix. Every bank and row
 /// map remains an explicit graph input, including mutable partial-residency banks.
 pub(super) fn prefill_indirect(
@@ -456,13 +634,26 @@ pub(super) fn gdn_prepare(
     scale: &MxArray,
     dt: &MxArray,
 ) -> Result<Option<[MxArray; 5]>> {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
+    let use_metal = crate::engine::persistence::compiled_forward_backend_available();
+    let use_cuda = super::cuda_qwen4_fast_enabled();
+    if !use_metal && !use_cuda {
         return Ok(None);
     }
     let old = match state {
         Some(s) => s.clone(),
         None => MxArray::zeros(&[3, 10240], Some(DType::BFloat16))?,
     };
+    if use_cuda {
+        // qwen4 semantics: L2-style norm (`mean_eps = false`) and FP32 `beta`
+        // (`beta_input_dtype = false`), matching `math::l2` + `math::gdn_gates`.
+        let Some([q, k, v, decay, beta, history]) =
+            crate::kernels::gdn::prepare(qkv, a, b, conv, &old, scale, dt, false, false)?
+        else {
+            return Ok(None);
+        };
+        *state = Some(history);
+        return Ok(Some([q, k, v, decay, beta]));
+    }
     let mut outputs = [std::ptr::null_mut(); 6];
     if !unsafe {
         // qwen4 semantics: L2-style norm (eps on the sum) and f32 beta —
@@ -660,6 +851,47 @@ pub fn rope(
     theta: f64,
     yarn: Option<&Yarn>,
 ) -> Result<MxArray> {
+    if super::cuda_qwen4_fast_enabled() && yarn.is_none() {
+        let shape = x.shape()?;
+        if let Some(&width) = shape.last()
+            && dims > 0
+            && (dims as i64) <= width
+            && matches!(
+                x.dtype()?,
+                DType::BFloat16 | DType::Float16 | DType::Float32
+            )
+            && (shape.len() == 2 || shape.len() == 3 || (shape.len() == 4 && shape[2] == 1))
+        {
+            // Fast single-kernel CUDA RoPE (replaces 14-op mrope + H2D angle upload
+            // on 12x QSA indexer block appends and sparse query rotations).
+            let x4 = if shape.len() == 2 {
+                // [R, D] -> [1, R, 1, D] so every row receives the same `position`.
+                x.reshape(&[1, shape[0], 1, width])?
+            } else if shape.len() == 3 {
+                x.reshape(&[shape[0], shape[1], 1, width])?
+            } else {
+                x.clone()
+            };
+            let out = MxArray::from_handle(
+                unsafe {
+                    mlx_sys::mlx_fast_rope(
+                        x4.as_raw_ptr(),
+                        dims as i32,
+                        false,
+                        theta as f32,
+                        1.0,
+                        position as i32,
+                    )
+                },
+                "qwen4::math::rope_fast",
+            )?;
+            return if shape.len() == 4 {
+                Ok(out)
+            } else {
+                out.reshape(&shape)
+            };
+        }
+    }
     mrope(x, [position as i64; 3], dims, theta, [0; 3], true, yarn)
 }
 
@@ -1360,6 +1592,16 @@ pub fn hash_ids(
 }
 
 pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
+    if super::cuda_qwen4_fast_enabled()
+        && logits.ndim()? == 3
+        && logits.shape_at(0)? == 1
+        && logits.shape_at(2)? <= 512
+        && (1..=16).contains(&top)
+        && matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
+        && let Some(routes) = crate::kernels::qwen4::router_topk_cuda(logits, top)?
+    {
+        return Ok(Some(routes));
+    }
     if top != 10
         || *logits.shape()? != [1, 1, 512]
         || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
@@ -1380,6 +1622,16 @@ pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(M
 }
 
 pub(super) fn prefill_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
+    if super::cuda_qwen4_fast_enabled()
+        && logits.ndim()? == 3
+        && logits.shape_at(0)? == 1
+        && logits.shape_at(2)? <= 512
+        && (1..=16).contains(&top)
+        && matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
+        && let Some(routes) = crate::kernels::qwen4::router_topk_cuda(logits, top)?
+    {
+        return Ok(Some(routes));
+    }
     if top != 10
         || logits.ndim()? != 3
         || logits.shape_at(0)? != 1
@@ -1567,6 +1819,125 @@ impl QsaKernel {
             #[cfg(test)]
             Self::PairedHeads => 2,
         }
+    }
+}
+
+/// Vectorized flat-KV sparse QSA attention for non-Metal hosts (Windows CUDA
+/// Phase 0; Phase 2 hook point: replace with fused `mlx_qwen4_qsa_attention_cuda`
+/// once the CUDA kernel lands).
+///
+/// `q` is `[1, nh, t, hd]`, `keys`/`values` are `[1, kh, total_kv, hd]`,
+/// `selected` is `[1, t, topk]` (sorted block ids with `-1` for unused picks),
+/// and `query_ends` is `[1, t]` (exclusive end `base + j + 1`). Each query row
+/// attends to all tokens in its selected complete blocks plus its incomplete
+/// tail `[complete * block_size, query_end)`, matching `attention_projected`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qsa_attention_flat(
+    q: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    selected: &MxArray,
+    query_ends: &MxArray,
+    base: usize,
+    scale: f64,
+    block_size: usize,
+) -> Result<MxArray> {
+    const Q_CHUNK: usize = 32;
+    let q_shape = q.shape()?;
+    let k_shape = keys.shape()?;
+    let sel_shape = selected.shape()?;
+    let (nh, t, hd) = (q_shape[1], q_shape[2] as usize, q_shape[3]);
+    let kh = k_shape[1];
+    let topk = sel_shape[2];
+    let ratio = block_size.max(1);
+    let ratio_i64 = ratio as i64;
+    let tail_slots = ratio - 1;
+    let s_len = topk * ratio_i64 + tail_slots as i64;
+
+    let k_t = keys.squeeze(Some(&[0]))?.transpose(Some(&[1, 0, 2]))?;
+    let v_t = values.squeeze(Some(&[0]))?.transpose(Some(&[1, 0, 2]))?;
+    let zero = MxArray::scalar_int(0)?;
+    let ratio_scalar = MxArray::scalar_int(ratio as i32)?;
+    let block_offsets = MxArray::arange(0.0, ratio as f64, None, Some(DType::Int32))?
+        .reshape(&[1, 1, ratio_i64])?;
+    let tail_offsets = if tail_slots > 0 {
+        Some(
+            MxArray::arange(0.0, tail_slots as f64, None, Some(DType::Int32))?
+                .reshape(&[1, tail_slots as i64])?,
+        )
+    } else {
+        None
+    };
+
+    let mut chunks = Vec::with_capacity(t.div_ceil(Q_CHUNK));
+    for start in (0..t).step_by(Q_CHUNK) {
+        let len = Q_CHUNK.min(t - start);
+        let c_len = len as i64;
+        let sel_c = selected
+            .slice_axis(1, start as i64, (start + len) as i64)?
+            .squeeze(Some(&[0]))?;
+        let block_valid = sel_c
+            .greater_equal(&zero)?
+            .expand_dims(-1)?
+            .broadcast_to(&[c_len, topk, ratio_i64])?
+            .reshape(&[c_len, topk * ratio_i64])?;
+        let block_safe = sel_c.maximum(&zero)?;
+        let block_toks_raw = block_safe
+            .mul(&ratio_scalar)?
+            .expand_dims(-1)?
+            .add(&block_offsets)?
+            .reshape(&[c_len, topk * ratio_i64])?;
+        let block_toks = block_valid.where_(&block_toks_raw, &zero)?;
+
+        let (tok_ids, valid) = if let Some(tail_off) = &tail_offsets {
+            let ends_c = query_ends
+                .slice_axis(1, start as i64, (start + len) as i64)?
+                .squeeze(Some(&[0]))?
+                .expand_dims(-1)?;
+            let tail_starts: Vec<i32> = (start..start + len)
+                .map(|j| (((base + j + 1) / ratio) * ratio) as i32)
+                .collect();
+            let tail_starts = MxArray::from_int32(&tail_starts, &[c_len, 1])?;
+            let tail_toks_raw = tail_starts.add(tail_off)?;
+            let tail_valid = tail_toks_raw.less(&ends_c)?;
+            let tail_toks = tail_valid.where_(&tail_toks_raw, &zero)?;
+            (
+                MxArray::concatenate(&block_toks, &tail_toks, 1)?,
+                MxArray::concatenate(&block_valid, &tail_valid, 1)?,
+            )
+        } else {
+            (block_toks, block_valid)
+        };
+
+        let flat_ids = tok_ids.reshape(&[-1])?;
+        let k_sel = k_t
+            .take(&flat_ids, 0)?
+            .reshape(&[c_len, s_len, kh, hd])?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let v_sel = v_t
+            .take(&flat_ids, 0)?
+            .reshape(&[c_len, s_len, kh, hd])?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let q_c = q
+            .slice_axis(2, start as i64, (start + len) as i64)?
+            .squeeze(Some(&[0]))?
+            .transpose(Some(&[1, 0, 2]))?
+            .expand_dims(2)?;
+        let mask = valid.reshape(&[c_len, 1, 1, s_len])?;
+        let out_c =
+            crate::array::scaled_dot_product_attention(&q_c, &k_sel, &v_sel, scale, Some(&mask))?;
+        let out_c = out_c
+            .squeeze(Some(&[2]))?
+            .transpose(Some(&[1, 0, 2]))?
+            .expand_dims(0)?;
+        chunks.push(out_c);
+    }
+    if chunks.len() == 1 {
+        Ok(chunks.remove(0))
+    } else {
+        let out = MxArray::concatenate_many(chunks.iter().collect(), Some(2))?;
+        debug_assert_eq!(out.shape_at(1).ok(), Some(nh));
+        Ok(out)
     }
 }
 

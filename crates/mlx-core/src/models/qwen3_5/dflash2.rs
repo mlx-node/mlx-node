@@ -2215,8 +2215,22 @@ pub(crate) trait DFlash2TargetView {
     /// The head's logits of the draft's normed hidden rows.
     fn logits(&mut self, hidden: &MxArray) -> Result<MxArray>;
     /// The table and head as arrays a compiled draft may capture; `None`
-    /// keeps every proposal eager.
+    /// keeps every proposal eager unless [`Self::target_lm_head_qlinear`]
+    /// provides a resident quantized head for embedded-input compilation.
     fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)>;
+    /// Resident quantized `lm_head` projection when [`Self::traced`] is `None`
+    /// (e.g., external row-table embeddings), enabling CUDA spanned draft
+    /// heads and compiled embedded-input draft graphs.
+    fn target_lm_head_qlinear(&self) -> Option<&QuantizedLinear> {
+        None
+    }
+    /// Optional cap on how many leading proposal positions from the full
+    /// bidirectional draft block need `lm_head` + selector output (`None` =
+    /// all `max_len` positions). Exact because `CandidateSelector` is strictly
+    /// left-to-right causal across positions.
+    fn proposal_head_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A Qwen3.5 target: its `Embedding` and its head, or the tied table.
@@ -2313,22 +2327,32 @@ impl DFlash2Model {
     }
 
     /// Return cached materialized zero-copy `[0, 98_304)` and `[248_000, 248_320)`
-    /// views of a 248,320-row `Tiled64` K-quant target `lm_head`, or `None` for
-    /// dense, non-tiled, or non-248,320 heads.
+    /// views of a 248,320-row `Tiled64` K-quant (or CUDA affine Q8_0 g32) target
+    /// `lm_head`, or `None` for dense, unsupported, or non-248,320 heads.
     fn spanned_draft_heads(
         &self,
         target_lm_head: Option<&LinearProj>,
     ) -> Result<Option<Arc<SpannedDraftHeads>>> {
+        let Some(LinearProj::Quantized(ql)) = target_lm_head else {
+            return Ok(None);
+        };
+        self.spanned_draft_heads_ql(ql)
+    }
+
+    fn spanned_draft_heads_ql(
+        &self,
+        ql: &QuantizedLinear,
+    ) -> Result<Option<Arc<SpannedDraftHeads>>> {
         if self.config.vocab_size as i64 != SPANNED_VOCAB_SIZE {
             return Ok(None);
         }
-        let Some(head) = target_lm_head else {
-            return Ok(None);
-        };
-        let LinearProj::Quantized(ql) = head else {
-            return Ok(None);
-        };
-        if !ql.is_kquant_tiled() || head.packed_out_features()? != SPANNED_VOCAB_SIZE {
+        let cuda_affine_q8 = crate::accelerator::cuda_ops_available()
+            && ql.mode() == "affine"
+            && ql.bits() == 8
+            && ql.group_size() == 32;
+        if (!ql.is_kquant_tiled() && !cuda_affine_q8)
+            || ql.get_weight().shape_at(0)? != SPANNED_VOCAB_SIZE
+        {
             return Ok(None);
         }
         let weight_handle = &ql.get_weight().handle;
@@ -2804,6 +2828,216 @@ impl DFlash2Model {
         )))
     }
 
+    /// Compiled greedy proposal taking pre-embedded `[1, rows, hidden]` BF16
+    /// input (for targets whose token table lives outside an `Embedding`
+    /// struct, such as `qwen4_exp`), capturing the resident quantized target
+    /// `lm_head` (or its spanned view) as a graph constant.
+    #[allow(clippy::too_many_arguments)]
+    fn propose_compiled_embedded(
+        &self,
+        embedded: &MxArray,
+        anchor: u32,
+        target_lm_head: &QuantizedLinear,
+        spanned_heads: Option<&SpannedDraftHeads>,
+        context: &mut DFlash2ContextCache,
+        head_rows: i64,
+        with_confidence: bool,
+    ) -> Result<Option<(MxArray, Option<MxArray>)>> {
+        if self.compiled.disabled.load(Ordering::Relaxed)
+            || unsafe { sys::mlx_default_device() } != 1
+            || self.selector.top_k > 64
+            || self.layers.is_empty()
+            || context.layers.len() != self.layers.len()
+            || embedded.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let rows = embedded.shape_at(1)?;
+        if !(2..=256).contains(&rows)
+            || embedded.shape_at(0)? != 1
+            || head_rows < 1
+            || head_rows >= rows
+            || (head_rows != rows - 1 && head_rows > 7)
+        {
+            return Ok(None);
+        }
+        let (start, end) = (context.layers[0].start, context.layers[0].end);
+        if start == end
+            || context
+                .layers
+                .iter()
+                .any(|w| (w.start, w.end) != (start, end))
+        {
+            return Ok(None);
+        }
+        let mut inputs = vec![
+            embedded.clone(),
+            MxArray::from_int32(&[context.logical_len], &[1])?,
+            MxArray::from_int32(&[anchor as i32], &[1])?,
+        ];
+        let mask = context.layers[0].block_mask(
+            &mut context.mask_memo,
+            context.logical_len,
+            rows,
+            self.config.sliding_window as i64,
+        )?;
+        let has_mask = mask.is_some();
+        if let Some(mask) = mask {
+            let heads = self.layers[0].attention.num_heads;
+            if self
+                .layers
+                .iter()
+                .any(|layer| layer.attention.num_heads != heads)
+            {
+                return Ok(None);
+            }
+            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, mask.shape_at(3)?])?;
+            inputs.extend([mask, broadcast_mask]);
+        }
+        let windows_at = inputs.len();
+        for window in &context.layers {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Ok(None);
+            };
+            let Some((from, to)) = window.block_range(rows)? else {
+                return Ok(None);
+            };
+            if keys.dtype()? != DType::BFloat16
+                || values.dtype()? != DType::BFloat16
+                || keys.shape_at(0)? != 1
+            {
+                return Ok(None);
+            }
+            inputs.extend([
+                keys.clone(),
+                values.clone(),
+                keys.slice_axis(2, from, to)?,
+                values.slice_axis(2, from, to)?,
+            ]);
+        }
+        const COMPILED_EMBEDDED_BIT: u64 = 1u64 << 12;
+        let head_tag = if head_rows == rows - 1 {
+            0u64
+        } else {
+            (head_rows as u64 & 0x7) << 13
+        };
+        let is_spanned = spanned_heads.is_some();
+        let fn_id = COMPILED_DRAFT_TAG
+            | ((self.compiled.id & 0xffff_ffff) << 16)
+            | head_tag
+            | COMPILED_EMBEDDED_BIT
+            | ((is_spanned as u64) << 11)
+            | ((has_mask as u64) << 9)
+            | ((with_confidence as u64) << 8)
+            | (rows - 1) as u64;
+        let cache_output_at = 1 + usize::from(with_confidence);
+        let mut builder =
+            |args: &[MxArray]| -> Result<Vec<MxArray>> {
+                #[cfg(test)]
+                self.compiled.traces.fetch_add(1, Ordering::Relaxed);
+                let mut pending: Option<DraftLayerOutput> = None;
+                let mut buffers = Vec::with_capacity(self.layers.len() * 2);
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let input = match &pending {
+                        Some(output) => output.as_input(),
+                        None => DraftResidual::Hidden(&args[0]),
+                    };
+                    let at = windows_at + i * 4;
+                    let (output, keys, values) = layer.forward_compiled(
+                        input,
+                        &args[at..at + 4],
+                        &args[1],
+                        has_mask.then(|| &args[3]),
+                        has_mask.then(|| &args[4]),
+                        self.merged_rows(),
+                    )?;
+                    pending = Some(output);
+                    buffers.extend([keys, values]);
+                }
+                let output =
+                    pending.ok_or_else(|| Error::from_reason("compiled draft has no layers"))?;
+                let hidden = output.hidden_and_normalized(&self.norm)?.1;
+                let draft_hidden = hidden.slice_axis(1, 1, 1 + head_rows)?;
+                let logits = if let Some(spanned) = spanned_heads {
+                    spanned.forward_logits(&draft_hidden)?
+                } else if head_rows < rows - 1 && crate::accelerator::cuda_ops_available() {
+                    target_lm_head.forward(&draft_hidden)?
+                } else {
+                    // Match `propose_with` / `propose_compiled`: run the full-vocab head
+                    // on the whole block (anchor + proposals, M=8) so Metal keeps its
+                    // K-quant M = 8 NAX route and eager/compiled stay bit-identical.
+                    target_lm_head
+                        .forward(&hidden)?
+                        .slice_axis(1, 1, 1 + head_rows)?
+                };
+                let mut confidence = None;
+                let (path, _) = self.selector.select_with_anchor(
+                    &draft_hidden,
+                    &logits,
+                    &args[2],
+                    0.0,
+                    true,
+                    is_spanned,
+                    with_confidence.then_some(&mut confidence),
+                    &mut rand::rng(),
+                )?;
+                let SelectorPath::Device(path) = path else {
+                    return Err(Error::from_reason(
+                        "compiled greedy draft returned a host path",
+                    ));
+                };
+                let mut outputs = vec![path];
+                if with_confidence {
+                    outputs.push(confidence.ok_or_else(|| {
+                        Error::from_reason("compiled draft confidence unavailable")
+                    })?);
+                }
+                outputs.extend(buffers);
+                Ok(outputs)
+            };
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
+            fn_id,
+            &inputs.iter().collect::<Vec<_>>(),
+            cache_output_at + self.layers.len() * 2,
+            true,
+            crate::accelerator::cuda_draft_no_fuse(),
+            &mut builder,
+        )?
+        .ok_or_else(|| Error::from_reason("compiled embedded draft invocation failed"))?;
+        for (window, pair) in context
+            .layers
+            .iter()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Err(Error::from_reason(
+                    "compiled draft returned incompatible cache buffers",
+                ));
+            };
+            if pair[0].shape()?.as_ref() != keys.shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != values.shape()?.as_ref()
+                || pair[0].dtype()? != DType::BFloat16
+                || pair[1].dtype()? != DType::BFloat16
+            {
+                return Err(Error::from_reason(
+                    "compiled draft returned incompatible cache buffers",
+                ));
+            }
+        }
+        for (window, pair) in context
+            .layers
+            .iter_mut()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            window.keys = Some(pair[0].clone());
+            window.values = Some(pair[1].clone());
+        }
+        Ok(Some((
+            outputs[0].clone(),
+            with_confidence.then(|| outputs[1].clone()),
+        )))
+    }
+
     /// Compiled tree-lattice proposal returning `(candidates [1, L, K] Int32,
     /// scores [L, K, K] Float32)`. Uses free bit 10 (`1 << 10`) in `fn_id`
     /// under `COMPILED_DRAFT_TAG` so `Drop` and `invalidate_compiled` release
@@ -3066,6 +3300,280 @@ impl DFlash2Model {
         Ok((candidates, scores))
     }
 
+    /// Compiled tree-lattice proposal for targets with external embeddings
+    /// (`qwen4_exp`), taking pre-embedded `[1, block_size + 1, hidden]` BF16
+    /// rows and a resident quantized `lm_head` (plus optional spanned head
+    /// `[0, 98_304) U [248_032, 248_320)`).
+    ///
+    /// Uses `(1 << 12) | (1 << 10)` (`COMPILED_EMBEDDED_BIT | COMPILED_LATTICE_BIT`)
+    /// under `COMPILED_DRAFT_TAG` so it never collides with linear compiled
+    /// embedded graphs or dense `propose_tree_lattice_compiled`, and is erased
+    /// automatically by `invalidate_compiled` and `Drop`.
+    #[allow(clippy::too_many_arguments)]
+    fn propose_tree_lattice_compiled_embedded(
+        &self,
+        embedded: &MxArray,
+        anchor: u32,
+        target_lm_head: &QuantizedLinear,
+        spanned_heads: Option<&SpannedDraftHeads>,
+        context: &mut DFlash2ContextCache,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        if self.compiled.disabled.load(Ordering::Relaxed)
+            || unsafe { sys::mlx_default_device() } != 1
+            || self.selector.top_k > 64
+            || self.layers.is_empty()
+            || context.layers.len() != self.layers.len()
+            || embedded.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let rows = embedded.shape_at(1)?;
+        if !(2..=256).contains(&rows) || embedded.shape_at(0)? != 1 {
+            return Ok(None);
+        }
+        let (start, end) = (context.layers[0].start, context.layers[0].end);
+        if start == end
+            || context
+                .layers
+                .iter()
+                .any(|w| (w.start, w.end) != (start, end))
+        {
+            return Ok(None);
+        }
+        let mut inputs = vec![
+            embedded.clone(),
+            MxArray::from_int32(&[context.logical_len], &[1])?,
+            MxArray::from_int32(&[anchor as i32], &[1])?,
+        ];
+        let mask = context.layers[0].block_mask(
+            &mut context.mask_memo,
+            context.logical_len,
+            rows,
+            self.config.sliding_window as i64,
+        )?;
+        let has_mask = mask.is_some();
+        if let Some(mask) = mask {
+            let heads = self.layers[0].attention.num_heads;
+            if self
+                .layers
+                .iter()
+                .any(|layer| layer.attention.num_heads != heads)
+            {
+                return Ok(None);
+            }
+            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, mask.shape_at(3)?])?;
+            inputs.extend([mask, broadcast_mask]);
+        }
+        let windows_at = inputs.len();
+        for window in &context.layers {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Ok(None);
+            };
+            let Some((from, to)) = window.block_range(rows)? else {
+                return Ok(None);
+            };
+            if keys.dtype()? != DType::BFloat16
+                || values.dtype()? != DType::BFloat16
+                || keys.shape_at(0)? != 1
+            {
+                return Ok(None);
+            }
+            inputs.extend([
+                keys.clone(),
+                values.clone(),
+                keys.slice_axis(2, from, to)?,
+                values.slice_axis(2, from, to)?,
+            ]);
+        }
+        const COMPILED_LATTICE_BIT: u64 = 1u64 << 10;
+        const COMPILED_EMBEDDED_BIT: u64 = 1u64 << 12;
+        let is_spanned = spanned_heads.is_some();
+        let fn_id = COMPILED_DRAFT_TAG
+            | ((self.compiled.id & 0xffff_ffff) << 16)
+            | COMPILED_EMBEDDED_BIT
+            | ((is_spanned as u64) << 11)
+            | COMPILED_LATTICE_BIT
+            | ((has_mask as u64) << 9)
+            | (rows - 1) as u64;
+        let cache_output_at = 2;
+        let mut builder = |args: &[MxArray]| -> Result<Vec<MxArray>> {
+            #[cfg(test)]
+            self.compiled.traces.fetch_add(1, Ordering::Relaxed);
+            let mut pending: Option<DraftLayerOutput> = None;
+            let mut buffers = Vec::with_capacity(self.layers.len() * 2);
+            for (i, layer) in self.layers.iter().enumerate() {
+                let input = match &pending {
+                    Some(output) => output.as_input(),
+                    None => DraftResidual::Hidden(&args[0]),
+                };
+                let at = windows_at + i * 4;
+                let (output, keys, values) = layer.forward_compiled(
+                    input,
+                    &args[at..at + 4],
+                    &args[1],
+                    has_mask.then(|| &args[3]),
+                    has_mask.then(|| &args[4]),
+                    self.merged_rows(),
+                )?;
+                pending = Some(output);
+                buffers.extend([keys, values]);
+            }
+            let output =
+                pending.ok_or_else(|| Error::from_reason("compiled draft has no layers"))?;
+            let hidden = output.hidden_and_normalized(&self.norm)?.1;
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let logits = if let Some(spanned) = spanned_heads {
+                spanned.forward_logits(&draft_hidden)?
+            } else {
+                // Match `propose_compiled` / `propose_tree_lattice_compiled`: run the
+                // full-vocab head on the whole block (anchor + proposals, M=8) so
+                // Metal keeps its K-quant M = 8 NAX route and eager/compiled stay
+                // bit-identical.
+                target_lm_head.forward(&hidden)?.slice_axis(1, 1, rows)?
+            };
+            let (candidates, scores) = self.selector.select_lattice_arrays(
+                &draft_hidden,
+                &logits,
+                &args[2],
+                is_spanned,
+            )?;
+            let mut outputs = vec![candidates, scores];
+            outputs.extend(buffers);
+            Ok(outputs)
+        };
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
+            fn_id,
+            &inputs.iter().collect::<Vec<_>>(),
+            cache_output_at + self.layers.len() * 2,
+            true,
+            crate::accelerator::cuda_draft_no_fuse(),
+            &mut builder,
+        )?
+        .ok_or_else(|| Error::from_reason("compiled embedded draft lattice invocation failed"))?;
+        for (window, pair) in context
+            .layers
+            .iter()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Err(Error::from_reason(
+                    "compiled embedded draft lattice returned incompatible cache buffers",
+                ));
+            };
+            if pair[0].shape()?.as_ref() != keys.shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != values.shape()?.as_ref()
+                || pair[0].dtype()? != DType::BFloat16
+                || pair[1].dtype()? != DType::BFloat16
+            {
+                return Err(Error::from_reason(
+                    "compiled embedded draft lattice returned incompatible cache buffers",
+                ));
+            }
+        }
+        for (window, pair) in context
+            .layers
+            .iter_mut()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            window.keys = Some(pair[0].clone());
+            window.values = Some(pair[1].clone());
+        }
+        Ok(Some((outputs[0].clone(), outputs[1].clone())))
+    }
+
+    /// Run DFlash2 draft + selector over a [`DFlash2TargetView`] (such as
+    /// `qwen4_exp`'s external embedding row store + resident quantized
+    /// `lm_head`) and return unevaluated `(candidates [1, L, K] Int32,
+    /// scores [L, K, K] Float32)`.
+    ///
+    /// Always runs at full `max_len == self.config.block_size` (`7`, `rows = 8`)
+    /// so the compiled embedded lattice graph never retraces.
+    pub(crate) fn propose_tree_lattice_arrays_embedded(
+        &self,
+        target: &mut dyn DFlash2TargetView,
+        context: &mut DFlash2ContextCache,
+        anchor: u32,
+        max_len: usize,
+    ) -> Result<(MxArray, MxArray)> {
+        if max_len == 0 {
+            return Err(Error::from_reason(
+                "DFlash2 propose_tree_lattice_arrays_embedded requires max_len > 0",
+            ));
+        }
+        context.observe_tokens(&[anchor]);
+        let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
+        let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+        let use_spanned_head = crate::accelerator::cuda_ops_available()
+            && cuda_spanned_head_enabled()
+            && !context.wide_vocab();
+        let spanned_heads = if use_spanned_head {
+            if let Some(ql) = target.target_lm_head_qlinear() {
+                self.spanned_draft_heads_ql(ql)?
+            } else if let Some((_, head)) = target.traced() {
+                self.spanned_draft_heads(head)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let compile = crate::accelerator::cuda_ops_available()
+            && target.target_lm_head_qlinear().is_some()
+            && max_len == self.config.block_size
+            && unsafe { sys::mlx_default_device() } == 1
+            && self.execution_policy.compile_draft();
+        let embedded = target.embed(&block, &ids)?;
+        let compiled_pair = if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+            if let Some(ql) = target.target_lm_head_qlinear() {
+                match self.propose_tree_lattice_compiled_embedded(
+                    &embedded,
+                    anchor,
+                    ql,
+                    spanned_heads.as_deref(),
+                    context,
+                ) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        self.compiled.disabled.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (candidates, scores) = if let Some(pair) = compiled_pair {
+            pair
+        } else {
+            let query_base = context.logical_len;
+            let hidden = self.forward_embedded(&embedded, query_base, context)?;
+            let rows = max_len as i64 + 1;
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let (draft_logits, is_spanned) = if let Some(spanned) = spanned_heads.as_deref() {
+                (spanned.forward_logits(&draft_hidden)?, true)
+            } else {
+                // Match `propose_tree_lattice_compiled_embedded`: run the full-vocab
+                // head on the whole block (anchor + proposals, M=8) so Metal keeps its
+                // K-quant M = 8 NAX route and eager/compiled stay bit-identical.
+                (target.logits(&hidden)?.slice_axis(1, 1, rows)?, false)
+            };
+            let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
+            self.selector.select_lattice_arrays(
+                &draft_hidden,
+                &draft_logits,
+                &anchor_ids,
+                is_spanned,
+            )?
+        };
+        if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
+            MxArray::eval_arrays(&[&candidates, &scores])?;
+            self.compiled.prepared.store(true, Ordering::Relaxed);
+        }
+        Ok((candidates, scores))
+    }
+
     /// Evaluate and read back device-resident `(candidates, scores)` into a
     /// host [`DraftLattice`].
     pub(crate) fn lattice_from_arrays(
@@ -3179,19 +3687,28 @@ impl DFlash2Model {
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        let traced = target.traced();
+        let head_len = target
+            .proposal_head_limit()
+            .map_or(max_len, |limit| limit.clamp(1, max_len));
         let use_spanned_head = crate::accelerator::cuda_ops_available()
             && cuda_spanned_head_enabled()
             && !context.wide_vocab();
+        let has_traced = target.traced().is_some();
+        let has_target_ql = !has_traced && target.target_lm_head_qlinear().is_some();
         let spanned_heads = if use_spanned_head {
-            traced
-                .and_then(|(_, head)| self.spanned_draft_heads(head).transpose())
-                .transpose()?
+            if let Some((_, head)) = target.traced() {
+                self.spanned_draft_heads(head)?
+            } else if let Some(ql) = target.target_lm_head_qlinear() {
+                self.spanned_draft_heads_ql(ql)?
+            } else {
+                None
+            }
         } else {
             None
         };
+        let compile_embedded = has_target_ql && crate::accelerator::cuda_ops_available();
         let compile = device_path
-            && traced.is_some()
+            && (has_traced || compile_embedded)
             && is_greedy_temperature(temperature)
             && max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
@@ -3200,39 +3717,76 @@ impl DFlash2Model {
         // pay for a new graph used once. The first full proposal runs eager
         // and is explicitly evaluated below before prepared becomes true, so
         // even a failed verification leaves materialized captured weights.
-        if compile
-            && self.compiled.prepared.load(Ordering::Relaxed)
-            && let Some((target_embedding, target_lm_head)) = traced
-        {
-            match self.propose_compiled(
-                target_embedding,
-                target_lm_head,
-                spanned_heads.as_deref(),
-                context,
-                &block,
-                confidence.is_some(),
-            ) {
-                Ok(Some((path, probabilities))) => {
-                    if let Some(out) = confidence {
-                        *out = probabilities;
+        let mut pre_embedded: Option<MxArray> = None;
+        if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+            if let Some((target_embedding, target_lm_head)) = target.traced() {
+                match self.propose_compiled(
+                    target_embedding,
+                    target_lm_head,
+                    spanned_heads.as_deref(),
+                    context,
+                    &block,
+                    confidence.is_some(),
+                ) {
+                    Ok(Some((path, probabilities))) => {
+                        if let Some(out) = confidence {
+                            *out = probabilities;
+                        }
+                        return Ok((SelectorPath::Device(path), Vec::new()));
                     }
-                    return Ok((SelectorPath::Device(path), Vec::new()));
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.compiled.disabled.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    self.compiled.disabled.store(true, Ordering::Relaxed);
-                    return Err(error);
+            } else if compile_embedded {
+                let embedded = target.embed(&block, &ids)?;
+                let compiled_res = if let Some(ql) = target.target_lm_head_qlinear() {
+                    self.propose_compiled_embedded(
+                        &embedded,
+                        anchor,
+                        ql,
+                        spanned_heads.as_deref(),
+                        context,
+                        head_len as i64,
+                        confidence.is_some(),
+                    )
+                } else {
+                    Ok(None)
+                };
+                match compiled_res {
+                    Ok(Some((path, probabilities))) => {
+                        if let Some(out) = confidence {
+                            *out = probabilities;
+                        }
+                        return Ok((SelectorPath::Device(path), Vec::new()));
+                    }
+                    Ok(None) => {
+                        pre_embedded = Some(embedded);
+                    }
+                    Err(error) => {
+                        self.compiled.disabled.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
                 }
             }
         }
         let query_base = context.logical_len;
-        let embedded = target.embed(&block, &ids)?;
+        let embedded = match pre_embedded {
+            Some(e) => e,
+            None => target.embed(&block, &ids)?,
+        };
         let hidden = self.forward_embedded(&embedded, query_base, context)?;
-        let rows = max_len as i64 + 1;
+        let rows = head_len as i64 + 1;
         let (hidden, logits, is_spanned) = if let Some(spanned) = spanned_heads.as_deref() {
             let draft_hidden = hidden.slice_axis(1, 1, rows)?;
             let draft_logits = spanned.forward_logits(&draft_hidden)?;
             (draft_hidden, draft_logits, true)
+        } else if head_len < max_len && crate::accelerator::cuda_ops_available() {
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let draft_logits = target.logits(&draft_hidden)?;
+            (draft_hidden, draft_logits, false)
         } else {
             // The head runs on the whole block (anchor + proposals, 8 rows), the
             // height its K-quant M = 8 route serves, and the anchor row's logits
@@ -6691,6 +7245,158 @@ mod tests {
         assert_eq!(
             lattice_top_path, expected_path,
             "DraftLattice greedy Markov chain must match CandidateSelector::select_with_anchor"
+        );
+    }
+
+    #[test]
+    fn propose_tree_lattice_embedded_compiled_matches_eager() {
+        use crate::models::quantized_linear::QuantizedLinear;
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        struct EmbeddedQLinearView<'a> {
+            embedding: &'a Embedding,
+            lm_head: &'a QuantizedLinear,
+        }
+        impl super::DFlash2TargetView for EmbeddedQLinearView<'_> {
+            fn embed(&mut self, block: &MxArray, _ids: &[i32]) -> napi::Result<MxArray> {
+                self.embedding.forward(block)
+            }
+            fn logits(&mut self, hidden: &MxArray) -> napi::Result<MxArray> {
+                self.lm_head.forward(hidden)
+            }
+            fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)> {
+                None
+            }
+            fn target_lm_head_qlinear(&self) -> Option<&QuantizedLinear> {
+                Some(self.lm_head)
+            }
+        }
+
+        let target = crate::models::qwen3_5::config::Qwen3_5Config {
+            rope_scaling: None,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            vocab_size: 64,
+            hidden_size: 256,
+            num_layers: 4,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 512,
+            rms_norm_eps: 1e-6,
+            head_dim: 128,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            max_position_embeddings: 512,
+            pad_token_id: 0,
+            eos_token_id: 2,
+            bos_token_id: 1,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+        };
+        let mut model = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
+        model.config.sliding_window = 64;
+        model.selector.top_k = 16;
+        model.configure_dense_execution();
+
+        let mut embedding = Embedding::new(64, 256).unwrap();
+        embedding
+            .load_weight(
+                &MxArray::random_normal(&[64, 256], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            )
+            .unwrap();
+        let dense_head =
+            MxArray::random_normal(&[64, 256], 0.0, 0.2, Some(DType::BFloat16)).unwrap();
+        let mut qw = std::ptr::null_mut();
+        let mut qs = std::ptr::null_mut();
+        let mut qb = std::ptr::null_mut();
+        let mode = std::ffi::CString::new("affine").unwrap();
+        assert!(unsafe {
+            mlx_sys::mlx_quantize(
+                dense_head.as_raw_ptr(),
+                32,
+                8,
+                mode.as_ptr(),
+                &mut qw,
+                &mut qs,
+                &mut qb,
+            )
+        });
+        let lm_head = QuantizedLinear::new(
+            MxArray::from_handle(qw, "qw").unwrap(),
+            MxArray::from_handle(qs, "qs").unwrap(),
+            Some(MxArray::from_handle(qb, "qb").unwrap()),
+            None,
+            32,
+            8,
+            "affine".to_string(),
+        );
+        lm_head.eval_packed_arrays("test_embedded_lm_head").unwrap();
+
+        let fused = MxArray::random_normal(&[1, 16, 256], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let tokens: Vec<u32> = (0..16).map(|t| 1 + (t % 20)).collect();
+        let mut ctx_compiled = super::DFlash2ContextCache::new(&model.config);
+        let mut ctx_eager = super::DFlash2ContextCache::new(&model.config);
+        ctx_compiled.append(&model, &fused, 0, &tokens).unwrap();
+        ctx_eager.append(&model, &fused, 0, &tokens).unwrap();
+        ctx_compiled.eval().unwrap();
+        ctx_eager.eval().unwrap();
+
+        let mut view = EmbeddedQLinearView {
+            embedding: &embedding,
+            lm_head: &lm_head,
+        };
+        // Cycle 0: warms up `compiled.prepared = true`.
+        let (c0, s0) = model
+            .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_compiled, 5, 7)
+            .unwrap();
+        MxArray::eval_arrays(&[&c0, &s0]).unwrap();
+        assert!(model.compiled.prepared.load(super::Ordering::Relaxed));
+
+        // Cycle 1 & 2: compiled replay must match eager bit-for-bit and trace once!
+        for anchor in [7u32, 11u32] {
+            let (cc, cs) = model
+                .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_compiled, anchor, 7)
+                .unwrap();
+            MxArray::eval_arrays(&[&cc, &cs]).unwrap();
+
+            model
+                .compiled
+                .disabled
+                .store(true, super::Ordering::Relaxed);
+            let (ec, es) = model
+                .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_eager, anchor, 7)
+                .unwrap();
+            MxArray::eval_arrays(&[&ec, &es]).unwrap();
+            model
+                .compiled
+                .disabled
+                .store(false, super::Ordering::Relaxed);
+
+            assert_eq!(
+                cc.to_int32().unwrap().as_ref(),
+                ec.to_int32().unwrap().as_ref(),
+                "compiled embedded lattice candidates mismatch for anchor={anchor}"
+            );
+            assert_eq!(
+                cs.to_float32().unwrap().as_ref(),
+                es.to_float32().unwrap().as_ref(),
+                "compiled embedded lattice scores mismatch for anchor={anchor}"
+            );
+        }
+        assert_eq!(
+            model.compiled.traces.load(super::Ordering::Relaxed),
+            1,
+            "fixed-width compiled embedded lattice must trace once and replay without retracing"
         );
     }
 }

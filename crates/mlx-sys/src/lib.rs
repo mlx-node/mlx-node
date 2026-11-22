@@ -669,6 +669,8 @@ unsafe extern "C-unwind" {
     // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_cuda_is_available() -> bool;
+    pub fn mlx_cuda_set_use_graphs(enable: bool) -> bool;
+    pub fn mlx_cuda_get_use_graphs() -> bool;
     pub fn mlx_cuda_compute_capability(out_major: *mut i32, out_minor: *mut i32) -> bool;
     pub fn mlx_device_static_memory_info(out_total: *mut u64, out_is_unified: *mut bool) -> i32;
     pub fn mlx_device_free_memory(out_free: *mut u64) -> i32;
@@ -2455,6 +2457,25 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Extended CUDA fused GDN step supporting `sigmoid_gate` (Qwen4 Sigmoid vs
+    /// Qwen3.5 SiLU), BF16/FP32 `beta`, and BF16/FP32 `w`.
+    pub fn mlx_gdn_fused_step_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
+        state_dst: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA deferred-fold fused GDN step: folds `prev_keep` accepted rows from
     /// `(prev_k, prev_v, prev_g, prev_beta)` into `state_base` before stepping
     /// the current window and returning `(out_y, out_committed_state)`.
@@ -2480,6 +2501,28 @@ unsafe extern "C-unwind" {
         out_committed_state: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Extended CUDA deferred-fold fused GDN step with `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_fused_step_deferred_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA tree-verify fused GDN step with deferred fold (`parent` is int32 `[T]`,
     /// `prev_indices` is nullable int32 `[prev_keep]`).
     pub fn mlx_gdn_tree_step_cuda(
@@ -2500,6 +2543,30 @@ unsafe extern "C-unwind" {
         norm_weight: *mut mlx_array,
         eps: f32,
         tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_committed_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Extended CUDA tree-verify fused GDN step with `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_tree_step_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_base: *mut mlx_array,
+        prev_k: *mut mlx_array,
+        prev_v: *mut mlx_array,
+        prev_g: *mut mlx_array,
+        prev_beta: *mut mlx_array,
+        prev_keep: i32,
+        prev_indices: *mut mlx_array,
+        parent: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
         out_y: *mut *mut mlx_array,
         out_committed_state: *mut *mut mlx_array,
     ) -> bool;
@@ -2568,6 +2635,24 @@ unsafe extern "C-unwind" {
         norm_weight: *mut mlx_array,
         eps: f32,
         tiled_heads: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Extended CUDA prefill GDN recurrence with fused RMSNormGated supporting
+    /// `sigmoid_gate` and BF16/FP32 `norm_weight`.
+    pub fn mlx_gdn_prefill_chain_gated_cuda_ex(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+        tiled_heads: i32,
+        sigmoid_gate: bool,
         out_y: *mut *mut mlx_array,
         out_state: *mut *mut mlx_array,
     ) -> bool;
@@ -3717,6 +3802,154 @@ unsafe extern "C" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
+    // Qwen3.8-Flash-Next (qwen4_exp) CUDA primitives (`mlx_qwen4_moe_cuda.cpp`,
+    // `mlx_qwen4_ops_cuda.cpp`). All return null/false on non-CUDA builds.
+    pub fn mlx_qwen4_moe_routed_shared_few_cuda(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        mode_gu: i32,
+        bits_dn: i32,
+        swg: *mut mlx_array,
+        ssg: *mut mlx_array,
+        sbg: *mut mlx_array,
+        swu: *mut mlx_array,
+        ssu: *mut mlx_array,
+        sbu: *mut mlx_array,
+        swd: *mut mlx_array,
+        ssd: *mut mlx_array,
+        sbd: *mut mlx_array,
+        shared_gate: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_moe_prefill_cuda(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        mode_gu: i32,
+        bits_dn: i32,
+        shared_out: *mut mlx_array,
+        shared_gate: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_inject_norm_cuda(
+        x: *mut mlx_array,
+        branch: *mut mlx_array,
+        gate: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        eps: f32,
+        weight_offset: f32,
+        out_x: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_hc_down_act_cuda(
+        normed: *mut mlx_array,
+        w_down: *mut mlx_array,
+        s_down: *mut mlx_array,
+        b_down: *mut mlx_array,
+        w_inj: *mut mlx_array,
+        s_inj: *mut mlx_array,
+        b_inj: *mut mlx_array,
+        inj_mode: i32,
+        out_down: *mut *mut mlx_array,
+        out_inj: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_hc_up_mix_cuda(
+        down_act: *mut mlx_array,
+        normed: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        b_up: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_router_topk_cuda(
+        logits: *mut mlx_array,
+        top_k: i32,
+        out_ids: *mut *mut mlx_array,
+        out_scores: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_qsa_sparse_sdpa_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        iq: *mut mlx_array,
+        pooled_k: *mut mlx_array,
+        tree_mask: *mut mlx_array,
+        kv_len: i32,
+        num_blocks: i32,
+        scale: f32,
+        idx_scale: f32,
+        mask_mode: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_ple_gate_conv_cuda(
+        x: *mut mlx_array,
+        key: *mut mlx_array,
+        value: *mut mlx_array,
+        norm_key_w: *mut mlx_array,
+        norm_query_w: *mut mlx_array,
+        norm_conv_w: *mut mlx_array,
+        conv_w: *mut mlx_array,
+        history: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        eps: f32,
+        weight_offset: f32,
+        fuse_residual: bool,
+        out_x: *mut *mut mlx_array,
+        out_hist: *mut *mut mlx_array,
+        out_conv_in: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_prefill_hc_mix_cuda(
+        up: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_stream_mean_cuda(x: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_dequant_q8_bf16_cuda(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_q8_prefill_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        gs_shift: i32,
+        general_bias: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_hc_up_mix_prefill_cuda(
+        down_act: *mut mlx_array,
+        normed: *mut mlx_array,
+        w_up: *mut mlx_array,
+        s_up: *mut mlx_array,
+        b_up: *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 unsafe extern "C" {
@@ -3759,6 +3992,9 @@ unsafe extern "C-unwind" {
         dtype: i32,
         out_data: *mut *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    pub fn mlx_array_alloc_gpu_uninit(shape: *const i64, ndim: usize, dtype: i32)
+    -> *mut mlx_array;
+    pub fn mlx_array_ensure_cuda_device(arr: *mut mlx_array) -> *mut mlx_array;
     /// Native Metal allocation with a CPU-visible pointer and a last-array
     /// lease (`mlx_array_alloc.cpp`). Null on unsupported builds or failure;
     /// `release_fn(ctx)` is not invoked on a null return.

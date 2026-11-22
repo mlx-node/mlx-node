@@ -1707,7 +1707,8 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // trim on CUDA when cache memory actually exceeds 1 GiB.
         if generated.len() >= last_clear_at + 256 {
             let should_clear = if crate::accelerator::cuda_ops_available() {
-                crate::array::get_cache_memory() > 1024.0 * 1024.0 * 1024.0
+                crate::array::get_cache_memory()
+                    > crate::accelerator::cuda_cache_clear_threshold_bytes()
             } else {
                 true
             };
@@ -1931,7 +1932,14 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     if report_perf {
         first_token_instant = Some(Instant::now());
     }
-    crate::array::synchronize_and_clear_cache();
+    let should_clear_post_prefill = if crate::accelerator::cuda_ops_available() {
+        crate::array::get_cache_memory() > crate::accelerator::cuda_cache_clear_threshold_bytes()
+    } else {
+        true
+    };
+    if should_clear_post_prefill {
+        crate::array::synchronize_and_clear_cache();
+    }
 
     let mut rng = rand::rng();
     let outcome = {

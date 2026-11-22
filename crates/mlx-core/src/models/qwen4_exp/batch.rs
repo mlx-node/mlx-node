@@ -134,39 +134,139 @@ impl Decoder {
             && self.weights.expert_slot_capacity(experts, top)? > 0)
     }
 
-    pub(super) fn resident_experts(
-        &self,
+    /// Resident shared-expert `[gate, up, down]` banks for layer `i` (GGUF).
+    fn cuda_shared_banks(&self, i: usize) -> Option<Banks> {
+        if !self.gguf() {
+            return None;
+        }
+        let [Some(gate), Some(up), Some(down)] = ["gate", "up", "down"].map(|part| {
+            self.weights
+                .resident_bank(&format!("blk.{i}.ffn_{part}_shexp.weight"))
+        }) else {
+            return None;
+        };
+        Some([gate, up, down])
+    }
+
+    /// Fused CUDA routed + shared MoE for layer `i` on direct/resident banks:
+    /// - `M in 1..=16`: `moe_routed_shared_few_cuda` (routed + shared in one primitive!)
+    /// - `M >= 17`: `shared_expert_parts` + `moe_prefill_cuda` (routed + shared combine!)
+    ///
+    /// Returns `Ok(None)` when disabled or off-contract so callers fall back cleanly.
+    pub(super) fn cuda_fused_moe(
+        &mut self,
         x: &MxArray,
         selected: &MxArray,
         scores: &MxArray,
         i: usize,
     ) -> Result<Option<MxArray>> {
-        let Some(banks) = self.resident_banks(i) else {
+        if !super::super::cuda_qwen4_fast_enabled() || !self.gguf() || !self.scope.is_empty() {
+            return Ok(None);
+        }
+        let c = self.config.clone();
+        if c.hidden_size != 2560
+            || c.moe_intermediate_size != 640
+            || c.num_experts_per_tok == 0
+            || c.num_experts_per_tok > 10
+            || x.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let (banks, local) = if let Some(banks) = self.resident_banks(i) {
+            (banks, selected.reshape(&[-1])?)
+        } else if self.weights.plan.direct {
+            let Some((banks, local)) = self.weights.device_expert_slots(i, selected)? else {
+                return Ok(None);
+            };
+            (banks, local)
+        } else {
+            return Ok(None);
+        };
+        let tokens = x.shape_at(1)?;
+        if (1..=16).contains(&tokens) {
+            if let Some(shared_banks) = self.cuda_shared_banks(i)
+                && shared_banks
+                    .iter()
+                    .all(|w| w.mode == "affine" && w.bits == 8 && w.group == 32)
+            {
+                let shared_gate = self.linear_rows(
+                    x,
+                    &format!("layers.{i}.mlp.shared_expert_gate.weight"),
+                    &format!("blk.{i}.ffn_gate_inp_shexp.weight"),
+                )?;
+                if let Some(out) = math::cuda_moe_routed_shared_few(
+                    x,
+                    &local,
+                    scores,
+                    &banks,
+                    Some((&shared_banks, &shared_gate)),
+                )? {
+                    return Ok(Some(out));
+                }
+            }
+            if let Some(routed) = math::cuda_moe_routed_shared_few(x, &local, scores, &banks, None)?
+            {
+                return self.with_shared_expert(x, &routed, i).map(Some);
+            }
+            return Ok(None);
+        }
+        let (shared_out, shared_gate) = self.shared_expert_parts(x, i)?;
+        if let Some(out) =
+            math::cuda_moe_prefill(x, &local, scores, &banks, Some((&shared_out, &shared_gate)))?
+        {
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn resident_experts(
+        &mut self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+        i: usize,
+    ) -> Result<Option<MxArray>> {
+        let (banks, ids, experts) = if let Some(banks) = self.resident_banks(i) {
+            (banks, selected.reshape(&[-1])?, self.config.num_experts)
+        } else if self.weights.plan.direct
+            && !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            // Non-Metal direct residency (Windows CUDA): wait for layer `i`'s
+            // direct fill if still running and run routed experts directly on
+            // the GPU-resident banks without host route readbacks.
+            let Some((banks, local)) = self.weights.device_expert_slots(i, selected)? else {
+                return Ok(None);
+            };
+            (banks, local, self.config.num_experts)
+        } else {
             return Ok(None);
         };
         let tokens = x.shape()?[1];
         let top = self.config.num_experts_per_tok;
         let h = self.config.hidden_size;
         if top == 10
-            && let Some(out) = math::routed_experts(x, selected, scores, &banks)?
+            && let Some(out) = math::routed_experts(x, &ids, scores, &banks)?
         {
             return Ok(Some(out));
+        }
+        if super::super::cuda_qwen4_fast_enabled() && top <= 10 && h == 2560 {
+            let cuda_out = if (1..=16).contains(&tokens) {
+                math::cuda_moe_routed_shared_few(x, &ids, scores, &banks, None)?
+            } else {
+                math::cuda_moe_prefill(x, &ids, scores, &banks, None)?
+            };
+            if let Some(out) = cuda_out {
+                return Ok(Some(out));
+            }
         }
         let token_rows = MxArray::arange(0.0, tokens as f64, None, Some(DType::Int32))?
             .reshape(&[tokens, 1])?
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
         let source = x.reshape(&[tokens, h as i64])?;
-        let ids = selected.reshape(&[-1])?;
-        let kernel = ExpertKernel::for_window(ids.size()? as usize, self.config.num_experts);
-        let (output, inverse) = Self::window_expert_rows(
-            kernel,
-            &source,
-            &token_rows,
-            &ids,
-            &banks,
-            self.config.num_experts,
-        )?;
+        let kernel = ExpertKernel::for_window(ids.size()? as usize, experts);
+        let (output, inverse) =
+            Self::window_expert_rows(kernel, &source, &token_rows, &ids, &banks, experts)?;
         math::combine_expert_rows(&output, scores, inverse.as_ref(), top).map(Some)
     }
 
@@ -712,17 +812,19 @@ impl Decoder {
         Ok(Some(out))
     }
 
-    pub(super) fn attention_matrix_for_mlp(
+    pub(super) fn attention_matrix_for_mlp_with_norm(
         &mut self,
         x: &MxArray,
         tokens: &[u32],
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
+        attn_normed: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let base = self.history.len();
-        let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
-            x.add(&self.ple_window(x, tokens, i, cache)?)?
+        let has_ple = self.config.ple_layer_ids.contains(&(i + 1));
+        let x = if has_ple {
+            self.ple_apply(x, tokens, i, cache)?
         } else {
             x.clone()
         };
@@ -732,7 +834,7 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            None,
+            if has_ple { None } else { attn_normed },
         )?;
 
         let branch = if self.config.linear(i) {
@@ -770,7 +872,7 @@ impl Decoder {
             Error::from_reason("Qwen4 batched attention is missing its injection gate")
         })?;
         let (out, normed) = self.inject_for_mlp(&x, &branch, &gate, i, normalize)?;
-        if !self.async_device_prefill() {
+        if !self.async_device_prefill() && !self.cuda_deferred_state() {
             self.submit(&[&out], "qwen4::batch::attention")?;
         }
 
@@ -794,27 +896,100 @@ impl Decoder {
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ssm_conv1d.weight"),
         )?;
-        let scale = self
-            .dense(&format!("{p}.A_log"), &format!("{g}.ssm_a"))?
-            .astype(DType::Float32)?;
-        let scale = if self.gguf() {
-            scale
-        } else {
-            scale.exp()?.negative()?
-        };
-        let dt = self
-            .dense(&format!("{p}.dt_bias"), &format!("{g}.ssm_dt.bias"))?
-            .astype(DType::Float32)?;
-        let prepared = if self.gguf()
+        let (scale, dt) = self.gdn_scale_dt(i, &p, &g)?;
+        let prepared = if (self.gguf() || super::super::cuda_qwen4_fast_enabled())
             && c.linear_conv_kernel_dim == 4
             && (kh, nh, kd, vd) == (16, 48, 128, 128)
+            && qkv.dtype()? == DType::BFloat16
+            && conv.dtype()? == DType::Float32
         {
             math::gdn_prepare(&qkv, &a, &b, &conv, &mut cache.conv, &scale, &dt)?
         } else {
             None
         };
-        let [q, k, v, decay, beta] = if let Some(values) = prepared {
-            values
+        let norm = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
+        let state = match &cache.recurrent {
+            Some(s) => s.clone(),
+            None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
+        };
+        if super::super::cuda_qwen4_fast_enabled()
+            && let Some([ref q, ref k, ref v, ref decay, ref beta]) = prepared
+            && c.rms_norm_eps.is_finite()
+            && c.rms_norm_eps > 0.0
+            && z.dtype()? == DType::BFloat16
+        {
+            let tiled_heads = self.gguf();
+            let sigmoid_gate = c.output_gate_type == "sigmoid";
+            let cuda_out = if t <= 16 {
+                crate::kernels::gdn::fused_step_with_gate(
+                    q,
+                    k,
+                    v,
+                    decay,
+                    beta,
+                    &state,
+                    &z,
+                    &norm,
+                    c.rms_norm_eps as f32,
+                    tiled_heads,
+                    sigmoid_gate,
+                    None,
+                )?
+            } else {
+                crate::kernels::gdn::prefill_chain_gated_with_gate(
+                    q,
+                    k,
+                    v,
+                    decay,
+                    beta,
+                    &state,
+                    &z,
+                    &norm,
+                    c.rms_norm_eps as f32,
+                    tiled_heads,
+                    sigmoid_gate,
+                )?
+            };
+            if let Some((out, next_state)) = cuda_out {
+                self.submit_state(&[&next_state], "qwen4::batch::recurrent_state")?;
+                cache.recurrent = Some(next_state);
+                return self.linear(
+                    &out,
+                    &format!("{p}.out_proj.weight"),
+                    &format!("{g}.ssm_out.weight"),
+                );
+            }
+        }
+        let a_f32 = if a.dtype()? == DType::Float32 {
+            a
+        } else {
+            a.astype(DType::Float32)?
+        };
+        let b_f32 = if b.dtype()? == DType::Float32 {
+            b
+        } else {
+            b.astype(DType::Float32)?
+        };
+        let [q, k, v, decay, beta] = if let Some([q, k, v, decay, beta]) = prepared {
+            if crate::engine::persistence::compiled_forward_backend_available() {
+                [q, k, v, decay, beta]
+            } else {
+                let (q, k) = if self.gguf() {
+                    (q, k)
+                } else {
+                    (
+                        q.repeat((nh / kh) as i32, 2)?,
+                        k.repeat((nh / kh) as i32, 2)?,
+                    )
+                };
+                [
+                    q.astype(DType::Float32)?,
+                    k.astype(DType::Float32)?,
+                    v.astype(DType::Float32)?,
+                    decay,
+                    beta,
+                ]
+            }
         } else {
             let qkv = math::conv_sequence(&qkv, &conv, &mut cache.conv, c.linear_conv_kernel_dim)?;
             let q = math::l2(&qkv.slice_axis(2, 0, kh * kd)?.reshape(&[1, t, kh, kd])?)?
@@ -835,7 +1010,7 @@ impl Decoder {
                     k.repeat((nh / kh) as i32, 2)?,
                 )
             };
-            let (decay, beta) = math::gdn_gates(&a, &b, &scale, &dt)?;
+            let (decay, beta) = math::gdn_gates(&a_f32, &b_f32, &scale, &dt)?;
             [
                 q.astype(DType::Float32)?,
                 k.astype(DType::Float32)?,
@@ -845,15 +1020,10 @@ impl Decoder {
             ]
         };
 
-        let state = match &cache.recurrent {
-            Some(s) => s.clone(),
-            None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
-        };
         let (out, state) = math::recurrent_sequence(&q, &k, &v, &decay, &beta, &state)?;
 
         self.submit_state(&[&state], "qwen4::batch::recurrent_state")?;
         cache.recurrent = Some(state);
-        let norm = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
         let replay = if c.output_gate_type == "sigmoid" {
             math::gdn_epilogue(&out, &z, &norm, c.rms_norm_eps)?
         } else {
@@ -907,9 +1077,52 @@ impl Decoder {
         i: usize,
         normed: Option<&MxArray>,
     ) -> Result<MxArray> {
+        Ok(self.mlp_matrix_for_attention_next(x, i, normed, false)?.0)
+    }
+
+    pub(super) fn mlp_matrix_for_attention_next(
+        &mut self,
+        x: &MxArray,
+        i: usize,
+        normed: Option<&MxArray>,
+        fuse_next_attn: bool,
+    ) -> Result<(MxArray, Option<MxArray>)> {
         let (mixed, gate) = self.mlp_mix(x, i, normed)?;
         let branch = self.moe_batch(&mixed, i)?;
-        self.mlp_inject(x, &branch, gate, i)
+        let gate = gate
+            .ok_or_else(|| Error::from_reason("Qwen4 batched MLP is missing its injection gate"))?;
+        let next_layer = i + 1;
+        let can_fuse_next = fuse_next_attn
+            && super::super::cuda_qwen4_fast_enabled()
+            && next_layer < self.config.num_hidden_layers
+            && !self.config.ple_layer_ids.contains(&(next_layer + 1));
+        let (out, next_normed) = if can_fuse_next {
+            self.inject_for_hyper(
+                x,
+                &branch,
+                &gate,
+                &format!("layers.{next_layer}.attn_hyper_connection.hc_norm.weight"),
+                &format!("blk.{next_layer}.hc_attn_norm.weight"),
+                true,
+            )?
+        } else {
+            (Self::inject(x, &branch, &gate)?, None)
+        };
+        if self.cuda_deferred_state() {
+            // Submit every 6 layers on CUDA direct prefill to keep transient
+            // activation footprint bounded without triggering per-layer WDDM
+            // CUDA graph instantiation stalls.
+            if (i + 1).is_multiple_of(6) {
+                if let Some(ref n) = next_normed {
+                    self.submit(&[&out, n], "qwen4::batch::mlp")?;
+                } else {
+                    self.submit(&[&out], "qwen4::batch::mlp")?;
+                }
+            }
+        } else if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
+            self.submit(&[&out], "qwen4::batch::mlp")?;
+        }
+        Ok((out, next_normed))
     }
 
     /// Layer `i`'s MLP input from the residual stream `x` (the hyper mix)
@@ -943,7 +1156,11 @@ impl Decoder {
         // The next router readback (or final window output) fences this
         // graph. Slot-bank readers remain retained until their own fence.
         // Reference schedule: first two layers, then groups of three.
-        if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
+        if self.cuda_deferred_state() {
+            if (i + 1).is_multiple_of(6) {
+                self.submit(&[&out], "qwen4::batch::mlp")?;
+            }
+        } else if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
             self.submit(&[&out], "qwen4::batch::mlp")?;
         }
 
@@ -952,6 +1169,11 @@ impl Decoder {
 
     pub(super) fn moe_batch(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
         let (selected, scores) = self.route_window(x, i)?;
+        if self.device_routes.is_none()
+            && let Some(out) = self.cuda_fused_moe(x, &selected, &scores, i)?
+        {
+            return Ok(out);
+        }
         let sum = self.expert_rows_for(x, &selected, &scores, i)?;
         self.with_shared_expert(x, &sum, i)
     }
