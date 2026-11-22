@@ -609,7 +609,9 @@ std::array<array, 2> paged_prefill_attention(
 
 /// `Inkling2PagedAttention`: relative-bias + natural-log LSE varlen paged
 /// attention for Inkling-2-Mini (INT8 32-token KTM and BF16 vLLM pools,
-/// head_size=128). Returns `{out [total_q, num_q_heads, 128] bf16, lse [total_q, num_q_heads] f32}`.
+/// head_size=128), with optional on-the-fly `r @ rel_bias_w^T` and optional
+/// fused gate+sink epilogue.
+/// Returns `{out}` when `write_lse == false`, else `{out, lse}`.
 class Inkling2PagedAttention : public Custom {
  public:
   Inkling2PagedAttention(
@@ -624,6 +626,9 @@ class Inkling2PagedAttention : public Custom {
       int rel_extent,
       KvDtype kv_dtype,
       bool has_rel_bias,
+      bool has_rel_bias_w,
+      bool has_gate_sink,
+      bool write_lse,
       bool has_score_scales)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
@@ -635,6 +640,9 @@ class Inkling2PagedAttention : public Custom {
         rel_extent_(rel_extent),
         kv_dtype_(kv_dtype),
         has_rel_bias_(has_rel_bias),
+        has_rel_bias_w_(has_rel_bias_w),
+        has_gate_sink_(has_gate_sink),
+        write_lse_(write_lse),
         has_score_scales_(has_score_scales) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
@@ -669,6 +677,9 @@ class Inkling2PagedAttention : public Custom {
         rel_extent_,
         static_cast<uint8_t>(kv_dtype_),
         has_rel_bias_,
+        has_rel_bias_w_,
+        has_gate_sink_,
+        write_lse_,
         has_score_scales_);
   }
 
@@ -682,13 +693,16 @@ class Inkling2PagedAttention : public Custom {
   int rel_extent_;
   KvDtype kv_dtype_;
   bool has_rel_bias_;
+  bool has_rel_bias_w_;
+  bool has_gate_sink_;
+  bool write_lse_;
   bool has_score_scales_;
 };
 
 /// `Inkling2PagedPrefillAttention`: in-place MPP paged prefill / verify for
 /// Inkling-2-Mini (G=3, D=128, INT8 32-token KTM `q8`/`q8q` and BF16 vLLM),
-/// with SWA tile skip, relative bias + zero-bias fast path, and natural-log LSE.
-/// Returns `{out [rows, num_q_heads, 128] bf16, lse [rows, num_q_heads] f32, workspace'}`.
+/// with SWA tile skip, relative bias (precomputed or on-the-fly `r @ rel_bias_w^T`),
+/// optional fused gate+sink epilogue, and optional natural-log LSE.
 class Inkling2PagedPrefillAttention : public Custom {
  public:
   Inkling2PagedPrefillAttention(
@@ -706,7 +720,10 @@ class Inkling2PagedPrefillAttention : public Custom {
       int rel_extent,
       KvDtype kv_dtype,
       bool int8_queries,
-      bool has_rel_bias)
+      bool has_rel_bias,
+      bool has_rel_bias_w,
+      bool has_gate_sink,
+      bool write_lse)
       : Custom(stream, std::move(fallback)),
         committed_tokens_(committed_tokens),
         rows_(rows),
@@ -720,7 +737,10 @@ class Inkling2PagedPrefillAttention : public Custom {
         rel_extent_(rel_extent),
         kv_dtype_(kv_dtype),
         int8_queries_(int8_queries),
-        has_rel_bias_(has_rel_bias) {}
+        has_rel_bias_(has_rel_bias),
+        has_rel_bias_w_(has_rel_bias_w),
+        has_gate_sink_(has_gate_sink),
+        write_lse_(write_lse) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -757,7 +777,10 @@ class Inkling2PagedPrefillAttention : public Custom {
         rel_extent_,
         static_cast<uint8_t>(kv_dtype_),
         int8_queries_,
-        has_rel_bias_);
+        has_rel_bias_,
+        has_rel_bias_w_,
+        has_gate_sink_,
+        write_lse_);
   }
 
  private:
@@ -774,9 +797,12 @@ class Inkling2PagedPrefillAttention : public Custom {
   KvDtype kv_dtype_;
   bool int8_queries_;
   bool has_rel_bias_;
+  bool has_rel_bias_w_;
+  bool has_gate_sink_;
+  bool write_lse_;
 };
 
-std::array<array, 2> inkling2_paged_attention(
+std::vector<array> inkling2_paged_attention(
     const array& q,
     const array& k_pool,
     const array& v_pool,
@@ -795,9 +821,13 @@ std::array<array, 2> inkling2_paged_attention(
     int head_size,
     KvDtype kv_dtype,
     StreamOrDevice s = {},
-    const std::optional<array>& score_scales = std::nullopt);
+    const std::optional<array>& score_scales = std::nullopt,
+    const std::optional<array>& rel_bias_w = std::nullopt,
+    const std::optional<array>& gate = std::nullopt,
+    const std::optional<array>& sink = std::nullopt,
+    bool write_lse = true);
 
-std::array<array, 3> inkling2_paged_prefill_attention(
+std::vector<array> inkling2_paged_prefill_attention(
     const array& q,
     const array& k_pool,
     const array& v_pool,
@@ -818,7 +848,11 @@ std::array<array, 3> inkling2_paged_prefill_attention(
     KvDtype kv_dtype,
     bool int8_queries,
     float scale,
-    StreamOrDevice s = {});
+    StreamOrDevice s = {},
+    const std::optional<array>& rel_bias_w = std::nullopt,
+    const std::optional<array>& gate = std::nullopt,
+    const std::optional<array>& sink = std::nullopt,
+    bool write_lse = true);
 
 } // namespace mlx::core::fast
 
@@ -879,7 +913,9 @@ extern "C" bool mlx_paged_prefill_attention_forward(
     mlx_array** out_attention,
     mlx_array** out_workspace);
 
-// Inkling-2-Mini relative-bias + LSE varlen paged attention (KTM INT8 & BF16).
+// Inkling-2-Mini relative-bias + LSE varlen paged attention (KTM INT8 & BF16),
+// with optional on-the-fly `rel_bias_w [rel_extent, 16]` and optional fused `gate`/`sink`.
+// `out_lse` may be null when `gate` & `sink` are provided (skips LSE allocation & write).
 extern "C" bool mlx_inkling2_paged_attention_forward(
     mlx_array* q,
     mlx_array* k_pool,
@@ -890,6 +926,9 @@ extern "C" bool mlx_inkling2_paged_attention_forward(
     mlx_array* k_scale,
     mlx_array* v_scale,
     mlx_array* rel_bias,
+    mlx_array* rel_bias_w,
+    mlx_array* gate,
+    mlx_array* sink,
     float scale,
     int sliding_window,
     int rel_extent,
@@ -902,7 +941,9 @@ extern "C" bool mlx_inkling2_paged_attention_forward(
     mlx_array** out_attention,
     mlx_array** out_lse);
 
-// Inkling-2-Mini in-place MPP paged prefill (with portable non-MPP fallback).
+// Inkling-2-Mini in-place MPP paged prefill (with portable non-MPP fallback),
+// with optional on-the-fly `rel_bias_w [rel_extent, 16]` and optional fused `gate`/`sink`.
+// `out_lse` may be null when `gate` & `sink` are provided.
 extern "C" bool mlx_inkling2_paged_prefill_attention_forward(
     mlx_array* q,
     mlx_array* k_pool,
@@ -912,6 +953,9 @@ extern "C" bool mlx_inkling2_paged_prefill_attention_forward(
     mlx_array* block_table,
     mlx_array* workspace,
     mlx_array* rel_bias,
+    mlx_array* rel_bias_w,
+    mlx_array* gate,
+    mlx_array* sink,
     int committed_tokens,
     int splits,
     int max_splits,

@@ -192,10 +192,16 @@ pub struct Inkling2Attention {
     pub sink_proj: LinearProj,
     pub o_proj: LinearProj,
 
-    /// Optional fused `[Q, R, Gate]` projection on `x_q` (`[3072 + 384 + 3072, D]`).
+    /// Optional fused `[Q, R, Gate]` (or `[Q, R, Gate, Sink]` when `fused_qrg_has_sink`) projection on `x_q`.
     pub fused_qrg: Option<LinearProj>,
-    /// Optional fused `[Q, R, Gate, K, V]` projection when `x_q == x_k == x_v` (SWA pass 0 / prelude / coda).
+    /// Optional fused `[Q, R, Gate, (Sink,) K, V]` projection when `x_q == x_k == x_v` (SWA pass 0 / prelude / coda).
     pub fused_qrgkv: Option<LinearProj>,
+    /// True when `sink_proj` (`[H, D]`) is row-concatenated immediately after `gate_proj` in `fused_qrg` & `fused_qrgkv`.
+    pub fused_qrg_has_sink: bool,
+    /// Optional fused `[K, K_conv_proj]` projection on Global layers (`[1024 + 32, D]`).
+    pub fused_k_with_conv: Option<LinearProj>,
+    /// Optional fused `[V, V_conv_proj]` projection on Global layers (`[1024 + 32, D]`).
+    pub fused_v_with_conv: Option<LinearProj>,
 
     /// Static ShortConv weights `[C, 4]` (F32, oldest-to-newest).
     pub k_conv: MxArray,
@@ -209,10 +215,12 @@ pub struct Inkling2Attention {
     /// Clip scales & relative bias table.
     /// - `q_clip`: `[1, H, head_dim]` (F32)
     /// - `rel_clip`: `[1, H, d_rel]` (F32)
-    /// - `rel_bias_t`: `[d_rel, rel_extent]` (F32, pre-transposed for `R @ rel_bias_t`)
+    /// - `rel_bias_t`: `[d_rel, rel_extent]` (F32, pre-transposed for flat `R @ rel_bias_t`)
+    /// - `rel_bias_w`: `[rel_extent, d_rel]` (F32, row-contiguous for on-the-fly paged `dot(r, w[dist])`)
     pub q_clip: MxArray,
     pub rel_clip: MxArray,
     pub rel_bias_t: MxArray,
+    pub rel_bias_w: MxArray,
     /// Pre-allocated FP32 scalars for `l2_clip_fast` (eliminates 288 `scalar_float` allocs/step).
     pub qk_thresh_scalar: MxArray,
     pub rel_thresh_scalar: MxArray,
@@ -235,6 +243,22 @@ pub(crate) fn forward_linear_proj_fast_ex(
     include_tiny: bool,
 ) -> Result<MxArray> {
     #[cfg(target_os = "macos")]
+    if let LinearProj::Quantized(ql) = proj
+        && ql.is_symmetric_q8()
+        && x.dtype()? == DType::BFloat16
+        && unsafe { mlx_sys::mlx_metal_is_available() }
+    {
+        let xs = x.shape()?;
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+            return super::kernels::inkling2_q8_sym_matmul_bf16(
+                x,
+                ql.get_weight(),
+                ql.get_scales(),
+                DType::BFloat16,
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
     if let LinearProj::Standard(lin) = proj
         && lin.get_bias().is_none()
         && x.dtype()? == DType::BFloat16
@@ -253,6 +277,39 @@ pub(crate) fn forward_linear_proj_fast_ex(
 
 pub(crate) fn forward_linear_proj_fast(proj: &LinearProj, x: &MxArray) -> Result<MxArray> {
     forward_linear_proj_fast_ex(proj, x, false)
+}
+
+/// Fused single-dispatch Symmetric Q8_0 main projection + exact-BF16 tail projection (`sink_proj`,
+/// `k_conv_proj`, or `v_conv_proj`) on `1 <= M <= 32`, `K % 32 == 0`.
+pub(crate) fn try_forward_q8_sym_with_bf16_aux(
+    main: &LinearProj,
+    aux: &LinearProj,
+    x: &MxArray,
+) -> Result<Option<(MxArray, MxArray)>> {
+    #[cfg(target_os = "macos")]
+    if let (LinearProj::Quantized(ql), LinearProj::Standard(aux_lin)) = (main, aux)
+        && ql.is_symmetric_q8()
+        && aux_lin.get_bias().is_none()
+        && x.dtype()? == DType::BFloat16
+        && unsafe { mlx_sys::mlx_metal_is_available() }
+    {
+        let xs = x.shape()?;
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+            let w_aux = aux_lin.get_weight();
+            if w_aux.dtype()? == DType::BFloat16 {
+                return Ok(Some(super::kernels::inkling2_q8_sym_matmul_bf16_with_aux(
+                    x,
+                    ql.get_weight(),
+                    ql.get_scales(),
+                    &w_aux,
+                    DType::BFloat16,
+                )?));
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (main, aux, x);
+    Ok(None)
 }
 
 /// Row-concatenate two compatible `LinearProj` weights (`Quantized` via `LinearProj::concat_rows`
@@ -287,136 +344,354 @@ pub(crate) fn concat_linear_proj_rows(
 }
 
 impl Inkling2Attention {
-    /// Attempt to build fused `[Q, R, Gate]` and (for SWA) `[Q, R, Gate, K, V]` packed projections.
-    /// For dense `Standard` (BF16) projections, slices the individual views out of the fused backing
-    /// tensor so there is ZERO duplicate resident weight memory!
+    /// Attempt to build fused `[Q, R, Gate (, Sink)]`, (for SWA) `[Q, R, Gate (, Sink), K, V]`,
+    /// and (for Global dense BF16) `[K, K_conv]` / `[V, V_conv]` packed projections.
+    /// Slices individual views out of the fused backing tensor so there is ZERO duplicate resident
+    /// weight memory!
     pub fn try_fuse_projections(&mut self) -> Result<()> {
+        let q_dim = (self.num_heads * self.head_dim) as i64;
+        let r_dim = (self.num_heads * self.d_rel) as i64;
+        let g_dim = q_dim;
+        let s_dim = self.num_heads as i64;
+        let kv_dim = (self.num_kv_heads * self.head_dim) as i64;
+
         if let Some(qr) = concat_linear_proj_rows(&self.q_proj, &self.rel_proj)?
             && let Some(qrg) = concat_linear_proj_rows(&qr, &self.gate_proj)?
         {
+            // Row-concat `sink_proj` directly onto `qrg` when formats match (dense BF16 or matching Quantized).
+            let (qrg_base, has_sink) = match concat_linear_proj_rows(&qrg, &self.sink_proj)? {
+                Some(qrgs) => (qrgs, true),
+                None => (qrg, false),
+            };
+            self.fused_qrg_has_sink = has_sink;
+
+            let qrg_dim = q_dim + r_dim + g_dim + if has_sink { s_dim } else { 0 };
             if self.is_local
-                && let Some(qrgk) = concat_linear_proj_rows(&qrg, &self.k_proj)?
+                && let Some(qrgk) = concat_linear_proj_rows(&qrg_base, &self.k_proj)?
                 && let Some(qrgkv) = concat_linear_proj_rows(&qrgk, &self.v_proj)?
             {
-                if let LinearProj::Standard(ref fused_lin) = qrgkv {
-                    let w = fused_lin.get_weight();
-                    let d = w.shape()?[1];
-                    let q_dim = (self.num_heads * self.head_dim) as i64;
-                    let r_dim = (self.num_heads * self.d_rel) as i64;
-                    let g_dim = q_dim;
-                    let kv_dim = (self.num_kv_heads * self.head_dim) as i64;
-                    let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
-                        let sub = w.slice(&[start, 0], &[end, d])?;
-                        Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
-                            &sub, None,
-                        )?))
-                    };
-                    let o1 = q_dim;
-                    let o2 = o1 + r_dim;
-                    let o3 = o2 + g_dim;
-                    let o4 = o3 + kv_dim;
-                    let o5 = o4 + kv_dim;
-                    self.q_proj = slice_lin(0, o1)?;
-                    self.rel_proj = slice_lin(o1, o2)?;
-                    self.gate_proj = slice_lin(o2, o3)?;
-                    self.k_proj = slice_lin(o3, o4)?;
-                    self.v_proj = slice_lin(o4, o5)?;
-                    self.fused_qrg = Some(slice_lin(0, o3)?);
-                    self.fused_qrgkv = Some(qrgkv);
-                    return Ok(());
+                let o1 = q_dim;
+                let o2 = o1 + r_dim;
+                let o3 = o2 + g_dim;
+                let o_sink = if has_sink { o3 + s_dim } else { o3 };
+                let o4 = o_sink + kv_dim;
+                let o5 = o4 + kv_dim;
+                match qrgkv {
+                    LinearProj::Standard(ref fused_lin) => {
+                        let w = fused_lin.get_weight();
+                        let d = w.shape()?[1];
+                        let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
+                            let sub = w.slice(&[start, 0], &[end, d])?;
+                            Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
+                                &sub, None,
+                            )?))
+                        };
+                        self.q_proj = slice_lin(0, o1)?;
+                        self.rel_proj = slice_lin(o1, o2)?;
+                        self.gate_proj = slice_lin(o2, o3)?;
+                        if has_sink {
+                            self.sink_proj = slice_lin(o3, o_sink)?;
+                        }
+                        self.k_proj = slice_lin(o_sink, o4)?;
+                        self.v_proj = slice_lin(o4, o5)?;
+                        self.fused_qrg = Some(slice_lin(0, qrg_dim)?);
+                    }
+                    LinearProj::Quantized(ref fused_ql) => {
+                        self.q_proj = LinearProj::Quantized(fused_ql.slice_rows(0, o1)?);
+                        self.rel_proj = LinearProj::Quantized(fused_ql.slice_rows(o1, o2)?);
+                        self.gate_proj = LinearProj::Quantized(fused_ql.slice_rows(o2, o3)?);
+                        if has_sink {
+                            self.sink_proj =
+                                LinearProj::Quantized(fused_ql.slice_rows(o3, o_sink)?);
+                        }
+                        self.k_proj = LinearProj::Quantized(fused_ql.slice_rows(o_sink, o4)?);
+                        self.v_proj = LinearProj::Quantized(fused_ql.slice_rows(o4, o5)?);
+                        self.fused_qrg =
+                            Some(LinearProj::Quantized(fused_ql.slice_rows(0, qrg_dim)?));
+                    }
                 }
                 self.fused_qrgkv = Some(qrgkv);
-            } else if let LinearProj::Standard(ref fused_lin) = qrg {
-                let w = fused_lin.get_weight();
-                let d = w.shape()?[1];
-                let q_dim = (self.num_heads * self.head_dim) as i64;
-                let r_dim = (self.num_heads * self.d_rel) as i64;
-                let g_dim = q_dim;
-                let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
-                    let sub = w.slice(&[start, 0], &[end, d])?;
-                    Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
-                        &sub, None,
-                    )?))
-                };
-                self.q_proj = slice_lin(0, q_dim)?;
-                self.rel_proj = slice_lin(q_dim, q_dim + r_dim)?;
-                self.gate_proj = slice_lin(q_dim + r_dim, q_dim + r_dim + g_dim)?;
+                return Ok(());
+            } else {
+                let o1 = q_dim;
+                let o2 = o1 + r_dim;
+                let o3 = o2 + g_dim;
+                match qrg_base {
+                    LinearProj::Standard(ref fused_lin) => {
+                        let w = fused_lin.get_weight();
+                        let d = w.shape()?[1];
+                        let slice_lin = |start: i64, end: i64| -> Result<LinearProj> {
+                            let sub = w.slice(&[start, 0], &[end, d])?;
+                            Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
+                                &sub, None,
+                            )?))
+                        };
+                        self.q_proj = slice_lin(0, o1)?;
+                        self.rel_proj = slice_lin(o1, o2)?;
+                        self.gate_proj = slice_lin(o2, o3)?;
+                        if has_sink {
+                            self.sink_proj = slice_lin(o3, o3 + s_dim)?;
+                        }
+                    }
+                    LinearProj::Quantized(ref fused_ql) => {
+                        self.q_proj = LinearProj::Quantized(fused_ql.slice_rows(0, o1)?);
+                        self.rel_proj = LinearProj::Quantized(fused_ql.slice_rows(o1, o2)?);
+                        self.gate_proj = LinearProj::Quantized(fused_ql.slice_rows(o2, o3)?);
+                        if has_sink {
+                            self.sink_proj =
+                                LinearProj::Quantized(fused_ql.slice_rows(o3, o3 + s_dim)?);
+                        }
+                    }
+                }
+                self.fused_qrg = Some(qrg_base);
             }
-            self.fused_qrg = Some(qrg);
+        }
+
+        // Global layers: row-concat `k_conv_proj` onto `k_proj` and `v_conv_proj` onto `v_proj`
+        // when formats match (dense BF16 SafeTensors -> eliminates 16 tiny dispatches/step!).
+        if !self.is_local {
+            if let Some(ref k_cp) = self.k_conv_proj
+                && let Some(fused_k) = concat_linear_proj_rows(&self.k_proj, k_cp)?
+            {
+                if let LinearProj::Standard(ref lin) = fused_k {
+                    let w = lin.get_weight();
+                    let d = w.shape()?[1];
+                    let total_rows = w.shape()?[0];
+                    self.k_proj = LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &w.slice(&[0, 0], &[kv_dim, d])?,
+                        None,
+                    )?);
+                    self.k_conv_proj = Some(LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &w.slice(&[kv_dim, 0], &[total_rows, d])?,
+                        None,
+                    )?));
+                }
+                self.fused_k_with_conv = Some(fused_k);
+            }
+            if let Some(ref v_cp) = self.v_conv_proj
+                && let Some(fused_v) = concat_linear_proj_rows(&self.v_proj, v_cp)?
+            {
+                if let LinearProj::Standard(ref lin) = fused_v {
+                    let w = lin.get_weight();
+                    let d = w.shape()?[1];
+                    let total_rows = w.shape()?[0];
+                    self.v_proj = LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &w.slice(&[0, 0], &[kv_dim, d])?,
+                        None,
+                    )?);
+                    self.v_conv_proj = Some(LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &w.slice(&[kv_dim, 0], &[total_rows, d])?,
+                        None,
+                    )?));
+                }
+                self.fused_v_with_conv = Some(fused_v);
+            }
         }
         Ok(())
     }
 
-    /// Run the (optionally fused) Q, R, Gate, K, V, and Sink linear projections.
+    /// Run the (optionally fused) Q, R, Gate, K, V, Sink, and Global dynamic ShortConv projections.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn project_qrgkv_and_sink(
+    pub(crate) fn project_qrgkv_sink_and_dyn_conv(
         &self,
         x_q: &MxArray,
         x_k_v: Option<(&MxArray, &MxArray)>,
-    ) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray, MxArray)> {
+    ) -> Result<(
+        MxArray,
+        MxArray,
+        MxArray,
+        MxArray,
+        MxArray,
+        MxArray,
+        Option<MxArray>,
+        Option<MxArray>,
+    )> {
+        let t_i64 = x_q.shape()?[0];
         let q_dim = (self.num_heads * self.head_dim) as i64;
         let r_dim = (self.num_heads * self.d_rel) as i64;
         let g_dim = q_dim;
+        let s_dim = self.num_heads as i64;
         let kv_dim = (self.num_kv_heads * self.head_dim) as i64;
+        let dense_bf16 = matches!(self.q_proj, LinearProj::Standard(_));
 
-        let (q_raw, r_raw, gate_raw, k_raw, v_raw) = if x_k_v.is_none()
+        let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_opt, dyn_k_flat, dyn_v_flat) = if x_k_v
+            .is_none()
             && let Some(ref fused) = self.fused_qrgkv
         {
-            let all = forward_linear_proj_fast(fused, x_q)?;
-            let mut parts = all.split_sections(
-                &[
-                    q_dim,
-                    q_dim + r_dim,
-                    q_dim + r_dim + g_dim,
-                    q_dim + r_dim + g_dim + kv_dim,
-                ],
-                -1,
-            )?;
-            let v_p = parts
-                .pop()
-                .ok_or_else(|| Error::from_reason("split qrgkv: v"))?;
-            let k_p = parts
-                .pop()
-                .ok_or_else(|| Error::from_reason("split qrgkv: k"))?;
-            let g_p = parts
-                .pop()
-                .ok_or_else(|| Error::from_reason("split qrgkv: g"))?;
-            let r_p = parts
-                .pop()
-                .ok_or_else(|| Error::from_reason("split qrgkv: r"))?;
-            let q_p = parts
-                .pop()
-                .ok_or_else(|| Error::from_reason("split qrgkv: q"))?;
-            (q_p, r_p, g_p, k_p, v_p)
-        } else {
-            let (q_p, r_p, g_p) = if let Some(ref fused) = self.fused_qrg {
-                let qrg = forward_linear_proj_fast(fused, x_q)?;
-                let mut parts = qrg.split_sections(&[q_dim, q_dim + r_dim], -1)?;
+            if self.fused_qrg_has_sink {
+                let all = forward_linear_proj_fast(fused, x_q)?;
+                let o1 = q_dim;
+                let o2 = o1 + r_dim;
+                let o3 = o2 + g_dim;
+                let o4 = o3 + s_dim;
+                let o5 = o4 + kv_dim;
+                let mut parts = all.split_sections(&[o1, o2, o3, o4, o5], -1)?;
+                let v_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgskv: v"))?;
+                let k_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgskv: k"))?;
+                let s_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgskv: sink"))?;
                 let g_p = parts
                     .pop()
-                    .ok_or_else(|| Error::from_reason("split qrg: g"))?;
+                    .ok_or_else(|| Error::from_reason("split qrgskv: g"))?;
                 let r_p = parts
                     .pop()
-                    .ok_or_else(|| Error::from_reason("split qrg: r"))?;
+                    .ok_or_else(|| Error::from_reason("split qrgskv: r"))?;
                 let q_p = parts
                     .pop()
-                    .ok_or_else(|| Error::from_reason("split qrg: q"))?;
-                (q_p, r_p, g_p)
+                    .ok_or_else(|| Error::from_reason("split qrgskv: q"))?;
+                (q_p, r_p, g_p, k_p, v_p, Some(s_p), None, None)
+            } else {
+                let (all, s_opt) =
+                    match try_forward_q8_sym_with_bf16_aux(fused, &self.sink_proj, x_q)? {
+                        Some((a, s)) => (a, Some(s)),
+                        None => (forward_linear_proj_fast(fused, x_q)?, None),
+                    };
+                let mut parts = all.split_sections(
+                    &[
+                        q_dim,
+                        q_dim + r_dim,
+                        q_dim + r_dim + g_dim,
+                        q_dim + r_dim + g_dim + kv_dim,
+                    ],
+                    -1,
+                )?;
+                let v_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgkv: v"))?;
+                let k_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgkv: k"))?;
+                let g_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgkv: g"))?;
+                let r_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgkv: r"))?;
+                let q_p = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split qrgkv: q"))?;
+                (q_p, r_p, g_p, k_p, v_p, s_opt, None, None)
+            }
+        } else {
+            let (q_p, r_p, g_p, s_opt) = if let Some(ref fused) = self.fused_qrg {
+                if self.fused_qrg_has_sink {
+                    let qrgs = forward_linear_proj_fast(fused, x_q)?;
+                    let mut parts =
+                        qrgs.split_sections(&[q_dim, q_dim + r_dim, q_dim + r_dim + g_dim], -1)?;
+                    let s_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrgs: sink"))?;
+                    let g_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrgs: g"))?;
+                    let r_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrgs: r"))?;
+                    let q_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrgs: q"))?;
+                    (q_p, r_p, g_p, Some(s_p))
+                } else {
+                    let (qrg, s_opt) =
+                        match try_forward_q8_sym_with_bf16_aux(fused, &self.sink_proj, x_q)? {
+                            Some((a, s)) => (a, Some(s)),
+                            None => (forward_linear_proj_fast(fused, x_q)?, None),
+                        };
+                    let mut parts = qrg.split_sections(&[q_dim, q_dim + r_dim], -1)?;
+                    let g_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrg: g"))?;
+                    let r_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrg: r"))?;
+                    let q_p = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split qrg: q"))?;
+                    (q_p, r_p, g_p, s_opt)
+                }
             } else {
                 (
                     forward_linear_proj_fast(&self.q_proj, x_q)?,
                     forward_linear_proj_fast(&self.rel_proj, x_q)?,
                     forward_linear_proj_fast(&self.gate_proj, x_q)?,
+                    None,
                 )
             };
             let (x_k, x_v) = x_k_v.unwrap_or((x_q, x_q));
-            let k_p = forward_linear_proj_fast(&self.k_proj, x_k)?;
-            let v_p = forward_linear_proj_fast(&self.v_proj, x_v)?;
-            (q_p, r_p, g_p, k_p, v_p)
+            let (k_p, dk_opt) = if let Some(ref fused_k) = self.fused_k_with_conv {
+                let kc = forward_linear_proj_fast(fused_k, x_k)?;
+                let mut parts = kc.split_sections(&[kv_dim], -1)?;
+                let dk = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split k_conv: dk"))?;
+                let kp = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split k_conv: k"))?;
+                (kp, Some(dk))
+            } else if let Some(ref k_cp) = self.k_conv_proj
+                && let Some((kp, dk)) = try_forward_q8_sym_with_bf16_aux(&self.k_proj, k_cp, x_k)?
+            {
+                (kp, Some(dk))
+            } else {
+                (forward_linear_proj_fast(&self.k_proj, x_k)?, None)
+            };
+            let (v_p, dv_opt) = if let Some(ref fused_v) = self.fused_v_with_conv {
+                let vc = forward_linear_proj_fast(fused_v, x_v)?;
+                let mut parts = vc.split_sections(&[kv_dim], -1)?;
+                let dv = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split v_conv: dv"))?;
+                let vp = parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split v_conv: v"))?;
+                (vp, Some(dv))
+            } else if let Some(ref v_cp) = self.v_conv_proj
+                && let Some((vp, dv)) = try_forward_q8_sym_with_bf16_aux(&self.v_proj, v_cp, x_v)?
+            {
+                (vp, Some(dv))
+            } else {
+                (forward_linear_proj_fast(&self.v_proj, x_v)?, None)
+            };
+            (q_p, r_p, g_p, k_p, v_p, s_opt, dk_opt, dv_opt)
         };
-        let dense_bf16 = matches!(self.q_proj, LinearProj::Standard(_));
-        let sink_raw = forward_linear_proj_fast_ex(&self.sink_proj, x_q, dense_bf16)?;
-        Ok((q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw))
+
+        let sink_raw = match sink_opt {
+            Some(s) => s,
+            None => forward_linear_proj_fast_ex(&self.sink_proj, x_q, dense_bf16)?,
+        };
+        let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
+        let dyn_k = if let Some(dk) = dyn_k_flat {
+            Some(dk.reshape(&[t_i64, self.num_kv_heads as i64, self.k_conv.shape()?[1]])?)
+        } else if let Some(ref k_cp) = self.k_conv_proj {
+            Some(
+                forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?.reshape(&[
+                    t_i64,
+                    self.num_kv_heads as i64,
+                    self.k_conv.shape()?[1],
+                ])?,
+            )
+        } else {
+            None
+        };
+        let dyn_v = if let Some(dv) = dyn_v_flat {
+            Some(dv.reshape(&[t_i64, self.num_kv_heads as i64, self.v_conv.shape()?[1]])?)
+        } else if let Some(ref v_cp) = self.v_conv_proj {
+            Some(
+                forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?.reshape(&[
+                    t_i64,
+                    self.num_kv_heads as i64,
+                    self.v_conv.shape()?[1],
+                ])?,
+            )
+        } else {
+            None
+        };
+        Ok((q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw, dyn_k, dyn_v))
     }
 
     /// Flat self-attention forward pass for one logical visit.
@@ -441,29 +716,17 @@ impl Inkling2Attention {
         let q_dim = (self.num_heads * self.head_dim) as i64;
 
         // 1. Projections (using fused projections when available)
-        let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw) =
-            self.project_qrgkv_and_sink(x_q, x_k_v)?;
+        let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw, dyn_k, dyn_v) =
+            self.project_qrgkv_sink_and_dyn_conv(x_q, x_k_v)?;
 
         // 2. K & V ShortConv (static on SWA, dynamic on Global)
-        let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
-        let dense_bf16 = matches!(self.q_proj, LinearProj::Standard(_));
-        let k_conv_out = if let Some(ref k_cp) = self.k_conv_proj {
-            let dyn_k = forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?.reshape(&[
-                t_i64,
-                self.num_kv_heads as i64,
-                self.k_conv.shape()?[1],
-            ])?;
-            dynamic_short_conv(&k_raw, &self.k_conv, &dyn_k, &mut conv_state.k)?
+        let k_conv_out = if let Some(ref dyn_k) = dyn_k {
+            dynamic_short_conv(&k_raw, &self.k_conv, dyn_k, &mut conv_state.k)?
         } else {
             static_short_conv(&k_raw, &self.k_conv, &mut conv_state.k)?
         };
-        let v_conv_out = if let Some(ref v_cp) = self.v_conv_proj {
-            let dyn_v = forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?.reshape(&[
-                t_i64,
-                self.num_kv_heads as i64,
-                self.v_conv.shape()?[1],
-            ])?;
-            dynamic_short_conv(&v_raw, &self.v_conv, &dyn_v, &mut conv_state.v)?
+        let v_conv_out = if let Some(ref dyn_v) = dyn_v {
+            dynamic_short_conv(&v_raw, &self.v_conv, dyn_v, &mut conv_state.v)?
         } else {
             static_short_conv(&v_raw, &self.v_conv, &mut conv_state.v)?
         };
@@ -614,51 +877,62 @@ impl Inkling2Attention {
             .reshape(&[t_i64, q_dim])?;
 
         // 8. Output projection + static `attn_post_conv`
-        let proj_out = self.o_proj.forward(&y)?;
+        let proj_out = forward_linear_proj_fast(&self.o_proj, &y)?;
         static_short_conv(&proj_out, &self.post_conv, &mut conv_state.attn_post)
     }
 
     pub fn weight_arrays(&self) -> Vec<MxArray> {
         let mut arrays = Vec::new();
-        if let Some(ref f) = self.fused_qrgkv
-            && matches!(f, LinearProj::Standard(_))
-        {
-            // All 5 individual views + `fused_qrg` alias this single backing buffer.
+        if let Some(ref f) = self.fused_qrgkv {
+            // All individual views (`q/r/g/(sink)/k/v` + `fused_qrg`) alias this single backing buffer.
             push_linear_proj_arrays(f, &mut arrays);
-        } else if let Some(ref f) = self.fused_qrg
-            && matches!(f, LinearProj::Standard(_))
-        {
-            // `q_proj`, `rel_proj`, `gate_proj` alias `fused_qrg`; `k_proj` & `v_proj` are separate.
+            if !self.fused_qrg_has_sink {
+                push_linear_proj_arrays(&self.sink_proj, &mut arrays);
+            }
+        } else if let Some(ref f) = self.fused_qrg {
+            // `q/r/g/(sink)` alias `fused_qrg`; `k` & `v` (or `fused_{k,v}_with_conv`) are separate.
             push_linear_proj_arrays(f, &mut arrays);
-            push_linear_proj_arrays(&self.k_proj, &mut arrays);
-            push_linear_proj_arrays(&self.v_proj, &mut arrays);
+            if !self.fused_qrg_has_sink {
+                push_linear_proj_arrays(&self.sink_proj, &mut arrays);
+            }
+            if let Some(ref fk) = self.fused_k_with_conv {
+                push_linear_proj_arrays(fk, &mut arrays);
+            } else {
+                push_linear_proj_arrays(&self.k_proj, &mut arrays);
+                if let Some(ref p) = self.k_conv_proj {
+                    push_linear_proj_arrays(p, &mut arrays);
+                }
+            }
+            if let Some(ref fv) = self.fused_v_with_conv {
+                push_linear_proj_arrays(fv, &mut arrays);
+            } else {
+                push_linear_proj_arrays(&self.v_proj, &mut arrays);
+                if let Some(ref p) = self.v_conv_proj {
+                    push_linear_proj_arrays(p, &mut arrays);
+                }
+            }
         } else {
             push_linear_proj_arrays(&self.q_proj, &mut arrays);
             push_linear_proj_arrays(&self.k_proj, &mut arrays);
             push_linear_proj_arrays(&self.v_proj, &mut arrays);
             push_linear_proj_arrays(&self.rel_proj, &mut arrays);
             push_linear_proj_arrays(&self.gate_proj, &mut arrays);
-            if let Some(ref f) = self.fused_qrg {
-                push_linear_proj_arrays(f, &mut arrays);
+            push_linear_proj_arrays(&self.sink_proj, &mut arrays);
+            if let Some(ref p) = self.k_conv_proj {
+                push_linear_proj_arrays(p, &mut arrays);
             }
-            if let Some(ref f) = self.fused_qrgkv {
-                push_linear_proj_arrays(f, &mut arrays);
+            if let Some(ref p) = self.v_conv_proj {
+                push_linear_proj_arrays(p, &mut arrays);
             }
         }
-        push_linear_proj_arrays(&self.sink_proj, &mut arrays);
         push_linear_proj_arrays(&self.o_proj, &mut arrays);
         arrays.push(self.k_conv.clone());
         arrays.push(self.v_conv.clone());
         arrays.push(self.post_conv.clone());
-        if let Some(ref p) = self.k_conv_proj {
-            push_linear_proj_arrays(p, &mut arrays);
-        }
-        if let Some(ref p) = self.v_conv_proj {
-            push_linear_proj_arrays(p, &mut arrays);
-        }
         arrays.push(self.q_clip.clone());
         arrays.push(self.rel_clip.clone());
         arrays.push(self.rel_bias_t.clone());
+        arrays.push(self.rel_bias_w.clone());
         arrays.push(self.qk_thresh_scalar.clone());
         arrays.push(self.rel_thresh_scalar.clone());
         arrays.push(self.one_scalar.clone());
@@ -734,5 +1008,186 @@ mod tests {
         // p=8192 -> 1 + 0.1 * ln(8193 / 8192)
         let exp2 = 1.0 + 0.1 * (8193.0_f64 / 8192.0).ln();
         assert!((tau[2] as f64 - exp2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sink_and_dyn_conv_fusion_matches_unfused_bf16_and_q8() {
+        use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, QuantizedLinear};
+
+        let mut seed = 0x51A4_F00Du64;
+        let mut next_vec = |len: usize, scale: f32| -> Vec<f32> {
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let u = ((seed >> 33) as f32) / (u32::MAX as f32) - 0.5;
+                out.push(u * scale);
+            }
+            out
+        };
+
+        let d = 64usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let hd = 16usize;
+        let d_rel = 8usize;
+        let q_dim = n_heads * hd;
+        let kv_dim = n_kv * hd;
+        let r_dim = n_heads * d_rel;
+
+        let make_bf16_lin = |rows: usize, cols: usize, vals: &[f32]| -> LinearProj {
+            let w = MxArray::from_float32(vals, &[rows as i64, cols as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            LinearProj::Standard(crate::nn::Linear::from_weights(&w, None).unwrap())
+        };
+        let make_sym_q8_lin = |rows: usize, cols: usize, rng_seed: &mut u64| -> LinearProj {
+            let mut w_u32 = vec![0u32; rows * (cols / 4)];
+            for w in &mut w_u32 {
+                *rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *w = (*rng_seed >> 16) as u32;
+            }
+            let sc_vals: Vec<f32> = (0..(rows * (cols / 32)))
+                .map(|i| 0.01 + ((i % 7) as f32) * 0.003)
+                .collect();
+            let sc = MxArray::from_float32(&sc_vals, &[rows as i64, (cols / 32) as i64])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+            let bi = sc
+                .mul_scalar(-128.0)
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+            let wq = MxArray::from_uint32(&w_u32, &[rows as i64, (cols / 4) as i64]).unwrap();
+            let mut ql = QuantizedLinear::new(
+                wq,
+                sc,
+                Some(bi),
+                None,
+                32,
+                8,
+                DEFAULT_QUANT_MODE.to_string(),
+            );
+            assert!(ql.try_compact_symmetric_q8_f16().unwrap());
+            LinearProj::Quantized(ql)
+        };
+
+        for &(is_local, use_q8) in &[(true, false), (false, false), (true, true), (false, true)] {
+            let mut q8_seed = 0x1234_5678u64 ^ ((is_local as u64) << 8) ^ (use_q8 as u64);
+            let q_v = next_vec(q_dim * d, 0.2);
+            let k_v = next_vec(kv_dim * d, 0.2);
+            let v_v = next_vec(kv_dim * d, 0.2);
+            let r_v = next_vec(r_dim * d, 0.2);
+            let g_v = next_vec(q_dim * d, 0.2);
+            let s_v = next_vec(n_heads * d, 0.2);
+            let o_v = next_vec(d * q_dim, 0.2);
+            let kc_v = next_vec(n_kv * 4 * d, 0.2);
+            let vc_v = next_vec(n_kv * 4 * d, 0.2);
+
+            let build_attn = |s_q8: &mut u64| -> Inkling2Attention {
+                let mk = |rows: usize, cols: usize, v: &[f32], s_q8: &mut u64| {
+                    if use_q8 {
+                        make_sym_q8_lin(rows, cols, s_q8)
+                    } else {
+                        make_bf16_lin(rows, cols, v)
+                    }
+                };
+                Inkling2Attention {
+                    num_heads: n_heads,
+                    num_kv_heads: n_kv,
+                    head_dim: hd,
+                    d_rel,
+                    rel_extent: 16,
+                    sliding_window: 32,
+                    is_local,
+                    qk_l2_clip_threshold: 22.627,
+                    rel_l2_clip_threshold: 8.0,
+                    log_scaling_n_floor: 8192,
+                    log_scaling_alpha: 0.1,
+                    rms_norm_eps: 1e-6,
+                    q_proj: mk(q_dim, d, &q_v, s_q8),
+                    k_proj: mk(kv_dim, d, &k_v, s_q8),
+                    v_proj: mk(kv_dim, d, &v_v, s_q8),
+                    rel_proj: mk(r_dim, d, &r_v, s_q8),
+                    gate_proj: mk(q_dim, d, &g_v, s_q8),
+                    sink_proj: make_bf16_lin(n_heads, d, &s_v),
+                    o_proj: mk(d, q_dim, &o_v, s_q8),
+                    fused_qrg: None,
+                    fused_qrgkv: None,
+                    fused_qrg_has_sink: false,
+                    fused_k_with_conv: None,
+                    fused_v_with_conv: None,
+                    k_conv: MxArray::zeros(&[kv_dim as i64, 4], Some(DType::Float32)).unwrap(),
+                    v_conv: MxArray::zeros(&[kv_dim as i64, 4], Some(DType::Float32)).unwrap(),
+                    post_conv: MxArray::zeros(&[d as i64, 4], Some(DType::Float32)).unwrap(),
+                    k_conv_proj: (!is_local).then(|| make_bf16_lin(n_kv * 4, d, &kc_v)),
+                    v_conv_proj: (!is_local).then(|| make_bf16_lin(n_kv * 4, d, &vc_v)),
+                    q_clip: MxArray::ones(&[1, n_heads as i64, hd as i64], Some(DType::Float32))
+                        .unwrap(),
+                    rel_clip: MxArray::ones(
+                        &[1, n_heads as i64, d_rel as i64],
+                        Some(DType::Float32),
+                    )
+                    .unwrap(),
+                    rel_bias_t: MxArray::zeros(&[d_rel as i64, 16], Some(DType::Float32)).unwrap(),
+                    rel_bias_w: MxArray::zeros(&[16, d_rel as i64], Some(DType::Float32)).unwrap(),
+                    qk_thresh_scalar: MxArray::scalar_float(22.627).unwrap(),
+                    rel_thresh_scalar: MxArray::scalar_float(8.0).unwrap(),
+                    one_scalar: MxArray::scalar_float(1.0).unwrap(),
+                }
+            };
+
+            let mut s1 = q8_seed;
+            let unfused = build_attn(&mut s1);
+            let mut fused = build_attn(&mut q8_seed);
+            fused.try_fuse_projections().unwrap();
+            assert_eq!(fused.fused_qrg_has_sink, !use_q8);
+            assert_eq!(fused.fused_k_with_conv.is_some(), !is_local && !use_q8);
+            assert_eq!(fused.fused_v_with_conv.is_some(), !is_local && !use_q8);
+
+            for &m in &[1usize, 8, 20] {
+                let x_q = MxArray::from_float32(&next_vec(m * d, 0.8), &[m as i64, d as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let x_k = MxArray::from_float32(&next_vec(m * d, 0.8), &[m as i64, d as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let x_v = MxArray::from_float32(&next_vec(m * d, 0.8), &[m as i64, d as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let xkv = (!is_local).then_some((&x_k, &x_v));
+                let u = unfused.project_qrgkv_sink_and_dyn_conv(&x_q, xkv).unwrap();
+                let f = fused.project_qrgkv_sink_and_dyn_conv(&x_q, xkv).unwrap();
+                let check = |a: &MxArray, b: &MxArray, name: &str| {
+                    let av = a.to_float32().unwrap();
+                    let bv = b.to_float32().unwrap();
+                    let md = av
+                        .iter()
+                        .zip(bv.iter())
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        md <= 0.0625,
+                        "fusion mismatch {name} (is_local={is_local}, use_q8={use_q8}, M={m}): max_diff={md}"
+                    );
+                };
+                check(&u.0, &f.0, "q");
+                check(&u.1, &f.1, "r");
+                check(&u.2, &f.2, "gate");
+                check(&u.3, &f.3, "k");
+                check(&u.4, &f.4, "v");
+                check(&u.5, &f.5, "sink");
+                if let (Some(udk), Some(fdk)) = (&u.6, &f.6) {
+                    check(udk, fdk, "dyn_k");
+                }
+                if let (Some(udv), Some(fdv)) = (&u.7, &f.7) {
+                    check(udv, fdv, "dyn_v");
+                }
+            }
+        }
     }
 }

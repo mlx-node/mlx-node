@@ -29,7 +29,8 @@ use super::kernels::{
     Inkling2KvDtype, inkling2_block_attn_res, inkling2_gate_sink, inkling2_grouped_moe_available,
     inkling2_lm_head_softcap_argmax, inkling2_markov_fold_softcap_argmax, inkling2_markov_gate,
     inkling2_moe_combine, inkling2_moe_route, inkling2_moe_router_proj, inkling2_paged_attention,
-    inkling2_qr_clip, inkling2_sconv_k4_kv_prep, inkling2_sconv_k4_ragged, inkling2_situ,
+    inkling2_paged_attention_ex, inkling2_qr_clip, inkling2_sconv_k4_kv_prep,
+    inkling2_sconv_k4_kv_prep_paged, inkling2_sconv_k4_ragged, inkling2_situ,
 };
 use super::model::{AttnInputNorm, Inkling2Inner};
 use super::persistence::{load_from_dir, test_real_model_path};
@@ -280,7 +281,12 @@ fn run_single_dspark(
             && let Some(ref dev_drafts) = prop.device_draft_ids
         {
             let anchor_arr = MxArray::from_int32(&[anchor as i32], &[1]).expect("anchor");
-            Some(MxArray::concatenate(&anchor_arr, dev_drafts, 0).expect("concat"))
+            let v_ids = MxArray::concatenate(&anchor_arr, dev_drafts, 0).expect("concat");
+            // Kick ONE async_eval right after propose_block returns (before target verify
+            // builds its 48-visit graph) so GPU executes `commit (append_taps) + propose_block`
+            // in ONE continuous Metal CB overlapped with CPU graph build!
+            MxArray::async_eval_arrays(&[&v_ids]);
+            Some(v_ids)
         } else {
             None
         };
@@ -378,23 +384,6 @@ fn run_single_dspark(
         draft_ctx
             .append_taps(draft, &taps, keep)
             .expect("append_taps");
-        {
-            let mut async_refs: Vec<&MxArray> = Vec::new();
-            if let Some(ref rt) = inner.paged
-                && let Some(conv) = rt.conv_states.get(&seq_id)
-            {
-                for v in &conv.visits {
-                    async_refs.push(&v.k);
-                    async_refs.push(&v.v);
-                    async_refs.push(&v.attn_post);
-                    async_refs.push(&v.mlp_post);
-                }
-            }
-            draft_ctx.collect_arrays(&mut async_refs);
-            if !async_refs.is_empty() {
-                MxArray::async_eval_arrays(&async_refs);
-            }
-        }
         commit_ms += t_com.elapsed().as_secs_f64() * 1000.0;
 
         if cap > 0 {
@@ -660,6 +649,9 @@ fn run_4lane_dspark(
         }
         let seg_refs: Vec<&MxArray> = device_segments.iter().collect();
         let stacked_verify_ids = MxArray::concatenate_many(seg_refs, Some(0)).expect("concat_many");
+        // Kick ONE async_eval on `stacked_verify_ids` so GPU runs `commit + propose_blocks_batched`
+        // in ONE continuous Metal CB while CPU builds the 48-visit target verify wave!
+        MxArray::async_eval_arrays(&[&stacked_verify_ids]);
         propose_ms += t_prop.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Stacked [N * 8] target verify wave + fused `inkling2_lm_head_softcap_argmax`
@@ -782,27 +774,6 @@ fn run_4lane_dspark(
             }
             Inkling2DsparkContext::append_taps_batched(draft, &mut batch_args)
                 .expect("append_taps_batched");
-        }
-        {
-            let mut evals: Vec<&MxArray> = Vec::new();
-            if let Some(ref rt) = inner.paged {
-                for &lane_idx in &active {
-                    if let Some(conv) = rt.conv_states.get(&(lane_idx as SeqId)) {
-                        for v in &conv.visits {
-                            evals.push(&v.k);
-                            evals.push(&v.v);
-                            evals.push(&v.attn_post);
-                            evals.push(&v.mlp_post);
-                        }
-                    }
-                }
-            }
-            for &lane_idx in &active {
-                draft_ctxs[lane_idx].collect_arrays(&mut evals);
-            }
-            if !evals.is_empty() {
-                MxArray::async_eval_arrays(&evals);
-            }
         }
         commit_ms += t_com.elapsed().as_secs_f64() * 1000.0;
     }
@@ -992,11 +963,6 @@ struct VisitCapture {
     sink_raw: MxArray,
     q_cur: MxArray,
     r_for_rel: MxArray,
-    k_cur: MxArray,
-    v_cur: MxArray,
-    rel_bias: MxArray,
-    attn_o: MxArray,
-    lse: MxArray,
     y: MxArray,
     proj_out: MxArray,
     blocks_after_attn: Vec<MxArray>,
@@ -1373,30 +1339,9 @@ fn profile_48_visits(
             let attn = &layer.self_attn;
             let q_dim = (attn.num_heads * attn.head_dim) as i64;
             let x_k_v_ref = x_k_v_normed.as_ref().map(|(k, v)| (k, v));
-            let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw) =
-                attn.project_qrgkv_and_sink(&x_q, x_k_v_ref).expect("proj");
-
-            let (x_k_inp, x_v_inp) = x_k_v_ref.unwrap_or((&x_q, &x_q));
-            let dyn_k = attn.k_conv_proj.as_ref().map(|cp| {
-                cp.forward(x_k_inp)
-                    .expect("kcp")
-                    .reshape(&[
-                        t_i64,
-                        attn.num_kv_heads as i64,
-                        attn.k_conv.shape().expect("s")[1],
-                    ])
-                    .expect("r")
-            });
-            let dyn_v = attn.v_conv_proj.as_ref().map(|cp| {
-                cp.forward(x_v_inp)
-                    .expect("vcp")
-                    .reshape(&[
-                        t_i64,
-                        attn.num_kv_heads as i64,
-                        attn.v_conv.shape().expect("s")[1],
-                    ])
-                    .expect("r")
-            });
+            let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw, dyn_k, dyn_v) = attn
+                .project_qrgkv_sink_and_dyn_conv(&x_q, x_k_v_ref)
+                .expect("proj");
 
             let tau_opt = if !attn.is_local {
                 global_tau.as_ref()
@@ -1637,11 +1582,6 @@ fn profile_48_visits(
                 &sink_raw,
                 &q_cur,
                 &r_for_rel,
-                &k_cur,
-                &v_cur,
-                &rel_bias,
-                &attn_o,
-                &lse,
                 &y,
                 &proj_out,
                 &ffn_inp,
@@ -1691,11 +1631,6 @@ fn profile_48_visits(
                 sink_raw,
                 q_cur,
                 r_for_rel,
-                k_cur,
-                v_cur,
-                rel_bias,
-                attn_o,
-                lse,
                 y,
                 proj_out,
                 blocks_after_attn,
@@ -1953,14 +1888,22 @@ fn profile_48_visits(
     // Stage 1c: FP32 Residual Adds — fused into `sconv_attn_post` & `sconv_mlp_post` in Stage 2!
     bd.residual_add_ms = 0.0;
 
-    // Stage 2a: Dense Q8_0 qrgkv / qrg+k+v + sink projections (48 visits, 1 sync)
+    // Stage 2a: Dense Q8_0 qrgkv / qrg+k+v + sink (+ fused dyn_conv) projections (48 visits, 1 sync)
     bd.qrgkv_sink_proj_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(captures.len() * 6);
+        let mut outs = Vec::with_capacity(captures.len() * 8);
         for cap in &captures {
             let attn = &inner.layers[cap.phys_layer].self_attn;
             let xkv = cap.x_k_v.as_ref().map(|(k, v)| (k, v));
-            let (q, r, g, k, v, s) = attn.project_qrgkv_and_sink(&cap.x_q, xkv).expect("proj");
+            let (q, r, g, k, v, s, dk, dv) = attn
+                .project_qrgkv_sink_and_dyn_conv(&cap.x_q, xkv)
+                .expect("proj");
             outs.extend([q, r, g, k, v, s]);
+            if let Some(dk) = dk {
+                outs.push(dk);
+            }
+            if let Some(dv) = dv {
+                outs.push(dv);
+            }
         }
         eval_owned_sync(&outs);
     });
@@ -1980,11 +1923,13 @@ fn profile_48_visits(
         eval_owned_sync(&outs);
     });
 
-    // Stage 3a: Fused ShortConv K/V + K L2-clip + V RMSNorm (+ Global dynamic conv proj)
+    // Stage 3a: Fused ShortConv K/V + K L2-clip + V RMSNorm + PagedKVWrite (+ Global dyn_proj)
     bd.sconv_kv_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(captures.len() * 4);
+        let rt = inner.paged.as_mut().expect("paged");
+        let mut outs = Vec::with_capacity(captures.len() * 2);
         for cap in &captures {
             let attn = &inner.layers[cap.phys_layer].self_attn;
+            let gm = &group_metas[cap.group_id];
             let (xk_in, xv_in) = cap
                 .x_k_v
                 .as_ref()
@@ -2005,27 +1950,68 @@ fn profile_48_visits(
                     .reshape(&[t_i64, attn.num_kv_heads as i64, 4])
                     .expect("r")
             });
-            let (kc, vc_o, kh, vh) = inkling2_sconv_k4_kv_prep(
-                &cap.k_raw,
-                &cap.v_raw,
-                &attn.k_conv,
-                &attn.v_conv,
-                dk.as_ref(),
-                dv.as_ref(),
-                None,
-                &[&cap.vc_before.k],
-                &[&cap.vc_before.v],
-                1,
-                false,
-                attn.num_kv_heads,
-                attn.head_dim,
-                attn.qk_l2_clip_threshold as f32,
-                attn.rms_norm_eps,
-                1e-6,
-            )
-            .expect("kvp");
-            outs.extend([kc, vc_o, kh, vh]);
+            #[cfg(target_os = "macos")]
+            {
+                let adapter = rt.coordinator.adapter_mut(cap.group_id).expect("ad");
+                let (kp_in, vp_in, ks_in, vs_in, kv_mode) = adapter
+                    .native_fused_write_pool_arrays(cap.phys_layer_ord)
+                    .expect("pool");
+                let (kp_o, vp_o, ks_o, vs_o, kh, vh) = inkling2_sconv_k4_kv_prep_paged(
+                    &cap.k_raw,
+                    &cap.v_raw,
+                    &attn.k_conv,
+                    &attn.v_conv,
+                    dk.as_ref(),
+                    dv.as_ref(),
+                    None,
+                    &[&cap.vc_before.k],
+                    &[&cap.vc_before.v],
+                    &kp_in,
+                    &vp_in,
+                    &ks_in,
+                    &vs_in,
+                    &gm.slot_mapping,
+                    1,
+                    false,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    page_block_size as usize,
+                    kv_mode,
+                    attn.qk_l2_clip_threshold as f32,
+                    attn.rms_norm_eps,
+                    1e-6,
+                )
+                .expect("kvp_paged");
+                adapter
+                    .commit_native_fused_write(cap.phys_layer_ord, kp_o, vp_o, ks_o, vs_o)
+                    .expect("commit");
+                outs.extend([kh, vh]);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let (kc, vc_o, kh, vh) = inkling2_sconv_k4_kv_prep(
+                    &cap.k_raw,
+                    &cap.v_raw,
+                    &attn.k_conv,
+                    &attn.v_conv,
+                    dk.as_ref(),
+                    dv.as_ref(),
+                    None,
+                    &[&cap.vc_before.k],
+                    &[&cap.vc_before.v],
+                    1,
+                    false,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    attn.qk_l2_clip_threshold as f32,
+                    attn.rms_norm_eps,
+                    1e-6,
+                )
+                .expect("kvp");
+                outs.extend([kc, vc_o, kh, vh]);
+            }
         }
+        rt.coordinator.eval_pending_pool_writes_all().expect("ev");
         eval_owned_sync(&outs);
     });
 
@@ -2110,37 +2096,13 @@ fn profile_48_visits(
         eval_owned_sync(&outs);
     });
 
-    // Stage 4b: rel_bias matmul (48 visits, 1 sync)
-    bd.rel_bias_matmul_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(captures.len());
-        for cap in &captures {
-            let attn = &inner.layers[cap.phys_layer].self_attn;
-            outs.push(cap.r_for_rel.matmul(&attn.rel_bias_t).expect("rb"));
-        }
-        eval_owned_sync(&outs);
-    });
+    // Stage 4b: rel_bias matmul — fused on-the-fly into Stage 5b PagedAttention!
+    bd.rel_bias_matmul_ms = 0.0;
 
-    // Stage 5a: PagedKVWrite (48 visits, 1 eval_pending_pool_writes_all + sync)
-    bd.kv_write_ms = time_stage_ms(w, iters, || {
-        let rt = inner.paged.as_mut().expect("paged");
-        for cap in &captures {
-            let gm = &group_metas[cap.group_id];
-            let adapter = rt.coordinator.adapter_mut(cap.group_id).expect("ad");
-            adapter
-                .update_keys_values_native_with_slot_mapping(
-                    cap.phys_layer_ord,
-                    &cap.k_cur,
-                    &cap.v_cur,
-                    &gm.slot_mapping,
-                    gm.total_queries,
-                )
-                .expect("kvw");
-        }
-        rt.coordinator.eval_pending_pool_writes_all().expect("ev");
-        synchronize();
-    });
+    // Stage 5a: PagedKVWrite — fused into Stage 3a `sconv_k4_kv_prep_paged`!
+    bd.kv_write_ms = 0.0;
 
-    // Stage 5b: PagedAttention (48 visits, 1 sync)
+    // Stage 5b: Fused PagedAttention + on-the-fly rel_bias + gate_sink (48 visits, 1 sync)
     let pool_views: Vec<(MxArray, MxArray, MxArray, MxArray)> = {
         let rt = inner.paged.as_ref().expect("paged");
         captures
@@ -2155,7 +2117,7 @@ fn profile_48_visits(
             .collect()
     };
     bd.paged_attn_ms = time_stage_ms(w, iters, || {
-        let mut outs = Vec::with_capacity(captures.len() * 2);
+        let mut outs = Vec::with_capacity(captures.len());
         for (cap, (kp, vp, ks, vs)) in captures.iter().zip(&pool_views) {
             let attn = &inner.layers[cap.phys_layer].self_attn;
             let gm = &group_metas[cap.group_id];
@@ -2165,7 +2127,7 @@ fn profile_48_visits(
             } else {
                 0
             };
-            let (o, lse) = inkling2_paged_attention(
+            let (y, _) = inkling2_paged_attention_ex(
                 &cap.q_cur,
                 kp,
                 vp,
@@ -2174,7 +2136,10 @@ fn profile_48_visits(
                 &gm.cu_seqlens_q,
                 ks,
                 vs,
-                Some(&cap.rel_bias),
+                Some(&cap.r_for_rel),
+                Some(&attn.rel_bias_w),
+                Some((&cap.gate_raw, &cap.sink_raw)),
+                false,
                 scale,
                 swa_i32,
                 attn.rel_extent as i32,
@@ -2186,27 +2151,67 @@ fn profile_48_visits(
                 None,
             )
             .expect("pa");
-            outs.push(o);
-            outs.push(lse);
+            outs.push(y);
         }
         eval_owned_sync(&outs);
     });
 
-    // Stage 5c: gate_sink epilogue (48 visits, 1 sync)
-    bd.gate_sink_ms = time_stage_ms(w, iters, || {
+    // Stage 5c: gate_sink epilogue — fused into Stage 5b PagedAttention!
+    bd.gate_sink_ms = 0.0;
+
+    // Direct A/B benchmark: on-the-fly `dot(r, rel_bias_w)` vs sliced `r @ rel_bias_t[:, :eff_ext]`
+    let eff_rel_ext = (ctx_prompt.len() + m_rows).min(1024) as i64;
+    let ab_sliced_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(captures.len());
-        for cap in &captures {
+        for (cap, (kp, vp, ks, vs)) in captures.iter().zip(&pool_views) {
             let attn = &inner.layers[cap.phys_layer].self_attn;
-            let q_dim = (attn.num_heads * attn.head_dim) as i64;
-            outs.push(
-                inkling2_gate_sink(&cap.attn_o, &cap.gate_raw, &cap.lse, &cap.sink_raw)
-                    .expect("gs")
-                    .reshape(&[t_i64, q_dim])
-                    .expect("r"),
-            );
+            let gm = &group_metas[cap.group_id];
+            let scale = 1.0_f32 / (attn.head_dim as f32).sqrt();
+            let swa_i32 = if attn.is_local {
+                attn.sliding_window as i32
+            } else {
+                0
+            };
+            let rb_t_slice = attn
+                .rel_bias_t
+                .slice(&[0, 0], &[attn.d_rel as i64, eff_rel_ext])
+                .expect("sl");
+            let rb = cap.r_for_rel.matmul(&rb_t_slice).expect("rb");
+            let (y, _) = inkling2_paged_attention_ex(
+                &cap.q_cur,
+                kp,
+                vp,
+                &gm.block_table_2d,
+                &gm.seq_lens,
+                &gm.cu_seqlens_q,
+                ks,
+                vs,
+                Some(&rb),
+                None,
+                Some((&cap.gate_raw, &cap.sink_raw)),
+                false,
+                scale,
+                swa_i32,
+                eff_rel_ext as i32,
+                page_block_size as i32,
+                attn.num_heads as i32,
+                attn.num_kv_heads as i32,
+                attn.head_dim as i32,
+                kv_dtype,
+                None,
+            )
+            .expect("pa");
+            outs.push(y);
         }
         eval_owned_sync(&outs);
     });
+    eprintln!(
+        "  [A/B rel_bias M={m_rows}, ctx={}]: on-the-fly dot = {:.3} ms | sliced matmul(ext={eff_rel_ext}) + attn = {:.3} ms (delta = {:+.3} ms)",
+        ctx_prompt.len(),
+        bd.paged_attn_ms,
+        ab_sliced_ms,
+        bd.paged_attn_ms - ab_sliced_ms,
+    );
 
     // Stage 6 & 7: MoE L0..19 (NVFP4) and L20..23 (Q8_0) — each sub-stage batched in 1 sync!
     let nvfp4_caps: Vec<&VisitCapture> = captures.iter().filter(|c| c.phys_layer < 20).collect();
@@ -2405,7 +2410,30 @@ fn profile_48_visits(
     let vocab_cols = logits_full.shape().expect("s")[1] as usize;
     let out_cols = unpadded.min(vocab_cols);
     let cap_val = inner.config.final_logit_softcapping as f32;
-    if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = inner.lm_head
+    if let crate::models::quantized_linear::LinearProj::Quantized(ref ql) = inner.lm_head
+        && ql.is_symmetric_q8()
+        && m_rows <= 32
+    {
+        let w_q8 = ql.get_weight();
+        let sc_f16 = ql.get_scales();
+        bd.lm_head_ms = time_stage_ms(w, iters, || {
+            let mut outs = Vec::with_capacity(epi_k);
+            for _ in 0..epi_k {
+                outs.push(
+                    super::kernels::inkling2_lm_head_q8_softcap_argmax(
+                        &normed_out,
+                        w_q8,
+                        sc_f16,
+                        out_cols,
+                        cap_val,
+                    )
+                    .expect("q8_lm_am"),
+                );
+            }
+            eval_owned_sync(&outs);
+        }) / epi_k as f64;
+        bd.softcap_argmax_ms = 0.0;
+    } else if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = inner.lm_head
         && m_rows <= 32
     {
         let w_bf16 = lin.get_weight();
@@ -2633,12 +2661,12 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
             .expect("r")
             .transpose(Some(&[0, 2, 1, 3]))
             .expect("t");
-        let (k_all, v_all) = match (&draft_ctx.layers[i].k, &draft_ctx.layers[i].v) {
-            (Some(ck), Some(cv)) => (
-                MxArray::concatenate(ck, &k_rot, 2).expect("ck"),
-                MxArray::concatenate(cv, &v_4d, 2).expect("cv"),
+        let (k_all, v_all) = match draft_ctx.layers[i].view().expect("view") {
+            Some((ck, cv)) => (
+                MxArray::concatenate(&ck, &k_rot, 2).expect("ck"),
+                MxArray::concatenate(&cv, &v_4d, 2).expect("cv"),
             ),
-            _ => (k_rot, v_4d),
+            None => (k_rot, v_4d),
         };
         let attn_out = scaled_dot_product_attention(&q_rot, &k_all, &v_all, attn_scale, None)
             .expect("sdpa")
@@ -2849,12 +2877,12 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                     .expect("r")
                     .transpose(Some(&[0, 2, 1, 3]))
                     .expect("t");
-                let (k_all, v_all) = match (&draft_ctx.layers[i].k, &draft_ctx.layers[i].v) {
-                    (Some(ck), Some(cv)) => (
-                        MxArray::concatenate(ck, &k_rot, 2).expect("ck"),
-                        MxArray::concatenate(cv, &v_4d, 2).expect("cv"),
+                let (k_all, v_all) = match draft_ctx.layers[i].view().expect("view") {
+                    Some((ck, cv)) => (
+                        MxArray::concatenate(&ck, &k_rot, 2).expect("ck"),
+                        MxArray::concatenate(&cv, &v_4d, 2).expect("cv"),
                     ),
-                    _ => (k_rot, v_4d),
+                    None => (k_rot, v_4d),
                 };
                 let ao = scaled_dot_product_attention(&q_rot, &k_all, &v_all, attn_scale, None)
                     .expect("sdpa")
@@ -2937,13 +2965,14 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
     let target_lm_head_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(k_rep);
         for _ in 0..k_rep {
-            let raw =
-                super::attention::forward_linear_proj_fast(&inner.lm_head, &hidden).expect("lm");
-            outs.push(if raw.dtype().expect("dt") == DType::BFloat16 {
-                raw
-            } else {
-                raw.astype(DType::BFloat16).expect("b")
-            });
+            outs.push(
+                super::dspark::project_draft_lm_head_bf16(
+                    &inner.lm_head,
+                    &hidden,
+                    draft.config.unpadded_vocab_size,
+                )
+                .expect("lm"),
+            );
         }
         eval_owned_sync(&outs);
     }) / k_rep as f64;

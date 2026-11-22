@@ -20,7 +20,23 @@
 //   dist  = q_pos - token_idx
 //   valid iff 0 <= dist && (sliding_window == 0 || dist < sliding_window)
 //   if valid && rel_extent > 0 && dist < rel_extent:
-//     qk += rel_bias[q_token_idx, head_idx, dist]
+//     qk += rel_bias[q_token_idx, head_idx, dist] (rel_mode == 1)
+//        or dot(r[q_token_idx, head_idx, 0..16], rel_bias_w[dist, 0..16]) (rel_mode == 2)
+//
+// Optional fused gate+sink epilogue (when `extra.has_gate_sink != 0`):
+//   o_bf16 = float(bfloat16_t(o_raw))
+//   y = bfloat16_t((o_bf16 * precise_sigmoid(gate)) * precise_sigmoid(lse - sink))
+
+struct Inkling2AttnExtraParams {
+  uint32_t has_gate_sink;
+  uint32_t gate_row_stride;
+  uint32_t gate_is_f32;
+  uint32_t sink_row_stride;
+  uint32_t sink_is_f32;
+  uint32_t write_lse;
+  uint32_t rel_mode; // 0 = none, 1 = precomputed [T,H,rel_extent], 2 = on-the-fly r [T,H,16] x w [rel_extent,16]
+  uint32_t _pad;
+};
 
 inline float inkling2_read_rel_bias(const device uchar *rel_bias_raw,
                                     int64_t idx, int rel_bias_is_f32) {
@@ -29,6 +45,34 @@ inline float inkling2_read_rel_bias(const device uchar *rel_bias_raw,
   }
   return float(reinterpret_cast<const device bfloat16_t *>(rel_bias_raw)[idx]);
 }
+
+inline float inkling2_read_epilogue_f32(const device uchar *raw, int64_t idx,
+                                        uint32_t is_f32) {
+  if (is_f32 != 0u) {
+    return reinterpret_cast<const device float *>(raw)[idx];
+  }
+  return float(reinterpret_cast<const device bfloat16_t *>(raw)[idx]);
+}
+
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+inline float inkling2_rel_dot8(float4 ra, float4 rb, float4 wa, float4 wb) {
+  const float da = ra.x * wa.x + ra.y * wa.y + ra.z * wa.z + ra.w * wa.w;
+  const float db = rb.x * wb.x + rb.y * wb.y + rb.z * wb.z + rb.w * wb.w;
+  return da + db;
+}
+
+inline float inkling2_precise_sigmoid(float x) {
+  return precise::divide(1.0f, 1.0f + precise::exp(-x));
+}
+
+inline float inkling2_apply_gate_sink(float o_f, float g_val, float sink_scale) {
+  const float o_bf16 = float(bfloat16_t(o_f));
+  const float g_sig = inkling2_precise_sigmoid(g_val);
+  return (o_bf16 * g_sig) * sink_scale;
+}
+#pragma clang fp reassociate(on)
+#pragma clang fp contract(fast)
 
 // ============================================================================
 // INT8 32-token KTM Inkling2 decode / varlen kernel (V1 ps=0 and V2 ps=512)
@@ -61,6 +105,10 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
     const device float *score_scales [[buffer(22)]],
     const constant int &has_score_scales [[buffer(23)]],
     device float *lse_out [[buffer(24)]],
+    const device uchar *gate_raw [[buffer(25)]],
+    const device uchar *sink_raw [[buffer(26)]],
+    const device float *rel_bias_w [[buffer(27)]],
+    const constant Inkling2AttnExtraParams &extra [[buffer(28)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -89,7 +137,7 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
   const int effective_context_len =
       int(context_lens[seq_idx]) - q_len + q_pos_in_seq + 1;
   if (effective_context_len <= 0) {
-    if (!USE_PARTITIONING && thread_idx == 0) {
+    if (!USE_PARTITIONING && thread_idx == 0 && extra.write_lse != 0u) {
       lse_out[q_token_idx * num_heads + head_idx] = -INFINITY;
     }
     return;
@@ -172,6 +220,14 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
   float qk_max = -FLT_MAX;
   const int64_t rel_bias_row_base =
       (int64_t(q_token_idx) * num_heads + head_idx) * int64_t(rel_extent);
+  float4 r_a(0.0f), r_b(0.0f);
+  if (extra.rel_mode == 2u && rel_extent > 0) {
+    const device float4 *r4 =
+        reinterpret_cast<const device float4 *>(rel_bias_raw) +
+        (int64_t(q_token_idx) * num_heads + head_idx) * 4;
+    r_a = r4[thread_group_offset * 2];
+    r_b = r4[thread_group_offset * 2 + 1];
+  }
 
   const device uint32_t *block_table =
       block_tables + int64_t(seq_idx) * max_num_blocks_per_seq;
@@ -212,11 +268,24 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
                       page_half * BLOCK_SIZE + physical_block_offset];
         qk *= score_scale;
 
-        if (thread_group_offset == 0) {
+        if (rel_extent > 0) {
           const int dist = q_pos - token_idx;
-          if (rel_extent > 0 && dist < rel_extent) {
-            qk += inkling2_read_rel_bias(
-                rel_bias_raw, rel_bias_row_base + dist, rel_bias_is_f32);
+          if (dist < rel_extent) {
+            if (extra.rel_mode == 2u) {
+              const device float4 *w4 =
+                  reinterpret_cast<const device float4 *>(rel_bias_w) +
+                  int64_t(dist) * 4;
+              float rb = inkling2_rel_dot8(
+                  r_a, r_b, w4[thread_group_offset * 2],
+                  w4[thread_group_offset * 2 + 1]);
+              rb += simd_shuffle_xor(rb, 1);
+              if (thread_group_offset == 0) {
+                qk += rb;
+              }
+            } else if (thread_group_offset == 0 && extra.rel_mode == 1u) {
+              qk += inkling2_read_rel_bias(
+                  rel_bias_raw, rel_bias_row_base + dist, rel_bias_is_f32);
+            }
           }
         }
       }
@@ -266,7 +335,7 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
     max_logits[stat_idx] = (exp_sum > 0.0f) ? qk_max : -INFINITY;
     exp_sums[stat_idx] = exp_sum;
   }
-  if (!USE_PARTITIONING && thread_idx == 0) {
+  if (!USE_PARTITIONING && thread_idx == 0 && extra.write_lse != 0u) {
     lse_out[q_token_idx * num_heads + head_idx] =
         (exp_sum > 0.0f) ? (qk_max + precise::log(exp_sum)) : -INFINITY;
   }
@@ -391,13 +460,33 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
         (int64_t(q_token_idx) * num_heads + head_idx) * max_num_partitions *
             HEAD_SIZE +
         int64_t(partition_idx) * HEAD_SIZE;
+    float sink_scale = 1.0f;
+    if constexpr (!USE_PARTITIONING) {
+      if (extra.has_gate_sink != 0u) {
+        const float lse_val =
+            (exp_sum > 0.0f) ? (qk_max + precise::log(exp_sum)) : -INFINITY;
+        const float sink_val = inkling2_read_epilogue_f32(
+            sink_raw,
+            int64_t(q_token_idx) * int64_t(extra.sink_row_stride) + head_idx,
+            extra.sink_is_f32);
+        sink_scale = inkling2_precise_sigmoid(lse_val - sink_val);
+      }
+    }
+    const int64_t gate_row_base =
+        int64_t(q_token_idx) * int64_t(extra.gate_row_stride) +
+        int64_t(head_idx) * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
         if constexpr (!USE_PARTITIONING) {
-          *(out_ptr + row_idx) =
-              Out_T(exp_sum > 0.0f ? accs[i] / exp_sum : 0.0f);
+          float o_f = (exp_sum > 0.0f) ? (accs[i] / exp_sum) : 0.0f;
+          if (extra.has_gate_sink != 0u) {
+            const float g_val = inkling2_read_epilogue_f32(
+                gate_raw, gate_row_base + row_idx, extra.gate_is_f32);
+            o_f = inkling2_apply_gate_sink(o_f, g_val, sink_scale);
+          }
+          *(out_ptr + row_idx) = Out_T(o_f);
         } else {
           *(out_ptr + row_idx) = Out_T(accs[i]);
         }
@@ -435,6 +524,10 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &rel_extent [[buffer(18)]],
     const constant int &rel_bias_is_f32 [[buffer(19)]],
     device float *lse_out [[buffer(20)]],
+    const device uchar *gate_raw [[buffer(21)]],
+    const device uchar *sink_raw [[buffer(22)]],
+    const device float *rel_bias_w [[buffer(23)]],
+    const constant Inkling2AttnExtraParams &extra [[buffer(24)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -461,7 +554,7 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   const int effective_context_len =
       int(context_lens[seq_idx]) - q_len + q_pos_in_seq + 1;
   if (effective_context_len <= 0) {
-    if (!USE_PARTITIONING && thread_idx == 0) {
+    if (!USE_PARTITIONING && thread_idx == 0 && extra.write_lse != 0u) {
       lse_out[q_token_idx * num_heads + head_idx] = -INFINITY;
     }
     return;
@@ -539,6 +632,21 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   float qk_max = -FLT_MAX;
   const int64_t rel_bias_row_base =
       (int64_t(q_token_idx) * num_heads + head_idx) * int64_t(rel_extent);
+  float4 r0(0.0f), r1(0.0f), r2(0.0f), r3(0.0f);
+  if (extra.rel_mode == 2u && rel_extent > 0) {
+    const device float4 *r4 =
+        reinterpret_cast<const device float4 *>(rel_bias_raw) +
+        (int64_t(q_token_idx) * num_heads + head_idx) * 4;
+    if constexpr (THREAD_GROUP_SIZE == 2) {
+      r0 = r4[thread_group_offset * 2];
+      r1 = r4[thread_group_offset * 2 + 1];
+    } else {
+      r0 = r4[0];
+      r1 = r4[1];
+      r2 = r4[2];
+      r3 = r4[3];
+    }
+  }
 
   const device uint32_t *block_table =
       block_tables + int64_t(seq_idx) * max_num_blocks_per_seq;
@@ -573,11 +681,30 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
 
         qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                          q_vecs[thread_group_offset], k_vecs);
-        if (thread_group_offset == 0) {
+        if (rel_extent > 0) {
           const int dist = q_pos - token_idx;
-          if (rel_extent > 0 && dist < rel_extent) {
-            qk += inkling2_read_rel_bias(
-                rel_bias_raw, rel_bias_row_base + dist, rel_bias_is_f32);
+          if (dist < rel_extent) {
+            if (extra.rel_mode == 2u) {
+              const device float4 *w4 =
+                  reinterpret_cast<const device float4 *>(rel_bias_w) +
+                  int64_t(dist) * 4;
+              if constexpr (THREAD_GROUP_SIZE == 2) {
+                float rb = inkling2_rel_dot8(
+                    r0, r1, w4[thread_group_offset * 2],
+                    w4[thread_group_offset * 2 + 1]);
+                rb += simd_shuffle_xor(rb, 1);
+                if (thread_group_offset == 0) {
+                  qk += rb;
+                }
+              } else {
+                const float rb = inkling2_rel_dot8(r0, r1, w4[0], w4[1]) +
+                                 inkling2_rel_dot8(r2, r3, w4[2], w4[3]);
+                qk += rb;
+              }
+            } else if (thread_group_offset == 0 && extra.rel_mode == 1u) {
+              qk += inkling2_read_rel_bias(
+                  rel_bias_raw, rel_bias_row_base + dist, rel_bias_is_f32);
+            }
           }
         }
       }
@@ -627,7 +754,7 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     max_logits[stat_idx] = (exp_sum > 0.0f) ? qk_max : -INFINITY;
     exp_sums[stat_idx] = exp_sum;
   }
-  if (!USE_PARTITIONING && thread_idx == 0) {
+  if (!USE_PARTITIONING && thread_idx == 0 && extra.write_lse != 0u) {
     lse_out[q_token_idx * num_heads + head_idx] =
         (exp_sum > 0.0f) ? (qk_max + precise::log(exp_sum)) : -INFINITY;
   }
@@ -745,13 +872,33 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
         (int64_t(q_token_idx) * num_heads + head_idx) * max_num_partitions *
             HEAD_SIZE +
         int64_t(partition_idx) * HEAD_SIZE;
+    float sink_scale = 1.0f;
+    if constexpr (!USE_PARTITIONING) {
+      if (extra.has_gate_sink != 0u) {
+        const float lse_val =
+            (exp_sum > 0.0f) ? (qk_max + precise::log(exp_sum)) : -INFINITY;
+        const float sink_val = inkling2_read_epilogue_f32(
+            sink_raw,
+            int64_t(q_token_idx) * int64_t(extra.sink_row_stride) + head_idx,
+            extra.sink_is_f32);
+        sink_scale = inkling2_precise_sigmoid(lse_val - sink_val);
+      }
+    }
+    const int64_t gate_row_base =
+        int64_t(q_token_idx) * int64_t(extra.gate_row_stride) +
+        int64_t(head_idx) * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
         if constexpr (!USE_PARTITIONING) {
-          *(out_ptr + row_idx) =
-              Out_T(exp_sum > 0.0f ? accs[i] / exp_sum : 0.0f);
+          float o_f = (exp_sum > 0.0f) ? (accs[i] / exp_sum) : 0.0f;
+          if (extra.has_gate_sink != 0u) {
+            const float g_val = inkling2_read_epilogue_f32(
+                gate_raw, gate_row_base + row_idx, extra.gate_is_f32);
+            o_f = inkling2_apply_gate_sink(o_f, g_val, sink_scale);
+          }
+          *(out_ptr + row_idx) = Out_T(o_f);
         } else {
           *(out_ptr + row_idx) = Out_T(accs[i]);
         }
@@ -774,6 +921,9 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
     const constant int &max_num_partitions [[buffer(6)]],
     device const int32_t *cu_seqlens_q [[buffer(7)]],
     const constant int &num_seqs [[buffer(8)]],
+    const device uchar *gate_raw [[buffer(9)]],
+    const device uchar *sink_raw [[buffer(10)]],
+    const constant Inkling2AttnExtraParams &extra [[buffer(11)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -791,7 +941,7 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
   const int64_t row = int64_t(q_token_idx) * num_heads + head_idx;
 
   if (effective_context_len <= 0) {
-    if (thread_idx == 0) {
+    if (thread_idx == 0 && extra.write_lse != 0u) {
       lse_out[row] = -INFINITY;
     }
     for (int i = thread_idx; i < HEAD_SIZE; i += NUM_THREADS) {
@@ -820,6 +970,9 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  const int64_t gate_row_base =
+      int64_t(q_token_idx) * int64_t(extra.gate_row_stride) +
+      int64_t(head_idx) * HEAD_SIZE;
   for (int i = thread_idx; i < HEAD_SIZE; i += NUM_THREADS) {
     float numerator = 0.0f;
     float denominator = 0.0f;
@@ -830,11 +983,22 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
         denominator += w * sums[p];
       }
     }
-    out[row * HEAD_SIZE + i] =
-        bfloat16_t(denominator > 0.0f ? numerator / denominator : 0.0f);
-    if (i == 0) {
-      lse_out[row] =
-          (denominator > 0.0f) ? (maximum + precise::log(denominator)) : -INFINITY;
+    float o_f = (denominator > 0.0f) ? (numerator / denominator) : 0.0f;
+    const float lse_val =
+        (denominator > 0.0f) ? (maximum + precise::log(denominator)) : -INFINITY;
+    if (extra.has_gate_sink != 0u) {
+      const float sink_val = inkling2_read_epilogue_f32(
+          sink_raw,
+          int64_t(q_token_idx) * int64_t(extra.sink_row_stride) + head_idx,
+          extra.sink_is_f32);
+      const float sink_scale = inkling2_precise_sigmoid(lse_val - sink_val);
+      const float g_val = inkling2_read_epilogue_f32(
+          gate_raw, gate_row_base + i, extra.gate_is_f32);
+      o_f = inkling2_apply_gate_sink(o_f, g_val, sink_scale);
+    }
+    out[row * HEAD_SIZE + i] = bfloat16_t(o_f);
+    if (i == 0 && extra.write_lse != 0u) {
+      lse_out[row] = lse_val;
     }
   }
 }
@@ -870,6 +1034,10 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
       const device float *score_scales [[buffer(22)]],                         \
       const constant int &has_score_scales [[buffer(23)]],                     \
       device float *lse_out [[buffer(24)]],                                    \
+      const device uchar *gate_raw [[buffer(25)]],                             \
+      const device uchar *sink_raw [[buffer(26)]],                             \
+      const device float *rel_bias_w [[buffer(27)]],                           \
+      const constant Inkling2AttnExtraParams &extra [[buffer(28)]],            \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -907,6 +1075,10 @@ instantiate_paged_attention_inkling2_ktm(
       const constant int &rel_extent [[buffer(18)]],                           \
       const constant int &rel_bias_is_f32 [[buffer(19)]],                      \
       device float *lse_out [[buffer(20)]],                                    \
+      const device uchar *gate_raw [[buffer(21)]],                             \
+      const device uchar *sink_raw [[buffer(22)]],                             \
+      const device float *rel_bias_w [[buffer(23)]],                           \
+      const constant Inkling2AttnExtraParams &extra [[buffer(24)]],            \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -935,6 +1107,9 @@ template [[host_name("paged_attention_inkling2_v2_reduce_hs128_ps512")]]
     const constant int &max_num_partitions [[buffer(6)]],
     device const int32_t *cu_seqlens_q [[buffer(7)]],
     const constant int &num_seqs [[buffer(8)]],
+    const device uchar *gate_raw [[buffer(9)]],
+    const device uchar *sink_raw [[buffer(10)]],
+    const constant Inkling2AttnExtraParams &extra [[buffer(11)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],

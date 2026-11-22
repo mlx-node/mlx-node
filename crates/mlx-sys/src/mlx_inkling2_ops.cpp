@@ -146,6 +146,28 @@ struct Inkling2SconvK4KvPrepParams {
 };
 static_assert(sizeof(Inkling2SconvK4KvPrepParams) == 96);
 
+struct Inkling2SconvK4KvPrepPagedParams {
+  uint32_t seq_len;
+  uint32_t num_kv_heads;
+  uint32_t head_dim;
+  uint32_t num_seqs;
+  uint32_t k_row_stride;
+  uint32_t v_row_stride;
+  float qk_thresh;
+  float v_eps;
+  float l2_eps;
+  uint32_t is_dynamic;
+  uint32_t packed_hist;
+  uint32_t flags;
+  uint32_t k_hist_f32_mask;
+  uint32_t v_hist_f32_mask;
+  uint32_t block_size;
+  uint32_t kv_mode;
+  uint32_t k_hist_strides[4];
+  uint32_t v_hist_strides[4];
+};
+static_assert(sizeof(Inkling2SconvK4KvPrepPagedParams) == 96);
+
 struct Inkling2BlockAttnResParams {
   uint32_t rows;
   uint32_t dim;
@@ -317,6 +339,18 @@ struct Inkling2Bf16LinearParams {
   uint32_t _pad2;
 };
 static_assert(sizeof(Inkling2MarkovFoldParams) == 32);
+
+struct Inkling2Q8SymParams {
+  uint32_t rows;
+  uint32_t out_dim;
+  uint32_t in_dim;
+  uint32_t num_splits;
+  float softcap;
+  uint32_t aux_dim;
+  uint32_t flags;
+  uint32_t _pad;
+};
+static_assert(sizeof(Inkling2Q8SymParams) == 32);
 
 inline bool is_bf16_or_f32(Dtype dt) {
   return dt == bfloat16 || dt == float32;
@@ -1211,6 +1245,278 @@ class Inkling2ShortConvK4KvPrep : public fast::Custom {
   float v_eps_;
   float l2_eps_;
   Dtype out_dtype_;
+};
+
+// ============================================================================
+// 6b. Inkling2ShortConvK4KvPrepPaged (fused ShortConv + L2-clip/RMSNorm + PagedKVWrite)
+// ============================================================================
+class Inkling2ShortConvK4KvPrepPaged : public fast::Custom {
+ public:
+  Inkling2ShortConvK4KvPrepPaged(
+      Stream s,
+      uint32_t num_kv_heads,
+      uint32_t head_dim,
+      uint32_t num_seqs,
+      uint32_t block_size,
+      uint32_t kv_mode,
+      bool is_dynamic,
+      bool packed_hist,
+      float qk_thresh,
+      float v_eps,
+      float l2_eps)
+      : Custom(
+            s,
+            [](std::vector<array>) -> std::vector<array> {
+              throw std::runtime_error("Inkling2ShortConvK4KvPrepPaged requires Metal");
+            }),
+        num_kv_heads_(num_kv_heads),
+        head_dim_(head_dim),
+        num_seqs_(num_seqs),
+        block_size_(block_size),
+        kv_mode_(kv_mode),
+        is_dynamic_(is_dynamic),
+        packed_hist_(packed_hist),
+        qk_thresh_(qk_thresh),
+        v_eps_(v_eps),
+        l2_eps_(l2_eps) {}
+
+  DEFINE_NAME(Inkling2ShortConvK4KvPrepPaged)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const Inkling2ShortConvK4KvPrepPaged&>(other);
+    return num_kv_heads_ == rhs.num_kv_heads_ &&
+        head_dim_ == rhs.head_dim_ &&
+        num_seqs_ == rhs.num_seqs_ &&
+        block_size_ == rhs.block_size_ &&
+        kv_mode_ == rhs.kv_mode_ &&
+        is_dynamic_ == rhs.is_dynamic_ &&
+        packed_hist_ == rhs.packed_hist_ &&
+        qk_thresh_ == rhs.qk_thresh_ &&
+        v_eps_ == rhs.v_eps_ &&
+        l2_eps_ == rhs.l2_eps_;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const int kv_dim = static_cast<int>(num_kv_heads_ * head_dim_);
+    Shape hs = (num_seqs_ == 1u && !packed_hist_)
+        ? Shape{3, kv_dim}
+        : Shape{static_cast<int>(num_seqs_), 3, kv_dim};
+    // Outputs: {k_pool', v_pool', k_scale', v_scale', k_hist_out, v_hist_out}
+    return {inputs[4].shape(), inputs[5].shape(), inputs[6].shape(), inputs[7].shape(), hs, hs};
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Inkling2ShortConvK4KvPrepPaged requires Metal");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+#ifdef MLX_NODE_METAL_ENABLED
+    auto& s = stream();
+    auto& device = metal::device(s.device);
+    auto& enc = metal::get_command_encoder(s);
+
+    // Layout of `inputs`:
+    //   0: k_in, 1: v_in, 2: k_weight, 3: v_weight
+    //   4: k_pool, 5: v_pool, 6: k_scale, 7: v_scale, 8: slot_mapping
+    //   [optional: dyn_k, dyn_v if is_dynamic_]
+    //   [optional: cu_seqlens if num_seqs_ > 1]
+    //   k_hists (1 if packed_hist_ else num_seqs_)
+    //   v_hists (1 if packed_hist_ else num_seqs_)
+    const uint32_t seq_len = static_cast<uint32_t>(inputs[0].shape(0));
+    const uint32_t kv_dim = num_kv_heads_ * head_dim_;
+
+    const array& k_pool = inputs[4];
+    const array& v_pool = inputs[5];
+    const array& k_scale = inputs[6];
+    const array& v_scale = inputs[7];
+    const array& slot_mapping = inputs[8];
+
+    // Runtime slot-id bounds check matching `PagedKVWrite::eval_gpu`.
+    if (slot_mapping.shape(0) != static_cast<int>(seq_len) ||
+        slot_mapping.dtype() != int64) {
+      throw std::invalid_argument(
+          "Inkling2ShortConvK4KvPrepPaged: invalid slot_mapping shape or dtype");
+    }
+    if (seq_len > 0u) {
+      const int64_t pool_capacity =
+          static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size_);
+      const int64_t* slot_data = slot_mapping.data<int64_t>();
+      int64_t max_slot = -1;
+      for (uint32_t i = 0; i < seq_len; ++i) {
+        if (slot_data[i] >= 0 && slot_data[i] > max_slot) {
+          max_slot = slot_data[i];
+        }
+      }
+      if (max_slot >= pool_capacity) {
+        throw std::invalid_argument(
+            "Inkling2ShortConvK4KvPrepPaged: slot_mapping exceeds pool capacity");
+      }
+    }
+
+    // Prepare ALL inputs BEFORE setting compute pipeline state.
+    auto [k_in, k_stride] = ensure_2d_strided(inputs[0], seq_len, kv_dim, s, enc);
+    auto [v_in, v_stride] = ensure_2d_strided(inputs[1], seq_len, kv_dim, s, enc);
+    array kw = ensure_row_contiguous(inputs[2], s, enc);
+    array vw = ensure_row_contiguous(inputs[3], s, enc);
+    array slots = ensure_row_contiguous(slot_mapping, s, enc);
+
+    size_t idx = 9;
+    std::optional<array> dk_arr;
+    std::optional<array> dv_arr;
+    uint32_t dk_f32 = 1u;
+    uint32_t dv_f32 = 1u;
+    if (is_dynamic_) {
+      dk_arr = ensure_row_contiguous(inputs[idx++], s, enc);
+      dv_arr = ensure_row_contiguous(inputs[idx++], s, enc);
+      dk_f32 = dk_arr->dtype() == float32 ? 1u : 0u;
+      dv_f32 = dv_arr->dtype() == float32 ? 1u : 0u;
+    }
+
+    std::optional<array> cu_arr;
+    if (num_seqs_ > 1u) {
+      cu_arr = ensure_row_contiguous(inputs[idx++], s, enc);
+    }
+
+    const uint32_t h_count = packed_hist_ ? 1u : num_seqs_;
+    std::vector<array> kh_arrs;
+    kh_arrs.reserve(h_count);
+    uint32_t kh_mask = 0u;
+    uint32_t kh_strides[4] = {kv_dim, kv_dim, kv_dim, kv_dim};
+    for (uint32_t i = 0; i < h_count; ++i) {
+      if (packed_hist_) {
+        array kh = ensure_row_contiguous(inputs[idx++], s, enc);
+        if (kh.dtype() == float32) kh_mask |= (1u << i);
+        kh_arrs.push_back(std::move(kh));
+      } else {
+        auto [kh, ks] = ensure_2d_strided(inputs[idx++], 3u, kv_dim, s, enc);
+        if (kh.dtype() == float32) kh_mask |= (1u << i);
+        kh_strides[i] = ks;
+        kh_arrs.push_back(std::move(kh));
+      }
+    }
+    std::vector<array> vh_arrs;
+    vh_arrs.reserve(h_count);
+    uint32_t vh_mask = 0u;
+    uint32_t vh_strides[4] = {kv_dim, kv_dim, kv_dim, kv_dim};
+    for (uint32_t i = 0; i < h_count; ++i) {
+      if (packed_hist_) {
+        array vh = ensure_row_contiguous(inputs[idx++], s, enc);
+        if (vh.dtype() == float32) vh_mask |= (1u << i);
+        vh_arrs.push_back(std::move(vh));
+      } else {
+        auto [vh, vs] = ensure_2d_strided(inputs[idx++], 3u, kv_dim, s, enc);
+        if (vh.dtype() == float32) vh_mask |= (1u << i);
+        vh_strides[i] = vs;
+        vh_arrs.push_back(std::move(vh));
+      }
+    }
+
+    // Alias pool outputs in-place so MLX tracks the dependency chain!
+    outputs[0].copy_shared_buffer(k_pool);
+    outputs[1].copy_shared_buffer(v_pool);
+    outputs[2].copy_shared_buffer(k_scale);
+    outputs[3].copy_shared_buffer(v_scale);
+    outputs[4].set_data(allocator::malloc(outputs[4].nbytes()));
+    outputs[5].set_data(allocator::malloc(outputs[5].nbytes()));
+
+    const float dummy = 0.0f;
+    const int32_t dummy_cu = 0;
+    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+        device, "inkling2_ops", "sconv_k4_kv_prep_paged",
+        "inkling2_sconv_k4_kv_prep_paged_bf16"));
+    enc.set_input_array(k_in, 0);
+    enc.set_input_array(v_in, 1);
+    enc.set_input_array(kw, 2);
+    enc.set_input_array(vw, 3);
+
+    if (is_dynamic_) {
+      enc.set_input_array(*dk_arr, 4);
+      enc.set_input_array(*dv_arr, 5);
+    } else {
+      enc.set_bytes(dummy, 4);
+      enc.set_bytes(dummy, 5);
+    }
+
+    if (num_seqs_ > 1u) {
+      enc.set_input_array(*cu_arr, 6);
+    } else {
+      enc.set_bytes(dummy_cu, 6);
+    }
+
+    for (uint32_t i = 0; i < 4u; ++i) {
+      if (i < h_count) {
+        enc.set_input_array(kh_arrs[i], 7 + static_cast<int>(i));
+      } else {
+        enc.set_bytes(dummy, 7 + static_cast<int>(i));
+      }
+    }
+    for (uint32_t i = 0; i < 4u; ++i) {
+      if (i < h_count) {
+        enc.set_input_array(vh_arrs[i], 11 + static_cast<int>(i));
+      } else {
+        enc.set_bytes(dummy, 11 + static_cast<int>(i));
+      }
+    }
+
+    enc.set_output_array(outputs[4], 15);
+    enc.set_output_array(outputs[5], 16);
+    enc.set_output_array(outputs[0], 17);
+    enc.set_output_array(outputs[1], 18);
+    if (kv_mode_ == 0u) {
+      enc.set_output_array(outputs[2], 19);
+      enc.set_output_array(outputs[3], 20);
+    } else {
+      enc.set_bytes(dummy, 19);
+      enc.set_bytes(dummy, 20);
+    }
+    enc.set_input_array(slots, 21);
+
+    const uint32_t flags =
+        (kw.dtype() == float32 ? 1u : 0u) |
+        ((vw.dtype() == float32 ? 1u : 0u) << 1u) |
+        (dk_f32 << 2u) |
+        (dv_f32 << 3u);
+
+    Inkling2SconvK4KvPrepPagedParams params{
+        seq_len,
+        num_kv_heads_,
+        head_dim_,
+        num_seqs_,
+        k_stride,
+        v_stride,
+        qk_thresh_,
+        v_eps_,
+        l2_eps_,
+        is_dynamic_ ? 1u : 0u,
+        packed_hist_ ? 1u : 0u,
+        flags,
+        kh_mask,
+        vh_mask,
+        block_size_,
+        kv_mode_,
+        {kh_strides[0], kh_strides[1], kh_strides[2], kh_strides[3]},
+        {vh_strides[0], vh_strides[1], vh_strides[2], vh_strides[3]}};
+    enc.set_bytes(params, 22);
+    enc.dispatch_threadgroups(MTL::Size(2u * num_kv_heads_, seq_len, 1), MTL::Size(32, 1, 1));
+#else
+    (void)inputs;
+    (void)outputs;
+    throw std::runtime_error("Inkling2ShortConvK4KvPrepPaged requires Metal");
+#endif
+  }
+
+ private:
+  uint32_t num_kv_heads_;
+  uint32_t head_dim_;
+  uint32_t num_seqs_;
+  uint32_t block_size_;
+  uint32_t kv_mode_;
+  bool is_dynamic_;
+  bool packed_hist_;
+  float qk_thresh_;
+  float v_eps_;
+  float l2_eps_;
 };
 
 // ============================================================================
@@ -2882,6 +3188,329 @@ class Inkling2Bf16LmHeadSoftcapArgmax : public fast::Custom {
   float softcap_;
 };
 
+// ============================================================================
+// 16a. Inkling2LmHeadQ8SoftcapArgmax (`1 <= M <= 32`, `K % 32 == 0`, F16 scales, 0 biases)
+// ============================================================================
+class Inkling2LmHeadQ8SoftcapArgmax : public fast::Custom {
+ public:
+  Inkling2LmHeadQ8SoftcapArgmax(
+      Stream s,
+      uint32_t rows,
+      uint32_t out_cols,
+      uint32_t in_dim,
+      float softcap)
+      : fast::Custom(
+            s,
+            [](std::vector<array>) -> std::vector<array> {
+              throw std::runtime_error("Inkling2LmHeadQ8SoftcapArgmax requires Metal");
+            }),
+        rows_(rows),
+        out_cols_(out_cols),
+        in_dim_(in_dim),
+        softcap_(softcap) {}
+
+  DEFINE_NAME(Inkling2LmHeadQ8SoftcapArgmax)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const Inkling2LmHeadQ8SoftcapArgmax&>(other);
+    return rows_ == rhs.rows_ && out_cols_ == rhs.out_cols_ &&
+        in_dim_ == rhs.in_dim_ && softcap_ == rhs.softcap_;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {Shape{static_cast<int>(rows_)}};
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Inkling2LmHeadQ8SoftcapArgmax requires Metal");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+#ifdef MLX_NODE_METAL_ENABLED
+    auto& s = stream();
+    auto& device = metal::device(s.device);
+    auto& enc = metal::get_command_encoder(s);
+
+    array x = ensure_row_contiguous_aligned(inputs[0], 16u, s, enc);
+    array w = ensure_row_contiguous_aligned(inputs[1], 16u, s, enc);
+    array scales = ensure_row_contiguous(inputs[2], s, enc);
+
+    const bool use_nax = metal::is_nax_available();
+    const uint32_t num_splits = use_nax
+        ? std::max<uint32_t>(1u, (out_cols_ + 63u) / 64u)
+        : std::min<uint32_t>(
+              512u,
+              std::max<uint32_t>(
+                  1u,
+                  (out_cols_ + (rows_ <= 16u ? 15u : 7u)) /
+                      (rows_ <= 16u ? 16u : 8u)));
+
+    array partial_vals(
+        Shape{static_cast<int>(rows_ * num_splits)}, float32, nullptr, {});
+    partial_vals.set_data(allocator::malloc(partial_vals.nbytes()));
+    enc.add_temporary(partial_vals);
+
+    array partial_idxs(
+        Shape{static_cast<int>(rows_ * num_splits)}, int32, nullptr, {});
+    partial_idxs.set_data(allocator::malloc(partial_idxs.nbytes()));
+    enc.add_temporary(partial_idxs);
+
+    Inkling2Q8SymParams p1_params{
+        rows_, out_cols_, in_dim_, num_splits, softcap_, 0u, 0u, 0u};
+    const char* p1_name = use_nax
+        ? "inkling2_lm_head_q8_nax_softcap_argmax_p1"
+        : "inkling2_lm_head_q8_softcap_argmax_stage1";
+    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+        device, "inkling2_ops", "lm_head_q8_softcap_argmax", p1_name));
+    enc.set_input_array(x, 0);
+    enc.set_input_array(w, 1);
+    enc.set_input_array(scales, 2);
+    enc.set_output_array(partial_vals, 3);
+    enc.set_output_array(partial_idxs, 4);
+    enc.set_bytes(p1_params, 5);
+    enc.dispatch_threadgroups(MTL::Size(num_splits, 1, 1), MTL::Size(128, 1, 1));
+
+    auto& out_ids = outputs[0];
+    out_ids.set_data(allocator::malloc(out_ids.nbytes()));
+    Inkling2LmHeadSoftcapParams stage2_params{
+        rows_, out_cols_, 0u, 0u, softcap_, num_splits, 0u, 0u};
+    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+        device,
+        "inkling2_ops",
+        "lm_head_softcap_argmax_stage2",
+        "inkling2_lm_head_softcap_argmax_stage2"));
+    enc.set_input_array(partial_vals, 0);
+    enc.set_input_array(partial_idxs, 1);
+    enc.set_output_array(out_ids, 2);
+    enc.set_bytes(stage2_params, 3);
+    enc.dispatch_threadgroups(MTL::Size(rows_, 1, 1), MTL::Size(64, 1, 1));
+#else
+    (void)inputs;
+    (void)outputs;
+    throw std::runtime_error("Inkling2LmHeadQ8SoftcapArgmax requires Metal");
+#endif
+  }
+
+ private:
+  uint32_t rows_;
+  uint32_t out_cols_;
+  uint32_t in_dim_;
+  float softcap_;
+};
+
+// ============================================================================
+// 16b. Inkling2LmHeadQ8Bf16 (`1 <= M <= 32`, `K % 32 == 0`, BF16 OR FP32+softcap)
+// ============================================================================
+class Inkling2LmHeadQ8Bf16 : public fast::Custom {
+ public:
+  Inkling2LmHeadQ8Bf16(
+      Stream s,
+      uint32_t rows,
+      uint32_t out_cols,
+      uint32_t in_dim,
+      float softcap,
+      Dtype out_dtype)
+      : fast::Custom(
+            s,
+            [](std::vector<array>) -> std::vector<array> {
+              throw std::runtime_error("Inkling2LmHeadQ8Bf16 requires Metal");
+            }),
+        rows_(rows),
+        out_cols_(out_cols),
+        in_dim_(in_dim),
+        softcap_(softcap),
+        out_dtype_(out_dtype) {}
+
+  DEFINE_NAME(Inkling2LmHeadQ8Bf16)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const Inkling2LmHeadQ8Bf16&>(other);
+    return rows_ == rhs.rows_ && out_cols_ == rhs.out_cols_ &&
+        in_dim_ == rhs.in_dim_ && softcap_ == rhs.softcap_ &&
+        out_dtype_ == rhs.out_dtype_;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {Shape{static_cast<int>(rows_), static_cast<int>(out_cols_)}};
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Inkling2LmHeadQ8Bf16 requires Metal");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+#ifdef MLX_NODE_METAL_ENABLED
+    auto& s = stream();
+    auto& device = metal::device(s.device);
+    auto& enc = metal::get_command_encoder(s);
+
+    array x = ensure_row_contiguous_aligned(inputs[0], 16u, s, enc);
+    array w = ensure_row_contiguous_aligned(inputs[1], 16u, s, enc);
+    array scales = ensure_row_contiguous(inputs[2], s, enc);
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const uint32_t flags = (out_dtype_ == float32) ? 1u : 0u;
+    Inkling2Q8SymParams params{
+        rows_, out_cols_, in_dim_, 0u, softcap_, 0u, flags, 0u};
+
+    if (metal::is_nax_available()) {
+      const uint32_t num_tgs = (out_cols_ + 31u) / 32u;
+      const uint32_t dummy = 0u;
+      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+          device,
+          "inkling2_ops",
+          "q8_sym_matmul_nax_bf16",
+          "inkling2_q8_sym_matmul_nax_bf16"));
+      enc.set_input_array(x, 0);
+      enc.set_input_array(w, 1);
+      enc.set_input_array(scales, 2);
+      enc.set_bytes(dummy, 3);
+      enc.set_output_array(out, 4);
+      enc.set_output_array(out, 5);
+      enc.set_bytes(params, 6);
+      enc.dispatch_threadgroups(MTL::Size(num_tgs, 1, 1), MTL::Size(128, 1, 1));
+    } else {
+      const uint32_t rows_per_tg = rows_ <= 16u ? 16u : 8u;
+      const uint32_t num_tgs = (out_cols_ + rows_per_tg - 1u) / rows_per_tg;
+      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+          device, "inkling2_ops", "lm_head_q8_bf16", "inkling2_lm_head_q8_bf16"));
+      enc.set_input_array(x, 0);
+      enc.set_input_array(w, 1);
+      enc.set_input_array(scales, 2);
+      enc.set_output_array(out, 3);
+      enc.set_bytes(params, 4);
+      enc.dispatch_threadgroups(MTL::Size(num_tgs, 1, 1), MTL::Size(128, 1, 1));
+    }
+#else
+    (void)inputs;
+    (void)outputs;
+    throw std::runtime_error("Inkling2LmHeadQ8Bf16 requires Metal");
+#endif
+  }
+
+ private:
+  uint32_t rows_;
+  uint32_t out_cols_;
+  uint32_t in_dim_;
+  float softcap_;
+  Dtype out_dtype_;
+};
+
+// ============================================================================
+// 16c. Inkling2Q8SymMatmul (`1 <= M <= 32`, `K % 32 == 0`, optional fused BF16 tail!)
+// ============================================================================
+class Inkling2Q8SymMatmul : public fast::Custom {
+ public:
+  Inkling2Q8SymMatmul(
+      Stream s,
+      uint32_t rows,
+      uint32_t out_dim,
+      uint32_t in_dim,
+      uint32_t aux_dim,
+      Dtype out_dtype)
+      : fast::Custom(
+            s,
+            [](std::vector<array>) -> std::vector<array> {
+              throw std::runtime_error("Inkling2Q8SymMatmul requires Metal");
+            }),
+        rows_(rows),
+        out_dim_(out_dim),
+        in_dim_(in_dim),
+        aux_dim_(aux_dim),
+        out_dtype_(out_dtype) {}
+
+  DEFINE_NAME(Inkling2Q8SymMatmul)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const Inkling2Q8SymMatmul&>(other);
+    return rows_ == rhs.rows_ && out_dim_ == rhs.out_dim_ &&
+        in_dim_ == rhs.in_dim_ && aux_dim_ == rhs.aux_dim_ &&
+        out_dtype_ == rhs.out_dtype_;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    if (aux_dim_ > 0u) {
+      return {
+          Shape{static_cast<int>(rows_), static_cast<int>(out_dim_)},
+          Shape{static_cast<int>(rows_), static_cast<int>(aux_dim_)}};
+    }
+    return {Shape{static_cast<int>(rows_), static_cast<int>(out_dim_)}};
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Inkling2Q8SymMatmul requires Metal");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+#ifdef MLX_NODE_METAL_ENABLED
+    auto& s = stream();
+    auto& device = metal::device(s.device);
+    auto& enc = metal::get_command_encoder(s);
+
+    array x = ensure_row_contiguous_aligned(inputs[0], 16u, s, enc);
+    array w = ensure_row_contiguous_aligned(inputs[1], 16u, s, enc);
+    array scales = ensure_row_contiguous(inputs[2], s, enc);
+    std::optional<array> w_aux;
+    if (aux_dim_ > 0u) {
+      w_aux = ensure_row_contiguous_aligned(inputs[3], 16u, s, enc);
+    }
+
+    auto& out_main = outputs[0];
+    out_main.set_data(allocator::malloc(out_main.nbytes()));
+    if (aux_dim_ > 0u) {
+      outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+    }
+
+    const bool use_nax = metal::is_nax_available();
+    const uint32_t rows_per_tg = use_nax ? 32u : (rows_ <= 16u ? 16u : 8u);
+    const uint32_t q8_tgs = (out_dim_ + rows_per_tg - 1u) / rows_per_tg;
+    const uint32_t aux_tgs = aux_dim_ > 0u ? (aux_dim_ + rows_per_tg - 1u) / rows_per_tg : 0u;
+    const uint32_t flags =
+        ((out_dtype_ == float32) ? 1u : 0u) | ((aux_dim_ > 0u) ? 2u : 0u);
+    Inkling2Q8SymParams params{
+        rows_, out_dim_, in_dim_, 0u, 0.0f, aux_dim_, flags, 0u};
+
+    const uint32_t dummy = 0u;
+    const char* kname = use_nax ? "inkling2_q8_sym_matmul_nax_bf16"
+                                : "inkling2_q8_sym_matmul_bf16";
+    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+        device, "inkling2_ops", "q8_sym_matmul", kname));
+    enc.set_input_array(x, 0);
+    enc.set_input_array(w, 1);
+    enc.set_input_array(scales, 2);
+    if (aux_dim_ > 0u) {
+      enc.set_input_array(*w_aux, 3);
+    } else {
+      enc.set_bytes(dummy, 3);
+    }
+    enc.set_output_array(out_main, 4);
+    if (aux_dim_ > 0u) {
+      enc.set_output_array(outputs[1], 5);
+    } else {
+      enc.set_output_array(out_main, 5);
+    }
+    enc.set_bytes(params, 6);
+    enc.dispatch_threadgroups(
+        MTL::Size(q8_tgs + aux_tgs, 1, 1), MTL::Size(128, 1, 1));
+#else
+    (void)inputs;
+    (void)outputs;
+    throw std::runtime_error("Inkling2Q8SymMatmul requires Metal");
+#endif
+  }
+
+ private:
+  uint32_t rows_;
+  uint32_t out_dim_;
+  uint32_t in_dim_;
+  uint32_t aux_dim_;
+  Dtype out_dtype_;
+};
+
 } // namespace
 } // namespace mlx::core::inkling2_ops
 
@@ -3351,6 +3980,203 @@ bool mlx_inkling2_sconv_k4_kv_prep(
   (void)dyn_k_ptr; (void)dyn_v_ptr; (void)cu_seqlens_ptr; (void)k_hists_ptr; (void)v_hists_ptr;
   (void)num_seqs; (void)packed_hist; (void)num_kv_heads; (void)head_dim;
   (void)qk_thresh; (void)v_eps; (void)l2_eps;
+  return false;
+#endif
+}
+
+bool mlx_inkling2_sconv_k4_kv_prep_paged(
+    mlx_array* k_in_ptr,
+    mlx_array* v_in_ptr,
+    mlx_array* k_weight_ptr,
+    mlx_array* v_weight_ptr,
+    mlx_array* dyn_k_ptr,
+    mlx_array* dyn_v_ptr,
+    mlx_array* cu_seqlens_ptr,
+    mlx_array* const* k_hists_ptr,
+    mlx_array* const* v_hists_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    mlx_array* slot_mapping_ptr,
+    uint32_t num_seqs,
+    bool packed_hist,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t block_size,
+    uint32_t kv_mode,
+    float qk_thresh,
+    float v_eps,
+    float l2_eps,
+    mlx_array** out_k_pool,
+    mlx_array** out_v_pool,
+    mlx_array** out_k_scale,
+    mlx_array** out_v_scale,
+    mlx_array** out_k_hist,
+    mlx_array** out_v_hist) {
+  if (out_k_pool) *out_k_pool = nullptr;
+  if (out_v_pool) *out_v_pool = nullptr;
+  if (out_k_scale) *out_k_scale = nullptr;
+  if (out_v_scale) *out_v_scale = nullptr;
+  if (out_k_hist) *out_k_hist = nullptr;
+  if (out_v_hist) *out_v_hist = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  if (!k_in_ptr || !v_in_ptr || !k_weight_ptr || !v_weight_ptr ||
+      !k_hists_ptr || !v_hists_ptr || !k_pool_ptr || !v_pool_ptr ||
+      !k_scale_ptr || !v_scale_ptr || !slot_mapping_ptr ||
+      !out_k_pool || !out_v_pool || !out_k_scale || !out_v_scale ||
+      !out_k_hist || !out_v_hist ||
+      num_seqs == 0 || num_kv_heads == 0 || head_dim == 0 || head_dim > 256u ||
+      block_size == 0 || kv_mode > 2u) {
+    return false;
+  }
+  if (!packed_hist && num_seqs > 4u) {
+    return false;
+  }
+  const bool is_dynamic = (dyn_k_ptr != nullptr) || (dyn_v_ptr != nullptr);
+  if (is_dynamic && (!dyn_k_ptr || !dyn_v_ptr)) {
+    return false;
+  }
+  if (num_seqs > 1u && !cu_seqlens_ptr) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!metal::is_available()) {
+      return false;
+    }
+    const auto& k_in = *reinterpret_cast<array*>(k_in_ptr);
+    const auto& v_in = *reinterpret_cast<array*>(v_in_ptr);
+    const auto& kw = *reinterpret_cast<array*>(k_weight_ptr);
+    const auto& vw = *reinterpret_cast<array*>(v_weight_ptr);
+    const auto& k_pool = *reinterpret_cast<array*>(k_pool_ptr);
+    const auto& v_pool = *reinterpret_cast<array*>(v_pool_ptr);
+    const auto& k_scale = *reinterpret_cast<array*>(k_scale_ptr);
+    const auto& v_scale = *reinterpret_cast<array*>(v_scale_ptr);
+    const auto& slot_mapping = *reinterpret_cast<array*>(slot_mapping_ptr);
+    const int kv_dim = static_cast<int>(num_kv_heads * head_dim);
+    if (k_in.ndim() != 2 || v_in.ndim() != 2 ||
+        k_in.shape(0) <= 0 || k_in.shape(0) != v_in.shape(0) ||
+        k_in.shape(1) != kv_dim || v_in.shape(1) != kv_dim ||
+        k_in.dtype() != bfloat16 || v_in.dtype() != bfloat16 ||
+        kw.ndim() != 2 || kw.shape(0) != kv_dim || kw.shape(1) != 4 || !is_bf16_or_f32(kw.dtype()) ||
+        vw.ndim() != 2 || vw.shape(0) != kv_dim || vw.shape(1) != 4 || !is_bf16_or_f32(vw.dtype()) ||
+        slot_mapping.ndim() != 1 || slot_mapping.shape(0) != k_in.shape(0) ||
+        slot_mapping.dtype() != int64) {
+      return false;
+    }
+    if (!k_pool.flags().row_contiguous || !v_pool.flags().row_contiguous ||
+        k_pool.offset() != 0 || v_pool.offset() != 0 ||
+        k_pool.shape(0) <= 0 || k_pool.shape(0) != v_pool.shape(0)) {
+      return false;
+    }
+    const int nb = k_pool.shape(0);
+    const int nkv = static_cast<int>(num_kv_heads);
+    const int hd = static_cast<int>(head_dim);
+    const int bs = static_cast<int>(block_size);
+    if (kv_mode == 0u) {
+      // INT8-KTM
+      if (k_pool.dtype() != int8 || v_pool.dtype() != int8 ||
+          k_pool.shape() != Shape{nb, nkv, bs, hd} ||
+          v_pool.shape() != Shape{nb, nkv, hd, bs} ||
+          k_scale.dtype() != float32 || v_scale.dtype() != float32 ||
+          !k_scale.flags().row_contiguous || !v_scale.flags().row_contiguous ||
+          k_scale.offset() != 0 || v_scale.offset() != 0 ||
+          k_scale.shape() != Shape{nb, nkv, bs} ||
+          v_scale.shape() != Shape{nb, nkv, bs}) {
+        return false;
+      }
+    } else if (kv_mode == 1u) {
+      // BF16 vLLM (x=8)
+      if (hd % 8 != 0 ||
+          k_pool.dtype() != bfloat16 || v_pool.dtype() != bfloat16 ||
+          k_pool.shape() != Shape{nb, nkv, hd / 8, bs, 8} ||
+          v_pool.shape() != Shape{nb, nkv, hd, bs}) {
+        return false;
+      }
+    } else {
+      // BF16 values_token_major
+      if (k_pool.dtype() != bfloat16 || v_pool.dtype() != bfloat16 ||
+          k_pool.shape() != Shape{nb, nkv, bs, hd} ||
+          v_pool.shape() != Shape{nb, nkv, bs, hd}) {
+        return false;
+      }
+    }
+    std::vector<array> inputs = {
+        k_in, v_in, kw, vw, k_pool, v_pool, k_scale, v_scale, slot_mapping};
+    if (is_dynamic) {
+      const auto& dk = *reinterpret_cast<array*>(dyn_k_ptr);
+      const auto& dv = *reinterpret_cast<array*>(dyn_v_ptr);
+      if (dk.ndim() != 3 || dv.ndim() != 3 ||
+          dk.shape(0) != k_in.shape(0) || dv.shape(0) != k_in.shape(0) ||
+          dk.shape(1) != nkv || dv.shape(1) != nkv ||
+          dk.shape(2) != 4 || dv.shape(2) != 4 ||
+          !is_bf16_or_f32(dk.dtype()) || !is_bf16_or_f32(dv.dtype())) {
+        return false;
+      }
+      inputs.push_back(dk);
+      inputs.push_back(dv);
+    }
+    if (num_seqs > 1u) {
+      const auto& cu = *reinterpret_cast<array*>(cu_seqlens_ptr);
+      if (cu.ndim() != 1 || cu.dtype() != int32 || cu.shape(0) != static_cast<int>(num_seqs + 1u)) {
+        return false;
+      }
+      inputs.push_back(cu);
+    }
+    const uint32_t h_count = packed_hist ? 1u : num_seqs;
+    for (uint32_t i = 0; i < h_count; ++i) {
+      if (!k_hists_ptr[i]) return false;
+      const auto& kh = *reinterpret_cast<array*>(k_hists_ptr[i]);
+      if (!is_bf16_or_f32(kh.dtype())) return false;
+      if (packed_hist) {
+        if (kh.ndim() != 3 || kh.shape(0) != static_cast<int>(num_seqs) || kh.shape(1) != 3 || kh.shape(2) != kv_dim) return false;
+      } else {
+        if (kh.ndim() != 2 || kh.shape(0) != 3 || kh.shape(1) != kv_dim) return false;
+      }
+      inputs.push_back(kh);
+    }
+    for (uint32_t i = 0; i < h_count; ++i) {
+      if (!v_hists_ptr[i]) return false;
+      const auto& vh = *reinterpret_cast<array*>(v_hists_ptr[i]);
+      if (!is_bf16_or_f32(vh.dtype())) return false;
+      if (packed_hist) {
+        if (vh.ndim() != 3 || vh.shape(0) != static_cast<int>(num_seqs) || vh.shape(1) != 3 || vh.shape(2) != kv_dim) return false;
+      } else {
+        if (vh.ndim() != 2 || vh.shape(0) != 3 || vh.shape(1) != kv_dim) return false;
+      }
+      inputs.push_back(vh);
+    }
+    Shape hs = (num_seqs == 1u && !packed_hist)
+        ? Shape{3, kv_dim}
+        : Shape{static_cast<int>(num_seqs), 3, kv_dim};
+    auto s = to_stream(Device::gpu);
+    auto prim = std::make_shared<Inkling2ShortConvK4KvPrepPaged>(
+        s, num_kv_heads, head_dim, num_seqs, block_size, kv_mode,
+        is_dynamic, packed_hist, qk_thresh, v_eps, l2_eps);
+    auto results = array::make_arrays(
+        {k_pool.shape(), v_pool.shape(), k_scale.shape(), v_scale.shape(), hs, hs},
+        {k_pool.dtype(), v_pool.dtype(), k_scale.dtype(), v_scale.dtype(), bfloat16, bfloat16},
+        std::move(prim),
+        std::move(inputs));
+    *out_k_pool = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    *out_v_pool = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    *out_k_scale = reinterpret_cast<mlx_array*>(new array(std::move(results[2])));
+    *out_v_scale = reinterpret_cast<mlx_array*>(new array(std::move(results[3])));
+    *out_k_hist = reinterpret_cast<mlx_array*>(new array(std::move(results[4])));
+    *out_v_hist = reinterpret_cast<mlx_array*>(new array(std::move(results[5])));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_sconv_k4_kv_prep_paged", e.what());
+    return false;
+  }
+#else
+  (void)k_in_ptr; (void)v_in_ptr; (void)k_weight_ptr; (void)v_weight_ptr;
+  (void)dyn_k_ptr; (void)dyn_v_ptr; (void)cu_seqlens_ptr; (void)k_hists_ptr; (void)v_hists_ptr;
+  (void)k_pool_ptr; (void)v_pool_ptr; (void)k_scale_ptr; (void)v_scale_ptr; (void)slot_mapping_ptr;
+  (void)num_seqs; (void)packed_hist; (void)num_kv_heads; (void)head_dim;
+  (void)block_size; (void)kv_mode; (void)qk_thresh; (void)v_eps; (void)l2_eps;
   return false;
 #endif
 }
@@ -4289,6 +5115,217 @@ uint32_t mlx_inkling2_attn_res_vec4_max_t() {
   return mlx::core::inkling2_ops::resolved_attn_res_vec4_max_t();
 #else
   return 0u;
+#endif
+}
+
+mlx_array* mlx_inkling2_lm_head_q8_softcap_argmax(
+    mlx_array* x_ptr,
+    mlx_array* w_q8_ptr,
+    mlx_array* scales_f16_ptr,
+    uint32_t out_cols,
+    float softcap) {
+#ifdef MLX_NODE_METAL_ENABLED
+  if (!x_ptr || !w_q8_ptr || !scales_f16_ptr || out_cols == 0u) {
+    return nullptr;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!metal::is_available()) {
+      return nullptr;
+    }
+    const auto& x = *reinterpret_cast<array*>(x_ptr);
+    const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
+    const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
+    if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 ||
+        x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
+        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
+        static_cast<uint32_t>(w.shape(0)) < out_cols ||
+        w.shape(1) != x.shape(1) / 4 ||
+        sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32) {
+      return nullptr;
+    }
+    const uint32_t rows = static_cast<uint32_t>(x.shape(0));
+    const uint32_t in_dim = static_cast<uint32_t>(x.shape(1));
+    auto s = to_stream(Device::gpu);
+    auto prim = std::make_shared<Inkling2LmHeadQ8SoftcapArgmax>(
+        s, rows, out_cols, in_dim, softcap);
+    auto res = array(
+        Shape{static_cast<int>(rows)},
+        int32,
+        std::move(prim),
+        {x, w, sc});
+    return reinterpret_cast<mlx_array*>(new array(std::move(res)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_lm_head_q8_softcap_argmax", e.what());
+    return nullptr;
+  }
+#else
+  (void)x_ptr; (void)w_q8_ptr; (void)scales_f16_ptr; (void)out_cols; (void)softcap;
+  return nullptr;
+#endif
+}
+
+mlx_array* mlx_inkling2_lm_head_q8_bf16(
+    mlx_array* x_ptr,
+    mlx_array* w_q8_ptr,
+    mlx_array* scales_f16_ptr,
+    uint32_t out_cols,
+    float softcap,
+    bool output_f32) {
+#ifdef MLX_NODE_METAL_ENABLED
+  if (!x_ptr || !w_q8_ptr || !scales_f16_ptr || out_cols == 0u) {
+    return nullptr;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!metal::is_available()) {
+      return nullptr;
+    }
+    const auto& x = *reinterpret_cast<array*>(x_ptr);
+    const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
+    const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
+    if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 ||
+        x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
+        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
+        static_cast<uint32_t>(w.shape(0)) < out_cols ||
+        w.shape(1) != x.shape(1) / 4 ||
+        sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32) {
+      return nullptr;
+    }
+    const uint32_t rows = static_cast<uint32_t>(x.shape(0));
+    const uint32_t in_dim = static_cast<uint32_t>(x.shape(1));
+    const Dtype out_dtype = output_f32 ? float32 : bfloat16;
+    auto s = to_stream(Device::gpu);
+    auto prim = std::make_shared<Inkling2LmHeadQ8Bf16>(
+        s, rows, out_cols, in_dim, softcap, out_dtype);
+    auto res = array(
+        Shape{static_cast<int>(rows), static_cast<int>(out_cols)},
+        out_dtype,
+        std::move(prim),
+        {x, w, sc});
+    return reinterpret_cast<mlx_array*>(new array(std::move(res)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_lm_head_q8_bf16", e.what());
+    return nullptr;
+  }
+#else
+  (void)x_ptr; (void)w_q8_ptr; (void)scales_f16_ptr;
+  (void)out_cols; (void)softcap; (void)output_f32;
+  return nullptr;
+#endif
+}
+
+mlx_array* mlx_inkling2_q8_sym_matmul_bf16(
+    mlx_array* x_ptr,
+    mlx_array* w_q8_ptr,
+    mlx_array* scales_f16_ptr,
+    bool output_f32) {
+#ifdef MLX_NODE_METAL_ENABLED
+  if (!x_ptr || !w_q8_ptr || !scales_f16_ptr) {
+    return nullptr;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!metal::is_available()) {
+      return nullptr;
+    }
+    const auto& x = *reinterpret_cast<array*>(x_ptr);
+    const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
+    const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
+    if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 ||
+        x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
+        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
+        w.shape(0) <= 0 || w.shape(1) != x.shape(1) / 4 ||
+        sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32) {
+      return nullptr;
+    }
+    const uint32_t rows = static_cast<uint32_t>(x.shape(0));
+    const uint32_t out_dim = static_cast<uint32_t>(w.shape(0));
+    const uint32_t in_dim = static_cast<uint32_t>(x.shape(1));
+    const Dtype out_dtype = output_f32 ? float32 : bfloat16;
+    auto s = to_stream(Device::gpu);
+    auto prim = std::make_shared<Inkling2Q8SymMatmul>(
+        s, rows, out_dim, in_dim, 0u, out_dtype);
+    auto res = array(
+        Shape{static_cast<int>(rows), static_cast<int>(out_dim)},
+        out_dtype,
+        std::move(prim),
+        {x, w, sc});
+    return reinterpret_cast<mlx_array*>(new array(std::move(res)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_q8_sym_matmul_bf16", e.what());
+    return nullptr;
+  }
+#else
+  (void)x_ptr; (void)w_q8_ptr; (void)scales_f16_ptr; (void)output_f32;
+  return nullptr;
+#endif
+}
+
+bool mlx_inkling2_q8_sym_matmul_bf16_with_aux(
+    mlx_array* x_ptr,
+    mlx_array* w_q8_ptr,
+    mlx_array* scales_f16_ptr,
+    mlx_array* w_aux_bf16_ptr,
+    bool output_f32,
+    mlx_array** out_main,
+    mlx_array** out_aux) {
+  if (out_main) *out_main = nullptr;
+  if (out_aux) *out_aux = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  if (!x_ptr || !w_q8_ptr || !scales_f16_ptr || !w_aux_bf16_ptr || !out_main || !out_aux) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!metal::is_available()) {
+      return false;
+    }
+    const auto& x = *reinterpret_cast<array*>(x_ptr);
+    const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
+    const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
+    const auto& w_aux = *reinterpret_cast<array*>(w_aux_bf16_ptr);
+    if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 || w_aux.ndim() != 2 ||
+        x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
+        w_aux.dtype() != bfloat16 ||
+        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
+        w.shape(0) <= 0 || w.shape(1) != x.shape(1) / 4 ||
+        sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32 ||
+        w_aux.shape(0) <= 0 || w_aux.shape(1) != x.shape(1)) {
+      return false;
+    }
+    const uint32_t rows = static_cast<uint32_t>(x.shape(0));
+    const uint32_t out_dim = static_cast<uint32_t>(w.shape(0));
+    const uint32_t in_dim = static_cast<uint32_t>(x.shape(1));
+    const uint32_t aux_dim = static_cast<uint32_t>(w_aux.shape(0));
+    const Dtype out_dtype = output_f32 ? float32 : bfloat16;
+    auto s = to_stream(Device::gpu);
+    auto prim = std::make_shared<Inkling2Q8SymMatmul>(
+        s, rows, out_dim, in_dim, aux_dim, out_dtype);
+    auto results = array::make_arrays(
+        {Shape{static_cast<int>(rows), static_cast<int>(out_dim)},
+         Shape{static_cast<int>(rows), static_cast<int>(aux_dim)}},
+        {out_dtype, bfloat16},
+        std::move(prim),
+        {x, w, sc, w_aux});
+    *out_main = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    *out_aux = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_q8_sym_matmul_bf16_with_aux", e.what());
+    return false;
+  }
+#else
+  (void)x_ptr; (void)w_q8_ptr; (void)scales_f16_ptr; (void)w_aux_bf16_ptr; (void)output_f32;
+  return false;
 #endif
 }
 

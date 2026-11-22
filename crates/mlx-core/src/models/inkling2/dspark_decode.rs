@@ -385,7 +385,7 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
             max_len
         };
         let draft = self.require_draft()?;
-        self.ctx.propose_block(
+        let prop = self.ctx.propose_block(
             draft,
             &self.inner.embed_tokens,
             &self.inner.embed_norm,
@@ -394,7 +394,14 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
             effective_len,
             params,
             rng,
-        )
+        )?;
+        // Kick ONE async_eval on `device_draft_ids` right after `propose_block` returns
+        // (before target `verify` builds its 48-visit graph) so the GPU executes
+        // `commit (append_taps) + propose_block` in ONE continuous Metal CB!
+        if let Some(ref dev_ids) = prop.device_draft_ids {
+            MxArray::schedule_overlap(&[dev_ids]);
+        }
+        Ok(prop)
     }
 
     fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
@@ -501,24 +508,12 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
         Ok(())
     }
 
-    fn eval_boundary(&self, token: &MxArray) {
-        if !crate::accelerator::supports_async_overlap() {
-            return;
-        }
-        let mut arrays: Vec<&MxArray> = Vec::new();
-        if let Some(ref rt) = self.inner.paged
-            && let Some(conv) = rt.conv_states.get(&self.seq_id)
-        {
-            for v in &conv.visits {
-                arrays.push(&v.k);
-                arrays.push(&v.v);
-                arrays.push(&v.attn_post);
-                arrays.push(&v.mlp_post);
-            }
-        }
-        self.ctx.collect_arrays(&mut arrays);
-        arrays.push(token);
-        MxArray::schedule_overlap(&arrays);
+    fn eval_boundary(&self, _token: &MxArray) {
+        // Deliberately no-op: flushing 199 leaf arrays (192 conv states + 7 draft ctx arrays)
+        // here costs ~0.6-0.8 ms of synchronous CPU graph traversal + submits a tiny Metal CB
+        // right before `propose_block`. Instead, `propose()` kicks ONE `schedule_overlap` on
+        // `device_draft_ids` so `commit + propose_block` execute in ONE continuous Metal CB
+        // overlapped with CPU building the 48-visit target `verify` graph.
     }
 }
 

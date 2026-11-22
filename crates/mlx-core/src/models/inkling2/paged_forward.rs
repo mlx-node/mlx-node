@@ -55,14 +55,16 @@ use super::attn_res::{ATTN_RES_EPS, apply_sublayer_rms_norm};
 use super::config::Inkling2Config;
 use super::dspark::Inkling2DsparkModel;
 use super::kernels::{
-    Inkling2KvDtype, inkling2_block_attn_res, inkling2_gate_sink, inkling2_lm_head_softcap,
-    inkling2_lm_head_softcap_argmax, inkling2_paged_attention, inkling2_paged_prefill_attention,
-    inkling2_paged_prefill_mpp_supported, inkling2_qr_clip,
+    Inkling2KvDtype, inkling2_block_attn_res, inkling2_lm_head_softcap,
+    inkling2_lm_head_softcap_argmax, inkling2_paged_attention_ex,
+    inkling2_paged_prefill_attention_ex, inkling2_paged_prefill_mpp_supported, inkling2_qr_clip,
 };
 use super::kv_cache::{
     INKLING2_PAGED_PREFILL_MAX_CHUNK, Inkling2KVCacheCoordinator, Inkling2PagedConfig,
 };
 use super::model::{AttnInputNorm, Inkling2Inner, Inkling2PhysicalLayer, overwrite_image_pad_rows};
+#[cfg(target_os = "macos")]
+use super::short_conv::fused_short_conv_kv_prep_paged_taped;
 use super::short_conv::{
     Inkling2ShortConvState, Inkling2ShortConvTape, StreamShortConvTape, VisitShortConvState,
     VisitShortConvTape, fused_short_conv_kv_prep_taped, fused_short_conv_ragged_residual_taped,
@@ -255,9 +257,9 @@ struct GroupAttentionMeta {
     block_table_2d: MxArray,
     seq_lens: MxArray,
     cu_seqlens_q: MxArray,
-    /// Prebuilt `int64` ragged write slot mapping (`(slot_mapping, total_queries)`) computed ONCE
-    /// per KV group before the 48-visit verify loop so KV writes never stall mid-wave.
-    ragged_slot_mapping: Option<(MxArray, u32)>,
+    /// Prebuilt `int64` write slot mapping (`(slot_mapping, total_queries)`) computed ONCE
+    /// per KV group before the 48-visit loop for fused `sconv_k4_kv_prep_paged` writes.
+    write_slot_mapping: Option<(MxArray, u32)>,
 }
 
 /// How the paged attention primitive writes K/V and dispatches attention for a forward wave.
@@ -405,7 +407,7 @@ fn build_group_attention_meta(
         block_table_2d,
         seq_lens,
         cu_seqlens_q,
-        ragged_slot_mapping: None,
+        write_slot_mapping: None,
     })
 }
 
@@ -1129,13 +1131,25 @@ impl Inkling2Inner {
         let (group_metas, kv_dtype, block_size, mpp_workspace) = {
             let rt = self
                 .paged
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
             let num_groups = rt.coordinator.groups().len();
             let mut metas = Vec::with_capacity(num_groups);
             for gid in 0..num_groups {
-                let adapter = rt.coordinator.adapter(gid).map_err(Error::from_reason)?;
-                metas.push(build_group_attention_meta(adapter, &seq_q_lens)?);
+                let adapter = rt
+                    .coordinator
+                    .adapter_mut(gid)
+                    .map_err(Error::from_reason)?;
+                let mut meta = build_group_attention_meta(adapter, &seq_q_lens)?;
+                #[cfg(target_os = "macos")]
+                {
+                    meta.write_slot_mapping = Some(
+                        adapter
+                            .build_single_write_slot_mapping(seq_id, first_pos, rows, first_pos)
+                            .map_err(Error::from_reason)?,
+                    );
+                }
+                metas.push(meta);
             }
             let ws = if use_mpp_prefill {
                 let splits_needed =
@@ -1324,11 +1338,44 @@ impl Inkling2Inner {
         };
         let _ = norm_rows;
 
+        // Fast fused single-pass Symmetric Q8_0 `lm_head` (F16 scales, zero biases, 128-bit uint4):
+        // - GreedyArgmax: zero `[M, V]` DRAM write, 1 DRAM pass of 490 MB, 0-ULP batch-size invariant!
+        // - FullSoftcap: single-pass FP32 + softcap directly for `0..out_cols` (exact match to GreedyArgmax!).
+        let unpadded = self.config.effective_unpadded_vocab_size();
+        let cap = self.config.final_logit_softcapping as f32;
+        #[cfg(target_os = "macos")]
+        if let crate::models::quantized_linear::LinearProj::Quantized(ref ql) = self.lm_head
+            && ql.is_symmetric_q8()
+            && lm_in.dtype()? == DType::BFloat16
+            && unsafe { mlx_sys::mlx_metal_is_available() }
+        {
+            let xs = lm_in.shape()?;
+            if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+                let w = ql.get_weight();
+                let sc = ql.get_scales();
+                let vocab_cols = w.shape()?[0] as usize;
+                let out_cols = unpadded.min(vocab_cols);
+                let out = match logits_output {
+                    LogitsOutput::GreedyArgmax => {
+                        super::kernels::inkling2_lm_head_q8_softcap_argmax(
+                            &lm_in, w, sc, out_cols, cap,
+                        )?
+                    }
+                    LogitsOutput::FullSoftcap => super::kernels::inkling2_lm_head_q8_bf16(
+                        &lm_in,
+                        w,
+                        sc,
+                        out_cols,
+                        cap,
+                        DType::Float32,
+                    )?,
+                };
+                return Ok((Some(out), captured_norm));
+            }
+        }
         // Fast fused single-pass BF16 `lm_head` + softcap + argmax (ZERO [M, V] DRAM write,
         // 1 DRAM pass of 926 MB for M <= 16 instead of 2+ passes in MLX `gemv_wide`, 0-ULP
         // batch-size invariant across M in 1..=32!).
-        let unpadded = self.config.effective_unpadded_vocab_size();
-        let cap = self.config.final_logit_softcapping as f32;
         #[cfg(target_os = "macos")]
         if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = self.lm_head
             && lin.get_bias().is_none()
@@ -2180,12 +2227,24 @@ impl Inkling2Inner {
                     .map_err(Error::from_reason)?;
                 let mut meta = build_group_attention_meta(adapter, seq_q_lens)?;
                 #[cfg(target_os = "macos")]
-                if let PagedWaveMode::RaggedVerify { ragged_rows, .. } = mode {
-                    meta.ragged_slot_mapping = Some(
-                        adapter
+                {
+                    meta.write_slot_mapping = Some(match mode {
+                        PagedWaveMode::Single {
+                            seq_id,
+                            first_pos,
+                            floor,
+                            rows,
+                            ..
+                        } => adapter
+                            .build_single_write_slot_mapping(seq_id, first_pos, rows, floor)
+                            .map_err(Error::from_reason)?,
+                        PagedWaveMode::BatchedDecode { planned_rows } => adapter
+                            .build_batched_decode_slot_mapping(planned_rows)
+                            .map_err(Error::from_reason)?,
+                        PagedWaveMode::RaggedVerify { ragged_rows, .. } => adapter
                             .build_ragged_slot_mapping(ragged_rows)
                             .map_err(Error::from_reason)?,
-                    );
+                    });
                 }
                 metas.push(meta);
             }
@@ -2754,15 +2813,19 @@ fn forward_physical_layer_paged(
 }
 
 /// Dispatch Inkling2 paged attention (single prefill/decode, per-lane MPP/varlen ragged verify,
-/// or varlen decode) over already-written KV pools.
+/// or varlen decode) over already-written KV pools, with optional on-the-fly `rel_bias_w`
+/// (`r_for_rel @ rel_bias_w^T`) and optional fused `gate + sink` epilogue.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_paged_attention_kernel(
+fn dispatch_paged_attention_kernel_ex(
     q_cur: &MxArray,
     k_pool: &MxArray,
     v_pool: &MxArray,
     k_scale: &MxArray,
     v_scale: &MxArray,
     rel_bias: &MxArray,
+    rel_bias_w: Option<&MxArray>,
+    gate_sink: Option<(&MxArray, &MxArray)>,
+    want_lse: bool,
     group_meta: &GroupAttentionMeta,
     kv_dtype: Inkling2KvDtype,
     mode: &PagedWaveMode<'_>,
@@ -2775,7 +2838,7 @@ fn dispatch_paged_attention_kernel(
     num_kv_heads: usize,
     head_dim: usize,
     mpp_workspace: Option<&mut MxArray>,
-) -> Result<(MxArray, MxArray)> {
+) -> Result<(MxArray, Option<MxArray>)> {
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let swa_i32 = if is_local { sliding_window as i32 } else { 0 };
     let rel_extent_i32 = rel_extent as i32;
@@ -2809,7 +2872,7 @@ fn dispatch_paged_attention_kernel(
             let use_int8_q = !is_local
                 && kv_dtype == Inkling2KvDtype::Int8
                 && int8_q_from.is_some_and(|from| *first_pos >= from);
-            let (out, lse, ws_next) = inkling2_paged_prefill_attention(
+            let (out, lse, ws_next) = inkling2_paged_prefill_attention_ex(
                 q_cur,
                 k_pool,
                 v_pool,
@@ -2818,6 +2881,9 @@ fn dispatch_paged_attention_kernel(
                 bt_1d,
                 ws,
                 Some(rel_bias),
+                rel_bias_w,
+                gate_sink,
+                want_lse,
                 *first_pos as i32,
                 splits as i32,
                 mpp_pass.max_splits() as i32,
@@ -2856,7 +2922,7 @@ fn dispatch_paged_attention_kernel(
                 );
                 let use_int8_q = kv_dtype == Inkling2KvDtype::Int8
                     && int8_q_from.is_some_and(|from| r0.first_logical_position >= from);
-                let (out, lse, ws_next) = inkling2_paged_prefill_attention(
+                let (out, lse, ws_next) = inkling2_paged_prefill_attention_ex(
                     q_cur,
                     k_pool,
                     v_pool,
@@ -2865,6 +2931,9 @@ fn dispatch_paged_attention_kernel(
                     bt_1d,
                     ws,
                     Some(rel_bias),
+                    rel_bias_w,
+                    gate_sink,
+                    want_lse,
                     r0.first_logical_position as i32,
                     splits as i32,
                     Pass::Verify.max_splits() as i32,
@@ -2887,8 +2956,10 @@ fn dispatch_paged_attention_kernel(
                 // identically to solo execution without forcing long-context peers onto fallback!
                 let ws_len = ws.shape()?[0];
                 let mut lane_outs = Vec::with_capacity(ragged_rows.len());
-                let mut lane_lses = Vec::with_capacity(ragged_rows.len());
+                let mut lane_lses =
+                    Vec::with_capacity(if want_lse { ragged_rows.len() } else { 0 });
                 let rb_ext = rel_bias.shape()?[2];
+                let q_dim = (num_heads * head_dim) as i64;
                 let mut shared_ws_used = false;
                 for (lane_idx, r) in ragged_rows.iter().enumerate() {
                     let row_start = cu_seqlens_q[lane_idx] as i64;
@@ -2899,6 +2970,22 @@ fn dispatch_paged_attention_kernel(
                     )?;
                     let rb_lane =
                         rel_bias.slice(&[row_start, 0, 0], &[row_end, num_heads as i64, rb_ext])?;
+                    let gs_lane_owned = match gate_sink {
+                        Some((g, s)) => {
+                            let g_lane = if g.ndim()? == 2 {
+                                g.slice(&[row_start, 0], &[row_end, q_dim])?
+                            } else {
+                                g.slice(
+                                    &[row_start, 0, 0],
+                                    &[row_end, num_heads as i64, head_dim as i64],
+                                )?
+                            };
+                            let s_lane = s.slice(&[row_start, 0], &[row_end, num_heads as i64])?;
+                            Some((g_lane, s_lane))
+                        }
+                        None => None,
+                    };
+                    let gs_lane = gs_lane_owned.as_ref().map(|(g, s)| (g, s));
                     let (out_l, lse_l) = if lane_uses_mpp_verify(r, true) {
                         let bt_1d = &group_meta.per_seq_block_tables_1d[lane_idx];
                         let splits = prefill_plan::splits(
@@ -2916,7 +3003,7 @@ fn dispatch_paged_attention_kernel(
                             lane_ws_owned = MxArray::zeros(&[ws_len], Some(DType::Float32))?;
                             &lane_ws_owned
                         };
-                        let (out_l, lse_l, ws_next) = inkling2_paged_prefill_attention(
+                        let (out_l, lse_l, ws_next) = inkling2_paged_prefill_attention_ex(
                             &q_lane,
                             k_pool,
                             v_pool,
@@ -2925,6 +3012,9 @@ fn dispatch_paged_attention_kernel(
                             bt_1d,
                             lane_ws_ref,
                             Some(&rb_lane),
+                            rel_bias_w,
+                            gs_lane,
+                            want_lse,
                             r.first_logical_position as i32,
                             splits as i32,
                             Pass::Verify.max_splits() as i32,
@@ -2951,7 +3041,7 @@ fn dispatch_paged_attention_kernel(
                             &[1],
                         )?;
                         let cu_lane = MxArray::from_int32(&[0, r.query_len as i32], &[2])?;
-                        inkling2_paged_attention(
+                        inkling2_paged_attention_ex(
                             &q_lane,
                             k_pool,
                             v_pool,
@@ -2961,6 +3051,9 @@ fn dispatch_paged_attention_kernel(
                             k_scale,
                             v_scale,
                             Some(&rb_lane),
+                            rel_bias_w,
+                            gs_lane,
+                            want_lse,
                             scale,
                             swa_i32,
                             rel_extent_i32,
@@ -2973,17 +3066,22 @@ fn dispatch_paged_attention_kernel(
                         )?
                     };
                     lane_outs.push(out_l);
-                    lane_lses.push(lse_l);
+                    if let Some(l) = lse_l {
+                        lane_lses.push(l);
+                    }
                 }
                 let out_refs: Vec<&MxArray> = lane_outs.iter().collect();
-                let lse_refs: Vec<&MxArray> = lane_lses.iter().collect();
-                Ok((
-                    MxArray::concatenate_many(out_refs, Some(0))?,
-                    MxArray::concatenate_many(lse_refs, Some(0))?,
-                ))
+                let out_cat = MxArray::concatenate_many(out_refs, Some(0))?;
+                let lse_cat = if want_lse {
+                    let lse_refs: Vec<&MxArray> = lane_lses.iter().collect();
+                    Some(MxArray::concatenate_many(lse_refs, Some(0))?)
+                } else {
+                    None
+                };
+                Ok((out_cat, lse_cat))
             }
         }
-        _ => inkling2_paged_attention(
+        _ => inkling2_paged_attention_ex(
             q_cur,
             k_pool,
             v_pool,
@@ -2993,6 +3091,9 @@ fn dispatch_paged_attention_kernel(
             k_scale,
             v_scale,
             Some(rel_bias),
+            rel_bias_w,
+            gate_sink,
+            want_lse,
             scale,
             swa_i32,
             rel_extent_i32,
@@ -3006,9 +3107,63 @@ fn dispatch_paged_attention_kernel(
     }
 }
 
-/// Paged self-attention using Stage 2 fused Metal kernels (`inkling2_qr_clip`,
-/// `inkling2_sconv_k4_kv_prep`, `inkling2_paged_prefill_attention` / `inkling2_paged_attention`,
-/// strided `inkling2_gate_sink`, and `inkling2_sconv_k4_ragged` with optional FP32 residual epilogue).
+/// Legacy wrapper returning `(attn_o, lse)` without fused gate/sink or on-the-fly rel_bias
+/// (used by unit parity tests).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_paged_attention_kernel(
+    q_cur: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    rel_bias: &MxArray,
+    group_meta: &GroupAttentionMeta,
+    kv_dtype: Inkling2KvDtype,
+    mode: &PagedWaveMode<'_>,
+    cu_seqlens_q: &[usize],
+    is_local: bool,
+    sliding_window: usize,
+    rel_extent: usize,
+    page_block_size: u32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mpp_workspace: Option<&mut MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let (out, lse) = dispatch_paged_attention_kernel_ex(
+        q_cur,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        rel_bias,
+        None,
+        None,
+        true,
+        group_meta,
+        kv_dtype,
+        mode,
+        cu_seqlens_q,
+        is_local,
+        sliding_window,
+        rel_extent,
+        page_block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        mpp_workspace,
+    )?;
+    let lse =
+        lse.ok_or_else(|| Error::from_reason("dispatch_paged_attention_kernel missing lse"))?;
+    Ok((out, lse))
+}
+
+/// Paged self-attention using Pass 3 fused Metal kernels (`inkling2_qr_clip`,
+/// `inkling2_sconv_k4_kv_prep_paged` fusing ShortConv + L2-clip/RMSNorm + PagedKVWrite,
+/// `inkling2_paged_prefill_attention` / `inkling2_paged_attention` with on-the-fly `rel_bias` dot
+/// and fused strided `gate_sink` epilogue, and `inkling2_sconv_k4_ragged` with optional FP32
+/// residual epilogue).
 #[allow(clippy::too_many_arguments)]
 fn forward_attention_paged(
     attn: &super::attention::Inkling2Attention,
@@ -3031,32 +3186,9 @@ fn forward_attention_paged(
     let act_dtype = x_q.dtype()?;
     let q_dim = (attn.num_heads * attn.head_dim) as i64;
 
-    // 1. Projections (using fused `QRGKV` / `QRG` when available — strided views stay zero-copy!)
-    let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw) =
-        attn.project_qrgkv_and_sink(x_q, x_k_v)?;
-
-    // 2. Global dynamic ShortConv tap projections (only on the 8 Global visits)
-    let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
-    let dense_bf16 = matches!(
-        attn.q_proj,
-        crate::models::quantized_linear::LinearProj::Standard(_)
-    );
-    let dyn_k = if let Some(ref k_cp) = attn.k_conv_proj {
-        Some(
-            super::attention::forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?
-                .reshape(&[t_i64, attn.num_kv_heads as i64, attn.k_conv.shape()?[1]])?,
-        )
-    } else {
-        None
-    };
-    let dyn_v = if let Some(ref v_cp) = attn.v_conv_proj {
-        Some(
-            super::attention::forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?
-                .reshape(&[t_i64, attn.num_kv_heads as i64, attn.v_conv.shape()?[1]])?,
-        )
-    } else {
-        None
-    };
+    // 1 & 2. Projections (fused `QRGKV`/`QRG` + `sink_proj` + Global dynamic ShortConv tap projections!)
+    let (q_raw, r_raw, gate_raw, k_raw, v_raw, sink_raw, dyn_k, dyn_v) =
+        attn.project_qrgkv_sink_and_dyn_conv(x_q, x_k_v)?;
 
     // 3. Fused Q + R L2-clip (+ optional global tau) in 1 Metal dispatch (zero-copy strided views!)
     let tau_opt = if !attn.is_local { global_tau } else { None };
@@ -3076,71 +3208,52 @@ fn forward_attention_paged(
         act_dtype == DType::BFloat16,
     )?;
 
-    // 4. Fused K+V ShortConv + K L2-clip + V RMSNorm in 1 Metal dispatch (single or ragged N lanes!)
+    // 4 & 6. Fused K+V ShortConv + K L2-clip + V RMSNorm + PagedKVWrite in 1 Metal dispatch!
     let cu_arr = Some(&group_meta.cu_seqlens_q);
-    let (k_cur, v_cur) = if visit_convs.len() == 1 {
-        let vc0 = &mut visit_convs[0];
-        let mut kh = [&mut vc0.k];
-        let mut vh = [&mut vc0.v];
-        match visit_tapes.as_deref_mut() {
-            Some(ts) => {
-                let vt0 = &mut ts[0];
-                let mut kt = [&mut vt0.k];
-                let mut vt = [&mut vt0.v];
-                fused_short_conv_kv_prep_taped(
-                    &k_raw,
-                    &v_raw,
-                    &attn.k_conv,
-                    &attn.v_conv,
-                    dyn_k.as_ref(),
-                    dyn_v.as_ref(),
-                    &mut kh,
-                    &mut vh,
-                    cu_seqlens_q,
-                    cu_arr,
-                    Some(&mut kt),
-                    Some(&mut vt),
-                    attn.num_kv_heads,
-                    attn.head_dim,
-                    attn.qk_l2_clip_threshold as f32,
-                    attn.rms_norm_eps,
-                )?
-            }
-            None => fused_short_conv_kv_prep_taped(
-                &k_raw,
-                &v_raw,
-                &attn.k_conv,
-                &attn.v_conv,
-                dyn_k.as_ref(),
-                dyn_v.as_ref(),
-                &mut kh,
-                &mut vh,
-                cu_seqlens_q,
-                cu_arr,
-                None,
-                None,
-                attn.num_kv_heads,
-                attn.head_dim,
-                attn.qk_l2_clip_threshold as f32,
-                attn.rms_norm_eps,
-            )?,
-        }
-    } else {
-        let mut kh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
-        let mut vh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
-        for vc in visit_convs.iter_mut() {
-            kh.push(&mut vc.k);
-            vh.push(&mut vc.v);
-        }
-        match visit_tapes.as_deref_mut() {
-            Some(ts) => {
-                let mut kt: Vec<&mut Option<StreamShortConvTape>> = Vec::with_capacity(ts.len());
-                let mut vt: Vec<&mut Option<StreamShortConvTape>> = Vec::with_capacity(ts.len());
-                for t_slot in ts.iter_mut() {
-                    kt.push(&mut t_slot.k);
-                    vt.push(&mut t_slot.v);
+    let mut fused_kv_done = false;
+    #[cfg(target_os = "macos")]
+    if act_dtype == DType::BFloat16
+        && let Some((ref slot_mapping, total_queries)) = group_meta.write_slot_mapping
+        && i64::from(total_queries) == t_i64
+        && let Ok((k_pool_in, v_pool_in, k_scale_in, v_scale_in, kv_mode)) =
+            adapter.native_fused_write_pool_arrays(phys_layer_ord)
+    {
+        let fused_out = if visit_convs.len() == 1 {
+            let vc0 = &mut visit_convs[0];
+            let mut kh = [&mut vc0.k];
+            let mut vh = [&mut vc0.v];
+            match visit_tapes.as_deref_mut() {
+                Some(ts) => {
+                    let vt0 = &mut ts[0];
+                    let mut kt = [&mut vt0.k];
+                    let mut vt = [&mut vt0.v];
+                    fused_short_conv_kv_prep_paged_taped(
+                        &k_raw,
+                        &v_raw,
+                        &attn.k_conv,
+                        &attn.v_conv,
+                        dyn_k.as_ref(),
+                        dyn_v.as_ref(),
+                        &mut kh,
+                        &mut vh,
+                        cu_seqlens_q,
+                        cu_arr,
+                        Some(&mut kt),
+                        Some(&mut vt),
+                        &k_pool_in,
+                        &v_pool_in,
+                        &k_scale_in,
+                        &v_scale_in,
+                        slot_mapping,
+                        attn.num_kv_heads,
+                        attn.head_dim,
+                        page_block_size as usize,
+                        kv_mode,
+                        attn.qk_l2_clip_threshold as f32,
+                        attn.rms_norm_eps,
+                    )?
                 }
-                fused_short_conv_kv_prep_taped(
+                None => fused_short_conv_kv_prep_paged_taped(
                     &k_raw,
                     &v_raw,
                     &attn.k_conv,
@@ -3151,89 +3264,261 @@ fn forward_attention_paged(
                     &mut vh,
                     cu_seqlens_q,
                     cu_arr,
-                    Some(&mut kt),
-                    Some(&mut vt),
+                    None,
+                    None,
+                    &k_pool_in,
+                    &v_pool_in,
+                    &k_scale_in,
+                    &v_scale_in,
+                    slot_mapping,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    page_block_size as usize,
+                    kv_mode,
+                    attn.qk_l2_clip_threshold as f32,
+                    attn.rms_norm_eps,
+                )?,
+            }
+        } else {
+            let mut kh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
+            let mut vh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
+            for vc in visit_convs.iter_mut() {
+                kh.push(&mut vc.k);
+                vh.push(&mut vc.v);
+            }
+            match visit_tapes.as_deref_mut() {
+                Some(ts) => {
+                    let mut kt: Vec<&mut Option<StreamShortConvTape>> =
+                        Vec::with_capacity(ts.len());
+                    let mut vt: Vec<&mut Option<StreamShortConvTape>> =
+                        Vec::with_capacity(ts.len());
+                    for t_slot in ts.iter_mut() {
+                        kt.push(&mut t_slot.k);
+                        vt.push(&mut t_slot.v);
+                    }
+                    fused_short_conv_kv_prep_paged_taped(
+                        &k_raw,
+                        &v_raw,
+                        &attn.k_conv,
+                        &attn.v_conv,
+                        dyn_k.as_ref(),
+                        dyn_v.as_ref(),
+                        &mut kh,
+                        &mut vh,
+                        cu_seqlens_q,
+                        cu_arr,
+                        Some(&mut kt),
+                        Some(&mut vt),
+                        &k_pool_in,
+                        &v_pool_in,
+                        &k_scale_in,
+                        &v_scale_in,
+                        slot_mapping,
+                        attn.num_kv_heads,
+                        attn.head_dim,
+                        page_block_size as usize,
+                        kv_mode,
+                        attn.qk_l2_clip_threshold as f32,
+                        attn.rms_norm_eps,
+                    )?
+                }
+                None => fused_short_conv_kv_prep_paged_taped(
+                    &k_raw,
+                    &v_raw,
+                    &attn.k_conv,
+                    &attn.v_conv,
+                    dyn_k.as_ref(),
+                    dyn_v.as_ref(),
+                    &mut kh,
+                    &mut vh,
+                    cu_seqlens_q,
+                    cu_arr,
+                    None,
+                    None,
+                    &k_pool_in,
+                    &v_pool_in,
+                    &k_scale_in,
+                    &v_scale_in,
+                    slot_mapping,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    page_block_size as usize,
+                    kv_mode,
+                    attn.qk_l2_clip_threshold as f32,
+                    attn.rms_norm_eps,
+                )?,
+            }
+        };
+        if let Some((kp_out, vp_out, ks_out, vs_out)) = fused_out {
+            adapter
+                .commit_native_fused_write(phys_layer_ord, kp_out, vp_out, ks_out, vs_out)
+                .map_err(Error::from_reason)?;
+            fused_kv_done = true;
+        }
+    }
+
+    if !fused_kv_done {
+        let (k_cur, v_cur) = if visit_convs.len() == 1 {
+            let vc0 = &mut visit_convs[0];
+            let mut kh = [&mut vc0.k];
+            let mut vh = [&mut vc0.v];
+            match visit_tapes.as_deref_mut() {
+                Some(ts) => {
+                    let vt0 = &mut ts[0];
+                    let mut kt = [&mut vt0.k];
+                    let mut vt = [&mut vt0.v];
+                    fused_short_conv_kv_prep_taped(
+                        &k_raw,
+                        &v_raw,
+                        &attn.k_conv,
+                        &attn.v_conv,
+                        dyn_k.as_ref(),
+                        dyn_v.as_ref(),
+                        &mut kh,
+                        &mut vh,
+                        cu_seqlens_q,
+                        cu_arr,
+                        Some(&mut kt),
+                        Some(&mut vt),
+                        attn.num_kv_heads,
+                        attn.head_dim,
+                        attn.qk_l2_clip_threshold as f32,
+                        attn.rms_norm_eps,
+                    )?
+                }
+                None => fused_short_conv_kv_prep_taped(
+                    &k_raw,
+                    &v_raw,
+                    &attn.k_conv,
+                    &attn.v_conv,
+                    dyn_k.as_ref(),
+                    dyn_v.as_ref(),
+                    &mut kh,
+                    &mut vh,
+                    cu_seqlens_q,
+                    cu_arr,
+                    None,
+                    None,
                     attn.num_kv_heads,
                     attn.head_dim,
                     attn.qk_l2_clip_threshold as f32,
                     attn.rms_norm_eps,
-                )?
+                )?,
             }
-            None => fused_short_conv_kv_prep_taped(
-                &k_raw,
-                &v_raw,
-                &attn.k_conv,
-                &attn.v_conv,
-                dyn_k.as_ref(),
-                dyn_v.as_ref(),
-                &mut kh,
-                &mut vh,
-                cu_seqlens_q,
-                cu_arr,
-                None,
-                None,
-                attn.num_kv_heads,
-                attn.head_dim,
-                attn.qk_l2_clip_threshold as f32,
-                attn.rms_norm_eps,
-            )?,
-        }
-    };
+        } else {
+            let mut kh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
+            let mut vh: Vec<&mut MxArray> = Vec::with_capacity(visit_convs.len());
+            for vc in visit_convs.iter_mut() {
+                kh.push(&mut vc.k);
+                vh.push(&mut vc.v);
+            }
+            match visit_tapes.as_deref_mut() {
+                Some(ts) => {
+                    let mut kt: Vec<&mut Option<StreamShortConvTape>> =
+                        Vec::with_capacity(ts.len());
+                    let mut vt: Vec<&mut Option<StreamShortConvTape>> =
+                        Vec::with_capacity(ts.len());
+                    for t_slot in ts.iter_mut() {
+                        kt.push(&mut t_slot.k);
+                        vt.push(&mut t_slot.v);
+                    }
+                    fused_short_conv_kv_prep_taped(
+                        &k_raw,
+                        &v_raw,
+                        &attn.k_conv,
+                        &attn.v_conv,
+                        dyn_k.as_ref(),
+                        dyn_v.as_ref(),
+                        &mut kh,
+                        &mut vh,
+                        cu_seqlens_q,
+                        cu_arr,
+                        Some(&mut kt),
+                        Some(&mut vt),
+                        attn.num_kv_heads,
+                        attn.head_dim,
+                        attn.qk_l2_clip_threshold as f32,
+                        attn.rms_norm_eps,
+                    )?
+                }
+                None => fused_short_conv_kv_prep_taped(
+                    &k_raw,
+                    &v_raw,
+                    &attn.k_conv,
+                    &attn.v_conv,
+                    dyn_k.as_ref(),
+                    dyn_v.as_ref(),
+                    &mut kh,
+                    &mut vh,
+                    cu_seqlens_q,
+                    cu_arr,
+                    None,
+                    None,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    attn.qk_l2_clip_threshold as f32,
+                    attn.rms_norm_eps,
+                )?,
+            }
+        };
 
-    // 5. Relative bias `R @ rel_bias_t` -> `[T, H, rel_extent]` FP32
-    let rel_bias = r_for_rel.matmul(&attn.rel_bias_t)?;
-
-    // 6. Write K, V into paged Metal pool (INT8 32-token KTM or BF16 vLLM)
-    match mode {
-        PagedWaveMode::Single {
-            seq_id,
-            first_pos,
-            floor,
-            ..
-        } => {
-            adapter
-                .activate_request(*seq_id)
-                .map_err(Error::from_reason)?;
-            adapter
-                .update_keys_values_native_recorded(
-                    phys_layer_ord,
-                    &k_cur,
-                    &v_cur,
-                    *first_pos,
-                    *floor,
-                )
-                .map_err(Error::from_reason)?;
-        }
-        PagedWaveMode::BatchedDecode { planned_rows } => {
-            adapter
-                .update_keys_values_native_batched(phys_layer_ord, &k_cur, &v_cur, planned_rows)
-                .map_err(Error::from_reason)?;
-        }
-        PagedWaveMode::RaggedVerify { ragged_rows, .. } => {
-            #[cfg(target_os = "macos")]
-            if let Some((ref slot_mapping, total_queries)) = group_meta.ragged_slot_mapping {
+        match mode {
+            PagedWaveMode::Single {
+                seq_id,
+                first_pos,
+                floor,
+                ..
+            } => {
                 adapter
-                    .update_keys_values_native_with_slot_mapping(
+                    .activate_request(*seq_id)
+                    .map_err(Error::from_reason)?;
+                adapter
+                    .update_keys_values_native_recorded(
                         phys_layer_ord,
                         &k_cur,
                         &v_cur,
-                        slot_mapping,
-                        total_queries,
+                        *first_pos,
+                        *floor,
                     )
                     .map_err(Error::from_reason)?;
-            } else {
+            }
+            PagedWaveMode::BatchedDecode { planned_rows } => {
+                adapter
+                    .update_keys_values_native_batched(phys_layer_ord, &k_cur, &v_cur, planned_rows)
+                    .map_err(Error::from_reason)?;
+            }
+            PagedWaveMode::RaggedVerify { ragged_rows, .. } => {
+                #[cfg(target_os = "macos")]
+                if let Some((ref slot_mapping, total_queries)) = group_meta.write_slot_mapping {
+                    adapter
+                        .update_keys_values_native_with_slot_mapping(
+                            phys_layer_ord,
+                            &k_cur,
+                            &v_cur,
+                            slot_mapping,
+                            total_queries,
+                        )
+                        .map_err(Error::from_reason)?;
+                } else {
+                    adapter
+                        .update_keys_values_native_ragged(
+                            phys_layer_ord,
+                            &k_cur,
+                            &v_cur,
+                            ragged_rows,
+                        )
+                        .map_err(Error::from_reason)?;
+                }
+                #[cfg(not(target_os = "macos"))]
                 adapter
                     .update_keys_values_native_ragged(phys_layer_ord, &k_cur, &v_cur, ragged_rows)
                     .map_err(Error::from_reason)?;
             }
-            #[cfg(not(target_os = "macos"))]
-            adapter
-                .update_keys_values_native_ragged(phys_layer_ord, &k_cur, &v_cur, ragged_rows)
-                .map_err(Error::from_reason)?;
         }
     }
 
-    // 7. Fetch dependency-carrying pool views and dispatch Inkling2 Paged Attention
+    // 5, 7 & 8. Fetch dependency-carrying pool views and dispatch Inkling2 Paged Attention
+    // with on-the-fly `dot(r_head[16], rel_bias_w[dist])` AND fused `gate + sink` epilogue!
     let k_pool = adapter
         .key_pool_array(phys_layer_ord)
         .map_err(Error::from_reason)?;
@@ -3244,13 +3529,24 @@ fn forward_attention_paged(
         .scale_pool_arrays(phys_layer_ord)
         .map_err(Error::from_reason)?;
 
-    let (attn_o, lse) = dispatch_paged_attention_kernel(
+    let precomp_rel_bias;
+    let (rel_arg, rel_w_arg) = if attn.d_rel == 16 && attn.rel_extent > 0 {
+        (&r_for_rel, Some(&attn.rel_bias_w))
+    } else {
+        precomp_rel_bias = r_for_rel.matmul(&attn.rel_bias_t)?;
+        (&precomp_rel_bias, None)
+    };
+
+    let (y_3d, _) = dispatch_paged_attention_kernel_ex(
         &q_cur,
         &k_pool,
         &v_pool,
         &k_scale,
         &v_scale,
-        &rel_bias,
+        rel_arg,
+        rel_w_arg,
+        Some((&gate_raw, &sink_raw)),
+        false,
         group_meta,
         kv_dtype,
         mode,
@@ -3264,9 +3560,6 @@ fn forward_attention_paged(
         attn.head_dim,
         mpp_workspace,
     )?;
-
-    // 8. Fused Gate + Sink epilogue: `Y = O * sigmoid(gate) * sigmoid(lse - sink)`
-    let y_3d = inkling2_gate_sink(&attn_o, &gate_raw, &lse, &sink_raw)?;
     let y = y_3d.reshape(&[t_i64, q_dim])?;
 
     // 9. Output projection + fused static `attn_post_conv` (+ optional FP32 residual epilogue)
@@ -5586,6 +5879,134 @@ mod mpp_verify_tests {
             &mix_sl_lse[lse_lane_len..],
             solo_long_lse.as_slice(),
             "long-context lane LSE must be bit-exact in [short, long]"
+        );
+
+        // Also verify Pass 3 fused path: on-the-fly `r_for_rel @ rel_bias_w^T` + fused strided `gate + sink`!
+        let r_long = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * 16, 0.35),
+            &[q_len as i64, num_q_heads as i64, 16],
+        )
+        .unwrap();
+        let r_short = MxArray::from_float32(
+            &next_vec(q_len as usize * num_q_heads * 16, 0.35),
+            &[q_len as i64, num_q_heads as i64, 16],
+        )
+        .unwrap();
+        let rel_w =
+            MxArray::from_float32(&next_vec(rel_extent * 16, 0.25), &[rel_extent as i64, 16])
+                .unwrap();
+        let q_dim = (num_q_heads * head_dim) as i64;
+        // Build strided `gate` and `sink` sliced from a wider [T, q_dim + num_q_heads + 64] buffer!
+        let wide_cols = q_dim + num_q_heads as i64 + 64;
+        let wide_long = MxArray::from_float32(
+            &next_vec(q_len as usize * wide_cols as usize, 0.5),
+            &[q_len as i64, wide_cols],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let wide_short = MxArray::from_float32(
+            &next_vec(q_len as usize * wide_cols as usize, 0.5),
+            &[q_len as i64, wide_cols],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let g_long = wide_long
+            .slice(&[0, 32], &[q_len as i64, 32 + q_dim])
+            .unwrap();
+        let s_long = wide_long
+            .slice(
+                &[0, 32 + q_dim],
+                &[q_len as i64, 32 + q_dim + num_q_heads as i64],
+            )
+            .unwrap();
+        let g_short = wide_short
+            .slice(&[0, 32], &[q_len as i64, 32 + q_dim])
+            .unwrap();
+        let s_short = wide_short
+            .slice(
+                &[0, 32 + q_dim],
+                &[q_len as i64, 32 + q_dim + num_q_heads as i64],
+            )
+            .unwrap();
+
+        let run_fused = |rows: &[PagedRaggedRow],
+                         q: &MxArray,
+                         r_arr: &MxArray,
+                         g: &MxArray,
+                         s: &MxArray|
+         -> Vec<f32> {
+            let seq_q_lens: Vec<(SeqId, u32)> =
+                rows.iter().map(|r| (r.seq_id, r.query_len)).collect();
+            let mut cu = vec![0usize];
+            for r in rows {
+                cu.push(cu.last().copied().unwrap_or(0) + r.query_len as usize);
+            }
+            let meta = build_group_attention_meta(&adapter, &seq_q_lens).expect("meta");
+            let use_mpp = rows.iter().any(|r| lane_uses_mpp_verify(r, true));
+            let mut ws = if use_mpp { make_ws(rows) } else { None };
+            let mode = PagedWaveMode::RaggedVerify {
+                ragged_rows: rows,
+                use_mpp_verify: use_mpp,
+                pages_per_split,
+                int8_q_from,
+            };
+            let (out, lse_opt) = dispatch_paged_attention_kernel_ex(
+                q,
+                &k_pool,
+                &v_pool,
+                &k_scale,
+                &v_scale,
+                r_arr,
+                Some(&rel_w),
+                Some((g, s)),
+                false,
+                &meta,
+                Inkling2KvDtype::Int8,
+                &mode,
+                &cu,
+                false,
+                0,
+                rel_extent,
+                block_size as u32,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                ws.as_mut(),
+            )
+            .expect("dispatch_paged_attention_kernel_ex");
+            assert!(lse_opt.is_none());
+            out.astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec()
+        };
+
+        let f_solo_long = run_fused(&[row_long], &q_long, &r_long, &g_long, &s_long);
+        let f_solo_short = run_fused(&[row_short], &q_short, &r_short, &g_short, &s_short);
+        let r_ls = MxArray::concatenate(&r_long, &r_short, 0).unwrap();
+        let wide_ls = MxArray::concatenate(&wide_long, &wide_short, 0).unwrap();
+        let g_ls = wide_ls
+            .slice(&[0, 32], &[2 * q_len as i64, 32 + q_dim])
+            .unwrap();
+        let s_ls = wide_ls
+            .slice(
+                &[0, 32 + q_dim],
+                &[2 * q_len as i64, 32 + q_dim + num_q_heads as i64],
+            )
+            .unwrap();
+        let f_mix_ls = run_fused(&[row_long, row_short], &q_ls, &r_ls, &g_ls, &s_ls);
+        assert_eq!(
+            &f_mix_ls[..o_lane_len],
+            f_solo_long.as_slice(),
+            "fused long-context lane must be bit-exact in [long, short]"
+        );
+        assert_eq!(
+            &f_mix_ls[o_lane_len..],
+            f_solo_short.as_slice(),
+            "fused short-context lane must be bit-exact in [long, short]"
         );
     }
 }

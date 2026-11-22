@@ -716,17 +716,23 @@ impl AdaptiveDraftDepth {
     }
 
     /// EMA threshold required to step UP from `k` to `k + 1`.
+    ///
+    /// Calibrated to M5 Max Pass 3 MoE + attention cycle times (`k=3 -> k=4` costs ~+1.88 ms/cyc,
+    /// ~+7.5% on GGUF / ~+6.0% on SafeTensors): `up_threshold(3) = 2.45` ensures a lone `3/3` burst
+    /// from the initial `1.8` EMA (`0.5*1.8 + 0.5*3 = 2.40`) does not thrash `3 <-> 4`, while
+    /// sustained high acceptance (`ema >= 2.45`) or `consecutive_full >= 2` ramps cleanly to `k=7`.
     #[inline]
     fn up_threshold(k: usize) -> f32 {
         match k {
-            0..=3 => 2.25,
-            4 => 3.10,
-            5 => 4.00,
-            _ => 4.90,
+            0..=3 => 2.45,
+            4 => 3.20,
+            5 => 4.05,
+            _ => 4.95,
         }
     }
 
-    /// EMA threshold below which `k` steps DOWN to `k - 1` (0.40 hysteresis deadband below `up`).
+    /// EMA threshold below which `k` steps DOWN to `k - 1` (0.50-0.60 Schmitt-trigger deadband
+    /// below `up` so lanes that genuinely ramp to `k=4` harvest multiple waves before stepping back).
     #[inline]
     fn down_threshold(k: usize) -> f32 {
         match k {
@@ -1313,11 +1319,133 @@ impl Inkling2DsparkModel {
     }
 }
 
-/// Per-layer BF16 context KV cache for one Inkling2 DSpark sequence.
+/// Pre-allocated slab growth step along the sequence axis for [`DraftLayerKV`].
+const DRAFT_KV_SLAB_STEP: i64 = 256;
+/// Scratch headroom reserved past `end` so local compaction stays infrequent.
+const DRAFT_KV_HEADROOM: i64 = 8;
+
+/// Per-layer pre-allocated BF16 slab KV cache for one Inkling2 DSpark sequence (`O(1)` append).
 #[derive(Clone, Default)]
 pub(crate) struct DraftLayerKV {
-    pub(crate) k: Option<MxArray>, // [1, H_kv, L, D] BF16
-    pub(crate) v: Option<MxArray>, // [1, H_kv, L, D] BF16
+    pub(crate) k_buf: Option<MxArray>, // [1, H_kv, cap, D] BF16
+    pub(crate) v_buf: Option<MxArray>, // [1, H_kv, cap, D] BF16
+    pub(crate) start: i64,             // inclusive start of committed window
+    pub(crate) end: i64,               // exclusive end of committed window
+    pub(crate) cap: i64,               // allocated capacity along axis 2
+}
+
+impl DraftLayerKV {
+    #[inline]
+    pub(crate) fn len(&self) -> i64 {
+        self.end - self.start
+    }
+
+    /// Zero-copy slice view of committed `[1, H_kv, len, D]` BF16 K/V tensors.
+    pub(crate) fn view(&self) -> Result<Option<(MxArray, MxArray)>> {
+        if self.end <= self.start {
+            return Ok(None);
+        }
+        let (Some(kb), Some(vb)) = (&self.k_buf, &self.v_buf) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            kb.slice_axis(2, self.start, self.end)?,
+            vb.slice_axis(2, self.start, self.end)?,
+        )))
+    }
+
+    fn store_pair_at(
+        k_buf: &mut MxArray,
+        v_buf: &mut MxArray,
+        offset: i64,
+        k_src: &MxArray,
+        v_src: &MxArray,
+    ) -> Result<()> {
+        let rows = k_src.shape_at(2)?;
+        if let Some((new_k, new_v)) =
+            crate::kernels::kv::store_kv_pair(k_buf, v_buf, k_src, v_src, offset as i32)?
+        {
+            *k_buf = new_k;
+            *v_buf = new_v;
+            return Ok(());
+        }
+        k_buf.slice_assign_axis_inplace(2, offset, offset + rows, k_src)?;
+        v_buf.slice_assign_axis_inplace(2, offset, offset + rows, v_src)?;
+        Ok(())
+    }
+
+    /// Append `k_rot` & `v_4d` (`[1, H_kv, keep, D]` BF16) in `O(1)` into the pre-allocated slab
+    /// (growing/compacting in steps of 256 tokens; trimming local layers to `swa`).
+    pub(crate) fn append(
+        &mut self,
+        k_rot: &MxArray,
+        v_4d: &MxArray,
+        is_local: bool,
+        swa: i64,
+    ) -> Result<()> {
+        let raw_keep = k_rot.shape_at(2)?;
+        if raw_keep <= 0 {
+            return Ok(());
+        }
+        let n_kv = k_rot.shape_at(1)?;
+        let hd = k_rot.shape_at(3)?;
+        let dtype = k_rot.dtype()?;
+
+        // If a single prefill chunk exceeds `swa` on a local layer, keep only the newest `swa` rows.
+        let (k_in, v_in, keep) = if is_local && raw_keep > swa {
+            let drop_n = raw_keep - swa;
+            (
+                k_rot.slice_axis(2, drop_n, raw_keep)?,
+                v_4d.slice_axis(2, drop_n, raw_keep)?,
+                swa,
+            )
+        } else {
+            (k_rot.clone(), v_4d.clone(), raw_keep)
+        };
+
+        let needed = self.end + keep + DRAFT_KV_HEADROOM;
+        if self.k_buf.is_none() || needed > self.cap {
+            let cur_len = self.len();
+            let keep_old = if is_local {
+                (swa - keep).max(0).min(cur_len)
+            } else {
+                cur_len
+            };
+            let min_cap = if is_local {
+                (swa.max(keep_old + keep) + DRAFT_KV_HEADROOM + DRAFT_KV_SLAB_STEP - 1)
+                    / DRAFT_KV_SLAB_STEP
+                    * DRAFT_KV_SLAB_STEP
+            } else {
+                (keep_old + keep + DRAFT_KV_HEADROOM + DRAFT_KV_SLAB_STEP - 1) / DRAFT_KV_SLAB_STEP
+                    * DRAFT_KV_SLAB_STEP
+            };
+            let mut new_k = MxArray::zeros(&[1, n_kv, min_cap, hd], Some(dtype))?;
+            let mut new_v = MxArray::zeros(&[1, n_kv, min_cap, hd], Some(dtype))?;
+            if keep_old > 0
+                && let (Some(old_k), Some(old_v)) = (&self.k_buf, &self.v_buf)
+            {
+                let old_start = self.end - keep_old;
+                let tail_k = old_k.slice_axis(2, old_start, self.end)?;
+                let tail_v = old_v.slice_axis(2, old_start, self.end)?;
+                Self::store_pair_at(&mut new_k, &mut new_v, 0, &tail_k, &tail_v)?;
+            }
+            self.k_buf = Some(new_k);
+            self.v_buf = Some(new_v);
+            self.start = 0;
+            self.end = keep_old;
+            self.cap = min_cap;
+        }
+
+        let (Some(kb), Some(vb)) = (&mut self.k_buf, &mut self.v_buf) else {
+            return Err(Error::from_reason("DraftLayerKV missing slab buffers"));
+        };
+        Self::store_pair_at(kb, vb, self.end, &k_in, &v_in)?;
+        self.end += keep;
+        if is_local && self.end - self.start > swa {
+            self.start = self.end - swa;
+        }
+        Ok(())
+    }
 }
 
 /// Per-sequence DSpark draft context (3 BF16 KV layers + Markov head `f_rnn` + cursor).
@@ -1341,10 +1469,10 @@ impl Inkling2DsparkContext {
 
     pub fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
         for layer in &self.layers {
-            if let Some(ref k) = layer.k {
+            if let Some(ref k) = layer.k_buf {
                 out.push(k);
             }
-            if let Some(ref v) = layer.v {
+            if let Some(ref v) = layer.v_buf {
                 out.push(v);
             }
         }
@@ -1444,24 +1572,7 @@ impl Inkling2DsparkContext {
                 .reshape(&[1, keep_i64, n_kv, hd])?
                 .transpose(Some(&[0, 2, 1, 3]))?;
 
-            let slot = &mut self.layers[i];
-            let (mut k_cat, mut v_cat) = match (&slot.k, &slot.v) {
-                (Some(prev_k), Some(prev_v)) => (
-                    MxArray::concatenate(prev_k, &k_rot, 2)?,
-                    MxArray::concatenate(prev_v, &v_4d, 2)?,
-                ),
-                _ => (k_rot, v_4d),
-            };
-            if layer.is_local {
-                let len = k_cat.shape()?[2];
-                if len > swa {
-                    let drop_n = len - swa;
-                    k_cat = k_cat.slice(&[0, 0, drop_n, 0], &[1, n_kv, len, hd])?;
-                    v_cat = v_cat.slice(&[0, 0, drop_n, 0], &[1, n_kv, len, hd])?;
-                }
-            }
-            slot.k = Some(k_cat);
-            slot.v = Some(v_cat);
+            self.layers[i].append(&k_rot, &v_4d, layer.is_local, swa)?;
         }
 
         // 2. Compute Markov head `f_rnn` from the LAST committed token (`row keep - 1`)
@@ -1610,24 +1721,7 @@ impl Inkling2DsparkContext {
                 let start_pos = ctx.committed_len;
                 let k_rot = draft.rope.forward(&k_lane, Some(start_pos))?;
 
-                let slot = &mut ctx.layers[layer_idx];
-                let (mut k_cat, mut v_cat) = match (&slot.k, &slot.v) {
-                    (Some(prev_k), Some(prev_v)) => (
-                        MxArray::concatenate(prev_k, &k_rot, 2)?,
-                        MxArray::concatenate(prev_v, &v_lane, 2)?,
-                    ),
-                    _ => (k_rot, v_lane),
-                };
-                if layer.is_local {
-                    let len = k_cat.shape()?[2];
-                    if len > swa {
-                        let drop_n = len - swa;
-                        k_cat = k_cat.slice(&[0, 0, drop_n, 0], &[1, n_kv, len, hd])?;
-                        v_cat = v_cat.slice(&[0, 0, drop_n, 0], &[1, n_kv, len, hd])?;
-                    }
-                }
-                slot.k = Some(k_cat);
-                slot.v = Some(v_cat);
+                ctx.layers[layer_idx].append(&k_rot, &v_lane, layer.is_local, swa)?;
                 off = end;
             }
         }
@@ -1762,12 +1856,12 @@ impl Inkling2DsparkContext {
             // Concatenate committed context KV (already trimmed to <= 1024 on local layers)
             // + the 8 block tokens. Because local window is `1024 + 8`, every block query attends
             // to ALL keys in `[ctx, block]` with NO mask needed!
-            let (k_all, v_all) = match (&self.layers[i].k, &self.layers[i].v) {
-                (Some(ck), Some(cv)) => (
-                    MxArray::concatenate(ck, &k_rot, 2)?,
-                    MxArray::concatenate(cv, &v_4d, 2)?,
+            let (k_all, v_all) = match self.layers[i].view()? {
+                Some((ck, cv)) => (
+                    MxArray::concatenate(&ck, &k_rot, 2)?,
+                    MxArray::concatenate(&cv, &v_4d, 2)?,
                 ),
-                _ => (k_rot, v_4d),
+                None => (k_rot, v_4d),
             };
 
             let attn_out = scaled_dot_product_attention(&q_rot, &k_all, &v_all, attn_scale, None)?
@@ -1817,12 +1911,8 @@ impl Inkling2DsparkContext {
 
         // 4. Recurrent Markov head over `n_draft` steps
         let head = &draft.markov_head;
-        let base_raw = super::attention::forward_linear_proj_fast(target_lm_head, &hidden)?;
-        let base_logits = if base_raw.dtype()? == DType::BFloat16 {
-            base_raw
-        } else {
-            base_raw.astype(DType::BFloat16)?
-        }; // [n_draft, padded_vocab] BF16
+        let base_logits =
+            project_draft_lm_head_bf16(target_lm_head, &hidden, draft.config.unpadded_vocab_size)?; // [n_draft, V] BF16
         let padded_vocab = base_logits.shape()?[1];
         let unpadded_vocab = (draft.config.unpadded_vocab_size as i64).min(padded_vocab);
 
@@ -2219,12 +2309,12 @@ impl Inkling2DsparkModel {
                 let v_j = v_4d.slice(&[s_i64, 0, 0, 0], &[s_i64 + 1, n_kv, block_i64, hd])?;
                 let q_rot = self.rope.forward(&q_j, Some(offset))?;
                 let k_rot = self.rope.forward(&k_j, Some(offset))?;
-                let (k_all, v_all) = match (&ctx.layers[layer_idx].k, &ctx.layers[layer_idx].v) {
-                    (Some(ck), Some(cv)) => (
-                        MxArray::concatenate(ck, &k_rot, 2)?,
-                        MxArray::concatenate(cv, &v_j, 2)?,
+                let (k_all, v_all) = match ctx.layers[layer_idx].view()? {
+                    Some((ck, cv)) => (
+                        MxArray::concatenate(&ck, &k_rot, 2)?,
+                        MxArray::concatenate(&cv, &v_j, 2)?,
                     ),
-                    _ => (k_rot, v_j),
+                    None => (k_rot, v_j),
                 };
                 let ao = scaled_dot_product_attention(&q_rot, &k_all, &v_all, attn_scale, None)?
                     .transpose(Some(&[0, 2, 1, 3]))?
@@ -2276,12 +2366,11 @@ impl Inkling2DsparkModel {
 
         // 4. Shared target `lm_head` ONCE for all `N * max_draft` draft rows!
         let head = &self.markov_head;
-        let base_raw = super::attention::forward_linear_proj_fast(target_lm_head, &hidden_2d)?;
-        let base_2d = if base_raw.dtype()? == DType::BFloat16 {
-            base_raw
-        } else {
-            base_raw.astype(DType::BFloat16)?
-        };
+        let base_2d = project_draft_lm_head_bf16(
+            target_lm_head,
+            &hidden_2d,
+            self.config.unpadded_vocab_size,
+        )?;
         let padded_vocab = base_2d.shape()?[1];
         let unpadded_vocab = (self.config.unpadded_vocab_size as i64).min(padded_vocab);
         let base_logits = base_2d.reshape(&[n_i64, max_draft_i64, padded_vocab])?;
@@ -2831,7 +2920,7 @@ fn load_draft_linear(
             DEFAULT_QUANT_MODE.to_string(),
         );
         let mut proj = LinearProj::Quantized(ql);
-        proj.promote_affine_sidecars_to_f32(DType::BFloat16)?;
+        proj.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
         Ok(proj)
     } else {
         let mut lin = Linear::new(in_features as u32, out_features as u32, Some(false))?;
@@ -2840,9 +2929,126 @@ fn load_draft_linear(
     }
 }
 
+/// Fast BF16 draft `lm_head` projection (`[M, K] -> [M, out_cols]` BF16):
+/// uses `inkling2_lm_head_q8_bf16` directly for symmetric Q8_0 (skipping padded vocab columns
+/// and F32 intermediate cast!), falling back to `forward_linear_proj_fast` otherwise.
+pub(crate) fn project_draft_lm_head_bf16(
+    target_lm_head: &LinearProj,
+    hidden: &MxArray,
+    unpadded_vocab_size: usize,
+) -> Result<MxArray> {
+    #[cfg(target_os = "macos")]
+    if let LinearProj::Quantized(ql) = target_lm_head
+        && ql.is_symmetric_q8()
+        && hidden.dtype()? == DType::BFloat16
+        && unsafe { mlx_sys::mlx_metal_is_available() }
+    {
+        let xs = hidden.shape()?;
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+            let w = ql.get_weight();
+            let sc = ql.get_scales();
+            let vocab_cols = w.shape()?[0] as usize;
+            let out_cols = unpadded_vocab_size.min(vocab_cols);
+            return super::kernels::inkling2_lm_head_q8_bf16(
+                hidden,
+                w,
+                sc,
+                out_cols,
+                0.0,
+                DType::BFloat16,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = unpadded_vocab_size;
+    let raw = super::attention::forward_linear_proj_fast(target_lm_head, hidden)?;
+    if raw.dtype()? == DType::BFloat16 {
+        Ok(raw)
+    } else {
+        raw.astype(DType::BFloat16)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_layer_kv_slab_matches_concat_for_global_and_local() {
+        let n_kv = 2i64;
+        let hd = 16i64;
+        let swa = 64i64;
+        let mut seed = 0x51AB_1234u64;
+        let mut make_chunk = |len: i64| -> (MxArray, MxArray) {
+            let count = (n_kv * len * hd) as usize;
+            let mut kv = Vec::with_capacity(count);
+            let mut vv = Vec::with_capacity(count);
+            for _ in 0..count {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                kv.push(((seed >> 40) as f32) / 16777216.0 - 0.5);
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                vv.push(((seed >> 40) as f32) / 16777216.0 - 0.5);
+            }
+            (
+                MxArray::from_float32(&kv, &[1, n_kv, len, hd])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+                MxArray::from_float32(&vv, &[1, n_kv, len, hd])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            )
+        };
+
+        for &is_local in &[false, true] {
+            let mut slab = DraftLayerKV::default();
+            let mut ref_k: Option<MxArray> = None;
+            let mut ref_v: Option<MxArray> = None;
+
+            // Exercise initial prefill chunk (> swa for local), incremental appends across
+            // multiple 256-token slab growth/compaction boundaries!
+            let chunks = [
+                80i64, 1, 3, 7, 5, 4, 8, 6, 7, 3, 5, 7, 7, 7, 7, 7, 128, 7, 5, 3, 200, 4, 7,
+            ];
+            for &keep in &chunks {
+                let (k_in, v_in) = make_chunk(keep);
+                slab.append(&k_in, &v_in, is_local, swa).unwrap();
+
+                let (mut ck, mut cv) = match (ref_k.take(), ref_v.take()) {
+                    (Some(pk), Some(pv)) => (
+                        MxArray::concatenate(&pk, &k_in, 2).unwrap(),
+                        MxArray::concatenate(&pv, &v_in, 2).unwrap(),
+                    ),
+                    _ => (k_in, v_in),
+                };
+                if is_local {
+                    let len = ck.shape().unwrap()[2];
+                    if len > swa {
+                        ck = ck
+                            .slice(&[0, 0, len - swa, 0], &[1, n_kv, len, hd])
+                            .unwrap();
+                        cv = cv
+                            .slice(&[0, 0, len - swa, 0], &[1, n_kv, len, hd])
+                            .unwrap();
+                    }
+                }
+                let (sk, sv) = slab.view().unwrap().expect("slab non-empty");
+                assert_eq!(
+                    sk.to_float32().unwrap().as_ref(),
+                    ck.to_float32().unwrap().as_ref(),
+                    "DraftLayerKV K mismatch (is_local={is_local}, keep={keep})"
+                );
+                assert_eq!(
+                    sv.to_float32().unwrap().as_ref(),
+                    cv.to_float32().unwrap().as_ref(),
+                    "DraftLayerKV V mismatch (is_local={is_local}, keep={keep})"
+                );
+                ref_k = Some(ck);
+                ref_v = Some(cv);
+            }
+        }
+    }
 
     #[test]
     fn fold_markov_head_f64_matches_exact_double_precision() {

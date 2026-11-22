@@ -245,6 +245,9 @@ bool mlx_inkling2_paged_attention_forward(
     mlx_array*,
     mlx_array*,
     mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
     float,
     int,
     int,
@@ -262,6 +265,9 @@ bool mlx_inkling2_paged_attention_forward(
 }
 
 bool mlx_inkling2_paged_prefill_attention_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
     mlx_array*,
     mlx_array*,
     mlx_array*,

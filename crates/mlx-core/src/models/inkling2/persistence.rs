@@ -572,9 +572,9 @@ fn load_weights_sync(
         default_plq,
         FAMILY_NAME,
     )?;
-    // Hoist F16 affine sidecars to F32 once at load (bit-identical to MLX's
-    // `promote_types(bf16, f16) -> f32` path, removing per-step F16->F32 casts).
-    lm_head.promote_affine_sidecars_to_f32(DType::BFloat16)?;
+    // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) to native Float16 scales
+    // with zero biases (4x less sidecar DRAM), falling back to F32 hoisting for asymmetric affine.
+    lm_head.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
 
     // Global cross-pass message queries (Unsloth GGUF format)
     let global_loop_res = params.get("loop_res_query.weight");
@@ -730,7 +730,7 @@ fn build_physical_layer(
     let ffn_norm = require_tensor(params, &format!("{prefix}.post_attention_layernorm.weight"))?
         .astype(DType::Float32)?;
 
-    // Attention projections (hoist Q8_0 Float16 sidecars BEFORE row-concat fusion!)
+    // Attention projections (compact exact symmetric Q8_0 to native F16 scales BEFORE row-concat fusion!)
     let load_proj = |sub: &str, in_f: usize, out_f: usize| -> Result<LinearProj> {
         let base = format!("{prefix}.self_attn.{sub}");
         let mut proj = LinearProj::Standard(Linear::new(in_f as u32, out_f as u32, Some(false))?);
@@ -742,7 +742,7 @@ fn build_physical_layer(
             default_plq,
             FAMILY_NAME,
         )?;
-        proj.promote_affine_sidecars_to_f32(DType::BFloat16)?;
+        proj.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
         Ok(proj)
     };
 
@@ -779,16 +779,19 @@ fn build_physical_layer(
         .astype(DType::Float32)?;
     let rb_shape = rel_bias_raw.shape()?;
     // GGUF loads `[rel_extent, d_rel]` (`[1024, 16]`); HF loads `[d_rel, rel_extent]` (`[16, 1024]`).
-    let rel_bias_t = if rb_shape.as_ref() == [rel_extent as i64, d_rel as i64] {
-        rel_bias_raw.transpose(None)?
+    let (rel_bias_t, rel_bias_w) = if rb_shape.as_ref() == [rel_extent as i64, d_rel as i64] {
+        (rel_bias_raw.transpose(None)?, rel_bias_raw)
     } else if rb_shape.as_ref() == [d_rel as i64, rel_extent as i64] {
-        rel_bias_raw
+        let w = rel_bias_raw.transpose(None)?;
+        (rel_bias_raw, w)
     } else {
         return Err(Error::from_reason(format!(
             "Inkling2: unexpected rel_bias shape {:?} on layer {phys} (expected [{rel_extent}, {d_rel}] or [{d_rel}, {rel_extent}])",
             rb_shape.as_ref()
         )));
     };
+    // Ensure `rel_bias_w` is row-contiguous in memory (`[rel_extent, d_rel]`) for on-the-fly Metal dot.
+    let rel_bias_w = rel_bias_w.copy()?;
     let qk_thresh_scalar = MxArray::scalar_float(config.qk_l2_clip_threshold)?;
     let rel_thresh_scalar = MxArray::scalar_float(config.rel_l2_clip_threshold)?;
     let one_scalar = MxArray::scalar_float(1.0)?;
@@ -815,6 +818,9 @@ fn build_physical_layer(
         o_proj,
         fused_qrg: None,
         fused_qrgkv: None,
+        fused_qrg_has_sink: false,
+        fused_k_with_conv: None,
+        fused_v_with_conv: None,
         k_conv,
         v_conv,
         post_conv,
@@ -823,6 +829,7 @@ fn build_physical_layer(
         q_clip,
         rel_clip,
         rel_bias_t,
+        rel_bias_w,
         qk_thresh_scalar,
         rel_thresh_scalar,
         one_scalar,
@@ -846,11 +853,11 @@ fn build_physical_layer(
         per_layer_quant,
         default_plq,
     )?;
-    // Hoist Q8_0 affine F16 sidecars on `blk.20..23` MoE experts to BF16 once at load
-    // (native BF16 `gather_qmm` with zero per-step F16->F32 copies, ~3.7x faster M=1,
-    // ~2.2x faster M=8, and 480 MiB smaller than F32 sidecars with full greedy parity).
-    gate_up_proj.promote_affine_sidecars_to_bf16()?;
-    down_proj.promote_affine_sidecars_to_bf16()?;
+    // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) on `blk.20..23` MoE experts
+    // to native Float16 scales with zero biases (-255 MiB RAM, 2x less sidecar DRAM, no x_sum ALU),
+    // falling back to BF16 sidecar hoisting for non-symmetric affine Q8_0.
+    gate_up_proj.try_compact_symmetric_q8_or_promote_bf16()?;
+    down_proj.try_compact_symmetric_q8_or_promote_bf16()?;
     let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?;
     let moe = Inkling2MoE::new(
         config.num_experts,

@@ -925,6 +925,273 @@ inline void inkling2_sconv_k4_kv_prep_impl(
 }
 
 // ============================================================================
+// 6b. inkling2_sconv_k4_kv_prep_paged_bf16
+//     Fused K/V ShortConv + K L2-clip + V RMSNorm + PagedKVWrite (INT8-KTM & BF16)
+//     Zero intermediate [T, H_kv, D] DRAM roundtrip; bit-exact vs unfused!
+// ============================================================================
+struct Inkling2SconvK4KvPrepPagedParams {
+  uint seq_len;           // total T
+  uint num_kv_heads;      // H_kv (8)
+  uint head_dim;          // D (128)
+  uint num_seqs;          // N (>= 1)
+  uint k_row_stride;      // elems per token row t in k_in
+  uint v_row_stride;      // elems per token row t in v_in
+  float qk_thresh;        // 22.627416997969522f
+  float v_eps;            // 1e-6f
+  float l2_eps;           // 1e-6f
+  uint is_dynamic;        // 0 or 1
+  uint packed_hist;       // 0 = up to 4 separate bufs, 1 = packed [N, 3, C] in buf 0
+  uint flags;             // bit0: kw_f32, bit1: vw_f32, bit2: dk_f32, bit3: dv_f32
+  uint k_hist_f32_mask;   // bit s = 1 if k_hist[s] is f32
+  uint v_hist_f32_mask;   // bit s = 1 if v_hist[s] is f32
+  uint block_size;        // 16 or 32
+  uint kv_mode;           // 0 = INT8-KTM, 1 = BF16 vLLM (x=8), 2 = BF16 values_token_major
+  uint k_hist_strides[4]; // row stride in elems for kh0..kh3 (C when packed)
+  uint v_hist_strides[4]; // row stride in elems for vh0..vh3 (C when packed)
+};
+
+[[kernel, max_total_threads_per_threadgroup(32)]] void
+inkling2_sconv_k4_kv_prep_paged_bf16(
+    device const bfloat *k_in [[buffer(0)]],
+    device const bfloat *v_in [[buffer(1)]],
+    device const uchar *k_weight [[buffer(2)]],
+    device const uchar *v_weight [[buffer(3)]],
+    device const uchar *dyn_k [[buffer(4)]],
+    device const uchar *dyn_v [[buffer(5)]],
+    device const int32_t *cu_seqlens [[buffer(6)]],
+    device const uchar *kh0 [[buffer(7)]],
+    device const uchar *kh1 [[buffer(8)]],
+    device const uchar *kh2 [[buffer(9)]],
+    device const uchar *kh3 [[buffer(10)]],
+    device const uchar *vh0 [[buffer(11)]],
+    device const uchar *vh1 [[buffer(12)]],
+    device const uchar *vh2 [[buffer(13)]],
+    device const uchar *vh3 [[buffer(14)]],
+    device bfloat *k_hist_out [[buffer(15)]],
+    device bfloat *v_hist_out [[buffer(16)]],
+    device uchar *k_pool [[buffer(17)]],
+    device uchar *v_pool [[buffer(18)]],
+    device float *k_scale [[buffer(19)]],
+    device float *v_scale [[buffer(20)]],
+    device const int64_t *slot_mapping [[buffer(21)]],
+    constant Inkling2SconvK4KvPrepPagedParams &params [[buffer(22)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  const uint n_kv = params.num_kv_heads;
+  const uint t = tgid.y;
+  if (tgid.x >= 2u * n_kv || t >= params.seq_len) {
+    return;
+  }
+  const bool is_v = tgid.x >= n_kv;
+  const uint h = is_v ? (tgid.x - n_kv) : tgid.x;
+  const uint hd = params.head_dim;
+  const uint C = n_kv * hd;
+
+  uint seq_idx = 0u;
+  uint seq_start = 0u;
+  uint seq_end = params.seq_len;
+  inkling2_find_seq(cu_seqlens, params.num_seqs, params.seq_len, t, seq_idx, seq_start, seq_end);
+  const uint local_t = t - seq_start;
+  const uint seq_t_len = seq_end - seq_start;
+
+  device const bfloat *x_ptr = is_v ? v_in : k_in;
+  const uint x_stride = is_v ? params.v_row_stride : params.k_row_stride;
+  device const uchar *w_ptr = is_v ? v_weight : k_weight;
+  const uint w_f32 = is_v ? ((params.flags >> 1u) & 1u) : ((params.flags >> 0u) & 1u);
+  device const uchar *dyn_ptr = is_v ? dyn_v : dyn_k;
+  const uint dyn_f32 = is_v ? ((params.flags >> 3u) & 1u) : ((params.flags >> 2u) & 1u);
+  const uint hist_mask = is_v ? params.v_hist_f32_mask : params.k_hist_f32_mask;
+
+  device const uchar *h_ptr;
+  ulong h_base;
+  uint h_row_stride;
+  uint h_f32;
+  if (params.packed_hist != 0u) {
+    h_ptr = is_v ? vh0 : kh0;
+    h_base = ulong(seq_idx) * 3ul * ulong(C);
+    h_row_stride = C;
+    h_f32 = hist_mask & 1u;
+  } else {
+    if (is_v) {
+      h_ptr = (seq_idx == 0u) ? vh0 : (seq_idx == 1u) ? vh1 : (seq_idx == 2u) ? vh2 : vh3;
+      h_row_stride = params.v_hist_strides[seq_idx];
+    } else {
+      h_ptr = (seq_idx == 0u) ? kh0 : (seq_idx == 1u) ? kh1 : (seq_idx == 2u) ? kh2 : kh3;
+      h_row_stride = params.k_hist_strides[seq_idx];
+    }
+    h_base = 0ul;
+    h_f32 = (hist_mask >> seq_idx) & 1u;
+  }
+
+  device bfloat *h_out_ptr = is_v ? v_hist_out : k_hist_out;
+  const ulong h_out_base = ulong(seq_idx) * 3ul * ulong(C);
+
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+  float scale = 0.44721359549995793f;
+  if (params.is_dynamic != 0u) {
+    const ulong d_base = (ulong(t) * ulong(n_kv) + ulong(h)) * 4ul;
+    d0 = inkling2_read_f32(dyn_ptr, d_base + 0ul, dyn_f32);
+    d1 = inkling2_read_f32(dyn_ptr, d_base + 1ul, dyn_f32);
+    d2 = inkling2_read_f32(dyn_ptr, d_base + 2ul, dyn_f32);
+    d3 = inkling2_read_f32(dyn_ptr, d_base + 3ul, dyn_f32);
+    scale = 1.0f / 3.0f;
+  }
+
+  const bool is_last_tok = (local_t == seq_t_len - 1u);
+  if (t == 0u && params.num_seqs > 1u) {
+    for (uint s = 0u; s < params.num_seqs; ++s) {
+      if (cu_seqlens[s] == cu_seqlens[s + 1u]) {
+        device const uchar *eh_ptr;
+        ulong eh_base;
+        uint eh_row_stride;
+        uint eh_f32;
+        if (params.packed_hist != 0u) {
+          eh_ptr = is_v ? vh0 : kh0;
+          eh_base = ulong(s) * 3ul * ulong(C);
+          eh_row_stride = C;
+          eh_f32 = hist_mask & 1u;
+        } else {
+          if (is_v) {
+            eh_ptr = (s == 0u) ? vh0 : (s == 1u) ? vh1 : (s == 2u) ? vh2 : vh3;
+            eh_row_stride = params.v_hist_strides[s];
+          } else {
+            eh_ptr = (s == 0u) ? kh0 : (s == 1u) ? kh1 : (s == 2u) ? kh2 : kh3;
+            eh_row_stride = params.k_hist_strides[s];
+          }
+          eh_base = 0ul;
+          eh_f32 = (hist_mask >> s) & 1u;
+        }
+        const ulong eout_base = ulong(s) * 3ul * ulong(C);
+        for (uint d = lane; d < hd; d += 32u) {
+          const uint ch = h * hd + d;
+          for (uint row_k = 0u; row_k < 3u; ++row_k) {
+            const float hv = inkling2_read_f32(
+                eh_ptr, eh_base + ulong(row_k) * ulong(eh_row_stride) + ulong(ch), eh_f32);
+            h_out_ptr[eout_base + ulong(row_k) * ulong(C) + ch] = bfloat(hv);
+          }
+        }
+      }
+    }
+  }
+
+  float conv_regs[8];
+  float sum_sq = 0.0f;
+  uint reg_count = 0u;
+  for (uint d = lane; d < hd; d += 32u) {
+    const uint ch = h * hd + d;
+    const float x3 = inkling2_sconv_read_full_strided<bfloat>(
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 0u, ch);
+    const float x2 = inkling2_sconv_read_full_strided<bfloat>(
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 1u, ch);
+    const float x1 = inkling2_sconv_read_full_strided<bfloat>(
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 2u, ch);
+    const float x0 = inkling2_sconv_read_full_strided<bfloat>(
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 3u, ch);
+
+    if (is_last_tok) {
+      h_out_ptr[h_out_base + 0ul * ulong(C) + ch] = bfloat(x2);
+      h_out_ptr[h_out_base + 1ul * ulong(C) + ch] = bfloat(x1);
+      h_out_ptr[h_out_base + 2ul * ulong(C) + ch] = bfloat(x0);
+    }
+
+    const ulong w_base = ulong(ch) * 4ul;
+    const float w3 = inkling2_read_f32(w_ptr, w_base + 0ul, w_f32) + d3;
+    const float w2 = inkling2_read_f32(w_ptr, w_base + 1ul, w_f32) + d2;
+    const float w1 = inkling2_read_f32(w_ptr, w_base + 2ul, w_f32) + d1;
+    const float w0 = inkling2_read_f32(w_ptr, w_base + 3ul, w_f32) + d0;
+
+    const float acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+    const float cv = float(bfloat(acc * scale));
+    if (reg_count < 8u) {
+      conv_regs[reg_count] = cv;
+    }
+    ++reg_count;
+    sum_sq += cv * cv;
+  }
+
+  const int64_t slot = slot_mapping[t];
+  if (slot < 0) {
+    return;
+  }
+
+  sum_sq = simd_sum(sum_sq);
+  const float factor = is_v
+      ? rsqrt(sum_sq / float(hd) + params.v_eps)
+      : min(params.qk_thresh / (sqrt(sum_sq) + params.l2_eps), 1.0f);
+
+  const ulong bs = ulong(params.block_size);
+  const ulong block = ulong(slot / int64_t(params.block_size));
+  const ulong page_token = ulong(slot % int64_t(params.block_size));
+  const ulong block_head = block * ulong(n_kv) + ulong(h);
+
+  if (params.kv_mode == 0u) {
+    // INT8-KTM: matches `reshape_and_cache_int8_ktm` (both `-fno-fast-math`) bit-for-bit!
+    float out_regs[8];
+    float local_max = 0.0f;
+    for (uint r = 0u; r < reg_count; ++r) {
+      const float val = float(bfloat(conv_regs[r] * factor));
+      out_regs[r] = val;
+      local_max = max(local_max, abs(val));
+    }
+    const float maximum = simd_max(local_max);
+    const float q_scale = (maximum == 0.0f) ? 0.0f : (maximum / 127.0f);
+    const ulong scale_index = block_head * bs + page_token;
+    if (is_v) {
+      device char *v_dst = reinterpret_cast<device char *>(v_pool);
+      if (lane == 0u) {
+        v_scale[scale_index] = q_scale;
+      }
+      uint r = 0u;
+      for (uint d = lane; d < hd; d += 32u) {
+        const float vf = out_regs[r++];
+        const int q = (maximum == 0.0f) ? 0 : clamp(int(rint(vf * 127.0f / maximum)), -127, 127);
+        v_dst[(block_head * ulong(hd) + ulong(d)) * bs + page_token] = char(q);
+      }
+    } else {
+      device char *k_dst = reinterpret_cast<device char *>(k_pool);
+      if (lane == 0u) {
+        k_scale[scale_index] = q_scale;
+      }
+      uint r = 0u;
+      for (uint d = lane; d < hd; d += 32u) {
+        const float kf = out_regs[r++];
+        const int q = (maximum == 0.0f) ? 0 : clamp(int(rint(kf * 127.0f / maximum)), -127, 127);
+        k_dst[scale_index * ulong(hd) + ulong(d)] = char(q);
+      }
+    }
+  } else if (params.kv_mode == 1u) {
+    // BF16 vLLM pool: K [nb, H_kv, hd/8, bs, 8], V [nb, H_kv, hd, bs]
+    if (is_v) {
+      device bfloat *v_dst = reinterpret_cast<device bfloat *>(v_pool);
+      uint r = 0u;
+      for (uint d = lane; d < hd; d += 32u) {
+        v_dst[(block_head * ulong(hd) + ulong(d)) * bs + page_token] =
+            bfloat(conv_regs[r++] * factor);
+      }
+    } else {
+      device bfloat *k_dst = reinterpret_cast<device bfloat *>(k_pool);
+      const ulong x = 8ul;
+      const ulong chunks = ulong(hd) / x;
+      uint r = 0u;
+      for (uint d = lane; d < hd; d += 32u) {
+        const ulong x_idx = ulong(d) / x;
+        const ulong x_off = ulong(d) % x;
+        const ulong tgt = (block_head * chunks + x_idx) * bs * x + page_token * x + x_off;
+        k_dst[tgt] = bfloat(conv_regs[r++] * factor);
+      }
+    }
+  } else {
+    // BF16 values_token_major: K & V both [nb, H_kv, bs, hd]
+    device bfloat *dst = reinterpret_cast<device bfloat *>(is_v ? v_pool : k_pool);
+    const ulong row_base = (block_head * bs + page_token) * ulong(hd);
+    uint r = 0u;
+    for (uint d = lane; d < hd; d += 32u) {
+      dst[row_base + ulong(d)] = bfloat(conv_regs[r++] * factor);
+    }
+  }
+}
+
+// ============================================================================
 // 7. inkling2_block_attn_res (fused Block AttnRes + optional addend + RMSNorm)
 // ============================================================================
 struct Inkling2BlockAttnResParams {
@@ -3571,6 +3838,1270 @@ inkling2_bf16_lm_head_softcap_argmax_p1(
       const ulong out_slot = ulong(r) * ulong(params.num_splits) + ulong(split);
       partial_vals[out_slot] = bv;
       partial_idxs[out_slot] = bi;
+    }
+  }
+}
+
+// ============================================================================
+// 18. Symmetric Q8_0 (`group_size=32`, native Float16 scales, ZERO biases!)
+//     `as_type<char4>(w_u32 ^ 0x80808080u)` is 0-ULP bit-exact to `int(u8) - 128`
+//     for every byte 0..255 with zero weight repacking!
+//     128-bit `uint4` weight + activation loads (`kLanes = 8`, 256B/warp),
+//     exact same k-order & 8-lane tree reduction across ALL `M in 1..=32`
+//     (0-ULP batch-size invariance!).
+//
+//     - `inkling2_lm_head_q8_softcap_argmax_stage1` (reuses `stage2`)
+//     - `inkling2_lm_head_q8_bf16` (BF16 base_logits OR FP32+softcap logits)
+//     - `inkling2_q8_sym_matmul_bf16` (dense Q8_0 + optional fused BF16 tail!)
+// ============================================================================
+struct Inkling2Q8SymParams {
+  uint rows;        // M (1..=32)
+  uint out_dim;     // N (or out_cols for lm_head)
+  uint in_dim;      // K (% 32 == 0)
+  uint num_splits;  // stage1 TG count for argmax (0 for linear/lm_head_bf16)
+  float softcap;    // > 0 applies softcap in lm_head kernels
+  uint aux_dim;     // N_aux for fused BF16 tail (0 when none)
+  uint flags;       // bit0: out_is_f32, bit1: has_aux
+  uint _pad;
+};
+
+inline float inkling2_q8_sym_reduce8(float v) {
+  v += simd_shuffle_down(v, 4);
+  v += simd_shuffle_down(v, 2);
+  v += simd_shuffle_down(v, 1);
+  return v;
+}
+
+inline float inkling2_q8_sym_dot32_x(
+    float4 w0, float4 w1, float4 w2, float4 w3,
+    float4 w4, float4 w5, float4 w6, float4 w7,
+    device const uint4 *xp) {
+  const uint4 x01 = xp[0];
+  const uint4 x23 = xp[1];
+  const uint4 x45 = xp[2];
+  const uint4 x67 = xp[3];
+  float4 d = w0 * float4(as_type<bfloat4>(x01.xy));
+  d = fma(w1, float4(as_type<bfloat4>(x01.zw)), d);
+  d = fma(w2, float4(as_type<bfloat4>(x23.xy)), d);
+  d = fma(w3, float4(as_type<bfloat4>(x23.zw)), d);
+  d = fma(w4, float4(as_type<bfloat4>(x45.xy)), d);
+  d = fma(w5, float4(as_type<bfloat4>(x45.zw)), d);
+  d = fma(w6, float4(as_type<bfloat4>(x67.xy)), d);
+  d = fma(w7, float4(as_type<bfloat4>(x67.zw)), d);
+  return (d.x + d.y) + (d.z + d.w);
+}
+
+inline float inkling2_q8_sym_row_m1(
+    device const uint4 *x_u4,
+    device const uint4 *w_row,
+    device const half *s_row,
+    uint n_groups,
+    uint k_lane) {
+  float acc = 0.0f;
+  uint g = k_lane;
+  for (; g + 8u < n_groups; g += 16u) {
+    const uint4 p0a = w_row[g * 2u + 0u];
+    const uint4 p1a = w_row[g * 2u + 1u];
+    const float sca = float(s_row[g]);
+    const uint g1 = g + 8u;
+    const uint4 p0b = w_row[g1 * 2u + 0u];
+    const uint4 p1b = w_row[g1 * 2u + 1u];
+    const float scb = float(s_row[g1]);
+
+    const float4 w0a = float4(as_type<char4>(p0a.x ^ 0x80808080u));
+    const float4 w1a = float4(as_type<char4>(p0a.y ^ 0x80808080u));
+    const float4 w2a = float4(as_type<char4>(p0a.z ^ 0x80808080u));
+    const float4 w3a = float4(as_type<char4>(p0a.w ^ 0x80808080u));
+    const float4 w4a = float4(as_type<char4>(p1a.x ^ 0x80808080u));
+    const float4 w5a = float4(as_type<char4>(p1a.y ^ 0x80808080u));
+    const float4 w6a = float4(as_type<char4>(p1a.z ^ 0x80808080u));
+    const float4 w7a = float4(as_type<char4>(p1a.w ^ 0x80808080u));
+    acc = fma(
+        sca,
+        inkling2_q8_sym_dot32_x(w0a, w1a, w2a, w3a, w4a, w5a, w6a, w7a, x_u4 + ulong(g) * 4ul),
+        acc);
+
+    const float4 w0b = float4(as_type<char4>(p0b.x ^ 0x80808080u));
+    const float4 w1b = float4(as_type<char4>(p0b.y ^ 0x80808080u));
+    const float4 w2b = float4(as_type<char4>(p0b.z ^ 0x80808080u));
+    const float4 w3b = float4(as_type<char4>(p0b.w ^ 0x80808080u));
+    const float4 w4b = float4(as_type<char4>(p1b.x ^ 0x80808080u));
+    const float4 w5b = float4(as_type<char4>(p1b.y ^ 0x80808080u));
+    const float4 w6b = float4(as_type<char4>(p1b.z ^ 0x80808080u));
+    const float4 w7b = float4(as_type<char4>(p1b.w ^ 0x80808080u));
+    acc = fma(
+        scb,
+        inkling2_q8_sym_dot32_x(w0b, w1b, w2b, w3b, w4b, w5b, w6b, w7b, x_u4 + ulong(g1) * 4ul),
+        acc);
+  }
+  if (g < n_groups) {
+    const uint4 p0 = w_row[g * 2u + 0u];
+    const uint4 p1 = w_row[g * 2u + 1u];
+    const float sc = float(s_row[g]);
+    const float4 w0 = float4(as_type<char4>(p0.x ^ 0x80808080u));
+    const float4 w1 = float4(as_type<char4>(p0.y ^ 0x80808080u));
+    const float4 w2 = float4(as_type<char4>(p0.z ^ 0x80808080u));
+    const float4 w3 = float4(as_type<char4>(p0.w ^ 0x80808080u));
+    const float4 w4 = float4(as_type<char4>(p1.x ^ 0x80808080u));
+    const float4 w5 = float4(as_type<char4>(p1.y ^ 0x80808080u));
+    const float4 w6 = float4(as_type<char4>(p1.z ^ 0x80808080u));
+    const float4 w7 = float4(as_type<char4>(p1.w ^ 0x80808080u));
+    acc = fma(
+        sc,
+        inkling2_q8_sym_dot32_x(w0, w1, w2, w3, w4, w5, w6, w7, x_u4 + ulong(g) * 4ul),
+        acc);
+  }
+  return inkling2_q8_sym_reduce8(acc);
+}
+
+template <uint M_CAP>
+inline void inkling2_q8_sym_row_multi(
+    device const uint4 *x_u4,
+    device const uint4 *w_row,
+    device const half *s_row,
+    uint m0,
+    uint n_m,
+    uint n_groups,
+    uint k_lane,
+    thread float (&acc)[M_CAP]) {
+  const ulong x_row_u4 = ulong(n_groups) * 4ul;
+  #pragma unroll
+  for (uint i = 0u; i < M_CAP; ++i) {
+    acc[i] = 0.0f;
+  }
+  const device uint4 *x_base = x_u4 + ulong(m0) * x_row_u4;
+  for (uint g = k_lane; g < n_groups; g += 8u) {
+    const uint4 p0 = w_row[g * 2u + 0u];
+    const uint4 p1 = w_row[g * 2u + 1u];
+    const float sc = float(s_row[g]);
+    const float4 w0 = float4(as_type<char4>(p0.x ^ 0x80808080u));
+    const float4 w1 = float4(as_type<char4>(p0.y ^ 0x80808080u));
+    const float4 w2 = float4(as_type<char4>(p0.z ^ 0x80808080u));
+    const float4 w3 = float4(as_type<char4>(p0.w ^ 0x80808080u));
+    const float4 w4 = float4(as_type<char4>(p1.x ^ 0x80808080u));
+    const float4 w5 = float4(as_type<char4>(p1.y ^ 0x80808080u));
+    const float4 w6 = float4(as_type<char4>(p1.z ^ 0x80808080u));
+    const float4 w7 = float4(as_type<char4>(p1.w ^ 0x80808080u));
+    const device uint4 *xg = x_base + ulong(g) * 4ul;
+    #pragma unroll
+    for (uint i = 0u; i < M_CAP; ++i) {
+      if (i < n_m) {
+        acc[i] = fma(
+            sc,
+            inkling2_q8_sym_dot32_x(w0, w1, w2, w3, w4, w5, w6, w7, xg + ulong(i) * x_row_u4),
+            acc[i]);
+      }
+    }
+  }
+  #pragma unroll
+  for (uint i = 0u; i < M_CAP; ++i) {
+    if (i < n_m) {
+      acc[i] = inkling2_q8_sym_reduce8(acc[i]);
+    }
+  }
+}
+
+template <uint M_CAP>
+inline void inkling2_bf16_aux_row_multi(
+    device const uint4 *x_u4,
+    device const uint4 *w_aux_row,
+    uint m0,
+    uint n_m,
+    uint n_groups,
+    uint k_lane,
+    thread float (&acc)[M_CAP]) {
+  const ulong x_row_u4 = ulong(n_groups) * 4ul;
+  #pragma unroll
+  for (uint i = 0u; i < M_CAP; ++i) {
+    acc[i] = 0.0f;
+  }
+  const device uint4 *x_base = x_u4 + ulong(m0) * x_row_u4;
+  for (uint g = k_lane; g < n_groups; g += 8u) {
+    const uint4 wp01 = w_aux_row[g * 4u + 0u];
+    const uint4 wp23 = w_aux_row[g * 4u + 1u];
+    const uint4 wp45 = w_aux_row[g * 4u + 2u];
+    const uint4 wp67 = w_aux_row[g * 4u + 3u];
+    const float4 w0 = float4(as_type<bfloat4>(wp01.xy));
+    const float4 w1 = float4(as_type<bfloat4>(wp01.zw));
+    const float4 w2 = float4(as_type<bfloat4>(wp23.xy));
+    const float4 w3 = float4(as_type<bfloat4>(wp23.zw));
+    const float4 w4 = float4(as_type<bfloat4>(wp45.xy));
+    const float4 w5 = float4(as_type<bfloat4>(wp45.zw));
+    const float4 w6 = float4(as_type<bfloat4>(wp67.xy));
+    const float4 w7 = float4(as_type<bfloat4>(wp67.zw));
+    const device uint4 *xg = x_base + ulong(g) * 4ul;
+    #pragma unroll
+    for (uint i = 0u; i < M_CAP; ++i) {
+      if (i < n_m) {
+        acc[i] += inkling2_q8_sym_dot32_x(
+            w0, w1, w2, w3, w4, w5, w6, w7, xg + ulong(i) * x_row_u4);
+      }
+    }
+  }
+  #pragma unroll
+  for (uint i = 0u; i < M_CAP; ++i) {
+    if (i < n_m) {
+      acc[i] = inkling2_q8_sym_reduce8(acc[i]);
+    }
+  }
+}
+
+inline void inkling2_argmax_sg_reduce4(thread float &bv, thread int32_t &bi) {
+  {
+    const float ov = simd_shuffle_xor(bv, 16);
+    const int32_t oi = simd_shuffle_xor(bi, 16);
+    if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+      bv = ov;
+      bi = oi;
+    }
+  }
+  {
+    const float ov = simd_shuffle_xor(bv, 8);
+    const int32_t oi = simd_shuffle_xor(bi, 8);
+    if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+      bv = ov;
+      bi = oi;
+    }
+  }
+}
+
+// (a) Fused Symmetric Q8_0 lm_head + softcap + Stage 1 argmax (ZERO [M, V] DRAM write!).
+// Grid: (num_splits, 1, 1), TG: (128, 1, 1) -> 4 SGs.
+// Stage 2 reuses `inkling2_lm_head_softcap_argmax_stage2`.
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_lm_head_q8_softcap_argmax_stage1(
+    device const uint4 *x_u4 [[buffer(0)]],
+    device const uint4 *w_u4 [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device float *partial_vals [[buffer(3)]],
+    device int32_t *partial_idxs [[buffer(4)]],
+    constant Inkling2Q8SymParams &params [[buffer(5)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint split = tgid_x;
+  if (split >= params.num_splits) {
+    return;
+  }
+  const uint M = params.rows;
+  const uint V = params.out_dim;
+  const uint n_groups = params.in_dim >> 5u;
+  const ulong row_u4_stride = ulong(n_groups) * 2ul;
+  const float cap = params.softcap;
+
+  const uint chunk = (V + params.num_splits - 1u) / params.num_splits;
+  const uint start = split * chunk;
+  const uint end = min(start + chunk, V);
+
+  const uint k_lane = lane & 7u;
+  const uint r_id = lane >> 3u; // 0..3
+
+  threadgroup float tg_v[32][4];
+  threadgroup int32_t tg_i[32][4];
+
+  if (M == 1u) {
+    float best_v = -INFINITY;
+    int32_t best_i = -1;
+    for (uint v_base = start; v_base < end; v_base += 16u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        const float dot_v = inkling2_q8_sym_row_m1(
+            x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+            n_groups, k_lane);
+        if (k_lane == 0u) {
+          const float val = cap > 0.0f ? inkling2_softcap(dot_v, cap) : dot_v;
+          const int32_t ci = int32_t(v);
+          if (best_i < 0 || val > best_v || (val == best_v && ci < best_i)) {
+            best_v = val;
+            best_i = ci;
+          }
+        }
+      }
+    }
+    inkling2_argmax_sg_reduce4(best_v, best_i);
+    if (lane == 0u) {
+      tg_v[0][sg] = best_v;
+      tg_i[0][sg] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane == 0u) {
+      float bv = tg_v[0][0];
+      int32_t bi = tg_i[0][0];
+      #pragma unroll
+      for (uint s = 1u; s < 4u; ++s) {
+        const float ov = tg_v[0][s];
+        const int32_t oi = tg_i[0][s];
+        if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+          bv = ov;
+          bi = oi;
+        }
+      }
+      partial_vals[split] = bv;
+      partial_idxs[split] = bi;
+    }
+    return;
+  }
+
+  if (M <= 8u) {
+    float best_v[8];
+    int32_t best_i[8];
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+      best_v[i] = -INFINITY;
+      best_i[i] = -1;
+    }
+    for (uint v_base = start; v_base < end; v_base += 16u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        float acc[8];
+        inkling2_q8_sym_row_multi<8>(
+            x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+            0u, M, n_groups, k_lane, acc);
+        if (k_lane == 0u) {
+          const int32_t ci = int32_t(v);
+          #pragma unroll
+          for (uint i = 0u; i < 8u; ++i) {
+            if (i < M) {
+              const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+              if (best_i[i] < 0 || val > best_v[i] || (val == best_v[i] && ci < best_i[i])) {
+                best_v[i] = val;
+                best_i[i] = ci;
+              }
+            }
+          }
+        }
+      }
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+      if (i < M) {
+        inkling2_argmax_sg_reduce4(best_v[i], best_i[i]);
+        if (lane == 0u) {
+          tg_v[i][sg] = best_v[i];
+          tg_i[i][sg] = best_i[i];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane < M) {
+      float bv = tg_v[lane][0];
+      int32_t bi = tg_i[lane][0];
+      #pragma unroll
+      for (uint s = 1u; s < 4u; ++s) {
+        const float ov = tg_v[lane][s];
+        const int32_t oi = tg_i[lane][s];
+        if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+          bv = ov;
+          bi = oi;
+        }
+      }
+      const ulong out_slot = ulong(lane) * ulong(params.num_splits) + ulong(split);
+      partial_vals[out_slot] = bv;
+      partial_idxs[out_slot] = bi;
+    }
+    return;
+  }
+
+  if (M <= 16u) {
+    float best_v[16];
+    int32_t best_i[16];
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+      best_v[i] = -INFINITY;
+      best_i[i] = -1;
+    }
+    for (uint v_base = start; v_base < end; v_base += 16u) {
+      const uint v = v_base + sg * 4u + r_id;
+      if (v < end) {
+        float acc[16];
+        inkling2_q8_sym_row_multi<16>(
+            x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+            0u, M, n_groups, k_lane, acc);
+        if (k_lane == 0u) {
+          const int32_t ci = int32_t(v);
+          #pragma unroll
+          for (uint i = 0u; i < 16u; ++i) {
+            if (i < M) {
+              const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+              if (best_i[i] < 0 || val > best_v[i] || (val == best_v[i] && ci < best_i[i])) {
+                best_v[i] = val;
+                best_i[i] = ci;
+              }
+            }
+          }
+        }
+      }
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+      if (i < M) {
+        inkling2_argmax_sg_reduce4(best_v[i], best_i[i]);
+        if (lane == 0u) {
+          tg_v[i][sg] = best_v[i];
+          tg_i[i][sg] = best_i[i];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane < M) {
+      float bv = tg_v[lane][0];
+      int32_t bi = tg_i[lane][0];
+      #pragma unroll
+      for (uint s = 1u; s < 4u; ++s) {
+        const float ov = tg_v[lane][s];
+        const int32_t oi = tg_i[lane][s];
+        if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+          bv = ov;
+          bi = oi;
+        }
+      }
+      const ulong out_slot = ulong(lane) * ulong(params.num_splits) + ulong(split);
+      partial_vals[out_slot] = bv;
+      partial_idxs[out_slot] = bi;
+    }
+    return;
+  }
+
+  // 17 <= M <= 32: pairs of SGs share each vocab row in L1 cache while splitting M into [0..16) / [16..M)!
+  const uint sg_pair = sg >> 1u; // 0 or 1
+  const uint m_half = sg & 1u;   // 0 or 1
+  const uint m0 = m_half * 16u;
+  const uint n_m = min(16u, M - m0);
+  float best_v[16];
+  int32_t best_i[16];
+  #pragma unroll
+  for (uint i = 0u; i < 16u; ++i) {
+    best_v[i] = -INFINITY;
+    best_i[i] = -1;
+  }
+  for (uint v_base = start; v_base < end; v_base += 8u) {
+    const uint v = v_base + sg_pair * 4u + r_id;
+    if (v < end) {
+      float acc[16];
+      inkling2_q8_sym_row_multi<16>(
+          x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+          m0, n_m, n_groups, k_lane, acc);
+      if (k_lane == 0u) {
+        const int32_t ci = int32_t(v);
+        #pragma unroll
+        for (uint i = 0u; i < 16u; ++i) {
+          if (i < n_m) {
+            const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+            if (best_i[i] < 0 || val > best_v[i] || (val == best_v[i] && ci < best_i[i])) {
+              best_v[i] = val;
+              best_i[i] = ci;
+            }
+          }
+        }
+      }
+    }
+  }
+  #pragma unroll
+  for (uint i = 0u; i < 16u; ++i) {
+    if (i < n_m) {
+      inkling2_argmax_sg_reduce4(best_v[i], best_i[i]);
+      if (lane == 0u) {
+        tg_v[m0 + i][sg_pair] = best_v[i];
+        tg_i[m0 + i][sg_pair] = best_i[i];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && lane < M) {
+    float bv = tg_v[lane][0];
+    int32_t bi = tg_i[lane][0];
+    const float ov = tg_v[lane][1];
+    const int32_t oi = tg_i[lane][1];
+    if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) {
+      bv = ov;
+      bi = oi;
+    }
+    const ulong out_slot = ulong(lane) * ulong(params.num_splits) + ulong(split);
+    partial_vals[out_slot] = bv;
+    partial_idxs[out_slot] = bi;
+  }
+}
+
+inline void inkling2_q8_sym_store_scalar(
+    device uchar *out_raw,
+    ulong idx,
+    float val,
+    uint out_is_f32) {
+  if (out_is_f32 != 0u) {
+    reinterpret_cast<device float *>(out_raw)[idx] = val;
+  } else {
+    reinterpret_cast<device bfloat *>(out_raw)[idx] = bfloat(val);
+  }
+}
+
+// (b) Symmetric Q8_0 lm_head -> `[M, out_cols]` BF16 (DSpark base_logits) OR FP32+softcap (sampled/prefill).
+// Grid: (ceil(out_cols / rows_per_tg), 1, 1), TG: (128, 1, 1) -> rows_per_tg = 16 (M<=16) or 8 (M>16).
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_lm_head_q8_bf16(
+    device const uint4 *x_u4 [[buffer(0)]],
+    device const uint4 *w_u4 [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device uchar *out_raw [[buffer(3)]],
+    constant Inkling2Q8SymParams &params [[buffer(4)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint M = params.rows;
+  const uint V = params.out_dim;
+  const uint n_groups = params.in_dim >> 5u;
+  const ulong row_u4_stride = ulong(n_groups) * 2ul;
+  const uint out_is_f32 = params.flags & 1u;
+  const float cap = params.softcap;
+
+  const uint k_lane = lane & 7u;
+  const uint r_id = lane >> 3u; // 0..3
+
+  if (M == 1u) {
+    const uint v = tgid_x * 16u + sg * 4u + r_id;
+    if (v >= V) {
+      return;
+    }
+    const float dot_v = inkling2_q8_sym_row_m1(
+        x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+        n_groups, k_lane);
+    if (k_lane == 0u) {
+      const float val = cap > 0.0f ? inkling2_softcap(dot_v, cap) : dot_v;
+      inkling2_q8_sym_store_scalar(out_raw, ulong(v), val, out_is_f32);
+    }
+    return;
+  }
+
+  if (M <= 8u) {
+    const uint v = tgid_x * 16u + sg * 4u + r_id;
+    if (v >= V) {
+      return;
+    }
+    float acc[8];
+    inkling2_q8_sym_row_multi<8>(
+        x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+        0u, M, n_groups, k_lane, acc);
+    if (k_lane == 0u) {
+      #pragma unroll
+      for (uint i = 0u; i < 8u; ++i) {
+        if (i < M) {
+          const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+          inkling2_q8_sym_store_scalar(out_raw, ulong(i) * ulong(V) + ulong(v), val, out_is_f32);
+        }
+      }
+    }
+    return;
+  }
+
+  if (M <= 16u) {
+    const uint v = tgid_x * 16u + sg * 4u + r_id;
+    if (v >= V) {
+      return;
+    }
+    float acc[16];
+    inkling2_q8_sym_row_multi<16>(
+        x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+        0u, M, n_groups, k_lane, acc);
+    if (k_lane == 0u) {
+      #pragma unroll
+      for (uint i = 0u; i < 16u; ++i) {
+        if (i < M) {
+          const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+          inkling2_q8_sym_store_scalar(out_raw, ulong(i) * ulong(V) + ulong(v), val, out_is_f32);
+        }
+      }
+    }
+    return;
+  }
+
+  const uint sg_pair = sg >> 1u;
+  const uint m_half = sg & 1u;
+  const uint v = tgid_x * 8u + sg_pair * 4u + r_id;
+  if (v >= V) {
+    return;
+  }
+  const uint m0 = m_half * 16u;
+  const uint n_m = min(16u, M - m0);
+  float acc[16];
+  inkling2_q8_sym_row_multi<16>(
+      x_u4, w_u4 + ulong(v) * row_u4_stride, scales + ulong(v) * ulong(n_groups),
+      m0, n_m, n_groups, k_lane, acc);
+  if (k_lane == 0u) {
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+      if (i < n_m) {
+        const float val = cap > 0.0f ? inkling2_softcap(acc[i], cap) : acc[i];
+        inkling2_q8_sym_store_scalar(
+            out_raw, ulong(m0 + i) * ulong(V) + ulong(v), val, out_is_f32);
+      }
+    }
+  }
+}
+
+// (c) Symmetric Q8_0 dense projection matmul (`1 <= M <= 32`, `K % 32 == 0`) with optional
+//     fused BF16 tail projection (`sink_proj` [24, K] or `k_conv_proj`/`v_conv_proj` [32, K])
+//     in the EXACT SAME GPU dispatch!
+// Grid: (q8_tgs + aux_tgs, 1, 1), TG: (128, 1, 1).
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_q8_sym_matmul_bf16(
+    device const uint4 *x_u4 [[buffer(0)]],
+    device const uint4 *w_u4 [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const uint4 *w_aux_u4 [[buffer(3)]],
+    device uchar *out_raw [[buffer(4)]],
+    device bfloat *out_aux [[buffer(5)]],
+    constant Inkling2Q8SymParams &params [[buffer(6)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint M = params.rows;
+  const uint N = params.out_dim;
+  const uint n_groups = params.in_dim >> 5u;
+  const uint out_is_f32 = params.flags & 1u;
+  const bool has_aux = ((params.flags >> 1u) & 1u) != 0u;
+  const uint rows_per_tg = (M <= 16u) ? 16u : 8u;
+  const uint q8_tgs = (N + rows_per_tg - 1u) / rows_per_tg;
+
+  const uint k_lane = lane & 7u;
+  const uint r_id = lane >> 3u;
+
+  if (tgid_x < q8_tgs) {
+    const ulong row_u4_stride = ulong(n_groups) * 2ul;
+    if (M == 1u) {
+      const uint n = tgid_x * 16u + sg * 4u + r_id;
+      if (n >= N) {
+        return;
+      }
+      const float dot_v = inkling2_q8_sym_row_m1(
+          x_u4, w_u4 + ulong(n) * row_u4_stride, scales + ulong(n) * ulong(n_groups),
+          n_groups, k_lane);
+      if (k_lane == 0u) {
+        inkling2_q8_sym_store_scalar(out_raw, ulong(n), dot_v, out_is_f32);
+      }
+      return;
+    }
+    if (M <= 8u) {
+      const uint n = tgid_x * 16u + sg * 4u + r_id;
+      if (n >= N) {
+        return;
+      }
+      float acc[8];
+      inkling2_q8_sym_row_multi<8>(
+          x_u4, w_u4 + ulong(n) * row_u4_stride, scales + ulong(n) * ulong(n_groups),
+          0u, M, n_groups, k_lane, acc);
+      if (k_lane == 0u) {
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+          if (i < M) {
+            inkling2_q8_sym_store_scalar(
+                out_raw, ulong(i) * ulong(N) + ulong(n), acc[i], out_is_f32);
+          }
+        }
+      }
+      return;
+    }
+    if (M <= 16u) {
+      const uint n = tgid_x * 16u + sg * 4u + r_id;
+      if (n >= N) {
+        return;
+      }
+      float acc[16];
+      inkling2_q8_sym_row_multi<16>(
+          x_u4, w_u4 + ulong(n) * row_u4_stride, scales + ulong(n) * ulong(n_groups),
+          0u, M, n_groups, k_lane, acc);
+      if (k_lane == 0u) {
+        #pragma unroll
+        for (uint i = 0u; i < 16u; ++i) {
+          if (i < M) {
+            inkling2_q8_sym_store_scalar(
+                out_raw, ulong(i) * ulong(N) + ulong(n), acc[i], out_is_f32);
+          }
+        }
+      }
+      return;
+    }
+    const uint sg_pair = sg >> 1u;
+    const uint m_half = sg & 1u;
+    const uint n = tgid_x * 8u + sg_pair * 4u + r_id;
+    if (n >= N) {
+      return;
+    }
+    const uint m0 = m_half * 16u;
+    const uint n_m = min(16u, M - m0);
+    float acc[16];
+    inkling2_q8_sym_row_multi<16>(
+        x_u4, w_u4 + ulong(n) * row_u4_stride, scales + ulong(n) * ulong(n_groups),
+        m0, n_m, n_groups, k_lane, acc);
+    if (k_lane == 0u) {
+      #pragma unroll
+      for (uint i = 0u; i < 16u; ++i) {
+        if (i < n_m) {
+          inkling2_q8_sym_store_scalar(
+              out_raw, ulong(m0 + i) * ulong(N) + ulong(n), acc[i], out_is_f32);
+        }
+      }
+    }
+    return;
+  }
+
+  // Optional fused exact-BF16 tail projection (uniform across TG -> 0% divergence!).
+  if (!has_aux) {
+    return;
+  }
+  const uint N_aux = params.aux_dim;
+  const uint aux_tg = tgid_x - q8_tgs;
+  const ulong aux_row_u4 = ulong(n_groups) * 4ul;
+
+  if (M <= 8u) {
+    const uint n = aux_tg * 16u + sg * 4u + r_id;
+    if (n >= N_aux) {
+      return;
+    }
+    float acc[8];
+    inkling2_bf16_aux_row_multi<8>(
+        x_u4, w_aux_u4 + ulong(n) * aux_row_u4, 0u, M, n_groups, k_lane, acc);
+    if (k_lane == 0u) {
+      #pragma unroll
+      for (uint i = 0u; i < 8u; ++i) {
+        if (i < M) {
+          out_aux[ulong(i) * ulong(N_aux) + ulong(n)] = bfloat(acc[i]);
+        }
+      }
+    }
+    return;
+  }
+
+  if (M <= 16u) {
+    const uint n = aux_tg * 16u + sg * 4u + r_id;
+    if (n >= N_aux) {
+      return;
+    }
+    float acc[16];
+    inkling2_bf16_aux_row_multi<16>(
+        x_u4, w_aux_u4 + ulong(n) * aux_row_u4, 0u, M, n_groups, k_lane, acc);
+    if (k_lane == 0u) {
+      #pragma unroll
+      for (uint i = 0u; i < 16u; ++i) {
+        if (i < M) {
+          out_aux[ulong(i) * ulong(N_aux) + ulong(n)] = bfloat(acc[i]);
+        }
+      }
+    }
+    return;
+  }
+
+  const uint sg_pair = sg >> 1u;
+  const uint m_half = sg & 1u;
+  const uint n = aux_tg * 8u + sg_pair * 4u + r_id;
+  if (n >= N_aux) {
+    return;
+  }
+  const uint m0 = m_half * 16u;
+  const uint n_m = min(16u, M - m0);
+  float acc[16];
+  inkling2_bf16_aux_row_multi<16>(
+      x_u4, w_aux_u4 + ulong(n) * aux_row_u4, m0, n_m, n_groups, k_lane, acc);
+  if (k_lane == 0u) {
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+      if (i < n_m) {
+        out_aux[ulong(m0 + i) * ulong(N_aux) + ulong(n)] = bfloat(acc[i]);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// 19. Apple M5 Max NAX Symmetric Q8_0 (`mpp::tensor_ops::matmul2d`)
+//     Single-pass 0-ULP exact dequant: EVERY int8 (`[-128, 127]`) is 100% BIT-EXACT
+//     in `bfloat16`! 128 threads = 32 rows x 4 groups (1 full 32B Q8_0 group per thread,
+//     4 threads = 128B cacheline per row, ZERO branch for scale load!).
+//     Computes exact FP32 group dot `Dtmp = A_bf16 @ q_i8_bf16^T` via single NAX
+//     `matmul2d(32, 32, 32, mode::multiply)` -> 2x fewer A reads & 2x fewer TGs on lm_head!
+//     FMA `Dacc += Dtmp * scale_f16[n, g]`, 4 SGs split-K (KS=4), 12.5 KB overlaid smem,
+//     0-ULP batch-size invariant across ALL `M in 1..=32`!
+//
+//     - `inkling2_q8_sym_matmul_nax_bf16`: dense Q8_0 (+ optional BF16 tail) & `lm_head`
+//     - `inkling2_lm_head_q8_nax_softcap_argmax_p1`: zero-DRAM-logits softcap + argmax p1
+// ============================================================================
+inline void inkling2_stage_sym_q8_32_bf16(uint4 p0, uint4 p1, threadgroup bfloat *dst) {
+  threadgroup bfloat4 *dst4 = reinterpret_cast<threadgroup bfloat4 *>(dst);
+  dst4[0] = bfloat4(as_type<char4>(p0.x ^ 0x80808080u));
+  dst4[1] = bfloat4(as_type<char4>(p0.y ^ 0x80808080u));
+  dst4[2] = bfloat4(as_type<char4>(p0.z ^ 0x80808080u));
+  dst4[3] = bfloat4(as_type<char4>(p0.w ^ 0x80808080u));
+  dst4[4] = bfloat4(as_type<char4>(p1.x ^ 0x80808080u));
+  dst4[5] = bfloat4(as_type<char4>(p1.y ^ 0x80808080u));
+  dst4[6] = bfloat4(as_type<char4>(p1.z ^ 0x80808080u));
+  dst4[7] = bfloat4(as_type<char4>(p1.w ^ 0x80808080u));
+}
+
+inline void inkling2_stage_zero_32_bf16(threadgroup bfloat *dst) {
+  threadgroup bfloat4 *dst4 = reinterpret_cast<threadgroup bfloat4 *>(dst);
+  const bfloat4 z = bfloat4(bfloat(0.0f));
+  #pragma unroll
+  for (uint i = 0u; i < 8u; ++i) {
+    dst4[i] = z;
+  }
+}
+
+// Grid: (ceil(N / 32) + (has_aux ? ceil(N_aux / 32) : 0), 1, 1), TG: (128, 1, 1) -> 4 SGs (KS=4).
+// Handles BOTH `inkling2_q8_sym_matmul_bf16` (+ optional fused BF16 tail) AND `inkling2_lm_head_q8_bf16`
+// (BF16 OR FP32 + optional softcap).
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_q8_sym_matmul_nax_bf16(
+    device const bfloat *x [[buffer(0)]],
+    device const uint4 *w_u4 [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device const bfloat *w_aux [[buffer(3)]],
+    device uchar *out_raw [[buffer(4)]],
+    device bfloat *out_aux [[buffer(5)]],
+    constant Inkling2Q8SymParams &params [[buffer(6)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)lane;
+  using extents_t = metal::dextents<int32_t, 2>;
+  using strides_t = metal::array<int32_t, 2>;
+  using dev_b_t = metal::tensor<device bfloat, extents_t, metal::tensor_inline>;
+  using tg_b_t = metal::tensor<threadgroup bfloat, extents_t, metal::tensor_inline>;
+  using tg_f_t = metal::tensor<threadgroup float, extents_t, metal::tensor_inline>;
+
+  constexpr int TSM = 32;
+  constexpr int TSN = 32;
+  constexpr int BK = 32;
+  constexpr int KS = 4;
+  constexpr int STAGE_STRIDE = 136; // 128 + 8 bfloat padding -> 0 bank conflicts!
+
+  const int M = int(params.rows);
+  const int N = int(params.out_dim);
+  const int K = int(params.in_dim);
+  const uint n_groups = params.in_dim >> 5u;
+  const uint q8_tgs = (params.out_dim + 31u) >> 5u;
+  const uint out_is_f32 = params.flags & 1u;
+  const bool has_aux = ((params.flags >> 1u) & 1u) != 0u;
+
+  device bfloat *A = const_cast<device bfloat *>(x);
+  dev_b_t tA(A, extents_t(K, M), strides_t{1, K});
+
+  // 12,288 B shared buffer: holds `stage[32 * 136]` bfloat (8,704 B) during K-loop
+  // and `partials[3 * 32 * 32]` float (12,288 B) during KS=4 epilogue reduction!
+  // Plus `stage_s[4][32]` float (512 B) -> 12.5 KB total smem!
+  threadgroup float smem_buf[(KS - 1) * TSM * TSN];
+  threadgroup float stage_s[KS][TSN];
+  threadgroup bfloat *stage = reinterpret_cast<threadgroup bfloat *>(smem_buf);
+
+  if (tgid_x < q8_tgs) {
+    constexpr auto desc_mul = matmul2d_descriptor(
+        TSM,
+        TSN,
+        BK,
+        false,
+        true,
+        true,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<desc_mul, metal::execution_simdgroup> op_mul;
+
+    const int n_off = int(tgid_x) * TSN;
+    const int cols = min(TSN, N - n_off);
+    const ulong row_u4_stride = ulong(n_groups) * 2ul;
+
+    tg_b_t tB(stage + int(sg) * BK, extents_t(BK, TSN), strides_t{1, STAGE_STRIDE});
+    auto a_chunk = [&](int k) { return tA.template slice<BK, TSM>(k, 0); };
+    auto b_chunk = tB.template slice<BK, TSN>(0, 0);
+    using a_chunk_t = decltype(a_chunk(0));
+    using b_chunk_t = decltype(b_chunk);
+
+    auto Dacc = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    auto Dtmp = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+      Dacc[i] = 0.0f;
+    }
+
+    const uint r = tid >> 2u;   // 0..31 (32 output rows)
+    const uint g4 = tid & 3u;   // 0..3  (4 consecutive groups = 128B full cacheline!)
+    const uint row_idx = uint(n_off) + r;
+    const bool valid_row = row_idx < params.out_dim;
+    const device uint4 *w_row = w_u4 + ulong(row_idx) * row_u4_stride;
+    const device half *s_row = scales + ulong(row_idx) * ulong(n_groups);
+    const uint dst_off = r * uint(STAGE_STRIDE) + g4 * 32u;
+
+    const bool full_m = (M == TSM);
+    for (uint g_base = 0u; g_base < n_groups; g_base += 4u) {
+      const uint g_load = g_base + g4;
+      if (valid_row && g_load < n_groups) {
+        const uint4 p0 = w_row[g_load * 2u + 0u];
+        const uint4 p1 = w_row[g_load * 2u + 1u];
+        inkling2_stage_sym_q8_32_bf16(p0, p1, stage + dst_off);
+        stage_s[g4][r] = float(s_row[g_load]);
+      } else {
+        inkling2_stage_zero_32_bf16(stage + dst_off);
+        stage_s[g4][r] = 0.0f;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const uint g_sg = g_base + sg;
+      if (g_sg < n_groups) {
+        const int k = int(g_sg * 32u);
+        if (full_m) {
+          auto a = a_chunk(k);
+          op_mul.run(a, b_chunk, Dtmp);
+        } else {
+          dev_b_t vA(A + k, extents_t(BK, M), strides_t{1, K});
+          op_mul.run(vA, b_chunk, Dtmp);
+        }
+        const threadgroup float *sc_ptr = stage_s[sg];
+        #pragma unroll
+        for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+          const auto idx = Dtmp.get_multidimensional_index(i);
+          Dacc[i] = fma(Dtmp[i], sc_ptr[idx[0]], Dacc[i]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    constexpr int kBlockSize = TSM * TSN; // 1024 floats
+    if (sg > 0u) {
+      tg_f_t tP(smem_buf + (sg - 1u) * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+      Dacc.store(tP);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const bool needs_scalar_epilogue = (out_is_f32 != 0u || params.softcap > 0.0f);
+    if (sg == 0u) {
+      #pragma unroll
+      for (uint g = 0u; g < uint(KS - 1); ++g) {
+        tg_f_t tP(smem_buf + g * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+        auto part = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+        part.load(tP);
+        #pragma unroll
+        for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+          Dacc[i] += part[i];
+        }
+      }
+
+      if (!needs_scalar_epilogue) {
+        auto Dout = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, bfloat>();
+        #pragma unroll
+        for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+          Dout[i] = bfloat(Dacc[i]);
+        }
+        device bfloat *D = reinterpret_cast<device bfloat *>(out_raw) + n_off;
+        dev_b_t tD(D, extents_t(cols, M), strides_t{1, N});
+        if (full_m && cols == TSN) {
+          Dout.store(tD.template slice<TSN, TSM>(0, 0));
+        } else {
+          Dout.store(tD);
+        }
+      } else {
+        // FP32 or softcap epilogue: dump reduced tile to smem for cooperative write.
+        tg_f_t tOut(smem_buf, extents_t(TSN, TSM), strides_t{1, TSN});
+        Dacc.store(tOut);
+      }
+    }
+    if (!needs_scalar_epilogue) {
+      return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float cap = params.softcap;
+    const uint total = uint(M) * uint(cols);
+    for (uint idx = tid; idx < total; idx += 128u) {
+      const uint r_out = idx / uint(cols);
+      const uint c_out = idx - r_out * uint(cols);
+      float v = smem_buf[r_out * uint(TSN) + c_out];
+      if (cap > 0.0f) {
+        v = inkling2_softcap(v, cap);
+      }
+      inkling2_q8_sym_store_scalar(
+          out_raw, ulong(r_out) * ulong(N) + ulong(n_off) + ulong(c_out), v, out_is_f32);
+    }
+    return;
+  }
+
+  // Optional fused exact-BF16 tail projection (`sink_proj` [24, K], `k_conv_proj`/`v_conv_proj` [32, K])
+  // using identical 4-SG NAX `matmul2d(32, 32, 64)` (1 TG covers all 24 or 32 rows!).
+  if (!has_aux) {
+    return;
+  }
+  const int N_aux = int(params.aux_dim);
+  const int n_off = int(tgid_x - q8_tgs) * TSN;
+  if (n_off >= N_aux) {
+    return;
+  }
+  constexpr int BK_AUX = 64;
+  constexpr auto desc_aux = matmul2d_descriptor(
+      TSM,
+      TSN,
+      BK_AUX,
+      false,
+      true,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc_aux, metal::execution_simdgroup> op_aux;
+
+  const int cols = min(TSN, N_aux - n_off);
+  const bool full_mn = (M == TSM && cols == TSN);
+  device bfloat *B = const_cast<device bfloat *>(w_aux) + int64_t(n_off) * K;
+  dev_b_t tB(B, extents_t(K, cols), strides_t{1, K});
+  auto a_chunk = [&](int k) { return tA.template slice<BK_AUX, TSM>(k, 0); };
+  auto b_chunk = [&](int k) { return tB.template slice<BK_AUX, TSN>(k, 0); };
+  using a_chunk_t = decltype(a_chunk(0));
+  using b_chunk_t = decltype(b_chunk(0));
+
+  auto Dacc = op_aux.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+  #pragma unroll
+  for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+    Dacc[i] = 0.0f;
+  }
+  auto Areg = op_aux.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+
+  const int k_iters = ((K + BK_AUX - 1) / BK_AUX + KS - 1) / KS;
+  for (int it = 0; it < k_iters; ++it) {
+    if ((it & 3) == 0) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
+    const int k = (it * KS + int(sg)) * BK_AUX;
+    if (k >= K) {
+      continue;
+    }
+    if (full_mn && k + BK_AUX <= K) {
+      auto a = a_chunk(k);
+      Areg.load(a);
+      auto b = b_chunk(k);
+      op_aux.run(Areg, b, Dacc);
+    } else {
+      const int kk = min(BK_AUX, K - k);
+      dev_b_t vA(A + k, extents_t(kk, M), strides_t{1, K});
+      dev_b_t vB(B + k, extents_t(kk, cols), strides_t{1, K});
+      op_aux.run(vA, vB, Dacc);
+    }
+  }
+
+  constexpr int kBlockSize = TSM * TSN; // 1024 floats
+  if (sg > 0u) {
+    tg_f_t tP(smem_buf + (sg - 1u) * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+    Dacc.store(tP);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0u) {
+    return;
+  }
+  #pragma unroll
+  for (uint g = 0u; g < uint(KS - 1); ++g) {
+    tg_f_t tP(smem_buf + g * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+    auto part = op_aux.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    part.load(tP);
+    #pragma unroll
+    for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+      Dacc[i] += part[i];
+    }
+  }
+  auto Dout = op_aux.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, bfloat>();
+  #pragma unroll
+  for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+    Dout[i] = bfloat(Dacc[i]);
+  }
+  dev_b_t tD(out_aux + n_off, extents_t(cols, M), strides_t{1, N_aux});
+  if (full_mn) {
+    Dout.store(tD.template slice<TSN, TSM>(0, 0));
+  } else {
+    Dout.store(tD);
+  }
+}
+
+// Fused NAX Symmetric Q8_0 `lm_head` + softcap + Stage 1 argmax (ZERO [M, V] DRAM write!).
+// Grid: (num_splits = ceil(out_cols / 64), 1, 1), TG: (128, 1, 1) -> 4 SGs (KS=4), 12.5 KB smem!
+// Processes 2 consecutive 32-row tiles per TG with IDENTICAL `matmul2d(32, 32, 32, mode::multiply)`
+// & `KS=4` reduction as `inkling2_q8_sym_matmul_nax_bf16` -> 0-ULP bit-exact across ALL M=1..=32!
+// Stage 2 reuses `inkling2_lm_head_softcap_argmax_stage2`.
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_lm_head_q8_nax_softcap_argmax_p1(
+    device const bfloat *x [[buffer(0)]],
+    device const uint4 *w_u4 [[buffer(1)]],
+    device const half *scales [[buffer(2)]],
+    device float *partial_vals [[buffer(3)]],
+    device int32_t *partial_idxs [[buffer(4)]],
+    constant Inkling2Q8SymParams &params [[buffer(5)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  using extents_t = metal::dextents<int32_t, 2>;
+  using strides_t = metal::array<int32_t, 2>;
+  using dev_b_t = metal::tensor<device bfloat, extents_t, metal::tensor_inline>;
+  using tg_b_t = metal::tensor<threadgroup bfloat, extents_t, metal::tensor_inline>;
+  using tg_f_t = metal::tensor<threadgroup float, extents_t, metal::tensor_inline>;
+
+  constexpr int TSM = 32;
+  constexpr int TSN = 32;
+  constexpr int BK = 32;
+  constexpr int KS = 4;
+  constexpr int TILES_PER_TG = 2; // 64 vocab rows per TG
+  constexpr int STAGE_STRIDE = 136;
+
+  const uint split = tgid_x;
+  if (split >= params.num_splits) {
+    return;
+  }
+  const int M = int(params.rows);
+  const int V = int(params.out_dim);
+  const int K = int(params.in_dim);
+  const uint n_groups = params.in_dim >> 5u;
+  const int base_n = int(split) * (TSN * TILES_PER_TG);
+  if (base_n >= V || M <= 0) {
+    return;
+  }
+  const ulong row_u4_stride = ulong(n_groups) * 2ul;
+
+  constexpr auto desc_mul = matmul2d_descriptor(
+      TSM,
+      TSN,
+      BK,
+      false,
+      true,
+      true,
+      matmul2d_descriptor::mode::multiply);
+  matmul2d<desc_mul, metal::execution_simdgroup> op_mul;
+
+  device bfloat *A = const_cast<device bfloat *>(x);
+  dev_b_t tA(A, extents_t(K, M), strides_t{1, K});
+
+  threadgroup float smem_buf[(KS - 1) * TSM * TSN];
+  threadgroup float stage_s[KS][TSN];
+  threadgroup bfloat *stage = reinterpret_cast<threadgroup bfloat *>(smem_buf);
+
+  tg_b_t tB(stage + int(sg) * BK, extents_t(BK, TSN), strides_t{1, STAGE_STRIDE});
+  auto a_chunk = [&](int k) { return tA.template slice<BK, TSM>(k, 0); };
+  auto b_chunk = tB.template slice<BK, TSN>(0, 0);
+  using a_chunk_t = decltype(a_chunk(0));
+  using b_chunk_t = decltype(b_chunk);
+
+  const uint r = tid >> 2u;
+  const uint g4 = tid & 3u;
+  const uint dst_off = r * uint(STAGE_STRIDE) + g4 * 32u;
+  const bool full_m = (M == TSM);
+  const float cap = params.softcap;
+
+  float best_v[8];
+  int32_t best_i[8];
+  #pragma unroll
+  for (uint idx = 0u; idx < 8u; ++idx) {
+    best_v[idx] = -INFINITY;
+    best_i[idx] = -1;
+  }
+
+  for (int tile = 0; tile < TILES_PER_TG; ++tile) {
+    const int n_off = base_n + tile * TSN;
+    if (n_off >= V) {
+      break;
+    }
+    const int cols = min(TSN, V - n_off);
+    const uint row_idx = uint(n_off) + r;
+    const bool valid_row = row_idx < params.out_dim;
+    const device uint4 *w_row = w_u4 + ulong(row_idx) * row_u4_stride;
+    const device half *s_row = scales + ulong(row_idx) * ulong(n_groups);
+
+    auto Dacc = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    auto Dtmp = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+      Dacc[i] = 0.0f;
+    }
+
+    for (uint g_base = 0u; g_base < n_groups; g_base += 4u) {
+      const uint g_load = g_base + g4;
+      if (valid_row && g_load < n_groups) {
+        const uint4 p0 = w_row[g_load * 2u + 0u];
+        const uint4 p1 = w_row[g_load * 2u + 1u];
+        inkling2_stage_sym_q8_32_bf16(p0, p1, stage + dst_off);
+        stage_s[g4][r] = float(s_row[g_load]);
+      } else {
+        inkling2_stage_zero_32_bf16(stage + dst_off);
+        stage_s[g4][r] = 0.0f;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const uint g_sg = g_base + sg;
+      if (g_sg < n_groups) {
+        const int k = int(g_sg * 32u);
+        if (full_m) {
+          auto a = a_chunk(k);
+          op_mul.run(a, b_chunk, Dtmp);
+        } else {
+          dev_b_t vA(A + k, extents_t(BK, M), strides_t{1, K});
+          op_mul.run(vA, b_chunk, Dtmp);
+        }
+        const threadgroup float *sc_ptr = stage_s[sg];
+        #pragma unroll
+        for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+          const auto idx = Dtmp.get_multidimensional_index(i);
+          Dacc[i] = fma(Dtmp[i], sc_ptr[idx[0]], Dacc[i]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    constexpr int kBlockSize = TSM * TSN; // 1024 floats
+    if (sg > 0u) {
+      tg_f_t tP(smem_buf + (sg - 1u) * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+      Dacc.store(tP);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0u) {
+      #pragma unroll
+      for (uint g = 0u; g < uint(KS - 1); ++g) {
+        tg_f_t tP(smem_buf + g * kBlockSize, extents_t(TSN, TSM), strides_t{1, TSN});
+        auto part = op_mul.template get_destination_cooperative_tensor<a_chunk_t, b_chunk_t, float>();
+        part.load(tP);
+        #pragma unroll
+        for (uint16_t i = 0; i < Dacc.get_capacity(); ++i) {
+          Dacc[i] += part[i];
+        }
+      }
+      tg_f_t tOut(smem_buf, extents_t(TSN, TSM), strides_t{1, TSN});
+      Dacc.store(tOut);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // All 4 SGs cooperatively softcap + reduce all 32 vocab cols (100% warp utilization!).
+    for (uint idx = 0u, r_m = sg; r_m < uint(M); r_m += 4u, ++idx) {
+      float tv = -INFINITY;
+      int32_t ti = -1;
+      if (lane < uint(cols)) {
+        float val = smem_buf[r_m * uint(TSN) + lane];
+        if (cap > 0.0f) {
+          val = inkling2_softcap(val, cap);
+        }
+        tv = val;
+        ti = int32_t(n_off + int(lane));
+      }
+      #pragma unroll
+      for (ushort off = 16; off >= 1; off >>= 1) {
+        const float ov = simd_shuffle_down(tv, off);
+        const int32_t oi = simd_shuffle_down(ti, off);
+        if (oi >= 0 && (ti < 0 || ov > tv || (ov == tv && oi < ti))) {
+          tv = ov;
+          ti = oi;
+        }
+      }
+      if (lane == 0u && ti >= 0) {
+        if (best_i[idx] < 0 || tv > best_v[idx] || (tv == best_v[idx] && ti < best_i[idx])) {
+          best_v[idx] = tv;
+          best_i[idx] = ti;
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lane == 0u) {
+    for (uint idx = 0u, r_m = sg; r_m < uint(M); r_m += 4u, ++idx) {
+      const ulong out_slot = ulong(r_m) * ulong(params.num_splits) + ulong(split);
+      partial_vals[out_slot] = best_v[idx];
+      partial_idxs[out_slot] = best_i[idx];
     }
   }
 }

@@ -2848,6 +2848,7 @@ std::vector<std::string> inkling2_kernel_names() {
       "inkling2_qr_clip_f32",
       "inkling2_sconv_k4_kv_prep_bf16",
       "inkling2_sconv_k4_kv_prep_f32",
+      "inkling2_sconv_k4_kv_prep_paged_bf16",
       "inkling2_block_attn_res_bf16",
       "inkling2_block_attn_res_f32",
       "inkling2_pair_rms_norm_f32",
@@ -2871,6 +2872,11 @@ std::vector<std::string> inkling2_kernel_names() {
       "inkling2_bf16_linear_m1",
       "inkling2_bf16_linear_batched",
       "inkling2_bf16_lm_head_softcap_argmax_p1",
+      "inkling2_lm_head_q8_softcap_argmax_stage1",
+      "inkling2_lm_head_q8_bf16",
+      "inkling2_q8_sym_matmul_bf16",
+      "inkling2_q8_sym_matmul_nax_bf16",
+      "inkling2_lm_head_q8_nax_softcap_argmax_p1",
       "inkling2_moe_m1_gate_up_situ_nvfp4",
       "inkling2_moe_m1_gate_up_situ_q8",
       "inkling2_moe_m1_gate_up_situ_mxfp8",
@@ -2933,7 +2939,7 @@ void dispatch_inkling2_paged_attention_auto(
     mlx::core::metal::Device& device,
     mlx::core::Stream stream,
     mlx::core::array& out,
-    mlx::core::array& lse_out,
+    mlx::core::array* lse_out,
     const mlx::core::array& q,
     const mlx::core::array& k_pool,
     const mlx::core::array& v_pool,
@@ -2943,6 +2949,10 @@ void dispatch_inkling2_paged_attention_auto(
     const mlx::core::array& k_scale,
     const mlx::core::array& v_scale,
     const mlx::core::array* rel_bias,
+    const mlx::core::array* rel_bias_w,
+    const mlx::core::array* gate,
+    const mlx::core::array* sink,
+    const Inkling2AttnExtraParams& extra,
     int num_seqs,
     int total_queries,
     int num_q_heads,
@@ -2973,12 +2983,15 @@ void dispatch_inkling2_paged_attention_auto(
                                 int64_t q_byte_off,
                                 int64_t bias_byte_off,
                                 int64_t score_scales_byte_off,
+                                int64_t gate_byte_off,
+                                int64_t sink_byte_off,
                                 const mlx::core::array& seq_lens_arr,
                                 int64_t seq_lens_off,
                                 const mlx::core::array& cu_arr,
                                 int64_t cu_off,
                                 mlx::core::array* lse_opt,
-                                int64_t lse_byte_off) {
+                                int64_t lse_byte_off,
+                                const Inkling2AttnExtraParams& stage1_extra) {
     encoder.set_input_array(q, 3, q_byte_off);
     if (is_ktm) {
       bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
@@ -3012,6 +3025,19 @@ void dispatch_inkling2_paged_attention_auto(
       } else {
         encoder.set_bytes(dummy_zero, 24);
       }
+      if (stage1_extra.has_gate_sink != 0u && gate != nullptr && sink != nullptr) {
+        encoder.set_input_array(*gate, 25, gate_byte_off);
+        encoder.set_input_array(*sink, 26, sink_byte_off);
+      } else {
+        encoder.set_bytes(dummy_zero, 25);
+        encoder.set_bytes(dummy_zero, 26);
+      }
+      if (stage1_extra.rel_mode == 2u && rel_bias_w != nullptr) {
+        encoder.set_input_array(*rel_bias_w, 27);
+      } else {
+        encoder.set_bytes(dummy_zero, 27);
+      }
+      encoder.set_bytes(stage1_extra, 28);
     } else {
       bind_pool_plane(encoder, k_pool, 4, live_blocks);
       bind_pool_plane(encoder, v_pool, 5, live_blocks);
@@ -3038,6 +3064,19 @@ void dispatch_inkling2_paged_attention_auto(
       } else {
         encoder.set_bytes(dummy_zero, 20);
       }
+      if (stage1_extra.has_gate_sink != 0u && gate != nullptr && sink != nullptr) {
+        encoder.set_input_array(*gate, 21, gate_byte_off);
+        encoder.set_input_array(*sink, 22, sink_byte_off);
+      } else {
+        encoder.set_bytes(dummy_zero, 21);
+        encoder.set_bytes(dummy_zero, 22);
+      }
+      if (stage1_extra.rel_mode == 2u && rel_bias_w != nullptr) {
+        encoder.set_input_array(*rel_bias_w, 23);
+      } else {
+        encoder.set_bytes(dummy_zero, 23);
+      }
+      encoder.set_bytes(stage1_extra, 24);
     }
   };
 
@@ -3052,7 +3091,7 @@ void dispatch_inkling2_paged_attention_auto(
     encoder.set_bytes(dummy_zero, 1);
     encoder.set_output_array(out, 2);
     bind_common_stage1(
-        is_ktm, 0, 0, 0, seq_lens, 0, cu_seqlens_q, 0, &lse_out, 0);
+        is_ktm, 0, 0, 0, 0, 0, seq_lens, 0, cu_seqlens_q, 0, lse_out, 0, extra);
 
     const size_t aligned_logits =
         (static_cast<size_t>(max_context_len) + 31) / 32 * 32;
@@ -3145,6 +3184,10 @@ void dispatch_inkling2_paged_attention_auto(
   MTL::ComputePipelineState* reduce_pipe =
       load_pipeline(device, inkling2_decode_reduce_kernel_name());
 
+  Inkling2AttnExtraParams stage1_extra = extra;
+  stage1_extra.has_gate_sink = 0u;
+  stage1_extra.write_lse = 0u;
+
   for (int t = 0; t < num_tiles; ++t) {
     const int first = t * tile_rows;
     const int rows = std::min(tile_rows, total_queries - first);
@@ -3154,12 +3197,21 @@ void dispatch_inkling2_paged_attention_auto(
         static_cast<int64_t>(first) * q_stride * out.itemsize();
     const int64_t lse_offset =
         static_cast<int64_t>(first) * num_q_heads * static_cast<int64_t>(sizeof(float));
+    const int64_t rel_cols = extra.rel_mode == 2u ? 16 : rel_extent;
     const int64_t bias_offset = (rel_bias != nullptr && rel_extent > 0)
-        ? static_cast<int64_t>(first) * num_q_heads * rel_extent *
+        ? static_cast<int64_t>(first) * num_q_heads * rel_cols *
               static_cast<int64_t>(rel_bias->itemsize())
         : 0;
     const int64_t ss_offset =
         static_cast<int64_t>(first) * num_q_heads * static_cast<int64_t>(sizeof(float));
+    const int64_t gate_offset = (extra.has_gate_sink != 0u && gate != nullptr)
+        ? static_cast<int64_t>(first) * static_cast<int64_t>(extra.gate_row_stride) *
+              static_cast<int64_t>(gate->itemsize())
+        : 0;
+    const int64_t sink_offset = (extra.has_gate_sink != 0u && sink != nullptr)
+        ? static_cast<int64_t>(first) * static_cast<int64_t>(extra.sink_row_stride) *
+              static_cast<int64_t>(sink->itemsize())
+        : 0;
     const mlx::core::array& seq_arr = tiled ? tile_meta : seq_lens;
     const int64_t seq_off = tiled ? int64_t{12} * t : 0;
     const mlx::core::array& cu_arr = tiled ? tile_meta : cu_seqlens_q;
@@ -3175,8 +3227,8 @@ void dispatch_inkling2_paged_attention_auto(
     encoder.set_output_array(max_logits, 1);
     encoder.set_output_array(tmp_out, 2);
     bind_common_stage1(
-        is_ktm, q_offset, bias_offset, ss_offset, seq_arr, seq_off, cu_arr,
-        cu_off, nullptr, 0);
+        is_ktm, q_offset, bias_offset, ss_offset, 0, 0, seq_arr, seq_off, cu_arr,
+        cu_off, nullptr, 0, stage1_extra);
     encoder.set_threadgroup_memory_length(stage1_tg_mem, 0);
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
@@ -3187,10 +3239,14 @@ void dispatch_inkling2_paged_attention_auto(
 
     encoder.barrier();
 
-    // Stage 2: shared FP32 reducer -> BF16 out + F32 lse
+    // Stage 2: shared FP32 reducer -> BF16 out (+ optional fused gate/sink) + optional F32 lse
     encoder.set_compute_pipeline_state(reduce_pipe);
     encoder.set_output_array(out, 0, out_offset);
-    encoder.set_output_array(lse_out, 1, lse_offset);
+    if (lse_out != nullptr && extra.write_lse != 0u) {
+      encoder.set_output_array(*lse_out, 1, lse_offset);
+    } else {
+      encoder.set_bytes(dummy_zero, 1);
+    }
     encoder.set_input_array(exp_sums, 2);
     encoder.set_input_array(max_logits, 3);
     encoder.set_input_array(tmp_out, 4);
@@ -3198,6 +3254,14 @@ void dispatch_inkling2_paged_attention_auto(
     encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 6);
     encoder.set_input_array(cu_arr, 7, cu_off);
     encoder.set_bytes<int32_t>(num_seqs, 8);
+    if (extra.has_gate_sink != 0u && gate != nullptr && sink != nullptr) {
+      encoder.set_input_array(*gate, 9, gate_offset);
+      encoder.set_input_array(*sink, 10, sink_offset);
+    } else {
+      encoder.set_bytes(dummy_zero, 9);
+      encoder.set_bytes(dummy_zero, 10);
+    }
+    encoder.set_bytes(extra, 11);
     encoder.set_threadgroup_memory_length(reduce_tg_mem, 0);
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
@@ -3218,7 +3282,7 @@ void dispatch_inkling2_paged_prefill_attention(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
     mlx::core::array& out,
-    mlx::core::array& lse_out,
+    mlx::core::array* lse_out,
     mlx::core::array& workspace,
     const mlx::core::array& q_staged,
     const mlx::core::array& k_pool,
@@ -3227,6 +3291,9 @@ void dispatch_inkling2_paged_prefill_attention(
     const mlx::core::array& v_scale,
     const mlx::core::array& block_table,
     const mlx::core::array* rel_bias,
+    const mlx::core::array* rel_bias_w,
+    const mlx::core::array* gate,
+    const mlx::core::array* sink,
     const Inkling2PagedPrefillParams& params,
     int num_q_heads,
     int head_size,
@@ -3258,6 +3325,11 @@ void dispatch_inkling2_paged_prefill_attention(
         encoder.set_bytes(dummy_zero, 8);
       }
       encoder.set_bytes(params, 9);
+      if (params.rel_mode == 2u && rel_bias_w != nullptr) {
+        encoder.set_input_array(*rel_bias_w, 10);
+      } else {
+        encoder.set_bytes(dummy_zero, 10);
+      }
     } else {
       bind_pool_plane(encoder, k_pool, 4, live_blocks);
       bind_pool_plane(encoder, v_pool, 5, live_blocks);
@@ -3267,6 +3339,11 @@ void dispatch_inkling2_paged_prefill_attention(
         encoder.set_bytes(dummy_zero, 6);
       }
       encoder.set_bytes(params, 7);
+      if (params.rel_mode == 2u && rel_bias_w != nullptr) {
+        encoder.set_input_array(*rel_bias_w, 8);
+      } else {
+        encoder.set_bytes(dummy_zero, 8);
+      }
     }
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
@@ -3278,7 +3355,7 @@ void dispatch_inkling2_paged_prefill_attention(
 
   encoder.barrier();
 
-  // Stage 2: reduce -> BF16 out + F32 lse
+  // Stage 2: reduce -> BF16 out (+ optional fused gate+sink) + optional F32 lse
   {
     auto* pipeline =
         paged_prefill_pipeline(device, inkling2_prefill_reduce_name());
@@ -3286,8 +3363,19 @@ void dispatch_inkling2_paged_prefill_attention(
     encoder.set_input_array(workspace, 0);
     encoder.set_input_array(workspace, 1, partial_floats * 4);
     encoder.set_output_array(out, 2);
-    encoder.set_output_array(lse_out, 3);
+    if (lse_out != nullptr && params.write_lse != 0u) {
+      encoder.set_output_array(*lse_out, 3);
+    } else {
+      encoder.set_bytes(dummy_zero, 3);
+    }
     encoder.set_bytes(params, 4);
+    if (params.has_gate_sink != 0u && gate != nullptr && sink != nullptr) {
+      encoder.set_input_array(*gate, 5);
+      encoder.set_input_array(*sink, 6);
+    } else {
+      encoder.set_bytes(dummy_zero, 5);
+      encoder.set_bytes(dummy_zero, 6);
+    }
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
             static_cast<size_t>(kv_heads),

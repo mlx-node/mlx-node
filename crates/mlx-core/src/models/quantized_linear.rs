@@ -560,15 +560,21 @@ impl LinearProj {
         self.forward(x)
     }
 
-    /// Hoist Float16 affine sidecars (`scales`/`biases`/`bias`) to Float32 once at load.
-    pub(crate) fn promote_affine_sidecars_to_f32(
+    /// Compact exact symmetric GGUF Q8_0 (`bits=8, group_size=32`, native Float16 `scales`,
+    /// `biases == -128 * scales`) by dropping `biases` completely and keeping native Float16
+    /// `scales` (4x smaller sidecar DRAM & resident RAM!). Falls back to
+    /// [`QuantizedLinear::promote_affine_sidecars_to_f32`] for any non-symmetric affine projection.
+    pub(crate) fn try_compact_symmetric_q8_or_promote_f32(
         &mut self,
         compute_dtype: crate::array::DType,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if let Self::Quantized(q) = self {
+            if q.try_compact_symmetric_q8_f16()? {
+                return Ok(true);
+            }
             q.promote_affine_sidecars_to_f32(compute_dtype)?;
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
@@ -1906,6 +1912,9 @@ pub struct QuantizedLinear {
     // Splash weight planes of the same rows (`attach_planes`). Every change of
     // the packed arrays drops them: stale planes would compute another layer.
     planes: Option<Box<AttachedPlanes>>,
+    // Exact symmetric Q8_0 (`mode == "affine", bits == 8, group_size == 32`, native Float16
+    // `scales`, `biases` dropped because `biases == -128 * scales` was verified bit-exact at load).
+    symmetric_q8: bool,
 }
 
 /// One projection's planes and the planned tensor they were written for.
@@ -2047,7 +2056,61 @@ impl QuantizedLinear {
             source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
+            symmetric_q8: false,
         }
+    }
+
+    /// Whether this projection holds compacted symmetric Q8_0 weights (`bits=8, group_size=32`,
+    /// native Float16 `scales`, `biases: None`, `w = scales * (q_u8 - 128)`).
+    pub fn is_symmetric_q8(&self) -> bool {
+        self.symmetric_q8
+    }
+
+    /// Verify exact symmetric Q8_0 (`mode == "affine"`, `bits == 8`, `group_size == 32`,
+    /// `bias.is_none()`, Float16 `scales` & `biases` with `max(|biases + 128 * scales|) == 0`).
+    /// When verified, drops `biases` completely (saving 75% sidecar DRAM/RAM vs F32 promotion)
+    /// and keeps native Float16 `scales`.
+    pub fn try_compact_symmetric_q8_f16(&mut self) -> Result<bool> {
+        if self.symmetric_q8 {
+            return Ok(true);
+        }
+        if self.mode != DEFAULT_QUANT_MODE
+            || self.bits != 8
+            || self.group_size != 32
+            || self.bias.is_some()
+            || self.output_layout != QuantizedOutputLayout::Native
+            || self.hadamard.is_some()
+            || self.fp8_dequant_weight.is_some()
+            || self.s_w.is_some()
+            || self.source_head
+            || self.scales.dtype()? != crate::array::DType::Float16
+            || self.weight.dtype()? != crate::array::DType::Uint32
+        {
+            return Ok(false);
+        }
+        let Some(ref biases) = self.biases else {
+            return Ok(false);
+        };
+        if biases.dtype()? != crate::array::DType::Float16 {
+            return Ok(false);
+        }
+        let expected_neg = self
+            .scales
+            .astype(crate::array::DType::Float32)?
+            .mul_scalar(128.0)?;
+        let diff = biases
+            .astype(crate::array::DType::Float32)?
+            .add(&expected_neg)?
+            .abs()?
+            .max(None, None)?;
+        let max_err = diff.item_at_float32(0)?;
+        if max_err != 0.0 {
+            return Ok(false);
+        }
+        self.planes = None;
+        self.biases = None;
+        self.symmetric_q8 = true;
+        Ok(true)
     }
 
     /// Repack a K-quant projection's `.weight`/`.scales`/`.biases` into the
@@ -2310,6 +2373,7 @@ impl QuantizedLinear {
     pub fn concat_rows(&self, other: &QuantizedLinear) -> Result<Option<QuantizedLinear>> {
         if self.source_head
             || other.source_head
+            || self.symmetric_q8 != other.symmetric_q8
             || self.mode != other.mode
             || self.bits != other.bits
             || self.group_size != other.group_size
@@ -2396,6 +2460,7 @@ impl QuantizedLinear {
             source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
+            symmetric_q8: self.symmetric_q8,
         }))
     }
 
@@ -2467,6 +2532,7 @@ impl QuantizedLinear {
             source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
+            symmetric_q8: self.symmetric_q8,
         })
     }
 
@@ -2496,6 +2562,7 @@ impl QuantizedLinear {
             source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
+            symmetric_q8: false,
         }
     }
 
@@ -2624,6 +2691,7 @@ impl QuantizedLinear {
             source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
+            symmetric_q8: false,
         }
     }
 
@@ -3358,9 +3426,19 @@ impl QuantizedLinear {
             }
         };
 
+        let syn_biases = if self.biases.is_none() && self.symmetric_q8 {
+            Some(
+                self.scales
+                    .mul_scalar(-128.0)?
+                    .astype(self.scales.dtype()?)?,
+            )
+        } else {
+            None
+        };
         let biases_ptr = self
             .biases
             .as_ref()
+            .or(syn_biases.as_ref())
             .map_or(std::ptr::null_mut(), |b| b.handle.0);
 
         let handle = unsafe {
@@ -3753,8 +3831,13 @@ impl QuantizedLinear {
         // after the untile, not under its kernel contract name.
         let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
         let mut weight = self.weight.clone();
-        let mut scales = self.scales.clone();
-        let mut biases = self.biases.clone();
+        let (mut scales, mut biases) = if self.biases.is_none() && self.symmetric_q8 {
+            let s_f32 = self.scales.astype(crate::array::DType::Float32)?;
+            let b_f32 = s_f32.mul_scalar(-128.0)?;
+            (s_f32, Some(b_f32))
+        } else {
+            (self.scales.clone(), self.biases.clone())
+        };
         let mut dequant_mode = base_mode.to_string();
         if tiled {
             use crate::models::quant_dispatch as qd;
@@ -4012,6 +4095,9 @@ pub struct QuantizedSwitchLinear {
     mode: String,
     // Pre-transposed BF16 `[E,K,N]` reconstruction for fp8_e4m3 fallback.
     fp8_dequant_weight_t: Option<MxArray>,
+    // Exact symmetric Q8_0 (`mode == "affine", bits == 8, group_size == 32`, native Float16
+    // `scales`, `biases == None`, `w = scales * (q_u8 - 128)`).
+    symmetric_q8: bool,
 }
 
 impl QuantizedSwitchLinear {
@@ -4086,6 +4172,7 @@ impl QuantizedSwitchLinear {
             bits,
             mode,
             fp8_dequant_weight_t: None,
+            symmetric_q8: false,
         }
     }
 
@@ -4099,7 +4186,56 @@ impl QuantizedSwitchLinear {
             bits: FP8_E4M3_BITS,
             mode: FP8_E4M3_MODE.to_string(),
             fp8_dequant_weight_t: Some(dequant_weight_t),
+            symmetric_q8: false,
         }
+    }
+
+    /// Whether this expert projection holds compacted symmetric Q8_0 weights
+    /// (`bits=8, group_size=32`, native Float16 `scales`, `biases: None`, `w = scales * (q_u8 - 128)`).
+    pub fn is_symmetric_q8(&self) -> bool {
+        self.symmetric_q8
+    }
+
+    /// Verify exact symmetric Q8_0 (`mode == "affine"`, `bits == 8`, `group_size == 32`,
+    /// Float16 `scales` & `biases` with `max(|biases + 128 * scales|) == 0`).
+    /// When verified, drops `biases` completely (saving ~255 MiB on Inkling-2-Mini L20..23
+    /// and halving sidecar DRAM bandwidth) and keeps native Float16 `scales`.
+    pub fn try_compact_symmetric_q8_f16(&mut self) -> Result<bool> {
+        if self.symmetric_q8 {
+            return Ok(true);
+        }
+        if self.mode != DEFAULT_QUANT_MODE
+            || self.bits != 8
+            || self.group_size != 32
+            || self.outer_scale.is_some()
+            || self.fp8_dequant_weight_t.is_some()
+            || self.scales.dtype()? != crate::array::DType::Float16
+            || self.weight.dtype()? != crate::array::DType::Uint32
+        {
+            return Ok(false);
+        }
+        let Some(ref biases) = self.biases else {
+            return Ok(false);
+        };
+        if biases.dtype()? != crate::array::DType::Float16 {
+            return Ok(false);
+        }
+        let expected_neg = self
+            .scales
+            .astype(crate::array::DType::Float32)?
+            .mul_scalar(128.0)?;
+        let diff = biases
+            .astype(crate::array::DType::Float32)?
+            .add(&expected_neg)?
+            .abs()?
+            .max(None, None)?;
+        let max_err = diff.item_at_float32(0)?;
+        if max_err != 0.0 {
+            return Ok(false);
+        }
+        self.biases = None;
+        self.symmetric_q8 = true;
+        Ok(true)
     }
 
     /// Attach a per-expert F32 outer scale `[num_experts]` multiplied into the
@@ -4226,16 +4362,40 @@ impl QuantizedSwitchLinear {
             }
         };
 
-        let biases_ptr = self
-            .biases
-            .as_ref()
-            .map_or(std::ptr::null_mut(), |b| b.handle.0);
+        let (scales_syn, biases_syn);
+        let (scales_ptr, biases_ptr) = if self.biases.is_none() && self.symmetric_q8 {
+            // Reconstruct BF16 scales + biases lazily for fallback `gather_qmm` (e.g. T > 32 prefill)
+            // so MLX hits native BF16 `gather_qmm_t_nax` with zero F16->F32 mixed promotion.
+            let target_dt = match activation_dtype {
+                Some(dt)
+                    if dt == crate::array::DType::Float16
+                        || dt == crate::array::DType::BFloat16 =>
+                {
+                    dt
+                }
+                _ => crate::array::DType::Float32,
+            };
+            scales_syn = if self.scales.dtype()? == target_dt {
+                self.scales.clone()
+            } else {
+                self.scales.astype(target_dt)?
+            };
+            biases_syn = scales_syn.mul_scalar(-128.0)?;
+            (scales_syn.handle.0, biases_syn.handle.0)
+        } else {
+            (
+                self.scales.handle.0,
+                self.biases
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), |b| b.handle.0),
+            )
+        };
 
         let handle = unsafe {
             sys::mlx_gather_qmm(
                 x.handle.0,
                 self.weight.handle.0,
-                self.scales.handle.0,
+                scales_ptr,
                 biases_ptr,
                 std::ptr::null_mut(),
                 indices.handle.0,
@@ -4339,6 +4499,7 @@ impl Clone for QuantizedSwitchLinear {
             bits: self.bits,
             mode: self.mode.clone(),
             fp8_dequant_weight_t: self.fp8_dequant_weight_t.clone(),
+            symmetric_q8: self.symmetric_q8,
         }
     }
 }

@@ -1270,7 +1270,8 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_prefill_mpp_builds() -> bool;
 
     /// Inkling-2-Mini relative-bias + natural-log LSE varlen paged attention
-    /// (INT8 32-token KTM and BF16 vLLM pools, head_size=128).
+    /// (INT8 32-token KTM and BF16 vLLM pools, head_size=128), with optional
+    /// on-the-fly `rel_bias_w [rel_extent, 16]` and optional fused `gate`/`sink`.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_paged_attention_forward(
         q: *mut mlx_array,
@@ -1282,6 +1283,9 @@ unsafe extern "C-unwind" {
         k_scale: *mut mlx_array,
         v_scale: *mut mlx_array,
         rel_bias: *mut mlx_array,
+        rel_bias_w: *mut mlx_array,
+        gate: *mut mlx_array,
+        sink: *mut mlx_array,
         scale: f32,
         sliding_window: i32,
         rel_extent: i32,
@@ -1296,7 +1300,8 @@ unsafe extern "C-unwind" {
     ) -> bool;
 
     /// Inkling-2-Mini in-place MPP paged prefill / verify (G=3, D=128, INT8
-    /// 32-token KTM q8/q8q + BF16 vLLM, with portable non-MPP fallback).
+    /// 32-token KTM q8/q8q + BF16 vLLM, with portable non-MPP fallback),
+    /// optional on-the-fly `rel_bias_w [rel_extent, 16]` and optional fused `gate`/`sink`.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_paged_prefill_attention_forward(
         q: *mut mlx_array,
@@ -1307,6 +1312,9 @@ unsafe extern "C-unwind" {
         block_table: *mut mlx_array,
         workspace: *mut mlx_array,
         rel_bias: *mut mlx_array,
+        rel_bias_w: *mut mlx_array,
+        gate: *mut mlx_array,
+        sink: *mut mlx_array,
         committed_tokens: i32,
         splits: i32,
         max_splits: i32,
@@ -1407,6 +1415,41 @@ unsafe extern "C-unwind" {
         l2_eps: f32,
         out_k: *mut *mut mlx_array,
         out_v: *mut *mut mlx_array,
+        out_k_hist: *mut *mut mlx_array,
+        out_v_hist: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip +
+    /// V RMSNorm + in-place PagedKVWrite (INT8-KTM & BF16), zero intermediate KV DRAM!
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_sconv_k4_kv_prep_paged(
+        k_in: *mut mlx_array,
+        v_in: *mut mlx_array,
+        k_weight: *mut mlx_array,
+        v_weight: *mut mlx_array,
+        dyn_k: *mut mlx_array,
+        dyn_v: *mut mlx_array,
+        cu_seqlens: *mut mlx_array,
+        k_hists: *const *mut mlx_array,
+        v_hists: *const *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        num_seqs: u32,
+        packed_hist: bool,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        kv_mode: u32,
+        qk_thresh: f32,
+        v_eps: f32,
+        l2_eps: f32,
+        out_k_pool: *mut *mut mlx_array,
+        out_v_pool: *mut *mut mlx_array,
+        out_k_scale: *mut *mut mlx_array,
+        out_v_scale: *mut *mut mlx_array,
         out_k_hist: *mut *mut mlx_array,
         out_v_hist: *mut *mut mlx_array,
     ) -> bool;
@@ -1558,6 +1601,44 @@ unsafe extern "C-unwind" {
         softcap: f32,
     ) -> *mut mlx_array;
 
+    /// Fused single-pass Symmetric Q8_0 (F16 scales, zero biases) `lm_head` + softcap + 2-stage GPU argmax -> `[M]` Int32 (`1 <= M <= 32`, `K % 32 == 0`).
+    pub fn mlx_inkling2_lm_head_q8_softcap_argmax(
+        x: *mut mlx_array,
+        w_q8: *mut mlx_array,
+        scales_f16: *mut mlx_array,
+        out_cols: u32,
+        softcap: f32,
+    ) -> *mut mlx_array;
+
+    /// Single-pass Symmetric Q8_0 (F16 scales, zero biases) `lm_head` -> `[M, out_cols]` BF16 (or FP32+softcap when `output_f32`).
+    pub fn mlx_inkling2_lm_head_q8_bf16(
+        x: *mut mlx_array,
+        w_q8: *mut mlx_array,
+        scales_f16: *mut mlx_array,
+        out_cols: u32,
+        softcap: f32,
+        output_f32: bool,
+    ) -> *mut mlx_array;
+
+    /// Single-pass Symmetric Q8_0 (F16 scales, zero biases) dense linear (`1 <= M <= 32`, `K % 32 == 0`) -> `[M, N]` BF16/F32.
+    pub fn mlx_inkling2_q8_sym_matmul_bf16(
+        x: *mut mlx_array,
+        w_q8: *mut mlx_array,
+        scales_f16: *mut mlx_array,
+        output_f32: bool,
+    ) -> *mut mlx_array;
+
+    /// Single-pass Symmetric Q8_0 dense linear + fused exact-BF16 tail projection (`w_aux [N_aux, K]`) -> `(out [M, N], out_aux [M, N_aux])`.
+    pub fn mlx_inkling2_q8_sym_matmul_bf16_with_aux(
+        x: *mut mlx_array,
+        w_q8: *mut mlx_array,
+        scales_f16: *mut mlx_array,
+        w_aux_bf16: *mut mlx_array,
+        output_f32: bool,
+        out_main: *mut *mut mlx_array,
+        out_aux: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Check whether Inkling2 grouped/fused NVFP4/Q8_0 MoE Metal kernels are available for `rows`.
     pub fn mlx_inkling2_grouped_moe_available(rows: u32) -> bool;
 
@@ -1610,6 +1691,7 @@ unsafe extern "C-unwind" {
         up_softcap: f32,
         round_bf16_before_situ: bool,
         emit_tape: bool,
+        router_input_is_weight: bool,
         out_y: *mut *mut mlx_array,
         out_history: *mut *mut mlx_array,
         out_tape: *mut *mut mlx_array,

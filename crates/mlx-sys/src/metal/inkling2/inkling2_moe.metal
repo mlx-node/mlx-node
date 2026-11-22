@@ -10,11 +10,60 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// Exact FP4 E2M1 lookup table (matches mlx/backend/metal/kernels/fp4.h bit-for-bit).
-constant float INKLING2_FP4_LUT[16] = {
-     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
-};
+// Exact 0-ULP branchless FP4 E2M1 decode WITHOUT the 16384.0h factor (2^14 hoisted ONCE
+// per 16-elem group into FP32 `scale * 16384.0f` -> 0-ULP bit-identical while eliminating
+// 4 vector half4 multiplies per 16 weights!).
+// Matches mlx/backend/metal/kernels/fp4.h bit-for-bit for ALL 16 nibble values 0..15:
+//   nib=0..7  -> (+0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0) * 2^-14
+//   nib=8..15 -> (-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0) * 2^-14
+inline half4 decode_nvfp4_4_half_unscaled(uint packed16) {
+  const ushort4 sh = ushort4(
+      ushort(packed16),
+      ushort(packed16 >> 4u),
+      ushort(packed16 >> 8u),
+      ushort(packed16 >> 12u));
+  const ushort4 bits = ((sh & ushort4(7u)) << 9u) | ((sh & ushort4(8u)) << 12u);
+  return as_type<half4>(bits);
+}
+
+inline void decode_nvfp4_16_half_unscaled(uint2 packed, thread half4 (&w)[4]) {
+  w[0] = decode_nvfp4_4_half_unscaled(packed.x);
+  w[1] = decode_nvfp4_4_half_unscaled(packed.x >> 16u);
+  w[2] = decode_nvfp4_4_half_unscaled(packed.y);
+  w[3] = decode_nvfp4_4_half_unscaled(packed.y >> 16u);
+}
+
+inline float inkling2_decode_fp8_e4m3_x16384(uint8_t bits) {
+  const uint16_t v = bits & 127u;
+  const uint16_t sign_bit = uint16_t((bits >> 7u) & 1u) << 15u;
+  const uint16_t u = (v << 7u) | (((v + 1u) >> 7u) << 14u) | sign_bit;
+  return float(as_type<half>(u) * 256.0h) * 16384.0f;
+}
+
+inline float dot_4x4_half(const thread half4 (&w)[4], const thread float4 (&x)[4]) {
+  return (dot(float4(w[0]), x[0]) + dot(float4(w[1]), x[1])) +
+         (dot(float4(w[2]), x[2]) + dot(float4(w[3]), x[3]));
+}
+
+// Load 32 BF16 activations into two float4[4] packs using 4 parallel 128-bit uint4 loads.
+inline void load_bf16_32(
+    device const bfloat *src,
+    thread float4 (&x0)[4],
+    thread float4 (&x1)[4]) {
+  const device uint4 *p = reinterpret_cast<device const uint4 *>(src);
+  const uint4 a = p[0];
+  const uint4 b = p[1];
+  const uint4 c = p[2];
+  const uint4 d = p[3];
+  x0[0] = float4(as_type<bfloat4>(a.xy));
+  x0[1] = float4(as_type<bfloat4>(a.zw));
+  x0[2] = float4(as_type<bfloat4>(b.xy));
+  x0[3] = float4(as_type<bfloat4>(b.zw));
+  x1[0] = float4(as_type<bfloat4>(c.xy));
+  x1[1] = float4(as_type<bfloat4>(c.zw));
+  x1[2] = float4(as_type<bfloat4>(d.xy));
+  x1[3] = float4(as_type<bfloat4>(d.zw));
+}
 
 // Exact FP8 E4M3FN decode (matches mlx/backend/metal/kernels/fp8.h bit-for-bit).
 inline float inkling2_decode_fp8_e4m3(uint8_t bits) {
@@ -47,16 +96,18 @@ inline void decode_mxfp8_32_half_unscaled(const device uint4 *w_u4, thread half4
   w[7] = decode_fp8_e4m3_4_half_unscaled(p1.w);
 }
 
-inline float dot_mxfp8_32_regs(const thread half4 (&w)[8], const thread float4 (&x)[8]) {
-  float acc = 0.0f;
-  acc += dot(float4(w[0]), x[0]);
-  acc += dot(float4(w[1]), x[1]);
-  acc += dot(float4(w[2]), x[2]);
-  acc += dot(float4(w[3]), x[3]);
-  acc += dot(float4(w[4]), x[4]);
-  acc += dot(float4(w[5]), x[5]);
-  acc += dot(float4(w[6]), x[6]);
-  acc += dot(float4(w[7]), x[7]);
+inline float dot_mxfp8_32_regs(
+    const thread half4 (&w)[8],
+    const thread float4 (&x0)[4],
+    const thread float4 (&x1)[4]) {
+  float acc = dot(float4(w[0]), x0[0]);
+  acc += dot(float4(w[1]), x0[1]);
+  acc += dot(float4(w[2]), x0[2]);
+  acc += dot(float4(w[3]), x0[3]);
+  acc += dot(float4(w[4]), x1[0]);
+  acc += dot(float4(w[5]), x1[1]);
+  acc += dot(float4(w[6]), x1[2]);
+  acc += dot(float4(w[7]), x1[3]);
   return acc * 256.0f;
 }
 
@@ -66,18 +117,15 @@ inline float inkling2_decode_fp8_e8m0(uint8_t bits) {
   return as_type<float>(u);
 }
 
-// Dot 32 FP8 E4M3FN weights (32 bytes = 2 x uint4) against 8 float4 activations in FP32.
-inline float dot_mxfp8_32(const device uint4 *w_u4, const thread float4 (&x)[8]) {
-  half4 w[8];
-  decode_mxfp8_32_half_unscaled(w_u4, w);
-  return dot_mxfp8_32_regs(w, x);
-}
-
 inline float inkling2_read_sidecar(device const uchar *ptr, ulong idx, bool is_f32) {
   if (is_f32) {
     return reinterpret_cast<device const float *>(ptr)[idx];
   }
   return float(reinterpret_cast<device const bfloat *>(ptr)[idx]);
+}
+
+inline float inkling2_read_f16_scale(device const uchar *ptr, ulong idx) {
+  return float(reinterpret_cast<device const half *>(ptr)[idx]);
 }
 
 inline float inkling2_moe_read_f32(device const uchar *ptr, ulong idx, uint is_f32) {
@@ -128,50 +176,26 @@ inline void load_bf16_16(device const bfloat *src, thread float4 (&x)[4]) {
   x[3] = float4(as_type<bfloat4>(b.zw));
 }
 
-// Load 16 NVFP4 weights (8 bytes = uint2) into 4 float4 vectors.
-inline void decode_nvfp4_16(uint2 packed, thread float4 (&w)[4]) {
-  const uint w0 = packed.x;
-  const uint w1 = packed.y;
-  w[0] = float4(
-      INKLING2_FP4_LUT[w0 & 15u],
-      INKLING2_FP4_LUT[(w0 >> 4u) & 15u],
-      INKLING2_FP4_LUT[(w0 >> 8u) & 15u],
-      INKLING2_FP4_LUT[(w0 >> 12u) & 15u]);
-  w[1] = float4(
-      INKLING2_FP4_LUT[(w0 >> 16u) & 15u],
-      INKLING2_FP4_LUT[(w0 >> 20u) & 15u],
-      INKLING2_FP4_LUT[(w0 >> 24u) & 15u],
-      INKLING2_FP4_LUT[(w0 >> 28u) & 15u]);
-  w[2] = float4(
-      INKLING2_FP4_LUT[w1 & 15u],
-      INKLING2_FP4_LUT[(w1 >> 4u) & 15u],
-      INKLING2_FP4_LUT[(w1 >> 8u) & 15u],
-      INKLING2_FP4_LUT[(w1 >> 12u) & 15u]);
-  w[3] = float4(
-      INKLING2_FP4_LUT[(w1 >> 16u) & 15u],
-      INKLING2_FP4_LUT[(w1 >> 20u) & 15u],
-      INKLING2_FP4_LUT[(w1 >> 24u) & 15u],
-      INKLING2_FP4_LUT[(w1 >> 28u) & 15u]);
-}
-
-inline float dot_4x4(const thread float4 (&w)[4], const thread float4 (&x)[4]) {
-  return (dot(w[0], x[0]) + dot(w[1], x[1])) + (dot(w[2], x[2]) + dot(w[3], x[3]));
-}
-
-// Dot 32 uint8 Q8_0 weights against 8 float4 activations, returning raw uint8*x dot product.
-inline float dot_q8_32(const device uint4 *w_u4, const thread float4 (&x)[8]) {
-  const uint4 p0 = w_u4[0];
-  const uint4 p1 = w_u4[1];
-  float acc = 0.0f;
-  acc += dot(float4(as_type<uchar4>(p0.x)), x[0]);
-  acc += dot(float4(as_type<uchar4>(p0.y)), x[1]);
-  acc += dot(float4(as_type<uchar4>(p0.z)), x[2]);
-  acc += dot(float4(as_type<uchar4>(p0.w)), x[3]);
-  acc += dot(float4(as_type<uchar4>(p1.x)), x[4]);
-  acc += dot(float4(as_type<uchar4>(p1.y)), x[5]);
-  acc += dot(float4(as_type<uchar4>(p1.z)), x[6]);
-  acc += dot(float4(as_type<uchar4>(p1.w)), x[7]);
+// Accumulate dot of 16 uint8 affine Q8_0 weights (preloaded in uint4 p) against 4 float4 activations.
+inline float dot_q8_16_accum(float acc, uint4 p, const thread float4 (&x)[4]) {
+  acc += dot(float4(as_type<uchar4>(p.x)), x[0]);
+  acc += dot(float4(as_type<uchar4>(p.y)), x[1]);
+  acc += dot(float4(as_type<uchar4>(p.z)), x[2]);
+  acc += dot(float4(as_type<uchar4>(p.w)), x[3]);
   return acc;
+}
+
+// Accumulate dot of 16 symmetric Q8_0 weights (`int8(u8 ^ 0x80)`, exact 0-ULP to `u8 - 128`).
+inline float dot_q8_sym_16_accum(float acc, uint4 p, const thread float4 (&x)[4]) {
+  acc += dot(float4(as_type<char4>(p.x ^ 0x80808080u)), x[0]);
+  acc += dot(float4(as_type<char4>(p.y ^ 0x80808080u)), x[1]);
+  acc += dot(float4(as_type<char4>(p.z ^ 0x80808080u)), x[2]);
+  acc += dot(float4(as_type<char4>(p.w ^ 0x80808080u)), x[3]);
+  return acc;
+}
+
+inline float4 sum_bf16_16_v4(const thread float4 (&x)[4]) {
+  return (x[0] + x[1]) + (x[2] + x[3]);
 }
 
 template <int KLanes>
@@ -189,7 +213,8 @@ inline float reduce_k_lanes(float v) {
 // ============================================================================
 
 // Grid: (ceil(I / 4), top_k, 1), TG: (64, 1, 1) -> 2 SGs x 2 cols/SG = 4 cols/TG.
-// k_lanes = 16 -> 16 consecutive lanes read 16 * 8 = 128 bytes (1 full cacheline) per load!
+// k_lanes = 16 -> 16 consecutive lanes read 16 * 8 = 128 bytes (1 full cacheline) per uint2 load,
+// 0-ULP unscaled branchless ALU FP4 decode, exact same FP32 reduction order as simd_gate_up_situ_nvfp4!
 [[kernel, max_total_threads_per_threadgroup(64)]] void
 inkling2_moe_m1_gate_up_situ_nvfp4(
     device const bfloat *x [[buffer(0)]],
@@ -222,9 +247,11 @@ inkling2_moe_m1_gate_up_situ_nvfp4(
   const uint g_row = interleaved ? (2u * col) : col;
   const uint u_row = interleaved ? (2u * col + 1u) : (p.intermediate + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * row_w_stride;
+  const device uint2 *gw_u2 = reinterpret_cast<device const uint2 *>(
+      gu_w + (exp_row_base + g_row) * row_w_stride);
   const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * row_s_stride;
-  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * row_w_stride;
+  const device uint2 *uw_u2 = reinterpret_cast<device const uint2 *>(
+      gu_w + (exp_row_base + u_row) * row_w_stride);
   const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * row_s_stride;
 
   float acc_g = 0.0f;
@@ -233,14 +260,12 @@ inkling2_moe_m1_gate_up_situ_nvfp4(
     float4 xv[4];
     load_bf16_16(x + (g << 4u), xv);
 
-    float4 wv[4];
-    const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
-    decode_nvfp4_16(gp, wv);
-    acc_g += inkling2_decode_fp8_e4m3(gs_row[g]) * dot_4x4(wv, xv);
+    half4 wv[4];
+    decode_nvfp4_16_half_unscaled(gw_u2[g], wv);
+    acc_g += inkling2_decode_fp8_e4m3_x16384(gs_row[g]) * dot_4x4_half(wv, xv);
 
-    const uint2 up = *reinterpret_cast<device const uint2 *>(uw_row + ulong(g) * 8ul);
-    decode_nvfp4_16(up, wv);
-    acc_u += inkling2_decode_fp8_e4m3(us_row[g]) * dot_4x4(wv, xv);
+    decode_nvfp4_16_half_unscaled(uw_u2[g], wv);
+    acc_u += inkling2_decode_fp8_e4m3_x16384(us_row[g]) * dot_4x4_half(wv, xv);
   }
 
   acc_g = reduce_k_lanes<16>(acc_g);
@@ -281,34 +306,55 @@ inkling2_moe_m1_gate_up_situ_q8(
   const uint N2 = p.intermediate * 2u;
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
   const ulong exp_row_base = ulong(expert) * ulong(N2);
   const bool interleaved = (p.flags & 32u) != 0u;
   const uint g_row = interleaved ? (2u * col) : col;
   const uint u_row = interleaved ? (2u * col + 1u) : (p.intermediate + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
+  const device uint4 *gw_u4 = reinterpret_cast<device const uint4 *>(
+      gu_w + (exp_row_base + g_row) * ulong(K));
   const ulong gs_base = (exp_row_base + g_row) * ulong(n_groups);
-  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
+  const device uint4 *uw_u4 = reinterpret_cast<device const uint4 *>(
+      gu_w + (exp_row_base + u_row) * ulong(K));
   const ulong us_base = (exp_row_base + u_row) * ulong(n_groups);
 
   float acc_g = 0.0f;
   float acc_u = 0.0f;
-  for (uint g = k_lane; g < n_groups; g += kLanes) {
-    float4 xv[8];
-    load_bf16_16(x + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-    load_bf16_16(x + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-    float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-    const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-
-    const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
-    const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
-    const float gd = dot_q8_32(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), xv);
-    acc_g += gs * gd + gb * x_sum;
-
-    const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
-    const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
-    const float ud = dot_q8_32(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), xv);
-    acc_u += us * ud + ub * x_sum;
+  if (sym_q8) {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float gs = inkling2_read_f16_scale(gu_s, gs_base + g);
+      const float us = inkling2_read_f16_scale(gu_s, us_base + g);
+      const uint4 gp0 = gw_u4[g * 2u];
+      const uint4 gp1 = gw_u4[g * 2u + 1u];
+      const uint4 up0 = uw_u4[g * 2u];
+      const uint4 up1 = uw_u4[g * 2u + 1u];
+      float4 x0[4], x1[4];
+      load_bf16_32(x + (g << 5u), x0, x1);
+      const float gd = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, gp0, x0), gp1, x1);
+      const float ud = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, up0, x0), up1, x1);
+      acc_g += gs * gd;
+      acc_u += us * ud;
+    }
+  } else {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
+      const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
+      const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
+      const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
+      const uint4 gp0 = gw_u4[g * 2u];
+      const uint4 gp1 = gw_u4[g * 2u + 1u];
+      const uint4 up0 = uw_u4[g * 2u];
+      const uint4 up1 = uw_u4[g * 2u + 1u];
+      float4 x0[4], x1[4];
+      load_bf16_32(x + (g << 5u), x0, x1);
+      const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1);
+      const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+      const float gd = dot_q8_16_accum(dot_q8_16_accum(0.0f, gp0, x0), gp1, x1);
+      const float ud = dot_q8_16_accum(dot_q8_16_accum(0.0f, up0, x0), up1, x1);
+      acc_g += gs * gd + gb * x_sum;
+      acc_u += us * ud + ub * x_sum;
+    }
   }
 
   acc_g = reduce_k_lanes<8>(acc_g);
@@ -359,17 +405,15 @@ inkling2_moe_m1_gate_up_situ_mxfp8(
   float acc_g = 0.0f;
   float acc_u = 0.0f;
   for (uint g = k_lane; g < n_groups; g += kLanes) {
-    float4 xv[8];
-    load_bf16_16(x + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-    load_bf16_16(x + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-
     const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
-    const float gd = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), xv);
-    acc_g += gs * gd;
-
     const float us = inkling2_decode_fp8_e8m0(us_row[g]);
-    const float ud = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), xv);
-    acc_u += us * ud;
+    half4 gw[8], uw[8];
+    decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), gw);
+    decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), uw);
+    float4 x0[4], x1[4];
+    load_bf16_32(x + (g << 5u), x0, x1);
+    acc_g += gs * dot_mxfp8_32_regs(gw, x0, x1);
+    acc_u += us * dot_mxfp8_32_regs(uw, x0, x1);
   }
 
   acc_g = reduce_k_lanes<8>(acc_g);
@@ -382,10 +426,8 @@ inkling2_moe_m1_gate_up_situ_mxfp8(
 }
 
 // Grid: (ceil(D / 4), 1, 1), TG: (64, 1, 1).
-// k_lanes = 8 -> 72 / 8 = 9 exact non-divergent iterations for I=1152 (0% warp divergence,
-// exact Pass A FP32 reduction order & 0-ULP M=1..32 parity).
-// Both SGs compute the same 4 output cols across interleaved top_k slots (sg=0: even, sg=1: odd),
-// then sg=0 sums all slots in exact 0..top_k-1 order!
+// k_lanes = 8 with uint2 loads -> 72 / 8 = 9 exact iters (0% divergence!), 0-ULP unscaled
+// branchless ALU FP4 decode, exact same FP32 reduction order as simd_down_nvfp4 -> 0-ULP M=1..32!
 [[kernel, max_total_threads_per_threadgroup(64)]] void
 inkling2_moe_m1_down_combine_nvfp4(
     device const bfloat *act [[buffer(0)]],
@@ -416,15 +458,16 @@ inkling2_moe_m1_down_combine_nvfp4(
     if (valid_col) {
       const uint expert = uint(indices[slot]);
       const ulong row_idx = ulong(expert) * ulong(p.hidden) + col;
-      const device uchar *w_row = dn_w + row_idx * row_w_stride;
+      const device uint2 *w_u2 = reinterpret_cast<device const uint2 *>(
+          dn_w + row_idx * row_w_stride);
       const device uint8_t *s_row = dn_s + row_idx * row_s_stride;
       const device bfloat *a_row = act + ulong(slot) * K;
       for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[4], wv[4];
+        float4 xv[4];
+        half4 wv[4];
         load_bf16_16(a_row + (g << 4u), xv);
-        const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
-        decode_nvfp4_16(wp, wv);
-        acc += inkling2_decode_fp8_e4m3(s_row[g]) * dot_4x4(wv, xv);
+        decode_nvfp4_16_half_unscaled(w_u2[g], wv);
+        acc += inkling2_decode_fp8_e4m3_x16384(s_row[g]) * dot_4x4_half(wv, xv);
       }
     }
     acc = reduce_k_lanes<8>(acc);
@@ -482,15 +525,16 @@ inkling2_moe_m1_down_combine_sconv_nvfp4(
     if (valid_col) {
       const uint expert = uint(indices[slot]);
       const ulong row_idx = ulong(expert) * ulong(D) + col;
-      const device uchar *w_row = dn_w + row_idx * row_w_stride;
+      const device uint2 *w_u2 = reinterpret_cast<device const uint2 *>(
+          dn_w + row_idx * row_w_stride);
       const device uint8_t *s_row = dn_s + row_idx * row_s_stride;
       const device bfloat *a_row = act + ulong(slot) * K;
       for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[4], wv[4];
+        float4 xv[4];
+        half4 wv[4];
         load_bf16_16(a_row + (g << 4u), xv);
-        const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
-        decode_nvfp4_16(wp, wv);
-        acc += inkling2_decode_fp8_e4m3(s_row[g]) * dot_4x4(wv, xv);
+        decode_nvfp4_16_half_unscaled(w_u2[g], wv);
+        acc += inkling2_decode_fp8_e4m3_x16384(s_row[g]) * dot_4x4_half(wv, xv);
       }
     }
     acc = reduce_k_lanes<8>(acc);
@@ -564,26 +608,39 @@ inkling2_moe_m1_down_combine_q8(
   const uint K = p.intermediate;
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
 
   for (uint slot = sg; slot < p.top_k; slot += 2u) {
     float acc = 0.0f;
     if (valid_col) {
       const uint expert = uint(indices[slot]);
       const ulong row_idx = ulong(expert) * ulong(p.hidden) + col;
-      const device uchar *w_row = dn_w + row_idx * ulong(K);
+      const device uint4 *w_u4 = reinterpret_cast<device const uint4 *>(dn_w + row_idx * ulong(K));
       const ulong s_base = row_idx * ulong(n_groups);
       const device bfloat *a_row = act + ulong(slot) * K;
-      for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[8];
-        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-        float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-        const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-
-        const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
-        const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
-        const float dp = dot_q8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
-        acc += sc * dp + bi * x_sum;
+      if (sym_q8) {
+        for (uint g = k_lane; g < n_groups; g += kLanes) {
+          const float sc = inkling2_read_f16_scale(dn_s, s_base + g);
+          const uint4 p0 = w_u4[g * 2u];
+          const uint4 p1 = w_u4[g * 2u + 1u];
+          float4 x0[4], x1[4];
+          load_bf16_32(a_row + (g << 5u), x0, x1);
+          const float dp = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, p0, x0), p1, x1);
+          acc += sc * dp;
+        }
+      } else {
+        for (uint g = k_lane; g < n_groups; g += kLanes) {
+          const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+          const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+          const uint4 p0 = w_u4[g * 2u];
+          const uint4 p1 = w_u4[g * 2u + 1u];
+          float4 x0[4], x1[4];
+          load_bf16_32(a_row + (g << 5u), x0, x1);
+          const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1);
+          const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+          const float dp = dot_q8_16_accum(dot_q8_16_accum(0.0f, p0, x0), p1, x1);
+          acc += sc * dp + bi * x_sum;
+        }
       }
     }
     acc = reduce_k_lanes<4>(acc);
@@ -634,26 +691,39 @@ inkling2_moe_m1_down_combine_sconv_q8(
   const uint K = p.intermediate;
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
 
   for (uint slot = sg; slot < p.top_k; slot += 2u) {
     float acc = 0.0f;
     if (valid_col) {
       const uint expert = uint(indices[slot]);
       const ulong row_idx = ulong(expert) * ulong(D) + col;
-      const device uchar *w_row = dn_w + row_idx * ulong(K);
+      const device uint4 *w_u4 = reinterpret_cast<device const uint4 *>(dn_w + row_idx * ulong(K));
       const ulong s_base = row_idx * ulong(n_groups);
       const device bfloat *a_row = act + ulong(slot) * K;
-      for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[8];
-        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-        float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-        const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-
-        const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
-        const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
-        const float dp = dot_q8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
-        acc += sc * dp + bi * x_sum;
+      if (sym_q8) {
+        for (uint g = k_lane; g < n_groups; g += kLanes) {
+          const float sc = inkling2_read_f16_scale(dn_s, s_base + g);
+          const uint4 p0 = w_u4[g * 2u];
+          const uint4 p1 = w_u4[g * 2u + 1u];
+          float4 x0[4], x1[4];
+          load_bf16_32(a_row + (g << 5u), x0, x1);
+          const float dp = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, p0, x0), p1, x1);
+          acc += sc * dp;
+        }
+      } else {
+        for (uint g = k_lane; g < n_groups; g += kLanes) {
+          const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+          const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+          const uint4 p0 = w_u4[g * 2u];
+          const uint4 p1 = w_u4[g * 2u + 1u];
+          float4 x0[4], x1[4];
+          load_bf16_32(a_row + (g << 5u), x0, x1);
+          const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1);
+          const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+          const float dp = dot_q8_16_accum(dot_q8_16_accum(0.0f, p0, x0), p1, x1);
+          acc += sc * dp + bi * x_sum;
+        }
       }
     }
     acc = reduce_k_lanes<4>(acc);
@@ -735,13 +805,12 @@ inkling2_moe_m1_down_combine_mxfp8(
       const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
       const device bfloat *a_row = act + ulong(slot) * K;
       for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[8];
-        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-
         const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
-        const float dp = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
-        acc += sc * dp;
+        half4 w[8];
+        decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), w);
+        float4 x0[4], x1[4];
+        load_bf16_32(a_row + (g << 5u), x0, x1);
+        acc += sc * dot_mxfp8_32_regs(w, x0, x1);
       }
     }
     acc = reduce_k_lanes<4>(acc);
@@ -800,13 +869,12 @@ inkling2_moe_m1_down_combine_sconv_mxfp8(
       const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
       const device bfloat *a_row = act + ulong(slot) * K;
       for (uint g = k_lane; g < n_groups; g += kLanes) {
-        float4 xv[8];
-        load_bf16_16(a_row + (g << 5u), *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(a_row + (g << 5u) + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-
         const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
-        const float dp = dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
-        acc += sc * dp;
+        half4 w[8];
+        decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), w);
+        float4 x0[4], x1[4];
+        load_bf16_32(a_row + (g << 5u), x0, x1);
+        acc += sc * dot_mxfp8_32_regs(w, x0, x1);
       }
     }
     acc = reduce_k_lanes<4>(acc);
@@ -941,8 +1009,8 @@ inkling2_moe_group(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // 100% deterministic in-order route scatter per expert for ALL `total_routes` (zero atomics!).
-  // For `total_routes <= 512`, scan threadgroup `tg_sel`; for larger prefills, all threads
-  // broadcast-read `selected[r]` in lockstep from L1 cache.
+  // Store token index (`r / p.top_k`) directly in `routes[pos]` so downstream gather / direct-gather
+  // needs ZERO integer division (`udiv`)!
   if (tid < p.experts && count > 0u) {
     uint slot = 0u;
     const uint base_pos = start * p.tile_rows;
@@ -950,7 +1018,7 @@ inkling2_moe_group(
       for (uint r = 0u; r < total_routes; ++r) {
         if (uint(tg_sel[r]) == tid) {
           const uint pos = base_pos + slot;
-          routes[pos] = r;
+          routes[pos] = r / p.top_k;
           inverse[r] = pos;
           ++slot;
         }
@@ -959,7 +1027,7 @@ inkling2_moe_group(
       for (uint r = 0u; r < total_routes; ++r) {
         if (uint(selected[r]) == tid) {
           const uint pos = base_pos + slot;
-          routes[pos] = r;
+          routes[pos] = r / p.top_k;
           inverse[r] = pos;
           ++slot;
         }
@@ -976,7 +1044,6 @@ inkling2_moe_group(
     tile_count->total_tiles = live_tiles;
     tile_count->simd_tiles = s_tiles;
     tile_count->nax_tiles = n_tiles;
-    tile_count->_pad0 = 0u;
 
     tile_count->gather_grid[0] = live_tiles;
     tile_count->gather_grid[1] = (p.hidden + 255u) / 256u;
@@ -1169,7 +1236,7 @@ inkling2_moe_route_group_small(
     for (uint r = 0u; r < total_routes; ++r) {
       if (uint(tg_sel[r]) == tid) {
         const uint pos = base_pos + slot;
-        routes[pos] = r;
+        routes[pos] = r / K;
         inverse[r] = pos;
         ++slot;
       }
@@ -1180,19 +1247,18 @@ inkling2_moe_route_group_small(
     const uint live_tiles = start + nt;
     const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
     const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
-    const bool is_q8 = (rp.flags & 1u) != 0u;
+    const bool is_8bit = (rp.flags & 1u) != 0u;
 
     tile_count->total_tiles = live_tiles;
     tile_count->simd_tiles = s_tiles;
     tile_count->nax_tiles = n_tiles;
-    tile_count->_pad0 = 0u;
 
     tile_count->gather_grid[0] = live_tiles;
     tile_count->gather_grid[1] = (rp.hidden + 255u) / 256u;
     tile_count->gather_grid[2] = 1u;
 
-    const uint simd_gu_x = is_q8 ? (rp.intermediate / 8u) : (rp.intermediate / 4u);
-    const uint simd_dn_x = is_q8 ? (rp.hidden / 16u) : (rp.hidden / 8u);
+    const uint simd_gu_x = is_8bit ? (rp.intermediate / 8u) : (rp.intermediate / 4u);
+    const uint simd_dn_x = is_8bit ? (rp.hidden / 16u) : (rp.hidden / 8u);
     tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
     tile_count->simd_gu_grid[1] = s_tiles;
     tile_count->simd_gu_grid[2] = 1u;
@@ -1230,18 +1296,21 @@ inkling2_moe_gather(
   if (col >= p.hidden) return;
   for (uint i = tid >> 5u; i < rows; i += 8u) {
     const uint dst_row = group.x * p.tile_rows + i;
-    const uint route = routes[dst_row];
+    const uint tok = routes[dst_row];
     *reinterpret_cast<device uint4 *>(out + ulong(dst_row) * p.hidden + col) =
-        route == ~0u
+        tok == ~0u
             ? uint4(0u)
             : *reinterpret_cast<device const uint4 *>(
-                  x + ulong(route / p.top_k) * p.hidden + col);
+                  x + ulong(tok) * p.hidden + col);
   }
 }
 
 // ============================================================================
-// 3. Zero-Smem 1-Pass Coalesced SIMD Multi-Row Kernels (1..8 rows/expert)
-//    Exact same FP32 reduction order as M=1 -> 490+ GB/s AND bit-exact M=1..8!
+// 3. Coalesced SIMD Multi-Row Kernels (1..8 rows/expert)
+//    - Direct-gather from L1-resident `x` via `routes` (zero udiv, 32B tg_rx smem)
+//    - 0-ULP branchless half4 ALU FP4 decode, single x-load for ALL n_rows=1..8
+//    - Hoisted weight loads + parallel 4x uint4 activation loads for Q8_0 & MXFP8
+//    - Exact same FP32 reduction order as M=1 -> 0-ULP bit-exact M=1..32!
 // ============================================================================
 
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -1250,11 +1319,12 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     device const Inkling2MoeTile *tiles [[buffer(1)]],
     device const uint *simd_list [[buffer(2)]],
     device const Inkling2MoeTileCount *count [[buffer(3)]],
-    device const uchar *gu_w [[buffer(4)]],
-    device const uint8_t *gu_s [[buffer(5)]],
-    device const float *gu_outer [[buffer(6)]],
-    device bfloat *hidden [[buffer(7)]],
-    constant Inkling2MoeParams &p [[buffer(8)]],
+    device const uint *routes [[buffer(4)]],
+    device const uchar *gu_w [[buffer(5)]],
+    device const uint8_t *gu_s [[buffer(6)]],
+    device const float *gu_outer [[buffer(7)]],
+    device bfloat *hidden [[buffer(8)]],
+    constant Inkling2MoeParams &p [[buffer(9)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
@@ -1265,6 +1335,16 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
   const uint K = p.hidden;
   const uint I = p.intermediate;
   const uint tile_row_base = tile_idx * p.tile_rows;
+  const bool direct_gather = (p.flags & 16u) != 0u;
+
+  threadgroup uint tg_rx[8];
+  if (n_rows > 1u) {
+    const uint tid = sg * 32u + lane;
+    if (tid < n_rows) {
+      tg_rx[tid] = direct_gather ? routes[tile_row_base + tid] : (tile_row_base + tid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 
   constexpr uint kLanes = 16u;
   const uint k_lane = lane & (kLanes - 1u);
@@ -1281,31 +1361,32 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
   const uint g_row = interleaved ? (2u * col) : col;
   const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
 
-  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * row_w_stride;
+  const device uint2 *gw_u2 = reinterpret_cast<device const uint2 *>(
+      gu_w + (exp_row_base + g_row) * row_w_stride);
   const device uint8_t *gs_row = gu_s + (exp_row_base + g_row) * row_s_stride;
-  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * row_w_stride;
+  const device uint2 *uw_u2 = reinterpret_cast<device const uint2 *>(
+      gu_w + (exp_row_base + u_row) * row_w_stride);
   const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * row_s_stride;
 
-  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
   const ulong out_tile_base = ulong(tile_row_base) * I;
   const float outer_s = (p.flags & 2u) ? gu_outer[t.expert] : 1.0f;
   const bool round_bf16 = (p.flags & 8u) != 0u;
 
   if (n_rows == 1u) {
+    const uint rx0 = direct_gather ? routes[tile_row_base] : tile_row_base;
+    const device bfloat *xp0 = x + ulong(rx0) * K;
     float acc_g = 0.0f;
     float acc_u = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
       float4 xv[4];
-      load_bf16_16(x_tile + (g << 4u), xv);
+      load_bf16_16(xp0 + (g << 4u), xv);
 
-      float4 wv[4];
-      const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
-      decode_nvfp4_16(gp, wv);
-      acc_g += inkling2_decode_fp8_e4m3(gs_row[g]) * dot_4x4(wv, xv);
+      half4 wv[4];
+      decode_nvfp4_16_half_unscaled(gw_u2[g], wv);
+      acc_g += inkling2_decode_fp8_e4m3_x16384(gs_row[g]) * dot_4x4_half(wv, xv);
 
-      const uint2 up = *reinterpret_cast<device const uint2 *>(uw_row + ulong(g) * 8ul);
-      decode_nvfp4_16(up, wv);
-      acc_u += inkling2_decode_fp8_e4m3(us_row[g]) * dot_4x4(wv, xv);
+      decode_nvfp4_16_half_unscaled(uw_u2[g], wv);
+      acc_u += inkling2_decode_fp8_e4m3_x16384(us_row[g]) * dot_4x4_half(wv, xv);
     }
     acc_g = reduce_k_lanes<16>(acc_g);
     acc_u = reduce_k_lanes<16>(acc_u);
@@ -1316,19 +1397,17 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     return;
   }
 
-#define NVFP4_GU_ROW4(IDX, AG, AU) \
-  if ((IDX) < n_rows) { \
+#define NVFP4_GU_ROW_UNCOND(IDX, AG, AU) \
+  { \
     float4 xv[4]; \
-    load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
-    (AG) += sg_val * dot_4x4(w_g, xv); \
-    (AU) += su_val * dot_4x4(w_u, xv); \
+    load_bf16_16(x + ulong(tg_rx[(IDX)]) * K + k0, xv); \
+    (AG) += gs * dot_4x4_half(wg, xv); \
+    (AU) += us * dot_4x4_half(wu, xv); \
   }
 
-#define NVFP4_GU_ONE(IDX, ACC, SC) \
+#define NVFP4_GU_ROW(IDX, AG, AU) \
   if ((IDX) < n_rows) { \
-    float4 xv[4]; \
-    load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
-    (ACC) += (SC) * dot_4x4(wv, xv); \
+    NVFP4_GU_ROW_UNCOND((IDX), (AG), (AU)); \
   }
 
 #define NVFP4_GU_STORE(IDX, AG, AU) \
@@ -1345,19 +1424,16 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
     float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
-      const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
-      const float sg_val = inkling2_decode_fp8_e4m3(gs_row[g]);
-      const uint2 up = *reinterpret_cast<device const uint2 *>(uw_row + ulong(g) * 8ul);
-      const float su_val = inkling2_decode_fp8_e4m3(us_row[g]);
-      float4 w_g[4], w_u[4];
-      decode_nvfp4_16(gp, w_g);
-      decode_nvfp4_16(up, w_u);
-
+      const float gs = inkling2_decode_fp8_e4m3_x16384(gs_row[g]);
+      const float us = inkling2_decode_fp8_e4m3_x16384(us_row[g]);
+      half4 wg[4], wu[4];
+      decode_nvfp4_16_half_unscaled(gw_u2[g], wg);
+      decode_nvfp4_16_half_unscaled(uw_u2[g], wu);
       const uint k0 = g << 4u;
-      NVFP4_GU_ROW4(0u, ag0, au0);
-      NVFP4_GU_ROW4(1u, ag1, au1);
-      NVFP4_GU_ROW4(2u, ag2, au2);
-      NVFP4_GU_ROW4(3u, ag3, au3);
+      NVFP4_GU_ROW_UNCOND(0u, ag0, au0);
+      NVFP4_GU_ROW_UNCOND(1u, ag1, au1);
+      NVFP4_GU_ROW(2u, ag2, au2);
+      NVFP4_GU_ROW(3u, ag3, au3);
     }
     NVFP4_GU_STORE(0u, ag0, au0);
     NVFP4_GU_STORE(1u, ag1, au1);
@@ -1366,36 +1442,26 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
     return;
   }
 
+  // 5..8 rows: half4 wg[4]+wu[4] = only 16 regs total -> single x-load per row & 0 alloca!
   float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
   float ag4 = 0.0f, ag5 = 0.0f, ag6 = 0.0f, ag7 = 0.0f;
   float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
   float au4 = 0.0f, au5 = 0.0f, au6 = 0.0f, au7 = 0.0f;
   for (uint g = k_lane; g < n_groups; g += kLanes) {
+    const float gs = inkling2_decode_fp8_e4m3_x16384(gs_row[g]);
+    const float us = inkling2_decode_fp8_e4m3_x16384(us_row[g]);
+    half4 wg[4], wu[4];
+    decode_nvfp4_16_half_unscaled(gw_u2[g], wg);
+    decode_nvfp4_16_half_unscaled(uw_u2[g], wu);
     const uint k0 = g << 4u;
-    float4 wv[4];
-    const uint2 gp = *reinterpret_cast<device const uint2 *>(gw_row + ulong(g) * 8ul);
-    const float sg_val = inkling2_decode_fp8_e4m3(gs_row[g]);
-    decode_nvfp4_16(gp, wv);
-    NVFP4_GU_ONE(0u, ag0, sg_val);
-    NVFP4_GU_ONE(1u, ag1, sg_val);
-    NVFP4_GU_ONE(2u, ag2, sg_val);
-    NVFP4_GU_ONE(3u, ag3, sg_val);
-    NVFP4_GU_ONE(4u, ag4, sg_val);
-    NVFP4_GU_ONE(5u, ag5, sg_val);
-    NVFP4_GU_ONE(6u, ag6, sg_val);
-    NVFP4_GU_ONE(7u, ag7, sg_val);
-
-    const uint2 up = *reinterpret_cast<device const uint2 *>(uw_row + ulong(g) * 8ul);
-    const float su_val = inkling2_decode_fp8_e4m3(us_row[g]);
-    decode_nvfp4_16(up, wv);
-    NVFP4_GU_ONE(0u, au0, su_val);
-    NVFP4_GU_ONE(1u, au1, su_val);
-    NVFP4_GU_ONE(2u, au2, su_val);
-    NVFP4_GU_ONE(3u, au3, su_val);
-    NVFP4_GU_ONE(4u, au4, su_val);
-    NVFP4_GU_ONE(5u, au5, su_val);
-    NVFP4_GU_ONE(6u, au6, su_val);
-    NVFP4_GU_ONE(7u, au7, su_val);
+    NVFP4_GU_ROW_UNCOND(0u, ag0, au0);
+    NVFP4_GU_ROW_UNCOND(1u, ag1, au1);
+    NVFP4_GU_ROW_UNCOND(2u, ag2, au2);
+    NVFP4_GU_ROW_UNCOND(3u, ag3, au3);
+    NVFP4_GU_ROW_UNCOND(4u, ag4, au4);
+    NVFP4_GU_ROW(5u, ag5, au5);
+    NVFP4_GU_ROW(6u, ag6, au6);
+    NVFP4_GU_ROW(7u, ag7, au7);
   }
   NVFP4_GU_STORE(0u, ag0, au0);
   NVFP4_GU_STORE(1u, ag1, au1);
@@ -1405,8 +1471,8 @@ inkling2_moe_simd_gate_up_situ_nvfp4(
   NVFP4_GU_STORE(5u, ag5, au5);
   NVFP4_GU_STORE(6u, ag6, au6);
   NVFP4_GU_STORE(7u, ag7, au7);
-#undef NVFP4_GU_ROW4
-#undef NVFP4_GU_ONE
+#undef NVFP4_GU_ROW_UNCOND
+#undef NVFP4_GU_ROW
 #undef NVFP4_GU_STORE
 }
 
@@ -1416,9 +1482,246 @@ inkling2_moe_simd_gate_up_situ_q8(
     device const Inkling2MoeTile *tiles [[buffer(1)]],
     device const uint *simd_list [[buffer(2)]],
     device const Inkling2MoeTileCount *count [[buffer(3)]],
-    device const uchar *gu_w [[buffer(4)]],
-    device const uchar *gu_s [[buffer(5)]],
-    device const uchar *gu_b [[buffer(6)]],
+    device const uint *routes [[buffer(4)]],
+    device const uchar *gu_w [[buffer(5)]],
+    device const uchar *gu_s [[buffer(6)]],
+    device const uchar *gu_b [[buffer(7)]],
+    device bfloat *hidden [[buffer(8)]],
+    constant Inkling2MoeParams &p [[buffer(9)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (group.y >= count->simd_tiles) return;
+  const uint tile_idx = simd_list[group.y];
+  const Inkling2MoeTile t = tiles[tile_idx];
+  const uint n_rows = t.rows;
+  const uint K = p.hidden;
+  const uint I = p.intermediate;
+  const uint tile_row_base = tile_idx * p.tile_rows;
+  const bool direct_gather = (p.flags & 16u) != 0u;
+
+  threadgroup uint tg_rx[8];
+  if (n_rows > 1u) {
+    const uint tid = sg * 32u + lane;
+    if (tid < n_rows) {
+      tg_rx[tid] = direct_gather ? routes[tile_row_base + tid] : (tile_row_base + tid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  constexpr uint kLanes = 8u;
+  const uint k_lane = lane & (kLanes - 1u);
+  const uint r_id = lane >> 3u; // 0..3
+  const uint col = group.x * 8u + sg * 4u + r_id;
+  if (col >= I) return;
+
+  const uint N2 = I * 2u;
+  const uint n_groups = K >> 5u;
+  const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool round_bf16 = (p.flags & 8u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
+  const ulong exp_row_base = ulong(t.expert) * ulong(N2);
+  const bool interleaved = (p.flags & 32u) != 0u;
+  const uint g_row = interleaved ? (2u * col) : col;
+  const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
+
+  const device uint4 *gw_u4 = reinterpret_cast<device const uint4 *>(
+      gu_w + (exp_row_base + g_row) * ulong(K));
+  const ulong gs_base = (exp_row_base + g_row) * ulong(n_groups);
+  const device uint4 *uw_u4 = reinterpret_cast<device const uint4 *>(
+      gu_w + (exp_row_base + u_row) * ulong(K));
+  const ulong us_base = (exp_row_base + u_row) * ulong(n_groups);
+
+  const ulong out_tile_base = ulong(tile_row_base) * I;
+
+  if (n_rows == 1u) {
+    const uint rx0 = direct_gather ? routes[tile_row_base] : tile_row_base;
+    const device bfloat *xp0 = x + ulong(rx0) * K;
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    if (sym_q8) {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float gs = inkling2_read_f16_scale(gu_s, gs_base + g);
+        const float us = inkling2_read_f16_scale(gu_s, us_base + g);
+        const uint4 gp0 = gw_u4[g * 2u];
+        const uint4 gp1 = gw_u4[g * 2u + 1u];
+        const uint4 up0 = uw_u4[g * 2u];
+        const uint4 up1 = uw_u4[g * 2u + 1u];
+        float4 x0[4], x1[4];
+        load_bf16_32(xp0 + (g << 5u), x0, x1);
+        float gd = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, gp0, x0), gp1, x1);
+        float ud = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, up0, x0), up1, x1);
+        acc_g += gs * gd;
+        acc_u += us * ud;
+      }
+    } else {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
+        const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
+        const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
+        const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
+        const uint4 gp0 = gw_u4[g * 2u];
+        const uint4 gp1 = gw_u4[g * 2u + 1u];
+        const uint4 up0 = uw_u4[g * 2u];
+        const uint4 up1 = uw_u4[g * 2u + 1u];
+        float4 x0[4], x1[4];
+        load_bf16_32(xp0 + (g << 5u), x0, x1);
+        const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1);
+        const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
+        const float gd = dot_q8_16_accum(dot_q8_16_accum(0.0f, gp0, x0), gp1, x1);
+        const float ud = dot_q8_16_accum(dot_q8_16_accum(0.0f, up0, x0), up1, x1);
+        acc_g += gs * gd + gb * x_sum;
+        acc_u += us * ud + ub * x_sum;
+      }
+    }
+    acc_g = reduce_k_lanes<8>(acc_g);
+    acc_u = reduce_k_lanes<8>(acc_u);
+    if (k_lane == 0u) {
+      hidden[out_tile_base + col] = inkling2_moe_situ_epilogue(
+          acc_g, acc_u, 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
+    }
+    return;
+  }
+
+#define Q8_GU_ROW_SYM(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x + ulong(tg_rx[(IDX)]) * K + k0, x0, x1); \
+    const float gd = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, gp0, x0), gp1, x1); \
+    const float ud = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, up0, x0), up1, x1); \
+    (AG) += gs * gd; \
+    (AU) += us * ud; \
+  }
+
+#define Q8_GU_ROW_AFF(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x + ulong(tg_rx[(IDX)]) * K + k0, x0, x1); \
+    const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1); \
+    const float x_sum = (s4.x + s4.y) + (s4.z + s4.w); \
+    const float gd = dot_q8_16_accum(dot_q8_16_accum(0.0f, gp0, x0), gp1, x1); \
+    const float ud = dot_q8_16_accum(dot_q8_16_accum(0.0f, up0, x0), up1, x1); \
+    (AG) += gs * gd + gb * x_sum; \
+    (AU) += us * ud + ub * x_sum; \
+  }
+
+#define Q8_GU_STORE(IDX, AG, AU) \
+  if ((IDX) < n_rows) { \
+    const float g_sum = reduce_k_lanes<8>((AG)); \
+    const float u_sum = reduce_k_lanes<8>((AU)); \
+    if (k_lane == 0u) { \
+      hidden[out_tile_base + ulong(IDX) * I + col] = inkling2_moe_situ_epilogue( \
+          g_sum, u_sum, 1.0f, p.gate_softcap, p.up_softcap, round_bf16); \
+    } \
+  }
+
+  // Hoisted weight loads (`gp0, gp1, up0, up1`) + parallel 4x uint4 activation loads + 0 alloca!
+  if (n_rows <= 4u) {
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    if (sym_q8) {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float gs = inkling2_read_f16_scale(gu_s, gs_base + g);
+        const float us = inkling2_read_f16_scale(gu_s, us_base + g);
+        const uint4 gp0 = gw_u4[g * 2u];
+        const uint4 gp1 = gw_u4[g * 2u + 1u];
+        const uint4 up0 = uw_u4[g * 2u];
+        const uint4 up1 = uw_u4[g * 2u + 1u];
+        const uint k0 = g << 5u;
+        Q8_GU_ROW_SYM(0u, ag0, au0);
+        Q8_GU_ROW_SYM(1u, ag1, au1);
+        Q8_GU_ROW_SYM(2u, ag2, au2);
+        Q8_GU_ROW_SYM(3u, ag3, au3);
+      }
+    } else {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
+        const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
+        const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
+        const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
+        const uint4 gp0 = gw_u4[g * 2u];
+        const uint4 gp1 = gw_u4[g * 2u + 1u];
+        const uint4 up0 = uw_u4[g * 2u];
+        const uint4 up1 = uw_u4[g * 2u + 1u];
+        const uint k0 = g << 5u;
+        Q8_GU_ROW_AFF(0u, ag0, au0);
+        Q8_GU_ROW_AFF(1u, ag1, au1);
+        Q8_GU_ROW_AFF(2u, ag2, au2);
+        Q8_GU_ROW_AFF(3u, ag3, au3);
+      }
+    }
+    Q8_GU_STORE(0u, ag0, au0);
+    Q8_GU_STORE(1u, ag1, au1);
+    Q8_GU_STORE(2u, ag2, au2);
+    Q8_GU_STORE(3u, ag3, au3);
+    return;
+  }
+
+  float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+  float ag4 = 0.0f, ag5 = 0.0f, ag6 = 0.0f, ag7 = 0.0f;
+  float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+  float au4 = 0.0f, au5 = 0.0f, au6 = 0.0f, au7 = 0.0f;
+  if (sym_q8) {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float gs = inkling2_read_f16_scale(gu_s, gs_base + g);
+      const float us = inkling2_read_f16_scale(gu_s, us_base + g);
+      const uint4 gp0 = gw_u4[g * 2u];
+      const uint4 gp1 = gw_u4[g * 2u + 1u];
+      const uint4 up0 = uw_u4[g * 2u];
+      const uint4 up1 = uw_u4[g * 2u + 1u];
+      const uint k0 = g << 5u;
+      Q8_GU_ROW_SYM(0u, ag0, au0);
+      Q8_GU_ROW_SYM(1u, ag1, au1);
+      Q8_GU_ROW_SYM(2u, ag2, au2);
+      Q8_GU_ROW_SYM(3u, ag3, au3);
+      Q8_GU_ROW_SYM(4u, ag4, au4);
+      Q8_GU_ROW_SYM(5u, ag5, au5);
+      Q8_GU_ROW_SYM(6u, ag6, au6);
+      Q8_GU_ROW_SYM(7u, ag7, au7);
+    }
+  } else {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
+      const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
+      const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
+      const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
+      const uint4 gp0 = gw_u4[g * 2u];
+      const uint4 gp1 = gw_u4[g * 2u + 1u];
+      const uint4 up0 = uw_u4[g * 2u];
+      const uint4 up1 = uw_u4[g * 2u + 1u];
+      const uint k0 = g << 5u;
+      Q8_GU_ROW_AFF(0u, ag0, au0);
+      Q8_GU_ROW_AFF(1u, ag1, au1);
+      Q8_GU_ROW_AFF(2u, ag2, au2);
+      Q8_GU_ROW_AFF(3u, ag3, au3);
+      Q8_GU_ROW_AFF(4u, ag4, au4);
+      Q8_GU_ROW_AFF(5u, ag5, au5);
+      Q8_GU_ROW_AFF(6u, ag6, au6);
+      Q8_GU_ROW_AFF(7u, ag7, au7);
+    }
+  }
+  Q8_GU_STORE(0u, ag0, au0);
+  Q8_GU_STORE(1u, ag1, au1);
+  Q8_GU_STORE(2u, ag2, au2);
+  Q8_GU_STORE(3u, ag3, au3);
+  Q8_GU_STORE(4u, ag4, au4);
+  Q8_GU_STORE(5u, ag5, au5);
+  Q8_GU_STORE(6u, ag6, au6);
+  Q8_GU_STORE(7u, ag7, au7);
+#undef Q8_GU_ROW_SYM
+#undef Q8_GU_ROW_AFF
+#undef Q8_GU_STORE
+}
+
+[[kernel, max_total_threads_per_threadgroup(64)]] void
+inkling2_moe_simd_gate_up_situ_mxfp8(
+    device const bfloat *x [[buffer(0)]],
+    device const Inkling2MoeTile *tiles [[buffer(1)]],
+    device const uint *simd_list [[buffer(2)]],
+    device const Inkling2MoeTileCount *count [[buffer(3)]],
+    device const uint *routes [[buffer(4)]],
+    device const uchar *gu_w [[buffer(5)]],
+    device const uint8_t *gu_s [[buffer(6)]],
     device bfloat *hidden [[buffer(7)]],
     constant Inkling2MoeParams &p [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -1431,114 +1734,16 @@ inkling2_moe_simd_gate_up_situ_q8(
   const uint K = p.hidden;
   const uint I = p.intermediate;
   const uint tile_row_base = tile_idx * p.tile_rows;
+  const bool direct_gather = (p.flags & 16u) != 0u;
 
-  constexpr uint kLanes = 8u;
-  const uint k_lane = lane & (kLanes - 1u);
-  const uint r_id = lane >> 3u; // 0..3
-  const uint col = group.x * 8u + sg * 4u + r_id;
-  if (col >= I) return;
-
-  const uint N2 = I * 2u;
-  const uint n_groups = K >> 5u;
-  const bool sidecar_f32 = (p.flags & 4u) != 0u;
-  const bool round_bf16 = (p.flags & 8u) != 0u;
-  const ulong exp_row_base = ulong(t.expert) * ulong(N2);
-  const bool interleaved = (p.flags & 32u) != 0u;
-  const uint g_row = interleaved ? (2u * col) : col;
-  const uint u_row = interleaved ? (2u * col + 1u) : (I + col);
-
-  const device uchar *gw_row = gu_w + (exp_row_base + g_row) * ulong(K);
-  const ulong gs_base = (exp_row_base + g_row) * ulong(n_groups);
-  const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
-  const ulong us_base = (exp_row_base + u_row) * ulong(n_groups);
-
-  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
-  const ulong out_tile_base = ulong(tile_row_base) * I;
-
-  if (n_rows <= 4u) {
-    float acc_g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc_u[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint g = k_lane; g < n_groups; g += kLanes) {
-      const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
-      const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
-      const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
-      const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
-      const device uint4 *gw_ptr = reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul);
-      const device uint4 *uw_ptr = reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul);
-      const uint k0 = g << 5u;
-      for (uint r = 0u; r < n_rows; ++r) {
-        float4 xv[8];
-        const device bfloat *xr = x_tile + ulong(r) * K + k0;
-        load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-        float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-        const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-        acc_g[r] += gs * dot_q8_32(gw_ptr, xv) + gb * x_sum;
-        acc_u[r] += us * dot_q8_32(uw_ptr, xv) + ub * x_sum;
-      }
+  threadgroup uint tg_rx[8];
+  if (n_rows > 1u) {
+    const uint tid = sg * 32u + lane;
+    if (tid < n_rows) {
+      tg_rx[tid] = direct_gather ? routes[tile_row_base + tid] : (tile_row_base + tid);
     }
-    for (uint r = 0u; r < n_rows; ++r) {
-      acc_g[r] = reduce_k_lanes<8>(acc_g[r]);
-      acc_u[r] = reduce_k_lanes<8>(acc_u[r]);
-      if (k_lane == 0u) {
-        hidden[out_tile_base + ulong(r) * I + col] = inkling2_moe_situ_epilogue(
-            acc_g[r], acc_u[r], 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
-      }
-    }
-    return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-
-  float acc_g[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  float acc_u[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  for (uint g = k_lane; g < n_groups; g += kLanes) {
-    const float gs = inkling2_read_sidecar(gu_s, gs_base + g, sidecar_f32);
-    const float gb = inkling2_read_sidecar(gu_b, gs_base + g, sidecar_f32);
-    const float us = inkling2_read_sidecar(gu_s, us_base + g, sidecar_f32);
-    const float ub = inkling2_read_sidecar(gu_b, us_base + g, sidecar_f32);
-    const device uint4 *gw_ptr = reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul);
-    const device uint4 *uw_ptr = reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul);
-    const uint k0 = g << 5u;
-    for (uint r = 0u; r < n_rows; ++r) {
-      float4 xv[8];
-      const device bfloat *xr = x_tile + ulong(r) * K + k0;
-      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-      float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-      const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-      acc_g[r] += gs * dot_q8_32(gw_ptr, xv) + gb * x_sum;
-      acc_u[r] += us * dot_q8_32(uw_ptr, xv) + ub * x_sum;
-    }
-  }
-  for (uint r = 0u; r < n_rows; ++r) {
-    acc_g[r] = reduce_k_lanes<8>(acc_g[r]);
-    acc_u[r] = reduce_k_lanes<8>(acc_u[r]);
-    if (k_lane == 0u) {
-      hidden[out_tile_base + ulong(r) * I + col] = inkling2_moe_situ_epilogue(
-          acc_g[r], acc_u[r], 1.0f, p.gate_softcap, p.up_softcap, round_bf16);
-    }
-  }
-}
-
-[[kernel, max_total_threads_per_threadgroup(64)]] void
-inkling2_moe_simd_gate_up_situ_mxfp8(
-    device const bfloat *x [[buffer(0)]],
-    device const Inkling2MoeTile *tiles [[buffer(1)]],
-    device const uint *simd_list [[buffer(2)]],
-    device const Inkling2MoeTileCount *count [[buffer(3)]],
-    device const uchar *gu_w [[buffer(4)]],
-    device const uint8_t *gu_s [[buffer(5)]],
-    device bfloat *hidden [[buffer(6)]],
-    constant Inkling2MoeParams &p [[buffer(7)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]]) {
-  if (group.y >= count->simd_tiles) return;
-  const uint tile_idx = simd_list[group.y];
-  const Inkling2MoeTile t = tiles[tile_idx];
-  const uint n_rows = t.rows;
-  const uint K = p.hidden;
-  const uint I = p.intermediate;
-  const uint tile_row_base = tile_idx * p.tile_rows;
 
   constexpr uint kLanes = 8u;
   const uint k_lane = lane & (kLanes - 1u);
@@ -1559,23 +1764,23 @@ inkling2_moe_simd_gate_up_situ_mxfp8(
   const device uchar *uw_row = gu_w + (exp_row_base + u_row) * ulong(K);
   const device uint8_t *us_row = gu_s + (exp_row_base + u_row) * ulong(n_groups);
 
-  const device bfloat *x_tile = x + ulong(tile_row_base) * K;
   const ulong out_tile_base = ulong(tile_row_base) * I;
 
   if (n_rows == 1u) {
+    const uint rx0 = direct_gather ? routes[tile_row_base] : tile_row_base;
+    const device bfloat *xp0 = x + ulong(rx0) * K;
     float acc_g = 0.0f;
     float acc_u = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
-      float4 xv[8];
-      const device bfloat *xr = x_tile + (g << 5u);
-      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-
       const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
-      acc_g += gs * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), xv);
-
       const float us = inkling2_decode_fp8_e8m0(us_row[g]);
-      acc_u += us * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), xv);
+      half4 gw[8], uw[8];
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), gw);
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), uw);
+      float4 x0[4], x1[4];
+      load_bf16_32(xp0 + (g << 5u), x0, x1);
+      acc_g += gs * dot_mxfp8_32_regs(gw, x0, x1);
+      acc_u += us * dot_mxfp8_32_regs(uw, x0, x1);
     }
     acc_g = reduce_k_lanes<8>(acc_g);
     acc_u = reduce_k_lanes<8>(acc_u);
@@ -1586,14 +1791,19 @@ inkling2_moe_simd_gate_up_situ_mxfp8(
     return;
   }
 
-#define MXFP8_GU_ROW(IDX, AG, AU) \
+#define MXFP8_GU_ROW4(IDX, AG, AU) \
   if ((IDX) < n_rows) { \
-    float4 xv[8]; \
-    const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
-    load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
-    load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
-    (AG) += gs * dot_mxfp8_32_regs(gw, xv); \
-    (AU) += us * dot_mxfp8_32_regs(uw, xv); \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x + ulong(tg_rx[(IDX)]) * K + k0, x0, x1); \
+    (AG) += gs * dot_mxfp8_32_regs(gw, x0, x1); \
+    (AU) += us * dot_mxfp8_32_regs(uw, x0, x1); \
+  }
+
+#define MXFP8_GU_ONE(IDX, ACC, SC) \
+  if ((IDX) < n_rows) { \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x + ulong(tg_rx[(IDX)]) * K + k0, x0, x1); \
+    (ACC) += (SC) * dot_mxfp8_32_regs(w, x0, x1); \
   }
 
 #define MXFP8_GU_STORE(IDX, AG, AU) \
@@ -1616,10 +1826,10 @@ inkling2_moe_simd_gate_up_situ_mxfp8(
       decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), gw);
       decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), uw);
       const uint k0 = g << 5u;
-      MXFP8_GU_ROW(0u, ag0, au0);
-      MXFP8_GU_ROW(1u, ag1, au1);
-      MXFP8_GU_ROW(2u, ag2, au2);
-      MXFP8_GU_ROW(3u, ag3, au3);
+      MXFP8_GU_ROW4(0u, ag0, au0);
+      MXFP8_GU_ROW4(1u, ag1, au1);
+      MXFP8_GU_ROW4(2u, ag2, au2);
+      MXFP8_GU_ROW4(3u, ag3, au3);
     }
     MXFP8_GU_STORE(0u, ag0, au0);
     MXFP8_GU_STORE(1u, ag1, au1);
@@ -1637,34 +1847,25 @@ inkling2_moe_simd_gate_up_situ_mxfp8(
     half4 w[8];
     const float gs = inkling2_decode_fp8_e8m0(gs_row[g]);
     decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(gw_row + ulong(g) * 32ul), w);
-#define MXFP8_ONE_ROW(IDX, ACC, SC) \
-    if ((IDX) < n_rows) { \
-      float4 xv[8]; \
-      const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
-      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
-      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
-      (ACC) += (SC) * dot_mxfp8_32_regs(w, xv); \
-    }
-    MXFP8_ONE_ROW(0u, ag0, gs);
-    MXFP8_ONE_ROW(1u, ag1, gs);
-    MXFP8_ONE_ROW(2u, ag2, gs);
-    MXFP8_ONE_ROW(3u, ag3, gs);
-    MXFP8_ONE_ROW(4u, ag4, gs);
-    MXFP8_ONE_ROW(5u, ag5, gs);
-    MXFP8_ONE_ROW(6u, ag6, gs);
-    MXFP8_ONE_ROW(7u, ag7, gs);
+    MXFP8_GU_ONE(0u, ag0, gs);
+    MXFP8_GU_ONE(1u, ag1, gs);
+    MXFP8_GU_ONE(2u, ag2, gs);
+    MXFP8_GU_ONE(3u, ag3, gs);
+    MXFP8_GU_ONE(4u, ag4, gs);
+    MXFP8_GU_ONE(5u, ag5, gs);
+    MXFP8_GU_ONE(6u, ag6, gs);
+    MXFP8_GU_ONE(7u, ag7, gs);
 
     const float us = inkling2_decode_fp8_e8m0(us_row[g]);
     decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(uw_row + ulong(g) * 32ul), w);
-    MXFP8_ONE_ROW(0u, au0, us);
-    MXFP8_ONE_ROW(1u, au1, us);
-    MXFP8_ONE_ROW(2u, au2, us);
-    MXFP8_ONE_ROW(3u, au3, us);
-    MXFP8_ONE_ROW(4u, au4, us);
-    MXFP8_ONE_ROW(5u, au5, us);
-    MXFP8_ONE_ROW(6u, au6, us);
-    MXFP8_ONE_ROW(7u, au7, us);
-#undef MXFP8_ONE_ROW
+    MXFP8_GU_ONE(0u, au0, us);
+    MXFP8_GU_ONE(1u, au1, us);
+    MXFP8_GU_ONE(2u, au2, us);
+    MXFP8_GU_ONE(3u, au3, us);
+    MXFP8_GU_ONE(4u, au4, us);
+    MXFP8_GU_ONE(5u, au5, us);
+    MXFP8_GU_ONE(6u, au6, us);
+    MXFP8_GU_ONE(7u, au7, us);
   }
   MXFP8_GU_STORE(0u, ag0, au0);
   MXFP8_GU_STORE(1u, ag1, au1);
@@ -1674,7 +1875,8 @@ inkling2_moe_simd_gate_up_situ_mxfp8(
   MXFP8_GU_STORE(5u, ag5, au5);
   MXFP8_GU_STORE(6u, ag6, au6);
   MXFP8_GU_STORE(7u, ag7, au7);
-#undef MXFP8_GU_ROW
+#undef MXFP8_GU_ROW4
+#undef MXFP8_GU_ONE
 #undef MXFP8_GU_STORE
 }
 
@@ -1705,7 +1907,8 @@ inkling2_moe_simd_down_nvfp4(
   const uint D = p.hidden;
   const uint n_groups = K >> 4u;
   const ulong row_idx = ulong(t.expert) * ulong(D) + col;
-  const device uchar *w_row = dn_w + row_idx * ulong(K >> 1u);
+  const device uint2 *w_u2 = reinterpret_cast<device const uint2 *>(
+      dn_w + row_idx * ulong(K >> 1u));
   const device uint8_t *s_row = dn_s + row_idx * ulong(n_groups);
 
   const device bfloat *x_tile = hidden + ulong(tile_idx) * p.tile_rows * K;
@@ -1714,11 +1917,11 @@ inkling2_moe_simd_down_nvfp4(
   if (n_rows == 1u) {
     float acc = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
-      float4 xv[4], wv[4];
+      float4 xv[4];
+      half4 wv[4];
       load_bf16_16(x_tile + (g << 4u), xv);
-      const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
-      decode_nvfp4_16(wp, wv);
-      acc += inkling2_decode_fp8_e4m3(s_row[g]) * dot_4x4(wv, xv);
+      decode_nvfp4_16_half_unscaled(w_u2[g], wv);
+      acc += inkling2_decode_fp8_e4m3_x16384(s_row[g]) * dot_4x4_half(wv, xv);
     }
     acc = reduce_k_lanes<8>(acc);
     if (k_lane == 0u) {
@@ -1727,11 +1930,16 @@ inkling2_moe_simd_down_nvfp4(
     return;
   }
 
-#define NVFP4_DN_ROW(IDX, ACC) \
-  if ((IDX) < n_rows) { \
+#define NVFP4_DN_ROW_UNCOND(IDX, ACC) \
+  { \
     float4 xv[4]; \
     load_bf16_16(x_tile + ulong(IDX) * K + k0, xv); \
-    (ACC) += sv * dot_4x4(wv, xv); \
+    (ACC) += sv * dot_4x4_half(wv, xv); \
+  }
+
+#define NVFP4_DN_ROW(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    NVFP4_DN_ROW_UNCOND((IDX), (ACC)); \
   }
 
 #define NVFP4_DN_STORE(IDX, ACC) \
@@ -1745,13 +1953,12 @@ inkling2_moe_simd_down_nvfp4(
   if (n_rows <= 4u) {
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
-      float4 wv[4];
-      const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
-      decode_nvfp4_16(wp, wv);
-      const float sv = inkling2_decode_fp8_e4m3(s_row[g]);
+      half4 wv[4];
+      decode_nvfp4_16_half_unscaled(w_u2[g], wv);
+      const float sv = inkling2_decode_fp8_e4m3_x16384(s_row[g]);
       const uint k0 = g << 4u;
-      NVFP4_DN_ROW(0u, a0);
-      NVFP4_DN_ROW(1u, a1);
+      NVFP4_DN_ROW_UNCOND(0u, a0);
+      NVFP4_DN_ROW_UNCOND(1u, a1);
       NVFP4_DN_ROW(2u, a2);
       NVFP4_DN_ROW(3u, a3);
     }
@@ -1765,16 +1972,15 @@ inkling2_moe_simd_down_nvfp4(
   float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
   float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
   for (uint g = k_lane; g < n_groups; g += kLanes) {
-    float4 wv[4];
-    const uint2 wp = *reinterpret_cast<device const uint2 *>(w_row + ulong(g) * 8ul);
-    decode_nvfp4_16(wp, wv);
-    const float sv = inkling2_decode_fp8_e4m3(s_row[g]);
+    half4 wv[4];
+    decode_nvfp4_16_half_unscaled(w_u2[g], wv);
+    const float sv = inkling2_decode_fp8_e4m3_x16384(s_row[g]);
     const uint k0 = g << 4u;
-    NVFP4_DN_ROW(0u, a0);
-    NVFP4_DN_ROW(1u, a1);
-    NVFP4_DN_ROW(2u, a2);
-    NVFP4_DN_ROW(3u, a3);
-    NVFP4_DN_ROW(4u, a4);
+    NVFP4_DN_ROW_UNCOND(0u, a0);
+    NVFP4_DN_ROW_UNCOND(1u, a1);
+    NVFP4_DN_ROW_UNCOND(2u, a2);
+    NVFP4_DN_ROW_UNCOND(3u, a3);
+    NVFP4_DN_ROW_UNCOND(4u, a4);
     NVFP4_DN_ROW(5u, a5);
     NVFP4_DN_ROW(6u, a6);
     NVFP4_DN_ROW(7u, a7);
@@ -1787,6 +1993,7 @@ inkling2_moe_simd_down_nvfp4(
   NVFP4_DN_STORE(5u, a5);
   NVFP4_DN_STORE(6u, a6);
   NVFP4_DN_STORE(7u, a7);
+#undef NVFP4_DN_ROW_UNCOND
 #undef NVFP4_DN_ROW
 #undef NVFP4_DN_STORE
 }
@@ -1819,59 +2026,152 @@ inkling2_moe_simd_down_q8(
   const uint D = p.hidden;
   const uint n_groups = K >> 5u;
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
   const ulong row_idx = ulong(t.expert) * ulong(D) + col;
-  const device uchar *w_row = dn_w + row_idx * ulong(K);
+  const device uint4 *w_u4 = reinterpret_cast<device const uint4 *>(dn_w + row_idx * ulong(K));
   const ulong s_base = row_idx * ulong(n_groups);
 
   const device bfloat *x_tile = hidden + ulong(tile_idx) * p.tile_rows * K;
   const ulong out_tile_base = ulong(tile_idx) * p.tile_rows * D;
 
-  if (n_rows <= 4u) {
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint g = k_lane; g < n_groups; g += kLanes) {
-      const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
-      const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
-      const device uint4 *w_ptr = reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul);
-      const uint k0 = g << 5u;
-      for (uint r = 0u; r < n_rows; ++r) {
-        float4 xv[8];
-        load_bf16_16(x_tile + ulong(r) * K + k0, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-        load_bf16_16(x_tile + ulong(r) * K + k0 + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-        float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
+  if (n_rows == 1u) {
+    float acc = 0.0f;
+    if (sym_q8) {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float sc = inkling2_read_f16_scale(dn_s, s_base + g);
+        const uint4 p0 = w_u4[g * 2u];
+        const uint4 p1 = w_u4[g * 2u + 1u];
+        float4 x0[4], x1[4];
+        load_bf16_32(x_tile + (g << 5u), x0, x1);
+        const float dp = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, p0, x0), p1, x1);
+        acc += sc * dp;
+      }
+    } else {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+        const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+        const uint4 p0 = w_u4[g * 2u];
+        const uint4 p1 = w_u4[g * 2u + 1u];
+        float4 x0[4], x1[4];
+        load_bf16_32(x_tile + (g << 5u), x0, x1);
+        const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1);
         const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-        acc[r] += sc * dot_q8_32(w_ptr, xv) + bi * x_sum;
+        const float dp = dot_q8_16_accum(dot_q8_16_accum(0.0f, p0, x0), p1, x1);
+        acc += sc * dp + bi * x_sum;
       }
     }
-    for (uint r = 0u; r < n_rows; ++r) {
-      acc[r] = reduce_k_lanes<4>(acc[r]);
-      if (k_lane == 0u) {
-        projected[out_tile_base + ulong(r) * D + col] = bfloat(acc[r]);
-      }
+    acc = reduce_k_lanes<4>(acc);
+    if (k_lane == 0u) {
+      projected[out_tile_base + col] = bfloat(acc);
     }
     return;
   }
 
-  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  for (uint g = k_lane; g < n_groups; g += kLanes) {
-    const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
-    const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
-    const device uint4 *w_ptr = reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul);
-    const uint k0 = g << 5u;
-    for (uint r = 0u; r < n_rows; ++r) {
-      float4 xv[8];
-      load_bf16_16(x_tile + ulong(r) * K + k0, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-      load_bf16_16(x_tile + ulong(r) * K + k0 + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
-      float4 s4 = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-      const float x_sum = (s4.x + s4.y) + (s4.z + s4.w);
-      acc[r] += sc * dot_q8_32(w_ptr, xv) + bi * x_sum;
+  // Hoisted weight loads (`p0, p1`) + parallel 4x uint4 activation loads + 0 alloca!
+#define Q8_DN_ROW_SYM(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x_tile + ulong(IDX) * K + k0, x0, x1); \
+    const float dp = dot_q8_sym_16_accum(dot_q8_sym_16_accum(0.0f, p0, x0), p1, x1); \
+    (ACC) += sc * dp; \
+  }
+
+#define Q8_DN_ROW_AFF(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x_tile + ulong(IDX) * K + k0, x0, x1); \
+    const float4 s4 = sum_bf16_16_v4(x0) + sum_bf16_16_v4(x1); \
+    const float x_sum = (s4.x + s4.y) + (s4.z + s4.w); \
+    const float dp = dot_q8_16_accum(dot_q8_16_accum(0.0f, p0, x0), p1, x1); \
+    (ACC) += sc * dp + bi * x_sum; \
+  }
+
+#define Q8_DN_STORE(IDX, ACC) \
+  if ((IDX) < n_rows) { \
+    const float sum = reduce_k_lanes<4>((ACC)); \
+    if (k_lane == 0u) { \
+      projected[out_tile_base + ulong(IDX) * D + col] = bfloat(sum); \
+    } \
+  }
+
+  if (n_rows <= 4u) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (sym_q8) {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float sc = inkling2_read_f16_scale(dn_s, s_base + g);
+        const uint4 p0 = w_u4[g * 2u];
+        const uint4 p1 = w_u4[g * 2u + 1u];
+        const uint k0 = g << 5u;
+        Q8_DN_ROW_SYM(0u, a0);
+        Q8_DN_ROW_SYM(1u, a1);
+        Q8_DN_ROW_SYM(2u, a2);
+        Q8_DN_ROW_SYM(3u, a3);
+      }
+    } else {
+      for (uint g = k_lane; g < n_groups; g += kLanes) {
+        const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+        const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+        const uint4 p0 = w_u4[g * 2u];
+        const uint4 p1 = w_u4[g * 2u + 1u];
+        const uint k0 = g << 5u;
+        Q8_DN_ROW_AFF(0u, a0);
+        Q8_DN_ROW_AFF(1u, a1);
+        Q8_DN_ROW_AFF(2u, a2);
+        Q8_DN_ROW_AFF(3u, a3);
+      }
+    }
+    Q8_DN_STORE(0u, a0);
+    Q8_DN_STORE(1u, a1);
+    Q8_DN_STORE(2u, a2);
+    Q8_DN_STORE(3u, a3);
+    return;
+  }
+
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+  if (sym_q8) {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float sc = inkling2_read_f16_scale(dn_s, s_base + g);
+      const uint4 p0 = w_u4[g * 2u];
+      const uint4 p1 = w_u4[g * 2u + 1u];
+      const uint k0 = g << 5u;
+      Q8_DN_ROW_SYM(0u, a0);
+      Q8_DN_ROW_SYM(1u, a1);
+      Q8_DN_ROW_SYM(2u, a2);
+      Q8_DN_ROW_SYM(3u, a3);
+      Q8_DN_ROW_SYM(4u, a4);
+      Q8_DN_ROW_SYM(5u, a5);
+      Q8_DN_ROW_SYM(6u, a6);
+      Q8_DN_ROW_SYM(7u, a7);
+    }
+  } else {
+    for (uint g = k_lane; g < n_groups; g += kLanes) {
+      const float sc = inkling2_read_sidecar(dn_s, s_base + g, sidecar_f32);
+      const float bi = inkling2_read_sidecar(dn_b, s_base + g, sidecar_f32);
+      const uint4 p0 = w_u4[g * 2u];
+      const uint4 p1 = w_u4[g * 2u + 1u];
+      const uint k0 = g << 5u;
+      Q8_DN_ROW_AFF(0u, a0);
+      Q8_DN_ROW_AFF(1u, a1);
+      Q8_DN_ROW_AFF(2u, a2);
+      Q8_DN_ROW_AFF(3u, a3);
+      Q8_DN_ROW_AFF(4u, a4);
+      Q8_DN_ROW_AFF(5u, a5);
+      Q8_DN_ROW_AFF(6u, a6);
+      Q8_DN_ROW_AFF(7u, a7);
     }
   }
-  for (uint r = 0u; r < n_rows; ++r) {
-    acc[r] = reduce_k_lanes<4>(acc[r]);
-    if (k_lane == 0u) {
-      projected[out_tile_base + ulong(r) * D + col] = bfloat(acc[r]);
-    }
-  }
+  Q8_DN_STORE(0u, a0);
+  Q8_DN_STORE(1u, a1);
+  Q8_DN_STORE(2u, a2);
+  Q8_DN_STORE(3u, a3);
+  Q8_DN_STORE(4u, a4);
+  Q8_DN_STORE(5u, a5);
+  Q8_DN_STORE(6u, a6);
+  Q8_DN_STORE(7u, a7);
+#undef Q8_DN_ROW_SYM
+#undef Q8_DN_ROW_AFF
+#undef Q8_DN_STORE
 }
 
 [[kernel, max_total_threads_per_threadgroup(64)]] void
@@ -1910,12 +2210,12 @@ inkling2_moe_simd_down_mxfp8(
   if (n_rows == 1u) {
     float acc = 0.0f;
     for (uint g = k_lane; g < n_groups; g += kLanes) {
-      float4 xv[8];
-      const device bfloat *xr = x_tile + (g << 5u);
-      load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0]));
-      load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4]));
       const float sc = inkling2_decode_fp8_e8m0(s_row[g]);
-      acc += sc * dot_mxfp8_32(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), xv);
+      half4 w[8];
+      decode_mxfp8_32_half_unscaled(reinterpret_cast<device const uint4 *>(w_row + ulong(g) * 32ul), w);
+      float4 x0[4], x1[4];
+      load_bf16_32(x_tile + (g << 5u), x0, x1);
+      acc += sc * dot_mxfp8_32_regs(w, x0, x1);
     }
     acc = reduce_k_lanes<4>(acc);
     if (k_lane == 0u) {
@@ -1926,11 +2226,9 @@ inkling2_moe_simd_down_mxfp8(
 
 #define MXFP8_DN_ROW(IDX, ACC) \
   if ((IDX) < n_rows) { \
-    float4 xv[8]; \
-    const device bfloat *xr = x_tile + ulong(IDX) * K + k0; \
-    load_bf16_16(xr, *reinterpret_cast<thread float4 (*)[4]>(&xv[0])); \
-    load_bf16_16(xr + 16u, *reinterpret_cast<thread float4 (*)[4]>(&xv[4])); \
-    (ACC) += sc * dot_mxfp8_32_regs(w, xv); \
+    float4 x0[4], x1[4]; \
+    load_bf16_32(x_tile + ulong(IDX) * K + k0, x0, x1); \
+    (ACC) += sc * dot_mxfp8_32_regs(w, x0, x1); \
   }
 
 #define MXFP8_DN_STORE(IDX, ACC) \
@@ -2016,19 +2314,21 @@ inline void stage_nvfp4_32_regs(
     threadgroup bfloat *dst) {
   threadgroup bfloat4 *dst4 = reinterpret_cast<threadgroup bfloat4 *>(dst);
 
-  float4 w0[4];
-  decode_nvfp4_16(uint2(packed.x, packed.y), w0);
-  dst4[0] = bfloat4(w0[0] * s0);
-  dst4[1] = bfloat4(w0[1] * s0);
-  dst4[2] = bfloat4(w0[2] * s0);
-  dst4[3] = bfloat4(w0[3] * s0);
+  const float s0_scaled = s0 * 16384.0f;
+  half4 w0[4];
+  decode_nvfp4_16_half_unscaled(uint2(packed.x, packed.y), w0);
+  dst4[0] = bfloat4(float4(w0[0]) * s0_scaled);
+  dst4[1] = bfloat4(float4(w0[1]) * s0_scaled);
+  dst4[2] = bfloat4(float4(w0[2]) * s0_scaled);
+  dst4[3] = bfloat4(float4(w0[3]) * s0_scaled);
 
-  float4 w1[4];
-  decode_nvfp4_16(uint2(packed.z, packed.w), w1);
-  dst4[4] = bfloat4(w1[0] * s1);
-  dst4[5] = bfloat4(w1[1] * s1);
-  dst4[6] = bfloat4(w1[2] * s1);
-  dst4[7] = bfloat4(w1[3] * s1);
+  const float s1_scaled = s1 * 16384.0f;
+  half4 w1[4];
+  decode_nvfp4_16_half_unscaled(uint2(packed.z, packed.w), w1);
+  dst4[4] = bfloat4(float4(w1[0]) * s1_scaled);
+  dst4[5] = bfloat4(float4(w1[1]) * s1_scaled);
+  dst4[6] = bfloat4(float4(w1[2]) * s1_scaled);
+  dst4[7] = bfloat4(float4(w1[3]) * s1_scaled);
 }
 
 inline void stage_q8_32_pair_regs(
@@ -2036,19 +2336,32 @@ inline void stage_q8_32_pair_regs(
     uint4 p1,
     float sc,
     float bi,
+    bool sym_q8,
     threadgroup bfloat *dst_hi,
     threadgroup bfloat *dst_lo) {
   threadgroup bfloat4 *hi4 = reinterpret_cast<threadgroup bfloat4 *>(dst_hi);
   threadgroup bfloat4 *lo4 = reinterpret_cast<threadgroup bfloat4 *>(dst_lo);
 
-  const float4 v0 = fma(float4(as_type<uchar4>(p0.x)), float4(sc), float4(bi));
-  const float4 v1 = fma(float4(as_type<uchar4>(p0.y)), float4(sc), float4(bi));
-  const float4 v2 = fma(float4(as_type<uchar4>(p0.z)), float4(sc), float4(bi));
-  const float4 v3 = fma(float4(as_type<uchar4>(p0.w)), float4(sc), float4(bi));
-  const float4 v4 = fma(float4(as_type<uchar4>(p1.x)), float4(sc), float4(bi));
-  const float4 v5 = fma(float4(as_type<uchar4>(p1.y)), float4(sc), float4(bi));
-  const float4 v6 = fma(float4(as_type<uchar4>(p1.z)), float4(sc), float4(bi));
-  const float4 v7 = fma(float4(as_type<uchar4>(p1.w)), float4(sc), float4(bi));
+  float4 v0, v1, v2, v3, v4, v5, v6, v7;
+  if (sym_q8) {
+    v0 = float4(as_type<char4>(p0.x ^ 0x80808080u)) * sc;
+    v1 = float4(as_type<char4>(p0.y ^ 0x80808080u)) * sc;
+    v2 = float4(as_type<char4>(p0.z ^ 0x80808080u)) * sc;
+    v3 = float4(as_type<char4>(p0.w ^ 0x80808080u)) * sc;
+    v4 = float4(as_type<char4>(p1.x ^ 0x80808080u)) * sc;
+    v5 = float4(as_type<char4>(p1.y ^ 0x80808080u)) * sc;
+    v6 = float4(as_type<char4>(p1.z ^ 0x80808080u)) * sc;
+    v7 = float4(as_type<char4>(p1.w ^ 0x80808080u)) * sc;
+  } else {
+    v0 = fma(float4(as_type<uchar4>(p0.x)), float4(sc), float4(bi));
+    v1 = fma(float4(as_type<uchar4>(p0.y)), float4(sc), float4(bi));
+    v2 = fma(float4(as_type<uchar4>(p0.z)), float4(sc), float4(bi));
+    v3 = fma(float4(as_type<uchar4>(p0.w)), float4(sc), float4(bi));
+    v4 = fma(float4(as_type<uchar4>(p1.x)), float4(sc), float4(bi));
+    v5 = fma(float4(as_type<uchar4>(p1.y)), float4(sc), float4(bi));
+    v6 = fma(float4(as_type<uchar4>(p1.z)), float4(sc), float4(bi));
+    v7 = fma(float4(as_type<uchar4>(p1.w)), float4(sc), float4(bi));
+  }
 
   const bfloat4 h0 = bfloat4(v0); hi4[0] = h0; lo4[0] = bfloat4(v0 - float4(h0));
   const bfloat4 h1 = bfloat4(v1); hi4[1] = h1; lo4[1] = bfloat4(v1 - float4(h1));
@@ -2069,6 +2382,7 @@ inline void inkling2_nax_staged(
     device const uchar *b_raw,
     ulong s_row_base,
     bool sidecar_f32,
+    bool sym_q8,
     uint lane,
     threadgroup bfloat *stage,
     Finish finish) {
@@ -2096,10 +2410,14 @@ inline void inkling2_nax_staged(
     for (uint step = 0u; step < n_steps; ++step) {
       const uint4 p0 = wp[step * 2u];
       const uint4 p1 = wp[step * 2u + 1u];
-      const float sc = inkling2_read_sidecar(s_raw, s_row_base + step, sidecar_f32);
-      const float bi = inkling2_read_sidecar(b_raw, s_row_base + step, sidecar_f32);
+      const float sc = sym_q8
+          ? inkling2_read_f16_scale(s_raw, s_row_base + step)
+          : inkling2_read_sidecar(s_raw, s_row_base + step, sidecar_f32);
+      const float bi = sym_q8
+          ? 0.0f
+          : inkling2_read_sidecar(b_raw, s_row_base + step, sidecar_f32);
       stage_q8_32_pair_regs(
-          p0, p1, sc, bi,
+          p0, p1, sc, bi, sym_q8,
           stage + lane * 32u, stage + 1024u + lane * 32u);
       simdgroup_barrier(mem_flags::mem_threadgroup);
       auto av = at.template slice<32, Rows>(int(step * 32u), 0);
@@ -2169,6 +2487,7 @@ kernel void inkling2_moe_gate_up_situ_nax(
   const ulong exp_row_base = ulong(t.expert) * ulong(N2);
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
   const bool round_bf16 = (p.flags & 8u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
   const float outer_s = (!IsQ8 && (p.flags & 2u))
       ? reinterpret_cast<device const float *>(gu_aux)[t.expert]
       : 1.0f;
@@ -2208,10 +2527,14 @@ kernel void inkling2_moe_gate_up_situ_nax(
       for (uint step = 0u; step < n_steps; ++step) {
         const uint4 p0 = wp[step * 2u];
         const uint4 p1 = wp[step * 2u + 1u];
-        const float sc = inkling2_read_sidecar(gu_s, s_row_base + step, sidecar_f32);
-        const float bi = inkling2_read_sidecar(gu_aux, s_row_base + step, sidecar_f32);
+        const float sc = sym_q8
+            ? inkling2_read_f16_scale(gu_s, s_row_base + step)
+            : inkling2_read_sidecar(gu_s, s_row_base + step, sidecar_f32);
+        const float bi = sym_q8
+            ? 0.0f
+            : inkling2_read_sidecar(gu_aux, s_row_base + step, sidecar_f32);
         stage_q8_32_pair_regs(
-            p0, p1, sc, bi,
+            p0, p1, sc, bi, sym_q8,
             sg_stage + lane * 32u, sg_stage + 1024u + lane * 32u);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         auto av = at.template slice<32, LiveR>(int(step * 32u), 0);
@@ -2303,6 +2626,7 @@ kernel void inkling2_moe_down_nax(
   const ulong out_tile_base = ulong(tile_idx) * TileRows * D;
   const ulong exp_row_base = ulong(t.expert) * ulong(D);
   const bool sidecar_f32 = (p.flags & 4u) != 0u;
+  const bool sym_q8 = (p.flags & 128u) != 0u;
 
   const ulong full_row_idx = exp_row_base + origin + lane;
   const device uchar *w_row_base = dn_w + full_row_idx * ulong(IsQ8 ? K : (K >> 1u));
@@ -2322,6 +2646,7 @@ kernel void inkling2_moe_down_nax(
         dn_b,
         s_row_base,
         sidecar_f32,
+        sym_q8,
         lane,
         stage + sg * 2048u,
         finish);

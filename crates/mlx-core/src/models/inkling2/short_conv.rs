@@ -730,6 +730,186 @@ pub fn fused_short_conv_kv_prep_taped(
     Ok((k_cur, v_cur))
 }
 
+/// Fused K+V ShortConv + K L2-clip + V RMSNorm + in-place PagedKVWrite (INT8-KTM & BF16)
+/// for `N >= 1` packed sequences with zero intermediate `[T, H_kv, D]` DRAM roundtrip.
+///
+/// Returns `Ok(Some((k_pool', v_pool', k_scale', v_scale')))` when the fused Metal kernel
+/// executed, or `Ok(None)` when the caller should fall back to separate `kv_prep` + `PagedKVWrite`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn fused_short_conv_kv_prep_paged_taped(
+    k_raw: &MxArray,
+    v_raw: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    k_histories: &mut [&mut MxArray],
+    v_histories: &mut [&mut MxArray],
+    cu_seqlens_q: &[usize],
+    cu_seqlens_arr: Option<&MxArray>,
+    mut k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    mut v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    slot_mapping: &MxArray,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_mode: u32,
+    qk_thresh: f32,
+    v_eps: f32,
+) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
+    let num_seqs = k_histories.len();
+    if num_seqs == 0 || v_histories.len() != num_seqs || cu_seqlens_q.len() != num_seqs + 1 {
+        return Err(Error::from_reason(
+            "fused_short_conv_kv_prep_paged_taped: invalid sequence count",
+        ));
+    }
+    let kv_dim = (num_kv_heads * head_dim) as i64;
+    let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
+    if !unsafe { mlx_sys::mlx_metal_is_available() }
+        || k_raw.dtype()? != DType::BFloat16
+        || v_raw.dtype()? != DType::BFloat16
+        || k_weight.shape()?[1] != 4
+        || v_weight.shape()?[1] != 4
+        || !all_non_empty
+    {
+        return Ok(None);
+    }
+
+    if let Some(ref mut kt) = k_tapes {
+        if num_seqs == 1 {
+            *kt[0] = Some(StreamShortConvTape {
+                hist_before: k_histories[0].clone(),
+                rows: k_raw.clone(),
+            });
+        } else {
+            for (seq_idx, hist) in k_histories.iter().enumerate() {
+                let st = cu_seqlens_q[seq_idx] as i64;
+                let en = cu_seqlens_q[seq_idx + 1] as i64;
+                *kt[seq_idx] = Some(StreamShortConvTape {
+                    hist_before: (*hist).clone(),
+                    rows: k_raw.slice(&[st, 0], &[en, kv_dim])?,
+                });
+            }
+        }
+    }
+    if let Some(ref mut vt) = v_tapes {
+        if num_seqs == 1 {
+            *vt[0] = Some(StreamShortConvTape {
+                hist_before: v_histories[0].clone(),
+                rows: v_raw.clone(),
+            });
+        } else {
+            for (seq_idx, hist) in v_histories.iter().enumerate() {
+                let st = cu_seqlens_q[seq_idx] as i64;
+                let en = cu_seqlens_q[seq_idx + 1] as i64;
+                *vt[seq_idx] = Some(StreamShortConvTape {
+                    hist_before: (*hist).clone(),
+                    rows: v_raw.slice(&[st, 0], &[en, kv_dim])?,
+                });
+            }
+        }
+    }
+
+    let cu_owned;
+    let cu_ref = if num_seqs > 1 {
+        match cu_seqlens_arr {
+            Some(arr) => Some(arr),
+            None => {
+                let vals: Vec<i32> = cu_seqlens_q.iter().map(|&v| v as i32).collect();
+                cu_owned = MxArray::from_int32(&vals, &[vals.len() as i64])?;
+                Some(&cu_owned)
+            }
+        }
+    } else {
+        None
+    };
+
+    let (kp_out, vp_out, ks_out, vs_out, kh_out, vh_out) = if num_seqs <= 4 {
+        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
+        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
+        super::kernels::inkling2_sconv_k4_kv_prep_paged(
+            k_raw,
+            v_raw,
+            k_weight,
+            v_weight,
+            dyn_k,
+            dyn_v,
+            cu_ref,
+            &kh_refs,
+            &vh_refs,
+            k_pool,
+            v_pool,
+            k_scale,
+            v_scale,
+            slot_mapping,
+            num_seqs,
+            false,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            kv_mode,
+            qk_thresh,
+            v_eps,
+            1e-6,
+        )?
+    } else {
+        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
+        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
+        let kh_p = MxArray::stack(kh_refs, Some(0))?;
+        let vh_p = MxArray::stack(vh_refs, Some(0))?;
+        super::kernels::inkling2_sconv_k4_kv_prep_paged(
+            k_raw,
+            v_raw,
+            k_weight,
+            v_weight,
+            dyn_k,
+            dyn_v,
+            cu_ref,
+            &[&kh_p],
+            &[&vh_p],
+            k_pool,
+            v_pool,
+            k_scale,
+            v_scale,
+            slot_mapping,
+            num_seqs,
+            true,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            kv_mode,
+            qk_thresh,
+            v_eps,
+            1e-6,
+        )?
+    };
+
+    if num_seqs == 1 {
+        *k_histories[0] = kh_out;
+        *v_histories[0] = vh_out;
+    } else {
+        for (seq_idx, (kh, vh)) in k_histories
+            .iter_mut()
+            .zip(v_histories.iter_mut())
+            .enumerate()
+        {
+            let s_i64 = seq_idx as i64;
+            **kh = kh_out
+                .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
+                .squeeze(Some(&[0]))?;
+            **vh = vh_out
+                .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
+                .squeeze(Some(&[0]))?;
+        }
+    }
+    Ok(Some((kp_out, vp_out, ks_out, vs_out)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

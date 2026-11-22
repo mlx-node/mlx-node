@@ -55,6 +55,15 @@ impl ExpertSwitchProj {
         Ok(())
     }
 
+    pub fn try_compact_symmetric_q8_or_promote_bf16(&mut self) -> Result<()> {
+        if let Self::Quantized(q) = self
+            && !q.try_compact_symmetric_q8_f16()?
+        {
+            q.promote_affine_sidecars_to_bf16()?;
+        }
+        Ok(())
+    }
+
     pub fn promote_affine_sidecars_to_f32(&mut self, compute_dtype: DType) -> Result<()> {
         if let Self::Quantized(q) = self {
             q.promote_affine_sidecars_to_f32(compute_dtype)?;
@@ -424,13 +433,28 @@ impl Inkling2MoE {
             }
         };
 
-        // 1. Router in FP32: `x_f32 @ W_gate^T` -> fused `inkling2_moe_route` (sigmoid + bias +
-        //    exact top-K int32 + norm + optional `down_proj.outer_scale()` folded directly!)
-        //    For `t <= 32` (M=1, M=4, M=8 verify, M=32 4-lane verify), use our coalesced
-        //    exact-FP32 `inkling2_moe_router_proj` (cuts M=8 router from 2.36 ms -> 0.50 ms and
-        //    keeps M=1 and M=8 router arithmetic bit-for-bit identical!).
+        // 1. Pass 2 end-to-end fused T <= 32 fast path: fuses `router_proj + route + group`,
+        //    skips `inkling2_moe_gather` (direct-gather from L1-resident `x`), uses 16 MiB
+        //    persistent workspace, and fuses `combine + ffn_post_conv + FP32 residual (+ optional
+        //    ShortConvTape)` in a single Metal primitive!
         let (router_min_t, router_max_t) = moe_router_proj_range();
-        let router_logits = if use_metal && t >= router_min_t && t <= router_max_t && d % 4 == 0 {
+        let use_router_proj = use_metal && t >= router_min_t && t <= router_max_t && d % 4 == 0;
+        if use_router_proj
+            && moe_fused_enabled()
+            && let Some(y) = self.try_grouped_moe_fused(
+                x,
+                &self.router_weight_f32,
+                true,
+                residual,
+                mlp_post_histories,
+                cu_seqlens_q,
+                mlp_post_tapes.as_deref_mut(),
+            )?
+        {
+            return Ok(y);
+        }
+
+        let router_logits = if use_router_proj {
             super::kernels::inkling2_moe_router_proj(x, &self.router_weight_f32)?
         } else {
             let x_f32 = if act_dtype == DType::Float32 {
@@ -441,14 +465,13 @@ impl Inkling2MoE {
             x_f32.matmul(&self.router_weight_t_f32)?
         };
 
-        // Pass B fused T <= 32 fast path: fuses `route+group`, kills `gather`, uses 16 MiB
-        // persistent workspace, and fuses `combine + ffn_post_conv + FP32 residual (+ optional
-        // ShortConvTape)` in a single Metal primitive!
         if use_metal
+            && !use_router_proj
             && moe_fused_enabled()
             && let Some(y) = self.try_grouped_moe_fused(
                 x,
                 &router_logits,
+                false,
                 residual,
                 mlp_post_histories,
                 cu_seqlens_q,
@@ -644,7 +667,20 @@ impl Inkling2MoE {
             && gu
                 .outer_scale()
                 .is_none_or(|s| s.dtype().ok() == Some(DType::Float32));
-        let is_q8 = gu.mode() == DEFAULT_QUANT_MODE
+        let is_q8_sym = gu.mode() == DEFAULT_QUANT_MODE
+            && dn.mode() == DEFAULT_QUANT_MODE
+            && gu.bits() == 8
+            && dn.bits() == 8
+            && gu.group_size() == 32
+            && dn.group_size() == 32
+            && gu.outer_scale().is_none()
+            && gu.is_symmetric_q8()
+            && dn.is_symmetric_q8()
+            && gu.get_biases().is_none()
+            && dn.get_biases().is_none()
+            && gu.get_scales().dtype()? == DType::Float16
+            && dn.get_scales().dtype()? == DType::Float16;
+        let is_q8_affine = gu.mode() == DEFAULT_QUANT_MODE
             && dn.mode() == DEFAULT_QUANT_MODE
             && gu.bits() == 8
             && dn.bits() == 8
@@ -664,6 +700,7 @@ impl Inkling2MoE {
                         .get_biases()
                         .is_some_and(|b| b.dtype().ok() == Some(s_dt))
             };
+        let is_q8 = is_q8_sym || is_q8_affine;
         let is_mxfp8 = gu.mode() == MXFP8_MODE
             && dn.mode() == MXFP8_MODE
             && gu.bits() == 8
@@ -718,7 +755,8 @@ impl Inkling2MoE {
     fn try_grouped_moe_fused(
         &self,
         x: &MxArray,
-        router_logits: &MxArray,
+        router_input: &MxArray,
+        router_input_is_weight: bool,
         residual: Option<&MxArray>,
         mlp_post_histories: &mut [&mut MxArray],
         cu_seqlens_q: &[usize],
@@ -772,7 +810,20 @@ impl Inkling2MoE {
             && gu
                 .outer_scale()
                 .is_none_or(|s| s.dtype().ok() == Some(DType::Float32));
-        let is_q8 = gu.mode() == DEFAULT_QUANT_MODE
+        let is_q8_sym = gu.mode() == DEFAULT_QUANT_MODE
+            && dn.mode() == DEFAULT_QUANT_MODE
+            && gu.bits() == 8
+            && dn.bits() == 8
+            && gu.group_size() == 32
+            && dn.group_size() == 32
+            && gu.outer_scale().is_none()
+            && gu.is_symmetric_q8()
+            && dn.is_symmetric_q8()
+            && gu.get_biases().is_none()
+            && dn.get_biases().is_none()
+            && gu.get_scales().dtype()? == DType::Float16
+            && dn.get_scales().dtype()? == DType::Float16;
+        let is_q8_affine = gu.mode() == DEFAULT_QUANT_MODE
             && dn.mode() == DEFAULT_QUANT_MODE
             && gu.bits() == 8
             && dn.bits() == 8
@@ -792,6 +843,7 @@ impl Inkling2MoE {
                         .get_biases()
                         .is_some_and(|b| b.dtype().ok() == Some(s_dt))
             };
+        let is_q8 = is_q8_sym || is_q8_affine;
         let is_mxfp8 = gu.mode() == MXFP8_MODE
             && dn.mode() == MXFP8_MODE
             && gu.bits() == 8
@@ -833,7 +885,7 @@ impl Inkling2MoE {
         let emit_tape = mlp_post_tapes.is_some();
         let (y, hist_out, tape_out) = super::kernels::inkling2_grouped_moe_fused(
             x,
-            router_logits,
+            router_input,
             self.router_bias_f32.as_ref(),
             self.down_proj.outer_scale(),
             gu.get_weight(),
@@ -856,6 +908,7 @@ impl Inkling2MoE {
             self.mlp_up_softcap as f32,
             true,
             emit_tape,
+            router_input_is_weight,
         )?;
 
         if let Some(ref mut tapes) = mlp_post_tapes

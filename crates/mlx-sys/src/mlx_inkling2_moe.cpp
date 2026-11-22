@@ -65,6 +65,60 @@ int resolved_moe_col_cutoff_override() {
 
 namespace {
 
+#ifdef MLX_NODE_METAL_ENABLED
+// Shared 16 MiB persistent stream workspace for T <= 32 across BOTH `Inkling2GroupedMoe` and
+// `Inkling2GroupedMoeFused` (M=1..32). Direct-gather skips `gathered`, so the full T=32
+// high-water workspace is ~13.55 MiB (<= 16 MiB) -> 100% hit rate, zero per-visit malloc churn!
+const std::vector<array>* try_inkling2_moe_workspace(
+    Stream s,
+    metal::CommandEncoder& enc,
+    const Inkling2MoeParams& p) {
+  if (p.rows > 32u) {
+    return nullptr;
+  }
+  constexpr size_t kWorkspaceCapBytes = size_t(16) << 20;
+  const uint32_t ws_rows = 32u;
+  const uint32_t ws_tile_rows = 8u;
+  const uint32_t ws_total_routes = ws_rows * p.top_k;
+  const uint32_t ws_max_tiles = std::min(
+      ws_total_routes,
+      (ws_total_routes + ws_tile_rows - 1u) / ws_tile_rows + p.experts - 1u);
+  const int ws_grouped_rows = static_cast<int>(ws_max_tiles * ws_tile_rows);
+  const size_t est_bytes =
+      size_t(ws_max_tiles) * 8 +
+      sizeof(Inkling2MoeTileCount) +
+      size_t(ws_grouped_rows) * 4 +
+      size_t(ws_total_routes) * 4 +
+      size_t(ws_max_tiles) * 8 +
+      size_t(ws_grouped_rows) * (size_t(p.hidden) + size_t(p.intermediate)) * 2 +
+      size_t(ws_total_routes) * 4 +
+      size_t(32u * 256u * 4u);
+  if (est_bytes > kWorkspaceCapBytes) {
+    return nullptr;
+  }
+  const uint64_t identity =
+      0x494E4B4C4D4F4505ULL ^
+      (uint64_t(ws_max_tiles) << 40) ^
+      (uint64_t(p.hidden) << 20) ^
+      (uint64_t(p.intermediate) << 4) ^
+      (uint64_t(ws_total_routes) << 1) ^
+      1ULL;
+  std::vector<splash_moe::persistent_workspace::Spec> specs = {
+      {{static_cast<int>(ws_max_tiles), 2}, uint32},
+      {{static_cast<int>(sizeof(Inkling2MoeTileCount) / sizeof(uint32_t))}, uint32},
+      {{ws_grouped_rows}, uint32},
+      {{static_cast<int>(ws_total_routes)}, uint32},
+      {{static_cast<int>(2u * ws_max_tiles)}, uint32},
+      {{ws_grouped_rows, static_cast<int>(p.intermediate)}, bfloat16},
+      {{ws_grouped_rows, static_cast<int>(p.hidden)}, bfloat16},
+      {{static_cast<int>(ws_total_routes)}, float32},
+      {{32, 256}, float32},
+  };
+  return splash_moe::persistent_workspace::try_workspace_capped(
+      s, enc, identity, specs, kWorkspaceCapBytes);
+}
+#endif
+
 class Inkling2GroupedMoe : public fast::Custom {
  public:
   Inkling2GroupedMoe(Stream s, Inkling2MoeParams params, bool has_gu_aux, bool has_dn_aux)
@@ -177,13 +231,18 @@ void Inkling2GroupedMoe::eval_gpu(
     return tmp;
   };
 
+  const std::vector<array>* workspace = try_inkling2_moe_workspace(s, enc, p);
+  auto scratch = [&](size_t slot, Shape shape, Dtype dtype) {
+    return workspace ? (*workspace)[slot] : make_temp(std::move(shape), dtype);
+  };
+
   const float dummy_f32 = 0.0f;
 
   // -------------------------------------------------------------------------
   // Fast zero-gather M=1 fused path (2 dispatches total, no NAX needed!).
   // -------------------------------------------------------------------------
   if (p.rows == 1u) {
-    auto act = make_temp({static_cast<int>(p.top_k), static_cast<int>(p.intermediate)}, bfloat16);
+    auto act = scratch(5, {static_cast<int>(p.top_k), static_cast<int>(p.intermediate)}, bfloat16);
 
     set_kernel(
         is_mxfp8 ? "inkling2_moe_m1_gate_up_situ_mxfp8"
@@ -250,14 +309,12 @@ void Inkling2GroupedMoe::eval_gpu(
     p.col_cutoff = static_cast<uint32_t>(std::clamp(cutoff_override, 0, max_c));
   } else if (p.rows <= 32u) {
     // M=2..32 (4-lane AR, solo DSpark M=8, 4-lane DSpark M=16/24/32, and <=32-tok prefill chunks):
-    // 100% 0-smem 1-pass coalesced SIMD multi-row QMV over `tile_rows=8` tiles! Every tile has
-    // 1..=8 rows with the exact same FP32 reduction order as M=1 -> bit-exact greedy parity across
-    // M=1, M=4, M=8, and M=32 (NVFP4, Q8_0, & MXFP8), zero NAX dispatch overhead (-96 dispatches/step),
-    // and full ~490 GB/s DRAM bandwidth on M5 Max!
+    // 100% coalesced SIMD multi-row QMV over `tile_rows=8` tiles! Every tile has 1..=8 rows with
+    // the exact same FP32 reduction order as M=1 -> bit-exact greedy parity across M=1..32!
     p.col_cutoff = 32u;
   } else {
-    // M=33..512 (chunked prefill, e.g. 512-token rolling checkpoints): 1..4 rows/expert use 0-smem
-    // SIMD, >=5 rows/expert use 2-SG BN=32/64 NAX tensor ops!
+    // M=33..512 (chunked prefill, e.g. 512-token rolling checkpoints): 1..4 rows/expert use SIMD,
+    // >=5 rows/expert use 2-SG BN=32/64 NAX tensor ops!
     p.col_cutoff = 4u;
   }
 
@@ -269,56 +326,11 @@ void Inkling2GroupedMoe::eval_gpu(
   const int grouped_rows = static_cast<int>(max_tiles * p.tile_rows);
 
   const bool need_simd = p.col_cutoff > 0u;
-  // `inkling2_moe_group` routes an expert to NAX whenever its total `count > p.col_cutoff`.
-  // Since each token selects distinct experts, `count <= p.rows`, so NAX can be non-empty iff
-  // `p.rows > p.col_cutoff` (even when `p.col_cutoff == p.tile_rows`!).
   const bool need_nax = p.rows > p.col_cutoff;
-
-  // Persistent stream workspace up to 16 MiB. For `T <= 32`, size for the `T = 32` high-water
-  // mark so M=1, M=4, M=8, M=16, M=24, and M=32 share ONE persistent workspace with zero allocator churn!
-  constexpr size_t kWorkspaceCapBytes = size_t(16) << 20;
-  const uint32_t ws_rows = (p.rows <= 32u) ? 32u : p.rows;
-  const uint32_t ws_tile_rows = (ws_rows <= 32u) ? 8u : p.tile_rows;
-  const uint32_t ws_total_routes = ws_rows * p.top_k;
-  const uint32_t ws_max_tiles = std::min(
-      ws_total_routes,
-      (ws_total_routes + ws_tile_rows - 1u) / ws_tile_rows + p.experts - 1u);
-  const int ws_grouped_rows = static_cast<int>(ws_max_tiles * ws_tile_rows);
-
-  const std::vector<array>* workspace = nullptr;
-  const size_t est_bytes =
-      size_t(ws_max_tiles) * 8 +
-      sizeof(Inkling2MoeTileCount) +
-      size_t(ws_grouped_rows) * 4 +
-      size_t(ws_total_routes) * 4 +
-      size_t(ws_max_tiles) * 8 +
-      size_t(ws_grouped_rows) * (2 * size_t(p.hidden) + size_t(p.intermediate)) * 2 +
-      size_t(ws_total_routes) * 4;
-  if (est_bytes <= kWorkspaceCapBytes) {
-    const uint64_t identity =
-        0x494E4B4C4D4F4502ULL ^
-        (uint64_t(ws_max_tiles) << 40) ^
-        (uint64_t(p.hidden) << 20) ^
-        (uint64_t(p.intermediate) << 4) ^
-        (uint64_t(ws_total_routes) << 1) ^
-        1ULL;
-    std::vector<splash_moe::persistent_workspace::Spec> specs = {
-        {{static_cast<int>(ws_max_tiles), 2}, uint32},
-        {{static_cast<int>(sizeof(Inkling2MoeTileCount) / sizeof(uint32_t))}, uint32},
-        {{ws_grouped_rows}, uint32},
-        {{static_cast<int>(ws_total_routes)}, uint32},
-        {{static_cast<int>(2u * ws_max_tiles)}, uint32},
-        {{ws_grouped_rows, static_cast<int>(p.intermediate)}, bfloat16},
-        {{ws_grouped_rows, static_cast<int>(p.hidden)}, bfloat16},
-        {{static_cast<int>(ws_total_routes)}, float32},
-        {{ws_grouped_rows, static_cast<int>(p.hidden)}, bfloat16},
-    };
-    workspace = splash_moe::persistent_workspace::try_workspace_capped(
-        s, enc, identity, specs, kWorkspaceCapBytes);
+  const bool use_direct_gather = need_simd && !need_nax;
+  if (use_direct_gather) {
+    p.flags |= 16u;
   }
-  auto scratch = [&](size_t slot, Shape shape, Dtype dtype) {
-    return workspace ? (*workspace)[slot] : make_temp(std::move(shape), dtype);
-  };
 
   auto tiles = scratch(0, {static_cast<int>(max_tiles), 2}, uint32);
   auto count = scratch(1, {static_cast<int>(sizeof(Inkling2MoeTileCount) / sizeof(uint32_t))}, uint32);
@@ -327,9 +339,8 @@ void Inkling2GroupedMoe::eval_gpu(
   auto tile_lists = scratch(4, {static_cast<int>(2u * max_tiles)}, uint32);
   auto hidden = scratch(5, {grouped_rows, static_cast<int>(p.intermediate)}, bfloat16);
   auto projected = scratch(6, {grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
-  auto gathered = scratch(8, {grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
 
-  // 1. Group: GPU histogram + prefix sum + tile table + dual SIMD/NAX tile lists + indirect grids
+  // 1. Group: GPU histogram + prefix sum + tile table + SIMD/NAX tile lists + indirect grids
   set_kernel("inkling2_moe_group");
   enc.set_input_array(indices, 0);
   enc.set_output_array(tiles, 1);
@@ -340,45 +351,51 @@ void Inkling2GroupedMoe::eval_gpu(
   enc.set_bytes(p, 6);
   enc.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
 
-  // 2. Gather (indirect dispatch: 0.05 ms/48 visits, keeps SIMD gate_up 0-smem & 0-barrier!)
-  set_kernel("inkling2_moe_gather");
-  enc.set_input_array(x, 0);
-  enc.set_input_array(routes, 1);
-  enc.set_input_array(tiles, 2);
-  enc.set_input_array(count, 3);
-  enc.set_output_array(gathered, 4);
-  enc.set_bytes(p, 5);
-  enc.dispatch_threadgroups_indirect(
-      static_cast<const MTL::Buffer*>(count.buffer().ptr()),
-      count.offset() + offsetof(Inkling2MoeTileCount, gather_grid),
-      MTL::Size(256, 1, 1));
+  // 2. Gather (skipped completely for M <= 32 SIMD-only path via direct-gather from L1-resident x!)
+  std::optional<array> gathered_opt;
+  if (!use_direct_gather) {
+    gathered_opt = make_temp({grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
+    set_kernel("inkling2_moe_gather");
+    enc.set_input_array(x, 0);
+    enc.set_input_array(routes, 1);
+    enc.set_input_array(tiles, 2);
+    enc.set_input_array(count, 3);
+    enc.set_output_array(*gathered_opt, 4);
+    enc.set_bytes(p, 5);
+    enc.dispatch_threadgroups_indirect(
+        static_cast<const MTL::Buffer*>(count.buffer().ptr()),
+        count.offset() + offsetof(Inkling2MoeTileCount, gather_grid),
+        MTL::Size(256, 1, 1));
+  }
+  const array& simd_x = use_direct_gather ? x : *gathered_opt;
 
   const std::string suffix =
       std::string(is_q8 ? "q8_" : "nvfp4_") + std::to_string(p.tile_rows);
 
-  // 3a. Zero-smem 1-pass coalesced SIMD gate_up + SiTU (indirect dispatch for rows <= col_cutoff)
+  // 3a. Coalesced SIMD gate_up + SiTU (direct-gather when !need_nax)
   if (need_simd) {
     set_kernel(
         is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
                  : is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
                          : "inkling2_moe_simd_gate_up_situ_nvfp4");
-    enc.set_input_array(gathered, 0);
+    enc.set_input_array(simd_x, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(gu_w, 4);
-    enc.set_input_array(gu_s, 5);
+    enc.set_input_array(routes, 4);
+    enc.set_input_array(gu_w, 5);
+    enc.set_input_array(gu_s, 6);
     if (is_mxfp8) {
-      enc.set_output_array(hidden, 6);
-      enc.set_bytes(p, 7);
-    } else {
-      if (gu_aux) {
-        enc.set_input_array(*gu_aux, 6);
-      } else {
-        enc.set_bytes(dummy_f32, 6);
-      }
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
+    } else {
+      if (gu_aux) {
+        enc.set_input_array(*gu_aux, 7);
+      } else {
+        enc.set_bytes(dummy_f32, 7);
+      }
+      enc.set_output_array(hidden, 8);
+      enc.set_bytes(p, 9);
     }
     enc.dispatch_threadgroups_indirect(
         static_cast<const MTL::Buffer*>(count.buffer().ptr()),
@@ -389,7 +406,7 @@ void Inkling2GroupedMoe::eval_gpu(
   // 3b. 2-SG BN=32 NAX gate_up + SiTU (8 KB smem, indirect dispatch for rows > col_cutoff)
   if (need_nax) {
     set_kernel("inkling2_moe_gate_up_situ_nax_" + suffix);
-    enc.set_input_array(gathered, 0);
+    enc.set_input_array(*gathered_opt, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
@@ -408,7 +425,7 @@ void Inkling2GroupedMoe::eval_gpu(
         MTL::Size(64, 1, 1));
   }
 
-  // 4a. Zero-smem 1-pass coalesced SIMD down_proj (indirect dispatch for rows <= col_cutoff)
+  // 4a. Coalesced SIMD down_proj (indirect dispatch for rows <= col_cutoff)
   if (need_simd) {
     set_kernel(
         is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
@@ -493,6 +510,18 @@ struct Inkling2MoeRouteParamsLocal {
 };
 static_assert(sizeof(Inkling2MoeRouteParamsLocal) == 32, "Inkling2MoeRouteParamsLocal ABI");
 
+struct Inkling2MoeRouterProjParamsLocal {
+  uint32_t rows;
+  uint32_t dim;
+  uint32_t num_experts;
+  uint32_t x_stride;
+  uint32_t x_is_f32;
+  uint32_t _pad0;
+  uint32_t _pad1;
+  uint32_t _pad2;
+};
+static_assert(sizeof(Inkling2MoeRouterProjParamsLocal) == 32, "Inkling2MoeRouterProjParamsLocal ABI");
+
 class Inkling2GroupedMoeFused : public fast::Custom {
  public:
   Inkling2GroupedMoeFused(
@@ -507,7 +536,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
       bool has_gu_aux,
       bool has_dn_aux,
       bool has_res,
-      bool emit_tape)
+      bool emit_tape,
+      bool router_input_is_weight)
       : fast::Custom(
             s,
             [](std::vector<array>) -> std::vector<array> {
@@ -523,7 +553,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
         has_gu_aux_(has_gu_aux),
         has_dn_aux_(has_dn_aux),
         has_res_(has_res),
-        emit_tape_(emit_tape) {}
+        emit_tape_(emit_tape),
+        router_input_is_weight_(router_input_is_weight) {}
 
   DEFINE_NAME(Inkling2GroupedMoeFused)
 
@@ -539,6 +570,7 @@ class Inkling2GroupedMoeFused : public fast::Custom {
         has_dn_aux_ == rhs.has_dn_aux_ &&
         has_res_ == rhs.has_res_ &&
         emit_tape_ == rhs.emit_tape_ &&
+        router_input_is_weight_ == rhs.router_input_is_weight_ &&
         std::memcmp(&p_, &rhs.p_, sizeof(p_)) == 0;
   }
 
@@ -571,6 +603,7 @@ class Inkling2GroupedMoeFused : public fast::Custom {
   bool has_dn_aux_;
   bool has_res_;
   bool emit_tape_;
+  bool router_input_is_weight_;
 };
 
 #ifdef MLX_NODE_METAL_ENABLED
@@ -652,61 +685,33 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   const float dummy_f32 = 0.0f;
 
-  // Shared 16 MiB persistent stream workspace sized for T=32 high-water mark so M=1..32
-  // reuse the exact same GPU scratch buffers with zero per-visit `allocator::malloc` churn.
-  constexpr size_t kWorkspaceCapBytes = size_t(16) << 20;
-  const uint32_t ws_rows = 32u;
-  const uint32_t ws_tile_rows = 8u;
-  const uint32_t ws_total_routes = ws_rows * p.top_k;
-  const uint32_t ws_max_tiles = std::min(
-      ws_total_routes,
-      (ws_total_routes + ws_tile_rows - 1u) / ws_tile_rows + p.experts - 1u);
-  const int ws_grouped_rows = static_cast<int>(ws_max_tiles * ws_tile_rows);
-
-  const std::vector<array>* workspace = nullptr;
-  const size_t est_bytes =
-      size_t(ws_max_tiles) * 8 +
-      sizeof(Inkling2MoeTileCount) +
-      size_t(ws_grouped_rows) * 4 +
-      size_t(ws_total_routes) * 4 +
-      size_t(ws_max_tiles) * 8 +
-      size_t(ws_grouped_rows) * (2 * size_t(p.hidden) + size_t(p.intermediate)) * 2 +
-      size_t(ws_total_routes) * 4;
-  if (est_bytes <= kWorkspaceCapBytes) {
-    const uint64_t identity =
-        0x494E4B4C4D4F4502ULL ^
-        (uint64_t(ws_max_tiles) << 40) ^
-        (uint64_t(p.hidden) << 20) ^
-        (uint64_t(p.intermediate) << 4) ^
-        (uint64_t(ws_total_routes) << 1) ^
-        1ULL;
-    std::vector<splash_moe::persistent_workspace::Spec> specs = {
-        {{static_cast<int>(ws_max_tiles), 2}, uint32},
-        {{static_cast<int>(sizeof(Inkling2MoeTileCount) / sizeof(uint32_t))}, uint32},
-        {{ws_grouped_rows}, uint32},
-        {{static_cast<int>(ws_total_routes)}, uint32},
-        {{static_cast<int>(2u * ws_max_tiles)}, uint32},
-        {{ws_grouped_rows, static_cast<int>(p.intermediate)}, bfloat16},
-        {{ws_grouped_rows, static_cast<int>(p.hidden)}, bfloat16},
-        {{static_cast<int>(ws_total_routes)}, float32},
-        {{ws_grouped_rows, static_cast<int>(p.hidden)}, bfloat16},
-    };
-    workspace = splash_moe::persistent_workspace::try_workspace_capped(
-        s, enc, identity, specs, kWorkspaceCapBytes);
-  }
+  const std::vector<array>* workspace = try_inkling2_moe_workspace(s, enc, p);
   auto scratch = [&](size_t slot, Shape shape, Dtype dtype) {
     return workspace ? (*workspace)[slot] : make_temp(std::move(shape), dtype);
   };
 
   // -------------------------------------------------------------------------
-  // M=1 Fused Path: route -> m1_gate_up_situ -> m1_down_combine_sconv (3 dispatches!)
+  // M=1 Fused Path: (router_proj+)route -> m1_gate_up_situ -> m1_down_combine_sconv (3 dispatches!)
   // -------------------------------------------------------------------------
   if (p.rows == 1u) {
     auto indices = scratch(2, {1, static_cast<int>(p.top_k)}, int32);
     auto gamma = scratch(7, {1, static_cast<int>(p.top_k)}, float32);
     auto act = scratch(5, {static_cast<int>(p.top_k), static_cast<int>(p.intermediate)}, bfloat16);
 
-    uint32_t rflags = (router_logits.dtype() == float32 ? 1u : 0u);
+    std::optional<array> proj_logits_opt;
+    if (router_input_is_weight_) {
+      proj_logits_opt = scratch(8, {1, static_cast<int>(p.experts)}, float32);
+      Inkling2MoeRouterProjParamsLocal rpp{1u, p.hidden, p.experts, p.hidden, 0u, 0u, 0u, 0u};
+      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+          d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
+      enc.set_input_array(x, 0);
+      enc.set_input_array(router_logits, 1);
+      enc.set_output_array(*proj_logits_opt, 2);
+      enc.set_bytes(rpp, 3);
+      enc.dispatch_threadgroups(MTL::Size((p.experts + 3u) / 4u, 1, 1), MTL::Size(128, 1, 1));
+    }
+    const array& logits_arr = router_input_is_weight_ ? *proj_logits_opt : router_logits;
+    uint32_t rflags = (logits_arr.dtype() == float32 ? 1u : 0u);
     if (bias) {
       rflags |= (1u << 1u);
       if (bias->dtype() == float32) rflags |= (1u << 2u);
@@ -719,7 +724,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
         1u, p.experts, p.top_k, route_scale_, rflags, p.experts, 0u, 0u};
     enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
         d, "inkling2_ops", "moe_route", "inkling2_moe_route_f32"));
-    enc.set_input_array(router_logits, 0);
+    enc.set_input_array(logits_arr, 0);
     if (bias) enc.set_input_array(*bias, 1); else enc.set_bytes(dummy_f32, 1);
     if (down_scale) enc.set_input_array(*down_scale, 2); else enc.set_bytes(dummy_f32, 2);
     enc.set_output_array(indices, 3);
@@ -777,7 +782,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
   }
 
   // -------------------------------------------------------------------------
-  // M=2..32 Fused Path: route_group_small -> gather -> gate_up+SiTU -> down -> combine_sconv
+  // M=2..32 Fused Path: (router_proj+)route_group_small -> gate_up+SiTU -> down -> combine_sconv
   // -------------------------------------------------------------------------
   p.tile_rows = 8u;
   if (is_mxfp8) {
@@ -797,6 +802,10 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   const bool need_simd = p.col_cutoff > 0u;
   const bool need_nax = p.rows > p.col_cutoff;
+  const bool use_direct_gather = need_simd && !need_nax;
+  if (use_direct_gather) {
+    p.flags |= 16u;
+  }
 
   auto tiles = scratch(0, {static_cast<int>(max_tiles), 2}, uint32);
   auto count = scratch(1, {static_cast<int>(sizeof(Inkling2MoeTileCount) / sizeof(uint32_t))}, uint32);
@@ -806,9 +815,8 @@ void Inkling2GroupedMoeFused::eval_gpu(
   auto hidden = scratch(5, {grouped_rows, static_cast<int>(p.intermediate)}, bfloat16);
   auto projected = scratch(6, {grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
   auto gamma = scratch(7, {static_cast<int>(total_routes)}, float32);
-  auto gathered = scratch(8, {grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
 
-  // 1. Fused Route + Group (1 single 256-thread TG!)
+  // 1. Fused (RouterProj +) Route + Group
   Inkling2MoeRouteGroupParams rp{};
   rp.rows = p.rows;
   rp.hidden = p.hidden;
@@ -818,7 +826,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
   rp.tile_rows = p.tile_rows;
   rp.route_scale = route_scale_;
   rp.flags = (is_8bit ? 1u : 0u) |
-      (router_logits.dtype() == float32 ? 2u : 0u) |
+      ((router_input_is_weight_ || router_logits.dtype() == float32) ? 2u : 0u) |
       (bias ? 4u : 0u) |
       ((bias && bias->dtype() == float32) ? 8u : 0u) |
       (down_scale ? 16u : 0u) |
@@ -828,8 +836,24 @@ void Inkling2GroupedMoeFused::eval_gpu(
   rp.logits_stride = p.experts;
   rp._pad0 = 0u;
 
+  std::optional<array> proj_logits_opt;
+  if (router_input_is_weight_) {
+    proj_logits_opt = scratch(8, {static_cast<int>(p.rows), static_cast<int>(p.experts)}, float32);
+    Inkling2MoeRouterProjParamsLocal rpp{
+        p.rows, p.hidden, p.experts, p.hidden, 0u, 0u, 0u, 0u};
+    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+        d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
+    enc.set_input_array(x, 0);
+    enc.set_input_array(router_logits, 1);
+    enc.set_output_array(*proj_logits_opt, 2);
+    enc.set_bytes(rpp, 3);
+    enc.dispatch_threadgroups(
+        MTL::Size((p.experts + 3u) / 4u, (p.rows + 7u) / 8u, 1),
+        MTL::Size(128, 1, 1));
+  }
+  const array& logits_arr = router_input_is_weight_ ? *proj_logits_opt : router_logits;
   set_kernel("inkling2_moe_route_group_small");
-  enc.set_input_array(router_logits, 0);
+  enc.set_input_array(logits_arr, 0);
   if (bias) enc.set_input_array(*bias, 1); else enc.set_bytes(dummy_f32, 1);
   if (down_scale) enc.set_input_array(*down_scale, 2); else enc.set_bytes(dummy_f32, 2);
   enc.set_output_array(gamma, 3);
@@ -841,40 +865,46 @@ void Inkling2GroupedMoeFused::eval_gpu(
   enc.set_bytes(rp, 9);
   enc.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
 
-  // 2. Gather (0.05 ms/48 visits; keeps SIMD gate_up 0-smem & 0-barrier!)
-  set_kernel("inkling2_moe_gather");
-  enc.set_input_array(x, 0);
-  enc.set_input_array(routes, 1);
-  enc.set_input_array(tiles, 2);
-  enc.set_input_array(count, 3);
-  enc.set_output_array(gathered, 4);
-  enc.set_bytes(p, 5);
-  enc.dispatch_threadgroups_indirect(
-      static_cast<const MTL::Buffer*>(count.buffer().ptr()),
-      count.offset() + offsetof(Inkling2MoeTileCount, gather_grid),
-      MTL::Size(256, 1, 1));
+  // 2. Gather (skipped completely for M=2..32 SIMD-only path via direct-gather from L1-resident x!)
+  std::optional<array> gathered_opt;
+  if (!use_direct_gather) {
+    gathered_opt = make_temp({grouped_rows, static_cast<int>(p.hidden)}, bfloat16);
+    set_kernel("inkling2_moe_gather");
+    enc.set_input_array(x, 0);
+    enc.set_input_array(routes, 1);
+    enc.set_input_array(tiles, 2);
+    enc.set_input_array(count, 3);
+    enc.set_output_array(*gathered_opt, 4);
+    enc.set_bytes(p, 5);
+    enc.dispatch_threadgroups_indirect(
+        static_cast<const MTL::Buffer*>(count.buffer().ptr()),
+        count.offset() + offsetof(Inkling2MoeTileCount, gather_grid),
+        MTL::Size(256, 1, 1));
+  }
+  const array& simd_x = use_direct_gather ? x : *gathered_opt;
 
   const std::string suffix = std::string(is_q8 ? "q8_8" : "nvfp4_8");
 
-  // 3a. Zero-smem 1-pass coalesced SIMD gate_up + SiTU
+  // 3a. Coalesced SIMD gate_up + SiTU (direct-gather when !need_nax)
   if (need_simd) {
     set_kernel(
         is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
                  : is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
                          : "inkling2_moe_simd_gate_up_situ_nvfp4");
-    enc.set_input_array(gathered, 0);
+    enc.set_input_array(simd_x, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(gu_w, 4);
-    enc.set_input_array(gu_s, 5);
+    enc.set_input_array(routes, 4);
+    enc.set_input_array(gu_w, 5);
+    enc.set_input_array(gu_s, 6);
     if (is_mxfp8) {
-      enc.set_output_array(hidden, 6);
-      enc.set_bytes(p, 7);
-    } else {
-      if (gu_aux) enc.set_input_array(*gu_aux, 6); else enc.set_bytes(dummy_f32, 6);
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
+    } else {
+      if (gu_aux) enc.set_input_array(*gu_aux, 7); else enc.set_bytes(dummy_f32, 7);
+      enc.set_output_array(hidden, 8);
+      enc.set_bytes(p, 9);
     }
     enc.dispatch_threadgroups_indirect(
         static_cast<const MTL::Buffer*>(count.buffer().ptr()),
@@ -885,7 +915,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
   // 3b. NAX gate_up + SiTU (if col_cutoff < T)
   if (need_nax) {
     set_kernel("inkling2_moe_gate_up_situ_nax_" + suffix);
-    enc.set_input_array(gathered, 0);
+    enc.set_input_array(*gathered_opt, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
@@ -900,7 +930,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
         MTL::Size(64, 1, 1));
   }
 
-  // 4a. SIMD down_proj (full-cacheline 128B uint4 for NVFP4/Q8/MXFP8!)
+  // 4a. Coalesced SIMD down_proj
   if (need_simd) {
     set_kernel(
         is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
@@ -1138,31 +1168,41 @@ mlx_array* mlx_inkling2_grouped_moe(
         inputs.push_back(gu_outer);
       }
     } else if (quant_mode == 1u) {
-      // Q8_0 affine: group_size=32, bits=8, BF16 or F32 scales & biases
-      if (!gu_aux_ptr || !dn_aux_ptr) {
-        return nullptr;
-      }
-      const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
-      const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
-      const Dtype sc_dt = gu_s.dtype();
-      if ((sc_dt != bfloat16 && sc_dt != float32) ||
-          dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
-        return nullptr;
-      }
+      // Q8_0: either exact symmetric (native Float16 scales, biases == nullptr)
+      // or affine (BF16/F32 scales & biases), group_size=32, bits=8.
       if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
           gu_s.shape() != Shape{E, N2, D / 32} ||
-          gu_b.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32} ||
-          dn_b.shape() != Shape{E, D, I / 32}) {
+          dn_s.shape() != Shape{E, D, I / 32}) {
         return nullptr;
       }
-      if (sc_dt == float32) {
-        flags |= 4u;
+      if (!gu_aux_ptr && !dn_aux_ptr) {
+        if (gu_s.dtype() != float16 || dn_s.dtype() != float16) {
+          return nullptr;
+        }
+        flags |= 128u;
+      } else {
+        if (!gu_aux_ptr || !dn_aux_ptr) {
+          return nullptr;
+        }
+        const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
+        const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
+        const Dtype sc_dt = gu_s.dtype();
+        if ((sc_dt != bfloat16 && sc_dt != float32) ||
+            dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
+          return nullptr;
+        }
+        if (gu_b.shape() != Shape{E, N2, D / 32} ||
+            dn_b.shape() != Shape{E, D, I / 32}) {
+          return nullptr;
+        }
+        if (sc_dt == float32) {
+          flags |= 4u;
+        }
+        has_gu_aux = true;
+        has_dn_aux = true;
+        inputs.push_back(gu_b);
+        inputs.push_back(dn_b);
       }
-      has_gu_aux = true;
-      has_dn_aux = true;
-      inputs.push_back(gu_b);
-      inputs.push_back(dn_b);
     } else {
       // MXFP8: group_size=32, bits=8, uint8 UE8M0 scales, no biases/outer_scale
       if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
@@ -1230,6 +1270,7 @@ bool mlx_inkling2_grouped_moe_fused(
     float up_softcap,
     bool round_bf16_before_situ,
     bool emit_tape,
+    bool router_input_is_weight,
     mlx_array** out_y,
     mlx_array** out_history,
     mlx_array** out_tape) {
@@ -1268,16 +1309,27 @@ bool mlx_inkling2_grouped_moe_fused(
     const auto& post_w = *reinterpret_cast<array*>(post_conv_w_ptr);
 
     if (x.ndim() != 2 || x.dtype() != bfloat16 ||
-        router_logits.ndim() != 2 || !is_bf16_or_f32(router_logits.dtype()) ||
+        router_logits.ndim() != 2 ||
         post_w.ndim() != 2 || !is_bf16_or_f32(post_w.dtype())) {
       return false;
     }
     const int T = x.shape(0);
     const int D = x.shape(1);
-    const int E = router_logits.shape(1);
+    int E = 0;
+    if (router_input_is_weight) {
+      if (router_logits.dtype() != float32 || router_logits.shape(1) != D) {
+        return false;
+      }
+      E = router_logits.shape(0);
+    } else {
+      if (!is_bf16_or_f32(router_logits.dtype()) || router_logits.shape(0) != T) {
+        return false;
+      }
+      E = router_logits.shape(1);
+    }
     const int K = static_cast<int>(top_k);
     if (T < 1 || T > 32 || D < 64 || (D % 64) != 0 ||
-        router_logits.shape(0) != T || E < 1 || E > 256 ||
+        E < 1 || E > 256 ||
         K < 1 || K > 16 || K > E || T * K > 512 ||
         post_w.shape(0) != D || post_w.shape(1) != 4) {
       return false;
@@ -1349,30 +1401,39 @@ bool mlx_inkling2_grouped_moe_fused(
         inputs.push_back(gu_outer);
       }
     } else if (quant_mode == 1u) {
-      if (!gu_aux_ptr || !dn_aux_ptr) {
-        return false;
-      }
-      const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
-      const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
-      const Dtype sc_dt = gu_s.dtype();
-      if ((sc_dt != bfloat16 && sc_dt != float32) ||
-          dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
-        return false;
-      }
       if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
           gu_s.shape() != Shape{E, N2, D / 32} ||
-          gu_b.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32} ||
-          dn_b.shape() != Shape{E, D, I / 32}) {
+          dn_s.shape() != Shape{E, D, I / 32}) {
         return false;
       }
-      if (sc_dt == float32) {
-        flags |= 4u;
+      if (!gu_aux_ptr && !dn_aux_ptr) {
+        if (gu_s.dtype() != float16 || dn_s.dtype() != float16) {
+          return false;
+        }
+        flags |= 128u;
+      } else {
+        if (!gu_aux_ptr || !dn_aux_ptr) {
+          return false;
+        }
+        const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
+        const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
+        const Dtype sc_dt = gu_s.dtype();
+        if ((sc_dt != bfloat16 && sc_dt != float32) ||
+            dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
+          return false;
+        }
+        if (gu_b.shape() != Shape{E, N2, D / 32} ||
+            dn_b.shape() != Shape{E, D, I / 32}) {
+          return false;
+        }
+        if (sc_dt == float32) {
+          flags |= 4u;
+        }
+        has_gu_aux = true;
+        has_dn_aux = true;
+        inputs.push_back(gu_b);
+        inputs.push_back(dn_b);
       }
-      has_gu_aux = true;
-      has_dn_aux = true;
-      inputs.push_back(gu_b);
-      inputs.push_back(dn_b);
     } else {
       if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
           gu_s.dtype() != uint8 || dn_s.dtype() != uint8 ||
@@ -1448,7 +1509,8 @@ bool mlx_inkling2_grouped_moe_fused(
         has_gu_aux,
         has_dn_aux,
         has_res,
-        emit_tape);
+        emit_tape,
+        router_input_is_weight);
     std::vector<Shape> out_shapes = emit_tape ? std::vector<Shape>{x.shape(), hs, x.shape()}
                                               : std::vector<Shape>{x.shape(), hs};
     std::vector<Dtype> out_dtypes = emit_tape ? std::vector<Dtype>{bfloat16, bfloat16, bfloat16}
@@ -1475,6 +1537,7 @@ bool mlx_inkling2_grouped_moe_fused(
   (void)num_hists; (void)num_seqs; (void)packed_hist; (void)top_k; (void)route_scale;
   (void)quant_mode; (void)interleaved_gate_up;
   (void)gate_softcap; (void)up_softcap; (void)round_bf16_before_situ; (void)emit_tape;
+  (void)router_input_is_weight;
   return false;
 #endif
 }

@@ -20,7 +20,13 @@ struct Inkling2PagedPrefillParams {
   uint sliding_window;
   uint rel_extent;
   uint rel_bias_is_f32;
-  uint _pad;
+  uint rel_mode; // 0 = none, 1 = precomputed [rows,H,rel_extent], 2 = on-the-fly r [rows,H,16] x w [rel_extent,16]
+  uint has_gate_sink;
+  uint gate_row_stride;
+  uint gate_is_f32;
+  uint sink_row_stride;
+  uint sink_is_f32;
+  uint write_lse;
 };
 
 inline bool inkling2_prefill_contract_valid(
@@ -51,6 +57,19 @@ inline PagedPrefillTile inkling2_prefill_tile(
           params.split_count,
           true};
 }
+
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+inline float inkling2_prefill_rel_dot16(
+    float4 r0, float4 r1, float4 r2, float4 r3, const device float4 *w4) {
+  const float d0 = r0.x * w4[0].x + r0.y * w4[0].y + r0.z * w4[0].z + r0.w * w4[0].w;
+  const float d1 = r1.x * w4[1].x + r1.y * w4[1].y + r1.z * w4[1].z + r1.w * w4[1].w;
+  const float d2 = r2.x * w4[2].x + r2.y * w4[2].y + r2.z * w4[2].z + r2.w * w4[2].w;
+  const float d3 = r3.x * w4[3].x + r3.y * w4[3].y + r3.z * w4[3].z + r3.w * w4[3].w;
+  return (d0 + d1) + (d2 + d3);
+}
+#pragma clang fp reassociate(on)
+#pragma clang fp contract(fast)
 
 inline float inkling2_prefill_read_bias(device const uchar *rel_bias_raw,
                                         ulong idx, uint is_f32) {
@@ -83,10 +102,10 @@ inline void inkling2_prefill_ktm_page_softmax(
     threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, device const float4 *key_scales4,
     device const float4 *value_scales4, device const uchar *rel_bias_raw,
-    uint rel_extent, uint rel_bias_is_f32, uint sliding_window, uint kv_head,
-    uint num_q_heads, uint tile_first_row, uint token_start,
-    uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index) {
+    device const float *rel_bias_w, uint rel_extent, uint rel_bias_is_f32,
+    uint rel_mode, uint sliding_window, uint kv_head, uint num_q_heads,
+    uint tile_first_row, uint token_start, uint visible_tokens,
+    uint committed_tokens, uint active_rows, uint thread_index) {
   constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;
   constexpr uint FusedRows = Rows * Group;
   constexpr uint TokensPerLane = 8;
@@ -119,10 +138,22 @@ inline void inkling2_prefill_ktm_page_softmax(
   }
 
   ulong bias_row_base = 0;
+  float4 r0(0.0f), r1(0.0f), r2(0.0f), r3(0.0f);
   if constexpr (HasBias) {
     const uint global_q_row = tile_first_row + query_row;
     const uint global_q_head = kv_head * Group + (fused_row % Group);
-    bias_row_base = (ulong(global_q_row) * num_q_heads + global_q_head) * rel_extent;
+    if (rel_mode == 2u) {
+      const device float4 *r4 =
+          reinterpret_cast<const device float4 *>(rel_bias_raw) +
+          (ulong(global_q_row) * num_q_heads + global_q_head) * 4ul;
+      r0 = r4[0];
+      r1 = r4[1];
+      r2 = r4[2];
+      r3 = r4[3];
+    } else {
+      bias_row_base =
+          (ulong(global_q_row) * num_q_heads + global_q_head) * rel_extent;
+    }
   }
 
   float local_max = -INFINITY;
@@ -134,8 +165,15 @@ inline void inkling2_prefill_ktm_page_softmax(
       if constexpr (HasBias) {
         const uint dist = q_pos - k_pos;
         if (dist < rel_extent) {
-          score[j] += inkling2_prefill_read_bias(
-              rel_bias_raw, bias_row_base + dist, rel_bias_is_f32);
+          if (rel_mode == 2u) {
+            const device float4 *w4 =
+                reinterpret_cast<const device float4 *>(rel_bias_w) +
+                ulong(dist) * 4ul;
+            score[j] += inkling2_prefill_rel_dot16(r0, r1, r2, r3, w4);
+          } else {
+            score[j] += inkling2_prefill_read_bias(
+                rel_bias_raw, bias_row_base + dist, rel_bias_is_f32);
+          }
         }
       }
       local_max = max(local_max, score[j]);
@@ -196,10 +234,10 @@ inline void inkling2_prefill_bf16_page_softmax(
     threadgroup bfloat *probabilities, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, device const uchar *rel_bias_raw,
-    uint rel_extent, uint rel_bias_is_f32, uint sliding_window, uint kv_head,
-    uint num_q_heads, uint tile_first_row, uint token_start,
-    uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index) {
+    device const float *rel_bias_w, uint rel_extent, uint rel_bias_is_f32,
+    uint rel_mode, uint sliding_window, uint kv_head, uint num_q_heads,
+    uint tile_first_row, uint token_start, uint visible_tokens,
+    uint committed_tokens, uint active_rows, uint thread_index) {
   constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;
   constexpr uint FusedRows = Rows * Group;
   constexpr uint TokensPerLane = 8;
@@ -228,10 +266,22 @@ inline void inkling2_prefill_bf16_page_softmax(
   }
 
   ulong bias_row_base = 0;
+  float4 r0(0.0f), r1(0.0f), r2(0.0f), r3(0.0f);
   if constexpr (HasBias) {
     const uint global_q_row = tile_first_row + query_row;
     const uint global_q_head = kv_head * Group + (fused_row % Group);
-    bias_row_base = (ulong(global_q_row) * num_q_heads + global_q_head) * rel_extent;
+    if (rel_mode == 2u) {
+      const device float4 *r4 =
+          reinterpret_cast<const device float4 *>(rel_bias_raw) +
+          (ulong(global_q_row) * num_q_heads + global_q_head) * 4ul;
+      r0 = r4[0];
+      r1 = r4[1];
+      r2 = r4[2];
+      r3 = r4[3];
+    } else {
+      bias_row_base =
+          (ulong(global_q_row) * num_q_heads + global_q_head) * rel_extent;
+    }
   }
 
   float local_max = -INFINITY;
@@ -243,8 +293,15 @@ inline void inkling2_prefill_bf16_page_softmax(
       if constexpr (HasBias) {
         const uint dist = q_pos - k_pos;
         if (dist < rel_extent) {
-          score[j] += inkling2_prefill_read_bias(
-              rel_bias_raw, bias_row_base + dist, rel_bias_is_f32);
+          if (rel_mode == 2u) {
+            const device float4 *w4 =
+                reinterpret_cast<const device float4 *>(rel_bias_w) +
+                ulong(dist) * 4ul;
+            score[j] += inkling2_prefill_rel_dot16(r0, r1, r2, r3, w4);
+          } else {
+            score[j] += inkling2_prefill_read_bias(
+                rel_bias_raw, bias_row_base + dist, rel_bias_is_f32);
+          }
         }
       }
       local_max = max(local_max, score[j]);
@@ -294,6 +351,7 @@ inline void inkling2_prefill_ktm_page_loop(
     device bfloat *tile_queries, device const int *table, device int8_t *key_pool,
     device int8_t *value_pool, device const float *key_scales,
     device const float *value_scales, device const uchar *rel_bias_raw,
+    device const float *rel_bias_w,
     constant Inkling2PagedPrefillParams &params, uint kv_head,
     uint committed_tokens, uint tile_first_row, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
@@ -392,27 +450,28 @@ inline void inkling2_prefill_ktm_page_loop(
 
     // Zero-bias fast path for all distant pages where `token_start + 32 <= bias_min_k`.
     const bool page_has_bias =
-        (params.rel_extent > 0u) && (token_start + N > bias_min_k);
+        (params.rel_extent > 0u) && (params.rel_mode != 0u) &&
+        (token_start + N > bias_min_k);
     if (page_has_bias) {
       inkling2_prefill_ktm_page_softmax<Group, Rows, HeadDim, Score, true>(
           page_score_tile, score_scale, probabilities, row_max, row_sum,
           previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales + first),
           reinterpret_cast<device const float4 *>(value_scales + first),
-          rel_bias_raw, params.rel_extent, params.rel_bias_is_f32,
-          params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          rel_bias_raw, rel_bias_w, params.rel_extent, params.rel_bias_is_f32,
+          params.rel_mode, params.sliding_window, kv_head, num_q_heads,
+          tile_first_row, token_start, visible_tokens, committed_tokens,
+          active_rows, thread_index);
     } else {
       inkling2_prefill_ktm_page_softmax<Group, Rows, HeadDim, Score, false>(
           page_score_tile, score_scale, probabilities, row_max, row_sum,
           previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales + first),
           reinterpret_cast<device const float4 *>(value_scales + first),
-          rel_bias_raw, params.rel_extent, params.rel_bias_is_f32,
-          params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          rel_bias_raw, rel_bias_w, params.rel_extent, params.rel_bias_is_f32,
+          params.rel_mode, params.sliding_window, kv_head, num_q_heads,
+          tile_first_row, token_start, visible_tokens, committed_tokens,
+          active_rows, thread_index);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
@@ -441,6 +500,7 @@ template <uint Group, uint Rows, uint HeadDim>
 inline void inkling2_prefill_bf16_page_loop(
     device bfloat *tile_queries, device const int *table, device bfloat *key_pool,
     device bfloat *value_pool, device const uchar *rel_bias_raw,
+    device const float *rel_bias_w,
     constant Inkling2PagedPrefillParams &params, uint kv_head,
     uint committed_tokens, uint tile_first_row, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
@@ -544,21 +604,22 @@ inline void inkling2_prefill_bf16_page_loop(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const bool page_has_bias =
-        (params.rel_extent > 0u) && (token_start + N > bias_min_k);
+        (params.rel_extent > 0u) && (params.rel_mode != 0u) &&
+        (token_start + N > bias_min_k);
     if (page_has_bias) {
       inkling2_prefill_bf16_page_softmax<Group, Rows, HeadDim, true>(
           scores, score_scale, probabilities, row_max, row_sum, previous_scale,
-          rescale, rel_bias_raw, params.rel_extent, params.rel_bias_is_f32,
-          params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          rescale, rel_bias_raw, rel_bias_w, params.rel_extent,
+          params.rel_bias_is_f32, params.rel_mode, params.sliding_window,
+          kv_head, num_q_heads, tile_first_row, token_start, visible_tokens,
+          committed_tokens, active_rows, thread_index);
     } else {
       inkling2_prefill_bf16_page_softmax<Group, Rows, HeadDim, false>(
           scores, score_scale, probabilities, row_max, row_sum, previous_scale,
-          rescale, rel_bias_raw, params.rel_extent, params.rel_bias_is_f32,
-          params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          rescale, rel_bias_raw, rel_bias_w, params.rel_extent,
+          params.rel_bias_is_f32, params.rel_mode, params.sliding_window,
+          kv_head, num_q_heads, tile_first_row, token_start, visible_tokens,
+          committed_tokens, active_rows, thread_index);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
@@ -595,11 +656,28 @@ inline void inkling2_prefill_bf16_page_loop(
   }
 }
 
-// Inkling2 prefill reduce: emits both BF16 `output` and natural-log F32 `lse`.
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+inline float inkling2_prefill_precise_sigmoid(float x) {
+  return precise::divide(1.0f, 1.0f + precise::exp(-x));
+}
+
+inline float inkling2_prefill_apply_gate_sink(
+    float o_f, float g_val, float lse_val, float sink_val) {
+  const float o_bf16 = float(bfloat(o_f));
+  const float sink_scale = inkling2_prefill_precise_sigmoid(lse_val - sink_val);
+  const float g_sig = inkling2_prefill_precise_sigmoid(g_val);
+  return (o_bf16 * g_sig) * sink_scale;
+}
+#pragma clang fp reassociate(on)
+#pragma clang fp contract(fast)
+
+// Inkling2 prefill reduce: emits BF16 `output` (with optional fused gate+sink) + optional F32 `lse`.
 template <uint Group, uint HeadDim>
 inline void inkling2_prefill_reduce_phase(
     device const float *partials, device const float *statistics,
     device bfloat *output, device float *lse_out,
+    device const uchar *gate_raw, device const uchar *sink_raw,
     constant Inkling2PagedPrefillParams &params, uint3 group, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values) {
   constexpr uint M = PAGED_PREFILL_TILE_ROWS * Group;
@@ -613,8 +691,8 @@ inline void inkling2_prefill_reduce_phase(
   if (row >= params.rows)
     return;
   const uint query_heads = params.kv_heads * Group;
-  const ulong out_head_idx =
-      ulong(row) * query_heads + group.x * Group + fused_row % Group;
+  const uint q_head = group.x * Group + fused_row % Group;
+  const ulong out_head_idx = ulong(row) * query_heads + q_head;
   device bfloat *row_output = output + out_head_idx * D;
 
   uint first_page = 0u, last_page_excl = 0u;
@@ -624,7 +702,7 @@ inline void inkling2_prefill_reduce_phase(
       last_page_excl > first_page ? last_page_excl - first_page : 0u;
   if (active_pages == 0u) {
     row_output[thread_index] = bfloat(0.0f);
-    if (thread_index == 0u)
+    if (thread_index == 0u && params.write_lse != 0u)
       lse_out[out_head_idx] = -INFINITY;
     return;
   }
@@ -657,11 +735,22 @@ inline void inkling2_prefill_reduce_phase(
       denominator += weight * statistics[slot * 2u + 1u];
     }
   }
-  row_output[thread_index] =
-      bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
-  if (thread_index == 0u) {
-    lse_out[out_head_idx] =
-        (denominator > 0.0f) ? (row_maximum + precise::log(denominator)) : -INFINITY;
+  float o_f = denominator > 0.0f ? numerator / denominator : 0.0f;
+  const float lse_val =
+      (denominator > 0.0f) ? (row_maximum + precise::log(denominator)) : -INFINITY;
+  if (params.has_gate_sink != 0u) {
+    const ulong sink_idx = ulong(row) * ulong(params.sink_row_stride) + ulong(q_head);
+    const float sink_val = inkling2_prefill_read_bias(
+        sink_raw, sink_idx, params.sink_is_f32);
+    const ulong gate_idx = ulong(row) * ulong(params.gate_row_stride) +
+                           ulong(q_head) * D + ulong(thread_index);
+    const float g_val =
+        inkling2_prefill_read_bias(gate_raw, gate_idx, params.gate_is_f32);
+    o_f = inkling2_prefill_apply_gate_sink(o_f, g_val, lse_val, sink_val);
+  }
+  row_output[thread_index] = bfloat(o_f);
+  if (thread_index == 0u && params.write_lse != 0u) {
+    lse_out[out_head_idx] = lse_val;
   }
 }
 
@@ -677,6 +766,7 @@ inline void inkling2_prefill_reduce_phase(
       device const float *value_scales [[buffer(7)]],                          \
       device const uchar *rel_bias_raw [[buffer(8)]],                          \
       constant Inkling2PagedPrefillParams &params [[buffer(9)]],               \
+      device const float *rel_bias_w [[buffer(10)]],                           \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS;                        \
@@ -696,10 +786,11 @@ inline void inkling2_prefill_reduce_phase(
     inkling2_prefill_ktm_page_loop<Group, PAGED_PREFILL_TILE_ROWS, HeadDim,    \
                                    Int8Queries>(                               \
         queries + tile.offset, table, key_pool, value_pool, key_scales,        \
-        value_scales, rel_bias_raw, params, kv_head, tile.first_position,      \
-        tile.first_row, tile.active_rows, tile.splits, split, partials,        \
-        statistics, tile.first_slot + split, scores, probabilities, row_max,   \
-        row_sum, previous_scale, &rescale, thread_index);                      \
+        value_scales, rel_bias_raw, rel_bias_w, params, kv_head,               \
+        tile.first_position, tile.first_row, tile.active_rows, tile.splits,    \
+        split, partials, statistics, tile.first_slot + split, scores,          \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index);                                                         \
   }
 
 #define INKLING2_PAGED_PREFILL_BF16_SPLIT(Name, Group, HeadDim)                \
@@ -712,6 +803,7 @@ inline void inkling2_prefill_reduce_phase(
       device bfloat *value_pool [[buffer(5)]],                                 \
       device const uchar *rel_bias_raw [[buffer(6)]],                          \
       constant Inkling2PagedPrefillParams &params [[buffer(7)]],               \
+      device const float *rel_bias_w [[buffer(8)]],                            \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS;                        \
@@ -731,10 +823,10 @@ inline void inkling2_prefill_reduce_phase(
       return;                                                                  \
     inkling2_prefill_bf16_page_loop<Group, PAGED_PREFILL_TILE_ROWS, HeadDim>(  \
         queries + tile.offset, table, key_pool, value_pool, rel_bias_raw,      \
-        params, kv_head, tile.first_position, tile.first_row, tile.active_rows,\
-        tile.splits, split, partials, statistics, tile.first_slot + split,     \
-        scores, probabilities, keys, row_max, row_sum, previous_scale,         \
-        &rescale, thread_index);                                               \
+        rel_bias_w, params, kv_head, tile.first_position, tile.first_row,      \
+        tile.active_rows, tile.splits, split, partials, statistics,            \
+        tile.first_slot + split, scores, probabilities, keys, row_max,         \
+        row_sum, previous_scale, &rescale, thread_index);                      \
   }
 
 #define INKLING2_PAGED_PREFILL_REDUCE(Name, Group, HeadDim)                    \
@@ -744,13 +836,15 @@ inline void inkling2_prefill_reduce_phase(
       device bfloat *output [[buffer(2)]],                                     \
       device float *lse_out [[buffer(3)]],                                     \
       constant Inkling2PagedPrefillParams &params [[buffer(4)]],               \
+      device const uchar *gate_raw [[buffer(5)]],                              \
+      device const uchar *sink_raw [[buffer(6)]],                              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup float weights[PAGED_PREFILL_MAX_SPLITS];                       \
     threadgroup float group_values[HeadDim / 32];                              \
     inkling2_prefill_reduce_phase<Group, HeadDim>(                             \
-        partials, statistics, output, lse_out, params, group, thread_index,    \
-        weights, group_values);                                                \
+        partials, statistics, output, lse_out, gate_raw, sink_raw, params,     \
+        group, thread_index, weights, group_values);                           \
   }
 
 INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8_split_g3_d128_ktm, 3, 128, false)

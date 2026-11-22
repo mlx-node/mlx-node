@@ -5978,6 +5978,132 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// Prebuild and validate the `int64` write slot mapping for a single-sequence wave
+    /// (`first_pos..first_pos + num_tokens` within `floor..current`) ONCE per KV group.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn build_single_write_slot_mapping(
+        &mut self,
+        seq_id: SeqId,
+        first_logical_position: u32,
+        num_tokens: u32,
+        floor: u32,
+    ) -> Result<(MxArray, u32), String> {
+        self.activate_request(seq_id)?;
+        if self.block_table.is_none() {
+            return Err(
+                "build_single_write_slot_mapping called without an active request".to_string(),
+            );
+        }
+        let current = self.request_tokens.len() as u32;
+        let end = first_logical_position.checked_add(num_tokens);
+        if first_logical_position < floor || end.is_none_or(|e| e > current) {
+            return Err(format!(
+                "build_single_write_slot_mapping: chunk {first_logical_position}..+{num_tokens} \
+                 lies outside recorded range {floor}..{current}"
+            ));
+        }
+        let (slot_mapping, _, _) =
+            self.write_slot_mapping_array(first_logical_position, num_tokens)?;
+        Ok((slot_mapping, num_tokens))
+    }
+
+    /// Prebuild and validate the `int64` write slot mapping for a uniform 1-token batched decode
+    /// wave ONCE per KV group (reuses `ragged_inputs_cache`).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn build_batched_decode_slot_mapping(
+        &mut self,
+        planned_rows: &[(SeqId, u32)],
+    ) -> Result<(MxArray, u32), String> {
+        if planned_rows.is_empty() {
+            return Err("build_batched_decode_slot_mapping requires at least one row".to_string());
+        }
+        let rows: Vec<PagedRaggedRow> = planned_rows
+            .iter()
+            .map(|&(seq_id, first_logical_position)| PagedRaggedRow {
+                seq_id,
+                first_logical_position,
+                query_len: 1,
+            })
+            .collect();
+        self.ensure_ragged_inputs(&rows)?;
+        let cache = self
+            .meta
+            .ragged_inputs_cache
+            .as_ref()
+            .ok_or_else(|| "ragged_inputs_cache was just populated".to_string())?;
+        if let Some(slot) = cache.aliased_slot {
+            return Err(format!(
+                "batched decode KV write aliases physical slot {slot} across query rows"
+            ));
+        }
+        Ok((cache.slot_mapping.clone(), rows.len() as u32))
+    }
+
+    /// Return the current dependency-carrying pool arrays and layout mode for a fused native KV
+    /// write on `layer_idx`: `(k_pool, v_pool, k_scale, v_scale, kv_mode)` where
+    /// `kv_mode`: `0` = INT8-KTM, `1` = BF16 vLLM (x=8), `2` = BF16 values_token_major.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_fused_write_pool_arrays(
+        &mut self,
+        layer_idx: u32,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray, u32), String> {
+        let pool = self.native_pool_arrays_for_layer(layer_idx)?;
+        let kv_mode = match self.layer_kv_pool.cache_dtype() {
+            mlx_paged_attn::metal::MetalDtype::Int8 => {
+                if !self.layer_kv_pool.layout().keys_token_major
+                    || self.layer_kv_pool.layout().values_token_major
+                {
+                    return Err(
+                        "native_fused_write_pool_arrays: INT8 pool requires KTM layout".to_string(),
+                    );
+                }
+                0u32
+            }
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => {
+                if self.layer_kv_pool.layout().values_token_major {
+                    2u32
+                } else {
+                    1u32
+                }
+            }
+            other => {
+                return Err(format!(
+                    "native_fused_write_pool_arrays: unsupported cache dtype {other:?}"
+                ));
+            }
+        };
+        Ok((pool.key, pool.value, pool.k_scale, pool.v_scale, kv_mode))
+    }
+
+    /// Adopt the four dependency-carrying pool arrays produced by a fused native KV write kernel.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn commit_native_fused_write(
+        &mut self,
+        layer_idx: u32,
+        k_pool: MxArray,
+        v_pool: MxArray,
+        k_scale: MxArray,
+        v_scale: MxArray,
+    ) -> Result<(), String> {
+        let (k_scale, v_scale) = if self.layer_kv_pool.cache_dtype().scale_bytes() == 0 {
+            (
+                self.unit_kv_scale_array.clone(),
+                self.unit_kv_scale_array.clone(),
+            )
+        } else {
+            (k_scale, v_scale)
+        };
+        self.replace_native_pool_arrays(
+            layer_idx,
+            PoolLayerArrays {
+                key: k_pool,
+                value: v_pool,
+                k_scale,
+                v_scale,
+            },
+        )
+    }
+
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
     /// this on another platform is a programming error rather than a
     /// runtime fallback.
