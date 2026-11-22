@@ -2824,8 +2824,8 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
     let markov_fold_matmul_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(k_rep * n_draft);
         for _ in 0..k_rep {
-            for step in 0..n_draft {
-                let bias = step_latents[step]
+            for latent in step_latents.iter().take(n_draft) {
+                let bias = latent
                     .matmul(&head.fold_weight_t)
                     .expect("m")
                     .astype(DType::BFloat16)
@@ -2843,7 +2843,7 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
     let markov_softcap_argmax_ms = time_stage_ms(w, iters, || {
         let mut outs = Vec::with_capacity(k_rep * n_draft);
         for _ in 0..k_rep {
-            for step in 0..n_draft {
+            for (step, step_bias) in step_biases.iter().enumerate().take(n_draft) {
                 let s_i64 = step as i64;
                 let base_i = base_logits
                     .slice(&[s_i64, 0], &[s_i64 + 1, padded_vocab])
@@ -2851,7 +2851,7 @@ fn profile_dspark_propose(inner: &mut Inkling2Inner, ctx_prompt: &[u32]) -> Dspa
                 outs.push(
                     inkling2_lm_head_softcap_argmax(
                         &base_i,
-                        Some(&step_biases[step]),
+                        Some(step_bias),
                         unpadded_vocab as usize,
                         softcap as f32,
                         true,

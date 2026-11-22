@@ -1293,9 +1293,9 @@ pub fn nvfp4_repack_block(block: &[u8], words: &mut [u32; 8], scales: &mut [u8; 
         let sub = &qs[s * 8..(s + 1) * 8];
         let mut lo_word = 0u32;
         let mut hi_word = 0u32;
-        for j in 0..8 {
-            lo_word |= u32::from(sub[j] & 0x0F) << (j * 4);
-            hi_word |= u32::from(sub[j] >> 4) << (j * 4);
+        for (j, &byte) in sub.iter().enumerate() {
+            lo_word |= u32::from(byte & 0x0F) << (j * 4);
+            hi_word |= u32::from(byte >> 4) << (j * 4);
         }
         words[s * 2] = lo_word;
         words[s * 2 + 1] = hi_word;

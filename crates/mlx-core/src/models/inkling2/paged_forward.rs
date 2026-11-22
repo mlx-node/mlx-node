@@ -27,8 +27,8 @@ use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
+    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::hybrid_scheduler::ScheduledPrefillPass;
 use crate::engine::paged_epilogue::{FinalTokenPolicy, reconcile_paged_surplus};
@@ -43,8 +43,9 @@ use crate::models::qwen3_5::dflash2_state::store::StateClass;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::tools::inkling::{
-    CONTENT_MODEL_END_SAMPLING_ID, IMAGE_PAD_ID, Inkling2RenderOptions, InklingToolSpec,
-    count_inkling2_reasoning_tokens, parse_inkling2_output, parse_reasoning_effort,
+    CONTENT_MODEL_END_SAMPLING_ID, IMAGE_PAD_ID, Inkling2RenderOptions, InklingParserState,
+    InklingStreamParser, InklingToolSpec, count_inkling2_reasoning_tokens,
+    output_marker_for_token_id, parse_inkling2_output, parse_reasoning_effort,
     render_inkling2_chat_messages_to_ids,
 };
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
@@ -3068,6 +3069,196 @@ impl PagedPrefix for Inkling2PrefixState {
     }
 }
 
+/// Inkling2's [`StreamEmitter`]: routes committed token text through
+/// [`InklingStreamParser`] so reasoning deltas (`is_reasoning = true`, gated by
+/// `include_reasoning`) and visible content deltas (`is_reasoning = false`) are
+/// separated cleanly, while Inkling2 framing markers (`<|message_model|>`,
+/// `<|content_thinking|>`, `<|content_text|>`, `<|content_invoke_tool_json|>`,
+/// `<|end_message|>`, `<|content_model_end_sampling|>`), tool-name headers,
+/// and raw JSON tool-call payloads are never leaked into streamed chunks.
+pub(crate) struct Inkling2StreamEmitter {
+    parser: InklingStreamParser,
+    /// Latched from the turn's `include_reasoning` flag so [`Self::finish`]
+    /// applies the same suppression gate to any reasoning tail flushed at EOS.
+    include_reasoning: bool,
+}
+
+impl Inkling2StreamEmitter {
+    pub(crate) fn new() -> Self {
+        Self::with_initial_state(InklingParserState::MessageHeader)
+    }
+
+    pub(crate) fn with_initial_state(initial_state: InklingParserState) -> Self {
+        Self {
+            parser: InklingStreamParser::with_initial_state(initial_state),
+            include_reasoning: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_prompt_tokens(prompt_tokens: &[u32]) -> Self {
+        Self {
+            parser: InklingStreamParser::from_prompt_tokens(prompt_tokens),
+            include_reasoning: true,
+        }
+    }
+
+    fn emit_delta(text: String, is_reasoning: bool, sink: &dyn ChunkSink) {
+        if text.is_empty() {
+            return;
+        }
+        sink.send(Ok(ChatStreamChunk {
+            text,
+            done: false,
+            finish_reason: None,
+            tool_calls: None,
+            thinking: None,
+            thinking_enabled: None,
+            num_tokens: None,
+            prompt_tokens: None,
+            reasoning_tokens: None,
+            reasoning_close: None,
+            reasoning_cut_at: None,
+            reasoning_cycle_period: None,
+            reasoning_stray_closes: None,
+            raw_text: None,
+            public_raw_text: None,
+            text_authoritative: None,
+            cached_tokens: None,
+            performance: None,
+            is_reasoning: Some(is_reasoning),
+        }));
+    }
+
+    fn emit_deltas(
+        &self,
+        content_delta: String,
+        reasoning_delta: String,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        if include_reasoning && !reasoning_delta.is_empty() {
+            Self::emit_delta(reasoning_delta, true, sink);
+        }
+        if !content_delta.is_empty() {
+            Self::emit_delta(content_delta, false, sink);
+        }
+    }
+}
+
+impl StreamEmitter for Inkling2StreamEmitter {
+    fn on_token_id(
+        &mut self,
+        token_id: u32,
+        token_text: &str,
+        _is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.include_reasoning = include_reasoning;
+        if let Some(marker) = output_marker_for_token_id(token_id)
+            && !token_text.contains(marker)
+        {
+            if !token_text.is_empty() {
+                let (content, reasoning, _) = self.parser.push_text(token_text);
+                self.emit_deltas(content, reasoning, include_reasoning, sink);
+            }
+            let (content, reasoning, _) = self.parser.push_token(token_id, "");
+            self.emit_deltas(content, reasoning, include_reasoning, sink);
+            return;
+        }
+        if !token_text.is_empty() {
+            let (content, reasoning, _) = self.parser.push_text(token_text);
+            self.emit_deltas(content, reasoning, include_reasoning, sink);
+        }
+    }
+
+    fn on_token_text(
+        &mut self,
+        token_text: &str,
+        _is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.include_reasoning = include_reasoning;
+        if token_text.is_empty() {
+            return;
+        }
+        let (content, reasoning, _) = self.parser.push_text(token_text);
+        self.emit_deltas(content, reasoning, include_reasoning, sink);
+    }
+
+    fn on_residual(
+        &mut self,
+        residual: &str,
+        _is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.include_reasoning = include_reasoning;
+        if residual.is_empty() {
+            return;
+        }
+        let (content, reasoning, _) = self.parser.push_text(residual);
+        self.emit_deltas(content, reasoning, include_reasoning, sink);
+    }
+
+    fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink) {
+        let (content_tail, reasoning_tail, _) = self.parser.flush();
+        self.emit_deltas(content_tail, reasoning_tail, self.include_reasoning, sink);
+
+        sink.send(Ok(ChatStreamChunk {
+            text: result.text.clone(),
+            done: true,
+            finish_reason: Some(result.finish_reason.clone()),
+            tool_calls: Some(result.tool_calls.clone()),
+            thinking: result.thinking.clone(),
+            thinking_enabled: Some(result.thinking_enabled),
+            num_tokens: Some(result.num_tokens),
+            prompt_tokens: Some(result.prompt_tokens),
+            reasoning_tokens: Some(result.reasoning_tokens),
+            reasoning_close: result.reasoning_close.clone(),
+            reasoning_cut_at: result.reasoning_cut_at,
+            reasoning_cycle_period: result.reasoning_cycle_period,
+            reasoning_stray_closes: result.reasoning_stray_closes,
+            raw_text: Some(result.raw_text.clone()),
+            public_raw_text: result.public_raw_text.clone(),
+            text_authoritative: Some(true),
+            cached_tokens: Some(result.cached_tokens),
+            performance: result.performance.clone(),
+            is_reasoning: None,
+        }));
+    }
+}
+
+fn finalize_inkling2_turn(args: FinalizeArgs<'_>) -> Result<ChatResult> {
+    let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
+    let parsed = parse_inkling2_output(&raw_text);
+    let reasoning_tokens = count_inkling2_reasoning_tokens(args.generated_tokens) as u32;
+    Ok(ChatResult {
+        text: parsed.text,
+        tool_calls: parsed.tool_calls,
+        thinking: if args.include_reasoning {
+            parsed.thinking
+        } else {
+            None
+        },
+        thinking_enabled: args.thinking_enabled,
+        num_tokens: args.generated_tokens.len() as u32,
+        prompt_tokens: args.prompt_tokens,
+        reasoning_tokens,
+        reasoning_close: None,
+        reasoning_cut_at: None,
+        reasoning_cycle_period: None,
+        reasoning_stray_closes: None,
+        finish_reason: args.finish_reason.to_string(),
+        raw_text,
+        public_raw_text: None,
+        cached_tokens: 0,
+        performance: args.performance,
+    })
+}
+
 impl ChatBackend for Inkling2Inner {
     fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
         self.tokenizer
@@ -3246,31 +3437,7 @@ impl ChatBackend for Inkling2Inner {
     }
 
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
-        let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
-        let parsed = parse_inkling2_output(&raw_text);
-        let reasoning_tokens = count_inkling2_reasoning_tokens(args.generated_tokens) as u32;
-        Ok(ChatResult {
-            text: parsed.text,
-            tool_calls: parsed.tool_calls,
-            thinking: if args.include_reasoning {
-                parsed.thinking
-            } else {
-                None
-            },
-            thinking_enabled: args.thinking_enabled,
-            num_tokens: args.generated_tokens.len() as u32,
-            prompt_tokens: args.prompt_tokens,
-            reasoning_tokens,
-            reasoning_close: None,
-            reasoning_cut_at: None,
-            reasoning_cycle_period: None,
-            reasoning_stray_closes: None,
-            finish_reason: args.finish_reason.to_string(),
-            raw_text,
-            public_raw_text: None,
-            cached_tokens: 0,
-            performance: args.performance,
-        })
+        finalize_inkling2_turn(args)
     }
 
     fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
@@ -3317,6 +3484,10 @@ impl ChatBackend for Inkling2Inner {
 
     fn stream_skip_special_tokens(&self) -> bool {
         false
+    }
+
+    fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
+        Box::new(Inkling2StreamEmitter::new())
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -3410,7 +3581,7 @@ impl ChatBackend for Inkling2Inner {
                     self,
                     args.tokenizer.inner(),
                     args.thinking.enabled,
-                    false,
+                    self.stream_skip_special_tokens(),
                 )
             });
             let mut generated_tokens: Vec<u32> = Vec::new();
@@ -3534,6 +3705,16 @@ impl ChatBackend for Inkling2Inner {
                     .extend_from_slice(&generated_tokens);
             }
 
+            if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+                let full_text = args
+                    .tokenizer
+                    .decode_sync(&generated_tokens, self.stream_skip_special_tokens())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to decode generated tokens: {}", e);
+                        String::new()
+                    });
+                ts.flush_residual(&full_text, args.params.include_reasoning, sink);
+            }
             let performance = crate::engine::finalize::compute_performance_metrics(
                 gen_start,
                 first_token_instant,
@@ -3553,28 +3734,8 @@ impl ChatBackend for Inkling2Inner {
                 performance,
                 reasoning: reasoning_tracker.outcome(),
             })?;
-            if let Some(sink) = args.sink {
-                sink.send(Ok(ChatStreamChunk {
-                    text: String::new(),
-                    done: true,
-                    finish_reason: Some(result.finish_reason.clone()),
-                    tool_calls: Some(result.tool_calls.clone()),
-                    thinking: result.thinking.clone(),
-                    thinking_enabled: Some(result.thinking_enabled),
-                    num_tokens: Some(result.num_tokens),
-                    prompt_tokens: Some(result.prompt_tokens),
-                    reasoning_tokens: Some(result.reasoning_tokens),
-                    reasoning_close: result.reasoning_close.clone(),
-                    reasoning_cut_at: result.reasoning_cut_at,
-                    reasoning_cycle_period: result.reasoning_cycle_period,
-                    reasoning_stray_closes: result.reasoning_stray_closes,
-                    raw_text: Some(result.raw_text.clone()),
-                    public_raw_text: result.public_raw_text.clone(),
-                    text_authoritative: None,
-                    is_reasoning: None,
-                    performance: result.performance.clone(),
-                    cached_tokens: Some(0),
-                }));
+            if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+                ts.emitter.finish(&result, sink);
                 Ok(TurnOutput::Streamed)
             } else {
                 Ok(TurnOutput::Complete(Box::new(result)))
@@ -4218,6 +4379,536 @@ mod tests {
                 "[VERIFY {} rows] matched AR continuation and rolled back cleanly!",
                 verify_toks.len()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_emitter_tests {
+    use std::cell::RefCell;
+
+    use serde_json::json;
+    use tokenizers::{AddedToken, Tokenizer};
+
+    use super::{Inkling2StreamEmitter, finalize_inkling2_turn};
+    use crate::engine::backend::{ChunkSink, FinalizeArgs, StreamEmitter};
+    use crate::engine::penalties::ReasoningOutcome;
+    use crate::engine::types::{ChatResult, ChatStreamChunk};
+    use crate::tokenizer::Qwen3Tokenizer;
+    use crate::tools::inkling::{
+        CONTENT_INVOKE_TOOL_JSON, CONTENT_INVOKE_TOOL_JSON_ID, CONTENT_MODEL_END_SAMPLING,
+        CONTENT_MODEL_END_SAMPLING_ID, CONTENT_TEXT, CONTENT_TEXT_ID, CONTENT_THINKING,
+        CONTENT_THINKING_ID, END_MESSAGE, END_MESSAGE_ID, INKLING2_CONTROL_TOKENS,
+        InklingParserState, MESSAGE_MODEL, MESSAGE_MODEL_ID, MESSAGE_USER_ID,
+        parse_inkling2_output, parse_inkling2_output_with_state,
+    };
+
+    #[derive(Default)]
+    struct VecSink {
+        chunks: RefCell<Vec<ChatStreamChunk>>,
+    }
+
+    impl VecSink {
+        fn chunks(&self) -> Vec<ChatStreamChunk> {
+            self.chunks.borrow().clone()
+        }
+    }
+
+    impl ChunkSink for VecSink {
+        fn send(&self, chunk: napi::bindgen_prelude::Result<ChatStreamChunk>) {
+            self.chunks
+                .borrow_mut()
+                .push(chunk.expect("stream chunk should be Ok"));
+        }
+    }
+
+    fn build_test_tokenizer() -> Qwen3Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, ch) in (32u8..=126u8).enumerate() {
+            vocab.insert((ch as char).to_string(), json!(i));
+        }
+        vocab.insert("\n".to_string(), json!(95));
+        let tokenizer_json = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": { "Regex": "." },
+                "behavior": "Isolated",
+                "invert": false
+            },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": vocab,
+                "unk_token": "?"
+            }
+        });
+        let mut tok = Tokenizer::from_bytes(tokenizer_json.to_string().as_bytes())
+            .expect("build WordLevel tokenizer");
+        let added: Vec<AddedToken> = INKLING2_CONTROL_TOKENS
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+        tok.add_special_tokens(added)
+            .expect("register Inkling2 special tokens");
+        Qwen3Tokenizer::from_tokenizer(tok, None).expect("wrap Qwen3Tokenizer")
+    }
+
+    fn make_final_result(raw_text: &str, include_reasoning: bool) -> ChatResult {
+        let parsed = parse_inkling2_output(raw_text);
+        ChatResult {
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: if include_reasoning {
+                parsed.thinking
+            } else {
+                None
+            },
+            thinking_enabled: false,
+            num_tokens: 10,
+            prompt_tokens: 5,
+            reasoning_tokens: 0,
+            reasoning_close: None,
+            reasoning_cut_at: None,
+            reasoning_cycle_period: None,
+            reasoning_stray_closes: None,
+            finish_reason: "stop".to_string(),
+            raw_text: raw_text.to_string(),
+            public_raw_text: None,
+            cached_tokens: 0,
+            performance: None,
+        }
+    }
+
+    fn collect_streamed(chunks: &[ChatStreamChunk]) -> (String, String, &ChatStreamChunk) {
+        let (done_chunk, deltas) = chunks.split_last().expect("expected terminal chunk");
+        assert!(done_chunk.done, "last chunk must be done: true");
+        assert_eq!(done_chunk.is_reasoning, None);
+        assert_eq!(done_chunk.text_authoritative, Some(true));
+
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for c in deltas {
+            assert!(!c.done, "non-terminal chunk must have done: false");
+            assert!(
+                !c.text.is_empty(),
+                "emitter must not send empty delta chunks"
+            );
+            match c.is_reasoning {
+                Some(true) => reasoning.push_str(&c.text),
+                Some(false) => content.push_str(&c.text),
+                None => panic!("delta chunk must tag is_reasoning"),
+            }
+        }
+        (reasoning, content, done_chunk)
+    }
+
+    fn assert_no_protocol_leaks(text: &str) {
+        for marker in INKLING2_CONTROL_TOKENS {
+            assert!(
+                !text.contains(marker),
+                "leaked Inkling2 marker {marker:?} in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_and_answer_respects_include_reasoning_flag() {
+        let raw = concat!(
+            "<|message_model|><|content_thinking|>Let me add 2 + 2 = 4.<|end_message|>",
+            "<|message_model|><|content_text|>The answer is 4.<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+        let pieces = [
+            MESSAGE_MODEL,
+            CONTENT_THINKING,
+            "Let me add ",
+            "2 + 2 = 4.",
+            END_MESSAGE,
+            MESSAGE_MODEL,
+            CONTENT_TEXT,
+            "The answer ",
+            "is 4.",
+            END_MESSAGE,
+            CONTENT_MODEL_END_SAMPLING,
+        ];
+
+        // include_reasoning = true: thinking arrives tagged is_reasoning=true, answer as false
+        let sink_with = VecSink::default();
+        let mut emitter_with = Inkling2StreamEmitter::new();
+        for piece in pieces {
+            // Note: engine passes is_reasoning=false because ThinkingPolicy::None
+            emitter_with.on_token_text(piece, false, true, &sink_with);
+        }
+        let result_with = make_final_result(raw, true);
+        emitter_with.finish(&result_with, &sink_with);
+
+        let chunks_with = sink_with.chunks();
+        let (reasoning_with, content_with, done_with) = collect_streamed(&chunks_with);
+        assert_eq!(reasoning_with, "Let me add 2 + 2 = 4.");
+        assert_eq!(content_with, "The answer is 4.");
+        assert_eq!(done_with.text, result_with.text);
+        assert_eq!(
+            done_with.thinking,
+            Some("Let me add 2 + 2 = 4.".to_string())
+        );
+        assert_no_protocol_leaks(&reasoning_with);
+        assert_no_protocol_leaks(&content_with);
+
+        // include_reasoning = false: zero reasoning deltas emitted, answer still streams cleanly
+        let sink_without = VecSink::default();
+        let mut emitter_without = Inkling2StreamEmitter::new();
+        for piece in pieces {
+            emitter_without.on_token_text(piece, false, false, &sink_without);
+        }
+        let result_without = make_final_result(raw, false);
+        emitter_without.finish(&result_without, &sink_without);
+
+        let chunks_without = sink_without.chunks();
+        let (reasoning_without, content_without, done_without) = collect_streamed(&chunks_without);
+        assert!(
+            reasoning_without.is_empty(),
+            "include_reasoning=false must emit zero reasoning deltas, got {reasoning_without:?}"
+        );
+        assert_eq!(content_without, "The answer is 4.");
+        assert_eq!(done_without.text, result_without.text);
+        assert_eq!(done_without.thinking, None);
+        assert_no_protocol_leaks(&content_without);
+    }
+
+    #[test]
+    fn tool_calls_thinking_and_text_never_leak_markers_headers_or_json() {
+        let raw = concat!(
+            "<|message_model|><|content_thinking|>Need SF weather.<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            r#"{"name":"get_weather","args":{"city":"SF"}}"#,
+            "<|end_message|>",
+            "<|message_model|><|content_text|>Checking SF weather now.<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+        let pieces = [
+            MESSAGE_MODEL,
+            CONTENT_THINKING,
+            "Need SF ",
+            "weather.",
+            END_MESSAGE,
+            MESSAGE_MODEL,
+            "get_",
+            "weather",
+            CONTENT_INVOKE_TOOL_JSON,
+            r#"{"name":"get_weather","#,
+            r#""args":{"city":"SF"}}"#,
+            END_MESSAGE,
+            MESSAGE_MODEL,
+            CONTENT_TEXT,
+            "Checking SF ",
+            "weather now.",
+            END_MESSAGE,
+            CONTENT_MODEL_END_SAMPLING,
+        ];
+
+        for include_reasoning in [true, false] {
+            let sink = VecSink::default();
+            let mut emitter = Inkling2StreamEmitter::new();
+            for piece in pieces {
+                emitter.on_token_text(piece, false, include_reasoning, &sink);
+            }
+            let result = make_final_result(raw, include_reasoning);
+            emitter.finish(&result, &sink);
+
+            let chunks = sink.chunks();
+            let (reasoning, content, done) = collect_streamed(&chunks);
+            if include_reasoning {
+                assert_eq!(reasoning, "Need SF weather.");
+            } else {
+                assert!(reasoning.is_empty());
+            }
+            assert_eq!(content, "Checking SF weather now.");
+            assert!(!content.contains("get_weather"));
+            assert!(!content.contains(r#""args""#));
+            assert_no_protocol_leaks(&reasoning);
+            assert_no_protocol_leaks(&content);
+
+            let tool_calls = done.tool_calls.as_ref().expect("terminal tool_calls");
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].status, "ok");
+            assert_eq!(tool_calls[0].name, "get_weather");
+            assert_eq!(tool_calls[0].arguments, json!({"city": "SF"}));
+        }
+    }
+
+    #[test]
+    fn partial_protocol_tags_split_across_chunks_never_leak() {
+        let raw = concat!(
+            "<|message_model|><|content_thinking|>Compare a <| b.<|end_message|>",
+            "<|message_model|>lookup<|content_invoke_tool_json|>",
+            r#"{"name":"lookup","args":{"q":"<|not_a_tag|>"}}"#,
+            "<|end_message|>",
+            "<|message_model|><|content_text|>Result: x <| y.<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+
+        let expected = parse_inkling2_output(raw);
+        for chunk_size in [1usize, 2, 3, 5, 7, 13] {
+            for include_reasoning in [true, false] {
+                let sink = VecSink::default();
+                let mut emitter = Inkling2StreamEmitter::new();
+                let bytes = raw.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    let end = (i + chunk_size).min(bytes.len());
+                    let piece = std::str::from_utf8(&bytes[i..end]).expect("ascii test input");
+                    emitter.on_token_text(piece, false, include_reasoning, &sink);
+                    i = end;
+                }
+                let result = make_final_result(raw, include_reasoning);
+                emitter.finish(&result, &sink);
+
+                let chunks = sink.chunks();
+                let (reasoning, content, done) = collect_streamed(&chunks);
+                if include_reasoning {
+                    assert_eq!(
+                        Some(reasoning),
+                        expected.thinking,
+                        "chunk_size={chunk_size}"
+                    );
+                } else {
+                    assert!(reasoning.is_empty(), "chunk_size={chunk_size}");
+                }
+                assert_eq!(content, expected.text, "chunk_size={chunk_size}");
+                assert_no_protocol_leaks(&content);
+                assert!(!content.contains("lookup"), "chunk_size={chunk_size}");
+                assert!(!content.contains("not_a_tag"), "chunk_size={chunk_size}");
+                assert_eq!(
+                    done.tool_calls.as_ref().expect("tool_calls").len(),
+                    expected.tool_calls.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn residual_and_finish_flush_buffered_tails_with_reasoning_gate() {
+        // Case 1: truncated reasoning ending with a partial marker prefix `<|end`
+        let truncated_reasoning = "<|message_model|><|content_thinking|>Still thinking<|end";
+        for include_reasoning in [true, false] {
+            let sink = VecSink::default();
+            let mut emitter = Inkling2StreamEmitter::new();
+            emitter.on_token_text(
+                "<|message_model|><|content_thinking|>Still ",
+                false,
+                include_reasoning,
+                &sink,
+            );
+            emitter.on_residual("thinking<|end", false, include_reasoning, &sink);
+            let result = make_final_result(truncated_reasoning, include_reasoning);
+            emitter.finish(&result, &sink);
+
+            let chunks = sink.chunks();
+            let (reasoning, content, done) = collect_streamed(&chunks);
+            if include_reasoning {
+                assert_eq!(reasoning, "Still thinking<|end");
+                assert_eq!(done.thinking.as_deref(), Some("Still thinking<|end"));
+            } else {
+                assert!(
+                    reasoning.is_empty(),
+                    "finish() flush must still honor include_reasoning=false"
+                );
+                assert_eq!(done.thinking, None);
+            }
+            assert!(content.is_empty());
+        }
+
+        // Case 2: truncated content ending with a partial marker prefix `<|content`
+        let truncated_content = "<|message_model|><|content_text|>Visible tail<|content";
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::new();
+        emitter.on_token_text(
+            "<|message_model|><|content_text|>Visible ",
+            false,
+            false,
+            &sink,
+        );
+        emitter.on_residual("tail<|content", false, false, &sink);
+        let result = make_final_result(truncated_content, false);
+        emitter.finish(&result, &sink);
+
+        let chunks = sink.chunks();
+        let (reasoning, content, done) = collect_streamed(&chunks);
+        assert!(reasoning.is_empty());
+        assert_eq!(content, "Visible tail<|content");
+        assert_eq!(done.text, "Visible tail<|content");
+    }
+
+    #[test]
+    fn continue_final_message_initial_state_matches_parser() {
+        let prompt_ids = [
+            MESSAGE_USER_ID,
+            42,
+            END_MESSAGE_ID,
+            MESSAGE_MODEL_ID,
+            CONTENT_TEXT_ID,
+            99,
+        ];
+        let continuation = " is 42.<|end_message|><|content_model_end_sampling|>";
+        let expected = parse_inkling2_output_with_state(continuation, InklingParserState::Content);
+
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::from_prompt_tokens(&prompt_ids);
+        emitter.on_token_text(" is ", false, false, &sink);
+        emitter.on_token_text("42.<|end_message|>", false, false, &sink);
+        emitter.on_token_text(CONTENT_MODEL_END_SAMPLING, false, false, &sink);
+        let mut result = make_final_result("", false);
+        result.text = expected.text.clone();
+        emitter.finish(&result, &sink);
+
+        let chunks = sink.chunks();
+        let (reasoning, content, done) = collect_streamed(&chunks);
+        assert!(reasoning.is_empty());
+        assert_eq!(content, " is 42.");
+        assert_eq!(content, expected.text);
+        assert_eq!(done.text, expected.text);
+    }
+
+    #[test]
+    fn on_token_id_handles_empty_marker_text_and_flushed_prefix() {
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::new();
+        // Simulate skip_special_tokens=true / empty marker text AND a flushed prefix
+        emitter.on_token_id(MESSAGE_MODEL_ID, "", false, true, &sink);
+        emitter.on_token_id(CONTENT_THINKING_ID, "", false, true, &sink);
+        emitter.on_token_id(10, "plan ", false, true, &sink);
+        // Flushed trailing text from previous token arrives on END_MESSAGE_ID without marker text
+        emitter.on_token_id(END_MESSAGE_ID, "done", false, true, &sink);
+        emitter.on_token_id(MESSAGE_MODEL_ID, "", false, true, &sink);
+        emitter.on_token_id(11, "get_weather", false, true, &sink);
+        emitter.on_token_id(CONTENT_INVOKE_TOOL_JSON_ID, "", false, true, &sink);
+        emitter.on_token_id(
+            12,
+            r#"{"name":"get_weather","args":{}}"#,
+            false,
+            true,
+            &sink,
+        );
+        emitter.on_token_id(END_MESSAGE_ID, "", false, true, &sink);
+        emitter.on_token_id(MESSAGE_MODEL_ID, "", false, true, &sink);
+        emitter.on_token_id(CONTENT_TEXT_ID, "", false, true, &sink);
+        emitter.on_token_id(13, "Answer", false, true, &sink);
+        emitter.on_token_id(END_MESSAGE_ID, "!", false, true, &sink);
+        emitter.on_token_id(CONTENT_MODEL_END_SAMPLING_ID, "", false, true, &sink);
+
+        let raw = concat!(
+            "<|message_model|><|content_thinking|>plan done<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            r#"{"name":"get_weather","args":{}}"#,
+            "<|end_message|>",
+            "<|message_model|><|content_text|>Answer!<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+        let result = make_final_result(raw, true);
+        emitter.finish(&result, &sink);
+
+        let chunks = sink.chunks();
+        let (reasoning, content, _) = collect_streamed(&chunks);
+        assert_eq!(reasoning, "plan done");
+        assert_eq!(content, "Answer!");
+        assert!(!content.contains("get_weather"));
+    }
+
+    #[test]
+    fn streamed_deltas_match_finalize_turn_with_real_decode_stream() {
+        let tokenizer = build_test_tokenizer();
+        let raw_output = concat!(
+            "<|message_model|><|content_thinking|>Step 1: check city.<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            r#"{"name":"get_weather","args":{"city":"Tokyo"}}"#,
+            "<|end_message|>",
+            "<|message_model|><|content_text|>Calling weather tool.<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+        let generated_tokens = tokenizer
+            .inner()
+            .encode(raw_output, false)
+            .expect("encode test output")
+            .get_ids()
+            .to_vec();
+
+        for include_reasoning in [true, false] {
+            let sink = VecSink::default();
+            let mut emitter = Inkling2StreamEmitter::new();
+            let mut decode_stream = tokenizer.inner().decode_stream(false);
+            let mut streamed_text_len = 0usize;
+            let mut prefix_tokens = Vec::with_capacity(generated_tokens.len());
+
+            for &tid in &generated_tokens {
+                prefix_tokens.push(tid);
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    tid,
+                    &prefix_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+                emitter.on_token_id(tid, &token_text, false, include_reasoning, &sink);
+            }
+
+            let full_text = tokenizer
+                .decode_sync(&generated_tokens, false)
+                .expect("decode_sync");
+            if full_text.len() > streamed_text_len {
+                emitter.on_residual(
+                    &full_text[streamed_text_len..],
+                    false,
+                    include_reasoning,
+                    &sink,
+                );
+            }
+
+            let finalized = finalize_inkling2_turn(FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &generated_tokens,
+                finish_reason: "stop".to_string(),
+                think_end_id: None,
+                think_end_str: None,
+                think_end_extra_ids: &[],
+                performance: None,
+                include_reasoning,
+                thinking_enabled: false,
+                prompt_tokens: 12,
+                reasoning: ReasoningOutcome::default(),
+            })
+            .expect("finalize_inkling2_turn");
+
+            emitter.finish(&finalized, &sink);
+
+            let chunks = sink.chunks();
+            let (streamed_reasoning, streamed_content, done) = collect_streamed(&chunks);
+            assert_eq!(streamed_content, finalized.text);
+            assert_eq!(done.text, finalized.text);
+            assert_eq!(done.thinking, finalized.thinking);
+            let done_calls = done.tool_calls.as_deref().expect("terminal tool_calls");
+            assert_eq!(done_calls.len(), finalized.tool_calls.len());
+            for (got, want) in done_calls.iter().zip(finalized.tool_calls.iter()) {
+                assert_eq!(got.status, want.status);
+                assert_eq!(got.name, want.name);
+                assert_eq!(got.arguments, want.arguments);
+                assert_eq!(got.raw_content, want.raw_content);
+            }
+            if include_reasoning {
+                assert_eq!(Some(streamed_reasoning), finalized.thinking);
+            } else {
+                assert!(streamed_reasoning.is_empty());
+                assert_eq!(finalized.thinking, None);
+            }
+            assert_no_protocol_leaks(&streamed_content);
+            assert!(!streamed_content.contains("get_weather"));
+            assert!(!streamed_content.contains("Tokyo"));
         }
     }
 }

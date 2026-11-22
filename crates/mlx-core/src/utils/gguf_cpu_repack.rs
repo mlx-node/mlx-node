@@ -553,7 +553,7 @@ mod tests {
             raw * 0.5
         }
         let mut out = vec![0.0f32; rows * k];
-        for (bi, block) in blocks.chunks_exact(36).enumerate() {
+        for (bi, block) in blocks.as_chunks::<36>().0.iter().enumerate() {
             let base = bi * 64;
             for s in 0..4 {
                 let d = ue4m3_to_f32(block[s]);
@@ -577,7 +577,7 @@ mod tests {
         let mut blocks = random_bytes(rows * row_bytes, 40);
         // Clamp UE4M3 scales into the valid unsigned finite domain 0x00..=0x7E
         // (matching `ggml_fp32_to_ue4m3`), so neither GGML nor MLX sees NaN/signed scales.
-        for block in blocks.chunks_exact_mut(36) {
+        for block in blocks.as_chunks_mut::<36>().0 {
             for d in &mut block[0..4] {
                 *d &= 0x7F;
                 if *d == 0x7F {

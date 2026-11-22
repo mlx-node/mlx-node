@@ -2095,8 +2095,8 @@ mod tests {
             let mut cpu_ref = vec![0.0_f32; q * t * d];
             for tok in 0..t {
                 let mut v_norm = Vec::with_capacity(k);
-                for si in 0..k {
-                    let row_s = &src_f64[si][tok * d..(tok + 1) * d];
+                for src in src_f64.iter().take(k) {
+                    let row_s = &src[tok * d..(tok + 1) * d];
                     let ms: f64 = row_s.iter().map(|x| x * x).sum::<f64>() / (d as f64);
                     let ir = 1.0 / (ms + f64::from(ATTN_RES_EPS)).sqrt();
                     v_norm.push(row_s.iter().map(|&x| x * ir).collect::<Vec<f64>>());

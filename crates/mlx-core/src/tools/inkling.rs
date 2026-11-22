@@ -1772,7 +1772,7 @@ pub fn count_inkling2_reasoning_tokens(token_ids: &[u32]) -> usize {
 // Internal parser helpers
 // ---------------------------------------------------------------------------
 
-fn output_marker_for_token_id(token_id: u32) -> Option<&'static str> {
+pub(crate) fn output_marker_for_token_id(token_id: u32) -> Option<&'static str> {
     match token_id {
         MESSAGE_MODEL_ID => Some(MESSAGE_MODEL),
         CONTENT_TEXT_ID => Some(CONTENT_TEXT),

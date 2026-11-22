@@ -616,7 +616,7 @@ mod tests {
         let t = 2usize;
         let s0_v = vec![1.0_f32, 2.0, -1.0, 0.5, 0.2, -0.3, 0.4, 0.8];
         let s1_v = vec![-0.5_f32, 0.5, 1.5, -1.0, 1.0, 1.0, -0.5, 0.2];
-        let q_raw = vec![0.3_f32, -0.4, 0.2, 0.5];
+        let q_raw = [0.3_f32, -0.4, 0.2, 0.5];
         let scale = 1.0_f32 / (d as f32).sqrt();
         let q_scaled: Vec<f32> = q_raw.iter().map(|v| v * scale).collect();
 
