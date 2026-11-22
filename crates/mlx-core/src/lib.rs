@@ -29,6 +29,7 @@ pub mod dataset;
 pub mod decode_profiler;
 pub(crate) mod disk_tier;
 pub mod engine;
+pub mod grammar;
 pub mod grpo;
 pub(crate) mod inference_trace;
 pub(crate) mod kernels;

@@ -172,6 +172,22 @@ function notifyEdge(): void {
   }
 }
 
+/** Notify the runtime sampler of a non-chat turn edge (e.g. System One). */
+export function notifyTurnEdge(): void {
+  notifyEdge();
+}
+
+/** Credit a non-chat turn (e.g. System One) to the process-wide turn counters and nudge the sampler. */
+export function recordExternalTurn(outcome: 'ok' | 'error' | 'cancelled', outputTokens = 0): void {
+  if (outcome === 'ok') COUNTERS.ok += 1;
+  else if (outcome === 'cancelled') COUNTERS.cancelled += 1;
+  else COUNTERS.error += 1;
+  if (typeof outputTokens === 'number' && Number.isFinite(outputTokens) && outputTokens > 0) {
+    COUNTERS.outputTokens += Math.floor(outputTokens);
+  }
+  notifyEdge();
+}
+
 /** One turn of this model in native flight. */
 export interface LiveTurn {
   traceId: string;

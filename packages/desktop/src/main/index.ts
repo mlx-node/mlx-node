@@ -532,6 +532,7 @@ async function bootstrap(): Promise<void> {
         const scan = (async () => {
           const modelsDir = await resolveModelsDirAsync(settings.modelsDir ?? undefined);
           return discoverLocalChatModels(modelsDir, {
+            includeDecisions: true,
             onEntryFailure: () => {
               incomplete = true;
             },

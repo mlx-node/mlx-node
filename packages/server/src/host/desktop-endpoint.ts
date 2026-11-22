@@ -13,18 +13,20 @@ export interface DesktopEndpoint {
   models: DesktopEndpointModel[];
 }
 
-/** A served chat model: its id, its path, and the base and build the app's model picker groups by. */
+/** A served model: its id, its path, and the base and build the app's model picker groups by. */
 export interface DesktopEndpointModel {
   name: string;
   path: string;
   base: string;
   variant: string;
   format: 'gguf' | 'mlx';
+  modelType?: string;
+  kind?: 'chat' | 'decision';
 }
 
 function validModel(model: unknown): boolean {
   if (typeof model !== 'object' || model === null) return false;
-  const { name, path, base, variant, format } = model as Record<string, unknown>;
+  const { name, path, base, variant, format, modelType, kind } = model as Record<string, unknown>;
   return (
     typeof name === 'string' &&
     typeof path === 'string' &&
@@ -33,7 +35,9 @@ function validModel(model: unknown): boolean {
     base !== '' &&
     typeof variant === 'string' &&
     variant !== '' &&
-    (format === 'gguf' || format === 'mlx')
+    (format === 'gguf' || format === 'mlx') &&
+    (modelType === undefined || (typeof modelType === 'string' && modelType !== '')) &&
+    (kind === undefined || kind === 'chat' || kind === 'decision')
   );
 }
 

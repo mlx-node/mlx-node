@@ -188,7 +188,7 @@ export function AppShell(): ReactElement {
   const hotkeys = useMemo<Hotkey[]>(
     () => [
       { key: 'k', meta: true, allowInInput: true, run: () => setPaletteOpen((open) => !open) },
-      ...NAV_ROUTES.map((route, index) => ({
+      ...NAV_ROUTES.slice(0, 9).map((route, index) => ({
         key: String(index + 1),
         meta: true,
         allowInInput: true,

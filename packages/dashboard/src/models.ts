@@ -516,14 +516,46 @@ export function isSafeRelPath(p: string): boolean {
   return true;
 }
 
+function hasClairicSidecars(modelDir: string): boolean {
+  return (
+    isRegularFile(join(modelDir, 'clair_head_config.json')) && isRegularFile(join(modelDir, 'clair_head.safetensors'))
+  );
+}
+
+function hasClefSidecars(modelDir: string): boolean {
+  return (
+    isRegularFile(join(modelDir, 'joint_head_config.json')) && isRegularFile(join(modelDir, 'joint_head.safetensors'))
+  );
+}
+
+/** Whether `dir` holds a target `.gguf` paired with Clairic head sidecars (valid without `config.json`). */
+function isClairicGgufDir(dir: string): boolean {
+  if (!hasClairicSidecars(dir)) return false;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return false;
+  }
+  return entries.some(
+    (name) => name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(name) && isRegularFile(join(dir, name)),
+  );
+}
+
 /**
- * Family label from `config.json` via the registry's `matchFamily`. A viewer
- * must label, never throw, so the shapes the loader fails closed on fall back
- * to the raw `model_type` (or `qwen3` when it is not a string).
+ * Family label from `config.json` via the registry's `matchFamily`, refined by
+ * Qwen3.5 Clairic / CLEF head sidecars. A viewer must label, never throw, so
+ * the shapes the loader fails closed on fall back to the raw `model_type`
+ * (or `qwen3` when it is not a string).
  */
 function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>): string {
   try {
-    return matchFamily(modelDir, config);
+    const family = matchFamily(modelDir, config);
+    if (family === 'qwen3_5') {
+      if (hasClairicSidecars(modelDir)) return 'clairic';
+      if (hasClefSidecars(modelDir)) return 'clef';
+    }
+    return family;
   } catch {
     return typeof config.model_type === 'string' ? config.model_type : 'qwen3';
   }
@@ -792,7 +824,11 @@ function readCheckpointConfig(dir: string): { config: Record<string, unknown> } 
  * name does not start with `.`, carrying a `config.json` that is a readable regular file with a JSON object root.
  */
 function isListedEntry(path: string, kind: Pick<Dirent, 'isDirectory' | 'isSymbolicLink'>): boolean {
-  return !basename(path).startsWith('.') && isUsableDir(path, kind) && 'config' in readCheckpointConfig(path);
+  return (
+    !basename(path).startsWith('.') &&
+    isUsableDir(path, kind) &&
+    ('config' in readCheckpointConfig(path) || isClairicGgufDir(path))
+  );
 }
 
 /**
@@ -832,6 +868,24 @@ export function discoverLocalModels(
     if (entry.name.startsWith('.')) continue;
     const read = readCheckpointConfig(full);
     if ('problem' in read) {
+      if (isClairicGgufDir(full)) {
+        const { sizeBytes, fileCount, truncated } =
+          options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
+        if (truncated) {
+          warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
+        }
+        models.push({
+          name: entry.name,
+          path: full,
+          modelType: 'clairic',
+          quant: null,
+          contextWindow: null,
+          sizeBytes,
+          fileCount,
+          servedIds: [],
+        });
+        continue;
+      }
       warnings.push(`${entry.name}: ${read.problem}; skipped`);
       continue;
     }
@@ -1026,7 +1080,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
     // A linked-in checkpoint is deletable like a real one — but only the LINK
     // is removed, never the foreign target it names. The checkpoint gate below
     // still applies through the link, so a link to a non-checkpoint is refused.
-    if (!existsSync(join(target, 'config.json'))) {
+    if (!existsSync(join(target, 'config.json')) && !isClairicGgufDir(target)) {
       throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
     }
     // Non-recursive `rmSync` unlinks a symlink — it never descends into the
@@ -1035,7 +1089,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
     return;
   }
   // Only delete a real checkpoint directory — a model or companion (a dir
-  // carrying a `config.json`). The route takes an arbitrary name, so without
+  // carrying a `config.json`, or a GGUF Clairic dir with head sidecars). The route takes an arbitrary name, so without
   // this a typo or hand-crafted request could `rmSync` an unrelated regular file
   // or non-model directory that merely happens to sit under `modelsDir`.
   //
@@ -1043,7 +1097,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   // this is the guard on the only route that can CLEAR a malformed checkpoint,
   // so a `config.json` that is a directory must still be deletable. Tightening
   // it here would make the wreckage those checks now report permanent.
-  if (!stat.isDirectory() || !existsSync(join(target, 'config.json'))) {
+  if (!stat.isDirectory() || (!existsSync(join(target, 'config.json')) && !isClairicGgufDir(target))) {
     throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
   }
   rmSync(target, { recursive: true, force: true });

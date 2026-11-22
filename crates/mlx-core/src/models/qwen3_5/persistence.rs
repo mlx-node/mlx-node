@@ -285,6 +285,7 @@ fn apply_sanitized_value_transforms(
     result: &mut HashMap<String, MxArray>,
     needs_norm_fix: bool,
     mtp_norms_need_shift: bool,
+    preserve_fp32_norms: bool,
 ) -> Result<()> {
     for (name, value) in result.iter_mut() {
         // `mtp.*` keys bypass the LM-body `will_shift` path. MTP norms
@@ -333,8 +334,13 @@ fn apply_sanitized_value_transforms(
             None
         };
         if will_shift && value.ndim()? == 1 {
-            let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
-            *value = value.add(&one)?;
+            if preserve_fp32_norms {
+                let one = MxArray::scalar_float(1.0)?;
+                *value = value.astype(DType::Float32)?.add(&one)?;
+            } else {
+                let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
+                *value = value.add(&one)?;
+            }
         }
         // Independent MTP-norm correction (see `mtp_norms_need_shift`).
         // Mutually exclusive with `will_shift`, which requires `!is_mtp_weight`.
@@ -431,6 +437,7 @@ fn sanitize_weights(
     config: &Qwen3_5Config,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     preserve_split_projections: bool,
+    preserve_fp32_norms: bool,
 ) -> Result<HashMap<String, MxArray>> {
     let has_mtp_weights = params.keys().any(|k| k.contains("mtp."));
     let has_unsanitized_conv1d = params.iter().any(|(name, array)| {
@@ -539,7 +546,12 @@ fn sanitize_weights(
         },
     )?;
 
-    apply_sanitized_value_transforms(&mut result, needs_norm_fix, mtp_norms_need_shift)?;
+    apply_sanitized_value_transforms(
+        &mut result,
+        needs_norm_fix,
+        mtp_norms_need_shift,
+        preserve_fp32_norms,
+    )?;
 
     if !preserve_split_projections {
         merge_split_projections(&mut result, per_layer_quant)?;
@@ -1692,6 +1704,7 @@ fn apply_weights_inner(
         prism,
         None,
         None,
+        false,
     )
     .map(drop)
 }
@@ -1787,6 +1800,9 @@ fn apply_weights_inner_with_residency(
     // Streaming GGUF residency is already reflected in params and its byte
     // count. Carry its rotations into installation without requantizing again.
     prepared_clef: Option<ClefTransforms>,
+    // Preserve Float32 RMSNorm weights and enable `PreciseF32` evaluation
+    // (Clairic checkpoints match `mlx_engine.py::PreciseRMSNorm`).
+    preserve_fp32_norms: bool,
 ) -> Result<(PlainFp8Residency, i64)> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1803,6 +1819,11 @@ fn apply_weights_inner_with_residency(
     // Sidecar params (norm/conv f32 tensors) fold down to THIS dtype — never
     // blanket-bf16, so an f32/f16-compute checkpoint keeps matching numerics.
     let compute_dtype = embedding_compute_dtype(params);
+    let norm_dtype = if preserve_fp32_norms {
+        DType::Float32
+    } else {
+        compute_dtype
+    };
 
     // CLEF residency pre-pass (`apply_clef_residency`): rewrites the backbone
     // projections in place and updates the per-layer overrides the builders
@@ -2050,9 +2071,15 @@ fn apply_weights_inner_with_residency(
 
     // Final norm
     if let Some(w) = params.get("final_norm.weight") {
-        inner
-            .final_norm
-            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)?;
+        let w = if preserve_fp32_norms {
+            w.astype(DType::Float32)?
+        } else {
+            super::sidecar_to_compute_dtype(w, norm_dtype)?
+        };
+        inner.final_norm.set_weight(&w)?;
+    }
+    if preserve_fp32_norms {
+        inner.final_norm.set_precise_f32();
     }
 
     // LM head. The outer `Some(head)` guard preserves the tied-embeddings
@@ -2345,10 +2372,20 @@ fn apply_weights_inner_with_residency(
                     }
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                    attn.set_q_norm_weight(w, compute_dtype)?;
+                    let w = if preserve_fp32_norms {
+                        w.astype(DType::Float32)?
+                    } else {
+                        w.clone()
+                    };
+                    attn.set_q_norm_weight(&w, norm_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                    attn.set_k_norm_weight(w, compute_dtype)?;
+                    let w = if preserve_fp32_norms {
+                        w.astype(DType::Float32)?
+                    } else {
+                        w.clone()
+                    };
+                    attn.set_k_norm_weight(&w, norm_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
                     attn.set_q_proj_bias(Some(w))?;
@@ -2432,10 +2469,23 @@ fn apply_weights_inner_with_residency(
         }
 
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-            layer.set_input_layernorm_weight(w, compute_dtype)?;
+            let w = if preserve_fp32_norms {
+                w.astype(DType::Float32)?
+            } else {
+                w.clone()
+            };
+            layer.set_input_layernorm_weight(&w, norm_dtype)?;
         }
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-            layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
+            let w = if preserve_fp32_norms {
+                w.astype(DType::Float32)?
+            } else {
+                w.clone()
+            };
+            layer.set_post_attention_layernorm_weight(&w, norm_dtype)?;
+        }
+        if preserve_fp32_norms {
+            layer.set_precise_f32_norms();
         }
         // The layer owns its (tiled, merged) projections now: drop the map's
         // row-major K-quant originals so the load peak stays one layer above
@@ -2608,6 +2658,28 @@ pub async fn load_for_tool(
     loaded
 }
 
+/// Load mode for Qwen3.5 dense checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadKind {
+    Standard,
+    Clef,
+    Clairic,
+}
+
+impl LoadKind {
+    const fn is_standard(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    const fn is_clef(self) -> bool {
+        matches!(self, Self::Clef)
+    }
+
+    const fn is_clairic(self) -> bool {
+        matches!(self, Self::Clairic)
+    }
+}
+
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_tool_source(
     source: &CheckpointSource,
@@ -2623,7 +2695,7 @@ pub(crate) async fn load_tool_source(
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
         crate::disk_tier::DiskTierOptions::default(),
-        false,
+        LoadKind::Standard,
         false,
         crate::engine::load_progress::LoadProgressCell::detached(),
     )
@@ -2651,7 +2723,7 @@ pub(crate) async fn load_with_source(
         max_context,
         decode_share,
         disk,
-        false,
+        LoadKind::Standard,
         true,
         progress,
     )
@@ -2789,11 +2861,159 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
             cache_disk: crate::disk_tier::CacheDisk::Off,
             ..Default::default()
         },
-        true,
+        LoadKind::Clef,
         false,
         crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
+}
+
+/// Load a Clairic structured-extraction checkpoint (Qwen3.5-VL backbone +
+/// `clair_head` + `GrammarEngine` + `RopeMode::Temporal`).
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_clairic_with_source(source: &CheckpointSource) -> Result<Qwen3_5Model> {
+    check_clairic_assets(source)?;
+    load_with_thread_impl(
+        source,
+        None,
+        Some(crate::transformer::KvFormat::Bf16),
+        crate::transformer::Activations::Bf16,
+        None,
+        None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions {
+            cache_disk: crate::disk_tier::CacheDisk::Off,
+            ..Default::default()
+        },
+        LoadKind::Clairic,
+        false,
+        crate::engine::load_progress::LoadProgressCell::detached(),
+    )
+    .await
+}
+
+/// Directory holding `clair_head_config.json` and `clair_head.safetensors`.
+/// For directory checkpoints this is the checkpoint directory itself; for GGUF
+/// checkpoints we check the `.gguf` file's parent directory first (where users
+/// keep the FP32 head sidecars next to `*.gguf` + `mmproj-*.gguf`) and fall
+/// back to the resolved asset cache directory.
+fn clairic_head_dir(source: &CheckpointSource) -> PathBuf {
+    match source {
+        CheckpointSource::Dir(dir) => dir.clone(),
+        CheckpointSource::Gguf(ckpt) => {
+            if let Some(parent) = ckpt.main.path().parent()
+                && (parent.join("clair_head_config.json").exists()
+                    || parent.join("clair_head.safetensors").exists())
+            {
+                return parent.to_path_buf();
+            }
+            ckpt.asset_dir.clone()
+        }
+    }
+}
+
+/// Fail-closed check for Clairic assets: requires both `clair_head_config.json`
+/// and `clair_head.safetensors` in the checkpoint (or GGUF sibling) directory,
+/// requires `tokenizer.json` in `source.asset_dir()`, and rejects directories
+/// that also contain CLEF `joint_head` files.
+pub(crate) fn check_clairic_assets(source: &CheckpointSource) -> Result<()> {
+    let asset_dir = source.asset_dir();
+    let head_dir = clairic_head_dir(source);
+    for dir in [asset_dir, head_dir.as_path()] {
+        if dir.join("joint_head_config.json").exists()
+            || dir.join("joint_head.safetensors").exists()
+        {
+            return Err(Error::from_reason(
+                "Ambiguous checkpoint directory: CLEF joint_head assets found alongside Clairic load",
+            ));
+        }
+    }
+    for name in ["clair_head_config.json", "clair_head.safetensors"] {
+        if !head_dir.join(name).is_file() {
+            return Err(Error::from_reason(format!(
+                "Missing Clairic checkpoint asset: {name}"
+            )));
+        }
+    }
+    if !asset_dir.join("tokenizer.json").is_file() {
+        return Err(Error::from_reason(
+            "Missing Clairic checkpoint asset: tokenizer.json",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the Qwen3.5-VL image processor config for Clairic, matching upstream
+/// `ClairicProcessor(path, tokenizer, VISION_MAX_PIXELS)` (`backend.py:1711-1720`).
+fn load_clairic_image_processor_config(
+    dir: &Path,
+) -> crate::models::paddleocr_vl::processing::ImageProcessorConfig {
+    let mut cfg = crate::vision::qwen::processing::qwen35_vl_processor_config();
+    let max_cap = crate::models::clairic::settings::VISION_MAX_PIXELS as i32;
+    cfg.min_pixels = 65_536;
+    cfg.max_pixels = max_cap;
+
+    let preproc_path = dir.join("preprocessor_config.json");
+    if let Ok(raw_text) = fs::read_to_string(&preproc_path)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw_text)
+    {
+        if let Some(shortest) = val
+            .get("size")
+            .and_then(|s| s.get("shortest_edge"))
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            cfg.min_pixels = shortest;
+        }
+        if let Some(longest) = val
+            .get("size")
+            .and_then(|s| s.get("longest_edge"))
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            cfg.max_pixels = longest.min(max_cap);
+        }
+        if let Some(ps) = val
+            .get("patch_size")
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            cfg.patch_size = ps;
+        }
+        if let Some(tps) = val
+            .get("temporal_patch_size")
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            cfg.temporal_patch_size = tps;
+        }
+        if let Some(ms) = val
+            .get("merge_size")
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
+            cfg.merge_size = ms;
+        }
+        if let Some(mean) = val.get("image_mean").and_then(Value::as_array) {
+            let parsed: Vec<f64> = mean.iter().filter_map(Value::as_f64).collect();
+            if parsed.len() == 3 {
+                cfg.image_mean = parsed;
+            }
+        }
+        if let Some(std) = val.get("image_std").and_then(Value::as_array) {
+            let parsed: Vec<f64> = std.iter().filter_map(Value::as_f64).collect();
+            if parsed.len() == 3 {
+                cfg.image_std = parsed;
+            }
+        }
+    }
+    cfg.max_pixels = cfg.max_pixels.min(max_cap);
+    cfg
 }
 
 /// A GGUF carries the decision head itself; a directory must ship it as
@@ -2847,24 +3067,28 @@ async fn load_with_thread_impl(
     max_context: Option<u32>,
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
-    clef: bool,
+    load_kind: LoadKind,
     warm: bool,
     progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5Model> {
+    let clef = load_kind.is_clef();
+    let clairic = load_kind.is_clairic();
+    let non_standard = !load_kind.is_standard();
     crate::engine::dspark_timeline::configure_from_env();
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
     let model_path = model_assets_path.clone();
+    let clairic_head_path = clairic_head_dir(source);
     let mut preload_input = match source {
         CheckpointSource::Dir(_) => None,
         CheckpointSource::Gguf(checkpoint) => {
             checkpoint.check_asset_config()?;
-            Some(checkpoint.preload_input(true))
+            Some(checkpoint.preload_input_with_preserved_norms(true, clairic))
         }
     };
     let planes_admission = PlanesAdmission::of(
         source,
         draft_model_path.as_deref(),
-        clef,
+        non_standard,
         kv_format,
         max_memory_bytes,
         max_context,
@@ -2914,7 +3138,7 @@ async fn load_with_thread_impl(
                             .startup_line(config.served_context_tokens())
                     );
                 }
-                // Decision inference never allocates a chat KV pool or speculative head.
+                // Decision and Clairic inference never allocate a chat KV pool or speculative head.
                 if clef {
                     config.n_mtp_layers = 0;
                     config.kv_format = Some("bf16".into());
@@ -2923,6 +3147,9 @@ async fn load_with_thread_impl(
                             "CLEF requires an untied output embedding",
                         ));
                     }
+                } else if clairic {
+                    config.n_mtp_layers = 0;
+                    config.kv_format = Some("bf16".into());
                 }
                 // An unknown config `kv_format` is a load error rather than a
                 // silent BF16; the format itself is pinned once the weights
@@ -2984,7 +3211,7 @@ async fn load_with_thread_impl(
                     input.planes = load_planes_plan(
                         input,
                         draft_model_path.is_some(),
-                        clef,
+                        non_standard,
                         max_memory_bytes,
                         planes_admission,
                     );
@@ -3011,7 +3238,7 @@ async fn load_with_thread_impl(
                                 path, &mut layer,
                             )?;
                             let mut layer =
-                                sanitize_weights(layer, &config, &per_layer_quant, false)?;
+                                sanitize_weights(layer, &config, &per_layer_quant, false, false)?;
                             let default_mode =
                                 resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&layer));
                             let default_plq =
@@ -3090,6 +3317,8 @@ async fn load_with_thread_impl(
                     path,
                     &if clef {
                         Vec::new()
+                    } else if clairic {
+                        vec![path.join("clair_head.safetensors")]
                     } else {
                         mtp_sidecar_candidates(path, &raw)
                     },
@@ -3102,13 +3331,13 @@ async fn load_with_thread_impl(
                 //   3. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
                 // Only attempt the sidecar/drafter merge when the body itself
                 // carries NO inline `mtp.*` tensors so inline always wins.
-                let has_inline_mtp = !clef
+                let has_inline_mtp = !non_standard
                     && raw_params
                         .keys()
                         .any(|name| normalize_mtp_weight_key(name).is_some());
                 if has_inline_mtp {
                     info!("Using inline mtp.* tensors from body shards (drafter merge skipped)");
-                } else if !clef
+                } else if !non_standard
                     && let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)?
                 {
                     let before = raw_params.len();
@@ -3120,7 +3349,7 @@ async fn load_with_thread_impl(
                         "Merged external MTP sidecar tensors: added={}, removed_embedded_mtp={}",
                         sidecar_count, removed_embedded
                     );
-                } else if !clef
+                } else if !non_standard
                     && let Some(drafter_path) =
                         crate::models::mtp_drafter::detect_drafter_safetensors(path)
                     && let Some(drafter_params) = crate::models::mtp_drafter::load_drafter_tensors(
@@ -3140,9 +3369,9 @@ async fn load_with_thread_impl(
                         drafter_count
                     );
                 }
-                // Decision inference runs no speculative decode: mtp.* tensors
-                // in the body shards would materialize as dead weight.
-                if clef {
+                // Decision and Clairic inference run no speculative decode: mtp.*
+                // tensors in the body shards would materialize as dead weight.
+                if non_standard {
                     raw_params.retain(|name, _| normalize_mtp_weight_key(name).is_none());
                 }
                 info!("Loaded {} raw tensors", raw_params.len());
@@ -3194,6 +3423,7 @@ async fn load_with_thread_impl(
                     &config,
                     &per_layer_quant,
                     prism_config.is_some(),
+                    clairic,
                 )?;
                 // These arrays already passed source expansion, sanitization
                 // and residency; never run those transforms a second time.
@@ -3303,6 +3533,7 @@ async fn load_with_thread_impl(
                     prism_runtime.as_ref(),
                     clef_residency,
                     prepared_clef,
+                    clairic,
                 )?;
                 if let Some(plan) = preload_input
                     .as_ref()
@@ -3332,6 +3563,28 @@ async fn load_with_thread_impl(
                         config.hidden_size as i64,
                         gguf_clef_head,
                     )?);
+                } else if clairic {
+                    inner.clairic_multimodal = super::config::parse_multimodal_tokens(&raw);
+                    let conv_dtype = inner
+                        .layers
+                        .iter()
+                        .find_map(|layer| match &layer.attn {
+                            AttentionType::Linear(gdn) => gdn.get_conv1d_weight().dtype().ok(),
+                            AttentionType::Full(_) => None,
+                        })
+                        .unwrap_or(DType::BFloat16);
+                    let round_bf16 = quantized || conv_dtype != DType::Float32;
+                    let head = crate::models::clairic::head::ClairicHead::load(
+                        &clairic_head_path,
+                        config.hidden_size as i64,
+                        round_bf16,
+                    )?;
+                    inner.clairic_profile = Some(
+                        crate::models::clairic::profile::ClairicProfile::from_head_config(
+                            head.config(),
+                        ),
+                    );
+                    inner.clairic_head = Some(head);
                 }
 
                 // Materialize mmap-backed weights. Pages were pre-warmed above, so
@@ -3371,6 +3624,30 @@ async fn load_with_thread_impl(
                     inner.set_tokenizer(Arc::new(tok));
                 }
 
+                if clairic {
+                    let tok = inner.tokenizer.as_ref().ok_or_else(|| {
+                        Error::from_reason("Clairic checkpoint requires tokenizer.json")
+                    })?;
+                    let eos_id = tok
+                        .token_to_id("<|im_end|>".to_string())
+                        .unwrap_or_else(|| tok.get_eos_token_id());
+                    let grammar_engine = if eos_id == tok.get_eos_token_id() {
+                        crate::grammar::GrammarEngine::from_qwen3_tokenizer(
+                            tok,
+                            config.vocab_size as usize,
+                            vec![eos_id],
+                        )?
+                    } else {
+                        crate::grammar::GrammarEngine::new(
+                            tok.inner_arc(),
+                            config.vocab_size as usize,
+                            eos_id,
+                            vec![eos_id],
+                        )?
+                    };
+                    inner.clairic_grammar = Some(Arc::new(grammar_engine));
+                }
+
                 // sym8 v1 scope is TEXT-ONLY: the eager VLM prefill path is
                 // not wired for sym8 int8 operands, so an image turn would
                 // run bf16-shaped matmuls against the [K,N] int8 kernel
@@ -3404,18 +3681,45 @@ async fn load_with_thread_impl(
                     let mut vision_encoder = QwenVisionEncoder::new(vision_config.clone())?;
                     load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
 
+                    let mrope_section = if clairic {
+                        inner.clairic_multimodal.mrope_section.clone()
+                    } else {
+                        vec![11, 11, 10]
+                    };
                     inner.init_mrope_layers(
-                        vec![11, 11, 10],
+                        mrope_section,
                         config.rope_theta,
                         config.max_position_embeddings,
                     )?;
+                    if clairic {
+                        inner.set_rope_mode_layers(super::attention::RopeMode::Temporal);
+                    }
 
                     inner.set_vision_encoder(vision_encoder)?;
-                    inner.set_image_processor(QwenImageProcessor::new(None));
+                    let image_processor = if clairic {
+                        let proc_dir =
+                            if clairic_head_path.join("preprocessor_config.json").is_file() {
+                                clairic_head_path.as_path()
+                            } else {
+                                path
+                            };
+                        QwenImageProcessor::new(Some(load_clairic_image_processor_config(proc_dir)))
+                    } else {
+                        QwenImageProcessor::new(None)
+                    };
+                    inner.set_image_processor(image_processor);
                     inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
                     info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
                 } else {
+                    if clairic {
+                        inner.init_mrope_layers(
+                            inner.clairic_multimodal.mrope_section.clone(),
+                            config.rope_theta,
+                            config.max_position_embeddings,
+                        )?;
+                        inner.set_rope_mode_layers(super::attention::RopeMode::Temporal);
+                    }
                     info!("Qwen3.5 model loaded successfully");
                 }
 
@@ -3439,6 +3743,9 @@ async fn load_with_thread_impl(
                 // materialized footprint.
                 let mut weight_bytes: u64 = text_weight_bytes;
                 if let Some(head) = inner.clef_head.as_ref() {
+                    weight_bytes = weight_bytes.saturating_add(head.nbytes());
+                }
+                if let Some(head) = inner.clairic_head.as_ref() {
                     weight_bytes = weight_bytes.saturating_add(head.nbytes());
                 }
                 if let Some(ref vparams) = vision_params {
@@ -3528,6 +3835,7 @@ async fn load_with_thread_impl(
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
+            let clairic_profile = inner.clairic_profile;
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let scheduled_lanes = inner.scheduled_lanes();
@@ -3537,7 +3845,7 @@ async fn load_with_thread_impl(
                 inner.image_processor.is_some(),
                 paged_active,
             );
-            if !clef {
+            if load_kind.is_standard() {
                 if let Some(adapter) = inner.paged_adapter.as_ref() {
                     adapter
                         .layer_kv_pool()
@@ -3558,6 +3866,7 @@ async fn load_with_thread_impl(
                     model_id,
                     image_processor,
                     spatial_merge_size,
+                    clairic_profile,
                     tokenizer_out,
                     cache_limit_guard,
                     pool_cache_limit_guard,
@@ -3579,6 +3888,7 @@ async fn load_with_thread_impl(
         model_id,
         image_processor,
         spatial_merge_size,
+        clairic_profile,
         _tokenizer,
         cache_limit_guard,
         pool_cache_limit_guard,
@@ -3606,6 +3916,7 @@ async fn load_with_thread_impl(
         vision_active,
         image_processor,
         spatial_merge_size,
+        clairic_profile,
         context_limits,
         model_assets_path,
         state_tier,
@@ -4032,6 +4343,77 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn clairic_dir_assets_fail_closed() {
+        let dir = scratch_dir("clairic-dir");
+        let source = CheckpointSource::Dir(dir.clone());
+
+        // Missing all files -> fail closed.
+        assert!(check_clairic_assets(&source).is_err());
+
+        // XOR: only clair_head_config.json + tokenizer.json (missing clair_head.safetensors).
+        fs::write(dir.join("clair_head_config.json"), "{}").unwrap();
+        fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        let err = check_clairic_assets(&source).unwrap_err();
+        assert!(
+            err.reason.contains("clair_head.safetensors"),
+            "unexpected error: {}",
+            err.reason
+        );
+
+        // XOR reverse: only clair_head.safetensors + tokenizer.json (missing clair_head_config.json).
+        fs::remove_file(dir.join("clair_head_config.json")).unwrap();
+        fs::write(dir.join("clair_head.safetensors"), b"stub").unwrap();
+        let err = check_clairic_assets(&source).unwrap_err();
+        assert!(
+            err.reason.contains("clair_head_config.json"),
+            "unexpected error: {}",
+            err.reason
+        );
+
+        // Complete valid set -> Ok.
+        fs::write(dir.join("clair_head_config.json"), "{}").unwrap();
+        assert!(check_clairic_assets(&source).is_ok());
+
+        // Missing tokenizer.json -> fail closed.
+        fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        assert!(check_clairic_assets(&source).is_err());
+        fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+
+        // CLEF collision (joint_head_config.json) -> fail closed.
+        fs::write(dir.join("joint_head_config.json"), "{}").unwrap();
+        let err = check_clairic_assets(&source).unwrap_err();
+        assert!(
+            err.reason.contains("joint_head"),
+            "expected CLEF collision error, got: {}",
+            err.reason
+        );
+        fs::remove_file(dir.join("joint_head_config.json")).unwrap();
+
+        // CLEF collision (joint_head.safetensors) -> fail closed.
+        fs::write(dir.join("joint_head.safetensors"), b"stub").unwrap();
+        assert!(check_clairic_assets(&source).is_err());
+        fs::remove_file(dir.join("joint_head.safetensors")).unwrap();
+
+        // Clean again -> Ok.
+        assert!(check_clairic_assets(&source).is_ok());
+
+        // Image processor config parser caps max_pixels at VISION_MAX_PIXELS.
+        fs::write(
+            dir.join("preprocessor_config.json"),
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2, "size": {"shortest_edge": 65536, "longest_edge": 9000000}}"#,
+        )
+        .unwrap();
+        let proc_cfg = load_clairic_image_processor_config(&dir);
+        assert_eq!(proc_cfg.min_pixels, 65_536);
+        assert_eq!(
+            proc_cfg.max_pixels,
+            crate::models::clairic::settings::VISION_MAX_PIXELS as i32
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Gate: the dense load pins the flat K/V format for the embedding's
     /// compute dtype. A 24 x 4 x 256 checkpoint whose embedding emits f16 (a
     /// dense f16 table, or affine f16 scales) gets BF16 K/V — the int8 verify
@@ -4425,6 +4807,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -4703,6 +5086,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -7021,6 +7405,7 @@ mod tests {
             None,
             Some(ClefResidency::Sym8),
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -7253,6 +7638,7 @@ mod tests {
             None,
             Some(ClefResidency::Sym8),
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -7620,6 +8006,7 @@ mod tests {
             None,
             Some(ClefResidency::Sym8),
             None,
+            false,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -7644,5 +8031,180 @@ mod tests {
         } else {
             panic!("layer 0 MLP must be quantized");
         }
+    }
+
+    #[test]
+    fn clairic_preserve_fp32_norms_precise_f32_keeps_f32_weights() {
+        let cfg = Qwen3_5Config {
+            vocab_size: 16,
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 0,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.5,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: Some("bf16".to_string()),
+            rope_scaling: None,
+        };
+
+        // 1. Verify sanitize_weights shifts raw HF BF16 norms in exact Float32 when
+        //    preserve_fp32_norms = true.
+        let mut raw_hf = HashMap::new();
+        // Shape [C, 1, K] with K != 1 signals unsanitized HF checkpoint (`needs_norm_fix = true`).
+        raw_hf.insert(
+            "model.layers.0.linear_attn.conv1d.weight".to_string(),
+            MxArray::zeros(&[96, 1, 4], Some(DType::BFloat16)).unwrap(),
+        );
+        let raw_vals: Vec<f32> = (0..32).map(|i| 0.003_906_25 * i as f32 - 0.1).collect();
+        let raw_bf16 = MxArray::from_float32(&raw_vals, &[32])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        raw_hf.insert("model.norm.weight".to_string(), raw_bf16.clone());
+        let sanitized =
+            sanitize_weights(raw_hf, &cfg, &HashMap::new(), false, true).expect("sanitize_weights");
+        let shifted = &sanitized["final_norm.weight"];
+        assert_eq!(shifted.dtype().unwrap(), DType::Float32);
+        let expected_shifted = raw_bf16
+            .astype(DType::Float32)
+            .unwrap()
+            .add(&MxArray::scalar_float(1.0).unwrap())
+            .unwrap();
+        assert_eq!(
+            shifted.to_float32().unwrap().to_vec(),
+            expected_shifted.to_float32().unwrap().to_vec()
+        );
+
+        // 2. Verify apply_weights_inner_with_residency(..., preserve_fp32_norms = true)
+        //    preserves Float32 on final_norm, input_layernorm, post_attention_layernorm,
+        //    q_norm, and k_norm even when embedding compute_dtype is BFloat16.
+        let mut inner = Qwen35Inner::new(cfg.clone()).expect("Qwen35Inner::new");
+        let h = cfg.hidden_size as i64;
+        let hd = cfg.head_dim as i64;
+        let mut params = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::zeros(&[cfg.vocab_size as i64, h], Some(DType::BFloat16)).unwrap(),
+        );
+        let f32_norm_h = MxArray::from_float32(
+            &(0..h)
+                .map(|i| 1.0 + i as f32 * 0.001_234_5)
+                .collect::<Vec<_>>(),
+            &[h],
+        )
+        .unwrap();
+        let f32_norm_hd = MxArray::from_float32(
+            &(0..hd)
+                .map(|i| 1.0 + i as f32 * 0.002_345_6)
+                .collect::<Vec<_>>(),
+            &[hd],
+        )
+        .unwrap();
+        params.insert("final_norm.weight".to_string(), f32_norm_h.clone());
+        for layer_idx in 0..2 {
+            params.insert(
+                format!("layers.{layer_idx}.input_layernorm.weight"),
+                f32_norm_h.clone(),
+            );
+            params.insert(
+                format!("layers.{layer_idx}.post_attention_layernorm.weight"),
+                f32_norm_h.clone(),
+            );
+        }
+        // Layer 1 is the full-attention layer (`full_attention_interval == 2`).
+        params.insert(
+            "layers.1.self_attn.q_norm.weight".to_string(),
+            f32_norm_hd.clone(),
+        );
+        params.insert(
+            "layers.1.self_attn.k_norm.weight".to_string(),
+            f32_norm_hd.clone(),
+        );
+
+        assert_eq!(embedding_compute_dtype(&params), DType::BFloat16);
+
+        let err = apply_weights_inner_with_residency(
+            &mut inner,
+            &mut params,
+            &cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &HashMap::new(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect_err(
+            "partial checkpoint should fail completeness validation after installing norms",
+        );
+        assert!(
+            err.reason.contains("missing mandatory weights"),
+            "unexpected error: {}",
+            err.reason
+        );
+
+        // All 5 norm types must remain Float32 (not downcast to BF16).
+        assert_eq!(inner.final_norm.weight().dtype().unwrap(), DType::Float32);
+        for (idx, layer) in inner.layers.iter().enumerate() {
+            assert_eq!(
+                layer.get_input_layernorm_weight().dtype().unwrap(),
+                DType::Float32,
+                "layer {idx} input_layernorm must stay Float32"
+            );
+            assert_eq!(
+                layer.get_post_attention_layernorm_weight().dtype().unwrap(),
+                DType::Float32,
+                "layer {idx} post_attention_layernorm must stay Float32"
+            );
+            if let AttentionType::Full(attn) = &layer.attn {
+                assert_eq!(
+                    attn.get_q_norm_weight().dtype().unwrap(),
+                    DType::Float32,
+                    "layer {idx} q_norm must stay Float32"
+                );
+                assert_eq!(
+                    attn.get_k_norm_weight().dtype().unwrap(),
+                    DType::Float32,
+                    "layer {idx} k_norm must stay Float32"
+                );
+            }
+        }
+
+        // Verify PreciseF32 policy is active on final_norm: BF16 input -> BF16 output
+        // and forward_residual_add declines.
+        let bf16_in = MxArray::from_float32(&vec![0.5f32; h as usize], &[1, h])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let normed = inner.final_norm.forward(&bf16_in).unwrap();
+        assert_eq!(normed.dtype().unwrap(), DType::BFloat16);
+        assert!(
+            inner
+                .final_norm
+                .forward_residual_add(&bf16_in, &bf16_in)
+                .is_none()
+        );
     }
 }

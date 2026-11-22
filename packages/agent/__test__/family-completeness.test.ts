@@ -68,6 +68,7 @@ describe('family-data completeness', () => {
 
   it('keeps embedding/vlm/decision/rerank families outside chat', () => {
     expect([...NON_GENERATIVE_FAMILY_IDS].sort()).toEqual([
+      'clairic',
       'clef',
       'harrier',
       'internvl_chat',

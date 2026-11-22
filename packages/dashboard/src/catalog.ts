@@ -26,6 +26,8 @@ import {
 export type CatalogBlocker = ForeignEntrySummary;
 
 export interface CatalogItem extends CatalogEntry {
+  /** Which product surface this catalog entry belongs to. */
+  category: 'chat' | 'systemone';
   draft?: CatalogDraftItem;
   /**
    * The repo THIS platform installs, already resolved by
@@ -215,6 +217,7 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     }
     return {
       ...entry,
+      category: entry.category ?? 'chat',
       draft,
       hfRepo,
       // Selection fields describe the GGUF repo only, so serve the SAME gated

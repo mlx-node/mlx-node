@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 const RAW_MODEL_TYPE_ALIASES = {
   clef: ['clef'],
+  clairic: ['clairic'],
   harrier: ['harrier'],
   jina_reranker: ['jina_reranker'],
   xlm_roberta_reranker: [],

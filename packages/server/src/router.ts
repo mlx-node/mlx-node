@@ -32,6 +32,8 @@ import type { ResponsesAPIRequest } from './types.js';
 
 /** Max request body size (10 MB). */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
+/** Max request body size for /v1/systemone (16 MiB — accommodates Clairic embedded media). */
+const MAX_SYSTEMONE_BODY_BYTES = 16 * 1024 * 1024;
 
 /**
  * The request's pathname, parsed against a CONSTANT base.
@@ -60,21 +62,36 @@ export function requestPathname(req: IncomingMessage): string {
   }
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
-    req.on('data', (chunk: Buffer) => {
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+    };
+    const onData = (chunk: Buffer) => {
       totalBytes += chunk.length;
-      if (totalBytes > MAX_BODY_BYTES) {
+      if (totalBytes > maxBytes) {
+        cleanup();
+        req.pause();
         reject(new Error('Request body too large'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    req.on('error', reject);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks).toString('utf-8'));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
@@ -168,8 +185,11 @@ export async function routeRequest(
     }
     let raw: string;
     try {
-      raw = await readBody(req);
+      raw = await readBody(req, MAX_SYSTEMONE_BODY_BYTES);
     } catch (error) {
+      if (error instanceof Error && error.message === 'Request body too large') {
+        res.setHeader('Connection', 'close');
+      }
       sendBadRequest(res, error instanceof Error ? error.message : 'Invalid request body');
       return;
     }

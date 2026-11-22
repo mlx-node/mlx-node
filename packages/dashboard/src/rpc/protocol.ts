@@ -18,6 +18,7 @@ import type { ChatHostEvent, ConversationEvent } from '../chat/types.js';
 import type { DownloadEvent } from '../download.js';
 import type { LiveEvent, LiveTopic } from '../live.js';
 import type { ApiCall } from '../runtime.js';
+import type { SystemOneJobSnapshot } from '../systemone.js';
 
 export type { LiveEvent, LiveTopic } from '../live.js';
 
@@ -48,6 +49,8 @@ export type RpcRequest =
   | { kind: 'watch'; id: number; topic: LiveTopic }
   /** Open a Chat stream; `id` tags every `chat` reply that follows. Closed by `unsubscribe`. */
   | ({ kind: 'chat'; id: number } & ChatScope)
+  /** Open a System One job stream; `id` tags every `systemone` reply that follows. Closed by `unsubscribe`. */
+  | { kind: 'systemone'; id: number; jobId: string }
   /** Close the subscription (any kind) opened under `id`. Never answered. */
   | { kind: 'unsubscribe'; id: number };
 
@@ -55,7 +58,8 @@ export type RpcReply =
   | { kind: 'response'; id: number; response: ApiResponse }
   | { kind: 'event'; id: number; event: DownloadEvent }
   | { kind: 'live'; id: number; event: LiveEvent }
-  | { kind: 'chat'; id: number; event: ChatHostEvent | ConversationEvent };
+  | { kind: 'chat'; id: number; event: ChatHostEvent | ConversationEvent }
+  | { kind: 'systemone'; id: number; event: SystemOneJobSnapshot };
 
 /**
  * Whether an inbound payload is a well-formed request. A port is only as trusted
@@ -88,6 +92,8 @@ export function isRpcRequest(value: unknown): value is RpcRequest {
         msg.scope === 'host' ||
         (msg.scope === 'conversation' && typeof msg.conversationId === 'string' && msg.conversationId !== '')
       );
+    case 'systemone':
+      return typeof msg.jobId === 'string' && msg.jobId !== '';
     case 'unsubscribe':
       return true;
     default:
@@ -106,6 +112,7 @@ export function isRpcReply(value: unknown): value is RpcReply {
     case 'event':
     case 'live':
     case 'chat':
+    case 'systemone':
       return typeof msg.event === 'object' && msg.event !== null;
     default:
       return false;

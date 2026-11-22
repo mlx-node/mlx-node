@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import {
   type CatalogEntry,
+  catalogDownloadRepos,
   catalogEntryForRepo,
   catalogRepo,
   catalogRepoFor,
+  catalogUpdateRepos,
   MODEL_CATALOG,
   visibleCatalog,
+  visibleSystemOneCatalog,
 } from '../src/catalog.js';
 
 describe('catalogUpdateRepos — update discovery covers the sidecar sources', () => {
@@ -181,6 +184,30 @@ describe('visibleCatalog', () => {
     const all = new Set(MODEL_CATALOG);
     for (const entry of visibleCatalog()) {
       expect(all.has(entry), entry.label).toBe(true);
+      expect(entry.category ?? 'chat', entry.label).toBe('chat');
+    }
+  });
+});
+
+describe('visibleSystemOneCatalog', () => {
+  it('returns the verified Clairic Hugging Face entries and keeps them out of visibleCatalog', () => {
+    const sysOne = visibleSystemOneCatalog();
+    expect(sysOne.map((entry) => [entry.label, entry.hfRepo, entry.assetsRepo, entry.sizeGb, entry.category])).toEqual([
+      ['Clairic Flash (9B)', 'Brooooooklyn/Clairic-Flash-GGUF', 'Cloudflare/clairic-flash', 7.6, 'systemone'],
+      ['Clairic (27B)', 'Brooooooklyn/Clairic-GGUF', 'Cloudflare/clairic', 18.9, 'systemone'],
+    ]);
+    const chatRepos = new Set(visibleCatalog().map((entry) => entry.hfRepo));
+    for (const entry of sysOne) {
+      expect(chatRepos.has(entry.hfRepo)).toBe(false);
+    }
+  });
+
+  it('includes System One repos in both catalogDownloadRepos and catalogUpdateRepos', () => {
+    const downloads = catalogDownloadRepos();
+    const updates = catalogUpdateRepos();
+    for (const entry of visibleSystemOneCatalog()) {
+      expect(downloads).toContain(entry.hfRepo);
+      expect(updates).toContain(entry.hfRepo);
     }
   });
 });

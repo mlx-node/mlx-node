@@ -39,6 +39,8 @@ const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx
  * the same contract against the built output in a real process.
  */
 const ADDON_FREE_SUBPATHS = [
+  '@mlx-node/lm/clairic-types',
+  '@mlx-node/lm/clef-types',
   '@mlx-node/lm/family-data',
   '@mlx-node/lm/cold-tier',
   '@mlx-node/lm/draft-companion',

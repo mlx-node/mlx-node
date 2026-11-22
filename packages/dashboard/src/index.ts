@@ -72,6 +72,7 @@ export {
   metricsRuntimeDir,
   metricsTraceDir,
   mlxNodeHome,
+  systemOneHistoryPath,
 } from './paths.js';
 export { createRpcClient, type RpcClient, type RpcClientOptions } from './rpc/client.js';
 export {
@@ -99,3 +100,17 @@ export {
   type RuntimeLifecycleEvent,
 } from './runtime.js';
 export type { CodingAgentsState, CodingAgentRow, CodingAgentId } from './coding-agents.js';
+export {
+  SystemOneService,
+  sanitizeRequestForHistory,
+  SYSTEMONE_HISTORY_LIMIT,
+  SYSTEMONE_HISTORY_MEDIA_LIMIT_BYTES,
+  SYSTEMONE_MAX_BODY_BYTES,
+  type SystemOneHistoryEntry,
+  type SystemOneJobSnapshot,
+  type SystemOneModelInfo,
+  type SystemOneRunInput,
+  type SystemOneRunResponse,
+  type SystemOneServiceOptions,
+  type SystemOneState,
+} from './systemone.js';
