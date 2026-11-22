@@ -2451,3 +2451,366 @@ fn bench_hc_bridge_latency() {
         }
     }
 }
+
+#[test]
+fn f32_head_weights_matches_unfused_and_is_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let to_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|&x| x.to_bits()).collect() };
+
+    for &(n, k) in &[(16usize, 3072usize), (2, 12), (32, 128)] {
+        let scale = ((n * 128) as f32).sqrt().recip();
+        let w = Dense::Array(
+            MxArray::from_float32(
+                &det_f32(9101 + k as u64, n * k, 0.25),
+                &[n as i64, k as i64],
+            )
+            .unwrap(),
+        );
+        let x_all =
+            MxArray::from_float32(&det_f32(9201 + k as u64, 16 * k, 1.0), &[16, k as i64]).unwrap();
+        let mut row1: Vec<Vec<u32>> = Vec::new();
+        for r in 0..16i64 {
+            let xr = x_all.slice(&[r, 0], &[r + 1, k as i64]).unwrap();
+            let Some(got) = try_f32_head_weights(&xr, &w, scale).unwrap() else {
+                eprintln!("skipping f32_head_weights Metal test (no GPU)");
+                return;
+            };
+            row1.push(to_bits(&read(&got)));
+        }
+        for &m in &[1usize, 2, 4, 8, 16] {
+            let xm = x_all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+            let got = read(&try_f32_head_weights(&xm, &w, scale).unwrap().unwrap());
+            let want = read(
+                &linear(&xm, &w)
+                    .unwrap()
+                    .mul_scalar(f64::from(scale))
+                    .unwrap(),
+            );
+            let err = max_err(&got, &want);
+            assert!(err <= 1e-4, "f32_head_weights N={n} K={k} M={m}: err={err}");
+            for r in 0..m {
+                assert_eq!(
+                    to_bits(&got[r * n..(r + 1) * n]),
+                    row1[r],
+                    "f32_head_weights invariance N={n} K={k} M={m} r={r}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mtp_fused_norms_match_unfused_and_are_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let eps = 1e-5f32;
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let to_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|&x| x.to_bits()).collect() };
+
+    for &d in &[3072i64, 192] {
+        let du = d as usize;
+        let enorm = MxArray::from_float32(
+            &det_f32(9301 + d as u64, du, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[d],
+        )
+        .unwrap();
+        let hnorm = MxArray::from_float32(
+            &det_f32(9302 + d as u64, du, 0.5)
+                .into_iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            &[d],
+        )
+        .unwrap();
+        let e_all =
+            MxArray::from_float32(&det_f32(9303 + d as u64, 17 * du, 1.5), &[17, d]).unwrap();
+        let h_all =
+            MxArray::from_float32(&det_f32(9304 + d as u64, 17 * du, 1.5), &[17, d]).unwrap();
+
+        for dt in [DType::Float32, DType::Float16, DType::BFloat16] {
+            let e_dt = e_all.astype(dt).unwrap();
+            let h_dt = h_all.astype(dt).unwrap();
+            let mut eh_r1 = Vec::new();
+            for r in 0..4i64 {
+                let er = e_dt.slice(&[r, 0], &[r + 1, d]).unwrap();
+                let hr = h_dt.slice(&[r, 0], &[r + 1, d]).unwrap();
+                let Some(got) = try_mtp_eh_norm_concat(&er, &hr, &enorm, &hnorm, eps).unwrap()
+                else {
+                    eprintln!("skipping mtp_fused_norms Metal test (no GPU)");
+                    return;
+                };
+                eh_r1.push(to_bits(&read(&got)));
+            }
+            for &m in &[1usize, 2, 4, 17] {
+                let em = e_dt.slice(&[0, 0], &[m as i64, d]).unwrap();
+                let hm = h_dt.slice(&[0, 0], &[m as i64, d]).unwrap();
+                let got = read(
+                    &try_mtp_eh_norm_concat(&em, &hm, &enorm, &hnorm, eps)
+                        .unwrap()
+                        .unwrap(),
+                );
+                let ref_a = rms_norm(&em.astype(DType::Float32).unwrap(), &enorm, eps).unwrap();
+                let ref_b = rms_norm(&hm.astype(DType::Float32).unwrap(), &hnorm, eps).unwrap();
+                let want = read(&MxArray::concatenate(&ref_a, &ref_b, 1).unwrap());
+                let err = max_err(&got, &want);
+                assert!(
+                    err <= 1e-5,
+                    "eh_norm_concat d={d} dt={dt:?} M={m}: err={err}"
+                );
+                for r in 0..m.min(4) {
+                    assert_eq!(
+                        to_bits(&got[r * 2 * du..(r + 1) * 2 * du]),
+                        eh_r1[r],
+                        "eh_norm_concat invariance d={d} dt={dt:?} M={m} r={r}"
+                    );
+                }
+            }
+        }
+
+        let mut pn_x1 = Vec::new();
+        let mut pn_h1 = Vec::new();
+        for r in 0..4i64 {
+            let rr = e_all.slice(&[r, 0], &[r + 1, d]).unwrap();
+            let yr = h_all.slice(&[r, 0], &[r + 1, d]).unwrap();
+            let (Some(xo), ho) = try_post_norm_add_rms_norm(&rr, &yr, &enorm, &hnorm, eps, true)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("need_x_out=true must return x_out");
+            };
+            pn_x1.push(to_bits(&read(&xo)));
+            pn_h1.push(to_bits(&read(&ho)));
+        }
+        for &m in &[1usize, 2, 4, 17] {
+            let rm = e_all.slice(&[0, 0], &[m as i64, d]).unwrap();
+            let ym = h_all.slice(&[0, 0], &[m as i64, d]).unwrap();
+            let (Some(xo), ho) = try_post_norm_add_rms_norm(&rm, &ym, &enorm, &hnorm, eps, true)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("need_x_out=true must return x_out");
+            };
+            let (xo_none, ho_only) =
+                try_post_norm_add_rms_norm(&rm, &ym, &enorm, &hnorm, eps, false)
+                    .unwrap()
+                    .unwrap();
+            assert!(xo_none.is_none());
+            let ref_x = rm.add(&rms_norm(&ym, &enorm, eps).unwrap()).unwrap();
+            let ref_h = rms_norm(&ref_x, &hnorm, eps).unwrap();
+            let gx = read(&xo);
+            let gh = read(&ho);
+            let gh2 = read(&ho_only);
+            assert!(
+                max_err(&gx, &read(&ref_x)) <= 1e-5,
+                "post_norm x d={d} M={m}"
+            );
+            assert!(
+                max_err(&gh, &read(&ref_h)) <= 1e-5,
+                "post_norm h d={d} M={m}"
+            );
+            assert_eq!(to_bits(&gh), to_bits(&gh2), "need_x_out false matches true");
+            for r in 0..m.min(4) {
+                assert_eq!(
+                    to_bits(&gx[r * du..(r + 1) * du]),
+                    pn_x1[r],
+                    "post_norm x inv d={d} M={m} r={r}"
+                );
+                assert_eq!(
+                    to_bits(&gh[r * du..(r + 1) * du]),
+                    pn_h1[r],
+                    "post_norm h inv d={d} M={m} r={r}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hc_bridge_prefill_reg_and_row2_match_unfused_and_row1() {
+    crate::models::hy_v4_flash::exact_f32();
+    let hc = 4i64;
+    let d = 3072i64;
+    let hd = (hc * d) as usize;
+    let du = d as usize;
+    let hcu = hc as usize;
+    let norm_eps = 1e-5f32;
+    let hc_eps = 1e-6f32;
+    let cfg = HcConfig {
+        count: hcu,
+        eps: hc_eps,
+        magnitude: 2.0,
+    };
+    let max_err = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let to_bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|&x| x.to_bits()).collect() };
+
+    let w_next = HcWeights {
+        weight: MxArray::from_float32(
+            &det_f32(9401, (2 * hc) as usize * hd, 0.02),
+            &[2 * hc, hc * d],
+        )
+        .unwrap(),
+        scale: MxArray::from_float32(&[0.75, 1.25], &[2]).unwrap(),
+        base: MxArray::from_float32(&det_f32(9402, (2 * hc) as usize, 0.5), &[2 * hc]).unwrap(),
+    };
+    let w_head = HcWeights {
+        weight: MxArray::from_float32(&det_f32(9403, hcu * hd, 0.02), &[hc, hc * d]).unwrap(),
+        scale: MxArray::from_float32(&[0.9], &[1]).unwrap(),
+        base: MxArray::from_float32(&det_f32(9404, hcu, 0.5), &[hc]).unwrap(),
+    };
+    let post_norm_w = MxArray::from_float32(
+        &det_f32(9405, du, 0.5)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>(),
+        &[d],
+    )
+    .unwrap();
+    let next_norm_w = MxArray::from_float32(
+        &det_f32(9406, du, 0.5)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>(),
+        &[d],
+    )
+    .unwrap();
+
+    let max_m = 65usize;
+    let x_all =
+        MxArray::from_float32(&det_f32(9407, max_m * hd, 1.2), &[max_m as i64, hc, d]).unwrap();
+    let y_all = MxArray::from_float32(&det_f32(9408, max_m * du, 1.2), &[max_m as i64, d]).unwrap();
+    let p_all =
+        MxArray::from_float32(&det_f32(9409, max_m * hcu, 0.8), &[max_m as i64, hc]).unwrap();
+
+    // Baseline M = 33 uses prefill 1-row/TG (USE_REG=true, ROW2=false).
+    let (bx33, bh33, bp33) = hc_bridge(
+        &y_all.slice(&[0, 0], &[33, d]).unwrap(),
+        &x_all.slice(&[0, 0, 0], &[33, hc, d]).unwrap(),
+        &p_all.slice(&[0, 0], &[33, hc]).unwrap(),
+        &post_norm_w,
+        &w_next,
+        Some(&next_norm_w),
+        norm_eps,
+        &cfg,
+    )
+    .unwrap();
+    let (bx33_v, bh33_v, bp33_v) = (read(&bx33), read(&bh33), read(&bp33));
+    let bhead33_v = read(
+        &hc_bridge_head(
+            &y_all.slice(&[0, 0], &[33, d]).unwrap(),
+            &x_all.slice(&[0, 0, 0], &[33, hc, d]).unwrap(),
+            &p_all.slice(&[0, 0], &[33, hc]).unwrap(),
+            &post_norm_w,
+            &w_head,
+            Some(&next_norm_w),
+            norm_eps,
+            hc_eps,
+        )
+        .unwrap(),
+    );
+
+    // M = 64 and odd M = 65 exercise prefill 2-row/TG (ROW2=true) including odd tail row 64.
+    for &m in &[64usize, 65] {
+        let ym = y_all.slice(&[0, 0], &[m as i64, d]).unwrap();
+        let xm = x_all.slice(&[0, 0, 0], &[m as i64, hc, d]).unwrap();
+        let pm = p_all.slice(&[0, 0], &[m as i64, hc]).unwrap();
+
+        let (bx, bh, bp) = hc_bridge(
+            &ym,
+            &xm,
+            &pm,
+            &post_norm_w,
+            &w_next,
+            Some(&next_norm_w),
+            norm_eps,
+            &cfg,
+        )
+        .unwrap();
+        let (bx_v, bh_v, bp_v) = (read(&bx), read(&bh), read(&bp));
+        let ref_x = post_norm_hc_post(&ym, &xm, &pm, &post_norm_w, norm_eps).unwrap();
+        let (ref_h_raw, ref_p) = hc_mix_reduce(&ref_x, &w_next, norm_eps, &cfg).unwrap();
+        let ref_h = rms_norm(&ref_h_raw, &next_norm_w, norm_eps).unwrap();
+        assert!(
+            max_err(&bx_v, &read(&ref_x)) <= 1e-5,
+            "prefill ROW2 x M={m}"
+        );
+        assert!(
+            max_err(&bh_v, &read(&ref_h)) <= 1e-5,
+            "prefill ROW2 h M={m}"
+        );
+        assert!(
+            max_err(&bp_v, &read(&ref_p)) <= 1e-5,
+            "prefill ROW2 p M={m}"
+        );
+
+        // Bit-exact match between ROW2 (M=64/65) and ROW1 (M=33) on shared rows 0..33.
+        assert_eq!(
+            to_bits(&bx_v[..33 * hd]),
+            to_bits(&bx33_v),
+            "ROW2 vs ROW1 x M={m}"
+        );
+        assert_eq!(
+            to_bits(&bh_v[..33 * du]),
+            to_bits(&bh33_v),
+            "ROW2 vs ROW1 h M={m}"
+        );
+        assert_eq!(
+            to_bits(&bp_v[..33 * hcu]),
+            to_bits(&bp33_v),
+            "ROW2 vs ROW1 p M={m}"
+        );
+
+        // SKIP_NEXT_NORM + HEAD_ONLY in ROW2.
+        let (_, sh, _) =
+            hc_bridge(&ym, &xm, &pm, &post_norm_w, &w_next, None, norm_eps, &cfg).unwrap();
+        assert!(
+            max_err(&read(&sh), &read(&ref_h_raw)) <= 1e-5,
+            "prefill ROW2 skip_next_norm M={m}"
+        );
+        let bhead = read(
+            &hc_bridge_head(
+                &ym,
+                &xm,
+                &pm,
+                &post_norm_w,
+                &w_head,
+                Some(&next_norm_w),
+                norm_eps,
+                hc_eps,
+            )
+            .unwrap(),
+        );
+        let ref_head = rms_norm(
+            &hc_head(&ref_x, &w_head, norm_eps, hc_eps).unwrap(),
+            &next_norm_w,
+            norm_eps,
+        )
+        .unwrap();
+        assert!(
+            max_err(&bhead, &read(&ref_head)) <= 1e-5,
+            "prefill ROW2 head M={m}"
+        );
+        assert_eq!(
+            to_bits(&bhead[..33 * du]),
+            to_bits(&bhead33_v),
+            "ROW2 vs ROW1 head M={m}"
+        );
+    }
+}

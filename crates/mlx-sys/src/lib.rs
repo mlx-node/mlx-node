@@ -4188,6 +4188,31 @@ unsafe extern "C" {
         keep_mask: *mut mlx_array,
         eps: f32,
     ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_f32_head_weights(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scale: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mtp_eh_norm_concat(
+        e: *mut mlx_array,
+        h: *mut mlx_array,
+        enorm: *mut mlx_array,
+        hnorm: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_post_norm_add_rms_norm(
+        res: *mut mlx_array,
+        y: *mut mlx_array,
+        post_w: *mut mlx_array,
+        next_w: *mut mlx_array,
+        eps: f32,
+        need_x_out: bool,
+        out_x: *mut *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+    ) -> bool;
 }
 
 unsafe extern "C-unwind" {

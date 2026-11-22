@@ -57,6 +57,24 @@ inline float4 hy4_aff4_prescale4(float4 v) {
   return float4(v[0], v[1] * (1.0f / 16.0f), v[2] * (1.0f / 256.0f), v[3] * (1.0f / 4096.0f));
 }
 
+inline void hy4_aff4_unpack_dedup(
+    uint4 ent,
+    thread uint& exp_id,
+    thread uint& cnt,
+    thread uint (&a_idx)[4],
+    thread uint (&r_idx)[4]) {
+  exp_id = ent.x;
+  cnt = (ent.y >> 30) + 1u;
+  a_idx[0] = ent.y & 0x3FFu;
+  a_idx[1] = (ent.y >> 10) & 0x3FFu;
+  a_idx[2] = (ent.y >> 20) & 0x3FFu;
+  a_idx[3] = ent.z & 0x3FFu;
+  r_idx[0] = (ent.z >> 10) & 0x3FFu;
+  r_idx[1] = (ent.z >> 20) & 0x3FFu;
+  r_idx[2] = ent.w & 0x3FFu;
+  r_idx[3] = (ent.w >> 10) & 0x3FFu;
+}
+
 template <
     bool FAST_K,
     bool FAST_M,
@@ -102,16 +120,14 @@ inline void hy4_affine4_gate_up_swiglu_impl(
     const uint n_uniq = dedup4[0].x;
     if (assign >= n_uniq) return;
 
-    const uint4 ent = dedup4[1u + assign];
-    const uint exp_id = ent.x;
-    const uint cnt = ent.y;
-    const uint packed_a = ent.z;
-    const uint packed_r = ent.w;
+    uint exp_id, cnt;
+    uint a_idx[4], r_idx[4];
+    hy4_aff4_unpack_dedup(dedup4[1u + assign], exp_id, cnt, a_idx, r_idx);
 
     if (exp_id >= uint(E)) {
       if (lane == 0u) {
         for (uint m = 0u; m < cnt; ++m) {
-          const uint dst_a = (packed_a >> (m * 8u)) & 0xFFu;
+          const uint dst_a = a_idx[m];
 #pragma unroll
           for (int r = 0; r < RPS; ++r) {
             if (FAST_M || first + r < M) {
@@ -132,8 +148,8 @@ inline void hy4_affine4_gate_up_swiglu_impl(
     const device bfloat* bu_base = bu + base_row * stride_g;
 
     if (cnt == 1u) {
-      const uint dst_a = packed_a & 0xFFu;
-      const uint rid = packed_r & 0xFFu;
+      const uint dst_a = a_idx[0];
+      const uint rid = r_idx[0];
       float g[RPS];
       float u_acc[RPS];
 #pragma unroll
@@ -260,7 +276,7 @@ inline void hy4_affine4_gate_up_swiglu_impl(
 #pragma unroll
             for (int m = 0; m < MAX_MATCH; ++m) {
               if (uint(m) < cnt) {
-                const uint rid = (packed_r >> (uint(m) * 8u)) & 0xFFu;
+                const uint rid = r_idx[m];
                 if (rid < uint(ROWS)) {
                   const device float4* xp = reinterpret_cast<const device float4*>(
                       x + size_t(rid) * x_row_stride + col);
@@ -303,7 +319,7 @@ inline void hy4_affine4_gate_up_swiglu_impl(
 #pragma unroll
               for (int m = 0; m < MAX_MATCH; ++m) {
                 if (uint(m) < cnt) {
-                  const uint rid = (packed_r >> (uint(m) * 8u)) & 0xFFu;
+                  const uint rid = r_idx[m];
                   if (rid < uint(ROWS)) {
                     const device float4* xp = reinterpret_cast<const device float4*>(
                         x + size_t(rid) * x_row_stride + col);
@@ -328,7 +344,7 @@ inline void hy4_affine4_gate_up_swiglu_impl(
 #pragma unroll
     for (int m = 0; m < MAX_MATCH; ++m) {
       if (uint(m) < cnt) {
-        const uint dst_a = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+        const uint dst_a = a_idx[m];
 #pragma unroll
         for (int r = 0; r < RPS; ++r) {
           if (FAST_M || first + r < M) {
@@ -494,15 +510,14 @@ inline void hy4_affine4_down_combine_impl(
     const device uint4* dedup4 = reinterpret_cast<const device uint4*>(dedup);
     const uint n_uniq = dedup4[0].x;
     for (uint u = simd; u < n_uniq; u += uint(KSG)) {
-      const uint4 ent = dedup4[1u + u];
-      const uint exp_id = ent.x;
-      const uint cnt = ent.y;
-      const uint packed_a = ent.z;
+      uint exp_id, cnt;
+      uint a_idx[4], r_idx[4];
+      hy4_aff4_unpack_dedup(dedup4[1u + u], exp_id, cnt, a_idx, r_idx);
 
       if (exp_id >= uint(E)) {
         if (lane == 0u) {
           for (uint m = 0u; m < cnt; ++m) {
-            const uint dst_a = (packed_a >> (m * 8u)) & 0xFFu;
+            const uint dst_a = a_idx[m];
 #pragma unroll
             for (int r = 0; r < RPS; ++r) {
               products[dst_a * uint(RPS) + uint(r)] = 0.0f;
@@ -518,7 +533,7 @@ inline void hy4_affine4_down_combine_impl(
       const device bfloat* bd_base = bd + base_row * stride_g;
 
       if (cnt == 1u) {
-        const uint a0 = packed_a & 0xFFu;
+        const uint a0 = a_idx[0];
         const device float* h_row = hidden + size_t(a0) * size_t(M);
         float acc[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
         if constexpr (FAST_M) {
@@ -611,7 +626,7 @@ inline void hy4_affine4_down_combine_impl(
 #pragma unroll
                 for (int m = 0; m < MAX_MATCH; ++m) {
                   if (uint(m) < cnt) {
-                    const uint a_m = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+                    const uint a_m = a_idx[m];
                     const device float4* hp = reinterpret_cast<const device float4*>(
                         hidden + size_t(a_m) * size_t(M) + col);
                     const float4 x0 = hp[0];
@@ -648,7 +663,7 @@ inline void hy4_affine4_down_combine_impl(
 #pragma unroll
                   for (int m = 0; m < MAX_MATCH; ++m) {
                     if (uint(m) < cnt) {
-                      const uint a_m = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+                      const uint a_m = a_idx[m];
                       const device float4* hp = reinterpret_cast<const device float4*>(
                           hidden + size_t(a_m) * size_t(M) + col);
                       const float4 x0 = hp[0];
@@ -669,7 +684,7 @@ inline void hy4_affine4_down_combine_impl(
 #pragma unroll
         for (int m = 0; m < MAX_MATCH; ++m) {
           if (uint(m) < cnt) {
-            const uint dst_a = (packed_a >> (uint(m) * 8u)) & 0xFFu;
+            const uint dst_a = a_idx[m];
             const float weight = weights[dst_a];
 #pragma unroll
             for (int r = 0; r < RPS; ++r) {

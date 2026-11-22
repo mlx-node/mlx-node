@@ -237,7 +237,7 @@ enum Hy4KernelId : int {
   kKernelKqSortedCombine = 13,
   kKernelRouterTopk = 14,
   kKernelGgufGateUp = 15,
-  kKernelGgufDownCombine = 16,
+  kKernelGgufDownProj = 16,
   kKernelGgufPrefillIndirectGu = 17,
   kKernelGgufPrefillIndirectDown = 18,
   kKernelMlaDecodeV2 = 19,
@@ -267,6 +267,10 @@ enum Hy4KernelId : int {
   kKernelIndexerScoreDecodeNax = 43,
   kKernelQ8DualDownPrefill = 44,
   kKernelGgufQ8_0EmbedRows = 45,
+  kKernelGgufDownReduce = 46,
+  kKernelF32HeadWeights = 47,
+  kKernelMtpEhNormConcat = 48,
+  kKernelPostNormAddRmsNorm = 49,
 };
 
 struct CachedPrimKey {
@@ -865,16 +869,15 @@ const mlx::core::fast::CustomKernelFunction &hy4_hc_bridge_kernel() {
       {"x_out", "h_out", "post_next"},
       R"METAL(
       constexpr int N_GATES = HEAD_ONLY ? HC : (2 * HC);
-      constexpr int TG_YNORM4_CAP = USE_TG_YNORM ? 768 : 1;
-      threadgroup float4 tg_yn4[TG_YNORM4_CAP];
-      threadgroup float tg_red[8 * (1 + N_GATES)];
-      threadgroup float tg_pre[HC];
-      threadgroup float tg_y2[8];
-      threadgroup float tg_h2[8];
-      hy4_hc_bridge_impl<HC, VEC4, SKIP_NEXT_NORM, HEAD_ONLY, USE_TG_YNORM>(
+      constexpr int R_MULT = (USE_REG && ROW2) ? 2 : 1;
+      threadgroup float tg_red[R_MULT * 8 * (1 + N_GATES)];
+      threadgroup float tg_pre[R_MULT * HC];
+      threadgroup float tg_y2[R_MULT * 8];
+      threadgroup float tg_h2[R_MULT * 8];
+      hy4_hc_bridge_impl<HC, VEC4, SKIP_NEXT_NORM, HEAD_ONLY, USE_REG, ROW2>(
           y, res, post_prev, post_norm_w, next_weight, next_scale, next_base,
           next_norm_w, params, x_out, h_out, post_next,
-          tg_yn4, tg_red, tg_pre, tg_y2, tg_h2,
+          tg_red, tg_pre, tg_y2, tg_h2,
           res_shape[0], res_shape[2], threadgroup_position_in_grid.y,
           thread_index_in_threadgroup, thread_index_in_simdgroup,
           simdgroup_index_in_threadgroup);
@@ -900,7 +903,7 @@ struct Hy4HcBridgePipelines {
 
 Hy4HcBridgePipelines hy4_hc_bridge_pipelines(mlx::core::metal::Device &device,
                                              int hc, int nsplits, int tg_x1,
-                                             bool skip_next_norm,
+                                             int m_tile, bool skip_next_norm,
                                              bool head_only) {
   const std::string lib_name = "mlx_node_hy4_hc_bridge_" + std::to_string(hc) +
                                "_" + std::to_string(nsplits) + "_" +
@@ -924,7 +927,7 @@ struct Hy4HcBridgeParams {
 )METAL";
     src += hy4_hc_fused_header();
     src += R"METAL(
-#define HY4_HC_P1_KERNEL(NAME, HO)                                            \
+#define HY4_HC_P1_KERNEL(NAME, MT, HO)                                        \
   [[kernel]] void NAME(                                                       \
       const device float* y [[buffer(0)]],                                    \
       const device float* res [[buffer(1)]],                                  \
@@ -940,12 +943,12 @@ struct Hy4HcBridgeParams {
       uint sg [[simdgroup_index_in_threadgroup]]) {                           \
     constexpr int N_GATES = (HO) ? HY4_HC : (2 * HY4_HC);                     \
     constexpr int NSG = HY4_TG_X >> 5;                                        \
-    constexpr int RED_CAP = (NSG > 1) ? (NSG * (1 + N_GATES)) : 1;            \
-    threadgroup float tg_y2[NSG];                                             \
+    constexpr int RED_CAP = (NSG > 1) ? ((MT) * NSG * (1 + N_GATES)) : 1;     \
+    threadgroup float tg_y2[(MT) * NSG];                                      \
     threadgroup float tg_red[RED_CAP];                                        \
     const float params[5] = {                                                 \
         p.post_eps, p.hc_norm_eps, p.hc_eps, p.magnitude, p.next_eps};        \
-    hy4_hc_bridge_pass1_impl<HY4_HC, HY4_NSPLITS, HY4_TG_X, HO>(              \
+    hy4_hc_bridge_pass1_impl<HY4_HC, HY4_NSPLITS, HY4_TG_X, MT, HO>(          \
         y, res, post_prev, post_norm_w, next_weight, params,                  \
         x_out, partial, tg_y2, tg_red, p.m, p.d, tgp.y, tgp.z, tid, lane,     \
         sg);                                                                  \
@@ -979,8 +982,14 @@ struct Hy4HcBridgeParams {
         p.m, p.d, tgp.y, tid, lane, sg);                                      \
   }
 
-HY4_HC_P1_KERNEL(hy4_hc_p1_f, false)
-HY4_HC_P1_KERNEL(hy4_hc_p1_h, true)
+HY4_HC_P1_KERNEL(hy4_hc_p1_f_m1, 1, false)
+HY4_HC_P1_KERNEL(hy4_hc_p1_f_m2, 2, false)
+HY4_HC_P1_KERNEL(hy4_hc_p1_f_m3, 3, false)
+HY4_HC_P1_KERNEL(hy4_hc_p1_f_m4, 4, false)
+HY4_HC_P1_KERNEL(hy4_hc_p1_h_m1, 1, true)
+HY4_HC_P1_KERNEL(hy4_hc_p1_h_m2, 2, true)
+HY4_HC_P1_KERNEL(hy4_hc_p1_h_m3, 3, true)
+HY4_HC_P1_KERNEL(hy4_hc_p1_h_m4, 4, true)
 HY4_HC_P2_KERNEL(hy4_hc_p2_00, false, false)
 HY4_HC_P2_KERNEL(hy4_hc_p2_01, false, true)
 HY4_HC_P2_KERNEL(hy4_hc_p2_10, true, false)
@@ -988,7 +997,12 @@ HY4_HC_P2_KERNEL(hy4_hc_p2_11, true, true)
 )METAL";
     return src;
   });
-  const char *p1_name = head_only ? "hy4_hc_p1_h" : "hy4_hc_p1_f";
+  static constexpr const char *kP1Names[2][4] = {
+      {"hy4_hc_p1_f_m1", "hy4_hc_p1_f_m2", "hy4_hc_p1_f_m3", "hy4_hc_p1_f_m4"},
+      {"hy4_hc_p1_h_m1", "hy4_hc_p1_h_m2", "hy4_hc_p1_h_m3", "hy4_hc_p1_h_m4"},
+  };
+  const int mt_idx = std::clamp(m_tile, 1, 4) - 1;
+  const char *p1_name = kP1Names[head_only ? 1 : 0][mt_idx];
   const char *p2_name = skip_next_norm
                             ? (head_only ? "hy4_hc_p2_11" : "hy4_hc_p2_10")
                             : (head_only ? "hy4_hc_p2_01" : "hy4_hc_p2_00");
@@ -996,17 +1010,18 @@ HY4_HC_P2_KERNEL(hy4_hc_p2_11, true, true)
           device.get_kernel(p2_name, library)};
 }
 
-// Single-graph-op multi-TG Hyper-Connections bridge: pass1 spreads the
-// 393 KiB gate matvec across NSPLITS TGs, pass2 merges partials and emits
-// h_out + post_next inside the same Metal command encoder.
+// Single-graph-op multi-TG Hyper-Connections bridge: pass1 tiles up to 4 rows
+// across NSPLITS TGs so the gate matrix is read once per split, pass2 merges
+// partials and emits h_out + post_next inside the same Metal command encoder.
 class Hy4HcBridge final : public mlx::core::Primitive {
  public:
-  Hy4HcBridge(Stream stream, int hc, int nsplits, int tg_x1,
+  Hy4HcBridge(Stream stream, int hc, int nsplits, int tg_x1, int m_tile,
               bool skip_next_norm, bool head_only, Hy4HcBridgeParams params)
       : Primitive(stream),
         hc_(hc),
         nsplits_(nsplits),
         tg_x1_(tg_x1),
+        m_tile_(m_tile),
         skip_next_norm_(skip_next_norm),
         head_only_(head_only),
         params_(params) {}
@@ -1023,7 +1038,7 @@ class Hy4HcBridge final : public mlx::core::Primitive {
   bool is_equivalent(const Primitive &other) const override {
     const auto &o = static_cast<const Hy4HcBridge &>(other);
     return hc_ == o.hc_ && nsplits_ == o.nsplits_ && tg_x1_ == o.tg_x1_ &&
-           skip_next_norm_ == o.skip_next_norm_ &&
+           m_tile_ == o.m_tile_ && skip_next_norm_ == o.skip_next_norm_ &&
            head_only_ == o.head_only_ && params_.m == o.params_.m &&
            params_.d == o.params_.d &&
            float_bits(params_.post_eps) == float_bits(o.params_.post_eps) &&
@@ -1078,8 +1093,9 @@ class Hy4HcBridge final : public mlx::core::Primitive {
     const array in7 =
         skip_next_norm_ ? inputs[7] : check_input(inputs[7], 16);
 
-    auto pso = hy4_hc_bridge_pipelines(device, hc_, nsplits_, tg_x1_,
+    auto pso = hy4_hc_bridge_pipelines(device, hc_, nsplits_, tg_x1_, m_tile_,
                                        skip_next_norm_, head_only_);
+    const int n_mblk = (params_.m + m_tile_ - 1) / m_tile_;
     enc.set_compute_pipeline_state(pso.pass1);
     enc.set_input_array(in0, 0);
     enc.set_input_array(in1, 1);
@@ -1089,7 +1105,7 @@ class Hy4HcBridge final : public mlx::core::Primitive {
     enc.set_output_array(x_out, 5);
     enc.set_output_array(partials, 6);
     enc.set_bytes(params_, 7);
-    enc.dispatch_threadgroups(MTL::Size(1, size_t(nsplits_), size_t(params_.m)),
+    enc.dispatch_threadgroups(MTL::Size(1, size_t(nsplits_), size_t(n_mblk)),
                               MTL::Size(size_t(tg_x1_), 1, 1));
 
     enc.set_compute_pipeline_state(pso.pass2);
@@ -1116,10 +1132,62 @@ class Hy4HcBridge final : public mlx::core::Primitive {
   int hc_;
   int nsplits_;
   int tg_x1_;
+  int m_tile_;
   bool skip_next_norm_;
   bool head_only_;
   Hy4HcBridgeParams params_;
 };
+
+const mlx::core::fast::CustomKernelFunction &hy4_f32_head_weights_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_f32_head_weights", {"x", "w", "scale"}, {"out"},
+#include "metal/hy4/f32_head_weights.metal.inc"
+  );
+  return kernel;
+}
+
+const std::string &hy4_mtp_fused_header() {
+  static const std::string header =
+#include "metal/hy4/mtp_fused.metal.inc"
+      ;
+  return header;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_mtp_eh_norm_concat_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_mtp_eh_norm_concat", {"e_in", "h_in", "enorm", "hnorm", "eps"},
+      {"out"},
+      R"METAL(
+      threadgroup float tg_sq[8];
+      hy4_mtp_eh_norm_concat_impl<VEC4, USE_REG>(
+          e_in, h_in, enorm, hnorm, eps, out, tg_sq,
+          e_in_shape[0], e_in_shape[1],
+          threadgroup_position_in_grid.y, threadgroup_position_in_grid.z,
+          thread_index_in_threadgroup, thread_index_in_simdgroup,
+          simdgroup_index_in_threadgroup);
+      )METAL",
+      hy4_mtp_fused_header());
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &
+hy4_post_norm_add_rms_norm_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_post_norm_add_rms_norm", {"res", "y", "post_w", "next_w", "eps"},
+      {"x_out", "h_out"},
+      R"METAL(
+      threadgroup float tg_y2[8];
+      threadgroup float tg_x2[8];
+      hy4_post_norm_add_rms_norm_impl<VEC4, USE_REG, NEED_X_OUT>(
+          res, y, post_w, next_w, eps, x_out, h_out, tg_y2, tg_x2,
+          res_shape[0], res_shape[1],
+          threadgroup_position_in_grid.y,
+          thread_index_in_threadgroup, thread_index_in_simdgroup,
+          simdgroup_index_in_threadgroup);
+      )METAL",
+      hy4_mtp_fused_header());
+  return kernel;
+}
 
 const std::string &hy4_mla_prep_q_kv_header() {
   static const std::string header =
@@ -1212,10 +1280,10 @@ mlx_array *bf16_lm_head_dispatch(const array &xa, const array &wc,
     return nullptr;
   }
   const bool fast_k = (k % 256 == 0);
-  const int nsg = 4;
-  const int rps = 2;
+  constexpr int nsg = 4;
+  const int rps = (m == 1) ? 4 : 2;
   const int r_tile = m;
-  const bool stream_x = (m > 8);
+  const bool stream_x = (m > 4);
   const int rows_per_tg = nsg * rps;
   array xc = ensure_contiguous_aligned(xa, 4);
   array w_meta = cached_u64_pair(byte_offset, uint64_t(v));
@@ -1865,8 +1933,9 @@ const mlx::core::fast::CustomKernelFunction &hy4_gguf_dedup_slots_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "hy4_gguf_dedup_slots", {"slots"}, {"dedup"},
       R"METAL(
-      threadgroup uint tg_slots[128];
-      threadgroup uint tg_sg_counts[4];
+      constexpr uint NSG_DD = uint(TG_SIZE / 32);
+      threadgroup uint tg_slots[TG_SIZE];
+      threadgroup uint tg_sg_counts[4][NSG_DD];
       const uint tid = thread_index_in_threadgroup;
       const uint lane = thread_index_in_simdgroup;
       const uint sg = simdgroup_index_in_threadgroup;
@@ -1886,36 +1955,70 @@ const mlx::core::fast::CustomKernelFunction &hy4_gguf_dedup_slots_kernel() {
       }
 
       // Start a new chunk every 4 occurrences so every compacted entry has 1..=4 matches.
-      const uint is_chunk = (tid < n_assign && (rank & 3u) == 0u) ? 1u : 0u;
-      const uint sg_off = simd_prefix_exclusive_sum(is_chunk);
-      const uint sg_tot = simd_sum(is_chunk);
-      if (lane == 0u) {
-        tg_sg_counts[sg] = sg_tot;
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      uint base = 0u;
-      for (uint s = 0u; s < sg; ++s) {
-        base += tg_sg_counts[s];
-      }
-      device uint4* out4 = reinterpret_cast<device uint4*>(dedup);
-      if (tid == 0u) {
-        const uint total_uniq =
-            tg_sg_counts[0] + tg_sg_counts[1] + tg_sg_counts[2] + tg_sg_counts[3];
-        out4[0] = uint4(total_uniq, 0u, 0u, 0u);
-      }
-      if (is_chunk != 0u) {
-        uint cnt = 0u;
-        uint packed_a = 0u;
-        uint packed_r = 0u;
+      const bool is_chunk = (tid < n_assign && (rank & 3u) == 0u);
+      uint cnt = 0u;
+      uint a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+      uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u;
+      if (is_chunk) {
         for (uint b = tid; b < n_assign && cnt < 4u; ++b) {
           if (tg_slots[b] == my_slot) {
-            packed_a |= (b & 0xFFu) << (cnt * 8u);
-            packed_r |= ((b / uint(TOP)) & 0xFFu) << (cnt * 8u);
+            const uint rid = b / uint(TOP);
+            if (cnt == 0u) { a0 = b; r0 = rid; }
+            else if (cnt == 1u) { a1 = b; r1 = rid; }
+            else if (cnt == 2u) { a2 = b; r2 = rid; }
+            else { a3 = b; r3 = rid; }
             ++cnt;
           }
         }
-        out4[1u + base + sg_off] = uint4(my_slot, cnt, packed_a, packed_r);
+      }
+
+      // Bucket sort descending by cnt (4, 3, 2, 1) to balance strided SG loops in down_combine.
+      const uint bucket = is_chunk ? (4u - cnt) : 4u;
+      uint my_sg_off = 0u;
+#pragma unroll
+      for (uint bk = 0u; bk < 4u; ++bk) {
+        const uint flag = (bucket == bk) ? 1u : 0u;
+        const uint sg_off = simd_prefix_exclusive_sum(flag);
+        const uint sg_tot = simd_sum(flag);
+        if (bucket == bk) {
+          my_sg_off = sg_off;
+        }
+        if (lane == 0u) {
+          tg_sg_counts[bk][sg] = sg_tot;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      uint bucket_tot[4];
+#pragma unroll
+      for (uint bk = 0u; bk < 4u; ++bk) {
+        uint s = 0u;
+        for (uint j = 0u; j < NSG_DD; ++j) {
+          s += tg_sg_counts[bk][j];
+        }
+        bucket_tot[bk] = s;
+      }
+
+      device uint4* out4 = reinterpret_cast<device uint4*>(dedup);
+      if (tid == 0u) {
+        const uint total_uniq =
+            bucket_tot[0] + bucket_tot[1] + bucket_tot[2] + bucket_tot[3];
+        out4[0] = uint4(total_uniq, 0u, 0u, 0u);
+      }
+      if (is_chunk) {
+        uint base = 0u;
+        for (uint bk = 0u; bk < bucket; ++bk) {
+          base += bucket_tot[bk];
+        }
+        for (uint j = 0u; j < sg; ++j) {
+          base += tg_sg_counts[bucket][j];
+        }
+        const uint py = (a0 & 0x3FFu) | ((a1 & 0x3FFu) << 10) |
+                        ((a2 & 0x3FFu) << 20) | ((cnt - 1u) << 30);
+        const uint pz = (a3 & 0x3FFu) | ((r0 & 0x3FFu) << 10) |
+                        ((r1 & 0x3FFu) << 20);
+        const uint pw = (r2 & 0x3FFu) | ((r3 & 0x3FFu) << 10);
+        out4[1u + base + my_sg_off] = uint4(my_slot, py, pz, pw);
       }
       )METAL");
   return kernel;
@@ -1941,19 +2044,33 @@ const mlx::core::fast::CustomKernelFunction &hy4_gguf_gate_up_kernel() {
   return kernel;
 }
 
-const mlx::core::fast::CustomKernelFunction &hy4_gguf_down_combine_kernel() {
+const mlx::core::fast::CustomKernelFunction &hy4_gguf_down_proj_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
-      "hy4_gguf_down_combine",
+      "hy4_gguf_down_proj",
       {"hidden", "slots", "weights", "dedup", "down_buf", "down_off", "dims"},
+      {"partial"},
+      R"METAL(
+      const uint assign = threadgroup_position_in_grid.z;
+      if (assign >= uint(slots_shape[0])) return;
+      hy4_gguf_down_proj_impl<BITS, FAST, DEDUP, MAX_MATCH, NSG, RPS>(
+          hidden, slots, weights, dedup, down_buf, down_off[0], partial,
+          slots_shape[0], hidden_shape[1], dims[1], dims[0], assign,
+          threadgroup_position_in_grid.y, simdgroup_index_in_threadgroup,
+          thread_index_in_simdgroup);
+      )METAL",
+      hy4_gguf_decode_header());
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_gguf_down_reduce_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_gguf_down_reduce",
+      {"partial"},
       {"out"},
       R"METAL(
-      constexpr int PROD_CAP = DEDUP_ROWS ? 128 : 32;
-      threadgroup float products[PROD_CAP * 4];
-      hy4_gguf_down_combine_impl<BITS, TOP, FAST, DEDUP_ROWS, MAX_MATCH>(
-          hidden, slots, weights, dedup, down_buf, down_off[0], out, products,
-          slots_shape[0], hidden_shape[1], dims[1], dims[0],
-          threadgroup_position_in_grid.z, threadgroup_position_in_grid.y,
-          simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+      hy4_gguf_down_reduce_impl<TOP, VEC4>(
+          partial, out, partial_shape[0] / TOP, partial_shape[1],
+          thread_position_in_grid.x, thread_position_in_grid.y);
       )METAL",
       hy4_gguf_decode_header());
   return kernel;
@@ -2400,7 +2517,8 @@ const mlx::core::fast::CustomKernelFunction &hy4_mla_prefill_nax_kernel() {
 
 const mlx::core::fast::CustomKernelFunction &hy4_mla_decode_nax_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
-      "hy4_mla_decode_nax", {"q", "k0", "k1", "idx", "scale", "split_cfg"},
+      "hy4_mla_decode_nax",
+      {"q", "k0", "k1", "idx", "sinks", "scale", "split_cfg"},
       {"o_part", "max_part", "sum_part"},
 #include "metal/hy4/mla_decode_nax.metal.inc"
       , hy4_mla_prefill_nax_header());
@@ -2509,28 +2627,34 @@ std::vector<array> hy4_mla_decode_v2_pass1(const array &q, const array &k0,
 
 std::vector<array> hy4_mla_decode_nax_pass1(const array &q, const array &k0,
                                             const array &k1, const array &idx,
+                                            const array &sinks,
                                             const array &scale,
                                             const array &split_cfg, bool split,
-                                            int n_splits,
+                                            int n_splits, bool single_split,
                                             const Stream &stream) {
   const int s = q.shape(0);
   const int h = q.shape(1);
-  constexpr int wn = 4;
+  constexpr int wn = 8;
   const int head_groups = h / 16;
   const std::tuple<int, int, int> grid{32, head_groups * n_splits * wn, s};
   const std::tuple<int, int, int> tg{32, wn, 1};
-  const uint64_t tmpl_key = uint64_t(split ? 1 : 0);
-  const std::vector<array> inputs{q, k0, k1, idx, scale, split_cfg};
-  const std::vector<Shape> out_shapes{
-      {s, h, n_splits, 512}, {s, h, n_splits}, {s, h, n_splits}};
+  const uint64_t tmpl_key = uint64_t(split ? 1 : 0) |
+                            (uint64_t(single_split ? 1 : 0) << 1);
+  const std::vector<array> inputs{q, k0, k1, idx, sinks, scale, split_cfg};
+  const std::vector<Shape> out_shapes =
+      single_split
+          ? std::vector<Shape>{{s, h, 512}, {1}, {1}}
+          : std::vector<Shape>{
+                {s, h, n_splits, 512}, {s, h, n_splits}, {s, h, n_splits}};
   const std::vector<Dtype> out_dtypes{
       mlx::core::float32, mlx::core::float32, mlx::core::float32};
   return dispatch_cached_kernel(
       kKernelMlaDecodeNax, stream, grid, tg, tmpl_key, inputs, out_shapes,
       out_dtypes, [&] {
         return hy4_mla_decode_nax_kernel()(
-            inputs, out_shapes, out_dtypes, grid, tg, {{"SPLIT", split}},
-            std::nullopt, false, stream);
+            inputs, out_shapes, out_dtypes, grid, tg,
+            {{"SPLIT", split}, {"SINGLE_SPLIT", single_split}}, std::nullopt,
+            false, stream);
       });
 }
 
@@ -3038,7 +3162,6 @@ bool mlx_hy4_hc_bridge(mlx_array *y, mlx_array *res, mlx_array *post_prev,
     const bool vec4 = (d % 4 == 0) && (ya.size() >= 8) && (ra.size() >= 8) &&
                       (pnwa.size() >= 8) && (nwa.size() >= 8) && nnw_vec4_ok &&
                       (size_t(m) * size_t(d) >= 8);
-    const bool use_tg_ynorm = vec4 && (d <= 3072);
     const size_t align = vec4 ? 4 : 1;
     array yc = ensure_contiguous_aligned(ya, align);
     array rc = ensure_contiguous_aligned(ra, align);
@@ -3074,10 +3197,12 @@ bool mlx_hy4_hc_bridge(mlx_array *y, mlx_array *res, mlx_array *post_prev,
       } else if (nsplits == 32) {
         tg_x1 = 96;
       }
+      const int m_tile = (m <= 4) ? m : 4;
       const Hy4HcBridgeParams bp{
           m, d, post_eps, hc_norm_eps, hc_eps, magnitude, next_eps};
       auto prim = std::make_shared<Hy4HcBridge>(stream, hc, nsplits, tg_x1,
-                                                skip_next_norm, head_only, bp);
+                                                m_tile, skip_next_norm,
+                                                head_only, bp);
       const std::vector<array> in_arrs{yc,  rc,  ppc,  pnwc,
                                        nwc, nsc, nbc, nnwc};
       const std::vector<Shape> out_s{x_shape, {m, d}, post_shape};
@@ -3095,15 +3220,19 @@ bool mlx_hy4_hc_bridge(mlx_array *y, mlx_array *res, mlx_array *post_prev,
       return true;
     }
 
+    const bool use_reg = vec4 && (hc <= 4) && (d <= 3072);
+    const bool row2 = use_reg && (m >= 64);
+    const int grid_y = row2 ? ((m + 1) / 2) : m;
     array params =
         cached_f32_five(post_eps, hc_norm_eps, hc_eps, magnitude, next_eps);
 
-    const std::tuple<int, int, int> grid{256, m, 1};
+    const std::tuple<int, int, int> grid{256, grid_y, 1};
     const std::tuple<int, int, int> tg{256, 1, 1};
     const uint64_t tmpl_key = uint64_t(hc) | (uint64_t(vec4 ? 1 : 0) << 8) |
                               (uint64_t(skip_next_norm ? 1 : 0) << 9) |
                               (uint64_t(head_only ? 1 : 0) << 10) |
-                              (uint64_t(use_tg_ynorm ? 1 : 0) << 11);
+                              (uint64_t(use_reg ? 1 : 0) << 11) |
+                              (uint64_t(row2 ? 1 : 0) << 12);
     const std::vector<array> inputs{yc,  rc,  ppc,  pnwc,  nwc,
                                     nsc, nbc, nnwc, params};
     const std::vector<Shape> out_shapes{x_shape, {m, d}, post_shape};
@@ -3118,7 +3247,8 @@ bool mlx_hy4_hc_bridge(mlx_array *y, mlx_array *res, mlx_array *post_prev,
                {"VEC4", vec4},
                {"SKIP_NEXT_NORM", skip_next_norm},
                {"HEAD_ONLY", head_only},
-               {"USE_TG_YNORM", use_tg_ynorm}},
+               {"USE_REG", use_reg},
+               {"ROW2", row2}},
               std::nullopt, false, stream);
         });
     auto h_arr = std::make_unique<array>(std::move(res_arrs[1]));
@@ -3356,9 +3486,10 @@ mlx_array *mlx_hy4_q8_dense_decode(mlx_array *x, mlx_array *w,
     array sc = ensure_contiguous_aligned(sa, 1);
 
     const int m_tile = hy4_q8_decode_m_tile(m);
-    const bool use_tg_x = (m_tile >= 2 && k >= 1024);
+    const int rps = (m_tile == 1) ? 4 : 2;
+    const int rows_per_tg = 4 * rps;
     const bool fast_k = (k % 512 == 0);
-    const int grid_y = 4 * ((n + 7) / 8);
+    const int grid_y = 4 * ((n + rows_per_tg - 1) / rows_per_tg);
     const int grid_z = (m + m_tile - 1) / m_tile;
     const auto stream = default_stream(Device::gpu);
     const std::tuple<int, int, int> grid{32, grid_y, grid_z};
@@ -3368,7 +3499,7 @@ mlx_array *mlx_hy4_q8_dense_decode(mlx_array *x, mlx_array *w,
                               (uint64_t(sym_f16 ? 1 : 0) << 9) |
                               (uint64_t(scales_f16 ? 1 : 0) << 10) |
                               (uint64_t(fast_k ? 1 : 0) << 11) |
-                              (uint64_t(use_tg_x ? 1 : 0) << 12);
+                              (uint64_t(rps) << 13);
     const std::vector<array> inputs{xc, wc, sc, bc};
     const std::vector<Shape> out_shapes{{m, n}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
@@ -3379,7 +3510,7 @@ mlx_array *mlx_hy4_q8_dense_decode(mlx_array *x, mlx_array *w,
           return hy4_q8_decode_kernel()(
               inputs, out_shapes, out_dtypes, grid, tg,
               {{"M_TILE", m_tile},
-               {"USE_TG_X", use_tg_x},
+               {"ROWS_PER_SG", rps},
                {"GROUPED", false},
                {"SYM_F16", sym_f16},
                {"FAST_K", fast_k}},
@@ -3529,6 +3660,7 @@ mlx_array *mlx_hy4_q8_grouped_decode(mlx_array *x, mlx_array *w,
     array sc = ensure_contiguous_aligned(sa, 1);
 
     const int m_tile = hy4_q8_decode_m_tile(m);
+    const int rps = 2;
     const bool fast_k = (k % 512 == 0);
     const int grid_y = 4 * ((n + 7) / 8);
     const int grid_z = g * ((m + m_tile - 1) / m_tile);
@@ -3537,7 +3669,8 @@ mlx_array *mlx_hy4_q8_grouped_decode(mlx_array *x, mlx_array *w,
     const uint64_t tmpl_key = uint64_t(m_tile) | (1ULL << 8) |
                               (uint64_t(sym_f16 ? 1 : 0) << 9) |
                               (uint64_t(scales_f16 ? 1 : 0) << 10) |
-                              (uint64_t(fast_k ? 1 : 0) << 11);
+                              (uint64_t(fast_k ? 1 : 0) << 11) |
+                              (uint64_t(rps) << 13);
     const std::vector<array> inputs{xc, wc, sc, bc};
 
     auto out = dispatch_cached_kernel(
@@ -3546,7 +3679,7 @@ mlx_array *mlx_hy4_q8_grouped_decode(mlx_array *x, mlx_array *w,
           return hy4_q8_decode_kernel()(
               inputs, out_shapes, out_dtypes, grid, tg,
               {{"M_TILE", m_tile},
-               {"USE_TG_X", false},
+               {"ROWS_PER_SG", rps},
                {"GROUPED", true},
                {"SYM_F16", sym_f16},
                {"FAST_K", fast_k}},
@@ -3976,17 +4109,41 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
     constexpr int kSplitKMaxChunk = 64;
 
     if (try_nax) {
-      // Fixed per-split key blocks depend only on H (multiples of TR=32) so
-      // trailing -1 padding in idx never shifts split or tile boundaries.
-      const int k_split_nax = (h >= 64) ? 64 : 128;
-      const int max_splits_nax = (h >= 64) ? 8 : 16;
+      // Fixed per-split key blocks depend only on H (multiples of TR=16) so
+      // row batching and trailing -1 padding never shift split boundaries.
+      static const int k_split_h64 = [] {
+        const char *v = std::getenv("MLX_HY4_MLA_KSPLIT_H64");
+        if (v && *v) {
+          const int p = std::atoi(v);
+          if (p >= 16 && p <= 512 && (p % 16) == 0) {
+            return p;
+          }
+        }
+        return 512;
+      }();
+      static const int k_split_h32 = [] {
+        const char *v = std::getenv("MLX_HY4_MLA_KSPLIT_H32");
+        if (v && *v) {
+          const int p = std::atoi(v);
+          if (p >= 16 && p <= 2048 && (p % 16) == 0) {
+            return p;
+          }
+        }
+        return 512;
+      }();
+      const int k_split_nax = (h >= 64) ? k_split_h64 : k_split_h32;
+      const int max_splits_nax =
+          std::min(16, std::max(8, 2048 / k_split_nax));
       const int n_splits_nax =
           std::min(max_splits_nax, (kmax + k_split_nax - 1) / k_split_nax);
+      const bool single_split = (n_splits_nax == 1);
       array split_cfg_nax = cached_i32_pair(n_splits_nax, k_split_nax);
 
-      static std::atomic<int> nax_ok[2]{{-1}, {-1}};
+      static std::atomic<int> nax_ok[2][2]{{{-1}, {-1}}, {{-1}, {-1}}};
+      const int sp_idx = split ? 1 : 0;
+      const int ss_idx = single_split ? 1 : 0;
       const int cached_nax =
-          nax_ok[split ? 1 : 0].load(std::memory_order_acquire);
+          nax_ok[sp_idx][ss_idx].load(std::memory_order_acquire);
 
       auto run_nax_chunked =
           [&](std::optional<std::vector<array>> first_parts) -> array {
@@ -3994,9 +4151,13 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
           auto parts =
               first_parts.has_value()
                   ? std::move(*first_parts)
-                  : hy4_mla_decode_nax_pass1(qc, k0c, k1c, idxc, scale_arr,
-                                             split_cfg_nax, split, n_splits_nax,
+                  : hy4_mla_decode_nax_pass1(qc, k0c, k1c, idxc, sinksc,
+                                             scale_arr, split_cfg_nax, split,
+                                             n_splits_nax, single_split,
                                              stream);
+          if (single_split) {
+            return std::move(parts[0]);
+          }
           return hy4_mla_splitk_merge(parts[0], parts[1], parts[2], sinksc, d_v,
                                       stream);
         }
@@ -4012,12 +4173,17 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
                 slice(qc, {row0, 0, 0}, {row1, h, d_k}, stream), 4);
             array idx_sub = ensure_contiguous_aligned(
                 slice(idxc, {row0, 0}, {row1, kmax}, stream), 1);
-            parts = hy4_mla_decode_nax_pass1(q_sub, k0c, k1c, idx_sub,
+            parts = hy4_mla_decode_nax_pass1(q_sub, k0c, k1c, idx_sub, sinksc,
                                              scale_arr, split_cfg_nax, split,
-                                             n_splits_nax, stream);
+                                             n_splits_nax, single_split,
+                                             stream);
           }
-          strips.push_back(hy4_mla_splitk_merge(parts[0], parts[1], parts[2],
-                                                sinksc, d_v, stream));
+          if (single_split) {
+            strips.push_back(std::move(parts[0]));
+          } else {
+            strips.push_back(hy4_mla_splitk_merge(parts[0], parts[1], parts[2],
+                                                  sinksc, d_v, stream));
+          }
         }
         return concatenate(strips, 0, stream);
       };
@@ -4039,10 +4205,11 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
                       slice(idxc, {0, 0}, {kSplitKMaxChunk, kmax}, stream), 1)
                 : idxc;
         auto parts = hy4_mla_decode_nax_pass1(q_probe, k0c, k1c, idx_probe,
-                                              scale_arr, split_cfg_nax, split,
-                                              n_splits_nax, stream);
-        const bool ok = (hy4_mla_pipeline_threads(parts[0]) >= 128);
-        nax_ok[split ? 1 : 0].store(ok ? 1 : 0, std::memory_order_release);
+                                              sinksc, scale_arr, split_cfg_nax,
+                                              split, n_splits_nax, single_split,
+                                              stream);
+        const bool ok = (hy4_mla_pipeline_threads(parts[0]) >= 256);
+        nax_ok[sp_idx][ss_idx].store(ok ? 1 : 0, std::memory_order_release);
         if (ok) {
           auto result = run_nax_chunked(std::move(parts));
           return reinterpret_cast<mlx_array *>(new array(std::move(result)));
@@ -4692,18 +4859,20 @@ mlx_array *mlx_hy4_router_mv(mlx_array *x, mlx_array *w) {
     array xc = ensure_contiguous_aligned(xa, 4);
     array wc = ensure_contiguous_aligned(wa, 4);
     const int m_tile = hy4_q8_decode_m_tile(m);
-    const bool fast_k = (k % 128 == 0);
-    const bool use_tg_x = (m_tile >= 2);
-    constexpr int experts_per_tg = 8;
+    const bool fast_k = (k % 512 == 0);
+    constexpr int num_sg = 2;
+    constexpr int rps = 1;
+    constexpr int experts_per_tg = num_sg * rps;
     const int n_etiles = (e + experts_per_tg - 1) / experts_per_tg;
     const int n_mtiles = (m + m_tile - 1) / m_tile;
     const auto stream = default_stream(Device::gpu);
-    const std::tuple<int, int, int> grid{32, 4, n_etiles * n_mtiles};
-    const std::tuple<int, int, int> tg{32, 4, 1};
+    const std::tuple<int, int, int> grid{32, num_sg, n_etiles * n_mtiles};
+    const std::tuple<int, int, int> tg{32, num_sg, 1};
     const uint64_t tmpl_key = uint64_t(m_tile) |
                               (uint64_t(fast_k ? 1 : 0) << 8) |
-                              (uint64_t(use_tg_x ? 1 : 0) << 9) |
-                              (uint64_t(w_f16 ? 1 : 0) << 10);
+                              (uint64_t(w_f16 ? 1 : 0) << 10) |
+                              (uint64_t(num_sg) << 12) |
+                              (uint64_t(rps) << 16);
     const std::vector<array> inputs{xc, wc};
     const std::vector<Shape> out_shapes{{m, e}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
@@ -4713,8 +4882,9 @@ mlx_array *mlx_hy4_router_mv(mlx_array *x, mlx_array *w) {
           return hy4_router_mv_kernel()(
               inputs, out_shapes, out_dtypes, grid, tg,
               {{"M_TILE", m_tile},
+               {"NUM_SG", num_sg},
+               {"RPS", rps},
                {"FAST_K", fast_k},
-               {"USE_TG_X", use_tg_x},
                {"W_F16", w_f16}},
               std::nullopt, false, stream);
         });
@@ -4821,9 +4991,9 @@ mlx_array *mlx_hy4_q8_dual_down_add(mlx_array *routed_latent,
     }
 
     const int m_tile = hy4_q8_decode_m_tile(m);
-    const bool use_tg = (m_tile >= 4);
-    const int rps = 2;
-    const int rows_per_tg = 4 * rps;
+    const bool use_tg = (m_tile >= 2);
+    constexpr int rps = 4;
+    constexpr int rows_per_tg = 4 * rps;
     const bool fast_k = (k % 512 == 0);
     const int grid_y = 4 * ((n + rows_per_tg - 1) / rows_per_tg);
     const int grid_z = (m + m_tile - 1) / m_tile;
@@ -5017,25 +5187,27 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
 
     array slots_flat = reshape(slc, {n_assign});
     const auto stream = default_stream(Device::gpu);
-    const bool dedup = (rows >= 2) && (n_assign <= 128);
+    const bool dedup = (rows >= 2) && (n_assign <= 512);
     array dedup_table = cached_zero_u32();
     if (dedup) {
-      const std::tuple<int, int, int> dd_grid{128, 1, 1};
-      const std::tuple<int, int, int> dd_tg{128, 1, 1};
+      const int dd_tg_size = (n_assign <= 128) ? 128 : ((n_assign <= 256) ? 256 : 512);
+      const std::tuple<int, int, int> dd_grid{dd_tg_size, 1, 1};
+      const std::tuple<int, int, int> dd_tg{dd_tg_size, 1, 1};
+      const uint64_t dd_tmpl = uint64_t(top) | (uint64_t(dd_tg_size) << 16);
       const std::vector<array> dd_inputs{slots_flat};
       const std::vector<Shape> dd_shapes{{n_assign + 1, 4}};
       const std::vector<Dtype> dd_dtypes{mlx::core::uint32};
       dedup_table = dispatch_cached_kernel(
-          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, uint64_t(top),
+          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, dd_tmpl,
           dd_inputs, dd_shapes, dd_dtypes, [&] {
             return hy4_gguf_dedup_slots_kernel()(
                 dd_inputs, dd_shapes, dd_dtypes, dd_grid, dd_tg,
-                {{"TOP", top}}, std::nullopt, false, stream);
+                {{"TOP", top}, {"TG_SIZE", dd_tg_size}}, std::nullopt, false, stream);
           })[0];
     }
 
     const int max_match = dedup ? 4 : 1;
-    const int gu_rps = dedup ? 2 : 4;
+    const int gu_rps = 4;
     const int gu_nsg = 4;
     const int gu_rows_per_tg = gu_nsg * gu_rps;
     const bool fast_gu = (m % gu_rows_per_tg == 0);
@@ -5067,32 +5239,54 @@ mlx_array *mlx_hy4_gguf_routed_decode(mlx_array *x, mlx_array *slots,
 
     array d_off_arr = cached_u64_scalar(down_off);
     array d_dims = cached_i32_pair(n_experts, h);
-    const bool fast_d = (h % 4 == 0);
-    const bool dc_dedup = dedup;
-    const int dc_max_match = dc_dedup ? 4 : 1;
-    constexpr int rps = 4;
-    constexpr int ksg = 8;
-    const std::tuple<int, int, int> dc_grid{
-        32, ((h + rps - 1) / rps) * ksg, dc_dedup ? 1 : rows};
-    const std::tuple<int, int, int> dc_tg{32, ksg, 1};
-    const uint64_t dc_tmpl = uint64_t(down_bits) | (uint64_t(top) << 8) |
-                             (uint64_t(fast_d ? 1 : 0) << 16) |
-                             (uint64_t(dc_dedup ? 1 : 0) << 17) |
-                             (uint64_t(dc_max_match) << 20);
-    const std::vector<array> dc_inputs{hidden, slc,       wc,    dedup_table,
-                                       dbc,    d_off_arr, d_dims};
-    const std::vector<Shape> dc_out_shapes{{rows, h}};
-    auto out = dispatch_cached_kernel(
-        kKernelGgufDownCombine, stream, dc_grid, dc_tg, dc_tmpl, dc_inputs,
-        dc_out_shapes, out_dtypes, [&] {
-          return hy4_gguf_down_combine_kernel()(
-              dc_inputs, dc_out_shapes, out_dtypes, dc_grid, dc_tg,
+    constexpr int dp_rps = 4;
+    constexpr int dp_nsg = 4;
+    constexpr int dp_rows_per_tg = dp_nsg * dp_rps;
+    const bool fast_dp = (h % dp_rows_per_tg == 0);
+    const int dp_max_match = dedup ? 4 : 1;
+    array weights_flat = reshape(wc, {n_assign});
+    const std::tuple<int, int, int> dp_grid{
+        32, ((h + dp_rows_per_tg - 1) / dp_rows_per_tg) * dp_nsg, n_assign};
+    const std::tuple<int, int, int> dp_tg{32, dp_nsg, 1};
+    const uint64_t dp_tmpl = uint64_t(down_bits) |
+                             (uint64_t(fast_dp ? 1 : 0) << 8) |
+                             (uint64_t(dedup ? 1 : 0) << 9) |
+                             (uint64_t(dp_max_match) << 12) |
+                             (uint64_t(dp_rps) << 16) |
+                             (uint64_t(dp_nsg) << 20);
+    const std::vector<array> dp_inputs{hidden, slots_flat, weights_flat,
+                                       dedup_table, dbc, d_off_arr, d_dims};
+    const std::vector<Shape> dp_out_shapes{{n_assign, h}};
+    auto partial = dispatch_cached_kernel(
+        kKernelGgufDownProj, stream, dp_grid, dp_tg, dp_tmpl, dp_inputs,
+        dp_out_shapes, out_dtypes, [&] {
+          return hy4_gguf_down_proj_kernel()(
+              dp_inputs, dp_out_shapes, out_dtypes, dp_grid, dp_tg,
               {{"BITS", down_bits},
-               {"TOP", top},
-               {"FAST", fast_d},
-               {"DEDUP_ROWS", dc_dedup},
-               {"MAX_MATCH", dc_max_match}},
+               {"FAST", fast_dp},
+               {"DEDUP", dedup},
+               {"MAX_MATCH", dp_max_match},
+               {"NSG", dp_nsg},
+               {"RPS", dp_rps}},
               std::nullopt, false, stream);
+        })[0];
+
+    const bool vec4 = (h % 4 == 0) && (size_t(n_assign) * size_t(h) >= 8) &&
+                      (size_t(rows) * size_t(h) >= 8);
+    const int cols = vec4 ? (h / 4) : h;
+    const int tg_x = std::min(cols, 128);
+    const int gx = ((cols + tg_x - 1) / tg_x) * tg_x;
+    const std::tuple<int, int, int> red_grid{gx, rows, 1};
+    const std::tuple<int, int, int> red_tg{tg_x, 1, 1};
+    const uint64_t red_tmpl = uint64_t(top) | (uint64_t(vec4 ? 1 : 0) << 8);
+    const std::vector<array> red_inputs{partial};
+    const std::vector<Shape> red_out_shapes{{rows, h}};
+    auto out = dispatch_cached_kernel(
+        kKernelGgufDownReduce, stream, red_grid, red_tg, red_tmpl, red_inputs,
+        red_out_shapes, out_dtypes, [&] {
+          return hy4_gguf_down_reduce_kernel()(
+              red_inputs, red_out_shapes, out_dtypes, red_grid, red_tg,
+              {{"TOP", top}, {"VEC4", vec4}}, std::nullopt, false, stream);
         });
     return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
   } catch (const std::exception &e) {
@@ -5710,15 +5904,16 @@ mlx_array *mlx_hy4_affine4_routed_decode(mlx_array *x, mlx_array *slots,
     if (dedup) {
       const std::tuple<int, int, int> dd_grid{128, 1, 1};
       const std::tuple<int, int, int> dd_tg{128, 1, 1};
+      const uint64_t dd_tmpl = uint64_t(top) | (uint64_t(128) << 16);
       const std::vector<array> dd_inputs{slots_flat};
       const std::vector<Shape> dd_shapes{{n_assign + 1, 4}};
       const std::vector<Dtype> dd_dtypes{mlx::core::uint32};
       dedup_table = dispatch_cached_kernel(
-          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, uint64_t(top),
+          kKernelGgufDedupSlots, stream, dd_grid, dd_tg, dd_tmpl,
           dd_inputs, dd_shapes, dd_dtypes, [&] {
             return hy4_gguf_dedup_slots_kernel()(
                 dd_inputs, dd_shapes, dd_dtypes, dd_grid, dd_tg,
-                {{"TOP", top}}, std::nullopt, false, stream);
+                {{"TOP", top}, {"TG_SIZE", 128}}, std::nullopt, false, stream);
           })[0];
     }
 
@@ -6376,6 +6571,227 @@ mlx_array *mlx_hy4_engram_gate_add(mlx_array *x, mlx_array *kv_raw,
   (void)keep_mask;
   (void)eps;
   return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_f32_head_weights(mlx_array *x, mlx_array *w, float scale) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return nullptr;
+    }
+    if (!x || !w || !std::isfinite(scale)) {
+      return nullptr;
+    }
+    const auto &xa = *reinterpret_cast<array *>(x);
+    const auto &wa = *reinterpret_cast<array *>(w);
+    if (xa.ndim() != 2 || wa.ndim() != 2 ||
+        xa.dtype() != mlx::core::float32 || wa.dtype() != mlx::core::float32) {
+      return nullptr;
+    }
+    const int m = xa.shape(0);
+    const int k = xa.shape(1);
+    const int h = wa.shape(0);
+    if (m < 1 || m > 16 || k < 8 || (k % 4) != 0 || h < 1 ||
+        wa.shape(1) != k || xa.size() < 8 || wa.size() < 8) {
+      return nullptr;
+    }
+    array xc = ensure_contiguous_aligned(xa, 4);
+    array wc = ensure_contiguous_aligned(wa, 4);
+    array scale_arr = cached_f32_scalar(scale);
+    const int m_tile = (m <= 4) ? m : ((m <= 8) ? 8 : 8);
+    const int n_mtiles = (m + m_tile - 1) / m_tile;
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{128, h, n_mtiles};
+    const std::tuple<int, int, int> tg{128, 1, 1};
+    const uint64_t tmpl_key = uint64_t(m_tile);
+    const std::vector<array> inputs{xc, wc, scale_arr};
+    const std::vector<Shape> out_shapes{{m, h}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto out = dispatch_cached_kernel(
+        kKernelF32HeadWeights, stream, grid, tg, tmpl_key, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_f32_head_weights_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg, {{"M_TILE", m_tile}},
+              std::nullopt, false, stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 f32_head_weights: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)x;
+  (void)w;
+  (void)scale;
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_hy4_mtp_eh_norm_concat(mlx_array *e, mlx_array *h,
+                                      mlx_array *enorm, mlx_array *hnorm,
+                                      float eps) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return nullptr;
+    }
+    if (!e || !h || !enorm || !hnorm || !std::isfinite(eps)) {
+      return nullptr;
+    }
+    const auto &ea = *reinterpret_cast<array *>(e);
+    const auto &ha = *reinterpret_cast<array *>(h);
+    const auto &ena = *reinterpret_cast<array *>(enorm);
+    const auto &hna = *reinterpret_cast<array *>(hnorm);
+    auto ok_in_dt = [](Dtype dt) {
+      return dt == mlx::core::float32 || dt == mlx::core::float16 ||
+             dt == mlx::core::bfloat16;
+    };
+    if (ea.ndim() != 2 || ha.ndim() != 2 || ena.ndim() != 1 ||
+        hna.ndim() != 1 || !ok_in_dt(ea.dtype()) || !ok_in_dt(ha.dtype()) ||
+        ena.dtype() != mlx::core::float32 ||
+        hna.dtype() != mlx::core::float32) {
+      return nullptr;
+    }
+    const int m = ea.shape(0);
+    const int d = ea.shape(1);
+    if (m <= 0 || d <= 0 || ha.shape(0) != m || ha.shape(1) != d ||
+        ena.shape(0) != d || hna.shape(0) != d) {
+      return nullptr;
+    }
+    const bool vec4 = (d >= 8) && ((d % 4) == 0) && (ena.size() >= 8) &&
+                      (hna.size() >= 8) && (size_t(m) * size_t(2 * d) >= 8);
+    const bool use_reg = vec4 && (d <= 3072);
+    const size_t align = vec4 ? 4 : 1;
+    array ec = ensure_contiguous_aligned(ea, 1);
+    array hc = ensure_contiguous_aligned(ha, 1);
+    array enc = ensure_contiguous_aligned(ena, align);
+    array hnc = ensure_contiguous_aligned(hna, align);
+    array eps_arr = cached_f32_scalar(eps);
+
+    auto dt_code = [](Dtype dt) -> uint64_t {
+      return (dt == mlx::core::float32)
+                 ? 0ULL
+                 : ((dt == mlx::core::float16) ? 1ULL : 2ULL);
+    };
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{256, m, 2};
+    const std::tuple<int, int, int> tg{256, 1, 1};
+    const uint64_t tmpl_key = uint64_t(vec4 ? 1 : 0) |
+                              (uint64_t(use_reg ? 1 : 0) << 1) |
+                              (dt_code(ec.dtype()) << 4) |
+                              (dt_code(hc.dtype()) << 12);
+    const std::vector<array> inputs{ec, hc, enc, hnc, eps_arr};
+    const std::vector<Shape> out_shapes{{m, 2 * d}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32};
+    auto out = dispatch_cached_kernel(
+        kKernelMtpEhNormConcat, stream, grid, tg, tmpl_key, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_mtp_eh_norm_concat_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"VEC4", vec4}, {"USE_REG", use_reg}}, std::nullopt, false,
+              stream);
+        });
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 mtp_eh_norm_concat: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)e;
+  (void)h;
+  (void)enorm;
+  (void)hnorm;
+  (void)eps;
+  return nullptr;
+#endif
+}
+
+bool mlx_hy4_post_norm_add_rms_norm(mlx_array *res, mlx_array *y,
+                                    mlx_array *post_w, mlx_array *next_w,
+                                    float eps, bool need_x_out,
+                                    mlx_array **out_x, mlx_array **out_h) {
+  if (out_x)
+    *out_x = nullptr;
+  if (out_h)
+    *out_h = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return false;
+    }
+    if (!res || !y || !post_w || !next_w || !out_h ||
+        (need_x_out && !out_x) || !std::isfinite(eps)) {
+      return false;
+    }
+    const auto &ra = *reinterpret_cast<array *>(res);
+    const auto &ya = *reinterpret_cast<array *>(y);
+    const auto &pwa = *reinterpret_cast<array *>(post_w);
+    const auto &nwa = *reinterpret_cast<array *>(next_w);
+    if (ra.ndim() != 2 || ya.ndim() != 2 || pwa.ndim() != 1 ||
+        nwa.ndim() != 1 || ra.dtype() != mlx::core::float32 ||
+        ya.dtype() != mlx::core::float32 ||
+        pwa.dtype() != mlx::core::float32 ||
+        nwa.dtype() != mlx::core::float32) {
+      return false;
+    }
+    const int m = ra.shape(0);
+    const int d = ra.shape(1);
+    if (m <= 0 || d <= 0 || ya.shape(0) != m || ya.shape(1) != d ||
+        pwa.shape(0) != d || nwa.shape(0) != d) {
+      return false;
+    }
+    const bool vec4 = (d >= 8) && ((d % 4) == 0) && (ra.size() >= 8) &&
+                      (ya.size() >= 8) && (pwa.size() >= 8) &&
+                      (nwa.size() >= 8);
+    const bool use_reg = vec4 && (d <= 3072);
+    const size_t align = vec4 ? 4 : 1;
+    array rc = ensure_contiguous_aligned(ra, align);
+    array yc = ensure_contiguous_aligned(ya, align);
+    array pwc = ensure_contiguous_aligned(pwa, align);
+    array nwc = ensure_contiguous_aligned(nwa, align);
+    array eps_arr = cached_f32_scalar(eps);
+
+    const Shape x_shape = need_x_out ? Shape{m, d} : Shape{1};
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{256, m, 1};
+    const std::tuple<int, int, int> tg{256, 1, 1};
+    const uint64_t tmpl_key = uint64_t(vec4 ? 1 : 0) |
+                              (uint64_t(use_reg ? 1 : 0) << 1) |
+                              (uint64_t(need_x_out ? 1 : 0) << 2);
+    const std::vector<array> inputs{rc, yc, pwc, nwc, eps_arr};
+    const std::vector<Shape> out_shapes{x_shape, {m, d}};
+    const std::vector<Dtype> out_dtypes{mlx::core::float32, mlx::core::float32};
+    auto res_arrs = dispatch_cached_kernel(
+        kKernelPostNormAddRmsNorm, stream, grid, tg, tmpl_key, inputs,
+        out_shapes, out_dtypes, [&] {
+          return hy4_post_norm_add_rms_norm_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"VEC4", vec4}, {"USE_REG", use_reg}, {"NEED_X_OUT", need_x_out}},
+              std::nullopt, false, stream);
+        });
+    auto h_arr = std::make_unique<array>(std::move(res_arrs[1]));
+    if (need_x_out) {
+      auto x_arr = std::make_unique<array>(std::move(res_arrs[0]));
+      *out_x = reinterpret_cast<mlx_array *>(x_arr.release());
+    }
+    *out_h = reinterpret_cast<mlx_array *>(h_arr.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 post_norm_add_rms_norm: " << e.what() << std::endl;
+    return false;
+  }
+#else
+  (void)res;
+  (void)y;
+  (void)post_w;
+  (void)next_w;
+  (void)eps;
+  (void)need_x_out;
+  return false;
 #endif
 }
 

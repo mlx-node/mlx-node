@@ -232,16 +232,16 @@ inline void hy4_q8_grouped_k512_impl(
   float acc[M_TILE][2];
 
   if constexpr (SYM_F16) {
-    const float4 q0_0 = float4(as_type<char4>(w0_u.x ^ 0x80808080u));
-    const float4 q0_1 = float4(as_type<char4>(w0_u.y ^ 0x80808080u));
-    const float4 q0_2 = float4(as_type<char4>(w0_u.z ^ 0x80808080u));
-    const float4 q0_3 = float4(as_type<char4>(w0_u.w ^ 0x80808080u));
-
-    const float4 q1_0 = float4(as_type<char4>(w1_u.x ^ 0x80808080u));
-    const float4 q1_1 = float4(as_type<char4>(w1_u.y ^ 0x80808080u));
-    const float4 q1_2 = float4(as_type<char4>(w1_u.z ^ 0x80808080u));
-    const float4 q1_3 = float4(as_type<char4>(w1_u.w ^ 0x80808080u));
-
+    // Int8 weights are exact in FP16: holding both rows as half4 uses 16 32-bit
+    // regs (half of float4) while sharing each x0..x3 load across both rows.
+    const half4 w00 = half4(as_type<char4>(w0_u.x ^ 0x80808080u));
+    const half4 w01 = half4(as_type<char4>(w0_u.y ^ 0x80808080u));
+    const half4 w02 = half4(as_type<char4>(w0_u.z ^ 0x80808080u));
+    const half4 w03 = half4(as_type<char4>(w0_u.w ^ 0x80808080u));
+    const half4 w10 = half4(as_type<char4>(w1_u.x ^ 0x80808080u));
+    const half4 w11 = half4(as_type<char4>(w1_u.y ^ 0x80808080u));
+    const half4 w12 = half4(as_type<char4>(w1_u.z ^ 0x80808080u));
+    const half4 w13 = half4(as_type<char4>(w1_u.w ^ 0x80808080u));
 #pragma unroll
     for (int r = 0; r < M_TILE; ++r) {
       const int mr = metal::min(row0 + r, M - 1);
@@ -252,26 +252,26 @@ inline void hy4_q8_grouped_k512_impl(
       const float4 x1 = xp[1];
       const float4 x2 = xp[2];
       const float4 x3 = xp[3];
-      const float d0 = metal::dot(x0, q0_0) + metal::dot(x1, q0_1) +
-                       metal::dot(x2, q0_2) + metal::dot(x3, q0_3);
-      const float d1 = metal::dot(x0, q1_0) + metal::dot(x1, q1_1) +
-                       metal::dot(x2, q1_2) + metal::dot(x3, q1_3);
+      const float d0 =
+          metal::dot(x0, float4(w00)) + metal::dot(x1, float4(w01)) +
+          metal::dot(x2, float4(w02)) + metal::dot(x3, float4(w03));
+      const float d1 =
+          metal::dot(x0, float4(w10)) + metal::dot(x1, float4(w11)) +
+          metal::dot(x2, float4(w12)) + metal::dot(x3, float4(w13));
       acc[r][0] = d0 * sc0;
       acc[r][1] = d1 * sc1;
     }
   } else {
     const float bi0 = float(biases[wrow0 * size_t(N_GRP) + size_t(grp)]);
     const float bi1 = float(biases[wrow1 * size_t(N_GRP) + size_t(grp)]);
-    const float4 q0_0 = float4(as_type<uchar4>(w0_u.x));
-    const float4 q0_1 = float4(as_type<uchar4>(w0_u.y));
-    const float4 q0_2 = float4(as_type<uchar4>(w0_u.z));
-    const float4 q0_3 = float4(as_type<uchar4>(w0_u.w));
-
-    const float4 q1_0 = float4(as_type<uchar4>(w1_u.x));
-    const float4 q1_1 = float4(as_type<uchar4>(w1_u.y));
-    const float4 q1_2 = float4(as_type<uchar4>(w1_u.z));
-    const float4 q1_3 = float4(as_type<uchar4>(w1_u.w));
-
+    const half4 w00 = half4(as_type<uchar4>(w0_u.x));
+    const half4 w01 = half4(as_type<uchar4>(w0_u.y));
+    const half4 w02 = half4(as_type<uchar4>(w0_u.z));
+    const half4 w03 = half4(as_type<uchar4>(w0_u.w));
+    const half4 w10 = half4(as_type<uchar4>(w1_u.x));
+    const half4 w11 = half4(as_type<uchar4>(w1_u.y));
+    const half4 w12 = half4(as_type<uchar4>(w1_u.z));
+    const half4 w13 = half4(as_type<uchar4>(w1_u.w));
 #pragma unroll
     for (int r = 0; r < M_TILE; ++r) {
       const int mr = metal::min(row0 + r, M - 1);
@@ -284,10 +284,12 @@ inline void hy4_q8_grouped_k512_impl(
       const float4 x3 = xp[3];
       const float4 xs = (x0 + x1) + (x2 + x3);
       const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
-      const float d0 = metal::dot(x0, q0_0) + metal::dot(x1, q0_1) +
-                       metal::dot(x2, q0_2) + metal::dot(x3, q0_3);
-      const float d1 = metal::dot(x0, q1_0) + metal::dot(x1, q1_1) +
-                       metal::dot(x2, q1_2) + metal::dot(x3, q1_3);
+      const float d0 =
+          metal::dot(x0, float4(w00)) + metal::dot(x1, float4(w01)) +
+          metal::dot(x2, float4(w02)) + metal::dot(x3, float4(w03));
+      const float d1 =
+          metal::dot(x0, float4(w10)) + metal::dot(x1, float4(w11)) +
+          metal::dot(x2, float4(w12)) + metal::dot(x3, float4(w13));
       acc[r][0] = metal::fma(d0, sc0, xsum * bi0);
       acc[r][1] = metal::fma(d1, sc1, xsum * bi1);
     }

@@ -1837,15 +1837,6 @@ impl Inner {
 
     /// One draft row at the end of `seq`'s draft from `h` and `emb`, deferring
     /// KV/indexer eval to the caller's scope.
-    pub(super) fn draft_row_lazy(
-        &mut self,
-        seq: SeqId,
-        h: &MxArray,
-        emb: &MxArray,
-    ) -> Result<(MxArray, MxArray)> {
-        self.draft_row_lazy_with_persist(seq, h, emb, true)
-    }
-
     pub(super) fn draft_row_lazy_with_persist(
         &mut self,
         seq: SeqId,

@@ -232,11 +232,24 @@ impl MtpStepper for Flat<'_> {
     }
 
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
+        self.draft_step_with_persist(prev_h, prev_emb, true)
+    }
+
+    fn draft_step_with_persist(
+        &mut self,
+        prev_h: &MxArray,
+        prev_emb: &MxArray,
+        persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
         self.draft_scope
             .get_or_insert_with(super::stats::DeferScope::enter);
-        let (model, mtp) = (self.model, self.mtp);
+        let (model, mtp, committed) = (self.model, self.mtp, self.committed);
         let d = self.draft_mut()?;
-        mtp.draft_lazy(model, d, prev_h, prev_emb)
+        // On a chained cycle `begin_cycle` cuts one row below `committed` and
+        // `commit_mtp` reuses the row written by slot 0, so rows below
+        // `committed` must persist both KV and indexer state.
+        let persist = persist_state || d.len() < committed;
+        mtp.draft_lazy_with_persist(model, d, prev_h, prev_emb, persist)
     }
 
     fn verify_step(
@@ -374,9 +387,13 @@ impl MtpStepper for Flat<'_> {
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
         let keep = unemitted_keep(self.seq.len(), unemitted);
+        let committed = self.committed;
         let r = self.cut_trunk(keep).and_then(|()| {
             let d = self.draft_mut()?;
-            let rows = d.len().min(keep.saturating_sub(1));
+            let rows = committed
+                .min(d.len())
+                .min(d.index().len())
+                .min(keep.saturating_sub(1));
             d.cut(rows)?;
             Ok(rows)
         });
@@ -488,9 +505,19 @@ impl MtpStepper for Paged<'_> {
     }
 
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
+        self.draft_step_with_persist(prev_h, prev_emb, true)
+    }
+
+    fn draft_step_with_persist(
+        &mut self,
+        prev_h: &MxArray,
+        prev_emb: &MxArray,
+        persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
         self.draft_scope
             .get_or_insert_with(super::stats::DeferScope::enter);
-        self.inner.draft_row_lazy(self.seq, prev_h, prev_emb)
+        self.inner
+            .draft_row_lazy_with_persist(self.seq, prev_h, prev_emb, persist_state)
     }
 
     fn verify_step(
@@ -667,6 +694,18 @@ impl MtpStepper for Stepper<'_> {
         match self {
             Self::Flat(s) => s.draft_step(prev_h, prev_emb),
             Self::Paged(s) => s.draft_step(prev_h, prev_emb),
+        }
+    }
+
+    fn draft_step_with_persist(
+        &mut self,
+        prev_h: &MxArray,
+        prev_emb: &MxArray,
+        persist_state: bool,
+    ) -> Result<(MxArray, MxArray)> {
+        match self {
+            Self::Flat(s) => s.draft_step_with_persist(prev_h, prev_emb, persist_state),
+            Self::Paged(s) => s.draft_step_with_persist(prev_h, prev_emb, persist_state),
         }
     }
 

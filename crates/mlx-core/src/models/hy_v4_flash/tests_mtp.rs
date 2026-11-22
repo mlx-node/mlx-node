@@ -46,30 +46,79 @@ fn info(t: &Value) -> GgufTensorInfo {
 
 #[test]
 fn held_bytes_match_the_fixture() {
-    let f = fixture();
-    let mut total = 0u64;
-    let mut experts = 0u64;
-    for t in f["tensors"].as_array().unwrap() {
-        let expert = t["category"] == "routed_expert";
-        let i = info(t);
-        let want = t["plan_form"]["bytes"].as_u64().unwrap();
-        assert_eq!(held_bytes(&i, expert).unwrap(), want, "{}", i.name);
-        let form = match held(&i, expert).unwrap() {
-            Held::SymQ8 => "symq8_g32_f16_scale",
-            Held::F32 => "f32",
-            Held::Affine4 => "affine4_g64_bf16_scale_bias",
-        };
-        assert_eq!(t["plan_form"]["form"], form, "{}", i.name);
-        total += want;
-        if expert {
-            experts += want;
-        }
-    }
-    assert_eq!(total, f["totals"]["plan_bytes"].as_u64().unwrap());
+    use super::mtp_weights::{MtpDenseMode, parse_mtp_dense_mode, with_mtp_dense};
+
+    assert_eq!(parse_mtp_dense_mode(None).unwrap(), MtpDenseMode::SymQ8);
+    assert_eq!(parse_mtp_dense_mode(Some("")).unwrap(), MtpDenseMode::SymQ8);
     assert_eq!(
-        experts,
-        f["totals"]["routed_expert_plan_bytes"].as_u64().unwrap()
+        parse_mtp_dense_mode(Some("symq8")).unwrap(),
+        MtpDenseMode::SymQ8
     );
+    assert_eq!(parse_mtp_dense_mode(Some("q4")).unwrap(), MtpDenseMode::Q4);
+    assert_eq!(
+        parse_mtp_dense_mode(Some(" Q4 ")).unwrap(),
+        MtpDenseMode::Q4
+    );
+    assert!(parse_mtp_dense_mode(Some("bf16")).is_err());
+
+    let f = fixture();
+    with_mtp_dense(MtpDenseMode::SymQ8, || {
+        let mut total = 0u64;
+        let mut experts = 0u64;
+        for t in f["tensors"].as_array().unwrap() {
+            let expert = t["category"] == "routed_expert";
+            let i = info(t);
+            let want = t["plan_form"]["bytes"].as_u64().unwrap();
+            assert_eq!(held_bytes(&i, expert).unwrap(), want, "{}", i.name);
+            let form = match held(&i, expert).unwrap() {
+                Held::SymQ8 => "symq8_g32_f16_scale",
+                Held::F32 => "f32",
+                Held::Affine4 => "affine4_g64_bf16_scale_bias",
+            };
+            assert_eq!(t["plan_form"]["form"], form, "{}", i.name);
+            total += want;
+            if expert {
+                experts += want;
+            }
+        }
+        assert_eq!(total, f["totals"]["plan_bytes"].as_u64().unwrap());
+        assert_eq!(
+            experts,
+            f["totals"]["routed_expert_plan_bytes"].as_u64().unwrap()
+        );
+    });
+
+    with_mtp_dense(MtpDenseMode::Q4, || {
+        let mut q4_non_expert = 0u64;
+        for t in f["tensors"].as_array().unwrap() {
+            let expert = t["category"] == "routed_expert";
+            let i = info(t);
+            let n = i.num_elements().unwrap();
+            let got = held(&i, expert).unwrap();
+            let got_b = held_bytes(&i, expert).unwrap();
+            if expert {
+                assert_eq!(got, Held::Affine4, "{}", i.name);
+            } else if t["plan_form"]["form"] == "symq8_g32_f16_scale" {
+                assert_eq!(got, Held::Affine4, "{}", i.name);
+                assert_eq!(got_b, n / 2 + n / 16, "{}", i.name);
+                q4_non_expert += got_b;
+            } else {
+                assert_eq!(got, Held::F32, "{}", i.name);
+                assert_eq!(
+                    got_b,
+                    t["plan_form"]["bytes"].as_u64().unwrap(),
+                    "{}",
+                    i.name
+                );
+                q4_non_expert += got_b;
+            }
+        }
+        let sym_non_expert = f["totals"]["non_expert_plan_bytes"].as_u64().unwrap();
+        assert!(
+            q4_non_expert + 50_000_000 < sym_non_expert,
+            "Q4 non-expert {q4_non_expert} should save >50 MB vs SymQ8 {sym_non_expert}"
+        );
+    });
 }
 
 #[test]
@@ -943,7 +992,8 @@ fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
     use super::mtp_weights::MtpWeights;
     use super::weights::{
         AttnWeights, Dense, Ffn, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Residual,
-        quantize_sym_q8_array, quantize_sym_q8_from_bf16_raw,
+        quantize_affine4_array, quantize_affine4_from_bf16_raw, quantize_sym_q8_array,
+        quantize_sym_q8_from_bf16_raw,
     };
     use crate::array::DType;
     use crate::cache_limit::coordinator;
@@ -972,8 +1022,10 @@ fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
         MxArray::from_float32(v, &s).unwrap()
     }
 
-    assert_eq!(parse_mtp_head_mode(None).unwrap(), MtpHeadMode::SymQ8);
-    assert_eq!(parse_mtp_head_mode(Some("")).unwrap(), MtpHeadMode::SymQ8);
+    assert_eq!(parse_mtp_head_mode(None).unwrap(), MtpHeadMode::Q4);
+    assert_eq!(parse_mtp_head_mode(Some("")).unwrap(), MtpHeadMode::Q4);
+    assert_eq!(parse_mtp_head_mode(Some("q4")).unwrap(), MtpHeadMode::Q4);
+    assert_eq!(parse_mtp_head_mode(Some(" Q4 ")).unwrap(), MtpHeadMode::Q4);
     assert_eq!(
         parse_mtp_head_mode(Some("symq8")).unwrap(),
         MtpHeadMode::SymQ8
@@ -990,9 +1042,9 @@ fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
         parse_mtp_head_mode(Some("BF16")).unwrap(),
         MtpHeadMode::Bf16
     );
-    assert!(parse_mtp_head_mode(Some("q4")).is_err());
+    assert!(parse_mtp_head_mode(Some("q2")).is_err());
 
-    // Direct raw BF16 -> SymQ8 matches array -> SymQ8 and keeps tight parity.
+    // Direct raw BF16 -> SymQ8 & Q4 g64 match array quantizers and keep tight parity.
     let (vocab, dim) = (128usize, 64usize);
     let mut r = Rng::new(701);
     let bf16_u16: Vec<u16> = r
@@ -1014,18 +1066,41 @@ fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
     assert_eq!(from_raw.nbytes(), vocab * dim + vocab * dim / 16);
     assert_eq!(from_arr.nbytes(), from_raw.nbytes());
 
+    let q4_from_raw = quantize_affine4_from_bf16_raw(&bf16_raw, vocab, dim).unwrap();
+    let q4_from_arr = quantize_affine4_array(&bf16_arr).unwrap();
+    assert_eq!(q4_from_raw.nbytes(), vocab * dim / 2 + vocab * dim / 16);
+    assert_eq!(q4_from_arr.nbytes(), q4_from_raw.nbytes());
+
     let x = arr(&r.vec(4 * dim, 1.0), &[4, dim]);
     let bf16_dense = Dense::Array(bf16_arr);
     let want = super::model::head_rows(&x, &bf16_dense).unwrap();
     let got_raw = super::model::head_rows(&x, &from_raw).unwrap();
     let got_arr = super::model::head_rows(&x, &from_arr).unwrap();
+    let got_q4_raw = super::model::head_rows(&x, &q4_from_raw).unwrap();
+    let got_q4_arr = super::model::head_rows(&x, &q4_from_arr).unwrap();
     let w_v = want.to_float32().unwrap();
     let r_v = got_raw.to_float32().unwrap();
     let a_v = got_arr.to_float32().unwrap();
+    let q4_r_v = got_q4_raw.to_float32().unwrap();
+    let q4_a_v = got_q4_arr.to_float32().unwrap();
     assert_eq!(
         r_v.as_ref(),
         a_v.as_ref(),
         "raw vs array SymQ8 must match bit-for-bit"
+    );
+    assert_eq!(
+        q4_r_v.as_ref(),
+        q4_a_v.as_ref(),
+        "raw vs array Q4 g64 must match bit-for-bit"
+    );
+    let max_diff_q4 = w_v
+        .iter()
+        .zip(q4_a_v.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff_q4 < 0.6,
+        "Q4 g64 draft head max logit diff {max_diff_q4}"
     );
     let max_diff = w_v
         .iter()
@@ -1227,6 +1302,13 @@ fn mtp_head_env_and_symq8_draft_head_accounting_and_parity() {
             .unwrap(),
     );
 
+    let q4 = with_mtp_head(MtpHeadMode::Q4, || {
+        MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
+    });
+    assert!(matches!(q4.draft_head(), Some(Dense::Qmm4 { .. })));
+    let expected_q4_bytes = (V * D / 2 + V * D / 16) as u64;
+    assert_eq!(q4.bytes(), 1234 + expected_q4_bytes);
+
     let sym = with_mtp_head(MtpHeadMode::SymQ8, || {
         MtpLayer::new_with_head(&cfg, make_mw(11), &tok_embd, Some(&out_head)).unwrap()
     });
@@ -1252,11 +1334,7 @@ fn real_held_layer_matches_the_fixture() {
     let opts = super::store::Options::from_env(Some(16_384), true).unwrap();
     let store = super::store::Store::open(&paths, &opts).unwrap();
     let m = super::mtp::MtpLayer::load(&store.scan, &store.shards, &store.model).unwrap();
-    let draft_head = super::mtp::draft_head_bytes(&store.scan).unwrap();
-    assert_eq!(
-        m.bytes(),
-        fixture()["totals"]["plan_bytes"].as_u64().unwrap() + draft_head
-    );
+    assert_eq!(m.bytes(), super::store::mtp_bytes(&store.scan).unwrap());
 }
 
 fn chat_msg(role: &str, content: &str) -> crate::tokenizer::ChatMessage {
@@ -1281,16 +1359,25 @@ fn real_greedy_mtp_matches_ar() {
     };
     let ar =
         crate::engine::session::session_start(&mut inner, msgs(), cfg(false, 1), &flag).unwrap();
+    println!(
+        "AR: tps={:.2}",
+        ar.performance
+            .as_ref()
+            .map_or(0.0, |p| p.decode_tokens_per_second)
+    );
     for depth in 1..=3 {
         inner.reset_caches(ResetScope::Command).unwrap();
         let r = crate::engine::session::session_start(&mut inner, msgs(), cfg(true, depth), &flag)
             .unwrap();
         println!(
-            "depth {depth}: {:?} perf {:?}",
+            "depth {depth}: {:?} perf {:?} tps={:.2}",
             r.text,
             r.performance
                 .as_ref()
-                .map(|p| (p.mtp_cycles, p.mtp_mean_accepted_tokens))
+                .map(|p| (p.mtp_cycles, p.mtp_mean_accepted_tokens)),
+            r.performance
+                .as_ref()
+                .map_or(0.0, |p| p.decode_tokens_per_second)
         );
         assert_eq!(r.text, ar.text, "depth {depth}");
         assert!(

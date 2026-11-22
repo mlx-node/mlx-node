@@ -44,8 +44,7 @@ use super::mtp::SEEDS;
 use super::rows::{EngramRows, F8Table, PrefetchHandle};
 use super::scan::{Role, Scan};
 use super::weights::{
-    Form, MmapDense, Resident, form, mmap_dense_saved_bytes, mmap_dense_spec, resident_bytes,
-    role_resident,
+    Form, MmapDense, Resident, form, mmap_dense_saved_bytes, mmap_dense_spec, role_resident,
 };
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::deepseek_v41::store::POOL_LIMIT;
@@ -403,9 +402,9 @@ fn routing_arch() -> Result<String> {
 }
 
 /// Resident bytes of the MTP layer as it is held: routed experts affine-4
-/// g64 (bf16 scales and biases), other BF16 matrices symmetric Q8_0 g32
-/// (`Dense::SymQ8`), the rest as `weights::resident_bytes`, plus the optional
-/// draft-only SymQ8 LM head when enabled. 0 without an MTP layer.
+/// g64 (bf16 scales and biases), other BF16 matrices per `MLX_HY4_MTP_DENSE`
+/// (`symq8` default or `q4`), the rest as `weights::resident_bytes`, plus the
+/// optional draft-only LM head per `MLX_HY4_MTP_HEAD`. 0 without an MTP layer.
 pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
     let add = |acc: u64, b: u64| {
         acc.checked_add(b)
@@ -413,13 +412,7 @@ pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
     };
     let mut n = 0u64;
     for (_, loc) in scan.with_role(Role::Mtp) {
-        let b = match form(Role::Mtp, &loc.info)? {
-            Form::Bf16 => {
-                let v = loc.info.num_elements()?;
-                v + v / 16
-            }
-            _ => resident_bytes(Role::Mtp, &loc.info)?,
-        };
+        let b = super::mtp_weights::held_bytes(&loc.info, false)?;
         n = add(n, b)?;
     }
     if let Some(l) = scan.mtp_experts() {

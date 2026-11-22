@@ -1998,3 +1998,127 @@ pub(crate) fn try_engram_gate_add(
         "hy_v4_flash engram_gate_add",
     )?))
 }
+
+/// Single-dispatch row-invariant f32 GEMV with folded `scale` for `1..=16` rows.
+pub(crate) fn try_f32_head_weights(x: &MxArray, w: &Dense, scale: f32) -> Result<Option<MxArray>> {
+    let Dense::Array(wf) = w else {
+        return Ok(None);
+    };
+    if x.ndim()? != 2 || wf.ndim()? != 2 || wf.dtype()? != DType::Float32 {
+        return Ok(None);
+    }
+    let m = x.shape_at(0)?;
+    let k = x.shape_at(1)?;
+    if !(1..=16).contains(&m) || k < 8 || k % 4 != 0 || wf.shape_at(1)? != k {
+        return Ok(None);
+    }
+    let xf = as_f32(x)?;
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe { mlx_sys::mlx_hy4_f32_head_weights(xf.as_raw_ptr(), wf.as_raw_ptr(), scale) };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        h,
+        "hy_v4_flash f32_head_weights",
+    )?))
+}
+
+/// Single-dispatch `[rms(e) * enorm ; rms(h) * hnorm]` into `[M, 2 * D]` f32.
+pub(crate) fn try_mtp_eh_norm_concat(
+    e: &MxArray,
+    h: &MxArray,
+    enorm: &MxArray,
+    hnorm: &MxArray,
+    eps: f32,
+) -> Result<Option<MxArray>> {
+    if e.ndim()? != 2 || h.ndim()? != 2 || enorm.ndim()? != 1 || hnorm.ndim()? != 1 {
+        return Ok(None);
+    }
+    let ef = if matches!(
+        e.dtype()?,
+        DType::Float32 | DType::Float16 | DType::BFloat16
+    ) {
+        e.clone()
+    } else {
+        e.astype(DType::Float32)?
+    };
+    let hf = if matches!(
+        h.dtype()?,
+        DType::Float32 | DType::Float16 | DType::BFloat16
+    ) {
+        h.clone()
+    } else {
+        h.astype(DType::Float32)?
+    };
+    let enf = as_f32(enorm)?;
+    let hnf = as_f32(hnorm)?;
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let out = unsafe {
+        mlx_sys::mlx_hy4_mtp_eh_norm_concat(
+            ef.as_raw_ptr(),
+            hf.as_raw_ptr(),
+            enf.as_raw_ptr(),
+            hnf.as_raw_ptr(),
+            eps,
+        )
+    };
+    if out.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(
+        out,
+        "hy_v4_flash mtp_eh_norm_concat",
+    )?))
+}
+
+/// Single-dispatch `x_out = res + rms(y) * post_w`, `h_out = rms(x_out) * next_w`.
+/// When `need_x_out` is false, `x_out` is omitted and returned as `None`.
+pub(crate) fn try_post_norm_add_rms_norm(
+    res: &MxArray,
+    y: &MxArray,
+    post_w: &MxArray,
+    next_w: &MxArray,
+    eps: f32,
+    need_x_out: bool,
+) -> Result<Option<(Option<MxArray>, MxArray)>> {
+    if res.ndim()? != 2 || y.ndim()? != 2 || post_w.ndim()? != 1 || next_w.ndim()? != 1 {
+        return Ok(None);
+    }
+    let rf = as_f32(res)?;
+    let yf = as_f32(y)?;
+    let pwf = as_f32(post_w)?;
+    let nwf = as_f32(next_w)?;
+    let mut out_x = std::ptr::null_mut();
+    let mut out_h = std::ptr::null_mut();
+    // SAFETY: live array handles; out pointers are set only when returning true.
+    let ok = unsafe {
+        mlx_sys::mlx_hy4_post_norm_add_rms_norm(
+            rf.as_raw_ptr(),
+            yf.as_raw_ptr(),
+            pwf.as_raw_ptr(),
+            nwf.as_raw_ptr(),
+            eps,
+            need_x_out,
+            if need_x_out {
+                &mut out_x
+            } else {
+                std::ptr::null_mut()
+            },
+            &mut out_h,
+        )
+    };
+    if !ok || out_h.is_null() {
+        return Ok(None);
+    }
+    let h = MxArray::from_handle(out_h, "hy_v4_flash post_norm_add_rms_norm h")?;
+    let x = if need_x_out {
+        Some(MxArray::from_handle(
+            out_x,
+            "hy_v4_flash post_norm_add_rms_norm x",
+        )?)
+    } else {
+        None
+    };
+    Ok(Some((x, h)))
+}

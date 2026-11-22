@@ -148,7 +148,8 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // the distribution row stay in line with the rows after it); only
         // its token is the end's, with no draw.
         let end_token = end_proposals.get(slot).copied();
-        let (h_next, draft_logits) = step.draft_step(&prev_hidden, &prev_emb)?;
+        let (h_next, draft_logits) =
+            step.draft_step_with_persist(&prev_hidden, &prev_emb, slot + 1 < depth)?;
         let logits_1d = if use_sparse_accept {
             None
         } else {

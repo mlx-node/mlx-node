@@ -17,7 +17,8 @@ use super::moe::{AffineExperts, AffineProj};
 use super::scan::{ExpertClass, Located, Role, Scan};
 use super::weights::{
     AttnWeights, Dense, Ffn, Form, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader,
-    Residual, dense_from_raw, held_shape, quantize_sym_q8_from_bf16_raw,
+    Residual, dense_from_raw, held_shape, quantize_affine4_from_bf16_raw,
+    quantize_sym_q8_from_bf16_raw,
 };
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
@@ -30,10 +31,59 @@ pub const EXPERT_GROUP: i32 = 64;
 pub const EXPERT_BITS: i32 = 4;
 pub const DENSE_GROUP: i32 = 32;
 pub const DENSE_BITS: i32 = 8;
+/// MTP non-expert BF16 dense weight format override (`symq8` default, `q4` opt-in).
+pub const MTP_DENSE_ENV: &str = "MLX_HY4_MTP_DENSE";
 const COMPRESSOR_MATS: [&str; 2] = [
     ".indexer_compressor_value.weight",
     ".indexer_compressor_gate.weight",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpDenseMode {
+    Q4,
+    SymQ8,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MTP_DENSE: std::cell::Cell<Option<MtpDenseMode>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn parse_mtp_dense_mode(raw: Option<&str>) -> Result<MtpDenseMode> {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(MtpDenseMode::SymQ8);
+    };
+    if v.eq_ignore_ascii_case("q4") {
+        Ok(MtpDenseMode::Q4)
+    } else if v.eq_ignore_ascii_case("symq8") {
+        Ok(MtpDenseMode::SymQ8)
+    } else {
+        Err(bad(format!(
+            "{MTP_DENSE_ENV}={v:?}: expected 'q4' or 'symq8'"
+        )))
+    }
+}
+
+pub fn mtp_dense_mode() -> Result<MtpDenseMode> {
+    #[cfg(test)]
+    if let Some(m) = TEST_MTP_DENSE.with(std::cell::Cell::get) {
+        return Ok(m);
+    }
+    parse_mtp_dense_mode(std::env::var(MTP_DENSE_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+pub(crate) fn with_mtp_dense<T>(mode: MtpDenseMode, f: impl FnOnce() -> T) -> T {
+    let prev = TEST_MTP_DENSE.with(|c| c.replace(Some(mode)));
+    struct Reset(Option<MtpDenseMode>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MTP_DENSE.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 MTP weights: {msg}"))
@@ -46,7 +96,7 @@ pub enum Held {
     SymQ8,
     /// An f32 array.
     F32,
-    /// Affine-4 g64 codes, bf16 scales and biases (routed experts).
+    /// Affine-4 g64 codes, bf16 scales and biases.
     Affine4,
 }
 
@@ -60,7 +110,16 @@ pub fn held(info: &GgufTensorInfo, expert: bool) -> Result<Held> {
     Ok(match (info.tensor_type, expert) {
         (BF16, true) => Held::Affine4,
         (BF16, false) if is_compressor_mat(&info.name) => Held::F32,
-        (BF16, false) => Held::SymQ8,
+        (BF16, false) => match mtp_dense_mode()? {
+            MtpDenseMode::Q4
+                if held_shape(info)?
+                    .last()
+                    .is_some_and(|&k| k > 0 && k % i64::from(EXPERT_GROUP) == 0) =>
+            {
+                Held::Affine4
+            }
+            _ => Held::SymQ8,
+        },
         (F32, false) => Held::F32,
         (t, _) => {
             return Err(bad(format!(
@@ -129,6 +188,16 @@ impl Loader<'_> {
         };
         let raw = self.shards.read_aligned(e, &mut self.buf)?;
         let d = match held(info, false)? {
+            Held::Affine4 => {
+                let shape = held_shape(info)?;
+                let &[rows, k] = shape.as_slice() else {
+                    return Err(bad(format!(
+                        "'{}': Affine4 requires 2-D held shape, got {shape:?}",
+                        info.name
+                    )));
+                };
+                quantize_affine4_from_bf16_raw(raw, rows as usize, k as usize)?
+            }
             Held::SymQ8 => {
                 let shape = held_shape(info)?;
                 let &[rows, k] = shape.as_slice() else {
@@ -139,7 +208,7 @@ impl Loader<'_> {
                 };
                 quantize_sym_q8_from_bf16_raw(raw, rows as usize, k as usize)?
             }
-            _ => dense_from_raw(info, raw, Form::F32)?,
+            Held::F32 => dense_from_raw(info, raw, Form::F32)?,
         };
         self.read += e.len;
         self.bytes += d.nbytes() as u64;

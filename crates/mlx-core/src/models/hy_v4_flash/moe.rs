@@ -1792,8 +1792,8 @@ impl Moe {
         weights: &MxArray,
         projs: &[MmapProj; 3],
     ) -> Result<MxArray> {
-        // Keep rows * top <= 128 so `mlx_hy4_gguf_routed_decode` activates slot dedup.
-        let chunk_rows = (128 / self.moe.n_used.max(1)).clamp(1, 32);
+        // Keep rows * top <= 512 so `mlx_hy4_gguf_routed_decode` activates slot dedup.
+        let chunk_rows = (512 / self.moe.n_used.max(1)).clamp(1, 32);
         let down_bits = Self::gguf_down_bits(projs)?;
         let rows = z.shape_at(0)? as usize;
         let latent = z.shape_at(1)?;

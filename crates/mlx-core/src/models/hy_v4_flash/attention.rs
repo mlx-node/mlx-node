@@ -161,7 +161,7 @@ fn cached_window_idx(
 /// with zero rows, as `qlinear` does.
 fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
     let s = x.shape_at(1)?;
-    if w.is_qmm() && s < MIN_Q8_ROWS {
+    if w.qmm_parts().is_some() && s < MIN_Q8_ROWS {
         let y = grouped_mm_t(
             w,
             &x.pad(&[0, 0, 0, (MIN_Q8_ROWS - s) as i32, 0, 0], 0.0)?,

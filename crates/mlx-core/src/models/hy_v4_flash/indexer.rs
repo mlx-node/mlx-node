@@ -689,9 +689,11 @@ impl PooledKeys for PlaneKeys<'_> {
         }
         let k = keys.shape_at(0)? as usize;
         let at = u32::try_from(first).map_err(|_| bad("group id exceeds u32"))?;
-        self.adapter
+        let written = self
+            .adapter
             .store_index_rows(self.layer, keys, at)
             .map_err(bad)?;
+        super::stats::defer(&written, "hy_v4_flash paged index store")?;
         *self.groups += k;
         Ok(())
     }
@@ -1108,9 +1110,12 @@ impl Indexer {
         self.rope(&q, positions)
     }
 
-    /// Head weights `proj·x · (H·d)^-½` `[r, H]`; `qlinear` is strictly
-    /// row-invariant for quantized `proj` at decode widths (`M <= 16`).
+    /// Head weights `proj·x · (H·d)^-½` `[r, H]`; single-dispatch row-invariant
+    /// for both f32 and quantized `proj` at decode widths (`M <= 16`).
     pub fn head_weights(&self, w: &IndexerWeights, x: &MxArray, kind: RowKind) -> Result<MxArray> {
+        if let Some(hw) = super::ops::try_f32_head_weights(x, &w.proj, self.g.weight_scale)? {
+            return Ok(hw);
+        }
         let one = |r: &MxArray| {
             qlinear(&r.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
         };

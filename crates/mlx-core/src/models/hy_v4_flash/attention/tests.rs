@@ -1265,6 +1265,7 @@ fn mla_sink_attention_splitk_invariant_to_trailing_unlisted_keys() {
     let scale = 1.0 / (d as f32).sqrt();
     let cases = [
         (32usize, 256usize, 257usize, 181u64),
+        (32, 512, 513, 187),
         (32, 836, 837, 191),
         (32, 1024, 1025, 193),
         (32, 1792, 1793, 197),

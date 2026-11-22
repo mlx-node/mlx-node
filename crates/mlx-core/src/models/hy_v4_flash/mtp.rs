@@ -31,15 +31,17 @@ use super::ladder::Snapshot;
 use super::model::{Mark, Model, Output, Session, Want, head_rows};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, RowKind, qlinear};
 use super::mtp_weights::{self, MtpWeights};
-use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
+use super::ops::{
+    fast_rope, rms_norm, rope_inv_freqs, try_mtp_eh_norm_concat, try_post_norm_add_rms_norm,
+};
 use super::owner::fill_draft;
 use super::prefill::{Runner, Seq, index_keeps, session_keeps};
 use super::prefix_state::PrefixState;
 use super::scan::Scan;
 use super::sparse::gather_sink_attention;
 use super::weights::{
-    Dense, LayerWeights, NextnWeights, OUTPUT, Residual, quantize_sym_q8_array,
-    quantize_sym_q8_from_bf16_raw,
+    Dense, LayerWeights, NextnWeights, OUTPUT, Residual, quantize_affine4_array,
+    quantize_affine4_from_bf16_raw, quantize_sym_q8_array, quantize_sym_q8_from_bf16_raw,
 };
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
@@ -55,11 +57,12 @@ const BLOCK_ROWS: usize = 32;
 pub const SEEDS: usize = 8;
 /// MTP rows a draft may hold past the trunk.
 pub const DRAFT_SLACK: usize = 4;
-/// Draft-only LM head format override (`symq8` default, `bf16` fallback).
+/// Draft-only LM head format override (`q4` default, `symq8`, `bf16`).
 pub const MTP_HEAD_ENV: &str = "MLX_HY4_MTP_HEAD";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtpHeadMode {
+    Q4,
     SymQ8,
     Bf16,
 }
@@ -71,15 +74,17 @@ thread_local! {
 
 pub fn parse_mtp_head_mode(raw: Option<&str>) -> Result<MtpHeadMode> {
     let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(MtpHeadMode::SymQ8);
+        return Ok(MtpHeadMode::Q4);
     };
-    if v.eq_ignore_ascii_case("symq8") {
+    if v.eq_ignore_ascii_case("q4") {
+        Ok(MtpHeadMode::Q4)
+    } else if v.eq_ignore_ascii_case("symq8") {
         Ok(MtpHeadMode::SymQ8)
     } else if v.eq_ignore_ascii_case("bf16") {
         Ok(MtpHeadMode::Bf16)
     } else {
         Err(bad(format!(
-            "{MTP_HEAD_ENV}={v:?}: expected 'symq8' or 'bf16'"
+            "{MTP_HEAD_ENV}={v:?}: expected 'q4', 'symq8', or 'bf16'"
         )))
     }
 }
@@ -105,10 +110,11 @@ pub(crate) fn with_mtp_head<T>(mode: MtpHeadMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Extra resident bytes of the draft-only SymQ8 LM head (`output.weight`) when
-/// enabled via `MLX_HY4_MTP_HEAD`, or 0 when disabled or not applicable.
+/// Extra resident bytes of the draft-only quantized LM head (`output.weight`)
+/// when enabled via `MLX_HY4_MTP_HEAD`, or 0 when `bf16` or not applicable.
 pub fn draft_head_bytes(scan: &Scan) -> Result<u64> {
-    if mtp_head_mode()? != MtpHeadMode::SymQ8 {
+    let mode = mtp_head_mode()?;
+    if mode == MtpHeadMode::Bf16 {
         return Ok(0);
     }
     let Some(entry) = scan.tensors.get(OUTPUT) else {
@@ -118,39 +124,80 @@ pub fn draft_head_bytes(scan: &Scan) -> Result<u64> {
     let &[_, k] = shape.as_slice() else {
         return Ok(0);
     };
-    if k <= 0 || k % 32 != 0 {
-        return Ok(0);
-    }
     let n = entry.loc.info.num_elements()?;
-    n.checked_add(n / 16)
-        .ok_or_else(|| bad("draft LM head bytes overflow u64"))
+    match mode {
+        MtpHeadMode::Q4 => {
+            if k <= 0 || k % 64 != 0 {
+                return Ok(0);
+            }
+            (n / 2)
+                .checked_add(n / 16)
+                .ok_or_else(|| bad("draft LM head bytes overflow u64"))
+        }
+        MtpHeadMode::SymQ8 => {
+            if k <= 0 || k % 32 != 0 {
+                return Ok(0);
+            }
+            n.checked_add(n / 16)
+                .ok_or_else(|| bad("draft LM head bytes overflow u64"))
+        }
+        MtpHeadMode::Bf16 => Ok(0),
+    }
 }
 
 fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
-    if mtp_head_mode()? != MtpHeadMode::SymQ8 {
+    let mode = mtp_head_mode()?;
+    if mode == MtpHeadMode::Bf16 {
         return Ok(None);
     }
     let t0 = std::time::Instant::now();
-    let q = match output {
-        Dense::Array(a) => {
-            if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 32 != 0 {
-                return Ok(None);
-            }
-            quantize_sym_q8_array(a)?
-        }
-        Dense::MmapBf16 { cols, .. } => {
-            if *cols <= 0 || cols % 32 != 0 {
-                return Ok(None);
-            }
-            let Some((raw, rows, k)) = output.mmap_bf16_raw_slice()? else {
-                return Ok(None);
+    let (label, q) = match mode {
+        MtpHeadMode::Q4 => {
+            let q = match output {
+                Dense::Array(a) => {
+                    if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 64 != 0 {
+                        return Ok(None);
+                    }
+                    quantize_affine4_array(a)?
+                }
+                Dense::MmapBf16 { cols, .. } => {
+                    if *cols <= 0 || cols % 64 != 0 {
+                        return Ok(None);
+                    }
+                    let Some((raw, rows, k)) = output.mmap_bf16_raw_slice()? else {
+                        return Ok(None);
+                    };
+                    quantize_affine4_from_bf16_raw(raw, rows, k)?
+                }
+                _ => return Ok(None),
             };
-            quantize_sym_q8_from_bf16_raw(raw, rows, k)?
+            ("Q4 g64", q)
         }
-        _ => return Ok(None),
+        MtpHeadMode::SymQ8 => {
+            let q = match output {
+                Dense::Array(a) => {
+                    if a.ndim()? != 2 || a.shape_at(1)? <= 0 || a.shape_at(1)? % 32 != 0 {
+                        return Ok(None);
+                    }
+                    quantize_sym_q8_array(a)?
+                }
+                Dense::MmapBf16 { cols, .. } => {
+                    if *cols <= 0 || cols % 32 != 0 {
+                        return Ok(None);
+                    }
+                    let Some((raw, rows, k)) = output.mmap_bf16_raw_slice()? else {
+                        return Ok(None);
+                    };
+                    quantize_sym_q8_from_bf16_raw(raw, rows, k)?
+                }
+                _ => return Ok(None),
+            };
+            ("SymQ8", q)
+        }
+        MtpHeadMode::Bf16 => return Ok(None),
     };
     tracing::info!(
-        "hy_v4_flash MTP draft head: SymQ8 {} bytes ({:.0} ms)",
+        "hy_v4_flash MTP draft head: {label} {} bytes ({:.0} ms)",
         q.nbytes(),
         t0.elapsed().as_secs_f64() * 1e3
     );
@@ -272,12 +319,17 @@ impl KvRows {
                 self.cap
             )));
         }
-        let kv = kv.astype(ROW_DTYPE)?;
+        let kv_cast = if kv.dtype()? == ROW_DTYPE {
+            None
+        } else {
+            Some(kv.astype(ROW_DTYPE)?)
+        };
+        let kv_ref = kv_cast.as_ref().unwrap_or(kv);
         if end > self.held {
             self.resize(round_up(end).max(2 * self.held).min(self.cap))?;
         }
         let buf = self.buf.as_mut().ok_or_else(|| bad("K/V buffer missing"))?;
-        buf.slice_assign_axis_inplace(0, start as i64, end as i64, &kv)?;
+        buf.slice_assign_axis_inplace(0, start as i64, end as i64, kv_ref)?;
         super::stats::defer(&*buf, "hy_v4_flash MTP K/V write")?;
         self.len = end;
         Ok(())
@@ -568,6 +620,11 @@ fn draft_embedding(token_embd: &Dense, vocab: usize, dim: usize) -> Result<Embed
             e.load_quantized_packed(w, scales, Some(biases), 32, 8, "affine")?;
             Ok(e)
         }
+        Dense::Qmm4 { w, scales, biases } => {
+            let mut e = Embedding::new_uninitialized(v, d)?;
+            e.load_quantized_packed(w, scales, Some(biases), 64, 4, "affine")?;
+            Ok(e)
+        }
         Dense::MmapQ8_0 {
             buf, byte_offset, ..
         } => {
@@ -699,6 +756,9 @@ impl MtpLayer {
     /// `eh_proj · [rms(e)·enorm ; rms(h)·hnorm]` `[m, d]` f32.
     fn eh(&self, e: &MxArray, h: &MxArray) -> Result<MxArray> {
         let n = self.nextn()?;
+        if let Some(cat) = try_mtp_eh_norm_concat(e, h, &n.enorm, &n.hnorm, self.eps)? {
+            return qlinear(&cat, &n.eh_proj);
+        }
         let a = rms_norm(&e.astype(DType::Float32)?, &n.enorm, self.eps)?;
         let b = rms_norm(&h.astype(DType::Float32)?, &n.hnorm, self.eps)?;
         qlinear(&MxArray::concatenate(&a, &b, 1)?, &n.eh_proj)
@@ -974,24 +1034,7 @@ impl MtpLayer {
             }
         })();
 
-        let out = core_res.and_then(|o| {
-            let x = x.add(
-                &self
-                    .mla
-                    .finish_with_gate(w, &p.x, p.gate_lin.as_ref(), &o)?,
-            )?;
-            let (f, _) = self
-                .ffn
-                .forward_traced(&self.w, &x, RowKind::Decode, false)?;
-            let x = x.add(&f)?;
-            let h_out = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
-            let head = self
-                .draft_head
-                .as_ref()
-                .unwrap_or_else(|| model.weights().output());
-            let logits = head_rows(&h_out, head)?;
-            Ok((h_out, logits))
-        });
+        let out = core_res.and_then(|o| self.draft_tail(model, &x, &p, &o));
 
         if out.is_err() {
             for (j, mark) in marks.into_iter().enumerate() {
@@ -1010,6 +1053,59 @@ impl MtpLayer {
         out
     }
 
+    /// Fused post-attention -> FFN -> shared_head_norm -> draft LM head tail.
+    fn draft_tail(
+        &self,
+        model: &Model,
+        x: &MxArray,
+        p: &Projected,
+        o: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let w = &self.w.attn;
+        let attn_raw = self
+            .mla
+            .finish_raw_with_gate(w, &p.x, p.gate_lin.as_ref(), o)?;
+        let (x, ffn_in) = if let Some((Some(x_after), fn_in)) = try_post_norm_add_rms_norm(
+            x,
+            &attn_raw,
+            &w.post_norm,
+            &self.w.ffn_norm,
+            self.eps,
+            true,
+        )? {
+            (x_after, fn_in)
+        } else {
+            let attn_out = rms_norm(&attn_raw, &w.post_norm, self.eps)?;
+            let x_after = x.add(&attn_out)?;
+            let fn_in = rms_norm(&x_after, &self.w.ffn_norm, self.eps)?;
+            (x_after, fn_in)
+        };
+        let (f_raw, _) =
+            self.ffn
+                .forward_normed_raw(&self.w, &ffn_in, RowKind::Decode, false, None)?;
+        let n = self.nextn()?;
+        let h_out = if let Some((_, h)) = try_post_norm_add_rms_norm(
+            &x,
+            &f_raw,
+            &self.w.post_ffw_norm,
+            &n.shared_head_norm,
+            self.eps,
+            false,
+        )? {
+            h
+        } else {
+            let f_out = rms_norm(&f_raw, &self.w.post_ffw_norm, self.eps)?;
+            let x_after = x.add(&f_out)?;
+            rms_norm(&x_after, &n.shared_head_norm, self.eps)?
+        };
+        let head = self
+            .draft_head
+            .as_ref()
+            .unwrap_or_else(|| model.weights().output());
+        let logits = head_rows(&h_out, head)?;
+        Ok((h_out, logits))
+    }
+
     fn finish_draft(
         &self,
         model: &Model,
@@ -1023,21 +1119,7 @@ impl MtpLayer {
         let w = &self.w.attn;
         let o =
             gather_sink_attention(&p.q, d.kv.rows()?, idx, g.kv_lora as i64, &w.sinks, g.scale)?;
-        let x = x.add(
-            &self
-                .mla
-                .finish_with_gate(w, &p.x, p.gate_lin.as_ref(), &o)?,
-        )?;
-        let (f, _) = self
-            .ffn
-            .forward_traced(&self.w, &x, RowKind::Decode, false)?;
-        let x = x.add(&f)?;
-        let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
-        let head = self
-            .draft_head
-            .as_ref()
-            .unwrap_or_else(|| model.weights().output());
-        let logits = head_rows(&h, head)?;
+        let (h, logits) = self.draft_tail(model, x, p, &o)?;
         if flush {
             super::stats::flush("hy_v4_flash MTP draft")?;
         }

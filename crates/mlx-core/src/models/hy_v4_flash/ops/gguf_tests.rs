@@ -461,6 +461,103 @@ fn gguf_routed_decode_matches_kq_decode_q4k_and_q6k() {
     }
 }
 
+/// Verify unchunked M=32 (n_assign=512, TG_SIZE=512, PROD_CAP=512, 10-bit packing for assign >= 256)
+/// matches kq_routed_decode and is bit-exact row-invariant against M=1 for both Q4_K and Q6_K.
+#[test]
+fn gguf_routed_decode_m32_512_assign_dedup_and_row_invariance() {
+    for down_bits in [4, 6] {
+        let (n_experts, k, m, h, rows, top) =
+            (48usize, 512usize, 256usize, 259usize, 32usize, 16usize);
+        let mut rng = Rng::new(9100 + down_bits as u64);
+        let raw_g = gen_raw_q4k(&mut rng, n_experts, m, k);
+        let raw_u = gen_raw_q4k(&mut rng, n_experts, m, k);
+        let (down_ty, raw_d, down_off) = if down_bits == 6 {
+            (
+                GgufTensorType::Q6K,
+                gen_raw_q6k(&mut rng, n_experts, h, m),
+                66u64,
+            )
+        } else {
+            (
+                GgufTensorType::Q4K,
+                gen_raw_q4k(&mut rng, n_experts, h, m),
+                64u64,
+            )
+        };
+        let g_buf = make_padded_u8_buf(&raw_g, 32, true);
+        let u_buf = make_padded_u8_buf(&raw_u, 96, true);
+        let d_buf = make_padded_u8_buf(&raw_d, down_off, true);
+        let g_kq = repack_to_proj_arrays(&raw_g, GgufTensorType::Q4K, n_experts, m, k);
+        let u_kq = repack_to_proj_arrays(&raw_u, GgufTensorType::Q4K, n_experts, m, k);
+        let d_kq = repack_to_proj_arrays(&raw_d, down_ty, n_experts, h, m);
+
+        let x_vals: Vec<f32> = (0..rows * k).map(|_| rng.next_f32(-4.0, 4.0)).collect();
+        let w_vals: Vec<f32> = (0..rows * top).map(|_| rng.next_f32(0.05, 0.35)).collect();
+        let mut slot_ids = Vec::with_capacity(rows * top);
+        for r in 0..rows {
+            for t in 0..top {
+                let e = if r == 25 && t == 15 {
+                    n_experts as u32 // OOB slot at assign > 256
+                } else if t < 3 {
+                    t as u32 // high-frequency shared (>4 chunk splitting across assign 0..511)
+                } else if t < 6 {
+                    (3 + (r / 4) * 3 + (t - 3)) as u32
+                } else {
+                    ((12 + r * 5 + t * 3) % n_experts) as u32
+                };
+                slot_ids.push(e);
+            }
+        }
+
+        let xm = MxArray::from_float32(&x_vals, &[rows as i64, k as i64]).unwrap();
+        let slm = MxArray::from_uint32(&slot_ids, &[rows as i64, top as i64]).unwrap();
+        let wm = MxArray::from_float32(&w_vals, &[rows as i64, top as i64]).unwrap();
+        let Some(ref_out) =
+            call_kq_routed_decode(&xm, &slm, &wm, &g_kq, &u_kq, &d_kq, down_bits, 7.0)
+        else {
+            assert!(!require_metal(), "Metal required");
+            return;
+        };
+        let got_out = gguf_routed_decode(
+            &xm, &slm, &wm, &g_buf, 32, &u_buf, 96, &d_buf, down_off, n_experts, m, h, down_bits,
+            7.0,
+        )
+        .unwrap()
+        .unwrap();
+        let ref_v = eval_f32(&ref_out);
+        let got_v = eval_f32(&got_out);
+        let (max_abs, rel_l2) = error_stats(&got_v, &ref_v);
+        assert!(
+            rel_l2 <= 1e-5,
+            "m32 512-assign dedup parity bits={down_bits}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
+        );
+
+        // Bit-exact row invariance on sampled rows across assign < 256 and assign >= 256.
+        for r in [0usize, 15, 16, 25, 31] {
+            let xr = MxArray::from_float32(&x_vals[r * k..(r + 1) * k], &[1, k as i64]).unwrap();
+            let slr =
+                MxArray::from_uint32(&slot_ids[r * top..(r + 1) * top], &[1, top as i64]).unwrap();
+            let wr =
+                MxArray::from_float32(&w_vals[r * top..(r + 1) * top], &[1, top as i64]).unwrap();
+            let one = gguf_routed_decode(
+                &xr, &slr, &wr, &g_buf, 32, &u_buf, 96, &d_buf, down_off, n_experts, m, h,
+                down_bits, 7.0,
+            )
+            .unwrap()
+            .unwrap();
+            let one_bits: Vec<u32> = eval_f32(&one).into_iter().map(f32::to_bits).collect();
+            let batch_bits: Vec<u32> = got_v[r * h..(r + 1) * h]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                batch_bits, one_bits,
+                "m32 512-assign row invariance bits={down_bits} row={r}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gguf_routed_decode_multi_row_dedup_and_row_invariance() {
     for down_bits in [4, 6] {
@@ -1180,5 +1277,381 @@ fn gguf_prefill_strided_x_and_kq_sorted_combine_f16_tail() {
             max_abs <= 1e-6 && rel_l2 <= 1e-6,
             "kq_sorted_combine F16 vs F32 H={h}: max_abs={max_abs:e} rel_l2={rel_l2:e}"
         );
+    }
+}
+
+#[test]
+#[ignore = "GPU microbenchmark for Hy4 decode BW kernels (M=1,2,4)"]
+fn bench_decode_bw_kernels() {
+    use crate::models::hy_v4_flash::attention::grouped_mm_t_mgh;
+    use crate::models::hy_v4_flash::moe::qlinear;
+    use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
+    use std::time::Instant;
+
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(20261122);
+
+    fn time_median_us(iters: usize, warmup_ms: f64, mut f: impl FnMut()) -> f64 {
+        let w0 = Instant::now();
+        let mut w_cnt = 0usize;
+        while w_cnt < 6 || w0.elapsed().as_secs_f64() * 1000.0 < warmup_ms {
+            f();
+            w_cnt += 1;
+        }
+        let mut ts = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            f();
+            ts.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts[ts.len() / 2]
+    }
+
+    let zero_f32 = MxArray::from_float32(&[0.0f32], &[1, 1]).unwrap();
+    MxArray::eval_arrays_with_context(&[&zero_f32], "bench zero").unwrap();
+
+    // 0. Pure DRAM read BW ceiling check (742 MB sum, also ramps GPU DVFS to peak clock).
+    {
+        let n_elems = 185_597_952usize; // 742.4 MB in f32
+        let buf = MxArray::ones(&[n_elems as i64], Some(DType::Float32)).unwrap();
+        MxArray::eval_arrays_with_context(&[&buf], "bench dram init").unwrap();
+        let med_us = time_median_us(15, 250.0, || {
+            let s = buf.sum(None, None).unwrap();
+            MxArray::eval_arrays_with_context(&[&s], "bench dram sum").unwrap();
+        });
+        let gbs = ((n_elems * 4) as f64 / 1e9) / (med_us / 1e6);
+        eprintln!("BENCH dram_sum_ceiling[742MB]: {med_us:.1} us ({gbs:.1} GB/s)");
+    }
+
+    // 1a. q8_dense_decode: output [3072, 16384] x 4 cold copies (214 MB > SLC) and down_shared_gu [4608, 3072] x 14 copies
+    for &(n, k, n_copies, tag) in &[
+        (3072usize, 16384usize, 4usize, "o_proj[3072x16384]"),
+        (4608usize, 3072usize, 14usize, "down_sgu[4608x3072]"),
+    ] {
+        let bytes_per = (n * k + (n * k) / 16) as f64;
+        let base_vals: Vec<f32> = (0..n * k)
+            .map(|i| (((i * 17) % 97) as f32 - 48.0) * 0.002)
+            .collect();
+        let base_w = MxArray::from_float32(&base_vals, &[n as i64, k as i64]).unwrap();
+        let base_sym = quantize_sym_q8_array(&base_w).unwrap();
+        let ws: Vec<Dense> = (0..n_copies)
+            .map(|_| {
+                let Dense::SymQ8 { w, scales } = &base_sym else {
+                    unreachable!();
+                };
+                Dense::SymQ8 {
+                    w: w.deep_copy().unwrap(),
+                    scales: scales.deep_copy().unwrap(),
+                }
+            })
+            .collect();
+        for w in &ws {
+            if let Dense::SymQ8 { w, scales } = w {
+                MxArray::eval_arrays_with_context(&[w, scales], "bench q8_dense init").unwrap();
+            }
+        }
+        for &m in &[1usize, 2, 4] {
+            let xv: Vec<f32> = (0..m * k).map(|_| rng.next_f32(-1.0, 1.0)).collect();
+            let x = MxArray::from_float32(&xv, &[m as i64, k as i64]).unwrap();
+            MxArray::eval_arrays_with_context(&[&x], "bench x").unwrap();
+            // Serial chained (1 dispatch active at a time, matching real layer-by-layer decode)
+            let dummy = MxArray::from_float32(&[1.0f32], &[1, 1]).unwrap();
+            MxArray::eval_arrays_with_context(&[&dummy], "bench dummy").unwrap();
+            let dep_us = time_median_us(15, 100.0, || {
+                let mut cur = x.clone();
+                for _ in 0..n_copies {
+                    let z = dummy.mul(&zero_f32).unwrap();
+                    cur = cur.add(&z).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&cur], "bench dep").unwrap();
+            });
+            let ser_us = time_median_us(15, 150.0, || {
+                let mut cur = x.clone();
+                let mut last = x.clone();
+                for w in &ws {
+                    last = qlinear(&cur, w).unwrap();
+                    let dep = last
+                        .slice(&[0, 0], &[1, 1])
+                        .unwrap()
+                        .mul(&zero_f32)
+                        .unwrap();
+                    cur = cur.add(&dep).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&last, &cur], "bench q8_dense ser").unwrap();
+            });
+            let per_us = (ser_us - dep_us).max(1.0) / n_copies as f64;
+            let gbs = (bytes_per / 1e9) / (per_us / 1e6);
+            eprintln!("BENCH q8_dense {tag} M={m}: {per_us:.1} us/call ({gbs:.1} GB/s)");
+        }
+    }
+
+    // 1b. q8_grouped_short k512 (v_b): G=64, N=256, K=512 x 20 cold copies (178 MB > SLC)
+    {
+        let (g, n, k, n_copies) = (64usize, 256usize, 512usize, 20usize);
+        let bytes_per = (g * n * k + (g * n * k) / 16) as f64;
+        let base_vals: Vec<f32> = (0..g * n * k)
+            .map(|i| (((i * 13) % 89) as f32 - 44.0) * 0.005)
+            .collect();
+        let base_w = MxArray::from_float32(&base_vals, &[(g * n) as i64, k as i64]).unwrap();
+        let base_sym = quantize_sym_q8_array(&base_w).unwrap();
+        let ws: Vec<Dense> = (0..n_copies)
+            .map(|_| {
+                let Dense::SymQ8 { w, scales } = &base_sym else {
+                    unreachable!();
+                };
+                Dense::SymQ8 {
+                    w: w.deep_copy().unwrap(),
+                    scales: scales.deep_copy().unwrap(),
+                }
+            })
+            .collect();
+        for w in &ws {
+            if let Dense::SymQ8 { w, scales } = w {
+                MxArray::eval_arrays_with_context(&[w, scales], "bench k512 init").unwrap();
+            }
+        }
+        for &m in &[1usize, 2, 4] {
+            let xv: Vec<f32> = (0..m * g * k).map(|_| rng.next_f32(-1.0, 1.0)).collect();
+            let x = MxArray::from_float32(&xv, &[m as i64, g as i64, k as i64]).unwrap();
+            MxArray::eval_arrays_with_context(&[&x], "bench x").unwrap();
+            let dummy = MxArray::from_float32(&[1.0f32], &[1, 1, 1]).unwrap();
+            let zero3 = MxArray::from_float32(&[0.0f32], &[1, 1, 1]).unwrap();
+            MxArray::eval_arrays_with_context(&[&dummy, &zero3], "bench dummy3").unwrap();
+            let dep_us = time_median_us(15, 100.0, || {
+                let mut cur = x.clone();
+                for _ in 0..n_copies {
+                    let z = dummy.mul(&zero3).unwrap();
+                    cur = cur.add(&z).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&cur], "bench dep3").unwrap();
+            });
+            let ser_us = time_median_us(15, 150.0, || {
+                let mut cur = x.clone();
+                let mut last = x.clone();
+                for w in &ws {
+                    last = grouped_mm_t_mgh(w, &cur, g as i64).unwrap();
+                    let dep = last
+                        .slice(&[0, 0, 0], &[1, 1, 1])
+                        .unwrap()
+                        .mul(&zero3)
+                        .unwrap();
+                    cur = cur.add(&dep).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&last, &cur], "bench k512 ser").unwrap();
+            });
+            let per_us = (ser_us - dep_us).max(1.0) / n_copies as f64;
+            let gbs = (bytes_per / 1e9) / (per_us / 1e6);
+            eprintln!(
+                "BENCH q8_grouped_k512[64x256x512] M={m}: {per_us:.1} us/call ({gbs:.1} GB/s)"
+            );
+        }
+    }
+
+    // 2. gguf_expert_decode: K=1536, M=1536, H=1536, TOP=16, Q6_K down, 128 experts (589 MB > SLC),
+    // serially chained `x = out` across rotating pools to match real layer-by-layer execution.
+    {
+        let (n_experts, k, m_ff, h, top) = (128usize, 1536usize, 1536usize, 1536usize, 16usize);
+        let raw_g = gen_raw_q4k(&mut rng, n_experts, m_ff, k);
+        let raw_u = gen_raw_q4k(&mut rng, n_experts, m_ff, k);
+        let raw_d = gen_raw_q6k(&mut rng, n_experts, h, m_ff);
+        let g_buf = make_padded_u8_buf(&raw_g, 32, false);
+        let u_buf = make_padded_u8_buf(&raw_u, 96, false);
+        let d_buf = make_padded_u8_buf(&raw_d, 66, false);
+        MxArray::eval_arrays_with_context(&[&g_buf, &u_buf, &d_buf], "bench gguf init").unwrap();
+        let bytes_per_exp = ((m_ff * (k / 256) * 144) * 2 + h * (m_ff / 256) * 210) as f64;
+
+        for &rows in &[1usize, 2, 4, 32] {
+            let xv: Vec<f32> = (0..rows * k).map(|_| rng.next_f32(-0.5, 0.5)).collect();
+            let wv: Vec<f32> = (0..rows * top).map(|_| 1.0 / top as f32).collect();
+            let n_rot = if rows <= 2 {
+                4usize
+            } else if rows == 4 {
+                2usize
+            } else {
+                1usize
+            };
+            let mut slot_arrs = Vec::with_capacity(n_rot);
+            let mut uniq_total = 0usize;
+            for rot in 0..n_rot {
+                let shift = rot * 32;
+                let mut sids = Vec::with_capacity(rows * top);
+                let mut uniq_set = std::collections::BTreeSet::new();
+                for r in 0..rows {
+                    let mut row_ids = Vec::with_capacity(top);
+                    for t in 0..top {
+                        let base_e = if t < 5 {
+                            t * 2
+                        } else if t < 9 {
+                            10 + ((r / 2) * 4 + (t - 5)) % 20
+                        } else {
+                            30 + (r * 7 + t) % 66
+                        };
+                        let e = ((base_e + shift) % n_experts) as u32;
+                        row_ids.push(e);
+                        uniq_set.insert(e);
+                    }
+                    row_ids.sort_unstable();
+                    sids.extend_from_slice(&row_ids);
+                }
+                uniq_total += uniq_set.len();
+                slot_arrs.push(MxArray::from_uint32(&sids, &[rows as i64, top as i64]).unwrap());
+            }
+            let x = MxArray::from_float32(&xv, &[rows as i64, k as i64]).unwrap();
+            let weights = MxArray::from_float32(&wv, &[rows as i64, top as i64]).unwrap();
+            let mut eval_in: Vec<&MxArray> = vec![&x, &weights];
+            eval_in.extend(slot_arrs.iter());
+            MxArray::eval_arrays_with_context(&eval_in, "bench gguf in").unwrap();
+
+            let med_us = time_median_us(12, 150.0, || {
+                let mut cur = x.clone();
+                for slots in &slot_arrs {
+                    cur = gguf_routed_decode(
+                        &cur, slots, &weights, &g_buf, 32, &u_buf, 96, &d_buf, 66, n_experts, m_ff,
+                        h, 6, 10.0,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&cur], "bench gguf").unwrap();
+            });
+            let per_us = med_us / n_rot as f64;
+            let avg_uniq = uniq_total as f64 / n_rot as f64;
+            let gbs = (avg_uniq * bytes_per_exp / 1e9) / (per_us / 1e6);
+            eprintln!(
+                "BENCH gguf_routed_decode[Q6K] M={rows} (uniq={avg_uniq:.0}): {per_us:.1} us/call ({gbs:.1} GB/s, 41x={:.2} ms)",
+                per_us * 41.0 / 1000.0
+            );
+        }
+    }
+
+    // 3. router_mv: [M, 3072] x [512, 3072]T F32 x 32 cold copies (201 MB > SLC), serial chained
+    {
+        let (e, k, n_copies) = (512usize, 3072usize, 32usize);
+        let bytes_per = (e * k * 4) as f64;
+        let base_v: Vec<f32> = (0..e * k)
+            .map(|i| (((i * 23) % 97) as f32 - 48.0) * 0.005)
+            .collect();
+        let base_w = MxArray::from_float32(&base_v, &[e as i64, k as i64]).unwrap();
+        let ws: Vec<Dense> = (0..n_copies)
+            .map(|_| Dense::Array(base_w.deep_copy().unwrap()))
+            .collect();
+        for w in &ws {
+            if let Dense::Array(a) = w {
+                MxArray::eval_arrays_with_context(&[a], "bench router init").unwrap();
+            }
+        }
+        let dummy = MxArray::from_float32(&[1.0f32], &[1, 1]).unwrap();
+        MxArray::eval_arrays_with_context(&[&dummy], "bench dummy").unwrap();
+        for &m in &[1usize, 2, 4] {
+            let xv: Vec<f32> = (0..m * k).map(|_| rng.next_f32(-1.0, 1.0)).collect();
+            let x = MxArray::from_float32(&xv, &[m as i64, k as i64]).unwrap();
+            MxArray::eval_arrays_with_context(&[&x], "bench x").unwrap();
+            let dep_us = time_median_us(15, 100.0, || {
+                let mut cur = x.clone();
+                for _ in 0..n_copies {
+                    let z = dummy.mul(&zero_f32).unwrap();
+                    cur = cur.add(&z).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&cur], "bench router dep").unwrap();
+            });
+            let ser_us = time_median_us(15, 150.0, || {
+                let mut cur = x.clone();
+                let mut last = x.clone();
+                for w in &ws {
+                    last = try_router_mv(&cur, w).unwrap().unwrap();
+                    let dep = last
+                        .slice(&[0, 0], &[1, 1])
+                        .unwrap()
+                        .mul(&zero_f32)
+                        .unwrap();
+                    cur = cur.add(&dep).unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&last, &cur], "bench router ser").unwrap();
+            });
+            let per_us = (ser_us - dep_us).max(1.0) / n_copies as f64;
+            let gbs = (bytes_per / 1e9) / (per_us / 1e6);
+            eprintln!(
+                "BENCH router_mv[512x3072 F32] M={m}: {per_us:.1} us/call ({gbs:.1} GB/s, 41x={:.2} ms)",
+                per_us * 41.0 / 1000.0
+            );
+        }
+    }
+
+    // 4. q8_dual_down: [M, 1536] x 2x[3072, 1536] SymQ8 x 20 cold copies (200 MB > SLC),
+    // zero-overhead serial chain via strided slice `cur[:, :1536]` + `cur`.
+    {
+        let (n, k, n_copies) = (3072usize, 1536usize, 20usize);
+        let bytes_per = (2 * (n * k + (n * k) / 16)) as f64;
+        let base_v: Vec<f32> = (0..n * k)
+            .map(|i| (((i * 19) % 89) as f32 - 44.0) * 0.0005)
+            .collect();
+        let base_w = MxArray::from_float32(&base_v, &[n as i64, k as i64]).unwrap();
+        let base_sym = quantize_sym_q8_array(&base_w).unwrap();
+        let pairs: Vec<(Dense, Dense)> = (0..n_copies)
+            .map(|_| {
+                let Dense::SymQ8 { w, scales } = &base_sym else {
+                    unreachable!();
+                };
+                (
+                    Dense::SymQ8 {
+                        w: w.deep_copy().unwrap(),
+                        scales: scales.deep_copy().unwrap(),
+                    },
+                    Dense::SymQ8 {
+                        w: w.deep_copy().unwrap(),
+                        scales: scales.deep_copy().unwrap(),
+                    },
+                )
+            })
+            .collect();
+        for (a, b) in &pairs {
+            if let (Dense::SymQ8 { w: wa, scales: sa }, Dense::SymQ8 { w: wb, scales: sb }) = (a, b)
+            {
+                MxArray::eval_arrays_with_context(&[wa, sa, wb, sb], "bench dual init").unwrap();
+            }
+        }
+        for &m in &[1usize, 2, 4] {
+            let sguv: Vec<f32> = (0..m * 2 * k).map(|_| rng.next_f32(-0.5, 0.5)).collect();
+            let sgu = MxArray::from_float32(&sguv, &[m as i64, (2 * k) as i64]).unwrap();
+            MxArray::eval_arrays_with_context(&[&sgu], "bench dual in").unwrap();
+            let med_us = time_median_us(15, 150.0, || {
+                let mut cur = sgu.clone();
+                for (wu, ws) in &pairs {
+                    let rl = cur.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
+                    cur = try_q8_dual_down_add(&rl, &cur, wu, ws, 0.0)
+                        .unwrap()
+                        .unwrap();
+                }
+                MxArray::eval_arrays_with_context(&[&cur], "bench dual ser").unwrap();
+            });
+            let per_us = med_us / n_copies as f64;
+            let gbs = (bytes_per / 1e9) / (per_us / 1e6);
+            eprintln!(
+                "BENCH q8_dual_down[3072x1536] M={m}: {per_us:.1} us/call ({gbs:.1} GB/s, 41x={:.2} ms)",
+                per_us * 41.0 / 1000.0
+            );
+        }
+    }
+
+    // 5. bf16_lm_head: [M, 3072] x [120832, 3072]T BF16 (742.4 MB > SLC)
+    {
+        let (v, k) = (120832usize, 3072usize);
+        let bytes_per = (v * k * 2) as f64;
+        let w_bits = vec![0x3C00u16; v * k];
+        let w_arr = MxArray::from_bfloat16(&w_bits, &[v as i64, k as i64]).unwrap();
+        MxArray::eval_arrays_with_context(&[&w_arr], "bench lm_head init").unwrap();
+        let head = Dense::Array(w_arr);
+        for &m in &[1usize, 2, 4] {
+            let xv: Vec<f32> = (0..m * k).map(|_| rng.next_f32(-1.0, 1.0)).collect();
+            let x = MxArray::from_float32(&xv, &[m as i64, k as i64]).unwrap();
+            MxArray::eval_arrays_with_context(&[&x], "bench x").unwrap();
+            let med_us = time_median_us(15, 250.0, || {
+                let out = try_bf16_lm_head(&x, &head).unwrap().unwrap();
+                MxArray::eval_arrays_with_context(&[&out], "bench lm_head").unwrap();
+            });
+            let gbs = (bytes_per / 1e9) / (med_us / 1e6);
+            eprintln!("BENCH bf16_lm_head[120832x3072] M={m}: {med_us:.1} us/call ({gbs:.1} GB/s)");
+        }
     }
 }

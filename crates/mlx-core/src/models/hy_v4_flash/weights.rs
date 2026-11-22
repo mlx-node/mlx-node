@@ -47,6 +47,7 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// - `Q8`: Q8_0 codes (`[rows, k / 4]` u32) + f16 scales (`[rows, k / 32]` f16) for row gathers
 /// - `SymQ8`: symmetric Q8_0 codes + f16 scales with derived `-128 * scale` bias (34 B / 32 weights)
 /// - `Qmm`: affine-8 codes + explicit scales and biases (e.g. MTP requantized BF16)
+/// - `Qmm4`: affine-4 g64 codes (`[rows, k / 8]` u32) + bf16 scales and biases (`[rows, k / 64]` bf16)
 /// - `MmapBf16`: zero-copy read-only mmap BF16 matrix (`buf` uint8 + `byte_offset`)
 /// - `MmapQ8_0`: zero-copy read-only mmap GGUF Q8_0 table (`buf` uint8 + `byte_offset`)
 pub enum Dense {
@@ -60,6 +61,11 @@ pub enum Dense {
         scales: MxArray,
     },
     Qmm {
+        w: MxArray,
+        scales: MxArray,
+        biases: MxArray,
+    },
+    Qmm4 {
         w: MxArray,
         scales: MxArray,
         biases: MxArray,
@@ -184,6 +190,28 @@ fn dequant_affine8(w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
     MxArray::from_handle(h, "hy_v4_flash q8_0 dequantize")
 }
 
+fn dequant_affine4(w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; the bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            64,
+            4,
+            -1,
+            mode.as_ptr(),
+        )
+    };
+    let out = MxArray::from_handle(h, "hy_v4_flash q4 dequantize")?;
+    if out.dtype()? == DType::Float32 {
+        Ok(out)
+    } else {
+        out.astype(DType::Float32)
+    }
+}
+
 fn qmm_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
     let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
     // SAFETY: live arrays for the call; the bridge returns a new array or null.
@@ -202,12 +230,42 @@ fn qmm_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> 
     MxArray::from_handle(h, "hy_v4_flash q8_0 quantized_matmul")
 }
 
+fn qmm4_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    let dt = s.dtype()?;
+    let xq = if x.dtype()? == dt {
+        x.clone()
+    } else {
+        x.astype(dt)?
+    };
+    let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; the bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            xq.as_raw_ptr(),
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            true,
+            64,
+            4,
+            mode.as_ptr(),
+        )
+    };
+    let out = MxArray::from_handle(h, "hy_v4_flash q4 quantized_matmul")?;
+    if out.dtype()? == DType::Float32 {
+        Ok(out)
+    } else {
+        out.astype(DType::Float32)
+    }
+}
+
 impl Weight for Dense {
     fn f32(&self) -> Result<MxArray> {
         match self {
             Self::Array(a) => a.astype(DType::Float32),
             Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => dequant_q8(w, scales),
             Self::Qmm { w, scales, biases } => dequant_affine8(w, scales, biases),
+            Self::Qmm4 { w, scales, biases } => dequant_affine4(w, scales, biases),
             Self::MmapBf16 {
                 buf,
                 byte_offset,
@@ -263,6 +321,7 @@ impl Weight for Dense {
                 qmm_t(x, w, &s, &b)
             }
             Self::Qmm { w, scales, biases } => qmm_t(x, w, scales, biases),
+            Self::Qmm4 { w, scales, biases } => qmm4_t(x, w, scales, biases),
             Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
                 x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?)
             }
@@ -277,6 +336,7 @@ impl Dense {
             Self::Q8 { .. }
             | Self::SymQ8 { .. }
             | Self::Qmm { .. }
+            | Self::Qmm4 { .. }
             | Self::MmapBf16 { .. }
             | Self::MmapQ8_0 { .. } => {
                 Err(bad("quantized or mmap tensor where an array is expected"))
@@ -285,17 +345,22 @@ impl Dense {
     }
 
     pub fn is_qmm(&self) -> bool {
-        matches!(self, Self::SymQ8 { .. } | Self::Qmm { .. })
+        matches!(
+            self,
+            Self::SymQ8 { .. } | Self::Qmm { .. } | Self::Qmm4 { .. }
+        )
     }
 
-    /// `(w, scales, biases)` for quantized matmul weights (`biases == None` for `SymQ8`).
+    /// `(w, scales, biases)` for 8-bit g32 quantized matmul weights (`biases == None` for `SymQ8`).
     pub fn qmm_parts(&self) -> Option<(&MxArray, &MxArray, Option<&MxArray>)> {
         match self {
             Self::SymQ8 { w, scales } => Some((w, scales, None)),
             Self::Qmm { w, scales, biases } => Some((w, scales, Some(biases))),
-            Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
-                None
-            }
+            Self::Array(_)
+            | Self::Q8 { .. }
+            | Self::Qmm4 { .. }
+            | Self::MmapBf16 { .. }
+            | Self::MmapQ8_0 { .. } => None,
         }
     }
 
@@ -326,7 +391,13 @@ impl Dense {
             {
                 Ok(scales.shape_at(axis)? * 32)
             }
-            Self::Q8 { w, .. } | Self::SymQ8 { w, .. } | Self::Qmm { w, .. } => w.shape_at(axis),
+            Self::Qmm4 { w, scales, .. } if axis + 1 == w.ndim()? => {
+                Ok(scales.shape_at(axis)? * 64)
+            }
+            Self::Q8 { w, .. }
+            | Self::SymQ8 { w, .. }
+            | Self::Qmm { w, .. }
+            | Self::Qmm4 { w, .. } => w.shape_at(axis),
             Self::MmapBf16 { rows, cols, .. } | Self::MmapQ8_0 { rows, cols, .. } => match axis {
                 0 => Ok(*rows),
                 1 => Ok(*cols),
@@ -342,6 +413,11 @@ impl Dense {
                 dequant_q8(&w.take(idx, 0)?, &scales.take(idx, 0)?)
             }
             Self::Qmm { w, scales, biases } => dequant_affine8(
+                &w.take(idx, 0)?,
+                &scales.take(idx, 0)?,
+                &biases.take(idx, 0)?,
+            ),
+            Self::Qmm4 { w, scales, biases } => dequant_affine4(
                 &w.take(idx, 0)?,
                 &scales.take(idx, 0)?,
                 &biases.take(idx, 0)?,
@@ -369,6 +445,11 @@ impl Dense {
                 scales: cut(scales)?,
             },
             Self::Qmm { w, scales, biases } => Self::Qmm {
+                w: cut(w)?,
+                scales: cut(scales)?,
+                biases: cut(biases)?,
+            },
+            Self::Qmm4 { w, scales, biases } => Self::Qmm4 {
                 w: cut(w)?,
                 scales: cut(scales)?,
                 biases: cut(biases)?,
@@ -432,6 +513,9 @@ impl Dense {
             Self::Qmm { w, scales, biases } => {
                 Ok(Some(qmm_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
             }
+            Self::Qmm4 { w, scales, biases } => {
+                Ok(Some(qmm4_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
+            }
             Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
                 Ok(None)
             }
@@ -442,7 +526,9 @@ impl Dense {
         match self {
             Self::Array(a) => a.nbytes(),
             Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => w.nbytes() + scales.nbytes(),
-            Self::Qmm { w, scales, biases } => w.nbytes() + scales.nbytes() + biases.nbytes(),
+            Self::Qmm { w, scales, biases } | Self::Qmm4 { w, scales, biases } => {
+                w.nbytes() + scales.nbytes() + biases.nbytes()
+            }
             Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => 0,
         }
     }
@@ -887,6 +973,296 @@ pub(crate) fn quantize_sym_q8_array(a: &MxArray) -> Result<Dense> {
     })
 }
 
+#[inline]
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if (bits & 0x7F80_0000) == 0x7F80_0000 {
+        let top = (bits >> 16) as u16;
+        return if (bits & 0x007F_FFFF) != 0 {
+            top | 0x0040
+        } else {
+            top
+        };
+    }
+    let round_bias = 0x0000_7FFF + ((bits >> 16) & 1);
+    ((bits.wrapping_add(round_bias)) >> 16) as u16
+}
+
+fn affine4_quantize_f32_range(
+    src: &[f32],
+    w_out: &mut [u32],
+    s_out: &mut [u16],
+    b_out: &mut [u16],
+) {
+    for (((vals, w_grp), s_dst), b_dst) in src
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(w_out.as_chunks_mut::<8>().0)
+        .zip(s_out.iter_mut())
+        .zip(b_out.iter_mut())
+    {
+        let mut min_v = vals[0];
+        let mut max_v = vals[0];
+        for &v in &vals[1..] {
+            if v < min_v {
+                min_v = v;
+            }
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let bias_bits = f32_to_bf16_bits(min_v);
+        let bias = f32::from_bits(u32::from(bias_bits) << 16);
+        let scale_bits = f32_to_bf16_bits((max_v - bias) / 15.0);
+        let scale = f32::from_bits(u32::from(scale_bits) << 16);
+        *s_dst = scale_bits;
+        *b_dst = bias_bits;
+        if scale == 0.0 || !scale.is_finite() {
+            w_grp.fill(0);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (j, dst) in w_grp.iter_mut().enumerate() {
+            let base = j * 8;
+            let mut word = 0u32;
+            for lane in 0..8 {
+                let q = ((vals[base + lane] - bias) * inv).round().clamp(0.0, 15.0) as u32;
+                word |= q << (lane * 4);
+            }
+            *dst = word;
+        }
+    }
+}
+
+fn affine4_quantize_f32_slice(
+    src: &[f32],
+    w_out: &mut [u32],
+    s_out: &mut [u16],
+    b_out: &mut [u16],
+) {
+    let groups = s_out.len();
+    debug_assert_eq!(src.len(), groups * 64);
+    debug_assert_eq!(w_out.len(), groups * 8);
+    debug_assert_eq!(b_out.len(), groups);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16);
+    if threads <= 1 || groups < 2048 {
+        affine4_quantize_f32_range(src, w_out, s_out, b_out);
+        return;
+    }
+    let chunk_g = groups.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut s_rem = s_out;
+        let mut b_rem = b_out;
+        let mut w_rem = w_out;
+        let mut x_rem = src;
+        while !s_rem.is_empty() {
+            let take = chunk_g.min(s_rem.len());
+            let (sc, sr) = s_rem.split_at_mut(take);
+            let (bc, br) = b_rem.split_at_mut(take);
+            let (wc, wr) = w_rem.split_at_mut(take * 8);
+            let (xc, xr) = x_rem.split_at(take * 64);
+            s_rem = sr;
+            b_rem = br;
+            w_rem = wr;
+            x_rem = xr;
+            scope.spawn(move || affine4_quantize_f32_range(xc, wc, sc, bc));
+        }
+    });
+}
+
+fn affine4_quantize_bf16_range(
+    raw: &[u8],
+    w_out: &mut [u32],
+    s_out: &mut [u16],
+    b_out: &mut [u16],
+) {
+    for (((blk, w_grp), s_dst), b_dst) in raw
+        .as_chunks::<128>()
+        .0
+        .iter()
+        .zip(w_out.as_chunks_mut::<8>().0)
+        .zip(s_out.iter_mut())
+        .zip(b_out.iter_mut())
+    {
+        let mut vals = [0.0f32; 64];
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        for (dst, pair) in vals.iter_mut().zip(blk.as_chunks::<2>().0) {
+            let v = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
+            *dst = v;
+            if v < min_v {
+                min_v = v;
+            }
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let bias_bits = f32_to_bf16_bits(min_v);
+        let bias = f32::from_bits(u32::from(bias_bits) << 16);
+        let scale_bits = f32_to_bf16_bits((max_v - bias) / 15.0);
+        let scale = f32::from_bits(u32::from(scale_bits) << 16);
+        *s_dst = scale_bits;
+        *b_dst = bias_bits;
+        if scale == 0.0 || !scale.is_finite() {
+            w_grp.fill(0);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (j, dst) in w_grp.iter_mut().enumerate() {
+            let base = j * 8;
+            let mut word = 0u32;
+            for lane in 0..8 {
+                let q = ((vals[base + lane] - bias) * inv).round().clamp(0.0, 15.0) as u32;
+                word |= q << (lane * 4);
+            }
+            *dst = word;
+        }
+    }
+}
+
+/// Quantizes raw little-endian BF16 `[rows, k]` bytes (`k % 64 == 0`) directly
+/// into `Dense::Qmm4` (affine-4 g64, bf16 scales & biases). Model thread only.
+pub(crate) fn quantize_affine4_from_bf16_raw(raw: &[u8], rows: usize, k: usize) -> Result<Dense> {
+    if rows == 0 || k == 0 || !k.is_multiple_of(64) {
+        return Err(bad(format!(
+            "Affine4 requant shape [{rows}, {k}] requires k > 0 divisible by 64"
+        )));
+    }
+    let n = rows
+        .checked_mul(k)
+        .ok_or_else(|| bad("Affine4 requant size overflows"))?;
+    check_lens(raw.len(), n, 2, "Affine4 bf16 values")?;
+    let groups = n / 64;
+    let (ri, ki) = (
+        i64::try_from(rows).map_err(|_| bad("row count exceeds i64"))?,
+        i64::try_from(k).map_err(|_| bad("col count exceeds i64"))?,
+    );
+    let (w_arr, w_ptr, w_bytes) = MxArray::alloc_uninit(&[ri, ki / 8], DType::Uint32)?;
+    let (s_arr, s_ptr, s_bytes) = MxArray::alloc_uninit(&[ri, ki / 64], DType::BFloat16)?;
+    let (b_arr, b_ptr, b_bytes) = MxArray::alloc_uninit(&[ri, ki / 64], DType::BFloat16)?;
+    let w_len = groups * 8;
+    if w_len.checked_mul(size_of::<u32>()) != Some(w_bytes)
+        || w_ptr.0.align_offset(align_of::<u32>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(s_bytes)
+        || s_ptr.0.align_offset(align_of::<u16>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(b_bytes)
+        || b_ptr.0.align_offset(align_of::<u16>()) != 0
+    {
+        return Err(bad("Affine4 alloc_uninit size or alignment mismatch"));
+    }
+    // SAFETY: `alloc_uninit` returned freshly allocated writable buffers alive
+    // for the lifetime of `w_arr`/`s_arr`/`b_arr` with verified size/alignment.
+    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    let b_slice = unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<u16>(), groups) };
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        .min(16);
+    if threads <= 1 || groups < 2048 {
+        affine4_quantize_bf16_range(raw, w_slice, s_slice, b_slice);
+    } else {
+        let chunk_g = groups.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut s_rem = s_slice;
+            let mut b_rem = b_slice;
+            let mut w_rem = w_slice;
+            let mut r_rem = raw;
+            while !s_rem.is_empty() {
+                let take = chunk_g.min(s_rem.len());
+                let (sc, sr) = s_rem.split_at_mut(take);
+                let (bc, br) = b_rem.split_at_mut(take);
+                let (wc, wr) = w_rem.split_at_mut(take * 8);
+                let (rc, rr) = r_rem.split_at(take * 128);
+                s_rem = sr;
+                b_rem = br;
+                w_rem = wr;
+                r_rem = rr;
+                scope.spawn(move || affine4_quantize_bf16_range(rc, wc, sc, bc));
+            }
+        });
+    }
+    Ok(Dense::Qmm4 {
+        w: w_arr,
+        scales: s_arr,
+        biases: b_arr,
+    })
+}
+
+/// Quantizes a 2-D `MxArray` `[rows, k]` (`k % 64 == 0`) into `Dense::Qmm4`
+/// (affine-4 g64, bf16 scales & biases) in bounded row chunks. Model thread only.
+pub(crate) fn quantize_affine4_array(a: &MxArray) -> Result<Dense> {
+    if a.ndim()? != 2 {
+        return Err(bad("Affine4 array requant requires a 2-D matrix"));
+    }
+    let rows_i = a.shape_at(0)?;
+    let k_i = a.shape_at(1)?;
+    if rows_i <= 0 || k_i <= 0 || k_i % 64 != 0 {
+        return Err(bad(format!(
+            "Affine4 array requant shape [{rows_i}, {k_i}] requires k > 0 divisible by 64"
+        )));
+    }
+    let rows = rows_i as usize;
+    let k = k_i as usize;
+    let groups_per_row = k / 64;
+    let words_per_row = k / 8;
+    let groups = rows
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| bad("Affine4 array requant overflows"))?;
+    let (w_arr, w_ptr, w_bytes) = MxArray::alloc_uninit(&[rows_i, k_i / 8], DType::Uint32)?;
+    let (s_arr, s_ptr, s_bytes) = MxArray::alloc_uninit(&[rows_i, k_i / 64], DType::BFloat16)?;
+    let (b_arr, b_ptr, b_bytes) = MxArray::alloc_uninit(&[rows_i, k_i / 64], DType::BFloat16)?;
+    let w_len = groups * 8;
+    if w_len.checked_mul(size_of::<u32>()) != Some(w_bytes)
+        || w_ptr.0.align_offset(align_of::<u32>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(s_bytes)
+        || s_ptr.0.align_offset(align_of::<u16>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(b_bytes)
+        || b_ptr.0.align_offset(align_of::<u16>()) != 0
+    {
+        return Err(bad("Affine4 alloc_uninit size or alignment mismatch"));
+    }
+    // SAFETY: freshly allocated writable buffers of verified size/alignment.
+    let w_slice = unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<u32>(), w_len) };
+    let s_slice = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<u16>(), groups) };
+    let b_slice = unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<u16>(), groups) };
+    const CHUNK_ROWS: usize = 4096;
+    let mut lo = 0usize;
+    while lo < rows {
+        let hi = (lo + CHUNK_ROWS).min(rows);
+        let sub = if lo == 0 && hi == rows {
+            a.clone()
+        } else {
+            a.slice(&[lo as i64, 0], &[hi as i64, k_i])?
+        };
+        let sub_f32 = if sub.dtype()? == DType::Float32 {
+            sub
+        } else {
+            sub.astype(DType::Float32)?
+        };
+        let vals = sub_f32.to_float32()?;
+        affine4_quantize_f32_slice(
+            vals.as_ref(),
+            &mut w_slice[lo * words_per_row..hi * words_per_row],
+            &mut s_slice[lo * groups_per_row..hi * groups_per_row],
+            &mut b_slice[lo * groups_per_row..hi * groups_per_row],
+        );
+        lo = hi;
+    }
+    if rows > CHUNK_ROWS {
+        crate::array::clear_cache();
+    }
+    Ok(Dense::Qmm4 {
+        w: w_arr,
+        scales: s_arr,
+        biases: b_arr,
+    })
+}
+
 /// Q8_0 blocks (f16 `d`, 32 × i8 `q`) as `d·q` in f32 (exact).
 pub fn q8_0_into_f32(raw: &[u8], out: &mut [f32]) -> Result<()> {
     let blocks = raw.len() / Q8_0_BYTES;
@@ -1174,24 +1550,37 @@ impl HcWeights {
     }
 }
 
-/// Concatenates 2-D `Dense::SymQ8` or `Dense::Qmm` matrices along axis 0 into
-/// a single backing allocation and returns `(fused, zero_copy_views)` so
-/// resident RAM stays 1.00x. Returns `None` if fewer than 2 parts or any part
-/// does not match the others' variant, rank, width, or dtypes.
+/// Concatenates 2-D `Dense::SymQ8`, `Dense::Qmm`, or `Dense::Qmm4` matrices
+/// along axis 0 into a single backing allocation and returns
+/// `(fused, zero_copy_views)` so resident RAM stays 1.00x. Returns `None` if
+/// fewer than 2 parts or any part does not match the others' variant, rank,
+/// width, or dtypes.
 pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense>)>> {
     if parts.len() < 2 {
         return Ok(None);
     }
-    let sym = matches!(parts[0], Dense::SymQ8 { .. });
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        SymQ8,
+        Qmm,
+        Qmm4,
+    }
+    let kind = match parts[0] {
+        Dense::SymQ8 { .. } => Kind::SymQ8,
+        Dense::Qmm { .. } => Kind::Qmm,
+        Dense::Qmm4 { .. } => Kind::Qmm4,
+        _ => return Ok(None),
+    };
     let mut ws = Vec::with_capacity(parts.len());
     let mut ss = Vec::with_capacity(parts.len());
-    let mut bs = Vec::with_capacity(if sym { 0 } else { parts.len() });
+    let mut bs = Vec::with_capacity(if kind == Kind::SymQ8 { 0 } else { parts.len() });
     let mut rows = Vec::with_capacity(parts.len());
     let mut expected: Option<(i64, i64, Option<i64>, DType, DType, Option<DType>)> = None;
     for part in parts {
-        let (w, scales, biases) = match (sym, part) {
-            (true, Dense::SymQ8 { w, scales }) => (w, scales, None),
-            (false, Dense::Qmm { w, scales, biases }) => (w, scales, Some(biases)),
+        let (w, scales, biases) = match (kind, part) {
+            (Kind::SymQ8, Dense::SymQ8 { w, scales }) => (w, scales, None),
+            (Kind::Qmm, Dense::Qmm { w, scales, biases })
+            | (Kind::Qmm4, Dense::Qmm4 { w, scales, biases }) => (w, scales, Some(biases)),
             _ => return Ok(None),
         };
         if w.ndim()? != 2 || scales.ndim()? != 2 {
@@ -1232,16 +1621,28 @@ pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense
     }
     let w = MxArray::concatenate_many(ws, Some(0))?;
     let s = MxArray::concatenate_many(ss, Some(0))?;
-    let fused = if sym {
-        MxArray::eval_arrays_with_context(&[&w, &s], "hy_v4_flash fuse sym q8")?;
-        Dense::SymQ8 { w, scales: s }
-    } else {
-        let b = MxArray::concatenate_many(bs, Some(0))?;
-        MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm")?;
-        Dense::Qmm {
-            w,
-            scales: s,
-            biases: b,
+    let fused = match kind {
+        Kind::SymQ8 => {
+            MxArray::eval_arrays_with_context(&[&w, &s], "hy_v4_flash fuse sym q8")?;
+            Dense::SymQ8 { w, scales: s }
+        }
+        Kind::Qmm => {
+            let b = MxArray::concatenate_many(bs, Some(0))?;
+            MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm")?;
+            Dense::Qmm {
+                w,
+                scales: s,
+                biases: b,
+            }
+        }
+        Kind::Qmm4 => {
+            let b = MxArray::concatenate_many(bs, Some(0))?;
+            MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm4")?;
+            Dense::Qmm4 {
+                w,
+                scales: s,
+                biases: b,
+            }
         }
     };
     let mut views = Vec::with_capacity(rows.len());

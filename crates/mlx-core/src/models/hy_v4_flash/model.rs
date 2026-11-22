@@ -1200,14 +1200,14 @@ impl Model {
                     }
                 }
                 RowKind::Prefill | RowKind::Decode => {
-                    // Flush at layer 0 in direct decode so GPU layer 0 overlaps
-                    // layer 1's Engram SSD read, then every 10 layers. For large
-                    // prefill chunks (> 2048 rows), flush every layer so peak
-                    // Metal scratch stays bounded to one layer.
+                    // Flush direct decode at layers 14 and 28 so Metal encodes
+                    // in three large command buffers without a premature l == 0
+                    // stall. For large prefill chunks (> 2048 rows), flush every
+                    // layer so peak Metal scratch stays bounded to one layer.
                     let flush = if !direct {
                         true
                     } else if wave.kind() == RowKind::Decode {
-                        l == 0 || l == 10 || l == 20 || l == 30
+                        matches!(l, 14 | 28)
                     } else if total > 2048 {
                         true
                     } else {

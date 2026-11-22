@@ -1132,6 +1132,73 @@ fn decode_head_weights_run_per_row() {
 }
 
 #[test]
+fn decode_head_weights_f32_runs_batched_bit_exact_real_dim() {
+    crate::models::hy_v4_flash::exact_f32();
+    let g = real();
+    let d = 3072usize;
+    let mut r = Rng(41);
+    let proj_arr = arr(&r.vec(g.n_heads * d, 0.25), &[g.n_heads, d]);
+    let w = IndexerWeights {
+        attn_k: dense(&vec![0.0; g.head_dim * d], g.head_dim, d),
+        k_norm: arr(&vec![1.0; g.head_dim], &[g.head_dim]),
+        q_b: dense(
+            &vec![0.0; g.n_heads * g.head_dim * Q_LORA],
+            g.n_heads * g.head_dim,
+            Q_LORA,
+        ),
+        proj: Dense::Array(proj_arr),
+        compressor_value: arr(
+            &vec![0.0; g.head_dim * g.head_dim],
+            &[g.head_dim, g.head_dim],
+        ),
+        compressor_gate: arr(
+            &vec![0.0; g.head_dim * g.head_dim],
+            &[g.head_dim, g.head_dim],
+        ),
+        compressor_ape: arr(&vec![0.0; g.kpool * g.head_dim], &[g.kpool, g.head_dim]),
+        compressor_norm: arr(&vec![1.0; g.head_dim], &[g.head_dim]),
+    };
+    let ix = Indexer::new(g.clone(), &w).unwrap();
+    let xs = inputs(8, d, 43);
+    let h = g.n_heads;
+    let ones: Vec<Vec<u32>> = xs
+        .iter()
+        .map(|x| {
+            read(
+                &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Decode)
+                    .unwrap(),
+            )
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+        })
+        .collect();
+    for m in [2usize, 4, 8] {
+        let all = read(
+            &ix.head_weights(&w, &rows_of(&xs[..m]), RowKind::Decode)
+                .unwrap(),
+        );
+        let ref_mm = read(
+            &linear(&rows_of(&xs[..m]), &w.proj)
+                .unwrap()
+                .mul_scalar(f64::from(g.weight_scale))
+                .unwrap(),
+        );
+        for i in 0..m {
+            let row = &all[i * h..(i + 1) * h];
+            let row_bits: Vec<u32> = row.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(row_bits, ones[i], "f32 M={m} row={i} invariance");
+            let max_diff = row
+                .iter()
+                .zip(&ref_mm[i * h..(i + 1) * h])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff <= 1e-4, "f32 M={m} row={i} diff {max_diff}");
+        }
+    }
+}
+
+#[test]
 fn decode_head_weights_q8_runs_batched_bit_exact() {
     use crate::models::hy_v4_flash::weights::quantize_sym_q8_array;
 
