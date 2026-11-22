@@ -299,6 +299,190 @@ impl KVCache {
         Ok((result_keys, result_values))
     }
 
+    /// Fused CUDA QK-Norm + non-traditional partial RoPE + in-place KV store.
+    ///
+    /// Expects `q_in` `[B, T, Hq, D]` and `k_in` / `v_in` `[B, T, Hkv, D]` in BF16.
+    /// When the fused CUDA kernel accepts the contract, returns
+    /// `Ok(Some((q_sdpa, cached_keys, cached_values)))` where `q_sdpa` is
+    /// `[B, Hq, T, D]` and `cached_keys`/`cached_values` are `[B, Hkv, 0..offset+T, D]`.
+    /// Returns `Ok(None)` without advancing `self.offset` on contract miss so the
+    /// caller can run the unfused QK-norm + RoPE + `update_and_fetch` path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qk_norm_rope_update_and_fetch(
+        &mut self,
+        q_in: &MxArray,
+        k_in: &MxArray,
+        v_in: &MxArray,
+        q_norm_w: &MxArray,
+        k_norm_w: &MxArray,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+    ) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+        if !crate::accelerator::cuda_ops_available()
+            || q_in.dtype()? != DType::BFloat16
+            || k_in.dtype()? != DType::BFloat16
+            || v_in.dtype()? != DType::BFloat16
+            || q_norm_w.dtype()? != DType::BFloat16
+            || k_norm_w.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let batch_size = k_in.shape_at(0)?;
+        let seq_len = i32::try_from(k_in.shape_at(1)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
+        let n_kv_heads = k_in.shape_at(2)?;
+        let k_head_dim = k_in.shape_at(3)?;
+        let v_head_dim = v_in.shape_at(3)?;
+        if k_head_dim != v_head_dim {
+            return Ok(None);
+        }
+
+        let prev = self.offset;
+        let next = prev
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::from_reason("KV cache sequence is too large"))?;
+        self.ensure_rows(
+            batch_size,
+            n_kv_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            DType::BFloat16,
+            DType::BFloat16,
+        )?;
+        let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
+            return Ok(None);
+        };
+        let Some((q_out, new_k, new_v)) = crate::kernels::kv::qk_norm_rope_kv_store(
+            q_in,
+            k_in,
+            v_in,
+            q_norm_w,
+            k_norm_w,
+            cached_keys,
+            cached_values,
+            eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            prev,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.keys = Some(new_k);
+        self.values = Some(new_v);
+        self.offset = next;
+
+        let result_keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache keys missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        let result_values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache values missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        Ok(Some((q_out, result_keys, result_values)))
+    }
+
+    /// Tree-RoPE variant of [`Self::qk_norm_rope_update_and_fetch`]: applies
+    /// QK-Norm + non-traditional partial RoPE at position `offset + depths[t]`
+    /// while storing K/V at slot `offset + t`.
+    ///
+    /// Returns `Ok(None)` without advancing `self.offset` if the CUDA kernel
+    /// is unavailable or declines the shape/dtype contract.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn qk_norm_rope_update_and_fetch_tree(
+        &mut self,
+        q: &MxArray,
+        k: &MxArray,
+        v: &MxArray,
+        q_norm_weight: &MxArray,
+        k_norm_weight: &MxArray,
+        depths: &MxArray,
+        norm_eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        rope_traditional: bool,
+    ) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+        if rope_traditional
+            || !crate::accelerator::cuda_ops_available()
+            || q.dtype()? != DType::BFloat16
+            || k.dtype()? != DType::BFloat16
+            || v.dtype()? != DType::BFloat16
+            || q_norm_weight.dtype()? != DType::BFloat16
+            || k_norm_weight.dtype()? != DType::BFloat16
+            || depths.dtype()? != DType::Int32
+            || depths.ndim()? != 1
+        {
+            return Ok(None);
+        }
+        let batch_size = k.shape_at(0)?;
+        let seq_len = i32::try_from(k.shape_at(1)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
+        let n_kv_heads = k.shape_at(2)?;
+        let k_head_dim = k.shape_at(3)?;
+        let v_head_dim = v.shape_at(3)?;
+        if k_head_dim != v_head_dim || depths.shape_at(0)? != i64::from(seq_len) {
+            return Ok(None);
+        }
+
+        let prev = self.offset;
+        let next = prev
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::from_reason("KV cache sequence is too large"))?;
+        self.ensure_rows(
+            batch_size,
+            n_kv_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            DType::BFloat16,
+            DType::BFloat16,
+        )?;
+        let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
+            return Ok(None);
+        };
+        let Some((q_out, new_k, new_v)) = crate::kernels::kv::qk_norm_rope_kv_store_tree(
+            q,
+            k,
+            v,
+            q_norm_weight,
+            k_norm_weight,
+            cached_keys,
+            cached_values,
+            depths,
+            norm_eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            prev,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.keys = Some(new_k);
+        self.values = Some(new_v);
+        self.offset = next;
+
+        let result_keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache keys missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        let result_values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache values missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        Ok(Some((q_out, result_keys, result_values)))
+    }
+
     /// Append a block of K and V rows with ONE store dispatch for the whole
     /// layer, in place into the cache buffers. The bytes equal the
     /// slice_update path ([`Self::update_and_fetch`]), which stays the
@@ -557,6 +741,130 @@ impl KVCache {
             self.offset = new_len;
         }
         // If new_len >= offset, do nothing (can't grow via trim)
+    }
+
+    /// Compact accepted speculative tree rows from `base_offset + accepted_nodes[r]`
+    /// into contiguous slots `base_offset + r` and rewind `self.offset` to
+    /// `base_offset + accepted_nodes.len()`.
+    ///
+    /// When `is_contiguous_prefix` is true (`accepted_nodes == [0, 1, ..., K-1]`),
+    /// performs a zero-copy `trim(base_offset + K)`.
+    #[allow(dead_code)]
+    pub(crate) fn compact_tree_rows(
+        &mut self,
+        base_offset: i32,
+        accepted_nodes: &[usize],
+        is_contiguous_prefix: bool,
+    ) -> Result<()> {
+        self.compact_tree_rows_with_indices(base_offset, accepted_nodes, is_contiguous_prefix, None)
+    }
+
+    /// Like [`Self::compact_tree_rows`], reusing a caller-uploaded
+    /// `accepted_i32` (`int32[K]`) across all FullAttention layers in one commit.
+    pub(crate) fn compact_tree_rows_with_indices(
+        &mut self,
+        base_offset: i32,
+        accepted_nodes: &[usize],
+        is_contiguous_prefix: bool,
+        accepted_i32: Option<&MxArray>,
+    ) -> Result<()> {
+        if base_offset < 0 {
+            return Err(Error::from_reason(format!(
+                "KVCache::compact_tree_rows: negative base_offset {base_offset}"
+            )));
+        }
+        if accepted_nodes.len() > 16 {
+            return Err(Error::from_reason(format!(
+                "KVCache::compact_tree_rows: accepted node count {} exceeds 16",
+                accepted_nodes.len()
+            )));
+        }
+        let keep = accepted_nodes.len() as i32;
+        let target = base_offset
+            .checked_add(keep)
+            .ok_or_else(|| Error::from_reason("KVCache::compact_tree_rows: frontier overflow"))?;
+        if target > self.offset {
+            return Err(Error::from_reason(format!(
+                "KVCache::compact_tree_rows: frontier {target} exceeds cache offset {}",
+                self.offset
+            )));
+        }
+        for (idx, &node) in accepted_nodes.iter().enumerate() {
+            if node >= 16 {
+                return Err(Error::from_reason(format!(
+                    "KVCache::compact_tree_rows: node index {node} outside 0..16"
+                )));
+            }
+            if is_contiguous_prefix && node != idx {
+                return Err(Error::from_reason(format!(
+                    "KVCache::compact_tree_rows: is_contiguous_prefix set but accepted_nodes[{idx}] == {node}"
+                )));
+            }
+            let src = base_offset
+                .checked_add(node as i32)
+                .ok_or_else(|| Error::from_reason("KVCache::compact_tree_rows: row overflow"))?;
+            if src >= self.offset {
+                return Err(Error::from_reason(format!(
+                    "KVCache::compact_tree_rows: source row {src} >= cache offset {}",
+                    self.offset
+                )));
+            }
+        }
+        if is_contiguous_prefix || accepted_nodes.is_empty() {
+            self.trim(target);
+            return Ok(());
+        }
+
+        let (Some(k_cache), Some(v_cache)) = (&self.keys, &self.values) else {
+            return Err(Error::from_reason(
+                "KVCache::compact_tree_rows: cache buffers missing",
+            ));
+        };
+        let owned_idx;
+        let idx_ref = match accepted_i32 {
+            Some(arr) => arr,
+            None => {
+                let nodes: Vec<i32> = accepted_nodes.iter().map(|&n| n as i32).collect();
+                owned_idx = MxArray::from_int32(&nodes, &[nodes.len() as i64])?;
+                &owned_idx
+            }
+        };
+        if let Some((new_k, new_v)) =
+            crate::kernels::kv::kv_compact_rows(k_cache, v_cache, base_offset, idx_ref)?
+        {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
+            self.offset = target;
+            return Ok(());
+        }
+
+        // Non-CUDA fallback: gather all accepted rows first (avoiding any
+        // overlap hazard), then write them into `base_offset..target`.
+        let abs_indices: Vec<i32> = accepted_nodes
+            .iter()
+            .map(|&n| base_offset + n as i32)
+            .collect();
+        let abs_arr = MxArray::from_int32(&abs_indices, &[abs_indices.len() as i64])?;
+        let gathered_k = k_cache.take(&abs_arr, 2)?;
+        let gathered_v = v_cache.take(&abs_arr, 2)?;
+        if let Some(cached_keys) = self.keys.as_mut() {
+            cached_keys.slice_assign_axis_inplace(
+                2,
+                i64::from(base_offset),
+                i64::from(target),
+                &gathered_k,
+            )?;
+        }
+        if let Some(cached_values) = self.values.as_mut() {
+            cached_values.slice_assign_axis_inplace(
+                2,
+                i64::from(base_offset),
+                i64::from(target),
+                &gathered_v,
+            )?;
+        }
+        self.offset = target;
+        Ok(())
     }
 }
 
@@ -1255,5 +1563,167 @@ mod tests {
             769 + 2 * 256,
             "a step-aligned frontier keeps the whole old buffer"
         );
+    }
+
+    #[test]
+    fn compact_tree_rows_fast_path_and_non_contiguous_branch() {
+        let (b, h, d) = (1i64, 4i64, 256i64);
+        let prefix_len = 6i64;
+        let tree_len = 12i64;
+        let prefix_k = rand_bf16(&[b, h, prefix_len, d]);
+        let prefix_v = rand_bf16(&[b, h, prefix_len, d]);
+        let tree_k = rand_bf16(&[b, h, tree_len, d]);
+        let tree_v = rand_bf16(&[b, h, tree_len, d]);
+
+        // 1. Contiguous prefix fast path.
+        let mut fast = KVCache::new();
+        fast.update_and_fetch(&prefix_k, &prefix_v).unwrap();
+        let base = fast.get_offset();
+        fast.update_and_fetch(&tree_k, &tree_v).unwrap();
+        fast.compact_tree_rows(base, &[0, 1, 2], true).unwrap();
+        assert_eq!(fast.get_offset(), base + 3);
+        let want_k_fast =
+            MxArray::concatenate(&prefix_k, &tree_k.slice_axis(2, 0, 3).unwrap(), 2).unwrap();
+        let want_v_fast =
+            MxArray::concatenate(&prefix_v, &tree_v.slice_axis(2, 0, 3).unwrap(), 2).unwrap();
+        assert!(bits_equal(
+            &fast
+                .keys_ref()
+                .unwrap()
+                .slice_axis(2, 0, base as i64 + 3)
+                .unwrap(),
+            &want_k_fast
+        ));
+        assert!(bits_equal(
+            &fast
+                .values_ref()
+                .unwrap()
+                .slice_axis(2, 0, base as i64 + 3)
+                .unwrap(),
+            &want_v_fast
+        ));
+
+        // 2. Non-contiguous accepted tree branch [0, 4, 7, 11].
+        let mut branch = KVCache::new();
+        branch.update_and_fetch(&prefix_k, &prefix_v).unwrap();
+        let base = branch.get_offset();
+        branch.update_and_fetch(&tree_k, &tree_v).unwrap();
+        let accepted = [0usize, 4, 7, 11];
+        branch.compact_tree_rows(base, &accepted, false).unwrap();
+        assert_eq!(branch.get_offset(), base + accepted.len() as i32);
+
+        let idx = MxArray::from_int32(&[0, 4, 7, 11], &[4]).unwrap();
+        let want_k = MxArray::concatenate(&prefix_k, &tree_k.take(&idx, 2).unwrap(), 2).unwrap();
+        let want_v = MxArray::concatenate(&prefix_v, &tree_v.take(&idx, 2).unwrap(), 2).unwrap();
+        let got_k = branch
+            .keys_ref()
+            .unwrap()
+            .slice_axis(2, 0, branch.get_offset() as i64)
+            .unwrap();
+        let got_v = branch
+            .values_ref()
+            .unwrap()
+            .slice_axis(2, 0, branch.get_offset() as i64)
+            .unwrap();
+        assert!(bits_equal(&got_k, &want_k), "compacted K rows mismatch");
+        assert!(bits_equal(&got_v, &want_v), "compacted V rows mismatch");
+
+        // 3. Validation guards.
+        assert!(branch.compact_tree_rows(-1, &[0], true).is_err());
+        assert!(branch.compact_tree_rows(base, &[0, 2], true).is_err());
+        assert!(branch.compact_tree_rows(base, &[0, 16], false).is_err());
+        assert!(branch.compact_tree_rows(base, &[0, 10], false).is_err());
+    }
+
+    #[test]
+    fn qk_norm_rope_update_and_fetch_tree_matches_per_depth_rope() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        use crate::nn::{RMSNorm, RoPE};
+        let (b, t, hq, hkv, d) = (1i64, 8i64, 24i64, 4i64, 256i64);
+        let prefix_len = 5i64;
+        let depths_host = [0i32, 1, 2, 1, 2, 3, 2, 3];
+        let depths = MxArray::from_int32(&depths_host, &[t]).unwrap();
+
+        let prefix_k = rand_bf16(&[b, hkv, prefix_len, d]);
+        let prefix_v = rand_bf16(&[b, hkv, prefix_len, d]);
+        let q_in = rand_bf16(&[b, t, hq, d]);
+        let k_in = rand_bf16(&[b, t, hkv, d]);
+        let v_in = rand_bf16(&[b, t, hkv, d]);
+        let qw = rand_bf16(&[d]);
+        let kw = rand_bf16(&[d]);
+        let eps = 1e-6f32;
+        let rope_dims = 64i32;
+        let rope_base = 10_000_000.0f32;
+
+        let mut fused = KVCache::new();
+        fused.update_and_fetch(&prefix_k, &prefix_v).unwrap();
+        let (q_got, k_got, v_got) = fused
+            .qk_norm_rope_update_and_fetch_tree(
+                &q_in, &k_in, &v_in, &qw, &kw, &depths, eps, rope_dims, rope_base, 1.0, false,
+            )
+            .unwrap()
+            .expect("CUDA tree QK-norm/RoPE/KV-store must accept Qwen3.8 geometry");
+        assert_eq!(fused.get_offset(), (prefix_len + t) as i32);
+
+        let mut q_norm = RMSNorm::new(d as u32, Some(f64::from(eps))).unwrap();
+        q_norm.set_weight(&qw).unwrap();
+        let mut k_norm = RMSNorm::new(d as u32, Some(f64::from(eps))).unwrap();
+        k_norm.set_weight(&kw).unwrap();
+        let rope = RoPE::new(
+            rope_dims,
+            Some(false),
+            Some(f64::from(rope_base)),
+            Some(1.0),
+        );
+        let pos_offsets: Vec<i32> = depths_host
+            .iter()
+            .map(|&dp| dp + prefix_len as i32)
+            .collect();
+        let pos_arr = MxArray::from_int32(&pos_offsets, &[t]).unwrap();
+        let q_ref = rope
+            .forward_with_offsets(
+                &q_norm
+                    .forward(&q_in)
+                    .unwrap()
+                    .reshape(&[t, hq, 1, d])
+                    .unwrap(),
+                &pos_arr,
+            )
+            .unwrap()
+            .reshape(&[1, t, hq, d])
+            .unwrap()
+            .transpose(Some(&[0, 2, 1, 3]))
+            .unwrap();
+        let k_ref_new = rope
+            .forward_with_offsets(
+                &k_norm
+                    .forward(&k_in)
+                    .unwrap()
+                    .reshape(&[t, hkv, 1, d])
+                    .unwrap(),
+                &pos_arr,
+            )
+            .unwrap()
+            .reshape(&[1, t, hkv, d])
+            .unwrap()
+            .transpose(Some(&[0, 2, 1, 3]))
+            .unwrap();
+        let v_ref_new = v_in.transpose(Some(&[0, 2, 1, 3])).unwrap();
+        let mut reference = KVCache::new();
+        reference.update_and_fetch(&prefix_k, &prefix_v).unwrap();
+        let (k_ref, v_ref) = reference.update_and_fetch(&k_ref_new, &v_ref_new).unwrap();
+
+        let max_diff = |a: &MxArray, b: &MxArray| -> f32 {
+            let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+            af.iter()
+                .zip(bf.iter())
+                .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()))
+        };
+        assert!(max_diff(&q_got, &q_ref) <= 2e-2, "tree Q mismatch");
+        assert!(max_diff(&k_got, &k_ref) <= 2e-2, "tree K mismatch");
+        assert!(bits_equal(&v_got, &v_ref), "tree V mismatch");
     }
 }

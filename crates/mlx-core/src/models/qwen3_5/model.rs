@@ -94,7 +94,8 @@ pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 use self::forward::chunked_prefill_with_size;
 pub(crate) use self::forward::{
     DFlash2LogitsSpan, PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches,
-    forward_dflash2_eager_with_taps, partition_prefill_chunks,
+    forward_dflash2_eager_with_taps, forward_dflash2_eager_with_taps_deferred,
+    forward_dflash2_eager_with_taps_deferred_tree, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, forward_inner, forward_pre_norm_inner, project_logits_from_hidden,

@@ -89,7 +89,27 @@ inline CUfunction jit_kernel(
     return it->second;
   }
   const auto source_hash = fnv1a_64(source);
-  const auto module_name = std::string(entry) + "_" + std::to_string(source_hash) +
+  std::string safe_entry(entry);
+  for (char& c : safe_entry) {
+    switch (c) {
+      case '<':
+      case '>':
+      case ':':
+      case '"':
+      case '/':
+      case '\\':
+      case '|':
+      case '?':
+      case '*':
+      case ',':
+      case ' ':
+        c = '_';
+        break;
+      default:
+        break;
+    }
+  }
+  const auto module_name = safe_entry + "_" + std::to_string(source_hash) +
       "_" + std::to_string(device.compute_capability_major()) + "_" +
       std::to_string(device.compute_capability_minor());
   auto& module = get_jit_module(device, module_name, [&] {

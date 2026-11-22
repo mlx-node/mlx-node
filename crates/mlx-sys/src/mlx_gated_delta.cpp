@@ -1,4 +1,355 @@
 #include "mlx_common.h"
+#include <cstdio>
+
+#ifdef MLX_NODE_CUDA_ENABLED
+#include "mlx_cuda_ops.h"
+#include "mlx/primitives.h"
+
+namespace {
+
+constexpr char dflash2_conv_cuda_source[] =
+#include "cuda/dflash2_conv.cu.inc"
+    ;
+
+class DFlash2ConvCuda final : public mlx::core::UnaryPrimitive {
+ public:
+  DFlash2ConvCuda(mlx::core::Stream stream, int32_t side)
+      : mlx::core::UnaryPrimitive(stream), side_(side) {}
+
+  void eval_cpu(const std::vector<mlx::core::array>&, mlx::core::array&) override {
+    throw std::runtime_error("DFlash2ConvCuda requires CUDA");
+  }
+
+  void eval_gpu(
+      const std::vector<mlx::core::array>& inputs,
+      mlx::core::array& out) override {
+    using namespace mlx::core;
+    auto& encoder = cu::get_command_encoder(stream());
+    auto owned = cu::contiguous_inputs(inputs, stream(), encoder);
+    const auto& x = owned[0];
+    const auto& dyn = owned[1];
+    const auto& base = owned[2];
+    const int B = x.shape(0);
+    const int L = x.shape(1);
+    const int H = x.shape(2);
+    const int K = base.shape(1);
+    const int G = dyn.shape(4);
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    encoder.set_input_array(x);
+    encoder.set_input_array(dyn);
+    encoder.set_input_array(base);
+    encoder.set_output_array(out);
+
+    const char* entry = nullptr;
+    if (x.dtype() == bfloat16) {
+      entry = "mlx_dflash2_conv_cuda_kernel<nv_bfloat16>";
+    } else if (x.dtype() == float16) {
+      entry = "mlx_dflash2_conv_cuda_kernel<__half>";
+    } else if (x.dtype() == float32) {
+      entry = "mlx_dflash2_conv_cuda_kernel<float>";
+    } else {
+      throw std::invalid_argument("DFlash2ConvCuda: unsupported dtype");
+    }
+    auto kernel = cu::jit_kernel(encoder.device(), dflash2_conv_cuda_source, entry);
+    cu::KernelArgs args;
+    args.append(x);
+    args.append(dyn);
+    args.append(base);
+    args.append(out);
+    args.append<int32_t>(B);
+    args.append<int32_t>(L);
+    args.append<int32_t>(H);
+    args.append<int32_t>(K);
+    args.append<int32_t>(G);
+    args.append<int32_t>(side_);
+    encoder.add_kernel_node_raw(
+        kernel, dim3((H + 255) / 256, L, B), dim3(256, 1, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(DFlash2ConvCuda)
+  bool is_equivalent(const mlx::core::Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const DFlash2ConvCuda*>(&other);
+    return rhs && rhs->side_ == side_;
+  }
+  std::vector<mlx::core::Shape> output_shapes(
+      const std::vector<mlx::core::array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+ private:
+  int32_t side_;
+};
+
+constexpr char gdn_prepare_tree_cuda_source[] = R"cuda(
+#include <cuda_bf16.h>
+
+__device__ __forceinline__ float gdn_prep_tree_warp_sum(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v += __shfl_xor_sync(0xffffffffu, v, offset);
+  }
+  return v;
+}
+
+__device__ __forceinline__ nv_bfloat16 gdn_prep_tree_bf16_silu(nv_bfloat16 raw) {
+  const float f = __bfloat162float(raw);
+  const float e = expf(fabsf(f));
+  const float y = 1.0f / (1.0f + e);
+  const float sig = (f < 0.0f) ? y : (1.0f - y);
+  const nv_bfloat16 sig_bf = __float2bfloat16(sig);
+  return __float2bfloat16(__bfloat162float(raw) * __bfloat162float(sig_bf));
+}
+
+__device__ __forceinline__ float gdn_prep_tree_precise_sigmoid_f32(float x) {
+  const float y = 1.0f / (1.0f + expf(fabsf(x)));
+  return (x < 0.0f) ? y : (1.0f - y);
+}
+
+// Tree-conv1d variant of fused Qwen3.5/3.8 GDN preparation:
+// 4-tap depthwise conv1d indexed by conv_taps[token, 0..3] + SiLU + q|k|v split
+// + q/k RMS/L2 norm+scale + decay & beta gating + next conv history.
+// For tap d in 0..3, src = conv_taps[token * 4 + d]:
+//   src < 0  -> history[3 + src, ch]  (-3 -> 0, -2 -> 1, -1 -> 2; < -3 -> 0.0)
+//   src >= 0 -> qkv[src, ch]
+// For a 1D chain (conv_taps[t] = [t-3, t-2, t-1, t]), bit-identical (0 ULP)
+// to mlx_gdn_prepare_cuda_kernel.
+// Grid: dim3(20, T, 1), Block: dim3(32, 4, 1)
+template <bool A_BF16, bool B_BF16, bool BETA_BF16>
+__global__ __launch_bounds__(128, 4) void mlx_gdn_prepare_tree_cuda_kernel(
+    const nv_bfloat16* __restrict__ qkv,
+    const void* __restrict__ a_ptr,
+    const void* __restrict__ b_ptr,
+    const float* __restrict__ conv,
+    const nv_bfloat16* __restrict__ history,
+    const float* __restrict__ scale,
+    const float* __restrict__ dt,
+    const int* __restrict__ conv_taps,
+    nv_bfloat16* __restrict__ q_out,
+    nv_bfloat16* __restrict__ k_out,
+    nv_bfloat16* __restrict__ v_out,
+    float* __restrict__ decay_out,
+    void* __restrict__ beta_out,
+    nv_bfloat16* __restrict__ next_history,
+    int T,
+    long long qkv_s1, long long qkv_s2,
+    long long a_s1, long long a_s2,
+    long long b_s1, long long b_s2,
+    long long hist_s0, long long hist_s1,
+    int mean_eps) {
+  constexpr int W = 10240;
+  const int lane = threadIdx.x;
+  const int vec = blockIdx.x * 4 + threadIdx.y; // 0..79
+  const int token = blockIdx.y;                 // 0..T-1
+  if (vec >= 80 || token >= T) {
+    return;
+  }
+
+  int taps[4];
+#pragma unroll
+  for (int tap = 0; tap < 4; ++tap) {
+    taps[tap] = conv_taps[token * 4 + tap];
+  }
+
+  float values[4];
+  float squared = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int ch = vec * 128 + lane * 4 + i;
+    float total = 0.0f;
+#pragma unroll
+    for (int tap = 0; tap < 4; ++tap) {
+      const int src_idx = taps[tap];
+      nv_bfloat16 src;
+      if (src_idx < 0) {
+        const int hrow = 3 + src_idx;
+        src = (hrow >= 0 && hrow < 3)
+            ? history[hrow * hist_s0 + ch * hist_s1]
+            : __float2bfloat16(0.0f);
+      } else {
+        src = (src_idx < T)
+            ? qkv[src_idx * qkv_s1 + ch * qkv_s2]
+            : __float2bfloat16(0.0f);
+      }
+      total += __bfloat162float(src) * conv[ch * 4 + tap];
+    }
+    const nv_bfloat16 raw = __float2bfloat16(total);
+    const nv_bfloat16 activated = gdn_prep_tree_bf16_silu(raw);
+    const float vf = __bfloat162float(activated);
+    values[i] = vf;
+    squared += vf * vf;
+
+    if (token == 0) {
+#pragma unroll
+      for (int row = 0; row < 3; ++row) {
+        const int source = T + row;
+        next_history[row * W + ch] = (source < 3)
+            ? history[source * hist_s0 + ch * hist_s1]
+            : qkv[(source - 3) * qkv_s1 + ch * qkv_s2];
+      }
+    }
+  }
+
+  if (vec < 32) {
+    const float sum_sq = gdn_prep_tree_warp_sum(squared);
+    const float eps_term = mean_eps ? (128.0f * 1e-6f) : 1e-6f;
+    const float divisor = sqrtf(sum_sq + eps_term);
+    const nv_bfloat16 q_scale = __float2bfloat16(0.08838834764831845f);
+    const float q_scale_f = __bfloat162float(q_scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int ch = (vec & 15) * 128 + lane * 4 + i;
+      const nv_bfloat16 normalized = __float2bfloat16(values[i] / divisor);
+      if (vec < 16) {
+        q_out[token * 2048 + ch] = __float2bfloat16(__bfloat162float(normalized) * q_scale_f);
+      } else {
+        k_out[token * 2048 + ch] = normalized;
+      }
+    }
+  } else {
+    const int base = token * 6144 + (vec - 32) * 128 + lane * 4;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      v_out[base + i] = __float2bfloat16(values[i]);
+    }
+  }
+
+  if (vec < 48 && lane == 0) {
+    const int h = token * 48 + vec;
+    const float a_val = A_BF16
+        ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(a_ptr)[token * a_s1 + vec * a_s2])
+        : reinterpret_cast<const float*>(a_ptr)[token * a_s1 + vec * a_s2];
+    const float b_val = B_BF16
+        ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(b_ptr)[token * b_s1 + vec * b_s2])
+        : reinterpret_cast<const float*>(b_ptr)[token * b_s1 + vec * b_s2];
+    const float ax = a_val + dt[vec];
+    const float sp = fmaxf(ax, 0.0f) + log1pf(expf(-fabsf(ax)));
+    decay_out[h] = expf(sp * scale[vec]);
+    const float sig_b = gdn_prep_tree_precise_sigmoid_f32(b_val);
+    if (BETA_BF16) {
+      reinterpret_cast<nv_bfloat16*>(beta_out)[h] = __float2bfloat16(sig_b);
+    } else {
+      reinterpret_cast<float*>(beta_out)[h] = sig_b;
+    }
+  }
+}
+)cuda";
+
+class GdnPrepareTreeCuda final : public mlx::core::Primitive {
+ public:
+  GdnPrepareTreeCuda(mlx::core::Stream stream, bool mean_eps, bool beta_bf16)
+      : Primitive(stream), mean_eps_(mean_eps), beta_bf16_(beta_bf16) {}
+
+  void eval_cpu(const std::vector<mlx::core::array>&,
+                std::vector<mlx::core::array>&) override {
+    throw std::runtime_error("GdnPrepareTreeCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<mlx::core::array>& inputs,
+                std::vector<mlx::core::array>& outputs) override {
+    using namespace mlx::core;
+    auto& encoder = cu::get_command_encoder(stream());
+    std::vector<array> owned;
+    owned.reserve(8);
+    for (int i = 0; i < 7; ++i) {
+      if ((i == 3 || i == 5 || i == 6) && !inputs[i].flags().row_contiguous) {
+        auto copy = contiguous_copy_gpu(inputs[i], stream());
+        encoder.add_temporary(copy);
+        owned.push_back(std::move(copy));
+      } else {
+        owned.push_back(inputs[i]);
+      }
+    }
+    owned.push_back(cu::ensure_row_contiguous_aligned<4>(inputs[7], stream(), encoder));
+
+    const auto& qkv = owned[0];
+    const auto& a = owned[1];
+    const auto& b = owned[2];
+    const auto& history = owned[4];
+    const auto& conv_taps = owned[7];
+    const int T = qkv.shape(1);
+    const bool valid_hist =
+        (history.ndim() == 2 && history.shape() == Shape{3, 10240}) ||
+        (history.ndim() == 3 && history.shape() == Shape{1, 3, 10240});
+    if (qkv.ndim() != 3 || qkv.shape(0) != 1 || T < 1 || T > 4096 ||
+        qkv.shape(2) != 10240 || qkv.dtype() != bfloat16 ||
+        a.shape() != Shape{1, T, 48} || b.shape() != Shape{1, T, 48} ||
+        !valid_hist || history.dtype() != bfloat16 ||
+        conv_taps.ndim() != 2 || conv_taps.shape(0) != T ||
+        conv_taps.shape(1) != 4 || conv_taps.dtype() != int32) {
+      throw std::invalid_argument("GdnPrepareTreeCuda: invalid shape or dtype");
+    }
+
+    for (const auto& input : owned) {
+      encoder.set_input_array(input);
+    }
+    for (auto& out : outputs) {
+      out.set_data(cu::malloc_async(out.nbytes(), encoder));
+      encoder.set_output_array(out);
+    }
+
+    const bool a_bf16 = a.dtype() == bfloat16;
+    const bool b_bf16 = b.dtype() == bfloat16;
+    static constexpr const char* kPrepTreeEntries[2][2][2] = {
+        {{"mlx_gdn_prepare_tree_cuda_kernel<false,false,false>",
+          "mlx_gdn_prepare_tree_cuda_kernel<false,false,true>"},
+         {"mlx_gdn_prepare_tree_cuda_kernel<false,true,false>",
+          "mlx_gdn_prepare_tree_cuda_kernel<false,true,true>"}},
+        {{"mlx_gdn_prepare_tree_cuda_kernel<true,false,false>",
+          "mlx_gdn_prepare_tree_cuda_kernel<true,false,true>"},
+         {"mlx_gdn_prepare_tree_cuda_kernel<true,true,false>",
+          "mlx_gdn_prepare_tree_cuda_kernel<true,true,true>"}},
+    };
+    const std::string_view entry = kPrepTreeEntries[a_bf16][b_bf16][beta_bf16_];
+    auto kernel =
+        cu::jit_kernel(encoder.device(), gdn_prepare_tree_cuda_source, entry);
+
+    const int64_t hist_s0 =
+        history.ndim() == 2 ? history.strides(0) : history.strides(1);
+    const int64_t hist_s1 =
+        history.ndim() == 2 ? history.strides(1) : history.strides(2);
+
+    cu::KernelArgs args;
+    for (const auto& input : owned) {
+      args.append(input);
+    }
+    for (const auto& out : outputs) {
+      args.append(out);
+    }
+    args.append<int32_t>(T);
+    args.append<int64_t>(qkv.strides(1));
+    args.append<int64_t>(qkv.strides(2));
+    args.append<int64_t>(a.strides(1));
+    args.append<int64_t>(a.strides(2));
+    args.append<int64_t>(b.strides(1));
+    args.append<int64_t>(b.strides(2));
+    args.append<int64_t>(hist_s0);
+    args.append<int64_t>(hist_s1);
+    args.append<int32_t>(mean_eps_ ? 1 : 0);
+
+    encoder.add_kernel_node_raw(
+        kernel, dim3(20, T, 1), dim3(32, 4, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(GdnPrepareTreeCuda)
+  bool is_equivalent(const mlx::core::Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const GdnPrepareTreeCuda*>(&other);
+    return rhs && rhs->mean_eps_ == mean_eps_ && rhs->beta_bf16_ == beta_bf16_;
+  }
+  std::vector<mlx::core::Shape> output_shapes(
+      const std::vector<mlx::core::array>& inputs) override {
+    const int T = inputs[0].shape(1);
+    return {
+        {1, T, 16, 128}, {1, T, 16, 128}, {1, T, 48, 128},
+        {1, T, 48}, {1, T, 48}, {3, 10240}};
+  }
+
+ private:
+  bool mean_eps_;
+  bool beta_bf16_;
+};
+
+} // namespace
+#endif
 
 // Opaque handle for a compiled Metal kernel function
 struct mlx_metal_kernel;
@@ -518,6 +869,22 @@ bool mlx_dflash2_conv(
             || base_arr.shape(0) != 2 || base_arr.shape(2) != H) {
             throw std::invalid_argument("mlx_dflash2_conv: inconsistent tensor dims");
         }
+
+#ifdef MLX_NODE_CUDA_ENABLED
+        if (mlx::core::default_device() == mlx::core::Device::gpu
+            && (x_arr.dtype() == mlx::core::bfloat16
+                || x_arr.dtype() == mlx::core::float16
+                || x_arr.dtype() == mlx::core::float32)) {
+            auto result = mlx::core::array(
+                x_arr.shape(),
+                x_arr.dtype(),
+                std::make_shared<DFlash2ConvCuda>(
+                    mlx::core::default_stream(mlx::core::Device::gpu), side),
+                {x_arr, dyn_arr, base_arr});
+            *out = reinterpret_cast<mlx_array*>(new array(std::move(result)));
+            return true;
+        }
+#endif
 
         auto side_arr = array(side, mlx::core::int32);
         auto L_arr = array(L, mlx::core::int32);
@@ -1047,4 +1414,85 @@ extern "C" bool mlx_gdn_fused_prefill_head_reference(
   return gdn_fused_prefill_entry(true, q, k, v, a, b, a_log, dt_bias, state,
                                  wq, wk, z, w, eps, qk_eps, tiled, out,
                                  out_state);
+}
+
+// Tree-conv1d variant of fused CUDA GDN preparation (same inputs/outputs as
+// mlx_gdn_prepare_cuda, plus int32[T, 4] `conv_taps`).
+// For token t and tap d in 0..3:
+//   src = conv_taps[t, d]
+//   src < 0  -> history[3 + src, c] (-3 -> 0, -2 -> 1, -1 -> 2)
+//   src >= 0 -> qkv[0, src, c]
+// Outputs[0..5]: q [1,T,16,128] bf16, k [1,T,16,128] bf16, v [1,T,48,128] bf16,
+// decay [1,T,48] f32, beta [1,T,48] (bf16/f32), next_history [3,10240] bf16.
+extern "C" bool mlx_gdn_prepare_tree_cuda(
+    mlx_array* qkv, mlx_array* a, mlx_array* b, mlx_array* conv,
+    mlx_array* history, mlx_array* scale, mlx_array* dt,
+    mlx_array* conv_taps, bool mean_eps, bool beta_input_dtype,
+    mlx_array** outputs) {
+  if (outputs) {
+    for (int i = 0; i < 6; ++i) {
+      outputs[i] = nullptr;
+    }
+  }
+#ifdef MLX_NODE_CUDA_ENABLED
+  if (!outputs) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    if (default_device() != Device::gpu) {
+      return false;
+    }
+    std::vector<array> in;
+    in.reserve(8);
+    for (auto* p : {qkv, a, b, conv, history, scale, dt, conv_taps}) {
+      if (!p) {
+        return false;
+      }
+      in.push_back(*reinterpret_cast<array*>(p));
+    }
+    const auto& x = in[0];
+    if (x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 1 ||
+        x.shape(1) > 4096 || x.shape(2) != 10240 || x.dtype() != bfloat16) {
+      return false;
+    }
+    const int T = x.shape(1);
+    for (int i : {1, 2}) {
+      if (in[i].shape() != Shape{1, T, 48} ||
+          (in[i].dtype() != float32 && in[i].dtype() != bfloat16)) {
+        return false;
+      }
+    }
+    const bool valid_hist =
+        (in[4].ndim() == 2 && in[4].shape() == Shape{3, 10240}) ||
+        (in[4].ndim() == 3 && in[4].shape() == Shape{1, 3, 10240});
+    if (in[3].size() != 40960 || in[3].dtype() != float32 ||
+        !valid_hist || in[4].dtype() != bfloat16 ||
+        in[5].size() != 48 || in[5].dtype() != float32 ||
+        in[6].size() != 48 || in[6].dtype() != float32 ||
+        in[7].ndim() != 2 || in[7].shape(0) != T || in[7].shape(1) != 4 ||
+        in[7].dtype() != int32) {
+      return false;
+    }
+    auto stream = default_stream(Device::gpu);
+    auto results = array::make_arrays(
+        {{1, T, 16, 128}, {1, T, 16, 128}, {1, T, 48, 128},
+         {1, T, 48}, {1, T, 48}, {3, 10240}},
+        {bfloat16, bfloat16, bfloat16, float32,
+         beta_input_dtype ? bfloat16 : float32, bfloat16},
+        std::make_shared<GdnPrepareTreeCuda>(stream, mean_eps, beta_input_dtype),
+        std::move(in));
+    for (int i = 0; i < 6; ++i) {
+      outputs[i] = reinterpret_cast<mlx_array*>(new array(std::move(results[i])));
+    }
+    return true;
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "mlx_gdn_prepare_tree_cuda: %s\n", error.what());
+    return false;
+  }
+#else
+  (void)qkv; (void)a; (void)b; (void)conv; (void)history; (void)scale; (void)dt;
+  (void)conv_taps; (void)mean_eps; (void)beta_input_dtype;
+  return false;
+#endif
 }

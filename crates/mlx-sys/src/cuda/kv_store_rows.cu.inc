@@ -30,4 +30,23 @@ extern "C" __global__ void mlx_node_kv_store_rows_cuda(
     dst[doff] = src[soff];
   }
 }
+
+// Fast 16-byte vectorized KV store for contiguous last-dim BF16/FP16 rows
+// (itemsize == 2, D % 8 == 0, ds3 == 1, ss3 == 1, 16-byte aligned).
+// Grid: dim3(rows, H, B), Block: dim3(D / 8, 1, 1) — zero 64-bit div/mod.
+extern "C" __global__ void mlx_node_kv_store_rows_vec16_cuda(
+    unsigned char* __restrict__ dst,
+    const unsigned char* __restrict__ src,
+    int offset,
+    long long ds0_b, long long ds1_b, long long ds2_b,
+    long long ss0_b, long long ss1_b, long long ss2_b) {
+  const int r = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+  const int v = threadIdx.x;
+  const long long doff = b * ds0_b + h * ds1_b + (long long)(offset + r) * ds2_b;
+  const long long soff = b * ss0_b + h * ss1_b + (long long)r * ss2_b;
+  reinterpret_cast<uint4*>(dst + doff)[v] =
+      reinterpret_cast<const uint4*>(src + soff)[v];
+}
 )cuda"

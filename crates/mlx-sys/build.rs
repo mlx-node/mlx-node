@@ -2022,7 +2022,13 @@ fn build_mlx_from_source(
         } else {
             "x64"
         };
-        cfg.define("CUDAToolkit_ROOT", &cuda)
+        // Rust's `cmake` crate seeds `CMAKE_CXX_FLAGS` from `cc::Build` without
+        // `/EHsc`, leaving MLX C++ translation units (e.g. `jit_module.cpp`)
+        // with no C++ exception unwind tables. Without `/EHsc`, throwing inside
+        // `get_jit_module` skips `std::unique_lock::~unique_lock()` and
+        // permanently deadlocks its `std::shared_mutex`.
+        cfg.cxxflag("/EHsc")
+            .define("CUDAToolkit_ROOT", &cuda)
             .define("CUDNN_INCLUDE_PATH", cudnn.join("include"))
             .define("CUDNN_LIBRARY_PATH", windows_cudnn_lib_dir(&cudnn, arch));
     }

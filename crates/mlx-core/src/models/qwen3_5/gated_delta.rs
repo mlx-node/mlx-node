@@ -562,6 +562,29 @@ impl GdnKernelTape {
         }
         Ok(state)
     }
+
+    /// Replay `keep` recorded steps selected by `indices` (`int32[keep]`) along
+    /// the time axis from `start_state`, returning the exact settled recurrent
+    /// state after a non-contiguous speculative tree branch accept.
+    pub(crate) fn replay_recurrent_state_indices(
+        &self,
+        start_state: &MxArray,
+        indices: &MxArray,
+        keep: usize,
+    ) -> Result<MxArray> {
+        if keep == 0 {
+            return Ok(start_state.clone());
+        }
+        let gathered = Self {
+            q: self.q.take(indices, 1)?,
+            k: self.k.take(indices, 1)?,
+            v: self.v.take(indices, 1)?,
+            g: self.g.take(indices, 1)?,
+            beta: self.beta.take(indices, 1)?,
+            tiled_heads: self.tiled_heads,
+        };
+        gathered.replay_recurrent_state(start_state, keep)
+    }
 }
 
 /// Single timestep of the gated delta recurrence (delta rule) — ops-based fallback.
@@ -1309,6 +1332,350 @@ pub(crate) fn gated_delta_update_fused(
         });
     }
     Ok(Some(result))
+}
+
+/// CUDA deferred-fold variant of [`gated_delta_update_fused`]: folds the prior
+/// cycle's `pending` accepted rows into `state_base` before running the current
+/// verify window (`T in 1..=16`, `Dk == Dv == 128`, BF16 activations, F32 state)
+/// and applying the fused gated RMSNorm + z-gate tail.
+///
+/// Returns `(gated_out, committed_state)` where `committed_state` is `S_folded`
+/// (the state after folding `pending`, BEFORE the current window — or `state_base`
+/// when `pending` is `None`). Records the current window's `(q, k, v, g, beta)`
+/// into `tape_sink`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_fused_deferred(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state_base: Option<&MxArray>,
+    pending: Option<&super::layer_cache::CudaPendingGdn>,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    tiled_gqa: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
+    tail: GdnTail<'_>,
+    tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !use_kernel
+        || mask.is_some()
+        || !crate::accelerator::cuda_ops_available()
+        || v.shape_at(3)? != 128
+        || q.shape_at(3)? != 128
+        || !(1..=16).contains(&v.shape_at(1)?)
+        || [q, k, v, tail.z, tail.norm_weight]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || state_base.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+    {
+        return Ok(None);
+    }
+    let (q, k, g, beta, initial_state) = kernel_inputs(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state_base,
+        tiled_gqa,
+        true,
+        precomputed_gates,
+    )?;
+    let g = if g.dtype()? != DType::Float32 {
+        g.astype(DType::Float32)?
+    } else {
+        g
+    };
+    if !matches!(beta.dtype()?, DType::BFloat16 | DType::Float32) {
+        return Ok(None);
+    }
+    let has_prev_indices = pending.is_some_and(|p| p.keep > 0 && p.prev_indices.is_some());
+    let Some(result) = (if has_prev_indices {
+        let t = v.shape_at(1)? as usize;
+        let chain_parent: Vec<i32> = (0..t).map(|i| i as i32 - 1).collect();
+        let parent_arr = MxArray::from_int32(&chain_parent, &[t as i64])?;
+        let pending_args = pending.and_then(|p| {
+            if p.keep == 0 {
+                return None;
+            }
+            let keep = i32::try_from(p.keep).ok()?;
+            Some((
+                &p.kernel.k,
+                &p.kernel.v,
+                &p.kernel.g,
+                &p.kernel.beta,
+                keep,
+                p.prev_indices.as_ref(),
+            ))
+        });
+        crate::kernels::gdn::tree_step_deferred(
+            &q,
+            &k,
+            v,
+            &g,
+            &beta,
+            &initial_state,
+            pending_args,
+            &parent_arr,
+            tail.z,
+            tail.norm_weight,
+            tail.eps,
+            tiled_gqa,
+        )?
+    } else {
+        let pending_args = pending.and_then(|p| {
+            if p.keep == 0 {
+                return None;
+            }
+            let keep = i32::try_from(p.keep).ok()?;
+            Some((&p.kernel.k, &p.kernel.v, &p.kernel.g, &p.kernel.beta, keep))
+        });
+        crate::kernels::gdn::fused_step_deferred(
+            &q,
+            &k,
+            v,
+            &g,
+            &beta,
+            &initial_state,
+            pending_args,
+            tail.z,
+            tail.norm_weight,
+            tail.eps,
+            tiled_gqa,
+        )?
+    }) else {
+        return Ok(None);
+    };
+    if let Some(sink) = tape_sink {
+        *sink = Some(GdnKernelTape {
+            q,
+            k,
+            v: v.clone(),
+            g,
+            beta,
+            tiled_heads: tiled_gqa,
+        });
+    }
+    Ok(Some(result))
+}
+
+/// Tree-verify CUDA deferred-fold GDN step: folds `pending` (contiguous prefix
+/// or indexed tree branch via `pending.prev_indices`) into `state_base`, then
+/// runs the tree recurrence along `parent` (`int32[T]`, `parent[0] == -1`,
+/// `parent[t] < t`) with fused gated RMSNorm + z-gate.
+///
+/// Returns `(y_normed [B, T, Hv * Dv], s_folded [B, Hv, Dv, Dk])`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_tree_deferred(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state_base: Option<&MxArray>,
+    pending: Option<&super::layer_cache::CudaPendingGdn>,
+    parent: &MxArray,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    tiled_gqa: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
+    tail: GdnTail<'_>,
+    tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !use_kernel
+        || mask.is_some()
+        || !crate::accelerator::cuda_ops_available()
+        || v.shape_at(3)? != 128
+        || q.shape_at(3)? != 128
+        || !(1..=16).contains(&v.shape_at(1)?)
+        || parent.dtype()? != DType::Int32
+        || parent.ndim()? != 1
+        || parent.shape_at(0)? != v.shape_at(1)?
+        || [q, k, v, tail.z, tail.norm_weight]
+            .iter()
+            .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || state_base.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+    {
+        return Ok(None);
+    }
+    let (q, k, g, beta, initial_state) = kernel_inputs(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state_base,
+        tiled_gqa,
+        true,
+        precomputed_gates,
+    )?;
+    let g = if g.dtype()? != DType::Float32 {
+        g.astype(DType::Float32)?
+    } else {
+        g
+    };
+    if !matches!(beta.dtype()?, DType::BFloat16 | DType::Float32) {
+        return Ok(None);
+    }
+    let pending_args = pending.and_then(|p| {
+        if p.keep == 0 {
+            return None;
+        }
+        let keep = i32::try_from(p.keep).ok()?;
+        Some((
+            &p.kernel.k,
+            &p.kernel.v,
+            &p.kernel.g,
+            &p.kernel.beta,
+            keep,
+            p.prev_indices.as_ref(),
+        ))
+    });
+    let Some(result) = crate::kernels::gdn::tree_step_deferred(
+        &q,
+        &k,
+        v,
+        &g,
+        &beta,
+        &initial_state,
+        pending_args,
+        parent,
+        tail.z,
+        tail.norm_weight,
+        tail.eps,
+        tiled_gqa,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(sink) = tape_sink {
+        *sink = Some(GdnKernelTape {
+            q,
+            k,
+            v: v.clone(),
+            g,
+            beta,
+            tiled_heads: tiled_gqa,
+        });
+    }
+    Ok(Some(result))
+}
+
+/// Device-agnostic tree GDN recurrence fallback (used on Metal/CPU or small
+/// test geometries when `gated_delta_update_tree_deferred` does not apply).
+/// Steps each node `t` from `states[parent[t]]` (or `initial_state` for root),
+/// returning `(y [B, T, Hv, Dv], initial_state)` and recording the tape.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_tree_with_tape(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state_base: Option<&MxArray>,
+    parent: &MxArray,
+    tiled_gqa: bool,
+    precomputed_gates: Option<(&MxArray, &MxArray)>,
+    tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<(MxArray, MxArray)> {
+    let (q, k, g, beta, initial_state) = kernel_inputs(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state_base,
+        tiled_gqa,
+        false,
+        precomputed_gates,
+    )?;
+    let (ops_q, ops_k) = if tiled_gqa && v.shape_at(2)? != q.shape_at(2)? {
+        let repeat_factor = (v.shape_at(2)? / q.shape_at(2)?) as i32;
+        (
+            MxArray::tile(&q, &[1, 1, repeat_factor, 1])?,
+            MxArray::tile(&k, &[1, 1, repeat_factor, 1])?,
+        )
+    } else {
+        (q.clone(), k.clone())
+    };
+    let batch = v.shape_at(0)?;
+    let seq_len = v.shape_at(1)? as usize;
+    let num_v_heads = v.shape_at(2)?;
+    let k_dim = ops_q.shape_at(3)?;
+    let v_dim = v.shape_at(3)?;
+    let parents = parent.to_int32()?;
+    if parents.len() != seq_len {
+        return Err(Error::from_reason(format!(
+            "gated_delta_update_tree_with_tape: parent len {} != seq_len {seq_len}",
+            parents.len()
+        )));
+    }
+    let mut node_states: Vec<MxArray> = Vec::with_capacity(seq_len);
+    let mut outputs: Vec<MxArray> = Vec::with_capacity(seq_len);
+    for (t, &p) in parents.iter().enumerate() {
+        let prev_state = if p < 0 {
+            &initial_state
+        } else {
+            let pidx = p as usize;
+            if pidx >= t {
+                return Err(Error::from_reason(format!(
+                    "gated_delta_update_tree_with_tape: invalid parent[{t}] = {p}"
+                )));
+            }
+            &node_states[pidx]
+        };
+        let ti = t as i64;
+        let q_t = ops_q.slice_axis(1, ti, ti + 1)?;
+        let k_t = ops_k.slice_axis(1, ti, ti + 1)?;
+        let v_t = v.slice_axis(1, ti, ti + 1)?;
+        let g_t = g.slice_axis(1, ti, ti + 1)?;
+        let beta_t = beta.slice_axis(1, ti, ti + 1)?;
+        let (y_t, state_t) = gated_delta_step(
+            &q_t,
+            &k_t,
+            &v_t,
+            &g_t,
+            &beta_t,
+            prev_state,
+            None,
+            batch,
+            num_v_heads,
+            k_dim,
+            v_dim,
+        )?;
+        outputs.push(y_t);
+        node_states.push(state_t);
+    }
+    if let Some(sink) = tape_sink {
+        *sink = Some(GdnKernelTape {
+            q,
+            k,
+            v: v.clone(),
+            g,
+            beta,
+            tiled_heads: tiled_gqa,
+        });
+    }
+    let output_refs: Vec<&MxArray> = outputs.iter().collect();
+    let output = MxArray::concatenate_many(output_refs, Some(1))?.astype(v.dtype()?)?;
+    // Return `initial_state` (un-advanced base state) when no deferred fold ran,
+    // or the last node's state if caller doesn't use deferred mode.
+    let final_state = node_states.pop().unwrap_or(initial_state);
+    Ok((output, final_state))
 }
 
 /// The prologue/tail inputs [`gated_delta_fused_prefill`] needs beyond the

@@ -4,7 +4,7 @@ R"cuda(
 
 // One eight-thread group quantizes 32 values of one activation row. The packed
 // activation stores Q8 codes, then FP32 scales and Q8 sums for each 32-value
-// group. Eight rows are padded so one INT8 MMA tile covers every M in 2..8.
+// group. Eight rows are padded so one INT8 MMA tile covers every M in 1..8.
 extern "C" __global__ void mlx_node_kquant_quantize_few(
     const nv_bfloat16* x, unsigned char* act, int M, int K) {
   const int units = K / 256;
@@ -23,7 +23,7 @@ extern "C" __global__ void mlx_node_kquant_quantize_few(
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const int col = unit * 256 + s * 32 + sub * 4 + j;
-    values[j] = row < M ? __bfloat162float(x[row * K + col]) : 0.0f;
+    values[j] = row < M ? __bfloat162float(x[(size_t)row * K + col]) : 0.0f;
     amax = fmaxf(amax, fabsf(values[j]));
   }
 #pragma unroll
@@ -49,6 +49,64 @@ extern "C" __global__ void mlx_node_kquant_quantize_few(
       (static_cast<unsigned int>(q[3] & 0xff) << 24);
   float* scales = reinterpret_cast<float*>(act + units * 2048);
   float* sums = scales + groups;
+  const float d = amax > 0.0f ? 1.0f / inverse : 0.0f;
+  if (sub == 0) {
+    scales[group] = d;
+    sums[group] = d * static_cast<float>(qsum);
+  }
+}
+
+// Sixteen-row variant for M in 9..16: packs two 8-row halves (rows 0..7 at
+// act[0..units*2560), rows 8..15 at act[units*2560..2*units*2560)) using the
+// exact same layout per half as mlx_node_kquant_quantize_few.
+extern "C" __global__ void mlx_node_kquant_quantize_few_16(
+    const nv_bfloat16* x, unsigned char* act, int M, int K) {
+  const int units = K / 256;
+  const int groups_per_half = units * 64;
+  const int total_groups = groups_per_half * 2;
+  const int group_all = (blockIdx.x * blockDim.x + threadIdx.x) / 8;
+  const int sub = threadIdx.x % 8;
+  if (group_all >= total_groups) {
+    return;
+  }
+  const int half = group_all >= groups_per_half ? 1 : 0;
+  const int group = half ? (group_all - groups_per_half) : group_all;
+  const int unit = group / 64;
+  const int remainder = group % 64;
+  const int row = half * 8 + remainder / 8;
+  const int s = remainder % 8;
+  float values[4];
+  float amax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int col = unit * 256 + s * 32 + sub * 4 + j;
+    values[j] = row < M ? __bfloat162float(x[(size_t)row * K + col]) : 0.0f;
+    amax = fmaxf(amax, fabsf(values[j]));
+  }
+#pragma unroll
+  for (int shift = 1; shift < 8; shift <<= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, shift, 8));
+  }
+  const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+  int q[4];
+  int qsum = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    q[j] = amax > 0.0f ? static_cast<int>(roundf(values[j] * inverse)) : 0;
+    qsum += q[j];
+  }
+#pragma unroll
+  for (int shift = 1; shift < 8; shift <<= 1) {
+    qsum += __shfl_xor_sync(0xffffffffu, qsum, shift, 8);
+  }
+  unsigned char* act_half = act + (size_t)half * units * 2560;
+  *reinterpret_cast<unsigned int*>(act_half + group * 32 + sub * 4) =
+      static_cast<unsigned int>(q[0] & 0xff) |
+      (static_cast<unsigned int>(q[1] & 0xff) << 8) |
+      (static_cast<unsigned int>(q[2] & 0xff) << 16) |
+      (static_cast<unsigned int>(q[3] & 0xff) << 24);
+  float* scales = reinterpret_cast<float*>(act_half + units * 2048);
+  float* sums = scales + groups_per_half;
   const float d = amax > 0.0f ? 1.0f / inverse : 0.0f;
   if (sub == 0) {
     scales[group] = d;
@@ -145,6 +203,22 @@ __device__ __forceinline__ unsigned int kqf_load_k16(
   }
 }
 
+__device__ __forceinline__ void kqf_cp_async16(void* smem_ptr, const void* glob_ptr) {
+  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n"
+      :: "r"(smem_addr), "l"(glob_ptr) : "memory");
+}
+
+__device__ __forceinline__ void kqf_cp_commit() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int N_WAIT>
+__device__ __forceinline__ void kqf_cp_wait() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N_WAIT) : "memory");
+}
+
 __device__ __forceinline__ void kqf_mma_k16(
     const unsigned int a0, const unsigned int a1, const unsigned int b,
     int& c0, int& c1, int& c2, int& c3) {
@@ -163,12 +237,17 @@ __device__ __forceinline__ void kqf_mma(
       : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-
-// Warps split 256-value units. Each warp evaluates a 16-row by 8-row
-// INT8 tile and applies the format's scales and optional min correction.
+)cuda"
+R"cuda(
+// Warps split 256-value units. Each warp evaluates a 16-row by 8-row (M16=false)
+// or 16-row by 16-row (M16=true, reusing unpacked weight registers across both
+// 8-row activation halves with zero extra weight DRAM traffic) INT8 MMA tile.
+// For tiled=true (Tiled64), weights stream into 2-stage double-buffered SMEM
+// via coalesced 128-bit L2-bypassing cp.async.cg.shared.global DMA transfers.
 // Modes: 0=Q4_K, 1=Q5_K, 2=Q6_K, 3=IQ4_XS, 4=Q3_K, 5=IQ4_NL.
-template <int mode, bool tiled = false, int NUM_WARPS = 4>
-__global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
+template <int mode, bool tiled = false, int NUM_WARPS = 4, bool M16 = false>
+__global__ __launch_bounds__(NUM_WARPS * 32, NUM_WARPS >= 12 ? 1 : 2)
+void mlx_node_kquant_matmul_few(
     const unsigned int* __restrict__ w,
     const unsigned char* __restrict__ scales,
     const unsigned short* __restrict__ biases,
@@ -184,24 +263,34 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
   const int units32 = K / 32;
   constexpr int bits = mode == 1 ? 5 : (mode == 2 ? 6 : (mode == 4 ? 3 : 4));
   constexpr int V4 = bits * 2; // 16-byte vectors per 256-weight unit (8, 10, 12, 6)
+  constexpr int SEG_V4 = bits * 4; // 16-byte vectors per 16-row Tiled64 segment (12..24)
   constexpr int sc_unit_bytes = mode == 3 ? 8 : 16;
   constexpr int b_unit_entries = (mode == 0 || mode == 1) ? 2 : 1;
+  constexpr int M_COLS = M16 ? 16 : 8;
 
+  // Shared memory:
+  // - tiled=true double-buffers one 16-row segment via cp.async.cg (<= 6 KB for 8 warps).
+  // - tiled=false pads row-major tile stride to V4+1 to avoid 8-way bank conflicts.
   union SharedBuf {
-    uint4 w_tile[NUM_WARPS][16][V4];
-    float partials[NUM_WARPS * 16 * 8];
+    uint4 t64_seg[2][NUM_WARPS][tiled ? SEG_V4 : 1];
+    uint4 w_tile[NUM_WARPS][tiled ? 1 : 16][tiled ? 1 : (V4 + 1)];
+    float partials[NUM_WARPS * 16 * M_COLS];
   };
   __shared__ SharedBuf smem;
 
+  const int tile_id = row0 / 64;
+  const int base_in_tile = row0 % 64;
   const int tile_ids[2] = {rows[0] / 64, rows[1] / 64};
   const int in_tile[2] = {rows[0] % 64, rows[1] % 64};
   const float* act_scales = reinterpret_cast<const float*>(act + units * 2048);
   const float* act_sums = act_scales + units * 64;
-  const int w_s_stride = tiled ? 64 * bits : bits;
+  const int act_half_u32 = units * 640; // 2560 bytes / 4
   const size_t row_w_stride_u4 = (size_t)units * V4;
   const uint4* w_u4 = reinterpret_cast<const uint4*>(w);
 
-  float total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float total_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float total_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
   for (int unit = warp; unit < units; unit += NUM_WARPS) {
     if constexpr (!tiled) {
       // Coalesced 128-bit streaming load of 16 rows for this unit into shared memory.
@@ -230,8 +319,8 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
       __syncwarp();
     }
 
-    float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float min_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float dot_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float dot_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     uint4 sc_vec[2];
     uint2 sc_vec8[2];
@@ -253,47 +342,89 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
     }
 
     const unsigned int* w_base[2] = {
-        tiled
-            ? (w + (((size_t)tile_ids[0] * units32 + unit * 8) * 64 + in_tile[0]) * bits)
-            : reinterpret_cast<const unsigned int*>(smem.w_tile[warp][g]),
-        tiled
-            ? (w + (((size_t)tile_ids[1] * units32 + unit * 8) * 64 + in_tile[1]) * bits)
-            : reinterpret_cast<const unsigned int*>(smem.w_tile[warp][g + 8])};
+        tiled ? nullptr : reinterpret_cast<const unsigned int*>(smem.w_tile[warp][g]),
+        tiled ? nullptr : reinterpret_cast<const unsigned int*>(smem.w_tile[warp][g + 8])};
+
+    if constexpr (tiled) {
+      // Prime cp.async stage 0 for segment s = 0.
+      if (lane < SEG_V4) {
+        const uint4* seg_u4 = reinterpret_cast<const uint4*>(
+            w + (((size_t)tile_id * units32 + unit * 8) * 64 + base_in_tile) * bits);
+        kqf_cp_async16(&smem.t64_seg[0][warp][lane], seg_u4 + lane);
+      }
+      kqf_cp_commit();
+    }
 
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
-      const unsigned int* q32 =
+      const unsigned int* seg0;
+      const unsigned int* seg1;
+      if constexpr (tiled) {
+        const int cur = s & 1;
+        const int nxt = cur ^ 1;
+        if (s + 1 < 8) {
+          if (lane < SEG_V4) {
+            const uint4* nxt_u4 = reinterpret_cast<const uint4*>(
+                w + (((size_t)tile_id * units32 + unit * 8 + s + 1) * 64 + base_in_tile) * bits);
+            kqf_cp_async16(&smem.t64_seg[nxt][warp][lane], nxt_u4 + lane);
+          }
+          kqf_cp_commit();
+          kqf_cp_wait<1>();
+        } else {
+          kqf_cp_wait<0>();
+        }
+        __syncwarp();
+        const unsigned int* seg_smem =
+            reinterpret_cast<const unsigned int*>(smem.t64_seg[cur][warp]);
+        seg0 = seg_smem + g * bits;
+        seg1 = seg_smem + (g + 8) * bits;
+      } else {
+        seg0 = w_base[0] + s * bits;
+        seg1 = w_base[1] + s * bits;
+      }
+      const unsigned int* q32_lo =
           reinterpret_cast<const unsigned int*>(act + (unit * 64 + g * 8 + s) * 32);
-      const float ad0 = act_scales[unit * 64 + (2 * t) * 8 + s];
-      const float ad1 = act_scales[unit * 64 + (2 * t + 1) * 8 + s];
+      const int sc_idx0 = unit * 64 + (2 * t) * 8 + s;
+      const int sc_idx1 = unit * 64 + (2 * t + 1) * 8 + s;
       if constexpr (mode == 2 || mode == 4) {
         const unsigned int sc_w0 = (s < 2) ? sc_vec[0].x : (s < 4 ? sc_vec[0].y : (s < 6 ? sc_vec[0].z : sc_vec[0].w));
         const unsigned int sc_w1 = (s < 2) ? sc_vec[1].x : (s < 4 ? sc_vec[1].y : (s < 6 ? sc_vec[1].z : sc_vec[1].w));
         const int shift_base = (s & 1) * 16;
-        const unsigned int* seg0 = w_base[0] + s * w_s_stride;
-        const unsigned int* seg1 = w_base[1] + s * w_s_stride;
 #pragma unroll
         for (int kh = 0; kh < 2; ++kh) {
           const unsigned int a0 = kqf_load_k16<mode>(seg0, kh, t);
           const unsigned int a1 = kqf_load_k16<mode>(seg1, kh, t);
-          const unsigned int b = q32[kh * 4 + t];
-          int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-          kqf_mma_k16(a0, a1, b, c0, c1, c2, c3);
           const int ws0 = static_cast<signed char>((sc_w0 >> (shift_base + kh * 8)) & 0xff);
           const int ws1 = static_cast<signed char>((sc_w1 >> (shift_base + kh * 8)) & 0xff);
-          dot[0] += ad0 * static_cast<float>(c0 * ws0);
-          dot[1] += ad1 * static_cast<float>(c1 * ws0);
-          dot[2] += ad0 * static_cast<float>(c2 * ws1);
-          dot[3] += ad1 * static_cast<float>(c3 * ws1);
+          {
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            kqf_mma_k16(a0, a1, q32_lo[kh * 4 + t], c0, c1, c2, c3);
+            const float ad0 = act_scales[sc_idx0];
+            const float ad1 = act_scales[sc_idx1];
+            dot_lo[0] += ad0 * static_cast<float>(c0 * ws0);
+            dot_lo[1] += ad1 * static_cast<float>(c1 * ws0);
+            dot_lo[2] += ad0 * static_cast<float>(c2 * ws1);
+            dot_lo[3] += ad1 * static_cast<float>(c3 * ws1);
+          }
+          if constexpr (M16) {
+            int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+            kqf_mma_k16(a0, a1, q32_lo[act_half_u32 + kh * 4 + t], h0, h1, h2, h3);
+            const float ad0 = act_scales[sc_idx0 + act_half_u32];
+            const float ad1 = act_scales[sc_idx1 + act_half_u32];
+            dot_hi[0] += ad0 * static_cast<float>(h0 * ws0);
+            dot_hi[1] += ad1 * static_cast<float>(h1 * ws0);
+            dot_hi[2] += ad0 * static_cast<float>(h2 * ws1);
+            dot_hi[3] += ad1 * static_cast<float>(h3 * ws1);
+          }
         }
       } else {
         unsigned int a0, a1, a2, a3;
-        kqf_load_pair<mode>(w_base[0] + s * w_s_stride, t, a0, a2);
-        kqf_load_pair<mode>(w_base[1] + s * w_s_stride, t, a1, a3);
-        const unsigned int b0 = q32[t];
-        const unsigned int b1 = q32[4 + t];
+        kqf_load_pair<mode>(seg0, t, a0, a2);
+        kqf_load_pair<mode>(seg1, t, a1, a3);
         int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        kqf_mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+        kqf_mma(a0, a1, a2, a3, q32_lo[t], q32_lo[4 + t], c0, c1, c2, c3);
+        const float ad0_lo = act_scales[sc_idx0];
+        const float ad1_lo = act_scales[sc_idx1];
         if constexpr (mode == 5) {
           const size_t idx0 = tiled
               ? (((size_t)tile_ids[0] * units32 + unit * 8 + s) * 64 + in_tile[0])
@@ -305,52 +436,120 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
               static_cast<float>(static_cast<signed char>(scales[idx0]));
           const float ds1 = __half2float(__ushort_as_half(biases[idx1])) *
               static_cast<float>(static_cast<signed char>(scales[idx1]));
-          total[0] += ad0 * ds0 * static_cast<float>(c0);
-          total[1] += ad1 * ds0 * static_cast<float>(c1);
-          total[2] += ad0 * ds1 * static_cast<float>(c2);
-          total[3] += ad1 * ds1 * static_cast<float>(c3);
+          total_lo[0] += ad0_lo * ds0 * static_cast<float>(c0);
+          total_lo[1] += ad1_lo * ds0 * static_cast<float>(c1);
+          total_lo[2] += ad0_lo * ds1 * static_cast<float>(c2);
+          total_lo[3] += ad1_lo * ds1 * static_cast<float>(c3);
+          if constexpr (M16) {
+            const unsigned int* q32_hi = q32_lo + act_half_u32;
+            int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+            kqf_mma(a0, a1, a2, a3, q32_hi[t], q32_hi[4 + t], h0, h1, h2, h3);
+            const float ad0_hi = act_scales[sc_idx0 + act_half_u32];
+            const float ad1_hi = act_scales[sc_idx1 + act_half_u32];
+            total_hi[0] += ad0_hi * ds0 * static_cast<float>(h0);
+            total_hi[1] += ad1_hi * ds0 * static_cast<float>(h1);
+            total_hi[2] += ad0_hi * ds1 * static_cast<float>(h2);
+            total_hi[3] += ad1_hi * ds1 * static_cast<float>(h3);
+          }
         } else if constexpr (mode == 3) {
           const unsigned int sw0 = s < 4 ? sc_vec8[0].x : sc_vec8[0].y;
           const unsigned int sw1 = s < 4 ? sc_vec8[1].x : sc_vec8[1].y;
           const int sh = (s & 3) * 8;
           const int ws0 = static_cast<signed char>((sw0 >> sh) & 0xff);
           const int ws1 = static_cast<signed char>((sw1 >> sh) & 0xff);
-          dot[0] += ad0 * static_cast<float>(c0 * ws0);
-          dot[1] += ad1 * static_cast<float>(c1 * ws0);
-          dot[2] += ad0 * static_cast<float>(c2 * ws1);
-          dot[3] += ad1 * static_cast<float>(c3 * ws1);
+          dot_lo[0] += ad0_lo * static_cast<float>(c0 * ws0);
+          dot_lo[1] += ad1_lo * static_cast<float>(c1 * ws0);
+          dot_lo[2] += ad0_lo * static_cast<float>(c2 * ws1);
+          dot_lo[3] += ad1_lo * static_cast<float>(c3 * ws1);
+          if constexpr (M16) {
+            const unsigned int* q32_hi = q32_lo + act_half_u32;
+            int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+            kqf_mma(a0, a1, a2, a3, q32_hi[t], q32_hi[4 + t], h0, h1, h2, h3);
+            const float ad0_hi = act_scales[sc_idx0 + act_half_u32];
+            const float ad1_hi = act_scales[sc_idx1 + act_half_u32];
+            dot_hi[0] += ad0_hi * static_cast<float>(h0 * ws0);
+            dot_hi[1] += ad1_hi * static_cast<float>(h1 * ws0);
+            dot_hi[2] += ad0_hi * static_cast<float>(h2 * ws1);
+            dot_hi[3] += ad1_hi * static_cast<float>(h3 * ws1);
+          }
         } else {
-          const float as0 = act_sums[unit * 64 + (2 * t) * 8 + s];
-          const float as1 = act_sums[unit * 64 + (2 * t + 1) * 8 + s];
+          // Q4_K / Q5_K: compute dot products here; min_sum is deferred after the
+          // MMA loop to free 8 live float registers and eliminate M16 spills.
           const unsigned int sw0 = (s < 2) ? sc_vec[0].x : (s < 4 ? sc_vec[0].y : (s < 6 ? sc_vec[0].z : sc_vec[0].w));
           const unsigned int sw1 = (s < 2) ? sc_vec[1].x : (s < 4 ? sc_vec[1].y : (s < 6 ? sc_vec[1].z : sc_vec[1].w));
           const int sh = (s & 1) * 16;
           const int ws0 = (sw0 >> sh) & 0xff;
-          const int wm0 = (sw0 >> (sh + 8)) & 0xff;
           const int ws1 = (sw1 >> sh) & 0xff;
-          const int wm1 = (sw1 >> (sh + 8)) & 0xff;
-          dot[0] += ad0 * static_cast<float>(c0 * ws0);
-          dot[1] += ad1 * static_cast<float>(c1 * ws0);
-          dot[2] += ad0 * static_cast<float>(c2 * ws1);
-          dot[3] += ad1 * static_cast<float>(c3 * ws1);
-          min_sum[0] += as0 * static_cast<float>(wm0);
-          min_sum[1] += as1 * static_cast<float>(wm0);
-          min_sum[2] += as0 * static_cast<float>(wm1);
-          min_sum[3] += as1 * static_cast<float>(wm1);
+          dot_lo[0] += ad0_lo * static_cast<float>(c0 * ws0);
+          dot_lo[1] += ad1_lo * static_cast<float>(c1 * ws0);
+          dot_lo[2] += ad0_lo * static_cast<float>(c2 * ws1);
+          dot_lo[3] += ad1_lo * static_cast<float>(c3 * ws1);
+          if constexpr (M16) {
+            const unsigned int* q32_hi = q32_lo + act_half_u32;
+            int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+            kqf_mma(a0, a1, a2, a3, q32_hi[t], q32_hi[4 + t], h0, h1, h2, h3);
+            const float ad0_hi = act_scales[sc_idx0 + act_half_u32];
+            const float ad1_hi = act_scales[sc_idx1 + act_half_u32];
+            dot_hi[0] += ad0_hi * static_cast<float>(h0 * ws0);
+            dot_hi[1] += ad1_hi * static_cast<float>(h1 * ws0);
+            dot_hi[2] += ad0_hi * static_cast<float>(h2 * ws1);
+            dot_hi[3] += ad1_hi * static_cast<float>(h3 * ws1);
+          }
         }
       }
     }
+)cuda"
+R"cuda(
     if constexpr (mode != 5) {
+      float min_sum_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float min_sum_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if constexpr (mode == 0 || mode == 1) {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+          const int sc_idx0 = unit * 64 + (2 * t) * 8 + s;
+          const int sc_idx1 = unit * 64 + (2 * t + 1) * 8 + s;
+          const unsigned int sw0 = (s < 2) ? sc_vec[0].x : (s < 4 ? sc_vec[0].y : (s < 6 ? sc_vec[0].z : sc_vec[0].w));
+          const unsigned int sw1 = (s < 2) ? sc_vec[1].x : (s < 4 ? sc_vec[1].y : (s < 6 ? sc_vec[1].z : sc_vec[1].w));
+          const int sh = (s & 1) * 16 + 8;
+          const float wm0 = static_cast<float>((sw0 >> sh) & 0xff);
+          const float wm1 = static_cast<float>((sw1 >> sh) & 0xff);
+          const float as0_lo = act_sums[sc_idx0];
+          const float as1_lo = act_sums[sc_idx1];
+          min_sum_lo[0] += as0_lo * wm0;
+          min_sum_lo[1] += as1_lo * wm0;
+          min_sum_lo[2] += as0_lo * wm1;
+          min_sum_lo[3] += as1_lo * wm1;
+          if constexpr (M16) {
+            const float as0_hi = act_sums[sc_idx0 + act_half_u32];
+            const float as1_hi = act_sums[sc_idx1 + act_half_u32];
+            min_sum_hi[0] += as0_hi * wm0;
+            min_sum_hi[1] += as1_hi * wm0;
+            min_sum_hi[2] += as0_hi * wm1;
+            min_sum_hi[3] += as1_hi * wm1;
+          }
+        }
+      }
       for (int r = 0; r < 2; ++r) {
         const size_t bias_index = tiled
             ? (((size_t)tile_ids[r] * units + unit) * 64 + in_tile[r]) * b_unit_entries
             : ((size_t)rows[r] * units + unit) * b_unit_entries;
         const float d = __half2float(__ushort_as_half(biases[bias_index]));
-        const float dmin = (mode == 0 || mode == 1)
-            ? __half2float(__ushort_as_half(biases[bias_index + 1]))
-            : 0.0f;
-        total[r * 2 + 0] += d * dot[r * 2 + 0] - dmin * min_sum[r * 2 + 0];
-        total[r * 2 + 1] += d * dot[r * 2 + 1] - dmin * min_sum[r * 2 + 1];
+        if constexpr (mode == 0 || mode == 1) {
+          const float dmin = __half2float(__ushort_as_half(biases[bias_index + 1]));
+          total_lo[r * 2 + 0] += d * dot_lo[r * 2 + 0] - dmin * min_sum_lo[r * 2 + 0];
+          total_lo[r * 2 + 1] += d * dot_lo[r * 2 + 1] - dmin * min_sum_lo[r * 2 + 1];
+          if constexpr (M16) {
+            total_hi[r * 2 + 0] += d * dot_hi[r * 2 + 0] - dmin * min_sum_hi[r * 2 + 0];
+            total_hi[r * 2 + 1] += d * dot_hi[r * 2 + 1] - dmin * min_sum_hi[r * 2 + 1];
+          }
+        } else {
+          total_lo[r * 2 + 0] += d * dot_lo[r * 2 + 0];
+          total_lo[r * 2 + 1] += d * dot_lo[r * 2 + 1];
+          if constexpr (M16) {
+            total_hi[r * 2 + 0] += d * dot_hi[r * 2 + 0];
+            total_hi[r * 2 + 1] += d * dot_hi[r * 2 + 1];
+          }
+        }
       }
     }
   }
@@ -360,19 +559,25 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 2) void mlx_node_kquant_matmul_few(
   for (int r = 0; r < 2; ++r) {
     const int row = g + r * 8;
     for (int half = 0; half < 2; ++half) {
-      smem.partials[(warp * 16 + row) * 8 + columns[half]] = total[r * 2 + half];
+      smem.partials[(warp * 16 + row) * M_COLS + columns[half]] = total_lo[r * 2 + half];
+      if constexpr (M16) {
+        smem.partials[(warp * 16 + row) * M_COLS + 8 + columns[half]] = total_hi[r * 2 + half];
+      }
     }
   }
   __syncthreads();
   const int flat = warp * 32 + lane;
-  if (flat < 128) {
-    const int row = flat / 8;
-    const int column = flat % 8;
+  constexpr int total_out = 16 * M_COLS;
+#pragma unroll
+  for (int idx = flat; idx < total_out; idx += NUM_WARPS * 32) {
+    // Coalesced output stores: 16 adjacent threads write contiguous rows of row0..row0+15.
+    const int column = idx >> 4;
+    const int row = idx & 15;
     if (row0 + row < N && column < M) {
       float value = 0.0f;
 #pragma unroll
       for (int ww = 0; ww < NUM_WARPS; ++ww) {
-        value += smem.partials[(ww * 16 + row) * 8 + column];
+        value += smem.partials[(ww * 16 + row) * M_COLS + column];
       }
       out[(size_t)column * N + row0 + row] = __float2bfloat16(value);
     }

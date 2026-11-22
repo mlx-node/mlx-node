@@ -38,9 +38,34 @@ impl Qwen35Inner {
             .config;
         let retained_start = tokens.len().saturating_sub(config.sliding_window - 1);
         let mut context = DFlash2ContextCache::new(config);
+        // Scan all prompt tokens up front so the turn's narrow/wide draft head
+        // mode is established before the first decode proposal.
+        context.observe_tokens(tokens);
         let mut next_position = 0i32;
         let mut last_logits = None;
-        let chunk_size = usize::try_from(PREFILL_STEP_SIZE).unwrap_or(2048).max(1);
+        // On CUDA with in-register KQuantPrefill and fused FlashAttention-2 D=256,
+        // peak chunk scratch is small (~400 MiB at 4096 rows), so 4096-row balanced
+        // chunks stay within the 4096-row GDN/norm kernel caps while cutting full-model
+        // weight reads from 3 passes to 2 passes on 6k prompts (3110 + 3109).
+        let base_chunk = if crate::accelerator::cuda_ops_available() {
+            4096usize
+        } else {
+            usize::try_from(PREFILL_STEP_SIZE).unwrap_or(2048).max(1)
+        };
+        let chunk_size = if crate::accelerator::cuda_ops_available() {
+            let chunks = tokens.len().div_ceil(base_chunk).max(1);
+            tokens.len().div_ceil(chunks)
+        } else if tokens.len() > base_chunk {
+            let rem = tokens.len() % base_chunk;
+            if rem > 0 && rem <= base_chunk / 4 {
+                let balanced_chunks = tokens.len() / base_chunk;
+                tokens.len().div_ceil(balanced_chunks)
+            } else {
+                base_chunk
+            }
+        } else {
+            base_chunk
+        };
         let chunk_count = tokens.len().div_ceil(chunk_size);
         for (index, chunk) in tokens.chunks(chunk_size).enumerate() {
             if self
@@ -50,13 +75,18 @@ impl Qwen35Inner {
             {
                 return Err(Error::from_reason(PREFILL_CANCELLED));
             }
+            let is_final = index + 1 == chunk_count;
             let input = MxArray::from_uint32(chunk, &[1, chunk.len() as i64])?;
             let (logits, taps, _) = forward_dflash2_eager_with_taps(
                 self,
                 &input,
                 &tap_layers,
                 false,
-                DFlash2LogitsSpan::LastRow,
+                if is_final {
+                    DFlash2LogitsSpan::LastRow
+                } else {
+                    DFlash2LogitsSpan::None
+                },
             )?;
             // Proposals can only read the retained sliding-window tail. Older
             // rows still advance provenance, but their draft FC and K/V work is dead.

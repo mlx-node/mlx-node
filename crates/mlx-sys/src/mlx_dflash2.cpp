@@ -187,6 +187,12 @@ extern "C" int mlx_dflash2_topk16_test(mlx_array* logits, mlx_array** out_ids,
   return dflash2_topk16_impl(logits, out_ids, out_values);
 }
 
+#ifdef MLX_NODE_CUDA_ENABLED
+extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
+    mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
+    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor);
+#endif
+
 // Optional source-style selector edge arithmetic. All six arguments are
 // explicit graph inputs, including the changing anchor. Row-contiguous copies
 // are lazy and handled by CustomKernel, so sliced projected rows are accepted.
@@ -244,6 +250,9 @@ extern "C" mlx_array* mlx_dflash2_selector_edges(
     std::cerr << "mlx_dflash2_selector_edges error: " << e.what() << std::endl;
     return nullptr;
   }
+#elif defined(MLX_NODE_CUDA_ENABLED)
+  return mlx_dflash2_selector_edges_cuda(
+      candidates, unary, hidden, predecessor, successor, anchor);
 #else
   (void)candidates; (void)unary; (void)hidden; (void)predecessor; (void)successor; (void)anchor;
   return nullptr;

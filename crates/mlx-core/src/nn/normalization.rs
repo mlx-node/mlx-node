@@ -110,7 +110,7 @@ impl RMSNorm {
     /// callers must fall back to `x.add(res)` + `self.forward(h)`.
     pub fn forward_residual_add(&self, x: &MxArray, res: &MxArray) -> Option<(MxArray, MxArray)> {
         if std::env::var_os("MLX_DISABLE_FUSED_ADD_RMSNORM").is_some()
-            || !unsafe { sys::mlx_metal_is_available() }
+            || (!crate::accelerator::host_has_metal() && !crate::accelerator::cuda_ops_available())
         {
             return None;
         }
