@@ -1,91 +1,13 @@
-//! Window-wide causal attention. Pages remain the persistent storage; only
-//! the current window and a bounded view of its prefix feed SDPA.
-use super::*;
+use super::super::*;
 
 impl Decoder {
-    pub(super) fn rope_window(&self, x: &MxArray, start: usize, count: usize) -> Result<MxArray> {
-        self.rope_window_positions(x, start..start + count)
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn rope_positions(
-        &self,
-        x: &MxArray,
-        offsets: &[usize],
-    ) -> Result<MxArray> {
-        self.rope_window_positions(x, offsets.iter().copied())
-    }
-
-    fn rope_window_positions(
-        &self,
-        x: &MxArray,
-        offsets: impl Iterator<Item = usize>,
-    ) -> Result<MxArray> {
-        let (positions, sections, interleaved) = self.rotary_window_parameters(offsets);
-        self.rotary_tables.borrow_mut().apply(
-            x,
-            positions,
-            self.config.rope_dims(),
-            self.config.rope_theta(),
-            sections,
-            interleaved,
-            self.yarn.as_ref(),
-        )
-    }
-
-    fn rotary_window_parameters(
-        &self,
-        offsets: impl Iterator<Item = usize>,
-    ) -> (Vec<[i64; 3]>, [usize; 3], bool) {
-        let media = self.scope.is_empty() && !self.positions.is_empty();
-        let positions: Vec<_> = offsets
-            .map(|pos| {
-                if media {
-                    self.positions
-                        .get(pos)
-                        .copied()
-                        .unwrap_or([pos as i64 + self.rope_delta; 3])
-                } else {
-                    [pos as i64; 3]
-                }
-            })
-            .collect();
-        let v = &self.config.rope_parameters;
-        let sections = std::array::from_fn(|i| {
-            if media {
-                v["mrope_section"][i].as_u64().unwrap_or(0) as usize
-            } else {
-                0
-            }
-        });
-        (
-            positions,
-            sections,
-            v["mrope_interleaved"].as_bool().unwrap_or(true),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn attention_norm_rotary(
-        &mut self,
-        x: &MxArray,
-        hf: &str,
-        gg: &str,
-        start: usize,
-        count: usize,
-        window: bool,
-    ) -> Result<MxArray> {
-        let normalized = self.norm(x, hf, gg, self.config.head_dim, true)?;
-        if window {
-            self.rope_window(&normalized, start, count)
-        } else {
-            self.rope(&normalized, start)
-        }
-    }
-
     /// Cached `[head_dim]` BF16 Q/K RMSNorm weight for fused CUDA `qk_norm_rope_kv_store`
     /// (with `+1.0` baked in for non-GGUF / HF weights).
-    pub(super) fn cuda_qk_norm_weight_bf16(&mut self, hf: &str, gg: &str) -> Result<MxArray> {
+    pub(in super::super) fn cuda_qk_norm_weight_bf16(
+        &mut self,
+        hf: &str,
+        gg: &str,
+    ) -> Result<MxArray> {
         let key = self.key(hf, gg);
         if let Some(w) = self.cuda_qk_norm_bf16.get(&key) {
             return Ok(w.clone());
@@ -112,7 +34,7 @@ impl Decoder {
     /// Returns `(q_sdpa [1, Hq, T, D], k_buf [1, Hkv, cap, D], v_buf [1, Hkv, cap, D], kv_len)`
     /// when admitted, or `Ok(None)` when disabled / off-contract (e.g. MRoPE, YaRN, paged, draft).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn cuda_flat_qk_rope_store(
+    pub(in super::super) fn cuda_flat_qk_rope_store(
         &mut self,
         qg: &MxArray,
         k_proj: &MxArray,
@@ -123,7 +45,7 @@ impl Decoder {
         t: usize,
         submit_context: &str,
     ) -> Result<Option<(MxArray, MxArray, MxArray, usize)>> {
-        if !super::super::cuda_qwen4_fast_enabled()
+        if !super::super::super::cuda_qwen4_fast_enabled()
             || self.paged.is_some()
             || cache.draft_rows.is_some()
             || !self.positions.is_empty()
@@ -187,7 +109,7 @@ impl Decoder {
     /// Fused CUDA dense (`sdpa_causal_few_q1_to_16` / `sdpa_prefill_d256`) or
     /// zero-gather sparse QSA (`qsa_sparse_sdpa_cuda`) over flat BF16 KV buffers.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn cuda_flat_sdpa(
+    pub(in super::super) fn cuda_flat_sdpa(
         &mut self,
         q: &MxArray,
         k_buf: &MxArray,
@@ -200,7 +122,7 @@ impl Decoder {
         t: usize,
         sparse: bool,
     ) -> Result<Option<MxArray>> {
-        if !super::super::cuda_qwen4_fast_enabled()
+        if !super::super::super::cuda_qwen4_fast_enabled()
             || q.dtype()? != DType::BFloat16
             || k_buf.dtype()? != DType::BFloat16
             || v_buf.dtype()? != DType::BFloat16
@@ -265,7 +187,7 @@ impl Decoder {
     /// Batched CUDA flat-KV attention for `verify_layer` (`R in 2..=16`): runs ONE
     /// `qk_norm_rope_kv_store`, ONE indexer block update, and ONE causal dense/sparse
     /// SDPA across all `R` rows while recording exact per-row rollback snapshots in `saved`.
-    pub(super) fn cuda_verify_attention_batch(
+    pub(in super::super) fn cuda_verify_attention_batch(
         &mut self,
         x: &MxArray,
         i: usize,
@@ -274,7 +196,7 @@ impl Decoder {
         saved: &mut [LayerCache],
     ) -> Result<Option<MxArray>> {
         let t = saved.len();
-        if !super::super::cuda_qwen4_fast_enabled()
+        if !super::super::super::cuda_qwen4_fast_enabled()
             || self.paged.is_some()
             || cache.draft_rows.is_some()
             || !self.positions.is_empty()
@@ -400,259 +322,6 @@ impl Decoder {
         Ok(Some(gated))
     }
 
-    pub(super) fn attention_window(
-        &mut self,
-        x: &MxArray,
-        i: usize,
-        cache: &mut LayerCache,
-        projections: &AttentionProjections,
-    ) -> Result<Option<MxArray>> {
-        let c = self.config.clone();
-        let base = self.history.len();
-        let t = x.shape()?[1] as usize;
-        let dtype = x.dtype()?;
-        let sparse = base + t > c.indexer_budget;
-        let use_metal_qsa = crate::engine::persistence::compiled_forward_backend_available();
-        // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
-        if dtype == DType::Float32
-            || self.verification.is_some()
-            || self.position_override.is_some()
-            || (sparse
-                && (!matches!(dtype, DType::BFloat16 | DType::Float16)
-                    || (use_metal_qsa
-                        && (!c.head_dim.is_multiple_of(32)
-                            // The Metal kernel attends at most 32 incomplete-block tokens.
-                            || c.indexer_compress_ratio > 33))
-                    || (!use_metal_qsa && self.paged.is_some())))
-        {
-            return Ok(None);
-        }
-        let (nh, kh, hd) = (
-            c.num_attention_heads as i64,
-            c.num_key_value_heads as i64,
-            c.head_dim as i64,
-        );
-        let p = format!("layers.{i}.self_attn");
-        let g = format!("blk.{i}");
-        let qg = projections.qg.reshape(&[1, t as i64, nh, 2 * hd])?;
-        let cuda_kv = self.cuda_flat_qk_rope_store(
-            &qg,
-            &projections.k,
-            &projections.v,
-            i,
-            cache,
-            base,
-            t,
-            "qwen4::window::kv",
-        )?;
-        let (q, k_and_v_opt) = if let Some((q_out, k_buf, v_buf, kv_len)) = cuda_kv {
-            (q_out, Some((k_buf, v_buf, kv_len)))
-        } else {
-            let q = self.attention_norm_rotary(
-                &qg.slice_axis(3, 0, hd)?.transpose(Some(&[0, 2, 1, 3]))?,
-                &format!("{p}.q_norm.weight"),
-                &format!("{g}.attn_q_norm.weight"),
-                base,
-                t,
-                true,
-            )?;
-            (q, None)
-        };
-        // Keep the same complete-block compression and its physical first
-        // position, including blocks split across windows or media positions.
-        let id = c.indexer_head_dim as i64;
-        let tail = cache.index_tail.len();
-        let mut raw = cache.index_tail.clone();
-        raw.push(projections.ik.reshape(&[t as i64, id])?);
-        let raw = MxArray::concatenate_many(raw.iter().collect(), Some(0))?;
-        let ratio = c.indexer_compress_ratio;
-        let blocks = (tail + t) / ratio;
-        let used = blocks * ratio;
-        if blocks > 0 {
-            let means = raw
-                .slice_axis(0, 0, used as i64)?
-                .reshape(&[blocks as i64, ratio as i64, id])?
-                .astype(DType::Float32)?
-                .mean(Some(&[1]), Some(false))?
-                .astype(x.dtype()?)?;
-            let norms = self.norm(
-                &means,
-                &format!("{p}.indexer.k_layernorm.weight"),
-                &format!("{g}.indexer.k_norm.weight"),
-                c.indexer_head_dim,
-                true,
-            )?;
-            let rotated = self
-                .rope_window_positions(
-                    &norms.reshape(&[1, 1, blocks as i64, id])?,
-                    (0..blocks).map(|b| base - tail + b * ratio),
-                )?
-                .reshape(&[blocks as i64, id])?;
-            let keys = self.append_index_blocks(i, cache, rotated)?;
-            self.submit_state(&[&keys], "qwen4::window::index_keys")?;
-        }
-        cache.index_tail = (used..tail + t)
-            .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
-            .collect::<Result<_>>()?;
-        let (k_buf_for_cuda, v_buf_for_cuda, kv_len_for_cuda, keys_values_fallback) =
-            if let Some((k_buf, v_buf, kv_len)) = k_and_v_opt {
-                (Some(k_buf), Some(v_buf), kv_len, None)
-            } else {
-                let k = self.attention_norm_rotary(
-                    &projections
-                        .k
-                        .reshape(&[1, t as i64, kh, hd])?
-                        .transpose(Some(&[0, 2, 1, 3]))?,
-                    &format!("{p}.k_norm.weight"),
-                    &format!("{g}.attn_k_norm.weight"),
-                    base,
-                    t,
-                    true,
-                )?;
-                let v = projections
-                    .v
-                    .reshape(&[1, t as i64, kh, hd])?
-                    .transpose(Some(&[0, 2, 1, 3]))?;
-                let (keys, values) = if let Some(adapter) = &self.paged {
-                    cache.keys = Some(k.clone());
-                    cache.values = Some(v.clone());
-                    if base == 0 {
-                        (k, v)
-                    } else {
-                        let layer = (0..i).filter(|&l| !c.linear(l)).count() as u32;
-                        let ids: Vec<_> = (0..base as i32).collect();
-                        let (pk, pv) = super::super::paged::gather_selected(
-                            adapter,
-                            layer,
-                            &ids,
-                            c.num_key_value_heads,
-                            c.head_dim,
-                        )?;
-                        (
-                            MxArray::concatenate(&pk.astype(x.dtype()?)?, &k, 2)?,
-                            MxArray::concatenate(&pv.astype(x.dtype()?)?, &v, 2)?,
-                        )
-                    }
-                } else {
-                    let (keys, values) = cache.append_flat_kv(&k, &v)?;
-                    if let (Some(k_buf), Some(v_buf)) = (&cache.keys, &cache.values) {
-                        self.submit_state(&[k_buf, v_buf], "qwen4::window::kv")?;
-                    }
-                    (keys, values)
-                };
-                let kv_len = keys.shape_at(2)? as usize;
-                (
-                    cache.keys.clone(),
-                    cache.values.clone(),
-                    kv_len,
-                    Some((keys, values)),
-                )
-            };
-        let scale = (c.head_dim as f64).powf(-0.5);
-        let out = if self.paged.is_none()
-            && let (Some(kb), Some(vb)) = (&k_buf_for_cuda, &v_buf_for_cuda)
-            && let Some(cuda_out) = self.cuda_flat_sdpa(
-                &q,
-                kb,
-                vb,
-                kv_len_for_cuda,
-                &projections.iq,
-                i,
-                cache,
-                base,
-                t,
-                sparse,
-            )? {
-            cuda_out
-        } else {
-            let (keys, values) = match keys_values_fallback {
-                Some(pair) => pair,
-                None => {
-                    let kb = k_buf_for_cuda.as_ref().ok_or_else(|| {
-                        Error::from_reason("Qwen4 window attention lost its K cache buffer")
-                    })?;
-                    let vb = v_buf_for_cuda.as_ref().ok_or_else(|| {
-                        Error::from_reason("Qwen4 window attention lost its V cache buffer")
-                    })?;
-                    (
-                        kb.slice_axis(2, 0, kv_len_for_cuda as i64)?,
-                        vb.slice_axis(2, 0, kv_len_for_cuda as i64)?,
-                    )
-                }
-            };
-            if sparse {
-                // Rows whose complete blocks fit the budget select all of them
-                // (the rest are -1), so the kernel is causal for those rows.
-                let (selected, query_ends) = self.qsa_select(i, cache, &projections.iq, base, t)?;
-                if use_metal_qsa {
-                    math::qsa_attention(
-                        &q,
-                        &keys,
-                        &values,
-                        &selected,
-                        &query_ends,
-                        scale,
-                        ratio,
-                        math::QsaKernel::ByCapability,
-                    )?
-                } else {
-                    math::qsa_attention_flat(
-                        &q,
-                        &keys,
-                        &values,
-                        &selected,
-                        &query_ends,
-                        base,
-                        scale,
-                        ratio,
-                    )?
-                }
-            } else {
-                crate::array::scaled_dot_product_attention_causal(&q, &keys, &values, scale)?
-            }
-        };
-        let gated = math::attention_output(&out, &qg)?;
-        Ok(Some(gated))
-    }
-
-    /// Normalized and rotary-embedded indexer query `[1, ih, t, id]` for rows `base..base + t`.
-    pub(super) fn qsa_query(
-        &mut self,
-        i: usize,
-        iq: &MxArray,
-        base: usize,
-        t: usize,
-    ) -> Result<MxArray> {
-        self.qsa_query_positions(i, iq, t, base..base + t)
-    }
-
-    /// Normalized and rotary-embedded indexer query `[1, ih, t, id]` at arbitrary
-    /// logical positions (e.g., `base + tree.depth[j]` for speculative trees).
-    pub(super) fn qsa_query_positions(
-        &mut self,
-        i: usize,
-        iq: &MxArray,
-        t: usize,
-        positions: impl Iterator<Item = usize>,
-    ) -> Result<MxArray> {
-        let c = self.config.clone();
-        let query = self
-            .norm(
-                &iq.reshape(&[
-                    1,
-                    t as i64,
-                    c.indexer_n_heads as i64,
-                    c.indexer_head_dim as i64,
-                ])?,
-                &format!("layers.{i}.self_attn.indexer.q_layernorm.weight"),
-                &format!("blk.{i}.indexer.q_norm.weight"),
-                c.indexer_head_dim,
-                true,
-            )?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        self.rope_window_positions(&query, positions)
-    }
-
     /// Tree-verify CUDA flat-KV attention (`T in 1..=16`):
     /// 1. Fused QK-Norm + tree-depth RoPE (`pre_kv_len + depths[j]`) + flat BF16 KV store
     ///    at `pre_kv_len..pre_kv_len + T`.
@@ -663,7 +332,7 @@ impl Decoder {
     ///    so `commit_tree_deferred` compacts non-contiguous branches and appends committed
     ///    4-token indexer blocks cleanly.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn cuda_verify_attention_tree(
+    pub(in super::super) fn cuda_verify_attention_tree(
         &mut self,
         x: &MxArray,
         i: usize,
@@ -673,7 +342,7 @@ impl Decoder {
         views: &crate::models::qwen3_5::verify_tree::TreeDeviceViews,
     ) -> Result<(MxArray, VerifyAttnLayerTape)> {
         let t = tree.len();
-        if !super::super::cuda_qwen4_fast_enabled()
+        if !super::super::super::cuda_qwen4_fast_enabled()
             || self.paged.is_some()
             || cache.draft_rows.is_some()
             || !self.positions.is_empty()
@@ -826,7 +495,7 @@ impl Decoder {
     /// accepted KV rows via `kernels::kv::kv_compact_rows` and reassigns handles;
     /// then updates `index_keys` and `index_tail` from the `keep` accepted `ik` rows.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn commit_attn_tree_layer(
+    pub(in super::super) fn commit_attn_tree_layer(
         &mut self,
         i: usize,
         cache: &mut LayerCache,
@@ -917,29 +586,5 @@ impl Decoder {
             .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
             .collect::<Result<_>>()?;
         Ok(())
-    }
-
-    /// Rows `base..base + t` choose among every block complete at that row,
-    /// including blocks this window completed, so call after appending them.
-    pub(super) fn qsa_select(
-        &mut self,
-        i: usize,
-        cache: &LayerCache,
-        iq: &MxArray,
-        base: usize,
-        t: usize,
-    ) -> Result<(MxArray, MxArray)> {
-        let c = self.config.clone();
-        let index_keys = self
-            .index_blocks(i, cache)?
-            .ok_or_else(|| Error::from_reason("Qwen4 sparse window has no indexer blocks"))?;
-        let query = self.qsa_query(i, iq, base, t)?;
-        math::qsa_select(
-            &query,
-            &index_keys,
-            base,
-            c.indexer_compress_ratio,
-            c.indexer_budget / c.indexer_compress_ratio,
-        )
     }
 }
