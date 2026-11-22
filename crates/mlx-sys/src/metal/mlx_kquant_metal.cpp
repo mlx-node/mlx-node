@@ -1858,24 +1858,6 @@ bool tiled_projection_spread(const Stream&) { return false; }
 bool tiled_tensor_op_tier(int, int, int, int, bool) { return false; }
 bool lane_tier_available(Mode, int, int) { return false; }
 
-#ifndef MLX_NODE_CUDA_ENABLED
-void KQuantMatmul::eval_gpu(const std::vector<array> &, array &) {
-  throw std::runtime_error(
-      "[quantized_matmul] K-quant modes are not implemented on this GPU "
-      "backend.");
-}
-
-void KQuantGatherQMM::eval_gpu(const std::vector<array> &, array &) {
-  throw std::runtime_error(
-      "[gather_qmm] K-quant modes are not implemented on this GPU backend.");
-}
-
-void KQuantDequantize::eval_gpu(const std::vector<array> &, array &) {
-  throw std::runtime_error(
-      "[dequantize] K-quant modes are not implemented on this GPU backend.");
-}
-#endif
-
 bool store_epilogue_route(Mode, int, int, int) { return false; }
 
 std::optional<array> quantized_matmul_epilogue(const array &, const array &,

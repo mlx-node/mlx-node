@@ -23,12 +23,12 @@
 
 namespace {
 
+#ifdef MLX_NODE_METAL_ENABLED
 constexpr int kTopK = 16;
 constexpr int kShards = 8;
 constexpr int kScanThreads = 256;
 constexpr int kSimdWidth = 32;
 
-#ifdef MLX_NODE_METAL_ENABLED
 // Inspect the exact generated pipeline used by CustomKernel::eval_gpu. This
 // compiles/caches shader metadata but never evaluates arrays or encodes work.
 // The launch sizes are algorithm contracts, not device-performance choices.
@@ -96,29 +96,22 @@ bool selector_pipelines_supported(const array& scan, const array& merge,
   cache.push_back({device.mtl_device(), dtype, vocab, supported});
   return supported;
 }
-#else
-bool selector_pipelines_supported(const array&, const array&,
-                                  mlx::core::Dtype, int) {
-  return false;
-}
-#endif
 
 const char* topk16_header =
 #include "metal/common/topk16_helpers.metal.inc"
     ;
+#endif
 
 } // namespace
 
 static int dflash2_topk16_impl(mlx_array* logits, mlx_array** out_ids,
-                                   mlx_array** out_values) {
+                               mlx_array** out_values) {
   if (!logits || !out_ids || !out_values)
     return 0;
   *out_ids = nullptr;
   *out_values = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
   try {
-#ifndef MLX_NODE_METAL_ENABLED
-    return 0;
-#endif
     if (!mlx::core::metal::is_available() ||
         !(mlx::core::default_device() == mlx::core::Device::gpu))
       return 0;
@@ -173,30 +166,14 @@ static int dflash2_topk16_impl(mlx_array* logits, mlx_array** out_ids,
     std::cerr << "mlx_dflash2_topk16 error: " << e.what() << std::endl;
     return -1;
   }
-}
-
-extern "C" bool mlx_dflash2_topk16(mlx_array* logits, mlx_array** out_ids,
-                                   mlx_array** out_values) {
-  return dflash2_topk16_impl(logits, out_ids, out_values) == 1;
-}
-
-// Test-only status: distinguish unsupported/invalid input from construction
-// failure so a broken fused route cannot silently pass its parity regression.
-extern "C" int mlx_dflash2_topk16_test(mlx_array* logits, mlx_array** out_ids,
-                                     mlx_array** out_values) {
-  return dflash2_topk16_impl(logits, out_ids, out_values);
-}
-
-#ifdef MLX_NODE_CUDA_ENABLED
-extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
-    mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
-    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor);
+#else
+  return 0;
 #endif
+}
 
-// Optional source-style selector edge arithmetic. All six arguments are
-// explicit graph inputs, including the changing anchor. Row-contiguous copies
-// are lazy and handled by CustomKernel, so sliced projected rows are accepted.
-extern "C" mlx_array* mlx_dflash2_selector_edges(
+namespace mlx_node_internal {
+
+mlx_array* dflash2_selector_edges_metal(
     mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
     mlx_array* predecessor, mlx_array* successor, mlx_array* anchor) {
 #ifdef MLX_NODE_METAL_ENABLED
@@ -250,13 +227,29 @@ extern "C" mlx_array* mlx_dflash2_selector_edges(
     std::cerr << "mlx_dflash2_selector_edges error: " << e.what() << std::endl;
     return nullptr;
   }
-#elif defined(MLX_NODE_CUDA_ENABLED)
-  return mlx_dflash2_selector_edges_cuda(
-      candidates, unary, hidden, predecessor, successor, anchor);
 #else
-  (void)candidates; (void)unary; (void)hidden; (void)predecessor; (void)successor; (void)anchor;
+  (void)candidates;
+  (void)unary;
+  (void)hidden;
+  (void)predecessor;
+  (void)successor;
+  (void)anchor;
   return nullptr;
 #endif
+}
+
+}  // namespace mlx_node_internal
+
+extern "C" bool mlx_dflash2_topk16(mlx_array* logits, mlx_array** out_ids,
+                                   mlx_array** out_values) {
+  return dflash2_topk16_impl(logits, out_ids, out_values) == 1;
+}
+
+// Test-only status: distinguish unsupported/invalid input from construction
+// failure so a broken fused route cannot silently pass its parity regression.
+extern "C" int mlx_dflash2_topk16_test(mlx_array* logits, mlx_array** out_ids,
+                                       mlx_array** out_values) {
+  return dflash2_topk16_impl(logits, out_ids, out_values);
 }
 
 // Collapse the dependent greedy predecessor walk from roughly four lazy MLX
@@ -269,6 +262,7 @@ extern "C" bool mlx_dflash2_greedy_path(mlx_array* candidates,
   if (!candidates || !scores || !out_path)
     return false;
   *out_path = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
   try {
     const auto& candidate_ids = *reinterpret_cast<array*>(candidates);
     const auto& score_table = *reinterpret_cast<array*>(scores);
@@ -299,15 +293,20 @@ extern "C" bool mlx_dflash2_greedy_path(mlx_array* candidates,
     std::cerr << "mlx_dflash2_greedy_path error: " << e.what() << std::endl;
     return false;
   }
+#else
+  return false;
+#endif
 }
 
 extern "C" bool mlx_dflash2_greedy_path_confidence(mlx_array* candidates,
-                                        mlx_array* scores,
-                                        mlx_array** out_path, mlx_array** out_confidence) {
+                                                   mlx_array* scores,
+                                                   mlx_array** out_path,
+                                                   mlx_array** out_confidence) {
   if (!candidates || !scores || !out_path || !out_confidence)
     return false;
   *out_path = nullptr;
   *out_confidence = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
   try {
     const auto& candidate_ids = *reinterpret_cast<array*>(candidates);
     const auto& score_table = *reinterpret_cast<array*>(scores);
@@ -341,6 +340,9 @@ extern "C" bool mlx_dflash2_greedy_path_confidence(mlx_array* candidates,
     std::cerr << "mlx_dflash2_greedy_path error: " << e.what() << std::endl;
     return false;
   }
+#else
+  return false;
+#endif
 }
 
 extern "C" bool mlx_dflash2_sampled_path(mlx_array* candidates,
@@ -353,6 +355,7 @@ extern "C" bool mlx_dflash2_sampled_path(mlx_array* candidates,
     return false;
   *out_path = nullptr;
   *out_q = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
   try {
     const auto& candidate_ids = *reinterpret_cast<array*>(candidates);
     const auto& score_table = *reinterpret_cast<array*>(scores);
@@ -392,10 +395,14 @@ extern "C" bool mlx_dflash2_sampled_path(mlx_array* candidates,
     std::cerr << "mlx_dflash2_sampled_path error: " << e.what() << std::endl;
     return false;
   }
+#else
+  return false;
+#endif
 }
 
 extern "C" mlx_array* mlx_dflash2_verify_budget(mlx_array* confidence, mlx_array* parameters) {
   if (!confidence || !parameters) return nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
   try {
     const auto& q = *reinterpret_cast<array*>(confidence);
     const auto& p = *reinterpret_cast<array*>(parameters);
@@ -414,4 +421,7 @@ extern "C" mlx_array* mlx_dflash2_verify_budget(mlx_array* confidence, mlx_array
     std::cerr << "mlx_dflash2_verify_budget error: " << e.what() << std::endl;
     return nullptr;
   }
+#else
+  return nullptr;
+#endif
 }

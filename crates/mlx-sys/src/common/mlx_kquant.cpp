@@ -1417,6 +1417,24 @@ void KQuantDequantize::eval_cpu(const std::vector<array> &inputs, array &out) {
       });
 }
 
+#if !defined(MLX_NODE_METAL_ENABLED) && !defined(MLX_NODE_CUDA_ENABLED)
+void KQuantMatmul::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[quantized_matmul] K-quant modes are not implemented on this GPU "
+      "backend.");
+}
+
+void KQuantGatherQMM::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[gather_qmm] K-quant modes are not implemented on this GPU backend.");
+}
+
+void KQuantDequantize::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[dequantize] K-quant modes are not implemented on this GPU backend.");
+}
+#endif
+
 } // namespace mlx::core::kquant
 
 struct mlx_array;

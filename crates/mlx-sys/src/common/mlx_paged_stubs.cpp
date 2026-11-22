@@ -22,7 +22,13 @@
 #if !defined(MLX_NODE_METAL_ENABLED)
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include "mlx_paged_ops.h"
 
@@ -242,6 +248,48 @@ uint64_t mlx_paged_prefill_test_probe_count(int) { return 0; }
 uint32_t mlx_paged_prefill_test_last_splits() { return 0; }
 
 uint32_t mlx_paged_prefill_test_last_max_splits() { return 0; }
+
+// CPU-only / non-Metal bridge definitions for the three entry points normally
+// supplied by mlx_paged_profile.cpp. That translation unit includes
+// Metal/Metal.hpp and is therefore intentionally excluded when
+// MLX_DISABLE_METAL=1 (and on non-Apple builds). Keep these stubs in a
+// translation unit that consumes only MLX's public, backend-neutral headers so
+// non-Metal builds can link.
+int32_t mlx_total_system_memory(uint64_t* out_value) {
+#if defined(__APPLE__)
+  size_t memsize = 0;
+  size_t length = sizeof(memsize);
+  if (sysctlbyname("hw.memsize", &memsize, &length, nullptr, 0) != 0) {
+    return -1;
+  }
+  if (out_value != nullptr) {
+    *out_value = static_cast<uint64_t>(memsize);
+  }
+  return 0;
+#else
+  (void)out_value;
+  return -1;
+#endif
+}
+
+int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
+  if (out_value != nullptr) {
+    *out_value = 0;
+  }
+  return 0;
+}
+
+mlx_array* mlx_array_from_metal_buffer_view(
+    void* metal_buffer_ptr,
+    const int64_t* dims,
+    size_t ndim,
+    int32_t dtype_code) {
+  (void)metal_buffer_ptr;
+  (void)dims;
+  (void)ndim;
+  (void)dtype_code;
+  return nullptr;
+}
 
 } // extern "C"
 
