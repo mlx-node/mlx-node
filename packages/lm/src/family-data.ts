@@ -200,6 +200,19 @@ export const DEEPSEEK_V41_SAMPLING_DEFAULTS: ChatConfig = {
 };
 
 /**
+ * Sampling defaults from Inkling-2-Mini GGUF metadata
+ * (`general.sampling.temp` 1.0, `top_k` 0, `top_p` 1.0, `min_p` 0.0).
+ */
+export const INKLING2_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 1.0,
+  topP: 1.0,
+  topK: 0,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
+/**
  * Sampling defaults + per-model output cap. A per-request client value still
  * wins: `ChatSession.mergeConfig` treats per-call config as an overlay on top
  * of `defaultConfig`.
@@ -548,6 +561,28 @@ export const MODEL_FAMILY_DATA = [
     /** v1 context limit (min(GGUF context, 16384)). */
     traits: { reasoning: true, fallbackContextWindow: 16384 },
     launchPreset: { sampling: DEEPSEEK_V41_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
+  },
+  {
+    id: 'inkling2',
+    visionConfigKeys: ['vision_config'],
+    kind: 'loadable',
+    ggufArchitectures: ['inkling2', 'inkling2_loop'],
+    ggufDiscovery: { variants: 'all', split: true },
+    match: { rawModelTypes: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'] },
+    acceptsDraftModel: true,
+    acceptsKvFormat: true,
+    acceptsMaxMemory: true,
+    loadsAlone: true,
+    acceptsMaxContext: true,
+    acceptsDecodeShare: true,
+    acceptsActivations: true,
+    acceptsCacheDisk: true,
+    streamOpts: { recordModelPath: true },
+    traits: { reasoning: true, fallbackContextWindow: 1048576 },
+    launchPreset: {
+      sampling: INKLING2_SAMPLING_DEFAULTS,
+      maxOutputTokens: 32768,
+    },
   },
   {
     id: 'lfm2',

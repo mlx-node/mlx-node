@@ -242,7 +242,8 @@ fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> 
         | GgufTensorType::Q5_0
         | GgufTensorType::Q5_1
         | GgufTensorType::Q8_0
-        | GgufTensorType::MXFP4 => Route::CpuAffine,
+        | GgufTensorType::MXFP4
+        | GgufTensorType::NVFP4 => Route::CpuAffine,
         _ => match dense_dtype(ty) {
             Some(d) => Route::Dense(d),
             None => Route::Whole,
@@ -1297,6 +1298,7 @@ fn dtype_target_for(
     let target = opts.dtype.filter(|_| !plan.prism)?;
     if plan.preserve_dtype_keys.contains(key)
         || key.ends_with(".scales")
+        || key.ends_with(".scale")
         || key.ends_with(".biases")
         || dtype == DType::Uint32
     {
@@ -1330,7 +1332,7 @@ pub(crate) fn imported_dtypes(
             }
         } else if ty.is_mlx_affine_quantized() {
             DType::Float16
-        } else if ty.is_mlx_mxfp4_quantized() {
+        } else if ty.is_mlx_mxfp4_quantized() || ty.is_mlx_nvfp4_quantized() {
             DType::Uint8
         } else {
             if let Some(source) = dense_dtype(ty) {

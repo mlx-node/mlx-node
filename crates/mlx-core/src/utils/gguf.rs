@@ -88,6 +88,9 @@ pub enum GgufTensorType {
     IQ1M = 29,
     BF16 = 30,
     MXFP4 = 39,
+    /// GGML `GGML_TYPE_NVFP4 = 40`: 64 E2M1 codes under 4 uint8 UE4M3 scales
+    /// (one per 16-element sub-block; `block_nvfp4`, 36 bytes).
+    NVFP4 = 40,
     /// llama.cpp PR #30817 `GGML_TYPE_MXFP8 = 43`: 32 E4M3 codes under one
     /// E8M0 scale (`block_mxfp8`, 33 bytes). Gather-only: no whole-tensor load.
     MXFP8 = 43,
@@ -120,6 +123,7 @@ impl GgufTensorType {
             29 => Some(Self::IQ1M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
+            40 => Some(Self::NVFP4),
             43 => Some(Self::MXFP8),
             142 => Some(Self::PQ2_0),
             _ => None,
@@ -143,6 +147,8 @@ impl GgufTensorType {
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
             // One E8M0 shared exponent + 16 bytes of E2M1 nibbles.
             Self::MXFP4 => 17,
+            // Four UE4M3 scales (one per 16 values) + 32 bytes of E2M1 nibbles.
+            Self::NVFP4 => 36,
             // One E8M0 scale byte + 32 E4M3 code bytes.
             Self::MXFP8 => 33,
             // 16 (sc, min) nibble pairs + 64 bytes of 2-bit codes + f16 d +
@@ -184,6 +190,7 @@ impl GgufTensorType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::MXFP4 => 32,
             Self::IQ4NL | Self::MXFP8 => 32,
+            Self::NVFP4 => 64,
             Self::PQ2_0 => 128,
             Self::Q2K
             | Self::Q3K
@@ -226,6 +233,14 @@ impl GgufTensorType {
         matches!(self, Self::MXFP4)
     }
 
+    /// Whether the blocks repack into MLX's native `nvfp4` pair
+    /// (`weight`, uint8 E4M3 `scales`, group_size 16, no biases): ggml's
+    /// `block_nvfp4` stores 4x 16-element sub-blocks with split-half nibbles
+    /// and UE4M3 scales whose values match MLX `nvfp4` 1:1.
+    pub(crate) fn is_mlx_nvfp4_quantized(&self) -> bool {
+        matches!(self, Self::NVFP4)
+    }
+
     /// The repacker format for the ggml K-quants, `None` for everything else.
     ///
     /// Deliberately exhaustive for the same reason as `block_size()`: a K-quant
@@ -256,13 +271,14 @@ impl GgufTensorType {
             | Self::Q5_1
             | Self::Q8_0
             | Self::MXFP4
+            | Self::NVFP4
             | Self::MXFP8
             | Self::PQ2_0 => None,
         }
     }
 
     /// Every type `from_u32` recognizes, for the header rejection message.
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 26] = [
         Self::F32,
         Self::F16,
         Self::Q4_0,
@@ -286,6 +302,7 @@ impl GgufTensorType {
         Self::IQ1M,
         Self::BF16,
         Self::MXFP4,
+        Self::NVFP4,
         Self::MXFP8,
         Self::PQ2_0,
     ];
@@ -325,6 +342,7 @@ impl GgufTensorType {
             Self::IQ1M => "IQ1_M",
             Self::BF16 => "BF16",
             Self::MXFP4 => "MXFP4",
+            Self::NVFP4 => "NVFP4",
             Self::MXFP8 => "MXFP8",
             Self::PQ2_0 => "PQ2_0",
         }
@@ -393,6 +411,7 @@ pub enum GgufMetaValue {
     ArrayU64(Vec<u64>),
     ArrayI64(Vec<i64>),
     ArrayF32(Vec<f32>),
+    ArrayBool(Vec<bool>),
     ArrayString(Vec<String>),
 }
 
@@ -662,6 +681,13 @@ fn read_meta_array(r: &mut impl Read) -> std::io::Result<GgufMetaValue> {
                 v.push(read_f32(r)?);
             }
             Ok(GgufMetaValue::ArrayF32(v))
+        }
+        GgufValueType::Bool => {
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(read_bool(r)?);
+            }
+            Ok(GgufMetaValue::ArrayBool(v))
         }
         GgufValueType::String => {
             let mut v = Vec::with_capacity(len);
@@ -1150,6 +1176,7 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         GgufTensorType::Q5_1
         | GgufTensorType::Q4_1
         | GgufTensorType::MXFP4
+        | GgufTensorType::NVFP4
         | GgufTensorType::MXFP8
         | GgufTensorType::PQ2_0
         | GgufTensorType::F32
@@ -1255,6 +1282,26 @@ pub fn mxfp4_repack_block(block: &[u8], words: &mut [u32; 4]) -> u8 {
     e
 }
 
+/// Repack one ggml `block_nvfp4` (36 bytes: `d[4]` UE4M3 scales + `qs[32]`
+/// split-half E2M1 nibbles for 64 values = 4 sub-blocks of 16) into eight
+/// LSB-first 4-bit words and four uint8 scales for MLX's native `nvfp4` mode
+/// (`group_size=16`, `bits=4`, no biases).
+pub fn nvfp4_repack_block(block: &[u8], words: &mut [u32; 8], scales: &mut [u8; 4]) {
+    scales.copy_from_slice(&block[0..4]);
+    let qs = &block[4..36];
+    for s in 0..4 {
+        let sub = &qs[s * 8..(s + 1) * 8];
+        let mut lo_word = 0u32;
+        let mut hi_word = 0u32;
+        for j in 0..8 {
+            lo_word |= u32::from(sub[j] & 0x0F) << (j * 4);
+            hi_word |= u32::from(sub[j] >> 4) << (j * 4);
+        }
+        words[s * 2] = lo_word;
+        words[s * 2 + 1] = hi_word;
+    }
+}
+
 /// `ggml_e8m0_to_fp32` (ggml-impl.h:439): `2^(x - 127)`, 0 is the subnormal
 /// `2^-127`; 0xFF gives +inf (callers that treat it as NaN check first).
 pub fn e8m0_to_f32(x: u8) -> f32 {
@@ -1344,6 +1391,7 @@ pub(super) fn load_quantized_tensor(
         GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => 4, // 32 x 4-bit
         GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => 5, // 32 x 5-bit = 160 bits
         GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
+        GgufTensorType::NVFP4 => 8,                       // 64 x 4-bit = 256 bits
         GgufTensorType::PQ2_0 => 8,
         other => {
             return Err(Error::from_reason(format!(
@@ -1352,6 +1400,11 @@ pub(super) fn load_quantized_tensor(
                 other.name()
             )));
         }
+    };
+    let scales_per_block: usize = if tensor.tensor_type.is_mlx_nvfp4_quantized() {
+        4
+    } else {
+        1
     };
 
     // Weight shape: the innermost dimension shrinks to its packed word count.
@@ -1370,9 +1423,9 @@ pub(super) fn load_quantized_tensor(
     let mut w_shape = leading_dims.to_vec();
     w_shape.push(last / block_size as i64 * words_per_block as i64);
 
-    // Scales/biases shape: last dim divided by block_size
+    // Scales/biases shape: last dim divided by block_size * scales_per_block
     let mut sb_shape = leading_dims.to_vec();
-    sb_shape.push(last / block_size as i64);
+    sb_shape.push(last / block_size as i64 * scales_per_block as i64);
 
     let w_elements: usize = w_shape
         .iter()
@@ -1529,6 +1582,26 @@ pub(super) fn load_quantized_tensor(
                 weights_packed[base..base + 4].copy_from_slice(&words);
             }
         }
+        GgufTensorType::NVFP4 => {
+            // Block: 4 bytes UE4M3 scales (one per 16 values), 32 nibble bytes.
+            // MLX's `nvfp4` mode reads the same E2M1 codes under the same UE4M3 scales.
+            e8m0_scales.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate UE4M3 scales for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            e8m0_scales.resize(sb_elements, 0);
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                let mut words = [0u32; 8];
+                let mut sub_scales = [0u8; 4];
+                nvfp4_repack_block(block, &mut words, &mut sub_scales);
+                let base = i * words_per_block;
+                weights_packed[base..base + 8].copy_from_slice(&words);
+                e8m0_scales[i * 4..(i + 1) * 4].copy_from_slice(&sub_scales);
+            }
+        }
         GgufTensorType::Q5_1 => {
             // Block: 2 bytes f16 scale (d), 2 bytes f16 bias (m), 4 bytes of
             // high bits (qh, one bit per weight), 16 nibble bytes (qs). ggml
@@ -1630,8 +1703,10 @@ pub(super) fn load_quantized_tensor(
     let w_i64_shape: Vec<i64> = w_shape.to_vec();
     let sb_i64_shape: Vec<i64> = sb_shape.to_vec();
 
+    let is_u8_fp4_scales =
+        tensor.tensor_type.is_mlx_mxfp4_quantized() || tensor.tensor_type.is_mlx_nvfp4_quantized();
     let weight_arr = MxArray::from_uint32(&weights_packed, &w_i64_shape)?;
-    let scales_arr = if tensor.tensor_type.is_mlx_mxfp4_quantized() {
+    let scales_arr = if is_u8_fp4_scales {
         MxArray::from_uint8(&e8m0_scales, &sb_i64_shape)?
     } else {
         MxArray::from_float16(&scales, &sb_i64_shape)?
@@ -1645,9 +1720,7 @@ pub(super) fn load_quantized_tensor(
         (name.clone(), weight_arr),
         (format!("{prefix}.scales"), scales_arr),
     ];
-    if symmetric_zero_point(tensor.tensor_type).is_none()
-        && !tensor.tensor_type.is_mlx_mxfp4_quantized()
-    {
+    if symmetric_zero_point(tensor.tensor_type).is_none() && !is_u8_fp4_scales {
         out.push((
             format!("{prefix}.biases"),
             MxArray::from_float16(&biases, &sb_i64_shape)?,
@@ -1905,6 +1978,7 @@ pub(crate) fn load_gguf_tensor(
         }
     } else if tensor.tensor_type.is_mlx_affine_quantized()
         || tensor.tensor_type.is_mlx_mxfp4_quantized()
+        || tensor.tensor_type.is_mlx_nvfp4_quantized()
     {
         load_quantized_tensor(reader, gguf, tensor)
     } else {
@@ -1987,6 +2061,47 @@ pub(super) fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaVal
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
         == Some("dflash")
+        && !is_inkling2_dspark_gguf(metadata)
+}
+
+/// Inkling2 / Inkling2-Mini text backbone GGUF: accepts both Unsloth's
+/// `general.architecture = "inkling2"` (with optional `inkling2.num_loops`)
+/// and mainline `llama.cpp#32694`'s `general.architecture = "inkling2_loop"`.
+pub(crate) fn is_inkling2_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    matches!(
+        metadata
+            .get("general.architecture")
+            .and_then(GgufMetaValue::as_str),
+        Some("inkling2" | "inkling2_loop")
+    )
+}
+
+/// Inkling2 vision projector GGUF (`mmproj-BF16.gguf`): `general.architecture = "clip"`
+/// with `clip.vision.projector_type = "inkling2v"`.
+pub(crate) fn is_inkling2_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clip")
+        && metadata
+            .get("clip.vision.projector_type")
+            .and_then(GgufMetaValue::as_str)
+            == Some("inkling2v")
+}
+
+/// Inkling2 DSpark parallel block drafter GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`):
+/// `general.architecture = "dflash"` with `dflash.dspark.markov_rank` and
+/// `tokenizer.ggml.pre = "inkling2"`.
+pub(crate) fn is_inkling2_dspark_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("dflash")
+        && metadata.contains_key("dflash.dspark.markov_rank")
+        && metadata
+            .get("tokenizer.ggml.pre")
+            .and_then(GgufMetaValue::as_str)
+            == Some("inkling2")
 }
 
 /// The three names a quantized tensor group ships under. Both GGUF quant
@@ -2290,6 +2405,187 @@ fn muse_glimmer_dflash_name_to_hf(name: &str) -> Option<String> {
     Some(result)
 }
 
+/// Map Inkling2 / Inkling2-Loop GGUF tensor names (supporting both Unsloth
+/// `inkling2` + `loop_{attn,k,v,mlp}_{down,gain,forget}` / global
+/// `loop_{,kv_}res_query` and mainline `inkling2_loop` +
+/// `loop_{q,k,v,ffn}_ctrl_{down,gain,forget}` / per-block `loop_msg_query`)
+/// into a single canonical HuggingFace-style namespace.
+fn inkling2_name_to_hf(name: &str) -> Option<String> {
+    if let Some(renamed) = rename_global_quant_group(name, "token_embd", "model.embed_tokens") {
+        return Some(renamed);
+    }
+    if name == "token_embd_norm.weight" {
+        return Some("model.embed_norm.weight".to_string());
+    }
+    if let Some(renamed) = rename_global_quant_group(name, "output", "lm_head") {
+        return Some(renamed);
+    }
+    if name == "output_norm.weight" {
+        return Some("model.norm.weight".to_string());
+    }
+    if name == "output_res_query.weight" {
+        return Some("model.output_res_query.weight".to_string());
+    }
+    if name == "loop_res_query.weight" {
+        return Some("model.loop_res_query.weight".to_string());
+    }
+    if name == "loop_kv_res_query.weight" {
+        return Some("model.loop_kv_res_query.weight".to_string());
+    }
+
+    if let Some(rest) = name.strip_prefix("blk.") {
+        let mut result = format!("model.layers.{rest}");
+        // Longest/most-specific patterns first so shorter prefixes cannot shadow them.
+        const REPLACEMENTS: [(&str, &str); 51] = [
+            (".attn_q_inp_norm.", ".self_attn.q_inp_norm."),
+            (".attn_k_inp_norm.", ".self_attn.k_inp_norm."),
+            (".attn_v_inp_norm.", ".self_attn.v_inp_norm."),
+            (".attn_k_conv_proj.", ".self_attn.k_conv_proj."),
+            (".attn_v_conv_proj.", ".self_attn.v_conv_proj."),
+            (".attn_k_conv.", ".self_attn.k_conv."),
+            (".attn_v_conv.", ".self_attn.v_conv."),
+            (".attn_post_conv.", ".self_attn.post_conv."),
+            (".attn_rel_bias.", ".self_attn.rel_bias."),
+            (".attn_rel_clip.", ".self_attn.rel_clip."),
+            (".attn_q_clip.", ".self_attn.q_clip."),
+            (".attn_sink_proj.", ".self_attn.sink_proj."),
+            (".attn_output.", ".self_attn.o_proj."),
+            (".attn_gate.", ".self_attn.gate_proj."),
+            (".attn_rel.", ".self_attn.rel_proj."),
+            (".attn_norm.", ".input_layernorm."),
+            (".attn_q.", ".self_attn.q_proj."),
+            (".attn_k.", ".self_attn.k_proj."),
+            (".attn_v.", ".self_attn.v_proj."),
+            (".ffn_gate_up_exps.", ".mlp.experts.gate_up_proj."),
+            (".ffn_gate_exps.", ".mlp.experts.gate_proj."),
+            (".ffn_up_exps.", ".mlp.experts.up_proj."),
+            (".ffn_down_exps.", ".mlp.experts.down_proj."),
+            (".ffn_gate_inp.", ".mlp.gate."),
+            (".ffn_exp_probs_b.bias", ".mlp.gate.e_score_correction_bias"),
+            (".exp_probs_b.bias", ".mlp.gate.e_score_correction_bias"),
+            (".ffn_post_conv.", ".mlp.post_conv."),
+            (".ffn_norm.", ".post_attention_layernorm."),
+            // Mainline `inkling2_loop` controllers
+            (".loop_q_ctrl_down.", ".loop_ctrl.q.down_proj."),
+            (".loop_q_ctrl_gain.", ".loop_ctrl.q.gain_proj."),
+            (".loop_q_ctrl_forget.", ".loop_ctrl.q.forget_proj."),
+            (".loop_k_ctrl_down.", ".loop_ctrl.k.down_proj."),
+            (".loop_k_ctrl_gain.", ".loop_ctrl.k.gain_proj."),
+            (".loop_k_ctrl_forget.", ".loop_ctrl.k.forget_proj."),
+            (".loop_v_ctrl_down.", ".loop_ctrl.v.down_proj."),
+            (".loop_v_ctrl_gain.", ".loop_ctrl.v.gain_proj."),
+            (".loop_v_ctrl_forget.", ".loop_ctrl.v.forget_proj."),
+            (".loop_ffn_ctrl_down.", ".loop_ctrl.mlp.down_proj."),
+            (".loop_ffn_ctrl_gain.", ".loop_ctrl.mlp.gain_proj."),
+            (".loop_ffn_ctrl_forget.", ".loop_ctrl.mlp.forget_proj."),
+            // Unsloth `inkling2` controllers -> unified canonical names
+            (".loop_attn_down.", ".loop_ctrl.q.down_proj."),
+            (".loop_attn_gain.", ".loop_ctrl.q.gain_proj."),
+            (".loop_attn_forget.", ".loop_ctrl.q.forget_proj."),
+            (".loop_k_down.", ".loop_ctrl.k.down_proj."),
+            (".loop_k_gain.", ".loop_ctrl.k.gain_proj."),
+            (".loop_k_forget.", ".loop_ctrl.k.forget_proj."),
+            (".loop_v_down.", ".loop_ctrl.v.down_proj."),
+            (".loop_v_gain.", ".loop_ctrl.v.gain_proj."),
+            (".loop_v_forget.", ".loop_ctrl.v.forget_proj."),
+            (".loop_mlp_down.", ".loop_ctrl.mlp.down_proj."),
+            (".loop_mlp_gain.", ".loop_ctrl.mlp.gain_proj."),
+        ];
+        for (from, to) in REPLACEMENTS {
+            if result.contains(from) {
+                result = result.replace(from, to);
+                return Some(result);
+            }
+        }
+        if result.contains(".loop_mlp_forget.") {
+            result = result.replace(".loop_mlp_forget.", ".loop_ctrl.mlp.forget_proj.");
+        }
+        // `.attn_res_query.`, `.ffn_res_query.`, `.loop_msg_query.` keep their names under `model.layers.{i}.`.
+        return Some(result);
+    }
+
+    Some(name.to_string())
+}
+
+/// Map Inkling2 `mmproj` (`clip.vision.projector_type = "inkling2v"`) GGUF
+/// tensor names into `vision_tower.*` and `vision_projector.*`.
+fn inkling2_mmproj_name_to_hf(name: &str) -> Option<String> {
+    if name == "v.class_embd" {
+        return Some("vision_tower.class_embedding".to_string());
+    }
+    if let Some(rest) = name.strip_prefix("v.class_position_embd.") {
+        return Some(format!("vision_tower.class_position_embedding.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("v.patch_embd.") {
+        return Some(format!("vision_tower.patch_embed.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("v.position_embd.") {
+        return Some(format!("vision_tower.position_embedding.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("v.pre_ln.") {
+        return Some(format!("vision_tower.pre_ln.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("mm.1.") {
+        return Some(format!("vision_projector.fc1.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("mm.2.") {
+        return Some(format!("vision_projector.fc2.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("v.blk.") {
+        let mut result = format!("vision_tower.blocks.{rest}");
+        for (from, to) in [
+            (".attn_q.", ".attn.q_proj."),
+            (".attn_k.", ".attn.k_proj."),
+            (".attn_v.", ".attn.v_proj."),
+            (".attn_out.", ".attn.o_proj."),
+            (".ffn_up.", ".mlp.fc1."),
+            (".ffn_down.", ".mlp.fc2."),
+            (".ln1.", ".norm1."),
+            (".ln2.", ".norm2."),
+        ] {
+            if result.contains(from) {
+                result = result.replace(from, to);
+                break;
+            }
+        }
+        return Some(result);
+    }
+    Some(name.to_string())
+}
+
+/// Map Inkling2 DSpark draft GGUF tensor names.
+fn inkling2_dspark_name_to_hf(name: &str) -> Option<String> {
+    if let Some(renamed) = rename_global_quant_group(name, "output_norm", "norm") {
+        return Some(renamed);
+    }
+    if let Some(rest) = name.strip_prefix("blk.") {
+        let mut result = format!("layers.{rest}");
+        for (from, to) in [
+            (".attn_k_ctx_norm.", ".self_attn.k_ctx_norm."),
+            (".attn_k_ctx.", ".self_attn.k_ctx_proj."),
+            (".attn_v_ctx.", ".self_attn.v_ctx_proj."),
+            (".attn_q_norm.", ".self_attn.q_norm."),
+            (".attn_k_norm.", ".self_attn.k_norm."),
+            (".attn_output.", ".self_attn.o_proj."),
+            (".attn_norm.", ".input_layernorm."),
+            (".attn_q.", ".self_attn.q_proj."),
+            (".attn_k.", ".self_attn.k_proj."),
+            (".attn_v.", ".self_attn.v_proj."),
+            (".ffn_norm.", ".post_attention_layernorm."),
+            (".ffn_gate.", ".mlp.gate_proj."),
+            (".ffn_up.", ".mlp.up_proj."),
+            (".ffn_down.", ".mlp.down_proj."),
+        ] {
+            if result.contains(from) {
+                result = result.replace(from, to);
+                break;
+            }
+        }
+        return Some(result);
+    }
+    Some(name.to_string())
+}
+
 pub(super) fn gguf_name_to_hf_for_metadata(
     name: &str,
     metadata: &HashMap<String, GgufMetaValue>,
@@ -2300,6 +2596,12 @@ pub(super) fn gguf_name_to_hf_for_metadata(
         gemma4_mmproj_name_to_hf(name)
     } else if is_gemma4v_mmproj_gguf(metadata) {
         gemma4v_mmproj_name_to_hf(name)
+    } else if is_inkling2_main_gguf(metadata) {
+        inkling2_name_to_hf(name)
+    } else if is_inkling2_mmproj_gguf(metadata) {
+        inkling2_mmproj_name_to_hf(name)
+    } else if is_inkling2_dspark_gguf(metadata) {
+        inkling2_dspark_name_to_hf(name)
     } else if is_muse_glimmer_main_gguf(metadata) {
         muse_glimmer_name_to_hf(name)
     } else if is_muse_glimmer_mmproj_gguf(metadata) {
@@ -3779,6 +4081,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
         // config must spell the backbone family so the directory loads
         // through the qwen3_5 loader.
         "clef" => "qwen3_5",
+        // Normalize both Unsloth `inkling2` and mainline `inkling2_loop` to `"inkling2"`.
+        "inkling2" | "inkling2_loop" => "inkling2",
         _ => arch.as_str(),
     };
     config.insert(
@@ -3868,7 +4172,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     // with existing Gemma4 K-quant conversions and because neither GGUF value is
     // the whole story there.
     let is_qwen_family = matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen35moe" | "clef");
-    let has_independent_head_dim = is_qwen_family || arch == "muse-glimmer";
+    let has_independent_head_dim =
+        is_qwen_family || matches!(arch.as_str(), "muse-glimmer" | "inkling2" | "inkling2_loop");
     // A key_length of 0 is not a head dim; fall through to the derivation
     // rather than writing a config that divides by it downstream. Same guard
     // the `heads > 0` arm below applies to the derived value.
@@ -3907,8 +4212,187 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
 
     let mut config = serde_json::Value::Object(config);
     apply_qwen35_gdn_config(&mut config, metadata);
+    apply_inkling2_config(&mut config, metadata);
 
     config
+}
+
+/// Populate Inkling2 / Inkling2-Loop config fields from GGUF metadata,
+/// normalizing both Unsloth (`general.architecture = "inkling2"`,
+/// `block_count = 48`, `num_loops`, `loop.core_start`, `loop.core_end`) and
+/// mainline `llama.cpp#32694` (`general.architecture = "inkling2_loop"`,
+/// `block_count = 24`, `loop.start`, `loop.end`, `loop.count`) into one schema.
+fn apply_inkling2_config(
+    config: &mut serde_json::Value,
+    metadata: &HashMap<String, GgufMetaValue>,
+) {
+    if !is_inkling2_main_gguf(metadata) {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or("inkling2");
+    let first_u64 = |val: &GgufMetaValue| -> Option<u64> {
+        val.as_u64().or_else(|| match val {
+            GgufMetaValue::ArrayU32(v) => v.first().copied().map(u64::from),
+            GgufMetaValue::ArrayI32(v) => v.first().copied().and_then(|x| u64::try_from(x).ok()),
+            GgufMetaValue::ArrayU64(v) => v.first().copied(),
+            GgufMetaValue::ArrayI64(v) => v.first().copied().and_then(|x| u64::try_from(x).ok()),
+            _ => None,
+        })
+    };
+    let meta_u64 = |suffix: &str| -> Option<u64> {
+        metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(first_u64)
+    };
+    let meta_f32 = |suffix: &str| -> Option<f64> {
+        metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(GgufMetaValue::as_f32)
+            .map(f64::from)
+    };
+
+    // Unsloth stores head_count / head_count_kv as per-visit Int32 arrays.
+    if !obj.contains_key("num_attention_heads")
+        && let Some(n) = meta_u64("attention.head_count")
+    {
+        obj.insert("num_attention_heads".to_string(), serde_json::json!(n));
+    }
+    if !obj.contains_key("num_key_value_heads")
+        && let Some(n) = meta_u64("attention.head_count_kv")
+    {
+        obj.insert("num_key_value_heads".to_string(), serde_json::json!(n));
+    }
+    if let Some(n) = meta_u64("attention.value_length").filter(|&v| v > 0) {
+        obj.insert("value_head_dim".to_string(), serde_json::json!(n));
+    }
+    if let Some(n) = meta_u64("vocab_size") {
+        obj.insert("padded_vocab_size".to_string(), serde_json::json!(n));
+    }
+    if let Some(n) = meta_u64("vocab_size_unpadded") {
+        obj.insert("unpadded_vocab_size".to_string(), serde_json::json!(n));
+    }
+
+    for (suffix, hf_key) in [
+        ("attention.sliding_window", "sliding_window"),
+        ("shortconv.l_cache", "sconv_kernel_size"),
+        ("attn_res.block_size", "n_layers_per_attn_res_block"),
+        ("attention.relative_length", "d_rel"),
+        ("attention.relative_extent", "rel_extent"),
+        ("attention.log_scale_floor", "log_scaling_n_floor"),
+    ] {
+        if let Some(v) = meta_u64(suffix) {
+            obj.insert(hf_key.to_string(), serde_json::json!(v));
+        }
+    }
+    for (suffix, hf_key) in [
+        ("expert_weights_scale", "route_scale"),
+        ("activation.situ_beta", "mlp_gate_softcap"),
+        ("activation.situ_linear_beta", "mlp_up_softcap"),
+        ("final_logit_softcapping", "final_logit_softcapping"),
+        ("attention.qk_clip", "qk_l2_clip_threshold"),
+        ("attention.relative_clip", "rel_l2_clip_threshold"),
+        ("attention.log_scale_alpha", "log_scaling_alpha"),
+    ] {
+        if let Some(v) = meta_f32(suffix)
+            && let Some(num) = serde_json::Number::from_f64(v)
+        {
+            obj.insert(hf_key.to_string(), serde_json::Value::Number(num));
+        }
+    }
+    obj.insert("tie_word_embeddings".to_string(), serde_json::json!(false));
+
+    // Loop config: normalize Unsloth (`num_loops`, `loop.core_start`, `loop.core_end`,
+    // `block_count` = logical visits) and mainline (`inkling2_loop`, `loop.count`,
+    // `loop.start`, `loop.end`, `block_count` = physical layers).
+    let block_count = meta_u64("block_count");
+    let loop_start = meta_u64("loop.start").or_else(|| meta_u64("loop.core_start"));
+    let loop_end = meta_u64("loop.end").or_else(|| meta_u64("loop.core_end"));
+    let loop_passes = meta_u64("loop.count").or_else(|| meta_u64("num_loops"));
+    let loop_gate_rank = meta_u64("loop.gate_rank");
+    let is_varloop = metadata
+        .get(&format!("{arch}.loop.varying"))
+        .and_then(|v| match v {
+            GgufMetaValue::Bool(b) => Some(*b),
+            _ => None,
+        })
+        .unwrap_or(false);
+
+    let (num_physical_layers, num_logical_layers) =
+        if let (Some(bc), Some(start), Some(end), Some(passes)) =
+            (block_count, loop_start, loop_end, loop_passes)
+            && end > start
+            && passes >= 1
+        {
+            let extra = (passes - 1).saturating_mul(end - start);
+            let (phys, logical) = if arch == "inkling2_loop" {
+                (bc, bc.saturating_add(extra))
+            } else {
+                // Unsloth writes logical visits in `block_count` (48) and physical layers in blk.0..23.
+                (bc.saturating_sub(extra), bc)
+            };
+            obj.insert("num_hidden_layers".to_string(), serde_json::json!(logical));
+            obj.insert("num_physical_layers".to_string(), serde_json::json!(phys));
+            obj.insert(
+                "loop_config".to_string(),
+                serde_json::json!({
+                    "core_start": start,
+                    "core_end": end,
+                    "num_passes": passes,
+                    "gate_rank": loop_gate_rank.unwrap_or(64),
+                    "is_varloop": is_varloop,
+                }),
+            );
+            (Some(phys as usize), Some(logical as usize))
+        } else {
+            if let Some(bc) = block_count {
+                obj.insert("num_physical_layers".to_string(), serde_json::json!(bc));
+            }
+            (
+                block_count.map(|b| b as usize),
+                block_count.map(|b| b as usize),
+            )
+        };
+
+    if let Some(GgufMetaValue::ArrayBool(pattern)) =
+        metadata.get(&format!("{arch}.attention.sliding_window_pattern"))
+    {
+        // Expand mainline physical-length pattern to full logical visit order when looped.
+        let mut full_pattern = pattern.clone();
+        if let (Some(phys), Some(logical), Some(start), Some(end), Some(passes)) = (
+            num_physical_layers,
+            num_logical_layers,
+            loop_start.map(|v| v as usize),
+            loop_end.map(|v| v as usize),
+            loop_passes.map(|v| v as usize),
+        ) && pattern.len() == phys
+            && logical > phys
+            && end <= pattern.len()
+        {
+            let mut expanded = Vec::with_capacity(logical);
+            expanded.extend_from_slice(&pattern[..start]);
+            for _ in 0..passes {
+                expanded.extend_from_slice(&pattern[start..end]);
+            }
+            expanded.extend_from_slice(&pattern[end..]);
+            full_pattern = expanded;
+        }
+        let local_ids: Vec<usize> = full_pattern
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &is_swa)| is_swa.then_some(idx))
+            .collect();
+        obj.insert(
+            "sliding_window_pattern".to_string(),
+            serde_json::json!(full_pattern),
+        );
+        obj.insert("local_layer_ids".to_string(), serde_json::json!(local_ids));
+    }
 }
 
 /// What a `quantization` config entry says about one tensor: the
@@ -3967,6 +4451,15 @@ impl SourceQuantProfile {
                 bits: 4,
                 group_size: 32,
                 mode: "mxfp4",
+                symmetric_zero_point: None,
+                layout: KQuantLayout::RowMajor,
+            }),
+            // MLX's native NVFP4 block: 4-bit E2M1 codes under a uint8 UE4M3
+            // scale per 16 values, no biases.
+            GgufTensorType::NVFP4 => Some(Self {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4",
                 symmetric_zero_point: None,
                 layout: KQuantLayout::RowMajor,
             }),
@@ -5497,6 +5990,10 @@ pub struct GgufConversionResult {
 /// in runs of 3 and CJK/kana runs before the word split.
 const JOYAI_LLM_PRE_TOKENIZER: &str = r##"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}"##;
 
+/// OpenAI GPT-4o / o200k `pre_tokenizer` regex (matching `llama-vocab.cpp`
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O`, used by `tokenizer.ggml.pre = "inkling2"` and `"gpt-4o"`).
+const GPT4O_PRE_TOKENIZER: &str = r##"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]}"##;
+
 /// The HF `tokenizer.json` of a GGUF-embedded GPT-2 BPE vocabulary, or `None`
 /// when the GGUF carries none.
 pub(crate) fn embedded_gpt2_tokenizer_json(
@@ -5564,6 +6061,11 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
         Some(GgufMetaValue::String(pre)) if pre == "joyai-llm" => {
             serde_json::from_str(JOYAI_LLM_PRE_TOKENIZER).map_err(|error| {
                 Error::from_reason(format!("joyai-llm pre-tokenizer JSON: {error}"))
+            })?
+        }
+        Some(GgufMetaValue::String(pre)) if matches!(pre.as_str(), "inkling2" | "gpt-4o") => {
+            serde_json::from_str(GPT4O_PRE_TOKENIZER).map_err(|error| {
+                Error::from_reason(format!("gpt-4o/inkling2 pre-tokenizer JSON: {error}"))
             })?
         }
         _ => serde_json::json!({
@@ -7722,9 +8224,42 @@ pub(crate) fn resolve_muse_glimmer_gguf_source(path: &Path) -> Result<Option<Pat
     resolve_native_gguf_source(path, "muse-glimmer", "Muse-Glimmer")
 }
 
+/// Resolve an Inkling2 / Inkling2-Loop GGUF directory without overriding an
+/// existing SafeTensors checkpoint. Ignores companion `mmproj-*.gguf` and
+/// `dspark-*.gguf` files in the same directory.
+pub(crate) fn resolve_inkling2_gguf_source(path: &Path) -> Result<Option<PathBuf>> {
+    resolve_native_gguf_source_matching(
+        path,
+        |meta| {
+            is_inkling2_main_gguf(meta)
+                && !meta
+                    .get("split.no")
+                    .and_then(GgufMetaValue::as_u64)
+                    .is_some_and(|no| no > 0)
+        },
+        "Inkling2",
+    )
+}
+
 fn resolve_native_gguf_source(
     path: &Path,
     architecture: &str,
+    family: &str,
+) -> Result<Option<PathBuf>> {
+    resolve_native_gguf_source_matching(
+        path,
+        |meta| {
+            meta.get("general.architecture")
+                .and_then(GgufMetaValue::as_str)
+                == Some(architecture)
+        },
+        family,
+    )
+}
+
+fn resolve_native_gguf_source_matching(
+    path: &Path,
+    matches_main: impl Fn(&HashMap<String, GgufMetaValue>) -> bool,
     family: &str,
 ) -> Result<Option<PathBuf>> {
     let is_gguf = |p: &Path| {
@@ -7752,11 +8287,7 @@ fn resolve_native_gguf_source(
         let candidate = entry.path();
         if candidate.is_file()
             && is_gguf(&candidate)
-            && parse_gguf(&candidate)?
-                .metadata
-                .get("general.architecture")
-                .and_then(GgufMetaValue::as_str)
-                == Some(architecture)
+            && matches_main(&parse_gguf(&candidate)?.metadata)
         {
             targets.push(candidate);
         }
@@ -8039,6 +8570,80 @@ fn muse_glimmer_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBu
     Ok((input, draft))
 }
 
+/// Locate an optional Inkling2 vision projector (`mmproj-*.gguf` with
+/// `clip.vision.projector_type == "inkling2v"`) beside `input`.
+/// Ignores DSpark draft GGUFs or unrelated projectors in the same directory.
+fn inkling2_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
+    let parent = input.parent().unwrap_or(Path::new("."));
+    let exact = parent.join(format!(
+        "mmproj-{}",
+        input
+            .file_name()
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Inkling2 GGUF input '{}' has no file name",
+                    input.display()
+                ))
+            })?
+            .to_string_lossy()
+    ));
+    if exact.is_file() && is_inkling2_mmproj_gguf(&parse_gguf(&exact)?.metadata) {
+        return Ok(Some(exact.canonicalize()?));
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_file()
+            && name.to_ascii_lowercase().starts_with("mmproj-")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+            && is_inkling2_mmproj_gguf(&parse_gguf(&path)?.metadata)
+        {
+            candidates.push(path.canonicalize()?);
+        }
+    }
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => {
+            let best = candidates
+                .iter()
+                .map(|path| mmproj_dtype_tier(path))
+                .min()
+                .ok_or_else(|| Error::from_reason("Inkling2 mmproj candidate list went empty"))?;
+            let mut preferred: Vec<PathBuf> = candidates
+                .iter()
+                .filter(|path| mmproj_dtype_tier(path) == best)
+                .cloned()
+                .collect();
+            if preferred.len() > 1 {
+                return Err(Error::from_reason(format!(
+                    "Ambiguous Inkling2 vision projectors beside '{}'; name the matching companion '{}'",
+                    input.display(),
+                    exact.display()
+                )));
+            }
+            Ok(preferred.pop())
+        }
+    }
+}
+
+fn inkling2_native_preflight(input: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    use super::gguf_source::{merge_split_headers, resolve_main_parts};
+    let parts = resolve_main_parts(input)?;
+    let headers = parts.iter().map(parse_gguf).collect::<Result<Vec<_>>>()?;
+    let merged = merge_split_headers(
+        &parts
+            .iter()
+            .map(PathBuf::as_path)
+            .zip(&headers)
+            .collect::<Vec<_>>(),
+    )?;
+    NativeGgufFamily::Inkling2.check_main_header(&merged, &parts[0])?;
+    let companion = inkling2_native_mmproj(&parts[0])?;
+    Ok((parts, companion))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NativeGgufFamily {
     Qwen35,
@@ -8046,6 +8651,7 @@ pub(crate) enum NativeGgufFamily {
     Clef,
     Gemma4,
     MuseGlimmer,
+    Inkling2,
 }
 
 /// Prepare a leased, small asset directory for a Muse-Glimmer GGUF target
@@ -8104,6 +8710,10 @@ impl NativeGgufFamily {
                 is_muse_glimmer_main_gguf(&header.metadata),
                 "MuseGlimmerModel.load requires a Muse-Glimmer text GGUF, not a projector, draft or another architecture",
             ),
+            Self::Inkling2 => (
+                is_inkling2_main_gguf(&header.metadata),
+                "Inkling2Model.load requires an Inkling2 text GGUF (general.architecture=inkling2 or inkling2_loop), not a vision projector, DSpark drafter, or another architecture",
+            ),
         };
         if ok {
             Ok(())
@@ -8124,6 +8734,7 @@ impl NativeGgufFamily {
             Self::Clef => "clef-v1",
             Self::Gemma4 => "gemma4-text-dtype-v2",
             Self::MuseGlimmer => "muse-glimmer-packed-v1",
+            Self::Inkling2 => "inkling2-v1",
         }
     }
 
@@ -8136,7 +8747,7 @@ impl NativeGgufFamily {
                 "tokenizer.json",
                 GGUF_SOURCE_FILE,
             ],
-            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 | Self::MuseGlimmer => {
+            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 | Self::MuseGlimmer | Self::Inkling2 => {
                 &["config.json", GGUF_SOURCE_FILE]
             }
         }
@@ -8145,8 +8756,8 @@ impl NativeGgufFamily {
 
 /// Family checks that run before any cache work: the main GGUF's architecture,
 /// required sibling assets, and the companion pick (Gemma4 media projector,
-/// Muse-Glimmer DFlash draft). Returns the canonical main parts: every part
-/// of a split qwen35 / qwen35moe GGUF, one file otherwise.
+/// Muse-Glimmer DFlash draft, Inkling2 vision projector). Returns the canonical
+/// main parts: every part of a split qwen35 / qwen35moe GGUF, one file otherwise.
 pub(crate) fn native_gguf_preflight(
     input: &Path,
     family: NativeGgufFamily,
@@ -8178,6 +8789,7 @@ pub(crate) fn native_gguf_preflight(
         NativeGgufFamily::MuseGlimmer => {
             muse_glimmer_native_preflight(input).map(|(main, companion)| (vec![main], companion))
         }
+        NativeGgufFamily::Inkling2 => inkling2_native_preflight(input),
     }
 }
 
@@ -19133,5 +19745,499 @@ mod tests {
         );
         native_gguf_unlease_in_use(&ckpt.asset_dir);
         fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn nvfp4_type_geometry_repack_and_profile() {
+        let t = GgufTensorType::from_u32(40).expect("GGML type 40 is NVFP4");
+        assert_eq!(t, GgufTensorType::NVFP4);
+        assert_eq!((t.type_size(), t.block_size(), t.name()), (36, 64, "NVFP4"));
+        assert!(t.is_quantized());
+        assert!(t.is_mlx_nvfp4_quantized());
+        assert!(!t.is_mlx_affine_quantized() && !t.is_mlx_mxfp4_quantized());
+        assert!(t.k_quant_format().is_none());
+        assert!(symmetric_zero_point(t).is_none());
+        assert!(GgufTensorType::recognized_list().contains("NVFP4(40)"));
+
+        let mut block = [0u8; 36];
+        block[0..4].copy_from_slice(&[0x38, 0x40, 0x30, 0x48]);
+        let mut expected_codes = [0u32; 64];
+        for s in 0..4 {
+            for j in 0..8 {
+                let lo = ((s * 16 + j) * 3 + 1) % 16;
+                let hi = ((s * 16 + j + 8) * 3 + 1) % 16;
+                expected_codes[s * 16 + j] = lo as u32;
+                expected_codes[s * 16 + j + 8] = hi as u32;
+                block[4 + s * 8 + j] = (lo as u8) | ((hi as u8) << 4);
+            }
+        }
+        let mut words = [0u32; 8];
+        let mut scales = [0u8; 4];
+        nvfp4_repack_block(&block, &mut words, &mut scales);
+        assert_eq!(scales, [0x38, 0x40, 0x30, 0x48]);
+        assert_eq!(unpack_lsb_codes(&words, 4, 64), expected_codes.to_vec());
+
+        // Verify load_quantized_tensor produces weight [1, 8] uint32 + scales [1, 4] uint8, no biases.
+        let info = GgufTensorInfo {
+            name: "test.weight".to_string(),
+            n_dims: 2,
+            dims: vec![64, 1],
+            tensor_type: GgufTensorType::NVFP4,
+            offset: 0,
+        };
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![info.clone()],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let loaded = load_quantized_tensor(&mut std::io::Cursor::new(&block), &gguf, &info)
+            .expect("load NVFP4 block");
+        let map: HashMap<String, MxArray> = loaded.into_iter().collect();
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key("test.biases"));
+        assert_eq!(map["test.weight"].shape().unwrap().to_vec(), vec![1, 8]);
+        assert_eq!(
+            map["test.weight"].to_uint32().unwrap().to_vec(),
+            words.to_vec()
+        );
+        assert_eq!(map["test.scales"].shape().unwrap().to_vec(), vec![1, 4]);
+        assert_eq!(map["test.scales"].dtype().unwrap(), DType::Uint8);
+        assert_eq!(map["test.scales"].to_uint8().unwrap(), scales.to_vec());
+
+        let gguf_q = source_quant_fixture(&[("blk.0.ffn_down_exps.weight", GgufTensorType::NVFP4)]);
+        let quant =
+            preserved_source_quantization(&gguf_q, false, &std::collections::BTreeSet::new())
+                .unwrap()
+                .expect("NVFP4 quantization block");
+        assert_eq!(quant["bits"], serde_json::json!(4));
+        assert_eq!(quant["group_size"], serde_json::json!(16));
+        assert_eq!(quant["mode"], serde_json::json!("nvfp4"));
+    }
+
+    #[test]
+    fn inkling2_dual_schema_config_predicates_and_tensor_mapping() {
+        // 1. Unsloth schema (`inkling2`, block_count=48, num_loops=3, core [6, 18), array head counts)
+        let mut unsloth = HashMap::new();
+        unsloth.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("inkling2".into()),
+        );
+        unsloth.insert("inkling2.block_count".into(), GgufMetaValue::Uint32(48));
+        unsloth.insert(
+            "inkling2.embedding_length".into(),
+            GgufMetaValue::Uint32(2304),
+        );
+        unsloth.insert(
+            "inkling2.attention.head_count".into(),
+            GgufMetaValue::ArrayI32(vec![24; 48]),
+        );
+        unsloth.insert(
+            "inkling2.attention.head_count_kv".into(),
+            GgufMetaValue::ArrayI32(vec![8; 48]),
+        );
+        unsloth.insert(
+            "inkling2.attention.key_length".into(),
+            GgufMetaValue::Uint32(128),
+        );
+        unsloth.insert(
+            "inkling2.attention.value_length".into(),
+            GgufMetaValue::Uint32(128),
+        );
+        unsloth.insert("inkling2.num_loops".into(), GgufMetaValue::Uint32(3));
+        unsloth.insert("inkling2.loop.core_start".into(), GgufMetaValue::Uint32(6));
+        unsloth.insert("inkling2.loop.core_end".into(), GgufMetaValue::Uint32(18));
+        unsloth.insert("inkling2.loop.gate_rank".into(), GgufMetaValue::Uint32(64));
+        unsloth.insert("inkling2.vocab_size".into(), GgufMetaValue::Uint32(201024));
+        unsloth.insert(
+            "inkling2.vocab_size_unpadded".into(),
+            GgufMetaValue::Uint32(200058),
+        );
+        let mut pat48 = vec![true; 48];
+        for g in [5, 11, 17, 23, 29, 35, 41, 47] {
+            pat48[g] = false;
+        }
+        unsloth.insert(
+            "inkling2.attention.sliding_window_pattern".into(),
+            GgufMetaValue::ArrayBool(pat48.clone()),
+        );
+
+        // 2. Mainline schema (`inkling2_loop`, block_count=24, loop.start=6, loop.end=18, loop.count=3)
+        let mut mainline = HashMap::new();
+        mainline.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("inkling2_loop".into()),
+        );
+        mainline.insert(
+            "inkling2_loop.block_count".into(),
+            GgufMetaValue::Uint32(24),
+        );
+        mainline.insert(
+            "inkling2_loop.embedding_length".into(),
+            GgufMetaValue::Uint32(2304),
+        );
+        mainline.insert(
+            "inkling2_loop.attention.head_count".into(),
+            GgufMetaValue::Uint32(24),
+        );
+        mainline.insert(
+            "inkling2_loop.attention.head_count_kv".into(),
+            GgufMetaValue::Uint32(8),
+        );
+        mainline.insert(
+            "inkling2_loop.attention.key_length".into(),
+            GgufMetaValue::Uint32(128),
+        );
+        mainline.insert(
+            "inkling2_loop.attention.value_length".into(),
+            GgufMetaValue::Uint32(128),
+        );
+        mainline.insert("inkling2_loop.loop.start".into(), GgufMetaValue::Uint32(6));
+        mainline.insert("inkling2_loop.loop.end".into(), GgufMetaValue::Uint32(18));
+        mainline.insert("inkling2_loop.loop.count".into(), GgufMetaValue::Uint32(3));
+        mainline.insert(
+            "inkling2_loop.loop.gate_rank".into(),
+            GgufMetaValue::Uint32(64),
+        );
+        mainline.insert(
+            "inkling2_loop.loop.varying".into(),
+            GgufMetaValue::Bool(false),
+        );
+        mainline.insert(
+            "inkling2_loop.vocab_size".into(),
+            GgufMetaValue::Uint32(201024),
+        );
+        mainline.insert(
+            "inkling2_loop.vocab_size_unpadded".into(),
+            GgufMetaValue::Uint32(200058),
+        );
+        let mut pat24 = vec![true; 24];
+        for g in [5, 11, 17, 23] {
+            pat24[g] = false;
+        }
+        mainline.insert(
+            "inkling2_loop.attention.sliding_window_pattern".into(),
+            GgufMetaValue::ArrayBool(pat24),
+        );
+
+        assert!(is_inkling2_main_gguf(&unsloth));
+        assert!(is_inkling2_main_gguf(&mainline));
+
+        let cfg_u = extract_config(&unsloth);
+        let cfg_m = extract_config(&mainline);
+        for field in [
+            "model_type",
+            "num_hidden_layers",
+            "num_physical_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "vocab_size",
+            "unpadded_vocab_size",
+            "loop_config",
+            "sliding_window_pattern",
+            "local_layer_ids",
+        ] {
+            assert_eq!(
+                cfg_u[field], cfg_m[field],
+                "field '{field}' differs between schemas"
+            );
+        }
+        assert_eq!(cfg_u["num_hidden_layers"], serde_json::json!(48));
+        assert_eq!(cfg_u["num_physical_layers"], serde_json::json!(24));
+        assert_eq!(cfg_u["head_dim"], serde_json::json!(128));
+        assert_eq!(cfg_u["num_attention_heads"], serde_json::json!(24));
+        assert_eq!(cfg_u["num_key_value_heads"], serde_json::json!(8));
+        assert_eq!(cfg_u["loop_config"]["core_start"], serde_json::json!(6));
+        assert_eq!(cfg_u["loop_config"]["core_end"], serde_json::json!(18));
+        assert_eq!(cfg_u["loop_config"]["num_passes"], serde_json::json!(3));
+        assert_eq!(cfg_u["loop_config"]["gate_rank"], serde_json::json!(64));
+
+        // Controller tensor names unify across Unsloth and mainline.
+        for (u_name, m_name, want) in [
+            (
+                "blk.6.loop_attn_down.weight",
+                "blk.6.loop_q_ctrl_down.weight",
+                "model.layers.6.loop_ctrl.q.down_proj.weight",
+            ),
+            (
+                "blk.6.loop_k_gain.weight",
+                "blk.6.loop_k_ctrl_gain.weight",
+                "model.layers.6.loop_ctrl.k.gain_proj.weight",
+            ),
+            (
+                "blk.6.loop_v_forget.weight",
+                "blk.6.loop_v_ctrl_forget.weight",
+                "model.layers.6.loop_ctrl.v.forget_proj.weight",
+            ),
+            (
+                "blk.6.loop_mlp_forget.weight",
+                "blk.6.loop_ffn_ctrl_forget.weight",
+                "model.layers.6.loop_ctrl.mlp.forget_proj.weight",
+            ),
+        ] {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(u_name, &unsloth).as_deref(),
+                Some(want)
+            );
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(m_name, &mainline).as_deref(),
+                Some(want)
+            );
+        }
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.6.loop_msg_query.weight", &mainline).as_deref(),
+            Some("model.layers.6.loop_msg_query.weight")
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("loop_res_query.weight", &unsloth).as_deref(),
+            Some("model.loop_res_query.weight")
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("loop_kv_res_query.weight", &unsloth).as_deref(),
+            Some("model.loop_kv_res_query.weight")
+        );
+
+        // DSpark predicate does NOT collide with Muse-Glimmer DFlash predicate.
+        let mut dspark = HashMap::new();
+        dspark.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("dflash".into()),
+        );
+        dspark.insert(
+            "dflash.dspark.markov_rank".into(),
+            GgufMetaValue::Uint32(256),
+        );
+        dspark.insert(
+            "tokenizer.ggml.pre".into(),
+            GgufMetaValue::String("inkling2".into()),
+        );
+        assert!(is_inkling2_dspark_gguf(&dspark));
+        assert!(!is_muse_glimmer_dflash_gguf(&dspark));
+    }
+
+    #[test]
+    fn inkling2_real_gguf_header_plan_and_tokenizer() {
+        let dir = PathBuf::from(
+            std::env::var("HOME")
+                .map(|h| format!("{h}/.mlx-node/models/inkling-2-mini-gguf"))
+                .unwrap_or_default(),
+        );
+        let main_path = dir.join("Inkling-2-Mini-UD-Q4_K_XL.gguf");
+        if !main_path.is_file() {
+            eprintln!(
+                "skipping real Inkling-2-Mini GGUF test ({} not found)",
+                main_path.display()
+            );
+            return;
+        }
+
+        // Directory resolution must pick the main GGUF and ignore dspark + mmproj.
+        let resolved = resolve_inkling2_gguf_source(&dir)
+            .expect("resolve inkling2 dir")
+            .expect("main GGUF found");
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            "Inkling-2-Mini-UD-Q4_K_XL.gguf"
+        );
+
+        // Preflight resolves main + optional mmproj-BF16.gguf companion.
+        let (parts, companion) = native_gguf_preflight(&resolved, NativeGgufFamily::Inkling2)
+            .expect("preflight inkling2");
+        assert_eq!(parts.len(), 1);
+        let mmproj_path = companion.expect("mmproj-BF16.gguf companion discovered");
+        assert_eq!(mmproj_path.file_name().unwrap(), "mmproj-BF16.gguf");
+
+        // Parse main header and verify NVFP4 tensors + zero remap collisions.
+        let gguf = parse_gguf(&main_path).expect("parse real Inkling-2-Mini GGUF header");
+        assert!(is_inkling2_main_gguf(&gguf.metadata));
+        assert_eq!(gguf.tensors.len(), 734);
+        let nvfp4_count = gguf
+            .tensors
+            .iter()
+            .filter(|t| t.tensor_type == GgufTensorType::NVFP4)
+            .count();
+        assert_eq!(
+            nvfp4_count, 40,
+            "layers 0..20 have 20*2=40 NVFP4 expert stacks"
+        );
+
+        let mut mapped = std::collections::BTreeSet::new();
+        for t in &gguf.tensors {
+            let hf = gguf_name_to_hf_for_metadata(&t.name, &gguf.metadata)
+                .unwrap_or_else(|| panic!("unmapped tensor {}", t.name));
+            assert!(
+                mapped.insert(hf.clone()),
+                "collision on {hf} from {}",
+                t.name
+            );
+        }
+
+        // Import plan + imported_dtypes preserve F32 on `.scale` and Uint8 on NVFP4 `.scales`.
+        let mmproj = parse_gguf(&mmproj_path).expect("parse mmproj-BF16.gguf");
+        assert!(is_inkling2_mmproj_gguf(&mmproj.metadata));
+        let (opts, main_plan, companion_plan) =
+            crate::engine::checkpoint_source::native_import_plans(
+                NativeGgufFamily::Inkling2,
+                (&main_path, &gguf),
+                Some((&mmproj_path, &mmproj)),
+            )
+            .expect("plan Inkling2 import");
+        assert!(companion_plan.is_some());
+        let cfg = main_plan.config.as_ref().expect("synthesized config");
+        assert_eq!(cfg["num_hidden_layers"], serde_json::json!(48));
+        assert_eq!(cfg["num_physical_layers"], serde_json::json!(24));
+        assert_eq!(cfg["head_dim"], serde_json::json!(128));
+        assert_eq!(cfg["num_attention_heads"], serde_json::json!(24));
+        assert_eq!(cfg["num_key_value_heads"], serde_json::json!(8));
+        assert_eq!(
+            cfg["quantization"]["language_model.model.layers.0.mlp.experts.gate_up_proj"]["mode"],
+            serde_json::json!("nvfp4")
+        );
+        assert_eq!(
+            cfg["quantization"]["language_model.model.layers.0.mlp.experts.gate_up_proj"]["group_size"],
+            serde_json::json!(16)
+        );
+        let (_, _, _, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&cfg["quantization"]), 4, 64)
+                .expect("published Inkling2 quantization block must parse");
+        assert_eq!(
+            per_layer["layers.0.mlp.experts.gate_up_proj"].mode,
+            crate::models::quant_dispatch::PerLayerMode::Nvfp4
+        );
+        assert_eq!(
+            per_layer["layers.0.mlp.experts.gate_up_proj"].group_size,
+            16
+        );
+        assert_eq!(
+            per_layer["layers.20.mlp.experts.gate_up_proj"].mode,
+            crate::models::quant_dispatch::PerLayerMode::Affine
+        );
+        assert_eq!(per_layer["layers.20.mlp.experts.gate_up_proj"].bits, 8);
+
+        let dtypes: HashMap<String, DType> =
+            crate::utils::gguf_import::imported_dtypes(&gguf, &main_plan, &opts)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            dtypes.get("model.layers.0.mlp.experts.gate_up_proj.scales"),
+            Some(&DType::Uint8)
+        );
+        assert_eq!(
+            dtypes.get("model.layers.0.mlp.experts.gate_up_proj.scale"),
+            Some(&DType::Float32),
+            "singular .scale outer scale must stay Float32, not downcast to BF16"
+        );
+        assert_eq!(
+            dtypes.get("model.layers.0.mlp.experts.down_proj.scale"),
+            Some(&DType::Float32)
+        );
+
+        // Verify mmproj and dspark headers also remap cleanly with zero collisions.
+        let mut mm_mapped = std::collections::BTreeSet::new();
+        for t in &mmproj.tensors {
+            let hf = gguf_name_to_hf_for_metadata(&t.name, &mmproj.metadata).unwrap();
+            assert!(mm_mapped.insert(hf.clone()), "mmproj collision on {hf}");
+        }
+        let dspark_path = dir.join("dspark-Inkling-2-Mini-Q8_0.gguf");
+        if dspark_path.is_file() {
+            let dspark = parse_gguf(&dspark_path).expect("parse dspark GGUF");
+            assert!(is_inkling2_dspark_gguf(&dspark.metadata));
+            assert!(!is_muse_glimmer_dflash_gguf(&dspark.metadata));
+            let mut ds_mapped = std::collections::BTreeSet::new();
+            for t in &dspark.tensors {
+                let hf = gguf_name_to_hf_for_metadata(&t.name, &dspark.metadata).unwrap();
+                assert!(ds_mapped.insert(hf.clone()), "dspark collision on {hf}");
+            }
+        }
+
+        // Embedded GPT-4o / o200k tokenizer compiles and encodes special tokens & digits.
+        let tok_json = embedded_gpt2_tokenizer_json(&gguf.metadata)
+            .expect("build embedded tokenizer JSON")
+            .expect("inkling2 GGUF embeds gpt2 tokenizer");
+        let tok = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&tok_json).unwrap())
+            .expect("compile GPT4O pre-tokenizer");
+        assert!(tok.token_to_id("<|message_user|>").is_some());
+        assert!(tok.token_to_id("<|content_thinking|>").is_some());
+        let enc = tok.encode("Hello world 123456!", false).expect("encode");
+        assert!(!enc.get_ids().is_empty());
+        assert_eq!(
+            tok.decode(enc.get_ids(), true).unwrap(),
+            "Hello world 123456!"
+        );
+    }
+
+    #[test]
+    fn inkling2_split_gguf_preflight_and_directory_resolution() {
+        use super::super::gguf_test_fixtures::build_minimal_gguf;
+
+        let dir =
+            std::env::temp_dir().join(format!("mlx-inkling2-split-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
+        let part1 = dir.join("Inkling-2-Mini-00001-of-00002.gguf");
+        let part2 = dir.join("Inkling-2-Mini-00002-of-00002.gguf");
+
+        let p1_bytes = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("inkling2".into()),
+                ),
+                ("split.no", GgufMetaValue::Uint16(0)),
+                ("split.count", GgufMetaValue::Uint16(2)),
+                ("split.tensors.count", GgufMetaValue::Int32(2)),
+            ],
+            &[(
+                "token_embd.weight",
+                &[4, 2],
+                GgufTensorType::F32,
+                &[0u8; 32],
+            )],
+        );
+        let p2_bytes = build_minimal_gguf(
+            &[
+                ("split.no", GgufMetaValue::Uint16(1)),
+                ("split.count", GgufMetaValue::Uint16(2)),
+            ],
+            &[("output_norm.weight", &[4], GgufTensorType::F32, &[0u8; 16])],
+        );
+        fs::write(&part1, p1_bytes).unwrap();
+        fs::write(&part2, p2_bytes).unwrap();
+
+        // Directory resolution finds part 1 cleanly.
+        let resolved = resolve_inkling2_gguf_source(&dir)
+            .expect("resolve split inkling2 dir")
+            .expect("part 1 resolved");
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            "Inkling-2-Mini-00001-of-00002.gguf"
+        );
+
+        // Preflight resolves both shards and merges headers cleanly.
+        let (parts, companion) = native_gguf_preflight(&part1, NativeGgufFamily::Inkling2)
+            .expect("preflight split inkling2");
+        assert_eq!(parts.len(), 2);
+        assert!(companion.is_none());
+
+        let main = crate::engine::checkpoint_source::open_gguf_main(&parts)
+            .expect("open merged split inkling2 main");
+        assert_eq!(main.header.tensors.len(), 2);
+
+        // Missing sibling shard fails preflight cleanly.
+        fs::remove_file(&part2).unwrap();
+        assert!(
+            native_gguf_preflight(&part1, NativeGgufFamily::Inkling2).is_err(),
+            "incomplete split set must fail preflight"
+        );
     }
 }

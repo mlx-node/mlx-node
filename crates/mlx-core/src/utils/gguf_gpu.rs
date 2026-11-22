@@ -25,6 +25,7 @@ pub(crate) enum GpuRepackKind {
     Iq3S,
     Q8_0,
     Mxfp4,
+    Nvfp4,
     Q4_0,
     Q5_1,
     /// Q8_0 with qwen4_exp's materialized `-128 * d` bias bank.
@@ -43,18 +44,19 @@ impl GpuRepackKind {
             Self::Iq3S => GgufTensorType::IQ3S,
             Self::Q8_0 => GgufTensorType::Q8_0,
             Self::Mxfp4 => GgufTensorType::MXFP4,
+            Self::Nvfp4 => GgufTensorType::NVFP4,
             Self::Q4_0 => GgufTensorType::Q4_0,
             Self::Q5_1 => GgufTensorType::Q5_1,
             Self::Q8_0Bias => GgufTensorType::Q8_0,
         }
     }
 
-    /// Affine and MXFP4 formats are row-major only. `Q8_0Bias` is explicit:
+    /// Affine, MXFP4 and NVFP4 formats are row-major only. `Q8_0Bias` is explicit:
     /// the ordinary importer keeps its bias-free Q8_0 route.
     pub(crate) fn is_kquant(self) -> bool {
         !matches!(
             self,
-            Self::Q4_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_0Bias | Self::Mxfp4
+            Self::Q4_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_0Bias | Self::Mxfp4 | Self::Nvfp4
         )
     }
 
@@ -80,6 +82,7 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
         GgufTensorType::IQ3S => Some(GpuRepackKind::Iq3S),
         GgufTensorType::Q8_0 => Some(GpuRepackKind::Q8_0),
         GgufTensorType::MXFP4 => Some(GpuRepackKind::Mxfp4),
+        GgufTensorType::NVFP4 => Some(GpuRepackKind::Nvfp4),
         GgufTensorType::Q4_0 => Some(GpuRepackKind::Q4_0),
         GgufTensorType::Q5_1 => Some(GpuRepackKind::Q5_1),
         _ => None,
@@ -93,6 +96,7 @@ pub(crate) fn band_offset_rule(kind: GpuRepackKind) -> usize {
     match kind {
         GpuRepackKind::Q4K | GpuRepackKind::Q5K => 16,
         GpuRepackKind::Iq4Xs => 8,
+        GpuRepackKind::Nvfp4 => 4,
         GpuRepackKind::Q6K
         | GpuRepackKind::Q3K
         | GpuRepackKind::Iq4Nl
@@ -121,6 +125,7 @@ fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> Result<i32> {
         | GpuRepackKind::Q8_0
         | GpuRepackKind::Q8_0Bias
         | GpuRepackKind::Mxfp4
+        | GpuRepackKind::Nvfp4
             if tiled =>
         {
             return Err(Error::from_reason(format!(
@@ -132,6 +137,7 @@ fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> Result<i32> {
         GpuRepackKind::Q4_0 => return Ok(16),
         GpuRepackKind::Q5_1 => return Ok(17),
         GpuRepackKind::Q8_0Bias => return Ok(18),
+        GpuRepackKind::Nvfp4 => return Ok(19),
     };
     Ok(base + i32::from(tiled))
 }
@@ -167,19 +173,24 @@ fn dst_cols(t: GgufTensorType, k: usize) -> Option<DstCols> {
             biases: Some(format.biases_cols(k)),
         });
     }
-    let words_per_block = match t {
-        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => 4,
-        GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => 5,
-        GgufTensorType::Q8_0 => 8,
+    let (words_per_block, scales_per_block) = match t {
+        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => (4, 1),
+        GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => (5, 1),
+        GgufTensorType::Q8_0 => (8, 1),
+        GgufTensorType::NVFP4 => (8, 4),
         _ => return None,
     };
     let blocks = k / t.block_size();
-    let mxfp4 = t == GgufTensorType::MXFP4;
+    let u8_scales = matches!(t, GgufTensorType::MXFP4 | GgufTensorType::NVFP4);
     Some(DstCols {
         weight: blocks * words_per_block,
-        scales: blocks,
-        scales_dtype: if mxfp4 { DType::Uint8 } else { DType::Float16 },
-        biases: (symmetric_zero_point(t).is_none() && !mxfp4).then_some(blocks),
+        scales: blocks * scales_per_block,
+        scales_dtype: if u8_scales {
+            DType::Uint8
+        } else {
+            DType::Float16
+        },
+        biases: (symmetric_zero_point(t).is_none() && !u8_scales).then_some(blocks),
     })
 }
 
@@ -365,7 +376,7 @@ pub(crate) fn gpu_repack_band(
 
 /// Every GPU kind.
 #[cfg(test)]
-const ALL_KINDS: [GpuRepackKind; 12] = [
+const ALL_KINDS: [GpuRepackKind; 13] = [
     GpuRepackKind::Q4K,
     GpuRepackKind::Q5K,
     GpuRepackKind::Q6K,
@@ -375,6 +386,7 @@ const ALL_KINDS: [GpuRepackKind; 12] = [
     GpuRepackKind::Iq3S,
     GpuRepackKind::Q8_0,
     GpuRepackKind::Mxfp4,
+    GpuRepackKind::Nvfp4,
     GpuRepackKind::Q4_0,
     GpuRepackKind::Q5_1,
     GpuRepackKind::Q8_0Bias,
@@ -395,7 +407,7 @@ mod tests {
     use crate::utils::gguf_kquant::{KQuantScales, repack_kquant};
     use std::collections::HashMap;
 
-    const KINDS: [GpuRepackKind; 12] = ALL_KINDS;
+    const KINDS: [GpuRepackKind; 13] = ALL_KINDS;
 
     /// On macOS the GPU path must be there; elsewhere the GPU tests skip.
     fn require_gpu() -> bool {
@@ -650,12 +662,13 @@ mod tests {
         );
     }
 
-    /// Row lengths with odd block counts included (288 = 9 blocks of 32).
+    /// Row lengths with odd block counts included (288 = 9 blocks of 32,
+    /// 192 = 3 blocks of 64).
     fn row_lengths(kind: GpuRepackKind) -> &'static [usize] {
-        if kind.gguf_type().block_size() == 32 {
-            &[256, 288, 768, 5120]
-        } else {
-            &[256, 768, 5120]
+        match kind.gguf_type().block_size() {
+            32 => &[256, 288, 768, 5120],
+            64 => &[128, 192, 256, 768, 5120],
+            _ => &[256, 768, 5120],
         }
     }
 
@@ -1564,6 +1577,94 @@ mod tests {
                 "{ty:?} Tiled64"
             );
         }
+
+        // NVFP4 3-D MoE stack `[E, N, K]` (K must be a multiple of 64).
+        let nvfp4_info = GgufTensorInfo {
+            name: "blk.0.ffn_down_exps.weight".to_string(),
+            n_dims: 3,
+            dims: vec![128, 5, 4],
+            tensor_type: GgufTensorType::NVFP4,
+            offset: 0,
+        };
+        let (dst, ptrs) = RepackDst::alloc(&nvfp4_info, OutLayout::RowMajor).unwrap();
+        assert_eq!((ptrs.rows, ptrs.k), (20, 128));
+        assert_eq!(dst.weight.shape().unwrap().to_vec(), vec![4, 5, 16]);
+        assert_eq!(dst.weight.dtype().unwrap(), DType::Uint32);
+        let s = dst.scales.as_ref().unwrap();
+        assert_eq!(s.shape().unwrap().to_vec(), vec![4, 5, 8]);
+        assert_eq!(s.dtype().unwrap(), DType::Uint8);
+        assert!(dst.biases.is_none());
+        assert!(RepackDst::alloc(&nvfp4_info, OutLayout::Tiled64).is_err());
+    }
+
+    #[test]
+    fn gpu_nvfp4_row_and_3d_moe_match_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Nvfp4);
+        bands_of_one_staging(
+            GpuRepackKind::Nvfp4,
+            OutLayout::RowMajor,
+            &[3, 5, 1],
+            192,
+            4,
+        );
+
+        // 3D MoE stack [E=4, N=7, K=128] repacked in two bands matches CPU `load_quantized_tensor`.
+        let (e, n, k) = (4usize, 7usize, 128usize);
+        let rows = e * n;
+        let rb = row_bytes(GpuRepackKind::Nvfp4, k);
+        let blocks = random_bytes(rows * rb, 4040);
+        let info = GgufTensorInfo {
+            name: "blk.0.ffn_gate_up_exps.weight".to_string(),
+            n_dims: 3,
+            dims: vec![k as u64, n as u64, e as u64],
+            tensor_type: GgufTensorType::NVFP4,
+            offset: 0,
+        };
+        let staging = staging_with(&blocks, 4, 99);
+        let (mut dst, _) = RepackDst::alloc(&info, OutLayout::RowMajor).unwrap();
+        let mut row0 = 0usize;
+        for band in [11usize, 17usize] {
+            let off = 4 + row0 * rb;
+            dst = gpu_repack_band(
+                &staging,
+                off as u64,
+                GpuRepackKind::Nvfp4,
+                OutLayout::RowMajor,
+                k as u32,
+                row0 as u32,
+                band as u32,
+                dst,
+            )
+            .unwrap();
+            row0 += band;
+        }
+        assert_eq!(row0, rows);
+        assert_eq!(dst.weight.shape().unwrap().to_vec(), vec![4, 7, 16]);
+        assert_eq!(
+            dst.scales.as_ref().unwrap().shape().unwrap().to_vec(),
+            vec![4, 7, 8]
+        );
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![info.clone()],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let want = load_quantized_tensor(&mut std::io::Cursor::new(&blocks), &gguf, &info).unwrap();
+        let (_, want_w) = want.iter().find(|(nm, _)| nm.ends_with(".weight")).unwrap();
+        let (_, want_s) = want.iter().find(|(nm, _)| nm.ends_with(".scales")).unwrap();
+        MxArray::eval_arrays_with_context(&[want_w, want_s], "nvfp4 3d oracle").unwrap();
+        let want_bytes = Bytes {
+            weight: want_w.to_uint32().unwrap().to_vec(),
+            scales: scale_bytes(want_s),
+            biases: Vec::new(),
+        };
+        assert_same(&read(&dst), &want_bytes, "Nvfp4 3D MoE [4, 7, 128]");
     }
 }
 

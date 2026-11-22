@@ -1,12 +1,14 @@
 /// <reference types="node" />
 
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   DeepseekV41Model,
   detectModelType,
+  Inkling2Model,
   loadModel,
   MuseGlimmerModel,
   Qwen35Model,
@@ -122,7 +124,7 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, expect.objectContaining({ activations: 'auto' }));
     const gemma = await writeStandaloneGguf('gemma4');
     await expect(loadModel(gemma.modelPath, { activations: 'auto' })).rejects.toThrow(
-      'only supported by qwen3_5 and qwen3_5_moe',
+      'only supported by qwen3_5, qwen3_5_moe and inkling2',
     );
   });
 
@@ -134,7 +136,7 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { kvFormat: 'int8' });
     const gemma = await writeStandaloneGguf('gemma4');
     await expect(loadModel(gemma.modelPath, { kvFormat: 'int8' })).rejects.toThrow(
-      'only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+      'only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2',
     );
   });
 
@@ -161,7 +163,7 @@ describe('standalone GGUF model detection', () => {
     });
     const other = await writeStandaloneGguf('deepseek41');
     await expect(loadModel(other.modelPath, { maxMemoryBytes: 1_024 })).rejects.toThrow(
-      'maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+      'maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2',
     );
   });
 
@@ -183,7 +185,7 @@ describe('standalone GGUF model detection', () => {
     expect(flashNextSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { maxContextTokens: 102_400 });
     const other = await writeStandaloneGguf('deepseek41');
     await expect(loadModel(other.modelPath, { maxContextTokens: 102_400 })).rejects.toThrow(
-      'maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+      'maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2',
     );
   });
 
@@ -198,7 +200,7 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { cacheDir: '/var/cache/mlx' });
     const gemma = await writeStandaloneGguf('gemma4');
     await expect(loadModel(gemma.modelPath, { cacheDisk: '0' })).rejects.toThrow(
-      'cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+      'cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2',
     );
   });
 
@@ -295,5 +297,92 @@ describe('standalone GGUF model detection', () => {
   it('rejects an unsupported standalone architecture instead of guessing a family', async () => {
     const { modelPath } = await writeStandaloneGguf('llama');
     await expect(detectModelType(modelPath)).rejects.toThrow('Unsupported GGUF architecture "llama"');
+  });
+
+  it.each(['inkling2', 'inkling2_loop'] as const)(
+    'detects %s GGUF, keeps auto-discovery soft, honors autoLoadDraft:false, and forwards explicit draftModelPath',
+    async (arch) => {
+      const { root, modelPath } = await writeStandaloneGguf(arch);
+      await expect(detectModelType(modelPath)).resolves.toBe('inkling2');
+
+      const dsparkPath = join(root, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+      await writeFile(
+        dsparkPath,
+        Buffer.concat([
+          Buffer.from('GGUF'),
+          u32(3),
+          u64(0),
+          u64(4),
+          ggufString('general.architecture'),
+          u32(8),
+          ggufString('dflash'),
+          ggufString('dflash.dspark.markov_rank'),
+          u32(4),
+          u32(256),
+          ggufString('tokenizer.ggml.pre'),
+          u32(8),
+          ggufString('inkling2'),
+          ggufString('dflash.target_layers'),
+          u32(9),
+          u32(4),
+          u64(4),
+          u32(5),
+          u32(23),
+          u32(41),
+          u32(48),
+        ]),
+      );
+
+      const loaded = {} as Inkling2Model;
+      const loadSpy = vi.spyOn(Inkling2Model, 'load').mockResolvedValue(loaded);
+      // Automatic mode delegates DSpark discovery to Rust (soft fallback on bad drafts)
+      // instead of elevating the candidate to an explicit `draftModelPath`.
+      await expect(loadModel(modelPath)).resolves.toBe(loaded);
+      expect(loadSpy).toHaveBeenLastCalledWith(
+        modelPath,
+        supportsAutomaticDFlash2('inkling2') ? null : { autoLoadDraft: false },
+      );
+
+      // Explicit `draftModelPath` is forwarded verbatim for strict native validation.
+      await loadModel(modelPath, { draftModelPath: dsparkPath });
+      expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: dsparkPath });
+
+      // `autoLoadDraft: false` propagates to Rust so native discovery stays disabled.
+      await loadModel(modelPath, {
+        autoLoadDraft: false,
+        kvFormat: 'bf16',
+        maxMemoryBytes: 32_000_000_000,
+        maxContextTokens: 131_072,
+        decodeShare: 0.5,
+        activations: 'auto',
+        cacheDisk: '16G',
+        cacheDir: '/tmp/inkling-cache',
+      });
+      expect(loadSpy).toHaveBeenLastCalledWith(modelPath, {
+        autoLoadDraft: false,
+        kvFormat: 'bf16',
+        maxMemoryBytes: 32_000_000_000,
+        maxContextTokens: 131_072,
+        decodeShare: 0.5,
+        activations: 'auto',
+        cacheDisk: '16G',
+        cacheDir: '/tmp/inkling-cache',
+      });
+    },
+  );
+
+  it('detects ~/.mlx-node/models/inkling-2-mini-gguf as inkling2 and delegates auto-draft cleanly', async () => {
+    const modelDir = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini-gguf');
+    const modelPath = join(modelDir, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+    const expectedDraft = join(modelDir, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+    if (!existsSync(modelPath) || !existsSync(expectedDraft)) return;
+
+    await expect(detectModelType(modelPath)).resolves.toBe('inkling2');
+    const loadSpy = vi.spyOn(Inkling2Model, 'load').mockResolvedValue({} as Inkling2Model);
+    await loadModel(modelPath);
+    expect(loadSpy).toHaveBeenLastCalledWith(
+      modelPath,
+      supportsAutomaticDFlash2('inkling2') ? null : { autoLoadDraft: false },
+    );
   });
 });

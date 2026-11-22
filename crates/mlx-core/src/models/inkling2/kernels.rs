@@ -1,0 +1,2956 @@
+//! Safe Rust wrappers for Inkling-2-Mini Metal `Custom` primitives:
+//! - `inkling2_paged_attention` (INT8 32-token KTM & BF16 vLLM, relative bias + natural-log LSE, varlen)
+//! - `inkling2_paged_prefill_attention` (in-place G=3 D=128 MPP prefill with SWA skip, zero-bias `q8q` fast path, portable fallback)
+//! - `inkling2_gate_sink` (`O * sigmoid(gate) * sigmoid(lse - sink)`)
+//! - `inkling2_situ` (SiTU activation with optional per-expert `outer_scale`)
+//! - `inkling2_loop_blend_rms_norm` (FP32 no-FMA loop blend + sublayer RMSNorm)
+//! - `inkling2_sconv_k4` (static & dynamic global causal k=4 ShortConv returning `(y, history_out)`)
+
+use napi::bindgen_prelude::{Error, Result};
+
+use crate::array::{DType, MxArray};
+
+/// On-cache KV dtype wire code (matches `mlx_paged_ops.h::KvDtype`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Inkling2KvDtype {
+    Bf16 = 1,
+    Int8 = 3,
+}
+
+/// Returns true when the G=3, D=128 Inkling2 in-place MPP prefill pipelines build on this GPU.
+pub fn inkling2_paged_prefill_mpp_supported() -> bool {
+    // SAFETY: nullary FFI query that catches internally.
+    unsafe { mlx_sys::mlx_inkling2_paged_prefill_mpp_supported() }
+}
+
+/// Inkling-2-Mini varlen relative-bias + natural-log LSE paged attention (head_size = 128).
+///
+/// Supports INT8 32-token KTM (`k_pool [nb, H_kv, 32, 128]`, `v_pool [nb, H_kv, 128, 32]`,
+/// `k_scale/v_scale [nb, H_kv, 32]`) and BF16 vLLM (`k_pool [nb, H_kv, 16, bs, 8]`,
+/// `v_pool [nb, H_kv, 128, bs]`, `bs` in `{16, 32}`).
+///
+/// Returns `(out [total_q, num_q_heads, 128] bf16, lse [total_q, num_q_heads] f32)`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_paged_attention(
+    q: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    block_table: &MxArray,
+    seq_lens: &MxArray,
+    cu_seqlens_q: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    rel_bias: Option<&MxArray>,
+    scale: f32,
+    sliding_window: i32,
+    rel_extent: i32,
+    block_size: i32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_size: i32,
+    kv_dtype: Inkling2KvDtype,
+    score_scales: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_attn = std::ptr::null_mut();
+    let mut out_lse = std::ptr::null_mut();
+    // SAFETY: all input pointers are live `MxArray` handles; optional pointers may be null.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_paged_attention_forward(
+            q.as_raw_ptr(),
+            k_pool.as_raw_ptr(),
+            v_pool.as_raw_ptr(),
+            block_table.as_raw_ptr(),
+            seq_lens.as_raw_ptr(),
+            cu_seqlens_q.as_raw_ptr(),
+            k_scale.as_raw_ptr(),
+            v_scale.as_raw_ptr(),
+            rel_bias.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            scale,
+            sliding_window,
+            rel_extent,
+            block_size,
+            num_q_heads,
+            num_kv_heads,
+            head_size,
+            kv_dtype as u8,
+            score_scales.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            &mut out_attn,
+            &mut out_lse,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_paged_attention_forward failed (invalid contract or Metal unavailable)",
+        ));
+    }
+    let attn = MxArray::from_handle(out_attn, "inkling2_paged_attention.out")?;
+    let lse = MxArray::from_handle(out_lse, "inkling2_paged_attention.lse")?;
+    Ok((attn, lse))
+}
+
+/// Inkling-2-Mini in-place MPP paged prefill / verify attention (G=3, D=128) with SWA page skip,
+/// relative bias + zero-bias fast path (including `q8q` INT8 queries on Apple10/M5+),
+/// and portable non-MPP fallback.
+///
+/// Returns `(out [rows, num_q_heads, 128] bf16, lse [rows, num_q_heads] f32, workspace')`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_paged_prefill_attention(
+    q: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    block_table: &MxArray,
+    workspace: &MxArray,
+    rel_bias: Option<&MxArray>,
+    committed_tokens: i32,
+    splits: i32,
+    max_splits: i32,
+    block_size: i32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_size: i32,
+    sliding_window: i32,
+    rel_extent: i32,
+    kv_dtype: Inkling2KvDtype,
+    int8_queries: bool,
+    scale: f32,
+) -> Result<(MxArray, MxArray, MxArray)> {
+    let mut out_attn = std::ptr::null_mut();
+    let mut out_lse = std::ptr::null_mut();
+    let mut out_ws = std::ptr::null_mut();
+    // SAFETY: all input pointers are live `MxArray` handles; `rel_bias` may be null.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_paged_prefill_attention_forward(
+            q.as_raw_ptr(),
+            k_pool.as_raw_ptr(),
+            v_pool.as_raw_ptr(),
+            k_scale.as_raw_ptr(),
+            v_scale.as_raw_ptr(),
+            block_table.as_raw_ptr(),
+            workspace.as_raw_ptr(),
+            rel_bias.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            committed_tokens,
+            splits,
+            max_splits,
+            block_size,
+            num_q_heads,
+            num_kv_heads,
+            head_size,
+            sliding_window,
+            rel_extent,
+            kv_dtype as u8,
+            int8_queries,
+            scale,
+            &mut out_attn,
+            &mut out_lse,
+            &mut out_ws,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_paged_prefill_attention_forward failed",
+        ));
+    }
+    let attn = MxArray::from_handle(out_attn, "inkling2_paged_prefill.out")?;
+    let lse = MxArray::from_handle(out_lse, "inkling2_paged_prefill.lse")?;
+    let ws = MxArray::from_handle(out_ws, "inkling2_paged_prefill.workspace")?;
+    Ok((attn, lse, ws))
+}
+
+/// Fused Inkling2 gate + sink epilogue: `Y = O * sigmoid(gate) * sigmoid(lse - sink)`.
+pub fn inkling2_gate_sink(
+    o: &MxArray,
+    gate: &MxArray,
+    lse: &MxArray,
+    sink: &MxArray,
+) -> Result<MxArray> {
+    // SAFETY: all input pointers are live `MxArray` handles.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_gate_sink(
+            o.as_raw_ptr(),
+            gate.as_raw_ptr(),
+            lse.as_raw_ptr(),
+            sink.as_raw_ptr(),
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_gate_sink")
+}
+
+/// Fused Inkling2 SiTU activation: `softcap(gate * s, gate_cap) * sigmoid(gate * s) * softcap(up * s, up_cap)`
+/// with optional per-expert `outer_scale[expert_indices]`.
+pub fn inkling2_situ(
+    gate_up: &MxArray,
+    outer_scale: Option<(&MxArray, &MxArray)>,
+    gate_softcap: f32,
+    up_softcap: f32,
+    interleaved: bool,
+) -> Result<MxArray> {
+    let (scale_ptr, idx_ptr) = match outer_scale {
+        Some((s, i)) => (s.as_raw_ptr(), i.as_raw_ptr()),
+        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+    };
+    // SAFETY: input handles are live; optional pointers are paired null or non-null.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_situ(
+            gate_up.as_raw_ptr(),
+            scale_ptr,
+            idx_ptr,
+            gate_softcap,
+            up_softcap,
+            interleaved,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_situ")
+}
+
+/// Fused Inkling2 FP32 no-FMA loop blend `(1 - tanh(forget)) * dest + tanh(gain) * msg`
+/// followed by sublayer RMSNorm -> `out_dtype` (`BFloat16` or `Float32`).
+pub fn inkling2_loop_blend_rms_norm(
+    dest: &MxArray,
+    msg: &MxArray,
+    gain_raw: &MxArray,
+    forget_raw: &MxArray,
+    norm_weight: &MxArray,
+    eps: f32,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_loop_blend_rms_norm: unsupported out_dtype {other:?}"
+            )));
+        }
+    };
+    // SAFETY: all input pointers are live `MxArray` handles.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_loop_blend_rms_norm(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            gain_raw.as_raw_ptr(),
+            forget_raw.as_raw_ptr(),
+            norm_weight.as_raw_ptr(),
+            eps,
+            output_f32,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_loop_blend_rms_norm")
+}
+
+/// Fused Inkling2 causal k=4 ShortConv (static when `dyn_taps` is `None`, dynamic global when `Some`).
+/// Returns `(y [T, C], updated_history [3, C])`.
+pub fn inkling2_sconv_k4(
+    x: &MxArray,
+    weight: &MxArray,
+    history_in: &MxArray,
+    dyn_taps: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_y = std::ptr::null_mut();
+    let mut out_hist = std::ptr::null_mut();
+    // SAFETY: all input pointers are live; `dyn_taps` may be null.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_sconv_k4(
+            x.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            history_in.as_raw_ptr(),
+            dyn_taps.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            &mut out_y,
+            &mut out_hist,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_sconv_k4 failed"));
+    }
+    let y = MxArray::from_handle(out_y, "inkling2_sconv_k4.y")?;
+    let hist = MxArray::from_handle(out_hist, "inkling2_sconv_k4.history")?;
+    Ok((y, hist))
+}
+
+/// Fused Inkling2 strided Q & R L2-clip + optional global `tau` -> `(Q [T, H, D], R [T, H, d_rel] F32)`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_qr_clip(
+    q_in: &MxArray,
+    r_in: &MxArray,
+    q_clip: &MxArray,
+    rel_clip: &MxArray,
+    tau: Option<&MxArray>,
+    num_heads: usize,
+    head_dim: usize,
+    d_rel: usize,
+    qk_thresh: f32,
+    rel_thresh: f32,
+    eps: f32,
+    q_out_dtype: DType,
+    r_round_bf16: bool,
+) -> Result<(MxArray, MxArray)> {
+    let output_f32 = match q_out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_qr_clip: unsupported q_out_dtype {other:?}"
+            )));
+        }
+    };
+    let mut out_q = std::ptr::null_mut();
+    let mut out_r = std::ptr::null_mut();
+    // SAFETY: all input handles are live; `tau` may be null.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_qr_clip(
+            q_in.as_raw_ptr(),
+            r_in.as_raw_ptr(),
+            q_clip.as_raw_ptr(),
+            rel_clip.as_raw_ptr(),
+            tau.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            num_heads as u32,
+            head_dim as u32,
+            d_rel as u32,
+            qk_thresh,
+            rel_thresh,
+            eps,
+            output_f32,
+            r_round_bf16,
+            &mut out_q,
+            &mut out_r,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_qr_clip failed"));
+    }
+    let q = MxArray::from_handle(out_q, "inkling2_qr_clip.q")?;
+    let r = MxArray::from_handle(out_r, "inkling2_qr_clip.r")?;
+    Ok((q, r))
+}
+
+/// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm.
+///
+/// Supports 1..=4 unstacked `[3, kv_dim]` histories per stream (zero `stack` overhead!) or
+/// packed `[N, 3, kv_dim]` histories when `packed_hist == true`.
+/// Returns `(k_cur [T, H_kv, head_dim], v_cur [T, H_kv, head_dim], k_hist_out, v_hist_out)`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_sconv_k4_kv_prep(
+    k_in: &MxArray,
+    v_in: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    k_hists: &[&MxArray],
+    v_hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+    num_kv_heads: usize,
+    head_dim: usize,
+    qk_thresh: f32,
+    v_eps: f32,
+    l2_eps: f32,
+) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+    let expected_h = if packed_hist { 1 } else { num_seqs };
+    if num_seqs == 0 || k_hists.len() != expected_h || v_hists.len() != expected_h {
+        return Err(Error::from_reason(
+            "inkling2_sconv_k4_kv_prep: history slice count mismatch",
+        ));
+    }
+    let k_ptrs: Vec<*mut mlx_sys::mlx_array> = k_hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let v_ptrs: Vec<*mut mlx_sys::mlx_array> = v_hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let mut out_k = std::ptr::null_mut();
+    let mut out_v = std::ptr::null_mut();
+    let mut out_kh = std::ptr::null_mut();
+    let mut out_vh = std::ptr::null_mut();
+    // SAFETY: all input pointers live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_sconv_k4_kv_prep(
+            k_in.as_raw_ptr(),
+            v_in.as_raw_ptr(),
+            k_weight.as_raw_ptr(),
+            v_weight.as_raw_ptr(),
+            dyn_k.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            dyn_v.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            cu_seqlens.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            k_ptrs.as_ptr(),
+            v_ptrs.as_ptr(),
+            num_seqs as u32,
+            packed_hist,
+            num_kv_heads as u32,
+            head_dim as u32,
+            qk_thresh,
+            v_eps,
+            l2_eps,
+            &mut out_k,
+            &mut out_v,
+            &mut out_kh,
+            &mut out_vh,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_sconv_k4_kv_prep failed"));
+    }
+    Ok((
+        MxArray::from_handle(out_k, "inkling2_sconv_k4_kv_prep.k")?,
+        MxArray::from_handle(out_v, "inkling2_sconv_k4_kv_prep.v")?,
+        MxArray::from_handle(out_kh, "inkling2_sconv_k4_kv_prep.k_hist")?,
+        MxArray::from_handle(out_vh, "inkling2_sconv_k4_kv_prep.v_hist")?,
+    ))
+}
+
+/// Fused Inkling2 Block AttnRes over `1..=8` source `[T, D]` tensors (+ optional `addend` on last
+/// source) with `queries [Q, D]` FP32 and optional fused sublayer RMSNorm (`norm_weight`).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_block_attn_res(
+    sources: &[&MxArray],
+    addend: Option<&MxArray>,
+    queries: &MxArray,
+    norm_weight: Option<&MxArray>,
+    attn_res_eps: f32,
+    norm_eps: f32,
+    squeeze_q1: bool,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    if sources.is_empty() || sources.len() > 8 {
+        return Err(Error::from_reason(format!(
+            "inkling2_block_attn_res: expected 1..=8 sources, got {}",
+            sources.len()
+        )));
+    }
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_block_attn_res: unsupported out_dtype {other:?}"
+            )));
+        }
+    };
+    let mut ptrs = [std::ptr::null_mut(); 8];
+    for (i, s) in sources.iter().enumerate() {
+        ptrs[i] = s.as_raw_ptr();
+    }
+    // SAFETY: `ptrs[..sources.len()]` and optional pointers are valid live handles.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_block_attn_res(
+            ptrs.as_ptr(),
+            sources.len() as u32,
+            addend.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            queries.as_raw_ptr(),
+            norm_weight.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            attn_res_eps,
+            norm_eps,
+            squeeze_q1,
+            output_f32,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_block_attn_res")
+}
+
+/// Fused Inkling2 `[rms_norm(dest, eps), rms_norm(msg, eps)]` -> `[T, 2*D]` or `[S, T, 2*D]`.
+pub fn inkling2_pair_rms_norm(
+    dest: &MxArray,
+    msg: &MxArray,
+    eps: f32,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_pair_rms_norm: unsupported out_dtype {other:?} (expected Float32 or BFloat16)"
+            )));
+        }
+    };
+    // SAFETY: both handles are live.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_pair_rms_norm(dest.as_raw_ptr(), msg.as_raw_ptr(), eps, output_f32)
+    };
+    MxArray::from_handle(ptr, "inkling2_pair_rms_norm")
+}
+
+/// Coalesced exact-FP32 MoE router projection `x [T, D] (BF16/F32) @ weight^T [D, E] (F32) -> [T, E] F32`.
+/// Avoids MLX's slow M=8/32 64x64-padded FP32 `steel_matmul` on small-M decode/verify!
+pub fn inkling2_moe_router_proj(x: &MxArray, weight_f32: &MxArray) -> Result<MxArray> {
+    // SAFETY: both handles are live.
+    let ptr =
+        unsafe { mlx_sys::mlx_inkling2_moe_router_proj(x.as_raw_ptr(), weight_f32.as_raw_ptr()) };
+    MxArray::from_handle(ptr, "inkling2_moe_router_proj")
+}
+
+/// Fused Inkling2 multi-sequence ragged causal k=4 ShortConv with optional FP32 residual epilogue
+/// (`res_a` + optional `res_b` + `conv_out`).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_sconv_k4_ragged(
+    x: &MxArray,
+    weight: &MxArray,
+    dyn_taps: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    res_a: Option<&MxArray>,
+    res_b: Option<&MxArray>,
+    hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+) -> Result<(MxArray, MxArray)> {
+    let expected_h = if packed_hist { 1 } else { num_seqs };
+    if num_seqs == 0 || hists.len() != expected_h {
+        return Err(Error::from_reason(
+            "inkling2_sconv_k4_ragged: history slice count mismatch",
+        ));
+    }
+    let h_ptrs: Vec<*mut mlx_sys::mlx_array> = hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let mut out_y = std::ptr::null_mut();
+    let mut out_hist = std::ptr::null_mut();
+    // SAFETY: all input pointers live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_sconv_k4_ragged(
+            x.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            dyn_taps.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            cu_seqlens.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            res_a.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            res_b.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            h_ptrs.as_ptr(),
+            num_seqs as u32,
+            packed_hist,
+            &mut out_y,
+            &mut out_hist,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_sconv_k4_ragged failed"));
+    }
+    let y = MxArray::from_handle(out_y, "inkling2_sconv_k4_ragged.y")?;
+    let h = MxArray::from_handle(out_hist, "inkling2_sconv_k4_ragged.history")?;
+    Ok((y, h))
+}
+
+/// Fused Inkling2 MoE router: `sigmoid(logits) + bias` -> exact top-K (`int32`) with smaller-index
+/// tie-break -> normalized weights `* route_scale` (with optional `down_scale` folded in!).
+pub fn inkling2_moe_route(
+    logits: &MxArray,
+    bias: Option<&MxArray>,
+    down_scale: Option<&MxArray>,
+    top_k: usize,
+    route_scale: f32,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_idx = std::ptr::null_mut();
+    let mut out_w = std::ptr::null_mut();
+    // SAFETY: all input pointers are live; optional pointers may be null.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_moe_route(
+            logits.as_raw_ptr(),
+            bias.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            down_scale.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            top_k as u32,
+            route_scale,
+            &mut out_idx,
+            &mut out_w,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_moe_route failed"));
+    }
+    let indices = MxArray::from_handle(out_idx, "inkling2_moe_route.indices")?;
+    let weights = MxArray::from_handle(out_w, "inkling2_moe_route.weights")?;
+    Ok((indices, weights))
+}
+
+/// Fused Inkling2 MoE combine: optional `inv_order` unsort + FP32 weighted sum -> `[T, D]`.
+pub fn inkling2_moe_combine(
+    down_out: &MxArray,
+    weights: &MxArray,
+    inv_order: Option<&MxArray>,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_moe_combine: unsupported out_dtype {other:?}"
+            )));
+        }
+    };
+    // SAFETY: all input pointers are live; `inv_order` may be null.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_moe_combine(
+            down_out.as_raw_ptr(),
+            weights.as_raw_ptr(),
+            inv_order.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            output_f32,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_moe_combine")
+}
+
+/// Fused Inkling2 vocab slice `[:out_cols]` + optional bias + `cap * tanh(x / cap)` -> `[T, out_cols]` F32.
+pub fn inkling2_lm_head_softcap(
+    logits: &MxArray,
+    bias: Option<&MxArray>,
+    out_cols: usize,
+    softcap: f32,
+    bias_round_bf16: bool,
+) -> Result<MxArray> {
+    // SAFETY: all input pointers are live; `bias` may be null.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_lm_head_softcap(
+            logits.as_raw_ptr(),
+            bias.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            out_cols as u32,
+            softcap,
+            bias_round_bf16,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_lm_head_softcap")
+}
+
+/// Fused Inkling2 vocab slice `[:out_cols]` + optional bias + `cap * tanh(x / cap)` + 2-stage
+/// GPU argmax -> `[T]` Int32 (zero `[T, V]` logits DRAM write!).
+pub fn inkling2_lm_head_softcap_argmax(
+    logits: &MxArray,
+    bias: Option<&MxArray>,
+    out_cols: usize,
+    softcap: f32,
+    bias_round_bf16: bool,
+) -> Result<MxArray> {
+    // SAFETY: all input pointers are live; `bias` may be null.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_lm_head_softcap_argmax(
+            logits.as_raw_ptr(),
+            bias.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            out_cols as u32,
+            softcap,
+            bias_round_bf16,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_lm_head_softcap_argmax")
+}
+
+/// Fused Inkling2 DSpark Markov RNN gate (`[N, 3*R]` + optional `[N, 3*R]` ctx + `[N, R]` state)
+/// -> `(next_state [N, R] BF16, latent [N, R] BF16)`.
+pub fn inkling2_markov_gate(
+    raw: &MxArray,
+    ctx: Option<&MxArray>,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_state = std::ptr::null_mut();
+    let mut out_latent = std::ptr::null_mut();
+    // SAFETY: all input pointers are live; `ctx` may be null; output pointers are valid stack locals.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_markov_gate(
+            raw.as_raw_ptr(),
+            ctx.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            state.as_raw_ptr(),
+            &mut out_state,
+            &mut out_latent,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("mlx_inkling2_markov_gate failed"));
+    }
+    let next_state = MxArray::from_handle(out_state, "inkling2_markov_gate.next_state")?;
+    let latent = MxArray::from_handle(out_latent, "inkling2_markov_gate.latent")?;
+    Ok((next_state, latent))
+}
+
+/// Check whether Inkling2 grouped/fused NVFP4/Q8_0 MoE Metal kernels are available for `rows`.
+pub fn inkling2_grouped_moe_available(rows: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        u32::try_from(rows).is_ok_and(|r| unsafe { mlx_sys::mlx_inkling2_grouped_moe_available(r) })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = rows;
+        false
+    }
+}
+
+/// Grouped/fused Inkling2 NVFP4 (`group_size=16`, `uint8` E4M3 scales + optional F32 `[E]`
+/// `gu_outer_scale`) or Q8_0 affine (`group_size=32`, BF16/F32 scales & biases) MoE forward.
+///
+/// Executes:
+/// - `T == 1`: zero-gather fused `m1_gate_up_situ` -> `m1_down_combine` (2 dispatches!)
+/// - `T >= 2`: GPU `group` -> indirect `gather` -> indirect hybrid SIMD/NAX `gate_up+SiTU`
+///   -> indirect hybrid SIMD/NAX `down` -> `combine` (zero host sync, reads each active expert ONCE!).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_grouped_moe(
+    x: &MxArray,
+    top_k_indices: &MxArray,
+    gamma: &MxArray,
+    gu_w: &MxArray,
+    gu_s: &MxArray,
+    gu_aux: Option<&MxArray>,
+    dn_w: &MxArray,
+    dn_s: &MxArray,
+    dn_aux: Option<&MxArray>,
+    is_q8: bool,
+    gate_softcap: f32,
+    up_softcap: f32,
+    round_bf16_before_situ: bool,
+) -> Result<MxArray> {
+    // SAFETY: all non-null array handles are valid and live for the duration of the FFI call.
+    let ptr = unsafe {
+        mlx_sys::mlx_inkling2_grouped_moe(
+            x.as_raw_ptr(),
+            top_k_indices.as_raw_ptr(),
+            gamma.as_raw_ptr(),
+            gu_w.as_raw_ptr(),
+            gu_s.as_raw_ptr(),
+            gu_aux.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            dn_w.as_raw_ptr(),
+            dn_s.as_raw_ptr(),
+            dn_aux.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            is_q8,
+            gate_softcap,
+            up_softcap,
+            round_bf16_before_situ,
+        )
+    };
+    MxArray::from_handle(ptr, "inkling2_grouped_moe")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::models::inkling2::attn_res::apply_sublayer_rms_norm;
+    use crate::models::inkling2::moe::situ_activation;
+    use crate::models::inkling2::short_conv::{dynamic_short_conv, static_short_conv};
+    use crate::nn::Activations;
+    use mlx_paged_attn::metal::MetalDtype;
+    use mlx_paged_attn::prefill_plan::{self, Pass};
+    use mlx_paged_attn::{LayerKVPool, PageLayout, PagedAttentionConfig};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            (z >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+        fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+            (0..n).map(|_| self.next_f32() * scale).collect()
+        }
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    fn metal_available() -> bool {
+        unsafe { mlx_sys::mlx_metal_is_available() }
+    }
+
+    #[test]
+    fn inkling2_gate_sink_matches_mlx_reference() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0x101);
+        let (t, h, d) = (9usize, 24usize, 128usize);
+        let o_f32 =
+            MxArray::from_float32(&rng.vec(t * h * d, 1.5), &[t as i64, h as i64, d as i64])
+                .unwrap();
+        let g_f32 =
+            MxArray::from_float32(&rng.vec(t * h * d, 3.0), &[t as i64, h as i64, d as i64])
+                .unwrap();
+        let mut lse_v = rng.vec(t * h, 5.0);
+        lse_v[3] = f32::NEG_INFINITY; // edge case: empty window -> sink scale 0
+        let lse = MxArray::from_float32(&lse_v, &[t as i64, h as i64]).unwrap();
+        let sink_f32 = MxArray::from_float32(&rng.vec(t * h, 2.0), &[t as i64, h as i64]).unwrap();
+
+        for (dtype, tol) in [(DType::BFloat16, 1e-3_f32), (DType::Float32, 1e-6_f32)] {
+            let o = o_f32.astype(dtype).unwrap();
+            let g = g_f32.astype(dtype).unwrap();
+            let sink = sink_f32.astype(dtype).unwrap();
+
+            // Pure-MLX reference
+            let sink_scale =
+                Activations::sigmoid(&lse.sub(&sink.astype(DType::Float32).unwrap()).unwrap())
+                    .unwrap()
+                    .expand_dims(-1)
+                    .unwrap();
+            let gate_scale = Activations::sigmoid(&g.astype(DType::Float32).unwrap()).unwrap();
+            let ref_out = o
+                .astype(DType::Float32)
+                .unwrap()
+                .mul(&gate_scale)
+                .unwrap()
+                .mul(&sink_scale)
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+
+            let got = inkling2_gate_sink(&o, &g, &lse, &sink).unwrap();
+            let diff = max_abs_diff(&got.to_float32().unwrap(), &ref_out.to_float32().unwrap());
+            assert!(diff <= tol, "gate_sink {dtype:?} max_diff={diff} > {tol}");
+        }
+    }
+
+    #[test]
+    fn inkling2_situ_matches_mlx_reference_split_interleaved_and_scaled() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0x202);
+        let (rows, inter, num_exp) = (16usize, 1152usize, 128usize);
+        let gu_vals = rng.vec(rows * 2 * inter, 12.0); // large values to exercise softcap + un-softcapped sigmoid
+        let outer_vals = rng
+            .vec(num_exp, 0.5)
+            .into_iter()
+            .map(|v| v.abs() + 0.1)
+            .collect::<Vec<_>>();
+        let idx_vals: Vec<i32> = (0..rows).map(|i| ((i * 7 + 3) % num_exp) as i32).collect();
+
+        let gu_f32 =
+            MxArray::from_float32(&gu_vals, &[rows as i64, 1, (2 * inter) as i64]).unwrap();
+        let outer = MxArray::from_float32(&outer_vals, &[num_exp as i64]).unwrap();
+        let idx = MxArray::from_int32(&idx_vals, &[rows as i64]).unwrap();
+
+        for interleaved in [false, true] {
+            for with_scale in [false, true] {
+                for (dtype, tol) in [(DType::BFloat16, 1e-3_f32), (DType::Float32, 1e-5_f32)] {
+                    let gu = gu_f32.astype(dtype).unwrap();
+                    // Reference
+                    let mut ref_gu = gu.astype(DType::Float32).unwrap();
+                    if with_scale {
+                        let gs = outer
+                            .take(&idx, 0)
+                            .unwrap()
+                            .reshape(&[rows as i64, 1, 1])
+                            .unwrap();
+                        ref_gu = ref_gu.mul(&gs).unwrap();
+                    }
+                    let (g_ref, u_ref) = if interleaved {
+                        let paired = ref_gu.reshape(&[rows as i64, 1, inter as i64, 2]).unwrap();
+                        (
+                            paired
+                                .slice(&[0, 0, 0, 0], &[rows as i64, 1, inter as i64, 1])
+                                .unwrap()
+                                .squeeze(Some(&[-1]))
+                                .unwrap(),
+                            paired
+                                .slice(&[0, 0, 0, 1], &[rows as i64, 1, inter as i64, 2])
+                                .unwrap()
+                                .squeeze(Some(&[-1]))
+                                .unwrap(),
+                        )
+                    } else {
+                        (
+                            ref_gu
+                                .slice(&[0, 0, 0], &[rows as i64, 1, inter as i64])
+                                .unwrap(),
+                            ref_gu
+                                .slice(&[0, 0, inter as i64], &[rows as i64, 1, (2 * inter) as i64])
+                                .unwrap(),
+                        )
+                    };
+                    let ref_out = situ_activation(&g_ref, &u_ref, 4.0, 25.0)
+                        .unwrap()
+                        .astype(dtype)
+                        .unwrap();
+
+                    let got = inkling2_situ(
+                        &gu,
+                        with_scale.then_some((&outer, &idx)),
+                        4.0,
+                        25.0,
+                        interleaved,
+                    )
+                    .unwrap();
+                    let diff =
+                        max_abs_diff(&got.to_float32().unwrap(), &ref_out.to_float32().unwrap());
+                    assert!(
+                        diff <= tol,
+                        "situ interleaved={interleaved} scaled={with_scale} {dtype:?} diff={diff} > {tol}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inkling2_loop_blend_rms_norm_matches_mlx_reference() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0x303);
+        let (t, d) = (8usize, 2304usize);
+        let dest = MxArray::from_float32(&rng.vec(t * d, 2.0), &[t as i64, d as i64]).unwrap();
+        let msg = MxArray::from_float32(&rng.vec(t * d, 2.0), &[t as i64, d as i64]).unwrap();
+        let gain_raw = MxArray::from_float32(&rng.vec(t * d, 3.0), &[t as i64, d as i64]).unwrap();
+        let forget_raw =
+            MxArray::from_float32(&rng.vec(t * d, 3.0), &[t as i64, d as i64]).unwrap();
+        let weight = MxArray::from_float32(&rng.vec(d, 1.0), &[d as i64]).unwrap();
+
+        // Reference FP32 blend + sublayer RMSNorm
+        let g = gain_raw.tanh().unwrap();
+        let f = forget_raw.tanh().unwrap();
+        let one_minus_f = MxArray::scalar_float(1.0).unwrap().sub(&f).unwrap();
+        let blended = one_minus_f
+            .mul(&dest)
+            .unwrap()
+            .add(&g.mul(&msg).unwrap())
+            .unwrap();
+
+        for (dtype, tol) in [(DType::BFloat16, 1e-3_f32), (DType::Float32, 1e-5_f32)] {
+            let ref_out = apply_sublayer_rms_norm(&blended, &weight, 1e-6, dtype).unwrap();
+            let got = inkling2_loop_blend_rms_norm(
+                &dest,
+                &msg,
+                &gain_raw,
+                &forget_raw,
+                &weight,
+                1e-6,
+                dtype,
+            )
+            .unwrap();
+            let diff = max_abs_diff(&got.to_float32().unwrap(), &ref_out.to_float32().unwrap());
+            assert!(
+                diff <= tol,
+                "loop_blend_rms_norm {dtype:?} diff={diff} > {tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_sconv_k4_static_and_dynamic_match_mlx_reference() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0x404);
+        let (c_static, n_kv, head_dim) = (2304usize, 8usize, 128usize);
+        let c_dyn = n_kv * head_dim;
+
+        for seq_len in [1usize, 2, 8, 37] {
+            // Static
+            let x = MxArray::from_float32(
+                &rng.vec(seq_len * c_static, 1.5),
+                &[seq_len as i64, c_static as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let w =
+                MxArray::from_float32(&rng.vec(c_static * 4, 0.5), &[c_static as i64, 4]).unwrap();
+            let h0 = MxArray::from_float32(&rng.vec(3 * c_static, 1.5), &[3, c_static as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+
+            let mut ref_h = h0.clone();
+            let ref_y = static_short_conv(&x, &w, &mut ref_h).unwrap();
+            let (got_y, got_h) = inkling2_sconv_k4(&x, &w, &h0, None).unwrap();
+            let dy = max_abs_diff(&got_y.to_float32().unwrap(), &ref_y.to_float32().unwrap());
+            let dh = max_abs_diff(&got_h.to_float32().unwrap(), &ref_h.to_float32().unwrap());
+            assert!(dy <= 1e-3, "static sconv T={seq_len} y diff={dy}");
+            assert!(dh == 0.0, "static sconv T={seq_len} hist diff={dh}");
+
+            // Dynamic global
+            let xd = MxArray::from_float32(
+                &rng.vec(seq_len * c_dyn, 1.5),
+                &[seq_len as i64, c_dyn as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let wd = MxArray::from_float32(&rng.vec(c_dyn * 4, 0.5), &[c_dyn as i64, 4]).unwrap();
+            let hd0 = MxArray::from_float32(&rng.vec(3 * c_dyn, 1.5), &[3, c_dyn as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let dyn_taps = MxArray::from_float32(
+                &rng.vec(seq_len * n_kv * 4, 0.4),
+                &[seq_len as i64, n_kv as i64, 4],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+            let mut ref_hd = hd0.clone();
+            let ref_yd = dynamic_short_conv(&xd, &wd, &dyn_taps, &mut ref_hd).unwrap();
+            let (got_yd, got_hd) = inkling2_sconv_k4(&xd, &wd, &hd0, Some(&dyn_taps)).unwrap();
+            let dyd = max_abs_diff(&got_yd.to_float32().unwrap(), &ref_yd.to_float32().unwrap());
+            let dhd = max_abs_diff(&got_hd.to_float32().unwrap(), &ref_hd.to_float32().unwrap());
+            assert!(dyd <= 1e-3, "dynamic sconv T={seq_len} y diff={dyd}");
+            assert!(dhd == 0.0, "dynamic sconv T={seq_len} hist diff={dhd}");
+        }
+    }
+
+    /// Reference FP64/FP32 attention with causal mask, optional SWA, relative bias for `d < rel_extent`,
+    /// returning `(out [total_q, H, D], lse [total_q, H])`.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_varlen_attention(
+        q: &[f32],
+        seq_k: &[Vec<f32>],
+        seq_v: &[Vec<f32>],
+        cu_seqlens_q: &[i32],
+        seq_lens: &[i32],
+        rel_bias: &[f32],
+        rel_extent: usize,
+        sliding_window: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let total_q = *cu_seqlens_q.last().unwrap() as usize;
+        let group = num_q_heads / num_kv_heads;
+        let mut out = vec![0.0_f32; total_q * num_q_heads * head_dim];
+        let mut lse = vec![f32::NEG_INFINITY; total_q * num_q_heads];
+
+        for seq_idx in 0..seq_lens.len() {
+            let q_start = cu_seqlens_q[seq_idx] as usize;
+            let q_end = cu_seqlens_q[seq_idx + 1] as usize;
+            let q_len = q_end - q_start;
+            let ctx = seq_lens[seq_idx] as usize;
+            let k_all = &seq_k[seq_idx];
+            let v_all = &seq_v[seq_idx];
+
+            for q_pos_in_seq in 0..q_len {
+                let q_row = q_start + q_pos_in_seq;
+                let eff_ctx = ctx - q_len + q_pos_in_seq + 1;
+                let q_pos = eff_ctx - 1;
+                let lower = if sliding_window > 0 && eff_ctx > sliding_window {
+                    eff_ctx - sliding_window
+                } else {
+                    0
+                };
+                for h in 0..num_q_heads {
+                    let kv_h = h / group;
+                    let q_base = (q_row * num_q_heads + h) * head_dim;
+                    let mut scores = Vec::with_capacity(eff_ctx - lower);
+                    let mut m = f64::NEG_INFINITY;
+                    for k_pos in lower..eff_ctx {
+                        let k_base = (k_pos * num_kv_heads + kv_h) * head_dim;
+                        let mut dot = 0.0_f64;
+                        for d in 0..head_dim {
+                            dot += f64::from(q[q_base + d]) * f64::from(k_all[k_base + d]);
+                        }
+                        let mut s = dot * f64::from(scale);
+                        let dist = q_pos - k_pos;
+                        if rel_extent > 0 && dist < rel_extent {
+                            s += f64::from(rel_bias[(q_row * num_q_heads + h) * rel_extent + dist]);
+                        }
+                        m = m.max(s);
+                        scores.push(s);
+                    }
+                    let mut sum_exp = 0.0_f64;
+                    let mut weights = Vec::with_capacity(scores.len());
+                    for s in &scores {
+                        let w = (s - m).exp();
+                        sum_exp += w;
+                        weights.push(w);
+                    }
+                    lse[q_row * num_q_heads + h] = (m + sum_exp.ln()) as f32;
+                    for d in 0..head_dim {
+                        let mut acc = 0.0_f64;
+                        for (idx, &w) in weights.iter().enumerate() {
+                            let k_pos = lower + idx;
+                            let v_base = (k_pos * num_kv_heads + kv_h) * head_dim;
+                            acc += (w / sum_exp) * f64::from(v_all[v_base + d]);
+                        }
+                        out[q_base + d] = acc as f32;
+                    }
+                }
+            }
+        }
+        (out, lse)
+    }
+
+    struct TestPool {
+        _pool: LayerKVPool,
+        k_pool: MxArray,
+        v_pool: MxArray,
+        k_scale: MxArray,
+        v_scale: MxArray,
+    }
+
+    fn build_pool(
+        kv_dtype: Inkling2KvDtype,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        num_blocks: usize,
+    ) -> TestPool {
+        let layout = match kv_dtype {
+            Inkling2KvDtype::Int8 => PageLayout {
+                keys_token_major: true,
+                ..PageLayout::default()
+            },
+            Inkling2KvDtype::Bf16 => PageLayout::default(),
+        };
+        let metal_dtype = match kv_dtype {
+            Inkling2KvDtype::Int8 => MetalDtype::Int8,
+            Inkling2KvDtype::Bf16 => MetalDtype::BFloat16,
+        };
+        let cfg = PagedAttentionConfig {
+            block_size: block_size as u32,
+            gpu_memory_mb: 512,
+            head_size: head_dim as u32,
+            num_kv_heads: num_kv_heads as u32,
+            num_layers: 1,
+            max_seq_len: Some((num_blocks * block_size) as u32),
+            max_batch_size: Some(4),
+        };
+        let pool = LayerKVPool::new_with_layout(
+            cfg,
+            num_blocks as u32,
+            num_blocks as u32,
+            metal_dtype,
+            layout,
+        )
+        .unwrap();
+        // Fill spare sentinel blocks (`0` and `num_blocks - 1`) with 0xFF (NaN in BF16 and F32
+        // scales) so any evicted SWA read or out-of-bounds block read fails loudly; fill active
+        // blocks with finite non-zero sentinel bytes (0x42 = BF16 ~0.008 / INT8 66, finite) so
+        // unwritten tail slots still catch masking bugs without triggering `0.0 * NaN = NaN` on
+        // in-place BF16 MPP device reads (matching `paged_prefill_attention.rs`).
+        let (kb, vb) = pool.block_blob_bytes().unwrap();
+        let k_nan = vec![0xffu8; kb as usize];
+        let v_nan = vec![0xffu8; vb as usize];
+        let k_fin = vec![0x42u8; kb as usize];
+        let v_fin = vec![0x42u8; vb as usize];
+        let uploads: Vec<_> = (0..num_blocks as u32)
+            .map(|b| {
+                let is_spare = b == 0 || b == (num_blocks - 1) as u32;
+                let (ks, vs) = if is_spare {
+                    (k_nan.as_slice(), v_nan.as_slice())
+                } else {
+                    (k_fin.as_slice(), v_fin.as_slice())
+                };
+                (b, vec![(ks, vs)])
+            })
+            .collect();
+        pool.write_blocks_all_layers(&uploads).unwrap();
+
+        let k_pool = MxArray::from_handle(pool.key_cache_array_raw(0).unwrap(), "k_pool").unwrap();
+        let v_pool =
+            MxArray::from_handle(pool.value_cache_array_raw(0).unwrap(), "v_pool").unwrap();
+        let (k_scale, v_scale) = match kv_dtype {
+            Inkling2KvDtype::Int8 => (
+                MxArray::from_handle(pool.key_scale_array_raw(0).unwrap(), "k_scale").unwrap(),
+                MxArray::from_handle(pool.value_scale_array_raw(0).unwrap(), "v_scale").unwrap(),
+            ),
+            Inkling2KvDtype::Bf16 => (
+                MxArray::from_float32(&[1.0], &[1]).unwrap(),
+                MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            ),
+        };
+        TestPool {
+            _pool: pool,
+            k_pool,
+            v_pool,
+            k_scale,
+            v_scale,
+        }
+    }
+
+    fn store_kv(
+        pool: &mut TestPool,
+        k: &MxArray,
+        v: &MxArray,
+        slots: &[i64],
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_dtype: Inkling2KvDtype,
+    ) {
+        let slot_arr = MxArray::from_int64(slots, &[slots.len() as i64]).unwrap();
+        let mut outs = [std::ptr::null_mut(); 4];
+        let ok = unsafe {
+            mlx_sys::mlx_paged_kv_write_forward(
+                pool.k_pool.as_raw_ptr(),
+                pool.v_pool.as_raw_ptr(),
+                k.as_raw_ptr(),
+                v.as_raw_ptr(),
+                slot_arr.as_raw_ptr(),
+                pool.k_scale.as_raw_ptr(),
+                pool.v_scale.as_raw_ptr(),
+                block_size as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dtype as u8,
+                false,
+                &mut outs[0],
+                &mut outs[1],
+                &mut outs[2],
+                &mut outs[3],
+            )
+        };
+        assert!(ok, "mlx_paged_kv_write_forward failed for {kv_dtype:?}");
+        pool.k_pool = MxArray::from_handle(outs[0], "kp").unwrap();
+        pool.v_pool = MxArray::from_handle(outs[1], "vp").unwrap();
+        pool.k_scale = MxArray::from_handle(outs[2], "ks").unwrap();
+        pool.v_scale = MxArray::from_handle(outs[3], "vs").unwrap();
+        MxArray::eval_arrays(&[&pool.k_pool, &pool.v_pool, &pool.k_scale, &pool.v_scale]).unwrap();
+    }
+
+    #[test]
+    fn inkling2_paged_decode_varlen_bf16_and_int8_ktm_parity() {
+        if !metal_available() {
+            return;
+        }
+        let num_q_heads = 24usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let rel_extent = 1024usize;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        // Test matrix:
+        // - V1 short ctx (ctx <= 512) and V2 long ctx (ctx = 1200 > 1024 crossing both SWA & rel_extent!)
+        // - Global (sliding_window=0 -> tests d >= 1024 zero-bias path!) and SWA (sliding_window=1024)
+        // - Multi-sequence varlen batch (seq 0: decode q=1, seq 1: DSpark verify q=8, seq 2: q=3)
+        // - Both BF16 (bs=16 & bs=32) and INT8 32-token KTM!
+        let cases: &[(&str, Inkling2KvDtype, usize, &[i32], &[i32], usize, DType)] = &[
+            (
+                "bf16_bs16_v1_varlen_global",
+                Inkling2KvDtype::Bf16,
+                16,
+                &[97, 260, 45],
+                &[0, 1, 9, 12],
+                0,
+                DType::BFloat16,
+            ),
+            (
+                "bf16_bs32_v2_global_cross1024",
+                Inkling2KvDtype::Bf16,
+                32,
+                &[1200, 1050],
+                &[0, 8, 9],
+                0,
+                DType::Float32,
+            ),
+            (
+                "bf16_bs32_v2_swa1024",
+                Inkling2KvDtype::Bf16,
+                32,
+                &[1200, 1050],
+                &[0, 8, 9],
+                1024,
+                DType::BFloat16,
+            ),
+            (
+                "int8_ktm_v1_varlen_global",
+                Inkling2KvDtype::Int8,
+                32,
+                &[97, 260, 45],
+                &[0, 1, 9, 12],
+                0,
+                DType::BFloat16,
+            ),
+            (
+                "int8_ktm_v2_global_cross1024",
+                Inkling2KvDtype::Int8,
+                32,
+                &[1200, 1050],
+                &[0, 8, 9],
+                0,
+                DType::Float32,
+            ),
+            (
+                "int8_ktm_v2_swa1024",
+                Inkling2KvDtype::Int8,
+                32,
+                &[1200, 1050],
+                &[0, 8, 9],
+                1024,
+                DType::BFloat16,
+            ),
+        ];
+
+        for &(label, kv_dtype, bs, seq_lens, cu_q, swa, bias_dtype) in cases {
+            let mut rng = Rng(0x5050 + bs as u64 + swa as u64 + kv_dtype as u64);
+            let num_seqs = seq_lens.len();
+            let total_q = *cu_q.last().unwrap() as usize;
+            let max_blocks = seq_lens
+                .iter()
+                .map(|&s| (s as usize).div_ceil(bs))
+                .max()
+                .unwrap();
+            let total_used_blocks: usize =
+                seq_lens.iter().map(|&s| (s as usize).div_ceil(bs)).sum();
+            let num_blocks = total_used_blocks + 2; // +2 spare NaN blocks
+
+            let mut pool = build_pool(kv_dtype, bs, num_kv_heads, head_dim, num_blocks);
+            let mut block_table_flat = vec![(num_blocks - 1) as i32; num_seqs * max_blocks];
+            let mut next_phys = total_used_blocks; // reverse-allocate physical blocks
+            let mut seq_k_ref = Vec::with_capacity(num_seqs);
+            let mut seq_v_ref = Vec::with_capacity(num_seqs);
+
+            for (s_idx, &ctx) in seq_lens.iter().enumerate() {
+                let ctx_u = ctx as usize;
+                let nb_s = ctx_u.div_ceil(bs);
+                let mut slots = Vec::with_capacity(ctx_u);
+                for lb in 0..nb_s {
+                    next_phys -= 1;
+                    let phys = next_phys + 1; // avoid block 0 (leave 0 as NaN sentinel)
+                    block_table_flat[s_idx * max_blocks + lb] = phys as i32;
+                }
+                for tok in 0..ctx_u {
+                    let phys = block_table_flat[s_idx * max_blocks + tok / bs] as usize;
+                    slots.push((phys * bs + tok % bs) as i64);
+                }
+                let k_arr = MxArray::from_float32(
+                    &rng.vec(ctx_u * num_kv_heads * head_dim, 0.4),
+                    &[ctx_u as i64, num_kv_heads as i64, head_dim as i64],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                let v_arr = MxArray::from_float32(
+                    &rng.vec(ctx_u * num_kv_heads * head_dim, 0.4),
+                    &[ctx_u as i64, num_kv_heads as i64, head_dim as i64],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                seq_k_ref.push(k_arr.to_float32().unwrap().to_vec());
+                seq_v_ref.push(v_arr.to_float32().unwrap().to_vec());
+                store_kv(
+                    &mut pool,
+                    &k_arr,
+                    &v_arr,
+                    &slots,
+                    bs,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dtype,
+                );
+            }
+
+            let q_arr = MxArray::from_float32(
+                &rng.vec(total_q * num_q_heads * head_dim, 0.4),
+                &[total_q as i64, num_q_heads as i64, head_dim as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let rel_bias_arr = MxArray::from_float32(
+                &rng.vec(total_q * num_q_heads * rel_extent, 0.5),
+                &[total_q as i64, num_q_heads as i64, rel_extent as i64],
+            )
+            .unwrap()
+            .astype(bias_dtype)
+            .unwrap();
+            let bt_arr =
+                MxArray::from_int32(&block_table_flat, &[num_seqs as i64, max_blocks as i64])
+                    .unwrap();
+            let sl_arr = MxArray::from_int32(seq_lens, &[num_seqs as i64]).unwrap();
+            let cu_arr = MxArray::from_int32(cu_q, &[cu_q.len() as i64]).unwrap();
+
+            let (got_out, got_lse) = inkling2_paged_attention(
+                &q_arr,
+                &pool.k_pool,
+                &pool.v_pool,
+                &bt_arr,
+                &sl_arr,
+                &cu_arr,
+                &pool.k_scale,
+                &pool.v_scale,
+                Some(&rel_bias_arr),
+                scale,
+                swa as i32,
+                rel_extent as i32,
+                bs as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dtype,
+                None,
+            )
+            .unwrap();
+
+            let (ref_out, ref_lse) = ref_varlen_attention(
+                &q_arr.to_float32().unwrap(),
+                &seq_k_ref,
+                &seq_v_ref,
+                cu_q,
+                seq_lens,
+                &rel_bias_arr.to_float32().unwrap(),
+                rel_extent,
+                swa,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            );
+
+            let got_out_v = got_out.to_float32().unwrap();
+            let got_lse_v = got_lse.to_float32().unwrap();
+            assert!(
+                got_out_v.iter().all(|v| v.is_finite()),
+                "{label}: non-finite out"
+            );
+            assert!(
+                got_lse_v.iter().all(|v| v.is_finite()),
+                "{label}: non-finite lse"
+            );
+
+            let out_diff = max_abs_diff(&got_out_v, &ref_out);
+            let lse_diff = max_abs_diff(&got_lse_v, &ref_lse);
+            let (out_tol, lse_tol) = match kv_dtype {
+                Inkling2KvDtype::Bf16 => (1e-3_f32, 2e-3_f32),
+                Inkling2KvDtype::Int8 => (2e-2_f32, 5e-2_f32),
+            };
+            assert!(
+                out_diff <= out_tol,
+                "{label}: out max_diff={out_diff} > {out_tol}"
+            );
+            assert!(
+                lse_diff <= lse_tol,
+                "{label}: lse max_diff={lse_diff} > {lse_tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_paged_prefill_mpp_ktm_q8_q8q_bf16_swa_and_global_parity() {
+        if !metal_available() {
+            return;
+        }
+        let num_q_heads = 24usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let rel_extent = 1024usize;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let mpp_ok = inkling2_paged_prefill_mpp_supported();
+        let apple10 = unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= 17;
+        eprintln!("inkling2 MPP supported={mpp_ok}, apple10(q8q)={apple10}");
+
+        // Cases cover:
+        // - SWA=1024 at committed=1500, rows=40 (first 14 pages completely skipped; we even poison
+        //   evicted pages with NaN in block_table/pool to PROVE tile skip never touches them!)
+        // - Global (swa=0) at committed=1500, rows=40 (pages 0..14 take ZERO-BIAS fast path,
+        //   pages 15..48 take rel_bias path!)
+        // - Both INT8 KTM q8 (BF16 queries) and q8q (INT8 queries on M5+/Apple10)
+        // - BF16 vLLM pool (bs=16 & bs=32)
+        // - Multiple splits (splits=1, splits=4)
+        let cases: &[(
+            &str,
+            Inkling2KvDtype,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            bool,
+        )] = &[
+            (
+                "ktm_q8_swa1024_skip",
+                Inkling2KvDtype::Int8,
+                32,
+                1500,
+                40,
+                1024,
+                4,
+                false,
+            ),
+            (
+                "ktm_q8_global_cross1024",
+                Inkling2KvDtype::Int8,
+                32,
+                1500,
+                40,
+                0,
+                4,
+                false,
+            ),
+            (
+                "ktm_q8q_global_cross1024",
+                Inkling2KvDtype::Int8,
+                32,
+                1500,
+                40,
+                0,
+                4,
+                true,
+            ),
+            (
+                "ktm_q8_verify8_swa1024",
+                Inkling2KvDtype::Int8,
+                32,
+                1200,
+                8,
+                1024,
+                8,
+                false,
+            ),
+            (
+                "bf16_bs16_swa1024_skip",
+                Inkling2KvDtype::Bf16,
+                16,
+                1500,
+                40,
+                1024,
+                4,
+                false,
+            ),
+            (
+                "bf16_bs32_global_cross1024",
+                Inkling2KvDtype::Bf16,
+                32,
+                1500,
+                40,
+                0,
+                4,
+                false,
+            ),
+        ];
+
+        for &(label, kv_dtype, bs, committed, rows, swa, splits, int8_queries) in cases {
+            let mut rng = Rng(0x7070 + bs as u64 + swa as u64 + (int8_queries as u64) * 17);
+            let total_tokens = committed + rows;
+            let used_blocks = total_tokens.div_ceil(bs);
+            let num_blocks = used_blocks + 2; // spare NaN blocks at 0 and used_blocks+1
+
+            let mut pool = build_pool(kv_dtype, bs, num_kv_heads, head_dim, num_blocks);
+            let mut table: Vec<i32> = (0..used_blocks)
+                .map(|lb| (used_blocks - lb) as i32)
+                .collect();
+            let slots: Vec<i64> = (0..total_tokens)
+                .map(|t| (table[t / bs] as usize * bs + t % bs) as i64)
+                .collect();
+
+            let k_arr = MxArray::from_float32(
+                &rng.vec(total_tokens * num_kv_heads * head_dim, 0.35),
+                &[total_tokens as i64, num_kv_heads as i64, head_dim as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let v_arr = MxArray::from_float32(
+                &rng.vec(total_tokens * num_kv_heads * head_dim, 0.35),
+                &[total_tokens as i64, num_kv_heads as i64, head_dim as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            store_kv(
+                &mut pool,
+                &k_arr,
+                &v_arr,
+                &slots,
+                bs,
+                num_kv_heads,
+                head_dim,
+                kv_dtype,
+            );
+
+            // For SWA cases, repoint completely evicted blocks (strictly before
+            // `committed + 1 - swa`) to block 0 (filled with 0xFF NaNs) to prove
+            // the SWA tile skip never reads evicted pages!
+            if swa > 0 && committed + 1 > swa {
+                let first_needed_page = (committed + 1 - swa) / 32;
+                let first_needed_block = first_needed_page * (32 / bs);
+                for entry in table.iter_mut().take(first_needed_block) {
+                    *entry = 0;
+                }
+            }
+
+            let q_arr = MxArray::from_float32(
+                &rng.vec(rows * num_q_heads * head_dim, 0.35),
+                &[rows as i64, num_q_heads as i64, head_dim as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let rel_bias_arr = MxArray::from_float32(
+                &rng.vec(rows * num_q_heads * rel_extent, 0.5),
+                &[rows as i64, num_q_heads as i64, rel_extent as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let bt_arr = MxArray::from_int32(&table, &[table.len() as i64]).unwrap();
+            let pass = if rows <= 8 {
+                Pass::Verify
+            } else {
+                Pass::Prefill
+            };
+            let ws_floats = prefill_plan::workspace_floats(
+                rows as u32,
+                splits as u32,
+                num_q_heads as u32,
+                head_dim as u32,
+            );
+            let workspace = MxArray::zeros(&[ws_floats as i64], Some(DType::Float32)).unwrap();
+
+            let (got_out, got_lse, _ws_out) = inkling2_paged_prefill_attention(
+                &q_arr,
+                &pool.k_pool,
+                &pool.v_pool,
+                &pool.k_scale,
+                &pool.v_scale,
+                &bt_arr,
+                &workspace,
+                Some(&rel_bias_arr),
+                committed as i32,
+                splits as i32,
+                pass.max_splits() as i32,
+                bs as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                swa as i32,
+                rel_extent as i32,
+                kv_dtype,
+                int8_queries,
+                scale,
+            )
+            .unwrap();
+
+            let (ref_out, ref_lse) = ref_varlen_attention(
+                &q_arr.to_float32().unwrap(),
+                &[k_arr.to_float32().unwrap().to_vec()],
+                &[v_arr.to_float32().unwrap().to_vec()],
+                &[0, rows as i32],
+                &[total_tokens as i32],
+                &rel_bias_arr.to_float32().unwrap(),
+                rel_extent,
+                swa,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            );
+
+            let got_out_v = got_out.to_float32().unwrap();
+            let got_lse_v = got_lse.to_float32().unwrap();
+            assert!(
+                got_out_v.iter().all(|v| v.is_finite()),
+                "{label}: non-finite out"
+            );
+            assert!(
+                got_lse_v.iter().all(|v| v.is_finite()),
+                "{label}: non-finite lse"
+            );
+
+            let out_diff = max_abs_diff(&got_out_v, &ref_out);
+            let lse_diff = max_abs_diff(&got_lse_v, &ref_lse);
+            let (out_tol, lse_tol) = match (kv_dtype, int8_queries) {
+                (Inkling2KvDtype::Bf16, _) => (1e-3_f32, 2e-3_f32),
+                (Inkling2KvDtype::Int8, false) => (2e-2_f32, 5e-2_f32),
+                (Inkling2KvDtype::Int8, true) => (2.5e-2_f32, 6e-2_f32),
+            };
+            assert!(
+                out_diff <= out_tol,
+                "{label}: out max_diff={out_diff} > {out_tol}"
+            );
+            assert!(
+                lse_diff <= lse_tol,
+                "{label}: lse max_diff={lse_diff} > {lse_tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_qr_clip_and_strided_gate_sink_match_reference() {
+        if !metal_available() {
+            return;
+        }
+        use crate::models::inkling2::attention::l2_clip;
+        let mut rng = Rng(0x6060);
+        let (t, h, hd, dr) = (8usize, 24usize, 128usize, 16usize);
+        let q_dim = h * hd;
+        let r_dim = h * dr;
+        let total_cols = q_dim + r_dim + q_dim + 2048;
+
+        // Pack into a fused QRGKV-like [T, 8600] buffer and slice strided views!
+        let packed = MxArray::from_float32(
+            &rng.vec(t * total_cols, 4.0),
+            &[t as i64, total_cols as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let q_view = packed.slice(&[0, 0], &[t as i64, q_dim as i64]).unwrap();
+        let r_view = packed
+            .slice(&[0, q_dim as i64], &[t as i64, (q_dim + r_dim) as i64])
+            .unwrap();
+        let g_view = packed
+            .slice(
+                &[0, (q_dim + r_dim) as i64],
+                &[t as i64, (q_dim + r_dim + q_dim) as i64],
+            )
+            .unwrap();
+
+        let q_clip =
+            MxArray::from_float32(&rng.vec(q_dim, 1.5), &[1, h as i64, hd as i64]).unwrap();
+        let r_clip =
+            MxArray::from_float32(&rng.vec(r_dim, 1.5), &[1, h as i64, dr as i64]).unwrap();
+        let tau = MxArray::from_float32(
+            &[1.0, 1.05, 1.12, 1.2, 1.0, 1.03, 1.18, 1.25],
+            &[t as i64, 1, 1],
+        )
+        .unwrap();
+        let qk_thresh = 22.627416997969522_f64;
+        let rel_thresh = 8.0_f64;
+
+        for use_tau in [false, true] {
+            let (got_q, got_r) = inkling2_qr_clip(
+                &q_view,
+                &r_view,
+                &q_clip,
+                &r_clip,
+                use_tau.then_some(&tau),
+                h,
+                hd,
+                dr,
+                qk_thresh as f32,
+                rel_thresh as f32,
+                1e-6,
+                DType::BFloat16,
+                true,
+            )
+            .unwrap();
+
+            let q_3d = q_view.reshape(&[t as i64, h as i64, hd as i64]).unwrap();
+            let r_3d = r_view.reshape(&[t as i64, h as i64, dr as i64]).unwrap();
+            let mut ref_q = l2_clip(&q_3d, Some(&q_clip), qk_thresh, DType::BFloat16).unwrap();
+            let ref_r_bf = l2_clip(&r_3d, Some(&r_clip), rel_thresh, DType::BFloat16).unwrap();
+            let ref_r = if use_tau {
+                ref_q = ref_q
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .mul(&tau)
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                ref_r_bf.astype(DType::Float32).unwrap().mul(&tau).unwrap()
+            } else {
+                ref_r_bf.astype(DType::Float32).unwrap()
+            };
+
+            let dq = max_abs_diff(&got_q.to_float32().unwrap(), &ref_q.to_float32().unwrap());
+            let dr_diff = max_abs_diff(&got_r.to_float32().unwrap(), &ref_r.to_float32().unwrap());
+            assert!(dq <= 1e-2, "qr_clip use_tau={use_tau} q diff={dq}");
+            assert!(
+                dr_diff <= 1e-4,
+                "qr_clip use_tau={use_tau} r diff={dr_diff}"
+            );
+        }
+
+        // Also verify zero-copy strided gate in inkling2_gate_sink
+        let o = MxArray::from_float32(&rng.vec(t * q_dim, 1.5), &[t as i64, h as i64, hd as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let lse = MxArray::from_float32(&rng.vec(t * h, 4.0), &[t as i64, h as i64]).unwrap();
+        let sink = MxArray::from_float32(&rng.vec(t * h, 2.0), &[t as i64, h as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let got_gs = inkling2_gate_sink(&o, &g_view, &lse, &sink).unwrap();
+        let g_contig = g_view.reshape(&[t as i64, h as i64, hd as i64]).unwrap();
+        let ref_gs = inkling2_gate_sink(&o, &g_contig, &lse, &sink).unwrap();
+        assert_eq!(
+            max_abs_diff(&got_gs.to_float32().unwrap(), &ref_gs.to_float32().unwrap()),
+            0.0,
+            "strided gate_sink must be bit-identical to contiguous"
+        );
+    }
+
+    #[test]
+    fn inkling2_sconv_k4_kv_prep_and_ragged_match_reference() {
+        if !metal_available() {
+            return;
+        }
+        use crate::models::inkling2::attention::l2_clip;
+        use crate::nn::normalization::rms_norm_unscaled;
+        let mut rng = Rng(0x7070);
+        let (n_kv, hd) = (8usize, 128usize);
+        let kv_dim = n_kv * hd;
+        let qk_thresh = 22.627416997969522_f64;
+
+        // Test N=1 and N=4 ragged (with variable lengths [1, 8, 3, 5]), both static and dynamic,
+        // and strided K/V views from a packed [T, 8600] tensor!
+        for cu_vec in [vec![0i32, 8], vec![0i32, 1, 9, 12, 17]] {
+            let num_seqs = cu_vec.len() - 1;
+            let total_t = *cu_vec.last().unwrap() as usize;
+            let cu_arr = MxArray::from_int32(&cu_vec, &[cu_vec.len() as i64]).unwrap();
+
+            let packed_cols = 6528 + 2 * kv_dim;
+            let packed = MxArray::from_float32(
+                &rng.vec(total_t * packed_cols, 3.0),
+                &[total_t as i64, packed_cols as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let k_view = packed
+                .slice(&[0, 6528], &[total_t as i64, (6528 + kv_dim) as i64])
+                .unwrap();
+            let v_view = packed
+                .slice(
+                    &[0, (6528 + kv_dim) as i64],
+                    &[total_t as i64, packed_cols as i64],
+                )
+                .unwrap();
+
+            let kw = MxArray::from_float32(&rng.vec(kv_dim * 4, 0.4), &[kv_dim as i64, 4]).unwrap();
+            let vw = MxArray::from_float32(&rng.vec(kv_dim * 4, 0.4), &[kv_dim as i64, 4]).unwrap();
+            let dk = MxArray::from_float32(
+                &rng.vec(total_t * n_kv * 4, 0.3),
+                &[total_t as i64, n_kv as i64, 4],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let dv = MxArray::from_float32(
+                &rng.vec(total_t * n_kv * 4, 0.3),
+                &[total_t as i64, n_kv as i64, 4],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+            let k_hists: Vec<MxArray> = (0..num_seqs)
+                .map(|_| {
+                    MxArray::from_float32(&rng.vec(3 * kv_dim, 2.0), &[3, kv_dim as i64])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                })
+                .collect();
+            let v_hists: Vec<MxArray> = (0..num_seqs)
+                .map(|_| {
+                    MxArray::from_float32(&rng.vec(3 * kv_dim, 2.0), &[3, kv_dim as i64])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                })
+                .collect();
+            let kh_refs: Vec<&MxArray> = k_hists.iter().collect();
+            let vh_refs: Vec<&MxArray> = v_hists.iter().collect();
+
+            for is_dyn in [false, true] {
+                let (got_k, got_v, got_kh, got_vh) = inkling2_sconv_k4_kv_prep(
+                    &k_view,
+                    &v_view,
+                    &kw,
+                    &vw,
+                    is_dyn.then_some(&dk),
+                    is_dyn.then_some(&dv),
+                    (num_seqs > 1).then_some(&cu_arr),
+                    &kh_refs,
+                    &vh_refs,
+                    num_seqs,
+                    false,
+                    n_kv,
+                    hd,
+                    qk_thresh as f32,
+                    1e-6,
+                    1e-6,
+                )
+                .unwrap();
+
+                // Reference per-sequence
+                let mut ref_k_parts = Vec::new();
+                let mut ref_v_parts = Vec::new();
+                let mut ref_kh_parts = Vec::new();
+                let mut ref_vh_parts = Vec::new();
+                for s in 0..num_seqs {
+                    let st = cu_vec[s] as i64;
+                    let en = cu_vec[s + 1] as i64;
+                    let ks = k_view.slice(&[st, 0], &[en, kv_dim as i64]).unwrap();
+                    let vs = v_view.slice(&[st, 0], &[en, kv_dim as i64]).unwrap();
+                    let mut kh = k_hists[s].clone();
+                    let mut vh = v_hists[s].clone();
+                    let (kc, vc) = if is_dyn {
+                        let dks = dk.slice(&[st, 0, 0], &[en, n_kv as i64, 4]).unwrap();
+                        let dvs = dv.slice(&[st, 0, 0], &[en, n_kv as i64, 4]).unwrap();
+                        (
+                            dynamic_short_conv(&ks, &kw, &dks, &mut kh).unwrap(),
+                            dynamic_short_conv(&vs, &vw, &dvs, &mut vh).unwrap(),
+                        )
+                    } else {
+                        (
+                            static_short_conv(&ks, &kw, &mut kh).unwrap(),
+                            static_short_conv(&vs, &vw, &mut vh).unwrap(),
+                        )
+                    };
+                    let len = en - st;
+                    let k3 = kc.reshape(&[len, n_kv as i64, hd as i64]).unwrap();
+                    let v3 = vc.reshape(&[len, n_kv as i64, hd as i64]).unwrap();
+                    ref_k_parts.push(l2_clip(&k3, None, qk_thresh, DType::BFloat16).unwrap());
+                    ref_v_parts.push(
+                        rms_norm_unscaled(&v3.astype(DType::Float32).unwrap(), 1e-6)
+                            .unwrap()
+                            .astype(DType::BFloat16)
+                            .unwrap(),
+                    );
+                    ref_kh_parts.push(kh);
+                    ref_vh_parts.push(vh);
+                }
+                let rk = MxArray::concatenate_many(ref_k_parts.iter().collect(), Some(0)).unwrap();
+                let rv = MxArray::concatenate_many(ref_v_parts.iter().collect(), Some(0)).unwrap();
+                let rkh = if num_seqs == 1 {
+                    ref_kh_parts[0].clone()
+                } else {
+                    MxArray::stack(ref_kh_parts.iter().collect(), Some(0)).unwrap()
+                };
+                let rvh = if num_seqs == 1 {
+                    ref_vh_parts[0].clone()
+                } else {
+                    MxArray::stack(ref_vh_parts.iter().collect(), Some(0)).unwrap()
+                };
+                assert!(
+                    max_abs_diff(&got_k.to_float32().unwrap(), &rk.to_float32().unwrap()) <= 2e-2,
+                    "kv_prep N={num_seqs} dyn={is_dyn} k mismatch"
+                );
+                assert!(
+                    max_abs_diff(&got_v.to_float32().unwrap(), &rv.to_float32().unwrap()) <= 2e-2,
+                    "kv_prep N={num_seqs} dyn={is_dyn} v mismatch"
+                );
+                assert_eq!(
+                    max_abs_diff(&got_kh.to_float32().unwrap(), &rkh.to_float32().unwrap()),
+                    0.0
+                );
+                assert_eq!(
+                    max_abs_diff(&got_vh.to_float32().unwrap(), &rvh.to_float32().unwrap()),
+                    0.0
+                );
+            }
+
+            // Test sconv_k4_ragged with residual epilogue (res_a + res_b + conv_out)
+            let c_post = 2304usize;
+            let x_post = MxArray::from_float32(
+                &rng.vec(total_t * c_post, 1.5),
+                &[total_t as i64, c_post as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let w_post =
+                MxArray::from_float32(&rng.vec(c_post * 4, 0.4), &[c_post as i64, 4]).unwrap();
+            let res_a = MxArray::from_float32(
+                &rng.vec(total_t * c_post, 1.5),
+                &[total_t as i64, c_post as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let res_b = MxArray::from_float32(
+                &rng.vec(total_t * c_post, 1.5),
+                &[total_t as i64, c_post as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let p_hists: Vec<MxArray> = (0..num_seqs)
+                .map(|_| {
+                    MxArray::from_float32(&rng.vec(3 * c_post, 1.5), &[3, c_post as i64])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                })
+                .collect();
+            let ph_refs: Vec<&MxArray> = p_hists.iter().collect();
+            let (got_y, got_h) = inkling2_sconv_k4_ragged(
+                &x_post,
+                &w_post,
+                None,
+                (num_seqs > 1).then_some(&cu_arr),
+                Some(&res_a),
+                Some(&res_b),
+                &ph_refs,
+                num_seqs,
+                false,
+            )
+            .unwrap();
+
+            let mut ref_y_parts = Vec::new();
+            let mut ref_h_parts = Vec::new();
+            for s in 0..num_seqs {
+                let st = cu_vec[s] as i64;
+                let en = cu_vec[s + 1] as i64;
+                let xs = x_post.slice(&[st, 0], &[en, c_post as i64]).unwrap();
+                let mut hs = p_hists[s].clone();
+                let ys = static_short_conv(&xs, &w_post, &mut hs).unwrap();
+                ref_y_parts.push(ys);
+                ref_h_parts.push(hs);
+            }
+            let conv_ref =
+                MxArray::concatenate_many(ref_y_parts.iter().collect(), Some(0)).unwrap();
+            let ref_y = res_a
+                .astype(DType::Float32)
+                .unwrap()
+                .add(&res_b.astype(DType::Float32).unwrap())
+                .unwrap()
+                .add(&conv_ref.astype(DType::Float32).unwrap())
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let ref_h = if num_seqs == 1 {
+                ref_h_parts[0].clone()
+            } else {
+                MxArray::stack(ref_h_parts.iter().collect(), Some(0)).unwrap()
+            };
+            assert!(
+                max_abs_diff(&got_y.to_float32().unwrap(), &ref_y.to_float32().unwrap()) <= 2e-2,
+                "sconv_k4_ragged residual N={num_seqs} mismatch"
+            );
+            assert_eq!(
+                max_abs_diff(&got_h.to_float32().unwrap(), &ref_h.to_float32().unwrap()),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_block_attn_res_and_pair_rms_norm_match_reference() {
+        if !metal_available() {
+            return;
+        }
+        use crate::models::inkling2::attn_res::ATTN_RES_EPS;
+        use crate::nn::normalization::rms_norm_unscaled;
+        let mut rng = Rng(0x8080);
+        let (t, d) = (6usize, 2304usize);
+
+        let srcs: Vec<MxArray> = (0..5)
+            .map(|_| {
+                MxArray::from_float32(&rng.vec(t * d, 1.5), &[t as i64, d as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap()
+            })
+            .collect();
+        let addend = MxArray::from_float32(&rng.vec(t * d, 1.0), &[t as i64, d as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let inv_sqrt_d = 1.0_f32 / (d as f32).sqrt();
+
+        for (k, q, with_addend, with_norm) in [
+            (1usize, 1usize, false, true),
+            (5, 1, false, true),
+            (4, 3, false, true),
+            (2, 4, false, false),
+            (3, 1, true, true),
+            (3, 3, true, false),
+        ] {
+            let q_vals: Vec<f32> = rng
+                .vec(q * d, 1.0)
+                .into_iter()
+                .map(|v| v * inv_sqrt_d)
+                .collect();
+            let queries = MxArray::from_float32(&q_vals, &[q as i64, d as i64]).unwrap();
+            let nw = MxArray::from_float32(&rng.vec(q * d, 1.0), &[q as i64, d as i64]).unwrap();
+
+            let src_refs: Vec<&MxArray> = srcs[..k].iter().collect();
+            let out_dtype = if with_norm {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            };
+            let got = inkling2_block_attn_res(
+                &src_refs,
+                with_addend.then_some(&addend),
+                &queries,
+                with_norm.then_some(&nw),
+                ATTN_RES_EPS,
+                1e-6,
+                q == 1,
+                out_dtype,
+            )
+            .unwrap();
+
+            // Reference
+            let last_eff = if with_addend {
+                srcs[k - 1]
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .add(&addend.astype(DType::Float32).unwrap())
+                    .unwrap()
+            } else {
+                srcs[k - 1].clone()
+            };
+            let mut ref_srcs: Vec<&MxArray> = srcs[..k - 1].iter().collect();
+            ref_srcs.push(&last_eff);
+            // Exact CPU FP64 reference (MLX FP32 matmul on Apple10/M5 uses TF32 tensor ops with ~2e-3 error).
+            let mut src_f64: Vec<Vec<f64>> = Vec::new();
+            for s in &ref_srcs {
+                src_f64.push(
+                    s.to_float32()
+                        .unwrap()
+                        .iter()
+                        .map(|&x| f64::from(x))
+                        .collect(),
+                );
+            }
+            let nw_f64: Vec<f64> = nw
+                .to_float32()
+                .unwrap()
+                .iter()
+                .map(|&x| f64::from(x))
+                .collect();
+            let mut cpu_ref = vec![0.0_f32; q * t * d];
+            for tok in 0..t {
+                let mut v_norm = Vec::with_capacity(k);
+                for si in 0..k {
+                    let row_s = &src_f64[si][tok * d..(tok + 1) * d];
+                    let ms: f64 = row_s.iter().map(|x| x * x).sum::<f64>() / (d as f64);
+                    let ir = 1.0 / (ms + f64::from(ATTN_RES_EPS)).sqrt();
+                    v_norm.push(row_s.iter().map(|&x| x * ir).collect::<Vec<f64>>());
+                }
+                for qi in 0..q {
+                    let mut probs = vec![0.0_f64; k];
+                    if k == 1 {
+                        probs[0] = 1.0;
+                    } else {
+                        let mut sc = vec![0.0_f64; k];
+                        let mut mx = f64::NEG_INFINITY;
+                        for si in 0..k {
+                            let dot: f64 = (0..d)
+                                .map(|j| f64::from(q_vals[qi * d + j]) * v_norm[si][j])
+                                .sum();
+                            sc[si] = dot;
+                            mx = mx.max(dot);
+                        }
+                        let exps: Vec<f64> = sc.iter().map(|&x| (x - mx).exp()).collect();
+                        let den: f64 = exps.iter().sum();
+                        for si in 0..k {
+                            probs[si] = exps[si] / den;
+                        }
+                    }
+                    let mut mix_row = vec![0.0_f64; d];
+                    for j in 0..d {
+                        let mut acc = 0.0_f64;
+                        for si in 0..k {
+                            acc += probs[si] * v_norm[si][j];
+                        }
+                        mix_row[j] = acc;
+                    }
+                    if with_norm {
+                        let ms: f64 = mix_row.iter().map(|x| x * x).sum::<f64>() / (d as f64);
+                        let ir = 1.0 / (ms + 1e-6_f64).sqrt();
+                        for j in 0..d {
+                            cpu_ref[(qi * t + tok) * d + j] =
+                                (mix_row[j] * ir * nw_f64[qi * d + j]) as f32;
+                        }
+                    } else {
+                        for j in 0..d {
+                            cpu_ref[(qi * t + tok) * d + j] = mix_row[j] as f32;
+                        }
+                    }
+                }
+            }
+
+            let got_v = got.to_float32().unwrap();
+            let diff = max_abs_diff(&got_v, &cpu_ref);
+            let tol = if with_norm { 2e-2 } else { 1e-5 };
+            assert!(
+                diff <= tol,
+                "block_attn_res K={k} Q={q} add={with_addend} norm={with_norm} diff={diff} > {tol}"
+            );
+        }
+
+        // Test inkling2_pair_rms_norm (S=1 and S=3 with broadcast dest + 3D strided loop_blend_rms_norm!)
+        let dest_1 = MxArray::from_float32(&rng.vec(t * d, 1.5), &[t as i64, d as i64]).unwrap();
+        let msgs_4 =
+            MxArray::from_float32(&rng.vec(4 * t * d, 1.5), &[4, t as i64, d as i64]).unwrap();
+        let msgs_3 = msgs_4.slice(&[0, 0, 0], &[3, t as i64, d as i64]).unwrap();
+        let pair_3 =
+            inkling2_pair_rms_norm(&dest_1, &msgs_3, ATTN_RES_EPS, DType::Float32).unwrap();
+        let pair_3_bf16 =
+            inkling2_pair_rms_norm(&dest_1, &msgs_3, ATTN_RES_EPS, DType::BFloat16).unwrap();
+        let pair_bf16_diff = max_abs_diff(
+            &pair_3_bf16.to_float32().unwrap(),
+            &pair_3
+                .astype(DType::BFloat16)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+        );
+        assert!(
+            pair_bf16_diff <= 1e-6,
+            "pair_rms_norm_bf16 mismatch diff={pair_bf16_diff}"
+        );
+
+        // Test coalesced exact-FP32 inkling2_moe_router_proj across M=1, 4, 8, 32 against exact FP32 CPU dot
+        let w_vals = rng.vec(128 * 256, 0.4);
+        let w_router = MxArray::from_float32(&w_vals, &[128, 256]).unwrap();
+        for &m in &[1i64, 4, 8, 32] {
+            let x_r = MxArray::from_float32(&rng.vec(m as usize * 256, 0.8), &[m, 256])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let got_r = inkling2_moe_router_proj(&x_r, &w_router).unwrap();
+            let x_f32 = x_r.to_float32().unwrap();
+            let mut ref_cpu = vec![0.0_f32; m as usize * 128];
+            for r in 0..m as usize {
+                for e in 0..128 {
+                    let mut sum = 0.0_f64;
+                    for c in 0..256 {
+                        sum += f64::from(x_f32[r * 256 + c]) * f64::from(w_vals[e * 256 + c]);
+                    }
+                    ref_cpu[r * 128 + e] = sum as f32;
+                }
+            }
+            let r_diff = max_abs_diff(&got_r.to_float32().unwrap(), &ref_cpu);
+            assert!(r_diff <= 1e-4, "moe_router_proj M={m} diff={r_diff}");
+        }
+        assert_eq!(
+            pair_3.shape().unwrap().as_ref(),
+            &[3, t as i64, (2 * d) as i64]
+        );
+        let dh_ref = rms_norm_unscaled(&dest_1, ATTN_RES_EPS).unwrap();
+        for s in 0..3 {
+            let ms = msgs_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let mh_ref = rms_norm_unscaled(&ms, ATTN_RES_EPS).unwrap();
+            let ref_p = MxArray::concatenate(&dh_ref, &mh_ref, -1).unwrap();
+            let got_p = pair_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, (2 * d) as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let diff = max_abs_diff(&got_p.to_float32().unwrap(), &ref_p.to_float32().unwrap());
+            assert!(diff <= 1e-5, "pair_rms_norm S=3 stream={s} diff={diff}");
+        }
+
+        // Test 3D strided inkling2_loop_blend_rms_norm with gf_3 [3, T, 2D] sliced without copy!
+        let gf_3 =
+            MxArray::from_float32(&rng.vec(3 * t * 2 * d, 2.0), &[3, t as i64, (2 * d) as i64])
+                .unwrap();
+        let gain_3 = gf_3.slice(&[0, 0, 0], &[3, t as i64, d as i64]).unwrap();
+        let forget_3 = gf_3
+            .slice(&[0, 0, d as i64], &[3, t as i64, (2 * d) as i64])
+            .unwrap();
+        let w_3 = MxArray::from_float32(&rng.vec(3 * d, 1.0), &[3, d as i64]).unwrap();
+        let got_blend_3 = inkling2_loop_blend_rms_norm(
+            &dest_1,
+            &msgs_3,
+            &gain_3,
+            &forget_3,
+            &w_3,
+            1e-6,
+            DType::BFloat16,
+        )
+        .unwrap();
+        assert_eq!(
+            got_blend_3.shape().unwrap().as_ref(),
+            &[3, t as i64, d as i64]
+        );
+        for s in 0..3 {
+            let ms = msgs_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let gs = gain_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let fs = forget_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let ws = w_3
+                .slice(&[s, 0], &[s + 1, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            let ref_s =
+                inkling2_loop_blend_rms_norm(&dest_1, &ms, &gs, &fs, &ws, 1e-6, DType::BFloat16)
+                    .unwrap();
+            let got_s = got_blend_3
+                .slice(&[s, 0, 0], &[s + 1, t as i64, d as i64])
+                .unwrap()
+                .squeeze(Some(&[0]))
+                .unwrap();
+            assert_eq!(
+                max_abs_diff(&got_s.to_float32().unwrap(), &ref_s.to_float32().unwrap()),
+                0.0,
+                "3D strided loop_blend_rms_norm stream={s} must be bit-exact"
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_moe_route_and_combine_match_reference_including_ties_and_sort() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0x9090);
+        let (t, e, k, d) = (10usize, 128usize, 8usize, 2304usize);
+        let mut logits_v = rng.vec(t * e, 3.0);
+        // Inject exact score ties on row 0 across different lanes (indices 5, 37, 69, 101)!
+        for &idx in &[5usize, 37, 69, 101] {
+            logits_v[idx] = 2.5;
+        }
+        let mut bias_v = rng.vec(e, 0.2);
+        for &idx in &[5usize, 37, 69, 101] {
+            bias_v[idx] = 0.5;
+        }
+        let down_scale_v: Vec<f32> = rng.vec(e, 0.5).into_iter().map(|v| v.abs() + 0.1).collect();
+
+        let logits = MxArray::from_float32(&logits_v, &[t as i64, e as i64]).unwrap();
+        let bias = MxArray::from_float32(&bias_v, &[e as i64]).unwrap();
+        let down_scale = MxArray::from_float32(&down_scale_v, &[e as i64]).unwrap();
+
+        let (got_idx, got_w) =
+            inkling2_moe_route(&logits, Some(&bias), Some(&down_scale), k, 8.0).unwrap();
+        assert_eq!(got_idx.dtype().unwrap(), DType::Int32);
+        assert_eq!(got_w.dtype().unwrap(), DType::Float32);
+
+        // Reference router
+        let probs = Activations::sigmoid(&logits).unwrap();
+        let sel = probs.add(&bias).unwrap();
+        let ref_idx = sel
+            .negative()
+            .unwrap()
+            .argsort(Some(-1))
+            .unwrap()
+            .slice_axis(1, 0, k as i64)
+            .unwrap();
+        let ps = probs.take_along_axis(&ref_idx, -1).unwrap();
+        let den = ps
+            .sum(Some(&[-1]), Some(true))
+            .unwrap()
+            .add_scalar(1e-20)
+            .unwrap();
+        let ds_g = down_scale.take(&ref_idx, 0).unwrap();
+        let ref_w = ps
+            .div(&den)
+            .unwrap()
+            .mul_scalar(8.0)
+            .unwrap()
+            .mul(&ds_g)
+            .unwrap();
+
+        assert_eq!(
+            got_idx.to_int32().unwrap().as_ref(),
+            ref_idx
+                .astype(DType::Int32)
+                .unwrap()
+                .to_int32()
+                .unwrap()
+                .as_ref(),
+            "moe_route indices & tie-break mismatch"
+        );
+        let dw = max_abs_diff(&got_w.to_float32().unwrap(), &ref_w.to_float32().unwrap());
+        assert!(dw <= 1e-5, "moe_route weights max_diff={dw}");
+
+        // Test moe_combine (both unsorted and sorted with uint32 inv_order)
+        let down_unsorted =
+            MxArray::from_float32(&rng.vec(t * k * d, 1.5), &[t as i64, k as i64, 1, d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+        let ref_comb = down_unsorted
+            .reshape(&[t as i64, k as i64, d as i64])
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .mul(&got_w.expand_dims(-1).unwrap())
+            .unwrap()
+            .sum(Some(&[1]), Some(false))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let got_comb_unsorted =
+            inkling2_moe_combine(&down_unsorted, &got_w, None, DType::BFloat16).unwrap();
+        assert!(
+            max_abs_diff(
+                &got_comb_unsorted.to_float32().unwrap(),
+                &ref_comb.to_float32().unwrap()
+            ) <= 1e-2
+        );
+
+        let flat_idx = got_idx.reshape(&[-1]).unwrap();
+        let order = flat_idx.argsort(Some(-1)).unwrap();
+        let inv = order.argsort(Some(-1)).unwrap();
+        let down_sorted = down_unsorted
+            .reshape(&[(t * k) as i64, 1, d as i64])
+            .unwrap()
+            .take(&order, 0)
+            .unwrap();
+        let got_comb_sorted =
+            inkling2_moe_combine(&down_sorted, &got_w, Some(&inv), DType::BFloat16).unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &got_comb_sorted.to_float32().unwrap(),
+                &got_comb_unsorted.to_float32().unwrap()
+            ),
+            0.0,
+            "sorted moe_combine must be bit-identical to unsorted"
+        );
+    }
+
+    #[test]
+    fn inkling2_lm_head_softcap_and_argmax_match_reference() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0xa0a0);
+        let (t, padded_v, unpadded_v) = (4usize, 4096usize, 4003usize);
+        let mut lv = rng.vec(t * padded_v, 25.0);
+        // Row 0: place a huge value in padded tail (must be ignored!) and a saturation tie at idx 50 & 3000!
+        lv[unpadded_v + 5] = 999.0;
+        lv[50] = 400.0;
+        lv[3000] = 500.0; // both saturate 30*tanh(x/30) to 30.0f -> tie must pick smaller idx 50!
+        let logits = MxArray::from_float32(&lv, &[t as i64, padded_v as i64]).unwrap();
+        let bias = MxArray::from_float32(&rng.vec(padded_v, 5.0), &[1, padded_v as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // 1. Target lm_head mode (no bias)
+        let got_sc = inkling2_lm_head_softcap(&logits, None, unpadded_v, 30.0, false).unwrap();
+        let ref_sc = logits
+            .slice(&[0, 0], &[t as i64, unpadded_v as i64])
+            .unwrap()
+            .mul_scalar(1.0 / 30.0)
+            .unwrap()
+            .tanh()
+            .unwrap()
+            .mul_scalar(30.0)
+            .unwrap();
+        assert!(max_abs_diff(&got_sc.to_float32().unwrap(), &ref_sc.to_float32().unwrap()) <= 1e-5);
+        let got_am =
+            inkling2_lm_head_softcap_argmax(&logits, None, unpadded_v, 30.0, false).unwrap();
+        let ref_am = ref_sc
+            .argmax(-1, Some(false))
+            .unwrap()
+            .astype(DType::Int32)
+            .unwrap();
+        assert_eq!(
+            got_am.to_int32().unwrap().as_ref(),
+            ref_am.to_int32().unwrap().as_ref()
+        );
+        assert_eq!(got_am.to_int32().unwrap()[0], 50);
+
+        // 2. DSpark Markov mode (BF16 base + BF16 bias with BF16 round + softcap + argmax)
+        let base_bf = logits.astype(DType::BFloat16).unwrap();
+        let got_m_sc =
+            inkling2_lm_head_softcap(&base_bf, Some(&bias), unpadded_v, 30.0, true).unwrap();
+        let ref_m_sum = base_bf
+            .astype(DType::Float32)
+            .unwrap()
+            .add(&bias.astype(DType::Float32).unwrap())
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+            .slice(&[0, 0], &[t as i64, unpadded_v as i64])
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap();
+        let ref_m_sc = ref_m_sum
+            .mul_scalar(1.0 / 30.0)
+            .unwrap()
+            .tanh()
+            .unwrap()
+            .mul_scalar(30.0)
+            .unwrap();
+        assert!(
+            max_abs_diff(
+                &got_m_sc.to_float32().unwrap(),
+                &ref_m_sc.to_float32().unwrap()
+            ) <= 1e-5
+        );
+        let got_m_am =
+            inkling2_lm_head_softcap_argmax(&base_bf, Some(&bias), unpadded_v, 30.0, true).unwrap();
+        let ref_m_am = ref_m_sc
+            .argmax(-1, Some(false))
+            .unwrap()
+            .astype(DType::Int32)
+            .unwrap();
+        assert_eq!(
+            got_m_am.to_int32().unwrap().as_ref(),
+            ref_m_am.to_int32().unwrap().as_ref()
+        );
+    }
+
+    #[test]
+    fn inkling2_stage2_kernels_handle_non_contiguous_inputs_without_clobber() {
+        if !metal_available() {
+            return;
+        }
+        let mut rng = Rng(0xc10b);
+
+        // 1. sconv_k4_kv_prep with strided (non-contiguous) k_hist / v_hist views (the exact
+        //    DSpark `StreamShortConvTape::commit_prefix` layout from fused `qrgkv`!).
+        let (t, n_kv, hd) = (8usize, 8usize, 128usize);
+        let kv_dim = n_kv * hd;
+        let fused_cols = 8600usize;
+        let big = MxArray::from_float32(
+            &rng.vec(t * fused_cols, 1.0),
+            &[t as i64, fused_cols as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let k_in = big
+            .slice(&[0, 6552], &[t as i64, (6552 + kv_dim) as i64])
+            .unwrap();
+        let v_in = big
+            .slice(&[0, 7576], &[t as i64, (7576 + kv_dim) as i64])
+            .unwrap();
+        // Non-contiguous `[3, kv_dim]` histories sliced directly out of `big` (row stride = 8600!)
+        let kh_nc = big.slice(&[1, 6552], &[4, (6552 + kv_dim) as i64]).unwrap();
+        let vh_nc = big.slice(&[2, 7576], &[5, (7576 + kv_dim) as i64]).unwrap();
+        // Contiguous copies via reshape/astype roundtrip for reference
+        let kh_c = MxArray::from_float32(&kh_nc.to_float32().unwrap(), &[3, kv_dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let vh_c = MxArray::from_float32(&vh_nc.to_float32().unwrap(), &[3, kv_dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let kw = MxArray::from_float32(&rng.vec(kv_dim * 4, 0.2), &[kv_dim as i64, 4]).unwrap();
+        let vw = MxArray::from_float32(&rng.vec(kv_dim * 4, 0.2), &[kv_dim as i64, 4]).unwrap();
+        let (k_got, v_got, kh_got, vh_got) = inkling2_sconv_k4_kv_prep(
+            &k_in,
+            &v_in,
+            &kw,
+            &vw,
+            None,
+            None,
+            None,
+            &[&kh_nc],
+            &[&vh_nc],
+            1,
+            false,
+            n_kv,
+            hd,
+            22.627417,
+            1e-6,
+            1e-6,
+        )
+        .unwrap();
+        let (k_ref, v_ref, kh_ref, vh_ref) = inkling2_sconv_k4_kv_prep(
+            &k_in,
+            &v_in,
+            &kw,
+            &vw,
+            None,
+            None,
+            None,
+            &[&kh_c],
+            &[&vh_c],
+            1,
+            false,
+            n_kv,
+            hd,
+            22.627417,
+            1e-6,
+            1e-6,
+        )
+        .unwrap();
+        assert_eq!(
+            max_abs_diff(&k_got.to_float32().unwrap(), &k_ref.to_float32().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            max_abs_diff(&v_got.to_float32().unwrap(), &v_ref.to_float32().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            max_abs_diff(&kh_got.to_float32().unwrap(), &kh_ref.to_float32().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            max_abs_diff(&vh_got.to_float32().unwrap(), &vh_ref.to_float32().unwrap()),
+            0.0
+        );
+
+        // 2. block_attn_res with transposed (non-contiguous) queries & norm_weight
+        let (rows, dim) = (4usize, 256usize);
+        let s0 = MxArray::from_float32(&rng.vec(rows * dim, 1.0), &[rows as i64, dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let s1 = MxArray::from_float32(&rng.vec(rows * dim, 1.0), &[rows as i64, dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let q_t = MxArray::from_float32(&rng.vec(3 * dim, 0.1), &[dim as i64, 3]).unwrap();
+        let q_nc = q_t.transpose(None).unwrap(); // [3, dim] non-contiguous!
+        let q_c = MxArray::from_float32(&q_nc.to_float32().unwrap(), &[3, dim as i64]).unwrap();
+        let nw_t = MxArray::from_float32(&rng.vec(3 * dim, 1.0), &[dim as i64, 3]).unwrap();
+        let nw_nc = nw_t.transpose(None).unwrap();
+        let nw_c = MxArray::from_float32(&nw_nc.to_float32().unwrap(), &[3, dim as i64]).unwrap();
+        let out_nc = inkling2_block_attn_res(
+            &[&s0, &s1],
+            None,
+            &q_nc,
+            Some(&nw_nc),
+            1e-6,
+            1e-6,
+            false,
+            DType::BFloat16,
+        )
+        .unwrap();
+        let out_c = inkling2_block_attn_res(
+            &[&s0, &s1],
+            None,
+            &q_c,
+            Some(&nw_c),
+            1e-6,
+            1e-6,
+            false,
+            DType::BFloat16,
+        )
+        .unwrap();
+        assert_eq!(
+            max_abs_diff(&out_nc.to_float32().unwrap(), &out_c.to_float32().unwrap()),
+            0.0
+        );
+
+        // 3. sconv_k4_ragged with non-contiguous transposed history
+        let h_t = MxArray::from_float32(&rng.vec(3 * dim, 1.0), &[dim as i64, 3])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let h_nc = h_t.transpose(None).unwrap();
+        let h_c = MxArray::from_float32(&h_nc.to_float32().unwrap(), &[3, dim as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let w_s = MxArray::from_float32(&rng.vec(dim * 4, 0.2), &[dim as i64, 4]).unwrap();
+        let (ry_nc, rh_nc) =
+            inkling2_sconv_k4_ragged(&s0, &w_s, None, None, Some(&s1), None, &[&h_nc], 1, false)
+                .unwrap();
+        let (ry_c, rh_c) =
+            inkling2_sconv_k4_ragged(&s0, &w_s, None, None, Some(&s1), None, &[&h_c], 1, false)
+                .unwrap();
+        assert_eq!(
+            max_abs_diff(&ry_nc.to_float32().unwrap(), &ry_c.to_float32().unwrap()),
+            0.0
+        );
+        assert_eq!(
+            max_abs_diff(&rh_nc.to_float32().unwrap(), &rh_c.to_float32().unwrap()),
+            0.0
+        );
+    }
+
+    #[test]
+    fn inkling2_markov_gate_matches_reference() {
+        if !metal_available() {
+            return;
+        }
+        use crate::models::inkling2::dspark::markov_gate;
+
+        let mut rng = Rng(0x909);
+        let rank = 256usize;
+        for rows in [1usize, 4usize] {
+            let rec = MxArray::from_float32(
+                &rng.vec(rows * 3 * rank, 1.5),
+                &[rows as i64, (3 * rank) as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let ctx = MxArray::from_float32(
+                &rng.vec(rows * 3 * rank, 1.5),
+                &[rows as i64, (3 * rank) as i64],
+            )
+            .unwrap();
+            let state =
+                MxArray::from_float32(&rng.vec(rows * rank, 1.0), &[rows as i64, rank as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+
+            // Reference: `raw = f32(rec) + ctx` -> `markov_gate(&raw, &state, rank)`
+            let raw = rec.astype(DType::Float32).unwrap().add(&ctx).unwrap();
+            let (ref_state, ref_lat) = markov_gate(&raw, &state, rank as i64).unwrap();
+
+            // Fused with ctx
+            let (got_state, got_lat) = inkling2_markov_gate(&rec, Some(&ctx), &state).unwrap();
+            assert_eq!(
+                max_abs_diff(
+                    &got_state.to_float32().unwrap(),
+                    &ref_state.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate fused state mismatch (rows={rows})"
+            );
+            assert_eq!(
+                max_abs_diff(
+                    &got_lat.to_float32().unwrap(),
+                    &ref_lat.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate fused latent mismatch (rows={rows})"
+            );
+
+            // Without ctx (pre-summed raw)
+            let (got_state2, got_lat2) = inkling2_markov_gate(&raw, None, &state).unwrap();
+            assert_eq!(
+                max_abs_diff(
+                    &got_state2.to_float32().unwrap(),
+                    &ref_state.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate raw state mismatch (rows={rows})"
+            );
+            assert_eq!(
+                max_abs_diff(
+                    &got_lat2.to_float32().unwrap(),
+                    &ref_lat.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate raw latent mismatch (rows={rows})"
+            );
+
+            // Non-contiguous strided ctx (slice from wider [rows, 2, 3*rank] tensor)
+            let wide_ctx = MxArray::concatenate(&ctx, &ctx, -1).unwrap();
+            let strided_ctx = wide_ctx
+                .slice(&[0, 0], &[rows as i64, (3 * rank) as i64])
+                .unwrap();
+            let (got_state3, got_lat3) =
+                inkling2_markov_gate(&rec, Some(&strided_ctx), &state).unwrap();
+            assert_eq!(
+                max_abs_diff(
+                    &got_state3.to_float32().unwrap(),
+                    &ref_state.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate strided ctx state mismatch (rows={rows})"
+            );
+            assert_eq!(
+                max_abs_diff(
+                    &got_lat3.to_float32().unwrap(),
+                    &ref_lat.to_float32().unwrap()
+                ),
+                0.0,
+                "markov_gate strided ctx latent mismatch (rows={rows})"
+            );
+        }
+    }
+
+    #[test]
+    fn inkling2_grouped_moe_nvfp4_and_q8_match_reference() {
+        if !metal_available() {
+            return;
+        }
+        use crate::models::quantized_linear::{
+            DEFAULT_QUANT_MODE, NVFP4_MODE, QuantizedSwitchLinear,
+        };
+
+        let mut rng = Rng(0x2026_0303);
+        let e = 16usize;
+        let top_k = 4usize;
+        let d = 256usize;
+        let inter = 128usize;
+        let gate_cap = 4.0_f32;
+        let up_cap = 25.0_f32;
+
+        // Build NVFP4 weights (uint32 [E, N, K/8], uint8 scales [E, N, K/16], f32 outer [E])
+        let nv_gu_w_f32 = MxArray::from_float32(
+            &rng.vec(e * 2 * inter * d, 0.5),
+            &[e as i64, (2 * inter) as i64, d as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let nv_dn_w_f32 = MxArray::from_float32(
+            &rng.vec(e * d * inter, 0.5),
+            &[e as i64, d as i64, inter as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let quantize_tensor = |w: &MxArray,
+                               group_size: i32,
+                               bits: i32,
+                               mode: &std::ffi::CStr|
+         -> (MxArray, MxArray, Option<MxArray>) {
+            let mut out_q = std::ptr::null_mut();
+            let mut out_s = std::ptr::null_mut();
+            let mut out_b = std::ptr::null_mut();
+            let ok = unsafe {
+                mlx_sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                    &mut out_q,
+                    &mut out_s,
+                    &mut out_b,
+                )
+            };
+            assert!(ok, "mlx_quantize failed for {mode:?}");
+            let q = MxArray::from_handle(out_q, "q").unwrap();
+            let s = MxArray::from_handle(out_s, "s").unwrap();
+            let b = if out_b.is_null() {
+                None
+            } else {
+                Some(MxArray::from_handle(out_b, "b").unwrap())
+            };
+            (q, s, b)
+        };
+
+        let (nv_gu_w, nv_gu_s, _) = quantize_tensor(&nv_gu_w_f32, 16, 4, c"nvfp4");
+        let (nv_dn_w, nv_dn_s, _) = quantize_tensor(&nv_dn_w_f32, 16, 4, c"nvfp4");
+        let nv_gu_outer_vals: Vec<f32> = (0..e).map(|i| 0.5 + 0.05 * i as f32).collect();
+        let nv_gu_outer = MxArray::from_float32(&nv_gu_outer_vals, &[e as i64]).unwrap();
+        let nv_gu_lin = QuantizedSwitchLinear::new(
+            nv_gu_w.clone(),
+            nv_gu_s.clone(),
+            None,
+            16,
+            4,
+            NVFP4_MODE.to_string(),
+        )
+        .with_outer_scale(nv_gu_outer.clone());
+        let nv_dn_lin = QuantizedSwitchLinear::new(
+            nv_dn_w.clone(),
+            nv_dn_s.clone(),
+            None,
+            16,
+            4,
+            NVFP4_MODE.to_string(),
+        );
+
+        // Build Q8_0 affine weights (BF16 sidecars, matching Inkling-2-Mini blk.20..23)
+        let (q8_gu_w, q8_gu_s, q8_gu_b_opt) = quantize_tensor(&nv_gu_w_f32, 32, 8, c"affine");
+        let (q8_dn_w, q8_dn_s, q8_dn_b_opt) = quantize_tensor(&nv_dn_w_f32, 32, 8, c"affine");
+        let q8_gu_s = q8_gu_s.astype(DType::BFloat16).unwrap();
+        let q8_gu_b = q8_gu_b_opt.unwrap().astype(DType::BFloat16).unwrap();
+        let q8_dn_s = q8_dn_s.astype(DType::BFloat16).unwrap();
+        let q8_dn_b = q8_dn_b_opt.unwrap().astype(DType::BFloat16).unwrap();
+        let q8_gu_lin = QuantizedSwitchLinear::new(
+            q8_gu_w.clone(),
+            q8_gu_s.clone(),
+            Some(q8_gu_b.clone()),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let q8_dn_lin = QuantizedSwitchLinear::new(
+            q8_dn_w.clone(),
+            q8_dn_s.clone(),
+            Some(q8_dn_b.clone()),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+
+        for &rows in &[1usize, 4, 8, 32, 128] {
+            if !inkling2_grouped_moe_available(rows) {
+                continue;
+            }
+            let x = MxArray::from_float32(&rng.vec(rows * d, 0.8), &[rows as i64, d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+
+            // Construct valid distinct top_k expert IDs per token (with deliberate expert reuse across rows!)
+            let mut idx_vec = Vec::with_capacity(rows * top_k);
+            let mut gam_vec = Vec::with_capacity(rows * top_k);
+            for r in 0..rows {
+                // Force hot experts 0..4 to hit >4 rows when rows >= 8 (exercising NAX path)
+                // AND sparse experts to hit 1..4 rows (exercising SIMD QMV path)!
+                let base = if r % 3 == 0 { 0 } else { (r * 3) % (e - top_k) };
+                for k in 0..top_k {
+                    idx_vec.push((base + k) as i32);
+                    gam_vec.push(0.25 + 0.1 * k as f32);
+                }
+            }
+            let topk = MxArray::from_int32(&idx_vec, &[rows as i64, top_k as i64]).unwrap();
+            let gamma = MxArray::from_float32(&gam_vec, &[rows as i64, top_k as i64]).unwrap();
+
+            // Reference helper using MLX gather_qmm + inkling2_situ + inkling2_moe_combine
+            let run_ref = |gu: &QuantizedSwitchLinear, dn: &QuantizedSwitchLinear| -> Vec<f32> {
+                let x_4d = x.reshape(&[rows as i64, 1, 1, d as i64]).unwrap();
+                let gu_out = gu.forward_without_outer_scale(&x_4d, &topk, false).unwrap();
+                let outer_arg = gu.outer_scale().map(|s| (s, &topk));
+                let act = inkling2_situ(&gu_out, outer_arg, gate_cap, up_cap, false).unwrap();
+                let dn_out = dn.forward_without_outer_scale(&act, &topk, false).unwrap();
+                let comb = inkling2_moe_combine(&dn_out, &gamma, None, DType::BFloat16).unwrap();
+                comb.to_float32().unwrap().as_ref().to_vec()
+            };
+
+            let err_stats = |a: &[f32], b: &[f32]| -> (f32, f32, f32) {
+                let mut max_abs = 0.0_f32;
+                let mut max_rel = 0.0_f32;
+                let mut sum_sq = 0.0_f64;
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    let abs_e = (x - y).abs();
+                    let denom = x.abs().max(y.abs()).max(1.0_f32);
+                    max_abs = max_abs.max(abs_e);
+                    max_rel = max_rel.max(abs_e / denom);
+                    sum_sq += f64::from(abs_e) * f64::from(abs_e);
+                }
+                let rmse = (sum_sq / a.len().max(1) as f64).sqrt() as f32;
+                (max_abs, max_rel, rmse)
+            };
+
+            // 1. NVFP4 parity
+            let ref_nv = run_ref(&nv_gu_lin, &nv_dn_lin);
+            let got_nv = inkling2_grouped_moe(
+                &x,
+                &topk,
+                &gamma,
+                &nv_gu_w,
+                &nv_gu_s,
+                Some(&nv_gu_outer),
+                &nv_dn_w,
+                &nv_dn_s,
+                None,
+                false,
+                gate_cap,
+                up_cap,
+                true,
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap();
+            let (abs_nv, rel_nv, rmse_nv) = err_stats(got_nv.as_ref(), &ref_nv);
+            eprintln!(
+                "  [grouped_moe NVFP4 M={rows:3}] max_abs={abs_nv:.5}, max_rel={rel_nv:.5}, rmse={rmse_nv:.6}"
+            );
+            assert!(
+                rmse_nv <= 0.01 && rel_nv <= 0.05,
+                "NVFP4 grouped MoE mismatch at M={rows}: max_abs={abs_nv}, max_rel={rel_nv}, rmse={rmse_nv}"
+            );
+
+            // 2. Q8_0 parity
+            let ref_q8 = run_ref(&q8_gu_lin, &q8_dn_lin);
+            let got_q8 = inkling2_grouped_moe(
+                &x,
+                &topk,
+                &gamma,
+                &q8_gu_w,
+                &q8_gu_s,
+                Some(&q8_gu_b),
+                &q8_dn_w,
+                &q8_dn_s,
+                Some(&q8_dn_b),
+                true,
+                gate_cap,
+                up_cap,
+                true,
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap();
+            let (abs_q8, rel_q8, rmse_q8) = err_stats(got_q8.as_ref(), &ref_q8);
+            eprintln!(
+                "  [grouped_moe Q8_0  M={rows:3}] max_abs={abs_q8:.5}, max_rel={rel_q8:.5}, rmse={rmse_q8:.6}"
+            );
+            assert!(
+                rmse_q8 <= 0.01 && rel_q8 <= 0.05,
+                "Q8_0 grouped MoE mismatch at M={rows}: max_abs={abs_q8}, max_rel={rel_q8}, rmse={rmse_q8}"
+            );
+        }
+    }
+}

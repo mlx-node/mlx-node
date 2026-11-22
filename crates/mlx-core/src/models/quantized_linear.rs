@@ -446,6 +446,33 @@ impl LinearProj {
         self.forward(x)
     }
 
+    /// Logits projection that avoids casting an FP32 affine quantized_matmul
+    /// output down to BF16 when the caller immediately consumes FP32 logits
+    /// (e.g., for softcap / argmax). Native BF16 projections still return BF16.
+    pub(crate) fn forward_logits_keep_f32(&self, x: &MxArray) -> Result<MxArray> {
+        if let Self::Quantized(q) = self {
+            if q.source_head {
+                return self.forward(x);
+            }
+            if let Some(logits) = q.try_head_f32(x)? {
+                return Ok(logits);
+            }
+            return q.forward_keep_f32(x);
+        }
+        self.forward(x)
+    }
+
+    /// Hoist Float16 affine sidecars (`scales`/`biases`/`bias`) to Float32 once at load.
+    pub(crate) fn promote_affine_sidecars_to_f32(
+        &mut self,
+        compute_dtype: crate::array::DType,
+    ) -> Result<()> {
+        if let Self::Quantized(q) = self {
+            q.promote_affine_sidecars_to_f32(compute_dtype)?;
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         match self {
             LinearProj::Standard(l) => l.forward(x),
@@ -2876,6 +2903,17 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        self.forward_with_rounding(x, true)
+    }
+
+    /// Like [`Self::forward`], but skips the trailing FP32->BF16 cast when an
+    /// affine `quantized_matmul` already produced FP32 (for `lm_head` callers
+    /// that consume FP32 logits directly).
+    pub(crate) fn forward_keep_f32(&self, x: &MxArray) -> Result<MxArray> {
+        self.forward_with_rounding(x, false)
+    }
+
+    fn forward_with_rounding(&self, x: &MxArray, round_affine_to_act: bool) -> Result<MxArray> {
         let transformed = self
             .hadamard
             .as_ref()
@@ -2992,7 +3030,8 @@ impl QuantizedLinear {
         // with the promoted path's F32 math and a single BF16 rounding, instead
         // of casting x up and the result back. Small row counts only, so M=1
         // decode and prefill graphs keep their standalone casts.
-        if activation_dtype == Some(crate::array::DType::BFloat16)
+        if round_affine_to_act
+            && activation_dtype == Some(crate::array::DType::BFloat16)
             && self.bias.is_none()
             && self.scales.dtype()? == crate::array::DType::Float32
             && let Some(biases) = &self.biases
@@ -3000,7 +3039,8 @@ impl QuantizedLinear {
         {
             let k = x.shape_at(x.ndim()?.saturating_sub(1))?;
             let rows = if k > 0 { x.size()? as i64 / k } else { 0 };
-            if (2..=8).contains(&rows) {
+            let out_features = self.weight.shape_at(0)?;
+            if (2..=8).contains(&rows) && out_features <= 65536 {
                 if let Some(out) = crate::kernels::linear::affine_bf16_matmul_few(
                     x,
                     &self.weight,
@@ -3115,8 +3155,15 @@ impl QuantizedLinear {
             self.clear_cuda_dense_prefill();
         }
 
-        let mode_c = CString::new(self.mode.as_str())
-            .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+        let mode_owned;
+        let mode_ptr = match intern_quant_mode(self.mode.as_str()) {
+            Some(cstr) => cstr.as_ptr(),
+            None => {
+                mode_owned = CString::new(self.mode.as_str())
+                    .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+                mode_owned.as_ptr()
+            }
+        };
 
         let biases_ptr = self
             .biases
@@ -3132,7 +3179,7 @@ impl QuantizedLinear {
                 true, // transpose
                 self.group_size,
                 self.bits,
-                mode_c.as_ptr(),
+                mode_ptr,
             )
         };
         let mut result = MxArray::from_handle(handle, "quantized_matmul")?;
@@ -3142,7 +3189,8 @@ impl QuantizedLinear {
             result = result.add(b)?;
         }
 
-        if let Some(dtype) = activation_dtype
+        if round_affine_to_act
+            && let Some(dtype) = activation_dtype
             && result.dtype()? != dtype
         {
             result = result.astype(dtype)?;
@@ -3742,6 +3790,20 @@ impl QuantizedLinear {
 
 /// Expert-indexed linear backed by a serialized quantized weight format.
 ///
+/// Pre-interned C strings for common quantization mode names so hot-path
+/// `QuantizedLinear::forward` and `QuantizedSwitchLinear::forward` avoid
+/// per-call `CString::new` heap allocations.
+#[inline]
+fn intern_quant_mode(mode: &str) -> Option<&'static std::ffi::CStr> {
+    match mode {
+        "affine" => Some(c"affine"),
+        "nvfp4" => Some(c"nvfp4"),
+        "mxfp4" => Some(c"mxfp4"),
+        "mxfp8" => Some(c"mxfp8"),
+        _ => crate::kernels::linear::intern_kquant_mode(mode),
+    }
+}
+
 /// Affine/MX/NVFP modes use fused gather_qmm. Plain `fp8_e4m3` retains raw
 /// Uint8 checkpoint storage, reconstructs a BF16 expert stack once at load,
 /// and runs ordinary A16 gather_mm; it does not claim native W8A8.
@@ -3749,6 +3811,9 @@ pub struct QuantizedSwitchLinear {
     weight: MxArray,         // Packed uint32 [num_experts, out, in_packed]
     scales: MxArray,         // Quantization scales [num_experts, out, groups]
     biases: Option<MxArray>, // Quantization biases (for affine mode)
+    /// Optional per-expert F32 outer scale `[num_experts]` (e.g., NVFP4
+    /// `ffn_gate_up_exps.scale` / `ffn_down_exps.scale` in Inkling-2-Mini).
+    outer_scale: Option<MxArray>,
     group_size: i32,
     bits: i32,
     mode: String,
@@ -3823,6 +3888,7 @@ impl QuantizedSwitchLinear {
             weight,
             scales,
             biases,
+            outer_scale: None,
             group_size,
             bits,
             mode,
@@ -3835,6 +3901,7 @@ impl QuantizedSwitchLinear {
             weight,
             scales,
             biases: None,
+            outer_scale: None,
             group_size: FP8_E4M3_GROUP_SIZE,
             bits: FP8_E4M3_BITS,
             mode: FP8_E4M3_MODE.to_string(),
@@ -3842,8 +3909,54 @@ impl QuantizedSwitchLinear {
         }
     }
 
-    /// Forward pass using gather_qmm.
+    /// Attach a per-expert F32 outer scale `[num_experts]` multiplied into the
+    /// output of [`Self::forward`].
+    pub fn with_outer_scale(mut self, outer_scale: MxArray) -> Self {
+        self.outer_scale = Some(outer_scale);
+        self
+    }
+
+    /// Optional per-expert F32 outer scale `[num_experts]`.
+    pub fn outer_scale(&self) -> Option<&MxArray> {
+        self.outer_scale.as_ref()
+    }
+
+    /// Forward pass using gather_qmm, applying the optional per-expert
+    /// `outer_scale` if attached.
     pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
+        let mut result = self.forward_without_outer_scale(x, indices, sorted)?;
+        if let Some(outer) = self.outer_scale.as_ref() {
+            let out_dtype = result.dtype()?;
+            let gathered = outer.take(indices, 0)?;
+            let mut broadcast_shape = indices.shape()?.to_vec();
+            let result_ndim = result.ndim()? as usize;
+            if result_ndim < broadcast_shape.len() {
+                return Err(Error::from_reason(format!(
+                    "QuantizedSwitchLinear outer_scale broadcast mismatch: result ndim {result_ndim} < indices ndim {}",
+                    broadcast_shape.len()
+                )));
+            }
+            broadcast_shape.resize(result_ndim, 1);
+            let scale = gathered.reshape(&broadcast_shape)?;
+            let scaled = result.mul(&scale)?;
+            result = if scaled.dtype()? != out_dtype {
+                scaled.astype(out_dtype)?
+            } else {
+                scaled
+            };
+        }
+        Ok(result)
+    }
+
+    /// Forward pass using gather_qmm WITHOUT applying `outer_scale`.
+    /// Callers that fold `down_proj.outer_scale()` directly into routing
+    /// weights `gamma` use this to avoid an extra multiply pass.
+    pub fn forward_without_outer_scale(
+        &self,
+        x: &MxArray,
+        indices: &MxArray,
+        sorted: bool,
+    ) -> Result<MxArray> {
         let (base, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
         if tiled {
             if matches!(base, "q4k" | "q5k" | "q6k")
@@ -3889,7 +4002,7 @@ impl QuantizedSwitchLinear {
                 .map(|b| untile(b, if base == "q6k" { 1 } else { 2 }))
                 .transpose()?;
             row_major.mode = base.to_owned();
-            return row_major.forward(x, indices, sorted);
+            return row_major.forward_without_outer_scale(x, indices, sorted);
         }
         if self.mode == FP8_E4M3_MODE {
             let weight_t = self.fp8_dequant_weight_t.as_ref().ok_or_else(|| {
@@ -3910,8 +4023,15 @@ impl QuantizedSwitchLinear {
             None
         };
 
-        let mode_c = CString::new(self.mode.as_str())
-            .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+        let mode_owned;
+        let mode_ptr = match intern_quant_mode(self.mode.as_str()) {
+            Some(cstr) => cstr.as_ptr(),
+            None => {
+                mode_owned = CString::new(self.mode.as_str())
+                    .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
+                mode_owned.as_ptr()
+            }
+        };
 
         let biases_ptr = self
             .biases
@@ -3929,7 +4049,7 @@ impl QuantizedSwitchLinear {
                 true,
                 self.group_size,
                 self.bits,
-                mode_c.as_ptr(),
+                mode_ptr,
                 sorted,
             )
         };
@@ -3940,6 +4060,38 @@ impl QuantizedSwitchLinear {
             result = result.astype(dtype)?;
         }
         Ok(result)
+    }
+
+    fn promote_affine_sidecars(&mut self, target: crate::array::DType) -> Result<()> {
+        if self.mode != DEFAULT_QUANT_MODE {
+            return Ok(());
+        }
+        if self.scales.dtype()? == crate::array::DType::Float16 {
+            self.scales = self.scales.astype(target)?;
+        }
+        if let Some(b) = &self.biases
+            && b.dtype()? == crate::array::DType::Float16
+        {
+            self.biases = Some(b.astype(target)?);
+        }
+        Ok(())
+    }
+
+    /// Cast affine-mode `scales`/`biases` f16→bf16 once at load so BF16
+    /// `gather_qmm` runs native BF16 kernels with zero per-step F16→F32 casts.
+    pub fn promote_affine_sidecars_to_bf16(&mut self) -> Result<()> {
+        self.promote_affine_sidecars(crate::array::DType::BFloat16)
+    }
+
+    /// Cast affine-mode `scales`/`biases` f16→f32 once at load.
+    pub fn promote_affine_sidecars_to_f32(
+        &mut self,
+        compute_dtype: crate::array::DType,
+    ) -> Result<()> {
+        if compute_dtype == crate::array::DType::Float16 {
+            return Ok(());
+        }
+        self.promote_affine_sidecars(crate::array::DType::Float32)
     }
 
     pub fn set_weight(&mut self, weight: MxArray) {
@@ -3973,6 +4125,14 @@ impl QuantizedSwitchLinear {
     pub fn get_biases(&self) -> Option<&MxArray> {
         self.biases.as_ref()
     }
+
+    pub(crate) fn bits(&self) -> i32 {
+        self.bits
+    }
+
+    pub(crate) fn group_size(&self) -> i32 {
+        self.group_size
+    }
 }
 
 impl Clone for QuantizedSwitchLinear {
@@ -3981,6 +4141,7 @@ impl Clone for QuantizedSwitchLinear {
             weight: self.weight.clone(),
             scales: self.scales.clone(),
             biases: self.biases.clone(),
+            outer_scale: self.outer_scale.clone(),
             group_size: self.group_size,
             bits: self.bits,
             mode: self.mode.clone(),
@@ -4024,7 +4185,8 @@ pub fn try_build_mxfp4_quantized_switch_linear(
     ))
 }
 
-/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys.
+/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys,
+/// attaching optional per-expert F32 `{prefix}.scale` outer scale when present.
 /// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
 pub fn try_build_nvfp4_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
@@ -4032,14 +4194,18 @@ pub fn try_build_nvfp4_quantized_switch_linear(
 ) -> Option<QuantizedSwitchLinear> {
     let weight = params.get(&format!("{}.weight", key_prefix))?;
     let scales = params.get(&format!("{}.scales", key_prefix))?;
-    Some(QuantizedSwitchLinear::new(
+    let mut qsl = QuantizedSwitchLinear::new(
         weight.clone(),
         scales.clone(),
         None,
         NVFP4_GROUP_SIZE,
         NVFP4_BITS,
         NVFP4_MODE.to_string(),
-    ))
+    );
+    if let Some(outer) = params.get(&format!("{}.scale", key_prefix)) {
+        qsl = qsl.with_outer_scale(outer.clone());
+    }
+    Some(qsl)
 }
 
 /// Build a plain E4M3 expert stack and reconstruct it to BF16 once at load.
@@ -8038,6 +8204,57 @@ mod source_mixer_fallback_tests {
         }
         assert_eq!(traces, 1);
         crate::compiled_graph::erase_compiled_graphs_matching(u64::MAX, key);
+        Ok(())
+    }
+    #[test]
+    fn quantized_switch_linear_outer_scale_applies_per_expert_and_preserves_dtype() -> Result<()> {
+        use crate::array::DType;
+        // 3 experts, N=4, K=64 (NVFP4: weight [3, 4, 8] uint32, scales [3, 4, 4] uint8).
+        // Pack all codes = 2 (E2M1 value 1.0) and all scales = 0x38 (E4M3 value 1.0).
+        let weight_words = vec![0x2222_2222u32; 3 * 4 * 8];
+        let scale_bytes = vec![0x38u8; 3 * 4 * 4];
+        let outer_vals = vec![2.0f32, 0.5f32, -3.0f32];
+        let weight = MxArray::from_uint32(&weight_words, &[3, 4, 8])?;
+        let scales = MxArray::from_uint8(&scale_bytes, &[3, 4, 4])?;
+        let outer = MxArray::from_float32(&outer_vals, &[3])?;
+
+        let mut params = HashMap::new();
+        params.insert("moe.down_proj.weight".to_string(), weight);
+        params.insert("moe.down_proj.scales".to_string(), scales);
+        params.insert("moe.down_proj.scale".to_string(), outer);
+
+        let qsl = try_build_nvfp4_quantized_switch_linear(&params, "moe.down_proj")
+            .expect("should build NVFP4 QuantizedSwitchLinear with .scale");
+        assert!(qsl.outer_scale().is_some());
+
+        // x: [T=2, 1, 1, K=64] BF16 ones -> raw dot per expert = 64.0
+        let x = MxArray::from_float32(&vec![1.0f32; 2 * 64], &[2, 1, 1, 64])?
+            .astype(DType::BFloat16)?;
+        // indices: [T=2, top_k=2] -> [[0, 2], [1, 0]]
+        let indices = MxArray::from_uint32(&[0, 2, 1, 0], &[2, 2])?;
+
+        let raw = qsl.forward_without_outer_scale(&x, &indices, false)?;
+        let scaled = qsl.forward(&x, &indices, false)?;
+        assert_eq!(raw.dtype()?, DType::BFloat16);
+        assert_eq!(scaled.dtype()?, DType::BFloat16);
+        assert_eq!(scaled.shape()?.to_vec(), vec![2, 2, 1, 4]);
+
+        let raw_vals = raw.to_float32()?;
+        let scaled_vals = scaled.to_float32()?;
+        for &v in raw_vals.iter() {
+            assert!((v - 64.0).abs() < 1e-2, "raw expected 64.0, got {v}");
+        }
+        let expected_experts = [2.0f32, -3.0, 0.5, 2.0];
+        for (slot, &mult) in expected_experts.iter().enumerate() {
+            for j in 0..4 {
+                let got = scaled_vals[slot * 4 + j];
+                let want = 64.0 * mult;
+                assert!(
+                    (got - want).abs() < 1e-1,
+                    "slot {slot} col {j}: got {got}, want {want}"
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -4443,6 +4443,195 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// Read the raw physical blocks (all layers, exact INT8 KTM + scales or BF16 bytes)
+    /// covering the live sliding window ending at block-aligned `boundary` for `seq_id`.
+    ///
+    /// Returns `live_blocks` entries in logical block order `[first_live_block .. boundary/bs)`,
+    /// each entry containing `num_layers` pairs of `(key_blob, value_blob)`.
+    pub fn read_sliding_raw_blocks_for(
+        &self,
+        seq_id: SeqId,
+        boundary: u32,
+    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, String> {
+        if self.sliding_window == 0 {
+            return Err("read_sliding_raw_blocks_for requires a sliding adapter".to_string());
+        }
+        if boundary == 0 || !boundary.is_multiple_of(self.block_size) {
+            return Err(format!(
+                "read_sliding_raw_blocks_for requires a positive multiple of block_size={}, got {boundary}",
+                self.block_size
+            ));
+        }
+        let table = self
+            .block_table_for(seq_id)
+            .ok_or_else(|| format!("read_sliding_raw_blocks_for: missing seq {seq_id}"))?;
+        if table.num_tokens() < boundary {
+            return Err(format!(
+                "read_sliding_raw_blocks_for: boundary {boundary} exceeds seq {seq_id} tokens {}",
+                table.num_tokens()
+            ));
+        }
+        let null_id = self
+            .null_block
+            .as_ref()
+            .map(|b| b.block_id)
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?;
+        let first_live_block = boundary.saturating_sub(self.sliding_window) / self.block_size;
+        let total_blocks = boundary / self.block_size;
+        let live_blocks = total_blocks.saturating_sub(first_live_block) as usize;
+        let mut out = Vec::with_capacity(live_blocks);
+        for b_idx in first_live_block as usize..total_blocks as usize {
+            let block = table.blocks().get(b_idx).ok_or_else(|| {
+                format!("read_sliding_raw_blocks_for: missing block {b_idx} for seq {seq_id}")
+            })?;
+            if block.block_id == null_id {
+                return Err(format!(
+                    "read_sliding_raw_blocks_for: live block {b_idx} was already pruned to null"
+                ));
+            }
+            let layers = self.layer_kv_pool.read_block_all_layers(block.block_id)?;
+            out.push(layers);
+        }
+        Ok(out)
+    }
+
+    /// Restore a sliding-window cache group at block-aligned `boundary` directly from raw
+    /// physical block payloads (`live_blocks` × `num_layers` × `(key_blob, value_blob)`).
+    ///
+    /// Preserves bit-exact INT8 KTM codes + scale planes or BF16 blocks without dequantization,
+    /// placing the reserved null sentinel in logical blocks `[0 .. first_live_block)`.
+    pub fn restore_sliding_raw_blocks_for(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        raw_blocks: &[Vec<(Vec<u8>, Vec<u8>)>],
+    ) -> Result<(), String> {
+        if self.sliding_window == 0 {
+            return Err("restore_sliding_raw_blocks_for requires a sliding adapter".to_string());
+        }
+        if boundary == 0
+            || !boundary.is_multiple_of(self.block_size)
+            || boundary as usize > prompt_tokens.len()
+        {
+            return Err(format!(
+                "restore_sliding_raw_blocks_for: invalid boundary {boundary} for block_size={} prompt_len={}",
+                self.block_size,
+                prompt_tokens.len()
+            ));
+        }
+        let first_live_block = boundary.saturating_sub(self.sliding_window) / self.block_size;
+        let total_blocks = boundary / self.block_size;
+        let live_blocks = total_blocks.saturating_sub(first_live_block);
+        if raw_blocks.len() != live_blocks as usize {
+            return Err(format!(
+                "restore_sliding_raw_blocks_for: expected {live_blocks} live blocks, got {}",
+                raw_blocks.len()
+            ));
+        }
+        let null_block = self
+            .null_block
+            .as_ref()
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?
+            .clone();
+
+        self.release_request_for(seq_id)?;
+        self.begin_request(seq_id)?;
+        let held = self.held_blocks();
+        let reserved = {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+            guard.reserve(live_blocks, held)
+        };
+        let allocated = match reserved {
+            Ok(blocks) => blocks,
+            Err(shortfall_held) => {
+                // Attempt pool growth if this sliding pool is extent-grown.
+                let needed = live_blocks.saturating_sub(shortfall_held).max(1);
+                if self.try_grow_pool(needed) {
+                    let held2 = self.held_blocks();
+                    let retry = self
+                        .allocator
+                        .lock()
+                        .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?
+                        .reserve(live_blocks, held2);
+                    match retry {
+                        Ok(blocks) => blocks,
+                        Err(allocated_count) => {
+                            let _ = self.release_request_for(seq_id);
+                            return Err(format!(
+                                "restore_sliding_raw_blocks_for could allocate only {allocated_count} of \
+                                 {live_blocks} live blocks after pool growth"
+                            ));
+                        }
+                    }
+                } else {
+                    let _ = self.release_request_for(seq_id);
+                    return Err(format!(
+                        "restore_sliding_raw_blocks_for could allocate only {shortfall_held} of \
+                         {live_blocks} live blocks"
+                    ));
+                }
+            }
+        };
+
+        let block_ids: Vec<u32> = allocated.iter().map(|b| b.block_id).collect();
+        let uploads: Vec<(u32, Vec<(&[u8], &[u8])>)> = block_ids
+            .iter()
+            .zip(raw_blocks.iter())
+            .map(|(&block_id, layer_blobs)| {
+                let refs = layer_blobs
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect::<Vec<_>>();
+                (block_id, refs)
+            })
+            .collect();
+        if let Err(error) = self.layer_kv_pool.write_blocks_all_layers(&uploads) {
+            if let Ok(mut guard) = self.allocator.lock() {
+                for block in allocated {
+                    guard.free(block);
+                }
+            }
+            let _ = self.release_request_for(seq_id);
+            return Err(format!(
+                "restore_sliding_raw_blocks_for failed to upload blocks: {error}"
+            ));
+        }
+
+        let Some(table) = self.block_table.as_mut() else {
+            if let Ok(mut guard) = self.allocator.lock() {
+                for block in allocated {
+                    guard.free(block);
+                }
+            }
+            let _ = self.release_request_for(seq_id);
+            return Err(
+                "restore_sliding_raw_blocks_for: begin_request did not install a block table"
+                    .to_string(),
+            );
+        };
+        for _ in 0..first_live_block {
+            table.add_block(Arc::clone(&null_block));
+        }
+        for block in allocated {
+            table.add_block(block);
+        }
+        table.set_num_tokens(boundary);
+        self.request_tokens
+            .extend_from_slice(&prompt_tokens[..boundary as usize]);
+        self.cached_token_count = boundary;
+        self.prefix_lookup_done = true;
+        self.already_registered = false;
+        self.restored_sidecar = None;
+        self.aux_prefix_unbacked = false;
+        #[cfg(target_os = "macos")]
+        self.meta.invalidate(MetadataClear::AttentionInputs);
+        Ok(())
+    }
+
     /// Record tokens emitted/consumed in this request. Updates
     /// `request_tokens` and `block_table.num_tokens`. Caller passes
     /// EVERY token (prompt prefill + decoded output) in order.
@@ -5658,6 +5847,132 @@ impl PagedKVCacheAdapter {
         if !self.adopt_native_write(layer_idx, ok, outputs)? {
             return Err(format!(
                 "update_keys_values_native_ragged: mlx_paged_kv_write_forward returned null (layer={layer_idx}, queries={total_queries})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prebuild and materialize the `int64` slot mapping for a multi-row ragged verify wave
+    /// ONCE per KV cache group (before entering the layer loop) so every layer in the group
+    /// writes via [`Self::update_keys_values_native_with_slot_mapping`] with zero mid-wave
+    /// `eval_arrays` command-buffer stalls.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn build_ragged_slot_mapping(
+        &mut self,
+        rows: &[PagedRaggedRow],
+    ) -> Result<(MxArray, u32), String> {
+        if rows.is_empty() {
+            return Err("build_ragged_slot_mapping requires at least one row".to_string());
+        }
+        let total_queries = rows.iter().try_fold(0u32, |total, row| {
+            if row.query_len == 0 {
+                return Err(format!(
+                    "build_ragged_slot_mapping: sequence {} has an empty query slice",
+                    row.seq_id
+                ));
+            }
+            total
+                .checked_add(row.query_len)
+                .ok_or_else(|| "build_ragged_slot_mapping query count overflow".to_string())
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut slots = Vec::with_capacity(total_queries as usize);
+        for row in rows {
+            if !seen.insert(row.seq_id) {
+                return Err(format!(
+                    "build_ragged_slot_mapping received duplicate sequence {}",
+                    row.seq_id
+                ));
+            }
+            if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
+                return Err(format!(
+                    "build_ragged_slot_mapping: unknown sequence {}",
+                    row.seq_id
+                ));
+            }
+            self.activate_request(row.seq_id)?;
+            let current = self.request_tokens.len() as u32;
+            let expected_first = current.checked_sub(row.query_len).ok_or_else(|| {
+                format!(
+                    "build_ragged_slot_mapping: sequence {} recorded {current} tokens for query length {}",
+                    row.seq_id, row.query_len
+                )
+            })?;
+            if row.first_logical_position != expected_first {
+                return Err(format!(
+                    "build_ragged_slot_mapping: sequence {} position {} does not align with its recorded suffix (expected {expected_first}, current_token_count {current}, query_len {})",
+                    row.seq_id, row.first_logical_position, row.query_len
+                ));
+            }
+            slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
+        }
+        // `MxArray::from_int64` copies host data directly into an already-available
+        // MLX array (`is_available() == true`), so no command-buffer sync is needed.
+        let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
+            .map_err(|error| format!("build_ragged_slot_mapping array: {error}"))?;
+        Ok((slot_mapping, total_queries))
+    }
+
+    /// Graph-native K/V write using a prebuilt `slot_mapping` from
+    /// [`Self::build_ragged_slot_mapping`] (zero per-layer `eval_arrays` syncs).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_keys_values_native_with_slot_mapping(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        slot_mapping: &MxArray,
+        total_queries: u32,
+    ) -> Result<(), String> {
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "update_keys_values_native_with_slot_mapping: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
+        let values_meta = KvTensorMeta::from_array(values, "values")?;
+        let info = validate_kv_input(
+            &keys_meta,
+            &values_meta,
+            self.layer_kv_pool.config(),
+            self.layer_kv_pool.cache_dtype(),
+        )?;
+        if info.num_tokens != total_queries {
+            return Err(format!(
+                "update_keys_values_native_with_slot_mapping: keys/values contain {} query rows but slot_mapping names {total_queries}",
+                info.num_tokens
+            ));
+        }
+        let pool = self.native_pool_arrays_for_layer(layer_idx)?;
+        let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_k_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_paged_kv_write_forward(
+                pool.key.as_raw_ptr(),
+                pool.value.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                slot_mapping.as_raw_ptr(),
+                pool.k_scale.as_raw_ptr(),
+                pool.v_scale.as_raw_ptr(),
+                self.block_size as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+                self.layer_kv_pool.layout().values_token_major,
+                &mut out_k_pool,
+                &mut out_v_pool,
+                &mut out_k_scale,
+                &mut out_v_scale,
+            )
+        };
+        let outputs = [out_k_pool, out_v_pool, out_k_scale, out_v_scale];
+        if !self.adopt_native_write(layer_idx, ok, outputs)? {
+            return Err(format!(
+                "update_keys_values_native_with_slot_mapping: mlx_paged_kv_write_forward returned null (layer={layer_idx}, queries={total_queries})"
             ));
         }
         Ok(())

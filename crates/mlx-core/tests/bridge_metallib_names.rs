@@ -202,3 +202,34 @@ fn a_paged_prefill_pipeline_failure_names_the_gpu_family() {
         "{text}"
     );
 }
+
+/// 4 Inkling2 MPP prefill kernels + 26 fused elementwise/conv/AttnRes/MoE/softcap/markov kernels
+/// + 19 grouped/fused MoE kernels (`inkling2_*` prefix).
+const INKLING2_PREFIX_NAMES: i64 = 4 + 26 + 19;
+/// Total Inkling2 pipelines built (including 7 `paged_attention_inkling2_*` decode kernels).
+const INKLING2_TOTAL_PIPELINES: i64 = 7 + 4 + 26 + 19;
+/// 8 NAX tensor-op MoE kernels (`inkling2_moe_*_nax_*`) built only when NAX (Apple10+) is available.
+const INKLING2_NAX_MOE_PIPELINES: i64 = 8;
+
+#[test]
+fn every_inkling2_kernel_is_in_the_metallib_and_builds() {
+    let c = check("inkling2", true);
+    assert_eq!(c.names, INKLING2_PREFIX_NAMES, "inkling2 prefix names");
+    assert!(
+        c.report.is_empty(),
+        "paged_attn.metallib does not match inkling2 dispatcher:\n{}",
+        c.report
+    );
+    assert_eq!(c.in_library, INKLING2_PREFIX_NAMES);
+    let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
+    let apple10 = unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= 17;
+    let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
+    let expected_built = INKLING2_TOTAL_PIPELINES
+        - if lacks { 4 } else { 0 }
+        - if !lacks && !apple10 { 1 } else { 0 } // q8q only on Apple10+
+        - if !nax { INKLING2_NAX_MOE_PIPELINES } else { 0 };
+    assert_eq!(
+        c.built, expected_built,
+        "inkling2 pipelines built (lacks={lacks}, apple10={apple10}, nax={nax})"
+    );
+}

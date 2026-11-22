@@ -719,3 +719,4 @@ inline void paged_query_codes_lane(device const bfloat *queries,
 PAGED_QUERY_CODES(128)
 PAGED_QUERY_CODES(256)
 #include "paged_prefill_attention_ktm.h"
+#include "paged_prefill_attention_inkling2.h"

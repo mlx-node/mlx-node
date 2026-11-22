@@ -311,6 +311,88 @@ void dispatch_paged_query_codes(
     const PagedQueryCodesParams& params,
     int head_size);
 
+// =============================================================================
+// Inkling-2-Mini Paged Attention (relative bias + LSE, KTM INT8 & BF16)
+// =============================================================================
+
+/// Parameters of `inkling2_paged_prefill_*`. Mirrored by
+/// `Inkling2PagedPrefillParams` in `paged_prefill_attention_inkling2.h`.
+struct Inkling2PagedPrefillParams {
+  uint32_t committed_tokens;
+  uint32_t rows;
+  uint32_t chunk_stride;
+  uint32_t table_entries;
+  uint32_t split_count;
+  uint32_t max_splits;
+  uint32_t block_size;
+  uint32_t kv_heads;
+  uint32_t sliding_window;
+  uint32_t rel_extent;
+  uint32_t rel_bias_is_f32;
+  uint32_t _pad;
+};
+static_assert(sizeof(Inkling2PagedPrefillParams) == 48, "matches the Metal struct");
+
+/// Dispatches Inkling2 relative-bias + LSE varlen paged attention (V1 ps=0 or
+/// V2 ps=512 + shared FP32 reducer) for INT8 32-token KTM or BF16 vLLM pools.
+void dispatch_inkling2_paged_attention_auto(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::Stream stream,
+    mlx::core::array& out,
+    mlx::core::array& lse_out,
+    const mlx::core::array& q,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& block_table,
+    const mlx::core::array& seq_lens,
+    const mlx::core::array& cu_seqlens_q,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array* rel_bias,
+    int num_seqs,
+    int total_queries,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int max_context_len,
+    int max_blocks_per_seq,
+    int64_t live_blocks,
+    float scale,
+    int sliding_window,
+    int rel_extent,
+    KvDtype kv_dtype,
+    const mlx::core::array* score_scales = nullptr);
+
+/// Whether the device can run the G=3, D=128 Inkling2 MPP prefill pipelines.
+bool inkling2_paged_prefill_mpp_supported(mlx::core::metal::Device& device);
+
+/// Every Inkling2 kernel name in `paged_attn.metallib` (decode, prefill, fused ops).
+std::vector<std::string> inkling2_kernel_names();
+
+/// Dispatches Inkling2 G=3, D=128 in-place MPP paged prefill (split + reduce),
+/// writing BF16 `out [rows, num_q_heads, 128]` and F32 `lse_out [rows, num_q_heads]`.
+void dispatch_inkling2_paged_prefill_attention(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    mlx::core::array& lse_out,
+    mlx::core::array& workspace,
+    const mlx::core::array& q_staged,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array& block_table,
+    const mlx::core::array* rel_bias,
+    const Inkling2PagedPrefillParams& params,
+    int num_q_heads,
+    int head_size,
+    KvDtype cache_dtype,
+    bool int8_queries,
+    int64_t live_blocks);
+
 } // namespace mlx::core::fast::paged
 
 #endif // defined(__APPLE__)

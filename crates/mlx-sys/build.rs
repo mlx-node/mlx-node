@@ -375,6 +375,8 @@ fn compile_paged_attn_metallib(
         "affine_mixed/affine_qmv_wide_mixed.metal",
         "gguf_repack/gguf_repack.metal",
         "sampling/dflash2_rows.metal",
+        "inkling2/inkling2_ops.metal",
+        "inkling2/inkling2_moe.metal",
     ] {
         let args = vec![
             "-x".to_string(),
@@ -511,7 +513,7 @@ fn walk_metal_dir(root: &Path) -> Vec<PathBuf> {
             if p.is_dir() {
                 out.extend(walk_metal_dir(&p));
             } else if let Some(ext) = p.extension()
-                && ext == "metal"
+                && (ext == "metal" || ext == "h")
             {
                 out.push(p);
             }

@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
@@ -792,5 +792,46 @@ describe('discoverLocalChatModels', () => {
     symlinkSync(join(external, 'Gemma-4-26B-real.gguf'), join(dir, 'Gemma-4-26B.gguf'));
 
     await expect(discoverLocalChatModels(dir)).resolves.toEqual([]);
+  });
+
+  it('discovers an Inkling2 GGUF repository while skipping mmproj and dspark companions', async () => {
+    const dir = join(tmp, 'inkling2-repo-root');
+    const repo = join(dir, 'inkling-2-mini-gguf');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, 'Inkling-2-Mini-UD-Q4_K_XL.gguf'), minimalGguf('inkling2'));
+    writeFileSync(join(repo, 'mmproj-BF16.gguf'), minimalGguf('clip'));
+    writeFileSync(join(repo, 'dspark-Inkling-2-Mini-Q8_0.gguf'), minimalGguf('dflash'));
+
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([
+      expect.objectContaining({
+        name: 'Inkling-2-Mini-UD-Q4_K_XL',
+        path: join(repo, 'Inkling-2-Mini-UD-Q4_K_XL.gguf'),
+        modelType: 'inkling2',
+        contextWindow: 1048576,
+        format: 'gguf',
+      }),
+    ]);
+  });
+
+  it('discovers the real ~/.mlx-node/models/inkling-2-mini-gguf checkpoint as inkling2 when present', async () => {
+    const modelsRoot = join(homedir(), '.mlx-node', 'models');
+    const repo = join(modelsRoot, 'inkling-2-mini-gguf');
+    const ggufPath = join(repo, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+    if (!existsSync(ggufPath)) return;
+
+    const dir = join(tmp, 'inkling2-real-symlink');
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(repo, join(dir, 'inkling-2-mini-gguf'));
+
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([
+      expect.objectContaining({
+        name: 'Inkling-2-Mini-UD-Q4_K_XL',
+        modelType: 'inkling2',
+        contextWindow: 1048576,
+        format: 'gguf',
+      }),
+    ]);
   });
 });

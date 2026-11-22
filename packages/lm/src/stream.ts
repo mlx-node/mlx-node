@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import {
   DeepseekV41Model as DeepseekV41ModelNative,
   Gemma4Model as Gemma4ModelNative,
+  Inkling2Model as Inkling2ModelNative,
   K2HorizonModel as K2HorizonModelNative,
   Lfm2Model as Lfm2ModelNative,
   MuseGlimmerModel as MuseGlimmerModelNative,
@@ -858,6 +859,9 @@ export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, FAMIL
 /** DeepSeek-V4.1 Flash GGUF with SSD-streamed experts (text-only). */
 export class DeepseekV41Model extends makeStreamingModel(DeepseekV41ModelNative, FAMILY_ROWS.deepseek_v41.streamOpts) {}
 
+/** Inkling-2-Mini hybrid SWA/Global + ShortConv + Looped MoE model with vision support. */
+export class Inkling2Model extends makeStreamingModel(Inkling2ModelNative, FAMILY_ROWS.inkling2.streamOpts) {}
+
 /** LFM2 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, FAMILY_ROWS.lfm2.streamOpts) {}
 
@@ -943,6 +947,7 @@ const FAMILY_WRAPPERS = {
   qwen3_5_moe: { wrapper: Qwen35MoeModel, native: Qwen35MoeModelNative, vision: true },
   qwen4_exp: { wrapper: Qwen4ExpModel, native: Qwen4ExpModelNative, vision: true },
   deepseek_v41: { wrapper: DeepseekV41Model, native: DeepseekV41ModelNative },
+  inkling2: { wrapper: Inkling2Model, native: Inkling2ModelNative, vision: true },
   lfm2: { wrapper: Lfm2Model, native: Lfm2ModelNative },
   // `lfm2_moe` loads through `lfm2`'s wrapper — there is no `Lfm2MoeModel`
   // class — and `lfm2`'s registry row owns its `streamOpts`.

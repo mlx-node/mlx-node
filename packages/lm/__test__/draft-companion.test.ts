@@ -1,10 +1,15 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { findDFlash2Draft, isDFlash2DraftDirectory } from '../src/draft-companion.js';
+import {
+  findDFlash2Draft,
+  findInkling2DSparkDraft,
+  isDFlash2DraftDirectory,
+  isInkling2DSparkGguf,
+} from '../src/draft-companion.js';
 
 describe('DFlash2 companion discovery', () => {
   let root: string;
@@ -203,5 +208,149 @@ describe('DFlash2 companion discovery', () => {
     writeDraft();
     writeFileSync(join(draft, 'config.json'), JSON.stringify({ architectures: ['Qwen3ForCausalLM'] }));
     expect(findDFlash2Draft(target, 'qwen3_5')).toBeUndefined();
+  });
+});
+
+type GgufTestValue =
+  | { kind: 'string'; value: string }
+  | { kind: 'u32'; value: number }
+  | { kind: 'u32Array'; value: readonly number[] };
+
+function ggufKv(entries: ReadonlyArray<readonly [string, GgufTestValue]>): Buffer {
+  const u32 = (v: number): Buffer => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(v);
+    return b;
+  };
+  const u64 = (v: number): Buffer => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64LE(BigInt(v));
+    return b;
+  };
+  const str = (text: string): Buffer => {
+    const bytes = Buffer.from(text, 'utf8');
+    return Buffer.concat([u64(bytes.length), bytes]);
+  };
+  return Buffer.concat([
+    Buffer.from('GGUF'),
+    u32(3),
+    u64(0),
+    u64(entries.length),
+    ...entries.flatMap(([key, entry]) => {
+      if (entry.kind === 'string') return [str(key), u32(8), str(entry.value)];
+      if (entry.kind === 'u32') return [str(key), u32(4), u32(entry.value)];
+      return [str(key), u32(9), u32(4), u64(entry.value.length), ...entry.value.map(u32)];
+    }),
+  ]);
+}
+
+function ggufStringKv(entries: ReadonlyArray<readonly [string, string]>): Buffer {
+  return ggufKv(entries.map(([k, v]) => [k, { kind: 'string', value: v }] as const));
+}
+
+function validInkling2DSparkHeader(): Buffer {
+  return ggufKv([
+    ['general.architecture', { kind: 'string', value: 'dflash' }],
+    ['dflash.dspark.markov_rank', { kind: 'u32', value: 256 }],
+    ['tokenizer.ggml.pre', { kind: 'string', value: 'inkling2' }],
+    ['dflash.target_layers', { kind: 'u32Array', value: [5, 23, 41, 48] }],
+  ]);
+}
+
+describe('Inkling2 DSpark GGUF companion discovery', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mlx-inkling2-dspark-'));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('discovers a colocated dspark-*.gguf carrying authoritative Inkling2 DSpark metadata', () => {
+    const targetGguf = join(root, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+    const dsparkGguf = join(root, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+    writeFileSync(targetGguf, ggufStringKv([['general.architecture', 'inkling2']]));
+    writeFileSync(dsparkGguf, validInkling2DSparkHeader());
+
+    expect(isInkling2DSparkGguf(dsparkGguf)).toBe(true);
+    expect(findInkling2DSparkDraft(targetGguf)).toBe(dsparkGguf);
+    expect(findInkling2DSparkDraft(root)).toBe(dsparkGguf);
+    expect(findDFlash2Draft(targetGguf, 'inkling2')).toBe(dsparkGguf);
+  });
+
+  it('rejects non-dflash, missing-DSpark-metadata, wrong-pretokenizer, or corrupt GGUFs', () => {
+    const targetGguf = join(root, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+    writeFileSync(targetGguf, ggufStringKv([['general.architecture', 'inkling2']]));
+
+    const wrongArch = join(root, 'dspark-a-wrong-arch.gguf');
+    writeFileSync(
+      wrongArch,
+      ggufKv([
+        ['general.architecture', { kind: 'string', value: 'llama' }],
+        ['dflash.dspark.markov_rank', { kind: 'u32', value: 256 }],
+        ['tokenizer.ggml.pre', { kind: 'string', value: 'inkling2' }],
+        ['dflash.target_layers', { kind: 'u32Array', value: [5, 23, 41, 48] }],
+      ]),
+    );
+    // Name-only match without authoritative DSpark keys must NOT pass (would fail native load).
+    const nameOnlyDflash = join(root, 'dspark-b-name-only.gguf');
+    writeFileSync(
+      nameOnlyDflash,
+      ggufStringKv([
+        ['general.architecture', 'dflash'],
+        ['general.name', 'Inkling-2-Mini'],
+      ]),
+    );
+    const missingTargetLayers = join(root, 'dspark-c-no-layers.gguf');
+    writeFileSync(
+      missingTargetLayers,
+      ggufKv([
+        ['general.architecture', { kind: 'string', value: 'dflash' }],
+        ['dflash.dspark.markov_rank', { kind: 'u32', value: 256 }],
+        ['tokenizer.ggml.pre', { kind: 'string', value: 'inkling2' }],
+      ]),
+    );
+    const wrongPre = join(root, 'dspark-d-gemma4.gguf');
+    writeFileSync(
+      wrongPre,
+      ggufKv([
+        ['general.architecture', { kind: 'string', value: 'dflash' }],
+        ['dflash.dspark.markov_rank', { kind: 'u32', value: 256 }],
+        ['tokenizer.ggml.pre', { kind: 'string', value: 'gemma4' }],
+        ['dflash.target_layers', { kind: 'u32Array', value: [5, 23, 41, 48] }],
+      ]),
+    );
+    const corrupt = join(root, 'dspark-e-corrupt.gguf');
+    writeFileSync(corrupt, 'not-a-gguf');
+
+    expect(isInkling2DSparkGguf(wrongArch)).toBe(false);
+    expect(isInkling2DSparkGguf(nameOnlyDflash)).toBe(false);
+    expect(isInkling2DSparkGguf(missingTargetLayers)).toBe(false);
+    expect(isInkling2DSparkGguf(wrongPre)).toBe(false);
+    expect(isInkling2DSparkGguf(corrupt)).toBe(false);
+    expect(findInkling2DSparkDraft(targetGguf)).toBeUndefined();
+  });
+
+  it('discovers dspark-Inkling-2-Mini-Q8_0.gguf beside a symlinked GGUF', () => {
+    const external = mkdtempSync(join(tmpdir(), 'mlx-inkling2-external-'));
+    try {
+      const realTarget = join(external, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+      const realDraft = join(external, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+      writeFileSync(realTarget, ggufStringKv([['general.architecture', 'inkling2']]));
+      writeFileSync(realDraft, validInkling2DSparkHeader());
+      const link = join(root, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+      symlinkSync(realTarget, link);
+      expect(findDFlash2Draft(link, 'inkling2')).toBe(realpathSync(realDraft));
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers the real on-disk dspark-Inkling-2-Mini-Q8_0.gguf when present', () => {
+    const modelDir = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini-gguf');
+    const targetGguf = join(modelDir, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
+    const expectedDraft = join(modelDir, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+    if (!existsSync(targetGguf) || !existsSync(expectedDraft)) return;
+    expect(isInkling2DSparkGguf(expectedDraft)).toBe(true);
+    expect(findDFlash2Draft(targetGguf, 'inkling2')).toBe(expectedDraft);
+    expect(findInkling2DSparkDraft(modelDir)).toBe(expectedDraft);
   });
 });

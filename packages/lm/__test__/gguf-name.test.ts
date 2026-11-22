@@ -86,6 +86,7 @@ describe('isGgufCompanionName', () => {
       'mtp-Q8_0.gguf',
       'Model-IMATRIX.gguf',
       'x.dflash.gguf',
+      'dspark-Inkling-2-Mini-Q8_0.gguf',
       'draft_q4.gguf',
       'mtp',
     ]) {

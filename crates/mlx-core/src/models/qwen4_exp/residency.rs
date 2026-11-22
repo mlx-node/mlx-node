@@ -68,6 +68,8 @@ impl Tensor {
                 GgufTensorType::Q8_0 => (36, 32),
                 // E8M0 scale byte + 16 nibble bytes, no biases.
                 GgufTensorType::MXFP4 => (17, 32),
+                // 4 UE4M3 scale bytes + 32 nibble bytes, no biases.
+                GgufTensorType::NVFP4 => (36, 64),
                 // 64 code bytes + 32 unpacked (sc, m) bytes + (d, dmin).
                 GgufTensorType::Q2K => (100, 256),
                 GgufTensorType::Q3K => (114, 256),

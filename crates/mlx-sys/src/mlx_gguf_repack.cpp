@@ -65,6 +65,7 @@ constexpr KernelInfo kKernels[] = {
     {"mlx_node_gguf_repack_q4_0", 32, 18, 4, 2, 0, 2, 1, false, ST::F16},
     {"mlx_node_gguf_repack_q5_1", 32, 24, 5, 2, 2, 2, 1, false, ST::F16},
     {"mlx_node_gguf_repack_q8_0_bias", 32, 34, 8, 2, 2, 2, 1, false, ST::F16},
+    {"mlx_node_gguf_repack_nvfp4", 64, 36, 8, 4, 0, 4, 1, false, ST::U8},
 };
 constexpr int kKernelCount = int(sizeof(kKernels) / sizeof(kKernels[0]));
 

@@ -151,6 +151,16 @@ pub(crate) struct SchedulerOwnerContext<'a, S> {
     pub next_seq_id: &'a mut SeqId,
 }
 
+/// Per-lane request for [`HybridSchedulerBackend::propose_scheduled_batch`].
+pub(crate) struct ScheduledProposalRequest<'a> {
+    pub seq_id: SeqId,
+    pub anchor: u32,
+    pub max_drafts: usize,
+    pub params: &'a engine::params::ChatParams,
+    pub rng: &'a mut dyn rand::Rng,
+    pub confidence: bool,
+}
+
 /// Host scheduling metadata for one contiguous verifier slice. Proposed tokens
 /// are not visible in committed history until the matching batch commit.
 pub(crate) struct ScheduledVerifyRow {
@@ -546,6 +556,26 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         _confidence: bool,
     ) -> Result<engine::backend::DsparkProposal> {
         Err(Error::from_reason("scheduled proposals are unavailable"))
+    }
+    /// Batched multi-lane draft proposal across a scheduled speculative wave.
+    /// Defaults to invoking [`Self::propose_scheduled`] per request.
+    fn propose_scheduled_batch(
+        &mut self,
+        requests: &mut [ScheduledProposalRequest<'_>],
+    ) -> Vec<Result<engine::backend::DsparkProposal>> {
+        requests
+            .iter_mut()
+            .map(|req| {
+                self.propose_scheduled(
+                    req.seq_id,
+                    req.anchor,
+                    req.max_drafts,
+                    req.params,
+                    req.rng,
+                    req.confidence,
+                )
+            })
+            .collect()
     }
     fn run_scheduled_verify(&mut self, _rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
         Err(Error::from_reason("scheduled verification is unavailable"))

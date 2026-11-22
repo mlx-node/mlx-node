@@ -268,6 +268,7 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
         'qwen3_5_moe',
         'qwen4_exp',
         'deepseek_v41',
+        'inkling2',
         'gemma4',
         'muse_glimmer',
         'lfm2',

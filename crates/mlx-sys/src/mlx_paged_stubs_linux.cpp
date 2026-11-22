@@ -235,6 +235,64 @@ bool mlx_paged_prefill_attention_forward(
 
 bool mlx_paged_prefill_mpp_builds() { return false; }
 
+bool mlx_inkling2_paged_attention_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t,
+    mlx_array*,
+    mlx_array** out_attention,
+    mlx_array** out_lse) {
+  if (out_attention) *out_attention = nullptr;
+  if (out_lse) *out_lse = nullptr;
+  return false;
+}
+
+bool mlx_inkling2_paged_prefill_attention_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t,
+    bool,
+    float,
+    mlx_array** out_attention,
+    mlx_array** out_lse,
+    mlx_array** out_workspace) {
+  if (out_attention) *out_attention = nullptr;
+  if (out_lse) *out_lse = nullptr;
+  if (out_workspace) *out_workspace = nullptr;
+  return false;
+}
+
+bool mlx_inkling2_paged_prefill_mpp_supported() { return false; }
+
 void mlx_paged_prefill_test_probe_reset() {}
 
 uint64_t mlx_paged_prefill_test_probe_count(int) { return 0; }

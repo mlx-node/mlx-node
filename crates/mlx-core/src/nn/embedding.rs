@@ -608,8 +608,18 @@ fn dequantize(
     mode: &str,
 ) -> Result<MxArray> {
     let biases_ptr = biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
-    let mode_c = std::ffi::CString::new(mode)
-        .map_err(|_| Error::from_reason("Invalid embedding dequantize mode string"))?;
+    let mode_owned;
+    let mode_ptr = match mode {
+        "affine" => c"affine".as_ptr(),
+        "nvfp4" => c"nvfp4".as_ptr(),
+        "mxfp4" => c"mxfp4".as_ptr(),
+        "mxfp8" => c"mxfp8".as_ptr(),
+        _ => {
+            mode_owned = std::ffi::CString::new(mode)
+                .map_err(|_| Error::from_reason("Invalid embedding dequantize mode string"))?;
+            mode_owned.as_ptr()
+        }
+    };
     let handle = unsafe {
         sys::mlx_dequantize(
             weight.as_raw_ptr(),
@@ -618,7 +628,7 @@ fn dequantize(
             group_size,
             bits,
             -1, // Use input dtype (bf16 from scales)
-            mode_c.as_ptr(),
+            mode_ptr,
         )
     };
     MxArray::from_handle(handle, "dequantize_embedding")

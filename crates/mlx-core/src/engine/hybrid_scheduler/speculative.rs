@@ -287,29 +287,103 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             .as_ref()
             .is_some_and(|shape| shape.iter().all(|&n| n == 0));
         let mut proposed = Vec::with_capacity(work.len());
-        for mut item in work {
+        let mut raw_proposals: Vec<Result<engine::backend::DsparkProposal>> =
+            (0..work.len()).map(|_| Ok(empty_proposal())).collect();
+        if !zero_probe {
+            // Collect all capped rows into one batched proposal call (so multi-lane DSpark
+            // stacks `[N * 8, H]` through draft layers + target lm_head + folded Markov head!).
+            let mut batch_work_indices = Vec::with_capacity(work.len());
+            for (wi, item) in work.iter().enumerate() {
+                if item.cap == 0 {
+                    continue;
+                }
+                if running[item.turn_index]
+                    .payload
+                    .scheduled_speculation
+                    .is_some()
+                {
+                    batch_work_indices.push(wi);
+                } else {
+                    raw_proposals[wi] = Err(Error::from_reason(
+                        "scheduled speculation state missing for capped row",
+                    ));
+                }
+            }
+            if !batch_work_indices.is_empty() {
+                // Borrow disjoint `running[turn_index]` entries safely via index-sorted split.
+                let mut turn_to_batch: Vec<(usize, usize)> = batch_work_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, &wi)| (work[wi].turn_index, bi))
+                    .collect();
+                turn_to_batch.sort_unstable_by_key(|&(ti, _)| ti);
+
+                let mut split_refs = Vec::with_capacity(turn_to_batch.len());
+                let mut slice = &mut *running;
+                let mut base = 0usize;
+                for &(ti, bi) in &turn_to_batch {
+                    let rel = ti - base;
+                    let (_, rest) = slice.split_at_mut(rel);
+                    let (head, tail) = rest.split_at_mut(1);
+                    split_refs.push((bi, &mut head[0]));
+                    slice = tail;
+                    base = ti + 1;
+                }
+                split_refs.sort_unstable_by_key(|&(bi, _)| bi);
+
+                let mut requests: Vec<ScheduledProposalRequest<'_>> =
+                    Vec::with_capacity(split_refs.len());
+                for (bi, turn) in split_refs {
+                    let wi = batch_work_indices[bi];
+                    let item = &work[wi];
+                    let row = &plan.rows[item.plan_index];
+                    if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
+                        requests.push(ScheduledProposalRequest {
+                            seq_id: row.seq_id,
+                            anchor: item.anchor,
+                            max_drafts: item.cap,
+                            params: &turn.payload.params,
+                            rng,
+                            confidence: profiling,
+                        });
+                    }
+                }
+                let batch_results = self.inner.propose_scheduled_batch(&mut requests);
+                for (&wi, res) in batch_work_indices.iter().zip(batch_results) {
+                    let row = &plan.rows[work[wi].plan_index];
+                    timeline::lane_mark(row.seq_id, Mark::DraftSubmit);
+                    raw_proposals[wi] = res;
+                }
+            }
+        }
+        // Materialize ALL device-resident draft proposals in ONE single GPU sync instead of N!
+        {
+            let mut eval_refs: Vec<&MxArray> = Vec::new();
+            for prop in raw_proposals.iter().flatten() {
+                if let Some(ref ids) = prop.device_draft_ids {
+                    eval_refs.push(ids);
+                }
+                if let Some(ref sparse) = prop.device_draft_sparse {
+                    eval_refs.push(&sparse.ids);
+                    eval_refs.push(&sparse.probs);
+                }
+            }
+            if !eval_refs.is_empty()
+                && let Err(error) =
+                    MxArray::eval_arrays_with_context(&eval_refs, "scheduled_draft_proposals")
+            {
+                for res in &mut raw_proposals {
+                    if res.as_ref().is_ok_and(|p| {
+                        p.device_draft_ids.is_some() || p.device_draft_sparse.is_some()
+                    }) {
+                        *res = Err(Error::from_reason(error.reason.clone()));
+                    }
+                }
+            }
+        }
+        for (mut item, proposal) in work.into_iter().zip(raw_proposals) {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];
-            let proposal = if item.cap > 0 && !zero_probe {
-                let _focus = timeline::focus_lane(row.seq_id);
-                let proposal = match turn.payload.scheduled_speculation.as_mut() {
-                    Some(rng) => self.inner.propose_scheduled(
-                        row.seq_id,
-                        item.anchor,
-                        item.cap,
-                        &turn.payload.params,
-                        rng,
-                        profiling,
-                    ),
-                    None => Err(Error::from_reason(
-                        "scheduled speculation state missing for capped row",
-                    )),
-                };
-                timeline::lane_mark(row.seq_id, Mark::DraftSubmit);
-                proposal
-            } else {
-                Ok(empty_proposal())
-            };
             // The scheduled verify wave is host-batched (`ScheduledVerifyRow`
             // tokens), so a device-resident proposal is normalized to host
             // ids here at the boundary rather than carried deeper.

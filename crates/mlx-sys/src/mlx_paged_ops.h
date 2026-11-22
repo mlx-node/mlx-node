@@ -607,6 +607,219 @@ std::array<array, 2> paged_prefill_attention(
     float scale,
     StreamOrDevice s = {});
 
+/// `Inkling2PagedAttention`: relative-bias + natural-log LSE varlen paged
+/// attention for Inkling-2-Mini (INT8 32-token KTM and BF16 vLLM pools,
+/// head_size=128). Returns `{out [total_q, num_q_heads, 128] bf16, lse [total_q, num_q_heads] f32}`.
+class Inkling2PagedAttention : public Custom {
+ public:
+  Inkling2PagedAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int block_size,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      int sliding_window,
+      int rel_extent,
+      KvDtype kv_dtype,
+      bool has_rel_bias,
+      bool has_score_scales)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        block_size_(block_size),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        sliding_window_(sliding_window),
+        rel_extent_(rel_extent),
+        kv_dtype_(kv_dtype),
+        has_rel_bias_(has_rel_bias),
+        has_score_scales_(has_score_scales) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("Inkling2PagedAttention CPU NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(Inkling2PagedAttention);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        scale_,
+        block_size_,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        sliding_window_,
+        rel_extent_,
+        static_cast<uint8_t>(kv_dtype_),
+        has_rel_bias_,
+        has_score_scales_);
+  }
+
+ private:
+  float scale_;
+  int block_size_;
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  int sliding_window_;
+  int rel_extent_;
+  KvDtype kv_dtype_;
+  bool has_rel_bias_;
+  bool has_score_scales_;
+};
+
+/// `Inkling2PagedPrefillAttention`: in-place MPP paged prefill / verify for
+/// Inkling-2-Mini (G=3, D=128, INT8 32-token KTM `q8`/`q8q` and BF16 vLLM),
+/// with SWA tile skip, relative bias + zero-bias fast path, and natural-log LSE.
+/// Returns `{out [rows, num_q_heads, 128] bf16, lse [rows, num_q_heads] f32, workspace'}`.
+class Inkling2PagedPrefillAttention : public Custom {
+ public:
+  Inkling2PagedPrefillAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int committed_tokens,
+      int rows,
+      int splits,
+      int max_splits,
+      int block_size,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      int sliding_window,
+      int rel_extent,
+      KvDtype kv_dtype,
+      bool int8_queries,
+      bool has_rel_bias)
+      : Custom(stream, std::move(fallback)),
+        committed_tokens_(committed_tokens),
+        rows_(rows),
+        splits_(splits),
+        max_splits_(max_splits),
+        block_size_(block_size),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        sliding_window_(sliding_window),
+        rel_extent_(rel_extent),
+        kv_dtype_(kv_dtype),
+        int8_queries_(int8_queries),
+        has_rel_bias_(has_rel_bias) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("Inkling2PagedPrefillAttention CPU NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(Inkling2PagedPrefillAttention);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        committed_tokens_,
+        rows_,
+        splits_,
+        max_splits_,
+        block_size_,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        sliding_window_,
+        rel_extent_,
+        static_cast<uint8_t>(kv_dtype_),
+        int8_queries_,
+        has_rel_bias_);
+  }
+
+ private:
+  int committed_tokens_;
+  int rows_;
+  int splits_;
+  int max_splits_;
+  int block_size_;
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  int sliding_window_;
+  int rel_extent_;
+  KvDtype kv_dtype_;
+  bool int8_queries_;
+  bool has_rel_bias_;
+};
+
+std::array<array, 2> inkling2_paged_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    const std::optional<array>& rel_bias,
+    float scale,
+    int sliding_window,
+    int rel_extent,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    StreamOrDevice s = {},
+    const std::optional<array>& score_scales = std::nullopt);
+
+std::array<array, 3> inkling2_paged_prefill_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    const std::optional<array>& rel_bias,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    KvDtype kv_dtype,
+    bool int8_queries,
+    float scale,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast
 
 // C ABI bridge for Rust callers that need the graph-native ragged-Q primitive.
@@ -665,3 +878,54 @@ extern "C" bool mlx_paged_prefill_attention_forward(
     float scale,
     mlx_array** out_attention,
     mlx_array** out_workspace);
+
+// Inkling-2-Mini relative-bias + LSE varlen paged attention (KTM INT8 & BF16).
+extern "C" bool mlx_inkling2_paged_attention_forward(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* block_table,
+    mlx_array* seq_lens,
+    mlx_array* cu_seqlens_q,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    mlx_array* rel_bias,
+    float scale,
+    int sliding_window,
+    int rel_extent,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype,
+    mlx_array* score_scales,
+    mlx_array** out_attention,
+    mlx_array** out_lse);
+
+// Inkling-2-Mini in-place MPP paged prefill (with portable non-MPP fallback).
+extern "C" bool mlx_inkling2_paged_prefill_attention_forward(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    mlx_array* block_table,
+    mlx_array* workspace,
+    mlx_array* rel_bias,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    uint8_t kv_dtype,
+    bool int8_queries,
+    float scale,
+    mlx_array** out_attention,
+    mlx_array** out_lse,
+    mlx_array** out_workspace);
+
+extern "C" bool mlx_inkling2_paged_prefill_mpp_supported();

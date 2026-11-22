@@ -3115,3 +3115,4 @@ template [[host_name("paged_attention_grouped_int8_hs256_striped_reduce")]]
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]]);
 #include "paged_attention_ktm.h"
+#include "paged_attention_inkling2.h"

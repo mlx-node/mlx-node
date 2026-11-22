@@ -861,6 +861,7 @@ module.exports.GenerationResult = nativeBinding.GenerationResult;
 module.exports.GrpoTrainingEngine = nativeBinding.GrpoTrainingEngine;
 module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine;
 module.exports.HarrierModel = nativeBinding.HarrierModel;
+module.exports.Inkling2Model = nativeBinding.Inkling2Model;
 module.exports.JinaRerankerModel = nativeBinding.JinaRerankerModel;
 module.exports.JinaRerankerTask = nativeBinding.JinaRerankerTask;
 module.exports.K2HorizonModel = nativeBinding.K2HorizonModel;

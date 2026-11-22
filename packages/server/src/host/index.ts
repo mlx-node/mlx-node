@@ -549,9 +549,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
     // The host's explicit draft option would otherwise bypass automatic-DFlash2 capability gating.
-    const draftModelPath = supportsAutomaticDFlash2(entry.modelType)
-      ? findDFlash2Draft(path, entry.modelType, modelsDir)
-      : undefined;
+    // Inkling2 discovers colocated DSpark companions natively with soft fallback on bad drafts.
+    const draftModelPath =
+      entry.modelType === 'inkling2' || !supportsAutomaticDFlash2(entry.modelType)
+        ? undefined
+        : findDFlash2Draft(path, entry.modelType, modelsDir);
     const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
     // A muse_glimmer .gguf resolve leased the prepared asset dir; that
     // reference is this attempt's. A successful load keeps the lazy
@@ -561,6 +563,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const leasedDir = pagedConfigOverrides.claimPreparedLease(resolvedPath);
     const options: LoadModelOptions = {
       ...(draftModelPath !== undefined ? { draftModelPath } : {}),
+      ...(entry.modelType === 'inkling2' && !supportsAutomaticDFlash2(entry.modelType) ? { autoLoadDraft: false } : {}),
       ...(opts.kvFormat !== undefined && familyDataFor(entry.modelType)?.acceptsKvFormat === true
         ? { kvFormat: opts.kvFormat }
         : {}),
@@ -892,7 +895,8 @@ export function nativeContextEstimate(
   qwen4Exp: typeof estimateQwen4ExpContextWindow = estimateQwen4ExpContextWindow,
 ): NonNullable<InferenceHostOptions['estimateContextWindow']> {
   return async (path, modelType, options) => {
-    if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
+    if (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') return qwen35(path, modelType, options);
+    if (modelType !== 'qwen4_exp') return null;
     const qwen4Options = {
       ...(options?.draftModelPath != null ? { draftModelPath: options.draftModelPath } : {}),
       ...(options?.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),

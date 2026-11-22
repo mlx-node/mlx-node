@@ -1,5 +1,16 @@
 /** Native-free metadata and discovery for optional speculative draft checkpoints. */
-import { type Dirent, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  type Dirent,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const QWEN38_DFLASH2 = {
@@ -13,6 +24,231 @@ export const QWEN36_MOE_DFLASH2 = {
   hfRepo: 'incoai/Qwen3.6-35B-A3B-DFlash2',
   sizeGb: 1.1,
 } as const;
+
+const GGUF_SCALAR_BYTES = new Map<number, number>([
+  [0, 1],
+  [1, 1],
+  [2, 2],
+  [3, 2],
+  [4, 4],
+  [5, 4],
+  [6, 4],
+  [7, 1],
+  [10, 8],
+  [11, 8],
+  [12, 8],
+]);
+const MAX_GGUF_STRING_BYTES = 16 * 1024 * 1024;
+const MAX_GGUF_HEADER_KEYS = 16384;
+const GGUF_WINDOW_BYTES = 64 * 1024;
+
+interface GgufDraftMetadata {
+  architecture?: string;
+  hasMarkovRank?: boolean;
+  tokenizerPre?: string;
+  hasTargetLayers?: boolean;
+}
+
+/**
+ * Synchronous, native-free GGUF v3+ metadata probe for speculative draft files
+ * (e.g. `dspark-Inkling-2-Mini-Q8_0.gguf`). Skips arrays without allocating
+ * them and closes its descriptor even on malformed headers.
+ */
+function readGgufDraftMetadataSync(path: string): GgufDraftMetadata | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch {
+    return undefined;
+  }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size < 24) return undefined;
+    const size = info.size;
+    let position = 0;
+    let window = Buffer.alloc(0);
+    let windowStart = 0;
+
+    const load = (pos: number, len: number): Buffer => {
+      const end = pos + len;
+      if (end > size) throw new Error('truncated');
+      if (pos < windowStart || end > windowStart + window.length) {
+        const toRead = Math.min(Math.max(GGUF_WINDOW_BYTES, len), size - pos);
+        const buf = Buffer.allocUnsafe(toRead);
+        let filled = 0;
+        while (filled < toRead) {
+          const n = readSync(fd, buf, filled, toRead - filled, pos + filled);
+          if (n <= 0) break;
+          filled += n;
+        }
+        if (filled < len) throw new Error('truncated');
+        window = buf.subarray(0, filled);
+        windowStart = pos;
+      }
+      return window.subarray(pos - windowStart, end - windowStart);
+    };
+
+    const skip = (len: number): void => {
+      if (!Number.isSafeInteger(len) || len < 0 || len > size - position) throw new Error('bounds');
+      position += len;
+    };
+
+    const bytes = (len: number): Buffer => {
+      const pos = position;
+      skip(len);
+      if (len > MAX_GGUF_STRING_BYTES) throw new Error('oversized');
+      return load(pos, len);
+    };
+
+    const u32 = (): number => bytes(4).readUInt32LE(0);
+    const u64 = (): number => {
+      const v = bytes(8).readBigUInt64LE(0);
+      if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('oversized');
+      return Number(v);
+    };
+    const str = (): string => {
+      const len = u64();
+      if (len > MAX_GGUF_STRING_BYTES) throw new Error('oversized');
+      return bytes(len).toString('utf8');
+    };
+    const skipValue = (type: number, depth = 0): void => {
+      const scalar = GGUF_SCALAR_BYTES.get(type);
+      if (scalar !== undefined) return skip(scalar);
+      if (type === 8) return skip(u64());
+      if (type !== 9 || depth > 16) throw new Error('bad type');
+      const elem = u32();
+      const count = u64();
+      const elemSize = GGUF_SCALAR_BYTES.get(elem);
+      if (elemSize !== undefined) return skip(count * elemSize);
+      if (elem !== 8 && elem !== 9) throw new Error('bad array elem');
+      for (let i = 0; i < count; i++) skipValue(elem, depth + 1);
+    };
+
+    if (bytes(4).toString('ascii') !== 'GGUF') return undefined;
+    if (u32() < 3) return undefined;
+    u64(); // tensor count
+    const kvCount = u64();
+    if (kvCount > MAX_GGUF_HEADER_KEYS) return undefined;
+
+    const readPositiveInt = (type: number): boolean => {
+      switch (type) {
+        case 0:
+          return bytes(1).readUInt8(0) > 0;
+        case 1:
+          return bytes(1).readInt8(0) > 0;
+        case 2:
+          return bytes(2).readUInt16LE(0) > 0;
+        case 3:
+          return bytes(2).readInt16LE(0) > 0;
+        case 4:
+          return bytes(4).readUInt32LE(0) > 0;
+        case 5:
+          return bytes(4).readInt32LE(0) > 0;
+        case 10:
+          return bytes(8).readBigUInt64LE(0) > 0n;
+        case 11:
+          return bytes(8).readBigInt64LE(0) > 0n;
+        default:
+          skipValue(type);
+          return false;
+      }
+    };
+
+    const meta: GgufDraftMetadata = {};
+    for (let i = 0; i < kvCount; i++) {
+      const key = str();
+      const type = u32();
+      if (type === 8 && key === 'general.architecture') {
+        meta.architecture = str();
+        if (meta.architecture !== 'dflash') break;
+      } else if (key === 'dflash.dspark.markov_rank') {
+        meta.hasMarkovRank = readPositiveInt(type);
+      } else if (type === 8 && key === 'tokenizer.ggml.pre') {
+        meta.tokenizerPre = str();
+      } else if (type === 9 && key === 'dflash.target_layers') {
+        const elem = u32();
+        const count = u64();
+        const elemSize = GGUF_SCALAR_BYTES.get(elem);
+        if (elemSize !== undefined) {
+          skip(count * elemSize);
+        } else if (elem === 8 || elem === 9) {
+          for (let j = 0; j < count; j++) skipValue(elem, 1);
+        } else {
+          throw new Error('bad array elem');
+        }
+        meta.hasTargetLayers = (elem === 4 || elem === 5 || elem === 10) && count > 0;
+      } else {
+        skipValue(type);
+      }
+      if (
+        meta.architecture === 'dflash' &&
+        meta.hasMarkovRank === true &&
+        meta.tokenizerPre === 'inkling2' &&
+        meta.hasTargetLayers === true
+      ) {
+        break;
+      }
+    }
+    return meta;
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore close errors
+    }
+  }
+}
+
+/**
+ * True when `path` is a DSpark GGUF companion for an Inkling2 target:
+ * matches the native Rust check (`general.architecture == "dflash"`,
+ * positive `dflash.dspark.markov_rank`, `tokenizer.ggml.pre == "inkling2"`,
+ * and a non-empty integer `dflash.target_layers` array).
+ */
+export function isInkling2DSparkGguf(path: string): boolean {
+  if (!regularFile(path)) return false;
+  const meta = readGgufDraftMetadataSync(path);
+  return (
+    meta?.architecture === 'dflash' &&
+    meta.hasMarkovRank === true &&
+    meta.tokenizerPre === 'inkling2' &&
+    meta.hasTargetLayers === true
+  );
+}
+
+/**
+ * Discover a colocated DSpark GGUF companion (`dspark-*.gguf` carrying
+ * `dflash` + Inkling2 metadata) inside an Inkling2 model's directory.
+ */
+export function findInkling2DSparkDraft(modelPath: string): string | undefined {
+  const isGguf = modelPath.toLowerCase().endsWith('.gguf');
+  let resolved = modelPath;
+  try {
+    resolved = realpathSync(modelPath);
+  } catch {
+    // Unresolvable path: fall back to lexical-only lookup.
+  }
+  const modelDir = isGguf ? dirname(modelPath) : modelPath;
+  const resolvedDir = isGguf ? dirname(resolved) : resolved;
+  const dirs = resolvedDir !== modelDir ? [modelDir, resolvedDir] : [modelDir];
+
+  for (const dir of dirs) {
+    try {
+      const candidates = readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => direntKind(dir, entry) === 'file' && /^dspark-.*\.gguf$/i.test(entry.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const candidate of candidates) {
+        const candidatePath = join(dir, candidate.name);
+        if (isInkling2DSparkGguf(candidatePath)) return candidatePath;
+      }
+    } catch {
+      // An absent/unreadable directory leaves ordinary target loading available.
+    }
+  }
+  return undefined;
+}
 
 function regularFile(path: string): boolean {
   try {
@@ -87,6 +323,7 @@ function isEmbeddedDFlash2Companion(path: string, requireMoeGeometry: boolean): 
  * compatibility alone does not establish a trained companion pairing.
  */
 export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir?: string): string | undefined {
+  if (modelType === 'inkling2') return findInkling2DSparkDraft(modelPath);
   if (modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe') return undefined;
   const isGguf = modelPath.toLowerCase().endsWith('.gguf');
   // Discovery records the lexical symlink path, and the recorded model path

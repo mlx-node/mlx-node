@@ -788,3 +788,34 @@ static inline uint ldb4(const device uchar* s) {
       nib32(ldb4(s + 1), ldb4(s + 5), ldb4(s + 9), ldb4(s + 13));
   scales[gb] = s[0];
 }
+
+// ---------------------------------------------------------------- NVFP4
+// 36-byte blocks (9 uint32, 4-byte aligned): d[4] UE4M3 scales @0, qs[32] @4.
+// Within each 16-element sub-block s in 0..4, qs[s*8 + j] holds elem j (0..7)
+// in its low nibble and elem j+8 (8..15) in its high nibble.
+// Output per block: 8 uint32 words (2 uint4) in MLX adjacent-nibble order,
+// 4 uint8 UE4M3 scales (1 uint32), no `.biases`.
+
+static inline uint2 nib16(uint q0, uint q1) {
+  return uint2(nib8(q0, q1), nib8(q0 >> 4, q1 >> 4));
+}
+
+[[kernel]] void mlx_node_gguf_repack_nvfp4(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* b =
+      (const device uint*)(staging + p.src_off) + (ulong)g * 9u;
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  uint2 s0 = nib16(b[1], b[2]);
+  uint2 s1 = nib16(b[3], b[4]);
+  uint2 s2 = nib16(b[5], b[6]);
+  uint2 s3 = nib16(b[7], b[8]);
+  device uint4* w4 = (device uint4*)weight + gb * 2u;
+  w4[0] = uint4(s0.x, s0.y, s1.x, s1.y);
+  w4[1] = uint4(s2.x, s2.y, s3.x, s3.y);
+  ((device uint*)scales)[gb] = b[0];
+}

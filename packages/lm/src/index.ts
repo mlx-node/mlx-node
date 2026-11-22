@@ -41,6 +41,10 @@ export type { Qwen35MoeConfig } from '@mlx-node/core';
 export { DeepseekV41Model } from './stream.js';
 export type { DeepseekV41ContextLimits, DeepseekV41ResidencyInfo, DeepseekV41TurnTokenIds } from '@mlx-node/core';
 
+// Inkling-2-Mini (hybrid SWA/Global + ShortConv + Looped MoE, GGUF + PE-Lang vision)
+export { Inkling2Model } from './stream.js';
+export type { Inkling2ContextLimits, Inkling2LoadOptions } from '@mlx-node/core';
+
 // Nemotron H models
 //
 // The config/limits types ship alongside the class for the same reason
@@ -153,6 +157,7 @@ export {
   familyTraitsFor,
   FAMILY_ROWS,
   GEMMA4_SAMPLING_DEFAULTS,
+  INKLING2_SAMPLING_DEFAULTS,
   K2_SAMPLING_DEFAULTS,
   launchPresetFor,
   LFM2_SAMPLING_DEFAULTS,

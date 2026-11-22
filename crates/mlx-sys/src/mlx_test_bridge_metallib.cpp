@@ -131,6 +131,29 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
         if (mlx_test_gpu_lacks_apple_family()) return int64_t(0);
         return fast::paged::build_paged_prefill_attention_pipelines(d);
       };
+    } else if (std::strcmp(family, "inkling2") == 0) {
+      prefix = "inkling2_";
+      // Check all inkling2-prefixed kernels (prefill + fused ops); paged_attention_inkling2_*
+      // are also built directly in `build`.
+      for (const auto& name : fast::paged::inkling2_kernel_names()) {
+        if (name.rfind(prefix, 0) == 0) {
+          names.push_back(name);
+        }
+      }
+      build = [&d] {
+        const bool lacks = mlx_test_gpu_lacks_apple_family();
+        const bool q8q_ok = fast::paged::paged_prefill_int8_queries_supported(d);
+        const bool nax_ok = metal::is_nax_available();
+        int64_t built = 0;
+        for (const auto& name : fast::paged::inkling2_kernel_names()) {
+          if (lacks && name.rfind("inkling2_paged_prefill_", 0) == 0) continue;
+          if (!q8q_ok && name.find("_q8q_") != std::string::npos) continue;
+          if (!nax_ok && name.find("_nax_") != std::string::npos) continue;
+          fast::paged::get_prebuilt_kernel(d, "inkling2", "inkling2", name);
+          ++built;
+        }
+        return built;
+      };
     } else {
       return false;
     }

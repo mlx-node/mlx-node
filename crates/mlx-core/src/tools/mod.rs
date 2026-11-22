@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod chatml;
 mod coerce;
+pub mod inkling;
 mod lfm2;
 mod markup;
 mod reasoning;
