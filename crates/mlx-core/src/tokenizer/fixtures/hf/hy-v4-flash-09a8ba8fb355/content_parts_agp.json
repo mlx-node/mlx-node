@@ -1,0 +1,18 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Part one. "
+        },
+        {
+          "type": "text",
+          "text": "Part two."
+        }
+      ]
+    }
+  ],
+  "add_generation_prompt": true
+}

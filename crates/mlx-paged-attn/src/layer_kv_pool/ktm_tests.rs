@@ -85,6 +85,7 @@ fn keys_token_major_pages_cross_the_host_and_refuse_raw_paths() {
             8,
             MetalDtype::Int8,
             keys_token_major(),
+            MetalDtype::BFloat16,
             shared,
         )
         .unwrap();

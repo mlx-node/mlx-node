@@ -7,6 +7,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
+import { offeredOnHost } from '../lib/catalog';
 import { formatBytes, formatBytesParts, formatCount } from '../lib/format';
 import { useHomeDir } from '../lib/home-dir';
 import { useDataVersion, useRuntimeLive } from '../lib/live';
@@ -151,13 +152,13 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
     },
   };
   const focused = focus === null ? undefined : localModels.find((model) => model.name === focus);
-  const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
+  const host = models.data?.host;
+  const catalogItems = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
   const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
   const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
   const present = chatCatalogItems.filter((item) => item.present).length;
   const systemOnePresent = systemOneCatalogItems.filter((item) => item.present).length;
   const activeCount = Object.keys(downloads.active).length;
-  const host = models.data?.host;
 
   const setFocus = (name: string | null): void => {
     setParams(

@@ -7,11 +7,14 @@
 //! ```text
 //! others = host_used - own                     own = MLX active + MLX pool - volatile banks
 //! live   = physical - others - reserve
-//! fixed  = dense + staging x layers + 1.2 (KV(ctx) + compute(ctx)) + io(ctx) + driver + pool
+//! fixed  = dense + staging x layers + 1.2 (KV(ctx) + compute(rows, ctx)) + io(rows) + driver + pool
 //! cache  = floor_to_slots(min(live - fixed, ws - fixed, env))
 //! layers = 2 when the cache does not need the second layer's bytes, or when
-//!          the cache left after it is >= SECOND_STAGING_MIN_CACHE; else 1
+//!          the cache left after it is >= second_staging_min_cache; else 1
 //! ```
+//!
+//! The constants are a [`Profile`]; `rows` is the prefill chunk the model
+//! runs at once (DS V4.1 prefills the whole context: `rows = ctx`).
 
 use napi::{Error, Result};
 
@@ -45,6 +48,41 @@ pub const GROW_MIN: u64 = 8 * GIB;
 /// cache only while this much cache is left; below it decode slows by more
 /// than 5 % (internal-SSD read rate; a slower drive raises the bar).
 pub const SECOND_STAGING_MIN_CACHE: u64 = 17 * GIB;
+
+/// One model family's admission constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub cache_env: &'static str,
+    pub reserve_env: &'static str,
+    /// `compute = 1.2 (base + per_row x rows + fixed + per_ctx x ctx)`.
+    pub compute_base: u64,
+    pub compute_per_row: u64,
+    pub compute_fixed: u64,
+    pub compute_per_ctx: u64,
+    /// `kv = 1.2 (base + per_ctx x ctx)`.
+    pub kv_base: u64,
+    pub kv_per_ctx: u64,
+    /// `io = base + per_row x rows + fixed`.
+    pub io_base: u64,
+    pub io_per_row: u64,
+    pub io_fixed: u64,
+    pub second_staging_min_cache: u64,
+}
+
+pub const DSV41: Profile = Profile {
+    cache_env: CACHE_ENV,
+    reserve_env: RESERVE_ENV,
+    compute_base: COMPUTE_BASE,
+    compute_per_row: COMPUTE_PER_ROW,
+    compute_fixed: 0,
+    compute_per_ctx: 0,
+    kv_base: KV_BASE,
+    kv_per_ctx: KV_PER_ROW,
+    io_base: IO_BASE,
+    io_per_row: IO_PER_ROW,
+    io_fixed: 0,
+    second_staging_min_cache: SECOND_STAGING_MIN_CACHE,
+};
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("moe_stream budget: {msg}"))
@@ -93,20 +131,38 @@ fn gib_value(name: &str, raw: &str) -> Result<u64> {
 
 impl Limits {
     pub fn from_values(cache_gb: Option<&str>, reserve_gb: Option<&str>) -> Result<Self> {
+        Self::from_values_with(&DSV41, cache_gb, reserve_gb)
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_with(&DSV41)
+    }
+
+    pub fn from_values_with(
+        p: &Profile,
+        cache_gb: Option<&str>,
+        reserve_gb: Option<&str>,
+    ) -> Result<Self> {
         fn set(v: Option<&str>) -> Option<&str> {
             v.filter(|s| !s.trim().is_empty())
         }
-        let cache_cap = set(cache_gb).map(|v| gib_value(CACHE_ENV, v)).transpose()?;
+        let cache_cap = set(cache_gb)
+            .map(|v| gib_value(p.cache_env, v))
+            .transpose()?;
         let reserve = match set(reserve_gb) {
-            Some(v) => gib_value(RESERVE_ENV, v)?.max(RESERVE),
+            Some(v) => gib_value(p.reserve_env, v)?.max(RESERVE),
             None => RESERVE,
         };
         Ok(Self { reserve, cache_cap })
     }
 
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env_with(p: &Profile) -> Result<Self> {
         let get = |k| std::env::var(k).ok();
-        Self::from_values(get(CACHE_ENV).as_deref(), get(RESERVE_ENV).as_deref())
+        Self::from_values_with(
+            p,
+            get(p.cache_env).as_deref(),
+            get(p.reserve_env).as_deref(),
+        )
     }
 }
 
@@ -152,13 +208,21 @@ pub struct Terms {
 
 impl Terms {
     pub fn new(m: &ModelSize, ws: u64) -> Self {
+        Self::with(&DSV41, m, ws, m.ctx)
+    }
+
+    /// `prefill_rows`: rows of one prefill call (compute and io scale with it).
+    pub fn with(p: &Profile, m: &ModelSize, ws: u64, prefill_rows: u64) -> Self {
         let x12 = |b: u64| b + b / 5;
         Self {
             dense: m.dense,
             staging_layer: m.n_experts * m.slot,
-            kv: x12(KV_BASE + KV_PER_ROW * m.ctx),
-            compute: x12(COMPUTE_BASE + COMPUTE_PER_ROW * m.ctx),
-            io: IO_BASE + IO_PER_ROW * m.ctx,
+            kv: x12(p.kv_base + p.kv_per_ctx * m.ctx),
+            compute: x12(p.compute_base
+                + p.compute_per_row * prefill_rows
+                + p.compute_fixed
+                + p.compute_per_ctx * m.ctx),
+            io: p.io_base + p.io_per_row * prefill_rows + p.io_fixed,
             driver: DRIVER_MIN.max(ws / 20),
             pool: POOL,
         }
@@ -264,6 +328,19 @@ pub fn admit(
     own: &Own,
     ws: u64,
 ) -> Result<Admission> {
+    admit_with(&DSV41, m, m.ctx, limits, host, own, ws)
+}
+
+/// [`admit`] with `p`'s constants at `prefill_rows` rows per prefill call.
+pub fn admit_with(
+    p: &Profile,
+    m: &ModelSize,
+    prefill_rows: u64,
+    limits: &Limits,
+    host: &HostMemory,
+    own: &Own,
+    ws: u64,
+) -> Result<Admission> {
     if m.slot == 0 || m.n_experts == 0 {
         return Err(bad("empty expert slot"));
     }
@@ -278,7 +355,7 @@ pub fn admit(
         .saturating_sub(others)
         .saturating_sub(limits.reserve);
     let budget = live.min(ws);
-    let terms = Terms::new(m, ws);
+    let terms = Terms::with(p, m, ws, prefill_rows);
     let one = terms.fixed(1);
     if one > budget {
         return Err(bad(format!(
@@ -299,12 +376,13 @@ pub fn admit(
     let cap = limits.cache_cap.unwrap_or(u64::MAX);
     let cache1 = (budget - one).min(cap) / m.slot * m.slot;
     let two = terms.fixed(2);
-    let layers =
-        if two + cache1 <= budget || (two <= budget && budget - two >= SECOND_STAGING_MIN_CACHE) {
-            2
-        } else {
-            1
-        };
+    let layers = if two + cache1 <= budget
+        || (two <= budget && budget - two >= p.second_staging_min_cache)
+    {
+        2
+    } else {
+        1
+    };
     let room = budget - terms.fixed(layers);
     let (cache, bound) = if cap < room {
         (cap, Bound::Env)
@@ -353,7 +431,22 @@ pub fn readmit(
     own: &Own,
     ws: u64,
 ) -> Result<Turn> {
-    let now = admit(m, limits, host, own, ws)?;
+    readmit_with(&DSV41, current, m, m.ctx, limits, host, own, ws)
+}
+
+/// [`readmit`] with `p`'s constants at `prefill_rows` rows per prefill call.
+#[allow(clippy::too_many_arguments)]
+pub fn readmit_with(
+    p: &Profile,
+    current: &Admission,
+    m: &ModelSize,
+    prefill_rows: u64,
+    limits: &Limits,
+    host: &HostMemory,
+    own: &Own,
+    ws: u64,
+) -> Result<Turn> {
+    let now = admit_with(p, m, prefill_rows, limits, host, own, ws)?;
     let held = current.fixed + current.cache_bytes();
     if current.cache_slots == 0 && current.staging_layers == 1 {
         return Ok(if now.cache_slots > 0 || now.staging_layers > 1 {
@@ -373,3 +466,5 @@ pub fn readmit(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_profile;

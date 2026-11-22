@@ -23,6 +23,14 @@ impl Activations {
         MxArray::from_handle(handle, "swiglu_compiled")
     }
 
+    /// Compiled SwiGLU with asymmetric clamp when `limit > 0`: gate is upper-clamped
+    /// (`<= limit`), up is clamped to `[-limit, +limit]`. Falls back to unclamped
+    /// `swiglu_compiled` when `limit <= 0`.
+    pub fn swiglu_clamped_compiled(gate: &MxArray, up: &MxArray, limit: f32) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_swiglu_clamped_compiled(gate.handle.0, up.handle.0, limit) };
+        MxArray::from_handle(handle, "swiglu_clamped_compiled")
+    }
+
     /// Sigmoid Linear Unit (SiLU): x * sigmoid(x)
     /// This is the most common activation in modern LLMs (Llama, Qwen, Phi)
     ///

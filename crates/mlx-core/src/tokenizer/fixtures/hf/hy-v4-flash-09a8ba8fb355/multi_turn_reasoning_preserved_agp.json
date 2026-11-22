@@ -1,0 +1,23 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise assistant. 请用中文回答。"
+    },
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    },
+    {
+      "role": "assistant",
+      "content": "I am Hy4, an assistant.",
+      "reasoning_content": "The user asks who I am. Answer briefly."
+    },
+    {
+      "role": "user",
+      "content": "What is 17 * 23?"
+    }
+  ],
+  "add_generation_prompt": true,
+  "preserved_thinking": true
+}

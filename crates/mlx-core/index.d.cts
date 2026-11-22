@@ -673,6 +673,144 @@ export declare class HarrierModel {
   static load(modelPath: string): Promise<HarrierModel>;
 }
 
+/**
+ * Hy4-flash (GGUF `hy_v4_flash`) with SSD-streamed routed experts:
+ * text-only chat on one owned model thread. Sequences of different cache
+ * owners run together on the shared scheduler over a paged pool, unless
+ * `MLX_SERVE_FORCE_SERIAL=1` at load keeps one whole turn at a time.
+ */
+export declare class HyV4FlashModel {
+  /**
+   * `model_path`: any shard of the split GGUF, its directory, or a
+   * single-file GGUF.
+   */
+  static load(modelPath: string, options?: HyV4FlashLoadOptions | undefined | null): Promise<HyV4FlashModel>;
+  /**
+   * What the load's warm-up did; `null` for a flat-mode load, which runs
+   * none.
+   */
+  get warmup(): WarmupReport | null;
+  /**
+   * Closes the stored states' SSD cache at a clean stop: on a persistent
+   * cache it asks the model thread to write the waiting states, the
+   * newest first, then drains every copy, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn share
+   * one deadline); a temporary cache is removed. The model thread gets
+   * all of the time but the last second (at most half of it). The cache
+   * takes no write and removes nothing afterwards. Resolves true only
+   * when no state was left waiting and every copy and write landed by
+   * the deadline; true without a cache, or after `dispose`, which closed
+   * it. A call while another close runs gets that close's outcome.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
+  /**
+   * The stored states' SSD cache: `'persistent'` or `'temp'` while it is
+   * open, `'off'` without one, after `closeCache`, and once a write failed
+   * for anything but room (it takes no write after).
+   */
+  stateTierMode(): 'persistent' | 'temp' | 'off';
+  /**
+   * The directory name of the stored states' open persistent SSD cache
+   * under its cache root, read from the cache itself; null without one,
+   * for a temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
+  /**
+   * Frees the weights, the bank and the sequence now: the model thread
+   * drops them and exits; every later call fails.
+   */
+  dispose(): Promise<void>;
+  contextLimits(): HyV4FlashContextLimits;
+  /**
+   * 1 under `MLX_SERVE_FORCE_SERIAL` (read per call) or in flat mode,
+   * else the scheduler's lanes.
+   */
+  maxConcurrentSequences(): number;
+  /** Whether the load runs in paged mode (fixed at load). */
+  hasBlockPagedCache(): boolean;
+  /** Prompt and generated ids of the last completed turn, if any. */
+  lastTurnTokenIds(): HyV4FlashTurnTokenIds | null;
+  residencyInfo(): HyV4FlashResidencyInfo;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
 export declare class JinaRerankerModel {
   static load(modelPath: string, optionsJson?: string | undefined | null): Promise<JinaRerankerModel>;
   get infoJson(): string;
@@ -4652,6 +4790,160 @@ export interface HarrierConfig {
    */
   useQkNorm?: boolean;
   vocabSize: number;
+}
+
+export interface HyV4FlashContextLimits {
+  /** The context the load's admission budgets for. */
+  effectiveWindowTokens: number;
+  trainedWindowTokens: number;
+  /** Rows of one prefill chunk. */
+  prefillChunkTokens: number;
+  /**
+   * The model's `modelId` in `memoryGovernorStatus().scheduler`; a
+   * flat-mode load does not register.
+   */
+  governorModelId?: number;
+}
+
+export interface HyV4FlashLoadOptions {
+  /**
+   * Context token limit (`--max-context`): the admission budgets for at
+   * most this many tokens (and at most 262,144).
+   */
+  maxContextTokens?: number;
+  /**
+   * The Metal memory budget (`--max-memory`): every admission, at load
+   * and at each turn, sizes the expert cache within it, and the memory
+   * governor's limit for this model is it.
+   */
+  maxMemoryBytes?: number;
+  /**
+   * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+   * default: up to 32 GiB, a quarter of the volume's room), a byte count,
+   * or `'0'`, which turns the SSD cache off.
+   */
+  cacheDisk?: string;
+  /**
+   * The paged KV disk cache switch every family shares (`--no-persist-cache`):
+   * keep the stored states on SSD across restarts in a directory of the
+   * model's own under `cacheDir`; off, the cache is temporary: a directory
+   * under the temp root that takes copies only while memory drops states,
+   * removed at the stop. Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+   */
+  persistPagedCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`), default
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+   */
+  cacheDir?: string;
+}
+
+/** The load-time and latest per-turn admission, and the expert bank. */
+export interface HyV4FlashResidencyInfo {
+  denseBytes: number;
+  physicalBytes?: number;
+  /** Other processes' (and other models') bytes at the last admission. */
+  othersBytes?: number;
+  /**
+   * Fixed working set: dense, staging, KV and compute at the context
+   * limit, I/O buffers, driver and MLX pool reserves.
+   */
+  fixedBytes?: number;
+  /** Expert cache slots of both classes. */
+  expertCacheSlots: number;
+  /** Expert cache slots per class (Q6_K down, Q4_K down). */
+  expertCacheSlotsByClass: Array<number>;
+  expertCacheBytes?: number;
+  stagingLayers?: number;
+  /** Bounded wired-limit request of each turn (`fixed + cache`). */
+  wiredLimitBytes?: number;
+  /**
+   * Bank pages still resident after the last turn made the bank volatile;
+   * non-zero while another live wired lease keeps them wired.
+   */
+  bankResidentAfterTurnBytes: number;
+  bankSwitches: number;
+  inTurn: boolean;
+  /**
+   * Routed expert uses since load served without a read (cache hits and
+   * still-valid staging copies), and the experts read into slots.
+   */
+  slotHits: number;
+  slotMisses: number;
+  /**
+   * Expert fill bytes read from the GGUF shards since load (excluding Engram
+   * rows, reported separately in `engram_bytes_read`); the page cache may
+   * serve part of them.
+   */
+  checkpointBytesRead: number;
+  engramBytesRead: number;
+  /** Stored prefix states with a RAM copy, and their bytes. */
+  prefixStates: number;
+  prefixStateBytes: number;
+  /** States published since load, and turns that resumed from one. */
+  prefixPublished: number;
+  prefixRestored: number;
+  /** The stored states' disk tier is open and takes writes. */
+  prefixDiskEnabled: boolean;
+  /** States waiting for their disk write, the one in flight included. */
+  prefixDiskWaiting: number;
+  /** States written whose whole chain is on disk. */
+  prefixDiskDurable: number;
+  /** Waiting states not written: their conversation went on. */
+  prefixDiskUnneeded: number;
+  /**
+   * States not written or dropped (chain incomplete, room, a failed
+   * write, a closed cache), and copies the writer refused.
+   */
+  prefixDiskRefused: number;
+  /** Turns that resumed from a state read back from disk. */
+  prefixDiskRestored: number;
+  /**
+   * States a persistent cache took back at load: on disk only until a
+   * turn reads one back.
+   */
+  prefixDiskAdopted: number;
+  /** States removed from disk: their chain was not there. */
+  prefixDiskDroppedChain: number;
+  /** Block and segment copies waiting for the writer. */
+  prefixDiskOwedBlocks: number;
+  /** Bytes of states written. */
+  prefixDiskStateBytesWritten: number;
+  /** Paged mode: decode and verify waves since load. */
+  decodeWaves: number;
+  /**
+   * Waves by rows: `[i]` counts the waves of `i + 1` rows, the last
+   * entry also every wider wave.
+   */
+  waveRows: Array<number>;
+  /**
+   * Distinct experts per layer step of the waves, summed, and the rows
+   * times the routed experts each row picks: their ratio is the share
+   * of picks the lanes shared.
+   */
+  unionExperts: number;
+  rowExperts: number;
+  /** Wave rows kept (one emitted token each). */
+  waveTokens: number;
+  /** Expert bytes the waves read per kept row. */
+  missBytesPerToken: number;
+  /**
+   * `[n - 1]`: the share of expert uses served without a read in waves
+   * of `n` owners.
+   */
+  hitRateByLanes: Array<number>;
+  /** Host syncs (evals and router reads) per wave. */
+  evalsPerWave: number;
+  /** Milliseconds of prefill slices run while another scheduled turn was open. */
+  prefillChunkStallMs: number;
+}
+
+/** The last saved turn of the session (prompt and output ids). */
+export interface HyV4FlashTurnTokenIds {
+  /** The rendered prompt the turn was given (whole conversation). */
+  promptIds: Array<number>;
+  /** The generated ids, the stop token included when one ended the turn. */
+  outputIds: Array<number>;
 }
 
 /** InternViT vision encoder configuration */

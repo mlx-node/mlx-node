@@ -286,30 +286,66 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let zero_probe = probe
             .as_ref()
             .is_some_and(|shape| shape.iter().all(|&n| n == 0));
+        let mut proposals: Vec<Result<DsparkProposal>> =
+            (0..work.len()).map(|_| Ok(empty_proposal())).collect();
+        let mut eligible_work_indices = Vec::new();
+        for (wi, item) in work.iter().enumerate() {
+            if item.cap > 0 && !zero_probe {
+                if running[item.turn_index]
+                    .payload
+                    .scheduled_speculation
+                    .is_some()
+                {
+                    eligible_work_indices.push(wi);
+                } else {
+                    proposals[wi] = Err(Error::from_reason(
+                        "scheduled speculation state missing for capped row",
+                    ));
+                    timeline::lane_mark(plan.rows[item.plan_index].seq_id, Mark::DraftSubmit);
+                }
+            }
+        }
+        if !eligible_work_indices.is_empty() {
+            let mut by_turn: HashMap<usize, &mut TurnState<ScheduledTurn<B::PrefixState>>> =
+                running.iter_mut().enumerate().collect();
+            let mut batch_reqs = Vec::with_capacity(eligible_work_indices.len());
+            for &wi in &eligible_work_indices {
+                let item = &work[wi];
+                let row = &plan.rows[item.plan_index];
+                let turn = by_turn
+                    .remove(&item.turn_index)
+                    .ok_or_else(|| Error::from_reason("scheduled verifier duplicate turn"))?;
+                let payload = &mut turn.payload;
+                let rng = payload.scheduled_speculation.as_mut().ok_or_else(|| {
+                    Error::from_reason("scheduled speculation state missing for capped row")
+                })?;
+                batch_reqs.push(ScheduledProposalRequest {
+                    seq_id: row.seq_id,
+                    anchor: item.anchor,
+                    max_drafts: item.cap,
+                    params: &payload.params,
+                    rng,
+                    confidence: profiling,
+                });
+            }
+            let batch_out = if batch_reqs.len() == 1 {
+                let _focus = timeline::focus_lane(batch_reqs[0].seq_id);
+                self.inner.propose_scheduled_batch(&mut batch_reqs)
+            } else {
+                self.inner.propose_scheduled_batch(&mut batch_reqs)
+            };
+            let mut batch_iter = batch_out.into_iter();
+            for wi in eligible_work_indices {
+                timeline::lane_mark(plan.rows[work[wi].plan_index].seq_id, Mark::DraftSubmit);
+                proposals[wi] = batch_iter.next().unwrap_or_else(|| {
+                    Err(Error::from_reason("scheduled proposal width mismatch"))
+                });
+            }
+        }
         let mut proposed = Vec::with_capacity(work.len());
-        for mut item in work {
+        for (mut item, proposal) in work.into_iter().zip(proposals) {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];
-            let proposal = if item.cap > 0 && !zero_probe {
-                let _focus = timeline::focus_lane(row.seq_id);
-                let proposal = match turn.payload.scheduled_speculation.as_mut() {
-                    Some(rng) => self.inner.propose_scheduled(
-                        row.seq_id,
-                        item.anchor,
-                        item.cap,
-                        &turn.payload.params,
-                        rng,
-                        profiling,
-                    ),
-                    None => Err(Error::from_reason(
-                        "scheduled speculation state missing for capped row",
-                    )),
-                };
-                timeline::lane_mark(row.seq_id, Mark::DraftSubmit);
-                proposal
-            } else {
-                Ok(empty_proposal())
-            };
             // The scheduled verify wave is host-batched (`ScheduledVerifyRow`
             // tokens), so a device-resident proposal is normalized to host
             // ids here at the boundary rather than carried deeper.

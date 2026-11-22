@@ -151,6 +151,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
       promptTokens: result.promptTokens,
       reasoningTokens: result.reasoningTokens,
       rawText: result.rawText,
+      publicRawText: result.publicRawText,
     };
   }
   return {
@@ -863,7 +864,16 @@ describe('handleCreateMessage', () => {
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
     });
 
-    it('does not emit tool_use blocks or parsed tool markup when request has no tools', async () => {
+    it.each([
+      { name: 'request has no tools', extra: {} },
+      {
+        name: "tool_choice is 'none'",
+        extra: {
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+          tool_choice: { type: 'none' as const },
+        },
+      },
+    ])('does not emit tool_use blocks or parsed tool markup when $name', async ({ extra }) => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
         makeChatResult({
@@ -894,6 +904,7 @@ describe('handleCreateMessage', () => {
           model: 'test-model',
           messages: [{ role: 'user', content: 'What is the weather?' }],
           max_tokens: 100,
+          ...extra,
         },
         registry,
       );
@@ -1427,6 +1438,106 @@ describe('handleCreateMessage', () => {
       expect(thinkingStart).toBeUndefined();
     });
 
+    // vLLM `hy_v4_reasoning_parser` drops the close from the reasoning.
+    // Mutation: strip only `</think>` from the deltas → red.
+    it('a Hy4 turn with no tools streams no close tag and no reasoning as text', async () => {
+      const x = ':6124c78e';
+      const block =
+        `<tool_calls${x}><tool_call${x}>get_weather` +
+        `<arg_key${x}>city</arg_key${x}><arg_value${x}>Paris</arg_value${x}>` +
+        `</tool_call${x}></tool_calls${x}>`;
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'plan', done: false, isReasoning: true },
+        { text: `</think${x}>`, done: false, isReasoning: true },
+        { text: '\n', done: false, isReasoning: false },
+        { text: block, done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{"city":"Paris"}' }],
+          thinking: 'plan',
+          numTokens: 12,
+          promptTokens: 4,
+          reasoningTokens: 2,
+          rawText: `plan</think${x}>\n${block}`,
+          publicRawText: `\n${block}`,
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 100, stream: true },
+        registry,
+      );
+
+      const deltas = parseSSE(getBody())
+        .filter((e) => e.event === 'content_block_delta')
+        .map((e) => e.data['delta'] as any);
+      const thinking = deltas.filter((d) => d.type === 'thinking_delta').map((d) => d.thinking as string);
+      expect(thinking.join('')).toBe('plan');
+      const text = deltas
+        .filter((d) => d.type === 'text_delta')
+        .map((d) => d.text as string)
+        .join('');
+      expect(text).not.toContain('plan');
+      expect(text).not.toContain('</think');
+      expect(text).not.toContain('tool_call');
+    });
+
+    // vLLM `_strip_content_whitespace` drops whitespace-only content beside a
+    // tool call. Mutation: keep the whitespace-only recovered text → red.
+    it('a suppressed call after the reasoning opens no whitespace text block', async () => {
+      const block = '<tool_call>\n{"name":"get_weather","arguments":{"city":"Paris"}}\n</tool_call>';
+      const done = {
+        text: '',
+        done: true,
+        finishReason: 'tool_calls',
+        toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{"city":"Paris"}' }],
+        thinking: 'plan',
+        numTokens: 12,
+        promptTokens: 4,
+        reasoningTokens: 2,
+        rawText: `plan\n</think>\n\n${block}`,
+        publicRawText: `\n\n${block}`,
+      };
+      const request = { model: 'test-model', messages: [{ role: 'user' as const, content: 'go' }], max_tokens: 100 };
+
+      const streamRegistry = new ModelRegistry();
+      streamRegistry.register(
+        'test-model',
+        createMockStreamModel([{ text: 'plan', done: false, isReasoning: true }, done]),
+      );
+      const streamed = createMockRes();
+      await handleCreateMessage(streamed.res, { ...request, stream: true }, streamRegistry);
+      const starts = parseSSE(streamed.getBody())
+        .filter((e) => e.event === 'content_block_start')
+        .map((e) => (e.data['content_block'] as any).type as string);
+      expect(starts).toEqual(['thinking']);
+
+      const registry = new ModelRegistry();
+      registry.register(
+        'test-model',
+        createMockModel(
+          makeChatResult({
+            text: '',
+            thinking: 'plan',
+            rawText: done.rawText,
+            publicRawText: done.publicRawText,
+            finishReason: 'tool_calls',
+            toolCalls: [done.toolCalls[0] as ToolCallResult],
+          }),
+        ),
+      );
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(res, request, registry);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.map((b: any) => b.type as string)).toEqual(['thinking']);
+    });
+
     it('emits thinking + text with correct content block indices', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [
@@ -1720,7 +1831,16 @@ describe('handleCreateMessage', () => {
       expect(toolStarts).toHaveLength(1);
     });
 
-    it('suppresses parsed tool_call markup when request has no tools', async () => {
+    it.each([
+      { name: 'request has no tools', extra: {} },
+      {
+        name: "tool_choice is 'none'",
+        extra: {
+          tools: [{ name: 'search', input_schema: { type: 'object', properties: {} } }],
+          tool_choice: { type: 'none' as const },
+        },
+      },
+    ])('suppresses parsed tool_call markup when $name', async ({ extra }) => {
       const registry = new ModelRegistry();
       const streamEvents = [
         { text: '<tool_call>', done: false, isReasoning: false },
@@ -1755,6 +1875,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Search' }],
           max_tokens: 100,
           stream: true,
+          ...extra,
         },
         registry,
       );
@@ -2975,7 +3096,7 @@ describe('handleCreateMessage', () => {
     it('non-streaming: honors a stop sequence inside recovered suppressed-tool text', async () => {
       // BUG B: the request disallows tools, but the native parser still
       // produced a tool call and `result.text` is empty, so
-      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(rawText)`
+      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(publicRawText)`
       // as the visible text. The stop scan must run over THAT recovered text,
       // not the empty `result.text` — otherwise a stop inside it leaks with
       // `stop_reason: end_turn`.
@@ -2984,6 +3105,7 @@ describe('handleCreateMessage', () => {
         makeChatResult({
           text: '',
           rawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+          publicRawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
           finishReason: 'stop',
           toolCalls: [
             {
@@ -3019,6 +3141,47 @@ describe('handleCreateMessage', () => {
       expect(textBlock.text).toBe('Sure ');
       expect(parsed.stop_reason).toBe('stop_sequence');
       expect(parsed.stop_sequence).toBe('STOP');
+    });
+
+    // vLLM: the text is the content after the reasoning. Mutation: recover
+    // from `rawText` → red (`plan\n</think>` in the text).
+    it('non-streaming: a stop in recovered text holds no reasoning', async () => {
+      const block = '<tool_call>\n{"name":"get_weather","arguments":{}}\n</tool_call>';
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          thinking: 'plan',
+          rawText: `plan\n</think>\n\nSure STOP ${block}`,
+          publicRawText: `\n\nSure STOP ${block}`,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{}' } as ToolCallResult],
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      const textBlock = parsed.content.find((b: any) => b.type === 'text');
+      expect(textBlock.text).not.toContain('plan');
+      expect(textBlock.text).not.toContain('</think>');
+      expect(textBlock.text.trimStart()).toBe('Sure ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
     });
 
     it('non-streaming: keeps a trailing incomplete partial when no stop completes', async () => {
@@ -3159,6 +3322,51 @@ describe('handleCreateMessage', () => {
       const msgDelta = events.find((e) => e.event === 'message_delta');
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    // vLLM `messages_full_converter` adds the empty text block only when no other
+    // block exists. Mutation: open the empty block whenever a stop matched → red.
+    it('streaming: a stop that consumes all text after thinking opens no text block', async () => {
+      const registry = new ModelRegistry();
+      registry.register(
+        'test-model',
+        createMockStreamModel([
+          { text: 'plan', done: false, isReasoning: true },
+          { text: 'STOPhello', done: false, isReasoning: false },
+          {
+            text: 'STOPhello',
+            done: true,
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: 'plan',
+            numTokens: 5,
+            promptTokens: 3,
+            reasoningTokens: 1,
+            rawText: 'plan</think>STOPhello',
+          },
+        ]),
+      );
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const starts = events
+        .filter((e) => e.event === 'content_block_start')
+        .map((e) => (e.data['content_block'] as any).type as string);
+      expect(starts).toEqual(['thinking']);
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
     });
 
     it('streaming: opens an empty text block when a stop sequence consumes all visible output', async () => {
@@ -7610,7 +7818,10 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
   // Splash cuts the raw output at a stop (`CallbackStreamer._emit`) before
   // `StreamingToolCallProjector` reads a nameless opening as text, so the block
   // keeps its place in the answer. Mutation: append the nameless blocks after the
-  // text (skip the in-place placement) → red (AFTER leaks past the stop).
+  // text (skip the in-place placement) → red (AFTER leaks past the stop). The
+  // mocks carry the native shape: `rawText` with the reasoning, which quotes the
+  // block, and `publicRawText` after it. Mutation: place in `rawText` → red (the
+  // quoted copy is found first and the block goes after the text).
   describe('a nameless call keeps its place in the answer', () => {
     const block = '<tool_call>\n<function=>\n<parameter=q>\nxSTOPy\n</parameter>\n</function>\n</tool_call>';
     const nameless = {
@@ -7647,10 +7858,13 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       };
       const registry = new ModelRegistry();
       const mock = createMockRes();
+      const publicRawText = `\n\n${raw}`;
+      const quoted = toolCalls.find((call) => call.status === 'missing_name')?.rawContent ?? '';
+      const rawText = `<think>see ${quoted}</think>${publicRawText}`;
       if (!stream) {
         registry.register(
           'test-model',
-          createMockModel(makeChatResult({ text: cleaned, rawText: raw, toolCalls, finishReason: 'stop' })),
+          createMockModel(makeChatResult({ text: cleaned, rawText, publicRawText, toolCalls, finishReason: 'stop' })),
         );
         await handleCreateMessage(mock.res, request, registry);
         const parsed = JSON.parse(mock.getBody());
@@ -7679,7 +7893,8 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
             numTokens: 16,
             promptTokens: 8,
             reasoningTokens: 0,
-            rawText: raw,
+            rawText,
+            publicRawText,
           },
         ]),
       );

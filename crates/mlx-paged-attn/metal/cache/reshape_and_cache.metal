@@ -98,3 +98,4 @@ instantiate_reshape_and_cache(float, float, false, "");
 instantiate_reshape_and_cache(bfloat16_t, bfloat16_t, false, "");
 instantiate_reshape_and_cache(half, half, false, "");
 instantiate_reshape_and_cache(bfloat16_t, bfloat16_t, true, "_vt");
+instantiate_reshape_and_cache(half, half, true, "_vt");

@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    }
+  ],
+  "add_generation_prompt": true,
+  "reasoning_effort": "max"
+}

@@ -23,8 +23,9 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                            |
 | **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                       |
 | **DeepSeek V4.1 Flash**    |      —       |     yes     |     —      | Split GGUF; routed experts stream from the SSD; text only; 16,384-token context    |
+| **Hy4-flash**              |      —       |     yes     |     —      | Split GGUF; experts stream from the SSD; text only; 256K context; MTP; scheduling  |
 
-`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and DeepSeek V4.1 Flash are inference-only.
+`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, DeepSeek V4.1 Flash, and Hy4-flash are inference-only.
 
 **Freeing a model.** `Qwen35Model`, `Qwen35MoeModel` and `Qwen4ExpModel` have
 `dispose()`: the model thread drops the weights, caches and state and exits,
@@ -35,7 +36,8 @@ residency set, both requested every 500 ms until `setResidencyKeepAlive(seconds)
 (default 600, `Infinity` = for the model's life) passes without a command. The
 server's idle release (`--idle-release`, `POST /v1/memory/release`) unloads the
 resident chat model through `dispose()` and loads it again on the next request;
-see [cli.md](cli.md).
+see [cli.md](cli.md). `HyV4FlashModel` has `dispose()` too, but it holds its
+wired lease only while turns run (see [Hy4-flash](#hy4-flash)).
 
 See [Qwen3.8-Flash-Next](qwen38-flash-next.md) for SSD loading, memory budgets,
 the first-split GGUF path, auxiliary MTP/vision weights, and supported media.
@@ -114,7 +116,7 @@ const result = await pipeline.analyze(imageBuffer);
 Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
 All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Qwen3.8-Flash-Next, Gemma4,
-Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, DeepSeek V4.1 Flash, and the VLM
+Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, DeepSeek V4.1 Flash, Hy4-flash, and the VLM
 `QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of
 them can be passed to `new ChatSession(model)`.
 
@@ -231,6 +233,96 @@ Decode grows with the cache: with ~20-24 GiB of cache (other apps ~50-55 GiB)
 it measured 2.6-3.0 tok/s. Every miss costs one expert read at ~12.6 GB/s, so
 the SSD read rate sets the decode floor. See [perf.md](perf.md#deepseek-v41-flash-ssd-streaming)
 for the full row set.
+
+## Hy4-flash
+
+The `hy_v4_flash` runtime (`HyV4FlashModel`) runs tencent/Hy4-flash from its
+split GGUF ([`AngelSlim/Hy4-flash-GGUF`](https://huggingface.co/AngelSlim/Hy4-flash-GGUF),
+`Q4_K_M`, two files, about 157 GiB). Pass either shard, their directory, or a
+single-file GGUF. The tokenizer and chat template come from the GGUF header.
+The weights may be larger than RAM: the routed experts and the Engram rows
+are read from the SSD.
+
+```typescript
+import { loadSession } from '@mlx-node/lm';
+
+const session = await loadSession('/models/Hy4-flash-GGUF/Hy4-flash-Q4_K_M-00001-of-00002.gguf');
+const reply = await session.send('Explain in one sentence why the sky is blue.', {
+  config: { maxNewTokens: 64, reasoningEffort: 'none' },
+});
+```
+
+Scope: text only, inference only. The context is at most 262,144 tokens. The
+MTP layer (`blk.42`) loads by default and every turn speculates with it
+unless the request sets `enableMtp: false`. Depth defaults to 1; a request may
+ask for up to 3; adaptive depth is never used. Sampling defaults come from
+`generation_config.json`: temperature 0.9, top_p 1.0. `reasoningEffort` maps
+to the template's levels: `none` = `no_think`, `minimal` and `low` = `low`,
+`medium`, `high` and `xhigh` = `high`, `max` = `max`. Tool calls come back from
+the model's `<tool_calls:…>` block as `toolCalls`; values stay text, object
+and array literals parse as JSON, and broken markup gives one `parse_error`
+call.
+
+The catalog lists the model only on a Mac with at least 39 GiB of RAM
+(`minMemoryGb`): the admission's fixed bytes at its smallest settings (16K
+context, 2,048-row chunk, MTP on, one staging layer) are 26.52 GiB, plus the
+12 GiB it keeps free for other apps. The setup wizard and the Models page hide
+it below that.
+
+How it fits in memory:
+
+```
+load    dense weights (attention, router, shared experts, head; Q8_0 codes) ─► resident
+        MTP layer ─► resident, 2,189,929,600 B (MLX_HY4_MTP=0 leaves it out)
+        routed experts ─► two K-quant banks: class A (Q4_K gate/up, Q6_K down, 19 layers),
+                          class B (all Q4_K, 22 layers); each = [staging slots | cache slots],
+                          purgeable between turns
+        Engram rows ─► read by row from the F8 table (the only tensor of shard 2)
+        admission: context = the max context, halved until it fits (floor 16,384)
+                   chunk   = the largest of 8,192 / 4,096 / 2,048 rows that leaves >= 17 GiB of
+                             expert cache, else 2,048
+prefill chunks of C rows on a fixed grid; prefix states at block rows of the prompt
+decode  router ─► cached experts used in place; misses read from the SSD and repacked into slots
+```
+
+The admission runs again at each turn start. It may drop the expert cache to
+staging only or rebuild it larger, and then holds a bounded wired lease
+(fixed + cache bytes) until the turn ends; in paged mode the lease lasts until
+the last open turn closes. After that the bank is purgeable. `maxMemoryBytes`
+(`--max-memory`) caps every admission and is the memory governor's limit for
+the model. `maxContextTokens` (`--max-context`) caps the context: the
+admission starts its ladder there. There is no YaRN past 262,144.
+
+The load picks one of two modes and keeps it:
+
+- **Paged** (the default): the indexed trunk layers keep their K/V in a paged
+  pool of 32-row f16 blocks. Each sequence keeps its sliding windows, indexer
+  tails, MTP draft and last Engram ids in an owner cell beside the pool.
+  Several conversations decode together on the shared scheduler (see
+  [concurrent-inference.md](concurrent-inference.md#hy4-flash-lanes)). The
+  load runs the engine's warm-up first and registers with the memory governor.
+- **Flat**: `MLX_SERVE_FORCE_SERIAL=1` at load, or a GPU whose decode wave holds
+  fewer than 2 rows. One sequence, one whole turn at a time, no warm-up
+  (`warmup` is `null`) and no governor entry. It is the reference the paged
+  mode is checked against.
+
+Both modes reuse the longest cached prefix of a prompt and keep prefix states:
+at the block row before the generation prompt, every 8,192 rows below 32,768,
+every 32,768 rows from there, and at the turn's end. In paged mode the newest
+8 stay in RAM.
+They also go to the model's own SSD tier and survive a restart (see
+"hy_v4_flash (Hy4-flash) on disk" in
+[paged-cache.md](paged-cache.md#ssd-cold-tier-hybrid-families-and-the-auxiliary-sidecar)).
+
+`model.residencyInfo()` reports the admission (dense, fixed, cache and wired
+bytes, cache slots per class, staging layers, other apps' bytes), the expert
+hits and reads, the bytes read from the shards, the prefix states and their
+`prefixDisk*` counters, and in paged mode the wave counters (`decodeWaves`,
+`waveRows`, `unionExperts` / `rowExperts`, `missBytesPerToken`,
+`hitRateByLanes`, `evalsPerWave`, `prefillChunkStallMs`). `contextLimits()`
+gives the admitted window, the prefill chunk and `governorModelId`. Tuning
+switches are listed in [perf.md](perf.md#hy4-flash-ssd-streaming). No speed
+numbers have been measured yet.
 
 ## Qwen3.8 DFlash2
 
@@ -559,7 +651,9 @@ stays native, and the saved `config.json` never carries the factor; the SSD cold
 (`rope yarn <factor> <native>`). A checkpoint whose RoPE is already scaled
 (`rope_parameters.rope_type` or `type` not `default`, or a GGUF
 `rope.scaling.type` other than `none`) is refused, and training refuses a model
-loaded with YaRN.
+loaded with YaRN. A hy_v4_flash load takes the limit too, but only caps: its
+context is at most the GGUF's `context_length` and 262,144, with no YaRN, and
+its admission halves the context from there until it fits.
 
 ## Server-side sessions
 

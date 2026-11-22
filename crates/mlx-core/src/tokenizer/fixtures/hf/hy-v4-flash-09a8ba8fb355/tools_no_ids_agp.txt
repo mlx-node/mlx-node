@@ -1,0 +1,14 @@
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"name": "get_weather", "description": "查询城市天气 (weather lookup)", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名"}, "days": {"type": "integer"}}, "required": ["city"]}}
+{"name": "web_search", "description": "Search the web.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}}, "required": ["query"]}}
+</tools>
+
+For function call returns, you should first print <tool_calls:6124c78e>
+For each function call, you should return object like:
+<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>
+At the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in 北京 for 3 days, and search 'Hy4 release'.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>北京</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>web_search<arg_key:6124c78e>query</arg_key:6124c78e><arg_value:6124c78e>Hy4</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>result B</tool_response:6124c78e><tool_response:6124c78e>result A</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>

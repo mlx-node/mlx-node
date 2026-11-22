@@ -165,6 +165,16 @@ pub(crate) struct ScheduledVerifyCommit {
     pub keep: usize,
 }
 
+/// One lane's inputs to [`HybridSchedulerBackend::propose_scheduled_batch`].
+pub(crate) struct ScheduledProposalRequest<'a> {
+    pub seq_id: SeqId,
+    pub anchor: u32,
+    pub max_drafts: usize,
+    pub params: &'a engine::params::ChatParams,
+    pub rng: &'a mut dyn rand::Rng,
+    pub confidence: bool,
+}
+
 /// What one prefill pass of a unit left.
 pub(crate) enum ScheduledPrefillPass {
     /// The unit stopped between its layers; its rows are not computed yet.
@@ -546,6 +556,24 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         _confidence: bool,
     ) -> Result<engine::backend::DsparkProposal> {
         Err(Error::from_reason("scheduled proposals are unavailable"))
+    }
+    fn propose_scheduled_batch(
+        &mut self,
+        requests: &mut [ScheduledProposalRequest<'_>],
+    ) -> Vec<Result<engine::backend::DsparkProposal>> {
+        requests
+            .iter_mut()
+            .map(|req| {
+                self.propose_scheduled(
+                    req.seq_id,
+                    req.anchor,
+                    req.max_drafts,
+                    req.params,
+                    req.rng,
+                    req.confidence,
+                )
+            })
+            .collect()
     }
     fn run_scheduled_verify(&mut self, _rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
         Err(Error::from_reason("scheduled verification is unavailable"))

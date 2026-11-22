@@ -9,6 +9,7 @@ import {
   getRuntimeCapabilities,
   ggufArchitecture,
   HarrierModel,
+  HyV4FlashModel as NativeHyV4FlashModel,
   JinaRerankerModel,
   XlmRobertaRerankerModel,
   K2HorizonModel as NativeK2HorizonModel,
@@ -20,6 +21,7 @@ import {
   Qwen35Model as NativeQwen35Model,
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
+  type HyV4FlashLoadOptions,
   type Qwen35LoadOptions,
   type Qwen4ExpLoadOptions,
 } from '@mlx-node/core';
@@ -33,6 +35,7 @@ import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
   DeepseekV41Model,
   Gemma4Model,
+  HyV4FlashModel,
   K2HorizonModel,
   Lfm2Model,
   MuseGlimmerModel,
@@ -88,8 +91,9 @@ export interface LoadModelOptions {
    * Metal memory budget in bytes for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
    * targets (`--max-memory`). It can only lower the automatic budget the
    * load's memory plan derives from the working set; the plan sizes the KV
-   * pool and the windows from it (and for `qwen4_exp` the expert store). Other
-   * model families reject it.
+   * pool and the windows from it (and for `qwen4_exp` the expert store).
+   * `hy_v4_flash` sizes its expert cache within it. Other model families
+   * reject it.
    */
   maxMemoryBytes?: number;
   /**
@@ -97,7 +101,8 @@ export interface LoadModelOptions {
    * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
    * tokens, and the load fails when its memory plan holds fewer. Past the
    * native window the target's RoPE takes YaRN, which is static and changes
-   * answers at every length. Other model families reject it.
+   * answers at every length. `hy_v4_flash` takes it too, capped at 262,144
+   * with no YaRN. Other model families reject it.
    */
   maxContextTokens?: number;
   /**
@@ -121,7 +126,8 @@ export interface LoadModelOptions {
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
    * `'0'` (off). Whether it survives a restart is the paged KV disk cache
    * switch every family reads, `MLX_PERSIST_PAGED_CACHE`; off, the tier is
-   * temporary. Other model families reject it, as they do `cacheDir`.
+   * temporary. `hy_v4_flash` takes it for its stored states, with the same
+   * switch. Other model families reject it, as they do `cacheDir`.
    */
   cacheDisk?: string;
   /** The persistent tier's root (`--cache-dir`); needs the switch on. */
@@ -168,6 +174,22 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
     ...(options.auxiliaryModelPath !== undefined ? { auxiliaryModelPath: options.auxiliaryModelPath } : {}),
     ...(options.draftModelPath !== undefined ? { draftModelPath: options.draftModelPath } : {}),
     ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
+    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
+    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
+    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
+  };
+}
+
+function hyV4FlashLoadOptions(options: LoadModelOptions | undefined): HyV4FlashLoadOptions | null {
+  if (
+    options?.maxMemoryBytes === undefined &&
+    options?.maxContextTokens === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.cacheDir === undefined
+  )
+    return null;
+  return {
     ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
     ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
     ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
@@ -243,6 +265,11 @@ const LOADER_BINDINGS = {
   deepseek_v41: {
     load: (modelPath: string) => DeepseekV41Model.load(modelPath),
     nativeModelClass: NativeDeepseekV41Model,
+  },
+  hy_v4_flash: {
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      HyV4FlashModel.load(modelPath, hyV4FlashLoadOptions(options)),
+    nativeModelClass: NativeHyV4FlashModel,
   },
   lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
@@ -333,13 +360,13 @@ function dispatchLoad(
   }
   if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
     throw new Error(
-      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
     throw new Error(
-      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -360,7 +387,7 @@ function dispatchLoad(
     requireFamilyData(modelType).acceptsCacheDisk !== true
   ) {
     throw new Error(
-      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

@@ -31,6 +31,8 @@ export class ToolCallTagBuffer {
     '<turn|>',
     '<|tool_call_start|>',
     '<｜DSML｜ calls>',
+    // Hy4: no suffix, it differs per vocabulary (GGUF `:6124c78e`, HF `:opensource`).
+    '<tool_calls:',
   ] as const;
 
   private pendingText = '';

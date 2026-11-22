@@ -332,6 +332,20 @@ array gather_qmm(const array &x, const array &w, const array &scales,
                  std::optional<int> group_size, std::optional<int> bits,
                  Mode mode, bool sorted_indices, StreamOrDevice s = {});
 
+// x [..B, 1, K] @ w[rhs_indices].T with rhs_indices [..B] ascending: the
+// sorted-rhs kernel at every B and expert count, on one fixed tile, so a
+// row's bits do not depend on how many rows or experts share the call.
+array gather_qmm_sorted_rhs(const array &x, const array &w,
+                            const array &scales,
+                            const std::optional<array> &biases,
+                            const array &rhs_indices,
+                            std::optional<int> group_size,
+                            std::optional<int> bits, Mode mode,
+                            StreamOrDevice s = {},
+                            bool allow_tf32 = false,
+                            int max_y_tiles = 0,
+                            int max_group = 0);
+
 array dequantize(const array &w, const array &scales,
                  const std::optional<array> &biases,
                  std::optional<int> group_size, std::optional<int> bits,
@@ -440,10 +454,14 @@ private:
 class KQuantGatherQMM : public UnaryPrimitive {
 public:
   KQuantGatherQMM(Stream stream, int group_size, int bits, Mode mode,
-                  bool transpose, bool left_sorted, bool right_sorted)
+                  bool transpose, bool left_sorted, bool right_sorted,
+                  bool rhs_any_rows = false, bool allow_tf32 = false,
+                  int max_y_tiles = 0, int max_group = 0)
       : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
         mode_(mode), transpose_(transpose), left_sorted_(left_sorted),
-        right_sorted_(right_sorted) {}
+        right_sorted_(right_sorted), rhs_any_rows_(rhs_any_rows),
+        allow_tf32_(allow_tf32), max_y_tiles_(max_y_tiles),
+        max_group_(max_group) {}
 
   void eval_cpu(const std::vector<array> &inputs, array &out) override;
   void eval_gpu(const std::vector<array> &inputs, array &out) override;
@@ -459,6 +477,10 @@ private:
   bool transpose_;
   bool left_sorted_;
   bool right_sorted_;
+  bool rhs_any_rows_;
+  bool allow_tf32_;
+  int max_y_tiles_;
+  int max_group_;
 };
 
 class KQuantDequantize : public UnaryPrimitive {

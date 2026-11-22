@@ -6,6 +6,7 @@ import {
   buildUsage,
   computeOutputText,
   mapFinishReasonToStatus,
+  requestAllowsToolUse,
 } from '../../packages/server/src/mappers/response.js';
 
 function makeChatResult(overrides: Record<string, unknown> = {}) {
@@ -53,7 +54,7 @@ describe('mapFinishReasonToStatus', () => {
 describe('buildOutputItems', () => {
   it('produces a single message item for text-only result', () => {
     const result = makeChatResult();
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     expect(items).toHaveLength(1);
     expect(items[0].type).toBe('message');
@@ -66,7 +67,7 @@ describe('buildOutputItems', () => {
 
   it('produces reasoning item before message when thinking is present', () => {
     const result = makeChatResult({ thinking: 'Let me think...' });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     expect(items).toHaveLength(2);
     expect(items[0].type).toBe('reasoning');
@@ -81,7 +82,7 @@ describe('buildOutputItems', () => {
       text: 'Let me check the weather.',
       toolCalls: [{ id: 'call_123', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok', rawContent: '' }],
     });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     expect(items).toHaveLength(2);
     expect(items[0].type).toBe('message');
@@ -97,7 +98,7 @@ describe('buildOutputItems', () => {
       text: '',
       toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{}', status: 'ok', rawContent: '' }],
     });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     expect(items).toHaveLength(1);
     expect(items[0].type).toBe('function_call');
@@ -105,7 +106,7 @@ describe('buildOutputItems', () => {
 
   it('includes message item with empty text when no tool calls', () => {
     const result = makeChatResult({ text: '' });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     expect(items).toHaveLength(1);
     expect(items[0].type).toBe('message');
@@ -113,12 +114,18 @@ describe('buildOutputItems', () => {
     expect(msg.content[0].text).toBe('');
   });
 
+  // vLLM `build_response_output_items`: no message item for empty content.
+  it('omits the empty message item after a reasoning item', () => {
+    const items = buildOutputItems(makeChatResult({ text: '', thinking: 'plan' }), true);
+    expect(items.map((i) => i.type)).toEqual(['reasoning']);
+  });
+
   it('stringifies non-string tool call arguments', () => {
     const result = makeChatResult({
       text: '',
       toolCalls: [{ id: 'call_2', name: 'fn', arguments: { key: 'value' }, status: 'ok', rawContent: '' }],
     });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     const fc = items[0] as { arguments: string };
     expect(fc.arguments).toBe('{"key":"value"}');
@@ -129,7 +136,7 @@ describe('buildOutputItems', () => {
       thinking: 'hmm',
       toolCalls: [{ id: 'call_3', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
     });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     const ids = items.map((i) => i.id);
     const uniqueIds = new Set(ids);
@@ -138,10 +145,56 @@ describe('buildOutputItems', () => {
 
   it('sets status to incomplete when finish reason is length', () => {
     const result = makeChatResult({ finishReason: 'length' });
-    const items = buildOutputItems(result);
+    const items = buildOutputItems(result, true);
 
     const msg = items[0] as { status: string };
     expect(msg.status).toBe('incomplete');
+  });
+});
+
+// vLLM: `check_tool_usage` sets `tool_choice` to 'none' with no tools, and
+// `_extract_tool_calls` returns no calls for 'none'; `build_response_output_items`
+// adds a message only for non-empty content. Mutation: keep the calls → red.
+describe('tool calls the request did not allow', () => {
+  const call = { id: 'call_1', name: 'get_weather', arguments: '{}', status: 'ok', rawContent: '' };
+
+  it.each([
+    { name: 'no tools', req: {}, allowed: false },
+    { name: 'empty tools', req: { tools: [] }, allowed: false },
+    {
+      name: "tool_choice 'none'",
+      req: { tools: [{ type: 'function' as const, name: 'f' }], tool_choice: 'none' as const },
+      allowed: false,
+    },
+    { name: 'tools', req: { tools: [{ type: 'function' as const, name: 'f' }] }, allowed: true },
+    {
+      name: "tool_choice 'auto'",
+      req: { tools: [{ type: 'function' as const, name: 'f' }], tool_choice: 'auto' as const },
+      allowed: true,
+    },
+  ])('requestAllowsToolUse for $name', ({ req, allowed }) => {
+    expect(requestAllowsToolUse(req)).toBe(allowed);
+  });
+
+  it.each([
+    { name: 'text and a call', result: { text: 'Sure.', toolCalls: [call] }, types: ['message'] },
+    { name: 'reasoning and a call', result: { text: '', thinking: 'plan', toolCalls: [call] }, types: ['reasoning'] },
+    { name: 'only a call', result: { text: '', toolCalls: [call] }, types: ['message'] },
+    { name: 'reasoning and no text', result: { text: '', thinking: 'plan' }, types: ['reasoning'] },
+  ])('items for $name', ({ result, types }) => {
+    const items = buildOutputItems(makeChatResult(result), false);
+    expect(items.map((i) => i.type)).toEqual(types);
+    expect(computeOutputText(items)).toBe(result.text);
+  });
+
+  it('buildResponseObject drops the calls of a request with no tools', () => {
+    const response = buildResponseObject(
+      makeChatResult({ text: 'Sure.', toolCalls: [call] }),
+      { model: 'm', input: 'go' },
+      'resp_1',
+    );
+    expect(response.output.map((i) => i.type)).toEqual(['message']);
+    expect(response.output_text).toBe('Sure.');
   });
 });
 
