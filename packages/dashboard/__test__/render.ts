@@ -219,10 +219,18 @@ export interface StubbedApi {
   chatWatchers(conversationId?: string): number;
   /** Close the runtime's end of the port, as a crashed control panel service does. Every stream ends with it. */
   dropPort(): void;
+  /**
+   * Settles when the SPA's end of the port has closed, which is when the client fails the calls still in flight. A
+   * test that ends with a call in flight awaits it after the disposer, or that failure lands in the next test.
+   */
+  closed: Promise<void>;
 }
 
 export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedApi {
   const { port1, port2 } = new MessageChannel();
+  const closed = new Promise<void>((resolve) => {
+    port1.once('close', resolve);
+  });
   // Never hold the runner open on the channel's account.
   port1.unref();
   port2.unref();
@@ -306,6 +314,7 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedA
     port2.close();
   };
   return Object.assign(stop, {
+    closed,
     emitLive(event: LiveEvent): void {
       // The SPA's copy of the type omits writer-only fields the SPA never reads.
       for (const listener of liveListeners) listener(event as RuntimeLiveEvent);

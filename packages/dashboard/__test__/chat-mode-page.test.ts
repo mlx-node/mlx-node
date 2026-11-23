@@ -335,9 +335,13 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-afterEach(() => {
+afterEach(async () => {
   page?.unmount();
+  // A call still in flight fails when the port closes; its toast must not land in the next test.
+  const closed = api?.closed;
   api?.();
+  await closed;
+  await new Promise((resolve) => setImmediate(resolve));
   page = undefined;
   api = undefined;
   navigate = undefined;
