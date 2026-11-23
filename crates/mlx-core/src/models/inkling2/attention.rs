@@ -240,7 +240,7 @@ pub struct Inkling2Attention {
 pub(crate) fn forward_linear_proj_fast_ex(
     proj: &LinearProj,
     x: &MxArray,
-    include_tiny: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] include_tiny: bool,
 ) -> Result<MxArray> {
     #[cfg(target_os = "macos")]
     if let LinearProj::Quantized(ql) = proj
