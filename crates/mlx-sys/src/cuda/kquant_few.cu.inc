@@ -246,7 +246,10 @@ R"cuda(
 // via coalesced 128-bit L2-bypassing cp.async.cg.shared.global DMA transfers.
 // Modes: 0=Q4_K, 1=Q5_K, 2=Q6_K, 3=IQ4_XS, 4=Q3_K, 5=IQ4_NL.
 template <int mode, bool tiled = false, int NUM_WARPS = 4, bool M16 = false>
-__global__ __launch_bounds__(NUM_WARPS * 32, NUM_WARPS >= 12 ? 1 : 2)
+__global__ __launch_bounds__(
+    NUM_WARPS * 32,
+    NUM_WARPS <= 4 ? ((M16 && (mode == 2 || mode == 3 || mode == 4)) ? 3 : 4)
+                   : (NUM_WARPS >= 12 ? 1 : 2))
 void mlx_node_kquant_matmul_few(
     const unsigned int* __restrict__ w,
     const unsigned char* __restrict__ scales,

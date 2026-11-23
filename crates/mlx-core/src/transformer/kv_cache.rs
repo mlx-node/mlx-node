@@ -483,6 +483,111 @@ impl KVCache {
         Ok(Some((q_out, result_keys, result_values)))
     }
 
+    /// Explicit-positions variant of [`Self::qk_norm_rope_update_and_fetch`]:
+    /// applies QK-Norm (optionally in `PreciseF32` with FP32 weights) +
+    /// non-traditional partial RoPE at per-token `positions[b, t]` (`int32[B, T]`)
+    /// while storing K/V in place at slot `offset + t`.
+    ///
+    /// Returns `Ok(None)` without advancing `self.offset` if the CUDA kernel
+    /// is unavailable or declines the shape/dtype contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qk_norm_rope_update_and_fetch_positions(
+        &mut self,
+        q_in: &MxArray,
+        k_in: &MxArray,
+        v_in: &MxArray,
+        q_norm_w: &MxArray,
+        k_norm_w: &MxArray,
+        positions: &MxArray,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        precise_f32: bool,
+    ) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+        let expected_w_dt = if precise_f32 {
+            DType::Float32
+        } else {
+            DType::BFloat16
+        };
+        if !crate::accelerator::cuda_ops_available()
+            || q_in.dtype()? != DType::BFloat16
+            || k_in.dtype()? != DType::BFloat16
+            || v_in.dtype()? != DType::BFloat16
+            || q_norm_w.dtype()? != expected_w_dt
+            || k_norm_w.dtype()? != expected_w_dt
+            || positions.dtype()? != DType::Int32
+            || positions.ndim()? != 2
+        {
+            return Ok(None);
+        }
+        let batch_size = k_in.shape_at(0)?;
+        let seq_len = i32::try_from(k_in.shape_at(1)?)
+            .map_err(|_| Error::from_reason("KV cache input sequence is too large"))?;
+        let n_kv_heads = k_in.shape_at(2)?;
+        let k_head_dim = k_in.shape_at(3)?;
+        let v_head_dim = v_in.shape_at(3)?;
+        if batch_size <= 0
+            || seq_len <= 0
+            || k_head_dim != v_head_dim
+            || positions.shape_at(0)? != batch_size
+            || positions.shape_at(1)? != i64::from(seq_len)
+        {
+            return Ok(None);
+        }
+
+        let prev = self.offset;
+        let next = prev
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::from_reason("KV cache sequence is too large"))?;
+        self.ensure_rows(
+            batch_size,
+            n_kv_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            DType::BFloat16,
+            DType::BFloat16,
+        )?;
+        let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values) else {
+            return Ok(None);
+        };
+        let Some((q_out, new_k, new_v)) = crate::kernels::kv::qk_norm_rope_kv_store_positions(
+            q_in,
+            k_in,
+            v_in,
+            q_norm_w,
+            k_norm_w,
+            cached_keys,
+            cached_values,
+            positions,
+            prev,
+            eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            precise_f32,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.keys = Some(new_k);
+        self.values = Some(new_v);
+        self.offset = next;
+
+        let result_keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache keys missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        let result_values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("KV cache values missing after buffer update"))?
+            .slice_axis(2, 0, self.offset as i64)?;
+        Ok(Some((q_out, result_keys, result_values)))
+    }
+
     /// Append a block of K and V rows with ONE store dispatch for the whole
     /// layer, in place into the cache buffers. The bytes equal the
     /// slice_update path ([`Self::update_and_fetch`]), which stays the
@@ -638,6 +743,33 @@ impl KVCache {
             }
             _ => Err(Error::from_reason(
                 "KVCache::broadcast_batch found mismatched keys/values state",
+            )),
+        }
+    }
+
+    /// Compact the batch dimension (axis 0) in place by selecting rows at `indices`.
+    ///
+    /// Takes across the full `[0..capacity]` buffers so existing sequence
+    /// capacity is preserved and the resulting arrays are fresh, contiguous,
+    /// unaliased buffers safe for subsequent in-place KV stores. Leaves
+    /// `offset`, `step`, and `pending_rows` unchanged.
+    pub fn select_batch_rows(&mut self, indices: &MxArray) -> Result<()> {
+        if indices.ndim()? != 1 || indices.shape_at(0)? < 1 {
+            return Err(Error::from_reason(
+                "KVCache::select_batch_rows requires a non-empty 1D index array",
+            ));
+        }
+        match (&self.keys, &self.values) {
+            (None, None) => Ok(()),
+            (Some(keys), Some(values)) => {
+                let new_k = keys.take(indices, 0)?;
+                let new_v = values.take(indices, 0)?;
+                self.keys = Some(new_k);
+                self.values = Some(new_v);
+                Ok(())
+            }
+            _ => Err(Error::from_reason(
+                "KVCache::select_batch_rows found mismatched keys/values state",
             )),
         }
     }
@@ -1788,5 +1920,85 @@ mod tests {
         assert!(max_diff(&q_got, &q_ref) <= 2e-2, "tree Q mismatch");
         assert!(max_diff(&k_got, &k_ref) <= 2e-2, "tree K mismatch");
         assert!(bits_equal(&v_got, &v_ref), "tree V mismatch");
+    }
+
+    #[test]
+    fn select_batch_rows_preserves_capacity_offset_and_unaliased_storage() -> Result<()> {
+        // Empty cache accepts valid 1D indices as a no-op and rejects invalid shapes.
+        let mut empty = KVCache::new();
+        let valid_idx = MxArray::from_int32(&[0], &[1])?;
+        empty.select_batch_rows(&valid_idx)?;
+        assert!(empty.keys_ref().is_none());
+        assert_eq!(empty.get_offset(), 0);
+
+        let empty_idx = MxArray::from_int32(&[], &[0])?;
+        assert!(empty.select_batch_rows(&empty_idx).is_err());
+        let rank2_idx = MxArray::from_int32(&[0, 1], &[1, 2])?;
+        assert!(empty.select_batch_rows(&rank2_idx).is_err());
+
+        // Populate B=3, Hkv=2, T=5, D=4 cache (allocated capacity = 256).
+        let total = 3 * 2 * 5 * 4;
+        let k_vals: Vec<f32> = (0..total).map(|i| (i as f32) * 0.25 + 1.0).collect();
+        let v_vals: Vec<f32> = (0..total).map(|i| -((i as f32) * 0.5 + 2.0)).collect();
+        let k_in = MxArray::from_float32(&k_vals, &[3, 2, 5, 4])?;
+        let v_in = MxArray::from_float32(&v_vals, &[3, 2, 5, 4])?;
+
+        let mut cache = KVCache::new();
+        cache.update_and_fetch(&k_in, &v_in)?;
+        let cap_before = cache.capacity()?;
+        assert_eq!(cap_before, 256);
+        assert_eq!(cache.get_offset(), 5);
+
+        // Retain original handles to confirm subsequent in-place updates do not alias them.
+        let orig_k = cache
+            .keys_ref()
+            .ok_or_else(|| Error::from_reason("missing keys before select"))?
+            .clone();
+        let orig_v = cache
+            .values_ref()
+            .ok_or_else(|| Error::from_reason("missing values before select"))?
+            .clone();
+
+        // Compact to rows [2, 0] -> batch 2, preserving full capacity and offset.
+        let idx = MxArray::from_int32(&[2, 0], &[2])?;
+        cache.select_batch_rows(&idx)?;
+        assert_eq!(cache.get_offset(), 5);
+        assert_eq!(cache.capacity()?, cap_before);
+
+        let got_k = cache
+            .keys_ref()
+            .ok_or_else(|| Error::from_reason("missing keys after select"))?;
+        let got_v = cache
+            .values_ref()
+            .ok_or_else(|| Error::from_reason("missing values after select"))?;
+        assert_eq!(got_k.shape()?.as_ref(), [2, 2, cap_before, 4]);
+        assert_eq!(got_v.shape()?.as_ref(), [2, 2, cap_before, 4]);
+
+        let expected_k = k_in.take(&idx, 0)?.to_float32()?;
+        let expected_v = v_in.take(&idx, 0)?.to_float32()?;
+        assert_eq!(
+            got_k.slice_axis(2, 0, 5)?.to_float32()?.as_ref(),
+            expected_k.as_ref()
+        );
+        assert_eq!(
+            got_v.slice_axis(2, 0, 5)?.to_float32()?.as_ref(),
+            expected_v.as_ref()
+        );
+
+        // Subsequent in-place append must succeed without growing and without mutating `orig_k/v`.
+        let step_k = MxArray::from_float32(&[99.0f32; 2 * 2 * 4], &[2, 2, 1, 4])?;
+        let step_v = MxArray::from_float32(&[-99.0f32; 2 * 2 * 4], &[2, 2, 1, 4])?;
+        cache.update_and_fetch(&step_k, &step_v)?;
+        assert_eq!(cache.get_offset(), 6);
+        assert_eq!(cache.capacity()?, cap_before);
+        assert_eq!(
+            orig_k.slice_axis(2, 5, 6)?.to_float32()?.as_ref(),
+            [0.0f32; 3 * 2 * 4]
+        );
+        assert_eq!(
+            orig_v.slice_axis(2, 5, 6)?.to_float32()?.as_ref(),
+            [0.0f32; 3 * 2 * 4]
+        );
+        Ok(())
     }
 }

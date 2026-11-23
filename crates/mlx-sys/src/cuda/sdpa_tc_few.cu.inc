@@ -57,15 +57,15 @@ __device__ __forceinline__ void sdpa_few_load_kv_unchecked(
     nv_bfloat16* dst, const nv_bfloat16* base, long long stride,
     int k_start, int tid) {
   constexpr int C8 = D / 8;
-  constexpr int TOTAL = 32 * C8;
-  constexpr int THREADS = NUM_WARPS * 32;
-#pragma unroll
-  for (int idx = tid; idx < TOTAL; idx += THREADS) {
-    const int r = idx / C8;
-    const int c8 = idx % C8;
-    sdpa_few_cp16(
-        &dst[sdpa_few_swiz<D>(r, c8)],
-        base + (long long)(k_start + r) * stride + c8 * 8);
+  constexpr int ROWS_STEP = (NUM_WARPS * 32) / C8;
+  const int r0 = tid / C8;
+  const int c8 = tid & (C8 - 1);
+  const nv_bfloat16* gptr = base + (long long)(k_start + r0) * stride + c8 * 8;
+  const long long step = (long long)ROWS_STEP * stride;
+#pragma unroll 1
+  for (int r = r0; r < 32; r += ROWS_STEP) {
+    sdpa_few_cp16(&dst[sdpa_few_swiz<D>(r, c8)], gptr);
+    gptr += step;
   }
   sdpa_few_cp_commit();
 }
@@ -75,16 +75,17 @@ __device__ __forceinline__ void sdpa_few_load_kv_checked(
     nv_bfloat16* dst, const nv_bfloat16* base, long long stride,
     int k_start, int K_len, int tid) {
   constexpr int C8 = D / 8;
-  constexpr int TOTAL = 32 * C8;
-  constexpr int THREADS = NUM_WARPS * 32;
-#pragma unroll
-  for (int idx = tid; idx < TOTAL; idx += THREADS) {
-    const int r = idx / C8;
-    const int c8 = idx % C8;
-    const int gk = k_start + r;
-    const bool ok = (gk < K_len);
-    const nv_bfloat16* gp = ok ? (base + (long long)gk * stride + c8 * 8) : base;
+  constexpr int ROWS_STEP = (NUM_WARPS * 32) / C8;
+  const int r0 = tid / C8;
+  const int c8 = tid & (C8 - 1);
+  long long off = (long long)(k_start + r0) * stride + c8 * 8;
+  const long long step = (long long)ROWS_STEP * stride;
+#pragma unroll 1
+  for (int r = r0; r < 32; r += ROWS_STEP) {
+    const bool ok = (k_start + r < K_len);
+    const nv_bfloat16* gp = ok ? (base + off) : base;
     sdpa_few_cp16_zfill(&dst[sdpa_few_swiz<D>(r, c8)], gp, ok);
+    off += step;
   }
   sdpa_few_cp_commit();
 }
@@ -96,7 +97,7 @@ R"cuda(
 // - sK and sV double-buffered with cp.async.cg + 128B XOR swizzle, overlapping V fetch
 //   with QK^T+softmax and next K fetch with PV MMA (only 2 __syncthreads()/tile).
 // - ex2.approx.ftz.f32 softmax in log2 space, normalized BF16 partial_O output.
-// - MASK_MODE: 0=causal, 1=unmasked, 2=bool mask [1,1,Q_len,K_len],
+// - MASK_MODE: 0=causal, 1=unmasked, 2=bool mask [B_m,1,Q_m,K_len],
 //              3=tree bitmask uint32[Q_len] + cache_len.
 // - Grid: (num_splits, Hkv, B * num_q_tiles), Block: (32, NUM_WARPS).
 template <int D, int NUM_WARPS, int MASK_MODE, int Q_HI_MODE>
@@ -112,7 +113,8 @@ void mlx_node_sdpa_tc_split(
     int Hkv, int gqa, int Q_len, int K_len, int cache_len,
     long long k_sb, long long k_sh, long long k_ss,
     long long v_sb, long long v_sh, long long v_ss,
-    float scale_log2, int num_splits, int num_q_tiles) {
+    float scale_log2, int num_splits, int num_q_tiles,
+    long long mask_sb, long long mask_sq) {
   constexpr int BN = 32;
   constexpr int D_TILES = D / 8;
   const int split = blockIdx.x;
@@ -157,8 +159,6 @@ void mlx_node_sdpa_tc_split(
   const int q_pos1 = (row1 < M_tile) ? (q_tile_offset + (row1 % q_tile_len)) : 0;
   const int global_row0 = head0 * Q_len + q_pos0;
   const int global_row1 = head1 * Q_len + q_pos1;
-  const int causal_limit0 = K_len - Q_len + q_pos0;
-  const int causal_limit1 = K_len - Q_len + q_pos1;
 
   const nv_bfloat16* Q_base = Q + ((long long)b * Hkv + hkv) * (long long)M_total * D;
   const nv_bfloat16* q_ptr0 = (row0 < M_tile) ? (Q_base + (long long)global_row0 * D) : nullptr;
@@ -239,7 +239,8 @@ void mlx_node_sdpa_tc_split(
 R"cuda(
   for (int tile = tile_start; tile < tile_end; ++tile) {
     const int k_start = tile * BN;
-    const bool is_full = (tile < num_full_tiles) && (k_start + BN <= K_len);
+    const bool is_full =
+        (MASK_MODE == 2) ? false : ((tile < num_full_tiles) && (k_start + BN <= K_len));
 
     sdpa_few_cp_wait0();
     __syncthreads();
@@ -275,38 +276,60 @@ R"cuda(
           b2, b3, s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3]);
     }
     if constexpr (D == 256) {
+      if constexpr (Q_HI_MODE == 1) {
 #pragma unroll
-      for (int kt = 0; kt < 8; ++kt) {
-        unsigned int a0, a1, a2, a3;
-        if constexpr (Q_HI_MODE == 1) {
+        for (int kt = 0; kt < 8; ++kt) {
+          unsigned int a0, a1, a2, a3;
           sdpa_few_ldmatrix4(
               a0, a1, a2, a3, &sQ_hi[sdpa_few_swiz<128>(q_ld_r, q_ld_c8_base + kt * 2)]);
-        } else {
-          const int k = 128 + kt * 16;
-          a0 = q_ptr0 ? __ldg(reinterpret_cast<const unsigned int*>(q_ptr0 + k + 2 * tid_in_grp)) : 0u;
-          a2 = q_ptr0 ? __ldg(reinterpret_cast<const unsigned int*>(q_ptr0 + k + 8 + 2 * tid_in_grp)) : 0u;
-          a1 = q_ptr1 ? __ldg(reinterpret_cast<const unsigned int*>(q_ptr1 + k + 2 * tid_in_grp)) : 0u;
-          a3 = q_ptr1 ? __ldg(reinterpret_cast<const unsigned int*>(q_ptr1 + k + 8 + 2 * tid_in_grp)) : 0u;
+          const int c8 = k_ld_c8_base + 16 + kt * 2;
+          unsigned int b0, b1, b2, b3;
+          sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0, c8)]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3],
+              a0, a1, a2, a3, b0, b1, s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3],
+              a0, a1, a2, a3, b2, b3, s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3]);
+          sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0 + 16, c8)]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3],
+              a0, a1, a2, a3, b0, b1, s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3],
+              a0, a1, a2, a3, b2, b3, s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3]);
         }
-        const int c8 = k_ld_c8_base + 16 + kt * 2;
-        unsigned int b0, b1, b2, b3;
-        sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0, c8)]);
-        sdpa_mma_m16n8k16_bf16(
-            s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3],
-            a0, a1, a2, a3, b0, b1, s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3]);
-        sdpa_mma_m16n8k16_bf16(
-            s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3],
-            a0, a1, a2, a3, b2, b3, s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3]);
-        sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0 + 16, c8)]);
-        sdpa_mma_m16n8k16_bf16(
-            s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3],
-            a0, a1, a2, a3, b0, b1, s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3]);
-        sdpa_mma_m16n8k16_bf16(
-            s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3],
-            a0, a1, a2, a3, b2, b3, s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3]);
+      } else {
+        const nv_bfloat16* qh0 = q_ptr0 ? (q_ptr0 + 128 + 2 * tid_in_grp) : nullptr;
+        const nv_bfloat16* qh1 = q_ptr1 ? (q_ptr1 + 128 + 2 * tid_in_grp) : nullptr;
+#pragma unroll 2
+        for (int kt = 0; kt < 8; ++kt) {
+          const int k = kt * 16;
+          unsigned int a0 = qh0 ? __ldg(reinterpret_cast<const unsigned int*>(qh0 + k)) : 0u;
+          unsigned int a2 = qh0 ? __ldg(reinterpret_cast<const unsigned int*>(qh0 + k + 8)) : 0u;
+          unsigned int a1 = qh1 ? __ldg(reinterpret_cast<const unsigned int*>(qh1 + k)) : 0u;
+          unsigned int a3 = qh1 ? __ldg(reinterpret_cast<const unsigned int*>(qh1 + k + 8)) : 0u;
+          const int c8 = k_ld_c8_base + 16 + kt * 2;
+          unsigned int b0, b1, b2, b3;
+          sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0, c8)]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3],
+              a0, a1, a2, a3, b0, b1, s_acc[0][0], s_acc[0][1], s_acc[0][2], s_acc[0][3]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3],
+              a0, a1, a2, a3, b2, b3, s_acc[1][0], s_acc[1][1], s_acc[1][2], s_acc[1][3]);
+          sdpa_few_ldmatrix4(b0, b1, b2, b3, &sK[sdpa_few_swiz<D>(k_ld_r0 + 16, c8)]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3],
+              a0, a1, a2, a3, b0, b1, s_acc[2][0], s_acc[2][1], s_acc[2][2], s_acc[2][3]);
+          sdpa_mma_m16n8k16_bf16(
+              s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3],
+              a0, a1, a2, a3, b2, b3, s_acc[3][0], s_acc[3][1], s_acc[3][2], s_acc[3][3]);
+        }
       }
     }
-
+)cuda"
+R"cuda(
     float local_max0 = -1e30f;
     float local_max1 = -1e30f;
     if (is_full) {
@@ -320,44 +343,69 @@ R"cuda(
         local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
       }
     } else {
+      if constexpr (MASK_MODE == 2) {
+        const int col_base = k_start + 2 * tid_in_grp;
+        const unsigned char* bmask =
+            reinterpret_cast<const unsigned char*>(mask_ptr) +
+            (long long)b * mask_sb;
+        const unsigned char* b0 = bmask + (long long)q_pos0 * mask_sq + col_base;
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt) {
-        const int c0 = k_start + nt * 8 + 2 * tid_in_grp;
-        const int c1 = c0 + 1;
-        bool v00, v01, v10, v11;
-        if constexpr (MASK_MODE == 0) {
-          v00 = (c0 <= causal_limit0 && c0 < K_len);
-          v01 = (c1 <= causal_limit0 && c1 < K_len);
-          v10 = (c0 <= causal_limit1 && c0 < K_len);
-          v11 = (c1 <= causal_limit1 && c1 < K_len);
-        } else if constexpr (MASK_MODE == 1) {
-          v00 = (c0 < K_len);
-          v01 = (c1 < K_len);
-          v10 = (c0 < K_len);
-          v11 = (c1 < K_len);
-        } else if constexpr (MASK_MODE == 2) {
-          const unsigned char* bmask = reinterpret_cast<const unsigned char*>(mask_ptr);
-          v00 = (c0 < K_len) && bmask[(long long)q_pos0 * K_len + c0];
-          v01 = (c1 < K_len) && bmask[(long long)q_pos0 * K_len + c1];
-          v10 = (c0 < K_len) && bmask[(long long)q_pos1 * K_len + c0];
-          v11 = (c1 < K_len) && bmask[(long long)q_pos1 * K_len + c1];
-        } else {
-          auto tree_vis = [&](int c, unsigned int tm) -> bool {
-            if (c < cache_len) return true;
-            const int j = c - cache_len;
-            return (c < K_len) && (j < Q_len) && ((tm >> j) & 1u);
-          };
-          v00 = tree_vis(c0, tmask0);
-          v01 = tree_vis(c1, tmask0);
-          v10 = tree_vis(c0, tmask1);
-          v11 = tree_vis(c1, tmask1);
+        for (int nt = 0; nt < 4; ++nt) {
+          const int c0 = col_base + nt * 8;
+          const int c1 = c0 + 1;
+          const bool v00 = (c0 < K_len) && __ldg(b0 + nt * 8);
+          const bool v01 = (c1 < K_len) && __ldg(b0 + nt * 8 + 1);
+          s_acc[nt][0] = v00 ? (s_acc[nt][0] * scale_log2) : -1e30f;
+          s_acc[nt][1] = v01 ? (s_acc[nt][1] * scale_log2) : -1e30f;
+          local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
         }
-        s_acc[nt][0] = v00 ? (s_acc[nt][0] * scale_log2) : -1e30f;
-        s_acc[nt][1] = v01 ? (s_acc[nt][1] * scale_log2) : -1e30f;
-        s_acc[nt][2] = v10 ? (s_acc[nt][2] * scale_log2) : -1e30f;
-        s_acc[nt][3] = v11 ? (s_acc[nt][3] * scale_log2) : -1e30f;
-        local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
-        local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        const unsigned char* b1 = bmask + (long long)q_pos1 * mask_sq + col_base;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int c0 = col_base + nt * 8;
+          const int c1 = c0 + 1;
+          const bool v10 = (c0 < K_len) && __ldg(b1 + nt * 8);
+          const bool v11 = (c1 < K_len) && __ldg(b1 + nt * 8 + 1);
+          s_acc[nt][2] = v10 ? (s_acc[nt][2] * scale_log2) : -1e30f;
+          s_acc[nt][3] = v11 ? (s_acc[nt][3] * scale_log2) : -1e30f;
+          local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        }
+      } else {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int c0 = k_start + nt * 8 + 2 * tid_in_grp;
+          const int c1 = c0 + 1;
+          bool v00, v01, v10, v11;
+          if constexpr (MASK_MODE == 0) {
+            const int causal_limit0 = K_len - Q_len + q_pos0;
+            const int causal_limit1 = K_len - Q_len + q_pos1;
+            v00 = (c0 <= causal_limit0 && c0 < K_len);
+            v01 = (c1 <= causal_limit0 && c1 < K_len);
+            v10 = (c0 <= causal_limit1 && c0 < K_len);
+            v11 = (c1 <= causal_limit1 && c1 < K_len);
+          } else if constexpr (MASK_MODE == 1) {
+            v00 = (c0 < K_len);
+            v01 = (c1 < K_len);
+            v10 = (c0 < K_len);
+            v11 = (c1 < K_len);
+          } else {
+            auto tree_vis = [&](int c, unsigned int tm) -> bool {
+              if (c < cache_len) return true;
+              const int j = c - cache_len;
+              return (c < K_len) && (j < Q_len) && ((tm >> j) & 1u);
+            };
+            v00 = tree_vis(c0, tmask0);
+            v01 = tree_vis(c1, tmask0);
+            v10 = tree_vis(c0, tmask1);
+            v11 = tree_vis(c1, tmask1);
+          }
+          s_acc[nt][0] = v00 ? (s_acc[nt][0] * scale_log2) : -1e30f;
+          s_acc[nt][1] = v01 ? (s_acc[nt][1] * scale_log2) : -1e30f;
+          s_acc[nt][2] = v10 ? (s_acc[nt][2] * scale_log2) : -1e30f;
+          s_acc[nt][3] = v11 ? (s_acc[nt][3] * scale_log2) : -1e30f;
+          local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
+          local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        }
       }
     }
     local_max0 = fmaxf(local_max0, __shfl_xor_sync(0xffffffffu, local_max0, 1));
@@ -455,35 +503,53 @@ R"cuda(
     }
   }
 
-  const long long base_split = (((long long)b * Hkv + hkv) * num_splits + split) * M_total;
-  if (row0 < M_tile) {
-    if (tid_in_grp == 0) {
-      partial_m[base_split + global_row0] = m_row0;
-      partial_l[base_split + global_row0] = l_row0;
+  const int ep_split = blockIdx.x;
+  const int ep_hkv = blockIdx.y;
+  const int ep_bz = blockIdx.z;
+  const int ep_b = (num_q_tiles == 2) ? (ep_bz >> 1) : ep_bz;
+  const int ep_qtile = (num_q_tiles == 2) ? (ep_bz & 1) : 0;
+  const int ep_q_off = ep_qtile * 8;
+  const int ep_q_len = (num_q_tiles == 2)
+      ? ((ep_qtile == 0) ? 8 : (Q_len - 8))
+      : Q_len;
+  const int ep_M_total = gqa * Q_len;
+  const int ep_M_tile = gqa * ep_q_len;
+  const int ep_row0 = threadIdx.y * 16 + (threadIdx.x >> 2);
+  const int ep_row1 = ep_row0 + 8;
+  const int ep_tid_in_grp = threadIdx.x & 3;
+  const long long base_split =
+      (((long long)ep_b * Hkv + ep_hkv) * num_splits + ep_split) * ep_M_total;
+  if (ep_row0 < ep_M_tile) {
+    const int ep_gr0 = (ep_row0 / ep_q_len) * Q_len + ep_q_off + (ep_row0 % ep_q_len);
+    if (ep_tid_in_grp == 0) {
+      partial_m[base_split + ep_gr0] = m_row0;
+      partial_l[base_split + ep_gr0] = l_row0;
     }
     const float inv0 = (l_row0 > 0.0f) ? (1.0f / l_row0) : 0.0f;
-    nv_bfloat16* dst0 = partial_O + (base_split + global_row0) * D;
+    nv_bfloat16* dst0 = partial_O + (base_split + ep_gr0) * D;
 #pragma unroll
     for (int nt = 0; nt < D_TILES; ++nt) {
-      *reinterpret_cast<unsigned int*>(dst0 + nt * 8 + 2 * tid_in_grp) =
+      *reinterpret_cast<unsigned int*>(dst0 + nt * 8 + 2 * ep_tid_in_grp) =
           sdpa_pack_bf16x2(accO[nt][0] * inv0, accO[nt][1] * inv0);
     }
   }
-  if (row1 < M_tile) {
-    if (tid_in_grp == 0) {
-      partial_m[base_split + global_row1] = m_row1;
-      partial_l[base_split + global_row1] = l_row1;
+  if (ep_row1 < ep_M_tile) {
+    const int ep_gr1 = (ep_row1 / ep_q_len) * Q_len + ep_q_off + (ep_row1 % ep_q_len);
+    if (ep_tid_in_grp == 0) {
+      partial_m[base_split + ep_gr1] = m_row1;
+      partial_l[base_split + ep_gr1] = l_row1;
     }
     const float inv1 = (l_row1 > 0.0f) ? (1.0f / l_row1) : 0.0f;
-    nv_bfloat16* dst1 = partial_O + (base_split + global_row1) * D;
+    nv_bfloat16* dst1 = partial_O + (base_split + ep_gr1) * D;
 #pragma unroll
     for (int nt = 0; nt < D_TILES; ++nt) {
-      *reinterpret_cast<unsigned int*>(dst1 + nt * 8 + 2 * tid_in_grp) =
+      *reinterpret_cast<unsigned int*>(dst1 + nt * 8 + 2 * ep_tid_in_grp) =
           sdpa_pack_bf16x2(accO[nt][2] * inv1, accO[nt][3] * inv1);
     }
   }
 }
-
+)cuda"
+R"cuda(
 // Vectorized 1-warp-per-row BF16 partial_O reduction in log2 space.
 // Grid: (M, Hkv, B), Block: (32, 1, 1).
 template <int D>

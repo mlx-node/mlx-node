@@ -48,6 +48,50 @@ pub(super) fn prepare(
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_batched(
+    qkv: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    conv_w: &MxArray,
+    history: &MxArray,
+    scale: &MxArray,
+    dt: &MxArray,
+    valid_lengths: Option<&MxArray>,
+    mean_eps: bool,
+    bf16_beta: bool,
+) -> Result<Option<[MxArray; 6]>> {
+    let mut outputs = [std::ptr::null_mut(); 6];
+    let valid_lengths_ptr = valid_lengths.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    let ok = unsafe {
+        sys::mlx_gdn_prepare_batched_cuda(
+            qkv.as_raw_ptr(),
+            a.as_raw_ptr(),
+            b.as_raw_ptr(),
+            conv_w.as_raw_ptr(),
+            history.as_raw_ptr(),
+            scale.as_raw_ptr(),
+            dt.as_raw_ptr(),
+            valid_lengths_ptr,
+            mean_eps,
+            bf16_beta,
+            outputs.as_mut_ptr(),
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    Ok(Some([
+        MxArray::from_handle(outputs[0], "gdn_prepare_batched:q")?,
+        MxArray::from_handle(outputs[1], "gdn_prepare_batched:k")?,
+        MxArray::from_handle(outputs[2], "gdn_prepare_batched:v")?,
+        MxArray::from_handle(outputs[3], "gdn_prepare_batched:decay")?,
+        MxArray::from_handle(outputs[4], "gdn_prepare_batched:beta")?,
+        MxArray::from_handle(outputs[5], "gdn_prepare_batched:history")?,
+    ]))
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fused_step_with_gate(
     q: &MxArray,
     k: &MxArray,

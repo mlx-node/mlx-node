@@ -143,8 +143,11 @@ mlx_array* mlx_array_ensure_cuda_device(mlx_array* handle) {
     if (arr->status() != array::Status::available) {
       arr->eval();
     }
+    // Skip empty tensors and <= 8 byte scalar-pool tensors
+    // (CudaAllocator::malloc_async always places <= 8 byte allocations in
+    // SmallSizePool with device == -1).
     if (!arr->flags().row_contiguous || arr->data_size() != arr->size() ||
-        arr->nbytes() == 0 || arr->buffer().ptr() == nullptr) {
+        arr->nbytes() <= 8 || arr->buffer().ptr() == nullptr) {
       return nullptr;
     }
     auto* src_cbuf =

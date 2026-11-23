@@ -555,11 +555,23 @@ extern "C" bool mlx_fused_add_rmsnorm(mlx_array* x_handle,
     if (dt != mlx::core::bfloat16 && dt != mlx::core::float16 &&
         dt != mlx::core::float32)
       return false;
-    const int axis = x.shape(-1);
-    const int rows = x.size() / axis;
-    if (rows < 1 || rows > 4096 || x.size() != rows * axis ||
-        res.size() != rows * axis)
+    const int64_t axis64 = x.shape(-1);
+    if (axis64 < 1 || axis64 > INT32_MAX)
       return false;
+    const int axis = static_cast<int>(axis64);
+    const size_t total = x.size();
+    if (total == 0 || (total % static_cast<size_t>(axis)) != 0 ||
+        res.size() != total)
+      return false;
+    const size_t rows64 = total / static_cast<size_t>(axis);
+    if (rows64 < 1 || rows64 > static_cast<size_t>(INT32_MAX))
+      return false;
+#ifndef MLX_NODE_CUDA_ENABLED
+    if (rows64 > 4096)
+      return false;
+#endif
+    const int rows = static_cast<int>(rows64);
+    (void)rows;
 
 #ifdef MLX_NODE_CUDA_ENABLED
     if (auto outs = mlx_node_internal::fused_add_rmsnorm_cuda(x, res, w, eps)) {

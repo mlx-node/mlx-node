@@ -133,6 +133,49 @@ pub(crate) fn qk_norm_rope_kv_store_tree(
     }
 }
 
+/// Explicit-positions variant of fused CUDA QK-Norm + non-traditional partial RoPE +
+/// in-place KV cache store. RoPE position for `(b, t)` is `positions[b, t]` (`int32[B, T]`),
+/// while KV store writes at slot `offset + t`. When `precise_f32` is `true`, QK RMSNorm
+/// runs in FP32 with FP32 weights before casting back to BF16.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_kv_store_positions(
+    q_in: &MxArray,
+    k_in: &MxArray,
+    v_in: &MxArray,
+    q_norm_w: &MxArray,
+    k_norm_w: &MxArray,
+    k_cache: &MxArray,
+    v_cache: &MxArray,
+    positions: &MxArray,
+    offset: i32,
+    eps: f32,
+    rope_dims: i32,
+    rope_base: f32,
+    rope_scale: f32,
+    precise_f32: bool,
+) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::qk_norm_rope_kv_store_positions(
+            q_in,
+            k_in,
+            v_in,
+            q_norm_w,
+            k_norm_w,
+            k_cache,
+            v_cache,
+            positions,
+            offset,
+            eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            precise_f32,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
 /// Race-free in-place CUDA KV cache row compaction for tree acceptance (`keep <= 16`).
 /// Copies `cache[:, :, base_offset + accepted_nodes[r], :] -> cache[:, :, base_offset + r, :]`
 /// for both K and V, returning aliased cache handles.

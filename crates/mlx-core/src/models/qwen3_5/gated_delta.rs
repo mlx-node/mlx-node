@@ -757,6 +757,56 @@ fn gated_delta_cuda(
     Ok((output, state))
 }
 
+/// Replace masked (`false`) slots in `(k, v, g, beta)` with neutral recurrence
+/// inputs (`k = 0`, `v = 0`, `g = 1`, `beta = 0`) preserving each tensor's
+/// original dtype so masked timesteps leave the recurrent state unchanged
+/// (`S' = 1 * S + 0 = S`) across CUDA kernels without an explicit mask input.
+///
+/// Shapes:
+///   mask: `[B, T]` bool
+///   k:    `[B, T, Hk, Dk]`
+///   v:    `[B, T, Hv, Dv]`
+///   g:    `[B, T, Hv]`
+///   beta: `[B, T, Hv]`
+pub(crate) fn apply_neutral_gdn_mask(
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    mask: &MxArray,
+) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+    let b = mask.shape_at(0)?;
+    let t = mask.shape_at(1)?;
+    let m3 = mask.reshape(&[b, t, 1])?;
+    let m4 = mask.reshape(&[b, t, 1, 1])?;
+
+    let k_dtype = k.dtype()?;
+    let v_dtype = v.dtype()?;
+    let g_dtype = g.dtype()?;
+    let beta_dtype = beta.dtype()?;
+
+    let one_g = MxArray::full(&[1], Either::A(1.0), Some(g_dtype))?;
+    let zero_k = MxArray::full(&[1], Either::A(0.0), Some(k_dtype))?;
+    let zero_v = if v_dtype == k_dtype {
+        zero_k.clone()
+    } else {
+        MxArray::full(&[1], Either::A(0.0), Some(v_dtype))?
+    };
+    let zero_beta = if beta_dtype == k_dtype {
+        zero_k.clone()
+    } else if beta_dtype == v_dtype {
+        zero_v.clone()
+    } else {
+        MxArray::full(&[1], Either::A(0.0), Some(beta_dtype))?
+    };
+
+    let k_masked = m4.where_(k, &zero_k)?;
+    let v_masked = m4.where_(v, &zero_v)?;
+    let g_masked = m3.where_(g, &one_g)?;
+    let beta_masked = m3.where_(beta, &zero_beta)?;
+    Ok((k_masked, v_masked, g_masked, beta_masked))
+}
+
 fn gated_delta_ops(
     q: &MxArray,
     k: &MxArray,
@@ -766,12 +816,15 @@ fn gated_delta_ops(
     state: &MxArray,
     mask: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
-    if mask.is_none()
-        && crate::accelerator::cuda_ops_available()
-        && q.shape_at(3)? == 128
-        && v.shape_at(3)? == 128
-    {
-        match gated_delta_cuda(q, k, v, g, beta, state) {
+    if crate::accelerator::cuda_ops_available() && q.shape_at(3)? == 128 && v.shape_at(3)? == 128 {
+        let masked = mask
+            .map(|m| apply_neutral_gdn_mask(k, v, g, beta, m))
+            .transpose()?;
+        let (k_in, v_in, g_in, beta_in) = match &masked {
+            Some((km, vm, gm, bm)) => (km, vm, gm, bm),
+            None => (k, v, g, beta),
+        };
+        match gated_delta_cuda(q, k_in, v_in, g_in, beta_in, state) {
             Ok(result) => return Ok(result),
             Err(e) => eprintln!("[mlx-gdn] CUDA recurrence failed ({e}); using serial ops"),
         }
@@ -1118,8 +1171,7 @@ pub(crate) fn gated_delta_update_with_tape(
         // geometries and the explicit `chunked_ops` diagnostic. Metal is unchanged.
         let seq_len = q.shape_at(1)?;
         let choice = gdn_kernel_override();
-        let cuda_recurrent = mask.is_none()
-            && crate::accelerator::cuda_ops_available()
+        let cuda_recurrent = crate::accelerator::cuda_ops_available()
             && q.shape_at(3)? == 128
             && v.shape_at(3)? == 128;
         if !crate::accelerator::host_has_metal()
@@ -1286,21 +1338,29 @@ pub(crate) fn gated_delta_update_fused(
     tail: GdnTail<'_>,
     tape_sink: Option<&mut Option<GdnKernelTape>>,
 ) -> Result<Option<(MxArray, MxArray)>> {
+    let is_cuda = crate::accelerator::cuda_ops_available();
+    let norm_w_ok = if is_cuda {
+        matches!(
+            tail.norm_weight.dtype().ok(),
+            Some(DType::BFloat16 | DType::Float32)
+        )
+    } else {
+        tail.norm_weight.dtype().ok() == Some(DType::BFloat16)
+    };
     if !use_kernel
-        || mask.is_some()
-        || (!crate::engine::persistence::compiled_forward_backend_available()
-            && !crate::accelerator::cuda_ops_available())
+        || (mask.is_some() && (!is_cuda || tape_sink.is_some()))
+        || (!crate::engine::persistence::compiled_forward_backend_available() && !is_cuda)
         || v.shape_at(3)? != 128
         || q.shape_at(3)? % 32 != 0
         || !(1..=32).contains(&v.shape_at(1)?)
-        || [q, k, v, tail.z, tail.norm_weight]
+        || [q, k, v, tail.z]
             .iter()
             .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || !norm_w_ok
         || state.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
     {
         return Ok(None);
     }
-    let compact_cuda = crate::accelerator::cuda_ops_available();
     let (q, k, g, beta, initial_state) = kernel_inputs(
         q,
         k,
@@ -1311,13 +1371,31 @@ pub(crate) fn gated_delta_update_fused(
         dt_bias,
         state,
         tiled_gqa,
-        compact_cuda,
+        is_cuda,
         precomputed_gates,
     )?;
-    if beta.dtype()? != DType::BFloat16 || g.dtype()? != DType::Float32 {
+    let g = if is_cuda && g.dtype()? != DType::Float32 {
+        g.astype(DType::Float32)?
+    } else {
+        g
+    };
+    let gates_ok = if is_cuda {
+        matches!(beta.dtype()?, DType::BFloat16 | DType::Float32)
+    } else {
+        beta.dtype()? == DType::BFloat16 && g.dtype()? == DType::Float32
+    };
+    if !gates_ok {
         return Ok(None);
     }
-    let Ok(result) = gated_delta_fused_step(&q, &k, v, &g, &beta, &initial_state, &tail, tiled_gqa)
+    let (k, v_owned, g, beta) = if let Some(m) = mask {
+        let (km, vm, gm, bm) = apply_neutral_gdn_mask(&k, v, &g, &beta, m)?;
+        (km, Some(vm), gm, bm)
+    } else {
+        (k, None, g, beta)
+    };
+    let v_ref = v_owned.as_ref().unwrap_or(v);
+    let Ok(result) =
+        gated_delta_fused_step(&q, &k, v_ref, &g, &beta, &initial_state, &tail, tiled_gqa)
     else {
         return Ok(None);
     };
@@ -1325,7 +1403,7 @@ pub(crate) fn gated_delta_update_fused(
         *sink = Some(GdnKernelTape {
             q,
             k,
-            v: v.clone(),
+            v: v_ref.clone(),
             g,
             beta,
             tiled_heads: tiled_gqa,

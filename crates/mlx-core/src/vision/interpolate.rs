@@ -53,6 +53,8 @@ fn bilinear_interpolate_gpu(
     new_width: i64,
     shape: &[i64],
 ) -> Result<MxArray> {
+    let orig_dtype = image.dtype()?;
+
     // Compute source coordinates for each output position
     // Using align_corners=false style: (i + 0.5) * h_in / new_height - 0.5
 
@@ -188,6 +190,11 @@ fn bilinear_interpolate_gpu(
     let term11 = v11.mul(&w11)?;
 
     let result_flat = term00.add(&term01)?.add(&term10)?.add(&term11)?;
+    let result_flat = if result_flat.dtype()? != orig_dtype {
+        result_flat.astype(orig_dtype)?
+    } else {
+        result_flat
+    };
 
     // Reshape to final output shape: [new_height, new_width, ...]
     let mut result_shape = vec![new_height, new_width];
@@ -487,5 +494,28 @@ mod tests {
             "expected 7.5, got {}",
             result_data[0]
         );
+    }
+
+    #[test]
+    fn test_interpolate_preserves_bfloat16_dtype() -> Result<()> {
+        let data: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) * 0.25).collect();
+        let image_f32 = MxArray::from_float32(&data, &[2, 2, 4])?;
+        let image_bf16 = image_f32.astype(DType::BFloat16)?;
+
+        let result_bf16 = bilinear_interpolate(&image_bf16, 4, 4)?;
+        assert_eq!(result_bf16.dtype()?, DType::BFloat16);
+        assert_eq!(result_bf16.shape()?.as_ref(), &[4, 4, 4]);
+
+        let ref_f32 = bilinear_interpolate(&image_f32, 4, 4)?;
+        let got = result_bf16.to_float32()?;
+        let expected = ref_f32.to_float32()?;
+        assert_eq!(got.len(), expected.len());
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 2e-2,
+                "BF16 interpolation diverged from FP32: got {a}, expected {b}"
+            );
+        }
+        Ok(())
     }
 }

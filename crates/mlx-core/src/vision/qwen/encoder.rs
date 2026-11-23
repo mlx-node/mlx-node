@@ -11,10 +11,48 @@ use crate::vision::embeddings::PatchEmbedding;
 use crate::vision::encoder::VisionAttention;
 use crate::vision::encoder::{VisionEncoderLayer, build_vision_segment_boundaries};
 use crate::vision::projector::SpatialProjector;
-use crate::vision::rope_vision::{VisionRotaryEmbedding, compute_rot_pos_emb_2d};
+use crate::vision::rope_vision::{
+    VisionRotaryEmbedding, compute_rot_pos_emb_2d, precompute_rotary_cos_sin,
+};
 use napi::bindgen_prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Minimum patch count before materializing and trimming the allocator cache
+/// after every vision transformer block on unified-memory or >=24 GiB CUDA
+/// GPUs. Typical images (e.g. Clairic `max_pixels = 1.6M` → at most 6,250
+/// patches, 53.8 MB BF16 FC1) fuse cleanly into one lazy graph evaluated by
+/// the caller, avoiding 27 GPU-CPU syncs and allocator pool trims per image.
+const CUDA_VISION_LAYER_BARRIER_MIN_PATCHES_LARGE: i64 = 32_768;
+/// Lower per-layer materialization threshold for smaller (<24 GiB) discrete
+/// CUDA GPUs to keep peak vision activation memory bounded.
+const CUDA_VISION_LAYER_BARRIER_MIN_PATCHES_SMALL: i64 = 8_192;
+/// Device memory threshold (24 GiB) selecting the larger CUDA vision layer
+/// barrier cutoff.
+const CUDA_VISION_LARGE_MEM_BYTES: u64 = 24u64 * 1024 * 1024 * 1024;
+
+/// Decide whether to materialize the vision residual stream and clear the
+/// allocator cache after every vision transformer layer.
+///
+/// Metal/CPU always materialize per layer to avoid peak-memory regressions on
+/// macOS unified memory. CUDA defers per-layer barriers below the device
+/// memory-scaled patch threshold so typical images run in one lazy graph.
+fn should_materialize_vision_per_layer(
+    total_seq_len: i64,
+    cuda_ops: bool,
+    is_unified_memory: bool,
+    total_device_bytes: u64,
+) -> bool {
+    if !cuda_ops {
+        return true;
+    }
+    let threshold = if is_unified_memory || total_device_bytes >= CUDA_VISION_LARGE_MEM_BYTES {
+        CUDA_VISION_LAYER_BARRIER_MIN_PATCHES_LARGE
+    } else {
+        CUDA_VISION_LAYER_BARRIER_MIN_PATCHES_SMALL
+    };
+    total_seq_len > threshold
+}
 
 /// Qwen Vision Encoder configuration
 #[derive(Debug, Clone)]
@@ -240,7 +278,17 @@ impl QwenVisionEncoder {
 
         // Reshape and transpose for Conv2d: [N, C, H, W] → [N, H, W, C] (NHWC)
         let flat_input = hidden_states.reshape(&[batch * seq_len, channels, patch_h, patch_w])?;
-        let flat_input = flat_input.transpose(Some(&[0, 2, 3, 1]))?;
+        let mut flat_input = flat_input.transpose(Some(&[0, 2, 3, 1]))?;
+        if crate::accelerator::cuda_ops_available() {
+            let weight_dtype = self.patch_embed.weight().dtype()?;
+            if matches!(
+                weight_dtype,
+                crate::array::DType::BFloat16 | crate::array::DType::Float16
+            ) && flat_input.dtype()? != weight_dtype
+            {
+                flat_input = flat_input.astype(weight_dtype)?;
+            }
+        }
 
         // Patch embedding
         let patch_embeds = self.patch_embed.forward(&flat_input)?;
@@ -273,6 +321,12 @@ impl QwenVisionEncoder {
                 } else {
                     pos
                 };
+                let embed_dtype = img_embeddings.dtype()?;
+                let pos = if pos.dtype()? != embed_dtype {
+                    pos.astype(embed_dtype)?
+                } else {
+                    pos
+                };
 
                 let img_with_pos = img_embeddings.add(&pos)?;
                 result_parts.push(img_with_pos);
@@ -289,8 +343,9 @@ impl QwenVisionEncoder {
             embeddings
         };
 
-        // Compute 2D rotary position embeddings
+        // Compute 2D rotary position embeddings and hoist (cos, sin) once for all layers
         let rotary_pos_emb = compute_rot_pos_emb_2d(&self.rotary_pos_emb, grid_thw)?;
+        let (rot_cos, rot_sin) = precompute_rotary_cos_sin(&rotary_pos_emb)?;
 
         // Build cumulative image/frame boundaries. Qwen vision attention is
         // block-diagonal across these segments. Keep the boundaries on the CPU
@@ -302,28 +357,41 @@ impl QwenVisionEncoder {
         // Forward through encoder layers. MLX builds lazy graphs, so leaving all
         // 27 blocks attached to the final merger output retains every layer's
         // QKV and expanded MLP activations until the caller evaluates the final
-        // feature tensor. That is untenable for large multi-image requests (one
-        // 200k-patch FC1 activation alone is about 1.6 GiB in bf16). Materialize
-        // the residual stream after every block: evaluating this exact tensor
-        // detaches the complete upstream graph without changing any tensor
-        // shapes or arithmetic, and clearing the allocator cache releases those
-        // now-dead intermediates before constructing the next block.
+        // feature tensor. On Metal/CPU, keep per-layer materialization enabled
+        // unconditionally to avoid macOS peak-memory regressions. On CUDA, defer
+        // per-layer materialization below the device memory-scaled patch cutoff
+        // (32,768 on unified / >=24 GiB GPUs, 8,192 on smaller discrete GPUs)
+        // so typical images fuse into one lazy graph evaluated by the caller.
+        let cuda_ops = crate::accelerator::cuda_ops_available();
+        let caps = crate::accelerator::caps();
+        let materialize_per_layer = should_materialize_vision_per_layer(
+            total_seq_len,
+            cuda_ops,
+            caps.is_unified_memory,
+            caps.total_device_bytes,
+        );
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            h = layer.forward_segmented(&h, &segment_boundaries, Some(&rotary_pos_emb))?;
-            let context = format!("qwen3_5_vision_layer_{layer_idx}");
-            MxArray::eval_arrays_with_context(&[&h], &context).map_err(|error| {
-                Error::from_reason(format!(
-                    "Qwen vision layer {layer_idx} materialization failed: {error}"
-                ))
-            })?;
-            crate::array::clear_cache();
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "vision_layer_materialized",
-                layer = layer_idx,
-                patch_count = total_seq_len,
-                "Qwen vision layer residual materialized"
-            );
+            h = layer.forward_segmented_with_cos_sin(
+                &h,
+                &segment_boundaries,
+                Some((&rot_cos, &rot_sin)),
+            )?;
+            if materialize_per_layer {
+                let context = format!("qwen3_5_vision_layer_{layer_idx}");
+                MxArray::eval_arrays_with_context(&[&h], &context).map_err(|error| {
+                    Error::from_reason(format!(
+                        "Qwen vision layer {layer_idx} materialization failed: {error}"
+                    ))
+                })?;
+                crate::array::clear_cache();
+                tracing::debug!(
+                    target: "mlx_core::inference",
+                    event = "vision_layer_materialized",
+                    layer = layer_idx,
+                    patch_count = total_seq_len,
+                    "Qwen vision layer residual materialized"
+                );
+            }
         }
 
         // Spatial projector (reduces token count by merge_size^2)
@@ -502,5 +570,65 @@ pub(crate) mod tests {
             max_abs_diff <= 1e-4,
             "combined/per-image vision output diverged: max abs diff {max_abs_diff}"
         );
+    }
+
+    #[test]
+    fn vision_layer_barrier_gating_respects_backend_and_cuda_memory() {
+        let gib = 1024u64 * 1024 * 1024;
+        // Metal / CPU always materialize per layer regardless of patch count or memory.
+        assert!(should_materialize_vision_per_layer(
+            1,
+            false,
+            true,
+            128 * gib
+        ));
+        assert!(should_materialize_vision_per_layer(
+            4096,
+            false,
+            false,
+            80 * gib
+        ));
+
+        // CUDA unified memory (e.g. GB10 Spark) uses 32,768 threshold.
+        assert!(!should_materialize_vision_per_layer(
+            32_768,
+            true,
+            true,
+            16 * gib
+        ));
+        assert!(should_materialize_vision_per_layer(
+            32_769,
+            true,
+            true,
+            16 * gib
+        ));
+
+        // CUDA discrete >= 24 GiB uses 32,768 threshold.
+        assert!(!should_materialize_vision_per_layer(
+            32_768,
+            true,
+            false,
+            24 * gib
+        ));
+        assert!(should_materialize_vision_per_layer(
+            32_769,
+            true,
+            false,
+            24 * gib
+        ));
+
+        // CUDA discrete < 24 GiB uses 8,192 threshold.
+        assert!(!should_materialize_vision_per_layer(
+            8_192,
+            true,
+            false,
+            16 * gib
+        ));
+        assert!(should_materialize_vision_per_layer(
+            8_193,
+            true,
+            false,
+            16 * gib
+        ));
     }
 }

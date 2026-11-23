@@ -173,6 +173,13 @@ impl QwenImageProcessor {
         })
     }
 
+    /// Plan the `[grid_t, grid_h, grid_w]` vision grid dimensions for an image
+    /// without resizing pixels or allocating any MLX arrays.
+    pub(crate) fn plan_grid_thw(&self, orig_width: u32, orig_height: u32) -> Result<[i32; 3]> {
+        let geometry = self.plan_geometry(orig_width, orig_height)?;
+        Ok([geometry.grid_t, geometry.grid_h, geometry.grid_w])
+    }
+
     /// Process a single already-decoded RGB image without re-encoding.
     #[allow(dead_code)]
     pub(crate) fn process_rgb_image(&self, img: &RgbImage) -> Result<ProcessedImage> {
@@ -335,5 +342,25 @@ mod tests {
             batch.grid_thw().to_int32().unwrap().as_ref(),
             &[1, 2, 4, 1, 2, 4]
         );
+    }
+
+    #[test]
+    fn plan_grid_thw_matches_process_rgb_image() -> napi::Result<()> {
+        let processor = QwenImageProcessor::new(Some(ImageProcessorConfig {
+            min_pixels: 32 * 32,
+            max_pixels: 64 * 64,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 2,
+            image_mean: vec![0.5; 3],
+            image_std: vec![0.5; 3],
+            do_rescale: true,
+            do_normalize: true,
+        }));
+        let rgb = RgbImage::new(64, 32);
+        let planned = processor.plan_grid_thw(rgb.width(), rgb.height())?;
+        let processed = processor.process_rgb_image(&rgb)?;
+        assert_eq!(planned.as_slice(), processed.image_grid_thw().as_slice());
+        Ok(())
     }
 }

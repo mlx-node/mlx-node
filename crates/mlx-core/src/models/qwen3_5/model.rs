@@ -186,6 +186,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) clairic_grammar: Option<Arc<mlx_clairic::grammar::GrammarEngine>>,
     pub(crate) clairic_multimodal: crate::models::qwen3_5::config::Qwen3_5MultimodalTokens,
     pub(crate) clairic_profile: Option<mlx_clairic::profile::ClairicProfile>,
+    pub(crate) clairic_cache: crate::models::clairic::persistent_cache::ClairicPersistentCache,
     pub(crate) prism_hadamard: Option<crate::quant::prism_hadamard::PrismHadamardRuntime>,
     /// Optional external DFlash2 companion. When installed it takes
     /// precedence over the target checkpoint's inline one-layer MTP head.
@@ -238,6 +239,12 @@ pub(crate) struct Qwen35Inner {
     /// caps the number of distinct tapes a model accumulates — further
     /// lengths take the eager backbone.
     pub(crate) clef_compiled_decide_shapes: std::collections::HashSet<i64>,
+    /// Cached detached `(conv_dtype, conv_zero, state_zero)` pair reused across
+    /// stateless `decide_clef` CUDA calls so linear layers avoid reallocating
+    /// and sync-evaluating fresh zero states on every request. Safe to share
+    /// because `decide_clef` passes clones in fresh 2-slot `ArraysCache::new(2)`
+    /// (no slot-2 `state_dst`) and retaining a reference here prevents donation.
+    pub(crate) clef_cuda_gdn_zeros: Option<(crate::array::DType, MxArray, MxArray)>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,

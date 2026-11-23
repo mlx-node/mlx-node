@@ -723,6 +723,13 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(ql) if ql.has_hadamard())
     }
 
+    pub(crate) fn as_quantized(&self) -> Option<&QuantizedLinear> {
+        match self {
+            LinearProj::Quantized(ql) => Some(ql),
+            LinearProj::Standard(_) => None,
+        }
+    }
+
     /// See [`QuantizedLinear::attach_planes`]; a dense projection takes none.
     pub(crate) fn attach_planes(
         &mut self,
@@ -827,6 +834,136 @@ impl MLPVariant {
         up_proj.try_store_epilogue(x, &gate, StoreEpilogue::Swiglu)
     }
 
+    /// CUDA Sym8 fused MLP path: runs merged `gate_up`, then fuses
+    /// `SwiGLU + Hadamard-1024 + INT8 quantization` into a single kernel
+    /// (`swiglu_hadamard_quant_int8`) feeding `down_proj.forward_prequantized_sym8`,
+    /// eliminating the `[B, T, inter]` BF16 intermediate buffer.
+    fn forward_sym8_cuda(
+        x: &MxArray,
+        down_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<Option<MxArray>> {
+        use crate::array::DType;
+        if !crate::accelerator::cuda_sym8_available() || !down_proj.is_sym8() {
+            return Ok(None);
+        }
+        let Some(pair) = gate_up.as_deref() else {
+            return Ok(None);
+        };
+        let (merged, split) = pair;
+        let inter = down_proj.weight.shape_at(1)?;
+        if *split != inter || merged.weight.shape_at(0)? != 2 * inter {
+            return Ok(None);
+        }
+        if down_proj
+            .hadamard()
+            .is_some_and(|h| h.gdn_permutation.is_some())
+        {
+            return Ok(None);
+        }
+        let out_dtype = x.dtype()?;
+        if out_dtype != DType::BFloat16 {
+            return Ok(None);
+        }
+        let shape = x.shape()?;
+        if shape.is_empty() {
+            return Ok(None);
+        }
+        let prefix_shape = &shape[..shape.len() - 1];
+        let m: i64 = prefix_shape.iter().product();
+        if m == 0 {
+            return Ok(None);
+        }
+        let gate_up_out = merged.forward(x)?;
+        if gate_up_out.dtype()? != DType::BFloat16 {
+            return Ok(None);
+        }
+        let gate_up_2d = gate_up_out.reshape(&[m, 2 * inter])?;
+        let (act_i8, s_act) =
+            crate::kernels::sym8::swiglu_hadamard_quant_int8(&gate_up_2d, down_proj.sym8_signs())?;
+        down_proj
+            .forward_prequantized_sym8(&act_i8, &s_act, prefix_shape, out_dtype)
+            .map(Some)
+    }
+
+    /// Whether this MLP can consume pre-quantized `(x_i8, s_x)` from a fused
+    /// `Add + RMSNorm + Hadamard-1024 + INT8 quant` kernel on CUDA.
+    ///
+    /// Returns `Some(signs)` when `gate_up` is merged `Sym8` and `down_proj` is
+    /// `Sym8` with matching intermediate width and no GDN permutation; `signs`
+    /// is `merged.sym8_signs()`. Returns `None` otherwise.
+    pub(crate) fn can_fuse_norm_sym8_cuda(&self) -> Option<Option<&MxArray>> {
+        if !crate::accelerator::cuda_sym8_available() {
+            return None;
+        }
+        let Self::Quantized {
+            down_proj, gate_up, ..
+        } = self
+        else {
+            return None;
+        };
+        if !down_proj.is_sym8()
+            || down_proj
+                .hadamard()
+                .is_some_and(|h| h.gdn_permutation.is_some())
+        {
+            return None;
+        }
+        let (merged, split) = gate_up.as_deref()?;
+        if !merged.is_sym8()
+            || merged
+                .hadamard()
+                .is_some_and(|h| h.gdn_permutation.is_some())
+        {
+            return None;
+        }
+        let inter = down_proj.weight.shape_at(1).ok()?;
+        if *split != inter || merged.weight.shape_at(0).ok()? != 2 * inter {
+            return None;
+        }
+        Some(merged.sym8_signs())
+    }
+
+    /// CUDA Sym8 MLP forward from pre-quantized `(x_i8, s_x)` produced by
+    /// `sym8::add_rmsnorm_hadamard_quant`, skipping `gate_up`'s separate
+    /// Hadamard+INT8 quantization and retaining the fused SwiGLU+HadQuant path
+    /// into `down_proj`.
+    pub(crate) fn forward_prequantized_sym8_cuda(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        prefix_shape: &[i64],
+        out_dtype: crate::array::DType,
+    ) -> Result<MxArray> {
+        let Self::Quantized {
+            down_proj, gate_up, ..
+        } = self
+        else {
+            return Err(Error::from_reason(
+                "MLPVariant::forward_prequantized_sym8_cuda requires Quantized Sym8 MLP",
+            ));
+        };
+        let Some((merged, _)) = gate_up.as_deref() else {
+            return Err(Error::from_reason(
+                "MLPVariant::forward_prequantized_sym8_cuda requires merged gate_up",
+            ));
+        };
+        let inter = down_proj.weight.shape_at(1)?;
+        let m: i64 = prefix_shape.iter().product();
+        if m == 0 {
+            let n = down_proj.weight.shape_at(0)?;
+            let mut out_shape = Vec::with_capacity(prefix_shape.len() + 1);
+            out_shape.extend_from_slice(prefix_shape);
+            out_shape.push(n);
+            return MxArray::zeros(&out_shape, Some(out_dtype));
+        }
+        let gate_up_out = merged.forward_prequantized_sym8(x_i8, s_x, prefix_shape, out_dtype)?;
+        let gate_up_2d = gate_up_out.reshape(&[m, 2 * inter])?;
+        let (act_i8, s_act) =
+            crate::kernels::sym8::swiglu_hadamard_quant_int8(&gate_up_2d, down_proj.sym8_signs())?;
+        down_proj.forward_prequantized_sym8(&act_i8, &s_act, prefix_shape, out_dtype)
+    }
+
     /// `residual + forward(x)`, with the SwiGLU and the residual add in the
     /// K-quant GEMM stores where the shapes take the epilogue GEMM (the dense
     /// prefill); the separate ops elsewhere. Same bits either way.
@@ -844,6 +981,9 @@ impl MLPVariant {
         else {
             return residual.add(&self.forward(x)?);
         };
+        if let Some(out) = Self::forward_sym8_cuda(x, down_proj, gate_up)? {
+            return residual.add(&out);
+        }
         let activated = match Self::swiglu_store(x, gate_proj, up_proj, gate_up)? {
             Some(activated) => activated,
             None => Self::quantized_activated(x, gate_proj, up_proj, gate_up)?,
@@ -1026,6 +1166,9 @@ impl MLPVariant {
                 down_proj,
                 gate_up,
             } => {
+                if let Some(out) = Self::forward_sym8_cuda(x, down_proj, gate_up)? {
+                    return Ok(out);
+                }
                 let activated = Self::quantized_activated(x, gate_proj, up_proj, gate_up)?;
                 down_proj.forward(&activated)
             }
@@ -1490,9 +1633,9 @@ pub fn try_build_sym8_quantized_linear(
     }
 
     let gpu_gen = unsafe { sys::mlx_gpu_architecture_gen() };
-    if gpu_gen < 17 {
+    if gpu_gen < 17 && !crate::accelerator::cuda_sym8_available() {
         return Err(Error::from_reason(format!(
-            "sym8 layer '{}': sym8 checkpoints require an M5+ GPU (gen >= 17), got gen {}. \
+            "sym8 layer '{}': sym8 checkpoints require an M5+ GPU (gen >= 17) or CUDA SM >= 8.0, got gen {}. \
              Re-convert the model with an affine quant mode for this host.",
             key_prefix, gpu_gen
         )));
@@ -1922,6 +2065,11 @@ pub struct QuantizedLinear {
     // When `true`, skip the trailing cast back to the activation dtype on mixed-dtype
     // affine `quantized_matmul` (preserving MLX's promoted dtype, e.g. FP32).
     preserve_promoted_dtype: bool,
+    // True when this affine Q8_0 (bits=8, group_size=32) projection comes from
+    // a checkpoint declaring `symmetric_zero_point == 128` (every group bias is
+    // exact `-128 * scale`), enabling the faster `general_bias = false` path in
+    // CUDA `q8_prefill_cuda`.
+    q8_symmetric_128: bool,
 }
 
 /// One projection's planes and the planned tensor they were written for.
@@ -2080,6 +2228,7 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: false,
             preserve_promoted_dtype: false,
+            q8_symmetric_128: false,
         }
     }
 
@@ -2402,6 +2551,103 @@ impl QuantizedLinear {
     /// projection keeps up to two keys and records the shared input under
     /// each, which reproduces the unmerged recordings exactly.
     pub fn concat_rows(&self, other: &QuantizedLinear) -> Result<Option<QuantizedLinear>> {
+        // CUDA Sym8 row-merge branch (gate+up -> gate_up, k+v -> kv_proj).
+        // Gated on `cuda_sym8_available()` so macOS Metal and pre-Ampere CUDA behavior is untouched.
+        if crate::accelerator::cuda_sym8_available()
+            && let (Some(s_w1), Some(s_w2)) = (&self.s_w, &other.s_w)
+        {
+            if self.preserve_promoted_dtype != other.preserve_promoted_dtype
+                || self.mode != SYM8_MODE
+                || other.mode != SYM8_MODE
+                || self.bits != other.bits
+                || self.group_size != other.group_size
+                || self.output_layout != QuantizedOutputLayout::Native
+                || other.output_layout != QuantizedOutputLayout::Native
+                || self.input_amax.is_some()
+                || other.input_amax.is_some()
+                || self.fp8_dequant_weight.is_some()
+                || other.fp8_dequant_weight.is_some()
+                || self.biases.is_some()
+                || other.biases.is_some()
+                || self.decode_sidecars.is_some()
+                || other.decode_sidecars.is_some()
+                || self.capture_input.is_some()
+                || other.capture_input.is_some()
+                || self.amax_keys.as_ref().is_some_and(|k| k.1.is_some())
+                || other.amax_keys.as_ref().is_some_and(|k| k.1.is_some())
+                || !self.sym8_hadamard_compatible_with(other)?
+            {
+                return Ok(None);
+            }
+            let (w1, w2) = (self.weight.shape()?, other.weight.shape()?);
+            let (s1, s2) = (s_w1.shape()?, s_w2.shape()?);
+            if w1.len() != 2
+                || w2.len() != 2
+                || w1[1] != w2[1]
+                || s1.len() != 1
+                || s2.len() != 1
+                || s1[0] != w1[0]
+                || s2[0] != w2[0]
+            {
+                return Ok(None);
+            }
+            if self.weight.dtype()? != crate::array::DType::Int8
+                || other.weight.dtype()? != crate::array::DType::Int8
+                || s_w1.dtype()? != crate::array::DType::Float32
+                || s_w2.dtype()? != crate::array::DType::Float32
+                || match (&self.bias, &other.bias) {
+                    (Some(a), Some(b)) => {
+                        a.dtype()? != b.dtype()?
+                            || a.shape()?.as_ref() != [w1[0]]
+                            || b.shape()?.as_ref() != [w2[0]]
+                    }
+                    (None, None) => false,
+                    _ => true,
+                }
+            {
+                return Ok(None);
+            }
+            let weight = MxArray::concatenate(&self.weight, &other.weight, 0)?;
+            let s_w = MxArray::concatenate(s_w1, s_w2, 0)?;
+            let bias = match (&self.bias, &other.bias) {
+                (Some(a), Some(b)) => Some(MxArray::concatenate(a, b, 0)?),
+                (None, None) => None,
+                _ => return Ok(None),
+            };
+            let mut to_eval = vec![&weight, &s_w];
+            if let Some(b) = bias.as_ref() {
+                to_eval.push(b);
+            }
+            MxArray::eval_arrays(&to_eval)?;
+            let a_key = self.amax_keys.as_ref().map(|k| k.0.clone());
+            let b_key = other.amax_keys.as_ref().map(|k| k.0.clone());
+            let amax_keys = match (a_key, b_key) {
+                (Some(a), Some(b)) if a != b => Some(Box::new((a, Some(b)))),
+                (a, b) => a.or(b).map(|k| Box::new((k, None))),
+            };
+            return Ok(Some(QuantizedLinear {
+                weight,
+                scales: s_w.clone(),
+                decode_sidecars: None,
+                capture_input: None,
+                biases: None,
+                bias,
+                group_size: self.group_size,
+                bits: self.bits,
+                mode: self.mode.clone(),
+                fp8_dequant_weight: None,
+                s_w: Some(s_w),
+                input_amax: None,
+                amax_keys,
+                output_layout: QuantizedOutputLayout::Native,
+                hadamard: self.hadamard.clone(),
+                cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
+                planes: None,
+                symmetric_q8: false,
+                preserve_promoted_dtype: self.preserve_promoted_dtype,
+                q8_symmetric_128: false,
+            }));
+        }
         if self.symmetric_q8 != other.symmetric_q8
             || self.preserve_promoted_dtype != other.preserve_promoted_dtype
             || self.mode != other.mode
@@ -2497,6 +2743,7 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: self.symmetric_q8,
             preserve_promoted_dtype: self.preserve_promoted_dtype,
+            q8_symmetric_128: self.q8_symmetric_128 && other.q8_symmetric_128,
         }))
     }
 
@@ -2515,6 +2762,53 @@ impl QuantizedLinear {
     /// calibration site with a view must re-attach the source's key via
     /// [`with_amax_key`](Self::with_amax_key).
     pub fn slice_rows(&self, start: i64, end: i64) -> Result<QuantizedLinear> {
+        if crate::accelerator::cuda_sym8_available()
+            && let Some(s_w) = &self.s_w
+        {
+            if self.mode != SYM8_MODE
+                || self.fp8_dequant_weight.is_some()
+                || self.decode_sidecars.is_some()
+                || self.output_layout != QuantizedOutputLayout::Native
+            {
+                return Err(Error::from_reason(
+                    "QuantizedLinear::slice_rows requires a plain projection",
+                ));
+            }
+            let rows = self.weight.shape()?;
+            if rows.len() != 2 || start < 0 || end > rows[0] || start >= end {
+                return Err(Error::from_reason(format!(
+                    "QuantizedLinear::slice_rows out of range: [{start},{end}) of {:?}",
+                    rows.to_vec()
+                )));
+            }
+            let sliced_s_w = s_w.slice_axis(0, start, end)?;
+            return Ok(QuantizedLinear {
+                weight: self.weight.slice_axis(0, start, end)?,
+                scales: sliced_s_w.clone(),
+                decode_sidecars: None,
+                capture_input: None,
+                biases: None,
+                bias: self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.slice_axis(0, start, end))
+                    .transpose()?,
+                group_size: self.group_size,
+                bits: self.bits,
+                mode: self.mode.clone(),
+                fp8_dequant_weight: None,
+                s_w: Some(sliced_s_w),
+                input_amax: None,
+                amax_keys: None,
+                output_layout: QuantizedOutputLayout::Native,
+                hadamard: self.hadamard.clone(),
+                cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
+                planes: None,
+                symmetric_q8: false,
+                preserve_promoted_dtype: self.preserve_promoted_dtype,
+                q8_symmetric_128: false,
+            });
+        }
         if self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
             || self.hadamard.is_some()
@@ -2571,6 +2865,7 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: self.symmetric_q8,
             preserve_promoted_dtype: self.preserve_promoted_dtype,
+            q8_symmetric_128: self.q8_symmetric_128,
         })
     }
 
@@ -2615,7 +2910,24 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: false,
             preserve_promoted_dtype: false,
+            q8_symmetric_128: false,
         }
+    }
+
+    /// Mark an affine Q8_0 (`bits=8, group_size=32`) projection as having
+    /// symmetric zero-point 128 (`bias == -128 * scale` on every group),
+    /// enabling the `general_bias = false` path in CUDA `q8_prefill_cuda`.
+    /// Non-Q8_0 or non-affine projections ignore `true` and stay `false`.
+    pub fn with_q8_symmetric_128(mut self, symmetric: bool) -> Self {
+        self.q8_symmetric_128 =
+            symmetric && self.mode == DEFAULT_QUANT_MODE && self.bits == 8 && self.group_size == 32;
+        self
+    }
+
+    /// Whether this projection carries the affine Q8_0 symmetric zero-point 128
+    /// invariant.
+    pub fn is_q8_symmetric_128(&self) -> bool {
+        self.q8_symmetric_128
     }
 
     /// Attach a per-tensor FP8 activation scale (`PerLayerQuant::input_amax`).
@@ -2687,12 +2999,38 @@ impl QuantizedLinear {
         self.hadamard.is_some()
     }
 
+    pub fn is_sym8(&self) -> bool {
+        self.s_w.is_some()
+    }
+
+    pub(crate) fn hadamard(&self) -> Option<&HadamardTransform> {
+        self.hadamard.as_ref()
+    }
+
+    pub fn sym8_signs(&self) -> Option<&MxArray> {
+        self.hadamard.as_ref().map(HadamardTransform::signs)
+    }
+
+    pub(crate) fn sym8_hadamard_compatible_with(&self, other: &Self) -> Result<bool> {
+        match (&self.hadamard, &other.hadamard) {
+            (None, None) => Ok(true),
+            (Some(a), Some(b)) => {
+                if a.gdn_permutation.is_some() || b.gdn_permutation.is_some() {
+                    return Ok(false);
+                }
+                a.is_compatible_with(b)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Attach the CLEF sym8 input rotation (QuaRot-style): `forward` runs
     /// `x' = transform.apply(x)` before the W8A8 kernels, whose int8 weight
     /// was quantized from the same rotation of the dense weight
     /// (`qwen3_5::persistence::apply_clef_residency`), so `x' W'^T == x W^T`
     /// up to the int8 rounding — now of an outlier-spread activation.
-    /// sym8-only, one transform per projection, sign width must equal K.
+    /// sym8-only, one transform per projection, sign width must equal K,
+    /// `block_size == 1024`, and `K % 1024 == 0`.
     pub(crate) fn with_sym8_hadamard(mut self, transform: HadamardTransform) -> Result<Self> {
         if self.mode != SYM8_MODE || self.s_w.is_none() {
             return Err(Error::from_reason(format!(
@@ -2711,6 +3049,15 @@ impl QuantizedLinear {
         if width != k || transform.gdn_permutation.is_some() {
             return Err(Error::from_reason(format!(
                 "sym8 hadamard rotation: sign width {width} must equal K={k} with no GDN permutation"
+            )));
+        }
+        const SYM8_HADAMARD_BLOCK_SIZE: i32 = 1024;
+        if transform.block_size() != SYM8_HADAMARD_BLOCK_SIZE
+            || k % i64::from(SYM8_HADAMARD_BLOCK_SIZE) != 0
+        {
+            return Err(Error::from_reason(format!(
+                "sym8 hadamard rotation: requires block_size={SYM8_HADAMARD_BLOCK_SIZE} and K % {SYM8_HADAMARD_BLOCK_SIZE} == 0, got block_size={} K={k}",
+                transform.block_size()
             )));
         }
         self.hadamard = Some(transform);
@@ -2746,6 +3093,7 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: false,
             preserve_promoted_dtype: false,
+            q8_symmetric_128: false,
         }
     }
 
@@ -2770,6 +3118,56 @@ impl QuantizedLinear {
         }
         if self.decode_sidecars.is_some() {
             return Ok(false);
+        }
+        // CUDA Sym8 row-reorder branch (gated on `cuda_sym8_available()` so
+        // macOS Metal and pre-Ampere CUDA behavior is untouched). Permuting
+        // axis 0 of weight/s_w commutes with the axis-1 input Hadamard transform.
+        if crate::accelerator::cuda_sym8_available()
+            && self.mode == SYM8_MODE
+            && let Some(s_w) = self.s_w.as_ref()
+        {
+            let weight_shape = self.weight.shape()?.to_vec();
+            let s_w_shape = s_w.shape()?.to_vec();
+            let expected_rows = i64::from(num_heads)
+                .checked_mul(i64::from(head_dim))
+                .and_then(|value| value.checked_mul(2))
+                .ok_or_else(|| Error::from_reason("q/gate block row count overflow"))?;
+            let additive_bias_compatible = match self.bias.as_ref() {
+                Some(bias) => bias.shape()?.to_vec() == [expected_rows],
+                None => true,
+            };
+            if weight_shape.len() != 2
+                || s_w_shape.len() != 1
+                || weight_shape[0] != expected_rows
+                || s_w_shape[0] != expected_rows
+                || !additive_bias_compatible
+            {
+                return Ok(false);
+            }
+
+            let permutation = q_gate_block_permutation(num_heads, head_dim, expected_rows)?;
+            let indices = MxArray::from_int32(&permutation, &[expected_rows])?;
+            let weight = self.weight.take(&indices, 0)?;
+            let new_s_w = s_w.take(&indices, 0)?;
+            let bias = self
+                .bias
+                .as_ref()
+                .map(|bias| bias.take(&indices, 0))
+                .transpose()?;
+
+            let mut arrays = vec![&weight, &new_s_w];
+            if let Some(bias) = bias.as_ref() {
+                arrays.push(bias);
+            }
+            MxArray::eval_arrays(&arrays)?;
+
+            self.weight = weight;
+            self.scales = new_s_w.clone();
+            self.s_w = Some(new_s_w);
+            self.bias = bias;
+            self.output_layout = QuantizedOutputLayout::QGateBlock;
+            self.planes = None;
+            return Ok(true);
         }
         let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
         let mode = crate::models::quant_dispatch::parse_mode_str(Some(base_mode));
@@ -2841,6 +3239,65 @@ impl QuantizedLinear {
 
     pub(crate) fn has_q_gate_block_layout(&self) -> bool {
         self.output_layout == QuantizedOutputLayout::QGateBlock
+    }
+
+    /// CUDA Sym8 forward from pre-quantized `(x_i8, s_x)`: runs
+    /// `imma_gemm_bf16`, reshapes to `[...prefix_shape, N]`, adds optional
+    /// additive `bias`, and casts back to `out_dtype` if non-BF16.
+    pub fn forward_prequantized_sym8(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        prefix_shape: &[i64],
+        out_dtype: crate::array::DType,
+    ) -> Result<MxArray> {
+        let Some(s_w) = self.s_w.as_ref() else {
+            return Err(Error::from_reason(
+                "sym8 QuantizedLinear missing per-channel scales — \
+                 constructed without new_sym8?",
+            ));
+        };
+        let n = self.weight.shape_at(0)?;
+        let mut out_shape = Vec::with_capacity(prefix_shape.len() + 1);
+        out_shape.extend_from_slice(prefix_shape);
+        out_shape.push(n);
+        let m: i64 = prefix_shape.iter().product();
+        if m == 0 {
+            return MxArray::zeros(&out_shape, Some(out_dtype));
+        }
+        let y2d = crate::kernels::sym8::imma_gemm_bf16(x_i8, &self.weight, s_x, s_w)?;
+        let mut result = y2d.reshape(&out_shape)?;
+        if let Some(ref b) = self.bias {
+            result = result.add(b)?;
+        }
+        if result.dtype()? != out_dtype {
+            result = result.astype(out_dtype)?;
+        }
+        Ok(result)
+    }
+
+    /// CUDA Sym8 forward: fuses optional Hadamard-1024 rotation with per-token
+    /// INT8 quantization (`hadamard_quant_int8`) and runs IMMA INT8 GEMM to
+    /// BF16 (`imma_gemm_bf16`).
+    fn forward_sym8_cuda(&self, x: &MxArray) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if shape.is_empty() {
+            return Err(Error::from_reason("sym8 forward: scalar input"));
+        }
+        let out_dtype = x.dtype()?;
+        let k = shape[shape.len() - 1];
+        let prefix_shape = &shape[..shape.len() - 1];
+        let m: i64 = prefix_shape.iter().product();
+        if m == 0 {
+            let n = self.weight.shape_at(0)?;
+            let mut out_shape = Vec::with_capacity(prefix_shape.len() + 1);
+            out_shape.extend_from_slice(prefix_shape);
+            out_shape.push(n);
+            return MxArray::zeros(&out_shape, Some(out_dtype));
+        }
+        let x_2d = x.reshape(&[m, k])?;
+        let (x_i8, s_x) = crate::kernels::sym8::hadamard_quant_int8(&x_2d, self.sym8_signs())?;
+        self.forward_prequantized_sym8(&x_i8, &s_x, prefix_shape, out_dtype)
     }
 
     /// sym8 forward: int8-weight GEMM/QMV + rescale.
@@ -3107,6 +3564,13 @@ impl QuantizedLinear {
                 }
             }
         }
+        // CUDA Sym8 fast path: fused Hadamard-1024 + INT8 quant + IMMA GEMM
+        // runs BEFORE the Metal NAX `self.hadamard.apply` path so macOS Metal
+        // behavior stays 100% untouched.
+        if crate::accelerator::cuda_sym8_available() && self.mode == SYM8_MODE && self.s_w.is_some()
+        {
+            return self.forward_sym8_cuda(x);
+        }
         let transformed = self
             .hadamard
             .as_ref()
@@ -3234,7 +3698,11 @@ impl QuantizedLinear {
 
         // CUDA affine Q8_0 (bits=8, group_size=32) fast path with BF16 `x` and
         // F32 / BF16 / F16 sidecars: small-row (M in 1..=16) stays packed in
-        // `mlx_affine_q8_few_cuda`; M >= 17 uses the cached dense BF16 cuBLAS path.
+        // `mlx_affine_q8_few_cuda`; M >= 17 with F16 sidecars uses the direct
+        // Q8_0 Tensor-Core prefill kernel (`q8_prefill_cuda`, zero retained
+        // dense BF16 weight cache — exact BF16 MMA below M=128 and auto-grouped
+        // INT8 TC at M >= 128), falling back cleanly to `dequant_q8_bf16_cuda`
+        // + cuBLAS when declined (e.g. odd N) or for non-F16 sidecars.
         if round_affine_to_act
             && crate::accelerator::cuda_ops_available()
             && activation_dtype == Some(crate::array::DType::BFloat16)
@@ -3272,6 +3740,18 @@ impl QuantizedLinear {
                     return Ok(out);
                 }
                 if rows >= 17 {
+                    if scale_dtype == crate::array::DType::Float16
+                        && let Some(out) = crate::kernels::linear::q8_prefill_cuda(
+                            x,
+                            &self.weight,
+                            &self.scales,
+                            biases,
+                            if rows < 128 { -2 } else { -1 },
+                            !self.q8_symmetric_128,
+                        )?
+                    {
+                        return Ok(out);
+                    }
                     let mut dense = self
                         .cuda_dense_prefill_slot()
                         .map(|slot| {
@@ -3619,6 +4099,7 @@ impl QuantizedLinear {
         self.decode_sidecars = None;
         self.clear_cuda_dense_prefill();
         self.planes = None;
+        self.q8_symmetric_128 = false;
         if self.mode == FP8_E4M3_MODE {
             self.fp8_dequant_weight = None;
         }
@@ -5196,6 +5677,222 @@ mod cuda_prefill_tests {
     }
 
     #[test]
+    fn affine_q8_f16_direct_prefill_matches_dequant_matmul() {
+        use crate::array::DType;
+
+        let next_f32 = |state: &mut u64| -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((*state >> 40) as f32) * (1.0 / ((1u32 << 24) as f32));
+            u * 2.0 - 1.0
+        };
+
+        let mut rng = 0x51A8_F160_0001u64;
+        let run_case = |n: i64, k: i64, row_counts: &[i64], general_bias: bool, rng: &mut u64| {
+            let packed = (0..n * (k / 4))
+                .map(|_| {
+                    *rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (*rng >> 32) as u32
+                })
+                .collect::<Vec<_>>();
+            let weight = MxArray::from_uint32(&packed, &[n, k / 4]).unwrap();
+            let scale_vals = (0..n * (k / 32))
+                .map(|_| 0.004 + next_f32(rng).abs() * 0.016)
+                .collect::<Vec<_>>();
+            let scales = MxArray::from_float32(&scale_vals, &[n, k / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+            let sym_biases = scales.mul_scalar(-128.0).unwrap();
+            let biases = if general_bias {
+                let offsets = (0..n * (k / 32))
+                    .map(|_| next_f32(rng) * 0.02)
+                    .collect::<Vec<_>>();
+                let off_arr = MxArray::from_float32(&offsets, &[n, k / 32])
+                    .unwrap()
+                    .astype(DType::Float16)
+                    .unwrap();
+                sym_biases.add(&off_arr).unwrap()
+            } else {
+                sym_biases
+            };
+            assert_eq!(scales.dtype().unwrap(), DType::Float16);
+            assert_eq!(biases.dtype().unwrap(), DType::Float16);
+
+            let linear = QuantizedLinear::new(
+                weight,
+                scales,
+                Some(biases),
+                None,
+                32,
+                8,
+                DEFAULT_QUANT_MODE.to_string(),
+            )
+            .with_q8_symmetric_128(!general_bias);
+            assert_eq!(linear.is_q8_symmetric_128(), !general_bias);
+            let ref_w_t = linear
+                .dequantize_current_weight()
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+
+            for &rows in row_counts {
+                let x_vals = (0..(rows * k) as usize)
+                    .map(|_| next_f32(rng) * 0.5)
+                    .collect::<Vec<_>>();
+                let x = MxArray::from_float32(&x_vals, &[1, rows, k])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let got = linear.forward(&x).unwrap();
+                assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(got.shape().unwrap().as_ref(), [1, rows, n]);
+                let reference = x.astype(DType::Float32).unwrap().matmul(&ref_w_t).unwrap();
+                got.eval();
+                reference.eval();
+                let actual = got.to_float32().unwrap();
+                let expected = reference.to_float32().unwrap();
+                let mut err_sq = 0.0f64;
+                let mut ref_sq = 0.0f64;
+                for (&a, &e) in actual.iter().zip(expected.iter()) {
+                    let d = f64::from(a - e);
+                    err_sq += d * d;
+                    ref_sq += f64::from(e) * f64::from(e);
+                }
+                let nrmse = (err_sq / ref_sq.max(1e-12)).sqrt();
+                let limit = if rows >= 128 { 1.2e-2 } else { 3.5e-3 };
+                assert!(
+                    nrmse <= limit,
+                    "affine Q8_0 F16 N={n} K={k} M={rows} general_bias={general_bias}: nrmse={nrmse:.3e} > {limit:.1e}"
+                );
+            }
+            linear
+        };
+
+        // Even N: exercises decode (1, 8), exact BF16 MMA prefill (32, gs_shift=-2),
+        // and INT8 TC prefill (256, gs_shift=-1) with zero dense BF16 cache retained.
+        // `general_bias = false` runs with `with_q8_symmetric_128(true)`.
+        let sym_linear = run_case(96, 512, &[1, 8, 32, 256], false, &mut rng);
+        let gen_linear = run_case(96, 512, &[1, 8, 32, 256], true, &mut rng);
+        if crate::accelerator::cuda_ops_available() {
+            for (general_bias, linear) in [(false, &sym_linear), (true, &gen_linear)] {
+                assert!(
+                    !linear.cuda_dense_prefill_resident(),
+                    "direct Q8_0 F16 prefill must retain zero dense BF16 weight cache (general_bias={general_bias})"
+                );
+            }
+        }
+
+        // `q8_symmetric_128` propagation across `concat_rows`, `slice_rows`,
+        // `finalize_packed_q_gate_block`, and non-Q8_0 rejection.
+        let sym_pair = sym_linear
+            .concat_rows(&sym_linear)
+            .unwrap()
+            .expect("symmetric Q8_0 pair must merge");
+        assert!(sym_pair.is_q8_symmetric_128());
+        let mixed_pair = sym_linear
+            .concat_rows(&gen_linear)
+            .unwrap()
+            .expect("symmetric + general Q8_0 pair must merge");
+        assert!(!mixed_pair.is_q8_symmetric_128());
+        let mixed_rev = gen_linear
+            .concat_rows(&sym_linear)
+            .unwrap()
+            .expect("general + symmetric Q8_0 pair must merge");
+        assert!(!mixed_rev.is_q8_symmetric_128());
+
+        // Forward parity of merged symmetric and mixed pairs at M=32 and M=256.
+        for (label, merged) in [("sym+sym", &sym_pair), ("sym+gen", &mixed_pair)] {
+            let ref_w_t = merged
+                .dequantize_current_weight()
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+            for rows in [32i64, 256] {
+                let x_vals = (0..(rows * 512) as usize)
+                    .map(|_| next_f32(&mut rng) * 0.5)
+                    .collect::<Vec<_>>();
+                let x = MxArray::from_float32(&x_vals, &[1, rows, 512])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let got = merged.forward(&x).unwrap();
+                let reference = x.astype(DType::Float32).unwrap().matmul(&ref_w_t).unwrap();
+                got.eval();
+                reference.eval();
+                let actual = got.to_float32().unwrap();
+                let expected = reference.to_float32().unwrap();
+                let mut err_sq = 0.0f64;
+                let mut ref_sq = 0.0f64;
+                for (&a, &e) in actual.iter().zip(expected.iter()) {
+                    let d = f64::from(a - e);
+                    err_sq += d * d;
+                    ref_sq += f64::from(e) * f64::from(e);
+                }
+                let nrmse = (err_sq / ref_sq.max(1e-12)).sqrt();
+                let limit = if rows >= 128 { 1.2e-2 } else { 3.5e-3 };
+                assert!(
+                    nrmse <= limit,
+                    "{label} M={rows}: nrmse={nrmse:.3e} > {limit:.1e}"
+                );
+            }
+        }
+
+        assert!(sym_linear.slice_rows(0, 48).unwrap().is_q8_symmetric_128());
+        assert!(!gen_linear.slice_rows(0, 48).unwrap().is_q8_symmetric_128());
+        assert!(sym_pair.slice_rows(0, 96).unwrap().is_q8_symmetric_128());
+        assert!(!mixed_pair.slice_rows(0, 96).unwrap().is_q8_symmetric_128());
+
+        // `finalize_packed_q_gate_block` mutates in place and preserves `q8_symmetric_128`.
+        let mut q_gate = sym_linear.slice_rows(0, 64).unwrap();
+        assert!(q_gate.finalize_packed_q_gate_block(2, 16).unwrap());
+        assert!(q_gate.is_q8_symmetric_128());
+
+        // Non-Q8_0 (bits != 8 or group_size != 32 or mode != "affine") stays false.
+        let dummy_w = MxArray::zeros(&[32, 32], Some(DType::Uint32)).unwrap();
+        let dummy_s = MxArray::ones(&[32, 2], Some(DType::Float16)).unwrap();
+        let dummy_b = MxArray::zeros(&[32, 2], Some(DType::Float16)).unwrap();
+        let non_q8_gs = QuantizedLinear::new(
+            dummy_w.clone(),
+            dummy_s.clone(),
+            Some(dummy_b.clone()),
+            None,
+            64,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        )
+        .with_q8_symmetric_128(true);
+        assert!(!non_q8_gs.is_q8_symmetric_128());
+        let non_q8_bits = QuantizedLinear::new(
+            dummy_w.clone(),
+            dummy_s.clone(),
+            Some(dummy_b),
+            None,
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        )
+        .with_q8_symmetric_128(true);
+        assert!(!non_q8_bits.is_q8_symmetric_128());
+        let non_affine =
+            QuantizedLinear::new(dummy_w, dummy_s, None, None, 32, 8, MXFP8_MODE.to_string())
+                .with_q8_symmetric_128(true);
+        assert!(!non_affine.is_q8_symmetric_128());
+
+        // Odd N: `q8_prefill_cuda` declines cleanly and falls through to the
+        // F16-sidecar `dequant_q8_bf16_cuda` + cuBLAS fallback.
+        let odd_linear = run_case(33, 256, &[1, 8, 32], true, &mut rng);
+        odd_linear.clear_cuda_dense_prefill();
+    }
+
+    #[test]
     fn bf16_gemm_few_matches_matmul() {
         if !crate::accelerator::cuda_ops_available() {
             return;
@@ -6321,9 +7018,9 @@ mod sym8_tests {
     /// `Ok(None)`.
     #[test]
     fn sym8_builder_fail_loud_contract() {
-        if gpu_gen() < 17 {
+        if gpu_gen() < 17 && !crate::accelerator::cuda_sym8_available() {
             eprintln!(
-                "[sym8] SKIP: gpu gen {} < 17 (builder gen-gate untestable)",
+                "[sym8] SKIP: gpu gen {} < 17 and CUDA SM >= 8.0 unavailable (builder gen-gate untestable)",
                 gpu_gen()
             );
             return;

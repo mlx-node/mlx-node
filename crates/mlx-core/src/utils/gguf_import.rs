@@ -255,6 +255,10 @@ fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> 
 enum Dst {
     Empty,
     Consumed,
+    GpuRepack {
+        dst: Option<RepackDst>,
+        k: usize,
+    },
     Repack {
         dst: Option<RepackDst>,
         ptrs: DstPtrs,
@@ -594,11 +598,21 @@ impl Seek for OffsetReader<'_> {
 
 fn alloc_dst(t: &GgufTensorInfo, route: Route, probe: &ImportProbe) -> Result<Dst> {
     Ok(match route {
-        Route::Gpu(_, layout) | Route::CpuKQuant(layout) => {
-            let (dst, ptrs) = match route {
-                Route::Gpu(kind, _) => RepackDst::alloc_for_kind(t, kind, layout)?,
-                _ => RepackDst::alloc(t, layout)?,
-            };
+        Route::Gpu(kind, layout) => {
+            let (dst, meta) = RepackDst::alloc_gpu_for_kind(t, kind, layout)?;
+            for a in std::iter::once(&dst.weight)
+                .chain(dst.scales.as_ref())
+                .chain(dst.biases.as_ref())
+            {
+                probe.alloc(a.nbytes());
+            }
+            Dst::GpuRepack {
+                dst: Some(dst),
+                k: meta.k,
+            }
+        }
+        Route::CpuKQuant(layout) => {
+            let (dst, ptrs) = RepackDst::alloc(t, layout)?;
             for a in std::iter::once(&dst.weight)
                 .chain(dst.scales.as_ref())
                 .chain(dst.biases.as_ref())
@@ -657,7 +671,7 @@ fn collect_tensor(
     ple_shards: &mut Option<(String, Vec<MxArray>, usize)>,
 ) -> Result<()> {
     match dst {
-        Dst::Repack { dst: Some(dst), .. } => {
+        Dst::GpuRepack { dst: Some(dst), .. } | Dst::Repack { dst: Some(dst), .. } => {
             let prefix = t.name.strip_suffix(".weight").unwrap_or(&t.name);
             let RepackDst {
                 weight,
@@ -687,7 +701,10 @@ fn collect_tensor(
         }
         Dst::Done(arrays) => map.extend(arrays),
         Dst::Consumed => {}
-        Dst::Empty | Dst::Whole(_) | Dst::Repack { dst: None, .. } => {
+        Dst::Empty
+        | Dst::Whole(_)
+        | Dst::GpuRepack { dst: None, .. }
+        | Dst::Repack { dst: None, .. } => {
             return Err(Error::from_reason(format!(
                 "GGUF tensor '{}' was not fully read",
                 t.name
@@ -810,16 +827,20 @@ fn read_gguf_tensors_consuming(
     let windows = plan_reads(header, h.len, cfg.slot_bytes, &|i| routes[i].row_multiple())?;
 
     let mut bands = vec![0usize; header.tensors.len()];
-    for b in windows.iter().flat_map(|w| &w.bands) {
-        bands[b.tensor] += 1;
-        if let Route::Gpu(kind, layout) = routes[b.tensor]
-            && !b.src_off.is_multiple_of(band_offset_rule(kind))
-        {
-            routes[b.tensor] = if kind.is_kquant() {
-                Route::CpuKQuant(layout)
-            } else {
-                Route::CpuAffine
-            };
+    let mut tensor_last_window = vec![0usize; header.tensors.len()];
+    for (w, window) in windows.iter().enumerate() {
+        for b in &window.bands {
+            bands[b.tensor] += 1;
+            tensor_last_window[b.tensor] = w;
+            if let Route::Gpu(kind, layout) = routes[b.tensor]
+                && !b.src_off.is_multiple_of(band_offset_rule(kind))
+            {
+                routes[b.tensor] = if kind.is_kquant() {
+                    Route::CpuKQuant(layout)
+                } else {
+                    Route::CpuAffine
+                };
+            }
         }
     }
     if let Some(i) = bands.iter().position(|&n| n == 0) {
@@ -827,6 +848,12 @@ fn read_gguf_tensors_consuming(
             "GGUF tensor '{}' has no data to read",
             header.tensors[i].name
         )));
+    }
+    let mut last_window = vec![Vec::new(); windows.len()];
+    for (i, (&route, &w)) in routes.iter().zip(&tensor_last_window).enumerate() {
+        if matches!(route, Route::CpuKQuant(_) | Route::CpuAffine) {
+            last_window[w].push(i);
+        }
     }
     if let Some(consumer) = consumer.as_mut() {
         consumer.plan(&windows, header.tensors.len())?;
@@ -913,6 +940,7 @@ fn read_gguf_tensors_consuming(
             pool: &pool,
             guard: &mut guard,
             windows: &windows,
+            last_window: &last_window,
             header,
             plan,
             cfg,
@@ -957,6 +985,7 @@ struct Run<'r, 's, 'p> {
     pool: &'r CpuPool,
     guard: &'r mut ImportGuard<'p>,
     windows: &'r [Window],
+    last_window: &'r [Vec<usize>],
     header: &'r GgufFile,
     plan: &'r ImportPlan,
     cfg: &'r ReadConfig,
@@ -977,6 +1006,43 @@ impl Run<'_, '_, '_> {
         MxArray::eval_arrays_with_context(&refs, "GGUF repack window")?;
         self.pool.wait_window(w)?;
         self.probe.event(ImportEvent::Completed(w));
+        Ok(())
+    }
+
+    /// Promote finished `CpuKQuant` / `CpuAffine` tensors from window `w` to
+    /// CUDA device memory (`device >= 0`), releasing their `device == -1` host
+    /// buffers back into `host_buffer_cache_` for reuse by subsequent windows.
+    fn promote_finished_cpu_repacks(&mut self, w: usize) -> Result<()> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(());
+        }
+        let Some(indices) = self.last_window.get(w) else {
+            return Ok(());
+        };
+        for &i in indices {
+            let state = &mut self.guard.states[i];
+            if state.bands_left != 0 {
+                continue;
+            }
+            if let Dst::Repack {
+                dst: Some(repack), ..
+            } = &mut state.dst
+            {
+                if let Some(dev) = repack.weight.ensure_cuda_device()? {
+                    repack.weight = dev;
+                }
+                if let Some(scales) = repack.scales.as_mut()
+                    && let Some(dev) = scales.ensure_cuda_device()?
+                {
+                    *scales = dev;
+                }
+                if let Some(biases) = repack.biases.as_mut()
+                    && let Some(dev) = biases.ensure_cuda_device()?
+                {
+                    *biases = dev;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1001,6 +1067,7 @@ impl Run<'_, '_, '_> {
         for w in 0..n {
             if w > 0 {
                 self.complete(w - 1, &std::mem::take(&mut pending))?;
+                self.promote_finished_cpu_repacks(w - 1)?;
                 if let Some(consumer) = consumer.as_mut() {
                     consumer.complete(w - 1, self.header, &mut self.guard.states)?;
                 }
@@ -1022,6 +1089,7 @@ impl Run<'_, '_, '_> {
         }
         self.complete(n - 1, &pending)?;
         drop(pending);
+        self.promote_finished_cpu_repacks(n - 1)?;
         if let Some(consumer) = consumer.as_mut() {
             consumer.complete(n - 1, self.header, &mut self.guard.states)?;
         }
@@ -1058,7 +1126,7 @@ impl Run<'_, '_, '_> {
             let src = SendPtr(base.0.wrapping_add(band.src_off));
             let row_bytes = band.bytes / band.rows;
             match (state.route, &mut state.dst) {
-                (Route::Gpu(kind, layout), Dst::Repack { dst, ptrs }) => {
+                (Route::Gpu(kind, layout), Dst::GpuRepack { dst, k }) => {
                     let current = dst.take().ok_or_else(|| {
                         Error::from_reason(format!("GGUF tensor '{}' lost its arrays", t.name))
                     })?;
@@ -1070,7 +1138,7 @@ impl Run<'_, '_, '_> {
                         band.src_off as u64,
                         kind,
                         layout,
-                        u32_of(ptrs.k, t)?,
+                        u32_of(*k, t)?,
                         u32_of(row0, t)?,
                         u32_of(rows, t)?,
                         current,
@@ -1491,14 +1559,41 @@ fn eval_lazy<'a>(arrays: impl Iterator<Item = &'a MxArray>) -> Result<()> {
     MxArray::eval_arrays_with_context(&batch, "GGUF import transform")
 }
 
-/// Copy `views` into contiguous storage, then evaluate every lazy array.
+/// Promoted CUDA byte threshold before clearing MLX's host buffer cache.
+const CUDA_PROMOTE_FLUSH_BYTES: usize = 256 << 20;
+
+/// Promote a settled `device == -1` array to CUDA device memory (`device >= 0`),
+/// clearing MLX's host buffer cache every 256 MiB of promoted bytes so freed
+/// pinned-host buffers do not balloon peak RAM.
+fn promote_to_cuda_device(arr: &mut MxArray, flushed_bytes: &mut usize) -> Result<()> {
+    if let Some(dev) = arr.ensure_cuda_device()? {
+        let bytes = dev.nbytes();
+        *arr = dev;
+        *flushed_bytes = flushed_bytes.saturating_add(bytes);
+        if *flushed_bytes >= CUDA_PROMOTE_FLUSH_BYTES {
+            clear_cache();
+            *flushed_bytes = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Copy `views` into contiguous storage, evaluate every lazy array, and on CUDA
+/// promote any remaining pinned-host arrays to GPU device memory.
 fn materialize(map: &mut HashMap<String, MxArray>, views: &HashSet<String>) -> Result<()> {
     for key in views {
         if let Some(a) = map.get_mut(key) {
             *a = a.deep_copy()?;
         }
     }
-    eval_lazy(map.values())
+    eval_lazy(map.values())?;
+    if crate::accelerator::cuda_ops_available() {
+        let mut flushed_bytes = 0usize;
+        for arr in map.values_mut() {
+            promote_to_cuda_device(arr, &mut flushed_bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// One GGUF file of a preload: path, the header parsed at prepare, the
@@ -1748,7 +1843,7 @@ impl GgufPreload {
                         ))
                     },
                 )?;
-                let shards = shards
+                let mut shards = shards
                     .into_iter()
                     .map(
                         |shard| match dtype_pass_target(&key, &shard, main_plan, &input.opts)? {
@@ -1758,6 +1853,12 @@ impl GgufPreload {
                     )
                     .collect::<Result<Vec<_>>>()?;
                 eval_lazy(shards.iter())?;
+                if crate::accelerator::cuda_ops_available() {
+                    let mut flushed_bytes = 0usize;
+                    for shard in &mut shards {
+                        promote_to_cuda_device(shard, &mut flushed_bytes)?;
+                    }
+                }
                 Some((shards, rows_per_shard))
             }
             None => None,

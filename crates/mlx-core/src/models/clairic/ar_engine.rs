@@ -5,13 +5,16 @@
 //! (lines 355-918), sharing one `Qwen35Inner` backbone across both paths.
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, OnceLock, atomic::AtomicBool};
+use std::time::Instant;
 
 use image::RgbImage;
 use mlx_clairic::ar::EOS as AR_EOS;
 use mlx_clairic::embedded::RenderedPdfPageData;
 use mlx_clairic::errors::check_cancel;
-use mlx_clairic::grammar::{fill_batch_allowed_bitmasks, mask_and_score_row_bitmask};
+use mlx_clairic::grammar::{
+    fill_batch_allowed_bitmasks, fill_batch_allowed_bitmasks_flat, mask_and_score_row_bitmask,
+};
 use mlx_clairic::media::{hex_digest, rgb_image_digest};
 use mlx_clairic::media_cache::{MediaCache, PreparedImages};
 use mlx_clairic::orchestrator::{ClairicBackend, extract_json};
@@ -25,6 +28,9 @@ use sha2::{Digest, Sha256};
 
 use crate::array::{DType, MxArray};
 use crate::models::forward as model_fwd;
+use crate::models::qwen3_5::arrays_cache::ArraysCache;
+use crate::models::qwen3_5::attention::AttentionMask;
+use crate::models::qwen3_5::decoder_layer::{DecoderLayer, LayerResidual};
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::model::Qwen35Inner;
 use crate::stream::{Stream, StreamContext};
@@ -33,6 +39,8 @@ use crate::vision::qwen::processing::merged_image_token_count;
 use crate::vision::qwen::prompt::{
     get_rope_index, inject_image_placeholders_with_token_id, merge_input_ids_with_image_features,
 };
+
+use super::persistent_cache::PrefixSnapshot;
 
 /// MLX-specialized prepared image cache entry holding `ProcessedImage` tensors.
 pub type ClairicPreparedImages<M = ()> = PreparedImages<ProcessedImage, M>;
@@ -49,8 +57,14 @@ fn inference_error(message: impl std::fmt::Display) -> napi::Error {
 }
 
 /// Threshold above which [`ClairicEngine::clear_request_caches`] drains MLX's
-/// Metal allocator free pool (512 MiB, matching CLEF's cache drain threshold).
+/// Metal/CPU allocator free pool (512 MiB, matching CLEF's cache drain threshold).
+/// On CUDA, [`crate::accelerator::cuda_cache_clear_threshold_bytes`] is used instead.
 const CLEAR_CACHE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Maximum `batch * length` token count that keeps CUDA Graph capture enabled
+/// (covers AR decode steps `B in 1..=16, T == 1`). Prefill passes above this
+/// threshold disable CUDA Graph capture via [`crate::accelerator::CudaGraphsGuard`].
+const CUDA_GRAPHS_MAX_TOKENS: usize = 16;
 
 /// Row chunk size when projecting answer-slot states through `lm_head`
 /// (matches `mlx_engine.py:677`).
@@ -58,6 +72,56 @@ const ANSWER_SLOT_LM_HEAD_CHUNK: i64 = 256;
 
 /// Stepwise per-layer eval threshold (`mlx_engine.py:600`).
 const STEPWISE_EVAL_TOKEN_THRESHOLD: usize = 4096;
+
+/// Minimum common prefix length (in tokens) required to create a shared
+/// text-only prefix cache entry for a multi-task batch.
+const MIN_TEXT_PREFIX_TOKENS: usize = 64;
+
+static PHASE_TIMING_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+pub(crate) fn phase_timing_enabled() -> bool {
+    *PHASE_TIMING_ENABLED.get_or_init(|| {
+        std::env::var_os("MLX_CLAIRIC_PHASE_TIME").is_some_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+#[inline]
+fn timing_now() -> Option<Instant> {
+    phase_timing_enabled().then(Instant::now)
+}
+
+#[inline]
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[derive(Debug, Default)]
+struct PhaseTimings {
+    vision_ms: f64,
+    vision_images: u64,
+    vision_patches: u64,
+    path_b_embed_ms: f64,
+    path_b_backbone_ms: f64,
+    path_b_head_ms: f64,
+    path_b_slots_ms: f64,
+    path_b_decode_ms: f64,
+    prefix_prefill_ms: f64,
+    prefix_hits: u64,
+    prefix_misses: u64,
+    prefix_broadcast_ms: f64,
+    chunk_prefill_ms: f64,
+    chunk_prefill_chunks: u64,
+    chunk_prefill_padded_chunks: u64,
+    chunk_prefill_tokens: u64,
+    decode_step_ms: f64,
+    decode_d2h_ms: f64,
+    grammar_cpu_ms: f64,
+    decode_steps: u64,
+    decode_batch_steps: u64,
+    decode_active_steps: u64,
+    clear_cache_ms: f64,
+}
 
 /// Runtime options for [`ClairicEngine`].
 #[derive(Debug, Clone)]
@@ -69,24 +133,47 @@ pub struct EngineOptions {
     pub memory_cap_bytes: Option<u64>,
 }
 
+/// Default prefill segment token budget for [`EngineOptions`].
+///
+/// Keeps [`SEGMENT_TOKENS`] (`1024`) on Metal/CPU; raises to `4096` on
+/// unified-memory or >=24 GiB CUDA GPUs (and `2048` on smaller discrete CUDA
+/// GPUs), matching `STEPWISE_EVAL_TOKEN_THRESHOLD = 4096` and
+/// `GatedDeltaNet::prepare_batched`'s `1..=4096` window.
+fn default_segment_tokens() -> usize {
+    if crate::accelerator::cuda_ops_available() {
+        let caps = crate::accelerator::caps();
+        if caps.is_unified_memory || caps.total_device_bytes >= 24u64 * 1024 * 1024 * 1024 {
+            4096
+        } else {
+            2048
+        }
+    } else {
+        SEGMENT_TOKENS
+    }
+}
+
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             batch_size: 16,
             batch_token_budget: 16_384,
-            segment_tokens: SEGMENT_TOKENS,
+            segment_tokens: default_segment_tokens(),
             prefix_cache: true,
             memory_cap_bytes: None,
         }
     }
 }
 
-/// Cached `B=1` layer states after running a shared image prefix up to
-/// `<|vision_end|>`.
-struct PrefixSnapshot {
-    caches: Vec<Qwen3_5LayerCache>,
-    cache_len: i32,
-    next_position: i32,
+/// Cache key separating media-backed and text-only shared prefix snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PrefixCacheKey {
+    Media {
+        media_key: String,
+        prefix_hash: String,
+    },
+    Text {
+        prefix_hash: String,
+    },
 }
 
 /// Live batched prefill/decode cache state across all layers of `Qwen35Inner`.
@@ -109,17 +196,9 @@ impl BatchCacheState {
         }
     }
 
-    fn eval_with_hidden(&self, hidden: &MxArray) -> Result<()> {
-        let mut arrays: Vec<&MxArray> = Vec::with_capacity(1 + self.layers.len() * 2);
-        arrays.push(hidden);
-        for layer in &self.layers {
-            layer.collect_arrays(&mut arrays);
-        }
-        MxArray::eval_arrays(&arrays)
-    }
-
-    fn eval_caches_only(&self) -> Result<()> {
-        let mut arrays: Vec<&MxArray> = Vec::with_capacity(self.layers.len() * 2);
+    fn eval_with_arrays(&self, extra: &[&MxArray]) -> Result<()> {
+        let mut arrays: Vec<&MxArray> = Vec::with_capacity(extra.len() + self.layers.len() * 2);
+        arrays.extend_from_slice(extra);
         for layer in &self.layers {
             layer.collect_arrays(&mut arrays);
         }
@@ -127,6 +206,14 @@ impl BatchCacheState {
             MxArray::eval_arrays(&arrays)?;
         }
         Ok(())
+    }
+
+    fn eval_with_hidden(&self, hidden: &MxArray) -> Result<()> {
+        self.eval_with_arrays(&[hidden])
+    }
+
+    fn eval_caches_only(&self) -> Result<()> {
+        self.eval_with_arrays(&[])
     }
 }
 
@@ -137,6 +224,17 @@ struct EmbeddedBatch {
     lengths: Vec<i32>,
 }
 
+/// Output of [`ClairicEngine::prefill_chunk`], carrying the optional CUDA
+/// Graphs guard, per-row padding flags, and timing handle across the lazy
+/// step-0 logit evaluation.
+struct PrefillChunkOutput {
+    last_hidden: MxArray,
+    cache: BatchCacheState,
+    cuda_graphs_guard: Option<crate::accelerator::CudaGraphsGuard>,
+    prefill_start: Option<Instant>,
+    row_has_padding: Vec<bool>,
+}
+
 /// Per-request Clairic execution engine borrowing the model-thread's
 /// `&mut Qwen35Inner` backbone, typed head, vision tower, and grammar engine.
 pub struct ClairicEngine<'a> {
@@ -144,7 +242,12 @@ pub struct ClairicEngine<'a> {
     options: EngineOptions,
     media_features: HashMap<String, MxArray>,
     media_grids: HashMap<String, [i32; 3]>,
-    prefix_caches: HashMap<(String, String), PrefixSnapshot>,
+    prefix_caches: HashMap<PrefixCacheKey, PrefixSnapshot>,
+    text_prefix_tokens: Vec<(Vec<u32>, String)>,
+    timings: PhaseTimings,
+    request_start: Option<Instant>,
+    request_parse_ms: f64,
+    request_encode_ms: f64,
 }
 
 impl<'a> ClairicEngine<'a> {
@@ -162,6 +265,11 @@ impl<'a> ClairicEngine<'a> {
             media_features: HashMap::new(),
             media_grids: HashMap::new(),
             prefix_caches: HashMap::new(),
+            text_prefix_tokens: Vec::new(),
+            timings: PhaseTimings::default(),
+            request_start: None,
+            request_parse_ms: 0.0,
+            request_encode_ms: 0.0,
         }
     }
 
@@ -175,15 +283,103 @@ impl<'a> ClairicEngine<'a> {
         &self.options
     }
 
+    /// Record request-level start timestamp and `parse_request` latency so
+    /// cleanup can emit a complete `[clairic-phase]` summary including
+    /// `clear_cache_ms` and total wall time.
+    pub(crate) fn set_request_timing_start(&mut self, start: Instant, parse_ms: f64) {
+        self.request_start = Some(start);
+        self.request_parse_ms = parse_ms;
+    }
+
+    /// Record `encode_request` latency for `[clairic-phase]` reporting.
+    pub(crate) fn set_request_encode_ms(&mut self, encode_ms: f64) {
+        self.request_encode_ms = encode_ms;
+    }
+
+    /// Consume the stored request timing context so `[clairic-phase]` is
+    /// emitted at most once per request.
+    pub(crate) fn take_request_timing_context(&mut self) -> Option<(Instant, f64, f64)> {
+        self.request_start
+            .take()
+            .map(|start| (start, self.request_parse_ms, self.request_encode_ms))
+    }
+
+    /// Emit one single-line `[clairic-phase]` JSON timing summary to stderr
+    /// when `MLX_CLAIRIC_PHASE_TIME` is enabled.
+    pub(crate) fn report_phase_timings(&self, parse_ms: f64, encode_ms: f64, total_ms: f64) {
+        if !phase_timing_enabled() {
+            return;
+        }
+        let t = &self.timings;
+        eprintln!(
+            "[clairic-phase] {{\"total_ms\":{total_ms:.2},\"parse_ms\":{parse_ms:.2},\"encode_ms\":{encode_ms:.2},\
+\"vision_ms\":{:.2},\"vision_images\":{},\"vision_patches\":{},\
+\"path_b_embed_ms\":{:.2},\"path_b_backbone_ms\":{:.2},\"path_b_head_ms\":{:.2},\"path_b_slots_ms\":{:.2},\"path_b_decode_ms\":{:.2},\
+\"prefix_prefill_ms\":{:.2},\"prefix_hits\":{},\"prefix_misses\":{},\"prefix_broadcast_ms\":{:.2},\
+\"chunk_prefill_ms\":{:.2},\"chunk_prefill_chunks\":{},\"chunk_prefill_padded_chunks\":{},\"chunk_prefill_tokens\":{},\
+\"decode_step_ms\":{:.2},\"decode_d2h_ms\":{:.2},\"grammar_cpu_ms\":{:.2},\"decode_steps\":{},\"decode_batch_steps\":{},\"decode_active_steps\":{},\
+\"clear_cache_ms\":{:.2}}}",
+            t.vision_ms,
+            t.vision_images,
+            t.vision_patches,
+            t.path_b_embed_ms,
+            t.path_b_backbone_ms,
+            t.path_b_head_ms,
+            t.path_b_slots_ms,
+            t.path_b_decode_ms,
+            t.prefix_prefill_ms,
+            t.prefix_hits,
+            t.prefix_misses,
+            t.prefix_broadcast_ms,
+            t.chunk_prefill_ms,
+            t.chunk_prefill_chunks,
+            t.chunk_prefill_padded_chunks,
+            t.chunk_prefill_tokens,
+            t.decode_step_ms,
+            t.decode_d2h_ms,
+            t.grammar_cpu_ms,
+            t.decode_steps,
+            t.decode_batch_steps,
+            t.decode_active_steps,
+            t.clear_cache_ms,
+        );
+    }
     /// Drop all per-request vision feature caches and shared prefix snapshots,
-    /// draining the Metal allocator pool only when it exceeds 512 MiB.
+    /// draining the allocator free pool only when backend pressure requires it:
+    /// - Unified CUDA: MLX's `CudaAllocator` already bounds `max_pool_size_`
+    ///   internally and auto-evicts, so only drain under explicit `memory_cap_bytes`
+    ///   or when active+cache exceeds 75% of total device memory.
+    /// - Discrete CUDA: `cuda_cache_clear_threshold_bytes()`.
+    /// - Metal/CPU: `CLEAR_CACHE_THRESHOLD_BYTES` (512 MiB).
     pub fn clear_request_caches(&mut self) {
+        let t_clear = timing_now();
         self.media_features.clear();
         self.media_grids.clear();
         self.prefix_caches.clear();
+        self.text_prefix_tokens.clear();
         let cache_bytes = crate::array::get_cache_memory();
-        if cache_bytes > CLEAR_CACHE_THRESHOLD_BYTES as f64 {
+        let should_clear = if crate::accelerator::cuda_ops_available() {
+            let caps = crate::accelerator::caps();
+            if caps.is_unified_memory {
+                let active_plus_cache = crate::array::get_active_memory() + cache_bytes;
+                let exceeds_cap = self
+                    .options
+                    .memory_cap_bytes
+                    .is_some_and(|cap| active_plus_cache > cap as f64);
+                let total = caps.total_device_bytes;
+                let exceeds_host_fraction = total > 0 && active_plus_cache > (total as f64) * 0.75;
+                exceeds_cap || exceeds_host_fraction
+            } else {
+                cache_bytes > crate::accelerator::cuda_cache_clear_threshold_bytes()
+            }
+        } else {
+            cache_bytes > CLEAR_CACHE_THRESHOLD_BYTES as f64
+        };
+        if should_clear {
             crate::array::clear_cache();
+        }
+        if let Some(start) = t_clear {
+            self.timings.clear_cache_ms += elapsed_ms(start);
         }
     }
 
@@ -209,8 +405,16 @@ impl<'a> ClairicEngine<'a> {
 
         let _stream_ctx = StreamContext::new(Stream::generation());
         let pad_id = self.pad_token_id();
+        let t_embed = timing_now();
         let embedded = self.embed_batch(&[item.input_ids.as_slice()], &[media], pad_id)?;
+        if let Some(start) = t_embed {
+            self.timings.path_b_embed_ms += elapsed_ms(start);
+        }
 
+        let t_backbone = timing_now();
+        let prefill_tokens = embedded.lengths.first().copied().unwrap_or(0).max(0) as usize;
+        let prefill_graphs_guard = (prefill_tokens > CUDA_GRAPHS_MAX_TOKENS)
+            .then(crate::accelerator::CudaGraphsGuard::disable_for_prefill);
         let (hidden_pre_norm, _) = self.run_segmented(
             embedded.inputs_embeds,
             embedded.position_ids,
@@ -222,8 +426,13 @@ impl<'a> ClairicEngine<'a> {
         let normed = self.inner.final_norm.forward(&hidden_pre_norm)?;
         let states = normed.squeeze(Some(&[0]))?; // [L, H]
         MxArray::eval_arrays(&[&states])?;
+        drop(prefill_graphs_guard);
+        if let Some(start) = t_backbone {
+            self.timings.path_b_backbone_ms += elapsed_ms(start);
+        }
         check_cancel_opt(cancelled)?;
 
+        let t_head = timing_now();
         let states_len = usize::try_from(states.shape_at(0)?)
             .map_err(|_| inference_error("invalid hidden sequence length"))?;
         let states_dtype = states.dtype()?;
@@ -244,23 +453,23 @@ impl<'a> ClairicEngine<'a> {
                 .clairic_head
                 .as_ref()
                 .ok_or_else(|| inference_error("ClairicHead is not loaded"))?;
-            let memory = head.memory(&hidden_f32, stop as i64)?;
-            let head_out = head.forward(
+            let prepared = head.prepare_memory(&hidden_f32, stop as i64)?;
+            let head_out = head.forward_prepared(
                 &hidden_f32,
                 input_start as i64,
                 stop as i64,
                 &views,
-                &memory,
+                &prepared,
             )?;
             let slot_states_opt = if !as_layout.is_empty() {
-                let s = head.answer_slot_states(
+                let s = head.answer_slot_states_prepared(
                     &hidden_f32,
                     &as_layout.field_queries,
                     &as_layout.slot_kinds,
                     &as_layout.slot_positions,
                     &as_layout.slot_lengths,
                     stop as i64,
-                    &memory,
+                    &prepared,
                 )?;
                 Some(s)
             } else {
@@ -268,8 +477,12 @@ impl<'a> ClairicEngine<'a> {
             };
             (head_out, slot_states_opt)
         };
+        if let Some(start) = t_head {
+            self.timings.path_b_head_ms += elapsed_ms(start);
+        }
 
         let (slot_ids, slot_log_probs) = if let Some(slot_states) = slot_states_opt {
+            let t_slots = timing_now();
             let n_slot = usize::try_from(slot_states.shape_at(0)?)
                 .map_err(|_| inference_error("invalid slot row count"))?;
             let width = usize::try_from(slot_states.shape_at(1)?)
@@ -282,20 +495,36 @@ impl<'a> ClairicEngine<'a> {
 
             let mut flat_ids: Vec<u32> = Vec::with_capacity(n_slot * width);
             let mut flat_lps: Vec<f32> = Vec::with_capacity(n_slot * width);
+            let use_cuda_select = crate::accelerator::cuda_ops_available();
 
             let mut first = 0i64;
             while first < total_rows {
                 check_cancel_opt(cancelled)?;
                 let end = (first + ANSWER_SLOT_LM_HEAD_CHUNK).min(total_rows);
                 let chunk = flat_states.slice_axis(0, first, end)?;
-                let logits = self.project_logits_2d(&chunk)?.astype(DType::Float32)?;
-                let best = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
-                let best_col = best.expand_dims(-1)?;
-                let max_logit = logits
-                    .take_along_axis(&best_col, -1)?
-                    .squeeze(Some(&[-1]))?;
-                let lse = logits.logsumexp(Some(&[-1]), Some(false))?;
-                let lp = max_logit.sub(&lse)?;
+                let raw_logits = self.project_logits_2d(&chunk)?;
+                let vocab = usize::try_from(raw_logits.shape_at(1)?)
+                    .map_err(|_| inference_error("invalid answer-slot logits vocab dimension"))?;
+                let (best, lp) = if use_cuda_select
+                    && let Some((choice, choice_lp, _scored)) =
+                        cuda_grammar_select(&raw_logits, None, None, vocab)?
+                {
+                    (choice, choice_lp)
+                } else {
+                    let logits = if raw_logits.dtype()? == DType::Float32 {
+                        raw_logits
+                    } else {
+                        raw_logits.astype(DType::Float32)?
+                    };
+                    let best = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
+                    let best_col = best.expand_dims(-1)?;
+                    let max_logit = logits
+                        .take_along_axis(&best_col, -1)?
+                        .squeeze(Some(&[-1]))?;
+                    let lse = logits.logsumexp(Some(&[-1]), Some(false))?;
+                    let lp = max_logit.sub(&lse)?;
+                    (best, lp)
+                };
                 MxArray::eval_arrays(&[&best, &lp])?;
 
                 flat_ids.extend_from_slice(&best.to_uint32()?);
@@ -310,27 +539,35 @@ impl<'a> ClairicEngine<'a> {
                 ids_2d.push(flat_ids[start..start + width].to_vec());
                 lps_2d.push(flat_lps[start..start + width].to_vec());
             }
+            if let Some(start) = t_slots {
+                self.timings.path_b_slots_ms += elapsed_ms(start);
+            }
             (Some(ids_2d), Some(lps_2d))
         } else {
             (None, None)
         };
 
+        let t_decode = timing_now();
         let tokenizer = self
             .inner
             .tokenizer
             .as_ref()
             .ok_or_else(|| inference_error("Clairic tokenizer is not loaded"))?;
-        super::head::decode_head_outputs(
+        let decoded = super::head::decode_head_outputs(
             &head_out,
             item,
             Some(tokenizer.inner()),
             slot_ids,
             slot_log_probs,
-        )
+        )?;
+        if let Some(start) = t_decode {
+            self.timings.path_b_decode_ms += elapsed_ms(start);
+        }
+        Ok(decoded)
     }
 
     /// Path A: deterministic grammar-constrained batched generation with shared
-    /// image-prefix caching and right-padded prefill/decode
+    /// media/text prefix caching and right-padded prefill/decode
     /// (`mlx_engine.py::_generate` + `_decode`).
     pub fn generate_batch(
         &mut self,
@@ -549,12 +786,16 @@ impl<'a> ClairicEngine<'a> {
         self.inner.spatial_merge_size.unwrap_or(2)
     }
 
-    fn check_memory(&self) -> Result<()> {
+    fn check_memory(&mut self) -> Result<()> {
         let Some(cap) = self.options.memory_cap_bytes else {
             return Ok(());
         };
         let cap_f = cap as f64;
         if crate::array::get_active_memory() > cap_f {
+            while crate::array::get_active_memory() > cap_f
+                && (self.inner.clairic_cache.evict_oldest_prefix()
+                    || self.inner.clairic_cache.evict_oldest_media())
+            {}
             crate::array::clear_cache();
             if crate::array::get_active_memory() > cap_f {
                 return Err(inference_error(format!(
@@ -567,7 +808,8 @@ impl<'a> ClairicEngine<'a> {
     }
 
     /// Encode one `RgbImage` through `QwenImageProcessor` + `QwenVisionEncoder`
-    /// and cache its `(features, grid_thw)` for the lifetime of this request.
+    /// and cache its `(features, grid_thw)` in the request-local map and the
+    /// cross-request content-addressed [`super::persistent_cache::ClairicPersistentCache`].
     fn encode_image_cached(&mut self, img: &RgbImage) -> Result<(MxArray, [i32; 3])> {
         let key = rgb_image_digest(img);
         if let (Some(feats), Some(&grid)) =
@@ -575,6 +817,12 @@ impl<'a> ClairicEngine<'a> {
         {
             return Ok((feats.clone(), grid));
         }
+        if let Some((feats, grid)) = self.inner.clairic_cache.get_media(&key) {
+            self.media_features.insert(key.clone(), feats.clone());
+            self.media_grids.insert(key, grid);
+            return Ok((feats, grid));
+        }
+        let t_vision = timing_now();
         let processor =
             self.inner.image_processor.as_ref().ok_or_else(|| {
                 inference_error("QwenImageProcessor is not loaded for image input")
@@ -603,9 +851,23 @@ impl<'a> ClairicEngine<'a> {
         }
         let pixels_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
         let grid_arr = MxArray::from_int32(&grid, &[1, 3])?;
+        let _cuda_graphs_guard = crate::accelerator::CudaGraphsGuard::disable_for_prefill();
         let features = encoder.forward(&pixels_5d, &grid_arr)?;
         MxArray::eval_arrays(&[&features])?;
 
+        if let Some(start) = t_vision {
+            self.timings.vision_ms += elapsed_ms(start);
+            self.timings.vision_images += 1;
+            let patches = u64::try_from(grid[0])
+                .unwrap_or(0)
+                .saturating_mul(u64::try_from(grid[1]).unwrap_or(0))
+                .saturating_mul(u64::try_from(grid[2]).unwrap_or(0));
+            self.timings.vision_patches += patches;
+        }
+
+        self.inner
+            .clairic_cache
+            .insert_media(key.clone(), features.clone(), grid);
         self.media_features.insert(key.clone(), features.clone());
         self.media_grids.insert(key, grid);
         Ok((features, grid))
@@ -732,14 +994,20 @@ impl<'a> ClairicEngine<'a> {
     /// Run one segment `[B, length, H]` through all backbone decoder layers,
     /// maintaining right-padded full-attention and GDN masks & caches
     /// (`mlx_engine.py::_forward`).
-    fn forward_segment(
+    ///
+    /// Returns a [`LayerResidual`] so small decode steps (`B * T <= 16`)
+    /// preserve cross-layer `AddRMSNorm` fusion across all layers and into
+    /// `final_norm`, while prefill passes (`B * T > 16`) materialize each
+    /// layer's hidden state to avoid holding an extra `[B*T, H]` tensor alive
+    /// across layers.
+    fn forward_segment_pending(
         &mut self,
-        mut h: MxArray,
+        h: MxArray,
         positions: &MxArray,
         lengths: Option<&[i32]>,
         cache: Option<&mut BatchCacheState>,
         cancelled: Option<&Arc<AtomicBool>>,
-    ) -> Result<MxArray> {
+    ) -> Result<LayerResidual> {
         let batch = usize::try_from(h.shape_at(0)?)
             .map_err(|_| inference_error("invalid batch dimension"))?;
         let length = i32::try_from(h.shape_at(1)?)
@@ -775,40 +1043,99 @@ impl<'a> ClairicEngine<'a> {
         };
 
         let total = cache_len + length;
-        let attn_mask = match &all_valid {
-            Some(av) => Some(build_padded_attn_mask(av, batch, length, cache_len, total)?),
-            None => None,
+        let use_cuda_causal_valid_mask = crate::accelerator::cuda_ops_available()
+            && crate::accelerator::caps()
+                .cuda_sm
+                .is_some_and(|(major, _)| major >= 8)
+            && length >= 9
+            && total >= length
+            && self.inner.config.head_dim == 256
+            && h.dtype()? == DType::BFloat16;
+        let (attn_mask_storage, attn_mask_is_causal_valid) = match &all_valid {
+            Some(av) if use_cuda_causal_valid_mask => {
+                (Some(av.reshape(&[batch as i64, 1, 1, total as i64])?), true)
+            }
+            Some(av) => (
+                Some(build_padded_attn_mask(av, batch, length, cache_len, total)?),
+                false,
+            ),
+            None => (None, false),
         };
+        let attn_mask = attn_mask_storage.as_ref().map(|m| {
+            if attn_mask_is_causal_valid {
+                AttentionMask::CausalValid(m)
+            } else {
+                AttentionMask::Full(m)
+            }
+        });
 
-        let stepwise = batch.saturating_mul(length as usize) > STEPWISE_EVAL_TOKEN_THRESHOLD;
+        let segment_tokens = batch.saturating_mul(length.max(0) as usize);
+        let _cuda_graphs_guard = (segment_tokens > CUDA_GRAPHS_MAX_TOKENS)
+            .then(crate::accelerator::CudaGraphsGuard::disable_for_prefill);
+        let stepwise = segment_tokens > STEPWISE_EVAL_TOKEN_THRESHOLD;
+        let use_pending = !stepwise && segment_tokens <= CUDA_GRAPHS_MAX_TOKENS;
         let mut cache_opt = cache;
 
-        for (layer_idx, layer) in self.inner.layers.iter().enumerate() {
-            check_cancel_opt(cancelled)?;
-            let layer_cache = cache_opt.as_deref_mut().map(|c| &mut c.layers[layer_idx]);
-            h = layer.forward_batched_flat(
-                &h,
-                attn_mask.as_ref(),
-                valid_mask.as_ref(),
-                linear_lengths,
-                layer_cache,
-                Some(positions),
-            )?;
-            if stepwise {
-                if let Some(c) = cache_opt.as_deref() {
-                    c.eval_with_hidden(&h)?;
-                } else {
-                    MxArray::eval_arrays(&[&h])?;
-                }
-                self.check_memory()?;
+        let out = if use_pending {
+            let mut residual = LayerResidual::Hidden(h);
+            for (layer_idx, layer) in self.inner.layers.iter().enumerate() {
+                check_cancel_opt(cancelled)?;
+                let layer_cache = cache_opt.as_deref_mut().map(|c| &mut c.layers[layer_idx]);
+                residual = layer.forward_batched_flat_pending_with_mask(
+                    residual,
+                    attn_mask,
+                    valid_mask.as_ref(),
+                    linear_lengths,
+                    layer_cache,
+                    Some(positions),
+                )?;
             }
-        }
+            residual
+        } else {
+            let mut h = h;
+            let num_layers = self.inner.layers.len();
+            for layer_idx in 0..num_layers {
+                check_cancel_opt(cancelled)?;
+                let layer_cache = cache_opt.as_deref_mut().map(|c| &mut c.layers[layer_idx]);
+                h = self.inner.layers[layer_idx].forward_batched_flat_with_mask(
+                    &h,
+                    attn_mask,
+                    valid_mask.as_ref(),
+                    linear_lengths,
+                    layer_cache,
+                    Some(positions),
+                )?;
+                if stepwise {
+                    if let Some(c) = cache_opt.as_deref() {
+                        c.eval_with_hidden(&h)?;
+                    } else {
+                        MxArray::eval_arrays(&[&h])?;
+                    }
+                    self.check_memory()?;
+                }
+            }
+            LayerResidual::Hidden(h)
+        };
 
         if let Some(c) = cache_opt {
             c.valid = all_valid;
             c.cache_len = total;
         }
-        Ok(h)
+        Ok(out)
+    }
+
+    /// Run one segment `[B, length, H]` through all backbone decoder layers
+    /// and materialize the final post-MLP hidden state.
+    fn forward_segment(
+        &mut self,
+        h: MxArray,
+        positions: &MxArray,
+        lengths: Option<&[i32]>,
+        cache: Option<&mut BatchCacheState>,
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> Result<MxArray> {
+        self.forward_segment_pending(h, positions, lengths, cache, cancelled)?
+            .into_hidden()
     }
 
     /// Run a whole sequence (or right-padded batch) through the backbone in
@@ -879,25 +1206,40 @@ impl<'a> ClairicEngine<'a> {
         Ok((out, cache_state))
     }
 
-    /// Look up or compute the `B=1` prefix cache up to the last common
-    /// `<|vision_end|>` token shared by every row in a batch, and broadcast it
-    /// to `B = tasks.len()` (`mlx_engine.py::_image_prefix`).
-    fn try_image_prefix(
+    /// Look up or compute a `B=1` shared prefix cache for either:
+    /// - a homogeneous media batch (up to the last common `<|vision_end|>`), or
+    /// - a text-only batch sharing a long common document prefix (`>= 64` tokens),
+    ///   including `B=1` hits against previously cached text prefixes in the same
+    ///   request.
+    fn try_shared_prefix(
         &mut self,
         tasks: &[&ArGenTask],
         media_keys: &[Option<&str>],
         cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<Option<(BatchCacheState, usize)>> {
-        if !self.options.prefix_cache || tasks.is_empty() {
-            return Ok(None);
-        }
-        let Some(first_key) = media_keys[0] else {
-            return Ok(None);
-        };
-        if media_keys.iter().any(|k| *k != Some(first_key)) {
+        if !self.options.prefix_cache || tasks.is_empty() || media_keys.len() != tasks.len() {
             return Ok(None);
         }
 
+        if let Some(first_key) = media_keys[0] {
+            if media_keys.iter().any(|k| *k != Some(first_key)) {
+                return Ok(None);
+            }
+            return self.try_media_prefix(tasks, first_key, cancelled);
+        }
+
+        if media_keys.iter().any(Option::is_some) {
+            return Ok(None);
+        }
+        self.try_text_prefix(tasks, cancelled)
+    }
+
+    fn try_media_prefix(
+        &mut self,
+        tasks: &[&ArGenTask],
+        first_key: &str,
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> Result<Option<(BatchCacheState, usize)>> {
         let seq_slices: Vec<&[u32]> = tasks.iter().map(|t| t.input_ids.as_slice()).collect();
         let common_len = common_prefix_len(&seq_slices);
         if common_len == 0 {
@@ -924,57 +1266,256 @@ impl<'a> ClairicEngine<'a> {
         }
 
         let prefix_tokens = &seq_slices[0][..cut];
-        let cache_key = (first_key.to_string(), hash_u32_slice(prefix_tokens));
+        let prefix_hash = hash_u32_slice(prefix_tokens);
+        let cache_key = PrefixCacheKey::Media {
+            media_key: first_key.to_string(),
+            prefix_hash: prefix_hash.clone(),
+        };
+        let content_digest = tasks[0]
+            .media
+            .as_deref()
+            .filter(|imgs| !imgs.is_empty())
+            .map(rgb_arcs_digest);
 
-        if !self.prefix_caches.contains_key(&cache_key) {
-            let pad_id = self.pad_token_id();
-            let embedded =
-                self.embed_batch(&[prefix_tokens], &[tasks[0].media.as_deref()], pad_id)?;
-            let prefix_expanded_len = embedded.lengths[0];
-            let (_, state_opt) = self.run_segmented(
-                embedded.inputs_embeds,
-                embedded.position_ids,
-                None,
-                None,
-                true,
-                cancelled,
-            )?;
-            let state = state_opt
-                .ok_or_else(|| inference_error("Prefix prefill returned no cache state"))?;
-            state.eval_caches_only()?;
-            let next_position = state
-                .next_positions
-                .first()
-                .copied()
-                .unwrap_or(prefix_expanded_len);
-            self.prefix_caches.insert(
-                cache_key.clone(),
-                PrefixSnapshot {
-                    caches: state.layers,
-                    cache_len: state.cache_len,
-                    next_position,
-                },
-            );
+        if self.prefix_caches.contains_key(&cache_key) {
+            self.timings.prefix_hits += 1;
+            return self
+                .broadcast_prefix_snapshot(&cache_key, tasks.len(), cut)
+                .map(Some);
         }
 
-        let snapshot = self
-            .prefix_caches
-            .get(&cache_key)
-            .ok_or_else(|| inference_error("Prefix cache entry vanished"))?;
-        let batch_i64 = tasks.len() as i64;
-        let broadcast_layers = broadcast_layer_caches(&snapshot.caches, batch_i64)?;
+        if let Some(ref cd) = content_digest
+            && let Some(snapshot) = self.inner.clairic_cache.get_prefix(cd, &prefix_hash)
+        {
+            let cache_len = snapshot.cache_len;
+            let next_position = snapshot.next_position;
+            let t_bcast = timing_now();
+            let broadcast_layers = broadcast_layer_caches(&snapshot.caches, tasks.len() as i64)?;
+            self.timings.prefix_hits += 1;
+            if let Some(start) = t_bcast {
+                self.timings.prefix_broadcast_ms += elapsed_ms(start);
+            }
+            return Ok(Some((
+                BatchCacheState {
+                    layers: broadcast_layers,
+                    valid: None,
+                    cache_len,
+                    next_positions: vec![next_position; tasks.len()],
+                },
+                cut,
+            )));
+        }
+
+        let snapshot =
+            self.compute_prefix_snapshot(prefix_tokens, tasks[0].media.as_deref(), cancelled)?;
+        let cache_len = snapshot.cache_len;
+        let next_position = snapshot.next_position;
+        let t_bcast = timing_now();
+        let broadcast_layers = broadcast_layer_caches(&snapshot.caches, tasks.len() as i64)?;
+        if let Some(start) = t_bcast {
+            self.timings.prefix_broadcast_ms += elapsed_ms(start);
+        }
+
+        let retained_local = if let Some(cd) = content_digest {
+            self.inner
+                .clairic_cache
+                .insert_prefix(cd, prefix_hash, snapshot)
+        } else {
+            Some(snapshot)
+        };
+        if let Some(snapshot) = retained_local {
+            self.prefix_caches.insert(cache_key, snapshot);
+        }
+
         Ok(Some((
             BatchCacheState {
                 layers: broadcast_layers,
                 valid: None,
-                cache_len: snapshot.cache_len,
-                next_positions: vec![snapshot.next_position; tasks.len()],
+                cache_len,
+                next_positions: vec![next_position; tasks.len()],
             },
             cut,
         )))
     }
 
-    /// Prefill one batch chunk, using the shared image-prefix cache when
+    fn try_text_prefix(
+        &mut self,
+        tasks: &[&ArGenTask],
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> Result<Option<(BatchCacheState, usize)>> {
+        if tasks
+            .iter()
+            .any(|t| t.media.as_deref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Ok(None);
+        }
+
+        if tasks.len() == 1 {
+            let seq = tasks[0].input_ids.as_slice();
+            let hit = self
+                .text_prefix_tokens
+                .iter()
+                .filter_map(|(toks, hash)| {
+                    if seq.len() <= toks.len() || !seq.starts_with(toks) {
+                        return None;
+                    }
+                    let key = PrefixCacheKey::Text {
+                        prefix_hash: hash.clone(),
+                    };
+                    self.prefix_caches
+                        .contains_key(&key)
+                        .then_some((toks.len(), key))
+                })
+                .max_by_key(|(len, _)| *len);
+            let Some((cut, cache_key)) = hit else {
+                return Ok(None);
+            };
+            self.timings.prefix_hits += 1;
+            return self.broadcast_prefix_snapshot(&cache_key, 1, cut).map(Some);
+        }
+
+        let seq_slices: Vec<&[u32]> = tasks.iter().map(|t| t.input_ids.as_slice()).collect();
+        let common_len = common_prefix_len(&seq_slices);
+        let min_len = seq_slices.iter().map(|s| s.len()).min().unwrap_or(0);
+        let cut = common_len.min(min_len.saturating_sub(1));
+        if cut < MIN_TEXT_PREFIX_TOKENS {
+            return Ok(None);
+        }
+
+        let prefix_tokens = &seq_slices[0][..cut];
+        // Reuse an already-cached text prefix when it matches `prefix_tokens`
+        // exactly or covers at least 75% of `cut`, avoiding a second full B=1
+        // document prefill when a narrower follow-up wave shares a slightly
+        // longer prompt header.
+        let existing_hit = self
+            .text_prefix_tokens
+            .iter()
+            .filter_map(|(toks, hash)| {
+                if toks.len() > cut
+                    || toks.len().saturating_mul(4) < cut.saturating_mul(3)
+                    || !prefix_tokens.starts_with(toks)
+                {
+                    return None;
+                }
+                let key = PrefixCacheKey::Text {
+                    prefix_hash: hash.clone(),
+                };
+                self.prefix_caches
+                    .contains_key(&key)
+                    .then_some((toks.len(), key))
+            })
+            .max_by_key(|(len, _)| *len);
+
+        if let Some((hit_cut, cache_key)) = existing_hit {
+            self.timings.prefix_hits += 1;
+            return self
+                .broadcast_prefix_snapshot(&cache_key, tasks.len(), hit_cut)
+                .map(Some);
+        }
+
+        let prefix_hash = hash_u32_slice(prefix_tokens);
+        let cache_key = PrefixCacheKey::Text {
+            prefix_hash: prefix_hash.clone(),
+        };
+        if self.prefix_caches.contains_key(&cache_key) {
+            self.timings.prefix_hits += 1;
+        } else {
+            self.compute_and_store_prefix_snapshot(
+                prefix_tokens,
+                None,
+                cache_key.clone(),
+                cancelled,
+            )?;
+            self.text_prefix_tokens
+                .push((prefix_tokens.to_vec(), prefix_hash));
+        }
+
+        self.broadcast_prefix_snapshot(&cache_key, tasks.len(), cut)
+            .map(Some)
+    }
+
+    fn compute_prefix_snapshot(
+        &mut self,
+        prefix_tokens: &[u32],
+        media: Option<&[Arc<RgbImage>]>,
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> Result<PrefixSnapshot> {
+        let t_prefix = timing_now();
+        let pad_id = self.pad_token_id();
+        let embedded = self.embed_batch(&[prefix_tokens], &[media], pad_id)?;
+        let prefix_expanded_len = embedded.lengths.first().copied().unwrap_or(0);
+        let prefill_graphs_guard = (prefix_expanded_len.max(0) as usize > CUDA_GRAPHS_MAX_TOKENS)
+            .then(crate::accelerator::CudaGraphsGuard::disable_for_prefill);
+        let (_, state_opt) = self.run_segmented(
+            embedded.inputs_embeds,
+            embedded.position_ids,
+            None,
+            None,
+            true,
+            cancelled,
+        )?;
+        let state =
+            state_opt.ok_or_else(|| inference_error("Prefix prefill returned no cache state"))?;
+        state.eval_caches_only()?;
+        drop(prefill_graphs_guard);
+        let next_position = state
+            .next_positions
+            .first()
+            .copied()
+            .unwrap_or(prefix_expanded_len);
+        self.timings.prefix_misses += 1;
+        if let Some(start) = t_prefix {
+            self.timings.prefix_prefill_ms += elapsed_ms(start);
+        }
+        Ok(PrefixSnapshot {
+            caches: state.layers,
+            cache_len: state.cache_len,
+            next_position,
+        })
+    }
+
+    fn compute_and_store_prefix_snapshot(
+        &mut self,
+        prefix_tokens: &[u32],
+        media: Option<&[Arc<RgbImage>]>,
+        cache_key: PrefixCacheKey,
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> Result<()> {
+        let snapshot = self.compute_prefix_snapshot(prefix_tokens, media, cancelled)?;
+        self.prefix_caches.insert(cache_key, snapshot);
+        Ok(())
+    }
+
+    fn broadcast_prefix_snapshot(
+        &mut self,
+        cache_key: &PrefixCacheKey,
+        batch_size: usize,
+        cut: usize,
+    ) -> Result<(BatchCacheState, usize)> {
+        let snapshot = self
+            .prefix_caches
+            .get(cache_key)
+            .ok_or_else(|| inference_error("Prefix cache entry vanished"))?;
+        let cache_len = snapshot.cache_len;
+        let next_position = snapshot.next_position;
+        let batch_i64 = batch_size as i64;
+        let t_bcast = timing_now();
+        let broadcast_layers = broadcast_layer_caches(&snapshot.caches, batch_i64)?;
+        if let Some(start) = t_bcast {
+            self.timings.prefix_broadcast_ms += elapsed_ms(start);
+        }
+        Ok((
+            BatchCacheState {
+                layers: broadcast_layers,
+                valid: None,
+                cache_len,
+                next_positions: vec![next_position; batch_size],
+            },
+            cut,
+        ))
+    }
+
+    /// Prefill one batch chunk, using the shared media/text prefix cache when
     /// applicable, and gather each row's last real hidden state `[B, 1, H]`
     /// (`mlx_engine.py::_prefill`).
     fn prefill_chunk(
@@ -982,54 +1523,72 @@ impl<'a> ClairicEngine<'a> {
         tasks: &[&ArGenTask],
         media_keys: &[Option<&str>],
         cancelled: Option<&Arc<AtomicBool>>,
-    ) -> Result<(MxArray, BatchCacheState)> {
+    ) -> Result<PrefillChunkOutput> {
         let size = tasks.len();
         let pad_id = self.pad_token_id();
+        let prefix_opt = self.try_shared_prefix(tasks, media_keys, cancelled)?;
+        let prefill_start = timing_now();
 
-        let (h_in, positions, lengths, initial_cache) = if let Some((prefix_state, cut)) =
-            self.try_image_prefix(tasks, media_keys, cancelled)?
-        {
-            let suffixes: Vec<&[u32]> = tasks.iter().map(|t| &t.input_ids[cut..]).collect();
-            let max_suf = suffixes.iter().map(|s| s.len()).max().unwrap_or(0);
-            let lengths: Vec<i32> = suffixes
-                .iter()
-                .map(|s| {
-                    i32::try_from(s.len())
-                        .map_err(|_| invalid_request("suffix length exceeds i32::MAX"))
-                })
-                .collect::<Result<Vec<_>>>()?;
+        let (h_in, positions, lengths, initial_cache) =
+            if let Some((prefix_state, cut)) = prefix_opt {
+                let suffixes: Vec<&[u32]> = tasks.iter().map(|t| &t.input_ids[cut..]).collect();
+                let max_suf = suffixes.iter().map(|s| s.len()).max().unwrap_or(0);
+                let lengths: Vec<i32> = suffixes
+                    .iter()
+                    .map(|s| {
+                        i32::try_from(s.len())
+                            .map_err(|_| invalid_request("suffix length exceeds i32::MAX"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
-            let mut padded_ids = vec![pad_id; size * max_suf];
-            for (row, suf) in suffixes.iter().enumerate() {
-                let dst = row * max_suf;
-                padded_ids[dst..dst + suf.len()].copy_from_slice(suf);
+                let mut padded_ids = vec![pad_id; size * max_suf];
+                for (row, suf) in suffixes.iter().enumerate() {
+                    let dst = row * max_suf;
+                    padded_ids[dst..dst + suf.len()].copy_from_slice(suf);
+                }
+                let ids_arr = MxArray::from_uint32(&padded_ids, &[size as i64, max_suf as i64])?;
+                let embeds = self.inner.embedding.forward(&ids_arr)?;
+
+                let base_pos = prefix_state.next_positions[0];
+                let pos_1d = MxArray::arange(
+                    f64::from(base_pos),
+                    f64::from(base_pos) + max_suf as f64,
+                    Some(1.0),
+                    Some(DType::Int32),
+                )?
+                .reshape(&[1, 1, max_suf as i64])?;
+                let pos_3d = MxArray::tile(&pos_1d, &[3, size as i32, 1])?;
+
+                (embeds, pos_3d, lengths, Some(prefix_state))
+            } else {
+                let seqs: Vec<&[u32]> = tasks.iter().map(|t| t.input_ids.as_slice()).collect();
+                let medias: Vec<Option<&[Arc<RgbImage>]>> =
+                    tasks.iter().map(|t| t.media.as_deref()).collect();
+                let embedded = self.embed_batch(&seqs, &medias, pad_id)?;
+                (
+                    embedded.inputs_embeds,
+                    embedded.position_ids,
+                    embedded.lengths,
+                    None,
+                )
+            };
+
+        let seq_len = usize::try_from(h_in.shape_at(1)?)
+            .map_err(|_| inference_error("invalid prefill sequence length"))?;
+        let row_has_padding: Vec<bool> = lengths
+            .iter()
+            .map(|&l| (l.max(0) as usize) < seq_len)
+            .collect();
+        let chunk_tokens = size.saturating_mul(seq_len);
+        if prefill_start.is_some() {
+            self.timings.chunk_prefill_chunks += 1;
+            if row_has_padding.iter().any(|&p| p) {
+                self.timings.chunk_prefill_padded_chunks += 1;
             }
-            let ids_arr = MxArray::from_uint32(&padded_ids, &[size as i64, max_suf as i64])?;
-            let embeds = self.inner.embedding.forward(&ids_arr)?;
-
-            let base_pos = prefix_state.next_positions[0];
-            let pos_1d = MxArray::arange(
-                f64::from(base_pos),
-                f64::from(base_pos) + max_suf as f64,
-                Some(1.0),
-                Some(DType::Int32),
-            )?
-            .reshape(&[1, 1, max_suf as i64])?;
-            let pos_3d = MxArray::tile(&pos_1d, &[3, size as i32, 1])?;
-
-            (embeds, pos_3d, lengths, Some(prefix_state))
-        } else {
-            let seqs: Vec<&[u32]> = tasks.iter().map(|t| t.input_ids.as_slice()).collect();
-            let medias: Vec<Option<&[Arc<RgbImage>]>> =
-                tasks.iter().map(|t| t.media.as_deref()).collect();
-            let embedded = self.embed_batch(&seqs, &medias, pad_id)?;
-            (
-                embedded.inputs_embeds,
-                embedded.position_ids,
-                embedded.lengths,
-                None,
-            )
-        };
+            self.timings.chunk_prefill_tokens += chunk_tokens as u64;
+        }
+        let cuda_graphs_guard = (chunk_tokens > CUDA_GRAPHS_MAX_TOKENS)
+            .then(crate::accelerator::CudaGraphsGuard::disable_for_prefill);
 
         let (h_out, cache_opt) = self.run_segmented(
             h_in,
@@ -1052,19 +1611,43 @@ impl<'a> ClairicEngine<'a> {
         ])?;
         let last_h = h_out.take_along_axis(&idx_arr, 1)?;
 
-        Ok((last_h, cache))
+        Ok(PrefillChunkOutput {
+            last_hidden: last_h,
+            cache,
+            cuda_graphs_guard,
+            prefill_start,
+            row_has_padding,
+        })
     }
 
-    /// Build lazy FP32 step logits `[B, V]` from pre-norm `[B, 1, H]` hidden
-    /// states through `final_norm` + `lm_head` without synchronizing Metal, so
-    /// the caller can fuse logit evaluation with KV/GDN cache evaluation in a
-    /// single `eval` barrier.
-    fn build_step_logits_f32(&self, pre_norm_h: &MxArray) -> Result<(MxArray, usize)> {
-        let normed = self.inner.final_norm.forward(pre_norm_h)?;
-        let logits =
+    /// Build lazy step logits `[B, V]` from a [`LayerResidual`] `[B, 1, H]`
+    /// through `final_norm` + `lm_head` without synchronizing GPU, so the caller
+    /// can fuse logit evaluation with KV/GDN cache evaluation in a single `eval`
+    /// barrier. When `residual` is [`LayerResidual::Pending`], the last layer's
+    /// `h + delta` is fused directly into `final_norm`. When `keep_native_dtype`
+    /// is `true`, preserves `lm_head`'s native dtype (e.g. BF16 on CUDA) for
+    /// fused GPU grammar selection without allocating an FP32 `[B, V]` cast.
+    fn build_step_logits_from_residual(
+        &self,
+        residual: &LayerResidual,
+        keep_native_dtype: bool,
+    ) -> Result<(MxArray, usize)> {
+        let normed = match residual {
+            LayerResidual::Hidden(pre_norm_h) => self.inner.final_norm.forward(pre_norm_h)?,
+            LayerResidual::Pending { h, delta } => {
+                let (_, normed) =
+                    DecoderLayer::add_residual_norm(&self.inner.final_norm, h, delta)?;
+                normed
+            }
+        };
+        let raw =
             model_fwd::project_logits(&normed, self.inner.lm_head.as_ref(), &self.inner.embedding)?
-                .squeeze(Some(&[1]))?
-                .astype(DType::Float32)?;
+                .squeeze(Some(&[1]))?;
+        let logits = if keep_native_dtype {
+            raw
+        } else {
+            raw.astype(DType::Float32)?
+        };
         let vocab = usize::try_from(logits.shape_at(1)?)
             .map_err(|_| inference_error("invalid logits vocab dimension"))?;
         Ok((logits, vocab))
@@ -1094,10 +1677,17 @@ impl<'a> ClairicEngine<'a> {
             return Ok(vec![(Vec::new(), Vec::new(), Vec::new()); size]);
         }
 
-        let (mut h, mut cache) = self.prefill_chunk(tasks, media_keys, cancelled)?;
-        let (init_logits, logits_vocab) = self.build_step_logits_f32(&h)?;
-        cache.eval_with_hidden(&init_logits)?;
-        let mut scores = init_logits.to_float32()?.to_vec();
+        let PrefillChunkOutput {
+            last_hidden: init_h,
+            mut cache,
+            cuda_graphs_guard,
+            prefill_start,
+            row_has_padding,
+        } = self.prefill_chunk(tasks, media_keys, cancelled)?;
+
+        let use_cuda_select = crate::accelerator::cuda_ops_available();
+        let (init_logits, logits_vocab) =
+            self.build_step_logits_from_residual(&LayerResidual::Hidden(init_h), use_cuda_select)?;
 
         let grammar_engine = self
             .inner
@@ -1112,96 +1702,448 @@ impl<'a> ClairicEngine<'a> {
             )));
         }
 
-        let mut matchers = tasks
-            .iter()
-            .map(|t| {
-                grammar_engine
-                    .compile(&t.grammar)
-                    .map_err(super::to_napi_err)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let mut tokens: Vec<Vec<u32>> = vec![Vec::new(); size];
         let mut token_logprobs: Vec<Vec<(f32, u32)>> = vec![Vec::new(); size];
         let mut first_step_logprobs: Vec<Vec<(f32, u32)>> = vec![Vec::new(); size];
         let mut done: Vec<bool> = vec![false; size];
         let pad_id = self.pad_token_id();
 
-        for step in 0..max_new_tokens {
-            check_cancel_opt(cancelled)?;
+        if use_cuda_select {
+            // Submit step-0 prefill + lm_head + caches asynchronously onto
+            // CUDA's default stream so GPU execution overlaps with CPU grammar
+            // compilation and step-0 bitmask generation (`cuda_graphs_guard`
+            // remains alive until after step-0 eval completes).
+            cuda_async_kick_decode(&init_logits, &cache);
+            if let Some(start) = prefill_start {
+                self.timings.chunk_prefill_ms += elapsed_ms(start);
+            }
+            let mut matchers = tasks
+                .iter()
+                .map(|t| {
+                    grammar_engine
+                        .compile(&t.grammar)
+                        .map_err(super::to_napi_err)
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            let active: Vec<bool> = (0..size).map(|row| !done[row] || step == 0).collect();
-            let bitmasks =
-                fill_batch_allowed_bitmasks(&mut matchers, &active).map_err(super::to_napi_err)?;
-            let step_score_ids: &[u32] = if step == 0 { score_token_ids } else { &[] };
+            let mask_words = grammar_vocab.div_ceil(32);
+            let mut active_orig: Vec<usize> = (0..size).collect();
+            let mut flat_bitmask: Vec<u32> = Vec::with_capacity(size.saturating_mul(mask_words));
+            let score_ids_arr = if score_token_ids.is_empty() {
+                None
+            } else {
+                Some(MxArray::from_uint32(
+                    score_token_ids,
+                    &[score_token_ids.len() as i64],
+                )?)
+            };
+            let mut cur_logits = init_logits;
+            let mut prefill_graphs_guard = cuda_graphs_guard;
 
-            for row in 0..size {
-                if !active[row] {
-                    continue;
+            for step in 0..max_new_tokens {
+                check_cancel_opt(cancelled)?;
+
+                let b_cur = active_orig.len();
+                let row_active: Vec<bool> = active_orig
+                    .iter()
+                    .map(|&orig| !done[orig] || step == 0)
+                    .collect();
+
+                let t_grammar = timing_now();
+                fill_batch_allowed_bitmasks_flat(
+                    &mut matchers,
+                    &active_orig,
+                    &row_active,
+                    &mut flat_bitmask,
+                    mask_words,
+                )
+                .map_err(super::to_napi_err)?;
+                if let Some(start) = t_grammar {
+                    self.timings.grammar_cpu_ms += elapsed_ms(start);
                 }
-                let row_start = row * logits_vocab;
-                let row_logits = &scores[row_start..row_start + grammar_vocab];
-                let (choice, choice_lp, scored) =
-                    mask_and_score_row_bitmask(row_logits, &bitmasks[row], step_score_ids);
 
-                if step == 0 {
-                    first_step_logprobs[row] = scored;
-                }
+                let t_eval = timing_now();
+                let bm_arr =
+                    MxArray::from_uint32(&flat_bitmask, &[b_cur as i64, mask_words as i64])?;
+                let step_score_arr = if step == 0 {
+                    score_ids_arr.as_ref()
+                } else {
+                    None
+                };
+                if let Some((choice_arr, choice_lp_arr, scored_arr)) =
+                    cuda_grammar_select(&cur_logits, Some(&bm_arr), step_score_arr, grammar_vocab)?
+                {
+                    cache.eval_with_arrays(&[&choice_arr, &choice_lp_arr, &scored_arr])?;
+                    drop(prefill_graphs_guard.take());
+                    if let Some(start) = t_eval {
+                        if step == 0 {
+                            self.timings.chunk_prefill_ms += elapsed_ms(start);
+                        } else {
+                            self.timings.decode_step_ms += elapsed_ms(start);
+                        }
+                    }
 
-                if done[row] {
-                    continue;
-                }
+                    let t_d2h = timing_now();
+                    let choices = choice_arr.to_uint32()?;
+                    let choice_lps = choice_lp_arr.to_float32()?;
+                    let scored_lps = if step == 0 && !score_token_ids.is_empty() {
+                        Some(scored_arr.to_float32()?)
+                    } else {
+                        None
+                    };
+                    if let Some(start) = t_d2h {
+                        self.timings.decode_d2h_ms += elapsed_ms(start);
+                    }
 
-                tokens[row].push(choice);
-                token_logprobs[row].push((choice_lp, choice));
-
-                let is_stop = stop_ids.contains(&choice);
-                if is_stop {
-                    done[row] = true;
-                }
-                if !matchers[row].is_terminated() {
-                    let accepted = matchers[row]
-                        .accept_token(choice)
-                        .map_err(super::to_napi_err)?;
-                    if !accepted && !is_stop {
+                    if choices.len() != b_cur || choice_lps.len() != b_cur {
                         return Err(inference_error(format!(
-                            "Generated token {choice} rejected by grammar for task {:?}",
-                            tasks[row].id
+                            "cuda_grammar_select output length mismatch: expected {b_cur}, \
+                             got choices={} lps={}",
+                            choices.len(),
+                            choice_lps.len()
                         )));
                     }
-                } else if is_stop {
-                    let _ = matchers[row].accept_token(choice);
+                    if let Some(ref sl) = scored_lps {
+                        let expected = b_cur.saturating_mul(score_token_ids.len());
+                        if sl.len() != expected {
+                            return Err(inference_error(format!(
+                                "cuda_grammar_select scored_lps length mismatch: expected \
+                                 {expected}, got {}",
+                                sl.len()
+                            )));
+                        }
+                    }
+
+                    let t_accept = timing_now();
+                    for (slot, &orig) in active_orig.iter().enumerate() {
+                        if !row_active[slot] {
+                            continue;
+                        }
+                        if step == 0
+                            && let Some(ref sl) = scored_lps
+                        {
+                            let base = slot * score_token_ids.len();
+                            first_step_logprobs[orig] = score_token_ids
+                                .iter()
+                                .enumerate()
+                                .map(|(j, &tok)| (sl[base + j], tok))
+                                .collect();
+                        }
+                        if done[orig] {
+                            continue;
+                        }
+                        let choice = choices[slot];
+                        let choice_lp = choice_lps[slot];
+                        tokens[orig].push(choice);
+                        token_logprobs[orig].push((choice_lp, choice));
+
+                        let is_stop = stop_ids.contains(&choice);
+                        if is_stop {
+                            done[orig] = true;
+                        }
+                        if !matchers[orig].is_terminated() {
+                            let accepted = matchers[orig]
+                                .accept_token(choice)
+                                .map_err(super::to_napi_err)?;
+                            if !accepted && !is_stop {
+                                return Err(inference_error(format!(
+                                    "Generated token {choice} rejected by grammar for task {:?}",
+                                    tasks[orig].id
+                                )));
+                            }
+                        } else if is_stop {
+                            let _ = matchers[orig].accept_token(choice);
+                        }
+                    }
+                    if let Some(start) = t_accept {
+                        self.timings.grammar_cpu_ms += elapsed_ms(start);
+                    }
+                } else {
+                    // Defensive fallback if the CUDA kernel declines the tensor layout/dtype.
+                    let f32_logits = if cur_logits.dtype()? == DType::Float32 {
+                        cur_logits.clone()
+                    } else {
+                        cur_logits.astype(DType::Float32)?
+                    };
+                    cache.eval_with_hidden(&f32_logits)?;
+                    drop(prefill_graphs_guard.take());
+                    if let Some(start) = t_eval {
+                        if step == 0 {
+                            self.timings.chunk_prefill_ms += elapsed_ms(start);
+                        } else {
+                            self.timings.decode_step_ms += elapsed_ms(start);
+                        }
+                    }
+
+                    let t_d2h = timing_now();
+                    let scores = f32_logits.to_float32()?;
+                    if let Some(start) = t_d2h {
+                        self.timings.decode_d2h_ms += elapsed_ms(start);
+                    }
+
+                    let t_accept = timing_now();
+                    let step_score_ids: &[u32] = if step == 0 { score_token_ids } else { &[] };
+                    for (slot, &orig) in active_orig.iter().enumerate() {
+                        if !row_active[slot] {
+                            continue;
+                        }
+                        let row_start = slot * logits_vocab;
+                        let row_logits = &scores[row_start..row_start + grammar_vocab];
+                        let row_bm = &flat_bitmask[slot * mask_words..(slot + 1) * mask_words];
+                        let (choice, choice_lp, scored) =
+                            mask_and_score_row_bitmask(row_logits, row_bm, step_score_ids);
+                        if step == 0 {
+                            first_step_logprobs[orig] = scored;
+                        }
+                        if done[orig] {
+                            continue;
+                        }
+                        tokens[orig].push(choice);
+                        token_logprobs[orig].push((choice_lp, choice));
+
+                        let is_stop = stop_ids.contains(&choice);
+                        if is_stop {
+                            done[orig] = true;
+                        }
+                        if !matchers[orig].is_terminated() {
+                            let accepted = matchers[orig]
+                                .accept_token(choice)
+                                .map_err(super::to_napi_err)?;
+                            if !accepted && !is_stop {
+                                return Err(inference_error(format!(
+                                    "Generated token {choice} rejected by grammar for task {:?}",
+                                    tasks[orig].id
+                                )));
+                            }
+                        } else if is_stop {
+                            let _ = matchers[orig].accept_token(choice);
+                        }
+                    }
+                    if let Some(start) = t_accept {
+                        self.timings.grammar_cpu_ms += elapsed_ms(start);
+                    }
+                }
+
+                if done.iter().all(|&d| d) || step + 1 == max_new_tokens {
+                    break;
+                }
+                check_cancel_opt(cancelled)?;
+
+                let t_step = timing_now();
+                let alive = active_orig.iter().filter(|&&o| !done[o]).count();
+                if alive > 0 && alive * 2 <= active_orig.len() {
+                    // Disarm slot-2 in-place GDN state aliases before compaction
+                    // so `select_batch_rows` only compacts slots 0 and 1.
+                    disarm_gdn_inplace_state(&mut cache.layers)?;
+                    let mut keep_local: Vec<i32> = Vec::with_capacity(alive);
+                    let mut new_active_orig: Vec<usize> = Vec::with_capacity(alive);
+                    let mut new_next_positions: Vec<i32> = Vec::with_capacity(alive);
+                    for (local, &orig) in active_orig.iter().enumerate() {
+                        if !done[orig] {
+                            keep_local.push(local as i32);
+                            new_active_orig.push(orig);
+                            new_next_positions.push(cache.next_positions[local]);
+                        }
+                    }
+                    let keep_idx = MxArray::from_int32(&keep_local, &[alive as i64])?;
+                    for layer in &mut cache.layers {
+                        match layer {
+                            Qwen3_5LayerCache::Linear(ac) => ac.select_batch_rows(&keep_idx)?,
+                            Qwen3_5LayerCache::FullAttention(kv) => {
+                                kv.select_batch_rows(&keep_idx)?;
+                            }
+                        }
+                    }
+                    cache.next_positions = new_next_positions;
+                    if let Some(v) = cache.valid.take()
+                        && new_active_orig.iter().any(|&o| row_has_padding[o])
+                    {
+                        cache.valid = Some(v.take(&keep_idx, 0)?);
+                    }
+                    // Materialize compacted cache buffers outside decode CUDA
+                    // Graph capture so the next T=1 step immediately enters
+                    // in-place GDN reuse with a clean compacted `cache[1]`.
+                    {
+                        let _compact_graphs_guard =
+                            crate::accelerator::CudaGraphsGuard::disable_for_prefill();
+                        if let Some(ref v) = cache.valid {
+                            cache.eval_with_arrays(&[v])?;
+                        } else {
+                            cache.eval_caches_only()?;
+                        }
+                    }
+                    active_orig = new_active_orig;
+                }
+
+                // Arm in-place GDN state reuse (`state_dst == state_in`) on the
+                // evaluated, exclusively-owned decode cache before the T=1 step.
+                arm_gdn_inplace_state(&mut cache.layers)?;
+
+                let b_next = active_orig.len();
+                let feed_ids: Vec<u32> = active_orig
+                    .iter()
+                    .map(|&orig| {
+                        if done[orig] {
+                            pad_id
+                        } else {
+                            tokens[orig].last().copied().unwrap_or(pad_id)
+                        }
+                    })
+                    .collect();
+                let feed_arr = MxArray::from_uint32(&feed_ids, &[b_next as i64, 1])?;
+                let feed_embeds = self.inner.embedding.forward(&feed_arr)?;
+
+                // Build [3, B_cur, 1] rotary position_ids from cache.next_positions.
+                let pos_1d = MxArray::from_int32(&cache.next_positions, &[1, b_next as i64, 1])?;
+                let pos_3d = MxArray::tile(&pos_1d, &[3, 1, 1])?;
+
+                if b_next > CUDA_GRAPHS_MAX_TOKENS {
+                    prefill_graphs_guard =
+                        Some(crate::accelerator::CudaGraphsGuard::disable_for_prefill());
+                }
+                let residual = self.forward_segment_pending(
+                    feed_embeds,
+                    &pos_3d,
+                    None,
+                    Some(&mut cache),
+                    cancelled,
+                )?;
+                for p in &mut cache.next_positions {
+                    *p += 1;
+                }
+                let (next_logits, _) = self.build_step_logits_from_residual(&residual, true)?;
+                cur_logits = next_logits;
+                // Submit next decode step + lm_head + caches asynchronously
+                // onto CUDA's default stream so GPU execution overlaps with
+                // next iteration's CPU grammar bitmask generation.
+                cuda_async_kick_decode(&cur_logits, &cache);
+                if let Some(start) = t_step {
+                    self.timings.decode_step_ms += elapsed_ms(start);
+                    self.timings.decode_steps += 1;
+                    self.timings.decode_batch_steps += b_next as u64;
+                    self.timings.decode_active_steps += alive as u64;
                 }
             }
-
-            if done.iter().all(|&d| d) || step + 1 == max_new_tokens {
-                break;
+            disarm_gdn_inplace_state(&mut cache.layers)?;
+        } else {
+            cache.eval_with_hidden(&init_logits)?;
+            drop(cuda_graphs_guard);
+            if let Some(start) = prefill_start {
+                self.timings.chunk_prefill_ms += elapsed_ms(start);
             }
-            check_cancel_opt(cancelled)?;
+            let t_d2h = timing_now();
+            let mut scores = init_logits.to_float32()?.to_vec();
+            if let Some(start) = t_d2h {
+                self.timings.decode_d2h_ms += elapsed_ms(start);
+            }
 
-            let feed_ids: Vec<u32> = (0..size)
-                .map(|row| {
-                    if done[row] {
-                        pad_id
-                    } else {
-                        tokens[row].last().copied().unwrap_or(pad_id)
-                    }
+            let mut matchers = tasks
+                .iter()
+                .map(|t| {
+                    grammar_engine
+                        .compile(&t.grammar)
+                        .map_err(super::to_napi_err)
                 })
-                .collect();
-            let feed_arr = MxArray::from_uint32(&feed_ids, &[size as i64, 1])?;
-            let feed_embeds = self.inner.embedding.forward(&feed_arr)?;
+                .collect::<Result<Vec<_>>>()?;
 
-            // Build [3, B, 1] rotary position_ids from cache.next_positions.
-            let pos_1d = MxArray::from_int32(&cache.next_positions, &[1, size as i64, 1])?;
-            let pos_3d = MxArray::tile(&pos_1d, &[3, 1, 1])?;
+            for step in 0..max_new_tokens {
+                check_cancel_opt(cancelled)?;
 
-            h = self.forward_segment(feed_embeds, &pos_3d, None, Some(&mut cache), cancelled)?;
-            for p in &mut cache.next_positions {
-                *p += 1;
+                let active: Vec<bool> = (0..size).map(|row| !done[row] || step == 0).collect();
+                let t_grammar = timing_now();
+                let bitmasks = fill_batch_allowed_bitmasks(&mut matchers, &active)
+                    .map_err(super::to_napi_err)?;
+                let step_score_ids: &[u32] = if step == 0 { score_token_ids } else { &[] };
+
+                for row in 0..size {
+                    if !active[row] {
+                        continue;
+                    }
+                    let row_start = row * logits_vocab;
+                    let row_logits = &scores[row_start..row_start + grammar_vocab];
+                    let (choice, choice_lp, scored) =
+                        mask_and_score_row_bitmask(row_logits, &bitmasks[row], step_score_ids);
+
+                    if step == 0 {
+                        first_step_logprobs[row] = scored;
+                    }
+
+                    if done[row] {
+                        continue;
+                    }
+
+                    tokens[row].push(choice);
+                    token_logprobs[row].push((choice_lp, choice));
+
+                    let is_stop = stop_ids.contains(&choice);
+                    if is_stop {
+                        done[row] = true;
+                    }
+                    if !matchers[row].is_terminated() {
+                        let accepted = matchers[row]
+                            .accept_token(choice)
+                            .map_err(super::to_napi_err)?;
+                        if !accepted && !is_stop {
+                            return Err(inference_error(format!(
+                                "Generated token {choice} rejected by grammar for task {:?}",
+                                tasks[row].id
+                            )));
+                        }
+                    } else if is_stop {
+                        let _ = matchers[row].accept_token(choice);
+                    }
+                }
+                if let Some(start) = t_grammar {
+                    self.timings.grammar_cpu_ms += elapsed_ms(start);
+                }
+
+                if done.iter().all(|&d| d) || step + 1 == max_new_tokens {
+                    break;
+                }
+                check_cancel_opt(cancelled)?;
+
+                let t_step = timing_now();
+                let feed_ids: Vec<u32> = (0..size)
+                    .map(|row| {
+                        if done[row] {
+                            pad_id
+                        } else {
+                            tokens[row].last().copied().unwrap_or(pad_id)
+                        }
+                    })
+                    .collect();
+                let feed_arr = MxArray::from_uint32(&feed_ids, &[size as i64, 1])?;
+                let feed_embeds = self.inner.embedding.forward(&feed_arr)?;
+
+                // Build [3, B, 1] rotary position_ids from cache.next_positions.
+                let pos_1d = MxArray::from_int32(&cache.next_positions, &[1, size as i64, 1])?;
+                let pos_3d = MxArray::tile(&pos_1d, &[3, 1, 1])?;
+
+                let residual = self.forward_segment_pending(
+                    feed_embeds,
+                    &pos_3d,
+                    None,
+                    Some(&mut cache),
+                    cancelled,
+                )?;
+                for p in &mut cache.next_positions {
+                    *p += 1;
+                }
+                let (next_logits, _) = self.build_step_logits_from_residual(&residual, false)?;
+                cache.eval_with_hidden(&next_logits)?;
+                if let Some(start) = t_step {
+                    self.timings.decode_step_ms += elapsed_ms(start);
+                    self.timings.decode_steps += 1;
+                    self.timings.decode_batch_steps += size as u64;
+                    let alive = done.iter().filter(|&&d| !d).count() as u64;
+                    self.timings.decode_active_steps += alive;
+                }
+                let t_d2h = timing_now();
+                scores = next_logits.to_float32()?.to_vec();
+                if let Some(start) = t_d2h {
+                    self.timings.decode_d2h_ms += elapsed_ms(start);
+                }
             }
-            let (next_logits, _) = self.build_step_logits_f32(&h)?;
-            cache.eval_with_hidden(&next_logits)?;
-            scores = next_logits.to_float32()?.to_vec();
         }
 
         let mut out = Vec::with_capacity(size);
@@ -1281,15 +2223,10 @@ impl ClairicBackend for ClairicEngine<'_> {
         let mut tokens: Vec<u32> = Vec::new();
         let mut total_image_tokens = 0usize;
         for img in images {
-            let processed = processor
-                .process_rgb_image(img)
+            let (width, height) = img.dimensions();
+            let grid = processor
+                .plan_grid_thw(width, height)
                 .map_err(super::napi_to_clairic_err)?;
-            let grid = processed.image_grid_thw();
-            if grid.len() != 3 {
-                return Err(mlx_clairic::errors::inference_error(format!(
-                    "Expected 3-element image_grid_thw, got {grid:?}"
-                )));
-            }
             let merged = merged_image_token_count(grid[0], grid[1], grid[2], merge_size)
                 .map_err(super::napi_to_clairic_err)?;
             if let Some(vs) = vision_start_id {
@@ -1324,6 +2261,25 @@ impl ClairicBackend for ClairicEngine<'_> {
     fn clear_request_caches(&mut self) {
         ClairicEngine::clear_request_caches(self);
     }
+
+    fn phase_timing_enabled(&self) -> bool {
+        phase_timing_enabled()
+    }
+
+    fn set_request_timing_start(&mut self, start: Instant, parse_ms: f64) {
+        ClairicEngine::set_request_timing_start(self, start, parse_ms);
+    }
+
+    fn set_request_encode_ms(&mut self, encode_ms: f64) {
+        ClairicEngine::set_request_encode_ms(self, encode_ms);
+    }
+
+    fn finish_request_timing(&mut self) {
+        if let Some((request_start, parse_ms, encode_ms)) = self.take_request_timing_context() {
+            let total_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            self.report_phase_timings(parse_ms, encode_ms, total_ms);
+        }
+    }
 }
 
 /// Full dual-path Clairic request entry point running on `&mut Qwen35Inner`
@@ -1342,6 +2298,169 @@ pub(crate) fn extract_json_on_inner(
 // =============================================================================
 // Pure helpers
 // =============================================================================
+
+/// Run the fused CUDA constrained-selection kernel over `[B, logits_vocab]`
+/// logits (`bf16 | f16 | f32`), optional `[B, mask_words]` `uint32` grammar
+/// bitmask, and optional `[S]` `uint32` candidate token IDs to score.
+fn cuda_grammar_select(
+    logits: &MxArray,
+    bitmask: Option<&MxArray>,
+    score_ids: Option<&MxArray>,
+    grammar_vocab: usize,
+) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    let vocab_i32 = i32::try_from(grammar_vocab)
+        .map_err(|_| inference_error("grammar_vocab exceeds i32::MAX"))?;
+    let bm_ptr = bitmask.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    let score_ptr = score_ids.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    let mut out_choice = std::ptr::null_mut();
+    let mut out_choice_lp = std::ptr::null_mut();
+    let mut out_scored_lps = std::ptr::null_mut();
+    // SAFETY: `mlx_clairic_grammar_select_cuda` validates shapes/dtypes,
+    // catches C++ exceptions internally, and only populates output handles
+    // when returning `true`.
+    let ok = unsafe {
+        mlx_sys::mlx_clairic_grammar_select_cuda(
+            logits.as_raw_ptr(),
+            bm_ptr,
+            score_ptr,
+            vocab_i32,
+            &mut out_choice,
+            &mut out_choice_lp,
+            &mut out_scored_lps,
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let choice = MxArray::from_handle(out_choice, "clairic_grammar_select:choice")?;
+    let choice_lp = MxArray::from_handle(out_choice_lp, "clairic_grammar_select:choice_lp")?;
+    let scored_lps = if out_scored_lps.is_null() && score_ids.is_none() {
+        MxArray::zeros(&[0, 0], Some(DType::Float32))?
+    } else {
+        MxArray::from_handle(out_scored_lps, "clairic_grammar_select:scored_lps")?
+    };
+    Ok(Some((choice, choice_lp, scored_lps)))
+}
+
+/// Arm in-place GDN recurrent-state reuse (`state_dst == state_in` via
+/// `ArraysCache` slot 2) on exclusively-owned `decode_chunk` caches on CUDA.
+///
+/// SAFETY: Never call on shared/snapshotted caches (such as prefix snapshots or
+/// DFlash2 caches). `ClairicEngine::decode_chunk` owns its `cache` exclusively
+/// (prefix caches were tiled/copied via `broadcast_layer_caches`, and
+/// compaction allocates fresh buffers via `select_batch_rows`), and this helper
+/// additionally checks `Arc::strong_count == 1`, `mlx_array_is_available`,
+/// `Float32`, and `[B, Hv, 128, 128]` before aliasing slot 2 to slot 1.
+fn arm_gdn_inplace_state(layers: &mut [Qwen3_5LayerCache]) -> Result<()> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(());
+    }
+    for layer in layers {
+        let Qwen3_5LayerCache::Linear(ac) = layer else {
+            continue;
+        };
+        let Some(state_ref) = ac.get(1) else {
+            continue;
+        };
+        if ac
+            .get(2)
+            .is_some_and(|dst| Arc::ptr_eq(&dst.handle, &state_ref.handle))
+        {
+            continue;
+        }
+        let unique_owner = Arc::strong_count(&state_ref.handle) == 1;
+        let eligible = unique_owner
+            && unsafe { mlx_sys::mlx_array_is_available(state_ref.as_raw_ptr()) }
+            && state_ref.dtype()? == DType::Float32
+            && state_ref.ndim()? == 4
+            && state_ref.shape_at(2)? == 128
+            && state_ref.shape_at(3)? == 128;
+        if !eligible {
+            if ac.len() > 2 {
+                let mut disarmed = ArraysCache::new(2);
+                if let Some(conv) = ac.get(0).cloned() {
+                    disarmed.set(0, conv)?;
+                }
+                if let Some(state) = ac.get(1).cloned() {
+                    disarmed.set(1, state)?;
+                }
+                *ac = disarmed;
+            }
+            continue;
+        }
+        let state = state_ref.clone();
+        if ac.len() >= 3 {
+            ac.set(2, state)?;
+        } else {
+            let mut armed = ArraysCache::new(3);
+            if let Some(conv) = ac.get(0).cloned() {
+                armed.set(0, conv)?;
+            }
+            armed.set(1, state.clone())?;
+            armed.set(2, state)?;
+            *ac = armed;
+        }
+    }
+    Ok(())
+}
+
+/// Restore `ArraysCache` instances to their standard 2-slot layout, removing
+/// any slot-2 in-place GDN state aliases (before compaction or exiting
+/// `decode_chunk`).
+fn disarm_gdn_inplace_state(layers: &mut [Qwen3_5LayerCache]) -> Result<()> {
+    for layer in layers {
+        let Qwen3_5LayerCache::Linear(ac) = layer else {
+            continue;
+        };
+        if ac.len() <= 2 {
+            continue;
+        }
+        let mut disarmed = ArraysCache::new(2);
+        if let Some(conv) = ac.get(0).cloned() {
+            disarmed.set(0, conv)?;
+        }
+        if let Some(state) = ac.get(1).cloned() {
+            disarmed.set(1, state)?;
+        }
+        *ac = disarmed;
+    }
+    Ok(())
+}
+
+/// Submit unevaluated `logits` and `cache` layer arrays asynchronously onto
+/// CUDA's single default GPU stream so GPU execution overlaps with CPU grammar
+/// compilation and bitmask construction.
+///
+/// Single-stream safety: on CUDA `Stream::generation()` collapses to
+/// `default_stream(Device::gpu)` (zero cross-stream `AtomicEvent::wait`),
+/// matching `qwen4_exp::decoder::cuda_deferred::cuda_async_eval`.
+fn cuda_async_kick_decode(logits: &MxArray, cache: &BatchCacheState) {
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    let mut arrays: Vec<&MxArray> = Vec::with_capacity(1 + cache.layers.len() * 2);
+    arrays.push(logits);
+    for layer in &cache.layers {
+        layer.collect_arrays(&mut arrays);
+    }
+    let mut handles: Vec<*mut mlx_sys::mlx_array> = arrays
+        .iter()
+        .map(|a| a.as_raw_ptr())
+        .filter(|&ptr| !ptr.is_null() && !unsafe { mlx_sys::mlx_array_is_available(ptr) })
+        .collect();
+    if handles.is_empty() {
+        return;
+    }
+    // SAFETY: All pointers in `handles` are non-null, borrowed from live
+    // `MxArray`s for the duration of this call, and `mlx_async_eval` catches
+    // C++ exceptions internally.
+    unsafe {
+        mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
+    }
+}
 
 fn check_cancel_opt(cancelled: Option<&Arc<AtomicBool>>) -> Result<()> {
     if let Some(flag) = cancelled {
@@ -1381,12 +2500,22 @@ fn common_prefix_len(sequences: &[&[u32]]) -> usize {
 }
 
 fn batch_cost(sequences: &[&[u32]], has_media: bool, prefix_cache: bool, vision_end: u32) -> usize {
-    let shared = if has_media && prefix_cache && sequences.len() > 1 {
+    let shared = if prefix_cache && sequences.len() > 1 {
         let common = common_prefix_len(sequences);
-        sequences[0][..common]
-            .iter()
-            .rposition(|&tok| tok == vision_end)
-            .map_or(0, |idx| idx + 1)
+        if has_media {
+            sequences[0][..common]
+                .iter()
+                .rposition(|&tok| tok == vision_end)
+                .map_or(0, |idx| idx + 1)
+        } else {
+            let min_len = sequences.iter().map(|s| s.len()).min().unwrap_or(0);
+            let cut = common.min(min_len.saturating_sub(1));
+            if cut >= MIN_TEXT_PREFIX_TOKENS {
+                cut
+            } else {
+                0
+            }
+        }
     } else {
         0
     };
@@ -2124,6 +3253,200 @@ mod tests {
     }
 
     #[test]
+    fn batch_cost_discounts_shared_text_prefix() {
+        let shared: Vec<u32> = (0..80u32).map(|i| 20 + (i % 40)).collect();
+        let mut s1 = shared.clone();
+        s1.extend_from_slice(&[70, 71, 72]);
+        let mut s2 = shared;
+        s2.extend_from_slice(&[73, 74, 75, 76, 77]);
+        let seqs = [s1.as_slice(), s2.as_slice()];
+
+        // Shared 80-token text prefix (>= MIN_TEXT_PREFIX_TOKENS) is discounted
+        // when prefix caching is enabled: (85 - 80) * 2 = 10.
+        assert_eq!(batch_cost(&seqs, false, true, 7), 10);
+        // Disabled prefix caching keeps full padded token cost: 85 * 2 = 170.
+        assert_eq!(batch_cost(&seqs, false, false, 7), 170);
+
+        // Short common prefix (< MIN_TEXT_PREFIX_TOKENS) is not discounted.
+        let short_a = [10u32, 11, 12, 13, 14];
+        let short_b = [10u32, 11, 12, 15, 16, 17];
+        assert_eq!(
+            batch_cost(&[short_a.as_slice(), short_b.as_slice()], false, true, 7),
+            12
+        );
+    }
+
+    #[test]
+    fn ar_engine_shared_text_prefix_matches_uncached_and_reuses_waves() -> Result<()> {
+        let (mut inner, eos_id, _) = synthetic_clairic_inner();
+        let score_ids = vec![eos_id];
+
+        let shared: Vec<u32> = (0..72u32).map(|i| 20 + (i % 40)).collect();
+        let mk_seq = |suf: &[u32]| {
+            let mut v = shared.clone();
+            v.extend_from_slice(suf);
+            v
+        };
+
+        let wave1 = vec![
+            ArGenTask {
+                id: "w1-0".to_string(),
+                input_ids: mk_seq(&[70, 71, 72]),
+                media: None,
+                media_key: None,
+                grammar: GrammarSpec::JsonSchema(json!({ "type": "boolean" })),
+                max_new_tokens: 6,
+                stop_token_ids: vec![eos_id],
+            },
+            ArGenTask {
+                id: "w1-1".to_string(),
+                input_ids: mk_seq(&[73, 74, 75, 76, 77, 78]),
+                media: None,
+                media_key: None,
+                grammar: GrammarSpec::JsonSchema(json!({ "type": "number" })),
+                max_new_tokens: 6,
+                stop_token_ids: vec![eos_id],
+            },
+            ArGenTask {
+                id: "w1-2".to_string(),
+                input_ids: mk_seq(&[79, 80]),
+                media: None,
+                media_key: None,
+                grammar: GrammarSpec::JsonSchema(json!({ "type": "string" })),
+                max_new_tokens: 6,
+                stop_token_ids: vec![eos_id],
+            },
+        ];
+
+        // Wave 2 shares an extra 8-token header (cut = 80), where
+        // 72 * 4 = 288 >= 80 * 3 = 240, so it must reuse Wave 1's cached prefix.
+        let wave2 = vec![
+            ArGenTask {
+                id: "w2-0".to_string(),
+                input_ids: mk_seq(&[90, 91, 92, 93, 94, 95, 96, 97, 101, 102]),
+                media: None,
+                media_key: None,
+                grammar: GrammarSpec::JsonSchema(json!({ "type": "boolean" })),
+                max_new_tokens: 6,
+                stop_token_ids: vec![eos_id],
+            },
+            ArGenTask {
+                id: "w2-1".to_string(),
+                input_ids: mk_seq(&[90, 91, 92, 93, 94, 95, 96, 97, 103, 104, 105]),
+                media: None,
+                media_key: None,
+                grammar: GrammarSpec::JsonSchema(json!({ "type": "number" })),
+                max_new_tokens: 6,
+                stop_token_ids: vec![eos_id],
+            },
+        ];
+
+        // Wave 3 is a single B=1 recovery task sharing Wave 1's cached prefix.
+        let wave3 = vec![ArGenTask {
+            id: "w3-0".to_string(),
+            input_ids: mk_seq(&[110, 111, 112, 113]),
+            media: None,
+            media_key: None,
+            grammar: GrammarSpec::JsonSchema(json!({ "type": "boolean" })),
+            max_new_tokens: 6,
+            stop_token_ids: vec![eos_id],
+        }];
+
+        // An isolated B=1 text task on a fresh engine must not create a new entry.
+        {
+            let mut engine = ClairicEngine::new(
+                &mut inner,
+                EngineOptions {
+                    prefix_cache: true,
+                    ..EngineOptions::default()
+                },
+            );
+            let _ = engine.generate_batch(&wave3, &score_ids, None)?;
+            assert!(engine.prefix_caches.is_empty());
+            assert!(engine.text_prefix_tokens.is_empty());
+        }
+
+        let (c1, c2, c3) = {
+            let mut engine = ClairicEngine::new(
+                &mut inner,
+                EngineOptions {
+                    prefix_cache: true,
+                    ..EngineOptions::default()
+                },
+            );
+            let o1 = engine.generate_batch(&wave1, &score_ids, None)?;
+            assert_eq!(engine.prefix_caches.len(), 1);
+            assert_eq!(engine.text_prefix_tokens.len(), 1);
+            assert_eq!(engine.timings.prefix_misses, 1);
+            assert_eq!(engine.timings.prefix_hits, 0);
+
+            let o2 = engine.generate_batch(&wave2, &score_ids, None)?;
+            assert_eq!(engine.prefix_caches.len(), 1);
+            assert_eq!(engine.text_prefix_tokens.len(), 1);
+            assert_eq!(engine.timings.prefix_misses, 1);
+            assert_eq!(engine.timings.prefix_hits, 1);
+
+            let o3 = engine.generate_batch(&wave3, &score_ids, None)?;
+            assert_eq!(engine.prefix_caches.len(), 1);
+            assert_eq!(engine.timings.prefix_misses, 1);
+            assert_eq!(engine.timings.prefix_hits, 2);
+
+            engine.clear_request_caches();
+            assert!(engine.prefix_caches.is_empty());
+            assert!(engine.text_prefix_tokens.is_empty());
+            (o1, o2, o3)
+        };
+
+        let (u1, u2, u3) = {
+            let mut engine = ClairicEngine::new(
+                &mut inner,
+                EngineOptions {
+                    prefix_cache: false,
+                    ..EngineOptions::default()
+                },
+            );
+            let o1 = engine.generate_batch(&wave1, &score_ids, None)?;
+            let o2 = engine.generate_batch(&wave2, &score_ids, None)?;
+            let o3 = engine.generate_batch(&wave3, &score_ids, None)?;
+            assert!(engine.prefix_caches.is_empty());
+            assert!(engine.text_prefix_tokens.is_empty());
+            (o1, o2, o3)
+        };
+
+        for (label, cached, uncached) in [
+            ("wave1", &c1, &u1),
+            ("wave2", &c2, &u2),
+            ("wave3", &c3, &u3),
+        ] {
+            assert_eq!(
+                cached.len(),
+                uncached.len(),
+                "{label} batch length mismatch"
+            );
+            for (i, (c, u)) in cached.iter().zip(uncached.iter()).enumerate() {
+                assert_eq!(
+                    c.output_ids, u.output_ids,
+                    "{label} row {i} cached vs uncached tokens diverged"
+                );
+                assert_eq!(c.text, u.text);
+                assert_eq!(c.finish_reason, u.finish_reason);
+                for ((clp, ctok), (ulp, utok)) in c
+                    .output_token_logprobs
+                    .iter()
+                    .zip(u.output_token_logprobs.iter())
+                {
+                    assert_eq!(ctok, utok);
+                    assert!(
+                        (clp - ulp).abs() < 5e-3,
+                        "{label} row {i} logprob diff cached={clp} vs uncached={ulp}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ar_engine_read_typed_end_to_end() {
         let (mut inner, _, _) = synthetic_clairic_inner();
         let tok = inner.tokenizer.as_ref().unwrap().inner().clone();
@@ -2191,5 +3514,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn default_segment_tokens_respects_backend_and_memory() {
+        let seg = EngineOptions::default().segment_tokens;
+        if crate::accelerator::cuda_ops_available() {
+            let caps = crate::accelerator::caps();
+            let expected = if caps.is_unified_memory
+                || caps.total_device_bytes >= 24u64 * 1024 * 1024 * 1024
+            {
+                4096
+            } else {
+                2048
+            };
+            assert_eq!(seg, expected);
+        } else {
+            assert_eq!(seg, SEGMENT_TOKENS);
+        }
+        assert_eq!(SEGMENT_TOKENS, 1024);
+    }
+
+    #[test]
+    fn gdn_inplace_state_arm_and_disarm_invariants() -> Result<()> {
+        let conv = MxArray::zeros(&[2, 3, 64], Some(DType::BFloat16))?;
+        let state = MxArray::zeros(&[2, 2, 128, 128], Some(DType::Float32))?;
+        MxArray::eval_arrays(&[&conv, &state])?;
+
+        let mut ac = ArraysCache::new(2);
+        ac.set(0, conv)?;
+        ac.set(1, state)?;
+        let mut layers = vec![
+            Qwen3_5LayerCache::Linear(ac),
+            Qwen3_5LayerCache::new_full_attention(),
+        ];
+
+        arm_gdn_inplace_state(&mut layers)?;
+        let Qwen3_5LayerCache::Linear(ac) = &layers[0] else {
+            unreachable!()
+        };
+        if crate::accelerator::cuda_ops_available() {
+            assert_eq!(ac.len(), 3);
+            let s1 = ac
+                .get(1)
+                .ok_or_else(|| inference_error("missing slot 1 after arm"))?;
+            let s2 = ac
+                .get(2)
+                .ok_or_else(|| inference_error("missing slot 2 after arm"))?;
+            assert!(Arc::ptr_eq(&s1.handle, &s2.handle));
+
+            // Idempotent re-arm keeps the same 3-slot alias.
+            arm_gdn_inplace_state(&mut layers)?;
+            let Qwen3_5LayerCache::Linear(ac) = &layers[0] else {
+                unreachable!()
+            };
+            assert_eq!(ac.len(), 3);
+
+            // Disarm restores the 2-slot layout without losing slots 0/1.
+            disarm_gdn_inplace_state(&mut layers)?;
+            let Qwen3_5LayerCache::Linear(ac) = &layers[0] else {
+                unreachable!()
+            };
+            assert_eq!(ac.len(), 2);
+            assert!(ac.get(0).is_some());
+            assert!(ac.get(1).is_some());
+            assert!(ac.get(2).is_none());
+
+            // External alias (`strong_count > 1`) prevents arming in-place reuse.
+            let external_alias = ac.get(1).cloned();
+            arm_gdn_inplace_state(&mut layers)?;
+            let Qwen3_5LayerCache::Linear(ac) = &layers[0] else {
+                unreachable!()
+            };
+            assert_eq!(ac.len(), 2);
+            assert!(ac.get(2).is_none());
+            drop(external_alias);
+        } else {
+            assert_eq!(ac.len(), 2);
+            assert!(ac.get(2).is_none());
+        }
+        Ok(())
     }
 }

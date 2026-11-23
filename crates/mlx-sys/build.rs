@@ -1795,10 +1795,15 @@ fn main() -> io::Result<()> {
         bridge
             .define("NOMINMAX", None)
             .define("WIN32_LEAN_AND_MEAN", None)
+            .define(
+                "_SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING",
+                None,
+            )
             .flag("/bigobj")
             .flag("/utf-8")
             .flag("/EHsc")
-            .flag("/Zc:__cplusplus");
+            .flag("/Zc:__cplusplus")
+            .flag("/wd4244");
     }
 
     // `__APPLE__` alone does not mean this build contains MLX's Metal backend:

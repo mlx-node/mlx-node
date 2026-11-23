@@ -10,20 +10,20 @@ R"cuda(
 // When FUSE_GATED_NORM=true, each token's BF16 recurrence output y_bf is staged
 // in-place into vs[tt][row] (0 syncs inside the recurrence loop), then all 8
 // warps process the chunk's 32 tokens in parallel using pure warp-shuffle
-// RMSNorm + strided-z gating and coalesced writes to [1, T, hv * 128].
+// RMSNorm + strided-z gating and coalesced writes to [B, T, hv * 128].
 //
-// Shapes (row-contiguous except z which may be strided along T with stride(-1)==1,
-// B=1, DK=DV=128):
-//   q, k:        [1, T, hk, 128] bf16
-//   v:           [1, T, hv, 128] bf16
-//   g:           [1, T, hv]      f32
-//   beta:        [1, T, hv]      bf16 or f32 (template BETA_BF16)
-//   state_in:    [1, hv, 128, 128] f32
-//   z:           [1, T, hv * 128] bf16 (used when FUSE_GATED_NORM=true)
+// Shapes (row-contiguous except z which may be strided along B/T with stride(-1)==1,
+// B>=1, DK=DV=128):
+//   q, k:        [B, T, hk, 128] bf16
+//   v:           [B, T, hv, 128] bf16
+//   g:           [B, T, hv]      f32
+//   beta:        [B, T, hv]      bf16 or f32 (template BETA_BF16)
+//   state_in:    [B, hv, 128, 128] f32
+//   z:           [B, T, hv * 128] bf16 (used when FUSE_GATED_NORM=true)
 //   norm_weight: [128] bf16 or f32 (w_is_f32 flag, used when FUSE_GATED_NORM=true)
-//   y_out:       [1, T, hv * 128] (or [1, T, hv, 128]) bf16
-//   state_out:   [1, hv, 128, 128] f32
-// Grid: dim3(hv, 1, 1), Block: dim3(256, 1, 1) -> 128 dv rows/block, 2 threads/row.
+//   y_out:       [B, T, hv * 128] (or [B, T, hv, 128]) bf16
+//   state_out:   [B, hv, 128, 128] f32
+// Grid: dim3(hv, B, 1), Block: dim3(256, 1, 1) -> 128 dv rows/block, 2 threads/row.
 namespace gdn_pf {
 
 constexpr int DK = 128;
@@ -147,7 +147,7 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
     nv_bfloat16* __restrict__ y_out,
     float* state_out,
     int W, int hk, int hv, int tiled_heads,
-    long long z_stride_t, float eps, int w_is_f32 = 0) {
+    long long z_stride_b, long long z_stride_t, float eps, int w_is_f32 = 0) {
   using namespace gdn_pf;
   // Static SMEM: 16384 + 16384 + 128 + 128 + 8192 + 512 = 41728 bytes (<= 48 KB).
   __shared__ float4 ks[STEPS][DK / 4];
@@ -158,9 +158,24 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
   [[maybe_unused]] __shared__ __align__(16) float ws[DV];
 
   const int head = blockIdx.x;
+  const int b = blockIdx.y;
   const int row = threadIdx.x >> 1;
   const int half = threadIdx.x & 1;
   const int key_head = tiled_heads ? (head % hk) : (head / (hv / hk));
+
+  const size_t qk_b_off = static_cast<size_t>(b) * W * hk * DK;
+  const size_t v_b_off = static_cast<size_t>(b) * W * hv * DV;
+  const size_t gb_b_off = static_cast<size_t>(b) * W * hv;
+  q += qk_b_off;
+  k += qk_b_off;
+  v += v_b_off;
+  g += gb_b_off;
+  if constexpr (BETA_BF16) {
+    beta = reinterpret_cast<const nv_bfloat16*>(beta) + gb_b_off;
+  } else {
+    beta = reinterpret_cast<const float*>(beta) + gb_b_off;
+  }
+  y_out += v_b_off;
 
   if constexpr (FUSE_GATED_NORM) {
     if (threadIdx.x < DV) {
@@ -171,7 +186,7 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
   }
 
   float s[64];
-  const float* s0 = state_in + ((size_t)head * DV + row) * DK;
+  const float* s0 = state_in + (((size_t)b * hv + head) * DV + row) * DK;
 #pragma unroll
   for (int j = 0; j < 16; ++j) {
     const float4 t = *reinterpret_cast<const float4*>(s0 + 8 * j + 4 * half);
@@ -243,8 +258,9 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
       __syncthreads();
       const int warp = threadIdx.x >> 5;
       const int lane = threadIdx.x & 31;
+      const nv_bfloat16* const z_b = z + static_cast<long long>(b) * z_stride_b;
       const bool z_vec4 =
-          (((reinterpret_cast<unsigned long long>(z) |
+          (((reinterpret_cast<unsigned long long>(z_b) |
              (unsigned long long)(z_stride_t * 2)) & 7ull) == 0);
       // Issue all 4 tokens' z loads for this warp up front (4x MLP) while
       // keeping ws[4*lane..4*lane+3] in registers.
@@ -256,12 +272,12 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
           const long long z_row =
               (long long)(t0 + tt) * z_stride_t + (long long)head * DV;
           if (z_vec4) {
-            zv[m] = reinterpret_cast<const uint2*>(z + z_row)[lane];
+            zv[m] = reinterpret_cast<const uint2*>(z_b + z_row)[lane];
           } else {
             nv_bfloat16 tmp[4];
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-              tmp[k] = z[z_row + 4 * lane + k];
+              tmp[k] = z_b[z_row + 4 * lane + k];
             }
             zv[m] = *reinterpret_cast<const uint2*>(tmp);
           }
@@ -295,7 +311,7 @@ __global__ __launch_bounds__(256) void mlx_gdn_prefill_chain_cuda_kernel(
     }
   }
 
-  float* s1 = state_out + ((size_t)head * DV + row) * DK;
+  float* s1 = state_out + (((size_t)b * hv + head) * DV + row) * DK;
 #pragma unroll
   for (int j = 0; j < 16; ++j) {
     *reinterpret_cast<float4*>(s1 + 8 * j + 4 * half) =

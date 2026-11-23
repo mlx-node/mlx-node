@@ -5,6 +5,7 @@ pub(crate) use crate::transformer::arrays_cache::forward_rows_independently;
 mod tests {
     use super::*;
     use crate::array::MxArray;
+    use napi::bindgen_prelude::{Error, Result};
 
     #[test]
     fn kv_cache_and_arrays_cache_broadcast_batch() {
@@ -236,5 +237,41 @@ mod tests {
         // Original B=1 prefix caches remain unmutated
         assert_eq!(kv_prefix.get_offset(), 5);
         assert_eq!(gdn_prefix.get(0).unwrap().shape_at(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn select_batch_rows_compacts_populated_slots_and_preserves_none() -> Result<()> {
+        let mut cache = ArraysCache::new(3);
+        let conv = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2])?;
+        let rec = MxArray::from_float32(&[10.0, 20.0, 30.0], &[3, 1])?;
+        cache.set(0, conv)?;
+        // Leave slot 1 as None
+        cache.set(2, rec)?;
+
+        // Invalid index shapes fail without mutating the cache.
+        let empty_idx = MxArray::from_int32(&[], &[0])?;
+        assert!(cache.select_batch_rows(&empty_idx).is_err());
+        let rank2_idx = MxArray::from_int32(&[0, 2], &[1, 2])?;
+        assert!(cache.select_batch_rows(&rank2_idx).is_err());
+        let before_slot0 = cache
+            .get(0)
+            .ok_or_else(|| Error::from_reason("slot 0 missing after failed select"))?;
+        assert_eq!(before_slot0.shape()?.as_ref(), [3, 2]);
+
+        let idx = MxArray::from_int32(&[2, 0], &[2])?;
+        cache.select_batch_rows(&idx)?;
+
+        let slot0 = cache
+            .get(0)
+            .ok_or_else(|| Error::from_reason("slot 0 missing after select"))?;
+        assert_eq!(slot0.shape()?.as_ref(), [2, 2]);
+        assert_eq!(slot0.to_float32()?.as_ref(), [5.0, 6.0, 1.0, 2.0]);
+        assert!(cache.get(1).is_none());
+        let slot2 = cache
+            .get(2)
+            .ok_or_else(|| Error::from_reason("slot 2 missing after select"))?;
+        assert_eq!(slot2.shape()?.as_ref(), [2, 1]);
+        assert_eq!(slot2.to_float32()?.as_ref(), [30.0, 10.0]);
+        Ok(())
     }
 }

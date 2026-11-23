@@ -40,16 +40,92 @@ __device__ __forceinline__ float fused_warp_sum(float v) {
   return v;
 }
 
-// Fused residual-add + RMSNorm:
-//   h = T(float(x) + float(res))
-//   normed = T(float(w) * float(T(float(h) * rsqrtf(mean_sq + eps))))
-// Matches MLX CUDA rms_norm.cu per-op rounding.
-template <typename T, int BLOCK_SIZE>
+// Fused residual-add + RMSNorm (and standalone RMSNorm when HAS_RES == false):
+//   HAS_RES == true:  h = T(float(x) + float(res)) -> written to h_out
+//   HAS_RES == false: h = x (res and h_out are nullptr)
+//   PRECISE_F32 == false:
+//     normed = T(float(w_t) * float(T(float(h) * rsqrtf(mean_sq + eps))))
+//     Matches MLX CUDA rms_norm.cu per-op rounding.
+//   PRECISE_F32 == true:
+//     w is float[axis]; normed = T((float(h) * rsqrtf(mean_sq + eps)) * w_f32)
+//     No intermediate BF16/F16 rounding; bit-identical to
+//     rms_norm(h.astype(f32), w_f32, eps).astype(T).
+template <typename T, bool HAS_RES>
+__device__ __forceinline__ uint4 fused_add_load_vec8(
+    const uint4* __restrict__ xv,
+    const uint4* __restrict__ rv,
+    uint4* __restrict__ hv,
+    int idx,
+    float& sq) {
+  const uint4 xa = xv[idx];
+  uint4 ha;
+  if constexpr (HAS_RES) {
+    const uint4 ra = rv[idx];
+    const T* x_e = reinterpret_cast<const T*>(&xa);
+    const T* r_e = reinterpret_cast<const T*>(&ra);
+    T* h_e = reinterpret_cast<T*>(&ha);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const T hv_j =
+          fused_from_f32<T>(fused_to_f32<T>(x_e[j]) + fused_to_f32<T>(r_e[j]));
+      h_e[j] = hv_j;
+      const float hf = fused_to_f32<T>(hv_j);
+      sq += hf * hf;
+    }
+    hv[idx] = ha;
+  } else {
+    ha = xa;
+    const T* h_e = reinterpret_cast<const T*>(&ha);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float hf = fused_to_f32<T>(h_e[j]);
+      sq += hf * hf;
+    }
+  }
+  return ha;
+}
+
+template <typename T, bool PRECISE_F32>
+__device__ __forceinline__ void fused_norm_store_vec8(
+    uint4 ha,
+    const void* __restrict__ w_raw,
+    uint4* __restrict__ nv,
+    int idx,
+    float inv) {
+  uint4 na;
+  const T* h_e = reinterpret_cast<const T*>(&ha);
+  T* n_e = reinterpret_cast<T*>(&na);
+  if constexpr (PRECISE_F32) {
+    const float4* wv4 = reinterpret_cast<const float4*>(w_raw);
+    const float4 w0 = wv4[idx * 2];
+    const float4 w1 = wv4[idx * 2 + 1];
+    n_e[0] = fused_from_f32<T>((fused_to_f32<T>(h_e[0]) * inv) * w0.x);
+    n_e[1] = fused_from_f32<T>((fused_to_f32<T>(h_e[1]) * inv) * w0.y);
+    n_e[2] = fused_from_f32<T>((fused_to_f32<T>(h_e[2]) * inv) * w0.z);
+    n_e[3] = fused_from_f32<T>((fused_to_f32<T>(h_e[3]) * inv) * w0.w);
+    n_e[4] = fused_from_f32<T>((fused_to_f32<T>(h_e[4]) * inv) * w1.x);
+    n_e[5] = fused_from_f32<T>((fused_to_f32<T>(h_e[5]) * inv) * w1.y);
+    n_e[6] = fused_from_f32<T>((fused_to_f32<T>(h_e[6]) * inv) * w1.z);
+    n_e[7] = fused_from_f32<T>((fused_to_f32<T>(h_e[7]) * inv) * w1.w);
+  } else {
+    const uint4 wa = reinterpret_cast<const uint4*>(w_raw)[idx];
+    const T* w_e = reinterpret_cast<const T*>(&wa);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const T scaled = fused_from_f32<T>(fused_to_f32<T>(h_e[j]) * inv);
+      n_e[j] = fused_from_f32<T>(fused_to_f32<T>(w_e[j]) * fused_to_f32<T>(scaled));
+    }
+  }
+  nv[idx] = na;
+}
+
+template <typename T, int BLOCK_SIZE, bool PRECISE_F32, bool HAS_RES>
 __global__ __launch_bounds__(BLOCK_SIZE) void mlx_fused_add_rmsnorm_cuda_kernel(
     const T* __restrict__ x,
     const T* __restrict__ res,
-    const T* __restrict__ w,
+    const void* __restrict__ w_raw,
     const float* __restrict__ eps_ptr,
+    float eps_val,
     T* __restrict__ h_out,
     T* __restrict__ normed_out,
     int rows, int axis) {
@@ -60,155 +136,99 @@ __global__ __launch_bounds__(BLOCK_SIZE) void mlx_fused_add_rmsnorm_cuda_kernel(
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const size_t base = (size_t)row * axis;
+  const size_t base = (size_t)row * (size_t)axis;
   const T* xr = x + base;
-  const T* rr = res + base;
-  T* hr = h_out + base;
+  const T* rr = HAS_RES ? (res + base) : nullptr;
+  T* hr = HAS_RES ? (h_out + base) : nullptr;
   T* nr = normed_out + base;
-
-  float sq = 0.0f;
-  const bool vec8 =
-      (sizeof(T) == 2) && ((axis & 7) == 0) &&
-      (((reinterpret_cast<unsigned long long>(xr) |
-         reinterpret_cast<unsigned long long>(rr) |
-         reinterpret_cast<unsigned long long>(w) |
-         reinterpret_cast<unsigned long long>(hr) |
-         reinterpret_cast<unsigned long long>(nr)) & 15ull) == 0);
-
-  if (vec8) {
-    const int nvec = axis >> 3;
-    const uint4* xv = reinterpret_cast<const uint4*>(xr);
-    const uint4* rv = reinterpret_cast<const uint4*>(rr);
-    uint4* hv = reinterpret_cast<uint4*>(hr);
-    uint4 h0, h1;
-    const bool use_reg2 = (nvec <= 2 * BLOCK_SIZE);
-    if (use_reg2) {
-      if (tid < nvec) {
-        const uint4 xa = xv[tid];
-        const uint4 ra = rv[tid];
-        const T* x_e = reinterpret_cast<const T*>(&xa);
-        const T* r_e = reinterpret_cast<const T*>(&ra);
-        T* h_e = reinterpret_cast<T*>(&h0);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T hv_j = fused_from_f32<T>(fused_to_f32<T>(x_e[j]) + fused_to_f32<T>(r_e[j]));
-          h_e[j] = hv_j;
-          const float hf = fused_to_f32<T>(hv_j);
-          sq += hf * hf;
-        }
-        hv[tid] = h0;
-      }
-      if (tid + BLOCK_SIZE < nvec) {
-        const int i1 = tid + BLOCK_SIZE;
-        const uint4 xa = xv[i1];
-        const uint4 ra = rv[i1];
-        const T* x_e = reinterpret_cast<const T*>(&xa);
-        const T* r_e = reinterpret_cast<const T*>(&ra);
-        T* h_e = reinterpret_cast<T*>(&h1);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T hv_j = fused_from_f32<T>(fused_to_f32<T>(x_e[j]) + fused_to_f32<T>(r_e[j]));
-          h_e[j] = hv_j;
-          const float hf = fused_to_f32<T>(hv_j);
-          sq += hf * hf;
-        }
-        hv[i1] = h1;
-      }
-    } else {
-      for (int i = tid; i < nvec; i += BLOCK_SIZE) {
-        const uint4 xa = xv[i];
-        const uint4 ra = rv[i];
-        uint4 ha;
-        const T* x_e = reinterpret_cast<const T*>(&xa);
-        const T* r_e = reinterpret_cast<const T*>(&ra);
-        T* h_e = reinterpret_cast<T*>(&ha);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T hv_j = fused_from_f32<T>(fused_to_f32<T>(x_e[j]) + fused_to_f32<T>(r_e[j]));
-          h_e[j] = hv_j;
-          const float hf = fused_to_f32<T>(hv_j);
-          sq += hf * hf;
-        }
-        hv[i] = ha;
-      }
-    }
-
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
-    __shared__ float smem[NUM_WARPS];
-    sq = fused_warp_sum(sq);
-    if (lane == 0) {
-      smem[warp] = sq;
-    }
-    __syncthreads();
-    float total = 0.0f;
-    if (warp == 0) {
-      total = lane < NUM_WARPS ? smem[lane] : 0.0f;
-      total = fused_warp_sum(total);
-      if (lane == 0) {
-        smem[0] = rsqrtf(total / static_cast<float>(axis) + eps_ptr[0]);
-      }
-    }
-    __syncthreads();
-    const float inv = smem[0];
-
-    const uint4* wv = reinterpret_cast<const uint4*>(w);
-    uint4* nv = reinterpret_cast<uint4*>(nr);
-    if (use_reg2) {
-      if (tid < nvec) {
-        const uint4 wa = wv[tid];
-        uint4 na;
-        const T* h_e = reinterpret_cast<const T*>(&h0);
-        const T* w_e = reinterpret_cast<const T*>(&wa);
-        T* n_e = reinterpret_cast<T*>(&na);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T scaled = fused_from_f32<T>(fused_to_f32<T>(h_e[j]) * inv);
-          n_e[j] = fused_from_f32<T>(fused_to_f32<T>(w_e[j]) * fused_to_f32<T>(scaled));
-        }
-        nv[tid] = na;
-      }
-      if (tid + BLOCK_SIZE < nvec) {
-        const int i1 = tid + BLOCK_SIZE;
-        const uint4 wa = wv[i1];
-        uint4 na;
-        const T* h_e = reinterpret_cast<const T*>(&h1);
-        const T* w_e = reinterpret_cast<const T*>(&wa);
-        T* n_e = reinterpret_cast<T*>(&na);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T scaled = fused_from_f32<T>(fused_to_f32<T>(h_e[j]) * inv);
-          n_e[j] = fused_from_f32<T>(fused_to_f32<T>(w_e[j]) * fused_to_f32<T>(scaled));
-        }
-        nv[i1] = na;
-      }
-    } else {
-      for (int i = tid; i < nvec; i += BLOCK_SIZE) {
-        const uint4 ha = hv[i];
-        const uint4 wa = wv[i];
-        uint4 na;
-        const T* h_e = reinterpret_cast<const T*>(&ha);
-        const T* w_e = reinterpret_cast<const T*>(&wa);
-        T* n_e = reinterpret_cast<T*>(&na);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const T scaled = fused_from_f32<T>(fused_to_f32<T>(h_e[j]) * inv);
-          n_e[j] = fused_from_f32<T>(fused_to_f32<T>(w_e[j]) * fused_to_f32<T>(scaled));
-        }
-        nv[i] = na;
-      }
-    }
-    return;
-  }
-
-  for (int i = tid; i < axis; i += BLOCK_SIZE) {
-    const T hv_i = fused_from_f32<T>(fused_to_f32<T>(xr[i]) + fused_to_f32<T>(rr[i]));
-    hr[i] = hv_i;
-    const float hf = fused_to_f32<T>(hv_i);
-    sq += hf * hf;
-  }
 
   constexpr int NUM_WARPS = BLOCK_SIZE / 32;
   __shared__ float smem[NUM_WARPS];
+  float sq = 0.0f;
+
+  if constexpr (sizeof(T) == 2) {
+    const bool vec8 =
+        ((axis & 7) == 0) &&
+        (((reinterpret_cast<unsigned long long>(xr) |
+           (HAS_RES ? reinterpret_cast<unsigned long long>(rr) : 0ull) |
+           reinterpret_cast<unsigned long long>(w_raw) |
+           (HAS_RES ? reinterpret_cast<unsigned long long>(hr) : 0ull) |
+           reinterpret_cast<unsigned long long>(nr)) & 15ull) == 0);
+
+    if (vec8) {
+      const int nvec = axis >> 3;
+      const uint4* xv = reinterpret_cast<const uint4*>(xr);
+      const uint4* rv = HAS_RES ? reinterpret_cast<const uint4*>(rr) : nullptr;
+      uint4* hv = HAS_RES ? reinterpret_cast<uint4*>(hr) : nullptr;
+      uint4 h0, h1;
+      const bool use_reg2 = (nvec <= 2 * BLOCK_SIZE);
+      if (use_reg2) {
+        if (tid < nvec) {
+          h0 = fused_add_load_vec8<T, HAS_RES>(xv, rv, hv, tid, sq);
+        }
+        if (tid + BLOCK_SIZE < nvec) {
+          h1 = fused_add_load_vec8<T, HAS_RES>(xv, rv, hv, tid + BLOCK_SIZE, sq);
+        }
+      } else {
+        for (int i = tid; i < nvec; i += BLOCK_SIZE) {
+          (void)fused_add_load_vec8<T, HAS_RES>(xv, rv, hv, i, sq);
+        }
+      }
+
+      sq = fused_warp_sum(sq);
+      if (lane == 0) {
+        smem[warp] = sq;
+      }
+      __syncthreads();
+      float total = 0.0f;
+      if (warp == 0) {
+        total = lane < NUM_WARPS ? smem[lane] : 0.0f;
+        total = fused_warp_sum(total);
+        if (lane == 0) {
+          const float eps = eps_ptr ? eps_ptr[0] : eps_val;
+          smem[0] = rsqrtf(total / static_cast<float>(axis) + eps);
+        }
+      }
+      __syncthreads();
+      const float inv = smem[0];
+
+      uint4* nv = reinterpret_cast<uint4*>(nr);
+      if (use_reg2) {
+        if (tid < nvec) {
+          fused_norm_store_vec8<T, PRECISE_F32>(h0, w_raw, nv, tid, inv);
+        }
+        if (tid + BLOCK_SIZE < nvec) {
+          fused_norm_store_vec8<T, PRECISE_F32>(
+              h1, w_raw, nv, tid + BLOCK_SIZE, inv);
+        }
+      } else {
+        for (int i = tid; i < nvec; i += BLOCK_SIZE) {
+          uint4 ha;
+          if constexpr (HAS_RES) {
+            ha = hv[i];
+          } else {
+            ha = xv[i];
+          }
+          fused_norm_store_vec8<T, PRECISE_F32>(ha, w_raw, nv, i, inv);
+        }
+      }
+      return;
+    }
+  }
+
+  for (int i = tid; i < axis; i += BLOCK_SIZE) {
+    float hf;
+    if constexpr (HAS_RES) {
+      const T hv_i =
+          fused_from_f32<T>(fused_to_f32<T>(xr[i]) + fused_to_f32<T>(rr[i]));
+      hr[i] = hv_i;
+      hf = fused_to_f32<T>(hv_i);
+    } else {
+      hf = fused_to_f32<T>(xr[i]);
+    }
+    sq += hf * hf;
+  }
+
   sq = fused_warp_sum(sq);
   if (lane == 0) {
     smem[warp] = sq;
@@ -219,17 +239,32 @@ __global__ __launch_bounds__(BLOCK_SIZE) void mlx_fused_add_rmsnorm_cuda_kernel(
     total = lane < NUM_WARPS ? smem[lane] : 0.0f;
     total = fused_warp_sum(total);
     if (lane == 0) {
-      smem[0] = rsqrtf(total / static_cast<float>(axis) + eps_ptr[0]);
+      const float eps = eps_ptr ? eps_ptr[0] : eps_val;
+      smem[0] = rsqrtf(total / static_cast<float>(axis) + eps);
     }
   }
   __syncthreads();
   const float inv = smem[0];
 
   for (int i = tid; i < axis; i += BLOCK_SIZE) {
-    const T scaled = fused_from_f32<T>(fused_to_f32<T>(hr[i]) * inv);
-    nr[i] = fused_from_f32<T>(fused_to_f32<T>(w[i]) * fused_to_f32<T>(scaled));
+    T hv_i;
+    if constexpr (HAS_RES) {
+      hv_i = hr[i];
+    } else {
+      hv_i = xr[i];
+    }
+    if constexpr (PRECISE_F32) {
+      const float wf = reinterpret_cast<const float*>(w_raw)[i];
+      nr[i] = fused_from_f32<T>((fused_to_f32<T>(hv_i) * inv) * wf);
+    } else {
+      const T scaled = fused_from_f32<T>(fused_to_f32<T>(hv_i) * inv);
+      const T wt = reinterpret_cast<const T*>(w_raw)[i];
+      nr[i] = fused_from_f32<T>(fused_to_f32<T>(wt) * fused_to_f32<T>(scaled));
+    }
   }
 }
+)cuda"
+R"cuda(
 
 template <typename T>
 __device__ __forceinline__ T fused_sigmoid(T x) {

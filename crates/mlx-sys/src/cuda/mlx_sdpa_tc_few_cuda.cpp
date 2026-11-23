@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace mlx::core::sdpa_few {
@@ -62,12 +64,20 @@ public:
     const int D = q.shape(3);
     const int Hkv = k.shape(1);
     const int K_len = k.shape(2);
+    if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
+        Hq < Hkv || Hq % Hkv != 0 || Q_len < 1 || Q_len > 16) {
+      throw std::invalid_argument("SdpaTcFewCuda: unsupported replay shape");
+    }
     const int gqa = Hq / Hkv;
+    if (gqa > 96) {
+      throw std::invalid_argument("SdpaTcFewCuda: unsupported replay shape");
+    }
     const int M = gqa * Q_len;
     const int num_q_tiles = (M <= 96) ? 1 : 2;
     const int M_tile = (num_q_tiles == 1) ? M : (gqa * 8);
     const int num_warps = (M_tile + 15) / 16;
-    if ((D != 128 && D != 256) || Q_len < 1 || Q_len > 16 || K_len < 1 ||
+    if (static_cast<int64_t>(B) * num_q_tiles > 65535 ||
+        (D != 128 && D != 256) || K_len < 1 ||
         M < 1 || (num_q_tiles == 2 && (Q_len <= 8 || M_tile > 96)) ||
         num_warps < 1 || num_warps > 6) {
       throw std::invalid_argument("SdpaTcFewCuda: unsupported replay shape");
@@ -92,10 +102,24 @@ public:
     encoder.set_input_array(k);
     encoder.set_input_array(v);
     CUdeviceptr mask_ptr = 0;
+    int64_t mask_sb = 0;
+    int64_t mask_sq = 0;
     if (mask_mode_ == 2) {
+      if (inputs.size() < 4) {
+        throw std::invalid_argument("SdpaTcFewCuda: missing mask input");
+      }
       array m = cu::ensure_row_contiguous_aligned<1>(inputs[3], stream(), encoder);
+      if (m.dtype() != bool_ || m.ndim() != 4 ||
+          (m.shape(0) != 1 && m.shape(0) != B) || m.shape(1) != 1 ||
+          (m.shape(2) != 1 && m.shape(2) != Q_len) || m.shape(3) != K_len) {
+        throw std::invalid_argument("SdpaTcFewCuda: unsupported mask shape");
+      }
       encoder.set_input_array(m);
       mask_ptr = reinterpret_cast<CUdeviceptr>(gpu_ptr<void>(m));
+      mask_sb = (m.shape(0) == 1)
+          ? 0LL
+          : static_cast<int64_t>(m.shape(2)) * static_cast<int64_t>(m.shape(3));
+      mask_sq = (m.shape(2) == 1) ? 0LL : static_cast<int64_t>(m.shape(3));
     } else if (mask_mode_ == 3) {
       array tm = cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
       encoder.set_input_array(tm);
@@ -160,6 +184,8 @@ public:
     sargs.append<float>(scale_ * kLog2E);
     sargs.append<int32_t>(num_splits);
     sargs.append<int32_t>(num_q_tiles);
+    sargs.append<int64_t>(mask_sb);
+    sargs.append<int64_t>(mask_sq);
     encoder.add_kernel_node_raw(
         split_kernel, dim3(num_splits, Hkv, B * num_q_tiles),
         dim3(32, num_warps, 1), {}, 0, sargs.args());
@@ -204,8 +230,15 @@ private:
 
 class SdpaPrefillD256Cuda : public UnaryPrimitive {
 public:
-  SdpaPrefillD256Cuda(Stream stream, float scale)
-      : UnaryPrimitive(stream), scale_(scale) {}
+  SdpaPrefillD256Cuda(
+      Stream stream,
+      float scale,
+      int mask_mode = 0,
+      bool gated_bthd = false)
+      : UnaryPrimitive(stream),
+        scale_(scale),
+        mask_mode_(mask_mode),
+        gated_bthd_(gated_bthd) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error("SdpaPrefillD256Cuda requires CUDA");
@@ -213,6 +246,16 @@ public:
 
   void eval_gpu(const std::vector<array>& inputs, array& out) override {
     auto& encoder = cu::get_command_encoder(stream());
+    const size_t mask_idx = gated_bthd_ ? 4u : 3u;
+    const bool has_mask = (mask_mode_ == 1 || mask_mode_ == 3);
+    const size_t min_inputs = mask_idx + (has_mask ? 1u : 0u);
+    if (mask_mode_ < 0 || mask_mode_ > 3 || inputs.size() < min_inputs ||
+        inputs[0].dtype() != bfloat16 || inputs[1].dtype() != bfloat16 ||
+        inputs[2].dtype() != bfloat16 || inputs[0].ndim() != 4 ||
+        inputs[1].ndim() != 4 || inputs[2].ndim() != 4) {
+      throw std::invalid_argument("SdpaPrefillD256Cuda: unsupported replay shape");
+    }
+
     auto ensure_strided_aligned = [&](const array& a) -> array {
       const bool ok = a.strides(3) == 1 &&
           a.strides(2) >= 0 && (a.strides(2) % 8 == 0) &&
@@ -237,21 +280,108 @@ public:
     const int D = q.shape(3);
     const int Hkv = k.shape(1);
     const int K_len = k.shape(2);
-    if (B <= 0 || Hkv <= 0 || Hq < Hkv || Hq % Hkv != 0 || D != 256 ||
-        Q_len < 9 || K_len < Q_len || k.shape(0) != B || k.shape(3) != D ||
+    const bool k_len_ok =
+        (mask_mode_ == 0 || mask_mode_ == 3) ? (K_len >= Q_len) : (K_len >= 1);
+    if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
+        Hq < Hkv || Hq % Hkv != 0 || D != 256 ||
+        Hq > std::numeric_limits<int>::max() / D ||
+        Q_len < 9 || !k_len_ok || k.shape(0) != B || k.shape(3) != D ||
         v.shape() != k.shape()) {
       throw std::invalid_argument("SdpaPrefillD256Cuda: unsupported replay shape");
     }
     const int gqa = Hq / Hkv;
+    const int64_t num_q_blocks = (static_cast<int64_t>(Q_len) + 63) / 64;
+    if (num_q_blocks * gqa > std::numeric_limits<int32_t>::max()) {
+      throw std::invalid_argument("SdpaPrefillD256Cuda: grid size exceeds CUDA limits");
+    }
+
+    auto ensure_gate_aligned = [&](const array& a) -> array {
+      const bool ok = a.strides(2) == 1 &&
+          a.strides(1) >= 0 && (a.strides(1) % 2 == 0) &&
+          (B == 1 || (a.strides(0) >= 0 && (a.strides(0) % 2 == 0))) &&
+          (reinterpret_cast<uintptr_t>(gpu_ptr<void>(a)) % 4 == 0);
+      if (ok) {
+        return a;
+      }
+      auto copy = contiguous_copy_gpu(a, stream());
+      encoder.add_temporary(copy);
+      return copy;
+    };
+
+    std::optional<array> gate_arr;
+    CUdeviceptr gate_ptr = 0;
+    int64_t gate_sb = 0;
+    int64_t gate_st = 0;
+    if (gated_bthd_) {
+      const auto& g_in = inputs[3];
+      if (g_in.dtype() != bfloat16 || g_in.ndim() != 3 ||
+          g_in.shape(0) != B || g_in.shape(1) != Q_len ||
+          g_in.shape(2) != Hq * D) {
+        throw std::invalid_argument("SdpaPrefillD256Cuda: unsupported gate shape");
+      }
+      gate_arr = ensure_gate_aligned(g_in);
+      gate_ptr = reinterpret_cast<CUdeviceptr>(gpu_ptr<void>(*gate_arr));
+      gate_sb = (B == 1) ? 0LL : gate_arr->strides(0);
+      gate_st = gate_arr->strides(1);
+    }
+
+    std::optional<array> mask_arr;
+    CUdeviceptr mask_ptr = 0;
+    int64_t mask_sb = 0;
+    int64_t mask_sq = 0;
+    if (has_mask) {
+      array m =
+          cu::ensure_row_contiguous_aligned<1>(inputs[mask_idx], stream(), encoder);
+      const bool mask_ok = (mask_mode_ == 3)
+          ? (m.dtype() == bool_ && m.ndim() == 4 &&
+             (m.shape(0) == 1 || m.shape(0) == B) && m.shape(1) == 1 &&
+             m.shape(2) == 1 && m.shape(3) >= K_len)
+          : (m.dtype() == bool_ && m.ndim() == 4 &&
+             (m.shape(0) == 1 || m.shape(0) == B) && m.shape(1) == 1 &&
+             (m.shape(2) == 1 || m.shape(2) == Q_len) && m.shape(3) == K_len);
+      if (!mask_ok) {
+        throw std::invalid_argument("SdpaPrefillD256Cuda: unsupported mask shape");
+      }
+      mask_ptr = reinterpret_cast<CUdeviceptr>(gpu_ptr<void>(m));
+      mask_sb = (m.shape(0) == 1)
+          ? 0LL
+          : static_cast<int64_t>(m.shape(2)) * static_cast<int64_t>(m.shape(3));
+      mask_sq = (mask_mode_ == 3 || m.shape(2) == 1)
+          ? 0LL
+          : static_cast<int64_t>(m.shape(3));
+      mask_arr = std::move(m);
+    }
 
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     encoder.set_input_array(q);
     encoder.set_input_array(k);
     encoder.set_input_array(v);
+    if (gate_arr) {
+      encoder.set_input_array(*gate_arr);
+    }
+    if (mask_arr) {
+      encoder.set_input_array(*mask_arr);
+    }
     encoder.set_output_array(out);
 
+    static constexpr const char* kPrefillEntries[2][4] = {
+        {
+            "mlx_node_sdpa_prefill_d256<0,false>",
+            "mlx_node_sdpa_prefill_d256<1,false>",
+            "mlx_node_sdpa_prefill_d256<2,false>",
+            "mlx_node_sdpa_prefill_d256<3,false>",
+        },
+        {
+            "mlx_node_sdpa_prefill_d256<0,true>",
+            "mlx_node_sdpa_prefill_d256<1,true>",
+            "mlx_node_sdpa_prefill_d256<2,true>",
+            "mlx_node_sdpa_prefill_d256<3,true>",
+        },
+    };
     auto kernel = cu::jit_kernel(
-        encoder.device(), sdpa_prefill_d256_source, "mlx_node_sdpa_prefill_d256");
+        encoder.device(),
+        sdpa_prefill_d256_source,
+        kPrefillEntries[gated_bthd_ ? 1 : 0][mask_mode_]);
     constexpr float kLog2E = 1.4426950408889634f;
     cu::KernelArgs args;
     args.append(q);
@@ -272,25 +402,141 @@ public:
     args.append<int64_t>(v.strides(1));
     args.append<int64_t>(v.strides(2));
     args.append<float>(scale_ * kLog2E);
+    args.append<CUdeviceptr>(mask_ptr);
+    args.append<int64_t>(mask_sb);
+    args.append<int64_t>(mask_sq);
+    args.append<CUdeviceptr>(gate_ptr);
+    args.append<int64_t>(gate_sb);
+    args.append<int64_t>(gate_st);
 
-    const uint32_t num_q_blocks = static_cast<uint32_t>((Q_len + 63) / 64);
     encoder.add_kernel_node_raw(
-        kernel, dim3(num_q_blocks * static_cast<uint32_t>(gqa), Hkv, B),
+        kernel,
+        dim3(static_cast<uint32_t>(num_q_blocks * gqa), Hkv, B),
         dim3(128, 1, 1), {}, 0, args.args());
   }
 
   DEFINE_NAME(SdpaPrefillD256Cuda)
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const SdpaPrefillD256Cuda*>(&other);
-    return rhs && rhs->scale_ == scale_;
+    return rhs && rhs->scale_ == scale_ && rhs->mask_mode_ == mask_mode_ &&
+        rhs->gated_bthd_ == gated_bthd_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    if (gated_bthd_) {
+      const auto& q = inputs[0];
+      return {Shape{q.shape(0), q.shape(2), q.shape(1) * q.shape(3)}};
+    }
     return {inputs[0].shape()};
   }
 
 private:
   float scale_;
+  int mask_mode_;
+  bool gated_bthd_;
 };
+
+mlx_array* sdpa_prefill_d256_dispatch(
+    mlx_array* q_handle,
+    mlx_array* k_handle,
+    mlx_array* v_handle,
+    mlx_array* gate_handle,
+    mlx_array* mask_handle,
+    float scale,
+    bool is_causal,
+    bool gated_bthd,
+    const char* op_name) {
+  try {
+    if (!q_handle || !k_handle || !v_handle ||
+        (gated_bthd && !gate_handle) ||
+        default_device() != Device::gpu ||
+        cu::device(Device::gpu).compute_capability_major() < 8) {
+      return nullptr;
+    }
+    const auto& q = *reinterpret_cast<array*>(q_handle);
+    const auto& k = *reinterpret_cast<array*>(k_handle);
+    const auto& v = *reinterpret_cast<array*>(v_handle);
+    if (q.dtype() != bfloat16 || k.dtype() != bfloat16 ||
+        v.dtype() != bfloat16 || q.ndim() != 4 || k.ndim() != 4 ||
+        v.ndim() != 4) {
+      return nullptr;
+    }
+    const int B = q.shape(0);
+    const int Hq = q.shape(1);
+    const int Q_len = q.shape(2);
+    const int D = q.shape(3);
+    const int Hkv = k.shape(1);
+    const int K_len = k.shape(2);
+    if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
+        Hq < Hkv || Hq % Hkv != 0 || D != 256 ||
+        Hq > std::numeric_limits<int>::max() / D ||
+        Q_len < 9 || k.shape(0) != B || k.shape(3) != D ||
+        v.shape() != k.shape()) {
+      return nullptr;
+    }
+    const int gqa = Hq / Hkv;
+    const int64_t num_q_blocks = (static_cast<int64_t>(Q_len) + 63) / 64;
+    if (num_q_blocks * gqa > std::numeric_limits<int32_t>::max()) {
+      return nullptr;
+    }
+    std::vector<array> inputs;
+    inputs.reserve(gated_bthd ? 5 : 4);
+    inputs.push_back(q);
+    inputs.push_back(k);
+    inputs.push_back(v);
+    if (gated_bthd) {
+      const auto& gate = *reinterpret_cast<array*>(gate_handle);
+      if (gate.dtype() != bfloat16 || gate.ndim() != 3 ||
+          gate.shape(0) != B || gate.shape(1) != Q_len ||
+          gate.shape(2) != Hq * D) {
+        return nullptr;
+      }
+      inputs.push_back(gate);
+    }
+    int mask_mode = 0;
+    if (mask_handle) {
+      const auto& mask = *reinterpret_cast<array*>(mask_handle);
+      if (is_causal) {
+        if (K_len < Q_len || mask.dtype() != bool_ || mask.ndim() != 4 ||
+            (mask.shape(0) != 1 && mask.shape(0) != B) || mask.shape(1) != 1 ||
+            mask.shape(2) != 1 || mask.shape(3) < K_len) {
+          return nullptr;
+        }
+        inputs.push_back(mask);
+        mask_mode = 3;
+      } else {
+        if (K_len < 1 || mask.dtype() != bool_ || mask.ndim() != 4 ||
+            (mask.shape(0) != 1 && mask.shape(0) != B) || mask.shape(1) != 1 ||
+            (mask.shape(2) != 1 && mask.shape(2) != Q_len) ||
+            mask.shape(3) != K_len) {
+          return nullptr;
+        }
+        inputs.push_back(mask);
+        mask_mode = 1;
+      }
+    } else if (is_causal) {
+      if (K_len < Q_len) {
+        return nullptr;
+      }
+      mask_mode = 0;
+    } else {
+      if (K_len < 1) {
+        return nullptr;
+      }
+      mask_mode = 2;
+    }
+    const Shape out_shape =
+        gated_bthd ? Shape{B, Q_len, Hq * D} : q.shape();
+    auto result = array(
+        out_shape, bfloat16,
+        std::make_shared<SdpaPrefillD256Cuda>(
+            default_stream(Device::gpu), scale, mask_mode, gated_bthd),
+        std::move(inputs));
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::cerr << op_name << " error: " << e.what() << std::endl;
+  }
+  return nullptr;
+}
 
 } // namespace
 } // namespace mlx::core::sdpa_few
@@ -324,24 +570,33 @@ extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
     const int D = q.shape(3);
     const int Hkv = k.shape(1);
     const int K_len = k.shape(2);
-    if (B <= 0 || Hkv <= 0 || Hq < Hkv || Hq % Hkv != 0 ||
+    if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
+        Hq < Hkv || Hq % Hkv != 0 ||
         (D != 128 && D != 256) || Q_len < 1 || Q_len > 16 ||
         k.shape(0) != B || k.shape(3) != D || v.shape() != k.shape()) {
       return nullptr;
     }
     const int gqa = Hq / Hkv;
+    if (gqa > 96) {
+      return nullptr;
+    }
     const int M = gqa * Q_len;
     const bool ok_single = (M >= 1 && M <= 96);
     const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 96);
     if (!ok_single && !ok_two_tile) {
       return nullptr;
     }
+    const int num_q_tiles = (M <= 96) ? 1 : 2;
+    if (static_cast<int64_t>(B) * num_q_tiles > 65535) {
+      return nullptr;
+    }
     int mask_mode = 0;
     if (mask_handle) {
       const auto& mask = *reinterpret_cast<array*>(mask_handle);
       if (is_causal || K_len < 1 || mask.dtype() != bool_ || mask.ndim() != 4 ||
-          mask.shape(0) != 1 || mask.shape(1) != 1 ||
-          mask.shape(2) != Q_len || mask.shape(3) != K_len) {
+          (mask.shape(0) != 1 && mask.shape(0) != B) || mask.shape(1) != 1 ||
+          (mask.shape(2) != 1 && mask.shape(2) != Q_len) ||
+          mask.shape(3) != K_len) {
         return nullptr;
       }
       inputs.push_back(mask);
@@ -401,17 +656,25 @@ extern "C" mlx_array* mlx_sdpa_tc_tree_few_cuda(
     const int D = q.shape(3);
     const int Hkv = k.shape(1);
     const int K_len = k.shape(2);
-    if (B <= 0 || Hkv <= 0 || Hq < Hkv || Hq % Hkv != 0 ||
+    if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
+        Hq < Hkv || Hq % Hkv != 0 ||
         (D != 128 && D != 256) || Q_len < 1 || Q_len > 16 || K_len < 1 ||
         k.shape(0) != B || k.shape(3) != D || v.shape() != k.shape() ||
         tm.shape(0) != Q_len) {
       return nullptr;
     }
     const int gqa = Hq / Hkv;
+    if (gqa > 96) {
+      return nullptr;
+    }
     const int M = gqa * Q_len;
     const bool ok_single = (M >= 1 && M <= 96);
     const bool ok_two_tile = (Q_len > 8 && gqa * 8 <= 96);
     if (!ok_single && !ok_two_tile) {
+      return nullptr;
+    }
+    const int num_q_tiles = (M <= 96) ? 1 : 2;
+    if (static_cast<int64_t>(B) * num_q_tiles > 65535) {
       return nullptr;
     }
     std::vector<array> inputs{q, k, v, tm};
@@ -427,46 +690,39 @@ extern "C" mlx_array* mlx_sdpa_tc_tree_few_cuda(
   return nullptr;
 }
 
+// FlashAttention-2 D=256 BF16 prefill SDPA on CUDA with optional boolean mask.
+// When `is_causal == true` and `mask_handle != nullptr` (MASK_MODE = 3),
+// `mask` must be a 4D bool tensor of shape [1 | B, 1, 1, >= K_len] and the
+// kernel applies `causal & (mask | self_diagonal)`:
+//   (k <= K_len - Q_len + q) && (mask[b, 0, 0, k] || k == K_len - Q_len + q)
+// Forcing the causal self-diagonal keeps softmax well-defined on padded query
+// rows where all preceding keys are masked out.
+extern "C" mlx_array* mlx_sdpa_prefill_d256_masked_cuda(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* mask_handle, float scale, bool is_causal) {
+  return mlx::core::sdpa_few::sdpa_prefill_d256_dispatch(
+      q_handle, k_handle, v_handle, nullptr, mask_handle, scale, is_causal,
+      false, "mlx_sdpa_prefill_d256_masked_cuda");
+}
+
 extern "C" mlx_array* mlx_sdpa_prefill_d256_cuda(
     mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
     float scale) {
-  try {
-    using namespace mlx::core;
-    if (!q_handle || !k_handle || !v_handle ||
-        default_device() != Device::gpu ||
-        cu::device(Device::gpu).compute_capability_major() < 8) {
-      return nullptr;
-    }
-    const auto& q = *reinterpret_cast<array*>(q_handle);
-    const auto& k = *reinterpret_cast<array*>(k_handle);
-    const auto& v = *reinterpret_cast<array*>(v_handle);
-    if (q.dtype() != bfloat16 || k.dtype() != bfloat16 ||
-        v.dtype() != bfloat16 || q.ndim() != 4 || k.ndim() != 4 ||
-        v.ndim() != 4) {
-      return nullptr;
-    }
-    const int B = q.shape(0);
-    const int Hq = q.shape(1);
-    const int Q_len = q.shape(2);
-    const int D = q.shape(3);
-    const int Hkv = k.shape(1);
-    const int K_len = k.shape(2);
-    if (B <= 0 || Hkv <= 0 || Hq < Hkv || Hq % Hkv != 0 || D != 256 ||
-        Q_len < 9 || K_len < Q_len || k.shape(0) != B || k.shape(3) != D ||
-        v.shape() != k.shape()) {
-      return nullptr;
-    }
-    std::vector<array> inputs = {q, k, v};
-    auto result = array(
-        q.shape(), bfloat16,
-        std::make_shared<sdpa_few::SdpaPrefillD256Cuda>(
-            default_stream(Device::gpu), scale),
-        std::move(inputs));
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  } catch (const std::exception& e) {
-    std::cerr << "mlx_sdpa_prefill_d256_cuda error: " << e.what() << std::endl;
-  }
-  return nullptr;
+  return mlx_sdpa_prefill_d256_masked_cuda(
+      q_handle, k_handle, v_handle, nullptr, scale, true);
+}
+
+// FlashAttention-2 D=256 BF16 prefill SDPA on CUDA with fused [B, Q_len, Hq*256]
+// transpose+reshape and sigmoid(gate) multiplication in the epilogue.
+// Accepts strided `gate` [B, Q_len, Hq*256] (bf16, last dim contiguous, even
+// outer strides, 4B aligned base pointer) without copying.
+extern "C" mlx_array* mlx_cuda_sdpa_prefill_d256_gated(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* gate_handle, mlx_array* mask_handle, float scale,
+    bool is_causal) {
+  return mlx::core::sdpa_few::sdpa_prefill_d256_dispatch(
+      q_handle, k_handle, v_handle, gate_handle, mask_handle, scale, is_causal,
+      true, "mlx_cuda_sdpa_prefill_d256_gated");
 }
 
 #else
@@ -505,6 +761,18 @@ extern "C" mlx_array* mlx_sdpa_tc_tree_few_cuda(
   return nullptr;
 }
 
+extern "C" mlx_array* mlx_sdpa_prefill_d256_masked_cuda(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* mask_handle, float scale, bool is_causal) {
+  (void)q_handle;
+  (void)k_handle;
+  (void)v_handle;
+  (void)mask_handle;
+  (void)scale;
+  (void)is_causal;
+  return nullptr;
+}
+
 extern "C" mlx_array* mlx_sdpa_prefill_d256_cuda(
     mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
     float scale) {
@@ -512,6 +780,20 @@ extern "C" mlx_array* mlx_sdpa_prefill_d256_cuda(
   (void)k_handle;
   (void)v_handle;
   (void)scale;
+  return nullptr;
+}
+
+extern "C" mlx_array* mlx_cuda_sdpa_prefill_d256_gated(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* gate_handle, mlx_array* mask_handle, float scale,
+    bool is_causal) {
+  (void)q_handle;
+  (void)k_handle;
+  (void)v_handle;
+  (void)gate_handle;
+  (void)mask_handle;
+  (void)scale;
+  (void)is_causal;
   return nullptr;
 }
 

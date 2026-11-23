@@ -178,12 +178,96 @@ pub(crate) struct RepackDst {
     pub biases: Option<MxArray>,
 }
 
+/// Geometry of a GPU-repacked tensor's destination arrays (without exposing
+/// CPU-writable host pointers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct GpuDstMeta {
+    pub rows: usize,
+    pub k: usize,
+    pub layout: OutLayout,
+}
+
 /// Destination columns of one row of `k` values, and the `.scales` dtype.
 struct DstCols {
     weight: usize,
     scales: usize,
     scales_dtype: DType,
     biases: Option<usize>,
+}
+
+struct ValidatedDst {
+    shape: Vec<i64>,
+    cols: DstCols,
+    meta: GpuDstMeta,
+}
+
+impl ValidatedDst {
+    fn row_shape(&self, cols: usize) -> Vec<i64> {
+        let mut s = self.shape.clone();
+        if let Some(last) = s.last_mut() {
+            *last = cols as i64;
+        }
+        s
+    }
+}
+
+fn validate_kind(t: &GgufTensorInfo, kind: GpuRepackKind) -> Result<()> {
+    if t.tensor_type != kind.gguf_type() {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' of type {} cannot use {kind:?} repack",
+            t.name,
+            t.tensor_type.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dst(t: &GgufTensorInfo, layout: OutLayout, q8_bias_bank: bool) -> Result<ValidatedDst> {
+    let ty = t.tensor_type;
+    let block = ty.block_size();
+    let shape = t.mlx_shape();
+    let k = shape.last().copied().unwrap_or(0);
+    if k <= 0 || !(k as usize).is_multiple_of(block) {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
+            t.name
+        )));
+    }
+    let k = k as usize;
+    let mut cols = dst_cols(ty, k).ok_or_else(|| {
+        Error::from_reason(format!(
+            "no packed destination contract for GGUF tensor '{}' of type {}",
+            t.name,
+            ty.name()
+        ))
+    })?;
+    if q8_bias_bank {
+        cols.biases = Some(k / ty.block_size());
+    }
+    let rows = usize::try_from(t.num_elements()?).map_err(|_| {
+        Error::from_reason(format!(
+            "GGUF tensor '{}' element count exceeds usize",
+            t.name
+        ))
+    })? / k;
+    if layout == OutLayout::Tiled64
+        && (ty.k_quant_format().is_none()
+            || shape.len() != 2
+            || !rows.is_multiple_of(64)
+            || !k.is_multiple_of(256))
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' of type {} shape {shape:?} cannot be Tiled64",
+            t.name,
+            ty.name()
+        )));
+    }
+    Ok(ValidatedDst {
+        shape,
+        cols,
+        meta: GpuDstMeta { rows, k, layout },
+    })
 }
 
 /// The loader's destination geometry for `t` with row length `k`: the
@@ -238,14 +322,44 @@ impl RepackDst {
         kind: GpuRepackKind,
         layout: OutLayout,
     ) -> Result<(RepackDst, DstPtrs)> {
-        if t.tensor_type != kind.gguf_type() {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' of type {} cannot use {kind:?} repack",
-                t.name,
-                t.tensor_type.name()
-            )));
-        }
+        validate_kind(t, kind)?;
         Self::alloc_inner(t, layout, kind == GpuRepackKind::Q8_0Bias)
+    }
+
+    /// Device-resident destination for an explicit GPU repack route. On CUDA,
+    /// allocates `weight`, `scales`, and optional `biases` directly in GPU
+    /// device memory (`device == 0`) with zero extra copy and never exposes
+    /// unwritable host pointers; falls back to `MxArray::alloc_uninit` on
+    /// non-CUDA / Metal / CPU hosts.
+    pub(crate) fn alloc_gpu_for_kind(
+        t: &GgufTensorInfo,
+        kind: GpuRepackKind,
+        layout: OutLayout,
+    ) -> Result<(RepackDst, GpuDstMeta)> {
+        validate_kind(t, kind)?;
+        let spec = validate_dst(t, layout, kind == GpuRepackKind::Q8_0Bias)?;
+        let use_cuda = crate::accelerator::cuda_ops_available();
+        let alloc = |shape: &[i64], dtype: DType| -> Result<MxArray> {
+            if use_cuda && let Some(arr) = MxArray::alloc_gpu_uninit(shape, dtype)? {
+                return Ok(arr);
+            }
+            Ok(MxArray::alloc_uninit(shape, dtype)?.0)
+        };
+        let weight = alloc(&spec.row_shape(spec.cols.weight), DType::Uint32)?;
+        let scales = alloc(&spec.row_shape(spec.cols.scales), spec.cols.scales_dtype)?;
+        let biases = spec
+            .cols
+            .biases
+            .map(|c| alloc(&spec.row_shape(c), DType::Float16))
+            .transpose()?;
+        Ok((
+            RepackDst {
+                weight,
+                scales: Some(scales),
+                biases,
+            },
+            spec.meta,
+        ))
     }
 
     fn alloc_inner(
@@ -253,57 +367,14 @@ impl RepackDst {
         layout: OutLayout,
         q8_bias_bank: bool,
     ) -> Result<(RepackDst, DstPtrs)> {
-        let ty = t.tensor_type;
-        let block = ty.block_size();
-        let shape = t.mlx_shape();
-        let k = shape.last().copied().unwrap_or(0);
-        if k <= 0 || !(k as usize).is_multiple_of(block) {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
-                t.name
-            )));
-        }
-        let k = k as usize;
-        let mut cols = dst_cols(ty, k).ok_or_else(|| {
-            Error::from_reason(format!(
-                "no packed destination contract for GGUF tensor '{}' of type {}",
-                t.name,
-                ty.name()
-            ))
-        })?;
-        if q8_bias_bank {
-            cols.biases = Some(k / ty.block_size());
-        }
-        let rows = usize::try_from(t.num_elements()?).map_err(|_| {
-            Error::from_reason(format!(
-                "GGUF tensor '{}' element count exceeds usize",
-                t.name
-            ))
-        })? / k;
-        if layout == OutLayout::Tiled64
-            && (ty.k_quant_format().is_none()
-                || shape.len() != 2
-                || !rows.is_multiple_of(64)
-                || !k.is_multiple_of(256))
-        {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' of type {} shape {shape:?} cannot be Tiled64",
-                t.name,
-                ty.name()
-            )));
-        }
-        let row_shape = |cols: usize| -> Vec<i64> {
-            let mut s = shape.clone();
-            if let Some(last) = s.last_mut() {
-                *last = cols as i64;
-            }
-            s
-        };
-        let (weight, wp, _) = MxArray::alloc_uninit(&row_shape(cols.weight), DType::Uint32)?;
-        let (scales, sp, _) = MxArray::alloc_uninit(&row_shape(cols.scales), cols.scales_dtype)?;
-        let (biases, bp) = match cols.biases {
+        let spec = validate_dst(t, layout, q8_bias_bank)?;
+        let (weight, wp, _) =
+            MxArray::alloc_uninit(&spec.row_shape(spec.cols.weight), DType::Uint32)?;
+        let (scales, sp, _) =
+            MxArray::alloc_uninit(&spec.row_shape(spec.cols.scales), spec.cols.scales_dtype)?;
+        let (biases, bp) = match spec.cols.biases {
             Some(c) => {
-                let (b, bp, _) = MxArray::alloc_uninit(&row_shape(c), DType::Float16)?;
+                let (b, bp, _) = MxArray::alloc_uninit(&spec.row_shape(c), DType::Float16)?;
                 (Some(b), Some(bp))
             }
             None => (None, None),
@@ -318,9 +389,9 @@ impl RepackDst {
                 weight: wp,
                 scales: Some(sp),
                 biases: bp,
-                rows,
-                k,
-                layout,
+                rows: spec.meta.rows,
+                k: spec.meta.k,
+                layout: spec.meta.layout,
             },
         ))
     }
@@ -1694,6 +1765,58 @@ mod tests {
             biases: Vec::new(),
         };
         assert_same(&read(&dst), &want_bytes, "Nvfp4 3D MoE [4, 7, 128]");
+    }
+
+    #[test]
+    fn alloc_gpu_for_kind_matches_alloc_for_kind_contract() -> Result<()> {
+        fn shape_dtype(a: &MxArray) -> Result<(Vec<i64>, DType)> {
+            Ok((a.shape()?.to_vec(), a.dtype()?))
+        }
+        for kind in ALL_KINDS {
+            let layouts: &[OutLayout] = if kind.is_kquant() {
+                &[OutLayout::RowMajor, OutLayout::Tiled64]
+            } else {
+                &[OutLayout::RowMajor]
+            };
+            let (rows, k) = (64usize, 256usize);
+            let info = tensor_info(kind, rows, k);
+            for &layout in layouts {
+                let (gpu_dst, meta) = RepackDst::alloc_gpu_for_kind(&info, kind, layout)?;
+                let (cpu_dst, ptrs) = RepackDst::alloc_for_kind(&info, kind, layout)?;
+                assert_eq!(
+                    (meta.rows, meta.k, meta.layout),
+                    (ptrs.rows, ptrs.k, ptrs.layout),
+                    "{kind:?} {layout:?} meta"
+                );
+                assert_eq!(
+                    shape_dtype(&gpu_dst.weight)?,
+                    shape_dtype(&cpu_dst.weight)?,
+                    "{kind:?} {layout:?} weight"
+                );
+                assert_eq!(
+                    gpu_dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    cpu_dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} scales"
+                );
+                assert_eq!(
+                    gpu_dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    cpu_dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} biases"
+                );
+            }
+            if !kind.is_kquant() {
+                assert!(
+                    RepackDst::alloc_gpu_for_kind(&info, kind, OutLayout::Tiled64).is_err(),
+                    "{kind:?} Tiled64"
+                );
+            }
+        }
+        let q4k_info = tensor_info(GpuRepackKind::Q4K, 64, 256);
+        assert!(
+            RepackDst::alloc_gpu_for_kind(&q4k_info, GpuRepackKind::Q8_0, OutLayout::RowMajor)
+                .is_err()
+        );
+        Ok(())
     }
 }
 

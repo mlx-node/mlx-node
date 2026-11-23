@@ -370,7 +370,12 @@ impl PrismHadamardConfig {
             .iter()
             .map(|&v| v as f32)
             .collect();
-        let signs = MxArray::from_float32(&values, &[width])?;
+        let mut signs = MxArray::from_float32(&values, &[width])?;
+        if crate::accelerator::cuda_ops_available()
+            && let Some(dev_signs) = signs.ensure_cuda_device()?
+        {
+            signs = dev_signs;
+        }
         cache.insert(width, signs.clone());
         owned.push(signs.clone());
         Ok(signs)
@@ -507,11 +512,7 @@ impl PrismHadamardConfig {
         } else {
             None
         };
-        Ok(HadamardTransform {
-            signs,
-            block_size: self.block_size,
-            gdn_permutation,
-        })
+        HadamardTransform::new(signs, self.block_size, gdn_permutation)
     }
 
     pub(crate) fn prepare(
@@ -631,6 +632,58 @@ impl PrismHadamardConfig {
 }
 
 impl HadamardTransform {
+    pub(crate) fn new(
+        mut signs: MxArray,
+        block_size: i32,
+        gdn_permutation: Option<(i32, i32, i32)>,
+    ) -> Result<Self> {
+        if crate::accelerator::cuda_ops_available()
+            && let Some(dev_signs) = signs.ensure_cuda_device()?
+        {
+            signs = dev_signs;
+        }
+        Ok(Self {
+            signs,
+            block_size,
+            gdn_permutation,
+        })
+    }
+
+    pub(crate) fn signs(&self) -> &MxArray {
+        &self.signs
+    }
+
+    pub(crate) fn block_size(&self) -> i32 {
+        self.block_size
+    }
+
+    pub(crate) fn dim(&self) -> Result<i64> {
+        self.signs.shape_at(0)
+    }
+
+    pub(crate) fn is_compatible_with(&self, other: &Self) -> Result<bool> {
+        if self.block_size() != other.block_size() || self.gdn_permutation != other.gdn_permutation
+        {
+            return Ok(false);
+        }
+        // Fast path: CLEF and Prism memoize one sign array per input width, so
+        // equal-width projections share the exact same `MxArray` handle.
+        if self.signs.as_raw_ptr() == other.signs.as_raw_ptr() {
+            return Ok(true);
+        }
+        if self.dim()? != other.dim()? || self.signs.dtype()? != other.signs.dtype()? {
+            return Ok(false);
+        }
+        let max_diff = self
+            .signs
+            .astype(DType::Float32)?
+            .sub(&other.signs.astype(DType::Float32)?)?
+            .abs()?
+            .max(None, None)?;
+        max_diff.eval();
+        Ok(max_diff.item_at_float32(0)? == 0.0)
+    }
+
     pub(crate) fn apply(&self, x: &MxArray, inverse: bool) -> Result<MxArray> {
         let shape = x.shape()?.to_vec();
         let dtype = x.dtype()?;
@@ -1925,5 +1978,25 @@ mod tests {
             config.prepare(&params, &qconfig, quant, &matching).is_ok(),
             "an embed_tokens override matching affine 2/128 must be accepted"
         );
+    }
+
+    #[test]
+    fn hadamard_transform_new_promotes_signs_to_cuda_device() {
+        let signs_i = nontrivial_signs(1024);
+        let expected: Vec<f32> = signs_i.iter().map(|&v| v as f32).collect();
+        let t1 = HadamardTransform::new(sign_array(&signs_i), 1024, None).unwrap();
+        assert_eq!(t1.signs().dtype().unwrap(), DType::Float32);
+        assert_eq!(t1.signs().shape().unwrap().as_ref(), &[1024]);
+        // Assert CUDA device residency and pointer-preserving re-wrap BEFORE
+        // `to_float32()`: on Windows WDDM, reading back to host migrates the
+        // buffer out of device memory in place.
+        assert!(
+            t1.signs().ensure_cuda_device().unwrap().is_none(),
+            "HadamardTransform::new must leave signs resident in CUDA device memory on CUDA"
+        );
+        // Re-wrapping an already-promoted signs array keeps the exact same handle.
+        let t2 = HadamardTransform::new(t1.signs().clone(), 1024, None).unwrap();
+        assert_eq!(t1.signs().as_raw_ptr(), t2.signs().as_raw_ptr());
+        assert_eq!(t1.signs().to_float32().unwrap().as_ref(), &expected[..]);
     }
 }

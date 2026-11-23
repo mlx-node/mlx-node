@@ -40,12 +40,16 @@ public:
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     encoder.set_output_array(out);
 
-    const int M = x.shape(-2);
-    const int K = x.shape(-1);
-    const int N = w.shape(0);
-    if (M < 1 || M > 8 || N <= 0 || N % 16 != 0 || K < 1024 || K % 256 != 0) {
+    if (x.ndim() < 2) {
       throw std::invalid_argument("AffineQ4G64FewCuda: unsupported shape");
     }
+    const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    const int N = w.shape(0);
+    if (M64 < 1 || M64 > 8 || N <= 0 || N % 16 != 0 || K < 1024 || K % 256 != 0) {
+      throw std::invalid_argument("AffineQ4G64FewCuda: unsupported shape");
+    }
+    const int M = static_cast<int>(M64);
 
     auto kernel = cu::jit_kernel(
         encoder.device(), affine_q4_few_source, "mlx_node_affine_q4_g64_few");
@@ -93,14 +97,13 @@ extern "C" mlx_array* mlx_affine_q4_g64_few_cuda(
     const auto& w = inputs[1];
     const auto& scales = inputs[2];
     const auto& biases = inputs[3];
-    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
-        (x.ndim() == 3 && x.shape(0) != 1)) {
+    if (x.dtype() != bfloat16 || x.ndim() < 2) {
       return nullptr;
     }
-    const int M = x.shape(-2);
     const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
     const int N = (w.ndim() == 2) ? w.shape(0) : 0;
-    if (M < 1 || M > 8 || K < 1024 || K % 256 != 0 ||
+    if (M64 < 1 || M64 > 8 || K < 1024 || K % 256 != 0 ||
         w.ndim() != 2 || N <= 0 || N % 16 != 0 || w.dtype() != uint32 ||
         w.shape(1) != K / 8 ||
         scales.ndim() != 2 || scales.dtype() != bfloat16 ||

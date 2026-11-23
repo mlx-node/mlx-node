@@ -56,17 +56,34 @@ impl MLP {
     /// persistence layer should invoke it once after the gate/up/down weights
     /// for a given layer have all been set.
     pub fn finalize_gate_up(&mut self) -> Result<()> {
+        if self.is_quantized() {
+            return Ok(());
+        }
+        if self.gate_up_proj_wt.is_some() && self.down_proj_wt.is_some() {
+            return Ok(());
+        }
         let w_gate = self.gate_proj.get_weight();
         let w_up = self.up_proj.get_weight();
         let w_down = self.down_proj.get_weight();
+        let inter = w_gate.shape_at(0)?;
         // gate, up: [intermediate, hidden] → stacked: [2*intermediate, hidden] →
         // transpose to [hidden, 2*intermediate] for the matmul x @ wgu_t.
         let stacked = MxArray::concatenate(&w_gate, &w_up, 0)?;
         let wgu_t = stacked.transpose(Some(&[1, 0]))?;
-        wgu_t.eval();
         // down: [hidden, intermediate] → [intermediate, hidden]
         let wd_t = w_down.transpose(Some(&[1, 0]))?;
-        wd_t.eval();
+        MxArray::eval_arrays(&[&wgu_t, &wd_t])?;
+        // Replace the individual dense projection buffers with zero-copy views
+        // over `wgu_t` and `wd_t` so the original gate/up/down tensors are
+        // released (avoiding 2x dense VRAM) while keeping getters and fallback
+        // paths (`forward_with_cache`, `MLX_DISABLE_E39_STACKED_MLP=1`) intact.
+        let wgu = wgu_t.transpose(Some(&[1, 0]))?;
+        let gate_view = wgu.slice_axis(0, 0, inter)?;
+        let up_view = wgu.slice_axis(0, inter, 2 * inter)?;
+        let down_view = wd_t.transpose(Some(&[1, 0]))?;
+        self.gate_proj.set_weight(&gate_view)?;
+        self.up_proj.set_weight(&up_view)?;
+        self.down_proj.set_weight(&down_view)?;
         self.gate_up_proj_wt = Some(wgu_t);
         self.down_proj_wt = Some(wd_t);
         Ok(())

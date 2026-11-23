@@ -159,6 +159,7 @@ pub(super) fn run_loaded_hook(inner: &mut Qwen35Inner) -> Result<()> {
 
 /// The product load of the real model and draft with `hook` run on its
 /// model thread; prints the load's planes lines.
+#[cfg(target_os = "macos")]
 fn load_real_with(hook: LoadedHook) -> Result<()> {
     crate::utils::gguf_planes::LOAD_LINES
         .lock()

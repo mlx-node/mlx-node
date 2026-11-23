@@ -5,14 +5,16 @@ R"cuda(
 // Shared device body for fused QK-Norm + Non-Traditional Partial RoPE +
 // In-Place KV-Cache Store.
 //   - kv_pos:   cache row index written to k_cache/v_cache (offset + t)
-//   - rope_pos: position fed into RoPE (offset + t, or offset + depths[t] for tree)
-template <bool D256>
+//   - rope_pos: position fed into RoPE (offset + t, offset + depths[t], or positions[b,t])
+//   - W_IS_F32: when true, q_norm_w / k_norm_w are float[D] and norm skips intermediate
+//               BF16 rounding (matches PreciseF32 q_norm/k_norm bit-for-bit).
+template <bool D256, bool W_IS_F32>
 __device__ __forceinline__ void qk_norm_rope_kv_store_impl(
     const nv_bfloat16* __restrict__ q_in,
     const nv_bfloat16* __restrict__ k_in,
     const nv_bfloat16* __restrict__ v_in,
-    const nv_bfloat16* __restrict__ q_norm_w,
-    const nv_bfloat16* __restrict__ k_norm_w,
+    const void* __restrict__ q_norm_w,
+    const void* __restrict__ k_norm_w,
     nv_bfloat16* __restrict__ q_out,
     nv_bfloat16* __restrict__ k_cache,
     nv_bfloat16* __restrict__ v_cache,
@@ -36,7 +38,7 @@ __device__ __forceinline__ void qk_norm_rope_kv_store_impl(
 
   const nv_bfloat16* src;
   nv_bfloat16* dst;
-  const nv_bfloat16* norm_w;
+  const void* norm_w;
   const nv_bfloat16* v_src = nullptr;
   nv_bfloat16* v_dst = nullptr;
 
@@ -92,11 +94,18 @@ __device__ __forceinline__ void qk_norm_rope_kv_store_impl(
     const float sum_sq = (s_warp[0] + s_warp[1]) + (s_warp[2] + s_warp[3]);
     const float inv_rms = rsqrtf(sum_sq * (1.0f / 256.0f) + eps);
 
-    const __nv_bfloat162 wv = reinterpret_cast<const __nv_bfloat162*>(norm_w)[tid];
-    const nv_bfloat16 sc0 = __float2bfloat16_rn(x0 * inv_rms);
-    const nv_bfloat16 sc1 = __float2bfloat16_rn(x1 * inv_rms);
-    const nv_bfloat16 n0 = __float2bfloat16_rn(__low2float(wv) * __bfloat162float(sc0));
-    const nv_bfloat16 n1 = __float2bfloat16_rn(__high2float(wv) * __bfloat162float(sc1));
+    nv_bfloat16 n0, n1;
+    if constexpr (W_IS_F32) {
+      const float2 wv = reinterpret_cast<const float2*>(norm_w)[tid];
+      n0 = __float2bfloat16_rn((x0 * inv_rms) * wv.x);
+      n1 = __float2bfloat16_rn((x1 * inv_rms) * wv.y);
+    } else {
+      const __nv_bfloat162 wv = reinterpret_cast<const __nv_bfloat162*>(norm_w)[tid];
+      const nv_bfloat16 sc0 = __float2bfloat16_rn(x0 * inv_rms);
+      const nv_bfloat16 sc1 = __float2bfloat16_rn(x1 * inv_rms);
+      n0 = __float2bfloat16_rn(__low2float(wv) * __bfloat162float(sc0));
+      n1 = __float2bfloat16_rn(__high2float(wv) * __bfloat162float(sc1));
+    }
 
     const int d0 = 2 * tid;
     if (d0 < rope_dims) {
@@ -157,9 +166,15 @@ __device__ __forceinline__ void qk_norm_rope_kv_store_impl(
 
     for (int d = tid; d < D; d += 128) {
       const float xf = __bfloat162float(s_buf[d]);
-      const nv_bfloat16 sc = __float2bfloat16_rn(xf * inv_rms);
-      const nv_bfloat16 n =
-          __float2bfloat16_rn(__bfloat162float(norm_w[d]) * __bfloat162float(sc));
+      nv_bfloat16 n;
+      if constexpr (W_IS_F32) {
+        const float wf = reinterpret_cast<const float*>(norm_w)[d];
+        n = __float2bfloat16_rn((xf * inv_rms) * wf);
+      } else {
+        const nv_bfloat16 sc = __float2bfloat16_rn(xf * inv_rms);
+        const nv_bfloat16 wt = reinterpret_cast<const nv_bfloat16*>(norm_w)[d];
+        n = __float2bfloat16_rn(__bfloat162float(wt) * __bfloat162float(sc));
+      }
       if (d < rope_dims) {
         s_buf[d] = n;
       } else {
@@ -240,7 +255,7 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_kv_store_cuda_kernel(
   __shared__ float s_warp[4];
   __shared__ nv_bfloat16 s_buf[D256 ? 256 : 1024];
   const int pos = offset + static_cast<int>(blockIdx.x);
-  qk_norm_rope_kv_store_impl<D256>(
+  qk_norm_rope_kv_store_impl<D256, false>(
       q_in, k_in, v_in, q_norm_w, k_norm_w, q_out, k_cache, v_cache,
       T, Hq, D, rope_dims, log2_base, rope_scale, eps, pos, pos,
       q_sb, q_st, q_sh, k_sb, k_st, k_sh, v_sb, v_st, v_sh,
@@ -274,12 +289,52 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_kv_store_tree_cuda_kerne
   const int t = static_cast<int>(blockIdx.x);
   const int kv_pos = offset + t;
   const int rope_pos = offset + depths[t];
-  qk_norm_rope_kv_store_impl<D256>(
+  qk_norm_rope_kv_store_impl<D256, false>(
       q_in, k_in, v_in, q_norm_w, k_norm_w, q_out, k_cache, v_cache,
       T, Hq, D, rope_dims, log2_base, rope_scale, eps, kv_pos, rope_pos,
       q_sb, q_st, q_sh, k_sb, k_st, k_sh, v_sb, v_st, v_sh,
       kc_sb, kc_sh, kc_st, vc_sb, vc_sh, vc_st, s_warp, s_buf);
 }
+
+// Positions-aware variant of fused QK-Norm + partial RoPE + in-place KV-Cache Store.
+// Supports both 2D [B, T] explicit positions (pos_is_2d != 0) and 1D [B] offsets
+// (pos_is_2d == 0, rope_pos = positions[b * pos_sb] + t), plus optional FP32 norm weights.
+// Grid: dim3(T, Hq + Hkv, B), Block: dim3(128, 1, 1)
+template <bool D256, bool W_IS_F32>
+__global__ __launch_bounds__(128) void mlx_qk_norm_rope_kv_store_positions_cuda_kernel(
+    const nv_bfloat16* __restrict__ q_in,
+    const nv_bfloat16* __restrict__ k_in,
+    const nv_bfloat16* __restrict__ v_in,
+    const void* __restrict__ q_norm_w,
+    const void* __restrict__ k_norm_w,
+    const int* __restrict__ positions,
+    nv_bfloat16* __restrict__ q_out,
+    nv_bfloat16* __restrict__ k_cache,
+    nv_bfloat16* __restrict__ v_cache,
+    int T, int Hq, int D,
+    int rope_dims, float log2_base, float rope_scale, float eps, int offset,
+    int pos_is_2d, long long pos_sb, long long pos_st,
+    long long q_sb, long long q_st, long long q_sh,
+    long long k_sb, long long k_st, long long k_sh,
+    long long v_sb, long long v_st, long long v_sh,
+    long long kc_sb, long long kc_sh, long long kc_st,
+    long long vc_sb, long long vc_sh, long long vc_st) {
+  __shared__ float s_warp[4];
+  __shared__ nv_bfloat16 s_buf[D256 ? 256 : 1024];
+  const int t = static_cast<int>(blockIdx.x);
+  const int b = static_cast<int>(blockIdx.z);
+  const int kv_pos = offset + t;
+  const int rope_pos = pos_is_2d
+      ? positions[(long long)b * pos_sb + (long long)t * pos_st]
+      : (positions[(long long)b * pos_sb] + t);
+  qk_norm_rope_kv_store_impl<D256, W_IS_F32>(
+      q_in, k_in, v_in, q_norm_w, k_norm_w, q_out, k_cache, v_cache,
+      T, Hq, D, rope_dims, log2_base, rope_scale, eps, kv_pos, rope_pos,
+      q_sb, q_st, q_sh, k_sb, k_st, k_sh, v_sb, v_st, v_sh,
+      kc_sb, kc_sh, kc_st, vc_sb, vc_sh, vc_st, s_warp, s_buf);
+}
+)cuda"
+R"cuda(
 
 // Race-free in-place KV cache row compaction for tree acceptance (keep <= 16).
 // Copies cache[b, h, base_offset + accepted_nodes[r], :] -> cache[b, h, base_offset + r, :]
@@ -499,29 +554,30 @@ __device__ __forceinline__ void qknr_store2(
 }
 
 // Standalone fused QK-Norm + Non-Traditional (half-split) RoPE, matching
-// Metal's `mlx_qk_norm_rope` semantics:
+// Metal's `mlx_qk_norm_rope` semantics, extended with W_IS_F32 and 2D [B, T] positions:
 //   Inputs:
-//     q_in:     [B, T, Hq, D] (stride(-1) == 1)
-//     k_in:     [B, T, Hk, D] (stride(-1) == 1)
-//     q_norm_w: [D] contiguous RMSNorm weight (plain `w`, not `1 + w`)
-//     k_norm_w: [D] contiguous RMSNorm weight
-//     offsets:  [B] int32 device array (position = offsets[b] + t)
+//     q_in:      [B, T, Hq, D] (stride(-1) == 1)
+//     k_in:      [B, T, Hk, D] (stride(-1) == 1)
+//     q_norm_w:  [D] contiguous RMSNorm weight (float if W_IS_F32 else T)
+//     k_norm_w:  [D] contiguous RMSNorm weight (float if W_IS_F32 else T)
+//     positions: int32 [B, T] (pos_is_2d != 0) or [B] / scalar (pos_is_2d == 0)
 //   Outputs:
-//     q_out:    [B, Hq, T, D] row-contiguous
-//     k_out:    [B, Hk, T, D] row-contiguous
+//     q_out:     [B, Hq, T, D] row-contiguous
+//     k_out:     [B, Hk, T, D] row-contiguous
 //   FIXED_D: 128 (draft fast path), 256 (target fast path), or 0 (generic D <= 4096)
 //   Grid: dim3(T, Hq + Hk, B), Block: dim3(128, 1, 1)
-template <typename T, int FIXED_D>
+template <typename T, int FIXED_D, bool W_IS_F32>
 __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
     const T* __restrict__ q_in,
     const T* __restrict__ k_in,
-    const T* __restrict__ q_norm_w,
-    const T* __restrict__ k_norm_w,
-    const int* __restrict__ offsets,
+    const void* __restrict__ q_norm_w,
+    const void* __restrict__ k_norm_w,
+    const int* __restrict__ positions,
     T* __restrict__ q_out,
     T* __restrict__ k_out,
     int T_len, int Hq, int Hk, int D,
     int rope_dims, float log2_base, float rope_scale, float eps,
+    int pos_is_2d, long long pos_sb, long long pos_st,
     long long q_sb, long long q_st, long long q_sh,
     long long k_sb, long long k_st, long long k_sh) {
   __shared__ float s_warp[4];
@@ -538,7 +594,7 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
 
   const T* src;
   T* dst;
-  const T* norm_w;
+  const void* norm_w;
   if (is_q) {
     const int hq = hy;
     src = q_in + (long long)b * q_sb + (long long)t * q_st + (long long)hq * q_sh;
@@ -551,7 +607,10 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
     norm_w = k_norm_w;
   }
 
-  const float pos_scaled = rope_scale * static_cast<float>(offsets[b] + t);
+  const int rope_pos = pos_is_2d
+      ? positions[(long long)b * pos_sb + (long long)t * pos_st]
+      : (positions[(long long)b * pos_sb] + t);
+  const float pos_scaled = rope_scale * static_cast<float>(rope_pos);
 
   if constexpr (FIXED_D == 128) {
     const float xf = qknr_to_f32<T>(src[tid]);
@@ -567,8 +626,15 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
 
     const float sum_sq = (s_warp[0] + s_warp[1]) + (s_warp[2] + s_warp[3]);
     const float inv_rms = rsqrtf(sum_sq * (1.0f / 128.0f) + eps);
-    const T sc = qknr_from_f32<T>(xf * inv_rms);
-    const T n = qknr_from_f32<T>(qknr_to_f32<T>(norm_w[tid]) * qknr_to_f32<T>(sc));
+    T n;
+    if constexpr (W_IS_F32) {
+      const float wf = reinterpret_cast<const float*>(norm_w)[tid];
+      n = qknr_from_f32<T>((xf * inv_rms) * wf);
+    } else {
+      const T sc = qknr_from_f32<T>(xf * inv_rms);
+      const T wt = reinterpret_cast<const T*>(norm_w)[tid];
+      n = qknr_from_f32<T>(qknr_to_f32<T>(wt) * qknr_to_f32<T>(sc));
+    }
 
     if (tid < rope_dims) {
       s_buf[tid] = n;
@@ -607,12 +673,20 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
     const float sum_sq = (s_warp[0] + s_warp[1]) + (s_warp[2] + s_warp[3]);
     const float inv_rms = rsqrtf(sum_sq * (1.0f / 256.0f) + eps);
 
-    float w0, w1;
-    qknr_load2(norm_w, tid, w0, w1);
-    const T sc0 = qknr_from_f32<T>(x0 * inv_rms);
-    const T sc1 = qknr_from_f32<T>(x1 * inv_rms);
-    const T n0 = qknr_from_f32<T>(w0 * qknr_to_f32<T>(sc0));
-    const T n1 = qknr_from_f32<T>(w1 * qknr_to_f32<T>(sc1));
+    T n0, n1;
+    if constexpr (W_IS_F32) {
+      float w0, w1;
+      qknr_load2(reinterpret_cast<const float*>(norm_w), tid, w0, w1);
+      n0 = qknr_from_f32<T>((x0 * inv_rms) * w0);
+      n1 = qknr_from_f32<T>((x1 * inv_rms) * w1);
+    } else {
+      float w0, w1;
+      qknr_load2(reinterpret_cast<const T*>(norm_w), tid, w0, w1);
+      const T sc0 = qknr_from_f32<T>(x0 * inv_rms);
+      const T sc1 = qknr_from_f32<T>(x1 * inv_rms);
+      n0 = qknr_from_f32<T>(w0 * qknr_to_f32<T>(sc0));
+      n1 = qknr_from_f32<T>(w1 * qknr_to_f32<T>(sc1));
+    }
 
     const int d0 = 2 * tid;
     if (d0 < rope_dims) {
@@ -659,8 +733,15 @@ __global__ __launch_bounds__(128) void mlx_qk_norm_rope_cuda_kernel(
 
     for (int d = tid; d < D; d += 128) {
       const float xf = qknr_to_f32<T>(s_buf[d]);
-      const T sc = qknr_from_f32<T>(xf * inv_rms);
-      const T n = qknr_from_f32<T>(qknr_to_f32<T>(norm_w[d]) * qknr_to_f32<T>(sc));
+      T n;
+      if constexpr (W_IS_F32) {
+        const float wf = reinterpret_cast<const float*>(norm_w)[d];
+        n = qknr_from_f32<T>((xf * inv_rms) * wf);
+      } else {
+        const T sc = qknr_from_f32<T>(xf * inv_rms);
+        const T wt = reinterpret_cast<const T*>(norm_w)[d];
+        n = qknr_from_f32<T>(qknr_to_f32<T>(wt) * qknr_to_f32<T>(sc));
+      }
       if (d < rope_dims) {
         s_buf[d] = n;
       } else {

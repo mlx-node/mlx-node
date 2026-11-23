@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace mlx::core::kquant {
@@ -236,6 +237,10 @@ void kquant_few_dispatch(
     widx = (units >= 8 && mode != 0) ? 1 : 0;
   } else if (units < 8) {
     widx = 0;
+  } else if ((units % 8 != 0) && (units % 4 == 0) && N >= 2048) {
+    // Eliminate W=8 warp tail imbalance (e.g., 27B K=5120 -> units=20, K=17408 -> units=68)
+    // when N >= 2048 (>= 128 CTAs) already saturates SM occupancy at W=4 with half the SMEM.
+    widx = 0;
   } else {
     // 128-bit cp.async.cg double-buffered SMEM saturates DRAM at W=8 for both
     // M <= 8 and M in 9..=16 across all K-quant formats.
@@ -261,12 +266,16 @@ public:
     array scales = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
     array biases = cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
 
-    const int M = x.shape(-2);
-    const int K = x.shape(-1);
-    const int N = w.shape(0);
-    if (M < 1 || M > 16 || N <= 0 || K < 256 || K % 256 != 0) {
+    if (x.ndim() < 2) {
       throw std::invalid_argument("KQuantFew: unsupported replay shape");
     }
+    const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    const int N = w.shape(0);
+    if (M64 < 1 || M64 > 16 || N <= 0 || K < 256 || K % 256 != 0) {
+      throw std::invalid_argument("KQuantFew: unsupported replay shape");
+    }
+    const int M = static_cast<int>(M64);
     const bool m16 = M > 8;
     const int units = K / 256;
     array act(Shape{units * (m16 ? 5120 : 2560)}, uint8, nullptr, {});
@@ -340,17 +349,22 @@ public:
 
   void eval_gpu(const std::vector<array>& inputs, array& out) override {
     auto& encoder = cu::get_command_encoder(stream());
-    array x = cu::ensure_row_contiguous_aligned<8>(inputs[0], stream(), encoder);
+    array x = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
     array w = cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
     array scales = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
     array biases = cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
 
-    const int K = x.shape(-1);
-    const int M = static_cast<int>(x.size() / K);
-    const int N = w.shape(0);
-    if (M < 9 || N <= 0 || (N % 64) != 0 || K < 256 || (K % 256) != 0) {
+    if (x.ndim() < 2) {
       throw std::invalid_argument("KQuantPrefill: unsupported replay shape");
     }
+    const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    const int N = w.shape(0);
+    if (M64 < 9 || M64 > (std::numeric_limits<int32_t>::max() - 127) ||
+        N <= 0 || (N % 64) != 0 || K < 256 || (K % 256) != 0) {
+      throw std::invalid_argument("KQuantPrefill: unsupported replay shape");
+    }
+    const int M = static_cast<int>(M64);
     const int M_pad = ((M + 127) / 128) * 128;
     const int units = K / 256;
     const int64_t total_groups = static_cast<int64_t>(M_pad) * units;
@@ -448,11 +462,15 @@ public:
     auto& encoder = cu::get_command_encoder(stream());
     const size_t count = modes_.size();
     array x = cu::ensure_row_contiguous_aligned<4>(inputs[0], stream(), encoder);
-    const int M = x.shape(-2);
-    const int K = x.shape(-1);
-    if (M < 1 || M > 16 || K < 256 || K % 256 != 0) {
+    if (x.ndim() < 2) {
       throw std::invalid_argument("KQuantFewMulti: unsupported replay shape");
     }
+    const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    if (M64 < 1 || M64 > 16 || K < 256 || K % 256 != 0) {
+      throw std::invalid_argument("KQuantFewMulti: unsupported replay shape");
+    }
+    const int M = static_cast<int>(M64);
     const bool m16 = M > 8;
     const int units = K / 256;
     array act(Shape{units * (m16 ? 5120 : 2560)}, uint8, nullptr, {});
@@ -536,12 +554,17 @@ public:
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
     auto& encoder = cu::get_command_encoder(stream());
     const size_t count = modes_.size();
-    array x = cu::ensure_row_contiguous_aligned<8>(inputs[0], stream(), encoder);
-    const int K = x.shape(-1);
-    const int M = static_cast<int>(x.size() / K);
-    if (M < 9 || K < 256 || (K % 256) != 0) {
+    array x = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    if (x.ndim() < 2) {
       throw std::invalid_argument("KQuantPrefillMulti: unsupported replay shape");
     }
+    const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    if (M64 < 9 || M64 > (std::numeric_limits<int32_t>::max() - 127) ||
+        K < 256 || (K % 256) != 0) {
+      throw std::invalid_argument("KQuantPrefillMulti: unsupported replay shape");
+    }
+    const int M = static_cast<int>(M64);
     const int M_pad = ((M + 127) / 128) * 128;
     const int units = K / 256;
     const int64_t total_groups = static_cast<int64_t>(M_pad) * units;
@@ -714,17 +737,16 @@ extern "C" mlx_array* mlx_kquant_few(
     const auto& w = inputs[1];
     const auto& scales = inputs[2];
     const auto& biases = inputs[3];
-    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
-        (x.ndim() == 3 && x.shape(0) != 1)) {
+    if (x.dtype() != bfloat16 || x.ndim() < 2) {
       return nullptr;
     }
-    const int M = x.shape(-2);
     const int K = x.shape(-1);
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
     const int bits = mode == 1 ? 5 : (mode == 2 ? 6 : (mode == 4 ? 3 : 4));
     const int scale_cols = (mode == 3 || mode == 5) ? K / 32 : K / 16;
     const int bias_cols = mode == 5 ? K / 32 : ((mode == 0 || mode == 1) ? K / 128 : K / 256);
     const Dtype scale_dtype = (mode == 0 || mode == 1) ? uint8 : int8;
-    if (M < 1 || M > 16 || K < 2048 || K % 256 != 0 ||
+    if (M64 < 1 || M64 > 16 || K < 2048 || K % 256 != 0 ||
         w.ndim() != 2 || w.shape(0) <= 0 || w.dtype() != uint32 ||
         w.shape(1) != K * bits / 32 ||
         scales.ndim() != 2 || scales.dtype() != scale_dtype ||
@@ -783,17 +805,17 @@ extern "C" mlx_array* mlx_kquant_prefill(
     const auto& w = inputs[1];
     const auto& scales = inputs[2];
     const auto& biases = inputs[3];
-    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
-        (x.ndim() == 3 && x.shape(0) != 1)) {
+    if (x.dtype() != bfloat16 || x.ndim() < 2) {
       return nullptr;
     }
     const int K = x.shape(-1);
-    const int64_t M = K > 0 ? (static_cast<int64_t>(x.size()) / K) : 0;
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
     const int bits = mode == 1 ? 5 : (mode == 2 ? 6 : (mode == 4 ? 3 : 4));
     const int scale_cols = (mode == 3 || mode == 5) ? K / 32 : K / 16;
     const int bias_cols = mode == 5 ? K / 32 : ((mode == 0 || mode == 1) ? K / 128 : K / 256);
     const Dtype scale_dtype = (mode == 0 || mode == 1) ? uint8 : int8;
-    if (M < 9 || K < 2048 || K % 256 != 0 ||
+    if (M64 < 9 || M64 > (std::numeric_limits<int32_t>::max() - 127) ||
+        K < 2048 || K % 256 != 0 ||
         w.ndim() != 2 || w.shape(0) <= 0 || w.shape(0) % 64 != 0 ||
         w.dtype() != uint32 || w.shape(1) != K * bits / 32 ||
         scales.ndim() != 2 || scales.dtype() != scale_dtype ||
@@ -836,13 +858,12 @@ extern "C" bool mlx_kquant_few_multi(
       return false;
     }
     const auto& x = *reinterpret_cast<array*>(x_handle);
-    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
-        (x.ndim() == 3 && x.shape(0) != 1)) {
+    if (x.dtype() != bfloat16 || x.ndim() < 2) {
       return false;
     }
-    const int M = x.shape(-2);
     const int K = x.shape(-1);
-    if (M < 1 || M > 16 || K < 2048 || K % 256 != 0) {
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    if (M64 < 1 || M64 > 16 || K < 2048 || K % 256 != 0) {
       return false;
     }
     std::vector<array> inputs;
@@ -936,13 +957,13 @@ extern "C" bool mlx_kquant_prefill_multi(
       return false;
     }
     const auto& x = *reinterpret_cast<array*>(x_handle);
-    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
-        (x.ndim() == 3 && x.shape(0) != 1)) {
+    if (x.dtype() != bfloat16 || x.ndim() < 2) {
       return false;
     }
     const int K = x.shape(-1);
-    const int64_t M = K > 0 ? (static_cast<int64_t>(x.size()) / K) : 0;
-    if (M < 9 || K < 2048 || K % 256 != 0) {
+    const int64_t M64 = (K > 0) ? (static_cast<int64_t>(x.size()) / K) : 0;
+    if (M64 < 9 || M64 > (std::numeric_limits<int32_t>::max() - 127) ||
+        K < 2048 || K % 256 != 0) {
       return false;
     }
     std::vector<array> inputs;

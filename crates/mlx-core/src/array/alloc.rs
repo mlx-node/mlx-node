@@ -46,6 +46,7 @@ unsafe impl Send for MetalResidencySet {}
 unsafe impl Sync for MetalResidencySet {}
 
 impl MetalResidencySet {
+    #[cfg(unix)]
     pub(crate) fn create(arrays: &[&MxArray]) -> Option<Self> {
         if arrays.is_empty() {
             return None;

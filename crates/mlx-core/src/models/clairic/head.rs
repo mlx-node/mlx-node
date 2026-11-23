@@ -5,7 +5,7 @@
 
 use crate::{
     array::{DType, MxArray, scaled_dot_product_attention},
-    nn::{Activations, LayerNorm},
+    nn::Activations,
 };
 use mlx_clairic::{
     typed_decode::{
@@ -73,6 +73,15 @@ pub struct HeadOutputs {
     pub date_list: Option<MxArray>,
     /// End-of-list logits for `date_list` items: `[N_dl, S_dl]`.
     pub date_list_end: Option<MxArray>,
+}
+
+/// Precomputed prompt cross-attention memory, normalized prefix tokens, and
+/// projected cross-attention K/V tensors shared across [`ClairicHead::forward_prepared`]
+/// and [`ClairicHead::answer_slot_states_prepared`].
+pub(crate) struct ClairicPreparedMemory {
+    pub(crate) memory: MxArray,
+    pub(crate) token_normed: MxArray,
+    memory_kv: Vec<(MxArray, MxArray)>,
 }
 
 /// Loaded Clairic lexical typed head evaluated in FP32 on MLX.
@@ -352,6 +361,17 @@ impl ClairicHead {
             ));
         }
 
+        // Pre-transpose all 2D `.weight` tensors used by `linear()` once at load
+        // time so inference avoids rebuilding transpose graph nodes per call.
+        for (key, weight) in &self.weights {
+            if key.ends_with(".weight") && weight.ndim()? == 2 {
+                let t_key = format!("{key}_t");
+                if !self.derived.contains_key(&t_key) {
+                    inserts.push((t_key, weight.transpose(None)?));
+                }
+            }
+        }
+
         let refs: Vec<&MxArray> = inserts.iter().map(|(_, a)| a).collect();
         MxArray::eval_arrays(&refs)?;
         self.derived.extend(inserts);
@@ -371,8 +391,12 @@ impl ClairicHead {
     }
 
     fn linear(&self, name: &str, x: &MxArray) -> Result<MxArray> {
-        let weight = self.w(&format!("{name}.weight"))?;
-        let y = x.matmul(&weight.transpose(None)?)?;
+        let y = if let Some(weight_t) = self.derived.get(&format!("{name}.weight_t")) {
+            x.matmul(weight_t)?
+        } else {
+            let weight = self.w(&format!("{name}.weight"))?;
+            x.matmul(&weight.transpose(None)?)?
+        };
         match self.weights.get(&format!("{name}.bias")) {
             Some(bias) => y.add(bias),
             None => Ok(y),
@@ -380,12 +404,19 @@ impl ClairicHead {
     }
 
     fn norm(&self, name: &str, x: &MxArray) -> Result<MxArray> {
-        LayerNorm::from_weights(
-            self.w(&format!("{name}.weight"))?,
-            Some(self.w(&format!("{name}.bias"))?),
-            Some(1e-5),
-        )?
-        .forward(x)
+        let weight = self.w(&format!("{name}.weight"))?;
+        let bias = self.w(&format!("{name}.bias"))?;
+        // SAFETY: `x`, `weight`, and `bias` are live `MxArray`s validated at load time
+        // (1D FP32 weight and bias of matching width), and `from_handle` checks for null.
+        let handle = unsafe {
+            mlx_sys::mlx_fast_layer_norm(
+                x.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                bias.as_raw_ptr(),
+                1e-5_f32,
+            )
+        };
+        MxArray::from_handle(handle, "fast_layer_norm")
     }
 
     fn normalize(x: &MxArray) -> Result<MxArray> {
@@ -463,11 +494,11 @@ impl ClairicHead {
         self.linear(&format!("{prefix}.out_proj"), &out)
     }
 
-    /// Compute the prompt cross-attention memory tensor `[1, stop, route_width]` in FP32.
-    ///
-    /// Matches `model.py:1156` (`memory_in(token_norm(hidden[:stop].float())).unsqueeze(0)`)
-    /// and the input stage of `mlx_engine.py::_memory`.
-    pub fn memory(&self, hidden: &MxArray, stop: i64) -> Result<MxArray> {
+    fn compute_token_norm_and_memory(
+        &self,
+        hidden: &MxArray,
+        stop: i64,
+    ) -> Result<(MxArray, MxArray)> {
         if hidden.ndim()? != 2 || hidden.shape_at(1)? != self.config.hidden_size {
             return Err(Error::from_reason(
                 "Invalid hidden tensor shape for ClairicHead::memory",
@@ -479,11 +510,81 @@ impl ClairicHead {
                 "Invalid Clairic memory stop={stop} for hidden length {tokens}"
             )));
         }
-        let prefix = hidden.slice_axis(0, 0, stop)?.astype(DType::Float32)?;
-        let normed = self.norm("token_norm", &prefix)?;
-        let mem = self.linear("memory_in", &normed)?.expand_dims(0)?;
+        let sliced = hidden.slice_axis(0, 0, stop)?;
+        let prefix = if sliced.dtype()? == DType::Float32 {
+            sliced
+        } else {
+            sliced.astype(DType::Float32)?
+        };
+        let token_normed = self.norm("token_norm", &prefix)?;
+        let memory = self.linear("memory_in", &token_normed)?.expand_dims(0)?;
+        Ok((token_normed, memory))
+    }
+
+    /// Compute the prompt cross-attention memory tensor `[1, stop, route_width]` in FP32.
+    ///
+    /// Matches `model.py:1156` (`memory_in(token_norm(hidden[:stop].float())).unsqueeze(0)`)
+    /// and the input stage of `mlx_engine.py::_memory`.
+    pub fn memory(&self, hidden: &MxArray, stop: i64) -> Result<MxArray> {
+        let (_token_normed, mem) = self.compute_token_norm_and_memory(hidden, stop)?;
         mem.eval();
         Ok(mem)
+    }
+
+    /// Precompute `token_norm`, prompt cross-attention `memory`, and projected
+    /// cross-attention K/V tensors once without forcing a premature GPU sync,
+    /// for reuse across [`Self::forward_prepared`] and
+    /// [`Self::answer_slot_states_prepared`].
+    pub(crate) fn prepare_memory(
+        &self,
+        hidden: &MxArray,
+        stop: i64,
+    ) -> Result<ClairicPreparedMemory> {
+        let (token_normed, memory) = self.compute_token_norm_and_memory(hidden, stop)?;
+        let memory_kv = self.project_memory_kv(&memory)?;
+        Ok(ClairicPreparedMemory {
+            memory,
+            token_normed,
+            memory_kv,
+        })
+    }
+
+    fn validate_prepared_memory(
+        &self,
+        prepared: &ClairicPreparedMemory,
+        stop: i64,
+        require_token_normed: bool,
+    ) -> Result<()> {
+        if prepared.memory.ndim()? != 3
+            || prepared.memory.shape_at(0)? != 1
+            || prepared.memory.shape_at(1)? != stop
+            || prepared.memory.shape_at(2)? != self.config.route_width
+        {
+            return Err(Error::from_reason(format!(
+                "Invalid Clairic prepared memory shape {:?}; expected [1, {stop}, {}]",
+                prepared.memory.shape()?.as_ref(),
+                self.config.route_width
+            )));
+        }
+        if prepared.memory_kv.len() != self.config.route_layers {
+            return Err(Error::from_reason(format!(
+                "Invalid Clairic prepared memory_kv layer count {}; expected {}",
+                prepared.memory_kv.len(),
+                self.config.route_layers
+            )));
+        }
+        if require_token_normed
+            && (prepared.token_normed.ndim()? != 2
+                || prepared.token_normed.shape_at(0)? != stop
+                || prepared.token_normed.shape_at(1)? != self.config.hidden_size)
+        {
+            return Err(Error::from_reason(format!(
+                "Invalid Clairic prepared token_normed shape {:?}; expected [{stop}, {}]",
+                prepared.token_normed.shape()?.as_ref(),
+                self.config.hidden_size
+            )));
+        }
+        Ok(())
     }
 
     fn normalize_memory_arg(&self, memory: &MxArray, stop: i64) -> Result<MxArray> {
@@ -625,8 +726,8 @@ impl ClairicHead {
         let count = raw.shape_at(0)?;
         let r = self.config.slot_rank;
         let unit = Self::normalize(raw)?;
-        let down = raw
-            .matmul(&self.w("slot_down.weight")?.transpose(None)?)?
+        let down = self
+            .linear("slot_down", raw)?
             .reshape(&[count, DIGIT_SLOTS + 2, r])?;
 
         let digit_prior = unit.matmul(self.d("digit_rows_unit_t")?)?.expand_dims(1)?;
@@ -788,15 +889,13 @@ impl ClairicHead {
         Self::span_scores(&start, &end, self.w("length_bias")?)
     }
 
-    /// Run the full lexical typed-head forward pass (`mlx_engine.py::TypedHead.forward`).
-    pub fn forward(
+    fn validate_forward_inputs(
         &self,
         hidden: &MxArray,
         input_start: i64,
         stop: i64,
         views: &PredictionViews,
-        memory: &MxArray,
-    ) -> Result<HeadOutputs> {
+    ) -> Result<i64> {
         if hidden.ndim()? != 2 || hidden.shape_at(1)? != self.config.hidden_size {
             return Err(Error::from_reason(
                 "Invalid hidden tensor shape for ClairicHead::forward",
@@ -808,14 +907,71 @@ impl ClairicHead {
                 "Invalid Clairic token range start={input_start}, stop={stop}, hidden_len={tokens_len}"
             )));
         }
-        let count = views.query_positions.len();
-        if count == 0 {
+        if views.query_positions.is_empty() {
             return Err(Error::from_reason(
                 "ClairicHead::forward requires at least one query position",
             ));
         }
+        Ok(tokens_len)
+    }
+
+    /// Run the full lexical typed-head forward pass (`mlx_engine.py::TypedHead.forward`).
+    pub fn forward(
+        &self,
+        hidden: &MxArray,
+        input_start: i64,
+        stop: i64,
+        views: &PredictionViews,
+        memory: &MxArray,
+    ) -> Result<HeadOutputs> {
+        let tokens_len = self.validate_forward_inputs(hidden, input_start, stop, views)?;
         let mem = self.normalize_memory_arg(memory, stop)?;
         let memory_kv = self.project_memory_kv(&mem)?;
+        self.forward_impl(
+            hidden,
+            tokens_len,
+            input_start,
+            stop,
+            views,
+            &memory_kv,
+            None,
+        )
+    }
+
+    /// Run the lexical typed-head forward pass reusing precomputed `token_norm`
+    /// states and projected cross-attention K/V tensors from [`Self::prepare_memory`].
+    pub(crate) fn forward_prepared(
+        &self,
+        hidden: &MxArray,
+        input_start: i64,
+        stop: i64,
+        views: &PredictionViews,
+        prepared: &ClairicPreparedMemory,
+    ) -> Result<HeadOutputs> {
+        let tokens_len = self.validate_forward_inputs(hidden, input_start, stop, views)?;
+        self.validate_prepared_memory(prepared, stop, true)?;
+        self.forward_impl(
+            hidden,
+            tokens_len,
+            input_start,
+            stop,
+            views,
+            &prepared.memory_kv,
+            Some(&prepared.token_normed),
+        )
+    }
+
+    fn forward_impl(
+        &self,
+        hidden: &MxArray,
+        tokens_len: i64,
+        input_start: i64,
+        stop: i64,
+        views: &PredictionViews,
+        memory_kv: &[(MxArray, MxArray)],
+        precomputed_token_normed: Option<&MxArray>,
+    ) -> Result<HeadOutputs> {
+        let count = views.query_positions.len();
 
         // Validate row indices and list item shapes before building flat positions/kinds.
         let group_rows: [&[i64]; 8] = [
@@ -952,7 +1108,7 @@ impl ClairicHead {
             .add(&kind_emb)?
             .expand_dims(0)?;
         let routed = self
-            .route_layers(route_queries, &memory_kv, None)?
+            .route_layers(route_queries, memory_kv, None)?
             .squeeze(Some(&[0]))?;
         let routed = self.norm("route_norm", &routed)?;
         let states = normed_raw.add(
@@ -974,8 +1130,13 @@ impl ClairicHead {
 
         let mut trim = None;
         let tokens = if has_text || has_tags || has_numbers {
-            let sliced = hidden_f32.slice_axis(0, input_start, stop)?;
-            let tok = self.norm("token_norm", &sliced)?;
+            let tok = match precomputed_token_normed {
+                Some(normed) => normed.slice_axis(0, input_start, stop)?,
+                None => {
+                    let sliced = hidden_f32.slice_axis(0, input_start, stop)?;
+                    self.norm("token_norm", &sliced)?
+                }
+            };
             if has_text || has_tags {
                 let tok_len = tok.shape_at(0)?;
                 trim = Some(
@@ -1182,12 +1343,7 @@ impl ClairicHead {
         })
     }
 
-    /// Correct each answer-slot hidden state by evidence routed from the prompt.
-    ///
-    /// Matches `mlx_engine.py::TypedHead.answer_slot_states` (`L326-353`) and
-    /// `model.py::ClairicHead.answer_slot_states` (`L1162-1246`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn answer_slot_states(
+    fn validate_answer_slot_inputs(
         &self,
         hidden: &MxArray,
         field_queries: &[i64],
@@ -1195,10 +1351,7 @@ impl ClairicHead {
         slot_positions: &[Vec<i64>],
         slot_lengths: &[i64],
         stop: i64,
-        memory: &MxArray,
-    ) -> Result<MxArray> {
-        const CHUNK: usize = 256;
-
+    ) -> Result<usize> {
         if hidden.ndim()? != 2 || hidden.shape_at(1)? != self.config.hidden_size {
             return Err(Error::from_reason("invalid answer-slot routing layout"));
         }
@@ -1215,7 +1368,7 @@ impl ClairicHead {
             ));
         }
         if n == 0 {
-            return MxArray::zeros(&[0, 0, self.config.hidden_size], Some(DType::Float32));
+            return Ok(0);
         }
         let width = slot_positions[0].len();
         if width < 1 {
@@ -1250,9 +1403,101 @@ impl ClairicHead {
                 }
             }
         }
+        Ok(width)
+    }
 
+    /// Correct each answer-slot hidden state by evidence routed from the prompt.
+    ///
+    /// Matches `mlx_engine.py::TypedHead.answer_slot_states` (`L326-353`) and
+    /// `model.py::ClairicHead.answer_slot_states` (`L1162-1246`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn answer_slot_states(
+        &self,
+        hidden: &MxArray,
+        field_queries: &[i64],
+        slot_kinds: &[i64],
+        slot_positions: &[Vec<i64>],
+        slot_lengths: &[i64],
+        stop: i64,
+        memory: &MxArray,
+    ) -> Result<MxArray> {
+        let width = self.validate_answer_slot_inputs(
+            hidden,
+            field_queries,
+            slot_kinds,
+            slot_positions,
+            slot_lengths,
+            stop,
+        )?;
+        if field_queries.is_empty() {
+            return MxArray::zeros(&[0, 0, self.config.hidden_size], Some(DType::Float32));
+        }
         let mem = self.normalize_memory_arg(memory, stop)?;
         let memory_kv = self.project_memory_kv(&mem)?;
+        self.answer_slot_states_impl(
+            hidden,
+            field_queries,
+            slot_kinds,
+            slot_positions,
+            slot_lengths,
+            stop,
+            width,
+            &memory_kv,
+        )
+    }
+
+    /// Correct each answer-slot hidden state reusing projected cross-attention
+    /// K/V tensors from [`Self::prepare_memory`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn answer_slot_states_prepared(
+        &self,
+        hidden: &MxArray,
+        field_queries: &[i64],
+        slot_kinds: &[i64],
+        slot_positions: &[Vec<i64>],
+        slot_lengths: &[i64],
+        stop: i64,
+        prepared: &ClairicPreparedMemory,
+    ) -> Result<MxArray> {
+        let width = self.validate_answer_slot_inputs(
+            hidden,
+            field_queries,
+            slot_kinds,
+            slot_positions,
+            slot_lengths,
+            stop,
+        )?;
+        if field_queries.is_empty() {
+            return MxArray::zeros(&[0, 0, self.config.hidden_size], Some(DType::Float32));
+        }
+        self.validate_prepared_memory(prepared, stop, false)?;
+        self.answer_slot_states_impl(
+            hidden,
+            field_queries,
+            slot_kinds,
+            slot_positions,
+            slot_lengths,
+            stop,
+            width,
+            &prepared.memory_kv,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn answer_slot_states_impl(
+        &self,
+        hidden: &MxArray,
+        field_queries: &[i64],
+        slot_kinds: &[i64],
+        slot_positions: &[Vec<i64>],
+        slot_lengths: &[i64],
+        stop: i64,
+        width: usize,
+        memory_kv: &[(MxArray, MxArray)],
+    ) -> Result<MxArray> {
+        const CHUNK: usize = 256;
+
+        let n = field_queries.len();
         let hidden_f32 = if hidden.dtype()? == DType::Float32 {
             hidden.clone()
         } else {
@@ -1264,6 +1509,7 @@ impl ClairicHead {
         let field_batch = (CHUNK / (width + 1))
             .min(262_144usize / (stop as usize))
             .max(1);
+        let multi_chunk = n > field_batch;
         let mut chunks: Vec<MxArray> = Vec::with_capacity(n.div_ceil(field_batch));
 
         let width_i64 = width as i64;
@@ -1310,7 +1556,7 @@ impl ClairicHead {
                 .take(&row_kinds_arr, 0)?
                 .expand_dims(1)?;
             let routed =
-                self.route_layers(queries_in.add(&kind_emb)?, &memory_kv, Some(&attn_mask))?;
+                self.route_layers(queries_in.add(&kind_emb)?, memory_kv, Some(&attn_mask))?;
             let slot_routed = routed.slice_axis(1, 1, width_i64 + 1)?;
             let evidence = self.linear("route_out", &self.norm("route_norm", &slot_routed)?)?;
             let scale = slot_route_scale_tanh
@@ -1319,7 +1565,9 @@ impl ClairicHead {
             let raw_slots = hidden_f32.take(&slot_pos_arr, 0)?;
             let corrected = raw_slots.add(&scale.mul(gate)?.mul(&evidence)?)?;
             let clamped = corrected.take_along_axis(&gather_arr, 1)?;
-            clamped.eval();
+            if multi_chunk {
+                clamped.eval();
+            }
             chunks.push(clamped);
         }
 
@@ -1906,6 +2154,233 @@ mod tests {
         let row0_slot3 = &flat[3 * h..4 * h];
         assert_eq!(row0_slot1, row0_slot2);
         assert_eq!(row0_slot1, row0_slot3);
+    }
+
+    #[test]
+    fn prepared_memory_matches_unprepared_bit_for_bit_and_pretransposes_2d_weights() {
+        let cfg = synthetic_config();
+        let head =
+            ClairicHead::from_weights(cfg.clone(), synthetic_weights(&cfg), 64, false).unwrap();
+
+        let assert_bits_eq = |label: &str, a: &MxArray, b: &MxArray| {
+            assert_eq!(
+                a.shape().unwrap().as_ref(),
+                b.shape().unwrap().as_ref(),
+                "{label} shape mismatch"
+            );
+            let av: Vec<u32> = a
+                .to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let bv: Vec<u32> = b
+                .to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(av, bv, "{label} bit-level mismatch");
+        };
+
+        // Every 2D `.weight` tensor has a matching pre-transposed `{key}_t` entry in `derived`.
+        let mut checked_2d = 0usize;
+        for (key, weight) in &head.weights {
+            if key.ends_with(".weight") && weight.ndim().unwrap() == 2 {
+                let t_key = format!("{key}_t");
+                let baked = head
+                    .derived
+                    .get(&t_key)
+                    .unwrap_or_else(|| panic!("missing pre-transposed derived tensor {t_key}"));
+                let expected = weight.transpose(None).unwrap();
+                assert_bits_eq(&t_key, baked, &expected);
+                checked_2d += 1;
+            }
+        }
+        assert!(
+            checked_2d > 20,
+            "expected >20 pre-transposed 2D weights, got {checked_2d}"
+        );
+
+        let tokens = 30i64;
+        let input_start = 4i64;
+        let stop = 16i64;
+        let hidden = MxArray::from_float32(
+            &det_data(99, (tokens * cfg.hidden_size) as usize, 0.5),
+            &[tokens, cfg.hidden_size],
+        )
+        .unwrap();
+
+        let memory = head.memory(&hidden, stop).unwrap();
+        let prepared = head.prepare_memory(&hidden, stop).unwrap();
+        assert_bits_eq("memory", &memory, &prepared.memory);
+
+        let views = PredictionViews {
+            query_positions: vec![16, 17, 18, 19, 20, 21, 22, 23],
+            text_rows: vec![0],
+            tags_rows: vec![1],
+            number_rows: vec![2],
+            date_rows: vec![3],
+            time_rows: vec![4],
+            estimate_rows: vec![5],
+            number_list_rows: vec![6],
+            date_list_rows: vec![7],
+            number_list_items: vec![vec![24, 25, 26]],
+            date_list_items: vec![vec![27, 28, 29]],
+        };
+
+        let out_ref = head
+            .forward(&hidden, input_start, stop, &views, &memory)
+            .unwrap();
+        let out_prep = head
+            .forward_prepared(&hidden, input_start, stop, &views, &prepared)
+            .unwrap();
+
+        assert_bits_eq("null", &out_ref.null, &out_prep.null);
+        for (label, lhs, rhs) in [
+            ("trim", &out_ref.trim, &out_prep.trim),
+            ("text", &out_ref.text, &out_prep.text),
+            ("tags", &out_ref.tags, &out_prep.tags),
+            ("number", &out_ref.number, &out_prep.number),
+            (
+                "number_groups",
+                &out_ref.number_groups,
+                &out_prep.number_groups,
+            ),
+            ("number_copy", &out_ref.number_copy, &out_prep.number_copy),
+            (
+                "number_copy_gate",
+                &out_ref.number_copy_gate,
+                &out_prep.number_copy_gate,
+            ),
+            ("date", &out_ref.date, &out_prep.date),
+            ("time", &out_ref.time, &out_prep.time),
+            ("estimate", &out_ref.estimate, &out_prep.estimate),
+            (
+                "estimate_offset",
+                &out_ref.estimate_offset,
+                &out_prep.estimate_offset,
+            ),
+            (
+                "estimate_overflow",
+                &out_ref.estimate_overflow,
+                &out_prep.estimate_overflow,
+            ),
+            (
+                "estimate_number_raw",
+                &out_ref.estimate_number_raw,
+                &out_prep.estimate_number_raw,
+            ),
+            (
+                "estimate_number",
+                &out_ref.estimate_number,
+                &out_prep.estimate_number,
+            ),
+            (
+                "estimate_gate",
+                &out_ref.estimate_gate,
+                &out_prep.estimate_gate,
+            ),
+            ("number_list", &out_ref.number_list, &out_prep.number_list),
+            (
+                "number_list_end",
+                &out_ref.number_list_end,
+                &out_prep.number_list_end,
+            ),
+            (
+                "number_list_groups",
+                &out_ref.number_list_groups,
+                &out_prep.number_list_groups,
+            ),
+            ("date_list", &out_ref.date_list, &out_prep.date_list),
+            (
+                "date_list_end",
+                &out_ref.date_list_end,
+                &out_prep.date_list_end,
+            ),
+        ] {
+            assert_bits_eq(label, lhs.as_ref().unwrap(), rhs.as_ref().unwrap());
+        }
+
+        // Single-chunk answer_slot_states (n = 3 <= field_batch)
+        let field_queries = [16, 17, 18];
+        let slot_kinds = [0, 1, 2];
+        let slot_positions = vec![
+            vec![24, 25, 26, 27],
+            vec![25, 26, 27, 28],
+            vec![26, 27, 28, 29],
+        ];
+        let slot_lengths = [2, 4, 1];
+        let slots_ref = head
+            .answer_slot_states(
+                &hidden,
+                &field_queries,
+                &slot_kinds,
+                &slot_positions,
+                &slot_lengths,
+                stop,
+                &memory,
+            )
+            .unwrap();
+        let slots_prep = head
+            .answer_slot_states_prepared(
+                &hidden,
+                &field_queries,
+                &slot_kinds,
+                &slot_positions,
+                &slot_lengths,
+                stop,
+                &prepared,
+            )
+            .unwrap();
+        assert_bits_eq("answer_slot_states_single_chunk", &slots_ref, &slots_prep);
+
+        // Multi-chunk answer_slot_states (width = 128 => field_batch = 1 < n = 2)
+        let mc_queries = [16, 17];
+        let mc_kinds = [0, 1];
+        let mc_positions = vec![vec![24; 128], vec![25; 128]];
+        let mc_lengths = [64, 128];
+        let mc_ref = head
+            .answer_slot_states(
+                &hidden,
+                &mc_queries,
+                &mc_kinds,
+                &mc_positions,
+                &mc_lengths,
+                stop,
+                &memory,
+            )
+            .unwrap();
+        let mc_prep = head
+            .answer_slot_states_prepared(
+                &hidden,
+                &mc_queries,
+                &mc_kinds,
+                &mc_positions,
+                &mc_lengths,
+                stop,
+                &prepared,
+            )
+            .unwrap();
+        assert_bits_eq("answer_slot_states_multi_chunk", &mc_ref, &mc_prep);
+
+        // Mismatched `stop` against `prepared` must return an error.
+        assert!(
+            head.forward_prepared(&hidden, input_start, stop - 1, &views, &prepared)
+                .is_err()
+        );
+        assert!(
+            head.answer_slot_states_prepared(
+                &hidden,
+                &field_queries,
+                &slot_kinds,
+                &slot_positions,
+                &slot_lengths,
+                stop - 1,
+                &prepared,
+            )
+            .is_err()
+        );
     }
 
     #[test]
