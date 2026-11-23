@@ -5,7 +5,7 @@ import { Alert } from '../../components/arc/alert/alert';
 import { Button } from '../../components/arc/button/button';
 import { Drawer, DrawerContent } from '../../components/arc/drawer/drawer';
 import { EmptyState } from '../../components/arc/empty-state/empty-state';
-import type { CatalogItem, CatalogResponse, CatalogUpdatesResponse, ModelsResponse } from '../../lib/types';
+import type { CatalogItem, CatalogResponse, CatalogUpdatesResponse, HostResponse } from '../../lib/types';
 import type { AsyncState } from '../../lib/use-api';
 import { PageSection } from '../../shell/page';
 import { CatalogCardPlaceholder, CatalogEntryCard, CatalogGrid, useChosenBuilds } from '../models/catalog';
@@ -20,8 +20,8 @@ export function isSystemOneCatalogItem(item: CatalogItem): boolean {
 export interface SystemOneModelsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  models: AsyncState<ModelsResponse>;
   catalog: AsyncState<CatalogResponse>;
+  host: AsyncState<HostResponse>;
   updates: AsyncState<CatalogUpdatesResponse>;
   downloads: ModelDownloads;
 }
@@ -30,13 +30,11 @@ export interface SystemOneModelsDrawerProps {
 export function SystemOneModelsDrawer({
   open,
   onOpenChange,
-  models,
   catalog,
+  host,
   downloads,
 }: SystemOneModelsDrawerProps): ReactElement {
   const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
-  const localModels = models.data?.models ?? [];
-  const host = models.data?.host;
   const { chosen, choose } = useChosenBuilds();
 
   return (
@@ -58,7 +56,7 @@ export function SystemOneModelsDrawer({
             </Alert>
           ) : null}
 
-          {catalog.data === undefined ? (
+          {catalog.data === undefined || host.loading ? (
             catalog.error !== undefined ? null : (
               <CatalogGrid>
                 <CatalogCardPlaceholder />
@@ -82,8 +80,7 @@ export function SystemOneModelsDrawer({
                   key={item.label}
                   item={item}
                   downloads={downloads}
-                  host={host}
-                  localModels={localModels}
+                  host={host.data}
                   chosen={chosen}
                   choose={choose}
                 />
@@ -98,16 +95,15 @@ export function SystemOneModelsDrawer({
 
 /** Inline onboarding card displayed when 0 System One models are installed. */
 export function NoSystemOneModelsCard({
-  models,
   catalog,
+  host,
   downloads,
 }: {
-  models: AsyncState<ModelsResponse>;
   catalog: AsyncState<CatalogResponse>;
+  host: AsyncState<HostResponse>;
   downloads: ModelDownloads;
 }): ReactElement {
   const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
-  const host = models.data?.host;
   const { chosen, choose } = useChosenBuilds();
 
   return (
@@ -115,7 +111,7 @@ export function NoSystemOneModelsCard({
       title="Install a System One model to get started"
       description="Download Clairic Flash (9B) for fast structured extraction or Clairic (27B) for highest accuracy and forecasting."
     >
-      {catalog.data === undefined && catalog.error === undefined ? (
+      {(catalog.data === undefined && catalog.error === undefined) || host.loading ? (
         <CatalogGrid>
           <CatalogCardPlaceholder />
           <CatalogCardPlaceholder />
@@ -127,8 +123,7 @@ export function NoSystemOneModelsCard({
               key={item.label}
               item={item}
               downloads={downloads}
-              host={host}
-              localModels={models.data?.models ?? []}
+              host={host.data}
               chosen={chosen}
               choose={choose}
             />

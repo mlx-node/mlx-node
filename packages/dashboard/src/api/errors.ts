@@ -69,8 +69,8 @@ export class ApiError extends Error {
     return new ApiError('E_METHOD_NOT_ALLOWED', message);
   }
 
-  static conflict(message: string): ApiError {
-    return new ApiError('E_CONFLICT', message);
+  static conflict(message: string, reason?: string): ApiError {
+    return new ApiError('E_CONFLICT', message, reason);
   }
 
   static payloadTooLarge(message: string): ApiError {

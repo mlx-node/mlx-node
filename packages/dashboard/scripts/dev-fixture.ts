@@ -2251,7 +2251,7 @@ function writeCatalogSecondBuild(home: string, now: number): void {
 
 /**
  * A catalog slug held by a leftover the app did not create (one companion file, no config.json): the card shows
- * "Needs cleanup" with Reinstall.
+ * "Needs cleanup" with Clean up & update, which sends the folder to the Trash.
  */
 export const CATALOG_BLOCKED = {
   slug: 'inkling-2-mini-gguf',
@@ -2265,6 +2265,29 @@ function writeCatalogBlocked(home: string): void {
   const file = join(dir, CATALOG_BLOCKED.file);
   writeFileSync(file, '');
   truncateSync(file, CATALOG_BLOCKED.sizeBytes);
+}
+
+/**
+ * A catalog slug (Qwen3.8-Flash-Next) that is a link the user made to a folder of model files: the first of the four
+ * shards, so no model is there to load. The card shows "Needs cleanup" with Clean up & update, which removes only the
+ * link. The folder stays inside the fixture home.
+ */
+export const CATALOG_LINK = {
+  slug: 'qwen3.8-flash-next-gguf',
+  target: 'external/Qwen3.8-Flash-Next-GGUF',
+  shard: 'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+  shardBytes: 2 * MIB,
+} as const;
+
+function writeCatalogLink(home: string): void {
+  const target = join(home, CATALOG_LINK.target);
+  const shard = join(target, CATALOG_LINK.shard);
+  mkdirSync(dirname(shard), { recursive: true });
+  writeFileSync(shard, '');
+  truncateSync(shard, CATALOG_LINK.shardBytes);
+  const link = join(fixturePaths(home).modelsDir, CATALOG_LINK.slug);
+  rmSync(link, { force: true });
+  symlinkSync(realpathSync(target), link);
 }
 
 /**
@@ -2372,6 +2395,7 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   writeCatalogInstall(home, now);
   writeCatalogSecondBuild(home, now);
   writeCatalogBlocked(home);
+  writeCatalogLink(home);
   writeCatalogUpdate(home);
   writeCatalogLocated(home, now);
   writeCodingAgents(home);

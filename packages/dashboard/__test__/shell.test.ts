@@ -579,7 +579,6 @@ describe('palette contents', () => {
     ],
     warnings: [],
     dir: '/m',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
   const SESSION_ID = '019a0000-0000-7000-8000-00000000abcd';
   const SESSIONS = {
@@ -683,7 +682,6 @@ describe('model colors', () => {
     ],
     warnings: [],
     dir: '/m',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
 
   beforeEach(() => resetModelColors());

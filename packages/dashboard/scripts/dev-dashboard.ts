@@ -18,8 +18,10 @@
  * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
  */
 
+import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdir, rename } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 import { createServer } from 'vite-plus';
 
@@ -138,11 +140,18 @@ async function main(): Promise<void> {
   };
   const workFolder = join(home, 'work', ...(process.env.MLX_DEV_WORK_DEEP === '1' ? DEEP_FOLDER : []));
   mkdirSync(workFolder, { recursive: true });
+  const devTrash = join(dirname(paths.modelsDir), '.dev-trash');
   const runtime = createDashboardRuntime({
     ...paths,
     codingAgents: { home, env: {} },
     prepareDelegation: async () => FIXTURE_COMMAND,
     chat,
+    // The harness never reaches the real Trash: a cleanup's old entry moves into a folder beside the fixture models.
+    moveToTrash: async (path) => {
+      const into = join(devTrash, randomUUID());
+      await mkdir(into, { recursive: true });
+      await rename(path, join(into, basename(path)));
+    },
   });
 
   let server: Awaited<ReturnType<typeof createServer>>;

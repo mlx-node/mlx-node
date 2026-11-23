@@ -98,6 +98,13 @@ vi.mock('node:fs/promises', async (importActual) => {
   };
 });
 
+// A Locate never moves anything to the Trash, and no test reaches the real one.
+vi.mock('../src/trash.js', () => ({
+  moveToSystemTrash: async () => {
+    throw new Error('a Locate test reached the Trash');
+  },
+}));
+
 vi.mock('@huggingface/hub', () => ({
   getRepoFolderName: ({ name, type }: { name: string; type: string }) => [`${type}s`, ...name.split('/')].join('--'),
   modelInfo: async (params: { name?: string }) => {

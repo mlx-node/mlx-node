@@ -22,7 +22,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
@@ -118,6 +118,9 @@ beforeEach(() => {
     tracesDir,
     modelsDir,
     cacheRoot,
+    moveToTrash: async () => {
+      throw new Error('an API test reached the Trash');
+    },
   });
   api = createTestClient(runtime);
 });
@@ -1849,11 +1852,26 @@ describe('dashboard api — cancel download route', () => {
 // a job that has not run yet. Asserted at the route layer with a stub manager so
 // no multi-GB transfer is triggered — a live-repo POST would really download.
 describe('dashboard api — download start is 202 Accepted', () => {
-  it('answers 202 (not 200) for an accepted download start', async () => {
-    const ctx = { downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO }) } } as unknown as ApiContext;
+  it('answers 202 (not 200) for an accepted download start, with the job kind', async () => {
+    const ctx = {
+      downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO, kind: 'install' }) },
+    } as unknown as ApiContext;
     const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
     expect(res.status).toBe(202);
-    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', slug: CATALOG_SLUG, repo: CATALOG_REPO });
+    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', slug: CATALOG_SLUG, repo: CATALOG_REPO, kind: 'install' });
+  });
+
+  it('sends the reason of a conflict beside its text', async () => {
+    const text = 'A download of this model is already in the queue. Cancel it, then use Clean up & update.';
+    const ctx = {
+      downloads: {
+        start: () => {
+          throw new DownloadConflictError(text);
+        },
+      },
+    } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
+    expect(res).toEqual({ ok: false, code: 'E_CONFLICT', message: text, status: 409 });
   });
 
   it('answers 400 for a body that names a repo and no folder', async () => {
@@ -1952,6 +1970,10 @@ describe('dashboard api — Update plan route', () => {
     const conflict = await postPlan(() => Promise.reject(new DownloadConflictError(text)));
     expect(conflict.status).toBe(409);
     expect(conflict.ok ? '' : conflict.message).toBe(text);
+    expect('reason' in conflict).toBe(false);
+
+    const cleanup = await postPlan(() => Promise.reject(new DownloadConflictError(text, 'needs-cleanup')));
+    expect(cleanup).toEqual({ ok: false, code: 'E_CONFLICT', message: text, status: 409, reason: 'needs-cleanup' });
   });
 
   it('answers 503 while shutting down, and 400 for a bad body or a failed check', async () => {
@@ -1993,7 +2015,7 @@ describe('dashboard api — Update start', () => {
     const { res, calls } = postStart({
       slug: CATALOG_SLUG,
       adopt: 'a'.repeat(64),
-      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 1, truncated: false },
+      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 1, truncated: false, linkTarget: null },
     });
     const answer = await res;
     expect(answer.status).toBe(400);
@@ -2014,6 +2036,22 @@ describe('dashboard api — Update start', () => {
     expect(answer.status).toBe(400);
     expect(answer.ok ? '' : answer.message).toBe('"adopt" must be the 64-character token of an Update plan');
     expect(calls).toEqual([]);
+  });
+});
+
+describe('dashboard api — host', () => {
+  it('answers on the transport thread with the memory and the free space of the models disk', async () => {
+    const route = ROUTES.find((r) => r.method === 'GET' && r.segments.join('/') === 'api/host');
+    expect(route?.thread).toBe('main');
+    const body = await get<{ totalMemBytes: number; diskFreeBytes: number | null }>('/api/host');
+    expect(body.totalMemBytes).toBe(totalmem());
+    expect(body.diskFreeBytes).toBeGreaterThan(0);
+  });
+
+  it('answers null free space for a models folder that is not there', async () => {
+    const ctx = { modelsDir: join(base, 'missing') } as unknown as ApiContext;
+    const res = await call(ctx, 'GET', '/api/host');
+    expect(res.ok ? res.body : null).toEqual({ totalMemBytes: totalmem(), diskFreeBytes: null });
   });
 });
 

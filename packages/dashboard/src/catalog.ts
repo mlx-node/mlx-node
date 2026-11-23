@@ -24,6 +24,7 @@ import {
   type ForeignEntrySummary,
   ggufBuilds,
   isDownloaderOwned,
+  isListedFolder,
   isModelInstalled,
   isModelPresent,
   isPathOccupied,
@@ -33,7 +34,7 @@ import {
   summarizeForeignEntry,
 } from './models.js';
 
-/** What is in the way of a blocked install: the numbers Reinstall shows and echoes back. */
+/** What is in the way of a blocked install: what the cleanup confirmation shows and its request echoes back. */
 export type CatalogBlocker = ForeignEntrySummary;
 
 /** One build of a catalog model with the state of its install folder. */
@@ -124,6 +125,8 @@ export interface CatalogBuildItem {
    * stays the app's own: not present, no blocker.
    */
   located: Pick<LocatedState, 'from' | 'mode' | 'filesAvailable'> | null;
+  /** Local models lists the folder at `<slug>`, by discovery's own rule. */
+  listed: boolean;
 }
 
 export interface CatalogItem {
@@ -278,6 +281,7 @@ function buildWithState(
     localAssetsRevision: completion?.assetsRevision ?? null,
     located:
       located === null ? null : { from: located.from, mode: located.mode, filesAvailable: located.filesAvailable },
+    listed: isListedFolder(dir),
   };
 }
 

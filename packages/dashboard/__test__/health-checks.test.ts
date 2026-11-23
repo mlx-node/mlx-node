@@ -27,7 +27,6 @@ function models(count: number, warnings: string[] = []): ModelsResponse {
     })),
     warnings,
     dir: '/models',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
 }
 

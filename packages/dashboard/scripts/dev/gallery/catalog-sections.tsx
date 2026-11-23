@@ -1,6 +1,6 @@
 /**
  * The catalog card of the Models page in every state it can show, with the real model names and sizes. The harness
- * refuses downloads, so the download, update and blocker states can only be seen here.
+ * refuses downloads, so the download, update and most blocker states can only be seen here.
  */
 
 import { type ReactElement, useState } from 'react';
@@ -16,8 +16,8 @@ import type {
   CatalogBlocker,
   CatalogBuildItem,
   CatalogItem,
+  HostResponse,
   LocatePlanResponse,
-  ModelsResponse,
 } from '../../../ui/src/lib/types';
 import {
   CatalogCardPlaceholder,
@@ -45,6 +45,7 @@ function build(
     localAssetsRepo: null,
     localAssetsRevision: null,
     located: null,
+    listed: false,
     ...fields,
   } satisfies CatalogBuildItem;
 }
@@ -109,6 +110,14 @@ const HY4 = build({
   included: 'Streams from SSD',
   slug: 'hy4-flash-gguf',
 });
+const FLASH_NEXT = build({
+  id: 'UD-Q4_K_XL',
+  hfRepo: 'unsloth/Qwen3.8-Flash-Next-GGUF',
+  sizeGb: 111.3,
+  source: 'Unsloth GGUF',
+  included: 'Text only · streams from SSD',
+  slug: 'qwen3.8-flash-next-gguf',
+});
 const CLAIRIC_FLASH = build({
   id: 'UD-Q4_K_XL',
   hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
@@ -128,6 +137,14 @@ function hy4(only: CatalogBuildItem): CatalogItem {
   return {
     label: 'Hy4-flash',
     description: '512-expert MoE streamed from SSD, 256K context',
+    minMemoryGb: 96,
+    builds: [only],
+  };
+}
+function flashNext(only: CatalogBuildItem): CatalogItem {
+  return {
+    label: 'Qwen3.8-Flash-Next',
+    description: '125B MoE, 512 experts streamed from SSD',
     minMemoryGb: 96,
     builds: [only],
   };
@@ -155,6 +172,8 @@ const LEFTOVER: CatalogBlocker = {
   holdsModel: false,
   linkTarget: null,
   dangling: false,
+  linkToFile: false,
+  locked: false,
 };
 /** A full model folder the app did not create. */
 const FOREIGN_MODEL: CatalogBlocker = {
@@ -166,6 +185,32 @@ const FOREIGN_MODEL: CatalogBlocker = {
   modelLike: true,
   holdsModel: true,
 };
+/** A link the user made to a folder of model files on another disk. */
+const MODEL_LINK: CatalogBlocker = {
+  ...LEFTOVER,
+  kind: 'symlink',
+  fileCount: 0,
+  sizeBytes: 0,
+  names: [],
+  holdsModel: true,
+  linkTarget: '/Volumes/Models/lmstudio/unsloth/Qwen3.8-Flash-Next-GGUF',
+};
+/** A link whose folder is gone. */
+const DEAD_LINK: CatalogBlocker = { ...MODEL_LINK, holdsModel: false, linkTarget: '/Volumes/Old/hy4', dangling: true };
+/** A model folder too large to list. */
+const LARGE_FOLDER: CatalogBlocker = {
+  ...FOREIGN_MODEL,
+  fileCount: 2000,
+  sizeBytes: 96_400_000_000,
+  truncated: true,
+};
+/** A file with the folder's name. */
+const FILE: CatalogBlocker = { ...LEFTOVER, kind: 'file', sizeBytes: 4096, names: [] };
+/** A folder the app has no write permission on, and cannot read. */
+const LOCKED: CatalogBlocker = { ...LEFTOVER, fileCount: 0, sizeBytes: 0, names: [], truncated: true, locked: true };
+/** The server's sentence of an Update plan that a cleanup solves. */
+const REFUSED_UPDATE =
+  '"Clairic-Flash-UD-Q4_K_XL.gguf" in "clairic-flash-gguf" is not the catalog file. Its size is different. Move it out of the folder, then use Update again. Update then downloads the catalog file (6,429,716,416 bytes).';
 
 const PLAN: AdoptPlanResponse = {
   repo: CLAIRIC_FLASH.hfRepo,
@@ -201,7 +246,16 @@ function wait(ms: number): Promise<void> {
 }
 
 function job(fields: Partial<ActiveJob> = {}): ActiveJob {
-  return { id: 'gallery', committing: false, cancelling: false, connection: 0, source: 'local', ...fields };
+  return {
+    id: 'gallery',
+    kind: 'install',
+    committing: false,
+    cancelling: false,
+    connection: 0,
+    source: 'local',
+    blocker: null,
+    ...fields,
+  };
 }
 
 function download(
@@ -214,10 +268,13 @@ function download(
     settling: false,
     updateSettling: false,
     job: undefined,
+    refused: false,
+    refusedSentence: undefined,
     onInstall: () => wait(800),
-    onReinstall: () => wait(800),
-    onReinstallStarted: () => {},
+    onCleanup: () => wait(800),
+    onConfirmStarted: () => {},
     onPlanUpdate: () => wait(600).then(() => PLAN),
+    onUpdateRefused: () => {},
     onUpdateInPlace: () => wait(800),
     onPlanLocate: () => wait(900).then(() => LOCATE_PLAN),
     onLocate: () => wait(800),
@@ -231,30 +288,32 @@ function download(
   };
 }
 
-/** The state after a start of `total` bytes and two frames a second apart, the second at `received`. */
-function running(total: number, received: number, rate: number, fileCount = 1): ProgressState {
+/** The state after a start of `total` bytes and two frames `seconds` apart at `rate`, the second at `received`. */
+function running(
+  total: number,
+  received: number,
+  rate: number,
+  { fileCount = 1, seconds = 1, file = 'Qwen3.8-27B-UD-Q4_K_M.gguf' } = {},
+): ProgressState {
   const frame = (bytes: number): ProgressEvent => ({
     type: 'progress',
     id: 'gallery',
-    file: 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+    file,
     receivedBytes: bytes,
     jobReceivedBytes: bytes,
     totalBytes: total,
     fileIndex: 0,
     fileCount,
   });
-  const events: ProgressEvent[] = [
-    { type: 'start', id: 'gallery', repo: QWEN_M.hfRepo, totalBytes: total, fileCount },
-    frame(Math.max(0, received - rate)),
-    frame(received),
+  const events: Array<[ProgressEvent, number]> = [
+    [{ type: 'start', id: 'gallery', repo: QWEN_M.hfRepo, totalBytes: total, fileCount }, 0],
+    [frame(Math.max(0, received - rate * seconds)), 1000],
+    [frame(received), 1000 + seconds * 1000],
   ];
-  return events.reduce<ProgressState>(
-    (state, event, index) => reduceProgress(state, event, index * 1000),
-    INITIAL_PROGRESS,
-  );
+  return events.reduce<ProgressState>((state, [event, at]) => reduceProgress(state, event, at), INITIAL_PROGRESS);
 }
 
-const HOST: ModelsResponse['host'] = { totalMemBytes: 128 * GIB, diskFreeBytes: 900 * GIB };
+const HOST: HostResponse = { totalMemBytes: 128 * GIB, diskFreeBytes: 900 * GIB };
 
 type Case = Omit<CatalogCardViewProps, 'onChoose' | 'onStart' | 'host' | 'progress' | 'starting' | 'locate'> &
   Partial<Pick<CatalogCardViewProps, 'host' | 'progress' | 'starting'>> & {
@@ -281,6 +340,11 @@ const LOCATED_LINKED = { from: EXTERNAL, mode: 'linked', filesAvailable: true } 
 const LOCATED_AWAY = { from: EXTERNAL, mode: 'linked', filesAvailable: false } as const;
 
 const QWEN_M_RUNNING = running(16.6 * 1e9, 7.4 * 1e9, 84 * MB);
+const FLASH_NEXT_RUNNING = running(111.3 * 1e9, 13.4 * 1e9, 48.2 * MB, {
+  fileCount: 4,
+  seconds: 12,
+  file: 'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+});
 const DRAFT_RUNNING = running(3.85 * 1e9, 1.6 * 1e9, 42 * MB);
 
 const CASES: readonly Case[] = [
@@ -343,25 +407,74 @@ const CASES: readonly Case[] = [
   },
   {
     name: 'Installed, two builds on disk',
-    entry: inkling([{ ...INKLING_XL, ...INSTALLED }, INKLING_M, { ...INKLING_ORIGINAL, ...INSTALLED }]),
+    entry: inkling([{ ...INKLING_XL, ...INSTALLED }, INKLING_M, { ...INKLING_ORIGINAL, ...INSTALLED, listed: true }]),
     chosen: INKLING_ORIGINAL.slug,
     downloads: [
       download({ ...INKLING_XL, ...INSTALLED }),
       download(INKLING_M),
       download({ ...INKLING_ORIGINAL, ...INSTALLED }),
     ],
-    detailsTo: `/models?focus=${INKLING_ORIGINAL.slug}`,
   },
   {
     name: 'Update available',
-    entry: qwen([{ ...QWEN_XL, ...INSTALLED }, QWEN_M], { ...DRAFT, present: true, installed: true }),
+    entry: qwen([{ ...QWEN_XL, ...INSTALLED, listed: true }, QWEN_M], { ...DRAFT, present: true, installed: true }),
     chosen: QWEN_XL.slug,
     downloads: [download({ ...QWEN_XL, ...INSTALLED }, { updateAvailable: true }), download(QWEN_M)],
     draft: { download: download({ ...DRAFT, present: true, installed: true }), progress: INITIAL_PROGRESS },
-    detailsTo: `/models?focus=${QWEN_XL.slug}`,
   },
   {
-    name: 'Needs cleanup: Reinstall',
+    name: 'Needs cleanup: a link to a folder of model files',
+    entry: flashNext({ ...FLASH_NEXT, blockedByForeignDir: true, blocker: MODEL_LINK }),
+    chosen: FLASH_NEXT.slug,
+    downloads: [download({ ...FLASH_NEXT, blockedByForeignDir: true, blocker: MODEL_LINK })],
+  },
+  {
+    name: 'Cleaning up a link: downloading',
+    entry: flashNext({ ...FLASH_NEXT, blockedByForeignDir: true, blocker: MODEL_LINK }),
+    chosen: FLASH_NEXT.slug,
+    downloads: [
+      download({ ...FLASH_NEXT, blockedByForeignDir: true, blocker: MODEL_LINK }, { job: job({ kind: 'cleanup' }) }),
+    ],
+    progress: FLASH_NEXT_RUNNING,
+  },
+  {
+    name: 'Needs cleanup: a link that points nowhere',
+    entry: hy4({ ...HY4, blockedByForeignDir: true, blocker: DEAD_LINK }),
+    chosen: HY4.slug,
+    downloads: [download({ ...HY4, blockedByForeignDir: true, blocker: DEAD_LINK })],
+  },
+  {
+    name: 'Needs cleanup: a folder too large to list',
+    entry: hy4({ ...HY4, blockedByForeignDir: true, blocker: LARGE_FOLDER }),
+    chosen: HY4.slug,
+    downloads: [download({ ...HY4, blockedByForeignDir: true, blocker: LARGE_FOLDER })],
+  },
+  {
+    name: 'Needs cleanup: a file',
+    entry: clairicFlash({ ...CLAIRIC_FLASH, blockedByForeignDir: true, blocker: FILE }),
+    chosen: CLAIRIC_FLASH.slug,
+    downloads: [download({ ...CLAIRIC_FLASH, blockedByForeignDir: true, blocker: FILE })],
+  },
+  {
+    name: 'Needs cleanup: Update refused the folder',
+    entry: clairicFlash({ ...CLAIRIC_FLASH, blockedByForeignDir: true, blocker: FOREIGN_MODEL }),
+    chosen: CLAIRIC_FLASH.slug,
+    downloads: [
+      download(
+        { ...CLAIRIC_FLASH, blockedByForeignDir: true, blocker: FOREIGN_MODEL },
+        { refused: true, refusedSentence: REFUSED_UPDATE },
+      ),
+    ],
+  },
+  {
+    name: 'No access: a folder the app cannot write',
+    entry: qwen([{ ...QWEN_XL, blockedByForeignDir: true, blocker: LOCKED }, QWEN_M]),
+    chosen: QWEN_XL.slug,
+    downloads: [download({ ...QWEN_XL, blockedByForeignDir: true, blocker: LOCKED }), download(QWEN_M)],
+    draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
+  },
+  {
+    name: 'Needs cleanup: a folder with one leftover file',
     entry: inkling([{ ...INKLING_XL, blockedByForeignDir: true, blocker: LEFTOVER }, INKLING_M, INKLING_ORIGINAL]),
     chosen: INKLING_XL.slug,
     downloads: [
@@ -377,32 +490,14 @@ const CASES: readonly Case[] = [
     downloads: [download({ ...CLAIRIC_FLASH, blockedByForeignDir: true, blocker: FOREIGN_MODEL })],
   },
   {
-    name: 'Needs cleanup: the app cannot replace it, listed',
-    entry: hy4({ ...HY4, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, truncated: true, fileCount: 2000 } }),
-    chosen: HY4.slug,
-    downloads: [
-      download({ ...HY4, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, truncated: true, fileCount: 2000 } }),
-    ],
-    detailsTo: `/models?focus=${HY4.slug}`,
-  },
-  {
-    name: 'Needs cleanup: the app cannot replace it, not listed',
-    entry: hy4({ ...HY4, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, kind: 'symlink', listed: false } }),
-    chosen: HY4.slug,
-    downloads: [
-      download({ ...HY4, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, kind: 'symlink', listed: false } }),
-    ],
-  },
-  {
     name: 'The folder holds another build',
     entry: qwen([
-      { ...QWEN_XL, heldBy: 'UD-Q4_K_M' },
+      { ...QWEN_XL, heldBy: 'UD-Q4_K_M', listed: true },
       { ...QWEN_M, present: true },
     ]),
     chosen: QWEN_XL.slug,
     downloads: [download({ ...QWEN_XL, heldBy: 'UD-Q4_K_M' }), download({ ...QWEN_M, present: true })],
     draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
-    detailsTo: `/models?focus=${QWEN_XL.slug}`,
   },
   {
     name: 'The folder holds another model',
@@ -452,11 +547,10 @@ const CASES: readonly Case[] = [
   },
   {
     name: 'Located, same disk',
-    entry: qwen([{ ...QWEN_XL, ...INSTALLED, located: LOCATED_SHARED }, QWEN_M]),
+    entry: qwen([{ ...QWEN_XL, ...INSTALLED, located: LOCATED_SHARED, listed: true }, QWEN_M]),
     chosen: QWEN_XL.slug,
     downloads: [download({ ...QWEN_XL, ...INSTALLED, located: LOCATED_SHARED }), download(QWEN_M)],
     draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
-    detailsTo: `/models?focus=${QWEN_XL.slug}`,
   },
   {
     name: 'Located, another disk, update available',
@@ -464,6 +558,7 @@ const CASES: readonly Case[] = [
       ...HY4,
       ...INSTALLED,
       located: { ...LOCATED_LINKED, from: '/Volumes/Models/AngelSlim/Hy4-flash-GGUF' },
+      listed: true,
     }),
     chosen: HY4.slug,
     downloads: [
@@ -472,7 +567,6 @@ const CASES: readonly Case[] = [
         { updateAvailable: true },
       ),
     ],
-    detailsTo: `/models?focus=${HY4.slug}`,
   },
   {
     name: 'Located, files not found',
@@ -483,10 +577,9 @@ const CASES: readonly Case[] = [
   },
   {
     name: 'System One card, installed',
-    entry: clairicFlash({ ...CLAIRIC_FLASH, ...INSTALLED }),
+    entry: clairicFlash({ ...CLAIRIC_FLASH, ...INSTALLED, listed: true }),
     chosen: CLAIRIC_FLASH.slug,
     downloads: [download({ ...CLAIRIC_FLASH, ...INSTALLED })],
-    detailsTo: `/models?focus=${CLAIRIC_FLASH.slug}`,
     openTo: `/system-one?model=${CLAIRIC_FLASH.slug}`,
   },
 ];
@@ -514,12 +607,12 @@ const DRAFT_CASES: ReadonlyArray<{
     draft: { ...DRAFT, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, sizeBytes: 3_850_000_000 } },
   },
   {
-    name: 'DFlash2: needs cleanup, Reinstall',
+    name: 'DFlash2: needs cleanup, an empty folder',
     draft: { ...DRAFT, blockedByForeignDir: true, blocker: { ...LEFTOVER, fileCount: 0, sizeBytes: 0, names: [] } },
   },
   {
-    name: 'DFlash2: needs cleanup, the app cannot replace it',
-    draft: { ...DRAFT, blockedByForeignDir: true, blocker: { ...FOREIGN_MODEL, kind: 'symlink', listed: false } },
+    name: 'DFlash2: needs cleanup, a link',
+    draft: { ...DRAFT, blockedByForeignDir: true, blocker: { ...MODEL_LINK, linkTarget: '/Volumes/Models/dflash2' } },
   },
 ];
 

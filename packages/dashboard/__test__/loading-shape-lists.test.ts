@@ -188,6 +188,7 @@ function catalogItem(
         localAssetsRepo: null,
         localAssetsRevision: null,
         located: null,
+        listed: false,
       },
     ],
   };
@@ -199,7 +200,6 @@ function modelsRoutes(): Record<string, unknown> {
     models: [localModel({}), localModel({ name: 'gemma-4-12b', modelType: 'gemma4', quant: null })],
     warnings: [],
     dir: '/models',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
   // As served below 96 GiB: two chat entries, one of them the default, and a System One entry in its own section.
   const catalog: CatalogResponse = {
@@ -213,7 +213,13 @@ function modelsRoutes(): Record<string, unknown> {
     ],
   };
   const downloads: DownloadsResponse = { jobs: [] };
-  return { '/models': models, '/catalog': catalog, '/catalog/updates': { items: [] }, '/downloads': downloads };
+  return {
+    '/models': models,
+    '/host': { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    '/catalog': catalog,
+    '/catalog/updates': { items: [] },
+    '/downloads': downloads,
+  };
 }
 
 const MODEL_HEADS = ['Model', 'Family', 'Quant', 'Context', 'Size', 'Activity (30 d)', 'Decode', 'Last used', ''];

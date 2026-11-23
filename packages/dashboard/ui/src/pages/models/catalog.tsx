@@ -24,6 +24,7 @@ import {
   useDownloadProgress,
   type ProgressState,
 } from '../../components/download-progress';
+import { DashboardApiError } from '../../lib/api';
 import { modelPresent, shownBuild } from '../../lib/catalog';
 import { cn } from '../../lib/cn';
 import { errMessage } from '../../lib/errors';
@@ -36,9 +37,8 @@ import type {
   CatalogBlocker,
   CatalogBuildItem,
   CatalogItem,
-  LocalModel,
+  HostResponse,
   LocatePlanResponse,
-  ModelsResponse,
 } from '../../lib/types';
 import styles from './catalog.module.css';
 import {
@@ -57,7 +57,7 @@ type HostWarning = { kind: 'disk'; free: number } | { kind: 'memory'; memory: nu
 function hostWarning(
   build: Pick<CatalogBuildItem, 'sizeGb' | 'present'>,
   minMemoryGb: number | undefined,
-  host: ModelsResponse['host'] | undefined,
+  host: HostResponse | undefined,
 ): HostWarning | null {
   if (host === undefined) return null;
   if (!build.present && host.diskFreeBytes !== null && build.sizeGb * GB > host.diskFreeBytes) {
@@ -69,24 +69,36 @@ function hostWarning(
   return null;
 }
 
+function diskText(sizeGb: number, free: number): string {
+  return `Needs about ${sizeGb} GB. ${formatBytes(free)} is free on this disk.`;
+}
+
 /** The one note a catalog card or an onboarding choice shows about room on this Mac for `build`, or null. */
 export function hostNote(
   build: Pick<CatalogBuildItem, 'sizeGb' | 'present'>,
   minMemoryGb: number | undefined,
-  host: ModelsResponse['host'] | undefined,
+  host: HostResponse | undefined,
 ): string | null {
   const warning = hostWarning(build, minMemoryGb, host);
   if (warning === null) return null;
-  if (warning.kind === 'disk')
-    return `Needs about ${build.sizeGb} GB. ${formatBytes(warning.free)} is free on this disk.`;
+  if (warning.kind === 'disk') return diskText(build.sizeGb, warning.free);
   return `Weights are larger than this Mac's memory (${formatBytes(warning.memory)}).`;
+}
+
+/** The disk half of {@link hostNote}: the line a cleanup confirmation adds when the disk is short, or null. */
+export function diskNote(
+  build: Pick<CatalogBuildItem, 'sizeGb' | 'present'>,
+  host: HostResponse | undefined,
+): string | null {
+  if (host === undefined || build.present || host.diskFreeBytes === null) return null;
+  return build.sizeGb * GB > host.diskFreeBytes ? diskText(build.sizeGb, host.diskFreeBytes) : null;
 }
 
 /** The short form of {@link hostNote} that the build line of a card shows, or null. */
 export function hostLine(
   build: Pick<CatalogBuildItem, 'sizeGb' | 'present'>,
   minMemoryGb: number | undefined,
-  host: ModelsResponse['host'] | undefined,
+  host: HostResponse | undefined,
 ): string | null {
   const warning = hostWarning(build, minMemoryGb, host);
   if (warning === null) return null;
@@ -110,97 +122,165 @@ function sizeText(bytes: number): string {
   return unit === '' ? value : `${value} ${unit}`;
 }
 
-/** How the card names what is in the way, and the word for it. */
-export function blockerPhrase(blocker: CatalogBlocker): { phrase: string; noun: string } {
-  if (blocker.kind === 'symlink') return { phrase: 'a link', noun: 'link' };
-  if (blocker.kind === 'file') return { phrase: `a file (${sizeText(blocker.sizeBytes)})`, noun: 'file' };
-  if (blocker.truncated) {
-    if (blocker.fileCount === 0) return { phrase: 'a directory the app could not fully read', noun: 'directory' };
-    return { phrase: `a directory with more than ${formatCount(blocker.fileCount)} files`, noun: 'directory' };
-  }
-  if (blocker.fileCount === 0) return { phrase: 'an empty directory', noun: 'directory' };
-  const files = blocker.fileCount === 1 ? '1 file' : `${formatCount(blocker.fileCount)} files`;
-  return { phrase: `a directory with ${files} (${sizeText(blocker.sizeBytes)})`, noun: 'directory' };
-}
-
 const NAME_MAX_CHARS = 40;
 
-/** What the removal takes away, or null when there is nothing to say (a link whose text is unknown). */
-function blockerContents(blocker: CatalogBlocker): ReactNode {
-  const size = sizeText(blocker.sizeBytes);
-  if (blocker.kind === 'symlink') {
-    if (blocker.linkTarget === null) return null;
-    return blocker.dangling
-      ? `It points to ${blocker.linkTarget}, which does not exist.`
-      : `It points to ${blocker.linkTarget}.`;
-  }
-  if (blocker.kind === 'file') return `The file is ${size}.`;
-  if (blocker.truncated) {
-    if (blocker.fileCount === 0) return 'The app could not read all of it, so its size is not known.';
-    return `It holds more than ${formatCount(blocker.fileCount)} files (more than ${size}).`;
-  }
-  if (blocker.fileCount === 0) return 'The directory is empty.';
-  const files = blocker.fileCount === 1 ? '1 file' : `${formatCount(blocker.fileCount)} files`;
-  if (blocker.names.length === 0) return `It holds ${files} (${size}).`;
+/** File names in a sentence, each shortened in the middle with the whole name in its title. */
+function NameList({ names }: { names: readonly string[] }): ReactElement {
   return (
     <>
-      {`It holds ${files} (${size}): `}
-      {blocker.names.map((name, index) => (
+      {names.map((name, index) => (
         <span key={name} title={name}>
           {index > 0 ? ', ' : ''}
           {truncateMiddle(name, NAME_MAX_CHARS)}
         </span>
       ))}
-      .
     </>
   );
 }
 
-function blockerNotice(blocker: CatalogBlocker): string | undefined {
-  if (blocker.kind === 'symlink') return 'This is a link. Only the link is removed. The target is not changed.';
-  if (blocker.listed) return 'Local models lists this directory. Make sure that you do not need it.';
-  if (blocker.modelLike) return 'This directory has a config.json. Make sure that you do not need it.';
-  return undefined;
+/** What moves to the Trash: the whole folder or file, in the numbers the card read. */
+function trashText(slug: string, blocker: CatalogBlocker): ReactNode {
+  const size = sizeText(blocker.sizeBytes);
+  if (blocker.kind === 'file') return `The file ${slug} (${size}).`;
+  if (blocker.truncated) {
+    if (blocker.fileCount === 0)
+      return `The whole folder ${slug}. The app could not read it, so its size is not known.`;
+    return `The whole folder ${slug}: more than ${filesText(blocker.fileCount)} (more than ${size}). The app could not list all of it.`;
+  }
+  if (blocker.fileCount === 0) return `The empty folder ${slug}.`;
+  const counted = `The folder ${slug}: ${filesText(blocker.fileCount)} (${size})`;
+  if (blocker.names.length === 0) return `${counted}.`;
+  return (
+    <>
+      {`${counted}: `}
+      <NameList names={blocker.names} />.
+    </>
+  );
 }
 
-export interface ReinstallHandlers {
+/** What the cleanup of a link removes: the link alone. */
+function removedText(blocker: CatalogBlocker): ReactNode {
+  if (blocker.linkTarget === null) return 'Only the link.';
+  return (
+    <>
+      Only the link. It points to <FolderName path={blocker.linkTarget} />
+      {blocker.dangling ? ', which is not there.' : '.'}
+    </>
+  );
+}
+
+/**
+ * One label and its text in the grid of a cleanup confirmation. Each cell starts with a space, which the grid does not
+ * draw, so the text a screen reader or a copy reads keeps its words apart.
+ */
+function CleanupRow({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <>
+      <span className="text-secondary"> {label}</span>
+      <span className="min-w-0 text-foreground"> {children}</span>
+    </>
+  );
+}
+
+/** The model a cleanup downloads, and its size. */
+export interface CleanupWhat {
+  /** `Qwen3.8-Flash-Next UD-Q4_K_XL`, or the companion's label. */
+  name: string;
+  sizeGb: number;
+  /** {@link diskNote} for this build, or null. */
+  spaceNote: string | null;
+}
+
+export interface CleanupHandlers {
   companion?: boolean;
-  onReinstall: () => Promise<void>;
-  onReinstallStarted: () => void;
+  onCleanup: () => Promise<void>;
+  onConfirmStarted: () => void;
 }
 
-/** The confirmation of a Reinstall over the entry in the way of `item`. */
-export function reinstallContent(
+/** From this size the confirmation says that the download can take an hour or more. */
+const LONG_DOWNLOAD_GB = 20;
+
+/**
+ * The confirmation of Clean up & update over the entry in the way of `item`: what is removed or goes to the Trash,
+ * what stays, and what is downloaded. `refusedSentence` is the server's reason when a refused Update led here.
+ */
+export function cleanupContent(
   item: { slug: string; blocker: CatalogBlocker },
-  handlers: ReinstallHandlers,
+  what: CleanupWhat,
+  handlers: CleanupHandlers,
+  refusedSentence?: string,
 ): ConfirmContent {
-  const { phrase, noun } = blockerPhrase(item.blocker);
-  const contents = blockerContents(item.blocker);
-  const name = <span className="font-medium text-foreground">{item.slug}</span>;
+  const { slug, blocker } = item;
+  const name = <span className="font-medium text-foreground">{slug}</span>;
+  const link = blocker.kind === 'symlink';
+  const noun = link ? 'link' : blocker.kind === 'file' ? 'file' : 'folder';
+  const long = what.sizeGb >= LONG_DOWNLOAD_GB ? ' A download of this size can take an hour or more.' : '';
+  const notices = [
+    !link && blocker.listed ? 'Local models lists this folder as a model. Make sure that you do not need it.' : null,
+    link
+      ? `The link is removed only when the download is complete and checked. If you cancel or the download fails, nothing changes.${
+          blocker.holdsModel ? ' The old files keep their disk space.' : ''
+        }`
+      : 'It moves to the Trash only when the download is complete and checked. If you cancel or the download fails, nothing changes. You can take it back from the Trash. Its disk space is free only after you empty the Trash.',
+    what.spaceNote,
+  ].filter((line): line is string => line !== null);
   return {
-    title: handlers.companion === true ? 'Reinstall companion weights?' : 'Reinstall model?',
+    title: handlers.companion === true ? 'Clean up and update companion weights?' : 'Clean up and update?',
     description: (
-      <>
-        {name} is in the way: {phrase} that the app did not create. This downloads the model, then permanently deletes
-        the {noun} {name} and installs the model in its place. {contents === null ? null : <>{contents} </>}
-        Nothing is deleted if the download fails or you cancel it.
-      </>
+      <span className="grid gap-2">
+        {refusedSentence !== undefined ? (
+          <span>
+            Update cannot use {name} as it is. {refusedSentence}{' '}
+            <span className="mt-1 block">Clean up &amp; update does this instead:</span>
+          </span>
+        ) : (
+          <span>
+            {name} is a {noun} that the app did not create.
+          </span>
+        )}
+        <span className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
+          {link ? (
+            <>
+              <CleanupRow label="Removed">{removedText(blocker)}</CleanupRow>
+              {blocker.dangling || blocker.linkToFile ? null : (
+                <CleanupRow label="Stays">
+                  That folder and every file in it. The app does not change it and no longer uses it.
+                </CleanupRow>
+              )}
+            </>
+          ) : (
+            <CleanupRow label="To the Trash">{trashText(slug, blocker)}</CleanupRow>
+          )}
+          <CleanupRow label="Downloaded">
+            {`${refusedSentence !== undefined ? 'The whole model: ' : ''}${what.name}, ${what.sizeGb} GB, into a new folder.${long}`}
+          </CleanupRow>
+        </span>
+      </span>
     ),
-    notice: blockerNotice(item.blocker),
-    confirmLabel: 'Reinstall',
+    notice: (
+      <span className="grid gap-1">
+        {notices.map((line, index) => (
+          <span key={line}>
+            {index > 0 ? ' ' : null}
+            {line}
+          </span>
+        ))}
+      </span>
+    ),
+    confirmLabel: 'Clean up & update',
     workingLabel: 'Starting…',
     successLabel: 'Started',
-    tone: 'danger',
+    tone: 'neutral',
     errorTitle: 'Could not start the download',
-    onConfirm: handlers.onReinstall,
-    onDone: handlers.onReinstallStarted,
+    onConfirm: handlers.onCleanup,
+    onDone: handlers.onConfirmStarted,
   };
 }
 
 export interface UpdateHandlers {
   companion?: boolean;
   onUpdateInPlace: (token: string) => Promise<void>;
-  onReinstallStarted: () => void;
+  onConfirmStarted: () => void;
 }
 
 function filesText(count: number): string {
@@ -235,12 +315,7 @@ export function updateContent(slug: string, plan: AdoptPlanResponse, handlers: U
             {other.names.length > 0 ? (
               <>
                 {': '}
-                {other.names.map((file, index) => (
-                  <span key={file} title={file}>
-                    {index > 0 ? ', ' : ''}
-                    {truncateMiddle(file, NAME_MAX_CHARS)}
-                  </span>
-                ))}
+                <NameList names={other.names} />
               </>
             ) : null}
             .{' '}
@@ -257,7 +332,7 @@ export function updateContent(slug: string, plan: AdoptPlanResponse, handlers: U
     tone: 'neutral',
     errorTitle: 'Could not start the update',
     onConfirm: () => handlers.onUpdateInPlace(plan.token),
-    onDone: handlers.onReinstallStarted,
+    onDone: handlers.onConfirmStarted,
   };
 }
 
@@ -337,8 +412,8 @@ export function missingText(from: string): string {
 
 /**
  * What a build's folder offers, first match: its job, an update, installed, located files that cannot be reached, a
- * folder holding another build, a full folder the app did not make (Update in place), one it cannot replace, something
- * else in the way (Reinstall), Install.
+ * folder holding another build, a folder the app may not write (no action), a full folder the app did not make
+ * (Update in place), anything else in the way (Clean up & update), Install.
  */
 export type CatalogActionState =
   | 'job'
@@ -346,14 +421,15 @@ export type CatalogActionState =
   | 'installed'
   | 'missing'
   | 'held'
+  | 'locked'
   | 'adopt'
-  | 'stuck'
-  | 'replace'
+  | 'cleanup'
   | 'install';
 
+/** `download.refused`: Update refused this folder for a reason a cleanup solves, so it is a cleanup, not an adopt. */
 export function catalogActionState(
   item: Pick<DownloadItem, 'present' | 'heldBy' | 'blocker' | 'located'>,
-  download: { job: ActiveJob | undefined; updateAvailable: boolean },
+  download: { job: ActiveJob | undefined; updateAvailable: boolean; refused?: boolean },
 ): CatalogActionState {
   // A live job is the only safe gate and must not be qualified by catalog state: an update re-installs something
   // already present, and the update probe may still be loading.
@@ -364,10 +440,66 @@ export function catalogActionState(
   if (item.located?.filesAvailable === false) return 'missing';
   if (item.heldBy !== null) return 'held';
   const blocker = item.blocker;
-  if (blocker?.holdsModel === true && blocker.kind === 'directory' && !blocker.truncated) return 'adopt';
-  if (blocker?.holdsModel === true) return 'stuck';
-  if (blocker !== null) return 'replace';
-  return 'install';
+  if (blocker === null) return 'install';
+  if (blocker.locked) return 'locked';
+  if (blocker.holdsModel && blocker.kind === 'directory' && !blocker.truncated && download.refused !== true)
+    return 'adopt';
+  return 'cleanup';
+}
+
+/** The open state of a cleanup confirmation, for the folder it was opened for. */
+function useCleanupOpen(slug: string): { open: boolean; onOpenChange: (open: boolean) => void } {
+  const [openFor, setOpenFor] = useState<string | null>(null);
+  return { open: openFor === slug, onOpenChange: (open) => setOpenFor(open ? slug : null) };
+}
+
+const CLEANUP_LABEL = 'Clean up & update…';
+
+interface CleanupButtonProps extends CleanupHandlers {
+  slug: string;
+  blocker: CatalogBlocker;
+  what: CleanupWhat;
+  refusedSentence: string | undefined;
+  settling: boolean;
+  variant: 'secondary' | 'ghost';
+  align: 'start' | 'end';
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+/** Clean up & update…: opens its confirmation from the catalog's numbers, with no request before the confirm. */
+function CleanupButton({
+  slug,
+  blocker,
+  what,
+  refusedSentence,
+  settling,
+  variant,
+  align,
+  open,
+  onOpenChange,
+  ...handlers
+}: CleanupButtonProps): ReactElement {
+  return (
+    <ConfirmPopover
+      trigger={{ kind: 'button', label: CLEANUP_LABEL, variant, size: 'sm' }}
+      align={align}
+      disabled={settling}
+      disabledReason="Checking the last download."
+      open={open}
+      onOpenChange={onOpenChange}
+      {...cleanupContent({ slug, blocker }, what, handlers, refusedSentence)}
+    />
+  );
+}
+
+/** The locked state's sentence: the one state the app cannot act on, and what the user can change. */
+function lockedSentence(slug: string): string {
+  return `The app has no write permission on ${slug}, so it cannot move it or add files to it. Change its permissions (Finder, Get Info), then open this page again.`;
+}
+
+function cleanupStatus(slug: string): string {
+  return `${slug} is in the way of this model.`;
 }
 
 interface UpdateInPlaceButtonProps extends UpdateHandlers {
@@ -381,6 +513,8 @@ interface UpdateInPlaceButtonProps extends UpdateHandlers {
   /** A click that loads a new plan. */
   onPlanStart?: () => void;
   onPlanError: (message: string) => void;
+  /** The plan was refused for a reason a cleanup solves (`needs-cleanup`). */
+  onNeedsCleanup: (message: string) => void;
 }
 
 /**
@@ -398,8 +532,9 @@ function UpdateInPlaceButton({
   onPlanUpdate,
   onPlanStart,
   onPlanError,
+  onNeedsCleanup,
   onUpdateInPlace,
-  onReinstallStarted,
+  onConfirmStarted,
 }: UpdateInPlaceButtonProps): ReactElement {
   const [loading, setLoading] = useState(false);
   const [plan, setPlan] = useState<AdoptPlanResponse | null>(null);
@@ -417,7 +552,8 @@ function UpdateInPlaceButton({
     try {
       setPlan(await onPlanUpdate());
     } catch (err) {
-      onPlanError(errMessage(err));
+      if (err instanceof DashboardApiError && err.reason === 'needs-cleanup') onNeedsCleanup(err.message);
+      else onPlanError(errMessage(err));
     } finally {
       setLoading(false);
     }
@@ -434,7 +570,7 @@ function UpdateInPlaceButton({
           refocus.current = true;
           setPlan(null);
         }}
-        {...updateContent(slug, plan, { companion, onUpdateInPlace, onReinstallStarted })}
+        {...updateContent(slug, plan, { companion, onUpdateInPlace, onConfirmStarted })}
       />
     );
   }
@@ -534,7 +670,7 @@ interface LocateButtonProps {
   control: LocateControl;
   /** The model the confirmation names: `Qwen3.8-27B UD-Q4_K_XL`. */
   name: string;
-  download: Pick<CatalogDownloadProps, 'onLocate' | 'onReinstallStarted'>;
+  download: Pick<CatalogDownloadProps, 'onLocate' | 'onConfirmStarted'>;
   size: 'sm' | 'md';
   align: 'start' | 'end';
   /** Install is starting, or the last job is settling (`reason` says so). */
@@ -580,7 +716,7 @@ function LocateButton({
           onLocate: download.onLocate,
           onStarted: () => {
             control.close();
-            download.onReinstallStarted();
+            download.onConfirmStarted();
           },
         })}
       />
@@ -623,9 +759,12 @@ export interface CatalogDownloadActionProps extends CatalogDownloadProps {
   buildName: string;
   /** The model a Locate confirmation names ({@link locateName}). */
   modelName: string;
+  /** The model a cleanup confirmation names ({@link buildFullName}). */
+  cleanupName: string;
+  host: HostResponse | undefined;
 }
 
-/** Onboarding's action for one build: progress, Update, the Installed status, the cleanup note, or Install. */
+/** Onboarding's action for one build: progress, Update, the Installed status, a note on the folder, or Install. */
 export function CatalogDownloadAction({
   item,
   installLabel = 'Install',
@@ -635,10 +774,13 @@ export function CatalogDownloadAction({
   settling,
   updateSettling,
   job,
+  refused,
+  refusedSentence,
   onInstall,
-  onReinstall,
-  onReinstallStarted,
+  onCleanup,
+  onConfirmStarted,
   onPlanUpdate,
+  onUpdateRefused,
   onUpdateInPlace,
   onPlanLocate,
   onLocate,
@@ -650,9 +792,12 @@ export function CatalogDownloadAction({
   onCancel,
   buildName,
   modelName,
+  cleanupName,
+  host,
 }: CatalogDownloadActionProps): ReactElement {
   const [starting, setStarting] = useState(false);
   const locate = useLocate({ item, onPlanLocate });
+  const cleanupOpen = useCleanupOpen(item.slug);
   const start = async (): Promise<void> => {
     if (starting) return;
     setStarting(true);
@@ -662,12 +807,13 @@ export function CatalogDownloadAction({
       setStarting(false);
     }
   };
-  const state = catalogActionState(item, { job, updateAvailable });
+  const state = catalogActionState(item, { job, updateAvailable, refused });
   if (state === 'job' && job !== undefined) {
+    const line = jobBlockerLine(item, job);
     return (
       <div className="grid gap-2">
         <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
-        {item.blocker !== null ? <p className="m-0 text-caption text-secondary">{jobBlockerLine(item)}</p> : null}
+        {line !== null ? <p className="m-0 text-caption text-secondary">{line}</p> : null}
         {/* cancel() refuses a committing job, and a second cancel answers 404. */}
         {!job.committing && !job.cancelling ? (
           <Button type="button" variant="ghost" size="sm" className="w-full" onClick={() => onCancel(job.id)}>
@@ -692,7 +838,7 @@ export function CatalogDownloadAction({
         disabledReason="Checking the last download."
         {...updateLocatedContent(
           { sizeGb: item.sizeGb, located: item.located },
-          { onDownload: onReplaceLocated, onStarted: onReinstallStarted },
+          { onDownload: onReplaceLocated, onStarted: onConfirmStarted },
         )}
       />
     );
@@ -723,7 +869,7 @@ export function CatalogDownloadAction({
     <LocateButton
       control={locate}
       name={modelName}
-      download={{ onLocate, onReinstallStarted }}
+      download={{ onLocate, onConfirmStarted }}
       size="sm"
       align="start"
       disabled={starting || settling}
@@ -760,9 +906,17 @@ export function CatalogDownloadAction({
     );
   }
   if (state === 'held') {
+    const heldBy = item.heldBy ?? '';
     return (
-      <Alert tone="warning" title="Needs cleanup">
-        {heldSentence(item.slug, item.heldBy ?? '', buildName)}
+      <Alert tone="warning" title={`Holds ${heldBy}`}>
+        {heldSentence(item.slug, heldBy, buildName)}
+      </Alert>
+    );
+  }
+  if (state === 'locked') {
+    return (
+      <Alert tone="warning" title="No access">
+        {lockedSentence(item.slug)}
       </Alert>
     );
   }
@@ -772,35 +926,31 @@ export function CatalogDownloadAction({
         slug={item.slug}
         settling={settling}
         onPlanUpdate={onPlanUpdate}
+        onNeedsCleanup={(message) => {
+          onUpdateRefused(message);
+          cleanupOpen.onOpenChange(true);
+        }}
         onUpdateInPlace={onUpdateInPlace}
-        onReinstallStarted={onReinstallStarted}
+        onConfirmStarted={onConfirmStarted}
       />
     );
   }
-  if (state === 'stuck' && item.blocker !== null) {
-    return <Alert tone="warning" title="Needs cleanup">{`${stuckSentence(item.slug, item.blocker)}`}</Alert>;
-  }
-  if (state === 'replace' && item.blocker !== null) {
-    const { phrase, noun } = blockerPhrase(item.blocker);
+  if (state === 'cleanup' && item.blocker !== null) {
     return (
       <Alert tone="warning" title="Needs cleanup">
         <span className="grid justify-items-start gap-2">
-          <span>
-            <span className="font-mono">{item.slug}</span> is in the way: {phrase} that the app did not create.
-            Reinstall downloads the model, then removes this {noun}.
-          </span>
-          <ConfirmPopover
-            trigger={{
-              kind: 'button',
-              label: 'Reinstall',
-              variant: 'secondary',
-              size: 'sm',
-              icon: <Download size={16} aria-hidden="true" />,
-            }}
+          <span>{cleanupStatus(item.slug)}</span>
+          <CleanupButton
+            slug={item.slug}
+            blocker={item.blocker}
+            what={{ name: cleanupName, sizeGb: item.sizeGb, spaceNote: diskNote(item, host) }}
+            refusedSentence={refusedSentence}
+            settling={settling}
+            variant="secondary"
             align="start"
-            disabled={settling}
-            disabledReason="Checking the last download."
-            {...reinstallContent({ slug: item.slug, blocker: item.blocker }, { onReinstall, onReinstallStarted })}
+            {...cleanupOpen}
+            onCleanup={onCleanup}
+            onConfirmStarted={onConfirmStarted}
           />
         </span>
       </Alert>
@@ -830,29 +980,32 @@ export function CatalogDownloadAction({
   );
 }
 
-/** What a job does to the old folder in its way. */
-function jobBlockerLine(item: Pick<DownloadItem, 'slug' | 'blocker'>): string | null {
-  if (item.blocker === null) return null;
-  return item.blocker.holdsModel
-    ? `Checks the files in ${item.slug}. Nothing is deleted.`
-    : `Replaces the old ${blockerPhrase(item.blocker).noun} when the download is complete.`;
+/**
+ * What a job does to the old entry in its way, by the job's kind; null when it touches none. A cleanup names the entry
+ * it was started for, which the catalog no longer shows once it reloads.
+ */
+function jobBlockerLine(item: Pick<DownloadItem, 'slug' | 'blocker'>, job: ActiveJob): string | null {
+  if (job.kind === 'update') return `Checks the files in ${item.slug}. Nothing is deleted.`;
+  const blocker = job.blocker ?? item.blocker;
+  if (job.kind !== 'cleanup' || blocker === null) return null;
+  if (blocker.kind === 'symlink') {
+    return `Removes the link when the download is complete.${blocker.linkToFile ? '' : ' Its folder is not changed.'}`;
+  }
+  return `Moves the old ${blocker.kind === 'file' ? 'file' : 'folder'} to the Trash when the download is complete.`;
 }
 
 function heldSentence(slug: string, heldBy: string, build: string): string {
-  return `${slug} holds ${heldBy}. Delete it in Local models to install ${build} here.`;
+  return `${slug} holds ${heldBy}. It is a working model, so this card does not remove it. Delete it in Local models to install ${build} here.`;
 }
 
-function stuckSentence(slug: string, blocker: CatalogBlocker): string {
-  return `${slug} holds a model that the app did not create, so Reinstall cannot replace it. ${
-    blocker.listed
-      ? 'Delete it in Local models to install this one.'
-      : 'Move or delete it in Finder to install this one.'
-  }`;
+/** `/models?focus=…` for the folder of `build` when Local models lists it. */
+export function detailsLink(build: Pick<CatalogBuildItem, 'slug' | 'listed'>): string | undefined {
+  return build.listed ? `/models?focus=${encodeURIComponent(build.slug)}` : undefined;
 }
 
-/** `/models?focus=…` for `slug` when Local models lists it. */
-export function detailsLink(localModels: readonly Pick<LocalModel, 'name'>[], slug: string): string | undefined {
-  return localModels.some((model) => model.name === slug) ? `/models?focus=${encodeURIComponent(slug)}` : undefined;
+/** The model and build a cleanup confirmation names: `Qwen3.8-Flash-Next UD-Q4_K_XL`. */
+export function buildFullName(entry: Pick<CatalogItem, 'label'>, build: Pick<CatalogBuildItem, 'id'>): string {
+  return `${entry.label} ${build.id}`;
 }
 
 function hfUrl(repo: string): string {
@@ -961,7 +1114,7 @@ function BuildLine({
   build: CatalogBuildItem;
   download: CatalogDownloadProps;
   progress: ProgressState;
-  host: ModelsResponse['host'] | undefined;
+  host: HostResponse | undefined;
   /** Why the folder the user picked for Locate cannot be used. */
   refusal: string | null;
 }): ReactElement {
@@ -1020,7 +1173,15 @@ function StatusWord({ text, tooltip }: { text: string; tooltip: string }): React
   );
 }
 
-function ShowWhy({ text, variant }: { text: string; variant: 'secondary' | 'ghost' }): ReactElement {
+function ShowWhy({
+  title,
+  text,
+  variant,
+}: {
+  title: string;
+  text: string;
+  variant: 'secondary' | 'ghost';
+}): ReactElement {
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -1029,7 +1190,7 @@ function ShowWhy({ text, variant }: { text: string; variant: 'secondary' | 'ghos
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end">
-        <p className="m-0 text-body font-medium text-foreground">Needs cleanup</p>
+        <p className="m-0 text-body font-medium text-foreground">{title}</p>
         <p className="m-0 mt-1 text-body text-secondary">{text}</p>
       </PopoverContent>
     </Popover>
@@ -1074,7 +1235,7 @@ interface RowProps {
   progress: ProgressState;
   starting: boolean;
   onStart: (download: CatalogDownloadProps) => void;
-  detailsTo: string | undefined;
+  host: HostResponse | undefined;
   openTo: string | undefined;
   locate: LocateControl | undefined;
 }
@@ -1087,15 +1248,17 @@ function ActionRow({
   progress,
   starting,
   onStart,
-  detailsTo,
+  host,
   openTo,
   locate,
 }: RowProps): ReactElement {
   const { item, job, settling, updateSettling } = download;
+  const cleanupOpen = useCleanupOpen(item.slug);
+  const detailsTo = detailsLink(build);
   const state = catalogActionState(item, download);
   if (state === 'job' && job !== undefined) {
     const fileLine = progressFileLine(progress);
-    const blockerLine = jobBlockerLine(item);
+    const blockerLine = jobBlockerLine(item, job);
     const lines = [fileLine, blockerLine].filter((line): line is string => line !== null);
     const moving = (progress.phase === 'connecting' || progress.phase === 'running') && !progress.stalled;
     const bar = (
@@ -1157,7 +1320,7 @@ function ActionRow({
             disabledReason="Checking the last download."
             {...updateLocatedContent(
               { sizeGb: build.sizeGb, located },
-              { onDownload: download.onReplaceLocated, onStarted: download.onReinstallStarted },
+              { onDownload: download.onReplaceLocated, onStarted: download.onConfirmStarted },
             )}
           />
         ) : state === 'update' ? (
@@ -1225,8 +1388,19 @@ function ActionRow({
             Show in Local models
           </ButtonLink>
         ) : (
-          <ShowWhy text={sentence} variant="secondary" />
+          <ShowWhy title={`Holds ${heldBy}`} text={sentence} variant="secondary" />
         )}
+      </>
+    );
+  }
+  if (state === 'locked') {
+    const sentence = lockedSentence(item.slug);
+    return (
+      <>
+        <div className={styles.primary}>
+          <StatusWord text="No access" tooltip={sentence} />
+        </div>
+        <ShowWhy title="No access" text={sentence} variant="secondary" />
       </>
     );
   }
@@ -1245,43 +1419,33 @@ function ActionRow({
           withIcon={false}
           onPlanUpdate={download.onPlanUpdate}
           onPlanError={(message) => toast.error('Could not check the folder', { description: message })}
+          onNeedsCleanup={(message) => {
+            download.onUpdateRefused(message);
+            cleanupOpen.onOpenChange(true);
+          }}
           onUpdateInPlace={download.onUpdateInPlace}
-          onReinstallStarted={download.onReinstallStarted}
+          onConfirmStarted={download.onConfirmStarted}
         />
       </>
     );
   }
-  if (state === 'stuck' && item.blocker !== null) {
+  if (state === 'cleanup' && item.blocker !== null) {
     return (
       <>
         <div className={styles.primary}>
-          <StatusWord text="Needs cleanup" tooltip={`${item.slug} holds a model that the app did not create.`} />
+          <StatusWord text="Needs cleanup" tooltip={cleanupStatus(item.slug)} />
         </div>
-        {detailsTo !== undefined && item.blocker.listed ? (
-          <ButtonLink to={detailsTo} variant="secondary" size="sm">
-            Show in Local models
-          </ButtonLink>
-        ) : (
-          <ShowWhy text={stuckSentence(item.slug, item.blocker)} variant="secondary" />
-        )}
-      </>
-    );
-  }
-  if (state === 'replace' && item.blocker !== null) {
-    return (
-      <>
-        <div className={styles.primary}>
-          <StatusWord text="Needs cleanup" tooltip={`${item.slug} is in the way.`} />
-        </div>
-        <ConfirmPopover
-          trigger={{ kind: 'button', label: 'Reinstall…', variant: 'secondary', size: 'sm' }}
+        <CleanupButton
+          slug={item.slug}
+          blocker={item.blocker}
+          what={{ name: buildFullName(entry, build), sizeGb: build.sizeGb, spaceNote: diskNote(build, host) }}
+          refusedSentence={download.refusedSentence}
+          settling={settling}
+          variant="secondary"
           align="end"
-          disabled={settling}
-          disabledReason="Checking the last download."
-          {...reinstallContent(
-            { slug: item.slug, blocker: item.blocker },
-            { onReinstall: download.onReinstall, onReinstallStarted: download.onReinstallStarted },
-          )}
+          {...cleanupOpen}
+          onCleanup={download.onCleanup}
+          onConfirmStarted={download.onConfirmStarted}
         />
       </>
     );
@@ -1326,11 +1490,13 @@ interface DraftLineProps {
   progress: ProgressState;
   starting: boolean;
   onStart: (download: CatalogDownloadProps) => void;
+  host: HostResponse | undefined;
 }
 
 /** The draft weights of an entry: one line with its own state and job, the same for every build of the entry. */
-function DraftLine({ entry, draft, download, progress, starting, onStart }: DraftLineProps): ReactElement {
+function DraftLine({ entry, draft, download, progress, starting, onStart, host }: DraftLineProps): ReactElement {
   const { item, job, settling, updateSettling } = download;
+  const cleanupOpen = useCleanupOpen(item.slug);
   const state = catalogActionState(item, download);
   const both = entry.builds.length === 2 ? ' Works with both builds.' : '';
   let glyph: ReactNode;
@@ -1419,33 +1585,37 @@ function DraftLine({ entry, draft, download, progress, starting, onStart }: Draf
           withIcon={false}
           onPlanUpdate={download.onPlanUpdate}
           onPlanError={(message) => toast.error('Could not check the folder', { description: message })}
+          onNeedsCleanup={(message) => {
+            download.onUpdateRefused(message);
+            cleanupOpen.onOpenChange(true);
+          }}
           onUpdateInPlace={download.onUpdateInPlace}
-          onReinstallStarted={download.onReinstallStarted}
+          onConfirmStarted={download.onConfirmStarted}
         />
       );
-    } else if (state === 'replace' && blocker !== null) {
-      text = 'needs cleanup';
-      tooltip = `${item.slug} is in the way.`;
-      control = (
-        <ConfirmPopover
-          trigger={{ kind: 'button', label: 'Reinstall…', variant: 'ghost', size: 'sm' }}
-          align="end"
-          disabled={settling}
-          disabledReason="Checking the last download."
-          {...reinstallContent(
-            { slug: item.slug, blocker },
-            { companion: true, onReinstall: download.onReinstall, onReinstallStarted: download.onReinstallStarted },
-          )}
-        />
-      );
+    } else if (state === 'locked') {
+      text = 'no access';
+      tooltip = lockedSentence(item.slug);
+      control = <ShowWhy title="No access" text={tooltip} variant="ghost" />;
     } else {
+      // A draft has no other build and no located files, so the only state left is a cleanup.
       text = 'needs cleanup';
-      tooltip = `${item.slug} holds a model that the app did not create.`;
+      tooltip = cleanupStatus(item.slug);
       control =
-        blocker !== null ? (
-          <ShowWhy text={stuckSentence(item.slug, blocker)} variant="ghost" />
-        ) : (
-          <ShowWhy text={heldSentence(item.slug, item.heldBy ?? '', draft.label)} variant="ghost" />
+        blocker === null ? null : (
+          <CleanupButton
+            slug={item.slug}
+            blocker={blocker}
+            what={{ name: draft.label, sizeGb: draft.sizeGb, spaceNote: diskNote(item, host) }}
+            refusedSentence={download.refusedSentence}
+            settling={settling}
+            variant="ghost"
+            align="end"
+            {...cleanupOpen}
+            companion
+            onCleanup={download.onCleanup}
+            onConfirmStarted={download.onConfirmStarted}
+          />
         );
     }
   }
@@ -1490,9 +1660,7 @@ export interface CatalogCardViewProps {
   /** Folders whose start request is in flight. */
   starting: readonly string[];
   onStart: (download: CatalogDownloadProps) => void;
-  host: ModelsResponse['host'] | undefined;
-  /** `/models?focus=…` when Local models lists the chosen build's folder. */
-  detailsTo?: string;
+  host: HostResponse | undefined;
   /** A workspace for the chosen build (`/system-one?model=…`). */
   openTo?: string;
   /** Locate of the chosen build: Locate… beside Install and in the "Files not found" state. */
@@ -1510,7 +1678,6 @@ export function CatalogCardView({
   starting,
   onStart,
   host,
-  detailsTo,
   openTo,
   locate,
 }: CatalogCardViewProps): ReactElement {
@@ -1612,6 +1779,7 @@ export function CatalogCardView({
                 progress={draft.progress}
                 starting={starting.includes(draft.download.item.slug)}
                 onStart={onStart}
+                host={host}
               />
             ) : included !== '' ? (
               <OneLine tooltip={included} className="text-caption text-secondary">
@@ -1627,7 +1795,7 @@ export function CatalogCardView({
               progress={progress}
               starting={starting.includes(build.slug)}
               onStart={onStart}
-              detailsTo={detailsTo}
+              host={host}
               openTo={openTo}
               locate={locate}
             />
@@ -1696,8 +1864,7 @@ export function CatalogCard({ draft, ...props }: CatalogCardProps): ReactElement
 export function CatalogEntryCard(props: {
   item: CatalogItem;
   downloads: Pick<ModelDownloads, 'downloadProps' | 'active'>;
-  host: ModelsResponse['host'] | undefined;
-  localModels: readonly Pick<LocalModel, 'name'>[];
+  host: HostResponse | undefined;
   chosen: Readonly<Record<string, string>>;
   choose: (label: string, slug: string) => void;
   /** The card links its installed build to its System One workspace. */
@@ -1717,7 +1884,6 @@ export function CatalogEntryCard(props: {
       downloads={builds}
       draft={draft}
       host={props.host}
-      detailsTo={detailsLink(props.localModels, build.slug)}
       openTo={
         props.systemOne === true && build.present ? `/system-one?model=${encodeURIComponent(build.slug)}` : undefined
       }

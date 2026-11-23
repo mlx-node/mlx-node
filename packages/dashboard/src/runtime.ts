@@ -139,6 +139,8 @@ export interface DashboardRuntimeOptions {
   chat?: ChatRuntimeOptions;
   /** System One history file override (tests / dev harness). Default `~/.mlx-node/desktop/systemone-history.json`. */
   systemOneHistoryPath?: string;
+  /** How a cleanup moves an old entry to the Trash. Default `/usr/bin/trash`; tests and the dev harness pass a fake. */
+  moveToTrash?: (path: string) => Promise<void>;
 }
 
 /** One API call, addressed the way `fetch` would address it. */
@@ -320,7 +322,10 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
   });
-  const downloads = new DownloadManager({ modelsDir });
+  const downloads = new DownloadManager({
+    modelsDir,
+    ...(opts.moveToTrash === undefined ? {} : { moveToTrash: opts.moveToTrash }),
+  });
 
   const codingAgents = new CodingAgentsService({
     ...opts.codingAgents,

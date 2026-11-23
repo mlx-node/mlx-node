@@ -1,6 +1,6 @@
 /** Pure helpers for catalog cards (Models) and the first-model choice (Onboarding). */
 
-import type { CatalogBuildItem, CatalogItem, ModelsResponse } from './types';
+import type { CatalogBuildItem, CatalogItem, HostResponse } from './types';
 
 const GIB = 2 ** 30;
 
@@ -10,7 +10,7 @@ const GIB = 2 ** 30;
  */
 export function offeredOnHost(
   item: Pick<CatalogItem, 'hidden' | 'minMemoryGb'>,
-  host: ModelsResponse['host'] | undefined,
+  host: HostResponse | undefined,
 ): boolean {
   if (item.hidden === true) return false;
   if (item.minMemoryGb === undefined) return true;

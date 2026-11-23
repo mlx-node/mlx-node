@@ -62,7 +62,6 @@ const GGUF_MODELS: ModelsResponse = {
   ],
   warnings: [],
   dir: '/models',
-  host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
 };
 
 function routes(overrides: Record<string, unknown> = {}): Record<string, unknown> {

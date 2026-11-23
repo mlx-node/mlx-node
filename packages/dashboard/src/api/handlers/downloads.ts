@@ -19,23 +19,27 @@ function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-/** `replaceBlocker` of the body: absent, or the four numbers of a Reinstall. Other fields are ignored. */
+/** The longest link text a blocker carries: 200 characters and the `…` of the cut. */
+const LINK_TARGET_MAX_CHARS = 201;
+
+/** `replaceBlocker` of the body: absent, or the five fields of a cleanup the user confirmed. Other fields are ignored. */
 function parseReplaceBlocker(value: unknown): ReplaceBlocker | undefined {
   if (value === undefined) return undefined;
   const fields = typeof value === 'object' && value !== null && !Array.isArray(value) ? value : undefined;
-  const { kind, fileCount, sizeBytes, truncated } = (fields ?? {}) as Record<string, unknown>;
+  const { kind, fileCount, sizeBytes, truncated, linkTarget } = (fields ?? {}) as Record<string, unknown>;
   if (
     fields === undefined ||
     (kind !== 'directory' && kind !== 'symlink' && kind !== 'file') ||
     !isCount(fileCount) ||
     !isCount(sizeBytes) ||
-    typeof truncated !== 'boolean'
+    typeof truncated !== 'boolean' ||
+    !(linkTarget === null || (typeof linkTarget === 'string' && linkTarget.length <= LINK_TARGET_MAX_CHARS))
   ) {
     throw ApiError.badRequest(
-      '"replaceBlocker" must be { kind: "directory" | "symlink" | "file", fileCount, sizeBytes, truncated }',
+      '"replaceBlocker" must be { kind: "directory" | "symlink" | "file", fileCount, sizeBytes, truncated, linkTarget }',
     );
   }
-  return { kind, fileCount, sizeBytes, truncated };
+  return { kind, fileCount, sizeBytes, truncated, linkTarget };
 }
 
 /** A plan token of the body (`adopt`, `locate`): absent, or 64 lower-case hex characters. */
@@ -60,7 +64,7 @@ function parseToken(value: unknown, field: 'adopt' | 'locate'): string | undefin
 
 /**
  * `POST /api/downloads` with `{ slug, replaceBlocker?, adopt?, locate? }`: `slug` is the catalog folder to install; at
- * most one of the three options. Answers `{ id, slug, repo }`.
+ * most one of the three options. Answers `{ id, slug, repo, kind }`.
  */
 export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unknown {
   const body = requireBody(req);
@@ -76,7 +80,7 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
     throw ApiError.badRequest('"replaceBlocker", "adopt" and "locate" cannot come together');
   }
   try {
-    const { id, repo } = ctx.downloads.start(
+    const { id, repo, kind } = ctx.downloads.start(
       slug,
       replaceBlocker !== undefined
         ? { replaceBlocker }
@@ -88,14 +92,14 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
     );
     // Accepted, not done: the route declares `successStatus: 202` so the HTTP
     // adapter still answers 202 for a job that is only queued.
-    return { id, slug, repo };
+    return { id, slug, repo, kind };
   } catch (err) {
     // The manager is draining for shutdown: the request is well-formed, the
     // server is simply going away, so answer 503 rather than blaming the caller.
     if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
       throw ApiError.unavailable(err.message);
     }
-    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
+    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message, err.reason);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Failed to start download');
   }
 }
@@ -113,7 +117,7 @@ export async function handleDownloadAdoptPlan(ctx: MainApiContext, req: ApiReque
     if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
       throw ApiError.unavailable(err.message);
     }
-    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
+    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message, err.reason);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Could not check the folder');
   }
 }
@@ -148,7 +152,7 @@ export async function handleDownloadLocatePlan(ctx: MainApiContext, req: ApiRequ
     ) {
       throw ApiError.unavailable(err.message);
     }
-    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
+    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message, err.reason);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Could not check the folder');
   }
 }

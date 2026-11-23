@@ -11,6 +11,7 @@
  */
 
 import {
+  accessSync,
   closeSync,
   constants,
   type Dir,
@@ -65,13 +66,12 @@ export interface LocalModel {
 /** Draft-only storage, managed on disk but excluded from standalone model lists. */
 export type LocalCompanion = Pick<LocalModel, 'name' | 'path' | 'sizeBytes' | 'fileCount'>;
 
-/** `/api/models`: the inventory plus what the host can say about room to grow it. */
+/** `/api/models`: the inventory of the models folder. This Mac's memory and free disk are `/api/host`. */
 export interface ModelsResponse {
   models: LocalModel[];
   companions: LocalCompanion[];
   warnings: string[];
   dir: string;
-  host: { totalMemBytes: number; diskFreeBytes: number | null };
 }
 
 /**
@@ -390,7 +390,7 @@ export function isModelFileName(name: string): boolean {
 }
 
 /**
- * Whether `dir` holds model files, so Reinstall must never replace it: an entry named `config.json`, or named like
+ * Whether `dir` holds model files, so the catalog card offers Update for it: an entry named `config.json`, or named like
  * weights (see {@link MODEL_FILE_SUFFIXES}, companion GGUFs included), of any type, at any depth. Every layout that
  * discovery lists or the loader opens has one of these, so this cannot fall behind either of them.
  *
@@ -609,8 +609,8 @@ export function isPathOccupied(path: string): boolean {
  * The shape test is {@link readCompletion}, our FULL marker, not merely "carries a
  * `files` array". For a plain install this is the only gate between `POST /api/downloads`
  * and a `rename(finalDir → backup)` + `rm(backup, { recursive: true })`; only a
- * Reinstall (`replaceBlocker`) passes an unowned entry, and only one that still matches
- * the numbers the user confirmed. A `{"files":[]}` file is not something we ever wrote — the marker has been the same
+ * cleanup (`replaceBlocker`) passes an unowned entry, which it never removes with `rm`, and only one that still
+ * matches what the user confirmed. A `{"files":[]}` file is not something we ever wrote — the marker has been the same
  * four fields since the first commit that emitted one — so accepting it authorized
  * the destructive swap on a directory we do not own. Going through the same reader
  * as every other ownership, identity and completeness check is also what stops those
@@ -1159,7 +1159,7 @@ export function discoverLocalModels(
 
 /**
  * The path of `name` as a SINGLE direct child of `modelsDir`, the gate every removal under the models directory goes
- * through (a delete by route name, a reinstall over a catalog slug). Throws `Refusing to {verb} "{name}": …` when
+ * through (a delete by route name, a cleanup of a catalog slug). Throws `Refusing to {verb} "{name}": …` when
  * `name` could reach anything else.
  */
 export function modelsChildPath(modelsDir: string, name: string, verb: string): string {
@@ -1207,12 +1207,35 @@ export interface ForeignEntrySummary {
   listed: boolean;
   /** A `config.json` of any type is at the root of the entry. */
   modelLike: boolean;
-  /** {@link holdsModelFiles}: it holds a config or weights, so Reinstall refuses to replace it. */
+  /** {@link holdsModelFiles}: it holds a config or weights, so Update may check it in place. */
   holdsModel: boolean;
-  /** symlink: the `readlink` text (at most 200 characters), else `null`. */
+  /** symlink: {@link readLinkText}, else `null`. */
   linkTarget: string | null;
   /** symlink whose target does not exist. */
   dangling: boolean;
+  /** symlink whose target exists and is not a folder. */
+  linkToFile: boolean;
+  /** A real directory the app has no write permission on: nothing can move it or add files to it. */
+  locked: boolean;
+}
+
+/** The `readlink` text of `path`, cut to 200 characters plus `…`, or `null` when it is not a readable link. */
+export function readLinkText(path: string): string | null {
+  try {
+    const text = readlinkSync(path);
+    return text.length > LINK_TARGET_MAX_CHARS ? `${text.slice(0, LINK_TARGET_MAX_CHARS)}…` : text;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether Local models lists the entry at `path`, by discovery's own rule. */
+export function isListedFolder(path: string): boolean {
+  try {
+    return isListedEntry(path, lstatSync(path));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1231,14 +1254,12 @@ export function summarizeForeignEntry(
   }
   const listed = isListedEntry(path, stat);
   if (stat.isSymbolicLink()) {
-    let linkTarget: string | null = null;
-    try {
-      const text = readlinkSync(path);
-      linkTarget = text.length > LINK_TARGET_MAX_CHARS ? `${text.slice(0, LINK_TARGET_MAX_CHARS)}…` : text;
-    } catch {
-      linkTarget = null;
-    }
+    const linkTarget = readLinkText(path);
     const dangling = !existsSync(path);
+    let linkToFile = false;
+    try {
+      linkToFile = !statSync(path).isDirectory();
+    } catch {}
     return {
       kind: 'symlink',
       fileCount: 0,
@@ -1250,6 +1271,8 @@ export function summarizeForeignEntry(
       holdsModel: holdsModelFiles(path),
       linkTarget,
       dangling,
+      linkToFile,
+      locked: false,
     };
   }
   if (!stat.isDirectory()) {
@@ -1264,7 +1287,15 @@ export function summarizeForeignEntry(
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     };
+  }
+  let locked = false;
+  try {
+    accessSync(path, constants.W_OK);
+  } catch {
+    locked = true;
   }
   const walk = walkDirStats(path, maxEntries, { noFollow: true, keepNames: BLOCKER_MAX_NAMES + 1 });
   const names =
@@ -1282,17 +1313,20 @@ export function summarizeForeignEntry(
     holdsModel: holdsModelFiles(path),
     linkTarget: null,
     dangling: false,
+    linkToFile: false,
+    locked,
   };
 }
 
-/** The entry still matches what the user was shown. A truncated walk is compared by kind only. */
+/** The entry still matches what the user was shown. A truncated walk is compared by kind and link text only. */
 export function sameForeignEntry(
-  a: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
-  b: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
+  a: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated' | 'linkTarget'>,
+  b: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated' | 'linkTarget'>,
 ): boolean {
   return (
     a.kind === b.kind &&
     a.truncated === b.truncated &&
+    a.linkTarget === b.linkTarget &&
     (a.truncated || (a.fileCount === b.fileCount && a.sizeBytes === b.sizeBytes))
   );
 }

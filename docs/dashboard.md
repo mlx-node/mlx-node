@@ -385,17 +385,34 @@ browser on `/models` and the gallery and exits 1 when two cards of a page differ
 - **Action:** one control for the shown build. Install (`Install UD-Q4_K_M` on a card with more builds) starts that
   build only; a download shows a spinner, a bar, the percent and Cancel (none in its last step), with the file name
   in the bar's tooltip; an installed build reads Installed, then Details (its folder in Local models) when Local
-  models lists it and, in System One, Open; an update adds an Update button. A build in a blocked state shows a
-  status word (Needs update, Needs cleanup, Holds UD-Q4_K_M) and one button. The long texts are not on the card: the
-  status word's tooltip holds the one-line reason (also as screen-reader text), **Update…** loads the plan
-  ("Checking…") and opens its confirmation, **Reinstall…** opens its confirmation, and a folder the app cannot
-  replace gets **Show in Local models** when Local models lists it, else **Show why**, a popover with the reason.
+  models lists it (`build.listed` of `/api/catalog`, so it does not wait for `/api/models`) and, in System One, Open;
+  an update adds an Update button. A build in a blocked state shows a status word and one button, by the first match
+  of `catalogActionState`: job > update > installed > missing (Locate) > held > locked > adopt > cleanup > install.
+
+  | state   | status word     | button               | when                                                                     |
+  | ------- | --------------- | -------------------- | ------------------------------------------------------------------------ |
+  | held    | Holds UD-Q4_K_M | Show in Local models | the folder is a loadable model of another build (Show why if not listed) |
+  | locked  | No access       | Show why             | a real folder the app has no write permission on (`blocker.locked`)      |
+  | adopt   | Needs update    | Update…              | a real folder of model files, fully listed, no kept refusal              |
+  | cleanup | Needs cleanup   | Clean up & update…   | anything else in the way: a link, a file, a large or junk folder         |
+
+  "Needs cleanup" always comes with **Clean up & update…**. The long texts are not on
+  the card: the status word's tooltip holds the one-line reason (also as screen-reader text), **Update…** loads the
+  plan ("Checking…") and opens its confirmation, **Clean up & update…** opens its confirmation from the catalog's
+  numbers with no request, and **Show why** is a popover with the reason. A job's tooltip says what it does to the
+  old entry: "Checks the files in <slug>. Nothing is deleted." (update), "Removes the link when the download is
+  complete. Its folder is not changed." (cleanup of a link), "Moves the old folder to the Trash when the download is
+  complete." (cleanup of a folder or file). The build line of a job reads bytes, speed and time left; the time left
+  waits 10 s into each phase (checking files, downloading; the speed is measured again when the phase changes), is
+  left out while checking or stalled, and reads `under a minute left`, `about N min left`, `about H h M min left`
+  (minutes by 5, up to 10 h), `about H h left` or `more than a day left`.
 
 The DFlash2 line belongs to Qwen3.8-27B, not to a build: one copy pairs with both builds by name. It reads
 `Optional DFlash2 · 3.85 GB` with an **Add** button that starts the draft download at once, beside a model download
 too, and never follows the build switch. Then it reads the received bytes and percent with Cancel, `added`, `added ·
 waits for the model` while no Qwen3.8-27B build is on disk, `update available` with Update, or `needs update` /
-`needs cleanup` with Update…, Reinstall… or Show why. The draft lives at `qwen3.8-27b-dflash2` in the models
+`needs cleanup` with Update… or Clean up & update… (`Clean up and update companion weights?`), or `no access` with
+Show why. The draft lives at `qwen3.8-27b-dflash2` in the models
 directory, and compatible Qwen3.8-27B targets find it automatically on their next load. It is not another chat model
 and never counts as one. Draft-only checkpoints are excluded from the local-model table and model counts; their bytes
 still count toward disk use on Models and Overview. Expand **Companion weights** in the local models panel to inspect
@@ -411,11 +428,18 @@ its build on the card. The System One drawer uses the same card and grid.
 
 Onboarding offers one choice per model, with no build control. A choice stands for the build with a running job, else
 the first build on disk, else the first build, and the dock adds "Build UD-Q4_K_XL. More builds are on the Models
-page." for a model with more builds. The setup wizard asks for the build instead
+page." for a model with more builds. The dock uses the card's action as an alert: **Needs cleanup** with one
+sentence and the same **Clean up & update…**, **No access** with the reason, or **Holds UD-Q4_K_M** with the held
+sentence. The setup wizard asks for the build instead
 ([cli.md](cli.md#model-selection-and-first-run-wizard)).
 
 An entry with `minMemoryGb` is offered on Models and on Onboarding only once the host reading is in and the Mac's
 physical RAM reaches it (`offeredOnHost`); Qwen3.8-Flash-Next and Hy4-flash need 96 GiB, which a 96 GB Mac reports.
+The reading is `GET /api/host` (`{ totalMemBytes, diskFreeBytes }`, `useHost`), a transport-thread route, so it never
+waits behind the worker's walk of the model folders that `/api/models` does; the Models page asks for `/catalog`
+before `/models` for the same reason. Until `/api/host` settles, the Recommended and System One sections keep their
+loading shape and show no count, so "N of M installed" is never counted over a list that is still filtered. When it
+fails, the entries with a floor stay hidden. Onboarding and the System One drawer read the same request.
 The setup wizard filters the same way (`visibleCatalog`). Below the floor the page hides the card, its palette
 commands and its share of the "N of M installed" count. An installed copy on a smaller Mac stays in the local list,
 and loads where its load admission accepts the RAM (Hy4-flash from 39 GiB).
@@ -441,29 +465,65 @@ trash button. If that refetch fails, the page says "Could not refresh the model 
 was in flight across any mutation never seeds the cache for the next visit (`json-cache` epoch). The Sessions list
 applies a confirmed rename or delete the same way.
 
-A catalog folder held by something the app did not create (a leftover file, a hand-made folder, a link) shows
-**Needs cleanup** and a **Reinstall…** button whose confirmation says what is in the way (`blocker`: kind, file count,
-size, at most 3 names; counted with `lstat`, never following a link or opening a file, at most 2,000 entries; only the
-root `config.json` is read, to tell whether Local models lists the entry). Reinstall
-downloads and verifies the model first and only then moves the old entry aside through the downloader's swap and
-deletes it; a failed or cancelled download removes nothing. The request echoes the numbers the user confirmed, and
-the server refuses (409) when the entry no longer matches them, at the request, at job start and right before the
-swap. Reinstall never replaces an entry that holds model files, and the card of such an entry shows no Reinstall. An
-entry holds model files when it has, anywhere in it, at any depth (links to folders followed), an entry named
-`config.json` or named like weights (`.safetensors`, `.gguf` including companions, `.pdiparams`, `.pdparams`, `.npz`,
-`.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more than 20,000 entries to look through. When that
-entry is a real folder its card shows **Needs update** and an **Update…** button, which adds the missing files and the
-marker and deletes nothing (below). A link, or a folder with more than 2,000 entries, keeps **Needs cleanup** with
-**Show in Local models** when Local models lists it, else **Show why**. A directory the app has no write permission on is refused at the request, before any download. A link is
-removed as a link; its target is not touched.
+A catalog folder held by something the app did not create (a leftover file, a hand-made folder, a link) is described
+by `blocker`: kind, file count, size, at most 3 names (counted with `lstat`, never following a link or opening a file,
+at most 2,000 entries; only the root `config.json` is read, to tell whether Local models lists the entry), the link
+text (cut to 200 characters), whether the link is dead, whether it holds model files, and `locked` (a real folder
+without write permission). An entry holds model files when it has, anywhere in it, at any depth (links to folders
+followed), an entry named `config.json` or named like weights (`.safetensors`, `.gguf` including companions,
+`.pdiparams`, `.pdparams`, `.npz`, `.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more than
+20,000 entries to look through. A fully listed real folder that holds model files gets **Update…** (below); a locked
+folder gets **No access** and no action, because a folder without write permission can be neither moved nor added to
+("The app has no write permission on <slug>, so it cannot move it or add files to it. Change its permissions (Finder,
+Get Info), then open this page again."). Every other entry gets **Clean up & update…**.
 
-The old entry is moved to `.staging/<slug>.reinstall-<pid>.<uuid>`. Before it is deleted, the moved entry is checked
-again: the same `dev:ino` as at the last check and, unless it is a link, still no model files and the same numbers. A
-writer outside the app (the `mlx` CLI, Finder) that changed it in between makes the job fail and the entry go back to
-its path; if something else took the path meanwhile, the entry is kept at `.staging/<slug>.kept-<uuid>`, which nothing
-removes, and the error names it. When the process dies between moving the entry aside and deleting it, recovery (when
-the download manager starts, and before every job for the slug) puts the entry back when the path is empty, deletes it
-when a complete model installed by the app is in place and the backup holds no model files, and otherwise keeps it.
+**Clean up & update…** downloads and checks the whole model into the job's own `.staging/<slug>@<sha>.<pid>.<uuid>`
+tree, puts it at `<slug>`, and only then takes the old entry away. Nothing is deleted for good:
+
+| at `<slug>`           | what happens to it                                                                                                                         | `done` event       |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------ |
+| a link (live or dead) | the link alone is removed (`unlink` after an `lstat` that says link); its folder is never opened, written or moved                         | `removed: 'link'`  |
+| a folder or a file    | moved whole, as one item named `<slug>`, to the macOS Trash of the disk that holds the models folder (`/usr/bin/trash -s`, no shell, 60 s) | `removed: 'trash'` |
+| the Trash refused     | kept at `.staging/<slug>.kept-<uuid>/<slug>`; the model is installed                                                                       | `keptDir`          |
+
+The confirmation (`cleanupContent`, tone neutral) says it in three rows: **Removed** "Only the link. It points to
+<target>." and **Stays** "That folder and every file in it…" for a link to a folder, **To the Trash** with the folder's numbers
+(or "The file <slug> (4.0 KB).") for a folder or a file, and **Downloaded** with the model, its size and, from 20 GB,
+"A download of this size can take an hour or more." The notice says the entry leaves only when the download is
+complete and checked, that a cancel or a failure changes nothing, and for the Trash that the space is free only after
+the Trash is emptied; a folder Local models lists adds "Make sure that you do not need it." and a short disk adds the
+disk line. The toasts after the job: "The link <slug> was removed. Its folder was not changed.", "The old folder
+<slug> is in the Trash.", or "The old <slug> could not go to the Trash. It is in <keptDir>. Nothing was deleted."; for
+a link that could not be removed, "The link <slug> could not be removed. It is in <keptDir>." A link to a file gets no
+**Stays** row and no "Its folder" sentence (the blocker's `linkToFile`). The page keeps the blocker the user confirmed
+on the job, so the job line and the toast name it after the catalog has reloaded without it. The old files of a link
+keep their disk space; this version always downloads the whole model and reuses no old file.
+
+The request echoes what the user confirmed: `replaceBlocker: { kind, fileCount, sizeBytes, truncated, linkTarget }`.
+The server refuses (409) a folder without write permission, and an entry that no longer matches (kind, link text, and
+the numbers unless the walk was truncated), and keeps the entry's `dev:ino` in the job. Just before the swap the entry
+must still have that `dev:ino`, the same `lstat` kind and, for a link, the same link text; nothing in it is listed
+again, so a file added to the folder during the download goes to the Trash with it. The swap makes a holder
+`.staging/<slug>.cleanup-<pid>.<uuid>/`, renames `<slug>` into it, checks the moved entry's `dev:ino` (else it is
+renamed back), then renames the new model in. When that rename fails, the old entry goes back and the error ends
+"Nothing was removed." A way back never renames over something another program put at `<slug>` meanwhile: the
+holder is then renamed to `.staging/<slug>.kept-<uuid>` and the error names where the old entry is. From there the model is installed, and what follows is reported, never undone. The holder is
+removed with `rmdir`. The app never calls `rm` on an entry it did not create. When the process dies with a holder in
+place, recovery (when the download manager starts, and before every job for the slug, for a holder whose pid is
+dead) removes an empty holder, renames the entry back when `<slug>` is free, finishes the job as above when the app's
+complete install is at `<slug>`, and leaves everything as it is in any other case. Nothing removes a `.kept-` folder.
+
+A refused **Update…** plan whose reason a cleanup solves answers 409 with `reason: 'needs-cleanup'` beside the
+server's sentence (a file of another size, a model file that is not in the catalog set, a name that differs only in
+letter case, an unreadable record, more than 2,000 entries, a link or special file inside, a file with no checksum, a
+file that failed the hash in an earlier Update, and a disk that cannot link files: the plan links a zero-byte file in
+`.staging` to a second name first; when the app cannot write that file the plan is refused with no reason). The card then reads **Needs cleanup** and the cleanup confirmation opens at once
+at the same button, led by "Update cannot use <slug> as it is." and the sentence; it trashes the folder whole and
+downloads the whole model. The page keeps the refusal for the visit, by the blocker's kind, count and size, so a
+folder the user fixed by hand gets **Update…** again; after a reload the card reads Needs update until one click.
+Other refusals (another job holds the folder, it changed on disk, the file list could not be read, held by another
+build) carry no reason and stay a "Could not check the folder" toast. A download of the slug already in the queue
+answers "A download of this model is already in the queue. Cancel it, then use Clean up & update."
 
 **Update…** makes the app own a folder that holds the catalog model but was not made by the app, by adding what is
 missing. It never moves, renames, deletes or overwrites a file that was in the folder. A click asks for a plan
@@ -471,12 +531,14 @@ missing. It never moves, renames, deletes or overwrites a file that was in the f
 wanted files the same way an install does (the wanted set must hold `config.json`), and scans the folder with `lstat`
 only, opening no file, at most 2,000 entries. A wanted file is **checked** when a regular file of the manifest size is
 at its path, and **downloaded** when nothing is there; any other file that is not a model file stays where it is. The
-plan is refused (409; the text names the file, and the card shows it in a "Could not check the folder" toast) for a wanted file of another size, a
+plan is refused (409 with `reason: 'needs-cleanup'`; the text names the file, and the card turns into the cleanup
+confirmation above) for a wanted file of another size, a
 wanted file the manifest gives no checksum for (in the folder or missing from it), a file that failed the hash in an earlier Update since the app
 started, a model file that is not part of the catalog model, a name that differs from a wanted name only in letter
 case, links or special files, a `.mlx-download-complete.json` at the root (the app cannot read it), more than 2,000
-entries, or no write permission. The plan, and the commit scan, read a `.mlx-download-complete.json` at the root on
-the transport thread with no size limit, as the catalog, Reinstall and every install already do: a file of hundreds of
+entries, or a disk that cannot link files; no write permission is refused with no reason (the card shows No access
+first). The plan, and the commit scan, read a `.mlx-download-complete.json` at the root on
+the transport thread with no size limit, as the catalog, a cleanup and every install already do: a file of hundreds of
 MB there stalls download progress and Cancel for as long as the read takes (seconds on a slow disk), and then the
 folder is refused. The plan reads Hugging Face with a deadline and outside any job, so it neither adds
 bytes to a running download nor dies with its cancel. Its token is a sha256 over the repo, both shas, the wanted files
@@ -527,9 +589,9 @@ and swaps instead. A record in any other shape reads as empty and proves nothing
 whose marker cannot be read is kept whole in `.staging/<slug>.kept-<uuid>`. The `mlx` CLI keeps the record when it
 rewrites the marker; a file it downloaded again no longer matches the record, so it is kept, not deleted.
 
-Delete in Local models and Reinstall never reach the same entry: Delete needs a `config.json` or a Clairic GGUF folder,
-and Reinstall refuses both. Update and Delete can reach the same folder; a Delete during an Update makes the Update
-stop.
+Delete in Local models removes a loadable folder for good; a catalog card never does: Clean up & update only unlinks a
+link or moves an entry to the Trash, and a held folder (another build, a working model) gets only Show in Local
+models. Update and Delete can reach the same folder; a Delete during an Update makes the Update stop.
 
 ### Locate
 
@@ -1651,35 +1713,36 @@ copy button keep the full path.
 Common params of the metrics routes, parsed by hand: `from`, `to` (epoch ms), `model` (exact `model_key`), `bucket`
 (`5m`, `hour`, `day`; hour and day follow local time), `groupBy` (`model`). A request spans at most 2000 buckets.
 
-| Route                          | Method       | Thread    | Purpose                                                                                                                                                                                                                                                                       |
-| ------------------------------ | ------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/models`                  | GET          | worker    | Local models: name, path, family, quant, size, ctx window, `servedIds`; `host` memory and free disk                                                                                                                                                                           |
-| `/api/models/:name`            | DELETE       | worker    | Delete a model dir (path-checked)                                                                                                                                                                                                                                             |
-| `/api/catalog`                 | GET          | worker    | Recommended catalog: entries with `builds[]`, each with its folder (`slug`) and state (`installed`, `present`, `heldBy`, `blocker`), and the `draft` companion                                                                                                                |
-| `/api/catalog/updates`         | GET          | transport | Upstream sha per catalog repo; the page joins it against `/api/catalog`                                                                                                                                                                                                       |
-| `/api/downloads`               | GET / POST   | transport | List active jobs / start a catalog download: body `{slug}` (a build or draft folder) → 202 `{id, slug, repo}`; `replaceBlocker: { kind, fileCount, sizeBytes, truncated }` is a Reinstall, `adopt: <token>` an Update (409 on change, or when the folder holds another build) |
-| `/api/downloads/adopt-plan`    | POST         | transport | `{slug}` → Update plan: `token`, `revision`, `assetsRevision`, `check` / `download` / `other` counts and bytes, up to 3 other names; 409 names the file it refuses                                                                                                            |
-| `/api/downloads/:id`           | DELETE       | transport | Cancel a download                                                                                                                                                                                                                                                             |
-| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503. `progress.phase: 'check'` while Update hashes a file; `done.keptDir` names kept files                                                                                                             |
-| `/api/coding-agents`           | GET / POST   | transport | Coding agent state with the managed instruction `block` / body `{action: 'refresh'}` or `{action: 'install', agent}`                                                                                                                                                          |
-| `/api/coding-agents/models`    | GET          | worker    | Local model ids the coding agents can be pointed at                                                                                                                                                                                                                           |
-| `/api/metrics/models`          | GET          | worker    | Model keys in first-seen order (color registry seed, model filter)                                                                                                                                                                                                            |
-| `/api/metrics/summary`         | GET          | worker    | Totals, latency quantiles, per model, finish reasons, failures, endpoints, dispatches; `previous` = the window of equal length before `from`                                                                                                                                  |
-| `/api/metrics/timeseries`      | GET          | worker    | Per-bucket series, optionally per model                                                                                                                                                                                                                                       |
-| `/api/metrics/distributions`   | GET          | worker    | Histograms with bins chosen by the API                                                                                                                                                                                                                                        |
-| `/api/metrics/speculative`     | GET          | worker    | MTP per model (acceptance per draft position, decode speed with and without MTP) and a trend                                                                                                                                                                                  |
-| `/api/metrics/turns`           | GET          | worker    | Turns, newest first; cursor paging (`beforeTs` + `beforeTraceId`), `limit` ≤ 2000, `traceId`, `outcome`                                                                                                                                                                       |
-| `/api/runtime/series`          | GET          | worker    | `from`, `to`, `bucketMs` (5 s … 1 h) → samples, scheduler deltas, processes, loads                                                                                                                                                                                            |
-| `/api/runtime/live`            | GET          | transport | `RuntimeLive` snapshot: status, supervisor, processes                                                                                                                                                                                                                         |
-| `/api/cache`                   | GET / DELETE | worker    | Cold-tier scan and daily trend (`trend[].t`, local day start) / clear all or evict older-than-N-days                                                                                                                                                                          |
-| `/api/cache/prefix`            | GET          | worker    | Model caches per folder: `roots[]` (`namespaces`, `volume`, `readError`, `engines` with their limit), `counting`, `canLock`                                                                                                                                                   |
-| `/api/cache/prefix/:namespace` | DELETE       | worker    | Body `{root, openedMs}` → one step `{removed, freedBytes, done, left, directoryRemoved}`; repeat until `done`. 400, 403, 404, 409 `held`/`changed`/`moved`/`no-lock-check`                                                                                                    |
-| `/api/ingest`                  | POST         | worker    | Trigger an incremental rescan                                                                                                                                                                                                                                                 |
-| `/api/sessions`                | GET          | worker    | `?q=&cwd=&limit=&offset=` → `{sessions, total, cwds}`; limit 1..500, default 100                                                                                                                                                                                              |
-| `/api/sessions/:id`            | GET          | worker    | `{session, transcript, turns, transcriptError?, resumeCommand}`; subagent ids work too; tool, text and subagent entries carry `endTs`                                                                                                                                         |
-| `/api/sessions/:id/timeline`   | GET          | worker    | `?turn=<n>` → `SessionTimelineResponse`: one turn as lanes, spans and handoffs; metadata only (below)                                                                                                                                                                         |
-| `/api/sessions/:id`            | PATCH        | worker    | Body `{title}` → `{id, title}`; 400 bad title, 404, 409 live/recent/changed                                                                                                                                                                                                   |
-| `/api/sessions/:id`            | DELETE       | worker    | `{deleted: [id, ...children]}`; 404, 409 when it or any child is live                                                                                                                                                                                                         |
+| Route                          | Method       | Thread    | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------ | ------------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/models`                  | GET          | worker    | Local models: name, path, family, quant, size, ctx window, `servedIds`, `companions`, `warnings`, `dir` (no host reading: see `/api/host`)                                                                                                                                                                                                                                                                                                                      |
+| `/api/host`                    | GET          | transport | `{ totalMemBytes, diskFreeBytes }`: this Mac's memory and the free space of the models disk (`null` when the folder cannot be read); never waits for the worker                                                                                                                                                                                                                                                                                                 |
+| `/api/models/:name`            | DELETE       | worker    | Delete a model dir (path-checked)                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `/api/catalog`                 | GET          | worker    | Recommended catalog: entries with `builds[]`, each with its folder (`slug`) and state (`installed`, `present`, `heldBy`, `blocker` with `locked`, `listed`: Local models lists the folder), and the `draft` companion                                                                                                                                                                                                                                           |
+| `/api/catalog/updates`         | GET          | transport | Upstream sha per catalog repo; the page joins it against `/api/catalog`                                                                                                                                                                                                                                                                                                                                                                                         |
+| `/api/downloads`               | GET / POST   | transport | List active jobs (`{id, slug, repo, kind, state, receivedBytes, totalBytes}`) / start a catalog download: body `{slug}` (a build or draft folder) → 202 `{id, slug, repo, kind}`, kind `install` \| `update` \| `cleanup` \| `locate`; at most one of `replaceBlocker: { kind, fileCount, sizeBytes, truncated, linkTarget }` (Clean up & update), `adopt: <token>` (Update), `locate: <token>` (Locate); 409 on change, or when the folder holds another build |
+| `/api/downloads/adopt-plan`    | POST         | transport | `{slug}` → Update plan: `token`, `revision`, `assetsRevision`, `check` / `download` / `other` counts and bytes, up to 3 other names; 409 names the file it refuses, with `reason: 'needs-cleanup'` when Clean up & update solves it                                                                                                                                                                                                                             |
+| `/api/downloads/:id`           | DELETE       | transport | Cancel a download                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503. `progress.phase: 'check'` while Update hashes a file; `done.keptDir` names kept files                                                                                                                                                                                                                                                                                               |
+| `/api/coding-agents`           | GET / POST   | transport | Coding agent state with the managed instruction `block` / body `{action: 'refresh'}` or `{action: 'install', agent}`                                                                                                                                                                                                                                                                                                                                            |
+| `/api/coding-agents/models`    | GET          | worker    | Local model ids the coding agents can be pointed at                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `/api/metrics/models`          | GET          | worker    | Model keys in first-seen order (color registry seed, model filter)                                                                                                                                                                                                                                                                                                                                                                                              |
+| `/api/metrics/summary`         | GET          | worker    | Totals, latency quantiles, per model, finish reasons, failures, endpoints, dispatches; `previous` = the window of equal length before `from`                                                                                                                                                                                                                                                                                                                    |
+| `/api/metrics/timeseries`      | GET          | worker    | Per-bucket series, optionally per model                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `/api/metrics/distributions`   | GET          | worker    | Histograms with bins chosen by the API                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `/api/metrics/speculative`     | GET          | worker    | MTP per model (acceptance per draft position, decode speed with and without MTP) and a trend                                                                                                                                                                                                                                                                                                                                                                    |
+| `/api/metrics/turns`           | GET          | worker    | Turns, newest first; cursor paging (`beforeTs` + `beforeTraceId`), `limit` ≤ 2000, `traceId`, `outcome`                                                                                                                                                                                                                                                                                                                                                         |
+| `/api/runtime/series`          | GET          | worker    | `from`, `to`, `bucketMs` (5 s … 1 h) → samples, scheduler deltas, processes, loads                                                                                                                                                                                                                                                                                                                                                                              |
+| `/api/runtime/live`            | GET          | transport | `RuntimeLive` snapshot: status, supervisor, processes                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `/api/cache`                   | GET / DELETE | worker    | Cold-tier scan and daily trend (`trend[].t`, local day start) / clear all or evict older-than-N-days                                                                                                                                                                                                                                                                                                                                                            |
+| `/api/cache/prefix`            | GET          | worker    | Model caches per folder: `roots[]` (`namespaces`, `volume`, `readError`, `engines` with their limit), `counting`, `canLock`                                                                                                                                                                                                                                                                                                                                     |
+| `/api/cache/prefix/:namespace` | DELETE       | worker    | Body `{root, openedMs}` → one step `{removed, freedBytes, done, left, directoryRemoved}`; repeat until `done`. 400, 403, 404, 409 `held`/`changed`/`moved`/`no-lock-check`                                                                                                                                                                                                                                                                                      |
+| `/api/ingest`                  | POST         | worker    | Trigger an incremental rescan                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `/api/sessions`                | GET          | worker    | `?q=&cwd=&limit=&offset=` → `{sessions, total, cwds}`; limit 1..500, default 100                                                                                                                                                                                                                                                                                                                                                                                |
+| `/api/sessions/:id`            | GET          | worker    | `{session, transcript, turns, transcriptError?, resumeCommand}`; subagent ids work too; tool, text and subagent entries carry `endTs`                                                                                                                                                                                                                                                                                                                           |
+| `/api/sessions/:id/timeline`   | GET          | worker    | `?turn=<n>` → `SessionTimelineResponse`: one turn as lanes, spans and handoffs; metadata only (below)                                                                                                                                                                                                                                                                                                                                                           |
+| `/api/sessions/:id`            | PATCH        | worker    | Body `{title}` → `{id, title}`; 400 bad title, 404, 409 live/recent/changed                                                                                                                                                                                                                                                                                                                                                                                     |
+| `/api/sessions/:id`            | DELETE       | worker    | `{deleted: [id, ...children]}`; 404, 409 when it or any child is live                                                                                                                                                                                                                                                                                                                                                                                           |
 
 `/api/sessions`, `/api/sessions/:id` and its timeline read both session homes. `origin` is `agent`, `chat` (the Chat
 home) or `work` (an agent-home session the Work index `~/.mlx-node/chat/conversations.json` names). `resumeCommand` is

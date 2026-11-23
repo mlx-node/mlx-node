@@ -41,7 +41,13 @@ export interface ModelsResponse {
   warnings: string[];
   /** Absolute path of the models directory these checkpoints were discovered in. */
   dir: string;
-  host: { totalMemBytes: number; diskFreeBytes: number | null };
+}
+
+/** `GET /api/host`: this Mac's memory and the free space of the disk that holds the models folder. */
+export interface HostResponse {
+  totalMemBytes: number;
+  /** `null` when the models folder cannot be read. */
+  diskFreeBytes: number | null;
 }
 
 export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
@@ -101,6 +107,8 @@ export interface CatalogBuildItem {
   localAssetsRevision: string | null;
   /** The folder was made by Locate from model files elsewhere on this Mac; `null` otherwise. */
   located: LocatedFiles | null;
+  /** Local models lists the folder at `slug`. */
+  listed: boolean;
 }
 
 export interface CatalogItem {
@@ -122,7 +130,10 @@ export type CatalogDraftItem = Pick<
   'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
 > & { label: string };
 
-/** An entry at a catalog slug that the app did not create, measured without following a link or opening a file. */
+/**
+ * An entry at a catalog slug that the app did not create, measured without following a link or opening a file. The
+ * cleanup confirmation shows these numbers, and its request echoes them back.
+ */
 export interface CatalogBlocker {
   kind: 'directory' | 'symlink' | 'file';
   /** directory: files below it. file: 1. symlink: 0. */
@@ -136,10 +147,15 @@ export interface CatalogBlocker {
   listed: boolean;
   /** A `config.json` is at its root. */
   modelLike: boolean;
-  /** `mlx serve` can list a model in it (a checkpoint or a target GGUF), so Reinstall refuses it. */
+  /** It holds model files (a checkpoint or a GGUF); for a link, the folder it points to does. */
   holdsModel: boolean;
+  /** The link text, cut to 200 characters and `…`. */
   linkTarget: string | null;
   dangling: boolean;
+  /** A link whose target is there and is not a folder. */
+  linkToFile: boolean;
+  /** A real folder the app has no write permission on: no cleanup and no Update can change it. */
+  locked: boolean;
 }
 
 export interface CatalogResponse {
@@ -157,11 +173,15 @@ export interface CatalogUpdatesResponse {
   items: CatalogUpdateItem[];
 }
 
+/** What a job does: download into a free folder, Update a folder in place, clean up an entry first, or Locate. */
+export type DownloadJobKind = 'install' | 'update' | 'cleanup' | 'locate';
+
 export interface DownloadJob {
   id: string;
   /** The folder the job installs to; the key of a download. */
   slug: string;
   repo: string;
+  kind: DownloadJobKind;
   state: 'running' | 'committing' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
   totalBytes: number;
@@ -175,6 +195,7 @@ export interface DownloadStartResponse {
   id: string;
   slug: string;
   repo: string;
+  kind: DownloadJobKind;
 }
 
 /**

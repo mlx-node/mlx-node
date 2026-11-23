@@ -26,6 +26,7 @@ import { DashboardApiError, getJson, mutate, subscribeSystemOne, type Subscripti
 import { getConnectionGeneration, subscribeConnection } from '../lib/connection';
 import { errMessage } from '../lib/errors';
 import { formatClock, formatCount, formatDurationParts, formatPercent } from '../lib/format';
+import { useHost } from '../lib/host';
 import { useRuntimeLive } from '../lib/live';
 import {
   type BatchRow,
@@ -111,8 +112,9 @@ export default function SystemOne(): ReactElement {
   const stateQuery = useJson<SystemOneState>('/systemone/state');
   const modelsQuery = useJson<ModelsResponse>('/models');
   const catalogQuery = useJson<CatalogResponse>('/catalog');
+  const hostQuery = useHost();
   const updatesQuery = useJson<CatalogUpdatesResponse>('/catalog/updates');
-  const downloads = useModelDownloads(modelsQuery, catalogQuery, updatesQuery);
+  const downloads = useModelDownloads(modelsQuery, catalogQuery, updatesQuery, hostQuery);
 
   const liveRunning = live === undefined ? undefined : live.processes.some((p) => p.status === 'running');
   const liveResidentKey = useMemo(() => {
@@ -1672,7 +1674,7 @@ export default function SystemOne(): ReactElement {
       ) : null}
 
       {showEmptyInstallCard ? (
-        <NoSystemOneModelsCard models={modelsQuery} catalog={catalogQuery} downloads={downloads} />
+        <NoSystemOneModelsCard catalog={catalogQuery} host={hostQuery} downloads={downloads} />
       ) : null}
 
       <div className={styles.apiStrip} role="region" aria-label="Local System One API endpoint">
@@ -2151,8 +2153,8 @@ export default function SystemOne(): ReactElement {
       <SystemOneModelsDrawer
         open={modelsDrawerOpen}
         onOpenChange={setModelsDrawerOpen}
-        models={modelsQuery}
         catalog={catalogQuery}
+        host={hostQuery}
         updates={updatesQuery}
         downloads={downloads}
       />

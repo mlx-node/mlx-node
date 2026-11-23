@@ -1,5 +1,3 @@
-import { statfsSync } from 'node:fs';
-import { totalmem } from 'node:os';
 import { isAbsolute, relative, sep } from 'node:path';
 
 import { discoverMlxModels } from '@mlx-node/agent/models';
@@ -45,15 +43,6 @@ async function servedIdsByEntry(modelsDir: string): Promise<Map<string, string[]
   return out;
 }
 
-function diskFreeBytes(dir: string): number | null {
-  try {
-    const fs = statfsSync(dir);
-    return Number(fs.bavail) * Number(fs.bsize);
-  } catch {
-    return null;
-  }
-}
-
 export async function handleModels(ctx: ApiPaths): Promise<ModelsResponse> {
   // A link to a missing disk is not an empty library: an empty list would read as "no model installed" and send a
   // first run to Onboarding. The page branches on the reason.
@@ -64,13 +53,7 @@ export async function handleModels(ctx: ApiPaths): Promise<ModelsResponse> {
   for (const model of models) model.servedIds = served.get(model.name) ?? [];
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
-  return {
-    models,
-    companions,
-    warnings,
-    dir: ctx.modelsDir,
-    host: { totalMemBytes: totalmem(), diskFreeBytes: diskFreeBytes(ctx.modelsDir) },
-  };
+  return { models, companions, warnings, dir: ctx.modelsDir };
 }
 
 export async function handleCodingAgentModels(ctx: ApiPaths): Promise<unknown> {

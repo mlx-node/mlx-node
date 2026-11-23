@@ -41,6 +41,7 @@ import {
   handleDownloadsList,
 } from './handlers/downloads.js';
 import { handleHealth } from './handlers/health.js';
+import { handleHost } from './handlers/host.js';
 import { handleIngest } from './handlers/ingest.js';
 import {
   handleMetricsDistributions,
@@ -152,6 +153,8 @@ export const ROUTES: Route[] = [
   workerRoute('DELETE', '/api/models/:name', handleDeleteModel),
   workerRoute('GET', '/api/catalog', handleCatalog),
   mainRoute('GET', '/api/catalog/updates', handleCatalogUpdates),
+  // Answers on the transport thread so the cards never wait for the worker.
+  mainRoute('GET', '/api/host', handleHost),
   // The download routes stay on the transport thread: network I/O and progress
   // events must never queue behind a synchronous query, and a cancel click has to
   // be RECEIVED while one is running.

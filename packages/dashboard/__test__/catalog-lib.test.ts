@@ -10,7 +10,8 @@ import {
   onboardingBuild,
   shownBuild,
 } from '../ui/src/lib/catalog.js';
-import type { CatalogBuildItem, CatalogItem } from '../ui/src/lib/types.js';
+import type { CatalogBlocker, CatalogBuildItem, CatalogItem } from '../ui/src/lib/types.js';
+import { catalogActionState } from '../ui/src/pages/models/catalog.js';
 
 describe('modelBlurb', () => {
   it('keeps the default case, then the catalog description', () => {
@@ -45,6 +46,7 @@ describe('catalogBuildAt', () => {
       localAssetsRepo: null,
       localAssetsRevision: null,
       located: null,
+      listed: false,
     };
   }
   const items: CatalogItem[] = [
@@ -67,6 +69,7 @@ describe('hasUpdate', () => {
     localAssetsRepo: null,
     localAssetsRevision: null,
     located: null,
+    listed: false,
   };
 
   it('compares the primary revision only for a dashboard-owned install', () => {
@@ -133,6 +136,7 @@ describe('the build a card or a choice stands for', () => {
       localAssetsRepo: null,
       localAssetsRevision: null,
       located: null,
+      listed: false,
     };
   }
   const entry = (builds: CatalogBuildItem[]): CatalogItem => ({ label: 'M', description: '', builds });
@@ -158,5 +162,50 @@ describe('the build a card or a choice stands for', () => {
     expect(shownBuild(plain, { Other: 'orig' }, {}).slug).toBe('m');
     // A chosen folder the entry no longer has falls back to the rule.
     expect(shownBuild(plain, { M: 'gone' }, {}).slug).toBe('m');
+  });
+});
+
+describe('catalogActionState: the card each entry in the way gets', () => {
+  const folder: CatalogBlocker = {
+    kind: 'directory',
+    fileCount: 4,
+    sizeBytes: 7_612_909_326,
+    truncated: false,
+    names: [],
+    listed: true,
+    modelLike: true,
+    holdsModel: true,
+    linkTarget: null,
+    dangling: false,
+    linkToFile: false,
+    locked: false,
+  };
+  const link: CatalogBlocker = { ...folder, kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/M/x' };
+  const absent = { present: false, heldBy: null, located: null };
+  const idle = { job: undefined, updateAvailable: false };
+  const state = (blocker: CatalogBlocker | null, refused = false, heldBy: string | null = null) =>
+    catalogActionState({ ...absent, heldBy, blocker }, { ...idle, refused });
+
+  it.each<[string, CatalogBlocker, string]>([
+    ['a link to a folder of model files', link, 'cleanup'],
+    ['a dead link', { ...link, holdsModel: false, dangling: true }, 'cleanup'],
+    ['a file', { ...folder, kind: 'file', fileCount: 1, holdsModel: false, listed: false }, 'cleanup'],
+    ['an empty folder', { ...folder, fileCount: 0, sizeBytes: 0, holdsModel: false, listed: false }, 'cleanup'],
+    ['a folder of other files', { ...folder, fileCount: 2, holdsModel: false, listed: false }, 'cleanup'],
+    ['a folder too large to list', { ...folder, fileCount: 2000, truncated: true }, 'cleanup'],
+    // Mutation: drop the locked check → the locked folder of model files is an adopt → red.
+    ['a folder the app cannot write', { ...folder, locked: true }, 'locked'],
+    ['a locked folder too large to read', { ...folder, truncated: true, fileCount: 0, locked: true }, 'locked'],
+    ['a folder of model files', folder, 'adopt'],
+  ])('%s', (_name, blocker, expected) => {
+    expect(state(blocker)).toBe(expected);
+  });
+
+  it('turns an adopt into a cleanup while Update refused this folder, and not a held folder', () => {
+    expect(state(folder, true)).toBe('cleanup');
+    expect(state(folder, false)).toBe('adopt');
+    expect(state(null, false, 'UD-Q4_K_M')).toBe('held');
+    expect(state(folder, true, 'UD-Q4_K_M')).toBe('held');
+    expect(state(null)).toBe('install');
   });
 });

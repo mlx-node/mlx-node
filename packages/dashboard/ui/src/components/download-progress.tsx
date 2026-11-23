@@ -20,6 +20,8 @@ export interface RateState {
   at: number;
   bytes: number;
   bytesPerSec: number | null;
+  /** performance.now() of the first frame of this phase: checking files or downloading them. */
+  since: number;
 }
 
 export interface ProgressState {
@@ -56,17 +58,19 @@ export const INITIAL_PROGRESS: ProgressState = {
 export const STALL_MS = 5000;
 const RATE_MIN_DT_MS = 1000;
 const RATE_WEIGHT = 0.3;
+/** The rate of the first seconds of a phase is noise: no time-left text before this. */
+export const TIME_LEFT_WARMUP_MS = 10_000;
 
 export type ProgressEvent = DownloadEvent | { type: 'stalled' };
 
 function nextRate(prev: RateState | null, bytes: number, now: number): RateState {
-  if (prev === null) return { at: now, bytes, bytesPerSec: null };
+  if (prev === null) return { at: now, bytes, bytesPerSec: null, since: now };
   const dt = now - prev.at;
   if (dt < RATE_MIN_DT_MS) return prev;
   const inst = ((bytes - prev.bytes) / dt) * 1000;
-  if (inst < 0) return { at: now, bytes, bytesPerSec: prev.bytesPerSec };
+  if (inst < 0) return { ...prev, at: now, bytes };
   const bytesPerSec = prev.bytesPerSec === null ? inst : RATE_WEIGHT * inst + (1 - RATE_WEIGHT) * prev.bytesPerSec;
-  return { at: now, bytes, bytesPerSec };
+  return { at: now, bytes, bytesPerSec, since: prev.since };
 }
 
 /** The card's state machine. `now` is performance.now() of the event; only the transfer rate reads it. */
@@ -87,15 +91,18 @@ export function reduceProgress(
       };
     case 'progress': {
       const terminal = prev.phase === 'done' || prev.phase === 'error';
+      const checking = event.phase === 'check';
+      // Hashing speed is not download speed: a new phase measures from its own first frame.
+      const rate = checking === prev.checking ? prev.rate : null;
       return {
         ...prev,
         phase: terminal ? prev.phase : 'running',
         fileCount: event.fileCount > 0 ? event.fileCount : prev.fileCount,
         fileIndex: event.fileIndex,
         currentFile: event.file,
-        checking: event.phase === 'check',
+        checking,
         receivedBytes: event.jobReceivedBytes,
-        rate: nextRate(prev.rate, event.jobReceivedBytes, now),
+        rate: nextRate(rate, event.jobReceivedBytes, now),
         stalled: false,
       };
     }
@@ -125,12 +132,31 @@ export interface DownloadProgressProps extends DownloadProgressCallbacks {
   className?: string;
 }
 
-function timeLeft(state: ProgressState): string | null {
-  const rate = state.rate?.bytesPerSec ?? null;
-  if (rate === null || rate <= 0 || state.totalBytes <= 0) return null;
-  const seconds = Math.max(0, state.totalBytes - state.receivedBytes) / rate;
+/** `seconds` of work left in words: minutes up to an hour, hours and minutes (by 5) up to ten hours, then hours. */
+export function timeLeftText(seconds: number): string {
   if (seconds < 60) return 'under a minute left';
-  return `about ${Math.round(seconds / 60)} min left`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `about ${minutes} min left`;
+  if (minutes < 600) {
+    let hours = Math.floor(minutes / 60);
+    let rest = Math.round((minutes % 60) / 5) * 5;
+    if (rest === 60) {
+      hours += 1;
+      rest = 0;
+    }
+    return rest === 0 ? `about ${hours} h left` : `about ${hours} h ${rest} min left`;
+  }
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `about ${hours} h left` : 'more than a day left';
+}
+
+/** The time left of a download, or null while the rate of this phase is not known well enough to say one. */
+export function timeLeft(state: ProgressState): string | null {
+  const rate = state.rate;
+  if (rate === null || rate.bytesPerSec === null || rate.bytesPerSec <= 0) return null;
+  if (state.totalBytes <= 0 || state.checking || state.stalled) return null;
+  if (rate.at - rate.since < TIME_LEFT_WARMUP_MS) return null;
+  return timeLeftText(Math.max(0, state.totalBytes - state.receivedBytes) / rate.bytesPerSec);
 }
 
 const LOADER: Record<ProgressPhase, LoaderStatus> = {
@@ -140,9 +166,11 @@ const LOADER: Record<ProgressPhase, LoaderStatus> = {
   error: 'error',
 };
 
+/** What the `done` event says about the old entry: where it was kept, or how a cleanup removed it. */
+export type DownloadDoneResult = Pick<Extract<DownloadEvent, { type: 'done' }>, 'keptDir' | 'removed'>;
+
 export interface DownloadProgressCallbacks {
-  /** `keptDir`: where a later update put the files of the old folder that the app may not delete. */
-  onDone?: (keptDir: string | undefined) => void;
+  onDone?: (result: DownloadDoneResult) => void;
   onError?: (message: string) => void;
   /**
    * The job stopped without finishing. Distinct from {@link onError}: a cancel is
@@ -189,7 +217,7 @@ export function useDownloadProgress(id: string | undefined, callbacks: DownloadP
       setState((prev) => reduceProgress(prev, event, now));
       if (event.type === 'start' || event.type === 'progress') armStall();
       else clearTimeout(stallTimer);
-      if (event.type === 'done') doneCb.current?.(event.keptDir);
+      if (event.type === 'done') doneCb.current?.({ keptDir: event.keptDir, removed: event.removed });
       if (event.type === 'error') errorCb.current?.(event.message);
       // A terminal event the owner cannot have been waiting for. The host answers
       // a cancel while the job is still `running` — it lets `processJob` emit this

@@ -26,6 +26,7 @@ import {
   assertFixtureTree,
   CATALOG_BLOCKED,
   CATALOG_INSTALL,
+  CATALOG_LINK,
   CATALOG_LOCATED,
   CATALOG_SECOND_BUILD,
   CATALOG_UPDATE,
@@ -284,6 +285,7 @@ describe('dev fixture home', () => {
       [
         'partial-download: no readable config.json; skipped',
         `${CATALOG_BLOCKED.slug}: no readable config.json; skipped`,
+        `${CATALOG_LINK.slug}: no readable config.json; skipped`,
       ].sort(),
     );
     const cache = scanColdCache(paths.cacheRoot);
@@ -313,7 +315,7 @@ describe('dev fixture content for the manage pages', () => {
     ]);
   });
 
-  it('blocks one catalog slug with a one-file leftover that Reinstall can replace', () => {
+  it('blocks one catalog slug with a one-file leftover that a cleanup can replace', () => {
     writeFixtureHome(home, { now });
     const build = catalogWithState(fixturePaths(home).modelsDir)
       .flatMap((item) => item.builds)
@@ -329,7 +331,27 @@ describe('dev fixture content for the manage pages', () => {
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     });
+  });
+
+  it('makes one catalog slug a link to a folder of model files inside the home, which a cleanup removes alone', () => {
+    writeFixtureHome(home, { now });
+    const build = catalogWithState(fixturePaths(home).modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_LINK.slug);
+    expect(build).toMatchObject({ present: false, heldBy: null, blockedByForeignDir: true, listed: false });
+    expect(build?.blocker).toMatchObject({
+      kind: 'symlink',
+      holdsModel: true,
+      linkTarget: realpathSync(join(home, CATALOG_LINK.target)),
+      dangling: false,
+      locked: false,
+    });
+    // A second run over the same home keeps the link and its folder; the tree check accepts both.
+    writeFixtureHome(home, { now });
+    expect(() => assertFixtureTree(home)).not.toThrow();
   });
 
   it('holds one catalog slug with a GGUF folder that Update can adopt', () => {

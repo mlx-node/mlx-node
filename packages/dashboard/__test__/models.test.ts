@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -10,7 +11,7 @@ import {
   truncateSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir, totalmem } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
 import { type CatalogBuild, catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG } from '@mlx-node/agent/catalog';
@@ -33,6 +34,8 @@ import {
   locatedState,
   modelsDirUnavailable,
   readCompletion,
+  readLinkText,
+  sameForeignEntry,
   summarizeForeignEntry,
 } from '../src/models.js';
 
@@ -145,13 +148,11 @@ describe('GET /api/models', () => {
     expect(body.warnings.some((w) => w.includes('clairic-gguf'))).toBe(false);
   });
 
-  it('host reports memory and free disk', async () => {
+  it('answers the inventory only: memory and free disk are GET /api/host', async () => {
     const body = await handleModels(paths(modelsDir));
-    expect(body.host.totalMemBytes).toBe(totalmem());
-    expect(body.host.diskFreeBytes).toBeGreaterThan(0);
+    expect(Object.keys(body).sort()).toEqual(['companions', 'dir', 'models', 'warnings']);
     const missing = await handleModels(paths(join(modelsDir, 'does-not-exist')));
     expect(missing.models).toEqual([]);
-    expect(missing.host.diskFreeBytes).toBeNull();
   });
 });
 
@@ -1705,7 +1706,63 @@ describe('catalog blocker: what is in the way, measured without following or ope
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     });
+  });
+
+  it.each<[string, number]>([
+    ['cannot be read or written', 0o000],
+    ['can be read but not written', 0o500],
+  ])('marks a folder the app has no write permission on as locked: one that %s', (_name, mode) => {
+    mkdirSync(slugDir());
+    writeFileSync(join(slugDir(), 'notes.txt'), 'x');
+    chmodSync(slugDir(), mode);
+    try {
+      expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'directory', locked: true });
+    } finally {
+      chmodSync(slugDir(), 0o755);
+    }
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'directory', locked: false });
+  });
+
+  it('never marks a link or a file as locked, whatever its target or mode', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => {
+      chmodSync(external, 0o755);
+      rmSync(external, { recursive: true, force: true });
+    });
+    chmodSync(external, 0o500);
+    symlinkSync(external, slugDir());
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'symlink', locked: false, linkTarget: external });
+    rmSync(slugDir());
+    writeFileSync(slugDir(), 'x');
+    chmodSync(slugDir(), 0o400);
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'file', locked: false });
+  });
+
+  it('cuts the link text at 200 characters, and compares it when it matches an echo', () => {
+    const long = `${'a'.repeat(250)}`;
+    symlinkSync(long, slugDir());
+    expect(readLinkText(slugDir())).toBe(`${'a'.repeat(200)}…`);
+    expect(readLinkText(modelsDir)).toBeNull();
+    const now = buildItem(QWEN_SLUG).blocker!;
+    expect(now.linkTarget).toBe(`${'a'.repeat(200)}…`);
+    expect(sameForeignEntry(now, { ...now })).toBe(true);
+    expect(sameForeignEntry(now, { ...now, linkTarget: 'b' })).toBe(false);
+    expect(sameForeignEntry(now, { ...now, linkTarget: null })).toBe(false);
+  });
+
+  it('says whether Local models lists the folder of a build', () => {
+    expect(buildItem(QWEN_SLUG).listed).toBe(false);
+    writeModel(modelsDir, QWEN_SLUG, CONFIG_A, 8);
+    expect(buildItem(QWEN_SLUG).listed).toBe(true);
+    rmSync(slugDir(), { recursive: true });
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, GGUF), ggufHeader('qwen35'));
+    symlinkSync(external, slugDir());
+    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: false, blocker: { kind: 'symlink' } });
   });
 
   it('names up to three files, sorted, with their relative paths; none for four', () => {
@@ -1884,6 +1941,7 @@ describe('catalog blocker: what is in the way, measured without following or ope
     expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
       kind: 'symlink',
       dangling: true,
+      linkToFile: false,
       linkTarget: target,
       fileCount: 0,
       sizeBytes: 0,
@@ -1896,6 +1954,16 @@ describe('catalog blocker: what is in the way, measured without following or ope
     expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
       kind: 'symlink',
       dangling: false,
+      linkToFile: false,
+      fileCount: 0,
+      sizeBytes: 0,
+    });
+    rmSync(slugDir());
+    symlinkSync(join(external, 'big.bin'), slugDir());
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
+      kind: 'symlink',
+      dangling: false,
+      linkToFile: true,
       fileCount: 0,
       sizeBytes: 0,
     });

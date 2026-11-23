@@ -32,6 +32,7 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
     localAssetsRepo: null,
     localAssetsRevision: null,
     located: null,
+    listed: false,
   })),
 }));
 
@@ -72,8 +73,8 @@ function routes(dir = '/test/onboarding') {
       companions: [],
       warnings: [],
       dir,
-      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     },
+    '/host': { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     '/catalog': { items },
     '/catalog/updates': { items: [] },
     '/downloads': { jobs: [] },
@@ -130,7 +131,7 @@ describe('first model onboarding', () => {
     const mac = routes(`/test/mac-${gib}`);
     dispose = stubApi({
       ...mac,
-      '/models': { ...mac['/models'], host: { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null } },
+      '/host': { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null },
     });
     page = await renderPage(createElement(App), (text) => text.includes('Download model'));
     const offered = [...page.container.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((el) => el.value);
@@ -291,6 +292,64 @@ describe('first model onboarding', () => {
     // Mutation: Onboarding reads builds[0] → the first build's size and "One-time download" → red.
     expect(card.textContent).toContain(`~${second.sizeGb} GB · Downloaded`);
     expect(card.textContent).toContain('On this Mac');
+  });
+
+  it.each<[string, Partial<CatalogBuildItem>, string]>([
+    ['held', { heldBy: 'UD-Q4_K_M' }, 'Holds UD-Q4_K_M'],
+    [
+      'locked',
+      {
+        blockedByForeignDir: true,
+        blocker: {
+          kind: 'directory',
+          fileCount: 1,
+          sizeBytes: 10,
+          truncated: false,
+          names: ['a.txt'],
+          listed: false,
+          modelLike: false,
+          holdsModel: false,
+          linkTarget: null,
+          dangling: false,
+          linkToFile: false,
+          locked: true,
+        },
+      },
+      'No access',
+    ],
+    [
+      'needs-update',
+      {
+        blockedByForeignDir: true,
+        blocker: {
+          kind: 'directory',
+          fileCount: 2,
+          sizeBytes: 10,
+          truncated: false,
+          names: ['a.gguf', 'config.json'],
+          listed: false,
+          modelLike: true,
+          holdsModel: true,
+          linkTarget: null,
+          dangling: false,
+          linkToFile: false,
+          locked: false,
+        },
+      },
+      'Folder needs update',
+    ],
+  ])('names a %s folder for what it is, not as one that needs cleanup', async (_name, change, word) => {
+    const qwen = visible.find((item) => item.isDefault === true)!;
+    const [first, ...rest] = qwen.builds;
+    const blockedEntry: CatalogItem = { ...qwen, builds: [{ ...first, ...change }, ...rest] };
+    dispose = stubApi({
+      ...routes(`/test/blocked-${_name}`),
+      '/catalog': { items: items.map((item) => (item.label === qwen.label ? blockedEntry : item)) },
+    });
+    await mount();
+    const card = page!.container.querySelector<HTMLInputElement>(`input[value="${qwen.label}"]`)!.closest('label')!;
+    expect(card.textContent).toContain(`~${first.sizeGb} GB · ${word}`);
+    expect(card.textContent).not.toContain('needs cleanup');
   });
 
   it('continues from a ready model to coding agent setup and remembers completion', async () => {

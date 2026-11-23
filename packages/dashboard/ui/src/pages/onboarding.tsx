@@ -13,23 +13,24 @@ import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
 import { modelBlurb, modelPresent, offeredOnHost, onboardingBuild } from '../lib/catalog';
 import { dismissOnboarding } from '../lib/onboarding';
-import type { CatalogBuildItem, CatalogResponse, ModelsResponse } from '../lib/types';
+import type { CatalogBuildItem, CatalogItem, CatalogResponse, HostResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
 import { WindowDragStrip } from '../shell/window-chrome';
-import { hostNote, locateName } from './models/catalog';
+import { catalogActionState, hostNote, locateName } from './models/catalog';
 import type { ModelDownloadError } from './models/use-model-downloads';
 
 interface OnboardingProps {
   catalog: AsyncState<CatalogResponse>;
   models: AsyncState<ModelsResponse>;
+  host: AsyncState<HostResponse>;
   /** The folders with a job this page follows. */
   activeSlugs: string[];
   downloadError: ModelDownloadError | null;
   downloadsLoading: boolean;
   downloadsError: Error | undefined;
   reloadDownloads: () => void;
-  /** The action of `build`; `modelName` is what a Locate confirmation names. */
-  renderDownload: (build: CatalogBuildItem, modelName: string) => ReactNode;
+  /** The action of `build` of `entry`; `modelName` is what a Locate confirmation names. */
+  renderDownload: (build: CatalogBuildItem, entry: CatalogItem, modelName: string) => ReactNode;
 }
 
 const STEPS = ['Choose a model', 'Download', 'Set up coding agents'] as const;
@@ -40,14 +41,29 @@ function blocked(build: CatalogBuildItem): boolean {
 }
 
 function availability(build: CatalogBuildItem): string {
-  if (blocked(build)) return 'Folder needs cleanup';
-  if (build.present) return 'Downloaded';
-  return 'One-time download';
+  switch (catalogActionState(build, { job: undefined, updateAvailable: false })) {
+    case 'held':
+      return `Holds ${build.heldBy}`;
+    case 'locked':
+      return 'No access';
+    case 'adopt':
+      return 'Folder needs update';
+    case 'cleanup':
+      return 'Folder needs cleanup';
+    case 'missing':
+      return 'Files not found';
+    case 'installed':
+    case 'update':
+      return 'Downloaded';
+    default:
+      return 'One-time download';
+  }
 }
 
 export default function Onboarding({
   catalog,
   models,
+  host: hostState,
   activeSlugs,
   downloadError,
   downloadsLoading,
@@ -57,7 +73,7 @@ export default function Onboarding({
 }: OnboardingProps): ReactElement {
   const navigate = useNavigate();
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
-  const host = models.data?.host;
+  const host = hostState.data;
   const items = (catalog.data?.items ?? []).filter(
     (item) => offeredOnHost(item, host) && item.category !== 'systemone',
   );
@@ -71,7 +87,8 @@ export default function Onboarding({
   const downloading = activeLabel !== undefined;
   const ready = selected !== undefined && modelPresent(selected) && !downloading;
   const error = catalog.error ?? models.error ?? downloadsError;
-  const loading = catalog.loading || models.loading || downloadsLoading;
+  // A failed host reading only hides the entries with a memory floor; it is no reason to stop here.
+  const loading = catalog.loading || models.loading || hostState.loading || downloadsLoading;
   const modelsDir = models.data?.dir;
   const canFinish =
     modelsDir !== undefined && modelsDir !== '' && !models.loading && !models.refreshing && models.error === undefined;
@@ -99,6 +116,7 @@ export default function Onboarding({
             onClick={() => {
               catalog.reload();
               models.reload();
+              hostState.reload();
               reloadDownloads();
             }}
           >
@@ -275,7 +293,9 @@ export default function Onboarding({
                     </>
                   ) : (
                     <>
-                      <div className="w-full">{renderDownload(selectedBuild, locateName(selected, selectedBuild))}</div>
+                      <div className="w-full">
+                        {renderDownload(selectedBuild, selected, locateName(selected, selectedBuild))}
+                      </div>
                       {downloading ? null : (
                         <a
                           className="link inline-flex items-center gap-1 text-caption"
