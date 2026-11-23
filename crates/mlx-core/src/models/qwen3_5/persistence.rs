@@ -38,7 +38,7 @@ use crate::models::clef::head::{HeadConfig, JointHead};
 use crate::utils::gguf_import::GgufPreload;
 
 use super::config::Qwen3_5Config;
-use super::decoder_layer::AttentionType;
+use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner};
 #[cfg(test)]
@@ -2379,7 +2379,7 @@ fn apply_weights_inner_with_residency(
 
         // Dense MLP weights
         match &mut layer.mlp {
-            MLPVariant::Standard(mlp) => {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 if is_quantized {
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
@@ -2434,7 +2434,7 @@ fn apply_weights_inner_with_residency(
                     mlp.finalize_gate_up()?;
                 }
             }
-            MLPVariant::Quantized { .. } => {}
+            MLPType::Dense(MLPVariant::Quantized { .. }) | MLPType::MoE(_) => {}
         }
 
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
@@ -2485,7 +2485,7 @@ fn apply_weights_inner_with_residency(
                 config.n_mtp_layers,
             );
             if missing_mtp.is_empty() {
-                mtp.apply_weights(params, default_plq, &per_layer_quant, compute_dtype)?;
+                mtp.apply_weights(params, default_plq, None, &per_layer_quant, compute_dtype)?;
                 inner.mtp_weights_loaded = true;
             } else {
                 inner.mtp_weights_loaded = false;
@@ -4743,12 +4743,12 @@ mod tests {
         );
         assert!(!live.contains_key(&format!("{p}.down_proj.weight")));
 
-        let MLPVariant::Quantized {
+        let MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
             ..
-        } = &inner.layers[0].mlp
+        }) = &inner.layers[0].mlp
         else {
             panic!("layer 0 MLP must be quantized");
         };
@@ -5022,12 +5022,12 @@ mod tests {
         assert!(live.contains_key("layers.1.linear_attn.in_proj_qkvz.weight"));
 
         for (layer, decoder) in inner.layers.iter().enumerate().take(2) {
-            let MLPVariant::Quantized {
+            let MLPType::Dense(MLPVariant::Quantized {
                 gate_proj,
                 up_proj,
                 down_proj,
                 ..
-            } = &decoder.mlp
+            }) = &decoder.mlp
             else {
                 panic!("layer {layer} MLP must be quantized");
             };
@@ -5094,9 +5094,9 @@ mod tests {
             let reference = |name: &str, bits: i32| {
                 try_build_quantized_linear(&params, name, 64, bits).unwrap()
             };
-            let MLPVariant::Quantized {
+            let MLPType::Dense(MLPVariant::Quantized {
                 gate_proj, up_proj, ..
-            } = &inner.layers[0].mlp
+            }) = &inner.layers[0].mlp
             else {
                 unreachable!()
             };
@@ -7340,18 +7340,18 @@ mod tests {
         assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
         assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
         match &layer.mlp {
-            MLPVariant::Quantized {
+            MLPType::Dense(MLPVariant::Quantized {
                 gate_proj,
                 up_proj,
                 down_proj,
                 gate_up,
-            } => {
+            }) => {
                 for ql in [gate_proj, up_proj, down_proj] {
                     assert_eq!(ql.mode(), sym8);
                 }
                 assert!(gate_up.is_none(), "sym8 projections never row-merge");
             }
-            MLPVariant::Standard(_) => panic!("layer 0 MLP must be quantized"),
+            _ => panic!("layer 0 MLP must be quantized"),
         }
     }
 
@@ -7572,11 +7572,11 @@ mod tests {
         assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
         assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
         match &layer.mlp {
-            MLPVariant::Standard(mlp) => {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 assert_eq!(mlp.get_gate_proj_weight().dtype().unwrap(), DType::BFloat16);
                 assert_eq!(mlp.get_down_proj_weight().dtype().unwrap(), DType::BFloat16);
             }
-            MLPVariant::Quantized { .. } => panic!("a mixed MLP must install dense"),
+            _ => panic!("a mixed MLP must install dense"),
         }
     }
 
@@ -7944,7 +7944,7 @@ mod tests {
         assert_eq!(gdn.prism_hadamard_sites(), (true, false, false, false));
         // gate/up K=1024 rotate; down K=128 does not.
         assert_eq!(layer.mlp.has_hadamard(), Some((true, true, false)));
-        if let MLPVariant::Quantized { gate_up, .. } = &layer.mlp {
+        if let MLPType::Dense(MLPVariant::Quantized { gate_up, .. }) = &layer.mlp {
             assert!(gate_up.is_none(), "sym8 projections never row-merge");
         } else {
             panic!("layer 0 MLP must be quantized");

@@ -8,6 +8,7 @@
 #include "../kquant/kquant_m8_nax.h"
 #include "abi.h"
 #include "../kquant/kquant_sg8.h"
+#include "../common/moe_common.h"
 using namespace metal;
 using namespace mpp::tensor_ops;
 
@@ -92,7 +93,7 @@ kernel void splash_moe_route(
   for (uint rank = 0; rank < p.top_k; ++rank) {
     float best = -INFINITY; uint slot = ~0u;
     for (uint j = 0; j < 8; ++j)
-      if ((available & (1u << j)) && (slot == ~0u || scores[j] >= best)) { best = scores[j]; slot = j; }
+      if ((available & (1u << j)) && (slot == ~0u || moe_topk_better<false>(scores[j], j, best, slot))) { best = scores[j]; slot = j; }
     float winner_score = simd_max(best);
     // MLX argpartition currently uses a stable ascending merge sort and
     // takes its last K entries: ties prefer the larger expert ids.
@@ -125,9 +126,6 @@ kernel void splash_moe_route(
   }
 }
 
-inline uint splash_matmul_rows(uint rows, uint tile_rows) {
-  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
-}
 inline bool splash_column_tile(device const SplashMoeTile *tiles, uint t, constant SplashMoeParams &p) {
   // Preserve the native grouped GEMM accumulation order for sparse experts
   // during prefill. Tiny BF16 rounding differences can change later routing.
@@ -154,17 +152,14 @@ kernel void splash_moe_group(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint count = atomic_load_explicit(counts + tid, memory_order_relaxed);
   uint nt = (count + p.tile_rows - 1) / p.tile_rows;
-  uint start = simd_prefix_exclusive_sum(nt);
-  if (lane == 31) totals[sg] = start + nt;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = 0; i < sg; ++i) start += totals[i];
+  uint start = moe_exclusive_prefix_sum_256(nt, totals, lane, sg);
   offsets[tid] = start;
   if (tid == 255) routed_tiles = start + nt;
   for (uint t = 0; t < nt; ++t) tiles[start + t] = {tid, min(p.tile_rows, count - t * p.tile_rows)};
   if (nt) {
     uint last = start + nt - 1, live = count - (nt - 1) * p.tile_rows;
     for (uint r = start * p.tile_rows + count;
-         r < last * p.tile_rows + splash_matmul_rows(live, p.tile_rows); ++r) routes[r] = ~0u;
+         r < last * p.tile_rows + moe_matmul_rows(live, p.tile_rows); ++r) routes[r] = ~0u;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = tid; r < live_rows * rpr; r += 256) {
@@ -176,7 +171,7 @@ kernel void splash_moe_group(
   }
   uint shared_tiles = (p.rows + p.tile_rows - 1) / p.tile_rows;
   uint shared_base = routed_tiles * p.tile_rows;
-  uint shared_rows = (shared_tiles - 1) * p.tile_rows + splash_matmul_rows(p.rows - (shared_tiles - 1) * p.tile_rows, p.tile_rows);
+  uint shared_rows = (shared_tiles - 1) * p.tile_rows + moe_matmul_rows(p.rows - (shared_tiles - 1) * p.tile_rows, p.tile_rows);
   for (uint t = tid; t < shared_tiles; t += 256)
     tiles[routed_tiles + t] = {p.experts, min(p.tile_rows, p.rows - t * p.tile_rows)};
   for (uint r = tid; r < shared_rows; r += 256) {
@@ -201,7 +196,7 @@ kernel void splash_moe_gather(
     device bfloat *out [[buffer(4)]], constant SplashMoeParams &p [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   if (group.x >= *count) return;
-  uint rows = splash_column_tile(tiles, group.x, p) ? tiles[group.x].rows : splash_matmul_rows(tiles[group.x].rows, p.tile_rows);
+  uint rows = splash_column_tile(tiles, group.x, p) ? tiles[group.x].rows : moe_matmul_rows(tiles[group.x].rows, p.tile_rows);
   uint col = group.y * 256 + (tid % 32) * 8;
   for (uint i = tid / 32; i < rows; i += 8) {
     uint row = group.x * p.tile_rows + i, route = routes[row];

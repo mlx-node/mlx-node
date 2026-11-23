@@ -1264,12 +1264,14 @@ impl Qwen35Inner {
                                 }
                             }
                         } else if name.contains(".mlp.") {
-                            if name.ends_with(".gate_proj.weight") {
-                                layer.mlp.set_gate_proj_weight(updated_param)?;
-                            } else if name.ends_with(".up_proj.weight") {
-                                layer.mlp.set_up_proj_weight(updated_param)?;
-                            } else if name.ends_with(".down_proj.weight") {
-                                layer.mlp.set_down_proj_weight(updated_param)?;
+                            if let Some(mlp) = layer.mlp.as_dense_mut() {
+                                if name.ends_with(".gate_proj.weight") {
+                                    mlp.set_gate_proj_weight(updated_param)?;
+                                } else if name.ends_with(".up_proj.weight") {
+                                    mlp.set_up_proj_weight(updated_param)?;
+                                } else if name.ends_with(".down_proj.weight") {
+                                    mlp.set_down_proj_weight(updated_param)?;
+                                }
                             }
                         } else if name.ends_with(".input_layernorm.weight") {
                             layer.set_input_layernorm_weight(updated_param, updated_dtype)?;
@@ -1365,19 +1367,55 @@ impl Qwen35Inner {
                 }
             }
 
-            // MLP (all layers have dense MLP)
-            params.insert(
-                format!("{}.mlp.gate_proj.weight", prefix),
-                layer.mlp.get_gate_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.up_proj.weight", prefix),
-                layer.mlp.get_up_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.down_proj.weight", prefix),
-                layer.mlp.get_down_proj_weight(),
-            );
+            // MLP
+            match &layer.mlp {
+                crate::models::qwen3_5::decoder_layer::MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{}.mlp.gate_proj.weight", prefix),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.up_proj.weight", prefix),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.down_proj.weight", prefix),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                crate::models::qwen3_5::decoder_layer::MLPType::MoE(moe) => {
+                    params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert_gate.weight", prefix),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
 
             // Layer norms
             params.insert(

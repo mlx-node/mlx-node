@@ -1,4 +1,4 @@
-pub(crate) mod adaptive_depth;
+pub(crate) use crate::engine::mtp_decode;
 pub mod arrays_cache;
 pub mod attention;
 pub mod config;
@@ -22,7 +22,6 @@ pub mod layer_cache;
 pub(crate) mod load_plan;
 pub mod model;
 pub mod mtp;
-pub(crate) mod mtp_decode;
 pub(crate) mod paged_forward;
 pub mod persistence;
 #[cfg(all(test, target_os = "macos"))]
@@ -35,8 +34,11 @@ pub mod quantized_linear;
 pub mod rms_norm_gated;
 pub(crate) mod scheduled_dflash2;
 pub(crate) mod scheduled_mtp;
+pub mod sparse_moe;
 #[cfg(all(test, target_os = "macos"))]
 mod store_epilogue_tests;
+pub mod switch_glu;
+pub(crate) mod verify_budget;
 pub(crate) mod verify_tree;
 pub use config::Qwen3_5Config;
 pub use model::Qwen3_5Model;

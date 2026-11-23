@@ -2,11 +2,11 @@ use napi::bindgen_prelude::{Error, Result};
 
 use super::*;
 use crate::array::MxArray;
-use crate::engine::backend::ChatBackend;
-use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+use crate::engine::cmd::ChatCmd;
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
-    ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
+    DualLaneChatBarrier, HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor,
+    NoRestoreTicket, ScheduledPrefixAdmission, SchedulerOwnerContext, chat_cmd_config,
+    execute_dual_lane_chat_barrier,
 };
 use crate::engine::scheduler::PreemptionMode;
 use crate::stream::Stream;
@@ -23,74 +23,57 @@ pub(crate) type Gemma4Cmd = crate::engine::model_command::ModelCommand;
 
 pub(crate) type Gemma4SchedulerState = HybridSchedulerState<Gemma4Inner>;
 
-fn gemma4_chat_parts(command: &ChatCmd) -> Option<(&[ChatMessage], &ChatConfig)> {
-    match command {
-        ChatCmd::SessionStart {
-            messages, config, ..
-        }
-        | ChatCmd::SessionContinue {
-            messages, config, ..
-        }
-        | ChatCmd::SessionContinueTool {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionStart {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionContinue {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionContinueTool {
-            messages, config, ..
-        } => Some((messages, config)),
-        ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => None,
+impl DualLaneChatBarrier for Gemma4Inner {
+    const LAYOUT_CONFLICT_ERROR: Option<&'static str> = Some(
+        "Gemma4 cannot switch a live cache owner between autoregressive/media and assistant-draft cache layouts; start a new session",
+    );
+
+    fn prepare_reset_barrier(&mut self) {
+        self.scheduled_dspark_states.clear();
+        self.set_active_paged_owner(0);
     }
-}
 
-fn gemma4_owner_id(command: &ChatCmd) -> Option<&str> {
-    gemma4_chat_parts(command)
-        .and_then(|(_, config)| config.cache_owner_id.as_deref())
-        .filter(|owner| !owner.is_empty())
-}
+    fn command_uses_flat_lane(&self, command: &ChatCmd) -> bool {
+        // Only the ASSISTANT drafter needs the flat target-cache lane (its
+        // Q-only attention reads `Gemma4LayerCache` K/V arrays directly).
+        // DSpark verifies against the paged pools, so a DSpark command stays
+        // on the paged lane — installing flat caches there would hide the
+        // pools from the planner and silently downgrade the turn to AR.
+        chat_cmd_config(command).is_some_and(|config| {
+            (config.enable_mtp == Some(true) && self.assistant_draft().is_some())
+                || self.kv_cache_coordinator.is_none()
+        })
+    }
 
-fn gemma4_is_session_start(command: &ChatCmd) -> bool {
-    matches!(
-        command,
-        ChatCmd::SessionStart { .. } | ChatCmd::StreamSessionStart { .. }
-    )
-}
+    fn prepare_ownerless_barrier(&mut self, flat_lane: bool) {
+        self.select_ownerless_lane(flat_lane);
+    }
 
-fn gemma4_send_error(command: ChatCmd, error: Error) {
-    match command {
-        ChatCmd::SessionStart {
-            reply, cancelled, ..
+    fn owner_has_flat_state(state: &Self::OwnerState) -> bool {
+        state.flat_caches.is_some()
+    }
+
+    fn install_flat_owner_state(&mut self, state: Self::OwnerState) {
+        self.install_flat_owner_caches(state.flat_caches);
+        self.install_owner_metadata(state.metadata);
+    }
+
+    fn capture_flat_owner_state(&mut self) -> Self::OwnerState {
+        Gemma4SchedulerOwnerState {
+            metadata: self.owner_metadata(),
+            flat_caches: self.take_flat_owner_caches(),
         }
-        | ChatCmd::SessionContinue {
-            reply, cancelled, ..
-        }
-        | ChatCmd::SessionContinueTool {
-            reply, cancelled, ..
-        } => ScheduledReply::Sync(reply).send_error(error, cancelled.as_ref()),
-        ChatCmd::StreamSessionStart {
-            stream_tx,
-            cancelled,
-            ..
-        }
-        | ChatCmd::StreamSessionContinue {
-            stream_tx,
-            cancelled,
-            ..
-        }
-        | ChatCmd::StreamSessionContinueTool {
-            stream_tx,
-            cancelled,
-            ..
-        } => ScheduledReply::Stream(stream_tx).send_error(error, cancelled.as_ref()),
-        ChatCmd::ResetCaches { reply } => {
-            let _ = reply.send(Err(error));
-        }
-        ChatCmd::ReleaseCacheOwner { reply, .. } => {
-            let _ = reply.send(Err(error));
+    }
+
+    fn install_paged_owner_state(&mut self, seq_id: SeqId, state: Self::OwnerState) {
+        self.set_active_paged_owner(seq_id);
+        self.install_owner_metadata(state.metadata);
+    }
+
+    fn capture_paged_owner_state(&mut self) -> Self::OwnerState {
+        Gemma4SchedulerOwnerState {
+            metadata: self.owner_metadata(),
+            flat_caches: None,
         }
     }
 }
@@ -388,99 +371,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
         command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        if matches!(&command, ChatCmd::ResetCaches { .. }) {
-            self.scheduled_dspark_states.clear();
-            self.set_active_paged_owner(0);
-            handle_chat_cmd(self, command);
-            return;
-        }
-        // Only the ASSISTANT drafter needs the flat target-cache lane (its
-        // Q-only attention reads `Gemma4LayerCache` K/V arrays directly).
-        // DSpark verifies against the paged pools, so a DSpark command stays
-        // on the paged lane — installing flat caches there would hide the
-        // pools from the planner and silently downgrade the turn to AR.
-        let flat_lane = gemma4_chat_parts(&command).is_some_and(|(_, config)| {
-            (config.enable_mtp == Some(true) && self.assistant_draft().is_some())
-                || self.kv_cache_coordinator.is_none()
-        });
-        let Some(owner_id) = gemma4_owner_id(&command).map(str::to_owned) else {
-            self.select_ownerless_lane(flat_lane);
-            handle_chat_cmd(self, command);
-            return;
-        };
-        if gemma4_is_session_start(&command) {
-            let seq_id = owners.owner_sequences.get(&owner_id).copied();
-            if let Err(error) =
-                self.release_owner_resources(seq_id, owners.owner_states.get(&owner_id))
-            {
-                gemma4_send_error(command, error);
-                return;
-            }
-            owners.owner_sequences.remove(&owner_id);
-            owners.owner_states.remove(&owner_id);
-        } else {
-            let state = owners.owner_states.get(&owner_id);
-            let matching_lane = if flat_lane {
-                state.is_some_and(|state| state.flat_caches.is_some())
-            } else {
-                owners.owner_sequences.contains_key(&owner_id)
-            };
-            if !matching_lane {
-                let conflicting = if flat_lane {
-                    owners.owner_sequences.contains_key(&owner_id)
-                } else {
-                    state.is_some_and(|state| state.flat_caches.is_some())
-                };
-                let message = if conflicting {
-                    "Gemma4 cannot switch a live cache owner between autoregressive/media and assistant-draft cache layouts; start a new session"
-                } else {
-                    "chat session continuation requires an initialized cache owner (call chatSessionStart first)"
-                };
-                gemma4_send_error(command, Error::from_reason(message));
-                return;
-            }
-        }
-        let state = owners.owner_states.remove(&owner_id).unwrap_or_default();
-        if flat_lane {
-            self.install_flat_owner_caches(state.flat_caches);
-            self.install_owner_metadata(state.metadata);
-            handle_chat_cmd(self, command);
-            let live = ChatBackend::has_live_session(self);
-            let state = Gemma4SchedulerOwnerState {
-                metadata: self.owner_metadata(),
-                flat_caches: self.take_flat_owner_caches(),
-            };
-            if live {
-                owners.owner_states.insert(owner_id, state);
-            } else {
-                owners.owner_sequences.remove(&owner_id);
-            }
-        } else {
-            let seq_id = owners
-                .owner_sequences
-                .get(&owner_id)
-                .copied()
-                .unwrap_or_else(|| {
-                    let seq_id = *owners.next_seq_id;
-                    *owners.next_seq_id = owners.next_seq_id.saturating_add(1);
-                    owners.owner_sequences.insert(owner_id.clone(), seq_id);
-                    seq_id
-                });
-            self.set_active_paged_owner(seq_id);
-            self.install_owner_metadata(state.metadata);
-            handle_chat_cmd(self, command);
-            if ChatBackend::has_live_session(self) {
-                owners.owner_states.insert(
-                    owner_id,
-                    Gemma4SchedulerOwnerState {
-                        metadata: self.owner_metadata(),
-                        flat_caches: None,
-                    },
-                );
-            } else {
-                owners.owner_sequences.remove(&owner_id);
-            }
-        }
+        execute_dual_lane_chat_barrier(self, command, owners);
     }
 }
 

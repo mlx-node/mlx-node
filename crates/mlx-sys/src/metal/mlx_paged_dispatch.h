@@ -393,8 +393,8 @@ void dispatch_inkling2_paged_attention_auto(
 /// Whether the device can run the G=3, D=128 Inkling2 MPP prefill pipelines.
 bool inkling2_paged_prefill_mpp_supported(mlx::core::metal::Device& device);
 
-/// Every Inkling2 kernel name in `paged_attn.metallib` (decode, prefill, fused ops).
-std::vector<std::string> inkling2_kernel_names();
+/// Every Inkling2 paged-attention kernel name in `paged_attn.metallib` (decode & prefill).
+std::vector<std::string> inkling2_paged_kernel_names();
 
 /// Dispatches Inkling2 G=3, D=128 in-place MPP paged prefill (split + reduce),
 /// writing BF16 `out [rows, num_q_heads, 128]` (optionally gate+sink fused) and

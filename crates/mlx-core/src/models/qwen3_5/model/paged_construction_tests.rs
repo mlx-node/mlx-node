@@ -440,12 +440,12 @@ fn a_guard_drop_detaches_the_planes_and_the_identity_part() {
     let load = |refuse: bool| -> (Qwen35Inner, u64, Vec<String>) {
         let _live = LiveMemory::set(16 * GIB, 0);
         let mut inner = Qwen35Inner::new(tiny_paged_forward_cfg()).expect("construct tiny model");
-        inner.layers[0].mlp = MLPVariant::Quantized {
+        inner.layers[0].mlp = decoder_layer::MLPType::Dense(MLPVariant::Quantized {
             gate_proj: projection(Q8_0, 256, 128, 0x91).expect("gate"),
             up_proj: projection(Q8_0, 256, 128, 0x92).expect("up"),
             down_proj: projection(Q4K, 128, 256, 0x93).expect("down"),
             gate_up: None,
-        };
+        });
         let tensor = PlanesTensor {
             key: "blk.0.ffn_down.planes".to_string(),
             layer: 0,
@@ -976,21 +976,14 @@ pub(super) fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
             }
         }
 
-        let w = layer.mlp.get_gate_proj_weight();
-        layer
-            .mlp
-            .set_gate_proj_weight(&cast(&w))
-            .expect("set gate_proj");
-        let w = layer.mlp.get_up_proj_weight();
-        layer
-            .mlp
-            .set_up_proj_weight(&cast(&w))
-            .expect("set up_proj");
-        let w = layer.mlp.get_down_proj_weight();
-        layer
-            .mlp
-            .set_down_proj_weight(&cast(&w))
-            .expect("set down_proj");
+        if let Some(mlp) = layer.mlp.as_dense_mut() {
+            let w = mlp.get_gate_proj_weight();
+            mlp.set_gate_proj_weight(&cast(&w)).expect("set gate_proj");
+            let w = mlp.get_up_proj_weight();
+            mlp.set_up_proj_weight(&cast(&w)).expect("set up_proj");
+            let w = mlp.get_down_proj_weight();
+            mlp.set_down_proj_weight(&cast(&w)).expect("set down_proj");
+        }
     }
 }
 
@@ -2966,8 +2959,7 @@ fn mtp_gate_at_the_cap_reclaims_before_falling_back() {
     });
     p.mtp_depth = 1;
     assert!(
-        inner
-            .reserve_paged_mtp_lookahead(&p, "cap_gate_test")
+        <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &p)
             .expect("the gate never errors on exhaustion")
     );
     assert!(inner.ladder_entries_for_test().is_empty());
@@ -3100,8 +3092,7 @@ fn paged_mtp_lookahead_exhaustion_falls_back_to_ar() {
             adapter.current_token_count(),
         )
     };
-    let admitted = inner
-        .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+    let admitted = <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &p)
         .expect("capacity exhaustion must not error the turn");
     assert!(
         !admitted,
@@ -3116,8 +3107,7 @@ fn paged_mtp_lookahead_exhaustion_falls_back_to_ar() {
     // A cycle-sized reservation still fits and admits MTP.
     p.mtp_depth = 3;
     assert!(
-        inner
-            .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+        <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &p)
             .expect("in-capacity reservation"),
         "a reservation the pool can hold must admit the MTP arm"
     );

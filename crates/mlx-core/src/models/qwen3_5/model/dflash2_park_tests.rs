@@ -1074,9 +1074,8 @@ impl crate::engine::backend::ChunkSink for NullSink {
 /// until the take order drops a ladder rung the prompt does not share; the
 /// prompt grow before it counts the live table as the prompt's and takes
 /// nothing, so the prepare's own reclaim is the only one on the path.
-/// Mutations: drop the `claimed` wrapper on the prepare in
-/// `paged_turn_sync_core` → red on `sync` (`Err`); in
-/// `paged_turn_stream_core` → red on `stream` (`Err`).
+/// Mutation: drop the `claimed` wrapper on the prepare in
+/// `prime_dense_prefix` → red on both (`Err`).
 #[test]
 fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
     if !own_process("serial_prepare_at_the_cap_frees_a_ladder_chain") {
@@ -1106,37 +1105,38 @@ fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
     };
     for entry in ["sync", "stream"] {
         let mut inner = cap_with_a_shared_live_table_of(0xDFA5_1816, rows + 4)?;
+        inner.dflash2 = None;
         let block_size = pool_block_size(&inner);
         let mut prompt = chain_tokens(23, 1, block_size);
         prompt.extend([2, 3, 4, 5]);
         let config = ar_config();
         let params = ChatBackend::resolve_params(&inner, &config);
         let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let sink = NullSink;
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Autoregressive,
+            },
+            sink: (entry == "stream").then_some(&sink as &dyn crate::engine::backend::ChunkSink),
+            cancelled: (entry == "stream").then_some(&cancelled),
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
         clear_grow_reclaim_log();
-        if entry == "sync" {
-            inner.paged_turn_sync_core(
-                prompt,
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                thinking,
-                &config,
-            )?;
-        } else {
-            let sink = NullSink;
-            inner.paged_turn_stream_core(
-                prompt,
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                &super::paged_backend::StreamSender(&sink),
-                &std::sync::atomic::AtomicBool::new(false),
-                thinking,
-                &config,
-            )?;
-        }
+        inner.paged_whole_turn(&mut args)?;
         assert_eq!(
             grow_reclaim_log().first(),
             Some(&GrowReclaim::Ladder),
@@ -1523,37 +1523,42 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
     };
     for entry in ["sync", "stream"] {
         let mut inner = fixture(0xDFA5_1831);
+        inner.dflash2 = None;
         install_pool(&mut inner, 16, 16, passing_probe())?;
         let params = ChatBackend::resolve_params(&inner, &config);
-        let (reasoning_tokens, raw_text) = if entry == "sync" {
-            let result = inner.paged_turn_sync_core(
-                first_prompt(3),
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                thinking,
-                &config,
-            )?;
-            (result.reasoning_tokens, result.raw_text)
-        } else {
-            let sink = LastChunk(std::sync::Mutex::new(None));
-            inner.paged_turn_stream_core(
-                first_prompt(3),
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                &super::paged_backend::StreamSender(&sink),
-                &std::sync::atomic::AtomicBool::new(false),
-                thinking,
-                &config,
-            )?;
-            let last = sink.0.lock().unwrap().take().expect("final chunk");
-            (
-                last.reasoning_tokens.unwrap_or_default(),
-                last.raw_text.unwrap_or_default(),
-            )
+        let prompt = first_prompt(3);
+        let sink = LastChunk(std::sync::Mutex::new(None));
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Autoregressive,
+            },
+            sink: (entry == "stream").then_some(&sink as &dyn crate::engine::backend::ChunkSink),
+            cancelled: (entry == "stream").then_some(&cancelled),
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let (reasoning_tokens, raw_text) = match inner.paged_whole_turn(&mut args)? {
+            TurnOutput::Complete(result) => (result.reasoning_tokens, result.raw_text),
+            TurnOutput::Streamed => {
+                let last = sink.0.lock().unwrap().take().expect("final chunk");
+                (
+                    last.reasoning_tokens.unwrap_or_default(),
+                    last.raw_text.unwrap_or_default(),
+                )
+            }
         };
         assert_eq!(reasoning_tokens, 2, "{entry}: {raw_text:?}");
         assert!(raw_text.contains("t13 </think>"), "{entry}: {raw_text:?}");

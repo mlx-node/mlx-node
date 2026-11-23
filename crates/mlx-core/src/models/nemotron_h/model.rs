@@ -2026,7 +2026,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         ids: &[u32],
         embedding: &Embedding,
         depth: usize,
-    ) -> Result<crate::models::qwen3_5::mtp_decode::MtpVerifyOutput> {
+    ) -> Result<crate::engine::mtp_decode::MtpVerifyOutput> {
         // Fail closed on the depth-1 invariant. `run_mtp_whole_turn` pins
         // `mtp_adaptive_depth = false` and seeds `p.mtp_depth.min(1)`, and
         // `run_mtp_cycle` only ever SHORTENS a cycle's depth, so exactly 1 arrives here;
@@ -2062,7 +2062,9 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         let hiddens = MxArray::concatenate_many(hidden_rows.iter().collect::<Vec<_>>(), Some(1))?;
         // The engine slices verify_hiddens[:, K, :], so hiddens must stay
         // [1, depth+1, hidden] (each row is the raw 3D per-token hidden).
-        Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
+        Ok(crate::engine::mtp_decode::MtpVerifyOutput::logits_only(
+            logits, hiddens,
+        ))
     }
 
     fn snapshot_main_linear(&mut self) {
@@ -2122,14 +2124,14 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
     /// and a rejected draft's K/V must be overwritten.
     fn commit_mtp(
         &mut self,
-        anchor: crate::models::qwen3_5::mtp_decode::MtpCommitAnchor,
+        anchor: crate::engine::mtp_decode::MtpCommitAnchor,
         seed_h: &MxArray,
         verify_hiddens: &MxArray,
         committed_ids: &[u32],
         _k_accepted: usize,
         embedding: &Embedding,
     ) -> Result<()> {
-        use crate::models::qwen3_5::mtp_decode::MtpCommitAnchor;
+        use crate::engine::mtp_decode::MtpCommitAnchor;
         let m = committed_ids.len();
         if m == 0 {
             return Ok(());
@@ -2503,26 +2505,22 @@ impl NemotronHInner {
         self.mtp_seed_failed_fallback(args, &err)
     }
 
-    /// Whole-turn speculative MTP core (fresh and delta turns). Prefills the FULL
-    /// token stream (re-prefilling the cached history on warm deltas) while seeding the
-    /// MTP head's own KV over the same stream, then drives run_mtp_turn at depth 1.
-    /// Returns `TurnOutput` so the fail-closed seed fallback can hand back the AR
-    /// lane's own output unchanged.
+    /// Whole-turn speculative MTP core (fresh and delta turns). Delegates to
+    /// the shared [`crate::engine::mtp_turn::run_flat_mtp_turn`] driver via
+    /// [`crate::engine::mtp_turn::FlatMtpBackend`].
     fn run_mtp_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if args.tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-        // The shared parameter resolver leaves `extra_eos_ids` empty for the executor to
-        // populate; union in the checkpoint's full EOS set so MTP turns stop on the
-        // alternate terminators, matching the paged executor.
-        let mut p = args.params.clone();
-        p.extra_eos_ids = self.extra_eos_ids();
+        crate::engine::mtp_turn::run_flat_mtp_turn(self, args)
+    }
+}
+
+impl crate::engine::mtp_turn::FlatMtpBackend for NemotronHInner {
+    fn prepare_flat_mtp_params(&self, params: &mut crate::engine::params::ChatParams) -> usize {
         // GUARD for the depth-1 invariant this family's flat MTP core rests on. The
-        // `p.mtp_depth.min(1)` at the call site below only SEEDS the turn: `run_mtp_cycle`
-        // re-picks the depth from `AdaptiveDepthPolicy::pick_depth()` whenever
-        // `mtp_adaptive_depth` is set, and that policy sweeps 1..=5 regardless of the
-        // seed. The two pins are ONE guard.
-        if p.mtp_adaptive_depth {
+        // `params.mtp_depth.min(1)` returned below only SEEDS the turn:
+        // `run_mtp_cycle` re-picks the depth from `AdaptiveDepthPolicy::pick_depth()`
+        // whenever `mtp_adaptive_depth` is set, and that policy sweeps 1..=5
+        // regardless of the seed. The two pins are ONE guard.
+        if params.mtp_adaptive_depth {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 tracing::warn!(
@@ -2532,36 +2530,21 @@ impl NemotronHInner {
                      disabled and every cycle runs at depth 1."
                 );
             });
-            p.mtp_adaptive_depth = false;
+            params.mtp_adaptive_depth = false;
         }
-        let p = &p;
-        let eos_id = args.eos_id;
-        let thinking = args.thinking;
-        let tokenizer = args.tokenizer.clone();
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let max_new_tokens = p.max_new_tokens;
-        let report_perf = p.report_performance;
-        let tokens = args.tokens.to_vec();
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        // Penalty history must start from the FULL rendered prompt:
-        // `cached_token_history` is empty on fresh turns, so the repetition, presence,
-        // frequency and ngram controls would otherwise ignore the prompt.
-        let mut token_history = tokens.clone();
-        // "length" like the other decode paths; run_mtp_turn overrides it on EOS.
-        let mut finish_reason = String::from("length");
-        let mut first_token_instant: Option<std::time::Instant> = None;
+        params.mtp_depth.min(1)
+    }
 
-        let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
+    fn prefill_flat_mtp(
+        &mut self,
+        args: &mut WholeTurnArgs<'_>,
+        params: &crate::engine::params::ChatParams,
+        history: &[u32],
+        stream: Stream,
+        profiler: &mut crate::decode_profiler::DecodeProfiler,
+        wired: &mut Option<crate::stream::WiredLimitContext>,
+    ) -> Result<crate::engine::mtp_turn::FlatMtpPrefill> {
+        let tokens = args.tokens;
         // The flat MTP head reads the backbone KV, so the caches must hold the FULL
         // token stream: reset + prefill. On a paged model the flat core takes over
         // `self.caches` wholesale, so park any adapter-owned scheduled sequence FIRST or
@@ -2572,117 +2555,84 @@ impl NemotronHInner {
         self.reset_caches_internal()?;
         self.flat_mtp_caches_desynced = false;
 
-        let mut profiler =
-            crate::decode_profiler::DecodeProfiler::new("nemotron_chat", "nemotron_h");
         profiler.set_prompt_tokens(tokens.len() as u32);
-        profiler.snapshot_memory_before();
-
         profiler.begin_prefill();
-        let turn_cancel = self.turn_cancel.clone();
-        let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
+        let prompt = MxArray::from_uint32(tokens, &[1, tokens.len() as i64])?;
         // The drafter's own KV history is seeded from the SAME chunked pass that fills
         // the backbone caches (no second prompt forward).
         let mut mtp_caches = super::mtp::NemotronHMtpModule::fresh_caches(&self.config);
         let mut committed_len = 0i32;
         let (prefill_logits, h_last) = match self.chunked_prefill_seeding_mtp(
             &prompt,
-            generation_stream,
+            stream,
             &mut mtp_caches,
             &mut committed_len,
         ) {
             Ok(v) => v,
             Err(e) => {
-                drop(wired_ctx);
-                return self.mtp_seed_aborted(args, e);
+                wired.take();
+                return self
+                    .mtp_seed_aborted(args, e)
+                    .map(crate::engine::mtp_turn::FlatMtpPrefill::Fallback);
             }
         };
         let mut last_logits = fwd::slice_last_logits_keep_batch(&prefill_logits)?;
         profiler.end_prefill();
 
-        last_logits = crate::engine::apply_all_penalties(last_logits, &token_history, p)?;
-        let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
+        last_logits = crate::engine::apply_all_penalties(last_logits, history, params)?;
+        let y = crate::sampling::sample(&last_logits, params.sampling_config)?;
         y.eval();
         let y_id = y.item_at_int32(0)? as u32;
         // Final prompt slot: (h_{T-1}, emb(y)). committed_len reaches T here.
         if let Err(e) = self.seed_mtp_final_slot(&h_last, y_id, &mut mtp_caches, &mut committed_len)
         {
-            drop(wired_ctx);
-            return self.mtp_seed_aborted(args, e);
+            wired.take();
+            return self
+                .mtp_seed_aborted(args, e)
+                .map(crate::engine::mtp_turn::FlatMtpPrefill::Fallback);
         }
         debug_assert_eq!(committed_len as usize, tokens.len());
         self.pending_mtp_draft_seed = Some((mtp_caches, committed_len));
+        Ok(crate::engine::mtp_turn::FlatMtpPrefill::Ready {
+            y,
+            cached_prefix_len: 0,
+            prefill_len: tokens.len(),
+            first_token_instant: None,
+        })
+    }
 
-        let mut reasoning_tracker = crate::engine::ReasoningTracker::from_setup(
-            &thinking,
-            &tokenizer.think_end(args.config),
-        );
-        let mut rng = rand::rng();
-        let outcome = crate::engine::mtp_turn::run_mtp_turn(
-            self,
-            &mut rng,
-            crate::engine::mtp_turn::MtpTurnArgs {
-                y: y.clone(),
-                // Depth is clamped to 1 by POLICY, not by architecture. This
-                // clamp only SEEDS the turn; it is a real ceiling only because
-                // `p.mtp_adaptive_depth` was pinned false at the top of this
-                // function — the two are ONE guard and must move together.
-                depth: p.mtp_depth.min(1),
-                params: p,
-                reasoning_tracker: &mut reasoning_tracker,
-                profiler: &mut profiler,
-                max_new_tokens,
-                eos_id,
-                generated_tokens: &mut generated_tokens,
-                token_history: &mut token_history,
-                finish_reason: &mut finish_reason,
-                first_token_instant: &mut first_token_instant,
-                report_perf,
-                generation_stream,
-                prompt_hidden: None,
-                prompt_hidden_ids: None,
-                cancel_flag: turn_cancel.as_deref(),
-            },
-            None,
-        )?;
-        let last_in_cache = outcome.last_in_cache;
+    fn fail_closed_flat_mtp(&mut self, error: Error) -> Error {
+        // Never call `reset_caches(ResetScope::Command)` here: that would purge
+        // the shared paged prefix cache owned by concurrent AR turns.
+        error
+    }
+
+    fn flat_mtp_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.turn_cancel.clone()
+    }
+
+    fn save_flat_mtp_state(
+        &mut self,
+        args: &WholeTurnArgs<'_>,
+        params: &crate::engine::params::ChatParams,
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        outcome: &crate::engine::mtp_turn::MtpTurnOutcome,
+    ) {
         self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
         if outcome.desynced {
             self.flat_mtp_caches_desynced = true;
         }
-
         self.save_cache_state_internal(
-            p.reuse_cache,
-            &tokens,
-            &generated_tokens,
-            mtp_history_drop_last(last_in_cache, &finish_reason, outcome.rollback_unemitted),
+            params.reuse_cache,
+            args.tokens,
+            generated_tokens,
+            mtp_history_drop_last(
+                outcome.last_in_cache,
+                finish_reason,
+                outcome.rollback_unemitted,
+            ),
         );
-
-        let performance = crate::engine::finalize::compute_performance_metrics(
-            generation_start,
-            first_token_instant,
-            tokens.len(),
-            generated_tokens.len(),
-        )
-        .map(|mut m| {
-            profiler.fill_mtp_acceptance(&mut m);
-            m
-        });
-
-        let mut result = crate::engine::finalize::finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            p.include_reasoning,
-            thinking.enabled,
-            tokens.len() as u32,
-            reasoning_tracker.outcome(),
-        )?;
-        // The flat MTP path re-prefills the full prompt every turn.
-        result.cached_tokens = 0;
-        Ok(TurnOutput::Complete(Box::new(result)))
     }
 }
 

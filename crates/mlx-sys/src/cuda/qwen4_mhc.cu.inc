@@ -17,38 +17,27 @@ __device__ __forceinline__ float q4mhc_warp_sum(float v) {
 }
 
 __device__ __forceinline__ uint4 q4mhc_ld_cs_u4(const uint4* ptr) {
-  uint4 v;
-  asm("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-      : "l"(ptr));
-  return v;
+  return ptx_ld_cs_u4(ptr);
 }
 
 __device__ __forceinline__ void q4mhc_cp16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;\n"
-      :: "r"(addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 __device__ __forceinline__ void q4mhc_cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 template <int N>
 __device__ __forceinline__ void q4mhc_cp_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+  ptx_cp_wait<N>();
 }
 
 __device__ __forceinline__ void q4mhc_mma_m16n8k16_bf16(
     float& d0, float& d1, float& d2, float& d3,
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k16_bf16_v(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
 }
 
 template <int PAIR>

@@ -12,6 +12,8 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 
 #include "mlx/fast_primitives.h"
 #include "mlx/utils.h" // StreamOrDevice
@@ -26,6 +28,17 @@ enum class KvDtype : uint8_t {
   Bf16 = 1,
   Int8 = 3,
 };
+
+/// Every C ABI entry takes the dtype as a raw byte; one outside the enum
+/// would misroute the kernel template selection.
+inline void require_known_kv_dtype(uint8_t kv_dtype_raw) {
+  if (kv_dtype_raw == 2 || kv_dtype_raw > static_cast<uint8_t>(KvDtype::Int8)) {
+    std::ostringstream msg;
+    msg << "invalid kv_dtype_raw " << static_cast<int>(kv_dtype_raw)
+        << "; expected 0 (Fp16), 1 (Bf16) or 3 (Int8)";
+    throw std::invalid_argument(msg.str());
+  }
+}
 
 /// `PagedKVWrite` writes a chunk of new K/V tokens into the per-layer
 /// block-paged K/V pool at positions specified by `slot_mapping`.
@@ -861,6 +874,61 @@ std::vector<array> inkling2_paged_prefill_attention(
 // The returned `mlx_array` owns a lazy `PagedAttentionVarlen` graph node and
 // must be released through the normal MLX array lifetime API.
 struct mlx_array;
+
+extern "C" mlx_array* mlx_paged_attention_forward_with_plan(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* block_table,
+    mlx_array* seq_lens,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype,
+    uint8_t route_hint,
+    uint32_t grouped_stripes,
+    mlx_array* score_scales);
+
+extern "C" mlx_array* mlx_paged_attention_forward(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* block_table,
+    mlx_array* seq_lens,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype);
+
+extern "C" bool mlx_paged_kv_write_forward(
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* new_k,
+    mlx_array* new_v,
+    mlx_array* slot_mapping,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    int block_size,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype,
+    bool values_token_major,
+    mlx_array** out_k_pool,
+    mlx_array** out_v_pool,
+    mlx_array** out_k_scale,
+    mlx_array** out_v_scale);
 
 extern "C" mlx_array* mlx_paged_attention_varlen_forward(
     mlx_array* q,

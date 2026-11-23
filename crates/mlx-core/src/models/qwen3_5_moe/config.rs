@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+pub(crate) use crate::models::qwen3_5::config::Qwen35MoeParams;
+
 /// Qwen3.5 MoE model configuration.
 ///
 /// Contains all fields including MoE-specific ones (num_experts, etc.).
@@ -184,6 +186,27 @@ impl Qwen3_5MoeConfig {
         elements
             .saturating_mul(2)
             .saturating_add(dim(self.num_experts).saturating_mul(6))
+    }
+
+    /// Extract the 7 MoE-specific fields into a [`Qwen35MoeParams`] handle.
+    #[allow(dead_code)]
+    pub(crate) fn moe_params(&self) -> Qwen35MoeParams {
+        Qwen35MoeParams {
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            decoder_sparse_step: self.decoder_sparse_step,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            mlp_only_layers: self.mlp_only_layers.clone(),
+        }
+    }
+
+    /// Split this MoE config into its dense base [`Qwen3_5Config`] plus
+    /// [`Qwen35MoeParams`].
+    #[allow(dead_code)]
+    pub(crate) fn split(&self) -> (crate::models::qwen3_5::Qwen3_5Config, Qwen35MoeParams) {
+        (self.to_dense_config(), self.moe_params())
     }
 
     /// Convert to a dense Qwen3_5Config for shared types (attention, GatedDeltaNet)

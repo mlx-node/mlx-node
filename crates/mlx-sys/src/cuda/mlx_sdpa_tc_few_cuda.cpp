@@ -17,10 +17,12 @@ namespace mlx::core::sdpa_few {
 namespace {
 
 constexpr char sdpa_tc_few_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/sdpa_tc_few.cu.inc"
     ;
 
 constexpr char sdpa_prefill_d256_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/sdpa_prefill_d256.cu.inc"
     ;
 

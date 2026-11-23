@@ -1459,65 +1459,14 @@ impl HybridSchedulerBackend for Inner {
         command: crate::engine::cmd::ChatCmd,
         owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Vec<u32>>,
     ) {
-        use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
-        let owner = match &command {
-            ChatCmd::SessionStart { config, .. }
-            | ChatCmd::SessionContinue { config, .. }
-            | ChatCmd::SessionContinueTool { config, .. }
-            | ChatCmd::StreamSessionStart { config, .. }
-            | ChatCmd::StreamSessionContinue { config, .. }
-            | ChatCmd::StreamSessionContinueTool { config, .. } => {
-                Some(config.cache_owner_id.clone().unwrap_or_default())
-            }
-            _ => None,
-        };
-        let Some(owner) = owner else {
-            handle_chat_cmd(self, command);
-            return;
-        };
-        let seq = *owners
-            .owner_sequences
-            .entry(owner.clone())
-            .or_insert_with(|| {
-                let seq = *owners.next_seq_id;
-                *owners.next_seq_id += 1;
-                seq
-            });
-        if let Err(error) = self.activate_exclusive_seq(seq) {
-            match command {
-                ChatCmd::SessionStart { reply, .. }
-                | ChatCmd::SessionContinue { reply, .. }
-                | ChatCmd::SessionContinueTool { reply, .. } => {
-                    let _ = reply.send(Err(error));
-                }
-                ChatCmd::StreamSessionStart { stream_tx, .. }
-                | ChatCmd::StreamSessionContinue { stream_tx, .. }
-                | ChatCmd::StreamSessionContinueTool { stream_tx, .. } => {
-                    crate::engine::backend::ChunkSink::send(&stream_tx, Err(error));
-                }
-                _ => unreachable!(),
-            }
-            owners.owner_sequences.remove(&owner);
-            owners.owner_states.remove(&owner);
-            return;
-        }
-        handle_chat_cmd(self, command);
-        if self.saved_history.is_empty() {
-            // Admission/media failures can return before run_paged_turn's abort
-            // hook. Empty rows have no reusable frontier and must not occupy an
-            // owner slot (including successful requests with reuse disabled).
-            if let Some(adapter) = &mut self.decoder.paged {
-                let _ = adapter.release_request_for(seq);
-            }
-            self.release_scheduled_recurrent_for(seq);
-            owners.owner_sequences.remove(&owner);
-            owners.owner_states.remove(&owner);
-        } else {
-            owners
-                .owner_states
-                .insert(owner, self.saved_history.clone());
-            self.park_row();
-        }
+        crate::engine::hybrid_scheduler::execute_exclusive_owner_barrier(
+            self,
+            command,
+            owners,
+            Self::activate_exclusive_seq,
+            |inner| inner.saved_history.clone(),
+            Self::park_row,
+        );
     }
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         HybridStepExecutor::new(self)

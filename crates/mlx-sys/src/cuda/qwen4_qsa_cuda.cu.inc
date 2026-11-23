@@ -394,9 +394,7 @@ R"cuda(
 // Grid: dim3(num_splits, Q_len, B * Hkv), Block: dim3(32, 4, 1)
 // ----------------------------------------------------------------------------
 __device__ __forceinline__ float qsa_exp2f(float x) {
-  float r;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
-  return r;
+  return ptx_ex2_approx_ftz(x);
 }
 
 __device__ __forceinline__ void qsa_mma_m16n8k16_bf16(
@@ -404,41 +402,24 @@ __device__ __forceinline__ void qsa_mma_m16n8k16_bf16(
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1,
     float c0, float c1, float c2, float c3) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-        "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+  ptx_mma_m16n8k16_bf16_c_v(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
 }
 
 __device__ __forceinline__ void qsa_ldmatrix4(
     unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3,
     const void* smem_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-      : "r"(addr));
+  ptx_ldmatrix_x4(r0, r1, r2, r3, smem_ptr);
 }
 
 __device__ __forceinline__ void qsa_ldmatrix4_trans(
     unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3,
     const void* smem_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-      : "r"(addr));
+  ptx_ldmatrix_x4_trans(r0, r1, r2, r3, smem_ptr);
 }
 
 __device__ __forceinline__ void qsa_cp16_zfill(
     void* smem_ptr, const void* glob_ptr, bool pred) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  int sz = pred ? 16 : 0;
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-      :: "r"(addr), "l"(glob_ptr), "r"(sz) : "memory");
+  ptx_cp_async16_cg_zfill(smem_ptr, glob_ptr, pred);
 }
 
 __device__ __forceinline__ int qsa_swiz256(int row, int c8) {
@@ -462,7 +443,7 @@ __device__ __forceinline__ void qsa_load_sparse_kv256(
     const nv_bfloat16* gp = ok ? (base + (long long)kpos * stride + c8 * 8) : base;
     qsa_cp16_zfill(&dst[qsa_swiz256(r, c8)], gp, ok);
   }
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 template <bool SPLIT_K, int MASK_MODE>
@@ -593,7 +574,7 @@ R"cuda(
   for (int tile = tile_start; tile < tile_end; ++tile) {
     const int cur = tile & 1;
     const int nxt = cur ^ 1;
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncthreads();
 
     // Launch sV fetch overlapped with QK^T, and prepare next tile's s_kpos
@@ -636,7 +617,7 @@ R"cuda(
     }
 
     // Wait for sV cp.async AND publish sS[0..3] + s_kpos[nxt]
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncthreads();
 
     // Launch next tile's sK fetch overlapped with softmax + PV
@@ -852,10 +833,7 @@ __device__ __forceinline__ int qsa_swiz128(int row, int c8) {
 }
 
 __device__ __forceinline__ void qsa_cp16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;\n"
-      :: "r"(addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 // ----------------------------------------------------------------------------
@@ -907,7 +885,7 @@ __global__ __launch_bounds__(256, 2) void qwen4_qsa_index_score_tc_cuda(
     const nv_bfloat16* gp = ok ? (iq + (size_t)(q0 + ql) * ID + c8 * 8) : iq;
     qsa_cp16_zfill(&sQ[0][qsa_swiz128(r, c8)], gp, ok);
   }
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 
   float acc_sum[4][4];
 #pragma unroll
@@ -928,7 +906,7 @@ __global__ __launch_bounds__(256, 2) void qwen4_qsa_index_score_tc_cuda(
   for (int h = 0; h < 4; ++h) {
     const int cur = h & 1;
     const int nxt = cur ^ 1;
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncthreads();
 
     if (h + 1 < 4) {
@@ -941,7 +919,7 @@ __global__ __launch_bounds__(256, 2) void qwen4_qsa_index_score_tc_cuda(
         const nv_bfloat16* gp = ok ? (iq_next + (size_t)(q0 + ql) * ID + c8 * 8) : iq_next;
         qsa_cp16_zfill(&sQ[nxt][qsa_swiz128(r, c8)], gp, ok);
       }
-      asm volatile("cp.async.commit_group;\n" ::: "memory");
+      ptx_cp_commit();
     }
 
     float acc_h[4][4];
@@ -1576,8 +1554,8 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_qtiled5_cuda(
     qsa_cp16_zfill(&sQ_hi[qsa_swiz128(r, c8)], row_ptr + (c8 + 16) * 8, ok);
   }
   if (tid == 0) { s_cm[0][BQ] = 0u; s_cm[1][BQ] = 0u; }
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
-  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+  ptx_cp_commit();
+  ptx_cp_wait<0>();
   __syncthreads();
 
   unsigned int q_lo[8][4];
@@ -1605,7 +1583,7 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_qtiled5_cuda(
       const nv_bfloat16* gp = base + (long long)(blk * 4 + r_in_blk) * stride + c8 * 8;
       qsa_cp16(&dst[qsa_swiz256(s * 4 + r_in_blk, c8)], gp);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    ptx_cp_commit();
   };
 
   auto load_kv_checked = [&](nv_bfloat16* dst, const nv_bfloat16* base, long long stride, int buf) {
@@ -1618,7 +1596,7 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_qtiled5_cuda(
       const nv_bfloat16* gp = ok ? (base + (long long)(blk * 4 + r_in_blk) * stride + c8 * 8) : base;
       qsa_cp16_zfill(&dst[qsa_swiz256(s * 4 + r_in_blk, c8)], gp, ok);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    ptx_cp_commit();
   };
 
   if (num_blk_tiles > 0) {
@@ -1650,7 +1628,7 @@ R"cuda(
     const int cur = tile & 1;
     const int nxt = cur ^ 1;
     const bool is_last = (tile + 1 == num_blk_tiles);
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncthreads();
 
     if (!is_last) load_kv_unchecked(sV, V_base, v_ss, cur);
@@ -1758,7 +1736,7 @@ R"cuda(
     l_row1 = l_row1 * alpha1 + local_sum1;
     m_row0 = new_m0; m_row1 = new_m1;
 
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncthreads();
     if (!is_last) {
       if (tile + 2 < num_blk_tiles) load_kv_unchecked(sK, K_base, k_ss, nxt);
@@ -1799,8 +1777,8 @@ R"cuda(
         qsa_cp16_zfill(&sK[qsa_swiz256(r, c8)], ok ? (K_base + (long long)kp * k_ss + c8 * 8) : K_base, ok);
         qsa_cp16_zfill(&sV[qsa_swiz256(r, c8)], ok ? (V_base + (long long)kp * v_ss + c8 * 8) : V_base, ok);
       }
-      asm volatile("cp.async.commit_group;\n" ::: "memory");
-      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      ptx_cp_commit();
+      ptx_cp_wait<0>();
       __syncthreads();
 
       const int qe0 = (ql0 < valid_bq) ? min(base_pos + q_base + ql0 + 1, K_len) : 0;
@@ -1968,8 +1946,8 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_indep4w_cuda(
     qsa_cp16_zfill(&my_sKV[qsa_swiz128(r, c8)], row_ptr + c8 * 8, ok);
     qsa_cp16_zfill(&my_sQhi[qsa_swiz128(r, c8)], row_ptr + (c8 + 16) * 8, ok);
   }
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
-  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+  ptx_cp_commit();
+  ptx_cp_wait<0>();
   __syncwarp();
 
   unsigned int q_lo[8][4];
@@ -2029,8 +2007,8 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_indep4w_cuda(
       const nv_bfloat16* gp = ok ? (K_base + (long long)kp * k_ss + lane * 8) : K_base;
       qsa_cp16_zfill(&my_sKV[qsa_swiz256(r, lane)], gp, ok);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_commit();
+    ptx_cp_wait<0>();
     __syncwarp();
 
     float s00 = 0.0f, s01 = 0.0f, s02 = 0.0f, s03 = 0.0f;
@@ -2064,7 +2042,7 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_indep4w_cuda(
       const nv_bfloat16* gp = ok ? (V_base + (long long)kp * v_ss + lane * 8) : V_base;
       qsa_cp16_zfill(&my_sKV[qsa_swiz256(r, lane)], gp, ok);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    ptx_cp_commit();
 
     const unsigned int vmask = __ballot_sync(0xffffffffu, my_kp >= 0);
     const int c0 = 2 * tid_in_grp;
@@ -2118,7 +2096,7 @@ __global__ __launch_bounds__(128, 2) void qwen4_qsa_sdpa_prefill_indep4w_cuda(
     l_row1 = l_row1 * alpha1 + local_sum1;
     m_row0 = new_m0; m_row1 = new_m1;
 
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    ptx_cp_wait<0>();
     __syncwarp();
 
 #pragma unroll

@@ -1,7 +1,7 @@
 use super::*;
 use crate::accelerator::{ActiveBackend, active_backend};
 use crate::array::{DType, MxArray};
-use crate::kernels::{attention, gdn};
+use crate::kernels::{attention, gdn, linear};
 use crate::models::quant_dispatch::kquant_tile_rows;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_gpu::{
@@ -2262,7 +2262,7 @@ fn qwen4_q8_prefill_parity() {
             .unwrap();
 
         for (gen_bias, bi_arr) in [(false, &bi_sym_arr), (true, &bi_gen_arr)] {
-            let w_bf16 = dequant_q8_bf16_cuda(&w_arr, &sc_arr, bi_arr)
+            let w_bf16 = linear::dequant_q8_bf16_cuda(&w_arr, &sc_arr, bi_arr)
                 .unwrap()
                 .expect("dequant_q8_bf16_cuda admitted");
             let want_arr = x_arr
@@ -2275,7 +2275,7 @@ fn qwen4_q8_prefill_parity() {
             }
             for gs_shift in modes {
                 let got_arr =
-                    q8_prefill_cuda(&x_arr, &w_arr, &sc_arr, bi_arr, gs_shift, gen_bias)
+                    linear::q8_prefill_cuda(&x_arr, &w_arr, &sc_arr, bi_arr, gs_shift, gen_bias)
                         .unwrap()
                         .unwrap_or_else(|| {
                             panic!("q8_prefill_cuda rejected (m={m}, n={n}, k={k}, gs={gs_shift}, gen={gen_bias})")
@@ -2303,7 +2303,7 @@ fn qwen4_q8_prefill_parity() {
     let x_odd = bf16_array(&vec![0.1f32; 32 * 256], &[1, 32, 256]);
     let (w_odd, s_odd, b_odd, _) = build_affine_bank(&mut rng, 8, 1, 1, 256, false);
     assert!(
-        q8_prefill_cuda(&x_odd, &w_odd, &s_odd, &b_odd, 0, false)
+        linear::q8_prefill_cuda(&x_odd, &w_odd, &s_odd, &b_odd, 0, false)
             .unwrap()
             .is_none(),
         "N=1 must return None cleanly"
@@ -2364,7 +2364,7 @@ fn qwen4_hc_up_mix_prefill_and_inject_only_parity() {
     let nm = bf16_array(&nm_vals, &[1, m as i64, 10240]);
     let (w_up, s_up, b_up, _) = build_affine_bank(&mut rng, 8, 1, 10240, 320, false);
 
-    let w_bf16 = dequant_q8_bf16_cuda(&w_up, &s_up, &b_up)
+    let w_bf16 = linear::dequant_q8_bf16_cuda(&w_up, &s_up, &b_up)
         .unwrap()
         .expect("dequant admitted");
     let w_bf16_t = w_bf16.transpose(Some(&[1, 0])).unwrap();

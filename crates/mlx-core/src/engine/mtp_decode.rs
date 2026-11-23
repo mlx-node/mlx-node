@@ -1,4 +1,4 @@
-//! Qwen3.5 MTP (Multi-Token Prediction) speculative-decode machinery.
+//! Engine-owned MTP (Multi-Token Prediction) speculative-decode machinery.
 //!
 //! Holds the cached MTP env-flag readers, the draft/verify helpers, and the
 //! shared cycle data types (`MtpCommitAnchor` / `MtpCycleOutcome` /

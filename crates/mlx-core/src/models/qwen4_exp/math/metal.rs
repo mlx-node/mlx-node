@@ -253,21 +253,6 @@ pub(super) fn gated_delta_kernel(
     crate::kernels::qwen4::metal::gated_delta_kernel(q, k, v, decay, beta, state, None)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn gdn_prepare(
-    qkv: &MxArray,
-    a: &MxArray,
-    b: &MxArray,
-    conv: &MxArray,
-    old: &MxArray,
-    scale: &MxArray,
-    dt: &MxArray,
-) -> Result<Option<[MxArray; 6]>> {
-    // qwen4 semantics: L2-style norm (eps on the sum) and f32 beta —
-    // matches this family's `math::l2` reference exactly.
-    crate::kernels::qwen4::metal::gdn_prepare(qkv, a, b, conv, old, scale, dt, false, false)
-}
-
 pub(super) fn window_conv(
     x: &MxArray,
     old: &MxArray,

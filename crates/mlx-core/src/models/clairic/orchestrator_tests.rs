@@ -409,7 +409,10 @@ mod tests {
                         .unwrap();
                 }
             }
-            if let crate::models::quantized_linear::MLPVariant::Standard(mlp) = &mut layer.mlp {
+            if let crate::models::qwen3_5::decoder_layer::MLPType::Dense(
+                crate::models::quantized_linear::MLPVariant::Standard(mlp),
+            ) = &mut layer.mlp
+            {
                 mlp.set_gate_proj_weight(&det_arr(s + 9, &[inter, h], 0.08))
                     .unwrap();
                 mlp.set_up_proj_weight(&det_arr(s + 10, &[inter, h], 0.08))

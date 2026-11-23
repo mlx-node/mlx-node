@@ -3266,7 +3266,7 @@ impl QuantizedLinear {
                     if let Some(weight) = dense.as_deref().and_then(Option::as_ref) {
                         return x.matmul(&weight.array().transpose(Some(&[1, 0]))?);
                     }
-                    let weight = if let Some(fast) = crate::kernels::qwen4::dequant_q8_bf16_cuda(
+                    let weight = if let Some(fast) = crate::kernels::linear::dequant_q8_bf16_cuda(
                         &self.weight,
                         &self.scales,
                         biases,

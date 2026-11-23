@@ -14,6 +14,7 @@ namespace {
 using namespace mlx_node::qwen4_cuda;
 
 constexpr char qwen4_moe_few_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/qwen4_moe_few.cu.inc"
     ;
 

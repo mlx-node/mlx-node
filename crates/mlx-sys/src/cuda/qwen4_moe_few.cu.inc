@@ -9,54 +9,38 @@ R"cuda(
 //   Shared expert:  RowMajor affine 8-bit (Q8_0) g32 f16 s+b
 
 __device__ __forceinline__ uint4 q4m_ld_cs_u4(const uint4* ptr) {
-  uint4 v;
-  asm("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-      : "l"(ptr));
-  return v;
+  return ptx_ld_cs_u4(ptr);
 }
 
 __device__ __forceinline__ int q4m_dp4a(unsigned int a, unsigned int b, int c) {
-  int d;
-  asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
-  return d;
+  return ptx_dp4a_s32(a, b, c);
 }
 
 __device__ __forceinline__ void q4m_cp_async16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;\n"
-      :: "r"(smem_addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 __device__ __forceinline__ void q4m_cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 template <int N_WAIT>
 __device__ __forceinline__ void q4m_cp_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(N_WAIT) : "memory");
+  ptx_cp_wait<N_WAIT>();
 }
 
 __device__ __forceinline__ void q4m_mma_s8(
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1,
     int& c0, int& c1, int& c2, int& c3) {
-  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-      : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k32_s8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
 }
 
 __device__ __forceinline__ void q4m_mma_bf16(
     float& d0, float& d1, float& d2, float& d3,
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k16_bf16_v(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
 }
 
 template <int mode>

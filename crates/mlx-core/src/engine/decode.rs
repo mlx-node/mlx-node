@@ -2,13 +2,12 @@
 //!
 //! [`run_decode_loop`] is the engine's generic decode loop over the
 //! [`DecodeStep`] backend trait — every family's standard chat flow
-//! drives it via the session cores. The `decode_loop!` macro and its
-//! `DecodeOps` closure bundle live in `models::qwen3_5::mtp_decode`;
-//! their only consumers are the qwen3_5 dense/MoE MTP/vision whole-turn
-//! cores.
+//! drives it via the session cores. The MTP runtime helpers live in
+//! `engine::mtp_decode`; their consumers are the engine and family MTP
+//! whole-turn cores.
 //!
 //! NOTE: `mtp_trace_logits` / `Top2` / `trace_top2` live HERE (not in
-//! `models::qwen3_5::mtp_decode`) because they serve both this loop's
+//! `engine::mtp_decode`) because they serve both this loop's
 //! AR per-token trace diagnostics and the MTP path, which imports them
 //! from this module.
 
@@ -300,8 +299,7 @@ impl Drop for PendingDecodeEvaluation {
 
 /// Generic decode loop over a [`DecodeStep`].
 ///
-/// Behavior matches the `decode_loop!` macro (still used by the
-/// MTP/vision whole-turn cores in `models::qwen3_5::mtp_decode`) at the
+/// Behavior matches the MTP/vision whole-turn cores at the
 /// engine defaults; the two must stay in lockstep. These seams each
 /// default to that behavior:
 ///   * (a) the throttled every-32-step trace reads

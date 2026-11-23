@@ -126,6 +126,7 @@ impl ScheduledMtpTarget for Qwen35Inner {
                 adapter,
                 &positions,
                 Some(&mut caches[index]),
+                false,
                 Some(&mut tape[index]),
             )?;
         }

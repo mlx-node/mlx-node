@@ -1023,23 +1023,22 @@ impl super::super::Inner {
 
     /// Off-Metal (Windows CUDA) flat-KV DFlash2 speculative turn: tapped
     /// prefill into the preallocated flat BF16 KV cache + eager verify/rollback
-    /// via `DraftStepper` and `run_dspark_turn`.
+    /// via `DraftStepper` and `run_flat_dspark_turn`.
     pub(in super::super) fn flat_dflash2_turn(
         &mut self,
         args: &mut crate::engine::backend::WholeTurnArgs<'_>,
     ) -> Result<crate::engine::backend::TurnOutput> {
-        use crate::decode_profiler::DecodeProfiler;
-        use crate::engine::backend::{ChatBackend, FinalizeArgs, TurnOutput};
-        use crate::engine::decode::TurnStreaming;
-        use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
-        use crate::engine::finalize::compute_performance_metrics;
-        use crate::engine::params::generated_capacity_hint;
-        use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-        use crate::stream::{Stream, StreamContext};
-        use std::time::Instant;
+        crate::engine::dspark_turn::run_flat_dspark_turn(self, args)
+    }
+}
 
-        let tokenizer = args.tokenizer.clone();
-        let tokens = args.tokens.to_vec();
+impl crate::engine::dspark_turn::FlatDsparkBackend for super::super::Inner {
+    fn prepare_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        _params: &ChatParams,
+        _is_delta: bool,
+    ) -> Result<crate::engine::dspark_turn::FlatDsparkPrefix> {
         if tokens.is_empty() {
             return Err(Error::from_reason(
                 "qwen4_exp flat DFlash2 turn requires at least one prompt token",
@@ -1051,13 +1050,6 @@ impl super::super::Inner {
                 self.decoder.context_window
             )));
         }
-        let is_delta = args.plan.is_delta;
-        let is_streaming = args.sink.is_some();
-        let mut params = ChatBackend::resolve_params(self, args.config);
-        params.extra_eos_ids = ChatBackend::extra_eos_ids(self);
-        let reuse_cache = params.reuse_cache;
-        let report_performance = params.report_performance;
-
         let draft_model = self
             .draft
             .as_ref()
@@ -1079,114 +1071,62 @@ impl super::super::Inner {
         if let Err(error) = self.decoder.draft_taps_on(&draft_model) {
             return Err(self.flat_dflash2_fail_closed(error));
         }
-
-        let generation_start = report_performance.then(Instant::now);
-        let mut profiler = DecodeProfiler::new(
-            ChatBackend::profiler_label(self, is_delta, is_streaming),
-            ChatBackend::family_name(self),
-        );
-        profiler.set_prompt_tokens(tokens.len() as u32);
-        profiler.snapshot_memory_before();
-        let progress = args.sink.and_then(|sink| sink.progress());
-        if let Some(progress) = progress {
-            progress.begin_prefill(tokens.len() as u32, 0);
-        }
-        profiler.begin_prefill();
-        let generation_stream = Stream::generation();
-        let last_logits = {
-            let _context = StreamContext::new(generation_stream);
-            self.decoder
-                .prefill_prompt(&tokens)
-                .and_then(|logits| logits.squeeze(Some(&[1])))
-        };
-        let last_logits = match last_logits {
-            Ok(logits) => logits,
-            Err(error) => return Err(self.flat_dflash2_fail_closed(error)),
-        };
-        if let Some(slot) = self.draft.as_mut()
-            && let Err(error) = self.decoder.draft_follow(&draft_model, &mut slot.context)
-        {
-            return Err(self.flat_dflash2_fail_closed(error));
-        }
-        profiler.end_prefill();
-
-        let mut token_history = tokens.clone();
-        let y = match apply_all_penalties(last_logits, &token_history, &params)
-            .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
-        {
-            Ok(token) => token,
-            Err(error) => return Err(self.flat_dflash2_fail_closed(error)),
-        };
-        y.eval();
-        if let Some(progress) = progress {
-            progress.first_token();
-        }
-        let mut first_token_instant = report_performance.then(Instant::now);
-
-        let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
-        let mut finish_reason = String::from("length");
-        let close = tokenizer.think_end(args.config);
-        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, &close);
-        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(
-                self,
-                tokenizer.inner(),
-                args.thinking.enabled,
-                stream_skip_special,
-            )
-        });
-        let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = (DRAFT_VERIFY_ROWS - 1).min(draft_model.config.block_size.max(1));
-        let mut rng = rand::rng();
-        let outcome = {
-            let streaming = turn_streaming
-                .as_mut()
-                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
-            run_dspark_turn(
-                self,
-                &mut rng,
-                DsparkTurnArgs {
-                    y,
-                    block_size,
-                    params: &params,
-                    reasoning_tracker: &mut reasoning,
-                    profiler: &mut profiler,
-                    max_new_tokens: params.max_new_tokens,
-                    eos_id: args.eos_id,
-                    generated_tokens: &mut generated,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant: &mut first_token_instant,
-                    report_perf: report_performance,
-                    generation_stream,
-                    cancel_flag: args.cancelled,
-                    turn_token_observer,
-                },
-                streaming,
-            )
-        };
-        if let Err(error) = outcome {
-            return Err(self.flat_dflash2_fail_closed(error));
+        Ok(crate::engine::dspark_turn::FlatDsparkPrefix {
+            prefill_tokens: tokens.to_vec(),
+            cached_prefix_len: 0,
+            prior_cached_len: 0,
+            block_size,
+        })
+    }
+
+    fn flat_prefill_with_draft_state(
+        &mut self,
+        prefix: &crate::engine::dspark_turn::FlatDsparkPrefix,
+        stream: crate::stream::Stream,
+    ) -> Result<MxArray> {
+        let draft_model = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| {
+                Error::from_reason("qwen4_exp flat DFlash2 turn requires an attached draft")
+            })?
+            .model
+            .clone();
+        let last_logits = {
+            let _context = crate::stream::StreamContext::new(stream);
+            self.decoder
+                .prefill_prompt(&prefix.prefill_tokens)
+                .and_then(|logits| logits.squeeze(Some(&[1])))
+        }?;
+        if let Some(slot) = self.draft.as_mut() {
+            self.decoder.draft_follow(&draft_model, &mut slot.context)?;
         }
+        Ok(last_logits)
+    }
+
+    fn eval_after_flat_prefill(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn fail_closed_flat_dspark(&mut self, error: Error) -> Error {
+        self.flat_dflash2_fail_closed(error)
+    }
+
+    fn finish_flat_dspark_turn(
+        &mut self,
+        _tokens: &[u32],
+        _generated_tokens: &[u32],
+        _finish_reason: &str,
+        _last_in_cache: bool,
+        _is_delta: bool,
+        reuse_cache: bool,
+        _stream: crate::stream::Stream,
+    ) -> Result<()> {
         self.decoder.draft_taps_off();
         if let Some(slot) = self.draft.as_mut() {
             slot.turn = None;
         }
-        let performance = if report_performance {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len(),
-                generated.len(),
-            )
-            .map(|mut metrics| {
-                ChatBackend::augment_performance(self, &profiler, &mut metrics);
-                metrics
-            })
-        } else {
-            None
-        };
         if reuse_cache {
             self.saved_history = self.decoder.history.clone();
         } else {
@@ -1197,37 +1137,7 @@ impl super::super::Inner {
                 slot.seq = None;
             }
         }
-
-        let reasoning = reasoning.outcome();
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            let decoded = tokenizer
-                .decode_sync(&generated, stream_skip_special)
-                .unwrap_or_default();
-            ts.flush_residual(&decoded, params.include_reasoning, sink);
-        }
-        let mut result = ChatBackend::finalize_turn(
-            self,
-            FinalizeArgs {
-                tokenizer: &tokenizer,
-                generated_tokens: &generated,
-                finish_reason,
-                think_end_id: close.think_end_id,
-                think_end_str: close.think_end_str.as_deref(),
-                think_end_extra_ids: &close.think_end_extra_ids,
-                performance,
-                include_reasoning: params.include_reasoning,
-                thinking_enabled: args.thinking.enabled,
-                prompt_tokens: tokens.len() as u32,
-                reasoning,
-            },
-        )?;
-        result.cached_tokens = 0;
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            ts.emitter.finish(&result, sink);
-            Ok(TurnOutput::Streamed)
-        } else {
-            Ok(TurnOutput::Complete(Box::new(result)))
-        }
+        Ok(())
     }
 }
 

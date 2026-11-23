@@ -9,6 +9,7 @@ use rand::Rng;
 
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
+use crate::engine::dspark_turn::{non_causal_sliding_mask, parallel_query_ids};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, RMSNorm, RoPE};
 use crate::sampling::{SamplingConfig, is_greedy_temperature, sampling_distribution};
@@ -16,46 +17,6 @@ use crate::transformer::HybridLayerCache;
 
 use super::config::{MuseGlimmerDFlashConfig, MuseGlimmerTextConfig};
 use super::mlp::MuseGlimmerMlp;
-
-fn parallel_query_ids(anchor: u32, mask: usize, draft_len: usize) -> Vec<i32> {
-    let mut ids = Vec::with_capacity(draft_len.saturating_add(1));
-    ids.push(anchor as i32);
-    ids.resize(draft_len.saturating_add(1), mask as i32);
-    ids
-}
-
-fn non_causal_sliding_mask(
-    query_base: i32,
-    query_len: i64,
-    key_base: i32,
-    key_len: i64,
-    window: i64,
-) -> Result<Option<MxArray>> {
-    if key_len <= window {
-        return Ok(None);
-    }
-    let queries = MxArray::arange(
-        f64::from(query_base),
-        f64::from(query_base) + query_len as f64,
-        None,
-        None,
-    )?
-    .reshape(&[query_len, 1])?;
-    let keys = MxArray::arange(
-        f64::from(key_base),
-        f64::from(key_base) + key_len as f64,
-        None,
-        None,
-    )?
-    .reshape(&[1, key_len])?;
-    let distance = queries.sub(&keys)?;
-    let window = MxArray::scalar_int(window as i32)?;
-    Ok(Some(
-        distance
-            .less(&window)?
-            .reshape(&[1, 1, query_len, key_len])?,
-    ))
-}
 
 pub(crate) struct DFlashAttention {
     q_proj: LinearProj,

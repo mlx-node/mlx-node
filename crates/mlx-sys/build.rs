@@ -1883,9 +1883,10 @@ fn main() -> io::Result<()> {
     // `common/mlx_paged_stubs.cpp`, and the Rust callers fall back to the
     // eager path via the `mlx_metal_is_available()` gates.
     const METAL_ONLY_TUS: &[&str] = &[
-        "mlx_paged_dispatch.cpp", // raw MTL:: types
-        "mlx_paged_ops.cpp",      // #include mlx/backend/metal/device.h
-        "mlx_paged_profile.cpp",  // __APPLE__-guarded body + Metal include
+        "mlx_paged_dispatch.cpp",  // raw MTL:: types
+        "mlx_paged_ops.cpp",       // #include mlx/backend/metal/device.h
+        "mlx_paged_ops_tests.cpp", // #include mlx/backend/metal/device.h
+        "mlx_paged_profile.cpp",   // __APPLE__-guarded body + Metal include
     ];
 
     // Collect all .cpp files under src/{common,metal,cuda} in deterministic order.

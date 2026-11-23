@@ -6,6 +6,7 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 #include "inkling2_moe_abi.h"
+#include "../common/moe_common.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -1048,8 +1049,136 @@ inkling2_moe_m1_down_combine_sconv_mxfp8(
 // 2. Grouped Indirect-Dispatch Infrastructure (T >= 2: M=4, 8, 32, Prefill)
 // ============================================================================
 
-inline uint inkling2_matmul_rows(uint rows, uint tile_rows) {
-  return min(tile_rows, rows <= 8u ? 8u : rows <= 16u ? 16u : tile_rows);
+// Shared tile-table + SIMD/NAX bucket + deterministic scatter + indirect grid
+// emission between `inkling2_moe_group` and `inkling2_moe_route_group_small`.
+template <bool AlwaysTgSel>
+inline void inkling2_moe_emit_tiles_and_grids(
+    device const int32_t *selected,
+    bool use_tg_sel,
+    threadgroup atomic_uint (&counts)[256],
+    threadgroup uint (&totals)[8],
+    threadgroup const uint16_t (&tg_sel)[512],
+    threadgroup atomic_uint &simd_cnt,
+    threadgroup atomic_uint &nax_cnt,
+    device Inkling2MoeTile *tiles,
+    device Inkling2MoeTileCount *tile_count,
+    device uint *routes,
+    device uint *inverse,
+    device uint *tile_lists,
+    uint rows,
+    uint hidden,
+    uint intermediate,
+    uint experts,
+    uint top_k,
+    uint tile_rows,
+    uint col_cutoff,
+    uint max_tiles,
+    uint flags,
+    uint tid,
+    uint lane,
+    uint sg) {
+  const uint count = tid < experts
+      ? atomic_load_explicit(counts + tid, memory_order_relaxed)
+      : 0u;
+  const uint nt = (count + tile_rows - 1u) / tile_rows;
+  const uint start = moe_exclusive_prefix_sum_256(nt, totals, lane, sg);
+
+  // Decide SIMD vs NAX per expert (not per tile) so a multi-tile expert never splits
+  // across SIMD and NAX kernels.
+  const bool use_simd = (count <= col_cutoff);
+  for (uint t = 0u; t < nt; ++t) {
+    const uint tile_idx = start + t;
+    const uint live = min(tile_rows, count - t * tile_rows);
+    tiles[tile_idx] = {tid, live};
+    if (use_simd) {
+      const uint pos = atomic_fetch_add_explicit(&simd_cnt, 1u, memory_order_relaxed);
+      tile_lists[pos] = tile_idx;
+    } else {
+      const uint pos = atomic_fetch_add_explicit(&nax_cnt, 1u, memory_order_relaxed);
+      tile_lists[max_tiles + pos] = tile_idx;
+    }
+  }
+  if (nt != 0u) {
+    const uint last = start + nt - 1u;
+    const uint live = count - (nt - 1u) * tile_rows;
+    const uint pad_end = last * tile_rows + moe_matmul_rows(live, tile_rows);
+    for (uint r = start * tile_rows + count; r < pad_end; ++r) {
+      routes[r] = ~0u;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 100% deterministic in-order route scatter per expert for ALL `total_routes` (zero atomics!).
+  // Store token index (`r / top_k`) directly in `routes[pos]` so downstream gather / direct-gather
+  // needs ZERO integer division (`udiv`)!
+  const uint total_routes = rows * top_k;
+  if (tid < experts && count > 0u) {
+    uint slot = 0u;
+    const uint base_pos = start * tile_rows;
+    if constexpr (AlwaysTgSel) {
+      for (uint r = 0u; r < total_routes; ++r) {
+        if (uint(tg_sel[r]) == tid) {
+          const uint pos = base_pos + slot;
+          routes[pos] = r / top_k;
+          inverse[r] = pos;
+          ++slot;
+        }
+      }
+    } else if (use_tg_sel) {
+      for (uint r = 0u; r < total_routes; ++r) {
+        if (uint(tg_sel[r]) == tid) {
+          const uint pos = base_pos + slot;
+          routes[pos] = r / top_k;
+          inverse[r] = pos;
+          ++slot;
+        }
+      }
+    } else {
+      for (uint r = 0u; r < total_routes; ++r) {
+        if (uint(selected[r]) == tid) {
+          const uint pos = base_pos + slot;
+          routes[pos] = r / top_k;
+          inverse[r] = pos;
+          ++slot;
+        }
+      }
+    }
+  }
+
+  if (tid == 255u) {
+    const uint live_tiles = start + nt;
+    const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
+    const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
+    const bool gu_8col = (flags & 1u) != 0u;
+    const bool dn_16col = (flags & 64u) != 0u;
+
+    tile_count->total_tiles = live_tiles;
+    tile_count->simd_tiles = s_tiles;
+    tile_count->nax_tiles = n_tiles;
+
+    tile_count->gather_grid[0] = live_tiles;
+    tile_count->gather_grid[1] = (hidden + 255u) / 256u;
+    tile_count->gather_grid[2] = 1u;
+
+    const uint simd_gu_x = gu_8col ? (intermediate / 8u) : (intermediate / 4u);
+    const uint simd_dn_x = dn_16col ? (hidden / 16u) : (hidden / 8u);
+    tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
+    tile_count->simd_gu_grid[1] = s_tiles;
+    tile_count->simd_gu_grid[2] = 1u;
+
+    tile_count->simd_dn_grid[0] = s_tiles > 0u ? simd_dn_x : 0u;
+    tile_count->simd_dn_grid[1] = s_tiles;
+    tile_count->simd_dn_grid[2] = 1u;
+
+    // 2-SG NAX (8 KB smem for max occupancy): gate_up computes 32 cols/TG, down computes 64 cols/TG.
+    tile_count->nax_gu_grid[0] = n_tiles > 0u ? (intermediate / 32u) : 0u;
+    tile_count->nax_gu_grid[1] = n_tiles;
+    tile_count->nax_gu_grid[2] = 1u;
+
+    tile_count->nax_dn_grid[0] = n_tiles > 0u ? (hidden / 64u) : 0u;
+    tile_count->nax_dn_grid[1] = n_tiles;
+    tile_count->nax_dn_grid[2] = 1u;
+  }
 }
 
 // Single-threadgroup GPU histogram + prefix sum + tile table + route scatter + dual-bucket
@@ -1092,105 +1221,11 @@ inkling2_moe_group(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const uint count = tid < p.experts
-      ? atomic_load_explicit(counts + tid, memory_order_relaxed)
-      : 0u;
-  const uint nt = (count + p.tile_rows - 1u) / p.tile_rows;
-  uint start = simd_prefix_exclusive_sum(nt);
-  if (lane == 31u) {
-    totals[sg] = start + nt;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = 0u; i < sg; ++i) {
-    start += totals[i];
-  }
-
-  // Decide SIMD vs NAX per expert (not per tile) so a multi-tile expert never splits
-  // across SIMD and NAX kernels.
-  const bool use_simd = (count <= p.col_cutoff);
-  for (uint t = 0u; t < nt; ++t) {
-    const uint tile_idx = start + t;
-    const uint live = min(p.tile_rows, count - t * p.tile_rows);
-    tiles[tile_idx] = {tid, live};
-    if (use_simd) {
-      const uint pos = atomic_fetch_add_explicit(&simd_cnt, 1u, memory_order_relaxed);
-      tile_lists[pos] = tile_idx;
-    } else {
-      const uint pos = atomic_fetch_add_explicit(&nax_cnt, 1u, memory_order_relaxed);
-      tile_lists[p.max_tiles + pos] = tile_idx;
-    }
-  }
-  if (nt != 0u) {
-    const uint last = start + nt - 1u;
-    const uint live = count - (nt - 1u) * p.tile_rows;
-    const uint pad_end = last * p.tile_rows + inkling2_matmul_rows(live, p.tile_rows);
-    for (uint r = start * p.tile_rows + count; r < pad_end; ++r) {
-      routes[r] = ~0u;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // 100% deterministic in-order route scatter per expert for ALL `total_routes` (zero atomics!).
-  // Store token index (`r / p.top_k`) directly in `routes[pos]` so downstream gather / direct-gather
-  // needs ZERO integer division (`udiv`)!
-  if (tid < p.experts && count > 0u) {
-    uint slot = 0u;
-    const uint base_pos = start * p.tile_rows;
-    if (use_tg_sel) {
-      for (uint r = 0u; r < total_routes; ++r) {
-        if (uint(tg_sel[r]) == tid) {
-          const uint pos = base_pos + slot;
-          routes[pos] = r / p.top_k;
-          inverse[r] = pos;
-          ++slot;
-        }
-      }
-    } else {
-      for (uint r = 0u; r < total_routes; ++r) {
-        if (uint(selected[r]) == tid) {
-          const uint pos = base_pos + slot;
-          routes[pos] = r / p.top_k;
-          inverse[r] = pos;
-          ++slot;
-        }
-      }
-    }
-  }
-
-  if (tid == 255u) {
-    const uint live_tiles = start + nt;
-    const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
-    const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
-    const bool gu_8col = (p.flags & 1u) != 0u;
-    const bool dn_16col = (p.flags & 64u) != 0u;
-
-    tile_count->total_tiles = live_tiles;
-    tile_count->simd_tiles = s_tiles;
-    tile_count->nax_tiles = n_tiles;
-
-    tile_count->gather_grid[0] = live_tiles;
-    tile_count->gather_grid[1] = (p.hidden + 255u) / 256u;
-    tile_count->gather_grid[2] = 1u;
-
-    const uint simd_gu_x = gu_8col ? (p.intermediate / 8u) : (p.intermediate / 4u);
-    const uint simd_dn_x = dn_16col ? (p.hidden / 16u) : (p.hidden / 8u);
-    tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
-    tile_count->simd_gu_grid[1] = s_tiles;
-    tile_count->simd_gu_grid[2] = 1u;
-
-    tile_count->simd_dn_grid[0] = s_tiles > 0u ? simd_dn_x : 0u;
-    tile_count->simd_dn_grid[1] = s_tiles;
-    tile_count->simd_dn_grid[2] = 1u;
-
-    // 2-SG NAX (8 KB smem for max occupancy): gate_up computes 32 cols/TG, down computes 64 cols/TG.
-    tile_count->nax_gu_grid[0] = n_tiles > 0u ? (p.intermediate / 32u) : 0u;
-    tile_count->nax_gu_grid[1] = n_tiles;
-    tile_count->nax_gu_grid[2] = 1u;
-
-    tile_count->nax_dn_grid[0] = n_tiles > 0u ? (p.hidden / 64u) : 0u;
-    tile_count->nax_dn_grid[1] = n_tiles;
-    tile_count->nax_dn_grid[2] = 1u;
-  }
+  inkling2_moe_emit_tiles_and_grids<false>(
+      selected, use_tg_sel, counts, totals, tg_sel, simd_cnt, nax_cnt,
+      tiles, tile_count, routes, inverse, tile_lists,
+      p.rows, p.hidden, p.intermediate, p.experts, p.top_k, p.tile_rows,
+      p.col_cutoff, p.max_tiles, p.flags, tid, lane, sg);
 }
 
 // Single-threadgroup fused `route + group` for T <= 32 (T*K <= 512, E <= 256).
@@ -1235,170 +1270,27 @@ inkling2_moe_route_group_small(
 
   for (uint row = sg; row < rp.rows; row += 8u) {
     const ulong row_base = ulong(row) * ulong(rp.logits_stride);
-    constexpr uint MAX_SLOTS = 8u; // 8 * 32 = 256 experts
-    float local_s[MAX_SLOTS];
-    float local_p[MAX_SLOTS];
-    int32_t local_id[MAX_SLOTS];
-    uint cnt = 0u;
-
-    for (uint e = lane; e < E; e += 32u) {
-      const float z = inkling2_moe_read_f32(logits_raw, row_base + e, logits_f32);
-      const float prob = inkling2_moe_sigmoid(z);
-      const float sc = has_bias
-          ? (prob + inkling2_moe_read_f32(bias_raw, ulong(e), bias_f32))
-          : prob;
-      local_s[cnt] = sc;
-      local_p[cnt] = prob;
-      local_id[cnt] = int32_t(e);
-      ++cnt;
-    }
-
-    int32_t sel_idx[16];
-    float sel_p[16];
-    float sum_p = 0.0f;
-
-    for (uint k = 0u; k < K; ++k) {
-      float best_s = -INFINITY;
-      int32_t best_i = -1;
-      float best_p = 0.0f;
-      for (uint j = 0u; j < cnt; ++j) {
-        const int32_t cid = local_id[j];
-        if (cid >= 0) {
-          const float cs = local_s[j];
-          if (best_i < 0 || cs > best_s || (cs == best_s && cid < best_i)) {
-            best_s = cs;
-            best_i = cid;
-            best_p = local_p[j];
+    const uint out_base = row * K;
+    moe_sigmoid_bias_topk_row<8u, true>(
+        logits_raw, row_base, bias_raw, down_scale_raw,
+        E, K, rp.route_scale, logits_f32, has_bias, bias_f32,
+        has_down_scale, ds_f32, lane,
+        [&](uint k, int32_t eid_i, float w) {
+          const uint eid = uint(eid_i);
+          out_gamma[out_base + k] = w;
+          tg_sel[out_base + k] = uint16_t(eid);
+          if (eid < E) {
+            atomic_fetch_add_explicit(counts + eid, 1u, memory_order_relaxed);
           }
-        }
-      }
-
-      for (ushort mask = 16; mask > 0; mask >>= 1) {
-        const float os = simd_shuffle_xor(best_s, mask);
-        const int32_t oi = simd_shuffle_xor(best_i, mask);
-        const float op = simd_shuffle_xor(best_p, mask);
-        if (oi >= 0 && (best_i < 0 || os > best_s || (os == best_s && oi < best_i))) {
-          best_s = os;
-          best_i = oi;
-          best_p = op;
-        }
-      }
-
-      for (uint j = 0u; j < cnt; ++j) {
-        if (local_id[j] == best_i) {
-          local_id[j] = -1;
-        }
-      }
-
-      if (lane == 0u) {
-        sel_idx[k] = best_i;
-        sel_p[k] = best_p;
-        sum_p += best_p;
-      }
-    }
-
-    if (lane == 0u) {
-      const float denom = sum_p + 1e-20f;
-      const uint out_base = row * K;
-      for (uint k = 0u; k < K; ++k) {
-        const uint eid = uint(sel_idx[k]);
-        float w = (sel_p[k] / denom) * rp.route_scale;
-        if (has_down_scale) {
-          w *= inkling2_moe_read_f32(down_scale_raw, ulong(eid), ds_f32);
-        }
-        out_gamma[out_base + k] = w;
-        tg_sel[out_base + k] = uint16_t(eid);
-        if (eid < E) {
-          atomic_fetch_add_explicit(counts + eid, 1u, memory_order_relaxed);
-        }
-      }
-    }
+        });
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const uint count = tid < E
-      ? atomic_load_explicit(counts + tid, memory_order_relaxed)
-      : 0u;
-  const uint nt = (count + rp.tile_rows - 1u) / rp.tile_rows;
-  uint start = simd_prefix_exclusive_sum(nt);
-  if (lane == 31u) {
-    totals[sg] = start + nt;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = 0u; i < sg; ++i) {
-    start += totals[i];
-  }
-
-  const bool use_simd = (count <= rp.col_cutoff);
-  for (uint t = 0u; t < nt; ++t) {
-    const uint tile_idx = start + t;
-    const uint live = min(rp.tile_rows, count - t * rp.tile_rows);
-    tiles[tile_idx] = {tid, live};
-    if (use_simd) {
-      const uint pos = atomic_fetch_add_explicit(&simd_cnt, 1u, memory_order_relaxed);
-      tile_lists[pos] = tile_idx;
-    } else {
-      const uint pos = atomic_fetch_add_explicit(&nax_cnt, 1u, memory_order_relaxed);
-      tile_lists[rp.max_tiles + pos] = tile_idx;
-    }
-  }
-  if (nt != 0u) {
-    const uint last = start + nt - 1u;
-    const uint live = count - (nt - 1u) * rp.tile_rows;
-    const uint pad_end = last * rp.tile_rows + inkling2_matmul_rows(live, rp.tile_rows);
-    for (uint r = start * rp.tile_rows + count; r < pad_end; ++r) {
-      routes[r] = ~0u;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const uint total_routes = rp.rows * K;
-  if (tid < E && count > 0u) {
-    uint slot = 0u;
-    const uint base_pos = start * rp.tile_rows;
-    for (uint r = 0u; r < total_routes; ++r) {
-      if (uint(tg_sel[r]) == tid) {
-        const uint pos = base_pos + slot;
-        routes[pos] = r / K;
-        inverse[r] = pos;
-        ++slot;
-      }
-    }
-  }
-
-  if (tid == 255u) {
-    const uint live_tiles = start + nt;
-    const uint s_tiles = atomic_load_explicit(&simd_cnt, memory_order_relaxed);
-    const uint n_tiles = atomic_load_explicit(&nax_cnt, memory_order_relaxed);
-    const bool gu_8col = (rp.flags & 1u) != 0u;
-    const bool dn_16col = (rp.flags & 64u) != 0u;
-
-    tile_count->total_tiles = live_tiles;
-    tile_count->simd_tiles = s_tiles;
-    tile_count->nax_tiles = n_tiles;
-
-    tile_count->gather_grid[0] = live_tiles;
-    tile_count->gather_grid[1] = (rp.hidden + 255u) / 256u;
-    tile_count->gather_grid[2] = 1u;
-
-    const uint simd_gu_x = gu_8col ? (rp.intermediate / 8u) : (rp.intermediate / 4u);
-    const uint simd_dn_x = dn_16col ? (rp.hidden / 16u) : (rp.hidden / 8u);
-    tile_count->simd_gu_grid[0] = s_tiles > 0u ? simd_gu_x : 0u;
-    tile_count->simd_gu_grid[1] = s_tiles;
-    tile_count->simd_gu_grid[2] = 1u;
-
-    tile_count->simd_dn_grid[0] = s_tiles > 0u ? simd_dn_x : 0u;
-    tile_count->simd_dn_grid[1] = s_tiles;
-    tile_count->simd_dn_grid[2] = 1u;
-
-    tile_count->nax_gu_grid[0] = n_tiles > 0u ? (rp.intermediate / 32u) : 0u;
-    tile_count->nax_gu_grid[1] = n_tiles;
-    tile_count->nax_gu_grid[2] = 1u;
-
-    tile_count->nax_dn_grid[0] = n_tiles > 0u ? (rp.hidden / 64u) : 0u;
-    tile_count->nax_dn_grid[1] = n_tiles;
-    tile_count->nax_dn_grid[2] = 1u;
-  }
+  inkling2_moe_emit_tiles_and_grids<true>(
+      nullptr, true, counts, totals, tg_sel, simd_cnt, nax_cnt,
+      tiles, tile_count, routes, inverse, tile_lists,
+      rp.rows, rp.hidden, rp.intermediate, E, K, rp.tile_rows,
+      rp.col_cutoff, rp.max_tiles, rp.flags, tid, lane, sg);
 }
 
 // Indirectly dispatched 128-bit vectorized gather into grouped tile layout.
@@ -1415,7 +1307,7 @@ inkling2_moe_gather(
   if (group.x >= count->total_tiles) return;
   const uint live = tiles[group.x].rows;
   // Always zero-pad up to the NAX tile height so multi-tile tail tiles routed to NAX see clean zeros.
-  const uint rows = inkling2_matmul_rows(live, p.tile_rows);
+  const uint rows = moe_matmul_rows(live, p.tile_rows);
   const uint col = group.y * 256u + (tid & 31u) * 8u;
   if (col >= p.hidden) return;
   for (uint i = tid >> 5u; i < rows; i += 8u) {

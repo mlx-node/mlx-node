@@ -107,3 +107,41 @@ pub(crate) fn affine_q4_g64_matmul_few(
         ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
     }
 }
+
+/// 1-pass affine Q8_0 (`bits=8, group_size=32`) -> BF16 dequantization on CUDA.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn dequant_q8_bf16_cuda(
+    w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::dequant_q8_bf16_cuda(w, scales, biases),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Direct fused `Q8_0` (`bits=8, group_size=32, f16 scales/biases`) Tensor-Core
+/// prefill GEMM on CUDA (eliminates BF16 dense weight cache allocation).
+///
+/// `gs_shift`: `0` = per-row INT8, `7` = GS=128 INT8, `8` = GS=256 INT8,
+/// `-1` = auto-grouped (`8` if `K%256==0`, else `7` if `K%128==0`, else `0`),
+/// `-2` = bit-exact BF16 MMA (zero X quantization).
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn q8_prefill_cuda(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+    gs_shift: i32,
+    general_bias: bool,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::q8_prefill_cuda(x, w, scales, biases, gs_shift, general_bias)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}

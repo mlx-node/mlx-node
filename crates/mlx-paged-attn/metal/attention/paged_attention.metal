@@ -690,64 +690,110 @@ inline float block_sum(threadgroup float *red_smem, float sum, uint simd_tid,
 //   constant bool use_alibi [[function_constant(20)]];
 // Note: use_partitioning is now derived from PARTITION_SIZE > 0
 
-template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
-          int NUM_SIMD_LANES, int PARTITION_SIZE = 0, bool USE_ALIBI = false>
-[[kernel]] void paged_attention(
-    device float *exp_sums
-    [[buffer(0)]], // [num_seqs, num_heads, max_num_partitions] - only used when
-                   // use_partitioning
-    device float *max_logits
-    [[buffer(1)]], // [num_seqs, num_heads, max_num_partitions] - only used when
-                   // use_partitioning
-    device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out
-    [[buffer(2)]], // [num_seqs, num_heads, max_num_partitions, head_size]
-    device const T *q [[buffer(3)]], // [num_seqs, num_heads, head_size]
-    device const CACHE_T *k_cache
-    [[buffer(4)]], // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    device const CACHE_T *v_cache
-    [[buffer(5)]], // [num_blocks, num_kv_heads, head_size, block_size]
-    const device float *__restrict__ k_scale
-    [[buffer(6)]], // int8: per-row key scales
-    const device float *__restrict__ v_scale
-    [[buffer(7)]], // int8: per-row value scales
-    const constant int &num_kv_heads [[buffer(8)]], // [num_heads]
-    const constant float &scale [[buffer(9)]],
-    const constant float &softcapping [[buffer(10)]],
-    device const uint32_t *block_tables
-    [[buffer(11)]], // [num_seqs, max_num_blocks_per_seq]
-    device const uint32_t *context_lens [[buffer(12)]], // [num_seqs]
-    const constant int &max_num_blocks_per_seq [[buffer(13)]],
-    device const float *alibi_slopes
-    [[buffer(14)]], // [num_heads] - only used when use_alibi
-    const constant int &q_stride [[buffer(15)]],
-    const constant int &kv_block_stride [[buffer(16)]],
-    const constant int &kv_head_stride [[buffer(17)]],
-    // Phase 7: Sliding-window mask for hybrid attention models (Gemma4 et al.).
-    // When sliding_window > 0, K positions older than
-    // `context_len - sliding_window` are masked out (zero contribution to
-    // softmax / V reduction). When sliding_window == 0 the kernel falls
-    // back to the original full-context behaviour.
-    const constant int &sliding_window [[buffer(18)]],
-    const device float *score_scales [[buffer(21)]],
-    const constant int &has_score_scales [[buffer(22)]],
-    threadgroup char *shared_mem [[threadgroup(0)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
-    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
-    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint simd_tid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  const int seq_idx = threadgroup_position_in_grid.y;
+// Binary search to find which sequence a global query token belongs to
+// (varlen mode). cu_seqlens_q is sorted ascending: [0, q_len_0, ...].
+inline int find_seq_idx_varlen(const device int32_t *cu_seqlens_q,
+                               int q_token_idx, int num_seqs) {
+  int lo = 0, hi = num_seqs;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) / 2;
+    if (cu_seqlens_q[mid] <= q_token_idx) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+// Compile-time layout traits shared between `[[kernel]]` wrappers (which must
+// own `threadgroup` array declarations in MSL) and the `inline` impl helpers.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
+          int NUM_SIMD_LANES>
+struct PagedAttentionLayout {
+  enum : int {
+    THREAD_GROUP_SIZE = MAX(NUM_SIMD_LANES / BLOCK_SIZE, 1),
+    NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES,
+    VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * int(sizeof(T))), 1),
+    NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE,
+    NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE,
+  };
+  using Q_vec = typename Vec<T, VEC_SIZE>::Type;
+};
+
+template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE,
+          bool USE_ALIBI, bool IsVarlen, bool KeysTokenMajor = false>
+inline void paged_attention_impl(
+    device float *exp_sums,
+    device float *max_logits,
+    device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out,
+    device const T *q,
+    device const CACHE_T *k_cache,
+    device const CACHE_T *v_cache,
+    const device float *__restrict__ k_scale,
+    const device float *__restrict__ v_scale,
+    const constant int &num_kv_heads,
+    const constant float &scale,
+    const constant float &softcapping,
+    device const uint32_t *block_tables,
+    device const uint32_t *context_lens,
+    const constant int &max_num_blocks_per_seq,
+    device const float *alibi_slopes,
+    const constant int &q_stride,
+    const constant int &kv_block_stride,
+    const constant int &kv_head_stride,
+    const constant int &sliding_window,
+    device const int32_t *cu_seqlens_q,
+    const int num_seqs,
+    const device float *score_scales,
+    const constant int &has_score_scales,
+    threadgroup char *shared_mem,
+    threadgroup typename PagedAttentionLayout<
+        T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, NUM_SIMD_LANES>::Q_vec (
+        &q_vecs)[PagedAttentionLayout<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
+                                      NUM_SIMD_LANES>::THREAD_GROUP_SIZE]
+                [PagedAttentionLayout<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
+                                      NUM_SIMD_LANES>::NUM_VECS_PER_THREAD],
+    threadgroup float *red_smem,
+    uint3 threadgroup_position_in_grid,
+    uint3 threadgroups_per_grid,
+    uint3 thread_position_in_threadgroup,
+    uint simd_tid,
+    uint simd_lid) {
+  constexpr int PAGE = KeysTokenMajor ? 32 : BLOCK_SIZE;
+  constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   const int partition_idx = threadgroup_position_in_grid.z;
   const int max_num_partitions = threadgroups_per_grid.z;
   const int thread_idx = thread_position_in_threadgroup.x;
-  constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const uint32_t context_len = context_lens[seq_idx];
-  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= context_len) {
+
+  int seq_idx;
+  int q_row_idx;
+  int effective_context_len;
+  if constexpr (IsVarlen) {
+    q_row_idx = threadgroup_position_in_grid.y;
+    seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_row_idx, num_seqs);
+    const int q_seq_start = cu_seqlens_q[seq_idx];
+    const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+    const int q_pos_in_seq = q_row_idx - q_seq_start;
+    effective_context_len =
+        int(context_lens[seq_idx]) - q_len + q_pos_in_seq + 1;
+    if (effective_context_len <= 0) {
+      return;
+    }
+  } else {
+    seq_idx = threadgroup_position_in_grid.y;
+    q_row_idx = seq_idx;
+    effective_context_len = int(context_lens[seq_idx]);
+  }
+  if (USE_PARTITIONING &&
+      partition_idx * PARTITION_SIZE >= effective_context_len) {
     // No work to do. Terminate the thread block.
     return;
   }
 
-  const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
+  const int num_context_blocks =
+      DIVIDE_ROUND_UP(effective_context_len, BLOCK_SIZE);
   const int num_blocks_per_partition =
       USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
@@ -761,7 +807,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   const int start_token_idx = start_block_idx * BLOCK_SIZE;
   const int end_token_idx =
-      MIN(start_token_idx + num_blocks * BLOCK_SIZE, context_len);
+      MIN(start_token_idx + num_blocks * BLOCK_SIZE, effective_context_len);
   const int num_tokens = end_token_idx - start_token_idx;
 
   constexpr int THREAD_GROUP_SIZE = MAX(NUM_SIMD_LANES / BLOCK_SIZE, 1);
@@ -779,19 +825,13 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int num_heads = threadgroups_per_grid.x;
   const int num_queries_per_kv = num_heads / num_kv_heads;
   const int kv_head_idx = head_idx / num_queries_per_kv;
-  // FORKED: Use template parameter instead of function constant
   const float alibi_slope = !USE_ALIBI ? 0.f : alibi_slopes[head_idx];
   // INT8 query codes carry their row's score scale (paged_query_codes).
   const float score_scale =
       is_char<CACHE_T>() && has_score_scales
-          ? score_scales[seq_idx * num_heads + head_idx]
+          ? score_scales[q_row_idx * num_heads + head_idx]
           : scale;
 
-  // A vector type to store a part of a key or a query.
-  // The vector size is configured in such a way that the threads in a thread
-  // group fetch or compute 16 bytes at a time. For example, if the size of a
-  // thread group is 4 and the data type is half, then the vector size is 16 /
-  // (4 * sizeof(half)) == 2.
   constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
   using K_vec = typename Vec<T, VEC_SIZE>::Type;
   using Q_vec = typename Vec<T, VEC_SIZE>::Type;
@@ -803,13 +843,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
   const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
 
-  // Load the query to registers.
-  // Each thread in a thread group has a different part of the query.
-  // For example, if the thread group size is 4, then the first thread in the
-  // group has 0, 4, 8, ... th vectors of the query, and the second thread has
-  // 1, 5, 9, ... th vectors of the query, and so on.
-  const device T *q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-  threadgroup Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
+  const device T *q_ptr = q + q_row_idx * q_stride + head_idx * HEAD_SIZE;
 #pragma unroll
   for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
        i += NUM_THREAD_GROUPS) {
@@ -821,120 +855,91 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
   // Use fp32 on softmax logits for better accuracy
   threadgroup float *logits = reinterpret_cast<threadgroup float *>(shared_mem);
-  // Workspace for reduction
-  threadgroup float red_smem[2 * NUM_WARPS];
 
-  // x == THREAD_GROUP_SIZE * VEC_SIZE
-  // Each thread group fetches x elements from the key at a time.
   constexpr int x = 16 / sizeof(CACHE_T);
   float qk_max = -FLT_MAX;
 
-  // Iterate over the key blocks.
-  // Each warp fetches a block of keys for each iteration.
-  // Each thread group in a warp fetches a key from the block, and computes
-  // dot product with the query.
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
-    // NOTE: The block number is stored in int32. However, we cast it to int64
-    // because int32 can lead to overflow when this variable is multiplied by
-    // large numbers (e.g., kv_block_stride).
-    const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
+    const int page_half = KeysTokenMajor ? (block_idx & 1) : 0;
+    const int64_t physical_block_number = static_cast<int64_t>(
+        KeysTokenMajor ? block_table[block_idx >> 1] : block_table[block_idx]);
 
-    // Load a key to registers.
-    // Each thread in a thread group has a different part of the key.
-    // For example, if the thread group size is 4, then the first thread in the
-    // group has 0, 4, 8, ... th vectors of the key, and the second thread has
-    // 1, 5, 9, ... th vectors of the key, and so on.
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
       const int physical_block_offset =
           (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
       K_vec k_vecs[NUM_VECS_PER_THREAD];
 
-#pragma unroll
-      for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+      if constexpr (KeysTokenMajor) {
         const device CACHE_T *k_ptr =
             k_cache + physical_block_number * kv_block_stride +
-            kv_head_idx * kv_head_stride + physical_block_offset * x;
-        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-        const int offset1 = (vec_idx * VEC_SIZE) / x;
-        const int offset2 = (vec_idx * VEC_SIZE) % x;
-
-        if constexpr (is_char<CACHE_T>()) {
+            kv_head_idx * kv_head_stride +
+            (page_half * BLOCK_SIZE + physical_block_offset) * HEAD_SIZE;
+#pragma unroll
+        for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+          const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+              k_ptr + vec_idx * VEC_SIZE);
           k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
-        } else {
-          k_vecs[j] = *reinterpret_cast<const device K_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+          const device CACHE_T *k_ptr =
+              k_cache + physical_block_number * kv_block_stride +
+              kv_head_idx * kv_head_stride + physical_block_offset * x;
+          const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+          const int offset1 = (vec_idx * VEC_SIZE) / x;
+          const int offset2 = (vec_idx * VEC_SIZE) % x;
+
+          if constexpr (is_char<CACHE_T>()) {
+            Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
+                k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+            k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
+          } else {
+            k_vecs[j] = *reinterpret_cast<const device K_vec *>(
+                k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          }
         }
       }
 
-      // Compute dot product.
-      // This includes a reduction across the threads in the same thread group.
       float qk;
       if constexpr (is_char<CACHE_T>()) {
         // Splash splash_attention_page_softmax: the key scale, then Scale.
         qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset],
                                                k_vecs);
         qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
-                          BLOCK_SIZE +
-                      physical_block_offset];
+                          PAGE +
+                      page_half * BLOCK_SIZE + physical_block_offset];
         qk *= score_scale;
       } else {
         qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                          q_vecs[thread_group_offset], k_vecs);
       }
 
-      // Apply softcapping
       if (softcapping != 1.0) {
         qk = precise::tanh(qk / softcapping) * softcapping;
       }
 
-      // FORKED: Use template parameter instead of function constant
-      // Add the ALiBi bias if slopes are given.
       if constexpr (USE_ALIBI) {
         if (alibi_slope != 0) {
-          // Compute bias with explicit float precision to minimize precision loss
-          int position_offset = token_idx - int(context_len) + 1;
+          int position_offset = token_idx - (effective_context_len - 1);
           float alibi_bias = alibi_slope * float(position_offset);
           qk += alibi_bias;
         }
       }
 
       if (thread_group_offset == 0) {
-        // Store the partial reductions to shared memory.
-        //
-        // Two distinct masks are applied here:
-        //
-        //   1. Upper-bound mask (`token_idx >= context_len`): kept at
-        //      logit=0 + V-zero (see the V loop below) for backward
-        //      compatibility with the original kernel. The V-vector for
-        //      positions past `context_len` may contain uninitialised
-        //      memory / NaN, so zero-V is the safe option.
-        //
-        //   2. Phase 7 sliding-window mask (`sliding_window > 0` and
-        //      `token_idx < context_len - sliding_window`): set
-        //      logit=-INFINITY so `exp(-inf - qk_max) == 0` and the
-        //      masked contribution drops out of softmax exactly. Unlike
-        //      out-of-context positions, sliding-window-evicted slots
-        //      hold valid initialised K/V from earlier real tokens — the
-        //      cleanest mask is at the softmax step, not via V-zeroing.
-        //
-        // With `sliding_window == 0` the lower bound collapses to 0 and
-        // only the upper-bound mask fires — identical behaviour to the
-        // pre-Phase-7 kernel.
         const int sw = sliding_window;
-        const uint32_t sliding_lower =
-            (sw > 0 && context_len > uint32_t(sw))
-                ? (context_len - uint32_t(sw))
-                : 0u;
-        const bool sliding_evicted =
-            sw > 0 && uint32_t(token_idx) < sliding_lower;
-        const bool out_of_context = token_idx >= context_len;
+        const int sliding_lower =
+            (sw > 0 && effective_context_len > sw)
+                ? (effective_context_len - sw)
+                : 0;
+        const bool sliding_evicted = sw > 0 && token_idx < sliding_lower;
+        const bool out_of_context = token_idx >= effective_context_len;
         float stored_logit;
         if (out_of_context) {
           stored_logit = 0.f;
@@ -944,16 +949,12 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           stored_logit = qk;
         }
         logits[token_idx - start_token_idx] = stored_logit;
-        // Update the max value (exclude masked positions of either kind).
         const bool any_mask = out_of_context || sliding_evicted;
         qk_max = any_mask ? qk_max : max(qk_max, qk);
       }
     }
   }
 
-  // Perform reduction across the threads in the same warp to get the
-  // max qk value for each "warp" (not across the thread block yet).
-  // The 0-th thread of each thread group already has its max qk value.
 #pragma unroll
   for (int mask = NUM_SIMD_LANES / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
     qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
@@ -963,16 +964,13 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Get the max qk value for the sequence.
   qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
     qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
   }
-  // Broadcast the max qk value to all threads.
   qk_max = simd_shuffle(qk_max, 0);
 
-  // Get the sum of the exp values.
   float exp_sum = 0.f;
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
     float val = exp(logits[i] - qk_max);
@@ -982,7 +980,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
                                                  simd_tid, simd_lid);
 
-  // Compute softmax.
   // Int8 keeps p unnormalized and divides once at the end (Splash
   // splash_attention_combine_splits).
   if constexpr (!is_char<CACHE_T>()) {
@@ -993,21 +990,17 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // FORKED: Removed redundant use_partitioning function constant check
-  // USE_PARTITIONING is already derived from PARTITION_SIZE > 0
-  // If partitioning is enabled, store the max logit and exp_sum.
   if (USE_PARTITIONING && thread_idx == 0) {
     device float *max_logits_ptr =
-        max_logits + seq_idx * num_heads * max_num_partitions +
+        max_logits + q_row_idx * num_heads * max_num_partitions +
         head_idx * max_num_partitions + partition_idx;
     *max_logits_ptr = qk_max;
     device float *exp_sums_ptr = exp_sums +
-                                 seq_idx * num_heads * max_num_partitions +
+                                 q_row_idx * num_heads * max_num_partitions +
                                  head_idx * max_num_partitions + partition_idx;
     *exp_sums_ptr = exp_sum;
   }
 
-  // Each thread will fetch 16 bytes from the value cache at a time.
   constexpr int V_VEC_SIZE = MIN(16 / sizeof(T), BLOCK_SIZE);
   using V_vec = typename Vec<T, V_VEC_SIZE>::Type;
   using L_vec = typename Vec<T, V_VEC_SIZE>::Type;
@@ -1019,7 +1012,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   constexpr int NUM_ROWS_PER_THREAD =
       DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER);
 
-  // NOTE: We use FP32 for the accumulator for better accuracy.
   float accs[NUM_ROWS_PER_THREAD];
 #pragma unroll
   for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
@@ -1029,11 +1021,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   T zero_value = 0;
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
-    // NOTE: The block number is stored in int32. However, we cast it to int64
-    // because int32 can lead to overflow when this variable is multiplied by
-    // large numbers (e.g., kv_block_stride).
-    const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
+    const int page_half = KeysTokenMajor ? (block_idx & 1) : 0;
+    const int64_t physical_block_number = static_cast<int64_t>(
+        KeysTokenMajor ? block_table[block_idx >> 1] : block_table[block_idx]);
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
@@ -1042,14 +1032,14 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     if constexpr (is_char<CACHE_T>()) {
       // Splash splash_attention_page_softmax: P = bf16(p * value scale), and
       // masked tokens stay exactly zero whatever their stored scale holds.
-      const int limit = int(context_len);
+      const int limit = effective_context_len;
       const int lower = (sliding_window > 0 && limit > sliding_window)
                             ? limit - sliding_window
                             : 0;
       const device float *value_scales =
           v_scale +
-          (physical_block_number * num_kv_heads + kv_head_idx) * BLOCK_SIZE +
-          physical_block_offset;
+          (physical_block_number * num_kv_heads + kv_head_idx) * PAGE +
+          page_half * BLOCK_SIZE + physical_block_offset;
       thread float *p = reinterpret_cast<thread float *>(&logits_float_vec);
 #pragma unroll
       for (int j = 0; j < V_VEC_SIZE; j++) {
@@ -1065,11 +1055,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE) {
-        const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
-        // NOTE: When v_vec contains the tokens that are out of the context,
-        // we should explicitly zero out the values since they may contain NaNs.
-        // See
-        // https://github.com/vllm-project/vllm/issues/641#issuecomment-1682544472
+        const int offset =
+            row_idx * PAGE + page_half * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec;
 
         if constexpr (is_char<CACHE_T>()) {
@@ -1084,8 +1071,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           thread T *v_vec_ptr = reinterpret_cast<thread T *>(&v_vec);
 #pragma unroll
           for (int j = 0; j < V_VEC_SIZE; j++) {
-            v_vec_ptr[j] =
-                token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
+            v_vec_ptr[j] = token_idx + j < effective_context_len
+                               ? v_vec_ptr[j]
+                               : zero_value;
           }
         }
         if constexpr (is_char<CACHE_T>()) {
@@ -1098,7 +1086,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     }
   }
 
-  // Perform reduction within each warp.
 #pragma unroll
   for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
     float acc = accs[i];
@@ -1109,17 +1096,13 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     accs[i] = acc;
   }
 
-  // NOTE: A barrier is required because the shared memory space for logits
-  // is reused for the output.
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Perform reduction across warps.
   threadgroup float *out_smem =
       reinterpret_cast<threadgroup float *>(shared_mem);
 #pragma unroll
   for (int i = NUM_WARPS; i > 1; i /= 2) {
     int mid = i / 2;
-    // Upper warps write to shared memory.
     if (warp_idx >= mid && warp_idx < i) {
       threadgroup float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
 #pragma unroll
@@ -1132,7 +1115,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Lower warps update the output.
     if (warp_idx < mid) {
       const threadgroup float *src = &out_smem[warp_idx * HEAD_SIZE];
 #pragma unroll
@@ -1146,11 +1128,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // Write the final output.
   if (warp_idx == 0) {
     using Out_T = typename PagedOut<T, CACHE_T, USE_PARTITIONING>::Type;
     device Out_T *out_ptr =
-        out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        out + q_row_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
@@ -1165,6 +1146,56 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
       }
     }
   }
+  (void)alibi_slopes;
+}
+
+template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0,
+          bool USE_ALIBI = false, bool KeysTokenMajor = false>
+[[kernel]] void paged_attention(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out
+    [[buffer(2)]],
+    device const T *q [[buffer(3)]],
+    device const CACHE_T *k_cache [[buffer(4)]],
+    device const CACHE_T *v_cache [[buffer(5)]],
+    const device float *__restrict__ k_scale [[buffer(6)]],
+    const device float *__restrict__ v_scale [[buffer(7)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes [[buffer(14)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const constant int &sliding_window [[buffer(18)]],
+    const device float *score_scales [[buffer(21)]],
+    const constant int &has_score_scales [[buffer(22)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using Layout =
+      PagedAttentionLayout<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, NUM_SIMD_LANES>;
+  threadgroup typename Layout::Q_vec
+      q_vecs[Layout::THREAD_GROUP_SIZE][Layout::NUM_VECS_PER_THREAD];
+  threadgroup float red_smem[2 * Layout::NUM_WARPS];
+  paged_attention_impl<T, CACHE_T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
+                       NUM_SIMD_LANES, PARTITION_SIZE, USE_ALIBI,
+                       /*IsVarlen=*/false, KeysTokenMajor>(
+      exp_sums, max_logits, out, q, k_cache, v_cache, k_scale, v_scale,
+      num_kv_heads, scale, softcapping, block_tables, context_lens,
+      max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
+      kv_head_stride, sliding_window, nullptr, 0, score_scales,
+      has_score_scales, shared_mem, q_vecs, red_smem,
+      threadgroup_position_in_grid, threadgroups_per_grid,
+      thread_position_in_threadgroup, simd_tid, simd_lid);
 }
 
 // ========================================== Grouped GQA paged attention
@@ -1607,37 +1638,53 @@ template [[host_name(
         uint simd_lid [[thread_index_in_simdgroup]]);
 
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
-          int PARTITION_SIZE = 0>
-[[kernel]] void paged_attention_v2_reduce(
-    device T *out [[buffer(0)]], const device float *exp_sums [[buffer(1)]],
-    const device float *max_logits [[buffer(2)]],
-    const device T *tmp_out [[buffer(3)]],
-    device uint32_t *context_lens [[buffer(4)]],
-    const constant int &max_num_partitions [[buffer(5)]],
-    threadgroup char *shared_mem [[threadgroup(0)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
-    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
-    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
-    uint simd_tid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+          int PARTITION_SIZE, bool IsVarlen>
+inline void paged_attention_v2_reduce_impl(
+    device T *out,
+    const device float *exp_sums,
+    const device float *max_logits,
+    const device T *tmp_out,
+    device uint32_t *context_lens,
+    const constant int &max_num_partitions,
+    device const int32_t *cu_seqlens_q,
+    const int num_seqs,
+    threadgroup char *shared_mem,
+    threadgroup float *red_smem,
+    uint3 threadgroup_position_in_grid,
+    uint3 threadgroups_per_grid,
+    uint3 thread_position_in_threadgroup,
+    uint3 threads_per_threadgroup,
+    uint simd_tid,
+    uint simd_lid) {
   const int num_heads = threadgroups_per_grid.x;
   const int head_idx = threadgroup_position_in_grid.x;
-  const int seq_idx = threadgroup_position_in_grid.y;
-  const uint32_t context_len = context_lens[seq_idx];
-  const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
+  const int row_idx = threadgroup_position_in_grid.y;
+  int effective_context_len;
+  if constexpr (IsVarlen) {
+    const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, row_idx, num_seqs);
+    const int q_seq_start = cu_seqlens_q[seq_idx];
+    const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+    const int q_pos_in_seq = row_idx - q_seq_start;
+    effective_context_len =
+        int(context_lens[seq_idx]) - q_len + q_pos_in_seq + 1;
+    if (effective_context_len <= 0) {
+      return;
+    }
+  } else {
+    effective_context_len = int(context_lens[row_idx]);
+  }
+  const int num_partitions =
+      DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
   if (num_partitions == 1) {
-    // No need to reduce. Only copy tmp_out to out.
     device T *out_ptr =
-        out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+        out + row_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
     const device T *tmp_out_ptr =
-        tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        tmp_out + row_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE;
     for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
          i += threads_per_threadgroup.x) {
       out_ptr[i] = tmp_out_ptr[i];
     }
-    // Terminate the thread block.
     return;
   }
 
@@ -1645,14 +1692,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int warp_idx = simd_tid;
   const int lane = simd_lid;
 
-  // Workspace for reduction.
-  threadgroup float red_smem[2 * NUM_WARPS];
-
-  // Load max logits to shared memory.
   threadgroup float *shared_max_logits =
       reinterpret_cast<threadgroup float *>(shared_mem);
   const device float *max_logits_ptr =
-      max_logits + seq_idx * num_heads * max_num_partitions +
+      max_logits + row_idx * num_heads * max_num_partitions +
       head_idx * max_num_partitions;
   float max_logit = -FLT_MAX;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
@@ -1663,8 +1706,6 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Get the global max logit.
-  // Reduce within the warp.
 #pragma unroll
   for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
     max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
@@ -1673,20 +1714,17 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     red_smem[warp_idx] = max_logit;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Reduce across warps.
   max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
     max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
   }
-  // Broadcast the max value to all threads.
   max_logit = simd_shuffle(max_logit, 0);
 
-  // Load rescaled exp sums to shared memory.
   threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
       shared_mem + sizeof(float) * num_partitions);
   const device float *exp_sums_ptr = exp_sums +
-                                     seq_idx * num_heads * max_num_partitions +
+                                     row_idx * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions;
   float global_exp_sum = 0.0f;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
@@ -1701,12 +1739,11 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
   const float inv_global_exp_sum = divide(1.0f, global_exp_sum + 1e-6f);
 
-  // Aggregate tmp_out to out.
   const device T *tmp_out_ptr =
-      tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+      tmp_out + row_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE;
   device T *out_ptr =
-      out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+      out + row_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
 #pragma unroll
   for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
        i += NUM_THREADS) {
@@ -1719,83 +1756,44 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
-// ========================================== Varlen Paged Attention kernel
-//
-// Phase 4a: multi-row paged attention for speculative decoding (MTP).
-//
-// The single-row kernel above launches one threadgroup per (head, seq_idx)
-// — every sequence contributes exactly one query token, so the global Q
-// layout is `[num_seqs, num_heads, head_size]`. With multi-token-prediction
-// the verify pass needs D+1 query tokens per sequence (one bonus token + D
-// draft tokens), so the existing kernel either has to be called D+1 times
-// (sequential round-trips, defeating the speedup) or be generalised to
-// accept ragged batches.
-//
-// This kernel keeps the proven single-row path untouched and provides a
-// SIBLING entrypoint that consumes a flat `[total_num_queries, num_heads,
-// head_size]` Q tensor plus a `cu_seqlens_q[num_seqs+1]` cumulative count.
-// One threadgroup per (head, q_token_idx); each threadgroup binary-searches
-// cu_seqlens_q to discover its source sequence so it can fetch the right
-// block_table row, context_len, and causal upper bound.
-//
-// Causal mask formula (matches MTPLX pagedattention.metal:867 exactly):
-//     q_len            = cu_seqlens_q[seq_idx+1] - cu_seqlens_q[seq_idx]
-//     q_pos_in_seq     = q_token_idx - cu_seqlens_q[seq_idx]
-//     effective_ctx    = context_len - q_len + q_pos_in_seq + 1
-//
-// Hand-traced example: 3 sequences with q_lens=[2,1,4] and
-// context_lens=[5,3,6] gives cu_seqlens_q=[0,2,3,7]. q_token_idx=1 (the
-// second token of seq 0) sees q_len=2, q_pos_in_seq=1, effective_ctx=5 — it
-// attends to all 5 KV positions. q_token_idx=3 (first draft of seq 2) sees
-// q_len=4, q_pos_in_seq=0, effective_ctx=3 — it attends only to the
-// 3-token prefix that existed before the draft window. This matches the
-// causal contract: a query token at logical position P can attend to KV
-// positions [0, P+1) and we model P as
-// (context_len - q_len + q_pos_in_seq).
-//
-// Special case: q_lens=[1,1,...,1] with cu_seqlens_q=[0,1,2,...,N] yields
-// q_len=1, q_pos_in_seq=0, effective_ctx=context_len for every threadgroup
-// — byte-identical to the single-row kernel. The single-seq T=1 parity
-// test relies on this property.
-
-// Binary search to find which sequence a global query token belongs to.
-//
-// In varlen attention, queries from multiple sequences are packed
-// contiguously into a flat array:
-//   q[0..q_len_0-1] -> seq 0, q[q_len_0..q_len_0+q_len_1-1] -> seq 1, ...
-// The kernel launches one threadgroup per (head, query_token) in a flat
-// grid. Each threadgroup needs to discover which sequence it belongs to so
-// it can look up the correct block_table row, context_len, and causal mask
-// boundary.
-//
-// cu_seqlens_q is sorted ascending: [0, q_len_0, q_len_0+q_len_1, ...].
-// Returns seq_idx such that
-//     cu_seqlens_q[seq_idx] <= q_token_idx < cu_seqlens_q[seq_idx+1].
-//
-// O(log num_seqs) — for our typical batch sizes (≤ 64) this is a couple of
-// iterations and dwarfs nothing in the kernel's QK/V loops.
-inline int find_seq_idx_varlen(const device int32_t *cu_seqlens_q,
-                                int q_token_idx, int num_seqs) {
-  int lo = 0, hi = num_seqs;
-  while (lo < hi) {
-    int mid = (lo + hi + 1) / 2;
-    if (cu_seqlens_q[mid] <= q_token_idx) {
-      lo = mid;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  return lo;
+template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
+          int PARTITION_SIZE = 0>
+[[kernel]] void paged_attention_v2_reduce(
+    device T *out [[buffer(0)]], const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device T *tmp_out [[buffer(3)]],
+    device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup float red_smem[2 * (NUM_THREADS / NUM_SIMD_LANES)];
+  paged_attention_v2_reduce_impl<T, HEAD_SIZE, NUM_THREADS, NUM_SIMD_LANES,
+                                 PARTITION_SIZE, /*IsVarlen=*/false>(
+      out, exp_sums, max_logits, tmp_out, context_lens, max_num_partitions,
+      nullptr, 0, shared_mem, red_smem, threadgroup_position_in_grid,
+      threadgroups_per_grid, thread_position_in_threadgroup,
+      threads_per_threadgroup, simd_tid, simd_lid);
 }
 
-template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
-          int NUM_SIMD_LANES, int PARTITION_SIZE = 0, bool USE_ALIBI = false>
+// ========================================== Varlen Paged Attention entrypoints
+//
+// Thin kernel wrappers delegating to `paged_attention_impl<..., IsVarlen=true>`
+// and `paged_attention_v2_reduce_impl<..., IsVarlen=true>` so Metal buffer
+// slot reflection matches the single-row and varlen ABIs exactly.
+
+template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0,
+          bool USE_ALIBI = false>
 [[kernel]] void paged_attention_varlen(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
     device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out
     [[buffer(2)]],
-    // Q is now ragged: [total_num_queries, num_heads, head_size].
     device const T *q [[buffer(3)]],
     device const CACHE_T *k_cache [[buffer(4)]],
     device const CACHE_T *v_cache [[buffer(5)]],
@@ -1812,7 +1810,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
     const constant int &sliding_window [[buffer(18)]],
-    device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
+    device const int32_t *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const device float *score_scales [[buffer(21)]],
     const constant int &has_score_scales [[buffer(22)]],
@@ -1822,406 +1820,23 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint simd_tid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // Varlen mapping: y-axis enumerates query tokens (not sequences).
-  // Binary-search to translate q_token_idx -> seq_idx so we can look up
-  // the right block_table row + context_len + causal bound.
-  const int q_token_idx = threadgroup_position_in_grid.y;
-  const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_token_idx, num_seqs);
-  const int q_seq_start = cu_seqlens_q[seq_idx];
-  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
-  const int q_pos_in_seq = q_token_idx - q_seq_start;
-  const int partition_idx = threadgroup_position_in_grid.z;
-  const int max_num_partitions = threadgroups_per_grid.z;
-  const int thread_idx = thread_position_in_threadgroup.x;
-  constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const uint32_t context_len = context_lens[seq_idx];
-
-  // Causal upper bound for this query token. See the header comment above
-  // for the derivation. Effective context can shrink below `context_len`
-  // (the bonus + draft tokens at the front of the verify window must NOT
-  // attend to the most recent KV slots — those slots correspond to
-  // future-in-time tokens for them).
-  const int effective_context_len =
-      (int)context_len - q_len + q_pos_in_seq + 1;
-  if (effective_context_len <= 0) {
-    // No KV tokens to attend to. The output buffer is zero-initialised by
-    // the caller, so leaving accs at zero produces 0 / softmax(0) = 0.
-    return;
-  }
-
-  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= effective_context_len) {
-    // This partition lies entirely past the causal cutoff for this query
-    // token. The reduce kernel ignores partitions past
-    // ceil(effective_context_len / PARTITION_SIZE), so we can safely bail
-    // without writing exp_sums / max_logits / tmp_out.
-    return;
-  }
-
-  const int num_context_blocks = DIVIDE_ROUND_UP(effective_context_len, BLOCK_SIZE);
-  const int num_blocks_per_partition =
-      USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
-
-  // [start_block_idx, end_block_idx) is the range of blocks to process.
-  const int start_block_idx =
-      USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
-  const int end_block_idx =
-      MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
-  const int num_blocks = end_block_idx - start_block_idx;
-
-  // [start_token_idx, end_token_idx) is the range of tokens to process.
-  // Clamp end_token_idx to effective_context_len (not context_len) so the
-  // tail block honours the causal cutoff.
-  const int start_token_idx = start_block_idx * BLOCK_SIZE;
-  const int end_token_idx =
-      MIN(start_token_idx + num_blocks * BLOCK_SIZE, effective_context_len);
-  const int num_tokens = end_token_idx - start_token_idx;
-
-  constexpr int THREAD_GROUP_SIZE = MAX(NUM_SIMD_LANES / BLOCK_SIZE, 1);
-  constexpr int NUM_THREAD_GROUPS =
-      NUM_THREADS / THREAD_GROUP_SIZE;
-  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
-  constexpr int NUM_TOKENS_PER_THREAD_GROUP =
-      DIVIDE_ROUND_UP(BLOCK_SIZE, NUM_SIMD_LANES);
-  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
-  const int warp_idx = simd_tid;
-  const int lane = simd_lid;
-
-  const int head_idx = threadgroup_position_in_grid.x;
-  const int num_heads = threadgroups_per_grid.x;
-  const int num_queries_per_kv = num_heads / num_kv_heads;
-  const int kv_head_idx = head_idx / num_queries_per_kv;
-  const float alibi_slope = !USE_ALIBI ? 0.f : alibi_slopes[head_idx];
-  // INT8 query codes carry their row's score scale (paged_query_codes).
-  const float score_scale =
-      is_char<CACHE_T>() && has_score_scales
-          ? score_scales[q_token_idx * num_heads + head_idx]
-          : scale;
-
-  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
-  using K_vec = typename Vec<T, VEC_SIZE>::Type;
-  using Q_vec = typename Vec<T, VEC_SIZE>::Type;
-  using Quant_vec = typename Vec<CACHE_T, VEC_SIZE>::Type;
-
-  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
-  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
-
-  const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
-  const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
-
-  // Q indexing: ragged layout uses q_token_idx (not seq_idx) as the row.
-  const device T *q_ptr = q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
-  threadgroup Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
-#pragma unroll
-  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
-       i += NUM_THREAD_GROUPS) {
-    const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
-    q_vecs[thread_group_offset][i] =
-        *reinterpret_cast<const device Q_vec *>(q_ptr + vec_idx * VEC_SIZE);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  threadgroup float *logits = reinterpret_cast<threadgroup float *>(shared_mem);
-  threadgroup float red_smem[2 * NUM_WARPS];
-
-  constexpr int x = 16 / sizeof(CACHE_T);
-  float qk_max = -FLT_MAX;
-
-  const device uint32_t *block_table =
-      block_tables + seq_idx * max_num_blocks_per_seq;
-  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
-       block_idx += NUM_WARPS) {
-    const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
-
-    for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-      const int physical_block_offset =
-          (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
-      const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD];
-
-#pragma unroll
-      for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const device CACHE_T *k_ptr =
-            k_cache + physical_block_number * kv_block_stride +
-            kv_head_idx * kv_head_stride + physical_block_offset * x;
-        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-        const int offset1 = (vec_idx * VEC_SIZE) / x;
-        const int offset2 = (vec_idx * VEC_SIZE) % x;
-
-        if constexpr (is_char<CACHE_T>()) {
-          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
-        } else {
-          k_vecs[j] = *reinterpret_cast<const device K_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-        }
-      }
-
-      float qk;
-      if constexpr (is_char<CACHE_T>()) {
-        // Splash splash_attention_page_softmax: the key scale, then Scale.
-        qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset],
-                                               k_vecs);
-        qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
-                          BLOCK_SIZE +
-                      physical_block_offset];
-        qk *= score_scale;
-      } else {
-        qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
-                         q_vecs[thread_group_offset], k_vecs);
-      }
-
-      if (softcapping != 1.0) {
-        qk = precise::tanh(qk / softcapping) * softcapping;
-      }
-
-      if constexpr (USE_ALIBI) {
-        if (alibi_slope != 0) {
-          // ALiBi bias is referenced to the query's own logical position
-          // within the full context (context_len - q_len + q_pos_in_seq),
-          // which equals effective_context_len - 1. This matches the
-          // single-row kernel for the T=1 case where
-          // effective_context_len == context_len.
-          int position_offset = token_idx - (effective_context_len - 1);
-          float alibi_bias = alibi_slope * float(position_offset);
-          qk += alibi_bias;
-        }
-      }
-
-      if (thread_group_offset == 0) {
-        // Two masks, same semantics as the single-row kernel:
-        //   1. Causal upper bound: token_idx >= effective_context_len ->
-        //      logit=0, V-zero. The single-row kernel masks against
-        //      context_len; varlen uses effective_context_len so draft
-        //      tokens that haven't been committed yet are excluded.
-        //   2. Sliding window (Phase 7): when sliding_window > 0 and
-        //      token_idx is older than effective_context_len - sw, mask
-        //      with -INFINITY so it drops out of softmax exactly.
-        const int sw = sliding_window;
-        const int sliding_lower =
-            (sw > 0 && effective_context_len > sw)
-                ? (effective_context_len - sw)
-                : 0;
-        const bool sliding_evicted =
-            sw > 0 && token_idx < sliding_lower;
-        const bool out_of_context = token_idx >= effective_context_len;
-        float stored_logit;
-        if (out_of_context) {
-          stored_logit = 0.f;
-        } else if (sliding_evicted) {
-          stored_logit = -INFINITY;
-        } else {
-          stored_logit = qk;
-        }
-        logits[token_idx - start_token_idx] = stored_logit;
-        const bool any_mask = out_of_context || sliding_evicted;
-        qk_max = any_mask ? qk_max : max(qk_max, qk);
-      }
-    }
-  }
-
-#pragma unroll
-  for (int mask = NUM_SIMD_LANES / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
-    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
-  }
-  if (lane == 0) {
-    red_smem[warp_idx] = qk_max;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
-#pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
-  }
-  qk_max = simd_shuffle(qk_max, 0);
-
-  float exp_sum = 0.f;
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    float val = exp(logits[i] - qk_max);
-    logits[i] = val;
-    exp_sum += val;
-  }
-  exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
-                                                 simd_tid, simd_lid);
-
-  // Int8 keeps p unnormalized and divides once at the end (Splash
-  // splash_attention_combine_splits).
-  if constexpr (!is_char<CACHE_T>()) {
-    const float inv_sum = divide(1.f, exp_sum + 1e-6f);
-    for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-      logits[i] *= inv_sum;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Partition output layout matches the single-row kernel: indexed by
-  // (q_token_idx, head_idx, partition_idx) rather than
-  // (seq_idx, head_idx, partition_idx). The reduce kernel below mirrors
-  // this — it iterates per query token, not per sequence.
-  if (USE_PARTITIONING && thread_idx == 0) {
-    device float *max_logits_ptr =
-        max_logits + q_token_idx * num_heads * max_num_partitions +
-        head_idx * max_num_partitions + partition_idx;
-    *max_logits_ptr = qk_max;
-    device float *exp_sums_ptr = exp_sums +
-                                 q_token_idx * num_heads * max_num_partitions +
-                                 head_idx * max_num_partitions + partition_idx;
-    *exp_sums_ptr = exp_sum;
-  }
-
-  constexpr int V_VEC_SIZE = MIN(16 / sizeof(T), BLOCK_SIZE);
-  using V_vec = typename Vec<T, V_VEC_SIZE>::Type;
-  using L_vec = typename Vec<T, V_VEC_SIZE>::Type;
-  using Float_L_vec = typename FloatVec<L_vec>::Type;
-  using V_quant_vec = typename Vec<CACHE_T, V_VEC_SIZE>::Type;
-
-  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
-  constexpr int NUM_ROWS_PER_ITER = NUM_SIMD_LANES / NUM_V_VECS_PER_ROW;
-  constexpr int NUM_ROWS_PER_THREAD =
-      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER);
-
-  float accs[NUM_ROWS_PER_THREAD];
-#pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-    accs[i] = 0.f;
-  }
-
-  T zero_value = 0;
-  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
-       block_idx += NUM_WARPS) {
-    const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
-    const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
-    const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-    L_vec logits_vec;
-    Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec *>(
-        logits + token_idx - start_token_idx);
-    if constexpr (is_char<CACHE_T>()) {
-      // Splash splash_attention_page_softmax: P = bf16(p * value scale), and
-      // masked tokens stay exactly zero whatever their stored scale holds.
-      const int limit = effective_context_len;
-      const int lower = (sliding_window > 0 && limit > sliding_window)
-                            ? limit - sliding_window
-                            : 0;
-      const device float *value_scales =
-          v_scale +
-          (physical_block_number * num_kv_heads + kv_head_idx) * BLOCK_SIZE +
-          physical_block_offset;
-      thread float *p = reinterpret_cast<thread float *>(&logits_float_vec);
-#pragma unroll
-      for (int j = 0; j < V_VEC_SIZE; j++) {
-        const bool valid = token_idx + j < limit && token_idx + j >= lower;
-        p[j] = valid ? p[j] * value_scales[j] : 0.0f;
-      }
-    }
-    from_float(logits_vec, logits_float_vec);
-
-    const device CACHE_T *v_ptr = v_cache + physical_block_number * kv_block_stride +
-                                  kv_head_idx * kv_head_stride;
-#pragma unroll
-    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-      if (row_idx < HEAD_SIZE) {
-        const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
-        V_vec v_vec;
-
-        if constexpr (is_char<CACHE_T>()) {
-          V_quant_vec v_quant_vec =
-              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
-          v_vec = char_to<V_vec, V_quant_vec>(v_quant_vec);
-        } else {
-          v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
-        }
-
-        // Zero V lanes past the causal cutoff in the tail block.
-        if (block_idx == num_context_blocks - 1) {
-          thread T *v_vec_ptr = reinterpret_cast<thread T *>(&v_vec);
-#pragma unroll
-          for (int j = 0; j < V_VEC_SIZE; j++) {
-            v_vec_ptr[j] =
-                token_idx + j < effective_context_len ? v_vec_ptr[j] : zero_value;
-          }
-        }
-        if constexpr (is_char<CACHE_T>()) {
-          // f32 products (Splash multiply_accumulate into a float tile).
-          accs[i] += dot<Float_L_vec>(logits_vec, v_vec);
-        } else {
-          accs[i] += dot(logits_vec, v_vec);
-        }
-      }
-    }
-  }
-
-#pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-    float acc = accs[i];
-#pragma unroll
-    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
-      acc += simd_shuffle_xor(acc, mask);
-    }
-    accs[i] = acc;
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  threadgroup float *out_smem =
-      reinterpret_cast<threadgroup float *>(shared_mem);
-#pragma unroll
-  for (int i = NUM_WARPS; i > 1; i /= 2) {
-    int mid = i / 2;
-    if (warp_idx >= mid && warp_idx < i) {
-      threadgroup float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
-#pragma unroll
-      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-          dst[row_idx] = accs[i];
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (warp_idx < mid) {
-      const threadgroup float *src = &out_smem[warp_idx * HEAD_SIZE];
-#pragma unroll
-      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-          accs[i] += src[row_idx];
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  // Output indexed by q_token_idx (not seq_idx).
-  if (warp_idx == 0) {
-    using Out_T = typename PagedOut<T, CACHE_T, USE_PARTITIONING>::Type;
-    device Out_T *out_ptr =
-        out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
-        head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
-#pragma unroll
-    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-      if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-        if constexpr (is_char<CACHE_T>() && !USE_PARTITIONING) {
-          *(out_ptr + row_idx) =
-              Out_T(exp_sum > 0.0f ? accs[i] / exp_sum : 0.0f);
-        } else {
-          *(out_ptr + row_idx) = Out_T(accs[i]);
-        }
-      }
-    }
-  }
+  using Layout =
+      PagedAttentionLayout<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, NUM_SIMD_LANES>;
+  threadgroup typename Layout::Q_vec
+      q_vecs[Layout::THREAD_GROUP_SIZE][Layout::NUM_VECS_PER_THREAD];
+  threadgroup float red_smem[2 * Layout::NUM_WARPS];
+  paged_attention_impl<T, CACHE_T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
+                       NUM_SIMD_LANES, PARTITION_SIZE, USE_ALIBI,
+                       /*IsVarlen=*/true, /*KeysTokenMajor=*/false>(
+      exp_sums, max_logits, out, q, k_cache, v_cache, k_scale, v_scale,
+      num_kv_heads, scale, softcapping, block_tables, context_lens,
+      max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
+      kv_head_stride, sliding_window, cu_seqlens_q, num_seqs, score_scales,
+      has_score_scales, shared_mem, q_vecs, red_smem,
+      threadgroup_position_in_grid, threadgroups_per_grid,
+      thread_position_in_threadgroup, simd_tid, simd_lid);
 }
 
-// V2 reduce kernel for varlen. The single-row reduce kernel keys partition
-// count off `context_lens[seq_idx]`, but in varlen mode each query token has
-// its own effective_context_len bound (a draft token sees less context than
-// the bonus token), so we must recompute it here using the same formula as
-// the main kernel.
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention_varlen_v2_reduce(
@@ -2240,104 +1855,14 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
     uint simd_tid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  const int num_heads = threadgroups_per_grid.x;
-  const int head_idx = threadgroup_position_in_grid.x;
-  // Varlen: y-axis enumerates query tokens, not sequences.
-  const int q_token_idx = threadgroup_position_in_grid.y;
-  const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_token_idx, num_seqs);
-  const int q_seq_start = cu_seqlens_q[seq_idx];
-  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
-  const int q_pos_in_seq = q_token_idx - q_seq_start;
-  const uint32_t context_len = context_lens[seq_idx];
-  const int effective_context_len =
-      (int)context_len - q_len + q_pos_in_seq + 1;
-  if (effective_context_len <= 0) {
-    // Output is zero-initialised by the caller. No reduction to do.
-    return;
-  }
-  const int num_partitions =
-      DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
-  if (num_partitions == 1) {
-    device T *out_ptr =
-        out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    const device T *tmp_out_ptr =
-        tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
-        head_idx * max_num_partitions * HEAD_SIZE;
-    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-         i += threads_per_threadgroup.x) {
-      out_ptr[i] = tmp_out_ptr[i];
-    }
-    return;
-  }
-
-  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
-  const int warp_idx = simd_tid;
-  const int lane = simd_lid;
-
-  threadgroup float red_smem[2 * NUM_WARPS];
-
-  threadgroup float *shared_max_logits =
-      reinterpret_cast<threadgroup float *>(shared_mem);
-  const device float *max_logits_ptr =
-      max_logits + q_token_idx * num_heads * max_num_partitions +
-      head_idx * max_num_partitions;
-  float max_logit = -FLT_MAX;
-  for (int i = thread_position_in_threadgroup.x; i < num_partitions;
-       i += threads_per_threadgroup.x) {
-    const float l = max_logits_ptr[i];
-    shared_max_logits[i] = l;
-    max_logit = max(max_logit, l);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-#pragma unroll
-  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
-    max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
-  }
-  if (lane == 0) {
-    red_smem[warp_idx] = max_logit;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
-#pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
-  }
-  max_logit = simd_shuffle(max_logit, 0);
-
-  threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
-      shared_mem + sizeof(float) * num_partitions);
-  const device float *exp_sums_ptr = exp_sums +
-                                     q_token_idx * num_heads * max_num_partitions +
-                                     head_idx * max_num_partitions;
-  float global_exp_sum = 0.0f;
-  for (int i = thread_position_in_threadgroup.x; i < num_partitions;
-       i += threads_per_threadgroup.x) {
-    float l = shared_max_logits[i];
-    float rescaled_exp_sum = exp_sums_ptr[i] * exp(l - max_logit);
-    global_exp_sum += rescaled_exp_sum;
-    shared_exp_sums[i] = rescaled_exp_sum;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  global_exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(
-      &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
-  const float inv_global_exp_sum = divide(1.0f, global_exp_sum + 1e-6f);
-
-  const device T *tmp_out_ptr =
-      tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
-      head_idx * max_num_partitions * HEAD_SIZE;
-  device T *out_ptr =
-      out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-#pragma unroll
-  for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-       i += NUM_THREADS) {
-    float acc = 0.0f;
-    for (int j = 0; j < num_partitions; ++j) {
-      acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
-             inv_global_exp_sum;
-    }
-    out_ptr[i] = T(acc);
-  }
+  threadgroup float red_smem[2 * (NUM_THREADS / NUM_SIMD_LANES)];
+  paged_attention_v2_reduce_impl<T, HEAD_SIZE, NUM_THREADS, NUM_SIMD_LANES,
+                                 PARTITION_SIZE, /*IsVarlen=*/true>(
+      out, exp_sums, max_logits, tmp_out, context_lens, max_num_partitions,
+      cu_seqlens_q, num_seqs, shared_mem, red_smem,
+      threadgroup_position_in_grid, threadgroups_per_grid,
+      thread_position_in_threadgroup, threads_per_threadgroup, simd_tid,
+      simd_lid);
 }
 
 // FORKED: Updated macro to include USE_ALIBI template parameter
@@ -2350,7 +1875,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
                        "_nsl" #num_simd_lanes                                  \
                        "_ps" #partition_size alibi_suffix)]] [[kernel]] void   \
   paged_attention<type, cache_type, head_size, block_size, num_threads,        \
-                  num_simd_lanes, partition_size, use_alibi>(                  \
+                  num_simd_lanes, partition_size, use_alibi, false>(           \
       device float *exp_sums [[buffer(0)]],                                   \
       device float *max_logits [[buffer(1)]],                                 \
       device type *out [[buffer(2)]], device const type *q [[buffer(3)]],      \
@@ -2753,8 +2278,9 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
 // over an int8 pool: one SIMD per (query row, query head), two lanes per
 // token, each lane half the head in 16-byte packs. Each stripe walks one
 // contiguous page range (Splash splash_attention_pages_per_split) and
-// writes an f32 numerator with its {max, sum}.
-template <int HEAD_SIZE>
+// writes an f32 numerator with its {max, sum}. Under KeysTokenMajor, each
+// 16-token logical block is half `b & 1` of 32-token page `b >> 1`.
+template <int HEAD_SIZE, bool KeysTokenMajor = false>
 [[kernel]] void paged_attention_grouped_int8_bs16_striped(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
@@ -2783,6 +2309,7 @@ template <int HEAD_SIZE>
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BLOCK_SIZE = 16;
+  constexpr int PAGE = KeysTokenMajor ? 32 : BLOCK_SIZE;
   constexpr int PACKS_PER_HALF_HEAD = HEAD_SIZE / 16 / 2;
   constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
 
@@ -2837,20 +2364,29 @@ template <int HEAD_SIZE>
     if (block_start_token + BLOCK_SIZE <= sliding_lower) {
       continue;
     }
-    const int64_t physical_block =
-        static_cast<int64_t>(block_table[logical_block]);
+    const int page_half = KeysTokenMajor ? (logical_block & 1) : 0;
+    const int64_t physical_block = static_cast<int64_t>(
+        KeysTokenMajor ? block_table[logical_block >> 1]
+                       : block_table[logical_block]);
     const int64_t scale_base =
-        (physical_block * num_kv_heads + kv_head_idx) * BLOCK_SIZE;
+        (physical_block * num_kv_heads + kv_head_idx) * PAGE +
+        page_half * BLOCK_SIZE;
     const device char *k_block = k_cache +
         physical_block * int64_t(kv_block_stride) +
         kv_head_idx * kv_head_stride;
+    const device char *k_token =
+        KeysTokenMajor
+            ? k_block + (page_half * BLOCK_SIZE + token_in_block) * HEAD_SIZE
+            : nullptr;
     float partial = 0.0f;
 #pragma unroll
     for (int pack = 0; pack < PACKS_PER_HALF_HEAD; ++pack) {
       const int head_pack = half_head * PACKS_PER_HALF_HEAD + pack;
       const device bfloat16_t *q_pack = q_ptr + head_pack * 16;
       const device char *k_pack =
-          k_block + (head_pack * BLOCK_SIZE + token_in_block) * 16;
+          KeysTokenMajor
+              ? k_token + head_pack * 16
+              : k_block + (head_pack * BLOCK_SIZE + token_in_block) * 16;
       const Char8_ k0 = *reinterpret_cast<const device Char8_ *>(k_pack);
       const Char8_ k1 = *reinterpret_cast<const device Char8_ *>(k_pack + 8);
       partial += sum(mul<Float8_, Bfloat8_, Bfloat8_>(
@@ -2908,7 +2444,7 @@ template <int HEAD_SIZE>
 #pragma unroll
     for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
       const int dim = lane * OUTPUTS_PER_LANE + i;
-      const device char *v_row = v_block + dim * BLOCK_SIZE;
+      const device char *v_row = v_block + dim * PAGE + page_half * BLOCK_SIZE;
       const Char8_ v0 = *reinterpret_cast<const device Char8_ *>(v_row);
       const Char8_ v1 = *reinterpret_cast<const device Char8_ *>(v_row + 8);
       const Bfloat8_ values0 = char_to<Bfloat8_, Char8_>(v0);
@@ -2968,7 +2504,7 @@ template <int HEAD_SIZE>
   template [[host_name("paged_attention_bfloat16_t_cache_char_hs" #head_size  \
                        "_bs" #block_size "_nt256_nsl32_ps" #partition_size)]] \
   [[kernel]] void paged_attention<bfloat16_t, char, head_size, block_size,    \
-                                  256, 32, partition_size, false>(            \
+                                  256, 32, partition_size, false, false>(     \
       device float *exp_sums [[buffer(0)]],                                   \
       device float *max_logits [[buffer(1)]],                                 \
       device out_type *out [[buffer(2)]],                                     \
@@ -3073,34 +2609,41 @@ template <int HEAD_SIZE>
 instantiate_paged_attention_int8_heads(128);
 instantiate_paged_attention_int8_heads(256);
 
-template [[host_name("paged_attention_grouped_int8_hs256_bs16_striped")]]
-[[kernel]] void paged_attention_grouped_int8_bs16_striped<256>(
-    device float *exp_sums [[buffer(0)]],
-    device float *max_logits [[buffer(1)]],
-    device float *tmp_out [[buffer(2)]],
-    device const bfloat16_t *q [[buffer(3)]],
-    device const char *k_cache [[buffer(4)]],
-    device const char *v_cache [[buffer(5)]],
-    const device float *__restrict__ k_scale [[buffer(6)]],
-    const device float *__restrict__ v_scale [[buffer(7)]],
-    const constant int &num_kv_heads [[buffer(8)]],
-    const constant float &scale [[buffer(9)]],
-    const constant float &softcapping [[buffer(10)]],
-    device const uint32_t *block_tables [[buffer(11)]],
-    device const uint32_t *context_lens [[buffer(12)]],
-    const constant int &max_num_blocks_per_seq [[buffer(13)]],
-    device const float *alibi_slopes [[buffer(14)]],
-    const constant int &q_stride [[buffer(15)]],
-    const constant int &kv_block_stride [[buffer(16)]],
-    const constant int &kv_head_stride [[buffer(17)]],
-    const constant int &sliding_window [[buffer(18)]],
-    const device float *score_scales [[buffer(21)]],
-    const constant int &has_score_scales [[buffer(22)]],
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
-    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
-    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
-    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]);
+#define instantiate_grouped_int8_striped(name, ktm)                           \
+  template [[host_name(name)]] [[kernel]] void                                \
+  paged_attention_grouped_int8_bs16_striped<256, ktm>(                        \
+      device float *exp_sums [[buffer(0)]],                                   \
+      device float *max_logits [[buffer(1)]],                                 \
+      device float *tmp_out [[buffer(2)]],                                    \
+      device const bfloat16_t *q [[buffer(3)]],                               \
+      device const char *k_cache [[buffer(4)]],                               \
+      device const char *v_cache [[buffer(5)]],                               \
+      const device float *__restrict__ k_scale [[buffer(6)]],                 \
+      const device float *__restrict__ v_scale [[buffer(7)]],                 \
+      const constant int &num_kv_heads [[buffer(8)]],                         \
+      const constant float &scale [[buffer(9)]],                              \
+      const constant float &softcapping [[buffer(10)]],                       \
+      device const uint32_t *block_tables [[buffer(11)]],                     \
+      device const uint32_t *context_lens [[buffer(12)]],                     \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],              \
+      device const float *alibi_slopes [[buffer(14)]],                        \
+      const constant int &q_stride [[buffer(15)]],                            \
+      const constant int &kv_block_stride [[buffer(16)]],                     \
+      const constant int &kv_head_stride [[buffer(17)]],                      \
+      const constant int &sliding_window [[buffer(18)]],                      \
+      const device float *score_scales [[buffer(21)]],                        \
+      const constant int &has_score_scales [[buffer(22)]],                    \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]],                                 \
+      uint3 threads_per_threadgroup [[threads_per_threadgroup]],              \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_grouped_int8_striped(
+    "paged_attention_grouped_int8_hs256_bs16_striped", false);
+instantiate_grouped_int8_striped(
+    "paged_attention_grouped_int8_hs256_striped_ktm", true);
 
 template [[host_name("paged_attention_grouped_int8_hs256_striped_reduce")]]
 [[kernel]] void paged_attention_grouped_int8_striped_reduce<256>(
@@ -3114,5 +2657,44 @@ template [[host_name("paged_attention_grouped_int8_hs256_striped_reduce")]]
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]]);
-#include "paged_attention_ktm.h"
+
+#define instantiate_paged_attention_ktm(name, out_type, partition_size)       \
+  template [[host_name(name)]] [[kernel]] void                                \
+  paged_attention<bfloat16_t, char, 256, 16, 256, 32, partition_size, false,  \
+                  true>(                                                      \
+      device float *exp_sums [[buffer(0)]],                                   \
+      device float *max_logits [[buffer(1)]],                                 \
+      device out_type *out [[buffer(2)]],                                     \
+      device const bfloat16_t *q [[buffer(3)]],                               \
+      device const char *k_cache [[buffer(4)]],                               \
+      device const char *v_cache [[buffer(5)]],                               \
+      const device float *__restrict__ k_scale [[buffer(6)]],                 \
+      const device float *__restrict__ v_scale [[buffer(7)]],                 \
+      const constant int &num_kv_heads [[buffer(8)]],                         \
+      const constant float &scale [[buffer(9)]],                              \
+      const constant float &softcapping [[buffer(10)]],                       \
+      device const uint32_t *block_tables [[buffer(11)]],                     \
+      device const uint32_t *context_lens [[buffer(12)]],                     \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],              \
+      device const float *alibi_slopes [[buffer(14)]],                        \
+      const constant int &q_stride [[buffer(15)]],                            \
+      const constant int &kv_block_stride [[buffer(16)]],                     \
+      const constant int &kv_head_stride [[buffer(17)]],                      \
+      const constant int &sliding_window [[buffer(18)]],                      \
+      const device float *score_scales [[buffer(21)]],                        \
+      const constant int &has_score_scales [[buffer(22)]],                    \
+      threadgroup char *shared_mem [[threadgroup(0)]],                        \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]],                                 \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_paged_attention_ktm(
+    "paged_attention_bfloat16_t_cache_char_hs256_nt256_nsl32_ps0_ktm",
+    bfloat16_t, 0);
+instantiate_paged_attention_ktm(
+    "paged_attention_bfloat16_t_cache_char_hs256_nt256_nsl32_ps512_ktm",
+    float, 512);
 #include "paged_attention_inkling2.h"

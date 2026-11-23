@@ -1218,6 +1218,42 @@ bool validate_and_append_quant_args(
 }
 #endif
 
+const std::vector<std::string>& kernel_names() {
+  static const std::vector<std::string> names = {
+      "inkling2_moe_m1_gate_up_situ_nvfp4",
+      "inkling2_moe_m1_gate_up_situ_q8",
+      "inkling2_moe_m1_gate_up_situ_mxfp8",
+      "inkling2_moe_m1_gate_up_situ_q5k",
+      "inkling2_moe_m1_down_combine_nvfp4",
+      "inkling2_moe_m1_down_combine_sconv_nvfp4",
+      "inkling2_moe_m1_down_combine_q8",
+      "inkling2_moe_m1_down_combine_sconv_q8",
+      "inkling2_moe_m1_down_combine_mxfp8",
+      "inkling2_moe_m1_down_combine_sconv_mxfp8",
+      "inkling2_moe_group",
+      "inkling2_moe_route_group_small",
+      "inkling2_moe_gather",
+      "inkling2_moe_simd_gate_up_situ_nvfp4",
+      "inkling2_moe_simd_gate_up_situ_q8",
+      "inkling2_moe_simd_gate_up_situ_mxfp8",
+      "inkling2_moe_simd_gate_up_situ_q5k",
+      "inkling2_moe_simd_down_nvfp4",
+      "inkling2_moe_simd_down_q8",
+      "inkling2_moe_simd_down_mxfp8",
+      "inkling2_moe_gate_up_situ_nax_nvfp4_8",
+      "inkling2_moe_gate_up_situ_nax_nvfp4_32",
+      "inkling2_moe_gate_up_situ_nax_q8_8",
+      "inkling2_moe_gate_up_situ_nax_q8_32",
+      "inkling2_moe_down_nax_nvfp4_8",
+      "inkling2_moe_down_nax_nvfp4_32",
+      "inkling2_moe_down_nax_q8_8",
+      "inkling2_moe_down_nax_q8_32",
+      "inkling2_moe_grouped_combine_bf16",
+      "inkling2_moe_grouped_combine_sconv_bf16",
+  };
+  return names;
+}
+
 } // namespace mlx::core::inkling2_moe
 
 extern "C" {

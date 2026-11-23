@@ -272,6 +272,7 @@ mod verify_route_timing {
             0,
             &s.taps,
             &s.blobs,
+            None,
             WINDOW,
         );
         PLANES_ROUTE_OFF.with(|off| off.set(false));
@@ -418,12 +419,14 @@ mod verify_route_timing {
             let mut outs = Vec::new();
             let planned = |p: Option<&AttachedPlanes>| p.is_some();
             for layer in &inner.layers {
-                if let MLPVariant::Quantized {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    gate_up,
-                } = &layer.mlp
+                if let crate::models::qwen3_5::decoder_layer::MLPType::Dense(
+                    MLPVariant::Quantized {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                        gate_up,
+                    },
+                ) = &layer.mlp
                 {
                     if let Some(pair) = gate_up
                         && planned(pair.0.planes())

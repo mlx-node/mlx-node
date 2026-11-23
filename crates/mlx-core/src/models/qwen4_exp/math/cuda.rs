@@ -184,21 +184,6 @@ pub(in crate::models::qwen4_exp) fn cuda_moe_prefill(
     crate::kernels::qwen4::moe_prefill_cuda(x, &ids, &scores_f32, &routed, shared)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn gdn_prepare(
-    qkv: &MxArray,
-    a: &MxArray,
-    b: &MxArray,
-    conv: &MxArray,
-    old: &MxArray,
-    scale: &MxArray,
-    dt: &MxArray,
-) -> Result<Option<[MxArray; 6]>> {
-    // qwen4 semantics: L2-style norm (`mean_eps = false`) and FP32 `beta`
-    // (`beta_input_dtype = false`), matching `math::l2` + `math::gdn_gates`.
-    crate::kernels::gdn::prepare(qkv, a, b, conv, old, scale, dt, false, false)
-}
-
 pub(super) fn rope_fast(
     x: &MxArray,
     position: usize,

@@ -2858,6 +2858,7 @@ pub(crate) fn run_paged_verify_step(
         cached_rope_deltas,
         &[],
         None,
+        None,
         false,
         false,
         VerifySubmit::Decode,
@@ -2942,6 +2943,7 @@ pub(crate) fn run_paged_dflash2_verify_step(
     cached_rope_deltas: i32,
     tap_layers: &[usize],
     gdn: &super::gdn_blob::GdnStateBlobs,
+    row_budget: Option<&MxArray>,
     context_window: u32,
 ) -> Result<(MxArray, Vec<MxArray>)> {
     require_verify_chunk(verify_ids.rows(), paged_adapter, context_window)?;
@@ -2958,6 +2960,7 @@ pub(crate) fn run_paged_dflash2_verify_step(
         cached_rope_deltas,
         tap_layers,
         Some(gdn),
+        row_budget,
         false,
         true,
         dflash2_verify_submit(VerifySubmit::EveryLayer),
@@ -2996,6 +2999,7 @@ pub(crate) fn run_recorded_dflash2_verify_step(
         cached_rope_deltas,
         tap_layers,
         Some(gdn),
+        None,
         true,
         true,
         dflash2_verify_submit(VerifySubmit::EveryLayer),
@@ -3017,6 +3021,7 @@ fn paged_verify_core(
     cached_rope_deltas: i32,
     tap_layers: &[usize],
     gdn: Option<&super::gdn_blob::GdnStateBlobs>,
+    row_budget: Option<&MxArray>,
     recorded: bool,
     planes_route: bool,
     submit: VerifySubmit,
@@ -3130,6 +3135,7 @@ fn paged_verify_core(
                         Some(&mut detached),
                         Some(&mut slot),
                         rope_position_offset,
+                        row_budget,
                     )?
                 } else {
                     layer.forward_paged_or_flat_with_tape(
@@ -3141,6 +3147,7 @@ fn paged_verify_core(
                         Some(&mut detached),
                         Some(&mut slot),
                         rope_position_offset,
+                        row_budget,
                     )?
                 };
                 let written = detached.as_arrays_cache_mut().ok_or_else(|| {
@@ -3157,6 +3164,7 @@ fn paged_verify_core(
                 Some(cache_slot),
                 Some(&mut slot),
                 rope_position_offset,
+                row_budget,
             )?,
             _ => layer.forward_paged_or_flat_with_tape(
                 &hidden_states,
@@ -3167,6 +3175,7 @@ fn paged_verify_core(
                 Some(cache_slot),
                 Some(&mut slot),
                 rope_position_offset,
+                row_budget,
             )?,
         };
         tape[layer_idx] = slot;

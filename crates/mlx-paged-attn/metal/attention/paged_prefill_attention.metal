@@ -241,8 +241,11 @@ inline float paged_prefill_query_codes(device const bfloat *queries,
 // scores (fp32, or the int32 products of INT8 queries) times score_scale.
 // An INT8 lane's eight tokens lie in one pool block; a block past the tile's
 // visible tokens is never looked up in the table, its lanes read the page's
-// first block's scales and the select masks them.
-template <uint Group, uint Rows, uint HeadDim, bool Quantized, typename Score>
+// first block's scales and the select masks them. Under KeysTokenMajor, a page
+// is one 32-token block and `key_scales` / `value_scales` already point to the
+// page's 32 scales.
+template <uint Group, uint Rows, uint HeadDim, bool Quantized, typename Score,
+          bool KeysTokenMajor = false>
 inline void paged_prefill_page_softmax(
     threadgroup const Score *scores, float score_scale,
     threadgroup bfloat *probabilities,
@@ -269,7 +272,10 @@ inline void paged_prefill_page_softmax(
   const uint token = token_start + column;
   device const float4 *key_scales4 = nullptr;
   device const float4 *value_scales4 = nullptr;
-  if constexpr (Quantized) {
+  if constexpr (KeysTokenMajor) {
+    key_scales4 = reinterpret_cast<device const float4 *>(key_scales + column);
+    value_scales4 = reinterpret_cast<device const float4 *>(value_scales + column);
+  } else if constexpr (Quantized) {
     const uint block_size = params.block_size;
     uint logical = token / block_size;
     if (logical >= visible_blocks)
@@ -346,10 +352,13 @@ inline void paged_prefill_page_softmax(
 // Splash splash_paged_attention_tile over the pool: one tile (or part) over
 // its split's pages. Only the blocks holding the tile's visible tokens are
 // looked up and read; the K stage of a page's unread block is zero and its
-// half of PV is skipped (its probabilities are zero). With Int8Queries the
-// query codes live in the threadgroup's own partials slot, which it writes
-// only after its last page.
-template <uint Group, uint Rows, uint HeadDim, typename CacheElement, bool Int8Queries>
+// half of PV is skipped (its probabilities are zero). Under KeysTokenMajor,
+// a page is one 32-token pool block and K/V are read directly in place without
+// threadgroup staging (`keys` is unused/null). With Int8Queries the query
+// codes live in the threadgroup's own partials slot, which it writes only
+// after its last page.
+template <uint Group, uint Rows, uint HeadDim, typename CacheElement,
+          bool Int8Queries, bool KeysTokenMajor = false>
 inline void paged_prefill_page_loop(
     device bfloat *tile_queries, device const int *table,
     device CacheElement *key_pool, device CacheElement *value_pool,
@@ -365,13 +374,21 @@ inline void paged_prefill_page_loop(
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = PAGED_PREFILL_PAGE_TOKENS;
   constexpr ushort Half = PAGED_PREFILL_HALF_TOKENS;
+  constexpr ushort PvK = KeysTokenMajor ? N : Half;
   constexpr ushort D = HeadDim;
   constexpr uint X = 16 / sizeof(CacheElement);
   constexpr uint Chunks = D / X;
+  static_assert(!KeysTokenMajor || Quantized, "KTM prefill requires INT8 cache");
+  if constexpr (KeysTokenMajor) {
+    // A page that is not one pool block would read another page's rows.
+    if (params.block_size != N)
+      return;
+  }
   const uint block_size = params.block_size;
   const uint kv_heads = params.kv_heads;
   const uint visible_tokens = committed_tokens + active_rows;
-  const uint visible_blocks = (visible_tokens + block_size - 1) / block_size;
+  const uint visible_blocks =
+      KeysTokenMajor ? 0u : (visible_tokens + block_size - 1) / block_size;
   const uint pages = paged_prefill_pages(visible_tokens);
   const uint per_split = paged_prefill_pages_per_split(pages, splits);
   const uint page_begin = split * per_split;
@@ -402,18 +419,17 @@ inline void paged_prefill_page_loop(
   auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
-  auto kt = tensor(keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-  auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
-                           dextents<int, 2>{Half, D}, array<int, 2>{1, int(block_size)});
+  auto value_type = tensor(
+      static_cast<device CacheElement *>(nullptr), dextents<int, 2>{PvK, D},
+      array<int, 2>{1, KeysTokenMajor ? int(N) : int(block_size)});
   auto q0 = qt.template slice<D, M>(0, 0);
-  auto k0 = kt.template slice<D, N>(0, 0);
-  auto p0 = pt.template slice<Half, M>(0, 0);
-  auto v0 = value_type.template slice<Half, D>(0, 0);
+  auto p0 = pt.template slice<PvK, M>(0, 0);
+  auto v0 = value_type.template slice<PvK, D>(0, 0);
   constexpr auto qk_descriptor =
       matmul2d_descriptor(M, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
   constexpr auto pv_descriptor =
-      matmul2d_descriptor(M, D, Half, false, true, true,
+      matmul2d_descriptor(M, D, PvK, false, true, true,
                           matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
@@ -427,38 +443,55 @@ inline void paged_prefill_page_loop(
       running[index] = 0.0f;
   }
 
-  const uint blocks_per_page = N / block_size;
-  const uint vectors = Chunks * block_size;
-  threadgroup uint4 *staged = reinterpret_cast<threadgroup uint4 *>(keys);
   for (uint page = page_begin; page < page_end; ++page) {
     const uint token_start = page * N;
-    // Stage the page's keys token-major: a block's (chunk, token) vectors are
-    // contiguous in the pool, vector v = chunk * block_size + token.
-    for (uint j = 0; j < blocks_per_page; ++j) {
-      const uint logical = page * blocks_per_page + j;
-      if (logical < visible_blocks) {
-        device const uint4 *source = reinterpret_cast<device const uint4 *>(
-            key_pool + (ulong(uint(table[logical])) * kv_heads + kv_head) * D * block_size);
-        for (uint v = thread_index; v < vectors; v += PAGED_PREFILL_THREADS)
-          staged[(j * block_size + v % block_size) * Chunks + v / block_size] = source[v];
-      } else {
-        for (uint v = thread_index; v < vectors; v += PAGED_PREFILL_THREADS)
-          staged[(j * block_size + v % block_size) * Chunks + v / block_size] = uint4(0);
+    ulong ktm_first = 0;
+    if constexpr (KeysTokenMajor) {
+      ktm_first = (ulong(uint(table[page])) * kv_heads + kv_head) * N;
+      auto kt = tensor(key_pool + ktm_first * D, dextents<int, 2>{D, N},
+                       array<int, 2>{1, D});
+      auto ks = kt.template slice<D, N>(0, 0);
+      auto page_scores = qk.template get_destination_cooperative_tensor<
+          decltype(q0), decltype(ks), Score>();
+      qk.run(q0, ks, page_scores);
+      page_scores.store(st.template slice<N, M>(0, 0));
+    } else {
+      const uint blocks_per_page = N / block_size;
+      const uint vectors = Chunks * block_size;
+      threadgroup uint4 *staged = reinterpret_cast<threadgroup uint4 *>(keys);
+      // Stage the page's keys token-major: a block's (chunk, token) vectors are
+      // contiguous in the pool, vector v = chunk * block_size + token.
+      for (uint j = 0; j < blocks_per_page; ++j) {
+        const uint logical = page * blocks_per_page + j;
+        if (logical < visible_blocks) {
+          device const uint4 *source = reinterpret_cast<device const uint4 *>(
+              key_pool + (ulong(uint(table[logical])) * kv_heads + kv_head) * D * block_size);
+          for (uint v = thread_index; v < vectors; v += PAGED_PREFILL_THREADS)
+            staged[(j * block_size + v % block_size) * Chunks + v / block_size] = source[v];
+        } else {
+          for (uint v = thread_index; v < vectors; v += PAGED_PREFILL_THREADS)
+            staged[(j * block_size + v % block_size) * Chunks + v / block_size] = uint4(0);
+        }
       }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto page_scores = qk.template get_destination_cooperative_tensor<
-        decltype(q0), decltype(k0), Score>();
-    qk.run(q0, k0, page_scores);
-    page_scores.store(st.template slice<N, M>(0, 0));
+      auto kt = tensor(keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+      auto k0 = kt.template slice<D, N>(0, 0);
+      auto page_scores = qk.template get_destination_cooperative_tensor<
+          decltype(q0), decltype(k0), Score>();
+      qk.run(q0, k0, page_scores);
+      page_scores.store(st.template slice<N, M>(0, 0));
+    }
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score>(
+    paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score,
+                               KeysTokenMajor>(
         page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale,
         rescale, table,
-        key_scales, value_scales, params, kv_head, token_start, visible_tokens,
+        KeysTokenMajor ? (key_scales + ktm_first) : key_scales,
+        KeysTokenMajor ? (value_scales + ktm_first) : value_scales,
+        params, kv_head, token_start, visible_tokens,
         visible_blocks, committed_tokens, active_rows, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
@@ -470,18 +503,25 @@ inline void paged_prefill_page_loop(
         running[index] *= previous_scale[coordinates[1]];
       }
     }
-    for (uint step = 0; step < N / Half; ++step) {
-      const uint first = token_start + step * Half;
-      const uint logical = first / block_size;
-      if (logical >= visible_blocks)
-        continue;
-      device CacheElement *values =
-          value_pool + (ulong(uint(table[logical])) * kv_heads + kv_head) * D * block_size +
-          first % block_size;
-      auto vt = tensor(values, dextents<int, 2>{Half, D}, array<int, 2>{1, int(block_size)});
-      auto vs = vt.template slice<Half, D>(0, 0);
-      auto ps = pt.template slice<Half, M>(step * Half, 0);
-      pv.run(ps, vs, running);
+    if constexpr (KeysTokenMajor) {
+      auto vt = tensor(value_pool + ktm_first * D, dextents<int, 2>{N, D},
+                       array<int, 2>{1, int(N)});
+      auto vs = vt.template slice<N, D>(0, 0);
+      pv.run(p0, vs, running);
+    } else {
+      for (uint step = 0; step < N / Half; ++step) {
+        const uint first = token_start + step * Half;
+        const uint logical = first / block_size;
+        if (logical >= visible_blocks)
+          continue;
+        device CacheElement *values =
+            value_pool + (ulong(uint(table[logical])) * kv_heads + kv_head) * D * block_size +
+            first % block_size;
+        auto vt = tensor(values, dextents<int, 2>{Half, D}, array<int, 2>{1, int(block_size)});
+        auto vs = vt.template slice<Half, D>(0, 0);
+        auto ps = pt.template slice<Half, M>(step * Half, 0);
+        pv.run(ps, vs, running);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -496,7 +536,8 @@ inline void paged_prefill_page_loop(
 
 // Splash splash_prefill_attention_split_phase: KV heads (and each one's
 // tile parts) vary first, then query tiles, then history splits.
-template <uint Group, uint HeadDim, typename CacheElement, bool Int8Queries>
+template <uint Group, uint HeadDim, typename CacheElement, bool Int8Queries,
+          bool KeysTokenMajor = false>
 inline void paged_prefill_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const int *table, device CacheElement *key_pool,
@@ -515,7 +556,7 @@ inline void paged_prefill_split_phase(
   if (!tile.active || split >= tile.splits)
     return;
   paged_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS / Parts, HeadDim, CacheElement,
-                          Int8Queries>(
+                          Int8Queries, KeysTokenMajor>(
       queries + tile.offset, table, key_pool, value_pool, key_scales, value_scales,
       params, kv_head, tile.first_position, tile.active_rows, tile.splits, split,
       partials, statistics, tile.first_slot + split, scores, probabilities, keys,
@@ -718,5 +759,38 @@ inline void paged_query_codes_lane(device const bfloat *queries,
 
 PAGED_QUERY_CODES(128)
 PAGED_QUERY_CODES(256)
-#include "paged_prefill_attention_ktm.h"
+
+// Keys-token-major split kernels: no threadgroup `keys[]` allocation because
+// K and V are read directly in place from the 32-token pool page.
+#define PAGED_PREFILL_KTM_SPLIT(Name, Group, HeadDim, Int8Queries)             \
+  [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const int *table [[buffer(3)]],                                   \
+      device int8_t *key_pool [[buffer(4)]],                                   \
+      device int8_t *value_pool [[buffer(5)]],                                 \
+      device const float *key_scales [[buffer(6)]],                            \
+      device const float *value_scales [[buffer(7)]],                          \
+      constant PagedPrefillParams &params [[buffer(8)]],                       \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS /                       \
+                       paged_prefill_tile_parts(Group);                        \
+    constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;                              \
+    alignas(16) threadgroup float scores[M * N];                               \
+    alignas(16) threadgroup bfloat probabilities[M * N];                       \
+    threadgroup float row_max[M];                                              \
+    threadgroup float row_sum[M];                                              \
+    threadgroup float previous_scale[M];                                       \
+    threadgroup atomic_uint rescale;                                           \
+    paged_prefill_split_phase<Group, HeadDim, int8_t, Int8Queries, true>(      \
+        queries, partials, statistics, table, key_pool, value_pool,            \
+        key_scales, value_scales, params, scores, probabilities,               \
+        static_cast<threadgroup int8_t *>(nullptr), row_max, row_sum,          \
+        previous_scale, &rescale, group, thread_index);                        \
+  }
+
+PAGED_PREFILL_KTM_SPLIT(paged_prefill_attention_q8_split_g6_d256_ktm, 6, 256, false)
+PAGED_PREFILL_KTM_SPLIT(paged_prefill_attention_q8q_split_g6_d256_ktm, 6, 256, true)
 #include "paged_prefill_attention_inkling2.h"

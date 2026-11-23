@@ -23,8 +23,8 @@ use super::test_support::{
 };
 use super::weights::Dense;
 use crate::array::{DType, MxArray};
+use crate::engine::mtp_decode::MtpCommitAnchor;
 use crate::engine::types::ChatConfig;
-use crate::models::qwen3_5::mtp_decode::MtpCommitAnchor;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
 fn info(t: &Value) -> GgufTensorInfo {

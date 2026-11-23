@@ -90,6 +90,8 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        self.want_paged_mtp_prompt_hidden = false;
+        self.pending_prompt_hidden = None;
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.dflash2_prefix
@@ -382,10 +384,9 @@ impl ChatBackend for Qwen35Inner {
 
 impl Qwen35Inner {
     fn paged_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Both SYNC and STREAMING turns take the paged core. The paged
-        // cores self-handle MTP via the `eager_mtp_paged` arm
-        // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
-        // the streaming eager-MTP path.
+        // Both SYNC and STREAMING turns take the generic paged engine
+        // (`engine::paged_turn::run_paged_turn`), with external DFlash2 routing
+        // through `run_paged_dspark_turn`.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
         if matches!(
@@ -411,33 +412,29 @@ impl Qwen35Inner {
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                self.vision_paged_turn_stream_core(
+                self.vision_paged_turn_core(
                     tokens,
                     args.media.images,
                     tokenizer,
                     args.eos_id,
                     p,
                     report_perf,
-                    &cb,
-                    cancelled,
+                    Some((&cb, cancelled)),
                     args.thinking,
                     args.config,
-                )?;
-                Ok(TurnOutput::Streamed)
+                )
             }
-            _ => {
-                let result = self.vision_paged_turn_sync_core(
-                    tokens,
-                    args.media.images,
-                    tokenizer,
-                    args.eos_id,
-                    p,
-                    report_perf,
-                    args.thinking,
-                    args.config,
-                )?;
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
+            _ => self.vision_paged_turn_core(
+                tokens,
+                args.media.images,
+                tokenizer,
+                args.eos_id,
+                p,
+                report_perf,
+                None,
+                args.thinking,
+                args.config,
+            ),
         }
     }
 }

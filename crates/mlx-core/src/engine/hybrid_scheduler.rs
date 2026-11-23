@@ -774,6 +774,250 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     }
 }
 
+/// Extract the [`ChatConfig`] carried by a chat turn command, or `None` for
+/// cache-management commands (`ResetCaches`, `ReleaseCacheOwner`).
+pub(crate) fn chat_cmd_config(command: &ChatCmd) -> Option<&ChatConfig> {
+    match command {
+        ChatCmd::SessionStart { config, .. }
+        | ChatCmd::SessionContinue { config, .. }
+        | ChatCmd::SessionContinueTool { config, .. }
+        | ChatCmd::StreamSessionStart { config, .. }
+        | ChatCmd::StreamSessionContinue { config, .. }
+        | ChatCmd::StreamSessionContinueTool { config, .. } => Some(config),
+        ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => None,
+    }
+}
+
+/// Extract a non-empty `cache_owner_id` from a chat turn command.
+pub(crate) fn chat_cmd_owner_id(command: &ChatCmd) -> Option<&str> {
+    chat_cmd_config(command)
+        .and_then(|config| config.cache_owner_id.as_deref())
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether `command` starts a fresh chat session (sync or streaming).
+pub(crate) fn chat_cmd_is_session_start(command: &ChatCmd) -> bool {
+    matches!(
+        command,
+        ChatCmd::SessionStart { .. } | ChatCmd::StreamSessionStart { .. }
+    )
+}
+
+/// Send an error reply for any [`ChatCmd`] variant, honoring cancellation via
+/// [`ScheduledReply::send_error`] for chat turn commands.
+pub(crate) fn chat_cmd_send_error(command: ChatCmd, error: Error) {
+    match command {
+        ChatCmd::SessionStart {
+            reply, cancelled, ..
+        }
+        | ChatCmd::SessionContinue {
+            reply, cancelled, ..
+        }
+        | ChatCmd::SessionContinueTool {
+            reply, cancelled, ..
+        } => ScheduledReply::Sync(reply).send_error(error, cancelled.as_ref()),
+        ChatCmd::StreamSessionStart {
+            stream_tx,
+            cancelled,
+            ..
+        }
+        | ChatCmd::StreamSessionContinue {
+            stream_tx,
+            cancelled,
+            ..
+        }
+        | ChatCmd::StreamSessionContinueTool {
+            stream_tx,
+            cancelled,
+            ..
+        } => ScheduledReply::Stream(stream_tx).send_error(error, cancelled.as_ref()),
+        ChatCmd::ResetCaches { reply } => {
+            let _ = reply.send(Err(error));
+        }
+        ChatCmd::ReleaseCacheOwner { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
+/// Look up or allocate a [`SeqId`] for `owner_id` in `owners.owner_sequences`.
+pub(crate) fn get_or_alloc_owner_seq<S>(
+    owners: &mut SchedulerOwnerContext<'_, S>,
+    owner_id: &str,
+) -> SeqId {
+    if let Some(&seq_id) = owners.owner_sequences.get(owner_id) {
+        return seq_id;
+    }
+    let seq_id = *owners.next_seq_id;
+    *owners.next_seq_id = owners.next_seq_id.saturating_add(1);
+    owners.owner_sequences.insert(owner_id.to_owned(), seq_id);
+    seq_id
+}
+
+/// Shared contract for dual-lane (flat vs. paged) `execute_chat_barrier`
+/// routers (Gemma4, Muse-Glimmer, Inkling2).
+pub(crate) trait DualLaneChatBarrier: HybridSchedulerBackend {
+    /// Error message when a continuation attempts to switch a live owner
+    /// between flat and paged cache layouts, or `None` if the backend cannot
+    /// switch lanes dynamically.
+    const LAYOUT_CONFLICT_ERROR: Option<&'static str> = None;
+
+    /// Prepare backend state before running a `ChatCmd::ResetCaches` barrier.
+    fn prepare_reset_barrier(&mut self);
+
+    /// Whether `command` runs on the flat-cache lane rather than the paged lane.
+    fn command_uses_flat_lane(&self, command: &ChatCmd) -> bool;
+
+    /// Prepare backend state before running an ownerless barrier command.
+    fn prepare_ownerless_barrier(&mut self, flat_lane: bool);
+
+    /// Optional cleanup after an ownerless barrier command completes.
+    fn finish_ownerless_barrier(&mut self, _flat_lane: bool) {}
+
+    /// Whether a saved `OwnerState` represents a live flat-lane owner.
+    fn owner_has_flat_state(state: &Self::OwnerState) -> bool;
+
+    /// Install an owner's flat-lane state prior to `handle_chat_cmd`.
+    fn install_flat_owner_state(&mut self, state: Self::OwnerState);
+
+    /// Capture (and drain from `self`) an owner's flat-lane state after
+    /// `handle_chat_cmd`. Called unconditionally so failed turns do not leave
+    /// stale flat caches installed on `self`.
+    fn capture_flat_owner_state(&mut self) -> Self::OwnerState;
+
+    /// Install an owner's paged-lane state and active `seq_id` prior to
+    /// `handle_chat_cmd`.
+    fn install_paged_owner_state(&mut self, seq_id: SeqId, state: Self::OwnerState);
+
+    /// Capture an owner's paged-lane metadata after a live `handle_chat_cmd`.
+    fn capture_paged_owner_state(&mut self) -> Self::OwnerState;
+
+    /// Optional cleanup when a paged-lane barrier command finishes without a
+    /// live session (e.g. Inkling2 releases the orphaned scheduled cache slot).
+    fn release_dead_paged_owner(&mut self, _seq_id: SeqId) {}
+}
+
+/// Pattern 1 barrier router: dual-lane (flat vs. paged) owner isolation with
+/// session-start cleanup, continuation layout validation, and ownerless
+/// fallback.
+pub(crate) fn execute_dual_lane_chat_barrier<B: DualLaneChatBarrier>(
+    backend: &mut B,
+    command: ChatCmd,
+    mut owners: SchedulerOwnerContext<'_, B::OwnerState>,
+) {
+    if matches!(&command, ChatCmd::ResetCaches { .. }) {
+        backend.prepare_reset_barrier();
+        handle_chat_cmd(backend, command);
+        return;
+    }
+    let flat_lane = backend.command_uses_flat_lane(&command);
+    let Some(owner_id) = chat_cmd_owner_id(&command).map(str::to_owned) else {
+        backend.prepare_ownerless_barrier(flat_lane);
+        handle_chat_cmd(backend, command);
+        backend.finish_ownerless_barrier(flat_lane);
+        return;
+    };
+    if chat_cmd_is_session_start(&command) {
+        let seq_id = owners.owner_sequences.get(&owner_id).copied();
+        if let Err(error) =
+            backend.release_owner_resources(seq_id, owners.owner_states.get(&owner_id))
+        {
+            chat_cmd_send_error(command, error);
+            return;
+        }
+        owners.owner_sequences.remove(&owner_id);
+        owners.owner_states.remove(&owner_id);
+    } else {
+        let state = owners.owner_states.get(&owner_id);
+        let has_seq = owners.owner_sequences.contains_key(&owner_id);
+        let has_flat = state.is_some_and(B::owner_has_flat_state);
+        let matching_lane = if flat_lane {
+            has_flat
+        } else {
+            has_seq && !has_flat
+        };
+        if !matching_lane {
+            let conflicting = if flat_lane { has_seq } else { has_flat };
+            let message = match (conflicting, B::LAYOUT_CONFLICT_ERROR) {
+                (true, Some(conflict)) => conflict,
+                _ => {
+                    "chat session continuation requires an initialized cache owner (call chatSessionStart first)"
+                }
+            };
+            chat_cmd_send_error(command, Error::from_reason(message));
+            return;
+        }
+    }
+    let state = owners.owner_states.remove(&owner_id).unwrap_or_default();
+    if flat_lane {
+        backend.install_flat_owner_state(state);
+        handle_chat_cmd(backend, command);
+        let live = crate::engine::backend::ChatBackend::has_live_session(backend);
+        let saved = backend.capture_flat_owner_state();
+        if live {
+            owners.owner_states.insert(owner_id, saved);
+        } else {
+            owners.owner_sequences.remove(&owner_id);
+        }
+    } else {
+        let seq_id = get_or_alloc_owner_seq(&mut owners, &owner_id);
+        backend.install_paged_owner_state(seq_id, state);
+        handle_chat_cmd(backend, command);
+        if crate::engine::backend::ChatBackend::has_live_session(backend) {
+            let saved = backend.capture_paged_owner_state();
+            owners.owner_states.insert(owner_id, saved);
+        } else {
+            backend.release_dead_paged_owner(seq_id);
+            owners.owner_sequences.remove(&owner_id);
+        }
+    }
+}
+
+/// Pattern 2 barrier router: exclusive-owner sequence activation where every
+/// chat command (including ownerless / `""` mapped via `.unwrap_or_default()`)
+/// activates a `SeqId` in the owner tables, while `ResetCaches` and
+/// `ReleaseCacheOwner` bypass owner routing directly to `handle_chat_cmd`.
+pub(crate) fn execute_exclusive_owner_barrier<B>(
+    backend: &mut B,
+    command: ChatCmd,
+    mut owners: SchedulerOwnerContext<'_, Vec<u32>>,
+    activate: impl FnOnce(&mut B, SeqId) -> Result<()>,
+    saved_history: impl FnOnce(&B) -> Vec<u32>,
+    park: impl FnOnce(&mut B),
+) where
+    B: HybridSchedulerBackend<OwnerState = Vec<u32>>,
+{
+    let Some(owner) =
+        chat_cmd_config(&command).map(|config| config.cache_owner_id.clone().unwrap_or_default())
+    else {
+        handle_chat_cmd(backend, command);
+        return;
+    };
+    let seq = get_or_alloc_owner_seq(&mut owners, &owner);
+    if let Err(error) = activate(backend, seq) {
+        chat_cmd_send_error(command, error);
+        owners.owner_sequences.remove(&owner);
+        owners.owner_states.remove(&owner);
+        return;
+    }
+    handle_chat_cmd(backend, command);
+    let saved = saved_history(backend);
+    if saved.is_empty() {
+        // Admission/media failures can return before run_paged_turn's abort
+        // hook. Empty rows have no reusable frontier and must not occupy an
+        // owner slot (including successful requests with reuse disabled).
+        if let Some(adapter) = backend.paged_adapter_mut() {
+            let _ = adapter.release_request_for(seq);
+        }
+        backend.release_scheduled_recurrent_for(seq);
+        owners.owner_sequences.remove(&owner);
+        owners.owner_states.remove(&owner);
+    } else {
+        owners.owner_states.insert(owner, saved);
+        park(backend);
+    }
+}
+
 /// Engine-owned scheduler policy. Model families declare execution/cache
 /// capabilities; they do not proxy global scheduling configuration.
 fn configured_scheduler_capacity(physical_capacity: usize) -> usize {

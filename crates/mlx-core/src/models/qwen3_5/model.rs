@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Instant;
@@ -37,8 +37,10 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::record_decode_wave;
 
 use crate::engine;
+#[cfg(test)]
+use crate::engine::extract_chat_params;
 use crate::engine::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
+    apply_all_penalties, compute_performance_metrics, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::qwen3_5::config::Qwen3_5Config;
@@ -104,13 +106,11 @@ use self::forward::{
 use self::mtp::DenseMtpStepper;
 pub(crate) use self::mtp::Qwen35Decode;
 use self::paged_backend::{Qwen35PrefixState, StreamSender};
-#[cfg(test)]
-use self::state::configure_paged_mtp_profiler;
 use self::state::{
     DenseGdnCheckpointStoreTrace, DenseGdnHistoryCheckpoint, DenseGdnPrefixCheckpoint,
-    DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder, begin_paged_mtp_profiler,
-    clone_dense_linear_layer_caches, dense_paged_frontier_skew, dense_paged_linear_caches_ready,
-    fresh_dense_layer_caches, qwen35_dense_media_plan, qwen35_dense_session_media,
+    DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder, clone_dense_linear_layer_caches,
+    dense_paged_frontier_skew, dense_paged_linear_caches_ready, fresh_dense_layer_caches,
+    qwen35_dense_media_plan, qwen35_dense_session_media,
     qwen35_dense_session_media_matches_payloads,
 };
 pub(crate) use self::state::{
@@ -139,9 +139,6 @@ pub(crate) fn qwen35_max_concurrent_sequences(paged_active: bool, lanes: u32) ->
 // `Qwen35Inner::new`; MoE imports it from `crate::engine::compiled_lock`
 // directly.
 pub(crate) use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
-
-#[cfg(test)]
-mod paged_mtp_profiler_tests;
 
 #[cfg(test)]
 mod paged_context_capacity_tests;
@@ -356,6 +353,17 @@ pub(crate) struct Qwen35Inner {
     /// re-probes (the aggregate resets to zero) so a later easier turn
     /// can re-enable speculation.
     mtp_gated_turns: u32,
+    /// One-shot hint set before `engine::paged_turn::run_paged_turn` when the
+    /// turn plans native paged MTP. Consumed by `PagedBackend::paged_prefill`
+    /// so a cold prefill (`effective_cached_prefix_len == 0`) retains the
+    /// post-`final_norm` prompt hidden states for `begin_mtp_decode`'s
+    /// committed-history prompt seed.
+    pub(crate) want_paged_mtp_prompt_hidden: bool,
+    /// Stashed `(prompt_hidden, prompt_hidden_ids)` captured during
+    /// `PagedBackend::paged_prefill` for `run_paged_speculative_decode`.
+    /// Cleared on speculative admission refusal, turn finalization, abort, and
+    /// cache reset so stale hidden tensors never outlive one turn.
+    pub(crate) pending_prompt_hidden: Option<(MxArray, Vec<u32>)>,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -531,7 +539,7 @@ impl Qwen3_5ContextLimits {
 
 // Shared chat types live in the model-neutral engine module; import them for
 // internal use (no re-export — consumers import from `crate::engine::types`).
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///

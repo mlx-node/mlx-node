@@ -18,7 +18,9 @@ using namespace metal;
 // ValuesTokenMajor (the `_vt` instances): key_cache and value_cache are both
 // [num_blocks, num_heads, block_size, HeadDim] (Splash
 // `splash_kv_key_element`; `splash_kv_value_index` under `ValuesTokenMajor`).
-template <uint HeadDim, bool ValuesTokenMajor>
+// KeysTokenMajor (the `_ktm` instances): K rows token-major as `_vt`, V rows
+// dimension-major as default (Splash dense `kv::Layout`).
+template <uint HeadDim, bool ValuesTokenMajor, bool KeysTokenMajor = false>
 [[kernel]] void reshape_and_cache_int8(
     const device bfloat16_t *__restrict__ key [[buffer(0)]],
     const device bfloat16_t *__restrict__ value [[buffer(1)]],
@@ -79,33 +81,35 @@ template <uint HeadDim, bool ValuesTokenMajor>
       maximum == 0.0f ? 0 : clamp(int(rint(value_f * 127.0f / maximum)), -127, 127);
 
   const ulong scale_index = block_head * ulong(block_size) + page_token;
-  if (ValuesTokenMajor) {
-    device char *cache = value_tensor ? value_cache : key_cache;
-    cache[scale_index * HeadDim + dimension] = char(quantized);
-    if (dimension == 0) {
-      (value_tensor ? value_scales : key_scales)[scale_index] = scale;
+  if (value_tensor) {
+    if constexpr (ValuesTokenMajor) {
+      value_cache[scale_index * HeadDim + dimension] = char(quantized);
+    } else {
+      value_cache[(block_head * HeadDim + dimension) * ulong(block_size) + page_token] =
+          char(quantized);
     }
-  } else if (value_tensor) {
-    value_cache[(block_head * HeadDim + dimension) * ulong(block_size) + page_token] =
-        char(quantized);
     if (dimension == 0) {
       value_scales[scale_index] = scale;
     }
   } else {
-    key_cache[((block_head * (HeadDim / 16) + dimension / 16) * ulong(block_size) +
-               page_token) *
-                  16 +
-              dimension % 16] = char(quantized);
+    if constexpr (ValuesTokenMajor || KeysTokenMajor) {
+      key_cache[scale_index * HeadDim + dimension] = char(quantized);
+    } else {
+      key_cache[((block_head * (HeadDim / 16) + dimension / 16) * ulong(block_size) +
+                 page_token) *
+                    16 +
+                dimension % 16] = char(quantized);
+    }
     if (dimension == 0) {
       key_scales[scale_index] = scale;
     }
   }
 }
 
-#define instantiate_reshape_and_cache_int8(head_dim, vt, suffix)              \
+#define instantiate_reshape_and_cache_int8(head_dim, vt, ktm, suffix)         \
   template [[host_name("reshape_and_cache_int8_kv_bfloat16_t_hd" #head_dim     \
                        suffix)]]                                               \
-  [[kernel]] void reshape_and_cache_int8<head_dim, vt>(                        \
+  [[kernel]] void reshape_and_cache_int8<head_dim, vt, ktm>(                   \
       const device bfloat16_t *__restrict__ key [[buffer(0)]],                 \
       const device bfloat16_t *__restrict__ value [[buffer(1)]],               \
       device char *__restrict__ key_cache [[buffer(2)]],                       \
@@ -123,8 +127,9 @@ template <uint HeadDim, bool ValuesTokenMajor>
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]);
 
-instantiate_reshape_and_cache_int8(128, false, "");
-instantiate_reshape_and_cache_int8(256, false, "");
-instantiate_reshape_and_cache_int8(128, true, "_vt");
-instantiate_reshape_and_cache_int8(256, true, "_vt");
-#include "kv_int8_store_ktm.h"
+instantiate_reshape_and_cache_int8(128, false, false, "");
+instantiate_reshape_and_cache_int8(256, false, false, "");
+instantiate_reshape_and_cache_int8(128, true, false, "_vt");
+instantiate_reshape_and_cache_int8(256, true, false, "_vt");
+instantiate_reshape_and_cache_int8(128, false, true, "_ktm");
+instantiate_reshape_and_cache_int8(256, false, true, "_ktm");

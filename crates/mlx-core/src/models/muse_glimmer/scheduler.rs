@@ -2,14 +2,13 @@ use napi::bindgen_prelude::{Error, Result};
 
 use super::{MuseGlimmerInner, MusePrefixState};
 use crate::array::MxArray;
-use crate::engine::backend::ChatBackend;
-use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+use crate::engine::cmd::ChatCmd;
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
-    ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
+    DualLaneChatBarrier, HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor,
+    NoRestoreTicket, ScheduledPrefixAdmission, SchedulerOwnerContext, chat_cmd_config,
+    execute_dual_lane_chat_barrier,
 };
 use crate::engine::scheduler::PreemptionMode;
-use crate::engine::types::ChatConfig;
 use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -24,66 +23,6 @@ pub(crate) struct MuseOwnerState {
 
 pub(crate) type MuseSchedulerState = HybridSchedulerState<MuseGlimmerInner>;
 
-fn chat_config(command: &ChatCmd) -> Option<&ChatConfig> {
-    match command {
-        ChatCmd::SessionStart { config, .. }
-        | ChatCmd::SessionContinue { config, .. }
-        | ChatCmd::SessionContinueTool { config, .. }
-        | ChatCmd::StreamSessionStart { config, .. }
-        | ChatCmd::StreamSessionContinue { config, .. }
-        | ChatCmd::StreamSessionContinueTool { config, .. } => Some(config),
-        ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => None,
-    }
-}
-
-fn owner_id(command: &ChatCmd) -> Option<&str> {
-    chat_config(command)
-        .and_then(|config| config.cache_owner_id.as_deref())
-        .filter(|owner| !owner.is_empty())
-}
-
-fn is_start(command: &ChatCmd) -> bool {
-    matches!(
-        command,
-        ChatCmd::SessionStart { .. } | ChatCmd::StreamSessionStart { .. }
-    )
-}
-
-fn send_error(command: ChatCmd, error: Error) {
-    match command {
-        ChatCmd::SessionStart {
-            reply, cancelled, ..
-        }
-        | ChatCmd::SessionContinue {
-            reply, cancelled, ..
-        }
-        | ChatCmd::SessionContinueTool {
-            reply, cancelled, ..
-        } => ScheduledReply::Sync(reply).send_error(error, cancelled.as_ref()),
-        ChatCmd::StreamSessionStart {
-            stream_tx,
-            cancelled,
-            ..
-        }
-        | ChatCmd::StreamSessionContinue {
-            stream_tx,
-            cancelled,
-            ..
-        }
-        | ChatCmd::StreamSessionContinueTool {
-            stream_tx,
-            cancelled,
-            ..
-        } => ScheduledReply::Stream(stream_tx).send_error(error, cancelled.as_ref()),
-        ChatCmd::ResetCaches { reply } => {
-            let _ = reply.send(Err(error));
-        }
-        ChatCmd::ReleaseCacheOwner { reply, .. } => {
-            let _ = reply.send(Err(error));
-        }
-    }
-}
-
 impl MuseGlimmerInner {
     /// Which physical cache layout a command needs before the model-neutral
     /// planner runs. Only a loaded DFlash drafter needs the flat target
@@ -93,7 +32,56 @@ impl MuseGlimmerInner {
     pub(crate) fn requires_flat_lane(&self, command: &ChatCmd) -> bool {
         self.paged.is_none()
             || (self.dflash.is_some()
-                && chat_config(command).is_some_and(|config| config.enable_mtp == Some(true)))
+                && chat_cmd_config(command).is_some_and(|config| config.enable_mtp == Some(true)))
+    }
+}
+
+impl DualLaneChatBarrier for MuseGlimmerInner {
+    const LAYOUT_CONFLICT_ERROR: Option<&'static str> = Some(
+        "Muse-Glimmer cannot switch a live cache owner between paged AR and flat DFlash layouts; start a new session",
+    );
+
+    fn prepare_reset_barrier(&mut self) {
+        self.select_ownerless_lane(self.paged.is_none());
+    }
+
+    fn command_uses_flat_lane(&self, command: &ChatCmd) -> bool {
+        self.requires_flat_lane(command)
+    }
+
+    fn prepare_ownerless_barrier(&mut self, flat_lane: bool) {
+        self.select_ownerless_lane(flat_lane);
+    }
+
+    fn owner_has_flat_state(state: &Self::OwnerState) -> bool {
+        state.flat_caches.is_some()
+    }
+
+    fn install_flat_owner_state(&mut self, state: Self::OwnerState) {
+        self.install_flat_owner_caches(state.flat_caches);
+        self.dflash_context = state.dflash_context;
+        self.cached_token_history = state.history;
+    }
+
+    fn capture_flat_owner_state(&mut self) -> Self::OwnerState {
+        MuseOwnerState {
+            history: self.cached_token_history.clone(),
+            flat_caches: Some(self.take_flat_owner_caches()),
+            dflash_context: self.dflash_context.take(),
+        }
+    }
+
+    fn install_paged_owner_state(&mut self, seq_id: SeqId, state: Self::OwnerState) {
+        self.set_active_paged_owner(seq_id);
+        self.cached_token_history = state.history;
+    }
+
+    fn capture_paged_owner_state(&mut self) -> Self::OwnerState {
+        MuseOwnerState {
+            history: self.cached_token_history.clone(),
+            flat_caches: None,
+            dflash_context: None,
+        }
     }
 }
 
@@ -379,88 +367,6 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        if matches!(&command, ChatCmd::ResetCaches { .. }) {
-            self.select_ownerless_lane(self.paged.is_none());
-            handle_chat_cmd(self, command);
-            return;
-        }
-        let flat_lane = self.requires_flat_lane(&command);
-        let Some(owner) = owner_id(&command).map(str::to_owned) else {
-            self.select_ownerless_lane(flat_lane);
-            handle_chat_cmd(self, command);
-            return;
-        };
-        if is_start(&command) {
-            if let Some(seq_id) = owners.owner_sequences.remove(&owner)
-                && let Err(error) = self.release_scheduled_cache(seq_id)
-            {
-                send_error(command, error);
-                return;
-            }
-            owners.owner_states.remove(&owner);
-        } else {
-            let state = owners.owner_states.get(&owner);
-            let matching = if flat_lane {
-                state.is_some_and(|state| state.flat_caches.is_some())
-            } else {
-                owners.owner_sequences.contains_key(&owner)
-                    && state.is_some_and(|state| state.flat_caches.is_none())
-            };
-            if !matching {
-                let conflicting = state.is_some() || owners.owner_sequences.contains_key(&owner);
-                let message = if conflicting {
-                    "Muse-Glimmer cannot switch a live cache owner between paged AR and flat DFlash layouts; start a new session"
-                } else {
-                    "chat session continuation requires an initialized cache owner (call chatSessionStart first)"
-                };
-                send_error(command, Error::from_reason(message));
-                return;
-            }
-        }
-        let state = owners.owner_states.remove(&owner).unwrap_or_default();
-        if flat_lane {
-            self.install_flat_owner_caches(state.flat_caches);
-            self.dflash_context = state.dflash_context;
-            self.cached_token_history = state.history;
-            handle_chat_cmd(self, command);
-            if ChatBackend::has_live_session(self) {
-                owners.owner_states.insert(
-                    owner,
-                    MuseOwnerState {
-                        history: self.cached_token_history.clone(),
-                        flat_caches: Some(self.take_flat_owner_caches()),
-                        dflash_context: self.dflash_context.take(),
-                    },
-                );
-            } else {
-                owners.owner_sequences.remove(&owner);
-            }
-        } else {
-            let seq_id = owners
-                .owner_sequences
-                .get(&owner)
-                .copied()
-                .unwrap_or_else(|| {
-                    let seq_id = *owners.next_seq_id;
-                    *owners.next_seq_id = owners.next_seq_id.saturating_add(1);
-                    owners.owner_sequences.insert(owner.clone(), seq_id);
-                    seq_id
-                });
-            self.set_active_paged_owner(seq_id);
-            self.cached_token_history = state.history;
-            handle_chat_cmd(self, command);
-            if ChatBackend::has_live_session(self) {
-                owners.owner_states.insert(
-                    owner,
-                    MuseOwnerState {
-                        history: self.cached_token_history.clone(),
-                        flat_caches: None,
-                        dflash_context: None,
-                    },
-                );
-            } else {
-                owners.owner_sequences.remove(&owner);
-            }
-        }
+        execute_dual_lane_chat_barrier(self, command, owners);
     }
 }

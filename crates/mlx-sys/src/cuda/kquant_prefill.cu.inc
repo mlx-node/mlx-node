@@ -86,29 +86,22 @@ extern "C" __global__ __launch_bounds__(256) void mlx_node_kquant_quantize_prefi
 }
 
 __device__ __forceinline__ void kqp_cp_async16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;\n"
-      :: "r"(smem_addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 __device__ __forceinline__ void kqp_cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 template <int N_WAIT>
 __device__ __forceinline__ void kqp_cp_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(N_WAIT) : "memory");
+  ptx_cp_wait<N_WAIT>();
 }
 
 __device__ __forceinline__ void kqp_ldmatrix4(
     unsigned int& a0, unsigned int& a1, unsigned int& a2, unsigned int& a3,
     const void* smem_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-      : "r"(smem_addr));
+  ptx_ldmatrix_x4(a0, a1, a2, a3, smem_ptr);
 }
 
 template <int mode>
@@ -181,20 +174,14 @@ __device__ __forceinline__ unsigned int kqp_load_k16(
 __device__ __forceinline__ void kqp_mma_k16(
     unsigned int a0, unsigned int a1, unsigned int b,
     int& c0, int& c1, int& c2, int& c3) {
-  asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
-      : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-      : "r"(a0), "r"(a1), "r"(b));
+  ptx_mma_m16n8k16_s8(a0, a1, b, c0, c1, c2, c3);
 }
 
 __device__ __forceinline__ void kqp_mma(
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1,
     int& c0, int& c1, int& c2, int& c3) {
-  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-      : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k32_s8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
 }
 )cuda"
 R"cuda(

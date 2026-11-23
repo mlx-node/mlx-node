@@ -149,6 +149,8 @@ impl Qwen35Inner {
             mtp_draft_accepted: 0,
             mtp_draft_attempted: 0,
             mtp_gated_turns: 0,
+            want_paged_mtp_prompt_hidden: false,
+            pending_prompt_hidden: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
@@ -1143,6 +1145,7 @@ impl Qwen35Inner {
                     adapter,
                     planned_rows,
                     gdn_cache.as_mut(),
+                    false,
                 )?
             };
             if let Some(cache) = gdn_cache.as_ref() {
@@ -1290,6 +1293,8 @@ impl Qwen35Inner {
         // A released/reset session has no GDN state left to refuse persisting.
         self.paged_gdn_state_dirty = false;
         self.paged_gdn_force_mismatch_for_test = false;
+        self.want_paged_mtp_prompt_hidden = false;
+        self.pending_prompt_hidden = None;
     }
 
     /// Tear down a partially prepared or partially executed paged turn.
@@ -1486,7 +1491,7 @@ impl Qwen35Inner {
 
     /// Save model weights and configuration to a directory (synchronous).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
-        use crate::models::qwen3_5::decoder_layer::AttentionType;
+        use crate::models::qwen3_5::decoder_layer::{AttentionType, MLPType};
 
         if let Some(component) = self.first_quantized_save_component() {
             return Err(Error::from_reason(format!(
@@ -1557,18 +1562,54 @@ impl Qwen35Inner {
                     );
                 }
             }
-            params.insert(
-                format!("{}.mlp.gate_proj.weight", prefix),
-                layer.mlp.get_gate_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.up_proj.weight", prefix),
-                layer.mlp.get_up_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.down_proj.weight", prefix),
-                layer.mlp.get_down_proj_weight(),
-            );
+            match &layer.mlp {
+                MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{}.mlp.gate_proj.weight", prefix),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.up_proj.weight", prefix),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.down_proj.weight", prefix),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                MLPType::MoE(moe) => {
+                    params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert_gate.weight", prefix),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
             params.insert(
                 format!("{}.input_layernorm.weight", prefix),
                 layer.get_input_layernorm_weight(),

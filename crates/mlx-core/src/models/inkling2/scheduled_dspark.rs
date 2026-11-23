@@ -437,22 +437,16 @@ fn select_verify_wave_groups_from_lanes(
     lanes: &HashMap<SeqId, Inkling2ScheduledDsparkLane>,
     rows: &[(PagedRaggedRow, Vec<u32>)],
 ) -> Vec<Vec<usize>> {
-    let eligible: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, (row, ids))| {
+    crate::engine::scheduled_verify::partition_verify_wave_groups(
+        rows,
+        INKLING2_WAVE_LANES,
+        |(row, ids)| {
             ids.len() >= 2
                 && lanes
                     .get(&row.seq_id)
                     .is_some_and(|lane| lane.open.is_none())
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-    eligible
-        .chunks(INKLING2_WAVE_LANES)
-        .filter(|g| g.len() >= 2)
-        .map(<[usize]>::to_vec)
-        .collect()
+        },
+    )
 }
 
 struct LaneVerify<'a>(&'a mut Inkling2Inner);

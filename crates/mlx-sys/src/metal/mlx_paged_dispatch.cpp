@@ -286,7 +286,7 @@ const std::string& reshape_and_cache_int8_kernel_name(
 }
 
 // The keys-token-major page (K `[num_blocks, num_kv_heads, block_size,
-// head_size]`, V dimension-major): `kv_int8_store_ktm.h`.
+// head_size]`, V dimension-major): `kv_int8_store.metal` (`KeysTokenMajor=true`).
 const std::string& reshape_and_cache_int8_ktm_kernel_name(int head_size) {
   static std::mutex mutex;
   static std::map<int, std::string> cache;
@@ -944,7 +944,7 @@ void count_paged_decode(int kind) {
   paged_decode_probe_counter(kind).fetch_add(1, std::memory_order_relaxed);
 }
 
-// paged_attention_ktm.h. The kernels walk 16-token halves of a 32-token page.
+// paged_attention.metal (`KeysTokenMajor=true`). The kernels walk 16-token halves of a 32-token page.
 constexpr int kKeysTokenMajorLogicalBlock = 16;
 
 enum class KeysTokenMajorKernel { Generic, Striped };
@@ -1322,6 +1322,137 @@ void bind_score_scales(
   }
 }
 
+// Dual-purpose stage-1 threadgroup memory shared by V1, V2, KTM, Varlen, and
+// Inkling2 kernels: max(logits[logits_count], out_smem[(NUM_WARPS/2)*D]) +
+// red_smem[2*NUM_WARPS], all f32.
+size_t stage1_threadgroup_memory_bytes(size_t logits_count, int head_size) {
+  const size_t logits_bytes = logits_count * sizeof(float);
+  const size_t v_reduce_bytes =
+      static_cast<size_t>(kNumWarps / 2) *
+      static_cast<size_t>(head_size) * sizeof(float);
+  const size_t red_smem_bytes =
+      2 * static_cast<size_t>(kNumWarps) * sizeof(float);
+  return std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
+}
+
+// Shared buffers 3..18 and 21..22 for standard paged-attention V1, V2, KTM,
+// Varlen V1, and Varlen V2 dispatches (varlen callers additionally bind
+// buffers 19..20 for cu_seqlens_q / num_seqs).
+void bind_paged_common_buffers(
+    mlx::core::metal::CommandEncoder& encoder,
+    const mlx::core::array& q,
+    int64_t q_byte_offset,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int64_t live_blocks,
+    const mlx::core::array& block_table,
+    int64_t block_table_byte_offset,
+    const mlx::core::array& seq_lens,
+    int64_t seq_lens_byte_offset,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int max_blocks_per_seq,
+    float scale,
+    float softcapping,
+    int sliding_window,
+    const mlx::core::array* score_scales,
+    int64_t score_scales_byte_offset) {
+  const float dummy_zero = 0.0f;
+  const int32_t q_stride = num_q_heads * head_size;
+  const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
+  const int32_t kv_head_stride = head_size * block_size;
+  encoder.set_input_array(q, 3, q_byte_offset);
+  bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
+  encoder.set_bytes<int32_t>(num_kv_heads, 8);
+  encoder.set_bytes<float>(scale, 9);
+  encoder.set_bytes<float>(softcapping, 10);
+  encoder.set_input_array(block_table, 11, block_table_byte_offset);
+  encoder.set_input_array(seq_lens, 12, seq_lens_byte_offset);
+  encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
+  // alibi_slopes — not used (use_alibi = false in the kernel instantiation).
+  encoder.set_bytes(dummy_zero, 14);
+  encoder.set_bytes<int32_t>(q_stride, 15);
+  encoder.set_bytes<int32_t>(kv_block_stride, 16);
+  encoder.set_bytes<int32_t>(kv_head_stride, 17);
+  encoder.set_bytes<int32_t>(sliding_window, 18);
+  bind_score_scales(encoder, score_scales, score_scales_byte_offset);
+}
+
+struct V2WorkspaceAndMeta {
+  mlx::core::array exp_sums;
+  mlx::core::array max_logits;
+  mlx::core::array tmp_out;
+  mlx::core::array tile_meta;
+};
+
+// Allocate V2 auxiliary buffers (`exp_sums`, `max_logits`, `tmp_out`) with an
+// explicit INT_MAX overflow guard and, when `tiled == true`, populate the
+// per-tile `{seq_len, 0, rows}` metadata array.
+V2WorkspaceAndMeta allocate_v2_workspace_and_meta(
+    int workspace_rows,
+    int num_q_heads,
+    uint32_t max_num_partitions,
+    int head_size,
+    mlx::core::Dtype partial_dtype,
+    bool tiled,
+    int num_tiles,
+    int total_queries,
+    int tile_rows,
+    int max_context_len,
+    const char* context_label) {
+  const int64_t exp_sums_size_i64 =
+      static_cast<int64_t>(workspace_rows) *
+      static_cast<int64_t>(num_q_heads) *
+      static_cast<int64_t>(max_num_partitions);
+  const int64_t tmp_out_size_i64 =
+      exp_sums_size_i64 * static_cast<int64_t>(head_size);
+  if (exp_sums_size_i64 > std::numeric_limits<int>::max() ||
+      tmp_out_size_i64 > std::numeric_limits<int>::max()) {
+    throw std::runtime_error(
+        std::string("[mlx_paged_dispatch] ") + context_label +
+        " auxiliary buffer size exceeds INT_MAX");
+  }
+  const int exp_sums_size = static_cast<int>(exp_sums_size_i64);
+  const int tmp_out_size = static_cast<int>(tmp_out_size_i64);
+
+  mlx::core::array exp_sums(
+      mlx::core::Shape{exp_sums_size}, mlx::core::float32, nullptr, {});
+  exp_sums.set_data(mlx::core::allocator::malloc(exp_sums.nbytes()));
+
+  mlx::core::array max_logits(
+      mlx::core::Shape{exp_sums_size}, mlx::core::float32, nullptr, {});
+  max_logits.set_data(mlx::core::allocator::malloc(max_logits.nbytes()));
+
+  mlx::core::array tmp_out(
+      mlx::core::Shape{tmp_out_size}, partial_dtype, nullptr, {});
+  tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
+
+  mlx::core::array tile_meta(
+      mlx::core::Shape{3 * std::max(num_tiles, 1)},
+      mlx::core::int32,
+      nullptr,
+      {});
+  if (tiled) {
+    tile_meta.set_data(mlx::core::allocator::malloc(tile_meta.nbytes()));
+    int32_t* meta = tile_meta.data<int32_t>();
+    for (int t = 0; t < num_tiles; ++t) {
+      const int end = std::min(total_queries, (t + 1) * tile_rows);
+      meta[3 * t] = max_context_len - (total_queries - end);
+      meta[3 * t + 1] = 0;
+      meta[3 * t + 2] = end - t * tile_rows;
+    }
+  }
+  return V2WorkspaceAndMeta{
+      std::move(exp_sums),
+      std::move(max_logits),
+      std::move(tmp_out),
+      std::move(tile_meta)};
+}
+
 void dispatch_paged_attention_v1_inner(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -1382,44 +1513,16 @@ void dispatch_paged_attention_v1_inner(
   encoder.set_bytes(dummy_zero, 0);
   encoder.set_bytes(dummy_zero, 1);
   encoder.set_output_array(out, 2);
-  encoder.set_input_array(q, 3);
-  bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
+  bind_paged_common_buffers(
+      encoder, q, 0, k_pool, v_pool, k_scale, v_scale, live_blocks,
+      block_table, 0, seq_lens, 0, num_q_heads, num_kv_heads, head_size,
+      block_size, max_blocks_per_seq, scale, softcapping, sliding_window,
+      score_scales, 0);
 
-  encoder.set_bytes<int32_t>(num_kv_heads, 8);
-  encoder.set_bytes<float>(scale, 9);
-  encoder.set_bytes<float>(softcapping, 10);
-  encoder.set_input_array(block_table, 11);
-  encoder.set_input_array(seq_lens, 12);
-  encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-  // alibi_slopes — not used (use_alibi = false in the kernel
-  // instantiation); pass a dummy.
-  encoder.set_bytes(dummy_zero, 14);
-
-  const int32_t q_stride = num_q_heads * head_size;
-  const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-  const int32_t kv_head_stride = head_size * block_size;
-  encoder.set_bytes<int32_t>(q_stride, 15);
-  encoder.set_bytes<int32_t>(kv_block_stride, 16);
-  encoder.set_bytes<int32_t>(kv_head_stride, 17);
-
-  // Sliding-window mask. 0 = full context (default).
-  encoder.set_bytes<int32_t>(sliding_window, 18);
-  bind_score_scales(encoder, score_scales, 0);
-
-  // Threadgroup memory math: same dual-purpose layout as Rust V1. The
-  // buffer serves two kernel stages and is sized to the max:
-  //   logits stage: logits[max_seq_len] f32 + red_smem[2*NUM_WARPS] f32
-  //   v-reduce stage: out_smem[(NUM_WARPS/2)*head_size] f32 + same red_smem
-  const size_t logits_bytes =
-      static_cast<size_t>(max_context_len) * sizeof(float);
-  const size_t v_reduce_bytes =
-      static_cast<size_t>(kNumWarps / 2) *
-      static_cast<size_t>(head_size) * sizeof(float);
-  const size_t red_smem_bytes =
-      2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-  const size_t threadgroup_mem =
-      std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-  encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+  encoder.set_threadgroup_memory_length(
+      stage1_threadgroup_memory_bytes(
+          static_cast<size_t>(max_context_len), head_size),
+      0);
 
   // Dispatch: (num_q_heads, num_seqs, 1) threadgroups, kNumThreads each.
   MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
@@ -1504,41 +1607,18 @@ void dispatch_paged_attention_v2_inner(
   // 64-bit math for the size calculation to detect overflow, then
   // narrow to `int` for the shape constructor with an explicit
   // overflow guard.
-  const int64_t exp_sums_size_i64 =
-      static_cast<int64_t>(num_seqs) *
-      static_cast<int64_t>(num_q_heads) *
-      static_cast<int64_t>(max_num_partitions);
-  const int64_t tmp_out_size_i64 =
-      exp_sums_size_i64 * static_cast<int64_t>(head_size);
-  if (exp_sums_size_i64 > std::numeric_limits<int>::max() ||
-      tmp_out_size_i64 > std::numeric_limits<int>::max()) {
-    throw std::runtime_error(
-        "[mlx_paged_dispatch] V2 auxiliary buffer size exceeds INT_MAX; "
-        "request too large for the kernel's int-sized tensor shapes");
-  }
-  const int exp_sums_size = static_cast<int>(exp_sums_size_i64);
-  const int tmp_out_size = static_cast<int>(tmp_out_size_i64);
-
-  mlx::core::array exp_sums(
-      mlx::core::Shape{exp_sums_size},
-      mlx::core::float32,
-      nullptr,
-      {});
-  exp_sums.set_data(mlx::core::allocator::malloc(exp_sums.nbytes()));
-
-  mlx::core::array max_logits(
-      mlx::core::Shape{exp_sums_size},
-      mlx::core::float32,
-      nullptr,
-      {});
-  max_logits.set_data(mlx::core::allocator::malloc(max_logits.nbytes()));
-
-  mlx::core::array tmp_out(
-      mlx::core::Shape{tmp_out_size},
+  V2WorkspaceAndMeta ws = allocate_v2_workspace_and_meta(
+      num_seqs,
+      num_q_heads,
+      max_num_partitions,
+      head_size,
       partial_dtype_for(io_dtype, cache_dtype),
-      nullptr,
-      {});
-  tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
+      /*tiled=*/false,
+      /*num_tiles=*/1,
+      /*total_queries=*/num_seqs,
+      /*tile_rows=*/num_seqs,
+      max_context_len,
+      "V2");
 
   // Stage 1: partitioned attention.
   {
@@ -1553,31 +1633,14 @@ void dispatch_paged_attention_v2_inner(
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
-    encoder.set_output_array(exp_sums, 0);
-    encoder.set_output_array(max_logits, 1);
-    encoder.set_output_array(tmp_out, 2);
-    encoder.set_input_array(q, 3);
-    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
-
-    encoder.set_bytes<int32_t>(num_kv_heads, 8);
-    encoder.set_bytes<float>(scale, 9);
-    encoder.set_bytes<float>(softcapping, 10);
-    encoder.set_input_array(block_table, 11);
-    encoder.set_input_array(seq_lens, 12);
-    encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-    const float dummy_zero = 0.0f;
-    encoder.set_bytes(dummy_zero, 14); // alibi_slopes
-
-    const int32_t q_stride = num_q_heads * head_size;
-    const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-    const int32_t kv_head_stride = head_size * block_size;
-    encoder.set_bytes<int32_t>(q_stride, 15);
-    encoder.set_bytes<int32_t>(kv_block_stride, 16);
-    encoder.set_bytes<int32_t>(kv_head_stride, 17);
-
-    // Sliding-window mask. 0 = full context (default).
-    encoder.set_bytes<int32_t>(sliding_window, 18);
-    bind_score_scales(encoder, score_scales, 0);
+    encoder.set_output_array(ws.exp_sums, 0);
+    encoder.set_output_array(ws.max_logits, 1);
+    encoder.set_output_array(ws.tmp_out, 2);
+    bind_paged_common_buffers(
+        encoder, q, 0, k_pool, v_pool, k_scale, v_scale, live_blocks,
+        block_table, 0, seq_lens, 0, num_q_heads, num_kv_heads, head_size,
+        block_size, max_blocks_per_seq, scale, softcapping, sliding_window,
+        score_scales, 0);
 
     // Match MLX's long-context GQA vector geometry on the specialized path:
     // one SIMD group per query head, grouped under the KV head they share.
@@ -1595,19 +1658,8 @@ void dispatch_paged_attention_v2_inner(
               static_cast<size_t>(num_seqs),
               static_cast<size_t>(max_num_partitions));
     if (!use_grouped) {
-      // Threadgroup memory: V2 partitions context into PARTITION_SIZE
-      // chunks, so logits is sized by PARTITION_SIZE (not max_seq_len).
-      // V-reduce phase still needs (NUM_WARPS/2) * head_size f32s.
-      const size_t logits_bytes =
-          static_cast<size_t>(kPartitionSize) * sizeof(float);
-      const size_t v_reduce_bytes =
-          static_cast<size_t>(kNumWarps / 2) *
-          static_cast<size_t>(head_size) * sizeof(float);
-      const size_t red_smem_bytes =
-          2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-      const size_t threadgroup_mem =
-          std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+      encoder.set_threadgroup_memory_length(
+          stage1_threadgroup_memory_bytes(kPartitionSize, head_size), 0);
     }
     if (use_grouped) {
       record_grouped_route_for_test(grouped_kind);
@@ -1629,9 +1681,9 @@ void dispatch_paged_attention_v2_inner(
     encoder.set_compute_pipeline_state(pipeline);
 
     encoder.set_output_array(out, 0);
-    encoder.set_input_array(exp_sums, 1);
-    encoder.set_input_array(max_logits, 2);
-    encoder.set_input_array(tmp_out, 3);
+    encoder.set_input_array(ws.exp_sums, 1);
+    encoder.set_input_array(ws.max_logits, 2);
+    encoder.set_input_array(ws.tmp_out, 3);
     encoder.set_input_array(seq_lens, 4); // context_lens
     encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 5);
 
@@ -1655,9 +1707,9 @@ void dispatch_paged_attention_v2_inner(
   // encoder commits + the kernels complete. After this, the local
   // references can go out of scope without freeing the GPU buffers
   // prematurely.
-  encoder.add_temporary(std::move(exp_sums));
-  encoder.add_temporary(std::move(max_logits));
-  encoder.add_temporary(std::move(tmp_out));
+  encoder.add_temporary(std::move(ws.exp_sums));
+  encoder.add_temporary(std::move(ws.max_logits));
+  encoder.add_temporary(std::move(ws.tmp_out));
 
   (void)stream;
 }
@@ -1729,14 +1781,8 @@ void dispatch_paged_attention_keys_token_major(
   };
 
   const int32_t q_stride = num_q_heads * head_size;
-  const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-  const int32_t kv_head_stride = head_size * block_size;
   const int gqa_factor = num_q_heads / num_kv_heads;
   const float dummy_zero = 0.0f;
-  const size_t v_reduce_bytes =
-      static_cast<size_t>(kNumWarps / 2) * static_cast<size_t>(head_size) *
-      sizeof(float);
-  const size_t red_smem_bytes = 2 * static_cast<size_t>(kNumWarps) * sizeof(float);
   const auto partitions = [](int context) {
     return (static_cast<uint32_t>(context) + kPartitionSize - 1) / kPartitionSize;
   };
@@ -1744,22 +1790,27 @@ void dispatch_paged_attention_keys_token_major(
   // Row `first` of the call is row 0 of the kernel: every per-row binding
   // starts at that row.
   const auto bind_inputs = [&](int first, int64_t q_bytes) {
-    encoder.set_input_array(q, 3, first * q_bytes);
-    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
-    encoder.set_bytes<int32_t>(num_kv_heads, 8);
-    encoder.set_bytes<float>(scale, 9);
-    encoder.set_bytes<float>(softcapping, 10);
-    encoder.set_input_array(
-        block_table, 11, int64_t{4} * first * max_blocks_per_seq);
-    encoder.set_input_array(seq_lens, 12, int64_t{4} * first);
-    encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-    encoder.set_bytes(dummy_zero, 14);
-    encoder.set_bytes<int32_t>(q_stride, 15);
-    encoder.set_bytes<int32_t>(kv_block_stride, 16);
-    encoder.set_bytes<int32_t>(kv_head_stride, 17);
-    encoder.set_bytes<int32_t>(sliding_window, 18);
-    bind_score_scales(
+    bind_paged_common_buffers(
         encoder,
+        q,
+        first * q_bytes,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        live_blocks,
+        block_table,
+        int64_t{4} * first * max_blocks_per_seq,
+        seq_lens,
+        int64_t{4} * first,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        max_blocks_per_seq,
+        scale,
+        softcapping,
+        sliding_window,
         score_scales,
         int64_t{4} * first * num_q_heads);
   };
@@ -1774,8 +1825,7 @@ void dispatch_paged_attention_keys_token_major(
     encoder.set_output_array(out, 2, first * out_row_bytes);
     bind_inputs(first, q_row_bytes);
     encoder.set_threadgroup_memory_length(
-        std::max(static_cast<size_t>(context) * sizeof(float), v_reduce_bytes) +
-            red_smem_bytes,
+        stage1_threadgroup_memory_bytes(static_cast<size_t>(context), head_size),
         0);
     count_paged_decode(3);
     encoder.dispatch_threadgroups(
@@ -1812,9 +1862,7 @@ void dispatch_paged_attention_keys_token_major(
           MTL::Size::Make(32, static_cast<size_t>(gqa_factor), 1));
     } else {
       encoder.set_threadgroup_memory_length(
-          std::max(static_cast<size_t>(kPartitionSize) * sizeof(float), v_reduce_bytes) +
-              red_smem_bytes,
-          0);
+          stage1_threadgroup_memory_bytes(kPartitionSize, head_size), 0);
       count_paged_decode(2);
       encoder.dispatch_threadgroups(
           MTL::Size::Make(
@@ -2087,39 +2135,18 @@ void dispatch_paged_attention_varlen_v1_inner(
   encoder.set_bytes(dummy_zero, 0); // exp_sums (unused in V1)
   encoder.set_bytes(dummy_zero, 1); // max_logits (unused in V1)
   encoder.set_output_array(out, 2);
-  encoder.set_input_array(q, 3);
-  bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
-
-  encoder.set_bytes<int32_t>(num_kv_heads, 8);
-  encoder.set_bytes<float>(scale, 9);
-  encoder.set_bytes<float>(softcapping, 10);
-  encoder.set_input_array(block_table, 11);
-  encoder.set_input_array(seq_lens, 12);
-  encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-  encoder.set_bytes(dummy_zero, 14); // alibi_slopes
-
-  const int32_t q_stride = num_q_heads * head_size;
-  const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-  const int32_t kv_head_stride = head_size * block_size;
-  encoder.set_bytes<int32_t>(q_stride, 15);
-  encoder.set_bytes<int32_t>(kv_block_stride, 16);
-  encoder.set_bytes<int32_t>(kv_head_stride, 17);
-  encoder.set_bytes<int32_t>(sliding_window, 18);
-
+  bind_paged_common_buffers(
+      encoder, q, 0, k_pool, v_pool, k_scale, v_scale, live_blocks,
+      block_table, 0, seq_lens, 0, num_q_heads, num_kv_heads, head_size,
+      block_size, max_blocks_per_seq, scale, softcapping, sliding_window,
+      score_scales, 0);
   encoder.set_input_array(cu_seqlens_q, 19);
   encoder.set_bytes<int32_t>(num_seqs, 20);
-  bind_score_scales(encoder, score_scales, 0);
 
-  const size_t logits_bytes =
-      static_cast<size_t>(max_context_len) * sizeof(float);
-  const size_t v_reduce_bytes =
-      static_cast<size_t>(kNumWarps / 2) *
-      static_cast<size_t>(head_size) * sizeof(float);
-  const size_t red_smem_bytes =
-      2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-  const size_t threadgroup_mem =
-      std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-  encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+  encoder.set_threadgroup_memory_length(
+      stage1_threadgroup_memory_bytes(
+          static_cast<size_t>(max_context_len), head_size),
+      0);
 
   MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
   MTL::Size grid = MTL::Size::Make(
@@ -2196,55 +2223,18 @@ void dispatch_paged_attention_varlen_v2_inner(
   const int num_tiles = (total_queries + tile_rows - 1) / tile_rows;
 
   // Aux buffers indexed by the tile's q_token_idx: size by tile_rows.
-  const int64_t exp_sums_size_i64 =
-      static_cast<int64_t>(tile_rows) *
-      static_cast<int64_t>(num_q_heads) *
-      static_cast<int64_t>(max_num_partitions);
-  const int64_t tmp_out_size_i64 =
-      exp_sums_size_i64 * static_cast<int64_t>(head_size);
-  if (exp_sums_size_i64 > std::numeric_limits<int>::max() ||
-      tmp_out_size_i64 > std::numeric_limits<int>::max()) {
-    throw std::runtime_error(
-        "[mlx_paged_dispatch] V2 varlen auxiliary buffer size exceeds INT_MAX");
-  }
-  const int exp_sums_size = static_cast<int>(exp_sums_size_i64);
-  const int tmp_out_size = static_cast<int>(tmp_out_size_i64);
-
-  mlx::core::array exp_sums(
-      mlx::core::Shape{exp_sums_size},
-      mlx::core::float32,
-      nullptr,
-      {});
-  exp_sums.set_data(mlx::core::allocator::malloc(exp_sums.nbytes()));
-
-  mlx::core::array max_logits(
-      mlx::core::Shape{exp_sums_size},
-      mlx::core::float32,
-      nullptr,
-      {});
-  max_logits.set_data(mlx::core::allocator::malloc(max_logits.nbytes()));
-
-  mlx::core::array tmp_out(
-      mlx::core::Shape{tmp_out_size},
+  V2WorkspaceAndMeta ws = allocate_v2_workspace_and_meta(
+      tile_rows,
+      num_q_heads,
+      max_num_partitions,
+      head_size,
       partial_dtype_for(io_dtype, cache_dtype),
-      nullptr,
-      {});
-  tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
-
-  // Per tile {seq_len, 0, rows}: the tile is the last `rows` queries of a
-  // sequence that ends at its last row, so each row keeps its causal bound.
-  mlx::core::array tile_meta(
-      mlx::core::Shape{3 * num_tiles}, mlx::core::int32, nullptr, {});
-  if (tiled) {
-    tile_meta.set_data(mlx::core::allocator::malloc(tile_meta.nbytes()));
-    int32_t* meta = tile_meta.data<int32_t>();
-    for (int t = 0; t < num_tiles; ++t) {
-      const int end = std::min(total_queries, (t + 1) * tile_rows);
-      meta[3 * t] = max_context_len - (total_queries - end);
-      meta[3 * t + 1] = 0;
-      meta[3 * t + 2] = end - t * tile_rows;
-    }
-  }
+      tiled,
+      num_tiles,
+      total_queries,
+      tile_rows,
+      max_context_len,
+      "V2 varlen");
 
   const int32_t q_stride = num_q_heads * head_size;
   for (int t = 0; t < num_tiles; ++t) {
@@ -2254,20 +2244,10 @@ void dispatch_paged_attention_varlen_v2_inner(
         static_cast<int64_t>(first) * q_stride * q.itemsize();
     const int64_t out_offset =
         static_cast<int64_t>(first) * q_stride * out.itemsize();
-    const auto bind_seq_lens = [&](int idx) {
-      if (tiled) {
-        encoder.set_input_array(tile_meta, idx, int64_t{12} * t);
-      } else {
-        encoder.set_input_array(seq_lens, idx);
-      }
-    };
-    const auto bind_cu_seqlens = [&](int idx) {
-      if (tiled) {
-        encoder.set_input_array(tile_meta, idx, int64_t{12} * t + 4);
-      } else {
-        encoder.set_input_array(cu_seqlens_q, idx);
-      }
-    };
+    const mlx::core::array& seq_arr = tiled ? ws.tile_meta : seq_lens;
+    const int64_t seq_off = tiled ? int64_t{12} * t : 0;
+    const mlx::core::array& cu_arr = tiled ? ws.tile_meta : cu_seqlens_q;
+    const int64_t cu_off = tiled ? int64_t{12} * t + 4 : 0;
     if (t > 0) {
       // The next stage 1 rewrites the partials the last reduce read.
       encoder.barrier();
@@ -2286,34 +2266,35 @@ void dispatch_paged_attention_varlen_v2_inner(
       MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
       encoder.set_compute_pipeline_state(pipeline);
 
-      encoder.set_output_array(exp_sums, 0);
-      encoder.set_output_array(max_logits, 1);
-      encoder.set_output_array(tmp_out, 2);
-      encoder.set_input_array(q, 3, q_offset);
-      bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
-
-      encoder.set_bytes<int32_t>(num_kv_heads, 8);
-      encoder.set_bytes<float>(scale, 9);
-      encoder.set_bytes<float>(softcapping, 10);
-      encoder.set_input_array(block_table, 11);
-      bind_seq_lens(12);
-      encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-      const float dummy_zero = 0.0f;
-      encoder.set_bytes(dummy_zero, 14); // alibi_slopes
-
-      const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-      const int32_t kv_head_stride = head_size * block_size;
-      encoder.set_bytes<int32_t>(q_stride, 15);
-      encoder.set_bytes<int32_t>(kv_block_stride, 16);
-      encoder.set_bytes<int32_t>(kv_head_stride, 17);
-      encoder.set_bytes<int32_t>(sliding_window, 18);
-
-      bind_cu_seqlens(19);
-      encoder.set_bytes<int32_t>(num_seqs, 20);
-      bind_score_scales(
+      encoder.set_output_array(ws.exp_sums, 0);
+      encoder.set_output_array(ws.max_logits, 1);
+      encoder.set_output_array(ws.tmp_out, 2);
+      bind_paged_common_buffers(
           encoder,
+          q,
+          q_offset,
+          k_pool,
+          v_pool,
+          k_scale,
+          v_scale,
+          live_blocks,
+          block_table,
+          0,
+          seq_arr,
+          seq_off,
+          num_q_heads,
+          num_kv_heads,
+          head_size,
+          block_size,
+          max_blocks_per_seq,
+          scale,
+          softcapping,
+          sliding_window,
           score_scales,
-          static_cast<int64_t>(first) * num_q_heads * static_cast<int64_t>(sizeof(float)));
+          static_cast<int64_t>(first) * num_q_heads *
+              static_cast<int64_t>(sizeof(float)));
+      encoder.set_input_array(cu_arr, 19, cu_off);
+      encoder.set_bytes<int32_t>(num_seqs, 20);
 
       // Keep one GQA-sized threadgroup per query row (192 threads for GQA6
       // or 256 for GQA8). Combining both q_len=2 rows would cut occupancy
@@ -2336,16 +2317,8 @@ void dispatch_paged_attention_varlen_v2_inner(
                 static_cast<size_t>(rows),
                 static_cast<size_t>(max_num_partitions));
       if (!use_grouped) {
-        const size_t logits_bytes =
-            static_cast<size_t>(kPartitionSize) * sizeof(float);
-        const size_t v_reduce_bytes =
-            static_cast<size_t>(kNumWarps / 2) *
-            static_cast<size_t>(head_size) * sizeof(float);
-        const size_t red_smem_bytes =
-            2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-        const size_t threadgroup_mem =
-            std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-        encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+        encoder.set_threadgroup_memory_length(
+            stage1_threadgroup_memory_bytes(kPartitionSize, head_size), 0);
       }
       if (use_grouped) {
         record_grouped_route_for_test(grouped_kind);
@@ -2363,13 +2336,13 @@ void dispatch_paged_attention_varlen_v2_inner(
       encoder.set_compute_pipeline_state(pipeline);
 
       encoder.set_output_array(out, 0, out_offset);
-      encoder.set_input_array(exp_sums, 1);
-      encoder.set_input_array(max_logits, 2);
-      encoder.set_input_array(tmp_out, 3);
-      bind_seq_lens(4);
+      encoder.set_input_array(ws.exp_sums, 1);
+      encoder.set_input_array(ws.max_logits, 2);
+      encoder.set_input_array(ws.tmp_out, 3);
+      encoder.set_input_array(seq_arr, 4, seq_off);
       encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 5);
 
-      bind_cu_seqlens(6);
+      encoder.set_input_array(cu_arr, 6, cu_off);
       encoder.set_bytes<int32_t>(num_seqs, 7);
 
       if (!use_grouped) {
@@ -2389,11 +2362,11 @@ void dispatch_paged_attention_varlen_v2_inner(
   }
 
   if (tiled) {
-    encoder.add_temporary(std::move(tile_meta));
+    encoder.add_temporary(std::move(ws.tile_meta));
   }
-  encoder.add_temporary(std::move(exp_sums));
-  encoder.add_temporary(std::move(max_logits));
-  encoder.add_temporary(std::move(tmp_out));
+  encoder.add_temporary(std::move(ws.exp_sums));
+  encoder.add_temporary(std::move(ws.max_logits));
+  encoder.add_temporary(std::move(ws.tmp_out));
 
   (void)stream;
 }
@@ -2540,7 +2513,7 @@ std::string paged_prefill_split_name(
       paged_prefill_suffix(group, head_size);
 }
 
-// The keys-token-major page (paged_prefill_attention_ktm.h): INT8, one
+// The keys-token-major page (paged_prefill_attention.metal, KeysTokenMajor=true): INT8, one
 // 32-token block per page, heads 24/4 at D 256 only.
 std::string paged_prefill_keys_token_major_split_name(bool int8_queries) {
   return paged_prefill_split_name(
@@ -2826,7 +2799,7 @@ const std::string& inkling2_prefill_reduce_name() {
 
 } // namespace
 
-std::vector<std::string> inkling2_kernel_names() {
+std::vector<std::string> inkling2_paged_kernel_names() {
   return {
       "paged_attention_inkling2_ktm_hs128_ps0",
       "paged_attention_inkling2_ktm_hs128_ps512",
@@ -2839,82 +2812,6 @@ std::vector<std::string> inkling2_kernel_names() {
       "inkling2_paged_prefill_q8q_split_g3_d128_ktm",
       "inkling2_paged_prefill_bf16_split_g3_d128",
       "inkling2_paged_prefill_reduce_g3_d128",
-      "inkling2_gate_sink_bf16",
-      "inkling2_gate_sink_f32",
-      "inkling2_situ_bf16",
-      "inkling2_situ_f32",
-      "inkling2_loop_blend_rms_norm_bf16",
-      "inkling2_loop_blend_rms_norm_f32",
-      "inkling2_sconv_k4_bf16",
-      "inkling2_sconv_k4_f32",
-      "inkling2_qr_clip_bf16",
-      "inkling2_qr_clip_f32",
-      "inkling2_sconv_k4_kv_prep_bf16",
-      "inkling2_sconv_k4_kv_prep_f32",
-      "inkling2_sconv_k4_kv_prep_paged_bf16",
-      "inkling2_block_attn_res_bf16",
-      "inkling2_block_attn_res_f32",
-      "inkling2_pair_rms_norm_f32",
-      "inkling2_pair_rms_norm_bf16",
-      "inkling2_sconv_k4_ragged_bf16",
-      "inkling2_sconv_k4_ragged_f32",
-      "inkling2_moe_router_proj_f32",
-      "inkling2_loop_ctrl_down_f32",
-      "inkling2_loop_ctrl_up_blend_f32",
-      "inkling2_rms_norm_from_sq_bf16",
-      "inkling2_rms_norm_from_sq_f32",
-      "inkling2_moe_route_f32",
-      "inkling2_moe_combine_bf16",
-      "inkling2_moe_combine_f32",
-      "inkling2_lm_head_softcap_f32",
-      "inkling2_lm_head_softcap_argmax_stage1",
-      "inkling2_lm_head_softcap_argmax_stage2",
-      "inkling2_markov_gate_bf16",
-      "inkling2_markov_fold_softcap_f32",
-      "inkling2_markov_fold_softcap_argmax_stage1",
-      "inkling2_bf16_linear_m1",
-      "inkling2_bf16_linear_nax_m8",
-      "inkling2_bf16_linear_batched",
-      "inkling2_bf16_linear_simd",
-      "inkling2_bf16_lm_head_softcap_argmax_p1",
-      "inkling2_bf16_lm_head_softcap_argmax_simd_stage1",
-      "inkling2_lm_head_q8_softcap_argmax_stage1",
-      "inkling2_lm_head_q8_bf16",
-      "inkling2_q8_sym_matmul_bf16",
-      "inkling2_q8_sym_matmul_nax_m8_bf16",
-      "inkling2_q8_sym_matmul_nax_m8_n32_bf16",
-      "inkling2_q8_sym_matmul_nax_bf16",
-      "inkling2_lm_head_q8_nax_softcap_argmax_p1",
-      "inkling2_moe_m1_gate_up_situ_nvfp4",
-      "inkling2_moe_m1_gate_up_situ_q8",
-      "inkling2_moe_m1_gate_up_situ_mxfp8",
-      "inkling2_moe_m1_gate_up_situ_q5k",
-      "inkling2_moe_m1_down_combine_nvfp4",
-      "inkling2_moe_m1_down_combine_sconv_nvfp4",
-      "inkling2_moe_m1_down_combine_q8",
-      "inkling2_moe_m1_down_combine_sconv_q8",
-      "inkling2_moe_m1_down_combine_mxfp8",
-      "inkling2_moe_m1_down_combine_sconv_mxfp8",
-      "inkling2_moe_group",
-      "inkling2_moe_route_group_small",
-      "inkling2_moe_gather",
-      "inkling2_moe_simd_gate_up_situ_nvfp4",
-      "inkling2_moe_simd_gate_up_situ_q8",
-      "inkling2_moe_simd_gate_up_situ_mxfp8",
-      "inkling2_moe_simd_gate_up_situ_q5k",
-      "inkling2_moe_simd_down_nvfp4",
-      "inkling2_moe_simd_down_q8",
-      "inkling2_moe_simd_down_mxfp8",
-      "inkling2_moe_gate_up_situ_nax_nvfp4_8",
-      "inkling2_moe_gate_up_situ_nax_nvfp4_32",
-      "inkling2_moe_gate_up_situ_nax_q8_8",
-      "inkling2_moe_gate_up_situ_nax_q8_32",
-      "inkling2_moe_down_nax_nvfp4_8",
-      "inkling2_moe_down_nax_nvfp4_32",
-      "inkling2_moe_down_nax_q8_8",
-      "inkling2_moe_down_nax_q8_32",
-      "inkling2_moe_grouped_combine_bf16",
-      "inkling2_moe_grouped_combine_sconv_bf16",
   };
 }
 
@@ -3105,15 +3002,8 @@ void dispatch_inkling2_paged_attention_auto(
 
     const size_t aligned_logits =
         (static_cast<size_t>(max_context_len) + 31) / 32 * 32;
-    const size_t logits_bytes = aligned_logits * sizeof(float);
-    const size_t v_reduce_bytes =
-        static_cast<size_t>(kNumWarps / 2) * static_cast<size_t>(head_size) *
-        sizeof(float);
-    const size_t red_smem_bytes =
-        2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-    const size_t threadgroup_mem =
-        std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-    encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    encoder.set_threadgroup_memory_length(
+        stage1_threadgroup_memory_bytes(aligned_logits, head_size), 0);
 
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
@@ -3139,52 +3029,21 @@ void dispatch_inkling2_paged_attention_auto(
       : total_queries;
   const int num_tiles = (total_queries + tile_rows - 1) / tile_rows;
 
-  const int64_t exp_sums_size_i64 = static_cast<int64_t>(tile_rows) *
-      static_cast<int64_t>(num_q_heads) *
-      static_cast<int64_t>(max_num_partitions);
-  const int64_t tmp_out_size_i64 =
-      exp_sums_size_i64 * static_cast<int64_t>(head_size);
-  if (exp_sums_size_i64 > std::numeric_limits<int>::max() ||
-      tmp_out_size_i64 > std::numeric_limits<int>::max()) {
-    throw std::runtime_error(
-        "[mlx_paged_dispatch] Inkling2 V2 auxiliary buffer size exceeds INT_MAX");
-  }
-  const int exp_sums_size = static_cast<int>(exp_sums_size_i64);
-  const int tmp_out_size = static_cast<int>(tmp_out_size_i64);
+  V2WorkspaceAndMeta ws = allocate_v2_workspace_and_meta(
+      tile_rows,
+      num_q_heads,
+      max_num_partitions,
+      head_size,
+      mlx::core::float32,
+      tiled,
+      num_tiles,
+      total_queries,
+      tile_rows,
+      max_context_len,
+      "Inkling2 V2");
 
-  mlx::core::array exp_sums(
-      mlx::core::Shape{exp_sums_size}, mlx::core::float32, nullptr, {});
-  exp_sums.set_data(mlx::core::allocator::malloc(exp_sums.nbytes()));
-  mlx::core::array max_logits(
-      mlx::core::Shape{exp_sums_size}, mlx::core::float32, nullptr, {});
-  max_logits.set_data(mlx::core::allocator::malloc(max_logits.nbytes()));
-  mlx::core::array tmp_out(
-      mlx::core::Shape{tmp_out_size}, mlx::core::float32, nullptr, {});
-  tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
-
-  mlx::core::array tile_meta(
-      mlx::core::Shape{3 * num_tiles}, mlx::core::int32, nullptr, {});
-  if (tiled) {
-    tile_meta.set_data(mlx::core::allocator::malloc(tile_meta.nbytes()));
-    int32_t* meta = tile_meta.data<int32_t>();
-    for (int t = 0; t < num_tiles; ++t) {
-      const int end = std::min(total_queries, (t + 1) * tile_rows);
-      meta[3 * t] = max_context_len - (total_queries - end);
-      meta[3 * t + 1] = 0;
-      meta[3 * t + 2] = end - t * tile_rows;
-    }
-  }
-
-  const size_t stage1_logits_bytes =
-      static_cast<size_t>(kPartitionSize) * sizeof(float);
-  const size_t stage1_v_reduce_bytes =
-      static_cast<size_t>(kNumWarps / 2) * static_cast<size_t>(head_size) *
-      sizeof(float);
-  const size_t stage1_red_smem_bytes =
-      2 * static_cast<size_t>(kNumWarps) * sizeof(float);
   const size_t stage1_tg_mem =
-      std::max(stage1_logits_bytes, stage1_v_reduce_bytes) +
-      stage1_red_smem_bytes;
+      stage1_threadgroup_memory_bytes(kPartitionSize, head_size);
   const size_t reduce_tg_mem = std::max<size_t>(
       16, static_cast<size_t>(max_num_partitions) * sizeof(float));
 
@@ -3222,9 +3081,9 @@ void dispatch_inkling2_paged_attention_auto(
         ? static_cast<int64_t>(first) * static_cast<int64_t>(extra.sink_row_stride) *
               static_cast<int64_t>(sink->itemsize())
         : 0;
-    const mlx::core::array& seq_arr = tiled ? tile_meta : seq_lens;
+    const mlx::core::array& seq_arr = tiled ? ws.tile_meta : seq_lens;
     const int64_t seq_off = tiled ? int64_t{12} * t : 0;
-    const mlx::core::array& cu_arr = tiled ? tile_meta : cu_seqlens_q;
+    const mlx::core::array& cu_arr = tiled ? ws.tile_meta : cu_seqlens_q;
     const int64_t cu_off = tiled ? int64_t{12} * t + 4 : 0;
 
     if (t > 0) {
@@ -3233,9 +3092,9 @@ void dispatch_inkling2_paged_attention_auto(
 
     // Stage 1
     encoder.set_compute_pipeline_state(stage1_pipe);
-    encoder.set_output_array(exp_sums, 0);
-    encoder.set_output_array(max_logits, 1);
-    encoder.set_output_array(tmp_out, 2);
+    encoder.set_output_array(ws.exp_sums, 0);
+    encoder.set_output_array(ws.max_logits, 1);
+    encoder.set_output_array(ws.tmp_out, 2);
     bind_common_stage1(
         is_ktm, q_offset, bias_offset, ss_offset, 0, 0, seq_arr, seq_off, cu_arr,
         cu_off, nullptr, 0, stage1_extra);
@@ -3257,9 +3116,9 @@ void dispatch_inkling2_paged_attention_auto(
     } else {
       encoder.set_bytes(dummy_zero, 1);
     }
-    encoder.set_input_array(exp_sums, 2);
-    encoder.set_input_array(max_logits, 3);
-    encoder.set_input_array(tmp_out, 4);
+    encoder.set_input_array(ws.exp_sums, 2);
+    encoder.set_input_array(ws.max_logits, 3);
+    encoder.set_input_array(ws.tmp_out, 4);
     encoder.set_input_array(seq_arr, 5, seq_off);
     encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 6);
     encoder.set_input_array(cu_arr, 7, cu_off);
@@ -3280,11 +3139,11 @@ void dispatch_inkling2_paged_attention_auto(
   }
 
   if (tiled) {
-    encoder.add_temporary(std::move(tile_meta));
+    encoder.add_temporary(std::move(ws.tile_meta));
   }
-  encoder.add_temporary(std::move(exp_sums));
-  encoder.add_temporary(std::move(max_logits));
-  encoder.add_temporary(std::move(tmp_out));
+  encoder.add_temporary(std::move(ws.exp_sums));
+  encoder.add_temporary(std::move(ws.max_logits));
+  encoder.add_temporary(std::move(ws.tmp_out));
   (void)stream;
 }
 

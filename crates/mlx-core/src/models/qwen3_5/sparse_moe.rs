@@ -4,7 +4,7 @@ use crate::nn::{Activations, Linear};
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
-use super::config::Qwen3_5MoeConfig;
+use super::config::{Qwen3_5Config, Qwen35MoeParams};
 use crate::models::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.
@@ -19,10 +19,39 @@ pub struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    pub fn new(config: &Qwen3_5MoeConfig) -> Result<Self> {
-        let num_experts = config.num_experts;
-        let num_experts_per_tok = config.num_experts_per_tok;
+    pub fn new(config: &crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig) -> Result<Self> {
+        Self::build(
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_experts,
+            config.num_experts_per_tok,
+            config.moe_intermediate_size,
+            config.shared_expert_intermediate_size,
+            config.norm_topk_prob,
+        )
+    }
 
+    pub(crate) fn new_with_params(base: &Qwen3_5Config, moe: &Qwen35MoeParams) -> Result<Self> {
+        Self::build(
+            base.hidden_size,
+            base.intermediate_size,
+            moe.num_experts,
+            moe.num_experts_per_tok,
+            moe.moe_intermediate_size,
+            moe.shared_expert_intermediate_size,
+            moe.norm_topk_prob,
+        )
+    }
+
+    fn build(
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        moe_intermediate_size: Option<i32>,
+        shared_expert_intermediate_size: Option<i32>,
+        norm_topk_prob: bool,
+    ) -> Result<Self> {
         if num_experts <= 0 {
             return Err(Error::from_reason(format!(
                 "SparseMoeBlock requires num_experts > 0, got {}",
@@ -36,14 +65,9 @@ impl SparseMoeBlock {
             )));
         }
 
-        let hidden_size = config.hidden_size;
-        let moe_intermediate = config
-            .moe_intermediate_size
-            .unwrap_or(config.intermediate_size);
-        let shared_expert_intermediate = config
-            .shared_expert_intermediate_size
-            .unwrap_or(config.intermediate_size);
-        let norm_topk_prob = config.norm_topk_prob;
+        let moe_intermediate = moe_intermediate_size.unwrap_or(intermediate_size);
+        let shared_expert_intermediate =
+            shared_expert_intermediate_size.unwrap_or(intermediate_size);
 
         let gate = Linear::new(hidden_size as u32, num_experts as u32, Some(false))?;
         let switch_mlp = SwitchGLU::new(
@@ -171,7 +195,7 @@ impl SparseMoeBlock {
     ///
     /// Used by the dense/bf16-only MTP save path to refuse serializing a
     /// quantized MoE MTP layer's stale dense weights (see
-    /// `Qwen3_5MoeMTPModule::has_quantized_weights`).
+    /// `Qwen3_5MTPModule::has_quantized_weights`).
     pub fn is_quantized(&self) -> bool {
         self.gate.is_quantized()
             || self.switch_mlp.is_quantized()

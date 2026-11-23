@@ -757,6 +757,7 @@ impl Qwen35DFlash2Stepper<'_> {
                         rope_deltas,
                         &self.tap_layers,
                         gdn_blobs,
+                        None,
                         window,
                     )
                 }
@@ -3690,6 +3691,7 @@ pub(crate) mod paged_dflash2_tests {
                 0,
                 &taps,
                 &blobs,
+                None,
                 window,
             )
             .map(|(logits, _)| logits.eval())
