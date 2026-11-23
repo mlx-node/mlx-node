@@ -876,13 +876,24 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             if ok {
                 #[cfg(test)]
                 self.landed_states.push(key);
-                match store.disk_mut(write.id).filter(|copy| copy.key == key) {
-                    Some(copy) => {
+                let chain_missing = store
+                    .get(write.id)
+                    .filter(|entry| entry.disk().is_some_and(|copy| copy.key == key))
+                    .map(|entry| !self.chain_on_disk(entry));
+                match (
+                    chain_missing,
+                    store.disk_mut(write.id).filter(|copy| copy.key == key),
+                ) {
+                    (Some(chain_missing), Some(copy)) => {
                         copy.landed = true;
+                        if chain_missing && !copy.chain_owed {
+                            copy.chain_owed = true;
+                            out.resync = true;
+                        }
                         out.state_landed_ok += 1;
                     }
                     // The point failed while its state was in flight.
-                    None => {
+                    (_, None) | (None, _) => {
                         self.tier.manager.remove(&key);
                     }
                 }
