@@ -10,16 +10,15 @@ use crate::engine::hybrid_scheduler::{
 };
 use crate::engine::scheduler::PreemptionMode;
 use crate::engine::types::ChatConfig;
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::muse_glimmer::dflash::DFlashContextCache;
-use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::{HybridLayerCache, PagedWindowSlot};
 
 #[derive(Default)]
 pub(crate) struct MuseOwnerState {
     history: Vec<u32>,
-    flat_caches: Option<Vec<Gemma4LayerCache>>,
+    flat_caches: Option<Vec<HybridLayerCache>>,
     dflash_context: Option<DFlashContextCache>,
 }
 

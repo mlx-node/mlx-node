@@ -11,32 +11,27 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::checkpoint_source::{CheckpointSource, GGUF_SOURCE_FILE};
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, cast_f32_tensors_to_bf16,
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    load_checkpoint, prewarm_checkpoint_pages,
+    CheckpointLeaseGuard, GgufPreloadGuard, KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES,
+    apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights, get_config_bool,
+    get_config_f64, get_config_i32, load_all_safetensors, load_checkpoint, load_gguf_preload,
+    params_weight_bytes, parse_generation_defaults, prewarm_checkpoint_pages,
+    register_loaded_weights_and_pool, spawn_loaded_model_thread,
 };
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
-    PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization,
-    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    kquant_mode_params_for_scales, load_quant_settings_from_disk, merge_per_layer,
-    resolve_default_mode,
+    PlainFp8Residency, QlBuildSpec, QlTiling, QslBuildSpec, QslFp8Policy, QslSym8Policy, build_ql,
+    build_qsl, default_per_layer_quant, defer_plain_fp8_materialization,
+    ensure_affine_biases_present, ensure_dense_weight_floating, kquant_mode_params_for_scales,
+    load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
 };
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
     is_quantized_checkpoint, mixed_affine_qmv_enabled, release_tiled_kquant_sources,
-    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::gguf::NativeGgufFamily;
-use crate::utils::gguf_import::{GgufPreload, PreloadInput, plan_dense_row_shards};
+use crate::utils::gguf_import::{PreloadInput, plan_dense_row_shards};
 
 use super::config::Gemma4Config;
 use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
@@ -1386,18 +1381,7 @@ fn load_gemma_weights(
         )?;
         input.main.plan.ple_shard = ple_shard;
     }
-    let mut preload = GgufPreload::load(&input)?;
-    let stats = &preload.stats;
-    info!(
-        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
-         {} GPU-repacked and {} other tensors",
-        stats.bytes,
-        stats.preload_secs,
-        stats.read_secs,
-        if stats.nocache { "off" } else { "on" },
-        stats.gpu_tensors,
-        stats.cpu_tensors,
-    );
+    let mut preload = load_gguf_preload(&input)?;
     let ple_shards = preload.ple_shards.take();
     let params = load_checkpoint(path, media, Some(&mut preload))?;
     Ok((params, ple_shards))
@@ -1620,50 +1604,15 @@ fn build_gemma_ql_tiled(
     plq: PerLayerQuant,
     tiled: &mut Vec<String>,
 ) -> Result<Option<QuantizedLinear>> {
-    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
-    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
-    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
-        // Tiled64 into the affine K-quant contract (`a4g64@t64` / `a8g64@t64`)
-        // for the MLX-affine checkpoints (gemma-4-*-it-4bit); the repack
-        // keeps MLX's affine route for f16 companions (GGUF Q4_0 imports,
-        // with their decode sidecars), uncarried (bits, group) pairs and odd
-        // shapes. Gemma4 threads no activation amax.
-        PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
-            params,
-            prefix,
-            plq.group_size,
-            plq.bits,
-            tiled,
-        )?,
-        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::Q2K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S
-        | PerLayerMode::IQ2XXS
-        | PerLayerMode::IQ2XS
-        | PerLayerMode::IQ2S
-        | PerLayerMode::IQ3XXS
-        | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => {
-            // Tiled64 for the `_t64` Metal kernels (the Gemma4 UD GGUFs are
-            // K-quant throughout; DSpark verify at M = 1 + L hits the
-            // `qmv_wide_t64` / `qmm_m8_nax_t64` routes).
-            try_build_kquant_quantized_linear_tiled(
-                params, prefix, plq.mode, plq.layout, "gemma4", tiled,
-            )?
-        }
-    })
+    build_ql(
+        params,
+        prefix,
+        plq,
+        QlBuildSpec {
+            tiling: QlTiling::TileCollect(tiled),
+            ..QlBuildSpec::standard("gemma4")
+        },
+    )
 }
 
 fn build_gemma_qsl(
@@ -1671,47 +1620,20 @@ fn build_gemma_qsl(
     prefix: &str,
     plq: PerLayerQuant,
 ) -> Result<Option<QuantizedSwitchLinear>> {
-    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
-    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
-    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "gemma4 expert layer '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only for 2-D attention/linear \
-                 tensors; Gemma4 experts must use the upstream NVFP4 low class"
-            )));
-        }
-        PerLayerMode::Affine => {
-            try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
-        }
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::Q2K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S
-        | PerLayerMode::IQ2XXS
-        | PerLayerMode::IQ2XS
-        | PerLayerMode::IQ2S
-        | PerLayerMode::IQ3XXS
-        | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
-            params, prefix, plq.mode, plq.layout, "gemma4",
-        )?,
-        PerLayerMode::Sym8 => {
-            return Err(Error::from_reason(format!(
-                "sym8 expert layer '{prefix}': 3-D switch (expert) tensors cannot be sym8 \
-                 (convert forces experts to affine under a sym8 default) — malformed checkpoint"
-            )));
-        }
-    })
+    build_qsl(
+        params,
+        prefix,
+        plq,
+        QslBuildSpec {
+            family: "gemma4",
+            validate_storage: true,
+            fp8: QslFp8Policy::RejectGemma4Experts,
+            sym8: QslSym8Policy::RejectGemma4,
+            nvfp4_only: false,
+            affine_optional_outer_scale: false,
+            nvfp4_outer_scale: None,
+        },
+    )
 }
 
 /// Apply sanitized weights to a Gemma4Inner (test entry: hands the production
@@ -2706,39 +2628,26 @@ impl Gemma4Inner {
         );
 
         // Merge stop tokens and sampling defaults from generation_config.json
-        let gen_config_path = path.join("generation_config.json");
-        if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
-            && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
-        {
-            // Merge EOS token IDs (e.g. <turn|> = 106)
-            if let Some(eos) = gen_val.get("eos_token_id") {
-                let mut ids: std::collections::HashSet<i32> =
-                    config.eos_token_ids.iter().copied().collect();
-                match eos {
-                    Value::Array(arr) => {
-                        for v in arr {
-                            if let Some(i) = v.as_i64() {
-                                ids.insert(i as i32);
-                            }
-                        }
-                    }
-                    Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            ids.insert(i as i32);
-                        }
-                    }
-                    _ => {}
+        let gen_defaults = parse_generation_defaults(path);
+        if !gen_defaults.eos_token_ids.is_empty() {
+            let mut ids: std::collections::HashSet<i32> =
+                config.eos_token_ids.iter().copied().collect();
+            for id in gen_defaults.eos_token_ids {
+                if let Ok(id) = i32::try_from(id) {
+                    ids.insert(id);
                 }
-                config.eos_token_ids = ids.into_iter().collect();
-                config.eos_token_ids.sort();
             }
-            // Read sampling defaults
-            config.default_temperature = gen_val.get("temperature").and_then(|v| v.as_f64());
-            config.default_top_k = gen_val
-                .get("top_k")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            config.default_top_p = gen_val.get("top_p").and_then(|v| v.as_f64());
+            config.eos_token_ids = ids.into_iter().collect();
+            config.eos_token_ids.sort();
+        }
+        if gen_defaults.temperature.is_some() {
+            config.default_temperature = gen_defaults.temperature;
+        }
+        if gen_defaults.top_k.is_some() {
+            config.default_top_k = gen_defaults.top_k;
+        }
+        if gen_defaults.top_p.is_some() {
+            config.default_top_p = gen_defaults.top_p;
         }
         let num_global = config
             .layer_types
@@ -2796,8 +2705,7 @@ impl Gemma4Inner {
         let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
         let mut checkpoint_load = CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
 
-        let _free_released =
-            crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
+        let _free_released = GgufPreloadGuard::enter(preload_input.is_some());
         let (mut params, ple_shards) =
             load_gemma_weights(path, &config, preload_input, ple_shard_byte_budget())?;
 
@@ -2953,10 +2861,7 @@ impl Gemma4Inner {
         // `apply_weights_mut` releases the row-major sources of Tiled64
         // K-quant projections from `params` (the model owns same-sized tiled
         // copies), so the map afterwards under-counts the resident weights.
-        let text_params_bytes: u64 = params
-            .values()
-            .map(|a| a.nbytes() as u64)
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let text_params_bytes: u64 = params_weight_bytes(&params);
 
         // Apply weights
         let plain_fp8_residency = apply_weights_mut(
@@ -3246,29 +3151,24 @@ impl Gemma4Model {
     ) -> Result<Self> {
         let path = Path::new(model_path);
         let mut draft_model_path = options.and_then(|o| o.draft_model_path);
-        let source = CheckpointSource::resolve(path, NativeGgufFamily::Gemma4).await?;
-        let loaded = async {
-            // A GGUF keeps sibling draft discovery from the directory it was
-            // given in; an explicit draft option still wins.
-            if matches!(source, CheckpointSource::Gguf(_))
-                && draft_model_path.is_none()
-                && !path.join(GGUF_SOURCE_FILE).is_file()
-            {
-                let dir = if path.is_dir() {
-                    path
-                } else {
-                    path.parent().unwrap_or(Path::new("."))
-                };
-                draft_model_path = resolve_draft_model_path(dir, None)?
-                    .map(|path| path.to_string_lossy().into_owned());
-            }
-            Self::load_with_source(&source, draft_model_path).await
+        let lease = CheckpointLeaseGuard::resolve(path, NativeGgufFamily::Gemma4).await?;
+        // A GGUF keeps sibling draft discovery from the directory it was
+        // given in; an explicit draft option still wins.
+        if matches!(lease.source(), CheckpointSource::Gguf(_))
+            && draft_model_path.is_none()
+            && !path.join(GGUF_SOURCE_FILE).is_file()
+        {
+            let dir = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(Path::new("."))
+            };
+            draft_model_path = resolve_draft_model_path(dir, None)?
+                .map(|path| path.to_string_lossy().into_owned());
         }
-        .await;
-        if loaded.is_err() {
-            source.release_lease();
-        }
-        loaded
+        let loaded = Self::load_with_source(lease.source(), draft_model_path).await?;
+        lease.commit();
+        Ok(loaded)
     }
 
     /// The caller releases `source`'s lease when this fails.
@@ -3285,15 +3185,20 @@ impl Gemma4Model {
             }
         };
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
+        let (
+            thread,
+            (
+                model_id,
+                has_vision,
+                has_audio,
+                guards,
+                paged_active,
+                max_concurrent_sequences,
+                draft_active,
+            ),
+        ) = spawn_loaded_model_thread(
+            "Model thread exited during load",
             move || {
-                // `Gemma4Inner::load_from_dir` returns a deterministic
-                // weight-byte total alongside the inner; register it
-                // with the cache-limit coordinator here so the guard
-                // can be carried up to `Gemma4Model`. No active-memory
-                // sampling — the deterministic path is race-free
-                // against concurrent inference. See `cache_limit.rs`
-                // module docs.
                 let (inner, weight_bytes) = Gemma4Inner::load_from_source(
                     &model_path,
                     preload_input,
@@ -3306,9 +3211,7 @@ impl Gemma4Model {
                     .transpose()
                     .map_err(Error::from_reason)?
                     .unwrap_or(0);
-                let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-                let pool_cache_limit_guard = (pool_bytes != 0)
-                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+                let guards = register_loaded_weights_and_pool(weight_bytes, pool_bytes, None);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_path_loaded();
                 let has_audio = inner.embed_audio.is_some();
@@ -3329,8 +3232,7 @@ impl Gemma4Model {
                         model_id,
                         has_vision,
                         has_audio,
-                        cache_limit_guard,
-                        pool_cache_limit_guard,
+                        guards,
                         paged_active,
                         max_concurrent_sequences,
                         draft_active,
@@ -3338,22 +3240,11 @@ impl Gemma4Model {
                 ))
             },
             |state, receiver| state.drive(receiver),
-        );
+        )
+        .await?;
 
-        let (
-            model_id,
-            has_vision,
-            has_audio,
-            cache_limit_guard,
-            pool_cache_limit_guard,
-            paged_active,
-            max_concurrent_sequences,
-            draft_active,
-        ) = match init_rx.await {
-            Ok(Ok(init)) => init,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(napi::Error::from_reason("Model thread exited during load")),
-        };
+        let cache_limit_guard = guards.cache_limit;
+        let pool_cache_limit_guard = guards.pool_cache_limit;
 
         Ok(Gemma4Model {
             thread: Some(thread),

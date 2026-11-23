@@ -20,7 +20,8 @@ use crate::array::MxArray;
 use crate::cold_tier::parse_bool_env;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, params_weight_bytes,
+    prewarm_checkpoint_pages, register_loaded_weights_and_pool, spawn_loaded_model_thread,
 };
 use crate::models::paged_config::PagedCacheConfig;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -541,7 +542,8 @@ pub(crate) fn load_inner_for_test(model_path: &Path) -> Result<Qwen3Inner> {
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
+    let (thread, (config, tokenizer, guards, paged_active)) = spawn_loaded_model_thread(
+        "Model thread exited during load",
         move || {
             let path = Path::new(&model_path);
 
@@ -701,13 +703,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     }
 
                     // Deterministic weight-byte total for the cache-limit
-                    // coordinator. `saturating_add` over the per-tensor
-                    // `nbytes()` so a pathological (corrupted) checkpoint
-                    // can't overflow. See `cache_limit.rs` module docs.
-                    let weight_bytes: u64 = mapped_params
-                        .values()
-                        .map(|a| a.nbytes() as u64)
-                        .fold(0u64, |acc, v| acc.saturating_add(v));
+                    // coordinator. See `cache_limit.rs` module docs.
+                    let weight_bytes = params_weight_bytes(&mapped_params);
                     let pool_bytes = inner.paged_pool_allocated_bytes()?;
 
                     let paged_active = inner.paged_adapter.is_some();
@@ -720,38 +717,32 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         paged_active,
                     ))
                 })();
-            let (inner, config, tokenizer, weight_bytes, pool_bytes, paged_active) = load_result?;
-            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-            let pool_cache_limit_guard = (pool_bytes != 0)
-                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+            let (mut inner, config, tokenizer, weight_bytes, pool_bytes, paged_active) =
+                load_result?;
+            let guards = register_loaded_weights_and_pool(
+                weight_bytes,
+                pool_bytes,
+                inner.pool_cache_limit_guard.take(),
+            );
             let config_out = config.clone();
             let tokenizer_out = Some(Arc::new(tokenizer));
 
             Ok((
                 QwenSchedulerState::new(inner)?,
-                (
-                    config_out,
-                    tokenizer_out,
-                    cache_limit_guard,
-                    pool_cache_limit_guard,
-                    paged_active,
-                ),
+                (config_out, tokenizer_out, guards, paged_active),
             ))
         },
         |state, receiver| state.drive(receiver),
-    );
-
-    let (config, tokenizer, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    )
+    .await?;
 
     Ok(Qwen3Model {
         thread,
         config: config.clone(),
         tokenizer,
         paged_active,
-        _cache_limit_guard: cache_limit_guard,
-        _pool_cache_limit_guard: pool_cache_limit_guard,
+        _cache_limit_guard: guards.cache_limit,
+        _pool_cache_limit_guard: guards.pool_cache_limit,
     })
 }
 

@@ -236,14 +236,11 @@ fn drive(inner: &mut Inner, until: impl Fn(&Inner) -> bool) {
 
 /// One drive pass's disk tick, as the scheduler makes it.
 fn tick(inner: &mut Inner) {
-    inner.tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Poll);
+    inner.tick_state_disk(crate::disk_tier::state_disk::Tick::Poll);
 }
 
 /// The entry of the stored state at `depth`.
-fn entry_at(
-    inner: &Inner,
-    depth: usize,
-) -> &crate::models::qwen3_5::dflash2_state::store::Entry<prefix_state::Cell> {
+fn entry_at(inner: &Inner, depth: usize) -> &crate::disk_tier::store::Entry<prefix_state::Cell> {
     inner
         .prefix_states
         .store
@@ -1820,7 +1817,7 @@ fn memory_takes_the_ram_copy_and_keeps_the_disk_state() {
     }
     let held = inner.prefix_states.bytes();
     let need = memory::state_bytes(&inner.decoder.config, 32, GRID as u64, inner.has_mtp)
-        + crate::models::qwen3_5::dflash2_state::store::lineage_bytes(32, 1);
+        + crate::disk_tier::store::lineage_bytes(32, 1);
     inner.prefix_states.room_override = Some(held + need - 1);
     turn(&mut inner, 2, &prompt(40, 2));
     finish(&mut inner);
@@ -2058,7 +2055,7 @@ fn written_state_first(
     inner: &mut Inner,
     tokens: &[u32],
 ) -> (
-    crate::models::qwen3_5::dflash2_state::store::EntryId,
+    crate::disk_tier::store::EntryId,
     mlx_paged_attn::ColdCacheKey,
 ) {
     disk_mut(inner).delay = Duration::ZERO;

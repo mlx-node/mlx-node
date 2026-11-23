@@ -1,7 +1,6 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Activations, RoPE, rms_norm_unscaled};
 use crate::transformer::paged_kv_cache_adapter::{
@@ -10,10 +9,10 @@ use crate::transformer::paged_kv_cache_adapter::{
 use crate::transformer::paged_policy::{
     gather_kv_for_decode_with_route_and_fallback, write_kv_chunk,
 };
+use crate::transformer::{HybridLayerCache, PagedWindowSlot, WindowCarrier};
 use napi::bindgen_prelude::*;
 
 use super::config::{LayerKind, MuseGlimmerTextConfig};
-use super::kv_cache::{PagedWindowSlot, WindowCarrier};
 
 /// Muse-Glimmer's gated GQA attention. Q/K normalization is weightless in the
 /// HF model; the official GGUF synthesizes scale tensors, which the converter
@@ -74,7 +73,7 @@ impl MuseGlimmerAttention {
         })
     }
 
-    pub fn forward(&self, x: &MxArray, cache: &mut Gemma4LayerCache) -> Result<MxArray> {
+    pub fn forward(&self, x: &MxArray, cache: &mut HybridLayerCache) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 3 {
             return Err(Error::from_reason(format!(

@@ -8,9 +8,11 @@ use napi_derive::napi;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
+#[cfg(test)]
+use crate::engine::backend::SpecFrontier;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
@@ -18,7 +20,6 @@ use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
-use crate::engine::spec_paged::SpecPagedCache;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -33,8 +34,8 @@ use crate::transformer::paged_kv_cache_adapter::{
 };
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
 use crate::transformer::{
-    AttentionKind, KVCacheCoordinator, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout,
-    LayerKVCacheRoute, LayerKVCacheSpec, group_layer_kv_cache_specs,
+    AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheRoute,
+    LayerKVCacheSpec, group_layer_kv_cache_specs,
 };
 
 use crate::models::gemma4::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
@@ -131,10 +132,14 @@ use self::sliding::{
     create_sliding_mask, gemma4_coalesce_single_token_restore_chunks, gemma4_cold_rung_candidates,
     gemma4_paged_prefill_body_chunk_plan, gemma4_paged_prefill_group_max_chunk,
     gemma4_sliding_caches_ready_at, gemma4_sliding_cold_ladder_wanted,
-    gemma4_sliding_cold_sidecar_chain_key, gemma4_sliding_retention_caps_for_cold_tier,
-    gemma4_vlm_prefill_chunk_end, gemma4_vlm_prefix_policy, materialize_gemma4_sliding_snapshots,
-    prefill_body_gemma4, resolve_grouped_sliding_cold_checkpoint, restore_gemma4_sliding_caches,
-    snapshot_gemma4_sliding_caches, upsert_gemma4_sliding_prefix_checkpoint,
+    gemma4_sliding_retention_caps_for_cold_tier, gemma4_vlm_prefill_chunk_end,
+    gemma4_vlm_prefix_policy, materialize_gemma4_sliding_snapshots, prefill_body_gemma4,
+    restore_gemma4_sliding_caches, snapshot_gemma4_sliding_caches,
+    upsert_gemma4_sliding_prefix_checkpoint,
+};
+#[cfg(test)]
+use self::sliding::{
+    gemma4_sliding_cold_sidecar_chain_key, resolve_grouped_sliding_cold_checkpoint,
 };
 pub(crate) use self::stream::Gemma4Draft;
 use self::stream::{

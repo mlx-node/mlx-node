@@ -1,8 +1,11 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, NATIVE_GGUF_ASSETS_PREFIX, native_gguf_assets_dir_name, native_gguf_cache_root,
-    native_gguf_lease_in_use, native_gguf_lease_in_use_retry, native_gguf_sidecar_mutex,
-    native_gguf_unlease_in_use, source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    GgufMetaValue, acquire_leased_gguf_assets_sidecar, native_gguf_cache_root,
+    write_embedded_gpt2_tokenizer,
+};
+#[cfg(all(test, unix))]
+use crate::utils::gguf::{
+    NATIVE_GGUF_ASSETS_PREFIX, native_gguf_assets_dir_name, source_file_identity_digest,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -165,198 +168,9 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
     assets_in(first, store, c, &native_gguf_cache_root()?)
 }
 
-/// Per-sidecar lock shared with the native-GGUF sweep: a held lock makes the
-/// sweep skip the directory, so the hit check and the publish below cannot
-/// race a mid-flight eviction. The caller keeps the file open as a guard
-/// and retries briefly if acquiring it fails.
-fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(root.join(format!("{dir_name}.lock")))
-        .ok()?;
-    file.try_lock().ok()?;
-    Some(file)
-}
-
 fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {
-    // Serialize the whole hit-check → build → publish section within this
-    // process. `assets_sidecar_lock`'s BSD flock cannot do either job: a
-    // second fd from the same process "acquires" LOCK_EX while the first
-    // holds it — racing loads would both miss the `complete` checks and the
-    // loser's publish could remove the dir the winner returned — and the
-    // sweep's `native_gguf_try_entry_lock` would trivially win against this
-    // process's own fd, deleting the dir between the hit check and first
-    // use. `native_gguf_sidecar_mutex` closes both gaps; the sweep only
-    // try-locks it and skips its pass on contention. Lock order is process
-    // mutex → sidecar flock. A std Mutex held across a blocking flock is fine here —
-    // `assets_in` is synchronous by design — and a poisoned mutex still
-    // serializes.
-    let _process_lock = native_gguf_sidecar_mutex()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let source = first
-        .canonicalize()
-        .map_err(|e| Error::from_reason(e.to_string()))?;
-    let metadata = std::fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
-    let dir_name = native_gguf_assets_dir_name(&source_file_identity_digest(&source, &metadata));
-    let dir = root.join(&dir_name);
-    // A sidecar that cannot replace a leased `dir` lands at this
-    // deterministic same-pid name instead: the uuid temp it replaces could
-    // never be found again, and the sweep's `assets-live` grammar protects it
-    // while this pid and its lease live. The live dir has no lock of its own;
-    // the `{dir_name}.lock`
-    // guard below serializes every check/rename touching it in this process
-    // because only the sidecar for `identity` can ever produce it.
-    let live_dir_name = format!(
-        ".mlx-qwen4-assets-live-{}-{}",
-        &dir_name[NATIVE_GGUF_ASSETS_PREFIX.len()..],
-        std::process::id()
-    );
-    let live_dir = root.join(&live_dir_name);
-    let stamp_complete = |complete: &std::path::Path| {
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(complete) {
-            let _ = file.set_modified(std::time::SystemTime::now());
-        }
-    };
-    const ASSETS_LOCK_RETRIES: u32 = 40;
-    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
-    // The hit path never needs the exclusive lock: a `complete` dir is a
-    // load output a model may keep opening for the whole process lifetime,
-    // so the hit leases `dir` — registered in-process and
-    // pinned cross-process by a LOCK_SH on the sidecar lock file, which
-    // every deleter's LOCK_EX try-flock loses to. Winning SH before any
-    // deleter's EX means the dir cannot be mid-delete now; a recheck under
-    // the lease catches a dir that vanished before the lease landed. A
-    // foreign-held EX makes the lease fail — fall through to the exclusive
-    // publish path, which spins on the same lock and either hits `complete`
-    // under EX or republishes.
-    if dir.join("complete").exists() {
-        let mut leased = false;
-        for _ in 0..ASSETS_LOCK_RETRIES {
-            if native_gguf_lease_in_use(root, &dir, Some(&dir_name)) {
-                leased = true;
-                break;
-            }
-            std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
-        }
-        if leased {
-            if dir.join("complete").exists() {
-                stamp_complete(&dir.join("complete"));
-                return Ok(dir);
-            }
-            // The dir vanished before the lease landed: drop the stale
-            // registration (it would pin the lock file against same-key
-            // republishes) and fall through to the exclusive publish path.
-            native_gguf_unlease_in_use(&dir);
-        }
-    }
-    for generation in 1..64_u32 {
-        let candidate = if generation == 1 {
-            live_dir.clone()
-        } else {
-            root.join(format!("{live_dir_name}-g{generation}"))
-        };
-        if candidate.join("complete").exists() {
-            // The completed live fallback from an earlier load in this
-            // process; reuse it rather than rebuilding (and rather than
-            // republishing — moving the path out from under a live reader).
-            // Live dirs have no lock file, so this lease is registry-only.
-            // Lease BEFORE the marker recheck: the sweep can now reclaim an
-            // unleased live dir, so the lease must land first and the
-            // recheck decides whether the dir still exists — the same
-            // vanished-under-lease pattern the `dir` hit path uses above.
-            native_gguf_lease_in_use(root, &candidate, None);
-            if candidate.join("complete").exists() {
-                stamp_complete(&candidate.join("complete"));
-                return Ok(candidate);
-            }
-            native_gguf_unlease_in_use(&candidate);
-        }
-        // Generations are allocated densely — the first missing one ends the
-        // search.
-        if !candidate.exists() {
-            break;
-        }
-    }
-    // Contention here is not an ordinary cache miss: a busy sidecar lock can
-    // be a sweep mid-`remove_dir_all` on this very directory.
-    // Publishing unguarded could land `rename(temp, dir)` while the sweep's
-    // delete is in flight, returning a path that no longer exists. Spin
-    // briefly — a sweep's delete is short — and publish only under the lock.
-    let mut guard = assets_sidecar_lock(root, &dir_name);
-    for _ in 0..ASSETS_LOCK_RETRIES {
-        if guard.is_some() {
-            break;
-        }
-        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
-        guard = assets_sidecar_lock(root, &dir_name);
-    }
-    // `_guard` keeps the exclusive sidecar lock held for the rest of this
-    // scope — the publish below must stay serialized against sweeps.
-    let Some(_guard) = guard else {
-        return Err(Error::from_reason(format!(
-            "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
-        )));
-    };
-    // Recheck under the exclusive lock — a publish may have completed while
-    // the lease attempts and lock spin were running.
-    if dir.join("complete").exists() {
-        // Lease pins the separate `{dir_name}.lease` sentinel — never the
-        // writer lock this path holds (a retained SH would brick later
-        // republishes; flock is per-open-description). The writer lock is
-        // held, so a `false` means the sentinel itself failed: fail the load
-        // rather than return a sidecar nothing protects from eviction.
-        if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
-            return Err(Error::from_reason(format!(
-                "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
-            )));
-        }
-        stamp_complete(&dir.join("complete"));
-        return Ok(dir);
-    }
-    // A markerless `dir` may still be leased by a loaded model — marker loss
-    // proves damage, not that nobody holds the path. Never unlease it: the
-    // publish guard below refuses a leased dir, and an unleased markerless
-    // dir is debris the publish may replace.
-    //
-    // Fallback when `dir` cannot be replaced: rename `temp` onto the first
-    // generation of the per-pid live name that is not leased. A completed
-    // live dir would have hit the reuse check above, so an existing
-    // unleased one is debris and is replaced; a leased one is kept and the
-    // next `-g{n}` name is tried. Live names are pid-gated by the sweep —
-    // per-process collisions are impossible.
-    let promote_live = |temp: &std::path::Path| -> Result<PathBuf> {
-        for generation in 1..64_u32 {
-            let candidate_name = if generation == 1 {
-                live_dir_name.clone()
-            } else {
-                format!("{live_dir_name}-g{generation}")
-            };
-            let candidate = root.join(&candidate_name);
-            if crate::utils::gguf::native_gguf_in_use_dir(&candidate) {
-                continue;
-            }
-            if candidate.exists() {
-                std::fs::remove_dir_all(&candidate)
-                    .map_err(|e| Error::from_reason(e.to_string()))?;
-            }
-            std::fs::rename(temp, &candidate).map_err(|e| Error::from_reason(e.to_string()))?;
-            return Ok(candidate);
-        }
-        Err(Error::from_reason(
-            "every .mlx-qwen4-assets-live generation for this source is leased",
-        ))
-    };
-    // Publish a complete directory in one rename while the sidecar lock is
-    // held: the sweep cannot delete `dir` between the rename and the return.
-    // Simultaneous loads serialize on the lock rather than racing temp dirs.
-    let temp = root.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&temp).map_err(|e| Error::from_reason(e.to_string()))?;
-    let result = (|| -> Result<PathBuf> {
-        if !write_embedded_gpt2_tokenizer(&store.metadata, &temp)? {
+    acquire_leased_gguf_assets_sidecar(first, root, |temp| {
+        if !write_embedded_gpt2_tokenizer(&store.metadata, temp)? {
             return Err(Error::from_reason(
                 "GGUF lacks a supported embedded tokenizer",
             ));
@@ -367,57 +181,14 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
                 .map_err(|e| Error::from_reason(e.to_string()))?,
         )
         .map_err(|e| Error::from_reason(e.to_string()))?;
-        std::fs::write(temp.join("complete"), b"1")
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        // A markerless `dir` a model still leases is promoted past
-        // rather than replaced — the lease probe needs no entry lock, which
-        // `_guard` already holds. An unleased remnant is debris removed under
-        // the guard: rename over a nonempty dir fails with EEXIST, and the
-        // guard must stay live through the remove so a racing leaser can
-        // only observe the replacement, never straddle it.
-        let dir_guard = if dir.exists() {
-            match crate::utils::gguf::native_gguf_output_delete_guard(root, &dir) {
-                Some(guard) => Some(guard),
-                None => return promote_live(&temp),
-            }
-        } else {
-            None
-        };
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| Error::from_reason(e.to_string()))?;
-        }
-        std::fs::rename(&temp, &dir).map_err(|e| Error::from_reason(e.to_string()))?;
-        drop(dir_guard);
-        Ok(dir.clone())
-    })();
-    // Remove the temp in every outcome that did not rename it away (to `dir`
-    // or `live_dir`); no success path returns the temp itself.
-    if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-    // Whatever path the caller will hand to the model is a load output:
-    // lease it for the process lifetime (see the hit path above). A
-    // published result must not return unleased — nothing would stop a
-    // sweep evicting it under the live model. Live dirs — the base name
-    // and every `-g{n}` generation — have no lock file, so their lease is
-    // registry-only.
-    if let Ok(path) = &result {
-        if *path == dir {
-            if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
-                return Err(Error::from_reason(format!(
-                    "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
-                )));
-            }
-        } else {
-            native_gguf_lease_in_use(root, path, None);
-        }
-    }
-    result
+        Ok(())
+    })
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::utils::native_gguf_unlease_in_use;
     use std::fs::{self, FileTimes, OpenOptions};
     use std::os::unix::fs::PermissionsExt;
 

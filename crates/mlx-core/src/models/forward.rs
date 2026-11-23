@@ -143,7 +143,7 @@ impl CollectCacheArrays for crate::models::nemotron_h::layer_cache::NemotronHLay
     }
 }
 
-impl CollectCacheArrays for crate::models::gemma4::layer_cache::Gemma4LayerCache {
+impl CollectCacheArrays for crate::transformer::HybridLayerCache {
     fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
         self.collect_cache_arrays(out);
     }

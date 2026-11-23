@@ -409,6 +409,113 @@ pub fn fused_short_conv_ragged_taped(
     )
 }
 
+#[cfg(target_os = "macos")]
+fn record_ragged_tapes(
+    x: &MxArray,
+    histories: &[&mut MxArray],
+    cu_seqlens_q: &[usize],
+    channels: i64,
+    tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+) -> Result<()> {
+    let Some(tape_slots) = tapes else {
+        return Ok(());
+    };
+    if histories.len() == 1 {
+        *tape_slots[0] = Some(StreamShortConvTape {
+            hist_before: histories[0].clone(),
+            rows: x.clone(),
+        });
+    } else {
+        for (seq_idx, hist) in histories.iter().enumerate() {
+            let start = cu_seqlens_q[seq_idx] as i64;
+            let end = cu_seqlens_q[seq_idx + 1] as i64;
+            *tape_slots[seq_idx] = Some(StreamShortConvTape {
+                hist_before: (*hist).clone(),
+                rows: x.slice(&[start, 0], &[end, channels])?,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_cu_seqlens(
+    num_seqs: usize,
+    cu_seqlens_q: &[usize],
+    cu_seqlens_arr: Option<&MxArray>,
+) -> Result<Option<MxArray>> {
+    if num_seqs <= 1 {
+        return Ok(None);
+    }
+    match cu_seqlens_arr {
+        Some(arr) => Ok(Some(arr.clone())),
+        None => {
+            let vals: Vec<i32> = cu_seqlens_q.iter().map(|&v| v as i32).collect();
+            Ok(Some(MxArray::from_int32(&vals, &[vals.len() as i64])?))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_back_ragged_histories(
+    histories: &mut [&mut MxArray],
+    hist_out: MxArray,
+    channels: i64,
+) -> Result<()> {
+    if histories.len() == 1 {
+        *histories[0] = hist_out;
+    } else {
+        for (seq_idx, hist) in histories.iter_mut().enumerate() {
+            let s_i64 = seq_idx as i64;
+            **hist = hist_out
+                .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, channels])?
+                .squeeze(Some(&[0]))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_ragged_history<R>(
+    histories: &mut [&mut MxArray],
+    channels: i64,
+    dispatch: impl FnOnce(&[&MxArray], bool) -> Result<(R, MxArray)>,
+) -> Result<R> {
+    let (res, hist_out) = if histories.len() <= 4 {
+        let h_refs: Vec<&MxArray> = histories.iter().map(|h| &**h).collect();
+        dispatch(&h_refs, false)?
+    } else {
+        let h_refs: Vec<&MxArray> = histories.iter().map(|h| &**h).collect();
+        let packed = MxArray::stack(h_refs, Some(0))?;
+        dispatch(&[&packed], true)?
+    };
+    write_back_ragged_histories(histories, hist_out, channels)?;
+    Ok(res)
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_ragged_kv_histories<R>(
+    k_histories: &mut [&mut MxArray],
+    v_histories: &mut [&mut MxArray],
+    channels: i64,
+    dispatch: impl FnOnce(&[&MxArray], &[&MxArray], bool) -> Result<(R, MxArray, MxArray)>,
+) -> Result<R> {
+    let (res, kh_out, vh_out) = if k_histories.len() <= 4 {
+        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
+        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
+        dispatch(&kh_refs, &vh_refs, false)?
+    } else {
+        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
+        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
+        let kh_p = MxArray::stack(kh_refs, Some(0))?;
+        let vh_p = MxArray::stack(vh_refs, Some(0))?;
+        dispatch(&[&kh_p], &[&vh_p], true)?
+    };
+    write_back_ragged_histories(k_histories, kh_out, channels)?;
+    write_back_ragged_histories(v_histories, vh_out, channels)?;
+    Ok(res)
+}
+
 /// Single-dispatch ragged causal `k=4` ShortConv across `N >= 1` packed sequences with optional
 /// FP32 residual epilogue (`res_a` + optional `res_b` + `conv_out`) and optional speculative
 /// rollback tape capture (`hist_before`, pre-conv `rows`).
@@ -436,74 +543,27 @@ pub fn fused_short_conv_ragged_residual_taped(
 
     #[cfg(target_os = "macos")]
     if unsafe { mlx_sys::mlx_metal_is_available() } && weight.shape()?[1] == 4 && all_non_empty {
-        if let Some(ref mut tape_slots) = tapes {
-            if num_seqs == 1 {
-                *tape_slots[0] = Some(StreamShortConvTape {
-                    hist_before: histories[0].clone(),
-                    rows: x.clone(),
-                });
-            } else {
-                for (seq_idx, hist) in histories.iter().enumerate() {
-                    let start = cu_seqlens_q[seq_idx] as i64;
-                    let end = cu_seqlens_q[seq_idx + 1] as i64;
-                    let x_seq = x.slice(&[start, 0], &[end, c])?;
-                    *tape_slots[seq_idx] = Some(StreamShortConvTape {
-                        hist_before: (*hist).clone(),
-                        rows: x_seq,
-                    });
-                }
-            }
-        }
+        record_ragged_tapes(x, histories, cu_seqlens_q, c, tapes)?;
         if num_seqs == 1 && res_a.is_none() && res_b.is_none() {
             let (y, hist_out) =
                 super::kernels::inkling2_sconv_k4(x, weight, histories[0], dyn_taps)?;
             *histories[0] = hist_out;
             return Ok(y);
         }
-        let cu_owned;
-        let cu_ref = if num_seqs > 1 {
-            match cu_seqlens_arr {
-                Some(arr) => Some(arr),
-                None => {
-                    let vals: Vec<i32> = cu_seqlens_q.iter().map(|&v| v as i32).collect();
-                    cu_owned = MxArray::from_int32(&vals, &[vals.len() as i64])?;
-                    Some(&cu_owned)
-                }
-            }
-        } else {
-            None
-        };
-        let (y, hist_out) = if num_seqs <= 4 {
-            let h_refs: Vec<&MxArray> = histories.iter().map(|h| &**h).collect();
-            super::kernels::inkling2_sconv_k4_ragged(
-                x, weight, dyn_taps, cu_ref, res_a, res_b, &h_refs, num_seqs, false,
-            )?
-        } else {
-            let h_refs: Vec<&MxArray> = histories.iter().map(|h| &**h).collect();
-            let packed = MxArray::stack(h_refs, Some(0))?;
+        let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
+        return dispatch_ragged_history(histories, c, |h_refs, stacked| {
             super::kernels::inkling2_sconv_k4_ragged(
                 x,
                 weight,
                 dyn_taps,
-                cu_ref,
+                cu_arr.as_ref(),
                 res_a,
                 res_b,
-                &[&packed],
+                h_refs,
                 num_seqs,
-                true,
-            )?
-        };
-        if num_seqs == 1 {
-            *histories[0] = hist_out;
-        } else {
-            for (seq_idx, hist) in histories.iter_mut().enumerate() {
-                let s_i64 = seq_idx as i64;
-                **hist = hist_out
-                    .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, c])?
-                    .squeeze(Some(&[0]))?;
-            }
-        }
-        return Ok(y);
+                stacked,
+            )
+        });
     }
 
     // Fallback (non-Metal, kernel_size != 4, or empty sequences)
@@ -580,8 +640,8 @@ pub fn fused_short_conv_kv_prep_taped(
     v_histories: &mut [&mut MxArray],
     cu_seqlens_q: &[usize],
     cu_seqlens_arr: Option<&MxArray>,
-    mut k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
-    mut v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
     num_kv_heads: usize,
     head_dim: usize,
     qk_thresh: f32,
@@ -602,117 +662,35 @@ pub fn fused_short_conv_kv_prep_taped(
         && v_weight.shape()?[1] == 4
         && all_non_empty
     {
-        if let Some(ref mut kt) = k_tapes {
-            if num_seqs == 1 {
-                *kt[0] = Some(StreamShortConvTape {
-                    hist_before: k_histories[0].clone(),
-                    rows: k_raw.clone(),
-                });
-            } else {
-                for (seq_idx, hist) in k_histories.iter().enumerate() {
-                    let st = cu_seqlens_q[seq_idx] as i64;
-                    let en = cu_seqlens_q[seq_idx + 1] as i64;
-                    *kt[seq_idx] = Some(StreamShortConvTape {
-                        hist_before: (*hist).clone(),
-                        rows: k_raw.slice(&[st, 0], &[en, kv_dim])?,
-                    });
-                }
-            }
-        }
-        if let Some(ref mut vt) = v_tapes {
-            if num_seqs == 1 {
-                *vt[0] = Some(StreamShortConvTape {
-                    hist_before: v_histories[0].clone(),
-                    rows: v_raw.clone(),
-                });
-            } else {
-                for (seq_idx, hist) in v_histories.iter().enumerate() {
-                    let st = cu_seqlens_q[seq_idx] as i64;
-                    let en = cu_seqlens_q[seq_idx + 1] as i64;
-                    *vt[seq_idx] = Some(StreamShortConvTape {
-                        hist_before: (*hist).clone(),
-                        rows: v_raw.slice(&[st, 0], &[en, kv_dim])?,
-                    });
-                }
-            }
-        }
-        let cu_owned;
-        let cu_ref = if num_seqs > 1 {
-            match cu_seqlens_arr {
-                Some(arr) => Some(arr),
-                None => {
-                    let vals: Vec<i32> = cu_seqlens_q.iter().map(|&v| v as i32).collect();
-                    cu_owned = MxArray::from_int32(&vals, &[vals.len() as i64])?;
-                    Some(&cu_owned)
-                }
-            }
-        } else {
-            None
-        };
-        let (k_cur, v_cur, kh_out, vh_out) = if num_seqs <= 4 {
-            let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
-            let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
-            super::kernels::inkling2_sconv_k4_kv_prep(
-                k_raw,
-                v_raw,
-                k_weight,
-                v_weight,
-                dyn_k,
-                dyn_v,
-                cu_ref,
-                &kh_refs,
-                &vh_refs,
-                num_seqs,
-                false,
-                num_kv_heads,
-                head_dim,
-                qk_thresh,
-                v_eps,
-                1e-6,
-            )?
-        } else {
-            let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
-            let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
-            let kh_p = MxArray::stack(kh_refs, Some(0))?;
-            let vh_p = MxArray::stack(vh_refs, Some(0))?;
-            super::kernels::inkling2_sconv_k4_kv_prep(
-                k_raw,
-                v_raw,
-                k_weight,
-                v_weight,
-                dyn_k,
-                dyn_v,
-                cu_ref,
-                &[&kh_p],
-                &[&vh_p],
-                num_seqs,
-                true,
-                num_kv_heads,
-                head_dim,
-                qk_thresh,
-                v_eps,
-                1e-6,
-            )?
-        };
-        if num_seqs == 1 {
-            *k_histories[0] = kh_out;
-            *v_histories[0] = vh_out;
-        } else {
-            for (seq_idx, (kh, vh)) in k_histories
-                .iter_mut()
-                .zip(v_histories.iter_mut())
-                .enumerate()
-            {
-                let s_i64 = seq_idx as i64;
-                **kh = kh_out
-                    .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
-                    .squeeze(Some(&[0]))?;
-                **vh = vh_out
-                    .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
-                    .squeeze(Some(&[0]))?;
-            }
-        }
-        return Ok((k_cur, v_cur));
+        record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
+        record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
+        let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
+        return dispatch_ragged_kv_histories(
+            k_histories,
+            v_histories,
+            kv_dim,
+            |kh, vh, stacked| {
+                let (k_cur, v_cur, kh_out, vh_out) = super::kernels::inkling2_sconv_k4_kv_prep(
+                    k_raw,
+                    v_raw,
+                    k_weight,
+                    v_weight,
+                    dyn_k,
+                    dyn_v,
+                    cu_arr.as_ref(),
+                    kh,
+                    vh,
+                    num_seqs,
+                    stacked,
+                    num_kv_heads,
+                    head_dim,
+                    qk_thresh,
+                    v_eps,
+                    1e-6,
+                )?;
+                Ok(((k_cur, v_cur), kh_out, vh_out))
+            },
+        );
     }
 
     // Fallback
@@ -748,8 +726,8 @@ pub fn fused_short_conv_kv_prep_paged_taped(
     v_histories: &mut [&mut MxArray],
     cu_seqlens_q: &[usize],
     cu_seqlens_arr: Option<&MxArray>,
-    mut k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
-    mut v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
     k_pool: &MxArray,
     v_pool: &MxArray,
     k_scale: &MxArray,
@@ -780,134 +758,40 @@ pub fn fused_short_conv_kv_prep_paged_taped(
         return Ok(None);
     }
 
-    if let Some(ref mut kt) = k_tapes {
-        if num_seqs == 1 {
-            *kt[0] = Some(StreamShortConvTape {
-                hist_before: k_histories[0].clone(),
-                rows: k_raw.clone(),
-            });
-        } else {
-            for (seq_idx, hist) in k_histories.iter().enumerate() {
-                let st = cu_seqlens_q[seq_idx] as i64;
-                let en = cu_seqlens_q[seq_idx + 1] as i64;
-                *kt[seq_idx] = Some(StreamShortConvTape {
-                    hist_before: (*hist).clone(),
-                    rows: k_raw.slice(&[st, 0], &[en, kv_dim])?,
-                });
-            }
-        }
-    }
-    if let Some(ref mut vt) = v_tapes {
-        if num_seqs == 1 {
-            *vt[0] = Some(StreamShortConvTape {
-                hist_before: v_histories[0].clone(),
-                rows: v_raw.clone(),
-            });
-        } else {
-            for (seq_idx, hist) in v_histories.iter().enumerate() {
-                let st = cu_seqlens_q[seq_idx] as i64;
-                let en = cu_seqlens_q[seq_idx + 1] as i64;
-                *vt[seq_idx] = Some(StreamShortConvTape {
-                    hist_before: (*hist).clone(),
-                    rows: v_raw.slice(&[st, 0], &[en, kv_dim])?,
-                });
-            }
-        }
-    }
+    record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
+    record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
+    let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
 
-    let cu_owned;
-    let cu_ref = if num_seqs > 1 {
-        match cu_seqlens_arr {
-            Some(arr) => Some(arr),
-            None => {
-                let vals: Vec<i32> = cu_seqlens_q.iter().map(|&v| v as i32).collect();
-                cu_owned = MxArray::from_int32(&vals, &[vals.len() as i64])?;
-                Some(&cu_owned)
-            }
-        }
-    } else {
-        None
-    };
-
-    let (kp_out, vp_out, ks_out, vs_out, kh_out, vh_out) = if num_seqs <= 4 {
-        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
-        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
-        super::kernels::inkling2_sconv_k4_kv_prep_paged(
-            k_raw,
-            v_raw,
-            k_weight,
-            v_weight,
-            dyn_k,
-            dyn_v,
-            cu_ref,
-            &kh_refs,
-            &vh_refs,
-            k_pool,
-            v_pool,
-            k_scale,
-            v_scale,
-            slot_mapping,
-            num_seqs,
-            false,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            kv_mode,
-            qk_thresh,
-            v_eps,
-            1e-6,
-        )?
-    } else {
-        let kh_refs: Vec<&MxArray> = k_histories.iter().map(|h| &**h).collect();
-        let vh_refs: Vec<&MxArray> = v_histories.iter().map(|h| &**h).collect();
-        let kh_p = MxArray::stack(kh_refs, Some(0))?;
-        let vh_p = MxArray::stack(vh_refs, Some(0))?;
-        super::kernels::inkling2_sconv_k4_kv_prep_paged(
-            k_raw,
-            v_raw,
-            k_weight,
-            v_weight,
-            dyn_k,
-            dyn_v,
-            cu_ref,
-            &[&kh_p],
-            &[&vh_p],
-            k_pool,
-            v_pool,
-            k_scale,
-            v_scale,
-            slot_mapping,
-            num_seqs,
-            true,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            kv_mode,
-            qk_thresh,
-            v_eps,
-            1e-6,
-        )?
-    };
-
-    if num_seqs == 1 {
-        *k_histories[0] = kh_out;
-        *v_histories[0] = vh_out;
-    } else {
-        for (seq_idx, (kh, vh)) in k_histories
-            .iter_mut()
-            .zip(v_histories.iter_mut())
-            .enumerate()
-        {
-            let s_i64 = seq_idx as i64;
-            **kh = kh_out
-                .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
-                .squeeze(Some(&[0]))?;
-            **vh = vh_out
-                .slice(&[s_i64, 0, 0], &[s_i64 + 1, 3, kv_dim])?
-                .squeeze(Some(&[0]))?;
-        }
-    }
-    Ok(Some((kp_out, vp_out, ks_out, vs_out)))
+    let out = dispatch_ragged_kv_histories(k_histories, v_histories, kv_dim, |kh, vh, stacked| {
+        let (kp_out, vp_out, ks_out, vs_out, kh_out, vh_out) =
+            super::kernels::inkling2_sconv_k4_kv_prep_paged(
+                k_raw,
+                v_raw,
+                k_weight,
+                v_weight,
+                dyn_k,
+                dyn_v,
+                cu_arr.as_ref(),
+                kh,
+                vh,
+                k_pool,
+                v_pool,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                num_seqs,
+                stacked,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                kv_mode,
+                qk_thresh,
+                v_eps,
+                1e-6,
+            )?;
+        Ok(((kp_out, vp_out, ks_out, vs_out), kh_out, vh_out))
+    })?;
+    Ok(Some(out))
 }
 
 #[cfg(test)]

@@ -305,6 +305,53 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Assemble a [`ChatResult`] from already-decoded/parsed fields and shared
+/// turn metadata in `args`.
+///
+/// When `finish_reason_override` is `Some(reason)`, it replaces
+/// `args.finish_reason` (e.g. `"tool_calls"` when valid tool calls were parsed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_parsed_chat_result(
+    args: FinalizeArgs<'_>,
+    text: String,
+    tool_calls: Vec<tools::ToolCallResult>,
+    thinking: Option<String>,
+    finish_reason_override: Option<&str>,
+    raw_text: String,
+    public_raw_text: Option<String>,
+) -> ChatResult {
+    let finish_reason = finish_reason_override
+        .map(str::to_owned)
+        .unwrap_or(args.finish_reason);
+    ChatResult {
+        text,
+        tool_calls,
+        thinking,
+        // The session core overwrites this with the effective Jinja kwarg
+        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
+        // family finalizer returns. Keeping the decode-time value here makes
+        // direct/non-session callers conservative and fully initializes the
+        // shared result type.
+        thinking_enabled: args.thinking_enabled,
+        num_tokens: args.generated_tokens.len() as u32,
+        prompt_tokens: args.prompt_tokens,
+        reasoning_tokens: args.reasoning.tokens,
+        reasoning_close: args.reasoning.close_name(),
+        reasoning_cut_at: args.reasoning.cut_at,
+        reasoning_cycle_period: args.reasoning.cycle_period,
+        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+        finish_reason,
+        raw_text,
+        public_raw_text,
+        // Callers that reused a cached prefix overwrite this via their own
+        // `cached_prefix_len as u32` after this function returns. Defaulting
+        // to zero keeps the behavior of callers that do not (yet) thread
+        // the value through intact.
+        cached_tokens: 0,
+        performance: args.performance,
+    }
+}
+
 pub(crate) fn finalize_chat_result_with(
     args: FinalizeArgs<'_>,
     parse: impl FnOnce(&str, &FinalizeArgs<'_>) -> (String, Vec<tools::ToolCallResult>, Option<String>),
@@ -319,47 +366,27 @@ pub(crate) fn finalize_chat_result_with(
             tracing::warn!("Failed to decode generated tokens: {}", e);
             String::new()
         });
-    let num_tokens = args.generated_tokens.len() as u32;
     let (clean_text, tool_calls, thinking) = parse(&text, &args);
     let public_raw_text = scrub(&text, &args);
     // If we have valid tool calls, override finish reason
-    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-        "tool_calls".to_string()
-    } else {
-        args.finish_reason
-    };
+    let finish_reason_override = tool_calls
+        .iter()
+        .any(|tc| tc.status == "ok")
+        .then_some("tool_calls");
     let raw_text = if args.include_reasoning {
         text
     } else {
         public_raw_text.clone()
     };
-    Ok(ChatResult {
-        text: clean_text,
+    Ok(assemble_parsed_chat_result(
+        args,
+        clean_text,
         tool_calls,
         thinking,
-        // The session core overwrites this with the effective Jinja kwarg
-        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
-        // family finalizer returns. Keeping the decode-time value here makes
-        // direct/non-session callers conservative and fully initializes the
-        // shared result type.
-        thinking_enabled: args.thinking_enabled,
-        num_tokens,
-        prompt_tokens: args.prompt_tokens,
-        reasoning_tokens: args.reasoning.tokens,
-        reasoning_close: args.reasoning.close_name(),
-        reasoning_cut_at: args.reasoning.cut_at,
-        reasoning_cycle_period: args.reasoning.cycle_period,
-        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
-        finish_reason,
+        finish_reason_override,
         raw_text,
-        public_raw_text: Some(public_raw_text),
-        // Callers that reused a cached prefix overwrite this via their own
-        // `cached_prefix_len as u32` after this function returns. Defaulting
-        // to zero keeps the behavior of callers that do not (yet) thread
-        // the value through intact.
-        cached_tokens: 0,
-        performance: args.performance,
-    })
+        Some(public_raw_text),
+    ))
 }
 
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.

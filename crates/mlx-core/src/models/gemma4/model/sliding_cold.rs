@@ -1,6 +1,55 @@
 //! The sliding/cold-tier prefix state on Gemma4Inner: scheduled admission, grouped checkpoint publish and settle, sidecar capture and install, and the cold-tier context.
 
 use super::*;
+use crate::disk_tier::sliding_cold::{
+    GroupedSlidingCheckpoint, PreparedSlidingPrefix, SlidingSidecarCodec,
+    build_sliding_cold_tier_context, capture_grouped_sliding_cold_sidecar,
+    prepare_grouped_sliding_prefix, remember_grouped_sliding_cold_checkpoints,
+};
+
+impl GroupedSlidingCheckpoint for Gemma4GroupedSlidingColdCheckpoint {
+    fn new(boundary: u32, tokens: Vec<u32>, layer_kv: Vec<(MxArray, MxArray)>) -> Self {
+        Self {
+            boundary,
+            tokens,
+            layer_kv,
+        }
+    }
+
+    fn boundary(&self) -> u32 {
+        self.boundary
+    }
+
+    fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    fn layer_kv(&self) -> &[(MxArray, MxArray)] {
+        &self.layer_kv
+    }
+}
+
+impl SlidingSidecarCodec for sliding_sidecar::SlidingSidecarGeometry {
+    fn layout_at(&self, boundary: u32) -> mlx_paged_attn::ColdSidecarLayout {
+        sliding_sidecar::layout_at(self, boundary)
+    }
+
+    fn decode_layer_kv(
+        &self,
+        tensors: &[Vec<u8>],
+        boundary: u32,
+    ) -> Result<Option<Vec<(MxArray, MxArray)>>> {
+        sliding_sidecar::decode_layer_kv(self, tensors, boundary)
+    }
+
+    fn encode_layer_kv(
+        &self,
+        layer_kv: &[(MxArray, MxArray)],
+        boundary: u32,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        sliding_sidecar::encode_layer_kv(self, layer_kv, boundary)
+    }
+}
 
 impl Gemma4Inner {
     /// Prepare a scheduler text turn by finding one common prefix boundary for
@@ -15,109 +64,21 @@ impl Gemma4Inner {
         cache_salt: u64,
         reuse_cache: bool,
     ) -> Result<u32> {
-        let total_budget = tokens.len() as u32;
         let geometry = sliding_sidecar::geometry(&self.config);
         let coordinator = self
             .kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 scheduled route requires coordinator"))?;
-        let block_size = coordinator.full_adapter().block_size();
-        let extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let plan = coordinator
-            .full_adapter_mut()
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                tokens,
-                total_budget,
-                reuse_cache,
-                &extra_keys,
-                cache_salt,
-                false,
-                total_budget.saturating_sub(1),
-            )
-            .map_err(Error::from_reason)?;
-
-        if plan.continued_live_prefix {
-            if let Err(error) = coordinator.continue_sliding_all(
-                seq_id,
-                tokens,
-                total_budget,
-                plan.cached_prefix_len,
-            ) {
-                tracing::warn!(
-                    target: "mlx_core::gemma4::paged",
-                    "Gemma4 hybrid live continuation disagreed across groups; restarting cold: {error}"
-                );
-                coordinator
-                    .full_adapter_mut()
-                    .restart_prepared_turn_cold_per_block(
-                        seq_id,
-                        tokens,
-                        total_budget,
-                        &extra_keys,
-                        cache_salt,
-                    )
-                    .map_err(Error::from_reason)?;
-                coordinator
-                    .reset_sliding_requests(seq_id)
-                    .map_err(Error::from_reason)?;
-                return Ok(0);
-            }
-            return Ok(plan.cached_prefix_len);
-        }
-
-        if plan.cached_prefix_len == 0 {
-            coordinator
-                .reset_sliding_requests(seq_id)
-                .map_err(Error::from_reason)?;
-            return Ok(0);
-        }
-
-        let restored = coordinator.full_adapter_mut().take_restored_sidecar();
-        let installed_boundary = if let Some(geometry) = geometry.as_ref() {
-            let expected_layout = sliding_sidecar::layout_at(geometry, plan.cached_prefix_len);
-            crate::cold_tier::try_install_cold_sidecar(
-                restored,
-                &expected_layout,
-                |tensors, boundary| {
-                    let Some(layer_kv) =
-                        sliding_sidecar::decode_layer_kv(geometry, tensors, boundary)?
-                    else {
-                        return Ok(None);
-                    };
-                    if coordinator
-                        .restore_sliding_groups(seq_id, tokens, boundary, &layer_kv)
-                        .is_err()
-                    {
-                        return Ok(None);
-                    }
-                    Ok(Some(boundary))
-                },
-            )?
-        } else {
-            None
-        };
-        if let Some(boundary) = installed_boundary {
-            return Ok(boundary);
-        }
-
-        // A hot-only full-group hit is deliberately not enough: the sliding
-        // group has no matching state. Discard it and allocate a fresh request
-        // in every group.
-        coordinator
-            .full_adapter_mut()
-            .restart_prepared_turn_cold_per_block(
-                seq_id,
-                tokens,
-                total_budget,
-                &extra_keys,
-                cache_salt,
-            )
-            .map_err(Error::from_reason)?;
-        coordinator
-            .reset_sliding_requests(seq_id)
-            .map_err(Error::from_reason)?;
-        Ok(0)
+        prepare_grouped_sliding_prefix(
+            coordinator,
+            geometry.as_ref(),
+            seq_id,
+            tokens,
+            cache_salt,
+            reuse_cache,
+            "Gemma4",
+        )
+        .map(PreparedSlidingPrefix::cached_prefix_len)
     }
 
     pub(super) fn remember_grouped_sliding_cold_checkpoint(&mut self, seq_id: u32) -> Result<()> {
@@ -136,75 +97,28 @@ impl Gemma4Inner {
         seq_id: u32,
         committed_tokens: Option<u32>,
     ) -> Result<()> {
-        let candidates = {
-            let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
-                return Ok(());
-            };
+        let Some(coordinator) = self.kv_cache_coordinator.as_mut() else {
+            return Ok(());
+        };
+        let anchors = {
             let full = coordinator.full_adapter();
             let cold = full.cold_tier();
             if !gemma4_sliding_cold_ladder_wanted(cold) {
                 return Ok(());
             }
-            let Some(recorded) = full.current_token_count_for(seq_id) else {
-                return Ok(());
-            };
-            let frontier = committed_tokens.map_or(recorded, |committed| committed.min(recorded));
-            let block_size = full.block_size();
-            let caps = gemma4_sliding_retention_caps_for_cold_tier(&self.config, cold, block_size);
-            let Some(tokens) = full.request_tokens_for(seq_id) else {
-                return Ok(());
-            };
-            gemma4_cold_rung_candidates(caps.anchors.as_slice(), frontier)
-                .into_iter()
-                .filter_map(|boundary| {
-                    tokens
-                        .get(..boundary as usize)
-                        .map(|tokens| (boundary, tokens.to_vec(), caps.anchors.len))
-                })
-                .collect::<Vec<_>>()
+            gemma4_sliding_retention_caps_for_cold_tier(&self.config, cold, full.block_size())
+                .anchors
+                .as_slice()
+                .to_vec()
         };
-        for (boundary, tokens, max_checkpoints) in candidates {
-            if self
-                .grouped_sliding_cold_checkpoints
-                .get(&seq_id)
-                .is_some_and(|checkpoints| {
-                    checkpoints.iter().any(|checkpoint| {
-                        checkpoint.boundary == boundary && checkpoint.tokens == tokens
-                    })
-                })
-            {
-                continue;
-            }
-            let Some(layer_kv) = self
-                .kv_cache_coordinator
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::from_reason(
-                        "Gemma4 grouped cold capture lost its KV coordinator".to_string(),
-                    )
-                })?
-                .read_sliding_groups_at(seq_id, boundary)
-                .map_err(Error::from_reason)?
-            else {
-                // The scheduler may first observe an old rung after its rows
-                // have already rotated out. A later rung can still be captured;
-                // missing this one is a cache miss, not an inference failure.
-                continue;
-            };
-            let checkpoints = self
-                .grouped_sliding_cold_checkpoints
-                .entry(seq_id)
-                .or_default();
-            checkpoints.push_back(Gemma4GroupedSlidingColdCheckpoint {
-                boundary,
-                tokens,
-                layer_kv,
-            });
-            while checkpoints.len() > max_checkpoints.max(1) {
-                checkpoints.pop_front();
-            }
-        }
-        Ok(())
+        remember_grouped_sliding_cold_checkpoints(
+            &mut self.grouped_sliding_cold_checkpoints,
+            coordinator,
+            seq_id,
+            committed_tokens,
+            &anchors,
+            gemma4_cold_rung_candidates,
+        )
     }
 
     pub(super) fn settle_grouped_kv_step(&mut self, seq_id: u32) -> Result<()> {
@@ -271,120 +185,33 @@ impl Gemma4Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) {
-        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
-        let Some((block_size, frontier, request_tokens, anchors)) =
-            self.kv_cache_coordinator.as_ref().and_then(|coordinator| {
-                let full = coordinator.full_adapter();
-                let cold = full.cold_tier()?;
-                if cold
-                    .sidecar_policy()
-                    .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
-                {
-                    return None;
-                }
-                let block_size = full.block_size();
-                let request_tokens = full.request_tokens_for(seq_id)?.to_vec();
-                let anchors = gemma4_sliding_retention_caps_for_cold_tier(
-                    &self.config,
-                    Some(cold),
-                    block_size,
-                )
-                .anchors
-                .as_slice()
-                .to_vec();
-                Some((
-                    block_size,
-                    full.cold_captured_blocks().saturating_mul(block_size),
-                    request_tokens,
-                    anchors,
-                ))
-            })
-        else {
+        let Some(coordinator) = self.kv_cache_coordinator.as_mut() else {
+            crate::cold_tier::cold_sidecar_counters().record_capture_reached();
             return;
         };
-        let checkpoints = self.grouped_sliding_cold_checkpoints.get(&seq_id).cloned();
-        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
-            checkpoints.as_ref(),
+        let anchors = {
+            let full = coordinator.full_adapter();
+            gemma4_sliding_retention_caps_for_cold_tier(
+                &self.config,
+                full.cold_tier(),
+                full.block_size(),
+            )
+            .anchors
+            .as_slice()
+            .to_vec()
+        };
+        let geometry = sliding_sidecar::geometry(&self.config);
+        capture_grouped_sliding_cold_sidecar(
+            &mut self.grouped_sliding_cold_checkpoints,
+            coordinator,
+            geometry.as_ref(),
+            seq_id,
             &anchors,
-            frontier,
-            &request_tokens,
-            |boundary| {
-                self.kv_cache_coordinator
-                    .as_mut()
-                    .ok_or_else(|| {
-                        "Gemma4 grouped cold capture lost its KV coordinator".to_string()
-                    })?
-                    .read_sliding_groups_at(seq_id, boundary)
-            },
-        );
-        let Some(checkpoint) = (match checkpoint {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                tracing::debug!(
-                    target: "mlx_core::gemma4::paged",
-                    "Gemma4 grouped sliding live-anchor capture failed: {error}"
-                );
-                None
-            }
-        }) else {
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            return;
-        };
-        let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
-            return;
-        };
-        let full = coordinator.full_adapter();
-        let Some(cold) = full.cold_tier() else {
-            return;
-        };
-        let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
-            return;
-        };
-        let Some(key) = gemma4_sliding_cold_sidecar_chain_key(
-            cold.fingerprint,
-            &request_tokens,
             extra_keys_per_block,
-            block_size,
-            checkpoint.boundary,
             cache_salt,
-        ) else {
-            return;
-        };
-        if cold
-            .manager
-            .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
-        {
-            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-            return;
-        }
-        let refs = checkpoint
-            .layer_kv
-            .iter()
-            .flat_map(|(keys, values)| [keys, values])
-            .collect::<Vec<_>>();
-        if MxArray::eval_arrays(&refs).is_err() {
-            return;
-        }
-        let Ok(Some(tensors)) =
-            sliding_sidecar::encode_layer_kv(&geometry, &checkpoint.layer_kv, checkpoint.boundary)
-        else {
-            return;
-        };
-        let sidecar = mlx_paged_attn::ColdSidecar {
-            key,
-            fingerprint: cold.fingerprint,
-            layout: sliding_sidecar::layout_at(&geometry, checkpoint.boundary),
-            tensors,
-        };
-        let deadline = std::time::Instant::now() + full.cold_capture_budget().max_walk;
-        match cold.manager.enqueue_sidecar_before(sidecar, deadline) {
-            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
-            Ok(false) => crate::cold_tier::cold_sidecar_counters().record_queue_drop(),
-            Err(error) => tracing::debug!(
-                target: "mlx_core::gemma4::paged",
-                "Gemma4 grouped sliding sidecar enqueue failed: {error}"
-            ),
-        }
+            false,
+            "Gemma4",
+        );
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -874,48 +701,22 @@ impl Gemma4Inner {
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
         let adapter = self.kv_cache_coordinator.as_ref()?;
-        let manager = crate::cold_tier::global_cold_cache()?;
         // No sliding layers means no out-of-pool state — but it also means this
         // is not the hybrid gemma4 the sidecar work validated, so stay off
         // rather than silently behaving like a dense family.
         let geometry = sliding_sidecar::geometry(&self.config)?;
         let sidecar_policy = sliding_sidecar::policy(&self.config)?;
-        let mut config_json = serde_json::to_vec(&self.config).ok()?;
-        config_json.extend_from_slice(&geometry.fingerprint_component());
-        let pool = adapter.layer_kv_pool();
-        let pool_geometry = crate::cold_tier::ColdTierGeometry {
-            block_size: pool.block_size() as u64,
-            num_layers: pool.num_layers() as u64,
-            num_kv_heads: pool.config().num_kv_heads as u64,
-            head_size: pool.config().head_size as u64,
-            cache_dtype: format!("{:?}", pool.cache_dtype()),
-        };
-        match crate::cold_tier::build_model_fingerprint(
+        let config_json = serde_json::to_vec(&self.config).ok()?;
+        let geometry_component = geometry.fingerprint_component();
+        build_sliding_cold_tier_context(
             "gemma4",
+            adapter.full_adapter(),
+            &config_json,
+            &geometry_component,
+            sidecar_policy,
             files,
-            Some(&config_json),
-            &pool_geometry,
             weights,
-        ) {
-            Some(fingerprint) => Some(
-                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
-                    manager,
-                    fingerprint,
-                    backing:
-                        crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
-                            sidecar_policy,
-                        ),
-                },
-            ),
-            None => {
-                tracing::warn!(
-                    "cold-tier persistence disabled for {}: could not establish a \
-                     content fingerprint (unreadable or missing weight shard)",
-                    files.label()
-                );
-                None
-            }
-        }
+        )
     }
 
     /// Attach a previously-built cold-tier context to the paged adapter. A

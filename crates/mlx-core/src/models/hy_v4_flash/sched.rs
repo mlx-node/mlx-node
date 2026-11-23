@@ -531,7 +531,7 @@ pub struct Paged {
     pub restored: u64,
     pub spec: Spec,
     /// The stored states' disk tier; `None` when it is off.
-    pub disk: Option<Disk>,
+    pub(crate) disk: Option<Disk>,
     /// Each owner's keys of its cell's whole blocks, as its turns wrote them.
     pub lines: HashMap<SeqId, Vec<Vec<u64>>>,
     _pool: PoolCacheLimitGuard,
@@ -622,7 +622,7 @@ impl Paged {
 
     /// Hands the pool's blocks and the RAM states to `disk` and takes back
     /// what a persistent tier holds.
-    pub fn attach_disk(&mut self, disk: Disk) -> Result<u64> {
+    pub(crate) fn attach_disk(&mut self, disk: Disk) -> Result<u64> {
         disk.attach(&mut self.adapter)?;
         let mut disk = disk;
         let adopted = disk.adopt(self.states.store_mut());

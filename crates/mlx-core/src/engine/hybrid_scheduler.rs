@@ -259,20 +259,16 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     }
     /// One tick of the model's SSD tier for its states (Splash
     /// `Engine::tick` → `pollTransfers`); true when anything landed.
-    fn tick_state_disk(
-        &mut self,
-        _tick: crate::models::qwen3_5::dflash2_state::disk::Tick,
-    ) -> bool {
+    fn tick_state_disk(&mut self, _tick: crate::disk_tier::state_disk::Tick) -> bool {
         false
     }
     /// Sets the model's SSD state tier aside with the states it holds, so
     /// no turn reaches either until [`Self::release_state_tier`]; `None`
     /// when the model has no tier.
-    fn hold_state_tier(&mut self) -> Option<crate::models::qwen3_5::dflash2_state::disk::HeldTier> {
+    fn hold_state_tier(&mut self) -> Option<crate::disk_tier::state_disk::HeldTier> {
         None
     }
-    fn release_state_tier(&mut self, _held: crate::models::qwen3_5::dflash2_state::disk::HeldTier) {
-    }
+    fn release_state_tier(&mut self, _held: crate::disk_tier::state_disk::HeldTier) {}
     /// Runs a stored state's restore copy on `seq_id`'s live GDN cell and
     /// drops the copy; false when the sequence holds no cell.
     fn warm_state_restore(&mut self, _seq_id: SeqId) -> Result<bool> {
@@ -2431,7 +2427,7 @@ impl<B: HybridSchedulerBackend> UnitSources for SchedUnits<'_, B> {
     fn poll_landings(&mut self) {
         self.state
             .inner
-            .tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Poll);
+            .tick_state_disk(crate::disk_tier::state_disk::Tick::Poll);
     }
 }
 
@@ -6984,9 +6980,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         );
         let started = self.prefix_clock();
         self.inner
-            .tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Full {
-                command_pages,
-            });
+            .tick_state_disk(crate::disk_tier::state_disk::Tick::Full { command_pages });
         #[cfg(test)]
         if let Some(hook) = self.after_state_tick.as_mut() {
             hook();

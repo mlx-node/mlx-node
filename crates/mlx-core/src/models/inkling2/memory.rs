@@ -16,9 +16,10 @@ use crate::array::DType;
 use crate::disk_tier::CacheDisk;
 use crate::engine::memory_plan::{
     KvLayout, LaneShape, LiveMemory, Margin, MemoryFootprint, MemoryPlan, PlanError, PoolInput,
-    SPECULATIVE_SCRATCH_TOKENS, check_max_context,
+    SPECULATIVE_SCRATCH_TOKENS, check_max_context, decode_share_option,
+    lane_ceiling_for_physical_memory, max_memory_option,
+    resolve_kv_format as resolve_kv_format_shared, select_max_lanes_preserving_window,
 };
-use crate::engine::scheduler::DEFAULT_DECODE_SHARE;
 use crate::transformer::{Activations, KvFormat};
 
 use super::config::Inkling2Config;
@@ -26,13 +27,6 @@ use super::kv_cache::{
     INKLING2_PAGED_BLOCK_SIZE, INKLING2_PAGED_PREFILL_MAX_CHUNK, default_inkling2_kv_format,
     kv_format_metal_layout,
 };
-
-/// Physical memory threshold from which Inkling-2-Mini unlocks 8 concurrent lanes.
-/// A 256 GB Mac reports 256 GiB and a 192 GB Mac 192 GiB; 256 * 10^9 bytes sits between them.
-const ALL_LANES_PHYSICAL_BYTES: u64 = 256_000_000_000;
-
-/// Concurrent decode lane cap below 256 GB physical RAM.
-const SMALL_MACHINE_LANES: usize = 4;
 
 /// Concurrent decode lane cap at or above 256 GB physical RAM.
 const LARGE_MACHINE_LANES: usize = 8;
@@ -236,10 +230,7 @@ pub(crate) fn swa_pool_block_bounds(
 pub(crate) fn inkling2_lane_ceiling(physical_bytes: Option<u64>) -> usize {
     let max_units =
         crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS.max(LARGE_MACHINE_LANES);
-    match physical_bytes {
-        Some(bytes) if bytes >= ALL_LANES_PHYSICAL_BYTES => LARGE_MACHINE_LANES.min(max_units),
-        _ => SMALL_MACHINE_LANES.min(max_units),
-    }
+    lane_ceiling_for_physical_memory(physical_bytes, LARGE_MACHINE_LANES.min(max_units))
 }
 
 /// Effective scheduler lane ceiling after honoring `MLX_SCHED_MAX_NUM_SEQS` and `force_serial()`.
@@ -311,18 +302,13 @@ pub(crate) fn decode_transient_bytes(config: &Inkling2Config, lanes: u32) -> u64
 
 /// Parse and validate `kvFormat` load option (defaults to INT8 on Metal, BF16 elsewhere).
 pub(crate) fn resolve_kv_format(label: &str, requested: Option<&str>) -> Result<KvFormat> {
-    let Some(raw) = requested else {
-        return Ok(default_inkling2_kv_format());
-    };
-    let format =
-        KvFormat::parse(Some(raw)).map_err(|e| Error::from_reason(format!("{label} load: {e}")))?;
-    if format == KvFormat::Int8 && !crate::engine::persistence::compiled_forward_backend_available()
-    {
-        return Err(Error::from_reason(format!(
-            "{label} load: int8 K/V requires the Metal paged backend; load with kvFormat 'bf16'"
-        )));
-    }
-    Ok(format)
+    resolve_kv_format_shared(
+        &format!("{label} load"),
+        requested,
+        default_inkling2_kv_format(),
+        crate::engine::persistence::compiled_forward_backend_available(),
+        || "int8 K/V requires the Metal paged backend; load with kvFormat 'bf16'".to_string(),
+    )
 }
 
 /// Parse and validate `activations` load option (`'auto'` default on Metal, or `'bf16'`).
@@ -333,13 +319,7 @@ pub(crate) fn resolve_activations(label: &str, requested: Option<&str>) -> Resul
 
 /// Parse and validate `maxMemoryBytes`.
 pub(crate) fn resolve_max_memory(label: &str, raw: Option<i64>) -> Result<Option<u64>> {
-    match raw {
-        None => Ok(None),
-        Some(v) if v <= 0 => Err(Error::from_reason(format!(
-            "{label} load: maxMemoryBytes must be a positive byte count, got {v}"
-        ))),
-        Some(v) => Ok(Some(v as u64)),
-    }
+    max_memory_option(label, raw)
 }
 
 /// Parse and validate `maxContextTokens`.
@@ -369,13 +349,7 @@ pub(crate) fn resolve_max_context(
 
 /// Parse and validate `decodeShare` (non-negative finite float, default `0.5`).
 pub(crate) fn resolve_decode_share(label: &str, raw: Option<f64>) -> Result<f64> {
-    let value = raw.unwrap_or(DEFAULT_DECODE_SHARE);
-    if !value.is_finite() || value < 0.0 {
-        return Err(Error::from_reason(format!(
-            "{label} load: decodeShare must be a finite non-negative number, got {value}"
-        )));
-    }
-    Ok(value)
+    decode_share_option(label, raw)
 }
 
 /// Evaluate Inkling-2-Mini's unified [`MemoryPlan`] after weights are materialized.
@@ -471,27 +445,11 @@ pub(crate) fn evaluate_inkling2_plan(
         Ok((plan, swa_runway, swa_max))
     };
 
-    let (single_plan, single_swa_runway, single_swa_max) =
-        eval_for_lanes(1).map_err(|e| Error::from_reason(e.message(label)))?;
-    let single_window = single_plan
-        .pool
-        .as_ref()
-        .map_or(0, |p| p.lane.window.maximum());
-
-    let mut chosen = (single_plan, single_swa_runway, single_swa_max, 1u32);
-    for lanes in (2..=max_lanes.max(1)).rev() {
-        if let Ok((plan, swa_runway, swa_max)) = eval_for_lanes(lanes)
-            && plan
-                .pool
-                .as_ref()
-                .is_some_and(|p| p.lane.window.maximum() >= single_window)
-        {
-            chosen = (plan, swa_runway, swa_max, lanes);
-            break;
-        }
-    }
-
-    let (memory_plan, swa_runway_blocks, swa_max_blocks, lanes) = chosen;
+    let ((memory_plan, swa_runway_blocks, swa_max_blocks), lanes) =
+        select_max_lanes_preserving_window(max_lanes, eval_for_lanes, |(plan, _, _)| {
+            plan.pool.as_ref().map(|p| p.lane.window.maximum())
+        })
+        .map_err(|e| Error::from_reason(e.message(label)))?;
     let pool = memory_plan.pool.as_ref().ok_or_else(|| {
         Error::from_reason(format!("{label} memory plan: produced no KV pool plan"))
     })?;

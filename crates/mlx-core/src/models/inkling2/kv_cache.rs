@@ -20,13 +20,13 @@ use napi::bindgen_prelude::{Error, Result};
 use crate::engine::backend::SpecFrontier;
 use crate::engine::governor::governor::{Governor, ModelGuard, ModelRegistration};
 use crate::engine::spec_paged::SpecPagedCache;
-use crate::transformer::Activations;
 use crate::transformer::kv_cache::KvFormat;
 use crate::transformer::kv_cache_spec::{
-    AttentionKind, KVCacheCoordinator, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout,
-    LayerKVCacheRoute, LayerKVCacheSpec, group_layer_kv_cache_specs,
+    AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheRoute,
+    LayerKVCacheSpec, group_layer_kv_cache_specs,
 };
 use crate::transformer::paged_kv_cache_adapter::{ColdTierContext, PagedKVCacheAdapter};
+use crate::transformer::{Activations, HybridKVCacheCoordinator, PruneOnlySpecPagedCache};
 
 use super::config::Inkling2Config;
 use super::kernels::Inkling2KvDtype;
@@ -203,30 +203,17 @@ pub fn compute_visit_kv_cache_groups(
     Ok((specs, groups))
 }
 
-/// Per-group runtime manager owned by [`Inkling2KVCacheCoordinator`].
-enum Inkling2KVCacheGroupManager {
-    /// Marker aligned with [`Inkling2KVCacheCoordinator::full_adapter`].
-    Full,
-    SlidingWindow {
-        sliding_window: u32,
-        max_admission_blocks: u32,
-        adapter: Box<PagedKVCacheAdapter>,
-    },
-}
-
 /// Hybrid grouped block-paged KV cache coordinator for Inkling-2-Mini (8 Global + 40 SWA visits).
 ///
-/// Implements [`SpecPagedCache`] directly so Phase 5 DSpark verify/commit/rollback works
-/// atomically across both the Global and SWA cache groups.
+/// Thin wrapper over [`HybridKVCacheCoordinator`] carrying Inkling2's KV format/dtype/block
+/// metadata and strict-extension continuation semantics (`prompt.len() > live.len()`).
+/// Implements [`SpecPagedCache`] by delegating to [`PruneOnlySpecPagedCache`] so Phase 5
+/// DSpark verify/commit/rollback stays atomic across both the Global and SWA cache groups.
 pub struct Inkling2KVCacheCoordinator {
-    inner: KVCacheCoordinator<Inkling2KVCacheGroupManager>,
-    full_group_id: usize,
-    full_adapter: Box<PagedKVCacheAdapter>,
-    sliding_group_id: Option<usize>,
+    inner: HybridKVCacheCoordinator,
     kv_format: KvFormat,
     kv_dtype: Inkling2KvDtype,
     block_size: u32,
-    max_concurrent_sequences: u32,
 }
 
 impl Inkling2KVCacheCoordinator {
@@ -558,22 +545,12 @@ impl Inkling2KVCacheCoordinator {
 
     /// Hold every KV group's Metal pool resident under the global residency clock (`--idle-release`).
     pub fn hold_resident_all(&mut self) -> Result<()> {
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter(group_id).map_err(Error::from_reason)?;
-            adapter
-                .layer_kv_pool()
-                .hold_resident()
-                .map_err(Error::from_reason)?;
-        }
-        Ok(())
+        self.inner.hold_resident_all().map_err(Error::from_reason)
     }
 
     /// Host-transfer `(key_blob, value_blob)` byte lengths of one SWA block in one layer.
     pub fn sliding_block_blob_bytes(&self) -> std::result::Result<Option<(u64, u64)>, String> {
-        let Some(adapter) = self.sliding_adapter() else {
-            return Ok(None);
-        };
-        adapter.layer_kv_pool().block_blob_bytes().map(Some)
+        self.inner.sliding_block_blob_bytes()
     }
 
     /// Read raw physical SWA blocks covering the live window ending at block-aligned `boundary`.
@@ -582,10 +559,7 @@ impl Inkling2KVCacheCoordinator {
         seq_id: u32,
         boundary: u32,
     ) -> std::result::Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, String> {
-        let adapter = self
-            .sliding_adapter()
-            .ok_or_else(|| "Inkling2 KV coordinator has no sliding group".to_string())?;
-        adapter.read_sliding_raw_blocks_for(seq_id, boundary)
+        self.inner.read_sliding_raw_blocks_for(seq_id, boundary)
     }
 
     /// Restore raw physical SWA blocks into Group 1 at block-aligned `boundary`.
@@ -596,10 +570,8 @@ impl Inkling2KVCacheCoordinator {
         boundary: u32,
         raw_blocks: &[Vec<(Vec<u8>, Vec<u8>)>],
     ) -> std::result::Result<(), String> {
-        let adapter = self
-            .sliding_adapter_mut()
-            .ok_or_else(|| "Inkling2 KV coordinator has no sliding group".to_string())?;
-        adapter.restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, raw_blocks)
+        self.inner
+            .restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, raw_blocks)
     }
 
     /// Register Group 0 (8 Global visits) committed blocks up to `boundary` in the prefix cache.
@@ -609,14 +581,10 @@ impl Inkling2KVCacheCoordinator {
         boundary: u32,
         cache_salt: u64,
     ) -> std::result::Result<(), String> {
-        self.full_adapter.activate_request(seq_id)?;
-        let keys = crate::engine::build_paged_extra_keys(
-            boundary as usize,
-            self.full_adapter.block_size(),
-            &[],
-        );
-        self.full_adapter
-            .register_committed_blocks(boundary as usize, &keys, cache_salt)
+        let full = self.inner.full_adapter_mut();
+        full.activate_request(seq_id)?;
+        let keys = crate::engine::build_paged_extra_keys(boundary as usize, full.block_size(), &[]);
+        full.register_committed_blocks(boundary as usize, &keys, cache_salt)
     }
 
     /// Register Group 0 full blocks for reuse during preemption/finalization.
@@ -626,23 +594,24 @@ impl Inkling2KVCacheCoordinator {
         cache_salt: u64,
         capture_cold: bool,
     ) -> std::result::Result<u32, String> {
-        self.full_adapter
+        self.inner
+            .full_adapter_mut()
             .register_full_blocks_for_reuse_for(seq_id, &[], cache_salt, capture_cold)
     }
 
     /// Update Group 0's pinned state-mark block hashes (blocks referenced by StateStore entries).
     pub fn set_full_state_marks(&self, hashes: impl IntoIterator<Item = u64>) {
-        self.full_adapter.set_state_marks(hashes);
+        self.inner.full_adapter().set_state_marks(hashes);
     }
 
     /// Install a `ColdTierContext` (`ColdContextBacking::StateOnly`) on Group 0.
     pub fn set_full_cold_tier(&mut self, context: ColdTierContext) {
-        self.full_adapter.set_cold_tier(context);
+        self.inner.full_adapter_mut().set_cold_tier(context);
     }
 
     /// Remove and return Group 0's `ColdTierContext` (if any).
     pub fn take_full_cold_tier(&mut self) -> Option<ColdTierContext> {
-        self.full_adapter.take_cold_tier()
+        self.inner.full_adapter_mut().take_cold_tier()
     }
 
     fn from_adapters(
@@ -654,54 +623,13 @@ impl Inkling2KVCacheCoordinator {
         block_size: u32,
         max_concurrent_sequences: u32,
     ) -> std::result::Result<Self, String> {
-        if groups.len() != adapters.len() {
-            return Err(format!(
-                "Inkling2 KV group count {} does not match adapter count {}",
-                groups.len(),
-                adapters.len()
-            ));
-        }
-        let mut full_group = None;
-        let mut sliding_group_id = None;
-        let mut managers = Vec::with_capacity(groups.len());
-        for (group, adapter) in groups.iter().zip(adapters) {
-            let manager = match group.attention_kind {
-                AttentionKind::Full => {
-                    if full_group
-                        .replace((group.group_id, Box::new(adapter)))
-                        .is_some()
-                    {
-                        return Err(
-                            "Inkling2 KV coordinator supports one full-attention KV group"
-                                .to_string(),
-                        );
-                    }
-                    Inkling2KVCacheGroupManager::Full
-                }
-                AttentionKind::SlidingWindow { sliding_window } => {
-                    sliding_group_id.get_or_insert(group.group_id);
-                    Inkling2KVCacheGroupManager::SlidingWindow {
-                        sliding_window,
-                        max_admission_blocks: group.max_admission_blocks,
-                        adapter: Box::new(adapter),
-                    }
-                }
-            };
-            managers.push(manager);
-        }
-        let (full_group_id, full_adapter) = full_group
-            .ok_or_else(|| "Inkling2 KV coordinator has no full-attention KV group".to_string())?;
         let inner =
-            KVCacheCoordinator::from_groups(specs, groups, managers).map_err(|e| e.to_string())?;
+            HybridKVCacheCoordinator::new(specs, groups, adapters, max_concurrent_sequences)?;
         Ok(Self {
             inner,
-            full_group_id,
-            full_adapter,
-            sliding_group_id,
             kv_format,
             kv_dtype,
             block_size,
-            max_concurrent_sequences,
         })
     }
 
@@ -718,7 +646,7 @@ impl Inkling2KVCacheCoordinator {
     }
 
     pub fn max_concurrent_sequences(&self) -> u32 {
-        self.max_concurrent_sequences
+        self.inner.max_concurrent_sequences()
     }
 
     pub fn groups(&self) -> &[KVCacheGroup] {
@@ -734,145 +662,69 @@ impl Inkling2KVCacheCoordinator {
     }
 
     pub fn full_group_id(&self) -> usize {
-        self.full_group_id
+        self.inner.full_group_id()
     }
 
     pub fn sliding_group_id(&self) -> Option<usize> {
-        self.sliding_group_id
+        self.inner.sliding_group_id()
     }
 
     pub fn full_adapter(&self) -> &PagedKVCacheAdapter {
-        &self.full_adapter
+        self.inner.full_adapter()
     }
 
     pub fn full_adapter_mut(&mut self) -> &mut PagedKVCacheAdapter {
-        &mut self.full_adapter
+        self.inner.full_adapter_mut()
     }
 
     pub fn sliding_adapter(&self) -> Option<&PagedKVCacheAdapter> {
-        let gid = self.sliding_group_id?;
-        self.adapter(gid).ok()
+        self.inner.sliding_adapter()
     }
 
     pub fn sliding_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
-        let gid = self.sliding_group_id?;
-        self.adapter_mut(gid).ok()
+        self.inner.sliding_adapter_mut()
     }
 
     pub fn adapter(&self, group_id: usize) -> std::result::Result<&PagedKVCacheAdapter, String> {
-        if group_id == self.full_group_id {
-            return Ok(&self.full_adapter);
-        }
-        match self.inner.manager(group_id) {
-            Some(Inkling2KVCacheGroupManager::SlidingWindow { adapter, .. }) => Ok(adapter),
-            Some(Inkling2KVCacheGroupManager::Full) => Err(format!(
-                "Inkling2 KV group {group_id} is marked full but owned full group is {}",
-                self.full_group_id
-            )),
-            None => Err(format!("Inkling2 KV group {group_id} is missing")),
-        }
+        self.inner.adapter(group_id)
     }
 
     pub fn adapter_mut(
         &mut self,
         group_id: usize,
     ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
-        if group_id == self.full_group_id {
-            return Ok(&mut self.full_adapter);
-        }
-        match self.inner.manager_mut(group_id) {
-            Some(Inkling2KVCacheGroupManager::SlidingWindow { adapter, .. }) => Ok(adapter),
-            Some(Inkling2KVCacheGroupManager::Full) => Err(format!(
-                "Inkling2 KV group {group_id} is marked full but owned full group is {}",
-                self.full_group_id
-            )),
-            None => Err(format!("Inkling2 KV group {group_id} is missing")),
-        }
+        self.inner.adapter_mut(group_id)
     }
 
     pub fn sliding_capacity_summary(&self) -> (usize, u32, u32) {
-        self.inner
-            .groups()
-            .iter()
-            .filter_map(|group| match self.inner.manager(group.group_id) {
-                Some(Inkling2KVCacheGroupManager::SlidingWindow {
-                    sliding_window,
-                    max_admission_blocks,
-                    ..
-                }) => Some((1usize, *sliding_window, *max_admission_blocks)),
-                _ => None,
-            })
-            .fold((0, 0, 0), |acc, item| {
-                (acc.0 + item.0, acc.1.max(item.1), acc.2.max(item.2))
-            })
+        self.inner.sliding_capacity_summary()
     }
 
     pub fn pool_allocated_bytes(&self) -> std::result::Result<u64, String> {
-        (0..self.inner.groups().len()).try_fold(0u64, |total, group_id| {
-            self.adapter(group_id)
-                .and_then(PagedKVCacheAdapter::pool_allocated_bytes)
-                .map(|bytes| total.saturating_add(bytes))
-        })
+        self.inner.pool_allocated_bytes()
     }
 
     /// Reset `seq_id` cleanly across every KV group and begin a fresh empty request.
     pub fn reset_scheduled_request(&mut self, seq_id: u32) -> std::result::Result<(), String> {
-        let _ = self.release_request_all(seq_id);
-        for group_id in 0..self.inner.groups().len() {
-            if let Err(error) = self.adapter_mut(group_id)?.begin_request(seq_id) {
-                let _ = self.release_request_all(seq_id);
-                return Err(format!(
-                    "Inkling2 KV group {group_id} request reset failed: {error}"
-                ));
-            }
-        }
-        Ok(())
+        self.inner.reset_scheduled_request(seq_id)
     }
 
     pub fn activate_request_all(&mut self, seq_id: u32) -> std::result::Result<(), String> {
-        for group_id in 0..self.inner.groups().len() {
-            self.adapter_mut(group_id)?.activate_request(seq_id)?;
-        }
-        Ok(())
+        self.inner.activate_request_all(seq_id)
     }
 
+    /// Strict continuation check (`prompt_tokens.len() > live.len()`), requiring at least
+    /// one new suffix token past the cached prefix.
     pub fn can_continue_all(&self, seq_id: u32, prompt_tokens: &[u32]) -> bool {
-        (0..self.inner.groups().len()).all(|group_id| {
-            let Ok(adapter) = self.adapter(group_id) else {
-                return false;
-            };
-            adapter.is_live_for_continue_for(seq_id)
-                && adapter.request_tokens_for(seq_id).is_some_and(|live| {
-                    prompt_tokens.len() > live.len() && prompt_tokens.starts_with(live)
-                })
-        })
+        self.inner.can_continue_strict_all(seq_id, prompt_tokens)
     }
 
     pub fn is_live_all(&self, seq_id: u32) -> bool {
-        (0..self.inner.groups().len()).all(|group_id| {
-            self.adapter(group_id)
-                .is_ok_and(|adapter| adapter.is_live_for_continue_for(seq_id))
-        })
+        self.inner.is_live_all(seq_id)
     }
 
     pub fn request_token_count_all(&self, seq_id: u32) -> std::result::Result<u32, String> {
-        let mut count = None;
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter(group_id)?;
-            let group_count = adapter
-                .request_tokens_for(seq_id)
-                .map(|tokens| tokens.len() as u32)
-                .ok_or_else(|| format!("Inkling2 KV group {group_id} has no sequence {seq_id}"))?;
-            if count
-                .replace(group_count)
-                .is_some_and(|prior| prior != group_count)
-            {
-                return Err(format!(
-                    "Inkling2 hybrid KV groups disagree on sequence {seq_id} token count"
-                ));
-            }
-        }
-        count.ok_or_else(|| "Inkling2 hybrid KV coordinator has no groups".to_string())
+        self.inner.request_token_count_all(seq_id)
     }
 
     pub fn continue_turn_all(
@@ -881,28 +733,12 @@ impl Inkling2KVCacheCoordinator {
         prompt_tokens: &[u32],
         total_budget: u32,
     ) -> std::result::Result<u32, String> {
-        let mut boundary = None;
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            adapter.activate_request(seq_id)?;
-            let (group_boundary, _) = adapter.continue_turn(prompt_tokens, total_budget)?;
-            if boundary
-                .replace(group_boundary)
-                .is_some_and(|prior| prior != group_boundary)
-            {
-                return Err(
-                    "Inkling2 hybrid KV groups disagree on live continuation boundary".to_string(),
-                );
-            }
-        }
-        Ok(boundary.unwrap_or(0))
+        self.inner
+            .continue_turn_all(seq_id, prompt_tokens, total_budget)
     }
 
     pub fn check_wave_fits_all(&self, rows: &[(u32, u32)]) -> std::result::Result<(), String> {
-        for group_id in 0..self.inner.groups().len() {
-            self.adapter(group_id)?.check_wave_fits(rows)?;
-        }
-        Ok(())
+        self.inner.check_wave_fits_all(rows)
     }
 
     /// Atomically record `tokens` across every KV group, rolling back earlier groups on error.
@@ -911,23 +747,7 @@ impl Inkling2KVCacheCoordinator {
         seq_id: u32,
         tokens: &[u32],
     ) -> std::result::Result<(), String> {
-        let mut recorded = Vec::with_capacity(self.inner.groups().len());
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            if let Err(error) = adapter.record_tokens_for(seq_id, tokens) {
-                let rollback_n = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-                for recorded_group in recorded.into_iter().rev() {
-                    if let Ok(prev) = self.adapter_mut(recorded_group)
-                        && prev.activate_request(seq_id).is_ok()
-                    {
-                        let _ = prev.rollback_last_tokens(rollback_n);
-                    }
-                }
-                return Err(error);
-            }
-            recorded.push(group_id);
-        }
-        Ok(())
+        self.inner.record_tokens_all(seq_id, tokens)
     }
 
     /// Patch the trailing `tokens.len()` placeholder (`u32::MAX`) entries across every KV group
@@ -938,96 +758,22 @@ impl Inkling2KVCacheCoordinator {
         seq_id: u32,
         tokens: &[u32],
     ) -> std::result::Result<(), String> {
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            adapter.activate_request(seq_id)?;
-            adapter.patch_last_recorded_tokens(tokens)?;
-        }
-        Ok(())
+        self.inner.patch_last_recorded_tokens_all(seq_id, tokens)
     }
 
     /// Reserve speculative lookahead rows atomically across every KV group (all or none).
     pub fn reserve_rows_all(&mut self, seq_id: u32, rows: u32) -> std::result::Result<u32, String> {
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            adapter.activate_request(seq_id)?;
-            let current_tokens = adapter
-                .request_tokens_for(seq_id)
-                .map(|tokens| tokens.len() as u32)
-                .ok_or_else(|| {
-                    format!("Inkling2 KV group {group_id} has no sequence {seq_id} to reserve for")
-                })?;
-            let new_total = current_tokens.checked_add(rows).ok_or_else(|| {
-                format!(
-                    "Inkling2 KV group {group_id} reservation overflows cursor \
-                     (current={current_tokens}, rows={rows})"
-                )
-            })?;
-            let capacity = adapter.max_capacity_tokens();
-            if new_total > capacity {
-                return Err(format!(
-                    "context_length_exceeded: Inkling2 KV group {group_id} cannot reserve \
-                     {rows} lookahead row(s) at cursor {current_tokens} (capacity {capacity})"
-                ));
-            }
-            let block_size = adapter.block_size();
-            if block_size == 0 {
-                return Err(format!("Inkling2 KV group {group_id} has block_size 0"));
-            }
-            let current_blocks = adapter
-                .block_table_for(seq_id)
-                .map(|table| table.num_blocks() as u32)
-                .ok_or_else(|| {
-                    format!("Inkling2 KV group {group_id} has no block table for {seq_id}")
-                })?;
-            let needed_blocks = new_total
-                .div_ceil(block_size)
-                .saturating_sub(current_blocks);
-            let telemetry = adapter.block_telemetry()?;
-            let available = telemetry
-                .free_blocks
-                .saturating_add(telemetry.evictable_blocks);
-            if needed_blocks > available {
-                return Err(format!(
-                    "context_length_exceeded: Inkling2 KV group {group_id} needs \
-                     {needed_blocks} block(s) for {rows} lookahead row(s) but only \
-                     {available} are free or reclaimable"
-                ));
-            }
-        }
-        let mut new_blocks = 0u32;
-        for group_id in 0..self.inner.groups().len() {
-            let reserved = self
-                .adapter_mut(group_id)?
-                .reserve_rows_for(seq_id, rows)
-                .map_err(|error| {
-                    format!(
-                        "Inkling2 KV group {group_id} reservation failed after pre-flight: {error}"
-                    )
-                })?;
-            new_blocks = new_blocks.saturating_add(reserved);
-        }
-        Ok(new_blocks)
+        self.inner.reserve_rows_all(seq_id, rows)
     }
 
     pub fn eval_pending_pool_writes_all(&mut self) -> std::result::Result<(), String> {
-        for group_id in 0..self.inner.groups().len() {
-            self.adapter_mut(group_id)?.eval_pending_pool_writes()?;
-        }
-        Ok(())
+        self.inner.eval_pending_pool_writes_all()
     }
 
     /// Prune expired SWA blocks beyond `sliding_window = 1024` (replaces with null sentinel while
     /// keeping absolute logical positions intact for `tau(p)` and `rel_bias`).
     pub fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
-        let mut released = 0u32;
-        for group_id in 0..self.inner.groups().len() {
-            released = released.saturating_add(
-                self.adapter_mut(group_id)?
-                    .prune_sliding_window_for(seq_id)?,
-            );
-        }
-        Ok(released)
+        self.inner.prune_sliding_all(seq_id)
     }
 
     /// Committed-frontier SWA prune: never retires any block that a speculative rollback may
@@ -1037,14 +783,8 @@ impl Inkling2KVCacheCoordinator {
         seq_id: u32,
         committed_tokens: u32,
     ) -> std::result::Result<u32, String> {
-        let mut released = 0u32;
-        for group_id in 0..self.inner.groups().len() {
-            released = released.saturating_add(
-                self.adapter_mut(group_id)?
-                    .prune_sliding_window_for_committed(seq_id, committed_tokens)?,
-            );
-        }
-        Ok(released)
+        self.inner
+            .prune_sliding_all_committed(seq_id, committed_tokens)
     }
 
     pub fn rollback_last_tokens_all(
@@ -1052,17 +792,7 @@ impl Inkling2KVCacheCoordinator {
         seq_id: u32,
         token_count: u32,
     ) -> std::result::Result<(), String> {
-        let mut first_error = None;
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            let res = adapter
-                .activate_request(seq_id)
-                .and_then(|_| adapter.rollback_last_tokens(token_count));
-            if let Err(error) = res {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        self.inner.rollback_last_tokens_all(seq_id, token_count)
     }
 
     pub fn finalize_keep_live_all(
@@ -1071,59 +801,16 @@ impl Inkling2KVCacheCoordinator {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> std::result::Result<(), String> {
-        for group_id in 0..self.inner.groups().len() {
-            let is_full = group_id == self.full_group_id;
-            let adapter = self.adapter_mut(group_id)?;
-            adapter.activate_request(seq_id)?;
-            if is_full {
-                if extra_keys_per_block.is_empty() {
-                    adapter.finalize_turn_keep_live(&[], cache_salt)?;
-                } else {
-                    adapter.finalize_turn_keep_live_per_block(extra_keys_per_block, cache_salt)?;
-                }
-                // A short turn (< block_size committed tokens) has no full block to publish
-                // into the prefix cache, so `register_full_blocks_for_reuse*` returns `Ok(0)`
-                // without marking `already_registered = true`. Mark the partial-block request
-                // live independently of prefix publication so `chatSessionContinue` succeeds.
-                if !adapter.is_live_for_continue() {
-                    adapter.finalize_turn_keep_live_no_prefix()?;
-                }
-            } else {
-                adapter.finalize_turn_keep_live_no_prefix()?;
-            }
-        }
-        Ok(())
+        self.inner
+            .finalize_keep_live_all(seq_id, extra_keys_per_block, cache_salt)
     }
 
     pub fn release_request_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
-        let mut released = 0u32;
-        let mut first_error = None;
-        for group_id in 0..self.inner.groups().len() {
-            match self.adapter_mut(group_id)?.release_request_for(seq_id) {
-                Ok(count) => released = released.saturating_add(count),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(released), Err)
+        self.inner.release_request_all(seq_id)
     }
 
     pub fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
-        let mut released = 0u32;
-        let mut first_error = None;
-        for group_id in 0..self.inner.groups().len() {
-            match self
-                .adapter_mut(group_id)?
-                .release_request_and_purge_prefix_cache()
-            {
-                Ok(count) => released = released.saturating_add(count),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(released), Err)
+        self.inner.release_all_and_purge()
     }
 
     /// Test helper: simulate hot-RAM eviction under memory pressure (releasing live requests and
@@ -1131,48 +818,26 @@ impl Inkling2KVCacheCoordinator {
     /// for user-triggered `reset_caches()`).
     #[cfg(test)]
     pub fn evict_all_hot_blocks_without_suppress(&mut self) -> std::result::Result<u32, String> {
-        let mut released = 0u32;
-        for group_id in 0..self.inner.groups().len() {
-            let adapter = self.adapter_mut(group_id)?;
-            released = released.saturating_add(adapter.release_all_requests()?);
-            let mut guard = adapter
-                .allocator()
-                .lock()
-                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.purge_prefix_cache();
-        }
-        Ok(released)
+        self.inner.evict_all_hot_blocks_without_suppress()
     }
 
     /// Common attention frontier across both Global and SWA groups for `seq_id`.
     pub(crate) fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
-        self.request_token_count_all(seq_id)
-            .ok()
-            .map(|attn_tokens| SpecFrontier {
-                attn_tokens: u64::from(attn_tokens),
-                recurrent_tokens: None,
-            })
+        self.inner.spec_frontier(seq_id)
     }
 }
 
 impl SpecPagedCache for Inkling2KVCacheCoordinator {
     fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
-        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
-        match self.reserve_rows_all(seq_id, rows) {
-            Ok(_) => Ok(true),
-            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
-            Err(error) => Err(error),
-        }
+        PruneOnlySpecPagedCache::new(&mut self.inner).reserve_lookahead(seq_id, rows)
     }
 
     fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
-        self.record_tokens_all(seq_id, tokens)
+        PruneOnlySpecPagedCache::new(&mut self.inner).record_rows(seq_id, tokens)
     }
 
     fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
-        let rows = u32::try_from(rows)
-            .map_err(|_| format!("Inkling2 commit rollback of {rows} rows does not fit u32"))?;
-        self.rollback_last_tokens_all(seq_id, rows)
+        PruneOnlySpecPagedCache::new(&mut self.inner).rollback_rows(seq_id, rows)
     }
 
     fn settle_committed(
@@ -1180,12 +845,7 @@ impl SpecPagedCache for Inkling2KVCacheCoordinator {
         seq_id: u32,
         committed_tokens: u64,
     ) -> std::result::Result<(), String> {
-        let committed = u32::try_from(committed_tokens).map_err(|_| {
-            format!("Inkling2 committed frontier {committed_tokens} does not fit u32")
-        })?;
-        self.eval_pending_pool_writes_all()?;
-        self.prune_sliding_all_committed(seq_id, committed)
-            .map(|_| ())
+        PruneOnlySpecPagedCache::new(&mut self.inner).settle_committed(seq_id, committed_tokens)
     }
 
     fn settle_captures_durable_state(&self) -> bool {

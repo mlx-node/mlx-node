@@ -81,34 +81,7 @@ pub(crate) struct StatePlan {
     pub(crate) state_key: ColdCacheKey,
 }
 
-/// The keys of `lineage` at `block` pages: one per whole page, and one for
-/// the part page past the last whole one, chained on it. A key hashes its
-/// token count, so the part page's key is never a whole page's.
-pub(crate) fn part_page_keys(
-    group: ColdGroup,
-    fingerprint: ColdCacheFingerprint,
-    lineage: Lineage<'_>,
-    block: u32,
-) -> (Vec<ColdCacheKey>, Option<ColdCacheKey>) {
-    let whole = lineage_keys(group, fingerprint, lineage, block);
-    let index = whole.len();
-    let part = lineage
-        .tokens
-        .get(index * block.max(1) as usize..)
-        .filter(|tokens| !tokens.is_empty())
-        .map(|tokens| {
-            ColdCacheKey::chain(
-                group,
-                fingerprint,
-                whole.last().copied(),
-                tokens,
-                lineage.extra_keys.get(index).map_or(&[][..], Vec::as_slice),
-                lineage.salt,
-                index,
-            )
-        });
-    (whole, part)
-}
+pub(crate) use crate::disk_tier::state_disk::part_page_keys;
 
 /// The image keys of a 16-token-block lineage of `rows` rows per 32-token
 /// page (`engine::build_paged_extra_keys` at block 32): per page the pairs

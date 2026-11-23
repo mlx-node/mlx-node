@@ -118,10 +118,130 @@ pub(crate) mod recipe {
     use tracing::{info, warn};
 
     use super::{
-        Sym8ScalesCastAction, dequant_fp8, normalize_mtp_prefix, remap_qwen35_body_key,
-        shift_raw_mtp_norms, sym8_scales_cast_action,
+        Sym8ScalesCastAction, normalize_mtp_prefix, remap_qwen35_body_key, shift_raw_mtp_norms,
+        sym8_scales_cast_action,
     };
     use crate::array::{DType, MxArray};
+
+    /// Parse a convert `--dtype` string into its [`DType`], warning and
+    /// defaulting to `BFloat16` for unrecognized values.
+    fn parse_target_dtype(target_dtype_str: &str) -> DType {
+        match target_dtype_str {
+            "float32" | "f32" => DType::Float32,
+            "float16" | "f16" => DType::Float16,
+            "bfloat16" | "bf16" => DType::BFloat16,
+            other => {
+                warn!("Unknown target dtype '{other}', defaulting to bfloat16");
+                DType::BFloat16
+            }
+        }
+    }
+
+    /// Cast remaining floating-point tensors to `target_dtype` while leaving
+    /// quantized tensor groups intact and preserving/normalizing sym8 Float32
+    /// `.scales` sidecars via [`sym8_scales_cast_action`].
+    ///
+    /// `exempt` skips family-specific float tensors (e.g. `.expert_bias` or
+    /// preserved FP32 LM norms).
+    fn cast_and_preserve_sym8<F>(
+        weights: &mut HashMap<String, MxArray>,
+        target_dtype: DType,
+        mut exempt: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str, &MxArray) -> Result<bool>,
+    {
+        let quantized_bases: HashSet<String> = weights
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect();
+        let keys: Vec<String> = weights.keys().cloned().collect();
+        for k in keys {
+            if k.ends_with(".biases") {
+                continue;
+            }
+            if k.ends_with(".scales") {
+                match sym8_scales_cast_action(&k, weights)? {
+                    Sym8ScalesCastAction::NormalizeToF32 => {
+                        if let Some(v) = weights.get(&k) {
+                            let normalized = v.astype(DType::Float32)?;
+                            weights.insert(k, normalized);
+                        }
+                    }
+                    Sym8ScalesCastAction::NotSym8Scales | Sym8ScalesCastAction::PreserveF32 => {}
+                }
+                continue;
+            }
+            if let Some(base) = k.strip_suffix(".weight")
+                && quantized_bases.contains(base)
+            {
+                continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
+            }
+            let v = weights.get(&k).ok_or_else(|| {
+                Error::from_reason(format!("weight key '{k}' vanished from weights"))
+            })?;
+            if exempt(&k, v)? {
+                continue;
+            }
+            // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
+            // packed Uint32, Uint8 scales) are never astype'd.
+            let current_dtype = v.dtype()?;
+            if matches!(
+                current_dtype,
+                DType::Float32 | DType::Float16 | DType::BFloat16
+            ) && current_dtype != target_dtype
+            {
+                let converted = v.astype(target_dtype)?;
+                weights.insert(k, converted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Root-cause backstop ensuring convert never emits a non-float `.weight`
+    /// that the family loader would misread as dense: rejects non-float weights
+    /// on always-dense tensor classes (norms, depthwise convs) and any other
+    /// non-float weight lacking one of the family's recognized quant sidecars.
+    fn reject_unsided_non_float_weights<F>(
+        weights: &HashMap<String, MxArray>,
+        family: &str,
+        always_dense: F,
+        always_dense_desc: &str,
+        sidecar_suffixes: &[&str],
+    ) -> Result<()>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let sidecar_desc = sidecar_suffixes.join(" / ");
+        for (k, v) in weights {
+            if !k.ends_with(".weight") {
+                continue;
+            }
+            let dt = v.dtype()?;
+            if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                continue;
+            }
+            if always_dense(k) {
+                return Err(Error::from_reason(format!(
+                    "{family} convert: non-float weight '{k}' ({dt:?}) on an always-dense \
+                     tensor class ({always_dense_desc}) — these are never quantized; convert \
+                     from an unquantized checkpoint instead"
+                )));
+            }
+            let base = k.strip_suffix(".weight").unwrap_or(k);
+            let has_sidecar = sidecar_suffixes
+                .iter()
+                .any(|suffix| weights.contains_key(&format!("{base}{suffix}")));
+            if !has_sidecar {
+                return Err(Error::from_reason(format!(
+                    "{family} convert: non-float weight '{k}' ({dt:?}) has no quant sidecar \
+                     ({sidecar_desc}) — pre-quantized source is unsupported; convert from an \
+                     unquantized checkpoint instead"
+                )));
+            }
+        }
+        Ok(())
+    }
 
     /// How a family carries Multi-Token-Prediction (MTP) weights through convert.
     ///
@@ -766,15 +886,7 @@ pub(crate) mod recipe {
             let vision_quant = qwen_vision_quantization_preflight(&weights, config)?;
             reject_prequantized_qwen_individual_experts(&weights)?;
 
-            let target_dtype = match target_dtype_str {
-                "float32" | "f32" => DType::Float32,
-                "float16" | "f16" => DType::Float16,
-                "bfloat16" | "bf16" => DType::BFloat16,
-                other => {
-                    warn!("Unknown target dtype '{}', defaulting to bfloat16", other);
-                    DType::BFloat16
-                }
-            };
+            let target_dtype = parse_target_dtype(target_dtype_str);
 
             // Get num_experts from config (check text_config first, then top-level)
             let num_experts_val = config
@@ -964,17 +1076,16 @@ pub(crate) mod recipe {
                 }
             }
 
-            let norm_suffixes = [
-                ".input_layernorm.weight",
-                ".post_attention_layernorm.weight",
-                "model.norm.weight",
-                ".q_norm.weight",
-                ".k_norm.weight",
-            ];
+            let is_qwen35_convert_norm_suffix = |k: &str| -> bool {
+                k.ends_with("model.norm.weight")
+                    || crate::models::qwen3_5::persistence::QWEN35_LAYER_NORM_SUFFIXES
+                        .iter()
+                        .any(|sfx| k.ends_with(sfx))
+            };
             let is_lm_norm_key = |k: &str| -> bool {
                 !k.starts_with("mtp.")
                     && !k.starts_with("vision_tower.")
-                    && norm_suffixes.iter().any(|sfx| k.ends_with(sfx))
+                    && is_qwen35_convert_norm_suffix(k)
             };
 
             // Step 2: FP8 dequantization (in-place to avoid extra HashMap allocation)
@@ -995,7 +1106,11 @@ pub(crate) mod recipe {
                         ))
                     })?;
                     if let Some(weight) = new_weights.remove(&weight_key) {
-                        let dequant = dequant_fp8(&weight, &scale_inv, target_dtype)?;
+                        let dequant = crate::engine::persistence::dequant_fp8(
+                            &weight,
+                            &scale_inv,
+                            target_dtype,
+                        )?;
                         // Eval immediately to prevent lazy chain accumulation (OOM with many FP8 pairs)
                         dequant.eval();
                         new_weights.insert(weight_key, dequant);
@@ -1006,138 +1121,17 @@ pub(crate) mod recipe {
                         );
                     }
                 }
+            }
 
-                // Convert remaining non-FP8 weights to target dtype, handling
-                // quantized tensor groups. A MIXED checkpoint (an FP8
-                // `weight_scale_inv` pair somewhere + a pre-quantized sym8/affine
-                // pair elsewhere) must not narrow float quant sidecars: the sym8
-                // loader contract (`try_build_sym8_quantized_linear`) hard-rejects
-                // non-Float32 `.scales`, and affine `.scales`/`.biases` plus packed
-                // `.weight` tensors with a `.scales` sibling must pass through
-                // untouched. `.scales` keys follow the three-way rule of
-                // `sym8_scales_cast_action`:
-                //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
-                //     → pass through unchanged;
-                //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
-                //     through unchanged (the loader mandates Float32);
-                //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
-                //     → lossless upcast to Float32 so the group stays loadable;
-                //   * anything else next to an Int8 weight is malformed sym8-like
-                //     storage → fail loud (Err propagated).
-                // Pure-FP8 checkpoints carry no `.scales`/`.biases` keys at this point
-                // (FP8 sidecars are `weight_scale_inv`, consumed by the dequant pass
-                // above), so for them the skips are behavior-preserving.
-                let quantized_bases: std::collections::HashSet<String> = new_weights
-                    .keys()
-                    .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
-                    .collect();
-                let keys: Vec<String> = new_weights.keys().cloned().collect();
-                for k in keys {
-                    // Skip quantized sidecars and packed/pre-quantized weights.
-                    if k.ends_with(".biases") {
-                        continue;
-                    }
-                    if k.ends_with(".scales") {
-                        match sym8_scales_cast_action(&k, &new_weights)? {
-                            Sym8ScalesCastAction::NormalizeToF32 => {
-                                if let Some(v) = new_weights.get(&k) {
-                                    let normalized = v.astype(DType::Float32)?;
-                                    new_weights.insert(k, normalized);
-                                }
-                            }
-                            Sym8ScalesCastAction::NotSym8Scales
-                            | Sym8ScalesCastAction::PreserveF32 => {}
-                        }
-                        continue;
-                    }
-                    if let Some(base) = k.strip_suffix(".weight")
-                        && quantized_bases.contains(base)
-                    {
-                        continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
-                    }
-                    let v = new_weights.get(&k).ok_or_else(|| {
-                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
-                    })?;
-                    if preserve_fp32_norms && is_lm_norm_key(&k) && v.ndim()? == 1 {
-                        continue;
-                    }
-                    // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
-                    // packed Uint32, Uint8 scales) are never astype'd.
-                    let current_dtype = v.dtype()?;
-                    if matches!(
-                        current_dtype,
-                        DType::Float32 | DType::Float16 | DType::BFloat16
-                    ) && current_dtype != target_dtype
-                    {
-                        let converted = v.astype(target_dtype)?;
-                        new_weights.insert(k, converted);
-                    }
-                }
+            // Cast remaining floating-point tensors to `target_dtype` while
+            // preserving quantized tensor groups and sym8 Float32 `.scales`
+            // (and optional FP32 LM norms).
+            cast_and_preserve_sym8(&mut new_weights, target_dtype, |k, v| {
+                Ok(preserve_fp32_norms && is_lm_norm_key(k) && v.ndim()? == 1)
+            })?;
 
+            if has_fp8 {
                 info!("  After FP8 dequantization: {} tensors", new_weights.len());
-            } else {
-                // Non-FP8: convert non-quantized weights to target dtype, handling
-                // quantized tensor groups. A pre-quantized sym8/affine pair must not
-                // have its float quant sidecars narrowed: the sym8 loader contract
-                // (`try_build_sym8_quantized_linear`) hard-rejects non-Float32
-                // `.scales`, and affine `.scales`/`.biases` plus packed `.weight`
-                // tensors with a `.scales` sibling must pass through untouched.
-                // `.scales` keys follow the three-way rule of
-                // `sym8_scales_cast_action`:
-                //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
-                //     → pass through unchanged;
-                //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
-                //     through unchanged (the loader mandates Float32);
-                //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
-                //     → lossless upcast to Float32 so the group stays loadable;
-                //   * anything else next to an Int8 weight is malformed sym8-like
-                //     storage → fail loud (Err propagated).
-                let quantized_bases: std::collections::HashSet<String> = new_weights
-                    .keys()
-                    .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
-                    .collect();
-                let keys: Vec<String> = new_weights.keys().cloned().collect();
-                for k in keys {
-                    // Skip quantized sidecars and packed/pre-quantized weights.
-                    if k.ends_with(".biases") {
-                        continue;
-                    }
-                    if k.ends_with(".scales") {
-                        match sym8_scales_cast_action(&k, &new_weights)? {
-                            Sym8ScalesCastAction::NormalizeToF32 => {
-                                if let Some(v) = new_weights.get(&k) {
-                                    let normalized = v.astype(DType::Float32)?;
-                                    new_weights.insert(k, normalized);
-                                }
-                            }
-                            Sym8ScalesCastAction::NotSym8Scales
-                            | Sym8ScalesCastAction::PreserveF32 => {}
-                        }
-                        continue;
-                    }
-                    if let Some(base) = k.strip_suffix(".weight")
-                        && quantized_bases.contains(base)
-                    {
-                        continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
-                    }
-                    let v = new_weights.get(&k).ok_or_else(|| {
-                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
-                    })?;
-                    if preserve_fp32_norms && is_lm_norm_key(&k) && v.ndim()? == 1 {
-                        continue;
-                    }
-                    // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
-                    // packed Uint32, Uint8 scales) are never astype'd.
-                    let current_dtype = v.dtype()?;
-                    if matches!(
-                        current_dtype,
-                        DType::Float32 | DType::Float16 | DType::BFloat16
-                    ) && current_dtype != target_dtype
-                    {
-                        let converted = v.astype(target_dtype)?;
-                        new_weights.insert(k, converted);
-                    }
-                }
             }
 
             // Step 3: Stack/normalize expert weights
@@ -1373,8 +1367,7 @@ pub(crate) mod recipe {
                             new_weights.insert(k, transposed);
                         }
                     }
-                } else if !k.starts_with("mtp.") && norm_suffixes.iter().any(|sfx| k.ends_with(sfx))
-                {
+                } else if !k.starts_with("mtp.") && is_qwen35_convert_norm_suffix(&k) {
                     // Raw-HF LM-body norm weights are stored unshifted (~0); MLX
                     // `fast::rms_norm` is direct-convention and expects weight+1.
                     // MTP-head norms are excluded here (the body suffixes also
@@ -1420,15 +1413,7 @@ pub(crate) mod recipe {
             tie_word_embeddings: bool,
             _verbose: bool,
         ) -> Result<HashMap<String, MxArray>> {
-            let target_dtype = match target_dtype_str {
-                "float32" | "f32" => DType::Float32,
-                "float16" | "f16" => DType::Float16,
-                "bfloat16" | "bf16" => DType::BFloat16,
-                other => {
-                    warn!("Unknown target dtype '{}', defaulting to bfloat16", other);
-                    DType::BFloat16
-                }
-            };
+            let target_dtype = parse_target_dtype(target_dtype_str);
 
             // LFM2 has no `text_config` nesting — every field is top-level.
             let num_hidden_layers = config
@@ -1586,135 +1571,22 @@ pub(crate) mod recipe {
                 new_weights.len()
             );
 
-            // Step 3: cast every remaining FLOATING-POINT tensor whose dtype differs
-            // from the target to `target_dtype` (so a bf16/f16 source still honors
-            // `--dtype`, not just f32). The cast is float-precision conversion ONLY: it
-            // NEVER touches packed/integer quant data (packed `Uint32` weights, integer
-            // tensors) — those are left in place unchanged. EXCLUDE `expert_bias`
-            // (loader keeps it f32 per `cast_predicate`) and skip any quantized tensor
-            // groups (mirror `sanitize_qwen35_moe` against a pre-quantized source).
-            // A pre-quantized sym8 pair must not have its float quant sidecar
-            // narrowed: the sym8 loader contract (`try_build_sym8_quantized_linear`)
-            // hard-rejects non-Float32 `.scales`. `.scales` keys follow the three-way
-            // rule of `sym8_scales_cast_action`:
-            //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
-            //     → pass through unchanged;
-            //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
-            //     through unchanged (the loader mandates Float32);
-            //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
-            //     → lossless upcast to Float32 so the group stays loadable;
-            //   * anything else next to an Int8 weight is malformed sym8-like
-            //     storage → fail loud (Err propagated).
-            let quantized_bases: std::collections::HashSet<String> = new_weights
-                .keys()
-                .filter(|k| k.ends_with(".scales"))
-                .map(|k| k.strip_suffix(".scales").unwrap_or(k.as_str()).to_string())
-                .collect();
-            let keys: Vec<String> = new_weights.keys().cloned().collect();
-            for k in keys {
-                if k.ends_with(".expert_bias") {
-                    continue;
-                }
-                if k.ends_with(".biases") {
-                    continue;
-                }
-                if k.ends_with(".scales") {
-                    match sym8_scales_cast_action(&k, &new_weights)? {
-                        Sym8ScalesCastAction::NormalizeToF32 => {
-                            if let Some(v) = new_weights.get(&k) {
-                                let normalized = v.astype(DType::Float32)?;
-                                new_weights.insert(k, normalized);
-                            }
-                        }
-                        Sym8ScalesCastAction::NotSym8Scales | Sym8ScalesCastAction::PreserveF32 => {
-                        }
-                    }
-                    continue;
-                }
-                if let Some(base) = k.strip_suffix(".weight")
-                    && quantized_bases.contains(base)
-                {
-                    continue; // packed quantized weight — leave as-is
-                }
-                let v = new_weights.get(&k).ok_or_else(|| {
-                    Error::from_reason(format!("lfm2: tensor {k} vanished during cast"))
-                })?;
-                // Cast ONLY floating-point tensors whose dtype differs from the target.
-                // `target_dtype` is always Float32/Float16/BFloat16 (see match above).
-                // Non-float tensors (packed `Uint32` quant weights, integer tensors) are
-                // never `astype`d — casting them would corrupt the packed bit layout.
-                let dt = v.dtype()?;
-                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16)
-                    && dt != target_dtype
-                {
-                    let converted = v.astype(target_dtype)?;
-                    new_weights.insert(k, converted);
-                }
-            }
+            // Step 3: cast remaining floating-point tensors to `target_dtype`
+            // (preserving `.expert_bias`, quantized groups, and sym8 `.scales`).
+            cast_and_preserve_sym8(&mut new_weights, target_dtype, |k, _| {
+                Ok(k.ends_with(".expert_bias"))
+            })?;
 
-            // Final invariant (root-cause backstop): the converter must NEVER emit a
-            // non-float `.weight` that the loader would misread. The loader classifies
-            // quantization by sidecar presence, so a non-float weight is acceptable ONLY
-            // if it is BOTH (a) a quantizable tensor class AND (b) carries its quant
-            // sidecar. The earlier per-expert guards (name-based reject + the dtype check
-            // in Step 2) already fail loud on per-expert pre-quantized sources; this is
-            // the comprehensive backstop for the DENSE (non-expert) analog and any
-            // residual.
-            //   * (a) Quantizability is base-aware: the depthwise short conv
-            //     (`conv.conv.weight`) is the one LFM2 `.weight` the loader NEVER
-            //     dequantizes — it is always cloned into a dense `Conv1d` via
-            //     `set_conv_weight` (cf. `should_quantize` excludes it; test
-            //     `lfm2_depthwise_conv_not_quantized`). A non-float conv weight is
-            //     therefore corrupt regardless of any sidecar and must be rejected.
-            //   * (b) Every other non-float weight must keep its `{base}.scales`
-            //     (affine/MXFP/NVFP) or `{base}.weight_scale_inv` (FP8) companion; a
-            //     valid already-quantized tensor passes, a packed weight with no sidecar
-            //     is rejected instead of silently corrupting.
-            let weight_keys: Vec<String> = new_weights
-                .keys()
-                .filter(|k| k.ends_with(".weight"))
-                .cloned()
-                .collect();
-            for k in &weight_keys {
-                let base = k.strip_suffix(".weight").unwrap_or(k);
-                let Some(v) = new_weights.get(k) else {
-                    continue;
-                };
-                let dt = v.dtype()?;
-                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
-                    continue;
-                }
-                // (a) Always-dense tensor classes must never be non-float, sidecar or
-                // not — the loader has NO quantized path for them (it always loads a plain
-                // float tensor), so a non-float value corrupts regardless of any sidecar.
-                // Exhaustively verified against the loader, exactly two classes:
-                //   * the depthwise short conv `conv.conv.weight` (loaded dense via
-                //     `set_conv_weight`; never quantized);
-                //   * EVERY RMSNorm/LayerNorm weight — all end with `norm.weight`
-                //     (embedding_norm, the final `norm`, per-layer operator_norm/ffn_norm,
-                //     and attn q_layernorm/k_layernorm), loaded via dense norm setters.
-                // No quantizable weight ends with either suffix (linears end in
-                // `_proj.weight`/`gate.weight`, embeddings in `tokens.weight`, and the
-                // affine-capable `lm_head.weight` is handled by (b) via its sidecar), so
-                // this never over-rejects a legitimately-quantized tensor.
-                if k.ends_with("conv.conv.weight") || k.ends_with("norm.weight") {
-                    return Err(Error::from_reason(format!(
-                        "lfm2 convert: non-float weight '{k}' ({dt:?}) on an always-dense \
-                         tensor class (depthwise conv / RMSNorm) — these are never \
-                         quantized; convert from an unquantized checkpoint instead"
-                    )));
-                }
-                // (b) Any other non-float weight must carry its quant sidecar.
-                if !new_weights.contains_key(&format!("{base}.scales"))
-                    && !new_weights.contains_key(&format!("{base}.weight_scale_inv"))
-                {
-                    return Err(Error::from_reason(format!(
-                        "lfm2 convert: non-float weight '{k}' ({dt:?}) has no quant sidecar \
-                         (.scales / .weight_scale_inv) — pre-quantized source is unsupported; \
-                         convert from an unquantized checkpoint instead"
-                    )));
-                }
-            }
+            // Final invariant (root-cause backstop): reject any non-float
+            // `.weight` on always-dense classes (short conv / RMSNorm) or
+            // lacking a recognized quant sidecar.
+            reject_unsided_non_float_weights(
+                &new_weights,
+                "lfm2",
+                |k| k.ends_with("conv.conv.weight") || k.ends_with("norm.weight"),
+                "depthwise conv / RMSNorm",
+                &[".scales", ".weight_scale_inv"],
+            )?;
 
             info!("  After lfm2 sanitization: {} tensors", new_weights.len());
 
@@ -2044,13 +1916,7 @@ pub(crate) mod recipe {
             for (key, array) in weights {
                 // Step 1: Strip HF prefix to get the bare key.
                 // HF stores as: model.language_model.model.layers.N.* or model.layers.N.*
-                let stripped = key
-                    .strip_prefix("model.language_model.model.")
-                    .or_else(|| key.strip_prefix("model.language_model."))
-                    .or_else(|| key.strip_prefix("language_model.model."))
-                    .or_else(|| key.strip_prefix("language_model."))
-                    .or_else(|| key.strip_prefix("model."))
-                    .unwrap_or(&key);
+                let stripped = crate::engine::persistence::strip_wrapper_prefix(&key);
 
                 // Skip rotary_emb keys (precomputed inverse frequencies, unused)
                 if stripped.contains("rotary_emb") {
@@ -2095,23 +1961,8 @@ pub(crate) mod recipe {
                 {
                     // Apply PyTorch→MLX layout conversions for conv weights
                     // (matches mlx-vlm's sanitize transforms)
-                    let ndim = array.ndim()?;
-                    let array = if stripped.contains("depthwise_conv1d.weight") && ndim == 3 {
-                        // Conv1d: PyTorch [out, in, kW] → MLX [out, kW, in]
-                        let transposed = array.transpose(Some(&[0, 2, 1]))?;
-                        transposed.eval();
-                        transposed
-                    } else if stripped.contains("subsample_conv_projection")
-                        && stripped.contains("conv.weight")
-                        && ndim == 4
-                    {
-                        // Conv2d: PyTorch [out, in, kH, kW] → MLX [out, kH, kW, in]
-                        let transposed = array.transpose(Some(&[0, 2, 3, 1]))?;
-                        transposed.eval();
-                        transposed
-                    } else {
-                        array
-                    };
+                    let array =
+                        crate::convert_gemma_import::transpose_gemma_conv_weight(stripped, array)?;
                     sanitized.insert(stripped.to_string(), array);
                     continue;
                 }
@@ -2823,15 +2674,7 @@ pub(crate) mod recipe {
             _tie_word_embeddings: bool,
             verbose: bool,
         ) -> Result<HashMap<String, MxArray>> {
-            let target_dtype = match target_dtype_str {
-                "float32" | "f32" => DType::Float32,
-                "float16" | "f16" => DType::Float16,
-                "bfloat16" | "bf16" => DType::BFloat16,
-                other => {
-                    warn!("Unknown target dtype '{other}', defaulting to bfloat16");
-                    DType::BFloat16
-                }
-            };
+            let target_dtype = parse_target_dtype(target_dtype_str);
 
             let mut out = weights;
 
@@ -2841,85 +2684,18 @@ pub(crate) mod recipe {
             crate::engine::persistence::dequant_fp8_block_scale(&mut out, target_dtype)?;
 
             // Step 2 — cast every remaining floating-point tensor to the
-            // target dtype. Quant sidecars (`.scales`, `.biases`) and packed
-            // `.weight`s that carry a `.scales` companion pass through
-            // untouched (an already-affine-quantized source stays loadable);
-            // sym8 `.scales` follow the shared normalize/preserve rule.
-            let quantized_bases: HashSet<String> = out
-                .keys()
-                .filter(|k| k.ends_with(".scales"))
-                .map(|k| k.strip_suffix(".scales").unwrap_or(k.as_str()).to_string())
-                .collect();
-            let keys: Vec<String> = out.keys().cloned().collect();
-            for k in keys {
-                if k.ends_with(".biases") {
-                    continue;
-                }
-                if k.ends_with(".scales") {
-                    if let Sym8ScalesCastAction::NormalizeToF32 = sym8_scales_cast_action(&k, &out)?
-                        && let Some(v) = out.get(&k)
-                    {
-                        let normalized = v.astype(DType::Float32)?;
-                        out.insert(k, normalized);
-                    }
-                    continue;
-                }
-                if let Some(base) = k.strip_suffix(".weight")
-                    && quantized_bases.contains(base)
-                {
-                    continue;
-                }
-                let Some(v) = out.get(&k) else {
-                    continue;
-                };
-                let dt = v.dtype()?;
-                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16)
-                    && dt != target_dtype
-                {
-                    let converted = v.astype(target_dtype)?;
-                    out.insert(k, converted);
-                }
-            }
+            // target dtype while preserving quantized groups and sym8 `.scales`.
+            cast_and_preserve_sym8(&mut out, target_dtype, |_, _| Ok(false))?;
 
-            // Step 3 — root-cause backstop: the converter must never emit a
-            // non-float `.weight` the loader misreads as dense. K2's
-            // always-dense tensor classes are the norms (`*layernorm.weight`
-            // and `norm.weight` — both covered by the `norm.weight` suffix)
-            // plus the rotary buffers (dropped by the loader, never loaded).
-            // Every other non-float weight must carry a quant sidecar.
-            let weight_keys: Vec<String> = out
-                .keys()
-                .filter(|k| k.ends_with(".weight"))
-                .cloned()
-                .collect();
-            for k in &weight_keys {
-                let base = k.strip_suffix(".weight").unwrap_or(k);
-                let Some(v) = out.get(k) else {
-                    continue;
-                };
-                let dt = v.dtype()?;
-                if matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
-                    continue;
-                }
-                if k.ends_with("norm.weight") {
-                    return Err(Error::from_reason(format!(
-                        "k2_horizon convert: non-float weight '{k}' ({dt:?}) on an \
-                         always-dense tensor class (grouped RMSNorm) — these are \
-                         never quantized; convert from an unquantized checkpoint instead"
-                    )));
-                }
-                if !out.contains_key(&format!("{base}.scales"))
-                    && !out.contains_key(&format!("{base}.weight_scale_inv"))
-                    && !out.contains_key(&format!("{base}.weight_scale"))
-                {
-                    return Err(Error::from_reason(format!(
-                        "k2_horizon convert: non-float weight '{k}' ({dt:?}) has no quant \
-                         sidecar (.scales / .weight_scale_inv / .weight_scale) — \
-                         pre-quantized source is unsupported; convert from an \
-                         unquantized checkpoint instead"
-                    )));
-                }
-            }
+            // Step 3 — root-cause backstop: reject any non-float `.weight` on
+            // always-dense norms or lacking a recognized quant sidecar.
+            reject_unsided_non_float_weights(
+                &out,
+                "k2_horizon",
+                |k| k.ends_with("norm.weight"),
+                "grouped RMSNorm",
+                &[".scales", ".weight_scale_inv", ".weight_scale"],
+            )?;
 
             if verbose {
                 info!("  After k2_horizon sanitization: {} tensors", out.len());
@@ -9339,63 +9115,6 @@ pub(crate) fn quantize_weights_with_recipe_pub(
         Some(predicate),
         embed_quantizable,
     )
-}
-
-/// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
-///
-/// 1. from_fp8(weight) → target_dtype
-/// 2. Pad to 128-block alignment
-/// 3. Reshape into blocks, multiply by scale_inv
-/// 4. Unpad and return
-fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
-    // Step 1: Convert FP8 uint8 → target float type
-    let weight = weight.from_fp8(target_dtype)?;
-
-    let shape = weight.shape()?;
-    let shape_ref = shape.as_ref();
-
-    if shape_ref.len() < 2 {
-        // 1D weight (e.g. bias): just scale directly
-        return weight.mul(scale_inv)?.astype(target_dtype);
-    }
-
-    let m = shape_ref[0] as usize;
-    let n = shape_ref[1] as usize;
-    let bs: usize = 128;
-
-    // Step 2: Pad to block alignment
-    let pad_bottom = (bs - (m % bs)) % bs;
-    let pad_side = (bs - (n % bs)) % bs;
-
-    let weight = if pad_bottom > 0 || pad_side > 0 {
-        weight.pad(&[0, pad_bottom as i32, 0, pad_side as i32], 0.0)?
-    } else {
-        weight
-    };
-
-    // Step 3: Reshape into [m_blocks, bs, n_blocks, bs]
-    let m_padded = m + pad_bottom;
-    let n_padded = n + pad_side;
-    let weight = weight.reshape(&[
-        (m_padded / bs) as i64,
-        bs as i64,
-        (n_padded / bs) as i64,
-        bs as i64,
-    ])?;
-
-    // Step 4: Multiply by scale_inv [m_blocks, 1, n_blocks, 1] (broadcast)
-    let scale = scale_inv.expand_dims(1)?.expand_dims(3)?;
-    let weight = weight.mul(&scale)?;
-
-    // Step 5: Reshape back and unpad
-    let weight = weight.reshape(&[m_padded as i64, n_padded as i64])?;
-    let weight = if pad_bottom > 0 || pad_side > 0 {
-        weight.slice(&[0, 0], &[m as i64, n as i64])?
-    } else {
-        weight
-    };
-
-    weight.astype(target_dtype)
 }
 
 // ── AWQ Pre-Scaling ─────────────────────────────────────────────────────────

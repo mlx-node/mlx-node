@@ -15,10 +15,8 @@ use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::models::gemma4::layer_cache::{
-    Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify,
-};
 use crate::stream::{Stream, StreamContext};
+use crate::transformer::{HybridVerifyRollback, commit_after_verify, snapshot_before_verify};
 
 use super::dflash::DFlashContextCache;
 use super::model::MuseGlimmerInner;
@@ -34,7 +32,7 @@ pub(crate) struct MuseGlimmerDFlashStepper<'a> {
     context: DFlashContextCache,
     next_position: i32,
     tap_layers: Vec<usize>,
-    rollback: Option<Gemma4VerifyRollback>,
+    rollback: Option<HybridVerifyRollback>,
     tapped: Option<Vec<MxArray>>,
 }
 

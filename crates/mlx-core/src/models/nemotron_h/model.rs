@@ -767,81 +767,29 @@ impl NemotronHInner {
                  cannot hold one block"
             )));
         }
-        // Hold the process-wide pool-growth lock across sizing → CAS
-        // reservation → pool allocation. The CAS retry loop only protects
-        // against registrations racing between its read and its commit;
-        // without this lock a concurrent qwen3_5 grow (or another loader)
-        // can probe sibling totals that miss this in-flight reservation and
-        // both allocations spend the same headroom. See
-        // `cache_limit::pool_growth_lock`.
-        let _growth_guard = crate::cache_limit::pool_growth_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let coordinator = crate::cache_limit::coordinator();
-        let hard_budget = crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
-            Error::from_reason(format!(
-                "NemotronH paged cache sizing failed safely; refusing an uncapped pool request: \
-                 {error}"
-            ))
-        })?;
-        let (selected_blocks, pool_guard) = {
-            let mut reserved = None;
-            for _ in 0..8 {
-                let sibling = coordinator.registered_pool_bytes();
-                let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
-                    requested_blocks,
-                    attn_layer_count,
-                    num_kv_heads,
-                    head_size,
+        let sized = crate::engine::persistence::size_paged_pool_after_weight_load(
+            &crate::engine::persistence::PagedPoolSizingSpec {
+                family: "NemotronH",
+                requested_blocks,
+                num_layers: attn_layer_count,
+                num_kv_heads,
+                head_size,
+                block_size,
+                cache_dtype,
+                extra_fixed_bytes: 0,
+            },
+            |selected_blocks, _| {
+                crate::engine::persistence::build_paged_kv_adapter(
+                    pa_config,
+                    selected_blocks,
                     block_size,
                     cache_dtype,
-                    hard_budget,
-                    sibling,
+                    "NemotronH",
                 )
-                .map_err(|error| {
-                    Error::from_reason(format!(
-                        "NemotronH adaptive paged cache sizing failed safely; refusing an uncapped \
-                         pool request: {error}"
-                    ))
-                })?;
-                if let Some(guard) =
-                    coordinator.try_register_pool_if_total_eq(sibling, sizing.selected_bytes)
-                {
-                    reserved = Some((sizing.selected_blocks, guard));
-                    break;
-                }
-            }
-            reserved.ok_or_else(|| {
-                Error::from_reason(
-                    "NemotronH adaptive paged cache sizing failed safely; concurrent pool \
-                     reservation kept racing",
-                )
-            })?
-        };
-        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            selected_blocks,
-            selected_blocks,
-            block_size,
-        )));
-        let pool = mlx_paged_attn::LayerKVPool::new(
-            pa_config,
-            selected_blocks,
-            selected_blocks,
-            cache_dtype,
-        )
-        .map_err(|e| {
-            Error::from_reason(format!(
-                "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
-            ))
-        })?;
-        self.paged_adapter = Some(
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                Error::from_reason(format!(
-                    "Failed to construct NemotronH PagedKVCacheAdapter: {e}"
-                ))
-            })?,
-        );
-        self.pool_cache_limit_guard = Some(pool_guard);
+            },
+        )?;
+        self.paged_adapter = Some(sized.pool);
+        self.pool_cache_limit_guard = Some(sized.guard);
         Ok(())
     }
 

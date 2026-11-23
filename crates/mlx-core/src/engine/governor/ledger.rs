@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::models::qwen3_5::dflash2_state::store::EntryId;
+use crate::disk_tier::store::EntryId;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 const MIB: f64 = (1u64 << 20) as f64;

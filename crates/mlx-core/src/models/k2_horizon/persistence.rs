@@ -25,7 +25,8 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_block_scale,
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    dequant_fp8_weights, load_all_safetensors, params_weight_bytes, prewarm_checkpoint_pages,
+    register_loaded_weights_and_pool, spawn_loaded_model_thread,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, load_dense_mlp_variant,
@@ -260,10 +261,7 @@ fn apply_weights(
 /// path has already replaced `.weight` entries with their bf16 expansion,
 /// so the sum matches live memory either way.
 fn compute_weight_bytes(params: &HashMap<String, MxArray>) -> u64 {
-    params
-        .values()
-        .map(|a| a.nbytes() as u64)
-        .fold(0u64, |acc, v| acc.saturating_add(v))
+    params_weight_bytes(params)
 }
 
 impl K2Inner {
@@ -378,37 +376,32 @@ impl K2HorizonModel {
     pub async fn load_from_dir(model_path: &str) -> Result<Self> {
         let model_path = model_path.to_string();
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
+        let (thread, (config, guards, paged_active)) = spawn_loaded_model_thread(
+            "Model thread exited during load",
             move || {
-                let (inner, weight_bytes, pool_bytes) = K2Inner::load_from_dir(&model_path)?;
-                let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-                let pool_cache_limit_guard = (pool_bytes != 0)
-                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+                let (mut inner, weight_bytes, pool_bytes) = K2Inner::load_from_dir(&model_path)?;
+                let guards = register_loaded_weights_and_pool(
+                    weight_bytes,
+                    pool_bytes,
+                    inner.pool_cache_limit_guard.take(),
+                );
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
                     super::model::K2SchedulerState::new(inner)?,
-                    (
-                        config,
-                        cache_limit_guard,
-                        pool_cache_limit_guard,
-                        paged_active,
-                    ),
+                    (config, guards, paged_active),
                 ))
             },
             |state, receiver| state.drive(receiver),
-        );
-
-        let (config, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        )
+        .await?;
 
         Ok(K2HorizonModel {
             thread,
             config,
             paged_active,
-            _cache_limit_guard: cache_limit_guard,
-            _pool_cache_limit_guard: pool_cache_limit_guard,
+            _cache_limit_guard: guards.cache_limit,
+            _pool_cache_limit_guard: guards.pool_cache_limit,
         })
     }
 }

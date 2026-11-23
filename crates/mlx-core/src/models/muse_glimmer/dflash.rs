@@ -9,10 +9,10 @@ use rand::Rng;
 
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, RMSNorm, RoPE};
 use crate::sampling::{SamplingConfig, is_greedy_temperature, sampling_distribution};
+use crate::transformer::HybridLayerCache;
 
 use super::config::{MuseGlimmerDFlashConfig, MuseGlimmerTextConfig};
 use super::mlp::MuseGlimmerMlp;
@@ -208,7 +208,7 @@ impl DFlashLayer {
 }
 
 pub(crate) struct DFlashContextCache {
-    layers: Vec<Gemma4LayerCache>,
+    layers: Vec<HybridLayerCache>,
     logical_len: i32,
 }
 
@@ -216,7 +216,7 @@ impl DFlashContextCache {
     pub(crate) fn new_at(config: &MuseGlimmerDFlashConfig, logical_len: i32) -> Self {
         Self {
             layers: (0..config.num_hidden_layers)
-                .map(|_| Gemma4LayerCache::new_sliding(config.sliding_window as i32))
+                .map(|_| HybridLayerCache::new_sliding(config.sliding_window as i32))
                 .collect(),
             logical_len,
         }

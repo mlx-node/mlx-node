@@ -6,7 +6,7 @@ use crate::engine::decode_tuning::{gpu_core_count, grouped_partition_stripes};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::nn::{Linear, RMSNorm, RoPE};
+use crate::nn::{Linear, RMSNorm, RoPE, rms_norm_unscaled};
 use crate::transformer::paged_kv_cache_adapter::{
     DenseAttentionWindow, PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
     PagedRaggedRow, SeqId,
@@ -17,7 +17,6 @@ use crate::transformer::paged_policy::{
     LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes, estimate_varlen_paged_attention_bytes,
     live_headroom, prefill_sdpa_effective_dtype,
 };
-use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
@@ -703,19 +702,12 @@ fn trim_mask(mask: Option<&MxArray>, kv_len: i64) -> Result<Option<MxArray>> {
 /// Gemma4 proportional RoPE for global attention layers.
 ///
 /// 1:1 port of mlx-lm `ProportionalRoPE` (rope_utils.py).
-/// Uses inf-padded frequencies with a SINGLE `mx.fast.rope` call.
+/// Builds inf-padded frequencies (`[dims / 2]`) and delegates to [`RoPE::with_freqs`].
 /// Non-rotated dimensions get `inf` frequency → no rotation (identity).
 ///
 /// Key insight: exponent denominator = full `dims` (head_size), not `rotated_dims`.
 /// Only `partial_rotary_factor` fraction of dims are actually rotated.
-pub(crate) struct Gemma4ProportionalRoPE {
-    /// Pre-computed frequencies for `mx.fast.rope`, shape [dims/2].
-    /// First rotated_dims/2 entries: factor * base^(2i / dims)
-    /// Remaining entries: inf (causes no rotation in mx.fast.rope)
-    freqs: MxArray,
-    /// Full head dimension (e.g. 512)
-    dims: i32,
-}
+pub(crate) struct Gemma4ProportionalRoPE(RoPE);
 
 impl Gemma4ProportionalRoPE {
     /// Create proportional RoPE for global attention.
@@ -743,73 +735,16 @@ impl Gemma4ProportionalRoPE {
         freqs_data.extend(std::iter::repeat_n(f32::INFINITY, nope_dims));
 
         let freqs = MxArray::from_float32(&freqs_data, &[half_dims as i64])?;
+        Ok(Self(RoPE::with_freqs(dims, false, freqs, None)))
+    }
 
-        Ok(Self { freqs, dims })
+    fn into_rope(self) -> RoPE {
+        self.0
     }
 
     /// Apply proportional RoPE to tensor in [B, H, T, D] format.
-    ///
-    /// Single fused `mx.fast.rope` call with inf-padded frequencies.
-    /// No split/scatter needed — the kernel handles everything.
     pub(crate) fn forward(&self, x: &MxArray, offset: i32) -> Result<MxArray> {
-        let offset_arr = MxArray::from_int32(&[offset], &[1])?;
-        let handle = unsafe {
-            sys::mlx_fast_rope_with_freqs(
-                x.handle.0,
-                self.dims, // full head dimension
-                false,     // traditional=False (neox-style)
-                0.0,       // base ignored when freqs provided
-                1.0,       // scale=1.0
-                offset_arr.handle.0,
-                self.freqs.handle.0,
-            )
-        };
-        MxArray::from_handle(handle, "proportional_rope")
-    }
-
-    fn forward_with_offsets(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            sys::mlx_fast_rope_with_freqs(
-                x.handle.0,
-                self.dims,
-                false,
-                0.0,
-                1.0,
-                offsets.handle.0,
-                self.freqs.handle.0,
-            )
-        };
-        MxArray::from_handle(handle, "proportional_rope_batched")
-    }
-}
-
-// ============================================
-// Gemma4 RoPE dispatch (sliding vs global)
-// ============================================
-
-/// RoPE variant for Gemma4 attention layers.
-enum Gemma4RoPE {
-    /// Standard RoPE for sliding (local) attention layers.
-    /// Uses `fast.rope(dims=head_dim, base=10K)` — correct because dims == head_size.
-    Standard(RoPE),
-    /// Proportional RoPE for global (full) attention layers.
-    /// Uses mx.fast.rope with precomputed freqs on only the rotated dims.
-    Proportional(Gemma4ProportionalRoPE),
-}
-
-impl Gemma4RoPE {
-    fn forward(&self, x: &MxArray, offset: i32) -> Result<MxArray> {
-        match self {
-            Self::Standard(rope) => rope.forward(x, Some(offset)),
-            Self::Proportional(rope) => rope.forward(x, offset),
-        }
-    }
-
-    fn forward_with_offsets(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
-        match self {
-            Self::Standard(rope) => rope.forward_with_offsets(x, offsets),
-            Self::Proportional(rope) => rope.forward_with_offsets(x, offsets),
-        }
+        self.0.forward(x, Some(offset))
     }
 }
 
@@ -838,7 +773,7 @@ pub struct Gemma4Attention {
     /// V norm epsilon (scale-free: passes weight=None to rms_norm, matching Python RMSNormNoScale)
     v_norm_eps: f32,
 
-    rope: Gemma4RoPE,
+    rope: RoPE,
 
     num_heads: i32,
     num_kv_heads: i32,
@@ -901,20 +836,21 @@ impl Gemma4Attention {
         let v_norm_eps = config.rms_norm_eps as f32;
 
         // RoPE: sliding uses standard RoPE (theta=10K, dims=head_dim).
-        // Global uses proportional RoPE (theta=1M, partial rotation via mx.fast.rope).
+        // Global uses proportional RoPE (theta=1M, partial rotation via RoPE::with_freqs).
         let rope = if is_sliding {
-            Gemma4RoPE::Standard(RoPE::new(
+            RoPE::new(
                 config.rope_dims_sliding(),
                 Some(false),
                 Some(config.rope_local_base_freq),
                 None,
-            ))
+            )
         } else {
-            Gemma4RoPE::Proportional(Gemma4ProportionalRoPE::new(
+            Gemma4ProportionalRoPE::new(
                 head_dim,                     // full head dimension (e.g. 512)
                 config.partial_rotary_factor, // fraction of dims to rotate (e.g. 0.25)
                 config.rope_theta,            // 1M
-            )?)
+            )?
+            .into_rope()
         };
 
         Ok(Self {
@@ -983,12 +919,7 @@ impl Gemma4Attention {
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
         // V norm: scale-free (weight=None), matching Python's RMSNormNoScale
-        let values = {
-            let handle = unsafe {
-                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
-            };
-            MxArray::from_handle(handle, "v_norm")?
-        };
+        let values = rms_norm_unscaled(&values, self.v_norm_eps)?;
 
         // Transpose to [B, H, T, D] BEFORE RoPE
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
@@ -997,8 +928,8 @@ impl Gemma4Attention {
 
         // Apply RoPE with cache offset
         let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-        let queries = self.rope.forward(&queries, offset)?;
-        let keys = self.rope.forward(&keys, offset)?;
+        let queries = self.rope.forward(&queries, Some(offset))?;
+        let keys = self.rope.forward(&keys, Some(offset))?;
 
         // Update cache
         let (keys, values) = if let Some(c) = cache {
@@ -1092,7 +1023,7 @@ impl Gemma4Attention {
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
 
         // Apply RoPE to queries using the anchor's cache offset
-        let queries = self.rope.forward(&queries, cache_offset)?;
+        let queries = self.rope.forward(&queries, Some(cache_offset))?;
 
         let mask = trim_mask(mask, shared_keys.shape_at(2)?)?;
 
@@ -1810,12 +1741,7 @@ impl Gemma4Attention {
         // 3. QKV normalization (Q/K learned-scale, V scale-free).
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
-        let values = {
-            let handle = unsafe {
-                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
-            };
-            MxArray::from_handle(handle, "v_norm")?
-        };
+        let values = rms_norm_unscaled(&values, self.v_norm_eps)?;
 
         // 4. Transpose to [B, H, T, D] BEFORE RoPE (matches `forward`).
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
@@ -1824,8 +1750,8 @@ impl Gemma4Attention {
 
         // 5. Apply RoPE using the request's logical offset.
         let rope_offset = first_logical_position as i32;
-        let queries_bhtd = self.rope.forward(&queries, rope_offset)?;
-        let keys_bhtd = self.rope.forward(&keys, rope_offset)?;
+        let queries_bhtd = self.rope.forward(&queries, Some(rope_offset))?;
+        let keys_bhtd = self.rope.forward(&keys, Some(rope_offset))?;
         let values_bhtd = values;
 
         // 6. Convert K/V into the paged layout `[num_tokens, n_kv_heads,
@@ -2032,12 +1958,7 @@ impl Gemma4Attention {
         };
         let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
-        let values = {
-            let handle = unsafe {
-                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
-            };
-            MxArray::from_handle(handle, "v_norm_batched")?.transpose(Some(&[0, 2, 1, 3]))?
-        };
+        let values = rms_norm_unscaled(&values, self.v_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
 
         let queries = queries.squeeze(Some(&[2]))?;
         let keys = keys.squeeze(Some(&[2]))?;
@@ -2111,12 +2032,8 @@ impl Gemma4Attention {
             };
             let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
             let keys = self.rope.forward_with_offsets(&keys, offsets)?;
-            let values = {
-                let handle = unsafe {
-                    sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
-                };
-                MxArray::from_handle(handle, "v_norm_batched")?.transpose(Some(&[0, 2, 1, 3]))?
-            };
+            let values =
+                rms_norm_unscaled(&values, self.v_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
 
             let keys = keys.squeeze(Some(&[2]))?;
             let values = values.squeeze(Some(&[2]))?;
@@ -2171,7 +2088,7 @@ impl Gemma4Attention {
             queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
         let queries = self.q_norm.forward(&queries)?;
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let queries_bhtd = self.rope.forward(&queries, cache_offset)?;
+        let queries_bhtd = self.rope.forward(&queries, Some(cache_offset))?;
 
         // SDPA. Same scale=1.0 as `forward_paged`. For cache-hit suffix
         // prefill, prefer the on-GPU paged prefill helper and fall back to

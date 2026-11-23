@@ -15,7 +15,7 @@
 //! not applicable to the bidirectional token-classification setting.
 
 use crate::array::{MxArray, banded_attention};
-use mlx_sys as sys;
+use crate::nn::RoPE;
 use napi::bindgen_prelude::*;
 
 use super::config::PrivacyFilterConfig;
@@ -71,57 +71,20 @@ impl<'a> AttentionLayer<'a> {
             .reshape(&[batch, seq_len, num_kv_heads, head_dim])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        // 3. YaRN `attention_factor` (a.k.a. `mscale`) — multiply Q and K
-        //    by the YaRN attention factor BEFORE the rotation. This
-        //    mirrors mlx-lm `YarnRoPE.__call__`
-        //    (`x[..., :dims] = self.mscale * x[..., :dims]` then
-        //    `mx.fast.rope(...)`) and HF transformers
-        //    (`cos *= attention_factor; sin *= attention_factor`, which
-        //    is algebraically equivalent to pre-scaling Q/K). Without it,
-        //    rotated Q/K are ~1.35× smaller than reference for
-        //    `factor=32`. `mul_scalar` keeps the bf16 dtype intact —
-        //    MLX handles the scalar promotion internally rather than
-        //    materialising an f32 constant that would force bf16→f32.
-        let attention_factor = self.config.rope_parameters.attention_factor();
-        let (q, k) = if (attention_factor - 1.0).abs() > 1e-7 {
-            let q = q.mul_scalar(attention_factor as f64)?;
-            let k = k.mul_scalar(attention_factor as f64)?;
-            (q, k)
-        } else {
-            (q, k)
-        };
-
-        // 4. YaRN RoPE on Q and K. Offset is always 0 (bidirectional
-        //    self-attention over a single chunk — no KV cache). `dims` is the
-        //    full head dimension; the freqs array is `[head_dim/2]`.
-        //
-        //    `mlx_fast_rope_with_freqs` accepts an array-valued offset for
-        //    compile-friendliness; we materialise a 1-element `i32` array.
-        let offset = MxArray::from_int32(&[0], &[1])?;
-        let q = unsafe {
-            sys::mlx_fast_rope_with_freqs(
-                q.handle.0,
-                head_dim as i32,
-                true, // traditional=true: interleaved [::2]/[1::2] (HF _apply_rotary_emb)
-                0.0,  // base ignored when freqs provided
-                1.0,  // scale=1.0
-                offset.handle.0,
-                self.yarn_freqs.handle.0,
-            )
-        };
-        let q = MxArray::from_handle(q, "privacy_filter yarn rope (q)")?;
-        let k = unsafe {
-            sys::mlx_fast_rope_with_freqs(
-                k.handle.0,
-                head_dim as i32,
-                true,
-                0.0,
-                1.0,
-                offset.handle.0,
-                self.yarn_freqs.handle.0,
-            )
-        };
-        let k = MxArray::from_handle(k, "privacy_filter yarn rope (k)")?;
+        // 3-4. YaRN RoPE on Q and K with native-dtype `attention_factor`
+        //      (mscale) pre-scaling. Offset is always 0 (bidirectional
+        //      self-attention over a single chunk — no KV cache).
+        //      `traditional=true` selects interleaved [::2]/[1::2] pairs
+        //      matching HF `_apply_rotary_emb`, while `RoPE::with_freqs`
+        //      pre-scales via `mul_scalar` so bf16 stays intact.
+        let rope = RoPE::with_freqs(
+            head_dim as i32,
+            true,
+            self.yarn_freqs.clone(),
+            Some(self.config.rope_parameters.attention_factor() as f64),
+        );
+        let q = rope.forward(&q, Some(0))?;
+        let k = rope.forward(&k, Some(0))?;
 
         // 5. Banded attention with per-head sinks. Sliding window is
         //    bidirectional: |q - k| <= band, already baked into

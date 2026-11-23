@@ -7764,6 +7764,180 @@ pub(crate) fn native_gguf_sidecar_mutex() -> &'static std::sync::Mutex<()> {
     MUTEX.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Per-sidecar exclusive flock shared with [`sweep_native_gguf_cache`]: a held
+/// lock makes the sweep skip the directory so hit checks and publishes cannot
+/// race a mid-flight eviction.
+fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(format!("{dir_name}.lock")))
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Acquire (or build and atomically publish) a leased GGUF assets sidecar
+/// directory under `root` for source file `first`.
+///
+/// Serializes same-process callers via [`native_gguf_sidecar_mutex`] and
+/// cross-process callers/sweeps via `{dir_name}.lock` + `{dir_name}.lease`
+/// (the exact same lock/lease/GC protocol used by [`prepare_gguf_assets_in`]
+/// and [`sweep_native_gguf_cache`]). On a cache miss, `populate` writes the
+/// sidecar payloads into a fresh temporary directory; this helper writes the
+/// `complete` marker, replaces any unleased debris (or promotes to a per-pid
+/// `.mlx-qwen4-assets-live-*` generation if the canonical dir is still leased),
+/// and returns the leased path.
+pub(crate) fn acquire_leased_gguf_assets_sidecar<F>(
+    first: &Path,
+    root: &Path,
+    populate: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let _process_lock = native_gguf_sidecar_mutex()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let source = first
+        .canonicalize()
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    let metadata = fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
+    let dir_name = native_gguf_assets_dir_name(&source_file_identity_digest(&source, &metadata));
+    let dir = root.join(&dir_name);
+    let live_dir_name = format!(
+        ".mlx-qwen4-assets-live-{}-{}",
+        &dir_name[NATIVE_GGUF_ASSETS_PREFIX.len()..],
+        std::process::id()
+    );
+    let live_dir = root.join(&live_dir_name);
+    const ASSETS_LOCK_RETRIES: u32 = 40;
+    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+    // Hit path: shared-lease `dir` before checking `complete` so a foreign
+    // sweep's LOCK_EX cannot delete it out from under the caller.
+    if dir.join("complete").exists() {
+        let mut leased = false;
+        for _ in 0..ASSETS_LOCK_RETRIES {
+            if native_gguf_lease_in_use(root, &dir, Some(&dir_name)) {
+                leased = true;
+                break;
+            }
+            std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        }
+        if leased {
+            if dir.join("complete").exists() {
+                native_gguf_stamp_mtime(&dir.join("complete"));
+                return Ok(dir);
+            }
+            native_gguf_unlease_in_use(&dir);
+        }
+    }
+
+    for generation in 1..64_u32 {
+        let candidate = if generation == 1 {
+            live_dir.clone()
+        } else {
+            root.join(format!("{live_dir_name}-g{generation}"))
+        };
+        if candidate.join("complete").exists() {
+            native_gguf_lease_in_use(root, &candidate, None);
+            if candidate.join("complete").exists() {
+                native_gguf_stamp_mtime(&candidate.join("complete"));
+                return Ok(candidate);
+            }
+            native_gguf_unlease_in_use(&candidate);
+        }
+        if !candidate.exists() {
+            break;
+        }
+    }
+
+    let mut guard = assets_sidecar_lock(root, &dir_name);
+    for _ in 0..ASSETS_LOCK_RETRIES {
+        if guard.is_some() {
+            break;
+        }
+        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        guard = assets_sidecar_lock(root, &dir_name);
+    }
+    let Some(_guard) = guard else {
+        return Err(Error::from_reason(format!(
+            "GGUF assets sidecar lock for {dir_name} stayed contended for ~2s; refusing to publish unguarded"
+        )));
+    };
+
+    if dir.join("complete").exists() {
+        if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
+            )));
+        }
+        native_gguf_stamp_mtime(&dir.join("complete"));
+        return Ok(dir);
+    }
+
+    let promote_live = |temp: &Path| -> Result<PathBuf> {
+        for generation in 1..64_u32 {
+            let candidate_name = if generation == 1 {
+                live_dir_name.clone()
+            } else {
+                format!("{live_dir_name}-g{generation}")
+            };
+            let candidate = root.join(&candidate_name);
+            if native_gguf_in_use_dir(&candidate) {
+                continue;
+            }
+            if candidate.exists() {
+                fs::remove_dir_all(&candidate).map_err(|e| Error::from_reason(e.to_string()))?;
+            }
+            fs::rename(temp, &candidate).map_err(|e| Error::from_reason(e.to_string()))?;
+            return Ok(candidate);
+        }
+        Err(Error::from_reason(
+            "every .mlx-qwen4-assets-live generation for this source is leased",
+        ))
+    };
+
+    let temp = root.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temp).map_err(|e| Error::from_reason(e.to_string()))?;
+    let result = (|| -> Result<PathBuf> {
+        populate(&temp)?;
+        fs::write(temp.join("complete"), b"1").map_err(|e| Error::from_reason(e.to_string()))?;
+        let dir_guard = if dir.exists() {
+            match native_gguf_output_delete_guard(root, &dir) {
+                Some(guard) => Some(guard),
+                None => return promote_live(&temp),
+            }
+        } else {
+            None
+        };
+        if dir.exists() {
+            fs::remove_dir_all(&dir).map_err(|e| Error::from_reason(e.to_string()))?;
+        }
+        fs::rename(&temp, &dir).map_err(|e| Error::from_reason(e.to_string()))?;
+        drop(dir_guard);
+        Ok(dir.clone())
+    })();
+    if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    if let Ok(path) = &result {
+        if *path == dir {
+            if !native_gguf_lease_in_use_retry(root, &dir, &dir_name) {
+                return Err(Error::from_reason(format!(
+                    "Failed to lease GGUF assets sidecar '{dir_name}' for the loaded model; retry the load"
+                )));
+            }
+        } else {
+            native_gguf_lease_in_use(root, path, None);
+        }
+    }
+    result
+}
+
 /// Sweep stale and orphaned entries from the native GGUF cache
 /// root. Runs under the process mutex and the caller's per-key lock; every
 /// gate is conservative so a load can never be broken by the sweep and every

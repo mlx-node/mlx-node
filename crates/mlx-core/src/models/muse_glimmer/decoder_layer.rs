@@ -1,11 +1,10 @@
 use crate::array::MxArray;
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::nn::RMSNorm;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::{HybridLayerCache, PagedWindowSlot};
 use napi::bindgen_prelude::*;
 
 use super::attention::MuseGlimmerAttention;
-use super::kv_cache::PagedWindowSlot;
 use super::mlp::MuseGlimmerMlp;
 
 pub struct MuseGlimmerDecoderLayer {
@@ -37,7 +36,7 @@ impl MuseGlimmerDecoderLayer {
         }
     }
 
-    pub fn forward(&self, x: &MxArray, cache: &mut Gemma4LayerCache) -> Result<MxArray> {
+    pub fn forward(&self, x: &MxArray, cache: &mut HybridLayerCache) -> Result<MxArray> {
         let attn = self
             .attention
             .forward(&self.input_layernorm.forward(x)?, cache)?;

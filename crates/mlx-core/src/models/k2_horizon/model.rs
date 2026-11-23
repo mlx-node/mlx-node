@@ -141,6 +141,10 @@ pub(crate) struct K2Inner {
     /// layer is full attention, so the pool has `num_hidden_layers` slots
     /// and the layer ordinal IS the adapter index.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Reserved atomically in [`Self::size_paged_pool_after_weight_load`] under
+    /// `pool_growth_lock` so concurrent loads cannot spend the same headroom;
+    /// taken by `persistence::K2HorizonModel::load_from_dir`.
+    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Sampling + stop-token defaults parsed from `generation_config.json`.
     gen_defaults: crate::engine::ModelGenerationDefaults,
     /// Exact-match rewind arm for [`ChatBackend::verify_cache_prefix`]:
@@ -253,6 +257,7 @@ impl K2Inner {
             tokenizer: None,
             cached_token_history: Vec::new(),
             paged_adapter,
+            pool_cache_limit_guard: None,
             turn_cancel: None,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             pending_exact_match_rewind: Cell::new(false),
@@ -265,78 +270,64 @@ impl K2Inner {
     /// weights, so the selected pool is capped against the real working
     /// set instead of double-budgeting them).
     pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
-        if self.paged_adapter.is_none() {
-            return Ok(());
-        }
-        // An explicit pool size is an operator cap, not a sizing hint — the
-        // constructor already built and co-resident-loaded that exact pool.
-        if self.config.paged_cache_memory_mb.is_some() {
+        if self.paged_adapter.is_none() || self.config.paged_cache_memory_mb.is_some() {
             return Ok(());
         }
         self.paged_adapter = None;
+        self.pool_cache_limit_guard = None;
 
         let block_size = self.config.paged_block_size.unwrap_or(16);
         let trained_context = u32::try_from(self.config.max_position_embeddings)
             .unwrap_or(1)
             .max(1);
         let per_seq_context = trained_context.min(scheduler_per_seq_context());
-        let requested_tokens =
-            per_seq_context.saturating_mul(scheduler_max_num_seqs_for(32) as u32);
+        let max_batch_size = scheduler_max_num_seqs_for(32) as u32;
+        let requested_tokens = per_seq_context.saturating_mul(max_batch_size);
         let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
-            requested_blocks,
-            self.config.num_hidden_layers as u32,
-            self.config.num_key_value_heads as u32,
-            self.config.head_dim() as u32,
-            block_size,
-            cache_dtype,
-            crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
-                Error::from_reason(format!(
-                    "K2 paged cache sizing failed safely; refusing an uncapped pool request: {error}"
-                ))
-            })?,
-            0,
-        )
-        .map_err(|error| {
-            Error::from_reason(format!(
-                "K2 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
-            ))
-        })?;
-        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
-        let pa_config = mlx_paged_attn::PagedAttentionConfig {
-            block_size,
-            gpu_memory_mb: selected_mb,
-            head_size: self.config.head_dim() as u32,
-            num_kv_heads: self.config.num_key_value_heads as u32,
-            num_layers: self.config.num_hidden_layers as u32,
-            max_seq_len: Some(per_seq_context),
-            max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
-        };
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            sizing.selected_blocks,
-            sizing.selected_blocks,
-            block_size,
-        )));
-        let pool = mlx_paged_attn::LayerKVPool::new(
-            pa_config,
-            sizing.selected_blocks,
-            sizing.selected_blocks,
-            cache_dtype,
-        )
-        .map_err(|error| Error::from_reason(format!("Failed to construct K2 KV pool: {error}")))?;
-        self.paged_adapter = Some(
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
-                Error::from_reason(format!("Failed to construct K2 paged adapter: {error}"))
-            })?,
-        );
+        let num_layers = self.config.num_hidden_layers as u32;
+        let num_kv_heads = self.config.num_key_value_heads as u32;
+        let head_size = self.config.head_dim() as u32;
+        let sized = crate::engine::persistence::size_paged_pool_after_weight_load(
+            &crate::engine::persistence::PagedPoolSizingSpec {
+                family: "K2",
+                requested_blocks,
+                num_layers,
+                num_kv_heads,
+                head_size,
+                block_size,
+                cache_dtype,
+                extra_fixed_bytes: 0,
+            },
+            |selected_blocks, selected_bytes| {
+                let selected_mb = selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+                let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                    block_size,
+                    gpu_memory_mb: selected_mb,
+                    head_size,
+                    num_kv_heads,
+                    num_layers,
+                    max_seq_len: Some(per_seq_context),
+                    max_batch_size: Some(max_batch_size),
+                };
+                crate::engine::persistence::build_paged_kv_adapter(
+                    pa_config,
+                    selected_blocks,
+                    block_size,
+                    cache_dtype,
+                    "K2",
+                )
+            },
+        )?;
+        self.paged_adapter = Some(sized.pool);
+        self.pool_cache_limit_guard = Some(sized.guard);
         info!(
             "K2 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
             requested_blocks,
-            sizing.selected_blocks,
-            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            sized.selected_blocks,
+            sized.selected_bytes as f64 / (1u64 << 30) as f64,
             per_seq_context,
-            scheduler_max_num_seqs_for(32),
+            max_batch_size,
         );
         Ok(())
     }

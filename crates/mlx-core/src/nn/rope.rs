@@ -10,6 +10,17 @@ use super::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 // Positional Encoding (Internal)
 // ============================================
 
+/// Pre-rotation input scaling applied before `mlx_fast_rope_with_freqs`.
+#[derive(Clone)]
+enum PreRotateScale {
+    /// Uniform scalar pre-scale applied in the input's native dtype (`mul_scalar`),
+    /// preserving bf16 without an f32 round-trip (e.g. YaRN `attention_factor` / `mscale`).
+    Scalar(f64),
+    /// Per-dimension `[head_dim]` f32 vector applied in f32 before rotation and cast
+    /// back to the input dtype after rotation (Splash YaRN partial-dim `attentionFactor`).
+    PerDimF32(Arc<MxArray>),
+}
+
 /// Rotary Position Embedding (RoPE)
 ///
 /// Applies rotary position embeddings to the input tensor.
@@ -19,12 +30,12 @@ pub struct RoPE {
     pub(crate) traditional: bool,
     pub(crate) base: f32,
     pub(crate) scale: f32,
-    /// YaRN only: `[dims / 2]` f32 periods (MLX `freqs`, `1 / inverse
-    /// frequency`) of Splash `rotaryInverseFrequencies`.
+    /// Precomputed `[dims / 2]` f32 periods (MLX `freqs`, `1 / inverse frequency`).
+    /// Used by YaRN (`RoPE::yarn`) and custom frequency tables (`RoPE::with_freqs`,
+    /// e.g. Gemma4 inf-padded proportional RoPE and Privacy Filter YaRN).
     periods: Option<Arc<MxArray>>,
-    /// YaRN only: `[head_dim]` f32, Splash `attentionFactor` on the rotated
-    /// dims and 1 on the rest.
-    rotated_scale: Option<Arc<MxArray>>,
+    /// Optional pre-rotation scale applied before `mlx_fast_rope_with_freqs`.
+    rotated_scale: Option<PreRotateScale>,
 }
 
 impl RoPE {
@@ -42,6 +53,31 @@ impl RoPE {
             scale: scale.unwrap_or(1.0) as f32,
             periods: None,
             rotated_scale: None,
+        }
+    }
+
+    /// Create a RoPE module backed by precomputed `[dims / 2]` f32 periods
+    /// (`freqs`, i.e. `1 / inverse_frequency` as expected by `mx.fast.rope`).
+    ///
+    /// When `rotated_scale` is `Some(factor)` with `(factor - 1.0).abs() > 1e-7`,
+    /// inputs are pre-scaled in their native dtype via `mul_scalar(factor)` before
+    /// rotation (matching mlx-lm `YarnRoPE.__call__` while preserving bf16).
+    pub fn with_freqs(
+        dims: i32,
+        traditional: bool,
+        freqs: MxArray,
+        rotated_scale: Option<f64>,
+    ) -> Self {
+        let rotated_scale = rotated_scale
+            .filter(|factor| (*factor - 1.0).abs() > 1e-7)
+            .map(PreRotateScale::Scalar);
+        Self {
+            dims,
+            traditional,
+            base: 0.0,
+            scale: 1.0,
+            periods: Some(Arc::new(freqs)),
+            rotated_scale,
         }
     }
 
@@ -63,10 +99,10 @@ impl RoPE {
             &periods,
             &[i64::from(dims / 2)],
         )?));
-        rope.rotated_scale = Some(Arc::new(MxArray::from_float32(
+        rope.rotated_scale = Some(PreRotateScale::PerDimF32(Arc::new(MxArray::from_float32(
             &rotated,
             &[i64::from(head_dim)],
-        )?));
+        )?)));
         Ok(rope)
     }
 
@@ -74,32 +110,65 @@ impl RoPE {
         self.periods.is_some()
     }
 
-    /// `x` in f32 times the rotated-dim scale, the periods, and the cast back.
-    fn scaled_rope(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
-        let (Some(periods), Some(rotated_scale)) = (&self.periods, &self.rotated_scale) else {
-            return Err(Error::from_reason("RoPE has no YaRN table"));
+    /// Apply `mlx_fast_rope_with_freqs` using `self.periods` and optional pre-rotation scale.
+    fn freqs_rope(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
+        let Some(periods) = &self.periods else {
+            return Err(Error::from_reason("RoPE has no frequency table"));
         };
-        let dtype = x.dtype()?;
-        let scaled = x.astype(DType::Float32)?.mul(rotated_scale)?;
-        let handle = unsafe {
-            sys::mlx_fast_rope_with_freqs(
-                scaled.handle.0,
-                self.dims,
-                self.traditional,
-                0.0,
-                self.scale,
-                offsets.handle.0,
-                periods.handle.0,
-            )
-        };
-        MxArray::from_handle(handle, "yarn_rope")?.astype(dtype)
+        match &self.rotated_scale {
+            Some(PreRotateScale::PerDimF32(rotated_scale)) => {
+                let dtype = x.dtype()?;
+                let scaled = x.astype(DType::Float32)?.mul(rotated_scale)?;
+                let handle = unsafe {
+                    sys::mlx_fast_rope_with_freqs(
+                        scaled.handle.0,
+                        self.dims,
+                        self.traditional,
+                        0.0,
+                        self.scale,
+                        offsets.handle.0,
+                        periods.handle.0,
+                    )
+                };
+                MxArray::from_handle(handle, "yarn_rope")?.astype(dtype)
+            }
+            Some(PreRotateScale::Scalar(factor)) => {
+                let scaled = x.mul_scalar(*factor)?;
+                let handle = unsafe {
+                    sys::mlx_fast_rope_with_freqs(
+                        scaled.handle.0,
+                        self.dims,
+                        self.traditional,
+                        0.0,
+                        self.scale,
+                        offsets.handle.0,
+                        periods.handle.0,
+                    )
+                };
+                MxArray::from_handle(handle, "rope_with_freqs")
+            }
+            None => {
+                let handle = unsafe {
+                    sys::mlx_fast_rope_with_freqs(
+                        x.handle.0,
+                        self.dims,
+                        self.traditional,
+                        0.0,
+                        self.scale,
+                        offsets.handle.0,
+                        periods.handle.0,
+                    )
+                };
+                MxArray::from_handle(handle, "rope_with_freqs")
+            }
+        }
     }
 
     /// Apply RoPE to input tensor
     pub fn forward(&self, x: &MxArray, offset: Option<i32>) -> Result<MxArray> {
         let offset = offset.unwrap_or(0);
         if self.is_scaled() {
-            return self.scaled_rope(x, &MxArray::from_int32(&[offset], &[1])?);
+            return self.freqs_rope(x, &MxArray::from_int32(&[offset], &[1])?);
         }
         let handle = unsafe {
             sys::mlx_fast_rope(
@@ -141,7 +210,7 @@ impl RoPE {
             )));
         }
         if self.is_scaled() {
-            return self.scaled_rope(x, offsets);
+            return self.freqs_rope(x, offsets);
         }
         let handle = unsafe {
             sys::mlx_fast_rope_with_freqs(
@@ -412,5 +481,102 @@ mod tests {
                 read(direct_offsets)
             );
         }
+    }
+
+    #[test]
+    fn with_freqs_inf_padded_preserves_bf16_and_matches_batched_offsets() {
+        // Proportional RoPE pattern: first half_rotated dims use base^(2i/dims),
+        // remaining dims are inf-padded (identity rotation).
+        let dims = 16i32;
+        let half_dims = (dims / 2) as usize;
+        let half_rotated = 2usize;
+        let base = 1_000_000.0f64;
+        let mut freqs_data = Vec::with_capacity(half_dims);
+        for i in 0..half_rotated {
+            freqs_data.push(base.powf((2 * i) as f64 / dims as f64) as f32);
+        }
+        freqs_data.extend(std::iter::repeat_n(f32::INFINITY, half_dims - half_rotated));
+        let freqs = MxArray::from_float32(&freqs_data, &[half_dims as i64]).unwrap();
+
+        let rope = RoPE::with_freqs(dims, false, freqs, None);
+        assert!(rope.is_scaled());
+
+        let input = sample(2 * 1 * 1 * dims as usize);
+        let x_bf16 = MxArray::from_float32(&input, &[2, 1, 1, dims as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let offsets = MxArray::from_int32(&[3, 19], &[2]).unwrap();
+        let batched = rope.forward_with_offsets(&x_bf16, &offsets).unwrap();
+        assert_eq!(batched.dtype().unwrap(), DType::BFloat16);
+
+        let row0 = rope
+            .forward(&x_bf16.slice_axis(0, 0, 1).unwrap(), Some(3))
+            .unwrap();
+        let row1 = rope
+            .forward(&x_bf16.slice_axis(0, 1, 2).unwrap(), Some(19))
+            .unwrap();
+        let expected = MxArray::concatenate(&row0, &row1, 0).unwrap();
+        assert_eq!(
+            batched
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            expected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn with_freqs_scalar_prescale_preserves_bf16_and_matches_direct_ffi() {
+        let dims = 8i32;
+        let factor = 1.35f64;
+        let freqs = MxArray::from_float32(&[1.0, 10.0, 100.0, 1000.0], &[4]).unwrap();
+        let rope = RoPE::with_freqs(dims, true, freqs.clone(), Some(factor));
+
+        let input = sample(2 * 3 * dims as usize);
+        let x_bf16 = MxArray::from_float32(&input, &[1, 2, 3, dims as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let got = rope.forward(&x_bf16, Some(0)).unwrap();
+        assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+
+        let pre_scaled = x_bf16.mul_scalar(factor).unwrap();
+        let offset = MxArray::from_int32(&[0], &[1]).unwrap();
+        let want = MxArray::from_handle(
+            unsafe {
+                sys::mlx_fast_rope_with_freqs(
+                    pre_scaled.handle.0,
+                    dims,
+                    true,
+                    0.0,
+                    1.0,
+                    offset.handle.0,
+                    freqs.handle.0,
+                )
+            },
+            "direct_rope_with_freqs",
+        )
+        .unwrap();
+        assert_eq!(
+            got.astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            want.astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref()
+        );
     }
 }

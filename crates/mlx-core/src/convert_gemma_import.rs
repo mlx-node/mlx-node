@@ -212,12 +212,7 @@ pub(crate) fn top_level_quant_metadata(
 /// Strip the HF wrapper prefix the same way `Gemma4Recipe::sanitize` does,
 /// returning the bare module key.
 fn strip_hf_prefix(key: &str) -> &str {
-    key.strip_prefix("model.language_model.model.")
-        .or_else(|| key.strip_prefix("model.language_model."))
-        .or_else(|| key.strip_prefix("language_model.model."))
-        .or_else(|| key.strip_prefix("language_model."))
-        .or_else(|| key.strip_prefix("model."))
-        .unwrap_or(key)
+    crate::engine::persistence::strip_wrapper_prefix(key)
 }
 
 /// Re-add the namespace prefix `Gemma4Recipe::sanitize` uses: `vision_tower.*`,
@@ -436,6 +431,28 @@ fn emit_i8_dequant(
     Ok(())
 }
 
+/// Apply PyTorch→MLX layout conversions for Gemma4 multimodal conv1d/conv2d
+/// weights (shared by `Gemma4Recipe::sanitize` and Gemma4 QAT import).
+pub(crate) fn transpose_gemma_conv_weight(stripped: &str, array: MxArray) -> Result<MxArray> {
+    let ndim = array.ndim()?;
+    if stripped.contains("depthwise_conv1d.weight") && ndim == 3 {
+        // Conv1d: PyTorch [out, in, kW] → MLX [out, kW, in]
+        let t = array.transpose(Some(&[0, 2, 1]))?;
+        t.eval();
+        Ok(t)
+    } else if stripped.contains("subsample_conv_projection")
+        && stripped.contains("conv.weight")
+        && ndim == 4
+    {
+        // Conv2d: PyTorch [out, in, kH, kW] → MLX [out, kH, kW, in]
+        let t = array.transpose(Some(&[0, 2, 3, 1]))?;
+        t.eval();
+        Ok(t)
+    } else {
+        Ok(array)
+    }
+}
+
 /// Pass a float / non-quantized tensor through, applying the conv transpose
 /// `Gemma4Recipe::sanitize` uses and casting floating tensors to `target_dtype`.
 fn emit_passthrough(
@@ -445,23 +462,7 @@ fn emit_passthrough(
     array: MxArray,
     target_dtype: DType,
 ) -> Result<()> {
-    let ndim = array.ndim()?;
-    let array = if stripped.contains("depthwise_conv1d.weight") && ndim == 3 {
-        // Conv1d: PyTorch [out, in, kW] → MLX [out, kW, in]
-        let t = array.transpose(Some(&[0, 2, 1]))?;
-        t.eval();
-        t
-    } else if stripped.contains("subsample_conv_projection")
-        && stripped.contains("conv.weight")
-        && ndim == 4
-    {
-        // Conv2d: PyTorch [out, in, kH, kW] → MLX [out, kH, kW, in]
-        let t = array.transpose(Some(&[0, 2, 3, 1]))?;
-        t.eval();
-        t
-    } else {
-        array
-    };
+    let array = transpose_gemma_conv_weight(stripped, array)?;
     // Cast floating tensors to the target dtype; leave integer tensors alone.
     let array = match array.dtype()? {
         DType::Float32 | DType::Float16 | DType::BFloat16 => {

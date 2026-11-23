@@ -103,8 +103,102 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// The device now; `None` when the working set or MLX's active bytes are
-/// unreadable.
+/// Physical memory threshold from which multi-lane loads unlock their full
+/// concurrent decode lane cap. A 256 GB Mac reports 256 GiB and a 192 GB Mac
+/// 192 GiB; `256 * 10^9` bytes sits between them.
+pub(crate) const ALL_LANES_PHYSICAL_BYTES: u64 = 256_000_000_000;
+
+/// Concurrent decode lane cap below [`ALL_LANES_PHYSICAL_BYTES`], or when host
+/// physical memory is unreadable.
+pub(crate) const SMALL_MACHINE_LANES: usize = 4;
+
+/// Concurrent decode lane ceiling for a host with `physical_bytes` of RAM:
+/// `large_machine_lanes` at or above [`ALL_LANES_PHYSICAL_BYTES`], otherwise
+/// `SMALL_MACHINE_LANES.min(large_machine_lanes)`.
+pub(crate) fn lane_ceiling_for_physical_memory(
+    physical_bytes: Option<u64>,
+    large_machine_lanes: usize,
+) -> usize {
+    match physical_bytes {
+        Some(bytes) if bytes >= ALL_LANES_PHYSICAL_BYTES => large_machine_lanes,
+        _ => SMALL_MACHINE_LANES.min(large_machine_lanes),
+    }
+}
+
+/// Pick the highest decode lane count in `1..=max_lanes.max(1)` whose plan
+/// preserves the single-lane context window (`window(candidate) >= window(single)`).
+///
+/// Lanes give way before the context window shrinks: any load that fits one
+/// lane always loads. Returns `(chosen, lanes)`.
+pub(crate) fn select_max_lanes_preserving_window<T, E>(
+    max_lanes: u32,
+    mut evaluate: impl FnMut(u32) -> std::result::Result<T, E>,
+    window_of: impl Fn(&T) -> Option<u32>,
+) -> std::result::Result<(T, u32), E> {
+    let single = evaluate(1)?;
+    let Some(single_window) = window_of(&single) else {
+        return Ok((single, 1));
+    };
+    for lanes in (2..=max_lanes.max(1)).rev() {
+        if let Ok(candidate) = evaluate(lanes)
+            && window_of(&candidate).is_some_and(|w| w >= single_window)
+        {
+            return Ok((candidate, lanes));
+        }
+    }
+    Ok((single, 1))
+}
+
+/// The `maxMemoryBytes` load option: a positive byte count.
+pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> napi::Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(bytes) if bytes > 0 => Ok(Some(bytes as u64)),
+        Some(_) => Err(napi::Error::from_reason(format!(
+            "{label} load: maxMemoryBytes must be a positive byte count"
+        ))),
+    }
+}
+
+/// The `decodeShare` load option (Splash `Engine::Engine`): nonnegative and
+/// finite; unset defaults to [`crate::engine::scheduler::DEFAULT_DECODE_SHARE`].
+pub(crate) fn decode_share_option(label: &str, value: Option<f64>) -> napi::Result<f64> {
+    match value {
+        None => Ok(crate::engine::scheduler::DEFAULT_DECODE_SHARE),
+        Some(share) if share.is_finite() && share >= 0.0 => Ok(share),
+        Some(_) => Err(napi::Error::from_reason(format!(
+            "{label} load: decode share must be nonnegative and finite"
+        ))),
+    }
+}
+
+/// Parse an optional `kvFormat` load option, defaulting to `default_format`
+/// when omitted and rejecting an explicit `int8` request when
+/// `!int8_supported`.
+pub(crate) fn resolve_kv_format(
+    label: &str,
+    requested: Option<&str>,
+    default_format: KvFormat,
+    int8_supported: bool,
+    unsupported_reason: impl FnOnce() -> String,
+) -> napi::Result<KvFormat> {
+    let Some(raw) = requested else {
+        return Ok(default_format);
+    };
+    let format = KvFormat::parse(Some(raw))
+        .map_err(|e| napi::Error::from_reason(format!("{label}: {e}")))?;
+    if format == KvFormat::Int8 && !int8_supported {
+        return Err(napi::Error::from_reason(format!(
+            "{label}: {}",
+            unsupported_reason()
+        )));
+    }
+    Ok(format)
+}
+
+/// The device now; `None` when the working set (Metal recommended working set,
+/// or CUDA `total_device_bytes` on non-Metal CUDA hosts) or MLX's active bytes
+/// are unreadable.
 pub(crate) fn live_memory() -> Option<LiveMemory> {
     #[cfg(test)]
     if LIVE_MEMORY_UNREADABLE.with(std::cell::Cell::get) {
@@ -114,7 +208,16 @@ pub(crate) fn live_memory() -> Option<LiveMemory> {
     if let Some(live) = LIVE_MEMORY_OVERRIDE.with(std::cell::Cell::get) {
         return Some(live);
     }
-    let working_set_bytes = recommended_working_set()?;
+    let working_set_bytes = recommended_working_set().or_else(|| {
+        if !crate::accelerator::host_has_metal() && crate::accelerator::host_has_cuda() {
+            match crate::accelerator::caps().total_device_bytes {
+                0 => None,
+                bytes => Some(bytes),
+            }
+        } else {
+            None
+        }
+    })?;
     let mut active_bytes = 0u64;
     // SAFETY: the probe writes one u64 through a valid pointer and reports
     // failure through its return code.
