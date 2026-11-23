@@ -343,6 +343,31 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             }
         }
         let mut proposed = Vec::with_capacity(work.len());
+        // Materialize ALL device-resident draft proposals in ONE single GPU sync instead of N!
+        {
+            let mut eval_refs: Vec<&MxArray> = Vec::new();
+            for prop in proposals.iter().flatten() {
+                if let Some(ref ids) = prop.device_draft_ids {
+                    eval_refs.push(ids);
+                }
+                if let Some(ref sparse) = prop.device_draft_sparse {
+                    eval_refs.push(&sparse.ids);
+                    eval_refs.push(&sparse.probs);
+                }
+            }
+            if !eval_refs.is_empty()
+                && let Err(error) =
+                    MxArray::eval_arrays_with_context(&eval_refs, "scheduled_draft_proposals")
+            {
+                for res in &mut proposals {
+                    if res.as_ref().is_ok_and(|p| {
+                        p.device_draft_ids.is_some() || p.device_draft_sparse.is_some()
+                    }) {
+                        *res = Err(Error::from_reason(error.reason.clone()));
+                    }
+                }
+            }
+        }
         for (mut item, proposal) in work.into_iter().zip(proposals) {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];

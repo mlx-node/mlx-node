@@ -27,7 +27,7 @@ const REQUIRED_MODELS: [&str; 8] = [
     "muse-30b",
     "clef-flash",
 ];
-const GPU_TYPES: [GgufTensorType; 11] = [
+const GPU_TYPES: [GgufTensorType; 12] = [
     GgufTensorType::Q4K,
     GgufTensorType::Q5K,
     GgufTensorType::Q6K,
@@ -37,6 +37,7 @@ const GPU_TYPES: [GgufTensorType; 11] = [
     GgufTensorType::IQ3S,
     GgufTensorType::Q8_0,
     GgufTensorType::MXFP4,
+    GgufTensorType::NVFP4,
     GgufTensorType::Q4_0,
     GgufTensorType::Q5_1,
 ];
@@ -112,13 +113,14 @@ fn family_from_class(class: &str) -> Option<NativeGgufFamily> {
         "Gemma4Model" => Some(NativeGgufFamily::Gemma4),
         "MuseGlimmerModel" => Some(NativeGgufFamily::MuseGlimmer),
         "ClefModel" => Some(NativeGgufFamily::Clef),
+        "Inkling2Model" => Some(NativeGgufFamily::Inkling2),
         _ => None,
     }
 }
 
 fn companion_role(family: NativeGgufFamily) -> Option<ManifestRole> {
     match family {
-        NativeGgufFamily::Gemma4 => Some(ManifestRole::Vision),
+        NativeGgufFamily::Gemma4 | NativeGgufFamily::Inkling2 => Some(ManifestRole::Vision),
         NativeGgufFamily::MuseGlimmer => Some(ManifestRole::Draft),
         _ => None,
     }

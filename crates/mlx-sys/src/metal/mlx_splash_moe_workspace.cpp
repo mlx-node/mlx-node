@@ -63,8 +63,8 @@ void trace_workspace(Stream stream, metal::CommandEncoder &encoder,
 template <typename Retain>
 const std::vector<array> *
 acquire(Stream stream, metal::CommandEncoder &encoder, uint64_t identity,
-        const std::vector<Spec> &specs, Retain &&retain) {
-  constexpr size_t max_bytes = size_t(8) << 20;
+        const std::vector<Spec> &specs, Retain &&retain,
+        size_t max_bytes = size_t(8) << 20) {
   auto &entries = pool();
   if (entries.find(stream) == entries.end()) {
     // Stream indices are never reused: each first acquisition bounds stale
@@ -136,6 +136,18 @@ const std::vector<array> *try_workspace(Stream stream,
                  [](metal::CommandEncoder &enc, const array &owner) {
                    enc.retain_inputs(owner);
                  });
+}
+
+const std::vector<array> *try_workspace_capped(Stream stream,
+                                               metal::CommandEncoder &encoder,
+                                               uint64_t identity,
+                                               const std::vector<Spec> &specs,
+                                               size_t max_bytes) {
+  return acquire(stream, encoder, identity, specs,
+                 [](metal::CommandEncoder &enc, const array &owner) {
+                   enc.retain_inputs(owner);
+                 },
+                 max_bytes);
 }
 
 void drain(Stream stream) {

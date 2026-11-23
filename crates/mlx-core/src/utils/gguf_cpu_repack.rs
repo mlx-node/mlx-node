@@ -233,7 +233,7 @@ pub(crate) fn cpu_kquant_band_into(
     Ok(())
 }
 
-/// Code width, words per 32-value block, and whether the block stores a min.
+/// Code width, words per block, and whether the block stores a min.
 fn affine_geometry(t: GgufTensorType) -> Option<(u32, usize, bool)> {
     match t {
         GgufTensorType::Q4_0 | GgufTensorType::MXFP4 => Some((4, 4, false)),
@@ -241,6 +241,7 @@ fn affine_geometry(t: GgufTensorType) -> Option<(u32, usize, bool)> {
         GgufTensorType::Q5_0 => Some((5, 5, false)),
         GgufTensorType::Q5_1 => Some((5, 5, true)),
         GgufTensorType::Q8_0 => Some((8, 8, false)),
+        GgufTensorType::NVFP4 => Some((4, 8, false)),
         _ => None,
     }
 }
@@ -357,6 +358,27 @@ pub(crate) fn decode_affine_band_into(
     }
     let n = rows * per_row;
     let first = row0 * per_row;
+    if t == GgufTensorType::NVFP4 {
+        // SAFETY: each destination holds `dst.rows * per_row` NVFP4 blocks
+        // (8 weight words + 4 uint8 scales per 64-value block); `[first, first + n)`
+        // lies inside and belongs exclusively to this band.
+        let weight = unsafe {
+            std::slice::from_raw_parts_mut(dst.weight.0.cast::<u32>().add(first * 8), n * 8)
+        };
+        let scales = unsafe { std::slice::from_raw_parts_mut(scales_dst.0.add(first * 4), n * 4) };
+        let mut w = [0u32; 8];
+        let mut s = [0u8; 4];
+        for i in 0..n {
+            crate::utils::gguf::nvfp4_repack_block(
+                &blocks[i * block_bytes..(i + 1) * block_bytes],
+                &mut w,
+                &mut s,
+            );
+            weight[i * 8..(i + 1) * 8].copy_from_slice(&w);
+            scales[i * 4..(i + 1) * 4].copy_from_slice(&s);
+        }
+        return Ok(());
+    }
     let mxfp4 = t == GgufTensorType::MXFP4;
     // SAFETY: each destination holds `dst.rows * per_row` blocks
     // (RepackDst::alloc), the band's blocks `[first, first + n)` lie inside
@@ -510,6 +532,127 @@ mod tests {
                     "{ty:?}{suffix}: (bytes, mismatched)"
                 );
             }
+        }
+    }
+
+    /// Reference GGML `ggml_ue4m3_to_fp32` (ggml-impl.h:502) and
+    /// `dequantize_row_nvfp4` (ggml-quants.c:589).
+    fn ggml_dequantize_nvfp4_ref(blocks: &[u8], rows: usize, k: usize) -> Vec<f32> {
+        const KVALUES_FP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+        fn ue4m3_to_f32(x: u8) -> f32 {
+            if x == 0 || x == 0x7F {
+                return 0.0;
+            }
+            let exp = i32::from((x >> 3) & 0xF);
+            let man = f32::from(x & 0x7);
+            let raw = if exp == 0 {
+                man * 2.0f32.powi(-9)
+            } else {
+                (1.0 + man / 8.0) * 2.0f32.powi(exp - 7)
+            };
+            raw * 0.5
+        }
+        let mut out = vec![0.0f32; rows * k];
+        for (bi, block) in blocks.as_chunks::<36>().0.iter().enumerate() {
+            let base = bi * 64;
+            for s in 0..4 {
+                let d = ue4m3_to_f32(block[s]);
+                let yb = &mut out[base + s * 16..base + (s + 1) * 16];
+                for j in 0..8 {
+                    let q = block[4 + s * 8 + j];
+                    yb[j] = f32::from(KVALUES_FP4[(q & 0x0F) as usize]) * d;
+                    yb[j + 8] = f32::from(KVALUES_FP4[(q >> 4) as usize]) * d;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decode_nvfp4_band_matches_load_quantized_tensor_and_ggml_dequant() {
+        let (rows, k) = (7usize, 128usize);
+        let ty = GgufTensorType::NVFP4;
+        let t = info(ty, rows, k);
+        let row_bytes = k / ty.block_size() * ty.type_size();
+        let mut blocks = random_bytes(rows * row_bytes, 40);
+        // Clamp UE4M3 scales into the valid unsigned finite domain 0x00..=0x7E
+        // (matching `ggml_fp32_to_ue4m3`), so neither GGML nor MLX sees NaN/signed scales.
+        for block in blocks.as_chunks_mut::<36>().0 {
+            for d in &mut block[0..4] {
+                *d &= 0x7F;
+                if *d == 0x7F {
+                    *d = 0x7E;
+                }
+            }
+        }
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![t.clone()],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let want = load_quantized_tensor(&mut std::io::Cursor::new(&blocks), &gguf, &t).unwrap();
+        let (dst, ptrs) = RepackDst::alloc(&t, OutLayout::RowMajor).unwrap();
+        for (row0, n) in [(5usize, 2usize), (0, 2), (2, 3)] {
+            decode_affine_band_into(
+                ty,
+                &blocks[row0 * row_bytes..(row0 + n) * row_bytes],
+                row0,
+                n,
+                k,
+                &ptrs,
+            )
+            .unwrap();
+        }
+        assert!(dst.biases.is_none(), "NVFP4 has no biases");
+        assert_eq!(want.len(), 2, "NVFP4 yields weight + scales");
+        let scales = dst.scales.as_ref().unwrap();
+        for (suffix, a) in [(".weight", &dst.weight), (".scales", scales)] {
+            let (_, w) = want
+                .iter()
+                .find(|(name, _)| name.ends_with(suffix))
+                .unwrap();
+            assert_eq!(
+                a.dtype().unwrap(),
+                w.dtype().unwrap(),
+                "NVFP4{suffix} dtype"
+            );
+            assert_eq!(
+                a.shape().unwrap().to_vec(),
+                w.shape().unwrap().to_vec(),
+                "NVFP4{suffix} shape"
+            );
+            assert_eq!(le_bytes(a), le_bytes(w), "NVFP4{suffix} bytes");
+        }
+        // Verify MLX native `"nvfp4"` dequantization matches GGML `dequantize_row_nvfp4` bit-for-bit.
+        let mode = std::ffi::CString::new("nvfp4").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                dst.weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                16,
+                4,
+                DType::Float32 as i32,
+                mode.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "MLX nvfp4 dequantize failed");
+        let deq = MxArray::from_handle(handle, "nvfp4_dequant").unwrap();
+        deq.eval();
+        let got_f32: Vec<f32> = deq.to_float32().unwrap().to_vec();
+        let ref_f32 = ggml_dequantize_nvfp4_ref(&blocks, rows, k);
+        assert_eq!(got_f32.len(), ref_f32.len());
+        for (idx, (&g, &r)) in got_f32.iter().zip(&ref_f32).enumerate() {
+            assert_eq!(
+                g,
+                r,
+                "NVFP4 dequant mismatch at elem {idx}: mlx={g} ({:#x}) vs ggml={r} ({:#x})",
+                g.to_bits(),
+                r.to_bits()
+            );
         }
     }
 

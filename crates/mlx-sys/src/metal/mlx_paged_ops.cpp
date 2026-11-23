@@ -2483,6 +2483,812 @@ std::array<array, 2> paged_prefill_attention(
   return {std::move(results[0]), std::move(results[1])};
 }
 
+// =============================================================================
+// Inkling-2-Mini Paged Attention & In-Place MPP Paged Prefill Primitives
+// =============================================================================
+
+namespace {
+
+void validate_inkling2_pool_planes(
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    int block_size,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
+  require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
+  require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
+  require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
+  if (head_size != 128) {
+    prefill_reject(op_name, "inkling2 paged attention requires head_size == 128");
+  }
+  if (kv_dtype != KvDtype::Int8 && kv_dtype != KvDtype::Bf16) {
+    prefill_reject(op_name, "kv_dtype must be Int8 (32-token KTM) or Bf16");
+  }
+  const auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+  if (k_pool.dtype() != expected_cache_dtype ||
+      v_pool.dtype() != expected_cache_dtype) {
+    prefill_reject(op_name, "k_pool / v_pool dtype disagrees with kv_dtype");
+  }
+  if (kv_dtype == KvDtype::Int8) {
+    if (block_size != 32) {
+      prefill_reject(op_name, "INT8 Inkling2 pool must use 32-token KTM (block_size == 32)");
+    }
+    if (k_pool.ndim() != 4 || v_pool.ndim() != 4) {
+      prefill_reject(op_name, "INT8 KTM requires rank-4 k_pool and rank-4 v_pool");
+    }
+    const int nb = k_pool.shape(0);
+    if (k_pool.shape() != Shape{nb, num_kv_heads, 32, 128} ||
+        v_pool.shape() != Shape{nb, num_kv_heads, 128, 32}) {
+      prefill_reject(
+          op_name,
+          "INT8 KTM expects K [nb, H_kv, 32, 128] and V [nb, H_kv, 128, 32]");
+    }
+  } else {
+    if (block_size != 16 && block_size != 32) {
+      prefill_reject(op_name, "BF16 Inkling2 pool requires block_size 16 or 32");
+    }
+    if (k_pool.ndim() != 5 || v_pool.ndim() != 4) {
+      prefill_reject(op_name, "BF16 pool requires rank-5 k_pool and rank-4 v_pool");
+    }
+    const int nb = k_pool.shape(0);
+    if (k_pool.shape() != Shape{nb, num_kv_heads, 16, block_size, 8} ||
+        v_pool.shape() != Shape{nb, num_kv_heads, 128, block_size}) {
+      prefill_reject(
+          op_name,
+          "BF16 pool expects K [nb, H_kv, 16, bs, 8] and V [nb, H_kv, 128, bs]");
+    }
+  }
+  validate_kv_scales(
+      k_pool, k_scale, v_scale, num_kv_heads, block_size, head_size, kv_dtype,
+      /*read=*/true, op_name);
+}
+
+void validate_inkling2_rel_bias_ex(
+    const array* rel_bias,
+    const array* rel_bias_w,
+    int rows,
+    int num_q_heads,
+    int rel_extent,
+    const char* op_name) {
+  if (rel_bias_w != nullptr) {
+    if (rel_bias == nullptr || rel_extent <= 0) {
+      prefill_reject(
+          op_name,
+          "rel_bias (r_for_rel) and rel_extent > 0 are required when rel_bias_w is provided");
+    }
+    require_row_contiguous_head_offset(*rel_bias, op_name, "r_for_rel");
+    require_row_contiguous_zero_offset(*rel_bias_w, op_name, "rel_bias_w");
+    if (rel_bias->dtype() != mlx::core::float32 ||
+        rel_bias_w->dtype() != mlx::core::float32) {
+      prefill_reject(op_name, "r_for_rel and rel_bias_w must be float32");
+    }
+    if (rel_bias->ndim() != 3 ||
+        rel_bias->shape() != Shape{rows, num_q_heads, 16}) {
+      prefill_reject(
+          op_name, "r_for_rel must have shape [total_q, num_q_heads, 16]");
+    }
+    if (rel_bias_w->ndim() != 2 ||
+        rel_bias_w->shape() != Shape{rel_extent, 16}) {
+      prefill_reject(op_name, "rel_bias_w must have shape [rel_extent, 16]");
+    }
+    return;
+  }
+  if (rel_bias != nullptr) {
+    if (rel_extent <= 0) {
+      prefill_reject(op_name, "rel_extent must be > 0 when rel_bias is provided");
+    }
+    require_row_contiguous_head_offset(*rel_bias, op_name, "rel_bias");
+    if (rel_bias->dtype() != mlx::core::bfloat16 &&
+        rel_bias->dtype() != mlx::core::float32) {
+      prefill_reject(op_name, "rel_bias must be bfloat16 or float32");
+    }
+    if (rel_bias->ndim() != 3 ||
+        rel_bias->shape() != Shape{rows, num_q_heads, rel_extent}) {
+      prefill_reject(
+          op_name,
+          "rel_bias must have shape [total_q, num_q_heads, rel_extent]");
+    }
+  } else if (rel_extent > 0) {
+    prefill_reject(op_name, "rel_bias must be provided when rel_extent > 0");
+  }
+}
+
+std::pair<uint32_t, uint32_t> validate_inkling2_gate_sink(
+    const array* gate,
+    const array* sink,
+    int rows,
+    int num_q_heads,
+    int head_size,
+    const char* op_name) {
+  if ((gate == nullptr) != (sink == nullptr)) {
+    prefill_reject(op_name, "gate and sink must both be provided or both null");
+  }
+  if (gate == nullptr) {
+    return {0u, 0u};
+  }
+  if ((gate->dtype() != mlx::core::bfloat16 &&
+       gate->dtype() != mlx::core::float32) ||
+      (sink->dtype() != mlx::core::bfloat16 &&
+       sink->dtype() != mlx::core::float32)) {
+    prefill_reject(op_name, "gate and sink must be bfloat16 or float32");
+  }
+  const int gate_cols = num_q_heads * head_size;
+  uint32_t gate_row_stride = static_cast<uint32_t>(gate_cols);
+  if (gate->ndim() == 3 &&
+      gate->shape() == Shape{rows, num_q_heads, head_size} &&
+      gate->flags().row_contiguous) {
+    gate_row_stride = static_cast<uint32_t>(gate_cols);
+  } else if (
+      gate->ndim() == 2 && gate->shape() == Shape{rows, gate_cols} &&
+      (gate->flags().row_contiguous ||
+       (gate->strides(1) == 1 && gate->strides(0) >= 0))) {
+    gate_row_stride = gate->flags().row_contiguous
+        ? static_cast<uint32_t>(gate_cols)
+        : static_cast<uint32_t>(gate->strides(0));
+  } else {
+    prefill_reject(
+        op_name,
+        "gate must be row-contiguous [rows, H, D] or 2D strided [rows, H*D]");
+  }
+  uint32_t sink_row_stride = static_cast<uint32_t>(num_q_heads);
+  if (sink->ndim() == 2 && sink->shape() == Shape{rows, num_q_heads} &&
+      (sink->flags().row_contiguous ||
+       (sink->strides(1) == 1 && sink->strides(0) >= 0))) {
+    sink_row_stride = sink->flags().row_contiguous
+        ? static_cast<uint32_t>(num_q_heads)
+        : static_cast<uint32_t>(sink->strides(0));
+  } else {
+    prefill_reject(
+        op_name, "sink must be row-contiguous or 2D strided [rows, H]");
+  }
+  return {gate_row_stride, sink_row_stride};
+}
+
+array prepare_inkling2_gate_input(
+    const array& gate,
+    int rows,
+    int num_q_heads,
+    int head_size,
+    Stream s) {
+  const int gate_cols = num_q_heads * head_size;
+  if (gate.ndim() == 3 && gate.shape() == Shape{rows, num_q_heads, head_size} &&
+      gate.flags().row_contiguous) {
+    return gate;
+  }
+  if (gate.ndim() == 2 && gate.shape() == Shape{rows, gate_cols} &&
+      (gate.flags().row_contiguous ||
+       (gate.strides(1) == 1 && gate.strides(0) >= 0))) {
+    return gate;
+  }
+  return contiguous(gate, false, s);
+}
+
+array prepare_inkling2_sink_input(
+    const array& sink,
+    int rows,
+    int num_q_heads,
+    Stream s) {
+  if (sink.ndim() == 2 && sink.shape() == Shape{rows, num_q_heads} &&
+      (sink.flags().row_contiguous ||
+       (sink.strides(1) == 1 && sink.strides(0) >= 0))) {
+    return sink;
+  }
+  return contiguous(sink, false, s);
+}
+
+void validate_inkling2_paged_attention_inputs(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    const array* rel_bias,
+    const array* rel_bias_w,
+    const array* gate,
+    const array* sink,
+    const array* score_scales,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  require_row_contiguous_head_offset(q, op_name, "q");
+  require_row_contiguous_zero_offset(block_table, op_name, "block_table");
+  require_row_contiguous_zero_offset(seq_lens, op_name, "seq_lens");
+  require_row_contiguous_zero_offset(cu_seqlens_q, op_name, "cu_seqlens_q");
+  if (sliding_window < 0 || rel_extent < 0) {
+    prefill_reject(op_name, "sliding_window and rel_extent must be >= 0");
+  }
+  if (num_kv_heads <= 0 || num_q_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(op_name, "num_q_heads must be a positive multiple of num_kv_heads");
+  }
+  if (q.ndim() != 3 || q.dtype() != mlx::core::bfloat16 ||
+      q.shape(0) <= 0 || q.shape(1) != num_q_heads || q.shape(2) != head_size) {
+    prefill_reject(op_name, "q must be bfloat16 [total_q, num_q_heads, 128]");
+  }
+  validate_inkling2_pool_planes(
+      k_pool, v_pool, k_scale, v_scale, block_size, num_kv_heads, head_size,
+      kv_dtype, op_name);
+  if (block_table.ndim() != 2 || block_table.dtype() != mlx::core::int32 ||
+      seq_lens.ndim() != 1 || seq_lens.dtype() != mlx::core::int32 ||
+      cu_seqlens_q.ndim() != 1 || cu_seqlens_q.dtype() != mlx::core::int32 ||
+      block_table.shape(0) != seq_lens.shape(0) ||
+      cu_seqlens_q.shape(0) != seq_lens.shape(0) + 1) {
+    prefill_reject(op_name, "invalid block_table / seq_lens / cu_seqlens_q shape or dtype");
+  }
+  validate_inkling2_rel_bias_ex(
+      rel_bias, rel_bias_w, q.shape(0), num_q_heads, rel_extent, op_name);
+  validate_inkling2_gate_sink(
+      gate, sink, q.shape(0), num_q_heads, head_size, op_name);
+  if (score_scales != nullptr) {
+    validate_score_scales(*score_scales, q.shape(0), num_q_heads, kv_dtype, op_name);
+  }
+}
+
+void validate_inkling2_paged_prefill_inputs(
+    const array& q_staged,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    const array* rel_bias,
+    const array* rel_bias_w,
+    const array* gate,
+    const array* sink,
+    int committed_tokens,
+    int rows,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    KvDtype kv_dtype,
+    bool int8_queries,
+    const char* op_name) {
+  namespace paged = mlx::core::fast::paged;
+  require_row_contiguous_head_offset(q_staged, op_name, "q_staged");
+  require_row_contiguous_zero_offset(block_table, op_name, "block_table");
+  require_row_contiguous_zero_offset(workspace, op_name, "workspace");
+  if (sliding_window < 0 || rel_extent < 0 || committed_tokens < 0) {
+    prefill_reject(op_name, "sliding_window, rel_extent, and committed_tokens must be >= 0");
+  }
+  if (int8_queries && kv_dtype != KvDtype::Int8) {
+    prefill_reject(op_name, "INT8 queries require INT8 pages");
+  }
+  if (num_kv_heads <= 0 || num_q_heads != num_kv_heads * 3) {
+    prefill_reject(op_name, "Inkling2 MPP prefill requires GQA group == 3 (num_q_heads == 3 * num_kv_heads)");
+  }
+  if (max_splits != paged::kPagedPrefillMaxSplits &&
+      max_splits != paged::kPagedVerifyMaxSplits) {
+    prefill_reject(op_name, "max_splits must be 32 (prefill) or 128 (verify)");
+  }
+  const int max_rows = max_splits == paged::kPagedVerifyMaxSplits
+      ? paged::kPagedVerifyRows
+      : paged::kPagedPrefillMaxRows;
+  if (rows <= 0 || rows > max_rows) {
+    prefill_reject(op_name, "rows out of range");
+  }
+  if (splits <= 0 || splits > max_splits) {
+    prefill_reject(op_name, "splits out of range");
+  }
+  const Shape staged{num_kv_heads, paged_prefill_stride(rows), 3, head_size};
+  if (q_staged.dtype() != mlx::core::bfloat16 || q_staged.shape() != staged) {
+    prefill_reject(op_name, "q_staged must be bf16 [kv_heads, stride, 3, 128]");
+  }
+  validate_inkling2_pool_planes(
+      k_pool, v_pool, k_scale, v_scale, block_size, num_kv_heads, head_size,
+      kv_dtype, op_name);
+  if (block_table.dtype() != mlx::core::int32) {
+    prefill_reject(op_name, "block_table must be int32");
+  }
+  const int64_t needed =
+      (static_cast<int64_t>(committed_tokens) + rows + block_size - 1) / block_size;
+  if (static_cast<int64_t>(block_table.size()) < needed) {
+    prefill_reject(op_name, "block_table too short for committed_tokens + rows");
+  }
+  if (workspace.dtype() != mlx::core::float32 ||
+      static_cast<int64_t>(workspace.size()) <
+          paged::paged_prefill_workspace_floats(rows, splits, num_q_heads, head_size)) {
+    prefill_reject(op_name, "workspace too small");
+  }
+  validate_inkling2_rel_bias_ex(
+      rel_bias, rel_bias_w, rows, num_q_heads, rel_extent, op_name);
+  validate_inkling2_gate_sink(
+      gate, sink, rows, num_q_heads, head_size, op_name);
+}
+
+} // namespace
+
+void Inkling2PagedAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  const size_t expected_in = 8 + (has_rel_bias_ ? 1 : 0) +
+      (has_rel_bias_w_ ? 1 : 0) + (has_gate_sink_ ? 2 : 0) +
+      (has_score_scales_ ? 1 : 0);
+  const size_t expected_out = write_lse_ ? 2 : 1;
+  if (inputs.size() != expected_in || outputs.size() != expected_out) {
+    throw std::runtime_error("Inkling2PagedAttention: input/output count mismatch");
+  }
+  const array& q = inputs[0];
+  const array& k_pool = inputs[1];
+  const array& v_pool = inputs[2];
+  const array& block_table = inputs[3];
+  const array& seq_lens = inputs[4];
+  const array& cu_seqlens_q = inputs[5];
+  const array& k_scale = inputs[6];
+  const array& v_scale = inputs[7];
+  size_t next_idx = 8;
+  const array* rel_bias = has_rel_bias_ ? &inputs[next_idx++] : nullptr;
+  const array* rel_bias_w = has_rel_bias_w_ ? &inputs[next_idx++] : nullptr;
+  const array* gate = has_gate_sink_ ? &inputs[next_idx++] : nullptr;
+  const array* sink = has_gate_sink_ ? &inputs[next_idx++] : nullptr;
+  const array* score_scales = has_score_scales_ ? &inputs[next_idx++] : nullptr;
+
+  validate_inkling2_paged_attention_inputs(
+      q, k_pool, v_pool, block_table, seq_lens, cu_seqlens_q, k_scale, v_scale,
+      rel_bias, rel_bias_w, gate, sink, score_scales, block_size_, num_q_heads_,
+      num_kv_heads_, head_size_, sliding_window_, rel_extent_, kv_dtype_,
+      "Inkling2PagedAttention::eval_gpu");
+  const auto [gate_row_stride, sink_row_stride] = validate_inkling2_gate_sink(
+      gate, sink, q.shape(0), num_q_heads_, head_size_,
+      "Inkling2PagedAttention::eval_gpu");
+
+  const uint32_t num_seqs = static_cast<uint32_t>(seq_lens.shape(0));
+  const uint32_t total_queries = static_cast<uint32_t>(q.shape(0));
+  const uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
+  const int32_t* seq_lens_data = seq_lens.data<int32_t>();
+  const int32_t* block_table_data = block_table.data<int32_t>();
+  const int32_t* cu_seqlens_q_data = cu_seqlens_q.data<int32_t>();
+  const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+  const int64_t max_seq_len_bound =
+      static_cast<int64_t>(max_blocks_per_seq) * block_size_;
+
+  int32_t max_context_len = 0;
+  for (uint32_t i = 0; i < num_seqs; ++i) {
+    const int32_t s = seq_lens_data[i];
+    if (s < 0 || static_cast<int64_t>(s) > max_seq_len_bound) {
+      throw std::invalid_argument(
+          "[runtime] Inkling2PagedAttention::eval_gpu: seq_lens out of range");
+    }
+    const int64_t used = ceil_div_nonnegative_i32(s, block_size_);
+    const size_t row_off = static_cast<size_t>(i) * max_blocks_per_seq;
+    for (int64_t j = 0; j < used; ++j) {
+      const int32_t blk = block_table_data[row_off + static_cast<size_t>(j)];
+      if (blk < 0 || blk >= num_blocks) {
+        throw std::invalid_argument(
+            "[runtime] Inkling2PagedAttention::eval_gpu: block_table entry out of range");
+      }
+    }
+    if (s > max_context_len) {
+      max_context_len = s;
+    }
+  }
+  if (cu_seqlens_q_data[0] != 0 ||
+      static_cast<uint32_t>(cu_seqlens_q_data[num_seqs]) != total_queries) {
+    throw std::invalid_argument(
+        "[runtime] Inkling2PagedAttention::eval_gpu: invalid cu_seqlens_q endpoints");
+  }
+  for (uint32_t i = 0; i < num_seqs; ++i) {
+    const int32_t span = cu_seqlens_q_data[i + 1] - cu_seqlens_q_data[i];
+    if (span < 0 || span > seq_lens_data[i]) {
+      throw std::invalid_argument(
+          "[runtime] Inkling2PagedAttention::eval_gpu: invalid query span");
+    }
+  }
+  if (max_context_len <= 0) {
+    throw std::runtime_error("Inkling2PagedAttention: max_context_len must be > 0");
+  }
+  const int64_t live_blocks = distinct_live_blocks(
+      block_table_data, seq_lens_data, num_seqs, max_blocks_per_seq,
+      block_size_, num_blocks);
+
+  outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+  array* lse_out_ptr = nullptr;
+  if (write_lse_) {
+    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+    lse_out_ptr = &outputs[1];
+  }
+
+  const uint32_t rel_mode = (rel_extent_ <= 0 || rel_bias == nullptr)
+      ? 0u
+      : (rel_bias_w != nullptr ? 2u : 1u);
+  mlx::core::fast::paged::Inkling2AttnExtraParams extra{
+      has_gate_sink_ ? 1u : 0u,
+      gate_row_stride,
+      (gate != nullptr && gate->dtype() == mlx::core::float32) ? 1u : 0u,
+      sink_row_stride,
+      (sink != nullptr && sink->dtype() == mlx::core::float32) ? 1u : 0u,
+      write_lse_ ? 1u : 0u,
+      rel_mode,
+      0u};
+
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& encoder = mlx::core::metal::get_command_encoder(s);
+  mlx::core::fast::paged::dispatch_inkling2_paged_attention_auto(
+      encoder, d, s, outputs[0], lse_out_ptr, q, k_pool, v_pool, block_table,
+      seq_lens, cu_seqlens_q, k_scale, v_scale, rel_bias, rel_bias_w, gate,
+      sink, extra, static_cast<int>(num_seqs), static_cast<int>(total_queries),
+      num_q_heads_, num_kv_heads_, head_size_, block_size_, max_context_len,
+      static_cast<int>(max_blocks_per_seq), live_blocks, scale_,
+      sliding_window_, rel_extent_, to_paged_dtype(kv_dtype_), score_scales);
+}
+
+std::vector<array> Inkling2PagedAttention::vjp(
+    const std::vector<array>&,
+    const std::vector<array>&,
+    const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("Inkling2PagedAttention is inference-only");
+}
+
+std::vector<Shape> Inkling2PagedAttention::output_shapes(
+    const std::vector<array>& inputs) {
+  const auto& q = inputs[0];
+  if (write_lse_) {
+    return {Shape{q.shape(0), num_q_heads_, head_size_},
+            Shape{q.shape(0), num_q_heads_}};
+  }
+  return {Shape{q.shape(0), num_q_heads_, head_size_}};
+}
+
+bool Inkling2PagedAttention::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const Inkling2PagedAttention&>(other);
+  return scale_ == o.scale_ && block_size_ == o.block_size_ &&
+      num_q_heads_ == o.num_q_heads_ && num_kv_heads_ == o.num_kv_heads_ &&
+      head_size_ == o.head_size_ && sliding_window_ == o.sliding_window_ &&
+      rel_extent_ == o.rel_extent_ && kv_dtype_ == o.kv_dtype_ &&
+      has_rel_bias_ == o.has_rel_bias_ &&
+      has_rel_bias_w_ == o.has_rel_bias_w_ &&
+      has_gate_sink_ == o.has_gate_sink_ &&
+      write_lse_ == o.write_lse_ &&
+      has_score_scales_ == o.has_score_scales_;
+}
+
+std::vector<array> inkling2_paged_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    const std::optional<array>& rel_bias,
+    float scale,
+    int sliding_window,
+    int rel_extent,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    StreamOrDevice s_,
+    const std::optional<array>& score_scales,
+    const std::optional<array>& rel_bias_w,
+    const std::optional<array>& gate,
+    const std::optional<array>& sink,
+    bool write_lse) {
+  auto s = to_stream(s_);
+  const int rows = q.shape(0);
+  std::optional<array> gate_prep = gate
+      ? std::optional<array>(
+            prepare_inkling2_gate_input(*gate, rows, num_q_heads, head_size, s))
+      : std::nullopt;
+  std::optional<array> sink_prep = sink
+      ? std::optional<array>(
+            prepare_inkling2_sink_input(*sink, rows, num_q_heads, s))
+      : std::nullopt;
+  const array* rel_ptr = rel_bias ? &(*rel_bias) : nullptr;
+  const array* rel_w_ptr = rel_bias_w ? &(*rel_bias_w) : nullptr;
+  const array* gate_ptr = gate_prep ? &(*gate_prep) : nullptr;
+  const array* sink_ptr = sink_prep ? &(*sink_prep) : nullptr;
+  const array* ss_ptr = score_scales ? &(*score_scales) : nullptr;
+  validate_inkling2_paged_attention_inputs(
+      q, k_pool, v_pool, block_table, seq_lens, cu_seqlens_q, k_scale, v_scale,
+      rel_ptr, rel_w_ptr, gate_ptr, sink_ptr, ss_ptr, block_size, num_q_heads,
+      num_kv_heads, head_size, sliding_window, rel_extent, kv_dtype,
+      "inkling2_paged_attention");
+
+  std::vector<array> inputs = {
+      q, k_pool, v_pool, block_table, seq_lens, cu_seqlens_q, k_scale, v_scale};
+  if (rel_bias) {
+    inputs.push_back(*rel_bias);
+  }
+  if (rel_bias_w) {
+    inputs.push_back(*rel_bias_w);
+  }
+  if (gate_prep && sink_prep) {
+    inputs.push_back(*gate_prep);
+    inputs.push_back(*sink_prep);
+  }
+  if (score_scales) {
+    inputs.push_back(*score_scales);
+  }
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error(
+        "inkling2_paged_attention has no fallback implementation");
+  };
+  const bool has_gate_sink = gate_prep.has_value() && sink_prep.has_value();
+  auto prim = std::make_shared<Inkling2PagedAttention>(
+      s, std::move(fallback), scale, block_size, num_q_heads, num_kv_heads,
+      head_size, sliding_window, rel_extent, kv_dtype, rel_bias.has_value(),
+      rel_bias_w.has_value(), has_gate_sink, write_lse, score_scales.has_value());
+  std::vector<Shape> out_shapes = {Shape{rows, num_q_heads, head_size}};
+  std::vector<Dtype> out_dtypes = {mlx::core::bfloat16};
+  if (write_lse) {
+    out_shapes.push_back(Shape{rows, num_q_heads});
+    out_dtypes.push_back(mlx::core::float32);
+  }
+  return array::make_arrays(
+      std::move(out_shapes), std::move(out_dtypes), std::move(prim),
+      std::move(inputs));
+}
+
+void Inkling2PagedPrefillAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  const size_t expected_in = 7 + (has_rel_bias_ ? 1 : 0) +
+      (has_rel_bias_w_ ? 1 : 0) + (has_gate_sink_ ? 2 : 0);
+  const size_t expected_out = write_lse_ ? 3 : 2;
+  if (inputs.size() != expected_in || outputs.size() != expected_out) {
+    throw std::runtime_error(
+        "Inkling2PagedPrefillAttention: input/output count mismatch");
+  }
+  const array& q_staged = inputs[0];
+  const array& k_pool = inputs[1];
+  const array& v_pool = inputs[2];
+  const array& k_scale = inputs[3];
+  const array& v_scale = inputs[4];
+  const array& block_table = inputs[5];
+  const array& workspace = inputs[6];
+  size_t next_idx = 7;
+  const array* rel_bias = has_rel_bias_ ? &inputs[next_idx++] : nullptr;
+  const array* rel_bias_w = has_rel_bias_w_ ? &inputs[next_idx++] : nullptr;
+  const array* gate = has_gate_sink_ ? &inputs[next_idx++] : nullptr;
+  const array* sink = has_gate_sink_ ? &inputs[next_idx++] : nullptr;
+
+  validate_inkling2_paged_prefill_inputs(
+      q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+      rel_bias, rel_bias_w, gate, sink, committed_tokens_, rows_, splits_,
+      max_splits_, block_size_, num_q_heads_, num_kv_heads_, head_size_,
+      sliding_window_, rel_extent_, kv_dtype_, int8_queries_,
+      "Inkling2PagedPrefillAttention::eval_gpu");
+  const auto [gate_row_stride, sink_row_stride] = validate_inkling2_gate_sink(
+      gate, sink, rows_, num_q_heads_, head_size_,
+      "Inkling2PagedPrefillAttention::eval_gpu");
+
+  const int32_t* table = block_table.data<int32_t>();
+  const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+  const int64_t used =
+      (static_cast<int64_t>(committed_tokens_) + rows_ + block_size_ - 1) /
+      block_size_;
+  for (int64_t j = 0; j < used; ++j) {
+    if (table[j] < 0 || table[j] >= num_blocks) {
+      throw std::invalid_argument(
+          "[runtime] Inkling2PagedPrefillAttention::eval_gpu: block_table out of range");
+    }
+  }
+  const int32_t visible = committed_tokens_ + rows_;
+  const int64_t live_blocks = distinct_live_blocks(
+      table, &visible, 1, static_cast<uint32_t>(used), block_size_, num_blocks);
+
+  outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+  array* lse_out_ptr = nullptr;
+  size_t ws_idx = 1;
+  if (write_lse_) {
+    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+    lse_out_ptr = &outputs[1];
+    ws_idx = 2;
+  }
+  outputs[ws_idx].copy_shared_buffer(workspace);
+
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& encoder = mlx::core::metal::get_command_encoder(s);
+  const bool use_int8_q =
+      int8_queries_ && paged::paged_prefill_int8_queries_supported(d);
+  const uint32_t rel_mode = (rel_extent_ <= 0 || rel_bias == nullptr)
+      ? 0u
+      : (rel_bias_w != nullptr ? 2u : 1u);
+  mlx::core::fast::paged::Inkling2PagedPrefillParams params{
+      static_cast<uint32_t>(committed_tokens_),
+      static_cast<uint32_t>(rows_),
+      static_cast<uint32_t>(q_staged.shape(1)),
+      static_cast<uint32_t>(block_table.size()),
+      static_cast<uint32_t>(splits_),
+      static_cast<uint32_t>(max_splits_),
+      static_cast<uint32_t>(block_size_),
+      static_cast<uint32_t>(num_kv_heads_),
+      static_cast<uint32_t>(sliding_window_),
+      static_cast<uint32_t>(rel_extent_),
+      (rel_bias != nullptr && rel_bias->dtype() == mlx::core::float32) ? 1u : 0u,
+      rel_mode,
+      has_gate_sink_ ? 1u : 0u,
+      gate_row_stride,
+      (gate != nullptr && gate->dtype() == mlx::core::float32) ? 1u : 0u,
+      sink_row_stride,
+      (sink != nullptr && sink->dtype() == mlx::core::float32) ? 1u : 0u,
+      write_lse_ ? 1u : 0u};
+  mlx::core::fast::paged::dispatch_inkling2_paged_prefill_attention(
+      encoder, d, outputs[0], lse_out_ptr, outputs[ws_idx], q_staged, k_pool,
+      v_pool, k_scale, v_scale, block_table, rel_bias, rel_bias_w, gate, sink,
+      params, num_q_heads_, head_size_, to_paged_dtype(kv_dtype_), use_int8_q,
+      live_blocks);
+}
+
+std::vector<array> Inkling2PagedPrefillAttention::vjp(
+    const std::vector<array>&,
+    const std::vector<array>&,
+    const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("Inkling2PagedPrefillAttention is inference-only");
+}
+
+std::vector<Shape> Inkling2PagedPrefillAttention::output_shapes(
+    const std::vector<array>& inputs) {
+  if (write_lse_) {
+    return {Shape{rows_, num_q_heads_, head_size_},
+            Shape{rows_, num_q_heads_},
+            inputs[6].shape()};
+  }
+  return {Shape{rows_, num_q_heads_, head_size_}, inputs[6].shape()};
+}
+
+bool Inkling2PagedPrefillAttention::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const Inkling2PagedPrefillAttention&>(other);
+  return committed_tokens_ == o.committed_tokens_ && rows_ == o.rows_ &&
+      splits_ == o.splits_ && max_splits_ == o.max_splits_ &&
+      block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
+      num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
+      sliding_window_ == o.sliding_window_ && rel_extent_ == o.rel_extent_ &&
+      kv_dtype_ == o.kv_dtype_ && int8_queries_ == o.int8_queries_ &&
+      has_rel_bias_ == o.has_rel_bias_ &&
+      has_rel_bias_w_ == o.has_rel_bias_w_ &&
+      has_gate_sink_ == o.has_gate_sink_ &&
+      write_lse_ == o.write_lse_;
+}
+
+std::vector<array> inkling2_paged_prefill_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    const std::optional<array>& rel_bias,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    KvDtype kv_dtype,
+    bool int8_queries,
+    float scale,
+    StreamOrDevice s_,
+    const std::optional<array>& rel_bias_w,
+    const std::optional<array>& gate,
+    const std::optional<array>& sink,
+    bool write_lse) {
+  const char* op_name = "inkling2_paged_prefill_attention";
+  auto s = to_stream(s_);
+  if (q.ndim() != 3 || q.shape(1) != num_q_heads || q.shape(2) != head_size) {
+    prefill_reject(op_name, "q must be [rows, num_q_heads, head_size]");
+  }
+  if (num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(op_name, "num_q_heads must be a positive multiple of num_kv_heads");
+  }
+  const int rows = q.shape(0);
+  const int group = num_q_heads / num_kv_heads;
+  const bool scale_is_default =
+      std::abs(scale * std::sqrt(static_cast<float>(head_size)) - 1.0f) <= 1e-6f;
+
+  // Portable fallback when MPP is unavailable on this GPU, or for non-G3/non-default-scale shapes.
+  auto& dev = mlx::core::metal::device(s.device);
+  const bool use_mpp = group == 3 && head_size == 128 && scale_is_default &&
+      paged::inkling2_paged_prefill_mpp_supported(dev);
+  if (!use_mpp) {
+    const int32_t seq_len_val = committed_tokens + rows;
+    const int32_t cu_vals[2] = {0, rows};
+    array seq_lens_arr(&seq_len_val, Shape{1}, mlx::core::int32);
+    array cu_arr(cu_vals, Shape{2}, mlx::core::int32);
+    array bt_2d = block_table.ndim() == 2
+        ? block_table
+        : reshape(block_table, {1, static_cast<int>(block_table.size())}, s);
+    auto q_bf16 = contiguous(astype(q, mlx::core::bfloat16, s), false, s);
+    auto out_vec = inkling2_paged_attention(
+        q_bf16, k_pool, v_pool, bt_2d, seq_lens_arr, cu_arr, k_scale, v_scale,
+        rel_bias, scale, sliding_window, rel_extent, block_size, num_q_heads,
+        num_kv_heads, head_size, kv_dtype, s, std::nullopt, rel_bias_w, gate,
+        sink, write_lse);
+    out_vec.push_back(workspace);
+    return out_vec;
+  }
+
+  const int stride = paged_prefill_stride(rows);
+  array staged = transpose(
+      reshape(astype(q, mlx::core::bfloat16, s), {rows, num_kv_heads, group, head_size}, s),
+      {1, 0, 2, 3},
+      s);
+  staged = stride == rows
+      ? contiguous(staged, false, s)
+      : pad(staged, {1}, {0}, {stride - rows},
+            array(0.0f, mlx::core::bfloat16), "constant", s);
+
+  std::optional<array> gate_prep = gate
+      ? std::optional<array>(
+            prepare_inkling2_gate_input(*gate, rows, num_q_heads, head_size, s))
+      : std::nullopt;
+  std::optional<array> sink_prep = sink
+      ? std::optional<array>(
+            prepare_inkling2_sink_input(*sink, rows, num_q_heads, s))
+      : std::nullopt;
+  const array* rel_ptr = rel_bias ? &(*rel_bias) : nullptr;
+  const array* rel_w_ptr = rel_bias_w ? &(*rel_bias_w) : nullptr;
+  const array* gate_ptr = gate_prep ? &(*gate_prep) : nullptr;
+  const array* sink_ptr = sink_prep ? &(*sink_prep) : nullptr;
+  validate_inkling2_paged_prefill_inputs(
+      staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+      rel_ptr, rel_w_ptr, gate_ptr, sink_ptr, committed_tokens, rows, splits,
+      max_splits, block_size, num_q_heads, num_kv_heads, head_size,
+      sliding_window, rel_extent, kv_dtype, int8_queries, op_name);
+
+  std::vector<array> inputs = {
+      staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace};
+  if (rel_bias) {
+    inputs.push_back(*rel_bias);
+  }
+  if (rel_bias_w) {
+    inputs.push_back(*rel_bias_w);
+  }
+  if (gate_prep && sink_prep) {
+    inputs.push_back(*gate_prep);
+    inputs.push_back(*sink_prep);
+  }
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error(
+        "inkling2_paged_prefill_attention has no fallback implementation");
+  };
+  const bool has_gate_sink = gate_prep.has_value() && sink_prep.has_value();
+  auto prim = std::make_shared<Inkling2PagedPrefillAttention>(
+      s, std::move(fallback), committed_tokens, rows, splits, max_splits,
+      block_size, num_q_heads, num_kv_heads, head_size, sliding_window,
+      rel_extent, kv_dtype, int8_queries, rel_bias.has_value(),
+      rel_bias_w.has_value(), has_gate_sink, write_lse);
+  std::vector<Shape> out_shapes = {Shape{rows, num_q_heads, head_size}};
+  std::vector<Dtype> out_dtypes = {mlx::core::bfloat16};
+  if (write_lse) {
+    out_shapes.push_back(Shape{rows, num_q_heads});
+    out_dtypes.push_back(mlx::core::float32);
+  }
+  out_shapes.push_back(workspace.shape());
+  out_dtypes.push_back(mlx::core::float32);
+  return array::make_arrays(
+      std::move(out_shapes), std::move(out_dtypes), std::move(prim),
+      std::move(inputs));
+}
+
 } // namespace mlx::core::fast
 
 extern "C" {
@@ -2800,6 +3606,205 @@ bool mlx_paged_prefill_attention_forward(
     return false;
   } catch (...) {
     mlx_trace_native_error("paged_prefill_attention_forward", "unknown exception");
+    return false;
+  }
+}
+
+bool mlx_inkling2_paged_attention_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* cu_seqlens_q_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    mlx_array* rel_bias_ptr,
+    mlx_array* rel_bias_w_ptr,
+    mlx_array* gate_ptr,
+    mlx_array* sink_ptr,
+    float scale,
+    int sliding_window,
+    int rel_extent,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw,
+    mlx_array* score_scales_ptr,
+    mlx_array** out_attention,
+    mlx_array** out_lse) {
+  if (out_attention) *out_attention = nullptr;
+  if (out_lse) *out_lse = nullptr;
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
+      !seq_lens_ptr || !cu_seqlens_q_ptr || !k_scale_ptr || !v_scale_ptr ||
+      !out_attention) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+    require_known_kv_dtype(kv_dtype_raw);
+    const auto& q_raw = *reinterpret_cast<array*>(q_ptr);
+    array q = (q_raw.dtype() == bfloat16 && q_raw.flags().row_contiguous)
+        ? q_raw
+        : contiguous(astype(q_raw, bfloat16));
+    std::optional<array> rel_bias;
+    if (rel_bias_ptr != nullptr) {
+      const auto& rb_raw = *reinterpret_cast<array*>(rel_bias_ptr);
+      rel_bias = rb_raw.flags().row_contiguous ? rb_raw : contiguous(rb_raw);
+    }
+    std::optional<array> rel_bias_w;
+    if (rel_bias_w_ptr != nullptr) {
+      const auto& rw_raw = *reinterpret_cast<array*>(rel_bias_w_ptr);
+      rel_bias_w = (rw_raw.flags().row_contiguous && rw_raw.offset() == 0)
+          ? rw_raw
+          : contiguous(rw_raw);
+    }
+    std::optional<array> gate = gate_ptr != nullptr
+        ? std::optional<array>(*reinterpret_cast<array*>(gate_ptr))
+        : std::nullopt;
+    std::optional<array> sink = sink_ptr != nullptr
+        ? std::optional<array>(*reinterpret_cast<array*>(sink_ptr))
+        : std::nullopt;
+    std::optional<array> score_scales = score_scales_ptr != nullptr
+        ? std::optional<array>(contiguous(*reinterpret_cast<array*>(score_scales_ptr)))
+        : std::nullopt;
+    const bool write_lse = (out_lse != nullptr);
+    auto results = inkling2_paged_attention(
+        q,
+        *reinterpret_cast<array*>(k_pool_ptr),
+        *reinterpret_cast<array*>(v_pool_ptr),
+        *reinterpret_cast<array*>(block_table_ptr),
+        *reinterpret_cast<array*>(seq_lens_ptr),
+        *reinterpret_cast<array*>(cu_seqlens_q_ptr),
+        *reinterpret_cast<array*>(k_scale_ptr),
+        *reinterpret_cast<array*>(v_scale_ptr),
+        rel_bias,
+        scale,
+        sliding_window,
+        rel_extent,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        static_cast<KvDtype>(kv_dtype_raw),
+        {},
+        score_scales,
+        rel_bias_w,
+        gate,
+        sink,
+        write_lse);
+    *out_attention = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    if (write_lse) {
+      *out_lse = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    }
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_paged_attention_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("inkling2_paged_attention_forward", "unknown exception");
+    return false;
+  }
+}
+
+bool mlx_inkling2_paged_prefill_attention_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* workspace_ptr,
+    mlx_array* rel_bias_ptr,
+    mlx_array* rel_bias_w_ptr,
+    mlx_array* gate_ptr,
+    mlx_array* sink_ptr,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    int rel_extent,
+    uint8_t kv_dtype_raw,
+    bool int8_queries,
+    float scale,
+    mlx_array** out_attention,
+    mlx_array** out_lse,
+    mlx_array** out_workspace) {
+  if (out_attention) *out_attention = nullptr;
+  if (out_lse) *out_lse = nullptr;
+  if (out_workspace) *out_workspace = nullptr;
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !k_scale_ptr || !v_scale_ptr ||
+      !block_table_ptr || !workspace_ptr || !out_attention || !out_workspace) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+    require_known_kv_dtype(kv_dtype_raw);
+    std::optional<array> rel_bias;
+    if (rel_bias_ptr != nullptr) {
+      const auto& rb_raw = *reinterpret_cast<array*>(rel_bias_ptr);
+      rel_bias = rb_raw.flags().row_contiguous ? rb_raw : contiguous(rb_raw);
+    }
+    std::optional<array> rel_bias_w;
+    if (rel_bias_w_ptr != nullptr) {
+      const auto& rw_raw = *reinterpret_cast<array*>(rel_bias_w_ptr);
+      rel_bias_w = (rw_raw.flags().row_contiguous && rw_raw.offset() == 0)
+          ? rw_raw
+          : contiguous(rw_raw);
+    }
+    std::optional<array> gate = gate_ptr != nullptr
+        ? std::optional<array>(*reinterpret_cast<array*>(gate_ptr))
+        : std::nullopt;
+    std::optional<array> sink = sink_ptr != nullptr
+        ? std::optional<array>(*reinterpret_cast<array*>(sink_ptr))
+        : std::nullopt;
+    const bool write_lse = (out_lse != nullptr);
+    auto results = inkling2_paged_prefill_attention(
+        *reinterpret_cast<array*>(q_ptr),
+        *reinterpret_cast<array*>(k_pool_ptr),
+        *reinterpret_cast<array*>(v_pool_ptr),
+        *reinterpret_cast<array*>(k_scale_ptr),
+        *reinterpret_cast<array*>(v_scale_ptr),
+        *reinterpret_cast<array*>(block_table_ptr),
+        *reinterpret_cast<array*>(workspace_ptr),
+        rel_bias,
+        committed_tokens,
+        splits,
+        max_splits,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        sliding_window,
+        rel_extent,
+        static_cast<KvDtype>(kv_dtype_raw),
+        int8_queries,
+        scale,
+        {},
+        rel_bias_w,
+        gate,
+        sink,
+        write_lse);
+    *out_attention = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    if (write_lse) {
+      *out_lse = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+      *out_workspace = reinterpret_cast<mlx_array*>(new array(std::move(results[2])));
+    } else {
+      *out_workspace = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    }
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("inkling2_paged_prefill_attention_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("inkling2_paged_prefill_attention_forward", "unknown exception");
     return false;
   }
 }

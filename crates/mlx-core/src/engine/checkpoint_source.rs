@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::array::DType;
 use crate::utils::gguf::{
     GgufFile, NativeGgufFamily, native_gguf_unlease_in_use, parse_gguf, prepare_gguf_assets,
-    prepare_gguf_assets_in, resolve_gemma4_gguf_source, resolve_muse_glimmer_gguf_source,
-    source_file_identity_digest,
+    prepare_gguf_assets_in, resolve_gemma4_gguf_source, resolve_inkling2_gguf_source,
+    resolve_muse_glimmer_gguf_source, source_file_identity_digest,
 };
 use crate::utils::gguf_import::{PreloadInput, PreloadMain};
 use crate::utils::gguf_plan::{
@@ -93,6 +93,7 @@ impl CheckpointSource {
             }
             NativeGgufFamily::Gemma4 => resolve_gemma4_gguf_source(path)?,
             NativeGgufFamily::MuseGlimmer => resolve_muse_glimmer_gguf_source(path)?,
+            NativeGgufFamily::Inkling2 => resolve_inkling2_gguf_source(path)?,
         };
         let Some(gguf) = gguf else {
             return Ok(Self::Dir(path.to_path_buf()));
@@ -253,7 +254,8 @@ fn companion_role(family: NativeGgufFamily) -> OutputRole {
             NativeGgufFamily::Qwen35
             | NativeGgufFamily::Qwen35Moe
             | NativeGgufFamily::Clef
-            | NativeGgufFamily::Gemma4 => "vision.safetensors",
+            | NativeGgufFamily::Gemma4
+            | NativeGgufFamily::Inkling2 => "vision.safetensors",
         }
         .to_string(),
     }

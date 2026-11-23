@@ -352,6 +352,14 @@ fn gguf_header(
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
+            GgufMetaValue::ArrayBool(values) => {
+                buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                buf.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+                buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for &v in values {
+                    buf.push(u8::from(v));
+                }
+            }
             _ => panic!("Unsupported metadata type in test helper"),
         }
     }

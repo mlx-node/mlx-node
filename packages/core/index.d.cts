@@ -811,6 +811,129 @@ export declare class HyV4FlashModel {
   ): Promise<ChatStreamHandle>;
 }
 
+/**
+ * NAPI handle for Inkling-2-Mini (`Inkling2LoopForConditionalGeneration`).
+ *
+ * All inference state and the continuous-batching `HybridSchedulerState` live on a dedicated OS
+ * thread spawned via [`ModelThread::spawn_with_scheduler`].
+ */
+export declare class Inkling2Model {
+  /**
+   * Load an Inkling-2-Mini model (directory or GGUF + optional companion `mmproj-BF16.gguf`)
+   * onto its dedicated continuous-batching scheduler thread.
+   */
+  static load(path: string, options?: Inkling2LoadOptions | undefined | null): Promise<Inkling2Model>;
+  /** Directory containing tokenizer/config assets for this loaded model. */
+  modelAssetsPath(): string;
+  /** Active persistent StateDisk namespace directory name, or `null` for temp/off/closed caches. */
+  stateTierNamespace(): string | null;
+  /** Whether weights are initialized (always `true` for instances returned by `Inkling2Model.load`). */
+  get isInitialized(): boolean;
+  /** Whether the block-paged hybrid KV cache coordinator is active on this instance. */
+  hasBlockPagedCache(): boolean;
+  /** Concurrent sequence lane width granted by the unified `MemoryPlan`. */
+  maxConcurrentSequences(): number;
+  /** Whether this loaded instance has the PE-Lang vision encoder active for image-bearing turns. */
+  supportsImages(): boolean;
+  /** Whether an external speculative drafter is attached (Phase 5 DSpark). */
+  hasMtpWeights(): boolean;
+  /** Synchronous snapshot of trained and memory-planned context limits. */
+  contextLimits(): Inkling2ContextLimits;
+  /**
+   * Compute the exact prompt length after Inkling2 image-placeholder expansion without
+   * running the vision encoder or touching GPU inference caches.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /**
+   * Flush waiting ordinary states (if persistent) and close the SSD StateDisk cache by
+   * `deadline_ms` (Unix epoch ms, defaults to 5s from now).
+   */
+  closeCache(deadlineMs?: number | undefined | null): Promise<boolean>;
+  /**
+   * Frees the weights, KV pools, and scheduler state now: the model thread drops them
+   * and exits before this promise resolves; every later call fails.
+   */
+  dispose(): Promise<void>;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
 export declare class JinaRerankerModel {
   static load(modelPath: string, optionsJson?: string | undefined | null): Promise<JinaRerankerModel>;
   get infoJson(): string;
@@ -4944,6 +5067,43 @@ export interface HyV4FlashTurnTokenIds {
   promptIds: Array<number>;
   /** The generated ids, the stop token included when one ended the turn. */
   outputIds: Array<number>;
+}
+
+/** Trained and physically available active-context limits for a loaded Inkling-2-Mini model. */
+export interface Inkling2ContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
+  restOfWindowOutputBudget: boolean;
+  omittedBudgetIsRestOfWindow: boolean;
+  kvFormat: 'int8' | 'bf16';
+  attentionQueries: 'int8' | 'bf16';
+  governorModelId?: number;
+}
+
+/** Optional load-time configuration for [`Inkling2Model::load`]. */
+export interface Inkling2LoadOptions {
+  /** Optional external DSpark drafter checkpoint path. */
+  draftModelPath?: string;
+  /** Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`). */
+  autoLoadDraft?: boolean;
+  /** KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`. */
+  kvFormat?: 'int8' | 'bf16' | undefined;
+  /** Metal memory budget ceiling in bytes (`--max-memory`). */
+  maxMemoryBytes?: number | undefined;
+  /** Maximum context token limit (`--max-context`). */
+  maxContextTokens?: number | undefined;
+  /** Decode time owed per unit of prefill time while other requests generate (`--decode-share`). */
+  decodeShare?: number;
+  /** Paged attention activation mode (`--activations`): `'auto'` or `'bf16'`. */
+  activations?: 'auto' | 'bf16' | undefined;
+  /** SSD StateDisk quota (`--max-cache-disk`): `'auto'`, a byte count, or `'0'` (off). */
+  cacheDisk?: string;
+  /** Root directory for persistent StateDisk cache (`--cache-dir`); requires `persistPagedCache`. */
+  cacheDir?: string;
+  /** Keep the SSD StateDisk cache across restarts (`--no-persist-cache` / `MLX_PERSIST_PAGED_CACHE`). */
+  persistPagedCache?: boolean;
 }
 
 /** InternViT vision encoder configuration */

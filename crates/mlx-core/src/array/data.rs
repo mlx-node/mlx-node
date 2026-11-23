@@ -206,6 +206,13 @@ impl MxArray {
         MxArray::from_handle(handle, "array_astype")
     }
 
+    /// Zero-copy bitcast view into another dtype along the last dimension
+    /// (e.g. `Uint8 [..., N] -> Uint32 [..., N/4]` for packed NVFP4/MXFP8 weights).
+    pub fn view(&self, dtype: DType) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_view(self.handle.0, dtype.code()) };
+        MxArray::from_handle(handle, "array_view")
+    }
+
     /// Create a copy of this array with a new handle.
     /// This is useful for parameter loading to avoid handle aliasing issues.
     #[napi]

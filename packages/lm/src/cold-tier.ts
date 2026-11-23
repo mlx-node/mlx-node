@@ -86,6 +86,7 @@ export const COLD_TIER_STATE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
   'qwen3_5_moe',
   'qwen4_exp',
   'hy_v4_flash',
+  'inkling2',
 ]);
 
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */

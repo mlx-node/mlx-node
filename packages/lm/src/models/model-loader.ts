@@ -10,6 +10,7 @@ import {
   ggufArchitecture,
   HarrierModel,
   HyV4FlashModel as NativeHyV4FlashModel,
+  Inkling2Model as NativeInkling2Model,
   JinaRerankerModel,
   XlmRobertaRerankerModel,
   K2HorizonModel as NativeK2HorizonModel,
@@ -22,6 +23,7 @@ import {
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
   type HyV4FlashLoadOptions,
+  type Inkling2LoadOptions,
   type Qwen35LoadOptions,
   type Qwen4ExpLoadOptions,
 } from '@mlx-node/core';
@@ -36,6 +38,7 @@ import {
   DeepseekV41Model,
   Gemma4Model,
   HyV4FlashModel,
+  Inkling2Model,
   K2HorizonModel,
   Lfm2Model,
   MuseGlimmerModel,
@@ -197,6 +200,31 @@ function hyV4FlashLoadOptions(options: LoadModelOptions | undefined): HyV4FlashL
   };
 }
 
+function inkling2LoadOptions(options: LoadModelOptions | undefined): Inkling2LoadOptions | null {
+  if (
+    options?.draftModelPath === undefined &&
+    options?.autoLoadDraft === undefined &&
+    options?.kvFormat === undefined &&
+    options?.maxMemoryBytes === undefined &&
+    options?.maxContextTokens === undefined &&
+    options?.decodeShare === undefined &&
+    options?.activations === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.cacheDir === undefined
+  )
+    return null;
+  return {
+    ...(options.draftModelPath !== undefined ? { draftModelPath: options.draftModelPath } : {}),
+    ...(options.autoLoadDraft !== undefined ? { autoLoadDraft: options.autoLoadDraft } : {}),
+    ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
+    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
+    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+    ...(options.decodeShare !== undefined ? { decodeShare: options.decodeShare } : {}),
+    ...(options.activations !== undefined ? { activations: options.activations } : {}),
+    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
+    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
+  };
+}
 type NativeModelClass = abstract new (...args: never[]) => object;
 
 interface LoaderBinding {
@@ -270,6 +298,11 @@ const LOADER_BINDINGS = {
     load: (modelPath: string, options?: LoadModelOptions) =>
       HyV4FlashModel.load(modelPath, hyV4FlashLoadOptions(options)),
     nativeModelClass: NativeHyV4FlashModel,
+  },
+  inkling2: {
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Inkling2Model.load(modelPath, inkling2LoadOptions(options)),
+    nativeModelClass: NativeInkling2Model,
   },
   lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
@@ -354,31 +387,31 @@ function dispatchLoad(
   }
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe, qwen4_exp and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
     throw new Error(
-      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
+      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
     throw new Error(
-      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
+      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.activations !== undefined && requireFamilyData(modelType).acceptsActivations !== true) {
     throw new Error(
-      `activations (int8 activations) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `activations (int8 activations) is only supported by qwen3_5, qwen3_5_moe and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.decodeShare !== undefined && requireFamilyData(modelType).acceptsDecodeShare !== true) {
     throw new Error(
-      `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5, qwen3_5_moe and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -387,17 +420,29 @@ function dispatchLoad(
     requireFamilyData(modelType).acceptsCacheDisk !== true
   ) {
     throw new Error(
-      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   if (options?.kvFormat !== undefined && requireFamilyData(modelType).acceptsKvFormat !== true) {
     throw new Error(
-      `kvFormat (K/V cache format) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `kvFormat (K/V cache format) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
+  // Inkling2 discovers colocated DSpark companions natively with soft fallback on
+  // incompatible drafts; forwarding an automatic pick as `draftModelPath` would
+  // elevate it to an explicit draft whose failure aborts startup. Instead honor
+  // explicit `draftModelPath` directly and propagate `autoLoadDraft: false` when
+  // opted out or unsupported on the active backend.
+  if (modelType === 'inkling2') {
+    if (options?.draftModelPath !== undefined) {
+      return binding.load(modelPath, options);
+    }
+    const disableAuto = options?.autoLoadDraft === false || !supportsAutomaticDFlash2(modelType);
+    return binding.load(modelPath, disableAuto ? { ...options, autoLoadDraft: false } : options);
+  }
   // Automatic DFlash2 verification follows the active backend's native capabilities.
   // Explicit drafts always retain native validation.
   const automaticDraft =

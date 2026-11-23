@@ -100,7 +100,7 @@ export function ggufSplitPartNames(name: string, siblings: readonly string[]): s
  * pairs a standalone GGUF MTP file: counting one as weights certifies a
  * directory the loader cannot open, and discovery would list the sidecar as a model.
  */
-const GGUF_COMPANION_TOKENS: ReadonlySet<string> = new Set(['imatrix', 'mmproj', 'dflash', 'draft', 'mtp']);
+const GGUF_COMPANION_TOKENS: ReadonlySet<string> = new Set(['imatrix', 'mmproj', 'dflash', 'dspark', 'draft', 'mtp']);
 
 /**
  * True when a `.gguf` filename is a companion artifact (projector, calibration,

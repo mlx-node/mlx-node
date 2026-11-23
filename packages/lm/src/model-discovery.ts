@@ -194,9 +194,11 @@ async function readDiscoveryMetadata(
 ): Promise<DiscoveryMetadata> {
   try {
     const config = (await readModelConfig(modelPath)) as Record<string, unknown>;
-    const root = positiveInteger(config.max_position_embeddings);
+    const root = positiveInteger(config.max_position_embeddings) ?? positiveInteger(config.model_max_length);
     const textConfig = config.text_config;
-    const nested = nonEmptyRecord(textConfig) ? positiveInteger(textConfig.max_position_embeddings) : undefined;
+    const nested = nonEmptyRecord(textConfig)
+      ? (positiveInteger(textConfig.max_position_embeddings) ?? positiveInteger(textConfig.model_max_length))
+      : undefined;
     const supportsImages =
       familyDataFor(modelType)?.visionConfigKeys?.some((key) => nonEmptyRecord(config[key])) ?? false;
     const draftOnly = Array.isArray(config.architectures) && config.architectures.includes('DFlash2DraftModel');

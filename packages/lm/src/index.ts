@@ -50,6 +50,9 @@ export type {
   HyV4FlashTurnTokenIds,
 } from '@mlx-node/core';
 
+// Inkling-2-Mini (hybrid SWA/Global + ShortConv + Looped MoE, GGUF + PE-Lang vision)
+export { Inkling2Model } from './stream.js';
+export type { Inkling2ContextLimits, Inkling2LoadOptions } from '@mlx-node/core';
 // Nemotron H models
 //
 // The config/limits types ship alongside the class for the same reason
@@ -165,6 +168,7 @@ export {
   FAMILY_ROWS,
   GEMMA4_SAMPLING_DEFAULTS,
   HY_V4_FLASH_SAMPLING_DEFAULTS,
+  INKLING2_SAMPLING_DEFAULTS,
   K2_SAMPLING_DEFAULTS,
   launchPresetFor,
   LFM2_SAMPLING_DEFAULTS,

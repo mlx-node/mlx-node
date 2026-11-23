@@ -25,6 +25,13 @@ const std::vector<array> *try_workspace(Stream stream,
                                         uint64_t identity,
                                         const std::vector<Spec> &specs);
 
+// Variant with explicit byte budget cap (e.g. 16 MiB for Inkling2 T<=32 MoE).
+const std::vector<array> *try_workspace_capped(Stream stream,
+                                               metal::CommandEncoder &encoder,
+                                               uint64_t identity,
+                                               const std::vector<Spec> &specs,
+                                               size_t max_bytes);
+
 // Synchronize before releasing a live profile. Failed synchronization retains
 // it; a destroyed encoder has already synchronized and its profile is reaped.
 void drain(Stream stream);

@@ -18,6 +18,7 @@
  * against native AND pins every re-export to be the very same object.
  */
 import { coldRestoreFamilies } from '@mlx-node/core';
+import { COLD_TIER_STATE_FAMILIES } from '@mlx-node/lm/cold-tier';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { COLD_TIER_RESTORE_FAMILIES as viaCatalog, coldTierRestoreFamilyList } from '../src/catalog.js';
@@ -28,11 +29,13 @@ describe('cold-tier restore allowlist', () => {
     expect([...COLD_TIER_RESTORE_FAMILIES].sort()).toEqual([...coldRestoreFamilies()].sort());
   });
 
-  // Splash keeps no per-turn KV on disk for these: their tier holds DFlash2
-  // states, so a KV chain alone must never back a restore.
-  it('leaves the qwen3_5 families out', () => {
-    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen3_5')).toBe(false);
-    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen3_5_moe')).toBe(false);
+  // Splash keeps no per-turn KV on disk for these: their tier holds DFlash2 /
+  // StateDisk states, so a KV chain alone must never back a restore.
+  it('leaves state-tier families out of COLD_TIER_RESTORE_FAMILIES and includes them in COLD_TIER_STATE_FAMILIES', () => {
+    for (const family of ['qwen3_5', 'qwen3_5_moe', 'qwen4_exp', 'inkling2']) {
+      expect(COLD_TIER_RESTORE_FAMILIES.has(family), family).toBe(false);
+      expect(COLD_TIER_STATE_FAMILIES.has(family), family).toBe(true);
+    }
   });
 
   // Identity, not equality: a re-export that ever became a second `new Set([…])`

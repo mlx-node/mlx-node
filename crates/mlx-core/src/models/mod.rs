@@ -12,6 +12,7 @@ pub(crate) mod forward;
 pub mod gemma4;
 pub mod harrier;
 pub mod hy_v4_flash;
+pub mod inkling2;
 pub mod int8_gemm;
 pub mod jina_reranker;
 pub mod k2_horizon;
@@ -134,7 +135,7 @@ mod free_released_wiring_tests {
                         .await
                         .map(drop)
                 }
-                NativeGgufFamily::Clef => unreachable!(),
+                NativeGgufFamily::Clef | NativeGgufFamily::Inkling2 => unreachable!(),
             };
             if outcome.is_err() {
                 source.release_lease();

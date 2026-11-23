@@ -31,6 +31,20 @@ pub(crate) trait ScheduledDraftVerify: Sized {
         rows: &[(PagedRaggedRow, Vec<u32>)],
     ) -> Result<(MxArray, Vec<MxArray>)>;
     fn append_committed_taps(&mut self, seq_id: u32, taps: &[MxArray], keep: usize) -> Result<()>;
+    /// Optional batched tap-append hook so multi-lane drafters (e.g. Inkling2 DSpark) can run
+    /// one stacked Q8_0 `kv_ctx` projection across all lanes in a verify wave.
+    fn supports_batched_append_taps(&self) -> bool {
+        false
+    }
+    fn append_committed_taps_batch(
+        &mut self,
+        items: &[(u32, &[MxArray], usize)],
+    ) -> Vec<Result<()>> {
+        items
+            .iter()
+            .map(|&(seq_id, taps, keep)| self.append_committed_taps(seq_id, taps, keep))
+            .collect()
+    }
     fn discard_draft_owner(&mut self, seq_id: u32);
     /// Recurrent targets verify into scratch state. Install only this owner's
     /// accepted prefix after every attention ticket in the wave has closed.
@@ -197,18 +211,34 @@ pub(crate) trait ScheduledDraftVerify: Sized {
                 }
             }
         }
-        for ((row, tapped), result) in rows.iter().zip(contexts).zip(&mut results) {
-            if result.is_err() {
-                continue;
+        if self.supports_batched_append_taps() {
+            let mut batch_indices = Vec::new();
+            let mut batch_items: Vec<(u32, &[MxArray], usize)> = Vec::new();
+            for (idx, ((row, tapped), result)) in
+                rows.iter().zip(&contexts).zip(&results).enumerate()
+            {
+                if result.is_err() || row.keep == 0 {
+                    continue;
+                }
+                if let Some(tapped) = tapped.as_deref() {
+                    batch_indices.push(idx);
+                    batch_items.push((row.seq_id, tapped, row.keep));
+                }
             }
-            if row.keep == 0 {
-                self.discard_draft_owner(row.seq_id);
-                continue;
+            if !batch_items.is_empty() {
+                let append_results = self.append_committed_taps_batch(&batch_items);
+                for (idx, res) in batch_indices.into_iter().zip(append_results) {
+                    results[idx] = res;
+                }
             }
-            if let Some(tapped) = tapped {
-                *result = self.append_committed_taps(row.seq_id, &tapped, row.keep);
-            }
-            if result.is_ok() {
+            for (row, result) in rows.iter().zip(&mut results) {
+                if result.is_err() {
+                    continue;
+                }
+                if row.keep == 0 {
+                    self.discard_draft_owner(row.seq_id);
+                    continue;
+                }
                 let mut cache = self.verify_cache();
                 *result = cache
                     .frontier(row.seq_id)
@@ -218,6 +248,30 @@ pub(crate) trait ScheduledDraftVerify: Sized {
                             .settle_committed(row.seq_id, frontier.attn_tokens)
                             .map_err(Error::from_reason)
                     });
+            }
+        } else {
+            for ((row, tapped), result) in rows.iter().zip(contexts).zip(&mut results) {
+                if result.is_err() {
+                    continue;
+                }
+                if row.keep == 0 {
+                    self.discard_draft_owner(row.seq_id);
+                    continue;
+                }
+                if let Some(tapped) = tapped {
+                    *result = self.append_committed_taps(row.seq_id, &tapped, row.keep);
+                }
+                if result.is_ok() {
+                    let mut cache = self.verify_cache();
+                    *result = cache
+                        .frontier(row.seq_id)
+                        .ok_or_else(|| Error::from_reason("scheduled commit lost target frontier"))
+                        .and_then(|frontier| {
+                            cache
+                                .settle_committed(row.seq_id, frontier.attn_tokens)
+                                .map_err(Error::from_reason)
+                        });
+                }
             }
         }
         for (row, result) in rows.iter().zip(&results) {

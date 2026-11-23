@@ -770,9 +770,9 @@ describe('makeSwapController, a target that loads alone', () => {
     expect(registry.getAny('mlx-local')).toBe(registry.getAny('old'));
   });
 
-  it('flags qwen4_exp and hy_v4_flash alone among the families', () => {
+  it('flags qwen4_exp, hy_v4_flash and inkling2 among the families that load alone', () => {
     const alone = MODEL_FAMILY_DATA.map((family) => family.id).filter((id) => familyDataFor(id)?.loadsAlone === true);
-    expect(alone).toEqual(['qwen4_exp', 'hy_v4_flash']);
+    expect(alone).toEqual(['qwen4_exp', 'hy_v4_flash', 'inkling2']);
   });
 });
 

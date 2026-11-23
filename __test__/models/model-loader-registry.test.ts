@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   detectModelType,
   Gemma4Model,
+  Inkling2Model,
   loadModel,
   loadSession,
   MuseGlimmerModel,
@@ -27,6 +28,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   qwen4_exp: ['qwen4_exp', 'qwen4_exp_text'],
   deepseek_v41: ['deepseek_v41'],
   hy_v4_flash: ['hy_v4_flash'],
+  inkling2: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'],
   lfm2: ['lfm2'],
   lfm2_moe: ['lfm2_moe'],
   nemotron_h: ['nemotron_h'],
@@ -197,7 +199,7 @@ describe('declarative model loader registry', () => {
   it('rejects draftModelPath for families without external draft support', async () => {
     await writeConfig({ model_type: 'qwen3' });
     await expect(loadModel(tempDir, { draftModelPath: '/tmp/draft' })).rejects.toThrow(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe and qwen4_exp models; ${tempDir} has model_type "qwen3"`,
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe, qwen4_exp and inkling2 models; ${tempDir} has model_type "qwen3"`,
     );
   });
 
@@ -245,5 +247,21 @@ describe('declarative model loader registry', () => {
 
     await expect(loadModel(tempDir)).resolves.toBe(loadedModel);
     expect(loadSpy).toHaveBeenCalledWith(tempDir);
+  });
+
+  it('forwards draftModelPath and load options through the Inkling2 family descriptor', async () => {
+    await writeConfig({ model_type: 'inkling2_loop' });
+    const loadedModel = { model: 'inkling2' };
+    const loadSpy = vi.spyOn(Inkling2Model, 'load').mockResolvedValue(loadedModel as never);
+
+    await expect(
+      loadModel(tempDir, { draftModelPath: '/tmp/dspark.gguf', kvFormat: 'int8', cacheDisk: 'auto' }),
+    ).resolves.toBe(loadedModel);
+    expect(loadSpy).toHaveBeenCalledOnce();
+    expect(loadSpy).toHaveBeenCalledWith(tempDir, {
+      draftModelPath: '/tmp/dspark.gguf',
+      kvFormat: 'int8',
+      cacheDisk: 'auto',
+    });
   });
 });
