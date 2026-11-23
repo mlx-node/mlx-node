@@ -10,9 +10,9 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
 use crate::vision::cnn::{
     load_conv_transpose2d, load_conv2d, load_frozen_bn, load_hgnetv2_backbone,
+    load_model_safetensors,
 };
 
 use super::config::TextDetConfig;
@@ -358,7 +358,7 @@ pub fn load_model(model_path: &str) -> Result<TextDetModel> {
     };
 
     // Load weights
-    let params = load_all_safetensors(path, false)?;
+    let params = load_model_safetensors(path)?;
 
     // Build components
     let backbone = load_hgnetv2_backbone(

@@ -761,8 +761,7 @@ impl Qwen35Inner {
             );
             return Ok((Some(logits), Some(context), None));
         }
-        let draft_lane = !self.is_moe()
-            && self.dflash2.is_some()
+        let draft_lane = self.dflash2.is_some()
             && mtp_seq.is_none()
             && self
                 .active_scheduled_seq
@@ -975,7 +974,7 @@ impl PagedBackend for Qwen35Inner {
                 cache_salt,
             );
         }
-        if !self.is_moe() && self.dflash2.is_some() {
+        if self.dflash2.is_some() {
             return crate::models::qwen3_5::dflash2_turn::prime_scheduled_draft_lane(
                 self,
                 plan,

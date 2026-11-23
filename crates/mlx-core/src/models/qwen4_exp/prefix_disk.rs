@@ -347,11 +347,9 @@ impl PrefixCodec for Qwen4Codec {
     }
 
     fn expected_segment_count(&self, row: usize, stride: usize) -> usize {
-        if stride == 0 {
-            0
-        } else {
-            super::memory::cached_draft_rows(row as u64, stride as u64) as usize / stride
-        }
+        (super::memory::cached_draft_rows(row as u64, stride as u64) as usize)
+            .checked_div(stride)
+            .unwrap_or(0)
     }
 
     fn encode_state_into(&self, cell: &Cell, into: &mut [u8]) -> Result<bool> {

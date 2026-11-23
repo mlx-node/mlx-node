@@ -705,8 +705,8 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
     let q_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
     let filled = fill_bf16_pool(
-        &[k_per_token.clone()],
-        &[v_per_token.clone()],
+        std::slice::from_ref(&k_per_token),
+        std::slice::from_ref(&v_per_token),
         &[CONTEXT_LEN],
         HEAD_SIZE,
         NUM_KV_HEADS,

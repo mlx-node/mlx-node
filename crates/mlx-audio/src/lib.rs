@@ -9,4 +9,5 @@ pub mod error;
 pub mod playback;
 pub mod wav;
 
+pub use capture::{AudioRingConsumer, AudioRingControl, AudioRingProducer, audio_ring};
 pub use error::AudioError;

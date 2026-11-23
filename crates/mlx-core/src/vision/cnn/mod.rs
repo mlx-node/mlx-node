@@ -19,5 +19,6 @@ pub use layers::{
 pub(crate) use persistence::{
     get_tensor, load_conv_bn_act, load_conv_bn_act_with_options, load_conv_transpose2d,
     load_conv2d, load_frozen_bn, load_hgnetv2_backbone, load_layer_norm, load_linear,
+    load_model_safetensors,
 };
 pub use processing::rgb_to_nhwc_f32;

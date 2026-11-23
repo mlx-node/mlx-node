@@ -11,10 +11,9 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
 use crate::vision::cnn::{
     load_conv_bn_act, load_conv2d, load_frozen_bn, load_hgnetv2_backbone, load_layer_norm,
-    load_linear,
+    load_linear, load_model_safetensors,
 };
 
 use super::config::PPDocLayoutV3Config;
@@ -576,7 +575,7 @@ pub fn load_model(model_path: &str) -> Result<PPDocLayoutV3Model> {
     }
 
     // Load weights
-    let raw_params = load_all_safetensors(path, false)?;
+    let raw_params = load_model_safetensors(path)?;
 
     // Strip "model." prefix from all keys
     let mut params: HashMap<String, MxArray> = HashMap::with_capacity(raw_params.len());

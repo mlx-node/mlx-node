@@ -69,6 +69,7 @@ impl GemmaMLP {
 }
 
 /// Gemma4 MLP variant: standard (GeGLU) or quantized.
+#[allow(clippy::large_enum_variant)]
 pub enum Gemma4MLPVariant {
     Standard(GemmaMLP),
     Quantized {

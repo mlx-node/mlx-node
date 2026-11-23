@@ -403,7 +403,7 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
 }
 
 fn primary_safetensor_is_mlx(path: &Path) -> Result<bool> {
-    let primary = checkpoint_safetensors_files(path)
+    let primary = checkpoint_safetensors_files(path)?
         .into_iter()
         .next()
         .ok_or_else(|| {

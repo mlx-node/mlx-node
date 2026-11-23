@@ -484,6 +484,8 @@ impl StateDiskCodec for Inkling2StateCodec {
     type State = Inkling2StateAnchor;
     type EncodeCtx<'a> = ();
 
+    const STOP_CHAIN_AT_DEADLINE: bool = true;
+
     fn encode_into(
         &self,
         _ctx: (),
@@ -1000,23 +1002,32 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         deadline: Instant,
     ) -> bool {
+        let has_work = |this: &Self| {
+            let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
+            let has_owed_chain = this
+                .store
+                .entries()
+                .any(|e| e.disk().is_some_and(|c| c.chain_owed));
+            let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
+                d.write_behind
+                    .iter()
+                    .any(|w| this.store.get(w.id).is_some_and(|e| e.disk().is_none()))
+            });
+            has_pending_write || has_owed_chain || has_waiting_wb
+        };
         loop {
             self.poll_offload(coordinator);
+            if !has_work(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
             self.drive_write_behind(coordinator, true);
             let chained = self.chain_step(coordinator, deadline);
             let polled = self.poll_offload(coordinator);
 
-            let has_pending_write = self.disk.as_ref().is_some_and(|d| d.writing());
-            let has_owed_chain = self
-                .store
-                .entries()
-                .any(|e| e.disk().is_some_and(|c| c.chain_owed));
-            let has_waiting_wb = self.disk.as_ref().is_some_and(|d| {
-                d.write_behind
-                    .iter()
-                    .any(|w| self.store.get(w.id).is_some_and(|e| e.disk().is_none()))
-            });
-            if !has_pending_write && !has_owed_chain && !has_waiting_wb {
+            if !has_work(self) {
                 return true;
             }
             if Instant::now() >= deadline {

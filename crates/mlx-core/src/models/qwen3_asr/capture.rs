@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use mlx_audio::capture::{
-    AudioDevice, AudioRing, CaptureOptions, CaptureSource, CaptureStream, InputDevice,
+    AudioDevice, AudioRingControl, CaptureOptions, CaptureSource, CaptureStream, InputDevice,
     PreparedCapture, capture_timing,
 };
 use napi::bindgen_prelude::*;
@@ -106,7 +106,7 @@ impl From<AudioDevice> for Qwen3AsrAudioDevice {
 #[napi]
 pub struct Qwen3AsrCapture {
     stream: Option<Box<dyn CaptureStream>>,
-    ring: Arc<AudioRing>,
+    ring: AudioRingControl,
     worker: Option<JoinHandle<()>>,
     source: Qwen3AsrCaptureSource,
     device_name: String,
@@ -202,7 +202,8 @@ fn start_prepared_capture_with_callback(
     let (_, feed_ms) =
         capture_timing(&audio_options).map_err(|error| Error::from_reason(error.to_string()))?;
     let callback = Arc::new(callback);
-    let worker_ring = ring.clone();
+    let control = ring.control();
+    let mut worker_ring = ring;
     let worker_callback = callback.clone();
     let worker_ready = Arc::new(AtomicBool::new(false));
     let capture_ready = worker_ready.clone();
@@ -273,7 +274,7 @@ fn start_prepared_capture_with_callback(
         .map_err(|error| Error::from_reason(format!("Failed to start capture worker: {error}")))?;
 
     if let Err(error) = stream.start() {
-        ring.stop();
+        control.stop();
         drop(stream);
         let _ = worker.join();
         return Err(Error::from_reason(error.to_string()));
@@ -294,17 +295,17 @@ fn start_prepared_capture_with_callback(
         Ok(())
     })();
     if let Err(error) = prepare_result {
-        ring.stop();
+        control.stop();
         drop(stream);
         let _ = worker.join();
         return Err(error);
     }
     capture_ready.store(true, Ordering::Release);
-    ring.wake();
+    control.wake();
 
     Ok(Qwen3AsrCapture {
         stream: Some(stream),
-        ring,
+        ring: control,
         worker: Some(worker),
         source: source.into(),
         device_name,
@@ -368,6 +369,8 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::time::Instant;
 
+    use mlx_audio::capture::{AudioRingConsumer, audio_ring};
+
     use super::*;
 
     #[derive(Default)]
@@ -415,7 +418,7 @@ mod tests {
     }
 
     fn test_prepared(
-        ring: Arc<AudioRing>,
+        ring: AudioRingConsumer,
         state: Arc<TestStreamState>,
         fail_start: bool,
     ) -> PreparedCapture {
@@ -498,7 +501,7 @@ mod tests {
     #[test]
     fn native_start_failure_stops_worker_without_preparing_model() {
         let (sender, mut commands) = mpsc::unbounded_channel();
-        let ring = Arc::new(AudioRing::new(10));
+        let (_producer, ring) = audio_ring(10);
         let state = Arc::new(TestStreamState::default());
         let (callback, _events) = callback_events();
         let result = start_prepared_capture_with_callback(
@@ -518,11 +521,10 @@ mod tests {
     #[test]
     fn prepare_failure_propagates_and_tears_down_native_stream() {
         let (sender, mut commands) = mpsc::unbounded_channel();
-        let ring = Arc::new(AudioRing::new(10));
+        let (mut producer, ring) = audio_ring(10);
         let state = Arc::new(TestStreamState::default());
         let (callback, _events) = callback_events();
         let startup = {
-            let ring = ring.clone();
             let state = state.clone();
             std::thread::spawn(move || {
                 start_prepared_capture_with_callback(
@@ -538,7 +540,7 @@ mod tests {
             Qwen3AsrCmd::PrepareCapture { reply, .. } => reply,
             _ => panic!("expected PrepareCapture"),
         };
-        ring.push_mono(&[1.0]);
+        producer.push_mono(&[1.0]);
         std::thread::sleep(Duration::from_millis(40));
         assert_no_command(&mut commands);
         prepare_reply
@@ -554,11 +556,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn feeder_gates_on_prepare_serializes_replies_and_delivers_results() {
         let (sender, mut commands) = mpsc::unbounded_channel();
-        let ring = Arc::new(AudioRing::new(10));
+        let (mut producer, ring) = audio_ring(10);
         let state = Arc::new(TestStreamState::default());
         let (callback, events) = callback_events();
         let startup = {
-            let ring = ring.clone();
             let state = state.clone();
             std::thread::spawn(move || {
                 start_prepared_capture_with_callback(
@@ -582,7 +583,7 @@ mod tests {
             }
             _ => panic!("expected PrepareCapture"),
         };
-        ring.push_mono(&[1.0]);
+        producer.push_mono(&[1.0]);
         std::thread::sleep(Duration::from_millis(40));
         assert_no_command(&mut commands);
         prepare_reply.send(Ok(())).unwrap();
@@ -602,7 +603,7 @@ mod tests {
             }
             _ => panic!("expected captured FeedStream"),
         };
-        ring.push_mono(&[2.0]);
+        producer.push_mono(&[2.0]);
         std::thread::sleep(Duration::from_millis(40));
         assert_no_command(&mut commands);
         first_reply.send(Ok(Some(test_result("first")))).unwrap();
@@ -633,12 +634,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn model_exit_is_delivered_and_stop_still_joins_worker() {
         let (sender, mut commands) = mpsc::unbounded_channel();
-        let ring = Arc::new(AudioRing::new(10));
-        ring.push_mono(&[1.0]);
+        let (mut producer, ring) = audio_ring(10);
+        producer.push_mono(&[1.0]);
         let state = Arc::new(TestStreamState::default());
         let (callback, events) = callback_events();
         let startup = {
-            let ring = ring.clone();
             let state = state.clone();
             std::thread::spawn(move || {
                 start_prepared_capture_with_callback(

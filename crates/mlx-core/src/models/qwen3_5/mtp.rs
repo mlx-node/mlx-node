@@ -138,6 +138,7 @@ pub(crate) fn reject_unsupported_fp8_mtp_state(
 /// `config.n_mtp_layers > 0`. The decode loop is the only intended caller
 /// of [`forward`](Self::forward). See module docs for the architecture.
 pub struct Qwen3_5MTPModule {
+    is_moe: bool,
     pre_fc_norm_hidden: RMSNorm,
     pre_fc_norm_embedding: RMSNorm,
     fc: LinearProj,
@@ -199,6 +200,7 @@ impl Qwen3_5MTPModule {
         let norm = RMSNorm::new(hidden, Some(config.rms_norm_eps))?;
 
         Ok(Self {
+            is_moe: moe.is_some(),
             pre_fc_norm_hidden,
             pre_fc_norm_embedding,
             fc,
@@ -549,7 +551,6 @@ impl Qwen3_5MTPModule {
 
             // MLP — dense MLP, MoE switch_mlp + router gate + shared_expert, or
             // already-quantized (no-op).
-            let is_moe_layer = matches!(layer.mlp, MLPType::MoE(_));
             match &mut layer.mlp {
                 MLPType::Dense(MLPVariant::Standard(mlp)) => {
                     if is_quantized {
@@ -693,7 +694,7 @@ impl Qwen3_5MTPModule {
                 }
             }
 
-            if is_moe_layer {
+            if self.is_moe {
                 if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
                     layer.set_input_layernorm_weight_raw(w)?;
                 }

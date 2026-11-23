@@ -10,8 +10,9 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
-use crate::vision::cnn::{load_conv_bn_act, load_hgnetv2_backbone, load_layer_norm, load_linear};
+use crate::vision::cnn::{
+    load_conv_bn_act, load_hgnetv2_backbone, load_layer_norm, load_linear, load_model_safetensors,
+};
 
 use super::config::TextRecConfig;
 use super::ctc_head::CTCHead;
@@ -163,7 +164,7 @@ pub fn load_model(model_path: &str, dict_path: &str) -> Result<TextRecModel> {
     let dictionary = CharDictionary::load(dict_path)?;
 
     // Load weights
-    let params = load_all_safetensors(path, false)?;
+    let params = load_model_safetensors(path)?;
 
     // Build components
     let backbone = load_hgnetv2_backbone(

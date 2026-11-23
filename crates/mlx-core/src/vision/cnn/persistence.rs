@@ -1,12 +1,14 @@
 //! Shared Tensor & HGNetV2 Backbone Weight Loaders
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::nn::linear::Linear;
 use crate::nn::normalization::LayerNorm;
+use crate::utils::safetensors::SafeTensorsFile;
 
 use super::hgnetv2::{
     HGBlock, HGBlockLayer, HGNetV2Backbone, HGNetV2Config, HGNetV2Embeddings, HGNetV2Encoder,
@@ -16,6 +18,19 @@ use super::layers::{
     ConvBNAct, ConvBNActLight, FrozenBatchNorm2d, LearnableAffineBlock, NativeConv2d,
     NativeConvTranspose2d,
 };
+
+/// Load strictly `dir/model.safetensors`, ignoring any sibling `.safetensors` files.
+pub(crate) fn load_model_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
+    let weights_path = dir.join("model.safetensors");
+    if !weights_path.exists() {
+        return Err(Error::from_reason(format!(
+            "Weights file not found: {}",
+            weights_path.display()
+        )));
+    }
+    let st_file = SafeTensorsFile::load(&weights_path)?;
+    st_file.load_tensors(&weights_path)
+}
 
 /// Get a required tensor from a parameter map.
 pub(crate) fn get_tensor(params: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {

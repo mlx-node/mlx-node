@@ -756,6 +756,7 @@ impl LinearProj {
 /// An MLP that can be either standard or quantized.
 ///
 /// Shared between decoder_layer and sparse_moe.
+#[allow(clippy::large_enum_variant)]
 pub enum MLPVariant {
     Standard(MLP),
     Quantized {
@@ -1854,7 +1855,7 @@ impl PlainFp8Weight {
         }
     }
 
-    fn into_source_shape(&self) -> Result<MxArray> {
+    fn to_source_shape(&self) -> Result<MxArray> {
         match self {
             Self::Transposed(weight_t) => weight_t.transpose(Some(&[1, 0])),
             Self::Source(weight) => Ok(weight.clone()),
@@ -1918,6 +1919,9 @@ pub struct QuantizedLinear {
     // Exact symmetric Q8_0 (`mode == "affine", bits == 8, group_size == 32`, native Float16
     // `scales`, `biases` dropped because `biases == -128 * scales` was verified bit-exact at load).
     symmetric_q8: bool,
+    // When `true`, skip the trailing cast back to the activation dtype on mixed-dtype
+    // affine `quantized_matmul` (preserving MLX's promoted dtype, e.g. FP32).
+    preserve_promoted_dtype: bool,
 }
 
 /// One projection's planes and the planned tensor they were written for.
@@ -2075,7 +2079,15 @@ impl QuantizedLinear {
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
+            preserve_promoted_dtype: false,
         }
+    }
+
+    /// Preserve MLX's promoted output dtype on mixed-dtype affine `quantized_matmul`
+    /// instead of casting back to the input activation dtype.
+    pub fn with_preserve_promoted_dtype(mut self, preserve: bool) -> Self {
+        self.preserve_promoted_dtype = preserve;
+        self
     }
 
     /// Whether this projection holds compacted symmetric Q8_0 weights (`bits=8, group_size=32`,
@@ -2391,6 +2403,7 @@ impl QuantizedLinear {
     /// each, which reproduces the unmerged recordings exactly.
     pub fn concat_rows(&self, other: &QuantizedLinear) -> Result<Option<QuantizedLinear>> {
         if self.symmetric_q8 != other.symmetric_q8
+            || self.preserve_promoted_dtype != other.preserve_promoted_dtype
             || self.mode != other.mode
             || self.bits != other.bits
             || self.group_size != other.group_size
@@ -2483,6 +2496,7 @@ impl QuantizedLinear {
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: self.symmetric_q8,
+            preserve_promoted_dtype: self.preserve_promoted_dtype,
         }))
     }
 
@@ -2556,6 +2570,7 @@ impl QuantizedLinear {
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: self.symmetric_q8,
+            preserve_promoted_dtype: self.preserve_promoted_dtype,
         })
     }
 
@@ -2599,6 +2614,7 @@ impl QuantizedLinear {
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
+            preserve_promoted_dtype: false,
         }
     }
 
@@ -2729,6 +2745,7 @@ impl QuantizedLinear {
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
+            preserve_promoted_dtype: false,
         }
     }
 
@@ -3059,7 +3076,7 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        self.forward_with_rounding(x, true)
+        self.forward_with_rounding(x, !self.preserve_promoted_dtype)
     }
 
     /// Like [`Self::forward`], but skips the trailing FP32->BF16 cast when an
@@ -3850,7 +3867,7 @@ impl QuantizedLinear {
                     "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
                 )
             })?;
-            return weight.into_source_shape();
+            return weight.to_source_shape();
         }
         if self.mode == SYM8_MODE {
             return Err(Error::from_reason(
@@ -3952,7 +3969,7 @@ impl QuantizedLinear {
         }
         let ids = MxArray::from_uint32(row_ids, &[row_ids.len() as i64])?;
         if let Some(w) = &self.fp8_dequant_weight {
-            return w.into_source_shape()?.take(&ids, 0);
+            return w.to_source_shape()?.take(&ids, 0);
         }
         if self.mode == FP8_E4M3_MODE {
             return Err(Error::from_reason(
@@ -4148,6 +4165,9 @@ pub struct QuantizedSwitchLinear {
     // Exact symmetric Q8_0 (`mode == "affine", bits == 8, group_size == 32`, native Float16
     // `scales`, `biases == None`, `w = scales * (q_u8 - 128)`).
     symmetric_q8: bool,
+    // When `true`, skip the trailing cast back to the activation dtype on mixed-dtype
+    // affine `gather_qmm` (preserving MLX's promoted dtype, e.g. FP32).
+    preserve_promoted_dtype: bool,
 }
 
 impl QuantizedSwitchLinear {
@@ -4224,6 +4244,7 @@ impl QuantizedSwitchLinear {
             transpose: true,
             fp8_dequant_weight_t: None,
             symmetric_q8: false,
+            preserve_promoted_dtype: false,
         }
     }
 
@@ -4239,6 +4260,7 @@ impl QuantizedSwitchLinear {
             transpose: true,
             fp8_dequant_weight_t: Some(dequant_weight_t),
             symmetric_q8: false,
+            preserve_promoted_dtype: false,
         }
     }
 
@@ -4247,6 +4269,13 @@ impl QuantizedSwitchLinear {
     /// e.g. PrivacyFilter).
     pub fn with_transpose(mut self, transpose: bool) -> Self {
         self.transpose = transpose;
+        self
+    }
+
+    /// Preserve MLX's promoted output dtype on mixed-dtype affine `gather_qmm`
+    /// instead of casting back to the input activation dtype.
+    pub fn with_preserve_promoted_dtype(mut self, preserve: bool) -> Self {
+        self.preserve_promoted_dtype = preserve;
         self
     }
 
@@ -4473,7 +4502,8 @@ impl QuantizedSwitchLinear {
             )
         };
         let mut result = MxArray::from_handle(handle, "gather_qmm")?;
-        if let Some(dtype) = activation_dtype
+        if !self.preserve_promoted_dtype
+            && let Some(dtype) = activation_dtype
             && result.dtype()? != dtype
         {
             result = result.astype(dtype)?;
@@ -4567,6 +4597,7 @@ impl Clone for QuantizedSwitchLinear {
             transpose: self.transpose,
             fp8_dequant_weight_t: self.fp8_dequant_weight_t.clone(),
             symmetric_q8: self.symmetric_q8,
+            preserve_promoted_dtype: self.preserve_promoted_dtype,
         }
     }
 }

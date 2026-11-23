@@ -464,6 +464,12 @@ pub(crate) trait StateDiskCodec {
     type State: StateBytes;
     type EncodeCtx<'a>;
 
+    /// Whether [`StateDiskEngine::chain_step`] breaks immediately when the
+    /// block writer has no room or once `deadline` elapses after enqueuing a
+    /// block. Models that allow a reclaim chain to wait for block room up to
+    /// `deadline` (e.g. Qwen3.5) leave this `false`; Inkling2 sets `true`.
+    const STOP_CHAIN_AT_DEADLINE: bool = false;
+
     /// Key of `entry`'s state object on `tier`. Defaults to the last whole-block
     /// key in `ColdGroup::DFlash2State`.
     fn state_key(&self, tier: &DiskTier, entry: &Entry<Self::State>) -> Option<ColdCacheKey> {
@@ -995,7 +1001,9 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                         lost = true;
                         break 'walk;
                     };
-                    if !manager.has_block_room() && Instant::now() >= deadline {
+                    if !manager.has_block_room()
+                        && (C::STOP_CHAIN_AT_DEADLINE || Instant::now() >= deadline)
+                    {
                         break 'walk;
                     }
                     match manager.capture_and_enqueue_tracked(
@@ -1012,6 +1020,9 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                             cursor.in_flight.insert(key);
                             in_flight = true;
                             out.step.enqueued += 1;
+                            if C::STOP_CHAIN_AT_DEADLINE && Instant::now() >= deadline {
+                                break 'walk;
+                            }
                         }
                         Ok(false) => break 'walk,
                         Err(_) => {

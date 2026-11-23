@@ -2103,13 +2103,37 @@ pub(super) fn apply_weights_inner_with_residency(
         inner.final_norm.set_precise_f32();
     }
 
-    // LM head. The outer `Some(head)` guard preserves the tied-embeddings
-    // path: when `tie_word_embeddings`, `inner.lm_head` is `None` and the head
-    // is never installed even if `lm_head.*` tensors are present. The head
-    // installs through the mode-aware `try_build_ql` dispatch (affine / mxfp8 /
-    // mxfp4 / nvfp4 / sym8) so non-affine quantized heads load, not just affine
-    // — the legacy `Linear::load_quantized` hardcoded affine dequant.
-    if let Some(ref mut head) = inner.lm_head {
+    // LM head. For dense checkpoints the outer `Some(head)` guard preserves
+    // the tied-embeddings path: when `tie_word_embeddings`, `inner.lm_head` is
+    // `None` and the head is never installed even if `lm_head.*` tensors are
+    // present. For MoE checkpoints, a quantized `lm_head` installs directly
+    // into `inner.lm_head` (matching pre-merge `qwen3_5_moe/persistence.rs`;
+    // real tied MoE checkpoints strip `lm_head.*` during `sanitize_weights_moe`).
+    // Both paths install through the mode-aware `try_build_ql` dispatch
+    // (affine / mxfp8 / mxfp4 / nvfp4 / sym8) so non-affine quantized heads
+    // load, not just affine — the legacy `Linear::load_quantized` hardcoded
+    // affine dequant.
+    if is_moe {
+        if is_quantized {
+            if let Some(ql) = try_build_ql(params, "lm_head")? {
+                inner.lm_head = Some(crate::models::quantized_linear::LinearProj::Quantized(ql));
+                release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
+                info!("Loaded quantized lm_head (mode-aware, quantized_matmul on forward)");
+            } else if let Some(ref mut head) = inner.lm_head
+                && let Some(w) = params.get("lm_head.weight")
+            {
+                // Dense fallback (no `.scales`) — same stripped-quant-group
+                // dtype guard as the embedding above.
+                ensure_dense_weight_floating("lm_head.weight", w)?;
+                head.set_weight(w, "lm_head")?;
+            }
+        } else if let Some(ref mut head) = inner.lm_head
+            && let Some(w) = params.get("lm_head.weight")
+        {
+            ensure_dense_weight_floating("lm_head.weight", w)?;
+            head.set_weight(w, "lm_head")?;
+        }
+    } else if let Some(ref mut head) = inner.lm_head {
         if let Some(ql) = try_build_ql(params, "lm_head")? {
             head.set_quantized(ql);
             release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());

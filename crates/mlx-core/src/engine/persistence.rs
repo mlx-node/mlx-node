@@ -88,7 +88,7 @@ pub(crate) fn load_all_safetensors(
     dir: &Path,
     load_vision: bool,
 ) -> Result<HashMap<String, MxArray>> {
-    let files = checkpoint_safetensors_files(dir);
+    let files = checkpoint_safetensors_files(dir)?;
     if files.is_empty() {
         return Err(Error::from_reason(format!(
             "No safetensors files found in {}",

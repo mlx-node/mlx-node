@@ -9,8 +9,9 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
-use crate::vision::cnn::{ConvBNAct, get_tensor, load_conv_bn_act, load_conv2d};
+use crate::vision::cnn::{
+    ConvBNAct, get_tensor, load_conv_bn_act, load_conv2d, load_model_safetensors,
+};
 
 use super::config::PPLCNetConfig;
 use super::model::{
@@ -122,7 +123,7 @@ pub fn load_model(model_path: &str) -> Result<DocOrientationModel> {
     let eps = 1e-5; // BatchNorm epsilon
 
     // Load weights
-    let params = load_all_safetensors(path, false)?;
+    let params = load_model_safetensors(path)?;
 
     // Build backbone
     // Stem: conv1 (3x3, stride=2, 3->16 channels)

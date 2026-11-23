@@ -501,7 +501,7 @@ mod tests {
         let rope = RoPE::with_freqs(dims, false, freqs, None);
         assert!(rope.is_scaled());
 
-        let input = sample(2 * 1 * 1 * dims as usize);
+        let input = sample(2 * dims as usize);
         let x_bf16 = MxArray::from_float32(&input, &[2, 1, 1, dims as i64])
             .unwrap()
             .astype(DType::BFloat16)

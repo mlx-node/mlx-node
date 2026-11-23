@@ -58,15 +58,18 @@ pub fn load_linear_proj(
             })?;
             let biases_key = format!("{prefix}.biases");
             let biases = tensors.get(&biases_key).cloned();
-            Ok(LinearProj::Quantized(QuantizedLinear::new(
-                weight,
-                scales,
-                biases,
-                bias,
-                q.group_size,
-                q.bits,
-                q.mode.clone(),
-            )))
+            Ok(LinearProj::Quantized(
+                QuantizedLinear::new(
+                    weight,
+                    scales,
+                    biases,
+                    bias,
+                    q.group_size,
+                    q.bits,
+                    q.mode.clone(),
+                )
+                .with_preserve_promoted_dtype(true),
+            ))
         }
         None => {
             let weight = tensors
@@ -117,7 +120,8 @@ pub fn load_moe_proj(
                     q.bits,
                     q.mode.clone(),
                 )
-                .with_transpose(false),
+                .with_transpose(false)
+                .with_preserve_promoted_dtype(true),
             ))
         }
         None => {

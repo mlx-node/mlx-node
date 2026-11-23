@@ -23,7 +23,7 @@ pub fn rgb_to_nhwc_f32(
         let mean = mean.unwrap_or([0.0; 3]);
         let std = std.unwrap_or([1.0; 3]);
         let mut buf = Vec::with_capacity(h * w * 3);
-        for rgb in rgb_img.as_raw().chunks_exact(3) {
+        for rgb in rgb_img.as_raw().as_chunks::<3>().0 {
             for (c, &src_c) in channel_map.iter().enumerate() {
                 let val = rgb[src_c] as f32 / 255.0;
                 buf.push((val - mean[c]) / std[c]);

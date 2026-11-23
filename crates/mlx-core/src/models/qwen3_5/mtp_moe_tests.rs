@@ -869,3 +869,133 @@ fn mtp_fc_installs_mode_aware_linearproj() {
         );
     }
 }
+
+/// Regression for Codex Review Finding #5: a dense-flavored MTP layer inside a
+/// MoE checkpoint (`fa_idx ∈ mlp_only_layers`) must still preserve FP32
+/// `input_layernorm` / `post_attention_layernorm` weights under
+/// `compute_dtype = DType::BFloat16`, matching pre-merge `qwen3_5_moe/mtp.rs`.
+/// Gating raw layernorm loading on `matches!(layer.mlp, MLPType::MoE(_))`
+/// downcast dense-flavored MoE MTP layernorms to BF16; gating on `self.is_moe`
+/// preserves FP32 for all MoE MTP layers while keeping dense MTP behavior
+/// unchanged.
+#[test]
+fn dense_flavored_moe_mtp_preserves_fp32_layernorm_dtypes() {
+    let label = "dense_flavored_moe_mtp_preserves_fp32_layernorm_dtypes";
+    let mut cfg = tiny_mtp_cfg();
+    let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+    cfg.mlp_only_layers = Some(vec![fa_idx as i32]);
+    assert!(
+        !cfg.is_moe_layer(fa_idx),
+        "mlp_only_layers override must make fa_idx dense-flavored"
+    );
+
+    let mut mtp = match new_moe_mtp(&cfg) {
+        Ok(m) => m,
+        Err(err) => {
+            let msg = err.reason.to_string();
+            if msg.contains("Metal") || msg.contains("device") {
+                eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                return;
+            }
+            panic!("unexpected Qwen3_5MTPModule::new_with_moe failure: {msg}");
+        }
+    };
+    assert!(
+        matches!(mtp.layers[0].mlp, MLPType::Dense(_)),
+        "MTP DecoderLayer must be dense-flavored when is_moe_layer(fa_idx) is false"
+    );
+
+    let hidden = cfg.hidden_size as usize;
+    let f32_norm =
+        || MxArray::from_float32(&vec![1.0f32; hidden], &[hidden as i64]).expect("f32 norm weight");
+    let mut params = HashMap::from([
+        (
+            "mtp.layers.0.input_layernorm.weight".to_string(),
+            f32_norm(),
+        ),
+        (
+            "mtp.layers.0.post_attention_layernorm.weight".to_string(),
+            f32_norm(),
+        ),
+    ]);
+    let default_plq = PerLayerQuant {
+        bits: 4,
+        group_size: 64,
+        mode: PerLayerMode::Affine,
+        input_amax: None,
+        layout: Default::default(),
+    };
+    let default_gate_plq = PerLayerQuant {
+        bits: 8,
+        group_size: 64,
+        mode: PerLayerMode::Affine,
+        input_amax: None,
+        layout: Default::default(),
+    };
+
+    mtp.apply_weights(
+        &mut params,
+        default_plq,
+        Some(default_gate_plq),
+        &HashMap::new(),
+        DType::BFloat16,
+    )
+    .expect("apply_weights must succeed on dense-flavored MoE MTP");
+
+    assert_eq!(
+        mtp.layers[0]
+            .get_input_layernorm_weight()
+            .dtype()
+            .expect("input_layernorm dtype"),
+        DType::Float32,
+        "dense-flavored MoE MTP input_layernorm must preserve Float32 under BFloat16 compute_dtype"
+    );
+    assert_eq!(
+        mtp.layers[0]
+            .get_post_attention_layernorm_weight()
+            .dtype()
+            .expect("post_attention_layernorm dtype"),
+        DType::Float32,
+        "dense-flavored MoE MTP post_attention_layernorm must preserve Float32 under BFloat16 compute_dtype"
+    );
+
+    // Contrast: a true dense MTP module (`is_moe = false`) still casts
+    // layernorms to `compute_dtype`.
+    let mut dense_mtp =
+        Qwen3_5MTPModule::new(&cfg.to_dense_config()).expect("dense MTP ctor must succeed");
+    let mut dense_params = HashMap::from([
+        (
+            "mtp.layers.0.input_layernorm.weight".to_string(),
+            f32_norm(),
+        ),
+        (
+            "mtp.layers.0.post_attention_layernorm.weight".to_string(),
+            f32_norm(),
+        ),
+    ]);
+    dense_mtp
+        .apply_weights(
+            &mut dense_params,
+            default_plq,
+            None,
+            &HashMap::new(),
+            DType::BFloat16,
+        )
+        .expect("apply_weights must succeed on dense MTP");
+    assert_eq!(
+        dense_mtp.layers[0]
+            .get_input_layernorm_weight()
+            .dtype()
+            .expect("dense input_layernorm dtype"),
+        DType::BFloat16,
+        "dense MTP input_layernorm must cast to BFloat16 compute_dtype"
+    );
+    assert_eq!(
+        dense_mtp.layers[0]
+            .get_post_attention_layernorm_weight()
+            .dtype()
+            .expect("dense post_attention_layernorm dtype"),
+        DType::BFloat16,
+        "dense MTP post_attention_layernorm must cast to BFloat16 compute_dtype"
+    );
+}

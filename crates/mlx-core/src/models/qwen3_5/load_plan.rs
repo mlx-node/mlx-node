@@ -886,7 +886,7 @@ fn safetensors_dtypes(paths: &[PathBuf]) -> Result<Vec<(String, DType)>> {
 /// sidecar, else the split drafter.
 pub(crate) fn checkpoint_header(source: &CheckpointSource, moe: bool) -> Result<CheckpointHeader> {
     let mut raw_dtypes = match source {
-        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir))?,
+        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir)?)?,
         CheckpointSource::Gguf(checkpoint) => imported_dtypes(
             &checkpoint.main.header,
             &checkpoint.plans.0,

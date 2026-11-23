@@ -9,9 +9,9 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::persistence::load_all_safetensors;
 use crate::vision::cnn::{
     ConvBNAct, get_tensor, load_conv_bn_act_with_options, load_conv2d, load_frozen_bn,
+    load_model_safetensors,
 };
 
 use super::config::UVDocConfig;
@@ -193,7 +193,7 @@ pub fn load_model(model_path: &str) -> Result<DocUnwarpModel> {
     let pad = ks / 2;
 
     // Load weights
-    let params = load_all_safetensors(path, false)?;
+    let params = load_model_safetensors(path)?;
 
     // ---- Head: 2x (Conv5x5/s2 + BN + ReLU) ----
     let head_0 = load_conv_bn_relu(

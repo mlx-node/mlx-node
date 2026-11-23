@@ -1,6 +1,7 @@
 //! OS audio device discovery and real-time capture primitives.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -71,11 +72,11 @@ pub struct AudioDevice {
     pub channels: u32,
 }
 
-/// Fixed-capacity single-producer/single-consumer ring. The native audio
-/// callback performs no allocation, lock acquisition, inference, or resampling.
-/// Acquire/release ordering makes each slot visible before the producer
-/// publishes its write cursor.
-pub struct AudioRing {
+/// Fixed-capacity single-producer/single-consumer ring storage. The native
+/// audio callback performs no allocation, lock acquisition, inference, or
+/// resampling. Acquire/release ordering makes each slot visible before the
+/// producer publishes its write cursor.
+struct AudioRingInner {
     data: Box<[UnsafeCell<f32>]>,
     capacity: usize,
     read: AtomicUsize,
@@ -87,12 +88,15 @@ pub struct AudioRing {
     ready: Condvar,
 }
 
-// SPSC discipline: only the native audio callback writes slots and only the
-// consumer worker reads them; cursors publish ownership transitions.
-unsafe impl Sync for AudioRing {}
+// SAFETY: `AudioRingInner` is private and only handed out as a unique
+// (`!Clone`, `!Sync`) `AudioRingProducer`/`AudioRingConsumer` pair plus
+// atomic/condvar-only `AudioRingControl` handles. Only the producer writes
+// `data` slots (`&mut self`) and only the consumer reads them (`&mut self`);
+// acquire/release cursors publish slot ownership transitions.
+unsafe impl Sync for AudioRingInner {}
 
-impl AudioRing {
-    pub fn new(capacity: usize) -> Self {
+impl AudioRingInner {
+    fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capture ring capacity must be positive");
         let mut data = Vec::with_capacity(capacity);
         data.resize_with(capacity, || UnsafeCell::new(0.0));
@@ -110,7 +114,7 @@ impl AudioRing {
     }
 
     #[inline]
-    pub fn push(&self, sample: f32) {
+    fn push(&self, sample: f32) {
         let write = self.write.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
         if write.wrapping_sub(read) >= self.capacity {
@@ -122,22 +126,22 @@ impl AudioRing {
         self.captured.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn push_mono(&self, samples: &[f32]) {
+    fn push_mono(&self, samples: &[f32]) {
         for &sample in samples {
             self.push(sample);
         }
         self.wake();
     }
 
-    pub fn available(&self) -> usize {
+    fn available(&self) -> usize {
         self.write
             .load(Ordering::Acquire)
             .wrapping_sub(self.read.load(Ordering::Relaxed))
     }
 
-    pub fn drain(&self, count: usize) -> Vec<f32> {
+    fn drain(&self, max_samples: usize) -> Vec<f32> {
         let read = self.read.load(Ordering::Relaxed);
-        let count = count.min(self.available());
+        let count = max_samples.min(self.available());
         let mut output = Vec::with_capacity(count);
         for offset in 0..count {
             output.push(unsafe { *self.data[(read + offset) % self.capacity].get() });
@@ -146,30 +150,28 @@ impl AudioRing {
         output
     }
 
-    pub fn wake(&self) {
+    fn wake(&self) {
         self.ready.notify_one();
     }
 
-    pub fn stop(&self) {
+    fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         self.ready.notify_all();
     }
 
-    pub fn is_stopped(&self) -> bool {
+    fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
 
-    pub fn captured_frames(&self) -> u64 {
+    fn captured_frames(&self) -> u64 {
         self.captured.load(Ordering::Relaxed)
     }
 
-    pub fn dropped_frames(&self) -> u64 {
+    fn dropped_frames(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Waits up to `timeout` for a wake or stop notification while `should_wait`
-    /// remains true under the internal wait lock.
-    pub fn wait_timeout_while(&self, timeout: Duration, should_wait: impl FnOnce() -> bool) {
+    fn wait_timeout_while(&self, timeout: Duration, should_wait: impl FnOnce() -> bool) {
         let guard = self
             .wait_lock
             .lock()
@@ -179,10 +181,127 @@ impl AudioRing {
         }
     }
 
-    /// Waits up to `timeout` for a wake or stop notification.
-    pub fn wait_timeout(&self, timeout: Duration) {
+    fn wait_timeout(&self, timeout: Duration) {
         self.wait_timeout_while(timeout, || true);
     }
+}
+
+/// Unique producer half of an SPSC audio capture ring (`Send`, `!Sync`, `!Clone`).
+pub struct AudioRingProducer {
+    inner: Arc<AudioRingInner>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl AudioRingProducer {
+    #[inline]
+    pub fn push(&mut self, sample: f32) {
+        self.inner.push(sample);
+    }
+
+    pub fn push_mono(&mut self, samples: &[f32]) {
+        self.inner.push_mono(samples);
+    }
+
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+}
+
+/// Unique consumer half of an SPSC audio capture ring (`Send`, `!Sync`, `!Clone`).
+pub struct AudioRingConsumer {
+    inner: Arc<AudioRingInner>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl AudioRingConsumer {
+    pub fn available(&self) -> usize {
+        self.inner.available()
+    }
+
+    pub fn drain(&mut self, max_samples: usize) -> Vec<f32> {
+        self.inner.drain(max_samples)
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.inner.is_stopped()
+    }
+
+    /// Waits up to `timeout` for a wake or stop notification while `should_wait`
+    /// remains true under the internal wait lock.
+    pub fn wait_timeout_while(&self, timeout: Duration, should_wait: impl FnOnce() -> bool) {
+        self.inner.wait_timeout_while(timeout, should_wait);
+    }
+
+    /// Waits up to `timeout` for a wake or stop notification.
+    pub fn wait_timeout(&self, timeout: Duration) {
+        self.inner.wait_timeout(timeout);
+    }
+
+    pub fn stop(&self) {
+        self.inner.stop();
+    }
+
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+
+    pub fn captured_frames(&self) -> u64 {
+        self.inner.captured_frames()
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.inner.dropped_frames()
+    }
+
+    pub fn control(&self) -> AudioRingControl {
+        AudioRingControl {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Shared, thread-safe control and metrics handle for an SPSC audio ring
+/// (`Clone`, `Send`, `Sync`). Exposes only atomic/condvar operations.
+#[derive(Clone)]
+pub struct AudioRingControl {
+    inner: Arc<AudioRingInner>,
+}
+
+impl AudioRingControl {
+    pub fn stop(&self) {
+        self.inner.stop();
+    }
+
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.inner.is_stopped()
+    }
+
+    pub fn captured_frames(&self) -> u64 {
+        self.inner.captured_frames()
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.inner.dropped_frames()
+    }
+}
+
+/// Create a fixed-capacity single-producer/single-consumer audio capture ring.
+pub fn audio_ring(capacity: usize) -> (AudioRingProducer, AudioRingConsumer) {
+    let inner = Arc::new(AudioRingInner::new(capacity));
+    (
+        AudioRingProducer {
+            inner: Arc::clone(&inner),
+            _not_sync: PhantomData,
+        },
+        AudioRingConsumer {
+            inner,
+            _not_sync: PhantomData,
+        },
+    )
 }
 
 /// Abstract start/stop handle for a native capture stream.
@@ -195,7 +314,7 @@ pub trait CaptureStream: Send {
 /// ready for a consumer worker to attach and start.
 pub struct PreparedCapture {
     pub stream: Box<dyn CaptureStream>,
-    pub ring: Arc<AudioRing>,
+    pub ring: AudioRingConsumer,
     pub source: CaptureSource,
     pub device_name: String,
     pub sample_rate: u32,
@@ -271,12 +390,10 @@ mod platform {
     pub(super) fn prepare_capture(options: &CaptureOptions) -> Result<PreparedCapture, AudioError> {
         let (ring_seconds, _) = capture_timing(options)?;
         let (_, selected_device) = core_audio::selected_device(options)?;
-        let ring = Arc::new(AudioRing::new(
-            (ring_seconds * selected_device.sample_rate as f64).ceil() as usize,
-        ));
-        let callback_ring = ring.clone();
+        let (mut producer, ring) =
+            audio_ring((ring_seconds * selected_device.sample_rate as f64).ceil() as usize);
         let (source, stream) = core_audio::build(options, move |samples| {
-            callback_ring.push_mono(samples);
+            producer.push_mono(samples);
         })?;
         let sample_rate = stream.device.sample_rate;
         let channels = stream.device.channels;
@@ -357,38 +474,37 @@ mod tests {
 
     #[test]
     fn audio_ring_is_bounded_and_preserves_order() {
-        let ring = AudioRing::new(3);
-        ring.push_mono(&[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(ring.captured_frames(), 3);
-        assert_eq!(ring.dropped_frames(), 1);
-        assert_eq!(ring.drain(2), vec![1.0, 2.0]);
-        ring.push_mono(&[5.0]);
-        assert_eq!(ring.drain(3), vec![3.0, 5.0]);
+        let (mut producer, mut consumer) = audio_ring(3);
+        producer.push_mono(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(consumer.captured_frames(), 3);
+        assert_eq!(consumer.dropped_frames(), 1);
+        assert_eq!(consumer.drain(2), vec![1.0, 2.0]);
+        producer.push_mono(&[5.0]);
+        assert_eq!(consumer.drain(3), vec![3.0, 5.0]);
     }
 
     #[test]
     fn audio_ring_accounts_for_all_frames_with_concurrent_producer_and_consumer() {
         const FRAME_COUNT: usize = 2_000;
-        let ring = Arc::new(AudioRing::new(64));
+        let (mut producer_ring, mut consumer_ring) = audio_ring(64);
+        let control = consumer_ring.control();
         let producer_done = Arc::new(AtomicBool::new(false));
         let producer = {
-            let ring = ring.clone();
             let producer_done = producer_done.clone();
             std::thread::spawn(move || {
                 for frame in 0..FRAME_COUNT {
-                    ring.push(frame as f32);
+                    producer_ring.push(frame as f32);
                 }
                 producer_done.store(true, Ordering::Release);
-                ring.wake();
+                producer_ring.wake();
             })
         };
         let consumer = {
-            let ring = ring.clone();
             let producer_done = producer_done.clone();
             std::thread::spawn(move || {
                 let mut frames = Vec::new();
-                while !producer_done.load(Ordering::Acquire) || ring.available() > 0 {
-                    let drained = ring.drain(7);
+                while !producer_done.load(Ordering::Acquire) || consumer_ring.available() > 0 {
+                    let drained = consumer_ring.drain(7);
                     if drained.is_empty() {
                         std::thread::yield_now();
                     } else {
@@ -400,8 +516,8 @@ mod tests {
         };
         producer.join().unwrap();
         let frames = consumer.join().unwrap();
-        let captured = ring.captured_frames();
-        let dropped = ring.dropped_frames();
+        let captured = control.captured_frames();
+        let dropped = control.dropped_frames();
         assert_eq!(captured as usize, frames.len());
         assert_eq!(captured + dropped, FRAME_COUNT as u64);
         assert!(!frames.is_empty());

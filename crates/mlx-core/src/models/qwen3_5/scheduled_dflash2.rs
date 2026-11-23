@@ -329,6 +329,7 @@ pub(crate) fn propose(
             "scheduled DFlash2 propose: prior verify was not committed",
         ));
     }
+    let _focus = timeline::focus_lane(seq);
     let (mut proposal, drafted) = propose_block(
         draft,
         &inner.embedding,
