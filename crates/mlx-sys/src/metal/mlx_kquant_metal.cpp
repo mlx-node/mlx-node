@@ -1,0 +1,1877 @@
+// Metal dispatch for the K-quant primitives. The kernel choice, tile sizes and
+// launch geometry mirror MLX's affine dispatcher in
+// mlx/backend/metal/quantized.cpp; the kernels are prebuilt into
+// paged_attn.metallib from metal/kquant/{kquant,kquant_nax,kquant_m8_nax}.metal.
+
+#include "mlx_kquant.h"
+#include "mlx_test_counters.h"
+
+#ifdef MLX_NODE_METAL_ENABLED
+
+#include "mlx/allocator.h"
+#include "mlx/backend/common/broadcasting.h"
+#include "mlx/backend/common/reduce.h"
+#include "mlx/backend/common/utils.h"
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/matmul.h"
+#include "mlx/backend/metal/reduce.h"
+#include "mlx/backend/metal/utils.h"
+#include "mlx/transforms_impl.h"
+#include "mlx/utils.h"
+#include "mlx_paged_metallib.h"
+#include "mlx_kquant_register_plan.h"
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <iostream>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string_view>
+#include <unordered_map>
+
+namespace mlx::core::kquant {
+
+namespace {
+
+const char *type_string(Dtype dtype) {
+  switch (dtype) {
+  case float32:
+    return "float";
+  case float16:
+    return "float16_t";
+  case bfloat16:
+    return "bfloat16_t";
+  default:
+    break;
+  }
+  std::ostringstream msg;
+  msg << "[kquant] Only float32, float16 and bfloat16 are supported but got "
+      << dtype << ".";
+  throw std::invalid_argument(msg.str());
+}
+
+} // namespace
+
+// Kernel names, built the way kquant.metal / kquant_nax.metal instantiate
+// them. The dispatchers below and metal_kernel_names() share these builders
+// and parameter tables, so a name the dispatcher can request is a name the
+// coverage test checks against the metallib.
+namespace kernels {
+
+constexpr Mode kModes[] = {Mode::Q6K,    Mode::Q4K,   Mode::Q5K,  Mode::Q3K,
+                           Mode::IQ4NL,  Mode::IQ4XS, Mode::IQ3S, Mode::Q2K,
+                           Mode::IQ2XXS, Mode::IQ2XS, Mode::IQ2S, Mode::IQ3XXS,
+                           Mode::IQ1S,   Mode::IQ1M,  Mode::IQ3S8};
+// The MLX affine modes: the Tiled64 kernels and dequantize only; a
+// row-major affine matmul stays on MLX's own route (eval_gpu refuses it).
+constexpr Mode kAffineModes[] = {Mode::A4G64, Mode::A8G64};
+constexpr Dtype kTypes[] = {float32, float16, bfloat16};
+
+// qmv_wide tiles 2..8 input vectors (multi-row matvecs only) at 8 k-lanes.
+constexpr int kWideMinVectors = 2;
+constexpr int kWideMaxVectors = 8;
+constexpr int kWideKLanes = 8;
+constexpr int kSplitKSmall = 8;
+constexpr int kSplitKLarge = 32;
+
+struct Tile {
+  int bm, bn, bk, wm, wn;
+};
+constexpr Tile kNaxTile{64, 64, 64, 2, 2};
+constexpr Tile kRhsTile{16, 32, 32, 1, 2};
+// gather_qmm_rhs_nax: bm 32 below kRhsNaxWideRows rows per expert, else 64.
+constexpr Tile kRhsNaxTiles[] = {{32, 64, 64, 2, 2}, {64, 64, 64, 2, 2}};
+constexpr int kRhsNaxWideRows = 64;
+
+// qmv_sg8 is bfloat16 only, for the modes kq_sg8::format decodes.
+constexpr Dtype kSg8Type = bfloat16;
+constexpr bool sg8_mode(Mode mode) {
+  return mode == Mode::Q4K || mode == Mode::Q5K || mode == Mode::Q6K ||
+         mode == Mode::IQ4XS;
+}
+
+std::string base(Mode mode, const char *family, Dtype type) {
+  std::string name;
+  concatenate(name, mode_name(mode), "_", family, "_", type_string(type),
+              "_gs_", default_group_size(mode), "_b_", default_bits(mode));
+  return name;
+}
+const char *batch(bool batched) { return batched ? "_batch_1" : "_batch_0"; }
+const char *aligned(bool aligned_n) {
+  return aligned_n ? "_alN_true" : "_alN_false";
+}
+
+std::string qmv(Mode m, Dtype t, bool fast, bool batched) {
+  return base(m, fast ? "qmv_fast" : "qmv", t) + batch(batched);
+}
+std::string qmv_wide(Mode m, Dtype t, int vecs_per_tg, bool batched) {
+  std::string name = base(m, "qmv_wide", t);
+  concatenate(name, "_nv_", vecs_per_tg, "_kl_", kWideKLanes, batch(batched));
+  return name;
+}
+// The Tiled64 layout ("_t64" family suffix, mlx_kquant.h): 2-D weights read
+// as x @ w.T with N % 64 == 0, so only the transposed, aligned, unbatched
+// kernels exist. M = 1 takes qmv_t64, so qmv_wide_t64 starts at nv_2.
+std::string qmv_wide_t64(Mode m, Dtype t, int vecs_per_tg) {
+  std::string name = base(m, "qmv_wide_t64", t);
+  concatenate(name, "_nv_", vecs_per_tg, "_kl_", kWideKLanes, batch(false));
+  return name;
+}
+// qmv_t64: the lane = row M = 1 matvec, rows_per_tg rows x k_splits
+// simdgroups per threadgroup (kquant_qmv_t64 in kquant.h), the row's units
+// in k_splits * (32 / rows_per_tg) chunks. Rows per threadgroup: the largest
+// of 32 / 16 / 8 whose grid still holds 16 threadgroups per core, else 8
+// (tiled_qmv_rows). A decode step is a dependency chain, so the matvec's
+// latency, not its overlapped throughput, is what the step pays: with 32-row
+// threadgroups (N / 32 of them) Gemma-4-E2B decode (N = 256..12288, 40
+// cores) ran 5% behind MLX's qmv (N / 8 threadgroups); 8- and 16-row
+// threadgroups close it (model decode 149-150 vs 150-152 tok/s, rows 32:
+// 141-147), and their ring throughput is no lower at any N up to 27648
+// (0.97-1.16x of MLX), so the 32-row tile is kept only where the grid is
+// already dense. K splits: 16 whenever every chunk gets a whole 32-input
+// unit, 8 below (overlapped throughput is the same for 8..32 splits at
+// every K, within 3%; the shorter chains of 16 measured 3-8% lower latency
+// at K <= 2560).
+// The K-quant modes keep the 32-row threadgroup and the K >= 8192 split
+// rule they shipped with (the Qwen3.8 GGUF decode is bit-for-bit what it
+// was); the sub-tiles and the chunk-count split rule are the affine modes'.
+constexpr int kTiledQmvKSplits[] = {8, 16};
+constexpr int kTiledQmvRows[] = {32, 16, 8};
+constexpr int kTiledQmvDenseGrid = 16;
+constexpr int kTiledQmvLongK = 8192;
+int tiled_qmv_rows(Mode m, int N, int cores) {
+  if (!is_affine(m)) {
+    return kTiledQmvRows[0];
+  }
+  for (int rows : kTiledQmvRows) {
+    if (N / rows >= kTiledQmvDenseGrid * cores) {
+      return rows;
+    }
+  }
+  return kTiledQmvRows[2];
+}
+int tiled_qmv_k_splits(Mode m, int K, int rows) {
+  if (!is_affine(m)) {
+    return K >= kTiledQmvLongK ? kTiledQmvKSplits[1] : kTiledQmvKSplits[0];
+  }
+  const int chunks16 = kTiledQmvKSplits[1] * (32 / rows);
+  return K / 32 >= chunks16 ? kTiledQmvKSplits[1] : kTiledQmvKSplits[0];
+}
+std::string qmv_t64(Mode m, Dtype t, int k_splits, int rows) {
+  std::string name = base(m, "qmv_t64", t);
+  concatenate(name, "_ks_", k_splits, "_rows_", rows);
+  return name;
+}
+std::string qmv_sg8(Mode m, bool tiled = false, bool split = false) {
+  return base(m, split ? (tiled ? "qmv_sg8_split_t64" : "qmv_sg8_split")
+                       : (tiled ? "qmv_sg8_t64" : "qmv_sg8"), kSg8Type);
+}
+// qmm_m8_nax: M <= 32 bfloat16 on the tensor op; 64-column tiles and at
+// most 8 K splits (kquant_m8_nax.h). The Tiled64 layout has the 8-, 16- and
+// 32-row tiers (kM8NaxRows; the tile's rows past M read as zeros) for the
+// affine contracts and the 8-row tier at M = 8 for the K-quant modes;
+// row-major only the 8-row tier of the modes qmv_sg8 does not decode
+// (q3k, q2k, iq4nl and the grid formats), where it measured 1.1-1.4x of
+// qmv_wide on the Qwen3.8 shapes on an M5 Max (the sg8 modes only tie
+// qmv_sg8 row-major, 0.85-1.0x). The legacy iq3s8 stays on qmv_wide
+// row-major, as it always has.
+constexpr int kM8TileCols = 64;
+constexpr int kM8MaxSplits = 8;
+constexpr int kM8NaxRows[] = {8, 16, 32};
+constexpr int kM8NaxMaxRows = 32;
+constexpr bool m8_nax_row_major_mode(Mode mode) {
+  return mode == Mode::Q3K || mode == Mode::IQ4NL || mode == Mode::Q2K ||
+         is_grid(mode);
+}
+// The row tier of an M <= kM8NaxMaxRows dispatch: the smallest that holds M.
+int m8_nax_rows(int M) {
+  for (int rows : kM8NaxRows) {
+    if (M <= rows) {
+      return rows;
+    }
+  }
+  return kM8NaxMaxRows;
+}
+// "qmm_m<rows>_nax" (+ "_t64"): the kernel family of a row tier.
+std::string qmm_m8_nax_family(bool tiled, int rows) {
+  std::string family = "qmm_m";
+  concatenate(family, rows, "_nax");
+  return tiled ? family + "_t64" : family;
+}
+std::string qmm_m8_nax(Mode m, bool tiled = false, int rows = 8) {
+  return base(m, qmm_m8_nax_family(tiled, rows).c_str(), kSg8Type);
+}
+std::string qmv_sg8_prep(int group_size) {
+  std::string name;
+  concatenate(name, "kquant_qmv_sg8_prep_", type_string(kSg8Type), "_gs_",
+              group_size);
+  return name;
+}
+std::string qvm(Mode m, Dtype t, bool batched) {
+  return base(m, "qvm", t) + batch(batched);
+}
+std::string qvm_split_k(Mode m, Dtype t, int split_k) {
+  std::string name = base(m, "qvm_split_k", t);
+  concatenate(name, "_spk_", split_k);
+  return name;
+}
+std::string qmm_t_nax(Mode m, Dtype t, bool aligned_n, bool batched,
+                      bool tiled = false) {
+  std::string name = base(m, tiled ? "qmm_t_nax_t64" : "qmm_t_nax", t);
+  concatenate(name, "_bm", kNaxTile.bm, "_bn", kNaxTile.bn, "_bk", kNaxTile.bk,
+              "_wm", kNaxTile.wm, "_wn", kNaxTile.wn, aligned(aligned_n),
+              batch(batched));
+  return name;
+}
+std::string qmm_t(Mode m, Dtype t, bool aligned_n, bool batched,
+                  bool tiled = false) {
+  return base(m, tiled ? "qmm_t_t64" : "qmm_t", t) + aligned(aligned_n) +
+         batch(batched);
+}
+std::string qmm_n(Mode m, Dtype t, bool batched) {
+  return base(m, "qmm_n", t) + batch(batched);
+}
+std::string qmm_t_splitk(Mode m, Dtype t, bool aligned_n, bool tiled = false) {
+  return base(m, tiled ? "qmm_t_splitk_t64" : "qmm_t_splitk", t) +
+         aligned(aligned_n);
+}
+std::string gather_qmm_t(Mode m, Dtype t, bool aligned_n) {
+  return base(m, "gather_qmm_t", t) + aligned(aligned_n);
+}
+std::string gather_qmm_n(Mode m, Dtype t) { return base(m, "gather_qmm_n", t); }
+std::string gather_qmv(Mode m, Dtype t, bool fast) {
+  return base(m, fast ? "gather_qmv_fast" : "gather_qmv", t);
+}
+std::string gather_qvm(Mode m, Dtype t) { return base(m, "gather_qvm", t); }
+std::string gather_qmm_rhs(Mode m, Dtype t, bool transpose) {
+  std::string name =
+      base(m, transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn", t);
+  concatenate(name, "_bm_", kRhsTile.bm, "_bn_", kRhsTile.bn, "_bk_",
+              kRhsTile.bk, "_wm_", kRhsTile.wm, "_wn_", kRhsTile.wn);
+  return name;
+}
+std::string gather_qmm_rhs_nax(Mode m, Dtype t, const Tile &tile) {
+  std::string name = base(m, "gather_qmm_rhs_nax_nt", t);
+  concatenate(name, "_bm_", tile.bm, "_bn_", tile.bn, "_bk_", tile.bk, "_wm_",
+              tile.wm, "_wn_", tile.wn);
+  return name;
+}
+std::string dequantize(Mode m, Dtype t) { return base(m, "dequantize", t); }
+
+// The modes with the Tiled64 GEMM store epilogues (kquant_nax.metal),
+// bfloat16 only.
+constexpr Mode kEpilogueModes[] = {Mode::Q3K,   Mode::Q4K,   Mode::Q5K, Mode::Q6K,
+                                   Mode::IQ4NL, Mode::IQ4XS, Mode::IQ3S};
+constexpr bool epilogue_mode(Mode mode) {
+  for (Mode m : kEpilogueModes) {
+    if (m == mode) {
+      return true;
+    }
+  }
+  return false;
+}
+std::string qmm_t_nax_t64_epilogue(Mode m, StoreEpilogue ep) {
+  std::string name = base(m,
+                          ep == StoreEpilogue::Residual ? "qmm_t_nax_t64_res"
+                                                        : "qmm_t_nax_t64_swiglu",
+                          bfloat16);
+  concatenate(name, "_bm", kNaxTile.bm, "_bn", kNaxTile.bn, "_bk", kNaxTile.bk,
+              "_wm", kNaxTile.wm, "_wn", kNaxTile.wn);
+  return name;
+}
+
+} // namespace kernels
+
+std::vector<KernelName> metal_kernel_names() {
+  using namespace kernels;
+  std::vector<KernelName> names;
+  auto add = [&names](std::string name, bool nax = false) {
+    names.push_back({std::move(name), nax});
+  };
+  for (Dtype t : kTypes) {
+    for (Mode m : kModes) {
+      for (bool b : {false, true}) {
+        add(qmv(m, t, false, b));
+        add(qmv(m, t, true, b));
+        for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
+          add(qmv_wide(m, t, v, b));
+        }
+        add(qvm(m, t, b));
+        add(qmm_n(m, t, b));
+        for (bool a : {false, true}) {
+          add(qmm_t(m, t, a, b));
+          add(qmm_t_nax(m, t, a, b), true);
+        }
+      }
+      for (int split_k : {kSplitKSmall, kSplitKLarge}) {
+        add(qvm_split_k(m, t, split_k));
+      }
+      for (bool a : {false, true}) {
+        add(qmm_t_splitk(m, t, a));
+        add(gather_qmm_t(m, t, a));
+      }
+      add(gather_qmm_n(m, t));
+      add(gather_qmv(m, t, false));
+      add(gather_qmv(m, t, true));
+      add(gather_qvm(m, t));
+      add(gather_qmm_rhs(m, t, true));
+      add(gather_qmm_rhs(m, t, false));
+      for (const Tile &tile : kRhsNaxTiles) {
+        add(gather_qmm_rhs_nax(m, t, tile), true);
+      }
+    }
+  }
+  // Dequantize and the Tiled64 family (transposed, aligned, unbatched
+  // only): every mode, the affine ones included.
+  auto tiled = [&](Mode m, Dtype t) {
+    add(dequantize(m, t));
+    for (int v = kWideMinVectors; v <= kWideMaxVectors; ++v) {
+      add(qmv_wide_t64(m, t, v));
+    }
+    for (int rows : kTiledQmvRows) {
+      for (int ks : kTiledQmvKSplits) {
+        add(qmv_t64(m, t, ks, rows));
+      }
+    }
+    add(qmm_t(m, t, true, false, true));
+    add(qmm_t_splitk(m, t, true, true));
+    add(qmm_t_nax(m, t, true, false, true), true);
+  };
+  for (Dtype t : kTypes) {
+    for (Mode m : kModes) {
+      tiled(m, t);
+    }
+    for (Mode m : kAffineModes) {
+      tiled(m, t);
+    }
+  }
+  for (Mode m : kModes) {
+    if (m8_nax_row_major_mode(m)) {
+      add(qmm_m8_nax(m), true);
+    }
+    for (int rows : kM8NaxRows) {
+      add(qmm_m8_nax(m, true, rows), true);
+    }
+  }
+  for (Mode m : kAffineModes) {
+    for (int rows : kM8NaxRows) {
+      add(qmm_m8_nax(m, true, rows), true);
+    }
+  }
+  for (Mode m : kEpilogueModes) {
+    for (StoreEpilogue ep : {StoreEpilogue::Residual, StoreEpilogue::Swiglu}) {
+      add(qmm_t_nax_t64_epilogue(m, ep), true);
+    }
+  }
+  // Head-only M8 instantiation stores the same tensor-op accumulator as F32.
+  add("q6k_head_f32_m8_nax_t64", true);
+  add("q4k_gather_t64_m1");
+  add("q5k_gather_t64_m1");
+  add("q6k_gather_t64_m1");
+  std::vector<int> prep_group_sizes;
+  add(qmv_sg8(Mode::A4G64, true));
+  add(qmv_sg8(Mode::A4G64, true, true));
+  for (Mode m : kModes) {
+    if (!sg8_mode(m)) {
+      continue;
+    }
+    add(qmv_sg8(m));
+    add(qmv_sg8(m, false, true));
+    if (m == Mode::Q4K) {
+      add(qmv_sg8(m, true));
+      add(qmv_sg8(m, true, true));
+    }
+    int gs = default_group_size(m);
+    if (std::find(prep_group_sizes.begin(), prep_group_sizes.end(), gs) ==
+        prep_group_sizes.end()) {
+      prep_group_sizes.push_back(gs);
+      add(qmv_sg8_prep(gs));
+    }
+  }
+  return names;
+}
+
+namespace {
+
+// The prebuilt pipeline for `kname`. Function-constant kernels pass the
+// specialization in `hash_name` / `func_consts`.
+MTL::ComputePipelineState *
+load_kernel(metal::Device &d, const std::string &kname,
+            const std::string &hash_name = "",
+            const metal::MTLFCList &func_consts = {}) {
+  return fast::paged::get_prebuilt_kernel(d, "kquant", "K-quant", kname,
+                                          hash_name, func_consts);
+}
+
+// Under MLX_METAL_COMMAND_TRACE (any value >= 1, the fork's command-trace
+// diagnostic), prints each distinct (kernel, M, N, K) the dispatcher
+// requests, once.
+void log_route(const std::string &kname, int M, int N, int K) {
+  static const bool enabled = env::get_var("MLX_METAL_COMMAND_TRACE", 0) >= 1;
+  if (!enabled) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::string key;
+  concatenate(key, kname, " M=", M, " N=", N, " K=", K);
+  if (seen.insert(key).second) {
+    std::cerr << "[kquant route] " << key << std::endl;
+  }
+}
+
+MTL::ComputePipelineState *get_kernel(metal::Device &d,
+                                      std::string_view family,
+                                      const std::string &kname, int M = 0,
+                                      int N = 0, int K = 0) {
+  bridge_testing::record(family);
+  log_route(kname, M, N, K);
+  return load_kernel(d, kname);
+}
+
+inline array ensure_row_contiguous(const array &x, const Stream &s) {
+  if (!x.flags().row_contiguous) {
+    array x_copy = contiguous_copy_gpu(x, s);
+    metal::get_command_encoder(s).add_temporary(x_copy);
+    return x_copy;
+  }
+  return x;
+}
+
+inline array ensure_row_contiguous_matrix(const array &x, const Stream &s) {
+  if (x.ndim() < 2) {
+    if (x.strides()[0] == 1) {
+      return x;
+    }
+  } else {
+    auto stride_0 = x.strides()[x.ndim() - 2];
+    auto stride_1 = x.strides()[x.ndim() - 1];
+    if (stride_0 == x.shape(-1) && stride_1 == 1) {
+      return x;
+    }
+  }
+  array x_copy = contiguous_copy_gpu(x, s);
+  metal::get_command_encoder(s).add_temporary(x_copy);
+  return x_copy;
+}
+
+inline int get_qmv_batch_limit(int D, int O, metal::Device &d) {
+  auto arch_size = d.get_architecture().back();
+  auto arch_gen = d.get_architecture_gen();
+  if (arch_gen == 13 || arch_gen == 14) {
+    switch (arch_size) {
+    case 'd':
+      if (D <= 2048 && O <= 2048) {
+        return 32;
+      } else if (D <= 4096 && O <= 4096) {
+        return 18;
+      } else {
+        return 12;
+      }
+    default:
+      if (D <= 2048 && O <= 2048) {
+        return 14;
+      } else if (D <= 4096 && O <= 4096) {
+        return 10;
+      } else {
+        return 6;
+      }
+    }
+  } else {
+    switch (arch_size) {
+    case 'd':
+      if (D <= 2048 && O <= 2048) {
+        return 32;
+      } else if (D <= 4096 && O <= 4096) {
+        return 18;
+      } else {
+        return 12;
+      }
+    default:
+      if (D <= 2048 && O <= 2048) {
+        return 18;
+      } else if (D <= 4096 && O <= 4096) {
+        return 12;
+      } else {
+        return 10;
+      }
+    }
+  }
+}
+
+inline int add_strides_and_shapes(metal::CommandEncoder &enc, bool skip,
+                                  const array &x, const array &w,
+                                  const array &scales, const array &biases,
+                                  int offset) {
+  if (skip) {
+    return 0;
+  }
+  int x_batch_ndims = x.ndim() - 2;
+  int w_batch_ndims = w.ndim() - 2;
+  enc.set_bytes(x_batch_ndims, offset++);
+  enc.set_vector_bytes(x.shape(), offset++);
+  enc.set_vector_bytes(x.strides(), offset++);
+  enc.set_bytes(w_batch_ndims, offset++);
+  enc.set_vector_bytes(w.shape(), offset++);
+  enc.set_vector_bytes(w.strides(), offset++);
+  enc.set_vector_bytes(scales.strides(), offset++);
+  enc.set_vector_bytes(biases.strides(), offset++);
+  return offset;
+}
+
+inline int add_gather_strides_and_shapes(metal::CommandEncoder &enc,
+                                         const array &lhs_indices,
+                                         const array &rhs_indices, int offset) {
+  auto [shape, strides] = collapse_contiguous_dims(
+      lhs_indices.shape(), {lhs_indices.strides(), rhs_indices.strides()});
+  int ndims = shape.size();
+  enc.set_bytes(ndims, offset++);
+  enc.set_vector_bytes(shape, offset++);
+  enc.set_vector_bytes(strides[0], offset++);
+  enc.set_vector_bytes(strides[1], offset++);
+  return offset;
+}
+
+void set_weights(metal::CommandEncoder &enc, const array &w,
+                 const array &scales, const array &biases) {
+  enc.set_input_array(w, 0);
+  enc.set_input_array(scales, 1);
+  enc.set_input_array(biases, 2);
+}
+
+struct Operands {
+  const array &x;
+  const array &w;
+  const array &scales;
+  const array &biases;
+  array &out;
+  int group_size;
+  int bits;
+  Mode mode;
+  metal::Device &d;
+  const Stream &s;
+  // Tiled64 weight layout (mlx_kquant.h): routes only to the "_t64" kernels.
+  bool tiled = false;
+};
+
+// Kernel-family counter names carry the layout so a test can see that a
+// tiled tensor never reached a row-major kernel.
+std::string family_of(const char *family, bool tiled) {
+  return tiled ? std::string(family) + "_t64" : std::string(family);
+}
+
+void qmv(const Operands &o, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  int bn = 8;
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  bool fast = N % bn == 0 && K % 512 == 0;
+  auto kernel = get_kernel(o.d, fast ? "qmv_fast" : "qmv",
+                           kernels::qmv(o.mode, o.x.dtype(), fast, B > 1), M,
+                           N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  add_strides_and_shapes(enc, B <= 1, o.x, o.w, o.scales, o.biases, 7);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// K-quants share affine's ALU-per-load balance, so qmv_wide only beats qmv on
+// gen-15+.
+inline bool use_qmv_wide(metal::Device &d) {
+  return d.get_architecture_gen() >= 15;
+}
+
+int gpu_core_count(metal::Device &d);
+
+// The tiled M = 1 matvec, lane = row: grid (M, N / rows) of 32 x k_splits
+// threads (kquant_qmv_t64). Measured against qmv_wide_t64 nv_1 at 8 and 4
+// k-lanes on the Qwen3.8 shapes; lane = row won.
+void qmv_t64(const Operands &o, int M, int N, int K) {
+  const int rows_per_tg = kernels::tiled_qmv_rows(o.mode, N, gpu_core_count(o.d));
+  const int k_splits = kernels::tiled_qmv_k_splits(o.mode, K, rows_per_tg);
+  if (bridge_testing::counting) {
+    bridge_testing::record("qmv_t64_ks" + std::to_string(k_splits));
+    bridge_testing::record("qmv_t64_rows" + std::to_string(rows_per_tg));
+  }
+  auto kernel = get_kernel(
+      o.d, "qmv_t64",
+      kernels::qmv_t64(o.mode, o.x.dtype(), k_splits, rows_per_tg), M, N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.dispatch_threadgroups(MTL::Size(M, N / rows_per_tg, 1),
+                            MTL::Size(32, k_splits, 1));
+}
+
+void qmv_wide(const Operands &o, int M, int N, int K) {
+  // Each tile re-reads the weights: fewest tiles, then the smallest tile that
+  // fills them. Up to 8 vectors per tile only when N is large enough that the
+  // row dimension already saturates the GPU.
+  const int tile_cap = N >= 2048 ? kernels::kWideMaxVectors : 5;
+  int n_tiles = (M + tile_cap - 1) / tile_cap;
+  int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+  constexpr int k_lanes = kernels::kWideKLanes;
+  constexpr int num_simdgroups = 2;
+  int B = o.out.size() / M / N;
+  bool batched = B > 1;
+  int rows_per_tg = (32 / k_lanes) * num_simdgroups;
+
+  MTL::Size group_dims(32, num_simdgroups, 1);
+  MTL::Size grid_dims((M + vecs_per_tg - 1) / vecs_per_tg,
+                      (N + rows_per_tg - 1) / rows_per_tg, B);
+
+  if (bridge_testing::counting) {
+    bridge_testing::record(family_of("qmv_wide", o.tiled) + "_nv" +
+                           std::to_string(vecs_per_tg));
+  }
+  auto kernel = get_kernel(
+      o.d, family_of("qmv_wide", o.tiled),
+      o.tiled ? kernels::qmv_wide_t64(o.mode, o.x.dtype(), vecs_per_tg)
+              : kernels::qmv_wide(o.mode, o.x.dtype(), vecs_per_tg, batched),
+      M, N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  add_strides_and_shapes(enc, !batched, o.x, o.w, o.scales, o.biases, 8);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// 8-row bfloat16 matvec on gen-17+, where it beats qmv_wide. The kernel has no
+// batch strides, no column tail and only aligned vector loads (x: uint2,
+// scales: uint4, biases: half2).
+bool use_qmv_sg8(const Operands &o, int M, int N) {
+  if (M != 8 || o.d.get_architecture_gen() < 17) {
+    return false;
+  }
+  if (!kernels::sg8_mode(o.mode)) {
+    return false;
+  }
+  return o.x.dtype() == kernels::kSg8Type && o.out.size() == size_t(8) * N &&
+         N % 32 == 0 && o.x.offset() % 8 == 0 && o.scales.offset() % 16 == 0 &&
+         o.biases.offset() % 4 == 0;
+}
+
+// The prepared path consumes the exact existing bt/sums packing; a fused
+// producer may call it without a separate activation-preparation dispatch.
+int gpu_core_count(metal::Device &d);
+array m8_nax_counters(const Stream &s, int tiles);
+void qmv_sg8_prepared(const Operands &o, int N, int K,
+                      const array &bt, const array &sums) {
+  auto &enc = metal::get_command_encoder(o.s);
+  const char* option = std::getenv("MLX_KQUANT_SG8_SPLIT_K");
+  const int splits = option && std::string_view(option) == "1"
+      ? sg8_register_splits(N,K,gpu_core_count(o.d)) : 1;
+  if (splits > 1) {
+    array partials({splits, 8, N}, float32, nullptr, {});
+    partials.set_data(allocator::malloc(partials.nbytes()));
+    enc.add_temporary(partials);
+    auto counters = m8_nax_counters(o.s, N / 32);
+    auto kernel = get_kernel(o.d, family_of("qmv_sg8_split", o.tiled),
+        kernels::qmv_sg8(o.mode, o.tiled, true), 8, N, K);
+    if (bridge_testing::counting)
+      bridge_testing::record("qmv_sg8_splits" + std::to_string(splits));
+    enc.set_compute_pipeline_state(kernel);
+    set_weights(enc, o.w, o.scales, o.biases);
+    enc.set_input_array(bt,3);
+    enc.set_input_array(sums,4);
+    enc.set_output_array(o.out,5);
+    enc.set_bytes(K,6);
+    enc.set_bytes(N,7);
+    enc.set_output_array(partials,8);
+    enc.set_output_array(counters,9);
+    enc.set_bytes(splits,10);
+    enc.dispatch_threadgroups(MTL::Size(N / 32, splits, 1), MTL::Size(128,1,1));
+    return;
+  }
+  auto kernel = get_kernel(o.d, family_of("qmv_sg8", o.tiled),
+                           kernels::qmv_sg8(o.mode, o.tiled), 8, N, K);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(bt, 3);
+  enc.set_input_array(sums, 4);
+  enc.set_output_array(o.out, 5);
+  enc.set_bytes(K, 6);
+  enc.set_bytes(N, 7);
+  enc.dispatch_threadgroups(MTL::Size(N / 32, 1, 1), MTL::Size(128, 1, 1));
+}
+
+// Two dispatches: the prep packs x into MMA operand order with fp32 per-group
+// row sums, then qmv_sg8 runs over N / 32 threadgroups.
+void qmv_sg8(const Operands &o, int N, int K) {
+  const int sum_group_size = o.mode == Mode::A4G64 ? 32 : o.group_size;
+  array bt({K * 4}, uint32, nullptr, {});
+  array sums({(K / sum_group_size) * 8}, float32, nullptr, {});
+  bt.set_data(allocator::malloc(bt.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.add_temporary(bt);
+  enc.add_temporary(sums);
+
+  auto prep = load_kernel(o.d, kernels::qmv_sg8_prep(sum_group_size));
+  enc.set_compute_pipeline_state(prep);
+  enc.set_input_array(o.x, 0);
+  enc.set_output_array(bt, 1);
+  enc.set_output_array(sums, 2);
+  enc.set_bytes(K, 3);
+  enc.dispatch_threadgroups(MTL::Size((K / 32 + 3) / 4, 1, 1),
+                            MTL::Size(128, 1, 1));
+
+  qmv_sg8_prepared(o, N, K, bt, sums);
+}
+
+// GPU cores from the IORegistry `gpu-core-count` of the accelerator entry
+// behind the Metal device (its registry ID, or an ancestor up to 4 levels;
+// the first IOAccelerator service as the fallback). Metal itself does not
+// expose the count. 0 when nothing publishes it.
+int gpu_reported_core_count(metal::Device &d) {
+  static const int cores = [&d]() {
+    int count = 0;
+    auto read = [&count](io_registry_entry_t entry) {
+      if (!entry) {
+        return false;
+      }
+      CFTypeRef value = IORegistryEntryCreateCFProperty(
+          entry, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+      if (value) {
+        int64_t number = 0;
+        if (CFGetTypeID(value) == CFNumberGetTypeID() &&
+            CFNumberGetValue(static_cast<CFNumberRef>(value),
+                             kCFNumberSInt64Type, &number) &&
+            number > 0 && number <= 4096) {
+          count = static_cast<int>(number);
+        }
+        CFRelease(value);
+      }
+      return count != 0;
+    };
+    io_registry_entry_t entry = IOServiceGetMatchingService(
+        kIOMainPortDefault,
+        IORegistryEntryIDMatching(d.mtl_device()->registryID()));
+    for (int depth = 0; entry && depth < 4 && !read(entry); ++depth) {
+      io_registry_entry_t parent = MACH_PORT_NULL;
+      if (IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent) !=
+          KERN_SUCCESS) {
+        parent = MACH_PORT_NULL;
+      }
+      IOObjectRelease(entry);
+      entry = parent;
+    }
+    if (entry) {
+      IOObjectRelease(entry);
+    }
+    if (!count) {
+      io_registry_entry_t accelerator = IOServiceGetMatchingService(
+          kIOMainPortDefault, IOServiceMatching("IOAccelerator"));
+      if (accelerator) {
+        read(accelerator);
+        IOObjectRelease(accelerator);
+      }
+    }
+    return count;
+  }();
+  return cores;
+}
+
+// The reported cores, or 8 when nothing publishes them: the smallest Apple
+// silicon GPUs have 7 to 10, so the split rule errs towards fewer splits.
+int gpu_core_count(metal::Device &d) {
+  const int cores = gpu_reported_core_count(d);
+  return cores ? cores : 8;
+}
+
+// Source Splash policy: staged decode on Apple GPU family 10 or later,
+// at least 16 cores. The experiment is opt-in and applies only at physical M8.
+bool staged_decode_spread(metal::Device& d) {
+  const char* option = std::getenv("MLX_KQUANT_STAGED_SPREAD");
+  return option && std::string_view(option) == "1" &&
+      d.mtl_device()->supportsFamily(MTL::GPUFamilyApple10) && gpu_core_count(d) >= 16;
+}
+
+// K splits of a tensor-op dispatch (Splash LinearGguf.cpp decodeSplits,
+// staged tier {6 threadgroups per core, 512 inputs per partition}): doubles
+// while the grid holds fewer than 6 threadgroups per core, each partition
+// would keep 512 inputs of whole 32-input units, and the fp32 partials the
+// splits publish (splits x rows x N x 4 bytes, written and read back) stay
+// under an eighth of the weight bytes (N x K x bits / 8): the taller row
+// tiers publish 2-4x the partials of the 8-row one, and on the short-K wide-N
+// shapes (K = 2560, N = 12288, 32 rows) the unbounded split measured 0.83x of
+// MLX's GEMM where one partition runs at 1.0x (M5 Max).
+// The partials bound and the taller tiers are the affine modes'; the K-quant
+// modes split as they shipped (the Qwen3.8 GGUF verify is bit-for-bit what
+// it was).
+int qmm_m8_nax_splits(Mode mode, int N, int K, int cores, int rows, int bits) {
+  const int64_t tiles = N / kernels::kM8TileCols;
+  int splits = 1;
+  while (splits < kernels::kM8MaxSplits &&
+         tiles * splits < int64_t(6) * cores && K / (2 * splits) >= 512 &&
+         (K / 32) % (2 * splits) == 0 &&
+         (!is_affine(mode) ||
+          int64_t(2 * splits) * rows * 4 * 8 <= int64_t(K) * bits / 8)) {
+    splits *= 2;
+  }
+  return splits;
+}
+
+// Tensor-op matmul on gen-17+ (is_nax_available): M = 8 row-major, M = 8..32
+// (the 8/16/32-row tiers, affine) or M = 8 (K-quant) Tiled64; whole 64-column tiles, whole 32-input
+// units, no batch, aligned operands (x rows as 16-byte tensor rows, scales as
+// ushort pairs, biases as half2 pairs). Every Tiled64 mode (1.18-1.40x of
+// qmv_sg8 at M = 8 on the Qwen3.8 shapes; the taller tiers stream the
+// weights once where qmv_wide re-reads them per 8-row tile); row-major only
+// the modes of kernels::m8_nax_row_major_mode. The grid must reach the
+// target of m8_nax_grid_reaches_target: when K is too short to split that
+// far, the few long threadgroups leave the GPU idle (N = 2048, K = 1536
+// affine at M = 8 measured 0.44x of MLX's qmv_wide on 64 threadgroups,
+// N = 6144, K = 2048 0.99x on 192, N = 9216, K = 2560 1.23x on 288, M5 Max).
+//
+// The grid rule: at M = 8 the alternative, qmv_wide on N / 8 row
+// threadgroups, streams the weights once too, so the tier must fill the GPU
+// as the split rule intends (6 threadgroups per core); above 8 the
+// alternatives re-read the weights (qmv_wide's 8-row tiles) or run the GEMM's
+// mostly empty 64-row tiles, so two threadgroups per core already win
+// (N = 1536, K = 6144: 96 threadgroups 1.6x the GEMM at M = 12..16; N = 2048,
+// K = 1536: 64 threadgroups 0.8x, M5 Max).
+// The K-quant modes take the 8-row tier at M = 8 on every grid, as they
+// shipped; the taller tiers and the grid rule are the affine modes'.
+bool m8_nax_grid_reaches_target(Mode mode, int M, int N, int K, int bits,
+                                metal::Device &d) {
+  if (!is_affine(mode)) {
+    return M == 8;
+  }
+  const int cores = gpu_core_count(d);
+  const int64_t grid =
+      int64_t(N / kernels::kM8TileCols) *
+      qmm_m8_nax_splits(mode, N, K, cores, kernels::m8_nax_rows(M), bits);
+  return grid >= int64_t(M == 8 ? 6 : 2) * cores;
+}
+
+bool use_qmm_m8_nax(const Operands &o, int M, int N, int K) {
+  if (!metal::is_nax_available()) {
+    return false;
+  }
+  if (o.tiled ? (M < 8 || M > kernels::kM8NaxMaxRows)
+              : (M != 8 || !kernels::m8_nax_row_major_mode(o.mode))) {
+    return false;
+  }
+  // The affine modes load a super-block's bfloat16 companions as one uint2
+  // / uint4.
+  const int64_t companion_align = is_affine(o.mode) ? 16 : 2;
+  return o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
+         o.out.size() == size_t(M) * N && N % kernels::kM8TileCols == 0 &&
+         K % 32 == 0 && o.x.offset() % 8 == 0 &&
+         o.scales.offset() % companion_align == 0 &&
+         o.biases.offset() % companion_align == 0 &&
+         m8_nax_grid_reaches_target(o.mode, M, N, K, o.bits, o.d);
+}
+
+// The split-K arrival counters of a stream: one uint32 per 64-column tile,
+// zero between dispatches (the last arriver of a tile resets its counter).
+// Bound as an output so the encoder orders dispatches that share them; each
+// stream has its own because MLX fences outputs per stream only.
+array m8_nax_counters(const Stream &s, int tiles) {
+  static std::mutex mutex;
+  static std::unordered_map<int, array> by_stream;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = by_stream.find(s.index);
+  if (it != by_stream.end() && it->second.size() >= size_t(tiles)) {
+    return it->second;
+  }
+  auto &enc = metal::get_command_encoder(s);
+  int size = std::max(tiles, 4096);
+  array zero(uint32_t(0), uint32);
+  array counters({size}, uint32, nullptr, {});
+  fill_gpu(zero, counters, s);
+  enc.add_temporary(zero);
+  if (it != by_stream.end()) {
+    enc.add_temporary(it->second);
+    it->second = counters;
+  } else {
+    by_stream.emplace(s.index, counters);
+  }
+  return counters;
+}
+
+// One dispatch: grid (N / 64, splits) of 64 threads. Splits > 1 publish fp32
+// partials [splits][rows][N] in a temporary; the last-arriving partition of
+// a tile sums them in split order (kquant_m8_nax.h).
+void qmm_m8_nax(const Operands &o, int M, int N, int K, bool lane_tier = false) {
+  const int tiles = N / kernels::kM8TileCols;
+  const int rows = o.tiled ? kernels::m8_nax_rows(M) : 8;
+  const int splits = qmm_m8_nax_splits(o.mode, N, K, gpu_core_count(o.d), rows, o.bits);
+  if (bridge_testing::counting) {
+    bridge_testing::record("qmm_m8_nax_splits" + std::to_string(splits));
+  }
+  auto kernel = get_kernel(o.d, kernels::qmm_m8_nax_family(o.tiled, rows),
+                           kernels::qmm_m8_nax(o.mode, o.tiled, rows), M, N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  array partials = o.out;
+  array counters = o.out;
+  if (splits > 1) {
+    partials = array({splits * rows * N}, float32, nullptr, {});
+    partials.set_data(allocator::malloc(partials.nbytes()));
+    enc.add_temporary(partials);
+    counters = m8_nax_counters(o.s, tiles);
+  }
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_output_array(partials, 5);
+  enc.set_output_array(counters, 6);
+  enc.set_bytes(K, 7);
+  enc.set_bytes(N, 8);
+  enc.set_bytes(splits, 9);
+  enc.set_bytes(M, 10);
+  const uint32_t spread = (M == 8 || lane_tier) && staged_decode_spread(o.d);
+  enc.set_bytes(spread, 11);
+  enc.dispatch_threadgroups(MTL::Size(tiles, splits, 1), MTL::Size(64, 1, 1));
+}
+
+// The K-quant qvm kernels tile 32 / pack_factor packs per thread, so a
+// simdgroup covers 32 columns whatever the group size (16 for q6k/q3k).
+constexpr int qvm_columns_per_simdgroup = 32;
+
+void qvm_split_k(const Operands &o, int M, int N, int K) {
+  auto &enc = metal::get_command_encoder(o.s);
+  const auto &x = o.x;
+  const auto &w = o.w;
+  const auto &scales = o.scales;
+  const auto &biases = o.biases;
+
+  int split_k = K > 8192 ? kernels::kSplitKLarge : kernels::kSplitKSmall;
+  int split_D = (K + split_k - 1) / split_k;
+  int B = o.out.size() / M / N;
+  B *= split_k;
+
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  // Round up: IQ4_NL allows N in 32s, and the kernel skips a simdgroup whose
+  // columns start at or past N.
+  int bn = qvm_columns_per_simdgroup * num_simdgroups;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  auto x_shape = x.shape();
+  auto x_strides = x.strides();
+  if (x_shape.size() == 1) {
+    x_shape.insert(x_shape.begin(), 1);
+    x_strides.insert(x_strides.begin(), 0);
+  }
+  int x_ndim = x_shape.size();
+  int x_batch_ndims = x_ndim - 2;
+  int w_batch_ndims = w.ndim() - 2;
+  auto w_shape = w.shape();
+  auto w_strides = w.strides();
+  auto s_strides = scales.strides();
+
+  x_shape.insert(x_shape.end() - 2, split_k);
+  x_shape.back() /= split_k;
+  x_strides.insert(x_strides.end() - 2, split_D);
+  x_strides[x_ndim - 1] = split_D;
+  x_batch_ndims += 1;
+
+  w_shape.insert(w_shape.end() - 2, split_k);
+  w_shape[w.ndim() - 1] /= split_k;
+  w_strides.insert(w_strides.end() - 2, split_D * w.shape(-1));
+  w_batch_ndims += 1;
+  s_strides.insert(s_strides.end() - 2, split_D * scales.shape(-1));
+
+  int final_block_size = K - (split_k - 1) * split_D;
+
+  auto temp_shape = o.out.shape();
+  if (temp_shape.size() == 1) {
+    temp_shape.insert(temp_shape.begin(), 1);
+  }
+  temp_shape.insert(temp_shape.end() - 2, split_k);
+  array intermediate(temp_shape, x.dtype(), nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  enc.add_temporary(intermediate);
+
+  auto kernel = get_kernel(o.d, "qvm_split_k",
+                           kernels::qvm_split_k(o.mode, x.dtype(), split_k));
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, w, scales, biases);
+  int c = 3;
+  enc.set_input_array(x, c++);
+  enc.set_output_array(intermediate, c++);
+  enc.set_bytes(split_D, c++);
+  enc.set_bytes(N, c++);
+  enc.set_bytes(x_batch_ndims, c++);
+  enc.set_vector_bytes(x_shape, c++);
+  enc.set_vector_bytes(x_strides, c++);
+  enc.set_bytes(w_batch_ndims, c++);
+  enc.set_vector_bytes(w_shape, c++);
+  enc.set_vector_bytes(w_strides, c++);
+  enc.set_vector_bytes(s_strides, c++);
+  auto b_strides = biases.strides();
+  b_strides.insert(b_strides.end() - 2, split_D * biases.shape(-1));
+  enc.set_vector_bytes(b_strides, c++);
+  enc.set_bytes(final_block_size, c++);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+
+  int axis = intermediate.ndim() - 3;
+  ReductionPlan plan(ReductionOpType::ContiguousStridedReduce,
+                     {intermediate.shape(axis)}, {intermediate.strides(axis)});
+  strided_reduce_general_dispatch(intermediate, o.out, "sum", plan, {axis}, enc,
+                                  o.d, o.s);
+}
+
+void qvm(const Operands &o, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  int bn = qvm_columns_per_simdgroup * num_simdgroups;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  auto kernel =
+      get_kernel(o.d, "qvm", kernels::qvm(o.mode, o.x.dtype(), B > 1));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  add_strides_and_shapes(enc, B <= 1, o.x, o.w, o.scales, o.biases, 7);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// The NAX family covers qmm with a transposed weight only.
+void qmm_nax(const Operands &o, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  constexpr auto tile = kernels::kNaxTile;
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm,
+                      B);
+
+  bool aligned = N % tile.bn == 0;
+  auto kernel = get_kernel(
+      o.d, family_of("qmm_t_nax", o.tiled),
+      kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1, o.tiled), M, N,
+      K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  add_strides_and_shapes(enc, B <= 1, o.x, o.w, o.scales, o.biases, 8);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void qmm(const Operands &o, bool transpose, int M, int N, int K) {
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+      (env::enable_tf32() || o.x.dtype() != float32)) {
+    return qmm_nax(o, M, N, K);
+  }
+
+  int B = o.out.size() / M / N;
+  int wm = 2;
+  int wn = 2;
+  int bm = 32;
+  int bn = 32;
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+
+  bool aligned = N % 32 == 0;
+  bool batched = B > 1;
+  auto kernel = transpose
+      ? get_kernel(
+            o.d, family_of("qmm_t", o.tiled),
+            kernels::qmm_t(o.mode, o.x.dtype(), aligned, batched, o.tiled), M,
+            N, K)
+      : get_kernel(o.d, "qmm_n", kernels::qmm_n(o.mode, o.x.dtype(), batched),
+                   M, N, K);
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(o.out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  add_strides_and_shapes(enc, B <= 1, o.x, o.w, o.scales, o.biases, 8);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// The K partitions qmm_splitk runs; 1 sends it to qmm.
+int splitk_count(int group_size, int M, int N, int K) {
+  // Target ~512 threadgroups.
+  int bm = 32, bn = 32;
+  int n_tiles = (N + bn - 1) / bn;
+  int m_tiles = (M + bm - 1) / bm;
+  int current_tgs = n_tiles * m_tiles;
+  int split_k = std::max(1, 512 / current_tgs);
+
+  // qmm_t_splitk tiles K by BK=32 without bounding it, so every partition
+  // must be whole BK tiles and whole groups.
+  int k_align = group_size > 32 ? group_size : 32;
+  split_k = std::min(split_k, K / k_align);
+  while (split_k > 1 && (K % (split_k * k_align) != 0)) {
+    split_k--;
+  }
+  return split_k;
+}
+
+void qmm_splitk(const Operands &o, int M, int N, int K) {
+  int bm = 32, bn = 32;
+  int n_tiles = (N + bn - 1) / bn;
+  int m_tiles = (M + bm - 1) / bm;
+  int split_k = splitk_count(o.group_size, M, N, K);
+  if (split_k <= 1) {
+    return qmm(o, true, M, N, K);
+  }
+
+  int k_partition_size = K / split_k;
+  int split_k_partition_stride = M * N;
+
+  auto &enc = metal::get_command_encoder(o.s);
+  auto temp_shape = o.out.shape();
+  if (temp_shape.size() == 1) {
+    temp_shape.insert(temp_shape.begin(), 1);
+  }
+  temp_shape.insert(temp_shape.begin(), split_k);
+  array intermediate(temp_shape, o.x.dtype(), nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  enc.add_temporary(intermediate);
+
+  MTL::Size group_dims(32, 2, 2);
+  MTL::Size grid_dims(n_tiles, m_tiles, split_k);
+
+  bool aligned = N % 32 == 0;
+  auto kernel = get_kernel(
+      o.d, family_of("qmm_t_splitk", o.tiled),
+      kernels::qmm_t_splitk(o.mode, o.x.dtype(), aligned, o.tiled), M, N, K);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  enc.set_input_array(o.x, 3);
+  enc.set_output_array(intermediate, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  enc.set_bytes(k_partition_size, 8);
+  enc.set_bytes(split_k_partition_stride, 9);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+
+  ReductionPlan plan(ReductionOpType::ContiguousStridedReduce,
+                     {intermediate.shape(0)}, {intermediate.strides(0)});
+  strided_reduce_general_dispatch(intermediate, o.out, "sum", plan, {0}, enc,
+                                  o.d, o.s);
+}
+
+void gather_qmm(const Operands &o, const array &lhs_indices,
+                const array &rhs_indices, bool transpose, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  int wm = 2;
+  int wn = 2;
+  int bm = 32;
+  int bn = 32;
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+
+  bool aligned = N % 32 == 0;
+  auto kernel =
+      transpose
+          ? get_kernel(o.d, "gather_qmm_t",
+                       kernels::gather_qmm_t(o.mode, o.x.dtype(), aligned))
+          : get_kernel(o.d, "gather_qmm_n",
+                       kernels::gather_qmm_n(o.mode, o.x.dtype()));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  int c = 3;
+  enc.set_input_array(o.x, c++);
+  enc.set_input_array(lhs_indices, c++);
+  enc.set_input_array(rhs_indices, c++);
+  enc.set_output_array(o.out, c++);
+  enc.set_bytes(K, c++);
+  enc.set_bytes(N, c++);
+  enc.set_bytes(M, c++);
+  c = add_strides_and_shapes(enc, false, o.x, o.w, o.scales, o.biases, c);
+  add_gather_strides_and_shapes(enc, lhs_indices, rhs_indices, c);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void gather_qmv(const Operands &o, const array &lhs_indices,
+                const array &rhs_indices, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  int bn = 8;
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  bool fast = N % bn == 0 && K % 512 == 0;
+  auto kernel = get_kernel(o.d, fast ? "gather_qmv_fast" : "gather_qmv",
+                           kernels::gather_qmv(o.mode, o.x.dtype(), fast));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  int c = 3;
+  enc.set_input_array(o.x, c++);
+  enc.set_input_array(lhs_indices, c++);
+  enc.set_input_array(rhs_indices, c++);
+  enc.set_output_array(o.out, c++);
+  enc.set_bytes(K, c++);
+  enc.set_bytes(N, c++);
+  c = add_strides_and_shapes(enc, false, o.x, o.w, o.scales, o.biases, c);
+  add_gather_strides_and_shapes(enc, lhs_indices, rhs_indices, c);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void gather_qvm(const Operands &o, const array &lhs_indices,
+                const array &rhs_indices, int M, int N, int K) {
+  int B = o.out.size() / M / N;
+  constexpr int num_simdgroups = 2;
+  constexpr int bk = 32;
+  int bn = qvm_columns_per_simdgroup * num_simdgroups;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
+  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+
+  auto kernel =
+      get_kernel(o.d, "gather_qvm", kernels::gather_qvm(o.mode, o.x.dtype()));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, o.w, o.scales, o.biases);
+  int c = 3;
+  enc.set_input_array(o.x, c++);
+  enc.set_input_array(lhs_indices, c++);
+  enc.set_input_array(rhs_indices, c++);
+  enc.set_output_array(o.out, c++);
+  enc.set_bytes(K, c++);
+  enc.set_bytes(N, c++);
+  c = add_strides_and_shapes(enc, false, o.x, o.w, o.scales, o.biases, c);
+  add_gather_strides_and_shapes(enc, lhs_indices, rhs_indices, c);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// lhs_indices are implied: x is broadcast against rhs_indices and copied as
+// if the lhs gather had been applied, then the sorted rhs walk reuses each
+// expert's weights across consecutive rows.
+void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
+                    const array &biases_, const array &indices_, array &out,
+                    bool transpose, Mode mode, int M, int N, int K,
+                    bool fixed_tile, bool allow_tf32, int max_y_tiles,
+                    int max_group, metal::Device &d, const Stream &s) {
+  array indices = ensure_row_contiguous(indices_, s);
+  auto broadcast_with_indices = [&s, &indices](const array &x) {
+    if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
+      return ensure_row_contiguous(x, s);
+    }
+    auto x_shape = indices.shape();
+    x_shape.push_back(x.shape(-2));
+    x_shape.push_back(x.shape(-1));
+    array new_x(std::move(x_shape), x.dtype(), nullptr, {});
+    broadcast(x, new_x);
+    return ensure_row_contiguous(new_x, s);
+  };
+  array x = broadcast_with_indices(x_);
+  array w = ensure_row_contiguous(w_, s);
+  array scales = ensure_row_contiguous(scales_, s);
+  array biases = ensure_row_contiguous(biases_, s);
+  auto &enc = metal::get_command_encoder(s);
+
+  // Tensor-op route: per-expert row tiles over `offsets`, so the small
+  // simdgroup tiles below (which straddle experts and re-dequantize) are only
+  // the fallback. Aligned tiles only; float32 only under tf32 as qmm does.
+  if (!bridge_testing::force_gather_rhs_fallback &&
+      metal::is_nax_available() && transpose && N % 64 == 0 &&
+      K % 64 == 0 &&
+      (allow_tf32 || env::enable_tf32() || x.dtype() != float32)) {
+    const int E = w.size() / w.shape(-1) / w.shape(-2);
+    const int num_groups =
+        (max_group > 0 && max_group < E) ? max_group : E;
+    const auto &tile =
+        kernels::kRhsNaxTiles[fixed_tile || M / num_groups < kernels::kRhsNaxWideRows
+                                  ? 0
+                                  : 1];
+    array offsets = gather_mm_offsets(indices, num_groups, M, d, s);
+    auto kernel = get_kernel(d, "gather_qmm_rhs_nax_nt",
+                             kernels::gather_qmm_rhs_nax(mode, x.dtype(), tile),
+                             M, N, K);
+    enc.set_compute_pipeline_state(kernel);
+    int c = 0;
+    enc.set_input_array(x, c++);
+    enc.set_input_array(w, c++);
+    enc.set_input_array(scales, c++);
+    enc.set_input_array(biases, c++);
+    enc.set_input_array(offsets, c++);
+    enc.set_output_array(out, c++);
+    enc.set_bytes(M, c++);
+    enc.set_bytes(N, c++);
+    enc.set_bytes(K, c++);
+    enc.set_bytes(num_groups, c++);
+    const int default_y_tiles =
+        std::min(M, (M + tile.bm - 1) / tile.bm + num_groups - 1);
+    const int y_tiles =
+        (fixed_tile && max_y_tiles > 0)
+            ? std::min(default_y_tiles, max_y_tiles)
+            : default_y_tiles;
+    enc.dispatch_threadgroups(
+        MTL::Size(N / tile.bn, y_tiles, 1),
+        MTL::Size(32, tile.wn, tile.wm));
+    return;
+  }
+
+  constexpr auto tile = kernels::kRhsTile;
+  const bool align_M = (M % tile.bm) == 0;
+  const bool align_N = (N % tile.bn) == 0;
+  const bool align_K = (K % tile.bk) == 0;
+
+  std::string kname = kernels::gather_qmm_rhs(mode, x.dtype(), transpose);
+  metal::MTLFCList func_consts = {
+      {&align_M, MTL::DataType::DataTypeBool, 200},
+      {&align_N, MTL::DataType::DataTypeBool, 201},
+      {&align_K, MTL::DataType::DataTypeBool, 202},
+  };
+  std::string hash_name;
+  concatenate(hash_name, kname, "_align_M_", align_M ? 't' : 'n', "_align_N_",
+              align_N ? 't' : 'n', "_align_K_", align_K ? 't' : 'n');
+
+  bridge_testing::record(transpose ? "gather_qmm_rhs_nt" : "gather_qmm_rhs_nn");
+  auto kernel = load_kernel(d, kname, hash_name, func_consts);
+  enc.set_compute_pipeline_state(kernel);
+
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm,
+                      1);
+
+  int c = 0;
+  enc.set_input_array(x, c++);
+  enc.set_input_array(w, c++);
+  enc.set_input_array(scales, c++);
+  enc.set_input_array(biases, c++);
+  enc.set_input_array(indices, c++);
+  enc.set_output_array(out, c++);
+  enc.set_bytes(M, c++);
+  enc.set_bytes(N, c++);
+  enc.set_bytes(K, c++);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+int qmv_vector_limit(int K, int N, bool transpose, metal::Device &d) {
+  int vector_limit = transpose ? get_qmv_batch_limit(K, N, d) : 4;
+  if (const char *e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
+    int v = std::atoi(e);
+    if (v > 0) {
+      vector_limit = v;
+    }
+  }
+  return vector_limit;
+}
+
+// A K-quant Tiled64 (N, K) whose M = 8 call takes qmm_m8_nax: not the M = 8
+// register output route, and 8 under the GEMM's row limit.
+bool m8_tier_is_the_eight_row_route(Mode mode, int N, int K, metal::Device &d) {
+  return metal::is_nax_available() && !is_affine(mode) &&
+         N % kernels::kM8TileCols == 0 && K % 32 == 0 &&
+         !(mode == Mode::Q4K && N == 2048 && K == 4096) &&
+         8 < qmv_vector_limit(K, N, true, d);
+}
+
+// The lane tier: M of 16, 24 or 32 on the 16/32-row tile. A K-quant mode's
+// split count does not depend on the row tier (qmm_m8_nax_splits), so each
+// 8-row block of x is summed in the M = 8 call's order.
+bool lane_tier_fits(const Operands &o, int M, int N, int K) {
+  return (M == 16 || M == 24 || M == 32) && o.tiled &&
+         m8_tier_is_the_eight_row_route(o.mode, N, K, o.d) &&
+         o.x.dtype() == kernels::kSg8Type && o.out.dtype() == kernels::kSg8Type &&
+         o.out.size() == size_t(M) * N;
+}
+
+// Rows [8 * lane, 8 * lane + 8) of a row-contiguous [M, cols] array: the
+// view an 8-row call on that lane reads or writes.
+array lane_rows(const array &a, int lane, int cols) {
+  array view({8, cols}, a.dtype(), nullptr, {});
+  auto flags = a.flags();
+  flags.contiguous = true;
+  flags.row_contiguous = true;
+  flags.col_contiguous = cols == 1;
+  view.copy_shared_buffer(a, Strides{int64_t(cols), 1}, flags,
+                          size_t(8) * cols, int64_t(lane) * 8 * cols);
+  return view;
+}
+
+// The Tiled64 route of x @ w.T without the lane tier.
+void tiled_route(const Operands &o, int M, int N, int K) {
+  // The four measured companion shapes use register MMA by default.
+  // Explicit 1 preserves the broader opt-in; 0 retains the staged route.
+  if (o.mode == Mode::A4G64 && M == 8 && N >= 2048 && N % 32 == 0 && K <= 8192 &&
+      o.d.get_architecture_gen() >= 17 && o.x.dtype() == bfloat16 &&
+      o.x.offset() % 8 == 0 && o.scales.offset() % 8 == 0 && o.biases.offset() % 8 == 0) {
+    const char* experiment = std::getenv("MLX_KQUANT_REGISTER_AFFINE");
+    const bool measured_shape =
+        (K == 2048 && (N == 6144 || N == 12288)) ||
+        (N == 2048 && (K == 6144 || K == 4096));
+    if ((!experiment && measured_shape) ||
+        (experiment && std::string_view(experiment) == "1")) {
+      qmv_sg8(o, N, K);
+      return;
+    }
+  }
+  // Keep this default limited to the measured target output projection.
+  // The Rust prepared-SG8 eligibility uses the same unset/1/0 policy.
+  if (o.mode == Mode::Q4K && M == 8 && N == 2048 && K == 4096 &&
+      use_qmv_sg8(o, M, N)) {
+    const char* experiment = std::getenv("MLX_KQUANT_REGISTER_OUTPUT");
+    if (!experiment || std::string_view(experiment) == "1") {
+      qmv_sg8(o, N, K);
+      return;
+    }
+  }
+  // The tensor-op tiers cover M = 8..32 ahead of the GEMM: at these
+  // heights the GEMM's 64-row tiles stream the weights at 190-210 GB/s
+  // where the tiers hold 450 (M5 Max, Qwen3.8 shapes).
+  // The affine tiers go ahead of the GEMM; a K-quant mode keeps the
+  // GEMM ahead of its 8-row tier, as it shipped.
+  const bool tier = use_qmm_m8_nax(o, M, N, K);
+  if (tier && is_affine(o.mode)) {
+    qmm_m8_nax(o, M, N, K);
+    return;
+  }
+  if (M >= qmv_vector_limit(K, N, true, o.d)) {
+    qmm_splitk(o, M, N, K);
+    return;
+  }
+  if (tier) {
+    qmm_m8_nax(o, M, N, K);
+    return;
+  }
+  if (M == 1) {
+    qmv_t64(o, M, N, K);
+    return;
+  }
+  qmv_wide(o, M, N, K);
+}
+
+// One lane-tier dispatch when every lane's own 8-row call takes the 8-row
+// tier; otherwise each lane runs its own 8-row route (a lane at a byte
+// offset not divisible by 8 takes qmv_wide alone, and the tier's bits differ).
+void lane_tiers_matmul(const Operands &o, int M, int N, int K) {
+  const int lanes = M / 8;
+  std::vector<array> xs, outs;
+  xs.reserve(lanes);
+  outs.reserve(lanes);
+  bool tier = true;
+  for (int lane = 0; lane < lanes; ++lane) {
+    xs.push_back(lane_rows(o.x, lane, K));
+    outs.push_back(lane_rows(o.out, lane, N));
+    Operands lo{xs.back(), o.w, o.scales, o.biases, outs.back(), o.group_size,
+                o.bits,    o.mode, o.d, o.s, o.tiled};
+    tier = tier && use_qmm_m8_nax(lo, 8, N, K);
+  }
+  if (tier) {
+    qmm_m8_nax(o, M, N, K, true);
+    return;
+  }
+  for (int lane = 0; lane < lanes; ++lane) {
+    Operands lo{xs[lane], o.w, o.scales, o.biases, outs[lane], o.group_size,
+                o.bits,   o.mode, o.d, o.s, o.tiled};
+    tiled_route(lo, 8, N, K);
+  }
+}
+
+} // namespace
+
+int tiled_projection_splits(int N, int K) {
+  auto& d = metal::device(Device::gpu);
+  return qmm_m8_nax_splits(Mode::Q4K, N, K, gpu_core_count(d), 8, 4);
+}
+
+int kquant_tiled_splits(int N, int K, int cores) {
+  return qmm_m8_nax_splits(Mode::Q4K, N, K, cores, 8, 4);
+}
+
+bool tiled_projection_spread(const Stream& s) {
+  return staged_decode_spread(metal::device(s.device));
+}
+
+array tiled_projection_counters(const Stream& s, int tiles) {
+  return m8_nax_counters(s, tiles);
+}
+
+int tiled_qmv_vector_limit(int K, int N) {
+  if (!is_available(Device::gpu)) {
+    return 0;
+  }
+  return qmv_vector_limit(K, N, true, metal::device(Device::gpu));
+}
+
+bool lane_tier_available(Mode mode, int N, int K) {
+  return is_available(Device::gpu) &&
+         m8_tier_is_the_eight_row_route(mode, N, K, metal::device(Device::gpu));
+}
+
+bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine) {
+  if (!is_available(Device::gpu) || !metal::is_nax_available() || M < 8 ||
+      M > kernels::kM8NaxMaxRows || N % kernels::kM8TileCols != 0 ||
+      K % 32 != 0) {
+    return false;
+  }
+  return m8_nax_grid_reaches_target(affine ? Mode::A4G64 : Mode::Q4K, M, N, K,
+                                    bits, metal::device(Device::gpu));
+}
+
+// Internal prepared-input consumer. The producer retains ordinary x for
+// shape/provenance; only its already rounded SG8 operands are read by the GPU.
+void prepared_sg8_matmul_eval(const std::vector<array>& inputs, array& out,
+                              const Stream& s) {
+  if (inputs.size() != 6) throw std::invalid_argument("prepared SG8 input count");
+  auto& d = metal::device(s.device);
+  const int K = inputs[0].shape(-1), N = inputs[1].shape(0);
+  auto& enc = metal::get_command_encoder(s);
+  std::vector<array> a;
+  a.reserve(inputs.size());
+  for (const auto& input : inputs) {
+    if (input.flags().row_contiguous && input.offset() % 16 == 0) a.push_back(input);
+    else {
+      array copy(input.shape(), input.dtype(), nullptr, {});
+      copy.set_data(allocator::malloc(copy.nbytes()));
+      copy_gpu(input, copy, CopyType::General, s);
+      enc.add_temporary(copy);
+      a.push_back(std::move(copy));
+    }
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  Operands o{a[0], a[1], a[2], a[3], out, 32, 4, Mode::Q4K, d, s, true};
+  bridge_testing::record("qmv_sg8_t64_prepared");
+  qmv_sg8_prepared(o, N, K, a[4], a[5]);
+}
+
+void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  const bool tiled = layout_ == Layout::Tiled64;
+  // The tiled kernels take x as one row-contiguous [M, K] (no batch strides).
+  array x = tiled ? ensure_row_contiguous(inputs[0], s)
+                  : ensure_row_contiguous_matrix(inputs[0], s);
+  array w = ensure_row_contiguous_matrix(inputs[1], s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], s);
+
+  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+  int K = x.shape(-1);
+  int M = non_batched ? x.size() / K : x.shape(-2);
+  int N = out.shape(-1);
+  Operands o{x,     w,     scales, biases, out, group_size_,
+             bits_, mode_, d,      s,      tiled};
+
+  if (tiled) {
+    // quantized_matmul() admits Tiled64 only as a 2-D transposed weight; the
+    // routes below are the ported kernels, every other kernel reads the
+    // row-major layout and must not be reached.
+    if (!transpose_ || !non_batched) {
+      throw std::runtime_error(
+          "[quantized_matmul] The @t64 layout needs x @ w.T on a 2-D weight.");
+    }
+    if (lane_tiers_) {
+      if (!lane_tier_fits(o, M, N, K)) {
+        throw std::runtime_error(
+            "[quantized_matmul] The lane tier needs 16, 24 or 32 bfloat16 rows "
+            "of a K-quant whose 8-row call takes the tensor-op tier.");
+      }
+      lane_tiers_matmul(o, M, N, K);
+      return;
+    }
+    tiled_route(o, M, N, K);
+    return;
+  }
+  if (lane_tiers_) {
+    throw std::runtime_error(
+        "[quantized_matmul] The lane tier reads the @t64 layout only.");
+  }
+  if (is_affine(mode_)) {
+    throw std::runtime_error(
+        std::string("[quantized_matmul] The ") + mode_name(mode_) +
+        " mode has Metal kernels for the " + std::string(kTiledSuffix) +
+        " layout only; row-major affine weights take MLX's own route.");
+  }
+
+  if (M >= qmv_vector_limit(K, N, transpose_, d)) {
+    int B = out.size() / M / N;
+    if (transpose_ && B == 1) {
+      qmm_splitk(o, M, N, K);
+      return;
+    }
+    qmm(o, transpose_, M, N, K);
+    return;
+  }
+
+  if (transpose_) {
+    // MLX routes K of 64 or 128 to qmv_quad, which has no K-quant kernel;
+    // only IQ4_NL (32-value blocks) can reach those K, and qmv covers it.
+    if (use_qmm_m8_nax(o, M, N, K)) {
+      qmm_m8_nax(o, M, N, K);
+      return;
+    }
+    if (use_qmv_sg8(o, M, N)) {
+      qmv_sg8(o, N, K);
+      return;
+    }
+    if (M >= 2 && use_qmv_wide(d)) {
+      qmv_wide(o, M, N, K);
+      return;
+    }
+    qmv(o, M, N, K);
+    return;
+  }
+
+  if (K < 1024) {
+    qvm(o, M, N, K);
+    return;
+  }
+  qvm_split_k(o, M, N, K);
+}
+
+// Mirrors the Tiled64 branch of KQuantMatmul::eval_gpu for a bfloat16 x of a
+// K-quant mode: true only where it reaches qmm_nax (qmm_splitk with one
+// partition, then qmm on the tensor op). The Q4_K output shape that may take
+// qmv_sg8 is refused whatever the environment says.
+bool store_epilogue_route(Mode mode, int M, int N, int K) {
+  if (!is_available(Device::gpu) || !metal::is_nax_available() ||
+      !kernels::epilogue_mode(mode) || M < 1 || N % kernels::kNaxTile.bn != 0 ||
+      K % kernels::kNaxTile.bk != 0) {
+    return false;
+  }
+  if (mode == Mode::Q4K && M == 8 && N == 2048 && K == 4096) {
+    return false;
+  }
+  auto &d = metal::device(Device::gpu);
+  return M >= qmv_vector_limit(K, N, true, d) &&
+         splitk_count(default_group_size(mode), M, N, K) <= 1;
+}
+
+std::optional<array> quantized_matmul_epilogue(
+    const array &x, const array &w, const array &scales, const array &biases,
+    const array &aux, Mode mode, StoreEpilogue epilogue) {
+  if (detail::in_grad_tracing() || !(default_device() == Device::gpu) ||
+      x.dtype() != bfloat16 || aux.dtype() != bfloat16 || w.ndim() != 2 ||
+      x.ndim() < 1) {
+    return std::nullopt;
+  }
+  const int K = x.shape(-1);
+  if (K <= 0 || x.size() % K != 0) {
+    return std::nullopt;
+  }
+  const int M = x.size() / K;
+  const int N = w.shape(0);
+  if (!store_epilogue_route(mode, M, N, K)) {
+    return std::nullopt;
+  }
+  // The plain op validates the operands and gives the output's shape.
+  array plain = quantized_matmul(x, w, scales, biases, true, std::nullopt,
+                                 std::nullopt, mode, {}, Layout::Tiled64);
+  if (aux.shape() != plain.shape()) {
+    return std::nullopt;
+  }
+  std::vector<array> inputs = plain.inputs();
+  inputs.push_back(aux);
+  return array(plain.shape(), bfloat16,
+               std::make_shared<KQuantMatmulEpilogue>(
+                   plain.primitive().stream(), default_group_size(mode),
+                   default_bits(mode), mode, epilogue),
+               std::move(inputs));
+}
+
+void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &inputs,
+                                    array &out) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous(inputs[0], s);
+  array w = ensure_row_contiguous_matrix(inputs[1], s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], s);
+  array aux = ensure_row_contiguous(inputs[4], s);
+  const int K = x.shape(-1);
+  const int M = x.size() / K;
+  const int N = out.shape(-1);
+  if (!store_epilogue_route(mode_, M, N, K)) {
+    throw std::runtime_error(
+        "[quantized_matmul] The K-quant store epilogue left the tensor-op GEMM.");
+  }
+  constexpr auto tile = kernels::kNaxTile;
+  MTL::Size group_dims(32, tile.wn, tile.wm);
+  MTL::Size grid_dims(N / tile.bn, (M + tile.bm - 1) / tile.bm, 1);
+  auto kernel = get_kernel(
+      d,
+      epilogue_ == StoreEpilogue::Residual ? "qmm_t_nax_t64_res"
+                                           : "qmm_t_nax_t64_swiglu",
+      kernels::qmm_t_nax_t64_epilogue(mode_, epilogue_), M, N, K);
+  auto &enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, w, scales, biases);
+  enc.set_input_array(x, 3);
+  enc.set_output_array(out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  enc.set_input_array(aux, 8);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
+  if (is_affine(mode_)) {
+    throw std::runtime_error(std::string("[gather_qmm] The ") +
+                             mode_name(mode_) +
+                             " mode has no Metal gather kernels.");
+  }
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], s);
+  array w = ensure_row_contiguous_matrix(inputs[1], s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], s);
+  const array &lhs_indices = inputs[4];
+  const array &rhs_indices = inputs[5];
+
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+  int B = out.size() / M / N;
+  int E = w.size() / w.shape(-1) / w.shape(-2);
+  int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+
+  // x and w are both walked in order, so the matmuls batch up and reuse the
+  // loads of each expert's weights.
+  if (M == 1 && right_sorted_ && (rhs_any_rows_ || (B >= 16 && B / E >= 4))) {
+    gather_qmm_rhs(x, w, scales, biases, rhs_indices, out, transpose_, mode_,
+                   x.size() / K, N, K, rhs_any_rows_, allow_tf32_,
+                   max_y_tiles_, max_group_, d, s);
+    return;
+  }
+
+  Operands o{x, w, scales, biases, out, group_size_, bits_, mode_, d, s};
+  if (M >= vector_limit) {
+    gather_qmm(o, lhs_indices, rhs_indices, transpose_, M, N, K);
+    return;
+  }
+  if (transpose_) {
+    gather_qmv(o, lhs_indices, rhs_indices, M, N, K);
+    return;
+  }
+  gather_qvm(o, lhs_indices, rhs_indices, M, N, K);
+}
+
+void KQuantDequantize::eval_gpu(const std::vector<array> &inputs, array &out) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto &enc = metal::get_command_encoder(s);
+
+  auto w = ensure_row_contiguous(inputs[0], s);
+  auto scales = ensure_row_contiguous(inputs[1], s);
+  auto biases = ensure_row_contiguous(inputs[2], s);
+
+  auto kernel =
+      get_kernel(d, "dequantize", kernels::dequantize(mode_, out.dtype()));
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, w, scales, biases);
+  enc.set_output_array(out, 3);
+
+  constexpr int uint8_per_uint32 = 4;
+  // Values one thread decodes: a pack of the affine stream, or an 8-value
+  // chunk of a grid unit (kquant_dequantize's KQ_GRID arm).
+  int packs_per_int = is_grid(mode_)             ? 8
+                      : (bits_ == 3 || bits_ == 5) ? 8
+                      : bits_ == 6               ? 4
+                                                 : 8 / bits_;
+  size_t nthreads = out.size() / packs_per_int;
+  NS::UInteger thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
+  if (thread_group_size > nthreads) {
+    thread_group_size = nthreads;
+  }
+  auto group_dims = MTL::Size(thread_group_size, 1, 1);
+  bool use_2d = nthreads > UINT_MAX;
+  auto grid_shape = w.shape();
+  grid_shape.back() *= uint8_per_uint32;
+  MTL::Size grid_dims = use_2d ? get_2d_grid_dims(grid_shape, w.strides())
+                               : MTL::Size(nthreads, 1, 1);
+  enc.dispatch_threads(grid_dims, group_dims);
+}
+
+} // namespace mlx::core::kquant
+
+extern "C" int mlx_gpu_core_count() {
+  using namespace mlx::core;
+  return is_available(Device::gpu)
+      ? kquant::gpu_core_count(metal::device(Device::gpu))
+      : 0;
+}
+
+extern "C" int mlx_gpu_reported_core_count() {
+  using namespace mlx::core;
+  return is_available(Device::gpu)
+      ? kquant::gpu_reported_core_count(metal::device(Device::gpu))
+      : 0;
+}
+
+// K splits of a K-quant Tiled64 call of an [n, k] weight on `cores` GPU cores: the same law at 8, 16, 24 and 32 rows
+// and for every K-quant mode. 0 without Metal.
+extern "C" int mlx_kquant_tiled_splits(int n, int k, int cores) {
+  return mlx::core::kquant::kquant_tiled_splits(n, k, cores);
+}
+
+#else
+
+#include <stdexcept>
+
+extern "C" int mlx_gpu_core_count() { return 0; }
+extern "C" int mlx_gpu_reported_core_count() { return 0; }
+extern "C" int mlx_kquant_tiled_splits(int, int, int) { return 0; }
+
+namespace mlx::core::kquant {
+
+int tiled_qmv_vector_limit(int, int) { return 0; }
+int tiled_projection_splits(int, int) { return 1; }
+bool tiled_projection_spread(const Stream&) { return false; }
+bool tiled_tensor_op_tier(int, int, int, int, bool) { return false; }
+bool lane_tier_available(Mode, int, int) { return false; }
+
+bool store_epilogue_route(Mode, int, int, int) { return false; }
+
+std::optional<array> quantized_matmul_epilogue(const array &, const array &,
+                                               const array &, const array &,
+                                               const array &, Mode,
+                                               StoreEpilogue) {
+  return std::nullopt;
+}
+
+void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[quantized_matmul] The K-quant store epilogue needs Metal.");
+}
+
+} // namespace mlx::core::kquant
+
+#endif

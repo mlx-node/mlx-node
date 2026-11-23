@@ -1865,8 +1865,12 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    // Add src/ as include path for metal/{common,<family>}/*.metal.inc includes
+    // Add src/ as include path for metal/{common,<family>}/*.metal.inc and
+    // cuda/*.cu.inc includes, plus common/, metal/, and cuda/ for mlx_*.h.
     bridge.include(&src_dir);
+    bridge.include(src_dir.join("common"));
+    bridge.include(src_dir.join("metal"));
+    bridge.include(src_dir.join("cuda"));
     // The host side of Splash's GGUF planes ABI (metal/abi/*.h, mlx_gguf_planes.cpp).
     bridge.include(src_dir.join("metal").join("splash_gguf"));
 
@@ -1876,7 +1880,7 @@ fn main() -> io::Result<()> {
     // `MLX_DISABLE_METAL=1` on macOS); the symbols
     // their `eval_gpu` consumers need (`paged_kv_write` / `paged_attention` /
     // `paged_attention_varlen`) are provided as runtime-throwing stubs in
-    // `mlx_paged_stubs_linux.cpp`, and the Rust callers fall back to the
+    // `common/mlx_paged_stubs.cpp`, and the Rust callers fall back to the
     // eager path via the `mlx_metal_is_available()` gates.
     const METAL_ONLY_TUS: &[&str] = &[
         "mlx_paged_dispatch.cpp", // raw MTL:: types
@@ -1884,20 +1888,25 @@ fn main() -> io::Result<()> {
         "mlx_paged_profile.cpp",  // __APPLE__-guarded body + Metal include
     ];
 
-    // Compile all .cpp files in src/ (split from original monolithic mlx.cpp)
-    for entry in std::fs::read_dir(&src_dir).expect("Failed to read src directory") {
-        let entry = entry.expect("Failed to read directory entry");
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "cpp") {
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if !build_metal && METAL_ONLY_TUS.contains(&file_name.as_str()) {
-                continue;
-            }
-            bridge.file(&path);
+    // Collect all .cpp files under src/{common,metal,cuda} in deterministic order.
+    let mut bridge_files = Vec::new();
+    for subdir in ["common", "metal", "cuda"] {
+        walk_files(&src_dir.join(subdir), &mut bridge_files)?;
+    }
+    bridge_files.retain(|path| path.extension().is_some_and(|ext| ext == "cpp"));
+    bridge_files.sort();
+    for path in bridge_files {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !build_metal && METAL_ONLY_TUS.contains(&file_name) {
+            continue;
         }
+        if build_metal && file_name == "mlx_paged_stubs.cpp" {
+            continue;
+        }
+        bridge.file(&path);
     }
     bridge.compile("mlx_ffi");
 
