@@ -28,7 +28,7 @@ concurrency:
 #
 #   lint-ts (ubuntu) ──────────────────────────────────────────┐
 #   clippy  (macos) ───────────────────────────────────────────┤
-#   rust-lib (macos) ──────────────────────────────────────────┤
+#   rust-lib ×2 (macos: qwen4_exp | core) ─────────────────────┤
 #   rust-int (macos) ──────────────────────────────────────────┼─▶ publish (ubuntu, main only)
 #   build (macos) ─┬─▶ ts-test (macos) ────────────────────────┤
 #                  └─▶ model-test ×N (macos; main / label) ────┤
@@ -289,16 +289,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-  # mlx-core's unit tests (`--lib`, ~4k tests, serial under RUST_TEST_THREADS=1)
-  # plus its doc-tests. No native addon, no model checkpoint, no Node: the only
-  # fixture any non-ignored Rust test reads is a tokenizer.json (see
-  # crates/mlx-core/tests/common/mod.rs::find_tokenizer_dir), fetched below.
+  # mlx-core's unit tests (`--lib`, ~6k tests, serial under RUST_TEST_THREADS=1)
+  # plus its doc-tests, split into two time-balanced shards (`qwen4_exp` ≈ 53%
+  # of runtime; `core` = everything else + `--doc` ≈ 47%). No native addon, no
+  # model checkpoint, no Node: the only fixture any non-ignored Rust test reads
+  # is a tokenizer.json (see crates/mlx-core/tests/common/mod.rs::find_tokenizer_dir),
+  # fetched below.
   rust-lib:
-    name: cargo test (mlx-core lib)
+    name: cargo test (mlx-core lib · ${{ matrix.shard }})
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
     runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: qwen4_exp
+            test_args: models::qwen4_exp::
+            run_doc: false
+          - shard: core
+            test_args: -- --skip models::qwen4_exp::
+            run_doc: true
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -356,8 +368,8 @@ jobs:
             test -s "$dir/$f"
           done
 
-      - name: cargo test --lib
-        run: cargo test --locked -p mlx-core --lib
+      - name: cargo test --lib (${{ matrix.shard }})
+        run: cargo test --locked -p mlx-core --lib ${{ matrix.test_args }}
         env:
           RUST_BACKTRACE: 1
           # This leg runs on a Metal runner, so a test that self-skips because
@@ -375,6 +387,7 @@ jobs:
           MLX_TEST_REQUIRE_METAL: '1'
 
       - name: cargo test --doc
+        if: ${{ matrix.run_doc }}
         run: cargo test --locked -p mlx-core --doc
         env:
           RUST_BACKTRACE: 1
