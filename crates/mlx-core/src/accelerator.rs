@@ -462,6 +462,10 @@ pub(crate) fn try_retain_dense_prefill_weight(
 mod tests {
     use super::*;
 
+    /// Serializes live `CudaGraphsGuard` tests so parallel `cargo test` threads
+    /// never observe each other's temporary `CUDA_GRAPHS_DISABLE_STATE` count.
+    static LIVE_GRAPHS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn active_backend_and_caps_are_consistent() {
         let c = caps();
@@ -717,6 +721,9 @@ mod tests {
 
         // Exercise the live `CudaGraphsGuard` RAII type on this host (no-op off CUDA;
         // keeps graphs disabled across out-of-order drops on CUDA).
+        let _live_lock = LIVE_GRAPHS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let live1 = CudaGraphsGuard::disable_for_prefill();
         let live2 = CudaGraphsGuard::disable_for_prefill();
         if cuda_ops_available() {
@@ -727,5 +734,211 @@ mod tests {
             assert!(!unsafe { mlx_sys::mlx_cuda_get_use_graphs() });
         }
         drop(live2);
+        if cuda_ops_available() {
+            assert_eq!(CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0, 0);
+        }
+    }
+
+    #[test]
+    fn cuda_graphs_guard_concurrent_eval_matches_serial() {
+        use std::sync::{Arc, Barrier};
+
+        use crate::array::{DType, MxArray};
+        use crate::nn::{Activations, rms_norm_scaled};
+
+        if !cuda_ops_available() {
+            return;
+        }
+
+        let _live_lock = LIVE_GRAPHS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        struct ClearStreamsOnDrop;
+        impl Drop for ClearStreamsOnDrop {
+            fn drop(&mut self) {
+                #[cfg(windows)]
+                unsafe {
+                    mlx_sys::mlx_clear_streams();
+                }
+            }
+        }
+
+        fn make_pattern(len: usize, seed: usize) -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let v = ((i.wrapping_mul(17).wrapping_add(seed)) % 97) as f32;
+                    (v - 48.0) * 0.01
+                })
+                .collect()
+        }
+
+        struct ChainInputs {
+            x: MxArray,
+            w1: MxArray,
+            b1: MxArray,
+            w2: MxArray,
+            b2: MxArray,
+            w3: MxArray,
+            b3: MxArray,
+            w4: MxArray,
+            norm_w: MxArray,
+        }
+
+        impl ChainInputs {
+            fn build(rows: i64, seed_offset: usize) -> Self {
+                const D: i64 = 64;
+                let make = |shape: &[i64], seed: usize| {
+                    let len = shape.iter().product::<i64>() as usize;
+                    MxArray::from_float32(&make_pattern(len, seed + seed_offset), shape)
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                };
+                let x = make(&[rows, D], 1);
+                let w1 = make(&[D, D], 7);
+                let b1 = make(&[1, D], 13);
+                let w2 = make(&[D, D], 19);
+                let b2 = make(&[1, D], 23);
+                let w3 = make(&[D, D], 29);
+                let b3 = make(&[1, D], 31);
+                let w4 = make(&[D, D], 37);
+                let norm_w = MxArray::from_float32(
+                    &(0..D as usize)
+                        .map(|i| 0.8 + ((i % 11) as f32) * 0.04)
+                        .collect::<Vec<_>>(),
+                    &[D],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                MxArray::eval_arrays(&[&x, &w1, &b1, &w2, &b2, &w3, &b3, &w4, &norm_w]).unwrap();
+                Self {
+                    x,
+                    w1,
+                    b1,
+                    w2,
+                    b2,
+                    w3,
+                    b3,
+                    w4,
+                    norm_w,
+                }
+            }
+
+            // 4 chained matmuls + adds + rms_norm + silu -> queues multiple graph
+            // nodes and cuBLAS CaptureContext scopes per eval.
+            fn forward(&self) -> MxArray {
+                let h1 = self.x.matmul(&self.w1).unwrap().add(&self.b1).unwrap();
+                let h1 = rms_norm_scaled(&h1, &self.norm_w, 1e-5).unwrap();
+                let h1 = Activations::silu(&h1).unwrap();
+
+                let h2 = h1.matmul(&self.w2).unwrap().add(&self.b2).unwrap();
+                let h2 = rms_norm_scaled(&h2, &self.norm_w, 1e-5).unwrap();
+                let h2 = Activations::silu(&h2).unwrap();
+
+                let h3 = h2.matmul(&self.w3).unwrap().add(&self.b3).unwrap();
+                let h3 = Activations::silu(&h3).unwrap();
+
+                h3.matmul(&self.w4).unwrap().add(&self.x).unwrap()
+            }
+        }
+
+        // Compute deterministic serial ground truth for both worker workloads.
+        let serial_a = ChainInputs::build(16, 0).forward();
+        MxArray::eval_arrays(&[&serial_a]).unwrap();
+        let expected_a: Vec<f32> = serial_a.to_float32().unwrap().to_vec();
+        assert_eq!(expected_a.len(), 16 * 64);
+        assert!(expected_a.iter().all(|v| v.is_finite()));
+        assert!(expected_a.iter().any(|v| v.abs() > 1e-4));
+
+        let serial_b = ChainInputs::build(32, 100).forward();
+        MxArray::eval_arrays(&[&serial_b]).unwrap();
+        let expected_b: Vec<f32> = serial_b.to_float32().unwrap().to_vec();
+        assert_eq!(expected_b.len(), 32 * 64);
+        assert!(expected_b.iter().all(|v| v.is_finite()));
+        assert!(expected_b.iter().any(|v| v.abs() > 1e-4));
+
+        let graphs_before = unsafe { mlx_sys::mlx_cuda_get_use_graphs() };
+        assert_eq!(CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0, 0);
+
+        const ITERS: usize = 80;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let barrier_a = Arc::clone(&barrier);
+        let expected_a_thread = expected_a;
+        let thread_a = std::thread::spawn(move || {
+            let _cleanup = ClearStreamsOnDrop;
+            let inputs = ChainInputs::build(16, 0);
+            barrier_a.wait();
+            for iter in 0..ITERS {
+                let out = inputs.forward();
+                match iter % 3 {
+                    0 => out.eval(),
+                    1 => {
+                        let mut ptr = out.as_raw_ptr();
+                        // SAFETY: single valid array handle owned by `out` on this thread.
+                        unsafe {
+                            mlx_sys::mlx_async_eval(&mut ptr, 1);
+                        }
+                    }
+                    _ => MxArray::eval_arrays(&[&out]).unwrap(),
+                }
+                let got = out.to_float32().unwrap();
+                assert_eq!(got.len(), expected_a_thread.len());
+                let mut max_abs_err = 0.0f32;
+                for (&g, &e) in got.iter().zip(expected_a_thread.iter()) {
+                    assert!(g.is_finite(), "Thread A iter {iter}: non-finite output {g}");
+                    max_abs_err = max_abs_err.max((g - e).abs());
+                }
+                assert_eq!(
+                    max_abs_err, 0.0,
+                    "Thread A iter {iter}: concurrent eval diverged from serial ground truth (max_abs_err={max_abs_err})"
+                );
+            }
+        });
+
+        let barrier_b = Arc::clone(&barrier);
+        let expected_b_thread = expected_b;
+        let thread_b = std::thread::spawn(move || {
+            let _cleanup = ClearStreamsOnDrop;
+            let inputs = ChainInputs::build(32, 100);
+            barrier_b.wait();
+            for iter in 0..ITERS {
+                let _guard = CudaGraphsGuard::disable_for_prefill();
+                assert!(
+                    !unsafe { mlx_sys::mlx_cuda_get_use_graphs() },
+                    "Thread B iter {iter}: graphs must stay disabled while CudaGraphsGuard is held"
+                );
+                let out = inputs.forward();
+                MxArray::eval_arrays(&[&out]).unwrap();
+                let got = out.to_float32().unwrap();
+                assert_eq!(got.len(), expected_b_thread.len());
+                let mut max_abs_err = 0.0f32;
+                for (&g, &e) in got.iter().zip(expected_b_thread.iter()) {
+                    assert!(g.is_finite(), "Thread B iter {iter}: non-finite output {g}");
+                    max_abs_err = max_abs_err.max((g - e).abs());
+                }
+                assert_eq!(
+                    max_abs_err, 0.0,
+                    "Thread B iter {iter}: prefill eval diverged from serial ground truth (max_abs_err={max_abs_err})"
+                );
+            }
+        });
+
+        thread_a.join().expect("Thread A panicked");
+        thread_b.join().expect("Thread B panicked");
+
+        // Verify reference count returned to 0 and CUDA Graphs state restored cleanly.
+        assert_eq!(
+            CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0,
+            0,
+            "active_disable_count must return to 0 after all guards drop"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_cuda_get_use_graphs() },
+            graphs_before,
+            "CUDA Graphs state must restore to initial value after all guards drop"
+        );
     }
 }

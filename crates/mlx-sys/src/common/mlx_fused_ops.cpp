@@ -287,7 +287,10 @@ mlx_array* mlx_fused_transformer_block_forward(
   // 7. Scaled dot-product attention
   std::string mask_mode = use_causal && seq_len > 1 ? "causal" : "";
   auto attn_output = fast::scaled_dot_product_attention(queries, keys, values, attn_scale, mask_mode, {}, std::nullopt, {});
-  attn_output.eval();  // Force GPU sync after SDPA to prevent timeout
+  {
+    CudaGraphsEvalReadLock graphs_eval_lock;
+    attn_output.eval();  // Force GPU sync after SDPA to prevent timeout
+  }
 
   // 8. Transpose back and reshape
   attn_output = transpose(attn_output, {0, 2, 1, 3});
@@ -494,6 +497,7 @@ mlx_array* mlx_fused_attention_output(
             *queries, *keys, *values, attn_scale, mask_mode
         );
         if (eval_attention) {
+            CudaGraphsEvalReadLock graphs_eval_lock;
             attn_output.eval();  // Force GPU sync after expensive SDPA to prevent timeout
         }
 

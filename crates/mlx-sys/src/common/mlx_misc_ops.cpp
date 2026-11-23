@@ -17,6 +17,7 @@ double mlx_steady_clock_now_s() {
 bool mlx_synchronize() {
   mlx_native_error_slot().clear();
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     mlx_throw_test_native_failure();
     mlx::core::synchronize();
     return true;
@@ -43,6 +44,7 @@ void mlx_clear_cache() {
 
 // Windows requires worker streams to be destroyed before thread teardown.
 void mlx_clear_streams() {
+  CudaGraphsEvalReadLock graphs_eval_lock;
   mlx::core::clear_streams();
 }
 

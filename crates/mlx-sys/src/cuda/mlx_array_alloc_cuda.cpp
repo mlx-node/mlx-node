@@ -141,6 +141,7 @@ mlx_array* mlx_array_ensure_cuda_device(mlx_array* handle) {
     if (!handle || !mlx::core::cu::is_available()) return nullptr;
     auto* arr = reinterpret_cast<array*>(handle);
     if (arr->status() != array::Status::available) {
+      CudaGraphsEvalReadLock graphs_eval_lock;
       arr->eval();
     }
     // Skip empty tensors and <= 8 byte scalar-pool tensors

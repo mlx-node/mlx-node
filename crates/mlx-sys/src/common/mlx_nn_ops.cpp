@@ -178,6 +178,7 @@ void mlx_array_eval(mlx_array* handle) {
   try {
     auto arr = reinterpret_cast<array*>(handle);
     if (arr) {
+      CudaGraphsEvalReadLock graphs_eval_lock;
       arr->eval();
     }
   } catch (const std::exception& e) {
@@ -189,6 +190,7 @@ void mlx_array_eval(mlx_array* handle) {
 
 void mlx_async_eval(mlx_array** handles, size_t count) {
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     std::vector<array> arrays;
     arrays.reserve(count);
     for (size_t i = 0; i < count; ++i) {
@@ -232,6 +234,7 @@ bool mlx_eval_with_error(mlx_array** handles,
     error_out[0] = '\0';
   }
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     std::vector<array> arrays;
     arrays.reserve(count);
     for (size_t i = 0; i < count; ++i) {
@@ -330,6 +333,7 @@ bool ensure_readable(array& arr, const char* context) {
   try {
     mlx_throw_test_native_failure();
     if (!arr.is_available()) {
+      CudaGraphsEvalReadLock graphs_eval_lock;
       arr.eval();
     }
     return true;
@@ -344,6 +348,7 @@ bool ensure_readable(array& arr, const char* context) {
 
 template <typename Out>
 Out read_scalar(const array& arr, size_t index) {
+  CudaGraphsEvalReadLock graphs_eval_lock;
   // Host-side reads require materialized data. On the CUDA backend data() on an
   // unevaluated array returns a null/device-only buffer and segfaults in
   // Buffer::raw_ptr(), so force materialization first. The eval adds no
@@ -436,6 +441,7 @@ bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  CudaGraphsEvalReadLock graphs_eval_lock;
   if (!ensure_readable(*arr, "array_item_at_float32")) return false;
   *out = read_scalar<float>(*arr, index);
   return true;
@@ -446,6 +452,7 @@ bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  CudaGraphsEvalReadLock graphs_eval_lock;
   if (!ensure_readable(*arr, "array_item_at_int32")) return false;
   *out = read_scalar<int32_t>(*arr, index);
   return true;
@@ -456,6 +463,7 @@ bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  CudaGraphsEvalReadLock graphs_eval_lock;
   if (!ensure_readable(*arr, "array_item_at_uint32")) return false;
   *out = read_scalar<uint32_t>(*arr, index);
   return true;
@@ -513,6 +521,7 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
     return false;
   }
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     arr->eval();
 
     auto dtype = arr->dtype();

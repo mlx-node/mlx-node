@@ -20,6 +20,7 @@ extern "C" bool mlx_test_affine_mixed_shapeless_replay(
     mlx_array *biases, int group_size, int bits, mlx_array **out_replay,
     mlx_array **out_eager) {
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto fn = [=](const std::vector<array> &in) {
       auto out = mlx::core::affine_mixed::quantized_matmul(
           in[0], in[1], in[2], in[3], group_size, bits, mlx::core::Device::gpu);

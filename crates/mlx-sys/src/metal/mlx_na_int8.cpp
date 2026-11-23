@@ -617,6 +617,7 @@ bool mlx_quantize_weight_int8(mlx_array* w_handle, mlx_array** out_w_i8,
   if (out_w_i8) *out_w_i8 = nullptr;
   if (out_s_w) *out_s_w = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& w = *reinterpret_cast<array*>(w_handle);
     if (w.ndim() != 2) {
       std::cerr << "[mlx_quantize_weight_int8] expected 2D [N,K] weight\n";
@@ -668,6 +669,7 @@ bool mlx_sym8_quantize_store(mlx_array* w_handle, mlx_array** out_q,
   if (out_q) *out_q = nullptr;
   if (out_scales) *out_scales = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& w = *reinterpret_cast<array*>(w_handle);
     if (w.ndim() != 2) {
       std::cerr << "[mlx_sym8_quantize_store] expected 2D [N,K] weight\n";
@@ -714,6 +716,7 @@ bool mlx_sym8_kernel_operand(mlx_array* w_handle, mlx_array** out_w_kn) {
   using namespace mlx::core;
   if (out_w_kn) *out_w_kn = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& w = *reinterpret_cast<array*>(w_handle);
     if (w.ndim() != 2) {
       std::cerr << "[mlx_sym8_kernel_operand] expected 2D [N,K] int8 weight, "
@@ -957,6 +960,7 @@ bool mlx_int8_act_quant_fused(mlx_array* x_handle, mlx_array** out_i8_as_i32,
   if (out_i8_as_i32) *out_i8_as_i32 = nullptr;
   if (out_s_x) *out_s_x = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& x = *reinterpret_cast<array*>(x_handle);
     if (x.ndim() != 2) {
       std::cerr << "[mlx_int8_act_quant_fused] expected 2D x\n";
@@ -990,6 +994,7 @@ bool mlx_int8_act_quant_lazy(mlx_array* x_handle, mlx_array** out_i8_as_i32,
   if (out_i8_as_i32) *out_i8_as_i32 = nullptr;
   if (out_s_x) *out_s_x = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& x = *reinterpret_cast<array*>(x_handle);
     if (x.ndim() != 2) {
       std::cerr << "[mlx_int8_act_quant_lazy] expected 2D x\n";
@@ -1024,6 +1029,7 @@ bool mlx_int8_rescale_fused(mlx_array* acc_handle, mlx_array* s_x_handle,
   using namespace mlx::core;
   if (out_bf16) *out_bf16 = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& acc = *reinterpret_cast<array*>(acc_handle);
     auto& s_x = *reinterpret_cast<array*>(s_x_handle);
     auto& s_w = *reinterpret_cast<array*>(s_w_handle);
@@ -1056,6 +1062,7 @@ bool mlx_int8_rescale_lazy(mlx_array* acc_handle, mlx_array* s_x_handle,
   using namespace mlx::core;
   if (out_bf16) *out_bf16 = nullptr;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& acc = *reinterpret_cast<array*>(acc_handle);
     auto& s_x = *reinterpret_cast<array*>(s_x_handle);
     auto& s_w = *reinterpret_cast<array*>(s_w_handle);

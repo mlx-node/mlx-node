@@ -364,6 +364,7 @@ bool mlx_test_kquant_shapeless_replay(mlx_array *trace_x, mlx_array *x,
                                       mlx_array **out_replay,
                                       mlx_array **out_eager) {
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto ml = mode_layout_of(mode);
     auto dev = device_of(device);
     auto fn = [=](const std::vector<array> &in) {

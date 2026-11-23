@@ -822,6 +822,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
     // not when CUDA or other GPU backends might be in use
     if (!mlx::core::metal::is_available()) return nullptr;
 
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // Ensure array is evaluated
@@ -840,6 +841,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
 /// Note: offset() already returns bytes (used with char* in MLX internals)
 size_t mlx_array_get_buffer_offset(mlx_array* handle) {
     if (!handle) return 0;
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // eval not strictly needed for offset, but ensure consistency
@@ -867,6 +869,7 @@ size_t mlx_array_get_itemsize(mlx_array* handle) {
 /// Synchronize - ensure all MLX operations are complete
 /// Call this before dispatching external Metal kernels
 void mlx_metal_synchronize() {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     mlx::core::synchronize();
 }
 
