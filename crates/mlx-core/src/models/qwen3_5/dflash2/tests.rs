@@ -2774,8 +2774,8 @@ mod adaptive_budget_tests {
         let old = MxArray::from_handle(old, "old")?;
         let path = MxArray::from_handle(path, "path")?;
         let confidence = MxArray::from_handle(confidence, "confidence")?;
-        let params = crate::models::qwen3_5_moe::verify_budget::VerifyBudget::default()
-            .parameters(false, true);
+        let params =
+            crate::models::qwen3_5::verify_budget::VerifyBudget::default().parameters(false, true);
         let mut values = vec![params.acceptance.slope];
         values.extend(params.acceptance.intercepts);
         values.extend(params.costs);

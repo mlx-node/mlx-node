@@ -304,6 +304,11 @@ pub(crate) trait PrefillTarget<L> {
     fn reached(&mut self, _row: u32, _outcome: Reached<'_>) -> Result<()> {
         Ok(())
     }
+    /// Whether paged prefill uses fused store-epilogue projections and
+    /// store-only tail optimization (dense: `true`, MoE: `false`).
+    fn use_store_epilogue(&self) -> bool {
+        true
+    }
 }
 
 impl<L> PrefillTarget<L> for PrefillParts<'_, L> {
@@ -991,6 +996,7 @@ pub(crate) struct PrefillDriver {
     trace_enabled: bool,
     info_enabled: bool,
     started: Option<Instant>,
+    use_store_epilogue: bool,
 }
 
 impl PrefillDriver {
@@ -1046,6 +1052,7 @@ impl PrefillDriver {
         let inference_info_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
         let ends_prompt = cached_prefix_len as usize + suffix_tokens.len() >= full_tokens.len();
+        let use_store_epilogue = target.use_store_epilogue();
         Ok(Self {
             full_tokens: full_tokens.to_vec(),
             suffix: suffix_tokens.to_vec(),
@@ -1071,6 +1078,7 @@ impl PrefillDriver {
             trace_enabled: inference_trace_enabled(),
             info_enabled: inference_info_enabled,
             started: (single_shot && inference_info_enabled).then(Instant::now),
+            use_store_epilogue,
         })
     }
 
@@ -1151,6 +1159,7 @@ impl PrefillDriver {
             };
             {
                 let parts = target.parts()?;
+                let use_store_epilogue = self.use_store_epilogue && !has_moe_layers(parts.layers);
                 run_paged_prefill_layers(
                     launch,
                     from..to,
@@ -1160,6 +1169,7 @@ impl PrefillDriver {
                     parts.adapter,
                     self.cached_rope_deltas,
                     &self.tap_layers,
+                    use_store_epilogue,
                 )?;
             }
             let ran = &layer_kinds[from..to];
@@ -1608,6 +1618,12 @@ fn note_prefill_pass(_layers: usize) {
     });
 }
 
+fn has_moe_layers(layers: &[DecoderLayer]) -> bool {
+    layers
+        .iter()
+        .any(|layer| matches!(layer.mlp, super::decoder_layer::MLPType::MoE(_)))
+}
+
 /// Layers `layers` of a launch's forward over its hidden rows, each tapped
 /// layer's output kept.
 #[allow(clippy::too_many_arguments)]
@@ -1620,6 +1636,7 @@ fn run_paged_prefill_layers(
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
     tap_layers: &[usize],
+    use_store_epilogue: bool,
 ) -> Result<()> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -1629,14 +1646,16 @@ fn run_paged_prefill_layers(
         #[cfg(test)]
         let build_scope = crate::array::host_waits::scope("prefill_chunk_graph");
         let kind = layer_kinds[layer_idx];
-        if let Some(paged_idx) = store_only_tail(
-            launch.output,
-            layer_idx,
-            layers.len(),
-            kind,
-            tap_layers,
-            false,
-        ) {
+        if use_store_epilogue
+            && let Some(paged_idx) = store_only_tail(
+                launch.output,
+                layer_idx,
+                layers.len(),
+                kind,
+                tap_layers,
+                false,
+            )
+        {
             layers[layer_idx].store_paged_kv(
                 &launch.hidden,
                 paged_idx,
@@ -1650,7 +1669,7 @@ fn run_paged_prefill_layers(
             launch.next_layer = layer_idx + 1;
             continue;
         }
-        launch.hidden = if separate_ops() {
+        launch.hidden = if !use_store_epilogue || separate_ops() {
             layers[layer_idx].forward_paged_or_flat(
                 &launch.hidden,
                 kind,
@@ -1835,8 +1854,9 @@ pub(crate) fn run_paged_vlm_prefill(
             context_after,
             absolute_end >= prompt_len,
         )?;
+        let use_store_epilogue = target.use_store_epilogue();
         let parts = target.parts()?;
-        let prefilled = run_paged_prefill_one_chunk_tapped(
+        let prefilled = run_paged_prefill_one_chunk_tapped_inner(
             chunk_tokens,
             absolute_start as u32,
             embed,
@@ -1854,6 +1874,7 @@ pub(crate) fn run_paged_vlm_prefill(
             } else {
                 ChunkOutput::Unread
             },
+            use_store_epilogue && !has_moe_layers(parts.layers),
         )?;
         if let Some(sink) = taps.as_deref_mut() {
             sink.chunk(absolute_start, chunk_tokens, &prefilled.taps)?;
@@ -2056,11 +2077,12 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             context_after,
             context_after as usize >= full_tokens.len(),
         )?;
+        let use_store_epilogue = target.use_store_epilogue();
         let parts = target.parts()?;
         #[cfg(test)]
         note_prefill_chunk_blocks(parts.adapter);
 
-        let prefilled = run_paged_prefill_one_chunk_tapped(
+        let prefilled = run_paged_prefill_one_chunk_tapped_inner(
             chunk,
             chunk_start_position,
             embed,
@@ -2077,6 +2099,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             } else {
                 ChunkOutput::Unread
             },
+            use_store_epilogue && !has_moe_layers(parts.layers),
         )?;
         if let Some(sink) = taps.as_deref_mut() {
             sink.chunk(chunk_start_position as usize, chunk, &prefilled.taps)?;
@@ -2253,12 +2276,13 @@ fn run_paged_prefill_single_shot_with_hidden(
         .map_err(Error::from_reason)?;
 
     target.record(suffix_tokens)?;
+    let use_store_epilogue = target.use_store_epilogue();
     let parts = target.parts()?;
 
     let tap_layers = taps
         .as_deref()
         .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
-    let prefilled = run_paged_prefill_one_chunk_tapped(
+    let prefilled = run_paged_prefill_one_chunk_tapped_inner(
         suffix_tokens,
         cached_prefix_len,
         embed,
@@ -2271,6 +2295,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         cached_rope_deltas,
         &tap_layers,
         ChunkOutput::Read,
+        use_store_epilogue && !has_moe_layers(parts.layers),
     )?;
     if let Some(sink) = taps {
         sink.chunk(cached_prefix_len as usize, suffix_tokens, &prefilled.taps)?;
@@ -2296,6 +2321,7 @@ fn run_paged_prefill_single_shot_with_hidden(
 /// Also returns the output rows of every layer in `tap_layers`, in that
 /// order. With [`ChunkOutput::Unread`] a last layer that is full attention,
 /// no tap and on the text RoPE path only stores its K/V ([`store_only_tail`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_one_chunk_tapped(
     chunk_tokens: &[u32],
@@ -2310,6 +2336,40 @@ pub(crate) fn run_paged_prefill_one_chunk_tapped(
     cached_rope_deltas: i32,
     tap_layers: &[usize],
     output: ChunkOutput,
+) -> Result<PrefillChunk> {
+    let use_store_epilogue = !has_moe_layers(layers);
+    run_paged_prefill_one_chunk_tapped_inner(
+        chunk_tokens,
+        chunk_first_position,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+        inputs_embeds,
+        position_ids,
+        cached_rope_deltas,
+        tap_layers,
+        output,
+        use_store_epilogue,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_one_chunk_tapped_inner(
+    chunk_tokens: &[u32],
+    chunk_first_position: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    inputs_embeds: Option<&MxArray>,
+    position_ids: Option<&MxArray>,
+    cached_rope_deltas: i32,
+    tap_layers: &[usize],
+    output: ChunkOutput,
+    use_store_epilogue: bool,
 ) -> Result<PrefillChunk> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -2354,14 +2414,16 @@ pub(crate) fn run_paged_prefill_one_chunk_tapped(
     {
         #[cfg(test)]
         let build_scope = crate::array::host_waits::scope("prefill_chunk_graph");
-        if let Some(paged_idx) = store_only_tail(
-            output,
-            layer_idx,
-            num_layers,
-            kind,
-            tap_layers,
-            position_ids.is_some(),
-        ) {
+        if use_store_epilogue
+            && let Some(paged_idx) = store_only_tail(
+                output,
+                layer_idx,
+                num_layers,
+                kind,
+                tap_layers,
+                position_ids.is_some(),
+            )
+        {
             layer.store_paged_kv(
                 &hidden_states,
                 paged_idx,
@@ -2385,7 +2447,7 @@ pub(crate) fn run_paged_prefill_one_chunk_tapped(
             Qwen3_5LayerKind::FullAttentionPaged { .. } => position_ids,
             Qwen3_5LayerKind::Linear => None,
         };
-        hidden_states = if separate_ops() {
+        hidden_states = if !use_store_epilogue || separate_ops() {
             layer.forward_paged_or_flat(
                 &hidden_states,
                 kind,
@@ -2844,7 +2906,7 @@ pub(crate) fn run_paged_verify_step(
     paged_adapter: &mut PagedKVCacheAdapter,
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
     cached_rope_deltas: i32,
-) -> Result<super::mtp_decode::MtpVerifyOutput> {
+) -> Result<crate::engine::mtp_decode::MtpVerifyOutput> {
     paged_verify_core(
         VerifyInput::Host(verify_ids),
         embed,
@@ -2946,6 +3008,45 @@ pub(crate) fn run_paged_dflash2_verify_step(
     row_budget: Option<&MxArray>,
     context_window: u32,
 ) -> Result<(MxArray, Vec<MxArray>)> {
+    run_paged_dflash2_verify_step_with_mode(
+        verify_ids,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        layer_kinds,
+        paged_adapter,
+        tape,
+        cached_rope_deltas,
+        tap_layers,
+        gdn,
+        row_budget,
+        context_window,
+        true,
+        dflash2_verify_submit(VerifySubmit::EveryLayer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_dflash2_verify_step_with_mode(
+    verify_ids: VerifyInput<'_>,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    cached_rope_deltas: i32,
+    tap_layers: &[usize],
+    gdn: &super::gdn_blob::GdnStateBlobs,
+    row_budget: Option<&MxArray>,
+    context_window: u32,
+    planes_route: bool,
+    submit: VerifySubmit,
+) -> Result<(MxArray, Vec<MxArray>)> {
     require_verify_chunk(verify_ids.rows(), paged_adapter, context_window)?;
     paged_verify_core(
         verify_ids,
@@ -2962,8 +3063,8 @@ pub(crate) fn run_paged_dflash2_verify_step(
         Some(gdn),
         row_budget,
         false,
-        true,
-        dflash2_verify_submit(VerifySubmit::EveryLayer),
+        planes_route,
+        submit,
     )
     .map(|(output, taps)| (output.logits, taps))
 }
@@ -3025,7 +3126,7 @@ fn paged_verify_core(
     recorded: bool,
     planes_route: bool,
     submit: VerifySubmit,
-) -> Result<(super::mtp_decode::MtpVerifyOutput, Vec<MxArray>)> {
+) -> Result<(crate::engine::mtp_decode::MtpVerifyOutput, Vec<MxArray>)> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
     #[cfg(test)]
@@ -3196,7 +3297,7 @@ fn paged_verify_core(
         embed.as_linear(&hiddens)?
     };
     Ok((
-        super::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens),
+        crate::engine::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens),
         collect_taps(taps, tap_layers)?,
     ))
 }
@@ -3766,3 +3867,7 @@ mod pass_sizing_tests {
         assert_eq!(measured.attention_ms, Some(100.0));
     }
 }
+
+#[cfg(test)]
+#[path = "paged_forward_moe_tests.rs"]
+mod paged_forward_moe_tests;

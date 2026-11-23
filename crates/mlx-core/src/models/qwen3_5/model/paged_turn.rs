@@ -152,7 +152,7 @@ impl Qwen35Inner {
         tracing::info!(
             target: "mlx_core::inference",
             event = "vlm_prefix_plan",
-            model = "qwen3_5_dense",
+            model = if self.is_moe() { "qwen3_5_moe" } else { "qwen3_5_dense" },
             prompt_tokens = expanded_tokens.len(),
             image_count = images.len(),
             image_tokens = image_token_positions.len(),

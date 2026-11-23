@@ -1,953 +1,21 @@
-//! DFlash2 whole-turn integration for Qwen3.5/3.6/3.8 MoE.
-
-use napi::bindgen_prelude::*;
-
-use crate::array::{DType, MxArray};
-use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
-
-use super::model::Qwen35MoeInner;
-use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
-use crate::models::qwen3_5::dflash2_decode::{
-    DraftedProposals, PagedVerifyLane, full_verify_ids, lend_lane, missing_cells, reclaim_lane,
-};
-use crate::models::qwen3_5::dflash2_turn::{DFlash2Target, DFlash2TurnState};
-use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
-
-pub(crate) struct Qwen35MoeDFlash2Stepper<'a> {
-    inner: &'a mut Qwen35MoeInner,
-    context: DFlash2ContextCache,
-    next_position: i32,
-    tap_layers: Vec<usize>,
-    tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
-    tapped: Option<Vec<MxArray>>,
-    verified_ids: Option<Vec<u32>>,
-    /// The lane's two GDN cells and pending tape: each verify folds the
-    /// last commit's retained rows, each commit swaps parity. Lent to the
-    /// target across the verify's claim ([`lend_lane`]).
-    gdn_blobs: Option<GdnStateBlobs>,
-    verify_confidence: Option<MxArray>,
-    verify_row_budget: Option<MxArray>,
-    paged: PagedVerifyLane,
-}
-
-// FC+merged-KV costs cross over between retained heights 6 and 7.
-fn prefer_full_width_context(keep: usize) -> bool {
-    (7..=8).contains(&keep)
-}
-
-impl Qwen35MoeDFlash2Stepper<'_> {
-    /// The verify's claim suspended and replayed the lane: the stepper takes
-    /// the draft window the tapped replay rebuilt and packs the GDN state
-    /// the replay left in the caches into fresh cells. The old cells and
-    /// their pending rows went with the vacate: the replay fed their
-    /// tokens.
-    fn adopt_replayed_lane(&mut self) -> Result<()> {
-        let Some(state) = self.inner.dflash2_turn_state.take() else {
-            return Ok(());
-        };
-        self.context = state.context;
-        self.next_position = state.next_position;
-        let tiled = self.inner.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
-        let caches =
-            self.inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
-            })?;
-        let gdn = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
-            Error::from_reason(
-                "Qwen3.5 MoE DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)",
-            )
-        })?;
-        gdn.apply_views(caches)?;
-        self.gdn_blobs = Some(gdn);
-        Ok(())
-    }
-
-    fn ensure_clean(&self, operation: &str) -> Result<()> {
-        if self.tape.is_some() || self.tapped.is_some() || self.verified_ids.is_some() {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 MoE DFlash2 {operation}: prior verify was not committed"
-            )));
-        }
-        Ok(())
-    }
-
-    /// A ring with no buffers, standing in while the lane holds the real one.
-    fn empty_ring(&self) -> Result<DFlash2ContextCache> {
-        self.inner
-            .dflash2
-            .as_ref()
-            .map(|draft| DFlash2ContextCache::new(&draft.config))
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))
-    }
-
-    /// A greedy draft of the 7 proposals after `anchor` for a cycle the
-    /// driver ran without one (Splash drafts every cycle).
-    fn draft_tail(&mut self, anchor: u32) -> Result<Vec<u32>> {
-        let draft = self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?;
-        let (path, _) = draft.propose(
-            &self.inner.embedding,
-            self.inner.lm_head.as_ref(),
-            &mut self.context,
-            anchor,
-            crate::models::qwen3_5::dflash2::DFLASH2_DRAFT_PROPOSALS,
-            0.0,
-            false,
-            None,
-            &mut rand::rng(),
-        )?;
-        match path {
-            crate::models::qwen3_5::dflash2::SelectorPath::Host(ids) => {
-                Ok(ids.into_iter().map(|id| id as u32).collect())
-            }
-            crate::models::qwen3_5::dflash2::SelectorPath::Device(ids)
-            | crate::models::qwen3_5::dflash2::SelectorPath::Sampled { ids, .. } => {
-                DraftedProposals::Device(ids).host()
-            }
-        }
-    }
-
-    /// The verify on the pool (Splash `Engine::workEndOf` for a decode
-    /// command books committed + 8); `budgeted` keeps the selector's row
-    /// budget, clamped to the driver's `ids.len()` rows (Splash
-    /// `decode_accept_dflash`: `min(remaining, verify_rows)`).
-    fn paged_verify(&mut self, ids: &[u32], budgeted: bool) -> Result<DsparkVerifyOutput> {
-        use crate::models::qwen3_5::dflash2::DFLASH2_VERIFY_ROWS;
-        if ids.is_empty() {
-            return Err(Error::from_reason(
-                "Qwen3.5 MoE DFlash2 verify block must not be empty",
-            ));
-        }
-        self.ensure_clean("verify")?;
-        if budgeted {
-            if let Some(budget) = self.verify_row_budget.take() {
-                let rows = MxArray::from_int32(&[ids.len() as i32], &[1])?;
-                self.verify_row_budget = Some(budget.minimum(&rows)?);
-            }
-        } else {
-            self.verify_confidence = None;
-            self.verify_row_budget = None;
-        }
-        let drafted = match self.paged.drafted.take() {
-            Some(drafted) => drafted.host()?,
-            None => self.draft_tail(ids[0])?,
-        };
-        let full = full_verify_ids(ids, &drafted)?;
-        let (seq, window) = (self.paged.seq, self.paged.context_window);
-        let empty = self.empty_ring()?;
-        let (lent, ring) = lend_lane(&mut self.gdn_blobs, &mut self.context, empty);
-        self.inner.dflash2_lane = lent;
-        self.inner.dflash2_context = Some(ring);
-        let claimed =
-            crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::from_reason("Qwen3.5 MoE DFlash2 paged adapter is absent")
-                    })?
-                    .reserve_rows(DFLASH2_VERIFY_ROWS as u32)
-                    .map(|_| ())
-                    .map_err(Error::from_reason)
-            });
-        reclaim_lane(
-            self.inner.dflash2_lane.take(),
-            self.inner.dflash2_context.take(),
-            &mut self.gdn_blobs,
-            &mut self.context,
-        );
-        claimed?;
-        self.adopt_replayed_lane()?;
-        let ticket =
-            crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
-                .map_err(Error::from_reason)?;
-        let mut tape = Vec::new();
-        let result = {
-            let inner = &mut *self.inner;
-            let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-            match (
-                inner.caches.as_mut(),
-                inner.paged_adapter.as_mut(),
-                self.gdn_blobs.as_ref(),
-            ) {
-                (Some(caches), Some(adapter), Some(gdn_blobs)) => {
-                    super::paged_forward::run_paged_dflash2_verify_step(
-                        &full,
-                        &inner.embedding,
-                        &mut inner.layers,
-                        caches,
-                        &inner.final_norm,
-                        &inner.lm_head,
-                        &inner.layer_kinds,
-                        adapter,
-                        &mut tape,
-                        rope_deltas,
-                        super::paged_forward::PagedVerifyExtras {
-                            tap_layers: &self.tap_layers,
-                            gdn: Some(gdn_blobs),
-                            row_budget: self.verify_row_budget.as_ref(),
-                        },
-                        window,
-                    )
-                }
-                _ => Err(Error::from_reason(
-                    "Qwen3.5 MoE DFlash2 paged verify lost its caches",
-                )),
-            }
-        };
-        let (logits, taps) = match result {
-            Ok(output) => output,
-            Err(error) => {
-                let _ =
-                    crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq, ticket, 0);
-                return Err(error);
-            }
-        };
-        self.paged.open_cycle = Some(ticket);
-        self.tape = Some(tape);
-        self.tapped = Some(taps);
-        self.verified_ids = Some(ids.to_vec());
-        let logits = logits.slice_axis(1, 0, ids.len() as i64)?;
-        Ok(DsparkVerifyOutput { logits })
-    }
-
-    /// Close the cycle the paged verify opened, keeping `keep` of its 8 rows
-    /// (Splash `Runtime::Impl::finalizeDecode`).
-    fn commit_paged_cycle(&mut self, keep: usize) -> Result<()> {
-        let seq = self.paged.seq;
-        let ticket = self.paged.open_cycle.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 commit has no open verify cycle")
-        })?;
-        crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq, ticket, keep)
-            .map_err(Error::from_reason)
-    }
-
-    fn append_tapped(&mut self, tapped: &[MxArray], token_ids: &[u32]) -> Result<()> {
-        let keep = token_ids.len();
-        let draft = self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?;
-        let full_width = prefer_full_width_context(keep)
-            && draft.config.block_size == 7
-            && tapped
-                .first()
-                .is_some_and(|hidden| hidden.shape_at(1).is_ok_and(|rows| rows == 8));
-        if full_width {
-            let fused = draft.fuse_context(tapped)?;
-            self.context
-                .append_full_width_prefix(draft, &fused, self.next_position, token_ids)?;
-        } else {
-            let kept = tapped
-                .iter()
-                .map(|hidden| hidden.slice_axis(1, 0, keep as i64))
-                .collect::<Result<Vec<_>>>()?;
-            let fused = draft.fuse_context(&kept)?;
-            self.context
-                .append(draft, &fused, self.next_position, token_ids)?;
-        }
-        self.next_position = self.next_position.saturating_add(keep as i32);
-        Ok(())
-    }
-}
-
-impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
-    fn device_sampled_rows(&self) -> bool {
-        true
-    }
-
-    fn propose(
-        &mut self,
-        anchor_id: u32,
-        max_len: usize,
-        params: &crate::engine::params::ChatParams,
-        rng: &mut dyn rand::Rng,
-    ) -> Result<DsparkProposal> {
-        let draft = self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?;
-        let temperature = params
-            .sampling_config
-            .unwrap_or_default()
-            .temperature
-            .unwrap_or(1.0);
-        // Mirror `accept_dspark_proposal`'s `greedy_fast` predicate: the
-        // device-resident path is only offered when acceptance will consume
-        // it without a mid-cycle host read. Sampled or penalized-greedy
-        // turns keep the host walk (their accept path needs host ids anyway).
-        let greedy_fast = crate::sampling::is_greedy_temperature(temperature)
-            && params.repetition_penalty == 1.0
-            && params.presence_penalty == 0.0
-            && params.frequency_penalty == 0.0;
-        self.verify_confidence = None;
-        self.verify_row_budget = None;
-        // Every cycle drafts the whole block (Splash `Runtime::decodeAsync`:
-        // one physical graph); the driver gets its cap.
-        let adaptive = params.mtp_adaptive_depth && greedy_fast;
-        let (path, draft_sparse_dists) = draft.propose(
-            &self.inner.embedding,
-            self.inner.lm_head.as_ref(),
-            &mut self.context,
-            anchor_id,
-            crate::models::qwen3_5::dflash2::DFLASH2_DRAFT_PROPOSALS,
-            temperature,
-            greedy_fast,
-            adaptive.then_some(&mut self.verify_confidence),
-            rng,
-        )?;
-        if let Some(confidence) = self.verify_confidence.as_ref() {
-            let policy = self.inner.dflash2_verify_budget.parameters(false, true);
-            let mut values = Vec::with_capacity(18);
-            values.push(policy.acceptance.slope);
-            values.extend(policy.acceptance.intercepts);
-            values.extend(policy.costs);
-            values.push(if policy.every_row { 1.0 } else { 0.0 });
-            let parameters = MxArray::from_float32(&values, &[18])?;
-            self.verify_row_budget = Some(MxArray::from_handle(
-                unsafe {
-                    mlx_sys::mlx_dflash2_verify_budget(
-                        confidence.as_raw_ptr(),
-                        parameters.as_raw_ptr(),
-                    )
-                },
-                "dflash2_verify_budget",
-            )?);
-        }
-        let (draft_ids, device_draft_ids, device_draft_sparse) = match path {
-            crate::models::qwen3_5::dflash2::SelectorPath::Device(ids) => {
-                (Vec::new(), Some(ids), None)
-            }
-            crate::models::qwen3_5::dflash2::SelectorPath::Sampled { ids, rows } => {
-                (Vec::new(), Some(ids), Some(rows))
-            }
-            crate::models::qwen3_5::dflash2::SelectorPath::Host(ids) => (ids, None, None),
-        };
-        // Queue the draft before the verify graph is built so the GPU is not
-        // idle during that host work. Off Metal this call is a blocking eval,
-        // which would only serialize the two builds.
-        if let Some(ids) = &device_draft_ids
-            && unsafe { mlx_sys::mlx_metal_is_available() }
-        {
-            let mut roots = vec![ids];
-            roots.extend(self.verify_row_budget.as_ref());
-            MxArray::async_eval_arrays(&roots);
-        }
-        let mut proposal = DsparkProposal {
-            draft_ids,
-            device_draft_ids,
-            device_draft_sparse,
-            draft_dists: Vec::new(),
-            draft_sparse_dists,
-            keep_probabilities: None,
-        };
-        self.paged.drafted = Some(match &proposal.device_draft_ids {
-            Some(ids) => DraftedProposals::Device(ids.clone()),
-            None => {
-                DraftedProposals::Host(proposal.draft_ids.iter().map(|&id| id as u32).collect())
-            }
-        });
-        proposal.truncate(max_len);
-        Ok(proposal)
-    }
-
-    /// Host verification includes teacher forcing and target-only steps: its
-    /// tokens need not be the selector's path, so it is never budgeted.
-    fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
-        self.paged_verify(verify_ids, false)
-    }
-
-    /// The pool records host ids before its write, so the device ids are
-    /// read back here.
-    fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
-        let ids = DraftedProposals::Device(verify_ids.clone()).host()?;
-        self.paged_verify(&ids, true)
-    }
-
-    fn device_verification_budget(&self) -> Option<&MxArray> {
-        self.verify_row_budget.as_ref()
-    }
-
-    fn observe_device_verification(
-        &mut self,
-        rows: usize,
-        raw_matches: usize,
-        milliseconds: f64,
-    ) -> Result<()> {
-        let Some(confidence) = self.verify_confidence.take() else {
-            return Ok(());
-        };
-        self.verify_row_budget = None;
-        // Budget is a dependent root of confidence, already forced at acceptance.
-        let values = confidence.to_float32()?;
-        let confidence: [f32; 7] = values
-            .as_ref()
-            .try_into()
-            .map_err(|_| Error::from_reason("DFlash2 confidence width changed after verify"))?;
-        self.inner
-            .dflash2_verify_budget
-            .observe(
-                super::verify_budget::CycleObservation {
-                    confidence,
-                    verify_rows: rows as u32,
-                    accepted: raw_matches as u32,
-                    labels: true,
-                },
-                false,
-                milliseconds,
-            )
-            .map_err(Error::from_reason)?;
-        Ok(())
-    }
-
-    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
-        if keep == 0 || keep > total_written {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 MoE DFlash2 invalid commit keep={keep}, total={total_written}"
-            )));
-        }
-        let tape = self
-            .tape
-            .take()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 commit has no GDN tape"))?;
-        let tapped = self
-            .tapped
-            .take()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 commit has no target taps"))?;
-        let verified_ids = self.verified_ids.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 commit has no token provenance")
-        })?;
-        if verified_ids.len() != total_written {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 MoE DFlash2 commit wrote {total_written} rows for {} token ids",
-                verified_ids.len()
-            )));
-        }
-        self.commit_paged_cycle(keep)?;
-        self.gdn_blobs
-            .as_mut()
-            .ok_or_else(missing_cells)?
-            .retain(&tape, keep)?;
-        self.append_tapped(&tapped, &verified_ids[..keep])
-    }
-
-    fn commit_with_provenance(
-        &mut self,
-        keep: usize,
-        total_written: usize,
-        verified_ids: &[u32],
-    ) -> Result<()> {
-        if verified_ids.len() != total_written {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 MoE DFlash2 commit wrote {total_written} rows for {} supplied token ids",
-                verified_ids.len()
-            )));
-        }
-        match &self.verified_ids {
-            Some(expected) if expected.as_slice() == verified_ids => {}
-            Some(_) => {
-                return Err(Error::from_reason(
-                    "Qwen3.5 MoE DFlash2 supplied commit provenance disagrees with host verify input",
-                ));
-            }
-            None => {
-                return Err(Error::from_reason(
-                    "Qwen3.5 MoE DFlash2 commit has no token provenance",
-                ));
-            }
-        }
-        self.commit(keep, total_written)
-    }
-
-    fn finish(mut self) -> Result<()> {
-        self.ensure_clean("finish")?;
-        let caches =
-            self.inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
-            })?;
-        self.gdn_blobs
-            .as_mut()
-            .ok_or_else(missing_cells)?
-            .settle(caches)?;
-        let config = self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?
-            .config
-            .clone();
-        let context = std::mem::replace(&mut self.context, DFlash2ContextCache::new(&config));
-        self.inner.dflash2_context = Some(context);
-        Ok(())
-    }
-
-    fn eval_boundary(&self, token: &MxArray) {
-        let mut arrays: Vec<&MxArray> = Vec::new();
-        crate::models::forward::CollectCacheArrays::collect_arrays(&self.inner.caches, &mut arrays);
-        self.context.collect_arrays(&mut arrays);
-        arrays.push(token);
-        MxArray::async_eval_arrays(&arrays);
-    }
-}
-
-impl DsparkBackend for Qwen35MoeInner {
-    type DsparkDecode<'a>
-        = Qwen35MoeDFlash2Stepper<'a>
-    where
-        Self: 'a;
-
-    fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>> {
-        let expected = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE has no loaded DFlash2 companion"))?
-            .config
-            .block_size;
-        if block_size != expected {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 MoE DFlash2 block size {block_size} does not match checkpoint {expected}"
-            )));
-        }
-        let state = self.dflash2_turn_state.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 decode requires tapped prefill state")
-        })?;
-        let tap_layers = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("checked DFlash2 companion"))?
-            .config
-            .target_layers
-            .clone();
-        // Pack the prefill's per-layer GDN states once per turn (two concats)
-        // into the lane's current cell; nothing is pending after a prefill.
-        let tiled = self.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
-        let caches = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent"))?;
-        let gdn_blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
-            Error::from_reason(
-                "Qwen3.5 MoE DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)",
-            )
-        })?;
-        gdn_blobs.apply_views(caches)?;
-        let seq = self
-            .paged_adapter
-            .as_ref()
-            .and_then(
-                crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::active_seq_id,
-            )
-            .ok_or_else(|| {
-                Error::from_reason("Qwen3.5 MoE DFlash2 paged turn has no active request")
-            })?;
-        let context_window = self.pool_context_limit();
-        let paged = PagedVerifyLane {
-            seq,
-            context_window,
-            open_cycle: None,
-            drafted: None,
-            _decode_limit: crate::cache_limit::coordinator().push_decode_limit(
-                crate::cache_limit::decode_cache_limit(
-                    crate::models::qwen3_5::dflash2_decode::pool_verify_cycle_bytes(
-                        &self.config.to_dense_config(),
-                        u64::from(context_window),
-                    ),
-                ),
-            ),
-        };
-        if self.active_scheduled_seq.is_none() {
-            self.serial_decode = Some(crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2);
-        }
-        Ok(Qwen35MoeDFlash2Stepper {
-            inner: self,
-            context: state.context,
-            next_position: state.next_position,
-            tap_layers,
-            tape: None,
-            tapped: None,
-            verified_ids: None,
-            gdn_blobs: Some(gdn_blobs),
-            verify_confidence: None,
-            verify_row_budget: None,
-            paged,
-        })
-    }
-}
-
-impl Drop for Qwen35MoeDFlash2Stepper<'_> {
-    fn drop(&mut self) {
-        self.inner.serial_decode = None;
-        // A turn that failed between the verify write and its commit leaves
-        // the cycle open; keeping every row closes the ticket, and the
-        // turn's abort releases the request.
-        if let Some(ticket) = self.paged.open_cycle.take() {
-            let (seq, rows) = (ticket.seq_id(), ticket.rows());
-            let _ =
-                crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq, ticket, rows);
-        }
-        // A stepper that ends without `finish` leaves its ring on the lane,
-        // which the turn's end gives to the idle lane.
-        if self.inner.dflash2_context.is_none()
-            && self.context.buffer_bytes() > 0
-            && let Some(config) = self
-                .inner
-                .dflash2
-                .as_ref()
-                .map(|draft| draft.config.clone())
-        {
-            let ring = std::mem::replace(&mut self.context, DFlash2ContextCache::new(&config));
-            self.inner.dflash2_context = Some(ring);
-        }
-    }
-}
-
-impl Qwen35MoeDFlash2Stepper<'_> {
-    fn dflash2_pool(
-        &mut self,
-        seq_id: u32,
-    ) -> std::result::Result<
-        &mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
-        String,
-    > {
-        if self.paged.seq != seq_id {
-            return Err(format!(
-                "Qwen3.5 MoE DFlash2: sequence {seq_id} is not this turn's paged sequence"
-            ));
-        }
-        self.inner
-            .paged_adapter
-            .as_mut()
-            .filter(|adapter| adapter.active_seq_id() == Some(seq_id))
-            .ok_or_else(|| {
-                format!("Qwen3.5 MoE DFlash2: sequence {seq_id} is not the active request")
-            })
-    }
-}
-
-impl crate::engine::spec_paged::SpecPagedCache for Qwen35MoeDFlash2Stepper<'_> {
-    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
-        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
-        match self.dflash2_pool(seq_id)?.reserve_rows(rows) {
-            Ok(_) => Ok(true),
-            Err(e) if e.starts_with("context_length_exceeded:") => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn record_rows(&mut self, seq_id: u32, _tokens: &[u32]) -> std::result::Result<(), String> {
-        Err(format!(
-            "Qwen3.5 MoE DFlash2 sequence {seq_id}: the verify core writes its own rows"
-        ))
-    }
-
-    fn record_verify(
-        &mut self,
-        seq_id: u32,
-        _tokens: &[u32],
-    ) -> std::result::Result<crate::engine::spec_paged::VerifyTicket, String> {
-        Err(format!(
-            "Qwen3.5 MoE DFlash2 sequence {seq_id}: the verify core writes its own rows"
-        ))
-    }
-
-    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
-        let rows = u32::try_from(rows)
-            .map_err(|_| format!("Qwen3.5 MoE DFlash2 rollback of {rows} rows does not fit u32"))?;
-        self.dflash2_pool(seq_id)?.rollback_last_tokens(rows)
-    }
-
-    fn settle_committed(
-        &mut self,
-        seq_id: u32,
-        committed_tokens: u64,
-    ) -> std::result::Result<(), String> {
-        let recorded = self.dflash2_pool(seq_id)?.request_tokens().len() as u64;
-        if committed_tokens > recorded {
-            return Err(format!(
-                "Qwen3.5 MoE DFlash2 settle_committed: committed frontier {committed_tokens} \
-                 exceeds recorded token count {recorded}"
-            ));
-        }
-        Ok(())
-    }
-
-    fn settle_captures_durable_state(&self) -> bool {
-        false
-    }
-
-    fn frontier(&self, seq_id: u32) -> Option<crate::engine::backend::SpecFrontier> {
-        let lane = Some(&self.paged).filter(|lane| lane.seq == seq_id)?;
-        let adapter = self
-            .inner
-            .paged_adapter
-            .as_ref()
-            .filter(|adapter| adapter.active_seq_id() == Some(lane.seq))?;
-        Some(crate::engine::backend::SpecFrontier {
-            attn_tokens: adapter.request_tokens().len() as u64,
-            recurrent_tokens: None,
-        })
-    }
-}
-
-impl Qwen35MoeInner {
-    /// The tapped prefill of `suffix_tokens` past `prefix`: the draft ring
-    /// it advances is the restored one, else the idle lane's; it is left in
-    /// the turn state for the stepper.
-    pub(crate) fn tapped_dflash2_prefill(
-        &mut self,
-        suffix_tokens: &[u32],
-        prefix: &<Self as crate::engine::backend::PagedBackend>::PrefixState,
-    ) -> Result<MxArray> {
-        use crate::engine::backend::PagedPrefix;
-        let config = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE has no loaded DFlash2 companion"))?
-            .config
-            .clone();
-        let cached = prefix.effective_cached_prefix_len();
-        let context = match self.dflash2_context.take() {
-            Some(context) if cached > 0 && usize::try_from(context.logical_len()) == Ok(cached) => {
-                context
-            }
-            _ if cached == 0 => self.dflash2_states.idle_lane.take_ring(&config),
-            _ => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE DFlash2 cached prefix {cached} has no retained draft context"
-                )));
-            }
-        };
-        let (logits, context) = self.moe_paged_prefill(suffix_tokens, prefix, Some(context))?;
-        let context = context.ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 prefill lost its draft context")
-        })?;
-        self.dflash2_turn_state = Some(DFlash2TurnState {
-            context,
-            next_position: i32::try_from(cached + suffix_tokens.len()).unwrap_or(i32::MAX),
-        });
-        Ok(logits)
-    }
-}
-
-impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
-    fn paged_prefill_with_draft_state(
-        &mut self,
-        suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: crate::stream::Stream,
-    ) -> Result<MxArray> {
-        crate::models::qwen3_5::dflash2_turn::suspendable_prefill(self, prefix.tokens(), |inner| {
-            inner.tapped_dflash2_prefill(suffix_tokens, prefix)
-        })
-    }
-
-    fn dspark_block_size(&self) -> Result<usize> {
-        self.dflash2
-            .as_ref()
-            .map(|draft| draft.config.block_size)
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE has no loaded DFlash2 companion"))
-    }
-
-    fn paged_spec_seq_id(&self) -> u32 {
-        self.paged_adapter
-            .as_ref()
-            .and_then(
-                crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::active_seq_id,
-            )
-            .unwrap_or(0)
-    }
-
-    fn prime_dspark_prefix_state(
-        &mut self,
-        tokens: &[u32],
-        reuse_cache: bool,
-        cache_salt: u64,
-    ) -> Result<Self::PrefixState> {
-        let seq = self.active_scheduled_seq.unwrap_or(0);
-        crate::models::qwen3_5::dflash2_turn::prime_dflash2_turn(
-            self,
-            tokens,
-            reuse_cache,
-            cache_salt,
-            seq,
-            |inner, hit| inner.prime_moe_prefix(tokens, cache_salt, Some(hit)),
-        )
-    }
-}
-
-impl DFlash2Target for Qwen35MoeInner {
-    fn dflash2(&self) -> Option<&crate::models::qwen3_5::dflash2::DFlash2Model> {
-        self.dflash2.as_ref()
-    }
-
-    fn lane_seq(&self) -> u32 {
-        self.active_scheduled_seq.unwrap_or(0)
-    }
-
-    fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
-        &self.dflash2_states
-    }
-
-    fn dflash2_states_mut(
-        &mut self,
-    ) -> &mut crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
-        &mut self.dflash2_states
-    }
-
-    fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
-        &self.vision_cache
-    }
-
-    fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
-        std::borrow::Cow::Owned(self.config.to_dense_config())
-    }
-
-    fn decode_row_expert_bytes(&self) -> u64 {
-        self.config.decode_row_expert_bytes()
-    }
-
-    fn embedding_dtype(&self) -> Result<DType> {
-        self.embedding
-            .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
-            .dtype()
-    }
-
-    fn paged_adapter_ref(
-        &self,
-    ) -> Option<&crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
-        self.paged_adapter.as_ref()
-    }
-
-    fn paged_adapter_mut_ref(
-        &mut self,
-    ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
-        self.paged_adapter.as_mut()
-    }
-    fn drop_gdn_state(&mut self, key: &crate::engine::governor::ledger::UnitKey) -> bool {
-        Self::drop_gdn_state(self, key)
-    }
-
-    fn sync_gdn_state_marks(&self) {
-        Self::sync_gdn_state_marks(self);
-    }
-
-    fn fresh_layer_caches(&self) -> Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache> {
-        self.fresh_dflash2_layer_caches()
-    }
-
-    fn adopt_parked_state(
-        &mut self,
-        caches: Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>,
-        window: crate::models::qwen3_5::dflash2::DFlash2ContextCache,
-        history: Vec<u32>,
-    ) {
-        self.adopt_parked_dflash2_state(caches, window, history);
-    }
-
-    fn replay_state_exact(&self) -> bool {
-        self.dflash2_replay_state_exact()
-    }
-
-    fn paged_block_keys(&self, tokens: usize) -> Vec<Vec<u64>> {
-        crate::engine::build_paged_extra_keys(
-            tokens,
-            self.paged_adapter
-                .as_ref()
-                .map_or(1, |adapter| adapter.block_size()),
-            &self.cached_paged_image_token_positions,
-        )
-    }
-
-    fn dflash2_turn_state_clear(&mut self) {
-        let turn = self.dflash2_turn_state.take();
-        self.dflash2_states
-            .idle_lane
-            .give_ring(turn.map(|turn| turn.context));
-    }
-
-    fn clear_draft_context(&mut self) {
-        let ring = self.dflash2_context.take();
-        self.dflash2_states.idle_lane.give_ring(ring);
-    }
-
-    fn snapshot_live_linear(
-        &mut self,
-    ) -> Result<Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>> {
-        crate::models::qwen3_5::paged_forward::snapshot_live_linear(self.caches.as_deref())
-    }
-
-    fn gdn_state_units(
-        &self,
-        keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>,
-        wanted: &crate::engine::governor::ledger::WantedChains,
-    ) -> Vec<crate::models::qwen3_5::dflash2_turn::GdnStateUnit> {
-        Self::gdn_state_units(self, keep, wanted)
-    }
-
-    fn memory_registration(
-        &self,
-    ) -> Option<&crate::engine::governor::governor::ModelGuard<'static>> {
-        self.memory_registration.as_ref()
-    }
-
-    fn serial_decode(&self) -> Option<crate::models::qwen3_5::dflash2_turn::SerialDecode> {
-        self.serial_decode.filter(|_| self.serial_text_lane())
-    }
-
-    fn serial_text_lane(&self) -> bool {
-        self.active_scheduled_seq.is_none()
-            && self.cached_image_key.is_none()
-            && self.cached_paged_image_token_positions.is_empty()
-    }
-
-    fn set_serial_decode(
-        &mut self,
-        decode: Option<crate::models::qwen3_5::dflash2_turn::SerialDecode>,
-    ) {
-        self.serial_decode = decode;
-    }
-
-    fn drop_serial_lane_state(&mut self) {
-        self.end_gdn_use(0);
-        self.caches = None;
-        self.dflash2_lane = None;
-        self.idle_dflash2_lane();
-    }
-
-    fn replay_serial_lane(
-        &mut self,
-        tokens: &[u32],
-        cache_salt: u64,
-        plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
-        decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
-        stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
-    ) -> Result<MxArray> {
-        self.replay_moe_serial_lane(tokens, cache_salt, plan, decode, stored)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::*;
     use crate::engine::backend::ChatBackend;
     use crate::engine::types::ChatConfig;
     use crate::models::quantized_linear::LinearProj;
     use crate::nn::Linear;
 
-    fn tiny_dflash_inner(seed: u64) -> Qwen35MoeInner {
+    fn tiny_dflash_inner(seed: u64) -> Qwen35Inner {
         tiny_dflash_inner_with_config(seed, |_| {})
     }
 
     fn tiny_dflash_inner_with_config(
         seed: u64,
-        adjust: impl FnOnce(&mut super::super::config::Qwen3_5MoeConfig),
-    ) -> Qwen35MoeInner {
-        let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_config(seed, adjust);
+        adjust: impl FnOnce(&mut crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig),
+    ) -> Qwen35Inner {
+        let mut inner =
+            super::super::super::model::scheduled_mtp::seeded_moe_inner_with_config(seed, adjust);
         let mut head = Linear::new(
             inner.config.hidden_size as u32,
             inner.config.vocab_size as u32,
@@ -968,7 +36,7 @@ mod tests {
         )
         .unwrap();
         inner.lm_head = Some(LinearProj::Standard(head));
-        let dense = inner.config.to_dense_config();
+        let dense = inner.config.clone();
         let draft =
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&dense).unwrap();
         draft.validate_target(&dense).unwrap();
@@ -1017,7 +85,7 @@ mod tests {
 
 #[cfg(test)]
 mod paged_dflash2_tests {
-    use super::*;
+    use super::super::*;
     use crate::engine::backend::{PagedBackend, PagedPrefix};
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::quantized_linear::LinearProj;
@@ -1031,9 +99,10 @@ mod paged_dflash2_tests {
 
     /// The seeded MoE paged fixture on an int8 pool, a sensitive random head
     /// and a draft that proposes the 7 tokens a cycle drafts.
-    fn tiny_paged_int8_moe_dflash_inner(seed: u64) -> Qwen35MoeInner {
-        let mut inner =
-            super::super::model::scheduled_mtp::seeded_inner_with_config(seed, |config| {
+    fn tiny_paged_int8_moe_dflash_inner(seed: u64) -> Qwen35Inner {
+        let mut inner = super::super::super::model::scheduled_mtp::seeded_moe_inner_with_config(
+            seed,
+            |config| {
                 config.head_dim = 256;
                 config.hidden_size = 256;
                 config.kv_format = Some("int8".to_string());
@@ -1043,7 +112,8 @@ mod paged_dflash2_tests {
                 config.linear_value_head_dim = 128;
                 config.linear_num_key_heads = 2;
                 config.linear_num_value_heads = 2;
-            });
+            },
+        );
         let mut head =
             Linear::new(inner.config.hidden_size as u32, VOCAB, Some(false)).expect("tiny head");
         head.set_weight(
@@ -1057,7 +127,7 @@ mod paged_dflash2_tests {
         )
         .expect("install tiny head");
         inner.lm_head = Some(LinearProj::Standard(head));
-        let dense = inner.config.to_dense_config();
+        let dense = inner.config.clone();
         let draft = crate::models::qwen3_5::dflash2::tiny_dflash2_model_with_block(
             &dense,
             DFLASH2_DRAFT_PROPOSALS,
@@ -1083,7 +153,7 @@ mod paged_dflash2_tests {
         Ok(ids.to_int32()?.iter().map(|&id| id as u32).collect())
     }
 
-    fn cursor(inner: &Qwen35MoeInner) -> u32 {
+    fn cursor(inner: &Qwen35Inner) -> u32 {
         inner
             .paged_adapter
             .as_ref()
@@ -1101,7 +171,7 @@ mod paged_dflash2_tests {
     fn verify_takes_the_verify_split_rule() -> Result<()> {
         // The launch probe counts every paged prefill in the process.
         if !crate::test_support::in_own_process(
-            "models::qwen3_5_moe::dflash2_decode::paged_dflash2_tests::verify_takes_the_verify_split_rule",
+            "models::qwen3_5::dflash2_decode::dflash2_decode_moe_tests::paged_dflash2_tests::verify_takes_the_verify_split_rule",
         ) {
             return Ok(());
         }
@@ -1163,17 +233,17 @@ mod paged_dflash2_tests {
     }
 
     /// Greedy paged AR: `n` tokens and the cursor after them.
-    fn paged_ar(inner: &mut Qwen35MoeInner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
-        let prefix = inner.prime_moe_prefix(prompt, 0, None)?;
+    fn paged_ar(inner: &mut Qwen35Inner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
+        let prefix = inner.prime_dense_prefix(prompt, 0, None)?;
         let suffix = &prompt[prefix.effective_cached_prefix_len()..];
-        let logits = inner.moe_paged_prefill(suffix, &prefix, None)?.0;
+        let logits = inner.dense_paged_prefill(suffix, &prefix, None)?.0;
         let mut tokens = argmax_rows(&logits)?;
         while tokens.len() < n {
             let last = *tokens.last().expect("one token");
             let embed = inner.embedding.clone();
             let caches = inner.caches.as_mut().expect("caches");
             let adapter = inner.paged_adapter.as_mut().expect("pool");
-            let logits = super::super::paged_forward::run_paged_decode_step(
+            let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
                 last,
                 &embed,
                 &mut inner.layers,
@@ -1192,7 +262,7 @@ mod paged_dflash2_tests {
     /// Paged MoE DFlash2 cycles where the first `correct` proposals of each
     /// are the reference's tokens and the next one is wrong.
     fn paged_dflash2(
-        inner: &mut Qwen35MoeInner,
+        inner: &mut Qwen35Inner,
         prompt: &[u32],
         reference: &[u32],
         correct: usize,
@@ -1605,7 +675,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
         use crate::models::qwen3_5::dflash2_state::write_behind::{MINIMUM_TOKENS, published};
         use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
-        use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
+        use crate::models::qwen3_5::model::Qwen35FamilyCommand;
         let _ctx = StreamContext::new(Stream::generation());
         let tier = persistent_test_tier("state-tier-moe-close-command", 1 << 30);
         let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8260);
@@ -1663,7 +733,7 @@ mod paged_dflash2_tests {
             .as_secs_f64()
             * 1000.0;
         let (reply, mut flushed) = tokio::sync::oneshot::channel();
-        Qwen35MoeFamilyCommand::CloseCache {
+        Qwen35FamilyCommand::CloseCache {
             deadline_ms: now_ms + 6000.0,
             reply,
         }
@@ -1780,7 +850,7 @@ mod paged_dflash2_tests {
     }
 
     /// The states on `tokens`' lineage, by depth.
-    fn draft_states(inner: &Qwen35MoeInner, tokens: &[u32]) -> Result<Vec<DraftState>> {
+    fn draft_states(inner: &Qwen35Inner, tokens: &[u32]) -> Result<Vec<DraftState>> {
         let mut states = Vec::new();
         for entry in inner.dflash2_states.store.entries() {
             if !tokens.starts_with(entry.tokens()) {
@@ -1806,7 +876,7 @@ mod paged_dflash2_tests {
 
     /// The fixture with a `rows`-row draft window, so a point's window
     /// spans prefill slices.
-    fn wide_draft_inner(seed: u64, rows: usize) -> Qwen35MoeInner {
+    fn wide_draft_inner(seed: u64, rows: usize) -> Qwen35Inner {
         let mut inner = tiny_paged_int8_moe_dflash_inner(seed);
         inner.dflash2.as_mut().expect("draft").config.sliding_window = rows;
         inner
@@ -1825,10 +895,10 @@ mod paged_dflash2_tests {
     /// The scheduled prime of `tokens` on `seq`, the sequence parked after
     /// it.
     fn scheduled_prime(
-        inner: &mut Qwen35MoeInner,
+        inner: &mut Qwen35Inner,
         seq: u32,
         tokens: &[u32],
-    ) -> Result<<Qwen35MoeInner as PagedBackend>::PrefixState> {
+    ) -> Result<<Qwen35Inner as PagedBackend>::PrefixState> {
         use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
         HybridSchedulerBackend::activate_scheduled_recurrent(inner, seq)?;
         let base = PagedBackend::prime_prefix_state(inner, tokens, true, 16, &[], 0)?;
@@ -1839,10 +909,10 @@ mod paged_dflash2_tests {
     /// The prefill slice `[start, end)` of `seq`'s request, the sequence
     /// parked after it; returns the slice's logits.
     fn scheduled_slice(
-        inner: &mut Qwen35MoeInner,
+        inner: &mut Qwen35Inner,
         seq: u32,
         tokens: &[u32],
-        base: &<Qwen35MoeInner as PagedBackend>::PrefixState,
+        base: &<Qwen35Inner as PagedBackend>::PrefixState,
         start: usize,
         end: usize,
     ) -> Result<MxArray> {
@@ -1977,7 +1047,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
         let _ctx = StreamContext::new(Stream::generation());
         let seed = 0x5_81B0;
-        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35MoeInner>> {
+        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35Inner>> {
             let mut inner = wide_draft_inner(seed, 40);
             let window = inner
                 .dflash2
@@ -1985,7 +1055,7 @@ mod paged_dflash2_tests {
                 .expect("draft")
                 .config
                 .context_window()?;
-            let dense = inner.config.to_dense_config();
+            let dense = inner.config.clone();
             attach_tier(
                 &mut inner.dflash2_states,
                 &dense,
@@ -2112,7 +1182,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
         let _ctx = StreamContext::new(Stream::generation());
         let seed = 0x5_8190;
-        let on_tier = |tier: &TestTier| -> Result<Qwen35MoeInner> {
+        let on_tier = |tier: &TestTier| -> Result<Qwen35Inner> {
             let mut inner = wide_draft_inner(seed, 40);
             let window = inner
                 .dflash2
@@ -2120,7 +1190,7 @@ mod paged_dflash2_tests {
                 .expect("draft")
                 .config
                 .context_window()?;
-            let dense = inner.config.to_dense_config();
+            let dense = inner.config.clone();
             attach_tier(
                 &mut inner.dflash2_states,
                 &dense,
@@ -2215,7 +1285,7 @@ mod paged_dflash2_tests {
     /// rows, accept, commit, queue the boundary. Returns the tokens, the
     /// cached prefix and the cycles the rows took.
     fn sampled_rows_cycles(
-        inner: &mut Qwen35MoeInner,
+        inner: &mut Qwen35Inner,
         prompt: &[u32],
         n: usize,
         seed: u64,
@@ -2268,7 +1338,7 @@ mod paged_dflash2_tests {
     /// One product whole turn (`run_paged_turn`, the draft-model plan) on
     /// `config`: (device rows cycles, (device, host) accepts).
     fn moe_product_turn(
-        inner: &mut Qwen35MoeInner,
+        inner: &mut Qwen35Inner,
         tokens: &[u32],
         config: &crate::engine::types::ChatConfig,
     ) -> Result<(usize, (usize, usize))> {

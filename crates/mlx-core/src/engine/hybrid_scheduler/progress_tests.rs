@@ -69,7 +69,7 @@ fn dense() -> HybridSchedulerState<Qwen35Inner> {
 }
 
 fn moe() -> HybridSchedulerState<Qwen35MoeInner> {
-    let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0102);
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(0x5730_0102);
     inner.tokenizer = Some(content_tokenizer());
     inner.memory_registration = Some(registration());
     inner.grant_scheduled_lanes(4);

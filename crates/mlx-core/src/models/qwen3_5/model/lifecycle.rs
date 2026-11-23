@@ -22,12 +22,26 @@ pub(crate) struct LentRecurrent {
 }
 
 impl Qwen35Inner {
-    /// Create a new Qwen35Inner with the given configuration.
+    /// Create a new dense Qwen35Inner with the given configuration.
     pub(crate) fn new(config: Qwen3_5Config) -> Result<Self> {
+        Self::new_with_moe(config, None)
+    }
+
+    /// Create a new MoE Qwen35Inner from a `Qwen3_5MoeConfig`.
+    pub(crate) fn new_moe(config: crate::models::qwen3_5_moe::Qwen3_5MoeConfig) -> Result<Self> {
+        let (base, moe) = config.split();
+        Self::new_with_moe(base, Some(moe))
+    }
+
+    /// Create a new Qwen35Inner with optional MoE parameters.
+    pub(crate) fn new_with_moe(
+        config: Qwen3_5Config,
+        moe: Option<crate::models::qwen3_5::config::Qwen35MoeParams>,
+    ) -> Result<Self> {
         let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
 
         let layers = (0..config.num_layers as usize)
-            .map(|i| DecoderLayer::new(&config, i))
+            .map(|i| DecoderLayer::new_with_moe(&config, moe.as_ref(), i))
             .collect::<Result<Vec<_>>>()?;
 
         let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
@@ -63,11 +77,12 @@ impl Qwen35Inner {
         // `persistence::apply_weights_inner`, so the module starts
         // with random init here.
         let mtp = if config.n_mtp_layers > 0 {
-            Some(Qwen3_5MTPModule::new(&config)?)
+            Some(Qwen3_5MTPModule::new_with_moe(&config, moe.as_ref())?)
         } else {
             None
         };
 
+        let is_moe = moe.is_some();
         let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
         let cache_recency = Arc::new(mlx_paged_attn::CacheRecency::new());
         let dflash2_states = crate::models::qwen3_5::dflash2_state::paged::DFlash2States::new(
@@ -76,6 +91,9 @@ impl Qwen35Inner {
         );
         Ok(Self {
             config,
+            moe_config: moe,
+            row_exact_decode_projections: false,
+            dflash2_verify_budget: Default::default(),
             wired: None,
             turn_cancel: None,
             layer_kinds,
@@ -109,7 +127,7 @@ impl Qwen35Inner {
             },
             max_context: None,
             decode_share: crate::engine::scheduler::DEFAULT_DECODE_SHARE,
-            activations: crate::models::qwen3_5::load_plan::default_activations(false, false),
+            activations: crate::models::qwen3_5::load_plan::default_activations(is_moe, false),
             planes: None,
             caches: None,
             tokenizer: None,
@@ -156,6 +174,32 @@ impl Qwen35Inner {
         })
     }
 
+    pub(crate) fn is_moe(&self) -> bool {
+        self.moe_config.is_some()
+    }
+
+    pub(crate) fn moe_config(&self) -> Option<crate::models::qwen3_5_moe::Qwen3_5MoeConfig> {
+        self.moe_config
+            .as_ref()
+            .map(|moe| moe.to_moe_config(&self.config))
+    }
+
+    pub(crate) fn family_name(&self) -> &'static str {
+        if self.is_moe() {
+            "qwen3_5_moe"
+        } else {
+            "qwen3_5"
+        }
+    }
+
+    pub(crate) fn log_label(&self) -> &'static str {
+        if self.is_moe() {
+            "Qwen3.5 MoE"
+        } else {
+            "Qwen3.5"
+        }
+    }
+
     /// Plan this load's memory once its weights are materialized (Splash
     /// `RuntimeResources::create`), then build the paged pool: it starts at
     /// the runway and grows by extents toward the plan's ceiling. A load
@@ -168,21 +212,24 @@ impl Qwen35Inner {
         // A new pool is a new cache: a parked state's block names a hash of
         // the old one.
         self.dflash2_states.clear();
+        let is_moe = self.is_moe();
+        let label = self.log_label();
+        let draft_lanes = !is_moe;
         let recurrent = self.config.recurrent_state_bytes();
         if self.clef_head.is_some()
             || self.clairic_head.is_some()
             || !crate::models::qwen3_5::load_plan::qwen35_pool_backend()
         {
             crate::models::qwen3_5::load_plan::qwen35_no_pool_format(
-                "Qwen3.5",
+                label,
                 self.config.kv_format(),
             )?;
             self.memory_plan = crate::models::qwen3_5::load_plan::plan_qwen35_load(
-                "Qwen3.5",
+                label,
                 &*self,
                 recurrent,
                 self.has_mtp_weights(),
-                true,
+                draft_lanes,
                 None,
                 self.max_memory_bytes,
                 self.max_context,
@@ -193,10 +240,10 @@ impl Qwen35Inner {
 
         let attn_layer_count = self.config.full_attention_layer_count() as u32;
         if attn_layer_count == 0 {
-            return Err(Error::from_reason(
-                "Qwen3.5 block-paged adapter: config has no full_attention layers; paged KV \
-                 cache requires at least one attention layer",
-            ));
+            return Err(Error::from_reason(format!(
+                "{label} block-paged adapter: config has no full_attention layers; paged KV \
+                 cache requires at least one attention layer"
+            )));
         }
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
@@ -204,24 +251,28 @@ impl Qwen35Inner {
         let format = self.config.kv_format();
         let heads = crate::models::qwen3_5::load_plan::PoolHeads::of(&self.config);
         let cache_dtype = crate::models::qwen3_5::load_plan::qwen35_pool_cache_dtype(
-            "Qwen3.5 block-paged adapter",
+            &format!("{label} block-paged adapter"),
             format,
             heads,
             self.config.paged_block_size(),
             crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)?,
         )?;
-        let page = crate::models::qwen3_5::load_plan::pool_page(
-            &crate::models::qwen3_5::load_plan::PageInputs {
-                heads,
-                cache_dtype,
-                draft: self.dflash2.is_some(),
-                explicit_block: self.config.paged_block_size,
-                tile: crate::models::qwen3_5::load_plan::device_builds_tile(),
-            },
-        );
-        let block_size = page.block_size;
+        let (block_size, keys_token_major) = if is_moe {
+            (self.config.paged_block_size(), false)
+        } else {
+            let page = crate::models::qwen3_5::load_plan::pool_page(
+                &crate::models::qwen3_5::load_plan::PageInputs {
+                    heads,
+                    cache_dtype,
+                    draft: self.dflash2.is_some(),
+                    explicit_block: self.config.paged_block_size,
+                    tile: crate::models::qwen3_5::load_plan::device_builds_tile(),
+                },
+            );
+            (page.block_size, page.keys_token_major)
+        };
         let layout = mlx_paged_attn::PageLayout {
-            keys_token_major: page.keys_token_major,
+            keys_token_major,
             ..mlx_paged_attn::PageLayout::default()
         };
         if self.dflash2_states.store.block_size() != block_size {
@@ -238,7 +289,7 @@ impl Qwen35Inner {
             block_size,
             cache_dtype,
         )
-        .map_err(|e| Error::from_reason(format!("Qwen3.5 block-paged adapter: {e}")))?;
+        .map_err(|e| Error::from_reason(format!("{label} block-paged adapter: {e}")))?;
         let geometry = crate::models::qwen3_5::load_plan::PoolGeometry {
             format,
             bytes_per_block,
@@ -249,11 +300,11 @@ impl Qwen35Inner {
         let mtp_weights = self.has_mtp_weights();
         let plan_now = |inner: &Self| {
             crate::models::qwen3_5::load_plan::plan_qwen35_load(
-                "Qwen3.5",
+                label,
                 inner,
                 recurrent,
                 mtp_weights,
-                true,
+                draft_lanes,
                 Some(geometry),
                 inner.max_memory_bytes,
                 inner.max_context,
@@ -261,16 +312,20 @@ impl Qwen35Inner {
             )
         };
         let mut plan = plan_now(self)?;
-        let planes_bytes = self.attached_planes_bytes();
+        let planes_bytes = if is_moe {
+            0
+        } else {
+            self.attached_planes_bytes()
+        };
         if planes_bytes > 0
             && let Some(with) = plan.as_ref()
         {
             let without = crate::models::qwen3_5::load_plan::plan_qwen35_load_freed(
-                "Qwen3.5",
+                label,
                 &*self,
                 recurrent,
                 mtp_weights,
-                true,
+                draft_lanes,
                 Some(geometry),
                 self.max_memory_bytes,
                 self.max_context,
@@ -291,26 +346,26 @@ impl Qwen35Inner {
             };
             match kept {
                 Ok(line) => {
-                    crate::utils::gguf_planes::load_line(format!("Qwen3.5 memory plan: {line}"))
+                    crate::utils::gguf_planes::load_line(format!("{label} memory plan: {line}"))
                 }
                 Err(why) => {
                     let dropped = self.detach_planes();
                     crate::array::memory::synchronize_and_clear_cache();
                     crate::utils::gguf_planes::load_line(format!(
-                        "Qwen3.5 GGUF planes dropped ({dropped} B): {why}"
+                        "{label} GGUF planes dropped ({dropped} B): {why}"
                     ));
                     plan = plan_now(self)?;
                 }
             }
         }
         let plan = plan.ok_or_else(|| {
-            Error::from_reason(
-                "Qwen3.5 memory plan: the Metal working set is unreadable; refusing an \
-                 unplanned paged pool",
-            )
+            Error::from_reason(format!(
+                "{label} memory plan: the Metal working set is unreadable; refusing an \
+                 unplanned paged pool"
+            ))
         })?;
         let pool_plan = plan.pool.ok_or_else(|| {
-            Error::from_reason("Qwen3.5 memory plan: a paged load planned no pool")
+            Error::from_reason(format!("{label} memory plan: a paged load planned no pool"))
         })?;
         let (num_blocks, max_num_blocks) = (pool_plan.runway_blocks, pool_plan.max_blocks);
         let pa_config = mlx_paged_attn::PagedAttentionConfig {
@@ -344,17 +399,26 @@ impl Qwen35Inner {
                             Arc::clone(&recency),
                         ),
                     ));
-                    let pool = mlx_paged_attn::LayerKVPool::new_with_layout(
-                        pa_config,
-                        num_blocks,
-                        max_num_blocks,
-                        cache_dtype,
-                        layout,
-                    )
-                    .map_err(|e| format!("Failed to construct Qwen3.5 KV pool: {e}"))?;
+                    let pool = if is_moe {
+                        mlx_paged_attn::LayerKVPool::new(
+                            pa_config,
+                            num_blocks,
+                            max_num_blocks,
+                            cache_dtype,
+                        )
+                    } else {
+                        mlx_paged_attn::LayerKVPool::new_with_layout(
+                            pa_config,
+                            num_blocks,
+                            max_num_blocks,
+                            cache_dtype,
+                            layout,
+                        )
+                    }
+                    .map_err(|e| format!("Failed to construct {label} KV pool: {e}"))?;
                     let adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
                         .map_err(|e| {
-                        format!("Failed to construct Qwen3.5 paged adapter: {e}")
+                        format!("Failed to construct {label} paged adapter: {e}")
                     })?;
                     Ok(adapter)
                 },
@@ -368,24 +432,26 @@ impl Qwen35Inner {
         }
         adapter.set_memory_ceiling(plan.ceiling_bytes());
         adapter.set_activations(self.activations);
-        adapter.set_planes_route(self.attached_planes_plan().store_identity());
-        crate::utils::gguf_planes::load_line(format!(
-            "Qwen3.5 state store identity: {}",
-            adapter.cache_identity()
-        ));
-        let keys = if page.keys_token_major {
+        let keys = if keys_token_major {
             "token-major"
         } else {
             "vllm"
         };
-        crate::utils::gguf_planes::load_line(format!(
-            "Qwen3.5 KV page: block_size={block_size} keys={keys}"
-        ));
+        if !is_moe {
+            adapter.set_planes_route(self.attached_planes_plan().store_identity());
+            crate::utils::gguf_planes::load_line(format!(
+                "{label} state store identity: {}",
+                adapter.cache_identity()
+            ));
+            crate::utils::gguf_planes::load_line(format!(
+                "{label} KV page: block_size={block_size} keys={keys}"
+            ));
+        }
         self.paged_adapter = Some(adapter);
         self.scheduled_recurrent
             .set_max_live_units(pool_plan.lanes as usize);
         info!(
-            "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
+            "{label} paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
              pool_kv_format={}, keys={}",
             num_blocks,
@@ -541,15 +607,24 @@ impl Qwen35Inner {
         else {
             return;
         };
-        let Some(config_json) = cold_tier_config_json(
-            &self.config,
-            &self.config.scaling(),
-            &geometry.fingerprint_component(),
-        ) else {
+        let config_json = if let Some(moe_cfg) = self.moe_config() {
+            cold_tier_config_json(
+                &moe_cfg,
+                &self.config.scaling(),
+                &geometry.fingerprint_component(),
+            )
+        } else {
+            cold_tier_config_json(
+                &self.config,
+                &self.config.scaling(),
+                &geometry.fingerprint_component(),
+            )
+        };
+        let Some(config_json) = config_json else {
             return;
         };
         let load = crate::models::qwen3_5::dflash2_state::disk::TierLoad {
-            family: "qwen3_5",
+            family: self.family_name(),
             config_json,
             dense: &dense,
             activation,
@@ -575,8 +650,33 @@ impl Qwen35Inner {
 
     /// Metal verifies DFlash2 on the block-paged pool with the fused GDN
     /// kernel, so a pool load refuses an off-contract GDN layer before its
-    /// first prefill. Off-Metal loads use the eager flat lane instead.
+    /// first prefill. Off-Metal dense loads use the eager flat lane; MoE has
+    /// no flat DFlash2 lane and refuses any pool-less load.
     pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
+        if self.is_moe() {
+            if self.dflash2.is_some() {
+                for (index, layer) in self.layers.iter().enumerate() {
+                    if let crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) =
+                        &layer.attn
+                        && let Some(needs) = gdn.deferred_verify_refusal()
+                    {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3.5 MoE DFlash2 verifies with the fused GDN kernel, which needs {needs}; \
+                             GDN layer {index} has not; load without the companion \
+                             (autoLoadDraft: false)"
+                        )));
+                    }
+                }
+            }
+            if self.dflash2.is_some() && self.paged_adapter.is_none() {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MoE DFlash2 runs on the block-paged KV pool, which this load has \
+                     none of (it needs Metal); load without the companion (autoLoadDraft: \
+                     false)",
+                ));
+            }
+            return Ok(());
+        }
         if self.dflash2.is_some() && self.paged_adapter.is_some() {
             for (index, layer) in self.layers.iter().enumerate() {
                 if let crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) =
@@ -687,7 +787,11 @@ impl Qwen35Inner {
                 .transpose()
                 .map_err(Error::from_reason)?
                 .unwrap_or(0);
-            crate::models::qwen3_5::load_plan::audit_qwen35_load("Qwen3.5", plan, pool_bytes)?;
+            crate::models::qwen3_5::load_plan::audit_qwen35_load(
+                self.log_label(),
+                plan,
+                pool_bytes,
+            )?;
         }
         Ok(self.context_limits_snapshot())
     }
@@ -702,7 +806,12 @@ impl Qwen35Inner {
                 "context_length_exceeded: paged cache is not initialized",
             ));
         }
-        constrain_paged_context_params("Qwen3.5", prompt_tokens, self.pool_context_limit(), params)
+        constrain_paged_context_params(
+            self.log_label(),
+            prompt_tokens,
+            self.pool_context_limit(),
+            params,
+        )
     }
 
     /// Store the checkpoint's parsed `generation_config.json` defaults.
@@ -1066,6 +1175,32 @@ impl Qwen35Inner {
                 "Qwen3.5 batched decode does not admit image-derived M-RoPE state",
             ));
         }
+        if self.is_moe()
+            && let [(seq_id, token_id)] = rows
+        {
+            // Preserve the established scalar decode graph for a one-row MoE
+            // wave so greedy output stays byte-identical on quantized
+            // checkpoints whose matrix kernels round differently in a batched
+            // graph.
+            self.activate_paged_seq(*seq_id)?;
+            let caches = self.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 MoE scalar scheduled decode has no recurrent state")
+            })?;
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 MoE scalar scheduled decode has no paged adapter")
+            })?;
+            return crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                *token_id,
+                &self.embedding,
+                &mut self.layers,
+                caches,
+                &self.final_norm,
+                &self.lm_head,
+                &self.layer_kinds,
+                adapter,
+                0,
+            );
+        }
         self.park_active_scheduled_recurrent()?;
         self.validate_scheduled_decode_residency(rows)?;
 
@@ -1074,12 +1209,13 @@ impl Qwen35Inner {
         // the rows selected for this decode must be present and materialized;
         // stack_rows below reads exactly this filtered set.
         let recurrent_snapshots = self.scheduled_decode_recurrent_snapshots(rows)?;
+        let family_name = self.family_name();
         let planned_rows = record_decode_wave(
             self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen3.5 batched decode requires a paged adapter")
             })?,
             rows,
-            "qwen3_5",
+            family_name,
         )
         .map_err(Error::from_reason)?;
 
@@ -1145,7 +1281,7 @@ impl Qwen35Inner {
                     adapter,
                     planned_rows,
                     gdn_cache.as_mut(),
-                    false,
+                    self.row_exact_decode_projections,
                 )?
             };
             if let Some(cache) = gdn_cache.as_ref() {
@@ -1690,21 +1826,28 @@ impl Qwen35Inner {
         }
 
         // Config JSON
-        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+        let mut config_value = if let Some(moe_cfg) = self.moe_config() {
+            serde_json::to_value(&moe_cfg)
+        } else {
+            serde_json::to_value(&self.config)
+        }
+        .map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Failed to serialize config: {e}"),
             )
         })?;
         if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+            map.insert(
+                "model_type".to_string(),
+                serde_json::json!(self.family_name()),
+            );
             // `parse_config` reads the MTP layer count ONLY from the
             // HF-convention keys `mtp_num_hidden_layers` /
             // `num_nextn_predict_layers`; the serde field name
             // `n_mtp_layers` is ignored on load. Without this, a saved MTP
             // checkpoint reloads with `n_mtp_layers = 0` and its head is
-            // silently dropped. Mirrors the MoE saver
-            // (`qwen3_5_moe::model::Qwen35MoeInner::save_model_sync`).
+            // silently dropped.
             map.insert(
                 "mtp_num_hidden_layers".to_string(),
                 serde_json::json!(self.config.n_mtp_layers),

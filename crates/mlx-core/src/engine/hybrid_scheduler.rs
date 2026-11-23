@@ -257,6 +257,8 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     ) -> LedgerTaken {
         LedgerTaken::default()
     }
+    /// Called after the scheduler releases an idle owner to reclaim memory.
+    fn note_idle_owner_reclaimed(&self) {}
     /// One tick of the model's SSD tier for its states (Splash
     /// `Engine::tick` → `pollTransfers`); true when anything landed.
     fn tick_state_disk(&mut self, _tick: crate::disk_tier::state_disk::Tick) -> bool {
@@ -2645,9 +2647,7 @@ impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
         if !self.state.release_owner(seq_id) {
             return LedgerTaken::default();
         }
-        crate::models::qwen3_5::dflash2_turn::log_reclaim(
-            crate::models::qwen3_5::dflash2_turn::GrowReclaim::Idle,
-        );
+        self.state.inner.note_idle_owner_reclaimed();
         let now_bytes = active.saturating_sub(crate::array::memory::active_memory_bytes());
         let pages = takeable(self.state).saturating_sub(blocks);
         LedgerTaken {
@@ -7812,7 +7812,7 @@ pub(crate) mod tests {
     #[test]
     fn dense_and_moe_construct_the_same_engine_scheduler() {
         let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
-        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let moe = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
         let dense_state: HybridSchedulerState<Qwen35Inner> =
             HybridSchedulerState::new(dense).expect("construct dense scheduler");
         let moe_state: HybridSchedulerState<Qwen35MoeInner> =
@@ -7890,7 +7890,8 @@ pub(crate) mod tests {
             let recency = Arc::new(mlx_paged_attn::CacheRecency::new());
             let mut dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
             dense.paged_adapter = Some(tiny_paged_adapter_with(Arc::clone(&recency), 4, 16));
-            let mut moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+            let mut moe =
+                Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
             moe.paged_adapter = Some(tiny_paged_adapter_with(recency, 4, 16));
             let dense_state: HybridSchedulerState<Qwen35Inner> =
                 HybridSchedulerState::new(dense).expect("construct dense scheduler");
@@ -8173,15 +8174,13 @@ pub(crate) mod tests {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return;
         }
-        let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner_with_config(
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner_with_config(
             0xDFA5_3504,
             |config| config.n_mtp_layers = 0,
         );
         inner.dflash2 = Some(
-            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
-                &inner.config.to_dense_config(),
-            )
-            .expect("tiny compatible draft"),
+            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
+                .expect("tiny compatible draft"),
         );
         assert!(
             !inner.supports_scheduled_speculation(),
@@ -9117,7 +9116,7 @@ pub(crate) mod tests {
     #[test]
     fn qwen35_families_clamp_scheduled_output_to_the_rest_of_the_window() {
         let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
-        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let moe = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
         assert!(dense.scheduler_output_budget_is_rest_of_window());
         assert!(moe.scheduler_output_budget_is_rest_of_window());
         if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
@@ -9180,7 +9179,7 @@ pub(crate) mod tests {
     #[test]
     fn qwen35_families_book_kv_on_demand() {
         let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
-        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let moe = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
         assert!(dense.scheduler_books_on_demand());
         assert!(moe.scheduler_books_on_demand());
         if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
@@ -11917,7 +11916,7 @@ pub(crate) mod tests {
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
         }
-        let mut inner = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE");
+        let mut inner = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE");
         let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 5, 5);
         adapter.set_grow_headroom_probe_override(Some(passing()));
         inner.paged_adapter = Some(adapter);
@@ -12780,7 +12779,7 @@ pub(crate) mod tests {
         }
         for in_reap in [false, true] {
             let mut inner =
-                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0003);
+                crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(0x5730_0003);
             inner.tokenizer = Some(vacated_stop_tokenizer());
             inner.memory_registration = Some(
                 roomy_governor()
@@ -13029,7 +13028,7 @@ pub(crate) mod tests {
         }
         for at in [StopAt::Waiting, StopAt::Expired, StopAt::FirstToken] {
             let mut inner =
-                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0005);
+                crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(0x5730_0005);
             inner.tokenizer = Some(vacated_stop_tokenizer());
             let (io, governor) = roomy_governor();
             inner.memory_registration =
@@ -13084,7 +13083,7 @@ pub(crate) mod tests {
         let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
         let dense = HybridSchedulerState::new(dense).expect("dense scheduler");
         assert!(dense.scheduler.measures_prefill_cut());
-        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let moe = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
         let moe = HybridSchedulerState::new(moe).expect("MoE scheduler");
         assert!(moe.scheduler.measures_prefill_cut());
         if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
@@ -13115,7 +13114,7 @@ pub(crate) mod tests {
         dense.decode_share = share;
         let cut = dense.measured_prefill_cut().expect("dense measures");
         assert_eq!(cut.decode_share, 0.0);
-        let mut moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let mut moe = Qwen35MoeInner::new_moe(tiny_moe_config()).expect("construct tiny MoE model");
         moe.decode_share = share;
         let cut = moe.measured_prefill_cut().expect("MoE measures");
         assert_eq!(cut.decode_share, 0.0);

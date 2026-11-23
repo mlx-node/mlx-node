@@ -4,42 +4,10 @@ use napi::bindgen_prelude::*;
 use super::cache::{DraftKvWindow, store_window_tail};
 use crate::array::MxArray;
 use crate::array::attention::scaled_dot_product_attention;
+use crate::engine::dspark_turn::non_causal_sliding_mask;
 use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::nn::{Activations, RMSNorm, RoPE};
-
-pub(super) fn non_causal_sliding_mask(
-    query_base: i32,
-    query_len: i64,
-    key_base: i32,
-    key_len: i64,
-    window: i64,
-) -> Result<Option<MxArray>> {
-    if key_len <= window {
-        return Ok(None);
-    }
-    let queries = MxArray::arange(
-        f64::from(query_base),
-        f64::from(query_base) + query_len as f64,
-        None,
-        None,
-    )?
-    .reshape(&[query_len, 1])?;
-    let keys = MxArray::arange(
-        f64::from(key_base),
-        f64::from(key_base) + key_len as f64,
-        None,
-        None,
-    )?
-    .reshape(&[1, key_len])?;
-    let window = MxArray::scalar_int(window as i32)?;
-    Ok(Some(
-        queries
-            .sub(&keys)?
-            .less(&window)?
-            .reshape(&[1, 1, query_len, key_len])?,
-    ))
-}
 
 /// The block's attention mask, keyed by what it depends on, which every
 /// draft layer shares and which repeats from cycle to cycle once the window

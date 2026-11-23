@@ -1,4 +1,3 @@
-pub(crate) use crate::engine::mtp_decode;
 pub mod arrays_cache;
 pub mod attention;
 pub mod config;
@@ -24,6 +23,7 @@ pub mod model;
 pub mod mtp;
 pub(crate) mod paged_forward;
 pub mod persistence;
+pub(crate) mod persistence_moe;
 #[cfg(all(test, target_os = "macos"))]
 mod prefill_kernel_timing;
 #[cfg(all(test, target_os = "macos"))]

@@ -317,7 +317,7 @@ pub(crate) trait ScheduledMtpTarget: Sized {
             }
             let config = params.sampling_config.unwrap_or_default();
             let greedy = is_greedy_temperature(config.temperature.unwrap_or(1.0));
-            let config = super::mtp_decode::mtp_draft_sampling_config(config);
+            let config = crate::engine::mtp_decode::mtp_draft_sampling_config(config);
             let mut device_ids = Vec::new();
             let mut distributions = Vec::new();
             for _ in 0..cap.min(MAX_DRAFTS) {

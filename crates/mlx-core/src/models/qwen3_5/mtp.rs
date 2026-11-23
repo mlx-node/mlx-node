@@ -1391,3 +1391,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "mtp_moe_tests.rs"]
+mod mtp_moe_tests;

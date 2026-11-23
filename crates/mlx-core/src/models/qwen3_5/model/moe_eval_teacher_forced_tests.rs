@@ -72,7 +72,7 @@ fn fixture_tokens() -> Vec<u32> {
 }
 
 /// Write a one-row teacher cache captured from `inner` itself.
-fn capture_self(inner: &mut Qwen35MoeInner, dir: &std::path::Path) -> Result<Vec<u32>> {
+fn capture_self(inner: &mut Qwen35Inner, dir: &std::path::Path) -> Result<Vec<u32>> {
     let tokens = fixture_tokens();
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::from_reason(format!("create {}: {e}", dir.display())))?;
@@ -95,7 +95,7 @@ fn capture_self(inner: &mut Qwen35MoeInner, dir: &std::path::Path) -> Result<Vec
     Ok(tokens)
 }
 
-fn score_self(inner: &mut Qwen35MoeInner, dir: &std::path::Path) -> Result<EvalReport> {
+fn score_self(inner: &mut Qwen35Inner, dir: &std::path::Path) -> Result<EvalReport> {
     match run(
         inner,
         EvalRequest::Score {
@@ -114,7 +114,7 @@ fn score_self(inner: &mut Qwen35MoeInner, dir: &std::path::Path) -> Result<EvalR
 
 /// Replace the tied lookup/head table so the model is a DIFFERENT
 /// checkpoint answering the same token ids.
-fn perturb_tied_head(inner: &mut Qwen35MoeInner) -> Result<()> {
+fn perturb_tied_head(inner: &mut Qwen35Inner) -> Result<()> {
     let weight = inner.embedding.get_weight();
     inner.embedding = Embedding::from_weight(&weight.mul_scalar(1.35)?.add_scalar(0.01)?)?;
     Ok(())
@@ -122,7 +122,7 @@ fn perturb_tied_head(inner: &mut Qwen35MoeInner) -> Result<()> {
 
 fn run_moe_self_identity() -> Result<()> {
     let dir = scratch_dir();
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg())?;
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg())?;
     let tokens = capture_self(&mut inner, &dir)?;
 
     let report = score_self(&mut inner, &dir)?;
@@ -147,9 +147,6 @@ fn run_moe_self_identity() -> Result<()> {
         report.mean_nll
     );
 
-    // A perturbed head is a different checkpoint on the same ids: if the
-    // score path ignored the student and echoed the cache, this would still
-    // report zero.
     perturb_tied_head(&mut inner)?;
     let perturbed = score_self(&mut inner, &dir)?;
     assert_eq!(perturbed.positions, report.positions);

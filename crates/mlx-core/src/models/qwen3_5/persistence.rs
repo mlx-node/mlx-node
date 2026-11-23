@@ -14,12 +14,13 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
-    AffineSidecarPromotion, InputAmaxPolicy, PlainFp8Residency, QlBuildSpec, QlTiling, build_ql,
-    default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
-    ensure_affine_biases_present, ensure_dense_weight_floating,
-    ensure_kquant_storage_resolves_kquant, ensure_row_major_kquant_layout, has_sym8_mode,
-    is_kquant_mode, merge_per_layer, mode_to_str, parse_mode_str, parse_quant_settings,
-    resolve_default_mode, select_quantization_block,
+    AffineSidecarPromotion, InputAmaxPolicy, PlainFp8Residency, QlBuildSpec, QlTiling,
+    QslBuildSpec, QslFp8Policy, QslSym8Policy, build_ql, build_qsl, default_per_layer_quant,
+    defer_plain_fp8_materialization, effective_plq_for, ensure_affine_biases_present,
+    ensure_dense_weight_floating, ensure_kquant_storage_resolves_kquant,
+    ensure_row_major_kquant_layout, has_kquant_mode, has_sym8_mode, is_kquant_mode,
+    merge_per_layer, mode_to_str, parse_mode_str, parse_quant_settings, resolve_default_mode,
+    select_quantization_block,
 };
 use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -41,17 +42,27 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner};
+pub use super::persistence_moe::{
+    create_random_qwen35_moe_checkpoint, create_random_qwen35_moe_checkpoint_sync,
+    load_moe_for_tool, load_moe_with_thread,
+};
+#[cfg(test)]
+pub(crate) use super::persistence_moe::{load_moe_tool_source, sanitize_weights_moe};
+pub(crate) use super::persistence_moe::{
+    load_moe_with_source, mtp_expert_keys, parse_moe_config, settled_compute_dtype,
+};
 #[cfg(test)]
 use crate::models::quant_dispatch::ensure_int8_storage_resolves_sym8;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
-    PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    release_tiled_kquant_sources,
+    PerLayerQuant, QuantizedSwitchLinear, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, release_tiled_kquant_sources,
 };
 #[cfg(test)]
 use crate::models::quantized_linear::{
     try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
+use crate::moe::SwitchGLU;
 use crate::vision::qwen::processing::QwenImageProcessor;
 
 const DISABLE_PACKED_QWEN_EMBEDDING_ENV: &str = "MLX_DISABLE_PACKED_QWEN_EMBEDDING";
@@ -1841,7 +1852,8 @@ fn pin_load_kv_format(
 /// same byte size as the released originals) and add the returned CLEF
 /// residency byte delta: the pre-pass replaces packed backbone groups with
 /// int8 or bf16 arrays of a different size.
-fn apply_weights_inner_with_residency(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_weights_inner_with_residency(
     inner: &mut Qwen35Inner,
     params: &mut HashMap<String, MxArray>,
     config: &Qwen3_5Config,
@@ -1869,10 +1881,14 @@ fn apply_weights_inner_with_residency(
     // (Clairic checkpoints match `mlx_engine.py::PreciseRMSNorm`).
     preserve_fp32_norms: bool,
 ) -> Result<(PlainFp8Residency, i64)> {
+    let is_moe = inner.is_moe();
+    let family = inner.family_name();
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+    let default_gate_plq =
+        is_moe.then(|| super::persistence_moe::compute_moe_gate_default(default_mode));
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
     // The completeness gate at the end judges the CHECKPOINT, so it reads the
     // key set as loaded, not the map after tiled sources were released.
@@ -1916,7 +1932,18 @@ fn apply_weights_inner_with_residency(
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
      -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
-        let plq = resolve_plq_for(&per_layer_quant, prefix, default_plq);
+        let plq = if is_moe {
+            effective_plq_for(prefix, &per_layer_quant, default_plq, default_gate_plq)
+        } else {
+            resolve_plq_for(&per_layer_quant, prefix, default_plq)
+        };
+        let promote_affine_sidecars = if is_moe {
+            AffineSidecarPromotion::None
+        } else if clef {
+            AffineSidecarPromotion::ToBf16
+        } else {
+            AffineSidecarPromotion::ToF32For(compute_dtype)
+        };
         let built = build_ql(
             params,
             prefix,
@@ -1924,12 +1951,8 @@ fn apply_weights_inner_with_residency(
             QlBuildSpec {
                 tiling: QlTiling::TileCollect(&mut tiled_prefixes.borrow_mut()),
                 input_amax: InputAmaxPolicy::ActivationFp8SitesOnly,
-                promote_affine_sidecars: if clef {
-                    AffineSidecarPromotion::ToBf16
-                } else {
-                    AffineSidecarPromotion::ToF32For(compute_dtype)
-                },
-                ..QlBuildSpec::standard("qwen3_5")
+                promote_affine_sidecars,
+                ..QlBuildSpec::standard(family)
             },
         )?;
         let built = match built {
@@ -1942,6 +1965,32 @@ fn apply_weights_inner_with_residency(
             (Some(ql), Some(transform)) => Some(ql.with_sym8_hadamard(transform.clone())?),
             (built, _) => built,
         };
+        if let Some(linear) = built.as_ref() {
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
+        }
+        Ok(built)
+    };
+
+    let try_build_qsl = |params: &HashMap<String, MxArray>,
+                         prefix: &str|
+     -> Result<Option<QuantizedSwitchLinear>> {
+        let plq = effective_plq_for(prefix, &per_layer_quant, default_plq, default_gate_plq);
+        let built = build_qsl(
+            params,
+            prefix,
+            plq,
+            QslBuildSpec {
+                family: "qwen3_5_moe",
+                validate_storage: true,
+                fp8: QslFp8Policy::Allow,
+                sym8: QslSym8Policy::RejectExplicitOrScaled(&per_layer_quant),
+                nvfp4_only: false,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: None,
+            },
+        )?;
         if let Some(linear) = built.as_ref() {
             plain_fp8_residency
                 .borrow_mut()
@@ -1983,9 +2032,9 @@ fn apply_weights_inner_with_residency(
         // fail loud before the embedding/tied-lm_head sidecars reach a mode that
         // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
         // affine). Mirrors the linear builders' guard on `try_build_ql`.
-        ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5")?;
-        ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5")?;
-        ensure_row_major_kquant_layout(plq, "embedding", "qwen3_5")?;
+        ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, family)?;
+        ensure_affine_biases_present(params, "embedding", plq.mode, family)?;
+        ensure_row_major_kquant_layout(plq, "embedding", family)?;
         // Every inference consumer now carries `Embedding` itself: flat and
         // paged lookup call `forward`, tied logits call `as_linear`, MTP draft /
         // verify gather through `forward`, and VLM text merge does the same.
@@ -2040,12 +2089,16 @@ fn apply_weights_inner_with_residency(
 
     // Final norm
     if let Some(w) = params.get("final_norm.weight") {
-        let w = if preserve_fp32_norms {
-            w.astype(DType::Float32)?
+        if is_moe {
+            inner.final_norm.set_weight(w)?;
         } else {
-            super::sidecar_to_compute_dtype(w, norm_dtype)?
-        };
-        inner.final_norm.set_weight(&w)?;
+            let w = if preserve_fp32_norms {
+                w.astype(DType::Float32)?
+            } else {
+                super::sidecar_to_compute_dtype(w, norm_dtype)?
+            };
+            inner.final_norm.set_weight(&w)?;
+        }
     }
     if preserve_fp32_norms {
         inner.final_norm.set_precise_f32();
@@ -2434,24 +2487,182 @@ fn apply_weights_inner_with_residency(
                     mlp.finalize_gate_up()?;
                 }
             }
-            MLPType::Dense(MLPVariant::Quantized { .. }) | MLPType::MoE(_) => {}
+            MLPType::Dense(MLPVariant::Quantized { .. }) => {}
+            MLPType::MoE(moe) => {
+                if is_quantized {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
+                        moe.set_quantized_gate(ql);
+                    } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
+                        moe.set_gate_weight(w)?;
+                    }
+
+                    let gate_proj_key = format!("{}.mlp.switch_mlp.gate_proj", prefix);
+                    let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
+                    let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
+
+                    let q_gate = try_build_qsl(params, &gate_proj_key)?;
+                    let q_up = try_build_qsl(params, &up_proj_key)?;
+                    let q_down = try_build_qsl(params, &down_proj_key)?;
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                        let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
+                        moe.set_switch_mlp(quantized_switch);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", gate_proj_key), w)?;
+                            moe.set_switch_mlp_gate_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", up_proj_key), w)?;
+                            moe.set_switch_mlp_up_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", down_proj_key), w)?;
+                            moe.set_switch_mlp_down_proj_weight(w);
+                        }
+                    }
+
+                    let se_gate_key = format!("{}.mlp.shared_expert.gate_proj", prefix);
+                    let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
+                    let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
+
+                    let q_se_gate = try_build_ql(params, &se_gate_key)?;
+                    let q_se_up = try_build_ql(params, &se_up_key)?;
+                    let q_se_down = try_build_ql(params, &se_down_key)?;
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
+                        moe.set_quantized_shared_expert(qg, qu, qd)?;
+                        if moe.finalize_grouped_layout()? {
+                            tiled_prefixes.borrow_mut().extend([
+                                gate_proj_key.clone(),
+                                up_proj_key.clone(),
+                                down_proj_key.clone(),
+                            ]);
+                        }
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_gate_key), w)?;
+                            moe.set_shared_expert_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_up_key), w)?;
+                            moe.set_shared_expert_up_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_down_key), w)?;
+                            moe.set_shared_expert_down_proj_weight(w)?;
+                        }
+                    }
+
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))?
+                    {
+                        moe.set_quantized_shared_expert_gate(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
+                        moe.set_gate_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_gate_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_up_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_down_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_up_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_down_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                }
+            }
         }
 
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-            let w = if preserve_fp32_norms {
-                w.astype(DType::Float32)?
+            if is_moe {
+                layer.set_input_layernorm_weight_raw(w)?;
             } else {
-                w.clone()
-            };
-            layer.set_input_layernorm_weight(&w, norm_dtype)?;
+                let w = if preserve_fp32_norms {
+                    w.astype(DType::Float32)?
+                } else {
+                    w.clone()
+                };
+                layer.set_input_layernorm_weight(&w, norm_dtype)?;
+            }
         }
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-            let w = if preserve_fp32_norms {
-                w.astype(DType::Float32)?
+            if is_moe {
+                layer.set_post_attention_layernorm_weight_raw(w)?;
             } else {
-                w.clone()
-            };
-            layer.set_post_attention_layernorm_weight(&w, norm_dtype)?;
+                let w = if preserve_fp32_norms {
+                    w.astype(DType::Float32)?
+                } else {
+                    w.clone()
+                };
+                layer.set_post_attention_layernorm_weight(&w, norm_dtype)?;
+            }
         }
         if preserve_fp32_norms {
             layer.set_precise_f32_norms();
@@ -2470,28 +2681,44 @@ fn apply_weights_inner_with_residency(
     // The speculative-decode loop is the only intended caller of
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
+    let moe_config_ref = inner.moe_config.as_ref();
+    let mtp_body = if is_moe {
+        super::mtp::Qwen3_5MTPModule::mtp_mlp_variant(config, moe_config_ref)
+    } else {
+        crate::models::mtp_drafter::DrafterBodyVariant::Dense
+    };
     if let Some(mtp) = inner.mtp.as_mut() {
-        if has_sym8_mode(top_level_mode, &per_layer_quant) {
+        let mtp_blocked_by_quant = has_sym8_mode(top_level_mode, &per_layer_quant)
+            || (is_moe && has_kquant_mode(top_level_mode, &per_layer_quant));
+        if mtp_blocked_by_quant {
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
-                 supported on the sym8 path; disabling speculative MTP.",
+                "{}: imported-quant checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on this quant path; disabling speculative MTP.",
+                if is_moe { "Qwen3.5-MoE" } else { "Qwen3.5" },
                 config.n_mtp_layers
             );
         } else {
             let missing_mtp = crate::models::mtp_drafter::missing_required_mtp_keys(
                 params,
-                crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+                mtp_body,
                 config.n_mtp_layers,
             );
             if missing_mtp.is_empty() {
-                mtp.apply_weights(params, default_plq, None, &per_layer_quant, compute_dtype)?;
+                mtp.apply_weights(
+                    params,
+                    default_plq,
+                    default_gate_plq,
+                    &per_layer_quant,
+                    compute_dtype,
+                )?;
                 inner.mtp_weights_loaded = true;
             } else {
                 inner.mtp_weights_loaded = false;
                 warn!(
-                    "Qwen3.5 config declares {} MTP layer(s), but MTP weights are incomplete; \
+                    "{} config declares {} MTP layer(s), but MTP weights are incomplete; \
                      disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                    if is_moe { "Qwen3.5-MoE" } else { "Qwen3.5" },
                     config.n_mtp_layers,
                     &missing_mtp[..missing_mtp.len().min(12)],
                     missing_mtp.len()
@@ -2501,7 +2728,7 @@ fn apply_weights_inner_with_residency(
     }
 
     // Validate mandatory weights
-    validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len())?;
+    validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len(), is_moe)?;
 
     Ok((plain_fp8_residency.into_inner(), clef_byte_delta))
 }
@@ -2513,6 +2740,7 @@ fn validate_mandatory_weights(
     keys: &std::collections::HashSet<String>,
     config: &Qwen3_5Config,
     num_layers: usize,
+    is_moe: bool,
 ) -> Result<()> {
     let mut missing_mandatory = Vec::new();
     if !keys.contains("embedding.weight") {
@@ -2521,7 +2749,10 @@ fn validate_mandatory_weights(
     if !keys.contains("final_norm.weight") {
         missing_mandatory.push("final_norm.weight".to_string());
     }
-    if !config.tie_word_embeddings && !keys.contains("lm_head.weight") {
+    if !config.tie_word_embeddings
+        && !keys.contains("lm_head.weight")
+        && !(is_moe && keys.contains("lm_head.scales"))
+    {
         missing_mandatory.push("lm_head.weight".to_string());
     }
 
@@ -2540,7 +2771,12 @@ fn validate_mandatory_weights(
             layers_missing_attn.push(i);
         }
         let has_mlp = keys.contains(&format!("{}.mlp.gate_proj.weight", prefix))
-            || keys.contains(&format!("{}.mlp.gate_proj.scales", prefix));
+            || keys.contains(&format!("{}.mlp.gate_proj.scales", prefix))
+            || (is_moe
+                && (keys.contains(&format!("{}.mlp.gate.weight", prefix))
+                    || keys.contains(&format!("{}.mlp.gate.scales", prefix))
+                    || keys.contains(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    || keys.contains(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix))));
         if !has_mlp {
             layers_missing_mlp.push(i);
         }

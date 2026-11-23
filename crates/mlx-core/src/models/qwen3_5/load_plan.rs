@@ -33,9 +33,9 @@ use super::dflash2::DFlash2Config;
 use super::dflash2_decode::{pool_decode_step_bytes, pool_lane_transient};
 use super::dflash2_turn::DFlash2Target;
 use super::persistence::{
-    compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
+    compute_dtype_of, mtp_expert_keys, mtp_sidecar_candidates, normalize_mtp_weight_key,
+    qwen35_text_key, settled_compute_dtype,
 };
-use crate::models::qwen3_5_moe::persistence::{mtp_expert_keys, settled_compute_dtype};
 
 /// The pool's element type for `format`. BF16 pages hold any compute dtype
 /// cast to bf16; int8 pages need BF16 rows. Either format exists only where
@@ -1043,9 +1043,11 @@ struct EstimatePlans {
 fn estimate_plans(label: &str, input: &EstimateInput<'_>) -> Result<Option<EstimatePlans>> {
     let raw = read_config_json(input.asset_dir)?;
     let (mut config, mtp_body, expert_row_bytes) = if input.moe {
-        let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
-        let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
-        (moe.to_dense_config(), body, moe.decode_row_expert_bytes())
+        let moe = super::persistence::parse_moe_config(&raw)?;
+        let (base, moe_params) = moe.split();
+        let body = super::mtp::Qwen3_5MTPModule::mtp_mlp_variant(&base, Some(&moe_params));
+        let expert_bytes = moe_params.decode_row_expert_bytes(&base);
+        (base, body, expert_bytes)
     } else {
         (
             crate::models::qwen3_5::persistence::parse_config(&raw)?,

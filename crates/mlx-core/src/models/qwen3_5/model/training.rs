@@ -516,7 +516,10 @@ impl Qwen35Inner {
 
         // Get model parameters
         let params = self.get_parameters_sync()?;
-        let model_type = ModelType::Qwen35Dense(self.config.clone());
+        let model_type = match self.moe_config() {
+            Some(cfg) => ModelType::Qwen35Moe(cfg),
+            None => ModelType::Qwen35Dense(self.config.clone()),
+        };
 
         // Build completion/logprob refs, optionally filtering by valid_indices from
         // the engine's degenerate-completion filter. prompt_refs always has one
@@ -862,7 +865,10 @@ impl Qwen35Inner {
 
         // Get model parameters
         let params = self.get_parameters_sync()?;
-        let model_type = crate::training_model::ModelType::Qwen35Dense(self.config.clone());
+        let model_type = match self.moe_config() {
+            Some(cfg) => crate::training_model::ModelType::Qwen35Moe(cfg),
+            None => crate::training_model::ModelType::Qwen35Dense(self.config.clone()),
+        };
 
         // Build loss config from SftEngineConfig
         let loss_config = crate::sft::SftLossConfig {
@@ -1264,13 +1270,38 @@ impl Qwen35Inner {
                                 }
                             }
                         } else if name.contains(".mlp.") {
-                            if let Some(mlp) = layer.mlp.as_dense_mut() {
-                                if name.ends_with(".gate_proj.weight") {
-                                    mlp.set_gate_proj_weight(updated_param)?;
-                                } else if name.ends_with(".up_proj.weight") {
-                                    mlp.set_up_proj_weight(updated_param)?;
-                                } else if name.ends_with(".down_proj.weight") {
-                                    mlp.set_down_proj_weight(updated_param)?;
+                            match &mut layer.mlp {
+                                crate::models::qwen3_5::decoder_layer::MLPType::Dense(mlp) => {
+                                    if name.ends_with(".gate_proj.weight") {
+                                        mlp.set_gate_proj_weight(updated_param)?;
+                                    } else if name.ends_with(".up_proj.weight") {
+                                        mlp.set_up_proj_weight(updated_param)?;
+                                    } else if name.ends_with(".down_proj.weight") {
+                                        mlp.set_down_proj_weight(updated_param)?;
+                                    }
+                                }
+                                crate::models::qwen3_5::decoder_layer::MLPType::MoE(moe) => {
+                                    if name.ends_with(".mlp.gate.weight") {
+                                        moe.set_gate_weight(updated_param)?;
+                                    } else if name.contains(".mlp.switch_mlp.") {
+                                        if name.ends_with(".gate_proj.weight") {
+                                            moe.set_switch_mlp_gate_proj_weight(updated_param);
+                                        } else if name.ends_with(".up_proj.weight") {
+                                            moe.set_switch_mlp_up_proj_weight(updated_param);
+                                        } else if name.ends_with(".down_proj.weight") {
+                                            moe.set_switch_mlp_down_proj_weight(updated_param);
+                                        }
+                                    } else if name.contains(".mlp.shared_expert_gate.") {
+                                        moe.set_shared_expert_gate_weight(updated_param)?;
+                                    } else if name.contains(".mlp.shared_expert.") {
+                                        if name.ends_with(".gate_proj.weight") {
+                                            moe.set_shared_expert_gate_proj_weight(updated_param)?;
+                                        } else if name.ends_with(".up_proj.weight") {
+                                            moe.set_shared_expert_up_proj_weight(updated_param)?;
+                                        } else if name.ends_with(".down_proj.weight") {
+                                            moe.set_shared_expert_down_proj_weight(updated_param)?;
+                                        }
+                                    }
                                 }
                             }
                         } else if name.ends_with(".input_layernorm.weight") {

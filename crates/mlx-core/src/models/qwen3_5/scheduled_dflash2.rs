@@ -21,7 +21,9 @@ use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
 };
 use crate::engine::params::ChatParams;
-use crate::engine::scheduled_verify::{ScheduledDraftVerify, ScheduledVerifyBatch};
+use crate::engine::scheduled_verify::{
+    ScheduledDraftVerify, ScheduledVerifyBatch, partition_verify_wave_groups,
+};
 use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
 
 fn missing_lane(seq: u32) -> Error {
@@ -96,27 +98,17 @@ pub(crate) fn wave_unready(layers: &[DecoderLayer], hidden: i64) -> Result<Optio
 /// order. None on a load that is not wave-ready; an autoregressive peer's
 /// row, and a lane whose cells cannot be lent, run alone beside the waves.
 fn wave_groups(inner: &Qwen35Inner, rows: &[(PagedRaggedRow, Vec<u32>)]) -> Vec<Vec<usize>> {
-    let lanes = &inner.dflash2_states.seq_lanes;
     if !inner.dflash2_wave_ready {
         return Vec::new();
     }
-    let plain: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, (row, ids))| {
-            ids.len() == DFLASH2_VERIFY_ROWS
-                && lanes
-                    .get(&row.seq_id)
-                    .is_some_and(|lane| lane.open.is_none())
-                && inner.can_lend_scheduled_recurrent(row.seq_id)
-        })
-        .map(|(index, _)| index)
-        .collect();
-    plain
-        .chunks(WAVE_LANES)
-        .filter(|group| group.len() >= 2)
-        .map(<[usize]>::to_vec)
-        .collect()
+    let lanes = &inner.dflash2_states.seq_lanes;
+    partition_verify_wave_groups(rows, WAVE_LANES, |(row, ids)| {
+        ids.len() == DFLASH2_VERIFY_ROWS
+            && lanes
+                .get(&row.seq_id)
+                .is_some_and(|lane| lane.open.is_none())
+            && inner.can_lend_scheduled_recurrent(row.seq_id)
+    })
 }
 
 /// One verify wave over `group` (indexes of `rows`): every lane's cells lent

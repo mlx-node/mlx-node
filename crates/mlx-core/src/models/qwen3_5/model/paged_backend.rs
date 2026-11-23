@@ -476,7 +476,8 @@ impl Qwen35Inner {
     /// Whether `seq`'s scheduled text prefill takes the draft-lane path of
     /// [`Self::dense_paged_prefill`], the one that can stop between layers.
     pub(crate) fn prefill_takes_passes(&self, seq: u32) -> bool {
-        self.dflash2.is_some()
+        !self.is_moe()
+            && self.dflash2.is_some()
             && !self.scheduled_mtp.owners.contains_key(&seq)
             && self.dflash2_states.turns.contains_key(&seq)
             && self.cached_rope_deltas.unwrap_or(0) == 0
@@ -760,7 +761,8 @@ impl Qwen35Inner {
             );
             return Ok((Some(logits), Some(context), None));
         }
-        let draft_lane = self.dflash2.is_some()
+        let draft_lane = !self.is_moe()
+            && self.dflash2.is_some()
             && mtp_seq.is_none()
             && self
                 .active_scheduled_seq
@@ -940,6 +942,10 @@ impl crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> for Qwen
     ) -> Result<()> {
         crate::models::qwen3_5::dflash2_turn::reached(self, row, outcome)
     }
+
+    fn use_store_epilogue(&self) -> bool {
+        !self.is_moe()
+    }
 }
 
 impl PagedBackend for Qwen35Inner {
@@ -969,7 +975,7 @@ impl PagedBackend for Qwen35Inner {
                 cache_salt,
             );
         }
-        if self.dflash2.is_some() {
+        if !self.is_moe() && self.dflash2.is_some() {
             return crate::models::qwen3_5::dflash2_turn::prime_scheduled_draft_lane(
                 self,
                 plan,
@@ -1116,7 +1122,9 @@ impl PagedBackend for Qwen35Inner {
             } else {
                 params
             };
-        profiler.set_label("chat_paged_mtp_eager");
+        if !self.is_moe() {
+            profiler.set_label("chat_paged_mtp_eager");
+        }
         MxArray::async_eval_arrays(&[&y]);
         let mut rng = rand::rng();
         let outcome = crate::engine::mtp_turn::run_mtp_turn(
@@ -1464,10 +1472,12 @@ impl Qwen35Inner {
             self.dflash2_prefix
                 .note_drop("paged_whole_turn", DropKind::Dirtied);
         }
-        self.want_paged_mtp_prompt_hidden = matches!(
-            args.plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ) && self.has_mtp_weights();
+        self.want_paged_mtp_prompt_hidden = !self.is_moe()
+            && matches!(
+                args.plan.decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+            )
+            && self.has_mtp_weights();
         self.pending_prompt_hidden = None;
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,

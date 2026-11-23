@@ -150,15 +150,10 @@ impl Qwen3_5MoeConfig {
         self.rope_scaling.unwrap_or_default()
     }
 
-    /// Tokens per paged KV block; also the granularity of DFlash2 prefix
-    /// accounting.
-    pub(crate) fn paged_block_size(&self) -> u32 {
-        self.paged_block_size.unwrap_or(16)
-    }
-
     /// BF16 bytes for one request's complete GDN conv + recurrent state.
     /// The MoE feed-forward layers are stateless; full-attention K/V is
     /// accounted independently by the paged allocator.
+    #[cfg(test)]
     pub(crate) fn recurrent_state_bytes(&self) -> u64 {
         self.to_dense_config().recurrent_state_bytes()
     }
@@ -168,6 +163,7 @@ impl Qwen3_5MoeConfig {
     /// outputs with their unsort and weighting copies, the shared expert's
     /// gate / up / SwiGLU (all bf16), and the router's bf16 logits and f32
     /// probabilities.
+    #[cfg(test)]
     pub(crate) fn decode_row_expert_bytes(&self) -> u64 {
         let dim = |v: i32| v.max(0) as u64;
         let top_k = dim(self.num_experts_per_tok);

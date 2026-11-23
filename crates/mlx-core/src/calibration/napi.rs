@@ -234,7 +234,6 @@ pub async fn calibrate_activation_amax_raw(
     calib_seq: u32,
 ) -> Result<u32> {
     use crate::models::qwen3_5::model::Qwen35FamilyCommand;
-    use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
 
     // Serialize the WHOLE clear→prefill→take→write section against any other
     // calibration run: the running-max map is process-global, so two interleaved
@@ -292,7 +291,7 @@ pub async fn calibrate_activation_amax_raw(
             .await?;
             prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
-                    Qwen35MoeFamilyCommand::CalibratePrefillRaw {
+                    Qwen35FamilyCommand::CalibratePrefillRaw {
                         texts,
                         calib_seq,
                         reply,

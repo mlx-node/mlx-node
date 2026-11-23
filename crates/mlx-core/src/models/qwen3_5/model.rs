@@ -39,6 +39,7 @@ use crate::transformer::paged_policy::record_decode_wave;
 use crate::engine;
 #[cfg(test)]
 use crate::engine::extract_chat_params;
+use crate::engine::mtp_decode;
 use crate::engine::{
     apply_all_penalties, compute_performance_metrics, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
@@ -57,7 +58,6 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 };
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::mtp::Qwen3_5MTPModule;
-use crate::models::qwen3_5::mtp_decode;
 use crate::models::qwen3_5::persistence;
 use crate::vision::qwen::encoder::QwenVisionEncoder;
 use crate::vision::qwen::processing::QwenImageProcessor;
@@ -74,7 +74,9 @@ mod flat_dflash2;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
-pub(crate) use lifecycle::{LentRecurrent, cold_tier_config_json};
+pub(crate) use lifecycle::LentRecurrent;
+#[cfg(test)]
+pub(crate) use lifecycle::cold_tier_config_json;
 mod mtp;
 mod paged_backend;
 pub(crate) mod restore;
@@ -149,6 +151,14 @@ mod paged_context_capacity_tests;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// MoE-specific parameters when this instance backs a `Qwen3_5MoeModel`;
+    /// `None` for dense Qwen3.5 / Qwen3.8 models.
+    pub(crate) moe_config: Option<super::config::Qwen35MoeParams>,
+    /// Preserves row-exact quantized matmul semantics in batched MoE decode
+    /// waves when quantized weights are sensitive to 1-ULP router input deltas.
+    pub(crate) row_exact_decode_projections: bool,
+    /// Adaptive GPU verify-row budget tracker used by MoE DFlash2 decode.
+    pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     /// The in-flight turn's cooperative-cancel flag, installed by the
     /// sync and streaming session wrappers via
     /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
@@ -1011,3 +1021,15 @@ pub(crate) mod dflash2_park_tests;
 
 #[cfg(test)]
 mod lane_state_tests;
+
+#[cfg(test)]
+mod moe_paged_tests;
+
+#[cfg(test)]
+mod mask_free_full_attention_parity_tests;
+
+#[cfg(test)]
+mod moe_eval_teacher_forced_tests;
+
+#[cfg(test)]
+mod moe_paged_speculative_routing_tests;

@@ -174,7 +174,7 @@ impl Qwen35Inner {
         Ok(true)
     }
 
-    pub(super) fn find_dense_gdn_prefix_checkpoint(
+    pub(crate) fn find_dense_gdn_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
         requested_prefix_len: u32,
@@ -319,7 +319,7 @@ impl Qwen35Inner {
         );
     }
 
-    pub(super) fn publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
+    pub(crate) fn publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
         &mut self,
         tokens: &[u32],
         extra_keys_per_block: &[Vec<u64>],
@@ -377,7 +377,7 @@ impl Qwen35Inner {
         crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
-    pub(super) fn prepare_dense_gdn_prefix_state(
+    pub(crate) fn prepare_dense_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,

@@ -168,7 +168,8 @@ impl Qwen35Inner {
     }
 
     fn parks_restore(&self, tokens: &[u32], reuse_cache: bool) -> bool {
-        if !reuse_cache
+        if self.is_moe()
+            || !reuse_cache
             || self.dflash2.is_none()
             || self.draft_lane_turn()
             || self.cached_rope_deltas.unwrap_or(0) != 0

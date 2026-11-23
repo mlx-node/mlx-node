@@ -71,7 +71,7 @@ mod free_released_wiring_tests {
             (
                 "qwen35moe-3d-experts",
                 NativeGgufFamily::Qwen35Moe,
-                "models/qwen3_5_moe/persistence.rs",
+                "models/qwen3_5/persistence_moe.rs",
             ),
             (
                 "gemma4-mmproj",

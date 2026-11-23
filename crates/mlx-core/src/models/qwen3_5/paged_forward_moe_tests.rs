@@ -1,0 +1,1273 @@
+//! Inline tests for the chunked paged-prefill driver in this module.
+//!
+//! These mirror the Phase B (Qwen3) parity tests in
+//! `crates/mlx-core/src/models/qwen3/model.rs`: a synthetic
+//! `Qwen3_5MoeConfig` is built with a tiny vocab + a tiny number of
+//! layers spanning both `Linear` (GDN) and `FullAttentionPaged`
+//! kinds, weights are cast to BFloat16 to match the paged pool's
+//! K/V dtype, and the chunked path is compared against the
+//! single-shot path on a same-prompt fresh-adapter run.
+//!
+//! Each parity test pins MLX's PRNG via `mlx_sys::mlx_seed` before
+//! constructing the model so weight init is reproducible across
+//! `cargo test` invocations. Without that, weight init varies per
+//! run and the chunked-vs-single-shot drift magnitude wanders from
+//! `~5e-2` to `~2e-1` with occasional argmax flips, which would
+//! turn the parity assertion into a flaky check. With a fixed
+//! seed both `max_abs_diff` and the argmax index are bit-stable.
+//!
+//! **All tests are `#[ignore]`-marked.** They require a Metal
+//! GPU; on machines without Metal, `Qwen35Inner::new` can
+//! throw a foreign C++ exception BEFORE Rust receives an `Err`,
+//! aborting the test process with `fatal runtime error: Rust
+//! cannot catch foreign exceptions, aborting`. String-matching
+//! the no-Metal error message is therefore unsafe in CI/sandboxes,
+//! so we gate the tests behind `--ignored` instead. Run with:
+//!
+//! ```bash
+//! cargo test -p mlx-core --lib qwen3_5_moe -- --ignored
+//! ```
+//!
+//! The default `cargo test` run does NOT execute these. They also
+//! skip when the env var `MLX_PAGED_PREFILL_CHUNK_SIZE` is set to
+//! a non-zero value for the default-path test (process-global
+//! OnceLock pollution).
+
+use super::*;
+use crate::array::DType;
+use crate::models::qwen3_5::decoder_layer::compute_layer_kinds;
+use crate::models::qwen3_5::model::Qwen35Inner;
+use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+
+/// Build a tiny MoE config that exercises both Linear (GDN) and
+/// FullAttentionPaged layer kinds. With `num_layers=8` and
+/// `full_attention_interval=4`, layers 3 and 7 are full-attention
+/// (the default Qwen3.5 placement); the rest are GDN. This gives
+/// us 2 full-attention layers and 6 GDN layers — enough to verify
+/// state propagation across chunks for both kinds.
+fn moe_paged_tiny_config() -> Qwen3_5MoeConfig {
+    // `head_dim = 32` chosen to satisfy the paged Metal kernel's
+    // valid-head-size whitelist `[32, 64, 80, 96, 112, 120, 128,
+    // 192, 256, 512]`. `hidden_size = num_heads * head_dim = 128`
+    // keeps q_proj output dimension consistent. Linear (GDN) head
+    // dims also bumped to 32 so all attention paths share a
+    // dtype-compatible layout.
+    Qwen3_5MoeConfig {
+        rope_scaling: None,
+        vocab_size: 128,
+        hidden_size: 128,
+        num_layers: 8,
+        num_heads: 4,
+        num_kv_heads: 2,
+        intermediate_size: 128,
+        rms_norm_eps: 1e-6,
+        head_dim: 32,
+        tie_word_embeddings: true,
+        attention_bias: false,
+        max_position_embeddings: 256,
+        pad_token_id: 0,
+        eos_token_id: 0,
+        bos_token_id: 0,
+        linear_num_value_heads: 4,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 32,
+        linear_value_head_dim: 32,
+        linear_conv_kernel_dim: 4,
+        full_attention_interval: 4,
+        partial_rotary_factor: 0.25,
+        rope_theta: 100_000.0,
+        num_experts: 4,
+        num_experts_per_tok: 2,
+        decoder_sparse_step: 1,
+        shared_expert_intermediate_size: None,
+        moe_intermediate_size: None,
+        norm_topk_prob: true,
+        mlp_only_layers: None,
+        paged_cache_memory_mb: Some(256),
+        paged_block_size: Some(16),
+        n_mtp_layers: 0,
+        qwen35_gguf_gdn_layout: None,
+        kv_format: None,
+    }
+}
+
+/// Recursively cast every weight in the freshly-constructed
+/// `Qwen35Inner` to BFloat16 so the K/V the full-attention layers
+/// produce matches the paged pool's `MetalDtype::BFloat16`. Without
+/// this `update_keys_values` rejects the F32 K/V the random-init
+/// weights would otherwise produce.
+///
+/// We walk every named-MxArray weight surface reachable through
+/// public setters: embedding, final norm, layer norms, the
+/// full-attention `Qwen3_5Attention` projections (q/k/v/o + qn/kn),
+/// the GDN `GatedDeltaNet` projections (in_proj_qkvz, in_proj_ba,
+/// conv1d, norm, out_proj, dt_bias), the dense MLP (gate/up/down)
+/// for non-MoE layers, and the SparseMoeBlock surfaces (gate,
+/// shared_expert_gate, shared expert gate/up/down, switch_mlp
+/// gate/up/down) for MoE layers.
+///
+/// **NOT cast** (deliberately): GDN `a_log` — a documented
+/// pattern, mlx-lm's `cast_predicate` excludes `A_log` from dtype
+/// casting (it stays f32 and is cast on-the-fly inside
+/// `compute_g`). Casting it would diverge from mlx-lm semantics.
+fn cast_moe_inner_weights_bf16(inner: &mut Qwen35Inner) {
+    use crate::models::quantized_linear::MLPVariant;
+    use crate::models::qwen3_5::decoder_layer::{AttentionType, MLPType};
+    let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
+
+    // Embedding.
+    let w = inner.embedding.get_weight();
+    inner.embedding.set_weight(&cast(&w)).expect("set embed");
+
+    // Final norm.
+    let w = inner.final_norm.get_weight();
+    inner
+        .final_norm
+        .set_weight(&cast(&w))
+        .expect("set final_norm");
+
+    // LM head: tied to embedding, no separate weights to cast.
+
+    // Per-layer.
+    for layer in inner.layers.iter_mut() {
+        // Layer norms.
+        let w = layer.get_input_layernorm_weight();
+        layer
+            .set_input_layernorm_weight_raw(&cast(&w))
+            .expect("set in ln");
+        let w = layer.get_post_attention_layernorm_weight();
+        layer
+            .set_post_attention_layernorm_weight_raw(&cast(&w))
+            .expect("set post ln");
+
+        // Attention.
+        match &mut layer.attn {
+            AttentionType::Full(attn) => {
+                let w = attn.get_q_proj_weight();
+                attn.set_q_proj_weight(&cast(&w)).expect("set q_proj");
+                let w = attn.get_k_proj_weight();
+                attn.set_k_proj_weight(&cast(&w)).expect("set k_proj");
+                let w = attn.get_v_proj_weight();
+                attn.set_v_proj_weight(&cast(&w)).expect("set v_proj");
+                let w = attn.get_o_proj_weight();
+                attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
+                let w = attn.get_q_norm_weight();
+                attn.set_q_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set q_norm");
+                let w = attn.get_k_norm_weight();
+                attn.set_k_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set k_norm");
+            }
+            AttentionType::Linear(gdn) => {
+                // dt_bias must be cast FIRST: `set_norm_weight` derives
+                // its target dtype from `self.dt_bias.dtype()`, so a
+                // late dt_bias cast leaves norm.weight at the wrong
+                // dtype.
+                let w = gdn.get_dt_bias();
+                gdn.set_dt_bias(&cast(&w));
+                let w = gdn.get_in_proj_qkvz_weight();
+                gdn.set_in_proj_qkvz_weight(&cast(&w))
+                    .expect("set in_proj_qkvz");
+                let w = gdn.get_in_proj_ba_weight();
+                gdn.set_in_proj_ba_weight(&cast(&w))
+                    .expect("set in_proj_ba");
+                let w = gdn.get_conv1d_weight();
+                gdn.set_conv1d_weight(&cast(&w), DType::BFloat16)
+                    .expect("set conv1d");
+                let w = gdn.get_norm_weight();
+                gdn.set_norm_weight(&cast(&w), DType::BFloat16)
+                    .expect("set norm");
+                let w = gdn.get_out_proj_weight();
+                gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
+                // a_log stays f32 (mlx-lm cast_predicate excludes it).
+            }
+        }
+
+        // MLP / MoE.
+        match &mut layer.mlp {
+            MLPType::Dense(mlp_variant) => {
+                if let MLPVariant::Standard(mlp) = mlp_variant {
+                    let w = mlp.get_gate_proj_weight();
+                    mlp.set_gate_proj_weight(&cast(&w)).expect("set gate_proj");
+                    let w = mlp.get_up_proj_weight();
+                    mlp.set_up_proj_weight(&cast(&w)).expect("set up_proj");
+                    let w = mlp.get_down_proj_weight();
+                    mlp.set_down_proj_weight(&cast(&w)).expect("set down_proj");
+                }
+                // MLPVariant::Quantized: weights are pre-quantized,
+                // not directly cast-able. Synthetic configs build
+                // Standard variants only.
+            }
+            MLPType::MoE(moe) => {
+                // Router gate.
+                let w = moe.get_gate_weight();
+                moe.set_gate_weight(&cast(&w)).expect("set moe gate");
+                // Shared expert.
+                let w = moe.get_shared_expert_gate_proj_weight();
+                moe.set_shared_expert_gate_proj_weight(&cast(&w))
+                    .expect("set shared_expert gate_proj");
+                let w = moe.get_shared_expert_up_proj_weight();
+                moe.set_shared_expert_up_proj_weight(&cast(&w))
+                    .expect("set shared_expert up_proj");
+                let w = moe.get_shared_expert_down_proj_weight();
+                moe.set_shared_expert_down_proj_weight(&cast(&w))
+                    .expect("set shared_expert down_proj");
+                let w = moe.get_shared_expert_gate_weight();
+                moe.set_shared_expert_gate_weight(&cast(&w))
+                    .expect("set shared_expert gate");
+                // Switch (per-expert) projections.
+                let w = moe.get_switch_mlp().get_gate_proj_weight();
+                moe.set_switch_mlp_gate_proj_weight(&cast(&w));
+                let w = moe.get_switch_mlp().get_up_proj_weight();
+                moe.set_switch_mlp_up_proj_weight(&cast(&w));
+                let w = moe.get_switch_mlp().get_down_proj_weight();
+                moe.set_switch_mlp_down_proj_weight(&cast(&w));
+            }
+        }
+    }
+}
+
+/// Read the full contents of a 1-D `[vocab]` `MxArray` to a host
+/// `Vec<f32>`. Goes via `astype(F32)` + per-element `item_at_float32`
+/// so it works on bf16 logits as well.
+fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
+    let f32_arr = logits.astype(DType::Float32).expect("astype f32");
+    f32_arr.eval();
+    let n = f32_arr.shape_at(0).expect("shape_at(0)") as usize;
+    (0..n)
+        .map(|i| f32_arr.item_at_float32(i).expect("item_at_float32"))
+        .collect()
+}
+
+fn materialized_linear_cache_values(caches: &[Qwen3_5LayerCache]) -> Vec<Vec<f32>> {
+    let mut values = Vec::new();
+    for cache in caches {
+        let Qwen3_5LayerCache::Linear(arrays) = cache else {
+            continue;
+        };
+        for slot in 0..2 {
+            let array = arrays.get(slot).expect("materialized linear cache slot");
+            let array = array.astype(DType::Float32).expect("cache astype f32");
+            array.eval();
+            let size = array.size().expect("cache size") as usize;
+            values.push(
+                (0..size)
+                    .map(|index| {
+                        array
+                            .item_at_float32(index)
+                            .expect("materialized cache item")
+                    })
+                    .collect(),
+            );
+        }
+    }
+    values
+}
+
+/// Run the prefill against a freshly-reset adapter via the public
+/// `run_paged_prefill_chunk_with_size` helper. Encapsulates the
+/// boilerplate (init caches, reset adapter, allocate suffix) so
+/// each parity test stays focused on the comparison.
+///
+/// Returns `Ok(Some(logits_vec))` on success, `Ok(None)` if the
+/// run hit a "no Metal device" / "Metal GPU not available" error
+/// (in which case the caller should skip the test), and `Err`
+/// for any other failure.
+fn run_one(inner: &mut Qwen35Inner, prompt: &[u32], chunk_size: i32) -> Result<Option<Vec<f32>>> {
+    // Init caches if not yet initialized.
+    if inner.caches.is_none() {
+        inner.init_caches_sync()?;
+    } else {
+        inner.reset_caches_sync()?;
+        inner.init_caches_sync()?;
+    }
+
+    let layer_kinds = compute_layer_kinds(inner.config.num_layers as usize, |i| {
+        inner.config.is_linear_layer(i)
+    });
+    let num_layers = inner.layers.len();
+    let _ = num_layers;
+
+    // Reset adapter and allocate suffix blocks.
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.reset_for_new_request(0).expect("reset");
+        let prefix = adapter
+            .find_cached_prefix(prompt, &[], 0, false)
+            .expect("find_cached_prefix");
+        assert_eq!(prefix.cached_token_count, 0);
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate_suffix_blocks");
+    }
+
+    let logits = {
+        let embed = inner.embedding.clone();
+        match super::run_paged_prefill_chunk_with_size(
+            prompt,
+            prompt,
+            0,
+            false,
+            &embed,
+            inner,
+            &layer_kinds,
+            chunk_size,
+            /* cached_rope_deltas */ 0,
+            None,
+            None,
+        ) {
+            Ok((l, _)) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let v = logits_to_f32_vec(&logits);
+
+    // Cleanup. We deliberately DO NOT call
+    // `register_full_blocks_for_reuse` so a subsequent run on the
+    // same prompt sees `cached_token_count = 0` from
+    // `find_cached_prefix`. This keeps single-shot vs chunked
+    // comparisons apples-to-apples (same fresh-cold-cache start).
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.release_request().expect("release_request");
+    }
+    Ok(Some(v))
+}
+
+/// A native failure at a MoE paged prefill chunk's eval fails the
+/// prefill with MLX's text.
+/// Mutation F1_MOE_CHUNK (the chunk eval drops its error) → red.
+#[test]
+fn a_failed_moe_prefill_chunk_eval_fails_the_prefill() {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_failed_moe_prefill_chunk_eval_fails_the_prefill",
+    ) || !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device()
+    {
+        return;
+    }
+    const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(0x5730_0003);
+    let prompt: Vec<u32> = (0u32..40).map(|i| (i * 7 + 3) % 16).collect();
+    let _armed = crate::array::fail_native_call_at("paged_prefill_chunk", OOM);
+    let error = run_one(&mut inner, &prompt, 16).expect_err("the chunk eval fails");
+    assert_eq!(
+        error.reason,
+        format!("MLX eval failed in paged_prefill_chunk while materializing 1 arrays: {OOM}")
+    );
+}
+
+/// **Parity test (multi-chunk)**: 96-token prompt with chunk_size=16
+/// (6 chunks) must produce the same final-token logits as the
+/// single-shot path (chunk_size=0). This is the primary correctness
+/// guarantee: if any chunk-boundary bug exists in either the
+/// full-attention K/V write path OR the GDN linear-attention
+/// recurrent-state propagation, this test fails. Asserts via
+/// `assert_logit_parity_relaxed` (tight `max_abs_diff <= 0.25` +
+/// argmax-must-match — see helper rustdoc for tolerance rationale).
+///
+/// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
+/// chunked-vs-single-shot drift is reproducible across runs;
+/// observed `max_abs_diff = 0.0693`, argmax stable at idx=69 (M3,
+/// pre scalar-RoPE-axis fix — the magnitude will differ after that
+/// fix since both paths' rotation angles changed; the 0.25 budget
+/// rationale below is unchanged).
+/// Requires Metal GPU; run with `--ignored`.
+///
+/// Skips on hosts whose half-precision GEMM fails the
+/// `test_support::half_gemm_untrustworthy` canary: this config's
+/// q_proj (K=128, N=256) and fallback-SDPA matmuls (K=32 scores)
+/// sit inside the vendored-MLX NAX unaligned-K broken regime on
+/// gen>=17 GPUs, where chunk length changes which kernel class each
+/// token's math takes and parity deterministically breaks O(1)
+/// (observed 0.86-0.91 with argmax flips on M5 Max) with no chunking
+/// bug present.
+///
+/// `Qwen35Inner::new` can throw a foreign C++ exception on
+/// machines without Metal, which aborts the test process before
+/// Rust can catch the failure.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits() {
+    if crate::test_support::half_gemm_untrustworthy() {
+        eprintln!(
+            "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits: \
+             half-precision GEMM fails the K=64/N=64 canary on this host \
+             (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+             single-shot parity is not meaningful here"
+        );
+        return;
+    }
+    unsafe {
+        mlx_sys::mlx_seed(0xC0DEC0DE);
+    }
+    let cfg = moe_paged_tiny_config();
+    let mut inner = match Qwen35Inner::new_moe(cfg.clone()) {
+        Ok(i) => i,
+        Err(err) => {
+            let msg = err.reason.to_string();
+            if msg.contains("No Metal device found") || msg.contains("No Metal device") {
+                eprintln!(
+                    "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits \
+                     (no Metal): {msg}"
+                );
+                return;
+            }
+            panic!("unexpected Qwen35Inner::new failure: {msg}");
+        }
+    };
+    cast_moe_inner_weights_bf16(&mut inner);
+
+    // 96 tokens — vocab_size=128, modulo to stay in range.
+    let prompt: Vec<u32> = (0u32..96).map(|i| (i * 7 + 3) % 128).collect();
+
+    // ---- Run 1: single-shot ----
+    let single_vec = match run_one(&mut inner, &prompt, /* chunk_size */ 0) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits: \
+                 no Metal device available"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected single-shot prefill failure: {}", e.reason),
+    };
+    assert_eq!(single_vec.len(), cfg.vocab_size as usize);
+    for (i, v) in single_vec.iter().enumerate() {
+        assert!(v.is_finite(), "single-shot logits[{i}] not finite: {v}");
+    }
+
+    // ---- Run 2: chunked, chunk_size = 16 (6 chunks) ----
+    let chunked_vec = match run_one(&mut inner, &prompt, /* chunk_size */ 16) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits \
+                 (Metal failure on second run)"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected chunked prefill failure: {}", e.reason),
+    };
+    assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
+
+    assert_logit_parity_relaxed(&single_vec, &chunked_vec, "MoE chunked-vs-single-shot");
+}
+
+/// A block-aligned prompt snapshots one block before its end, matching the
+/// prefix lookup's `prompt.len() - 1` cap. A one-block rollback therefore
+/// restores exactly, while a full-boundary hit replays only one GDN block.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_dense_paged_prefill_captures_exact_gdn_block_checkpoint() {
+    unsafe {
+        mlx_sys::mlx_seed(0xC0DEC0DE);
+    }
+    let cfg = moe_paged_tiny_config();
+    let mut inner = Qwen35Inner::new_moe(cfg.clone()).expect("construct tiny MoE model");
+    inner
+        .initialize_paged_adapter()
+        .expect("initialize paged adapter");
+    cast_moe_inner_weights_bf16(&mut inner);
+
+    let prompt: Vec<u32> = (0u32..32).map(|i| (i * 13 + 9) % 128).collect();
+    let single_shot_logits = run_one(&mut inner, &prompt, 0)
+        .expect("single-shot prefill")
+        .expect("Metal-backed single-shot logits");
+
+    inner.reset_caches_sync().expect("reset MoE caches");
+    inner.init_caches_sync().expect("initialize MoE caches");
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.reset_for_new_request(0).expect("reset request");
+        let prefix = adapter
+            .find_cached_prefix(&prompt, &[], 0, false)
+            .expect("find cached prefix");
+        assert_eq!(prefix.cached_token_count, 0);
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate suffix blocks");
+    }
+
+    let layer_kinds = compute_layer_kinds(inner.config.num_layers as usize, |i| {
+        inner.config.is_linear_layer(i)
+    });
+    let (logits, checkpoint) = {
+        let embed = inner.embedding.clone();
+        super::run_paged_prefill_chunk_with_size(
+            &prompt,
+            &prompt,
+            0,
+            false,
+            &embed,
+            &mut inner,
+            &layer_kinds,
+            2048,
+            0,
+            None,
+            None,
+        )
+        .expect("MoE checkpoint prefill")
+    };
+    let checkpoint_logits = logits_to_f32_vec(&logits);
+    assert_eq!(checkpoint_logits.len(), cfg.vocab_size as usize);
+    if !crate::test_support::half_gemm_untrustworthy() {
+        assert_logit_parity_relaxed(
+            &single_shot_logits,
+            &checkpoint_logits,
+            "MoE stable checkpoint split vs single-shot",
+        );
+    }
+
+    let mut checkpoints = checkpoint;
+    let checkpoint = checkpoints
+        .pop()
+        .expect("stable reusable-block GDN checkpoint");
+    assert_eq!(checkpoint.prefix_len, 16);
+    for (layer, cache) in inner.layers.iter().zip(&checkpoint.caches) {
+        if !layer.is_linear() {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = cache else {
+            panic!("linear layer checkpoint used a full-attention cache");
+        };
+        assert!(arrays.get(0).is_some(), "missing convolution state");
+        assert!(arrays.get(1).is_some(), "missing recurrent state");
+    }
+
+    let block_size = inner
+        .paged_adapter
+        .as_ref()
+        .expect("paged_adapter")
+        .block_size();
+    let cache_salt = 0x51DE_CAFE;
+    let extra_keys =
+        crate::engine::build_paged_extra_keys(prompt.len(), block_size, &[(0, 0xA63B_1280)]);
+    inner.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
+        &prompt,
+        &extra_keys,
+        cache_salt,
+        vec![checkpoint],
+    );
+    crate::engine::backend::ChatBackend::set_cache_owner_id(
+        &mut inner,
+        "child-session",
+        Some("root-session"),
+    );
+    assert!(
+        inner
+            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt,)
+            .is_none(),
+        "an exact token/hash checkpoint owned by another session must not restore"
+    );
+    crate::engine::backend::ChatBackend::set_cache_owner_id(&mut inner, "", None);
+    let restored = inner
+        .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt)
+        .expect("exact checkpoint restore");
+    assert_eq!(restored.0, 16);
+    assert_eq!(restored.1.len(), inner.layers.len());
+
+    let prepared = inner
+        .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, cache_salt, false)
+        .expect("prepare one-block rollback checkpoint");
+    assert_eq!(prepared.state, "checkpoint");
+    assert!(prepared.already_primed);
+    assert_eq!(prepared.restored_prefix_tokens, 16);
+    assert_eq!(prepared.replayed_prefix_tokens, 0);
+
+    let prepared = inner
+        .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, cache_salt, false)
+        .expect("prepare full-boundary hit from stable checkpoint");
+    assert_eq!(prepared.state, "checkpoint_replay_materialized");
+    assert!(prepared.already_primed);
+    assert_eq!(prepared.restored_prefix_tokens, 16);
+    assert_eq!(prepared.replayed_prefix_tokens, 16);
+
+    let mut mutated_prompt = prompt.clone();
+    mutated_prompt[7] ^= 1;
+    assert!(
+        inner
+            .find_dense_gdn_prefix_checkpoint(
+                &mutated_prompt,
+                16,
+                block_size,
+                &extra_keys,
+                cache_salt,
+            )
+            .is_none(),
+        "a token mutation inside the cached prefix must reject the sidecar"
+    );
+    assert!(
+        inner
+            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt + 1,)
+            .is_none(),
+        "a different cache namespace must reject the sidecar"
+    );
+
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("paged_adapter")
+        .release_request()
+        .expect("release request");
+}
+
+/// A checkpoint miss replays the cached GDN prefix in bounded,
+/// materialized chunks. The resulting recurrent state must match the
+/// original one-shot replay before it is used to prefill the suffix.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_moe_materialized_gdn_replay_matches_one_shot_state() {
+    unsafe {
+        mlx_sys::mlx_seed(0xC0DEC0DE);
+    }
+    let cfg = moe_paged_tiny_config();
+    let mut inner = Qwen35Inner::new_moe(cfg).expect("construct tiny MoE model");
+    cast_moe_inner_weights_bf16(&mut inner);
+    inner.init_caches_sync().expect("initialize MoE caches");
+    let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+
+    {
+        let embed = inner.embedding.clone();
+        let caches = inner.caches.as_mut().expect("one-shot caches");
+        super::run_gdn_only_prefill(&prompt, &embed, &mut inner.layers, caches)
+            .expect("one-shot GDN replay");
+        materialize_linear_layer_caches(caches).expect("materialize one-shot GDN state");
+    }
+    let one_shot = materialized_linear_cache_values(inner.caches.as_ref().expect("caches"));
+
+    inner.reset_caches_sync().expect("reset MoE caches");
+    inner.init_caches_sync().expect("reinitialize MoE caches");
+    {
+        let embed = inner.embedding.clone();
+        let caches = inner.caches.as_mut().expect("chunked caches");
+        super::run_gdn_only_prefill_materialized_with_chunk_size(
+            &prompt,
+            &embed,
+            &mut inner.layers,
+            caches,
+            7,
+            None,
+        )
+        .expect("bounded GDN replay");
+    }
+    let chunked = materialized_linear_cache_values(inner.caches.as_ref().expect("caches"));
+
+    assert_eq!(one_shot.len(), chunked.len());
+    let mut max_abs_diff = 0.0f32;
+    for (slot, (expected, actual)) in one_shot.iter().zip(&chunked).enumerate() {
+        assert_eq!(expected.len(), actual.len(), "cache slot {slot} length");
+        for (&expected, &actual) in expected.iter().zip(actual) {
+            assert!(expected.is_finite() && actual.is_finite());
+            max_abs_diff = max_abs_diff.max((expected - actual).abs());
+        }
+    }
+    assert!(
+        max_abs_diff <= 0.25,
+        "bounded GDN replay diverged from one-shot state: max_abs_diff={max_abs_diff}"
+    );
+}
+
+/// Fresh per-layer caches matching `model.rs`'s private
+/// `fresh_moe_layer_caches`, for staged-replay tests.
+fn fresh_tiny_moe_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
+    (0..inner.config.num_layers as usize)
+        .map(|i| {
+            if inner.config.is_linear_layer(i) {
+                Qwen3_5LayerCache::new_linear()
+            } else {
+                Qwen3_5LayerCache::new_full_attention()
+            }
+        })
+        .collect()
+}
+
+/// H1b regression: a cancel flag observed between materialized replay
+/// chunks must abort the replay with the distinguished error, and the
+/// staged-commit wrapper must drop the partial state (no warm publish).
+/// A one-chunk replay stays single-shot and ignores the flag.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_moe_materialized_gdn_replay_cancels_between_chunks() {
+    use std::sync::Arc;
+
+    use crate::models::qwen3_5::gdn_checkpoint_store::replay_gdn_cache_and_commit;
+
+    let cfg = moe_paged_tiny_config();
+    let mut inner = Qwen35Inner::new_moe(cfg).expect("construct tiny MoE model");
+    cast_moe_inner_weights_bf16(&mut inner);
+    inner.init_caches_sync().expect("initialize MoE caches");
+    let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+    let embed = inner.embedding.clone();
+    let cancelled = Arc::new(AtomicBool::new(true));
+
+    // Multi-chunk replay with the flag pre-set: chunk 1 runs, the
+    // between-chunk poll aborts before chunk 2, and the staged cache is
+    // dropped — the active cache is never published.
+    {
+        let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+        let staged = fresh_tiny_moe_caches(&inner);
+        let layers = &mut inner.layers;
+        let err = replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+            super::run_gdn_only_prefill_materialized_with_chunk_size(
+                &prompt,
+                &embed,
+                layers,
+                staged,
+                7,
+                Some(cancelled.as_ref()),
+            )
+        })
+        .expect_err("cancelled multi-chunk replay must abort");
+        assert!(
+            err.to_string().contains("prefill cancelled"),
+            "replay abort must carry the distinguished error, got: {err}",
+        );
+        assert!(
+            active.is_none(),
+            "a cancelled replay must never publish the staged cache"
+        );
+    }
+
+    // One-chunk exception: the same pre-set flag is ignored when the
+    // whole prefix fits in a single replay chunk (single-shot contract).
+    {
+        let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+        let staged = fresh_tiny_moe_caches(&inner);
+        let layers = &mut inner.layers;
+        replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+            super::run_gdn_only_prefill_materialized_with_chunk_size(
+                &prompt,
+                &embed,
+                layers,
+                staged,
+                prompt.len(),
+                Some(cancelled.as_ref()),
+            )
+        })
+        .expect("single-chunk replay stays uncancellable");
+        assert!(active.is_some(), "a completed replay must publish");
+    }
+
+    // Un-set flag: the multi-chunk replay completes and publishes.
+    cancelled.store(false, Ordering::Relaxed);
+    {
+        let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+        let staged = fresh_tiny_moe_caches(&inner);
+        let layers = &mut inner.layers;
+        replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+            super::run_gdn_only_prefill_materialized_with_chunk_size(
+                &prompt,
+                &embed,
+                layers,
+                staged,
+                7,
+                Some(cancelled.as_ref()),
+            )
+        })
+        .expect("uncancelled multi-chunk replay must complete");
+        assert!(active.is_some(), "a completed replay must publish");
+    }
+}
+
+/// **Uneven-tail parity test**: 97-token prompt with chunk_size=16
+/// produces 6 full chunks of 16 + 1 trailing chunk of 1 token. This
+/// is the worst case for off-by-one bugs at chunk boundaries — the
+/// trailing 1-token chunk's `chunk_start_position = 96` is not
+/// aligned to a block boundary, and the explicit causal mask in
+/// the full-attention path must be built with `num_tokens=1,
+/// offset=96`. Compared against single-shot for the same 97-token
+/// prompt. Asserts via `assert_logit_parity_relaxed` (tight
+/// `max_abs_diff <= 0.25` + argmax-must-match — see helper rustdoc).
+///
+/// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
+/// chunked-vs-single-shot drift is reproducible across runs;
+/// observed `max_abs_diff = 0.1199`, argmax stable at idx=80 (M3,
+/// pre scalar-RoPE-axis fix — the magnitude will differ after that
+/// fix since both paths' rotation angles changed; the 0.25 budget
+/// rationale is unchanged).
+/// Requires Metal GPU; run with `--ignored`.
+///
+/// Skips on hosts whose half-precision GEMM fails the
+/// `test_support::half_gemm_untrustworthy` canary — same rationale
+/// as `test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits`
+/// above (observed 0.73-0.91 on M5 Max with no chunking bug).
+///
+/// `Qwen35Inner::new` can throw a foreign C++ exception on
+/// machines without Metal, which aborts the test process before
+/// Rust can catch the failure.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_chunked_prefill_qwen3_5_moe_uneven_tail() {
+    if crate::test_support::half_gemm_untrustworthy() {
+        eprintln!(
+            "skipping test_chunked_prefill_qwen3_5_moe_uneven_tail: \
+             half-precision GEMM fails the K=64/N=64 canary on this host \
+             (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+             single-shot parity is not meaningful here"
+        );
+        return;
+    }
+    unsafe {
+        mlx_sys::mlx_seed(0xC0DEC0DE);
+    }
+    let cfg = moe_paged_tiny_config();
+    let mut inner = match Qwen35Inner::new_moe(cfg.clone()) {
+        Ok(i) => i,
+        Err(err) => {
+            let msg = err.reason.to_string();
+            if msg.contains("No Metal device found") || msg.contains("No Metal device") {
+                eprintln!(
+                    "skipping test_chunked_prefill_qwen3_5_moe_uneven_tail (no Metal): {msg}"
+                );
+                return;
+            }
+            panic!("unexpected Qwen35Inner::new failure: {msg}");
+        }
+    };
+    cast_moe_inner_weights_bf16(&mut inner);
+
+    // 97 tokens — 6*16 full chunks + 1 leftover. vocab_size=128 so
+    // the modulo stays in range.
+    let prompt: Vec<u32> = (0u32..97).map(|i| (i * 13 + 7) % 128).collect();
+
+    let single_vec = match run_one(&mut inner, &prompt, /* chunk_size */ 0) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("skipping test_chunked_prefill_qwen3_5_moe_uneven_tail: no Metal");
+            return;
+        }
+        Err(e) => panic!("unexpected single-shot prefill failure: {}", e.reason),
+    };
+    assert_eq!(single_vec.len(), cfg.vocab_size as usize);
+
+    let chunked_vec = match run_one(&mut inner, &prompt, /* chunk_size */ 16) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_uneven_tail (Metal failure on second run)"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected chunked prefill failure: {}", e.reason),
+    };
+    assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
+
+    assert_logit_parity_relaxed(
+        &single_vec,
+        &chunked_vec,
+        "MoE uneven-tail chunked-vs-single-shot",
+    );
+}
+
+/// Real parity assertion for MoE chunked-vs-single-shot.
+///
+/// **Determinism gate**: callers must seed `mlx_sys::mlx_seed` to a
+/// fixed value at the top of the test before constructing
+/// `Qwen35Inner`. With a fixed seed, MLX's random init produces
+/// byte-equal weights across `cargo test` invocations, and the
+/// downstream chunked-vs-single-shot logit drift is reproducible
+/// (verified bit-stable across 5 consecutive runs with seed
+/// `0xC0DEC0DE`). Without a seed, weight init varies per run and
+/// the drift magnitude can range from `~5e-2` to `~2e-1` with
+/// occasional argmax flips, which is what made the original
+/// finiteness-only assertion structurally weak — it would also
+/// pass for a deterministic-but-wrong chunking path.
+///
+/// **Tolerance choice**: bf16 paged K/V (the pool's hard
+/// requirement) + GDN linear-attention's recurrent state mutating
+/// in chunk-sized batches + MoE softmax+top-k under bf16 noise add
+/// up to `~1e-1` of element-wise drift between chunked and
+/// single-shot at this synthetic config size. The dense Qwen3
+/// `5e-3` budget would falsely flag this as a regression, so we
+/// allow `max_abs_diff <= 0.25` — comfortably above the observed
+/// `0.07` (matches test) / `0.12` (uneven-tail test) drift but
+/// far below the `O(1)` divergence any real chunking bug would
+/// produce (e.g. GDN state reset between chunks, K/V write to
+/// wrong slot, position off-by-one — all of those amplify through
+/// 8 layers + softmax to either NaN/Inf or a complete logit
+/// reshuffle). Argmax must match — a "deterministic finite
+/// wrong" chunked path is overwhelmingly likely to flip the
+/// argmax under any real bug, since the small bf16 noise we
+/// tolerate is weight-driven and can't move argmax under fixed
+/// weights.
+///
+/// **Why not byte-equal**: The dense Qwen3 Phase B inline parity
+/// tests (in `crates/mlx-core/src/models/qwen3/model.rs`) hit
+/// byte-equal `max_abs_diff = 0` because that model has 2 layers,
+/// no GDN, no MoE — bf16 fma orderings happen to align across
+/// chunk boundaries at that scale. Adding GDN's recurrent fma
+/// chain and MoE's per-token softmax routing breaks bit-equality
+/// without breaking semantic equality.
+///
+/// Numerical parity on **real Qwen3.5 MoE checkpoint weights** is
+/// gated separately by the integration test in
+/// `crates/mlx-core/tests/qwen3_5_moe_chunked_prefill.rs` (which
+/// asserts byte-identical greedy-decoded token streams under a
+/// real prompt). That test runs only when a checkpoint is on
+/// disk; this synthetic test runs always and gates against the
+/// regressions any real chunking bug would produce.
+fn assert_logit_parity_relaxed(single_vec: &[f32], chunked_vec: &[f32], label: &str) {
+    assert_eq!(
+        single_vec.len(),
+        chunked_vec.len(),
+        "{label}: vector length mismatch"
+    );
+
+    // Finiteness on both paths. NaN/Inf would short-circuit the
+    // numeric checks below, so assert separately first.
+    for (i, v) in single_vec.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "{label}: single-shot logits[{i}] not finite: {v}"
+        );
+    }
+    for (i, v) in chunked_vec.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "{label}: chunked logits[{i}] not finite: {v}"
+        );
+    }
+
+    let argmax = |v: &[f32]| -> (usize, f32) {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            })
+    };
+    let (idx_single, val_single) = argmax(single_vec);
+    let (idx_chunked, val_chunked) = argmax(chunked_vec);
+    let mut max_abs_diff = 0.0f32;
+    let mut argmax_diff_idx = 0usize;
+    for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > max_abs_diff {
+            max_abs_diff = d;
+            argmax_diff_idx = i;
+        }
+    }
+
+    eprintln!(
+        "{label}: max_abs_diff={max_abs_diff} (at idx={argmax_diff_idx}), single-shot \
+         argmax=(idx={idx_single}, val={val_single}), chunked argmax=(idx={idx_chunked}, \
+         val={val_chunked}) over {} elements",
+        single_vec.len()
+    );
+
+    // Hard parity bounds — the real assertions a chunking bug must
+    // surface against. See the rustdoc above for tolerance rationale.
+    const ATOL: f32 = 0.25;
+    assert!(
+        max_abs_diff <= ATOL,
+        "{label}: max_abs_diff {max_abs_diff} exceeds tolerance {ATOL} \
+         (at idx={argmax_diff_idx}: single={}, chunked={}). A real chunking \
+         regression — GDN state reset between chunks, position off-by-one in \
+         the layer loop, mask misalignment, or paged-pool K/V write to wrong \
+         slots — would surface here. Re-seed only after investigating.",
+        single_vec[argmax_diff_idx],
+        chunked_vec[argmax_diff_idx]
+    );
+    assert_eq!(
+        idx_single, idx_chunked,
+        "{label}: argmax flipped (single={idx_single} val={val_single}, \
+         chunked={idx_chunked} val={val_chunked}). Under a fixed mlx_seed, \
+         argmax flipping is the canonical signature of a chunking bug — bf16 \
+         noise alone cannot move argmax under fixed weights."
+    );
+}
+
+/// **Default-path guard**: the public entry point
+/// `run_paged_prefill_chunk` (which reads `MLX_PAGED_PREFILL_CHUNK_SIZE`
+/// once via OnceLock) must be byte-equivalent to an explicit 2,048-row
+/// chunk (`run_paged_prefill_chunk_with_size(..., 2048)`) when the env
+/// knob is unset. Skips if the env knob is set (process-global OnceLock).
+/// Requires Metal GPU; run with `--ignored`.
+/// `Qwen35Inner::new` can throw a foreign C++ exception on
+/// machines without Metal, which aborts the test process before
+/// Rust can catch the failure.
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe() {
+    if crate::array::memory::paged_prefill_chunk_size() != 0 {
+        eprintln!(
+            "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe: \
+             MLX_PAGED_PREFILL_CHUNK_SIZE is set, default-path coverage is environment-dependent"
+        );
+        return;
+    }
+
+    let cfg = moe_paged_tiny_config();
+    let mut inner = match Qwen35Inner::new_moe(cfg.clone()) {
+        Ok(i) => i,
+        Err(err) => {
+            let msg = err.reason.to_string();
+            if msg.contains("No Metal device found") || msg.contains("No Metal device") {
+                eprintln!(
+                    "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe \
+                     (no Metal): {msg}"
+                );
+                return;
+            }
+            panic!("unexpected Qwen35Inner::new failure: {msg}");
+        }
+    };
+    cast_moe_inner_weights_bf16(&mut inner);
+
+    // Short 8-token prompt: small enough that any positive
+    // chunk_size value would also take the single-shot fast path.
+    let prompt: Vec<u32> = vec![5, 11, 21, 33, 47, 60, 71, 83];
+
+    // Init caches.
+    if inner.caches.is_none() {
+        inner.init_caches_sync().expect("init_caches");
+    }
+
+    let layer_kinds = compute_layer_kinds(inner.config.num_layers as usize, |i| {
+        inner.config.is_linear_layer(i)
+    });
+
+    // Run 1: public default-path entry point.
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.reset_for_new_request(0).expect("reset");
+        let prefix = adapter
+            .find_cached_prefix(&prompt, &[], 0, false)
+            .expect("find_cached_prefix");
+        assert_eq!(prefix.cached_token_count, 0);
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate_suffix_blocks");
+    }
+    let logits_default = {
+        let embed = inner.embedding.clone();
+        match super::run_paged_prefill_chunk_with_size(
+            &prompt,
+            &prompt,
+            0,
+            false,
+            &embed,
+            &mut inner,
+            &layer_kinds,
+            crate::models::forward::paged_prefill_chunk_rows() as i32,
+            /* cached_rope_deltas */ 0,
+            None,
+            None,
+        ) {
+            Ok((l, _)) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe: \
+                         {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected default-path prefill failure: {msg}");
+            }
+        }
+    };
+    let default_vec = logits_to_f32_vec(&logits_default);
+    assert_eq!(default_vec.len(), cfg.vocab_size as usize);
+    for (i, v) in default_vec.iter().enumerate() {
+        assert!(v.is_finite(), "default-path logits[{i}] not finite: {v}");
+    }
+
+    // Cleanup before second run.
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+    inner.reset_caches_sync().expect("reset_caches");
+    inner.init_caches_sync().expect("re-init_caches");
+
+    // Run 2: explicit chunk_size=2048.
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.reset_for_new_request(0).expect("reset");
+        let prefix = adapter
+            .find_cached_prefix(&prompt, &[], 0, false)
+            .expect("find_cached_prefix");
+        assert_eq!(prefix.cached_token_count, 0);
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate_suffix_blocks");
+    }
+    let (logits_explicit, _) = {
+        let embed = inner.embedding.clone();
+        super::run_paged_prefill_chunk_with_size(
+            &prompt,
+            &prompt,
+            0,
+            false,
+            &embed,
+            &mut inner,
+            &layer_kinds,
+            2048,
+            /* cached_rope_deltas */ 0,
+            None,
+            None,
+        )
+        .expect("explicit chunk_size=2048 prefill")
+    };
+    let explicit_vec = logits_to_f32_vec(&logits_explicit);
+
+    // Bytewise equality: both paths run the same chunk size. Any
+    // divergence here would be a wrapper bug.
+    for (i, (a, b)) in default_vec.iter().zip(explicit_vec.iter()).enumerate() {
+        let abs_diff = (a - b).abs();
+        assert!(
+            abs_diff <= 1e-6,
+            "MoE default path diverged from explicit chunk_size=2048 at index {i}: \
+             default={a}, explicit={b}, abs_diff={abs_diff}"
+        );
+    }
+
+    // Cleanup.
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+}
+
+#[cfg(test)]
+mod last_row_projection_tests {
+    use super::*;
+    #[test]
+    fn retained_prefill_seed_and_logits_match_full_projection() {
+        let input = MxArray::from_float32(
+            &(0..19 * 128)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect::<Vec<_>>(),
+            &[1, 19, 128],
+        )
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+        let mut norm = RMSNorm::new(128, Some(1e-6)).unwrap();
+        norm.set_weight(
+            &norm
+                .get_weight()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut embed = Embedding::new(64, 128).unwrap();
+        embed
+            .set_weight(
+                &embed
+                    .get_weight()
+                    .astype(crate::array::DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+        let full_hidden = norm.forward(&input).unwrap();
+        let expected_hidden = full_hidden.clone();
+        let (logits, hidden) =
+            project_last_token_logits_with_full_hidden(&input, &norm, &None, &embed, None).unwrap();
+        let expected_logits = embed
+            .as_linear(&full_hidden)
+            .unwrap()
+            .slice_axis(1, 18, 19)
+            .unwrap()
+            .squeeze(Some(&[0, 1]))
+            .unwrap();
+        assert_eq!(hidden.shape().unwrap().as_ref(), [1, 19, 128]);
+        assert_eq!(
+            hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            expected_hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref()
+        );
+        let actual = logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let expected = expected_logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let scale = expected.iter().map(|v| v.abs()).fold(1.0_f32, f32::max);
+        let error = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            error <= scale * 0.01,
+            "prefill head error {error} scale {scale}"
+        );
+    }
+    #[test]
+    #[ignore = "isolated Metal prefill-head benchmark; run explicitly"]
+    fn benchmark_last_row_prefill_head() {
+        use crate::array::DType;
+        use crate::nn::Linear;
+        use std::time::Instant;
+        let mut norm = RMSNorm::new(2048, Some(1e-6)).unwrap();
+        norm.set_weight(&norm.get_weight().astype(DType::BFloat16).unwrap())
+            .unwrap();
+        let embed = Embedding::new(1, 2048).unwrap();
+        let mut linear = Linear::new(2048, 65536, Some(false)).unwrap();
+        linear
+            .set_weight(&linear.get_weight().astype(DType::BFloat16).unwrap())
+            .unwrap();
+        linear.get_weight().eval();
+        let head = Some(LinearProj::Standard(linear));
+        for width in [64_i64, 512] {
+            let hidden =
+                MxArray::random_normal(&[1, width, 2048], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+            hidden.eval();
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..43 {
+                for arm in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let start = Instant::now();
+                    let logits = if arm == 0 {
+                        head.as_ref()
+                            .unwrap()
+                            .forward(&norm.forward(&hidden).unwrap())
+                            .unwrap()
+                            .slice_axis(1, width - 1, width)
+                            .unwrap()
+                            .squeeze(Some(&[0, 1]))
+                            .unwrap()
+                    } else {
+                        project_last_token_logits(&hidden, &norm, &head, &embed).unwrap()
+                    };
+                    logits.eval();
+                    if round >= 3 {
+                        times[arm].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for values in &mut times {
+                values.sort_by(f64::total_cmp);
+            }
+            eprintln!(
+                "prefill_head width={width} hidden=2048 vocab=65536 baseline_p50_us={:.3} candidate_p50_us={:.3}",
+                (times[0][19] + times[0][20]) / 2.0,
+                (times[1][19] + times[1][20]) / 2.0
+            );
+        }
+    }
+}

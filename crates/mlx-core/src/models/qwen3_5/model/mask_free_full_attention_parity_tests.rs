@@ -4,9 +4,7 @@
 //! numerically transparent versus the explicit `create_causal_mask`
 //! array it replaced, for a PRIMED cache (nonzero KV offset) — the
 //! exact shape of the eager-MTP verify call (`[1, K+1]` ids over an
-//! already-decoded prefix). Mirrors
-//! `causal_attention_matches_explicit_offset_mask_when_kv_is_longer` in
-//! `crate::array::attention::tests`, one layer stack up.
+//! already-decoded prefix).
 
 use super::*;
 use crate::array::mask::create_causal_mask;
@@ -52,10 +50,6 @@ fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     }
 }
 
-/// Reference oracle only — the explicit-mask forward this path replaced.
-/// Never call it from production.
-/// Builds an explicit causal mask sized from `caches[fa_idx]`'s offset
-/// and hands it to every full-attention layer.
 fn forward_with_explicit_causal_mask(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -94,35 +88,30 @@ fn forward_with_explicit_causal_mask(
 #[test]
 fn mask_free_forward_matches_explicit_offset_mask_after_priming() {
     let cfg = tiny_moe_cfg();
-    let mut layers = (0..cfg.num_layers as usize)
-        .map(|i| DecoderLayer::new(&cfg, i))
+    let (base, moe) = cfg.split();
+    let mut layers = (0..base.num_layers as usize)
+        .map(|i| DecoderLayer::new_with_moe(&base, Some(&moe), i))
         .collect::<Result<Vec<_>>>()
         .expect("layer construction must succeed");
-    let embedding = Embedding::new(cfg.vocab_size as u32, cfg.hidden_size as u32)
+    let embedding = Embedding::new(base.vocab_size as u32, base.hidden_size as u32)
         .expect("embedding construction must succeed");
     let embedding_weight = embedding.get_weight();
 
-    let fa_idx = (0..cfg.num_layers as usize)
-        .find(|&i| !cfg.is_linear_layer(i))
+    let fa_idx = (0..base.num_layers as usize)
+        .find(|&i| !base.is_linear_layer(i))
         .expect("tiny_moe_cfg must contain at least one full-attention layer");
 
-    let mut caches_old = Some(fresh_moe_layer_caches(&cfg));
-    let mut caches_new = Some(fresh_moe_layer_caches(&cfg));
+    let mut caches_old = Some(fresh_dense_layer_caches(&base));
+    let mut caches_new = Some(fresh_dense_layer_caches(&base));
 
-    // Prime both cache sets identically with a few single-token decode
-    // steps so the eventual multi-token forward runs against a nonzero
-    // KV offset — an empty cache is the degenerate offset=0 case both
-    // code paths already handled identically, so it wouldn't exercise
-    // the fix.
     for tok in [5u32, 9, 13] {
         let ids = MxArray::from_uint32(&[tok], &[1, 1]).expect("prime ids");
-        forward_pre_norm_inner(&ids, &embedding, &mut layers, &mut caches_old, fa_idx)
+        forward_pre_norm_inner(&ids, &embedding, &mut layers, &mut caches_old)
             .expect("priming forward (old-path cache) must succeed");
-        forward_pre_norm_inner(&ids, &embedding, &mut layers, &mut caches_new, fa_idx)
+        forward_pre_norm_inner(&ids, &embedding, &mut layers, &mut caches_new)
             .expect("priming forward (new-path cache) must succeed");
     }
 
-    // The eager-MTP verify shape: `[1, K+1]` ids over the primed prefix.
     let verify_ids = MxArray::from_uint32(&[21u32, 22, 23, 24], &[1, 4]).expect("verify ids");
 
     let old_out = forward_with_explicit_causal_mask(
@@ -133,14 +122,8 @@ fn mask_free_forward_matches_explicit_offset_mask_after_priming() {
         fa_idx,
     )
     .expect("explicit-mask forward must succeed");
-    let new_out = forward_pre_norm_inner(
-        &verify_ids,
-        &embedding,
-        &mut layers,
-        &mut caches_new,
-        fa_idx,
-    )
-    .expect("mask-free forward must succeed");
+    let new_out = forward_pre_norm_inner(&verify_ids, &embedding, &mut layers, &mut caches_new)
+        .expect("mask-free forward must succeed");
 
     let old_vals = old_out.to_float32().expect("old output to_float32");
     let new_vals = new_out.to_float32().expect("new output to_float32");

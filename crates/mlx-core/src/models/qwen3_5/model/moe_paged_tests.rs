@@ -5,9 +5,9 @@ use crate::array::DType;
 use crate::models::quantized_linear::{
     MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedSwitchLinear,
 };
+use crate::models::qwen3_5::decoder_layer::{AttentionType, MLPType};
+use crate::models::qwen3_5::switch_glu::SwitchGLU;
 use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
-use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
-use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
 pub(super) fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     Qwen3_5MoeConfig {
@@ -49,7 +49,7 @@ pub(super) fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     }
 }
 
-fn expected_scheduler_window(inner: &Qwen35MoeInner) -> (u32, u32, u32) {
+fn expected_scheduler_window(inner: &Qwen35Inner) -> (u32, u32, u32) {
     use crate::engine::hybrid_scheduler::{pool_tokens_after_recurrent, scheduled_turn_context};
     let trained = inner.config.max_position_embeddings.max(0) as u32;
     let adapter = inner
@@ -69,7 +69,7 @@ fn expected_scheduler_window(inner: &Qwen35MoeInner) -> (u32, u32, u32) {
 #[test]
 fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     use crate::engine::hybrid_scheduler::{pool_tokens_after_recurrent, scheduled_turn_context};
-    let inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     let rec = inner.config.recurrent_state_bytes();
     assert!(rec > 0, "tiny hybrid MoE config must have GDN state");
     let trained = 1_048_576;
@@ -88,7 +88,7 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
 
 /// Installs a memory plan whose pool lane holds `pool_window` tokens and,
 /// with `draft`, a tiny DFlash2 draft.
-fn install_plan(inner: &mut Qwen35MoeInner, pool_window: Option<u32>, draft: bool) {
+fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, draft: bool) {
     use crate::engine::memory_plan::MemoryPlan;
     let mut plan = MemoryPlan::with_pool_window(0, 1, 0, pool_window.unwrap_or(0));
     if pool_window.is_none() {
@@ -97,7 +97,7 @@ fn install_plan(inner: &mut Qwen35MoeInner, pool_window: Option<u32>, draft: boo
     if draft && inner.dflash2.is_none() {
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
-                &inner.config.to_dense_config(),
+                &inner.config.clone(),
             )
             .expect("tiny DFlash2 companion"),
         );
@@ -171,7 +171,7 @@ const GIB: u64 = 1 << 30;
 
 /// A tiny planned load on `cfg` against a 16 GiB working set, `None` with
 /// no Metal device.
-fn planned_load(cfg: Qwen3_5MoeConfig, draft: bool) -> Option<Result<Qwen35MoeInner>> {
+fn planned_load(cfg: Qwen3_5MoeConfig, draft: bool) -> Option<Result<Qwen35Inner>> {
     planned_load_within(cfg, draft, None)
 }
 
@@ -180,17 +180,17 @@ fn planned_load_within(
     cfg: Qwen3_5MoeConfig,
     draft: bool,
     max_memory: Option<u64>,
-) -> Option<Result<Qwen35MoeInner>> {
+) -> Option<Result<Qwen35Inner>> {
     if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
         return None;
     }
     let _live = LiveMemory::set(16 * GIB, 0);
-    let mut inner = Qwen35MoeInner::new(cfg).expect("construct tiny model");
+    let mut inner = Qwen35Inner::new_moe(cfg).expect("construct tiny model");
     inner.max_memory_bytes = max_memory;
     if draft {
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
-                &inner.config.to_dense_config(),
+                &inner.config.clone(),
             )
             .expect("tiny DFlash2 companion"),
         );
@@ -292,7 +292,7 @@ fn pool_below_the_config_floor_loads() {
     // Its 1,200 MiB budget lowers the process-wide governor limit for every
     // load beside it.
     if !crate::test_support::in_own_process(
-        "models::qwen3_5_moe::model::paged_construction_tests::pool_below_the_config_floor_loads",
+        "models::qwen3_5::model::moe_paged_tests::pool_below_the_config_floor_loads",
     ) {
         return;
     }
@@ -390,7 +390,7 @@ fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
 fn all_full_attention_recurrent_lifecycle_is_a_noop() {
     let mut config = tiny_moe_cfg();
     config.full_attention_interval = 1;
-    let mut inner = Qwen35MoeInner::new(config).expect("construct all-full MoE model");
+    let mut inner = Qwen35Inner::new_moe(config).expect("construct all-full MoE model");
     assert_eq!(inner.config.recurrent_state_bytes(), 0);
 
     inner
@@ -438,7 +438,7 @@ fn inert_mxfp8_switch(out_features: i64, in_features: i64) -> QuantizedSwitchLin
 
 #[test]
 fn save_model_rejects_quantized_moe_experts_before_creating_destination() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     let quantized_switch = SwitchGLU::new_quantized(
         inert_mxfp8_switch(128, 64),
         inert_mxfp8_switch(128, 64),
@@ -506,12 +506,7 @@ fn test_moe_full_attention_layer_count() {
 
 #[test]
 fn test_moe_gdn_root_rotation_retains_new_root() {
-    fn push_checkpoint(
-        inner: &mut Qwen35MoeInner,
-        owner_id: &str,
-        root_owner_id: &str,
-        marker: u32,
-    ) {
+    fn push_checkpoint(inner: &mut Qwen35Inner, owner_id: &str, root_owner_id: &str, marker: u32) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(
             inner,
             owner_id,
@@ -520,7 +515,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
         let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
         inner
             .gdn_prefix_checkpoints
-            .push_back(MoeGdnPrefixCheckpoint {
+            .push_back(DenseGdnPrefixCheckpoint {
                 owner_id: inner.active_cache_owner_id.clone(),
                 prefix_len: 16,
                 block_size: 16,
@@ -530,10 +525,10 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
                 caches: Vec::new(),
                 last_used: 0,
             });
-        inner.prune_moe_gdn_prefix_checkpoints();
+        inner.prune_dense_gdn_prefix_checkpoints();
     }
 
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     push_checkpoint(&mut inner, "root-0", "root-0", 1);
     push_checkpoint(&mut inner, "root-1", "root-1", 2);
     for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
@@ -563,13 +558,13 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     // lands here: `cacheRootOwnerId` is set in exactly one place
     // (`packages/agent/src/provider/chat-config.ts`), so a plain
     // `@mlx-node/lm` ChatSession publishes under the implicit owner `""`.
-    let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct legacy MoE");
+    let mut legacy = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct legacy MoE");
     for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(&mut legacy, "", None);
         let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
         legacy
             .gdn_prefix_checkpoints
-            .push_back(MoeGdnPrefixCheckpoint {
+            .push_back(DenseGdnPrefixCheckpoint {
                 owner_id: legacy.active_cache_owner_id.clone(),
                 prefix_len: 16,
                 block_size: 16,
@@ -579,7 +574,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
                 caches: Vec::new(),
                 last_used: 0,
             });
-        legacy.prune_moe_gdn_prefix_checkpoints();
+        legacy.prune_dense_gdn_prefix_checkpoints();
     }
     assert!(!legacy.gdn_root_cache_owner_is_explicit);
     assert_eq!(
@@ -594,7 +589,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
 /// it which owner is publishing, which is exactly where they can drift.
 #[test]
 fn test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site() {
-    fn push(inner: &mut Qwen35MoeInner, owner_id: &str, root_owner_id: &str, blocks: u32) {
+    fn push(inner: &mut Qwen35Inner, owner_id: &str, root_owner_id: &str, blocks: u32) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(
             inner,
             owner_id,
@@ -602,7 +597,7 @@ fn test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site() {
         );
         inner
             .gdn_prefix_checkpoints
-            .push_back(MoeGdnPrefixCheckpoint {
+            .push_back(DenseGdnPrefixCheckpoint {
                 owner_id: inner.active_cache_owner_id.clone(),
                 prefix_len: blocks * 16,
                 block_size: 16,
@@ -612,10 +607,10 @@ fn test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site() {
                 caches: Vec::new(),
                 last_used: 0,
             });
-        inner.prune_moe_gdn_prefix_checkpoints();
+        inner.prune_dense_gdn_prefix_checkpoints();
     }
 
-    fn run_fleet(inner: &mut Qwen35MoeInner) -> Vec<(String, u32)> {
+    fn run_fleet(inner: &mut Qwen35Inner) -> Vec<(String, u32)> {
         inner.gdn_prefix_checkpoints.clear();
         push(inner, "root", "root", 1);
         push(inner, "root", "root", 64);
@@ -656,7 +651,7 @@ fn test_qwen35_moe_media_plan_requires_complete_paged_vision_stack() {
     for has_encoder in [false, true] {
         for has_processor in [false, true] {
             for has_paged in [false, true] {
-                let plan = qwen35_moe_media_plan(has_encoder, has_processor, has_paged);
+                let plan = qwen35_dense_media_plan(has_encoder, has_processor, has_paged);
                 let available = has_encoder && has_processor && has_paged;
                 assert_eq!(plan.available.images, available);
                 assert!(!plan.available.audio);
@@ -670,16 +665,16 @@ fn test_qwen35_moe_media_plan_requires_complete_paged_vision_stack() {
 #[test]
 fn test_qwen35_moe_session_media_survives_paged_image_key_clear() {
     assert_eq!(
-        qwen35_moe_session_media(true, false),
+        qwen35_dense_session_media(true, false),
         MediaCapabilities::IMAGES
     );
     assert_eq!(
-        qwen35_moe_session_media(false, true),
+        qwen35_dense_session_media(false, true),
         MediaCapabilities::IMAGES,
         "a retained M-RoPE delta proves successive paged text turns still extend image KV"
     );
     assert_eq!(
-        qwen35_moe_session_media(false, false),
+        qwen35_dense_session_media(false, false),
         MediaCapabilities::NONE
     );
 }
@@ -689,22 +684,22 @@ fn test_qwen35_moe_session_media_payload_identity() {
     let images = vec![vec![1, 2, 3]];
     let cached_key = Some(engine::compute_image_cache_key(&images));
 
-    assert!(qwen35_moe_session_media_matches_payloads(
+    assert!(qwen35_dense_session_media_matches_payloads(
         cached_key,
         &images,
         &[]
     ));
-    assert!(!qwen35_moe_session_media_matches_payloads(
+    assert!(!qwen35_dense_session_media_matches_payloads(
         cached_key,
         &[vec![1, 2, 4]],
         &[]
     ));
-    assert!(!qwen35_moe_session_media_matches_payloads(
+    assert!(!qwen35_dense_session_media_matches_payloads(
         cached_key,
         &images,
         &[vec![9]]
     ));
-    assert!(!qwen35_moe_session_media_matches_payloads(
+    assert!(!qwen35_dense_session_media_matches_payloads(
         None,
         &images,
         &[]
@@ -713,16 +708,14 @@ fn test_qwen35_moe_session_media_payload_identity() {
 
 #[test]
 fn test_moe_paged_finalize_failure_cannot_republish_image_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
-    inner.caches = Some(fresh_moe_layer_caches(&inner.config));
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
+    inner.caches = Some(fresh_dense_layer_caches(&inner.config));
     inner.cached_token_history = vec![7, 248_056, 248_056, 8];
     inner.cached_image_key = Some(0xA30B);
     inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
     inner.cached_rope_deltas = Some(-2);
 
-    <Qwen35MoeInner as crate::engine::backend::PagedBackend>::finalize_paged_turn(
-        &mut inner, true, 0,
-    );
+    <Qwen35Inner as crate::engine::backend::PagedBackend>::finalize_paged_turn(&mut inner, true, 0);
     assert!(inner.paged_finalize_failed);
     assert!(inner.caches.is_none());
     assert!(inner.cached_token_history.is_empty());
@@ -730,7 +723,7 @@ fn test_moe_paged_finalize_failure_cannot_republish_image_session() {
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
 
-    <Qwen35MoeInner as crate::engine::backend::PagedBackend>::save_paged_history(
+    <Qwen35Inner as crate::engine::backend::PagedBackend>::save_paged_history(
         &mut inner,
         &[7, 248_056, 248_056, 8],
         &[9],
@@ -749,8 +742,8 @@ fn test_moe_paged_finalize_failure_cannot_republish_image_session() {
     );
 }
 
-fn seed_moe_paged_image_session(inner: &mut Qwen35MoeInner) {
-    inner.caches = Some(fresh_moe_layer_caches(&inner.config));
+fn seed_moe_paged_image_session(inner: &mut Qwen35Inner) {
+    inner.caches = Some(fresh_dense_layer_caches(&inner.config));
     inner.cached_token_history = vec![7, 248_056, 248_056, 8];
     inner.cached_image_key = Some(0xA30B);
     inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
@@ -759,11 +752,11 @@ fn seed_moe_paged_image_session(inner: &mut Qwen35MoeInner) {
 
 #[test]
 fn test_moe_manual_paged_finalize_failure_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
     let error = inner
-        .finalize_moe_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0)
+        .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0, 4)
         .expect_err("missing adapter must fail manual finalization");
     assert!(error.to_string().contains("paged finalization failed"));
     assert!(inner.caches.is_none());
@@ -775,11 +768,11 @@ fn test_moe_manual_paged_finalize_failure_invalidates_session() {
 
 #[test]
 fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
     inner
-        .prepare_moe_vlm_paged_prefix(
+        .prepare_dense_vlm_paged_prefix(
             &[7, 248_056, 248_056, 8],
             4,
             16,
@@ -787,6 +780,7 @@ fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
             true,
             true,
             0xA30B,
+            0,
         )
         .expect_err("missing adapter must fail VLM prefix preparation");
     assert!(inner.caches.is_none());
@@ -801,10 +795,10 @@ fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
 
 #[test]
 fn test_moe_generic_paged_abort_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
-    <Qwen35MoeInner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
+    <Qwen35Inner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
     assert!(inner.caches.is_none());
     assert!(inner.cached_token_history.is_empty());
     assert!(inner.cached_image_key.is_none());
@@ -821,13 +815,13 @@ fn test_qwen35_moe_planned_decoder_overrides_raw_mtp_flag() {
         enable_mtp: Some(true),
         ..ChatConfig::default()
     };
-    assert!(!apply_qwen35_moe_planned_decoder(
+    assert!(!apply_qwen35_dense_planned_decoder(
         &mut config,
         DecoderPlan::Autoregressive
     ));
     assert_eq!(config.enable_mtp, Some(false));
 
-    assert!(apply_qwen35_moe_planned_decoder(
+    assert!(apply_qwen35_dense_planned_decoder(
         &mut config,
         DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
     ));
@@ -838,17 +832,17 @@ fn test_qwen35_moe_planned_decoder_overrides_raw_mtp_flag() {
 fn test_moe_inner_no_paged_adapter_when_flag_is_none() {
     let cfg = tiny_moe_cfg();
     let inner =
-        Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed without paged adapter");
+        Qwen35Inner::new_moe(cfg).expect("Qwen35Inner::new must succeed without paged adapter");
     assert!(inner.paged_adapter.is_none());
 }
 
 #[test]
 fn test_fresh_moe_layer_caches_are_not_gdn_reuse_ready() {
     let cfg = tiny_moe_cfg();
-    let caches = fresh_moe_layer_caches(&cfg);
+    let caches = fresh_dense_layer_caches(&cfg.to_dense_config());
     assert_eq!(caches.len(), cfg.num_layers as usize);
     assert!(
-        !moe_paged_linear_caches_ready(&cfg, Some(&caches)),
+        !dense_paged_linear_caches_ready(&cfg.to_dense_config(), Some(&caches)),
         "fresh linear caches have empty conv/recurrent slots, so a live continuation must replay GDN"
     );
     assert!(matches!(caches[0], Qwen3_5LayerCache::Linear(_)));
@@ -910,7 +904,7 @@ fn test_moe_inner_constructs_paged_adapter_when_flag_is_true() {
     }
     let cfg = tiny_moe_cfg();
     let mut inner =
-        Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed on a Metal host");
+        Qwen35Inner::new_moe(cfg).expect("Qwen35Inner::new must succeed on a Metal host");
     inner
         .initialize_paged_adapter()
         .expect("post-load paged adapter initialization must succeed");
@@ -920,7 +914,7 @@ fn test_moe_inner_constructs_paged_adapter_when_flag_is_true() {
 /// MoE inner carrying a real adapter over a test-sized `LayerKVPool`.
 /// Mirrors the dense helper: `initialize_paged_adapter` sizes a pool for a
 /// real checkpoint, and the lifecycle below dispatches no kernel.
-fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
+fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35Inner> {
     const BLOCK_SIZE: u32 = 16;
     const NUM_BLOCKS: u32 = 8;
     let pool_config = mlx_paged_attn::PagedAttentionConfig {
@@ -955,12 +949,12 @@ fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner
     )));
     let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
         .expect("test paged adapter must construct");
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     inner.paged_adapter = Some(adapter);
     Some(inner)
 }
 
-fn record_whole_moe_paged_request(inner: &mut Qwen35MoeInner, prompt: &[u32]) {
+fn record_whole_moe_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
     let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
     adapter.reset_for_new_request(0).expect("reset request");
     adapter
@@ -1005,7 +999,7 @@ fn moe_paged_verify_refuses_a_cycle_it_cannot_open() {
     let stranger =
         SpecOwner::claim(Some(owner.seq_id() + 1), "test stranger").expect("claim stranger");
     let error = stepper
-        .open_verify_cycle(stranger, 3)
+        .open_verify_cycle_strict(stranger, 3)
         .expect_err("a cycle the facade cannot mint must refuse the verify");
     assert!(
         error.reason.contains("could not be opened"),
@@ -1098,12 +1092,12 @@ pub(super) fn tiny_paged_forward_moe_cfg() -> Qwen3_5MoeConfig {
 /// hand-built 8-block pool for lifecycle tests that dispatch no kernel.
 /// This one goes through `initialize_paged_adapter`, so the pool geometry is
 /// the one the config really implies and a prefill can run against it.
-fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
+fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35Inner> {
     // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
     // must be > 0` means the test config stopped producing a usable pool,
     // and skipping on that is a silent green — see `metal_device_absent`.
     let unavailable = crate::test_support::metal_device_absent;
-    let mut inner = match Qwen35MoeInner::new(tiny_paged_forward_moe_cfg()) {
+    let mut inner = match Qwen35Inner::new_moe(tiny_paged_forward_moe_cfg()) {
         Ok(inner) => inner,
         Err(err) => {
             let msg = err.reason.to_string();
@@ -1111,7 +1105,7 @@ fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
                 eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
                 return None;
             }
-            panic!("unexpected Qwen35MoeInner::new failure in {test_name}: {msg}");
+            panic!("unexpected Qwen35Inner::new failure in {test_name}: {msg}");
         }
     };
     if let Err(err) = inner.initialize_paged_adapter() {
@@ -1146,7 +1140,7 @@ fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
 /// PARTIAL cast is worse than none: one f32 weight promotes the hidden state
 /// back to f32 and the failure surfaces at the K/V write, several frames
 /// from its cause. So this walks dense and genuinely sparse MLP variants.
-pub(super) fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
+pub(super) fn cast_moe_inner_weights_bf16(inner: &mut Qwen35Inner) {
     let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
 
     let w = inner.embedding.get_weight();
@@ -1166,11 +1160,11 @@ pub(super) fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
     for layer in inner.layers.iter_mut() {
         let w = layer.get_input_layernorm_weight();
         layer
-            .set_input_layernorm_weight(&cast(&w))
+            .set_input_layernorm_weight_raw(&cast(&w))
             .expect("set input_layernorm");
         let w = layer.get_post_attention_layernorm_weight();
         layer
-            .set_post_attention_layernorm_weight(&cast(&w))
+            .set_post_attention_layernorm_weight_raw(&cast(&w))
             .expect("set post_attention_layernorm");
 
         match &mut layer.attn {
@@ -1340,7 +1334,7 @@ fn moe_hybrid_n2_batched_decode_matches_scalar_replay() {
         let logits = {
             let caches = inner.caches.as_mut().expect("active GDN state");
             let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
-            crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
+            crate::models::qwen3_5::paged_forward::run_paged_decode_step(
                 token_id,
                 &embed,
                 &mut inner.layers,
@@ -1422,7 +1416,7 @@ type ReclaimProbe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send +
 
 /// Swaps the model's pool for one of `initial` blocks that grows to `max`,
 /// its allocator on the model's clock, with `probe` as the grow probe.
-fn install_moe_pool(inner: &mut Qwen35MoeInner, initial: u32, max: u32, probe: ReclaimProbe) {
+fn install_moe_pool(inner: &mut Qwen35Inner, initial: u32, max: u32, probe: ReclaimProbe) {
     inner.paged_adapter = None;
     inner.initialize_paged_adapter().expect("paged adapter");
     let adapter = inner.paged_adapter.take().expect("paged adapter");
@@ -1446,13 +1440,13 @@ fn install_moe_pool(inner: &mut Qwen35MoeInner, initial: u32, max: u32, probe: R
     inner.sync_gdn_state_marks();
 }
 
-fn moe_reclaim_inner(test_name: &str) -> Option<Qwen35MoeInner> {
+fn moe_reclaim_inner(test_name: &str) -> Option<Qwen35Inner> {
     let mut inner = moe_paged_inner_or_skip(test_name)?;
     cast_moe_inner_weights_bf16(&mut inner);
     Some(inner)
 }
 
-fn moe_block_size(inner: &Qwen35MoeInner) -> u32 {
+fn moe_block_size(inner: &Qwen35Inner) -> u32 {
     inner.paged_adapter.as_ref().expect("adapter").block_size()
 }
 
@@ -1463,13 +1457,13 @@ fn moe_chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
 }
 
 /// Caches `tokens` (whole blocks) as a chain nothing holds.
-fn moe_cache_chain(inner: &Qwen35MoeInner, tokens: &[u32]) -> Vec<u64> {
+fn moe_cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
     moe_cache_keyed_chain(inner, tokens, &[], 0)
 }
 
 /// [`moe_cache_chain`] under per-block `keys` and `salt`.
 fn moe_cache_keyed_chain(
-    inner: &Qwen35MoeInner,
+    inner: &Qwen35Inner,
     tokens: &[u32],
     keys: &[Vec<u64>],
     salt: u64,
@@ -1494,11 +1488,11 @@ fn moe_cache_keyed_chain(
     prefix_keys.chain_hashes(tokens, block_size, salt)
 }
 
-fn moe_push_rung(inner: &mut Qwen35MoeInner, tokens: Vec<u32>, hashes: Vec<u64>, last_used: u64) {
+fn moe_push_rung(inner: &mut Qwen35Inner, tokens: Vec<u32>, hashes: Vec<u64>, last_used: u64) {
     inner.push_ladder_entry_for_test(tokens.len() as u32, hashes, tokens, Vec::new(), last_used);
 }
 
-fn moe_ladder(inner: &Qwen35MoeInner) -> Vec<(u32, u64, u64)> {
+fn moe_ladder(inner: &Qwen35Inner) -> Vec<(u32, u64, u64)> {
     inner
         .gdn_prefix_checkpoints
         .iter()
@@ -1527,8 +1521,8 @@ fn moe_probe_after(taken: usize) -> ReclaimProbe {
 /// GDN caches the MoE restore accepts: every linear layer's two slots set.
 /// GDN caches of their own: evaluated 4 MiB arrays no other state shares,
 /// so a take measurably frees them.
-fn moe_owned_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
-    let mut caches = fresh_moe_layer_caches(config);
+fn moe_owned_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
+    let mut caches = fresh_dense_layer_caches(config);
     for cache in &mut caches {
         if let Qwen3_5LayerCache::Linear(arrays) = cache {
             for slot in 0..2 {
@@ -1541,8 +1535,8 @@ fn moe_owned_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
     caches
 }
 
-fn moe_ready_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
-    let mut caches = fresh_moe_layer_caches(config);
+fn moe_ready_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
+    let mut caches = fresh_dense_layer_caches(config);
     for cache in &mut caches {
         if let Qwen3_5LayerCache::Linear(arrays) = cache {
             for slot in 0..2 {
@@ -1559,12 +1553,12 @@ fn moe_ready_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
 /// live sequence 0 holds it too plus one uncached block, and a 1-block
 /// ladder chain fills the pool. The prompt grow counts the live blocks as
 /// the prompt's, so only the prepare's own refusal can reclaim.
-fn moe_cap_with_a_shared_live_table(inner: &mut Qwen35MoeInner) {
+fn moe_cap_with_a_shared_live_table(inner: &mut Qwen35Inner) {
     moe_cap_with_a_shared_live_table_of(inner, 4);
 }
 
 /// [`moe_cap_with_a_shared_live_table`] on a `total`-block pool.
-fn moe_cap_with_a_shared_live_table_of(inner: &mut Qwen35MoeInner, total: u32) {
+fn moe_cap_with_a_shared_live_table_of(inner: &mut Qwen35Inner, total: u32) {
     install_moe_pool(inner, total, total, Arc::new(Ok));
     let block_size = moe_block_size(inner);
     let shared = moe_chain_tokens(5, total - 2, block_size);
@@ -1601,7 +1595,7 @@ fn moe_cap_with_a_shared_live_table_of(inner: &mut Qwen35MoeInner, total: u32) {
 /// A MoE model whose sequence 0 restored its prompt's GDN state from rung
 /// E through the text prepare; the hit stamped E, and rung F, pushed after
 /// the prepare, is newer still. Returns E's final hash and F's.
-fn moe_restored_from_rung(test_name: &str) -> Option<(Qwen35MoeInner, u64, u64)> {
+fn moe_restored_from_rung(test_name: &str) -> Option<(Qwen35Inner, u64, u64)> {
     let mut inner = moe_reclaim_inner(test_name)?;
     install_moe_pool(&mut inner, 4, 8, moe_probe_after(1));
     let block_size = moe_block_size(&inner);
@@ -1621,7 +1615,7 @@ fn moe_restored_from_rung(test_name: &str) -> Option<(Qwen35MoeInner, u64, u64)>
     let keys = moe_keys(&prompt, block_size);
     inner.cached_token_history.clear();
     let prepared = inner
-        .prepare_moe_gdn_prefix_state(&prompt, rung.len() as u32, block_size, &keys, 0, false)
+        .prepare_dense_gdn_prefix_state(&prompt, rung.len() as u32, block_size, &keys, 0, false)
         .expect("prepare");
     assert!(prepared.already_primed || inner.gdn_restored_from.is_none());
     let f_final = 0xF0F0;
@@ -1638,7 +1632,7 @@ fn moe_restored_from_rung(test_name: &str) -> Option<(Qwen35MoeInner, u64, u64)>
 }
 
 fn moe_rung_key(
-    inner: &Qwen35MoeInner,
+    inner: &Qwen35Inner,
     prefix_len: u32,
     final_block_hash: u64,
 ) -> crate::engine::governor::ledger::UnitKey {
@@ -1944,7 +1938,7 @@ fn moe_vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain() {
     let keys = moe_keys(&prompt, block_size);
     clear_grow_log();
     inner
-        .prepare_moe_vlm_paged_prefix(
+        .prepare_dense_vlm_paged_prefix(
             &prompt,
             prompt.len() as u32,
             block_size,
@@ -1952,6 +1946,7 @@ fn moe_vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain() {
             true,
             true,
             77,
+            0,
         )
         .expect("the prepare fits after the take");
     assert_eq!(
@@ -1995,7 +1990,7 @@ fn moe_vlm_cold_restart_at_the_cap_frees_a_ladder_chain() {
     let keys = moe_keys(&prompt, block_size);
     clear_grow_log();
     let resolution = inner
-        .prepare_moe_vlm_paged_prefix(
+        .prepare_dense_vlm_paged_prefix(
             &prompt,
             prompt.len() as u32,
             block_size,
@@ -2003,6 +1998,7 @@ fn moe_vlm_cold_restart_at_the_cap_frees_a_ladder_chain() {
             true,
             true,
             77,
+            0,
         )
         .expect("the restart fits after the take");
     assert_eq!(resolution.candidate_cached_prefix_len as usize, kept.len());
@@ -2018,7 +2014,7 @@ fn moe_vlm_cold_restart_at_the_cap_frees_a_ladder_chain() {
 
 /// A pool of 3 blocks holding a cached 2-block chain whose first block
 /// carries the only ladder rung; the prompt is that chain plus one block.
-fn moe_vlm_rung_on_the_prompts_chain(test_name: &str) -> Option<(Qwen35MoeInner, Vec<u32>)> {
+fn moe_vlm_rung_on_the_prompts_chain(test_name: &str) -> Option<(Qwen35Inner, Vec<u32>)> {
     let mut inner = moe_reclaim_inner(test_name)?;
     install_moe_pool(&mut inner, 3, 3, Arc::new(Ok));
     let block_size = moe_block_size(&inner);
@@ -2060,7 +2056,7 @@ fn moe_vlm_cold_restart_takes_the_prompts_own_rung() {
     let keys = moe_keys(&prompt, block_size);
     clear_grow_log();
     let resolution = inner
-        .prepare_moe_vlm_paged_prefix(
+        .prepare_dense_vlm_paged_prefix(
             &prompt,
             prompt.len() as u32,
             block_size,
@@ -2068,6 +2064,7 @@ fn moe_vlm_cold_restart_takes_the_prompts_own_rung() {
             true,
             true,
             77,
+            0,
         )
         .expect("the restart takes the rung");
     assert!(resolution.downgraded_to_cold);
@@ -2096,7 +2093,7 @@ fn moe_vlm_prepare_without_reuse_takes_the_prompts_own_rung() {
     let keys = moe_keys(&prompt, block_size);
     clear_grow_log();
     let resolution = inner
-        .prepare_moe_vlm_paged_prefix(
+        .prepare_dense_vlm_paged_prefix(
             &prompt,
             prompt.len() as u32,
             block_size,
@@ -2104,6 +2101,7 @@ fn moe_vlm_prepare_without_reuse_takes_the_prompts_own_rung() {
             false,
             true,
             77,
+            0,
         )
         .expect("the fresh prompt takes the rung");
     assert_eq!(resolution.candidate_cached_prefix_len, 0);
@@ -2144,7 +2142,7 @@ fn moe_a_released_serial_turn_ends_the_replay_points_use() {
                 .expect("the save");
         }
         assert!(inner.gdn_in_use.is_empty(), "reuse {reuse}");
-        let stamp_of = |inner: &Qwen35MoeInner, hash: u64| {
+        let stamp_of = |inner: &Qwen35Inner, hash: u64| {
             moe_ladder(inner)
                 .into_iter()
                 .find(|&(_, final_hash, _)| final_hash == hash)
@@ -2180,7 +2178,7 @@ fn moe_mtp_gate_at_the_cap_reclaims_before_falling_back() {
     let unavailable = crate::test_support::metal_device_absent;
     let mut cfg = tiny_paged_forward_moe_cfg();
     cfg.n_mtp_layers = 1;
-    let mut inner = match Qwen35MoeInner::new(cfg) {
+    let mut inner = match Qwen35Inner::new_moe(cfg) {
         Ok(inner) => inner,
         Err(err) if unavailable(&err.reason) => return,
         Err(err) => panic!("tiny MoE MTP model: {}", err.reason),
@@ -2220,7 +2218,7 @@ fn moe_mtp_gate_at_the_cap_reclaims_before_falling_back() {
 /// returns `None` → red.
 #[test]
 fn flat_context_window_is_the_capped_lane() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
+    let mut inner = Qwen35Inner::new_moe(tiny_moe_cfg()).expect("construct tiny MoE model");
     assert!(inner.paged_adapter.is_none());
     assert_eq!(
         crate::engine::backend::ChatBackend::context_window(&inner),
@@ -2255,7 +2253,7 @@ fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
     else {
         return;
     };
-    let dense = inner.config.to_dense_config();
+    let dense = inner.config.clone();
     let draft = crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&dense)
         .expect("tiny draft");
     draft.validate_target(&dense).expect("draft fits target");
@@ -2363,14 +2361,14 @@ fn moe_metal_load_has_no_flat_lane() {
 fn plain_moe_on(
     tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
     test: &str,
-) -> Option<Qwen35MoeInner> {
+) -> Option<Qwen35Inner> {
     if crate::test_support::paged_prefill_unsupported(test) {
         return None;
     }
     let mut inner = moe_paged_inner_or_skip(test)?;
     cast_moe_inner_weights_bf16(&mut inner);
     assert!(inner.dflash2.is_none());
-    let dense = inner.config.to_dense_config();
+    let dense = inner.config.clone();
     crate::models::qwen3_5::dflash2_state::disk::tests::attach_tier(
         &mut inner.dflash2_states,
         &dense,
@@ -2393,7 +2391,7 @@ fn moe_small_plan(on: bool) {
 }
 
 /// The encoded GDN cell of the RAM copy of the state `depth` deep.
-fn moe_cell_at(inner: &Qwen35MoeInner, depth: usize) -> Vec<u8> {
+fn moe_cell_at(inner: &Qwen35Inner, depth: usize) -> Vec<u8> {
     let anchor = inner
         .dflash2_states
         .store
@@ -2403,7 +2401,7 @@ fn moe_cell_at(inner: &Qwen35MoeInner, depth: usize) -> Vec<u8> {
         .unwrap_or_else(|| panic!("a RAM state at {depth}"));
     crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
         &inner.dflash2_states,
-        &inner.config.to_dense_config(),
+        &inner.config.clone(),
         anchor,
     )
     .expect("an encoded cell")
@@ -2437,7 +2435,7 @@ fn moe_plain_paged_load_opens_the_state_tier() {
         cache_dir: Some(root.join("cache")),
         temp_root: Some(root.join("tmp")),
     };
-    let dense = inner.config.to_dense_config();
+    let dense = inner.config.clone();
     let activation =
         crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner).unwrap();
     let cell = crate::models::qwen3_5::gdn_sidecar::geometry(&dense, activation)
@@ -2494,7 +2492,7 @@ fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
             ),
             (1, 1)
         );
-        let waiting = |inner: &Qwen35MoeInner| {
+        let waiting = |inner: &Qwen35Inner| {
             inner
                 .dflash2_states
                 .disk
@@ -2552,7 +2550,7 @@ impl Drop for MoeSmallPlan {
 
 /// One MoE text turn: prime, prefill of the rest, finalize. Returns the
 /// prefix it resumed from and its last logits.
-fn moe_turn(inner: &mut Qwen35MoeInner, tokens: &[u32]) -> Result<(usize, MxArray)> {
+fn moe_turn(inner: &mut Qwen35Inner, tokens: &[u32]) -> Result<(usize, MxArray)> {
     let prefix = inner.prime_prefix_state(tokens, true, 16, &[], 0)?;
     let cached = prefix.effective_cached_prefix_len;
     let logits = inner.paged_prefill(
@@ -2570,7 +2568,7 @@ fn moe_turn(inner: &mut Qwen35MoeInner, tokens: &[u32]) -> Result<(usize, MxArra
 fn seeded_moe_on(
     tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
     test: &str,
-) -> Option<Qwen35MoeInner> {
+) -> Option<Qwen35Inner> {
     unsafe { mlx_sys::mlx_seed(0x5A13_0021) };
     plain_moe_on(tier, test)
 }
@@ -2581,12 +2579,12 @@ fn moe_restart_after(
     tag: &str,
     test: &str,
     turns: &[Vec<u32>],
-    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    damage: impl FnOnce(&Qwen35Inner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
     adopted: u64,
 ) -> Result<
     Option<(
         crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
-        Qwen35MoeInner,
+        Qwen35Inner,
         MxArray,
     )>,
 > {
@@ -2607,16 +2605,16 @@ fn moe_restart_after(
 /// `first` closes the tier cleanly; the next MoE load on it, after
 /// `damage`, adopts what is left.
 fn moe_reopen_after(
-    mut first: Qwen35MoeInner,
+    mut first: Qwen35Inner,
     tier: crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
     tag: &str,
     test: &str,
-    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    damage: impl FnOnce(&Qwen35Inner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
     adopted: u64,
 ) -> Result<
     Option<(
         crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
-        Qwen35MoeInner,
+        Qwen35Inner,
     )>,
 > {
     assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
@@ -2873,13 +2871,13 @@ fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
 /// core runs it: the image-aware prepare, the lane's prefill and the
 /// finalize, the merge standing in as the token embeddings on a text
 /// M-RoPE grid. Returns the prefix the turn resumed at.
-fn moe_image_turn(inner: &mut Qwen35MoeInner, tokens: &[u32], hash: u64) -> Result<u32> {
+fn moe_image_turn(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) -> Result<u32> {
     moe_image_turn_logits(inner, tokens, hash).map(|(cached, _)| cached)
 }
 
 /// [`moe_image_turn`], with the last row's logits.
 fn moe_image_turn_logits(
-    inner: &mut Qwen35MoeInner,
+    inner: &mut Qwen35Inner,
     tokens: &[u32],
     hash: u64,
 ) -> Result<(u32, MxArray)> {
@@ -2887,7 +2885,7 @@ fn moe_image_turn_logits(
     let keys = crate::engine::build_paged_extra_keys(tokens.len(), 16, &positions);
     let len = tokens.len() as u32;
     let resolution =
-        inner.prepare_moe_vlm_paged_prefix(tokens, len, 16, &keys, true, false, hash)?;
+        inner.prepare_dense_vlm_paged_prefix(tokens, len, 16, &keys, true, false, hash, 0)?;
     let cached = resolution.effective_plan.cached_prefix_len;
     let rows = tokens.len() as i64;
     let merge = crate::engine::vision::VisionMerge {
@@ -2910,12 +2908,13 @@ fn moe_image_turn_logits(
         &merge,
         cached,
         resolution.gdn_prefix_already_primed,
+        0,
         true,
         &layer_kinds,
     )?;
     logits.eval();
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(tokens, &keys, 0, rungs);
-    inner.finalize_moe_manual_paged_turn(&positions, 0)?;
+    inner.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(tokens, &keys, 0, rungs);
+    inner.finalize_dense_manual_paged_turn(&positions, 0, tokens.len())?;
     Ok((cached, logits))
 }
 
@@ -2994,7 +2993,7 @@ fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
             .expect("the promoted state");
         let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
             &second.dflash2_states,
-            &second.config.to_dense_config(),
+            &second.config,
             anchor,
         )
         .expect("an encoded cell");
@@ -3046,7 +3045,7 @@ fn moe_text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()
     let counters = first.dflash2_states.counters;
     assert_eq!(counters.replay_state_publications - before, 1);
     assert_eq!(counters.replay_state_publication_failures, 0);
-    let keys = |inner: &Qwen35MoeInner, depth: usize| {
+    let keys = |inner: &Qwen35Inner, depth: usize| {
         inner
             .dflash2_states
             .store
@@ -3094,7 +3093,7 @@ fn moe_text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()
         .expect("the promoted state");
     let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
         &second.dflash2_states,
-        &second.config.to_dense_config(),
+        &second.config,
         anchor,
     )
     .expect("an encoded cell");
