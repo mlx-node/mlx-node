@@ -7,7 +7,7 @@ crates/mlx-sys/src/metal/splash_moe/LICENSE.
 
 The grouped GGUF MoE kernels and host plan in
 crates/mlx-sys/src/metal/splash_moe/{abi.h,moe.metal} and
-crates/mlx-sys/src/mlx_splash_moe.cpp are adapted from Splash revision
+crates/mlx-sys/src/metal/mlx_splash_moe.cpp are adapted from Splash revision
 1482f6bbc2abf12375332725302019594150b6cb, runtime/ops/MoE.cpp,
 runtime/metal/abi/MoE.h, runtime/metal/kernels/shared/{moe,moe_gguf}.metal
 and runtime/metal/kernels/common/{moe_expert_slab,gguf_column_tile,
@@ -24,7 +24,7 @@ selects its register expert path on Apple9; its use on newer architectures
 here is an independently measured experiment.
 
 The heterogeneous projection dispatch in
-crates/mlx-sys/src/mlx_mixed_projection.cpp and
+crates/mlx-sys/src/metal/mlx_mixed_projection.cpp and
 crates/mlx-sys/src/metal/mixed_projection/ adapts the fused-segment plan in
 Splash's runtime/ops/LinearGguf.cpp and
 runtime/metal/kernels/shared/gguf_linear.metal at the same revision. It
@@ -48,7 +48,7 @@ candidate arrays as inputs and every anchor predecessor row initialized.
 
 The optional D128 draft attention kernel and host bridge in
 crates/mlx-sys/src/metal/dflash2_attention/ and
-crates/mlx-sys/src/mlx_dflash2_attention.cpp adapt the four-split tensor-op
+crates/mlx-sys/src/metal/mlx_dflash2_attention.cpp adapt the four-split tensor-op
 attention, FP32 online softmax and fixed-order reduction in Splash's
 runtime/metal/kernels/decode/draft.metal at the same revision. Live MLX
 views and an explicit sliding mask replace the source ring addressing;
@@ -74,7 +74,7 @@ runtime/metal/kernels/decode/{gdn,attention_qkv}.metal and
 runtime/metal/kernels/common/gguf_sgmatrix.h. They retain mlx-node's native
 BF16 arithmetic, packing and sum order. The optional SG8 split-K kernels in
 crates/mlx-sys/src/metal/kquant/kquant.h and their launch policy in
-crates/mlx-sys/src/mlx_kquant_register_plan.h follow
+crates/mlx-sys/src/metal/mlx_kquant_register_plan.h follow
 runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and
 runtime/ops/LinearGguf.cpp, with 32-column tiles and whole 256-input
 superblocks. Both native split kernel families share the source's
@@ -83,7 +83,7 @@ crates/mlx-sys/src/metal/kquant/kquant_split_reduce.h.
 
 The optional exact H2048 RMS kernels in
 crates/mlx-sys/src/metal/common/source_norm.metal.inc and their host bridge
-crates/mlx-sys/src/mlx_source_norm.cpp adapt the same revision's
+crates/mlx-sys/src/metal/mlx_source_norm.cpp adapt the same revision's
 runtime/metal/kernels/common/rms_inverse.h,
 runtime/metal/kernels/shared/normalization.metal and
 runtime/ops/Normalization.cpp. They preserve the source's ordered
@@ -91,7 +91,7 @@ runtime/ops/Normalization.cpp. They preserve the source's ordered
 weights and BF16 input, residual-add and output boundaries.
 
 The optional exact-width Q4 mixer projection in
-crates/mlx-sys/src/mlx_source_mixer.cpp and
+crates/mlx-sys/src/metal/mlx_source_mixer.cpp and
 crates/mlx-sys/src/metal/common/source_mixer.metal.inc adapts
 runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and
 runtime/metal/kernels/common/{gguf_sgmatrix,sgmatrix,split_reduce}.h at
@@ -102,7 +102,7 @@ exact integer chunk permutation; weights are not numerically converted.
 The measured-device diagnostic is separate from native SG8 operands.
 
 The optional measured-companion convolution bridge in
-crates/mlx-sys/src/mlx_source_draft_conv.cpp and
+crates/mlx-sys/src/metal/mlx_source_draft_conv.cpp and
 crates/mlx-sys/src/metal/common/source_draft_conv.metal.inc adapts
 runtime/metal/kernels/decode/draft.metal::draft_conv_phase at that
 revision. It preserves the two current-row dynamic taps, ordered FP32
@@ -110,7 +110,7 @@ products and sum, and the finish residual before a single BF16 store.
 The source arithmetic is isolated from the native BF16 operation policy.
 
 The optional strict Q6 vocabulary head in
-crates/mlx-sys/src/mlx_source_head_q6.cpp and
+crates/mlx-sys/src/metal/mlx_source_head_q6.cpp and
 crates/mlx-sys/src/metal/common/source_head_q6.metal.inc adapts
 runtime/metal/kernels/common/{gguf_staged,gguf_staged_tile,quant_formats}.h
 and runtime/metal/kernels/shared/gguf_linear.metal at that revision.
@@ -121,7 +121,7 @@ metadata addressing is adapted; generic projections remain separate.
 The M = 8 K-quant tensor-op kernel in
 crates/mlx-sys/src/metal/kquant/kquant_m8_nax.h (compiled into
 paged_attn.metallib by crates/mlx-sys/src/metal/kquant/kquant_m8_nax.metal)
-and its host-side K split rule in crates/mlx-sys/src/mlx_kquant_metal.cpp
+and its host-side K split rule in crates/mlx-sys/src/metal/mlx_kquant_metal.cpp
 (qmm_m8_nax_splits) are ported from Splash's
 runtime/metal/kernels/common/gguf_staged.h,
 runtime/metal/kernels/common/gguf_staged_tile.h,
@@ -135,7 +135,7 @@ KQ_INT8 / KQ_GRID) follow Splash's FmtQ2K, quant_spread2 and QuantKind in
 runtime/metal/kernels/common/quant_formats.h. The IQ1_S / IQ1_M / IQ2_XXS /
 IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S grid decode in
 crates/mlx-sys/src/metal/kquant/kquant_grid.h (and its C++ twin in
-crates/mlx-sys/src/mlx_kquant.cpp) — the 7-bit sign index expansion
+crates/mlx-sys/src/common/mlx_kquant.cpp) — the 7-bit sign index expansion
 (kq_signs7), the per-chunk grid index / sign / scale extraction (IQ3_S's
 two 9th index bits per chunk and per-element sign bits), the IQ1
 "code - 9" delta form and the power-of-two scale shift — follows Splash's
@@ -152,12 +152,12 @@ written for mlx-node's two-pass layout. The DFlash2 state structure — the
 packed per-layer GDN state blobs with decode parity and the pending tape
 (crates/mlx-core/src/models/qwen3_5/gdn_blob.rs) and the one-dispatch KV
 row store (crates/mlx-sys/src/metal/common/kv_store_rows.metal.inc,
-crates/mlx-sys/src/mlx_kv_store.cpp) — follows Splash's
+crates/mlx-sys/src/metal/mlx_kv_store_metal.cpp) — follows Splash's
 runtime/model/QwenState.cpp (swapDecodeParity), runtime/ops/GDN.cpp,
 runtime/ops/StateLayout.hpp and
 runtime/metal/kernels/common/paged_store_row.h.
 The fused GDN step (crates/mlx-sys/src/metal/common/gdn_fused_step.metal.inc,
-crates/mlx-sys/src/mlx_gdn_fused.cpp) — one threadgroup per value head
+crates/mlx-sys/src/metal/mlx_gdn_fused.cpp) — one threadgroup per value head
 running the window's recurrence, then the gated RMSNorm and z gate on the
 rows kept in threadgroup memory, folding the previous step's retained rows
 from its tape before the window (gdn_decode_batch_phase pending rows),
@@ -169,7 +169,7 @@ arithmetic kept as MLX's rms_norm kernel and compiled sigmoid gate so the
 result equals mlx-node's unfused chain.
 The sampled DFlash2 target rows
 (crates/mlx-sys/src/metal/sampling/dflash2_rows.metal,
-crates/mlx-sys/src/mlx_dflash2_rows.cpp) — a sharded online-softmax scan of
+crates/mlx-sys/src/metal/mlx_dflash2_rows.cpp) — a sharded online-softmax scan of
 each row's denominator, one threadgroup per row that brackets the kept tokens
 by key with pivot counts (no sort or partition of the vocabulary) and ranks
 them in threadgroup memory, a tie order by id, and an inverse-CDF draw from
@@ -183,7 +183,7 @@ acceptance law kept as mlx-node's.
 
 The optional source-routing path in
 crates/mlx-sys/src/metal/common/source_routing.metal.inc and its dedicated
-Fast-math JIT encoder in mlx_splash_moe.cpp adapt the FP32 router matrix
+Fast-math JIT encoder in crates/mlx-sys/src/metal/mlx_splash_moe.cpp adapt the FP32 router matrix
 projection, top-k selection, normalization and fused shared scalar gate from
 runtime/metal/kernels/shared/gguf_float.metal, shared/moe.metal,
 common/sgmatrix.h and common/activation.h at the same Splash revision. The
@@ -191,7 +191,7 @@ native BF16 router weights are widened exactly; this diagnostic uses the
 source FP32 arithmetic and retains a separate, explicitly selected policy.
 
 The opt-in original Q/K RMS normalization and RoPE primitive in
-crates/mlx-sys/src/mlx_source_qk_norm_rope.cpp and
+crates/mlx-sys/src/metal/mlx_source_qk_norm_rope.cpp and
 crates/mlx-sys/src/metal/common/source_qk_norm_rope.metal.inc adapts
 Splash common/attention_qkv_prepare.h, common/rms_inverse.h and
 common/target_rope.h at the revision above. It preserves the source
@@ -210,7 +210,7 @@ each tag to survive a skip-special decode, because mlx-node parses decoded
 text.
 
 The Qwen3.8-Flash-Next prefill window in
-crates/mlx-core/src/models/qwen4_exp/memory.rs (prefill_window: one fixed
+crates/mlx-core/src/models/qwen4_exp/memory/mod.rs (prefill_window: one fixed
 chunk of rows whose scratch the memory plan prices as the lane transient,
 never cut by live free memory) follows the fixed prefill chunk of Splash
 runtime/metal/abi/ExecutionGeometry.h (SPLASH_PREFILL_TOKEN_BUDGET) and
@@ -241,7 +241,7 @@ cut to eight formats and the 8 / 16 / 32-row decode kernels; each file's
 header names its changes. metal/kernels/common/gguf_tile.h replaces Splash's
 store epilogues with mlx-node's (MLX's Add and Sigmoid / Multiply functors in
 bf16) and keeps Splash's fp32 ones for test-only kernels. The plan law, encoding and repack host side in
-crates/mlx-sys/src/mlx_gguf_planes.cpp are rewritten from Splash
+crates/mlx-sys/src/metal/mlx_gguf_planes.cpp are rewritten from Splash
 runtime/ops/{KernelSelection.cpp,KernelCalibration.hpp,LinearGguf.cpp} and
 runtime/model/GgufPreparation.cpp at the same revision, and so are the
 planes plan of a load and the import's planes writer in

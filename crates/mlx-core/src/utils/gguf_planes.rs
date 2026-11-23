@@ -53,7 +53,7 @@ const LANE_RESERVE_BYTES: u64 = 8 << 30;
 const MIN_CORES: u32 = 40;
 /// sha256 of the planes route's sources, oldest first: everything under
 /// `crates/mlx-sys/src/metal/splash_gguf` (its compile flags included) and
-/// `crates/mlx-sys/src/mlx_gguf_planes.{h,cpp}`. A test fails while the last
+/// `crates/mlx-sys/src/metal/mlx_gguf_planes.{h,cpp}`. A test fails while the last
 /// entry is not the sources' hash: append the new hash, which bumps
 /// [`ROUTE_VERSION`], so stored states never restore across two routes.
 const ROUTE_SOURCES: [&str; 1] =
@@ -1472,10 +1472,13 @@ mod tests {
         );
     }
 
-    /// The pinned files, relative to `crates/mlx-sys/src`, in byte order of
-    /// the path; hidden files are not part of the sources.
-    fn route_source_files(sys_src: &std::path::Path) -> Vec<String> {
-        fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+    /// The pinned files as `(canonical hash key, path relative to
+    /// `crates/mlx-sys/src`)`, in byte order of the key; hidden files are not
+    /// part of the sources. Keeping the pre-move canonical keys for
+    /// `mlx_gguf_planes.{h,cpp}` preserves `ROUTE_VERSION` (stored disk states)
+    /// across the directory move while still hashing every byte of both files.
+    fn route_source_files(sys_src: &std::path::Path) -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, String)>) {
             for entry in std::fs::read_dir(dir).expect("read the planes sources") {
                 let entry = entry.expect("a directory entry");
                 let name = entry.file_name().into_string().expect("a UTF-8 file name");
@@ -1486,20 +1489,26 @@ mod tests {
                 if entry.file_type().expect("a file type").is_dir() {
                     walk(&entry.path(), &rel, out);
                 } else {
-                    out.push(rel);
+                    out.push((rel.clone(), rel));
                 }
             }
         }
         let mut files = vec![
-            "mlx_gguf_planes.h".to_string(),
-            "mlx_gguf_planes.cpp".to_string(),
+            (
+                "mlx_gguf_planes.h".to_string(),
+                "metal/mlx_gguf_planes.h".to_string(),
+            ),
+            (
+                "mlx_gguf_planes.cpp".to_string(),
+                "metal/mlx_gguf_planes.cpp".to_string(),
+            ),
         ];
         walk(
             &sys_src.join("metal/splash_gguf"),
             "metal/splash_gguf",
             &mut files,
         );
-        files.sort();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
         files
     }
 
@@ -1508,7 +1517,7 @@ mod tests {
     fn route_sources_hash(flip: Option<(usize, usize)>) -> String {
         let sys_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mlx-sys/src");
         let mut h = Sha256::new();
-        for (i, rel) in route_source_files(&sys_src).iter().enumerate() {
+        for (i, (key, rel)) in route_source_files(&sys_src).iter().enumerate() {
             let mut bytes = std::fs::read(sys_src.join(rel)).expect("read a planes source");
             if let Some((file, at)) = flip
                 && file == i
@@ -1516,7 +1525,7 @@ mod tests {
                 let at = at.min(bytes.len() - 1);
                 bytes[at] ^= 1;
             }
-            h.update(rel.as_bytes());
+            h.update(key.as_bytes());
             h.update([0u8]);
             h.update((bytes.len() as u64).to_le_bytes());
             h.update(&bytes);
@@ -1543,7 +1552,7 @@ mod tests {
         assert!(
             files
                 .iter()
-                .any(|f| f == "metal/splash_gguf/metal_flags.txt")
+                .any(|(_, rel)| rel == "metal/splash_gguf/metal_flags.txt")
         );
         let hash = route_sources_hash(None);
         println!(

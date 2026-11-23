@@ -37,7 +37,7 @@
 // producer's sentinel `.../mlx-prebuilt/<release_tag>/kernels/mlx.metallib`,
 // which names the release, not a local dir. The mlx-sys OUT_DIR is then read
 // from the second path the bridge bakes, `<OUT_DIR>/paged_attn.metallib`
-// (`MLX_NODE_PAGED_ATTN_METALLIB` in mlx_paged_dispatch.cpp); build.rs puts
+// (`MLX_NODE_PAGED_ATTN_METALLIB` in metal/mlx_paged_dispatch.cpp); build.rs puts
 // both metallibs in `<OUT_DIR>/lib` in that mode (the prebuilt mlx.metallib
 // as a hard link or copy), so no cache location is re-derived here.
 //
@@ -74,7 +74,7 @@ export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
 
 /**
- * K-quant kernels mlx_kquant_metal.cpp loads from paged_attn.metallib (it has
+ * K-quant kernels metal/mlx_kquant_metal.cpp loads from paged_attn.metallib (it has
  * no JIT fallback): one per dtype, plus the function-constant sorted gather and
  * the bfloat16-only sg8 pair. A metallib without them builds fine and then
  * throws on the first GGUF K-quant matmul.
@@ -89,7 +89,7 @@ export const KQUANT_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * GGUF repack kernels (mlx_gguf_repack.cpp kernel table), loaded from
+ * GGUF repack kernels (common/mlx_gguf_repack.h kernel table), loaded from
  * paged_attn.metallib with no JIT fallback: every name of the table, which the
  * Rust test gguf_repack_metallib_names compares with this list both ways.
  */
@@ -116,8 +116,8 @@ export const GGUF_REPACK_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * Segmented SDPA (mlx_segmented_sdpa.cpp), mixed BF16 x F32-sidecar affine
- * `qmv_wide` (mlx_affine_mixed_qmm.cpp) and GGUF repack (mlx_gguf_repack.cpp)
+ * Segmented SDPA (metal/mlx_segmented_sdpa.cpp), mixed BF16 x F32-sidecar affine
+ * `qmv_wide` (metal/mlx_affine_mixed_qmm.cpp) and GGUF repack (metal/mlx_gguf_repack_metal.cpp)
  * kernels, also loaded from paged_attn.metallib with no JIT fallback: every one
  * the dispatchers can request.
  */
@@ -273,7 +273,7 @@ const PREBUILT_METAL_PATH_RE =
 
 /**
  * `MLX_NODE_PAGED_ATTN_METALLIB` baked by build.rs into the bridge
- * (mlx_paged_dispatch.cpp): `<OUT_DIR>/paged_attn.metallib`, which names the
+ * (metal/mlx_paged_dispatch.cpp): `<OUT_DIR>/paged_attn.metallib`, which names the
  * mlx-sys build even when the METAL_PATH is a prebuilt sentinel.
  */
 function parsePagedOrigin(path: string): string | undefined {
