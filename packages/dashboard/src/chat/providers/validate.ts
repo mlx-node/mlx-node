@@ -29,7 +29,7 @@ function request(id: ProviderId, key: string, deps: ValidateDeps): HttpRequest {
   };
   switch (id) {
     case 'exa':
-      return { ...common, path: '/v0/teams/me', auth: { 'x-api-key': key } };
+      return { ...common, path: '/monitors', query: [['limit', '1']], auth: { 'x-api-key': key } };
     case 'deepseek':
       return { ...common, path: '/user/balance', auth: { Authorization: `Bearer ${key}` } };
     case 'brave':
@@ -105,6 +105,10 @@ function firecrawlFacts(data: Record<string, unknown>): ProviderFacts | null {
 export async function validateKey(id: ProviderId, key: string, deps: ValidateDeps): Promise<KeyValidation> {
   const reply = await httpJson(request(id, key, deps));
   if (reply.kind === 'failed') return { check: 'unverified', facts: null };
+  // Exa answers 403 `FEATURE_DISABLED` to a key it accepted when the team has no monitors; search does not need them.
+  if (id === 'exa' && reply.status === 403 && record(reply.json)?.tag === 'FEATURE_DISABLED') {
+    return { check: 'ok', facts: null };
+  }
   if (reply.status === 401 || reply.status === 403) return { check: 'rejected', facts: null };
   if (reply.status === 402) return { check: 'no-credit', facts: null };
   if (reply.status !== 200) return { check: 'unverified', facts: null };

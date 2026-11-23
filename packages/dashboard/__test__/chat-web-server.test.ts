@@ -10,7 +10,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { STDERR_LINES } from '../src/chat/web/errors.js';
 import { MAX_FRAME_BYTES } from '../src/chat/web/mcp.js';
@@ -19,11 +19,19 @@ import {
   MAX_CALLS_IN_FLIGHT,
   TOOL_DEFINITIONS,
   WebTools,
+  readWebConfig,
   scrubEnv,
   searchArgs,
   type WebConfig,
   type WebDeps,
 } from '../src/chat/web/tools.js';
+import {
+  fakeLocalAnswers,
+  fakeLocalScript,
+  type FakeLocalAnswers,
+  type FakeProvider,
+  startFakeProvider,
+} from './helpers/fake-providers.js';
 
 const WEB_DIR = fileURLToPath(new URL('../src/chat/web/', import.meta.url));
 const BOOTSTRAP = join(WEB_DIR, 'server-ts-bootstrap.ts');
@@ -114,6 +122,28 @@ describe('mlx_web over stdio', () => {
     expect(JSON.stringify(out.replies)).not.toContain(KEY);
   });
 
+  it('reads pages through Firecrawl on this Mac from its env, with no Authorization header', async () => {
+    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+    try {
+      const out = await run([callTool(1, 'web_fetch', { url: 'https://example.com/doc' })], {
+        MLX_WEB_FETCH_PROVIDER: 'firecrawl',
+        MLX_WEB_FETCH_KEY: KEY,
+        MLX_WEB_FETCH_URL: local.baseUrl,
+      });
+      expect(out.stderr).toBe('');
+      expect(parseWebResultText(textOf(out.replies[0]))).toMatchObject({
+        kind: 'page',
+        provider: 'firecrawl',
+        title: 'Local page',
+      });
+      expect(local.requests.map((r) => r.path)).toEqual(['/health', '/v2/scrape', '/v2/scrape']);
+      for (const request of local.requests) expect(request.headers.authorization).toBeUndefined();
+      expect(JSON.stringify(local.requests)).not.toContain(KEY);
+    } finally {
+      await local.close();
+    }
+  });
+
   it('says not-configured with no provider, and with a provider but no key', async () => {
     const envs: Array<Record<string, string>> = [
       {},
@@ -175,7 +205,13 @@ describe('mlx_web over stdio', () => {
   });
 });
 
-const CONFIG: WebConfig = { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY };
+const CONFIG: WebConfig = {
+  searchProvider: 'exa',
+  searchKey: KEY,
+  fetchProvider: 'exa',
+  fetchKey: KEY,
+  fetchUrl: '',
+};
 
 /** A fetch that answers from `answer` and records each URL it was asked for. */
 function fakeFetch(answer: (url: string) => Promise<Response>): { fetch: typeof fetch; urls: string[] } {
@@ -270,6 +306,140 @@ describe('web tools', () => {
     };
     scrubEnv(env);
     expect(env).toEqual({ PATH: '/bin', HOME: '/h' });
+  });
+});
+
+describe('readWebConfig', () => {
+  const BASE = 'http://127.0.0.1:3002';
+
+  it('keeps MLX_WEB_FETCH_URL only for Firecrawl and only in the saved form, and then drops the fetch key', () => {
+    expect(
+      readWebConfig({ MLX_WEB_FETCH_PROVIDER: 'firecrawl', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: BASE }),
+    ).toEqual({ searchProvider: 'none', searchKey: '', fetchProvider: 'firecrawl', fetchKey: '', fetchUrl: BASE });
+    for (const env of [
+      { MLX_WEB_FETCH_PROVIDER: 'exa', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: BASE },
+      { MLX_WEB_FETCH_PROVIDER: 'firecrawl', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: 'http://192.168.1.5:3002' },
+      { MLX_WEB_FETCH_PROVIDER: 'firecrawl', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: 'https://127.0.0.1:3002' },
+      { MLX_WEB_FETCH_PROVIDER: 'firecrawl', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: 'http://localhost:3002' },
+    ]) {
+      expect([env, readWebConfig(env)]).toMatchObject([env, { fetchKey: '', fetchUrl: '' }]);
+    }
+    expect(
+      readWebConfig({ MLX_WEB_FETCH_PROVIDER: 'firecrawl', MLX_WEB_FETCH_KEY: KEY, MLX_WEB_FETCH_URL: '' }),
+    ).toEqual({ searchProvider: 'none', searchKey: '', fetchProvider: 'firecrawl', fetchKey: KEY, fetchUrl: '' });
+  });
+});
+
+describe('web tools with Firecrawl on this Mac', () => {
+  const locals: FakeProvider[] = [];
+  afterEach(async () => {
+    await Promise.all(locals.splice(0).map((s) => s.close()));
+  });
+
+  async function local(): Promise<{ server: FakeProvider; answers: FakeLocalAnswers; tools: WebTools }> {
+    const answers = fakeLocalAnswers();
+    const server = await startFakeProvider(fakeLocalScript(answers));
+    locals.push(server);
+    const tools = new WebTools(
+      { searchProvider: 'none', searchKey: '', fetchProvider: 'firecrawl', fetchKey: '', fetchUrl: server.baseUrl },
+      deps((input, init) => fetch(input, init)),
+    );
+    return { server, answers, tools };
+  }
+
+  const paths = (server: FakeProvider): string[] => server.requests.map((r) => `${r.method} ${r.path}`);
+
+  it('checks the server, then reads the page from it, with no key', async () => {
+    const { server, tools } = await local();
+    const page = parseWebResultText(await tools.call('web_fetch', { url: 'https://example.com/doc' }));
+    expect(page).toMatchObject({ kind: 'page', provider: 'firecrawl', title: 'Local page', cloudRead: false });
+    expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape', 'POST /v2/scrape']);
+    expect(JSON.parse(server.requests[2]!.body)).toMatchObject({ url: 'https://example.com/doc' });
+    for (const request of server.requests) expect(request.headers.authorization).toBeUndefined();
+  });
+
+  it('a server that reads private addresses gives local-down and gets no page address', async () => {
+    const { server, answers, tools } = await local();
+    answers.probe = { json: { success: true, data: { markdown: 'health', metadata: { statusCode: 200 } } } };
+    expect(await tools.call('web_fetch', { url: 'https://example.com/doc' })).toBe(
+      formatErrorText('local-down', 'firecrawl'),
+    );
+    expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape']);
+    expect(JSON.stringify(server.requests)).not.toContain('example.com');
+  });
+
+  it('checks again before every read', async () => {
+    const { server, answers, tools } = await local();
+    expect(parseWebResultText(await tools.call('web_fetch', { url: 'https://example.com/1' }))).toMatchObject({
+      kind: 'page',
+    });
+    answers.probe = { json: { success: true, data: { markdown: 'health' } } };
+    expect(await tools.call('web_fetch', { url: 'https://example.com/2' })).toBe(
+      formatErrorText('local-down', 'firecrawl'),
+    );
+    answers.probe = fakeLocalAnswers().probe;
+    expect(parseWebResultText(await tools.call('web_fetch', { url: 'https://example.com/3' }))).toMatchObject({
+      kind: 'page',
+    });
+    const scraped = server.requests
+      .filter((r) => r.path === '/v2/scrape')
+      .map((r) => (JSON.parse(r.body) as { url: string }).url)
+      .filter((url) => url.startsWith('https://example.com'));
+    expect(scraped).toEqual(['https://example.com/1', 'https://example.com/3']);
+    expect(server.requests.filter((r) => r.path === '/health')).toHaveLength(3);
+  });
+
+  it('a server that is not running gives local-down', async () => {
+    const { server, tools } = await local();
+    await locals.pop()!.close();
+    expect(server.requests).toEqual([]);
+    expect(await tools.call('web_fetch', { url: 'https://example.com/doc' })).toBe(
+      formatErrorText('local-down', 'firecrawl'),
+    );
+  });
+
+  it('a private or local page address is still blocked before any request', async () => {
+    const { server, tools } = await local();
+    for (const url of ['http://localhost:8080/admin', 'https://10.0.0.1/', 'http://127.1/', 'https://nas.local/x']) {
+      expect(await tools.call('web_fetch', { url })).toBe(formatErrorText('blocked', 'firecrawl'));
+    }
+    expect(server.requests).toEqual([]);
+  });
+
+  it('search never goes to the local base', async () => {
+    const answers = fakeLocalAnswers();
+    const server = await startFakeProvider(fakeLocalScript(answers));
+    locals.push(server);
+    const fake = fakeFetch(() => Promise.resolve(Response.json({ results: [] })));
+    const tools = new WebTools(
+      { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'firecrawl', fetchKey: '', fetchUrl: server.baseUrl },
+      deps(fake.fetch),
+    );
+    expect(await tools.call('web_search', { query: 'q' })).toBe('WEB_SEARCH provider=exa results=0');
+    expect(fake.urls).toEqual(['http://127.0.0.1:9/search']);
+    expect(server.requests).toEqual([]);
+  });
+
+  it('cloud with no key, or a fetch URL that is not a saved loopback form, is not-configured and sends nothing', async () => {
+    const fake = fakeFetch(() => Promise.resolve(Response.json({})));
+    const configs: WebConfig[] = [
+      { searchProvider: 'none', searchKey: '', fetchProvider: 'firecrawl', fetchKey: '', fetchUrl: '' },
+      {
+        searchProvider: 'none',
+        searchKey: '',
+        fetchProvider: 'firecrawl',
+        fetchKey: KEY,
+        fetchUrl: 'http://10.0.0.2:3002',
+      },
+      { searchProvider: 'none', searchKey: '', fetchProvider: 'exa', fetchKey: KEY, fetchUrl: 'http://127.0.0.1:3002' },
+    ];
+    for (const config of configs) {
+      const tools = new WebTools(config, deps(fake.fetch));
+      expect(await tools.call('web_fetch', { url: 'https://example.com' })).toBe(
+        formatErrorText('not-configured', 'none'),
+      );
+    }
+    expect(fake.urls).toEqual([]);
   });
 });
 

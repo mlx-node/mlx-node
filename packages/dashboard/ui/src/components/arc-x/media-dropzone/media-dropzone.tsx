@@ -11,6 +11,7 @@ import {
 } from 'react';
 
 import { cn } from '../../../lib/cn';
+import { normalizeMime, readFileAsDataUrl } from '../../../lib/file-read';
 import { formatBytes, formatNumber } from '../../../lib/format';
 import {
   CLAIRIC_MAX_IMAGES,
@@ -46,33 +47,11 @@ export interface MediaDropzoneProps {
   onClear?: () => void;
 }
 
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') resolve(reader.result);
-      else reject(new Error('Could not read file'));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error('Could not read file'));
-    reader.readAsDataURL(file);
-  });
-}
-
 function nextRotation(current: ClairicImageRotation): ClairicImageRotation {
   if (current === 0) return 90;
   if (current === 90) return 180;
   if (current === 180) return 270;
   return 0;
-}
-
-function normalizeMime(file: File): string {
-  if (file.type !== '') return file.type.toLowerCase();
-  const lower = file.name.toLowerCase();
-  if (lower.endsWith('.png')) return 'image/png';
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
-  if (lower.endsWith('.webp')) return 'image/webp';
-  if (lower.endsWith('.pdf')) return 'application/pdf';
-  return '';
 }
 
 /**

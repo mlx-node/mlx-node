@@ -1,5 +1,5 @@
 import { ExternalLink, Info, TriangleAlert } from 'lucide-react';
-import { type ReactElement, useEffect, useRef, useState } from 'react';
+import { type ReactElement, type ReactNode, useEffect, useRef, useState } from 'react';
 
 import { ConfirmPopover } from '../../components/arc-x/confirm-popover/confirm-popover';
 import { LiveLabel } from '../../components/arc-x/live-label/live-label';
@@ -22,7 +22,6 @@ import {
   factsLine,
   fill,
   KEY_PAGES,
-  keyReachesWork,
   providerName,
   skillSource,
 } from '../../lib/providers-view';
@@ -44,6 +43,10 @@ export interface ProviderCardProps {
   /** Rejects with an Error whose message is fixed text. */
   onRemove: () => Promise<void>;
   onRemoved: () => void;
+  /** What Work gets from this provider now: its key, or (Firecrawl) the address of Firecrawl on this Mac. */
+  workNotice: 'key' | 'local' | null;
+  /** Shown under the key rows: the Firecrawl on this Mac block. */
+  children?: ReactNode;
 }
 
 function StatusBadge({ provider, checking }: { provider: ProviderState; checking: boolean }): ReactElement {
@@ -348,10 +351,10 @@ export function ProviderCard(props: ProviderCardProps): ReactElement {
         <Rule />
         <div className={LABEL_GRID}>
           <SwapCell active={entering ? 'form' : 'key'} items={{ form, key: keyRow }} className="col-span-2" />
-          {keyReachesWork(p) ? (
+          {props.workNotice !== null ? (
             <p className="m-0 flex items-start gap-1.5 text-caption text-secondary col-start-2">
               <Info size={12} aria-hidden="true" className="mt-0.5 shrink-0" />
-              <span>{PROVIDERS.workKeyNotice}</span>
+              <span>{props.workNotice === 'key' ? PROVIDERS.workKeyNotice : PROVIDERS.localWorkNotice}</span>
             </p>
           ) : null}
           {p.skill.installed ? (
@@ -377,6 +380,12 @@ export function ProviderCard(props: ProviderCardProps): ReactElement {
             </div>
           ) : null}
         </div>
+        {props.children !== undefined ? (
+          <>
+            <Rule />
+            {props.children}
+          </>
+        ) : null}
       </div>
     </Panel>
   );

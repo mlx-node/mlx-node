@@ -417,7 +417,7 @@ export function webErrorText(code: WebErrorCode): string {
 
 /** Codes whose row offers the Web Search settings link. */
 export function errorNeedsSettings(code: WebErrorCode): boolean {
-  return code === 'not-configured' || code === 'key-rejected' || code === 'no-credit';
+  return code === 'not-configured' || code === 'key-rejected' || code === 'no-credit' || code === 'local-down';
 }
 
 /** "5 results", "1 result", "No results". */

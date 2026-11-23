@@ -103,7 +103,10 @@ export function folderReason(
   return folderTooLong(folder) ? CHAT.folderTooLong : undefined;
 }
 
-/** Providers whose key the Work agent gets: the selected search provider, and Firecrawl when its Work skills are ready. */
+/**
+ * Providers whose key the Work agent gets: the selected search provider, and Firecrawl when its Work skills are ready
+ * and it reads pages in Firecrawl Cloud (on this Mac, Work gets no key).
+ */
 export function workKeyProviders(
   host: ChatHostState['providers'] | null,
   list: ProvidersResponse | null,
@@ -111,7 +114,8 @@ export function workKeyProviders(
   const out: ProviderId[] = [];
   const search = list !== null ? list.search : (host?.search ?? null);
   if (search !== null) out.push(search);
-  if (list?.providers.find((provider) => provider.id === 'firecrawl')?.work.ready === true) out.push('firecrawl');
+  const firecrawl = list?.providers.find((provider) => provider.id === 'firecrawl');
+  if (list !== null && firecrawl?.work.ready === true && !list.firecrawlLocal) out.push('firecrawl');
   return out;
 }
 

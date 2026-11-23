@@ -7,6 +7,7 @@
 
 import { TranscriptReducer, type UpdateLine } from '../agent-sessions/transcript.js';
 import type { TranscriptEntry, TurnMetric } from '../agent-sessions/types.js';
+import type { UserAttachment } from './attachment-rule.js';
 import { needleList, redactDeep, redactEntry, StreamRedactor } from './redact.js';
 import type {
   CompactionState,
@@ -99,6 +100,15 @@ export class Conversation {
     return this.base !== null;
   }
 
+  /** What the user messages of the current base carry, live ones included. */
+  userAttachments(): UserAttachment[] {
+    const out: UserAttachment[] = [];
+    for (const entry of this.base?.view ?? []) {
+      if (entry.kind === 'user' && entry.attachments !== undefined) out.push(...entry.attachments);
+    }
+    return out;
+  }
+
   /** The disk entries of the current base, or undefined when there is none. */
   diskEntries(): TranscriptEntry[] | undefined {
     return this.base?.disk;
@@ -176,11 +186,11 @@ export class Conversation {
   }
 
   /** The user's prompt, pushed when it is accepted (the agent does not echo it). */
-  userPrompt(text: string): void {
+  userPrompt(text: string, attachments: UserAttachment[] = []): void {
     this.lastEnd = null;
     if (this.base === null) return;
     this.version += 1;
-    this.emitOps(this.base.reducer.userPrompt(text));
+    this.emitOps(this.base.reducer.userPrompt(text, attachments));
   }
 
   /** A model switch the user made between turns. */

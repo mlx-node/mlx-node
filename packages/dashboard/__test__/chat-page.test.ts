@@ -4,15 +4,46 @@ import { act, createElement, type ReactElement } from 'react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { CHAT_PICTURES_MAX_BASE64, numberedBytes, type UserAttachment } from '../src/chat/attachment-rule.js';
 import type { ApiCall } from '../src/runtime.js';
+import type { DraftAttachment } from '../ui/src/lib/chat-attachments.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState, ChatMode, ConversationInfo, ConversationRow } from '../ui/src/lib/chat-types.js';
+import { formatBytes } from '../ui/src/lib/format.js';
+import { PROVIDERS } from '../ui/src/lib/providers-strings.js';
+import type {
+  KeyCheck,
+  LocalCheck,
+  ProviderId,
+  ProvidersResponse,
+  SearchProviderId,
+} from '../ui/src/lib/providers-types.js';
+import type { CrawlerValue } from '../ui/src/lib/providers-view.js';
 import { toast } from '../ui/src/lib/toast.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import Chat from '../ui/src/pages/chat.js';
 import { modeBlocker, sendFailure } from '../ui/src/pages/chat/blockers.js';
-import { webChip } from '../ui/src/pages/chat/composer-tools.js';
-import { forgetPlace, NEW_PLACE, readDraft, writeDraft } from '../ui/src/pages/chat/drafts.js';
+import {
+  type CrawlerChoiceRow,
+  crawlerChoices,
+  type CrawlerPanelState,
+  crawlerRow,
+  type WebChoiceRow,
+  webChoices,
+  type WebPanelState,
+  webRow,
+} from '../ui/src/pages/chat/composer-tools.js';
+import {
+  forgetPlace,
+  placeEpoch,
+  NEW_PLACE,
+  readAttachments,
+  readDraft,
+  readFailed,
+  writeAttachments,
+  writeDraft,
+  writeFailed,
+} from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
 import {
   answer,
@@ -226,6 +257,98 @@ function host(over: Partial<ChatHostState>): ChatHostState {
   return { ...READY_CHAT_HOST, ...over };
 }
 
+/** A `GET /providers` body: `keys` names the search providers with a key and their check. */
+function providersBody(
+  search: SearchProviderId | null,
+  keys: Partial<Record<SearchProviderId, KeyCheck>>,
+  over: Partial<ProvidersResponse> = {},
+): ProvidersResponse {
+  const ids: ProviderId[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
+  return {
+    search,
+    firecrawl: false,
+    firecrawlLocal: false,
+    fetch: search,
+    local: { url: null, check: null, checkedAt: null, version: null, cloud: null },
+    providers: ids.map((id) => ({
+      id,
+      role: id === 'firecrawl' ? 'crawl' : 'search',
+      configured: id !== 'firecrawl' && keys[id] !== undefined,
+      check: id === 'firecrawl' ? null : (keys[id] ?? null),
+      checkedAt: null,
+      selected: id === search,
+      keyEnv: [],
+      skill: { installed: id === search, names: [], upstream: null },
+      work: { ready: id === search, missing: null },
+      facts: null,
+    })),
+    chatSkill: { installed: true },
+    keychain: 'ok',
+    applyPending: false,
+    vanished: null,
+    ...over,
+  };
+}
+
+function summary(search: SearchProviderId | null, searchCheck: KeyCheck | null = 'ok'): ChatHostState['providers'] {
+  return { ...READY_CHAT_HOST.providers, search, searchCheck: search === null ? null : searchCheck, fetch: search };
+}
+
+function reads(): number {
+  return calls.filter((call) => call.method === 'GET' && pathOf(call) === '/providers').length;
+}
+
+function selections(): unknown[] {
+  return writes()
+    .filter((call) => call.path === '/providers/selection')
+    .map((call) => call.body);
+}
+
+/** The "Web search" row of the `+` menu. */
+function webMenuRow(): HTMLElement {
+  return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[1]!;
+}
+
+/** A row of the web search panel by its label. */
+function choice(label: string): HTMLElement {
+  const found = allByRole(document.body, 'menuitemradio').find(
+    (row) => row.getAttribute('data-label') === label.toLowerCase(),
+  );
+  if (found === undefined) throw new Error(`no choice ${label}`);
+  return found;
+}
+
+/** Opens Chat with `search` selected, then the `+` menu and the web search panel. */
+async function openWeb(
+  search: SearchProviderId | null,
+  routes: Record<string, unknown>,
+  searchCheck: KeyCheck = 'ok',
+  over: Partial<ChatHostState['providers']> = {},
+): Promise<HTMLElement> {
+  page?.unmount();
+  api?.();
+  await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+    host: host({ providers: { ...summary(search, searchCheck), ...over } }),
+    routes,
+  });
+  const plus = reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!;
+  click(plus);
+  await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+  click(webMenuRow());
+  await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+  return byRole(document.body, 'dialog', CHAT.webSearch)!;
+}
+
+/** Escape until the `+` menu is gone: one level per press. */
+function closeMenu(): void {
+  for (let level = 0; level < 2; level += 1) {
+    const target = document.activeElement ?? document.body;
+    act(() => {
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    });
+  }
+}
+
 beforeEach(() => {
   localStorage.clear();
 });
@@ -236,6 +359,8 @@ afterEach(() => {
   page = undefined;
   api = undefined;
   writeDraft(NEW_PLACE, '');
+  writeAttachments(NEW_PLACE, []);
+  writeFailed(NEW_PLACE, null);
   for (const id of used.splice(0)) forgetPlace(id);
   Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
   vi.restoreAllMocks();
@@ -431,6 +556,13 @@ describe('Chat page: sending', () => {
     await act(async () => create.release());
     await waitFor(() => error.mock.calls.length > 0);
     expect(readDraft(NEW_PLACE)).toBe('newer text');
+    click(button(CHAT.newChat));
+    await waitFor(() => where.search === '?mode=chat');
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(composer().value).toBe('newer text');
+    click(button(CHAT.sendErrors.other[1]));
+    await waitFor(() => writes().length === 2);
+    expect((writes()[1]!.body as { text: string }).text).toBe('first prompt');
   });
 
   it('a prompt that fails late in an open conversation keeps the text typed while it was pending', async () => {
@@ -577,6 +709,43 @@ describe('Chat page: sending', () => {
     expect(writes()[1]!.body).toMatchObject({ text: 'Are you there?' });
   });
 
+  // Mutation: leave a failed send's strip up after its own action -> the refusal stays on screen.
+  it("a refused send's own action takes its strip; a message the composer does not hold keeps Retry", async () => {
+    const prompt = deferred(stubError('E_CONFLICT', 'gone', 'model-unavailable'));
+    await open('/chat?c=p-act', (text) => text.includes('Hi there'), {
+      routes: {
+        '/chat/conversations/p-act/prompt': sequence(prompt.body, stubError('E_CONFLICT', 'gone', 'model-unavailable')),
+      },
+      conversations: { 'p-act': sync('p-act') },
+    });
+    type('first prompt');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    type('newer text');
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors['model-unavailable'][0]));
+    click(button(CHAT.sendErrors['model-unavailable'][1]));
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(shown()).not.toContain(CHAT.sendErrors['model-unavailable'][0]);
+    await flushTimers();
+    key(document.activeElement ?? document.body, { key: 'Escape' });
+    await waitFor(() => hasButton(CHAT.sendErrors.other[1]));
+    click(button(CHAT.sendErrors.other[1]));
+    await waitFor(() => writes().length === 2);
+    expect((writes()[1]!.body as { text: string }).text).toBe('first prompt');
+    await waitFor(() => shown().includes(CHAT.sendErrors['model-unavailable'][0]));
+    expect(composer().value).toBe('newer text');
+    type('');
+    type('second');
+    click(sendFace());
+    await waitFor(() => writes().length === 3);
+    await waitFor(() => composer().value === 'second');
+    click(button(CHAT.sendErrors['model-unavailable'][1]));
+    await waitFor(() => !shown().includes(CHAT.sendErrors['model-unavailable'][0]));
+    expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+    expect(composer().value).toBe('second');
+  });
+
   it('slash text keeps Send off, also after spaces or a new line, and Enter sends nothing', async () => {
     await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
     for (const text of ['/help', '   /help', '\n/help']) {
@@ -714,14 +883,19 @@ describe('Chat page: Escape', () => {
     expect(hasButton(CHAT.stop)).toBe(true);
   });
 
-  it('Escape closes an open popover, and a second Escape on its trigger stops nothing', async () => {
+  it('Escape closes the web search panel, then the + menu, and a third Escape on the + stops nothing', async () => {
     await openRunning('p-esc-pop');
-    const chip = button(CHAT.webOff);
-    click(chip);
-    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSettings) !== null);
-    key(byRole(document.body, 'dialog', CHAT.webSettings)!, { key: 'Escape' });
-    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSettings) === null);
-    key(chip, { key: 'Escape' });
+    const plus = button(CHAT.tools);
+    click(plus);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    click(byRole(document.body, 'menuitem', CHAT.webNameOff)!);
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+    key(byRole(document.body, 'dialog', CHAT.webSearch)!, { key: 'Escape' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) === null);
+    expect(byRole(document.body, 'menu', CHAT.tools)).not.toBeNull();
+    key(byRole(document.body, 'menu', CHAT.tools)!, { key: 'Escape' });
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
+    key(plus, { key: 'Escape' });
     await flushTimers();
     expect(cancels()).toBe(0);
   });
@@ -1411,33 +1585,441 @@ describe('Chat page: web calls', () => {
     expect(shown()).toContain('here');
   });
 
-  it('the web chip follows the provider selection', () => {
+  it('the web search row follows the provider selection', () => {
     const base = READY_CHAT_HOST.providers;
-    expect(webChip(base)).toMatchObject({
-      label: CHAT.webOff,
-      state: 'off',
-      action: { label: CHAT.webSetUp, to: '/providers' },
+    expect(webRow(base)).toEqual({ end: CHAT.webEndOff, name: CHAT.webNameOff, problem: null });
+    expect(webRow({ ...base, firecrawl: true, fetch: 'firecrawl' })).toEqual({
+      end: CHAT.webEndOff,
+      name: CHAT.webNameOff,
+      problem: null,
     });
-    expect(webChip({ ...base, firecrawl: true, fetch: 'firecrawl' })).toMatchObject({ label: CHAT.webPagesOnly });
-    expect(webChip({ ...base, search: 'exa', searchCheck: 'ok', fetch: 'exa' })).toMatchObject({
-      label: 'Web · Exa',
-      lines: [fill(CHAT.webChatSame, { search: 'Exa' })],
+    expect(webRow({ ...base, firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' }).end).toBe(CHAT.webEndOff);
+    expect(webRow({ ...base, search: 'exa', searchCheck: 'ok', fetch: 'exa' })).toEqual({
+      end: 'Exa',
+      name: 'Web search, Exa',
+      problem: null,
     });
-    expect(webChip({ ...base, search: 'brave', searchCheck: 'ok', fetch: 'brave' }).lines).toEqual([
-      fill(CHAT.webChatExcerpts, { search: 'Brave' }),
-    ]);
-    expect(webChip({ ...base, search: 'brave', searchCheck: 'ok', firecrawl: true, fetch: 'firecrawl' }).lines).toEqual(
-      [fill(CHAT.webChatBoth, { search: 'Brave', fetch: 'Firecrawl' })],
-    );
-    expect(webChip({ ...base, search: 'exa', searchCheck: 'rejected', fetch: 'exa' })).toMatchObject({
-      name: 'Web, Exa, key rejected',
+    expect(webRow({ ...base, search: 'exa', searchCheck: 'rejected', fetch: 'exa' })).toEqual({
+      end: CHAT.webEndRejected,
+      name: 'Web search, Exa, key rejected',
       dot: 'danger',
-      action: { label: CHAT.webFix },
+      problem: CHAT.webProblemRejected,
     });
-    expect(webChip({ ...base, search: 'exa', searchCheck: 'no-credit', fetch: 'exa' })).toMatchObject({
+    expect(webRow({ ...base, search: 'exa', searchCheck: 'no-credit', fetch: 'exa' })).toEqual({
+      end: CHAT.webEndNoCredit,
+      name: 'Web search, Exa, no credit',
       dot: 'warning',
+      problem: CHAT.webProblemNoCredit,
     });
-    expect(webChip({ ...base, applyPending: true }).pending).toBe(true);
+  });
+
+  it('webChoices: the rows, the settings note and the caption for each key state', () => {
+    const base = READY_CHAT_HOST.providers;
+    const exa = { ...base, search: 'exa' as const, searchCheck: 'ok' as const, fetch: 'exa' as const };
+    const idle: WebPanelState = { body: null, read: 'done', busy: null, error: null, vanished: null };
+    const view = (row: WebChoiceRow) => [row.label, row.checked, row.disabled, row.end ?? '', row.endTone ?? ''];
+
+    const unread = webChoices(exa, { ...idle, read: 'reading' });
+    expect(unread.rows.map(view)).toEqual([
+      ['Exa', true, false, '', ''],
+      ['DeepSeek', false, true, '', ''],
+      ['Brave', false, true, '', ''],
+      [CHAT.webEndOff, false, false, '', ''],
+    ]);
+    expect(unread.rows[1]!.name).toBe('DeepSeek, key not read yet');
+    expect(unread.note).toBe(CHAT.webSettingsNote);
+    expect(unread.caption).toEqual({ text: CHAT.webReading, tone: 'secondary' });
+    expect(webChoices(exa, { ...idle, read: 'failed' }).caption).toEqual({
+      text: CHAT.webReadFailed,
+      tone: 'secondary',
+    });
+    expect(webChoices({ ...exa, searchCheck: 'rejected' }, idle).rows[0]).toMatchObject({
+      end: CHAT.webEndRejected,
+      endTone: 'danger',
+      name: 'Exa, key rejected',
+    });
+    expect(webChoices({ ...exa, searchCheck: 'no-credit' }, idle).rows[0]).toMatchObject({
+      checked: true,
+      end: CHAT.webEndNoCredit,
+      endTone: 'warning',
+      name: 'Exa, no credit',
+    });
+    const pagesOnly = webChoices({ ...base, firecrawl: true, fetch: 'firecrawl' }, idle).rows;
+    expect(pagesOnly.map((row) => row.checked)).toEqual([false, false, false, true]);
+
+    const none = webChoices(base, { ...idle, body: providersBody(null, {}) });
+    expect(none.rows.map(view)).toEqual([
+      ['Exa', false, true, CHAT.webNoKey, ''],
+      ['DeepSeek', false, true, CHAT.webNoKey, ''],
+      ['Brave', false, true, CHAT.webNoKey, ''],
+      [CHAT.webEndOff, true, false, '', ''],
+    ]);
+    expect(none.rows[0]!.name).toBe('Exa, no key. Add it in Web Search settings.');
+    expect(none.note).toBe('Add a key for Exa, DeepSeek or Brave.');
+    expect(none.caption).toBeNull();
+    expect(webChoices(exa, { ...idle, body: providersBody('exa', { exa: 'ok' }) }).note).toBe(
+      'Add a key for DeepSeek or Brave.',
+    );
+    expect(webChoices(exa, { ...idle, body: providersBody('exa', { exa: 'ok', brave: 'ok' }) }).note).toBe(
+      'Add a key for DeepSeek.',
+    );
+    const all = webChoices(exa, { ...idle, body: providersBody('exa', { exa: 'ok', deepseek: 'ok', brave: 'ok' }) });
+    expect(all.note).toBe(CHAT.webSettingsNote);
+    expect(all.rows.map(view)).toEqual([
+      ['Exa', true, false, '', ''],
+      ['DeepSeek', false, false, '', ''],
+      ['Brave', false, false, '', ''],
+      [CHAT.webEndOff, false, false, '', ''],
+    ]);
+
+    const checks = webChoices(exa, {
+      ...idle,
+      body: providersBody('exa', { exa: 'unverified', deepseek: 'no-credit', brave: 'rejected' }),
+    });
+    expect(checks.rows.map(view)).toEqual([
+      ['Exa', true, false, '', ''],
+      ['DeepSeek', false, false, CHAT.webEndNoCredit, 'warning'],
+      ['Brave', false, false, CHAT.webEndRejected, 'danger'],
+      [CHAT.webEndOff, false, false, '', ''],
+    ]);
+    expect(checks.rows.map((row) => row.name)).toEqual([
+      'Exa',
+      'DeepSeek, no credit',
+      'Brave, key rejected',
+      CHAT.webEndOff,
+    ]);
+
+    const down = webChoices(exa, {
+      ...idle,
+      body: providersBody('exa', { exa: 'ok', brave: 'rejected' }, { keychain: 'unavailable' }),
+    });
+    expect(down.rows.map(view)).toEqual([
+      ['Exa', true, false, '', ''],
+      ['DeepSeek', false, true, '', ''],
+      ['Brave', false, false, CHAT.webEndRejected, 'danger'],
+      [CHAT.webEndOff, false, false, '', ''],
+    ]);
+    expect(down.rows[1]!.name).toBe('DeepSeek, key not read yet');
+    expect(down.note).toBe(CHAT.webSettingsNote);
+    expect(down.caption).toEqual({ text: CHAT.webKeychain, tone: 'warning' });
+
+    const body = providersBody('exa', { exa: 'ok', brave: 'ok' });
+    const busy = webChoices(exa, { ...idle, body, busy: { search: 'brave' } });
+    expect(busy.rows.map(view)).toEqual([
+      ['Exa', true, true, '', ''],
+      ['DeepSeek', false, true, CHAT.webNoKey, ''],
+      ['Brave', false, false, CHAT.webSwitching, ''],
+      [CHAT.webEndOff, false, true, '', ''],
+    ]);
+    expect(webChoices(exa, { ...idle, body, busy: { search: null } }).rows[3]).toMatchObject({
+      end: CHAT.webSwitching,
+      disabled: false,
+    });
+
+    const pending = { ...exa, applyPending: true };
+    const downBody = providersBody('exa', { exa: 'ok' }, { keychain: 'unavailable' });
+    expect(webChoices(pending, { ...idle, body }).caption).toEqual({ text: CHAT.webPending, tone: 'secondary' });
+    expect(webChoices(pending, { ...idle, body: downBody }).caption?.text).toBe(CHAT.webKeychain);
+    expect(webChoices(pending, { ...idle, body: downBody, vanished: 'brave' }).caption).toEqual({
+      text: 'The Brave key is no longer in the Keychain. Web search was turned off.',
+      tone: 'warning',
+    });
+    expect(webChoices(pending, { ...idle, body: downBody, vanished: 'brave', error: 'Nope.' }).caption).toEqual({
+      text: 'Nope.',
+      tone: 'danger',
+    });
+  });
+
+  it('no web chip in the tools row: the first button of the row is the +', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ providers: { ...READY_CHAT_HOST.providers, search: 'deepseek', searchCheck: 'ok' } }),
+    });
+    const form = composer().closest('form')!;
+    const names = reachable(form).map(accessibleName);
+    expect(names.filter((name) => name.startsWith('Web'))).toEqual([]);
+    expect(names[0]).toBe(CHAT.tools);
+  });
+
+  it('a rejected key or no credit puts a dot on the +, and its name says it; ok and off do not', async () => {
+    const plus = async (searchCheck: ChatHostState['providers']['searchCheck'], name: string) => {
+      page?.unmount();
+      api?.();
+      await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+        host: host({ providers: { ...READY_CHAT_HOST.providers, search: 'exa', searchCheck, fetch: 'exa' } }),
+      });
+      return button(name);
+    };
+    const rejected = await plus('rejected', 'Tools, web search key rejected');
+    expect(rejected.querySelector('[data-tone="danger"]')).not.toBeNull();
+    const broke = await plus('no-credit', 'Tools, web search has no credit');
+    expect(broke.querySelector('[data-tone="warning"]')).not.toBeNull();
+    const ok = await plus('ok', CHAT.tools);
+    expect(ok.querySelector('[data-tone]')).toBeNull();
+    page!.unmount();
+    api!();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+  });
+
+  it('the panel lists the providers with a check mark on the current one; a row with no key is disabled and says where to add it', async () => {
+    const dialog = await openWeb('exa', { '/providers': providersBody('exa', { exa: 'ok' }) });
+    await waitFor(() => choice('DeepSeek').textContent === `DeepSeek${CHAT.webNoKey}`);
+    expect(webMenuRow().textContent).toBe(`${CHAT.webSearch}Exa`);
+    const list = byRole(dialog, 'menu', CHAT.webSearch)!;
+    const group = byRole(list, 'group', CHAT.webProvider)!;
+    expect(allByRole(group, 'menuitemradio').map((row) => row.getAttribute('data-label'))).toEqual([
+      'exa',
+      'deepseek',
+      'brave',
+      'off',
+    ]);
+    expect(choice('Exa').getAttribute('aria-checked')).toBe('true');
+    expect(choice('Exa').getAttribute('aria-disabled')).toBeNull();
+    for (const name of ['DeepSeek', 'Brave']) {
+      expect(choice(name).getAttribute('aria-checked')).toBe('false');
+      expect(choice(name).getAttribute('aria-disabled')).toBe('true');
+      expect(choice(name).textContent).toBe(`${name}${CHAT.webNoKey}`);
+      expect(accessibleName(choice(name))).toBe(`${name}, no key. Add it in Web Search settings.`);
+    }
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBeNull();
+    const settings = byRole(list, 'menuitem', CHAT.webSettings)!;
+    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Add a key for DeepSeek or Brave.',
+    );
+    expect(shown(dialog)).not.toContain(CHAT.webPending);
+    click(settings);
+    await waitFor(() => where.pathname === '/providers');
+    await waitFor(
+      () =>
+        byRole(document.body, 'menu', CHAT.tools) === null && byRole(document.body, 'dialog', CHAT.webSearch) === null,
+    );
+  });
+
+  it('with no key at all Off is checked and the note names all three; a rejected or no-credit main row keeps its dot', async () => {
+    await openWeb(null, { '/providers': providersBody(null, {}) });
+    await waitFor(() => choice('Exa').textContent === `Exa${CHAT.webNoKey}`);
+    expect(choice(CHAT.webEndOff).getAttribute('aria-checked')).toBe('true');
+    const settings = byRole(document.body, 'menuitem', CHAT.webSettings)!;
+    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Add a key for Exa, DeepSeek or Brave.',
+    );
+    await openWeb('exa', { '/providers': providersBody('exa', { exa: 'rejected' }) }, 'rejected');
+    expect(webMenuRow().textContent).toBe(`${CHAT.webSearch}${CHAT.webEndRejected}`);
+    expect(webMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
+    await waitFor(() => choice('Exa').textContent === `Exa${CHAT.webEndRejected}`);
+    expect(choice('Exa').querySelector('[data-tone="danger"]')).not.toBeNull();
+    await openWeb('exa', { '/providers': providersBody('exa', { exa: 'no-credit' }) }, 'no-credit');
+    expect(webMenuRow().textContent).toBe(`${CHAT.webSearch}${CHAT.webEndNoCredit}`);
+    expect(webMenuRow().querySelector('[data-tone="warning"]')).not.toBeNull();
+  });
+
+  it('a pick sends only the search; the row says Switching… until the host state follows, and a second click sends nothing', async () => {
+    const reply = deferred(providersBody('brave', { exa: 'ok', deepseek: 'ok', brave: 'ok' }));
+    await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok', brave: 'ok' }),
+      'PUT /providers/selection': reply.body,
+    });
+    await waitFor(() => choice('DeepSeek').textContent === `DeepSeek${CHAT.webNoKey}`);
+    click(choice('Brave'));
+    await waitFor(() => choice('Brave').textContent === `Brave${CHAT.webSwitching}`);
+    expect(choice('Exa').getAttribute('aria-disabled')).toBe('true');
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBe('true');
+    expect(choice('Brave').getAttribute('aria-disabled')).toBeNull();
+    click(choice('Brave'));
+    click(choice('Brave'));
+    await waitFor(() => selections().length > 0);
+    reply.release();
+    // The reply's body is in: DeepSeek has a key now, and waits for the pick like every other row.
+    await waitFor(() => choice('DeepSeek').textContent === 'DeepSeek');
+    expect(choice('DeepSeek').getAttribute('aria-disabled')).toBe('true');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(choice('Brave').textContent).toBe(`Brave${CHAT.webSwitching}`);
+    expect(choice('Exa').getAttribute('aria-checked')).toBe('true');
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: summary('brave') }) }));
+    await waitFor(() => choice('Brave').getAttribute('aria-checked') === 'true');
+    expect(choice('Brave').textContent).toBe('Brave');
+    expect(choice('Exa').getAttribute('aria-checked')).toBe('false');
+    expect(byRole(document.body, 'menuitem', 'Web search, Brave')).not.toBeNull();
+    expect(byRole(document.body, 'menu', CHAT.tools)).not.toBeNull();
+    expect(byRole(document.body, 'dialog', CHAT.webSearch)).not.toBeNull();
+    expect(selections()).toEqual([{ search: 'brave' }]);
+  });
+
+  it('Off sends a null search; the checked row and a row with no key send nothing', async () => {
+    await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok' }),
+      'PUT /providers/selection': providersBody(null, { exa: 'ok' }),
+    });
+    await waitFor(() => choice('Brave').textContent === `Brave${CHAT.webNoKey}`);
+    click(choice('Exa'));
+    click(choice('Brave'));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(selections()).toEqual([]);
+    click(choice(CHAT.webEndOff));
+    await waitFor(() => selections().length === 1);
+    expect(selections()).toEqual([{ search: null }]);
+  });
+
+  it('a provider whose key was rejected or has no credit can still be picked, with its dot and words', async () => {
+    await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok', deepseek: 'no-credit', brave: 'rejected' }),
+      'PUT /providers/selection': providersBody('brave', { exa: 'ok', deepseek: 'no-credit', brave: 'rejected' }),
+    });
+    await waitFor(() => choice('Brave').textContent === `Brave${CHAT.webEndRejected}`);
+    expect(choice('Brave').querySelector('[data-tone="danger"]')).not.toBeNull();
+    expect(choice('Brave').getAttribute('aria-disabled')).toBeNull();
+    expect(accessibleName(choice('Brave'))).toBe('Brave, key rejected');
+    expect(choice('DeepSeek').textContent).toBe(`DeepSeek${CHAT.webEndNoCredit}`);
+    expect(choice('DeepSeek').querySelector('[data-tone="warning"]')).not.toBeNull();
+    expect(choice('DeepSeek').getAttribute('aria-disabled')).toBeNull();
+    click(choice('Brave'));
+    await waitFor(() => selections().length === 1);
+    expect(selections()).toEqual([{ search: 'brave' }]);
+  });
+
+  it('before the keys are read only the current row and Off can be picked, and the caption says so', async () => {
+    const read = deferred(providersBody('exa', { exa: 'ok', brave: 'ok' }));
+    const dialog = await openWeb('exa', { '/providers': read.body });
+    expect(choice('Exa').getAttribute('aria-disabled')).toBeNull();
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBeNull();
+    expect(choice('DeepSeek').getAttribute('aria-disabled')).toBe('true');
+    expect(choice('Brave').getAttribute('aria-disabled')).toBe('true');
+    expect(accessibleName(choice('Brave'))).toBe('Brave, key not read yet');
+    expect(shown(dialog)).not.toContain(CHAT.webNoKey);
+    expect(byRole(dialog, 'status')!.textContent).toBe(CHAT.webReading);
+    read.release();
+    await waitFor(() => choice('Brave').getAttribute('aria-disabled') === null);
+    expect(byRole(dialog, 'status')!.textContent).toBe('');
+    expect(choice('DeepSeek').textContent).toBe(`DeepSeek${CHAT.webNoKey}`);
+  });
+
+  it('a read that fails says so, keeps the current row and Off, and the next open reads again', async () => {
+    const dialog = await openWeb('exa', { '/providers': STUB_FAILURE });
+    await waitFor(() => byRole(dialog, 'status')!.textContent === CHAT.webReadFailed);
+    expect(choice('Exa').getAttribute('aria-disabled')).toBeNull();
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBeNull();
+    expect(choice('Brave').getAttribute('aria-disabled')).toBe('true');
+    expect(reads()).toBe(1);
+    closeMenu();
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
+    click(button(CHAT.tools));
+    await waitFor(() => reads() === 2);
+  });
+
+  it('a Keychain that does not answer: a known key can still be picked, an unknown one cannot, and the caption says why', async () => {
+    const dialog = await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok', brave: 'ok' }, { keychain: 'unavailable' }),
+    });
+    await waitFor(() => byRole(dialog, 'status')!.textContent === CHAT.webKeychain);
+    expect(byRole(dialog, 'status')!.querySelector('.text-warning')).not.toBeNull();
+    expect(choice('Brave').getAttribute('aria-disabled')).toBeNull();
+    expect(choice('DeepSeek').getAttribute('aria-disabled')).toBe('true');
+    expect(choice('DeepSeek').textContent).toBe('DeepSeek');
+    expect(shown(dialog)).not.toContain(CHAT.webNoKey);
+  });
+
+  it('a failed pick: the caption says why, the check stays, the keys are read again; the next pick clears it', async () => {
+    const last = deferred(providersBody('brave', { exa: 'ok', brave: 'ok' }));
+    const dialog = await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok', brave: 'ok' }),
+      'PUT /providers/selection': sequence(
+        stubError('E_CONFLICT', 'Add a key for Brave first.'),
+        stubError('E_UNAVAILABLE', "The app's skill files are damaged. Reinstall the app.", 'skill-bundle-corrupt'),
+        stubError('E_UNAVAILABLE', 'Skills could not be installed.'),
+        last.body,
+      ),
+    });
+    const status = (): string => byRole(dialog, 'status')!.textContent ?? '';
+    await waitFor(() => choice('Brave').getAttribute('aria-disabled') === null);
+    const before = reads();
+    click(choice('Brave'));
+    await waitFor(() => status() === 'Add a key for Brave in Web Search settings.');
+    expect(byRole(dialog, 'status')!.querySelector('.text-danger')).not.toBeNull();
+    expect(choice('Exa').getAttribute('aria-checked')).toBe('true');
+    expect(choice('Brave').textContent).toBe('Brave');
+    await waitFor(() => reads() === before + 1);
+    click(choice('Brave'));
+    await waitFor(() => status() === CHAT.webCorrupt);
+    click(choice('Brave'));
+    await waitFor(() => status() === CHAT.webSwitchFailed);
+    click(choice('Brave'));
+    await waitFor(() => status() === '');
+    last.release();
+  });
+
+  it('a pick that fails after the menu closed shows the sentence as a toast', async () => {
+    const errors = vi.spyOn(toast, 'error');
+    const reply = deferred(stubError('E_UNAVAILABLE', 'Skills could not be installed.'));
+    await openWeb('exa', {
+      '/providers': providersBody('exa', { exa: 'ok', brave: 'ok' }),
+      'PUT /providers/selection': reply.body,
+    });
+    await waitFor(() => choice('Brave').getAttribute('aria-disabled') === null);
+    click(choice('Brave'));
+    closeMenu();
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
+    reply.release();
+    await waitFor(() => errors.mock.calls.length === 1);
+    expect(errors.mock.calls[0]![0]).toBe(CHAT.webSwitchFailed);
+  });
+
+  it('a change that waits for running answers puts the pending caption above the rows', async () => {
+    const dialog = await openWeb('exa', { '/providers': providersBody('exa', { exa: 'ok' }) }, 'ok', {
+      applyPending: true,
+    });
+    await waitFor(() => byRole(dialog, 'status')!.textContent === CHAT.webPending);
+    const text = shown(dialog);
+    expect(text.indexOf(CHAT.webPending)).toBeLessThan(text.indexOf('Exa'));
+  });
+
+  it('opening the + reads the keys once in Chat; a new host summary reads again; a read from before a write is dropped', async () => {
+    const first = deferred(providersBody('exa', { exa: 'ok' }));
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ providers: summary('exa') }),
+      routes: {
+        '/providers': sequence(first.body, providersBody(null, { exa: 'ok', brave: 'ok' })),
+        'PUT /providers/selection': providersBody(null, { exa: 'ok', brave: 'ok' }),
+      },
+    });
+    expect(reads()).toBe(0);
+    click(button(CHAT.tools));
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    await waitFor(() => reads() === 1);
+    click(webMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+    expect(accessibleName(choice('Brave'))).toBe('Brave, key not read yet');
+    click(choice(CHAT.webEndOff));
+    await waitFor(() => accessibleName(choice('Brave')) === 'Brave');
+    first.release();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(accessibleName(choice('Brave'))).toBe('Brave');
+    expect(reads()).toBe(1);
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: summary(null) }) }));
+    await waitFor(() => reads() === 2);
+    await waitFor(() => choice(CHAT.webEndOff).getAttribute('aria-checked') === 'true');
+  });
+
+  it('a key gone at app start shows once in the panel; with the panel never opened it is a toast', async () => {
+    const warnings = vi.spyOn(toast, 'warning');
+    const gone = providersBody(null, {}, { vanished: 'exa' });
+    const dialog = await openWeb(null, { '/providers': sequence(gone, providersBody(null, {})) });
+    const text = 'The Exa key is no longer in the Keychain. Web search was turned off.';
+    await waitFor(() => byRole(dialog, 'status')!.textContent === text);
+    closeMenu();
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
+    expect(warnings).not.toHaveBeenCalled();
+    page!.unmount();
+    api!();
+
+    await open('/chat?mode=chat', (shownText) => shownText.includes(CHAT.heroChatTitle), {
+      routes: { '/providers': sequence(gone, providersBody(null, {})) },
+    });
+    click(button(CHAT.tools));
+    await waitFor(() => reads() === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    closeMenu();
+    await waitFor(() => warnings.mock.calls.length === 1);
+    expect(warnings.mock.calls[0]![0]).toBe('Exa key not found');
   });
 
   it('the hero names the search provider, or links to set one up', async () => {
@@ -1449,7 +2031,601 @@ describe('Chat page: web calls', () => {
     await open('/chat?mode=chat', (text) => text.includes(fill(CHAT.heroChatWeb, { provider: 'Brave' })), {
       host: host({ providers: { ...READY_CHAT_HOST.providers, search: 'brave', searchCheck: 'ok', fetch: 'brave' } }),
     });
-    expect(byRole(page!.container, 'button', 'Web, Brave')).not.toBeNull();
+    click(button(CHAT.tools));
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    expect(byRole(document.body, 'menuitem', 'Web search, Brave')).not.toBeNull();
+  });
+});
+
+describe('Chat page: the crawler', () => {
+  const LOCAL = 'http://127.0.0.1:3002';
+
+  interface CrawlerSetup {
+    /** The Firecrawl key's check; absent: no key. */
+    key?: KeyCheck;
+    /** The saved address's last check; absent: no address; null: not checked yet. */
+    local?: LocalCheck | null;
+    search?: SearchProviderId | null;
+  }
+
+  /** A `GET /providers` body with the crawler on `place`. */
+  function crawlerBody(
+    place: CrawlerValue,
+    setup: CrawlerSetup = {},
+    over: Partial<ProvidersResponse> = {},
+  ): ProvidersResponse {
+    const search = setup.search ?? null;
+    const base = providersBody(search, search === null ? {} : { [search]: 'ok' });
+    const on = place !== 'off';
+    const local = setup.local;
+    return {
+      ...base,
+      firecrawl: on,
+      firecrawlLocal: place === 'local',
+      fetch: on ? 'firecrawl' : search,
+      local:
+        local === undefined
+          ? base.local
+          : {
+              url: LOCAL,
+              check: local,
+              checkedAt: local === null ? null : 1_000,
+              version: local === 'ok' ? '0.1.1' : null,
+              cloud: null,
+            },
+      providers: base.providers.map((p) =>
+        p.id !== 'firecrawl'
+          ? p
+          : { ...p, configured: setup.key !== undefined, check: setup.key ?? null, selected: on },
+      ),
+      ...over,
+    };
+  }
+
+  function crawlSummary(place: CrawlerValue, search: SearchProviderId | null = null): ChatHostState['providers'] {
+    return {
+      ...summary(search),
+      firecrawl: place !== 'off',
+      firecrawlLocal: place === 'local',
+      fetch: place !== 'off' ? 'firecrawl' : search,
+    };
+  }
+
+  function crawlerMenuRow(): HTMLElement {
+    return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[2]!;
+  }
+
+  function checks(): number {
+    return calls.filter((call) => call.method === 'POST' && pathOf(call) === '/providers/local/check').length;
+  }
+
+  function checkedRow(): string | null {
+    return allByRole(byRole(document.body, 'menu', CHAT.crawler)!, 'menuitemradio')
+      .filter((row) => row.getAttribute('aria-checked') === 'true')
+      .map((row) => row.getAttribute('data-label'))[0]!;
+  }
+
+  /** Opens Chat with the crawler on `place`, then the `+` menu and the crawler panel. */
+  async function openCrawler(
+    place: CrawlerValue,
+    routes: Record<string, unknown>,
+    over: Partial<ChatHostState['providers']> = {},
+  ): Promise<HTMLElement> {
+    page?.unmount();
+    api?.();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ providers: { ...crawlSummary(place), ...over } }),
+      routes,
+    });
+    click(reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    click(crawlerMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+    return byRole(document.body, 'dialog', CHAT.crawler)!;
+  }
+
+  it('crawlerRow: on or off and the place from the host summary, what is wrong from the body', () => {
+    const off = crawlSummary('off');
+    const cloud = crawlSummary('cloud');
+    const local = crawlSummary('local');
+    expect(crawlerRow(off, null)).toEqual({ end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null });
+    expect(crawlerRow(off, crawlerBody('local', { local: 'not-running' }))).toEqual({
+      end: CHAT.webEndOff,
+      name: CHAT.crawlerNameOff,
+      problem: null,
+    });
+    expect(crawlerRow(local, crawlerBody('local', { local: 'not-running' }))).toEqual({
+      end: CHAT.crawlerNotRunning,
+      dot: 'warning',
+      name: CHAT.crawlerNameNotRunning,
+      problem: null,
+    });
+    for (const check of ['not-firecrawl', 'open', 'token'] as const) {
+      expect(crawlerRow(local, crawlerBody('local', { local: check }))).toEqual({
+        end: CHAT.crawlerCheckFailed,
+        dot: 'danger',
+        name: CHAT.crawlerNameCheckFailed,
+        problem: null,
+      });
+    }
+    const atMac = { end: CHAT.crawlerEndLocal, name: CHAT.crawlerNameLocal, problem: null };
+    expect(crawlerRow(local, crawlerBody('local', { local: 'ok' }))).toEqual(atMac);
+    expect(crawlerRow(local, crawlerBody('local', { local: null }))).toEqual(atMac);
+    expect(crawlerRow(local, null)).toEqual(atMac);
+    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'rejected' }))).toEqual({
+      end: CHAT.webEndRejected,
+      dot: 'danger',
+      name: CHAT.crawlerNameRejected,
+      problem: null,
+    });
+    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'no-credit' }))).toEqual({
+      end: CHAT.webEndNoCredit,
+      dot: 'warning',
+      name: CHAT.crawlerNameNoCredit,
+      problem: null,
+    });
+    const atCloud = { end: CHAT.crawlerEndCloud, name: CHAT.crawlerNameCloud, problem: null };
+    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'ok' }))).toEqual(atCloud);
+    expect(crawlerRow(cloud, null)).toEqual(atCloud);
+    // The body is one read old: the place still comes from the summary.
+    expect(crawlerRow(cloud, crawlerBody('local', { key: 'ok', local: 'not-running' }))).toEqual(atCloud);
+  });
+
+  it('crawlerChoices: the rows, the Off note, the settings note and the caption for each state', () => {
+    const idle: CrawlerPanelState = { body: null, read: 'done', busy: null, error: null };
+    const view = (row: CrawlerChoiceRow) => [row.value, row.checked, row.disabled, row.end ?? '', row.endTone ?? ''];
+
+    const none = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off') });
+    expect(none.rows.map(view)).toEqual([
+      ['cloud', false, true, CHAT.webNoKey, ''],
+      ['local', false, true, CHAT.crawlerNotSetUp, ''],
+      ['off', true, false, '', ''],
+    ]);
+    expect(none.rows.map((row) => row.name)).toEqual([CHAT.crawlerRowNoKey, CHAT.crawlerRowNotSetUp, CHAT.webEndOff]);
+    expect(none.rows.map((row) => row.label)).toEqual([CHAT.crawlerCloud, CHAT.crawlerLocal, CHAT.webEndOff]);
+    expect(none.note).toBe(CHAT.crawlerAddBoth);
+    expect(none.caption).toBeNull();
+    expect(crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }) }).note).toBe(
+      CHAT.crawlerAddLocal,
+    );
+    expect(crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { local: 'ok' }) }).note).toBe(
+      CHAT.crawlerAddKey,
+    );
+    const both = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok', local: 'ok' }) });
+    expect(both.note).toBe(CHAT.webSettingsNote);
+    expect(both.rows.map(view)).toEqual([
+      ['cloud', false, false, '', ''],
+      ['local', false, false, '', ''],
+      ['off', true, false, '', ''],
+    ]);
+    expect(crawlerChoices(crawlSummary('off'), idle).note).toBe(CHAT.webSettingsNote);
+
+    // The Off note follows the search provider of the host summary, with the Web Search page's words.
+    const offNote = (search: SearchProviderId | null): string | undefined =>
+      crawlerChoices(crawlSummary('off', search), idle).rows[2]!.note;
+    expect(offNote('exa')).toBe('Exa reads pages for Chat.');
+    expect(offNote('deepseek')).toBe('DeepSeek reads pages for Chat.');
+    expect(offNote('brave')).toBe(CHAT.crawlerOffExcerpts);
+    expect(offNote(null)).toBe(CHAT.crawlerOffNone);
+    expect([CHAT.crawlerOffReads, CHAT.crawlerOffExcerpts, CHAT.crawlerOffNone]).toEqual([
+      PROVIDERS.crawlerOffReads,
+      PROVIDERS.crawlerOffExcerpts,
+      PROVIDERS.crawlerOffNone,
+    ]);
+
+    // A rejected key, no credit, a server that does not answer and a failed check can all still be picked.
+    const problems = crawlerChoices(crawlSummary('cloud'), {
+      ...idle,
+      body: crawlerBody('cloud', { key: 'rejected', local: 'not-running' }),
+    });
+    expect(problems.rows.map(view)).toEqual([
+      ['cloud', true, false, CHAT.webEndRejected, 'danger'],
+      ['local', false, false, CHAT.crawlerNotRunning, 'warning'],
+      ['off', false, false, '', ''],
+    ]);
+    expect(problems.rows.map((row) => row.name)).toEqual([
+      CHAT.crawlerRowRejected,
+      CHAT.crawlerRowNotRunning,
+      CHAT.webEndOff,
+    ]);
+    const failed = crawlerChoices(crawlSummary('local'), {
+      ...idle,
+      body: crawlerBody('local', { key: 'no-credit', local: 'open' }),
+    });
+    expect(failed.rows.map(view)).toEqual([
+      ['cloud', false, false, CHAT.webEndNoCredit, 'warning'],
+      ['local', true, false, CHAT.crawlerCheckFailed, 'danger'],
+      ['off', false, false, '', ''],
+    ]);
+    expect(failed.rows.map((row) => row.name)).toEqual([
+      CHAT.crawlerRowNoCredit,
+      CHAT.crawlerRowCheckFailed,
+      CHAT.webEndOff,
+    ]);
+    const unchecked = crawlerChoices(crawlSummary('local'), { ...idle, body: crawlerBody('local', { local: null }) });
+    expect(unchecked.rows[1]).toMatchObject({ checked: true, disabled: false, name: CHAT.crawlerLocal });
+    expect(unchecked.rows[1]!.end).toBeUndefined();
+
+    // No body yet: only the current row and Off.
+    const reading = crawlerChoices(crawlSummary('cloud'), { ...idle, read: 'reading' });
+    expect(reading.rows.map(view)).toEqual([
+      ['cloud', true, false, '', ''],
+      ['local', false, true, '', ''],
+      ['off', false, false, '', ''],
+    ]);
+    expect(reading.rows[1]!.name).toBe(CHAT.crawlerRowLocalUnread);
+    expect(reading.caption).toEqual({ text: CHAT.webReading, tone: 'secondary' });
+    const unreadLocal = crawlerChoices(crawlSummary('local'), { ...idle, read: 'failed' });
+    expect(unreadLocal.rows.map(view)).toEqual([
+      ['cloud', false, true, '', ''],
+      ['local', true, false, '', ''],
+      ['off', false, false, '', ''],
+    ]);
+    expect(unreadLocal.rows[0]!.name).toBe(CHAT.crawlerRowUnread);
+    expect(unreadLocal.caption).toEqual({ text: CHAT.webReadFailed, tone: 'secondary' });
+
+    // A Keychain that does not answer: a key in the cache can be picked, no key reads as not known; This Mac needs none.
+    const down = { keychain: 'unavailable' as const };
+    const cached = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }, down) });
+    expect(cached.rows[0]).toMatchObject({ disabled: false, name: CHAT.crawlerCloud });
+    expect(cached.caption).toEqual({ text: CHAT.webKeychain, tone: 'warning' });
+    const unknown = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { local: 'ok' }, down) });
+    expect(unknown.rows.map(view)).toEqual([
+      ['cloud', false, true, '', ''],
+      ['local', false, false, '', ''],
+      ['off', true, false, '', ''],
+    ]);
+    expect(unknown.rows[0]!.name).toBe(CHAT.crawlerRowUnread);
+    expect(unknown.note).toBe(CHAT.webSettingsNote);
+
+    // A write in flight: its row says Switching…, the others wait, the check mark stays.
+    const body = crawlerBody('cloud', { key: 'ok', local: 'ok' });
+    const busy = crawlerChoices(crawlSummary('cloud'), { ...idle, body, busy: 'local' });
+    expect(busy.rows.map(view)).toEqual([
+      ['cloud', true, true, '', ''],
+      ['local', false, false, CHAT.webSwitching, ''],
+      ['off', false, true, '', ''],
+    ]);
+    expect(crawlerChoices(crawlSummary('cloud'), { ...idle, body, busy: 'off' }).rows[2]).toMatchObject({
+      end: CHAT.webSwitching,
+      disabled: false,
+      checked: false,
+    });
+
+    // Captions: the write error, then the Keychain, then the read, then a change that waits.
+    const pending = { ...crawlSummary('cloud'), applyPending: true };
+    const downBody = crawlerBody('cloud', { key: 'ok' }, down);
+    expect(crawlerChoices(pending, { ...idle, body }).caption).toEqual({ text: CHAT.webPending, tone: 'secondary' });
+    expect(crawlerChoices(pending, { ...idle, read: 'reading' }).caption?.text).toBe(CHAT.webReading);
+    expect(crawlerChoices(pending, { ...idle, body: downBody }).caption?.text).toBe(CHAT.webKeychain);
+    expect(crawlerChoices(pending, { ...idle, body: downBody, error: 'Nope.' }).caption).toEqual({
+      text: 'Nope.',
+      tone: 'danger',
+    });
+  });
+
+  it('Crawler is the third row of the +; its panel has Cloud, This Mac and Off, the Off note and the settings row', async () => {
+    const dialog = await openCrawler('off', { '/providers': crawlerBody('off', { search: 'exa' }) }, { search: 'exa' });
+    await waitFor(() => choice(CHAT.crawlerCloud).textContent === `${CHAT.crawlerCloud}${CHAT.webNoKey}`);
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.webEndOff}`);
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameOff);
+    const list = byRole(dialog, 'menu', CHAT.crawler)!;
+    const group = byRole(list, 'group', CHAT.crawlerGroup)!;
+    expect(allByRole(group, 'menuitemradio').map((row) => row.getAttribute('data-label'))).toEqual([
+      'firecrawl cloud',
+      'firecrawl on this mac',
+      'off',
+    ]);
+    expect(checkedRow()).toBe('off');
+    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotSetUp}`);
+    expect(choice(CHAT.crawlerLocal).getAttribute('aria-disabled')).toBe('true');
+    expect(accessibleName(choice(CHAT.crawlerLocal))).toBe(CHAT.crawlerRowNotSetUp);
+    const off = choice(CHAT.webEndOff);
+    expect(document.getElementById(off.getAttribute('aria-describedby')!)?.textContent).toBe(
+      'Exa reads pages for Chat.',
+    );
+    const settings = byRole(list, 'menuitem', CHAT.webSettings)!;
+    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(CHAT.crawlerAddBoth);
+    click(settings);
+    await waitFor(() => where.pathname === '/providers');
+    await waitFor(
+      () =>
+        byRole(document.body, 'menu', CHAT.tools) === null && byRole(document.body, 'dialog', CHAT.crawler) === null,
+    );
+  });
+
+  it('the main row says what is wrong once the body is read; the dot on the + stays search only', async () => {
+    await openCrawler('local', { '/providers': crawlerBody('local', { local: 'not-running' }) });
+    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.crawlerNotRunning}`);
+    expect(crawlerMenuRow().querySelector('[data-tone="warning"]')).not.toBeNull();
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameNotRunning);
+    expect(choice(CHAT.crawlerLocal).getAttribute('aria-checked')).toBe('true');
+    expect(choice(CHAT.crawlerLocal).querySelector('[data-tone="warning"]')).not.toBeNull();
+    expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+    await openCrawler('cloud', { '/providers': crawlerBody('cloud', { key: 'rejected' }) });
+    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.webEndRejected}`);
+    expect(crawlerMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameRejected);
+    expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+  });
+
+  it('each pick sends its own body and never `search`; the check mark follows the host summary', async () => {
+    const both = { key: 'ok' as const, local: 'ok' as const };
+    await openCrawler('cloud', {
+      '/providers': crawlerBody('cloud', both),
+      'PUT /providers/selection': crawlerBody('cloud', both),
+    });
+    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    const to = async (label: string, place: CrawlerValue): Promise<void> => {
+      const before = selections().length;
+      click(choice(label));
+      await waitFor(() => selections().length === before + 1);
+      act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary(place) }) }));
+      await waitFor(() => choice(label).getAttribute('aria-checked') === 'true');
+      expect(choice(label).textContent).not.toContain(CHAT.webSwitching);
+    };
+    await to(CHAT.crawlerLocal, 'local');
+    await to(CHAT.webEndOff, 'off');
+    await to(CHAT.crawlerCloud, 'cloud');
+    expect(selections()).toEqual([
+      { firecrawl: true, firecrawlLocal: true },
+      { firecrawl: false },
+      { firecrawl: true, firecrawlLocal: false },
+    ]);
+    expect(byRole(document.body, 'dialog', CHAT.crawler)).not.toBeNull();
+  });
+
+  it('a pick is busy until the host summary shows it, even while the reply waits; a second click sends nothing', async () => {
+    const both = { key: 'ok' as const, local: 'ok' as const };
+    const reply = deferred(crawlerBody('local', both));
+    await openCrawler('cloud', {
+      '/providers': crawlerBody('cloud', both),
+      'PUT /providers/selection': reply.body,
+    });
+    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.webSwitching}`);
+    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBe('true');
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBe('true');
+    click(choice(CHAT.crawlerLocal));
+    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => selections().length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(checkedRow()).toBe('firecrawl cloud');
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerEndCloud}`);
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('local') }) }));
+    await waitFor(() => checkedRow() === 'firecrawl on this mac');
+    expect(choice(CHAT.crawlerLocal).textContent).toBe(CHAT.crawlerLocal);
+    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBeNull();
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerEndLocal}`);
+    expect(selections()).toEqual([{ firecrawl: true, firecrawlLocal: true }]);
+    reply.release();
+  });
+
+  it('the checked row, a Cloud row with no key and a This Mac row with no address send nothing', async () => {
+    await openCrawler('off', {
+      '/providers': crawlerBody('off'),
+      'PUT /providers/selection': crawlerBody('off'),
+    });
+    await waitFor(() => choice(CHAT.crawlerCloud).textContent === `${CHAT.crawlerCloud}${CHAT.webNoKey}`);
+    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBe('true');
+    expect(accessibleName(choice(CHAT.crawlerCloud))).toBe(CHAT.crawlerRowNoKey);
+    click(choice(CHAT.crawlerCloud));
+    click(choice(CHAT.crawlerLocal));
+    click(choice(CHAT.webEndOff));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(selections()).toEqual([]);
+    expect(checkedRow()).toBe('off');
+  });
+
+  it('a failed pick: the caption says why by the pick, the check stays, the keys are read again; closed, a toast', async () => {
+    const both = { key: 'ok' as const, local: 'ok' as const };
+    const last = deferred(stubError('E_UNAVAILABLE', 'Skills could not be installed.'));
+    const dialog = await openCrawler('off', {
+      '/providers': crawlerBody('off', both),
+      'PUT /providers/selection': sequence(
+        stubError('E_CONFLICT', 'Add a key for Firecrawl first.'),
+        stubError('E_CONFLICT', 'Set up Firecrawl on this Mac first.', 'local-not-set-up'),
+        stubError('E_UNAVAILABLE', 'Skills could not be installed.'),
+        stubError('E_UNAVAILABLE', "The app's skill files are damaged. Reinstall the app.", 'skill-bundle-corrupt'),
+        last.body,
+      ),
+    });
+    const status = (): string => byRole(dialog, 'status')!.textContent ?? '';
+    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    const before = reads();
+    click(choice(CHAT.crawlerCloud));
+    await waitFor(() => status() === CHAT.crawlerNeedKey);
+    expect(byRole(dialog, 'status')!.querySelector('.text-danger')).not.toBeNull();
+    expect(checkedRow()).toBe('off');
+    expect(choice(CHAT.crawlerCloud).textContent).toBe(CHAT.crawlerCloud);
+    await waitFor(() => reads() === before + 1);
+    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => status() === CHAT.crawlerNeedLocal);
+    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => status() === CHAT.crawlerSwitchFailed);
+    click(choice(CHAT.crawlerCloud));
+    await waitFor(() => status() === CHAT.webCorrupt);
+    expect(checkedRow()).toBe('off');
+
+    const errors = vi.spyOn(toast, 'error');
+    click(choice(CHAT.crawlerLocal));
+    closeMenu();
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
+    last.release();
+    await waitFor(() => errors.mock.calls.length === 1);
+    expect(errors.mock.calls[0]![0]).toBe(CHAT.crawlerSwitchFailed);
+  });
+
+  it('one read for both panels; a new firecrawlLocal in the host summary reads again', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ providers: crawlSummary('cloud', 'exa') }),
+      routes: { '/providers': crawlerBody('cloud', { key: 'ok', local: 'ok', search: 'exa' }) },
+    });
+    click(button(CHAT.tools));
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    await waitFor(() => reads() === 1);
+    click(webMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+    await waitFor(() => choice('Exa').getAttribute('aria-checked') === 'true');
+    key(byRole(document.body, 'dialog', CHAT.webSearch)!, { key: 'ArrowLeft' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) === null);
+    click(crawlerMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(reads()).toBe(1);
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('local', 'exa') }) }));
+    await waitFor(() => reads() === 2);
+  });
+
+  it('opening the Crawler panel checks this Mac now and uses the answer for the crawler rows only', async () => {
+    const read = crawlerBody('local', { local: 'ok', search: 'exa' });
+    // The check's body says Brave has a key: the web search rows must not take it.
+    const fresh = providersBody('exa', { exa: 'ok', brave: 'ok' });
+    const reply = {
+      check: 'not-running',
+      providers: {
+        ...fresh,
+        firecrawl: true,
+        firecrawlLocal: true,
+        local: { url: LOCAL, check: 'not-running', checkedAt: 2_000, version: null, cloud: null },
+      },
+    };
+    await openCrawler(
+      'local',
+      { '/providers': read, 'POST /providers/local/check': reply },
+      { search: 'exa', searchCheck: 'ok' },
+    );
+    await waitFor(() => checks() === 1);
+    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerNotRunning}`);
+    key(byRole(document.body, 'dialog', CHAT.crawler)!, { key: 'ArrowLeft' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
+    click(webMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+    await waitFor(() => choice('Brave').textContent === `Brave${CHAT.webNoKey}`);
+    expect(checks()).toBe(1);
+  });
+
+  /** Opens Chat with the crawler on `place`, then the `+` menu only. */
+  async function openPlus(place: CrawlerValue, routes: Record<string, unknown>): Promise<void> {
+    page?.unmount();
+    api?.();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ providers: crawlSummary(place) }),
+      routes,
+    });
+    click(reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+  }
+
+  const checkReply = (url: string | null, check: LocalCheck, checkedAt: number) => ({
+    check,
+    providers: crawlerBody('local', {}, { local: { url, check, checkedAt, version: null, cloud: null } }),
+  });
+
+  it('opening the + while this Mac is in use checks it now, and the Crawler row shows the answer', async () => {
+    await openPlus('local', {
+      '/providers': crawlerBody('local', { local: 'ok' }),
+      'POST /providers/local/check': checkReply(LOCAL, 'not-running', 2_000),
+    });
+    await waitFor(() => checks() === 1);
+    await waitFor(() => accessibleName(crawlerMenuRow()) === CHAT.crawlerNameNotRunning);
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerNotRunning}`);
+    click(crawlerMenuRow());
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+    expect(checks()).toBe(1);
+
+    await openPlus('local', {
+      '/providers': crawlerBody('local', { local: 'not-running' }),
+      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
+    });
+    await waitFor(() => checks() === 1);
+    await waitFor(() => accessibleName(crawlerMenuRow()) === CHAT.crawlerNameLocal);
+  });
+
+  it('a check answer older than the read, or of another address, never replaces the read', async () => {
+    await openCrawler('local', {
+      '/providers': crawlerBody(
+        'local',
+        {},
+        { local: { url: LOCAL, check: 'not-running', checkedAt: 2_000, version: null, cloud: null } },
+      ),
+      'POST /providers/local/check': checkReply(LOCAL, 'ok', 1_000),
+    });
+    await waitFor(() => checks() === 1);
+    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+    await flushTimers();
+    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameNotRunning);
+
+    await openCrawler('local', {
+      '/providers': crawlerBody('local', { local: 'not-running' }),
+      'POST /providers/local/check': checkReply('http://127.0.0.1:4000', 'ok', 2_000),
+    });
+    await waitFor(() => checks() === 1);
+    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+    await flushTimers();
+    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
+
+    await openCrawler('off', {
+      '/providers': crawlerBody('off', { key: 'ok' }),
+      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
+    });
+    await waitFor(() => checks() === 1);
+    await waitFor(() => choice(CHAT.crawlerCloud).getAttribute('aria-disabled') === null);
+    await flushTimers();
+    expect(choice(CHAT.crawlerLocal).getAttribute('aria-disabled')).toBe('true');
+    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotSetUp}`);
+  });
+
+  it('the keyboard: right arrow enters on the checked row, down moves, left and Escape close only the panel', async () => {
+    await openPlus('local', {
+      '/providers': crawlerBody('local', { local: 'ok', key: 'ok' }),
+      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
+    });
+    const row = crawlerMenuRow();
+    act(() => row.focus());
+    key(row, { key: 'ArrowRight' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+    await waitFor(() => document.activeElement?.getAttribute('data-label') === CHAT.crawlerLocal.toLowerCase());
+    expect(document.activeElement?.getAttribute('aria-checked')).toBe('true');
+    key(document.activeElement!, { key: 'ArrowDown' });
+    await waitFor(() => document.activeElement?.getAttribute('data-label') === CHAT.webEndOff.toLowerCase());
+    key(document.activeElement!, { key: 'ArrowLeft' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
+    await waitFor(() => document.activeElement === crawlerMenuRow());
+    key(crawlerMenuRow(), { key: 'ArrowRight' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+    key(byRole(document.body, 'dialog', CHAT.crawler)!, { key: 'Escape' });
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
+    expect(byRole(document.body, 'menu', CHAT.tools)).not.toBeNull();
+  });
+
+  it('opening the Web search panel never waits for the check of this Mac', async () => {
+    const held = deferred({ check: 'ok', providers: crawlerBody('local', { local: 'ok' }) });
+    await openWeb(
+      'exa',
+      {
+        '/providers': crawlerBody(
+          'local',
+          { local: 'ok', search: 'exa' },
+          {
+            providers: providersBody('exa', { exa: 'ok', brave: 'ok' }).providers,
+          },
+        ),
+        'POST /providers/local/check': held.body,
+      },
+      'ok',
+      { firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' },
+    );
+    await waitFor(() => choice('Brave').getAttribute('aria-disabled') === null);
+    expect(choice('DeepSeek').textContent).toBe(`DeepSeek${CHAT.webNoKey}`);
+    // The `+` opening started the check (this Mac is in use); its answer is still held.
+    expect(checks()).toBe(1);
+    held.release();
   });
 });
 
@@ -1561,6 +2737,7 @@ describe('Chat page: conversation actions', () => {
       format: 'gguf',
       contextTokens: 262144,
       sizeBytes: gb * 1024 ** 3,
+      images: false,
     });
     const models = [hostModel('qwen3.5-4b', 32768), build(XL, 'UD-Q4_K_XL', 17.6), build(M, 'UD-Q4_K_M', 16.5)];
     await open('/chat?c=p-quant', (text) => text.includes('Hi there'), {
@@ -1710,5 +2887,622 @@ describe('Chat page: Work tab', () => {
     expect(heading()).toBe('Title p-work');
     expect(page!.container.querySelector('button[data-value="work"]')?.getAttribute('aria-pressed')).toBe('true');
     expect(composer().placeholder).toBe(CHAT.placeholderReply);
+  });
+});
+
+describe('Chat page: files and pictures', () => {
+  const PNG = 'iVBORw0KGgoAAAANSUhEUg==';
+  const picture = (id: string): DraftAttachment => ({
+    id,
+    kind: 'image',
+    name: 'cat.png',
+    mediaType: 'image/png',
+    bytes: 16,
+    dataUrl: `data:image/png;base64,${PNG}`,
+  });
+  /** A text file of exactly `numbered` bytes with its line number. */
+  const textFile = (id: string, numbered: number, name = `${id}.txt`): DraftAttachment => {
+    const text = 'a'.repeat(numbered - 4);
+    return { id, kind: 'file', name, bytes: text.length, numbered: numberedBytes(text), text };
+  };
+  const seeing = (id: string, images: boolean, contextTokens: number | null = 32768) => ({
+    ...hostModel(id, contextTokens),
+    images,
+  });
+  const sentWith = (text: string, attachments: UserAttachment[]): TranscriptEntry => ({
+    ...(user(text) as Extract<TranscriptEntry, { kind: 'user' }>),
+    attachments,
+  });
+  const visionHost = (images: boolean): ChatHostState => host({ models: [seeing('qwen3.5-4b', images)] });
+
+  function fileInput(): HTMLInputElement {
+    const input = page!.container.querySelector<HTMLInputElement>(`input[type="file"]`);
+    if (input === null || accessibleName(input) !== CHAT.attach.row) throw new Error('no file input');
+    return input;
+  }
+
+  function pick(...files: File[]): void {
+    const input = fileInput();
+    act(() => {
+      Object.defineProperty(input, 'files', { value: files, configurable: true });
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  /** A text file whose read waits for `release`. */
+  function slowFile(name: string, text: string): { file: File; release: () => void } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const file = new File([text], name, { type: 'text/plain' });
+    const slice = file.slice.bind(file);
+    file.slice = (...args: Parameters<File['slice']>) => {
+      const part = slice(...args);
+      const read = part.arrayBuffer.bind(part);
+      part.arrayBuffer = () => gate.then(read);
+      return part;
+    };
+    return { file, release };
+  }
+
+  const form = (): HTMLFormElement => composer().closest('form')!;
+  /** The chips of the composer, as read. */
+  const chipText = (): string =>
+    allByRole(form(), 'listitem')
+      .map((chip) => chip.textContent ?? '')
+      .join('|');
+
+  it('a picked text file shows a chip, goes with the message, and leaves the composer with it', async () => {
+    const create = deferred({ conversation: info('p-att-send'), turnId: 't1' });
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      routes: { 'POST /chat/conversations': create.body },
+      conversations: { 'p-att-send': sync('p-att-send', { entries: [] }) },
+    });
+    pick(new File(['hello\nworld\n'], 'notes.ts', { type: 'video/mp2t' }));
+    await waitFor(() => chipText().includes('notes.ts'));
+    expect(composer().placeholder).toBe(CHAT.attach.placeholder);
+    expect(shown(form())).toContain(fill(CHAT.attach.tokens, { n: 7 }));
+    type('Read this');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    expect(writes()[0]!.body).toEqual({
+      mode: 'chat',
+      text: 'Read this',
+      modelId: 'qwen3.5-4b',
+      attachments: [{ kind: 'file', name: 'notes.ts', text: 'hello\nworld\n' }],
+    });
+    expect(composer().value).toBe('');
+    expect(allByRole(form(), 'listitem')).toEqual([]);
+    expect(readAttachments(NEW_PLACE)).toEqual([]);
+    const bubble = [...page!.container.querySelectorAll('[role="list"]')].find(
+      (list) => list.closest('form') === null && accessibleName(list) === CHAT.attach.list,
+    );
+    expect(bubble?.textContent).toContain('notes.ts');
+    await act(async () => create.release());
+    await waitFor(() => where.search === '?c=p-att-send');
+  });
+
+  it('a read that ends after the user moved on lands in the place it started in', async () => {
+    await open('/chat?c=p-att-a', (text) => text.includes('Hi there'), {
+      rows: [row('p-att-a'), row('p-att-b')],
+      conversations: { 'p-att-a': sync('p-att-a'), 'p-att-b': sync('p-att-b') },
+    });
+    const slow = slowFile('late.txt', 'late text');
+    pick(slow.file);
+    expect(shown(form())).not.toContain('late.txt');
+    click(rowLink('Title p-att-b'));
+    await waitFor(() => where.search === '?c=p-att-b' && shown().includes('Hi there'));
+    await act(async () => slow.release());
+    await waitFor(() => readAttachments('p-att-a').length === 1);
+    await flushTimers();
+    expect(readAttachments('p-att-b')).toEqual([]);
+    expect(allByRole(form(), 'listitem')).toEqual([]);
+    click(rowLink('Title p-att-a'));
+    await waitFor(() => where.search === '?c=p-att-a');
+    await waitFor(() => chipText().includes('late.txt'));
+  });
+
+  it('two picks at once add at most 4 files; the rest get one sentence', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    const three = (tag: string): File[] =>
+      [1, 2, 3].map((n) => new File([`text ${tag}${n}`], `${tag}${n}.txt`, { type: 'text/plain' }));
+    pick(...three('a'));
+    pick(...three('b'));
+    await waitFor(() => shown(form()).includes(fill(CHAT.attach.errors.tooMany, { n: 2 })));
+    expect(readAttachments(NEW_PLACE).map((item) => item.name)).toEqual(['a1.txt', 'a2.txt', 'a3.txt', 'b1.txt']);
+    expect(allByRole(form(), 'listitem')).toHaveLength(4);
+  });
+
+  it('a refused file says why in the strip while a notice of the mode shows above it', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ inference: 'starting' }),
+    });
+    pick(new File(['%PDF-1.7'], 'report.pdf', { type: 'application/pdf' }));
+    const sentence = fill(CHAT.attach.errors.pdf, { name: 'report.pdf' });
+    await waitFor(() => allByRole(form(), 'status').some((node) => node.textContent === sentence));
+    expect(shown(form())).toContain(CHAT.blockers['inference-starting']);
+    type('Now text');
+    expect(shown(form())).not.toContain(sentence);
+  });
+
+  it('a failed send puts the text and the files back when both are empty', async () => {
+    await open('/chat?c=p-att-back', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-back/prompt': stubError('E_UNAVAILABLE', 'slow', 'agent-slow') },
+      conversations: { 'p-att-back': sync('p-att-back') },
+    });
+    pick(new File(['some notes'], 'back.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('back.txt'));
+    type('With a file');
+    click(sendFace());
+    await waitFor(() => shown().includes(CHAT.sendErrors['agent-slow'][0]));
+    expect(composer().value).toBe('With a file');
+    expect(chipText()).toContain('back.txt');
+    expect(readAttachments('p-att-back').map((item) => item.name)).toEqual(['back.txt']);
+    click(button(CHAT.sendErrors['agent-slow'][1]));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toEqual({
+      text: 'With a file',
+      attachments: [{ kind: 'file', name: 'back.txt', text: 'some notes' }],
+    });
+  });
+
+  it('text typed while the send failed keeps the composer; Retry sends the files once', async () => {
+    const prompt = deferred(STUB_FAILURE);
+    await open('/chat?c=p-att-keep', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-keep/prompt': sequence(prompt.body, {}) },
+      conversations: { 'p-att-keep': sync('p-att-keep') },
+    });
+    pick(new File(['kept'], 'keep.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('keep.txt'));
+    type('first prompt');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    type('newer text');
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(composer().value).toBe('newer text');
+    expect(allByRole(form(), 'listitem')).toEqual([]);
+    click(button(CHAT.sendErrors.other[1]));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toEqual({
+      text: 'first prompt',
+      attachments: [{ kind: 'file', name: 'keep.txt', text: 'kept' }],
+    });
+    expect(composer().value).toBe('newer text');
+    expect(readAttachments('p-att-keep')).toEqual([]);
+    expect(allByRole(form(), 'listitem')).toEqual([]);
+  });
+
+  const KEEP_BODY = { text: 'first prompt', attachments: [{ kind: 'file', name: 'keep.txt', text: 'kept' }] };
+
+  /** Sends "first prompt" with keep.txt from the composer on screen, then types "newer text" while it is pending. */
+  async function sendKeepThenType(): Promise<void> {
+    pick(new File(['kept'], 'keep.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('keep.txt'));
+    type('first prompt');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    type('newer text');
+  }
+
+  /** Back on a place whose send failed: the newer draft stays, and Retry sends the failed text with its files. */
+  async function retryOnReturn(): Promise<void> {
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(composer().value).toBe('newer text');
+    expect(allByRole(form(), 'listitem')).toEqual([]);
+    click(button(CHAT.sendErrors.other[1]));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toMatchObject(KEEP_BODY);
+    expect(composer().value).toBe('newer text');
+  }
+
+  // Mutation: keep one failed record per window, cleared on a place switch -> no Retry on return.
+  it('a prompt that fails after the user moved on keeps its files for Retry on return', async () => {
+    const error = vi.spyOn(toast, 'error');
+    const prompt = deferred(STUB_FAILURE);
+    await open('/chat?c=p-fail-a', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-fail-a/prompt': sequence(prompt.body, {}) },
+      rows: [row('p-fail-a'), row('p-fail-b')],
+      conversations: { 'p-fail-a': sync('p-fail-a'), 'p-fail-b': sync('p-fail-b') },
+    });
+    await sendKeepThenType();
+    click(rowLink('Title p-fail-b'));
+    await waitFor(() => where.search === '?c=p-fail-b' && shown().includes('Hi there'));
+    await act(async () => prompt.release());
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+    click(rowLink('Title p-fail-a'));
+    await waitFor(() => where.search === '?c=p-fail-a');
+    await retryOnReturn();
+    await flushTimers();
+    expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+  });
+
+  it('a failure seen on screen keeps its Retry after the user leaves and comes back', async () => {
+    const prompt = deferred(STUB_FAILURE);
+    await open('/chat?c=p-fail-c', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-fail-c/prompt': sequence(prompt.body, {}) },
+      rows: [row('p-fail-c'), row('p-fail-d')],
+      conversations: { 'p-fail-c': sync('p-fail-c'), 'p-fail-d': sync('p-fail-d') },
+    });
+    await sendKeepThenType();
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    click(rowLink('Title p-fail-d'));
+    await waitFor(() => where.search === '?c=p-fail-d' && shown().includes('Hi there'));
+    expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+    click(rowLink('Title p-fail-c'));
+    await waitFor(() => where.search === '?c=p-fail-c');
+    await retryOnReturn();
+  });
+
+  it('a later send that goes through takes the Retry strip of a failed message the composer did not hold', async () => {
+    const prompt = deferred(STUB_FAILURE);
+    await open('/chat?c=p-fail-ok', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-fail-ok/prompt': sequence(prompt.body, {}) },
+      conversations: { 'p-fail-ok': sync('p-fail-ok') },
+    });
+    await sendKeepThenType();
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(readFailed('p-fail-ok')?.restored).toBe(false);
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toEqual({ text: 'newer text' });
+    await waitFor(() => readFailed('p-fail-ok') === null);
+    await flushTimers();
+    expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+    expect(writes()).toHaveLength(2);
+  });
+
+  it('a create that fails after the user moved on keeps its files for Retry on the New screen', async () => {
+    const create = deferred(STUB_FAILURE);
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      routes: { 'POST /chat/conversations': create.body },
+      rows: [row('p-fail-e')],
+      conversations: { 'p-fail-e': sync('p-fail-e') },
+    });
+    await waitFor(() => shown().includes('Title p-fail-e'));
+    await sendKeepThenType();
+    click(rowLink('Title p-fail-e'));
+    await waitFor(() => where.search === '?c=p-fail-e' && shown().includes('Hi there'));
+    await act(async () => create.release());
+    await waitFor(() => readDraft(NEW_PLACE) === 'newer text');
+    click(button(CHAT.newChat));
+    await waitFor(() => where.search === '?mode=chat');
+    await retryOnReturn();
+    expect(readAttachments(NEW_PLACE)).toEqual([]);
+  });
+
+  it('a send refused as busy beside a newer draft keeps its files for Retry', async () => {
+    const prompt = deferred(stubError('E_CONFLICT', 'busy', 'conversation-busy'));
+    await open('/chat?c=p-fail-busy', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-fail-busy/prompt': sequence(prompt.body, {}) },
+      conversations: { 'p-fail-busy': sync('p-fail-busy') },
+    });
+    await sendKeepThenType();
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors['conversation-busy'][0]));
+    expect(composer().value).toBe('newer text');
+    click(button(CHAT.tryAgain));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toMatchObject(KEEP_BODY);
+  });
+
+  // Mutation: give each Chat mount its own queue -> the store holds 5 and the screen shows 4 stale chips.
+  it('a read started before Chat was left and opened again lands in the chips of the new screen', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    const slow = slowFile('late.txt', 'late text');
+    pick(slow.file);
+    page!.unmount();
+    api!();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    pick(...[0, 1, 2, 3].map((n) => new File([`text ${n}`], `t${n}.txt`, { type: 'text/plain' })));
+    await flushTimers();
+    await act(async () => slow.release());
+    await waitFor(() => allByRole(form(), 'listitem').length === 4 && chipText().includes('late.txt'));
+    await flushTimers();
+    expect(readAttachments(NEW_PLACE).map((item) => item.name)).toEqual(['late.txt', 't0.txt', 't1.txt', 't2.txt']);
+    expect(allByRole(form(), 'listitem')).toHaveLength(4);
+    expect(shown(form())).toContain(fill(CHAT.attach.errors.tooMany, { n: 1 }));
+  });
+
+  it('a send refused as busy puts the text and the files back on screen, not only in the store', async () => {
+    await open('/chat?c=p-att-conflict', (text) => text.includes('Hi there'), {
+      routes: {
+        '/chat/conversations/p-att-conflict/prompt': stubError('E_CONFLICT', 'busy', 'conversation-busy'),
+      },
+      conversations: { 'p-att-conflict': sync('p-att-conflict') },
+    });
+    pick(new File(['busy'], 'busy.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('busy.txt'));
+    type('With a file');
+    click(sendFace());
+    await waitFor(() => writes().length === 1);
+    await waitFor(() => composer().value === 'With a file');
+    expect(chipText()).toContain('busy.txt');
+    expect(readAttachments('p-att-conflict').map((item) => item.name)).toEqual(['busy.txt']);
+  });
+
+  it('a failed send does not put its files back beside a file that is still being read', async () => {
+    const prompt = deferred(STUB_FAILURE);
+    await open('/chat?c=p-att-race', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-race/prompt': prompt.body },
+      conversations: { 'p-att-race': sync('p-att-race') },
+    });
+    pick(...[1, 2, 3, 4].map((n) => new File([`text ${n}`], `f${n}.txt`, { type: 'text/plain' })));
+    await waitFor(() => allByRole(form(), 'listitem').length === 4);
+    type('Four files');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    const slow = slowFile('late.txt', 'late text');
+    pick(slow.file);
+    await act(async () => prompt.release());
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    await act(async () => slow.release());
+    await waitFor(() => chipText().includes('late.txt'));
+    expect(readAttachments('p-att-race').map((item) => item.name)).toEqual(['late.txt']);
+    expect(composer().value).toBe('');
+  });
+
+  it('a read or a send that ends after its conversation was deleted brings no files and no failed record back', async () => {
+    const late = deferred(STUB_FAILURE);
+    await open('/chat?c=p-att-del', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-del/prompt': sequence(STUB_FAILURE, late.body) },
+      conversations: { 'p-att-del': sync('p-att-del') },
+    });
+    used.push('p-att-del');
+    type('first prompt');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => shown().includes(CHAT.sendErrors.other[0]));
+    expect(readFailed('p-att-del')).not.toBeNull();
+    const slow = slowFile('late.txt', 'late text');
+    pick(slow.file);
+    forgetPlace('p-att-del');
+    expect(readFailed('p-att-del')).toBeNull();
+    await act(async () => slow.release());
+    await waitFor(() => !shown(form()).includes(CHAT.attach.reading));
+    expect(readAttachments('p-att-del')).toEqual([]);
+    type('second prompt');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 2);
+    forgetPlace('p-att-del');
+    await act(async () => late.release());
+    await waitFor(() => composer().value === 'second prompt');
+    await flushTimers();
+    expect(readFailed('p-att-del')).toBeNull();
+  });
+
+  it('a file picked on the screen of a gone conversation stays in its composer', async () => {
+    await open('/chat?c=p-att-gone', (text) => text.includes(CHAT.goneUnknown));
+    used.push('p-att-gone');
+    pick(new File(['some notes'], 'kept.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('kept.txt'));
+    expect(readAttachments('p-att-gone').map((item) => item.name)).toEqual(['kept.txt']);
+  });
+
+  it('Retry with a picture after the model turned out not to see images posts nothing and says why', async () => {
+    writeAttachments('p-att-pic', [picture('pic-1')]);
+    await open('/chat?c=p-att-pic', (text) => text.includes('Hi there'), {
+      host: visionHost(true),
+      routes: { '/chat/conversations/p-att-pic/prompt': stubError('E_UNAVAILABLE', 'slow', 'agent-slow') },
+      conversations: { 'p-att-pic': sync('p-att-pic') },
+    });
+    await waitFor(() => chipText().includes('cat.png'));
+    type('What is this?');
+    click(sendFace());
+    await waitFor(() => shown().includes(CHAT.sendErrors['agent-slow'][0]));
+    expect(writes()[0]!.body).toEqual({
+      text: 'What is this?',
+      attachments: [{ kind: 'image', mediaType: 'image/png', data: PNG }],
+    });
+    act(() => api!.emitChatHost({ type: 'state', state: visionHost(false) }));
+    await waitFor(() => chipText().includes(CHAT.attach.chipModel));
+    click(button(CHAT.sendErrors['agent-slow'][1]));
+    await waitFor(() => shown().includes(CHAT.attach.blockedModel));
+    await flushTimers();
+    expect(writes()).toHaveLength(1);
+  });
+
+  it('Retry is not held back by a file still being read into the draft', async () => {
+    await open('/chat?c=p-att-busy', (text) => text.includes('Hi there'), {
+      routes: {
+        '/chat/conversations/p-att-busy/prompt': sequence(stubError('E_UNAVAILABLE', 'slow', 'agent-slow'), {}),
+      },
+      conversations: { 'p-att-busy': sync('p-att-busy') },
+    });
+    type('Plain text');
+    click(sendFace());
+    await waitFor(() => shown().includes(CHAT.sendErrors['agent-slow'][0]));
+    const slow = slowFile('later.txt', 'later');
+    pick(slow.file);
+    expect(shown(form())).toContain(CHAT.attach.reading);
+    click(button(CHAT.sendErrors['agent-slow'][1]));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toEqual({ text: 'Plain text' });
+    await act(async () => slow.release());
+  });
+
+  it('Send again sends the files while this window holds them; otherwise it says it sends none', async () => {
+    await open('/chat?c=p-att-again', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-again/prompt': {} },
+      conversations: { 'p-att-again': sync('p-att-again') },
+    });
+    pick(new File(['again'], 'again.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('again.txt'));
+    type('Look at it');
+    click(sendFace());
+    await waitFor(() => writes().length === 1);
+    act(() => {
+      api!.emitChat('p-att-again', {
+        type: 'ops',
+        seq: 1,
+        ops: [
+          {
+            op: 'push',
+            entry: {
+              kind: 'user',
+              ts: NOW,
+              text: 'Look at it',
+              promptIndex: null,
+              attachments: [{ kind: 'file', name: 'again.txt', bytes: 5 }],
+            },
+          },
+        ],
+      });
+      api!.emitChat('p-att-again', { type: 'turn', seq: 2, turn: null, turnId: 't2', outcome: 'cancelled' });
+    });
+    await waitFor(() => hasButton(CHAT.sendAgain));
+    expect(hasButton(CHAT.sendAgainNoFiles)).toBe(false);
+    click(button(CHAT.sendAgain));
+    await waitFor(() => writes().length === 2);
+    expect(writes()[1]!.body).toEqual({
+      text: 'Look at it',
+      attachments: [{ kind: 'file', name: 'again.txt', text: 'again' }],
+    });
+    page!.unmount();
+    api!();
+    await open('/chat?c=p-att-again2', (text) => text.includes('Look at it'), {
+      routes: { '/chat/conversations/p-att-again2/prompt': {} },
+      conversations: {
+        'p-att-again2': sync('p-att-again2', {
+          entries: [sentWith('Look at it', [{ kind: 'file', name: 'again.txt', bytes: 5 }]), end('cancelled')],
+        }),
+      },
+    });
+    await waitFor(() => hasButton(CHAT.sendAgainNoFiles));
+    click(button(CHAT.sendAgainNoFiles));
+    await waitFor(() => writes().length === 1);
+    expect(writes()[0]!.body).toEqual({ text: 'Look at it' });
+  });
+
+  it('a picture on a model that does not see images: the chip says so and Send waits until the model can', async () => {
+    writeAttachments(NEW_PLACE, [picture('pic-2')]);
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), { host: visionHost(true) });
+    type('Describe it');
+    expect(sendFace().disabled).toBe(false);
+    expect(chipText()).not.toContain(CHAT.attach.chipModel);
+    act(() => api!.emitChatHost({ type: 'state', state: visionHost(false) }));
+    await waitFor(() => chipText().includes(CHAT.attach.chipModel));
+    expect(sendFace().disabled).toBe(true);
+    expect(shown(form())).toContain(CHAT.attach.blockedModel);
+    key(composer(), { key: 'Enter' });
+    act(() => api!.emitChatHost({ type: 'state', state: visionHost(true) }));
+    await waitFor(() => !chipText().includes(CHAT.attach.chipModel));
+    expect(sendFace().disabled).toBe(false);
+    expect(writes()).toEqual([]);
+  });
+
+  it('a conversation with pictures on a model that cannot see them says the pictures are left out', async () => {
+    const entries = [
+      sentWith('Look', [{ kind: 'image', mediaType: 'image/png', bytes: 2048 }]),
+      answer('A cat'),
+      end(),
+    ];
+    await open('/chat?c=p-att-unseen', (text) => text.includes('A cat'), {
+      host: visionHost(false),
+      conversations: { 'p-att-unseen': sync('p-att-unseen', { entries }) },
+    });
+    expect(shown(form())).toContain(CHAT.attach.imagesUnseen);
+    act(() => api!.emitChatHost({ type: 'state', state: visionHost(true) }));
+    await waitFor(() => !shown(form()).includes(CHAT.attach.imagesUnseen));
+  });
+
+  it('the thread shows the chips of a stored message: file name and size, picture type and size', async () => {
+    const entries = [
+      sentWith('Both', [
+        { kind: 'file', name: 'stored.md', bytes: 2048 },
+        { kind: 'image', mediaType: 'image/jpeg', bytes: 4096 },
+      ]),
+      answer('Seen'),
+      end(),
+    ];
+    await open('/chat?c=p-att-stored', (text) => text.includes('Seen'), {
+      host: visionHost(true),
+      conversations: { 'p-att-stored': sync('p-att-stored', { entries }) },
+    });
+    const list = byRole(threadColumn()!, 'list', CHAT.attach.list)!;
+    const items = allByRole(list, 'listitem').map((item) => item.textContent);
+    expect(items).toEqual([`stored.md${formatBytes(2048)}`, `${CHAT.attach.image}JPEG · ${formatBytes(4096)}`]);
+    expect(list.querySelector('button, img')).toBeNull();
+    expect(shown(form())).not.toContain(CHAT.attach.imagesUnseen);
+  });
+
+  it('files and text over 90,000 bytes together are too long; a window decides only when it is known', async () => {
+    const four = (tag: string): DraftAttachment[] => [1, 2, 3, 4].map((n) => textFile(`${tag}${n}`, 20_000));
+    writeAttachments(NEW_PLACE, four('long'));
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: host({ models: [hostModel('qwen3.5-4b', null)] }),
+    });
+    type('b'.repeat(10_001));
+    expect(shown(form())).toContain(CHAT.attach.blockedLong);
+    expect(sendFace().disabled).toBe(true);
+    type('hi');
+    expect(sendFace().disabled).toBe(false);
+    expect(shown(form())).toContain(fill(CHAT.attach.tokens, { n: '26,668' }));
+    page!.unmount();
+    api!();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    type('hi');
+    expect(shown(form())).toContain(CHAT.attach.blockedWindow);
+    expect(shown(form())).toContain(fill(CHAT.attach.tokensNearFull, { n: '26,668' }));
+    expect(sendFace().disabled).toBe(true);
+  });
+
+  it('a removed chip leaves the store of its place; a forget drops the writes that started before it', async () => {
+    used.push('p-att-store');
+    writeAttachments('p-att-store', [textFile('s1', 100)]);
+    writeAttachments('p-att-other', [textFile('s2', 100)]);
+    expect(readAttachments('p-att-store').map((item) => item.id)).toEqual(['s1']);
+    const before = placeEpoch('p-att-store');
+    forgetPlace('p-att-store');
+    expect(readAttachments('p-att-store')).toEqual([]);
+    writeAttachments('p-att-store', [textFile('s3', 100)], before);
+    expect(readAttachments('p-att-store')).toEqual([]);
+    writeAttachments('p-att-store', [textFile('s6', 100)]);
+    expect(readAttachments('p-att-store').map((item) => item.id)).toEqual(['s6']);
+    expect(readAttachments('p-att-other').map((item) => item.id)).toEqual(['s2']);
+    forgetPlace('p-att-other');
+    writeAttachments(NEW_PLACE, [textFile('s4', 100, 'gone.txt'), textFile('s5', 100, 'stays.txt')]);
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    click(button(fill(CHAT.attach.remove, { name: 'gone.txt' })));
+    expect(readAttachments(NEW_PLACE).map((item) => item.id)).toEqual(['s5']);
+    await waitFor(() => !chipText().includes('gone.txt'));
+    expect(chipText()).toContain('stays.txt');
+  });
+
+  it('a refused attachment says so in the strip, with no action', () => {
+    expect(sendFailure('attachment-refused', 'E_BAD_REQUEST', 'chat')).toEqual({
+      strip: { tone: 'danger', text: CHAT.sendErrors['attachment-refused'][0], action: undefined },
+    });
+    expect(sendFailure('pictures-full', 'E_CONFLICT', 'chat')).toEqual({
+      strip: { tone: 'danger', text: CHAT.sendErrors['pictures-full'][0], action: undefined },
+    });
+  });
+
+  // Mutation: drop the page's count of the pictures the chat holds → Send posts the picture.
+  it('a chat that holds as many pictures as it can keep says so before a picture is sent; a file still goes', async () => {
+    const full = sentWith('many', [
+      { kind: 'image', mediaType: 'image/png', bytes: (CHAT_PICTURES_MAX_BASE64 / 4) * 3 },
+    ]);
+    writeAttachments('p-att-full', [picture('pic-full')]);
+    await open('/chat?c=p-att-full', (text) => text.includes('Hi there'), {
+      host: visionHost(true),
+      routes: { '/chat/conversations/p-att-full/prompt': {} },
+      conversations: { 'p-att-full': sync('p-att-full', { entries: [full, answer('Hi there'), end()] }) },
+    });
+    await waitFor(() => chipText().includes('cat.png'));
+    type('One more');
+    expect(shown(form())).toContain(CHAT.sendErrors['pictures-full'][0]);
+    click(sendFace());
+    await flushTimers();
+    expect(writes()).toEqual([]);
+    click(button(fill(CHAT.attach.remove, { name: 'cat.png' })));
+    pick(new File(['notes'], 'notes.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('notes.txt'));
+    expect(shown(form())).not.toContain(CHAT.sendErrors['pictures-full'][0]);
+    click(sendFace());
+    await waitFor(() => writes().length === 1);
   });
 });

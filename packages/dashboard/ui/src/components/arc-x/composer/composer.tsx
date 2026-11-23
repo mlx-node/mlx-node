@@ -5,6 +5,8 @@ import {
   useId,
   useLayoutEffect,
   useRef,
+  useState,
+  type ClipboardEvent,
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
@@ -55,6 +57,10 @@ export interface ComposerProps {
   /** Accessible name of the textarea. Default 'Message'. */
   label?: string;
   textareaRef?: Ref<HTMLTextAreaElement>;
+  /** The attached files, between the notice and the text field. */
+  attachments?: ReactNode;
+  /** Files pasted (with no plain text beside them) or dropped on the box. Without it the box ignores files. */
+  onFiles?: (files: File[]) => void;
 }
 
 const MAX_LENGTH = 100_000;
@@ -206,14 +212,56 @@ export function Composer(props: ComposerProps): ReactElement {
     if (event.dataTransfer.types.includes('Files')) event.preventDefault();
   };
 
+  const onFiles = props.onFiles;
+  const [dragging, setDragging] = useState(false);
+
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>): void => {
+    if (onFiles === undefined) return;
+    const data = event.clipboardData;
+    if (data.types.includes('text/plain')) return;
+    const files: File[] = [];
+    for (const item of Array.from(data.items)) {
+      if (item.kind !== 'file') continue;
+      const file = item.getAsFile();
+      if (file !== null) files.push(file);
+    }
+    if (files.length === 0) return;
+    event.preventDefault();
+    onFiles(files);
+  };
+
+  const onDragOver = (event: DragEvent<HTMLFormElement>): void => {
+    if (onFiles === undefined || !event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    setDragging(true);
+  };
+
+  const onDragLeave = (event: DragEvent<HTMLFormElement>): void => {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setDragging(false);
+  };
+
+  const onDrop = (event: DragEvent<HTMLFormElement>): void => {
+    if (onFiles === undefined || !event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    setDragging(false);
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length > 0) onFiles(files);
+  };
+
   return (
     <form
       className={styles.root}
       aria-label={label}
       data-blocked={props.blocked !== undefined ? '' : undefined}
+      data-dragging={dragging ? '' : undefined}
       onSubmit={submit}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
     >
       {props.notice !== undefined ? <NoticeStrip notice={props.notice} /> : null}
+      {props.attachments}
       <div className={styles.field}>
         <textarea
           ref={attach}
@@ -226,6 +274,7 @@ export function Composer(props: ComposerProps): ReactElement {
           spellCheck
           onChange={(event) => props.onValueChange(event.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           onDragOver={ignoreFiles}
           onDrop={ignoreFiles}
         />

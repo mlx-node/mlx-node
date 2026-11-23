@@ -17,6 +17,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -83,6 +84,11 @@ export interface ChatRuntimeOptions {
   homeDir?: string;
   /** Work: the environment the agent inherits. Default: this process's. Tests and the dev harness pass a throwaway home. */
   baseEnv?: NodeJS.ProcessEnv;
+  /**
+   * Work: the `PATH` a command of the agent gets, for `baseEnv` and `homeDir`. Default: the `PATH` of `baseEnv`. The
+   * Control Panel passes `workCommandPath`, which asks the user's login shell.
+   */
+  workPath?: (base: NodeJS.ProcessEnv, home: string) => string | undefined | Promise<string | undefined>;
   /** Work: the temp roots Auto covers. Default: `/tmp` when the resolver accepts it. Tests pass `[]` or a throwaway root. */
   tempRoots?: readonly AllowedRoot[];
   /** With no window attached for this long, open Work requests are denied. */
@@ -330,10 +336,13 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     supervisorPath: opts.supervisorPath ?? desktopSupervisorStatePath(),
     ingest: () => worker.ingest(),
   });
+  const workBase = chatOpts.baseEnv ?? process.env;
+  const workHome = chatOpts.homeDir ?? homedir();
   const providers = new ProvidersService({
     paths,
     secrets: chatOpts.secrets ?? new KeyringSecretStore(),
     baseUrls: chatOpts.providerBaseUrls,
+    workPath: () => (chatOpts.workPath === undefined ? workBase.PATH : chatOpts.workPath(workBase, workHome)),
   });
   const readEndpoint = chatOpts.readEndpoint ?? (() => readDesktopEndpoint());
   const chat = new ChatService({

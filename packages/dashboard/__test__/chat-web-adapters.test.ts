@@ -11,7 +11,7 @@ import type { ConversationEvent } from '../src/chat/types.js';
 import { braveFetch, braveSearch, stripTags } from '../src/chat/web/adapters/brave.js';
 import { deepseekFetch, deepseekQuery, deepseekSearch } from '../src/chat/web/adapters/deepseek.js';
 import { exaFetch, exaSearch } from '../src/chat/web/adapters/exa.js';
-import { firecrawlFetch } from '../src/chat/web/adapters/firecrawl.js';
+import { firecrawlFetch, firecrawlLocalFetch } from '../src/chat/web/adapters/firecrawl.js';
 import {
   type AdapterContext,
   httpJson,
@@ -21,7 +21,12 @@ import {
   type SearchArgs,
   targetAllowed,
 } from '../src/chat/web/http.js';
-import { formatErrorText, parseWebResultText, type WebErrorCode } from '../src/chat/web/result-text.js';
+import {
+  formatErrorText,
+  PAGE_CLOUD_NOTE,
+  parseWebResultText,
+  type WebErrorCode,
+} from '../src/chat/web/result-text.js';
 import { WebTools } from '../src/chat/web/tools.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import { fakeService, until, type Json } from './helpers/chat-fake.js';
@@ -282,6 +287,72 @@ describe('provider requests', () => {
   });
 });
 
+describe('Firecrawl on this Mac', () => {
+  const PAGE = { success: true, data: { markdown: '# Doc\nBody', metadata: { title: 'Doc', statusCode: 200 } } };
+
+  it('sends the same scrape to the local base with no Authorization header, and reads the page', async () => {
+    const server = await fake({ json: { ...PAGE, data: { ...PAGE.data, source: 'local' } } });
+    const text = await firecrawlLocalFetch('https://example.com/a', ctx(server));
+    expect(parseWebResultText(text)).toEqual({
+      kind: 'page',
+      provider: 'firecrawl',
+      url: 'https://example.com/a',
+      title: 'Doc',
+      cut: false,
+      cloudRead: false,
+      text: '# Doc\nBody',
+    });
+    const request = server.requests[0]!;
+    expect([request.method, request.path]).toEqual(['POST', '/v2/scrape']);
+    expect(JSON.parse(request.body)).toEqual({
+      url: 'https://example.com/a',
+      formats: ['markdown'],
+      onlyMainContent: true,
+      timeout: 25000,
+    });
+    expect(request.headers.authorization).toBeUndefined();
+    expect(JSON.stringify(request)).not.toContain(KEY);
+  });
+
+  it('says so when Firecrawl Cloud read the page', async () => {
+    const server = await fake({ json: { ...PAGE, data: { ...PAGE.data, source: 'firecrawl-cloud' } } });
+    const text = await firecrawlLocalFetch('https://example.com/a', ctx(server));
+    expect(text.split('\n\n')[0]!.split('\n')).toContain(PAGE_CLOUD_NOTE);
+    expect(parseWebResultText(text)).toMatchObject({ kind: 'page', cloudRead: true, text: '# Doc\nBody' });
+    expect(parseWebResultText(await firecrawlFetch('https://example.com/a', ctx(server)))).toMatchObject({
+      cloudRead: false,
+    });
+  });
+
+  it('maps its own answers: blocked page, refused target, token, no connection, page status, redirect', async () => {
+    const blockedPage = await fake({ json: { success: true, data: { blocked: true, markdown: 'Just a moment' } } });
+    const refused = await fake({ status: 403, json: { success: false, code: 'BLOCKED_TARGET' } });
+    const token = await fake({ status: 401, json: { success: false } });
+    const notFound = await fake({ json: { success: true, data: { markdown: 'Gone', metadata: { statusCode: 404 } } } });
+    const dropped = await fake({ drop: true });
+    const target = await fake({ json: PAGE });
+    const redirecting = await fake({ status: 302, headers: { Location: `${target.baseUrl}/v2/scrape` }, body: '' });
+    const cases: Array<[FakeProvider, WebErrorCode]> = [
+      [blockedPage, 'no-content'],
+      [refused, 'blocked'],
+      [token, 'local-down'],
+      [notFound, 'no-content'],
+      [dropped, 'local-down'],
+      [redirecting, 'provider-error'],
+    ];
+    for (const [server, code] of cases) {
+      expect(await firecrawlLocalFetch('https://example.com/a', ctx(server))).toBe(formatErrorText(code, 'firecrawl'));
+    }
+    expect(target.requests).toHaveLength(0);
+    const closed = await fake({ json: PAGE });
+    const base = closed.baseUrl;
+    await servers.pop()!.close();
+    expect(await firecrawlLocalFetch('https://example.com/a', ctx({ baseUrl: base }))).toBe(
+      formatErrorText('local-down', 'firecrawl'),
+    );
+  });
+});
+
 describe('provider failures', () => {
   const TABLE: Array<[number, WebErrorCode]> = [
     [401, 'key-rejected'],
@@ -436,7 +507,7 @@ describe('a Chat turn with adapter-written web results', () => {
           : { json: { results: [{ title: 'Rust 1.99', text: 'Release notes body.' }] } },
       );
       const tools = new WebTools(
-        { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY },
+        { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY, fetchUrl: '' },
         {
           fetch: (input, init) => fetch(input, init),
           baseUrls: {

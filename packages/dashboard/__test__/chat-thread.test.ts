@@ -18,8 +18,9 @@ import {
   type ChatThreadProps,
 } from '../ui/src/components/chat-thread.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
-import { formatClock } from '../ui/src/lib/format.js';
+import { formatBytes, formatClock } from '../ui/src/lib/format.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
+import { formatErrorText, formatPageText } from '../ui/src/lib/web-result-text.js';
 import {
   CITED_ANSWER,
   FETCH_USER_URL,
@@ -116,6 +117,66 @@ function anchors(container: HTMLElement): string[] {
   return [...container.querySelectorAll('a[href]')].map((a) => a.getAttribute('href') ?? '');
 }
 
+describe('ChatThread: files on a message', () => {
+  it('a message sent with files shows read-only chips; one without draws none', () => {
+    const sample: ThreadSample = {
+      mode: 'chat',
+      entries: [
+        {
+          kind: 'user',
+          ts: T0,
+          text: 'Look at these',
+          promptIndex: 1,
+          attachments: [
+            { kind: 'file', name: 'notes.md', bytes: 2048 },
+            { kind: 'image', mediaType: 'image/png', bytes: 4096 },
+          ],
+        },
+        answer('Seen'),
+        end(),
+        user('And now?'),
+        answer('Nothing attached'),
+        end(),
+      ],
+      turns: [],
+      turn: null,
+      lastEnd: null,
+    };
+    const container = mount(threadOf(sample));
+    const lists = allByRole(container, 'list', CHAT.attach.list);
+    expect(lists).toHaveLength(1);
+    expect(allByRole(lists[0]!, 'listitem').map((item) => item.textContent)).toEqual([
+      `notes.md${formatBytes(2048)}`,
+      `${CHAT.attach.image}PNG · ${formatBytes(4096)}`,
+    ]);
+    expect(lists[0]!.querySelector('button, img')).toBeNull();
+    expect(container.textContent).toContain('Look at these');
+  });
+
+  it('a message with only a picture still draws its row', () => {
+    const container = mount(
+      threadOf({
+        mode: 'chat',
+        entries: [
+          {
+            kind: 'user',
+            ts: T0,
+            text: '',
+            promptIndex: 1,
+            attachments: [{ kind: 'image', mediaType: 'image/jpeg', bytes: 100 }],
+          },
+          answer('A dog'),
+          end(),
+        ],
+        turns: [],
+        turn: null,
+        lastEnd: null,
+      }),
+    );
+    expect(allByRole(byRole(container, 'list', CHAT.attach.list)!, 'listitem')).toHaveLength(1);
+  });
+});
+
 describe('ChatThread: sources and citations', () => {
   it('cited sources become chips, the written Sources block is replaced, a chip opens and focuses its source', async () => {
     const container = mount(threadOf(CITED_ANSWER));
@@ -195,6 +256,49 @@ describe('ChatThread: web call rows', () => {
     const toggles = allByRole(container, 'button').filter((b) => b.getAttribute('aria-expanded') === 'false');
     for (const toggle of toggles) act(() => toggle.click());
     expect(anchors(container)).toContain('/providers');
+  });
+
+  it('a reader on this Mac that is not ready offers the settings', () => {
+    const container = mount(
+      threadOf({
+        mode: 'chat',
+        entries: [
+          user('Read https://docs.example.org/guide'),
+          directFetch('https://docs.example.org/guide', formatErrorText('local-down', 'firecrawl')),
+          end('end_turn'),
+        ],
+        turns: [],
+        turn: null,
+        lastEnd: { turnId: 't1', outcome: 'completed' },
+      }),
+    );
+    expect(container.textContent).toContain(CHAT.webErrors['local-down']);
+    const toggles = allByRole(container, 'button').filter((b) => b.getAttribute('aria-expanded') === 'false');
+    for (const toggle of toggles) act(() => toggle.click());
+    expect(anchors(container)).toContain('/providers');
+  });
+
+  it('a page Firecrawl Cloud read for this Mac says so in its row; a page read here does not', () => {
+    const page = (cloudRead: boolean) =>
+      formatPageText('firecrawl', {
+        url: 'https://docs.example.org/guide',
+        title: 'Guide',
+        cut: false,
+        cloudRead,
+        text: 'Hello',
+      });
+    const sample = (output: string): ThreadSample => ({
+      mode: 'chat',
+      entries: [user('Read it'), directFetch('https://docs.example.org/guide', output), end('end_turn')],
+      turns: [],
+      turn: null,
+      lastEnd: { turnId: 't1', outcome: 'completed' },
+    });
+    const container = mount(threadOf(sample(page(true))));
+    expect(container.textContent).toContain(CHAT.readByCloud);
+    rerender(threadOf(sample(page(false))));
+    expect(container.textContent).toContain('docs.example.org');
+    expect(container.textContent).not.toContain(CHAT.readByCloud);
   });
 
   it('a read the app refused for its address says so; an earlier failed read still says the provider failed', () => {
@@ -502,6 +606,31 @@ describe('ChatThread: outcomes and actions', () => {
     expect(onTurnAction).toHaveBeenCalledWith({ kind: 'send-again', text: 'Write a poem' });
     rerender(threadOf(UNFINISHED, { onTurnAction, actionDisabledReason: 'The engine is stopped.' }));
     expect((byRole(container, 'button', 'Send again') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('Send again names a lost file: the label says it goes without them unless the page still holds them', async () => {
+    const withFiles: ThreadSample = {
+      ...UNFINISHED,
+      entries: [
+        {
+          kind: 'user',
+          ts: T0,
+          text: 'Write a poem',
+          promptIndex: null,
+          attachments: [{ kind: 'file', name: 'poem.txt', bytes: 12 }],
+        },
+        answer('Roses'),
+      ],
+    };
+    const onTurnAction = vi.fn();
+    const container = mount(threadOf(withFiles, { onTurnAction }));
+    expect(byRole(container, 'button', CHAT.sendAgain)).toBeNull();
+    act(() => byRole(container, 'button', CHAT.sendAgainNoFiles)!.click());
+    expect(onTurnAction).toHaveBeenCalledWith({ kind: 'send-again', text: 'Write a poem' });
+    rerender(threadOf(withFiles, { onTurnAction, keptFor: 'Write a poem' }));
+    await waitFor(() => byRole(container, 'button', CHAT.sendAgain) !== null);
+    rerender(threadOf(UNFINISHED, { onTurnAction, keptFor: null }));
+    await waitFor(() => byRole(container, 'button', CHAT.sendAgain) !== null);
   });
 
   it('a model switch after an unfinished turn is drawn below its footer', () => {

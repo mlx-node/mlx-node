@@ -15,13 +15,16 @@ import type { SessionDetailResponse } from '../src/agent-sessions/types.js';
 import { routeThreadFor } from '../src/api/dispatch.js';
 import type { ApiResponse } from '../src/api/errors.js';
 import { ROUTES } from '../src/api/routes.js';
+import { promptParams } from '../src/chat/agent/profiles.js';
+import type { AttachmentInput } from '../src/chat/attachment-rule.js';
 import { MemorySecretStore } from '../src/chat/providers/secrets.js';
 import { guarded } from '../src/chat/route-errors.js';
-import { isSlashText, permissionModeInput } from '../src/chat/route-input.js';
+import { createConversationInput, isSlashText, permissionModeInput, promptInput } from '../src/chat/route-input.js';
 import type { ConversationEvent, ConversationInfo, Interaction } from '../src/chat/types.js';
 import { createDashboardRuntime, type ChatRuntimeOptions, type DashboardRuntime } from '../src/runtime.js';
 import { endpointModel, FAKE_AGENT, INFERENCE_TOKEN, readScenario, until, type Json } from './helpers/chat-fake.js';
 import { startFakeEngine, UNLOAD_PATH, type FakeEngine } from './helpers/fake-engine.js';
+import { fakeLocalAnswers, fakeLocalScript, startFakeProvider } from './helpers/fake-providers.js';
 
 const MARKER = 'marker-KEY-12345678';
 
@@ -166,6 +169,57 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/engine/unload',
     ]);
     expect(routeThreadFor('POST', '/api/chat/conversations/abc/prompt')).toBe('main');
+  });
+});
+
+describe('Provider routes — Firecrawl on this Mac', () => {
+  it('three routes on the transport take exactly their bodies, and no error quotes the typed address', async () => {
+    const providers = ROUTES.filter((r) => r.segments[1] === 'providers' && r.segments[2] === 'local').map(
+      (r) => `${r.thread} ${r.method} /${r.segments.join('/')}`,
+    );
+    expect(providers).toEqual([
+      'main PUT /api/providers/local',
+      'main DELETE /api/providers/local',
+      'main POST /api/providers/local/check',
+    ]);
+    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+    try {
+      start('chat-basic');
+      for (const url of [`http://${MARKER}.example:3002`, `http://127.0.0.1:3002/${MARKER}`]) {
+        const refused = failureOf(await call('PUT', '/api/providers/local', { url }));
+        expect(refused).toEqual({ code: 'E_BAD_REQUEST', message: 'Use an address on this Mac.' });
+      }
+      expect(failureOf(await call('PUT', '/api/providers/local', { url: local.baseUrl, x: 1 })).message).toBe(
+        'Unknown field "x".',
+      );
+      expect(failureOf(await call('PUT', '/api/providers/local', {})).message).toBe('Field "url" is required.');
+      expect(failureOf(await call('PUT', '/api/providers/local', { url: 3002 })).code).toBe('E_BAD_REQUEST');
+      expect(failureOf(await call('POST', '/api/providers/local/check', { url: local.baseUrl })).message).toBe(
+        'This request takes no body.',
+      );
+      expect(failureOf(await call('DELETE', '/api/providers/local', { url: local.baseUrl })).code).toBe(
+        'E_BAD_REQUEST',
+      );
+      expect(await call('POST', '/api/providers/local/check')).toMatchObject({ ok: true, body: { check: null } });
+      expect(local.requests).toEqual([]);
+      expect(await call('PUT', '/api/providers/local', { url: local.baseUrl })).toMatchObject({
+        ok: true,
+        body: { saved: true, check: 'ok', providers: { firecrawl: true, firecrawlLocal: true } },
+      });
+      expect(await call('POST', '/api/providers/local/check')).toMatchObject({
+        ok: true,
+        body: { check: 'ok', providers: { local: { url: local.baseUrl, check: 'ok' } } },
+      });
+      expect(await call('DELETE', '/api/providers/local')).toMatchObject({
+        ok: true,
+        body: { firecrawl: false, firecrawlLocal: false, local: { url: null } },
+      });
+      expect(
+        failureOf(await call('PUT', '/api/providers/selection', { firecrawl: true, firecrawlLocal: true })),
+      ).toEqual({ code: 'E_CONFLICT', reason: 'local-not-set-up', message: 'Set up Firecrawl on this Mac first.' });
+    } finally {
+      await local.close();
+    }
   });
 });
 
@@ -593,6 +647,143 @@ describe('Chat routes — Work', () => {
       const raw = (await serviceRead(id))?.transcript.find((e) => e.kind === 'tool');
       expect(raw?.kind === 'tool' && raw.output?.endsWith(head)).toBe(true);
     }, 30_000);
+  });
+});
+
+describe('Chat routes — attachments', () => {
+  it('both routes pass checked attachments to the agent; a picture for a model that takes none is refused', async () => {
+    start('chat-basic', undefined, {
+      readEndpoint: async () => ({
+        version: 1,
+        pid: process.pid,
+        url: engine.url,
+        token: INFERENCE_TOKEN,
+        models: [
+          { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), images: true },
+          endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'),
+        ],
+      }),
+    });
+    const file: AttachmentInput = { kind: 'file', name: 'dir/a#1.md', text: '# a\n' };
+    const picture: AttachmentInput = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' };
+    const response = await call('POST', '/api/chat/conversations', {
+      mode: 'chat',
+      text: 'look',
+      attachments: [file, picture],
+    });
+    if (!response.ok) throw new Error(response.message);
+    const id = (response.body as { conversation: ConversationInfo }).conversation.id;
+    await settled(id);
+    const blind = await call('POST', '/api/chat/conversations', {
+      mode: 'chat',
+      text: 'look',
+      modelId: 'qwen3.5-9b',
+      attachments: [picture],
+    });
+    expect(failureOf(blind)).toEqual({
+      code: 'E_BAD_REQUEST',
+      reason: 'attachment-refused',
+      message: 'The attached files were refused.',
+    });
+    const many = await call('POST', `/api/chat/conversations/${id}/prompt`, {
+      text: 'again',
+      attachments: [file, file, file, file, file],
+    });
+    expect(failureOf(many).reason).toBe('attachment-refused');
+    const again = await call('POST', `/api/chat/conversations/${id}/prompt`, { text: 'again', attachments: [file] });
+    expect(again.ok && again.status).toBe(202);
+    await settled(id);
+    const prompts = sent().filter((m) => m.method === 'session/prompt');
+    expect(prompts.map((m) => m.params)).toEqual([
+      promptParams(id, 'look', [{ ...file, name: 'a_1.md' }, picture]),
+      promptParams(id, 'again', [{ ...file, name: 'a_1.md' }]),
+    ]);
+  }, 20_000);
+});
+
+describe('the attachment input', () => {
+  const PNG_HEAD = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const png = (bytes: number): string => {
+    const data = new Uint8Array(bytes);
+    data.set(PNG_HEAD);
+    return Buffer.from(data).toString('base64');
+  };
+  const file = (text: string, name = 'a.txt') => ({ kind: 'file', name, text });
+  const image = (data: string, mediaType = 'image/png') => ({ kind: 'image', mediaType, data });
+  /** A file whose text, numbered as the agent renders it (`1→` + text), is `bytes` long. */
+  const numbered = (bytes: number) => file('x'.repeat(bytes - 4));
+  const reasonOf = (run: () => unknown): string => {
+    try {
+      run();
+    } catch (error) {
+      return (error as { reason?: string; code?: string }).reason ?? (error as { code?: string }).code ?? 'thrown';
+    }
+    return 'ok';
+  };
+  const create = (attachments: unknown, text = 'look') => createConversationInput({ mode: 'chat', text, attachments });
+  const prompt = (attachments: unknown, text = 'look') => promptInput({ text, attachments });
+
+  it('takes files and pictures on both routes, the name cleaned to its base; an empty list is no field', () => {
+    const items = [file('hello\n', '../../etc/a#b.md'), image(png(64)), image('/9j/4AAQ', 'image/jpeg')];
+    const expected = [
+      { kind: 'file', name: 'a_b.md', text: 'hello\n' },
+      { kind: 'image', mediaType: 'image/png', data: png(64) },
+      { kind: 'image', mediaType: 'image/jpeg', data: '/9j/4AAQ' },
+    ];
+    expect(create(items)).toEqual({ mode: 'chat', text: 'look', attachments: expected });
+    expect(prompt(items)).toEqual({ text: 'look', attachments: expected });
+    expect(create([])).toEqual(createConversationInput({ mode: 'chat', text: 'look' }));
+    expect(prompt([])).toEqual({ text: 'look' });
+    expect(promptInput({ text: 'look' })).toEqual({ text: 'look' });
+    expect(create([file('x', 'n'.repeat(255))]).attachments![0]).toMatchObject({ name: 'n'.repeat(120) });
+  });
+
+  it('takes the limits themselves: 4 items, 20,000 numbered bytes, 90,000 bytes in all, 1,000,000 picture bytes', () => {
+    expect(
+      reasonOf(() =>
+        create([numbered(20_000), numbered(20_000), numbered(20_000), numbered(20_000)], 'y'.repeat(10_000)),
+      ),
+    ).toBe('ok');
+    expect(reasonOf(() => prompt([image(png(1_000_000))]))).toBe('ok');
+  });
+
+  // Mutations: accept a 5th attachment → red; skip the first-bytes check of a picture → red.
+  it('refuses every attachment past a limit as attachment-refused, on both routes', () => {
+    const cases: Array<[string, unknown[], string?]> = [
+      ['5 items', [file('a'), file('b'), file('c'), file('d'), file('e')]],
+      ['an unknown key', [{ ...file('a'), path: '/etc/passwd' }]],
+      ['a missing key', [{ kind: 'file', name: 'a.txt' }]],
+      ['an unknown kind', [{ kind: 'audio', name: 'a', text: 'a' }]],
+      ['not an object', ['a.txt']],
+      ['an array item', [['file', 'a.txt', 'a']]],
+      ['a name of 256 characters', [file('a', 'n'.repeat(256))]],
+      ['an empty name', [file('a', '')]],
+      ['a name that is not text', [{ kind: 'file', name: 7, text: 'a' }]],
+      ['text with NUL', [file('a\0b')]],
+      ['a lone surrogate', [file('a\ud800b')]],
+      ['a blank text file', [file(' \n\t ')]],
+      ['20,001 numbered bytes', [numbered(20_001)]],
+      [
+        'over 90,000 bytes in all',
+        [numbered(20_000), numbered(20_000), numbered(20_000), numbered(20_000)],
+        'y'.repeat(10_001),
+      ],
+      ['bad base64', [image('iVBORw0KGgo!AAAA')]],
+      ['base64 without padding', [image('iVBORw0KGgo')]],
+      ['too short', [image('iVB')]],
+      ['1,000,001 picture bytes', [image(png(1_000_001))]],
+      ['over the base64 length', [image(`${png(1_000_000)}AAAA`)]],
+      ['PNG bytes sent as image/jpeg', [image(png(64), 'image/jpeg')]],
+      ['JPEG bytes sent as image/png', [image('/9j/4AAQ')]],
+      ['image/webp', [image('UklGRiQAAABXRUJQ', 'image/webp')]],
+      ['data that is not text', [{ kind: 'image', mediaType: 'image/png', data: 7 }]],
+    ];
+    for (const [name, items, text] of cases) {
+      expect([name, reasonOf(() => create(items, text))]).toEqual([name, 'attachment-refused']);
+      expect([name, reasonOf(() => prompt(items, text))]).toEqual([name, 'attachment-refused']);
+    }
+    expect(reasonOf(() => create('a.txt'))).toBe('E_BAD_REQUEST');
+    expect(reasonOf(() => prompt({ 0: file('a') }))).toBe('E_BAD_REQUEST');
   });
 });
 

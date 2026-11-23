@@ -24,6 +24,7 @@ export {
   type ApiRequestInput,
 } from './api/dispatch.js';
 export { ROUTES, type Route, type RouteThread } from './api/routes.js';
+export { workCommandPath } from './chat/agent/work-path.js';
 export type {
   MetricsDistributions,
   MetricsModels,

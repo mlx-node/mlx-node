@@ -17,7 +17,7 @@ export const PROVIDERS = {
     exa: 'Web search and page text.',
     deepseek: 'Web search and page text. The skill for Work is written by mlx-node.',
     brave: 'Web search. It has no page reader: Chat reads excerpts, or uses Firecrawl.',
-    firecrawl: 'Reads pages for Chat. Crawl, map and search skills for Work.',
+    firecrawl: 'Reads pages for Chat. Crawl, map and search skills for Work. Use a key, or run it on this Mac.',
   },
   getKey: 'Get a key',
 
@@ -27,7 +27,7 @@ export const PROVIDERS = {
   chatBoth: 'Web search via {search}, pages via {fetch}.',
   chatSame: 'Web search and pages via {search}.',
   chatBrave: 'Web search and page excerpts via Brave.',
-  chatPagesOnly: 'No web search. Pages via Firecrawl when you give an address.',
+  chatPagesOnly: 'No web search. Pages via {fetch} when you give an address.',
   chatOff: 'Web search is off.',
   workSkills: '{n} {provider} skills',
   workOneSkill: '1 {provider} skill',
@@ -57,14 +57,25 @@ export const PROVIDERS = {
   selectedStatus: '{provider} selected. {n} skills installed.',
   selectedStatusOne: '{provider} selected. 1 skill installed.',
   offStatus: 'Web search is off.',
-  firecrawlSwitch: 'Read pages with Firecrawl',
-  firecrawlNoKey: 'Add a Firecrawl key below.',
-  firecrawlOff: 'Off. Chat reads pages through the search provider. Work has no Firecrawl skills.',
+  switching: 'Switching…',
+  crawler: 'Crawler',
+  crawlerCloud: 'Firecrawl Cloud',
+  crawlerLocal: 'Firecrawl on this Mac',
+  crawlerOffReads: '{provider} reads pages for Chat.',
+  crawlerOffExcerpts: 'Brave gives Chat page excerpts only.',
+  crawlerOffNone: 'Chat cannot read pages.',
+  crawlerNone: 'Add a Firecrawl key or set up Firecrawl on this Mac below to turn on the crawler.',
   firecrawlOn: 'Chat reads pages through Firecrawl. Work gets {n} Firecrawl skills.',
+  localOn:
+    'Chat reads pages through Firecrawl on this Mac. Work gets {n} Firecrawl skills. Firecrawl search sends the search words to Firecrawl Cloud, and fails when the server runs with FIRECRAWL_CLOUD=off.',
+  localOnNoCli:
+    'Chat reads pages through Firecrawl on this Mac. Work has no Firecrawl skills until the firecrawl CLI is installed.',
 
   leavesTitle: 'What leaves this Mac',
   leavesText:
     'Each search sends the search words to the provider. Each page read sends the address. The answer is written by the local model.',
+  leavesLocal:
+    'With Firecrawl on this Mac, no page address goes to a provider: this Mac fetches the page, so the site sees your IP address. Pages open only to your network (office, VPN) can be read, and pages that need JavaScript run in a Chrome on this Mac. If the server runs without FIRECRAWL_CLOUD=off, a page it cannot load is sent to Firecrawl Cloud.',
   historyTitle: 'Search results in your history',
   historyBrave:
     "Brave's terms limit how long search results may be kept. Results stay in a conversation on this Mac until you delete it. If the engine's disk cache is on, clear it on the Cache page too. Results are never used for training.",
@@ -72,6 +83,8 @@ export const PROVIDERS = {
     "Exa's terms limit how search results may be stored. Results stay in a conversation on this Mac until you delete it. If the engine's disk cache is on, clear it on the Cache page too. Results are never used for training.",
   workKeyNotice:
     "In Work, the agent's shell commands, MCP servers and hooks can read this key. In Chat, the key never reaches a shell.",
+  localWorkNotice:
+    'In Work, the firecrawl CLI talks to this address. The app passes no key. A key saved with firecrawl login is still used for searches, which go to Firecrawl Cloud.',
 
   keys: 'Keys',
   keyLabel: 'API key',
@@ -125,6 +138,39 @@ export const PROVIDERS = {
   removedDone: 'Removed',
   removedToast: '{provider} removed. Web search is off.',
   removedToastFirecrawl: 'Firecrawl removed.',
+
+  localRow: 'This Mac',
+  localText: 'Firecrawl Local reads pages from this Mac with no key. You install and start it yourself.',
+  localNeeds: 'Needs Rust and a C compiler (xcode-select --install).',
+  localInstall: 'cargo install firecrawl-local',
+  localStart: 'FIRECRAWL_CLOUD=off firecrawl-local serve',
+  localStartNote:
+    'FIRECRAWL_CLOUD=off keeps every page on this Mac. Without it, a page the server cannot load is sent to Firecrawl Cloud.',
+  localGuide: 'Firecrawl Local guide',
+  localAddress: 'Address',
+  localAddressHelp: 'Saving checks the server at this address.',
+  localSave: 'Check and save',
+  localBadAddress: 'Use an address on this Mac, like http://127.0.0.1:3002.',
+  localNotRunning: 'No answer at this address. Start the server, then check again.',
+  localNotFirecrawl: 'Something else answers at this address. It is not Firecrawl Local.',
+  localOpen: 'This server reads private addresses. Start it without --allow-private.',
+  localToken: 'This server asks for a token. Start it without --token.',
+  localNotSaved: 'The address was not saved.',
+  localEarlierKept: 'The earlier address is still in use.',
+  localRunning: 'Running · Firecrawl Local {version}',
+  localRunningPlain: 'Running',
+  localCloudFallback: 'Pages this server cannot load are sent to Firecrawl Cloud.',
+  localLimits:
+    'Pages, crawl and map run on this Mac. Pages that need JavaScript use the Chrome on this Mac. Search still needs Firecrawl Cloud.',
+  badgeRunning: 'Running',
+  badgeNotRunning: 'Not running',
+  badgeCheckFailed: 'Check failed',
+  badgeNotSetUp: 'Not set up',
+  localRemoveTitle: 'Remove Firecrawl on this Mac?',
+  localRemoveText: 'The address is forgotten. The server keeps running until you stop it.',
+  localRemoveSelected: 'The crawler is turned off for Chat and Work.',
+  localRemovedToast: 'Firecrawl on this Mac removed.',
+  needLocal: 'Set up Firecrawl on this Mac first.',
 
   keychainTitle: 'The Keychain cannot be reached',
   keychainText: 'Keys cannot be saved or read. Web search is off until it works again.',

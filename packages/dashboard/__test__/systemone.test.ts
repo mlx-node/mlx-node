@@ -148,6 +148,7 @@ function liveWithModels(pid: number, residentNames: string[]): { readNow(): Prom
             queueLimit: 16,
             pool: null,
             experts: null,
+            images: null,
           })),
           turns: [],
           status: 'running',
@@ -176,7 +177,7 @@ describe('ChatService decision model filtering', () => {
   it('filters clairic and clef models out of ChatHostState.models', async () => {
     const chatRoot = join(rootDir, 'chat');
     const paths = chatPaths(chatRoot);
-    const providers = new ProvidersService({ paths, secrets: new MemorySecretStore() });
+    const providers = new ProvidersService({ paths, secrets: new MemorySecretStore(), workPath: () => '' });
     const endpoint: InferenceEndpoint = {
       version: 1,
       pid: process.pid,

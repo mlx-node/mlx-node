@@ -142,7 +142,9 @@ function WorkHero({
   folder,
   onChooseFolder,
 }: Pick<NewScreenProps, 'providers' | 'onStarter' | 'folder' | 'onChooseFolder'>) {
-  const keyShared = providers !== null && (providers.search !== null || providers.firecrawl);
+  // Firecrawl on this Mac puts no key in the Work environment.
+  const keyShared =
+    providers !== null && (providers.search !== null || (providers.firecrawl && !providers.firecrawlLocal));
   const chosen = folder !== null && folder !== undefined;
   return (
     <div className="grid justify-items-center gap-4 text-center">

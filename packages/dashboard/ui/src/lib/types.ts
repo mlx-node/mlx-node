@@ -5,6 +5,8 @@
  * pages consume identical types; only fields the UI reads are modelled.
  */
 
+import type { UserAttachment } from '../../../src/chat/attachment-rule.js';
+
 export interface LocalModel {
   name: string;
   path: string;
@@ -436,6 +438,8 @@ export type TranscriptEntry =
       interjection?: boolean;
       /** The `continue` prompt right after a length end: drawn as a divider, not a message. */
       continued?: true;
+      /** The files and pictures sent with the message: names and sizes only, never their content. */
+      attachments?: UserAttachment[];
     }
   /** A hidden prompt the agent wrote to itself when a background event woke it. Never a message of the user. */
   | {

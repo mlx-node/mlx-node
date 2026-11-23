@@ -16,6 +16,7 @@
  * `MLX_DEV_LOAD_KERNELS=<done>/<steps>`: the heartbeat reports a load as "Preparing GPU kernels", done of steps.
  * `MLX_DEV_DISK_CACHE=native|off|older`: the disk cache the heartbeat reports (default: on, whole prompt).
  * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
+ * The start line names a fake Firecrawl on this Mac for the This Mac field of the Web Search page.
  */
 
 import { closeSync, mkdirSync, rmSync } from 'node:fs';
@@ -161,6 +162,7 @@ async function main(): Promise<void> {
     throw err;
   }
   process.stdout.write(`mlx-node Control Panel dev harness: http://127.0.0.1:${port}/  (home ${home})\n`);
+  process.stdout.write(`fake Firecrawl on this Mac: ${providers.localUrl}\n`);
 
   let stopping = false;
   const stop = async (): Promise<void> => {

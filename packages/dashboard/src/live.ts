@@ -55,6 +55,8 @@ export interface RuntimeLiveModel {
   } | null;
   /** Routed experts per layer held in memory; null when the model reports none or the engine is older. */
   experts: { inMemory: number; total: number; streaming: boolean } | null;
+  /** The loaded model's own answer to whether it takes pictures; null when it could not be asked or the engine is older. */
+  images: boolean | null;
 }
 
 export interface RuntimeLiveTurn {
@@ -292,6 +294,7 @@ function parseModel(value: unknown): RuntimeLiveModel | null {
     queueLimit,
     pool,
     experts: parseExperts(value.experts),
+    images: typeof value.images === 'boolean' ? value.images : null,
   };
 }
 

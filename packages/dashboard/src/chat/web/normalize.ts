@@ -195,13 +195,17 @@ export function searchText(
   return text;
 }
 
-/** The page result text: cleaned Markdown cut at 12,000 characters and 16,000 bytes, or `no-content` when empty. */
+/**
+ * The page result text: cleaned Markdown cut at 12,000 characters and 16,000 bytes, or `no-content` when empty.
+ * `cloudRead`: Firecrawl on this Mac handed the page to Firecrawl Cloud.
+ */
 export function pageText(
   provider: WebFetchProvider,
   url: string,
   title: unknown,
   markdown: unknown,
   keys: readonly string[],
+  cloudRead = false,
 ): string {
   const body = redactKeys(collapseBlankLines(cleanText(typeof markdown === 'string' ? markdown : '')).trim(), keys);
   if (body === '') return formatErrorText('no-content', provider);
@@ -210,6 +214,7 @@ export function pageText(
     url,
     title: field(title, TITLE_CHARS, keys),
     cut: capped.length < body.length,
+    cloudRead,
     text: capped,
   });
 }

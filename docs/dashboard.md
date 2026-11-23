@@ -215,20 +215,20 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | `⌘⇧O`     | A new conversation in the last used mode                                      |
 | `⌘K`      | The command palette (it also lists the 20 newest conversations of both modes) |
 
-| Route            | Page           | What it shows                                                                                                                                                                                                                                                                                | Data                                                                                                         |
-| ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                   | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
-| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer: model picker, web chip, (Work) folder chip (bar once set); Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work) | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
-| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                         | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
-| `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                 | `/sessions`                                                                                                  |
-| `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                      | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
-| `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                        | the six `/metrics/*` routes                                                                                  |
-| `/engine`        | Engine         | Live part: "Now" ticker, output rate, memory, turns in flight, loaded models, KV block pool. History part (1h · 6h · 24h · 7d): memory, busy time, decode batch size, model loads, processes, supervisor                                                                                     | live channel, `/runtime/series`, `/models`                                                                   |
-| `/cache`         | Cache          | Model caches (one folder per model identity under `prefix-cache/`: size, files, last use, lock; delete an idle one); cold-tier usage against quota, objects by age with an eviction preview, hit / miss trend, bytes written and restored, cold-tier health counters; evict older, clear all | `/cache`, `/cache/prefix`                                                                                    |
-| `/models`        | Models         | Local models table (also the legend of the disk-use bar), usage per model over 30 days, recommended catalog with installs; `?focus=` opens a model's drawer                                                                                                                                  | `/models`, `/catalog`, `/catalog/updates`, `/downloads`, `/metrics/summary`, `/metrics/timeseries`           |
-| `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                         | `/coding-agents`                                                                                             |
-| `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the Firecrawl switch, with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry)               | `/providers`                                                                                                 |
-| `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                          | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
+| Route            | Page           | What it shows                                                                                                                                                                                                                                                                                                                                                                               | Data                                                                                                         |
+| ---------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                                                                                                                  | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
+| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer: the + menu (files and photos, web search, crawler), model picker, (Work) folder chip (bar once set); Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work)                                                      | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
+| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                                                                                                                        | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
+| `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                                                                                                                | `/sessions`                                                                                                  |
+| `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                                                                                                                     | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
+| `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                                                                                                                       | the six `/metrics/*` routes                                                                                  |
+| `/engine`        | Engine         | Live part: "Now" ticker, output rate, memory, turns in flight, loaded models, KV block pool. History part (1h · 6h · 24h · 7d): memory, busy time, decode batch size, model loads, processes, supervisor                                                                                                                                                                                    | live channel, `/runtime/series`, `/models`                                                                   |
+| `/cache`         | Cache          | Model caches (one folder per model identity under `prefix-cache/`: size, files, last use, lock; delete an idle one); cold-tier usage against quota, objects by age with an eviction preview, hit / miss trend, bytes written and restored, cold-tier health counters; evict older, clear all                                                                                                | `/cache`, `/cache/prefix`                                                                                    |
+| `/models`        | Models         | Local models table (also the legend of the disk-use bar), usage per model over 30 days, recommended catalog with installs; `?focus=` opens a model's drawer                                                                                                                                                                                                                                 | `/models`, `/catalog`, `/catalog/updates`, `/downloads`, `/metrics/summary`, `/metrics/timeseries`           |
+| `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                                                                                                                        | `/coding-agents`                                                                                             |
+| `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the crawler choice (Firecrawl Cloud, Firecrawl on this Mac, or Off), with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry); the Firecrawl card's This Mac block (address, check, remove) | `/providers`                                                                                                 |
+| `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                                                                                                                         | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
 
 A System One run changes only the Output card. The four metric tiles are always there and show "—" when the mode
 on screen has no result. The Output status line is always there too, with three faces in one box: rest ("No run yet"
@@ -456,12 +456,160 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   puts the text back and shows the strip for its `reason` (`blockers.ts`).
 - Keys: the tooltip of the round button names its key (`Send ↵`, `Stop Esc`). The empty text field shows `⇧↵ New line`
   at the end of its first line (icons with hidden key names; not drawn under 520 px of composer).
-- Tools row: the chips, then Send / Stop in a column of its own that never shrinks. As the row gets short, first the
-  folder label shortens, then the web label, then (Work) the quantization badge goes, then the model name, each label
-  down to a floor (a label of 8 characters or fewer never shortens). A badge that does not fit whole is not
-  drawn and its room goes back to the folder and web labels (`data-fit-whole`, composer); under 520 px of composer
-  the chips are icons, under 320 px they wrap. The Bypass word and the Send button never give way. The reason Send is
-  off keeps up to two lines beside the chips.
+- Tools row: a round `+` first, then the model picker and the chips, then Send / Stop in a column of its own that never
+  shrinks. The `+` never shrinks. As the row gets short, first the folder label shortens, then (Work) the quantization
+  badge goes, then the model name, each label down to a floor (a label of 8 characters or fewer never shortens). A
+  badge that does not fit whole is not drawn and its room goes back to the folder label (`data-fit-whole`, composer);
+  under 520 px of composer the chips are icons, under 320 px they wrap. The Bypass word and the Send button never give
+  way. The reason Send is off keeps up to two lines beside the chips.
+- Tools menu (`+`; `arc-x/menu`, `pages/chat/composer-tools.tsx`): opens upward, `role="menu"`. It holds only what
+  exists: three rows. The first is Add files or photos (paperclip, `⌘U`, below). The second is Web search, whose right
+  side says the provider, `Off`, `Key rejected` or `No credit`. The third is Crawler (below). The Web search row
+  opens a panel beside it (pointer rest, click, Enter or the right arrow; the left arrow or Esc closes it) that picks
+  the search provider:
+  a list (`role="menu"`, the menu's keys) of Exa, DeepSeek, Brave and Off as `menuitemradio` rows with a check mark on
+  the one the host summary names, then the row Web Search settings, whose note names the providers with no key ("Add
+  a key for DeepSeek or Brave.", else "Keys and page reading"); it opens the Web Search page and closes both. A row
+  with no key is `aria-disabled`, says `No key`, and its name says where to add it ("DeepSeek, no key. Add it in Web
+  Search settings."). A rejected or no-credit key keeps its dot and words and can still be picked. The keys come from
+  `GET /api/providers`, read in Chat and Work each time the menu opens and again when the host summary's `search`,
+  `searchCheck`, `firecrawl`, `firecrawlLocal` or `fetch` changes while it is open; the Web search and Crawler panels
+  share that one read. Until the first read answers, or when it fails, only the current row and Off can be picked;
+  while the Keychain does not answer, a provider whose key is not known cannot be picked. A pick sends
+  `PUT /api/providers/selection` with `{search}` only (never `firecrawl` or `firecrawlLocal`); the row says
+  `Switching…` and every other row waits until the first host state after the reply, or until the reply fails. The
+  menu stays open. One caption above the list says, in this order: why a pick failed (red; it clears on the next pick
+  and when the menu closes, and the keys are read again), a key gone at app start (`vanished`, amber; a toast when the
+  menu closes before the panel opened), the Keychain (amber), `Reading keys…` / `Could not read the keys.`, a change
+  that waits for running answers. A pick that fails after the menu closed is a toast. In Work a grey line under the
+  list counts the search skills Work gets. The composer shows nothing about web search while it works or is off.
+  A rejected search key or a search account with no credit puts a 6 px dot on the `+` (danger / warning) and the
+  button's name and tooltip say it (`Tools, web search key rejected`); the dot stays search only, crawler problems
+  show on the Crawler row. Before the first host state the `+` is disabled.
+- Crawler row (FileText icon): picks who reads pages, Firecrawl Cloud, Firecrawl on this Mac (see
+  [Web search providers](#web-search-providers)) or Off. Its right side says `Off`, `Firecrawl`, `This Mac`, or a
+  problem with its dot: `Key rejected` (danger), `No credit` (warning), `Not running` (warning), `Check failed`
+  (danger). On or off and the place come from the host summary (`firecrawl`, `firecrawlLocal`); the problem words need
+  the `/api/providers` body, so they show from the menu's first read on. The panel is built like the Web search one: a
+  caption, the list "Reads pages" with the rows Firecrawl Cloud, Firecrawl on this Mac and Off (always these three,
+  in this order), a separator, then Web Search settings. Firecrawl Cloud with no key (`No key`) and Firecrawl on this
+  Mac with no saved address (`Not set up`) are `aria-disabled`, and their names say where to set them up; a row not
+  read yet is disabled unless it is the current one; a rejected key, no credit, a server that does not answer or a
+  failed check keep their dot and words and can still be picked. The Off row's second line says who reads pages then:
+  "Exa reads pages for Chat." (or DeepSeek), "Brave gives Chat page excerpts only." or "Chat cannot read pages." (no
+  search provider). The settings row's note names what is missing ("Add a Firecrawl key, or set up Firecrawl on this
+  Mac.", "Add a Firecrawl key.", "Set up Firecrawl on this Mac.", else "Keys and page reading"). A pick sends
+  `PUT /api/providers/selection` with `{firecrawl: true, firecrawlLocal: false}`, `{firecrawl: true, firecrawlLocal:
+  true}` or `{firecrawl: false}`, never `search`; the row says `Switching…` and the other rows wait until the host
+  summary shows the picked place (the HTTP reply may still wait for the Work `PATH`), or until the reply fails. The
+  check mark follows the host summary only. The caption says, in this order: why a pick failed (red; "Add a Firecrawl
+  key in Web Search settings.", "Set up Firecrawl on this Mac in Web Search settings.", the damaged-skills sentence, or
+  "Could not switch the crawler. Try again."), the Keychain, `Reading keys…` / `Could not read the keys.` (before the
+  first body), a change that waits for running answers. Opening the panel, or the `+` while Firecrawl on this Mac is
+  in use, sends `POST /api/providers/local/check`; its `local` is applied to the crawler rows
+  and the Crawler row only, and only when it is for the same address and not older than what the rows have. The Web
+  search panel never waits for that check. In Work a grey line under the list says what Work gets:
+  the Firecrawl skills with the key (the agent's commands, MCP servers and hooks can read it), the skills on this Mac
+  with no key from the app (a key saved with `firecrawl login` is still used for searches, which go to Firecrawl
+  Cloud, and Firecrawl search fails when the server runs with `FIRECRAWL_CLOUD=off`), no skills until the
+  `firecrawl` CLI is installed, skills not installed, or no skills (Off).
+- Files and photos: the row Add files or photos, `⌘U`, paste and drop on the composer all take files the same way
+  (`ui/src/lib/chat-attachments.ts`). Small UTF-8 text files work in Chat and Work; PNG, JPEG and WebP pictures work
+  in Chat when the model row of `ChatHostState.models` has `images: true`. The page reads the bytes of what was picked,
+  pasted or dropped; it never learns a path. The text file goes to the agent as one ACP `resource` block
+  (`file:///attached/<name>`, `text/plain`), a picture as one `image` block (no `uri`), both after the one text block,
+  and on the first `session/prompt` of a turn only (a Work continue sends text only). No block carries `_meta`. The
+  agent shows a file to the model as `<file_contents path="/attached/<name>">` with numbered lines.
+  - `⌘U` works from the text field, with the `+` menu open (the menu closes) and while a tooltip shows; not while a
+    dialog is open (Rename, Permission, Confirm, Settings, the palette), not while the `+` is disabled, and not with 4
+    files held. The picker is one hidden `<input type="file" multiple>` with no `accept`; after it closes or is
+    cancelled the focus goes back to the text field. Paste takes files only when the clipboard has no plain text.
+  - Row note: Chat and a model that does not see images: "Text files only. This model cannot see images."; Work: "Text
+    files only in Work"; 4 files held: the row is disabled with "Up to 4 files per message".
+  - The content decides, not the type the browser gives: only `image/png`, `image/jpeg` (also `image/jpg`) and
+    `image/webp` take the picture path and `application/pdf` is refused; every other file (`.ts` labelled
+    `video/mp2t`, `.svg`, HEIC, a zip) gets the text path. A text file is first looked at in its first 8,192 bytes, so a
+    40 MB zip says "not a text file", not "too long". A picture is always decoded and drawn again in the page
+    (`createImageBitmap` with the photo's EXIF turn applied), scaled to fit 2000 px a side and 2,400,000 px (the 8 px
+    and 512 px floor is checked on that drawn size, as the agent checks it: a 4000 x 15 strip is refused), and leaves
+    as PNG, or as JPEG (quality 0.9, 0.8, 0.7, then 0.5) for a JPEG source or a PNG over 1 MB. Its own bytes, EXIF, GPS
+    and camera data are never sent. The route checks a picture's type, base64, size and first bytes only: the redraw
+    (upright pixels, no EXIF or GPS, the pixel limits) happens in the page, the route's only caller. The agent decodes
+    every picture in full: one it cannot decode is dropped with a note to the model and the turn answers from the text;
+    one over its pixel limits is made smaller before the engine sees it.
+  - Strip (`arc-x/attachment-strip`): between the notice strip and the text field, one chip per file (thumbnail for a
+    picture, name, size, remove), one status line with the first refusal of the last add ("{n} more not added" for the
+    rest), and the caption "About N tokens". The caption turns to a warning, "The context window is nearly full.", when
+    the conversation's context plus the estimate passes 80 % of the model's window. A read that ends after the user
+    moved to another place lands in the place it started in, and its refusal shows as a toast; one that ends after its
+    conversation was deleted adds nothing. One queue serves the whole window (`attachDrafts`, `pages/chat/drafts.ts`),
+    so a read started before Chat was closed ends before the next Chat page's read starts. A read adds only what still
+    fits under 4 when it ends and refuses the rest ("Up to 4 files per message"), and the composer on screen follows
+    the store, whichever page wrote it. With files and no text
+    the field says "Add a message for these files": a message still needs text.
+  - Send is off, first match, after the reasons above: "Reading files…"; a picture in Work; a picture and a model that
+    does not see images (the picture chips say why; nothing is removed); a picture when the conversation's stored
+    pictures and the new ones pass 40 MiB of base64 (below); text plus files over 90,000 bytes; the estimate over 80 %
+    of a known window. A window the host state does not know yet blocks nothing. `send()` runs the
+    same checks, so Retry and Send again cannot pass them.
+  - Retry and Send again resend the files while this window holds them. A failed send keeps one `failed` record per
+    place (conversation or the New screen; text, files and the failure's strip, in `pages/chat/drafts.ts`). The message
+    is put back into the composer only when it has no text, no files and no file still being read; otherwise the newer
+    draft stays as it is and the strip keeps Retry. The record outlives a move to another place and closing Chat, so
+    the strip and Retry show again on return. A failure shown as a toast (a busy conversation) keeps one too when the
+    message could not be put back. Acting on the strip (Pick another, Choose folder…) takes it away: a message the
+    composer holds needs no record, one it does not keeps a Retry strip. The record goes on Retry, when a send from
+    its place goes through, when the user types into a composer the message was put back into, and when the place is
+    forgotten (a deleted conversation).
+    `lastSent` is one record per window. After a reload, or once another message was sent, the thread's button reads
+    "Send again without files" and sends the text only.
+  - Thread: the user message shows read-only chips, live and after a reload, in Chat and in the Sessions transcript,
+    whose find also matches file names. A file chip has its name and size, a picture chip "Image", its type and size
+    (the agent stores no picture name). No thumbnail in the thread: it is rebuilt from the agent's file and a picture
+    would send up to 1.3 MB on every read. A Chat conversation that holds pictures on a model that does not see
+    images shows one warning line: "This model cannot see images. The images in this conversation are left out of its
+    answers."
+
+  | Limit                                       | Value                                                                                     | Checked by                                                            |
+  | ------------------------------------------- | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+  | attachments per message                     | 4                                                                                         | page (one queue per window, held again when a read ends); route       |
+  | first look at a file that is not a picture  | 8,192 bytes; a NUL or bad UTF-8 = not a text file                                         | page                                                                  |
+  | text file                                   | 20,000 bytes with line numbers (`N→line`, as the agent renders it; about 5,000 tokens)    | page; route                                                           |
+  | message text plus all text files            | 90,000 bytes UTF-8 (the agent cuts a prompt over 100,000 bytes)                           | page; route                                                           |
+  | file name                                   | 255 characters in; stored as the base name, controls and `#"<>/\` as `_`, cut to 120      | route                                                                 |
+  | picture file picked                         | 20 MiB, PNG / JPEG / WebP                                                                 | page, before the decode                                               |
+  | picture sent                                | PNG or JPEG, ≤ 1,000,000 bytes, ≤ 2000 px a side, ≤ 2,400,000 px, ≥ 8 px a side, ≥ 512 px | page; route checks length, base64, bytes and the first bytes          |
+  | pictures                                    | Chat only, model row `images: true`                                                       | page; service (`attachment-refused`); engine (400, below)             |
+  | `/v1/messages`, `/v1/messages/count_tokens` | 16 MiB body (other engine routes 10 MiB), listed as `max_request_bytes` in `/v1/models`   | engine router; the agent drops old pictures from 13 MiB down to 8 MiB |
+  | pictures one chat keeps                     | 40 MiB of stored base64 (about 31 full-size pictures), so text and tools keep 24 MiB      | page; service (`pictures-full`): "Start a new chat to send more."     |
+  | the session file the thread is read from    | 64 MiB; past it the thread shows only "Some messages could not be read"                   | reader                                                                |
+
+  Token estimate (page only): bytes of the message and the numbered files ÷ 3, plus 2,800 per picture.
+
+  Model gate: `images` on a host state model row is the loaded model's own `supportsImages()` while it is in memory
+  (the engine's live file, per model `images`), else discovery's answer (the endpoint file). Discovery gives a
+  `qwen3_5` GGUF image support only with a sibling `mmproj-*.gguf` (`config.json` does not count), a `gemma4` GGUF only
+  with both the vision marker of its `config.json` and a sibling `mmproj-*.gguf` (its load looks for a projector only
+  then), and a `qwen3_5_moe` GGUF none (its load takes no mmproj); MLX checkpoints and Clairic keep their rule.
+  Discovery reads only the file name of the projector: one of the wrong kind or width (Qwen `projection_dim`, `gemma4v`
+  against `gemma4uv`) or a Prism-Hadamard Qwen file still reads as images until the first load. That cold turn
+  answers without the picture, then the loaded model's own answer takes over; after each unload the guess comes back.
+  A request with an image for a model whose `supportsImages()` is not true gets 400 `Could not process image: the
+  model "<id>" does not take images.` before any inference; the agent then retries the request without its images, so
+  the turn still answers. It leaves the images out of that retry only and keeps them in its history (measured with
+  `mlx-agent-v0.3.3`, its log says `payload_heuristic`), so every later turn of such a chat costs one refused request
+  and one retry, with one picture or more. A picture sent while a model change is still in flight can reach a model
+  that cannot see: the engine refuses it, the turn answers without it, and the warning line shows.
+
+  Stored: nothing new by the app. Drafts (text and files) live in this window's memory, one per place; the New screen's
+  place is shared by Chat and Work, so its files are too. The agent writes each sent block to its session folder: the
+  file text and the picture's base64 in `updates.jsonl`, the picture again in `chat_history.jsonl` and as
+  `assets/image-<uuid>.<ext>`. Only the redrawn picture is stored. `updates.jsonl` keeps every sent block, so the chip
+  stays when the agent's retry left the picture out. The reader turns stored `resource` and `image` user blocks into
+  `attachments` on the user entry (name from the `uri`, sizes from the stored text or base64); no file text and no
+  pixels cross to the page. Titles and the conversation list use the message text only. The Chat address list for
+  `web_fetch` is built from the typed text only, so an address inside a file is not opened.
+
 - Context hint: an 18 px ring just before Send / Stop, outside the box the chips shrink in, with no text. The arc
   (`--info` blue; warning from 80 %, danger from 95 %; a share above 0 shows at least a short arc) is the conversation's
   context over its model's window. The numbers are only in its tooltip and name (`Context: 11,971 of 262,144 tokens
@@ -546,8 +694,8 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   carries the smaller `totalTokens`.
 
 - Picker: the pill shows the base model and a badge with its quantization (`Qwen3.8-27B` `UD-Q4_K_XL`; the badge hides
-  under 520 px of composer, and in Work it is drawn whenever the row has room for it with the web label (and, while no
-  folder is chosen, the folder label) at their floors, else not at all; the picker, its title and its name always say
+  under 520 px of composer, and in Work it is drawn whenever the row has room for it (while no folder is chosen, with the
+  folder label at its floor), else not at all; the picker, its title and its name always say
   it),
   the title the full id. The popover has two lists: one row per base on the left, the
   quantizations of the open base on the right. A base opens on a click, `Enter`, `Space` or `→`, never on hover; a base
@@ -974,13 +1122,13 @@ and also holds other turns' decode steps.
 
 `packages/server/src/host/runtime-sampler.ts`, started by the server host; one per process.
 
-| Output                               | Content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Cadence                                                                                                  |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `live-<pid>.json` (`v: 2`)           | status, health, memory, loaded models with their KV pool, turns in flight with their phase and `waitMs` / `slotMs` / `prepareMs`, the loads in flight (`loading`: model, start, `phase` `weights` or `kernels`, `stepsDone` of `steps`, read per load path from native `loadProgress`), counters, decode rate, `stateCache: { dir, limitBytes }` (the `--cache-dir`, null for the default folder, and one open persistent state tier's limit, null when the engine's figure is a sum over two or more Qwen3.5 models, the tier is not persistent, or there is none), and per model `stateNamespace` (its open persistent state cache's folder name, from `stateTierNamespace()`; null without one); about 0.6 KB plus about 380 B per turn in flight (at most 32 listed) plus each resident model, not capped | 1 s while busy, 5 s while idle (tmp + rename), plus a write 250 ms after each turn or load start and end |
-| `<date>-<pid>.jsonl` `proc`          | host kind, version, port, wired limit, total memory, chip                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | first line of each file                                                                                  |
-| `<date>-<pid>.jsonl` `sample`        | busy time, memory, in flight, queued, resident models, turn and token deltas, `pipelinesCreatedWhileServing` (cumulative; absent while the native counter is off)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 5 s while busy, 60 s while idle, plus one on each busy flip or resident-set change                       |
-| `<date>-<pid>.jsonl` `sched`         | `schedulerStats()` snapshot of one model, plus `turns`: the turns sent to that model since its load, all lanes, counted when the call was sent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | once after each load, then once after each busy burst, only when that model is idle (see below)          |
-| `<date>-<pid>.jsonl` `load` / `exit` | one model load (with `warmupMs`, `warmupSteps`, `warmupSkipped`, `warmupReset`, `warmupPipelines`, `warmupCompileMs`, `warmupPeakBytes` when the load ran a warm-up; not indexed); process exit                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | on the event                                                                                             |
+| Output                               | Content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Cadence                                                                                                  |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `live-<pid>.json` (`v: 2`)           | status, health, memory, loaded models with their KV pool, turns in flight with their phase and `waitMs` / `slotMs` / `prepareMs`, the loads in flight (`loading`: model, start, `phase` `weights` or `kernels`, `stepsDone` of `steps`, read per load path from native `loadProgress`), counters, decode rate, `stateCache: { dir, limitBytes }` (the `--cache-dir`, null for the default folder, and one open persistent state tier's limit, null when the engine's figure is a sum over two or more Qwen3.5 models, the tier is not persistent, or there is none), and per model `stateNamespace` (its open persistent state cache's folder name, from `stateTierNamespace()`; null without one) and `images` (`supportsImages()`: false for a model with no such method, null when the call throws); about 0.6 KB plus about 380 B per turn in flight (at most 32 listed) plus each resident model, not capped | 1 s while busy, 5 s while idle (tmp + rename), plus a write 250 ms after each turn or load start and end |
+| `<date>-<pid>.jsonl` `proc`          | host kind, version, port, wired limit, total memory, chip                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | first line of each file                                                                                  |
+| `<date>-<pid>.jsonl` `sample`        | busy time, memory, in flight, queued, resident models, turn and token deltas, `pipelinesCreatedWhileServing` (cumulative; absent while the native counter is off)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 5 s while busy, 60 s while idle, plus one on each busy flip or resident-set change                       |
+| `<date>-<pid>.jsonl` `sched`         | `schedulerStats()` snapshot of one model, plus `turns`: the turns sent to that model since its load, all lanes, counted when the call was sent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | once after each load, then once after each busy burst, only when that model is idle (see below)          |
+| `<date>-<pid>.jsonl` `load` / `exit` | one model load (with `warmupMs`, `warmupSteps`, `warmupSkipped`, `warmupReset`, `warmupPipelines`, `warmupCompileMs`, `warmupPeakBytes` when the load ran a warm-up; not indexed); process exit                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | on the event                                                                                             |
 
 `schedulerStats()` is a scheduler barrier, so the sampler never calls it on a model with work: it goes through
 `SessionRegistry.tryIdleProbe`, which holds any dispatch that arrives until the reply settles. Scheduler counters are
@@ -1323,7 +1471,8 @@ class of bug is deleted rather than mitigated. What remains:
   loudly instead of returning HTML labelled `text/javascript`.
 - **The folder dialog is the only main-process surface the page adds.** The renderer posts a request id; MAIN opens
   the native folder dialog for the Control Panel window only (one at a time) and answers that id with the chosen path
-  or null. Nothing else crosses: no path goes in, no file is read.
+  or null. Nothing else crosses: no path goes in, no file is read. An attached file is read by the page from what the
+  user picked, pasted or dropped; its path is never known (see [Chat and Work](#chat-and-work)).
 - **Mutations are still the dangerous part** — model delete, cache clear, model cache delete, session rename/delete —
   and they are reachable by anything that gets the port. The port is minted
   by MAIN, transferred once to the Control Panel window it created, and consumed on receipt.
@@ -1386,8 +1535,8 @@ runs), not through the session routes.
 | ----------------------------------------------- | ------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks                                           |
 | `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                                                                   |
-| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode                                        |
-| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                                                                   |
+| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?, attachments?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode                          |
+| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text, attachments?}` → 202 `{turnId}`                                                                                                                                     |
 | `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                                                             |
 | `/api/chat/conversations/:id/runs/:runId/stop`  | POST   | transport | no body → `{}`; Stop run of one live workflow run; 404 "No such run." when the host does not hold it; 409 when the agent rejects the stop, 503 when its reply does not come |
 | `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                                                             |
@@ -1401,7 +1550,11 @@ runs), not through the session routes.
 
 Bodies hold exactly the listed fields: any other field (`_meta`, `mcpServers`, `pluginDirs`, `env`, …) is 400. Text is
 1–100,000 characters (413 above); text whose first non-space character is `/` is 400 with `reason: 'slash-text'` and
-never reaches the agent. A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
+never reaches the agent. `attachments` is a list of `{kind: 'file', name, text}` and
+`{kind: 'image', mediaType: 'image/png' | 'image/jpeg', data}` (base64, no `data:` prefix); an empty list is no list,
+and an item that breaks a limit of [Chat and Work](#chat-and-work) is 400 with `reason: 'attachment-refused'` ("The
+attached files were refused."). The service refuses a picture in Work, or for a model whose row is not `images: true`,
+the same way. A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
 `ChatFailureCode`); any other error becomes `E_UNAVAILABLE` "The agent could not be reached." and its text is dropped.
 
 Streams are not routes: `runtime.watchChat({scope: 'host'}, fn)` sends `{type: 'state'}` (coalesced to 100 ms) and
@@ -1426,8 +1579,10 @@ token (a Work command may print one), waiting at most 10 s for the Keychain.
 ## Web search providers
 
 Chat's `web_search` / `web_fetch` tools (the `mlx_web` MCP server) and the Work agent's provider skills use one
-search provider (Exa, DeepSeek or Brave: exactly one or none) and, independently, Firecrawl. When Firecrawl is on it
-does every `web_fetch`; otherwise the search provider does.
+search provider (Exa, DeepSeek or Brave: exactly one or none) and, independently, a crawler: Firecrawl Cloud (with a
+key), Firecrawl on this Mac (a `firecrawl-local serve` the user runs, below) or Off. When the crawler is on it does
+every `web_fetch`; otherwise the search provider does. Firecrawl is one provider with two places; it is on in one
+place at a time.
 
 - **Keys** live in the macOS Keychain, service `mlx-node`, accounts `search-exa-api-key`, `search-deepseek-api-key`,
   `search-brave-api-key`, `crawl-firecrawl-api-key` (`@napi-rs/keyring`). The providers service reads each once into
@@ -1435,15 +1590,21 @@ does every `web_fetch`; otherwise the search provider does.
   the hosts start with no key. While it is unavailable, each `GET /api/providers` reads every provider again (8 s
   each) and takes only the keys the cache never had; a late answer to a timed-out call is taken too. No create or load
   path calls the Keychain. A replaced or removed key stays in memory as a redaction needle until the process exits.
-- **Settings** `<chat root>/providers.json` (0600): `{version: 1, search, firecrawl, checks: {id: {status, at}}}`. No
-  key. A selection whose key is gone is cleared on start and on a Check; one cleared on start is reported once as
-  `vanished` (the first `GET` carries it). A Check that ends after a key PUT or DELETE of the same provider is
-  dropped, and a web result's `rejected` / `no-credit` is recorded only while the key that got it is still current.
-- **A new key is checked first** (Exa `GET /v0/teams/me`, DeepSeek `GET /user/balance`, Brave one `test` search,
+- **Settings** `<chat root>/providers.json` (0600): `{version: 1, search, firecrawl, firecrawlLocal, localUrl, checks:
+  {id: {status, at}}}`. No key. `firecrawlLocal` is the saved place (it stays while the crawler is Off) and is kept
+  only with a `localUrl`; `localUrl` is kept only in its saved form (below). A file that picks this Mac with an
+  address not in that form reads as Off, never as the cloud. A file without the two fields reads as
+  Firecrawl Cloud with no address. The crawler is on when `firecrawl` is set and its place is ready: a key for the
+  cloud, a saved address for this Mac. A selection whose key is gone is cleared on start and on a Check; one cleared
+  on start is reported once as `vanished` (the first `GET` carries it). A Check that ends after a key PUT or DELETE
+  of the same provider is dropped, and a web result's `rejected` / `no-credit` is recorded only while the key that got it is still current.
+- **A new key is checked first** (Exa `GET /monitors?limit=1`, where 403 `FEATURE_DISABLED` also means the key is good, DeepSeek `GET /user/balance`, Brave one `test` search,
   Firecrawl `GET /v2/team/credit-usage`, 10 s): `rejected` (401/403) is not saved and any earlier key stays;
   `no-credit` (402, or the account says so) and `unverified` (any other answer) are saved. The first search key
-  becomes the selection when none is set, and a Firecrawl key turns Firecrawl on, only when its skill folder
-  installs; otherwise the key is saved and the provider stays off.
+  becomes the selection when none is set, and a Firecrawl key turns on Firecrawl Cloud when the crawler is Off, only
+  when its skill folder installs; otherwise the key is saved and the provider stays off. While Firecrawl on this Mac
+  is in use, a new key leaves it in use: page addresses never move to a place the user did not pick. Removing the
+  Firecrawl key turns the crawler Off only when the cloud was in use.
 - **Skills** are bundled in `packages/dashboard/skills/`: `vendor/{exa,brave,firecrawl}` from pinned upstream commits
   (each with `LICENSE` and `PROVENANCE.md` listing every local edit), `own/deepseek`, and `manifest.json` (sha256 and
   size per file). Selecting a provider installs its folder into `<chat root>/plugins/<id>` (temp folder, then rename;
@@ -1454,30 +1615,122 @@ does every `web_fetch`; otherwise the search provider does.
 - **Work** gets the selected providers' key variables (`EXA_API_KEY`, `DEEPSEEK_API_KEY`,
   `BRAVE_SEARCH_API_KEY`/`BRAVE_API_KEY`, `FIRECRAWL_API_KEY`) and their skill folders. The key is readable by
   everything the Work agent runs: shell commands, MCP servers and hooks. The Firecrawl folder and `FIRECRAWL_API_KEY`
-  are passed only when a `firecrawl` executable is on the Work `PATH` (`work.missing: 'firecrawl-cli'` otherwise); the
-  app never installs the CLI.
+  are passed only when a `firecrawl` executable is on the `PATH` a Work command gets (`work.missing: 'firecrawl-cli'`
+  otherwise); the app never installs the CLI. An inherited `FIRECRAWL_API_URL` is always removed. With Firecrawl
+  Cloud, Work gets `FIRECRAWL_API_URL=https://api.firecrawl.dev` next to the key, so an address the CLI saved itself
+  (`firecrawl config --api-url`) does not get the key. With Firecrawl on this Mac, Work gets
+  `FIRECRAWL_API_URL=<saved address>` and no `FIRECRAWL_API_KEY`; a key the CLI saved itself (`firecrawl login`) can
+  still be used by it, and the local server passes it on to Firecrawl Cloud for searches. `~/.zshenv` can still set
+  either name again (each command runs with `$SHELL -c`, below). That `PATH` is not the app's own (an app started from Finder has
+  `/usr/bin:/bin:/usr/sbin:/sbin`): `mlx-agent` asks the user's login shell (`$SHELL -lc`, with `~/.zshrc` or
+  `~/.bashrc` sourced, 5 s limit), puts its own entries after the answer, and runs each command with `$SHELL -c`, which
+  reads `~/.zshenv` or `$BASH_ENV` once more. `chat/agent/work-path.ts` asks the same two questions and reads back only
+  `$PATH`. It asks only while Firecrawl is on: once when the providers service starts, and again on
+  `GET /api/providers` (at most once in 15 s) and on a route that turns Firecrawl on while the CLI is not found. No
+  host start and no turn waits for it; until the first answer the CLI counts as not found, and the answer restarts idle hosts as any change
+  does. A login shell that fails or is too slow gives the app's own `PATH`, as in the agent. A login shell close to
+  the 5 s limit can still read as found while the agent's capture times out (the agent runs a second copy of the rc
+  files beside it for its alias snapshot). The file follows `capture_login_env` and `spawn_static_command` of
+  mlx-agent v0.3.3 (`xai-grok-tools/src/computer/local/terminal.rs`); read them again when the agent release moves,
+  and run row U16 of the live smoke.
 - **Chat** never sees a key in a prompt or argv: `mlx_web` gets it in its per-session MCP `env`
-  (`MLX_WEB_SEARCH_PROVIDER`, `MLX_WEB_SEARCH_KEY`, `MLX_WEB_FETCH_PROVIDER`, `MLX_WEB_FETCH_KEY`). The server talks
-  only to the four fixed provider hosts, with no redirects (a 3xx is `provider-error`), a 15 s (search) / 30 s
+  (`MLX_WEB_SEARCH_PROVIDER`, `MLX_WEB_SEARCH_KEY`, `MLX_WEB_FETCH_PROVIDER`, `MLX_WEB_FETCH_KEY`,
+  `MLX_WEB_FETCH_URL`). `MLX_WEB_FETCH_URL` is the saved address while Firecrawl on this Mac is in use, else empty; the
+  server keeps it only with the fetch provider `firecrawl` and only in the saved form, and whenever it is set the
+  fetch key reads empty, so a page read meant for this Mac never goes to the cloud. The server talks only to the four
+  fixed provider hosts and that address, with no redirects (a 3xx is `provider-error`), a 15 s (search) / 30 s
   (fetch) timeout and a 2 MiB reply cap; `web_fetch` refuses local names, private and special IPv4 ranges, IP literals
   in brackets, user info, empty host labels, white space, control characters, backslashes and non-ASCII before the
   path, before any call, and forwards the address without its fragment.
-- **A change** (key, selection, a late Keychain answer) marks both agent hosts stale: each restarts when no turn is in
-  flight (`applyPending` while one is).
+- **Firecrawl on this Mac** (`src/chat/web/local.ts`): Firecrawl Local (crate `firecrawl-local`, AGPL-3.0, one
+  binary; `firecrawl-local serve` answers part of the Firecrawl v2 API on `http://127.0.0.1:3002` with no key). The
+  user installs and starts it; the app only talks to it.
+  - Address rule: `http://`, host `127.0.0.1`, `localhost` or `[::1]`, an explicit port 1024-65535, nothing after the
+    port but one `/`; no user info, query or hash. Saved as `http://127.0.0.1:<port>` (`localhost` is rewritten) or
+    `http://[::1]:<port>`. Everything else (https, LAN addresses, other `127.x` addresses, ports below 1024) is
+    refused. Why: http is safe only when the bytes never leave the Mac; a LAN or remote base would let a settings
+    value aim the fetch at any host and send page addresses in clear text; `serve` off loopback needs a token the
+    app does not store; an IP literal means no name lookup can move the target. The paths are fixed in code, and no
+    request to the server carries an Authorization header (the server would pass a caller's key on to Firecrawl
+    Cloud).
+  - The check, three requests to the saved address: `GET /health` (2 s) must answer 200 JSON with `engine:
+    "firecrawl-local"` (else `not-firecrawl`; no answer `not-running`; 401 `token`). Then a scrape of the server's
+    own `<address>/health` (5 s), a loopback target it must refuse with 403 `BLOCKED_TARGET`; any other answer is
+    `open` (started with `--allow-private`). A refused target is never handed to Firecrawl Cloud. Then
+    `GET /v2/team/credit-usage` with `Sec-Fetch-Site: cross-site` (2 s), which the server refuses itself, so nothing
+    leaves the Mac: 501 `CLOUD_ONLY` means its Cloud hand-off is off, 403 `CROSS_SITE_REQUEST` means a page it
+    cannot load is sent to Firecrawl Cloud (`cloud: 'fallback'`); anything else is not known. The version is kept
+    only when it is digits and dots.
+  - When it runs: on Check and save (only `ok` is saved; the earlier address and the selection stay otherwise); on
+    `POST /api/providers/local/check` (Check again on the page; the `+` menu, see the Crawler row); in
+    the background at providers start and on `GET /api/providers`, at most once in 15 s. `GET /api/providers` never
+    waits for it and answers with the last result (`local.check` is null until the first check of the saved address
+    ends). A check of the same address that is already running is joined. In the `mlx_web` server before every page
+    read on this Mac (the first two requests, inside the call slot): anything but `ok` returns `WEB_ERROR local-down`
+    and no page address is sent.
+  - A saved address turns on Firecrawl on this Mac only when the crawler is Off; while Firecrawl Cloud is in use it
+    stays in use until the user picks this Mac. Removing the address turns the crawler Off when it was in use; it
+    never moves to the cloud.
+  - Chat's page read: `POST <address>/v2/scrape` with the cloud body, no Authorization header. No connection or 401
+    gives `local-down`, 403 gives `blocked`, `data.blocked` gives `no-content`. A page the server handed to Firecrawl
+    Cloud (`data.source: "firecrawl-cloud"`) gets the result line `note: read by Firecrawl Cloud`, and its tool row
+    says "read by Firecrawl Cloud". A `local-down` row offers the Web Search settings link. The app's own
+    rules run first, as with the cloud: the `web_fetch` address checks and the Chat address ledger (only addresses
+    from the user or from search results).
+  - What leaves this Mac: no page address goes to a provider; this Mac fetches the page, so the site sees the user's
+    IP address. Pages open only to the user's network (office, VPN) can be read, and pages that need JavaScript run
+    in a Chrome on this Mac. The server's own rule refuses private addresses (also after DNS and on every redirect)
+    and nothing more; for network-position access the Chat address ledger is the control. Without
+    `FIRECRAWL_CLOUD=off`, a page the server cannot load is sent to Firecrawl Cloud. Another program listening on the
+    saved port and answering like Firecrawl Local would get the page addresses Chat reads: same-machine trust, as for
+    any loopback server.
+  - What does not work on this Mac: search (it always goes to Firecrawl Cloud; with `FIRECRAWL_CLOUD=off` the CLI's
+    search fails), JSON and summary formats, browser actions. Chat only uses page text, so Chat loses nothing.
+  - The Web Search page: the Use panel's second list, "Crawler · One at a time", shows Firecrawl Cloud only with a
+    key, Firecrawl on this Mac only with a saved address, and Off (its note says who reads pages then); with neither
+    set up one sentence stands in place of the list. The Firecrawl card's This Mac block, not set up: an address
+    field prefilled with `http://127.0.0.1:3002`, Check and save, "Needs Rust and a C compiler (xcode-select
+    --install).", the guide link, and `cargo install firecrawl-local` and `FIRECRAWL_CLOUD=off firecrawl-local serve`
+    with copy buttons. A typed address the rule refuses sends nothing. Saved: the address, a badge (Running, Not
+    running, Check failed, Not checked) and the check's sentence, the Cloud hand-off line with the start command when
+    `cloud` is `fallback`, then Check again, Replace and Remove. The block and the Crawler list work while the
+    Keychain is down (this Mac needs no key, and Firecrawl Cloud is listed only with its key in the cache); the search
+    list is locked then. While this Mac is in use the card's Work notice says the CLI talks to this address with no key from the
+    app, and "What leaves this Mac" adds the local sentence while an address is saved.
+  - Not done, each a separate decision:
+    - Bundling, installing or starting the server: AGPL-3.0 needs a legal decision, and there is no prebuilt binary.
+    - A server on the LAN or the internet, or https: refused by the address rule.
+    - `serve --token`: it would need a second stored secret.
+    - The Docker Compose self-host: it fails the engine check, and how it treats private addresses was not read.
+    - Local search: search always needs Firecrawl Cloud.
+    - A dot on the `+` and a live `Not running` in the host summary: the Crawler row shows it after the menu's check.
+    - Flagging `--api-url` in the Work command guard: in cloud mode such a command could send the key elsewhere.
+- **A change** (key, address, selection, a late Keychain answer) marks both agent hosts stale: each restarts when no
+  turn is in flight (`applyPending` while one is). A local check never does. The selection is also changed from the
+  composer's `+` menu: the Web search panel sends `search` only, the Crawler panel `firecrawl` and `firecrawlLocal`
+  only.
 
-| Route                         | Method | Body                                      | Reply                                       |
-| ----------------------------- | ------ | ----------------------------------------- | ------------------------------------------- |
-| `/api/providers`              | GET    |                                           | `ProvidersResponse`                         |
-| `/api/providers/:id/key`      | PUT    | `{key}`                                   | `{saved, check, providers}`                 |
-| `/api/providers/:id/key`      | DELETE |                                           | `ProvidersResponse`                         |
-| `/api/providers/:id/validate` | POST   |                                           | `{check, providers}` (`check` null: no key) |
-| `/api/providers/selection`    | PUT    | `{search?: id \| null, firecrawl?: bool}` | `ProvidersResponse`                         |
+| Route                         | Method | Body                                                             | Reply                                           |
+| ----------------------------- | ------ | ---------------------------------------------------------------- | ----------------------------------------------- |
+| `/api/providers`              | GET    |                                                                  | `ProvidersResponse`                             |
+| `/api/providers/:id/key`      | PUT    | `{key}`                                                          | `{saved, check, providers}`                     |
+| `/api/providers/:id/key`      | DELETE |                                                                  | `ProvidersResponse`                             |
+| `/api/providers/:id/validate` | POST   |                                                                  | `{check, providers}` (`check` null: no key)     |
+| `/api/providers/selection`    | PUT    | `{search?: id \| null, firecrawl?: bool, firecrawlLocal?: bool}` | `ProvidersResponse`                             |
+| `/api/providers/local`        | PUT    | `{url}`                                                          | `{saved, check, providers}`                     |
+| `/api/providers/local`        | DELETE |                                                                  | `ProvidersResponse`                             |
+| `/api/providers/local/check`  | POST   |                                                                  | `{check, providers}` (`check` null: no address) |
 
-All run on the transport thread. Errors: `E_BAD_REQUEST` "That does not look like an API key." (the key is never
-quoted) or an unknown field; `E_NOT_FOUND` for an unknown provider id; `E_CONFLICT` "Add a key for X first.";
-`E_UNAVAILABLE` with `reason: 'keychain-unavailable'` or `'skill-bundle-corrupt'`; `E_INTERNAL` "The key changed, but
-the settings could not be saved." when a key PUT or DELETE changed the Keychain but not `providers.json` (the hosts
-are still told). The page's types are
+`ProvidersResponse` carries `firecrawlLocal` (Firecrawl on this Mac is in use) and `local: {url, check, checkedAt,
+version, cloud}`; the host summary carries `firecrawlLocal` the same way. All run on the transport thread. Errors:
+`E_BAD_REQUEST` "That does not look like an API key." (the key is never quoted), "Use an address on this Mac." (the
+address is never quoted) or an unknown field; `E_NOT_FOUND` for an unknown provider id; `E_CONFLICT` "Add a key for X
+first.", or "Set up Firecrawl on this Mac first." with `reason: 'local-not-set-up'`; `E_UNAVAILABLE` with
+`reason: 'keychain-unavailable'` or `'skill-bundle-corrupt'`; `E_INTERNAL` "The key changed, but the settings could
+not be saved." when a key PUT or DELETE changed the Keychain but not `providers.json` (the hosts are still told); any
+other failure of a local route is "Firecrawl on this Mac could not be checked.". The page's types are
 `ui/src/lib/providers-types.ts`, a copy of `src/chat/providers/types.ts`. The dev harness keeps keys in memory and
 points every provider at fake servers on 127.0.0.1 (a key starting `bad` is rejected, `nocredit` has no credit,
-`slow` times out the check).
+`slow` times out the check). It also starts a fake Firecrawl Local on a loopback port and prints its address at start
+(`fake Firecrawl on this Mac: <url>`); typed into the This Mac field it passes the check, and any other loopback port
+reads not running.

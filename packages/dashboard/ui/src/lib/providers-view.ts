@@ -2,7 +2,15 @@
 
 import { formatCount, formatDay, formatRelativeTime } from './format';
 import { PROVIDERS } from './providers-strings';
-import type { ProviderId, ProviderState, ProvidersResponse, SearchProviderId } from './providers-types';
+import type {
+  LocalCheck,
+  LocalFirecrawl,
+  ProviderId,
+  ProviderSelectionInput,
+  ProviderState,
+  ProvidersResponse,
+  SearchProviderId,
+} from './providers-types';
 
 export const SEARCH_IDS: readonly SearchProviderId[] = ['exa', 'deepseek', 'brave'];
 export const PROVIDER_ORDER: readonly ProviderId[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
@@ -22,6 +30,42 @@ export const BILLING_PAGES: Readonly<Record<ProviderId, string>> = {
   brave: 'https://api-dashboard.search.brave.com',
   firecrawl: 'https://www.firecrawl.dev/app',
 };
+
+/** The address `firecrawl-local serve` listens on by default. */
+export const LOCAL_DEFAULT_URL = 'http://127.0.0.1:3002';
+export const LOCAL_GUIDE = 'https://docs.firecrawl.dev/quickstarts/firecrawl-local';
+
+/**
+ * The SPA's copy of `parseLocalAddress` in `src/chat/web/local.ts`, pinned to it by test: the saved form of a typed
+ * address, or null. `http://` then `127.0.0.1`, `localhost` or `[::1]` with a port from 1024 to 65535 and at most a
+ * trailing `/`; `localhost` is saved as `127.0.0.1`.
+ */
+export function parseLocalAddress(raw: string): string | null {
+  const text = raw.trim();
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    // White space, controls, non-ASCII, `\`, `@` (user info), `?` and `#`.
+    if (c <= 0x20 || c >= 0x7f || c === 0x5c || c === 0x40 || c === 0x3f || c === 0x23) return null;
+  }
+  if (text.slice(0, 7).toLowerCase() !== 'http://') return null;
+  const rest = text.slice(7);
+  const slash = rest.indexOf('/');
+  const authority = slash === -1 ? rest : rest.slice(0, slash);
+  const tail = slash === -1 ? '' : rest.slice(slash);
+  if (authority === '' || (tail !== '' && tail !== '/')) return null;
+  let url: URL;
+  try {
+    url = new URL(`http://${authority}/`);
+  } catch {
+    return null;
+  }
+  if (url.port === '') return null;
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port < 1024 || port > 65_535) return null;
+  if (url.hostname === '[::1]') return `http://[::1]:${port}`;
+  if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return `http://127.0.0.1:${port}`;
+  return null;
+}
 
 /** `{name}` placeholders filled from `values`; an unknown name stays as written. */
 export function fill(template: string, values: Readonly<Record<string, string | number>>): string {
@@ -72,17 +116,20 @@ export interface Line {
 export function chatLines(data: ProvidersResponse): Line[] {
   const search = data.search;
   const fetch = data.fetch;
+  const reader = data.firecrawlLocal ? PROVIDERS.crawlerLocal : providerName('firecrawl');
   let text: string = PROVIDERS.chatOff;
   if (search !== null && fetch === 'firecrawl') {
-    text = fill(PROVIDERS.chatBoth, { search: providerName(search), fetch: providerName('firecrawl') });
+    text = fill(PROVIDERS.chatBoth, { search: providerName(search), fetch: reader });
   } else if (search !== null) {
     text = search === 'brave' ? PROVIDERS.chatBrave : fill(PROVIDERS.chatSame, { search: providerName(search) });
   } else if (fetch === 'firecrawl') {
-    text = PROVIDERS.chatPagesOnly;
+    text = fill(PROVIDERS.chatPagesOnly, { fetch: reader });
   }
   const lines: Line[] = [{ text }];
   for (const p of data.providers) {
     if (!p.selected) continue;
+    // Firecrawl on this Mac uses no key, so the state of a saved key says nothing about page reads.
+    if (p.id === 'firecrawl' && data.firecrawlLocal) continue;
     if (p.check === 'rejected')
       lines.push({ text: fill(PROVIDERS.nowRejected, { provider: providerName(p.id) }), tone: 'danger' });
     if (p.check === 'no-credit')
@@ -179,10 +226,70 @@ export function skillSource(p: ProviderState): string {
   return fill(PROVIDERS.skillsSource, { repo: up.repo, commit: up.commit.slice(0, 7), license: up.license });
 }
 
-/** Whether this provider's key reaches the Work agent now: the selected search provider; Firecrawl when its skills do. */
-export function keyReachesWork(p: ProviderState): boolean {
-  if (p.id === 'firecrawl') return p.configured && p.selected && p.work.ready;
+/**
+ * Whether this provider's key reaches the Work agent now: the selected search provider; Firecrawl when its skills do
+ * and it reads pages in Firecrawl Cloud.
+ */
+export function keyReachesWork(p: ProviderState, data: ProvidersResponse): boolean {
+  if (p.id === 'firecrawl') return p.configured && p.selected && p.work.ready && !data.firecrawlLocal;
   return p.configured && p.selected;
+}
+
+/** Whether Work's firecrawl CLI is pointed at Firecrawl on this Mac now. */
+export function localReachesWork(p: ProviderState, data: ProvidersResponse): boolean {
+  return p.id === 'firecrawl' && data.firecrawlLocal && p.work.ready;
+}
+
+/** The option of the Crawler list in use. */
+export type CrawlerValue = 'cloud' | 'local' | 'off';
+
+/** The selection body of each Crawler option, the same from the Web Search page and the `+` menu. */
+export const CRAWLER_BODIES: Readonly<Record<CrawlerValue, ProviderSelectionInput>> = {
+  cloud: { firecrawl: true, firecrawlLocal: false },
+  local: { firecrawl: true, firecrawlLocal: true },
+  off: { firecrawl: false },
+};
+
+/** From a `/providers` body or the host summary: both carry `firecrawl` and `firecrawlLocal` (in use). */
+export function crawlerValue(data: Pick<ProvidersResponse, 'firecrawl' | 'firecrawlLocal'>): CrawlerValue {
+  if (!data.firecrawl) return 'off';
+  return data.firecrawlLocal ? 'local' : 'cloud';
+}
+
+/** Who reads pages for Chat when the crawler is off: the search provider, Brave's excerpts, or nobody. */
+export function crawlerOffNote(search: SearchProviderId | null): string {
+  if (search === null) return PROVIDERS.crawlerOffNone;
+  if (search === 'brave') return PROVIDERS.crawlerOffExcerpts;
+  return fill(PROVIDERS.crawlerOffReads, { provider: providerName(search) });
+}
+
+/** What a failed check of Firecrawl on this Mac found, in one sentence. */
+export function localProblem(check: Exclude<LocalCheck, 'ok'>): string {
+  if (check === 'not-running') return PROVIDERS.localNotRunning;
+  if (check === 'not-firecrawl') return PROVIDERS.localNotFirecrawl;
+  if (check === 'open') return PROVIDERS.localOpen;
+  return PROVIDERS.localToken;
+}
+
+export type LocalBadge = 'running' | 'not-running' | 'check-failed' | 'unchecked';
+
+/** The badge of a saved address: `unchecked` until the first check of it ends. */
+export function localBadge(local: LocalFirecrawl): LocalBadge {
+  if (local.check === null) return 'unchecked';
+  if (local.check === 'ok') return 'running';
+  return local.check === 'not-running' ? 'not-running' : 'check-failed';
+}
+
+/** The line under a saved address: the version when it runs, or what the last check found. */
+export function localLine(local: LocalFirecrawl): Line | null {
+  if (local.check === null) return null;
+  if (local.check === 'ok') {
+    return {
+      text:
+        local.version === null ? PROVIDERS.localRunningPlain : fill(PROVIDERS.localRunning, { version: local.version }),
+    };
+  }
+  return { text: localProblem(local.check), tone: local.check === 'not-running' ? 'warning' : 'danger' };
 }
 
 export interface Progress {

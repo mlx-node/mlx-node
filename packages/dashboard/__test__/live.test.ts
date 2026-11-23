@@ -57,6 +57,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         pool: { at: T - 1000, blockCapacity: 100, allocatedBlocks: 10, freeBlocks: 80, reclaimableBlocks: 10 },
         stateNamespace: null,
         experts: null,
+        images: true,
       },
     ],
     turns: [
@@ -320,6 +321,26 @@ describe('live: watcher', () => {
       ['over', null],
       ['zero', null],
       ['half', null],
+      ['text', null],
+    ]);
+  });
+
+  it("reads the loaded model's image answer; an older engine or a value that is not a boolean reads as null, the model stays", () => {
+    const model = liveFile(31).models[0]!;
+    const { images: _images, ...older } = model;
+    const rows = [
+      { ...model, name: 'sees', images: true },
+      { ...model, name: 'blind', images: false },
+      { ...older, name: 'older' },
+      { ...model, name: 'unknown', images: null },
+      { ...model, name: 'text', images: 'yes' },
+    ];
+    const parsed = parseLiveFile({ ...liveFile(31), models: rows });
+    expect(parsed?.models.map((m) => [m.name, m.images])).toEqual([
+      ['sees', true],
+      ['blind', false],
+      ['older', null],
+      ['unknown', null],
       ['text', null],
     ]);
   });

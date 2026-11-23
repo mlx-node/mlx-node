@@ -8,8 +8,9 @@
 import { braveFetch, braveSearch } from './adapters/brave.js';
 import { deepseekFetch, deepseekSearch } from './adapters/deepseek.js';
 import { exaFetch, exaSearch } from './adapters/exa.js';
-import { firecrawlFetch } from './adapters/firecrawl.js';
+import { firecrawlFetch, firecrawlLocalFetch } from './adapters/firecrawl.js';
 import { type AdapterContext, PROVIDER_ORIGINS, type SearchArgs } from './http.js';
+import { checkLocal, localOrigin } from './local.js';
 import { redactKeys } from './normalize.js';
 import { formatErrorText, type WebFetchProvider, type WebSearchProvider } from './result-text.js';
 import { fetchAllowed, forwardedAddress } from './url-policy.js';
@@ -59,20 +60,29 @@ export interface WebConfig {
   searchKey: string;
   fetchProvider: WebFetchProvider | 'none';
   fetchKey: string;
+  /** The saved address of Firecrawl on this Mac, or '' for the provider's own servers. */
+  fetchUrl: string;
 }
 
 const SEARCH_IDS: readonly string[] = ['exa', 'deepseek', 'brave'];
 const FETCH_IDS: readonly string[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
 
-/** The four `MLX_WEB_*` variables; an unknown provider reads as `none`. */
+/**
+ * The five `MLX_WEB_*` variables; an unknown provider reads as `none`. `MLX_WEB_FETCH_URL` is kept only for Firecrawl
+ * and only in the exact saved form of a loopback address; whenever it is set the fetch key reads '', so a page read
+ * meant for this Mac never falls back to a provider with a key.
+ */
 export function readWebConfig(env: NodeJS.ProcessEnv): WebConfig {
   const search = env.MLX_WEB_SEARCH_PROVIDER ?? '';
   const fetch = env.MLX_WEB_FETCH_PROVIDER ?? '';
+  const fetchProvider = FETCH_IDS.includes(fetch) ? (fetch as WebFetchProvider) : 'none';
+  const rawUrl = env.MLX_WEB_FETCH_URL ?? '';
   return {
     searchProvider: SEARCH_IDS.includes(search) ? (search as WebSearchProvider) : 'none',
     searchKey: env.MLX_WEB_SEARCH_KEY ?? '',
-    fetchProvider: FETCH_IDS.includes(fetch) ? (fetch as WebFetchProvider) : 'none',
-    fetchKey: env.MLX_WEB_FETCH_KEY ?? '',
+    fetchProvider,
+    fetchKey: rawUrl === '' ? (env.MLX_WEB_FETCH_KEY ?? '') : '',
+    fetchUrl: fetchProvider === 'firecrawl' ? (localOrigin(rawUrl) ?? '') : '',
   };
 }
 
@@ -140,7 +150,10 @@ export function scrubKeys(text: string, keys: readonly string[]): string {
   return redactKeys(text, keys);
 }
 
-/** Where the provider calls go. Production uses the fixed provider origins; tests pass loopback fakes. */
+/**
+ * Where the provider calls go. Production uses the fixed provider origins; tests pass loopback fakes. Firecrawl on
+ * this Mac is the one exception: its base is `WebConfig.fetchUrl`, never this table.
+ */
 export interface WebDeps {
   fetch: typeof fetch;
   baseUrls: Readonly<Record<WebFetchProvider, string>>;
@@ -170,10 +183,13 @@ export class WebTools {
   private inFlight = 0;
   private readonly config: WebConfig;
   private readonly deps: WebDeps;
+  /** Firecrawl on this Mac, or null. */
+  private readonly localBase: string | null;
 
   constructor(config: WebConfig, deps: WebDeps = PRODUCTION_DEPS) {
     this.config = config;
     this.deps = deps;
+    this.localBase = config.fetchProvider === 'firecrawl' ? localOrigin(config.fetchUrl) : null;
   }
 
   definitions(): readonly unknown[] {
@@ -193,8 +209,20 @@ export class WebTools {
     const provider = this.config.fetchProvider;
     const parsed = fetchArgs(args);
     if (parsed === null) return formatErrorText('bad-request', provider);
-    if (provider === 'none' || this.config.fetchKey === '') return notConfigured();
+    const local = this.localBase;
+    if (provider === 'none') return notConfigured();
+    // A fetch URL that is not Firecrawl on this Mac never falls back to a provider's own servers.
+    if (local === null && (this.config.fetchUrl !== '' || this.config.fetchKey === '')) return notConfigured();
     if (!fetchAllowed(parsed.url)) return formatErrorText('blocked', provider);
+    if (local !== null) {
+      const ctx: AdapterContext = { ...this.context(provider, ''), baseUrl: local };
+      return this.run(provider, async () => {
+        // Before every read: the server could have been restarted with --allow-private since the last one.
+        const { check } = await checkLocal(local, { fetch: this.deps.fetch, readCloud: false });
+        if (check !== 'ok') return formatErrorText('local-down', 'firecrawl');
+        return firecrawlLocalFetch(parsed.url, ctx);
+      });
+    }
     const ctx = this.context(provider, this.config.fetchKey);
     return this.run(provider, () => FETCH[provider](parsed.url, ctx));
   }

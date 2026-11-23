@@ -70,6 +70,7 @@ import {
 } from '../lib/web-tools';
 import { type WorkCall, workCallOf } from '../lib/work-tools';
 import { useScrollRoot } from '../shell/scroll-root';
+import { AttachmentStrip, sentChips } from './arc-x/attachment-strip/attachment-strip';
 import { ButtonLink } from './arc-x/button-link/button-link';
 import { ChatMarkdown, type LinkRule } from './arc-x/chat-markdown/chat-markdown';
 import { CodePanel } from './arc-x/code-panel/code-panel';
@@ -133,6 +134,8 @@ export interface ChatThreadProps {
   /** Where "Inspect" goes from the transcript error. */
   inspectHref?: string;
   onTurnAction?: (action: TurnAction) => void;
+  /** The message text whose files the page still holds for this conversation: Send again sends them with it. */
+  keptFor?: string | null;
   /** Why the turn actions are off now (the engine is stopped). */
   actionDisabledReason?: string;
   /** One status sentence for the page's polite live region. */
@@ -307,7 +310,10 @@ function WebRow(props: {
     detail = resultCountText(result.results.length);
     body = <WebBody result={result} raw={entry.output} />;
   } else if (result.kind === 'page') {
-    detail = result.cut ? CHAT.cut : undefined;
+    const notes: string[] = [];
+    if (result.cloudRead) notes.push(CHAT.readByCloud);
+    if (result.cut) notes.push(CHAT.cut);
+    detail = notes.length === 0 ? undefined : notes.join(', ');
     body = <WebBody result={result} raw={entry.output} />;
   }
   return (
@@ -489,6 +495,7 @@ interface TurnViewProps {
   shownText: Map<number, string>;
   actionDisabledReason: string | undefined;
   onTurnAction: ((action: TurnAction) => void) | undefined;
+  keptFor: string | null;
   unload: UnloadControl | undefined;
   turnMarks: TurnMarks | undefined;
 }
@@ -536,8 +543,15 @@ function sameTurn(prev: TurnViewProps, next: TurnViewProps): boolean {
     prev.liveFrom === next.liveFrom &&
     prev.actionDisabledReason === next.actionDisabledReason &&
     prev.onTurnAction === next.onTurnAction &&
+    prev.keptFor === next.keptFor &&
     prev.turnMarks?.key === next.turnMarks?.key
   );
+}
+
+/** The turn's prompt was sent with files or pictures. */
+function turnHasFiles(turn: ThreadTurn): boolean {
+  const user = turn.entries.find((entry) => entry.kind === 'user');
+  return user?.kind === 'user' && user.attachments !== undefined && user.attachments.length > 0;
 }
 
 const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
@@ -699,7 +713,14 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
             enter={at >= props.liveFrom}
             footer={<CopyButton value={entry.text} label={CHAT.copyMessage} iconOnly variant="plain" />}
           >
-            <ExpandableText lines={12}>{entry.text}</ExpandableText>
+            {entry.attachments !== undefined && entry.attachments.length > 0 ? (
+              <div className="grid gap-2">
+                {entry.text !== '' ? <ExpandableText lines={12}>{entry.text}</ExpandableText> : null}
+                <AttachmentStrip readOnly items={sentChips(entry.attachments)} />
+              </div>
+            ) : (
+              <ExpandableText lines={12}>{entry.text}</ExpandableText>
+            )}
           </Message>,
         );
         break;
@@ -824,9 +845,14 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
     if (props.isLast && outcome !== null && outcome.action !== null && onTurnAction !== undefined) {
       const disabled = props.actionDisabledReason !== undefined && outcome.action !== 'update-agent';
       const base = { disabled, disabledReason: props.actionDisabledReason };
-      if (outcome.action === 'send-again' && prompt !== null)
-        action = { ...base, label: CHAT.sendAgain, onSelect: () => onTurnAction({ kind: 'send-again', text: prompt }) };
-      else if (outcome.action === 'continue')
+      if (outcome.action === 'send-again' && prompt !== null) {
+        const filesLost = turnHasFiles(turn) && props.keptFor !== prompt;
+        action = {
+          ...base,
+          label: filesLost ? CHAT.sendAgainNoFiles : CHAT.sendAgain,
+          onSelect: () => onTurnAction({ kind: 'send-again', text: prompt }),
+        };
+      } else if (outcome.action === 'continue')
         action = {
           ...base,
           label: CHAT.continueAnswer,
@@ -1304,6 +1330,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
               shownText={shownText}
               actionDisabledReason={props.actionDisabledReason}
               onTurnAction={props.onTurnAction}
+              keptFor={isLast ? (props.keptFor ?? null) : null}
               unload={isLast ? props.unload : undefined}
               turnMarks={turnMarks?.get(turn.start)}
             />

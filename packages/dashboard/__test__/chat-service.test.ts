@@ -22,9 +22,11 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { ApiError } from '../src/api/errors.js';
+import { promptParams } from '../src/chat/agent/profiles.js';
+import { attachmentView, type AttachmentInput, CHAT_PICTURES_MAX_BASE64 } from '../src/chat/attachment-rule.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
-import { ProvidersService } from '../src/chat/providers/service.js';
+import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
 import { routeError } from '../src/chat/route-errors.js';
 import type { ChatService } from '../src/chat/service.js';
 import type { ChatHostEvent, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
@@ -43,6 +45,7 @@ import {
   type Json,
 } from './helpers/chat-fake.js';
 import { UNLOAD_PATH } from './helpers/fake-engine.js';
+import { fakeLocalAnswers, fakeLocalScript, startFakeProvider } from './helpers/fake-providers.js';
 import { live, liveModel, liveTurn, process as liveProcess } from './helpers/observability-fixtures.js';
 
 const BASIC = [
@@ -927,6 +930,140 @@ describe('Chat service — engine facts and unload', () => {
       await fake.close();
     }
   });
+
+  it("takes a model's image support from the loaded model's own answer first, then the endpoint file, else none", async () => {
+    const seen = (name: string, images: boolean | null) => Object.assign(liveModel(name), { images });
+    const snapshot = live({
+      processes: [
+        liveProcess({
+          pid: process.pid,
+          loading: [],
+          models: [seen('said-no', false), seen('said-yes', true), seen('not-asked', null)],
+        }),
+      ],
+    }) as unknown as RuntimeLive;
+    const fake = fakeService('chat-basic', {
+      mutate: scripted,
+      endpointModels: [
+        { ...endpointModel('said-no', '/models/a'), images: true },
+        { ...endpointModel('said-yes', '/models/b'), images: false },
+        { ...endpointModel('not-asked', '/models/c'), images: true },
+        { ...endpointModel('on-disk', '/models/d'), images: true },
+        endpointModel('unknown', '/models/e'),
+      ],
+      live: { subscribe: () => () => {}, readNow: async () => snapshot },
+    });
+    try {
+      expect((await fake.service.state()).models.map((m) => [m.id, m.images])).toEqual([
+        ['said-no', false],
+        ['said-yes', true],
+        ['not-asked', true],
+        ['on-disk', true],
+        ['unknown', false],
+      ]);
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+describe('Chat service — attachments', () => {
+  const FILE: AttachmentInput = { kind: 'file', name: 'notes.md', text: '# notes\n' };
+  const PICTURE: AttachmentInput = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' };
+  const SEES = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), images: true };
+  const BLIND = endpointModel('qwen3.5-9b', '/models/qwen3.5-9b');
+  const refusedAs = (error: ApiError) => [error.code, error.reason, error.message];
+  const REFUSED = ['E_BAD_REQUEST', 'attachment-refused', 'The attached files were refused.'];
+
+  // Mutation: let a picture through on a model whose row has images false → red.
+  it('a picture goes only to a model whose row takes images, refused before any session or prompt', async () => {
+    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES, BLIND] });
+    try {
+      const svc = fake.service;
+      const prompts = () => fake.sent().filter((m) => m.method === 'session/prompt');
+      const blind = await apiError(
+        svc.create({ mode: 'chat', text: 'what is this', modelId: BLIND.name, attachments: [PICTURE] }),
+      );
+      expect(refusedAs(blind)).toEqual(REFUSED);
+      expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+
+      const attachments = [FILE, PICTURE];
+      const { conversation } = await svc.create({ mode: 'chat', text: 'what is this', attachments });
+      const page = new Page(svc, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(prompts().map((m) => m.params)).toEqual([promptParams(conversation.id, 'what is this', attachments)]);
+      expect(page.state!.entries.filter((e) => e.kind === 'user')).toEqual([
+        expect.objectContaining({ text: 'what is this', attachments: attachments.map(attachmentView) }),
+      ]);
+      page.detach();
+
+      const text = await svc.create({ mode: 'chat', text: 'hello', modelId: BLIND.name });
+      const second = new Page(svc, text.conversation.id);
+      await until(() => second.ends().length === 1, 5_000);
+      expect(refusedAs(await apiError(svc.prompt(text.conversation.id, 'and this?', [PICTURE])))).toEqual(REFUSED);
+      expect(prompts()).toHaveLength(2);
+      await svc.prompt(text.conversation.id, 'and this file?', [FILE]);
+      await until(() => second.ends().length === 2, 5_000);
+      expect(prompts()[2]!.params).toEqual(promptParams(text.conversation.id, 'and this file?', [FILE]));
+      second.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 20_000);
+
+  // Mutation: drop the count of the pictures a chat holds → the last picture goes out.
+  it('a picture past the stored pictures a chat can keep is refused; text and files still go', async () => {
+    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES] });
+    try {
+      const svc = fake.service;
+      const { conversation } = await svc.create({ mode: 'chat', text: 'hello' });
+      const page = new Page(svc, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      const big: AttachmentInput = {
+        kind: 'image',
+        mediaType: 'image/png',
+        data: `iVBO${'A'.repeat(CHAT_PICTURES_MAX_BASE64 - 8)}`,
+      };
+      await svc.prompt(conversation.id, 'a big one', [big]);
+      await until(() => page.ends().length === 2, 10_000);
+      const full = await apiError(svc.prompt(conversation.id, 'one more', [PICTURE]));
+      expect(refusedAs(full)).toEqual([
+        'E_CONFLICT',
+        'pictures-full',
+        'This chat has too many pictures to keep. Start a new chat to send more.',
+      ]);
+      await svc.prompt(conversation.id, 'and this file?', [FILE]);
+      await until(() => page.ends().length === 3, 5_000);
+      const prompts = fake.sent().filter((m) => m.method === 'session/prompt');
+      expect(prompts.map((m) => (m.params as { prompt: Array<{ text?: string }> }).prompt[0]!.text)).toEqual([
+        'hello',
+        'a big one',
+        'and this file?',
+      ]);
+      page.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  // Mutation: let a picture through in Work → red.
+  it('a picture is refused in Work on any model, before the session; a file is not', async () => {
+    await withWork(
+      'work-always',
+      async (fake, project) => {
+        const svc = fake.service;
+        const work = await apiError(svc.create({ mode: 'work', text: 'list', cwd: project, attachments: [PICTURE] }));
+        expect(refusedAs(work)).toEqual(REFUSED);
+        expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+        const { conversation } = await svc.create({ mode: 'work', text: 'list', cwd: project, attachments: [FILE] });
+        await until(() => fake.sent().some((m) => m.method === 'session/prompt'), 5_000);
+        const prompt = fake.sent().find((m) => m.method === 'session/prompt')!;
+        expect(prompt.params).toEqual(promptParams(conversation.id, 'list', [FILE]));
+        expect(refusedAs(await apiError(svc.prompt(conversation.id, 'again', [PICTURE])))).toEqual(REFUSED);
+      },
+      { endpointModels: [SEES] },
+    );
+  }, 20_000);
 });
 
 describe('Chat service — the host stream and redaction', () => {
@@ -1140,6 +1277,14 @@ describe('Chat service — the host stream and redaction', () => {
 });
 
 /** A Work service on the fake agent with a project folder inside the throwaway home. */
+/** A fetch that reaches only `origin` (a fake on 127.0.0.1); any other address fails as with no network. */
+function onlyTo(origin: string): typeof fetch {
+  return (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    return url.startsWith(`${origin}/`) ? fetch(input, init) : NO_NETWORK(input, init);
+  };
+}
+
 async function withWork(
   name: string,
   run: (fake: FakeService, project: string) => Promise<void>,
@@ -1516,11 +1661,13 @@ describe('Chat service — Work', () => {
     }, 20_000);
   });
 
-  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH', async () => {
+  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH; on this Mac, the address and no key', async () => {
+    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
     const secrets = new MemorySecretStore();
     await secrets.set('deepseek', 'ds-key-00001');
     await secrets.set('firecrawl', 'fc-key-000001');
     let path = '';
+    let clock = 1_000;
     let providers: ProvidersService | null = null;
     await withWork(
       'work-permission',
@@ -1528,7 +1675,7 @@ describe('Chat service — Work', () => {
         await providers!.select({ search: 'deepseek', firecrawl: true });
         const svc = fake.service;
         const hostOff = svc.watchHost(() => {});
-        const run = async (): Promise<{ dirs: unknown; env: unknown }> => {
+        const run = async (): Promise<{ dirs: unknown; env: unknown; url: unknown }> => {
           const before = fake.sent().filter((m) => m.method === 'session/new').length;
           const { conversation } = await svc.create({ mode: 'work', text: 'ls', cwd: project });
           const page = new Page(svc, conversation.id);
@@ -1541,18 +1688,24 @@ describe('Chat service — Work', () => {
             .records()
             .filter((r) => r.kind === 'start')
             .at(-1) as Json;
-          return { dirs: ((created.params as Json)._meta as Json).pluginDirs, env: start.envNames };
+          return {
+            dirs: ((created.params as Json)._meta as Json).pluginDirs,
+            env: start.envNames,
+            url: start.firecrawlApiUrl,
+          };
         };
         const first = await run();
         expect(first.dirs).toEqual([fake.paths.workGuard, join(fake.paths.plugins, 'deepseek')]);
         expect(first.env).toContain('DEEPSEEK_API_KEY');
         expect(first.env).not.toContain('FIRECRAWL_API_KEY');
+        expect(first.url).toBeNull();
 
         const bin = join(fake.root, 'bin');
         mkdirSync(bin);
         writeFileSync(join(bin, 'firecrawl'), '#!/bin/sh\n');
         chmodSync(join(bin, 'firecrawl'), 0o755);
         path = bin;
+        clock += WORK_PATH_ASK_GAP_MS;
         await providers!.list();
         const second = await run();
         expect(second.dirs).toEqual([
@@ -1561,16 +1714,61 @@ describe('Chat service — Work', () => {
           join(fake.paths.plugins, 'firecrawl'),
         ]);
         expect(second.env).toEqual(expect.arrayContaining(['DEEPSEEK_API_KEY', 'FIRECRAWL_API_KEY']));
+        expect(second.url).toBe('https://api.firecrawl.dev');
+
+        await providers!.putLocal(local.baseUrl);
+        await providers!.select({ firecrawl: true, firecrawlLocal: true });
+        const third = await run();
+        expect(third.dirs).toEqual(second.dirs);
+        expect(third.env).toContain('DEEPSEEK_API_KEY');
+        expect(third.env).not.toContain('FIRECRAWL_API_KEY');
+        expect(third.url).toBe(local.baseUrl);
         expect(JSON.stringify(fake.records())).not.toContain('fc-key-000001');
         hostOff();
       },
       {
         providers: (paths) => {
-          providers = new ProvidersService({ paths, secrets, fetch: NO_NETWORK, workPath: () => path });
+          providers = new ProvidersService({
+            paths,
+            secrets,
+            fetch: onlyTo(local.baseUrl),
+            workPath: () => path,
+            now: () => clock,
+          });
           return providers;
         },
       },
-    );
+    ).finally(() => local.close());
+  }, 30_000);
+
+  it('a Chat session on Firecrawl on this Mac gets the saved address and no fetch key in its mlx_web env', async () => {
+    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+    const secrets = new MemorySecretStore();
+    await secrets.set('firecrawl', 'fc-key-000001');
+    let providers: ProvidersService | null = null;
+    const fake = fakeService('chat-basic', {
+      providers: (paths) => {
+        providers = new ProvidersService({ paths, secrets, fetch: onlyTo(local.baseUrl), workPath: () => '' });
+        return providers;
+      },
+    });
+    try {
+      await providers!.putLocal(local.baseUrl);
+      await providers!.select({ firecrawl: true, firecrawlLocal: true });
+      await fake.service.create({ mode: 'chat', text: 'hello' });
+      await until(() => fake.sent().some((m) => m.method === 'session/new'), 5_000);
+      const created = fake.sent().find((m) => m.method === 'session/new')!;
+      const env = ((created.params as Json).mcpServers as Json[])[0]!.env as Array<{ name: string; value: string }>;
+      const value = (name: string): string | undefined => env.find((e) => e.name === name)?.value;
+      expect([value('MLX_WEB_FETCH_PROVIDER'), value('MLX_WEB_FETCH_KEY'), value('MLX_WEB_FETCH_URL')]).toEqual([
+        'firecrawl',
+        '',
+        local.baseUrl,
+      ]);
+    } finally {
+      await fake.close();
+      await local.close();
+    }
   }, 30_000);
 });
 

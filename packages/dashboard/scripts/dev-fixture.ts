@@ -982,6 +982,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         },
         stateNamespace: fixturePrefixNamespaces()[0]!,
         experts: null,
+        images: false,
       },
       {
         name: small,
@@ -997,6 +998,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         pool: { at: now - 40_000, blockCapacity: 2048, allocatedBlocks: 310, freeBlocks: 1738, reclaimableBlocks: 120 },
         stateNamespace: null,
         experts: null,
+        images: false,
       },
       ...(live.chatModels ?? []).map((name) => ({
         name,
@@ -1012,6 +1014,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         pool: null,
         stateNamespace: null,
         experts: null,
+        images: false,
       })),
       ...(live.engineStates === true ? engineStateModels(live, now) : []),
     ],
@@ -1092,6 +1095,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       },
       stateNamespace: null,
       experts: null,
+      images: false,
     };
   });
   const loadedAt = live.startedAt + 3000;
@@ -1109,6 +1113,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: null,
+      images: false,
     },
     {
       ...UNREAD_MODEL,
@@ -1122,6 +1127,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: null,
+      images: false,
     },
     {
       ...STREAMING_MODEL,
@@ -1135,6 +1141,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: { inMemory: 409, total: 512, streaming: true },
+      images: false,
     },
   ];
 }

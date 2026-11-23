@@ -15,6 +15,7 @@ import {
   formatErrorText,
   formatPageText,
   formatSearchText,
+  PAGE_CLOUD_NOTE,
   parseWebResultText,
 } from '../src/chat/web/result-text.js';
 
@@ -49,13 +50,30 @@ describe('web result text', () => {
       results: [],
     });
     for (const cut of [false, true]) {
-      const page = { url: 'https://example.com/p', title: 'Title', cut, text: 'line 1\n\nline 3' };
-      expect(parseWebResultText(formatPageText('firecrawl', page))).toEqual({
-        kind: 'page',
-        provider: 'firecrawl',
-        ...page,
-      });
+      for (const cloudRead of [false, true]) {
+        const page = { url: 'https://example.com/p', title: 'Title', cut, cloudRead, text: 'line 1\n\nline 3' };
+        expect(parseWebResultText(formatPageText('firecrawl', page))).toEqual({
+          kind: 'page',
+          provider: 'firecrawl',
+          ...page,
+        });
+      }
     }
+  });
+
+  it('writes the Firecrawl Cloud note only for Firecrawl, and refuses it on another provider', () => {
+    const page = { url: 'https://example.com/p', title: 'Title', cut: false, cloudRead: true, text: 'body' };
+    expect(formatPageText('firecrawl', page).split('\n')[2]).toBe(PAGE_CLOUD_NOTE);
+    expect(formatPageText('exa', page)).not.toContain(PAGE_CLOUD_NOTE);
+    expect(parseWebResultText(formatPageText('exa', page))).toMatchObject({ kind: 'page', cloudRead: false });
+    const forged = formatPageText('firecrawl', page).replace('provider=firecrawl', 'provider=exa');
+    expect(parseWebResultText(forged)).toBeNull();
+    expect(parseWebResultText(formatErrorText('local-down', 'firecrawl'))).toEqual({
+      kind: 'error',
+      code: 'local-down',
+      provider: 'firecrawl',
+      sentence: WEB_ERROR_SENTENCES['local-down'],
+    });
   });
 
   it('keeps every field on one line, so a forged block cannot appear', () => {

@@ -18,8 +18,8 @@ const assetsDir = join(webDir, 'assets');
  * Size caps in bytes, set about 1 % above the measured build. A cap that fails means the bundle grew: find what
  * grew before raising it.
  */
-const JS_CAP_BYTES = 1_758_208;
-const CSS_CAP_BYTES = 337_920;
+const JS_CAP_BYTES = 1_812_480;
+const CSS_CAP_BYTES = 343_040;
 const FONTS_CAP_BYTES = 230_000;
 
 /** Strings only the dev harness carries. None may reach `web/`. */
@@ -28,12 +28,14 @@ const HARNESS_STRINGS = ['__gallery', 'dev-fixture', '.dev-home', 'mlx:dev-', 'd
 /**
  * Every URL the shipped JS may hold, by prefix. None is fetched at run time (CSP `connect-src 'self'`): XML namespace
  * names, the parse base of a router, library help text, and the Hugging Face model page and the web search providers'
- * key and billing pages that links open in the system browser. A new URL fails here so somebody looks at it.
+ * key and billing pages and the Firecrawl Local guide that links open in the system browser, and the loopback
+ * addresses of Firecrawl on this Mac, which the page only shows. A new URL fails here so somebody looks at it.
  */
 const JS_URL_PREFIXES = [
   'http://www.w3.org/',
   'http://localhost',
   'http://127.0.0.1',
+  'http://[::1]:',
   'https://react.dev/errors/',
   'https://reactrouter.com/en/main/routers/picking-a-router',
   'https://github.com/ungap/url-search-params',
@@ -43,6 +45,7 @@ const JS_URL_PREFIXES = [
   'https://platform.deepseek.com',
   'https://api-dashboard.search.brave.com',
   'https://www.firecrawl.dev/app',
+  'https://docs.firecrawl.dev/quickstarts/firecrawl-local',
 ];
 
 function endsWith(name: string, suffix: string): boolean {

@@ -12,6 +12,7 @@ import { afterEach, describe, expect, expectTypeOf, it } from 'vite-plus/test';
 
 import type * as ServerProviders from '../src/chat/providers/types.js';
 import type * as Server from '../src/chat/types.js';
+import type * as WebLocal from '../src/chat/web/local.js';
 import { DashboardApiError, mutate } from '../ui/src/lib/api.js';
 import {
   applyConversationEvent,
@@ -352,5 +353,10 @@ describe('the page copies of the Chat types', () => {
     expectTypeOf<Page.ChatHostEvent>().toEqualTypeOf<Server.ChatHostEvent>();
     expectTypeOf<PageProviders.ProviderState>().toEqualTypeOf<ServerProviders.ProviderState>();
     expectTypeOf<PageProviders.ProvidersResponse>().toEqualTypeOf<ServerProviders.ProvidersResponse>();
+    expectTypeOf<PageProviders.ProviderLocalReply>().toEqualTypeOf<ServerProviders.ProviderLocalReply>();
+    expectTypeOf<PageProviders.ProviderLocalCheckReply>().toEqualTypeOf<ServerProviders.ProviderLocalCheckReply>();
+    expectTypeOf<PageProviders.ProviderSelectionInput>().toEqualTypeOf<ServerProviders.ProviderSelectionInput>();
+    expectTypeOf<WebLocal.LocalCheck>().toEqualTypeOf<ServerProviders.LocalCheck>();
+    expectTypeOf<WebLocal.LocalCloud>().toEqualTypeOf<ServerProviders.LocalCloud>();
   });
 });

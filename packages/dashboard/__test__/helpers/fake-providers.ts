@@ -106,12 +106,15 @@ export const CHECK_OK: Readonly<Record<'exa' | 'deepseek' | 'brave' | 'firecrawl
 
 export interface HarnessProviders {
   baseUrls: Record<'exa' | 'deepseek' | 'brave' | 'firecrawl', string>;
+  /** A fake Firecrawl on this Mac, as `firecrawl-local serve` answers by default: type it into the This Mac field. */
+  localUrl: string;
   close(): Promise<void>;
 }
 
 /**
  * The dev harness's providers: a key that starts with `bad` is rejected, one that starts with `nocredit` has no
  * credit, one that starts with `slow` answers after 12 s (the check gives up: "not checked"), any other is valid.
+ * Beside them runs a fake Firecrawl on this Mac that passes the check; any other loopback port reads "not running".
  */
 export async function startHarnessProviders(): Promise<HarnessProviders> {
   const ids = ['exa', 'deepseek', 'brave', 'firecrawl'] as const;
@@ -132,10 +135,58 @@ export async function startHarnessProviders(): Promise<HarnessProviders> {
     brave: servers[2]!.baseUrl,
     firecrawl: servers[3]!.baseUrl,
   };
+  const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
   return {
     baseUrls,
+    localUrl: local.baseUrl,
     close: async () => {
-      await Promise.all(servers.map((s) => s.close()));
+      await Promise.all([...servers, local].map((s) => s.close()));
     },
+  };
+}
+
+/** What the fake Firecrawl on this Mac answers; a test may change a field between calls. */
+export interface FakeLocalAnswers {
+  health: FakeAnswer;
+  /** The answer to a scrape of a loopback target (the check's probe). */
+  probe: FakeAnswer;
+  /** The answer to a scrape of any other target. */
+  page: FakeAnswer;
+  /** The answer to `GET /v2/team/credit-usage` (the check's Cloud read). */
+  cloud: FakeAnswer;
+}
+
+/** `firecrawl-local serve` as its source answers by default: Cloud off, private targets refused. */
+export function fakeLocalAnswers(): FakeLocalAnswers {
+  return {
+    health: { json: { status: 'ok', engine: 'firecrawl-local', version: '0.1.1' } },
+    probe: { status: 403, json: { success: false, code: 'BLOCKED_TARGET', error: 'blocked' } },
+    page: {
+      json: {
+        success: true,
+        data: { markdown: '# Local page\nBody', metadata: { title: 'Local page', statusCode: 200 }, source: 'local' },
+      },
+    },
+    cloud: { status: 501, json: { success: false, code: 'CLOUD_ONLY', error: 'cloud is off' } },
+  };
+}
+
+const LOOPBACK_HOSTS: readonly string[] = ['127.0.0.1', 'localhost', '[::1]'];
+
+/** Routes a request to the fake Firecrawl on this Mac to the matching field of `answers`, read at request time. */
+export function fakeLocalScript(answers: FakeLocalAnswers): FakeScript {
+  return (request) => {
+    if (request.method === 'GET' && request.path === '/health') return answers.health;
+    if (request.method === 'GET' && request.path === '/v2/team/credit-usage') return answers.cloud;
+    if (request.method === 'POST' && request.path === '/v2/scrape') {
+      let target = '';
+      try {
+        target = new URL((JSON.parse(request.body) as { url: string }).url).hostname;
+      } catch {
+        return { status: 400, json: { success: false, code: 'BAD_REQUEST' } };
+      }
+      return LOOPBACK_HOSTS.includes(target) ? answers.probe : answers.page;
+    }
+    return { status: 404, json: { success: false } };
   };
 }

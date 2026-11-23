@@ -87,7 +87,8 @@ export function handleChatCreate(ctx: MainApiContext, req: ApiRequest): Promise<
 export function handleChatPrompt(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
   return guarded('chat', () => {
     const id = idParam(req.params.id);
-    return service(ctx).prompt(id, promptInput(requireBody(req)).text);
+    const input = promptInput(requireBody(req));
+    return service(ctx).prompt(id, input.text, input.attachments);
   });
 }
 

@@ -23,7 +23,7 @@ import { splitWhitespace } from '../ui/src/lib/text-scan.js';
 import { toast } from '../ui/src/lib/toast.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import Chat from '../ui/src/pages/chat.js';
-import { chooseFolder, forgetPlace, NEW_PLACE, writeDraft } from '../ui/src/pages/chat/drafts.js';
+import { chooseFolder, forgetPlace, NEW_PLACE, writeDraft, writeFailed } from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
 import { CARD_ARM_MS, cardButtons, cardNotes, FEEDBACK_MAX_CHARS } from '../ui/src/pages/chat/work/permission.js';
 import { APP_ROUTES, NAV_ROUTES } from '../ui/src/shell/routes.js';
@@ -264,6 +264,7 @@ afterEach(() => {
   page = undefined;
   api = undefined;
   writeDraft(NEW_PLACE, '');
+  writeFailed(NEW_PLACE, null);
   for (const id of used.splice(0)) forgetPlace(id);
   chooseFolder(null);
   vi.restoreAllMocks();

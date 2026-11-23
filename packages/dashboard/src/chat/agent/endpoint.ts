@@ -19,6 +19,8 @@ export interface InferenceEndpoint {
     format: 'gguf' | 'mlx';
     modelType?: string;
     kind?: 'chat' | 'decision';
+    /** Discovery's word that the files on disk take pictures. */
+    images?: boolean;
   }>;
 }
 

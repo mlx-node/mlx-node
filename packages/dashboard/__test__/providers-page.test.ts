@@ -4,15 +4,20 @@ import { act, createElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { parseLocalAddress as serverParseLocalAddress } from '../src/chat/web/local.js';
 import type { ApiCall } from '../src/runtime.js';
 import { PROVIDERS } from '../ui/src/lib/providers-strings.js';
-import type { ProviderId, ProviderState, ProvidersResponse } from '../ui/src/lib/providers-types.js';
+import type { LocalFirecrawl, ProviderId, ProviderState, ProvidersResponse } from '../ui/src/lib/providers-types.js';
 import {
   BILLING_PAGES,
   chatLines,
   checkKeyFormat,
+  crawlerOffNote,
   fill,
   KEY_PAGES,
+  LOCAL_DEFAULT_URL,
+  LOCAL_GUIDE,
+  parseLocalAddress,
   progressOf,
   workParts,
   workSentence,
@@ -70,6 +75,9 @@ function provider(id: ProviderId, over: Partial<ProviderState> = {}): ProviderSt
 interface Setup {
   search?: ProvidersResponse['search'];
   firecrawl?: boolean;
+  /** Firecrawl is on and reads pages on this Mac (needs `local.url`). */
+  firecrawlLocal?: boolean;
+  local?: Partial<LocalFirecrawl>;
   configured?: ProviderId[];
   over?: Partial<Record<ProviderId, Partial<ProviderState>>>;
   keychain?: ProvidersResponse['keychain'];
@@ -78,15 +86,18 @@ interface Setup {
 
 function response(setup: Setup = {}): ProvidersResponse {
   const search = setup.search ?? null;
-  const firecrawl = setup.firecrawl ?? false;
+  const firecrawlLocal = setup.firecrawlLocal ?? false;
+  const firecrawl = (setup.firecrawl ?? false) || firecrawlLocal;
   const configured = new Set(setup.configured ?? []);
   if (search !== null) configured.add(search);
-  if (firecrawl) configured.add('firecrawl');
+  if (firecrawl && !firecrawlLocal) configured.add('firecrawl');
   const ids: ProviderId[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
   return {
     search,
     firecrawl,
+    firecrawlLocal,
     fetch: firecrawl ? 'firecrawl' : search,
+    local: { url: null, check: null, checkedAt: null, version: null, cloud: null, ...setup.local },
     providers: ids.map((id) =>
       provider(id, {
         configured: configured.has(id),
@@ -181,12 +192,22 @@ function leaks(text: string): string[] {
   return windows().filter((w) => text.includes(w));
 }
 
-const radios = (): HTMLElement[] => allByRole(page!.container, 'radio');
+/** The radios of one option list of the Use panel: the search provider list unless named. */
+const radios = (group: string = PROVIDERS.searchProvider): HTMLElement[] => {
+  const list = byRole(page!.container, 'radiogroup', group);
+  return list === null ? [] : allByRole(list, 'radio');
+};
 const radioTitle = (radio: Element): string => radio.children[1]?.children[0]?.textContent ?? '';
-const radioNames = (): string[] => radios().map(radioTitle);
-const checkedRadio = (): string | undefined => {
-  const checked = radios().find((r) => r.getAttribute('aria-checked') === 'true');
+const radioNote = (radio: Element): string => radio.children[1]?.children[1]?.textContent ?? '';
+const radioNames = (group?: string): string[] => radios(group).map(radioTitle);
+const checkedRadio = (group?: string): string | undefined => {
+  const checked = radios(group).find((r) => r.getAttribute('aria-checked') === 'true');
   return checked === undefined ? undefined : radioTitle(checked);
+};
+const crawlerRadio = (title: string): HTMLElement => {
+  const found = radios(PROVIDERS.crawler).find((r) => radioTitle(r) === title);
+  if (found === undefined) throw new Error(`no crawler option ${title}`);
+  return found;
 };
 
 describe('Now sentences', () => {
@@ -198,6 +219,13 @@ describe('Now sentences', () => {
     expect(chat({ search: 'brave' })).toBe('Web search and page excerpts via Brave.');
     expect(chat({ firecrawl: true })).toBe('No web search. Pages via Firecrawl when you give an address.');
     expect(chat({})).toBe('Web search is off.');
+    const local = { firecrawlLocal: true, local: { url: LOCAL_DEFAULT_URL } };
+    expect(chat(local)).toBe('No web search. Pages via Firecrawl on this Mac when you give an address.');
+    expect(chat({ ...local, search: 'exa' })).toBe('Web search via Exa, pages via Firecrawl on this Mac.');
+    // A rejected cloud key says nothing about page reads on this Mac.
+    expect(
+      chatLines(response({ ...local, configured: ['firecrawl'], over: { firecrawl: { check: 'rejected' } } })),
+    ).toHaveLength(1);
   });
 
   it('adds a line for a selected provider whose key failed its check', () => {
@@ -253,21 +281,19 @@ describe('Now sentences', () => {
 });
 
 describe('Web Search page', () => {
-  it('with no keys: four "No key" cards, no radios, the Firecrawl switch off, the always-on notice', async () => {
+  it('with no keys: four "No key" cards, no radios, no crawler to pick, the always-on notice', async () => {
     await open({ '/providers': response() }, PROVIDERS.noneConfigured);
     const text = page!.text();
     expect(page!.container.querySelector('h1')?.textContent).toBe('Web Search');
     expect(text).toContain(PROVIDERS.chatOff);
     expect(text).toContain(PROVIDERS.workNone);
-    expect(radios()).toHaveLength(0);
+    expect(allByRole(page!.container, 'radio')).toHaveLength(0);
     for (const name of ['Exa', 'DeepSeek', 'Brave', 'Firecrawl']) {
       expect(card(name).textContent).toContain(PROVIDERS.badgeNoKey);
       expect(keyField(card(name)).type).toBe('password');
     }
-    const sw = byRole(page!.container, 'switch');
-    expect(sw?.getAttribute('aria-checked')).toBe('false');
-    expect((sw as HTMLButtonElement).disabled).toBe(true);
-    expect(text).toContain(PROVIDERS.firecrawlNoKey);
+    expect(byRole(page!.container, 'switch')).toBeNull();
+    expect(text).toContain(PROVIDERS.crawlerNone);
     expect(text).toContain(PROVIDERS.leavesTitle);
     expect(text).not.toContain(PROVIDERS.historyTitle);
     expect(shownText(card('Brave'))).toContain(PROVIDERS.saveHelpBrave);
@@ -532,8 +558,8 @@ describe('Web Search page', () => {
 
   it('the radio group: arrow keys move focus and never select; Space selects and installs', async () => {
     const calls: ApiCall[] = [];
-    const before = response({ search: 'exa', configured: ['brave'] });
-    const after = response({ search: 'brave', configured: ['exa'] });
+    const before = response({ search: 'exa', configured: ['brave', 'firecrawl'] });
+    const after = response({ search: 'brave', configured: ['exa', 'firecrawl'] });
     const held = deferred(after);
     await open({ '/providers': before, '/providers/selection': held.body }, PROVIDERS.keySaved, calls);
     expect(radioNames()).toEqual(['Exa', 'Brave', 'Off']);
@@ -553,7 +579,7 @@ describe('Web Search page', () => {
 
     await key(brave!, ' ');
     await waitFor(() => page!.text().includes(PROVIDERS.installing));
-    expect(byRole(page!.container, 'switch')?.hasAttribute('disabled')).toBe(true);
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.crawler)?.getAttribute('aria-disabled')).toBe('true');
     expect(calls.filter((call) => call.method === 'PUT')).toEqual([
       { method: 'PUT', path: '/api/providers/selection', body: { search: 'brave' } },
     ]);
@@ -578,25 +604,25 @@ describe('Web Search page', () => {
     expect(page!.container.querySelector('[role="status"][aria-live="polite"]')?.textContent).toBe(PROVIDERS.offStatus);
   });
 
-  it('the Firecrawl switch installs its skills; a missing CLI changes its words and shows the install line', async () => {
+  it('picking Firecrawl Cloud installs its skills; a missing CLI changes its words and shows the install line', async () => {
     const calls: ApiCall[] = [];
     const missing = { work: { ready: false, missing: 'firecrawl-cli' as const } };
     const before = response({ configured: ['firecrawl'], over: { firecrawl: missing } });
     const after = response({ firecrawl: true, over: { firecrawl: missing } });
     await open({ '/providers': before, '/providers/selection': after }, PROVIDERS.keySaved, calls);
-    expect(page!.text()).toContain(PROVIDERS.firecrawlOff);
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.off);
     const fire = card('Firecrawl');
     expect(shownText(fire)).not.toContain(PROVIDERS.firecrawlCli);
-    await click(byRole(page!.container, 'switch')!);
+    await click(crawlerRadio(PROVIDERS.crawlerCloud));
     await waitFor(() => page!.text().includes('Installed: 5 Firecrawl skills'));
-    expect(calls.filter((call) => call.method === 'PUT')[0]?.body).toEqual({ firecrawl: true });
+    expect(calls.filter((call) => call.method === 'PUT')[0]?.body).toEqual({ firecrawl: true, firecrawlLocal: false });
     expect(page!.text()).toContain(PROVIDERS.firecrawlOnNoCli);
     expect(shownText(card('Firecrawl'))).toContain(PROVIDERS.firecrawlCli);
     expect(shownText(card('Firecrawl'))).toContain(PROVIDERS.firecrawlCliCommand);
     expect(shownText(card('Firecrawl'))).toContain(PROVIDERS.firecrawlCliChat);
     expect(shownText(card('Firecrawl'))).not.toContain(PROVIDERS.workKeyNotice);
     expect(page!.text()).toContain(`Work${PROVIDERS.workNoCli}.`);
-    expect(byRole(page!.container, 'switch')?.getAttribute('aria-checked')).toBe('true');
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.crawlerCloud);
   });
 
   it('removing the selected key: the confirm says so, then Off, the removed line and a toast', async () => {
@@ -659,18 +685,42 @@ describe('Web Search page', () => {
   });
 
   it('the Keychain cannot be reached: one alert, and every control is off', async () => {
-    await open({ '/providers': response({ search: 'exa', keychain: 'unavailable' }) }, PROVIDERS.keychainTitle);
+    await open(
+      { '/providers': response({ search: 'exa', configured: ['firecrawl'], keychain: 'unavailable' }) },
+      PROVIDERS.keychainTitle,
+    );
     expect(page!.text()).toContain(PROVIDERS.keychainText);
     expect(maybeButton(page!.container, PROVIDERS.tryAgain)).toBeDefined();
     for (const label of [PROVIDERS.check, PROVIDERS.replace, PROVIDERS.remove, PROVIDERS.save]) {
       for (const b of page!.container.querySelectorAll('section[aria-label] button')) {
-        if (b.textContent?.startsWith(label) !== true) continue;
+        // Firecrawl on this Mac uses no key: its block works without the Keychain.
+        if (b.textContent?.startsWith(label) !== true || b.closest('[data-local]') !== null) continue;
         expect((b as HTMLButtonElement).disabled || b.getAttribute('aria-disabled') === 'true').toBe(true);
       }
     }
-    expect(byRole(page!.container, 'radiogroup')?.getAttribute('aria-disabled')).toBe('true');
-    expect(byRole(page!.container, 'switch')?.hasAttribute('disabled')).toBe(true);
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.searchProvider)?.getAttribute('aria-disabled')).toBe('true');
+    // Firecrawl Cloud is listed only with its key in the cache, and this Mac needs no key: the Crawler list works.
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.crawler)?.getAttribute('aria-disabled')).toBeNull();
     expect(button(page!.container, PROVIDERS.checkAll).disabled).toBe(true);
+    expect(button(card('Firecrawl'), PROVIDERS.localSave).disabled).toBe(false);
+  });
+
+  it('the Keychain cannot be reached: a Crawler pick of this Mac, or Off, still goes through', async () => {
+    const calls: ApiCall[] = [];
+    const onLocal = response({ search: 'exa', firecrawlLocal: true, local: RUNNING, keychain: 'unavailable' });
+    await open(
+      {
+        '/providers': onLocal,
+        '/providers/selection': response({ search: 'exa', local: RUNNING, keychain: 'unavailable' }),
+      },
+      PROVIDERS.keychainTitle,
+      calls,
+    );
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.searchProvider)?.getAttribute('aria-disabled')).toBe('true');
+    expect(radioNames(PROVIDERS.crawler)).toEqual([PROVIDERS.crawlerLocal, PROVIDERS.off]);
+    await click(crawlerRadio(PROVIDERS.off));
+    await waitFor(() => checkedRadio(PROVIDERS.crawler) === PROVIDERS.off);
+    expect(calls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([{ firecrawl: false }]);
   });
 
   it('a damaged skill bundle: the alert says reinstall, nothing changed, no retry', async () => {
@@ -780,5 +830,292 @@ describe('Web Search page', () => {
       '/api/providers/exa/validate',
       '/api/providers/firecrawl/validate',
     ]);
+  });
+});
+
+/** The address field of the This Mac block. */
+function addressField(): HTMLInputElement {
+  const input = card('Firecrawl').querySelector<HTMLInputElement>('[data-local-form] input');
+  if (input === null) throw new Error('no address field');
+  return input;
+}
+
+/** The This Mac block, with hidden parts of its swap cell left out. */
+function localText(): string {
+  const block = card('Firecrawl').querySelector('[data-local]');
+  if (block === null) throw new Error('no This Mac block');
+  return shownText(block);
+}
+
+const RUNNING: Partial<LocalFirecrawl> = {
+  url: LOCAL_DEFAULT_URL,
+  check: 'ok',
+  checkedAt: Date.now(),
+  version: '0.1.1',
+  cloud: 'off',
+};
+
+describe('Firecrawl on this Mac', () => {
+  it('the SPA copy of the address rule answers as the server one', () => {
+    const cases = [
+      'http://127.0.0.1:3002',
+      'http://127.0.0.1:3002/',
+      ' http://localhost:3002 ',
+      'HTTP://LOCALHOST:4000',
+      'http://[::1]:4000',
+      'https://127.0.0.1:3002',
+      'http://127.0.0.1',
+      'http://127.0.0.1:80',
+      'http://127.0.0.1:70000',
+      'http://192.168.1.5:3002',
+      'http://10.0.0.2:3002',
+      'http://127.0.0.2:3002',
+      'http://example.com:3002',
+      'http://user@127.0.0.1:3002',
+      'http://127.0.0.1:3002/v2',
+      'http://127.0.0.1:3002?a=1',
+      'http://127.0.0.1:3002#x',
+      'localhost:3002',
+      'http://localhost.example:3002',
+      'http://127.0.0.1:3002\\',
+      '',
+    ];
+    for (const text of cases) expect([text, parseLocalAddress(text)]).toEqual([text, serverParseLocalAddress(text)]);
+    expect(parseLocalAddress(' http://localhost:3002 ')).toBe('http://127.0.0.1:3002');
+    expect(parseLocalAddress('http://192.168.1.5:3002')).toBeNull();
+  });
+
+  it('the Off note names who reads pages: the search provider, Brave excerpts, or nobody', () => {
+    expect(crawlerOffNote('exa')).toBe('Exa reads pages for Chat.');
+    expect(crawlerOffNote('deepseek')).toBe('DeepSeek reads pages for Chat.');
+    expect(crawlerOffNote('brave')).toBe(PROVIDERS.crawlerOffExcerpts);
+    expect(crawlerOffNote(null)).toBe(PROVIDERS.crawlerOffNone);
+  });
+
+  it('the Crawler list offers only the places that are set up, plus Off', async () => {
+    const names = async (setup: Setup): Promise<string[]> => {
+      await open({ '/providers': response(setup) }, PROVIDERS.leavesTitle);
+      const out = radioNames(PROVIDERS.crawler);
+      page!.unmount();
+      dispose!();
+      page = undefined;
+      dispose = undefined;
+      return out;
+    };
+    expect(await names({ configured: ['firecrawl'] })).toEqual([PROVIDERS.crawlerCloud, PROVIDERS.off]);
+    expect(await names({ local: RUNNING })).toEqual([PROVIDERS.crawlerLocal, PROVIDERS.off]);
+    expect(await names({ configured: ['firecrawl'], local: RUNNING })).toEqual([
+      PROVIDERS.crawlerCloud,
+      PROVIDERS.crawlerLocal,
+      PROVIDERS.off,
+    ]);
+    expect(await names({})).toEqual([]);
+  });
+
+  it('each Crawler pick sends its exact body; the Off note follows the search provider', async () => {
+    const calls: ApiCall[] = [];
+    const before = response({ search: 'brave', configured: ['firecrawl'], local: RUNNING });
+    await open({ '/providers': before, '/providers/selection': before }, PROVIDERS.keySaved, calls);
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.off);
+    const off = crawlerRadio(PROVIDERS.off);
+    expect(radioNote(off)).toBe(PROVIDERS.crawlerOffExcerpts);
+    expect(radioNote(crawlerRadio(PROVIDERS.crawlerLocal))).toBe(LOCAL_DEFAULT_URL);
+    await click(crawlerRadio(PROVIDERS.crawlerLocal));
+    await waitFor(() => calls.some((call) => call.method === 'PUT'));
+    await waitFor(
+      () => byRole(page!.container, 'radiogroup', PROVIDERS.crawler)?.getAttribute('aria-disabled') === null,
+    );
+    await click(crawlerRadio(PROVIDERS.crawlerCloud));
+    await waitFor(() => calls.filter((call) => call.method === 'PUT').length === 2);
+    expect(calls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([
+      { firecrawl: true, firecrawlLocal: true },
+      { firecrawl: true, firecrawlLocal: false },
+    ]);
+    page!.unmount();
+    dispose!();
+
+    const onLocal = response({ firecrawlLocal: true, local: RUNNING });
+    const offCalls: ApiCall[] = [];
+    await open(
+      { '/providers': onLocal, '/providers/selection': response({ local: RUNNING }) },
+      PROVIDERS.keySaved,
+      offCalls,
+    );
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.crawlerLocal);
+    expect(radioNote(crawlerRadio(PROVIDERS.off))).toBe(PROVIDERS.crawlerOffNone);
+    expect(page!.text()).toContain(fill(PROVIDERS.localOn, { n: 5 }));
+    await click(crawlerRadio(PROVIDERS.off));
+    await waitFor(() => checkedRadio(PROVIDERS.crawler) === PROVIDERS.off);
+    expect(offCalls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([{ firecrawl: false }]);
+  });
+
+  it('a 409 on a This Mac pick says to set it up first', async () => {
+    const error = vi.spyOn(toast, 'error');
+    await open(
+      {
+        '/providers': response({ local: RUNNING }),
+        '/providers/selection': stubError('E_CONFLICT', 'Set up Firecrawl on this Mac first.', 'local-not-set-up'),
+      },
+      PROVIDERS.leavesTitle,
+    );
+    await click(crawlerRadio(PROVIDERS.crawlerLocal));
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls[0]?.[0]).toBe(PROVIDERS.needLocal);
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.off);
+  });
+
+  it('not set up: the default address, the badge, how to install and start it', async () => {
+    await open({ '/providers': response() }, PROVIDERS.noneConfigured);
+    expect(addressField().value).toBe(LOCAL_DEFAULT_URL);
+    const text = localText();
+    for (const words of [
+      PROVIDERS.badgeNotSetUp,
+      PROVIDERS.localText,
+      PROVIDERS.localNeeds,
+      PROVIDERS.localInstall,
+      PROVIDERS.localStart,
+      PROVIDERS.localStartNote,
+      PROVIDERS.localAddressHelp,
+      PROVIDERS.localLimits,
+    ]) {
+      expect(text).toContain(words);
+    }
+    const guide = [...card('Firecrawl').querySelectorAll('a')].find((a) => a.textContent === PROVIDERS.localGuide);
+    expect(guide?.getAttribute('href')).toBe(LOCAL_GUIDE);
+    expect(page!.text()).not.toContain(PROVIDERS.leavesLocal);
+  });
+
+  it('a typed LAN address is refused in the page, with no call', async () => {
+    const calls: ApiCall[] = [];
+    await open({ '/providers': response() }, PROVIDERS.noneConfigured, calls);
+    await typeInto(addressField(), 'http://192.168.1.5:3002');
+    await click(button(card('Firecrawl'), PROVIDERS.localSave));
+    await waitFor(() => localText().includes(PROVIDERS.localBadAddress));
+    expect(calls.filter((call) => call.method !== 'GET')).toEqual([]);
+  });
+
+  it('each failed check says why and that nothing was saved; the field keeps the address', async () => {
+    const problems = [
+      ['not-running', PROVIDERS.localNotRunning],
+      ['not-firecrawl', PROVIDERS.localNotFirecrawl],
+      ['open', PROVIDERS.localOpen],
+      ['token', PROVIDERS.localToken],
+    ] as const;
+    for (const [check, sentence] of problems) {
+      await open(
+        { '/providers': response(), '/providers/local': { saved: false, check, providers: response() } },
+        PROVIDERS.noneConfigured,
+      );
+      await typeInto(addressField(), 'http://localhost:4000/');
+      await key(addressField(), 'Enter');
+      await waitFor(() => localText().includes(PROVIDERS.localNotSaved));
+      expect(localText()).toContain(`${sentence} ${PROVIDERS.localNotSaved}`);
+      expect(addressField().value).toBe('http://localhost:4000/');
+      expect(card('Firecrawl').querySelector('[data-local-form]')?.closest('[inert]')).toBeNull();
+      page!.unmount();
+      dispose!();
+      page = undefined;
+      dispose = undefined;
+    }
+  });
+
+  it('a passing check saves the saved form and swaps to the running row', async () => {
+    const calls: ApiCall[] = [];
+    const after = response({ firecrawlLocal: true, local: { ...RUNNING, url: 'http://127.0.0.1:4000' } });
+    await open(
+      {
+        '/providers': sequence(response(), after),
+        '/providers/local': { saved: true, check: 'ok', providers: after },
+      },
+      PROVIDERS.noneConfigured,
+      calls,
+    );
+    await typeInto(addressField(), ' http://localhost:4000/ ');
+    await click(button(card('Firecrawl'), PROVIDERS.localSave));
+    await waitFor(() => localText().includes('Running · Firecrawl Local 0.1.1'));
+    expect(calls.filter((call) => call.method === 'PUT')).toEqual([
+      { method: 'PUT', path: '/api/providers/local', body: { url: 'http://127.0.0.1:4000' } },
+    ]);
+    expect(card('Firecrawl').querySelector('[data-local-form]')?.closest('[inert]')).not.toBeNull();
+    expect(localText()).toContain('http://127.0.0.1:4000');
+    expect(localText()).toContain(PROVIDERS.badgeRunning);
+    expect(page!.text()).toContain('Installed: 5 Firecrawl skills');
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.crawlerLocal);
+    expect(page!.text()).toContain(PROVIDERS.leavesLocal);
+  });
+
+  it('a failed replace keeps the earlier address', async () => {
+    const before = response({ local: RUNNING });
+    await open(
+      { '/providers': before, '/providers/local': { saved: false, check: 'not-running', providers: before } },
+      PROVIDERS.leavesTitle,
+    );
+    await click(button(card('Firecrawl'), PROVIDERS.replace));
+    expect(addressField().value).toBe(LOCAL_DEFAULT_URL);
+    await typeInto(addressField(), 'http://127.0.0.1:4001');
+    await click(button(card('Firecrawl'), PROVIDERS.localSave));
+    await waitFor(() => localText().includes(PROVIDERS.localEarlierKept));
+    expect(localText()).toContain(`${PROVIDERS.localNotRunning} ${PROVIDERS.localEarlierKept}`);
+  });
+
+  it('a saved address: its badge and line per check, the Cloud hand-off line, Check again', async () => {
+    const calls: ApiCall[] = [];
+    const down = response({ local: { ...RUNNING, check: 'not-running', cloud: null } });
+    await open(
+      {
+        '/providers': sequence(response({ local: { ...RUNNING, cloud: 'fallback' } }), down),
+        '/providers/local/check': { check: 'not-running', providers: down },
+      },
+      PROVIDERS.leavesTitle,
+      calls,
+    );
+    expect(localText()).toContain(PROVIDERS.localCloudFallback);
+    expect(localText()).toContain(PROVIDERS.badgeRunning);
+    await click(button(card('Firecrawl'), PROVIDERS.checkAgain));
+    await waitFor(() => localText().includes(PROVIDERS.badgeNotRunning));
+    expect(localText()).toContain(PROVIDERS.localNotRunning);
+    expect(localText()).not.toContain(PROVIDERS.localCloudFallback);
+    expect(calls.filter((call) => call.method === 'POST').map((call) => call.path)).toEqual([
+      '/api/providers/local/check',
+    ]);
+    page!.unmount();
+    dispose!();
+    await open({ '/providers': response({ local: { ...RUNNING, check: 'open' } }) }, PROVIDERS.leavesTitle);
+    expect(localText()).toContain(PROVIDERS.badgeCheckFailed);
+    expect(localText()).toContain(PROVIDERS.localOpen);
+    expect(localText()).not.toContain(PROVIDERS.localCloudFallback);
+  });
+
+  it('Remove asks first, says the crawler turns off when in use, then a toast', async () => {
+    const calls: ApiCall[] = [];
+    const success = vi.spyOn(toast, 'success');
+    await open(
+      {
+        '/providers': sequence(response({ firecrawlLocal: true, local: RUNNING }), response()),
+        '/providers/local': response(),
+      },
+      PROVIDERS.leavesTitle,
+      calls,
+    );
+    await click(button(card('Firecrawl'), PROVIDERS.remove));
+    await waitFor(() => document.querySelector('[role="dialog"]') !== null);
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(dialog.textContent).toContain(PROVIDERS.localRemoveTitle);
+    expect(dialog.textContent).toContain(`${PROVIDERS.localRemoveText} ${PROVIDERS.localRemoveSelected}`);
+    await click(button(dialog, PROVIDERS.removeConfirm));
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success.mock.calls[0]?.[0]).toBe(PROVIDERS.localRemovedToast);
+    expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.path)).toEqual(['/api/providers/local']);
+    await waitFor(() => localText().includes(PROVIDERS.badgeNotSetUp));
+  });
+
+  it('in use, Work gets the address and no key: the card says so in place of the key notice', async () => {
+    await open(
+      { '/providers': response({ firecrawlLocal: true, configured: ['firecrawl'], local: RUNNING }) },
+      PROVIDERS.keySaved,
+    );
+    const fire = shownText(card('Firecrawl'));
+    expect(fire).toContain(PROVIDERS.localWorkNotice);
+    expect(fire).not.toContain(PROVIDERS.workKeyNotice);
   });
 });

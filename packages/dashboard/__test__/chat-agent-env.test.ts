@@ -102,7 +102,13 @@ describe('workAgentEnv', () => {
   };
 
   it('keeps the parent env, removes the app internals and every unselected key, sets the rest', () => {
-    const env = workAgentEnv({ base, endpoint, agentHome: null, providerKeys: { EXA_API_KEY: 'new-exa' } });
+    const env = workAgentEnv({
+      base,
+      endpoint,
+      agentHome: null,
+      providerKeys: { EXA_API_KEY: 'new-exa' },
+      firecrawlUrl: null,
+    });
     expect(env.PATH).toBe('/usr/bin:/opt/homebrew/bin');
     expect(env.HOME).toBe('/Users/dev');
     for (const name of ['ELECTRON_RUN_AS_NODE', 'MLX_DESKTOP_CLI', 'NAPI_RS_NATIVE_LIBRARY_PATH', 'NODE_OPTIONS']) {
@@ -132,7 +138,13 @@ describe('workAgentEnv', () => {
 
   it('sets CDPATH empty, also over a CDPATH of the app, so the agent does not fill it from the login shell', () => {
     for (const own of [{}, { CDPATH: '/Users/dev:.' }]) {
-      const env = workAgentEnv({ base: { ...base, ...own }, endpoint, agentHome: null, providerKeys: {} });
+      const env = workAgentEnv({
+        base: { ...base, ...own },
+        endpoint,
+        agentHome: null,
+        providerKeys: {},
+        firecrawlUrl: null,
+      });
       expect(Object.hasOwn(env, 'CDPATH')).toBe(true);
       expect(env.CDPATH).toBe('');
     }
@@ -144,6 +156,7 @@ describe('workAgentEnv', () => {
       endpoint,
       agentHome: null,
       providerKeys: {},
+      firecrawlUrl: null,
     });
     expect([env.GROK_TWO_PASS_COMPACTION, env.GROK_COMPACTION_WALL_CLOCK_SECS]).toEqual(['0', '0']);
     expect(AGENT_IDLE_TIMEOUT_SECS).toBe(3600);
@@ -159,7 +172,13 @@ describe('workAgentEnv', () => {
   });
 
   it('caps output at 28,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
-    const env = workAgentEnv({ base: { PATH: '/bin' }, endpoint, agentHome: '/custom/agent', providerKeys: {} });
+    const env = workAgentEnv({
+      base: { PATH: '/bin' },
+      endpoint,
+      agentHome: '/custom/agent',
+      providerKeys: {},
+      firecrawlUrl: null,
+    });
     expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}');
     expect(env.GROK_HOME).toBe('/custom/agent');
   });
@@ -219,15 +238,47 @@ describe('workAgentEnv', () => {
         endpoint,
         agentHome: null,
         providerKeys: {},
+        firecrawlUrl: null,
       });
       expect([base, env.GROK_CONFIG]).toEqual([base, want]);
     }
   });
 
   it('never sets a provider key variable name it does not know', () => {
-    const env = workAgentEnv({ base: {}, endpoint, agentHome: null, providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' } });
+    const env = workAgentEnv({
+      base: {},
+      endpoint,
+      agentHome: null,
+      providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' },
+      firecrawlUrl: null,
+    });
     expect(env.PATH).toBeUndefined();
     expect(env.EXA_API_KEY).toBe('k');
+  });
+
+  it('pins the address the firecrawl CLI uses: the cloud with the key, this Mac with no key, none without either', () => {
+    const inherited = { ...base, FIRECRAWL_API_URL: 'https://elsewhere.example' };
+    const cloud = workAgentEnv({
+      base: inherited,
+      endpoint,
+      agentHome: null,
+      providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
+      firecrawlUrl: null,
+    });
+    expect([cloud.FIRECRAWL_API_KEY, cloud.FIRECRAWL_API_URL]).toEqual(['fc-key', 'https://api.firecrawl.dev']);
+    const local = workAgentEnv({
+      base: inherited,
+      endpoint,
+      agentHome: null,
+      providerKeys: { FIRECRAWL_API_KEY: 'fc-key', EXA_API_KEY: 'k' },
+      firecrawlUrl: 'http://127.0.0.1:3002',
+    });
+    expect(local.FIRECRAWL_API_URL).toBe('http://127.0.0.1:3002');
+    expect(local).not.toHaveProperty('FIRECRAWL_API_KEY');
+    expect(local.EXA_API_KEY).toBe('k');
+    const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {}, firecrawlUrl: null });
+    expect(none).not.toHaveProperty('FIRECRAWL_API_URL');
+    expect(none).not.toHaveProperty('FIRECRAWL_API_KEY');
   });
 });
 
@@ -251,7 +302,7 @@ describe('session contract', () => {
       cwd: '/r/chat-workspace',
       modelId: 'm',
       webServer: { command: '/app/exe', script: '/app/server.js' },
-      web: { searchProvider: 'exa', searchKey: 'KEY-1', fetchProvider: 'exa', fetchKey: 'KEY-1' },
+      web: { searchProvider: 'exa', searchKey: 'KEY-1', fetchProvider: 'exa', fetchKey: 'KEY-1', fetchUrl: '' },
       prompt: 'P',
       pluginDir: '/r/plugins/chat-web',
       extraCaCerts: '/ca.pem',
@@ -268,6 +319,7 @@ describe('session contract', () => {
             { name: 'MLX_WEB_SEARCH_KEY', value: 'KEY-1' },
             { name: 'MLX_WEB_FETCH_PROVIDER', value: 'exa' },
             { name: 'MLX_WEB_FETCH_KEY', value: 'KEY-1' },
+            { name: 'MLX_WEB_FETCH_URL', value: '' },
             { name: 'NODE_NO_WARNINGS', value: '1' },
             { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
             { name: 'NODE_EXTRA_CA_CERTS', value: '/ca.pem' },
@@ -376,6 +428,36 @@ describe('session contract', () => {
     expect(params).toEqual({ sessionId: 'sid', prompt: [{ type: 'text', text: 'hello' }] });
     const block = (params.prompt as Array<Record<string, unknown>>)[0]!;
     expect(Object.keys(block).sort()).toEqual(['text', 'type']);
+  });
+
+  it('attachments follow the text block: every file as a resource, then every picture, none with _meta, no picture with a uri', () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    expect(promptParams('sid', 'hello', [])).toEqual(promptParams('sid', 'hello'));
+    const params = promptParams('sid', 'hello', [
+      { kind: 'image', mediaType: 'image/png', data: png },
+      { kind: 'file', name: 'a#b.ts', text: 'const a = 1;\n' },
+      { kind: 'image', mediaType: 'image/jpeg', data: '/9j/4A==' },
+      { kind: 'file', name: 'notes.md', text: '# notes' },
+    ]);
+    expect(params).toEqual({
+      sessionId: 'sid',
+      prompt: [
+        { type: 'text', text: 'hello' },
+        {
+          type: 'resource',
+          resource: { uri: 'file:///attached/a_b.ts', mimeType: 'text/plain', text: 'const a = 1;\n' },
+        },
+        { type: 'resource', resource: { uri: 'file:///attached/notes.md', mimeType: 'text/plain', text: '# notes' } },
+        { type: 'image', data: png, mimeType: 'image/png' },
+        { type: 'image', data: '/9j/4A==', mimeType: 'image/jpeg' },
+      ],
+    });
+    for (const block of params.prompt as Array<Record<string, unknown>>) {
+      expect(block).not.toHaveProperty('_meta');
+      if (block.type === 'image') expect(Object.keys(block).sort()).toEqual(['data', 'mimeType', 'type']);
+      if (block.type === 'resource')
+        expect(Object.keys(block.resource as object).sort()).toEqual(['mimeType', 'text', 'uri']);
+    }
   });
 
   it('the Chat prompt is the head, a blank line and the skill body without frontmatter', () => {

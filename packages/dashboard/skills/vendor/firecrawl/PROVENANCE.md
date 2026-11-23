@@ -23,7 +23,7 @@
 Only the two changes the app allows. Line numbers are those of the upstream file.
 
 1. The `allowed-tools` frontmatter entry is removed (it pre-approves shell commands; in Work every command must pass the permission prompt).
-2. A line that points to a file that is not shipped (install, security or setup instructions) is replaced by the fixed sentence: "The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup."
+2. A line that points to a file that is not shipped (install, security or setup instructions) is replaced by the fixed sentence: "The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup."
 
 | File | Upstream line | Change | Upstream text |
 |---|---|---|---|

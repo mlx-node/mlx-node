@@ -17,6 +17,10 @@
   border-color: var(--foreground);
 }
 
+.root[data-dragging] {
+  border-color: var(--foreground);
+}
+
 .noticeClip {
   overflow: clip;
 }

@@ -1,12 +1,14 @@
 /**
  * Spawn environments of the two agent processes. Chat is built from nothing: no variable is inherited, so no key,
  * token or user config of the Control Panel reaches it. Work is the Control Panel's own environment, like `mlx agent`
- * in a terminal, minus the app's internal variables and every provider key that is not selected.
+ * in a terminal, minus the app's internal variables, every provider key that is not selected and the Firecrawl
+ * address, which the app sets itself.
  */
 
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 
 import type { ChatPaths } from '../paths.js';
+import { PROVIDER_ORIGINS } from '../web/http.js';
 
 export interface InferenceAccess {
   /** Loopback origin of the inference sidecar, without a path. */
@@ -108,6 +110,8 @@ export interface WorkEnvInput {
   agentHome: string | null;
   /** The selected providers' key variables (name → key). Every other provider key variable is removed. */
   providerKeys: Readonly<Record<string, string>>;
+  /** Firecrawl on this Mac, when the Work `firecrawl` CLI uses it: its address, and no Firecrawl key goes with it. */
+  firecrawlUrl: string | null;
 }
 
 function plainObject(value: unknown): Record<string, unknown> | null {
@@ -147,11 +151,21 @@ export function workOverlay(base: string | undefined): string {
   });
 }
 
-export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
+/**
+ * What Work inherits from the Control Panel: every variable minus the app's internals, every provider key and the
+ * address the `firecrawl` CLI sends its key to.
+ */
+export function workInherited(base: NodeJS.ProcessEnv): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [name, value] of Object.entries(input.base)) if (value !== undefined) env[name] = value;
+  for (const [name, value] of Object.entries(base)) if (value !== undefined) env[name] = value;
   for (const name of WORK_ENV_REMOVED) delete env[name];
   for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
+  delete env.FIRECRAWL_API_URL;
+  return env;
+}
+
+export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
+  const env = workInherited(input.base);
   Object.assign(env, baseUrls(input.endpoint));
   env.XAI_API_KEY = input.endpoint.token;
   env.GROK_DISABLE_AUTOUPDATER = '1';
@@ -163,9 +177,16 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   env.CDPATH = '';
   env.GROK_CONFIG = workOverlay(env.GROK_CONFIG);
   if (input.agentHome !== null) env.GROK_HOME = input.agentHome;
+  const firecrawlKeys: readonly string[] = PROVIDER_KEY_ENV.firecrawl;
   for (const [name, value] of Object.entries(input.providerKeys)) {
-    if (ALL_PROVIDER_KEY_ENV.includes(name)) env[name] = value;
+    if (!ALL_PROVIDER_KEY_ENV.includes(name)) continue;
+    // Firecrawl on this Mac passes a caller's key on to Firecrawl Cloud.
+    if (input.firecrawlUrl !== null && firecrawlKeys.includes(name)) continue;
+    env[name] = value;
   }
+  // Set over the CLI's own saved address, which it would otherwise send the key to.
+  if (input.firecrawlUrl !== null) env.FIRECRAWL_API_URL = input.firecrawlUrl;
+  else if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
   env.FIRECRAWL_NO_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_NO_ENDPOINT_FEEDBACK = '1';

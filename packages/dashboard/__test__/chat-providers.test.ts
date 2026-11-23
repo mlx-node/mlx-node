@@ -25,12 +25,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import { ApiError, type ApiResponse } from '../src/api/errors.js';
 import { chatPaths, type ChatPaths } from '../src/chat/paths.js';
 import { checkKeyFormat, MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
-import { ProvidersService, type ProvidersServiceOptions } from '../src/chat/providers/service.js';
+import {
+  LOCAL_CHECK_GAP_MS,
+  ProvidersService,
+  type ProvidersServiceOptions,
+  WORK_PATH_ASK_GAP_MS,
+} from '../src/chat/providers/service.js';
 import { parseSettings, repairSettings, defaultSettings } from '../src/chat/providers/settings.js';
 import type { ProviderId, ProvidersResponse } from '../src/chat/providers/types.js';
 import { validateKey } from '../src/chat/providers/validate.js';
 import { routeError } from '../src/chat/route-errors.js';
-import { providerIdParam, providerKeyInput, providerSelectionInput } from '../src/chat/route-input.js';
+import {
+  providerIdParam,
+  providerKeyInput,
+  providerLocalInput,
+  providerSelectionInput,
+} from '../src/chat/route-input.js';
 import type { ChatService } from '../src/chat/service.js';
 import { defaultSkillsDir } from '../src/chat/skills/manifest.js';
 import { formatErrorText } from '../src/chat/web/result-text.js';
@@ -48,6 +58,9 @@ import {
 import {
   CHECK_OK,
   type FakeAnswer,
+  type FakeLocalAnswers,
+  fakeLocalAnswers,
+  fakeLocalScript,
   type FakeProvider,
   type FakeRequest,
   keyOf,
@@ -72,6 +85,11 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => s.close()));
   rmSync(root, { recursive: true, force: true });
 });
+
+/** The address a fetch call names. */
+function urlOf(input: string | URL | Request): string {
+  return typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+}
 
 /** One fake per provider; each answers by `answer(id, request)`, by default a valid key check. */
 async function providerServers(
@@ -125,6 +143,12 @@ function service(over: Partial<ProvidersServiceOptions> = {}): ProvidersService 
     workPath: () => '',
     ...over,
   });
+}
+
+/** A clock that is past the ask gap at every read, so each providers read may ask the shell. */
+function pastGap(): () => number {
+  let at = 0;
+  return () => (at += WORK_PATH_ASK_GAP_MS);
 }
 
 function selected(response: ProvidersResponse): ProviderId[] {
@@ -194,7 +218,82 @@ describe('settings file', () => {
           key: MARKER,
         }),
       ),
-    ).toEqual({ version: 1, search: null, firecrawl: false, checks: { exa: { status: 'ok', at: 5 } } });
+    ).toEqual({
+      version: 1,
+      search: null,
+      firecrawl: false,
+      firecrawlLocal: false,
+      localUrl: null,
+      checks: { exa: { status: 'ok', at: 5 } },
+    });
+  });
+
+  it('keeps an address of Firecrawl on this Mac only in its saved form, and this Mac only with an address', () => {
+    const read = (fields: Record<string, unknown>) =>
+      parseSettings(JSON.stringify({ version: 1, firecrawl: true, ...fields }));
+    expect(read({})).toMatchObject({ firecrawl: true, firecrawlLocal: false, localUrl: null });
+    expect(read({ firecrawlLocal: true, localUrl: 'http://127.0.0.1:3002' })).toMatchObject({
+      firecrawlLocal: true,
+      localUrl: 'http://127.0.0.1:3002',
+    });
+    expect(read({ firecrawlLocal: true, localUrl: 'http://[::1]:4000' }).localUrl).toBe('http://[::1]:4000');
+    for (const url of [
+      'http://localhost:3002',
+      'http://127.0.0.1:3002/',
+      'https://127.0.0.1:3002',
+      'http://192.168.1.5:3002',
+      'http://127.0.0.1:80',
+      ' http://127.0.0.1:3002',
+      3002,
+    ]) {
+      expect([url, read({ firecrawlLocal: true, localUrl: url })]).toMatchObject([
+        url,
+        { firecrawl: false, firecrawlLocal: false, localUrl: null },
+      ]);
+    }
+    expect(read({ firecrawlLocal: true })).toMatchObject({ firecrawl: false, firecrawlLocal: false, localUrl: null });
+    expect(read({ localUrl: 'http://localhost:3002' })).toMatchObject({ firecrawl: true, localUrl: null });
+    expect(read({ firecrawlLocal: 'yes', localUrl: 'http://127.0.0.1:3002' }).firecrawlLocal).toBe(false);
+  });
+
+  it('a pick of this Mac whose address cannot be read turns the crawler off, not to the cloud key', async () => {
+    const secrets = new MemorySecretStore();
+    await secrets.set('firecrawl', 'fc-key-000001');
+    mkdirSync(join(root, 'chat'), { recursive: true });
+    writeFileSync(
+      paths.providers,
+      JSON.stringify({
+        version: 1,
+        search: null,
+        firecrawl: true,
+        firecrawlLocal: true,
+        localUrl: 'http://localhost:3002',
+      }),
+    );
+    const svc = service({ secrets });
+    const listed = await svc.list();
+    expect([listed.firecrawl, listed.firecrawlLocal, listed.fetch]).toEqual([false, false, null]);
+    expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'none', fetchKey: '', fetchUrl: '' });
+  });
+
+  it('writes the place and the address, and a file without them reads as the cloud with no address', async () => {
+    const svc = service({ fetch: (i, n) => fetch(i, n) });
+    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+    servers.push(local);
+    await svc.putLocal(local.baseUrl);
+    expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toEqual({
+      version: 1,
+      search: null,
+      firecrawl: true,
+      firecrawlLocal: true,
+      localUrl: local.baseUrl,
+      checks: {},
+    });
+    expect(parseSettings('{"version":1,"search":"exa","firecrawl":true}')).toEqual({
+      ...defaultSettings(),
+      search: 'exa',
+      firecrawl: true,
+    });
   });
 
   it('repairs a selection without a key, and keeps one whose key is not known yet', () => {
@@ -203,6 +302,12 @@ describe('settings file', () => {
     expect(settings).toMatchObject({ search: 'brave', firecrawl: true });
     expect(repairSettings(settings, () => false)).toBe(true);
     expect(settings).toMatchObject({ search: null, firecrawl: false });
+    const local = { ...defaultSettings(), firecrawl: true, firecrawlLocal: true, localUrl: 'http://127.0.0.1:3002' };
+    expect(repairSettings(local, () => false)).toBe(false);
+    expect(local).toMatchObject({ firecrawl: true, firecrawlLocal: true });
+    const gone = { ...local, localUrl: null };
+    expect(repairSettings(gone, () => true)).toBe(true);
+    expect(gone).toMatchObject({ firecrawl: false, firecrawlLocal: false });
   });
 });
 
@@ -221,6 +326,19 @@ describe('route inputs', () => {
     expect(() => providerSelectionInput({ firecrawl: 'yes' })).toThrow('wrong type');
     expect(() => providerSelectionInput({})).toThrow('required');
     expect(() => providerSelectionInput({ search: 'exa', pluginDirs: ['/tmp'] })).toThrow('Unknown field');
+    expect(providerSelectionInput({ firecrawl: true, firecrawlLocal: true })).toEqual({
+      firecrawl: true,
+      firecrawlLocal: true,
+    });
+    expect(providerSelectionInput({ firecrawlLocal: false })).toEqual({ firecrawlLocal: false });
+    expect(() => providerSelectionInput({ firecrawlLocal: 'yes' })).toThrow('wrong type');
+    expect(() => providerSelectionInput({ firecrawl: true, localUrl: 'http://127.0.0.1:3002' })).toThrow(
+      'Unknown field',
+    );
+    expect(providerLocalInput({ url: 'http://127.0.0.1:3002' })).toEqual({ url: 'http://127.0.0.1:3002' });
+    expect(() => providerLocalInput({})).toThrow('required');
+    expect(() => providerLocalInput({ url: 3002 })).toThrow('wrong type');
+    expect(() => providerLocalInput({ url: 'http://127.0.0.1:3002', firecrawl: true })).toThrow('Unknown field');
     expect(() => providerIdParam('google')).toThrow('No such provider');
     expect(providerIdParam('firecrawl')).toBe('firecrawl');
     expect(checkKeyFormat('  abcdefgh  ')).toBe('abcdefgh');
@@ -269,9 +387,15 @@ describe('key checks', () => {
     });
     answers['firecrawl:zero-0000'] = { json: { success: true, data: { remainingCredits: 0 } } };
     expect((await check('firecrawl', 'zero-0000')).check).toBe('no-credit');
+    answers['exa:kfeat-000'] = { status: 403, json: { error: 'Feature disabled', tag: 'FEATURE_DISABLED' } };
+    answers['exa:kblock-00'] = { status: 403, json: { error: 'Team blocked', tag: 'TEAM_BLOCKED' } };
+    answers['brave:kfeat-000'] = { status: 403, json: { tag: 'FEATURE_DISABLED' } };
+    expect((await check('exa', 'kfeat-000')).check).toBe('ok');
+    expect((await check('exa', 'kblock-00')).check).toBe('rejected');
+    expect((await check('brave', 'kfeat-000')).check).toBe('rejected');
     const requests = servers.flatMap((s) => s.requests);
-    const exa = requests.find((r) => r.path === '/v0/teams/me')!;
-    expect([exa.method, exa.headers['x-api-key']]).toEqual(['GET', 'good-key-1']);
+    const exa = requests.find((r) => r.path === '/monitors')!;
+    expect([exa.method, exa.query, exa.headers['x-api-key']]).toEqual(['GET', [['limit', '1']], 'good-key-1']);
     expect(requests.find((r) => r.path === '/user/balance')!.headers.authorization).toBe('Bearer good-key-1');
     const brave = requests.find((r) => r.path === '/res/v1/web/search')!;
     expect(brave.query).toEqual([
@@ -447,6 +571,7 @@ describe('keys', () => {
       searchKey: 'brave-key-new',
       fetchProvider: 'brave',
       fetchKey: 'brave-key-new',
+      fetchUrl: '',
     });
     const removed = await svc.deleteKey('brave');
     expect([removed.search, removed.providers[2]!.configured, removed.providers[2]!.check]).toEqual([
@@ -457,7 +582,13 @@ describe('keys', () => {
     expect(pluginFolders()).toEqual(['chat-web']);
     expect(svc.secretNeedles().sort()).toEqual(['brave-key-new', 'brave-key-old']);
     expect(svc.workKeys()).toEqual({});
-    expect(svc.chatWeb()).toEqual({ searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '' });
+    expect(svc.chatWeb()).toEqual({
+      searchProvider: 'none',
+      searchKey: '',
+      fetchProvider: 'none',
+      fetchKey: '',
+      fetchUrl: '',
+    });
   });
 
   it('a Check re-reads the Keychain: a key removed outside the app turns the provider off', async () => {
@@ -604,7 +735,13 @@ describe('keys', () => {
           null,
           false,
         ]);
-        expect(svc.chatWeb()).toEqual({ searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '' });
+        expect(svc.chatWeb()).toEqual({
+          searchProvider: 'none',
+          searchKey: '',
+          fetchProvider: 'none',
+          fetchKey: '',
+          fetchUrl: '',
+        });
         expect((await failure(svc.select({ search: 'exa' }), 'provider-selection')).code).toBe('E_CONFLICT');
       }
       rmSync(paths.root, { recursive: true, force: true });
@@ -671,7 +808,13 @@ describe('key cache', () => {
     const listed = await svc.list();
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(listed.keychain).toBe('unavailable');
-    expect(svc.chatWeb()).toEqual({ searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '' });
+    expect(svc.chatWeb()).toEqual({
+      searchProvider: 'none',
+      searchKey: '',
+      fetchProvider: 'none',
+      fetchKey: '',
+      fetchUrl: '',
+    });
     expect(svc.workKeys()).toEqual({});
     expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toMatchObject({ search: 'exa', firecrawl: true });
     const write = await failure(svc.putKey('brave', 'brave-key-001'));
@@ -808,7 +951,7 @@ describe('Work view of the providers', () => {
     await store.set('deepseek', 'ds-key-00001');
     await store.set('firecrawl', 'fc-key-000001');
     let path = '';
-    const svc = service({ secrets: store, workPath: () => path });
+    const svc = service({ secrets: store, now: pastGap(), workPath: () => path });
     await svc.select({ search: 'deepseek', firecrawl: true });
     let listed = await svc.list();
     expect(listed.providers[3]!.work).toEqual({ ready: false, missing: 'firecrawl-cli' });
@@ -844,6 +987,500 @@ describe('Work view of the providers', () => {
     expect((await svc.list()).providers[0]!.skill.installed).toBe(false);
     expect(svc.workPluginDirs()).toEqual([]);
   });
+});
+
+describe('the Work PATH', () => {
+  /** A store with a Firecrawl key; with `on`, the settings on disk have Firecrawl selected. */
+  async function firecrawlStore(on: boolean): Promise<MemorySecretStore> {
+    const store = new MemorySecretStore();
+    await store.set('firecrawl', 'fc-key-000001');
+    if (on) await service({ secrets: store }).select({ firecrawl: true });
+    return store;
+  }
+
+  function cliIn(name: string): string {
+    const bin = join(root, name);
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'firecrawl'), '#!/bin/sh\n');
+    chmodSync(join(bin, 'firecrawl'), 0o755);
+    return bin;
+  }
+
+  /** Every queued step and every open question has finished. */
+  async function idle(svc: ProvidersService): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await svc.settled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  function deferred(): { promise: Promise<string | undefined>; resolve: (path: string | undefined) => void } {
+    let resolve!: (path: string | undefined) => void;
+    const promise = new Promise<string | undefined>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it('Firecrawl off: the shell is never asked', async () => {
+    const store = await firecrawlStore(false);
+    let calls = 0;
+    const svc = service({
+      secrets: store,
+      workPath: () => {
+        calls += 1;
+        return '';
+      },
+    });
+    await idle(svc);
+    for (let i = 0; i < 3; i += 1) await svc.list();
+    await idle(svc);
+    expect(calls).toBe(0);
+    await svc.select({ firecrawl: true });
+    expect(calls).toBe(1);
+  });
+
+  it('no start, settle or host path waits for the Work PATH', async () => {
+    const store = await firecrawlStore(true);
+    const answer = deferred();
+    const svc = service({ secrets: store, workPath: () => answer.promise });
+    let changed = 0;
+    svc.attach({ changed: () => (changed += 1), keysChanged: () => {}, applyPending: () => false });
+    await svc.settled();
+    expect(await svc.chatSkillReady()).toBe(true);
+    expect(svc.workKeys()).toEqual({});
+    expect(changed).toBe(0);
+    answer.resolve(cliIn('bin'));
+    await until(() => changed === 1);
+    expect(svc.workKeys()).toEqual({ FIRECRAWL_API_KEY: 'fc-key-000001' });
+    expect(svc.workPluginDirs()).toEqual([join(paths.plugins, 'firecrawl')]);
+  });
+
+  it('asks again only while the CLI is not found, and a read asks at most once per gap', async () => {
+    const store = await firecrawlStore(true);
+    let calls = 0;
+    let path = '';
+    let clock = 1_000;
+    const later = (): void => {
+      clock += WORK_PATH_ASK_GAP_MS;
+    };
+    const svc = service({
+      secrets: store,
+      now: () => clock,
+      workPath: () => {
+        calls += 1;
+        return path;
+      },
+    });
+    await idle(svc);
+    expect(calls).toBe(1);
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    expect(calls).toBe(1);
+    later();
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    expect(calls).toBe(2);
+    const bin = cliIn('bin');
+    path = `/nonexistent:${bin}`;
+    clock += WORK_PATH_ASK_GAP_MS - 1;
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    expect(calls).toBe(2);
+    clock += 1;
+    expect((await svc.list()).providers[3]!.work).toEqual({ ready: true, missing: null });
+    expect(calls).toBe(3);
+    later();
+    await svc.list();
+    expect(calls).toBe(3);
+    rmSync(join(bin, 'firecrawl'));
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    expect(calls).toBe(3);
+    await svc.list();
+    expect(calls).toBe(4);
+  });
+
+  it('one question at a time', async () => {
+    const store = await firecrawlStore(true);
+    let calls = 0;
+    let gate = deferred();
+    const svc = service({
+      secrets: store,
+      now: pastGap(),
+      workPath: () => {
+        calls += 1;
+        return gate.promise;
+      },
+    });
+    await svc.settled();
+    gate.resolve('');
+    await idle(svc);
+    expect(calls).toBe(1);
+    gate = deferred();
+    const both = Promise.all([svc.list(), svc.list()]);
+    await until(() => calls === 2);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    gate.resolve('');
+    await both;
+    expect(calls).toBe(2);
+  });
+
+  it('a workPath that throws keeps the earlier answer', async () => {
+    const store = await firecrawlStore(true);
+    const bin = cliIn('bin');
+    let fail = false;
+    let calls = 0;
+    const svc = service({
+      secrets: store,
+      now: pastGap(),
+      workPath: () => {
+        calls += 1;
+        if (fail) throw new Error('no shell');
+        return bin;
+      },
+    });
+    await idle(svc);
+    expect((await svc.list()).providers[3]!.work.missing).toBe(null);
+    fail = true;
+    rmSync(join(bin, 'firecrawl'));
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    expect((await svc.list()).providers[3]!.work.missing).toBe('firecrawl-cli');
+    cliIn('bin');
+    expect((await svc.list()).providers[3]!.work).toEqual({ ready: true, missing: null });
+    expect(calls).toBe(3);
+  });
+});
+
+describe('Firecrawl on this Mac', () => {
+  /** A fake `firecrawl-local serve` on 127.0.0.1; its saved form is its base URL. */
+  async function fakeLocal(over: Partial<FakeLocalAnswers> = {}): Promise<{
+    url: string;
+    answers: FakeLocalAnswers;
+    server: FakeProvider;
+  }> {
+    const answers = { ...fakeLocalAnswers(), ...over };
+    const server = await startFakeProvider(fakeLocalScript(answers));
+    servers.push(server);
+    return { url: server.baseUrl, answers, server };
+  }
+
+  /** A service on the real network stack (fakes on 127.0.0.1 only) that counts host changes. */
+  function counted(over: Partial<ProvidersServiceOptions> = {}): { svc: ProvidersService; changes: () => number } {
+    let changes = 0;
+    const svc = service({ fetch: (i, n) => fetch(i, n), ...over });
+    svc.attach({ changed: () => (changes += 1), keysChanged: () => {}, applyPending: () => false });
+    return { svc, changes: () => changes };
+  }
+
+  function cliOnPath(): string {
+    const bin = join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'firecrawl'), '#!/bin/sh\n');
+    chmodSync(join(bin, 'firecrawl'), 0o755);
+    return bin;
+  }
+
+  it('a typed address that is not on this Mac is refused before any request', async () => {
+    const asked: string[] = [];
+    const svc = service({
+      fetch: (input) => {
+        asked.push(urlOf(input));
+        return Promise.reject(new Error('no network'));
+      },
+    });
+    for (const typed of ['http://192.168.1.5:3002', 'https://127.0.0.1:3002', `http://${MARKER}.example:3002`]) {
+      const error = await failure(svc.putLocal(typed), 'provider-local');
+      expect([error.code, error.message]).toEqual(['E_BAD_REQUEST', 'Use an address on this Mac.']);
+      expect(error.message).not.toContain(typed);
+    }
+    expect(asked).toEqual([]);
+  });
+
+  it('a check that is not ok saves nothing: the earlier address and the selection stay', async () => {
+    const good = await fakeLocal();
+    const { svc, changes } = counted();
+    expect((await svc.putLocal(good.url)).saved).toBe(true);
+    const before = readFileSync(paths.providers, 'utf8');
+    const open = await fakeLocal({ probe: { json: { success: true, data: { markdown: 'health' } } } });
+    const reply = await svc.putLocal(open.url);
+    expect([reply.saved, reply.check]).toEqual([false, 'open']);
+    expect(reply.providers.local.url).toBe(good.url);
+    expect([reply.providers.firecrawl, reply.providers.firecrawlLocal]).toEqual([true, true]);
+    expect(readFileSync(paths.providers, 'utf8')).toBe(before);
+    expect(svc.chatWeb().fetchUrl).toBe(good.url);
+    expect(changes()).toBe(1);
+    const closed = await startFakeProvider({});
+    await closed.close();
+    const down = await svc.putLocal(closed.baseUrl);
+    expect([down.saved, down.check]).toEqual([false, 'not-running']);
+  });
+
+  it('an ok check saves the address, turns on this Mac from Off, installs the Firecrawl folder, tells the hosts once', async () => {
+    const local = await fakeLocal();
+    const { svc, changes } = counted();
+    const reply = await svc.putLocal(` ${local.url.replace('127.0.0.1', 'localhost')}/ `);
+    expect([reply.saved, reply.check]).toEqual([true, 'ok']);
+    expect(reply.providers).toMatchObject({ firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' });
+    expect(reply.providers.local).toMatchObject({ url: local.url, check: 'ok', version: '0.1.1', cloud: 'off' });
+    expect(reply.providers.local.checkedAt).not.toBeNull();
+    expect(pluginFolders()).toEqual(['chat-web', 'firecrawl']);
+    expect(changes()).toBe(1);
+    expect(svc.summary()).toMatchObject({ firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' });
+    expect(local.server.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+      'GET /health',
+      'POST /v2/scrape',
+      'GET /v2/team/credit-usage',
+    ]);
+  });
+
+  it('a Firecrawl folder that does not install keeps the address but leaves the crawler off', async () => {
+    const local = await fakeLocal();
+    const skills = join(root, 'skills');
+    cpSync(defaultSkillsDir(), skills, { recursive: true });
+    writeFileSync(join(skills, 'vendor/firecrawl/skills/firecrawl/SKILL.md'), 'tampered');
+    const { svc } = counted({ skillsDir: skills });
+    const reply = await svc.putLocal(local.url);
+    expect(reply.saved).toBe(true);
+    expect([reply.providers.firecrawl, reply.providers.firecrawlLocal, reply.providers.local.url]).toEqual([
+      false,
+      false,
+      local.url,
+    ]);
+    expect(pluginFolders()).toEqual(['chat-web']);
+  });
+
+  it('a saved address or key never moves the crawler from the place in use; from Off it turns on the saved one', async () => {
+    const local = await fakeLocal();
+    const urls = await providerServers();
+    const { svc } = counted({ baseUrls: urls });
+    await svc.putLocal(local.url);
+    const key = await svc.putKey('firecrawl', 'fc-key-000001');
+    expect([key.providers.firecrawl, key.providers.firecrawlLocal]).toEqual([true, true]);
+    expect(svc.chatWeb()).toEqual({
+      searchProvider: 'none',
+      searchKey: '',
+      fetchProvider: 'firecrawl',
+      fetchKey: '',
+      fetchUrl: local.url,
+    });
+    await svc.select({ firecrawl: true, firecrawlLocal: false });
+    const again = await svc.putLocal(local.url);
+    expect([again.providers.firecrawl, again.providers.firecrawlLocal]).toEqual([true, false]);
+    expect(svc.chatWeb()).toMatchObject({ fetchKey: 'fc-key-000001', fetchUrl: '' });
+    await svc.select({ firecrawl: false });
+    expect((await svc.putKey('firecrawl', 'fc-key-000002')).providers).toMatchObject({
+      firecrawl: true,
+      firecrawlLocal: false,
+    });
+    await svc.select({ firecrawl: false });
+    expect((await svc.putLocal(local.url)).providers).toMatchObject({ firecrawl: true, firecrawlLocal: true });
+  });
+
+  it('removing the place in use turns the crawler off and never moves it to the other place', async () => {
+    const local = await fakeLocal();
+    const urls = await providerServers();
+    const { svc, changes } = counted({ baseUrls: urls });
+    await svc.putKey('firecrawl', 'fc-key-000001');
+    await svc.putLocal(local.url);
+    await svc.select({ firecrawlLocal: true });
+    const keyGone = await svc.deleteKey('firecrawl');
+    expect([keyGone.firecrawl, keyGone.firecrawlLocal, keyGone.fetch]).toEqual([true, true, 'firecrawl']);
+    await svc.putKey('firecrawl', 'fc-key-000001');
+    const before = changes();
+    const localGone = await svc.deleteLocal();
+    expect([localGone.firecrawl, localGone.firecrawlLocal, localGone.fetch, localGone.local.url]).toEqual([
+      false,
+      false,
+      null,
+      null,
+    ]);
+    expect(changes()).toBe(before + 1);
+    expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'none', fetchKey: '', fetchUrl: '' });
+    expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toMatchObject({
+      firecrawl: false,
+      firecrawlLocal: false,
+      localUrl: null,
+    });
+
+    await svc.putLocal(local.url);
+    await svc.select({ firecrawl: true, firecrawlLocal: false });
+    const cloudStays = await svc.deleteLocal();
+    expect([cloudStays.firecrawl, cloudStays.firecrawlLocal, cloudStays.fetch, cloudStays.local.url]).toEqual([
+      true,
+      false,
+      'firecrawl',
+      null,
+    ]);
+    const cloudGone = await svc.deleteKey('firecrawl');
+    expect([cloudGone.firecrawl, cloudGone.firecrawlLocal]).toEqual([false, false]);
+  });
+
+  it('a pick of this Mac needs a saved address, a pick of the cloud a key; each switch tells the hosts once', async () => {
+    const local = await fakeLocal();
+    const urls = await providerServers();
+    const { svc, changes } = counted({ baseUrls: urls });
+    const none = await failure(svc.select({ firecrawl: true, firecrawlLocal: true }), 'provider-selection');
+    expect([none.code, none.reason, none.message]).toEqual([
+      'E_CONFLICT',
+      'local-not-set-up',
+      'Set up Firecrawl on this Mac first.',
+    ]);
+    await svc.putLocal(local.url);
+    await svc.select({ firecrawl: false });
+    expect((await svc.select({ firecrawl: true, firecrawlLocal: true })).firecrawlLocal).toBe(true);
+    const noKey = await failure(svc.select({ firecrawl: true, firecrawlLocal: false }), 'provider-selection');
+    expect([noKey.code, noKey.message]).toEqual(['E_CONFLICT', 'Add a key for Firecrawl first.']);
+    expect(svc.summary()).toMatchObject({ firecrawl: true, firecrawlLocal: true });
+    await svc.putKey('firecrawl', 'fc-key-000001');
+    let before = changes();
+    expect((await svc.select({ firecrawl: true, firecrawlLocal: false })).firecrawlLocal).toBe(false);
+    expect(changes()).toBe(before + 1);
+    before = changes();
+    expect((await svc.select({ firecrawl: true, firecrawlLocal: true })).firecrawlLocal).toBe(true);
+    expect(changes()).toBe(before + 1);
+  });
+
+  it('the hosts: Chat reads pages here with no key, Work gets the address and no key, only with the CLI', async () => {
+    const local = await fakeLocal();
+    const urls = await providerServers();
+    let path = '';
+    const { svc } = counted({ baseUrls: urls, now: pastGap(), workPath: () => path });
+    await svc.putKey('exa', 'exa-key-0001');
+    await svc.putKey('firecrawl', 'fc-key-000001');
+    await svc.putLocal(local.url);
+    expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'firecrawl', fetchKey: 'fc-key-000001', fetchUrl: '' });
+    await svc.select({ firecrawl: false });
+    expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'exa', fetchKey: 'exa-key-0001', fetchUrl: '' });
+    await svc.select({ firecrawl: true, firecrawlLocal: true });
+    expect(svc.chatWeb()).toEqual({
+      searchProvider: 'exa',
+      searchKey: 'exa-key-0001',
+      fetchProvider: 'firecrawl',
+      fetchKey: '',
+      fetchUrl: local.url,
+    });
+    expect(svc.workFirecrawlUrl()).toBeNull();
+    path = cliOnPath();
+    await svc.list();
+    expect(svc.workFirecrawlUrl()).toBe(local.url);
+    expect(svc.workKeys()).toEqual({ EXA_API_KEY: 'exa-key-0001' });
+    expect(svc.workPluginDirs()).toEqual([join(paths.plugins, 'exa'), join(paths.plugins, 'firecrawl')]);
+    await svc.select({ firecrawl: true, firecrawlLocal: false });
+    expect(svc.workFirecrawlUrl()).toBeNull();
+    expect(svc.workKeys()).toEqual({ EXA_API_KEY: 'exa-key-0001', FIRECRAWL_API_KEY: 'fc-key-000001' });
+    expect(svc.summary()).toMatchObject({ firecrawl: true, firecrawlLocal: false });
+    const keys = servers.flatMap((s) => (s === local.server ? s.requests : [])).map((r) => keyOf(r) + r.body);
+    expect(keys.filter((k) => k.includes('fc-key') || k.includes('exa-key'))).toEqual([]);
+    expect(local.server.requests.every((r) => r.headers.authorization === undefined)).toBe(true);
+  });
+
+  it('a providers read never waits for the check: it answers with the last one and starts one per gap', async () => {
+    const local = await fakeLocal();
+    let clock = 1_000;
+    const { svc, changes } = counted({ now: () => clock });
+    await svc.putLocal(local.url);
+    const after = changes();
+    const healthCount = (): number => local.server.requests.filter((r) => r.path === '/health').length;
+    expect(healthCount()).toBe(1);
+    await svc.list();
+    expect(healthCount()).toBe(1);
+    clock += LOCAL_CHECK_GAP_MS;
+    local.answers.health = { ...local.answers.health, delayMs: 800 };
+    local.answers.probe = { json: { success: true, data: { markdown: 'health' } } };
+    const started = Date.now();
+    const reply = await svc.list();
+    expect(Date.now() - started).toBeLessThan(600);
+    expect(reply.local.check).toBe('ok');
+    await until(() => healthCount() === 2);
+    await svc.list();
+    expect(healthCount()).toBe(2);
+    // The route joins the check still running.
+    expect((await svc.checkLocalNow()).check).toBe('open');
+    expect(healthCount()).toBe(2);
+    expect((await svc.list()).local).toMatchObject({ url: local.url, check: 'open', cloud: null });
+    expect(changes()).toBe(after);
+    local.answers.probe = fakeLocalAnswers().probe;
+    const now = await svc.checkLocalNow();
+    expect([now.check, now.providers.local.check]).toEqual(['ok', 'ok']);
+    expect(healthCount()).toBe(3);
+    expect(changes()).toBe(after);
+  });
+
+  it('with no address saved nothing is asked of the network', async () => {
+    const asked: string[] = [];
+    const svc = service({
+      now: pastGap(),
+      fetch: (input) => {
+        asked.push(urlOf(input));
+        return Promise.reject(new Error('no network'));
+      },
+    });
+    const empty = { url: null, check: null, checkedAt: null, version: null, cloud: null };
+    for (let i = 0; i < 3; i += 1) expect((await svc.list()).local).toEqual(empty);
+    expect(await svc.checkLocalNow()).toMatchObject({ check: null });
+    expect(asked).toEqual([]);
+  });
+});
+
+describe('the runtime and the Work PATH', () => {
+  let runtime: DashboardRuntime | null = null;
+
+  afterEach(async () => {
+    await runtime?.close();
+    runtime = null;
+  });
+
+  async function firecrawlWork(chat: {
+    workPath?: (base: NodeJS.ProcessEnv, home: string) => string;
+    baseEnv: NodeJS.ProcessEnv;
+    homeDir: string;
+  }): Promise<ProvidersResponse> {
+    const secrets = new MemorySecretStore();
+    await secrets.set('firecrawl', 'fc-key-000001');
+    const rt = join(root, 'rt');
+    runtime = createDashboardRuntime({
+      dbPath: ':memory:',
+      tracesDir: join(rt, 'traces'),
+      modelsDir: join(rt, 'models'),
+      runtimeDir: join(rt, 'runtime'),
+      supervisorPath: join(rt, 'supervisor.json'),
+      agentHome: join(rt, 'agent-home'),
+      chat: {
+        tempRoots: [],
+        root: paths.root,
+        agentCommand: { command: process.execPath, args: [FAKE_AGENT, join(root, 'none.json')] },
+        secrets,
+        readEndpoint: async () => null,
+        ...chat,
+      },
+    });
+    expect(
+      (await runtime.call({ method: 'PUT', path: '/api/providers/selection', body: { firecrawl: true } })).ok,
+    ).toBe(true);
+    const reply = await runtime.call({ method: 'GET', path: '/api/providers' });
+    if (!reply.ok) throw new Error(reply.message);
+    return reply.body as ProvidersResponse;
+  }
+
+  it('asks chat.workPath with the Work env and home; without it, the PATH of baseEnv', async () => {
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'firecrawl'), '#!/bin/sh\n');
+    chmodSync(join(bin, 'firecrawl'), 0o755);
+    const baseEnv = { PATH: '/usr/bin:/bin', HOME: join(root, 'home') };
+    const homeDir = join(root, 'home');
+    let seen: [NodeJS.ProcessEnv, string] | null = null;
+    const asked = await firecrawlWork({
+      baseEnv,
+      homeDir,
+      workPath: (base, home) => {
+        seen = [base, home];
+        return bin;
+      },
+    });
+    expect(asked.providers[3]!.work.missing).toBe(null);
+    expect(seen).toEqual([baseEnv, homeDir]);
+    await runtime!.close();
+    runtime = null;
+    const plain = await firecrawlWork({ baseEnv: { ...baseEnv, PATH: bin }, homeDir });
+    expect(plain.providers[3]!.work.missing).toBe(null);
+  }, 30_000);
 });
 
 describe('a change and the agent hosts', () => {

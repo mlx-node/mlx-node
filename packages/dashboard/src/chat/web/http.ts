@@ -1,8 +1,9 @@
 /**
  * Outbound HTTPS to the four provider APIs, for the web tools and for key validation. A request goes only to the
- * origin it was built on, and that origin is one of the four provider hosts over `https` on the default port (or a
- * loopback `http` origin a test or the dev harness passed in). No redirect is followed, the body read stops at 2 MiB,
- * and every failure is a code: no error text, header or body of a provider is ever passed on.
+ * origin it was built on, and that origin is one of the four provider hosts over `https` on the default port, or a
+ * loopback `http` origin: Firecrawl on this Mac at the address the user saved, or a fake a test or the dev harness
+ * passed in. No redirect is followed, the body read stops at 2 MiB, and every failure is a code: no error text, header
+ * or body of a provider is ever passed on.
  */
 
 import type { WebErrorCode, WebFetchProvider } from './result-text.js';
@@ -78,6 +79,8 @@ export interface HttpRequest {
   query?: ReadonlyArray<readonly [string, string]>;
   /** The provider's auth header, and nothing else. */
   auth: Readonly<Record<string, string>>;
+  /** Fixed headers a request needs besides auth; never a value from a provider or the model. */
+  headers?: Readonly<Record<string, string>>;
   body?: unknown;
   timeoutMs: number;
 }
@@ -115,7 +118,12 @@ export async function httpJson(request: HttpRequest): Promise<HttpReply> {
     return { kind: 'failed', code: 'provider-error' };
   }
   if (!targetAllowed(url, request.baseUrl)) return { kind: 'failed', code: 'provider-error' };
-  const headers: Record<string, string> = { ...request.auth, Accept: 'application/json', 'User-Agent': USER_AGENT };
+  const headers: Record<string, string> = {
+    ...request.auth,
+    ...request.headers,
+    Accept: 'application/json',
+    'User-Agent': USER_AGENT,
+  };
   if (request.body !== undefined) headers['Content-Type'] = 'application/json';
   const controller = new AbortController();
   let timedOut = false;

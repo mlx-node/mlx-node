@@ -38,6 +38,8 @@ record({
   pid: process.pid,
   argv: process.argv.slice(2),
   envNames: Object.keys(process.env).sort(),
+  // Not a secret: the address the firecrawl CLI would use.
+  firecrawlApiUrl: process.env.FIRECRAWL_API_URL ?? null,
   cwd: process.cwd(),
 });
 

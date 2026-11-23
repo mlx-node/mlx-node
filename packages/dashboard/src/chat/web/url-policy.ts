@@ -1,8 +1,13 @@
 /**
- * Which addresses `web_fetch` sends to a provider. The provider reads the page from its own servers, so this is not
- * the leak control (that is the Chat address ledger); it refuses addresses that have no business leaving the Mac:
+ * Which addresses `web_fetch` sends to a provider. A cloud provider reads the page from its own servers, so this is
+ * not the leak control (that is the Chat address ledger); it refuses addresses that have no business leaving the Mac:
  * local names, private and special IPv4 ranges, IPv6 literals, user info. `new URL` already writes every IPv4
  * spelling as four decimal octets, so the scan reads parts of the parsed URL and never guesses at spellings.
+ *
+ * Firecrawl on this Mac reads the page from here, inside the user's network. This check still runs first. A public
+ * name that resolves to a private address is refused by the local server's own rule, which the web tool checks is on
+ * before each read; that rule covers private addresses only. Pages open only to the user's network position (office,
+ * VPN, home IP) are bounded by the address ledger alone.
  */
 
 export const MAX_FETCH_URL_CHARS = 2048;
