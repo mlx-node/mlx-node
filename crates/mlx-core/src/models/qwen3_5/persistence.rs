@@ -43,8 +43,7 @@ use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner};
 pub use super::persistence_moe::{
-    create_random_qwen35_moe_checkpoint, create_random_qwen35_moe_checkpoint_sync,
-    load_moe_for_tool, load_moe_with_thread,
+    create_random_qwen35_moe_checkpoint_sync, load_moe_for_tool, load_moe_with_thread,
 };
 #[cfg(test)]
 pub(crate) use super::persistence_moe::{load_moe_tool_source, sanitize_weights_moe};

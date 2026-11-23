@@ -137,6 +137,8 @@ impl Qwen3_5MoeModel {
 #[napi]
 impl Qwen3_5MoeModel {
     /// Resolved directory containing this model's tokenizer/config assets.
+    /// Streaming wrappers use it after a direct GGUF load so chat templating
+    /// reads the reconstructed sidecars from the native-packed cache.
     #[napi]
     pub fn model_assets_path(&self) -> String {
         self.model_assets_path.clone()
@@ -159,12 +161,21 @@ impl Qwen3_5MoeModel {
 
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
+    ///
+    /// `true` iff `Qwen35MoeInner::paged_adapter` was successfully
+    /// constructed at load time (every load on Metal). On
+    /// VLM checkpoints image turns run on the paged-vision core; a load with
+    /// no adapter admits no image turn. Surfaced through this NAPI method so
+    /// server endpoints can branch on it without round-tripping through
+    /// the model thread.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
     }
 
-    /// Native admission width for plain text autoregressive turns.
+    /// Native admission width for plain text autoregressive turns. Native
+    /// MTP, DFlash2 and multimodal turns retain their speculative or exclusive
+    /// admission policy instead of using this plain autoregressive width.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
         crate::models::qwen3_5::model::qwen35_max_concurrent_sequences(
@@ -203,13 +214,23 @@ impl Qwen3_5MoeModel {
     }
 
     /// Whether this instance has a native MTP head or a loaded DFlash2
-    /// companion.
+    /// companion. Snapshotted at load time so the TS `ChatSession` can
+    /// auto-default `enableMtp = true` without dispatching a command into the
+    /// model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+    ///
+    /// Note: this only reports weight availability. Whether the
+    /// speculative-decode path actually runs on a given call also requires
+    /// the per-request `enableMtp` flag.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
     }
 
     /// Whether this loaded model instance can execute image-bearing turns.
+    ///
+    /// This is an authoritative load-time snapshot, not a model-family guess:
+    /// it requires the loaded vision encoder, image processor, and block-paged
+    /// KV adapter used by the MoE vision path.
     #[napi]
     pub fn supports_images(&self) -> bool {
         self.vision_active
@@ -240,6 +261,11 @@ impl Qwen3_5MoeModel {
     }
 
     /// Load a pretrained model from a directory, or a `.gguf` file.
+    ///
+    /// A direct GGUF file is read into memory and repacked on the model
+    /// thread; only its non-weight assets (config, tokenizer) are written to
+    /// the native GGUF asset directory, which the model reports as its assets
+    /// path.
     #[napi]
     pub async fn load(
         path: String,
@@ -350,6 +376,8 @@ impl Qwen3_5MoeModel {
     }
 
     /// Get the number of parameters in the model.
+    ///
+    /// Pure config computation -- no model-thread dispatch needed.
     #[napi]
     pub fn num_parameters(&self) -> i64 {
         let h = self.config.hidden_size as i64;
@@ -408,6 +436,8 @@ impl Qwen3_5MoeModel {
     }
 
     /// Save the model weights and configuration to a directory.
+    ///
+    /// Dispatches to model thread.
     #[napi]
     pub fn save_model<'env>(
         &self,
@@ -426,7 +456,14 @@ impl Qwen3_5MoeModel {
         Ok(promise)
     }
 
-    /// Closes the model's SSD cache at a clean stop.
+    /// Closes the model's SSD cache at a clean stop (Splash
+    /// `closePersistentCache`): a persistent cache first writes every
+    /// restore point still waiting, newest first, until `deadlineMs`
+    /// (milliseconds on `Date.now()`'s clock, so models closed in turn
+    /// share one deadline); a temporary cache is removed. The cache takes no
+    /// write afterwards. Resolves false when something missed the deadline.
+    ///
+    /// Dispatches to model thread.
     #[napi]
     pub async fn close_cache(&self, deadline_ms: f64) -> Result<bool> {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35FamilyCommand::CloseCache {

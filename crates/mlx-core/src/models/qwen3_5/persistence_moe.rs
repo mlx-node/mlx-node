@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -1097,31 +1096,6 @@ pub fn create_random_qwen35_moe_checkpoint_sync(
         inner.mtp_weights_loaded = true;
     }
     inner.save_model_sync(save_path)
-}
-
-/// Create a random-init Qwen3.5 MoE model and save it to disk.
-#[napi]
-pub fn create_random_qwen35_moe_checkpoint<'env>(
-    env: &'env Env,
-    config: Qwen3_5MoeConfig,
-    save_path: String,
-) -> Result<PromiseRaw<'env, ()>> {
-    let (thread, init_rx) = crate::model_thread::ModelThread::<()>::spawn_with_init(
-        move || {
-            create_random_qwen35_moe_checkpoint_sync(config, &save_path)?;
-            Ok(((), ()))
-        },
-        |_state, _cmd| {},
-    );
-
-    env.spawn_future(async move {
-        init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
-
-        drop(thread);
-        Ok(())
-    })
 }
 
 #[cfg(test)]
