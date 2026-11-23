@@ -1117,7 +1117,6 @@ export class AgentHost {
             endpoint,
             agentHome: this.opts.agentHome ?? null,
             providerKeys: this.opts.providers.workKeys(),
-            firecrawlUrl: this.opts.providers.workFirecrawlUrl(),
           });
     if (launch.env !== undefined) Object.assign(env, launch.env);
     const cwd = this.mode === 'chat' ? this.opts.paths.chatWorkspace : (this.opts.homeDir ?? homedir());

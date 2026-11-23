@@ -60,9 +60,6 @@ import { handlePrefixCacheDelete, handlePrefixCacheGet } from './handlers/prefix
 import {
   handleProviderKeyDelete,
   handleProviderKeyPut,
-  handleProviderLocalCheck,
-  handleProviderLocalDelete,
-  handleProviderLocalPut,
   handleProviderSelection,
   handleProvidersList,
   handleProviderValidate,
@@ -200,9 +197,6 @@ export const ROUTES: Route[] = [
   // Provider routes call the Keychain and the provider APIs and hold the provider lock, with the Chat service.
   mainRoute('GET', '/api/providers', handleProvidersList),
   mainRoute('PUT', '/api/providers/selection', handleProviderSelection),
-  mainRoute('PUT', '/api/providers/local', handleProviderLocalPut),
-  mainRoute('DELETE', '/api/providers/local', handleProviderLocalDelete),
-  mainRoute('POST', '/api/providers/local/check', handleProviderLocalCheck),
   mainRoute('PUT', '/api/providers/:id/key', handleProviderKeyPut),
   mainRoute('DELETE', '/api/providers/:id/key', handleProviderKeyDelete),
   mainRoute('POST', '/api/providers/:id/validate', handleProviderValidate),

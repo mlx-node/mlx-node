@@ -18,8 +18,6 @@ export const WEB_ERROR_CODES = [
   'no-content',
   'bad-request',
   'provider-error',
-  'local-down',
-  'local-cloud',
 ] as const;
 export type WebErrorCode = (typeof WEB_ERROR_CODES)[number];
 
@@ -37,10 +35,6 @@ export const WEB_ERROR_SENTENCES: Readonly<Record<WebErrorCode, string>> = {
   'no-content': 'That page has no readable text. Use another address or answer from the search results.',
   'bad-request': 'The tool input was wrong. Call it again with {"query": "<words>"} or {"url": "<https address>"}.',
   'provider-error': 'The search provider failed. Answer from what you know and say that the search failed.',
-  'local-down':
-    'The page reader on this Mac is not ready. Tell the user to check Firecrawl in Web Search settings. Do not call the tool again.',
-  'local-cloud':
-    'Firecrawl on this Mac is set to send pages to Firecrawl Cloud, and the app does not use it that way. Tell the user to open Web Search settings. Do not call the tool again.',
 };
 
 const SEARCH_PROVIDERS: readonly string[] = ['exa', 'deepseek', 'brave'];
@@ -58,20 +52,10 @@ export interface WebSearchItem {
 
 export type WebResult =
   | { kind: 'search'; provider: WebSearchProvider; results: WebSearchItem[] }
-  | {
-      kind: 'page';
-      provider: WebFetchProvider;
-      url: string;
-      title: string;
-      cut: boolean;
-      /** Firecrawl on this Mac could not load the page and handed it to Firecrawl Cloud, which read it. */
-      cloudRead: boolean;
-      text: string;
-    }
+  | { kind: 'page'; provider: WebFetchProvider; url: string; title: string; cut: boolean; text: string }
   | { kind: 'error'; code: WebErrorCode; provider: WebFetchProvider | 'none'; sentence: string };
 
 export const PAGE_CUT_NOTE = 'note: cut at 12000 characters';
-export const PAGE_CLOUD_NOTE = 'note: read by Firecrawl Cloud';
 
 /** Line breaks and tabs become one space each, so a field can never add a line. */
 function oneLine(text: string): string {
@@ -103,11 +87,10 @@ export function formatSearchText(
 
 export function formatPageText(
   provider: WebFetchProvider,
-  page: { url: string; title: string; cut: boolean; cloudRead?: boolean; text: string },
+  page: { url: string; title: string; cut: boolean; text: string },
 ): string {
   const head = [`WEB_PAGE provider=${provider} url=${oneLine(page.url)}`, `title: ${oneLine(page.title)}`];
   if (page.cut) head.push(PAGE_CUT_NOTE);
-  if (page.cloudRead === true && provider === 'firecrawl') head.push(PAGE_CLOUD_NOTE);
   return `${head.join('\n')}\n\n${page.text}`;
 }
 
@@ -197,9 +180,6 @@ export function parseWebResultText(text: string): WebResult | null {
     let at = 1;
     const cut = lines[at] === PAGE_CUT_NOTE;
     if (cut) at += 1;
-    const cloudRead = lines[at] === PAGE_CLOUD_NOTE;
-    if (cloudRead && provider !== 'firecrawl') return null;
-    if (cloudRead) at += 1;
     if (lines[at] !== '') return null;
     return {
       kind: 'page',
@@ -207,7 +187,6 @@ export function parseWebResultText(text: string): WebResult | null {
       url,
       title,
       cut,
-      cloudRead,
       text: lines.slice(at + 1).join('\n'),
     };
   }

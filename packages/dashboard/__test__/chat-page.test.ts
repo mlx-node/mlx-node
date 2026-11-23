@@ -11,14 +11,7 @@ import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState, ChatMode, ConversationInfo, ConversationRow } from '../ui/src/lib/chat-types.js';
 import { formatBytes } from '../ui/src/lib/format.js';
 import { PROVIDERS } from '../ui/src/lib/providers-strings.js';
-import type {
-  KeyCheck,
-  LocalCheck,
-  LocalCloud,
-  ProviderId,
-  ProvidersResponse,
-  SearchProviderId,
-} from '../ui/src/lib/providers-types.js';
+import type { KeyCheck, ProviderId, ProvidersResponse, SearchProviderId } from '../ui/src/lib/providers-types.js';
 import type { CrawlerValue } from '../ui/src/lib/providers-view.js';
 import { toast } from '../ui/src/lib/toast.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
@@ -268,9 +261,7 @@ function providersBody(
   return {
     search,
     firecrawl: false,
-    firecrawlLocal: false,
     fetch: search,
-    local: { url: null, check: null, checkedAt: null, version: null, cloud: null },
     providers: ids.map((id) => ({
       id,
       role: id === 'firecrawl' ? 'crawl' : 'search',
@@ -1594,7 +1585,6 @@ describe('Chat page: web calls', () => {
       name: CHAT.webNameOff,
       problem: null,
     });
-    expect(webRow({ ...base, firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' }).end).toBe(CHAT.webEndOff);
     expect(webRow({ ...base, search: 'exa', searchCheck: 'ok', fetch: 'exa' })).toEqual({
       end: 'Exa',
       name: 'Web search, Exa',
@@ -2039,15 +2029,11 @@ describe('Chat page: web calls', () => {
 });
 
 describe('Chat page: the crawler', () => {
-  const LOCAL = 'http://127.0.0.1:3002';
+  const FIRECRAWL = 'Firecrawl';
 
   interface CrawlerSetup {
     /** The Firecrawl key's check; absent: no key. */
     key?: KeyCheck;
-    /** The saved address's last check; absent: no address; null: not checked yet. */
-    local?: LocalCheck | null;
-    /** The saved address's Cloud setting, as its last check read it. */
-    cloud?: LocalCloud;
     search?: SearchProviderId | null;
   }
 
@@ -2060,22 +2046,10 @@ describe('Chat page: the crawler', () => {
     const search = setup.search ?? null;
     const base = providersBody(search, search === null ? {} : { [search]: 'ok' });
     const on = place !== 'off';
-    const local = setup.local;
     return {
       ...base,
       firecrawl: on,
-      firecrawlLocal: place === 'local',
       fetch: on ? 'firecrawl' : search,
-      local:
-        local === undefined
-          ? base.local
-          : {
-              url: LOCAL,
-              check: local,
-              checkedAt: local === null ? null : 1_000,
-              version: local === 'ok' ? '0.1.1' : null,
-              cloud: setup.cloud ?? null,
-            },
       providers: base.providers.map((p) =>
         p.id !== 'firecrawl'
           ? p
@@ -2086,20 +2060,11 @@ describe('Chat page: the crawler', () => {
   }
 
   function crawlSummary(place: CrawlerValue, search: SearchProviderId | null = null): ChatHostState['providers'] {
-    return {
-      ...summary(search),
-      firecrawl: place !== 'off',
-      firecrawlLocal: place === 'local',
-      fetch: place !== 'off' ? 'firecrawl' : search,
-    };
+    return { ...summary(search), firecrawl: place !== 'off', fetch: place !== 'off' ? 'firecrawl' : search };
   }
 
   function crawlerMenuRow(): HTMLElement {
     return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[2]!;
-  }
-
-  function checks(): number {
-    return calls.filter((call) => call.method === 'POST' && pathOf(call) === '/providers/local/check').length;
   }
 
   function checkedRow(): string | null {
@@ -2127,64 +2092,29 @@ describe('Chat page: the crawler', () => {
     return byRole(document.body, 'dialog', CHAT.crawler)!;
   }
 
-  it('crawlerRow: on or off and the place from the host summary, what is wrong from the body', () => {
+  it('crawlerRow: on or off from the host summary, what is wrong from the body', () => {
     const off = crawlSummary('off');
-    const cloud = crawlSummary('cloud');
-    const local = crawlSummary('local');
-    expect(crawlerRow(off, null)).toEqual({ end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null });
-    expect(crawlerRow(off, crawlerBody('local', { local: 'not-running' }))).toEqual({
-      end: CHAT.webEndOff,
-      name: CHAT.crawlerNameOff,
-      problem: null,
-    });
-    expect(crawlerRow(local, crawlerBody('local', { local: 'not-running' }))).toEqual({
-      end: CHAT.crawlerNotRunning,
-      dot: 'warning',
-      name: CHAT.crawlerNameNotRunning,
-      problem: null,
-    });
-    for (const check of ['not-firecrawl', 'open', 'token'] as const) {
-      expect(crawlerRow(local, crawlerBody('local', { local: check }))).toEqual({
-        end: CHAT.crawlerCheckFailed,
-        dot: 'danger',
-        name: CHAT.crawlerNameCheckFailed,
-        problem: null,
-      });
-    }
-    // A server whose Cloud takes pages it cannot load, and one whose Cloud setting could not be read.
-    expect(crawlerRow(local, crawlerBody('local', { local: 'cloud-on', cloud: 'fallback' }))).toEqual({
-      end: CHAT.crawlerCloudOn,
-      dot: 'danger',
-      name: CHAT.crawlerNameCloudOn,
-      problem: null,
-    });
-    expect(crawlerRow(local, crawlerBody('local', { local: 'cloud-on' }))).toEqual({
-      end: CHAT.crawlerCheckFailed,
-      dot: 'danger',
-      name: CHAT.crawlerNameCloudUnread,
-      problem: null,
-    });
-    const atMac = { end: CHAT.crawlerEndLocal, name: CHAT.crawlerNameLocal, problem: null };
-    expect(crawlerRow(local, crawlerBody('local', { local: 'ok' }))).toEqual(atMac);
-    expect(crawlerRow(local, crawlerBody('local', { local: null }))).toEqual(atMac);
-    expect(crawlerRow(local, null)).toEqual(atMac);
-    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'rejected' }))).toEqual({
+    const on = crawlSummary('firecrawl');
+    const atOff = { end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null };
+    expect(crawlerRow(off, null)).toEqual(atOff);
+    expect(crawlerRow(off, crawlerBody('off', { key: 'rejected' }))).toEqual(atOff);
+    expect(crawlerRow(on, crawlerBody('firecrawl', { key: 'rejected' }))).toEqual({
       end: CHAT.webEndRejected,
       dot: 'danger',
       name: CHAT.crawlerNameRejected,
       problem: null,
     });
-    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'no-credit' }))).toEqual({
+    expect(crawlerRow(on, crawlerBody('firecrawl', { key: 'no-credit' }))).toEqual({
       end: CHAT.webEndNoCredit,
       dot: 'warning',
       name: CHAT.crawlerNameNoCredit,
       problem: null,
     });
-    const atCloud = { end: CHAT.crawlerEndCloud, name: CHAT.crawlerNameCloud, problem: null };
-    expect(crawlerRow(cloud, crawlerBody('cloud', { key: 'ok' }))).toEqual(atCloud);
-    expect(crawlerRow(cloud, null)).toEqual(atCloud);
-    // The body is one read old: the place still comes from the summary.
-    expect(crawlerRow(cloud, crawlerBody('local', { key: 'ok', local: 'not-running' }))).toEqual(atCloud);
+    const atFirecrawl = { end: FIRECRAWL, name: CHAT.crawlerNameOn, problem: null };
+    expect(crawlerRow(on, crawlerBody('firecrawl', { key: 'ok' }))).toEqual(atFirecrawl);
+    expect(crawlerRow(on, null)).toEqual(atFirecrawl);
+    // The body is one read old: on or off still comes from the summary.
+    expect(crawlerRow(on, crawlerBody('off', { key: 'ok' }))).toEqual(atFirecrawl);
   });
 
   it('crawlerChoices: the rows, the Off note, the settings note and the caption for each state', () => {
@@ -2193,32 +2123,28 @@ describe('Chat page: the crawler', () => {
 
     const none = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off') });
     expect(none.rows.map(view)).toEqual([
-      ['cloud', false, true, CHAT.webNoKey, ''],
-      ['local', false, true, CHAT.crawlerNotSetUp, ''],
+      ['firecrawl', false, true, CHAT.webNoKey, ''],
       ['off', true, false, '', ''],
     ]);
-    expect(none.rows.map((row) => row.name)).toEqual([CHAT.crawlerRowNoKey, CHAT.crawlerRowNotSetUp, CHAT.webEndOff]);
-    expect(none.rows.map((row) => row.label)).toEqual([CHAT.crawlerCloud, CHAT.crawlerLocal, CHAT.webEndOff]);
-    expect(none.note).toBe(CHAT.crawlerAddBoth);
+    expect(none.rows.map((row) => row.name)).toEqual([
+      'Firecrawl, no key. Add it in Web Search settings.',
+      CHAT.webEndOff,
+    ]);
+    expect(none.rows.map((row) => row.label)).toEqual([FIRECRAWL, CHAT.webEndOff]);
+    expect(none.note).toBe(CHAT.crawlerAddKey);
     expect(none.caption).toBeNull();
-    expect(crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }) }).note).toBe(
-      CHAT.crawlerAddLocal,
-    );
-    expect(crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { local: 'ok' }) }).note).toBe(
-      CHAT.crawlerAddKey,
-    );
-    const both = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok', local: 'ok' }) });
-    expect(both.note).toBe(CHAT.webSettingsNote);
-    expect(both.rows.map(view)).toEqual([
-      ['cloud', false, false, '', ''],
-      ['local', false, false, '', ''],
+    const keyed = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }) });
+    expect(keyed.note).toBe(CHAT.webSettingsNote);
+    expect(keyed.rows.map(view)).toEqual([
+      ['firecrawl', false, false, '', ''],
       ['off', true, false, '', ''],
     ]);
+    expect(keyed.rows[0]!.name).toBe(FIRECRAWL);
     expect(crawlerChoices(crawlSummary('off'), idle).note).toBe(CHAT.webSettingsNote);
 
     // The Off note follows the search provider of the host summary, with the Web Search page's words.
     const offNote = (search: SearchProviderId | null): string | undefined =>
-      crawlerChoices(crawlSummary('off', search), idle).rows[2]!.note;
+      crawlerChoices(crawlSummary('off', search), idle).rows[1]!.note;
     expect(offNote('exa')).toBe('Exa reads pages for Chat.');
     expect(offNote('deepseek')).toBe('DeepSeek reads pages for Chat.');
     expect(offNote('brave')).toBe(CHAT.crawlerOffExcerpts);
@@ -2229,112 +2155,66 @@ describe('Chat page: the crawler', () => {
       PROVIDERS.crawlerOffNone,
     ]);
 
-    // A rejected key, no credit, a server that does not answer and a failed check can all still be picked.
-    const problems = crawlerChoices(crawlSummary('cloud'), {
+    // A rejected key and no credit can still be picked.
+    const rejected = crawlerChoices(crawlSummary('firecrawl'), {
       ...idle,
-      body: crawlerBody('cloud', { key: 'rejected', local: 'not-running' }),
+      body: crawlerBody('firecrawl', { key: 'rejected' }),
     });
-    expect(problems.rows.map(view)).toEqual([
-      ['cloud', true, false, CHAT.webEndRejected, 'danger'],
-      ['local', false, false, CHAT.crawlerNotRunning, 'warning'],
+    expect(rejected.rows.map(view)).toEqual([
+      ['firecrawl', true, false, CHAT.webEndRejected, 'danger'],
       ['off', false, false, '', ''],
     ]);
-    expect(problems.rows.map((row) => row.name)).toEqual([
-      CHAT.crawlerRowRejected,
-      CHAT.crawlerRowNotRunning,
-      CHAT.webEndOff,
-    ]);
-    const failed = crawlerChoices(crawlSummary('local'), {
-      ...idle,
-      body: crawlerBody('local', { key: 'no-credit', local: 'open' }),
-    });
-    expect(failed.rows.map(view)).toEqual([
-      ['cloud', false, false, CHAT.webEndNoCredit, 'warning'],
-      ['local', true, false, CHAT.crawlerCheckFailed, 'danger'],
-      ['off', false, false, '', ''],
-    ]);
-    expect(failed.rows.map((row) => row.name)).toEqual([
-      CHAT.crawlerRowNoCredit,
-      CHAT.crawlerRowCheckFailed,
-      CHAT.webEndOff,
-    ]);
-    const cloudOn = crawlerChoices(crawlSummary('local'), {
-      ...idle,
-      body: crawlerBody('local', { key: 'ok', local: 'cloud-on', cloud: 'fallback' }),
-    });
-    expect(cloudOn.rows.map(view)).toEqual([
-      ['cloud', false, false, '', ''],
-      ['local', true, false, CHAT.crawlerCloudOn, 'danger'],
-      ['off', false, false, '', ''],
-    ]);
-    expect(cloudOn.rows[1]!.name).toBe(CHAT.crawlerRowCloudOn);
-    expect(cloudOn.note).toBe(CHAT.crawlerRestartLocal);
-    const cloudUnread = crawlerChoices(crawlSummary('local'), {
-      ...idle,
-      body: crawlerBody('local', { key: 'ok', local: 'cloud-on' }),
-    });
-    expect(cloudUnread.rows[1]).toMatchObject({
-      checked: true,
-      disabled: false,
-      end: CHAT.crawlerCheckFailed,
-      endTone: 'danger',
-      name: CHAT.crawlerRowCloudUnread,
-    });
-    expect(cloudUnread.note).toBe(CHAT.crawlerRestartLocal);
-    expect(failed.note).toBe(CHAT.webSettingsNote);
-    const unchecked = crawlerChoices(crawlSummary('local'), { ...idle, body: crawlerBody('local', { local: null }) });
-    expect(unchecked.rows[1]).toMatchObject({ checked: true, disabled: false, name: CHAT.crawlerLocal });
-    expect(unchecked.rows[1]!.end).toBeUndefined();
-
-    // No body yet: only the current row and Off.
-    const reading = crawlerChoices(crawlSummary('cloud'), { ...idle, read: 'reading' });
-    expect(reading.rows.map(view)).toEqual([
-      ['cloud', true, false, '', ''],
-      ['local', false, true, '', ''],
-      ['off', false, false, '', ''],
-    ]);
-    expect(reading.rows[1]!.name).toBe(CHAT.crawlerRowLocalUnread);
-    expect(reading.caption).toEqual({ text: CHAT.webReading, tone: 'secondary' });
-    const unreadLocal = crawlerChoices(crawlSummary('local'), { ...idle, read: 'failed' });
-    expect(unreadLocal.rows.map(view)).toEqual([
-      ['cloud', false, true, '', ''],
-      ['local', true, false, '', ''],
-      ['off', false, false, '', ''],
-    ]);
-    expect(unreadLocal.rows[0]!.name).toBe(CHAT.crawlerRowUnread);
-    expect(unreadLocal.caption).toEqual({ text: CHAT.webReadFailed, tone: 'secondary' });
-
-    // A Keychain that does not answer: a key in the cache can be picked, no key reads as not known; This Mac needs none.
-    const down = { keychain: 'unavailable' as const };
-    const cached = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }, down) });
-    expect(cached.rows[0]).toMatchObject({ disabled: false, name: CHAT.crawlerCloud });
-    expect(cached.caption).toEqual({ text: CHAT.webKeychain, tone: 'warning' });
-    const unknown = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { local: 'ok' }, down) });
-    expect(unknown.rows.map(view)).toEqual([
-      ['cloud', false, true, '', ''],
-      ['local', false, false, '', ''],
+    expect(rejected.rows[0]!.name).toBe('Firecrawl, key rejected');
+    const noCredit = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'no-credit' }) });
+    expect(noCredit.rows.map(view)).toEqual([
+      ['firecrawl', false, false, CHAT.webEndNoCredit, 'warning'],
       ['off', true, false, '', ''],
     ]);
-    expect(unknown.rows[0]!.name).toBe(CHAT.crawlerRowUnread);
+    expect(noCredit.rows[0]!.name).toBe('Firecrawl, no credit');
+    expect(noCredit.note).toBe(CHAT.webSettingsNote);
+
+    // No body yet: Firecrawl can be picked only while it is the current one.
+    const reading = crawlerChoices(crawlSummary('firecrawl'), { ...idle, read: 'reading' });
+    expect(reading.rows.map(view)).toEqual([
+      ['firecrawl', true, false, '', ''],
+      ['off', false, false, '', ''],
+    ]);
+    expect(reading.caption).toEqual({ text: CHAT.webReading, tone: 'secondary' });
+    const unread = crawlerChoices(crawlSummary('off'), { ...idle, read: 'failed' });
+    expect(unread.rows.map(view)).toEqual([
+      ['firecrawl', false, true, '', ''],
+      ['off', true, false, '', ''],
+    ]);
+    expect(unread.rows[0]!.name).toBe('Firecrawl, key not read yet');
+    expect(unread.caption).toEqual({ text: CHAT.webReadFailed, tone: 'secondary' });
+
+    // A Keychain that does not answer: a key in the cache can be picked, no key reads as not known.
+    const down = { keychain: 'unavailable' as const };
+    const cached = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', { key: 'ok' }, down) });
+    expect(cached.rows[0]).toMatchObject({ disabled: false, name: FIRECRAWL });
+    expect(cached.caption).toEqual({ text: CHAT.webKeychain, tone: 'warning' });
+    const unknown = crawlerChoices(crawlSummary('off'), { ...idle, body: crawlerBody('off', {}, down) });
+    expect(unknown.rows.map(view)).toEqual([
+      ['firecrawl', false, true, '', ''],
+      ['off', true, false, '', ''],
+    ]);
+    expect(unknown.rows[0]!.name).toBe('Firecrawl, key not read yet');
     expect(unknown.note).toBe(CHAT.webSettingsNote);
 
-    // A write in flight: its row says Switching…, the others wait, the check mark stays.
-    const body = crawlerBody('cloud', { key: 'ok', local: 'ok' });
-    const busy = crawlerChoices(crawlSummary('cloud'), { ...idle, body, busy: 'local' });
-    expect(busy.rows.map(view)).toEqual([
-      ['cloud', true, true, '', ''],
-      ['local', false, false, CHAT.webSwitching, ''],
-      ['off', false, true, '', ''],
+    // A write in flight: its row says Switching…, the other waits, the check mark stays.
+    const body = crawlerBody('firecrawl', { key: 'ok' });
+    expect(crawlerChoices(crawlSummary('firecrawl'), { ...idle, body, busy: 'off' }).rows.map(view)).toEqual([
+      ['firecrawl', true, true, '', ''],
+      ['off', false, false, CHAT.webSwitching, ''],
     ]);
-    expect(crawlerChoices(crawlSummary('cloud'), { ...idle, body, busy: 'off' }).rows[2]).toMatchObject({
-      end: CHAT.webSwitching,
-      disabled: false,
-      checked: false,
-    });
+    expect(crawlerChoices(crawlSummary('off'), { ...idle, body, busy: 'firecrawl' }).rows.map(view)).toEqual([
+      ['firecrawl', false, false, CHAT.webSwitching, ''],
+      ['off', true, true, '', ''],
+    ]);
 
     // Captions: the write error, then the Keychain, then the read, then a change that waits, in the crawler's words.
-    const pending = { ...crawlSummary('cloud'), applyPending: true };
-    const downBody = crawlerBody('cloud', { key: 'ok' }, down);
+    const pending = { ...crawlSummary('firecrawl'), applyPending: true };
+    const downBody = crawlerBody('firecrawl', { key: 'ok' }, down);
     expect(crawlerChoices(pending, { ...idle, body }).caption).toEqual({
       text: CHAT.crawlerPending,
       tone: 'secondary',
@@ -2348,28 +2228,26 @@ describe('Chat page: the crawler', () => {
     });
   });
 
-  it('Crawler is the third row of the +; its panel has Cloud, This Mac and Off, the Off note and the settings row', async () => {
+  it('Crawler is the third row of the +; its panel has Firecrawl and Off, the Off note and the settings row', async () => {
     const dialog = await openCrawler('off', { '/providers': crawlerBody('off', { search: 'exa' }) }, { search: 'exa' });
-    await waitFor(() => choice(CHAT.crawlerCloud).textContent === `${CHAT.crawlerCloud}${CHAT.webNoKey}`);
+    await waitFor(() => choice(FIRECRAWL).textContent === `${FIRECRAWL}${CHAT.webNoKey}`);
     expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.webEndOff}`);
     expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameOff);
     const list = byRole(dialog, 'menu', CHAT.crawler)!;
     const group = byRole(list, 'group', CHAT.crawlerGroup)!;
     expect(allByRole(group, 'menuitemradio').map((row) => row.getAttribute('data-label'))).toEqual([
-      'firecrawl cloud',
-      'firecrawl on this mac',
+      'firecrawl',
       'off',
     ]);
     expect(checkedRow()).toBe('off');
-    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotSetUp}`);
-    expect(choice(CHAT.crawlerLocal).getAttribute('aria-disabled')).toBe('true');
-    expect(accessibleName(choice(CHAT.crawlerLocal))).toBe(CHAT.crawlerRowNotSetUp);
+    expect(choice(FIRECRAWL).getAttribute('aria-disabled')).toBe('true');
+    expect(accessibleName(choice(FIRECRAWL))).toBe('Firecrawl, no key. Add it in Web Search settings.');
     const off = choice(CHAT.webEndOff);
     expect(document.getElementById(off.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Exa reads pages for Chat.',
     );
     const settings = byRole(list, 'menuitem', CHAT.webSettings)!;
-    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(CHAT.crawlerAddBoth);
+    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(CHAT.crawlerAddKey);
     click(settings);
     await waitFor(() => where.pathname === '/providers');
     await waitFor(
@@ -2379,51 +2257,39 @@ describe('Chat page: the crawler', () => {
   });
 
   it('the main row says what is wrong once the body is read; the dot on the + stays search only', async () => {
-    await openCrawler('local', { '/providers': crawlerBody('local', { local: 'not-running' }) });
-    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.crawlerNotRunning}`);
-    expect(crawlerMenuRow().querySelector('[data-tone="warning"]')).not.toBeNull();
-    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameNotRunning);
-    expect(choice(CHAT.crawlerLocal).getAttribute('aria-checked')).toBe('true');
-    expect(choice(CHAT.crawlerLocal).querySelector('[data-tone="warning"]')).not.toBeNull();
-    expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
-    await openCrawler('cloud', { '/providers': crawlerBody('cloud', { key: 'rejected' }) });
+    await openCrawler('firecrawl', { '/providers': crawlerBody('firecrawl', { key: 'rejected' }) });
     await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.webEndRejected}`);
     expect(crawlerMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
     expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameRejected);
+    expect(choice(FIRECRAWL).getAttribute('aria-checked')).toBe('true');
+    expect(choice(FIRECRAWL).querySelector('[data-tone="danger"]')).not.toBeNull();
     expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
-    const dialog = await openCrawler('local', {
-      '/providers': crawlerBody('local', { key: 'ok', local: 'cloud-on', cloud: 'fallback' }),
-    });
-    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.crawlerCloudOn}`);
-    expect(crawlerMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
-    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameCloudOn);
-    expect(choice(CHAT.crawlerLocal).getAttribute('aria-checked')).toBe('true');
-    expect(accessibleName(choice(CHAT.crawlerLocal))).toBe(CHAT.crawlerRowCloudOn);
-    const settings = byRole(byRole(dialog, 'menu', CHAT.crawler)!, 'menuitem', CHAT.webSettings)!;
-    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(
-      CHAT.crawlerRestartLocal,
-    );
+    await openCrawler('firecrawl', { '/providers': crawlerBody('firecrawl', { key: 'no-credit' }) });
+    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.webEndNoCredit}`);
+    expect(crawlerMenuRow().querySelector('[data-tone="warning"]')).not.toBeNull();
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameNoCredit);
     expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+    await openCrawler('firecrawl', { '/providers': crawlerBody('firecrawl', { key: 'ok' }) });
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${FIRECRAWL}`);
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameOn);
+    expect(crawlerMenuRow().querySelector('[data-tone]')).toBeNull();
   });
 
   it('a change that waits: the Crawler panel says open conversations keep the old crawler', async () => {
     const dialog = await openCrawler(
-      'cloud',
-      { '/providers': crawlerBody('cloud', { key: 'ok', local: 'ok' }) },
+      'firecrawl',
+      { '/providers': crawlerBody('firecrawl', { key: 'ok' }) },
       { applyPending: true },
     );
     await waitFor(() => byRole(dialog, 'status')!.textContent === CHAT.crawlerPending);
     expect(shown(dialog)).not.toContain(CHAT.webPending);
-    expect(checkedRow()).toBe('firecrawl cloud');
+    expect(checkedRow()).toBe('firecrawl');
   });
 
-  it('each pick sends its own body and never `search`; the check mark follows the host summary', async () => {
-    const both = { key: 'ok' as const, local: 'ok' as const };
-    await openCrawler('cloud', {
-      '/providers': crawlerBody('cloud', both),
-      'PUT /providers/selection': crawlerBody('cloud', both),
-    });
-    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+  it('each pick sends only `firecrawl`, never `search`; the check mark follows the host summary', async () => {
+    const keyed = crawlerBody('firecrawl', { key: 'ok' });
+    await openCrawler('firecrawl', { '/providers': keyed, 'PUT /providers/selection': keyed });
+    await waitFor(() => reads() === 1 && byRole(document.body, 'status')?.textContent !== CHAT.webReading);
     const to = async (label: string, place: CrawlerValue): Promise<void> => {
       const before = selections().length;
       click(choice(label));
@@ -2432,54 +2298,45 @@ describe('Chat page: the crawler', () => {
       await waitFor(() => choice(label).getAttribute('aria-checked') === 'true');
       expect(choice(label).textContent).not.toContain(CHAT.webSwitching);
     };
-    await to(CHAT.crawlerLocal, 'local');
     await to(CHAT.webEndOff, 'off');
-    await to(CHAT.crawlerCloud, 'cloud');
-    expect(selections()).toEqual([
-      { firecrawl: true, firecrawlLocal: true },
-      { firecrawl: false },
-      { firecrawl: true, firecrawlLocal: false },
-    ]);
+    await to(FIRECRAWL, 'firecrawl');
+    expect(selections()).toEqual([{ firecrawl: false }, { firecrawl: true }]);
     expect(byRole(document.body, 'dialog', CHAT.crawler)).not.toBeNull();
   });
 
   it('a pick is busy until the host summary shows it, even while the reply waits; a second click sends nothing', async () => {
-    const both = { key: 'ok' as const, local: 'ok' as const };
-    const reply = deferred(crawlerBody('local', both));
-    await openCrawler('cloud', {
-      '/providers': crawlerBody('cloud', both),
+    const reply = deferred(crawlerBody('firecrawl', { key: 'ok' }));
+    await openCrawler('off', {
+      '/providers': crawlerBody('off', { key: 'ok' }),
       'PUT /providers/selection': reply.body,
     });
-    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
-    click(choice(CHAT.crawlerLocal));
-    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.webSwitching}`);
-    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBe('true');
+    await waitFor(() => choice(FIRECRAWL).getAttribute('aria-disabled') === null);
+    click(choice(FIRECRAWL));
+    await waitFor(() => choice(FIRECRAWL).textContent === `${FIRECRAWL}${CHAT.webSwitching}`);
     expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBe('true');
-    click(choice(CHAT.crawlerLocal));
-    click(choice(CHAT.crawlerLocal));
+    click(choice(FIRECRAWL));
+    click(choice(FIRECRAWL));
     await waitFor(() => selections().length > 0);
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(checkedRow()).toBe('firecrawl cloud');
-    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerEndCloud}`);
-    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('local') }) }));
-    await waitFor(() => checkedRow() === 'firecrawl on this mac');
-    expect(choice(CHAT.crawlerLocal).textContent).toBe(CHAT.crawlerLocal);
-    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBeNull();
-    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerEndLocal}`);
-    expect(selections()).toEqual([{ firecrawl: true, firecrawlLocal: true }]);
+    expect(checkedRow()).toBe('off');
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.webEndOff}`);
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('firecrawl') }) }));
+    await waitFor(() => checkedRow() === 'firecrawl');
+    expect(choice(FIRECRAWL).textContent).toBe(FIRECRAWL);
+    expect(choice(CHAT.webEndOff).getAttribute('aria-disabled')).toBeNull();
+    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${FIRECRAWL}`);
+    expect(selections()).toEqual([{ firecrawl: true }]);
     reply.release();
   });
 
-  it('the checked row, a Cloud row with no key and a This Mac row with no address send nothing', async () => {
+  it('the checked row and a Firecrawl row with no key send nothing', async () => {
     await openCrawler('off', {
       '/providers': crawlerBody('off'),
       'PUT /providers/selection': crawlerBody('off'),
     });
-    await waitFor(() => choice(CHAT.crawlerCloud).textContent === `${CHAT.crawlerCloud}${CHAT.webNoKey}`);
-    expect(choice(CHAT.crawlerCloud).getAttribute('aria-disabled')).toBe('true');
-    expect(accessibleName(choice(CHAT.crawlerCloud))).toBe(CHAT.crawlerRowNoKey);
-    click(choice(CHAT.crawlerCloud));
-    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => choice(FIRECRAWL).textContent === `${FIRECRAWL}${CHAT.webNoKey}`);
+    expect(choice(FIRECRAWL).getAttribute('aria-disabled')).toBe('true');
+    click(choice(FIRECRAWL));
     click(choice(CHAT.webEndOff));
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(selections()).toEqual([]);
@@ -2487,37 +2344,34 @@ describe('Chat page: the crawler', () => {
   });
 
   it('a failed pick: the caption says why by the pick, the check stays, the keys are read again; closed, a toast', async () => {
-    const both = { key: 'ok' as const, local: 'ok' as const };
     const last = deferred(stubError('E_UNAVAILABLE', 'Skills could not be installed.'));
     const dialog = await openCrawler('off', {
-      '/providers': crawlerBody('off', both),
+      '/providers': crawlerBody('off', { key: 'ok' }),
       'PUT /providers/selection': sequence(
         stubError('E_CONFLICT', 'Add a key for Firecrawl first.'),
-        stubError('E_CONFLICT', 'Set up Firecrawl on this Mac first.', 'local-not-set-up'),
         stubError('E_UNAVAILABLE', 'Skills could not be installed.'),
         stubError('E_UNAVAILABLE', "The app's skill files are damaged. Reinstall the app.", 'skill-bundle-corrupt'),
         last.body,
       ),
     });
     const status = (): string => byRole(dialog, 'status')!.textContent ?? '';
-    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    await waitFor(() => choice(FIRECRAWL).getAttribute('aria-disabled') === null);
     const before = reads();
-    click(choice(CHAT.crawlerCloud));
+    click(choice(FIRECRAWL));
     await waitFor(() => status() === CHAT.crawlerNeedKey);
     expect(byRole(dialog, 'status')!.querySelector('.text-danger')).not.toBeNull();
     expect(checkedRow()).toBe('off');
-    expect(choice(CHAT.crawlerCloud).textContent).toBe(CHAT.crawlerCloud);
+    expect(choice(FIRECRAWL).textContent).toBe(FIRECRAWL);
     await waitFor(() => reads() === before + 1);
-    click(choice(CHAT.crawlerLocal));
-    await waitFor(() => status() === CHAT.crawlerNeedLocal);
-    click(choice(CHAT.crawlerLocal));
+    await waitFor(() => choice(FIRECRAWL).getAttribute('aria-disabled') === null);
+    click(choice(FIRECRAWL));
     await waitFor(() => status() === CHAT.crawlerSwitchFailed);
-    click(choice(CHAT.crawlerCloud));
+    click(choice(FIRECRAWL));
     await waitFor(() => status() === CHAT.webCorrupt);
     expect(checkedRow()).toBe('off');
 
     const errors = vi.spyOn(toast, 'error');
-    click(choice(CHAT.crawlerLocal));
+    click(choice(FIRECRAWL));
     closeMenu();
     await waitFor(() => byRole(document.body, 'menu', CHAT.tools) === null);
     last.release();
@@ -2525,10 +2379,10 @@ describe('Chat page: the crawler', () => {
     expect(errors.mock.calls[0]![0]).toBe(CHAT.crawlerSwitchFailed);
   });
 
-  it('one read for both panels; a new firecrawlLocal in the host summary reads again', async () => {
+  it('one read for both panels; a new `firecrawl` in the host summary reads again', async () => {
     await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
-      host: host({ providers: crawlSummary('cloud', 'exa') }),
-      routes: { '/providers': crawlerBody('cloud', { key: 'ok', local: 'ok', search: 'exa' }) },
+      host: host({ providers: crawlSummary('firecrawl', 'exa') }),
+      routes: { '/providers': crawlerBody('firecrawl', { key: 'ok', search: 'exa' }) },
     });
     click(button(CHAT.tools));
     await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
@@ -2540,125 +2394,27 @@ describe('Chat page: the crawler', () => {
     await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) === null);
     click(crawlerMenuRow());
     await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
-    await waitFor(() => choice(CHAT.crawlerLocal).getAttribute('aria-disabled') === null);
+    await waitFor(() => choice(FIRECRAWL).getAttribute('aria-checked') === 'true');
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(reads()).toBe(1);
-    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('local', 'exa') }) }));
+    act(() => api!.emitChatHost({ type: 'state', state: host({ providers: crawlSummary('off', 'exa') }) }));
     await waitFor(() => reads() === 2);
   });
 
-  it('opening the Crawler panel checks this Mac now and uses the answer for the crawler rows only', async () => {
-    const read = crawlerBody('local', { local: 'ok', search: 'exa' });
-    // The check's body says Brave has a key: the web search rows must not take it.
-    const fresh = providersBody('exa', { exa: 'ok', brave: 'ok' });
-    const reply = {
-      check: 'not-running',
-      providers: {
-        ...fresh,
-        firecrawl: true,
-        firecrawlLocal: true,
-        local: { url: LOCAL, check: 'not-running', checkedAt: 2_000, version: null, cloud: null },
-      },
-    };
-    await openCrawler(
-      'local',
-      { '/providers': read, 'POST /providers/local/check': reply },
-      { search: 'exa', searchCheck: 'ok' },
-    );
-    await waitFor(() => checks() === 1);
-    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerNotRunning}`);
-    key(byRole(document.body, 'dialog', CHAT.crawler)!, { key: 'ArrowLeft' });
-    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
-    click(webMenuRow());
-    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
-    await waitFor(() => choice('Brave').textContent === `Brave${CHAT.webNoKey}`);
-    expect(checks()).toBe(1);
-  });
-
-  /** Opens Chat with the crawler on `place`, then the `+` menu only. */
-  async function openPlus(place: CrawlerValue, routes: Record<string, unknown>): Promise<void> {
+  it('the keyboard: right arrow enters on the checked row, down moves, left and Escape close only the panel', async () => {
     page?.unmount();
     api?.();
     await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
-      host: host({ providers: crawlSummary(place) }),
-      routes,
+      host: host({ providers: crawlSummary('firecrawl') }),
+      routes: { '/providers': crawlerBody('firecrawl', { key: 'ok' }) },
     });
     click(reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!);
     await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
-  }
-
-  const checkReply = (url: string | null, check: LocalCheck, checkedAt: number) => ({
-    check,
-    providers: crawlerBody('local', {}, { local: { url, check, checkedAt, version: null, cloud: null } }),
-  });
-
-  it('opening the + while this Mac is in use checks it now, and the Crawler row shows the answer', async () => {
-    await openPlus('local', {
-      '/providers': crawlerBody('local', { local: 'ok' }),
-      'POST /providers/local/check': checkReply(LOCAL, 'not-running', 2_000),
-    });
-    await waitFor(() => checks() === 1);
-    await waitFor(() => accessibleName(crawlerMenuRow()) === CHAT.crawlerNameNotRunning);
-    expect(crawlerMenuRow().textContent).toBe(`${CHAT.crawler}${CHAT.crawlerNotRunning}`);
-    click(crawlerMenuRow());
-    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
-    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-    expect(checks()).toBe(1);
-
-    await openPlus('local', {
-      '/providers': crawlerBody('local', { local: 'not-running' }),
-      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
-    });
-    await waitFor(() => checks() === 1);
-    await waitFor(() => accessibleName(crawlerMenuRow()) === CHAT.crawlerNameLocal);
-  });
-
-  it('a check answer older than the read, or of another address, never replaces the read', async () => {
-    await openCrawler('local', {
-      '/providers': crawlerBody(
-        'local',
-        {},
-        { local: { url: LOCAL, check: 'not-running', checkedAt: 2_000, version: null, cloud: null } },
-      ),
-      'POST /providers/local/check': checkReply(LOCAL, 'ok', 1_000),
-    });
-    await waitFor(() => checks() === 1);
-    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-    await flushTimers();
-    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameNotRunning);
-
-    await openCrawler('local', {
-      '/providers': crawlerBody('local', { local: 'not-running' }),
-      'POST /providers/local/check': checkReply('http://127.0.0.1:4000', 'ok', 2_000),
-    });
-    await waitFor(() => checks() === 1);
-    await waitFor(() => choice(CHAT.crawlerLocal).textContent === `${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-    await flushTimers();
-    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotRunning}`);
-
-    await openCrawler('off', {
-      '/providers': crawlerBody('off', { key: 'ok' }),
-      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
-    });
-    await waitFor(() => checks() === 1);
-    await waitFor(() => choice(CHAT.crawlerCloud).getAttribute('aria-disabled') === null);
-    await flushTimers();
-    expect(choice(CHAT.crawlerLocal).getAttribute('aria-disabled')).toBe('true');
-    expect(choice(CHAT.crawlerLocal).textContent).toBe(`${CHAT.crawlerLocal}${CHAT.crawlerNotSetUp}`);
-  });
-
-  it('the keyboard: right arrow enters on the checked row, down moves, left and Escape close only the panel', async () => {
-    await openPlus('local', {
-      '/providers': crawlerBody('local', { local: 'ok', key: 'ok' }),
-      'POST /providers/local/check': checkReply(LOCAL, 'ok', 2_000),
-    });
     const row = crawlerMenuRow();
     act(() => row.focus());
     key(row, { key: 'ArrowRight' });
     await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
-    await waitFor(() => document.activeElement?.getAttribute('data-label') === CHAT.crawlerLocal.toLowerCase());
+    await waitFor(() => document.activeElement?.getAttribute('data-label') === 'firecrawl');
     expect(document.activeElement?.getAttribute('aria-checked')).toBe('true');
     key(document.activeElement!, { key: 'ArrowDown' });
     await waitFor(() => document.activeElement?.getAttribute('data-label') === CHAT.webEndOff.toLowerCase());
@@ -2670,30 +2426,6 @@ describe('Chat page: the crawler', () => {
     key(byRole(document.body, 'dialog', CHAT.crawler)!, { key: 'Escape' });
     await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
     expect(byRole(document.body, 'menu', CHAT.tools)).not.toBeNull();
-  });
-
-  it('opening the Web search panel never waits for the check of this Mac', async () => {
-    const held = deferred({ check: 'ok', providers: crawlerBody('local', { local: 'ok' }) });
-    await openWeb(
-      'exa',
-      {
-        '/providers': crawlerBody(
-          'local',
-          { local: 'ok', search: 'exa' },
-          {
-            providers: providersBody('exa', { exa: 'ok', brave: 'ok' }).providers,
-          },
-        ),
-        'POST /providers/local/check': held.body,
-      },
-      'ok',
-      { firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' },
-    );
-    await waitFor(() => choice('Brave').getAttribute('aria-disabled') === null);
-    expect(choice('DeepSeek').textContent).toBe(`DeepSeek${CHAT.webNoKey}`);
-    // The `+` opening started the check (this Mac is in use); its answer is still held.
-    expect(checks()).toBe(1);
-    held.release();
   });
 });
 

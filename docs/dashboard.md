@@ -215,20 +215,20 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | `⌘⇧O`     | A new conversation in the last used mode                                      |
 | `⌘K`      | The command palette (it also lists the 20 newest conversations of both modes) |
 
-| Route            | Page           | What it shows                                                                                                                                                                                                                                                                                                                                                                               | Data                                                                                                         |
-| ---------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                                                                                                                  | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
-| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer: the + menu (files and photos, web search, crawler), model picker, (Work) folder chip (bar once set); Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work)                                                      | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
-| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                                                                                                                        | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
-| `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                                                                                                                | `/sessions`                                                                                                  |
-| `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                                                                                                                     | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
-| `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                                                                                                                       | the six `/metrics/*` routes                                                                                  |
-| `/engine`        | Engine         | Live part: "Now" ticker, output rate, memory, turns in flight, loaded models, KV block pool. History part (1h · 6h · 24h · 7d): memory, busy time, decode batch size, model loads, processes, supervisor                                                                                                                                                                                    | live channel, `/runtime/series`, `/models`                                                                   |
-| `/cache`         | Cache          | Model caches (one folder per model identity under `prefix-cache/`: size, files, last use, lock; delete an idle one); cold-tier usage against quota, objects by age with an eviction preview, hit / miss trend, bytes written and restored, cold-tier health counters; evict older, clear all                                                                                                | `/cache`, `/cache/prefix`                                                                                    |
-| `/models`        | Models         | Local models table (also the legend of the disk-use bar), usage per model over 30 days, recommended catalog with installs; `?focus=` opens a model's drawer                                                                                                                                                                                                                                 | `/models`, `/catalog`, `/catalog/updates`, `/downloads`, `/metrics/summary`, `/metrics/timeseries`           |
-| `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                                                                                                                        | `/coding-agents`                                                                                             |
-| `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the crawler choice (Firecrawl Cloud, Firecrawl on this Mac, or Off), with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry); the Firecrawl card's This Mac block (address, check, remove) | `/providers`                                                                                                 |
-| `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                                                                                                                         | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
+| Route            | Page           | What it shows                                                                                                                                                                                                                                                                                                                          | Data                                                                                                         |
+| ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `/`              | Overview       | Live engine panel and health list; "Last 24 hours" tiles (each opens a detail panel in place); turns per hour; storage tiles; latest turns                                                                                                                                                                                             | live channel, `/metrics/summary`, `/metrics/timeseries`, `/metrics/turns`, `/models`, `/cache`, `/downloads` |
+| `/chat`          | Chat           | Chat and Work: the conversation list (search over both modes), the thread, the composer: the + menu (files and photos, web search, crawler), model picker, (Work) folder chip (bar once set); Work's permission and plan cards. `?c=<id>` opens a conversation, `?mode=chat\|work` the New screen. See [Chat and Work](#chat-and-work) | `/chat/*` routes, the Chat host and conversation streams, live channel                                       |
+| `/system-one`    | System One     | Structured extraction (Clairic) and calibrated decisions (CLEF): visual field/rubric builders, live routing thresholds, batch evaluation studio, saved specs, run history, and copyable `/v1/systemone` API snippets                                                                                                                   | `/systemone/*` routes, `/models`, `/catalog`, live channel                                                   |
+| `/sessions`      | Sessions       | `mlx agent` sessions and the app's conversations (tagged Chat or Work): search, directory filter, live filter, summary tiles, sortable table                                                                                                                                                                                           | `/sessions`                                                                                                  |
+| `/sessions/:id`  | Session detail | Activity tab (session totals, per-turn charts, turn inspector with an agent timeline (one lane per agent, handoffs, replay; live while the turn runs), subagents) and Transcript tab (turn groups, find); a live session shows its open thinking block and running tool                                                                | `/sessions/:id`, `/sessions/:id/timeline`                                                                    |
+| `/metrics`       | Metrics        | Six tabs: Summary · Speed · Usage · Speculation · Failures · Turns. One header with range and model filter; only the open tab queries. KPI tiles pick the main chart; `?detail=` opens a tile's panel                                                                                                                                  | the six `/metrics/*` routes                                                                                  |
+| `/engine`        | Engine         | Live part: "Now" ticker, output rate, memory, turns in flight, loaded models, KV block pool. History part (1h · 6h · 24h · 7d): memory, busy time, decode batch size, model loads, processes, supervisor                                                                                                                               | live channel, `/runtime/series`, `/models`                                                                   |
+| `/cache`         | Cache          | Model caches (one folder per model identity under `prefix-cache/`: size, files, last use, lock; delete an idle one); cold-tier usage against quota, objects by age with an eviction preview, hit / miss trend, bytes written and restored, cold-tier health counters; evict older, clear all                                           | `/cache`, `/cache/prefix`                                                                                    |
+| `/models`        | Models         | Local models table (also the legend of the disk-use bar), usage per model over 30 days, recommended catalog with installs; `?focus=` opens a model's drawer                                                                                                                                                                            | `/models`, `/catalog`, `/catalog/updates`, `/downloads`, `/metrics/summary`, `/metrics/timeseries`           |
+| `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                                                                   | `/coding-agents`                                                                                             |
+| `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the crawler choice (Firecrawl or Off), with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry)                                        | `/providers`                                                                                                 |
+| `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                                                                    | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
 
 A System One run changes only the Output card. The four metric tiles are always there and show "—" when the mode
 on screen has no result. The Output status line is always there too, with three faces in one box: rest ("No run yet"
@@ -473,10 +473,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   with no key is `aria-disabled`, says `No key`, and its name says where to add it ("DeepSeek, no key. Add it in Web
   Search settings."). A rejected or no-credit key keeps its dot and words and can still be picked. The keys come from
   `GET /api/providers`, read in Chat and Work each time the menu opens and again when the host summary's `search`,
-  `searchCheck`, `firecrawl`, `firecrawlLocal` or `fetch` changes while it is open; the Web search and Crawler panels
+  `searchCheck`, `firecrawl` or `fetch` changes while it is open; the Web search and Crawler panels
   share that one read. Until the first read answers, or when it fails, only the current row and Off can be picked;
   while the Keychain does not answer, a provider whose key is not known cannot be picked. A pick sends
-  `PUT /api/providers/selection` with `{search}` only (never `firecrawl` or `firecrawlLocal`); the row says
+  `PUT /api/providers/selection` with `{search}` only (never `firecrawl`); the row says
   `Switching…` and every other row waits until the first host state after the reply, or until the reply fails. The
   menu stays open. One caption above the list says, in this order: why a pick failed (red; it clears on the next pick
   and when the menu closes, and the keys are read again), a key gone at app start (`vanished`, amber; a toast when the
@@ -486,39 +486,26 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   A rejected search key or a search account with no credit puts a 6 px dot on the `+` (danger / warning) and the
   button's name and tooltip say it (`Tools, web search key rejected`); the dot stays search only, crawler problems
   show on the Crawler row. Before the first host state the `+` is disabled.
-- Crawler row (FileText icon): picks who reads pages, Firecrawl Cloud, Firecrawl on this Mac (see
-  [Web search providers](#web-search-providers)) or Off. Its right side says `Off`, `Firecrawl`, `This Mac`, or a
-  problem with its dot: `Key rejected` (danger), `No credit` (warning), `Not running` (warning), `Cloud on` (danger;
-  the server sends a page it cannot load to Firecrawl Cloud), `Check failed` (danger; also a server whose Cloud setting
-  could not be read). On or off and the place come from the host summary (`firecrawl`, `firecrawlLocal`); the problem words need
-  the `/api/providers` body, so they show from the menu's first read on. The panel is built like the Web search one: a
-  caption, the list "Reads pages" with the rows Firecrawl Cloud, Firecrawl on this Mac and Off (always these three,
-  in this order), a separator, then Web Search settings. Firecrawl Cloud with no key (`No key`) and Firecrawl on this
-  Mac with no saved address (`Not set up`) are `aria-disabled`, and their names say where to set them up; a row not
-  read yet is disabled unless it is the current one; a rejected key, no credit, a server that does not answer or a
-  failed check keep their dot and words and can still be picked. The This Mac row of a server whose Cloud is on is
-  named "Firecrawl on this Mac, may send pages to Firecrawl Cloud. Web Search settings shows how to restart it." (or
-  "…, Cloud setting not confirmed. …"). The Off row's second line says who reads pages then:
-  "Exa reads pages for Chat." (or DeepSeek), "Brave gives Chat page excerpts only." or "Chat cannot read pages." (no
-  search provider). The settings row's note names what is missing ("Add a Firecrawl key, or set up Firecrawl on this
-  Mac.", "Add a Firecrawl key.", "Set up Firecrawl on this Mac.", "Restart Firecrawl on this Mac with FIRECRAWL_CLOUD=off or search."
-  for a server whose Cloud is on, else "Keys and page reading"). A pick sends
-  `PUT /api/providers/selection` with `{firecrawl: true, firecrawlLocal: false}`, `{firecrawl: true, firecrawlLocal:
-  true}` or `{firecrawl: false}`, never `search`; the row says `Switching…` and the other rows wait until the host
-  summary shows the picked place (the HTTP reply may still wait for the Work `PATH`), or until the reply fails. The
-  check mark follows the host summary only. The caption says, in this order: why a pick failed (red; "Add a Firecrawl
-  key in Web Search settings.", "Set up Firecrawl on this Mac in Web Search settings.", the damaged-skills sentence, or
-  "Could not switch the crawler. Try again."), the Keychain, `Reading keys…` / `Could not read the keys.` (before the
-  first body), a change that waits for running answers: "Conversations that are open keep the old crawler until every
-  running answer ends." (a loaded conversation keeps the `mlx_web` it was given, and a stale Work host keeps its
-  `FIRECRAWL_API_URL`, until the host restarts). Opening the panel, or the `+` while Firecrawl on this Mac is
-  in use, sends `POST /api/providers/local/check`; its `local` is applied to the crawler rows
-  and the Crawler row only, and only when it is for the same address and not older than what the rows have. The Web
-  search panel never waits for that check. In Work a grey line under the list says what Work gets:
-  the Firecrawl skills with the key (the agent's commands, MCP servers and hooks can read it), the skills on this Mac
-  with a placeholder key (never the key saved with `firecrawl login`; Firecrawl search goes to Firecrawl Cloud with the
-  server's own key; with none the placeholder goes with it and the search likely fails (not tried); it fails with
-  `FIRECRAWL_CLOUD=off`), no skills until the `firecrawl` CLI is installed, skills not installed, or no skills (Off).
+- Crawler row (FileText icon): picks who reads pages, Firecrawl or Off. Its right side says `Off`, `Firecrawl`, or a
+  problem with its dot: `Key rejected` (danger), `No credit` (warning). On or off come from the host summary
+  (`firecrawl`); the problem words need the `/api/providers` body, so they show from the menu's first read on. The
+  panel is built like the Web search one: a caption, the list "Reads pages" with the rows Firecrawl and Off (always
+  these two, in this order), a separator, then Web Search settings. Firecrawl with no key is `aria-disabled`, says
+  `No key`, and is named "Firecrawl, no key. Add it in Web Search settings."; while its key is not known (no body yet,
+  or a Keychain that does not answer) it is disabled unless it is the current one; a rejected key or no credit keeps
+  its dot and words and can still be picked. The Off row's second line says who reads pages then: "Exa reads pages
+  for Chat." (or DeepSeek), "Brave gives Chat page excerpts only." or "Chat cannot read pages." (no search provider).
+  The settings row's note is "Add a Firecrawl key." with no key, else "Keys and page reading". A pick sends
+  `PUT /api/providers/selection` with `{firecrawl: true}` or `{firecrawl: false}`, never `search`; the row says
+  `Switching…` and the other row waits until the host summary shows the pick (the HTTP reply may still wait for the
+  Work `PATH`), or until the reply fails. The check mark follows the host summary only. The caption says, in this
+  order: why a pick failed (red; "Add a Firecrawl key in Web Search settings.", the damaged-skills sentence, or "Could
+  not switch the crawler. Try again."), the Keychain, `Reading keys…` / `Could not read the keys.` (before the first
+  body), a change that waits for running answers: "Conversations that are open keep the old crawler until every
+  running answer ends." (a loaded conversation keeps the `mlx_web` it was given, and a stale Work host its
+  environment, until the host restarts). In Work a grey line under the list says what Work gets: the Firecrawl skills
+  with the key (the agent's commands, MCP servers and hooks can read it), no skills until the `firecrawl` CLI is
+  installed, skills not installed, or no skills (Off).
 - Files and photos: the row Add files or photos, `⌘U`, paste and drop on the composer all take files the same way
   (`ui/src/lib/chat-attachments.ts`). Small UTF-8 text files work in Chat and Work; PNG, JPEG and WebP pictures work
   in Chat when the model row of `ChatHostState.models` has `images: true`. The page reads the bytes of what was picked,
@@ -1585,10 +1572,8 @@ token (a Work command may print one), waiting at most 10 s for the Keychain.
 ## Web search providers
 
 Chat's `web_search` / `web_fetch` tools (the `mlx_web` MCP server) and the Work agent's provider skills use one
-search provider (Exa, DeepSeek or Brave: exactly one or none) and, independently, a crawler: Firecrawl Cloud (with a
-key), Firecrawl on this Mac (a `firecrawl-local serve` the user runs, below) or Off. When the crawler is on it does
-every `web_fetch`; otherwise the search provider does. Firecrawl is one provider with two places; it is on in one
-place at a time.
+search provider (Exa, DeepSeek or Brave: exactly one or none) and, independently, Firecrawl. When Firecrawl is on it
+does every `web_fetch`; otherwise the search provider does.
 
 - **Keys** live in the macOS Keychain, service `mlx-node`, accounts `search-exa-api-key`, `search-deepseek-api-key`,
   `search-brave-api-key`, `crawl-firecrawl-api-key` (`@napi-rs/keyring`). The providers service reads each once into
@@ -1596,25 +1581,16 @@ place at a time.
   the hosts start with no key. While it is unavailable, each `GET /api/providers` reads every provider again (8 s
   each) and takes only the keys the cache never had; a late answer to a timed-out call is taken too. No create or load
   path calls the Keychain. A replaced or removed key stays in memory as a redaction needle until the process exits.
-- **Settings** `<chat root>/providers.json` (0600): `{version: 1, search, firecrawl, firecrawlLocal, localUrl, checks:
-  {id: {status, at}}}`. No key. The crawler on disk: Firecrawl Cloud in use is `firecrawl: true`; Firecrawl on this
-  Mac in use is `firecrawl: false` with `firecrawlLocal: true` and a `localUrl`; Off is both false. Why: a build that
-  does not know `firecrawlLocal` reads `firecrawl` alone, so it reads a pick of this Mac as Off and never sends page
-  addresses to Firecrawl Cloud with the key. In memory a pick of this Mac is `firecrawl` and `firecrawlLocal` both
-  true, and while the crawler is Off `firecrawlLocal` keeps the place; that place is not written, so after a restart
-  the crawler is Off with no place. `localUrl` is kept only in its saved form (below). A file with `firecrawlLocal:
-  true` and an address missing or not in that form reads as Off, never as the cloud. A file without the two fields
-  reads as Firecrawl Cloud with no address. The crawler is on when `firecrawl` is set and its place is ready: a key for the
-  cloud, a saved address for this Mac. A selection whose key is gone is cleared on start and on a Check; one cleared
-  on start is reported once as `vanished` (the first `GET` carries it). A Check that ends after a key PUT or DELETE
-  of the same provider is dropped, and a web result's `rejected` / `no-credit` is recorded only while the key that got it is still current.
-- **A new key is checked first** (Exa `GET /monitors?limit=1`, where 403 `FEATURE_DISABLED` also means the key is good, DeepSeek `GET /user/balance`, Brave one `test` search,
-  Firecrawl `GET /v2/team/credit-usage`, 10 s): `rejected` (401/403) is not saved and any earlier key stays;
-  `no-credit` (402, or the account says so) and `unverified` (any other answer) are saved. The first search key
-  becomes the selection when none is set, and a Firecrawl key turns on Firecrawl Cloud when the crawler is Off, only
-  when its skill folder installs; otherwise the key is saved and the provider stays off. While Firecrawl on this Mac
-  is in use, a new key leaves it in use: page addresses never move to a place the user did not pick. Removing the
-  Firecrawl key turns the crawler Off only when the cloud was in use.
+- **Settings** `<chat root>/providers.json` (0600): `{version: 1, search, firecrawl, checks: {id: {status, at}}}`. No
+  key. A selection whose key is gone is cleared on start and on a Check; one cleared on start is reported once as
+  `vanished` (the first `GET` carries it). A Check that ends after a key PUT or DELETE of the same provider is
+  dropped, and a web result's `rejected` / `no-credit` is recorded only while the key that got it is still current.
+- **A new key is checked first** (Exa `GET /monitors?limit=1`, where 403 `FEATURE_DISABLED` also means the key is
+  good, DeepSeek `GET /user/balance`, Brave one `test` search, Firecrawl `GET /v2/team/credit-usage`, 10 s):
+  `rejected` (401/403) is not saved and any earlier key stays; `no-credit` (402, or the account says so) and
+  `unverified` (any other answer) are saved. The first search key becomes the selection when none is set, and a
+  Firecrawl key turns Firecrawl on, only when its skill folder installs; otherwise the key is saved and the provider
+  stays off.
 - **Skills** are bundled in `packages/dashboard/skills/`: `vendor/{exa,brave,firecrawl}` from pinned upstream commits
   (each with `LICENSE` and `PROVENANCE.md` listing every local edit), `own/deepseek`, and `manifest.json` (sha256 and
   size per file). Selecting a provider installs its folder into `<chat root>/plugins/<id>` (temp folder, then rename;
@@ -1626,16 +1602,10 @@ place at a time.
   `BRAVE_SEARCH_API_KEY`/`BRAVE_API_KEY`, `FIRECRAWL_API_KEY`) and their skill folders. The key is readable by
   everything the Work agent runs: shell commands, MCP servers and hooks. The Firecrawl folder and `FIRECRAWL_API_KEY`
   are passed only when a `firecrawl` executable is on the `PATH` a Work command gets (`work.missing: 'firecrawl-cli'`
-  otherwise); the app never installs the CLI. An inherited `FIRECRAWL_API_URL` is always removed. With Firecrawl
-  Cloud, Work gets `FIRECRAWL_API_URL=https://api.firecrawl.dev` next to the key, so an address the CLI saved itself
-  (`firecrawl config --api-url`) does not get the key. With Firecrawl on this Mac, Work gets
-  `FIRECRAWL_API_URL=<saved address>` and `FIRECRAWL_API_KEY=fc-local-no-key` (`FIRECRAWL_LOCAL_PLACEHOLDER_KEY` in
-  `chat/agent/env.ts`): the CLI takes that variable before the key it saved itself (`firecrawl login`), so that key
-  is never sent to the saved address. Firecrawl Local passes a search on to Firecrawl Cloud with its own key first
-  (its `FIRECRAWL_API_KEY`, or the `firecrawl login` key it reads itself under its `HOME`; `cloud.rs` `Cloud::key`,
-  `forward`); only a server with neither passes the caller's Bearer on, so its searches go out with the placeholder
-  and fail. Scrape, crawl and map on the local server are not affected. `~/.zshenv` can still set
-  either name again (each command runs with `$SHELL -c`, below). That `PATH` is not the app's own (an app started from Finder has
+  otherwise); the app never installs the CLI. With a Firecrawl key, Work also gets
+  `FIRECRAWL_API_URL=https://api.firecrawl.dev`: the CLI takes that variable before an address it saved itself
+  (`firecrawl config --api-url`), so the key goes to Firecrawl unless a command passes `--api-url`. `~/.zshenv` can
+  still set it again (each command runs with `$SHELL -c`, below). That `PATH` is not the app's own (an app started from Finder has
   `/usr/bin:/bin:/usr/sbin:/sbin`): `mlx-agent` asks the user's login shell (`$SHELL -lc`, with `~/.zshrc` or
   `~/.bashrc` sourced, 5 s limit), puts its own entries after the answer, and runs each command with `$SHELL -c`, which
   reads `~/.zshenv` or `$BASH_ENV` once more. `chat/agent/work-path.ts` asks the same two questions and reads back only
@@ -1648,131 +1618,31 @@ place at a time.
   mlx-agent v0.3.3 (`xai-grok-tools/src/computer/local/terminal.rs`); read them again when the agent release moves,
   and run row U16 of the live smoke.
 - **Chat** never sees a key in a prompt or argv: `mlx_web` gets it in its per-session MCP `env`
-  (`MLX_WEB_SEARCH_PROVIDER`, `MLX_WEB_SEARCH_KEY`, `MLX_WEB_FETCH_PROVIDER`, `MLX_WEB_FETCH_KEY`,
-  `MLX_WEB_FETCH_URL`). `MLX_WEB_FETCH_URL` is the saved address while Firecrawl on this Mac is in use, else empty; the
-  server keeps it only with the fetch provider `firecrawl` and only in the saved form, and whenever it is set the
-  fetch key reads empty, so a page read meant for this Mac never goes to the cloud. The server talks only to the four
-  fixed provider hosts and that address, with no redirects (a 3xx is `provider-error`), a 15 s (search) / 30 s
+  (`MLX_WEB_SEARCH_PROVIDER`, `MLX_WEB_SEARCH_KEY`, `MLX_WEB_FETCH_PROVIDER`, `MLX_WEB_FETCH_KEY`). The server talks
+  only to the four fixed provider hosts, with no redirects (a 3xx is `provider-error`), a 15 s (search) / 30 s
   (fetch) timeout and a 2 MiB reply cap; `web_fetch` refuses local names, private and special IPv4 ranges, IP literals
   in brackets, user info, empty host labels, white space, control characters, backslashes and non-ASCII before the
   path, before any call, and forwards the address without its fragment.
-- **Firecrawl on this Mac** (`src/chat/web/local.ts`): Firecrawl Local (crate `firecrawl-local`, AGPL-3.0, one
-  binary; `firecrawl-local serve` answers part of the Firecrawl v2 API on `http://127.0.0.1:3002` with no key). The
-  user installs and starts it; the app only talks to it.
-  - Address rule: `http://`, host `127.0.0.1`, `localhost` or `[::1]`, an explicit port 1024-65535, nothing after the
-    port but one `/`; no user info, query or hash. Saved as `http://127.0.0.1:<port>` (`localhost` is rewritten) or
-    `http://[::1]:<port>`. Everything else (https, LAN addresses, other `127.x` addresses, ports below 1024) is
-    refused. Why: http is safe only when the bytes never leave the Mac; a LAN or remote base would let a settings
-    value aim the fetch at any host and send page addresses in clear text; `serve` off loopback needs a token the
-    app does not store; an IP literal means no name lookup can move the target. The paths are fixed in code, and no
-    request to the server carries an Authorization header (the server would pass a caller's key on to Firecrawl
-    Cloud).
-  - The check, three requests to the saved address: `GET /health` (2 s) must answer 200 JSON with `engine:
-    "firecrawl-local"` (else `not-firecrawl`; no answer `not-running`; 401 `token`). Then a scrape of the server's
-    own `<address>/health` (5 s), a loopback target it must refuse with 403 `BLOCKED_TARGET`; any other answer is
-    `open` (started with `--allow-private`). A refused target is never handed to Firecrawl Cloud. Then, always and
-    only after both passed, `GET /v2/team/credit-usage` with `Sec-Fetch-Site: cross-site` (2 s), which the server
-    refuses itself, so nothing leaves the Mac: 501 `CLOUD_ONLY` (`FIRECRAWL_CLOUD=off`, or `search`, which passes on
-    only searches) is `ok` with `cloud: 'off'`. Everything else fails closed as `cloud-on`: 403 `CROSS_SITE_REQUEST`
-    means a page it cannot load is sent to Firecrawl Cloud (`cloud: 'fallback'`; `FIRECRAWL_CLOUD` unset, the
-    server's default, or `on`, `auto`, `fallback`, `true`, `1`, `yes`, `enabled`, `enable`); any other answer,
-    timeout or dropped socket is `cloud: null`. The server reads `off`, `false`, `0`, `none`, `no`, `disabled`,
-    `disable` and any value it does not know as Off (`cloud.rs` `CloudMode::parse`, `requested`). The version is
-    kept only when it is digits and dots.
-  - When it runs: on Check and save (only `ok` is saved; the earlier address and the selection stay otherwise); on
-    `POST /api/providers/local/check` (Check again on the page; the `+` menu, see the Crawler row); in
-    the background at providers start and on `GET /api/providers`, at most once in 15 s. `GET /api/providers` never
-    waits for it and answers with the last result (`local.check` is null until the first check of the saved address
-    ends). A check of the same address that is already running is joined. In the `mlx_web` server before every page
-    read on this Mac (all three requests, inside the call slot): `cloud-on` returns `WEB_ERROR local-cloud`, every
-    other outcome but `ok` returns `WEB_ERROR local-down`, and no page address is sent.
-  - A saved address turns on Firecrawl on this Mac only when the crawler is Off; while Firecrawl Cloud is in use it
-    stays in use until the user picks this Mac. A `cloud-on` address, like `open`, is not saved and turns nothing on. A
-    stored check of `cloud-on` (a server restarted with its Cloud on) keeps the pick, as `open` does: the badge says
-    Check failed and every Chat page read is refused until a check passes. Work's `firecrawl` CLI keeps the address (it
-    does not switch on the check). Removing the address turns the crawler Off when it was in use; it never moves to the
-    cloud.
-  - A save never undoes a later change: the providers service counts crawler changes (a pick that sends `firecrawl` or
-    `firecrawlLocal`, a Remove, a saved address) inside its mutation queue. A save reads the count before its check and,
-    when it moved during the check, writes nothing (no address, no stored check, no change event) and answers `saved:
-    false` with `check: 'ok'` (`saved: true` when that address is the saved one already); the page says "Could not
-    finish. Try again." with "The earlier address is still in use." when the reply has an address and This Mac in use,
-    else "The address was not saved.". Background checks and Check again do not count.
-  - Chat's page read: `POST <address>/v2/scrape` with the cloud body, no Authorization header. No connection or 401
-    gives `local-down`, 403 gives `blocked`, `data.blocked` gives `no-content`. A page the server handed to Firecrawl
-    Cloud (`data.source: "firecrawl-cloud"`) gets the result line `note: read by Firecrawl Cloud`, and its tool row
-    says "read by Firecrawl Cloud". With the Cloud check before each read such an answer should not come; the note
-    stays as a second line of defence. A `local-down` row ("Firecrawl on this Mac is not ready") and a `local-cloud` row ("Firecrawl on this
-    Mac may send pages to Firecrawl Cloud") offer the Web Search settings link. The app's own
-    rules run first, as with the cloud: the `web_fetch` address checks and the Chat address ledger (only addresses
-    from the user or from search results).
-  - What leaves this Mac: no page address goes to a provider; this Mac fetches the page, so the site sees the user's IP
-    address. Pages open only to the user's network (office, VPN) can be read, and pages that need JavaScript run in a
-    Chrome on this Mac. The server's own rule refuses private addresses (also after DNS and on every redirect) and
-    nothing more; for network-position access the Chat address ledger is the control. Chat reads a page there only after
-    a check that reads its Cloud as off, so a page Chat reads on this Mac is not sent to Firecrawl Cloud unless the
-    server is restarted between the check and the read (the `read by Firecrawl Cloud` note covers that case). Work's
-    `firecrawl` commands reach the server directly, without this check: a server started without `FIRECRAWL_CLOUD=off`
-    or `=search` sends a page it cannot load for them to Firecrawl Cloud. Another program listening on the saved port
-    and answering like Firecrawl Local would get the page addresses Chat reads: same-machine trust, as for any loopback
-    server.
-  - What does not work on this Mac: search (it always goes to Firecrawl Cloud: with `FIRECRAWL_CLOUD=search` with the
-    server's own key, with `FIRECRAWL_CLOUD=off` the CLI's search fails), JSON and summary formats, browser actions. Chat only uses page text, so Chat loses nothing.
-  - The Web Search page: the Use panel's second list, "Crawler · One at a time", shows Firecrawl Cloud only with a
-    key, Firecrawl on this Mac only with a saved address, and Off (its note says who reads pages then); with neither
-    set up one sentence stands in place of the list. The Firecrawl card's This Mac block, not set up: an address
-    field prefilled with `http://127.0.0.1:3002`, Check and save, "Needs Rust and a C compiler (xcode-select
-    --install).", the guide link, `cargo install firecrawl-local`, "Start it with one of these. Started without
-    FIRECRAWL_CLOUD, the server sends a page it cannot load to Firecrawl Cloud, and Chat does not use it.", then
-    `FIRECRAWL_CLOUD=off firecrawl-local serve` ("Everything stays on this Mac. Firecrawl search is off.") and
-    `FIRECRAWL_CLOUD=search firecrawl-local serve` ("Pages stay on this Mac. Firecrawl search goes to Firecrawl
-    Cloud."), each with a copy button. A typed address the rule refuses sends nothing; a refused save says why under
-    the field (for `cloud-on`: "This server may send pages to Firecrawl Cloud, so the app does not use it. Start it
-    with FIRECRAWL_CLOUD=off or FIRECRAWL_CLOUD=search."). Saved: the address, a badge (Running, Not running, Check
-    failed, Not checked) and the check's sentence (for `cloud-on`, by `cloud`: the server sends a page it cannot load
-    to Firecrawl Cloud, or the app could not confirm that it keeps pages on this Mac), then Check again, Replace and
-    Remove, then the same two start commands while the check is `cloud-on`. The commands are laid out in every state
-    (hidden and inert unless `cloud-on`), so the block keeps its height from one check to the next. The block and the Crawler list work while the
-    Keychain is down (this Mac needs no key, and Firecrawl Cloud is listed only with its key in the cache); the search
-    list is locked then. While this Mac is in use the card's Work notice says the CLI talks to this address with a
-    placeholder key and how search gets a key, and "What leaves this Mac" adds the local sentence while an address is
-    saved.
-  - Not done, each a separate decision:
-    - Bundling, installing or starting the server: AGPL-3.0 needs a legal decision, and there is no prebuilt binary.
-    - A server on the LAN or the internet, or https: refused by the address rule.
-    - `serve --token`: it would need a second stored secret.
-    - The Docker Compose self-host: it fails the engine check, and how it treats private addresses was not read.
-    - Local search: search always needs Firecrawl Cloud.
-    - A dot on the `+` and a live `Not running` in the host summary: the Crawler row shows it after the menu's check.
-    - Flagging `--api-url` in the Work command guard: in cloud mode such a command could send the key elsewhere.
-- **A change** (key, address, selection, a late Keychain answer) marks both agent hosts stale: each restarts when no
-  turn is in flight (`applyPending` while one is). A local check never does. The selection is also changed from the
-  composer's `+` menu: the Web search panel sends `search` only, the Crawler panel `firecrawl` and `firecrawlLocal`
-  only.
+- **The Web Search page**: the Use panel's second list, "Crawler · One at a time", shows Firecrawl only with a key,
+  and Off (its note says who reads pages then); with no key "Add a Firecrawl key below." stands in place of the list.
+  Both lists are locked while the Keychain is down.
+- **A change** (key, selection, a late Keychain answer) marks both agent hosts stale: each restarts when no turn is in
+  flight (`applyPending` while one is). The selection is also changed from the composer's `+` menu: the Web search
+  panel sends `search` only, the Crawler panel `firecrawl` only.
 
-| Route                         | Method | Body                                                             | Reply                                           |
-| ----------------------------- | ------ | ---------------------------------------------------------------- | ----------------------------------------------- |
-| `/api/providers`              | GET    |                                                                  | `ProvidersResponse`                             |
-| `/api/providers/:id/key`      | PUT    | `{key}`                                                          | `{saved, check, providers}`                     |
-| `/api/providers/:id/key`      | DELETE |                                                                  | `ProvidersResponse`                             |
-| `/api/providers/:id/validate` | POST   |                                                                  | `{check, providers}` (`check` null: no key)     |
-| `/api/providers/selection`    | PUT    | `{search?: id \| null, firecrawl?: bool, firecrawlLocal?: bool}` | `ProvidersResponse`                             |
-| `/api/providers/local`        | PUT    | `{url}`                                                          | `{saved, check, providers}`                     |
-| `/api/providers/local`        | DELETE |                                                                  | `ProvidersResponse`                             |
-| `/api/providers/local/check`  | POST   |                                                                  | `{check, providers}` (`check` null: no address) |
+| Route                         | Method | Body                                      | Reply                                       |
+| ----------------------------- | ------ | ----------------------------------------- | ------------------------------------------- |
+| `/api/providers`              | GET    |                                           | `ProvidersResponse`                         |
+| `/api/providers/:id/key`      | PUT    | `{key}`                                   | `{saved, check, providers}`                 |
+| `/api/providers/:id/key`      | DELETE |                                           | `ProvidersResponse`                         |
+| `/api/providers/:id/validate` | POST   |                                           | `{check, providers}` (`check` null: no key) |
+| `/api/providers/selection`    | PUT    | `{search?: id \| null, firecrawl?: bool}` | `ProvidersResponse`                         |
 
-`ProvidersResponse` carries `firecrawlLocal` (Firecrawl on this Mac is in use) and `local: {url, check, checkedAt,
-version, cloud}`; the host summary carries `firecrawlLocal` the same way. All run on the transport thread. Errors:
-`E_BAD_REQUEST` "That does not look like an API key." (the key is never quoted), "Use an address on this Mac." (the
-address is never quoted) or an unknown field; `E_NOT_FOUND` for an unknown provider id; `E_CONFLICT` "Add a key for X
-first.", or "Set up Firecrawl on this Mac first." with `reason: 'local-not-set-up'`; `E_UNAVAILABLE` with
-`reason: 'keychain-unavailable'` or `'skill-bundle-corrupt'`; `E_INTERNAL` "The key changed, but the settings could
-not be saved." when a key PUT or DELETE changed the Keychain but not `providers.json` (the hosts are still told); any
-other failure of a local route is "Firecrawl on this Mac could not be checked.". The page's types are
+All run on the transport thread. Errors: `E_BAD_REQUEST` "That does not look like an API key." (the key is never
+quoted) or an unknown field; `E_NOT_FOUND` for an unknown provider id; `E_CONFLICT` "Add a key for X first.";
+`E_UNAVAILABLE` with `reason: 'keychain-unavailable'` or `'skill-bundle-corrupt'`; `E_INTERNAL` "The key changed, but
+the settings could not be saved." when a key PUT or DELETE changed the Keychain but not `providers.json` (the hosts
+are still told). The page's types are
 `ui/src/lib/providers-types.ts`, a copy of `src/chat/providers/types.ts`. The dev harness keeps keys in memory and
 points every provider at fake servers on 127.0.0.1 (a key starting `bad` is rejected, `nocredit` has no credit,
-`slow` times out the check). It also starts a fake Firecrawl Local on a loopback port and prints its address at start
-(`fake Firecrawl on this Mac: <url>`); typed into the This Mac field it passes the check (its Cloud step answers
-501 `CLOUD_ONLY`), and any other loopback port reads not running. `MLX_DEV_LOCAL_CLOUD=fallback` makes its Cloud step
-answer 403 `CROSS_SITE_REQUEST` and `MLX_DEV_LOCAL_CLOUD=unreadable` an answer the check does not know; both read as
-`cloud-on`.
+`slow` times out the check).

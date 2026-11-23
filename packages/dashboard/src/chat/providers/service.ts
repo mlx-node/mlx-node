@@ -1,11 +1,9 @@
 /**
- * The web search providers: the selection (exactly one search provider or none, Firecrawl independent, in Firecrawl
- * Cloud or on this Mac), the keys, their checks, and the skill folders that follow the selection. Keys live in the
- * Keychain; this service keeps a cache filled once and refreshed only by the key routes, so no create or load path
- * waits on the Keychain past {@link KEYCHAIN_CALL_MS}. A replaced or removed key stays in memory as a redaction needle
- * until the process exits. Changes run one at a time; after each one the skills are synced and the agent hosts are
- * told to restart when idle. The check of Firecrawl on this Mac is a live fact in memory: no read waits for it, and
- * its result never restarts a host (the mlx_web server checks the server again before each page read).
+ * The web search providers: the selection (exactly one search provider or none, Firecrawl independent), the keys,
+ * their checks, and the skill folders that follow the selection. Keys live in the Keychain; this service keeps a
+ * cache filled once and refreshed only by the key routes, so no create or load path waits on the Keychain past
+ * {@link KEYCHAIN_CALL_MS}. A replaced or removed key stays in memory as a redaction needle until the process exits.
+ * Changes run one at a time; after each one the skills are synced and the agent hosts are told to restart when idle.
  */
 
 import { join } from 'node:path';
@@ -19,7 +17,6 @@ import { SkillsInstaller, type SyncResult } from '../skills/install.js';
 import { CHAT_SKILL_BUNDLE, defaultSkillsDir, loadManifest, type SkillsManifest } from '../skills/manifest.js';
 import type { ChatHostState } from '../types.js';
 import { PROVIDER_ORIGINS } from '../web/http.js';
-import { checkLocal, type LocalCheckResult, parseLocalAddress } from '../web/local.js';
 import { checkKeyFormat, type SecretStore } from './secrets.js';
 import {
   defaultSettings,
@@ -32,13 +29,10 @@ import {
 import type { ProviderSource } from './source.js';
 import type {
   KeyCheck,
-  LocalFirecrawl,
   ProviderCheckReply,
   ProviderFacts,
   ProviderId,
   ProviderKeyReply,
-  ProviderLocalCheckReply,
-  ProviderLocalReply,
   ProviderSelectionInput,
   ProvidersResponse,
   ProviderState,
@@ -50,8 +44,6 @@ import { validateKey } from './validate.js';
 export const KEYCHAIN_CALL_MS = 8_000;
 /** A providers read asks the shell again at most this often: each ask runs the user's shell start files. */
 export const WORK_PATH_ASK_GAP_MS = 15_000;
-/** A providers read starts a check of Firecrawl on this Mac at most this often. */
-export const LOCAL_CHECK_GAP_MS = 15_000;
 
 const PROVIDER_NAMES: Readonly<Record<ProviderId, string>> = {
   exa: 'Exa',
@@ -65,10 +57,6 @@ const SETTINGS_UNSAVED_MESSAGE = 'The key changed, but the settings could not be
 
 function keychainError(): ApiError {
   return new ApiError('E_UNAVAILABLE', KEYCHAIN_MESSAGE, 'keychain-unavailable');
-}
-
-function localNotSetUp(): ApiError {
-  return new ApiError('E_CONFLICT', 'Set up Firecrawl on this Mac first.', 'local-not-set-up');
 }
 
 export interface ProvidersServiceOptions {
@@ -100,12 +88,6 @@ export interface ProviderHooks {
 
 type Raced<T> = { kind: 'value'; value: T } | { kind: 'timeout' } | { kind: 'error' };
 
-/** A check of Firecrawl on this Mac and its place in the order the checks started. */
-interface LocalChecked {
-  result: LocalCheckResult;
-  seq: number;
-}
-
 export class ProvidersService implements ProviderSource {
   private readonly opts: ProvidersServiceOptions;
   private readonly now: () => number;
@@ -131,16 +113,6 @@ export class ProvidersService implements ProviderSource {
   private pathAskedAt = Number.NEGATIVE_INFINITY;
   /** Providers whose Keychain write timed out and is still pending: a newer write could land before it. */
   private readonly writing = new Set<ProviderId>();
-  /** The last check of the saved address that ended; a check that started earlier never replaces it. */
-  private localCheck: { url: string; result: LocalCheckResult; at: number; seq: number } | null = null;
-  private localRunning: { url: string; done: Promise<LocalChecked> } | null = null;
-  private localSeq = 0;
-  private localStartedAt = Number.NEGATIVE_INFINITY;
-  /**
-   * Bumped in the queue by a crawler pick, a Remove of the address and a saved address: an address save whose check
-   * began before one of them saves nothing, so it never undoes a later Off or Remove.
-   */
-  private crawlerRev = 0;
   private chain: Promise<void> = Promise.resolve();
   private started: Promise<void> | null = null;
   private hooks: ProviderHooks = { changed: () => {}, keysChanged: () => {}, applyPending: () => false };
@@ -165,13 +137,11 @@ export class ProvidersService implements ProviderSource {
   chatWeb(): ChatWebEnv {
     const search = this.selectedSearch();
     const fetchProvider = this.fetchProvider();
-    const local = this.localInUse() ? this.settings.localUrl : null;
     return {
       searchProvider: search ?? 'none',
       searchKey: search === null ? '' : (this.keys.get(search) ?? ''),
       fetchProvider: fetchProvider ?? 'none',
-      fetchKey: fetchProvider === null || local !== null ? '' : (this.keys.get(fetchProvider) ?? ''),
-      fetchUrl: local ?? '',
+      fetchKey: fetchProvider === null ? '' : (this.keys.get(fetchProvider) ?? ''),
     };
   }
 
@@ -183,12 +153,8 @@ export class ProvidersService implements ProviderSource {
     };
     const search = this.selectedSearch();
     if (search !== null) add(search);
-    if (this.firecrawlInWork() && !this.localInUse()) add('firecrawl');
+    if (this.firecrawlInWork()) add('firecrawl');
     return out;
-  }
-
-  workFirecrawlUrl(): string | null {
-    return this.firecrawlInWork() && this.localInUse() ? this.settings.localUrl : null;
   }
 
   workPluginDirs(): string[] {
@@ -242,7 +208,6 @@ export class ProvidersService implements ProviderSource {
       search,
       searchCheck: search === null ? null : (this.settings.checks[search]?.status ?? null),
       firecrawl: this.firecrawlOn(),
-      firecrawlLocal: this.localInUse(),
       fetch: this.fetchProvider(),
       applyPending: this.hooks.applyPending(),
     };
@@ -253,12 +218,9 @@ export class ProvidersService implements ProviderSource {
   /**
    * `GET /api/providers`: re-verifies the installed skill folders. While the Keychain is marked down, every provider is
    * read again (each read bounded); keys the cache did not have yet are taken, and the mark clears when all answer.
-   * With an address saved it answers with the last check of Firecrawl on this Mac and starts the next one in the
-   * background, at most once per {@link LOCAL_CHECK_GAP_MS}: the reply never waits for it.
    */
   async list(): Promise<ProvidersResponse> {
     await this.start();
-    this.checkLocalInBackground();
     const reread = this.keychainDown ? await this.rereadAll() : null;
     const due = this.pathAsked !== null || this.now() - this.pathAskedAt >= WORK_PATH_ASK_GAP_MS;
     if (this.firecrawlOn() && !this.cliFound && due) await this.askPath();
@@ -290,23 +252,16 @@ export class ProvidersService implements ProviderSource {
       );
       this.replaceKey(id, key);
       this.recordCheck(id, result.check, result.facts);
-      const prior = {
-        search: this.settings.search,
-        firecrawl: this.settings.firecrawl,
-        firecrawlLocal: this.settings.firecrawlLocal,
-      };
-      // A Firecrawl key turns on Firecrawl Cloud only from Off: while Firecrawl on this Mac is in use, page addresses
-      // keep going there until the user picks the cloud.
-      if (id === 'firecrawl' && !this.settings.firecrawl) {
-        this.settings.firecrawl = true;
-        this.settings.firecrawlLocal = false;
-      } else if (id !== 'firecrawl' && this.settings.search === null) this.settings.search = id;
+      const prior = { search: this.settings.search, firecrawl: this.settings.firecrawl };
+      if (id === 'firecrawl') this.settings.firecrawl = true;
+      else if (this.settings.search === null) this.settings.search = id;
       const enabled = this.settings.search !== prior.search || this.settings.firecrawl !== prior.firecrawl;
       await this.afterKeyChange(async () => {
         const synced = await this.sync().catch(() => null);
         // As on the select route, a provider is not turned on when its skill folder does not install.
         if (!enabled || synced?.[id] === 'ok') return;
-        Object.assign(this.settings, prior);
+        this.settings.search = prior.search;
+        this.settings.firecrawl = prior.firecrawl;
         await this.sync().catch(() => {});
       });
       return { saved: true, check: result.check, providers: this.snapshot() };
@@ -327,8 +282,7 @@ export class ProvidersService implements ProviderSource {
       this.replaceKey(id, null);
       this.recordCheck(id, null, null);
       if (this.settings.search === id) this.settings.search = null;
-      // Firecrawl on this Mac needs no key: only the cloud turns off.
-      if (id === 'firecrawl' && !this.settings.firecrawlLocal) this.settings.firecrawl = false;
+      if (id === 'firecrawl') this.settings.firecrawl = false;
       await this.afterKeyChange(async () => {
         await this.sync().catch(() => {});
       });
@@ -379,27 +333,18 @@ export class ProvidersService implements ProviderSource {
   /** `PUT /api/providers/selection`: nothing changes unless every wanted skill folder installs. */
   async select(input: ProviderSelectionInput): Promise<ProvidersResponse> {
     await this.start();
-    const crawlerPicked = input.firecrawl !== undefined || input.firecrawlLocal !== undefined;
     const reply = await this.exclusive(async () => {
-      if (crawlerPicked) this.crawlerRev += 1;
       const previous = { ...this.settings, checks: { ...this.settings.checks } };
       const next = { ...previous, checks: { ...previous.checks } };
       if (input.search !== undefined) {
         if (input.search !== null && !this.configured(input.search)) throw this.needsKey(input.search);
         next.search = input.search;
       }
-      if (input.firecrawl !== undefined) next.firecrawl = input.firecrawl;
-      if (input.firecrawlLocal !== undefined) {
-        if (input.firecrawlLocal && next.localUrl === null) throw localNotSetUp();
-        next.firecrawlLocal = input.firecrawlLocal;
+      if (input.firecrawl !== undefined) {
+        if (input.firecrawl && !this.configured('firecrawl')) throw this.needsKey('firecrawl');
+        next.firecrawl = input.firecrawl;
       }
-      if (crawlerPicked && next.firecrawl && !next.firecrawlLocal && !this.configured('firecrawl')) {
-        throw this.needsKey('firecrawl');
-      }
-      const changed =
-        next.search !== previous.search ||
-        next.firecrawl !== previous.firecrawl ||
-        next.firecrawlLocal !== previous.firecrawlLocal;
+      const changed = next.search !== previous.search || next.firecrawl !== previous.firecrawl;
       this.settings = next;
       let failed: 'skill-bundle-corrupt' | 'install-failed' | null;
       try {
@@ -435,86 +380,7 @@ export class ProvidersService implements ProviderSource {
       if (changed) this.hooks.changed();
       return this.snapshot();
     });
-    return input.firecrawl === true || input.firecrawlLocal !== undefined ? this.withWorkPath(reply) : reply;
-  }
-
-  /**
-   * `PUT /api/providers/local`: the address is checked first (see `checkLocal`); one whose check is not `ok` is not
-   * saved, and the earlier address and the selection stay. A saved address turns on Firecrawl on this Mac only from
-   * Off: while Firecrawl Cloud is in use, it stays in use until the user picks this Mac. A crawler pick, a Remove or
-   * another saved address that lands during the check wins: this one saves nothing and answers `saved: false`, or
-   * `saved: true` when that address is the saved one already.
-   */
-  async putLocal(raw: string): Promise<ProviderLocalReply> {
-    const url = parseLocalAddress(raw);
-    if (url === null) throw ApiError.badRequest('Use an address on this Mac.');
-    await this.start();
-    // Read in the queue, so a change asked for before this save does not count as a later one.
-    const rev = await this.exclusive(async () => this.crawlerRev);
-    const checked = await this.runLocalCheck(url);
-    const { check } = checked.result;
-    if (check !== 'ok') {
-      return { saved: false, check, providers: await this.exclusive(async () => this.snapshot()) };
-    }
-    const reply = await this.exclusive(async (): Promise<ProviderLocalReply> => {
-      if (this.crawlerRev !== rev) return { saved: this.settings.localUrl === url, check, providers: this.snapshot() };
-      this.crawlerRev += 1;
-      const previous = { ...this.settings, checks: { ...this.settings.checks } };
-      this.settings.localUrl = url;
-      this.keepLocalCheck(url, checked);
-      if (!this.settings.firecrawl) {
-        this.settings.firecrawl = true;
-        this.settings.firecrawlLocal = true;
-      }
-      try {
-        const synced = await this.sync().catch(() => null);
-        // As on the select route, Firecrawl is not turned on when its skill folder does not install.
-        if (this.settings.firecrawl !== previous.firecrawl && synced?.firecrawl !== 'ok') {
-          this.settings.firecrawl = previous.firecrawl;
-          this.settings.firecrawlLocal = previous.firecrawlLocal;
-          await this.sync().catch(() => {});
-        }
-        await this.saveOrRestore(previous);
-      } finally {
-        const s = this.settings;
-        if (s.localUrl !== previous.localUrl || s.firecrawl !== previous.firecrawl) this.hooks.changed();
-      }
-      return { saved: true, check, providers: this.snapshot() };
-    });
-    if (!reply.saved) return reply;
-    return { ...reply, providers: await this.withWorkPath(reply.providers) };
-  }
-
-  /** `POST /api/providers/local/check`: checks the saved address now, past the gap of a providers read. */
-  async checkLocalNow(): Promise<ProviderLocalCheckReply> {
-    await this.start();
-    const url = this.settings.localUrl;
-    const checked = url === null ? null : await this.runLocalCheck(url);
-    return { check: checked?.result.check ?? null, providers: await this.exclusive(async () => this.snapshot()) };
-  }
-
-  /**
-   * `DELETE /api/providers/local`: the address is forgotten. When it was in use the crawler turns off; it never moves
-   * to the cloud.
-   */
-  async deleteLocal(): Promise<ProvidersResponse> {
-    await this.start();
-    return this.exclusive(async () => {
-      this.crawlerRev += 1;
-      const previous = { ...this.settings, checks: { ...this.settings.checks } };
-      const inUse = this.settings.firecrawl && this.settings.firecrawlLocal;
-      this.settings.localUrl = null;
-      this.settings.firecrawlLocal = false;
-      if (inUse) this.settings.firecrawl = false;
-      this.localCheck = null;
-      try {
-        await this.sync().catch(() => {});
-        await this.saveOrRestore(previous);
-      } finally {
-        if (inUse) this.hooks.changed();
-      }
-      return this.snapshot();
-    });
+    return input.firecrawl === true ? this.withWorkPath(reply) : reply;
   }
 
   // ── internals ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -532,50 +398,8 @@ export class ProvidersService implements ProviderSource {
       await this.refreshCli();
       // Not awaited: its answer queues behind this step.
       if (this.firecrawlOn()) void this.askPath();
-      this.checkLocalInBackground();
     });
     return this.started;
-  }
-
-  /** Starts a check of the saved address unless one runs or one started less than the gap ago. Never awaited. */
-  private checkLocalInBackground(): void {
-    const url = this.settings.localUrl;
-    if (url === null || this.localRunning !== null || this.now() - this.localStartedAt < LOCAL_CHECK_GAP_MS) return;
-    void this.runLocalCheck(url);
-  }
-
-  /** A check of `url`; a caller while one of the same address runs joins it. Kept only while `url` is saved. */
-  private runLocalCheck(url: string): Promise<LocalChecked> {
-    if (this.localRunning?.url === url) return this.localRunning.done;
-    this.localStartedAt = this.now();
-    const seq = ++this.localSeq;
-    const done = checkLocal(url, { fetch: this.fetcher() }).then((result) => {
-      const checked = { result, seq };
-      if (this.settings.localUrl === url) this.keepLocalCheck(url, checked);
-      return checked;
-    });
-    const running = { url, done };
-    this.localRunning = running;
-    void done.finally(() => {
-      if (this.localRunning === running) this.localRunning = null;
-    });
-    return done;
-  }
-
-  private keepLocalCheck(url: string, checked: LocalChecked): void {
-    if (this.localCheck !== null && this.localCheck.url === url && this.localCheck.seq > checked.seq) return;
-    this.localCheck = { url, result: checked.result, at: this.now(), seq: checked.seq };
-  }
-
-  /** Saves the settings; on a failure the earlier ones and their folders come back and the error is thrown. */
-  private async saveOrRestore(previous: ProviderSettings): Promise<void> {
-    try {
-      await writeSettings(this.opts.paths.providers, this.settings);
-    } catch (error) {
-      this.settings = previous;
-      await this.sync().catch(() => {});
-      throw error;
-    }
   }
 
   /** One question at a time: a caller while one is open joins it. A throw keeps the earlier answer. */
@@ -832,13 +656,9 @@ export class ProvidersService implements ProviderSource {
   private validateDeps(id: ProviderId): { baseUrl: string; fetch: typeof fetch; timeoutMs?: number } {
     return {
       baseUrl: this.opts.baseUrls?.[id] ?? PROVIDER_ORIGINS[id],
-      fetch: this.fetcher(),
+      fetch: this.opts.fetch ?? ((input, init) => fetch(input, init)),
       timeoutMs: this.opts.validateTimeoutMs,
     };
-  }
-
-  private fetcher(): typeof fetch {
-    return this.opts.fetch ?? ((input, init) => fetch(input, init));
   }
 
   private configured(id: ProviderId): boolean {
@@ -855,32 +675,11 @@ export class ProvidersService implements ProviderSource {
     return search !== null && this.configured(search) ? search : null;
   }
 
-  /** Firecrawl reads pages: in the cloud with a key, or on this Mac with a saved address. */
   private firecrawlOn(): boolean {
-    if (!this.settings.firecrawl) return false;
-    return this.settings.firecrawlLocal ? this.settings.localUrl !== null : this.configured('firecrawl');
+    return this.settings.firecrawl && this.configured('firecrawl');
   }
 
-  private localInUse(): boolean {
-    return this.firecrawlOn() && this.settings.firecrawlLocal;
-  }
-
-  private localView(): LocalFirecrawl {
-    const url = this.settings.localUrl;
-    const last = url !== null && this.localCheck?.url === url ? this.localCheck : null;
-    return {
-      url,
-      check: last?.result.check ?? null,
-      checkedAt: last?.at ?? null,
-      version: last?.result.version ?? null,
-      cloud: last?.result.cloud ?? null,
-    };
-  }
-
-  /**
-   * Work gets the Firecrawl skills only when the `firecrawl` CLI is on its PATH, and with them the key (cloud) or the
-   * address (this Mac).
-   */
+  /** Work gets the Firecrawl key and skills only together, and only when the `firecrawl` CLI is on its PATH. */
   private firecrawlInWork(): boolean {
     return this.firecrawlOn() && this.installed.get('firecrawl') === true && this.cliFound;
   }
@@ -926,10 +725,8 @@ export class ProvidersService implements ProviderSource {
     return {
       search,
       firecrawl,
-      firecrawlLocal: this.localInUse(),
       fetch: this.fetchProvider(),
       providers,
-      local: this.localView(),
       chatSkill: { installed: this.installed.get(CHAT_SKILL_BUNDLE) === true },
       keychain: this.keychainDown ? 'unavailable' : 'ok',
       applyPending: this.hooks.applyPending(),

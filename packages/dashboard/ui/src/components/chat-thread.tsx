@@ -310,10 +310,7 @@ function WebRow(props: {
     detail = resultCountText(result.results.length);
     body = <WebBody result={result} raw={entry.output} />;
   } else if (result.kind === 'page') {
-    const notes: string[] = [];
-    if (result.cloudRead) notes.push(CHAT.readByCloud);
-    if (result.cut) notes.push(CHAT.cut);
-    detail = notes.length === 0 ? undefined : notes.join(', ');
+    detail = result.cut ? CHAT.cut : undefined;
     body = <WebBody result={result} raw={entry.output} />;
   }
   return (

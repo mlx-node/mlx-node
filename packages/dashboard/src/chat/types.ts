@@ -389,8 +389,6 @@ export interface ChatHostState {
     search: SearchProviderId | null;
     searchCheck: KeyCheck | null;
     firecrawl: boolean;
-    /** Firecrawl is on and reads pages on this Mac. */
-    firecrawlLocal: boolean;
     fetch: ProviderId | null;
     applyPending: boolean;
   };

@@ -398,7 +398,7 @@ describe('what ps shows of the app', () => {
     const fake = await fakeHost('chat-basic', {
       mode: 'chat',
       providers: noProviders({
-        chatWeb: () => ({ searchProvider: 'brave', searchKey: key, fetchProvider: 'none', fetchKey: '', fetchUrl: '' }),
+        chatWeb: () => ({ searchProvider: 'brave', searchKey: key, fetchProvider: 'none', fetchKey: '' }),
         workKeys: () => ({ BRAVE_API_KEY: key }),
         secretNeedles: () => [key],
       }),

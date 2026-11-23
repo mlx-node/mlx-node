@@ -74,7 +74,10 @@ export const CHAT = {
   webNameNoCredit: 'Web search, {provider}, no credit',
   webWork: "Work has {skills}. The agent's commands, MCP servers and hooks can read the key.",
   webWorkNone: 'No web skills are installed.',
-  /** The web search panel: one row per search provider, then Off (`webEndOff`), then the settings row. */
+  /**
+   * The web search panel: one row per search provider, then Off (`webEndOff`), then the settings row. The `webRow*`
+   * names are the {provider} rows of the Web search and Crawler panels.
+   */
   webProvider: 'Search provider',
   webNoKey: 'No key',
   webRowNoKey: '{provider}, no key. Add it in Web Search settings.',
@@ -97,56 +100,25 @@ export const CHAT = {
   webReadFailed: 'Could not read the keys.',
   webPending: 'A change applies when the running answers finish.',
   /**
-   * The crawler row of the `+` menu and its panel: Firecrawl Cloud, Firecrawl on this Mac, Off, then the settings row
-   * (`webSettings`). The Off row's note has the same words as the Web Search page's (`PROVIDERS.crawlerOff*`).
+   * The crawler row of the `+` menu and its panel: Firecrawl, Off, then the settings row (`webSettings`). The Off
+   * row's note has the same words as the Web Search page's (`PROVIDERS.crawlerOff*`).
    */
   crawler: 'Crawler',
   crawlerGroup: 'Reads pages',
-  crawlerCloud: 'Firecrawl Cloud',
-  crawlerLocal: 'Firecrawl on this Mac',
-  crawlerEndCloud: 'Firecrawl',
-  crawlerEndLocal: 'This Mac',
-  crawlerNotRunning: 'Not running',
-  crawlerCheckFailed: 'Check failed',
-  crawlerCloudOn: 'Cloud on',
-  crawlerNotSetUp: 'Not set up',
-  crawlerNameCloud: 'Crawler, Firecrawl Cloud',
-  crawlerNameLocal: 'Crawler, Firecrawl on this Mac',
+  crawlerNameOn: 'Crawler, Firecrawl',
   crawlerNameOff: 'Crawler, off',
-  crawlerNameRejected: 'Crawler, Firecrawl Cloud, key rejected',
-  crawlerNameNoCredit: 'Crawler, Firecrawl Cloud, no credit',
-  crawlerNameNotRunning: 'Crawler, Firecrawl on this Mac, not running',
-  crawlerNameCheckFailed: 'Crawler, Firecrawl on this Mac, check failed',
-  crawlerNameCloudOn: 'Crawler, Firecrawl on this Mac, may send pages to Firecrawl Cloud',
-  crawlerNameCloudUnread: 'Crawler, Firecrawl on this Mac, Cloud setting not confirmed',
-  crawlerRowNoKey: 'Firecrawl Cloud, no key. Add it in Web Search settings.',
-  crawlerRowUnread: 'Firecrawl Cloud, key not read yet',
-  crawlerRowRejected: 'Firecrawl Cloud, key rejected',
-  crawlerRowNoCredit: 'Firecrawl Cloud, no credit',
-  crawlerRowNotSetUp: 'Firecrawl on this Mac, not set up. Set it up in Web Search settings.',
-  crawlerRowLocalUnread: 'Firecrawl on this Mac, not read yet',
-  crawlerRowNotRunning: 'Firecrawl on this Mac, not running',
-  crawlerRowCheckFailed: 'Firecrawl on this Mac, check failed',
-  crawlerRowCloudOn:
-    'Firecrawl on this Mac, may send pages to Firecrawl Cloud. Web Search settings shows how to restart it.',
-  crawlerRowCloudUnread:
-    'Firecrawl on this Mac, Cloud setting not confirmed. Web Search settings shows how to restart it.',
+  crawlerNameRejected: 'Crawler, Firecrawl, key rejected',
+  crawlerNameNoCredit: 'Crawler, Firecrawl, no credit',
   crawlerOffReads: '{provider} reads pages for Chat.',
   crawlerOffExcerpts: 'Brave gives Chat page excerpts only.',
   crawlerOffNone: 'Chat cannot read pages.',
-  crawlerAddBoth: 'Add a Firecrawl key, or set up Firecrawl on this Mac.',
   crawlerAddKey: 'Add a Firecrawl key.',
-  crawlerAddLocal: 'Set up Firecrawl on this Mac.',
-  crawlerRestartLocal: 'Restart Firecrawl on this Mac with FIRECRAWL_CLOUD=off or search.',
   crawlerNeedKey: 'Add a Firecrawl key in Web Search settings.',
-  crawlerNeedLocal: 'Set up Firecrawl on this Mac in Web Search settings.',
   crawlerSwitchFailed: 'Could not switch the crawler. Try again.',
   /** The Crawler panel's caption for a change that waits (the Web search panel's is `webPending`). */
   crawlerPending: 'Conversations that are open keep the old crawler until every running answer ends.',
   /** Work only: the line under the crawler list. */
   crawlerWorkKey: "Work has {n} Firecrawl skills. The agent's commands, MCP servers and hooks can read the key.",
-  crawlerWorkLocal:
-    "Work has {n} Firecrawl skills. They use Firecrawl on this Mac with a placeholder key, never the key saved with firecrawl login. Firecrawl search goes to Firecrawl Cloud with the server's own key. It likely fails when it has none, and fails with FIRECRAWL_CLOUD=off.",
   crawlerWorkNoCli: 'Work has no Firecrawl skills until the firecrawl CLI is installed.',
   crawlerWorkMissing: 'Firecrawl skills are not installed.',
   crawlerWorkOff: 'Work has no Firecrawl skills.',
@@ -300,8 +272,6 @@ export const CHAT = {
   oneResult: '1 result',
   noResults: 'No results',
   cut: 'cut at 12,000 characters',
-  /** A page Firecrawl on this Mac could not load and handed to Firecrawl Cloud. */
-  readByCloud: 'read by Firecrawl Cloud',
   resultsBy: '{provider} · {n} results',
   address: 'Address',
   pageTitle: 'Title',
@@ -317,8 +287,6 @@ export const CHAT = {
     'no-content': 'No readable text',
     'bad-request': 'The tool input was wrong',
     'provider-error': 'The provider failed',
-    'local-down': 'Firecrawl on this Mac is not ready',
-    'local-cloud': 'Firecrawl on this Mac may send pages to Firecrawl Cloud',
   },
   /** The row of a call that the app refused, in place of the agent's "User rejected" text. */
   refusedCall: {

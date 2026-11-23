@@ -1,10 +1,8 @@
 /**
  * The addresses Chat's `web_fetch` may read: those a user message or a parsed search result put into this
- * conversation. A cloud provider fetches a page from its own servers, so an address chosen by injected text would
- * carry conversation text to a stranger's server. Firecrawl on this Mac fetches it from here, so this ledger is also
- * the control for pages open only to the user's network position (office, VPN, home IP): the local server's own rule
- * refuses private addresses only. Addresses in page text, snippets, titles or the model's own text never count. In
- * memory only.
+ * conversation. The provider fetches a page from its own servers, so an address chosen by injected text would carry
+ * conversation text to a stranger's server. Addresses in page text, snippets, titles or the model's own text never
+ * count. In memory only.
  */
 
 import { forwardedAddress } from '../web/url-policy.js';

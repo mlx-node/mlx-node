@@ -1,19 +1,12 @@
 /**
- * `ROOT/providers.json` (0600): which search provider is selected, whether Firecrawl reads pages and where (Firecrawl
- * Cloud, or Firecrawl on this Mac at a saved loopback address), and the last check of each key. Enums, times and that
- * address only: no key and no part of one. A missing or unreadable file reads as the defaults.
- *
- * The crawler on disk: Firecrawl Cloud in use is `firecrawl: true`; Firecrawl on this Mac in use is `firecrawl: false`
- * with `firecrawlLocal: true` and `localUrl`; Off is both false. A build that does not know `firecrawlLocal` reads
- * `firecrawl` alone, so it reads a pick of this Mac as Off and never sends page addresses to Firecrawl Cloud with the
- * key. Where the crawler would read while it is Off is not written: after a restart it is Off with no place.
+ * `ROOT/providers.json` (0600): which search provider is selected, whether Firecrawl reads pages, and the last check
+ * of each key. Enums and times only: no key and no part of one. A missing or unreadable file reads as the defaults.
  */
 
 import { chmod, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { writeFileAtomic } from '../paths.js';
-import { localOrigin } from '../web/local.js';
 import type { KeyCheck, ProviderId, SearchProviderId } from './types.js';
 
 export const PROVIDER_IDS: readonly ProviderId[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
@@ -24,15 +17,11 @@ export interface ProviderSettings {
   version: 1;
   search: SearchProviderId | null;
   firecrawl: boolean;
-  /** Firecrawl reads pages on this Mac at `localUrl`, not in Firecrawl Cloud. Only with a `localUrl`. */
-  firecrawlLocal: boolean;
-  /** The address of Firecrawl on this Mac, only in its saved form (see `parseLocalAddress`). */
-  localUrl: string | null;
   checks: Partial<Record<ProviderId, { status: KeyCheck; at: number }>>;
 }
 
 export function defaultSettings(): ProviderSettings {
-  return { version: 1, search: null, firecrawl: false, firecrawlLocal: false, localUrl: null, checks: {} };
+  return { version: 1, search: null, firecrawl: false, checks: {} };
 }
 
 export function isProviderId(value: unknown): value is ProviderId {
@@ -56,14 +45,7 @@ export function parseSettings(text: string): ProviderSettings {
   if (r.version !== 1) return defaultSettings();
   const settings = defaultSettings();
   if (isSearchProviderId(r.search)) settings.search = r.search;
-  settings.localUrl = typeof r.localUrl === 'string' ? localOrigin(r.localUrl) : null;
-  if (r.firecrawlLocal === true) {
-    // A pick of this Mac whose address is dropped reads as Off; it never becomes a pick of the cloud.
-    settings.firecrawl = settings.localUrl !== null;
-    settings.firecrawlLocal = settings.localUrl !== null;
-  } else {
-    settings.firecrawl = r.firecrawl === true;
-  }
+  settings.firecrawl = r.firecrawl === true;
   const checks = r.checks;
   if (typeof checks === 'object' && checks !== null && !Array.isArray(checks)) {
     for (const id of PROVIDER_IDS) {
@@ -94,21 +76,13 @@ export async function writeSettings(path: string, settings: ProviderSettings): P
     const check = settings.checks[id];
     if (check !== undefined) checks[id] = { status: check.status, at: check.at };
   }
-  const clean: ProviderSettings = {
-    version: 1,
-    search: settings.search,
-    firecrawl: settings.firecrawl && !settings.firecrawlLocal,
-    firecrawlLocal: settings.firecrawl && settings.firecrawlLocal,
-    localUrl: settings.localUrl,
-    checks,
-  };
+  const clean: ProviderSettings = { version: 1, search: settings.search, firecrawl: settings.firecrawl, checks };
   await writeFileAtomic(path, `${JSON.stringify(clean)}\n`);
 }
 
 /**
- * The invariants: a selected search provider has a key; Firecrawl reads pages in the cloud only with a key, and on this
- * Mac only with a saved address (it never moves to the other place). `configured` answers null for a provider whose
- * key is not known (the Keychain did not answer): such a choice is kept.
+ * The invariants: a selected search provider has a key, and Firecrawl reads pages only with a key. `configured`
+ * answers null for a provider whose key is not known (the Keychain did not answer): such a choice is kept.
  */
 export function repairSettings(settings: ProviderSettings, configured: (id: ProviderId) => boolean | null): boolean {
   let changed = false;
@@ -116,12 +90,7 @@ export function repairSettings(settings: ProviderSettings, configured: (id: Prov
     settings.search = null;
     changed = true;
   }
-  if (settings.firecrawlLocal && settings.localUrl === null) {
-    settings.firecrawlLocal = false;
-    settings.firecrawl = false;
-    changed = true;
-  }
-  if (settings.firecrawl && !settings.firecrawlLocal && configured('firecrawl') === false) {
+  if (settings.firecrawl && configured('firecrawl') === false) {
     settings.firecrawl = false;
     changed = true;
   }

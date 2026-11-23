@@ -15,7 +15,6 @@ import {
   type CrawlerValue,
   crawlerValue,
   fill,
-  localBadge,
   type Progress,
   providerById,
   providerName,
@@ -30,47 +29,18 @@ export type Selecting = ProviderSelectionInput | null;
 
 /** The Crawler option a selection body picks, or null for a body that does not touch the crawler. */
 function crawlerTarget(input: ProviderSelectionInput): CrawlerValue | null {
-  if (input.firecrawl === undefined) return null;
-  if (!input.firecrawl) return 'off';
-  return input.firecrawlLocal === true ? 'local' : 'cloud';
+  return input.firecrawl === undefined ? null : input.firecrawl ? 'firecrawl' : 'off';
 }
 
 export interface UsePanelProps {
   data: ProvidersResponse;
   /** The selection change in flight, if any. */
   selecting: Selecting;
-  /** Another change is in flight: nothing can be chosen. */
+  /** Another change is in flight, or the Keychain is down: nothing can be chosen. */
   locked: boolean;
-  /**
-   * Set while the Keychain is down: the search list is locked with this reason. The Crawler list is not: Firecrawl
-   * Cloud is listed only with its key in the cache, and this Mac needs no key.
-   */
-  keychainReason?: string;
+  lockedReason?: string;
   progress: Progress | null;
   onSelect: (input: ProviderSelectionInput) => void;
-}
-
-function localTrailing(data: ProvidersResponse): ReactElement | null {
-  const badge = localBadge(data.local);
-  if (badge === 'not-running')
-    return (
-      <Badge size="sm" tone="warning">
-        {PROVIDERS.badgeNotRunning}
-      </Badge>
-    );
-  if (badge === 'check-failed')
-    return (
-      <Badge size="sm" tone="danger">
-        {PROVIDERS.badgeCheckFailed}
-      </Badge>
-    );
-  if (badge === 'unchecked')
-    return (
-      <Badge size="sm" tone="warning">
-        {PROVIDERS.badgeUnverified}
-      </Badge>
-    );
-  return null;
 }
 
 function checkBadge(check: string | null): ReactElement | null {
@@ -95,14 +65,13 @@ function checkBadge(check: string | null): ReactElement | null {
   return null;
 }
 
-/** The exclusive search provider choice and the crawler that reads pages: Firecrawl Cloud, on this Mac, or off. */
-export function UsePanel({ data, selecting, locked, keychainReason, progress, onSelect }: UsePanelProps): ReactElement {
+/** The exclusive search provider choice and the crawler that reads pages: Firecrawl or off. */
+export function UsePanel({ data, selecting, locked, lockedReason, progress, onSelect }: UsePanelProps): ReactElement {
   const configured = SEARCH_IDS.map((id) => providerById(data, id)).filter((p) => p !== undefined && p.configured);
   const firecrawl = providerById(data, 'firecrawl');
   const busySearch = selecting !== null && selecting.search !== undefined;
   const target = selecting === null ? null : crawlerTarget(selecting);
   const blocked = locked || selecting !== null;
-  const searchBlocked = blocked || keychainReason !== undefined;
 
   const options: OptionItem[] = configured.map((p) => {
     const working = busySearch && selecting.search === p!.id;
@@ -118,7 +87,7 @@ export function UsePanel({ data, selecting, locked, keychainReason, progress, on
       ),
       working,
       workingLabel: PROVIDERS.installing,
-      disabledReason: keychainReason,
+      disabledReason: lockedReason,
     };
   });
   if (options.length > 0) {
@@ -128,19 +97,17 @@ export function UsePanel({ data, selecting, locked, keychainReason, progress, on
       note: PROVIDERS.offNote,
       working: busySearch && selecting.search === null,
       workingLabel: PROVIDERS.removing,
-      disabledReason: keychainReason,
+      disabledReason: lockedReason,
     });
   }
 
   const current = crawlerValue(data);
   const fireCount = firecrawl?.skill.names.length ?? 0;
-  const workingLabel = (value: CrawlerValue): string =>
-    value === 'off' ? PROVIDERS.removing : current === 'off' ? PROVIDERS.installing : PROVIDERS.switching;
   const crawler: OptionItem[] = [];
   if (firecrawl?.configured === true) {
     crawler.push({
-      value: 'cloud',
-      title: PROVIDERS.crawlerCloud,
+      value: 'firecrawl',
+      title: providerName('firecrawl'),
       note: roleWords('firecrawl'),
       trailing: (
         <>
@@ -148,36 +115,27 @@ export function UsePanel({ data, selecting, locked, keychainReason, progress, on
           <span>{skillsForWork(firecrawl)}</span>
         </>
       ),
-      working: target === 'cloud',
-      workingLabel: workingLabel('cloud'),
+      working: target === 'firecrawl',
+      workingLabel: PROVIDERS.installing,
+      disabledReason: lockedReason,
     });
-  }
-  if (data.local.url !== null) {
-    crawler.push({
-      value: 'local',
-      title: PROVIDERS.crawlerLocal,
-      note: data.local.url,
-      trailing: localTrailing(data),
-      working: target === 'local',
-      workingLabel: workingLabel('local'),
-    });
-  }
-  if (crawler.length > 0) {
     crawler.push({
       value: 'off',
       title: PROVIDERS.off,
       note: crawlerOffNote(data.search),
       working: target === 'off',
-      workingLabel: workingLabel('off'),
+      workingLabel: PROVIDERS.removing,
+      disabledReason: lockedReason,
     });
   }
 
   let fireText: string | null = null;
-  if (target !== null) fireText = workingLabel(target);
+  if (target !== null) fireText = target === 'off' ? PROVIDERS.removing : PROVIDERS.installing;
   else if (current !== 'off') {
-    const noCli = firecrawl?.work.missing === 'firecrawl-cli';
-    if (current === 'local') fireText = noCli ? PROVIDERS.localOnNoCli : fill(PROVIDERS.localOn, { n: fireCount });
-    else fireText = noCli ? PROVIDERS.firecrawlOnNoCli : fill(PROVIDERS.firecrawlOn, { n: fireCount });
+    fireText =
+      firecrawl?.work.missing === 'firecrawl-cli'
+        ? PROVIDERS.firecrawlOnNoCli
+        : fill(PROVIDERS.firecrawlOn, { n: fireCount });
   }
 
   const proof = (area: Progress['area']): ReactElement | null =>
@@ -203,7 +161,7 @@ export function UsePanel({ data, selecting, locked, keychainReason, progress, on
             label={PROVIDERS.searchProvider}
             value={data.search ?? OFF}
             options={options}
-            disabled={searchBlocked}
+            disabled={blocked}
             onValueChange={(value) => onSelect({ search: value === OFF ? null : (value as SearchProviderId) })}
           />
         )}
@@ -213,7 +171,7 @@ export function UsePanel({ data, selecting, locked, keychainReason, progress, on
           {PROVIDERS.crawler} · {PROVIDERS.oneAtATime}
         </p>
         {crawler.length === 0 ? (
-          <p className="m-0 text-body text-secondary">{PROVIDERS.crawlerNone}</p>
+          <p className="m-0 text-body text-secondary">{PROVIDERS.firecrawlNoKey}</p>
         ) : (
           <OptionList
             label={PROVIDERS.crawler}

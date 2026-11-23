@@ -34,42 +34,15 @@ export interface ProviderState {
   facts: ProviderFacts | null;
 }
 
-/**
- * The last check of Firecrawl on this Mac. `ok`: Firecrawl Local, refusing private targets, its Cloud setting off.
- * `not-running`: no answer. `not-firecrawl`: something else answers. `open`: it reads private addresses. `token`: it
- * asks for a token. `cloud-on`: it may send a page to Firecrawl Cloud, or its Cloud setting could not be read.
- */
-export type LocalCheck = 'ok' | 'not-running' | 'not-firecrawl' | 'open' | 'token' | 'cloud-on';
-
-/** `off`: no page leaves this Mac. `fallback`: a page the server cannot load is sent to Firecrawl Cloud. */
-export type LocalCloud = 'off' | 'fallback';
-
-/** Firecrawl on this Mac: the saved address and the last check of it, in memory only. */
-export interface LocalFirecrawl {
-  /** The saved address, `http://127.0.0.1:<port>` or `http://[::1]:<port>`. */
-  url: string | null;
-  /** Null before the first check of this address ends. */
-  check: LocalCheck | null;
-  /** Epoch ms. */
-  checkedAt: number | null;
-  /** The server's version, digits and dots only. */
-  version: string | null;
-  /** The server's Cloud setting: `off` with `ok`; `fallback` or null (not readable) with `cloud-on`; else null. */
-  cloud: LocalCloud | null;
-}
-
 export interface ProvidersResponse {
   /** Exactly one or none. */
   search: SearchProviderId | null;
   /** Independent of `search`. */
   firecrawl: boolean;
-  /** Firecrawl is on and reads pages on this Mac, with no key. */
-  firecrawlLocal: boolean;
   /** What `web_fetch` uses now. */
   fetch: ProviderId | null;
   /** Always four, fixed order exa, deepseek, brave, firecrawl. */
   providers: ProviderState[];
-  local: LocalFirecrawl;
   chatSkill: { installed: boolean };
   keychain: 'ok' | 'unavailable';
   /** A host still runs on the old selection. */
@@ -95,22 +68,4 @@ export interface ProviderCheckReply {
 export interface ProviderSelectionInput {
   search?: SearchProviderId | null;
   firecrawl?: boolean;
-  /** Where Firecrawl reads pages: on this Mac (true) or in Firecrawl Cloud (false). */
-  firecrawlLocal?: boolean;
-}
-
-/**
- * `PUT /api/providers/local`. An address whose check is not `ok` is not saved, and any earlier address stays. Nor is
- * one whose check passed after an Off or a Remove of the crawler landed during it (`saved: false`, `check: 'ok'`).
- */
-export interface ProviderLocalReply {
-  saved: boolean;
-  check: LocalCheck;
-  providers: ProvidersResponse;
-}
-
-/** `POST /api/providers/local/check`. `check` is null when no address is saved. */
-export interface ProviderLocalCheckReply {
-  check: LocalCheck | null;
-  providers: ProvidersResponse;
 }

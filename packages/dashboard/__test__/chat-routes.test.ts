@@ -24,7 +24,6 @@ import type { ConversationEvent, ConversationInfo, Interaction } from '../src/ch
 import { createDashboardRuntime, type ChatRuntimeOptions, type DashboardRuntime } from '../src/runtime.js';
 import { endpointModel, FAKE_AGENT, INFERENCE_TOKEN, readScenario, until, type Json } from './helpers/chat-fake.js';
 import { startFakeEngine, UNLOAD_PATH, type FakeEngine } from './helpers/fake-engine.js';
-import { fakeLocalAnswers, fakeLocalScript, startFakeProvider } from './helpers/fake-providers.js';
 
 const MARKER = 'marker-KEY-12345678';
 
@@ -169,57 +168,6 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/engine/unload',
     ]);
     expect(routeThreadFor('POST', '/api/chat/conversations/abc/prompt')).toBe('main');
-  });
-});
-
-describe('Provider routes — Firecrawl on this Mac', () => {
-  it('three routes on the transport take exactly their bodies, and no error quotes the typed address', async () => {
-    const providers = ROUTES.filter((r) => r.segments[1] === 'providers' && r.segments[2] === 'local').map(
-      (r) => `${r.thread} ${r.method} /${r.segments.join('/')}`,
-    );
-    expect(providers).toEqual([
-      'main PUT /api/providers/local',
-      'main DELETE /api/providers/local',
-      'main POST /api/providers/local/check',
-    ]);
-    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
-    try {
-      start('chat-basic');
-      for (const url of [`http://${MARKER}.example:3002`, `http://127.0.0.1:3002/${MARKER}`]) {
-        const refused = failureOf(await call('PUT', '/api/providers/local', { url }));
-        expect(refused).toEqual({ code: 'E_BAD_REQUEST', message: 'Use an address on this Mac.' });
-      }
-      expect(failureOf(await call('PUT', '/api/providers/local', { url: local.baseUrl, x: 1 })).message).toBe(
-        'Unknown field "x".',
-      );
-      expect(failureOf(await call('PUT', '/api/providers/local', {})).message).toBe('Field "url" is required.');
-      expect(failureOf(await call('PUT', '/api/providers/local', { url: 3002 })).code).toBe('E_BAD_REQUEST');
-      expect(failureOf(await call('POST', '/api/providers/local/check', { url: local.baseUrl })).message).toBe(
-        'This request takes no body.',
-      );
-      expect(failureOf(await call('DELETE', '/api/providers/local', { url: local.baseUrl })).code).toBe(
-        'E_BAD_REQUEST',
-      );
-      expect(await call('POST', '/api/providers/local/check')).toMatchObject({ ok: true, body: { check: null } });
-      expect(local.requests).toEqual([]);
-      expect(await call('PUT', '/api/providers/local', { url: local.baseUrl })).toMatchObject({
-        ok: true,
-        body: { saved: true, check: 'ok', providers: { firecrawl: true, firecrawlLocal: true } },
-      });
-      expect(await call('POST', '/api/providers/local/check')).toMatchObject({
-        ok: true,
-        body: { check: 'ok', providers: { local: { url: local.baseUrl, check: 'ok' } } },
-      });
-      expect(await call('DELETE', '/api/providers/local')).toMatchObject({
-        ok: true,
-        body: { firecrawl: false, firecrawlLocal: false, local: { url: null } },
-      });
-      expect(
-        failureOf(await call('PUT', '/api/providers/selection', { firecrawl: true, firecrawlLocal: true })),
-      ).toEqual({ code: 'E_CONFLICT', reason: 'local-not-set-up', message: 'Set up Firecrawl on this Mac first.' });
-    } finally {
-      await local.close();
-    }
   });
 });
 

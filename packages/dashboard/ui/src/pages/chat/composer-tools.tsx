@@ -18,14 +18,7 @@ import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatHostState, ChatMode } from '../../lib/chat-types';
 import { formatBytes } from '../../lib/format';
 import { PROVIDERS } from '../../lib/providers-strings';
-import type {
-  LocalFirecrawl,
-  ProviderId,
-  ProviderLocalCheckReply,
-  ProvidersResponse,
-  ProviderState,
-  SearchProviderId,
-} from '../../lib/providers-types';
+import type { ProviderId, ProvidersResponse, ProviderState, SearchProviderId } from '../../lib/providers-types';
 import { CRAWLER_BODIES, type CrawlerValue, crawlerValue, SEARCH_IDS } from '../../lib/providers-view';
 import { toast } from '../../lib/toast';
 import { providerName } from '../../lib/web-tools';
@@ -172,60 +165,12 @@ function firecrawlState(body: ProvidersResponse | null): ProviderState | undefin
   return body?.providers.find((p) => p.id === 'firecrawl');
 }
 
-/** What the last check of this Mac's address found, for the Crawler row (`main`) and the This Mac row (`row`). */
-interface MacProblem {
-  end: string;
-  tone: 'warning' | 'danger';
-  main: string;
-  row: string;
-}
-
-function macProblem(local: LocalFirecrawl | null): MacProblem | null {
-  if (local === null) return null;
-  switch (local.check) {
-    case null:
-    case 'ok':
-      return null;
-    case 'not-running':
-      return {
-        end: CHAT.crawlerNotRunning,
-        tone: 'warning',
-        main: CHAT.crawlerNameNotRunning,
-        row: CHAT.crawlerRowNotRunning,
-      };
-    case 'cloud-on':
-      return local.cloud === 'fallback'
-        ? { end: CHAT.crawlerCloudOn, tone: 'danger', main: CHAT.crawlerNameCloudOn, row: CHAT.crawlerRowCloudOn }
-        : {
-            end: CHAT.crawlerCheckFailed,
-            tone: 'danger',
-            main: CHAT.crawlerNameCloudUnread,
-            row: CHAT.crawlerRowCloudUnread,
-          };
-    case 'not-firecrawl':
-    case 'open':
-    case 'token':
-      return {
-        end: CHAT.crawlerCheckFailed,
-        tone: 'danger',
-        main: CHAT.crawlerNameCheckFailed,
-        row: CHAT.crawlerRowCheckFailed,
-      };
-  }
-}
-
 /**
- * The crawler row of the `+` menu. On or off and the place come from the host summary; what is wrong needs the
- * `/providers` body, so those words show from the menu's first read on. The dot on the `+` stays search only.
+ * The crawler row of the `+` menu. On or off comes from the host summary; what is wrong needs the `/providers` body,
+ * so those words show from the menu's first read on. The dot on the `+` stays search only.
  */
 export function crawlerRow(providers: ChatHostState['providers'], body: ProvidersResponse | null): WebRowView {
-  const place = crawlerValue(providers);
-  if (place === 'off') return { end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null };
-  if (place === 'local') {
-    const found = macProblem(body?.local ?? null);
-    if (found !== null) return { end: found.end, dot: found.tone, name: found.main, problem: null };
-    return { end: CHAT.crawlerEndLocal, name: CHAT.crawlerNameLocal, problem: null };
-  }
+  if (crawlerValue(providers) === 'off') return { end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null };
   const check = firecrawlState(body)?.check ?? null;
   if (check === 'rejected') {
     return { end: CHAT.webEndRejected, dot: 'danger', name: CHAT.crawlerNameRejected, problem: null };
@@ -233,7 +178,7 @@ export function crawlerRow(providers: ChatHostState['providers'], body: Provider
   if (check === 'no-credit') {
     return { end: CHAT.webEndNoCredit, dot: 'warning', name: CHAT.crawlerNameNoCredit, problem: null };
   }
-  return { end: CHAT.crawlerEndCloud, name: CHAT.crawlerNameCloud, problem: null };
+  return { end: providerName('firecrawl'), name: CHAT.crawlerNameOn, problem: null };
 }
 
 type Read = 'reading' | 'failed' | 'done';
@@ -352,7 +297,7 @@ export function webChoices(providers: ChatHostState['providers'], panel: WebPane
 
 /** What the crawler panel knows besides the host summary. */
 export interface CrawlerPanelState {
-  /** The last `/providers` body or reply, with the newest check of this Mac's address; null before the first. */
+  /** The last `/providers` body or reply; null before the first. */
   body: ProvidersResponse | null;
   read: Read;
   /** The row picked, from the click until the host summary shows it, or until the write fails. */
@@ -373,7 +318,7 @@ export interface CrawlerChoiceRow {
 }
 
 export interface CrawlerChoices {
-  /** Firecrawl Cloud, Firecrawl on this Mac, Off. */
+  /** Firecrawl, Off. */
   rows: CrawlerChoiceRow[];
   /** Second line of the settings row. */
   note: string;
@@ -389,61 +334,40 @@ function offNote(search: SearchProviderId | null): string {
 
 /**
  * The rows of the crawler panel, by the same rules as the web search panel: the check mark follows the host summary
- * only; Cloud with no key and This Mac with no saved address are disabled, and so is a row not read yet unless it is
- * the current one, and every other row while a write runs. A rejected key or a server that does not answer can still
- * be picked.
+ * only; Firecrawl with no key is disabled, and so is a key not read yet unless Firecrawl is the current one, and every
+ * other row while a write runs. A rejected key can still be picked.
  */
 export function crawlerChoices(providers: ChatHostState['providers'], panel: CrawlerPanelState): CrawlerChoices {
   const { body, busy } = panel;
   const current = crawlerValue(providers);
   const blocked = (value: CrawlerValue): boolean => busy !== null && busy !== value;
+  const provider = providerName('firecrawl');
 
   const state = firecrawlState(body);
   const keyKnown = state !== undefined && (state.configured || body?.keychain === 'ok');
   const noKey = keyKnown && !state.configured;
-  const keyUnknown = !keyKnown && current !== 'cloud';
+  const keyUnknown = !keyKnown && current !== 'firecrawl';
   const keyCheck = state?.check ?? null;
-  const cloud: CrawlerChoiceRow = {
-    value: 'cloud',
-    label: CHAT.crawlerCloud,
-    name: CHAT.crawlerCloud,
-    checked: current === 'cloud',
-    disabled: noKey || keyUnknown || blocked('cloud'),
+  const firecrawl: CrawlerChoiceRow = {
+    value: 'firecrawl',
+    label: provider,
+    name: provider,
+    checked: current === 'firecrawl',
+    disabled: noKey || keyUnknown || blocked('firecrawl'),
   };
-  if (busy === 'cloud') cloud.end = CHAT.webSwitching;
-  else if (noKey) cloud.end = CHAT.webNoKey;
+  if (busy === 'firecrawl') firecrawl.end = CHAT.webSwitching;
+  else if (noKey) firecrawl.end = CHAT.webNoKey;
   else if (keyCheck === 'rejected') {
-    cloud.end = CHAT.webEndRejected;
-    cloud.endTone = 'danger';
+    firecrawl.end = CHAT.webEndRejected;
+    firecrawl.endTone = 'danger';
   } else if (keyCheck === 'no-credit') {
-    cloud.end = CHAT.webEndNoCredit;
-    cloud.endTone = 'warning';
+    firecrawl.end = CHAT.webEndNoCredit;
+    firecrawl.endTone = 'warning';
   }
-  if (noKey) cloud.name = CHAT.crawlerRowNoKey;
-  else if (keyUnknown) cloud.name = CHAT.crawlerRowUnread;
-  else if (keyCheck === 'rejected') cloud.name = CHAT.crawlerRowRejected;
-  else if (keyCheck === 'no-credit') cloud.name = CHAT.crawlerRowNoCredit;
-
-  const local = body?.local ?? null;
-  const notSetUp = local !== null && local.url === null;
-  const localUnknown = local === null && current !== 'local';
-  const found = macProblem(local);
-  const mac: CrawlerChoiceRow = {
-    value: 'local',
-    label: CHAT.crawlerLocal,
-    name: CHAT.crawlerLocal,
-    checked: current === 'local',
-    disabled: notSetUp || localUnknown || blocked('local'),
-  };
-  if (busy === 'local') mac.end = CHAT.webSwitching;
-  else if (notSetUp) mac.end = CHAT.crawlerNotSetUp;
-  else if (found !== null) {
-    mac.end = found.end;
-    mac.endTone = found.tone;
-  }
-  if (notSetUp) mac.name = CHAT.crawlerRowNotSetUp;
-  else if (localUnknown) mac.name = CHAT.crawlerRowLocalUnread;
-  else if (found !== null) mac.name = found.row;
+  if (noKey) firecrawl.name = fill(CHAT.webRowNoKey, { provider });
+  else if (keyUnknown) firecrawl.name = fill(CHAT.webRowUnread, { provider });
+  else if (keyCheck === 'rejected') firecrawl.name = fill(CHAT.webRowRejected, { provider });
+  else if (keyCheck === 'no-credit') firecrawl.name = fill(CHAT.webRowNoCredit, { provider });
 
   const off: CrawlerChoiceRow = {
     value: 'off',
@@ -455,21 +379,12 @@ export function crawlerChoices(providers: ChatHostState['providers'], panel: Cra
   };
   if (busy === 'off') off.end = CHAT.webSwitching;
 
-  const note =
-    noKey && notSetUp
-      ? CHAT.crawlerAddBoth
-      : notSetUp
-        ? CHAT.crawlerAddLocal
-        : noKey
-          ? CHAT.crawlerAddKey
-          : local?.check === 'cloud-on'
-            ? CHAT.crawlerRestartLocal
-            : CHAT.webSettingsNote;
+  const note = noKey ? CHAT.crawlerAddKey : CHAT.webSettingsNote;
   const caption: Caption =
     panel.error !== null
       ? { text: panel.error, tone: 'danger' }
       : readCaption(providers, body, panel.read, CHAT.crawlerPending);
-  return { rows: [cloud, mac, off], note, caption };
+  return { rows: [firecrawl, off], note, caption };
 }
 
 /** Work: the search provider's skills. */
@@ -486,7 +401,7 @@ function crawlerWork(data: ProvidersResponse): string {
   const state = firecrawlState(data);
   if (state === undefined || !state.skill.installed || state.skill.names.length === 0) return CHAT.crawlerWorkMissing;
   if (state.work.missing !== null) return CHAT.crawlerWorkNoCli;
-  return fill(data.firecrawlLocal ? CHAT.crawlerWorkLocal : CHAT.crawlerWorkKey, { n: state.skill.names.length });
+  return fill(CHAT.crawlerWorkKey, { n: state.skill.names.length });
 }
 
 function useMounted(): { readonly current: boolean } {
@@ -523,10 +438,7 @@ interface ProvidersRead {
   take: (reply: ProvidersResponse) => void;
 }
 
-/**
- * `GET /providers` when the menu opens and when the host summary changes while it is open, once for both panels. The
- * server answers with the last check of this Mac's address and never waits for a new one.
- */
+/** `GET /providers` when the menu opens and when the host summary changes while it is open, once for both panels. */
 function useProvidersRead(open: boolean, providers: ChatHostState['providers'] | null): ProvidersRead {
   const [body, setBody] = useState<ProvidersResponse | null>(null);
   const [read, setRead] = useState<Read>('reading');
@@ -556,7 +468,7 @@ function useProvidersRead(open: boolean, providers: ChatHostState['providers'] |
   const summary =
     providers === null
       ? null
-      : `${providers.search}|${providers.searchCheck}|${providers.firecrawl}|${providers.firecrawlLocal}|${providers.fetch}`;
+      : `${providers.search}|${providers.searchCheck}|${providers.firecrawl}|${providers.fetch}`;
   useEffect(() => {
     if (open) load();
   }, [open, summary, load]);
@@ -673,35 +585,23 @@ function useWebPanel(
   return { choices, work: mode === 'work' && body !== null ? searchWork(body) : null, pick, setPanelOpen };
 }
 
-/** The body with the newer check of the same saved address: the one from the check route, or the read's. */
-function withCheck(body: ProvidersResponse, checked: LocalFirecrawl | null): ProvidersResponse {
-  if (checked === null || checked.url !== body.local.url) return body;
-  if ((checked.checkedAt ?? 0) < (body.local.checkedAt ?? 0)) return body;
-  return { ...body, local: checked };
-}
-
 function crawlerFailure(error: unknown, target: CrawlerValue): string {
   if (error instanceof DashboardApiError) {
-    if (error.code === 'E_CONFLICT' && target === 'cloud') return CHAT.crawlerNeedKey;
-    if (error.code === 'E_CONFLICT' && target === 'local') return CHAT.crawlerNeedLocal;
+    if (error.code === 'E_CONFLICT' && target === 'firecrawl') return CHAT.crawlerNeedKey;
     if (error.reason === 'skill-bundle-corrupt') return CHAT.webCorrupt;
   }
   return CHAT.crawlerSwitchFailed;
 }
 
 interface CrawlerPanel {
-  /** The shared body with the newest check of this Mac's address, for the crawler rows only. */
-  body: ProvidersResponse | null;
   choices: CrawlerChoices | null;
   /** Work: the Firecrawl skills Work gets, from the same body. */
   work: string | null;
   pick: (target: CrawlerValue) => void;
-  setPanelOpen: (open: boolean) => void;
 }
 
 /**
- * The crawler panel on top of the shared read. Opening the panel, or the `+` while this Mac is in use, checks this
- * Mac's address now; the answer is used by the crawler rows only. A pick writes `firecrawl` and `firecrawlLocal`, never `search`, and is busy until the host
+ * The crawler panel on top of the shared read. A pick writes `firecrawl`, never `search`, and is busy until the host
  * summary shows it, because the reply can wait seconds for the Work PATH.
  */
 function useCrawlerPanel(
@@ -713,23 +613,8 @@ function useCrawlerPanel(
   const { body, read, load, begin, take } = providersRead;
   const [busy, setBusy] = useState<CrawlerValue | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [checked, setChecked] = useState<LocalFirecrawl | null>(null);
-  const [panelOpen, setPanelOpen] = useState(false);
   const mounted = useMounted();
   const live = useLive(open, providers);
-
-  // While this Mac is in use the Crawler main row shows its state too, so the `+` opening checks it.
-  const wantCheck = panelOpen || (open && providers?.firecrawlLocal === true);
-  useEffect(() => {
-    if (!wantCheck) return;
-    mutate<ProviderLocalCheckReply>('POST', '/providers/local/check').then(
-      (reply) => {
-        if (mounted.current) setChecked(reply.providers.local);
-      },
-      // The rows keep the read's last check.
-      () => {},
-    );
-  }, [wantCheck, mounted]);
 
   useEffect(() => {
     if (busy !== null && providers !== null && crawlerValue(providers) === busy) setBusy(null);
@@ -757,15 +642,8 @@ function useCrawlerPanel(
     });
   };
 
-  const merged = body === null ? null : withCheck(body, checked);
-  const choices = providers === null ? null : crawlerChoices(providers, { body: merged, read, busy, error });
-  return {
-    body: merged,
-    choices,
-    work: mode === 'work' && merged !== null ? crawlerWork(merged) : null,
-    pick,
-    setPanelOpen,
-  };
+  const choices = providers === null ? null : crawlerChoices(providers, { body, read, busy, error });
+  return { choices, work: mode === 'work' && body !== null ? crawlerWork(body) : null, pick };
 }
 
 const CAPTION_TONE = { danger: 'text-danger', warning: 'text-warning', secondary: 'text-secondary' } as const;
@@ -824,15 +702,9 @@ function WebSearchPanel({ choices, work, pick, setPanelOpen }: WebPanel & { choi
   );
 }
 
-/** The crawler panel: a caption, Cloud, This Mac and Off with the settings row, and in Work the Firecrawl line. */
-function CrawlerPanelView({
-  choices,
-  work,
-  pick,
-  setPanelOpen,
-}: CrawlerPanel & { choices: CrawlerChoices }): ReactElement {
+/** The crawler panel: a caption, Firecrawl and Off with the settings row, and in Work the Firecrawl line. */
+function CrawlerPanelView({ choices, work, pick }: CrawlerPanel & { choices: CrawlerChoices }): ReactElement {
   const navigate = useNavigate();
-  usePanelOpen(setPanelOpen);
   return (
     <>
       <PanelCaption caption={choices.caption} />
@@ -897,7 +769,7 @@ export function ComposerMenu({
   const providersRead = useProvidersRead(shown, providers);
   const web = useWebPanel(providersRead, shown, providers, mode);
   const crawler = useCrawlerPanel(providersRead, shown, providers, mode);
-  const crawl = providers === null ? null : crawlerRow(providers, crawler.body);
+  const crawl = providers === null ? null : crawlerRow(providers, providersRead.body);
   useHotkeys([
     {
       key: 'u',

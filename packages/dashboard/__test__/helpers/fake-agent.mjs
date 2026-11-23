@@ -40,8 +40,6 @@ record({
   envNames: Object.keys(process.env).sort(),
   // Not a secret: the address the firecrawl CLI would use.
   firecrawlApiUrl: process.env.FIRECRAWL_API_URL ?? null,
-  // Whether the firecrawl key is the fixed stand-in of Firecrawl on this Mac; the key itself is never written.
-  firecrawlPlaceholderKey: process.env.FIRECRAWL_API_KEY === 'fc-local-no-key',
   cwd: process.cwd(),
 });
 

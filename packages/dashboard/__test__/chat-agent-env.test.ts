@@ -8,7 +8,6 @@ import {
   CHAT_ANSWER_TOKENS,
   CHAT_MAX_COMPLETION_TOKENS,
   chatAgentEnv,
-  FIRECRAWL_LOCAL_PLACEHOLDER_KEY,
   WORK_ANSWER_TOKENS,
   WORK_MAX_COMPLETION_TOKENS,
   workAgentEnv,
@@ -103,13 +102,7 @@ describe('workAgentEnv', () => {
   };
 
   it('keeps the parent env, removes the app internals and every unselected key, sets the rest', () => {
-    const env = workAgentEnv({
-      base,
-      endpoint,
-      agentHome: null,
-      providerKeys: { EXA_API_KEY: 'new-exa' },
-      firecrawlUrl: null,
-    });
+    const env = workAgentEnv({ base, endpoint, agentHome: null, providerKeys: { EXA_API_KEY: 'new-exa' } });
     expect(env.PATH).toBe('/usr/bin:/opt/homebrew/bin');
     expect(env.HOME).toBe('/Users/dev');
     for (const name of ['ELECTRON_RUN_AS_NODE', 'MLX_DESKTOP_CLI', 'NAPI_RS_NATIVE_LIBRARY_PATH', 'NODE_OPTIONS']) {
@@ -139,13 +132,7 @@ describe('workAgentEnv', () => {
 
   it('sets CDPATH empty, also over a CDPATH of the app, so the agent does not fill it from the login shell', () => {
     for (const own of [{}, { CDPATH: '/Users/dev:.' }]) {
-      const env = workAgentEnv({
-        base: { ...base, ...own },
-        endpoint,
-        agentHome: null,
-        providerKeys: {},
-        firecrawlUrl: null,
-      });
+      const env = workAgentEnv({ base: { ...base, ...own }, endpoint, agentHome: null, providerKeys: {} });
       expect(Object.hasOwn(env, 'CDPATH')).toBe(true);
       expect(env.CDPATH).toBe('');
     }
@@ -157,7 +144,6 @@ describe('workAgentEnv', () => {
       endpoint,
       agentHome: null,
       providerKeys: {},
-      firecrawlUrl: null,
     });
     expect([env.GROK_TWO_PASS_COMPACTION, env.GROK_COMPACTION_WALL_CLOCK_SECS]).toEqual(['0', '0']);
     expect(AGENT_IDLE_TIMEOUT_SECS).toBe(3600);
@@ -173,13 +159,7 @@ describe('workAgentEnv', () => {
   });
 
   it('caps output at 28,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
-    const env = workAgentEnv({
-      base: { PATH: '/bin' },
-      endpoint,
-      agentHome: '/custom/agent',
-      providerKeys: {},
-      firecrawlUrl: null,
-    });
+    const env = workAgentEnv({ base: { PATH: '/bin' }, endpoint, agentHome: '/custom/agent', providerKeys: {} });
     expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}');
     expect(env.GROK_HOME).toBe('/custom/agent');
   });
@@ -239,70 +219,30 @@ describe('workAgentEnv', () => {
         endpoint,
         agentHome: null,
         providerKeys: {},
-        firecrawlUrl: null,
       });
       expect([base, env.GROK_CONFIG]).toEqual([base, want]);
     }
   });
 
   it('never sets a provider key variable name it does not know', () => {
-    const env = workAgentEnv({
-      base: {},
-      endpoint,
-      agentHome: null,
-      providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' },
-      firecrawlUrl: null,
-    });
+    const env = workAgentEnv({ base: {}, endpoint, agentHome: null, providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' } });
     expect(env.PATH).toBeUndefined();
     expect(env.EXA_API_KEY).toBe('k');
   });
 
-  it('pins the address the firecrawl CLI uses: the cloud with the key, this Mac with the placeholder, none without either', () => {
+  it('pins the address the firecrawl CLI sends the key to', () => {
     const inherited = { ...base, FIRECRAWL_API_URL: 'https://elsewhere.example' };
-    expect(FIRECRAWL_LOCAL_PLACEHOLDER_KEY).toBe('fc-local-no-key');
-    const cloud = workAgentEnv({
-      base: inherited,
-      endpoint,
-      agentHome: null,
-      providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
-      firecrawlUrl: null,
-    });
-    expect([cloud.FIRECRAWL_API_KEY, cloud.FIRECRAWL_API_URL]).toEqual(['fc-key', 'https://api.firecrawl.dev']);
-    const local = workAgentEnv({
-      base: inherited,
-      endpoint,
-      agentHome: null,
-      providerKeys: { FIRECRAWL_API_KEY: 'fc-key', EXA_API_KEY: 'k' },
-      firecrawlUrl: 'http://127.0.0.1:3002',
-    });
-    expect(local.FIRECRAWL_API_URL).toBe('http://127.0.0.1:3002');
-    // Set, so the CLI never falls back to the key saved by `firecrawl login` and sends it to that address.
-    expect(local.FIRECRAWL_API_KEY).toBe(FIRECRAWL_LOCAL_PLACEHOLDER_KEY);
-    expect(local.EXA_API_KEY).toBe('k');
-    const localNoKeys = workAgentEnv({
-      base: inherited,
-      endpoint,
-      agentHome: null,
-      providerKeys: {},
-      firecrawlUrl: 'http://[::1]:4000',
-    });
-    expect([localNoKeys.FIRECRAWL_API_KEY, localNoKeys.FIRECRAWL_API_URL]).toEqual([
-      FIRECRAWL_LOCAL_PLACEHOLDER_KEY,
-      'http://[::1]:4000',
-    ]);
-    const cloudNoUrl = workAgentEnv({
-      base,
-      endpoint,
-      agentHome: null,
-      providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
-      firecrawlUrl: null,
-    });
-    expect([cloudNoUrl.FIRECRAWL_API_KEY, cloudNoUrl.FIRECRAWL_API_URL]).toEqual([
-      'fc-key',
-      'https://api.firecrawl.dev',
-    ]);
-    const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {}, firecrawlUrl: null });
-    expect(none).not.toHaveProperty('FIRECRAWL_API_URL');
+    for (const from of [inherited, base]) {
+      const env = workAgentEnv({
+        base: from,
+        endpoint,
+        agentHome: null,
+        providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
+      });
+      expect([env.FIRECRAWL_API_KEY, env.FIRECRAWL_API_URL]).toEqual(['fc-key', 'https://api.firecrawl.dev']);
+    }
+    const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {} });
+    expect(none.FIRECRAWL_API_URL).toBe('https://elsewhere.example');
     expect(none).not.toHaveProperty('FIRECRAWL_API_KEY');
   });
 });
@@ -327,7 +267,7 @@ describe('session contract', () => {
       cwd: '/r/chat-workspace',
       modelId: 'm',
       webServer: { command: '/app/exe', script: '/app/server.js' },
-      web: { searchProvider: 'exa', searchKey: 'KEY-1', fetchProvider: 'exa', fetchKey: 'KEY-1', fetchUrl: '' },
+      web: { searchProvider: 'exa', searchKey: 'KEY-1', fetchProvider: 'exa', fetchKey: 'KEY-1' },
       prompt: 'P',
       pluginDir: '/r/plugins/chat-web',
       extraCaCerts: '/ca.pem',
@@ -344,7 +284,6 @@ describe('session contract', () => {
             { name: 'MLX_WEB_SEARCH_KEY', value: 'KEY-1' },
             { name: 'MLX_WEB_FETCH_PROVIDER', value: 'exa' },
             { name: 'MLX_WEB_FETCH_KEY', value: 'KEY-1' },
-            { name: 'MLX_WEB_FETCH_URL', value: '' },
             { name: 'NODE_NO_WARNINGS', value: '1' },
             { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
             { name: 'NODE_EXTRA_CA_CERTS', value: '/ca.pem' },

@@ -105,17 +105,9 @@ export interface ChatWebEnv {
   searchKey: string;
   fetchProvider: 'firecrawl' | 'exa' | 'deepseek' | 'brave' | 'none';
   fetchKey: string;
-  /** The saved address of Firecrawl on this Mac, or ''. */
-  fetchUrl: string;
 }
 
-export const NO_WEB: ChatWebEnv = {
-  searchProvider: 'none',
-  searchKey: '',
-  fetchProvider: 'none',
-  fetchKey: '',
-  fetchUrl: '',
-};
+export const NO_WEB: ChatWebEnv = { searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '' };
 
 export interface ChatSessionInput {
   /** realpath of the Chat workspace. */
@@ -137,7 +129,6 @@ export function chatSessionParams(input: ChatSessionInput): Record<string, unkno
     { name: 'MLX_WEB_SEARCH_KEY', value: input.web.searchKey },
     { name: 'MLX_WEB_FETCH_PROVIDER', value: input.web.fetchProvider },
     { name: 'MLX_WEB_FETCH_KEY', value: input.web.fetchKey },
-    { name: 'MLX_WEB_FETCH_URL', value: input.web.fetchUrl },
     { name: 'NODE_NO_WARNINGS', value: '1' },
     { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
   ];

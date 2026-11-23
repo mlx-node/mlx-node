@@ -12,18 +12,12 @@ import type {
   ProviderCheckReply,
   ProviderId,
   ProviderKeyReply,
-  ProviderLocalCheckReply,
-  ProviderLocalReply,
   ProviderSelectionInput,
   ProvidersResponse,
 } from '../lib/providers-types';
 import {
   checkKeyFormat,
   fill,
-  keyReachesWork,
-  localProblem,
-  localReachesWork,
-  parseLocalAddress,
   type Progress,
   progressOf,
   providerById,
@@ -34,7 +28,6 @@ import { toast } from '../lib/toast';
 import { useJson } from '../lib/use-api';
 import { type AppCommand, useCommands } from '../shell/commands';
 import { Page, PageHeader, PageSection } from '../shell/page';
-import { LocalFirecrawl } from './providers/local-firecrawl';
 import { NowPanel } from './providers/now-panel';
 import { ProviderCard } from './providers/provider-card';
 import { type Selecting, UsePanel } from './providers/use-panel';
@@ -42,7 +35,6 @@ import { type Selecting, UsePanel } from './providers/use-panel';
 type Busy =
   | { kind: 'key' | 'check' | 'remove'; id: ProviderId }
   | { kind: 'select'; input: ProviderSelectionInput }
-  | { kind: 'local'; action: 'save' | 'check' | 'remove' }
   | null;
 
 function reasonOf(error: unknown): string | undefined {
@@ -212,9 +204,7 @@ export default function Providers(): ReactElement {
       } catch (error) {
         if (!active.current) return;
         reload();
-        if (codeOf(error) === 'E_CONFLICT' && input.firecrawlLocal === true) {
-          toast.error(PROVIDERS.needLocal);
-        } else if (codeOf(error) === 'E_CONFLICT') {
+        if (codeOf(error) === 'E_CONFLICT') {
           const id: ProviderId | null = input.search ?? (input.firecrawl === true ? 'firecrawl' : null);
           toast.error(id === null ? PROVIDERS.failed : fill(PROVIDERS.needKey, { provider: providerName(id) }));
         } else if (reasonOf(error) !== 'keychain-unavailable') {
@@ -226,62 +216,6 @@ export default function Providers(): ReactElement {
     },
     [apply, reload, settle],
   );
-
-  const saveLocal = useCallback(
-    async (raw: string): Promise<string | null> => {
-      const url = parseLocalAddress(raw);
-      if (url === null) return PROVIDERS.localBadAddress;
-      const hadAddress = data !== undefined && data.local.url !== null;
-      setBusy({ kind: 'local', action: 'save' });
-      try {
-        const reply = await mutate<ProviderLocalReply>('PUT', '/providers/local', { url });
-        if (!active.current) return null;
-        apply(reply.providers);
-        if (reply.saved) return null;
-        if (reply.check !== 'ok') {
-          return `${localProblem(reply.check)} ${hadAddress ? PROVIDERS.localEarlierKept : PROVIDERS.localNotSaved}`;
-        }
-        // A save refused by a change that landed during its check: the reply says what is in use now.
-        const kept = reply.providers.local.url !== null && reply.providers.firecrawlLocal;
-        return `${PROVIDERS.failed} ${kept ? PROVIDERS.localEarlierKept : PROVIDERS.localNotSaved}`;
-      } catch (error) {
-        if (active.current) reload();
-        return codeOf(error) === 'E_BAD_REQUEST' ? PROVIDERS.localBadAddress : PROVIDERS.failed;
-      } finally {
-        settle();
-      }
-    },
-    [apply, data, reload, settle],
-  );
-
-  const checkLocal = useCallback(async (): Promise<void> => {
-    setBusy({ kind: 'local', action: 'check' });
-    try {
-      const reply = await mutate<ProviderLocalCheckReply>('POST', '/providers/local/check');
-      if (active.current) apply(reply.providers);
-    } catch {
-      if (!active.current) return;
-      reload();
-      toast.error(PROVIDERS.failed);
-    } finally {
-      settle();
-    }
-  }, [apply, reload, settle]);
-
-  const removeLocal = useCallback(async (): Promise<void> => {
-    setBusy({ kind: 'local', action: 'remove' });
-    try {
-      const reply = await mutate<ProvidersResponse>('DELETE', '/providers/local');
-      if (!active.current) return;
-      apply(reply);
-      toast.success(PROVIDERS.localRemovedToast);
-    } catch {
-      if (active.current) reload();
-      throw new Error(PROVIDERS.failed);
-    } finally {
-      settle();
-    }
-  }, [apply, reload, settle]);
 
   const locked = data?.keychain === 'unavailable';
   const idle = busy === null;
@@ -379,8 +313,8 @@ export default function Providers(): ReactElement {
           <UsePanel
             data={data}
             selecting={selecting}
-            locked={!idle}
-            keychainReason={locked ? PROVIDERS.keychainTitle : undefined}
+            locked={locked || !idle}
+            lockedReason={locked ? PROVIDERS.keychainTitle : undefined}
             progress={progress}
             onSelect={(input) => void select(input)}
           />
@@ -405,14 +339,7 @@ export default function Providers(): ReactElement {
           ) : null}
 
           <Alert tone="info" title={PROVIDERS.leavesTitle}>
-            {data.local.url === null ? (
-              PROVIDERS.leavesText
-            ) : (
-              <span className="grid gap-2">
-                <span>{PROVIDERS.leavesText}</span>
-                <span>{PROVIDERS.leavesLocal}</span>
-              </span>
-            )}
+            {PROVIDERS.leavesText}
           </Alert>
           {data.search === 'brave' ? (
             <Alert tone="info" title={PROVIDERS.historyTitle}>
@@ -427,8 +354,7 @@ export default function Providers(): ReactElement {
 
           <PageSection title={PROVIDERS.keys}>
             {data.providers.map((p) => {
-              const own = busy !== null && busy.kind !== 'select' && busy.kind !== 'local' && busy.id === p.id;
-              const localBusy = busy?.kind === 'local' ? busy.action : null;
+              const own = busy !== null && busy.kind !== 'select' && busy.id === p.id;
               return (
                 <ProviderCard
                   key={p.id}
@@ -442,20 +368,7 @@ export default function Providers(): ReactElement {
                   onRemoved={() => {
                     removedByPage.current = null;
                   }}
-                  workNotice={keyReachesWork(p, data) ? 'key' : localReachesWork(p, data) ? 'local' : null}
-                >
-                  {p.id === 'firecrawl' ? (
-                    <LocalFirecrawl
-                      local={data.local}
-                      inUse={data.firecrawlLocal}
-                      busy={localBusy}
-                      locked={!idle && localBusy === null}
-                      onSave={saveLocal}
-                      onCheck={() => void checkLocal()}
-                      onRemove={removeLocal}
-                    />
-                  ) : undefined}
-                </ProviderCard>
+                />
               );
             })}
           </PageSection>

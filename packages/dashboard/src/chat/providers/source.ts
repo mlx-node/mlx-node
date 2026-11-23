@@ -12,8 +12,6 @@ export interface ProviderSource {
   chatWeb(): ChatWebEnv;
   /** Key variables of the selected providers for the Work agent env (name → key). */
   workKeys(): Record<string, string>;
-  /** The address of Firecrawl on this Mac for the Work `firecrawl` CLI, when it is in use there; else null. */
-  workFirecrawlUrl(): string | null;
   /** Installed and verified provider skill folders for Work sessions. */
   workPluginDirs(): string[];
   /** Redaction needles: every current and retired provider key. */

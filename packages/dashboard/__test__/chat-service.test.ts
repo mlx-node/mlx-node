@@ -45,7 +45,6 @@ import {
   type Json,
 } from './helpers/chat-fake.js';
 import { UNLOAD_PATH } from './helpers/fake-engine.js';
-import { fakeLocalAnswers, fakeLocalScript, startFakeProvider } from './helpers/fake-providers.js';
 import { live, liveModel, liveTurn, process as liveProcess } from './helpers/observability-fixtures.js';
 
 const BASIC = [
@@ -1277,14 +1276,6 @@ describe('Chat service — the host stream and redaction', () => {
 });
 
 /** A Work service on the fake agent with a project folder inside the throwaway home. */
-/** A fetch that reaches only `origin` (a fake on 127.0.0.1); any other address fails as with no network. */
-function onlyTo(origin: string): typeof fetch {
-  return (input, init) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    return url.startsWith(`${origin}/`) ? fetch(input, init) : NO_NETWORK(input, init);
-  };
-}
-
 async function withWork(
   name: string,
   run: (fake: FakeService, project: string) => Promise<void>,
@@ -1661,8 +1652,7 @@ describe('Chat service — Work', () => {
     }, 20_000);
   });
 
-  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH; on this Mac, the address and the placeholder key', async () => {
-    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH', async () => {
     const secrets = new MemorySecretStore();
     await secrets.set('deepseek', 'ds-key-00001');
     await secrets.set('firecrawl', 'fc-key-000001');
@@ -1675,7 +1665,7 @@ describe('Chat service — Work', () => {
         await providers!.select({ search: 'deepseek', firecrawl: true });
         const svc = fake.service;
         const hostOff = svc.watchHost(() => {});
-        const run = async (): Promise<{ dirs: unknown; env: unknown; url: unknown; placeholder: unknown }> => {
+        const run = async (): Promise<{ dirs: unknown; env: unknown; url: unknown }> => {
           const before = fake.sent().filter((m) => m.method === 'session/new').length;
           const { conversation } = await svc.create({ mode: 'work', text: 'ls', cwd: project });
           const page = new Page(svc, conversation.id);
@@ -1692,7 +1682,6 @@ describe('Chat service — Work', () => {
             dirs: ((created.params as Json)._meta as Json).pluginDirs,
             env: start.envNames,
             url: start.firecrawlApiUrl,
-            placeholder: start.firecrawlPlaceholderKey,
           };
         };
         const first = await run();
@@ -1716,15 +1705,6 @@ describe('Chat service — Work', () => {
         ]);
         expect(second.env).toEqual(expect.arrayContaining(['DEEPSEEK_API_KEY', 'FIRECRAWL_API_KEY']));
         expect(second.url).toBe('https://api.firecrawl.dev');
-        expect(second.placeholder).toBe(false);
-
-        await providers!.putLocal(local.baseUrl);
-        await providers!.select({ firecrawl: true, firecrawlLocal: true });
-        const third = await run();
-        expect(third.dirs).toEqual(second.dirs);
-        expect(third.env).toContain('DEEPSEEK_API_KEY');
-        expect(third.placeholder).toBe(true);
-        expect(third.url).toBe(local.baseUrl);
         expect(JSON.stringify(fake.records())).not.toContain('fc-key-000001');
         hostOff();
       },
@@ -1733,44 +1713,14 @@ describe('Chat service — Work', () => {
           providers = new ProvidersService({
             paths,
             secrets,
-            fetch: onlyTo(local.baseUrl),
+            fetch: NO_NETWORK,
             workPath: () => path,
             now: () => clock,
           });
           return providers;
         },
       },
-    ).finally(() => local.close());
-  }, 30_000);
-
-  it('a Chat session on Firecrawl on this Mac gets the saved address and no fetch key in its mlx_web env', async () => {
-    const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
-    const secrets = new MemorySecretStore();
-    await secrets.set('firecrawl', 'fc-key-000001');
-    let providers: ProvidersService | null = null;
-    const fake = fakeService('chat-basic', {
-      providers: (paths) => {
-        providers = new ProvidersService({ paths, secrets, fetch: onlyTo(local.baseUrl), workPath: () => '' });
-        return providers;
-      },
-    });
-    try {
-      await providers!.putLocal(local.baseUrl);
-      await providers!.select({ firecrawl: true, firecrawlLocal: true });
-      await fake.service.create({ mode: 'chat', text: 'hello' });
-      await until(() => fake.sent().some((m) => m.method === 'session/new'), 5_000);
-      const created = fake.sent().find((m) => m.method === 'session/new')!;
-      const env = ((created.params as Json).mcpServers as Json[])[0]!.env as Array<{ name: string; value: string }>;
-      const value = (name: string): string | undefined => env.find((e) => e.name === name)?.value;
-      expect([value('MLX_WEB_FETCH_PROVIDER'), value('MLX_WEB_FETCH_KEY'), value('MLX_WEB_FETCH_URL')]).toEqual([
-        'firecrawl',
-        '',
-        local.baseUrl,
-      ]);
-    } finally {
-      await fake.close();
-      await local.close();
-    }
+    );
   }, 30_000);
 });
 

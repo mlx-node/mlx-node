@@ -9,14 +9,13 @@ import { ApiError, type ApiErrorCode } from '../api/errors.js';
 import { AgentHostError, FAILURE_MESSAGES, InteractionError } from './agent/agent-host.js';
 import type { ChatFailureCode } from './types.js';
 
-export type GuardedRoute = 'chat' | 'provider-key' | 'provider-validate' | 'provider-selection' | 'provider-local';
+export type GuardedRoute = 'chat' | 'provider-key' | 'provider-validate' | 'provider-selection';
 
 const ROUTE_FAILURES: Readonly<Record<GuardedRoute, string>> = {
   chat: 'The agent could not be reached.',
   'provider-key': 'The Keychain cannot be reached.',
   'provider-validate': 'The provider could not be reached.',
   'provider-selection': 'Skills could not be installed.',
-  'provider-local': 'Firecrawl on this Mac could not be checked.',
 };
 
 const CODE_OF_FAILURE: Readonly<Record<ChatFailureCode, ApiErrorCode>> = {

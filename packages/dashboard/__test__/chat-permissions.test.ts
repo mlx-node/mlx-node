@@ -277,7 +277,7 @@ describe('Chat permission ladder', () => {
     const asked: string[] = [];
     const base = 'http://127.0.0.1:9';
     const tools = new WebTools(
-      { searchProvider: 'exa', searchKey: 'k-12345678', fetchProvider: 'exa', fetchKey: 'k-12345678', fetchUrl: '' },
+      { searchProvider: 'exa', searchKey: 'k-12345678', fetchProvider: 'exa', fetchKey: 'k-12345678' },
       {
         fetch: (_input, init) => {
           asked.push((JSON.parse(init?.body as string) as { urls: string[] }).urls[0]!);

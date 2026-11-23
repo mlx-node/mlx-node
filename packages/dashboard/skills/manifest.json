@@ -125,8 +125,8 @@
         },
         {
           "path": "PROVENANCE.md",
-          "sha256": "355fa1278b1ea74693f728a3c24727970cf3c0d055d1feb47d7924e9852d137d",
-          "bytes": 3855
+          "sha256": "33d1fa8b2f341ddc3fb261dab7ac6bd44b1d830a7d3050ca827426ef6def2d94",
+          "bytes": 3884
         },
         {
           "path": "skills/firecrawl-crawl/SKILL.md",
@@ -155,8 +155,8 @@
         },
         {
           "path": "skills/firecrawl/SKILL.md",
-          "sha256": "e4c85b2cd2d26054bc81b5d24e3d140e22bced56bb396c948b8496e15fb4fa90",
-          "bytes": 11615
+          "sha256": "80d39592ad1a07d6082027c21b1814eed1f68f44f1d98b5939ba4ed16b89fbda",
+          "bytes": 11731
         }
       ]
     }

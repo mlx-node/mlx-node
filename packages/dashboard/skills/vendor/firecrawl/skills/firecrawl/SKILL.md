@@ -12,7 +12,7 @@ Run `firecrawl --help` or `firecrawl <command> --help` for full option details. 
 
 ## Prerequisites
 
-The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup.
+The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup.
 
 ## Workflow
 
@@ -84,9 +84,9 @@ A client context/output error does not prove the provider failed. Keep the reque
 - **Downloading a site to local files** -> [firecrawl-download](../firecrawl-download/SKILL.md)
 - **Parsing a local file (PDF, DOCX, XLSX, HTML, etc.)** -> [firecrawl-parse](../firecrawl-parse/SKILL.md)
 - **Detecting content changes on a website and getting notified by webhook or email (pricing, jobs, posts, docs, status pages, anything ongoing)** -> [firecrawl-monitor](../firecrawl-monitor/SKILL.md)
-The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup.
-The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup.
-The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup.
+The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup.
+The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup.
+The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup.
 - **Producing Firecrawl-powered deliverables such as research briefs, SEO audits, QA reports, lead lists, knowledge bases, or design-system extraction** -> use the `firecrawl-workflows` skills (already installed alongside this CLI skill). These skills infer from context first and ask only short blocking questions when needed.
 
 ## Output & Organization

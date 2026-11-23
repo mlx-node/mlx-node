@@ -393,18 +393,15 @@ describe('rules of the page', () => {
   it('names the keys in the Work environment, worded for each confirm', () => {
     const host: ChatHostState['providers'] = { ...READY_CHAT_HOST.providers, search: 'exa' };
     expect(workKeyProviders(host, null)).toEqual(['exa']);
-    const list = (ready: boolean, firecrawlLocal = false): ProvidersResponse =>
+    const list = (ready: boolean): ProvidersResponse =>
       ({
         search: 'brave',
         firecrawl: true,
-        firecrawlLocal,
         fetch: 'firecrawl',
         providers: [{ id: 'firecrawl', work: { ready, missing: ready ? null : 'firecrawl-cli' } }],
       }) as unknown as ProvidersResponse;
     expect(workKeyProviders(host, list(true))).toEqual(['brave', 'firecrawl']);
     expect(workKeyProviders(host, list(false))).toEqual(['brave']);
-    // Firecrawl on this Mac: Work gets the address and no key.
-    expect(workKeyProviders(host, list(true, true))).toEqual(['brave']);
     expect(keySentence([], 'auto')).toBeNull();
     expect(keySentence([], 'bypass')).toBeNull();
     expect(keySentence(['exa'], 'auto')).toBe(fill(P.auto.key, { provider: 'Exa' }));
@@ -2108,9 +2105,9 @@ describe('the New Work screen: a mode picked before the first message', () => {
   });
 
   it('the Work hero says the agent can read the key only when a key is in the Work environment', async () => {
-    const hero = async (firecrawlLocal: boolean): Promise<string> => {
+    const hero = async (firecrawl: boolean): Promise<string> => {
       await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
-        host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, firecrawl: true, firecrawlLocal } },
+        host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, firecrawl } },
       });
       const text = page!.text();
       page!.unmount();
@@ -2119,8 +2116,8 @@ describe('the New Work screen: a mode picked before the first message', () => {
       api = undefined;
       return text;
     };
-    expect(await hero(false)).toContain(CHAT.workKeyNotice);
-    expect(await hero(true)).not.toContain(CHAT.workKeyNotice);
+    expect(await hero(true)).toContain(CHAT.workKeyNotice);
+    expect(await hero(false)).not.toContain(CHAT.workKeyNotice);
   });
 
   it('the tools row once a folder is chosen: the +, the picker, the mode chip', async () => {
@@ -2137,9 +2134,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     const exa = (names: string[], check: 'ok' | 'rejected' = 'ok') => ({
       search: 'exa',
       firecrawl: false,
-      firecrawlLocal: false,
       fetch: 'exa',
-      local: { url: null, check: null, checkedAt: null, version: null, cloud: null },
       keychain: 'ok',
       applyPending: false,
       vanished: null,
@@ -2221,13 +2216,10 @@ describe('the New Work screen: a mode picked before the first message', () => {
   });
 
   it('Work: the Crawler panel says what Work gets from Firecrawl; the Web search line counts search skills only', async () => {
-    const LOCAL = 'http://127.0.0.1:3002';
-    const body = (place: 'cloud' | 'local' | 'off', missing: 'firecrawl-cli' | null, installed = true) => ({
+    const body = (place: 'firecrawl' | 'off', missing: 'firecrawl-cli' | null, installed = true) => ({
       search: 'exa',
       firecrawl: place !== 'off',
-      firecrawlLocal: place === 'local',
       fetch: place === 'off' ? 'exa' : 'firecrawl',
-      local: { url: LOCAL, check: 'ok', checkedAt: 1, version: '0.1.1', cloud: 'off' },
       keychain: 'ok',
       applyPending: false,
       vanished: null,
@@ -2249,7 +2241,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       ],
     });
     const panel = async (
-      place: 'cloud' | 'local' | 'off',
+      place: 'firecrawl' | 'off',
       row: string,
       missing: 'firecrawl-cli' | null = null,
       installed = true,
@@ -2264,7 +2256,6 @@ describe('the New Work screen: a mode picked before the first message', () => {
             search: 'exa',
             searchCheck: 'ok',
             firecrawl: place !== 'off',
-            firecrawlLocal: place === 'local',
             fetch: place === 'off' ? 'exa' : 'firecrawl',
           },
         },
@@ -2283,9 +2274,9 @@ describe('the New Work screen: a mode picked before the first message', () => {
       expect(shown(dialog).indexOf(text)).toBeGreaterThan(shown(dialog).indexOf(CHAT.webSettings));
     };
 
-    const cloud = await panel('cloud', CHAT.crawlerNameCloud);
-    await line(cloud, fill(CHAT.crawlerWorkKey, { n: 5 }));
-    key(cloud, 'ArrowLeft');
+    const on = await panel('firecrawl', CHAT.crawlerNameOn);
+    await line(on, fill(CHAT.crawlerWorkKey, { n: 5 }));
+    key(on, 'ArrowLeft');
     await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
     click(byRole(document.body, 'menuitem', 'Web search, Exa')!);
     await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
@@ -2294,14 +2285,8 @@ describe('the New Work screen: a mode picked before the first message', () => {
     await waitFor(() => shown(web).includes(skills));
     expect([...web.querySelectorAll('p')].map((p) => p.textContent)).toEqual([skills]);
 
-    const local = await panel('local', CHAT.crawlerNameLocal);
-    await line(local, fill(CHAT.crawlerWorkLocal, { n: 5 }));
-    expect(fill(CHAT.crawlerWorkLocal, { n: 5 })).toContain(
-      'a placeholder key, never the key saved with firecrawl login',
-    );
-    await line(await panel('cloud', CHAT.crawlerNameCloud, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
-    await line(await panel('local', CHAT.crawlerNameLocal, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
-    await line(await panel('cloud', CHAT.crawlerNameCloud, null, false), CHAT.crawlerWorkMissing);
+    await line(await panel('firecrawl', CHAT.crawlerNameOn, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
+    await line(await panel('firecrawl', CHAT.crawlerNameOn, null, false), CHAT.crawlerWorkMissing);
     await line(await panel('off', CHAT.crawlerNameOff), CHAT.crawlerWorkOff);
   });
 });

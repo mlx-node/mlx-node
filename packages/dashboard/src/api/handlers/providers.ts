@@ -1,19 +1,12 @@
 /**
  * The web search provider routes. Bodies are checked against their exact field lists, and every handler runs under
  * the error text law: Keychain, `fetch` and `fs` errors can quote a key or a path, so none of their text reaches a
- * reply. The key appears in exactly one payload, the body of `PUT /api/providers/:id/key`, and in no reply. The address
- * of Firecrawl on this Mac is checked before it is saved, and no error text quotes what was typed.
+ * reply. The key appears in exactly one payload, the body of `PUT /api/providers/:id/key`, and in no reply.
  */
 
 import type { ProvidersService } from '../../chat/providers/service.js';
 import { guarded } from '../../chat/route-errors.js';
-import {
-  noBody,
-  providerIdParam,
-  providerKeyInput,
-  providerLocalInput,
-  providerSelectionInput,
-} from '../../chat/route-input.js';
+import { noBody, providerIdParam, providerKeyInput, providerSelectionInput } from '../../chat/route-input.js';
 import type { ApiRequest, MainApiContext } from '../context.js';
 import { requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
@@ -55,22 +48,4 @@ export function handleProviderValidate(ctx: MainApiContext, req: ApiRequest): Pr
 
 export function handleProviderSelection(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
   return guarded('provider-selection', () => service(ctx).select(providerSelectionInput(requireBody(req))));
-}
-
-export function handleProviderLocalPut(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
-  return guarded('provider-local', () => service(ctx).putLocal(providerLocalInput(requireBody(req)).url));
-}
-
-export function handleProviderLocalCheck(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
-  return guarded('provider-local', () => {
-    noBody(req.body);
-    return service(ctx).checkLocalNow();
-  });
-}
-
-export function handleProviderLocalDelete(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
-  return guarded('provider-local', () => {
-    noBody(req.body);
-    return service(ctx).deleteLocal();
-  });
 }

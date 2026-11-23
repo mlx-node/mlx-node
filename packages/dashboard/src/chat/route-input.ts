@@ -356,14 +356,12 @@ export function providerKeyInput(body: unknown): { key: string } {
   return { key: record.key as string };
 }
 
-/** `{search?, firecrawl?, firecrawlLocal?}`, at least one; `search` is a search provider id or null. */
+/** `{search?, firecrawl?}`, at least one; `search` is a search provider id or null. */
 export function providerSelectionInput(body: unknown): ProviderSelectionInput {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) throw bad('The body must be an object.');
   const record = body as Record<string, unknown>;
   for (const key of Object.keys(record)) {
-    if (key !== 'search' && key !== 'firecrawl' && key !== 'firecrawlLocal') {
-      throw bad(`Unknown field "${fieldName(key)}".`);
-    }
+    if (key !== 'search' && key !== 'firecrawl') throw bad(`Unknown field "${fieldName(key)}".`);
   }
   const input: ProviderSelectionInput = {};
   if (Object.hasOwn(record, 'search')) {
@@ -376,18 +374,7 @@ export function providerSelectionInput(body: unknown): ProviderSelectionInput {
     if (typeof record.firecrawl !== 'boolean') throw bad('Field "firecrawl" has the wrong type.');
     input.firecrawl = record.firecrawl;
   }
-  if (Object.hasOwn(record, 'firecrawlLocal')) {
-    if (typeof record.firecrawlLocal !== 'boolean') throw bad('Field "firecrawlLocal" has the wrong type.');
-    input.firecrawlLocal = record.firecrawlLocal;
-  }
-  if (input.search === undefined && input.firecrawl === undefined && input.firecrawlLocal === undefined) {
-    throw bad('Field "search", "firecrawl" or "firecrawlLocal" is required.');
-  }
+  if (input.search === undefined && input.firecrawl === undefined)
+    throw bad('Field "search" or "firecrawl" is required.');
   return input;
-}
-
-/** `{url}`: the address is checked by the providers service, and no error text ever quotes it. */
-export function providerLocalInput(body: unknown): { url: string } {
-  const record = exactBody(body, { url: 'string' }, ['url']);
-  return { url: record.url as string };
 }

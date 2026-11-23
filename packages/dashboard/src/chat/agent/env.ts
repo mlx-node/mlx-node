@@ -1,8 +1,7 @@
 /**
  * Spawn environments of the two agent processes. Chat is built from nothing: no variable is inherited, so no key,
  * token or user config of the Control Panel reaches it. Work is the Control Panel's own environment, like `mlx agent`
- * in a terminal, minus the app's internal variables, every provider key that is not selected and the Firecrawl
- * address, which the app sets itself.
+ * in a terminal, minus the app's internal variables and every provider key that is not selected.
  */
 
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
@@ -25,14 +24,6 @@ export const PROVIDER_KEY_ENV = {
 } as const;
 
 export const ALL_PROVIDER_KEY_ENV: readonly string[] = Object.values(PROVIDER_KEY_ENV).flat();
-
-/**
- * `FIRECRAWL_API_KEY` of Work while the `firecrawl` CLI uses Firecrawl on this Mac. The CLI takes this variable before
- * the key saved by `firecrawl login`, so that key is never sent to the saved address. Firecrawl Local passes a search
- * on to Firecrawl Cloud with its own key (its `FIRECRAWL_API_KEY`, or the `firecrawl login` key it reads itself)
- * before a caller's, so only a server with no key of its own passes this one on, and it is no account's key.
- */
-export const FIRECRAWL_LOCAL_PLACEHOLDER_KEY = 'fc-local-no-key';
 
 /** Removed from the Work environment: the app's own internals. */
 export const WORK_ENV_REMOVED = [
@@ -118,11 +109,6 @@ export interface WorkEnvInput {
   agentHome: string | null;
   /** The selected providers' key variables (name → key). Every other provider key variable is removed. */
   providerKeys: Readonly<Record<string, string>>;
-  /**
-   * Firecrawl on this Mac, when the Work `firecrawl` CLI uses it: its address, with {@link FIRECRAWL_LOCAL_PLACEHOLDER_KEY}
-   * in place of a Firecrawl key.
-   */
-  firecrawlUrl: string | null;
 }
 
 function plainObject(value: unknown): Record<string, unknown> | null {
@@ -162,16 +148,12 @@ export function workOverlay(base: string | undefined): string {
   });
 }
 
-/**
- * What Work inherits from the Control Panel: every variable minus the app's internals, every provider key and the
- * address the `firecrawl` CLI sends its key to.
- */
+/** What Work inherits from the Control Panel: every variable minus the app's internals and every provider key. */
 export function workInherited(base: NodeJS.ProcessEnv): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(base)) if (value !== undefined) env[name] = value;
   for (const name of WORK_ENV_REMOVED) delete env[name];
   for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
-  delete env.FIRECRAWL_API_URL;
   return env;
 }
 
@@ -188,18 +170,11 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   env.CDPATH = '';
   env.GROK_CONFIG = workOverlay(env.GROK_CONFIG);
   if (input.agentHome !== null) env.GROK_HOME = input.agentHome;
-  const firecrawlKeys: readonly string[] = PROVIDER_KEY_ENV.firecrawl;
   for (const [name, value] of Object.entries(input.providerKeys)) {
-    if (!ALL_PROVIDER_KEY_ENV.includes(name)) continue;
-    // Firecrawl on this Mac passes a caller's key on to Firecrawl Cloud.
-    if (input.firecrawlUrl !== null && firecrawlKeys.includes(name)) continue;
-    env[name] = value;
+    if (ALL_PROVIDER_KEY_ENV.includes(name)) env[name] = value;
   }
-  // Set over the CLI's own saved address, which it would otherwise send the key to.
-  if (input.firecrawlUrl !== null) {
-    env.FIRECRAWL_API_URL = input.firecrawlUrl;
-    env.FIRECRAWL_API_KEY = FIRECRAWL_LOCAL_PLACEHOLDER_KEY;
-  } else if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
+  // The CLI sends the key to `FIRECRAWL_API_URL` before an address it saved itself (`firecrawl config --api-url`).
+  if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
   env.FIRECRAWL_NO_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_NO_ENDPOINT_FEEDBACK = '1';

@@ -24,7 +24,7 @@ import {
 const SKILLS = defaultSkillsDir();
 const manifest = loadManifest(SKILLS);
 const FIXED =
-  'The firecrawl CLI is already installed and set up. Never install it. Never run firecrawl login, init or setup.';
+  'The firecrawl CLI is already installed and signed in through FIRECRAWL_API_KEY. Never install it. Never run firecrawl login, init or setup.';
 const FORBIDDEN = ['firecrawl login', '--api-key', 'npm install -g', 'npm i -g', '@latest'];
 
 function walk(dir: string, prefix = ''): string[] {

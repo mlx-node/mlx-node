@@ -134,23 +134,15 @@ export interface FakeHost {
 /** A provider source with no provider: the web tools answer `not-configured`, Work gets no key. */
 export function noProviders(overrides: Partial<ProviderSource> = {}): ProviderSource {
   return {
-    chatWeb: () => ({ searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '', fetchUrl: '' }),
+    chatWeb: () => ({ searchProvider: 'none', searchKey: '', fetchProvider: 'none', fetchKey: '' }),
     workKeys: () => ({}),
-    workFirecrawlUrl: () => null,
     workPluginDirs: () => [],
     secretNeedles: () => [],
     keyNeedles: () => [],
     markKeyCheck: () => {},
     settled: () => Promise.resolve(),
     chatSkillReady: () => Promise.resolve(true),
-    summary: () => ({
-      search: null,
-      searchCheck: null,
-      firecrawl: false,
-      firecrawlLocal: false,
-      fetch: null,
-      applyPending: false,
-    }),
+    summary: () => ({ search: null, searchCheck: null, firecrawl: false, fetch: null, applyPending: false }),
     ...overrides,
   };
 }
