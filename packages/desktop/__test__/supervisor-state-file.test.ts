@@ -109,6 +109,11 @@ describe('supervisor state file', () => {
       release = resolve;
     });
     const written: string[] = [];
+    let renames = 0;
+    let secondRenamed!: () => void;
+    const secondRename = new Promise<void>((resolve) => {
+      secondRenamed = resolve;
+    });
     const io: SupervisorStateWriterIo = {
       mkdir,
       writeFile: vi.fn(async (target: string, data: string) => {
@@ -118,14 +123,18 @@ describe('supervisor state file', () => {
         } else written.push(data);
         await writeFile(target, data);
       }),
-      rename,
+      rename: async (from: string, to: string) => {
+        await rename(from, to);
+        renames += 1;
+        if (renames === 2) secondRenamed();
+      },
       unlink,
     };
     const writer = createSupervisorStateWriter(path, io);
     const states = [1, 2, 3, 4].map((n) => projectSupervisorState(snapshot({ generation: n }), 1, n));
     for (const state of states) writer.write(state);
     release();
-    for (let i = 0; i < 50 && written.length < 2; i++) await new Promise((r) => setImmediate(r));
+    await secondRename;
     for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
 
     // The first write was already in flight; of the three queued behind it only the newest is written.
