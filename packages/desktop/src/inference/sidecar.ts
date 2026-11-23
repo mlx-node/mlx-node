@@ -161,6 +161,7 @@ export interface SidecarHost {
     base: string;
     variant: string;
     format: 'gguf' | 'mlx';
+    supportsImages: boolean;
   }[];
   logDir: string | null;
   close(opts?: { timeoutMs?: number }): Promise<void>;
@@ -175,8 +176,9 @@ export function endpointModels(models: SidecarHost['models']): {
   format: 'gguf' | 'mlx';
   modelType: string;
   kind: 'chat' | 'decision';
+  images: boolean;
 }[] {
-  return models.map(({ name, path, base, variant, format, modelType }) => ({
+  return models.map(({ name, path, base, variant, format, modelType, supportsImages }) => ({
     name,
     path,
     base,
@@ -184,6 +186,7 @@ export function endpointModels(models: SidecarHost['models']): {
     format,
     modelType,
     kind: familyDataFor(modelType)?.kind === 'decision' ? 'decision' : 'chat',
+    images: supportsImages,
   }));
 }
 

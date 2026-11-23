@@ -334,13 +334,19 @@ export async function discoverLocalChatModels(
       return;
     }
 
-    const supportsImages =
-      modelType === 'clef'
-        ? false
-        : metadata.supportsImages ||
-          (format === 'gguf' &&
-            (modelType === 'clairic' || modelType === 'qwen3_5') &&
-            (await hasSiblingMmprojGguf(metadataRoot)));
+    // A Qwen3.5 or Gemma4 GGUF load takes its vision tower only from a sibling mmproj, and a Qwen3.5 MoE GGUF load
+    // never takes one (native_gguf_preflight). Qwen3.5 ignores config.json; Gemma4 looks for the projector only when
+    // config.json declares a vision tower (gemma4_native_preflight).
+    let supportsImages: boolean;
+    if (modelType === 'clef') supportsImages = false;
+    else if (format === 'gguf' && modelType === 'qwen3_5_moe') supportsImages = false;
+    else if (format === 'gguf' && modelType === 'qwen3_5') supportsImages = await hasSiblingMmprojGguf(metadataRoot);
+    else if (format === 'gguf' && modelType === 'gemma4')
+      supportsImages = metadata.supportsImages && (await hasSiblingMmprojGguf(metadataRoot));
+    else
+      supportsImages =
+        metadata.supportsImages ||
+        (format === 'gguf' && modelType === 'clairic' && (await hasSiblingMmprojGguf(metadataRoot)));
 
     // Automatic companions can be installed or removed after this startup
     // scan. The host resolves them on each load; draftModelPath is reserved

@@ -22,11 +22,13 @@ export interface DesktopEndpointModel {
   format: 'gguf' | 'mlx';
   modelType?: string;
   kind?: 'chat' | 'decision';
+  /** Discovery's image support: before a load, the best guess the app has. */
+  images?: boolean;
 }
 
 function validModel(model: unknown): boolean {
   if (typeof model !== 'object' || model === null) return false;
-  const { name, path, base, variant, format, modelType, kind } = model as Record<string, unknown>;
+  const { name, path, base, variant, format, modelType, kind, images } = model as Record<string, unknown>;
   return (
     typeof name === 'string' &&
     typeof path === 'string' &&
@@ -37,7 +39,8 @@ function validModel(model: unknown): boolean {
     variant !== '' &&
     (format === 'gguf' || format === 'mlx') &&
     (modelType === undefined || (typeof modelType === 'string' && modelType !== '')) &&
-    (kind === undefined || kind === 'chat' || kind === 'decision')
+    (kind === undefined || kind === 'chat' || kind === 'decision') &&
+    (images === undefined || typeof images === 'boolean')
   );
 }
 

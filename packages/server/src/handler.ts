@@ -60,6 +60,8 @@ export interface PublicModelEntry {
   api_backend?: 'messages' | 'responses';
   model_family?: string;
   supports_images?: boolean;
+  /** Body cap of the Anthropic routes; the agent keeps its resent history under it. */
+  max_request_bytes?: number;
   modality?: 'audio' | 'text';
   task?: 'asr' | 'tts' | 'rerank';
   capabilities?: Record<string, unknown>;

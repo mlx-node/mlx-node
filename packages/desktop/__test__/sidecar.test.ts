@@ -68,7 +68,15 @@ async function realHost(overrides: Partial<SidecarHost> = {}): Promise<SidecarHo
     modelsDir: '/models',
     boundModel: 'a-model',
     models: [
-      { name: 'a-model', path: '/models/a-model', modelType: 'qwen3', base: 'a-model', variant: 'BF16', format: 'mlx' },
+      {
+        name: 'a-model',
+        path: '/models/a-model',
+        modelType: 'qwen3',
+        base: 'a-model',
+        variant: 'BF16',
+        format: 'mlx',
+        supportsImages: false,
+      },
     ],
     logDir: null,
     close: async () => {
@@ -323,9 +331,17 @@ describe('handleSidecarRequest', () => {
 });
 
 describe('endpointModels', () => {
-  it('writes each served model field by field, with its base, variant, format, modelType and kind', () => {
+  it('writes each served model field by field, with its base, variant, format, modelType, kind and images', () => {
     const models = [
-      { name: 'm-Q4_K_M', path: '/m.gguf', modelType: 'qwen4_exp', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
+      {
+        name: 'm-Q4_K_M',
+        path: '/m.gguf',
+        modelType: 'qwen4_exp',
+        base: 'm',
+        variant: 'Q4_K_M',
+        format: 'gguf',
+        supportsImages: false,
+      },
       {
         name: 'm-bf16',
         path: '/m-bf16',
@@ -333,6 +349,7 @@ describe('endpointModels', () => {
         base: 'm',
         variant: 'BF16',
         format: 'mlx',
+        supportsImages: true,
         preset: {},
       },
       {
@@ -342,6 +359,7 @@ describe('endpointModels', () => {
         base: 'clairic-flash-4bit',
         variant: '4-bit',
         format: 'mlx',
+        supportsImages: true,
       },
       {
         name: 'clef-flash',
@@ -350,6 +368,7 @@ describe('endpointModels', () => {
         base: 'clef-flash',
         variant: 'MLX',
         format: 'mlx',
+        supportsImages: false,
       },
     ] as SidecarHost['models'];
     const value = endpointModels(models);
@@ -362,6 +381,7 @@ describe('endpointModels', () => {
         format: 'gguf',
         modelType: 'qwen4_exp',
         kind: 'chat',
+        images: false,
       },
       {
         name: 'm-bf16',
@@ -371,6 +391,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'qwen4_exp',
         kind: 'chat',
+        images: true,
       },
       {
         name: 'clairic-flash-4bit',
@@ -380,6 +401,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'clairic',
         kind: 'decision',
+        images: true,
       },
       {
         name: 'clef-flash',
@@ -389,6 +411,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'clef',
         kind: 'decision',
+        images: false,
       },
     ]);
   });

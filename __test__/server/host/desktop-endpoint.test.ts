@@ -82,6 +82,18 @@ it('reads null for a model without a base, a build or a known format', async () 
   await expect(publishDesktopEndpoint({ ...endpoint, models: [{ ...model, base: '' }] }, path)).rejects.toThrow();
 });
 
+it('reads a model whose images flag is true, false or missing, and refuses one that is not a boolean', async () => {
+  const path = await location();
+  const model = endpoint.models[0]!;
+  for (const images of [true, false, undefined]) {
+    const one = { ...endpoint, models: [{ ...model, images }] };
+    await writeRaw(path, JSON.stringify(one));
+    expect(await readDesktopEndpoint(path)).toEqual(one);
+  }
+  await writeRaw(path, JSON.stringify({ ...endpoint, models: [{ ...model, images: 'yes' }] }));
+  expect(await readDesktopEndpoint(path)).toBeNull();
+});
+
 it('reads null when group or other may read the file', async () => {
   const path = await location();
   await writeRaw(path, JSON.stringify(endpoint), 0o640);
