@@ -20,9 +20,10 @@ use crate::transformer::paged_policy::{
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+
 use super::config::Gemma4Config;
 use super::layer_cache::Gemma4LayerCache;
-use super::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Dense cache-hit attention lives behind its own module boundary so that the
 /// gathered K/V cannot exist in this file as a pair of loose arrays. See that

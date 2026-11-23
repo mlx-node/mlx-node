@@ -65,40 +65,14 @@ use crate::nn::{Linear, RMSNorm};
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, DecoderLayer, MLPType};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
-    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
-    is_quantized_checkpoint, try_build_affine_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
+    try_build_affine_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_switch_linear,
 };
-
-/// Build an affine-mode `QuantizedSwitchLinear` from `params` if both
-/// `<prefix>.weight` and `<prefix>.scales` exist.
-///
-/// Inlined here to mirror the private `try_build_quantized_switch_linear`
-/// in `persistence.rs::apply_weights_moe_inner`. Duplicated rather than
-/// hoisted per the W2 contract: keep the MTP scope surgical, no main-loader
-/// refactor.
-fn try_build_affine_quantized_switch_linear(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-    group_size: i32,
-    bits: i32,
-) -> Option<QuantizedSwitchLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
-    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
-    Some(QuantizedSwitchLinear::new(
-        weight.clone(),
-        scales.clone(),
-        biases,
-        group_size,
-        bits,
-        "affine".to_string(),
-    ))
-}
+use crate::moe::SwitchGLU;
 
 /// Multi-Token Prediction head for Qwen3.5 MoE.
 ///
@@ -395,12 +369,9 @@ impl Qwen3_5MoeMTPModule {
                 PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
                 PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
                 PerLayerMode::Fp8E4m3 => None,
-                PerLayerMode::Affine => try_build_affine_quantized_switch_linear(
-                    params,
-                    prefix,
-                    plq.group_size,
-                    plq.bits,
-                ),
+                PerLayerMode::Affine => {
+                    try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+                }
                 // Unreachable: see try_build_ql above.
                 PerLayerMode::Sym8 => None,
                 // Unreachable: see try_build_ql above (K-quant MTP is gated off).

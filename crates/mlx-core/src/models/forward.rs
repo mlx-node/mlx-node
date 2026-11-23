@@ -102,12 +102,6 @@ impl LogitsHead for crate::models::quantized_linear::LinearProj {
     }
 }
 
-impl LogitsHead for crate::models::gemma4::quantized_linear::LinearProj {
-    fn project(&self, hidden: &MxArray) -> Result<MxArray> {
-        self.forward(hidden)
-    }
-}
-
 // ============================ cache arrays ============================
 
 /// Per-layer cache exposing its live arrays for a bulk materialization

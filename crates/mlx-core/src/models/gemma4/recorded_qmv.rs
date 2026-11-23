@@ -192,3 +192,68 @@ fn recorded_gemma4_qmv_bandwidth() {
         })
     );
 }
+
+#[test]
+fn canonical_quantized_linear_decode_sidecars_match_qmm_reference() {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let (n, k) = (24i64, 256i64);
+    let x: Vec<u16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(((i * 17 % 101) as f32 - 50.0) / 32.0).to_bits())
+        .collect();
+    let x = MxArray::from_bfloat16(&x, &[1, 1, k]).unwrap();
+    let w: Vec<u32> = (0..(n * k / 8) as usize)
+        .map(|i| (i as u32).wrapping_mul(0x9e37_79b9))
+        .collect();
+    let w = MxArray::from_uint32(&w, &[n, k / 8]).unwrap();
+    let scales_f16: Vec<u16> = (0..(n * k / 32) as usize)
+        .map(|i| half::f16::from_f32(((i * 7 % 23) as f32 - 11.0) * 0.001003).to_bits())
+        .collect();
+    let scales_f16 = MxArray::from_float16(&scales_f16, &[n, k / 32]).unwrap();
+    let biases_f16 = scales_f16.mul_scalar(-8.0).unwrap();
+    let scales_f32 = scales_f16.astype(DType::Float32).unwrap();
+    let biases_f32 = biases_f16.astype(DType::Float32).unwrap();
+
+    let raw = unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales_f32.as_raw_ptr(),
+            biases_f32.as_raw_ptr(),
+            true,
+            32,
+            4,
+            c"affine".as_ptr(),
+        )
+    };
+    let expected = MxArray::from_handle(raw, "qmm reference")
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+
+    for symmetric in [false, true] {
+        let mut params = HashMap::from([
+            ("proj.weight".to_string(), w.clone()),
+            ("proj.scales".to_string(), scales_f32.clone()),
+            ("proj.biases".to_string(), biases_f32.clone()),
+        ]);
+        if symmetric {
+            params.insert("proj.decode_q4_0_scales".to_string(), scales_f16.clone());
+        } else {
+            params.insert("proj.decode_scales".to_string(), scales_f16.clone());
+            params.insert("proj.decode_biases".to_string(), biases_f16.clone());
+        }
+        let ql = super::try_build_quantized_linear(&params, "proj", 32, 4).unwrap();
+        let actual = ql.forward(&x).unwrap();
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(actual.shape().unwrap().to_vec(), vec![1, 1, n]);
+        assert_eq!(
+            actual.to_float32().unwrap().as_ref(),
+            expected.as_ref(),
+            "canonical QuantizedLinear decode_sidecars (symmetric={symmetric}) must match QMM reference"
+        );
+    }
+}

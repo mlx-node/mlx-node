@@ -6,6 +6,7 @@
 
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{LinearProj, QuantizedSwitchLinear};
+use crate::moe::sigmoid_biased_topk_from_logits;
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
@@ -17,19 +18,17 @@ pub(crate) fn relu2(x: &MxArray) -> Result<MxArray> {
 
 /// Stacked expert projections in checkpoint orientation. The dense arm keeps
 /// pre-transposed stacks for gather_mm; the quantized arm runs gather_qmm on
-/// the packed payload.
+/// the packed payload (with per-expert Float32 `global_scale` attached via
+/// [`QuantizedSwitchLinear::with_outer_scale`]).
 pub enum NemotronHExperts {
     /// Quantized (NVFP4) stacked experts.
     ///
-    /// Each side carries an `[E]` Float32 `global_scale`: NVIDIA's
-    /// `weight_scale_2` must NOT be folded into the per-group E4M3 scales, so
-    /// it rides along and is gathered by the routing indices onto the
-    /// projection OUTPUT. It is per-expert — a scalar would mis-scale the rest.
+    /// Each side carries NVIDIA's `[E]` Float32 `weight_scale_2` as its
+    /// `QuantizedSwitchLinear::outer_scale`, applied in F32 on the projection
+    /// output before restoring the activation dtype.
     Quantized {
         up: QuantizedSwitchLinear,
-        up_global_scale: MxArray,
         down: QuantizedSwitchLinear,
-        down_global_scale: MxArray,
     },
     /// Dense bf16 stacked experts (MTP head): no global scale.
     Dense { up_t: MxArray, down_t: MxArray },
@@ -53,31 +52,12 @@ impl NemotronHExperts {
             )));
         };
         match self {
-            NemotronHExperts::Quantized {
-                up: u,
-                up_global_scale,
-                down: d,
-                down_global_scale,
-            } => {
-                let (ql, gs) = if up {
-                    (u, up_global_scale)
-                } else {
-                    (d, down_global_scale)
-                };
-                // Squeeze FIRST: multiplying the [ne, k, 1, N] gather output by
-                // the [ne, k, 1] scale would broadcast against N instead of the
-                // expert dim and silently produce garbage.
-                let out = ql.forward(&x4, indices, false)?.squeeze(Some(&[-2]))?;
-                let dtype = out.dtype()?;
-                let scale = gs.take(indices, 0)?.expand_dims(-1)?;
-                let scaled = out.mul(&scale)?;
-                // The f32 scale promotes the bf16 activation; restore the dtype
-                // here so the rest of the block keeps running in bf16.
-                if scaled.dtype()? == dtype {
-                    Ok(scaled)
-                } else {
-                    scaled.astype(dtype)
-                }
+            NemotronHExperts::Quantized { up: u, down: d } => {
+                let ql = if up { u } else { d };
+                // `QuantizedSwitchLinear::forward` applies its `[E]` F32
+                // `outer_scale` broadcast to `[ne, k, 1, 1]` and restores the
+                // activation dtype before we squeeze the singleton M dim.
+                ql.forward(&x4, indices, false)?.squeeze(Some(&[-2]))
             }
             NemotronHExperts::Dense { up_t, down_t } => {
                 let wt = if up { up_t } else { down_t };
@@ -98,13 +78,8 @@ impl NemotronHExperts {
     /// the quantized/dense representation.
     pub fn set_experts(&mut self, up: ExpertProj, down: ExpertProj) -> Result<()> {
         let experts = match (up, down) {
-            (ExpertProj::Quantized(u, ugs), ExpertProj::Quantized(d, dgs)) => {
-                NemotronHExperts::Quantized {
-                    up: u,
-                    up_global_scale: ugs,
-                    down: d,
-                    down_global_scale: dgs,
-                }
+            (ExpertProj::Quantized(u), ExpertProj::Quantized(d)) => {
+                NemotronHExperts::Quantized { up: u, down: d }
             }
             (ExpertProj::Dense(u), ExpertProj::Dense(d)) => NemotronHExperts::Dense {
                 up_t: u.transpose(Some(&[0, 2, 1]))?,
@@ -136,9 +111,10 @@ impl NemotronHExperts {
 }
 
 /// One side of the stacked expert projections. The quantized arm carries the
-/// MANDATORY `[E]` Float32 global scale; the loader fails closed without it.
+/// MANDATORY `[E]` Float32 global scale via `QuantizedSwitchLinear::outer_scale`;
+/// the loader fails closed without it.
 pub enum ExpertProj {
-    Quantized(QuantizedSwitchLinear, MxArray),
+    Quantized(QuantizedSwitchLinear),
     Dense(MxArray),
 }
 
@@ -204,7 +180,6 @@ pub struct NemotronHMoE {
     pub(crate) e_score_correction_bias: MxArray,
     pub(crate) experts: NemotronHExperts,
     pub(crate) shared_experts: NemotronHSharedExpert,
-    pub(crate) num_experts: i32,
     pub(crate) top_k: i32,
     pub(crate) routed_scaling_factor: f64,
     pub(crate) norm_topk_prob: bool,
@@ -251,8 +226,8 @@ impl NemotronHMoE {
                     16,
                     4,
                     crate::models::quantized_linear::NVFP4_MODE.to_string(),
-                ),
-                up_global_scale: unit.clone(),
+                )
+                .with_outer_scale(unit.clone()),
                 down: QuantizedSwitchLinear::new(
                     down,
                     scales_d,
@@ -260,8 +235,8 @@ impl NemotronHMoE {
                     16,
                     4,
                     crate::models::quantized_linear::NVFP4_MODE.to_string(),
-                ),
-                down_global_scale: unit,
+                )
+                .with_outer_scale(unit),
             }
         };
 
@@ -270,7 +245,6 @@ impl NemotronHMoE {
             e_score_correction_bias,
             experts,
             shared_experts: NemotronHSharedExpert::new(config)?,
-            num_experts,
             top_k,
             routed_scaling_factor: config.routed_scaling_factor,
             norm_topk_prob: config.norm_topk_prob,
@@ -289,24 +263,19 @@ impl NemotronHMoE {
         let hidden = shape[2];
         let ne = batch * seq;
         let k = self.top_k as i64;
-        let e = self.num_experts as i64;
 
         let x_flat = x.reshape(&[ne, hidden])?;
-        let router_logits = self.gate.forward(&x_flat)?.astype(DType::Float32)?;
-        let scores = Activations::sigmoid(&router_logits)?;
-        let scores_for_choice = scores.add(&self.e_score_correction_bias)?;
-
+        let router_logits = self.gate.forward(&x_flat)?;
         // n_group=1/topk_group=1 degenerates to a flat top-k over all experts.
-        let inds_full = scores_for_choice.argpartition(-self.top_k, Some(-1))?;
-        let topk_indices = inds_full.slice_axis(1, e - k, e)?;
-
-        // Weights from the UNBIASED sigmoid scores.
-        let mut topk_weights = scores.take_along_axis(&topk_indices, -1)?;
-        if self.norm_topk_prob {
-            let denom = topk_weights.sum(Some(&[-1]), Some(true))?;
-            topk_weights = topk_weights.div(&denom.add_scalar(1e-20)?)?;
-        }
-        topk_weights = topk_weights.mul_scalar(self.routed_scaling_factor)?;
+        let (topk_weights, topk_indices) = sigmoid_biased_topk_from_logits(
+            &router_logits,
+            Some(&self.e_score_correction_bias),
+            self.top_k,
+            1e-20,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+            false,
+        )?;
 
         let up = self.experts.forward_up(&x_flat, &topk_indices)?;
         let activated = relu2(&up)?;
@@ -580,10 +549,8 @@ mod tests {
         let gs = MxArray::from_float32(&gs_vals, &[E]).unwrap();
 
         let experts = NemotronHExperts::Quantized {
-            up: qsl(&weight, &scales),
-            up_global_scale: gs.clone(),
-            down: qsl(&weight, &scales),
-            down_global_scale: gs.clone(),
+            up: qsl(&weight, &scales).with_outer_scale(gs.clone()),
+            down: qsl(&weight, &scales).with_outer_scale(gs.clone()),
         };
 
         let indices = MxArray::from_uint32(&[0, 1, 2], &[3, 1]).unwrap();

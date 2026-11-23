@@ -19,42 +19,10 @@
 //! The model.rs caller then pools height to get [B, W, dims] for CTC.
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::backbone::{FrozenBatchNorm2d, NativeConv2d};
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
+use crate::vision::cnn::ConvBNAct;
 use napi::bindgen_prelude::*;
-
-// ============================================================================
-// ConvBNLayer helper (conv + optional BN + optional activation)
-// ============================================================================
-
-/// Conv2d + BatchNorm layer used in SVTR neck bottleneck convolutions.
-pub struct SVTRConvBN {
-    conv: NativeConv2d,
-    bn: FrozenBatchNorm2d,
-    activation: String,
-}
-
-impl SVTRConvBN {
-    pub fn new(conv: NativeConv2d, bn: FrozenBatchNorm2d, activation: &str) -> Self {
-        Self {
-            conv,
-            bn,
-            activation: activation.to_string(),
-        }
-    }
-
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        let x = self.conv.forward(input)?;
-        let x = self.bn.forward(&x)?;
-        match self.activation.as_str() {
-            "swish" | "silu" => Activations::silu(&x),
-            "relu" => Activations::relu(&x),
-            "none" => Ok(x),
-            _ => Activations::silu(&x),
-        }
-    }
-}
 
 // ============================================================================
 // Pre-norm Transformer Encoder Layer
@@ -189,30 +157,30 @@ impl SVTREncoderLayer {
 /// transformer output.
 pub struct SVTRNeck {
     /// Conv2d(C → C/8, k=[1,3], pad=[0,1]) — channel reduction
-    conv1: SVTRConvBN,
+    conv1: ConvBNAct,
     /// Conv2d(C/8 → hidden, k=1, pad=0) — project to hidden
-    conv2: SVTRConvBN,
+    conv2: ConvBNAct,
     /// Transformer encoder layers (pre-norm, Swish FFN)
     layers: Vec<SVTREncoderLayer>,
     /// Final LayerNorm applied after all transformer blocks (eps=1e-6)
     final_norm: LayerNorm,
     /// Conv2d(hidden → C, k=1, pad=0) — project back
-    conv3: SVTRConvBN,
+    conv3: ConvBNAct,
     /// Conv2d(2C → C/8, k=[1,3], pad=[0,1]) — reduce concatenated
-    conv4: SVTRConvBN,
+    conv4: ConvBNAct,
     /// Conv2d(C/8 → dims, k=1, pad=0) — final projection to output dims
-    conv1x1: SVTRConvBN,
+    conv1x1: ConvBNAct,
 }
 
 impl SVTRNeck {
     pub fn new(
-        conv1: SVTRConvBN,
-        conv2: SVTRConvBN,
+        conv1: ConvBNAct,
+        conv2: ConvBNAct,
         layers: Vec<SVTREncoderLayer>,
         final_norm: LayerNorm,
-        conv3: SVTRConvBN,
-        conv4: SVTRConvBN,
-        conv1x1: SVTRConvBN,
+        conv3: ConvBNAct,
+        conv4: ConvBNAct,
+        conv1x1: ConvBNAct,
     ) -> Self {
         Self {
             conv1,

@@ -6,35 +6,13 @@
 //! All operations use NHWC format (MLX native).
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::backbone::{FrozenBatchNorm2d, NativeConv2d};
 use crate::nn::activations::Activations;
+use crate::vision::cnn::{ConvBNAct, NativeConv2d};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::Arc;
 
 use super::processing;
-
-// ============================================================================
-// ConvBNLayer: Conv2d + BatchNorm + HardSwish
-// ============================================================================
-
-/// Conv + BatchNorm + HardSwish layer (PP-LCNet building block).
-pub struct ConvBNLayer {
-    conv: NativeConv2d,
-    bn: FrozenBatchNorm2d,
-}
-
-impl ConvBNLayer {
-    pub fn new(conv: NativeConv2d, bn: FrozenBatchNorm2d) -> Self {
-        Self { conv, bn }
-    }
-
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        let x = self.conv.forward(input)?;
-        let x = self.bn.forward(&x)?;
-        Activations::hard_swish(&x)
-    }
-}
 
 // ============================================================================
 // SEModule: Squeeze-and-Excitation
@@ -83,13 +61,13 @@ impl SEModule {
 /// Depthwise Separable Convolution block.
 /// dw_conv (depthwise, groups=in_channels) -> [SE] -> pw_conv (pointwise, 1x1)
 pub struct DepthwiseSeparable {
-    dw_conv: ConvBNLayer,
+    dw_conv: ConvBNAct,
     se: Option<SEModule>,
-    pw_conv: ConvBNLayer,
+    pw_conv: ConvBNAct,
 }
 
 impl DepthwiseSeparable {
-    pub fn new(dw_conv: ConvBNLayer, se: Option<SEModule>, pw_conv: ConvBNLayer) -> Self {
+    pub fn new(dw_conv: ConvBNAct, se: Option<SEModule>, pw_conv: ConvBNAct) -> Self {
         Self {
             dw_conv,
             se,
@@ -113,7 +91,7 @@ impl DepthwiseSeparable {
 /// PP-LCNet backbone: stem conv + blocks2-6 + optional last_conv (1x1 expansion).
 pub struct PPLCNetBackbone {
     /// Initial 3x3 conv with stride 2
-    conv1: ConvBNLayer,
+    conv1: ConvBNAct,
     /// Block groups 2-6
     block_groups: Vec<Vec<DepthwiseSeparable>>,
     /// Optional 1x1 conv expanding channels (e.g. 512 -> 1280), no BN
@@ -122,7 +100,7 @@ pub struct PPLCNetBackbone {
 
 impl PPLCNetBackbone {
     pub fn new(
-        conv1: ConvBNLayer,
+        conv1: ConvBNAct,
         block_groups: Vec<Vec<DepthwiseSeparable>>,
         last_conv: Option<NativeConv2d>,
     ) -> Self {

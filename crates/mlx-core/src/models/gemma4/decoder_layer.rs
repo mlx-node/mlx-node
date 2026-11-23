@@ -4,15 +4,14 @@ use crate::nn::{Linear, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use napi::bindgen_prelude::*;
 
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear, QuantizedSwitchLinear};
+
 use super::attention::Gemma4Attention;
 use super::config::Gemma4Config;
 use super::diagnostic;
 use super::layer_cache::Gemma4LayerCache;
-use super::mlp::GemmaMLP;
+use super::mlp::{Gemma4MLPVariant, GemmaMLP};
 use super::moe::{Gemma4MoE, Gemma4Router};
-use super::quantized_linear::{
-    Gemma4MLPVariant, LinearProj, QuantizedLinear, QuantizedSwitchLinear,
-};
 
 /// Per-layer routing kind for Gemma4's paged dispatch.
 ///

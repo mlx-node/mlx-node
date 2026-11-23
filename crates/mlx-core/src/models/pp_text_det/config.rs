@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::models::pp_doclayout_v3::config::HGNetV2Config;
+use crate::vision::cnn::HGNetV2Config;
 
 /// Configuration for the text detection model.
 #[derive(Debug, Clone, Deserialize)]

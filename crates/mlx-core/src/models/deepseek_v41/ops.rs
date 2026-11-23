@@ -3,8 +3,8 @@
 
 use napi::{Error, Result};
 
-use super::config::YarnConfig;
 use crate::array::{DType, MxArray};
+pub use crate::models::moe_common::{hc_pre, inv_freqs, route_select};
 use crate::nn::Activations;
 
 fn dims(x: &MxArray) -> Result<Vec<i64>> {
@@ -27,37 +27,6 @@ fn last(x: &MxArray, lo: i64, hi: i64) -> Result<MxArray> {
     starts[d.len() - 1] = lo;
     stops[d.len() - 1] = hi;
     x.slice(&starts, &stops)
-}
-
-/// Rotary inverse frequencies `f_i` in f32, `model.py:370-388`; `yarn` None is
-/// the ratio-0 (window-only) path: base theta, no YaRN.
-pub fn inv_freqs(dim: usize, theta: f32, yarn: Option<&YarnConfig>) -> Vec<f32> {
-    let half = dim / 2;
-    let mut f: Vec<f32> = (0..half)
-        // torch's f32 `base ** e` is the correctly rounded power (checked on
-        // both thetas); libm powf is not, so round the f64 power
-        .map(|i| {
-            let e = (2 * i) as f32 / dim as f32;
-            1.0 / f64::from(theta).powf(f64::from(e)) as f32
-        })
-        .collect();
-    if let Some(y) = yarn.filter(|y| y.original_seq_len > 0) {
-        let base = f64::from(theta);
-        let corrected = |rot: f32| {
-            dim as f64
-                * (y.original_seq_len as f64 / (f64::from(rot) * 2.0 * std::f64::consts::PI)).ln()
-                / (2.0 * base.ln())
-        };
-        let low = corrected(y.beta_fast).floor().max(0.0);
-        let high = corrected(y.beta_slow).ceil().min((dim - 1) as f64);
-        let span = (high - low).max(1e-3) as f32;
-        for (i, fi) in f.iter_mut().enumerate() {
-            let ramp = ((i as f32 - low as f32) / span).clamp(0.0, 1.0);
-            let smooth = 1.0 - ramp;
-            *fi = *fi / y.factor * (1.0 - smooth) + *fi * smooth;
-        }
-    }
-    f
 }
 
 /// The reference angle `fl32(p * f_i)` (`torch.outer(arange, freqs)` in f32).
@@ -231,39 +200,6 @@ pub fn router_scores(logits: &MxArray) -> Result<MxArray> {
     x.greater(&scalar(20.0)?)?.where_(&x, &soft)?.sqrt()
 }
 
-/// Top-k by `biased` (scores + bias), ties to the lowest index, weights from
-/// the unbiased `scores`: `/ (sum + 1e-20) * route_scale` when `norm` and
-/// k > 1. Row-major `[rows, n]` in, `[rows, k]` ids and weights out.
-pub fn route_select(
-    biased: &[f32],
-    scores: &[f32],
-    n: usize,
-    k: usize,
-    route_scale: f32,
-    norm: bool,
-) -> (Vec<u32>, Vec<f32>) {
-    let rows = biased.len() / n;
-    let (mut ids, mut weights) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k));
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    for r in 0..rows {
-        let b = &biased[r * n..(r + 1) * n];
-        order.clear();
-        order.extend(0..n as u32);
-        order.sort_by(|&i, &j| b[j as usize].total_cmp(&b[i as usize]).then(i.cmp(&j)));
-        let w: Vec<f32> = order[..k]
-            .iter()
-            .map(|&e| scores[r * n + e as usize])
-            .collect();
-        let sum = w.iter().fold(0.0f32, |a, &x| a + x) + 1e-20;
-        ids.extend_from_slice(&order[..k]);
-        weights.extend(
-            w.iter()
-                .map(|&x| (if norm && k > 1 { x / sum } else { x }) * route_scale),
-        );
-    }
-    (ids, weights)
-}
-
 /// `hc_split_sinkhorn` (`kernel.py:421-460`): mixes `[n, (2 + hc) * hc]` ->
 /// pre `[n, hc]`, post `[n, hc]`, comb `[n, hc, hc]` (`comb[j, k]` = from copy
 /// j to copy k), exactly `iters` normalization rounds, no early exit.
@@ -327,15 +263,6 @@ pub fn hc_mixes(
         .matmul(&hc_fn.astype(DType::Float32)?.transpose(Some(&[1, 0]))?)?
         .mul(&rs)?;
     hc_split_sinkhorn(&mixes, scale, base, hc, iters, hc_eps)
-}
-
-/// `Block.hc_pre`: `sum_j pre[j] * x[j]` in f32, back to `x`'s dtype.
-pub fn hc_pre(x: &MxArray, pre: &MxArray) -> Result<MxArray> {
-    let d = dims(x)?;
-    pre.reshape(&[d[0], 1, d[1]])?
-        .matmul(&x.astype(DType::Float32)?)?
-        .reshape(&[d[0], d[2]])?
-        .astype(x.dtype()?)
 }
 
 /// `Block.hc_post`: `out[k] = post[k] * x + sum_j comb[j, k] * residual[j]`

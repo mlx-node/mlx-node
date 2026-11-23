@@ -28,9 +28,9 @@ use crate::models::quantized_linear::{
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    try_build_quantized_switch_linear,
 };
-use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
-use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
+use crate::moe::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
 use crate::nn::Linear;

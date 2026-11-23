@@ -194,6 +194,83 @@ pub fn host_memory() -> Option<HostMemory> {
     None
 }
 
+/// This process: (current footprint, lifetime peak footprint, disk bytes read).
+#[cfg(target_os = "macos")]
+pub fn rusage() -> (u64, u64, u64) {
+    // SAFETY: rusage_info_v4 is plain integers; all-zero is valid.
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a writable rusage_info_v4 for the V4 flavor.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast(),
+        )
+    };
+    if rc != 0 {
+        return (0, 0, 0);
+    }
+    (
+        info.ri_phys_footprint,
+        info.ri_lifetime_max_phys_footprint,
+        info.ri_diskio_bytesread,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn rusage() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut v = [0u8; 8];
+    let mut len = v.len();
+    // SAFETY: `v` is writable for `len` bytes; the name is NUL-terminated.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c.as_ptr(),
+            v.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    match (rc, len) {
+        (0, 4) => Some(u64::from(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))),
+        (0, 8) => Some(u64::from_le_bytes(v)),
+        _ => None,
+    }
+}
+
+/// (`kern.memorystatus_level`, `vm.swapusage` used bytes).
+#[cfg(target_os = "macos")]
+pub fn host_pressure() -> (Option<u64>, Option<u64>) {
+    let swap = {
+        // SAFETY: xsw_usage is plain integers; all-zero is valid.
+        let mut s: libc::xsw_usage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xsw_usage>();
+        // SAFETY: `s` is writable for `len` bytes; the name is NUL-terminated.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"vm.swapusage".as_ptr(),
+                (&raw mut s).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(s.xsu_used)
+    };
+    (sysctl_u64("kern.memorystatus_level"), swap)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn host_pressure() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

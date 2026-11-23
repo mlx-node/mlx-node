@@ -32,21 +32,12 @@ pub fn bilinear_interpolate(image: &MxArray, new_height: i64, new_width: i64) ->
     let h_in = shape[0];
     let w_in = shape[1];
 
-    // Handle edge cases
+    // Handle edge case
     if new_height == h_in && new_width == w_in {
         return Ok(image.clone());
     }
 
-    if new_height == 1 && new_width == 1 {
-        // Just return the center-ish pixel
-        let center_h = h_in / 2;
-        let center_w = w_in / 2;
-        let pixel = image.slice_axis(0, center_h, center_h + 1)?;
-        let pixel = pixel.slice_axis(1, center_w, center_w + 1)?;
-        return Ok(pixel);
-    }
-
-    // Use GPU implementation
+    // Use GPU implementation (handles 1x1 cleanly with align_corners=false)
     bilinear_interpolate_gpu(image, h_in, w_in, new_height, new_width, &shape)
 }
 
@@ -69,40 +60,33 @@ fn bilinear_interpolate_gpu(
     let y_out = MxArray::arange(0.0, new_height as f64, Some(1.0), Some(DType::Float32))?; // [new_h]
     let x_out = MxArray::arange(0.0, new_width as f64, Some(1.0), Some(DType::Float32))?; // [new_w]
 
-    // Compute source coordinates using align_corners=false formula
-    // y_src = (y_out + 0.5) * h_in / new_height - 0.5
-    let y_src = y_out
-        .add_scalar(0.5)?
-        .mul_scalar(h_in as f64 / new_height as f64)?
-        .sub_scalar(0.5)?; // [new_h]
-
-    let x_src = x_out
-        .add_scalar(0.5)?
-        .mul_scalar(w_in as f64 / new_width as f64)?
-        .sub_scalar(0.5)?; // [new_w]
-
-    // Compute floor indices (unclamped for now)
-    let y0_f_raw = y_src.floor()?; // [new_h]
-    let x0_f_raw = x_src.floor()?; // [new_w]
-
-    // Clamp floor indices to valid range (same as CPU implementation)
+    // Compute source coordinates using align_corners=false formula and clamp to [0, dim - 1]
+    // matching PyTorch F.interpolate(mode="bilinear", align_corners=False)
     let zero = MxArray::zeros(&[], Some(DType::Float32))?;
     let h_max = MxArray::full(&[], Either::A((h_in - 1) as f64), Some(DType::Float32))?;
     let w_max = MxArray::full(&[], Either::A((w_in - 1) as f64), Some(DType::Float32))?;
 
-    let y0_f = y0_f_raw.maximum(&zero)?.minimum(&h_max)?;
-    let x0_f = x0_f_raw.maximum(&zero)?.minimum(&w_max)?;
+    let y_src = y_out
+        .add_scalar(0.5)?
+        .mul_scalar(h_in as f64 / new_height as f64)?
+        .sub_scalar(0.5)?
+        .maximum(&zero)?
+        .minimum(&h_max)?; // [new_h]
 
-    // Compute fractional weights using CLAMPED floor indices
-    // This matches CPU: (r - rf as f32).clamp(0.0, 1.0) where rf is clamped
+    let x_src = x_out
+        .add_scalar(0.5)?
+        .mul_scalar(w_in as f64 / new_width as f64)?
+        .sub_scalar(0.5)?
+        .maximum(&zero)?
+        .minimum(&w_max)?; // [new_w]
+
+    // Floor indices are already within [0, dim - 1]
+    let y0_f = y_src.floor()?; // [new_h]
+    let x0_f = x_src.floor()?; // [new_w]
+
+    // Compute fractional weights (guaranteed within [0, 1] since y_src is clamped)
     let wy = y_src.sub(&y0_f)?; // [new_h]
     let wx = x_src.sub(&x0_f)?; // [new_w]
-
-    // Clamp weights to [0, 1]
-    let zero_f = MxArray::zeros(&[], Some(DType::Float32))?;
-    let one_f = MxArray::ones(&[], Some(DType::Float32))?;
-    let wy = wy.maximum(&zero_f)?.minimum(&one_f)?; // [new_h]
-    let wx = wx.maximum(&zero_f)?.minimum(&one_f)?; // [new_w]
 
     // Compute ceil indices and clamp
     let y1_f = y0_f.add_scalar(1.0)?.minimum(&h_max)?;
@@ -483,6 +467,25 @@ mod tests {
         assert!(
             result_data.iter().all(|x| x.is_finite()),
             "Result contains NaN or Inf"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_1x1_align_corners_false() {
+        // 4x4 -> 1x1: align_corners=false samples at (1.5, 1.5), averaging
+        // the 4 center pixels (1,1)=5, (1,2)=6, (2,1)=9, (2,2)=10 -> 7.5.
+        let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let image = MxArray::from_float32(&data, &[4, 4]).unwrap();
+
+        let result = bilinear_interpolate(&image, 1, 1).unwrap();
+        let shape: Vec<i64> = result.shape().unwrap().as_ref().to_vec();
+        assert_eq!(shape, vec![1, 1]);
+
+        let result_data = result.to_float32().unwrap();
+        assert!(
+            (result_data[0] - 7.5).abs() < 1e-5,
+            "expected 7.5, got {}",
+            result_data[0]
         );
     }
 }

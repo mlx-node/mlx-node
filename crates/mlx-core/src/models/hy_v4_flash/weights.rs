@@ -23,8 +23,9 @@ use super::scan::{Located, Role, Scan};
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::models::deepseek_v41::store::Weight;
+use crate::models::moe_common::Weight;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
+pub(crate) use crate::quant::gguf_mmap::{mmap_q8_0_gather_rows, mmap_raw_slice};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
 use crate::utils::gguf_gpu::RepackDst;
@@ -83,78 +84,6 @@ pub enum Dense {
         rows: i64,
         cols: i64,
     },
-}
-
-fn mmap_raw_slice(buf: &MxArray, byte_offset: u64, len: usize) -> Result<&[u8]> {
-    buf.eval();
-    let total = buf.nbytes();
-    let off = usize::try_from(byte_offset).map_err(|_| bad("mmap byte_offset exceeds usize"))?;
-    if off.checked_add(len).is_none_or(|end| end > total) {
-        return Err(bad(format!(
-            "mmap slice {off}..+{len} exceeds buffer size {total}"
-        )));
-    }
-    let ptr = buf.storage_ptr();
-    if ptr.is_null() {
-        return Err(bad("mmap buffer has null storage pointer"));
-    }
-    // SAFETY: `buf` is evaluated and alive for the returned borrow, and
-    // `off..off + len` was bounds-checked against `buf.nbytes()`.
-    Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(off), len) })
-}
-
-pub(crate) fn mmap_q8_0_gather_rows(
-    idx: &MxArray,
-    buf: &MxArray,
-    byte_offset: u64,
-    rows: i64,
-    cols: i64,
-) -> Result<MxArray> {
-    if let Some(arr) = super::ops::gguf_q8_0_embed_rows(idx, buf, byte_offset, rows, cols)? {
-        return Ok(arr);
-    }
-    let orig_shape = idx.shape()?.as_ref().to_vec();
-    let mut out_shape = orig_shape.clone();
-    out_shape.push(cols);
-    let n: usize = orig_shape.iter().map(|&d| d as usize).product();
-    if n == 0 {
-        return MxArray::zeros(&out_shape, Some(DType::Float32));
-    }
-    let flat = if orig_shape.len() == 1 {
-        idx.clone()
-    } else {
-        idx.reshape(&[n as i64])?
-    };
-    let flat_i32 = if flat.dtype()? == DType::Int32 {
-        flat
-    } else {
-        flat.astype(DType::Int32)?
-    };
-    let ids = flat_i32.to_int32()?;
-    let rows_u = usize::try_from(rows).map_err(|_| bad("rows exceeds usize"))?;
-    let cols_u = usize::try_from(cols).map_err(|_| bad("cols exceeds usize"))?;
-    if cols_u == 0 || !cols_u.is_multiple_of(Q8_0_VALUES) {
-        return Err(bad(format!("Q8_0 mmap cols {cols_u} not divisible by 32")));
-    }
-    let row_bytes = (cols_u / Q8_0_VALUES)
-        .checked_mul(Q8_0_BYTES)
-        .ok_or_else(|| bad("Q8_0 mmap row bytes overflow"))?;
-    let table_bytes = rows_u
-        .checked_mul(row_bytes)
-        .ok_or_else(|| bad("Q8_0 mmap table bytes overflow"))?;
-    let raw = mmap_raw_slice(buf, byte_offset, table_bytes)?;
-    alloc_filled(&out_shape, DType::Float32, n * cols_u, |out| {
-        for (i, &id) in ids.iter().enumerate() {
-            let dst = &mut out[i * cols_u..(i + 1) * cols_u];
-            if id < 0 || (id as usize) >= rows_u {
-                dst.fill(MaybeUninit::new(0.0));
-            } else {
-                let r = id as usize;
-                q8_0_into_f32_slots(&raw[r * row_bytes..(r + 1) * row_bytes], dst)?;
-            }
-        }
-        Ok(())
-    })
 }
 
 impl From<MxArray> for Dense {

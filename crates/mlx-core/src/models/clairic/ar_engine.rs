@@ -25,10 +25,10 @@ use sha2::{Digest, Sha256};
 
 use crate::array::{DType, MxArray};
 use crate::models::forward as model_fwd;
-use crate::models::paddleocr_vl::processing::ProcessedImage;
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::model::Qwen35Inner;
 use crate::stream::{Stream, StreamContext};
+use crate::vision::processing::ProcessedImage;
 use crate::vision::qwen::processing::merged_image_token_count;
 use crate::vision::qwen::prompt::{
     get_rope_index, inject_image_placeholders_with_token_id, merge_input_ids_with_image_features,

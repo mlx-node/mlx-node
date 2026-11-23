@@ -1,5 +1,6 @@
 use crate::array::MxArray;
-use crate::nn::Linear;
+use crate::models::quantized_linear::QuantizedLinear;
+use crate::nn::{Activations, Linear};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
@@ -64,5 +65,114 @@ impl GemmaMLP {
     }
     pub(crate) fn down_proj_weight(&self) -> MxArray {
         self.down_proj.get_weight()
+    }
+}
+
+/// Gemma4 MLP variant: standard (GeGLU) or quantized.
+pub enum Gemma4MLPVariant {
+    Standard(GemmaMLP),
+    Quantized {
+        gate_proj: QuantizedLinear,
+        up_proj: QuantizedLinear,
+        down_proj: QuantizedLinear,
+    },
+}
+
+impl Gemma4MLPVariant {
+    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            Gemma4MLPVariant::Standard(mlp) => mlp.forward(x),
+            Gemma4MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.forward(x)?;
+                let up = up_proj.forward(x)?;
+                let activated = Activations::gelu(&gate)?;
+                let gated = activated.mul(&up)?;
+                down_proj.forward(&gated)
+            }
+        }
+    }
+
+    pub fn set_gate_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            Gemma4MLPVariant::Standard(mlp) => mlp.set_gate_proj_weight(w),
+            Gemma4MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+
+    pub fn set_up_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            Gemma4MLPVariant::Standard(mlp) => mlp.set_up_proj_weight(w),
+            Gemma4MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+
+    pub fn set_down_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            Gemma4MLPVariant::Standard(mlp) => mlp.set_down_proj_weight(w),
+            Gemma4MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod quantized_mlp_tests {
+    use super::*;
+    use crate::array::DType;
+    use crate::models::quantized_linear::DEFAULT_QUANT_MODE;
+
+    fn affine_q4(seed: u32) -> QuantizedLinear {
+        let packed: Vec<u32> = (0..32 * 4)
+            .map(|i| 0x7654_3210u32.rotate_left(((i as u32 + seed) % 8) * 4))
+            .collect();
+        let scales = vec![half::f16::from_f32(0.0625).to_bits(); 32];
+        let biases = vec![half::f16::from_f32(-0.5).to_bits(); 32];
+        QuantizedLinear::new(
+            MxArray::from_uint32(&packed, &[32, 4]).unwrap(),
+            MxArray::from_float16(&scales, &[32, 1]).unwrap(),
+            Some(MxArray::from_float16(&biases, &[32, 1]).unwrap()),
+            None,
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        )
+    }
+
+    fn values(array: &MxArray) -> Vec<f32> {
+        array.eval();
+        array.to_float32().unwrap().as_ref().to_vec()
+    }
+
+    #[test]
+    fn separate_q4_projections_preserve_bfloat16() {
+        let input_bits: Vec<u16> = (0..64)
+            .map(|i| half::bf16::from_f32(((i % 13) as f32 - 6.0) / 8.0).to_bits())
+            .collect();
+        let input = MxArray::from_bfloat16(&input_bits, &[1, 2, 32]).unwrap();
+
+        let mlp = Gemma4MLPVariant::Quantized {
+            gate_proj: affine_q4(2),
+            up_proj: affine_q4(7),
+            down_proj: affine_q4(11),
+        };
+        let actual = mlp.forward(&input).unwrap();
+
+        let gate = affine_q4(2).forward(&input).unwrap();
+        let up = affine_q4(7).forward(&input).unwrap();
+        let gated = Activations::gelu(&gate).unwrap().mul(&up).unwrap();
+        let expected = affine_q4(11).forward(&gated).unwrap();
+
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(actual.shape().unwrap().to_vec(), vec![1, 2, 32]);
+        assert_eq!(values(&actual), values(&expected));
     }
 }

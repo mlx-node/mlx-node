@@ -31,21 +31,8 @@ pub fn preprocess(data: &[u8], config: &UVDocConfig) -> Result<(MxArray, u32, u3
     let resized = img.resize_exact(target_w, target_h, FilterType::Triangle);
     let rgb_img = resized.to_rgb8();
 
-    let h = target_h as usize;
-    let w = target_w as usize;
-    let mut pixel_data: Vec<f32> = vec![0.0; h * w * 3];
-
     // Normalize to [0, 1] (UVDoc uses simple /255 normalization)
-    for y in 0..h {
-        for x in 0..w {
-            let pixel = rgb_img.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                pixel_data[(y * w + x) * 3 + c] = pixel[c] as f32 / 255.0;
-            }
-        }
-    }
-
-    let pixel_values = MxArray::from_float32(&pixel_data, &[1, h as i64, w as i64, 3])?;
+    let pixel_values = crate::vision::cnn::rgb_to_nhwc_f32(&rgb_img, None, None, false)?;
     Ok((pixel_values, orig_w, orig_h))
 }
 

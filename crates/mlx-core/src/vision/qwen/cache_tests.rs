@@ -386,7 +386,7 @@ fn unheld_units_are_the_unshared_entries() {
 #[cfg(target_os = "macos")]
 #[test]
 fn prepared_image_features_stay_held_until_dropped() {
-    use crate::models::paddleocr_vl::processing::ProcessedImages;
+    use crate::vision::processing::ProcessedImages;
     if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
         return;
     }

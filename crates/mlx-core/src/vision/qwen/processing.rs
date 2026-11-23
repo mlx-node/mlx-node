@@ -3,9 +3,9 @@
 /// Handles image preprocessing including smart resizing, normalization,
 /// and patch extraction. Adapted from PaddleOCR-VL processing module
 /// with model-specific resize budgets.
-use crate::array::MxArray;
-use crate::models::paddleocr_vl::processing::{
-    ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images, smart_resize,
+use crate::vision::processing::{
+    ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images,
+    extract_image_patches, smart_resize,
 };
 use image::ImageReader;
 use image::imageops::FilterType;
@@ -213,77 +213,9 @@ impl QwenImageProcessor {
     fn process_resized_rgb(
         &self,
         rgb_img: &RgbImage,
-        geometry: QwenImageGeometry,
+        _geometry: QwenImageGeometry,
     ) -> Result<ProcessedImage> {
-        let new_height = geometry.resized_height;
-        let new_width = geometry.resized_width;
-
-        // Convert to float and normalize
-        let (height, width) = (new_height, new_width);
-        let channels = 3usize;
-        let mut pixel_data: Vec<f32> = Vec::with_capacity(height * width * channels);
-
-        let mean: Vec<f32> = self.config.image_mean.iter().map(|&x| x as f32).collect();
-        let std: Vec<f32> = self.config.image_std.iter().map(|&x| x as f32).collect();
-
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = rgb_img.get_pixel(x as u32, y as u32);
-                for c in 0..channels {
-                    let mut value = pixel[c] as f32;
-                    if self.config.do_rescale {
-                        value /= 255.0;
-                    }
-                    if self.config.do_normalize {
-                        value = (value - mean[c]) / std[c];
-                    }
-                    pixel_data.push(value);
-                }
-            }
-        }
-
-        // Reshape to patches
-        // Qwen3.5-VL uses patch_size=16.
-        // For images (not video), temporal_patch_size=2 means we duplicate the frame.
-        let patch_size = self.config.patch_size as usize;
-        let grid_h = geometry.grid_h as usize;
-        let grid_w = geometry.grid_w as usize;
-        let grid_t = geometry.grid_t as usize; // temporal dimension for images
-        let num_patches = grid_t * grid_h * grid_w;
-
-        // Reorder data into patches: [num_patches, C, patch_h, patch_w]
-        let mut patch_data: Vec<f32> =
-            Vec::with_capacity(num_patches * channels * patch_size * patch_size);
-
-        for ph in 0..grid_h {
-            for pw in 0..grid_w {
-                for c in 0..channels {
-                    for py in 0..patch_size {
-                        for px in 0..patch_size {
-                            let y = ph * patch_size + py;
-                            let x = pw * patch_size + px;
-                            let idx = (y * width + x) * channels + c;
-                            patch_data.push(pixel_data[idx]);
-                        }
-                    }
-                }
-            }
-        }
-
-        let pixel_values = MxArray::from_float32(
-            &patch_data,
-            &[
-                num_patches as i64,
-                channels as i64,
-                patch_size as i64,
-                patch_size as i64,
-            ],
-        )?;
-
-        Ok(ProcessedImage::new(
-            pixel_values,
-            vec![grid_t as i32, grid_h as i32, grid_w as i32],
-        ))
+        extract_image_patches(rgb_img, &self.config)
     }
 }
 

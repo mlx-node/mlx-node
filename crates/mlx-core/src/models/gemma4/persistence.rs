@@ -23,21 +23,23 @@ use crate::models::quant_dispatch::{
     kquant_mode_params_for_scales, load_quant_settings_from_disk, merge_per_layer,
     resolve_default_mode,
 };
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+    PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, mixed_affine_qmv_enabled, release_tiled_kquant_sources,
+    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
+};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::gguf::NativeGgufFamily;
 use crate::utils::gguf_import::{GgufPreload, PreloadInput, plan_dense_row_shards};
 
 use super::config::Gemma4Config;
 use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
-use super::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
-    PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
-};
 
 /// Conventional in-checkpoint location for an external Gemma4 speculative
 /// draft. Keeping the draft in a subdirectory avoids colliding with the
@@ -1230,7 +1232,7 @@ fn widen_bf16_affine_text_qmm_sidecars(
 
             let source_bytes = sidecar.nbytes();
             let widened = sidecar.astype(DType::Float32)?;
-            let decode_sidecar = (super::quantized_linear::mixed_affine_qmv_enabled()
+            let decode_sidecar = (mixed_affine_qmv_enabled()
                 && plq.bits == 4
                 && plq.group_size == 32
                 && packed_matrix)
@@ -1603,7 +1605,7 @@ fn build_gemma_ql(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     plq: PerLayerQuant,
-) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+) -> Result<Option<QuantizedLinear>> {
     build_gemma_ql_tiled(params, prefix, plq, &mut Vec::new())
 }
 
@@ -1617,7 +1619,7 @@ fn build_gemma_ql_tiled(
     prefix: &str,
     plq: PerLayerQuant,
     tiled: &mut Vec<String>,
-) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+) -> Result<Option<QuantizedLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
@@ -1632,7 +1634,7 @@ fn build_gemma_ql_tiled(
         // keeps MLX's affine route for f16 companions (GGUF Q4_0 imports,
         // with their decode sidecars), uncarried (bits, group) pairs and odd
         // shapes. Gemma4 threads no activation amax.
-        PerLayerMode::Affine => super::quantized_linear::try_build_affine_quantized_linear_tiled(
+        PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
             params,
             prefix,
             plq.group_size,
@@ -1657,7 +1659,7 @@ fn build_gemma_ql_tiled(
             // Tiled64 for the `_t64` Metal kernels (the Gemma4 UD GGUFs are
             // K-quant throughout; DSpark verify at M = 1 + L hits the
             // `qmv_wide_t64` / `qmm_m8_nax_t64` routes).
-            super::quantized_linear::try_build_kquant_quantized_linear_tiled(
+            try_build_kquant_quantized_linear_tiled(
                 params, prefix, plq.mode, plq.layout, "gemma4", tiled,
             )?
         }
@@ -1668,7 +1670,7 @@ fn build_gemma_qsl(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     plq: PerLayerQuant,
-) -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
+) -> Result<Option<QuantizedSwitchLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
@@ -1789,23 +1791,22 @@ fn apply_weights_mut(
     // Prefixes whose Tiled64 repack made the map's row-major arrays redundant;
     // drained into `release_tiled_kquant_sources` once their owner is installed.
     let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
-    let try_build_ql = |params: &HashMap<String, MxArray>,
-                        prefix: &str|
-     -> Result<Option<super::quantized_linear::QuantizedLinear>> {
-        let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        let quantized =
-            build_gemma_ql_tiled(params, prefix, plq, &mut tiled_prefixes.borrow_mut())?;
-        if let Some(linear) = quantized.as_ref() {
-            plain_fp8_residency
-                .borrow_mut()
-                .track(linear.reconstructed_fp8_weight());
-        }
-        Ok(quantized)
-    };
+    let try_build_ql =
+        |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<QuantizedLinear>> {
+            let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+            let quantized =
+                build_gemma_ql_tiled(params, prefix, plq, &mut tiled_prefixes.borrow_mut())?;
+            if let Some(linear) = quantized.as_ref() {
+                plain_fp8_residency
+                    .borrow_mut()
+                    .track(linear.reconstructed_fp8_weight());
+            }
+            Ok(quantized)
+        };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
     let try_build_qsl = |params: &HashMap<String, MxArray>,
                          prefix: &str|
-     -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
+     -> Result<Option<QuantizedSwitchLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
         build_gemma_qsl(params, prefix, plq)
     };
@@ -2269,13 +2270,10 @@ fn apply_weights_mut(
         }
         // The layer owns its tiled projections now; drop the map's row-major
         // originals (mirrors the dense qwen3_5 loader's layer loop).
-        super::quantized_linear::release_tiled_kquant_sources(
-            params,
-            &mut tiled_prefixes.borrow_mut(),
-        );
+        release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
     }
     // The lm_head / PLE projection built above the loop.
-    super::quantized_linear::release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
+    release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
 
     info!("All weights applied successfully");
     Ok(plain_fp8_residency.into_inner())
@@ -4403,7 +4401,7 @@ mod tests {
             &zero_points,
         )
         .unwrap();
-        let enabled = super::super::quantized_linear::mixed_affine_qmv_enabled();
+        let enabled = mixed_affine_qmv_enabled();
         assert_eq!(stats.decode_bytes, if enabled { 48 } else { 0 });
         assert!(!params.contains_key(&format!("{q}.decode_biases")));
         for prefix in [v, media] {
@@ -4979,7 +4977,8 @@ mod tests {
     /// non-tileable shape keep MLX's `affine` route.
     #[test]
     fn affine_bf16_projections_load_tiled_and_f16_or_odd_sites_stay_affine() {
-        use super::super::quantized_linear::{Gemma4MLPVariant, LinearProj};
+        use super::super::mlp::Gemma4MLPVariant;
+        use crate::models::quantized_linear::LinearProj;
         let json = serde_json::json!({
             "vocab_size": 8,
             "hidden_size": 1536,
@@ -5153,7 +5152,7 @@ mod tests {
                 (gate_proj, "layers.0.mlp.gate_proj", 4),
                 (up_proj, "layers.0.mlp.up_proj", 8),
             ] {
-                let row_major = super::super::quantized_linear::try_build_quantized_linear(
+                let row_major = crate::models::quantized_linear::try_build_quantized_linear(
                     &params, name, 64, bits,
                 )
                 .unwrap();
@@ -5997,7 +5996,7 @@ mod tests {
     /// leave `lm_head` as `None` (regression).
     #[test]
     fn lm_head_quantized_and_dense_install() {
-        use super::super::quantized_linear::LinearProj;
+        use crate::models::quantized_linear::LinearProj;
 
         let base_json = |tied: bool| {
             serde_json::json!({
@@ -6107,7 +6106,7 @@ mod tests {
 
     #[test]
     fn ple_projections_install_quantized_and_dense_weights() {
-        use super::super::quantized_linear::LinearProj;
+        use crate::models::quantized_linear::LinearProj;
 
         let config: Gemma4Config = serde_json::from_value(serde_json::json!({
             "vocab_size": 8,

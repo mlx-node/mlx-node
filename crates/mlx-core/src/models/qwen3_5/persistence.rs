@@ -2947,7 +2947,7 @@ pub(crate) fn check_clairic_assets(source: &CheckpointSource) -> Result<()> {
 /// `ClairicProcessor(path, tokenizer, VISION_MAX_PIXELS)` (`backend.py:1711-1720`).
 fn load_clairic_image_processor_config(
     dir: &Path,
-) -> crate::models::paddleocr_vl::processing::ImageProcessorConfig {
+) -> crate::vision::processing::ImageProcessorConfig {
     let mut cfg = crate::vision::qwen::processing::qwen35_vl_processor_config();
     let max_cap = mlx_clairic::settings::VISION_MAX_PIXELS as i32;
     cfg.min_pixels = 65_536;

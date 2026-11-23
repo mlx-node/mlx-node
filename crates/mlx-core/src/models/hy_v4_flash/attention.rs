@@ -40,8 +40,7 @@ use super::sparse::{
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::ops::inv_freqs;
-use crate::models::deepseek_v41::store::Weight;
+use crate::models::moe_common::{Weight, inv_freqs};
 use crate::nn::Activations;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 

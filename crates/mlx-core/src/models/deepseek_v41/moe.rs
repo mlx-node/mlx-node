@@ -15,11 +15,12 @@ use napi::{Error, Result};
 
 use super::attention::linear;
 use super::config::DeepseekV41Config;
-use super::ops::{route_select, router_scores, swiglu};
+use super::ops::{router_scores, swiglu};
 use super::stats::{Phase, prof_end, prof_start};
 use super::store::Dense;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
+use crate::models::moe_common::route_select;
 use crate::moe_stream::bank::StagingBank;
 use crate::moe_stream::cache::decode_step;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};

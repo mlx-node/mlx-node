@@ -2,7 +2,7 @@ use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
-use crate::models::gemma4::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Activations, RoPE, rms_norm_unscaled};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,

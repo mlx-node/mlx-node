@@ -140,7 +140,7 @@ impl Embedding {
     /// `load_quantized` path, or plain bf16).
     pub fn forward(&self, indices: &MxArray) -> Result<MxArray> {
         if let Some(ref m) = self.gguf_q8_0_mmap {
-            return crate::models::hy_v4_flash::weights::mmap_q8_0_gather_rows(
+            return crate::quant::gguf_mmap::mmap_q8_0_gather_rows(
                 indices,
                 &m.buf,
                 m.byte_offset,

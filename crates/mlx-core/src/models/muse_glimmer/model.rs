@@ -29,7 +29,7 @@ use crate::models::forward as fwd;
 use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
-use crate::models::gemma4::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, RMSNorm, rms_norm_unscaled};
 use crate::stream::Stream;
 use crate::tokenizer::Qwen3Tokenizer;

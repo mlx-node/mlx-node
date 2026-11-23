@@ -36,6 +36,7 @@ use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{RMSNorm, RoPE};
+use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::{
     PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,
 };
@@ -165,26 +166,16 @@ fn paged_kv_write(
 }
 
 impl PagedAttentionCore<'_> {
-    /// Single-sequence paged forward: `x: [B, T, hidden]` → `[B, T, hidden]`.
-    ///
-    /// Reproduces the hand-rolled K2/LFM2/Nemotron bodies op-for-op:
-    /// projections → `[B,T,H,D]` reshape → optional Q/K norm → `[B,H,T,D]`
-    /// transpose → optional RoPE → paged write → prefill SDPA / cache-hit
-    /// route / decode gather → o_proj.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_paged(
+    /// Project `x: [B, T, hidden]` into `[B, H, T, D]` Q/K/V with optional
+    /// per-head Q/K RMSNorm and optional scalar-offset RoPE. Shared by
+    /// [`Self::forward_flat`] and [`Self::forward_paged`].
+    fn project_qkv_bhtd(
         &self,
         x: &MxArray,
-        adapter: &mut PagedKVCacheAdapter,
-        attn_layer_idx: u32,
-        first_logical_position: u32,
-        cached_prefix_len: u32,
-        is_prefill: bool,
-        prefill_mask: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
+        batch: i64,
+        seq_len: i64,
+        rope_offset: i32,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
         // 1. Q/K/V projections.
         let queries = self.q_proj.forward(x)?;
         let keys = self.k_proj.forward(x)?;
@@ -219,18 +210,80 @@ impl PagedAttentionCore<'_> {
             ])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        // 3. Optional scalar-offset RoPE at the request's logical position
-        //    (the adapter's pre-record offset).
+        // 3. Optional scalar-offset RoPE.
         let (queries_bhtd, keys_bhtd) = match self.rope {
-            Some(rope) => {
-                let rope_offset = first_logical_position as i32;
-                (
-                    rope.forward(&queries_bhtd, Some(rope_offset))?,
-                    rope.forward(&keys_bhtd, Some(rope_offset))?,
-                )
-            }
+            Some(rope) => (
+                rope.forward(&queries_bhtd, Some(rope_offset))?,
+                rope.forward(&keys_bhtd, Some(rope_offset))?,
+            ),
             None => (queries_bhtd, keys_bhtd),
         };
+        Ok((queries_bhtd, keys_bhtd, values_bhtd))
+    }
+
+    /// Flat forward with an optional `KVCache`: `x: [B, T, hidden]` →
+    /// `[B, T, hidden]`.
+    ///
+    /// Reproduces the K2 / LFM2 / Nemotron-H flat `forward` bodies op-for-op.
+    /// Intentionally does NOT apply `self.kv_io_dtype` so flat caches stay
+    /// dtype-transparent (Nemotron-H's flat cache stores whatever `k_proj` /
+    /// `v_proj` produce).
+    pub(crate) fn forward_flat(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+        let (queries, keys, values) = self.project_qkv_bhtd(x, batch, seq_len, offset)?;
+
+        let (keys, values) = if let Some(c) = cache {
+            c.update_and_fetch(&keys, &values)?
+        } else {
+            (keys, values)
+        };
+
+        let output = if let Some(m) = mask {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale, Some(m))?
+        } else if seq_len > 1 {
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale)?
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale, None)?
+        };
+
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch,
+            seq_len,
+            (self.num_heads * self.head_dim) as i64,
+        ])?;
+        self.o_proj.forward(&output)
+    }
+
+    /// Single-sequence paged forward: `x: [B, T, hidden]` → `[B, T, hidden]`.
+    ///
+    /// Reproduces the hand-rolled K2/LFM2/Nemotron bodies op-for-op:
+    /// projections → `[B,T,H,D]` reshape → optional Q/K norm → `[B,H,T,D]`
+    /// transpose → optional RoPE → paged write → prefill SDPA / cache-hit
+    /// route / decode gather → o_proj.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        prefill_mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // 1-3. Projections, optional Q/K norm, [B,H,T,D] layout, optional RoPE.
+        let (queries_bhtd, keys_bhtd, values_bhtd) =
+            self.project_qkv_bhtd(x, batch, seq_len, first_logical_position as i32)?;
 
         // 4. [B, H_kv, T, D] → [B*T, H_kv, D] for the paged write, with the
         //    optional pool-boundary dtype cast (Nemotron-H).

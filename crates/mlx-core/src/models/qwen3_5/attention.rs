@@ -5,14 +5,14 @@ use crate::array::{DType, MxArray};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::models::paddleocr_vl::language::{
-    MultimodalRoPE, apply_interleaved_rotary, apply_multimodal_rotary_pos_emb_interleaved,
-    select_interleaved_cos_sin,
-};
 use crate::nn::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::vision::rope_vision::{
+    MultimodalRoPE, apply_interleaved_rotary, apply_multimodal_rotary_pos_emb_interleaved,
+    select_interleaved_cos_sin,
+};
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;

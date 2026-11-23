@@ -11,19 +11,17 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::nn::linear::Linear;
-use crate::nn::normalization::LayerNorm;
-use crate::utils::safetensors::SafeTensorsFile;
-
-use super::backbone::{
-    ConvBNAct, ConvBNActLight, FrozenBatchNorm2d, HGBlock, HGBlockLayer, HGNetV2Backbone,
-    HGNetV2Embeddings, HGNetV2Encoder, HGNetV2Stage, LearnableAffineBlock, NativeConv2d,
+use crate::engine::persistence::load_all_safetensors;
+use crate::vision::cnn::{
+    load_conv_bn_act, load_conv2d, load_frozen_bn, load_hgnetv2_backbone, load_layer_norm,
+    load_linear,
 };
+
 use super::config::PPDocLayoutV3Config;
 use super::decoder::{Decoder, DecoderLayer, MultiscaleDeformableAttention, SelfAttention};
 use super::encoder::{
-    CSPRepLayer, ConvLayer, ConvNormLayer, Encoder, EncoderLayer, EncoderMaskOutput, HybridEncoder,
-    InputProjection, MaskFeatFPN, MultiheadAttention, RepVggBlock, ScaleHead, ScaleHeadLayer,
+    CSPRepLayer, Encoder, EncoderLayer, EncoderMaskOutput, HybridEncoder, InputProjection,
+    MaskFeatFPN, MultiheadAttention, RepVggBlock, ScaleHead, ScaleHeadLayer,
 };
 use super::heads::{GlobalPointer, MLPPredictionHead};
 use super::model::{PPDocLayoutV3Model, create_model};
@@ -31,107 +29,6 @@ use super::model::{PPDocLayoutV3Model, create_model};
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-/// Get a tensor from the param map, stripping the "model." prefix if present.
-pub(crate) fn get_tensor(params: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {
-    params
-        .get(key)
-        .cloned()
-        .ok_or_else(|| Error::from_reason(format!("Missing weight: {}", key)))
-}
-
-/// Transpose a Conv2d weight from PyTorch [O, I, kH, kW] to MLX [O, kH, kW, I].
-pub(crate) fn transpose_conv_weight(weight: &MxArray) -> Result<MxArray> {
-    weight.transpose(Some(&[0, 2, 3, 1]))
-}
-
-/// Load a FrozenBatchNorm2d from parameters.
-pub(crate) fn load_frozen_bn(
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    eps: f64,
-) -> Result<FrozenBatchNorm2d> {
-    let weight = get_tensor(params, &format!("{}.weight", prefix))?;
-    let bias = get_tensor(params, &format!("{}.bias", prefix))?;
-    let running_mean = get_tensor(params, &format!("{}.running_mean", prefix))?;
-    let running_var = get_tensor(params, &format!("{}.running_var", prefix))?;
-    Ok(FrozenBatchNorm2d::new(
-        &weight,
-        &bias,
-        &running_mean,
-        &running_var,
-        eps,
-    ))
-}
-
-/// Load a NativeConv2d from parameters (transposing weights from OIHW to OHWI).
-pub(crate) fn load_conv2d(
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    stride: (i32, i32),
-    padding: (i32, i32),
-    dilation: (i32, i32),
-    groups: i32,
-    has_bias: bool,
-) -> Result<NativeConv2d> {
-    let weight_raw = get_tensor(params, &format!("{}.weight", prefix))?;
-    let weight = transpose_conv_weight(&weight_raw)?;
-    let bias = if has_bias {
-        Some(get_tensor(params, &format!("{}.bias", prefix))?)
-    } else {
-        None
-    };
-    Ok(NativeConv2d::new(
-        &weight,
-        bias.as_ref(),
-        stride,
-        padding,
-        dilation,
-        groups,
-    ))
-}
-
-/// Load a Linear layer from parameters.
-pub(crate) fn load_linear(params: &HashMap<String, MxArray>, prefix: &str) -> Result<Linear> {
-    let weight = get_tensor(params, &format!("{}.weight", prefix))?;
-    let bias = params.get(&format!("{}.bias", prefix));
-    Linear::from_weights(&weight, bias)
-}
-
-/// Load a LayerNorm from parameters.
-pub(crate) fn load_layer_norm(
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    eps: f64,
-) -> Result<LayerNorm> {
-    let weight = get_tensor(params, &format!("{}.weight", prefix))?;
-    let bias = params.get(&format!("{}.bias", prefix));
-    LayerNorm::from_weights(&weight, bias, Some(eps))
-}
-
-/// Load a ConvBNAct (Conv + BN + Activation) from the backbone.
-pub(crate) fn load_conv_bn_act(
-    params: &HashMap<String, MxArray>,
-    conv_prefix: &str,
-    bn_prefix: &str,
-    activation: &str,
-    stride: (i32, i32),
-    padding: (i32, i32),
-    groups: i32,
-    eps: f64,
-    lab_prefix: Option<&str>,
-) -> Result<ConvBNAct> {
-    let conv = load_conv2d(params, conv_prefix, stride, padding, (1, 1), groups, false)?;
-    let norm = load_frozen_bn(params, bn_prefix, eps)?;
-    let lab = if let Some(lp) = lab_prefix {
-        let scale = get_tensor(params, &format!("{}.scale", lp))?;
-        let bias = get_tensor(params, &format!("{}.bias", lp))?;
-        Some(LearnableAffineBlock::new(&scale, &bias))
-    } else {
-        None
-    };
-    Ok(ConvBNAct::new(conv, norm, activation, lab))
-}
 
 /// Load an InputProjection (1x1 Conv + BN) from parameters.
 fn load_input_projection(
@@ -152,38 +49,6 @@ fn load_input_projection(
     Ok(InputProjection::new(conv, norm))
 }
 
-/// Load a ConvNormLayer from parameters.
-pub(crate) fn load_conv_norm_layer(
-    params: &HashMap<String, MxArray>,
-    conv_prefix: &str,
-    bn_prefix: &str,
-    activation: Option<&str>,
-    stride: (i32, i32),
-    padding: (i32, i32),
-    groups: i32,
-    eps: f64,
-) -> Result<ConvNormLayer> {
-    let conv = load_conv2d(params, conv_prefix, stride, padding, (1, 1), groups, false)?;
-    let norm = load_frozen_bn(params, bn_prefix, eps)?;
-    Ok(ConvNormLayer::new(conv, norm, activation))
-}
-
-/// Load a ConvLayer (Conv + BN + Activation, always with activation).
-pub(crate) fn load_conv_layer(
-    params: &HashMap<String, MxArray>,
-    conv_prefix: &str,
-    bn_prefix: &str,
-    activation: &str,
-    stride: (i32, i32),
-    padding: (i32, i32),
-    groups: i32,
-    eps: f64,
-) -> Result<ConvLayer> {
-    let conv = load_conv2d(params, conv_prefix, stride, padding, (1, 1), groups, false)?;
-    let norm = load_frozen_bn(params, bn_prefix, eps)?;
-    Ok(ConvLayer::new(conv, norm, activation))
-}
-
 /// Load an MLPPredictionHead from parameters.
 fn load_mlp_head(
     params: &HashMap<String, MxArray>,
@@ -196,253 +61,6 @@ fn load_mlp_head(
         layers.push(linear);
     }
     Ok(MLPPredictionHead::from_layers(layers))
-}
-
-// ============================================================================
-// Backbone Loading
-// ============================================================================
-
-fn load_backbone(
-    params: &HashMap<String, MxArray>,
-    config: &PPDocLayoutV3Config,
-) -> Result<HGNetV2Backbone> {
-    let bc = &config.backbone_config;
-    let eps = config.batch_norm_eps;
-    let act = bc.hidden_act.as_str();
-    let use_lab = bc.use_learnable_affine_block;
-
-    // Load stem (embeddings)
-    // HF hierarchy: backbone.model.embedder.{stem1,stem2a,stem2b,stem3,stem4}
-    // Each stem is an HGNetV2ConvLayer with .convolution, .normalization, .lab
-    let stem_prefix = "backbone.model.embedder";
-
-    let lab0 = format!("{}.stem1.lab", stem_prefix);
-    let stem1 = load_conv_bn_act(
-        params,
-        &format!("{}.stem1.convolution", stem_prefix),
-        &format!("{}.stem1.normalization", stem_prefix),
-        act,
-        (2, 2),
-        (1, 1),
-        1,
-        eps,
-        if use_lab { Some(lab0.as_str()) } else { None },
-    )?;
-
-    let lab1 = format!("{}.stem2a.lab", stem_prefix);
-    let stem2a = load_conv_bn_act(
-        params,
-        &format!("{}.stem2a.convolution", stem_prefix),
-        &format!("{}.stem2a.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab1.as_str()) } else { None },
-    )?;
-
-    let lab2 = format!("{}.stem2b.lab", stem_prefix);
-    let stem2b = load_conv_bn_act(
-        params,
-        &format!("{}.stem2b.convolution", stem_prefix),
-        &format!("{}.stem2b.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab2.as_str()) } else { None },
-    )?;
-
-    let lab3 = format!("{}.stem3.lab", stem_prefix);
-    let stem3 = load_conv_bn_act(
-        params,
-        &format!("{}.stem3.convolution", stem_prefix),
-        &format!("{}.stem3.normalization", stem_prefix),
-        act,
-        bc.stem3_stride,
-        (1, 1),
-        1,
-        eps,
-        if use_lab { Some(lab3.as_str()) } else { None },
-    )?;
-
-    let lab4 = format!("{}.stem4.lab", stem_prefix);
-    let stem4 = load_conv_bn_act(
-        params,
-        &format!("{}.stem4.convolution", stem_prefix),
-        &format!("{}.stem4.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab4.as_str()) } else { None },
-    )?;
-
-    let embedder = HGNetV2Embeddings::new(stem1, stem2a, stem2b, stem3, stem4);
-
-    // Load encoder stages
-    let mut stages = Vec::with_capacity(bc.num_stages());
-
-    for stage_idx in 0..bc.num_stages() {
-        let stage_prefix = format!("backbone.model.encoder.stages.{}", stage_idx);
-        let do_downsample = bc.stage_downsample[stage_idx];
-        let in_channels = bc.stage_in_channels[stage_idx];
-        let out_channels = bc.stage_out_channels[stage_idx];
-        let is_light = bc.stage_light_block[stage_idx];
-        let kernel_size = bc.stage_kernel_size[stage_idx];
-        let num_blocks = bc.stage_num_blocks[stage_idx] as usize;
-        let num_layers_per_block = bc.stage_numb_of_layers[stage_idx] as usize;
-        let mid_channels = bc.stage_mid_channels[stage_idx];
-        let stage_stride = bc.stage_strides.get(stage_idx).copied().unwrap_or((2, 2));
-
-        // Downsample conv (depthwise)
-        let downsample = if do_downsample {
-            let ds = load_conv_bn_act(
-                params,
-                &format!("{}.downsample.convolution", stage_prefix),
-                &format!("{}.downsample.normalization", stage_prefix),
-                "none",
-                stage_stride,
-                (1, 1),
-                in_channels,
-                eps,
-                None,
-            )?;
-            Some(ds)
-        } else {
-            None
-        };
-
-        // Load HGBlocks
-        let mut blocks = Vec::with_capacity(num_blocks);
-
-        for block_idx in 0..num_blocks {
-            let block_prefix = format!("{}.blocks.{}", stage_prefix, block_idx);
-            let is_first_block = block_idx == 0;
-
-            // Determine channels for this block
-            let block_in = if is_first_block {
-                in_channels
-            } else {
-                out_channels
-            };
-
-            // Load conv layers
-            let mut layers: Vec<HGBlockLayer> = Vec::with_capacity(num_layers_per_block);
-            for layer_idx in 0..num_layers_per_block {
-                let layer_prefix = format!("{}.layers.{}", block_prefix, layer_idx);
-                let layer_in = if layer_idx == 0 {
-                    block_in
-                } else {
-                    mid_channels
-                };
-                let kp = (kernel_size / 2, kernel_size / 2); // padding = k // 2
-
-                if is_light {
-                    // Light block: conv1 (1x1 pointwise, no activation) + conv2 (kxk depthwise)
-                    // HF: HGNetV2ConvLayerLight -> self.conv1 = HGNetV2ConvLayer, self.conv2 = HGNetV2ConvLayer
-                    // HGNetV2ConvLayer uses .convolution and .normalization
-                    let conv1 = load_conv_bn_act(
-                        params,
-                        &format!("{}.conv1.convolution", layer_prefix),
-                        &format!("{}.conv1.normalization", layer_prefix),
-                        "none",
-                        (1, 1),
-                        (0, 0),
-                        1,
-                        eps,
-                        None,
-                    )?;
-                    let conv2_lab = format!("{}.conv2.lab", layer_prefix);
-                    let conv2 = load_conv_bn_act(
-                        params,
-                        &format!("{}.conv2.convolution", layer_prefix),
-                        &format!("{}.conv2.normalization", layer_prefix),
-                        act,
-                        (1, 1),
-                        kp,
-                        mid_channels,
-                        eps,
-                        if use_lab {
-                            Some(conv2_lab.as_str())
-                        } else {
-                            None
-                        },
-                    )?;
-                    layers.push(HGBlockLayer::Light(ConvBNActLight::new(conv1, conv2)));
-                } else {
-                    // Standard conv
-                    // HF: HGNetV2ConvLayer uses .convolution and .normalization
-                    let _ = layer_in; // channels handled by the loaded weights
-                    let std_lab = format!("{}.lab", layer_prefix);
-                    let conv = load_conv_bn_act(
-                        params,
-                        &format!("{}.convolution", layer_prefix),
-                        &format!("{}.normalization", layer_prefix),
-                        act,
-                        (1, 1),
-                        kp,
-                        1,
-                        eps,
-                        if use_lab {
-                            Some(std_lab.as_str())
-                        } else {
-                            None
-                        },
-                    )?;
-                    layers.push(HGBlockLayer::Standard(conv));
-                }
-            }
-
-            // Aggregation: squeeze + excitation
-            // HF: self.aggregation = nn.Sequential(squeeze_conv, excitation_conv)
-            // Each is HGNetV2ConvLayer with .convolution, .normalization, .lab
-            let agg_prefix = format!("{}.aggregation", block_prefix);
-            let agg_lab0 = format!("{}.0.lab", agg_prefix);
-            let agg_squeeze = load_conv_bn_act(
-                params,
-                &format!("{}.0.convolution", agg_prefix),
-                &format!("{}.0.normalization", agg_prefix),
-                act,
-                (1, 1),
-                (0, 0),
-                1,
-                eps,
-                if use_lab {
-                    Some(agg_lab0.as_str())
-                } else {
-                    None
-                },
-            )?;
-            let agg_lab1 = format!("{}.1.lab", agg_prefix);
-            let agg_excitation = load_conv_bn_act(
-                params,
-                &format!("{}.1.convolution", agg_prefix),
-                &format!("{}.1.normalization", agg_prefix),
-                act,
-                (1, 1),
-                (0, 0),
-                1,
-                eps,
-                if use_lab {
-                    Some(agg_lab1.as_str())
-                } else {
-                    None
-                },
-            )?;
-
-            let residual = !is_first_block;
-            blocks.push(HGBlock::new(layers, agg_squeeze, agg_excitation, residual));
-        }
-
-        stages.push(HGNetV2Stage::new(downsample, blocks));
-    }
-
-    let encoder = HGNetV2Encoder::new(stages);
-    Ok(HGNetV2Backbone::new(embedder, encoder, bc))
 }
 
 // ============================================================================
@@ -512,15 +130,16 @@ fn load_hybrid_encoder(
     let mut lateral_convs = Vec::with_capacity(num_fpn);
     for i in 0..num_fpn {
         let prefix = format!("encoder.lateral_convs.{}", i);
-        let cnl = load_conv_norm_layer(
+        let cnl = load_conv_bn_act(
             params,
             &format!("{}.conv", prefix),
             &format!("{}.norm", prefix),
-            Some(act_fn),
+            act_fn,
             (1, 1),
             (0, 0),
             1,
             eps,
+            None,
         )?;
         lateral_convs.push(cnl);
     }
@@ -536,15 +155,16 @@ fn load_hybrid_encoder(
     let mut downsample_convs = Vec::with_capacity(num_fpn);
     for i in 0..num_fpn {
         let prefix = format!("encoder.downsample_convs.{}", i);
-        let cnl = load_conv_norm_layer(
+        let cnl = load_conv_bn_act(
             params,
             &format!("{}.conv", prefix),
             &format!("{}.norm", prefix),
-            Some(act_fn),
+            act_fn,
             (2, 2),
             (1, 1),
             1,
             eps,
+            None,
         )?;
         downsample_convs.push(cnl);
     }
@@ -562,7 +182,7 @@ fn load_hybrid_encoder(
     // Load encoder_mask_lateral
     // HF: PPDocLayoutV3ConvLayer uses .convolution and .normalization
     // This is a 3x3 conv so padding = (kernel_size - 1) / 2 = 1
-    let encoder_mask_lateral = load_conv_layer(
+    let encoder_mask_lateral = load_conv_bn_act(
         params,
         "encoder.encoder_mask_lateral.convolution",
         "encoder.encoder_mask_lateral.normalization",
@@ -571,11 +191,12 @@ fn load_hybrid_encoder(
         (1, 1),
         1,
         eps,
+        None,
     )?;
 
     // Load encoder_mask_output
     // HF: PPDocLayoutV3EncoderMaskOutput.base_conv = PPDocLayoutV3ConvLayer (uses .convolution, .normalization)
-    let base_conv = load_conv_layer(
+    let base_conv = load_conv_bn_act(
         params,
         "encoder.encoder_mask_output.base_conv.convolution",
         "encoder.encoder_mask_output.base_conv.normalization",
@@ -584,6 +205,7 @@ fn load_hybrid_encoder(
         (1, 1),
         1,
         eps,
+        None,
     )?;
     let mask_output_conv = load_conv2d(
         params,
@@ -615,25 +237,27 @@ fn load_csp_rep_layer(
     act_fn: &str,
     eps: f64,
 ) -> Result<CSPRepLayer> {
-    let conv1 = load_conv_norm_layer(
+    let conv1 = load_conv_bn_act(
         params,
         &format!("{}.conv1.conv", prefix),
         &format!("{}.conv1.norm", prefix),
-        Some(act_fn),
+        act_fn,
         (1, 1),
         (0, 0),
         1,
         eps,
+        None,
     )?;
-    let conv2 = load_conv_norm_layer(
+    let conv2 = load_conv_bn_act(
         params,
         &format!("{}.conv2.conv", prefix),
         &format!("{}.conv2.norm", prefix),
-        Some(act_fn),
+        act_fn,
         (1, 1),
         (0, 0),
         1,
         eps,
+        None,
     )?;
 
     // Load bottleneck RepVGG blocks
@@ -644,25 +268,27 @@ fn load_csp_rep_layer(
         if !params.contains_key(&key) {
             break;
         }
-        let rep_conv1 = load_conv_norm_layer(
+        let rep_conv1 = load_conv_bn_act(
             params,
             &format!("{}.bottlenecks.{}.conv1.conv", prefix, idx),
             &format!("{}.bottlenecks.{}.conv1.norm", prefix, idx),
-            None,
+            "none",
             (1, 1),
             (1, 1),
             1,
             eps,
+            None,
         )?;
-        let rep_conv2 = load_conv_norm_layer(
+        let rep_conv2 = load_conv_bn_act(
             params,
             &format!("{}.bottlenecks.{}.conv2.conv", prefix, idx),
             &format!("{}.bottlenecks.{}.conv2.norm", prefix, idx),
-            None,
+            "none",
             (1, 1),
             (0, 0),
             1,
             eps,
+            None,
         )?;
         bottlenecks.push(RepVggBlock::new(rep_conv1, rep_conv2, act_fn));
         idx += 1;
@@ -671,15 +297,16 @@ fn load_csp_rep_layer(
     // Optional conv3
     let conv3_key = format!("{}.conv3.conv.weight", prefix);
     let conv3 = if params.contains_key(&conv3_key) {
-        Some(load_conv_norm_layer(
+        Some(load_conv_bn_act(
             params,
             &format!("{}.conv3.conv", prefix),
             &format!("{}.conv3.norm", prefix),
-            Some(act_fn),
+            act_fn,
             (1, 1),
             (0, 0),
             1,
             eps,
+            None,
         )?)
     } else {
         None
@@ -720,7 +347,7 @@ fn load_mask_feat_fpn(
         if num_scale_layers == 0 {
             // Single conv, no upsample
             // HF: PPDocLayoutV3ScaleHead.layers[0] = PPDocLayoutV3ConvLayer (uses .convolution, .normalization)
-            let conv = load_conv_layer(
+            let conv = load_conv_bn_act(
                 params,
                 &format!(
                     "encoder.mask_feature_head.scale_heads.{}.layers.0.convolution",
@@ -735,12 +362,13 @@ fn load_mask_feat_fpn(
                 (1, 1),
                 1,
                 eps,
+                None,
             )?;
             layers.push(ScaleHeadLayer::Conv(conv));
         } else {
             for j in 0..num_scale_layers {
                 // HF: layers[j*2] = PPDocLayoutV3ConvLayer, layers[j*2+1] = nn.Upsample
-                let conv = load_conv_layer(
+                let conv = load_conv_bn_act(
                     params,
                     &format!(
                         "encoder.mask_feature_head.scale_heads.{}.layers.{}.convolution",
@@ -757,6 +385,7 @@ fn load_mask_feat_fpn(
                     (1, 1),
                     1,
                     eps,
+                    None,
                 )?;
                 layers.push(ScaleHeadLayer::Conv(conv));
                 layers.push(ScaleHeadLayer::Upsample);
@@ -768,7 +397,7 @@ fn load_mask_feat_fpn(
 
     // Output conv
     // HF: PPDocLayoutV3ConvLayer uses .convolution and .normalization
-    let output_conv = load_conv_layer(
+    let output_conv = load_conv_bn_act(
         params,
         "encoder.mask_feature_head.output_conv.convolution",
         "encoder.mask_feature_head.output_conv.normalization",
@@ -777,6 +406,7 @@ fn load_mask_feat_fpn(
         (1, 1),
         1,
         eps,
+        None,
     )?;
 
     Ok(MaskFeatFPN::new(reorder_index, scale_heads, output_conv))
@@ -946,16 +576,7 @@ pub fn load_model(model_path: &str) -> Result<PPDocLayoutV3Model> {
     }
 
     // Load weights
-    let weights_path = path.join("model.safetensors");
-    if !weights_path.exists() {
-        return Err(Error::from_reason(format!(
-            "Weights file not found: {}",
-            weights_path.display()
-        )));
-    }
-
-    let st_file = SafeTensorsFile::load(&weights_path)?;
-    let raw_params = st_file.load_tensors(&weights_path)?;
+    let raw_params = load_all_safetensors(path, false)?;
 
     // Strip "model." prefix from all keys
     let mut params: HashMap<String, MxArray> = HashMap::with_capacity(raw_params.len());
@@ -965,7 +586,13 @@ pub fn load_model(model_path: &str) -> Result<PPDocLayoutV3Model> {
     }
 
     // Build all components
-    let backbone = load_backbone(&params, &config)?;
+    let backbone = load_hgnetv2_backbone(
+        &params,
+        &config.backbone_config,
+        "backbone.model.embedder",
+        "backbone.model.encoder.stages",
+        config.batch_norm_eps,
+    )?;
 
     // Encoder input projections (3 levels: stages 2, 3, 4)
     let mut encoder_input_proj = Vec::with_capacity(3);

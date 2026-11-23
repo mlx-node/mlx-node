@@ -441,59 +441,11 @@ fn bilinear_interp_posemb(
         return Ok(table_f32);
     }
 
-    let n_dst = dst_h * dst_w;
-    let max_idx = (src_grid - 1) as f32;
-    let src_f = src_grid as f32;
-
-    let mut idx00 = Vec::with_capacity(n_dst);
-    let mut idx01 = Vec::with_capacity(n_dst);
-    let mut idx10 = Vec::with_capacity(n_dst);
-    let mut idx11 = Vec::with_capacity(n_dst);
-    let mut w00 = Vec::with_capacity(n_dst);
-    let mut w01 = Vec::with_capacity(n_dst);
-    let mut w10 = Vec::with_capacity(n_dst);
-    let mut w11 = Vec::with_capacity(n_dst);
-
-    for iy in 0..dst_h {
-        let fy = (src_f * (iy as f32 + 0.5) / (dst_h as f32) - 0.5).clamp(0.0, max_idx);
-        let y0 = (fy.floor() as usize).min(src_grid - 1);
-        let y1 = (y0 + 1).min(src_grid - 1);
-        let wy = fy - y0 as f32;
-        for ix in 0..dst_w {
-            let fx = (src_f * (ix as f32 + 0.5) / (dst_w as f32) - 0.5).clamp(0.0, max_idx);
-            let x0 = (fx.floor() as usize).min(src_grid - 1);
-            let x1 = (x0 + 1).min(src_grid - 1);
-            let wx = fx - x0 as f32;
-
-            idx00.push((y0 * src_grid + x0) as i32);
-            idx01.push((y0 * src_grid + x1) as i32);
-            idx10.push((y1 * src_grid + x0) as i32);
-            idx11.push((y1 * src_grid + x1) as i32);
-
-            w00.push((1.0 - wy) * (1.0 - wx));
-            w01.push((1.0 - wy) * wx);
-            w10.push(wy * (1.0 - wx));
-            w11.push(wy * wx);
-        }
-    }
-
-    let n_i64 = n_dst as i64;
-    let i00 = MxArray::from_int32(&idx00, &[n_i64])?;
-    let i01 = MxArray::from_int32(&idx01, &[n_i64])?;
-    let i10 = MxArray::from_int32(&idx10, &[n_i64])?;
-    let i11 = MxArray::from_int32(&idx11, &[n_i64])?;
-
-    let fw00 = MxArray::from_float32(&w00, &[n_i64, 1])?;
-    let fw01 = MxArray::from_float32(&w01, &[n_i64, 1])?;
-    let fw10 = MxArray::from_float32(&w10, &[n_i64, 1])?;
-    let fw11 = MxArray::from_float32(&w11, &[n_i64, 1])?;
-
-    let p00 = table_f32.take(&i00, 0)?.mul(&fw00)?;
-    let p01 = table_f32.take(&i01, 0)?.mul(&fw01)?;
-    let p10 = table_f32.take(&i10, 0)?.mul(&fw10)?;
-    let p11 = table_f32.take(&i11, 0)?.mul(&fw11)?;
-
-    p00.add(&p01)?.add(&p10)?.add(&p11)
+    let hidden_dim = table_f32.shape_at(1)?;
+    let table_2d = table_f32.reshape(&[src_grid as i64, src_grid as i64, hidden_dim])?;
+    let interp =
+        crate::vision::interpolate::bilinear_interpolate(&table_2d, dst_h as i64, dst_w as i64)?;
+    interp.reshape(&[(dst_h * dst_w) as i64, hidden_dim])
 }
 
 /// Build 2D interleaved axial RoPE `(cos, sin)` tables `[h_p * w_p + 1, 1, head_dim / 2]` in FP32.

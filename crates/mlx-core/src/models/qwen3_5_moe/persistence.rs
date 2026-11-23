@@ -40,7 +40,6 @@ use crate::vision::qwen::processing::QwenImageProcessor;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
 use super::model::{Qwen3_5MoeModel, Qwen35MoeInner};
-use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
@@ -51,8 +50,9 @@ use crate::models::quantized_linear::{
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
-    try_build_sym8_quantized_linear,
+    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
+use crate::moe::SwitchGLU;
 
 /// Sanitize weights from HuggingFace format.
 pub(crate) fn sanitize_weights(
@@ -442,25 +442,6 @@ pub(crate) fn mtp_expert_keys(name: &str, has_individual_experts: bool) -> Vec<S
         return vec![tensor("down_proj")];
     }
     vec![name.to_string()]
-}
-
-pub(crate) fn try_build_quantized_switch_linear(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-    group_size: i32,
-    bits: i32,
-) -> Option<QuantizedSwitchLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
-    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
-    Some(QuantizedSwitchLinear::new(
-        weight.clone(),
-        scales.clone(),
-        biases,
-        group_size,
-        bits,
-        "affine".to_string(),
-    ))
 }
 
 /// Compute the fallback PLQs that `effective_plq_for` consults when no per-layer
@@ -3718,8 +3699,8 @@ mod tests {
 
     #[test]
     fn grouped_expert_tiling_preserves_registered_weight_bytes() {
-        use super::super::switch_glu::SwitchProj;
         use crate::models::quant_dispatch::kquant_untile_rows;
+        use crate::moe::SwitchProj;
 
         if !unsafe { mlx_sys::mlx_splash_moe_available() } {
             eprintln!("[skip] grouped MoE tiling requires the grouped Metal backend");

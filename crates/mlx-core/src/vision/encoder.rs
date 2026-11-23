@@ -356,6 +356,7 @@ impl VisionAttention {
 /// Vision MLP (internal)
 ///
 /// Feed-forward network for vision transformers with GELU activation.
+#[derive(Clone)]
 pub struct VisionMLP {
     /// First linear layer (expansion)
     fc1: Arc<Linear>,
@@ -564,6 +565,44 @@ impl VisionEncoderLayer {
         let mlp_output = self.mlp.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
+}
+
+/// Build cumulative per-image/frame segment boundaries from `grid_thw` for
+/// [`VisionEncoderLayer::forward_segmented`].
+///
+/// Validates that the cumulative boundaries cover `total_seq_len` exactly
+/// without overflowing `i64`.
+pub(crate) fn build_vision_segment_boundaries(
+    grid_thw: &MxArray,
+    total_seq_len: i64,
+) -> Result<Vec<i64>> {
+    let grid_data = grid_thw.to_int32()?;
+    let num_images = grid_thw.shape()?[0] as usize;
+
+    let mut segment_boundaries: Vec<i64> = vec![0];
+    for img_idx in 0..num_images {
+        let t = i64::from(grid_data[img_idx * 3]);
+        let h_dim = i64::from(grid_data[img_idx * 3 + 1]);
+        let w_dim = i64::from(grid_data[img_idx * 3 + 2]);
+        let segment_len = h_dim
+            .checked_mul(w_dim)
+            .ok_or_else(|| Error::from_reason("Vision segment length overflow"))?;
+        for _ in 0..t {
+            let prev = *segment_boundaries.last().unwrap_or(&0);
+            segment_boundaries.push(
+                prev.checked_add(segment_len).ok_or_else(|| {
+                    Error::from_reason("Vision cumulative segment length overflow")
+                })?,
+            );
+        }
+    }
+    if segment_boundaries.last().copied() != Some(total_seq_len) {
+        return Err(Error::from_reason(format!(
+            "Vision grid covers {} patches but patch embedding produced {total_seq_len}",
+            segment_boundaries.last().copied().unwrap_or(0),
+        )));
+    }
+    Ok(segment_boundaries)
 }
 
 impl Clone for VisionEncoderLayer {

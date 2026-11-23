@@ -13,8 +13,8 @@ pub mod processing;
 pub mod vision;
 
 // Re-export public items used cross-module
-pub use language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb_interleaved};
-pub use persistence::load_paddleocr_vl_weights;
-pub use processing::{
+pub use crate::vision::processing::{
     ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images, smart_resize,
 };
+pub use crate::vision::rope_vision::{MultimodalRoPE, apply_multimodal_rotary_pos_emb_interleaved};
+pub use persistence::load_paddleocr_vl_weights;

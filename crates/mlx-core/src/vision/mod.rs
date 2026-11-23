@@ -17,10 +17,12 @@
 //! - `SpatialProjector` - Projects vision features to language model dimension
 //! - `bilinear_interpolate` - GPU-accelerated image resizing
 
+pub mod cnn;
 pub mod conv2d;
 pub mod embeddings;
 pub mod encoder;
 pub mod interpolate;
+pub mod processing;
 pub mod projector;
 pub mod qwen;
 pub mod rope_vision;
@@ -30,5 +32,13 @@ pub use conv2d::Conv2d;
 pub use embeddings::{PatchEmbedding, VisionPositionEmbedding};
 pub use encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 pub use interpolate::bilinear_interpolate;
+pub use processing::{
+    ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images,
+    extract_image_patches, smart_resize,
+};
 pub use projector::SpatialProjector;
-pub use rope_vision::{VisionRotaryEmbedding, apply_rotary_pos_emb_vision};
+pub use rope_vision::{
+    MultimodalRoPE, VisionRotaryEmbedding, apply_interleaved_rotary,
+    apply_multimodal_rotary_pos_emb_interleaved, apply_rotary_pos_emb_vision,
+    compute_rot_pos_emb_2d, rotate_half, select_interleaved_cos_sin,
+};

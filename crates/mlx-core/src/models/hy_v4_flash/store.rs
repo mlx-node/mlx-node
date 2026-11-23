@@ -47,7 +47,7 @@ use super::weights::{
     Form, MmapDense, Resident, form, mmap_dense_saved_bytes, mmap_dense_spec, role_resident,
 };
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::models::deepseek_v41::store::POOL_LIMIT;
+use crate::models::moe_common::POOL_LIMIT;
 use crate::moe_stream::budget::{
     Admission, Bound, DSV41, Limits, ModelSize, Own, Profile, Terms, Turn, admit_with,
     readmit_with, working_set,

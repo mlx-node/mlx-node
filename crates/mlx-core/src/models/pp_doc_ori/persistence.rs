@@ -9,16 +9,16 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::persistence::{get_tensor, load_conv2d, load_frozen_bn};
-use crate::utils::safetensors::SafeTensorsFile;
+use crate::engine::persistence::load_all_safetensors;
+use crate::vision::cnn::{ConvBNAct, get_tensor, load_conv_bn_act, load_conv2d};
 
 use super::config::PPLCNetConfig;
 use super::model::{
-    ClassificationHead, ConvBNLayer, DepthwiseSeparable, DocOrientationModel, PPLCNetBackbone,
-    SEModule, create_model,
+    ClassificationHead, DepthwiseSeparable, DocOrientationModel, PPLCNetBackbone, SEModule,
+    create_model,
 };
 
-/// Load a ConvBNLayer (Conv + BN, activation applied externally).
+/// Load a PP-LCNet Conv + BN + HardSwish layer.
 fn load_conv_bn_layer(
     params: &HashMap<String, MxArray>,
     prefix: &str,
@@ -26,18 +26,18 @@ fn load_conv_bn_layer(
     padding: (i32, i32),
     groups: i32,
     eps: f64,
-) -> Result<ConvBNLayer> {
-    let conv = load_conv2d(
+) -> Result<ConvBNAct> {
+    load_conv_bn_act(
         params,
         &format!("{}.conv", prefix),
+        &format!("{}.bn", prefix),
+        "hardswish",
         stride,
         padding,
-        (1, 1),
         groups,
-        false, // no bias, BN handles it
-    )?;
-    let bn = load_frozen_bn(params, &format!("{}.bn", prefix), eps)?;
-    Ok(ConvBNLayer::new(conv, bn))
+        eps,
+        None,
+    )
 }
 
 /// Load an SEModule (two 1x1 convs with bias).
@@ -122,16 +122,7 @@ pub fn load_model(model_path: &str) -> Result<DocOrientationModel> {
     let eps = 1e-5; // BatchNorm epsilon
 
     // Load weights
-    let weights_path = path.join("model.safetensors");
-    if !weights_path.exists() {
-        return Err(Error::from_reason(format!(
-            "Weights file not found: {}",
-            weights_path.display()
-        )));
-    }
-
-    let st_file = SafeTensorsFile::load(&weights_path)?;
-    let params = st_file.load_tensors(&weights_path)?;
+    let params = load_all_safetensors(path, false)?;
 
     // Build backbone
     // Stem: conv1 (3x3, stride=2, 3->16 channels)

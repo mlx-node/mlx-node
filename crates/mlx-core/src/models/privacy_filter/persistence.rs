@@ -20,9 +20,9 @@
 //! [`QuantizationConfig`] (top-level defaults + per-tensor overrides).
 //! Each projection's resolved params drive how its weight is loaded:
 //! quantized projections come with companion `.scales` (and optional
-//! `.biases`) tensors which are bound into [`LoadedProj::Quantized`]
-//! variants. Unquantized projections (and entire bf16 checkpoints)
-//! resolve to [`LoadedProj::Plain`].
+//! `.biases`) tensors which are bound into quantized [`LinearProj`] /
+//! [`SwitchProj`] variants. Unquantized projections (and entire bf16
+//! checkpoints) resolve to their standard variants.
 //!
 //! The override map in `config.json` is exhaustive — every quantized
 //! tensor is listed, even when its parameters match the top-level
@@ -40,24 +40,24 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::moe::{RouterConfig, RoutingMode, TopKRouter};
+use crate::models::quant_dispatch::{
+    PerLayerMode, mode_to_str, normalize_per_layer_key, parse_quant_settings,
+    select_quantization_block,
+};
+use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj};
+use crate::moe::{RouterConfig, RoutingMode, SwitchProj, TopKRouter};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::config::PrivacyFilterConfig;
-use super::quantized_linear::{LoadedProj, TensorQuantParams};
+use super::quantized_linear::{TensorQuantParams, load_linear_proj, load_moe_proj};
 use super::viterbi::Calibration;
 
 /// Parsed `quantization` block from `config.json`.
 ///
-/// `defaults` holds the top-level `bits` / `group_size` / `mode` and
-/// applies to any tensor whose canonical prefix appears in
-/// `overrides` without an explicit override (rare — the privacy-filter
-/// convert pipeline always emits an explicit override per quantized
-/// tensor, but we honour the inheritance rule for forward compat with
-/// hand-written configs). `overrides` enumerates every quantized
-/// tensor by its canonical prefix (e.g.
-/// `"model.layers.0.self_attn.q_proj"`).
+/// `defaults` holds the top-level `bits` / `group_size` / `mode`. `overrides`
+/// enumerates every quantized tensor keyed by its normalized prefix (via
+/// [`normalize_per_layer_key`]).
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
     pub defaults: TensorQuantParams,
@@ -65,56 +65,25 @@ pub struct QuantizationConfig {
 }
 
 fn parse_quantization_config(cfg_value: &serde_json::Value) -> Result<Option<QuantizationConfig>> {
-    let Some(block) = cfg_value.get("quantization").and_then(|v| v.as_object()) else {
+    let Some(block) = select_quantization_block(cfg_value)? else {
         return Ok(None);
     };
-    let bits =
-        block.get("bits").and_then(|v| v.as_i64()).ok_or_else(|| {
-            Error::from_reason("config.json: quantization.bits missing or not int")
-        })? as i32;
-    let group_size = block
-        .get("group_size")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            Error::from_reason("config.json: quantization.group_size missing or not int")
-        })? as i32;
-    let mode = block
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::from_reason("config.json: quantization.mode missing or not str"))?
-        .to_string();
-
-    let mut overrides = HashMap::new();
-    for (key, val) in block {
-        if matches!(key.as_str(), "bits" | "group_size" | "mode") {
-            continue;
-        }
-        // Per-tensor override keyed by canonical module prefix.
-        let Some(obj) = val.as_object() else {
-            continue;
-        };
-        let ov_bits = obj
-            .get("bits")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(bits as i64) as i32;
-        let ov_group = obj
-            .get("group_size")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(group_size as i64) as i32;
-        let ov_mode = obj
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or(mode.as_str())
-            .to_string();
-        overrides.insert(
-            key.clone(),
-            TensorQuantParams {
-                bits: ov_bits,
-                group_size: ov_group,
-                mode: ov_mode,
-            },
-        );
-    }
+    let (bits, group_size, top_level_mode, per_layer) =
+        parse_quant_settings(Some(block), DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
+    let mode = mode_to_str(top_level_mode.unwrap_or(PerLayerMode::Affine)).to_string();
+    let overrides = per_layer
+        .into_iter()
+        .map(|(k, plq)| {
+            (
+                k,
+                TensorQuantParams {
+                    bits: plq.bits,
+                    group_size: plq.group_size,
+                    mode: mode_to_str(plq.mode).to_string(),
+                },
+            )
+        })
+        .collect();
 
     Ok(Some(QuantizationConfig {
         defaults: TensorQuantParams {
@@ -166,10 +135,10 @@ pub struct LayerWeights {
 }
 
 pub struct AttnWeights {
-    pub q_proj: LoadedProj,
-    pub k_proj: LoadedProj,
-    pub v_proj: LoadedProj,
-    pub o_proj: LoadedProj,
+    pub q_proj: LinearProj,
+    pub k_proj: LinearProj,
+    pub v_proj: LinearProj,
+    pub o_proj: LinearProj,
     /// Per-query-head attention sinks. Always stored as f32 in the
     /// checkpoint (every other tensor is bf16) — kept in its native
     /// dtype because the attention kernel concatenates the sink as a
@@ -178,12 +147,12 @@ pub struct AttnWeights {
 }
 
 /// Router projection — either the original [`TopKRouter`] for plain
-/// (bf16) checkpoints, or a [`LoadedProj::Quantized`] that we score
+/// (bf16) checkpoints, or a quantized [`LinearProj`] that we score
 /// manually before feeding the logits into [`crate::moe::topk_from_logits`].
 pub enum LoadedRouter {
     Plain(TopKRouter),
     Quantized {
-        proj: LoadedProj,
+        proj: LinearProj,
         config: RouterConfig,
     },
 }
@@ -200,13 +169,13 @@ impl LoadedRouter {
 pub struct MlpWeights {
     pub router: LoadedRouter,
     /// `[E, hidden, 2*intermediate]` (plain) or `[E, hidden, packed]`
-    /// (quantized) — fused gate+up projection per expert.
-    pub gate_up_proj: LoadedProj,
+    /// (quantized, `transpose = false`) — fused gate+up projection per expert.
+    pub gate_up_proj: SwitchProj,
     /// `[E, 2*intermediate]` — gate+up bias per expert. Never quantized.
     pub gate_up_bias: MxArray,
     /// `[E, intermediate, hidden]` (plain) or `[E, intermediate, packed]`
-    /// (quantized) — down projection per expert.
-    pub down_proj: LoadedProj,
+    /// (quantized, `transpose = false`) — down projection per expert.
+    pub down_proj: SwitchProj,
     /// `[E, hidden]` — down projection bias per expert. Never quantized.
     pub down_bias: MxArray,
 }
@@ -298,7 +267,11 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
     // `None` for plain bf16 tensors.
     let quant_for = |prefix: &str| -> Option<TensorQuantParams> {
         let q = quantization.as_ref()?;
-        q.overrides.get(prefix).cloned()
+        let normalized = normalize_per_layer_key(prefix);
+        q.overrides
+            .get(&normalized)
+            .or_else(|| q.overrides.get(prefix))
+            .cloned()
     };
 
     // ---- 3. Top-level weights ----
@@ -324,7 +297,7 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
             mode: RoutingMode::GptOss,
         };
         let router = if router_quant.is_some() {
-            let proj = LoadedProj::from_tensors(
+            let proj = load_linear_proj(
                 &tensors,
                 &router_prefix,
                 Some(&format!("{router_prefix}.bias")),
@@ -344,25 +317,25 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
         let k_prefix = format!("{p}.self_attn.k_proj");
         let v_prefix = format!("{p}.self_attn.v_proj");
         let o_prefix = format!("{p}.self_attn.o_proj");
-        let q_proj = LoadedProj::from_tensors(
+        let q_proj = load_linear_proj(
             &tensors,
             &q_prefix,
             Some(&format!("{q_prefix}.bias")),
             quant_for(&q_prefix).as_ref(),
         )?;
-        let k_proj = LoadedProj::from_tensors(
+        let k_proj = load_linear_proj(
             &tensors,
             &k_prefix,
             Some(&format!("{k_prefix}.bias")),
             quant_for(&k_prefix).as_ref(),
         )?;
-        let v_proj = LoadedProj::from_tensors(
+        let v_proj = load_linear_proj(
             &tensors,
             &v_prefix,
             Some(&format!("{v_prefix}.bias")),
             quant_for(&v_prefix).as_ref(),
         )?;
-        let o_proj = LoadedProj::from_tensors(
+        let o_proj = load_linear_proj(
             &tensors,
             &o_prefix,
             Some(&format!("{o_prefix}.bias")),
@@ -373,18 +346,12 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
         // `<prefix>_bias` (not `<prefix>.bias`) and are never quantized.
         let gate_up_prefix = format!("{p}.mlp.experts.gate_up_proj");
         let down_prefix = format!("{p}.mlp.experts.down_proj");
-        let gate_up_proj = LoadedProj::from_tensors(
+        let gate_up_proj = load_moe_proj(
             &tensors,
             &gate_up_prefix,
-            None,
             quant_for(&gate_up_prefix).as_ref(),
         )?;
-        let down_proj = LoadedProj::from_tensors(
-            &tensors,
-            &down_prefix,
-            None,
-            quant_for(&down_prefix).as_ref(),
-        )?;
+        let down_proj = load_moe_proj(&tensors, &down_prefix, quant_for(&down_prefix).as_ref())?;
         let gate_up_bias = take(&format!("{p}.mlp.experts.gate_up_proj_bias"))?;
         let down_bias = take(&format!("{p}.mlp.experts.down_proj_bias"))?;
 
@@ -477,13 +444,6 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn proj_weight(p: &LoadedProj) -> &MxArray {
-        match p {
-            LoadedProj::Plain { weight, .. } => weight,
-            LoadedProj::Quantized { weight, .. } => weight,
-        }
-    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| (*x).to_string()).collect()
@@ -584,13 +544,13 @@ mod tests {
         assert!(loaded.quantization.is_none());
 
         let l0 = &loaded.weights.layers[0];
-        let q_shape: Vec<i64> = proj_weight(&l0.self_attn.q_proj).shape().unwrap().to_vec();
+        let q_shape: Vec<i64> = l0.self_attn.q_proj.get_weight().shape().unwrap().to_vec();
         assert_eq!(q_shape, vec![896, 640]);
         let sinks_shape: Vec<i64> = l0.self_attn.sinks.shape().unwrap().to_vec();
         assert_eq!(sinks_shape, vec![14]);
-        let gate_up_shape: Vec<i64> = proj_weight(&l0.mlp.gate_up_proj).shape().unwrap().to_vec();
+        let gate_up_shape: Vec<i64> = l0.mlp.gate_up_proj.weight_ref().shape().unwrap().to_vec();
         assert_eq!(gate_up_shape, vec![128, 640, 1280]);
-        let down_shape: Vec<i64> = proj_weight(&l0.mlp.down_proj).shape().unwrap().to_vec();
+        let down_shape: Vec<i64> = l0.mlp.down_proj.weight_ref().shape().unwrap().to_vec();
         assert_eq!(down_shape, vec![128, 640, 640]);
 
         let embed_shape: Vec<i64> = loaded.weights.embed_tokens.shape().unwrap().to_vec();
@@ -621,15 +581,13 @@ mod tests {
         // For 8-bit mxfp8, pack factor is 4 (u32 / 8b = 4 elements/u32),
         // so the packed last-dim is 640 / 4 = 160.
         match &l0.self_attn.q_proj {
-            LoadedProj::Quantized {
-                weight, bits, mode, ..
-            } => {
-                assert_eq!(*bits, 8);
-                assert_eq!(mode, "mxfp8");
-                let shape: Vec<i64> = weight.shape().unwrap().to_vec();
+            LinearProj::Quantized(ql) => {
+                assert_eq!(ql.bits(), 8);
+                assert_eq!(ql.mode(), "mxfp8");
+                let shape: Vec<i64> = ql.get_weight().shape().unwrap().to_vec();
                 assert_eq!(shape, vec![896, 160]);
             }
-            LoadedProj::Plain { .. } => panic!("expected mxfp8 q_proj to be quantized"),
+            LinearProj::Standard(_) => panic!("expected mxfp8 q_proj to be quantized"),
         }
 
         // Router stays bf16 in fp-mode checkpoints.

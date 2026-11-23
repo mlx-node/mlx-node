@@ -23,13 +23,13 @@ use napi::Either;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use super::backbone::HGNetV2Backbone;
 use super::config::PPDocLayoutV3Config;
 use super::decoder::{Decoder, inverse_sigmoid, mask_to_box_coordinate};
 use super::encoder::{HybridEncoder, InputProjection};
 use super::heads::{GlobalPointer, MLPPredictionHead};
 use super::postprocessing::{LayoutElement, postprocess_detection};
 use super::processing::PPDocLayoutV3ImageProcessor;
+use crate::vision::cnn::HGNetV2Backbone;
 
 /// PP-DocLayoutV3 full model for document layout analysis.
 ///

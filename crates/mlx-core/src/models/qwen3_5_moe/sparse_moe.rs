@@ -1,11 +1,10 @@
 use crate::array::MxArray;
-use crate::moe::{RoutingMode, topk_from_logits};
+use crate::moe::{RoutingMode, SwitchGLU, topk_from_logits};
 use crate::nn::{Activations, Linear};
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5MoeConfig;
-use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.

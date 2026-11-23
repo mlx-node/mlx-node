@@ -503,7 +503,7 @@ fn apply_weights(
     let n_routed_experts = inner.config.n_routed_experts as i64;
     let try_build_qsl = |params: &HashMap<String, MxArray>,
                          prefix: &str|
-     -> Result<Option<(QuantizedSwitchLinear, MxArray)>> {
+     -> Result<Option<QuantizedSwitchLinear>> {
         let plq = plq_for(prefix);
         if plq.mode != PerLayerMode::Nvfp4 {
             return Ok(None);
@@ -512,7 +512,7 @@ fn apply_weights(
             return Ok(None);
         };
         let gs = require_expert_global_scale(params, prefix, n_routed_experts)?;
-        Ok(Some((qsl, gs)))
+        Ok(Some(qsl.with_outer_scale(gs)))
     };
 
     let emb = params.get("embedding.weight").ok_or_else(|| {
@@ -712,13 +712,10 @@ fn apply_weights(
         try_build_qsl: &F,
     ) -> Result<Option<super::sparse_moe::ExpertProj>>
     where
-        F: Fn(&HashMap<String, MxArray>, &str) -> Result<Option<(QuantizedSwitchLinear, MxArray)>>,
+        F: Fn(&HashMap<String, MxArray>, &str) -> Result<Option<QuantizedSwitchLinear>>,
     {
-        if let Some((qsl, global_scale)) = try_build_qsl(params, key)? {
-            return Ok(Some(super::sparse_moe::ExpertProj::Quantized(
-                qsl,
-                global_scale,
-            )));
+        if let Some(qsl) = try_build_qsl(params, key)? {
+            return Ok(Some(super::sparse_moe::ExpertProj::Quantized(qsl)));
         }
         if let Some(w) = params.get(&format!("{}.weight", key)) {
             crate::models::quant_dispatch::ensure_dense_weight_floating(

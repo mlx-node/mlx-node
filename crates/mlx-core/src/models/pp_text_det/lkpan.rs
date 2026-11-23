@@ -28,7 +28,7 @@ use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use napi::bindgen_prelude::*;
 
-use crate::models::pp_doclayout_v3::backbone::{FrozenBatchNorm2d, NativeConv2d};
+use crate::vision::cnn::{FrozenBatchNorm2d, NativeConv2d};
 
 // ============================================================================
 // IntraCLBlock

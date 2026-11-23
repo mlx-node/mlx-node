@@ -24,9 +24,10 @@ use crate::sampling::{self, SamplingConfig};
 use crate::transformer::kv_cache::KVCache;
 use crate::utils::safetensors::load_safetensors_lazy;
 
+use crate::models::quantized_linear::LinearProj;
+
 use super::attention::Gemma4ProportionalRoPE;
 use super::mlp::GemmaMLP;
-use super::quantized_linear::LinearProj;
 
 /// Draft architecture name required in the checkpoint's `architectures` list.
 pub(crate) const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";

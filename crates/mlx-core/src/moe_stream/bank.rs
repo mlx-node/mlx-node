@@ -21,7 +21,8 @@ use std::time::Instant;
 
 use napi::{Error, Result};
 
-use super::cache::{Cache, Source};
+use super::cache::Cache;
+use super::directory::{Directory, Plan};
 use super::io::{BatchWatch, Extent, IoPool, IoStats, Priority, Read, Ticket};
 use super::repack::SlotRepack;
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
@@ -110,8 +111,7 @@ pub struct Pending<'a> {
     bank: &'a StagingBank,
     ticket: Option<Ticket>,
     layer: usize,
-    staging: Vec<u32>,
-    victims: Vec<(u32, u32)>,
+    plan: Plan,
 }
 
 impl Pending<'_> {
@@ -129,22 +129,15 @@ impl Pending<'_> {
         let io: IoStats = match io {
             Ok(io) => io,
             Err(err) => {
-                self.victims.iter().for_each(|&(_, c)| g.cache.release(c));
+                g.dir.abandon(&self.plan);
                 return Err(err);
             }
         };
-        let n = bank.n_experts;
-        for &e in &self.staging {
-            let s = g.stage(self.layer, e, n);
-            g.tags[s] = Some((self.layer, e));
-        }
-        for &(e, c) in &self.victims {
-            g.cache.commit(c, self.layer, e);
-        }
+        g.dir.publish(self.layer, &self.plan);
         drop(g);
         let mut st = lock(&bank.stats);
         st.fills += 1;
-        st.slots += self.staging.len() + self.victims.len();
+        st.slots += self.plan.reads();
         st.bytes += io.bytes;
         st.ns += io.ns;
         st.wait_ns += waited;
@@ -158,7 +151,7 @@ impl Drop for Pending<'_> {
             // the slots stay unpublished: wait so no read outlives the step
             drop(ticket);
             let mut g = lock(&self.bank.inner);
-            self.victims.iter().for_each(|&(_, c)| g.cache.release(c));
+            g.dir.abandon(&self.plan);
         }
     }
 }
@@ -172,10 +165,7 @@ struct Ahead {
 
 struct Inner {
     proj: Vec<Proj>,
-    /// Staging layers (1 or 2).
-    staging: usize,
-    tags: Vec<Option<(usize, u32)>>,
-    cache: Cache,
+    dir: Directory,
     in_turn: bool,
     /// Buffers of banks dropped by `rebuild` that an array may still hold.
     retired: Vec<BankWatch>,
@@ -190,16 +180,6 @@ struct Inner {
 }
 
 impl Inner {
-    /// Staging slot of `(layer, e)`.
-    fn stage(&self, layer: usize, e: u32, n: usize) -> usize {
-        (layer % self.staging) * n + e as usize
-    }
-
-    /// First cache slot (bank index of cache slot 0).
-    fn base(&self, n: usize) -> u32 {
-        (self.staging * n) as u32
-    }
-
     /// Blocks until every read in flight is done (their slots may then be
     /// freed or rewritten).
     fn drain(&mut self) {
@@ -340,14 +320,13 @@ impl StagingBank {
             n_experts = shape[0];
         }
         let n = n_experts as usize;
-        let proj = alloc(first, (staging * n + cache_slots) as i64)?;
+        let dir = Directory::new(staging, layers.len(), n, cache_slots)?;
+        let proj = alloc(first, dir.total_slots() as i64)?;
         Ok(Self {
             pool,
             inner: Mutex::new(Inner {
                 proj,
-                staging,
-                tags: vec![None; staging * n],
-                cache: Cache::lru(cache_slots, layers.len(), n),
+                dir,
                 in_turn: true,
                 retired: Vec::new(),
                 inflight: Vec::new(),
@@ -370,7 +349,7 @@ impl StagingBank {
     }
 
     pub fn cache_slots(&self) -> usize {
-        lock(&self.inner).cache.slots()
+        lock(&self.inner).dir.cache().slots()
     }
 
     /// Bytes of one slot of every projection (MLX layout).
@@ -411,7 +390,7 @@ impl StagingBank {
     }
 
     pub fn tags(&self) -> Vec<Option<(usize, u32)>> {
-        lock(&self.inner).tags.clone()
+        lock(&self.inner).dir.tags().to_vec()
     }
 
     pub fn stats(&self) -> BankStats {
@@ -420,7 +399,7 @@ impl StagingBank {
 
     /// Runs `f` on the cache directory (diagnostics, tests).
     pub fn with_cache_dir<T>(&self, f: impl FnOnce(&Cache) -> T) -> T {
-        f(&lock(&self.inner).cache)
+        f(lock(&self.inner).dir.cache())
     }
 
     fn begin(&self, g: &mut Inner) -> Result<bool> {
@@ -431,10 +410,9 @@ impl StagingBank {
             }
         }
         if emptied {
-            g.tags.fill(None);
-            g.cache.clear();
+            g.dir.clear();
         }
-        g.cache.new_turn();
+        g.dir.new_turn();
         g.in_turn = true;
         Ok(emptied)
     }
@@ -465,23 +443,12 @@ impl StagingBank {
         self.settle_ahead(&mut g, |_| true);
         self.close_ahead_locked(&mut g, |_| true);
         g.drain();
-        g.cache.complete_all();
-        let n = self.n_experts;
+        g.dir.complete_all();
         let t0 = std::time::Instant::now();
-        let inner = &mut *g;
-        let tags = &inner.tags;
-        let stage = |l: usize, e: u32| (l % inner.staging) * n + e as usize;
-        let moved = inner
-            .cache
-            .promote_staged(&|l, e| tags[stage(l, e)] == Some((l, e)));
-        let base = inner.base(n) as usize;
-        for &(slot, l, e) in &moved {
-            copy_slot(
-                &inner.proj,
-                base + inner.cache.slots(),
-                stage(l, e),
-                base + slot as usize,
-            );
+        let total = g.dir.total_slots();
+        let moved = g.dir.promote();
+        for &(from, to) in &moved {
+            copy_slot(&g.proj, total, from as usize, to as usize);
         }
         if !moved.is_empty() {
             let mut st = lock(&self.stats);
@@ -519,7 +486,7 @@ impl StagingBank {
 
     /// `rebuild_staging` with the current staging layers.
     pub fn rebuild(&self, cache_slots: usize) -> Result<()> {
-        let staging = lock(&self.inner).staging;
+        let staging = lock(&self.inner).dir.staging_layers();
         self.rebuild_staging(cache_slots, staging)
     }
 
@@ -531,6 +498,7 @@ impl StagingBank {
         if !(1..=2).contains(&staging) {
             return Err(bad(format!("{staging} staging layers (1 or 2)")));
         }
+        let next_dir = Directory::new(staging, self.layers.len(), self.n_experts, cache_slots)?;
         let mut g = lock(&self.inner);
         crate::array::synchronize();
         self.settle_ahead(&mut g, |_| true);
@@ -545,8 +513,7 @@ impl StagingBank {
         // before any new bank is allocated
         g.retired.extend(watches);
         g.proj = Vec::new();
-        g.tags.fill(None);
-        g.cache = Cache::lru(0, self.layers.len(), self.n_experts);
+        g.dir = Directory::new(g.dir.staging_layers(), self.layers.len(), self.n_experts, 0)?;
         crate::array::clear_cache();
         g.retired.retain(|w| w.alive());
         if !g.retired.is_empty() {
@@ -554,13 +521,8 @@ impl StagingBank {
                 "an array still holds the old bank; a second bank is not allocated",
             ));
         }
-        g.staging = staging;
-        g.tags = vec![None; staging * self.n_experts];
-        g.proj = alloc(
-            &self.layers[0],
-            (staging * self.n_experts + cache_slots) as i64,
-        )?;
-        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts);
+        g.proj = alloc(&self.layers[0], next_dir.total_slots() as i64)?;
+        g.dir = next_dir;
         g.in_turn = true;
         Ok(())
     }
@@ -587,20 +549,11 @@ impl StagingBank {
         unsafe { self.pool.submit(reads, Priority::High) }?.wait()
     }
 
-    fn check_step(&self, g: &Inner, layer: usize, experts: &[u32]) -> Result<()> {
-        if layer >= self.layers.len() {
-            return Err(bad(format!("layer {layer} of {}", self.layers.len())));
-        }
+    fn check_step(&self, g: &Inner, layer: usize, experts: &[u32], uses: &[u32]) -> Result<()> {
         if g.proj.is_empty() {
             return Err(bad("no bank (a rebuild failed)"));
         }
-        if let Some(&e) = experts.iter().find(|&&e| e as usize >= self.n_experts) {
-            return Err(bad(format!("expert {e} of {}", self.n_experts)));
-        }
-        if experts.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(bad("experts must be sorted and distinct"));
-        }
-        Ok(())
+        g.dir.check_step(layer, experts, uses)
     }
 
     /// Slots for one layer step's distinct, sorted `experts`: cache hits
@@ -638,14 +591,7 @@ impl StagingBank {
         decode: bool,
     ) -> Result<(Prepared, Option<Pending<'_>>)> {
         let mut g = lock(&self.inner);
-        self.check_step(&g, layer, experts)?;
-        if !uses.is_empty() && uses.len() != experts.len() {
-            return Err(bad(format!(
-                "{} use counts for {} experts",
-                uses.len(),
-                experts.len()
-            )));
-        }
+        self.check_step(&g, layer, experts, uses)?;
         if !g.in_turn {
             self.begin(&mut g)?;
         }
@@ -669,69 +615,48 @@ impl StagingBank {
                 left.retain(|e| experts.binary_search(e).is_err());
             }
         }
-        let n = self.n_experts;
-        let base = g.base(n);
-        let inner = &mut *g;
-        let tags = &inner.tags;
-        let staging_n = inner.staging;
-        let stage = |e: u32| (layer % staging_n) * n + e as usize;
-        let (epoch, src) = inner.cache.plan_step(layer, experts, uses, decode, &|e| {
-            tags[stage(e)] == Some((layer, e))
-        });
-        let (mut slots, mut staging, mut victims, mut copies, mut hits) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
-        for (&e, s) in experts.iter().zip(&src) {
-            slots.push(match *s {
-                Source::Hit(c) => {
-                    hits += 1;
-                    base + c
-                }
-                Source::Victim(c) => {
-                    // a prefill seed whose staging copy is valid (a prefetch
-                    // or an earlier chunk) is copied, never read twice
-                    if staging_n == 2 && !decode && g.tags[stage(e)] == Some((layer, e)) {
-                        copies.push((e, c));
-                    } else {
-                        victims.push((e, c));
-                    }
-                    base + c
-                }
-                Source::Staging => {
-                    if g.tags[stage(e)] != Some((layer, e)) {
-                        staging.push(e);
-                    }
-                    stage(e) as u32
-                }
-            });
-        }
-        if !copies.is_empty() {
+        // a prefill seed whose staging copy is valid (a prefetch or an earlier
+        // chunk) is copied, never read twice, on two-staging-layer banks
+        let copy_staged = g.dir.staging_layers() == 2 && !decode;
+        let plan = g
+            .dir
+            .plan_with_staging_copy(layer, experts, uses, decode, copy_staged);
+        let base = g.dir.base();
+        if !plan.copies.is_empty() {
             crate::array::synchronize();
-            g.cache.complete_all();
+            g.dir.complete_all();
             let t0 = Instant::now();
-            let total = base as usize + g.cache.slots();
-            for &(e, c) in &copies {
-                copy_slot(&g.proj, total, stage(e), (base + c) as usize);
-                g.cache.commit(c, layer, e);
+            let total = g.dir.total_slots();
+            for &(e, c) in &plan.copies {
+                copy_slot(&g.proj, total, g.dir.stage(layer, e), (base + c) as usize);
             }
+            g.dir.commit_copies(layer, &plan);
             let mut st = lock(&self.stats);
-            st.promoted += copies.len();
+            st.promoted += plan.copies.len();
             st.promote_ns += t0.elapsed().as_nanos() as u64;
         }
         let mut pending = None;
         let mut reading = Vec::new();
         if self.skip_fill.load(Ordering::Relaxed) {
-            victims.iter().for_each(|&(_, c)| g.cache.release(c));
-        } else if !staging.is_empty() || !victims.is_empty() {
+            g.dir.abandon(&plan);
+        } else if plan.reads() > 0 {
             crate::array::synchronize();
-            g.cache.complete_all();
+            g.dir.complete_all();
             let mut reads = Vec::new();
-            for &e in &staging {
-                g.tags[stage(e)] = None;
-                self.reads(&g, layer, e, stage(e), &mut reads)?;
+            let build_reads = (|| -> Result<()> {
+                for &e in &plan.staging {
+                    self.reads(&g, layer, e, g.dir.stage(layer, e), &mut reads)?;
+                }
+                for &(e, c) in &plan.victims {
+                    self.reads(&g, layer, e, (base + c) as usize, &mut reads)?;
+                }
+                Ok(())
+            })();
+            if let Err(err) = build_reads {
+                g.dir.abandon(&plan);
+                return Err(err);
             }
-            for &(e, c) in &victims {
-                self.reads(&g, layer, e, (base + c) as usize, &mut reads)?;
-            }
+            g.dir.untag(layer, &plan);
             // SAFETY: every slot read is untagged (staging) or an unmapped
             // victim (cache), so no gather passes the slot checks on it until
             // `Pending::finish`; earlier GPU work was drained above, every
@@ -740,41 +665,49 @@ impl StagingBank {
             let ticket = match unsafe { self.pool.submit(reads, Priority::High) } {
                 Ok(t) => t,
                 Err(err) => {
-                    victims.iter().for_each(|&(_, c)| g.cache.release(c));
+                    g.dir.abandon(&plan);
                     return Err(err);
                 }
             };
             g.watch(&ticket);
-            reading = staging
+            reading = plan
+                .staging
                 .iter()
-                .chain(victims.iter().map(|(e, _)| e))
                 .copied()
+                .chain(plan.victims.iter().map(|&(e, _)| e))
                 .collect();
             reading.sort_unstable();
             pending = Some(Pending {
                 bank: self,
                 ticket: Some(ticket),
                 layer,
-                staging,
-                victims,
+                plan: Plan {
+                    epoch: plan.epoch,
+                    slots: Vec::new(),
+                    staging: plan.staging,
+                    victims: plan.victims,
+                    copies: Vec::new(),
+                    hits: plan.hits,
+                    drain: plan.drain,
+                },
             });
         }
         {
             let mut st = lock(&self.stats);
             st.uses += experts.len();
-            st.hits += hits;
+            st.hits += plan.hits;
             st.wait_ns += ahead_wait;
         }
         let p = Prepared {
             layer,
             experts: experts.to_vec(),
-            slots,
+            slots: plan.slots,
             arrays: g
                 .proj
                 .iter()
                 .map(|p| (p.w.array().clone(), p.s.array().clone()))
                 .collect(),
-            epoch,
+            epoch: plan.epoch,
             reading,
         };
         Ok((p, pending))
@@ -793,10 +726,10 @@ impl StagingBank {
             return Ok(0);
         }
         let mut g = lock(&self.inner);
-        if g.staging < 2 {
+        if g.dir.staging_layers() < 2 {
             return Ok(0);
         }
-        self.check_step(&g, layer, experts)?;
+        self.check_step(&g, layer, experts, &[])?;
         if !g.in_turn {
             self.begin(&mut g)?;
         }
@@ -804,24 +737,20 @@ impl StagingBank {
         // settled first: this layer's, older ones and, after a cancelled
         // forward, later ones writing the same half
         self.settle_ahead(&mut g, |l| l + 1 != layer);
-        let n = self.n_experts;
         let want: Vec<u32> = experts
             .iter()
             .copied()
-            .filter(|&e| {
-                g.cache.lookup(layer, e).is_none()
-                    && g.tags[g.stage(layer, e, n)] != Some((layer, e))
-            })
+            .filter(|&e| !g.dir.is_resident(layer, e))
             .collect();
         if want.is_empty() {
             return Ok(0);
         }
         crate::array::synchronize();
-        g.cache.complete_all();
+        g.dir.complete_all();
         let mut reads = Vec::new();
         for &e in &want {
-            let s = g.stage(layer, e, n);
-            g.tags[s] = None;
+            let s = g.dir.stage(layer, e);
+            g.dir.clear_tag(layer, e);
             self.reads(&g, layer, e, s, &mut reads)?;
         }
         // SAFETY: the slots are untagged (no gather passes the slot checks on
@@ -842,7 +771,6 @@ impl StagingBank {
     /// tags their slots; a failed prefetch tags nothing (a later step reads
     /// those experts).
     fn settle_ahead(&self, g: &mut Inner, pick: impl Fn(usize) -> bool) {
-        let n = self.n_experts;
         let (now, keep): (Vec<Ahead>, Vec<Ahead>) = std::mem::take(&mut g.ahead)
             .into_iter()
             .partition(|a| pick(a.layer));
@@ -851,8 +779,7 @@ impl StagingBank {
             match a.ticket.wait() {
                 Ok(io) => {
                     for &e in &a.experts {
-                        let s = g.stage(a.layer, e, n);
-                        g.tags[s] = Some((a.layer, e));
+                        g.dir.set_tag(a.layer, e);
                     }
                     {
                         let mut st = lock(&self.stats);
@@ -928,7 +855,7 @@ impl StagingBank {
 
     /// Staging layers in the bank.
     pub fn staging_layers(&self) -> usize {
-        lock(&self.inner).staging
+        lock(&self.inner).dir.staging_layers()
     }
 
     /// Test hook: every expert read sleeps `ms` first.
@@ -965,22 +892,12 @@ impl StagingBank {
         self.settle_ahead(&mut g, |_| true);
         self.close_ahead_locked(&mut g, |_| true);
         g.drain();
-        for t in g.tags.iter_mut() {
-            if t.is_some_and(|(l, e)| f(l, e)) {
-                *t = None;
-            }
-        }
-        let gone: Vec<u32> = (0..g.cache.slots() as u32)
-            .filter(|&s| g.cache.occ(s).is_some_and(|(l, e)| f(l, e)))
-            .collect();
-        for s in gone {
-            g.cache.release(s);
-        }
+        g.dir.forget_where(f);
     }
 
     /// The gathers of step `epoch` (and every earlier one) are evaluated.
     pub fn done(&self, epoch: u64) {
-        lock(&self.inner).cache.complete(epoch);
+        lock(&self.inner).dir.complete(epoch);
     }
 
     /// Panics (release builds too) unless every slot of `p` holds its
@@ -996,22 +913,14 @@ impl StagingBank {
     }
 
     fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
-        let n = self.n_experts;
         let stale = {
             let g = lock(&self.inner);
-            let base = g.base(n);
             p.experts
                 .iter()
                 .zip(&p.slots)
                 .filter(|(e, _)| check(**e))
                 .find_map(|(&e, &s)| {
-                    let held = if s < base {
-                        (s as usize == g.stage(p.layer, e, n))
-                            .then(|| g.tags[s as usize])
-                            .flatten()
-                    } else {
-                        g.cache.occ(s - base)
-                    };
+                    let held = g.dir.held_at(p.layer, e, s);
                     (held != Some((p.layer, e))).then_some((e, s, held))
                 })
         };
@@ -1033,28 +942,26 @@ impl StagingBank {
         want.sort_unstable();
         want.dedup();
         let mut g = lock(&self.inner);
-        self.check_step(&g, layer, &want)?;
+        self.check_step(&g, layer, &want, &[])?;
         if !g.in_turn {
             self.begin(&mut g)?;
         }
-        let n = self.n_experts;
         self.settle_ahead(&mut g, |_| true);
         g.drain();
-        want.retain(|&e| g.tags[g.stage(layer, e, n)] != Some((layer, e)));
+        want.retain(|&e| !g.dir.is_staged(layer, e));
         if want.is_empty() {
             return Ok(());
         }
         crate::array::synchronize();
         let mut reads = Vec::new();
         for &e in &want {
-            let s = g.stage(layer, e, n);
-            g.tags[s] = None;
+            let s = g.dir.stage(layer, e);
+            g.dir.clear_tag(layer, e);
             self.reads(&g, layer, e, s, &mut reads)?;
         }
         let io = self.submit(reads)?;
         for &e in &want {
-            let s = g.stage(layer, e, n);
-            g.tags[s] = Some((layer, e));
+            g.dir.set_tag(layer, e);
         }
         let mut st = lock(&self.stats);
         st.fills += 1;
@@ -1068,8 +975,7 @@ impl StagingBank {
     pub fn assert_tags(&self, layer: usize, experts: &[u32]) {
         let stale = {
             let g = lock(&self.inner);
-            let n = self.n_experts;
-            let at = |e: u32| g.tags.get(g.stage(layer, e, n)).copied().flatten();
+            let at = |e: u32| g.dir.tag_of(layer, e);
             experts
                 .iter()
                 .find(|&&e| at(e) != Some((layer, e)))

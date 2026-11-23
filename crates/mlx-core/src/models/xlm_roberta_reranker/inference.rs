@@ -6,7 +6,7 @@ use crate::{
     array::{self, DType, MxArray, attention::scaled_dot_product_attention},
     models::{
         quantized_linear::LinearProj,
-        rerank_runtime::{Backend, Request},
+        rerank_runtime::{Backend, Request, check_cancel},
     },
     nn::{Embedding, LayerNorm},
 };
@@ -54,13 +54,6 @@ struct Prepared {
     prompt_tokens: usize,
     truncated_query: bool,
     truncated_documents: Vec<usize>,
-}
-fn check_cancel(cancel: &AtomicBool, shutdown: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
-        Err(Error::from_reason("rerank_cancelled: request cancelled"))
-    } else {
-        Ok(())
-    }
 }
 fn too_large(message: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("rerank_input_too_large: {message}"))

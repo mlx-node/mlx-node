@@ -10,17 +10,17 @@ use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_checkpoint, parse_generation_defaults,
 };
-use crate::models::gemma4::quantized_linear::{
-    LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
-    try_build_sym8_quantized_linear,
-};
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, ensure_affine_biases_present, ensure_dense_weight_floating,
     ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
     ensure_plain_fp8_storage_resolves_fp8_e4m3, ensure_row_major_kquant_layout, has_kquant_mode,
     load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
+};
+use crate::models::quantized_linear::{
+    LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
@@ -859,7 +859,7 @@ mod tests {
         primary_safetensor_is_mlx, quant_lookup_prefix, requires_row_exact_decode_projections,
     };
     use crate::array::MxArray;
-    use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
+    use crate::models::quant_dispatch::{PerLayerMode, PerLayerQuant};
     use crate::utils::safetensors::save_safetensors;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

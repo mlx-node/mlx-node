@@ -8,9 +8,9 @@ use std::sync::atomic::Ordering;
 
 use napi::{Error, Result};
 
-use super::config::EngramConfig;
 use super::engram::{EngramRows, row_bytes};
 use super::stats::{ENGRAM_BYTES, ENGRAM_NS};
+use crate::models::engram_hash::EngramConfig;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType, decode_mxfp8_rows};
 

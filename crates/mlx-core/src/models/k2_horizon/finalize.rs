@@ -16,7 +16,10 @@ use napi::bindgen_prelude::*;
 use serde_json::Value;
 
 use crate::engine::backend::FinalizeArgs;
-use crate::engine::finalize::finalize_chat_result_with;
+use crate::engine::finalize::{
+    FinalizeMarkup, finalize_chat_result_with, parse_thinking_and_tools_with,
+    raw_text_with_reasoning_suppressed_with,
+};
 use crate::engine::types::ChatResult;
 use crate::tools::{self, MarkupSpec, ToolCallResult};
 
@@ -206,113 +209,15 @@ fn parse_k2_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Optio
     (cleaned_text, tool_calls, thinking)
 }
 
-/// The close tag the generation actually emitted: earliest text
-/// occurrence among K2's three `</ifm|think*>` members. The caller has
-/// already confirmed a close TOKEN in `generated_tokens`; the tags are
-/// dedicated added tokens, so any occurrence in the decoded text is that
-/// token. `think_end_str` (the armed tag) wins ties.
-fn k2_emitted_close_tag<'a>(text: &str, think_end_str: Option<&'a str>) -> Option<&'a str> {
-    let mut best: Option<(usize, &'a str)> =
-        think_end_str.and_then(|tag| text.find(tag).map(|pos| (pos, tag)));
-    for close_tag in K2_REASONING_PAIRS.iter().map(|(_, c)| *c) {
-        if let Some(pos) = text.find(close_tag)
-            && best.is_none_or(|(bp, _)| pos < bp)
-        {
-            best = Some((pos, close_tag));
-        }
-    }
-    best.map(|(_, tag)| tag)
-}
-
-/// Any armed-or-alternate close token present in the generation —
-/// the K2-aware form of `tools::has_think_end_token`.
-fn has_k2_think_end(generated_tokens: &[u32], ids: &[u32]) -> bool {
-    ids.iter().any(|id| generated_tokens.contains(id))
-}
-
-/// K2 port of `engine::finalize::parse_thinking_and_tools` — same four-way
-/// branch, K2 tags.
-fn parse_thinking_and_tools(
-    text: &str,
-    generated_tokens: &[u32],
-    thinking_enabled: bool,
-    think_end_id: Option<u32>,
-    think_end_str: Option<&str>,
-    think_end_extra_ids: &[u32],
-    include_reasoning: bool,
-) -> (String, Vec<ToolCallResult>, Option<String>) {
-    let all_end_ids: Vec<u32> = think_end_id
-        .into_iter()
-        .chain(think_end_extra_ids.iter().copied())
-        .collect();
-    let (clean_text, tool_calls, thinking) = if !thinking_enabled {
-        let (clean, calls) = parse_tool_calls(text);
-        (clean, calls, None)
-    } else if has_k2_think_end(generated_tokens, &all_end_ids) {
-        // Token-level split at whichever family member was emitted.
-        let emitted = k2_emitted_close_tag(text, think_end_str);
-        tools::split_at_think_end_with(
-            text,
-            emitted.or(think_end_str),
-            K2_OPEN_PREFIXES,
-            parse_tool_calls,
-            parse_k2_generation_output,
-        )
-    } else if think_end_id.is_some() {
-        // Truncated generation: entire output is reasoning.
-        let thinking_text = text.trim();
-        let thinking_text = K2_OPEN_PREFIXES
-            .iter()
-            .find_map(|p| thinking_text.strip_prefix(p))
-            .unwrap_or(thinking_text)
-            .trim();
-        let thinking = if thinking_text.is_empty() {
-            None
-        } else {
-            Some(thinking_text.to_string())
-        };
-        (String::new(), vec![], thinking)
-    } else {
-        // No think_end_id in vocab: text-level scrub preserving tool spans.
-        let content = tools::strip_reasoning_preserving_tools_with(text, K2_MARKUP);
-        let (clean, calls) = parse_tool_calls(&content);
-        let (text_without_tools, _) = parse_tool_calls(text);
-        let thinking = parse_k2_thinking(&text_without_tools).1;
-        (clean.trim().to_string(), calls, thinking)
-    };
-
-    let thinking = if include_reasoning { thinking } else { None };
-    (clean_text, tool_calls, thinking)
-}
-
-/// K2 port of `engine::finalize::raw_text_with_reasoning_suppressed`.
-fn raw_text_with_reasoning_suppressed(
-    text: &str,
-    generated_tokens: &[u32],
-    thinking_enabled: bool,
-    think_end_id: Option<u32>,
-    think_end_str: Option<&str>,
-    think_end_extra_ids: &[u32],
-    include_reasoning: bool,
-) -> String {
-    if include_reasoning || !thinking_enabled {
-        return text.to_string();
-    }
-    let all_end_ids: Vec<u32> = think_end_id
-        .into_iter()
-        .chain(think_end_extra_ids.iter().copied())
-        .collect();
-    if has_k2_think_end(generated_tokens, &all_end_ids) {
-        if let Some(tag) = k2_emitted_close_tag(text, think_end_str)
-            && let Some(close_pos) = text.find(tag)
-        {
-            return text[close_pos + tag.len()..].to_string();
-        }
-    } else if think_end_id.is_some() {
-        return String::new();
-    }
-    tools::strip_reasoning_preserving_tools_with(text, K2_MARKUP)
-}
+/// K2 finalization spec for the shared `engine::finalize` four-way branch.
+const K2_FINALIZE_MARKUP: FinalizeMarkup = FinalizeMarkup {
+    markup: K2_MARKUP,
+    open_prefixes: K2_OPEN_PREFIXES,
+    parse_tools: parse_tool_calls,
+    parse_thinking: parse_k2_thinking,
+    parse_fallback: parse_k2_generation_output,
+    scan_all_reasoning_closes: true,
+};
 
 /// K2 `finalize_turn` — `finalize_chat_result` against K2 markup.
 ///
@@ -324,7 +229,7 @@ pub(crate) fn finalize_k2_chat_result(args: FinalizeArgs<'_>) -> Result<ChatResu
     finalize_chat_result_with(
         args,
         |text, args| {
-            let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
+            let (clean_text, tool_calls, thinking) = parse_thinking_and_tools_with(
                 text,
                 args.generated_tokens,
                 args.thinking_enabled,
@@ -332,6 +237,7 @@ pub(crate) fn finalize_k2_chat_result(args: FinalizeArgs<'_>) -> Result<ChatResu
                 args.think_end_str,
                 args.think_end_extra_ids,
                 args.include_reasoning,
+                K2_FINALIZE_MARKUP,
             );
             // K2's template RAISES on any assistant history message without a
             // thinking field (`reasoning_content`/`think`/…), so a suppressed or
@@ -341,7 +247,7 @@ pub(crate) fn finalize_k2_chat_result(args: FinalizeArgs<'_>) -> Result<ChatResu
             (clean_text, tool_calls, Some(thinking.unwrap_or_default()))
         },
         |text, args| {
-            raw_text_with_reasoning_suppressed(
+            raw_text_with_reasoning_suppressed_with(
                 text,
                 args.generated_tokens,
                 args.thinking_enabled,
@@ -349,6 +255,7 @@ pub(crate) fn finalize_k2_chat_result(args: FinalizeArgs<'_>) -> Result<ChatResu
                 args.think_end_str,
                 args.think_end_extra_ids,
                 false,
+                K2_FINALIZE_MARKUP,
             )
         },
     )

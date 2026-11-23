@@ -11,7 +11,6 @@
 //! scale = head_dim^-0.5.
 
 use crate::array::MxArray;
-use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::models::attention_core::{
     BatchedDecodeLabels, CacheHitPrefillRoute, PagedAttentionCore,
 };
@@ -83,57 +82,7 @@ impl K2Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
-
-        let queries = queries
-            .reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = keys
-            .reshape(&[
-                batch,
-                seq_len,
-                self.num_kv_heads as i64,
-                self.head_dim as i64,
-            ])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let values = values
-            .reshape(&[
-                batch,
-                seq_len,
-                self.num_kv_heads as i64,
-                self.head_dim as i64,
-            ])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-
-        let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-        let queries = self.rope.forward(&queries, Some(offset))?;
-        let keys = self.rope.forward(&keys, Some(offset))?;
-
-        let (keys, values) = if let Some(c) = cache {
-            c.update_and_fetch(&keys, &values)?
-        } else {
-            (keys, values)
-        };
-
-        let output = if let Some(m) = mask {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale, Some(m))?
-        } else if seq_len > 1 {
-            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale)?
-        } else {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale, None)?
-        };
-
-        let output = output.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch,
-            seq_len,
-            (self.num_heads * self.head_dim) as i64,
-        ])?;
-        self.o_proj.forward(&output)
+        self.paged_core().forward_flat(x, mask, cache)
     }
 
     /// The shared paged skeleton with K2's parameterization: no Q/K norm

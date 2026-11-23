@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::models::gemma4::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 

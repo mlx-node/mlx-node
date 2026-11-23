@@ -24,14 +24,13 @@
 //! - The learned `expert_bias` is a selection-only correction
 //!   (DeepSeek-V3-style `e_score_correction_bias`): it perturbs top-k
 //!   selection but is never gathered into the combination weights.
-//!   This cannot reuse `moe::topk_from_logits` (no bias step), so the
-//!   gate math is inlined here.
+//!   Delegated to [`crate::moe::sigmoid_biased_topk_from_logits`].
 //! - `expert_bias` stays f32 (matches Python `cast_predicate`).
 
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
-use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
-use crate::nn::{Activations, Linear};
+use crate::moe::{SwitchGLU, sigmoid_biased_topk_from_logits};
+use crate::nn::Linear;
 use napi::bindgen_prelude::*;
 
 use super::config::Lfm2Config;
@@ -42,21 +41,15 @@ pub struct Lfm2SparseMoeBlock {
     /// checkpoints. Convert forces `feed_forward.gate` to 8-bit affine (never
     /// mxfp8) via `is_router_gate`, so the quantized form is 8-bit affine.
     gate: LinearProj,
-    /// Expert-indexed SwiGLU (gather_mm / gather_qmm). Reused from qwen3_5_moe.
+    /// Expert-indexed SwiGLU (gather_mm / gather_qmm).
     switch_mlp: SwitchGLU,
     /// Per-expert routing bias `(num_experts,)`, kept f32. `None` when
     /// `use_expert_bias` is false.
     expert_bias: Option<MxArray>,
-    num_experts: i32,
     top_k: i32,
     norm_topk_prob: bool,
-    /// Pre-built f32 `1e-6` renorm epsilon, allocated once so the forward
-    /// hot path does not create a scalar array per layer per token.
-    /// `None` when `norm_topk_prob` is false.
-    renorm_eps: Option<MxArray>,
-    /// Pre-built f32 `routed_scaling_factor` (HF applies it after renorm;
-    /// default 1.0). `None` when the factor is 1.0.
-    routed_scale: Option<MxArray>,
+    /// Scaling factor applied after renorm (HF default 1.0).
+    routed_scaling_factor: f64,
 }
 
 impl Lfm2SparseMoeBlock {
@@ -90,24 +83,14 @@ impl Lfm2SparseMoeBlock {
 
         let norm_topk_prob = config.norm_topk_prob.unwrap_or(true);
         let routed_scaling_factor = config.routed_scaling_factor.unwrap_or(1.0);
-        let renorm_eps = norm_topk_prob
-            .then(|| MxArray::scalar_float(1e-6).and_then(|a| a.astype(DType::Float32)))
-            .transpose()?;
-        let routed_scale = (routed_scaling_factor != 1.0)
-            .then(|| {
-                MxArray::scalar_float(routed_scaling_factor).and_then(|a| a.astype(DType::Float32))
-            })
-            .transpose()?;
 
         Ok(Self {
             gate: LinearProj::Standard(gate),
             switch_mlp,
             expert_bias,
-            num_experts,
             top_k,
             norm_topk_prob,
-            renorm_eps,
-            routed_scale,
+            routed_scaling_factor,
         })
     }
 
@@ -167,45 +150,20 @@ impl Lfm2SparseMoeBlock {
         let hidden = shape[2];
         let ne = batch * seq_len;
         let k = self.top_k as i64;
-        let ne_e = self.num_experts as i64;
 
         let x_flat = x.reshape(&[ne, hidden])?;
         let x_dtype = x.dtype()?;
 
-        // gates = sigmoid(gate(x).astype(f32)) — HF Lfm2MoeTopKRouter uses
-        // sigmoid (NOT softmax); f32 keeps selection ties/renorm precise and
-        // avoids the degraded bf16 sigmoid kernel.
-        let logits = self.gate.forward(&x_flat)?.astype(DType::Float32)?; // [ne, num_experts]
-        let gates = Activations::sigmoid(&logits)?;
-
-        // inds = topk(gates + expert_bias) — the bias is SELECTION-ONLY
-        // (HF: topk over `routing_weights + expert_bias`); it must never
-        // contaminate the gathered combination weights.
-        let selection = if let Some(bias) = &self.expert_bias {
-            gates.add(bias)? // f32 + f32; broadcasts [ne, E] + [E]
-        } else {
-            gates.clone()
-        };
-        let inds_full = selection.argpartition(-self.top_k, Some(-1))?;
-        let inds = inds_full.slice_axis(1, ne_e - k, ne_e)?; // [ne, k]
-
-        // scores = gather(gates, inds) — from the UNBIASED sigmoid weights
-        // (HF: `gather(routing_weights, selected_experts)`).
-        let mut scores = gates.take_along_axis(&inds, -1)?; // [ne, k]
-
-        // if norm_topk_prob: scores /= sum(scores, -1, keepdims) + 1e-6
-        if self.norm_topk_prob {
-            let denom = scores.sum(Some(&[-1]), Some(true))?; // [ne, 1]
-            let eps = self.renorm_eps.as_ref().ok_or_else(|| {
-                Error::from_reason("renorm_eps is built when norm_topk_prob is true")
-            })?;
-            let denom = denom.add(eps)?;
-            scores = scores.div(&denom)?;
-        }
-        // scores *= routed_scaling_factor (HF applies it after renorm).
-        if let Some(scale) = &self.routed_scale {
-            scores = scores.mul(scale)?;
-        }
+        let logits = self.gate.forward(&x_flat)?;
+        let (scores, inds) = sigmoid_biased_topk_from_logits(
+            &logits,
+            self.expert_bias.as_ref(),
+            self.top_k,
+            1e-6,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+            false,
+        )?;
         let scores = scores.astype(x_dtype)?;
 
         // y = switch_mlp(x, inds);  y = (y * scores[..., None]).sum(axis=-2)

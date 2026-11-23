@@ -20,7 +20,6 @@ use napi::bindgen_prelude::*;
 
 use super::config::PrivacyFilterConfig;
 use super::persistence::AttnWeights;
-use super::quantized_linear::project_2d;
 
 /// One privacy-filter attention block, parameterised by borrowed weights /
 /// config / shared YaRN frequencies.
@@ -56,17 +55,10 @@ impl<'a> AttentionLayer<'a> {
         let num_kv_heads = self.config.num_key_value_heads as i64;
         let q_dim = num_q_heads * head_dim; // 14 * 64 = 896
 
-        // 1. Q, K, V projections with bias.
-        //    For plain bf16 checkpoints each weight is stored as
-        //    `[out, in]`, so `project_2d` transposes to `[in, out]`
-        //    before the fused matmul (mirroring `nn::Linear`). For
-        //    quantized checkpoints `project_2d` dispatches to
-        //    `mlx_quantized_matmul(transpose=true)` and adds the bias
-        //    after dequantize; both branches return the same shape so
-        //    the rest of this forward pass is unchanged.
-        let q = project_2d(hidden, &self.weights.q_proj)?;
-        let k = project_2d(hidden, &self.weights.k_proj)?;
-        let v = project_2d(hidden, &self.weights.v_proj)?;
+        // 1. Q, K, V projections with bias via canonical `LinearProj`.
+        let q = self.weights.q_proj.forward(hidden)?;
+        let k = self.weights.k_proj.forward(hidden)?;
+        let v = self.weights.v_proj.forward(hidden)?;
 
         // 2. Reshape `[B, T, *]` to `[B, T, H, D]` and permute to `[B, H, T, D]`.
         let q = q
@@ -145,7 +137,7 @@ impl<'a> AttentionLayer<'a> {
             .transpose(Some(&[0, 2, 1, 3]))?
             .reshape(&[batch, seq_len, q_dim])?;
 
-        let out = project_2d(&merged, &self.weights.o_proj)?;
+        let out = self.weights.o_proj.forward(&merged)?;
 
         // Output shape sanity: `[B, T, hidden_size]`. Use a debug_assert so
         // tests pin the contract without paying for a shape check on every
@@ -193,14 +185,12 @@ mod tests {
         // Random hidden state in the weights' native dtype (bf16 for this
         // checkpoint) so the matmuls don't trip the f32-promotes-bf16
         // footgun.
-        let hidden_dtype = match &loaded.weights.layers[0].self_attn.q_proj {
-            crate::models::privacy_filter::LoadedProj::Plain { weight, .. } => {
-                weight.dtype().unwrap()
-            }
-            crate::models::privacy_filter::LoadedProj::Quantized { weight, .. } => {
-                weight.dtype().unwrap()
-            }
-        };
+        let hidden_dtype = loaded.weights.layers[0]
+            .self_attn
+            .q_proj
+            .get_weight()
+            .dtype()
+            .unwrap();
         let hidden = MxArray::random_normal(
             &[1, 8, loaded.config.hidden_size as i64],
             0.0,
@@ -247,14 +237,12 @@ mod tests {
             yarn_freqs: &freqs,
         };
 
-        let hidden_dtype = match &loaded.weights.layers[0].self_attn.q_proj {
-            crate::models::privacy_filter::LoadedProj::Plain { weight, .. } => {
-                weight.dtype().unwrap()
-            }
-            crate::models::privacy_filter::LoadedProj::Quantized { weight, .. } => {
-                weight.dtype().unwrap()
-            }
-        };
+        let hidden_dtype = loaded.weights.layers[0]
+            .self_attn
+            .q_proj
+            .get_weight()
+            .dtype()
+            .unwrap();
         let hidden = MxArray::random_normal(
             &[1, 16, loaded.config.hidden_size as i64],
             0.0,

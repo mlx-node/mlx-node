@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use napi::{Error, Result};
 
-use crate::models::deepseek_v41::EngramConfig;
+use crate::models::engram_hash::EngramConfig;
 use crate::utils::gguf::{GgufFile, GgufMetaValue};
 
 pub const ARCH: &str = "hy_v4_flash";

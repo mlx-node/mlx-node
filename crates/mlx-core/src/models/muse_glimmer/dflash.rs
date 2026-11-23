@@ -10,7 +10,7 @@ use rand::Rng;
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
-use crate::models::gemma4::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, RMSNorm, RoPE};
 use crate::sampling::{SamplingConfig, is_greedy_temperature, sampling_distribution};
 

@@ -9,18 +9,21 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::persistence::{get_tensor, load_conv2d, load_frozen_bn};
-use crate::utils::safetensors::SafeTensorsFile;
+use crate::engine::persistence::load_all_safetensors;
+use crate::vision::cnn::{
+    ConvBNAct, get_tensor, load_conv_bn_act_with_options, load_conv2d, load_frozen_bn,
+};
 
 use super::config::UVDocConfig;
 use super::model::{
-    Bridge, ConvBNRelu, DocUnwarpModel, OutputHead, ResLayer, ResidualBlock, ResnetEncoder,
-    UVDocNet, create_model,
+    Bridge, DocUnwarpModel, OutputHead, ResLayer, ResidualBlock, ResnetEncoder, UVDocNet,
+    create_model,
 };
 
 const BN_EPS: f64 = 1e-5;
 
-/// Load a ConvBNRelu block.
+/// Load a Conv + BN + ReLU block.
+#[allow(clippy::too_many_arguments)]
 fn load_conv_bn_relu(
     params: &HashMap<String, MxArray>,
     conv_prefix: &str,
@@ -30,18 +33,20 @@ fn load_conv_bn_relu(
     dilation: (i32, i32),
     groups: i32,
     has_bias: bool,
-) -> Result<ConvBNRelu> {
-    let conv = load_conv2d(
+) -> Result<ConvBNAct> {
+    load_conv_bn_act_with_options(
         params,
         conv_prefix,
+        bn_prefix,
+        "relu",
         stride,
         padding,
         dilation,
         groups,
         has_bias,
-    )?;
-    let bn = load_frozen_bn(params, bn_prefix, BN_EPS)?;
-    Ok(ConvBNRelu::new(conv, bn))
+        BN_EPS,
+        None,
+    )
 }
 
 /// Load a residual block.
@@ -109,12 +114,12 @@ fn load_residual_block(
     Ok(ResidualBlock::new(conv1, bn1, conv2, bn2, downsample))
 }
 
-/// Load a bridge branch (sequence of dilated ConvBNRelu blocks).
+/// Load a bridge branch (sequence of dilated Conv+BN+ReLU blocks).
 fn load_bridge_branch(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     dilations: &[i32],
-) -> Result<Vec<ConvBNRelu>> {
+) -> Result<Vec<ConvBNAct>> {
     let mut layers = Vec::with_capacity(dilations.len());
     for (i, &dil) in dilations.iter().enumerate() {
         let pad = dil; // padding = dilation for kernel_size=3
@@ -188,16 +193,7 @@ pub fn load_model(model_path: &str) -> Result<DocUnwarpModel> {
     let pad = ks / 2;
 
     // Load weights
-    let weights_path = path.join("model.safetensors");
-    if !weights_path.exists() {
-        return Err(Error::from_reason(format!(
-            "Weights file not found: {}",
-            weights_path.display()
-        )));
-    }
-
-    let st_file = SafeTensorsFile::load(&weights_path)?;
-    let params = st_file.load_tensors(&weights_path)?;
+    let params = load_all_safetensors(path, false)?;
 
     // ---- Head: 2x (Conv5x5/s2 + BN + ReLU) ----
     let head_0 = load_conv_bn_relu(

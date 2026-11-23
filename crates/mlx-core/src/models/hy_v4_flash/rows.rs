@@ -24,7 +24,7 @@ use super::f8::decode_f8_rows;
 #[cfg(test)]
 use super::scan::Scan;
 use super::scan::{ENGRAM_TABLE, Located};
-use crate::models::deepseek_v41::EngramConfig;
+use crate::models::engram_hash::EngramConfig;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::GgufTensorType;
 

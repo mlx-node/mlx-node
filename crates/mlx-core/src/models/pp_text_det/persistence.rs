@@ -1,7 +1,7 @@
 //! Text Detection Weight Loading
 //!
 //! SafeTensors weight loading for the DBNet text detection model.
-//! Reuses shared persistence helpers from pp_doclayout_v3.
+//! Reuses shared persistence helpers from `crate::vision::cnn`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,238 +10,15 @@ use std::path::Path;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::backbone::{
-    ConvBNActLight, HGBlock, HGBlockLayer, HGNetV2Backbone, HGNetV2Embeddings, HGNetV2Encoder,
-    HGNetV2Stage, NativeConvTranspose2d,
+use crate::engine::persistence::load_all_safetensors;
+use crate::vision::cnn::{
+    load_conv_transpose2d, load_conv2d, load_frozen_bn, load_hgnetv2_backbone,
 };
-use crate::models::pp_doclayout_v3::persistence::{
-    get_tensor, load_conv_bn_act, load_conv2d, load_frozen_bn,
-};
-use crate::utils::safetensors::SafeTensorsFile;
 
 use super::config::TextDetConfig;
 use super::db_head::{Head, LocalModule, PFHeadLocal};
 use super::lkpan::{IntraCLBlock, LKPAN};
 use super::model::{TextDetModel, create_model};
-
-// ============================================================================
-// Backbone Loading (reuses HGNetV2 with text-det config)
-// ============================================================================
-
-fn load_backbone(
-    params: &HashMap<String, MxArray>,
-    config: &TextDetConfig,
-) -> Result<HGNetV2Backbone> {
-    let bc = &config.backbone;
-    let eps = config.batch_norm_eps;
-    let act = bc.hidden_act.as_str();
-    let use_lab = bc.use_learnable_affine_block;
-
-    // Load stem
-    let stem_prefix = "backbone";
-
-    let lab0 = format!("{}.stem1.lab", stem_prefix);
-    let stem1 = load_conv_bn_act(
-        params,
-        &format!("{}.stem1.convolution", stem_prefix),
-        &format!("{}.stem1.normalization", stem_prefix),
-        act,
-        (2, 2),
-        (1, 1),
-        1,
-        eps,
-        if use_lab { Some(lab0.as_str()) } else { None },
-    )?;
-
-    let lab1 = format!("{}.stem2a.lab", stem_prefix);
-    let stem2a = load_conv_bn_act(
-        params,
-        &format!("{}.stem2a.convolution", stem_prefix),
-        &format!("{}.stem2a.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab1.as_str()) } else { None },
-    )?;
-
-    let lab2 = format!("{}.stem2b.lab", stem_prefix);
-    let stem2b = load_conv_bn_act(
-        params,
-        &format!("{}.stem2b.convolution", stem_prefix),
-        &format!("{}.stem2b.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab2.as_str()) } else { None },
-    )?;
-
-    let lab3 = format!("{}.stem3.lab", stem_prefix);
-    let stem3 = load_conv_bn_act(
-        params,
-        &format!("{}.stem3.convolution", stem_prefix),
-        &format!("{}.stem3.normalization", stem_prefix),
-        act,
-        bc.stem3_stride,
-        (1, 1),
-        1,
-        eps,
-        if use_lab { Some(lab3.as_str()) } else { None },
-    )?;
-
-    let lab4 = format!("{}.stem4.lab", stem_prefix);
-    let stem4 = load_conv_bn_act(
-        params,
-        &format!("{}.stem4.convolution", stem_prefix),
-        &format!("{}.stem4.normalization", stem_prefix),
-        act,
-        (1, 1),
-        (0, 0),
-        1,
-        eps,
-        if use_lab { Some(lab4.as_str()) } else { None },
-    )?;
-
-    let embedder = HGNetV2Embeddings::new(stem1, stem2a, stem2b, stem3, stem4);
-
-    // Load encoder stages
-    let mut stages = Vec::with_capacity(bc.num_stages());
-
-    for stage_idx in 0..bc.num_stages() {
-        let stage_prefix = format!("{}.stages.{}", stem_prefix, stage_idx);
-        let do_downsample = bc.stage_downsample[stage_idx];
-        let in_channels = bc.stage_in_channels[stage_idx];
-        let is_light = bc.stage_light_block[stage_idx];
-        let kernel_size = bc.stage_kernel_size[stage_idx];
-        let num_blocks = bc.stage_num_blocks[stage_idx] as usize;
-        let num_layers_per_block = bc.stage_numb_of_layers[stage_idx] as usize;
-        let mid_channels = bc.stage_mid_channels[stage_idx];
-
-        let stage_stride = bc.stage_strides.get(stage_idx).copied().unwrap_or((2, 2));
-        let downsample = if do_downsample {
-            Some(load_conv_bn_act(
-                params,
-                &format!("{}.downsample.convolution", stage_prefix),
-                &format!("{}.downsample.normalization", stage_prefix),
-                "none",
-                stage_stride,
-                (1, 1),
-                in_channels,
-                eps,
-                None,
-            )?)
-        } else {
-            None
-        };
-
-        let mut blocks = Vec::with_capacity(num_blocks);
-
-        for block_idx in 0..num_blocks {
-            let block_prefix = format!("{}.blocks.{}", stage_prefix, block_idx);
-
-            let mut layers: Vec<HGBlockLayer> = Vec::with_capacity(num_layers_per_block);
-            for layer_idx in 0..num_layers_per_block {
-                let layer_prefix = format!("{}.layers.{}", block_prefix, layer_idx);
-                let kp = (kernel_size / 2, kernel_size / 2);
-
-                if is_light {
-                    let conv1 = load_conv_bn_act(
-                        params,
-                        &format!("{}.conv1.convolution", layer_prefix),
-                        &format!("{}.conv1.normalization", layer_prefix),
-                        "none",
-                        (1, 1),
-                        (0, 0),
-                        1,
-                        eps,
-                        None,
-                    )?;
-                    let conv2_lab = format!("{}.conv2.lab", layer_prefix);
-                    let conv2 = load_conv_bn_act(
-                        params,
-                        &format!("{}.conv2.convolution", layer_prefix),
-                        &format!("{}.conv2.normalization", layer_prefix),
-                        act,
-                        (1, 1),
-                        kp,
-                        mid_channels,
-                        eps,
-                        if use_lab {
-                            Some(conv2_lab.as_str())
-                        } else {
-                            None
-                        },
-                    )?;
-                    layers.push(HGBlockLayer::Light(ConvBNActLight::new(conv1, conv2)));
-                } else {
-                    let std_lab = format!("{}.lab", layer_prefix);
-                    let conv = load_conv_bn_act(
-                        params,
-                        &format!("{}.convolution", layer_prefix),
-                        &format!("{}.normalization", layer_prefix),
-                        act,
-                        (1, 1),
-                        kp,
-                        1,
-                        eps,
-                        if use_lab {
-                            Some(std_lab.as_str())
-                        } else {
-                            None
-                        },
-                    )?;
-                    layers.push(HGBlockLayer::Standard(conv));
-                }
-            }
-
-            // Aggregation
-            let agg_prefix = format!("{}.aggregation", block_prefix);
-            let agg_lab0 = format!("{}.0.lab", agg_prefix);
-            let agg_squeeze = load_conv_bn_act(
-                params,
-                &format!("{}.0.convolution", agg_prefix),
-                &format!("{}.0.normalization", agg_prefix),
-                act,
-                (1, 1),
-                (0, 0),
-                1,
-                eps,
-                if use_lab {
-                    Some(agg_lab0.as_str())
-                } else {
-                    None
-                },
-            )?;
-            let agg_lab1 = format!("{}.1.lab", agg_prefix);
-            let agg_excitation = load_conv_bn_act(
-                params,
-                &format!("{}.1.convolution", agg_prefix),
-                &format!("{}.1.normalization", agg_prefix),
-                act,
-                (1, 1),
-                (0, 0),
-                1,
-                eps,
-                if use_lab {
-                    Some(agg_lab1.as_str())
-                } else {
-                    None
-                },
-            )?;
-
-            let residual = block_idx != 0;
-            blocks.push(HGBlock::new(layers, agg_squeeze, agg_excitation, residual));
-        }
-
-        stages.push(HGNetV2Stage::new(downsample, blocks));
-    }
-
-    let encoder = HGNetV2Encoder::new(stages);
-    Ok(HGNetV2Backbone::new(embedder, encoder, bc))
-}
 
 // ============================================================================
 // LKPAN Loading
@@ -473,33 +250,6 @@ fn load_lkpan(params: &HashMap<String, MxArray>, config: &TextDetConfig) -> Resu
 // DBHead Loading
 // ============================================================================
 
-fn load_conv_transpose2d(
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    stride: (i32, i32),
-    padding: (i32, i32),
-    has_bias: bool,
-) -> Result<NativeConvTranspose2d> {
-    let weight_raw = get_tensor(params, &format!("{}.weight", prefix))?;
-    // ConvTranspose2d weights in Paddle are (C_in, C_out, kH, kW) = IOHW,
-    // whereas regular Conv2d is (C_out, C_in, kH, kW) = OIHW.
-    // MLX expects (C_out, kH, kW, C_in) = OHWI, so we need [1, 2, 3, 0].
-    let weight = weight_raw.transpose(Some(&[1, 2, 3, 0]))?;
-    let bias = if has_bias {
-        Some(get_tensor(params, &format!("{}.bias", prefix))?)
-    } else {
-        None
-    };
-    Ok(NativeConvTranspose2d::new(
-        &weight,
-        bias.as_ref(),
-        stride,
-        padding,
-        (1, 1),
-        1,
-    ))
-}
-
 /// Load a single Head branch (binarize or thresh).
 fn load_head_branch(params: &HashMap<String, MxArray>, prefix: &str, eps: f64) -> Result<Head> {
     // Conv2d(in_ch->inner_ch, k=3, pad=1, bias=False) + BN
@@ -608,19 +358,16 @@ pub fn load_model(model_path: &str) -> Result<TextDetModel> {
     };
 
     // Load weights
-    let weights_path = path.join("model.safetensors");
-    if !weights_path.exists() {
-        return Err(Error::from_reason(format!(
-            "Weights file not found: {}",
-            weights_path.display()
-        )));
-    }
-
-    let st_file = SafeTensorsFile::load(&weights_path)?;
-    let params = st_file.load_tensors(&weights_path)?;
+    let params = load_all_safetensors(path, false)?;
 
     // Build components
-    let backbone = load_backbone(&params, &config)?;
+    let backbone = load_hgnetv2_backbone(
+        &params,
+        &config.backbone,
+        "backbone",
+        "backbone.stages",
+        config.batch_norm_eps,
+    )?;
     let neck = load_lkpan(&params, &config)?;
     let head = load_pf_head_local(&params, &config)?;
 
