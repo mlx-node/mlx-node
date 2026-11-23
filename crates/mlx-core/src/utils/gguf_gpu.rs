@@ -279,7 +279,6 @@ impl CudaDeviceBudget {
         self.apply_live_free(live_free);
     }
 
-    #[cfg(test)]
     pub(crate) fn remaining_bytes(&self) -> u64 {
         self.remaining_bytes.load(Ordering::Acquire)
     }

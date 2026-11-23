@@ -2514,13 +2514,38 @@ fn apply_clef_residency_core(
             }
 
             let peak_need = output_bytes.and_then(|o| o.checked_add(scratch_bytes?));
+            let has_fp8_e4m3 = decoded_sources
+                .iter()
+                .any(|(_, plq, _)| plq.mode == PerLayerMode::Fp8E4m3);
             let can_keep_native = (!sym8_stored || crate::accelerator::cuda_sym8_available())
+                && !has_fp8_e4m3
                 && !clef_mlp_unit_incomplete(&unit);
-            let reserved_peak = peak_need.filter(|&need| budget.try_reserve(need));
-            if reserved_peak.is_none() && can_keep_native {
-                kept.extend(decoded_sources.into_iter().map(|(prefix, _, _)| prefix));
-                continue;
-            }
+            let Some(reserved_peak) = peak_need.filter(|&need| budget.try_reserve(need)) else {
+                if can_keep_native {
+                    kept.extend(decoded_sources.into_iter().map(|(prefix, _, _)| prefix));
+                    continue;
+                }
+                let unit_desc = decoded_sources
+                    .iter()
+                    .map(|(prefix, _, _)| prefix.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let why = if clef_mlp_unit_incomplete(&unit) {
+                    "mixed dense+quantized MLP requires dense BF16 reconstruction"
+                } else if has_fp8_e4m3 {
+                    "plain FP8 E4M3 requires dense BF16 reconstruction"
+                } else {
+                    "stored sym8 requires dense BF16 reconstruction without CUDA Sym8 support"
+                };
+                let need_desc = peak_need
+                    .map(|bytes| format!("{bytes} bytes"))
+                    .unwrap_or_else(|| "overflowing byte estimate".to_string());
+                return Err(Error::from_reason(format!(
+                    "CLEF discrete-GPU VRAM budget denied required conversion for [{unit_desc}] \
+                     ({why}; needed {need_desc}, remaining {} bytes)",
+                    budget.remaining_bytes()
+                )));
+            };
 
             let mut new_signs: HashMap<i64, MxArray> = HashMap::new();
             let mut built: Vec<BudgetBuiltOutput> = Vec::with_capacity(decoded_sources.len());
@@ -2581,9 +2606,7 @@ fn apply_clef_residency_core(
                 drop(new_signs);
                 drop(decoded_sources);
                 crate::array::clear_cache();
-                if let Some(need) = reserved_peak {
-                    budget.release(need);
-                }
+                budget.release(reserved_peak);
                 budget.refresh_from_free();
                 return Err(err);
             }
@@ -2637,13 +2660,11 @@ fn apply_clef_residency_core(
             drop(decoded_sources);
             drop(old_sources);
             crate::array::clear_cache();
-            if reserved_peak.is_some() {
-                budget.release(
-                    scratch_bytes
-                        .unwrap_or(0)
-                        .saturating_add(freed_source_device_bytes),
-                );
-            }
+            budget.release(
+                scratch_bytes
+                    .unwrap_or(0)
+                    .saturating_add(freed_source_device_bytes),
+            );
             budget.refresh_from_free();
             continue;
         }
@@ -11211,5 +11232,259 @@ mod tests {
                 "{name} forward produced non-finite values"
             );
         }
+    }
+
+    #[test]
+    fn clef_residency_budget_denies_mixed_dense_packed_mlp_with_error() {
+        let label = "clef_residency_budget_denies_mixed_dense_packed_mlp_with_error";
+        let Some(gate) = clef_dense_or_skip(label, 64, 128, 71) else {
+            return;
+        };
+        let Some(up) = clef_dense_or_skip(label, 64, 128, 72) else {
+            return;
+        };
+        let Some(down) = clef_dense_or_skip(label, 128, 64, 73) else {
+            return;
+        };
+
+        let mut before = HashMap::new();
+        insert_affine_group(&mut before, "layers.0.mlp.gate_proj", &gate, 8, 32);
+        insert_affine_group(&mut before, "layers.0.mlp.up_proj", &up, 8, 32);
+        before.insert("layers.0.mlp.down_proj.weight".to_string(), down);
+        eval_param_map(&before, label);
+
+        let before_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        let exhausted = CudaDeviceBudget::from_limits_for_test(16 << 30, Some(0), false);
+        assert!(!exhausted.is_unlimited());
+        assert_eq!(exhausted.remaining_bytes(), 0);
+
+        let mut params = before.clone();
+        let mut per_layer_quant = HashMap::new();
+        let err = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+        )
+        .err()
+        .expect("exhausted discrete budget must reject mixed dense+packed MLP conversion");
+
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("mixed dense+quantized MLP"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            per_layer_quant.is_empty(),
+            "denied conversion must not mutate per_layer_quant"
+        );
+        assert_eq!(params.len(), before.len());
+        assert_affine_untouched(&before, &params, "layers.0.mlp.gate_proj");
+        assert_affine_untouched(&before, &params, "layers.0.mlp.up_proj");
+        assert_dense_bf16(&params, "layers.0.mlp.down_proj", &[128, 64]);
+        for (key, before_ptr) in &before_ptrs {
+            assert_eq!(
+                params[key].as_raw_ptr(),
+                *before_ptr,
+                "denied mixed MLP conversion must not reallocate '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_residency_budget_denies_plain_fp8_e4m3_with_error() {
+        let label = "clef_residency_budget_denies_plain_fp8_e4m3_with_error";
+        let Some(dense) = clef_dense_or_skip(label, 64, 128, 81) else {
+            return;
+        };
+        let prefix = "layers.0.linear_attn.out_proj";
+        let (w, s_bf16) =
+            crate::quant::fp8_weight::quantize_per_output_channel(&dense, prefix).unwrap();
+        let s = s_bf16.astype(DType::Float32).unwrap();
+
+        let mut before = HashMap::new();
+        before.insert(format!("{prefix}.weight"), w);
+        before.insert(format!("{prefix}.scales"), s);
+        eval_param_map(&before, label);
+        assert_eq!(
+            before[&format!("{prefix}.weight")].dtype().unwrap(),
+            DType::Uint8
+        );
+        assert_eq!(
+            before[&format!("{prefix}.scales")].dtype().unwrap(),
+            DType::Float32
+        );
+        assert_eq!(
+            before[&format!("{prefix}.scales")]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            [64, 1]
+        );
+
+        let before_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let fp8_plq = PerLayerQuant {
+            bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            mode: PerLayerMode::Fp8E4m3,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let initial_quant = HashMap::from([(prefix.to_string(), fp8_plq)]);
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        let exhausted = CudaDeviceBudget::from_limits_for_test(16 << 30, Some(0), false);
+        assert!(!exhausted.is_unlimited());
+        assert_eq!(exhausted.remaining_bytes(), 0);
+
+        let mut params = before.clone();
+        let mut per_layer_quant = initial_quant.clone();
+        let err = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+        )
+        .err()
+        .expect("exhausted discrete budget must reject plain FP8 E4M3 conversion");
+
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("plain FP8 E4M3"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert_eq!(
+            per_layer_quant, initial_quant,
+            "denied FP8 conversion must not mutate per_layer_quant"
+        );
+        assert_eq!(params.len(), before.len());
+        assert_eq!(
+            params[&format!("{prefix}.weight")].dtype().unwrap(),
+            DType::Uint8
+        );
+        assert_eq!(
+            params[&format!("{prefix}.scales")].dtype().unwrap(),
+            DType::Float32
+        );
+        for (key, before_ptr) in &before_ptrs {
+            assert_eq!(
+                params[key].as_raw_ptr(),
+                *before_ptr,
+                "denied FP8 conversion must not reallocate '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_residency_budget_admits_plain_fp8_e4m3_when_headroom_suffices() {
+        let label = "clef_residency_budget_admits_plain_fp8_e4m3_when_headroom_suffices";
+        let sym8_prefix = "layers.0.linear_attn.out_proj";
+        let bf16_prefix = "layers.0.linear_attn.in_proj_ba";
+        let Some(sym8_dense) = clef_dense_or_skip(label, 64, 1024, 91) else {
+            return;
+        };
+        let Some(bf16_dense) = clef_dense_or_skip(label, 128, 256, 92) else {
+            return;
+        };
+
+        let mut before = HashMap::new();
+        for (prefix, dense) in [(sym8_prefix, &sym8_dense), (bf16_prefix, &bf16_dense)] {
+            let (w, s) =
+                crate::quant::fp8_weight::quantize_per_output_channel(dense, prefix).unwrap();
+            before.insert(format!("{prefix}.weight"), w);
+            before.insert(format!("{prefix}.scales"), s);
+        }
+        eval_param_map(&before, label);
+
+        let fp8_plq = PerLayerQuant {
+            bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            mode: PerLayerMode::Fp8E4m3,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let budget = CudaDeviceBudget::from_limits_for_test(16 << 30, Some(16 << 30), false);
+        assert!(!budget.is_unlimited());
+        let initial_remaining = budget.remaining_bytes();
+
+        let align = |b: u64| CudaDeviceBudget::align_bytes(b).unwrap();
+        let sym8_source_freed = align(before[&format!("{sym8_prefix}.weight")].nbytes() as u64)
+            + align(before[&format!("{sym8_prefix}.scales")].nbytes() as u64);
+        let sym8_output = align(64 * 1024) + align(64 * 4) + align(1024 * 4);
+        let bf16_source_freed = align(before[&format!("{bf16_prefix}.weight")].nbytes() as u64)
+            + align(before[&format!("{bf16_prefix}.scales")].nbytes() as u64);
+        let bf16_output = align(128 * 256 * 2);
+        let expected_net_charge =
+            (sym8_output - sym8_source_freed) + (bf16_output - bf16_source_freed);
+        assert!(expected_net_charge > 0);
+
+        let mut params = before.clone();
+        let mut per_layer_quant = HashMap::from([
+            (sym8_prefix.to_string(), fp8_plq),
+            (bf16_prefix.to_string(), fp8_plq),
+        ]);
+        let (transforms, byte_delta) = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            fp8_plq,
+            ClefResidency::Sym8,
+            &budget,
+        )
+        .unwrap();
+
+        assert_eq!(
+            params[&format!("{sym8_prefix}.weight")].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            params[&format!("{sym8_prefix}.weight")]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            [64, 1024]
+        );
+        assert_eq!(
+            params[&format!("{sym8_prefix}.scales")].dtype().unwrap(),
+            DType::Float32
+        );
+        assert_eq!(
+            params[&format!("{sym8_prefix}.scales")]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            [64]
+        );
+        assert!(!params.contains_key(&format!("{sym8_prefix}.biases")));
+        assert_eq!(per_layer_quant.get(sym8_prefix), Some(&clef_sym8_plq()));
+        assert!(transforms.contains_key(sym8_prefix));
+
+        assert_dense_bf16(&params, bf16_prefix, &[128, 256]);
+        assert!(!per_layer_quant.contains_key(bf16_prefix));
+        assert!(!transforms.contains_key(bf16_prefix));
+
+        assert_eq!(byte_delta, map_nbytes(&params) - map_nbytes(&before));
+        assert_eq!(
+            budget.remaining_bytes(),
+            initial_remaining - expected_net_charge,
+            "admitted plain FP8 conversions must account for output + freed source VRAM"
+        );
     }
 }
