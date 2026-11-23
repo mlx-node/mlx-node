@@ -58,6 +58,8 @@ export interface LocalModel {
    * directory serves nothing, or when discovery could not run.
    */
   servedIds: string[];
+  /** Set when Locate made the folder from files the user already had ({@link locatedState}). */
+  located: LocatedState | null;
 }
 
 /** Draft-only storage, managed on disk but excluded from standalone model lists. */
@@ -118,6 +120,38 @@ export interface DownloadCompletion {
    * when it rewrites the marker.
    */
   adopted?: Record<string, { size: number; mtimeNs: string }>;
+  /**
+   * Written only by Locate: the weight-like files of this folder ({@link isLinkableFile}) are second names of files
+   * in `from` (`shared`, same disk) or links to them (`linked`, another disk). Every other file is the app's own.
+   * The mlx CLI carries it when it rewrites the marker.
+   */
+  located?: LocatedRecord;
+}
+
+/** The `located` record of a marker written by Locate. */
+export interface LocatedRecord {
+  /** The real path of the folder the user located. */
+  from: string;
+  mode: 'shared' | 'linked';
+}
+
+/** The `located` record of a marker, or `undefined` when it is absent or in any other shape. */
+function readLocated(value: unknown): LocatedRecord | undefined {
+  const record = asObject(value);
+  if (record === undefined) return undefined;
+  const { from, mode } = record;
+  if (typeof from !== 'string' || !from.startsWith('/') || from.includes('\0')) return undefined;
+  if (mode !== 'shared' && mode !== 'linked') return undefined;
+  return { from, mode };
+}
+
+/**
+ * A file Locate gives a second name or a link instead of a copy: its path ends in `.gguf`, `.safetensors` or
+ * `.pdiparams`, in any case. Split parts, projectors, drafts and heads included.
+ */
+export function isLinkableFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith('.gguf') || lower.endsWith('.safetensors') || lower.endsWith('.pdiparams');
 }
 
 /** The `adopted` record of a marker: `undefined` when absent, `{}` when present in any shape but the one Update writes. */
@@ -450,7 +484,12 @@ function shardsComplete(modelDir: string): boolean {
  * files still exist on disk (that is `isModelInstalled`'s job); callers pair the two.
  */
 export function readCompletion(finalDir: string): DownloadCompletion | undefined {
-  const marker = asObject(readMarkerFile(finalDir));
+  return parseCompletion(readMarkerFile(finalDir));
+}
+
+/** The parsed JSON of a completion marker as its typed shape, by the rules of {@link readCompletion}. */
+export function parseCompletion(value: unknown): DownloadCompletion | undefined {
+  const marker = asObject(value);
   if (
     marker === undefined ||
     typeof marker.repo !== 'string' ||
@@ -467,6 +506,7 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     return undefined;
   }
   const adopted = readAdopted(marker.adopted);
+  const located = readLocated(marker.located);
   return {
     repo: marker.repo,
     revision: marker.revision,
@@ -479,7 +519,46 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
     ...(adopted !== undefined ? { adopted } : {}),
+    ...(located !== undefined ? { located } : {}),
   };
+}
+
+/** What a folder that Locate made uses, for the Models page and Local models. */
+export interface LocatedState extends LocatedRecord {
+  /** Every file the marker lists is there: the weights in `from` can be reached. */
+  filesAvailable: boolean;
+  /**
+   * Deleting the folder leaves the model files on disk: each of its weight-like files is a link or has another name.
+   * False when the folder holds the last name of one, so a delete frees its bytes.
+   */
+  filesStay: boolean;
+}
+
+/**
+ * The {@link LocatedState} of `dir`, or `null` when it is not a real folder whose marker Locate wrote, or when none of
+ * its weight-like files is a link or has another name any more.
+ */
+export function locatedState(dir: string): LocatedState | null {
+  try {
+    if (!lstatSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const completion = readCompletion(dir);
+  if (completion?.located === undefined) return null;
+  const { from, mode } = completion.located;
+  const elsewhere = completion.files.filter(isLinkableFile).map((file) => {
+    try {
+      const stat = lstatSync(join(dir, file));
+      return stat.isSymbolicLink() || stat.nlink >= 2;
+    } catch {
+      return false;
+    }
+  });
+  // Every weight file is the folder's own (`mlx download` wrote new copies, or the located originals were removed):
+  // the folder no longer uses the located files.
+  if (!elsewhere.includes(true)) return null;
+  return { from, mode, filesAvailable: isModelInstalled(dir), filesStay: !elsewhere.includes(false) };
 }
 
 /**
@@ -1042,6 +1121,7 @@ export function discoverLocalModels(
           sizeBytes,
           fileCount,
           servedIds: [],
+          located: locatedState(full),
         });
         continue;
       }
@@ -1068,6 +1148,7 @@ export function discoverLocalModels(
       sizeBytes,
       fileCount,
       servedIds: [],
+      located: locatedState(full),
     });
   }
 

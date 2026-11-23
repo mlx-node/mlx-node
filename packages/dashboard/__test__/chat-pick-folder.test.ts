@@ -30,24 +30,26 @@ function desktop(answer: (requestId: string) => unknown[]): unknown[] {
 }
 
 describe('pickFolder', () => {
-  it('sends only a request id and resolves with the folder answered for that id', async () => {
+  it('sends only a request id and the purpose, and resolves with the folder answered for that id', async () => {
     const requests = desktop((requestId) => [
       { type: FOLDER_PICKED_MESSAGE, requestId: 'someone-else', path: '/wrong' },
       { type: FOLDER_PICKED_MESSAGE, requestId, path: '/Users/me/code/app' },
     ]);
-    expect(await pickFolder()).toBe('/Users/me/code/app');
-    expect(requests).toHaveLength(1);
-    const request = requests[0] as Record<string, unknown>;
-    expect(Object.keys(request).sort()).toEqual(['requestId', 'type']);
-    expect(typeof request.requestId).toBe('string');
+    expect(await pickFolder('work')).toBe('/Users/me/code/app');
+    expect(await pickFolder('model')).toBe('/Users/me/code/app');
+    expect(requests).toHaveLength(2);
+    const [work, model] = requests as Array<Record<string, unknown>>;
+    expect(Object.keys(work!).sort()).toEqual(['purpose', 'requestId', 'type']);
+    expect([work!.purpose, model!.purpose]).toEqual(['work', 'model']);
+    expect(typeof work!.requestId).toBe('string');
   });
 
   it('resolves null for a cancelled dialog and an empty path', async () => {
     desktop((requestId) => [{ type: FOLDER_PICKED_MESSAGE, requestId, path: null }]);
-    expect(await pickFolder()).toBeNull();
+    expect(await pickFolder('work')).toBeNull();
     off?.();
     desktop((requestId) => [{ type: FOLDER_PICKED_MESSAGE, requestId, path: '' }]);
-    expect(await pickFolder()).toBeNull();
+    expect(await pickFolder('work')).toBeNull();
   });
 
   it('ignores an answer from another window', async () => {
@@ -62,10 +64,10 @@ describe('pickFolder', () => {
     };
     window.addEventListener('message', onMessage);
     off = () => window.removeEventListener('message', onMessage);
-    expect(await pickFolder(20)).toBeNull();
+    expect(await pickFolder('model', 20)).toBeNull();
   });
 
   it('resolves null when nothing answers', async () => {
-    expect(await pickFolder(20)).toBeNull();
+    expect(await pickFolder('model', 20)).toBeNull();
   });
 });

@@ -105,10 +105,11 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
         downloadsLoading={downloads.downloadsLoading}
         downloadsError={downloads.downloadsError}
         reloadDownloads={downloads.reloadDownloads}
-        renderDownload={(build) => (
+        renderDownload={(build, modelName) => (
           <CatalogDownloadAction
             {...downloads.downloadProps(build)}
             buildName={build.id}
+            modelName={modelName}
             prominent
             installLabel="Download model"
             settlingLabel="Checking download…"

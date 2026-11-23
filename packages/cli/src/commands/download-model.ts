@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { readdir, copyFile, rm, mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -929,11 +929,20 @@ async function fetchAssetSidecars(opts: {
         revision,
       }),
     );
-    await copyFile(snapshotPath, destPath);
+    await replaceWithCopy(snapshotPath, destPath);
     fetched.push(file.path);
   }
   console.log('');
   return { ensured: fetched, repo: opts.assetsRepo, revision: opts.plan.revision };
+}
+
+/**
+ * Put a new copy of `from` at `to`. The name at `to` is removed first and the copy is exclusive, so a write never goes
+ * through it: in a folder the dashboard's Locate made, that name is a second name of, or a link to, a user's file.
+ */
+async function replaceWithCopy(from: string, to: string): Promise<void> {
+  await rm(to, { force: true });
+  await copyFile(from, to, constants.COPYFILE_EXCL);
 }
 
 export interface GgufLoadEntry {
@@ -1617,7 +1626,7 @@ export async function run(argv: string[]) {
         }),
       );
       await ensureDir(dirname(destPath));
-      await copyFile(snapshotPath, destPath);
+      await replaceWithCopy(snapshotPath, destPath);
     }
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
       weightFiles.push(file.path);
@@ -1723,6 +1732,7 @@ export async function run(argv: string[]) {
           : {}),
       completedAt: new Date().toISOString(),
       ...(previousCompletion?.adopted !== undefined ? { adopted: previousCompletion.adopted } : {}),
+      ...(previousCompletion?.located !== undefined ? { located: previousCompletion.located } : {}),
     });
   };
 

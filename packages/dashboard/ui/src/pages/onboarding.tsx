@@ -16,7 +16,7 @@ import { dismissOnboarding } from '../lib/onboarding';
 import type { CatalogBuildItem, CatalogResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
 import { WindowDragStrip } from '../shell/window-chrome';
-import { hostNote } from './models/catalog';
+import { hostNote, locateName } from './models/catalog';
 import type { ModelDownloadError } from './models/use-model-downloads';
 
 interface OnboardingProps {
@@ -28,7 +28,8 @@ interface OnboardingProps {
   downloadsLoading: boolean;
   downloadsError: Error | undefined;
   reloadDownloads: () => void;
-  renderDownload: (build: CatalogBuildItem) => ReactNode;
+  /** The action of `build`; `modelName` is what a Locate confirmation names. */
+  renderDownload: (build: CatalogBuildItem, modelName: string) => ReactNode;
 }
 
 const STEPS = ['Choose a model', 'Download', 'Set up coding agents'] as const;
@@ -236,7 +237,7 @@ export default function Onboarding({
                 <div className="grid min-w-[min(100%,16rem)] flex-1 gap-1" aria-live="polite">
                   {downloading ? (
                     <LiveLabel active as="p" className="m-0 text-caption text-secondary">
-                      Downloading
+                      Getting the model
                     </LiveLabel>
                   ) : (
                     <p className="m-0 text-caption text-secondary">{ready ? 'Model ready' : 'Your first model'}</p>
@@ -244,9 +245,9 @@ export default function Onboarding({
                   <h2 className="m-0 text-heading font-medium text-foreground">{prettyModelName(selected.label)}</h2>
                   <p className="m-0 text-body text-secondary">
                     {ready
-                      ? 'The download is complete.'
+                      ? 'The model is ready.'
                       : downloading
-                        ? 'Keep the app open. You can look around while it downloads.'
+                        ? 'Keep the app open. You can look around while it finishes.'
                         : `About ${selectedBuild.sizeGb} GB to download.`}
                   </p>
                   {selected.builds.length > 1 ? (
@@ -274,7 +275,7 @@ export default function Onboarding({
                     </>
                   ) : (
                     <>
-                      <div className="w-full">{renderDownload(selectedBuild)}</div>
+                      <div className="w-full">{renderDownload(selectedBuild, locateName(selected, selectedBuild))}</div>
                       {downloading ? null : (
                         <a
                           className="link inline-flex items-center gap-1 text-caption"

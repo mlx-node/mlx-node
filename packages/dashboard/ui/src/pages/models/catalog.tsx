@@ -29,6 +29,7 @@ import { cn } from '../../lib/cn';
 import { errMessage } from '../../lib/errors';
 import { formatBytes, formatBytesParts, formatCount, formatCountNoun } from '../../lib/format';
 import { truncateMiddle } from '../../lib/labels';
+import { pickFolder } from '../../lib/pick-folder';
 import { toast } from '../../lib/toast';
 import type {
   AdoptPlanResponse,
@@ -36,6 +37,7 @@ import type {
   CatalogBuildItem,
   CatalogItem,
   LocalModel,
+  LocatePlanResponse,
   ModelsResponse,
 } from '../../lib/types';
 import styles from './catalog.module.css';
@@ -259,14 +261,98 @@ export function updateContent(slug: string, plan: AdoptPlanResponse, handlers: U
   };
 }
 
+const FOLDER_MAX_CHARS = 48;
+
+/** A folder path in a sentence: shortened in the middle, the whole path in its title. */
+function FolderName({ path }: { path: string }): ReactElement {
+  return (
+    <span className="font-medium text-foreground" title={path}>
+      {truncateMiddle(path, FOLDER_MAX_CHARS)}
+    </span>
+  );
+}
+
+export interface LocateHandlers {
+  onLocate: (plan: LocatePlanResponse) => Promise<void>;
+  onStarted: () => void;
+}
+
+/** The confirmation of a Locate of `name` (`Qwen3.8-27B UD-Q4_K_XL`), in the numbers and the mode of `plan`. */
+export function locateContent(name: string, plan: LocatePlanResponse, handlers: LocateHandlers): ConfirmContent {
+  const { use, download } = plan;
+  return {
+    title: 'Use these files?',
+    description: (
+      <>
+        The app found {filesText(use.count)} ({sizeText(use.bytes)}) of {name} in <FolderName path={plan.folder} />.{' '}
+        {plan.byRecord
+          ? `This folder has this app's install record for ${name}. The app trusts the record: it checks that the files are there and does not read them. `
+          : 'So far it checked names and sizes. Next it reads each file once to check its content. This can take a few minutes. '}
+        {plan.mode === 'shared'
+          ? 'Nothing is copied: the models folder shares these files on disk, so they take no extra space.'
+          : 'Nothing is copied: the app links to these files. The model works only while this disk is connected.'}
+        {download.count > 0
+          ? ` It downloads ${filesText(download.count)} (${sizeText(download.bytes)}) into the models folder.`
+          : null}
+      </>
+    ),
+    notice: 'Nothing in your folder is changed, moved or deleted.',
+    confirmLabel: 'Use files',
+    workingLabel: 'Starting…',
+    successLabel: 'Started',
+    tone: 'neutral',
+    errorTitle: 'Could not start Locate',
+    onConfirm: () => handlers.onLocate(plan),
+    onDone: handlers.onStarted,
+  };
+}
+
+/** The confirmation of an update of a located build: the job downloads the whole build into the models folder. */
+export function updateLocatedContent(
+  item: { sizeGb: number; located: { from: string } },
+  handlers: { onDownload: () => Promise<void>; onStarted: () => void },
+): ConfirmContent {
+  return {
+    title: 'Download the new version?',
+    description: (
+      <>
+        The app downloads it (about {item.sizeGb} GB) into the models folder. The files in{' '}
+        <FolderName path={item.located.from} /> are not changed, and the app stops using them.
+      </>
+    ),
+    confirmLabel: 'Download',
+    workingLabel: 'Starting…',
+    successLabel: 'Started',
+    tone: 'neutral',
+    errorTitle: 'Could not start the download',
+    onConfirm: handlers.onDownload,
+    onDone: handlers.onStarted,
+  };
+}
+
+/** The sentence of a located build whose files cannot be reached. */
+export function missingText(from: string): string {
+  return `${from} is not available. Connect the disk, or locate the files again.`;
+}
+
 /**
- * What a build's folder offers, first match: its job, an update, installed, a folder holding another build, a full
- * folder the app did not make (Update in place), one it cannot replace, something else in the way (Reinstall), Install.
+ * What a build's folder offers, first match: its job, an update, installed, located files that cannot be reached, a
+ * folder holding another build, a full folder the app did not make (Update in place), one it cannot replace, something
+ * else in the way (Reinstall), Install.
  */
-export type CatalogActionState = 'job' | 'update' | 'installed' | 'held' | 'adopt' | 'stuck' | 'replace' | 'install';
+export type CatalogActionState =
+  | 'job'
+  | 'update'
+  | 'installed'
+  | 'missing'
+  | 'held'
+  | 'adopt'
+  | 'stuck'
+  | 'replace'
+  | 'install';
 
 export function catalogActionState(
-  item: Pick<DownloadItem, 'present' | 'heldBy' | 'blocker'>,
+  item: Pick<DownloadItem, 'present' | 'heldBy' | 'blocker' | 'located'>,
   download: { job: ActiveJob | undefined; updateAvailable: boolean },
 ): CatalogActionState {
   // A live job is the only safe gate and must not be qualified by catalog state: an update re-installs something
@@ -275,6 +361,7 @@ export function catalogActionState(
   if (item.present && download.updateAvailable) return 'update';
   // `present`, not `installed`: an unowned install (mlx download) cannot be overwritten, so it gets no Install.
   if (item.present) return 'installed';
+  if (item.located?.filesAvailable === false) return 'missing';
   if (item.heldBy !== null) return 'held';
   const blocker = item.blocker;
   if (blocker?.holdsModel === true && blocker.kind === 'directory' && !blocker.truncated) return 'adopt';
@@ -394,9 +481,148 @@ function UpdateInPlaceAction(
   );
 }
 
+/** Locate on one build: the folder dialog, the server's check, a refusal, or a plan to confirm. */
+export type LocateView =
+  | { step: 'idle' }
+  | { step: 'pick' }
+  | { step: 'plan' }
+  | { step: 'refused'; message: string }
+  | { step: 'confirm'; plan: LocatePlanResponse };
+
+export interface LocateControl {
+  view: LocateView;
+  /** Opens the folder dialog, then checks the folder. Does nothing while the dialog or the check runs. */
+  start: () => void;
+  /** Closes the confirmation, or forgets a refusal. */
+  close: () => void;
+}
+
+const LOCATE_IDLE: LocateView = { step: 'idle' };
+
+/** Locate for the build that `download` installs. A cancelled dialog goes back to idle and says nothing. */
+export function useLocate(download: Pick<CatalogDownloadProps, 'item' | 'onPlanLocate'>): LocateControl {
+  const slug = download.item.slug;
+  const [state, setState] = useState<{ slug: string; view: LocateView }>({ slug, view: LOCATE_IDLE });
+  const busy = useRef(false);
+  const plan = download.onPlanLocate;
+  const start = (): void => {
+    if (busy.current) return;
+    busy.current = true;
+    setState({ slug, view: { step: 'pick' } });
+    void (async () => {
+      try {
+        const path = await pickFolder('model');
+        if (path === null) {
+          setState({ slug, view: LOCATE_IDLE });
+          return;
+        }
+        setState({ slug, view: { step: 'plan' } });
+        const found = await plan(path);
+        setState({ slug, view: { step: 'confirm', plan: found } });
+      } catch (err) {
+        setState({ slug, view: { step: 'refused', message: errMessage(err) } });
+      } finally {
+        busy.current = false;
+      }
+    })();
+  };
+  const close = (): void => setState((prev) => (prev.slug === slug ? { slug, view: LOCATE_IDLE } : prev));
+  return { view: state.slug === slug ? state.view : LOCATE_IDLE, start, close };
+}
+
+interface LocateButtonProps {
+  control: LocateControl;
+  /** The model the confirmation names: `Qwen3.8-27B UD-Q4_K_XL`. */
+  name: string;
+  download: Pick<CatalogDownloadProps, 'onLocate' | 'onReinstallStarted'>;
+  size: 'sm' | 'md';
+  align: 'start' | 'end';
+  /** Install is starting, or the last job is settling (`reason` says so). */
+  disabled: boolean;
+  reason?: string;
+  className?: string;
+}
+
+/**
+ * Locate…: picks a folder, shows "Checking…" while the server checks it, then grows into the confirmation. The button
+ * keeps its focus while it works (`aria-disabled`), and gets it back when the confirmation closes.
+ */
+function LocateButton({
+  control,
+  name,
+  download,
+  size,
+  align,
+  disabled,
+  reason,
+  className,
+}: LocateButtonProps): ReactElement {
+  const { view } = control;
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (view.step === 'confirm' || !refocus.current) return;
+    refocus.current = false;
+    buttonRef.current?.focus({ preventScroll: true });
+  }, [view.step]);
+  if (view.step === 'confirm') {
+    return (
+      <ConfirmPopover
+        trigger={{ kind: 'button', label: 'Locate…', variant: 'ghost', size }}
+        align={align}
+        open
+        onOpenChange={(open) => {
+          if (open) return;
+          refocus.current = true;
+          control.close();
+        }}
+        {...locateContent(name, view.plan, {
+          onLocate: download.onLocate,
+          onStarted: () => {
+            control.close();
+            download.onReinstallStarted();
+          },
+        })}
+      />
+    );
+  }
+  const busy = view.step === 'pick' || view.step === 'plan';
+  const off = disabled && !busy;
+  const button = (
+    <Button
+      ref={buttonRef}
+      type="button"
+      variant="ghost"
+      size={size}
+      className={className}
+      disabled={off}
+      aria-disabled={busy ? true : undefined}
+      onClick={() => {
+        if (!busy) control.start();
+      }}
+    >
+      {/* The word stays on screen: the check can take some seconds, and a bare spinner does not say what runs. */}
+      {view.step === 'plan' ? <MorphLoader size={14} status="loading" spinning className="text-muted" /> : null}
+      {view.step === 'plan' ? 'Checking…' : 'Locate…'}
+    </Button>
+  );
+  return (
+    <Tooltip content={off && reason !== undefined ? reason : 'Use model files that are already on this Mac'}>
+      {off ? <span className="inline-flex">{button}</span> : button}
+    </Tooltip>
+  );
+}
+
+/** The model name a Locate confirmation uses: the entry, and the build when the entry has more than one. */
+export function locateName(entry: Pick<CatalogItem, 'label' | 'builds'>, build: Pick<CatalogBuildItem, 'id'>): string {
+  return entry.builds.length > 1 ? `${entry.label} ${build.id}` : entry.label;
+}
+
 export interface CatalogDownloadActionProps extends CatalogDownloadProps {
   /** The name of what `item` installs (`UD-Q4_K_XL`), for a folder that holds another build. */
   buildName: string;
+  /** The model a Locate confirmation names ({@link locateName}). */
+  modelName: string;
 }
 
 /** Onboarding's action for one build: progress, Update, the Installed status, the cleanup note, or Install. */
@@ -414,13 +640,19 @@ export function CatalogDownloadAction({
   onReinstallStarted,
   onPlanUpdate,
   onUpdateInPlace,
+  onPlanLocate,
+  onLocate,
+  onRecheck,
+  onReplaceLocated,
   onDone,
   onError,
   onCancelled,
   onCancel,
   buildName,
+  modelName,
 }: CatalogDownloadActionProps): ReactElement {
   const [starting, setStarting] = useState(false);
+  const locate = useLocate({ item, onPlanLocate });
   const start = async (): Promise<void> => {
     if (starting) return;
     setStarting(true);
@@ -445,6 +677,26 @@ export function CatalogDownloadAction({
       </div>
     );
   }
+  if (state === 'update' && item.located !== null) {
+    return (
+      <ConfirmPopover
+        trigger={{
+          kind: 'button',
+          label: 'Update available',
+          variant: 'secondary',
+          size: 'md',
+          icon: <Download size={16} aria-hidden="true" />,
+        }}
+        align="start"
+        disabled={settling || updateSettling}
+        disabledReason="Checking the last download."
+        {...updateLocatedContent(
+          { sizeGb: item.sizeGb, located: item.located },
+          { onDownload: onReplaceLocated, onStarted: onReinstallStarted },
+        )}
+      />
+    );
+  }
   if (state === 'update') {
     return (
       <Button
@@ -465,6 +717,46 @@ export function CatalogDownloadAction({
         <MorphLoader size={14} status="success" />
         <span>Installed</span>
       </p>
+    );
+  }
+  const locateButton = (
+    <LocateButton
+      control={locate}
+      name={modelName}
+      download={{ onLocate, onReinstallStarted }}
+      size="sm"
+      align="start"
+      disabled={starting || settling}
+      reason={settling ? 'Checking the last download.' : undefined}
+    />
+  );
+  const refusal =
+    locate.view.step === 'refused' ? (
+      <HostNote text={locate.view.message} as={state === 'missing' ? 'span' : 'p'} />
+    ) : null;
+  if (state === 'missing' && item.located !== null) {
+    return (
+      <Alert tone="warning" title="Files not found">
+        <span className="grid justify-items-start gap-2">
+          <span>{missingText(item.located.from)}</span>
+          {refusal}
+          <span className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="secondary" size="sm" onClick={onRecheck}>
+              Check again
+            </Button>
+            {locateButton}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={starting || settling}
+              onClick={() => void start()}
+            >
+              Download instead
+            </Button>
+          </span>
+        </span>
+      </Alert>
     );
   }
   if (state === 'held') {
@@ -514,19 +806,27 @@ export function CatalogDownloadAction({
       </Alert>
     );
   }
+  const locating = locate.view.step === 'pick' || locate.view.step === 'plan';
   return (
-    <Button
-      type="button"
-      variant={prominent ? 'primary' : 'secondary'}
-      size={prominent ? 'lg' : 'md'}
-      className="w-full"
-      loading={starting}
-      disabled={starting || settling}
-      onClick={() => void start()}
-    >
-      {starting ? null : <Download size={16} aria-hidden="true" />}
-      {starting ? 'Starting download…' : settling ? settlingLabel : installLabel}
-    </Button>
+    <div className="grid justify-items-center gap-2">
+      <Button
+        type="button"
+        variant={prominent ? 'primary' : 'secondary'}
+        size={prominent ? 'lg' : 'md'}
+        className="w-full"
+        loading={starting}
+        disabled={starting || settling || locating}
+        onClick={() => {
+          locate.close();
+          void start();
+        }}
+      >
+        {starting ? null : <Download size={16} aria-hidden="true" />}
+        {starting ? 'Starting download…' : settling ? settlingLabel : installLabel}
+      </Button>
+      {locateButton}
+      {refusal}
+    </div>
   );
 }
 
@@ -585,7 +885,9 @@ export function buildMark(
   download: Pick<CatalogDownloadProps, 'item' | 'job' | 'updateAvailable'>,
 ): BuildMarkKind | null {
   if (download.job !== undefined) return 'downloading';
-  if (download.item.blocker !== null || download.item.heldBy !== null) return 'attention';
+  const { item } = download;
+  if (item.blocker !== null || item.heldBy !== null) return 'attention';
+  if (!item.present && item.located?.filesAvailable === false) return 'attention';
   if (download.item.present && download.updateAvailable) return 'update';
   if (download.item.present) return 'installed';
   return null;
@@ -626,20 +928,70 @@ function OneLine({
   );
 }
 
+/** A warning that fits one line: the line opens a popover with all of it, for the pointer and the keyboard. */
+function WarningLine({ line, title, text }: { line: string; title: string; text: string }): ReactElement {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="flex max-w-full min-w-0 cursor-pointer items-center gap-1.5 text-start text-caption text-warning"
+        >
+          <AlertTriangle size={12} aria-hidden="true" className="shrink-0" />
+          <span className="min-w-0 truncate">{line}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start">
+        <p className="m-0 text-body font-medium text-foreground">{title}</p>
+        <p className="m-0 mt-1 text-body text-secondary">{text}</p>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function BuildLine({
   entry,
   build,
   download,
   progress,
   host,
+  refusal,
 }: {
   entry: CatalogItem;
   build: CatalogBuildItem;
   download: CatalogDownloadProps;
   progress: ProgressState;
   host: ModelsResponse['host'] | undefined;
+  /** Why the folder the user picked for Locate cannot be used. */
+  refusal: string | null;
 }): ReactElement {
   const job = download.job;
+  const located = download.item.located;
+  if (job === undefined && (refusal !== null || (located !== null && !located.filesAvailable && !build.present))) {
+    return (
+      <p className={cn('m-0', styles.line)}>
+        {refusal !== null ? (
+          <WarningLine line={refusal} title="Could not use this folder" text={refusal} />
+        ) : located !== null ? (
+          <WarningLine
+            line={`Files not found · ${located.from}`}
+            title="Files not found"
+            text={missingText(located.from)}
+          />
+        ) : null}
+      </p>
+    );
+  }
+  if (job === undefined && located !== null && build.present) {
+    const text = `Uses files in ${located.from}`;
+    return (
+      <p className={cn('m-0 text-caption text-secondary', styles.line)} data-located={located.mode}>
+        <OneLine tooltip={text}>
+          <span className="min-w-0 truncate">Uses files in {truncateMiddle(located.from, FOLDER_MAX_CHARS)}</span>
+        </OneLine>
+      </p>
+    );
+  }
   const warning = job === undefined ? hostLine(build, entry.minMemoryGb, host) : null;
   const text =
     job !== undefined
@@ -724,7 +1076,7 @@ interface RowProps {
   onStart: (download: CatalogDownloadProps) => void;
   detailsTo: string | undefined;
   openTo: string | undefined;
-  locate: ((build: CatalogBuildItem) => void) | undefined;
+  locate: LocateControl | undefined;
 }
 
 /** The bottom row: one control that acts on the chosen build, and at most one in the right slot. */
@@ -785,12 +1137,30 @@ function ActionRow({
     );
   }
   if (state === 'installed' || state === 'update') {
+    const located = item.located;
     return (
       <>
         <div className={styles.primary}>
           <InstalledText detailsTo={detailsTo} openTo={openTo} />
         </div>
-        {state === 'update' ? (
+        {state === 'update' && located !== null ? (
+          <ConfirmPopover
+            trigger={{
+              kind: 'button',
+              label: 'Update',
+              variant: 'secondary',
+              size: 'sm',
+              icon: <Download size={16} aria-hidden="true" />,
+            }}
+            align="end"
+            disabled={starting || settling || updateSettling}
+            disabledReason="Checking the last download."
+            {...updateLocatedContent(
+              { sizeGb: build.sizeGb, located },
+              { onDownload: download.onReplaceLocated, onStarted: download.onReinstallStarted },
+            )}
+          />
+        ) : state === 'update' ? (
           <Button
             type="button"
             variant="secondary"
@@ -802,6 +1172,43 @@ function ActionRow({
             Update
           </Button>
         ) : null}
+      </>
+    );
+  }
+  const locateButton = (size: 'sm' | 'md') =>
+    locate === undefined ? null : (
+      <LocateButton
+        control={locate}
+        name={locateName(entry, build)}
+        download={download}
+        size={size}
+        align="end"
+        disabled={starting || settling}
+        reason={settling ? 'Checking the last download.' : undefined}
+      />
+    );
+  const locating = locate?.view.step === 'pick' || locate?.view.step === 'plan';
+  if (state === 'missing') {
+    return (
+      <>
+        <div className={styles.primary}>
+          <Button type="button" variant="secondary" size="sm" onClick={download.onRecheck}>
+            Check again
+          </Button>
+        </div>
+        {locateButton('sm')}
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          disabled={starting || settling || locating}
+          onClick={() => {
+            locate?.close();
+            onStart(download);
+          }}
+        >
+          Download instead
+        </Button>
       </>
     );
   }
@@ -886,8 +1293,11 @@ function ActionRow({
       size="md"
       className="max-w-72"
       loading={starting}
-      disabled={starting || settling}
-      onClick={() => onStart(download)}
+      disabled={starting || settling || locating}
+      onClick={() => {
+        locate?.close();
+        onStart(download);
+      }}
     >
       {starting ? null : <Download size={16} aria-hidden="true" />}
       {starting ? 'Starting download…' : entry.builds.length > 1 ? `Install ${build.id}` : 'Install'}
@@ -904,13 +1314,7 @@ function ActionRow({
           install
         )}
       </div>
-      {locate !== undefined ? (
-        <Tooltip content="Use a folder on this Mac that already holds this build. Nothing is downloaded.">
-          <Button type="button" variant="ghost" size="md" disabled={starting} onClick={() => locate(build)}>
-            Locate…
-          </Button>
-        </Tooltip>
-      ) : null}
+      {locateButton('md')}
     </>
   );
 }
@@ -1091,8 +1495,8 @@ export interface CatalogCardViewProps {
   detailsTo?: string;
   /** A workspace for the chosen build (`/system-one?model=…`). */
   openTo?: string;
-  /** Adds Locate… beside Install. */
-  locate?: (build: CatalogBuildItem) => void;
+  /** Locate of the chosen build: Locate… beside Install and in the "Files not found" state. */
+  locate?: LocateControl;
 }
 
 /** One recommended model in five fixed rows: title, description, build, extras, action. */
@@ -1118,6 +1522,9 @@ export function CatalogCardView({
   const download = downloads[index];
   const busy = downloads.some((props) => props.job !== undefined) || draft?.download.job !== undefined;
   const included = build.included ?? '';
+  const state = catalogActionState(download.item, download);
+  const refusal =
+    locate?.view.step === 'refused' && (state === 'install' || state === 'missing') ? locate.view.message : null;
   return (
     <div
       data-model={entry.builds[0].slug}
@@ -1184,7 +1591,17 @@ export function CatalogCardView({
                 </Badge>
               )}
             </div>
-            <BuildLine entry={entry} build={build} download={download} progress={progress} host={host} />
+            <BuildLine
+              entry={entry}
+              build={build}
+              download={download}
+              progress={progress}
+              host={host}
+              refusal={refusal}
+            />
+            <span className="sr-only" aria-live="polite">
+              {refusal}
+            </span>
           </div>
           <div data-row="extras" className={styles.line}>
             {entry.draft !== undefined && draft !== undefined ? (
@@ -1227,7 +1644,10 @@ function JobFollower({ download }: { download: CatalogDownloadProps }): null {
   return null;
 }
 
-export interface CatalogCardProps extends Omit<CatalogCardViewProps, 'progress' | 'draft' | 'starting' | 'onStart'> {
+export interface CatalogCardProps extends Omit<
+  CatalogCardViewProps,
+  'progress' | 'draft' | 'starting' | 'onStart' | 'locate'
+> {
   draft?: CatalogDownloadProps;
 }
 
@@ -1240,6 +1660,7 @@ export function CatalogCard({ draft, ...props }: CatalogCardProps): ReactElement
   const shown = props.downloads[index];
   const progress = useDownloadProgress(shown.job?.id, shown);
   const draftProgress = useDownloadProgress(draft?.job?.id, draft ?? {});
+  const locate = useLocate(shown);
   const [starting, setStarting] = useState<readonly string[]>([]);
   const inFlight = useRef(new Set<string>());
   const start = (download: CatalogDownloadProps): void => {
@@ -1265,6 +1686,7 @@ export function CatalogCard({ draft, ...props }: CatalogCardProps): ReactElement
         draft={draft === undefined ? undefined : { download: draft, progress: draftProgress }}
         starting={starting}
         onStart={start}
+        locate={locate}
       />
     </>
   );

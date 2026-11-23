@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -10,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir, totalmem } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { type CatalogBuild, catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
@@ -29,6 +30,7 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
+  locatedState,
   modelsDirUnavailable,
   readCompletion,
   summarizeForeignEntry,
@@ -805,6 +807,82 @@ describe('readCompletion — the adopted record', () => {
     const read = readCompletion(dir);
     expect(read).toEqual(BASE);
     expect(read !== undefined && 'adopted' in read).toBe(false);
+  });
+});
+
+describe('readCompletion — the located record', () => {
+  const BASE = {
+    repo: 'owner/repo',
+    revision: 'a'.repeat(40),
+    files: ['config.json', 'model.gguf'],
+    scope: 'full',
+    completedAt: 'x',
+  };
+
+  function writeMarker(dir: string, body: unknown): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), JSON.stringify(body));
+  }
+
+  it('reads the located record of a marker', () => {
+    const dir = join(modelsDir, 'located');
+    for (const mode of ['shared', 'linked']) {
+      writeMarker(dir, { ...BASE, located: { from: '/Users/me/models/qwen', mode } });
+      expect(readCompletion(dir)).toEqual({ ...BASE, located: { from: '/Users/me/models/qwen', mode } });
+    }
+  });
+
+  it('reads any other shape as absent, and the marker still counts as owned', () => {
+    const cases: [string, unknown][] = [
+      ['string', '/Users/me'],
+      ['null', null],
+      ['array', ['/Users/me', 'shared']],
+      ['relative', { from: 'me/models', mode: 'shared' }],
+      ['nul', { from: '/a\0b', mode: 'shared' }],
+      ['from-number', { from: 1, mode: 'shared' }],
+      ['mode-copy', { from: '/a', mode: 'copy' }],
+      ['mode-missing', { from: '/a' }],
+    ];
+    for (const [name, located] of cases) {
+      const dir = join(modelsDir, `located-${name}`);
+      writeMarker(dir, { ...BASE, located });
+      const read = readCompletion(dir);
+      expect([name, read !== undefined && 'located' in read]).toEqual([name, false]);
+      expect([name, isDownloaderOwned(dir)]).toEqual([name, true]);
+      expect([name, locatedState(dir)]).toEqual([name, null]);
+    }
+  });
+
+  it('reads the state of a located folder: files there, and whether a delete leaves them', () => {
+    const user = join(modelsDir, '..', `${basename(modelsDir)}-user`);
+    mkdirSync(user, { recursive: true });
+    onTestFinished(() => rmSync(user, { recursive: true, force: true }));
+    writeFileSync(join(user, 'model.gguf'), 'w');
+    const dir = join(modelsDir, 'located-state');
+    writeMarker(dir, { ...BASE, located: { from: user, mode: 'shared' } });
+    writeFileSync(join(dir, 'config.json'), '{}');
+    linkSync(join(user, 'model.gguf'), join(dir, 'model.gguf'));
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'shared', filesAvailable: true, filesStay: true });
+    // The user removed their name: the app's is the last one, so the folder is a plain install.
+    rmSync(join(user, 'model.gguf'));
+    expect(locatedState(dir)).toBeNull();
+    // A link to a file that is gone: nothing is there to free, and the files are not available.
+    rmSync(join(dir, 'model.gguf'));
+    symlinkSync(join(user, 'model.gguf'), join(dir, 'model.gguf'));
+    writeMarker(dir, { ...BASE, located: { from: user, mode: 'linked' } });
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'linked', filesAvailable: false, filesStay: true });
+    // `mlx download` put its own new copy in place of the link and kept the record: the folder is a plain install.
+    rmSync(join(dir, 'model.gguf'));
+    writeFileSync(join(dir, 'model.gguf'), 'w');
+    expect(locatedState(dir)).toBeNull();
+    // One weight file is the folder's own and one is still a link: located, and a delete frees the own one.
+    writeMarker(dir, { ...BASE, files: [...BASE.files, 'part.gguf'], located: { from: user, mode: 'linked' } });
+    writeFileSync(join(user, 'part.gguf'), 'p');
+    symlinkSync(join(user, 'part.gguf'), join(dir, 'part.gguf'));
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'linked', filesAvailable: true, filesStay: false });
+    // A link at the slug is never read as a located folder.
+    symlinkSync(dir, join(modelsDir, 'located-link'));
+    expect(locatedState(join(modelsDir, 'located-link'))).toBeNull();
   });
 });
 

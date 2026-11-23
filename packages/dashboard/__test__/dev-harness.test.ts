@@ -130,18 +130,21 @@ describe('dev harness plugin', () => {
     expect([...socket.listeners.values()].every((set) => set.size === 0)).toBe(true);
   });
 
-  it('the plan route is guarded offline', async () => {
-    const runtime = fakeRuntime();
-    const call = { method: 'POST', path: '/api/downloads/adopt-plan', body: { slug: 'x' } };
-    expect(await guardRuntime(runtime, false).call(call)).toMatchObject({
-      ok: false,
-      code: 'E_UNAVAILABLE',
-      message: 'Disabled in the dev harness',
-    });
-    expect(runtime.calls).toEqual([]);
-    expect((await guardRuntime(runtime, true).call(call)).ok).toBe(true);
-    expect(runtime.calls.map((c) => `${c.method} ${c.path}`)).toEqual(['POST /api/downloads/adopt-plan']);
-  });
+  it.each(['/api/downloads/adopt-plan', '/api/downloads/locate-plan'])(
+    'the plan route %s is guarded offline',
+    async (path) => {
+      const runtime = fakeRuntime();
+      const call = { method: 'POST', path, body: { slug: 'x', path: '/fixture/lmstudio/models' } };
+      expect(await guardRuntime(runtime, false).call(call)).toMatchObject({
+        ok: false,
+        code: 'E_UNAVAILABLE',
+        message: 'Disabled in the dev harness',
+      });
+      expect(runtime.calls).toEqual([]);
+      expect((await guardRuntime(runtime, true).call(call)).ok).toBe(true);
+      expect(runtime.calls.map((c) => `${c.method} ${c.path}`)).toEqual([`POST ${path}`]);
+    },
+  );
 
   it('answers the two network routes locally unless the network is allowed', async () => {
     const runtime = fakeRuntime();
@@ -161,23 +164,31 @@ describe('dev harness plugin', () => {
     ]);
   });
 
-  it('answers a folder request with the fixture work folder, to the asking tab only', () => {
+  it('answers a folder request with the fixture folder of its purpose, to the asking tab only', () => {
     const socket = new FakeSocket();
     const client = new FakeClient();
     const other = new FakeClient();
-    const detach = attachHarness(socket, fakeRuntime(), '/fixture/work');
-    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-1', path: '/etc' }, client);
-    for (const requestId of ['', 'x'.repeat(65), 7, undefined]) socket.emit(DEV_PICK_FOLDER, { requestId }, client);
+    const detach = attachHarness(socket, fakeRuntime(), { work: '/fixture/work', model: '/fixture/lmstudio/models' });
+    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-1', purpose: 'work', path: '/etc' }, client);
+    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-m', purpose: 'model' }, client);
+    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-x', purpose: 'Work' }, client);
+    for (const requestId of ['', 'x'.repeat(65), 7, undefined]) {
+      socket.emit(DEV_PICK_FOLDER, { requestId, purpose: 'work' }, client);
+    }
     socket.emit(DEV_PICK_FOLDER, null, client);
-    expect(client.sent).toEqual([{ event: DEV_FOLDER, payload: { requestId: 'r-1', path: '/fixture/work' } }]);
+    expect(client.sent).toEqual([
+      { event: DEV_FOLDER, payload: { requestId: 'r-1', path: '/fixture/work' } },
+      { event: DEV_FOLDER, payload: { requestId: 'r-m', path: '/fixture/lmstudio/models' } },
+      { event: DEV_FOLDER, payload: { requestId: 'r-x', path: null } },
+    ]);
     expect(other.sent).toEqual([]);
     detach();
-    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-2' }, client);
-    expect(client.sent).toHaveLength(1);
+    socket.emit(DEV_PICK_FOLDER, { requestId: 'r-2', purpose: 'work' }, client);
+    expect(client.sent).toHaveLength(3);
 
     const bare = new FakeSocket();
     attachHarness(bare, fakeRuntime());
-    bare.emit(DEV_PICK_FOLDER, { requestId: 'r-3' }, other);
+    bare.emit(DEV_PICK_FOLDER, { requestId: 'r-3', purpose: 'work' }, other);
     expect(other.sent).toEqual([{ event: DEV_FOLDER, payload: { requestId: 'r-3', path: null } }]);
   });
 

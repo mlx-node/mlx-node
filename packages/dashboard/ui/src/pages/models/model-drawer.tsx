@@ -54,7 +54,7 @@ import {
   type TurnRow,
 } from '../../lib/types';
 import { LIVE_REFETCH_FAST_MS, useJson } from '../../lib/use-api';
-import { deleteContent, LiveBadge, liveStateOf, usageKeyOf } from './local-models';
+import { deleteContent, LiveBadge, liveStateOf, removesOnlyFromApp, usageKeyOf } from './local-models';
 
 export interface ModelDrawerProps {
   /** The folder named by ?focus=, or null when the drawer is closed. */
@@ -266,6 +266,21 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
       numeric: true,
     },
   ];
+  const located = model.located;
+  if (located !== null) {
+    disk.push({
+      key: 'located',
+      label: located.mode === 'shared' ? 'Shares files with' : 'Linked to',
+      value: (
+        <>
+          <PathText path={located.from} maxChars={42} />
+          {located.filesAvailable ? null : <span className="text-warning"> · not available</span>}
+        </>
+      ),
+      mono: true,
+      copy: located.from,
+    });
+  }
   if (catalogBuild !== undefined) {
     disk.push({
       key: 'source',
@@ -587,7 +602,11 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
       <div className="flex flex-wrap items-center justify-between gap-2">
         <CopyButton value={model.name} label="Copy name" />
         <ConfirmPopover
-          trigger={{ kind: 'button', label: 'Delete model', variant: 'danger' }}
+          trigger={
+            removesOnlyFromApp(model)
+              ? { kind: 'button', label: 'Remove model', variant: 'secondary' }
+              : { kind: 'button', label: 'Delete model', variant: 'danger' }
+          }
           align="end"
           {...deleteContent(model, { loaded: state.resident !== undefined, onDeleted: props.onDeleted })}
         />

@@ -23,6 +23,7 @@ function models(count: number, warnings: string[] = []): ModelsResponse {
       sizeBytes: 1,
       fileCount: 1,
       servedIds: [],
+      located: null,
     })),
     warnings,
     dir: '/models',

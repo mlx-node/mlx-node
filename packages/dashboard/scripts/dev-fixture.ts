@@ -14,6 +14,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   truncateSync,
   utimesSync,
   writeFileSync,
@@ -2294,6 +2295,53 @@ function writeCatalogUpdate(home: string): void {
   writeFileSync(join(dir, 'README.md'), '# Clairic Flash\n\nCopied from another Mac.\n');
 }
 
+/**
+ * A catalog model (Clairic (27B)) that Locate made from a folder on another disk: the app's folder links to the weight
+ * files in {@link CATALOG_LOCATED.source} and holds its own copies of the small files. The card reads as installed with
+ * the folder it uses, and Local models shows the Linked badge. The links stay inside the fixture home.
+ */
+export const CATALOG_LOCATED = {
+  repo: 'Brooooooklyn/Clairic-GGUF',
+  slug: 'clairic-gguf',
+  /** Under the fixture home: the folder the harness's Locate dialog answers with. */
+  picked: 'lmstudio/models',
+  source: 'lmstudio/models/Brooooooklyn/Clairic-GGUF',
+  weights: ['Clairic-UD-Q4_K_XL.gguf', 'mmproj-BF16.gguf', 'clair_head.safetensors'],
+  weightsBytes: [18 * GIB, 876 * MIB, 24 * MIB],
+  small: ['config.json', 'clair_head_config.json', 'preprocessor_config.json'],
+  assetsRepo: 'Cloudflare/clairic',
+} as const;
+
+function writeCatalogLocated(home: string, now: number): void {
+  const source = join(home, CATALOG_LOCATED.source);
+  mkdirSync(source, { recursive: true });
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_LOCATED.slug);
+  mkdirSync(dir, { recursive: true });
+  CATALOG_LOCATED.weights.forEach((name, index) => {
+    const file = join(source, name);
+    writeFileSync(file, '');
+    truncateSync(file, CATALOG_LOCATED.weightsBytes[index]!);
+    const link = join(dir, name);
+    rmSync(link, { force: true });
+    symlinkSync(realpathSync(file), link);
+  });
+  for (const name of CATALOG_LOCATED.small) {
+    const value = name === 'config.json' ? { model_type: 'qwen3_5', max_position_embeddings: 262144 } : {};
+    writeJson(join(source, name), value);
+    writeJson(join(dir, name), value);
+  }
+  writeJson(join(dir, '.mlx-download-complete.json'), {
+    repo: CATALOG_LOCATED.repo,
+    revision: '3f0b1c2d4e5f60718293a4b5c6d7e8f901234567',
+    completedAt: new Date(now - 4 * DAY_MS).toISOString(),
+    files: [...CATALOG_LOCATED.small, ...CATALOG_LOCATED.weights].sort(),
+    scope: 'full',
+    assetsRepo: CATALOG_LOCATED.assetsRepo,
+    assetsRevision: '0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3',
+    located: { from: realpathSync(source), mode: 'linked' },
+  });
+}
+
 export interface FixtureSummary {
   traces: number;
   sessions: number;
@@ -2325,6 +2373,7 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   writeCatalogSecondBuild(home, now);
   writeCatalogBlocked(home);
   writeCatalogUpdate(home);
+  writeCatalogLocated(home, now);
   writeCodingAgents(home);
   return { traces, sessions, live };
 }

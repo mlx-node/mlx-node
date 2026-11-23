@@ -15,6 +15,7 @@ import type {
   DownloadJob,
   DownloadStartResponse,
   DownloadsResponse,
+  LocatePlanResponse,
   ModelsResponse,
 } from '../../lib/types';
 import { type AsyncState, useJson } from '../../lib/use-api';
@@ -86,6 +87,8 @@ export type DownloadItem = Pick<
   | 'blocker'
   | 'heldBy'
   | 'slug'
+  | 'sizeGb'
+  | 'located'
 >;
 
 export interface CatalogDownloadProps {
@@ -110,6 +113,17 @@ export interface CatalogDownloadProps {
   onPlanUpdate: () => Promise<AdoptPlanResponse>;
   /** Starts the Update the plan with `token` describes and keeps the job id. Rejects with the server text. */
   onUpdateInPlace: (token: string) => Promise<void>;
+  /** What Locate would use from the folder at `path`; writes nothing. Rejects with the server text. */
+  onPlanLocate: (path: string) => Promise<LocatePlanResponse>;
+  /** Starts the Locate that `plan` describes and keeps the job id. Rejects with the server text. */
+  onLocate: (plan: LocatePlanResponse) => Promise<void>;
+  /** Reads the folders again: a disk that was away may be back. */
+  onRecheck: () => void;
+  /**
+   * Update of a located build: downloads the whole build into the models folder and keeps the job id until the
+   * confirmation hands over. Rejects with the server text.
+   */
+  onReplaceLocated: () => Promise<void>;
   onDone: (keptDir: string | undefined) => void;
   onError: (message: string) => void;
   onCancelled: () => void;
@@ -294,6 +308,35 @@ export function useModelDownloads(
       throw err;
     }
   };
+  /** The folder each Locate job this page started uses, by slug, for its toast. */
+  const locates = useRef(new Map<string, string>());
+  const planLocate = (item: DownloadItem, path: string): Promise<LocatePlanResponse> =>
+    mutate<LocatePlanResponse>('POST', '/downloads/locate-plan', { slug: item.slug, path });
+  const locate = async (item: DownloadItem, plan: LocatePlanResponse): Promise<void> => {
+    const startedConnection = connection;
+    try {
+      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { slug: item.slug, locate: plan.token });
+      reinstalls.current.set(item.slug, { id: res.id, connection: startedConnection });
+      locates.current.set(item.slug, plan.folder);
+    } catch (err) {
+      reloadCatalog();
+      throw err;
+    }
+  };
+  const replaceLocated = async (item: DownloadItem): Promise<void> => {
+    const startedConnection = connection;
+    try {
+      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { slug: item.slug });
+      reinstalls.current.set(item.slug, { id: res.id, connection: startedConnection });
+    } catch (err) {
+      reloadCatalog();
+      throw err;
+    }
+  };
+  const recheck = (): void => {
+    reloadModels();
+    reloadCatalog();
+  };
   const reinstallStarted = (slug: string): void => {
     const kept = reinstalls.current.get(slug);
     reinstalls.current.delete(slug);
@@ -311,10 +354,16 @@ export function useModelDownloads(
 
   const onDownloadDone = (item: DownloadItem, keptDir: string | undefined): void => {
     const slug = item.slug;
-    toast.success(isUpdateInPlace(item) ? 'Update complete' : 'Download complete', {
-      description:
-        keptDir === undefined ? slug : `Files that were added or changed in the old folder are in ${keptDir}.`,
-    });
+    const located = locates.current.get(slug);
+    locates.current.delete(slug);
+    if (located !== undefined) {
+      toast.success('Model located', { description: `Uses the files in ${located}.` });
+    } else {
+      toast.success(isUpdateInPlace(item) ? 'Update complete' : 'Download complete', {
+        description:
+          keptDir === undefined ? slug : `Files that were added or changed in the old folder are in ${keptDir}.`,
+      });
+    }
     const id = active[slug]?.id;
     setActive((prev) => {
       const next = { ...prev };
@@ -333,8 +382,14 @@ export function useModelDownloads(
 
   const onDownloadError = (item: DownloadItem, message: string): void => {
     const slug = item.slug;
-    setDownloadError({ slug, message });
-    toast.error(isUpdateInPlace(item) ? 'Update failed' : 'Download failed', { description: message });
+    const located = locates.current.has(slug);
+    locates.current.delete(slug);
+    if (located) {
+      toast.error('Locate failed', { description: message });
+    } else {
+      setDownloadError({ slug, message });
+      toast.error(isUpdateInPlace(item) ? 'Update failed' : 'Download failed', { description: message });
+    }
     // `error` can still have installed: refresh both halves of the update verdict.
     setSettledOn((prev) => new Map(prev).set(slug, settledBodies()));
     models.reload();
@@ -353,6 +408,7 @@ export function useModelDownloads(
 
   /** The job stopped without finishing, learned from the STREAM (a cancel from elsewhere, or shutdown). Silent. */
   const onDownloadCancelled = (slug: string): void => {
+    locates.current.delete(slug);
     setActive((prev) => {
       if (prev[slug] === undefined) return prev;
       const next = { ...prev };
@@ -368,7 +424,7 @@ export function useModelDownloads(
   const cancel = async (slug: string, id: string): Promise<void> => {
     try {
       await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
-      toast.success('Download cancelled', { description: slug });
+      toast.success(locates.current.has(slug) ? 'Locate cancelled' : 'Download cancelled', { description: slug });
       // Mark, never drop: the job emits its terminal frame as it unwinds, and only that frame proves it is done
       // touching the disk. Dropping here would close the stream before it lands.
       setActive((prev) => {
@@ -398,6 +454,10 @@ export function useModelDownloads(
     onReinstallStarted: () => reinstallStarted(item.slug),
     onPlanUpdate: () => planUpdate(item),
     onUpdateInPlace: (token) => updateInPlace(item, token),
+    onPlanLocate: (path) => planLocate(item, path),
+    onLocate: (plan) => locate(item, plan),
+    onRecheck: recheck,
+    onReplaceLocated: () => replaceLocated(item),
     onDone: (keptDir) => onDownloadDone(item, keptDir),
     onError: (message) => onDownloadError(item, message),
     onCancelled: () => onDownloadCancelled(item.slug),
@@ -426,6 +486,12 @@ export function entryDownloads(
       item.draft === undefined
         ? undefined
         : // Drafts carry no tokenizer sidecars of their own, and no other build shares their folder.
-          downloads.downloadProps({ ...item.draft, heldBy: null, localAssetsRepo: null, localAssetsRevision: null }),
+          downloads.downloadProps({
+            ...item.draft,
+            heldBy: null,
+            localAssetsRepo: null,
+            localAssetsRevision: null,
+            located: null,
+          }),
   };
 }

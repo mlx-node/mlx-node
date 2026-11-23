@@ -38,6 +38,11 @@ function isRequestId(value: unknown): value is string {
   return typeof value === 'string' && value.length >= 1 && value.length <= 64;
 }
 
+/** Keep in sync with `isFolderPurpose` in `src/main/window-policy.ts`. */
+function isFolderPurpose(value: unknown): value is 'work' | 'model' {
+  return value === 'work' || value === 'model';
+}
+
 /**
  * Keep in sync with `DASHBOARD_PORT_MESSAGE` in
  * `packages/dashboard/src/rpc/protocol.ts` — the tag the SPA compares `event.data`
@@ -92,12 +97,12 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
   const data: unknown = event.data;
   if (typeof data !== 'object' || data === null) return;
-  const message = data as { type?: unknown; requestId?: unknown };
+  const message = data as { type?: unknown; requestId?: unknown; purpose?: unknown };
   const type = message.type;
   if (type === CONTROL_PANEL_READY_CHANNEL) requestPort();
-  // Only a request id crosses: the dialog's folder, title and options are MAIN's alone.
-  if (type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId)) {
-    ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId);
+  // Only a request id and one of two fixed words cross: the dialog's folder, title and options are MAIN's alone.
+  if (type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId) && isFolderPurpose(message.purpose)) {
+    ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId, message.purpose);
   }
 });
 

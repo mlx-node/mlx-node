@@ -104,6 +104,8 @@ interface ModelFileInventory {
   targetGgufs: string[];
   hasGguf: boolean;
   hasPrimarySafetensors: boolean;
+  /** A link named like weights (`.gguf`, `.safetensors`) whose target cannot be reached: a disk that is away. */
+  hasDeadWeightLink: boolean;
 }
 
 /**
@@ -137,10 +139,32 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
   const entries = await readdir(modelDir, { withFileTypes: true });
   const kinds = await Promise.all(entries.map((entry) => resolveDirentKind(modelDir, entry)));
   const files = entries.filter((_, index) => kinds[index] === 'file').map((entry) => entry.name);
+  const isWeightName = (name: string): boolean => {
+    const lower = name.toLowerCase();
+    return lower.endsWith('.gguf') || lower.endsWith('.safetensors');
+  };
+  const deadWeightLinks = entries
+    .filter((entry, index) => entry.isSymbolicLink() && kinds[index] === 'other' && isWeightName(entry.name))
+    .map((entry) => entry.name);
+  // A split set or a safetensors checkpoint with one part away cannot load: none of its live parts is a target.
+  const deadSplitPart = (name: string): boolean => {
+    const split = ggufSplitPart(name);
+    return (
+      split !== null &&
+      deadWeightLinks.some((dead) => {
+        const part = ggufSplitPart(dead);
+        return part !== null && part.stem === split.stem && part.total === split.total;
+      })
+    );
+  };
+  const deadPrimarySafetensors = deadWeightLinks.some((name) => PRIMARY_SAFETENSORS.test(name));
   return {
-    targetGgufs: files.filter((name) => name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(name)).sort(),
+    targetGgufs: files
+      .filter((name) => name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(name) && !deadSplitPart(name))
+      .sort(),
     hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
-    hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
+    hasPrimarySafetensors: !deadPrimarySafetensors && files.some((name) => PRIMARY_SAFETENSORS.test(name)),
+    hasDeadWeightLink: deadWeightLinks.length > 0,
   };
 }
 
@@ -419,18 +443,24 @@ export async function discoverLocalChatModels(
 
   /**
    * Discover target GGUFs in the variant folders of `repoDir` (one level, no
-   * dot-folders, no deeper). True when any variant holds a target file name:
-   * `repoDir` is then a repository, not a model.
+   * dot-folders, no deeper). `claimed` when any variant holds a target file
+   * name: `repoDir` is then a repository, not a model. `deadLink` when a
+   * variant folder holds a weight link whose target cannot be reached.
    */
-  const appendVariantGguf = async (repoDir: string, scopeName: string): Promise<boolean> => {
+  const appendVariantGguf = async (
+    repoDir: string,
+    scopeName: string,
+  ): Promise<{ claimed: boolean; deadLink: boolean }> => {
     const children = await readdir(repoDir, { withFileTypes: true });
     children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     let claimed = false;
+    let deadLink = false;
     for (const child of children) {
       if (child.name.startsWith('.') || (await resolveDirentKind(repoDir, child)) !== 'dir') continue;
       const variantDir = join(repoDir, child.name);
       try {
         const inventory = await modelFileInventory(variantDir);
+        if (inventory.hasDeadWeightLink) deadLink = true;
         if (inventory.hasPrimarySafetensors) continue;
         for (const name of inventory.targetGgufs) {
           claimed = true;
@@ -441,7 +471,7 @@ export async function discoverLocalChatModels(
         if (debug) console.warn(`[mlx] skip ${variantDir}: ${(err as Error).message}`);
       }
     }
-    return claimed;
+    return { claimed, deadLink };
   };
 
   for (const entry of entries) {
@@ -471,8 +501,13 @@ export async function discoverLocalChatModels(
         // variant is never itself a model, even with a root config.json.
         // Dot-folders are never repos: `.staging/` holds the dashboard's
         // unpublished download jobs and publish backups.
-        if (!entry.name.startsWith('.') && (await appendVariantGguf(full, entry.name))) continue;
+        const variants = entry.name.startsWith('.')
+          ? { claimed: false, deadLink: false }
+          : await appendVariantGguf(full, entry.name);
+        if (variants.claimed) continue;
         if (inventory.hasGguf) continue;
+        // Weights on a disk that is away: the root config.json alone must not list the folder as a model.
+        if (inventory.hasDeadWeightLink || variants.deadLink) continue;
       }
       const modelType = await detectModelType(full);
       await append(entry.name, full, full, modelType, entry.name, 'mlx', undefined, (config) =>

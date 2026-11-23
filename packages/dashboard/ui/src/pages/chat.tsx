@@ -707,7 +707,7 @@ export default function Chat(): ReactElement {
     if (picking.current) return;
     picking.current = true;
     try {
-      const path = await pickFolder();
+      const path = await pickFolder('work');
       if (path !== null) {
         chooseFolder(path);
         setFolderChoice(path);

@@ -574,6 +574,7 @@ describe('palette contents', () => {
         sizeBytes: 5 * 1024 ** 3,
         fileCount: 3,
         servedIds: [],
+        located: null,
       },
     ],
     warnings: [],
@@ -655,6 +656,7 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: ['gguf-dir/q8', 'gguf-dir/q4'],
+        located: null,
       },
       {
         name: 'b-plain',
@@ -665,6 +667,7 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: [],
+        located: null,
       },
       {
         name: 'zeta-7b',
@@ -675,6 +678,7 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: ['zeta-7b'],
+        located: null,
       },
     ],
     warnings: [],

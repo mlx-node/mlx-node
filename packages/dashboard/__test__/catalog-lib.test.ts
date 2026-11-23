@@ -44,6 +44,7 @@ describe('catalogBuildAt', () => {
       localRevision: null,
       localAssetsRepo: null,
       localAssetsRevision: null,
+      located: null,
     };
   }
   const items: CatalogItem[] = [
@@ -65,6 +66,7 @@ describe('hasUpdate', () => {
     localRevision: 'aaa',
     localAssetsRepo: null,
     localAssetsRevision: null,
+    located: null,
   };
 
   it('compares the primary revision only for a dashboard-owned install', () => {
@@ -130,6 +132,7 @@ describe('the build a card or a choice stands for', () => {
       localRevision: null,
       localAssetsRepo: null,
       localAssetsRevision: null,
+      located: null,
     };
   }
   const entry = (builds: CatalogBuildItem[]): CatalogItem => ({ label: 'M', description: '', builds });

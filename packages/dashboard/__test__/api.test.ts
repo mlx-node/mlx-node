@@ -1997,7 +1997,7 @@ describe('dashboard api — Update start', () => {
     });
     const answer = await res;
     expect(answer.status).toBe(400);
-    expect(answer.ok ? '' : answer.message).toBe('"adopt" and "replaceBlocker" cannot come together');
+    expect(answer.ok ? '' : answer.message).toBe('"replaceBlocker", "adopt" and "locate" cannot come together');
     expect(calls).toEqual([]);
   });
 

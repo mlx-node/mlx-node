@@ -63,6 +63,13 @@ command then syncs instead of skipping blindly:
   ones the old marker recorded) are removed;
 - `--force` runs that hash-verify sync even when the marker looks current.
 
+A file the sync downloads again replaces the old one by name: the old name is
+removed first and the new copy is created exclusively, so nothing is written
+through the old file. In a folder that the dashboard's Locate made, the old
+name can be a second name of a file in the user's folder, or a link to it; the
+user's file keeps its bytes, and the folder then holds the new file. The
+marker keeps its `located` record.
+
 Full syncs list the remote tree recursively so nested files already recorded
 by a CLI/dashboard marker are verified or removed before the revision advances.
 Fresh downloads select root assets and required child checkpoints declared by

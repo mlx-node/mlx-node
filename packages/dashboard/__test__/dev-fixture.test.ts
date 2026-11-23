@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -22,8 +23,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   assertFixtureHome,
+  assertFixtureTree,
   CATALOG_BLOCKED,
   CATALOG_INSTALL,
+  CATALOG_LOCATED,
   CATALOG_SECOND_BUILD,
   CATALOG_UPDATE,
   fixtureArgs,
@@ -271,11 +274,11 @@ describe('dev fixture home', () => {
     expect(read(now, { ...flight, chatModels: [] }).turns).toEqual([]);
   });
 
-  it('holds nine models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
+  it('holds ten models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
     writeFixtureHome(home, { now });
     const paths = fixturePaths(home);
     const models = discoverLocalModels(paths.modelsDir);
-    expect(models.models).toHaveLength(9);
+    expect(models.models).toHaveLength(10);
     expect(models.companions).toHaveLength(2);
     expect([...models.warnings].sort()).toEqual(
       [
@@ -366,6 +369,26 @@ describe('dev fixture content for the manage pages', () => {
     });
     expect(second?.assetsRepo).toBe(second?.localAssetsRepo);
     expect(second?.localAssetsRevision).not.toBeNull();
+  });
+
+  it('holds one catalog model that Locate made from a folder on another disk, with links inside the home', () => {
+    writeFixtureHome(home, { now });
+    writeFixtureHome(home, { now });
+    const modelsDir = fixturePaths(home).modelsDir;
+    const build = catalogWithState(modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_LOCATED.slug);
+    const source = realpathSync(join(home, CATALOG_LOCATED.source));
+    expect(build).toMatchObject({ present: true, installed: true, blocker: null });
+    expect(build?.located).toEqual({ from: source, mode: 'linked', filesAvailable: true });
+    expect(build?.assetsRepo).toBe(build?.localAssetsRepo);
+    for (const name of CATALOG_LOCATED.weights) {
+      expect(lstatSync(join(modelsDir, CATALOG_LOCATED.slug, name)).isSymbolicLink()).toBe(true);
+    }
+    expect(discoverLocalModels(modelsDir).models.find((model) => model.name === CATALOG_LOCATED.slug)?.located).toEqual(
+      { from: source, mode: 'linked', filesAvailable: true, filesStay: true },
+    );
+    expect(() => assertFixtureTree(home)).not.toThrow();
   });
 
   it('writes a long session with subagents and a live session whose last turn is still running', () => {

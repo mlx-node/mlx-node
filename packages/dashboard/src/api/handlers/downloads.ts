@@ -1,6 +1,9 @@
+import { isAbsolute } from 'node:path';
+
 import {
   DownloadConflictError,
   DownloadsClosedError,
+  HubUnreachableError,
   ModelsDirUnavailableError,
   type ReplaceBlocker,
 } from '../../download.js';
@@ -35,8 +38,8 @@ function parseReplaceBlocker(value: unknown): ReplaceBlocker | undefined {
   return { kind, fileCount, sizeBytes, truncated };
 }
 
-/** `adopt` of the body: absent, or the token of an Update plan, 64 lower-case hex characters. */
-function parseAdoptToken(value: unknown): string | undefined {
+/** A plan token of the body (`adopt`, `locate`): absent, or 64 lower-case hex characters. */
+function parseToken(value: unknown, field: 'adopt' | 'locate'): string | undefined {
   if (value === undefined) return undefined;
   let hex = typeof value === 'string' && value.length === 64;
   if (hex) {
@@ -47,30 +50,41 @@ function parseAdoptToken(value: unknown): string | undefined {
       }
     }
   }
-  if (!hex) throw ApiError.badRequest('"adopt" must be the 64-character token of an Update plan');
+  if (!hex) {
+    throw ApiError.badRequest(
+      `"${field}" must be the 64-character token of ${field === 'adopt' ? 'an Update' : 'a Locate'} plan`,
+    );
+  }
   return value as string;
 }
 
 /**
- * `POST /api/downloads` with `{ slug, replaceBlocker?, adopt? }`: `slug` is the catalog folder to install. Answers
- * `{ id, slug, repo }`.
+ * `POST /api/downloads` with `{ slug, replaceBlocker?, adopt?, locate? }`: `slug` is the catalog folder to install; at
+ * most one of the three options. Answers `{ id, slug, repo }`.
  */
 export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unknown {
   const body = requireBody(req);
-  const fields = (body ?? {}) as { slug?: unknown; replaceBlocker?: unknown; adopt?: unknown };
+  const fields = (body ?? {}) as { slug?: unknown; replaceBlocker?: unknown; adopt?: unknown; locate?: unknown };
   const slug = fields.slug;
   if (typeof slug !== 'string' || slug === '') {
     throw ApiError.badRequest('Body must include a "slug" string');
   }
   const replaceBlocker = parseReplaceBlocker(fields.replaceBlocker);
-  const adopt = parseAdoptToken(fields.adopt);
-  if (adopt !== undefined && replaceBlocker !== undefined) {
-    throw ApiError.badRequest('"adopt" and "replaceBlocker" cannot come together');
+  const adopt = parseToken(fields.adopt, 'adopt');
+  const locate = parseToken(fields.locate, 'locate');
+  if ([replaceBlocker, adopt, locate].filter((option) => option !== undefined).length > 1) {
+    throw ApiError.badRequest('"replaceBlocker", "adopt" and "locate" cannot come together');
   }
   try {
     const { id, repo } = ctx.downloads.start(
       slug,
-      replaceBlocker !== undefined ? { replaceBlocker } : adopt !== undefined ? { adopt } : undefined,
+      replaceBlocker !== undefined
+        ? { replaceBlocker }
+        : adopt !== undefined
+          ? { adopt }
+          : locate !== undefined
+            ? { locate }
+            : undefined,
     );
     // Accepted, not done: the route declares `successStatus: 202` so the HTTP
     // adapter still answers 202 for a job that is only queued.
@@ -97,6 +111,41 @@ export async function handleDownloadAdoptPlan(ctx: MainApiContext, req: ApiReque
     return await ctx.downloads.planAdoption(slug);
   } catch (err) {
     if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
+      throw ApiError.unavailable(err.message);
+    }
+    if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
+    throw ApiError.badRequest(err instanceof Error ? err.message : 'Could not check the folder');
+  }
+}
+
+/** The longest folder path a Locate plan takes. */
+const LOCATE_PATH_MAX_CHARS = 4096;
+
+/**
+ * `POST /api/downloads/locate-plan` with `{ slug, path }`: the plan of a Locate of the catalog folder `slug` from the
+ * absolute folder `path`, whose token a later start must carry. Writes nothing.
+ */
+export async function handleDownloadLocatePlan(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  const body = requireBody(req);
+  const { slug, path } = (body ?? {}) as { slug?: unknown; path?: unknown };
+  if (
+    typeof slug !== 'string' ||
+    slug === '' ||
+    typeof path !== 'string' ||
+    path.length > LOCATE_PATH_MAX_CHARS ||
+    path.includes('\0') ||
+    !isAbsolute(path)
+  ) {
+    throw ApiError.badRequest('Body must include a "slug" and an absolute "path".');
+  }
+  try {
+    return await ctx.downloads.planLocate(slug, path);
+  } catch (err) {
+    if (
+      err instanceof DownloadsClosedError ||
+      err instanceof ModelsDirUnavailableError ||
+      err instanceof HubUnreachableError
+    ) {
       throw ApiError.unavailable(err.message);
     }
     if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);

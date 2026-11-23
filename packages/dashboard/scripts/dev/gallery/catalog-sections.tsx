@@ -16,6 +16,7 @@ import type {
   CatalogBlocker,
   CatalogBuildItem,
   CatalogItem,
+  LocatePlanResponse,
   ModelsResponse,
 } from '../../../ui/src/lib/types';
 import {
@@ -23,6 +24,8 @@ import {
   CatalogCardView,
   type CatalogCardViewProps,
   CatalogGrid,
+  type LocateControl,
+  type LocateView,
 } from '../../../ui/src/pages/models/catalog';
 import type { ActiveJob, CatalogDownloadProps } from '../../../ui/src/pages/models/use-model-downloads';
 
@@ -41,6 +44,7 @@ function build(
     localRevision: null,
     localAssetsRepo: null,
     localAssetsRevision: null,
+    located: null,
     ...fields,
   } satisfies CatalogBuildItem;
 }
@@ -174,6 +178,24 @@ const PLAN: AdoptPlanResponse = {
   other: { count: 1, bytes: 1765, names: ['README.md'] },
 };
 
+const LOCATE_PLAN: LocatePlanResponse = {
+  slug: 'qwen3.8-27b-gguf',
+  repo: 'unsloth/Qwen3.8-27B-GGUF',
+  token: 'c3'.repeat(32),
+  folder: '/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF',
+  mode: 'shared',
+  byRecord: false,
+  revision: 'd'.repeat(40),
+  use: { count: 1, bytes: 17_610_000_000 },
+  read: { count: 1, bytes: 17_610_000_000 },
+  download: { count: 5, bytes: 11_400_000 },
+};
+
+const LMSTUDIO = '/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF';
+const EXTERNAL = '/Volumes/Models/lmstudio/unsloth/Qwen3.8-27B-GGUF';
+const REFUSAL =
+  'No Qwen3.8-27B files here. Pick the folder that holds "Qwen3.8-27B-UD-Q4_K_XL.gguf". In a Hugging Face cache that is the folder inside "snapshots".';
+
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -187,7 +209,7 @@ function download(
   fields: Partial<CatalogDownloadProps> = {},
 ): CatalogDownloadProps {
   return {
-    item: { heldBy: null, localAssetsRepo: null, localAssetsRevision: null, ...item },
+    item: { heldBy: null, localAssetsRepo: null, localAssetsRevision: null, located: null, ...item },
     updateAvailable: false,
     settling: false,
     updateSettling: false,
@@ -197,6 +219,10 @@ function download(
     onReinstallStarted: () => {},
     onPlanUpdate: () => wait(600).then(() => PLAN),
     onUpdateInPlace: () => wait(800),
+    onPlanLocate: () => wait(900).then(() => LOCATE_PLAN),
+    onLocate: () => wait(800),
+    onRecheck: () => {},
+    onReplaceLocated: () => wait(800),
     onDone: () => {},
     onError: () => {},
     onCancelled: () => {},
@@ -230,10 +256,29 @@ function running(total: number, received: number, rate: number, fileCount = 1): 
 
 const HOST: ModelsResponse['host'] = { totalMemBytes: 128 * GIB, diskFreeBytes: 900 * GIB };
 
-type Case = Omit<CatalogCardViewProps, 'onChoose' | 'onStart' | 'host' | 'progress' | 'starting'> &
-  Partial<Pick<CatalogCardViewProps, 'host' | 'progress' | 'starting'>> & { name: string };
+type Case = Omit<CatalogCardViewProps, 'onChoose' | 'onStart' | 'host' | 'progress' | 'starting' | 'locate'> &
+  Partial<Pick<CatalogCardViewProps, 'host' | 'progress' | 'starting'>> & {
+    name: string;
+    /** The Locate step the card starts in; a click on Locate… then walks the check and the confirmation. */
+    locate?: LocateView;
+  };
 
-const locate = (): void => {};
+/** Locate without a folder dialog: a click checks for a moment, then opens the confirmation of a fixed plan. */
+function useGalleryLocate(first: LocateView): LocateControl {
+  const [view, setView] = useState<LocateView>(first);
+  return {
+    view,
+    start: () => {
+      setView({ step: 'plan' });
+      void wait(900).then(() => setView({ step: 'confirm', plan: LOCATE_PLAN }));
+    },
+    close: () => setView({ step: 'idle' }),
+  };
+}
+
+const LOCATED_SHARED = { from: LMSTUDIO, mode: 'shared', filesAvailable: true } as const;
+const LOCATED_LINKED = { from: EXTERNAL, mode: 'linked', filesAvailable: true } as const;
+const LOCATED_AWAY = { from: EXTERNAL, mode: 'linked', filesAvailable: false } as const;
 
 const QWEN_M_RUNNING = running(16.6 * 1e9, 7.4 * 1e9, 84 * MB);
 const DRAFT_RUNNING = running(3.85 * 1e9, 1.6 * 1e9, 42 * MB);
@@ -390,6 +435,53 @@ const CASES: readonly Case[] = [
     downloads: [download(CLAIRIC_FLASH)],
   },
   {
+    name: 'Locate: checking the folder',
+    entry: qwen([QWEN_XL, QWEN_M]),
+    chosen: QWEN_XL.slug,
+    downloads: [download(QWEN_XL), download(QWEN_M)],
+    draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
+    locate: { step: 'plan' },
+  },
+  {
+    name: 'Locate: the folder cannot be used',
+    entry: qwen([QWEN_XL, QWEN_M]),
+    chosen: QWEN_XL.slug,
+    downloads: [download(QWEN_XL), download(QWEN_M)],
+    draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
+    locate: { step: 'refused', message: REFUSAL },
+  },
+  {
+    name: 'Located, same disk',
+    entry: qwen([{ ...QWEN_XL, ...INSTALLED, located: LOCATED_SHARED }, QWEN_M]),
+    chosen: QWEN_XL.slug,
+    downloads: [download({ ...QWEN_XL, ...INSTALLED, located: LOCATED_SHARED }), download(QWEN_M)],
+    draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
+    detailsTo: `/models?focus=${QWEN_XL.slug}`,
+  },
+  {
+    name: 'Located, another disk, update available',
+    entry: hy4({
+      ...HY4,
+      ...INSTALLED,
+      located: { ...LOCATED_LINKED, from: '/Volumes/Models/AngelSlim/Hy4-flash-GGUF' },
+    }),
+    chosen: HY4.slug,
+    downloads: [
+      download(
+        { ...HY4, ...INSTALLED, located: { ...LOCATED_LINKED, from: '/Volumes/Models/AngelSlim/Hy4-flash-GGUF' } },
+        { updateAvailable: true },
+      ),
+    ],
+    detailsTo: `/models?focus=${HY4.slug}`,
+  },
+  {
+    name: 'Located, files not found',
+    entry: qwen([{ ...QWEN_XL, located: LOCATED_AWAY }, QWEN_M]),
+    chosen: QWEN_XL.slug,
+    downloads: [download({ ...QWEN_XL, located: LOCATED_AWAY }), download(QWEN_M)],
+    draft: { download: download(DRAFT), progress: INITIAL_PROGRESS },
+  },
+  {
     name: 'System One card, installed',
     entry: clairicFlash({ ...CLAIRIC_FLASH, ...INSTALLED }),
     chosen: CLAIRIC_FLASH.slug,
@@ -431,8 +523,9 @@ const DRAFT_CASES: ReadonlyArray<{
   },
 ];
 
-function GalleryCard({ name, chosen: first, ...props }: Case): ReactElement {
+function GalleryCard({ name, chosen: first, locate: firstLocate, ...props }: Case): ReactElement {
   const [chosen, setChosen] = useState(first);
+  const locate = useGalleryLocate(firstLocate ?? { step: 'idle' });
   return (
     <div data-gallery-card={name} style={{ display: 'grid', gridTemplateRows: 'auto 1fr', gap: 4, minWidth: 0 }}>
       <span className="gallery-note">{name}</span>

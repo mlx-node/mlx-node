@@ -34,6 +34,7 @@ import {
 import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
   handleDownloadAdoptPlan,
+  handleDownloadLocatePlan,
   handleDownloadCancel,
   handleDownloadEventsUnsupported,
   handleDownloadStart,
@@ -157,6 +158,8 @@ export const ROUTES: Route[] = [
   mainRoute('GET', '/api/downloads', handleDownloadsList),
   mainRoute('POST', '/api/downloads', handleDownloadStart, { successStatus: 202 }),
   mainRoute('POST', '/api/downloads/adopt-plan', handleDownloadAdoptPlan),
+  // On the transport thread so the plan agrees with the job queue; it reads the picked folder with async fs only.
+  mainRoute('POST', '/api/downloads/locate-plan', handleDownloadLocatePlan),
   mainRoute('DELETE', '/api/downloads/:id', handleDownloadCancel),
   mainRoute('GET', '/api/downloads/:id/events', handleDownloadEventsUnsupported, { stream: true }),
   workerRoute('GET', '/api/metrics/models', handleMetricsModels),

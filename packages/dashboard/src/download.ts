@@ -65,14 +65,15 @@ import {
   rename,
   rm,
   rmdir,
+  symlink,
   unlink,
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
-import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { type CatalogTarget, catalogTargetForSlug, catalogUpdateRepos } from '@mlx-node/agent/catalog';
+import { downloadFileToCacheDir, getRepoFolderName, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
+import { type CatalogTarget, catalogTargetForSlug, catalogTargets, catalogUpdateRepos } from '@mlx-node/agent/catalog';
 import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
@@ -92,16 +93,44 @@ const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 
 import { catalogBlocker, heldByOtherBuild } from './catalog.js';
 import {
+  candidateFolders,
+  checksumOf,
+  digestMatches,
+  type FileFingerprint,
+  findWanted,
+  type FoundFile,
+  fingerprintOf,
+  foundAt,
+  isCommitSha,
+  isFolder,
+  isInside,
+  LOCATE_DISK_DEADLINE_MS,
+  LOCATE_SMALL_MAX_BYTES,
+  type LocateDownload,
+  type LocatePlan,
+  type LocateUse,
+  locateToken,
+  pickMode,
+  proveAt,
+  readRecord,
+  recordInstalled,
+  sameFingerprint,
+  withDeadline,
+} from './locate.js';
+import {
   type DownloadCompletion,
   DOWNLOAD_COMPLETE_MARKER,
   type ForeignEntrySummary,
   holdsModelFiles,
   isDownloaderOwned,
+  isLinkableFile,
   isModelFileName,
   isModelInstalled,
+  isModelPresent,
   isPathOccupied,
   isSafeRelPath,
   isWeightFile,
+  type LocatedRecord,
   modelsChildPath,
   modelsDirUnavailable,
   readCompletion,
@@ -595,6 +624,14 @@ function assertModelsDirAvailable(modelsDir: string): void {
   if (unavailable !== null) throw new ModelsDirUnavailableError(unavailable);
 }
 
+/** Locate could not read the catalog's file list from Hugging Face. The API answers 503. */
+export class HubUnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HubUnreachableError';
+  }
+}
+
 /**
  * A Reinstall that cannot be accepted as asked: another job holds the repo, or the entry in the way is not what the
  * user confirmed. The API answers 409.
@@ -700,40 +737,96 @@ function withNothingChanged(message: string): string {
   return message.endsWith('.') ? `${message} ${NOTHING_CHANGED}` : `${message}. ${NOTHING_CHANGED}`;
 }
 
+/** A catalog target that is a build, the only kind Locate takes. */
+type BuildTarget = Extract<CatalogTarget, { kind: 'build' }>;
+
+const LOCATE_QUEUED = 'A download of this model is already in the queue. Cancel it, then use Locate.';
+const LOCATE_CHANGED = 'The folder changed after you confirmed. Use Locate again.';
+const LOCATE_UNREADABLE = 'The app cannot read this folder. Pick the folder that holds the model files.';
+const LOCATE_SLOW =
+  `The app could not read this folder in ${LOCATE_DISK_DEADLINE_MS / 1000} seconds. ` +
+  'If macOS asks for access to the disk, allow it, then use Locate again.';
+const LOCATE_INSIDE_MODELS = 'This folder is inside the models folder. The app already lists the models there.';
+const LOCATE_OTHER_NAMES =
+  'These files are on another disk than the models folder, and they are stored there under other names ' +
+  '(a Hugging Face cache does this). The app can use them only from the disk of the models folder. ' +
+  'Use Install, or copy the folder to that disk and use Locate again.';
+
+function locateNotBesideMessage(name: string): string {
+  return (
+    `These files are on another disk than the models folder, and "${name}" is not beside them. ` +
+    'The app does not add files to your folder. ' +
+    'Use Install, or copy the folder to the disk of the models folder and use Locate again.'
+  );
+}
+
+function locateInCacheMessage(name: string): string {
+  return `This folder is part of the app's download cache, and "${name}" is missing or different there. Use Install.`;
+}
+
+function locateOtherBuildMessage(build: string): string {
+  return `This folder holds ${build}. Choose ${build} on the card, then use Locate again.`;
+}
+
+function locateTwoFoldersMessage(label: string, a: string, b: string): string {
+  return `Two folders here hold ${label}: "${basename(a)}" and "${basename(b)}". Pick one of them.`;
+}
+
+/** The body of `POST /api/downloads/locate-plan`: what the confirmation of a Locate says. */
+export interface LocatePlanSummary {
+  slug: string;
+  repo: string;
+  token: string;
+  /** The real path of the folder whose files the app uses. */
+  folder: string;
+  /** `shared`: the models folder shares these files on disk. `linked`: it links to them on another disk. */
+  mode: 'shared' | 'linked';
+  /** The folder has this app's install record, so the job trusts it and reads no file. */
+  byRecord: boolean;
+  revision: string;
+  /** Every file of the folder that the app uses. */
+  use: { count: number; bytes: number };
+  /** The weight files the job reads once to check their content; zeros when {@link byRecord}. */
+  read: { count: number; bytes: number };
+  /** The files the job downloads into the models folder. */
+  download: { count: number; bytes: number };
+}
+
+/** The `dev` of `path`, or of its nearest folder that exists: the disk a new folder there lands on. */
+function deviceOf(path: string): bigint {
+  let at = resolve(path);
+  for (;;) {
+    try {
+      return statSync(at, { bigint: true }).dev;
+    } catch (error) {
+      const up = dirname(at);
+      if (up === at) throw error;
+      at = up;
+    }
+  }
+}
+
+/** A record Locate may trust for the catalog repo `repo`: a full install with a pinned revision and safe paths. */
+function isLocatableRecord(record: DownloadCompletion, repo: string): boolean {
+  return (
+    record.repo.toLowerCase() === repo.toLowerCase() &&
+    record.scope !== 'partial' &&
+    isCommitSha(record.revision) &&
+    record.files.length <= 200 &&
+    record.files.every((path) => isSafeRelPath(path) && path !== DOWNLOAD_COMPLETE_MARKER)
+  );
+}
+
+/** Whether `target`'s file filter takes `path`. */
+function buildTakes(target: BuildTarget, path: string): boolean {
+  return isWantedFileFor(path, target.globs?.map(globToRegex));
+}
+
 /** Entries {@link scanFolder} reads before it refuses a folder for Update. */
 const ADOPT_SCAN_MAX_ENTRIES = 2_000;
 
 /** Shortest gap between two `progress` frames of one file that Update hashes in the folder. */
 const CHECK_PROGRESS_INTERVAL_MS = 100;
-
-/** The `stat` fields that change when a file is rewritten in place or replaced. */
-export interface FileFingerprint {
-  dev: bigint;
-  ino: bigint;
-  size: bigint;
-  mtimeNs: bigint;
-  ctimeNs: bigint;
-}
-
-function fingerprintOf(stat: BigIntStats): FileFingerprint {
-  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
-}
-
-function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
-  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
-}
-
-/**
- * The digest that proves a manifest entry's bytes, by the same two branches as {@link isStagedCopyComplete}: the LFS
- * sha256, or the git-blob sha1 of a plain file. `null` when the entry has neither, and then Update cannot prove it.
- */
-function checksumOf(file: ListFileEntry): { algo: 'sha256' | 'git-blob-sha1'; oid: string } | null {
-  if (file.lfs?.oid !== undefined) return { algo: 'sha256', oid: file.lfs.oid };
-  if (file.lfs === undefined && file.xetHash === undefined && file.oid !== undefined) {
-    return { algo: 'git-blob-sha1', oid: file.oid };
-  }
-  return null;
-}
 
 /** One entry of a folder Update looks at, by its posix path inside the folder. */
 interface FolderEntry {
@@ -990,37 +1083,15 @@ export async function proveInPlace(
   expect: { size: number; mtimeNs: bigint; ino: bigint },
   hooks: { cancelled(): boolean; onBytes(n: number): void },
 ): Promise<{ match: boolean; fingerprint: FileFingerprint }> {
-  const sum = checksumOf(file);
-  if (sum === null) throw new Error(`The catalog gives no checksum for "${file.path}", so Update cannot check it.`);
-  const changed = (): Error =>
-    new Error(`"${file.path}" in "${basename(dir)}" changed during the check. ${NOTHING_CHANGED} Use Update again.`);
-  // O_NONBLOCK so that a FIFO swapped in after the plan cannot block the open.
-  const handle = await open(join(dir, file.path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const opened = await handle.stat({ bigint: true });
-    const before = fingerprintOf(opened);
-    if (
-      !opened.isFile() ||
-      before.size !== BigInt(expect.size) ||
-      before.mtimeNs !== expect.mtimeNs ||
-      before.ino !== expect.ino
-    ) {
-      throw changed();
-    }
-    const hash = createHash(sum.algo === 'sha256' ? 'sha256' : 'sha1');
-    if (sum.algo === 'git-blob-sha1') hash.update(`blob ${before.size}\0`);
-    for await (const chunk of handle.createReadStream({ autoClose: false })) {
-      if (hooks.cancelled()) throw new Error('Download cancelled');
-      const bytes = chunk as Buffer;
-      hash.update(bytes);
-      hooks.onBytes(bytes.length);
-    }
-    const after = fingerprintOf(await handle.stat({ bigint: true }));
-    if (!sameFingerprint(before, after)) throw changed();
-    return { match: hash.digest('hex') === sum.oid, fingerprint: before };
-  } finally {
-    await handle.close();
-  }
+  return proveAt(
+    join(dir, file.path),
+    file,
+    expect,
+    hooks,
+    () =>
+      new Error(`"${file.path}" in "${basename(dir)}" changed during the check. ${NOTHING_CHANGED} Use Update again.`),
+    () => new Error(`The catalog gives no checksum for "${file.path}", so Update cannot check it.`),
+  );
 }
 
 /** A name that Update added to the folder: a second name of the staged file with this `dev:ino`. */
@@ -1163,6 +1234,8 @@ interface JobState {
    * `null` for every other job.
    */
   adopt: AdoptPlan | null;
+  /** A Locate: the plan the user confirmed, for a folder of files the user already has. `null` for every other job. */
+  locate: LocatePlan | null;
   /**
    * From just before the final entry is moved aside until a rollback put it back: the old entry is not in place. For
    * an Update, from the first add until a rollback removed every added name: the folder holds files the job added.
@@ -1264,12 +1337,27 @@ export class DownloadManager {
    * it again. In memory only.
    */
   private readonly mismatchMemo = new Map<string, MismatchRecord>();
+  /** The last Locate plan per folder; a request must carry its token. */
+  private readonly locatePlans = new Map<string, LocatePlan>();
+  /** Whether two `stat` devices are one disk: the choice between a second name and a link. */
+  private readonly sameVolume: (a: bigint, b: bigint) => boolean;
+  /** How long the folder a Locate reads may take to answer. */
+  private readonly diskDeadlineMs: number;
 
-  constructor(opts: { modelsDir: string; cacheDir?: string; fetchImpl?: typeof fetch; probeTimeoutMs?: number }) {
+  constructor(opts: {
+    modelsDir: string;
+    cacheDir?: string;
+    fetchImpl?: typeof fetch;
+    probeTimeoutMs?: number;
+    sameVolume?: (a: bigint, b: bigint) => boolean;
+    diskDeadlineMs?: number;
+  }) {
     this.modelsDir = opts.modelsDir;
     this.cacheDir = opts.cacheDir ?? DEFAULT_CACHE_DIR;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.probeTimeoutMs = opts.probeTimeoutMs ?? CATALOG_SHA_PROBE_TIMEOUT_MS;
+    this.sameVolume = opts.sameVolume ?? ((a, b) => a === b);
+    this.diskDeadlineMs = opts.diskDeadlineMs ?? LOCATE_DISK_DEADLINE_MS;
     this.wrappedFetch = this.makeCountingFetch();
     // Each job id can have many subscribers (SSE clients); lift the default cap.
     this.emitter.setMaxListeners(0);
@@ -1302,11 +1390,14 @@ export class DownloadManager {
    *
    * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the folder, which the
    * request uses up. A repeat Update request while the Update job is active hands back its id; one while another job
-   * holds the folder is refused.
+   * holds the folder is refused. `locate` makes the job a Locate, by the same rules with {@link planLocate}.
    *
    * Answers the job's id and the repository it downloads.
    */
-  start(slug: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): { id: string; repo: string } {
+  start(
+    slug: string,
+    opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string; locate?: string },
+  ): { id: string; repo: string } {
     if (this.closed) throw new DownloadsClosedError();
     // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
@@ -1319,12 +1410,16 @@ export class DownloadManager {
     assertModelsDirAvailable(this.modelsDir);
     const asked = opts?.replaceBlocker;
     const token = opts?.adopt;
+    const locating = opts?.locate;
     const active = this.activeJobFor(slug);
     if (active !== undefined) {
       if (token !== undefined && active.adopt === null) {
         throw new DownloadConflictError(
           'A download of this model is already in the queue. Cancel it, then use Update.',
         );
+      }
+      if (locating !== undefined && active.locate === null) {
+        throw new DownloadConflictError(LOCATE_QUEUED);
       }
       if (asked !== undefined && active.replace === null) {
         throw new DownloadConflictError(
@@ -1336,6 +1431,7 @@ export class DownloadManager {
     this.assertNotHeld(target);
     const replace = asked === undefined ? null : this.acceptReplace(slug, asked);
     const adopt = token === undefined ? null : this.acceptAdopt(slug, token);
+    const locate = locating === undefined ? null : this.acceptLocate(slug, locating);
     const id = randomUUID();
     this.jobsById.set(id, {
       id,
@@ -1347,6 +1443,7 @@ export class DownloadManager {
       totalBytes: 0,
       replace,
       adopt,
+      locate,
       swapStarted: false,
       cancelled: false,
       controller: new AbortController(),
@@ -1470,6 +1567,417 @@ export class DownloadManager {
     const assetsRevision = sidecarPlan?.revision ?? null;
     const token = adoptToken({ repo, revision, assetsRepo, assetsRevision, wanted, check, download, folder });
     return { token, revision, assetsRepo, assetsRevision, folder, wanted, check, download, other };
+  }
+
+  /** The plan a Locate request confirmed, taken out of `locatePlans`: it must be the server's last plan for the folder. */
+  private acceptLocate(slug: string, token: string): LocatePlan {
+    const plan = this.locatePlans.get(slug);
+    if (plan === undefined || plan.token !== token) {
+      throw new DownloadConflictError(`The folder or "${slug}" changed. Close this, then use Locate again.`);
+    }
+    this.locatePlans.delete(slug);
+    return plan;
+  }
+
+  /**
+   * Plan a Locate of the catalog build that installs to `slug` from the folder `picked`: which files of the folder (or
+   * of one of its child folders) the app's folder will use, which the job reads to check their content, which it
+   * downloads, and whether the models folder shares the files on disk or links to them. Writes nothing and opens no
+   * weight file. The plan is kept per folder, and a request to start the Locate must carry its token. A folder Locate
+   * cannot take is refused with a {@link DownloadConflictError} whose text says why.
+   */
+  async planLocate(slug: string, picked: string): Promise<LocatePlanSummary> {
+    if (this.closed) throw new DownloadsClosedError();
+    const target = catalogTarget(slug);
+    if (target.kind !== 'build') throw new DownloadConflictError('Locate is not offered for companion weights.');
+    assertModelsDirAvailable(this.modelsDir);
+    if (this.activeJobFor(slug) !== undefined) throw new DownloadConflictError(LOCATE_QUEUED);
+    this.assertNotHeld(target);
+    await this.reinstallRecovery;
+    this.assertLocateSlugFree(slug);
+    const pickedReal = await this.pickedFolder(picked);
+    let plan: LocatePlan;
+    try {
+      plan = await this.computeLocatePlan(target, pickedReal, this.deadlineFetch());
+    } catch (error) {
+      if (error instanceof DownloadConflictError || error instanceof HubUnreachableError) throw error;
+      throw new Error(`Could not check the folder: ${describeFailure(error)}`);
+    }
+    this.locatePlans.set(slug, plan);
+    const count = (sizes: readonly number[]): { count: number; bytes: number } => ({
+      count: sizes.length,
+      bytes: sizes.reduce((sum, size) => sum + size, 0),
+    });
+    return {
+      slug,
+      repo: target.repo,
+      token: plan.token,
+      folder: plan.folder,
+      mode: plan.mode,
+      byRecord: plan.byRecord,
+      revision: plan.revision,
+      use: count(plan.use.map((item) => Number(item.fingerprint.size))),
+      read: count(
+        plan.byRecord
+          ? []
+          : plan.use.filter((item) => isLinkableFile(item.path)).map((item) => Number(item.fingerprint.size)),
+      ),
+      download: count(plan.download.map((item) => (item.file.size > 0 ? item.file.size : 0))),
+    };
+  }
+
+  /**
+   * The folder at `slug` that a Locate may build: nothing there, or the app's own folder that holds no loadable model
+   * (a Locate whose disk went away). Returns its path.
+   */
+  private assertLocateSlugFree(slug: string): string {
+    const finalDir = modelsChildPath(this.modelsDir, slug, 'locate');
+    if (!isPathOccupied(finalDir)) return finalDir;
+    if (isRealDirectory(finalDir) && isDownloaderOwned(finalDir) && !isModelPresent(finalDir)) return finalDir;
+    throw new DownloadConflictError(
+      `"${slug}" already exists in the models folder. Use the action on its card, or delete it in Local models.`,
+    );
+  }
+
+  /** The real path of the picked folder, read within {@link diskDeadlineMs}; never one inside the models folder. */
+  private async pickedFolder(picked: string): Promise<string> {
+    const read = async (): Promise<string | null> => {
+      const real = await realpath(picked);
+      return (await isFolder(real)) ? real : null;
+    };
+    let real: string | null;
+    try {
+      real = await withDeadline(read(), this.diskDeadlineMs, () => new DownloadConflictError(LOCATE_SLOW));
+    } catch (error) {
+      if (error instanceof DownloadConflictError) throw error;
+      real = null;
+    }
+    if (real === null) throw new DownloadConflictError(LOCATE_UNREADABLE);
+    const modelsReal = await realpath(this.modelsDir).catch(() => resolve(this.modelsDir));
+    if (isInside(real, modelsReal)) throw new DownloadConflictError(LOCATE_INSIDE_MODELS);
+    return real;
+  }
+
+  /** The whole plan of a Locate from the real folder `picked`, the hub read through `fetchImpl`. */
+  private async computeLocatePlan(target: BuildTarget, picked: string, fetchImpl: typeof fetch): Promise<LocatePlan> {
+    const modelsReal = await realpath(this.modelsDir).catch(() => resolve(this.modelsDir));
+    const modelsDev = deviceOf(this.modelsDir);
+    let listing: { folders: string[]; tooMany: boolean };
+    try {
+      listing = await candidateFolders(picked, modelsReal);
+    } catch {
+      throw new DownloadConflictError(LOCATE_UNREADABLE);
+    }
+    const byRecord = await this.recordLocatePlan(target, picked, listing.folders, modelsDev);
+    return byRecord ?? (await this.hubLocatePlan(target, picked, listing, modelsDev, fetchImpl));
+  }
+
+  /**
+   * The plan of a Locate from a folder that has this app's install record for the build: its files are trusted, so
+   * nothing is read and nothing is fetched. `null` when no candidate folder has one.
+   */
+  private async recordLocatePlan(
+    target: BuildTarget,
+    picked: string,
+    folders: readonly string[],
+    modelsDev: bigint,
+  ): Promise<LocatePlan | null> {
+    const found: { dir: string; record: DownloadCompletion }[] = [];
+    let otherBuild: string | null = null;
+    for (const dir of folders) {
+      const record = await readRecord(dir);
+      if (record === undefined || !isLocatableRecord(record, target.repo)) continue;
+      if (!(await recordInstalled(dir, record))) continue;
+      const weights = record.files.filter(isWeightFile);
+      if (!weights.every((path) => buildTakes(target, path))) {
+        otherBuild ??= this.otherBuildTaking(target, weights);
+        continue;
+      }
+      found.push({ dir, record });
+    }
+    if (found.length > 1) {
+      throw new DownloadConflictError(locateTwoFoldersMessage(target.entry.label, found[0]!.dir, found[1]!.dir));
+    }
+    if (found.length === 0) {
+      if (otherBuild !== null) throw new DownloadConflictError(locateOtherBuildMessage(otherBuild));
+      return null;
+    }
+    const { dir, record } = found[0]!;
+    const use: LocateUse[] = [];
+    for (const path of record.files) {
+      const at = await foundAt(join(dir, path));
+      if (at === null) throw new DownloadConflictError(LOCATE_UNREADABLE);
+      use.push({ path, realPath: at.realPath, how: 'copy', file: null, fingerprint: at.fingerprint });
+    }
+    const mode = this.locateMode(use, record.files, record.files.find(isWeightFile)!, modelsDev);
+    const hasAssets = record.assetsRepo !== undefined && record.assetsRevision !== undefined;
+    const plan = {
+      slug: target.slug,
+      repo: target.repo,
+      picked,
+      folder: dir,
+      mode,
+      byRecord: true,
+      revision: record.revision,
+      assetsRepo: hasAssets ? record.assetsRepo! : null,
+      assetsRevision: hasAssets ? record.assetsRevision! : null,
+      wanted: [...record.files],
+      use,
+      download: [],
+    };
+    return { ...plan, token: locateToken(plan) };
+  }
+
+  /** The build of `target`'s model whose file filter takes every one of `weights`, other than `target`, or `null`. */
+  private otherBuildTaking(target: BuildTarget, weights: readonly string[]): string | null {
+    for (const other of catalogTargets()) {
+      if (other.kind !== 'build' || other.entry !== target.entry || other.slug === target.slug) continue;
+      if (other.repo.toLowerCase() !== target.repo.toLowerCase()) continue;
+      if (weights.length > 0 && weights.every((path) => buildTakes(other, path))) return other.build.id;
+    }
+    return null;
+  }
+
+  /**
+   * The mode of a Locate by {@link pickMode}, or its refusal; sets how each used file enters the app's folder: a
+   * weight-like file as a second name (`shared`) or a link (`linked`), every other file as the app's own copy.
+   */
+  private locateMode(
+    use: LocateUse[],
+    wanted: readonly string[],
+    primary: string,
+    modelsDev: bigint,
+  ): 'shared' | 'linked' {
+    const picked = pickMode(use, wanted, primary, modelsDev, this.sameVolume);
+    if ('refuse' in picked) {
+      throw new DownloadConflictError(
+        picked.refuse === 'name' ? LOCATE_OTHER_NAMES : locateNotBesideMessage(picked.file),
+      );
+    }
+    for (const item of use) {
+      item.how = !isLinkableFile(item.path) ? 'copy' : picked.mode === 'shared' ? 'link' : 'symlink';
+    }
+    return picked.mode;
+  }
+
+  /** A file that failed the content check of an earlier Locate and is unchanged since. */
+  private failedBefore(
+    at: { realPath: string; fingerprint: { size: bigint; mtimeNs: bigint; ino: bigint } },
+    oid: string,
+  ): boolean {
+    const failed = this.mismatchMemo.get(`locate\0${at.realPath}`);
+    return (
+      failed !== undefined &&
+      BigInt(failed.size) === at.fingerprint.size &&
+      failed.mtimeNs === at.fingerprint.mtimeNs &&
+      failed.ino === at.fingerprint.ino &&
+      failed.oid === oid
+    );
+  }
+
+  /**
+   * The plan of a Locate checked against the catalog's file list: the candidate folder that holds every primary weight
+   * of the build by name and size, the other wanted files found there (a small file only when its hash matches now),
+   * and the rest to download.
+   */
+  private async hubLocatePlan(
+    target: BuildTarget,
+    picked: string,
+    listing: { folders: string[]; tooMany: boolean },
+    modelsDev: bigint,
+    fetchImpl: typeof fetch,
+  ): Promise<LocatePlan> {
+    const label = target.entry.label;
+    let resolved: Awaited<ReturnType<DownloadManager['resolveWanted']>>;
+    try {
+      resolved = await this.resolveWanted(target, fetchImpl);
+    } catch (error) {
+      throw new HubUnreachableError(
+        `Could not reach Hugging Face: ${describeFailure(error)}. ` +
+          `Locate needs the catalog's file list to check this folder. ${NOTHING_CHANGED}`,
+      );
+    }
+    const { revision, selection, files, sidecarPlan } = resolved;
+    const wanted: LocateDownload[] = files.map((file) => ({ file, repo: target.repo, revision }));
+    for (const file of sidecarPlan?.files ?? []) {
+      wanted.push({ file, repo: sidecarPlan!.repo.name, revision: sidecarPlan!.revision });
+    }
+    if (!wanted.some((item) => item.file.path === 'config.json')) {
+      throw new Error(
+        `Repo "${target.repo}" is not a complete model (neither it nor its assets repo "${selection.assetsRepo}" provides a config.json)`,
+      );
+    }
+    const primaries = wanted.filter((item) => isWeightFile(item.file.path));
+
+    const holders: { dir: string; found: Map<string, FoundFile>; key: string }[] = [];
+    let best: { dir: string; missing: string[]; found: number } | null = null;
+    let otherSize: string | null = null;
+    for (const dir of listing.folders) {
+      const found = new Map<string, FoundFile>();
+      const missing: string[] = [];
+      for (const item of primaries) {
+        const at = await findWanted(dir, item.file.path);
+        if (at !== null && Number(at.fingerprint.size) === item.file.size) found.set(item.file.path, at);
+        else {
+          if (at !== null) otherSize ??= basename(item.file.path);
+          missing.push(basename(item.file.path));
+        }
+      }
+      if (missing.length === 0) {
+        // The picked folder and its child can reach the same files (`<repo>/UD-Q4_K_XL/x.gguf`): one holder.
+        const key = [...found.values()]
+          .map((at) => at.realPath)
+          .sort()
+          .join('\0');
+        if (!holders.some((holder) => holder.key === key)) holders.push({ dir, found, key });
+      } else if (found.size > 0 && (best === null || found.size > best.found)) {
+        // Named by the folder the found parts are in, which is a variant folder for a repo-shaped folder.
+        best = { dir: dirname([...found.values()][0]!.realPath), missing, found: found.size };
+      }
+    }
+    if (holders.length > 1) {
+      throw new DownloadConflictError(locateTwoFoldersMessage(label, holders[0]!.dir, holders[1]!.dir));
+    }
+    const first = basename(primaries[0]!.file.path);
+    if (holders.length === 0) {
+      if (otherSize !== null) {
+        throw new DownloadConflictError(
+          `"${otherSize}" here is not the file the catalog lists: its size is different. ` +
+            'It can be an older version. Locate takes only the current file. Use Install.',
+        );
+      }
+      if (best !== null) {
+        throw new DownloadConflictError(
+          `${best.missing.length} of ${primaries.length} weight files are missing in ${best.dir}: ` +
+            `${best.missing.slice(0, 3).join(', ')}. Locate needs all of them in one folder.`,
+        );
+      }
+      const other = await this.otherBuildIn(target, listing.folders, fetchImpl);
+      if (other !== null) throw new DownloadConflictError(locateOtherBuildMessage(other));
+      if (listing.tooMany) {
+        throw new DownloadConflictError(
+          `This folder has too many folders to search. Pick the folder that holds "${first}".`,
+        );
+      }
+      throw new DownloadConflictError(
+        `No ${label} files here. Pick the folder that holds "${first}". ` +
+          'In a Hugging Face cache that is the folder inside "snapshots".',
+      );
+    }
+
+    const holder = holders[0]!;
+    const use: LocateUse[] = [];
+    for (const item of primaries) {
+      const at = holder.found.get(item.file.path)!;
+      const name = basename(item.file.path);
+      const sum = checksumOf(item.file);
+      if (sum === null) {
+        throw new DownloadConflictError(`The catalog gives no checksum for "${name}", so Locate cannot check it.`);
+      }
+      if (this.failedBefore(at, sum.oid)) {
+        throw new DownloadConflictError(
+          `"${name}" in ${holder.dir} is not the catalog file: its content is different. Use Install.`,
+        );
+      }
+      use.push({
+        path: item.file.path,
+        realPath: at.realPath,
+        how: 'copy',
+        file: item.file,
+        fingerprint: at.fingerprint,
+      });
+    }
+    const download: LocateDownload[] = [];
+    for (const item of wanted) {
+      if (isWeightFile(item.file.path)) continue;
+      const at = await findWanted(holder.dir, item.file.path);
+      const sum = checksumOf(item.file);
+      let usable = at !== null && sum !== null && Number(at.fingerprint.size) === item.file.size;
+      if (usable && isLinkableFile(item.file.path)) usable = !this.failedBefore(at!, sum!.oid);
+      else if (usable) {
+        usable =
+          item.file.size <= LOCATE_SMALL_MAX_BYTES && (await digestMatches(at!.realPath, sum!).catch(() => false));
+      }
+      if (usable) {
+        use.push({
+          path: item.file.path,
+          realPath: at!.realPath,
+          how: 'copy',
+          file: item.file,
+          fingerprint: at!.fingerprint,
+        });
+      } else download.push(item);
+    }
+    // A download first makes the cache's name of the file: in this folder when it is that snapshot of the cache.
+    const cacheReal = await realpath(this.cacheDir).catch(() => resolve(this.cacheDir));
+    const throughFolder = download.find((item) =>
+      isInside(
+        join(
+          cacheReal,
+          getRepoFolderName({ type: 'model', name: item.repo }),
+          'snapshots',
+          item.revision,
+          item.file.path,
+        ),
+        holder.dir,
+      ),
+    );
+    if (throughFolder !== undefined) {
+      throw new DownloadConflictError(locateInCacheMessage(basename(throughFolder.file.path)));
+    }
+    const paths = wanted.map((item) => item.file.path);
+    const mode = this.locateMode(use, paths, primaries[0]!.file.path, modelsDev);
+    const plan = {
+      slug: target.slug,
+      repo: target.repo,
+      picked,
+      folder: holder.dir,
+      mode,
+      byRecord: false,
+      revision,
+      assetsRepo: sidecarPlan?.repo.name ?? null,
+      assetsRevision: sidecarPlan?.revision ?? null,
+      wanted: paths,
+      use,
+      download,
+    };
+    return { ...plan, token: locateToken(plan) };
+  }
+
+  /**
+   * Another build of `target`'s model whose weight files are all in one of `folders` by name, or `null`. Reads that
+   * build's file list; a build whose list cannot be read is passed over.
+   */
+  private async otherBuildIn(
+    target: BuildTarget,
+    folders: readonly string[],
+    fetchImpl: typeof fetch,
+  ): Promise<string | null> {
+    for (const other of catalogTargets()) {
+      if (other.kind !== 'build' || other.entry !== target.entry || other.slug === target.slug) continue;
+      let weights: ListFileEntry[];
+      try {
+        const revision = await this.resolveRevision(other.repo, fetchImpl);
+        const globs = selectionOf(other).globs?.map(globToRegex);
+        weights = (await this.listWantedFiles(other.repo, revision, globs, fetchImpl)).filter((file) =>
+          isWeightFile(file.path),
+        );
+      } catch {
+        continue;
+      }
+      if (weights.length === 0) continue;
+      for (const dir of folders) {
+        let all = true;
+        for (const file of weights) {
+          if ((await findWanted(dir, file.path)) === null) {
+            all = false;
+            break;
+          }
+        }
+        if (all) return other.build.id;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1936,6 +2444,12 @@ export class DownloadManager {
         });
         return;
       }
+      if (job.locate !== null) {
+        await this.locateFromPlan(job, job.locate, slug, (dir) => {
+          stagingDir = dir;
+        });
+        return;
+      }
 
       // Ownership preflight: refuse an unowned/foreign finalDir up front (no bytes
       // move for a doomed job).
@@ -2163,6 +2677,7 @@ export class DownloadManager {
         let message = truncateMessage(modelsDirUnavailable(this.modelsDir) ?? describeFailure(error));
         if (job.replace !== null && !job.swapStarted) message = withNothingRemoved(message);
         if (job.adopt !== null && !job.swapStarted) message = withNothingChanged(message);
+        if (job.locate !== null && !job.swapStarted) message = withNothingChanged(message);
         this.emit({ type: 'error', id: job.id, message });
       }
     } finally {
@@ -2391,6 +2906,184 @@ export class DownloadManager {
   }
 
   /**
+   * Run a Locate: build the app's folder for `slug` from the files of the folder the user located, without writing
+   * into that folder. In order:
+   *
+   *   1. compute the plan again through the job's fetch; its token must be the one the user confirmed;
+   *   2. the folder at the slug must still be free (or the app's own folder with no loadable model);
+   *   3. unless the folder has this app's record, hash every used weight-like file where it is ({@link proveAt});
+   *      a file that is not the catalog file is remembered, so the next plan refuses it without a new hash;
+   *   4. in a staging tree, give each used weight-like file a second name (`link`) or a link (`symlink`), and make the
+   *      app's own copy of each used small file; every create fails when the name exists;
+   *   5. download the missing files into staging;
+   *   6. barrier: each staged weight-like entry still is the file that was hashed, and the tree holds a model;
+   *   7. publish: the record, with `located`, then the rename onto the slug.
+   *
+   * `setStaging` hands the staging tree to `processJob`, whose `finally` removes it; that unlinks names only.
+   */
+  private async locateFromPlan(
+    job: JobState,
+    confirmed: LocatePlan,
+    slug: string,
+    setStaging: (dir: string) => void,
+  ): Promise<void> {
+    const target = job.target;
+    if (target.kind !== 'build') throw new Error('Locate is not offered for companion weights.');
+    const at = ++this.resolveSeq;
+    const plan = await this.computeLocatePlan(target, confirmed.picked, this.wrappedFetch);
+    if (!plan.byRecord) this.noteJobRevision(job.repo, plan.revision, at);
+    if (plan.token !== confirmed.token) throw new Error(LOCATE_CHANGED);
+    const finalDir = this.assertLocateSlugFree(slug);
+    await this.recoverBackup(slug, finalDir);
+    this.assertLocateSlugFree(slug);
+
+    const sizeOf = (file: ListFileEntry): number => (file.size > 0 ? file.size : 0);
+    const checks = plan.byRecord ? [] : plan.use.filter((item) => isLinkableFile(item.path));
+    const fileCount = checks.length + plan.download.length;
+    job.totalBytes =
+      checks.reduce((sum, item) => sum + Number(item.fingerprint.size), 0) +
+      plan.download.reduce((sum, item) => sum + sizeOf(item.file), 0);
+    this.emit({ type: 'start', id: job.id, repo: job.repo, totalBytes: job.totalBytes, fileCount });
+
+    const stagingDir = join(this.modelsDir, '.staging', `${slug}@${plan.revision}.${process.pid}.${randomUUID()}`);
+    setStaging(stagingDir);
+    await mkdir(stagingDir, { recursive: true });
+    const stagingReal = realpathSync(stagingDir);
+    const stagedPath = (path: string): string => {
+      const resolved = resolve(stagingReal, path);
+      if (resolved === stagingReal || !resolved.startsWith(stagingReal + sep)) {
+        throw new Error(`Refusing to write "${path}" outside the staging directory`);
+      }
+      return join(stagingDir, path);
+    };
+
+    const mismatched: string[] = [];
+    for (let index = 0; index < checks.length; index++) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      const item = checks[index]!;
+      const file = item.file!;
+      const name = basename(item.path);
+      const size = Number(item.fingerprint.size);
+      const base = job.receivedBytes;
+      let read = 0;
+      let shownAt = 0;
+      const proof = await proveAt(
+        item.realPath,
+        file,
+        { size, mtimeNs: item.fingerprint.mtimeNs, ino: item.fingerprint.ino },
+        {
+          cancelled: () => job.cancelled,
+          onBytes: (n) => {
+            read = Math.min(size, read + n);
+            job.receivedBytes = base + read;
+            const now = Date.now();
+            if (now - shownAt < CHECK_PROGRESS_INTERVAL_MS) return;
+            shownAt = now;
+            this.emitFileProgress(job, item.path, read, file.size, index, fileCount, 'check');
+          },
+        },
+        () => new Error(`"${name}" changed during the check. Use Locate again.`),
+        () => new Error(`The catalog gives no checksum for "${name}", so Locate cannot check it.`),
+      );
+      if (!proof.match) {
+        mismatched.push(name);
+        this.mismatchMemo.set(`locate\0${item.realPath}`, {
+          size,
+          mtimeNs: item.fingerprint.mtimeNs,
+          ino: item.fingerprint.ino,
+          oid: checksumOf(file)!.oid,
+        });
+      }
+      job.receivedBytes = base + size;
+      this.emitFileProgress(job, item.path, size, file.size, index, fileCount, 'check');
+    }
+    if (mismatched.length > 0) {
+      throw new Error(
+        `"${mismatched.join('", "')}" in ${plan.folder} is not the catalog file: its content is different.`,
+      );
+    }
+
+    for (const item of plan.use) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      const staged = stagedPath(item.path);
+      await mkdir(dirname(staged), { recursive: true });
+      if (item.how === 'copy') {
+        await copyFile(item.realPath, staged, constants.COPYFILE_EXCL);
+        if (item.file !== null && !(await isStagedCopyComplete(staged, item.file))) {
+          throw new Error(`"${basename(item.path)}" changed during the check. Use Locate again.`);
+        }
+        continue;
+      }
+      try {
+        if (item.how === 'link') await link(item.realPath, staged);
+        else await symlink(item.realPath, staged);
+      } catch (error) {
+        if (item.how !== 'link') throw error;
+        const code = (error as NodeJS.ErrnoException).code ?? String(error);
+        throw new Error(`This disk cannot share a file between two folders (${code}).`);
+      }
+    }
+
+    for (let n = 0; n < plan.download.length; n++) {
+      if (job.cancelled) throw new Error('Download cancelled');
+      const item = plan.download[n]!;
+      const destPath = stagedPath(item.file.path);
+      const jobBaseBytes = job.receivedBytes;
+      const fileIndex = checks.length + n;
+      const context = await this.downloadVerifiedFile(
+        { type: 'model', name: item.repo },
+        item.revision,
+        item.file,
+        destPath,
+        { jobBaseBytes, fileIndex, fileCount },
+      );
+      const fileBytes = item.file.size > 0 ? item.file.size : context.received;
+      job.receivedBytes = jobBaseBytes + fileBytes;
+      this.emitFileProgress(job, item.file.path, fileBytes, item.file.size, fileIndex, fileCount);
+    }
+
+    // The barrier: a file replaced after its hash, or a staged name that is not what the job made, is not published.
+    if (job.cancelled) throw new Error('Download cancelled');
+    for (const item of plan.use) {
+      if (item.how === 'copy') continue;
+      const staged = join(stagingDir, item.path);
+      const entry = await lstat(staged).catch(() => null);
+      const now = await foundAt(staged);
+      const kindHolds = entry !== null && (item.how === 'link' ? entry.isFile() : entry.isSymbolicLink());
+      if (
+        !kindHolds ||
+        now === null ||
+        now.fingerprint.dev !== item.fingerprint.dev ||
+        now.fingerprint.ino !== item.fingerprint.ino ||
+        now.fingerprint.size !== item.fingerprint.size ||
+        now.fingerprint.mtimeNs !== item.fingerprint.mtimeNs
+      ) {
+        throw new Error(`"${basename(item.path)}" changed during the check. Use Locate again.`);
+      }
+    }
+    if (!isModelPresent(stagingDir)) throw new Error(LOCATE_CHANGED);
+
+    if (job.cancelled) throw new Error('Download cancelled');
+    job.state = 'committing';
+    const sidecar =
+      plan.assetsRepo !== null && plan.assetsRevision !== null
+        ? { repo: { name: plan.assetsRepo }, revision: plan.assetsRevision }
+        : null;
+    await this.publish(
+      stagingDir,
+      finalDir,
+      job,
+      plan.revision,
+      plan.wanted.map((path) => ({ path })),
+      sidecar,
+      { from: plan.folder, mode: plan.mode },
+    );
+    job.receivedBytes = job.totalBytes;
+    job.state = 'done';
+    this.emit({ type: 'done', id: job.id, outputDir: finalDir });
+  }
+
+  /**
    * The commit barrier of an Update: the folder is the one the plan saw, still not owned, holds every checked file
    * with the fingerprint its hash saw, holds nothing at a path the job adds, and holds nothing the plan refuses.
    * Other files may have come or gone.
@@ -2611,7 +3304,9 @@ export class DownloadManager {
           fetch: this.wrappedFetch,
         });
         await mkdir(dirname(destPath), { recursive: true });
-        await copyFile(snapshotPath, destPath);
+        // A new file, never a write through a name that is there: that name can be a second name of a user file.
+        await rm(destPath, { force: true });
+        await copyFile(snapshotPath, destPath, constants.COPYFILE_EXCL);
       } finally {
         this.currentFile = null;
       }
@@ -2971,8 +3666,9 @@ export class DownloadManager {
     finalDir: string,
     job: JobState,
     revision: string,
-    files: ListFileEntry[],
-    sidecarPlan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] } | null,
+    files: readonly { path: string }[],
+    sidecarPlan: { repo: { name: string }; revision: string } | null,
+    located?: LocatedRecord,
   ): Promise<string | undefined> {
     const repo = job.repo;
     const slug = basename(finalDir);
@@ -2998,8 +3694,9 @@ export class DownloadManager {
       // badge that lets the repair job run at all.
       ...(sidecarPlan !== null ? { assetsRepo: sidecarPlan.repo.name, assetsRevision: sidecarPlan.revision } : {}),
       completedAt: new Date().toISOString(),
+      ...(located !== undefined ? { located } : {}),
     };
-    await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);
+    await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx' });
 
     if (!isPathOccupied(finalDir)) {
       await rename(stagingDir, finalDir);

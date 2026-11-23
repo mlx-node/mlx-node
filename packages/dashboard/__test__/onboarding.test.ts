@@ -31,6 +31,7 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
     localRevision: null,
     localAssetsRepo: null,
     localAssetsRevision: null,
+    located: null,
   })),
 }));
 
@@ -300,6 +301,8 @@ describe('first model onboarding', () => {
       '/catalog': { items: items.map((item) => withPresent(item, item.isDefault === true)) },
     });
     page = await renderPage(createElement(App), (text) => text.includes('Model ready'));
+    // True for a download and for Locate alike.
+    expect(page.text()).toContain('The model is ready.');
     await act(async () => button('Set up coding agents').click());
     await waitFor(() => expect(window.location.pathname).toBe('/coding-agents'));
     expect(localStorage.getItem(`mlx-node:onboarding:v1:${dir}`)).toBe('done');
@@ -375,9 +378,10 @@ describe('first model onboarding', () => {
       },
     );
     page = await renderPage(createElement(MemoryRouter, null, createElement(Models, { onboarding: true })), (text) =>
-      text.includes('Downloading'),
+      text.includes('Getting the model'),
     );
     await waitFor(() => expect(listener).toBeDefined());
+    expect(page.text()).toContain('Keep the app open. You can look around while it finishes.');
     expect(page.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.label);
     expect(page.container.querySelector('fieldset')?.disabled).toBe(true);
     await act(async () => button('Cancel').click());
@@ -406,7 +410,7 @@ describe('first model onboarding', () => {
       },
     );
     page = await renderPage(createElement(MemoryRouter, null, createElement(Models, { onboarding: true })), (text) =>
-      text.includes('Downloading'),
+      text.includes('Getting the model'),
     );
     await waitFor(() => expect(listener).toBeDefined());
     await act(async () => listener!({ type: 'error', id: 'failed-job', message: 'Connection lost' }));

@@ -155,6 +155,7 @@ function localModel(overrides: Partial<LocalModel>): LocalModel {
     sizeBytes: 4_800_000_000,
     fileCount: 7,
     servedIds: [],
+    located: null,
     ...overrides,
   };
 }
@@ -186,6 +187,7 @@ function catalogItem(
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
+        located: null,
       },
     ],
   };

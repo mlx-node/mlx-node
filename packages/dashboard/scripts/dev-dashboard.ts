@@ -29,6 +29,7 @@ import { takeNamespaceLock } from '../src/prefix-cache.js';
 import { createDashboardRuntime } from '../src/runtime.js';
 import {
   assertFixtureTree,
+  CATALOG_LOCATED,
   DEFAULT_HOME,
   FIXTURE_COMMAND,
   fixtureArgs,
@@ -149,7 +150,9 @@ async function main(): Promise<void> {
     server = await createServer({
       root: UI_ROOT,
       configFile: join(UI_ROOT, 'vite.config.ts'),
-      plugins: [devHarness(runtime, { chat, workFolder })],
+      plugins: [
+        devHarness(runtime, { chat, folders: { work: workFolder, model: join(home, CATALOG_LOCATED.picked) } }),
+      ],
       server: { host: '127.0.0.1', port, strictPort: true },
     });
     await server.listen();

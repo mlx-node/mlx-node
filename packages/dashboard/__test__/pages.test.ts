@@ -22,6 +22,7 @@ import { MessageChannel } from 'node:worker_threads';
 import { INITIAL_PROGRESS } from '@/components/download-progress';
 import { categoryLabels, truncateMiddle } from '@/lib/labels';
 import { modelShareLabel } from '@/lib/metrics-view';
+import { FOLDER_PICKED_MESSAGE, PICK_FOLDER_MESSAGE } from '@/lib/pick-folder';
 import { toast } from '@/lib/toast';
 import type {
   CacheResponse,
@@ -35,6 +36,7 @@ import type {
   ColdTierHealth,
   DownloadJob,
   DownloadsResponse,
+  LocatePlanResponse,
   ModelsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
@@ -48,6 +50,8 @@ import {
   CatalogDownloadAction,
   hostLine,
   hostNote,
+  type LocateControl,
+  locateContent,
   reinstallContent,
   updateContent,
 } from '@/pages/models/catalog';
@@ -847,6 +851,7 @@ describe('Models page — the Install affordance', () => {
               localRevision: null,
               localAssetsRepo: null,
               localAssetsRevision: null,
+              located: null,
               ...build,
             },
           ],
@@ -1390,6 +1395,7 @@ describe('Models page — the Install affordance', () => {
     post: (body: unknown) => ApiResponse,
     plan?: (body: unknown) => ApiResponse | Promise<ApiResponse>,
     get?: (path: string) => Promise<ApiResponse> | undefined,
+    locatePlan?: (body: unknown) => ApiResponse | Promise<ApiResponse>,
   ): Array<{ method: string; path: string; body: unknown }> {
     const calls: Array<{ method: string; path: string; body: unknown }> = [];
     openedStreams = [];
@@ -1403,6 +1409,9 @@ describe('Models page — the Install affordance', () => {
           calls.push({ method: call.method, path, body: call.body });
           if (call.method === 'POST' && path === '/downloads') return post(call.body);
           if (call.method === 'POST' && path === '/downloads/adopt-plan' && plan !== undefined) return plan(call.body);
+          if (call.method === 'POST' && path === '/downloads/locate-plan' && locatePlan !== undefined) {
+            return locatePlan(call.body);
+          }
           const answer = call.method === 'GET' ? get?.(path) : undefined;
           if (answer !== undefined) return answer;
           if (call.method === 'GET' && Object.hasOwn(routes, path)) {
@@ -1500,9 +1509,11 @@ describe('Models page — the Install affordance', () => {
   ): Parameters<typeof CatalogDownloadAction>[0] {
     return {
       buildName: 'MXFP4',
+      modelName: LABEL,
       item: {
         hfRepo: REPO,
         slug: SLUG,
+        sizeGb: 23.3,
         installed: false,
         present: false,
         heldBy: null,
@@ -1511,6 +1522,7 @@ describe('Models page — the Install affordance', () => {
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
+        located: null,
       },
       updateAvailable: false,
       settling: true,
@@ -1521,6 +1533,10 @@ describe('Models page — the Install affordance', () => {
       onReinstallStarted: () => {},
       onPlanUpdate,
       onUpdateInPlace: () => Promise.resolve(),
+      onPlanLocate: () => Promise.reject(new Error('no plan')),
+      onLocate: () => Promise.resolve(),
+      onRecheck: () => {},
+      onReplaceLocated: () => Promise.resolve(),
       onDone: () => {},
       onError: () => {},
       onCancelled: () => {},
@@ -2084,6 +2100,7 @@ describe('Models page — the Install affordance', () => {
           assetsRepo: 'base/model',
           localAssetsRepo: null,
           localAssetsRevision: null,
+          located: null,
         },
         [],
         {
@@ -3053,6 +3070,285 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).not.toContain('Cancel');
   });
 
+  describe('Locate', () => {
+    const FOLDER = '/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF';
+    const LOCATE_PLAN: LocatePlanResponse = {
+      slug: SLUG,
+      repo: REPO,
+      token: 'e5'.repeat(32),
+      folder: FOLDER,
+      mode: 'shared',
+      byRecord: false,
+      revision: 'f'.repeat(40),
+      use: { count: 1, bytes: 17.6 * 1024 ** 3 },
+      read: { count: 1, bytes: 17.6 * 1024 ** 3 },
+      download: { count: 5, bytes: 11.4 * 1024 ** 2 },
+    };
+
+    /** The native dialog: records each request and answers it with `answer()` when that is not undefined. */
+    function desktopDialog(answer: () => string | null | undefined): unknown[] {
+      const requests: unknown[] = [];
+      const onMessage = (event: MessageEvent): void => {
+        const data = event.data as { type?: unknown; requestId?: unknown };
+        if (data?.type !== PICK_FOLDER_MESSAGE) return;
+        requests.push(data);
+        const path = answer();
+        if (path === undefined) return;
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: { type: FOLDER_PICKED_MESSAGE, requestId: data.requestId, path },
+            source: window,
+          }),
+        );
+      };
+      window.addEventListener('message', onMessage);
+      onTestFinished(() => window.removeEventListener('message', onMessage));
+      return requests;
+    }
+
+    function locateDialog(): HTMLElement | undefined {
+      return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes('Use these files?'),
+      );
+    }
+
+    function card(): Element {
+      return mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    }
+
+    function textOf(node: ParentNode | undefined): string {
+      return splitWhitespace(node?.textContent ?? '').join(' ');
+    }
+
+    it('picks a model folder, checks it, confirms in the words of the plan, then posts the slug and the token', async () => {
+      const success = vi.spyOn(toast, 'success');
+      onTestFinished(() => success.mockRestore());
+      const held = heldPlan({ ok: true, status: 200, body: LOCATE_PLAN });
+      const requests = desktopDialog(() => FOLDER);
+      const calls = serveReinstall(
+        catalogRoutes({}),
+        () => ({ ok: true, status: 202, body: { id: 'job-locate', slug: SLUG, repo: REPO } }),
+        undefined,
+        undefined,
+        held.answer,
+      );
+      await mountModels();
+      const locate = buttonNamed(card(), 'Locate…');
+      await act(async () => locate.click());
+      await waitFor(() => posts(calls, '/downloads/locate-plan').length === 1);
+      // Mutation: send the Work purpose → MAIN opens the Work dialog → red.
+      expect(requests).toEqual([{ type: PICK_FOLDER_MESSAGE, requestId: expect.any(String), purpose: 'model' }]);
+      expect(posts(calls, '/downloads/locate-plan')).toEqual([{ slug: SLUG, path: FOLDER }]);
+      const checking = buttonNamed(card(), 'Checking…');
+      expect(checking.getAttribute('aria-disabled')).toBe('true');
+      // A second click while the check runs does nothing.
+      await act(async () => checking.click());
+      await settle();
+      expect(requests).toHaveLength(1);
+      expect(posts(calls, '/downloads/locate-plan')).toHaveLength(1);
+      expect(buttonNamed(card(), 'Install').disabled).toBe(true);
+      expect(locateDialog()).toBeUndefined();
+
+      held.release();
+      await waitFor(() => locateDialog() !== undefined);
+      const text = textOf(locateDialog());
+      expect(text).toContain(
+        `The app found 1 file (17.6 GB) of ${LABEL} in ${truncateMiddle(FOLDER, 48)}. So far it checked names and sizes. Next it reads each file once to check its content. This can take a few minutes. Nothing is copied: the models folder shares these files on disk, so they take no extra space. It downloads 5 files (11.4 MB) into the models folder.`,
+      );
+      expect(text).toContain('Nothing in your folder is changed, moved or deleted.');
+      expect(posts(calls, '/downloads')).toEqual([]);
+
+      await act(async () => buttonNamed(locateDialog()!, 'Use files').click());
+      await waitFor(() => openedStreams.includes('job-locate'));
+      // Mutation: post the repository or drop the token → red.
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG, locate: LOCATE_PLAN.token }]);
+      await waitFor(() => buttonLabels().includes('Cancel'));
+      emitDownload('done', { id: 'job-locate', outputDir: `/models/${SLUG}` });
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success.mock.calls).toEqual([['Model located', { description: `Uses the files in ${FOLDER}.` }]]);
+    });
+
+    it('does nothing when the dialog is cancelled', async () => {
+      const requests = desktopDialog(() => null);
+      const calls = serveReinstall(catalogRoutes({}), () => ({
+        ok: false,
+        status: 500,
+        code: 'E_INTERNAL',
+        message: 'no',
+      }));
+      await mountModels();
+      await act(async () => buttonNamed(card(), 'Locate…').click());
+      await waitFor(() => requests.length === 1);
+      await settle();
+      expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
+      expect(liveButtonLabels()).toContain('Locate…');
+      expect(card().querySelector('[data-row="build"]')?.textContent).toContain('23.3 GB');
+      expect(locateDialog()).toBeUndefined();
+    });
+
+    it('says a refusal on the build line of the card, raises no toast and offers Locate again', async () => {
+      const error = vi.spyOn(toast, 'error');
+      onTestFinished(() => error.mockRestore());
+      const refusal = `This folder holds UD-Q4_K_M. Choose UD-Q4_K_M on the card, then use Locate again.`;
+      desktopDialog(() => FOLDER);
+      let plans = 0;
+      const calls = serveReinstall(
+        catalogRoutes({}),
+        () => ({ ok: true, status: 202, body: { id: 'job-locate', slug: SLUG, repo: REPO } }),
+        undefined,
+        undefined,
+        () =>
+          ++plans === 1
+            ? { ok: false, status: 409, code: 'E_CONFLICT', message: refusal }
+            : { ok: true, status: 200, body: LOCATE_PLAN },
+      );
+      await mountModels();
+      const before = card().getBoundingClientRect().height;
+      const locate = buttonNamed(card(), 'Locate…');
+      locate.focus();
+      await act(async () => locate.click());
+      await waitFor(() => (card().querySelector('[data-row="build"]')?.textContent ?? '').includes(refusal));
+      expect(error).not.toHaveBeenCalled();
+      expect(card().querySelector('[role="alert"], [role="status"]')).toBeNull();
+      // The sentence is read out, and the line opens it whole.
+      expect(card().querySelector('[aria-live="polite"]')?.textContent).toBe(refusal);
+      const rows = [...card().querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      expect(card().getBoundingClientRect().height).toBe(before);
+      expect(document.activeElement).toBe(buttonNamed(card(), 'Locate…'));
+
+      await act(async () => buttonNamed(card(), 'Locate…').click());
+      await waitFor(() => locateDialog() !== undefined);
+      expect(posts(calls, '/downloads/locate-plan')).toHaveLength(2);
+      expect(card().querySelector('[data-row="build"]')?.textContent).not.toContain(refusal);
+    });
+
+    it('says the other disk and the install record in the confirmation, and leaves out an empty download', () => {
+      const handlers = { onLocate: () => Promise.resolve(), onStarted: () => {} };
+      const linked = locateContent('Hy4-flash', { ...LOCATE_PLAN, mode: 'linked' }, handlers);
+      const record = locateContent(
+        'Qwen3.8-27B UD-Q4_K_XL',
+        {
+          ...LOCATE_PLAN,
+          byRecord: true,
+          read: { count: 0, bytes: 0 },
+          download: { count: 0, bytes: 0 },
+        },
+        handlers,
+      );
+      const words = (node: ReactNode): string =>
+        splitWhitespace(
+          renderToStaticMarkup(createElement('p', null, node))
+            .replace('<p>', '')
+            .replace('</p>', ''),
+        )
+          .join(' ')
+          .replaceAll(`<span class="font-medium text-foreground" title="${FOLDER}">`, '')
+          .replaceAll('</span>', '');
+      expect(words(linked.description)).toBe(
+        `The app found 1 file (17.6 GB) of Hy4-flash in ${truncateMiddle(FOLDER, 48)}. So far it checked names and sizes. Next it reads each file once to check its content. This can take a few minutes. Nothing is copied: the app links to these files. The model works only while this disk is connected. It downloads 5 files (11.4 MB) into the models folder.`,
+      );
+      expect(words(record.description)).toBe(
+        `The app found 1 file (17.6 GB) of Qwen3.8-27B UD-Q4_K_XL in ${truncateMiddle(FOLDER, 48)}. This folder has this app&#x27;s install record for Qwen3.8-27B UD-Q4_K_XL. The app trusts the record: it checks that the files are there and does not read them. Nothing is copied: the models folder shares these files on disk, so they take no extra space.`,
+      );
+      expect(record).toMatchObject({
+        title: 'Use these files?',
+        notice: 'Nothing in your folder is changed, moved or deleted.',
+        confirmLabel: 'Use files',
+        workingLabel: 'Starting…',
+        successLabel: 'Started',
+        tone: 'neutral',
+        errorTitle: 'Could not start Locate',
+      });
+    });
+
+    it('names the folder a located build uses, and asks before an update downloads the whole build', async () => {
+      const located = { from: FOLDER, mode: 'shared' as const, filesAvailable: true };
+      const calls = serveReinstall(
+        catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40), located }, [], {
+          items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+        } as CatalogUpdatesResponse),
+        () => ({ ok: true, status: 202, body: { id: 'job-new', slug: SLUG, repo: REPO } }),
+      );
+      await mountModels();
+      expect(card().querySelector('[data-row="build"] p')?.textContent).toBe(
+        `Uses files in ${truncateMiddle(FOLDER, 48)}`,
+      );
+      expect(card().querySelector('[data-row="action"] [data-status="installed"]')).not.toBeNull();
+      expect(buttonLabels()).not.toContain('Locate…');
+      await act(async () => buttonNamed(card(), 'Update').click());
+      const dialog = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes('Download the new version?'),
+      );
+      // Mutation: start the update on the click → a POST before the confirmation → red.
+      expect(posts(calls, '/downloads')).toEqual([]);
+      expect(textOf(dialog)).toContain(
+        `The app downloads it (about 23.3 GB) into the models folder. The files in ${truncateMiddle(FOLDER, 48)} are not changed, and the app stops using them.`,
+      );
+      await act(async () => buttonNamed(dialog!, 'Download').click());
+      await waitFor(() => openedStreams.includes('job-new'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
+
+    it('shows Files not found in the five rows with Check again, Locate… and Download instead', async () => {
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      const calls = serveReinstall(catalogRoutes({ located: away }), () => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-instead', slug: SLUG, repo: REPO },
+      }));
+      await mountModels();
+      const rows = [...card().querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      expect(card().querySelector('[data-row="build"] p')?.textContent).toBe('Files not found · /Volumes/Models/qwen');
+      // Mutation: ignore filesAvailable → a bare Install shows → red.
+      expect(buttonLabels()).not.toContain('Install');
+      const action = card().querySelector('[data-row="action"]')!;
+      expect([...action.querySelectorAll('button')].map((button) => button.textContent?.trim())).toEqual([
+        'Check again',
+        'Locate…',
+        'Download instead',
+      ]);
+      await act(async () => buttonNamed(card(), 'Files not found · /Volumes/Models/qwen').click());
+      expect(document.body.textContent).toContain(
+        '/Volumes/Models/qwen is not available. Connect the disk, or locate the files again.',
+      );
+      const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
+      await act(async () => buttonNamed(card(), 'Check again').click());
+      await waitFor(
+        () => calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length > catalogGets,
+      );
+      expect(posts(calls, '/downloads')).toEqual([]);
+      await act(async () => buttonNamed(card(), 'Download instead').click());
+      await waitFor(() => openedStreams.includes('job-instead'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
+
+    it('offers no Locate on the DFlash2 line', async () => {
+      serveReinstall(
+        catalogRoutes({
+          draft: {
+            label: 'DFlash2',
+            hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
+            sizeGb: 3.85,
+            slug: 'qwen3.8-27b-dflash2',
+            installed: false,
+            present: false,
+            blockedByForeignDir: false,
+            blocker: null,
+            localRevision: null,
+          },
+        }),
+        () => ({ ok: false, status: 500, code: 'E_INTERNAL', message: 'no' }),
+      );
+      await mountModels();
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      // Mutation: render Locate in the draft line → red.
+      expect([...companion.querySelectorAll('button')].map((button) => button.textContent?.trim())).toEqual(['Add']);
+      expect(buttonLabels().filter((label) => label === 'Locate…')).toHaveLength(1);
+    });
+  });
+
   describe('the card with more than one build', () => {
     const XL_SLUG = 'inkling-2-mini-gguf';
     const M_SLUG = 'inkling-2-mini-gguf-ud-q4_k_m';
@@ -3073,6 +3369,7 @@ describe('Models page — the Install affordance', () => {
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
+        located: null,
         ...fields,
       };
     }
@@ -3287,6 +3584,7 @@ describe('Models page — the Install affordance', () => {
           localRevision: null,
           localAssetsRepo: null,
           localAssetsRevision: null,
+          located: null,
         },
       ],
     };
@@ -3373,16 +3671,24 @@ describe('Models page — the Install affordance', () => {
       expect(mounted.container.querySelector('[data-row="action"] [data-status="installed"]')).not.toBeNull();
     });
 
-    it('takes the first match: job, update, installed, held, adopt, stuck, replace, install', () => {
+    it('takes the first match: job, update, installed, missing, held, adopt, stuck, replace, install', () => {
       const job = { id: 'j', committing: false, cancelling: false, connection: 0, source: 'local' as const };
       const all = {
         present: true,
         heldBy: 'UD-Q4_K_M',
         blocker: HELD,
+        located: null,
       };
       expect(catalogActionState(all, { job, updateAvailable: true })).toBe('job');
       expect(catalogActionState(all, { job: undefined, updateAvailable: true })).toBe('update');
       expect(catalogActionState(all, { job: undefined, updateAvailable: false })).toBe('installed');
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      expect(catalogActionState({ ...all, located: away }, { job: undefined, updateAvailable: false })).toBe(
+        'installed',
+      );
+      expect(
+        catalogActionState({ ...all, present: false, located: away }, { job: undefined, updateAvailable: true }),
+      ).toBe('missing');
       const absent = { ...all, present: false };
       expect(catalogActionState(absent, { job: undefined, updateAvailable: true })).toBe('held');
       expect(catalogActionState({ ...absent, heldBy: null }, { job: undefined, updateAvailable: false })).toBe('adopt');
@@ -3400,29 +3706,61 @@ describe('Models page — the Install affordance', () => {
       ).toBe('install');
     });
 
+    function control(view: LocateControl['view'] = { step: 'idle' }): LocateControl & { starts: number } {
+      const made = { view, starts: 0, start: () => (made.starts += 1), close: () => {} };
+      return made;
+    }
+
     it('says Starting download… while the request is in flight, with Locate… off', async () => {
       const download = props({});
-      mounted = await renderPage(view(download, { starting: [SLUG], locate: () => {} }), (text) =>
+      mounted = await renderPage(view(download, { starting: [SLUG], locate: control() }), (text) =>
         text.includes(LABEL),
       );
       expect(buttonNamed(mounted.container, 'Starting download…').disabled).toBe(true);
       expect(buttonNamed(mounted.container, 'Locate…').disabled).toBe(true);
     });
 
-    it('renders Locate… only with the prop and only beside Install', async () => {
-      const locate = vi.fn();
+    it('renders Locate… only with the prop, beside Install and in Files not found', async () => {
+      const locate = control();
       mounted = await renderPage(view(props({})), (text) => text.includes(LABEL));
       expect(liveButtonLabels()).not.toContain('Locate…');
       mounted.unmount();
       mounted = await renderPage(view(props({}), { locate }), (text) => text.includes(LABEL));
       await act(async () => buttonNamed(mounted!.container, 'Locate…').click());
-      expect(locate).toHaveBeenCalledWith(expect.objectContaining({ slug: SLUG }));
-      mounted.unmount();
-      mounted = await renderPage(view(props({ present: true, installed: true }), { locate }), (text) =>
+      expect(locate.starts).toBe(1);
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      for (const [state, item, fields] of [
+        ['installed', { present: true, installed: true }, {}],
+        ['update', { present: true, installed: true }, { updateAvailable: true }],
+        ['job', {}, { job }],
+        ['held', { heldBy: 'UD-Q4_K_M' }, {}],
+        ['adopt', { blockedByForeignDir: true, blocker: HELD }, {}],
+        ['replace', { blockedByForeignDir: true, blocker: BLOCKER }, {}],
+        ['missing', { located: away }, {}],
+      ] as const) {
+        mounted.unmount();
+        const download = props(item, fields);
+        expect(catalogActionState(download.item, download)).toBe(state);
+        mounted = await renderPage(view(download, { locate }), (text) => text.includes(LABEL));
+        // Mutation: render Locate in every state → red.
+        expect([state, buttonLabels().includes('Locate…')]).toEqual([state, state === 'missing']);
+      }
+    });
+
+    it('says Checking… while the folder is checked, and a refusal on the build line', async () => {
+      mounted = await renderPage(view(props({}), { locate: control({ step: 'plan' }) }), (text) =>
         text.includes(LABEL),
       );
-      // Mutation: render Locate in every state → red.
-      expect(buttonLabels()).not.toContain('Locate…');
+      const checking = buttonNamed(mounted.container, 'Checking…');
+      expect(checking.getAttribute('aria-disabled')).toBe('true');
+      expect(buttonNamed(mounted.container, 'Install').disabled).toBe(true);
+      mounted.unmount();
+      const message = 'The app cannot read this folder. Pick the folder that holds the model files.';
+      mounted = await renderPage(view(props({}), { locate: control({ step: 'refused', message }) }), (text) =>
+        text.includes(LABEL),
+      );
+      expect(mounted.container.querySelector('[data-row="build"] button')?.textContent).toBe(message);
+      expect(mounted.container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     });
 
     it('says a disk that is too small on the build line, with the full sentence for the tooltip', async () => {
@@ -3467,7 +3805,10 @@ describe('Models page — local models and the drawer', () => {
   const NAME = 'qwen3.8-27b-gguf';
   const SERVED = 'Qwen3.8-27B-UD-Q4_K_XL';
 
-  function modelsRoutes(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  function modelsRoutes(
+    extra: Record<string, unknown> = {},
+    located: ModelsResponse['models'][number]['located'] = null,
+  ): Record<string, unknown> {
     const models: ModelsResponse = {
       models: [
         {
@@ -3479,6 +3820,7 @@ describe('Models page — local models and the drawer', () => {
           sizeBytes: 17 * 1024 ** 3,
           fileCount: 2,
           servedIds: [SERVED],
+          located,
         },
       ],
       warnings: [],
@@ -3543,6 +3885,77 @@ describe('Models page — local models and the drawer', () => {
     expect(button).toBeTruthy();
     return button!;
   }
+
+  describe('a model that Locate made', () => {
+    const FROM = '/Volumes/Models/lmstudio/unsloth/Qwen3.8-27B-GGUF';
+
+    function dialogWith(title: string): HTMLElement | undefined {
+      return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes(title),
+      );
+    }
+
+    it.each<[string, ModelsResponse['models'][number]['located'], string | null]>([
+      ['linked', { from: FROM, mode: 'linked', filesAvailable: true, filesStay: true }, 'Linked'],
+      ['away', { from: FROM, mode: 'linked', filesAvailable: false, filesStay: true }, 'Not connected'],
+      ['shared', { from: FROM, mode: 'shared', filesAvailable: true, filesStay: true }, null],
+    ])('badges the row of a %s model', async (_name, located, badge) => {
+      await mountModels(modelsRoutes({}, located));
+      const cell = modelRow().querySelector('td')!;
+      const badges = [...cell.querySelectorAll('[title]')].filter((node) => node.getAttribute('title') === FROM);
+      expect(badges.map((node) => node.textContent)).toEqual(badge === null ? [] : [badge]);
+    });
+
+    it('says Remove when the model files stay on disk, and the delete calls the same route', async () => {
+      const success = vi.spyOn(toast, 'success');
+      const located = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: true };
+      const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } }, located);
+      routes['/models'] = sequence(routes['/models'], { ...(routes['/models'] as ModelsResponse), models: [] });
+      await mountModels(routes);
+      expect(modelRow().querySelector(`button[aria-label="Delete ${NAME}"]`)).toBeNull();
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Remove ${NAME}"]`)!.click(),
+      );
+      const dialog = dialogWith('Remove model?')!;
+      expect(splitWhitespace(dialog.textContent ?? '').join(' ')).toContain(
+        `This removes ${NAME} from the app. Its model files stay on disk; you located them in ${truncateMiddle(FROM, 48)}.`,
+      );
+      expect(dialog.textContent).not.toContain('permanently');
+      await act(async () => buttonIn(dialog, 'Remove').click());
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success).toHaveBeenCalledWith('Model removed', { description: NAME });
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.path)).toEqual([
+        `/api/models/${NAME}`,
+      ]);
+    });
+
+    it('says the danger Delete when the folder holds the last name of a model file', async () => {
+      const located = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: false };
+      await mountModels(modelsRoutes({}, located));
+      // Mutation: read `located` alone, not `filesStay` → the Remove text over the last copy → red.
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click(),
+      );
+      expect(popover().textContent).toContain('permanently removes');
+      expect(dialogWith('Remove model?')).toBeUndefined();
+    });
+
+    const shown = truncateMiddle(FROM, 42);
+    it.each<[string, 'shared' | 'linked', boolean, string]>([
+      ['shared', 'shared', true, `Shares files with${shown}`],
+      ['linked', 'linked', true, `Linked to${shown}`],
+      ['away', 'linked', false, `Linked to${shown} · not available`],
+    ])('names the located folder in the drawer of a %s model', async (_name, mode, filesAvailable, row) => {
+      await mountModels(
+        modelsRoutes({}, { from: FROM, mode, filesAvailable, filesStay: true }),
+        `/models?focus=${NAME}`,
+      );
+      await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+      const disk = byRole(document, 'region', 'On disk') ?? byRole(document, 'dialog', NAME)!;
+      expect(splitWhitespace(disk.textContent ?? '').join(' ')).toContain(splitWhitespace(row).join(' '));
+      expect(buttonIn(byRole(document, 'dialog', NAME)!, 'Remove model')).toBeTruthy();
+    });
+  });
 
   it('joins a GGUF checkpoint to its usage, live state and drawer through its served id', async () => {
     await mountModels(modelsRoutes());

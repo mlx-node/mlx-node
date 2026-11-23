@@ -919,11 +919,16 @@ describe('Work folder chip: composer or bar', () => {
   const OTHER = '/tmp/work/other';
   const otherLabel = fill(CHAT.folderLabel, { folder: OTHER });
 
+  /** The purpose of every folder request the page sent. */
+  let pickPurposes: unknown[] = [];
+
   /** The native dialog: every request is answered with `path`. Returns the undo. */
   function answerPicks(path: string): () => void {
+    pickPurposes = [];
     const onMessage = (event: MessageEvent): void => {
-      const data = event.data as { type?: unknown; requestId?: unknown };
+      const data = event.data as { type?: unknown; requestId?: unknown; purpose?: unknown };
       if (data?.type !== PICK_FOLDER_MESSAGE) return;
+      pickPurposes.push(data.purpose);
       window.dispatchEvent(
         new MessageEvent('message', {
           data: { type: FOLDER_PICKED_MESSAGE, requestId: data.requestId, path },
@@ -944,6 +949,8 @@ describe('Work folder chip: composer or bar', () => {
       expect(document.activeElement).toBe(chip);
       click(chip);
       await waitFor(() => folderChips(bar()).includes(label));
+      // Mutation: ask for the Locate dialog → MAIN opens "Locate model files" → red.
+      expect(pickPurposes).toEqual(['work']);
       expect(folderChips(composerForm())).toEqual([]);
       await waitFor(() => document.activeElement === composer());
     } finally {

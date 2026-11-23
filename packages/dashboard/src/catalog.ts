@@ -27,6 +27,8 @@ import {
   isModelInstalled,
   isModelPresent,
   isPathOccupied,
+  type LocatedState,
+  locatedState,
   readCompletion,
   summarizeForeignEntry,
 } from './models.js';
@@ -116,6 +118,12 @@ export interface CatalogBuildItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /**
+   * Set when Locate made `<slug>` from files the user already had: the folder they are in, whether the models folder
+   * shares them on disk or links to them, and whether they can be reached now. A folder whose files cannot be reached
+   * stays the app's own: not present, no blocker.
+   */
+  located: Pick<LocatedState, 'from' | 'mode' | 'filesAvailable'> | null;
 }
 
 export interface CatalogItem {
@@ -250,6 +258,7 @@ function buildWithState(
   // Read from the build's own folder ONLY — see `localRevision` for why a
   // provenance-matched renamed dir deliberately reports null.
   const completion = installed ? readCompletion(dir) : undefined;
+  const located = locatedState(dir);
   return {
     id: build.id,
     hfRepo,
@@ -267,6 +276,8 @@ function buildWithState(
     localRevision: completion?.revision ?? null,
     localAssetsRepo: completion?.assetsRepo ?? null,
     localAssetsRevision: completion?.assetsRevision ?? null,
+    located:
+      located === null ? null : { from: located.from, mode: located.mode, filesAvailable: located.filesAvailable },
   };
 }
 

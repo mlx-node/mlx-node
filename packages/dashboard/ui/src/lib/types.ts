@@ -20,6 +20,18 @@ export interface LocalModel {
    * `servedIds.includes(key) || (servedIds.length === 0 && name === key)`.
    */
   servedIds: string[];
+  /** Set when Locate made the folder from model files the user already had. */
+  located: (LocatedFiles & { filesStay: boolean }) | null;
+}
+
+/** Where the model files of a folder that Locate made are. */
+export interface LocatedFiles {
+  /** The real path of the folder the user located. */
+  from: string;
+  /** `shared`: the models folder shares the files on the same disk. `linked`: it links to them on another disk. */
+  mode: 'shared' | 'linked';
+  /** The files in `from` can be reached; false while their disk is not connected. */
+  filesAvailable: boolean;
 }
 
 export interface ModelsResponse {
@@ -87,6 +99,8 @@ export interface CatalogBuildItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /** The folder was made by Locate from model files elsewhere on this Mac; `null` otherwise. */
+  located: LocatedFiles | null;
 }
 
 export interface CatalogItem {
@@ -177,6 +191,25 @@ export interface AdoptPlanResponse {
   download: { count: number; bytes: number };
   /** Files that stay in the folder; `names` holds at most 3, sorted. */
   other: { count: number; bytes: number; names: string[] };
+}
+
+/** Result of `POST /api/downloads/locate-plan`: what Locate would use from a folder, before anything changes. */
+export interface LocatePlanResponse {
+  slug: string;
+  repo: string;
+  token: string;
+  /** The real path of the folder whose files are used: the picked folder or one of its child folders. */
+  folder: string;
+  mode: 'shared' | 'linked';
+  /** The folder has this app's install record: the job checks that the files are there and reads none of them. */
+  byRecord: boolean;
+  revision: string;
+  /** The files of the folder the app uses. */
+  use: { count: number; bytes: number };
+  /** The weight files the job reads once to check their content; zeros when `byRecord`. */
+  read: { count: number; bytes: number };
+  /** The files the job downloads into the models folder. */
+  download: { count: number; bytes: number };
 }
 
 /** Result of `DELETE /api/downloads/:id` (cancel an in-flight/queued download). */

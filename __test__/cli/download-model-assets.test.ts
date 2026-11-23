@@ -1,4 +1,14 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -260,6 +270,71 @@ describe('download model --assets-repo', () => {
     };
     expect(conservative.revision).toBe('a'.repeat(40));
   });
+
+  // Mutation: copyFile onto the existing name (no rm, no COPYFILE_EXCL) → red: the user's file is overwritten.
+  it.each(['second name', 'link'])(
+    "writes a new file in place of a %s and leaves the user's file as it was",
+    async (kind) => {
+      hub.shas[PRIMARY] = 'c'.repeat(40);
+      hub.shas[ASSETS] = 'b'.repeat(40);
+      const user = mkdtempSync(join(tmpdir(), 'mlx-assets-user-'));
+      const names = [GGUF, 'tokenizer.json'];
+      writeFileSync(join(user, GGUF), 'y'.repeat(100));
+      writeFileSync(join(user, 'tokenizer.json'), 'y'.repeat(5));
+      const seen = (path: string) => {
+        const stat = lstatSync(path, { bigint: true });
+        return { bytes: readFileSync(path, 'utf-8'), size: stat.size, mtimeNs: stat.mtimeNs, ino: stat.ino };
+      };
+      const before = names.map((name) => seen(join(user, name)));
+      for (const name of names) {
+        if (kind === 'link') symlinkSync(join(user, name), join(outputDir, name));
+        else linkSync(join(user, name), join(outputDir, name));
+      }
+      writeFileSync(join(outputDir, 'config.json'), '{}'.padEnd(12));
+      const located = { from: user, mode: kind === 'link' ? 'linked' : 'shared' };
+      writeFileSync(
+        join(outputDir, '.mlx-download-complete.json'),
+        JSON.stringify({
+          repo: PRIMARY,
+          revision: 'a'.repeat(40),
+          files: [GGUF, 'config.json', 'tokenizer.json'],
+          scope: 'full',
+          assetsRepo: ASSETS,
+          assetsRevision: 'b'.repeat(40),
+          completedAt: new Date().toISOString(),
+          located,
+        }),
+      );
+      try {
+        await run([
+          '-m',
+          PRIMARY,
+          '-o',
+          outputDir,
+          '-g',
+          '*UD-Q4_K_XL*',
+          '--assets-repo',
+          ASSETS,
+          '--complete',
+          '--cache-dir',
+          cacheDir,
+        ]);
+        expect(names.map((name) => seen(join(user, name)))).toEqual(before);
+        for (const name of names) {
+          const entry = lstatSync(join(outputDir, name));
+          expect(entry.isFile(), name).toBe(true);
+          expect(entry.nlink, name).toBe(1);
+          expect(entry.ino, name).not.toBe(lstatSync(join(user, name)).ino);
+        }
+        const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')) as {
+          located?: unknown;
+        };
+        expect(marker.located).toEqual(located);
+      } finally {
+        rmSync(user, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('prunes a sidecar the assets manifest no longer supplies', async () => {
     // The blanket exemption must apply only when the assets manifest was NOT

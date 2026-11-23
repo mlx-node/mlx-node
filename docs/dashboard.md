@@ -531,6 +531,68 @@ Delete in Local models and Reinstall never reach the same entry: Delete needs a 
 and Reinstall refuses both. Update and Delete can reach the same folder; a Delete during an Update makes the Update
 stop.
 
+### Locate
+
+**Locate…** sits beside Install on the card of a build that has nothing in its folder (and in the Onboarding dock under
+**Download model**). It uses model files that are already on this Mac, for example in `~/.lmstudio/models` or a
+Hugging Face cache, instead of downloading them. It is not on the DFlash2 line, on hidden entries, on a build that is on
+disk, has a job or has something in its way, and not in the command palette.
+
+The user picks a folder in the macOS dialog ("Locate model files", button **Locate**, hidden folders shown): the folder
+that holds the model, or the folder one level above it. The page sends only a request id and the word `model`; MAIN
+holds the dialog's options, one dialog at a time for Work and Locate together. A cancelled dialog does nothing. While
+the server checks the folder (`POST /api/downloads/locate-plan` with `{ slug, path }`, which writes nothing) the button
+reads **Checking…**. A refusal is one line in the card's build row, in the server's words; the line opens the whole
+sentence. Otherwise a confirmation, **Use these files?**, says how many files of which size the app found and where,
+what it checks, how the files are used and what it downloads, and that nothing in the user's folder is changed, moved
+or deleted. **Use files** starts the job (`POST /api/downloads` with `{ slug, locate: token }`); it waits in the same
+queue as downloads, shows the usual progress ("Checking <file>" while it reads a file) and Cancel, and ends with the
+toast "Model located".
+
+What the app checks: the folder (or one of its direct child folders) must hold every weight file of the chosen build
+under its catalog name and size. A folder that holds another build of the same model is named ("This folder holds
+UD-Q4_K_M. Choose UD-Q4_K_M on the card, then use Locate again."). The job then reads each weight file once and
+compares its sha256 with the catalog's; a file of the right size with other bytes stops the job with nothing changed.
+A folder that has this app's own install record of the build is trusted: the job checks that the listed files are
+there and reads none of them, and needs no network. The models folder on a missing disk is refused with the same
+sentence as Install. A snapshot of the app's own download cache is refused when a file must be downloaded, because the
+download would create that file in the snapshot ("This folder is part of the app's download cache, and "<name>" is
+missing or different there. Use Install.").
+
+The app makes its own folder `<models>/<slug>`, built in `.staging` and renamed into place, in one of two modes:
+
+- **Same disk** (`shared`): each weight file gets a second name in the app's folder. The file is stored once and
+  takes no extra space; its content, name and modified time stay as they are.
+- **Another disk** (`linked`): the app's folder links to each weight file. The model works only while that disk is
+  connected. The engine reads the small files beside the real weights, so the user's folder must hold them under the
+  catalog names, with the same bytes; a Hugging Face cache, whose files have other names, can be used only from the
+  disk of the models folder.
+
+The small files (configs, tokenizer) are always the app's own copies, made with an exclusive create; missing files are
+downloaded into the app's folder. The marker carries `located: { from, mode }`. The app never creates, renames,
+deletes or writes a file in the user's folder.
+
+After Locate the card reads **Installed** with "Uses files in <folder>" on its build row. A linked model whose disk is
+away reads **Files not found** (the line opens "<folder> is not available. Connect the disk, or locate the files
+again.") with **Check again**, **Locate…** and **Download instead**; nothing is removed until the user acts, and the
+engine does not list a folder whose weight links are dead (nor a split set or safetensors checkpoint with one part
+whose link is dead). Local models shows a **Linked** badge (or **Not connected**)
+and the drawer a **Shares files with** or **Linked to** row.
+
+Delete of a located model removes only the app's folder (its names and links). When every weight file in it is a link
+or still has another name, the confirmation is **Remove model?**: "This removes <name> from the app. Its
+model files stay on disk; you located them in <folder>." When the app's folder holds the last name of a weight file
+(the user deleted the originals, or `mlx download` put its own copy in place of a link), the normal **Delete model?**
+text is shown, because the bytes do go. **Update
+available** on a located model asks first ("Download the new version?"): the update downloads the whole build into the
+models folder, the old app folder is removed by the usual swap, and the files in the user's folder stay and are no
+longer used. **Download instead** does the same without a question. `mlx download` into a located folder replaces a
+file by removing its name first, so it never writes through to the user's file ([cli.md](cli.md)).
+
+Not supported: copying or moving weights into the models folder, an older version of a file or a renamed file (only
+the current catalog file passes, unless the folder has this app's install record), picking a single file, a search
+deeper than the direct child folders, models that are not in the catalog, and updating a located model in place.
+
 ## Chat and Work
 
 `/chat` is one page with two modes, switched by the segmented control in its bar (`⌘⇧M`). Chat runs the bundled
@@ -1335,8 +1397,8 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
 - `http://127.0.0.1:5179/__gallery` shows every own component in its states (loading, ready, working, error).
 - The fixture home defaults to `packages/dashboard/.dev-home` (gitignored). `assertFixtureHome` refuses the user's
   home, the real `~/.mlx-node`, anything inside it and every ancestor of them, so the harness never reaches real data.
-- Routes that would reach the network (a real download, the update check) answer `E_UNAVAILABLE` unless
-  `MLX_DEV_NETWORK=1`.
+- Routes that would reach the network (a real download, the update check, the Update and Locate plans) answer
+  `E_UNAVAILABLE` unless `MLX_DEV_NETWORK=1`; a Locate click there ends in the "Disabled in the dev harness" line.
 - `MLX_DEV_ENGINE_STATES=1` loads five more models, one per state of the Engine "Block pool and batching" section: turns
   that ran alone with 0 or 1,200 blocks held, turns only before the last hour, a flat-cache model and a paged model
   before its first snapshot. `MLX_DEV_TICKER_TPS` and `MLX_DEV_TICKER_MEM_GB` fix the Output rate and MLX memory of the
@@ -1361,7 +1423,11 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   conversation of the fixture home, so the last unfinished turn of each shows its line.
 - Chat and Work run only on the scripted fake agent (`__test__/helpers/fake-agent.mjs`, script
   `__test__/fixtures/chat-scenarios/chat-harness.json`, picked by a word of the prompt), with keys in memory and the
-  providers on loopback. The folder dialog answers a throwaway folder in the fixture home.
+  providers on loopback. The folder dialog answers a throwaway folder in the fixture home: `work/` for Work,
+  `lmstudio/models` for Locate.
+- The fixture home holds one catalog model that Locate made (Clairic (27B), `CATALOG_LOCATED`): its folder links to
+  the weights in `lmstudio/models/Brooooooklyn/Clairic-GGUF`, so the card shows "Uses files in" and Local models the
+  Linked badge. The other Locate states (checking, a refusal, files not found) are in the gallery.
 - Nothing of the harness ships: its files live in `packages/dashboard/scripts/`, no file under `ui/` imports them,
   and `__test__/pack.test.ts` checks that `web/` holds no harness string.
 - The harness runs without the app's CSP, drag region and traffic lights. Check those in the real window:
