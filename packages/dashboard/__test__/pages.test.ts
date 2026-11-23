@@ -96,6 +96,7 @@ import {
   sequence,
   statValue,
   stubApi,
+  stubError,
   waitFor,
   type RenderedPage,
 } from './render.js';
@@ -4310,8 +4311,36 @@ describe('Models page — local models and the drawer', () => {
       await act(async () => buttonIn(dialog, 'Remove').click());
       await waitFor(() => success.mock.calls.length > 0);
       expect(success).toHaveBeenCalledWith('Model removed', { description: NAME });
-      expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.path)).toEqual([
-        `/api/models/${NAME}`,
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+        [`/api/models/${NAME}`, { keepsFiles: true }],
+      ]);
+    });
+
+    it('turns Remove into the danger Delete when the server says the files no longer stay', async () => {
+      const success = vi.spyOn(toast, 'success');
+      const stays = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: true };
+      const routes = modelsRoutes({}, stays);
+      const listed = routes['/models'] as ModelsResponse;
+      const lastCopy = { ...listed, models: [{ ...listed.models[0]!, located: { ...stays, filesStay: false } }] };
+      routes['/models'] = sequence(listed, lastCopy, { ...listed, models: [] });
+      const conflict = `The model files of "${NAME}" are no longer anywhere else on disk. Delete now removes them.`;
+      routes[`/models/${NAME}`] = sequence(stubError('E_CONFLICT', conflict), { deleted: true, name: NAME });
+      await mountModels(routes);
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Remove ${NAME}"]`)!.click(),
+      );
+      await act(async () => buttonIn(dialogWith('Remove model?')!, 'Remove').click());
+      await waitFor(() => dialogWith('Delete model?')?.textContent?.includes(conflict) === true);
+      const dialog = popover();
+      expect(dialog.textContent).toContain('permanently removes');
+      expect(dialogWith('Remove model?')).toBeUndefined();
+      expect(success).not.toHaveBeenCalled();
+      await act(async () => buttonIn(dialog, 'Delete').click());
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success).toHaveBeenCalledWith('Model deleted', { description: NAME });
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+        [`/api/models/${NAME}`, { keepsFiles: true }],
+        [`/api/models/${NAME}`, undefined],
       ]);
     });
 

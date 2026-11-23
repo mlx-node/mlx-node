@@ -545,7 +545,8 @@ bytes to a running download nor dies with its cancel. Its token is a sha256 over
 with their checksums, the checked files with size, `mtimeNs` and inode, the downloaded paths and the folder's
 `dev:ino`; other files are not in it, so a new `.DS_Store` does not break the confirm. The confirm shows the counts,
 the sizes and up to 3 other names. The start request carries the token, and a token starts one job only: a token that
-is not the last plan's, or one already used, gets 409. The job computes the plan again before it does anything and
+is not the last plan's gets 409, and so does a used one once its job has ended. While the Update job is active, an
+Update request for the folder returns that job's id. The job computes the plan again before it does anything and
 stops with "Nothing was changed." when the token differs.
 
 The job hashes each checked file where it is. It opens the file with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, the `fstat`
@@ -609,17 +610,24 @@ sentence. Otherwise a confirmation, **Use these files?**, says how many files of
 what it checks, how the files are used and what it downloads, and that nothing in the user's folder is changed, moved
 or deleted. **Use files** starts the job (`POST /api/downloads` with `{ slug, locate: token }`); it waits in the same
 queue as downloads, shows the usual progress ("Checking <file>" while it reads a file) and Cancel, and ends with the
-toast "Model located".
+toast "Model located". The token follows the Update rules, except that while the Locate job is active only its own
+token returns its id; any other token gets "A download of this model is already in the queue. Cancel it, then use
+Locate."
 
 What the app checks: the folder (or one of its direct child folders) must hold every weight file of the chosen build
 under its catalog name and size. A folder that holds another build of the same model is named ("This folder holds
 UD-Q4_K_M. Choose UD-Q4_K_M on the card, then use Locate again."). The job then reads each weight file once and
 compares its sha256 with the catalog's; a file of the right size with other bytes stops the job with nothing changed.
 A folder that has this app's own install record of the build is trusted: the job checks that the listed files are
-there and reads none of them, and needs no network. The models folder on a missing disk is refused with the same
-sentence as Install. A snapshot of the app's own download cache is refused when a file must be downloaded, because the
-download would create that file in the snapshot ("This folder is part of the app's download cache, and "<name>" is
-missing or different there. Use Install.").
+there and reads none of them, and needs no network. The record is trusted for content too: a file replaced under a
+listed name after the record was written is used as it is, as the recorded build at the recorded revision, and is not
+read. Use Install, or remove the record from that folder, to have the files checked. The models folder on a missing
+disk is refused with the same sentence as Install. A snapshot of the app's own download cache is refused when a file
+must be downloaded, because the download would create that file in the snapshot ("This folder is part of the app's
+download cache, and "<name>" is missing or different there. Use Install."). The check compares real paths: the cache
+paths a download writes (the file in its snapshot and the repo's `blobs` folder), with every link in their existing
+part followed, must be outside the folder that holds the files, so a cache repo folder that is a link into that
+folder is refused too. When that folder holds the whole download cache, the sentence names the cache.
 
 The app makes its own folder `<models>/<slug>`, built in `.staging` and renamed into place, in one of two modes:
 
@@ -630,9 +638,18 @@ The app makes its own folder `<models>/<slug>`, built in `.staging` and renamed 
   catalog names, with the same bytes; a Hugging Face cache, whose files have other names, can be used only from the
   disk of the models folder.
 
+A link uses the file by its path: a file replaced or rewritten there later is used as it is and is not read again, and
+the card keeps Installed at the recorded revision. In shared mode the same holds for a file rewritten in place; a file
+that another program replaces under its name keeps its old bytes in the app's folder.
+
 The small files (configs, tokenizer) are always the app's own copies, made with an exclusive create; missing files are
 downloaded into the app's folder. The marker carries `located: { from, mode }`. The app never creates, renames,
-deletes or writes a file in the user's folder.
+deletes or writes a file in the user's folder. Inside the located folder it writes only in the models folder, when the
+located folder contains it (model files at the root of the disk that holds the models folder): `<slug>` and `.staging` are made
+inside the models folder, and nothing else in the located folder is created. The search never takes anything from the
+models folder: it skips the models folder as a child folder, and a file that a link (or a catalog path into a child
+folder) leads to inside it refuses the plan, with the text that "<name>" here is a file in the models folder and
+Locate uses only files outside it.
 
 After Locate the card reads **Installed** with "Uses files in <folder>" on its build row. A linked model whose disk is
 away reads **Files not found** (the line opens "<folder> is not available. Connect the disk, or locate the files
@@ -645,7 +662,9 @@ Delete of a located model removes only the app's folder (its names and links). W
 or still has another name, the confirmation is **Remove model?**: "This removes <name> from the app. Its
 model files stay on disk; you located them in <folder>." When the app's folder holds the last name of a weight file
 (the user deleted the originals, or `mlx download` put its own copy in place of a link), the normal **Delete model?**
-text is shown, because the bytes do go. **Update
+text is shown, because the bytes do go. **Remove** sends `{ keepsFiles: true }` with the delete, and the server checks
+again just before it removes: when the folder now holds the last name of a weight file it answers 409 and removes
+nothing, and the page reads the list again and shows the **Delete model?** text, which the user confirms anew. **Update
 available** on a located model asks first ("Download the new version?"): the update downloads the whole build into the
 models folder, the old app folder is removed by the usual swap, and the files in the user's folder stay and are no
 longer used. **Download instead** does the same without a question. `mlx download` into a located folder replaces a

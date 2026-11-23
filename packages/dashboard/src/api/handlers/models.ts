@@ -7,12 +7,13 @@ import { catalogWithState } from '../../catalog.js';
 import {
   discoverLocalModels,
   deleteLocalModel,
+  FilesNoLongerStayError,
   isModelPresent,
   isRegularFile,
   modelsDirUnavailable,
   type ModelsResponse,
 } from '../../models.js';
-import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
+import { type ApiPaths, type ApiRequest, type MainApiContext, requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
 
 /** The first path segment of `path` under `root`, or null when it is not inside it. */
@@ -66,11 +67,27 @@ export async function handleCodingAgentModels(ctx: ApiPaths): Promise<unknown> {
   };
 }
 
+/** The Remove form sends `{ keepsFiles: true }`; the Delete form sends no body. */
+function keepsFilesOf(req: ApiRequest): boolean {
+  const body = requireBody(req);
+  if (body === null) return false;
+  if (
+    typeof body === 'object' &&
+    Object.keys(body).length === 1 &&
+    (body as { keepsFiles?: unknown }).keepsFiles === true
+  ) {
+    return true;
+  }
+  throw ApiError.badRequest('The body is { keepsFiles: true } or none.');
+}
+
 export function handleDeleteModel(ctx: ApiPaths, req: ApiRequest): unknown {
   try {
-    deleteLocalModel(ctx.modelsDir, req.params.name);
+    deleteLocalModel(ctx.modelsDir, req.params.name, () => keepsFilesOf(req));
     return { deleted: true, name: req.params.name };
   } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof FilesNoLongerStayError) throw ApiError.conflict(err.message);
     const message = err instanceof Error ? err.message : String(err);
     // The store surfaces "not found" only through the message text; keep sniffing
     // it verbatim so an unknown name stays a 404 and every other failure a 400.

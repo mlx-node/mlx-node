@@ -781,6 +781,23 @@ function locateInCacheMessage(name: string): string {
   return `This folder is part of the app's download cache, and "${name}" is missing or different there. Use Install.`;
 }
 
+function locateHoldsCacheMessage(name: string): string {
+  return `The app's download cache is inside this folder, and "${name}" must be downloaded. Use Install.`;
+}
+
+/** Where a write to `path` lands: the real path of its deepest existing part, then the rest of `path`. */
+async function realWritePath(path: string): Promise<string> {
+  const rest: string[] = [];
+  for (let head = path; ; head = dirname(head)) {
+    try {
+      return join(await realpath(head), ...rest);
+    } catch {
+      if (dirname(head) === head) return path;
+      rest.unshift(basename(head));
+    }
+  }
+}
+
 function locateOtherBuildMessage(build: string): string {
   return `This folder holds ${build}. Choose ${build} on the card, then use Locate again.`;
 }
@@ -1428,7 +1445,8 @@ export class DownloadManager {
    *
    * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the folder, which the
    * request uses up. A repeat Update request while the Update job is active hands back its id; one while another job
-   * holds the folder is refused. `locate` makes the job a Locate, by the same rules with {@link planLocate}.
+   * holds the folder is refused. `locate` makes the job a Locate, by the same rules with {@link planLocate}, except
+   * that only the active Locate's own token hands back its id.
    *
    * Answers the job's id, the repository it downloads, and its kind.
    */
@@ -1456,7 +1474,7 @@ export class DownloadManager {
           'A download of this model is already in the queue. Cancel it, then use Update.',
         );
       }
-      if (locating !== undefined && active.locate === null) {
+      if (locating !== undefined && active.locate?.token !== locating) {
         throw new DownloadConflictError(LOCATE_QUEUED);
       }
       if (asked !== undefined && active.replace === null) {
@@ -1746,7 +1764,16 @@ export class DownloadManager {
       throw new DownloadConflictError(LOCATE_UNREADABLE);
     }
     const byRecord = await this.recordLocatePlan(target, picked, listing.folders, modelsDev);
-    return byRecord ?? (await this.hubLocatePlan(target, picked, listing, modelsDev, fetchImpl));
+    const plan = byRecord ?? (await this.hubLocatePlan(target, picked, listing, modelsDev, fetchImpl));
+    // A link in the folder, or a catalog path into a child folder, can lead into the models folder.
+    const inModels = plan.use.find((item) => isInside(item.realPath, modelsReal));
+    if (inModels !== undefined) {
+      throw new DownloadConflictError(
+        `"${basename(inModels.path)}" here is a file in the models folder. ` +
+          'Locate uses only files outside the models folder.',
+      );
+    }
+    return plan;
   }
 
   /**
@@ -1985,22 +2012,24 @@ export class DownloadManager {
         });
       } else download.push(item);
     }
-    // A download first makes the cache's name of the file: in this folder when it is that snapshot of the cache.
-    const cacheReal = await realpath(this.cacheDir).catch(() => resolve(this.cacheDir));
-    const throughFolder = download.find((item) =>
-      isInside(
-        join(
-          cacheReal,
-          getRepoFolderName({ type: 'model', name: item.repo }),
-          'snapshots',
-          item.revision,
-          item.file.path,
-        ),
-        holder.dir,
-      ),
-    );
+    // A download first writes the cache's blob and its name of the file: in the folder that holds the user's files
+    // when a link in the cache leads there, or when that folder is part of the cache.
+    let throughFolder: LocateDownload | undefined;
+    for (const item of download) {
+      const repoDir = join(this.cacheDir, getRepoFolderName({ type: 'model', name: item.repo }));
+      const writes = [
+        await realWritePath(join(repoDir, 'snapshots', item.revision, item.file.path)),
+        await realWritePath(join(repoDir, 'blobs')),
+      ];
+      if (writes.some((path) => isInside(path, holder.dir))) {
+        throughFolder = item;
+        break;
+      }
+    }
     if (throughFolder !== undefined) {
-      throw new DownloadConflictError(locateInCacheMessage(basename(throughFolder.file.path)));
+      const name = basename(throughFolder.file.path);
+      const holdsCache = isInside(await realWritePath(this.cacheDir), holder.dir);
+      throw new DownloadConflictError(holdsCache ? locateHoldsCacheMessage(name) : locateInCacheMessage(name));
     }
     const paths = wanted.map((item) => item.file.path);
     const mode = this.locateMode(use, paths, primaries[0]!.file.path, modelsDev);

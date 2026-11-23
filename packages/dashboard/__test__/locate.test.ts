@@ -457,6 +457,34 @@ describe('Locate: plan', () => {
     }
   });
 
+  it('takes a folder that contains the models folder, and writes only in the models folder', async () => {
+    const disk = userFolder('disk', { [WEIGHT]: undefined, 'notes.txt': Buffer.from('mine') });
+    modelsDir = join(disk, 'models');
+    mkdirSync(modelsDir);
+    const outsideModels = (): Record<string, string> =>
+      Object.fromEntries(
+        Object.entries(tree(disk)).filter(([path]) => path !== 'models' && !path.startsWith('models/')),
+      );
+    const before = outsideModels();
+    const { plan, events } = await locate(manager(), disk);
+    expect(plan.mode).toBe('shared');
+    expect(plan.folder).toBe(disk);
+    expect(events.at(-1)).toEqual({ type: 'done', id: expect.any(String), outputDir: join(modelsDir, SLUG) });
+    expect(lstatSync(join(modelsDir, SLUG, WEIGHT)).ino).toBe(lstatSync(join(disk, WEIGHT)).ino);
+    expect(outsideModels()).toEqual(before);
+  });
+
+  it('never takes a file of the models folder through a link in the picked folder', async () => {
+    const owned = userFolder(`models/${SLUG_M}`, { [WEIGHT]: undefined, 'config.json': undefined });
+    const folder = userFolder('links', {});
+    symlinkSync(join(owned, WEIGHT), join(folder, WEIGHT));
+    const before = tree(root);
+    expect(await refusal(manager(), folder)).toBe(
+      `"${WEIGHT}" here is a file in the models folder. Locate uses only files outside the models folder.`,
+    );
+    expect(tree(root)).toEqual(before);
+  });
+
   it("refuses a snapshot of the app's download cache when a file must be downloaded into it", async () => {
     const snapshot = join(cacheDir, `models--${REPO.split('/').join('--')}`, 'snapshots', hub.sha);
     userFolder(snapshot.slice(root.length + 1), {
@@ -468,6 +496,57 @@ describe('Locate: plan', () => {
       'This folder is part of the app\'s download cache, and "config.json" is missing or different there. Use Install.',
     );
     expect(tree(root)).toEqual(before);
+  });
+
+  it("refuses when the app cache's repo folder is a link to the folder that holds the model", async () => {
+    const repoFolder = `models--${REPO.split('/').join('--')}`;
+    const snapshot = join(root, 'hf', repoFolder, 'snapshots', hub.sha);
+    userFolder(snapshot.slice(root.length + 1), {
+      [WEIGHT]: undefined,
+      'config.json': Buffer.alloc(CANON['config.json']!.length, 0x20),
+    });
+    symlinkSync(join(root, 'hf', repoFolder), join(cacheDir, repoFolder));
+    const before = tree(root);
+    expect(await refusal(manager(), snapshot)).toBe(
+      'This folder is part of the app\'s download cache, and "config.json" is missing or different there. Use Install.',
+    );
+    expect(tree(root)).toEqual(before);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it("refuses when the app cache's blobs folder is a link into the folder that holds the model", async () => {
+    const folder = userFolder('flat', { [WEIGHT]: undefined });
+    mkdirSync(join(folder, 'blobstore'));
+    const repoDir = join(cacheDir, `models--${REPO.split('/').join('--')}`);
+    mkdirSync(repoDir, { recursive: true });
+    symlinkSync(join(folder, 'blobstore'), join(repoDir, 'blobs'));
+    const before = tree(folder);
+    expect(await refusal(manager(), folder)).toBe(
+      'This folder is part of the app\'s download cache, and "config.json" is missing or different there. Use Install.',
+    );
+    expect(tree(folder)).toEqual(before);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it('takes a picked folder that holds the download cache beside the folder of the model files', async () => {
+    const home = join(root, 'home');
+    const folder = userFolder('home/qwen', { [WEIGHT]: undefined });
+    const before = tree(folder);
+    const m = new DownloadManager({ modelsDir, cacheDir: join(home, '.cache', 'hf'), fetchImpl: serveCanon });
+    const { events } = await locate(m, home);
+    expect(events.at(-1)?.type).toBe('done');
+    expect(tree(folder)).toEqual(before);
+  });
+
+  it('names the cache when the folder of the model files holds the download cache', async () => {
+    const home = userFolder('home', { [WEIGHT]: undefined });
+    const before = tree(home);
+    const m = new DownloadManager({ modelsDir, cacheDir: join(home, '.cache', 'hf'), fetchImpl: serveCanon });
+    expect(await refusal(m, home)).toBe(
+      'The app\'s download cache is inside this folder, and "config.json" must be downloaded. Use Install.',
+    );
+    expect(tree(home)).toEqual(before);
+    expect(hub.downloaded).toEqual([]);
   });
 
   it("takes a snapshot of the app's download cache that needs nothing downloaded into it", async () => {
@@ -651,6 +730,48 @@ describe('Locate: job, shared', () => {
     const before = tree(folder);
     deleteLocalModel(modelsDir, SLUG);
     expect(existsSync(dir)).toBe(false);
+    expect(tree(folder)).toEqual(before);
+  });
+
+  it('Remove deletes only while the files still stay, checked at the delete', async () => {
+    const folder = userFolder('flat', { [WEIGHT]: undefined });
+    await locate(manager(), folder);
+    const dir = join(modelsDir, SLUG);
+    const ctx = { modelsDir } as unknown as ApiContext;
+    const remove = (body?: unknown) =>
+      dispatch(ctx, { method: 'DELETE', pathname: `/api/models/${SLUG}`, query: new URLSearchParams(), body });
+    // The page read the list while the user still had the weight; then the user deleted their copy.
+    expect(discoverLocalModels(modelsDir).models.find((model) => model.name === SLUG)?.located?.filesStay).toBe(true);
+    rmSync(join(folder, WEIGHT));
+    const refused = await remove({ keepsFiles: true });
+    expect(refused).toEqual({
+      ok: false,
+      code: 'E_CONFLICT',
+      status: 409,
+      message: `The model files of "${SLUG}" are no longer anywhere else on disk. Delete now removes them.`,
+    });
+    expect(lstatSync(join(dir, WEIGHT)).nlink).toBe(1);
+    for (const body of [{ keepsFiles: 'yes' }, { keepsFiles: true, more: 1 }, [true]]) {
+      expect((await remove(body)).status, JSON.stringify(body)).toBe(400);
+    }
+    expect(isModelInstalled(dir)).toBe(true);
+    expect((await remove()).status).toBe(200);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('Remove deletes the app folder while the files stay, and the user files are unchanged', async () => {
+    const folder = userFolder('flat', { [WEIGHT]: undefined });
+    await locate(manager(), folder);
+    const before = tree(folder);
+    const ctx = { modelsDir } as unknown as ApiContext;
+    const removed = await dispatch(ctx, {
+      method: 'DELETE',
+      pathname: `/api/models/${SLUG}`,
+      query: new URLSearchParams(),
+      body: { keepsFiles: true },
+    });
+    expect(removed).toMatchObject({ ok: true, status: 200 });
+    expect(existsSync(join(modelsDir, SLUG))).toBe(false);
     expect(tree(folder)).toEqual(before);
   });
 
@@ -888,6 +1009,25 @@ describe('Locate: the job fails, and nothing is changed', () => {
     });
     expect(again.status).toBe(409);
     expect(again.ok ? '' : again.message).toBe(`The folder or "${SLUG}" changed. Close this, then use Locate again.`);
+  });
+
+  it("hands back the active Locate's id only for its own token", async () => {
+    const folderA = userFolder('a', { [WEIGHT]: undefined });
+    const folderB = userFolder('b', { [WEIGHT]: undefined });
+    const m = manager();
+    const a = await m.planLocate(SLUG, folderA);
+    const pb = m.planLocate(SLUG, folderB);
+    const id = m.start(SLUG, { locate: a.token }).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    const b = await pb;
+    expect(() => m.start(SLUG, { locate: b.token })).toThrow(
+      'A download of this model is already in the queue. Cancel it, then use Locate.',
+    );
+    expect(m.start(SLUG, { locate: a.token }).id).toBe(id);
+    await waitFor(() => events.some(isTerminal));
+    expect(events.at(-1)?.type).toBe('done');
+    expect(readCompletion(join(modelsDir, SLUG))?.located?.from).toBe(folderA);
   });
 
   it('is cancelled during the check, and only its staging folder is removed', async () => {

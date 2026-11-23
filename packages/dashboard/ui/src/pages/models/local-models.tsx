@@ -29,6 +29,7 @@ import {
   type ModelsResponse,
   type RuntimeLive,
 } from '../../lib/types';
+import { reloadMountedQueries } from '../../lib/use-api';
 
 const NO_USAGE = 'No recorded turns for this model in the last 30 days';
 const USAGE_FAILED = 'Usage could not be loaded';
@@ -148,8 +149,18 @@ export function deleteContent(target: DeleteTarget, handlers: DeleteHandlers): C
   const remove = async (): Promise<void> => {
     goneBeforeDelete.delete(target.name);
     try {
-      await mutate<DeleteModelResponse>('DELETE', `/models/${encodeURIComponent(target.name)}`);
+      // The Remove text is a promise: the server checks it again and answers a conflict when it no longer holds.
+      await mutate<DeleteModelResponse>(
+        'DELETE',
+        `/models/${encodeURIComponent(target.name)}`,
+        located !== null ? { keepsFiles: true } : undefined,
+      );
     } catch (err) {
+      if (err instanceof DashboardApiError && err.code === 'E_CONFLICT') {
+        // The list read again turns this form into the danger Delete, which the user confirms anew.
+        reloadMountedQueries();
+        throw err;
+      }
       if (!(err instanceof DashboardApiError) || err.code !== 'E_NOT_FOUND') throw err;
       goneBeforeDelete.add(target.name);
     }

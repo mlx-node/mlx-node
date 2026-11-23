@@ -1331,6 +1331,14 @@ export function sameForeignEntry(
   );
 }
 
+/** A Remove that promised the model files stay on disk, when the folder now holds the last name of one. */
+export class FilesNoLongerStayError extends Error {
+  constructor(name: string) {
+    super(`The model files of "${name}" are no longer anywhere else on disk. Delete now removes them.`);
+    this.name = 'FilesNoLongerStayError';
+  }
+}
+
 /**
  * Delete a checkpoint directory by its exact name. `name` must be a single
  * direct child of `modelsDir`: any path separator, `.`/`..`, or NUL is rejected,
@@ -1340,8 +1348,12 @@ export function sameForeignEntry(
  * it — but ONLY the link itself is removed (a non-recursive `rmSync` unlinks a
  * symlink rather than following it), so the foreign target outside the store is
  * never touched.
+ *
+ * `keepsFiles` is read once the name is found, so an unknown name stays "not found" before a bad request. When it
+ * answers true (the Remove form told the user the model files stay on disk), the delete is refused with
+ * {@link FilesNoLongerStayError} unless {@link locatedState} still says so.
  */
-export function deleteLocalModel(modelsDir: string, name: string): void {
+export function deleteLocalModel(modelsDir: string, name: string, keepsFiles: () => boolean = () => false): void {
   const target = modelsChildPath(modelsDir, name, 'delete');
 
   let stat;
@@ -1350,6 +1362,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   } catch {
     throw new Error(`Model "${name}" not found`);
   }
+  if (keepsFiles() && locatedState(target)?.filesStay !== true) throw new FilesNoLongerStayError(name);
   if (stat.isSymbolicLink()) {
     // A linked-in checkpoint is deletable like a real one — but only the LINK
     // is removed, never the foreign target it names. The checkpoint gate below
