@@ -19,6 +19,7 @@ export const WEB_ERROR_CODES = [
   'bad-request',
   'provider-error',
   'local-down',
+  'local-cloud',
 ] as const;
 export type WebErrorCode = (typeof WEB_ERROR_CODES)[number];
 
@@ -38,6 +39,8 @@ export const WEB_ERROR_SENTENCES: Readonly<Record<WebErrorCode, string>> = {
   'provider-error': 'The search provider failed. Answer from what you know and say that the search failed.',
   'local-down':
     'The page reader on this Mac is not ready. Tell the user to check Firecrawl in Web Search settings. Do not call the tool again.',
+  'local-cloud':
+    'Firecrawl on this Mac is set to send pages to Firecrawl Cloud, and the app does not use it that way. Tell the user to open Web Search settings. Do not call the tool again.',
 };
 
 const SEARCH_PROVIDERS: readonly string[] = ['exa', 'deepseek', 'brave'];

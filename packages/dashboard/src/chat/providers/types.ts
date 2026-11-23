@@ -35,10 +35,11 @@ export interface ProviderState {
 }
 
 /**
- * The last check of Firecrawl on this Mac. `ok`: Firecrawl Local, refusing private targets. `not-running`: no answer.
- * `not-firecrawl`: something else answers. `open`: it reads private addresses. `token`: it asks for a token.
+ * The last check of Firecrawl on this Mac. `ok`: Firecrawl Local, refusing private targets, its Cloud setting off.
+ * `not-running`: no answer. `not-firecrawl`: something else answers. `open`: it reads private addresses. `token`: it
+ * asks for a token. `cloud-on`: it may send a page to Firecrawl Cloud, or its Cloud setting could not be read.
  */
-export type LocalCheck = 'ok' | 'not-running' | 'not-firecrawl' | 'open' | 'token';
+export type LocalCheck = 'ok' | 'not-running' | 'not-firecrawl' | 'open' | 'token' | 'cloud-on';
 
 /** `off`: no page leaves this Mac. `fallback`: a page the server cannot load is sent to Firecrawl Cloud. */
 export type LocalCloud = 'off' | 'fallback';
@@ -53,7 +54,7 @@ export interface LocalFirecrawl {
   checkedAt: number | null;
   /** The server's version, digits and dots only. */
   version: string | null;
-  /** The server's Cloud setting; null when it was not read. */
+  /** The server's Cloud setting: `off` with `ok`; `fallback` or null (not readable) with `cloud-on`; else null. */
   cloud: LocalCloud | null;
 }
 
@@ -98,7 +99,10 @@ export interface ProviderSelectionInput {
   firecrawlLocal?: boolean;
 }
 
-/** `PUT /api/providers/local`. An address whose check is not `ok` is not saved, and any earlier address stays. */
+/**
+ * `PUT /api/providers/local`. An address whose check is not `ok` is not saved, and any earlier address stays. Nor is
+ * one whose check passed after an Off or a Remove of the crawler landed during it (`saved: false`, `check: 'ok'`).
+ */
 export interface ProviderLocalReply {
   saved: boolean;
   check: LocalCheck;

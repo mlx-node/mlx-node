@@ -15,6 +15,7 @@ import {
 } from '../src/chat/web/local.js';
 import {
   fakeLocalAnswers,
+  fakeLocalCloud,
   fakeLocalScript,
   type FakeLocalAnswers,
   type FakeProvider,
@@ -49,8 +50,8 @@ function recordingFetch(): { fetch: typeof fetch; urls: string[] } {
   };
 }
 
-function opts(f: typeof fetch, readCloud = true): LocalCheckOptions {
-  return { fetch: f, readCloud };
+function opts(f: typeof fetch): LocalCheckOptions {
+  return { fetch: f };
 }
 
 describe('parseLocalAddress', () => {
@@ -116,7 +117,7 @@ describe('localOrigin', () => {
 });
 
 describe('checkLocal', () => {
-  it('Firecrawl Local that refuses private targets is ok, with its version and its Cloud setting', async () => {
+  it('Firecrawl Local that refuses private targets and has its Cloud off is ok, with its version', async () => {
     const { server } = await fakeLocal();
     const rec = recordingFetch();
     expect(await checkLocal(server.baseUrl, opts(rec.fetch))).toEqual({ check: 'ok', version: '0.1.1', cloud: 'off' });
@@ -136,36 +137,27 @@ describe('checkLocal', () => {
     for (const url of rec.urls) expect(new URL(url).origin).toBe(server.baseUrl);
   });
 
-  it('reads the Cloud hand-off when the server refuses a cross-site request, and nothing for another answer', async () => {
-    const fallback = await fakeLocal({
-      cloud: { status: 403, json: { success: false, code: 'CROSS_SITE_REQUEST' } },
-    });
+  it('a Cloud that takes pages the server cannot load, or a Cloud setting it cannot read, is cloud-on', async () => {
+    const fallback = await fakeLocal({ cloud: fakeLocalCloud('fallback') });
     expect(await checkLocal(fallback.server.baseUrl, opts(fetch))).toEqual({
-      check: 'ok',
+      check: 'cloud-on',
       version: '0.1.1',
       cloud: 'fallback',
     });
     for (const cloud of [
+      fakeLocalCloud('unreadable'),
       { status: 200, json: { success: true } },
       { status: 501, json: { code: 'OTHER' } },
+      { status: 501, body: 'not json' },
+      { ...fakeLocalCloud('off'), delayMs: 300 },
+      { drop: true },
     ]) {
       const other = await fakeLocal({ cloud });
-      expect(await checkLocal(other.server.baseUrl, opts(fetch))).toEqual({
-        check: 'ok',
-        version: '0.1.1',
-        cloud: null,
-      });
+      expect([cloud, await checkLocal(other.server.baseUrl, { fetch, cloudMs: 50 })]).toEqual([
+        cloud,
+        { check: 'cloud-on', version: '0.1.1', cloud: null },
+      ]);
     }
-  });
-
-  it('without readCloud, sends only the health request and the probe', async () => {
-    const { server } = await fakeLocal();
-    expect(await checkLocal(server.baseUrl, opts(fetch, false))).toEqual({
-      check: 'ok',
-      version: '0.1.1',
-      cloud: null,
-    });
-    expect(server.requests.map((r) => r.path)).toEqual(['/health', '/v2/scrape']);
   });
 
   it('nothing listening is not-running', async () => {
@@ -224,7 +216,7 @@ describe('checkLocal', () => {
       cloud: null,
     });
     const slow = await fakeLocal({ probe: { ...fakeLocalAnswers().probe, delayMs: 300 } });
-    expect(await checkLocal(slow.server.baseUrl, { fetch, readCloud: true, probeMs: 50 })).toEqual({
+    expect(await checkLocal(slow.server.baseUrl, { fetch, probeMs: 50 })).toEqual({
       check: 'not-running',
       version: '0.1.1',
       cloud: null,
@@ -254,17 +246,32 @@ describe('checkLocal', () => {
 });
 
 describe('the dev harness', () => {
-  it('runs a fake Firecrawl on this Mac on a loopback port that passes the check', async () => {
+  it('runs a fake Firecrawl on this Mac on a loopback port that passes the check, its Cloud off', async () => {
     const harness = await startHarnessProviders();
     try {
       expect(parseLocalAddress(harness.localUrl)).toBe(harness.localUrl);
-      const result = await checkLocal(harness.localUrl, {
-        fetch: (input, init) => fetch(input, init),
-        readCloud: true,
-      });
+      const result = await checkLocal(harness.localUrl, { fetch: (input, init) => fetch(input, init) });
       expect(result).toEqual({ check: 'ok', version: '0.1.1', cloud: 'off' });
     } finally {
       await harness.close();
+    }
+  });
+
+  it('switches its Cloud step to fallback or to an answer the check cannot read', async () => {
+    for (const [mode, cloud] of [
+      ['fallback', 'fallback'],
+      ['unreadable', null],
+    ] as const) {
+      const harness = await startHarnessProviders(mode);
+      try {
+        expect(await checkLocal(harness.localUrl, { fetch: (input, init) => fetch(input, init) })).toEqual({
+          check: 'cloud-on',
+          version: '0.1.1',
+          cloud,
+        });
+      } finally {
+        await harness.close();
+      }
     }
   });
 });

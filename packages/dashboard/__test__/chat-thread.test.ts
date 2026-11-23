@@ -258,24 +258,29 @@ describe('ChatThread: web call rows', () => {
     expect(anchors(container)).toContain('/providers');
   });
 
-  it('a reader on this Mac that is not ready offers the settings', () => {
-    const container = mount(
-      threadOf({
-        mode: 'chat',
-        entries: [
-          user('Read https://docs.example.org/guide'),
-          directFetch('https://docs.example.org/guide', formatErrorText('local-down', 'firecrawl')),
-          end('end_turn'),
-        ],
-        turns: [],
-        turn: null,
-        lastEnd: { turnId: 't1', outcome: 'completed' },
-      }),
-    );
-    expect(container.textContent).toContain(CHAT.webErrors['local-down']);
-    const toggles = allByRole(container, 'button').filter((b) => b.getAttribute('aria-expanded') === 'false');
-    for (const toggle of toggles) act(() => toggle.click());
-    expect(anchors(container)).toContain('/providers');
+  it('a reader on this Mac that is not ready, or whose Cloud is on, offers the settings', () => {
+    for (const code of ['local-down', 'local-cloud'] as const) {
+      const container = mount(
+        threadOf({
+          mode: 'chat',
+          entries: [
+            user('Read https://docs.example.org/guide'),
+            directFetch('https://docs.example.org/guide', formatErrorText(code, 'firecrawl')),
+            end('end_turn'),
+          ],
+          turns: [],
+          turn: null,
+          lastEnd: { turnId: 't1', outcome: 'completed' },
+        }),
+      );
+      expect(container.textContent).toContain(CHAT.webErrors[code]);
+      const toggles = allByRole(container, 'button').filter((b) => b.getAttribute('aria-expanded') === 'false');
+      for (const toggle of toggles) act(() => toggle.click());
+      expect([code, anchors(container)]).toEqual([code, expect.arrayContaining(['/providers'])]);
+      act(() => mounted!.root.unmount());
+      container.remove();
+      mounted = undefined;
+    }
   });
 
   it('a page Firecrawl Cloud read for this Mac says so in its row; a page read here does not', () => {

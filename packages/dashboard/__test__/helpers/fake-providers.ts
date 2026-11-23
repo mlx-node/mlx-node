@@ -106,7 +106,7 @@ export const CHECK_OK: Readonly<Record<'exa' | 'deepseek' | 'brave' | 'firecrawl
 
 export interface HarnessProviders {
   baseUrls: Record<'exa' | 'deepseek' | 'brave' | 'firecrawl', string>;
-  /** A fake Firecrawl on this Mac, as `firecrawl-local serve` answers by default: type it into the This Mac field. */
+  /** A fake Firecrawl on this Mac, as `FIRECRAWL_CLOUD=off firecrawl-local serve` answers: type it into the This Mac field. */
   localUrl: string;
   close(): Promise<void>;
 }
@@ -114,9 +114,10 @@ export interface HarnessProviders {
 /**
  * The dev harness's providers: a key that starts with `bad` is rejected, one that starts with `nocredit` has no
  * credit, one that starts with `slow` answers after 12 s (the check gives up: "not checked"), any other is valid.
- * Beside them runs a fake Firecrawl on this Mac that passes the check; any other loopback port reads "not running".
+ * Beside them runs a fake Firecrawl on this Mac whose Cloud step answers `localCloud` (default off, which passes the
+ * check); any other loopback port reads "not running".
  */
-export async function startHarnessProviders(): Promise<HarnessProviders> {
+export async function startHarnessProviders(localCloud: FakeLocalCloud = 'off'): Promise<HarnessProviders> {
   const ids = ['exa', 'deepseek', 'brave', 'firecrawl'] as const;
   const servers = await Promise.all(
     ids.map((id) =>
@@ -135,7 +136,7 @@ export async function startHarnessProviders(): Promise<HarnessProviders> {
     brave: servers[2]!.baseUrl,
     firecrawl: servers[3]!.baseUrl,
   };
-  const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
+  const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers(localCloud)));
   return {
     baseUrls,
     localUrl: local.baseUrl,
@@ -156,8 +157,23 @@ export interface FakeLocalAnswers {
   cloud: FakeAnswer;
 }
 
-/** `firecrawl-local serve` as its source answers by default: Cloud off, private targets refused. */
-export function fakeLocalAnswers(): FakeLocalAnswers {
+/**
+ * The Cloud step of a fake Firecrawl on this Mac. `off`: started with `FIRECRAWL_CLOUD=off` (or `search`), 501
+ * `CLOUD_ONLY`. `fallback`: `FIRECRAWL_CLOUD` unset, the server's default, 403 `CROSS_SITE_REQUEST`. `unreadable`: an
+ * answer the check does not know.
+ */
+export type FakeLocalCloud = 'off' | 'fallback' | 'unreadable';
+
+export function fakeLocalCloud(mode: FakeLocalCloud): FakeAnswer {
+  if (mode === 'off') return { status: 501, json: { success: false, code: 'CLOUD_ONLY', error: 'cloud is off' } };
+  if (mode === 'fallback') {
+    return { status: 403, json: { success: false, code: 'CROSS_SITE_REQUEST', error: 'from a web page' } };
+  }
+  return { status: 404, json: { success: false, code: 'NOT_FOUND' } };
+}
+
+/** `firecrawl-local serve` as its source answers: private targets refused, the Cloud step as `cloud` says. */
+export function fakeLocalAnswers(cloud: FakeLocalCloud = 'off'): FakeLocalAnswers {
   return {
     health: { json: { status: 'ok', engine: 'firecrawl-local', version: '0.1.1' } },
     probe: { status: 403, json: { success: false, code: 'BLOCKED_TARGET', error: 'blocked' } },
@@ -167,7 +183,7 @@ export function fakeLocalAnswers(): FakeLocalAnswers {
         data: { markdown: '# Local page\nBody', metadata: { title: 'Local page', statusCode: 200 }, source: 'local' },
       },
     },
-    cloud: { status: 501, json: { success: false, code: 'CLOUD_ONLY', error: 'cloud is off' } },
+    cloud: fakeLocalCloud(cloud),
   };
 }
 

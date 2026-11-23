@@ -1,4 +1,4 @@
-import { ExternalLink, TriangleAlert } from 'lucide-react';
+import { ExternalLink } from 'lucide-react';
 import { type ReactElement, useEffect, useRef, useState } from 'react';
 
 import { ConfirmPopover } from '../../components/arc-x/confirm-popover/confirm-popover';
@@ -31,11 +31,22 @@ export interface LocalFirecrawlProps {
 /** The label column of the block, as in the key rows of the card. */
 const LABEL_GRID = 'grid items-start gap-x-4 gap-y-2 grid-cols-[6rem_minmax(0,1fr)]';
 
-function Command({ text }: { text: string }): ReactElement {
+function Command({ text, note }: { text: string; note?: string }): ReactElement {
   return (
-    <span className="flex flex-wrap items-center gap-2">
+    <span className="flex flex-wrap items-center gap-x-2">
       <code className="font-mono text-caption text-foreground">{text}</code>
       <CopyButton value={text} label="Copy command" iconOnly variant="plain" />
+      {note !== undefined ? <span className="text-caption text-secondary">{note}</span> : null}
+    </span>
+  );
+}
+
+/** The two ways to start the server that the app uses, each with what it does. */
+function StartCommands(): ReactElement {
+  return (
+    <span className="grid gap-0.5">
+      <Command text={PROVIDERS.localStart} note={PROVIDERS.localStartOffNote} />
+      <Command text={PROVIDERS.localStartSearch} note={PROVIDERS.localStartSearchNote} />
     </span>
   );
 }
@@ -131,8 +142,8 @@ export function LocalFirecrawl(props: LocalFirecrawlProps): ReactElement {
             </a>
           </span>
           <Command text={PROVIDERS.localInstall} />
-          <Command text={PROVIDERS.localStart} />
           <span>{PROVIDERS.localStartNote}</span>
+          <StartCommands />
         </div>
       ) : null}
       <Input
@@ -205,15 +216,6 @@ export function LocalFirecrawl(props: LocalFirecrawlProps): ReactElement {
             {line.text}
           </span>
         ) : null}
-        {local.check === 'ok' && local.cloud === 'fallback' ? (
-          <span className="grid gap-0.5 text-caption">
-            <span className="flex items-start gap-1.5 text-warning">
-              <TriangleAlert size={12} aria-hidden="true" className="mt-0.5 shrink-0" />
-              <span>{PROVIDERS.localCloudFallback}</span>
-            </span>
-            <Command text={PROVIDERS.localStart} />
-          </span>
-        ) : null}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <Button
@@ -263,6 +265,11 @@ export function LocalFirecrawl(props: LocalFirecrawlProps): ReactElement {
           }}
         />
       </div>
+      {/* Laid out in every state, so the commands of a Cloud that is on take no new room. */}
+      <SwapCell
+        active={local.check === 'cloud-on' ? 'cloud' : 'none'}
+        items={{ none: null, cloud: <StartCommands /> }}
+      />
     </div>
   );
 

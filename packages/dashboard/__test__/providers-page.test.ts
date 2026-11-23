@@ -973,8 +973,11 @@ describe('Firecrawl on this Mac', () => {
       PROVIDERS.localText,
       PROVIDERS.localNeeds,
       PROVIDERS.localInstall,
-      PROVIDERS.localStart,
       PROVIDERS.localStartNote,
+      PROVIDERS.localStart,
+      PROVIDERS.localStartOffNote,
+      PROVIDERS.localStartSearch,
+      PROVIDERS.localStartSearchNote,
       PROVIDERS.localAddressHelp,
       PROVIDERS.localLimits,
     ]) {
@@ -1000,6 +1003,7 @@ describe('Firecrawl on this Mac', () => {
       ['not-firecrawl', PROVIDERS.localNotFirecrawl],
       ['open', PROVIDERS.localOpen],
       ['token', PROVIDERS.localToken],
+      ['cloud-on', PROVIDERS.localCloudOn],
     ] as const;
     for (const [check, sentence] of problems) {
       await open(
@@ -1058,32 +1062,75 @@ describe('Firecrawl on this Mac', () => {
     expect(localText()).toContain(`${PROVIDERS.localNotRunning} ${PROVIDERS.localEarlierKept}`);
   });
 
-  it('a saved address: its badge and line per check, the Cloud hand-off line, Check again', async () => {
+  it('a replace refused by an Off that landed during its check says the address was not saved', async () => {
+    const before = response({ firecrawlLocal: true, local: RUNNING });
+    const off = response({ local: RUNNING });
+    await open(
+      { '/providers': before, '/providers/local': { saved: false, check: 'ok', providers: off } },
+      PROVIDERS.leavesTitle,
+    );
+    await click(button(card('Firecrawl'), PROVIDERS.replace));
+    await typeInto(addressField(), 'http://127.0.0.1:4001');
+    await click(button(card('Firecrawl'), PROVIDERS.localSave));
+    await waitFor(() => localText().includes(PROVIDERS.failed));
+    expect(localText()).toContain(`${PROVIDERS.failed} ${PROVIDERS.localNotSaved}`);
+    expect(localText()).not.toContain(PROVIDERS.localEarlierKept);
+  });
+
+  it('a saved address: its badge and line per check, the start commands while its Cloud is on, Check again', async () => {
     const calls: ApiCall[] = [];
     const down = response({ local: { ...RUNNING, check: 'not-running', cloud: null } });
     await open(
       {
-        '/providers': sequence(response({ local: { ...RUNNING, cloud: 'fallback' } }), down),
+        '/providers': sequence(response({ local: { ...RUNNING, check: 'cloud-on', cloud: 'fallback' } }), down),
         '/providers/local/check': { check: 'not-running', providers: down },
       },
       PROVIDERS.leavesTitle,
       calls,
     );
+    const commands = [
+      PROVIDERS.localStart,
+      PROVIDERS.localStartOffNote,
+      PROVIDERS.localStartSearch,
+      PROVIDERS.localStartSearchNote,
+    ];
     expect(localText()).toContain(PROVIDERS.localCloudFallback);
-    expect(localText()).toContain(PROVIDERS.badgeRunning);
+    for (const words of commands) expect(localText()).toContain(words);
+    expect(localText()).toContain(PROVIDERS.badgeCheckFailed);
     await click(button(card('Firecrawl'), PROVIDERS.checkAgain));
     await waitFor(() => localText().includes(PROVIDERS.badgeNotRunning));
     expect(localText()).toContain(PROVIDERS.localNotRunning);
     expect(localText()).not.toContain(PROVIDERS.localCloudFallback);
+    for (const words of commands) expect(localText()).not.toContain(words);
+    // The commands stay laid out, hidden and inert, so the block keeps its height from one check to the next.
+    const block = card('Firecrawl').querySelector('[data-local-row]')!;
+    expect(
+      [...block.querySelectorAll('[inert]')].some((node) => node.textContent?.includes(PROVIDERS.localStartSearch)),
+    ).toBe(true);
     expect(calls.filter((call) => call.method === 'POST').map((call) => call.path)).toEqual([
       '/api/providers/local/check',
     ]);
     page!.unmount();
     dispose!();
+    await open(
+      { '/providers': response({ local: { ...RUNNING, check: 'cloud-on', cloud: null } }) },
+      PROVIDERS.leavesTitle,
+    );
+    expect(localText()).toContain(PROVIDERS.badgeCheckFailed);
+    expect(localText()).toContain(PROVIDERS.localCloudUnread);
+    expect(localText()).not.toContain(PROVIDERS.localCloudFallback);
+    for (const words of commands) expect(localText()).toContain(words);
+    page!.unmount();
+    dispose!();
     await open({ '/providers': response({ local: { ...RUNNING, check: 'open' } }) }, PROVIDERS.leavesTitle);
     expect(localText()).toContain(PROVIDERS.badgeCheckFailed);
     expect(localText()).toContain(PROVIDERS.localOpen);
-    expect(localText()).not.toContain(PROVIDERS.localCloudFallback);
+    expect(localText()).not.toContain(PROVIDERS.localStart);
+    page!.unmount();
+    dispose!();
+    await open({ '/providers': response({ local: RUNNING }) }, PROVIDERS.leavesTitle);
+    expect(localText()).toContain(PROVIDERS.badgeRunning);
+    expect(localText()).not.toContain(PROVIDERS.localStart);
   });
 
   it('Remove asks first, says the crawler turns off when in use, then a toast', async () => {
@@ -1109,13 +1156,14 @@ describe('Firecrawl on this Mac', () => {
     await waitFor(() => localText().includes(PROVIDERS.badgeNotSetUp));
   });
 
-  it('in use, Work gets the address and no key: the card says so in place of the key notice', async () => {
+  it('in use, Work gets the address and a placeholder key: the card says so in place of the key notice', async () => {
     await open(
       { '/providers': response({ firecrawlLocal: true, configured: ['firecrawl'], local: RUNNING }) },
       PROVIDERS.keySaved,
     );
     const fire = shownText(card('Firecrawl'));
     expect(fire).toContain(PROVIDERS.localWorkNotice);
+    expect(PROVIDERS.localWorkNotice).toContain('a placeholder key, never the key saved with firecrawl login');
     expect(fire).not.toContain(PROVIDERS.workKeyNotice);
   });
 });

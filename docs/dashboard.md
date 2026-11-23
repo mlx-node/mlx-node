@@ -488,31 +488,37 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   show on the Crawler row. Before the first host state the `+` is disabled.
 - Crawler row (FileText icon): picks who reads pages, Firecrawl Cloud, Firecrawl on this Mac (see
   [Web search providers](#web-search-providers)) or Off. Its right side says `Off`, `Firecrawl`, `This Mac`, or a
-  problem with its dot: `Key rejected` (danger), `No credit` (warning), `Not running` (warning), `Check failed`
-  (danger). On or off and the place come from the host summary (`firecrawl`, `firecrawlLocal`); the problem words need
+  problem with its dot: `Key rejected` (danger), `No credit` (warning), `Not running` (warning), `Cloud on` (danger;
+  the server sends a page it cannot load to Firecrawl Cloud), `Check failed` (danger; also a server whose Cloud setting
+  could not be read). On or off and the place come from the host summary (`firecrawl`, `firecrawlLocal`); the problem words need
   the `/api/providers` body, so they show from the menu's first read on. The panel is built like the Web search one: a
   caption, the list "Reads pages" with the rows Firecrawl Cloud, Firecrawl on this Mac and Off (always these three,
   in this order), a separator, then Web Search settings. Firecrawl Cloud with no key (`No key`) and Firecrawl on this
   Mac with no saved address (`Not set up`) are `aria-disabled`, and their names say where to set them up; a row not
   read yet is disabled unless it is the current one; a rejected key, no credit, a server that does not answer or a
-  failed check keep their dot and words and can still be picked. The Off row's second line says who reads pages then:
+  failed check keep their dot and words and can still be picked. The This Mac row of a server whose Cloud is on is
+  named "Firecrawl on this Mac, may send pages to Firecrawl Cloud. Web Search settings shows how to restart it." (or
+  "…, Cloud setting not confirmed. …"). The Off row's second line says who reads pages then:
   "Exa reads pages for Chat." (or DeepSeek), "Brave gives Chat page excerpts only." or "Chat cannot read pages." (no
   search provider). The settings row's note names what is missing ("Add a Firecrawl key, or set up Firecrawl on this
-  Mac.", "Add a Firecrawl key.", "Set up Firecrawl on this Mac.", else "Keys and page reading"). A pick sends
+  Mac.", "Add a Firecrawl key.", "Set up Firecrawl on this Mac.", "Restart Firecrawl on this Mac with FIRECRAWL_CLOUD=off or search."
+  for a server whose Cloud is on, else "Keys and page reading"). A pick sends
   `PUT /api/providers/selection` with `{firecrawl: true, firecrawlLocal: false}`, `{firecrawl: true, firecrawlLocal:
   true}` or `{firecrawl: false}`, never `search`; the row says `Switching…` and the other rows wait until the host
   summary shows the picked place (the HTTP reply may still wait for the Work `PATH`), or until the reply fails. The
   check mark follows the host summary only. The caption says, in this order: why a pick failed (red; "Add a Firecrawl
   key in Web Search settings.", "Set up Firecrawl on this Mac in Web Search settings.", the damaged-skills sentence, or
   "Could not switch the crawler. Try again."), the Keychain, `Reading keys…` / `Could not read the keys.` (before the
-  first body), a change that waits for running answers. Opening the panel, or the `+` while Firecrawl on this Mac is
+  first body), a change that waits for running answers: "Conversations that are open keep the old crawler until every
+  running answer ends." (a loaded conversation keeps the `mlx_web` it was given, and a stale Work host keeps its
+  `FIRECRAWL_API_URL`, until the host restarts). Opening the panel, or the `+` while Firecrawl on this Mac is
   in use, sends `POST /api/providers/local/check`; its `local` is applied to the crawler rows
   and the Crawler row only, and only when it is for the same address and not older than what the rows have. The Web
   search panel never waits for that check. In Work a grey line under the list says what Work gets:
   the Firecrawl skills with the key (the agent's commands, MCP servers and hooks can read it), the skills on this Mac
-  with no key from the app (a key saved with `firecrawl login` is still used for searches, which go to Firecrawl
-  Cloud, and Firecrawl search fails when the server runs with `FIRECRAWL_CLOUD=off`), no skills until the
-  `firecrawl` CLI is installed, skills not installed, or no skills (Off).
+  with a placeholder key (never the key saved with `firecrawl login`; Firecrawl search goes to Firecrawl Cloud with the
+  server's own key; with none the placeholder goes with it and the search likely fails (not tried); it fails with
+  `FIRECRAWL_CLOUD=off`), no skills until the `firecrawl` CLI is installed, skills not installed, or no skills (Off).
 - Files and photos: the row Add files or photos, `⌘U`, paste and drop on the composer all take files the same way
   (`ui/src/lib/chat-attachments.ts`). Small UTF-8 text files work in Chat and Work; PNG, JPEG and WebP pictures work
   in Chat when the model row of `ChatHostState.models` has `images: true`. The page reads the bytes of what was picked,
@@ -1591,10 +1597,14 @@ place at a time.
   each) and takes only the keys the cache never had; a late answer to a timed-out call is taken too. No create or load
   path calls the Keychain. A replaced or removed key stays in memory as a redaction needle until the process exits.
 - **Settings** `<chat root>/providers.json` (0600): `{version: 1, search, firecrawl, firecrawlLocal, localUrl, checks:
-  {id: {status, at}}}`. No key. `firecrawlLocal` is the saved place (it stays while the crawler is Off) and is kept
-  only with a `localUrl`; `localUrl` is kept only in its saved form (below). A file that picks this Mac with an
-  address not in that form reads as Off, never as the cloud. A file without the two fields reads as
-  Firecrawl Cloud with no address. The crawler is on when `firecrawl` is set and its place is ready: a key for the
+  {id: {status, at}}}`. No key. The crawler on disk: Firecrawl Cloud in use is `firecrawl: true`; Firecrawl on this
+  Mac in use is `firecrawl: false` with `firecrawlLocal: true` and a `localUrl`; Off is both false. Why: a build that
+  does not know `firecrawlLocal` reads `firecrawl` alone, so it reads a pick of this Mac as Off and never sends page
+  addresses to Firecrawl Cloud with the key. In memory a pick of this Mac is `firecrawl` and `firecrawlLocal` both
+  true, and while the crawler is Off `firecrawlLocal` keeps the place; that place is not written, so after a restart
+  the crawler is Off with no place. `localUrl` is kept only in its saved form (below). A file with `firecrawlLocal:
+  true` and an address missing or not in that form reads as Off, never as the cloud. A file without the two fields
+  reads as Firecrawl Cloud with no address. The crawler is on when `firecrawl` is set and its place is ready: a key for the
   cloud, a saved address for this Mac. A selection whose key is gone is cleared on start and on a Check; one cleared
   on start is reported once as `vanished` (the first `GET` carries it). A Check that ends after a key PUT or DELETE
   of the same provider is dropped, and a web result's `rejected` / `no-credit` is recorded only while the key that got it is still current.
@@ -1619,8 +1629,12 @@ place at a time.
   otherwise); the app never installs the CLI. An inherited `FIRECRAWL_API_URL` is always removed. With Firecrawl
   Cloud, Work gets `FIRECRAWL_API_URL=https://api.firecrawl.dev` next to the key, so an address the CLI saved itself
   (`firecrawl config --api-url`) does not get the key. With Firecrawl on this Mac, Work gets
-  `FIRECRAWL_API_URL=<saved address>` and no `FIRECRAWL_API_KEY`; a key the CLI saved itself (`firecrawl login`) can
-  still be used by it, and the local server passes it on to Firecrawl Cloud for searches. `~/.zshenv` can still set
+  `FIRECRAWL_API_URL=<saved address>` and `FIRECRAWL_API_KEY=fc-local-no-key` (`FIRECRAWL_LOCAL_PLACEHOLDER_KEY` in
+  `chat/agent/env.ts`): the CLI takes that variable before the key it saved itself (`firecrawl login`), so that key
+  is never sent to the saved address. Firecrawl Local passes a search on to Firecrawl Cloud with its own key first
+  (its `FIRECRAWL_API_KEY`, or the `firecrawl login` key it reads itself under its `HOME`; `cloud.rs` `Cloud::key`,
+  `forward`); only a server with neither passes the caller's Bearer on, so its searches go out with the placeholder
+  and fail. Scrape, crawl and map on the local server are not affected. `~/.zshenv` can still set
   either name again (each command runs with `$SHELL -c`, below). That `PATH` is not the app's own (an app started from Finder has
   `/usr/bin:/bin:/usr/sbin:/sbin`): `mlx-agent` asks the user's login shell (`$SHELL -lc`, with `~/.zshrc` or
   `~/.bashrc` sourced, 5 s limit), puts its own entries after the answer, and runs each command with `$SHELL -c`, which
@@ -1656,47 +1670,73 @@ place at a time.
   - The check, three requests to the saved address: `GET /health` (2 s) must answer 200 JSON with `engine:
     "firecrawl-local"` (else `not-firecrawl`; no answer `not-running`; 401 `token`). Then a scrape of the server's
     own `<address>/health` (5 s), a loopback target it must refuse with 403 `BLOCKED_TARGET`; any other answer is
-    `open` (started with `--allow-private`). A refused target is never handed to Firecrawl Cloud. Then
-    `GET /v2/team/credit-usage` with `Sec-Fetch-Site: cross-site` (2 s), which the server refuses itself, so nothing
-    leaves the Mac: 501 `CLOUD_ONLY` means its Cloud hand-off is off, 403 `CROSS_SITE_REQUEST` means a page it
-    cannot load is sent to Firecrawl Cloud (`cloud: 'fallback'`); anything else is not known. The version is kept
-    only when it is digits and dots.
+    `open` (started with `--allow-private`). A refused target is never handed to Firecrawl Cloud. Then, always and
+    only after both passed, `GET /v2/team/credit-usage` with `Sec-Fetch-Site: cross-site` (2 s), which the server
+    refuses itself, so nothing leaves the Mac: 501 `CLOUD_ONLY` (`FIRECRAWL_CLOUD=off`, or `search`, which passes on
+    only searches) is `ok` with `cloud: 'off'`. Everything else fails closed as `cloud-on`: 403 `CROSS_SITE_REQUEST`
+    means a page it cannot load is sent to Firecrawl Cloud (`cloud: 'fallback'`; `FIRECRAWL_CLOUD` unset, the
+    server's default, or `on`, `auto`, `fallback`, `true`, `1`, `yes`, `enabled`, `enable`); any other answer,
+    timeout or dropped socket is `cloud: null`. The server reads `off`, `false`, `0`, `none`, `no`, `disabled`,
+    `disable` and any value it does not know as Off (`cloud.rs` `CloudMode::parse`, `requested`). The version is
+    kept only when it is digits and dots.
   - When it runs: on Check and save (only `ok` is saved; the earlier address and the selection stay otherwise); on
     `POST /api/providers/local/check` (Check again on the page; the `+` menu, see the Crawler row); in
     the background at providers start and on `GET /api/providers`, at most once in 15 s. `GET /api/providers` never
     waits for it and answers with the last result (`local.check` is null until the first check of the saved address
     ends). A check of the same address that is already running is joined. In the `mlx_web` server before every page
-    read on this Mac (the first two requests, inside the call slot): anything but `ok` returns `WEB_ERROR local-down`
-    and no page address is sent.
+    read on this Mac (all three requests, inside the call slot): `cloud-on` returns `WEB_ERROR local-cloud`, every
+    other outcome but `ok` returns `WEB_ERROR local-down`, and no page address is sent.
   - A saved address turns on Firecrawl on this Mac only when the crawler is Off; while Firecrawl Cloud is in use it
-    stays in use until the user picks this Mac. Removing the address turns the crawler Off when it was in use; it
-    never moves to the cloud.
+    stays in use until the user picks this Mac. A `cloud-on` address, like `open`, is not saved and turns nothing on. A
+    stored check of `cloud-on` (a server restarted with its Cloud on) keeps the pick, as `open` does: the badge says
+    Check failed and every Chat page read is refused until a check passes. Work's `firecrawl` CLI keeps the address (it
+    does not switch on the check). Removing the address turns the crawler Off when it was in use; it never moves to the
+    cloud.
+  - A save never undoes a later change: the providers service counts crawler changes (a pick that sends `firecrawl` or
+    `firecrawlLocal`, a Remove, a saved address) inside its mutation queue. A save reads the count before its check and,
+    when it moved during the check, writes nothing (no address, no stored check, no change event) and answers `saved:
+    false` with `check: 'ok'` (`saved: true` when that address is the saved one already); the page says "Could not
+    finish. Try again." with "The earlier address is still in use." when the reply has an address and This Mac in use,
+    else "The address was not saved.". Background checks and Check again do not count.
   - Chat's page read: `POST <address>/v2/scrape` with the cloud body, no Authorization header. No connection or 401
     gives `local-down`, 403 gives `blocked`, `data.blocked` gives `no-content`. A page the server handed to Firecrawl
     Cloud (`data.source: "firecrawl-cloud"`) gets the result line `note: read by Firecrawl Cloud`, and its tool row
-    says "read by Firecrawl Cloud". A `local-down` row offers the Web Search settings link. The app's own
+    says "read by Firecrawl Cloud". With the Cloud check before each read such an answer should not come; the note
+    stays as a second line of defence. A `local-down` row ("Firecrawl on this Mac is not ready") and a `local-cloud` row ("Firecrawl on this
+    Mac may send pages to Firecrawl Cloud") offer the Web Search settings link. The app's own
     rules run first, as with the cloud: the `web_fetch` address checks and the Chat address ledger (only addresses
     from the user or from search results).
-  - What leaves this Mac: no page address goes to a provider; this Mac fetches the page, so the site sees the user's
-    IP address. Pages open only to the user's network (office, VPN) can be read, and pages that need JavaScript run
-    in a Chrome on this Mac. The server's own rule refuses private addresses (also after DNS and on every redirect)
-    and nothing more; for network-position access the Chat address ledger is the control. Without
-    `FIRECRAWL_CLOUD=off`, a page the server cannot load is sent to Firecrawl Cloud. Another program listening on the
-    saved port and answering like Firecrawl Local would get the page addresses Chat reads: same-machine trust, as for
-    any loopback server.
-  - What does not work on this Mac: search (it always goes to Firecrawl Cloud; with `FIRECRAWL_CLOUD=off` the CLI's
-    search fails), JSON and summary formats, browser actions. Chat only uses page text, so Chat loses nothing.
+  - What leaves this Mac: no page address goes to a provider; this Mac fetches the page, so the site sees the user's IP
+    address. Pages open only to the user's network (office, VPN) can be read, and pages that need JavaScript run in a
+    Chrome on this Mac. The server's own rule refuses private addresses (also after DNS and on every redirect) and
+    nothing more; for network-position access the Chat address ledger is the control. Chat reads a page there only after
+    a check that reads its Cloud as off, so a page Chat reads on this Mac is not sent to Firecrawl Cloud unless the
+    server is restarted between the check and the read (the `read by Firecrawl Cloud` note covers that case). Work's
+    `firecrawl` commands reach the server directly, without this check: a server started without `FIRECRAWL_CLOUD=off`
+    or `=search` sends a page it cannot load for them to Firecrawl Cloud. Another program listening on the saved port
+    and answering like Firecrawl Local would get the page addresses Chat reads: same-machine trust, as for any loopback
+    server.
+  - What does not work on this Mac: search (it always goes to Firecrawl Cloud: with `FIRECRAWL_CLOUD=search` with the
+    server's own key, with `FIRECRAWL_CLOUD=off` the CLI's search fails), JSON and summary formats, browser actions. Chat only uses page text, so Chat loses nothing.
   - The Web Search page: the Use panel's second list, "Crawler · One at a time", shows Firecrawl Cloud only with a
     key, Firecrawl on this Mac only with a saved address, and Off (its note says who reads pages then); with neither
     set up one sentence stands in place of the list. The Firecrawl card's This Mac block, not set up: an address
     field prefilled with `http://127.0.0.1:3002`, Check and save, "Needs Rust and a C compiler (xcode-select
-    --install).", the guide link, and `cargo install firecrawl-local` and `FIRECRAWL_CLOUD=off firecrawl-local serve`
-    with copy buttons. A typed address the rule refuses sends nothing. Saved: the address, a badge (Running, Not
-    running, Check failed, Not checked) and the check's sentence, the Cloud hand-off line with the start command when
-    `cloud` is `fallback`, then Check again, Replace and Remove. The block and the Crawler list work while the
+    --install).", the guide link, `cargo install firecrawl-local`, "Start it with one of these. Started without
+    FIRECRAWL_CLOUD, the server sends a page it cannot load to Firecrawl Cloud, and Chat does not use it.", then
+    `FIRECRAWL_CLOUD=off firecrawl-local serve` ("Everything stays on this Mac. Firecrawl search is off.") and
+    `FIRECRAWL_CLOUD=search firecrawl-local serve` ("Pages stay on this Mac. Firecrawl search goes to Firecrawl
+    Cloud."), each with a copy button. A typed address the rule refuses sends nothing; a refused save says why under
+    the field (for `cloud-on`: "This server may send pages to Firecrawl Cloud, so the app does not use it. Start it
+    with FIRECRAWL_CLOUD=off or FIRECRAWL_CLOUD=search."). Saved: the address, a badge (Running, Not running, Check
+    failed, Not checked) and the check's sentence (for `cloud-on`, by `cloud`: the server sends a page it cannot load
+    to Firecrawl Cloud, or the app could not confirm that it keeps pages on this Mac), then Check again, Replace and
+    Remove, then the same two start commands while the check is `cloud-on`. The commands are laid out in every state
+    (hidden and inert unless `cloud-on`), so the block keeps its height from one check to the next. The block and the Crawler list work while the
     Keychain is down (this Mac needs no key, and Firecrawl Cloud is listed only with its key in the cache); the search
-    list is locked then. While this Mac is in use the card's Work notice says the CLI talks to this address with no key from the
-    app, and "What leaves this Mac" adds the local sentence while an address is saved.
+    list is locked then. While this Mac is in use the card's Work notice says the CLI talks to this address with a
+    placeholder key and how search gets a key, and "What leaves this Mac" adds the local sentence while an address is
+    saved.
   - Not done, each a separate decision:
     - Bundling, installing or starting the server: AGPL-3.0 needs a legal decision, and there is no prebuilt binary.
     - A server on the LAN or the internet, or https: refused by the address rule.
@@ -1732,5 +1772,7 @@ other failure of a local route is "Firecrawl on this Mac could not be checked.".
 `ui/src/lib/providers-types.ts`, a copy of `src/chat/providers/types.ts`. The dev harness keeps keys in memory and
 points every provider at fake servers on 127.0.0.1 (a key starting `bad` is rejected, `nocredit` has no credit,
 `slow` times out the check). It also starts a fake Firecrawl Local on a loopback port and prints its address at start
-(`fake Firecrawl on this Mac: <url>`); typed into the This Mac field it passes the check, and any other loopback port
-reads not running.
+(`fake Firecrawl on this Mac: <url>`); typed into the This Mac field it passes the check (its Cloud step answers
+501 `CLOUD_ONLY`), and any other loopback port reads not running. `MLX_DEV_LOCAL_CLOUD=fallback` makes its Cloud step
+answer 403 `CROSS_SITE_REQUEST` and `MLX_DEV_LOCAL_CLOUD=unreadable` an answer the check does not know; both read as
+`cloud-on`.

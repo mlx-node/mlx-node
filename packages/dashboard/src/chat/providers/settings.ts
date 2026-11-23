@@ -2,6 +2,11 @@
  * `ROOT/providers.json` (0600): which search provider is selected, whether Firecrawl reads pages and where (Firecrawl
  * Cloud, or Firecrawl on this Mac at a saved loopback address), and the last check of each key. Enums, times and that
  * address only: no key and no part of one. A missing or unreadable file reads as the defaults.
+ *
+ * The crawler on disk: Firecrawl Cloud in use is `firecrawl: true`; Firecrawl on this Mac in use is `firecrawl: false`
+ * with `firecrawlLocal: true` and `localUrl`; Off is both false. A build that does not know `firecrawlLocal` reads
+ * `firecrawl` alone, so it reads a pick of this Mac as Off and never sends page addresses to Firecrawl Cloud with the
+ * key. Where the crawler would read while it is Off is not written: after a restart it is Off with no place.
  */
 
 import { chmod, mkdir, readFile } from 'node:fs/promises';
@@ -51,11 +56,14 @@ export function parseSettings(text: string): ProviderSettings {
   if (r.version !== 1) return defaultSettings();
   const settings = defaultSettings();
   if (isSearchProviderId(r.search)) settings.search = r.search;
-  settings.firecrawl = r.firecrawl === true;
   settings.localUrl = typeof r.localUrl === 'string' ? localOrigin(r.localUrl) : null;
-  settings.firecrawlLocal = settings.localUrl !== null && r.firecrawlLocal === true;
-  // A pick of this Mac whose address is dropped turns the crawler off; it never becomes a pick of the cloud.
-  if (r.firecrawlLocal === true && settings.localUrl === null) settings.firecrawl = false;
+  if (r.firecrawlLocal === true) {
+    // A pick of this Mac whose address is dropped reads as Off; it never becomes a pick of the cloud.
+    settings.firecrawl = settings.localUrl !== null;
+    settings.firecrawlLocal = settings.localUrl !== null;
+  } else {
+    settings.firecrawl = r.firecrawl === true;
+  }
   const checks = r.checks;
   if (typeof checks === 'object' && checks !== null && !Array.isArray(checks)) {
     for (const id of PROVIDER_IDS) {
@@ -89,8 +97,8 @@ export async function writeSettings(path: string, settings: ProviderSettings): P
   const clean: ProviderSettings = {
     version: 1,
     search: settings.search,
-    firecrawl: settings.firecrawl,
-    firecrawlLocal: settings.firecrawlLocal,
+    firecrawl: settings.firecrawl && !settings.firecrawlLocal,
+    firecrawlLocal: settings.firecrawl && settings.firecrawlLocal,
     localUrl: settings.localUrl,
     checks,
   };

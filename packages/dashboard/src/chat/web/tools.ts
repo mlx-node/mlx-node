@@ -10,9 +10,9 @@ import { deepseekFetch, deepseekSearch } from './adapters/deepseek.js';
 import { exaFetch, exaSearch } from './adapters/exa.js';
 import { firecrawlFetch, firecrawlLocalFetch } from './adapters/firecrawl.js';
 import { type AdapterContext, PROVIDER_ORIGINS, type SearchArgs } from './http.js';
-import { checkLocal, localOrigin } from './local.js';
+import { checkLocal, type LocalCheck, localOrigin } from './local.js';
 import { redactKeys } from './normalize.js';
-import { formatErrorText, type WebFetchProvider, type WebSearchProvider } from './result-text.js';
+import { formatErrorText, type WebErrorCode, type WebFetchProvider, type WebSearchProvider } from './result-text.js';
 import { fetchAllowed, forwardedAddress } from './url-policy.js';
 
 export type { Recency, SearchArgs } from './http.js';
@@ -217,9 +217,10 @@ export class WebTools {
     if (local !== null) {
       const ctx: AdapterContext = { ...this.context(provider, ''), baseUrl: local };
       return this.run(provider, async () => {
-        // Before every read: the server could have been restarted with --allow-private since the last one.
-        const { check } = await checkLocal(local, { fetch: this.deps.fetch, readCloud: false });
-        if (check !== 'ok') return formatErrorText('local-down', 'firecrawl');
+        // Before every read: the server could have been restarted with --allow-private or its Cloud on since the last.
+        const { check } = await checkLocal(local, { fetch: this.deps.fetch });
+        const refused = localRefusal(check);
+        if (refused !== null) return formatErrorText(refused, 'firecrawl');
         return firecrawlLocalFetch(parsed.url, ctx);
       });
     }
@@ -248,6 +249,21 @@ export class WebTools {
     } finally {
       this.inFlight -= 1;
     }
+  }
+}
+
+/** The error a page read on this Mac answers after the check, or null when the page address may be sent. */
+function localRefusal(check: LocalCheck): WebErrorCode | null {
+  switch (check) {
+    case 'ok':
+      return null;
+    case 'cloud-on':
+      return 'local-cloud';
+    case 'not-running':
+    case 'not-firecrawl':
+    case 'open':
+    case 'token':
+      return 'local-down';
   }
 }
 

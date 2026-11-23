@@ -14,6 +14,7 @@ import { PROVIDERS } from '../ui/src/lib/providers-strings.js';
 import type {
   KeyCheck,
   LocalCheck,
+  LocalCloud,
   ProviderId,
   ProvidersResponse,
   SearchProviderId,
@@ -2045,6 +2046,8 @@ describe('Chat page: the crawler', () => {
     key?: KeyCheck;
     /** The saved address's last check; absent: no address; null: not checked yet. */
     local?: LocalCheck | null;
+    /** The saved address's Cloud setting, as its last check read it. */
+    cloud?: LocalCloud;
     search?: SearchProviderId | null;
   }
 
@@ -2071,7 +2074,7 @@ describe('Chat page: the crawler', () => {
               check: local,
               checkedAt: local === null ? null : 1_000,
               version: local === 'ok' ? '0.1.1' : null,
-              cloud: null,
+              cloud: setup.cloud ?? null,
             },
       providers: base.providers.map((p) =>
         p.id !== 'firecrawl'
@@ -2148,6 +2151,19 @@ describe('Chat page: the crawler', () => {
         problem: null,
       });
     }
+    // A server whose Cloud takes pages it cannot load, and one whose Cloud setting could not be read.
+    expect(crawlerRow(local, crawlerBody('local', { local: 'cloud-on', cloud: 'fallback' }))).toEqual({
+      end: CHAT.crawlerCloudOn,
+      dot: 'danger',
+      name: CHAT.crawlerNameCloudOn,
+      problem: null,
+    });
+    expect(crawlerRow(local, crawlerBody('local', { local: 'cloud-on' }))).toEqual({
+      end: CHAT.crawlerCheckFailed,
+      dot: 'danger',
+      name: CHAT.crawlerNameCloudUnread,
+      problem: null,
+    });
     const atMac = { end: CHAT.crawlerEndLocal, name: CHAT.crawlerNameLocal, problem: null };
     expect(crawlerRow(local, crawlerBody('local', { local: 'ok' }))).toEqual(atMac);
     expect(crawlerRow(local, crawlerBody('local', { local: null }))).toEqual(atMac);
@@ -2242,6 +2258,30 @@ describe('Chat page: the crawler', () => {
       CHAT.crawlerRowCheckFailed,
       CHAT.webEndOff,
     ]);
+    const cloudOn = crawlerChoices(crawlSummary('local'), {
+      ...idle,
+      body: crawlerBody('local', { key: 'ok', local: 'cloud-on', cloud: 'fallback' }),
+    });
+    expect(cloudOn.rows.map(view)).toEqual([
+      ['cloud', false, false, '', ''],
+      ['local', true, false, CHAT.crawlerCloudOn, 'danger'],
+      ['off', false, false, '', ''],
+    ]);
+    expect(cloudOn.rows[1]!.name).toBe(CHAT.crawlerRowCloudOn);
+    expect(cloudOn.note).toBe(CHAT.crawlerRestartLocal);
+    const cloudUnread = crawlerChoices(crawlSummary('local'), {
+      ...idle,
+      body: crawlerBody('local', { key: 'ok', local: 'cloud-on' }),
+    });
+    expect(cloudUnread.rows[1]).toMatchObject({
+      checked: true,
+      disabled: false,
+      end: CHAT.crawlerCheckFailed,
+      endTone: 'danger',
+      name: CHAT.crawlerRowCloudUnread,
+    });
+    expect(cloudUnread.note).toBe(CHAT.crawlerRestartLocal);
+    expect(failed.note).toBe(CHAT.webSettingsNote);
     const unchecked = crawlerChoices(crawlSummary('local'), { ...idle, body: crawlerBody('local', { local: null }) });
     expect(unchecked.rows[1]).toMatchObject({ checked: true, disabled: false, name: CHAT.crawlerLocal });
     expect(unchecked.rows[1]!.end).toBeUndefined();
@@ -2292,10 +2332,14 @@ describe('Chat page: the crawler', () => {
       checked: false,
     });
 
-    // Captions: the write error, then the Keychain, then the read, then a change that waits.
+    // Captions: the write error, then the Keychain, then the read, then a change that waits, in the crawler's words.
     const pending = { ...crawlSummary('cloud'), applyPending: true };
     const downBody = crawlerBody('cloud', { key: 'ok' }, down);
-    expect(crawlerChoices(pending, { ...idle, body }).caption).toEqual({ text: CHAT.webPending, tone: 'secondary' });
+    expect(crawlerChoices(pending, { ...idle, body }).caption).toEqual({
+      text: CHAT.crawlerPending,
+      tone: 'secondary',
+    });
+    expect(CHAT.crawlerPending).not.toBe(CHAT.webPending);
     expect(crawlerChoices(pending, { ...idle, read: 'reading' }).caption?.text).toBe(CHAT.webReading);
     expect(crawlerChoices(pending, { ...idle, body: downBody }).caption?.text).toBe(CHAT.webKeychain);
     expect(crawlerChoices(pending, { ...idle, body: downBody, error: 'Nope.' }).caption).toEqual({
@@ -2347,6 +2391,30 @@ describe('Chat page: the crawler', () => {
     expect(crawlerMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
     expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameRejected);
     expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+    const dialog = await openCrawler('local', {
+      '/providers': crawlerBody('local', { key: 'ok', local: 'cloud-on', cloud: 'fallback' }),
+    });
+    await waitFor(() => crawlerMenuRow().textContent === `${CHAT.crawler}${CHAT.crawlerCloudOn}`);
+    expect(crawlerMenuRow().querySelector('[data-tone="danger"]')).not.toBeNull();
+    expect(accessibleName(crawlerMenuRow())).toBe(CHAT.crawlerNameCloudOn);
+    expect(choice(CHAT.crawlerLocal).getAttribute('aria-checked')).toBe('true');
+    expect(accessibleName(choice(CHAT.crawlerLocal))).toBe(CHAT.crawlerRowCloudOn);
+    const settings = byRole(byRole(dialog, 'menu', CHAT.crawler)!, 'menuitem', CHAT.webSettings)!;
+    expect(document.getElementById(settings.getAttribute('aria-describedby')!)?.textContent).toBe(
+      CHAT.crawlerRestartLocal,
+    );
+    expect(button(CHAT.tools).querySelector('[data-tone]')).toBeNull();
+  });
+
+  it('a change that waits: the Crawler panel says open conversations keep the old crawler', async () => {
+    const dialog = await openCrawler(
+      'cloud',
+      { '/providers': crawlerBody('cloud', { key: 'ok', local: 'ok' }) },
+      { applyPending: true },
+    );
+    await waitFor(() => byRole(dialog, 'status')!.textContent === CHAT.crawlerPending);
+    expect(shown(dialog)).not.toContain(CHAT.webPending);
+    expect(checkedRow()).toBe('firecrawl cloud');
   });
 
   it('each pick sends its own body and never `search`; the check mark follows the host summary', async () => {

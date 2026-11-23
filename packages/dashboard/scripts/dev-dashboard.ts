@@ -16,7 +16,8 @@
  * `MLX_DEV_LOAD_KERNELS=<done>/<steps>`: the heartbeat reports a load as "Preparing GPU kernels", done of steps.
  * `MLX_DEV_DISK_CACHE=native|off|older`: the disk cache the heartbeat reports (default: on, whole prompt).
  * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
- * The start line names a fake Firecrawl on this Mac for the This Mac field of the Web Search page.
+ * The start line names a fake Firecrawl on this Mac for the This Mac field of the Web Search page; its Cloud setting
+ * reads as off. `MLX_DEV_LOCAL_CLOUD=fallback|unreadable`: it reads as sending pages to Firecrawl Cloud, or cannot be read.
  */
 
 import { closeSync, mkdirSync, rmSync } from 'node:fs';
@@ -25,7 +26,7 @@ import { join } from 'node:path';
 import { createServer } from 'vite-plus';
 
 import { HARNESS_LOAD_MS, startHarnessEngine } from '../__test__/helpers/fake-engine.js';
-import { startHarnessProviders } from '../__test__/helpers/fake-providers.js';
+import { type FakeLocalCloud, startHarnessProviders } from '../__test__/helpers/fake-providers.js';
 import { takeNamespaceLock } from '../src/prefix-cache.js';
 import { createDashboardRuntime } from '../src/runtime.js';
 import {
@@ -81,6 +82,10 @@ function diskCacheValue(value: string | undefined): LiveProcess['diskCache'] {
   return value === 'native' || value === 'off' || value === 'older' ? value : 'whole-prompt';
 }
 
+function localCloudValue(value: string | undefined): FakeLocalCloud {
+  return value === 'fallback' || value === 'unreadable' ? value : 'off';
+}
+
 async function main(): Promise<void> {
   const { home, fresh, port } = fixtureArgs(process.argv.slice(2), DEFAULT_HOME);
   if (fresh) resetHome(home);
@@ -111,7 +116,7 @@ async function main(): Promise<void> {
     prefixLock = null;
   }
 
-  const providers = await startHarnessProviders();
+  const providers = await startHarnessProviders(localCloudValue(process.env.MLX_DEV_LOCAL_CLOUD));
   const loadMs = Number.parseInt(process.env.MLX_DEV_LOAD_MS ?? '', 10);
   const hidden = process.env.MLX_DEV_LOAD_HIDDEN === '1';
   const kernels = kernelSteps(process.env.MLX_DEV_LOAD_KERNELS);

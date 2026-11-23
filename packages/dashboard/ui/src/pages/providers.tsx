@@ -238,8 +238,12 @@ export default function Providers(): ReactElement {
         if (!active.current) return null;
         apply(reply.providers);
         if (reply.saved) return null;
-        const problem = reply.check === 'ok' ? PROVIDERS.failed : localProblem(reply.check);
-        return `${problem} ${hadAddress ? PROVIDERS.localEarlierKept : PROVIDERS.localNotSaved}`;
+        if (reply.check !== 'ok') {
+          return `${localProblem(reply.check)} ${hadAddress ? PROVIDERS.localEarlierKept : PROVIDERS.localNotSaved}`;
+        }
+        // A save refused by a change that landed during its check: the reply says what is in use now.
+        const kept = reply.providers.local.url !== null && reply.providers.firecrawlLocal;
+        return `${PROVIDERS.failed} ${kept ? PROVIDERS.localEarlierKept : PROVIDERS.localNotSaved}`;
       } catch (error) {
         if (active.current) reload();
         return codeOf(error) === 'E_BAD_REQUEST' ? PROVIDERS.localBadAddress : PROVIDERS.failed;

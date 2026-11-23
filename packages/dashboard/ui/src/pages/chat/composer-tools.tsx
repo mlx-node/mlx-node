@@ -172,6 +172,48 @@ function firecrawlState(body: ProvidersResponse | null): ProviderState | undefin
   return body?.providers.find((p) => p.id === 'firecrawl');
 }
 
+/** What the last check of this Mac's address found, for the Crawler row (`main`) and the This Mac row (`row`). */
+interface MacProblem {
+  end: string;
+  tone: 'warning' | 'danger';
+  main: string;
+  row: string;
+}
+
+function macProblem(local: LocalFirecrawl | null): MacProblem | null {
+  if (local === null) return null;
+  switch (local.check) {
+    case null:
+    case 'ok':
+      return null;
+    case 'not-running':
+      return {
+        end: CHAT.crawlerNotRunning,
+        tone: 'warning',
+        main: CHAT.crawlerNameNotRunning,
+        row: CHAT.crawlerRowNotRunning,
+      };
+    case 'cloud-on':
+      return local.cloud === 'fallback'
+        ? { end: CHAT.crawlerCloudOn, tone: 'danger', main: CHAT.crawlerNameCloudOn, row: CHAT.crawlerRowCloudOn }
+        : {
+            end: CHAT.crawlerCheckFailed,
+            tone: 'danger',
+            main: CHAT.crawlerNameCloudUnread,
+            row: CHAT.crawlerRowCloudUnread,
+          };
+    case 'not-firecrawl':
+    case 'open':
+    case 'token':
+      return {
+        end: CHAT.crawlerCheckFailed,
+        tone: 'danger',
+        main: CHAT.crawlerNameCheckFailed,
+        row: CHAT.crawlerRowCheckFailed,
+      };
+  }
+}
+
 /**
  * The crawler row of the `+` menu. On or off and the place come from the host summary; what is wrong needs the
  * `/providers` body, so those words show from the menu's first read on. The dot on the `+` stays search only.
@@ -180,13 +222,8 @@ export function crawlerRow(providers: ChatHostState['providers'], body: Provider
   const place = crawlerValue(providers);
   if (place === 'off') return { end: CHAT.webEndOff, name: CHAT.crawlerNameOff, problem: null };
   if (place === 'local') {
-    const check = body?.local.check ?? null;
-    if (check === 'not-running') {
-      return { end: CHAT.crawlerNotRunning, dot: 'warning', name: CHAT.crawlerNameNotRunning, problem: null };
-    }
-    if (check !== null && check !== 'ok') {
-      return { end: CHAT.crawlerCheckFailed, dot: 'danger', name: CHAT.crawlerNameCheckFailed, problem: null };
-    }
+    const found = macProblem(body?.local ?? null);
+    if (found !== null) return { end: found.end, dot: found.tone, name: found.main, problem: null };
     return { end: CHAT.crawlerEndLocal, name: CHAT.crawlerNameLocal, problem: null };
   }
   const check = firecrawlState(body)?.check ?? null;
@@ -235,12 +272,17 @@ export interface WebChoices {
   caption: Caption;
 }
 
-/** The captions both panels share, after their own: Keychain down, the read, a change that waits. */
-function readCaption(providers: ChatHostState['providers'], body: ProvidersResponse | null, read: Read): Caption {
+/** The captions both panels share, after their own: Keychain down, the read, a change that waits (`pending`). */
+function readCaption(
+  providers: ChatHostState['providers'],
+  body: ProvidersResponse | null,
+  read: Read,
+  pending: string,
+): Caption {
   if (body?.keychain === 'unavailable') return { text: CHAT.webKeychain, tone: 'warning' };
   if (body === null && read === 'reading') return { text: CHAT.webReading, tone: 'secondary' };
   if (body === null && read === 'failed') return { text: CHAT.webReadFailed, tone: 'secondary' };
-  if (providers.applyPending) return { text: CHAT.webPending, tone: 'secondary' };
+  if (providers.applyPending) return { text: pending, tone: 'secondary' };
   return null;
 }
 
@@ -304,7 +346,7 @@ export function webChoices(providers: ChatHostState['providers'], panel: WebPane
   if (panel.error !== null) caption = { text: panel.error, tone: 'danger' };
   else if (panel.vanished !== null) {
     caption = { text: fill(CHAT.webVanished, { provider: providerName(panel.vanished) }), tone: 'warning' };
-  } else caption = readCaption(providers, body, panel.read);
+  } else caption = readCaption(providers, body, panel.read, CHAT.webPending);
   return { rows: [...rows, off], note, caption };
 }
 
@@ -385,8 +427,7 @@ export function crawlerChoices(providers: ChatHostState['providers'], panel: Cra
   const local = body?.local ?? null;
   const notSetUp = local !== null && local.url === null;
   const localUnknown = local === null && current !== 'local';
-  const localCheck = local?.check ?? null;
-  const failed = localCheck !== null && localCheck !== 'ok' && localCheck !== 'not-running';
+  const found = macProblem(local);
   const mac: CrawlerChoiceRow = {
     value: 'local',
     label: CHAT.crawlerLocal,
@@ -396,17 +437,13 @@ export function crawlerChoices(providers: ChatHostState['providers'], panel: Cra
   };
   if (busy === 'local') mac.end = CHAT.webSwitching;
   else if (notSetUp) mac.end = CHAT.crawlerNotSetUp;
-  else if (localCheck === 'not-running') {
-    mac.end = CHAT.crawlerNotRunning;
-    mac.endTone = 'warning';
-  } else if (failed) {
-    mac.end = CHAT.crawlerCheckFailed;
-    mac.endTone = 'danger';
+  else if (found !== null) {
+    mac.end = found.end;
+    mac.endTone = found.tone;
   }
   if (notSetUp) mac.name = CHAT.crawlerRowNotSetUp;
   else if (localUnknown) mac.name = CHAT.crawlerRowLocalUnread;
-  else if (localCheck === 'not-running') mac.name = CHAT.crawlerRowNotRunning;
-  else if (failed) mac.name = CHAT.crawlerRowCheckFailed;
+  else if (found !== null) mac.name = found.row;
 
   const off: CrawlerChoiceRow = {
     value: 'off',
@@ -425,9 +462,13 @@ export function crawlerChoices(providers: ChatHostState['providers'], panel: Cra
         ? CHAT.crawlerAddLocal
         : noKey
           ? CHAT.crawlerAddKey
-          : CHAT.webSettingsNote;
+          : local?.check === 'cloud-on'
+            ? CHAT.crawlerRestartLocal
+            : CHAT.webSettingsNote;
   const caption: Caption =
-    panel.error !== null ? { text: panel.error, tone: 'danger' } : readCaption(providers, body, panel.read);
+    panel.error !== null
+      ? { text: panel.error, tone: 'danger' }
+      : readCaption(providers, body, panel.read, CHAT.crawlerPending);
   return { rows: [cloud, mac, off], note, caption };
 }
 

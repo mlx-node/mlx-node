@@ -263,12 +263,23 @@ export function crawlerOffNote(search: SearchProviderId | null): string {
   return fill(PROVIDERS.crawlerOffReads, { provider: providerName(search) });
 }
 
-/** What a failed check of Firecrawl on this Mac found, in one sentence. */
+/**
+ * What a failed check of Firecrawl on this Mac found, in one sentence. A save's reply carries no Cloud setting, so
+ * `cloud-on` has one sentence for both.
+ */
 export function localProblem(check: Exclude<LocalCheck, 'ok'>): string {
-  if (check === 'not-running') return PROVIDERS.localNotRunning;
-  if (check === 'not-firecrawl') return PROVIDERS.localNotFirecrawl;
-  if (check === 'open') return PROVIDERS.localOpen;
-  return PROVIDERS.localToken;
+  switch (check) {
+    case 'not-running':
+      return PROVIDERS.localNotRunning;
+    case 'not-firecrawl':
+      return PROVIDERS.localNotFirecrawl;
+    case 'open':
+      return PROVIDERS.localOpen;
+    case 'token':
+      return PROVIDERS.localToken;
+    case 'cloud-on':
+      return PROVIDERS.localCloudOn;
+  }
 }
 
 export type LocalBadge = 'running' | 'not-running' | 'check-failed' | 'unchecked';
@@ -280,13 +291,22 @@ export function localBadge(local: LocalFirecrawl): LocalBadge {
   return local.check === 'not-running' ? 'not-running' : 'check-failed';
 }
 
-/** The line under a saved address: the version when it runs, or what the last check found. */
+/**
+ * The line under a saved address: the version when it runs, or what the last check found. A Cloud that is on says
+ * whether the server sends pages to Firecrawl Cloud or its setting could not be read.
+ */
 export function localLine(local: LocalFirecrawl): Line | null {
   if (local.check === null) return null;
   if (local.check === 'ok') {
     return {
       text:
         local.version === null ? PROVIDERS.localRunningPlain : fill(PROVIDERS.localRunning, { version: local.version }),
+    };
+  }
+  if (local.check === 'cloud-on') {
+    return {
+      text: local.cloud === 'fallback' ? PROVIDERS.localCloudFallback : PROVIDERS.localCloudUnread,
+      tone: 'danger',
     };
   }
   return { text: localProblem(local.check), tone: local.check === 'not-running' ? 'warning' : 'danger' };

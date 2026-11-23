@@ -136,6 +136,11 @@ export class ProvidersService implements ProviderSource {
   private localRunning: { url: string; done: Promise<LocalChecked> } | null = null;
   private localSeq = 0;
   private localStartedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Bumped in the queue by a crawler pick, a Remove of the address and a saved address: an address save whose check
+   * began before one of them saves nothing, so it never undoes a later Off or Remove.
+   */
+  private crawlerRev = 0;
   private chain: Promise<void> = Promise.resolve();
   private started: Promise<void> | null = null;
   private hooks: ProviderHooks = { changed: () => {}, keysChanged: () => {}, applyPending: () => false };
@@ -374,7 +379,9 @@ export class ProvidersService implements ProviderSource {
   /** `PUT /api/providers/selection`: nothing changes unless every wanted skill folder installs. */
   async select(input: ProviderSelectionInput): Promise<ProvidersResponse> {
     await this.start();
+    const crawlerPicked = input.firecrawl !== undefined || input.firecrawlLocal !== undefined;
     const reply = await this.exclusive(async () => {
+      if (crawlerPicked) this.crawlerRev += 1;
       const previous = { ...this.settings, checks: { ...this.settings.checks } };
       const next = { ...previous, checks: { ...previous.checks } };
       if (input.search !== undefined) {
@@ -386,7 +393,6 @@ export class ProvidersService implements ProviderSource {
         if (input.firecrawlLocal && next.localUrl === null) throw localNotSetUp();
         next.firecrawlLocal = input.firecrawlLocal;
       }
-      const crawlerPicked = input.firecrawl !== undefined || input.firecrawlLocal !== undefined;
       if (crawlerPicked && next.firecrawl && !next.firecrawlLocal && !this.configured('firecrawl')) {
         throw this.needsKey('firecrawl');
       }
@@ -435,18 +441,24 @@ export class ProvidersService implements ProviderSource {
   /**
    * `PUT /api/providers/local`: the address is checked first (see `checkLocal`); one whose check is not `ok` is not
    * saved, and the earlier address and the selection stay. A saved address turns on Firecrawl on this Mac only from
-   * Off: while Firecrawl Cloud is in use, it stays in use until the user picks this Mac.
+   * Off: while Firecrawl Cloud is in use, it stays in use until the user picks this Mac. A crawler pick, a Remove or
+   * another saved address that lands during the check wins: this one saves nothing and answers `saved: false`, or
+   * `saved: true` when that address is the saved one already.
    */
   async putLocal(raw: string): Promise<ProviderLocalReply> {
     const url = parseLocalAddress(raw);
     if (url === null) throw ApiError.badRequest('Use an address on this Mac.');
     await this.start();
+    // Read in the queue, so a change asked for before this save does not count as a later one.
+    const rev = await this.exclusive(async () => this.crawlerRev);
     const checked = await this.runLocalCheck(url);
     const { check } = checked.result;
     if (check !== 'ok') {
       return { saved: false, check, providers: await this.exclusive(async () => this.snapshot()) };
     }
     const reply = await this.exclusive(async (): Promise<ProviderLocalReply> => {
+      if (this.crawlerRev !== rev) return { saved: this.settings.localUrl === url, check, providers: this.snapshot() };
+      this.crawlerRev += 1;
       const previous = { ...this.settings, checks: { ...this.settings.checks } };
       this.settings.localUrl = url;
       this.keepLocalCheck(url, checked);
@@ -469,6 +481,7 @@ export class ProvidersService implements ProviderSource {
       }
       return { saved: true, check, providers: this.snapshot() };
     });
+    if (!reply.saved) return reply;
     return { ...reply, providers: await this.withWorkPath(reply.providers) };
   }
 
@@ -487,6 +500,7 @@ export class ProvidersService implements ProviderSource {
   async deleteLocal(): Promise<ProvidersResponse> {
     await this.start();
     return this.exclusive(async () => {
+      this.crawlerRev += 1;
       const previous = { ...this.settings, checks: { ...this.settings.checks } };
       const inUse = this.settings.firecrawl && this.settings.firecrawlLocal;
       this.settings.localUrl = null;
@@ -535,7 +549,7 @@ export class ProvidersService implements ProviderSource {
     if (this.localRunning?.url === url) return this.localRunning.done;
     this.localStartedAt = this.now();
     const seq = ++this.localSeq;
-    const done = checkLocal(url, { fetch: this.fetcher(), readCloud: true }).then((result) => {
+    const done = checkLocal(url, { fetch: this.fetcher() }).then((result) => {
       const checked = { result, seq };
       if (this.settings.localUrl === url) this.keepLocalCheck(url, checked);
       return checked;

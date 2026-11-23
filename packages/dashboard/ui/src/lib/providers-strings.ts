@@ -67,7 +67,7 @@ export const PROVIDERS = {
   crawlerNone: 'Add a Firecrawl key or set up Firecrawl on this Mac below to turn on the crawler.',
   firecrawlOn: 'Chat reads pages through Firecrawl. Work gets {n} Firecrawl skills.',
   localOn:
-    'Chat reads pages through Firecrawl on this Mac. Work gets {n} Firecrawl skills. Firecrawl search sends the search words to Firecrawl Cloud, and fails when the server runs with FIRECRAWL_CLOUD=off.',
+    "Chat reads pages through Firecrawl on this Mac. Work gets {n} Firecrawl skills. Firecrawl search sends the search words to Firecrawl Cloud with the server's own key. It likely fails without one, and fails with FIRECRAWL_CLOUD=off.",
   localOnNoCli:
     'Chat reads pages through Firecrawl on this Mac. Work has no Firecrawl skills until the firecrawl CLI is installed.',
 
@@ -75,7 +75,7 @@ export const PROVIDERS = {
   leavesText:
     'Each search sends the search words to the provider. Each page read sends the address. The answer is written by the local model.',
   leavesLocal:
-    'With Firecrawl on this Mac, no page address goes to a provider: this Mac fetches the page, so the site sees your IP address. Pages open only to your network (office, VPN) can be read, and pages that need JavaScript run in a Chrome on this Mac. If the server runs without FIRECRAWL_CLOUD=off, a page it cannot load is sent to Firecrawl Cloud.',
+    "With Firecrawl on this Mac, no page address goes to a provider: this Mac fetches the page, so the site sees your IP address. Pages open only to your network (office, VPN) can be read, and pages that need JavaScript run in a Chrome on this Mac. Before each page read, Chat checks that the server keeps pages on this Mac, and it does not use a server that would send a page to Firecrawl Cloud. Work's firecrawl commands reach the server without this check.",
   historyTitle: 'Search results in your history',
   historyBrave:
     "Brave's terms limit how long search results may be kept. Results stay in a conversation on this Mac until you delete it. If the engine's disk cache is on, clear it on the Cache page too. Results are never used for training.",
@@ -84,7 +84,7 @@ export const PROVIDERS = {
   workKeyNotice:
     "In Work, the agent's shell commands, MCP servers and hooks can read this key. In Chat, the key never reaches a shell.",
   localWorkNotice:
-    'In Work, the firecrawl CLI talks to this address. The app passes no key. A key saved with firecrawl login is still used for searches, which go to Firecrawl Cloud.',
+    "In Work, the firecrawl CLI talks to this address with a placeholder key, never the key saved with firecrawl login. A Firecrawl search goes to Firecrawl Cloud with the server's own key (its FIRECRAWL_API_KEY or firecrawl login). With neither, search likely fails.",
 
   keys: 'Keys',
   keyLabel: 'API key',
@@ -143,9 +143,12 @@ export const PROVIDERS = {
   localText: 'Firecrawl Local reads pages from this Mac with no key. You install and start it yourself.',
   localNeeds: 'Needs Rust and a C compiler (xcode-select --install).',
   localInstall: 'cargo install firecrawl-local',
-  localStart: 'FIRECRAWL_CLOUD=off firecrawl-local serve',
   localStartNote:
-    'FIRECRAWL_CLOUD=off keeps every page on this Mac. Without it, a page the server cannot load is sent to Firecrawl Cloud.',
+    'Start it with one of these. Started without FIRECRAWL_CLOUD, the server sends a page it cannot load to Firecrawl Cloud, and Chat does not use it.',
+  localStart: 'FIRECRAWL_CLOUD=off firecrawl-local serve',
+  localStartOffNote: 'Everything stays on this Mac. Firecrawl search is off.',
+  localStartSearch: 'FIRECRAWL_CLOUD=search firecrawl-local serve',
+  localStartSearchNote: 'Pages stay on this Mac. Firecrawl search goes to Firecrawl Cloud.',
   localGuide: 'Firecrawl Local guide',
   localAddress: 'Address',
   localAddressHelp: 'Saving checks the server at this address.',
@@ -155,11 +158,16 @@ export const PROVIDERS = {
   localNotFirecrawl: 'Something else answers at this address. It is not Firecrawl Local.',
   localOpen: 'This server reads private addresses. Start it without --allow-private.',
   localToken: 'This server asks for a token. Start it without --token.',
+  localCloudOn:
+    'This server may send pages to Firecrawl Cloud, so the app does not use it. Start it with FIRECRAWL_CLOUD=off or FIRECRAWL_CLOUD=search.',
+  localCloudFallback:
+    'This server sends a page it cannot load to Firecrawl Cloud, so Chat does not use it. Restart it with one of the commands below.',
+  localCloudUnread:
+    'The app could not confirm that this server keeps pages on this Mac, so Chat does not use it. Restart it with one of the commands below.',
   localNotSaved: 'The address was not saved.',
   localEarlierKept: 'The earlier address is still in use.',
   localRunning: 'Running · Firecrawl Local {version}',
   localRunningPlain: 'Running',
-  localCloudFallback: 'Pages this server cannot load are sent to Firecrawl Cloud.',
   localLimits:
     'Pages, crawl and map run on this Mac. Pages that need JavaScript use the Chrome on this Mac. Search still needs Firecrawl Cloud.',
   badgeRunning: 'Running',

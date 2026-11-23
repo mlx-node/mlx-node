@@ -1661,7 +1661,7 @@ describe('Chat service — Work', () => {
     }, 20_000);
   });
 
-  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH; on this Mac, the address and no key', async () => {
+  it('gives Work the Firecrawl folder and key only once the firecrawl CLI is on its PATH; on this Mac, the address and the placeholder key', async () => {
     const local = await startFakeProvider(fakeLocalScript(fakeLocalAnswers()));
     const secrets = new MemorySecretStore();
     await secrets.set('deepseek', 'ds-key-00001');
@@ -1675,7 +1675,7 @@ describe('Chat service — Work', () => {
         await providers!.select({ search: 'deepseek', firecrawl: true });
         const svc = fake.service;
         const hostOff = svc.watchHost(() => {});
-        const run = async (): Promise<{ dirs: unknown; env: unknown; url: unknown }> => {
+        const run = async (): Promise<{ dirs: unknown; env: unknown; url: unknown; placeholder: unknown }> => {
           const before = fake.sent().filter((m) => m.method === 'session/new').length;
           const { conversation } = await svc.create({ mode: 'work', text: 'ls', cwd: project });
           const page = new Page(svc, conversation.id);
@@ -1692,6 +1692,7 @@ describe('Chat service — Work', () => {
             dirs: ((created.params as Json)._meta as Json).pluginDirs,
             env: start.envNames,
             url: start.firecrawlApiUrl,
+            placeholder: start.firecrawlPlaceholderKey,
           };
         };
         const first = await run();
@@ -1715,13 +1716,14 @@ describe('Chat service — Work', () => {
         ]);
         expect(second.env).toEqual(expect.arrayContaining(['DEEPSEEK_API_KEY', 'FIRECRAWL_API_KEY']));
         expect(second.url).toBe('https://api.firecrawl.dev');
+        expect(second.placeholder).toBe(false);
 
         await providers!.putLocal(local.baseUrl);
         await providers!.select({ firecrawl: true, firecrawlLocal: true });
         const third = await run();
         expect(third.dirs).toEqual(second.dirs);
         expect(third.env).toContain('DEEPSEEK_API_KEY');
-        expect(third.env).not.toContain('FIRECRAWL_API_KEY');
+        expect(third.placeholder).toBe(true);
         expect(third.url).toBe(local.baseUrl);
         expect(JSON.stringify(fake.records())).not.toContain('fc-key-000001');
         hostOff();

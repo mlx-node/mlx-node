@@ -26,6 +26,14 @@ export const PROVIDER_KEY_ENV = {
 
 export const ALL_PROVIDER_KEY_ENV: readonly string[] = Object.values(PROVIDER_KEY_ENV).flat();
 
+/**
+ * `FIRECRAWL_API_KEY` of Work while the `firecrawl` CLI uses Firecrawl on this Mac. The CLI takes this variable before
+ * the key saved by `firecrawl login`, so that key is never sent to the saved address. Firecrawl Local passes a search
+ * on to Firecrawl Cloud with its own key (its `FIRECRAWL_API_KEY`, or the `firecrawl login` key it reads itself)
+ * before a caller's, so only a server with no key of its own passes this one on, and it is no account's key.
+ */
+export const FIRECRAWL_LOCAL_PLACEHOLDER_KEY = 'fc-local-no-key';
+
 /** Removed from the Work environment: the app's own internals. */
 export const WORK_ENV_REMOVED = [
   'ELECTRON_RUN_AS_NODE',
@@ -110,7 +118,10 @@ export interface WorkEnvInput {
   agentHome: string | null;
   /** The selected providers' key variables (name → key). Every other provider key variable is removed. */
   providerKeys: Readonly<Record<string, string>>;
-  /** Firecrawl on this Mac, when the Work `firecrawl` CLI uses it: its address, and no Firecrawl key goes with it. */
+  /**
+   * Firecrawl on this Mac, when the Work `firecrawl` CLI uses it: its address, with {@link FIRECRAWL_LOCAL_PLACEHOLDER_KEY}
+   * in place of a Firecrawl key.
+   */
   firecrawlUrl: string | null;
 }
 
@@ -185,8 +196,10 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
     env[name] = value;
   }
   // Set over the CLI's own saved address, which it would otherwise send the key to.
-  if (input.firecrawlUrl !== null) env.FIRECRAWL_API_URL = input.firecrawlUrl;
-  else if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
+  if (input.firecrawlUrl !== null) {
+    env.FIRECRAWL_API_URL = input.firecrawlUrl;
+    env.FIRECRAWL_API_KEY = FIRECRAWL_LOCAL_PLACEHOLDER_KEY;
+  } else if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
   env.FIRECRAWL_NO_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_NO_ENDPOINT_FEEDBACK = '1';

@@ -27,6 +27,7 @@ import {
 } from '../src/chat/web/tools.js';
 import {
   fakeLocalAnswers,
+  fakeLocalCloud,
   fakeLocalScript,
   type FakeLocalAnswers,
   type FakeProvider,
@@ -136,7 +137,12 @@ describe('mlx_web over stdio', () => {
         provider: 'firecrawl',
         title: 'Local page',
       });
-      expect(local.requests.map((r) => r.path)).toEqual(['/health', '/v2/scrape', '/v2/scrape']);
+      expect(local.requests.map((r) => r.path)).toEqual([
+        '/health',
+        '/v2/scrape',
+        '/v2/team/credit-usage',
+        '/v2/scrape',
+      ]);
       for (const request of local.requests) expect(request.headers.authorization).toBeUndefined();
       expect(JSON.stringify(local.requests)).not.toContain(KEY);
     } finally {
@@ -353,8 +359,8 @@ describe('web tools with Firecrawl on this Mac', () => {
     const { server, tools } = await local();
     const page = parseWebResultText(await tools.call('web_fetch', { url: 'https://example.com/doc' }));
     expect(page).toMatchObject({ kind: 'page', provider: 'firecrawl', title: 'Local page', cloudRead: false });
-    expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape', 'POST /v2/scrape']);
-    expect(JSON.parse(server.requests[2]!.body)).toMatchObject({ url: 'https://example.com/doc' });
+    expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape', 'GET /v2/team/credit-usage', 'POST /v2/scrape']);
+    expect(JSON.parse(server.requests[3]!.body)).toMatchObject({ url: 'https://example.com/doc' });
     for (const request of server.requests) expect(request.headers.authorization).toBeUndefined();
   });
 
@@ -366,6 +372,24 @@ describe('web tools with Firecrawl on this Mac', () => {
     );
     expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape']);
     expect(JSON.stringify(server.requests)).not.toContain('example.com');
+  });
+
+  it('a server whose Cloud setting is not off, or cannot be read, gives local-cloud and gets no page address', async () => {
+    for (const cloud of [
+      fakeLocalCloud('fallback'),
+      fakeLocalCloud('unreadable'),
+      { status: 501, json: { success: false, code: 'OTHER' } },
+      { drop: true },
+    ]) {
+      const { server, answers, tools } = await local();
+      answers.cloud = cloud;
+      expect([cloud, await tools.call('web_fetch', { url: 'https://example.com/doc' })]).toEqual([
+        cloud,
+        formatErrorText('local-cloud', 'firecrawl'),
+      ]);
+      expect(paths(server)).toEqual(['GET /health', 'POST /v2/scrape', 'GET /v2/team/credit-usage']);
+      expect(JSON.stringify(server.requests)).not.toContain('example.com');
+    }
   });
 
   it('checks again before every read', async () => {

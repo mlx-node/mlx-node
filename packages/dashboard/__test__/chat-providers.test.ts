@@ -31,7 +31,13 @@ import {
   type ProvidersServiceOptions,
   WORK_PATH_ASK_GAP_MS,
 } from '../src/chat/providers/service.js';
-import { parseSettings, repairSettings, defaultSettings } from '../src/chat/providers/settings.js';
+import {
+  defaultSettings,
+  parseSettings,
+  type ProviderSettings,
+  repairSettings,
+  writeSettings,
+} from '../src/chat/providers/settings.js';
 import type { ProviderId, ProvidersResponse } from '../src/chat/providers/types.js';
 import { validateKey } from '../src/chat/providers/validate.js';
 import { routeError } from '../src/chat/route-errors.js';
@@ -60,6 +66,7 @@ import {
   type FakeAnswer,
   type FakeLocalAnswers,
   fakeLocalAnswers,
+  fakeLocalCloud,
   fakeLocalScript,
   type FakeProvider,
   type FakeRequest,
@@ -284,16 +291,109 @@ describe('settings file', () => {
     expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toEqual({
       version: 1,
       search: null,
-      firecrawl: true,
+      firecrawl: false,
       firecrawlLocal: true,
       localUrl: local.baseUrl,
       checks: {},
     });
+    await svc.select({ firecrawl: false });
+    expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toMatchObject({
+      firecrawl: false,
+      firecrawlLocal: false,
+      localUrl: local.baseUrl,
+    });
+    const restarted = service({ fetch: (i, n) => fetch(i, n) });
+    expect(restarted.summary()).toMatchObject({ firecrawl: false, firecrawlLocal: false, fetch: null });
+    expect((await restarted.list()).local.url).toBe(local.baseUrl);
+    expect(restarted.summary()).toMatchObject({ firecrawl: false, firecrawlLocal: false, fetch: null });
     expect(parseSettings('{"version":1,"search":"exa","firecrawl":true}')).toEqual({
       ...defaultSettings(),
       search: 'exa',
       firecrawl: true,
     });
+  });
+
+  it('reads the crawler from every disk form: this Mac only with a valid address, never the cloud', () => {
+    const VALID = 'http://127.0.0.1:3002';
+    const REFUSED = 'http://10.0.0.1:3002';
+    const crawler = (fields: Record<string, unknown>) => {
+      const read = parseSettings(JSON.stringify({ version: 1, ...fields }));
+      return [read.firecrawl, read.firecrawlLocal, read.localUrl];
+    };
+    // [firecrawl, firecrawlLocal, localUrl] on disk → [firecrawl, firecrawlLocal, localUrl] in memory.
+    const rows: Array<[unknown, unknown, unknown, [boolean, boolean, string | null]]> = [
+      [false, true, VALID, [true, true, VALID]],
+      [true, true, VALID, [true, true, VALID]],
+      [undefined, true, VALID, [true, true, VALID]],
+      [false, true, REFUSED, [false, false, null]],
+      [true, true, REFUSED, [false, false, null]],
+      [undefined, true, REFUSED, [false, false, null]],
+      [false, true, undefined, [false, false, null]],
+      [true, true, undefined, [false, false, null]],
+      [undefined, true, undefined, [false, false, null]],
+      [true, false, VALID, [true, false, VALID]],
+      [true, false, REFUSED, [true, false, null]],
+      [true, false, undefined, [true, false, null]],
+      [false, false, VALID, [false, false, VALID]],
+      [false, false, REFUSED, [false, false, null]],
+      [false, false, undefined, [false, false, null]],
+      [true, undefined, VALID, [true, false, VALID]],
+      [true, undefined, REFUSED, [true, false, null]],
+      [true, undefined, undefined, [true, false, null]],
+      [false, undefined, VALID, [false, false, VALID]],
+      [undefined, undefined, VALID, [false, false, VALID]],
+      [undefined, false, undefined, [false, false, null]],
+      ['yes', true, VALID, [true, true, VALID]],
+      [true, 'yes', VALID, [true, false, VALID]],
+      ['yes', 'yes', VALID, [false, false, VALID]],
+    ];
+    for (const [firecrawl, firecrawlLocal, localUrl, expected] of rows) {
+      const fields = { firecrawl, firecrawlLocal, localUrl };
+      expect([fields, crawler(fields)]).toEqual([fields, expected]);
+    }
+  });
+
+  it('writes this Mac in use as firecrawl false, so a build without it reads the crawler as Off', async () => {
+    const VALID = 'http://127.0.0.1:3002';
+    const states: Array<
+      [Pick<ProviderSettings, 'firecrawl' | 'firecrawlLocal' | 'localUrl'>, Record<string, unknown>]
+    > = [
+      [
+        { firecrawl: true, firecrawlLocal: true, localUrl: VALID },
+        { firecrawl: false, firecrawlLocal: true, localUrl: VALID },
+      ],
+      [
+        { firecrawl: true, firecrawlLocal: false, localUrl: VALID },
+        { firecrawl: true, firecrawlLocal: false, localUrl: VALID },
+      ],
+      [
+        { firecrawl: true, firecrawlLocal: false, localUrl: null },
+        { firecrawl: true, firecrawlLocal: false, localUrl: null },
+      ],
+      [
+        { firecrawl: false, firecrawlLocal: true, localUrl: VALID },
+        { firecrawl: false, firecrawlLocal: false, localUrl: VALID },
+      ],
+      [
+        { firecrawl: false, firecrawlLocal: false, localUrl: null },
+        { firecrawl: false, firecrawlLocal: false, localUrl: null },
+      ],
+    ];
+    const file = join(root, 'disk-form.json');
+    for (const [memory, disk] of states) {
+      await writeSettings(file, { ...defaultSettings(), ...memory });
+      const text = readFileSync(file, 'utf8');
+      const written = JSON.parse(text) as Record<string, unknown>;
+      expect([memory, written]).toMatchObject([memory, disk]);
+      // A build without this feature reads only `firecrawl === true`: this Mac in use must never read as the cloud.
+      if (memory.firecrawl && memory.firecrawlLocal) expect(written.firecrawl === true).toBe(false);
+      const back = parseSettings(text);
+      expect([memory, back.firecrawl, back.firecrawl && back.firecrawlLocal]).toEqual([
+        memory,
+        memory.firecrawl,
+        memory.firecrawl && memory.firecrawlLocal,
+      ]);
+    }
   });
 
   it('repairs a selection without a key, and keeps one whose key is not known yet', () => {
@@ -1209,6 +1309,119 @@ describe('Firecrawl on this Mac', () => {
     await closed.close();
     const down = await svc.putLocal(closed.baseUrl);
     expect([down.saved, down.check]).toEqual([false, 'not-running']);
+  });
+
+  it('a server whose Cloud setting is not off is refused like one that reads private addresses', async () => {
+    for (const mode of ['fallback', 'unreadable'] as const) {
+      rmSync(paths.providers, { force: true });
+      const cloudOn = await fakeLocal({ cloud: fakeLocalCloud(mode) });
+      const { svc, changes } = counted();
+      const reply = await svc.putLocal(cloudOn.url);
+      expect([mode, reply.saved, reply.check]).toEqual([mode, false, 'cloud-on']);
+      expect(reply.providers).toMatchObject({ firecrawl: false, firecrawlLocal: false, fetch: null });
+      expect(reply.providers.local.url).toBeNull();
+      expect(svc.summary()).toMatchObject({ firecrawl: false, firecrawlLocal: false });
+      expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'none', fetchUrl: '' });
+      expect(existsSync(paths.providers)).toBe(false);
+      expect(changes()).toBe(0);
+    }
+    const good = await fakeLocal();
+    const { svc } = counted();
+    await svc.putLocal(good.url);
+    const before = readFileSync(paths.providers, 'utf8');
+    good.answers.cloud = fakeLocalCloud('fallback');
+    const now = await svc.checkLocalNow();
+    expect(now.check).toBe('cloud-on');
+    expect(now.providers.local).toMatchObject({
+      url: good.url,
+      check: 'cloud-on',
+      version: '0.1.1',
+      cloud: 'fallback',
+    });
+    const again = await svc.putLocal(good.url);
+    expect([again.saved, again.check, again.providers.local.url]).toEqual([false, 'cloud-on', good.url]);
+    expect(readFileSync(paths.providers, 'utf8')).toBe(before);
+  });
+
+  it('an Off or a Remove that lands during a slow save wins: the save writes nothing and answers saved false', async () => {
+    for (const action of ['off', 'remove'] as const) {
+      rmSync(paths.providers, { force: true });
+      const first = await fakeLocal();
+      const slow = await fakeLocal();
+      const { svc, changes } = counted();
+      await svc.putLocal(first.url);
+      slow.answers.health = { ...slow.answers.health, delayMs: 1_200 };
+      const saving = svc.putLocal(slow.url);
+      await until(() => slow.server.requests.length === 1);
+      if (action === 'off') await svc.select({ firecrawl: false });
+      else await svc.deleteLocal();
+      const between = readFileSync(paths.providers, 'utf8');
+      const foldersBefore = pluginFolders();
+      const changesBetween = changes();
+      const reply = await saving;
+      expect([action, reply.saved, reply.check]).toEqual([action, false, 'ok']);
+      expect(readFileSync(paths.providers, 'utf8')).toBe(between);
+      expect(pluginFolders()).toEqual(foldersBefore);
+      expect(changes()).toBe(changesBetween);
+      const url = action === 'off' ? first.url : null;
+      expect(reply.providers).toMatchObject({ firecrawl: false, firecrawlLocal: false, fetch: null });
+      expect(reply.providers.local.url).toBe(url);
+      expect(svc.summary()).toMatchObject({ firecrawl: false, firecrawlLocal: false });
+      expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'none', fetchUrl: '' });
+      expect(JSON.parse(between)).toMatchObject({ firecrawl: false, firecrawlLocal: false, localUrl: url });
+    }
+  });
+
+  it('a search pick, Check again and a providers read during a slow save do not stop it', async () => {
+    for (const between of ['search', 'check'] as const) {
+      rmSync(paths.providers, { force: true });
+      const first = await fakeLocal();
+      const slow = await fakeLocal();
+      const { svc } = counted();
+      await svc.putLocal(first.url);
+      slow.answers.health = { ...slow.answers.health, delayMs: 1_200 };
+      const saving = svc.putLocal(slow.url);
+      await until(() => slow.server.requests.length === 1);
+      if (between === 'search') await svc.select({ search: null });
+      else {
+        await svc.checkLocalNow();
+        await svc.list();
+      }
+      const reply = await saving;
+      expect([between, reply.saved, reply.check]).toEqual([between, true, 'ok']);
+      expect(reply.providers.local.url).toBe(slow.url);
+      expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'firecrawl', fetchUrl: slow.url });
+    }
+  });
+
+  it('a second save that lands during a slow one wins; the same address saved twice at once is saved for both', async () => {
+    const slow = await fakeLocal();
+    const fast = await fakeLocal();
+    const { svc } = counted();
+    slow.answers.health = { ...slow.answers.health, delayMs: 1_200 };
+    const saving = svc.putLocal(slow.url);
+    await until(() => slow.server.requests.length === 1);
+    expect((await svc.putLocal(fast.url)).saved).toBe(true);
+    const refused = await saving;
+    expect([refused.saved, refused.check, refused.providers.local.url]).toEqual([false, 'ok', fast.url]);
+    expect(JSON.parse(readFileSync(paths.providers, 'utf8'))).toMatchObject({ localUrl: fast.url });
+    const both = await Promise.all([svc.putLocal(slow.url), svc.putLocal(slow.url)]);
+    expect(both.map((r) => [r.saved, r.check])).toEqual([
+      [true, 'ok'],
+      [true, 'ok'],
+    ]);
+    expect(svc.chatWeb().fetchUrl).toBe(slow.url);
+  });
+
+  it('a slow save with nothing in between still saves and turns on this Mac from Off', async () => {
+    const slow = await fakeLocal();
+    slow.answers.health = { ...slow.answers.health, delayMs: 1_200 };
+    const { svc, changes } = counted();
+    const reply = await svc.putLocal(slow.url);
+    expect([reply.saved, reply.check]).toEqual([true, 'ok']);
+    expect(reply.providers).toMatchObject({ firecrawl: true, firecrawlLocal: true, fetch: 'firecrawl' });
+    expect(svc.chatWeb()).toMatchObject({ fetchProvider: 'firecrawl', fetchUrl: slow.url });
+    expect(changes()).toBe(1);
   });
 
   it('an ok check saves the address, turns on this Mac from Off, installs the Firecrawl folder, tells the hosts once', async () => {

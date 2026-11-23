@@ -3,9 +3,10 @@
  *
  * The address is loopback only and saved as an IP literal, so no name lookup can move it and no page address crosses
  * the network in clear text. The page itself is then fetched from inside the user's network, so before each use the
- * check proves that the server is Firecrawl Local and that it refuses a private target on its own (its rule also runs
- * after DNS and on every redirect). Paths are fixed here. No request carries an Authorization header: the server
- * would pass a caller's key on to Firecrawl Cloud.
+ * check proves that the server is Firecrawl Local, that it refuses a private target on its own (its rule also runs
+ * after DNS and on every redirect), and that its Cloud setting reads as off: in its default setting the server sends
+ * the address of a page it cannot load to Firecrawl Cloud. Paths are fixed here. No request carries an Authorization
+ * header: the server would pass a caller's key on to Firecrawl Cloud.
  */
 
 import { httpJson, record } from './http.js';
@@ -22,26 +23,31 @@ export const LOCAL_ENGINE = 'firecrawl-local';
 const MAX_VERSION_CHARS = 16;
 
 /**
- * `ok`: Firecrawl Local, refusing private targets. `not-running`: no answer. `not-firecrawl`: something else answers.
- * `open`: it reads private addresses (`--allow-private`). `token`: it asks for a token (`--token`).
+ * `ok`: Firecrawl Local, refusing private targets, its Cloud setting off. `not-running`: no answer. `not-firecrawl`:
+ * something else answers. `open`: it reads private addresses (`--allow-private`). `token`: it asks for a token
+ * (`--token`). `cloud-on`: it may send a page to Firecrawl Cloud, or its Cloud setting could not be read.
  */
-export type LocalCheck = 'ok' | 'not-running' | 'not-firecrawl' | 'open' | 'token';
+export type LocalCheck = 'ok' | 'not-running' | 'not-firecrawl' | 'open' | 'token' | 'cloud-on';
 
-/** `off`: no page leaves this Mac. `fallback`: a page the server cannot load is sent to Firecrawl Cloud. */
+/**
+ * `off`: no page leaves this Mac (`FIRECRAWL_CLOUD=off`, or `search`, which passes on only searches). `fallback`: a
+ * page the server cannot load is sent to Firecrawl Cloud.
+ */
 export type LocalCloud = 'off' | 'fallback';
 
 export interface LocalCheckResult {
   check: LocalCheck;
   /** The server's version, only when it is digits and dots. */
   version: string | null;
-  /** The server's Cloud setting; null when it was not read or the answer was not one of the two known refusals. */
+  /**
+   * The server's Cloud setting: `off` exactly when `check` is `ok`; with `cloud-on`, `fallback` or null for an answer
+   * that is not one of the two known refusals; null for every other check.
+   */
   cloud: LocalCloud | null;
 }
 
 export interface LocalCheckOptions {
   fetch: typeof fetch;
-  /** Also read the Cloud setting. The web tool's check before a page read leaves it out. */
-  readCloud: boolean;
   healthMs?: number;
   probeMs?: number;
   cloudMs?: number;
@@ -100,9 +106,10 @@ function codeOf(json: unknown): unknown {
 /**
  * Three requests to the saved address, in order: `GET /health` (must name the engine `firecrawl-local`); a scrape of
  * the server's own `/health`, a loopback target it must refuse with 403 `BLOCKED_TARGET` (a refused target is never
- * handed to Firecrawl Cloud); then, when asked and only after both passed, the Cloud setting, read from a forwarded
- * route the server refuses itself (501 `CLOUD_ONLY` when the Cloud is off, 403 `CROSS_SITE_REQUEST` for a request
- * marked as coming from a web page), so this request does not leave the Mac either. Never throws.
+ * handed to Firecrawl Cloud); then, only after both passed, the Cloud setting, read from a forwarded route the server
+ * refuses itself (501 `CLOUD_ONLY` when the Cloud is off or passes on only searches, 403 `CROSS_SITE_REQUEST` for a
+ * request marked as coming from a web page), so this request does not leave the Mac either. Only `CLOUD_ONLY` is
+ * `ok`. Never throws.
  */
 export async function checkLocal(url: string, opts: LocalCheckOptions): Promise<LocalCheckResult> {
   const base = localOrigin(url);
@@ -139,7 +146,6 @@ export async function checkLocal(url: string, opts: LocalCheckOptions): Promise<
   if (probe.kind !== 'response' || probe.status !== 403 || codeOf(probe.json) !== 'BLOCKED_TARGET') {
     return { check: 'open', version, cloud: null };
   }
-  if (!opts.readCloud) return { check: 'ok', version, cloud: null };
   const cloud = await httpJson({
     fetch: opts.fetch,
     baseUrl: base,
@@ -153,7 +159,7 @@ export async function checkLocal(url: string, opts: LocalCheckOptions): Promise<
     return { check: 'ok', version, cloud: 'off' };
   }
   if (cloud.kind === 'response' && cloud.status === 403 && codeOf(cloud.json) === 'CROSS_SITE_REQUEST') {
-    return { check: 'ok', version, cloud: 'fallback' };
+    return { check: 'cloud-on', version, cloud: 'fallback' };
   }
-  return { check: 'ok', version, cloud: null };
+  return { check: 'cloud-on', version, cloud: null };
 }

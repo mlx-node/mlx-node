@@ -8,6 +8,7 @@ import {
   CHAT_ANSWER_TOKENS,
   CHAT_MAX_COMPLETION_TOKENS,
   chatAgentEnv,
+  FIRECRAWL_LOCAL_PLACEHOLDER_KEY,
   WORK_ANSWER_TOKENS,
   WORK_MAX_COMPLETION_TOKENS,
   workAgentEnv,
@@ -256,8 +257,9 @@ describe('workAgentEnv', () => {
     expect(env.EXA_API_KEY).toBe('k');
   });
 
-  it('pins the address the firecrawl CLI uses: the cloud with the key, this Mac with no key, none without either', () => {
+  it('pins the address the firecrawl CLI uses: the cloud with the key, this Mac with the placeholder, none without either', () => {
     const inherited = { ...base, FIRECRAWL_API_URL: 'https://elsewhere.example' };
+    expect(FIRECRAWL_LOCAL_PLACEHOLDER_KEY).toBe('fc-local-no-key');
     const cloud = workAgentEnv({
       base: inherited,
       endpoint,
@@ -274,8 +276,31 @@ describe('workAgentEnv', () => {
       firecrawlUrl: 'http://127.0.0.1:3002',
     });
     expect(local.FIRECRAWL_API_URL).toBe('http://127.0.0.1:3002');
-    expect(local).not.toHaveProperty('FIRECRAWL_API_KEY');
+    // Set, so the CLI never falls back to the key saved by `firecrawl login` and sends it to that address.
+    expect(local.FIRECRAWL_API_KEY).toBe(FIRECRAWL_LOCAL_PLACEHOLDER_KEY);
     expect(local.EXA_API_KEY).toBe('k');
+    const localNoKeys = workAgentEnv({
+      base: inherited,
+      endpoint,
+      agentHome: null,
+      providerKeys: {},
+      firecrawlUrl: 'http://[::1]:4000',
+    });
+    expect([localNoKeys.FIRECRAWL_API_KEY, localNoKeys.FIRECRAWL_API_URL]).toEqual([
+      FIRECRAWL_LOCAL_PLACEHOLDER_KEY,
+      'http://[::1]:4000',
+    ]);
+    const cloudNoUrl = workAgentEnv({
+      base,
+      endpoint,
+      agentHome: null,
+      providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
+      firecrawlUrl: null,
+    });
+    expect([cloudNoUrl.FIRECRAWL_API_KEY, cloudNoUrl.FIRECRAWL_API_URL]).toEqual([
+      'fc-key',
+      'https://api.firecrawl.dev',
+    ]);
     const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {}, firecrawlUrl: null });
     expect(none).not.toHaveProperty('FIRECRAWL_API_URL');
     expect(none).not.toHaveProperty('FIRECRAWL_API_KEY');

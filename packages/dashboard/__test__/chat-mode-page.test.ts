@@ -2292,7 +2292,9 @@ describe('the New Work screen: a mode picked before the first message', () => {
 
     const local = await panel('local', CHAT.crawlerNameLocal);
     await line(local, fill(CHAT.crawlerWorkLocal, { n: 5 }));
-    expect(fill(CHAT.crawlerWorkLocal, { n: 5 })).toContain('The app passes no key.');
+    expect(fill(CHAT.crawlerWorkLocal, { n: 5 })).toContain(
+      'a placeholder key, never the key saved with firecrawl login',
+    );
     await line(await panel('cloud', CHAT.crawlerNameCloud, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
     await line(await panel('local', CHAT.crawlerNameLocal, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
     await line(await panel('cloud', CHAT.crawlerNameCloud, null, false), CHAT.crawlerWorkMissing);
