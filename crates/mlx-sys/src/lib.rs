@@ -1654,7 +1654,8 @@ unsafe extern "C-unwind" {
     /// Check whether Inkling2 grouped/fused NVFP4/Q8_0 MoE Metal kernels are available for `rows`.
     pub fn mlx_inkling2_grouped_moe_available(rows: u32) -> bool;
 
-    /// Grouped/fused Inkling2 NVFP4 (`quant_mode=0`), Q8_0 (`quant_mode=1`), or MXFP8 (`quant_mode=2`) MoE.
+    /// Grouped/fused Inkling2 MoE with independent `gu_quant_mode` (0=NVFP4, 1=Q8_0, 2=MXFP8, 3=Q5_K)
+    /// and `dn_quant_mode` (0=NVFP4, 1=Q8_0, 2=MXFP8).
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_grouped_moe(
         x: *mut mlx_array,
@@ -1666,7 +1667,8 @@ unsafe extern "C-unwind" {
         dn_w: *mut mlx_array,
         dn_s: *mut mlx_array,
         dn_aux: *mut mlx_array,
-        quant_mode: u32,
+        gu_quant_mode: u32,
+        dn_quant_mode: u32,
         interleaved_gate_up: bool,
         gate_softcap: f32,
         up_softcap: f32,
@@ -1697,7 +1699,8 @@ unsafe extern "C-unwind" {
         packed_hist: bool,
         top_k: u32,
         route_scale: f32,
-        quant_mode: u32,
+        gu_quant_mode: u32,
+        dn_quant_mode: u32,
         interleaved_gate_up: bool,
         gate_softcap: f32,
         up_softcap: f32,

@@ -2223,7 +2223,16 @@ fn profile_48_visits(
             visits: caps.len(),
             ..Default::default()
         };
-        if use_grouped_moe {
+        let group_uses_grouped = use_grouped_moe
+            && !caps.is_empty()
+            && caps.iter().all(|cap| {
+                inner.layers[cap.phys_layer].moe.supports_grouped_moe(
+                    m_rows,
+                    d_i64 as usize,
+                    act_dtype,
+                )
+            });
+        if group_uses_grouped {
             mb.router_ms = time_stage_ms(w, iters, || {
                 let mut outs = Vec::with_capacity(caps.len() * 2);
                 for cap in caps {

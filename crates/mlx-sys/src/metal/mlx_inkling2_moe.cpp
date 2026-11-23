@@ -121,13 +121,21 @@ const std::vector<array>* try_inkling2_moe_workspace(
 
 class Inkling2GroupedMoe : public fast::Custom {
  public:
-  Inkling2GroupedMoe(Stream s, Inkling2MoeParams params, bool has_gu_aux, bool has_dn_aux)
+  Inkling2GroupedMoe(
+      Stream s,
+      Inkling2MoeParams params,
+      uint32_t gu_quant_mode,
+      uint32_t dn_quant_mode,
+      bool has_gu_aux,
+      bool has_dn_aux)
       : fast::Custom(
             s,
             [](std::vector<array>) -> std::vector<array> {
               throw std::runtime_error("Inkling2GroupedMoe requires Metal");
             }),
         p_(params),
+        gu_quant_mode_(gu_quant_mode),
+        dn_quant_mode_(dn_quant_mode),
         has_gu_aux_(has_gu_aux),
         has_dn_aux_(has_dn_aux) {}
 
@@ -135,7 +143,9 @@ class Inkling2GroupedMoe : public fast::Custom {
 
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const Inkling2GroupedMoe&>(other);
-    return has_gu_aux_ == rhs.has_gu_aux_ &&
+    return gu_quant_mode_ == rhs.gu_quant_mode_ &&
+        dn_quant_mode_ == rhs.dn_quant_mode_ &&
+        has_gu_aux_ == rhs.has_gu_aux_ &&
         has_dn_aux_ == rhs.has_dn_aux_ &&
         std::memcmp(&p_, &rhs.p_, sizeof(p_)) == 0;
   }
@@ -152,6 +162,8 @@ class Inkling2GroupedMoe : public fast::Custom {
 
  private:
   Inkling2MoeParams p_;
+  uint32_t gu_quant_mode_;
+  uint32_t dn_quant_mode_;
   bool has_gu_aux_;
   bool has_dn_aux_;
 };
@@ -192,19 +204,24 @@ void Inkling2GroupedMoe::eval_gpu(
 
   Inkling2MoeParams p = p_;
   p.rows = static_cast<uint32_t>(a[0].shape(0));
-  const bool is_q8 = (p.flags & 1u) != 0u;
-  const bool is_mxfp8 = (p.flags & 64u) != 0u;
-  const bool is_8bit = is_q8 || is_mxfp8;
+  const bool gu_is_q8 = (gu_quant_mode_ == 1u);
+  const bool gu_is_mxfp8 = (gu_quant_mode_ == 2u);
+  const bool gu_is_q5k = (gu_quant_mode_ == 3u);
+  const bool dn_is_q8 = (dn_quant_mode_ == 1u);
+  const bool dn_is_mxfp8 = (dn_quant_mode_ == 2u);
+  const bool simd_only_quant = (gu_quant_mode_ >= 2u || dn_quant_mode_ >= 2u);
+  const uint32_t gu_cols_per_tg = (gu_quant_mode_ == 0u) ? 4u : 8u;
+  const uint32_t dn_cols_per_tg = (dn_quant_mode_ == 0u) ? 4u : 8u;
 
   // Input layout:
   //   0: x [T, D] BF16
   //   1: top_k_indices [T, K] Int32
   //   2: gamma [T, K] F32
   //   3: gu_w [E, 2*I, K_gu_packed] uint32
-  //   4: gu_s [E, 2*I, K_gu_groups] uint8 (NVFP4) or BF16/F32 (Q8)
+  //   4: gu_s [E, 2*I, K_gu_groups] uint8 (NVFP4/MXFP8/Q5K) or BF16/F32/F16 (Q8)
   //   5: dn_w [E, D, K_dn_packed] uint32
-  //   6: dn_s [E, D, K_dn_groups] uint8 (NVFP4) or BF16/F32 (Q8)
-  //   7 (optional, if has_gu_aux_): gu_outer [E] F32 (NVFP4) or gu_b (Q8)
+  //   6: dn_s [E, D, K_dn_groups] uint8 (NVFP4/MXFP8) or BF16/F32/F16 (Q8)
+  //   7 (optional, if has_gu_aux_): gu_outer [E] F32 (NVFP4) or gu_b (Q8/Q5K)
   //   7/8 (optional, if has_dn_aux_): dn_b (Q8)
   const array& x = a[0];
   const array& indices = a[1];
@@ -245,14 +262,15 @@ void Inkling2GroupedMoe::eval_gpu(
     auto act = scratch(5, {static_cast<int>(p.top_k), static_cast<int>(p.intermediate)}, bfloat16);
 
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_m1_gate_up_situ_mxfp8"
-                 : is_q8 ? "inkling2_moe_m1_gate_up_situ_q8"
-                         : "inkling2_moe_m1_gate_up_situ_nvfp4");
+        gu_is_q5k ? "inkling2_moe_m1_gate_up_situ_q5k"
+                  : gu_is_mxfp8 ? "inkling2_moe_m1_gate_up_situ_mxfp8"
+                                : gu_is_q8 ? "inkling2_moe_m1_gate_up_situ_q8"
+                                           : "inkling2_moe_m1_gate_up_situ_nvfp4");
     enc.set_input_array(x, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gu_w, 2);
     enc.set_input_array(gu_s, 3);
-    if (is_mxfp8) {
+    if (gu_is_mxfp8) {
       enc.set_output_array(act, 4);
       enc.set_bytes(p, 5);
     } else {
@@ -264,21 +282,20 @@ void Inkling2GroupedMoe::eval_gpu(
       enc.set_output_array(act, 5);
       enc.set_bytes(p, 6);
     }
-    const uint32_t gu_cols_per_tg = is_8bit ? 8u : 4u;
     enc.dispatch_threadgroups(
         MTL::Size((p.intermediate + gu_cols_per_tg - 1u) / gu_cols_per_tg, p.top_k, 1),
         MTL::Size(64, 1, 1));
 
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_m1_down_combine_mxfp8"
-                 : is_q8 ? "inkling2_moe_m1_down_combine_q8"
-                         : "inkling2_moe_m1_down_combine_nvfp4");
+        dn_is_mxfp8 ? "inkling2_moe_m1_down_combine_mxfp8"
+                    : dn_is_q8 ? "inkling2_moe_m1_down_combine_q8"
+                               : "inkling2_moe_m1_down_combine_nvfp4");
     enc.set_input_array(act, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gamma, 2);
     enc.set_input_array(dn_w, 3);
     enc.set_input_array(dn_s, 4);
-    if (is_q8) {
+    if (dn_is_q8) {
       if (dn_aux) {
         enc.set_input_array(*dn_aux, 5);
       } else {
@@ -290,7 +307,6 @@ void Inkling2GroupedMoe::eval_gpu(
       enc.set_output_array(out, 5);
       enc.set_bytes(p, 6);
     }
-    const uint32_t dn_cols_per_tg = is_8bit ? 8u : 4u;
     enc.dispatch_threadgroups(
         MTL::Size((p.hidden + dn_cols_per_tg - 1u) / dn_cols_per_tg, 1, 1),
         MTL::Size(64, 1, 1));
@@ -302,8 +318,8 @@ void Inkling2GroupedMoe::eval_gpu(
   // -------------------------------------------------------------------------
   p.tile_rows = (p.rows <= 32u) ? 8u : 32u;
   const uint32_t total_routes = p.rows * p.top_k;
-  if (is_mxfp8 || !metal::is_nax_available()) {
-    // MXFP8 and non-NAX Apple7-9 GPUs use 100% 0-smem coalesced SIMD multi-row QMV for T <= 32.
+  if (simd_only_quant || !metal::is_nax_available()) {
+    // MXFP8, Q5_K, and non-NAX Apple7-9 GPUs use 100% 0-smem coalesced SIMD multi-row QMV for T <= 32.
     // Force every expert into the SIMD list even if repeated expert IDs give an expert > 32 routes.
     p.col_cutoff = total_routes;
   } else if (const int cutoff_override = resolved_moe_col_cutoff_override(); cutoff_override >= 0) {
@@ -328,7 +344,7 @@ void Inkling2GroupedMoe::eval_gpu(
 
   const bool need_simd = p.col_cutoff > 0u;
   const bool need_nax =
-      metal::is_nax_available() && !is_mxfp8 && (total_routes > p.col_cutoff);
+      metal::is_nax_available() && !simd_only_quant && (total_routes > p.col_cutoff);
   const bool use_direct_gather = need_simd && !need_nax;
   if (use_direct_gather) {
     p.flags |= 16u;
@@ -371,15 +387,18 @@ void Inkling2GroupedMoe::eval_gpu(
   }
   const array& simd_x = use_direct_gather ? x : *gathered_opt;
 
-  const std::string suffix =
-      std::string(is_q8 ? "q8_" : "nvfp4_") + std::to_string(p.tile_rows);
+  const std::string gu_suffix =
+      std::string(gu_is_q8 ? "q8_" : "nvfp4_") + std::to_string(p.tile_rows);
+  const std::string dn_suffix =
+      std::string(dn_is_q8 ? "q8_" : "nvfp4_") + std::to_string(p.tile_rows);
 
   // 3a. Coalesced SIMD gate_up + SiTU (direct-gather when !need_nax)
   if (need_simd) {
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
-                 : is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
-                         : "inkling2_moe_simd_gate_up_situ_nvfp4");
+        gu_is_q5k ? "inkling2_moe_simd_gate_up_situ_q5k"
+                  : gu_is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
+                                : gu_is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
+                                           : "inkling2_moe_simd_gate_up_situ_nvfp4");
     enc.set_input_array(simd_x, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -387,7 +406,7 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(routes, 4);
     enc.set_input_array(gu_w, 5);
     enc.set_input_array(gu_s, 6);
-    if (is_mxfp8) {
+    if (gu_is_mxfp8) {
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
     } else {
@@ -407,7 +426,7 @@ void Inkling2GroupedMoe::eval_gpu(
 
   // 3b. 2-SG BN=32 NAX gate_up + SiTU (8 KB smem, indirect dispatch for rows > col_cutoff)
   if (need_nax) {
-    set_kernel("inkling2_moe_gate_up_situ_nax_" + suffix);
+    set_kernel("inkling2_moe_gate_up_situ_nax_" + gu_suffix);
     enc.set_input_array(*gathered_opt, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -430,16 +449,16 @@ void Inkling2GroupedMoe::eval_gpu(
   // 4a. Coalesced SIMD down_proj (indirect dispatch for rows <= col_cutoff)
   if (need_simd) {
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
-                 : is_q8 ? "inkling2_moe_simd_down_q8"
-                         : "inkling2_moe_simd_down_nvfp4");
+        dn_is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
+                    : dn_is_q8 ? "inkling2_moe_simd_down_q8"
+                               : "inkling2_moe_simd_down_nvfp4");
     enc.set_input_array(hidden, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
     enc.set_input_array(dn_w, 4);
     enc.set_input_array(dn_s, 5);
-    if (is_q8) {
+    if (dn_is_q8) {
       if (dn_aux) {
         enc.set_input_array(*dn_aux, 6);
       } else {
@@ -459,7 +478,7 @@ void Inkling2GroupedMoe::eval_gpu(
 
   // 4b. 2-SG BN=64 NAX down_proj (8 KB smem, indirect dispatch for rows > col_cutoff)
   if (need_nax) {
-    set_kernel("inkling2_moe_down_nax_" + suffix);
+    set_kernel("inkling2_moe_down_nax_" + dn_suffix);
     enc.set_input_array(hidden, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -529,6 +548,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
   Inkling2GroupedMoeFused(
       Stream s,
       Inkling2MoeParams params,
+      uint32_t gu_quant_mode,
+      uint32_t dn_quant_mode,
       float route_scale,
       uint32_t num_seqs,
       std::vector<int32_t> cu_seqlens,
@@ -546,6 +567,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
               throw std::runtime_error("Inkling2GroupedMoeFused requires Metal");
             }),
         p_(params),
+        gu_quant_mode_(gu_quant_mode),
+        dn_quant_mode_(dn_quant_mode),
         route_scale_(route_scale),
         num_seqs_(num_seqs),
         cu_seqlens_(std::move(cu_seqlens)),
@@ -562,7 +585,9 @@ class Inkling2GroupedMoeFused : public fast::Custom {
 
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const Inkling2GroupedMoeFused&>(other);
-    return route_scale_ == rhs.route_scale_ &&
+    return gu_quant_mode_ == rhs.gu_quant_mode_ &&
+        dn_quant_mode_ == rhs.dn_quant_mode_ &&
+        route_scale_ == rhs.route_scale_ &&
         num_seqs_ == rhs.num_seqs_ &&
         cu_seqlens_ == rhs.cu_seqlens_ &&
         packed_hist_ == rhs.packed_hist_ &&
@@ -595,6 +620,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
 
  private:
   Inkling2MoeParams p_;
+  uint32_t gu_quant_mode_;
+  uint32_t dn_quant_mode_;
   float route_scale_;
   uint32_t num_seqs_;
   std::vector<int32_t> cu_seqlens_;
@@ -624,9 +651,14 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   Inkling2MoeParams p = p_;
   p.rows = static_cast<uint32_t>(a[0].shape(0));
-  const bool is_q8 = (p.flags & 1u) != 0u;
-  const bool is_mxfp8 = (p.flags & 64u) != 0u;
-  const bool is_8bit = is_q8 || is_mxfp8;
+  const bool gu_is_q8 = (gu_quant_mode_ == 1u);
+  const bool gu_is_mxfp8 = (gu_quant_mode_ == 2u);
+  const bool gu_is_q5k = (gu_quant_mode_ == 3u);
+  const bool dn_is_q8 = (dn_quant_mode_ == 1u);
+  const bool dn_is_mxfp8 = (dn_quant_mode_ == 2u);
+  const bool simd_only_quant = (gu_quant_mode_ >= 2u || dn_quant_mode_ >= 2u);
+  const uint32_t gu_cols_per_tg = (gu_quant_mode_ == 0u) ? 4u : 8u;
+  const uint32_t dn_cols_per_tg = (dn_quant_mode_ == 0u) ? 4u : 8u;
 
   const array& x = a[0];
   const array& router_logits = a[1];
@@ -735,14 +767,15 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
 
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_m1_gate_up_situ_mxfp8"
-                 : is_q8 ? "inkling2_moe_m1_gate_up_situ_q8"
-                         : "inkling2_moe_m1_gate_up_situ_nvfp4");
+        gu_is_q5k ? "inkling2_moe_m1_gate_up_situ_q5k"
+                  : gu_is_mxfp8 ? "inkling2_moe_m1_gate_up_situ_mxfp8"
+                                : gu_is_q8 ? "inkling2_moe_m1_gate_up_situ_q8"
+                                           : "inkling2_moe_m1_gate_up_situ_nvfp4");
     enc.set_input_array(x, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gu_w, 2);
     enc.set_input_array(gu_s, 3);
-    if (is_mxfp8) {
+    if (gu_is_mxfp8) {
       enc.set_output_array(act, 4);
       enc.set_bytes(p, 5);
     } else {
@@ -750,22 +783,21 @@ void Inkling2GroupedMoeFused::eval_gpu(
       enc.set_output_array(act, 5);
       enc.set_bytes(p, 6);
     }
-    const uint32_t gu_cols_per_tg = is_8bit ? 8u : 4u;
     enc.dispatch_threadgroups(
         MTL::Size((p.intermediate + gu_cols_per_tg - 1u) / gu_cols_per_tg, p.top_k, 1),
         MTL::Size(64, 1, 1));
 
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_m1_down_combine_sconv_mxfp8"
-                 : is_q8 ? "inkling2_moe_m1_down_combine_sconv_q8"
-                         : "inkling2_moe_m1_down_combine_sconv_nvfp4");
+        dn_is_mxfp8 ? "inkling2_moe_m1_down_combine_sconv_mxfp8"
+                    : dn_is_q8 ? "inkling2_moe_m1_down_combine_sconv_q8"
+                               : "inkling2_moe_m1_down_combine_sconv_nvfp4");
     enc.set_input_array(act, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gamma, 2);
     enc.set_input_array(dn_w, 3);
     enc.set_input_array(dn_s, 4);
     uint32_t bidx = 5u;
-    if (is_q8) {
+    if (dn_is_q8) {
       if (dn_aux) enc.set_input_array(*dn_aux, bidx++); else enc.set_bytes(dummy_f32, bidx++);
     }
     enc.set_input_array(post_w, bidx++);
@@ -776,7 +808,6 @@ void Inkling2GroupedMoeFused::eval_gpu(
     if (out_tape) enc.set_output_array(*out_tape, bidx++); else enc.set_bytes(dummy_f32, bidx++);
     enc.set_bytes(p, bidx++);
     enc.set_bytes(pc, bidx++);
-    const uint32_t dn_cols_per_tg = is_8bit ? 8u : 4u;
     enc.dispatch_threadgroups(
         MTL::Size((p.hidden + dn_cols_per_tg - 1u) / dn_cols_per_tg, 1, 1),
         MTL::Size(64, 1, 1));
@@ -788,7 +819,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
   // -------------------------------------------------------------------------
   p.tile_rows = 8u;
   const uint32_t total_routes = p.rows * p.top_k;
-  if (is_mxfp8 || !metal::is_nax_available()) {
+  if (simd_only_quant || !metal::is_nax_available()) {
     p.col_cutoff = total_routes;
   } else if (const int cutoff_override = resolved_moe_col_cutoff_override(); cutoff_override >= 0) {
     p.col_cutoff = static_cast<uint32_t>(std::clamp(cutoff_override, 0, 32));
@@ -804,7 +835,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   const bool need_simd = p.col_cutoff > 0u;
   const bool need_nax =
-      metal::is_nax_available() && !is_mxfp8 && (total_routes > p.col_cutoff);
+      metal::is_nax_available() && !simd_only_quant && (total_routes > p.col_cutoff);
   const bool use_direct_gather = need_simd && !need_nax;
   if (use_direct_gather) {
     p.flags |= 16u;
@@ -828,12 +859,13 @@ void Inkling2GroupedMoeFused::eval_gpu(
   rp.top_k = p.top_k;
   rp.tile_rows = p.tile_rows;
   rp.route_scale = route_scale_;
-  rp.flags = (is_8bit ? 1u : 0u) |
+  rp.flags = (gu_quant_mode_ != 0u ? 1u : 0u) |
       ((router_input_is_weight_ || router_logits.dtype() == float32) ? 2u : 0u) |
       (bias ? 4u : 0u) |
       ((bias && bias->dtype() == float32) ? 8u : 0u) |
       (down_scale ? 16u : 0u) |
-      ((down_scale && down_scale->dtype() == float32) ? 32u : 0u);
+      ((down_scale && down_scale->dtype() == float32) ? 32u : 0u) |
+      (dn_quant_mode_ != 0u ? 64u : 0u);
   rp.col_cutoff = p.col_cutoff;
   rp.max_tiles = p.max_tiles;
   rp.logits_stride = p.experts;
@@ -886,14 +918,16 @@ void Inkling2GroupedMoeFused::eval_gpu(
   }
   const array& simd_x = use_direct_gather ? x : *gathered_opt;
 
-  const std::string suffix = std::string(is_q8 ? "q8_8" : "nvfp4_8");
+  const std::string gu_suffix = std::string(gu_is_q8 ? "q8_8" : "nvfp4_8");
+  const std::string dn_suffix = std::string(dn_is_q8 ? "q8_8" : "nvfp4_8");
 
   // 3a. Coalesced SIMD gate_up + SiTU (direct-gather when !need_nax)
   if (need_simd) {
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
-                 : is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
-                         : "inkling2_moe_simd_gate_up_situ_nvfp4");
+        gu_is_q5k ? "inkling2_moe_simd_gate_up_situ_q5k"
+                  : gu_is_mxfp8 ? "inkling2_moe_simd_gate_up_situ_mxfp8"
+                                : gu_is_q8 ? "inkling2_moe_simd_gate_up_situ_q8"
+                                           : "inkling2_moe_simd_gate_up_situ_nvfp4");
     enc.set_input_array(simd_x, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -901,7 +935,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(routes, 4);
     enc.set_input_array(gu_w, 5);
     enc.set_input_array(gu_s, 6);
-    if (is_mxfp8) {
+    if (gu_is_mxfp8) {
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
     } else {
@@ -917,7 +951,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   // 3b. NAX gate_up + SiTU (if col_cutoff < T)
   if (need_nax) {
-    set_kernel("inkling2_moe_gate_up_situ_nax_" + suffix);
+    set_kernel("inkling2_moe_gate_up_situ_nax_" + gu_suffix);
     enc.set_input_array(*gathered_opt, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -936,16 +970,16 @@ void Inkling2GroupedMoeFused::eval_gpu(
   // 4a. Coalesced SIMD down_proj
   if (need_simd) {
     set_kernel(
-        is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
-                 : is_q8 ? "inkling2_moe_simd_down_q8"
-                         : "inkling2_moe_simd_down_nvfp4");
+        dn_is_mxfp8 ? "inkling2_moe_simd_down_mxfp8"
+                    : dn_is_q8 ? "inkling2_moe_simd_down_q8"
+                               : "inkling2_moe_simd_down_nvfp4");
     enc.set_input_array(hidden, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
     enc.set_input_array(dn_w, 4);
     enc.set_input_array(dn_s, 5);
-    if (is_q8) {
+    if (dn_is_q8) {
       if (dn_aux) enc.set_input_array(*dn_aux, 6); else enc.set_bytes(dummy_f32, 6);
       enc.set_output_array(projected, 7);
       enc.set_bytes(p, 8);
@@ -961,7 +995,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   // 4b. NAX down_proj (if col_cutoff < T)
   if (need_nax) {
-    set_kernel("inkling2_moe_down_nax_" + suffix);
+    set_kernel("inkling2_moe_down_nax_" + dn_suffix);
     enc.set_input_array(hidden, 0);
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
@@ -1048,6 +1082,142 @@ bool available_for_rows(uint32_t rows, bool check_max_rows = true) {
 #endif
 }
 
+#ifdef MLX_NODE_METAL_ENABLED
+bool validate_and_append_quant_args(
+    int E,
+    int N2,
+    int D,
+    int I,
+    uint32_t gu_quant_mode,
+    uint32_t dn_quant_mode,
+    const mlx::core::array& gu_w,
+    const mlx::core::array& gu_s,
+    mlx_array* gu_aux_ptr,
+    const mlx::core::array& dn_w,
+    const mlx::core::array& dn_s,
+    mlx_array* dn_aux_ptr,
+    uint32_t& flags,
+    bool& has_gu_aux,
+    bool& has_dn_aux,
+    std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core;
+  if (gu_quant_mode > 3u || dn_quant_mode > 2u) {
+    return false;
+  }
+  if (gu_quant_mode != 0u) {
+    flags |= 1u;
+  }
+  if (dn_quant_mode != 0u) {
+    flags |= 64u;
+  }
+
+  bool gu_q8_sym = false;
+  bool gu_q8_f32 = false;
+  bool dn_q8_sym = false;
+  bool dn_q8_f32 = false;
+
+  if (gu_quant_mode == 0u) {
+    if (gu_w.shape(2) != D / 8 || gu_s.dtype() != uint8 ||
+        gu_s.shape() != Shape{E, N2, D / 16}) {
+      return false;
+    }
+    if (gu_aux_ptr) {
+      const auto& gu_outer = *reinterpret_cast<array*>(gu_aux_ptr);
+      if (gu_outer.ndim() != 1 || gu_outer.shape(0) != E || gu_outer.dtype() != float32) {
+        return false;
+      }
+      flags |= 2u;
+      has_gu_aux = true;
+      inputs.push_back(gu_outer);
+    }
+  } else if (gu_quant_mode == 1u) {
+    if (gu_w.shape(2) != D / 4 || gu_s.shape() != Shape{E, N2, D / 32}) {
+      return false;
+    }
+    if (!gu_aux_ptr) {
+      if (gu_s.dtype() != float16) {
+        return false;
+      }
+      gu_q8_sym = true;
+    } else {
+      const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
+      const Dtype sc_dt = gu_s.dtype();
+      if ((sc_dt != bfloat16 && sc_dt != float32) ||
+          gu_b.dtype() != sc_dt || gu_b.shape() != Shape{E, N2, D / 32}) {
+        return false;
+      }
+      gu_q8_f32 = (sc_dt == float32);
+      has_gu_aux = true;
+      inputs.push_back(gu_b);
+    }
+  } else if (gu_quant_mode == 2u) {
+    if (gu_aux_ptr || gu_w.shape(2) != D / 4 || gu_s.dtype() != uint8 ||
+        gu_s.shape() != Shape{E, N2, D / 32}) {
+      return false;
+    }
+  } else {
+    // RowMajor Q5_K: 256-elem super-blocks (8 sub-blocks of 32), 5 uint32 words/group,
+    // 2 uint8 (sc, m) bytes/group, 2 float16 (d, dmin) entries/super-block.
+    if (D < 256 || (D % 256) != 0 || !gu_aux_ptr ||
+        gu_w.shape(2) != (D / 32) * 5 ||
+        gu_s.dtype() != uint8 || gu_s.shape() != Shape{E, N2, D / 16}) {
+      return false;
+    }
+    const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
+    if (gu_b.dtype() != float16 || gu_b.shape() != Shape{E, N2, D / 128}) {
+      return false;
+    }
+    has_gu_aux = true;
+    inputs.push_back(gu_b);
+  }
+
+  if (dn_quant_mode == 0u) {
+    if (dn_aux_ptr || dn_w.shape(2) != I / 8 || dn_s.dtype() != uint8 ||
+        dn_s.shape() != Shape{E, D, I / 16}) {
+      return false;
+    }
+  } else if (dn_quant_mode == 1u) {
+    if (dn_w.shape(2) != I / 4 || dn_s.shape() != Shape{E, D, I / 32}) {
+      return false;
+    }
+    if (!dn_aux_ptr) {
+      if (dn_s.dtype() != float16) {
+        return false;
+      }
+      dn_q8_sym = true;
+    } else {
+      const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
+      const Dtype sc_dt = dn_s.dtype();
+      if ((sc_dt != bfloat16 && sc_dt != float32) ||
+          dn_b.dtype() != sc_dt || dn_b.shape() != Shape{E, D, I / 32}) {
+        return false;
+      }
+      dn_q8_f32 = (sc_dt == float32);
+      has_dn_aux = true;
+      inputs.push_back(dn_b);
+    }
+  } else {
+    if (dn_aux_ptr || dn_w.shape(2) != I / 4 || dn_s.dtype() != uint8 ||
+        dn_s.shape() != Shape{E, D, I / 32}) {
+      return false;
+    }
+  }
+
+  if (gu_quant_mode == 1u && dn_quant_mode == 1u) {
+    if (gu_q8_sym != dn_q8_sym || gu_q8_f32 != dn_q8_f32) {
+      return false;
+    }
+  }
+  if ((gu_quant_mode == 1u && gu_q8_sym) || (dn_quant_mode == 1u && dn_q8_sym)) {
+    flags |= 128u;
+  }
+  if ((gu_quant_mode == 1u && gu_q8_f32) || (dn_quant_mode == 1u && dn_q8_f32)) {
+    flags |= 4u;
+  }
+  return true;
+}
+#endif
+
 } // namespace mlx::core::inkling2_moe
 
 extern "C" {
@@ -1090,14 +1260,16 @@ mlx_array* mlx_inkling2_grouped_moe(
     mlx_array* dn_w_ptr,
     mlx_array* dn_s_ptr,
     mlx_array* dn_aux_ptr,
-    uint32_t quant_mode,
+    uint32_t gu_quant_mode,
+    uint32_t dn_quant_mode,
     bool interleaved_gate_up,
     float gate_softcap,
     float up_softcap,
     bool round_bf16_before_situ) {
 #ifdef MLX_NODE_METAL_ENABLED
   if (!x_ptr || !top_k_indices_ptr || !gamma_ptr ||
-      !gu_w_ptr || !gu_s_ptr || !dn_w_ptr || !dn_s_ptr || quant_mode > 2u) {
+      !gu_w_ptr || !gu_s_ptr || !dn_w_ptr || !dn_s_ptr ||
+      gu_quant_mode > 3u || dn_quant_mode > 2u) {
     return nullptr;
   }
   try {
@@ -1120,7 +1292,8 @@ mlx_array* mlx_inkling2_grouped_moe(
     const int T = x.shape(0);
     const int D = x.shape(1);
     const int K = idx.shape(1);
-    if (T < 1 || T > 8192 || (quant_mode == 2u && T > 32) || D < 64 || (D % 64) != 0 ||
+    const bool simd_only_quant = (gu_quant_mode >= 2u || dn_quant_mode >= 2u);
+    if (T < 1 || T > 8192 || (simd_only_quant && T > 32) || D < 64 || (D % 64) != 0 ||
         idx.shape(0) != T || gamma.shape(0) != T || gamma.shape(1) != K ||
         K < 1 || K > 16) {
       return nullptr;
@@ -1144,7 +1317,7 @@ mlx_array* mlx_inkling2_grouped_moe(
       return nullptr;
     }
 
-    uint32_t flags = (quant_mode == 1u ? 1u : 0u) | (quant_mode == 2u ? 64u : 0u);
+    uint32_t flags = 0u;
     if (round_bf16_before_situ) {
       flags |= 8u;
     }
@@ -1155,68 +1328,11 @@ mlx_array* mlx_inkling2_grouped_moe(
     std::vector<array> inputs = {x, idx, gamma, gu_w, gu_s, dn_w, dn_s};
     bool has_gu_aux = false;
     bool has_dn_aux = false;
-
-    if (quant_mode == 0u) {
-      // NVFP4: group_size=16, bits=4, uint8 E4M3 scales, optional F32 [E] gu_outer
-      if (gu_w.shape(2) != D / 8 || dn_w.shape(2) != I / 8 ||
-          gu_s.dtype() != uint8 || dn_s.dtype() != uint8 ||
-          gu_s.shape() != Shape{E, N2, D / 16} ||
-          dn_s.shape() != Shape{E, D, I / 16}) {
-        return nullptr;
-      }
-      if (gu_aux_ptr) {
-        const auto& gu_outer = *reinterpret_cast<array*>(gu_aux_ptr);
-        if (gu_outer.ndim() != 1 || gu_outer.shape(0) != E || gu_outer.dtype() != float32) {
-          return nullptr;
-        }
-        flags |= 2u;
-        has_gu_aux = true;
-        inputs.push_back(gu_outer);
-      }
-    } else if (quant_mode == 1u) {
-      // Q8_0: either exact symmetric (native Float16 scales, biases == nullptr)
-      // or affine (BF16/F32 scales & biases), group_size=32, bits=8.
-      if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
-          gu_s.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32}) {
-        return nullptr;
-      }
-      if (!gu_aux_ptr && !dn_aux_ptr) {
-        if (gu_s.dtype() != float16 || dn_s.dtype() != float16) {
-          return nullptr;
-        }
-        flags |= 128u;
-      } else {
-        if (!gu_aux_ptr || !dn_aux_ptr) {
-          return nullptr;
-        }
-        const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
-        const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
-        const Dtype sc_dt = gu_s.dtype();
-        if ((sc_dt != bfloat16 && sc_dt != float32) ||
-            dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
-          return nullptr;
-        }
-        if (gu_b.shape() != Shape{E, N2, D / 32} ||
-            dn_b.shape() != Shape{E, D, I / 32}) {
-          return nullptr;
-        }
-        if (sc_dt == float32) {
-          flags |= 4u;
-        }
-        has_gu_aux = true;
-        has_dn_aux = true;
-        inputs.push_back(gu_b);
-        inputs.push_back(dn_b);
-      }
-    } else {
-      // MXFP8: group_size=32, bits=8, uint8 UE8M0 scales, no biases/outer_scale
-      if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
-          gu_s.dtype() != uint8 || dn_s.dtype() != uint8 ||
-          gu_s.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32}) {
-        return nullptr;
-      }
+    if (!validate_and_append_quant_args(
+            E, N2, D, I, gu_quant_mode, dn_quant_mode,
+            gu_w, gu_s, gu_aux_ptr, dn_w, dn_s, dn_aux_ptr,
+            flags, has_gu_aux, has_dn_aux, inputs)) {
+      return nullptr;
     }
 
     Inkling2MoeParams p{};
@@ -1229,12 +1345,13 @@ mlx_array* mlx_inkling2_grouped_moe(
     p.gate_softcap = gate_softcap;
     p.up_softcap = up_softcap;
     p.flags = flags;
-    p.col_cutoff = (quant_mode == 2u || !metal::is_nax_available() || T <= 32)
+    p.col_cutoff = (simd_only_quant || !metal::is_nax_available() || T <= 32)
         ? static_cast<uint32_t>(T * K)
         : (p.tile_rows == 8u) ? 4u : 2u;
 
     auto s = to_stream(Device::gpu);
-    auto prim = std::make_shared<Inkling2GroupedMoe>(s, p, has_gu_aux, has_dn_aux);
+    auto prim = std::make_shared<Inkling2GroupedMoe>(
+        s, p, gu_quant_mode, dn_quant_mode, has_gu_aux, has_dn_aux);
     auto res = array(x.shape(), bfloat16, std::move(prim), std::move(inputs));
     return reinterpret_cast<mlx_array*>(new array(std::move(res)));
   } catch (const std::exception& e) {
@@ -1245,7 +1362,7 @@ mlx_array* mlx_inkling2_grouped_moe(
   (void)x_ptr; (void)top_k_indices_ptr; (void)gamma_ptr;
   (void)gu_w_ptr; (void)gu_s_ptr; (void)gu_aux_ptr;
   (void)dn_w_ptr; (void)dn_s_ptr; (void)dn_aux_ptr;
-  (void)quant_mode; (void)interleaved_gate_up;
+  (void)gu_quant_mode; (void)dn_quant_mode; (void)interleaved_gate_up;
   (void)gate_softcap; (void)up_softcap; (void)round_bf16_before_situ;
   return nullptr;
 #endif
@@ -1272,7 +1389,8 @@ bool mlx_inkling2_grouped_moe_fused(
     bool packed_hist,
     uint32_t top_k,
     float route_scale,
-    uint32_t quant_mode,
+    uint32_t gu_quant_mode,
+    uint32_t dn_quant_mode,
     bool interleaved_gate_up,
     float gate_softcap,
     float up_softcap,
@@ -1289,7 +1407,7 @@ bool mlx_inkling2_grouped_moe_fused(
   if (!x_ptr || !router_logits_ptr || !gu_w_ptr || !gu_s_ptr ||
       !dn_w_ptr || !dn_s_ptr || !post_conv_w_ptr || !hists_ptr ||
       !out_y || !out_history || (emit_tape && !out_tape) ||
-      num_seqs == 0u || quant_mode > 2u) {
+      num_seqs == 0u || gu_quant_mode > 3u || dn_quant_mode > 2u) {
     return false;
   }
   const uint32_t expected_hists = packed_hist ? 1u : num_seqs;
@@ -1364,7 +1482,7 @@ bool mlx_inkling2_grouped_moe_fused(
       return false;
     }
 
-    uint32_t flags = (quant_mode == 1u ? 1u : 0u) | (quant_mode == 2u ? 64u : 0u);
+    uint32_t flags = 0u;
     if (round_bf16_before_situ) {
       flags |= 8u;
     }
@@ -1392,63 +1510,11 @@ bool mlx_inkling2_grouped_moe_fused(
 
     bool has_gu_aux = false;
     bool has_dn_aux = false;
-    if (quant_mode == 0u) {
-      if (gu_w.shape(2) != D / 8 || dn_w.shape(2) != I / 8 ||
-          gu_s.dtype() != uint8 || dn_s.dtype() != uint8 ||
-          gu_s.shape() != Shape{E, N2, D / 16} ||
-          dn_s.shape() != Shape{E, D, I / 16}) {
-        return false;
-      }
-      if (gu_aux_ptr) {
-        const auto& gu_outer = *reinterpret_cast<array*>(gu_aux_ptr);
-        if (gu_outer.ndim() != 1 || gu_outer.shape(0) != E || gu_outer.dtype() != float32) {
-          return false;
-        }
-        flags |= 2u;
-        has_gu_aux = true;
-        inputs.push_back(gu_outer);
-      }
-    } else if (quant_mode == 1u) {
-      if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
-          gu_s.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32}) {
-        return false;
-      }
-      if (!gu_aux_ptr && !dn_aux_ptr) {
-        if (gu_s.dtype() != float16 || dn_s.dtype() != float16) {
-          return false;
-        }
-        flags |= 128u;
-      } else {
-        if (!gu_aux_ptr || !dn_aux_ptr) {
-          return false;
-        }
-        const auto& gu_b = *reinterpret_cast<array*>(gu_aux_ptr);
-        const auto& dn_b = *reinterpret_cast<array*>(dn_aux_ptr);
-        const Dtype sc_dt = gu_s.dtype();
-        if ((sc_dt != bfloat16 && sc_dt != float32) ||
-            dn_s.dtype() != sc_dt || gu_b.dtype() != sc_dt || dn_b.dtype() != sc_dt) {
-          return false;
-        }
-        if (gu_b.shape() != Shape{E, N2, D / 32} ||
-            dn_b.shape() != Shape{E, D, I / 32}) {
-          return false;
-        }
-        if (sc_dt == float32) {
-          flags |= 4u;
-        }
-        has_gu_aux = true;
-        has_dn_aux = true;
-        inputs.push_back(gu_b);
-        inputs.push_back(dn_b);
-      }
-    } else {
-      if (gu_w.shape(2) != D / 4 || dn_w.shape(2) != I / 4 ||
-          gu_s.dtype() != uint8 || dn_s.dtype() != uint8 ||
-          gu_s.shape() != Shape{E, N2, D / 32} ||
-          dn_s.shape() != Shape{E, D, I / 32}) {
-        return false;
-      }
+    if (!validate_and_append_quant_args(
+            E, N2, D, I, gu_quant_mode, dn_quant_mode,
+            gu_w, gu_s, gu_aux_ptr, dn_w, dn_s, dn_aux_ptr,
+            flags, has_gu_aux, has_dn_aux, inputs)) {
+      return false;
     }
 
     const bool has_res = residual_ptr != nullptr;
@@ -1508,6 +1574,8 @@ bool mlx_inkling2_grouped_moe_fused(
     auto prim = std::make_shared<Inkling2GroupedMoeFused>(
         s,
         p,
+        gu_quant_mode,
+        dn_quant_mode,
         route_scale,
         num_seqs,
         std::move(cu_seqlens),
@@ -1543,7 +1611,7 @@ bool mlx_inkling2_grouped_moe_fused(
   (void)gu_w_ptr; (void)gu_s_ptr; (void)gu_aux_ptr; (void)dn_w_ptr; (void)dn_s_ptr; (void)dn_aux_ptr;
   (void)post_conv_w_ptr; (void)residual_ptr; (void)cu_seqlens_host; (void)cu_seqlens_len; (void)hists_ptr;
   (void)num_hists; (void)num_seqs; (void)packed_hist; (void)top_k; (void)route_scale;
-  (void)quant_mode; (void)interleaved_gate_up;
+  (void)gu_quant_mode; (void)dn_quant_mode; (void)interleaved_gate_up;
   (void)gate_softcap; (void)up_softcap; (void)round_bf16_before_situ; (void)emit_tape;
   (void)router_input_is_weight;
   return false;

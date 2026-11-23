@@ -5,7 +5,7 @@
 #include <cstdint>
 #endif
 
-// Shared ABI between crates/mlx-sys/src/mlx_inkling2_moe.cpp and
+// Shared ABI between crates/mlx-sys/src/metal/mlx_inkling2_moe.cpp and
 // crates/mlx-sys/src/metal/inkling2/inkling2_moe.metal.
 struct Inkling2MoeTile {
   uint32_t expert;
@@ -33,13 +33,13 @@ struct Inkling2MoeParams {
   float gate_softcap;    // 4.0f
   float up_softcap;      // 25.0f
   // flags:
-  //   bit 0 (1u):   is_q8 (1 = Q8_0 affine/sym g32)
+  //   bit 0 (1u):   gu_simd_8col (1 = gate_up SIMD uses 8 cols/TG: Q8_0, MXFP8, Q5_K; 0 = 4 cols/TG: NVFP4)
   //   bit 1 (2u):   has_gu_outer_scale (NVFP4 per-expert F32 outer scale on gate_up)
   //   bit 2 (4u):   q8_sidecar_is_f32 (0 = BF16 scales/biases, 1 = F32 scales/biases)
   //   bit 3 (8u):   gu_round_bf16_before_situ (1 = match MLX gather_qmm BF16 boundary)
   //   bit 4 (16u):  direct_gather (1 = SIMD gate_up reads x[routes[r]] directly, skipping gather)
   //   bit 5 (32u):  interleaved_gate_up (0 = split [gate(0..I), up(I..2I)], 1 = interleaved [2*j, 2*j+1])
-  //   bit 6 (64u):  is_mxfp8 (1 = MXFP8 E4M3FN + UE8M0 g32)
+  //   bit 6 (64u):  dn_simd_16col (1 = down SIMD uses 16 cols/TG: Q8_0, MXFP8; 0 = 8 cols/TG: NVFP4)
   //   bit 7 (128u): q8_symmetric_f16 (1 = Q8_0 symmetric: native Float16 scales, no biases, w = s*(u8^0x80))
   uint32_t flags;
   uint32_t col_cutoff;   // tiles with rows <= col_cutoff (<= 8) use 0-smem SIMD; > use 4-SG NAX
@@ -56,12 +56,13 @@ struct Inkling2MoeRouteGroupParams {
   uint32_t tile_rows;     // 8
   float route_scale;      // 8.0f
   // flags:
-  //   bit 0 (1u):  is_8bit (Q8_0 or MXFP8)
+  //   bit 0 (1u):  gu_simd_8col (1 = gate_up SIMD uses 8 cols/TG: Q8_0, MXFP8, Q5_K; 0 = 4 cols/TG: NVFP4)
   //   bit 1 (2u):  logits_f32 (1 = F32, 0 = BF16)
   //   bit 2 (4u):  has_bias
   //   bit 3 (8u):  bias_f32
   //   bit 4 (16u): has_down_scale
   //   bit 5 (32u): down_scale_f32
+  //   bit 6 (64u): dn_simd_16col (1 = down SIMD uses 16 cols/TG: Q8_0, MXFP8; 0 = 8 cols/TG: NVFP4)
   uint32_t flags;
   uint32_t col_cutoff;
   uint32_t max_tiles;

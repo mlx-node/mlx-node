@@ -1152,9 +1152,10 @@ pub enum Inkling2MoeQuantMode {
     Nvfp4 = 0,
     Q8 = 1,
     Mxfp8 = 2,
+    Q5k = 3,
 }
 
-/// Check whether Inkling2 grouped/fused NVFP4/Q8_0/MXFP8 MoE Metal kernels are available for `rows`.
+/// Check whether Inkling2 grouped/fused NVFP4/Q8_0/MXFP8/Q5_K MoE Metal kernels are available for `rows`.
 pub fn inkling2_grouped_moe_available(rows: usize) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -1167,9 +1168,8 @@ pub fn inkling2_grouped_moe_available(rows: usize) -> bool {
     }
 }
 
-/// Grouped/fused Inkling2 NVFP4 (`group_size=16`, `uint8` E4M3 scales + optional F32 `[E]`
-/// `gu_outer_scale`), Q8_0 affine (`group_size=32`, BF16/F32 scales & biases), or MXFP8
-/// (`group_size=32`, `uint8` UE8M0 scales) MoE forward.
+/// Grouped/fused Inkling2 MoE forward with independent `gu_quant_mode` (`Nvfp4`, `Q8`, `Mxfp8`, `Q5k`)
+/// and `dn_quant_mode` (`Nvfp4`, `Q8`, `Mxfp8`).
 ///
 /// Executes:
 /// - `T == 1`: zero-gather fused `m1_gate_up_situ` -> `m1_down_combine` (2 dispatches!)
@@ -1186,7 +1186,8 @@ pub fn inkling2_grouped_moe(
     dn_w: &MxArray,
     dn_s: &MxArray,
     dn_aux: Option<&MxArray>,
-    quant_mode: Inkling2MoeQuantMode,
+    gu_quant_mode: Inkling2MoeQuantMode,
+    dn_quant_mode: Inkling2MoeQuantMode,
     interleaved_gate_up: bool,
     gate_softcap: f32,
     up_softcap: f32,
@@ -1204,7 +1205,8 @@ pub fn inkling2_grouped_moe(
             dn_w.as_raw_ptr(),
             dn_s.as_raw_ptr(),
             dn_aux.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
-            quant_mode as u32,
+            gu_quant_mode as u32,
+            dn_quant_mode as u32,
             interleaved_gate_up,
             gate_softcap,
             up_softcap,
@@ -1238,7 +1240,8 @@ pub fn inkling2_grouped_moe_fused(
     packed_hist: bool,
     top_k: usize,
     route_scale: f32,
-    quant_mode: Inkling2MoeQuantMode,
+    gu_quant_mode: Inkling2MoeQuantMode,
+    dn_quant_mode: Inkling2MoeQuantMode,
     interleaved_gate_up: bool,
     gate_softcap: f32,
     up_softcap: f32,
@@ -1316,7 +1319,8 @@ pub fn inkling2_grouped_moe_fused(
             packed_hist,
             top_k_u32,
             route_scale,
-            quant_mode as u32,
+            gu_quant_mode as u32,
+            dn_quant_mode as u32,
             interleaved_gate_up,
             gate_softcap,
             up_softcap,
@@ -1357,13 +1361,15 @@ mod tests {
 
     struct Rng(u64);
     impl Rng {
-        fn next_f32(&mut self) -> f32 {
+        fn next_u64(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^= z >> 31;
-            (z >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            z ^ (z >> 31)
+        }
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
         }
         fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
             (0..n).map(|_| self.next_f32() * scale).collect()
@@ -3611,6 +3617,7 @@ mod tests {
                     &nv_dn_s,
                     None,
                     Inkling2MoeQuantMode::Nvfp4,
+                    Inkling2MoeQuantMode::Nvfp4,
                     interleaved,
                     gate_cap,
                     up_cap,
@@ -3640,6 +3647,7 @@ mod tests {
                     &q8_dn_w,
                     &q8_dn_s,
                     Some(&q8_dn_b),
+                    Inkling2MoeQuantMode::Q8,
                     Inkling2MoeQuantMode::Q8,
                     interleaved,
                     gate_cap,
@@ -3671,6 +3679,7 @@ mod tests {
                     &q8s_dn_s,
                     None,
                     Inkling2MoeQuantMode::Q8,
+                    Inkling2MoeQuantMode::Q8,
                     interleaved,
                     gate_cap,
                     up_cap,
@@ -3701,6 +3710,7 @@ mod tests {
                         &mx_dn_w,
                         &mx_dn_s,
                         None,
+                        Inkling2MoeQuantMode::Mxfp8,
                         Inkling2MoeQuantMode::Mxfp8,
                         interleaved,
                         gate_cap,
@@ -3874,6 +3884,7 @@ mod tests {
                     (Inkling2MoeQuantMode::Mxfp8, _) => {
                         (&mx_gu_w, &mx_gu_s, None, &mx_dn_w, &mx_dn_s, None, None)
                     }
+                    (Inkling2MoeQuantMode::Q5k, _) => unreachable!(),
                 };
 
                 for &interleaved in &[false, true] {
@@ -3896,6 +3907,7 @@ mod tests {
                         dn_w,
                         dn_s,
                         dn_aux,
+                        quant_mode,
                         quant_mode,
                         interleaved,
                         gate_cap,
@@ -3938,6 +3950,7 @@ mod tests {
                                 false,
                                 top_k,
                                 route_scale,
+                                quant_mode,
                                 quant_mode,
                                 interleaved,
                                 gate_cap,
@@ -3994,6 +4007,7 @@ mod tests {
                             false,
                             top_k,
                             route_scale,
+                            quant_mode,
                             quant_mode,
                             interleaved,
                             gate_cap,
@@ -5170,6 +5184,7 @@ mod tests {
             1,
             1.0,
             Inkling2MoeQuantMode::Nvfp4,
+            Inkling2MoeQuantMode::Nvfp4,
             false,
             0.0,
             0.0,
@@ -5199,6 +5214,7 @@ mod tests {
             false,
             1,
             1.0,
+            Inkling2MoeQuantMode::Nvfp4,
             Inkling2MoeQuantMode::Nvfp4,
             false,
             0.0,
@@ -5230,6 +5246,7 @@ mod tests {
             1,
             1.0,
             Inkling2MoeQuantMode::Nvfp4,
+            Inkling2MoeQuantMode::Nvfp4,
             false,
             0.0,
             0.0,
@@ -5259,6 +5276,7 @@ mod tests {
             true,
             1,
             1.0,
+            Inkling2MoeQuantMode::Nvfp4,
             Inkling2MoeQuantMode::Nvfp4,
             false,
             0.0,
@@ -5302,6 +5320,7 @@ mod tests {
                 false,
                 1,
                 1.0,
+                Inkling2MoeQuantMode::Nvfp4,
                 Inkling2MoeQuantMode::Nvfp4,
                 false,
                 0.0,
@@ -6124,6 +6143,7 @@ mod tests {
             &q8_dn_s_f16,
             None,
             Inkling2MoeQuantMode::Q8,
+            Inkling2MoeQuantMode::Q8,
             false,
             gate_cap,
             up_cap,
@@ -6152,6 +6172,7 @@ mod tests {
             &mx_dn_s,
             None,
             Inkling2MoeQuantMode::Mxfp8,
+            Inkling2MoeQuantMode::Mxfp8,
             false,
             gate_cap,
             up_cap,
@@ -6167,6 +6188,407 @@ mod tests {
             mx_diff <= 0.15,
             "MXFP8 repeated-expert (>32 routes) max_abs_diff={mx_diff}"
         );
+    }
+
+    #[test]
+    fn inkling2_grouped_moe_q5k_gate_up_q8_down_matches_reference() {
+        if !inkling2_grouped_moe_available(1) {
+            return;
+        }
+        use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, QuantizedSwitchLinear};
+
+        let mut rng = Rng(0x05CA_1E05);
+        let d = 512usize; // 2 super-blocks of 256 (16 sub-blocks of 32)
+        let inter = 128usize;
+        let e = 16usize;
+        let top_k = 4usize;
+        let gate_cap = 4.0_f32;
+        let up_cap = 25.0_f32;
+        let route_scale = 8.0_f32;
+
+        // Quantize realistic zero-centered weights (~Uniform[-0.15, 0.15]) into RowMajor Q5_K:
+        //   gu_w: [E, 2*I, (D/32)*5] uint32 (5-bit codes packed LSB-first)
+        //   gu_s: [E, 2*I, (D/32)*2] uint8  ((sc, m) pairs in 0..63)
+        //   gu_b: [E, 2*I, (D/256)*2] float16 ((d, dmin) per 256-elem super-block)
+        let n2 = 2 * inter;
+        let n_groups = d / 32;
+        let n_super = d / 256;
+        let mut q5_w = vec![0u32; e * n2 * n_groups * 5];
+        let mut q5_s = vec![0u8; e * n2 * n_groups * 2];
+        let mut q5_b = vec![0.0_f32; e * n2 * n_super * 2];
+
+        for row in 0..(e * n2) {
+            for sb in 0..n_super {
+                let d_val = 0.00015 + (rng.next_u64() % 10) as f32 * 0.00002;
+                let dmin_val = d_val * 15.5;
+                q5_b[(row * n_super + sb) * 2] = d_val;
+                q5_b[(row * n_super + sb) * 2 + 1] = dmin_val;
+                for u in 0..8usize {
+                    let g = sb * 8 + u;
+                    let sc = 10u8 + (rng.next_u64() % 45) as u8;
+                    let m = sc; // zero-centered: d*sc*15.5 - dmin*m == 0
+                    q5_s[(row * n_groups + g) * 2] = sc;
+                    q5_s[(row * n_groups + g) * 2 + 1] = m;
+
+                    let mut words = [0u32; 5];
+                    for i in 0..32usize {
+                        let code = (rng.next_u64() & 31) as u32;
+                        let bit = i * 5;
+                        let wi = bit / 32;
+                        let bo = bit % 32;
+                        words[wi] |= code << bo;
+                        if bo + 5 > 32 {
+                            words[wi + 1] |= code >> (32 - bo);
+                        }
+                    }
+                    let base = (row * n_groups + g) * 5;
+                    q5_w[base..base + 5].copy_from_slice(&words);
+                }
+            }
+        }
+
+        let gu_w =
+            MxArray::from_uint32(&q5_w, &[e as i64, n2 as i64, (n_groups * 5) as i64]).unwrap();
+        let gu_s =
+            MxArray::from_uint8(&q5_s, &[e as i64, n2 as i64, (n_groups * 2) as i64]).unwrap();
+        let gu_b = MxArray::from_float32(&q5_b, &[e as i64, n2 as i64, (n_super * 2) as i64])
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        let q5k_gu_lin = QuantizedSwitchLinear::new(
+            gu_w.clone(),
+            gu_s.clone(),
+            Some(gu_b.clone()),
+            32,
+            5,
+            "q5k".to_string(),
+        );
+
+        // Quantize Q8_0 down_proj (both symmetric Float16 and affine BF16)
+        let dn_w_f32 = MxArray::from_float32(
+            &rng.vec(e * d * inter, 0.3),
+            &[e as i64, d as i64, inter as i64],
+        )
+        .unwrap();
+        let mut out_q = std::ptr::null_mut();
+        let mut out_s = std::ptr::null_mut();
+        let mut out_b = std::ptr::null_mut();
+        unsafe {
+            mlx_sys::mlx_quantize(
+                dn_w_f32.as_raw_ptr(),
+                32,
+                8,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            );
+        }
+        let dn_w = MxArray::from_handle(out_q, "dn_q").unwrap();
+        let dn_s_bf16 = MxArray::from_handle(out_s, "dn_s")
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let dn_b_bf16 = MxArray::from_handle(out_b, "dn_b")
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let dn_s_f16 = dn_s_bf16.astype(DType::Float16).unwrap();
+        let dn_b_sym = dn_s_f16
+            .astype(DType::Float32)
+            .unwrap()
+            .mul_scalar(-128.0)
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+
+        let q8_dn_aff = QuantizedSwitchLinear::new(
+            dn_w.clone(),
+            dn_s_bf16.clone(),
+            Some(dn_b_bf16.clone()),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let mut q8_dn_sym = QuantizedSwitchLinear::new(
+            dn_w.clone(),
+            dn_s_f16.clone(),
+            Some(dn_b_sym),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        assert!(q8_dn_sym.try_compact_symmetric_q8_f16().unwrap());
+
+        let router_w = MxArray::from_float32(&rng.vec(e * d, 0.2), &[e as i64, d as i64]).unwrap();
+        let router_bias = MxArray::from_float32(&rng.vec(e, 0.25), &[e as i64]).unwrap();
+        let post_conv_w = MxArray::from_float32(&rng.vec(d * 4, 0.35), &[d as i64, 4]).unwrap();
+
+        let err_stats = |a: &[f32], b: &[f32]| -> (f32, f32, f32) {
+            let mut max_abs = 0.0_f32;
+            let mut max_rel = 0.0_f32;
+            let mut sum_sq = 0.0_f64;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                let abs_e = (x - y).abs();
+                let denom = x.abs().max(y.abs()).max(1.0_f32);
+                max_abs = max_abs.max(abs_e);
+                max_rel = max_rel.max(abs_e / denom);
+                sum_sq += f64::from(abs_e) * f64::from(abs_e);
+            }
+            let rmse = (sum_sq / a.len().max(1) as f64).sqrt() as f32;
+            (max_abs, max_rel, rmse)
+        };
+
+        let cases: &[(usize, &[usize])] = &[
+            (1, &[0, 1]),
+            (4, &[0, 1, 2, 3, 4]),
+            (8, &[0, 8]),
+            (16, &[0, 4, 8, 12, 16]),
+            (32, &[0, 8, 16, 24, 32]),
+        ];
+
+        for &(rows, cu) in cases {
+            assert!(inkling2_grouped_moe_available(rows));
+            let num_seqs = cu.len() - 1;
+            let x = MxArray::from_float32(&rng.vec(rows * d, 0.7), &[rows as i64, d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let logits = inkling2_moe_router_proj(&x, &router_w).unwrap();
+            let (topk, gamma) =
+                inkling2_moe_route(&logits, Some(&router_bias), None, top_k, route_scale).unwrap();
+            let res = MxArray::from_float32(&rng.vec(rows * d, 0.5), &[rows as i64, d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let cu_i32: Vec<i32> = cu.iter().map(|&v| v as i32).collect();
+            let cu_arr = MxArray::from_int32(&cu_i32, &[cu_i32.len() as i64]).unwrap();
+            let hists: Vec<MxArray> = (0..num_seqs)
+                .map(|_| {
+                    MxArray::from_float32(&rng.vec(3 * d, 0.4), &[3, d as i64])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                })
+                .collect();
+            let h_refs: Vec<&MxArray> = hists.iter().collect();
+
+            for &sym_dn in &[true, false] {
+                let (dn_lin, dn_s, dn_aux) = if sym_dn {
+                    (&q8_dn_sym, &dn_s_f16, None)
+                } else {
+                    (&q8_dn_aff, &dn_s_bf16, Some(&dn_b_bf16))
+                };
+
+                for &interleaved in &[false, true] {
+                    // 1. Exact FP32 Q5_K reference (matches llama.cpp / q5k_qmv_fast without BF16 weight staging)
+                    //    + MLX K-quant Q5_K gather_qmm reference
+                    let x_4d = x.reshape(&[rows as i64, 1, 1, d as i64]).unwrap();
+                    let gu_out = q5k_gu_lin
+                        .forward_without_outer_scale(&x_4d, &topk, false)
+                        .unwrap();
+                    let act = inkling2_situ(&gu_out, None, gate_cap, up_cap, interleaved).unwrap();
+                    let dn_out = dn_lin
+                        .forward_without_outer_scale(&act, &topk, false)
+                        .unwrap();
+                    let ref_moe =
+                        inkling2_moe_combine(&dn_out, &gamma, None, DType::BFloat16).unwrap();
+
+                    // Exact FP32 Q5_K gate_up -> BF16 -> inkling2_situ -> dn_lin -> combine
+                    let x_f = x.to_float32().unwrap();
+                    let topk_i = topk.to_int32().unwrap();
+                    let mut exact_gu = vec![0.0_f32; rows * top_k * n2];
+                    for r in 0..rows {
+                        let xr = &x_f[r * d..(r + 1) * d];
+                        for slot in 0..top_k {
+                            let ex = topk_i[r * top_k + slot] as usize;
+                            for col in 0..n2 {
+                                let row_idx = ex * n2 + col;
+                                let mut acc = 0.0_f32;
+                                for sb in 0..n_super {
+                                    let d_v =
+                                        half::f16::from_f32(q5_b[(row_idx * n_super + sb) * 2])
+                                            .to_f32();
+                                    let dm_v =
+                                        half::f16::from_f32(q5_b[(row_idx * n_super + sb) * 2 + 1])
+                                            .to_f32();
+                                    for u in 0..8 {
+                                        let g = sb * 8 + u;
+                                        let sc = q5_s[(row_idx * n_groups + g) * 2] as f32;
+                                        let m = q5_s[(row_idx * n_groups + g) * 2 + 1] as f32;
+                                        let s = d_v * sc;
+                                        let b = -(dm_v * m);
+                                        let base = (row_idx * n_groups + g) * 5;
+                                        let w = &q5_w[base..base + 5];
+                                        for i in 0..32 {
+                                            let bit = i * 5;
+                                            let wi = bit / 32;
+                                            let bo = bit % 32;
+                                            let mut code = (w[wi] >> bo) & 31;
+                                            if bo + 5 > 32 {
+                                                code |= (w[wi + 1] << (32 - bo)) & 31;
+                                            }
+                                            acc += (s * code as f32 + b) * xr[g * 32 + i];
+                                        }
+                                    }
+                                }
+                                exact_gu[(r * top_k + slot) * n2 + col] = acc;
+                            }
+                        }
+                    }
+                    let exact_gu_arr = MxArray::from_float32(
+                        &exact_gu,
+                        &[rows as i64, top_k as i64, 1, n2 as i64],
+                    )
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                    let exact_act =
+                        inkling2_situ(&exact_gu_arr, None, gate_cap, up_cap, interleaved).unwrap();
+                    let exact_dn = dn_lin
+                        .forward_without_outer_scale(&exact_act, &topk, false)
+                        .unwrap();
+                    let exact_moe =
+                        inkling2_moe_combine(&exact_dn, &gamma, None, DType::BFloat16).unwrap();
+
+                    // 2. Grouped MoE (`Q5k` gate_up + `Q8` down) vs exact FP32 Q5_K & MLX K-quant reference
+                    let got_moe = inkling2_grouped_moe(
+                        &x,
+                        &topk,
+                        &gamma,
+                        &gu_w,
+                        &gu_s,
+                        Some(&gu_b),
+                        &dn_w,
+                        dn_s,
+                        dn_aux,
+                        Inkling2MoeQuantMode::Q5k,
+                        Inkling2MoeQuantMode::Q8,
+                        interleaved,
+                        gate_cap,
+                        up_cap,
+                        true,
+                    )
+                    .unwrap();
+                    let got_v = got_moe.to_float32().unwrap();
+                    let exact_v = exact_moe.to_float32().unwrap();
+                    let ref_v = ref_moe.to_float32().unwrap();
+                    let (ex_abs, ex_rel, ex_rmse) = err_stats(got_v.as_ref(), exact_v.as_ref());
+                    let (mlx_abs, mlx_rel, mlx_rmse) = err_stats(got_v.as_ref(), ref_v.as_ref());
+                    eprintln!(
+                        "  [grouped_moe Q5K+Q8 sym={sym_dn} il={interleaved} M={rows:2}] vs_exact(abs={ex_abs:.5}, rel={ex_rel:.5}, rmse={ex_rmse:.6}) | vs_mlx_kq(abs={mlx_abs:.5}, rel={mlx_rel:.5}, rmse={mlx_rmse:.6})"
+                    );
+                    assert!(
+                        ex_rmse <= 0.005 && ex_rel <= 0.02,
+                        "Q5_K+Q8 grouped MoE vs exact FP32 mismatch (sym={sym_dn}, il={interleaved}, M={rows}): max_abs={ex_abs}, max_rel={ex_rel}, rmse={ex_rmse}"
+                    );
+                    // MLX K-quant gather_qmm stages Q5_K weights through BF16 (dequantize_to<bfloat16_t>),
+                    // so it carries ~0.5% BF16 weight rounding noise (~0.03 RMSE at route_scale=8).
+                    assert!(
+                        mlx_rmse <= 0.05 && mlx_rel <= 0.25,
+                        "Q5_K+Q8 grouped MoE vs MLX K-quant mismatch (sym={sym_dn}, il={interleaved}, M={rows}): max_abs={mlx_abs}, max_rel={mlx_rel}, rmse={mlx_rmse}"
+                    );
+
+                    // 3. Fused MoE (`Q5k` gate_up + `Q8` down) bit-exact vs unfused grouped MoE + sconv
+                    let (y_ref, hist_ref) = inkling2_sconv_k4_ragged(
+                        &got_moe,
+                        &post_conv_w,
+                        None,
+                        if num_seqs > 1 { Some(&cu_arr) } else { None },
+                        Some(&res),
+                        None,
+                        &h_refs,
+                        num_seqs,
+                        false,
+                    )
+                    .unwrap();
+                    let (y_got, hist_got, tape_got) = inkling2_grouped_moe_fused(
+                        &x,
+                        &router_w,
+                        Some(&router_bias),
+                        None,
+                        &gu_w,
+                        &gu_s,
+                        Some(&gu_b),
+                        &dn_w,
+                        dn_s,
+                        dn_aux,
+                        &post_conv_w,
+                        Some(&res),
+                        cu,
+                        &h_refs,
+                        num_seqs,
+                        false,
+                        top_k,
+                        route_scale,
+                        Inkling2MoeQuantMode::Q5k,
+                        Inkling2MoeQuantMode::Q8,
+                        interleaved,
+                        gate_cap,
+                        up_cap,
+                        true,
+                        true,
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        y_got.to_float32().unwrap().as_ref(),
+                        y_ref.to_float32().unwrap().as_ref(),
+                        "Q5_K+Q8 fused y mismatch (sym={sym_dn}, il={interleaved}, M={rows})"
+                    );
+                    assert_eq!(
+                        hist_got.to_float32().unwrap().as_ref(),
+                        hist_ref.to_float32().unwrap().as_ref(),
+                        "Q5_K+Q8 fused hist mismatch (sym={sym_dn}, il={interleaved}, M={rows})"
+                    );
+                    assert_eq!(
+                        tape_got.unwrap().to_float32().unwrap().as_ref(),
+                        got_moe.to_float32().unwrap().as_ref(),
+                        "Q5_K+Q8 fused tape mismatch (sym={sym_dn}, il={interleaved}, M={rows})"
+                    );
+
+                    // 4. M=1 vs M>1 batch-size bit-exact invariance!
+                    if rows > 1 {
+                        let x0 = x.slice(&[0, 0], &[1, d as i64]).unwrap();
+                        let r0 = res.slice(&[0, 0], &[1, d as i64]).unwrap();
+                        let (y0, _, _) = inkling2_grouped_moe_fused(
+                            &x0,
+                            &router_w,
+                            Some(&router_bias),
+                            None,
+                            &gu_w,
+                            &gu_s,
+                            Some(&gu_b),
+                            &dn_w,
+                            dn_s,
+                            dn_aux,
+                            &post_conv_w,
+                            Some(&r0),
+                            &[0, 1],
+                            &[&hists[0]],
+                            1,
+                            false,
+                            top_k,
+                            route_scale,
+                            Inkling2MoeQuantMode::Q5k,
+                            Inkling2MoeQuantMode::Q8,
+                            interleaved,
+                            gate_cap,
+                            up_cap,
+                            true,
+                            false,
+                            true,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            &y_got.to_float32().unwrap()[..d],
+                            y0.to_float32().unwrap().as_ref(),
+                            "Q5_K+Q8 M=1 vs M={rows} batch invariance failed (sym={sym_dn}, il={interleaved})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

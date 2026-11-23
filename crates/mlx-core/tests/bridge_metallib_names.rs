@@ -204,10 +204,10 @@ fn a_paged_prefill_pipeline_failure_names_the_gpu_family() {
 }
 
 /// 4 Inkling2 MPP prefill kernels + 46 fused elementwise/conv/AttnRes/LoopCtrl/MoE/softcap/markov/bf16-linear/q8-sym/kv-prep-paged kernels
-/// + 28 grouped/fused MoE kernels (`inkling2_*` prefix: NVFP4, Q8_0, and MXFP8).
-const INKLING2_PREFIX_NAMES: i64 = 4 + 46 + 28;
+/// + 30 grouped/fused MoE kernels (`inkling2_*` prefix: NVFP4, Q8_0, MXFP8, and Q5_K).
+const INKLING2_PREFIX_NAMES: i64 = 4 + 46 + 30;
 /// Total Inkling2 pipelines built (including 7 `paged_attention_inkling2_*` decode kernels).
-const INKLING2_TOTAL_PIPELINES: i64 = 7 + 4 + 46 + 28;
+const INKLING2_TOTAL_PIPELINES: i64 = 7 + 4 + 46 + 30;
 /// 8 NAX tensor-op MoE kernels (`inkling2_moe_*_nax_*`), 3 NAX BF16 linear/lm_head kernels
 /// (`inkling2_bf16_linear_nax_m8`, `inkling2_bf16_linear_batched`,
 /// `inkling2_bf16_lm_head_softcap_argmax_p1`), and 4 NAX Q8_0 linear/lm_head kernels

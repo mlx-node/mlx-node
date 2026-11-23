@@ -1529,7 +1529,7 @@ impl Inkling2Restore {
 ///
 /// Bump whenever fused Metal kernels or projection/norm rounding order change so cached SSD
 /// prefixes produced by an older build are never adopted and extended under different arithmetic.
-const INKLING2_FORWARD_ARITH_VERSION: &str = "v3";
+const INKLING2_FORWARD_ARITH_VERSION: &str = "v4";
 
 fn query_precision_tag(int8_query_from: Option<u32>) -> String {
     match int8_query_from {
@@ -2694,6 +2694,22 @@ mod tests {
         assert_ne!(
             v2_kv, alt_kv,
             "distinct NAX/arithmetic modes must not collide"
+        );
+
+        // Changing arithmetic epoch (v3 -> current v4 after fused Q5_K MoE) must reject v3 prefixes.
+        let v3_arith = arith_tag.replacen(INKLING2_FORWARD_ARITH_VERSION, "v3", 1);
+        let v3_kv = ColdCacheFingerprint::from_components([
+            b"inkling2-path-kv:v2".as_slice(),
+            dir.to_string_lossy().as_bytes(),
+            cfg_json.as_slice(),
+            b"int8",
+            q_tag.as_bytes(),
+            v3_arith.as_bytes(),
+            &block_size.to_le_bytes(),
+        ]);
+        assert_ne!(
+            v2_kv, v3_kv,
+            "current arithmetic epoch must reject stale v3 SSD prefixes"
         );
     }
 }

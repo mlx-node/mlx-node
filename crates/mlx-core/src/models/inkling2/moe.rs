@@ -621,6 +621,172 @@ impl Inkling2MoE {
         )
     }
 
+    #[allow(clippy::type_complexity)]
+    fn resolve_grouped_moe_quant<'a>(
+        gu: &'a QuantizedSwitchLinear,
+        dn: &'a QuantizedSwitchLinear,
+        t: usize,
+        d: usize,
+    ) -> Result<
+        Option<(
+            Inkling2MoeQuantMode,
+            Option<&'a MxArray>,
+            Inkling2MoeQuantMode,
+            Option<&'a MxArray>,
+        )>,
+    > {
+        let gu_classified = if gu.mode() == NVFP4_MODE
+            && gu.bits() == 4
+            && gu.group_size() == 16
+            && gu.get_scales().dtype()? == DType::Uint8
+            && gu
+                .outer_scale()
+                .is_none_or(|s| s.dtype().ok() == Some(DType::Float32))
+        {
+            Some((Inkling2MoeQuantMode::Nvfp4, gu.outer_scale(), false, None))
+        } else if gu.mode() == DEFAULT_QUANT_MODE
+            && gu.bits() == 8
+            && gu.group_size() == 32
+            && gu.outer_scale().is_none()
+            && gu.is_symmetric_q8()
+            && gu.get_biases().is_none()
+            && gu.get_scales().dtype()? == DType::Float16
+        {
+            Some((Inkling2MoeQuantMode::Q8, None, true, None))
+        } else if gu.mode() == DEFAULT_QUANT_MODE
+            && gu.bits() == 8
+            && gu.group_size() == 32
+            && gu.outer_scale().is_none()
+            && gu.get_biases().is_some()
+        {
+            let s_dt = gu.get_scales().dtype()?;
+            if (s_dt == DType::BFloat16 || s_dt == DType::Float32)
+                && gu
+                    .get_biases()
+                    .is_some_and(|b| b.dtype().ok() == Some(s_dt))
+            {
+                Some((Inkling2MoeQuantMode::Q8, gu.get_biases(), false, Some(s_dt)))
+            } else {
+                None
+            }
+        } else if gu.mode() == MXFP8_MODE
+            && gu.bits() == 8
+            && gu.group_size() == 32
+            && gu.get_scales().dtype()? == DType::Uint8
+            && gu.outer_scale().is_none()
+            && gu.get_biases().is_none()
+        {
+            Some((Inkling2MoeQuantMode::Mxfp8, None, false, None))
+        } else if gu.mode() == "q5k"
+            && gu.bits() == 5
+            && gu.group_size() == 32
+            && d >= 256
+            && d.is_multiple_of(256)
+            && gu.outer_scale().is_none()
+            && gu.get_scales().dtype()? == DType::Uint8
+            && gu
+                .get_biases()
+                .is_some_and(|b| b.dtype().ok() == Some(DType::Float16))
+        {
+            Some((Inkling2MoeQuantMode::Q5k, gu.get_biases(), false, None))
+        } else {
+            None
+        };
+        let Some((gu_mode, gu_aux, gu_q8_sym, gu_q8_dt)) = gu_classified else {
+            return Ok(None);
+        };
+
+        let dn_classified = if dn.mode() == NVFP4_MODE
+            && dn.bits() == 4
+            && dn.group_size() == 16
+            && dn.get_scales().dtype()? == DType::Uint8
+        {
+            Some((Inkling2MoeQuantMode::Nvfp4, None, false, None))
+        } else if dn.mode() == DEFAULT_QUANT_MODE
+            && dn.bits() == 8
+            && dn.group_size() == 32
+            && dn.outer_scale().is_none()
+            && dn.is_symmetric_q8()
+            && dn.get_biases().is_none()
+            && dn.get_scales().dtype()? == DType::Float16
+        {
+            Some((Inkling2MoeQuantMode::Q8, None, true, None))
+        } else if dn.mode() == DEFAULT_QUANT_MODE
+            && dn.bits() == 8
+            && dn.group_size() == 32
+            && dn.outer_scale().is_none()
+            && dn.get_biases().is_some()
+        {
+            let s_dt = dn.get_scales().dtype()?;
+            if (s_dt == DType::BFloat16 || s_dt == DType::Float32)
+                && dn
+                    .get_biases()
+                    .is_some_and(|b| b.dtype().ok() == Some(s_dt))
+            {
+                Some((Inkling2MoeQuantMode::Q8, dn.get_biases(), false, Some(s_dt)))
+            } else {
+                None
+            }
+        } else if dn.mode() == MXFP8_MODE
+            && dn.bits() == 8
+            && dn.group_size() == 32
+            && dn.get_scales().dtype()? == DType::Uint8
+            && dn.outer_scale().is_none()
+            && dn.get_biases().is_none()
+        {
+            Some((Inkling2MoeQuantMode::Mxfp8, None, false, None))
+        } else {
+            None
+        };
+        let Some((dn_mode, dn_aux, dn_q8_sym, dn_q8_dt)) = dn_classified else {
+            return Ok(None);
+        };
+
+        if gu_mode == Inkling2MoeQuantMode::Q8
+            && dn_mode == Inkling2MoeQuantMode::Q8
+            && (gu_q8_sym != dn_q8_sym || gu_q8_dt != dn_q8_dt)
+        {
+            return Ok(None);
+        }
+        if (matches!(
+            gu_mode,
+            Inkling2MoeQuantMode::Mxfp8 | Inkling2MoeQuantMode::Q5k
+        ) || dn_mode == Inkling2MoeQuantMode::Mxfp8)
+            && t > 32
+        {
+            return Ok(None);
+        }
+        Ok(Some((gu_mode, gu_aux, dn_mode, dn_aux)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn supports_grouped_moe(&self, t: usize, d: usize, act_dtype: DType) -> bool {
+        if act_dtype != DType::BFloat16
+            || t == 0
+            || t > 8192
+            || d < 64
+            || !d.is_multiple_of(64)
+            || self.intermediate_size < 64
+            || !self.intermediate_size.is_multiple_of(64)
+            || self.num_experts == 0
+            || self.num_experts > 256
+            || self.top_k == 0
+            || self.top_k > 16
+            || !super::kernels::inkling2_grouped_moe_available(t)
+        {
+            return false;
+        }
+        let (ExpertSwitchProj::Quantized(gu), ExpertSwitchProj::Quantized(dn)) =
+            (&self.gate_up_proj, &self.down_proj)
+        else {
+            return false;
+        };
+        Self::resolve_grouped_moe_quant(gu, dn, t, d)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Attempt Stage 3 fused/grouped Metal MoE (`inkling2_grouped_moe`), returning `Ok(None)` when
     /// geometry, quant format, dtype, or device capabilities require the Stage 2 fallback.
     pub(crate) fn try_grouped_moe(
@@ -655,80 +821,12 @@ impl Inkling2MoE {
         else {
             return Ok(None);
         };
-
-        let is_nvfp4 = gu.mode() == NVFP4_MODE
-            && dn.mode() == NVFP4_MODE
-            && gu.bits() == 4
-            && dn.bits() == 4
-            && gu.group_size() == 16
-            && dn.group_size() == 16
-            && gu.get_scales().dtype()? == DType::Uint8
-            && dn.get_scales().dtype()? == DType::Uint8
-            && gu
-                .outer_scale()
-                .is_none_or(|s| s.dtype().ok() == Some(DType::Float32));
-        let is_q8_sym = gu.mode() == DEFAULT_QUANT_MODE
-            && dn.mode() == DEFAULT_QUANT_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.outer_scale().is_none()
-            && gu.is_symmetric_q8()
-            && dn.is_symmetric_q8()
-            && gu.get_biases().is_none()
-            && dn.get_biases().is_none()
-            && gu.get_scales().dtype()? == DType::Float16
-            && dn.get_scales().dtype()? == DType::Float16;
-        let is_q8_affine = gu.mode() == DEFAULT_QUANT_MODE
-            && dn.mode() == DEFAULT_QUANT_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.outer_scale().is_none()
-            && gu.get_biases().is_some()
-            && dn.get_biases().is_some()
-            && {
-                let s_dt = gu.get_scales().dtype()?;
-                (s_dt == DType::BFloat16 || s_dt == DType::Float32)
-                    && dn.get_scales().dtype()? == s_dt
-                    && gu
-                        .get_biases()
-                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
-                    && dn
-                        .get_biases()
-                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
-            };
-        let is_q8 = is_q8_sym || is_q8_affine;
-        let is_mxfp8 = gu.mode() == MXFP8_MODE
-            && dn.mode() == MXFP8_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.get_scales().dtype()? == DType::Uint8
-            && dn.get_scales().dtype()? == DType::Uint8
-            && gu.outer_scale().is_none()
-            && dn.outer_scale().is_none()
-            && gu.get_biases().is_none()
-            && dn.get_biases().is_none()
-            && t <= 32;
-        let quant_mode = if is_nvfp4 {
-            Inkling2MoeQuantMode::Nvfp4
-        } else if is_q8 {
-            Inkling2MoeQuantMode::Q8
-        } else if is_mxfp8 {
-            Inkling2MoeQuantMode::Mxfp8
-        } else {
+        let Some((gu_mode, gu_aux, dn_mode, dn_aux)) =
+            Self::resolve_grouped_moe_quant(gu, dn, t, d)?
+        else {
             return Ok(None);
         };
 
-        let (gu_aux, dn_aux) = match quant_mode {
-            Inkling2MoeQuantMode::Nvfp4 => (gu.outer_scale(), None),
-            Inkling2MoeQuantMode::Q8 => (gu.get_biases(), dn.get_biases()),
-            Inkling2MoeQuantMode::Mxfp8 => (None, None),
-        };
         let out = super::kernels::inkling2_grouped_moe(
             x,
             top_k_indices,
@@ -739,7 +837,8 @@ impl Inkling2MoE {
             dn.get_weight(),
             dn.get_scales(),
             dn_aux,
-            quant_mode,
+            gu_mode,
+            dn_mode,
             self.gate_up_interleaved,
             self.mlp_gate_softcap as f32,
             self.mlp_up_softcap as f32,
@@ -798,78 +897,10 @@ impl Inkling2MoE {
         else {
             return Ok(None);
         };
-
-        let is_nvfp4 = gu.mode() == NVFP4_MODE
-            && dn.mode() == NVFP4_MODE
-            && gu.bits() == 4
-            && dn.bits() == 4
-            && gu.group_size() == 16
-            && dn.group_size() == 16
-            && gu.get_scales().dtype()? == DType::Uint8
-            && dn.get_scales().dtype()? == DType::Uint8
-            && gu
-                .outer_scale()
-                .is_none_or(|s| s.dtype().ok() == Some(DType::Float32));
-        let is_q8_sym = gu.mode() == DEFAULT_QUANT_MODE
-            && dn.mode() == DEFAULT_QUANT_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.outer_scale().is_none()
-            && gu.is_symmetric_q8()
-            && dn.is_symmetric_q8()
-            && gu.get_biases().is_none()
-            && dn.get_biases().is_none()
-            && gu.get_scales().dtype()? == DType::Float16
-            && dn.get_scales().dtype()? == DType::Float16;
-        let is_q8_affine = gu.mode() == DEFAULT_QUANT_MODE
-            && dn.mode() == DEFAULT_QUANT_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.outer_scale().is_none()
-            && gu.get_biases().is_some()
-            && dn.get_biases().is_some()
-            && {
-                let s_dt = gu.get_scales().dtype()?;
-                (s_dt == DType::BFloat16 || s_dt == DType::Float32)
-                    && dn.get_scales().dtype()? == s_dt
-                    && gu
-                        .get_biases()
-                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
-                    && dn
-                        .get_biases()
-                        .is_some_and(|b| b.dtype().ok() == Some(s_dt))
-            };
-        let is_q8 = is_q8_sym || is_q8_affine;
-        let is_mxfp8 = gu.mode() == MXFP8_MODE
-            && dn.mode() == MXFP8_MODE
-            && gu.bits() == 8
-            && dn.bits() == 8
-            && gu.group_size() == 32
-            && dn.group_size() == 32
-            && gu.get_scales().dtype()? == DType::Uint8
-            && dn.get_scales().dtype()? == DType::Uint8
-            && gu.outer_scale().is_none()
-            && dn.outer_scale().is_none()
-            && gu.get_biases().is_none()
-            && dn.get_biases().is_none();
-        let quant_mode = if is_nvfp4 {
-            Inkling2MoeQuantMode::Nvfp4
-        } else if is_q8 {
-            Inkling2MoeQuantMode::Q8
-        } else if is_mxfp8 {
-            Inkling2MoeQuantMode::Mxfp8
-        } else {
+        let Some((gu_mode, gu_aux, dn_mode, dn_aux)) =
+            Self::resolve_grouped_moe_quant(gu, dn, t, d)?
+        else {
             return Ok(None);
-        };
-
-        let (gu_aux, dn_aux) = match quant_mode {
-            Inkling2MoeQuantMode::Nvfp4 => (gu.outer_scale(), None),
-            Inkling2MoeQuantMode::Q8 => (gu.get_biases(), dn.get_biases()),
-            Inkling2MoeQuantMode::Mxfp8 => (None, None),
         };
 
         let packed_hist = num_seqs > 4;
@@ -902,7 +933,8 @@ impl Inkling2MoE {
             packed_hist,
             self.top_k,
             self.route_scale as f32,
-            quant_mode,
+            gu_mode,
+            dn_mode,
             self.gate_up_interleaved,
             self.mlp_gate_softcap as f32,
             self.mlp_up_softcap as f32,
