@@ -7,174 +7,27 @@ use crate::{
     array::{DType, MxArray, scaled_dot_product_attention},
     nn::{Activations, LayerNorm},
 };
+use mlx_clairic::{
+    typed_decode::{
+        DecodedOutputs, argmax_and_softmax_max, argmax_f32, argmax_f64, decode_record,
+        log_softmax_f64, split_3d, split_chunks,
+    },
+    typed_prompt::EncodedRecord,
+};
 use napi::{Either, Error, Result};
-use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
 };
+use tokenizers::Tokenizer;
+
+pub use mlx_clairic::head_config::*;
 
 /// Compiled-graph id for the fused `gelu_exact` used by Clairic head blocks.
 /// Pure elementwise function with no captured weights, so a single process-wide
 /// id is safe and nothing needs to be erased on drop.
 const GELU_EXACT_FN_ID: u64 = 0xC1A1_21C0_0000_0001;
-
-pub const MAX_SPAN: i64 = 64;
-pub const TRIM_CLASSES: i64 = 8;
-pub const BINS: i64 = 256;
-pub const POINTER_WIDTH: i64 = 256;
-pub const NUMBER_DIGITS: i64 = 12;
-pub const MIN_EXPONENT: i64 = -12;
-pub const MAX_EXPONENT: i64 = 15;
-pub const EXPONENT_CLASSES: i64 = MAX_EXPONENT - MIN_EXPONENT + 2; // 29
-pub const YEAR_DIGITS: i64 = 4;
-pub const YEAR_LOW: i32 = 1800;
-pub const YEAR_HIGH: i32 = 2199;
-pub const YEAR_OUTSIDE: i64 = (YEAR_HIGH - YEAR_LOW + 1) as i64; // 400
-pub const YEAR_CLASSES: i64 = YEAR_OUTSIDE + 1; // 401
-pub const LEXICAL_DIGITS: i64 = 4;
-pub const ESTIMATE_SPREAD_LIMIT: f64 = 2.0;
-pub const NUMBER_WIDTH: i64 = 2 + EXPONENT_CLASSES + NUMBER_DIGITS * 10; // 151
-pub const GROUP_DIGITS: i64 = 3;
-pub const GROUP_CLASSES: i64 = 1000;
-pub const GROUP_LOW: i64 = -4; // MIN_EXPONENT / GROUP_DIGITS
-pub const GROUP_HIGH: i64 = 5; // MAX_EXPONENT / GROUP_DIGITS
-pub const NUMBER_GROUPS: i64 = GROUP_HIGH - GROUP_LOW + 1; // 10
-pub const GROUP_RANK: i64 = 256;
-pub const DATE_WIDTH: i64 = YEAR_DIGITS * 10 + YEAR_CLASSES + 12 + 31; // 484
-pub const TIME_WIDTH: i64 = 24 + 60 + 60; // 144
-
-pub const DIGIT_SLOTS: i64 = NUMBER_DIGITS + YEAR_DIGITS + 2 + 2 + 2 + 2; // 24
-pub const YEAR_SLOT: i64 = NUMBER_DIGITS; // 12
-pub const DAY_SLOT: i64 = NUMBER_DIGITS + YEAR_DIGITS; // 16
-pub const HOUR_SLOT: i64 = NUMBER_DIGITS + YEAR_DIGITS + 2; // 18
-pub const MINUTE_SLOT: i64 = NUMBER_DIGITS + YEAR_DIGITS + 4; // 20
-pub const SECOND_SLOT: i64 = NUMBER_DIGITS + YEAR_DIGITS + 6; // 22
-
-pub const ROUTE_KINDS: [&str; 8] = [
-    "text",
-    "tags",
-    "number",
-    "date",
-    "time",
-    "estimate",
-    "number_list",
-    "date_list",
-];
-pub const LIST_KINDS: [&str; 2] = ["number_list", "date_list"];
-pub const ROUTE_KIND_COUNT: i64 = 8;
-pub const LIST_KIND_COUNT: i64 = 2;
-pub const KIND_EMBEDDING_ROWS: i64 = ROUTE_KIND_COUNT + LIST_KIND_COUNT; // 10
-
-/// Configuration deserialized from `clair_head_config.json`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClairicHeadConfig {
-    pub hidden_size: i64,
-    pub bins: i64,
-    pub pointer_width: i64,
-    pub readout: String,
-    pub route_width: i64,
-    pub route_layers: usize,
-    pub route_heads: i64,
-    pub slot_rank: i64,
-    #[serde(default)]
-    pub estimate_lexical: bool,
-    #[serde(default)]
-    pub span_trim: bool,
-    #[serde(default)]
-    pub loop_feedback: bool,
-    #[serde(default)]
-    pub answer_slots: bool,
-    #[serde(default)]
-    pub answer_slot_routing: bool,
-    #[serde(default)]
-    pub number_groups: bool,
-    #[serde(default)]
-    pub number_pointer: bool,
-}
-
-impl ClairicHeadConfig {
-    /// Load `clair_head_config.json` from a checkpoint directory.
-    pub fn load(dir: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(dir.join("clair_head_config.json")).map_err(|e| {
-            Error::from_reason(format!("Failed to read clair_head_config.json: {e}"))
-        })?;
-        serde_json::from_str(&raw)
-            .map_err(|e| Error::from_reason(format!("Invalid clair_head_config.json: {e}")))
-    }
-
-    /// Validate that the configuration matches the supported lexical typed head contract
-    /// (`mlx_engine.py::TypedHead.REQUIRED`) and expected backbone hidden size.
-    pub fn validate(&self, expected_hidden_size: i64) -> Result<()> {
-        if self.readout != "lexical" {
-            return Err(Error::from_reason(
-                "unsupported typed head: readout must be 'lexical'",
-            ));
-        }
-        for (name, flag) in [
-            ("estimate_lexical", self.estimate_lexical),
-            ("span_trim", self.span_trim),
-            ("answer_slots", self.answer_slots),
-            ("answer_slot_routing", self.answer_slot_routing),
-            ("number_groups", self.number_groups),
-            ("number_pointer", self.number_pointer),
-        ] {
-            if !flag {
-                return Err(Error::from_reason(format!(
-                    "unsupported typed head: {name} must be true"
-                )));
-            }
-        }
-        if self.loop_feedback {
-            return Err(Error::from_reason(
-                "unsupported typed head: loop_feedback is not supported",
-            ));
-        }
-        if self.hidden_size != expected_hidden_size
-            || self.hidden_size <= 0
-            || self.bins <= 0
-            || self.pointer_width <= 0
-            || self.route_width <= 0
-            || self.route_heads <= 0
-            || self.route_width % self.route_heads != 0
-            || self.route_layers == 0
-            || self.route_layers > 32
-            || self.slot_rank <= 0
-        {
-            return Err(Error::from_reason(
-                "Invalid Clairic head configuration or backbone hidden size",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Index views describing which query positions and list-item slots belong to each readout group.
-#[derive(Debug, Clone, Default)]
-pub struct PredictionViews {
-    /// Token positions in `hidden` for each field query (`[Q]`).
-    pub query_positions: Vec<i64>,
-    /// Row indices into `query_positions` for `text` span fields.
-    pub text_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `tags` (`text_list`) BIO fields.
-    pub tags_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `number` fields.
-    pub number_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `date` fields.
-    pub date_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `time` fields.
-    pub time_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `estimate` fields.
-    pub estimate_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `number_list` fields.
-    pub number_list_rows: Vec<i64>,
-    /// Row indices into `query_positions` for `date_list` fields.
-    pub date_list_rows: Vec<i64>,
-    /// Token positions in `hidden` for `number_list` item cues (`[number_list_rows.len(), list_slots]`).
-    pub number_list_items: Vec<Vec<i64>>,
-    /// Token positions in `hidden` for `date_list` item cues (`[date_list_rows.len(), list_slots]`).
-    pub date_list_items: Vec<Vec<i64>>,
-}
 
 /// Outputs produced by [`ClairicHead::forward`], matching the keys of `TypedHead.forward`.
 pub struct HeadOutputs {
@@ -239,7 +92,7 @@ struct TypedOutputs {
 impl ClairicHead {
     /// Load `clair_head_config.json` and `clair_head.safetensors` from `dir`.
     pub fn load(dir: &Path, expected_hidden_size: i64, round_bf16: bool) -> Result<Self> {
-        let config = ClairicHeadConfig::load(dir)?;
+        let config = ClairicHeadConfig::load(dir).map_err(super::to_napi_err)?;
         let weights =
             crate::utils::safetensors::load_safetensors_lazy(dir.join("clair_head.safetensors"))?;
         Self::from_weights(config, weights, expected_hidden_size, round_bf16)
@@ -256,7 +109,9 @@ impl ClairicHead {
         expected_hidden_size: i64,
         round_bf16: bool,
     ) -> Result<Self> {
-        config.validate(expected_hidden_size)?;
+        config
+            .validate(expected_hidden_size)
+            .map_err(super::to_napi_err)?;
         let shapes = Self::expected_shapes(&config);
         let expected: HashSet<&str> = shapes.iter().map(|(k, _)| k.as_str()).collect();
 
@@ -1477,6 +1332,229 @@ impl ClairicHead {
     }
 }
 
+/// Evaluate and materialize [`HeadOutputs`] (plus optional answer-slot token IDs & log-probs)
+/// into pure-Rust CPU [`DecodedOutputs`] ready for [`mlx_clairic::typed_decode::decode_record`].
+pub fn decoded_outputs_from_head(
+    out: &HeadOutputs,
+    slot_ids: Option<Vec<Vec<u32>>>,
+    slot_log_probs: Option<Vec<Vec<f32>>>,
+) -> Result<DecodedOutputs> {
+    let mut refs: Vec<&MxArray> = vec![&out.null];
+    for arr in [
+        &out.trim,
+        &out.text,
+        &out.tags,
+        &out.number,
+        &out.number_groups,
+        &out.number_copy,
+        &out.number_copy_gate,
+        &out.date,
+        &out.time,
+        &out.estimate,
+        &out.estimate_offset,
+        &out.estimate_overflow,
+        &out.estimate_number,
+        &out.estimate_gate,
+        &out.number_list,
+        &out.number_list_end,
+        &out.number_list_groups,
+        &out.date_list,
+        &out.date_list_end,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        refs.push(arr);
+    }
+    MxArray::eval_arrays(&refs)?;
+
+    let mut decoded = DecodedOutputs {
+        null: out.null.to_float32()?.to_vec(),
+        slot_ids,
+        slot_log_probs,
+        ..DecodedOutputs::default()
+    };
+
+    if let Some(ref text_arr) = out.text {
+        let shape = text_arr.shape()?;
+        let rows = shape[0] as usize;
+        let row_len = (shape[1] * shape[2]) as usize;
+        let flat = text_arr.to_float32()?;
+        let mut best = Vec::with_capacity(rows);
+        let mut probs = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let slice = &flat[r * row_len..(r + 1) * row_len];
+            let (idx, prob) = argmax_and_softmax_max(slice);
+            best.push(idx);
+            probs.push(prob as f32);
+        }
+        decoded.text_best = Some(best);
+        decoded.text_probability = Some(probs);
+    }
+
+    if let Some(ref tags_arr) = out.tags {
+        let shape = tags_arr.shape()?;
+        let rows = shape[0] as usize;
+        let tokens = shape[1] as usize;
+        let classes = shape[2] as usize;
+        let flat = tags_arr.to_float32()?;
+        let mut all_labels = Vec::with_capacity(rows);
+        let mut all_log_probs = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let mut row_labels = Vec::with_capacity(tokens);
+            let mut sum_lp = 0.0f64;
+            for t in 0..tokens {
+                let base = (r * tokens + t) * classes;
+                let lp = log_softmax_f64(&flat[base..base + classes]);
+                let (best_c, best_lp) = argmax_f64(&lp);
+                row_labels.push(best_c);
+                sum_lp += best_lp;
+            }
+            all_labels.push(row_labels);
+            all_log_probs.push(sum_lp as f32);
+        }
+        decoded.tags_labels = Some(all_labels);
+        decoded.tags_log_probability = Some(all_log_probs);
+    }
+
+    if let Some(ref trim_arr) = out.trim {
+        let shape = trim_arr.shape()?;
+        let tokens = shape[0] as usize;
+        let sides = shape[1] as usize;
+        let classes = shape[2] as usize;
+        let flat = trim_arr.to_float32()?;
+        let mut trims = Vec::with_capacity(tokens);
+        for t in 0..tokens {
+            let base0 = t * sides * classes;
+            let base1 = base0 + classes;
+            let left = argmax_f32(&flat[base0..base0 + classes]);
+            let right = argmax_f32(&flat[base1..base1 + classes]);
+            trims.push([left, right]);
+        }
+        decoded.trim_labels = Some(trims);
+    }
+
+    if let Some(ref copy_arr) = out.number_copy {
+        let shape = copy_arr.shape()?;
+        let rows = shape[0] as usize;
+        let row_len = (shape[1] * shape[2]) as usize;
+        let flat = copy_arr.to_float32()?;
+        let mut best = Vec::with_capacity(rows);
+        let mut probs = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let slice = &flat[r * row_len..(r + 1) * row_len];
+            let (idx, prob) = argmax_and_softmax_max(slice);
+            best.push(idx);
+            probs.push(prob as f32);
+        }
+        decoded.number_copy_best = Some(best);
+        decoded.number_copy_probability = Some(probs);
+    }
+
+    if let Some(ref arr) = out.number_copy_gate {
+        decoded.number_copy_gate = Some(arr.to_float32()?.to_vec());
+    }
+    if let Some(ref arr) = out.number {
+        decoded.number = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.number_groups {
+        let shape = arr.shape()?;
+        let rows = shape[0] as usize;
+        let width = (shape[1] * shape[2]) as usize;
+        decoded.number_groups = Some(split_chunks(&arr.to_float32()?, rows, width));
+    }
+    if let Some(ref arr) = out.date {
+        decoded.date = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.time {
+        decoded.time = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.estimate {
+        decoded.estimate = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.estimate_offset {
+        decoded.estimate_offset = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.estimate_overflow {
+        let rows = extract_2d(arr)?;
+        decoded.estimate_overflow = Some(
+            rows.into_iter()
+                .map(|r| {
+                    [
+                        r.first().copied().unwrap_or(0.0),
+                        r.get(1).copied().unwrap_or(0.0),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    if let Some(ref arr) = out.estimate_number {
+        decoded.estimate_number = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.estimate_gate {
+        decoded.estimate_gate = Some(arr.to_float32()?.to_vec());
+    }
+    if let Some(ref arr) = out.number_list {
+        decoded.number_list = Some(extract_3d(arr)?);
+    }
+    if let Some(ref arr) = out.number_list_end {
+        decoded.number_list_end = Some(extract_2d(arr)?);
+    }
+    if let Some(ref arr) = out.number_list_groups {
+        let shape = arr.shape()?;
+        let rows = shape[0] as usize;
+        let slots = shape[1] as usize;
+        let width = (shape[2] * shape[3]) as usize;
+        let flat = arr.to_float32()?;
+        let mut out_3d = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let mut row_v = Vec::with_capacity(slots);
+            for s in 0..slots {
+                let base = (r * slots + s) * width;
+                row_v.push(flat[base..base + width].to_vec());
+            }
+            out_3d.push(row_v);
+        }
+        decoded.number_list_groups = Some(out_3d);
+    }
+    if let Some(ref arr) = out.date_list {
+        decoded.date_list = Some(extract_3d(arr)?);
+    }
+    if let Some(ref arr) = out.date_list_end {
+        decoded.date_list_end = Some(extract_2d(arr)?);
+    }
+
+    Ok(decoded)
+}
+
+/// Convenience entry point that converts [`HeadOutputs`] -> [`DecodedOutputs`] and runs
+/// [`mlx_clairic::typed_decode::decode_record`].
+pub fn decode_head_outputs(
+    output: &HeadOutputs,
+    record: &EncodedRecord,
+    tokenizer: Option<&Tokenizer>,
+    slot_ids: Option<Vec<Vec<u32>>>,
+    slot_log_probs: Option<Vec<Vec<f32>>>,
+) -> Result<Map<String, Value>> {
+    let decoded = decoded_outputs_from_head(output, slot_ids, slot_log_probs)?;
+    decode_record(&decoded, record, tokenizer, None).map_err(super::to_napi_err)
+}
+
+fn extract_2d(arr: &MxArray) -> Result<Vec<Vec<f32>>> {
+    let shape = arr.shape()?;
+    let rows = shape[0] as usize;
+    let width = shape[1] as usize;
+    Ok(split_chunks(&arr.to_float32()?, rows, width))
+}
+
+fn extract_3d(arr: &MxArray) -> Result<Vec<Vec<Vec<f32>>>> {
+    let shape = arr.shape()?;
+    let rows = shape[0] as usize;
+    let slots = shape[1] as usize;
+    let width = shape[2] as usize;
+    Ok(split_3d(&arr.to_float32()?, rows, slots, width))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2042,5 +2120,96 @@ mod tests {
         if use_cpu {
             unsafe { mlx_sys::mlx_set_default_device(prev_dev) };
         }
+    }
+
+    #[test]
+    fn end_to_end_synthetic_clairic_head_forward_to_decode_record_and_compact_roundtrip() {
+        use mlx_clairic::typed_decode::{compact_output, expand_output, merge_forecasts};
+        use mlx_clairic::typed_prompt::{
+            EncodeRecordOptions, build_prediction_views, encode_record,
+        };
+        use serde_json::json;
+        use std::path::PathBuf;
+
+        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../__test__/fixtures/clef/tokenizer.json");
+        let tok = Tokenizer::from_file(&tok_path).expect("load clef fixture tokenizer");
+        let record = json!({
+            "input": "Vendor: Acme Corp. Amount: 1,234.56 USD. Date: 2025-05-01. Time: 14:30:00.",
+            "fields": {
+                "vendor": {"type": "text"},
+                "amount": {"type": "number", "decimals": 2},
+                "date": {"type": "date"},
+                "clock": {"type": "time"},
+                "eta": {"type": "estimate", "min": 0, "max": 100},
+                "fc.1": {"type": "estimate", "min": 0, "max": 100},
+                "fc.2": {"type": "estimate", "min": 0, "max": 100},
+                "amounts": {"type": "list", "items": "number"},
+                "dates": {"type": "list", "items": "date"},
+                "items": {"type": "list", "items": "text"}
+            }
+        });
+        let opts = EncodeRecordOptions {
+            max_length: 4096,
+            ..EncodeRecordOptions::default()
+        };
+        let encoded = encode_record(&tok, &record, &opts).unwrap().unwrap();
+        let (start, stop, views, _as_layout) = build_prediction_views(&encoded).unwrap();
+
+        let cfg = synthetic_config();
+        let hidden_size = cfg.hidden_size;
+        let bins = cfg.bins;
+        let weights = synthetic_weights(&cfg);
+        let head = ClairicHead::from_weights(cfg, weights, hidden_size, false).unwrap();
+
+        let seq_len = encoded.input_ids.len() as i64;
+        let hidden = MxArray::from_float32(
+            &det_data(777, (seq_len * hidden_size) as usize, 0.4),
+            &[seq_len, hidden_size],
+        )
+        .unwrap();
+        let memory = head.memory(&hidden, stop as i64).unwrap();
+        let head_out = head
+            .forward(&hidden, start as i64, stop as i64, &views, &memory)
+            .unwrap();
+
+        let decoded_out = decoded_outputs_from_head(&head_out, None, None).unwrap();
+        // Verify compact_output -> expand_output lossless roundtrip
+        let flat = compact_output(&decoded_out);
+        let expanded =
+            expand_output(&flat, &encoded, bins as usize, true, true, true, true).unwrap();
+        assert_eq!(expanded.null.len(), decoded_out.null.len());
+
+        let preds = decode_record(&expanded, &encoded, Some(&tok), None).unwrap();
+        assert!(preds.contains_key("vendor"));
+        assert!(preds.contains_key("amount"));
+        assert!(preds.contains_key("date"));
+        assert!(preds.contains_key("clock"));
+        assert!(preds.contains_key("amounts"));
+        assert!(preds.contains_key("dates"));
+        assert!(preds.contains_key("items"));
+
+        let est = &preds["eta"];
+        let quantiles = est["quantiles"].as_array().unwrap();
+        assert_eq!(quantiles.len(), 99);
+        assert_eq!(est["median"], quantiles[49]);
+        assert_eq!(est["p10"], quantiles[9]);
+        assert_eq!(est["p90"], quantiles[89]);
+        assert!(est["p_below"].as_f64().unwrap().is_finite());
+        assert!(est["p_above"].as_f64().unwrap().is_finite());
+
+        // Verify forecast merge
+        let merged = merge_forecasts(
+            &preds,
+            &[(
+                "fc".to_string(),
+                vec!["fc.1".to_string(), "fc.2".to_string()],
+            )],
+        )
+        .unwrap();
+        assert!(merged.contains_key("fc"));
+        assert!(!merged.contains_key("fc.1"));
+        assert_eq!(merged["fc"]["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["fc"]["value"].as_array().unwrap().len(), 2);
     }
 }

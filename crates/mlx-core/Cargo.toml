@@ -20,7 +20,7 @@ regex = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.11"
+sha2 = { workspace = true }
 tokio = { workspace = true }
 minijinja = { workspace = true }
 uuid = { workspace = true }
@@ -30,17 +30,14 @@ image = { workspace = true }
 mlx-paged-attn = { workspace = true }
 mlx-db = { workspace = true }
 mlx-tts = { workspace = true }
+mlx-audio = { workspace = true }
+mlx-clairic = { workspace = true }
 sqlx = { workspace = true }
 unicode-width = { workspace = true }
 unicode-ident = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 zip = { workspace = true }
 unicode-normalization.workspace = true
-base64 = { workspace = true }
-bigdecimal = { workspace = true }
-fancy-regex = { workspace = true }
-llguidance = { workspace = true }
-toktrie = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true
@@ -55,19 +52,7 @@ cc = { workspace = true }
 napi-build = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-coreaudio-rs = "0.14.2"
 mlx_metal = { package = "mlx-metal", path = "../mlx-metal" }
-objc2 = "0.6.4"
-objc2-core-audio = "0.3.2"
-objc2-core-audio-types = "0.3.2"
-objc2-core-foundation = "0.3.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "NSArray",
-  "NSString",
-  "NSUUID",
-  "NSValue",
-] }
 
 [target.'cfg(not(windows))'.dependencies]
 tokenizers = { workspace = true, features = ["esaxx_fast"] }
@@ -75,14 +60,7 @@ tokenizers = { workspace = true, features = ["esaxx_fast"] }
 [target.'cfg(windows)'.dependencies]
 # esaxx_fast forces the static MSVC CRT. The pure Rust trainer works with Node's DLL CRT.
 tokenizers = { workspace = true }
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Media_Audio",
-  "Win32_System_Com",
-  "Win32_System_Com_StructuredStorage",
-  "Win32_System_SystemInformation",
-  "Win32_System_Variant",
-] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [[bench]]
 name = "attention_vjp_bench"

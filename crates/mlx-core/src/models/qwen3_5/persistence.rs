@@ -2949,7 +2949,7 @@ fn load_clairic_image_processor_config(
     dir: &Path,
 ) -> crate::models::paddleocr_vl::processing::ImageProcessorConfig {
     let mut cfg = crate::vision::qwen::processing::qwen35_vl_processor_config();
-    let max_cap = crate::models::clairic::settings::VISION_MAX_PIXELS as i32;
+    let max_cap = mlx_clairic::settings::VISION_MAX_PIXELS as i32;
     cfg.min_pixels = 65_536;
     cfg.max_pixels = max_cap;
 
@@ -3580,9 +3580,7 @@ async fn load_with_thread_impl(
                         round_bf16,
                     )?;
                     inner.clairic_profile = Some(
-                        crate::models::clairic::profile::ClairicProfile::from_head_config(
-                            head.config(),
-                        ),
+                        mlx_clairic::profile::ClairicProfile::from_head_config(head.config()),
                     );
                     inner.clairic_head = Some(head);
                 }
@@ -3631,20 +3629,13 @@ async fn load_with_thread_impl(
                     let eos_id = tok
                         .token_to_id("<|im_end|>".to_string())
                         .unwrap_or_else(|| tok.get_eos_token_id());
-                    let grammar_engine = if eos_id == tok.get_eos_token_id() {
-                        crate::grammar::GrammarEngine::from_qwen3_tokenizer(
-                            tok,
-                            config.vocab_size as usize,
-                            vec![eos_id],
-                        )?
-                    } else {
-                        crate::grammar::GrammarEngine::new(
-                            tok.inner_arc(),
-                            config.vocab_size as usize,
-                            eos_id,
-                            vec![eos_id],
-                        )?
-                    };
+                    let grammar_engine = mlx_clairic::grammar::GrammarEngine::new(
+                        tok.inner_arc(),
+                        config.vocab_size as usize,
+                        eos_id,
+                        vec![eos_id],
+                    )
+                    .map_err(crate::models::clairic::to_napi_err)?;
                     inner.clairic_grammar = Some(Arc::new(grammar_engine));
                 }
 
@@ -4408,7 +4399,7 @@ mod tests {
         assert_eq!(proc_cfg.min_pixels, 65_536);
         assert_eq!(
             proc_cfg.max_pixels,
-            crate::models::clairic::settings::VISION_MAX_PIXELS as i32
+            mlx_clairic::settings::VISION_MAX_PIXELS as i32
         );
 
         fs::remove_dir_all(&dir).ok();

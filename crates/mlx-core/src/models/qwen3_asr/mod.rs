@@ -9,11 +9,7 @@
 mod audio;
 mod capture;
 mod config;
-#[cfg(target_os = "macos")]
-mod core_audio_capture;
 mod model;
-#[cfg(windows)]
-mod wasapi_devices;
 
 pub use capture::*;
 pub use config::*;

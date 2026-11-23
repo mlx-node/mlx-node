@@ -1,5 +1,5 @@
-pub(crate) use crate::audio::dsp::resample_mono;
-use crate::audio::dsp::{mel_filter_bank, reflect_index};
+pub(crate) use mlx_audio::dsp::resample_mono;
+use mlx_audio::dsp::{mel_filter_bank, reflect_index};
 use std::sync::Arc;
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex32};

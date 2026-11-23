@@ -1,0 +1,29 @@
+[package]
+name = "mlx-clairic"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+base64 = { workspace = true }
+bigdecimal = { workspace = true }
+fancy-regex = { workspace = true }
+image = { workspace = true }
+llguidance = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+toktrie = { workspace = true }
+unicode-normalization = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+tokenizers = { workspace = true, features = ["esaxx_fast"] }
+
+[target.'cfg(windows)'.dependencies]
+# esaxx_fast forces the static MSVC CRT. The pure Rust trainer works with Node's DLL CRT.
+tokenizers = { workspace = true }

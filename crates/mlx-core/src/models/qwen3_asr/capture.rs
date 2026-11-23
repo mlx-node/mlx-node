@@ -1,10 +1,17 @@
-use std::cell::UnsafeCell;
+//! N-API capture adapter and Qwen3-ASR stream feeder worker.
+//!
+//! Native OS audio discovery, ring buffering, and stream capture live in `mlx-audio`.
+
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use mlx_audio::capture::{
+    AudioDevice, AudioRing, CaptureOptions, CaptureSource, CaptureStream, InputDevice,
+    PreparedCapture, capture_timing,
+};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
@@ -39,106 +46,61 @@ pub struct Qwen3AsrCaptureStats {
     pub dropped_frames: i64,
 }
 
-/// Fixed-capacity single-producer/single-consumer ring. The native audio
-/// callback performs no allocation, lock acquisition, inference, or resampling.
-/// Acquire/release ordering makes each slot visible before the producer
-/// publishes its write cursor.
-struct AudioRing {
-    data: Box<[UnsafeCell<f32>]>,
-    capacity: usize,
-    read: AtomicUsize,
-    write: AtomicUsize,
-    captured: AtomicU64,
-    dropped: AtomicU64,
-    stopped: AtomicBool,
-    wait_lock: Mutex<()>,
-    ready: Condvar,
+impl From<Qwen3AsrCaptureSource> for CaptureSource {
+    fn from(source: Qwen3AsrCaptureSource) -> Self {
+        match source {
+            Qwen3AsrCaptureSource::Microphone => Self::Microphone,
+            Qwen3AsrCaptureSource::SystemAudio => Self::SystemAudio,
+        }
+    }
 }
 
-// SPSC discipline: only the native audio callback writes slots and only the
-// feeder worker reads them; cursors publish ownership transitions.
-unsafe impl Sync for AudioRing {}
+impl From<CaptureSource> for Qwen3AsrCaptureSource {
+    fn from(source: CaptureSource) -> Self {
+        match source {
+            CaptureSource::Microphone => Self::Microphone,
+            CaptureSource::SystemAudio => Self::SystemAudio,
+        }
+    }
+}
 
-impl AudioRing {
-    #[cfg(any(target_os = "macos", test))]
-    fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "capture ring capacity must be positive");
-        let mut data = Vec::with_capacity(capacity);
-        data.resize_with(capacity, || UnsafeCell::new(0.0));
+impl From<&Qwen3AsrCaptureOptions> for CaptureOptions {
+    fn from(options: &Qwen3AsrCaptureOptions) -> Self {
         Self {
-            data: data.into_boxed_slice(),
-            capacity,
-            read: AtomicUsize::new(0),
-            write: AtomicUsize::new(0),
-            captured: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            stopped: AtomicBool::new(false),
-            wait_lock: Mutex::new(()),
-            ready: Condvar::new(),
+            source: options.source.map(Into::into),
+            device_id: options.device_id.clone(),
+            device_name: options.device_name.clone(),
+            application_bundle_ids: options.application_bundle_ids.clone(),
+            ring_seconds: options.ring_seconds,
+            feed_milliseconds: options.feed_milliseconds,
         }
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    #[inline]
-    fn push(&self, sample: f32) {
-        let write = self.write.load(Ordering::Relaxed);
-        let read = self.read.load(Ordering::Acquire);
-        if write.wrapping_sub(read) >= self.capacity {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        unsafe { *self.data[write % self.capacity].get() = sample };
-        self.write.store(write.wrapping_add(1), Ordering::Release);
-        self.captured.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    fn push_mono(&self, samples: &[f32]) {
-        for &sample in samples {
-            self.push(sample);
-        }
-        self.wake();
-    }
-
-    fn available(&self) -> usize {
-        self.write
-            .load(Ordering::Acquire)
-            .wrapping_sub(self.read.load(Ordering::Relaxed))
-    }
-
-    fn drain(&self, count: usize) -> Vec<f32> {
-        let read = self.read.load(Ordering::Relaxed);
-        let count = count.min(self.available());
-        let mut output = Vec::with_capacity(count);
-        for offset in 0..count {
-            output.push(unsafe { *self.data[(read + offset) % self.capacity].get() });
-        }
-        self.read.store(read.wrapping_add(count), Ordering::Release);
-        output
-    }
-
-    fn wake(&self) {
-        self.ready.notify_one();
-    }
-
-    fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.ready.notify_all();
     }
 }
 
-trait CaptureStream: Send {
-    fn start(&mut self) -> Result<()>;
-    fn stop(&mut self) -> Result<()>;
+impl From<InputDevice> for Qwen3AsrInputDevice {
+    fn from(device: InputDevice) -> Self {
+        Self {
+            id: device.id,
+            name: device.name,
+            is_default: device.is_default,
+            sample_rate: device.sample_rate,
+            channels: device.channels,
+            sample_format: device.sample_format,
+        }
+    }
 }
 
-struct PreparedCapture {
-    stream: Box<dyn CaptureStream>,
-    ring: Arc<AudioRing>,
-    source: Qwen3AsrCaptureSource,
-    device_name: String,
-    sample_rate: u32,
-    channels: u32,
+impl From<AudioDevice> for Qwen3AsrAudioDevice {
+    fn from(device: AudioDevice) -> Self {
+        Self {
+            id: device.id,
+            name: device.name,
+            source: device.source.into(),
+            is_default: device.is_default,
+            sample_rate: device.sample_rate,
+            channels: device.channels,
+        }
+    }
 }
 
 #[napi]
@@ -180,6 +142,7 @@ impl Qwen3AsrCapture {
             .as_mut()
             .ok_or_else(|| Error::from_reason("Capture is stopped"))?
             .stop()
+            .map_err(|error| Error::from_reason(error.to_string()))
     }
 
     #[napi]
@@ -188,6 +151,7 @@ impl Qwen3AsrCapture {
             .as_mut()
             .ok_or_else(|| Error::from_reason("Capture is stopped"))?
             .start()
+            .map_err(|error| Error::from_reason(error.to_string()))
     }
 
     #[napi]
@@ -204,17 +168,6 @@ impl Drop for Qwen3AsrCapture {
         // that need deterministic teardown use `await capture.stop()`.
         self.worker.take();
     }
-}
-
-fn capture_timing(options: &Qwen3AsrCaptureOptions) -> Result<(f64, u32)> {
-    let ring_seconds = options.ring_seconds.unwrap_or(10.0);
-    if !ring_seconds.is_finite() || !(1.0..=120.0).contains(&ring_seconds) {
-        return Err(Error::from_reason("ring_seconds must be between 1 and 120"));
-    }
-    Ok((
-        ring_seconds,
-        options.feed_milliseconds.unwrap_or(100).clamp(10, 1_000),
-    ))
 }
 
 fn start_prepared_capture(
@@ -238,15 +191,16 @@ fn start_prepared_capture_with_callback(
     callback: impl Fn(Result<Qwen3AsrResult>) + Send + Sync + 'static,
 ) -> Result<Qwen3AsrCapture> {
     let PreparedCapture {
-        stream,
+        mut stream,
         ring,
         source,
         device_name,
         sample_rate,
         channels,
     } = prepared?;
-    let mut stream = stream;
-    let (_, feed_ms) = capture_timing(&options)?;
+    let audio_options = CaptureOptions::from(&options);
+    let (_, feed_ms) =
+        capture_timing(&audio_options).map_err(|error| Error::from_reason(error.to_string()))?;
     let callback = Arc::new(callback);
     let worker_ring = ring.clone();
     let worker_callback = callback.clone();
@@ -256,41 +210,28 @@ fn start_prepared_capture_with_callback(
     let worker_stream_id = stream_id.clone();
     let feed_frames = ((sample_rate as u64 * feed_ms as u64) / 1_000).max(1) as usize;
     let worker = std::thread::Builder::new()
-        .name(format!("mlx-asr-{}-capture", source_name(source)))
+        .name(format!("mlx-asr-{}-capture", source.as_str()))
         .spawn(move || {
             // Native setup, worker creation, and model preparation are all
             // fallible. Keep the worker parked until every step succeeds.
             while !worker_ready.load(Ordering::Acquire) {
-                if worker_ring.stopped.load(Ordering::Acquire) {
+                if worker_ring.is_stopped() {
                     return;
                 }
-                let guard = worker_ring
-                    .wait_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if worker_ready.load(Ordering::Acquire) {
-                    break;
-                }
-                let _ = worker_ring
-                    .ready
-                    .wait_timeout(guard, Duration::from_millis(20));
+                worker_ring.wait_timeout_while(Duration::from_millis(20), || {
+                    !worker_ready.load(Ordering::Acquire)
+                });
             }
             loop {
                 let available = worker_ring.available();
-                if available < feed_frames && !worker_ring.stopped.load(Ordering::Acquire) {
-                    let guard = worker_ring
-                        .wait_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let _ = worker_ring
-                        .ready
-                        .wait_timeout(guard, Duration::from_millis(20));
+                if available < feed_frames && !worker_ring.is_stopped() {
+                    worker_ring.wait_timeout(Duration::from_millis(20));
                     continue;
                 }
-                if available == 0 && worker_ring.stopped.load(Ordering::Acquire) {
+                if available == 0 && worker_ring.is_stopped() {
                     break;
                 }
-                let samples = worker_ring.drain(if worker_ring.stopped.load(Ordering::Acquire) {
+                let samples = worker_ring.drain(if worker_ring.is_stopped() {
                     available
                 } else {
                     feed_frames
@@ -335,7 +276,7 @@ fn start_prepared_capture_with_callback(
         ring.stop();
         drop(stream);
         let _ = worker.join();
-        return Err(error);
+        return Err(Error::from_reason(error.to_string()));
     }
 
     let prepare_result = (|| {
@@ -365,7 +306,7 @@ fn start_prepared_capture_with_callback(
         stream: Some(stream),
         ring,
         worker: Some(worker),
-        source,
+        source: source.into(),
         device_name,
         sample_rate,
         channels,
@@ -390,158 +331,9 @@ fn stop_capture(
                 .map_err(|_| Error::from_reason("Capture worker panicked"))?;
         }
         Ok(Qwen3AsrCaptureStats {
-            captured_frames: ring.captured.load(Ordering::Relaxed) as i64,
-            dropped_frames: ring.dropped.load(Ordering::Relaxed) as i64,
+            captured_frames: ring.captured_frames() as i64,
+            dropped_frames: ring.dropped_frames() as i64,
         })
-    }
-}
-
-fn source_name(source: Qwen3AsrCaptureSource) -> &'static str {
-    match source {
-        Qwen3AsrCaptureSource::Microphone => "microphone",
-        Qwen3AsrCaptureSource::SystemAudio => "system-audio",
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod platform {
-    use super::*;
-    use crate::models::qwen3_asr::core_audio_capture::{self, NativeCapture};
-
-    impl CaptureStream for NativeCapture {
-        fn start(&mut self) -> Result<()> {
-            NativeCapture::start(self)
-        }
-
-        fn stop(&mut self) -> Result<()> {
-            NativeCapture::stop(self)
-        }
-    }
-
-    pub(super) fn audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
-        let mut devices = Vec::new();
-        for source in [
-            Qwen3AsrCaptureSource::Microphone,
-            Qwen3AsrCaptureSource::SystemAudio,
-        ] {
-            let default = core_audio_capture::default_device_id(source);
-            devices.extend(
-                core_audio_capture::audio_devices(source)?
-                    .into_iter()
-                    .map(|device| Qwen3AsrAudioDevice {
-                        is_default: default == Some(device.object_id),
-                        id: device.id,
-                        name: device.name,
-                        source,
-                        sample_rate: device.sample_rate,
-                        channels: device.channels,
-                    }),
-            );
-        }
-        Ok(devices)
-    }
-
-    pub(super) fn input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
-        let source = Qwen3AsrCaptureSource::Microphone;
-        let default = core_audio_capture::default_device_id(source);
-        Ok(core_audio_capture::audio_devices(source)?
-            .into_iter()
-            .map(|device| Qwen3AsrInputDevice {
-                id: device.id,
-                name: device.name,
-                is_default: default == Some(device.object_id),
-                sample_rate: device.sample_rate,
-                channels: device.channels,
-                sample_format: "f32".into(),
-            })
-            .collect())
-    }
-
-    pub(super) fn start_capture(
-        sender: mpsc::UnboundedSender<Qwen3AsrCmd>,
-        stream_id: String,
-        options: Qwen3AsrCaptureOptions,
-        callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
-    ) -> Result<Qwen3AsrCapture> {
-        let (ring_seconds, _) = capture_timing(&options)?;
-        let (_, selected_device) = core_audio_capture::selected_device(&options)?;
-        let ring = Arc::new(AudioRing::new(
-            (ring_seconds * selected_device.sample_rate as f64).ceil() as usize,
-        ));
-        let callback_ring = ring.clone();
-        let (source, stream) = core_audio_capture::build(&options, move |samples| {
-            callback_ring.push_mono(samples);
-        })?;
-        let sample_rate = stream.device.sample_rate;
-        let channels = stream.device.channels;
-        let device_name = stream.device.name.clone();
-        if sample_rate == 0 || channels == 0 {
-            return Err(Error::from_reason(
-                "Core Audio returned an invalid capture configuration",
-            ));
-        }
-        start_prepared_capture(
-            sender,
-            stream_id,
-            options,
-            callback,
-            Ok(PreparedCapture {
-                stream: Box::new(stream),
-                ring,
-                source,
-                device_name,
-                sample_rate,
-                channels,
-            }),
-        )
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    use super::*;
-
-    pub(super) fn input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
-        #[cfg(windows)]
-        {
-            super::super::wasapi_devices::input_devices()
-        }
-        #[cfg(not(windows))]
-        {
-            Err(Error::from_reason(
-                "Qwen3-ASR audio device discovery is currently built only for macOS and Windows",
-            ))
-        }
-    }
-
-    pub(super) fn audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
-        #[cfg(windows)]
-        {
-            super::super::wasapi_devices::audio_devices()
-        }
-        #[cfg(not(windows))]
-        {
-            Err(Error::from_reason(
-                "Qwen3-ASR audio device discovery is currently built only for macOS and Windows",
-            ))
-        }
-    }
-
-    pub(super) fn start_capture(
-        sender: mpsc::UnboundedSender<Qwen3AsrCmd>,
-        stream_id: String,
-        options: Qwen3AsrCaptureOptions,
-        callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
-    ) -> Result<Qwen3AsrCapture> {
-        start_prepared_capture(
-            sender,
-            stream_id,
-            options,
-            callback,
-            Err(Error::from_reason(
-                "Qwen3-ASR Core Audio capture is currently built only for macOS",
-            )),
-        )
     }
 }
 
@@ -551,17 +343,24 @@ pub(super) fn start_capture(
     options: Qwen3AsrCaptureOptions,
     callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
 ) -> Result<Qwen3AsrCapture> {
-    platform::start_capture(sender, stream_id, options, callback)
+    let audio_options = CaptureOptions::from(&options);
+    let prepared = mlx_audio::capture::prepare_capture(&audio_options)
+        .map_err(|error| Error::from_reason(error.to_string()));
+    start_prepared_capture(sender, stream_id, options, callback, prepared)
 }
 
 #[napi]
 pub fn qwen3_asr_input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
-    platform::input_devices()
+    mlx_audio::capture::input_devices()
+        .map(|devices| devices.into_iter().map(Into::into).collect())
+        .map_err(|error| Error::from_reason(error.to_string()))
 }
 
 #[napi]
 pub fn qwen3_asr_audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
-    platform::audio_devices()
+    mlx_audio::capture::audio_devices()
+        .map(|devices| devices.into_iter().map(Into::into).collect())
+        .map_err(|error| Error::from_reason(error.to_string()))
 }
 
 #[cfg(test)]
@@ -584,16 +383,18 @@ mod tests {
     }
 
     impl CaptureStream for TestStream {
-        fn start(&mut self) -> Result<()> {
+        fn start(&mut self) -> std::result::Result<(), mlx_audio::AudioError> {
             self.state.started.store(true, Ordering::Release);
             if self.fail_start {
-                Err(Error::from_reason("test stream start failed"))
+                Err(mlx_audio::AudioError::Capture(
+                    "test stream start failed".into(),
+                ))
             } else {
                 Ok(())
             }
         }
 
-        fn stop(&mut self) -> Result<()> {
+        fn stop(&mut self) -> std::result::Result<(), mlx_audio::AudioError> {
             self.state.stopped.store(true, Ordering::Release);
             Ok(())
         }
@@ -621,7 +422,7 @@ mod tests {
         PreparedCapture {
             stream: Box::new(TestStream { state, fail_start }),
             ring,
-            source: Qwen3AsrCaptureSource::Microphone,
+            source: CaptureSource::Microphone,
             device_name: "test input".into(),
             sample_rate: 10,
             channels: 1,
@@ -692,59 +493,6 @@ mod tests {
             commands.try_recv(),
             Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
         ));
-    }
-
-    #[test]
-    fn audio_ring_is_bounded_and_preserves_order() {
-        let ring = AudioRing::new(3);
-        ring.push_mono(&[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(ring.captured.load(Ordering::Relaxed), 3);
-        assert_eq!(ring.dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(ring.drain(2), vec![1.0, 2.0]);
-        ring.push_mono(&[5.0]);
-        assert_eq!(ring.drain(3), vec![3.0, 5.0]);
-    }
-
-    #[test]
-    fn audio_ring_accounts_for_all_frames_with_concurrent_producer_and_consumer() {
-        const FRAME_COUNT: usize = 2_000;
-        let ring = Arc::new(AudioRing::new(64));
-        let producer_done = Arc::new(AtomicBool::new(false));
-        let producer = {
-            let ring = ring.clone();
-            let producer_done = producer_done.clone();
-            std::thread::spawn(move || {
-                for frame in 0..FRAME_COUNT {
-                    ring.push(frame as f32);
-                }
-                producer_done.store(true, Ordering::Release);
-                ring.wake();
-            })
-        };
-        let consumer = {
-            let ring = ring.clone();
-            let producer_done = producer_done.clone();
-            std::thread::spawn(move || {
-                let mut frames = Vec::new();
-                while !producer_done.load(Ordering::Acquire) || ring.available() > 0 {
-                    let drained = ring.drain(7);
-                    if drained.is_empty() {
-                        std::thread::yield_now();
-                    } else {
-                        frames.extend(drained);
-                    }
-                }
-                frames
-            })
-        };
-        producer.join().unwrap();
-        let frames = consumer.join().unwrap();
-        let captured = ring.captured.load(Ordering::Relaxed);
-        let dropped = ring.dropped.load(Ordering::Relaxed);
-        assert_eq!(captured as usize, frames.len());
-        assert_eq!(captured + dropped, FRAME_COUNT as u64);
-        assert!(!frames.is_empty());
-        assert!(frames.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
