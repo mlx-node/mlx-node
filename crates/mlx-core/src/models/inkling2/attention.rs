@@ -248,8 +248,13 @@ pub(crate) fn forward_linear_proj_fast_ex(
         && x.dtype()? == DType::BFloat16
         && unsafe { mlx_sys::mlx_metal_is_available() }
     {
+        let max_m = if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+            2048
+        } else {
+            32
+        };
         let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 32 == 0 {
             return super::kernels::inkling2_q8_sym_matmul_bf16(
                 x,
                 ql.get_weight(),
@@ -262,10 +267,15 @@ pub(crate) fn forward_linear_proj_fast_ex(
     if let LinearProj::Standard(lin) = proj
         && lin.get_bias().is_none()
         && x.dtype()? == DType::BFloat16
-        && unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_metal_is_nax_available() }
+        && unsafe { mlx_sys::mlx_metal_is_available() }
     {
+        let max_m = if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+            1024
+        } else {
+            32
+        };
         let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 1024 && xs[1] > 0 && xs[1] % 4 == 0 {
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 4 == 0 {
             let w = lin.get_weight();
             if w.dtype()? == DType::BFloat16 && (include_tiny || w.shape()?[0] >= 256) {
                 return super::kernels::inkling2_bf16_linear(x, &w);
@@ -293,8 +303,13 @@ pub(crate) fn try_forward_q8_sym_with_bf16_aux(
         && x.dtype()? == DType::BFloat16
         && unsafe { mlx_sys::mlx_metal_is_available() }
     {
+        let max_m = if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+            2048
+        } else {
+            32
+        };
         let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 32 && xs[1] > 0 && xs[1] % 32 == 0 {
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 32 == 0 {
             let w_aux = aux_lin.get_weight();
             if w_aux.dtype()? == DType::BFloat16 {
                 return Ok(Some(super::kernels::inkling2_q8_sym_matmul_bf16_with_aux(

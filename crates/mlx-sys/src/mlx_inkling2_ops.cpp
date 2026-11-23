@@ -3065,15 +3065,29 @@ class Inkling2Bf16Linear : public fast::Custom {
     out.set_data(allocator::malloc(out.nbytes()));
 
     Inkling2Bf16LinearParams params{rows_, out_dim_, in_dim_, 0u, 0.0f, 0u, 0u, 0u};
-    const uint32_t tiles_m = (rows_ + 31u) / 32u;
-    const uint32_t tiles_n = (out_dim_ + 15u) / 16u;
-    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
-        device, "inkling2_ops", "bf16_linear_batched", "inkling2_bf16_linear_batched"));
-    enc.set_input_array(x, 0);
-    enc.set_input_array(w, 1);
-    enc.set_output_array(out, 2);
-    enc.set_bytes(params, 3);
-    enc.dispatch_threadgroups(MTL::Size(tiles_m * tiles_n, 1, 1), MTL::Size(128, 1, 1));
+    if (metal::is_nax_available()) {
+      const bool use_m8 = rows_ <= 8u;
+      const uint32_t tiles_m = use_m8 ? 1u : ((rows_ + 31u) / 32u);
+      const uint32_t tiles_n = (out_dim_ + 15u) / 16u;
+      const char* kname = use_m8 ? "inkling2_bf16_linear_nax_m8" : "inkling2_bf16_linear_batched";
+      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+          device, "inkling2_ops", "bf16_linear_batched", kname));
+      enc.set_input_array(x, 0);
+      enc.set_input_array(w, 1);
+      enc.set_output_array(out, 2);
+      enc.set_bytes(params, 3);
+      enc.dispatch_threadgroups(MTL::Size(tiles_m * tiles_n, 1, 1), MTL::Size(128, 1, 1));
+    } else {
+      const uint32_t rows_per_tg = rows_ <= 16u ? 16u : 8u;
+      const uint32_t num_tgs = (out_dim_ + rows_per_tg - 1u) / rows_per_tg;
+      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
+          device, "inkling2_ops", "bf16_linear_simd", "inkling2_bf16_linear_simd"));
+      enc.set_input_array(x, 0);
+      enc.set_input_array(w, 1);
+      enc.set_output_array(out, 2);
+      enc.set_bytes(params, 3);
+      enc.dispatch_threadgroups(MTL::Size(num_tgs, 1, 1), MTL::Size(128, 1, 1));
+    }
 #else
     (void)inputs;
     (void)outputs;
@@ -3135,7 +3149,13 @@ class Inkling2Bf16LmHeadSoftcapArgmax : public fast::Custom {
     array x = ensure_row_contiguous_aligned(inputs[0], align, s, enc);
     array w = ensure_row_contiguous_aligned(inputs[1], align, s, enc);
 
-    const uint32_t num_splits = (out_cols_ + 31u) / 32u;
+    const bool use_nax = metal::is_nax_available();
+    const uint32_t rows_per_tg = rows_ <= 16u ? 16u : 8u;
+    const uint32_t num_splits = use_nax
+        ? (out_cols_ + 31u) / 32u
+        : std::min<uint32_t>(
+              512u,
+              std::max<uint32_t>(1u, (out_cols_ + rows_per_tg - 1u) / rows_per_tg));
     array partial_vals(
         Shape{static_cast<int>(rows_ * num_splits)}, float32, nullptr, {});
     partial_vals.set_data(allocator::malloc(partial_vals.nbytes()));
@@ -3148,11 +3168,14 @@ class Inkling2Bf16LmHeadSoftcapArgmax : public fast::Custom {
 
     Inkling2Bf16LinearParams p1_params{
         rows_, out_cols_, in_dim_, num_splits, softcap_, 0u, 0u, 0u};
+    const char* p1_name = use_nax
+        ? "inkling2_bf16_lm_head_softcap_argmax_p1"
+        : "inkling2_bf16_lm_head_softcap_argmax_simd_stage1";
     enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
         device,
         "inkling2_ops",
         "bf16_lm_head_softcap_argmax_p1",
-        "inkling2_bf16_lm_head_softcap_argmax_p1"));
+        p1_name));
     enc.set_input_array(x, 0);
     enc.set_input_array(w, 1);
     enc.set_output_array(partial_vals, 2);
@@ -3357,13 +3380,16 @@ class Inkling2LmHeadQ8Bf16 : public fast::Custom {
         rows_, out_cols_, in_dim_, 0u, softcap_, 0u, flags, 0u};
 
     if (metal::is_nax_available()) {
+      const bool use_m8 = rows_ <= 8u;
       const uint32_t num_tgs = (out_cols_ + 31u) / 32u;
       const uint32_t dummy = 0u;
+      const char* kname = use_m8 ? "inkling2_q8_sym_matmul_nax_m8_n32_bf16"
+                                 : "inkling2_q8_sym_matmul_nax_bf16";
       enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
           device,
           "inkling2_ops",
           "q8_sym_matmul_nax_bf16",
-          "inkling2_q8_sym_matmul_nax_bf16"));
+          kname));
       enc.set_input_array(x, 0);
       enc.set_input_array(w, 1);
       enc.set_input_array(scales, 2);
@@ -3466,17 +3492,27 @@ class Inkling2Q8SymMatmul : public fast::Custom {
     }
 
     const bool use_nax = metal::is_nax_available();
-    const uint32_t rows_per_tg = use_nax ? 32u : (rows_ <= 16u ? 16u : 8u);
-    const uint32_t q8_tgs = (out_dim_ + rows_per_tg - 1u) / rows_per_tg;
-    const uint32_t aux_tgs = aux_dim_ > 0u ? (aux_dim_ + rows_per_tg - 1u) / rows_per_tg : 0u;
+    const bool use_nax_m8_n16 = use_nax && rows_ <= 8u && out_dim_ <= 3072u;
+    const bool use_nax_m8_n32 = use_nax && rows_ <= 8u && out_dim_ > 3072u;
+    const uint32_t tiles_m =
+        use_nax ? ((use_nax_m8_n16 || use_nax_m8_n32) ? 1u : ((rows_ + 31u) / 32u)) : 1u;
+    const uint32_t rows_per_tg =
+        use_nax ? (use_nax_m8_n16 ? 16u : 32u) : (rows_ <= 16u ? 16u : 8u);
+    const uint32_t q8_tgs = tiles_m * ((out_dim_ + rows_per_tg - 1u) / rows_per_tg);
+    const uint32_t aux_tgs =
+        aux_dim_ > 0u ? tiles_m * ((aux_dim_ + rows_per_tg - 1u) / rows_per_tg) : 0u;
     const uint32_t flags =
         ((out_dtype_ == float32) ? 1u : 0u) | ((aux_dim_ > 0u) ? 2u : 0u);
     Inkling2Q8SymParams params{
         rows_, out_dim_, in_dim_, 0u, 0.0f, aux_dim_, flags, 0u};
 
     const uint32_t dummy = 0u;
-    const char* kname = use_nax ? "inkling2_q8_sym_matmul_nax_bf16"
-                                : "inkling2_q8_sym_matmul_bf16";
+    const char* kname = use_nax_m8_n16
+        ? "inkling2_q8_sym_matmul_nax_m8_bf16"
+        : (use_nax_m8_n32
+               ? "inkling2_q8_sym_matmul_nax_m8_n32_bf16"
+               : (use_nax ? "inkling2_q8_sym_matmul_nax_bf16"
+                          : "inkling2_q8_sym_matmul_bf16"));
     enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
         device, "inkling2_ops", "q8_sym_matmul", kname));
     enc.set_input_array(x, 0);
@@ -5032,14 +5068,15 @@ mlx_array* mlx_inkling2_bf16_linear(mlx_array* x_ptr, mlx_array* w_ptr) {
   try {
     using namespace mlx::core;
     using namespace mlx::core::inkling2_ops;
-    if (!metal::is_available() || !metal::is_nax_available()) {
+    if (!metal::is_available()) {
       return nullptr;
     }
     const auto& x = *reinterpret_cast<array*>(x_ptr);
     const auto& w = *reinterpret_cast<array*>(w_ptr);
+    const int max_rows = metal::is_nax_available() ? 1024 : 32;
     if (x.ndim() != 2 || w.ndim() != 2 ||
         x.dtype() != bfloat16 || w.dtype() != bfloat16 ||
-        x.shape(0) <= 0 || x.shape(0) > 1024 ||
+        x.shape(0) <= 0 || x.shape(0) > max_rows ||
         w.shape(0) <= 0 || x.shape(1) <= 0 ||
         x.shape(1) != w.shape(1) || (x.shape(1) % 4) != 0) {
       return nullptr;
@@ -5077,7 +5114,7 @@ mlx_array* mlx_inkling2_bf16_lm_head_softcap_argmax(
   try {
     using namespace mlx::core;
     using namespace mlx::core::inkling2_ops;
-    if (!metal::is_available() || !metal::is_nax_available()) {
+    if (!metal::is_available()) {
       return nullptr;
     }
     const auto& x = *reinterpret_cast<array*>(x_ptr);
@@ -5237,9 +5274,10 @@ mlx_array* mlx_inkling2_q8_sym_matmul_bf16(
     const auto& x = *reinterpret_cast<array*>(x_ptr);
     const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
     const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
+    const int max_rows = metal::is_nax_available() ? 2048 : 32;
     if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 ||
         x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
-        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(0) <= 0 || x.shape(0) > max_rows ||
         x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
         w.shape(0) <= 0 || w.shape(1) != x.shape(1) / 4 ||
         sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32) {
@@ -5292,10 +5330,11 @@ bool mlx_inkling2_q8_sym_matmul_bf16_with_aux(
     const auto& w = *reinterpret_cast<array*>(w_q8_ptr);
     const auto& sc = *reinterpret_cast<array*>(scales_f16_ptr);
     const auto& w_aux = *reinterpret_cast<array*>(w_aux_bf16_ptr);
+    const int max_rows = metal::is_nax_available() ? 2048 : 32;
     if (x.ndim() != 2 || w.ndim() != 2 || sc.ndim() != 2 || w_aux.ndim() != 2 ||
         x.dtype() != bfloat16 || w.dtype() != uint32 || sc.dtype() != float16 ||
         w_aux.dtype() != bfloat16 ||
-        x.shape(0) <= 0 || x.shape(0) > 32 ||
+        x.shape(0) <= 0 || x.shape(0) > max_rows ||
         x.shape(1) <= 0 || (x.shape(1) % 32) != 0 ||
         w.shape(0) <= 0 || w.shape(1) != x.shape(1) / 4 ||
         sc.shape(0) != w.shape(0) || sc.shape(1) != x.shape(1) / 32 ||

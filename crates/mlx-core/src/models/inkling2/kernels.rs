@@ -3539,6 +3539,12 @@ mod tests {
         );
 
         for &rows in &[1usize, 4, 5, 6, 8, 16, 32, 64, 128] {
+            if rows <= 32 {
+                assert!(
+                    inkling2_grouped_moe_available(rows),
+                    "M={rows} grouped MoE must be available on both NAX and non-NAX Metal"
+                );
+            }
             if !inkling2_grouped_moe_available(rows) {
                 continue;
             }
@@ -3810,9 +3816,10 @@ mod tests {
         ];
 
         for &(rows, cu) in cases {
-            if !inkling2_grouped_moe_available(rows) {
-                continue;
-            }
+            assert!(
+                inkling2_grouped_moe_available(rows),
+                "M={rows} fused MoE must be available on both NAX and non-NAX Metal"
+            );
             let num_seqs = cu.len() - 1;
             let x = MxArray::from_float32(&rng.vec(rows * d, 0.8), &[rows as i64, d as i64])
                 .unwrap()
@@ -4664,7 +4671,7 @@ mod tests {
 
     #[test]
     fn inkling2_bf16_linear_and_lm_head_argmax_match_ref_and_batch_invariant() {
-        if !metal_available() || !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        if !metal_available() {
             return;
         }
         let mut rng = Rng(0xBF16_1234);
@@ -5011,6 +5018,110 @@ mod tests {
                     "lm_head_q8_softcap_argmax row 0 not 0-ULP invariant between M=1 and M={m}"
                 );
             }
+
+            // Multi-M-tile NAX invariance (e.g. M=65 = 2 full 32-row tiles + 1-row tail,
+            // covering cold-tier prefix tails M=38 vs M=672 with 0-ULP invariance!).
+            if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+                let x_big = MxArray::from_float32(&rng.vec(65 * k, 0.5), &[65, k as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let (m_big, a_big) = inkling2_q8_sym_matmul_bf16_with_aux(
+                    &x_big,
+                    &w_q8,
+                    &scales_f16,
+                    &w_aux,
+                    DType::BFloat16,
+                )
+                .unwrap();
+                let m_big_v = m_big.to_float32().unwrap();
+                let a_big_v = a_big.to_float32().unwrap();
+                let x_tail = x_big.slice(&[64, 0], &[65, k as i64]).unwrap();
+                let (m_tail, a_tail) = inkling2_q8_sym_matmul_bf16_with_aux(
+                    &x_tail,
+                    &w_q8,
+                    &scales_f16,
+                    &w_aux,
+                    DType::BFloat16,
+                )
+                .unwrap();
+                assert_eq!(
+                    &m_big_v.as_ref()[64 * n..65 * n],
+                    m_tail.to_float32().unwrap().as_ref(),
+                    "q8_sym_matmul NAX multi-tile tail row 64 not 0-ULP invariant (K={k})"
+                );
+                assert_eq!(
+                    &a_big_v.as_ref()[64 * aux_n..65 * aux_n],
+                    a_tail.to_float32().unwrap().as_ref(),
+                    "q8_sym_matmul NAX aux multi-tile tail row 64 not 0-ULP invariant (K={k})"
+                );
+            }
+        }
+
+        // Wide-N (`N = 3104 > 3072`) 0-ULP invariance check covering the `nax_m8_n32` (`M <= 8`)
+        // vs `nax_bf16` (`M > 8`) split (with fused BF16 aux tail).
+        {
+            let k = 128usize;
+            let n = 3104usize;
+            let aux_n = 24usize;
+            let n_groups = k / 32;
+            let row_u32 = k / 4;
+            let mut w_u32 = vec![0u32; n * row_u32];
+            for (idx, slot) in w_u32.iter_mut().enumerate() {
+                let b0 = ((idx * 17 + 3) & 0xff) as u32;
+                let b1 = ((idx * 31 + 7) & 0xff) as u32;
+                let b2 = ((idx * 47 + 11) & 0xff) as u32;
+                let b3 = ((idx * 61 + 19) & 0xff) as u32;
+                *slot = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            }
+            let w_q8 = MxArray::from_uint32(&w_u32, &[n as i64, row_u32 as i64]).unwrap();
+            let sc_f16 = MxArray::from_float32(
+                &rng.vec(n * n_groups, 0.02)
+                    .into_iter()
+                    .map(|v| v.abs() + 0.002)
+                    .collect::<Vec<_>>(),
+                &[n as i64, n_groups as i64],
+            )
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+            let w_aux = MxArray::from_float32(&rng.vec(aux_n * k, 0.2), &[aux_n as i64, k as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let x16 = MxArray::from_float32(&rng.vec(16 * k, 0.5), &[16, k as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let x1 = x16.slice(&[0, 0], &[1, k as i64]).unwrap();
+            let x8 = x16.slice(&[0, 0], &[8, k as i64]).unwrap();
+            let (m1, a1) =
+                inkling2_q8_sym_matmul_bf16_with_aux(&x1, &w_q8, &sc_f16, &w_aux, DType::BFloat16)
+                    .unwrap();
+            let (m8, a8) =
+                inkling2_q8_sym_matmul_bf16_with_aux(&x8, &w_q8, &sc_f16, &w_aux, DType::BFloat16)
+                    .unwrap();
+            let (m16, a16) =
+                inkling2_q8_sym_matmul_bf16_with_aux(&x16, &w_q8, &sc_f16, &w_aux, DType::BFloat16)
+                    .unwrap();
+            let m1_v = m1.to_float32().unwrap();
+            let a1_v = a1.to_float32().unwrap();
+            let m8_v = m8.to_float32().unwrap();
+            let a8_v = a8.to_float32().unwrap();
+            let m16_v = m16.to_float32().unwrap();
+            let a16_v = a16.to_float32().unwrap();
+            assert_eq!(&m8_v.as_ref()[..n], m1_v.as_ref(), "wide-N M=8 vs M=1");
+            assert_eq!(&m16_v.as_ref()[..n], m1_v.as_ref(), "wide-N M=16 vs M=1");
+            assert_eq!(
+                &a8_v.as_ref()[..aux_n],
+                a1_v.as_ref(),
+                "wide-N aux M=8 vs M=1"
+            );
+            assert_eq!(
+                &a16_v.as_ref()[..aux_n],
+                a1_v.as_ref(),
+                "wide-N aux M=16 vs M=1"
+            );
         }
 
         // Exact smaller-index tie-break check when all weights are zero (`q_u8 = 128` -> `q_i8 = 0`)
@@ -5859,5 +5970,329 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_inkling2_grouped_moe_repeated_expert_ids_over_32_routes() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        use crate::models::quantized_linear::{
+            DEFAULT_QUANT_MODE, MXFP8_MODE, QuantizedSwitchLinear,
+        };
+
+        let mut rng = Rng(0x5EED_6464_u64);
+        let rows = 32usize;
+        let top_k = 2usize;
+        let e = 8usize;
+        let d = 128usize;
+        let i_dim = 128usize;
+        let n2 = 2 * i_dim;
+        let gate_cap = 30.0_f32;
+        let up_cap = 30.0_f32;
+
+        let gu_f =
+            MxArray::from_float32(&rng.vec(e * n2 * d, 0.25), &[e as i64, n2 as i64, d as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+        let dn_f = MxArray::from_float32(
+            &rng.vec(e * d * i_dim, 0.25),
+            &[e as i64, d as i64, i_dim as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+
+        let quantize_tensor = |w: &MxArray,
+                               group_size: i32,
+                               bits: i32,
+                               mode: &std::ffi::CStr|
+         -> (MxArray, MxArray, Option<MxArray>) {
+            let mut out_q = std::ptr::null_mut();
+            let mut out_s = std::ptr::null_mut();
+            let mut out_b = std::ptr::null_mut();
+            let ok = unsafe {
+                mlx_sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                    &mut out_q,
+                    &mut out_s,
+                    &mut out_b,
+                )
+            };
+            assert!(ok, "mlx_quantize failed for {mode:?}");
+            let q = MxArray::from_handle(out_q, "q").unwrap();
+            let s = MxArray::from_handle(out_s, "s").unwrap();
+            let b = if out_b.is_null() {
+                None
+            } else {
+                Some(MxArray::from_handle(out_b, "b").unwrap())
+            };
+            (q, s, b)
+        };
+
+        let (q8_gu_w, q8_gu_s, _) = quantize_tensor(&gu_f, 32, 8, c"affine");
+        let (q8_dn_w, q8_dn_s, _) = quantize_tensor(&dn_f, 32, 8, c"affine");
+        let q8_gu_s_f16 = q8_gu_s.astype(DType::Float16).unwrap();
+        let q8_dn_s_f16 = q8_dn_s.astype(DType::Float16).unwrap();
+        let q8_gu_b_f16 = q8_gu_s_f16
+            .mul_scalar(-128.0)
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        let q8_dn_b_f16 = q8_dn_s_f16
+            .mul_scalar(-128.0)
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        let mut q8_gu_lin = QuantizedSwitchLinear::new(
+            q8_gu_w.clone(),
+            q8_gu_s_f16.clone(),
+            Some(q8_gu_b_f16),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let mut q8_dn_lin = QuantizedSwitchLinear::new(
+            q8_dn_w.clone(),
+            q8_dn_s_f16.clone(),
+            Some(q8_dn_b_f16),
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        assert!(q8_gu_lin.try_compact_symmetric_q8_f16().unwrap());
+        assert!(q8_dn_lin.try_compact_symmetric_q8_f16().unwrap());
+
+        let (mx_gu_w, mx_gu_s, _) = quantize_tensor(&gu_f, 32, 8, c"mxfp8");
+        let (mx_dn_w, mx_dn_s, _) = quantize_tensor(&dn_f, 32, 8, c"mxfp8");
+        let mx_gu_lin = QuantizedSwitchLinear::new(
+            mx_gu_w.clone(),
+            mx_gu_s.clone(),
+            None,
+            32,
+            8,
+            MXFP8_MODE.to_string(),
+        );
+        let mx_dn_lin = QuantizedSwitchLinear::new(
+            mx_dn_w.clone(),
+            mx_dn_s.clone(),
+            None,
+            32,
+            8,
+            MXFP8_MODE.to_string(),
+        );
+
+        let x = MxArray::from_float32(&rng.vec(rows * d, 0.8), &[rows as i64, d as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Repeated expert ID 0 on every route: expert 0 receives 64 > 32 routes in a 32-row batch!
+        // Both NAX and non-NAX SIMD-only paths must place all 64 routes into the SIMD tile list
+        // instead of dropping tiles into an unlaunched NAX list.
+        let idx_vec = vec![0_i32; rows * top_k];
+        let gam_vec: Vec<f32> = (0..rows * top_k)
+            .map(|k| if k % 2 == 0 { 0.6 } else { 0.4 })
+            .collect();
+        let topk = MxArray::from_int32(&idx_vec, &[rows as i64, top_k as i64]).unwrap();
+        let gamma = MxArray::from_float32(&gam_vec, &[rows as i64, top_k as i64]).unwrap();
+
+        assert!(inkling2_grouped_moe_available(rows));
+
+        let run_ref = |gu: &QuantizedSwitchLinear, dn: &QuantizedSwitchLinear| -> Vec<f32> {
+            let x_4d = x.reshape(&[rows as i64, 1, 1, d as i64]).unwrap();
+            let gu_out = gu.forward_without_outer_scale(&x_4d, &topk, false).unwrap();
+            let act = inkling2_situ(&gu_out, None, gate_cap, up_cap, false).unwrap();
+            let dn_out = dn.forward_without_outer_scale(&act, &topk, false).unwrap();
+            let comb = inkling2_moe_combine(&dn_out, &gamma, None, DType::BFloat16).unwrap();
+            comb.to_float32().unwrap().as_ref().to_vec()
+        };
+
+        let ref_q8 = run_ref(&q8_gu_lin, &q8_dn_lin);
+        let got_q8 = inkling2_grouped_moe(
+            &x,
+            &topk,
+            &gamma,
+            &q8_gu_w,
+            &q8_gu_s_f16,
+            None,
+            &q8_dn_w,
+            &q8_dn_s_f16,
+            None,
+            Inkling2MoeQuantMode::Q8,
+            false,
+            gate_cap,
+            up_cap,
+            false,
+        )
+        .unwrap()
+        .to_float32()
+        .unwrap()
+        .as_ref()
+        .to_vec();
+        let q8_diff = max_abs_diff(&got_q8, &ref_q8);
+        assert!(
+            q8_diff <= 0.15,
+            "Q8 repeated-expert (>32 routes) max_abs_diff={q8_diff}"
+        );
+
+        let ref_mx = run_ref(&mx_gu_lin, &mx_dn_lin);
+        let got_mx = inkling2_grouped_moe(
+            &x,
+            &topk,
+            &gamma,
+            &mx_gu_w,
+            &mx_gu_s,
+            None,
+            &mx_dn_w,
+            &mx_dn_s,
+            None,
+            Inkling2MoeQuantMode::Mxfp8,
+            false,
+            gate_cap,
+            up_cap,
+            false,
+        )
+        .unwrap()
+        .to_float32()
+        .unwrap()
+        .as_ref()
+        .to_vec();
+        let mx_diff = max_abs_diff(&got_mx, &ref_mx);
+        assert!(
+            mx_diff <= 0.15,
+            "MXFP8 repeated-expert (>32 routes) max_abs_diff={mx_diff}"
+        );
+    }
+
+    #[test]
+    fn test_inkling2_q8_sym_chunk_boundary_fp16_scale_parity() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        use crate::models::inkling2::attention;
+        use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
+
+        let mut rng = Rng(0x1024_9600_u64);
+        let k = 128usize;
+        let n = 64usize;
+        let n_groups = k / 32;
+        let row_u32 = k / 4;
+
+        // Include exact non-BF16 FP16 scale 257/32768 (which BF16 truncation shifts by ~0.5%)
+        // across every group of row 0, and varied FP16 scales on remaining rows.
+        let mut scales_vec = Vec::with_capacity(n * n_groups);
+        for r in 0..n {
+            for g in 0..n_groups {
+                if r == 0 {
+                    scales_vec.push(257.0_f32 / 32768.0_f32);
+                } else {
+                    scales_vec.push(0.005 + ((r * 13 + g * 7) % 100) as f32 * 0.00031);
+                }
+            }
+        }
+        let scales_f16 = MxArray::from_float32(&scales_vec, &[n as i64, n_groups as i64])
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        let biases_f16 = scales_f16
+            .mul_scalar(-128.0)
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+
+        let mut w_u32 = vec![0u32; n * row_u32];
+        for (idx, slot) in w_u32.iter_mut().enumerate() {
+            if idx < row_u32 {
+                // Row 0: packed code 131 (signed +3) everywhere so exact dot = 3 * (257/32768) * sum(x)
+                *slot = 0x8383_8383u32;
+            } else {
+                let b0 = ((idx * 17 + 3) & 0xff) as u32;
+                let b1 = ((idx * 31 + 7) & 0xff) as u32;
+                let b2 = ((idx * 47 + 11) & 0xff) as u32;
+                let b3 = ((idx * 61 + 19) & 0xff) as u32;
+                *slot = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            }
+        }
+        let w_q8 = MxArray::from_uint32(&w_u32, &[n as i64, row_u32 as i64]).unwrap();
+
+        let mut ql = QuantizedLinear::new(
+            w_q8,
+            scales_f16,
+            Some(biases_f16),
+            None,
+            32,
+            8,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        assert!(ql.try_compact_symmetric_q8_f16().unwrap());
+        let proj = LinearProj::Quantized(ql);
+
+        // Build 2048 rows of BF16 activations (row 0 = all 1.0 -> exact FP16-scale output on col 0 is
+        // 128 * 3 * (257/32768) = 3.01171875, BF16=3.015625; BF16-truncated scale 256/32768 gives 3.0!).
+        let mut x_vals = rng.vec(2048 * k, 0.5);
+        for v in &mut x_vals[..k] {
+            *v = 1.0;
+        }
+        let x_2048 = MxArray::from_float32(&x_vals, &[2048, k as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let x_1504 = x_2048.slice(&[0, 0], &[1504, k as i64]).unwrap();
+        let x_960 = x_2048.slice(&[0, 0], &[960, k as i64]).unwrap();
+
+        let y_960 = attention::forward_linear_proj_fast(&proj, &x_960)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let y_1504_prefix = attention::forward_linear_proj_fast(&proj, &x_1504)
+            .unwrap()
+            .slice(&[0, 0], &[960, n as i64])
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let y_2048_prefix = attention::forward_linear_proj_fast(&proj, &x_2048)
+            .unwrap()
+            .slice(&[0, 0], &[960, n as i64])
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        // Exact FP16 scale preservation on row 0, col 0: 128 * 3 * (257/32768) = 3.01171875 -> bf16 3.015625
+        // (truncating FP16 scale to BF16 gives 3.000000 and fails this check!).
+        assert_eq!(
+            y_960[0], 3.015625_f32,
+            "M=960 must preserve exact FP16 scale"
+        );
+        assert_eq!(
+            y_1504_prefix[0], 3.015625_f32,
+            "M=1504 must preserve exact FP16 scale"
+        );
+        assert_eq!(
+            y_2048_prefix[0], 3.015625_f32,
+            "M=2048 must preserve exact FP16 scale"
+        );
+
+        // Prefix [0..960) must be bit-exact across M=960, M=1504, and M=2048 chunks!
+        assert_eq!(
+            y_960.as_ref(),
+            y_1504_prefix.as_ref(),
+            "Q8 prefix [0..960) diverged between M=960 and M=1504 chunks"
+        );
+        assert_eq!(
+            y_960.as_ref(),
+            y_2048_prefix.as_ref(),
+            "Q8 prefix [0..960) diverged between M=960 and M=2048 chunks"
+        );
     }
 }

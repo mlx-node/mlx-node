@@ -2658,8 +2658,11 @@ int64_t build_paged_prefill_attention_pipelines(mlx::core::metal::Device& device
   return built;
 }
 
+extern "C" int32_t mlx_gpu_architecture_gen();
+
 bool paged_prefill_int8_queries_supported(mlx::core::metal::Device& device) {
-  return device.mtl_device()->supportsFamily(MTL::GPUFamilyApple10);
+  return device.mtl_device()->supportsFamily(MTL::GPUFamilyApple10) &&
+      mlx_gpu_architecture_gen() >= 17;
 }
 
 int64_t paged_prefill_workspace_floats(
@@ -2870,11 +2873,16 @@ std::vector<std::string> inkling2_kernel_names() {
       "inkling2_markov_fold_softcap_f32",
       "inkling2_markov_fold_softcap_argmax_stage1",
       "inkling2_bf16_linear_m1",
+      "inkling2_bf16_linear_nax_m8",
       "inkling2_bf16_linear_batched",
+      "inkling2_bf16_linear_simd",
       "inkling2_bf16_lm_head_softcap_argmax_p1",
+      "inkling2_bf16_lm_head_softcap_argmax_simd_stage1",
       "inkling2_lm_head_q8_softcap_argmax_stage1",
       "inkling2_lm_head_q8_bf16",
       "inkling2_q8_sym_matmul_bf16",
+      "inkling2_q8_sym_matmul_nax_m8_bf16",
+      "inkling2_q8_sym_matmul_nax_m8_n32_bf16",
       "inkling2_q8_sym_matmul_nax_bf16",
       "inkling2_lm_head_q8_nax_softcap_argmax_p1",
       "inkling2_moe_m1_gate_up_situ_nvfp4",

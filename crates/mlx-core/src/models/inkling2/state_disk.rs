@@ -1529,7 +1529,7 @@ impl Inkling2Restore {
 ///
 /// Bump whenever fused Metal kernels or projection/norm rounding order change so cached SSD
 /// prefixes produced by an older build are never adopted and extended under different arithmetic.
-const INKLING2_FORWARD_ARITH_VERSION: &str = "v2";
+const INKLING2_FORWARD_ARITH_VERSION: &str = "v3";
 
 fn query_precision_tag(int8_query_from: Option<u32>) -> String {
     match int8_query_from {

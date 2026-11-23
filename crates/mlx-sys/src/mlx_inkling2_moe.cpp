@@ -301,9 +301,11 @@ void Inkling2GroupedMoe::eval_gpu(
   // Grouped Indirect-Dispatch Path (T >= 2: M=4, 8, 32, Prefill).
   // -------------------------------------------------------------------------
   p.tile_rows = (p.rows <= 32u) ? 8u : 32u;
-  if (is_mxfp8) {
-    // MXFP8 uses 100% 0-smem coalesced SIMD multi-row QMV for T <= 32.
-    p.col_cutoff = 32u;
+  const uint32_t total_routes = p.rows * p.top_k;
+  if (is_mxfp8 || !metal::is_nax_available()) {
+    // MXFP8 and non-NAX Apple7-9 GPUs use 100% 0-smem coalesced SIMD multi-row QMV for T <= 32.
+    // Force every expert into the SIMD list even if repeated expert IDs give an expert > 32 routes.
+    p.col_cutoff = total_routes;
   } else if (const int cutoff_override = resolved_moe_col_cutoff_override(); cutoff_override >= 0) {
     const int max_c = (p.tile_rows == 8u) ? 32 : 8;
     p.col_cutoff = static_cast<uint32_t>(std::clamp(cutoff_override, 0, max_c));
@@ -311,14 +313,13 @@ void Inkling2GroupedMoe::eval_gpu(
     // M=2..32 (4-lane AR, solo DSpark M=8, 4-lane DSpark M=16/24/32, and <=32-tok prefill chunks):
     // 100% coalesced SIMD multi-row QMV over `tile_rows=8` tiles! Every tile has 1..=8 rows with
     // the exact same FP32 reduction order as M=1 -> bit-exact greedy parity across M=1..32!
-    p.col_cutoff = 32u;
+    p.col_cutoff = total_routes;
   } else {
     // M=33..512 (chunked prefill, e.g. 512-token rolling checkpoints): 1..4 rows/expert use SIMD,
     // >=5 rows/expert use 2-SG BN=32/64 NAX tensor ops!
     p.col_cutoff = 4u;
   }
 
-  const uint32_t total_routes = p.rows * p.top_k;
   const uint32_t max_tiles = std::min(
       total_routes,
       (total_routes + p.tile_rows - 1u) / p.tile_rows + p.experts - 1u);
@@ -326,7 +327,8 @@ void Inkling2GroupedMoe::eval_gpu(
   const int grouped_rows = static_cast<int>(max_tiles * p.tile_rows);
 
   const bool need_simd = p.col_cutoff > 0u;
-  const bool need_nax = p.rows > p.col_cutoff;
+  const bool need_nax =
+      metal::is_nax_available() && !is_mxfp8 && (total_routes > p.col_cutoff);
   const bool use_direct_gather = need_simd && !need_nax;
   if (use_direct_gather) {
     p.flags |= 16u;
@@ -785,15 +787,15 @@ void Inkling2GroupedMoeFused::eval_gpu(
   // M=2..32 Fused Path: (router_proj+)route_group_small -> gate_up+SiTU -> down -> combine_sconv
   // -------------------------------------------------------------------------
   p.tile_rows = 8u;
-  if (is_mxfp8) {
-    p.col_cutoff = 32u;
+  const uint32_t total_routes = p.rows * p.top_k;
+  if (is_mxfp8 || !metal::is_nax_available()) {
+    p.col_cutoff = total_routes;
   } else if (const int cutoff_override = resolved_moe_col_cutoff_override(); cutoff_override >= 0) {
     p.col_cutoff = static_cast<uint32_t>(std::clamp(cutoff_override, 0, 32));
   } else {
-    p.col_cutoff = 32u;
+    p.col_cutoff = total_routes;
   }
 
-  const uint32_t total_routes = p.rows * p.top_k;
   const uint32_t max_tiles = std::min(
       total_routes,
       (total_routes + p.tile_rows - 1u) / p.tile_rows + p.experts - 1u);
@@ -801,7 +803,8 @@ void Inkling2GroupedMoeFused::eval_gpu(
   const int grouped_rows = static_cast<int>(max_tiles * p.tile_rows);
 
   const bool need_simd = p.col_cutoff > 0u;
-  const bool need_nax = p.rows > p.col_cutoff;
+  const bool need_nax =
+      metal::is_nax_available() && !is_mxfp8 && (total_routes > p.col_cutoff);
   const bool use_direct_gather = need_simd && !need_nax;
   if (use_direct_gather) {
     p.flags |= 16u;
@@ -1027,12 +1030,15 @@ bool available_for_rows(uint32_t rows, bool check_max_rows = true) {
   }
   if (check_max_rows) {
     // Up to M=32 (covers ALL M=1..32 AR decode, 4-lane AR, solo DSpark M=8, and 4-lane DSpark M=32
-    // with 100% coalesced SIMD exact-FP32 parity). Above M=32 (prefill), MLX's native 64x64x64
-    // `gather_qmm_t_nax` avoids grouped gather/projected copies (+15-25% faster on 2K/8K prefill)
-    // and ensures consistent prefill behavior across all chunk sizes (T=56..2048).
+    // with 100% coalesced SIMD exact-FP32 parity on both NAX and non-NAX Apple7-9 GPUs).
+    // Above M=32 (prefill), MLX's native 64x64x64 `gather_qmm_t` avoids grouped gather/projected
+    // copies and ensures consistent prefill behavior across all chunk sizes (T=56..2048).
     if (rows > resolved_moe_max_rows()) {
       return false;
     }
+  }
+  if (rows <= 32u) {
+    return true;
   }
   return metal::is_nax_available();
 #else
@@ -1223,7 +1229,9 @@ mlx_array* mlx_inkling2_grouped_moe(
     p.gate_softcap = gate_softcap;
     p.up_softcap = up_softcap;
     p.flags = flags;
-    p.col_cutoff = (quant_mode == 2u) ? 32u : (p.tile_rows == 8u) ? 4u : 2u;
+    p.col_cutoff = (quant_mode == 2u || !metal::is_nax_available() || T <= 32)
+        ? static_cast<uint32_t>(T * K)
+        : (p.tile_rows == 8u) ? 4u : 2u;
 
     auto s = to_stream(Device::gpu);
     auto prim = std::make_shared<Inkling2GroupedMoe>(s, p, has_gu_aux, has_dn_aux);

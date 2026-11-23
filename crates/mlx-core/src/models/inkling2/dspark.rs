@@ -2959,6 +2959,31 @@ pub(crate) fn project_draft_lm_head_bf16(
             );
         }
     }
+    #[cfg(target_os = "macos")]
+    if let LinearProj::Standard(lin) = target_lm_head
+        && lin.get_bias().is_none()
+        && hidden.dtype()? == DType::BFloat16
+        && unsafe { mlx_sys::mlx_metal_is_available() }
+    {
+        let xs = hidden.shape()?;
+        let w = lin.get_weight();
+        if xs.len() == 2
+            && xs[0] >= 1
+            && xs[0] <= 32
+            && xs[1] > 0
+            && xs[1] % 4 == 0
+            && w.dtype()? == DType::BFloat16
+        {
+            let vocab_cols = w.shape()?[0] as usize;
+            let out_cols = unpadded_vocab_size.min(vocab_cols);
+            let w_unpadded = if out_cols < vocab_cols {
+                w.slice_axis(0, 0, out_cols as i64)?
+            } else {
+                w
+            };
+            return super::kernels::inkling2_bf16_linear(hidden, &w_unpadded);
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = unpadded_vocab_size;
     let raw = super::attention::forward_linear_proj_fast(target_lm_head, hidden)?;

@@ -1380,7 +1380,7 @@ impl Inkling2Inner {
         if let crate::models::quantized_linear::LinearProj::Standard(ref lin) = self.lm_head
             && lin.get_bias().is_none()
             && lm_in.dtype()? == DType::BFloat16
-            && unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_metal_is_nax_available() }
+            && unsafe { mlx_sys::mlx_metal_is_available() }
         {
             let xs = lm_in.shape()?;
             let w = lin.get_weight();
@@ -1400,7 +1400,13 @@ impl Inkling2Inner {
                         )?
                     }
                     LogitsOutput::FullSoftcap => {
-                        let logits_bf16 = super::kernels::inkling2_bf16_linear(&lm_in, &w)?;
+                        let w_unpadded = if out_cols < vocab_cols {
+                            w.slice_axis(0, 0, out_cols as i64)?
+                        } else {
+                            w
+                        };
+                        let logits_bf16 =
+                            super::kernels::inkling2_bf16_linear(&lm_in, &w_unpadded)?;
                         inkling2_lm_head_softcap(&logits_bf16, None, out_cols, cap, false)?
                     }
                 };
