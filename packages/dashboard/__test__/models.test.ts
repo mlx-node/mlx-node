@@ -1704,6 +1704,7 @@ describe('catalog blocker: what is in the way, measured without following or ope
       listed: false,
       modelLike: false,
       holdsModel: false,
+      served: false,
       linkTarget: null,
       dangling: false,
       linkToFile: false,

@@ -149,6 +149,8 @@ export interface CatalogBlocker {
   modelLike: boolean;
   /** It holds model files (a checkpoint or a GGUF); for a link, the folder it points to does. */
   holdsModel: boolean;
+  /** Chat can load a GGUF from it (for a link, from its folder), even when Local models does not list it. */
+  served: boolean;
   /** The link text, cut to 200 characters and `…`. */
   linkTarget: string | null;
   dangling: boolean;
@@ -185,6 +187,12 @@ export interface DownloadJob {
   state: 'running' | 'committing' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
   totalBytes: number;
+  /** A done job: where old files were kept. */
+  keptDir?: string;
+  /** A done cleanup: how the old entry went. */
+  removed?: 'link' | 'trash';
+  /** A cleanup: the entry it replaces. */
+  entry?: Pick<CatalogBlocker, 'kind' | 'linkToFile'>;
 }
 
 export interface DownloadsResponse {

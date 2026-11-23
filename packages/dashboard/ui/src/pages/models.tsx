@@ -432,16 +432,18 @@ function ModelsPage({ models, catalog, host: hostState, updates, downloads }: Mo
         </PageSection>
       </div>
 
-      {systemOneCatalogItems.length > 0 ? (
+      {systemOneCatalogItems.length > 0 || (!catalogReady && catalog.error === undefined) ? (
         <div id="system-one-models" className="min-w-0">
           <PageSection
             title="System One models"
             description="Clairic & CLEF checkpoints for structured extraction, forecasting, and calibrated decisions."
             actions={
               <span className="flex flex-wrap items-center justify-end gap-3">
-                <span className="text-body text-secondary tabular-nums">
-                  {`${formatCount(systemOnePresent)} of ${formatCount(systemOneCatalogItems.length)} installed`}
-                </span>
+                {catalogReady ? (
+                  <span className="text-body text-secondary tabular-nums">
+                    {`${formatCount(systemOnePresent)} of ${formatCount(systemOneCatalogItems.length)} installed`}
+                  </span>
+                ) : null}
                 <Link className="link text-body" to="/system-one">
                   Open System One
                 </Link>
@@ -449,17 +451,19 @@ function ModelsPage({ models, catalog, host: hostState, updates, downloads }: Mo
             }
           >
             <CatalogGrid>
-              {systemOneCatalogItems.map((item) => (
-                <CatalogEntryCard
-                  key={item.label}
-                  item={item}
-                  downloads={downloads}
-                  host={host}
-                  chosen={chosen}
-                  choose={choose}
-                  systemOne
-                />
-              ))}
+              {catalogReady
+                ? systemOneCatalogItems.map((item) => (
+                    <CatalogEntryCard
+                      key={item.label}
+                      item={item}
+                      downloads={downloads}
+                      host={host}
+                      chosen={chosen}
+                      choose={choose}
+                      systemOne
+                    />
+                  ))
+                : [0, 1].map((index) => <CatalogCardPlaceholder key={index} />)}
             </CatalogGrid>
           </PageSection>
         </div>

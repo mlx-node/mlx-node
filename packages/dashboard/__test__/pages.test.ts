@@ -1099,8 +1099,18 @@ describe('Models page — the Install affordance', () => {
       answerHost = () =>
         resolve({ ok: true, status: 200, body: { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null } });
     });
+    const routes = floorRoutes(128);
+    const catalog = routes['/catalog'] as CatalogResponse;
+    const first = catalog.items[0]!;
+    const systemOne: CatalogItem = {
+      ...first,
+      label: 'Clairic-Mini',
+      category: 'systemone',
+      builds: [{ ...first.builds[0]!, hfRepo: 'mlx-node/Clairic-Mini', slug: 'clairic-mini' }],
+    };
+    routes['/catalog'] = { items: [...catalog.items, systemOne] };
     const calls = serveJobs(
-      floorRoutes(128),
+      routes,
       () => ({ ok: false, status: 404, code: 'E_NOT_FOUND', message: 'no' }),
       undefined,
       (path) => (path === '/host' ? host : modelsNever(path)),
@@ -1114,8 +1124,13 @@ describe('Models page — the Install affordance', () => {
     expect(mounted.text()).not.toContain('installed');
     expect(mounted.container.querySelector('[data-model]')).toBeNull();
     expect(mounted.container.querySelector('[data-catalog-card]')).not.toBeNull();
+    // The System One section keeps its place too, as two placeholders.
+    expect(mounted.container.querySelectorAll('#system-one-models [data-catalog-card]')).toHaveLength(2);
+    expect(mounted.container.querySelector('#system-one-models [data-model]')).toBeNull();
     answerHost();
     await waitFor(() => (mounted!.text() ?? '').includes('0 of 2 installed'));
+    expect(mounted.text()).toContain('0 of 1 installed');
+    expect(mounted.container.querySelector('#system-one-models [data-model="clairic-mini"]')).not.toBeNull();
     const order = calls.filter((call) => call.method === 'GET').map((call) => call.path);
     expect(order.indexOf('/catalog')).toBeLessThan(order.indexOf('/models'));
   });
@@ -1277,6 +1292,7 @@ describe('Models page — the Install affordance', () => {
     listed: false,
     modelLike: false,
     holdsModel: false,
+    served: false,
     linkTarget: null,
     dangling: false,
     linkToFile: false,
@@ -1358,6 +1374,21 @@ describe('Models page — the Install affordance', () => {
     [
       'a listed folder too large to list',
       { fileCount: 2000, truncated: true, listed: true },
+      ['Local models lists this folder as a model. Make sure that you do not need it.'],
+    ],
+    [
+      'a folder that Local models does not list but Chat can load',
+      { fileCount: 2000, truncated: true, served: true },
+      ['Chat can load a model from this folder. Make sure that you do not need it.'],
+    ],
+    [
+      'a link to a folder Chat can load',
+      { kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/x/m', served: true },
+      ['Chat can load a model from this folder. Make sure that you do not need it.'],
+    ],
+    [
+      'a link to a folder Local models lists',
+      { kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/x/m', listed: true },
       ['Local models lists this folder as a model. Make sure that you do not need it.'],
     ],
   ])('offers Clean up & update over %s that holds a model, never Show why', async (_name, overrides, lines) => {
@@ -1479,7 +1510,12 @@ describe('Models page — the Install affordance', () => {
       `${LINK_NOTICE} The old files keep their disk space.`,
     ],
     ['a link to other files', { kind: 'symlink' }, null, LINK_NOTICE],
-    ['a link that lists, which stays', { kind: 'symlink', listed: true }, null, LINK_NOTICE],
+    [
+      'a link Local models lists',
+      { kind: 'symlink', listed: true },
+      null,
+      `Local models lists this folder as a model. Make sure that you do not need it. ${LINK_NOTICE}`,
+    ],
     ['a folder', {}, null, TRASH_NOTICE],
     [
       'a folder Local models lists',
@@ -2213,7 +2249,10 @@ describe('Models page — the Install affordance', () => {
     emitDownload('done', { id: 'job-1', outputDir: `/models/${SLUG}`, keptDir });
     await waitFor(() => success.mock.calls.length > 0);
     expect(success.mock.calls).toEqual([
-      ['Download complete', { description: `Files that were added or changed in the old folder are in ${keptDir}.` }],
+      [
+        'Download complete',
+        { description: `Files that were added or changed in the old folder are in ${keptDir}.`, duration: Infinity },
+      ],
     ]);
   });
 
@@ -2256,7 +2295,9 @@ describe('Models page — the Install affordance', () => {
     await mountModels();
     emitDownload('done', { id: 'job-1', outputDir: `/models/${SLUG}`, ...done });
     await waitFor(() => success.mock.calls.length > 0);
-    expect(success.mock.calls).toEqual([['Download complete', { description }]]);
+    // A toast that names a kept folder stays until the user closes it.
+    const stays = 'keptDir' in done ? { duration: Infinity } : {};
+    expect(success.mock.calls).toEqual([['Download complete', { description, ...stays }]]);
   });
 
   it('titles a failed job by its kind, not by what was in the way', async () => {
@@ -2512,6 +2553,7 @@ describe('Models page — the Install affordance', () => {
     // keeps the rows for the life of the process, with the Overview tile
     // reporting "1 completed" beside a model that is simply installed.
     const failed = vi.spyOn(toast, 'error');
+    const succeeded = vi.spyOn(toast, 'success');
     try {
       const calls = recordRequests({
         ...catalogRoutes({ present: true, installed: true }, [
@@ -2526,10 +2568,46 @@ describe('Models page — the Install affordance', () => {
       // Both outcomes are already known to the user — the model is installed, the
       // cancel was their own — so neither may raise a failure notice.
       expect(failed.mock.calls).toEqual([]);
+      expect(succeeded.mock.calls).toEqual([]);
       expect(buttonLabels()).toContain('Installed');
     } finally {
       failed.mockRestore();
+      succeeded.mockRestore();
     }
+  });
+
+  it.each<[string, Partial<DownloadJob>, string, Record<string, unknown>]>([
+    [
+      'kept the old folder',
+      { keptDir: `/models/.staging/${SLUG}.kept-0d6f`, entry: { kind: 'directory', linkToFile: false } },
+      `The old ${SLUG} could not go to the Trash. It is in /models/.staging/${SLUG}.kept-0d6f. Nothing was deleted.`,
+      { duration: Infinity },
+    ],
+    [
+      'moved a file to the Trash',
+      { removed: 'trash', entry: { kind: 'file', linkToFile: false } },
+      `The old file ${SLUG} is in the Trash.`,
+      {},
+    ],
+    [
+      'removed a link',
+      { removed: 'link', entry: { kind: 'symlink', linkToFile: false } },
+      `The link ${SLUG} was removed. Its folder was not changed.`,
+      {},
+    ],
+  ])('tells what a cleanup that ended while the page was away did: %s', async (_name, row, description, stays) => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    const calls = recordRequests({
+      ...catalogRoutes({ present: true, installed: true }, [
+        downloadJob({ id: 'job-done', kind: 'cleanup', state: 'done', ...row }),
+      ]),
+      '/downloads/job-done': { cancelled: true, id: 'job-done' },
+    });
+    await mountModels();
+    await waitFor(() => dismissed(calls).length > 0);
+    expect(success.mock.calls).toEqual([['Download complete', { description, ...stays }]]);
+    expect(dismissed(calls)).toEqual(['job-done']);
   });
 
   it('reverts to Install when a job is cancelled from somewhere else', async () => {

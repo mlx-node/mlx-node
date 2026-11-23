@@ -376,6 +376,21 @@ function ggufBuildLabel(modelDir: string, folderName: string): string | undefine
   return builds.length === 1 ? builds[0]! : 'GGUF';
 }
 
+/**
+ * Whether `dir` (a link followed) holds a GGUF the engine can load, by the file rules of {@link isModelPresent} without
+ * its `config.json` gate: a root GGUF, or one in a variant folder.
+ */
+export function holdsServedGguf(dir: string): boolean {
+  let entries: string[];
+  try {
+    if (!statSync(dir).isDirectory()) return false;
+    entries = readdirSync(dir);
+  } catch {
+    return false;
+  }
+  return rootGgufNames(dir, entries).length > 0 || variantFolderGgufs(dir, entries).length > 0;
+}
+
 /** Entries {@link holdsModelFiles} reads before it gives up and answers "holds model files". */
 export const HELD_SCAN_MAX_ENTRIES = 20_000;
 
@@ -1190,7 +1205,8 @@ const LINK_TARGET_MAX_CHARS = 200;
 
 /**
  * What occupies a path the app did not create. The counts come from `lstat` and never follow a link or open a file;
- * `listed` reads the root `config.json` and `holdsModel` lists the whole tree (both through a link at the root too).
+ * `listed` reads the root `config.json`, `holdsModel` lists the whole tree and `served` lists the root and its folders
+ * (all through a link at the root too).
  */
 export interface ForeignEntrySummary {
   /** `lstat` of the path, never followed. `file` = not a directory and not a link. */
@@ -1209,6 +1225,8 @@ export interface ForeignEntrySummary {
   modelLike: boolean;
   /** {@link holdsModelFiles}: it holds a config or weights, so Update may check it in place. */
   holdsModel: boolean;
+  /** {@link holdsServedGguf}: Chat can load a GGUF from it, even when Local models does not list it. */
+  served: boolean;
   /** symlink: {@link readLinkText}, else `null`. */
   linkTarget: string | null;
   /** symlink whose target does not exist. */
@@ -1240,7 +1258,7 @@ export function isListedFolder(path: string): boolean {
 
 /**
  * Measure what is at `path`, or `null` when nothing is. The walk never follows a link and never opens a file; the
- * one read is the root `config.json`, to decide `listed`, and `holdsModel` lists the tree by file names.
+ * one read is the root `config.json`, to decide `listed`; `holdsModel` and `served` go by file names.
  */
 export function summarizeForeignEntry(
   path: string,
@@ -1260,6 +1278,7 @@ export function summarizeForeignEntry(
     try {
       linkToFile = !statSync(path).isDirectory();
     } catch {}
+    const holdsModel = holdsModelFiles(path);
     return {
       kind: 'symlink',
       fileCount: 0,
@@ -1268,7 +1287,8 @@ export function summarizeForeignEntry(
       names: [],
       listed,
       modelLike: !dangling && existsSync(join(path, 'config.json')),
-      holdsModel: holdsModelFiles(path),
+      holdsModel,
+      served: holdsModel && holdsServedGguf(path),
       linkTarget,
       dangling,
       linkToFile,
@@ -1285,6 +1305,7 @@ export function summarizeForeignEntry(
       listed: false,
       modelLike: false,
       holdsModel: false,
+      served: false,
       linkTarget: null,
       dangling: false,
       linkToFile: false,
@@ -1298,6 +1319,8 @@ export function summarizeForeignEntry(
     locked = true;
   }
   const walk = walkDirStats(path, maxEntries, { noFollow: true, keepNames: BLOCKER_MAX_NAMES + 1 });
+  // `served` lists folders without a budget, so the bounded walk of `holdsModel` (it counts every `.gguf`) goes first.
+  const holdsModel = holdsModelFiles(path);
   const names =
     !walk.truncated && walk.fileCount <= BLOCKER_MAX_NAMES
       ? [...walk.names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1310,7 +1333,8 @@ export function summarizeForeignEntry(
     names,
     listed,
     modelLike: isPathOccupied(join(path, 'config.json')),
-    holdsModel: holdsModelFiles(path),
+    holdsModel,
+    served: holdsModel && holdsServedGguf(path),
     linkTarget: null,
     dangling: false,
     linkToFile: false,

@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  cpSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -9,6 +10,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -189,8 +191,14 @@ const rmCalls = vi.hoisted(() => ({ paths: [] as string[] }));
 
 // The Trash every manager in this file gets: the default `moveToSystemTrash` renames the path into `dir` (a fixture
 // folder per test), so no test reaches the real Trash. `refuse` makes it reject and move nothing; `ignore` makes it
-// answer success and move nothing.
-const trash = vi.hoisted(() => ({ dir: '', calls: [] as string[], refuse: false, ignore: false }));
+// answer success and move nothing. `before` runs first with the path, so a test can change the disk around the call.
+const trash = vi.hoisted(() => ({
+  dir: '',
+  calls: [] as string[],
+  refuse: false,
+  ignore: false,
+  before: null as ((path: string) => void) | null,
+}));
 
 vi.mock('../src/trash.js', async () => {
   const { existsSync: exists, renameSync } = await import('node:fs');
@@ -198,6 +206,7 @@ vi.mock('../src/trash.js', async () => {
   return {
     moveToSystemTrash: async (path: string) => {
       trash.calls.push(path);
+      trash.before?.(path);
       if (trash.refuse) throw new Error('simulated Trash refusal');
       if (trash.ignore) return;
       // A second item of the same name gets a suffix, as in the real Trash.
@@ -545,6 +554,7 @@ beforeEach(() => {
   trash.calls = [];
   trash.refuse = false;
   trash.ignore = false;
+  trash.before = null;
 });
 
 afterEach(() => {
@@ -3923,11 +3933,44 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     writeFileSync(join(finalDir(), WEIGHT), qwen35Gguf());
     expect((await discoverLocalChatModels(modelsDir)).map((model) => model.path)).toEqual([join(finalDir(), WEIGHT)]);
     const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ holdsModel: true, locked: false });
+    expect(blocker).toMatchObject({ holdsModel: true, locked: false, listed: false, served: true });
     const m = manager();
     const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
     expect(doneOf(events)).toMatchObject({ removed: 'trash' });
     expect(readFileSync(join(trash.dir, SLUG, WEIGHT))).toEqual(qwen35Gguf());
+  });
+
+  it.each<[string, () => void, boolean]>([
+    [
+      'a link to a folder with a GGUF in a variant folder',
+      () => {
+        const external = externalFolder();
+        mkdirSync(join(external, 'UD-Q4_K_XL'));
+        writeFileSync(join(external, 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
+        symlinkSync(external, finalDir());
+      },
+      true,
+    ],
+    [
+      'a folder of companion GGUFs',
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), 'mmproj-F16.gguf'), Buffer.alloc(20));
+      },
+      false,
+    ],
+    [
+      'a link to a model file',
+      () => {
+        const file = join(externalFolder(), WEIGHT);
+        writeFileSync(file, qwen35Gguf());
+        symlinkSync(file, finalDir());
+      },
+      false,
+    ],
+  ])('says whether Chat can load a model from %s', (_name, plant, served) => {
+    plant();
+    expect(slugItem().blocker).toMatchObject({ served });
   });
 
   it.each<[string, number]>([
@@ -3990,6 +4033,23 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     const m = manager();
     const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(leftoverIntact()).toBe(true);
+    expect(readdirSync(original)).toEqual([LEFTOVER]);
+    expect(trashed()).toEqual([]);
+  });
+
+  it('refuses at the publish a folder that replaced the confirmed one, even when it goes before the swap', async () => {
+    plantLeftover();
+    const original = join(modelsDir, 'original');
+    stagingHook.onVerifyWindow = () => {
+      renameSync(finalDir(), original);
+      plantLeftover();
+    };
+    raceHook.onMarkerWrite = () => rmSync(finalDir(), { recursive: true, force: true });
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(raceHook.onMarkerWrite).not.toBeNull();
     expect(leftoverIntact()).toBe(true);
     expect(readdirSync(original)).toEqual([LEFTOVER]);
     expect(trashed()).toEqual([]);
@@ -4171,8 +4231,13 @@ describe('Clean up & update: replace the entry in the way after a verified downl
   });
 
   describe('a crash between moving the old entry into its holder and removing it', () => {
-    function holderPath(pid: number = DEAD_PID): string {
-      return join(stagingRoot(), `${SLUG}.cleanup-${pid}.55555555-5555-5555-5555-555555555555`);
+    /** A holder name as a cleanup makes it: owner pid, then the inode of the folder it renames in. */
+    function holderPath(pid: number = DEAD_PID, ino: bigint = 1n): string {
+      return join(stagingRoot(), `${SLUG}.cleanup-${pid}.${ino}.55555555-5555-5555-5555-555555555555`);
+    }
+    /** The inode of the folder at the slug: what the holder of the cleanup that put it there names. */
+    function finalIno(): bigint {
+      return lstatSync(finalDir(), { bigint: true }).ino;
     }
     /** The disk as a cleanup left it when it died right after `rename(finalDir, <holder>/<slug>)`. */
     function crashedAfterFirstRename(pid: number = DEAD_PID): string {
@@ -4219,9 +4284,40 @@ describe('Clean up & update: replace the entry in the way after a verified downl
       expect(jobStagingDirs()).toEqual([]);
     });
 
-    it('finishes the cleanup when the new model is in place: a folder goes to the Trash', async () => {
-      await installed();
+    it.each<[string, (holder: string) => void, (holder: string) => void]>([
+      [
+        'a file',
+        (holder) => writeFileSync(join(holder, SLUG), 'old file'),
+        (at) => expect(readFileSync(join(at, SLUG), 'utf-8')).toBe('old file'),
+      ],
+      [
+        'a link',
+        (holder) => symlinkSync('old-target', join(holder, SLUG)),
+        (at) => expect(readlinkSync(join(at, SLUG))).toBe('old-target'),
+      ],
+    ])('never puts back %s over a file another program wrote at the path meanwhile', async (_name, plant, intact) => {
       const holder = holderPath();
+      mkdirSync(holder, { recursive: true });
+      plant(holder);
+      lstatHook.after = (path) => {
+        if (path !== join(holder, SLUG)) return;
+        lstatHook.after = null;
+        writeFileSync(finalDir(), 'newcomer');
+      };
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      onTestFinished(() => error.mockRestore());
+      await recovered();
+      expect(readFileSync(finalDir(), 'utf-8')).toBe('newcomer');
+      const kept = keptDirs();
+      expect(kept).toHaveLength(1);
+      intact(join(stagingRoot(), kept[0]!));
+      expect(existsSync(holder)).toBe(false);
+      expect(error.mock.calls.some((call) => String(call[0]).includes(join(stagingRoot(), kept[0]!)))).toBe(true);
+    });
+
+    it('finishes the cleanup when the folder at the path is the one it renamed in: a folder goes to the Trash', async () => {
+      await installed();
+      const holder = holderPath(DEAD_PID, finalIno());
       mkdirSync(join(holder, SLUG, 'sub'), { recursive: true });
       writeFileSync(join(holder, SLUG, 'sub', LEFTOVER), 'old');
       const tree = treeOf(join(holder, SLUG));
@@ -4231,12 +4327,12 @@ describe('Clean up & update: replace the entry in the way after a verified downl
       expect(isModelInstalled(finalDir())).toBe(true);
     });
 
-    it('finishes the cleanup when the new model is in place: a link is unlinked, its folder untouched', async () => {
+    it('finishes the cleanup when the folder at the path is the one it renamed in: a link is unlinked, its folder untouched', async () => {
       await installed();
       const external = externalFolder();
       writeFileSync(join(external, 'keep.gguf'), Buffer.alloc(64, 0x33));
       const tree = treeOf(external);
-      const holder = holderPath();
+      const holder = holderPath(DEAD_PID, finalIno());
       mkdirSync(holder, { recursive: true });
       symlinkSync(external, join(holder, SLUG));
       await recovered();
@@ -4245,9 +4341,39 @@ describe('Clean up & update: replace the entry in the way after a verified downl
       expect(trashed()).toEqual([]);
     });
 
+    it.each<[string, (holder: string) => void]>([
+      [
+        'a folder',
+        (holder) => {
+          mkdirSync(join(holder, SLUG));
+          writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
+        },
+      ],
+      ['a link', (holder) => symlinkSync('old-target', join(holder, SLUG))],
+    ])(
+      'keeps %s, never removed, when the model at the path is not the one this cleanup installed',
+      async (_name, plant) => {
+        await installed();
+        const holder = holderPath(DEAD_PID, finalIno() + 1n);
+        mkdirSync(holder, { recursive: true });
+        plant(holder);
+        const tree = treeOf(join(holder, SLUG));
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        onTestFinished(() => error.mockRestore());
+        await recovered();
+        const kept = keptDirs();
+        expect(kept).toHaveLength(1);
+        expect(treeOf(join(stagingRoot(), kept[0]!, SLUG))).toEqual(tree);
+        expect(trashed()).toEqual([]);
+        expect(trash.calls).toEqual([]);
+        expect(error.mock.calls.some((call) => String(call[0]).includes(join(stagingRoot(), kept[0]!)))).toBe(true);
+        expect(isModelInstalled(finalDir())).toBe(true);
+      },
+    );
+
     it('keeps the old entry when the Trash refuses during recovery', async () => {
       await installed();
-      const holder = holderPath();
+      const holder = holderPath(DEAD_PID, finalIno());
       mkdirSync(join(holder, SLUG), { recursive: true });
       writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
       trash.refuse = true;
@@ -4271,10 +4397,18 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     });
 
     it('leaves the holder of a live owner alone', async () => {
-      const holder = crashedAfterFirstRename(process.pid);
+      expect(pidAlive(process.ppid)).toBe(true);
+      const holder = crashedAfterFirstRename(process.ppid);
       await recovered();
       expect(readFileSync(join(holder, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
       expect(existsSync(finalDir())).toBe(false);
+    });
+
+    it('settles a holder with its own pid at manager start: no job of this process exists yet', async () => {
+      const holder = crashedAfterFirstRename(process.pid);
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
+      expect(leftoverIntact()).toBe(true);
     });
   });
 
@@ -4296,6 +4430,12 @@ describe('Clean up & update: replace the entry in the way after a verified downl
         symlinkSync(join(modelsDir, 'nowhere'), finalDir());
         return slugItem().blocker!;
       },
+      // The folder gains the app's record during the download: it still goes to the Trash whole.
+      () => {
+        plantLeftover();
+        stagingHook.onVerifyWindow = () => writeMarker(finalDir(), SHA_OLD);
+        return ONE_FILE;
+      },
     ];
     for (const [index, plant] of layouts.entries()) {
       rmSync(finalDir(), { recursive: true, force: true });
@@ -4308,7 +4448,8 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     }
     trash.refuse = false;
     for (const pid of [DEAD_PID]) {
-      const holder = join(stagingRoot(), `${SLUG}.cleanup-${pid}.88888888-8888-8888-8888-888888888888`);
+      const ino = lstatSync(finalDir(), { bigint: true }).ino;
+      const holder = join(stagingRoot(), `${SLUG}.cleanup-${pid}.${ino}.88888888-8888-8888-8888-888888888888`);
       mkdirSync(join(holder, SLUG), { recursive: true });
       writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
       const m = manager();
@@ -4317,6 +4458,261 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     }
     expect(rmCalls.paths.length).toBeGreaterThan(0);
     expect(foreignRm()).toEqual([]);
+  });
+
+  /** The app's record in `dir`, of this repo at `revision`, listing the files of a plain install. */
+  function writeMarker(dir: string, revision: string): void {
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision, files: ['config.json', WEIGHT], completedAt: 'x' }),
+    );
+  }
+
+  describe('an entry that gains the app record during the job', () => {
+    it('moves a folder that gained the record during the download to the Trash whole', async () => {
+      plantLeftover();
+      writeFileSync(join(finalDir(), 'notes.txt'), 'my notes');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: slugItem().blocker! }).id;
+      stagingHook.onVerifyWindow = () => writeMarker(finalDir(), SHA_OLD);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'trash' });
+      expect(trash.calls).toHaveLength(1);
+      expect(trash.calls[0]!.startsWith(join(stagingRoot(), `${SLUG}.cleanup-`))).toBe(true);
+      expect(readFileSync(join(trash.dir, SLUG, 'notes.txt'), 'utf-8')).toBe('my notes');
+      expect(isModelInstalled(finalDir())).toBe(true);
+      expect(foreignRm()).toEqual([]);
+    });
+
+    it('refuses a folder with the record that replaced the confirmed one, and removes nothing', async () => {
+      plantLeftover();
+      const original = join(modelsDir, 'original');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      stagingHook.onVerifyWindow = () => {
+        renameSync(finalDir(), original);
+        plantLeftover();
+        writeMarker(finalDir(), SHA_OLD);
+      };
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(readdirSync(finalDir()).sort()).toEqual([DOWNLOAD_COMPLETE_MARKER, LEFTOVER].sort());
+      expect(leftoverIntact()).toBe(true);
+      expect(readdirSync(original)).toEqual([LEFTOVER]);
+      expect(trashed()).toEqual([]);
+      expect(foreignRm()).toEqual([]);
+    });
+
+    it('refuses before any download a folder with the record that replaced the confirmed one after the request', async () => {
+      plantLeftover();
+      const original = join(modelsDir, 'original');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      renameSync(finalDir(), original);
+      plantLeftover();
+      writeMarker(finalDir(), SHA_OLD);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(hub.downloaded).toEqual([]);
+      expect(leftoverIntact()).toBe(true);
+      expect(trashed()).toEqual([]);
+    });
+
+    it('replaces a folder that became a complete install of this revision after the request', async () => {
+      const plain = manager();
+      expect(errorOf(await settled(plain, plain.start(SLUG).id))).toBe('');
+      // Outside the models folder: a marked folder there would read as this build installed elsewhere.
+      const install = join(externalFolder(), 'install');
+      renameSync(finalDir(), install);
+      plantLeftover();
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      cpSync(install, finalDir(), { recursive: true });
+      expect(isModelInstalled(finalDir())).toBe(true);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'trash' });
+      expect(readdirSync(join(trash.dir, SLUG))).toContain(LEFTOVER);
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('removes only the link when its folder gains the record during the download', async () => {
+      const external = plantLinkToShards();
+      const blocker = slugItem().blocker!;
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: blocker }).id;
+      let tree: string[] = [];
+      stagingHook.onVerifyWindow = () => {
+        writeMarker(external, SHA_OLD);
+        tree = treeOf(external);
+      };
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'link' });
+      expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+      expect(treeOf(external)).toEqual(tree);
+      expect(existsSync(join(external, DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+      expect(trash.calls).toEqual([]);
+      expect(foreignRm()).toEqual([]);
+    });
+  });
+
+  describe('what the Trash step reports', () => {
+    it('keeps the old folder when the entry cannot be read after a refused Trash', async () => {
+      plantLeftover();
+      const tree = treeOf(finalDir());
+      onTestFinished(() => {
+        if (!existsSync(stagingRoot())) return;
+        for (const name of readdirSync(stagingRoot())) chmodSync(join(stagingRoot(), name), 0o700);
+      });
+      trash.before = (path) => chmodSync(dirname(path), 0o000);
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      for (const name of readdirSync(stagingRoot())) chmodSync(join(stagingRoot(), name), 0o700);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBeDefined();
+      expect(treeOf(join(done.keptDir!, SLUG))).toEqual(tree);
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('names the holder when the holder is gone after a refused Trash', async () => {
+      plantLeftover();
+      const away = join(modelsDir, 'away');
+      let holder = '';
+      trash.before = (path) => {
+        holder = dirname(path);
+        renameSync(holder, away);
+      };
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBe(holder);
+      expect(readFileSync(join(away, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    });
+
+    it('never renames a folder that took the holder path during a refused Trash', async () => {
+      plantLeftover();
+      const away = join(modelsDir, 'away');
+      let holder = '';
+      trash.before = (path) => {
+        holder = dirname(path);
+        renameSync(holder, away);
+        mkdirSync(holder);
+      };
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBe(holder);
+      expect(keptDirs()).toEqual([]);
+      expect(readdirSync(holder)).toEqual([]);
+      expect(readFileSync(join(away, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    });
+  });
+
+  it('keeps what a done job did in its row of the job list, with the kind of the cleaned entry', async () => {
+    plantLeftover();
+    trash.refuse = true;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => error.mockRestore());
+    const m = manager();
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    const done = doneOf(await settled(m, id))!;
+    expect(done.keptDir).toBeDefined();
+    // The core log names the kept folder too.
+    expect(error.mock.calls.some((call) => String(call[0]).includes(done.keptDir!))).toBe(true);
+    expect(m.jobs()).toEqual([
+      expect.objectContaining({
+        id,
+        state: 'done',
+        keptDir: done.keptDir,
+        entry: { kind: 'directory', linkToFile: false },
+      }),
+    ]);
+    expect(m.jobs()[0]!.removed).toBeUndefined();
+
+    rmSync(finalDir(), { recursive: true, force: true });
+    m.cancel(id);
+    trash.refuse = false;
+    plantLeftover();
+    const next = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    await settled(m, next);
+    expect(m.jobs().find((job) => job.id === next)).toMatchObject({ removed: 'trash' });
+    expect(m.jobs().find((job) => job.id === next)?.keptDir).toBeUndefined();
+  });
+
+  describe('the way back of a file or a link', () => {
+    it.each<[string, () => void, (at: string) => void]>([
+      [
+        'a file',
+        () => writeFileSync(finalDir(), Buffer.alloc(41, 0x1)),
+        (at) => expect(readFileSync(at)).toEqual(Buffer.alloc(41, 0x1)),
+      ],
+      [
+        'a link',
+        () => symlinkSync(join(modelsDir, 'nowhere'), finalDir()),
+        (at) => expect(readlinkSync(at)).toBe(join(modelsDir, 'nowhere')),
+      ],
+    ])('never replaces a file that lands at the path while %s is put back', async (_name, plant, intact) => {
+      plant();
+      const blocker = slugItem().blocker!;
+      renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+      lstatHook.after = (path) => {
+        if (!path.includes(`${SLUG}.cleanup-`) || basename(path) !== SLUG) return;
+        lstatHook.after = null;
+        writeFileSync(finalDir(), 'newcomer');
+      };
+      const m = manager();
+      const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id));
+      expect(readFileSync(finalDir(), 'utf-8')).toBe('newcomer');
+      const kept = keptDirs();
+      expect(kept).toHaveLength(1);
+      const keptDir = join(stagingRoot(), kept[0]!);
+      intact(join(keptDir, SLUG));
+      expect(message).toBe(
+        `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
+          `The old entry is at "${join(keptDir, SLUG)}". Nothing was removed.`,
+      );
+      expect(trashed()).toEqual([]);
+    });
+
+    it.each<[string, () => void, (at: string) => void]>([
+      [
+        'a file',
+        () => writeFileSync(finalDir(), Buffer.alloc(41, 0x1)),
+        (at) => expect(readFileSync(at)).toEqual(Buffer.alloc(41, 0x1)),
+      ],
+      [
+        'a link',
+        () => symlinkSync(join(modelsDir, 'nowhere'), finalDir()),
+        (at) => expect(readlinkSync(at)).toBe(join(modelsDir, 'nowhere')),
+      ],
+    ])(
+      'says nothing was removed when %s is back but its name in the holder cannot be unlinked',
+      async (_name, plant, intact) => {
+        plant();
+        const blocker = slugItem().blocker!;
+        renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+        unlinkHook.before = (path) => {
+          if (path.includes(`${SLUG}.cleanup-`) && basename(path) === SLUG) {
+            throw Object.assign(new Error('simulated unlink failure'), { code: 'EPERM' });
+          }
+        };
+        const m = manager();
+        const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id));
+        intact(finalDir());
+        expect(message).not.toContain('could not be put back');
+        expect(message.endsWith('. Nothing was removed.')).toBe(true);
+        expect(keptDirs()).toEqual([]);
+        expect(trashed()).toEqual([]);
+      },
+    );
   });
 
   describe('through the route', () => {

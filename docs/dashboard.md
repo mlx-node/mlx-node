@@ -486,13 +486,26 @@ tree, puts it at `<slug>`, and only then takes the old entry away. Nothing is de
 | a folder or a file    | moved whole, as one item named `<slug>`, to the macOS Trash of the disk that holds the models folder (`/usr/bin/trash -s`, no shell, 60 s) | `removed: 'trash'` |
 | the Trash refused     | kept at `.staging/<slug>.kept-<uuid>/<slug>`; the model is installed                                                                       | `keptDir`          |
 
+`removed: 'trash'` needs proof: after the Trash call, `lstat` of the old entry answers ENOENT and the holder is still
+the same folder (same `dev:ino`). A disk that went away also answers ENOENT, and any other answer (EACCES, EIO, a
+changed holder) proves nothing, so in each such case the entry counts as kept: the holder is renamed to `.kept-`, or,
+when that fails or another folder took the holder path, the `done` event names the holder path itself. The kept path is also written to the core log. An ended
+job's row in `GET /api/downloads` carries `keptDir`, `removed` and, for a cleanup, `entry: { kind, linkToFile }`, so a
+page that was not open when a cleanup ended shows the same toast before it dismisses the job. A toast that names
+`keptDir` stays until the user closes it. The registry is in memory: after the app quits, nothing names a `.kept-`
+folder any more.
+
 The confirmation (`cleanupContent`, tone neutral) says it in three rows: **Removed** "Only the link. It points to
 <target>." and **Stays** "That folder and every file in it…" for a link to a folder, **To the Trash** with the folder's numbers
 (or "The file <slug> (4.0 KB).") for a folder or a file, and **Downloaded** with the model, its size and, from 20 GB,
 "A download of this size can take an hour or more." The notice says the entry leaves only when the download is
 complete and checked, that a cancel or a failure changes nothing, and for the Trash that the space is free only after
-the Trash is emptied; a folder Local models lists adds "Make sure that you do not need it." and a short disk adds the
-disk line. The toasts after the job: "The link <slug> was removed. Its folder was not changed.", "The old folder
+the Trash is emptied; an entry Chat can load a model from (`served`: the folder, or a link's folder, holds a GGUF by
+the file rules of the present check, with no `config.json` needed) adds "Chat can load a model from this folder. Make
+sure that you do not need it.", else an entry Local models lists (a folder, or a link to one) adds "Local models lists this folder as a model. Make
+sure that you do not need it."; a short disk adds the disk line. Such a GGUF folder without `config.json` is not
+listed in Local models, but Chat loads it, and its cleanup moves it to the Trash like any other folder. The toasts
+after the job: "The link <slug> was removed. Its folder was not changed.", "The old folder
 <slug> is in the Trash.", or "The old <slug> could not go to the Trash. It is in <keptDir>. Nothing was deleted."; for
 a link that could not be removed, "The link <slug> could not be removed. It is in <keptDir>." A link to a file gets no
 **Stays** row and no "Its folder" sentence (the blocker's `linkToFile`). The page keeps the blocker the user confirmed
@@ -501,17 +514,37 @@ keep their disk space; this version always downloads the whole model and reuses 
 
 The request echoes what the user confirmed: `replaceBlocker: { kind, fileCount, sizeBytes, truncated, linkTarget }`.
 The server refuses (409) a folder without write permission, and an entry that no longer matches (kind, link text, and
-the numbers unless the walk was truncated), and keeps the entry's `dev:ino` in the job. Just before the swap the entry
-must still have that `dev:ino`, the same `lstat` kind and, for a link, the same link text; nothing in it is listed
-again, so a file added to the folder during the download goes to the Trash with it. The swap makes a holder
-`.staging/<slug>.cleanup-<pid>.<uuid>/`, renames `<slug>` into it, checks the moved entry's `dev:ino` (else it is
-renamed back), then renames the new model in. When that rename fails, the old entry goes back and the error ends
-"Nothing was removed." A way back never renames over something another program put at `<slug>` meanwhile: the
-holder is then renamed to `.staging/<slug>.kept-<uuid>` and the error names where the old entry is. From there the model is installed, and what follows is reported, never undone. The holder is
-removed with `rmdir`. The app never calls `rm` on an entry it did not create. When the process dies with a holder in
-place, recovery (when the download manager starts, and before every job for the slug, for a holder whose pid is
-dead) removes an empty holder, renames the entry back when `<slug>` is free, finishes the job as above when the app's
-complete install is at `<slug>`, and leaves everything as it is in any other case. Nothing removes a `.kept-` folder.
+the numbers unless the walk was truncated), and keeps the entry's `dev:ino` in the job. The identity is taken when
+the request arrives. Between the catalog read that drew the card and the click, only the shown numbers are compared,
+and a folder too large to list (`truncated`) is matched by kind only; names are not compared. So the entry that goes
+to the Trash is the one at `<slug>` when the request arrives, whatever the card described.
+
+A cleanup job never takes the paths of an app install: at the job start, in place of the "already installed at this
+revision" check, and at the publish, whenever `<slug>` is occupied the entry must still have the kept `dev:ino`, the
+same `lstat` kind and, for a link, the same link text. Nothing is read through a link to decide this. The same entry
+goes to the Trash whole even when it gained the app's record during the job (for example from `mlx download`), and a
+file added to it during the download goes with it. Any other entry, with the record or without, is refused with
+"changed on disk" and nothing is removed.
+
+The swap makes a holder `.staging/<slug>.cleanup-<pid>.<ino>.<uuid>/`, where `<ino>` is the inode of the staged
+folder (a rename keeps it), renames `<slug>` into it, checks the moved entry's `dev:ino` (else it is put back), then
+renames the new model in. When that rename fails, the old entry goes back and the error ends "Nothing was removed." A
+way back puts a file back with `link` and then `unlink` of the holder name (when that `unlink` fails, the entry is
+back and its second name stays in the holder), and a link with a new link of the same text, so neither replaces what another program put at `<slug>` meanwhile (EEXIST); then, as when the path is already
+taken, the holder is renamed to `.staging/<slug>.kept-<uuid>` and the error names where the old entry is. A folder
+goes back by `rename`, which fails over a file or a folder with files in it; the one gap is an empty folder that
+another program makes at `<slug>` in the moment of the swap (about 0.1 ms between the check and the rename): the
+rename replaces it. The same holds for the rename of the new model into place. Nothing else can be replaced. From
+there the model is installed, and what follows is reported, never undone. The holder is removed with `rmdir`. The app
+never calls `rm` on an entry it did not create.
+
+When the process dies with a holder in place, recovery runs when the download manager starts (a holder with the
+manager's own pid counts as dead then, since no job of this process exists yet) and before every job for the slug,
+for a holder whose pid is dead. It removes an empty holder; puts the entry back as above when `<slug>` is free (when
+something took the path meanwhile, the holder goes to `.kept-`); finishes the job as above only when the folder at
+`<slug>` is the one this cleanup renamed in (the holder's device and the inode in its name); keeps the old entry in
+`.kept-`, never removed, when another complete install of the app is at `<slug>`; and leaves everything as it is in
+any other case. A recovery that keeps an entry writes its path to the core log. Nothing removes a `.kept-` folder.
 
 A refused **Update…** plan whose reason a cleanup solves answers 409 with `reason: 'needs-cleanup'` beside the
 server's sentence (a file of another size, a model file that is not in the catalog set, a name that differs only in

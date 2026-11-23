@@ -69,6 +69,15 @@ export function jobDoneToast(
   };
 }
 
+/** Shows {@link jobDoneToast}. A toast that names kept files stays until the user closes it. */
+function showJobDone(...args: Parameters<typeof jobDoneToast>): void {
+  const done = jobDoneToast(...args);
+  toast.success(done.title, {
+    description: done.description,
+    ...(args[3].keptDir !== undefined ? { duration: Infinity } : {}),
+  });
+}
+
 /** What a refused Update is kept by: the numbers of the blocker it was refused for. */
 function blockerKey(blocker: Pick<CatalogBlocker, 'kind' | 'fileCount' | 'sizeBytes'>): string {
   return `${blocker.kind}:${String(blocker.fileCount)}:${String(blocker.sizeBytes)}`;
@@ -267,11 +276,15 @@ export function useModelDownloads(
       return next;
     });
     // A job that settled while this page was unmounted got no terminal-dismiss DELETE. Dismiss it here; announce a
-    // failure first (its card reverts to Install, so the toast is its only trace). A duplicate dismiss answers 404.
+    // failure first (its card reverts to Install, so the toast is its only trace), and what a cleanup did with the old
+    // entry, which the dismiss forgets. A duplicate dismiss answers 404.
     let settled = false;
     for (const job of jobs) {
       if (!isTerminalJob(job.state)) continue;
       if (job.state === 'error') toast.error(FAILED_TITLE[job.kind], { description: job.slug });
+      if (job.state === 'done' && job.kind === 'cleanup') {
+        showJobDone(job.kind, job.slug, job.entry ?? null, { keptDir: job.keptDir, removed: job.removed }, undefined);
+      }
       settled = true;
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
     }
@@ -409,8 +422,7 @@ export function useModelDownloads(
     const folder = locates.current.get(slug);
     locates.current.delete(slug);
     const job = active[slug];
-    const done = jobDoneToast(job?.kind ?? 'install', slug, job?.blocker ?? item.blocker, result, folder);
-    toast.success(done.title, { description: done.description });
+    showJobDone(job?.kind ?? 'install', slug, job?.blocker ?? item.blocker, result, folder);
     const id = job?.id;
     setActive((prev) => {
       const next = { ...prev };

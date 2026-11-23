@@ -62,6 +62,7 @@ import {
   open,
   opendir,
   readdir,
+  readlink,
   realpath,
   rename,
   rm,
@@ -150,25 +151,60 @@ const BACKUP_DIR_RE = /\.backup-(\d+)\.[0-9a-f-]+$/i;
 
 /**
  * The folder a cleanup moves the entry the app did not create into, as `<holder>/<slug>`:
- * `<slug>.cleanup-<pid>.<uuid>`. Recovery puts the entry back without the ownership test the owned `.backup-` rule
- * needs, so the two names must stay apart.
+ * `<slug>.cleanup-<pid>.<ino>.<uuid>`, where `<ino>` is the inode of the new folder the cleanup renames in. Recovery
+ * puts the entry back without the ownership test the owned `.backup-` rule needs, so the two names must stay apart.
  */
 const CLEANUP_MARK = '.cleanup-';
 /** An old entry the app could not remove or put back: `<slug>.kept-<uuid>`. Nothing ever removes it. */
 const KEPT_MARK = '.kept-';
 
-/** The slug and owner pid of a `<slug>.cleanup-<pid>.<uuid>` name, or `null` for any other name. */
-function parseCleanupHolder(name: string): { slug: string; pid: number } | null {
-  const at = name.lastIndexOf(CLEANUP_MARK);
-  if (at <= 0) return null;
-  const rest = name.slice(at + CLEANUP_MARK.length);
-  const dot = rest.indexOf('.');
-  if (dot <= 0 || dot === rest.length - 1) return null;
-  const digits = rest.slice(0, dot);
+/** The leading decimal digits of `text` up to its first `.`, and the rest after that dot, or `null`. */
+function digitsThenDot(text: string): { digits: string; rest: string } | null {
+  const dot = text.indexOf('.');
+  if (dot <= 0 || dot === text.length - 1) return null;
+  const digits = text.slice(0, dot);
   for (const ch of digits) {
     if (ch < '0' || ch > '9') return null;
   }
-  return { slug: name.slice(0, at), pid: Number(digits) };
+  return { digits, rest: text.slice(dot + 1) };
+}
+
+/** The slug, owner pid and new-folder inode of a `<slug>.cleanup-<pid>.<ino>.<uuid>` name, or `null`. */
+function parseCleanupHolder(name: string): { slug: string; pid: number; ino: bigint } | null {
+  const at = name.lastIndexOf(CLEANUP_MARK);
+  if (at <= 0) return null;
+  const pid = digitsThenDot(name.slice(at + CLEANUP_MARK.length));
+  if (pid === null) return null;
+  const ino = digitsThenDot(pid.rest);
+  if (ino === null) return null;
+  return { slug: name.slice(0, at), pid: Number(pid.digits), ino: BigInt(ino.digits) };
+}
+
+/** Only an `lstat` that answers ENOENT says nothing is at `path`; any other failure says nothing. */
+function isGone(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
+/**
+ * Put an entry a cleanup moved aside back at `finalDir`. A file is linked back and a link is made again from its text,
+ * so neither replaces what another program put at `finalDir` (EEXIST); a folder is renamed back, which can replace only
+ * an empty folder.
+ */
+async function putBack(moved: string, finalDir: string): Promise<void> {
+  const stat = await lstat(moved);
+  if (stat.isDirectory()) {
+    await rename(moved, finalDir);
+    return;
+  }
+  if (stat.isSymbolicLink()) await symlink(await readlink(moved), finalDir);
+  else await link(moved, finalDir);
+  // The entry is back; a second name the unlink leaves stays in `.staging`.
+  await unlink(moved).catch(() => {});
 }
 
 /**
@@ -1416,7 +1452,7 @@ export class DownloadManager {
     this.wrappedFetch = this.makeCountingFetch();
     // Each job id can have many subscribers (SSE clients); lift the default cap.
     this.emitter.setMaxListeners(0);
-    this.cleanupRecovery = this.recoverCleanupHolders(null);
+    this.cleanupRecovery = this.recoverCleanupHolders(null, true);
   }
 
   /**
@@ -2199,9 +2235,15 @@ export class DownloadManager {
     state: JobStatus;
     receivedBytes: number;
     totalBytes: number;
+    keptDir?: string;
+    removed?: 'link' | 'trash';
+    entry?: Pick<ForeignEntrySummary, 'kind' | 'linkToFile'>;
   }> {
     return this.order.map((id) => {
       const job = this.jobsById.get(id)!;
+      // The page reads what a job did from here when it was not open as the job ended.
+      const last = this.lastEvent.get(id);
+      const done = last?.type === 'done' ? last : undefined;
       return {
         id: job.id,
         slug: job.slug,
@@ -2210,6 +2252,11 @@ export class DownloadManager {
         state: job.state,
         receivedBytes: job.receivedBytes,
         totalBytes: job.totalBytes,
+        ...(done?.keptDir !== undefined ? { keptDir: done.keptDir } : {}),
+        ...(done?.removed !== undefined ? { removed: done.removed } : {}),
+        ...(job.replace !== null
+          ? { entry: { kind: job.replace.summary.kind, linkToFile: job.replace.summary.linkToFile } }
+          : {}),
       };
     });
   }
@@ -2518,15 +2565,18 @@ export class DownloadManager {
       // BEFORE skip-detection follows it. The publish-time checks
       // below still guard the narrow check-then-swap race for a dir that races in
       // after this point.
+      // A cleanup checks the confirmed identity of whatever is at the path, owned or not, and never reads through it.
       const refuseIfUnownedFinal = (): void => {
-        if (!isPathOccupied(finalDir) || isDownloaderOwned(finalDir)) return;
-        if (job.replace === null) {
-          throw new Error(
-            `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
-              `Remove it manually to reinstall.`,
-          );
+        if (!isPathOccupied(finalDir)) return;
+        if (job.replace !== null) {
+          assertStillReplaceable(job.replace, finalDir, slug);
+          return;
         }
-        assertStillReplaceable(job.replace, finalDir, slug);
+        if (isDownloaderOwned(finalDir)) return;
+        throw new Error(
+          `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
+            `Remove it manually to reinstall.`,
+        );
       };
 
       // Refuse a symlinked (or non-directory) `.staging` root BEFORE creating it:
@@ -2639,7 +2689,8 @@ export class DownloadManager {
       // on its own revision) still lands the next time a job runs, instead of
       // being skipped forever. A missing or stale sidecar falls through to the
       // full path, which re-fetches it through the plan.
-      const installed = readCompletion(finalDir);
+      // A cleanup always replaces the entry it was confirmed for, so it never reads that entry as done.
+      const installed = job.replace === null ? readCompletion(finalDir) : undefined;
       const installedIsCurrent =
         installed !== undefined &&
         installed.repo === job.repo &&
@@ -3339,19 +3390,23 @@ export class DownloadManager {
   }
 
   /**
-   * Settle the holders a cleanup left when its process died (`<slug>.cleanup-<pid>.<uuid>`, owner pid dead), for one
-   * slug or for every slug when `onlySlug` is null. Looks at the final path without following a link:
+   * Settle the holders a cleanup left when its process died (`<slug>.cleanup-<pid>.<ino>.<uuid>`, owner pid dead), for
+   * one slug or for every slug when `onlySlug` is null. At manager start no job of this process exists yet, so a holder
+   * with this process's pid is dead too (`ownPidDead`). Looks at the final path without following a link:
    *
    *   - an empty holder: the cleanup had finished, so the holder is removed;
    *   - the old entry in the holder and nothing at the path: the crash came before the new model was in place, so the
-   *     old entry is renamed back;
-   *   - the old entry in the holder and a complete model this app installed at the path, as a real directory: the
-   *     cleanup is finished as the job would have (a link unlinked, anything else to the Trash, else kept);
+   *     old entry is put back ({@link putBack}; when something took the path meanwhile it is kept as `.kept-`);
+   *   - the old entry in the holder and, at the path, the very folder the cleanup renamed in (the holder's device and
+   *     the inode in its name): the cleanup is finished as the job would have (a link unlinked, anything else to the
+   *     Trash, else kept);
+   *   - the old entry in the holder and another complete model this app installed at the path: the old entry is kept
+   *     as `.kept-`, never removed;
    *   - anything else: everything is left as it is.
    *
    * Never removes anything with `rm`. Never throws.
    */
-  private async recoverCleanupHolders(onlySlug: string | null): Promise<void> {
+  private async recoverCleanupHolders(onlySlug: string | null, ownPidDead = false): Promise<void> {
     const stagingRoot = join(this.modelsDir, '.staging');
     let entries: string[];
     try {
@@ -3362,10 +3417,12 @@ export class DownloadManager {
     }
     for (const name of entries) {
       const parsed = parseCleanupHolder(name);
-      if (parsed === null || (onlySlug !== null && parsed.slug !== onlySlug) || pidAlive(parsed.pid)) continue;
+      if (parsed === null || (onlySlug !== null && parsed.slug !== onlySlug)) continue;
+      if (!(ownPidDead && parsed.pid === process.pid) && pidAlive(parsed.pid)) continue;
       const holder = join(stagingRoot, name);
       try {
-        if (!lstatSync(holder).isDirectory()) continue;
+        const holderStat = lstatSync(holder, { bigint: true });
+        if (!holderStat.isDirectory()) continue;
         const inside = await readdir(holder);
         if (inside.length === 0) {
           await rmdir(holder);
@@ -3373,31 +3430,55 @@ export class DownloadManager {
         }
         if (inside.length !== 1 || inside[0] !== parsed.slug) continue;
         const finalDir = modelsChildPath(this.modelsDir, parsed.slug, 'restore');
+        const old = join(holder, parsed.slug);
         let finalStat;
         try {
-          finalStat = lstatSync(finalDir);
+          finalStat = lstatSync(finalDir, { bigint: true });
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-            await rename(join(holder, parsed.slug), finalDir);
-            await rmdir(holder);
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') continue;
+          try {
+            await putBack(old, finalDir);
+          } catch (putBackError) {
+            if ((putBackError as NodeJS.ErrnoException).code !== 'EEXIST') throw putBackError;
+            const keptDir = await this.keepHolder(holder, parsed.slug);
+            console.error(`[downloads] something took the path of "${parsed.slug}"; the old one is in "${keptDir}"`);
+            continue;
           }
+          await rmdir(holder);
           continue;
         }
-        if (!finalStat.isDirectory() || !isDownloaderOwned(finalDir) || !isModelInstalled(finalDir)) continue;
-        const old = lstatSync(join(holder, parsed.slug));
-        const { keptDir } = await this.removeReplaced(holder, parsed.slug, old.isSymbolicLink());
-        if (keptDir !== undefined) console.error(`[downloads] the old "${parsed.slug}" was kept in "${keptDir}"`);
+        if (!finalStat.isDirectory()) continue;
+        if (finalStat.dev === holderStat.dev && finalStat.ino === parsed.ino) {
+          await this.removeReplaced(holder, parsed.slug, lstatSync(old).isSymbolicLink());
+          continue;
+        }
+        if (!isDownloaderOwned(finalDir) || !isModelInstalled(finalDir)) continue;
+        const keptDir = await this.keepHolder(holder, parsed.slug);
+        console.error(
+          `[downloads] the model at "${finalDir}" is not the one a cleanup installed; the old one is in "${keptDir}"`,
+        );
       } catch {
         // One holder that cannot be settled must not block the rest.
       }
     }
   }
 
+  /** Rename a cleanup holder to `.staging/<slug>.kept-<uuid>`, which nothing removes; answers where it is now. */
+  private async keepHolder(holder: string, slug: string): Promise<string> {
+    const keptDir = join(this.modelsDir, '.staging', `${slug}${KEPT_MARK}${randomUUID()}`);
+    try {
+      await rename(holder, keptDir);
+      return keptDir;
+    } catch {
+      return holder;
+    }
+  }
+
   /**
    * Remove the old entry a cleanup moved to `<holder>/<slug>` once the new model is in place: a link is unlinked after
-   * an `lstat` that says link; anything else goes to the Trash, and only an `lstat` that finds nothing afterwards says
-   * it went. On any other outcome the holder is renamed to `.staging/<slug>.kept-<uuid>`, which nothing removes.
-   * Never calls `rm`, never throws.
+   * an `lstat` that says link; anything else goes to the Trash, and it went only when `lstat` of it answers ENOENT
+   * while the holder is still the same folder (an unreachable disk also answers ENOENT for the entry). On any other
+   * outcome the holder is kept ({@link keepHolder}) and the core log names where. Never calls `rm`, never throws.
    */
   private async removeReplaced(
     holder: string,
@@ -3406,6 +3487,7 @@ export class DownloadManager {
   ): Promise<{ removed?: 'link' | 'trash'; keptDir?: string }> {
     const old = join(holder, slug);
     let removed: 'link' | 'trash' | undefined;
+    let holderReplaced = false;
     try {
       if (isLink) {
         if ((await lstat(old)).isSymbolicLink()) {
@@ -3413,12 +3495,17 @@ export class DownloadManager {
           removed = 'link';
         }
       } else {
+        const holderBefore = entryIdentity(holder);
         try {
           await this.moveToTrash(old);
         } catch (error) {
           console.error(`[downloads] the Trash refused "${old}":`, error instanceof Error ? error.message : error);
         }
-        if (entryIdentity(old) === null) removed = 'trash';
+        const holderAfter = entryIdentity(holder);
+        holderReplaced = holderBefore !== null && holderAfter !== null && !sameIdentity(holderAfter, holderBefore);
+        if (holderBefore !== null && isGone(old) && sameIdentity(holderAfter, holderBefore)) {
+          removed = 'trash';
+        }
       }
     } catch {
       removed = undefined;
@@ -3427,13 +3514,10 @@ export class DownloadManager {
       await rmdir(holder).catch(() => {});
       return { removed };
     }
-    const keptDir = join(this.modelsDir, '.staging', `${slug}${KEPT_MARK}${randomUUID()}`);
-    try {
-      await rename(holder, keptDir);
-      return { keptDir };
-    } catch {
-      return { keptDir: holder };
-    }
+    // Another folder at the holder path is not the holder: renaming it would name a folder without the old entry.
+    const keptDir = holderReplaced ? holder : await this.keepHolder(holder, slug);
+    console.error(`[downloads] the old "${slug}" was kept in "${keptDir}"`);
+    return { keptDir };
   }
 
   /**
@@ -3820,9 +3904,9 @@ export class DownloadManager {
    * step (so it travels with the rename and only coexists with a full, verified
    * set). Then:
    *   - final dir absent → rename staging → final (+ fsync parent);
+   *   - a cleanup → the entry must still be the one the user confirmed, owned or not ({@link swapCleanup});
    *   - final dir present but UNOWNED (no marker) → refuse, leaving that dir and
-   *     its files untouched, unless the job is a cleanup whose entry is still the one
-   *     the user confirmed ({@link swapCleanup});
+   *     its files untouched;
    *   - otherwise → rollback-safe swap: move the existing entry to a temp backup,
    *     rename staging → final, fsync the parent, and only then remove the backup
    *     with {@link removeOwnedBackup}, which keeps the files of an adopted folder
@@ -3844,14 +3928,13 @@ export class DownloadManager {
     const slug = basename(finalDir);
     await mkdir(dirname(finalDir), { recursive: true });
 
-    if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir)) {
-      if (job.replace === null) {
-        throw new Error(
-          `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
-            `Remove it manually to reinstall.`,
-        );
-      }
-      assertStillReplaceable(job.replace, finalDir, slug);
+    if (job.replace !== null) {
+      if (isPathOccupied(finalDir)) assertStillReplaceable(job.replace, finalDir, slug);
+    } else if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir)) {
+      throw new Error(
+        `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
+          `Remove it manually to reinstall.`,
+      );
     }
 
     const marker: DownloadCompletion = {
@@ -3874,14 +3957,14 @@ export class DownloadManager {
       return {};
     }
 
-    // Re-check ownership adjacent to the swap: the first guard is a no-op when finalDir was absent then, so an
-    // UNOWNED dir that raced in between must still never be renamed away.
-    if (!isDownloaderOwned(finalDir)) {
-      if (job.replace === null) {
-        throw new Error(`Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`);
-      }
+    // Checked again next to the swap: the first guard is a no-op when finalDir was absent then. A cleanup never takes
+    // the owned swap, whether or not the entry now carries the app's record.
+    if (job.replace !== null) {
       assertStillReplaceable(job.replace, finalDir, slug);
       return await this.swapCleanup(stagingDir, finalDir, job, job.replace);
+    }
+    if (!isDownloaderOwned(finalDir)) {
+      throw new Error(`Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`);
     }
 
     // Rollback-safe swap of an owned final dir. The backup lives under `.staging` (a dotdir skipped by model
@@ -3932,7 +4015,9 @@ export class DownloadManager {
   ): Promise<{ keptDir?: string; removed?: 'link' | 'trash' }> {
     const slug = basename(finalDir);
     const stagingRoot = join(this.modelsDir, '.staging');
-    const holder = join(stagingRoot, `${slug}${CLEANUP_MARK}${process.pid}.${randomUUID()}`);
+    // Recovery finishes the cleanup only when the folder at the path is this new folder: a rename keeps its inode.
+    const { ino } = await lstat(stagingDir, { bigint: true });
+    const holder = join(stagingRoot, `${slug}${CLEANUP_MARK}${process.pid}.${ino}.${randomUUID()}`);
     const moved = join(holder, slug);
     await mkdir(holder);
     job.swapStarted = true;
@@ -3943,7 +4028,7 @@ export class DownloadManager {
       await rmdir(holder).catch(() => {});
       throw error;
     }
-    // A rename back would replace whatever another program put at `finalDir` since, so the old entry then stays aside.
+    // A way back must not replace whatever another program put at `finalDir` since, so the old entry then stays aside.
     const keepAside = async (): Promise<never> => {
       const keptDir = join(stagingRoot, `${slug}${KEPT_MARK}${randomUUID()}`);
       let at = moved;
@@ -3959,7 +4044,7 @@ export class DownloadManager {
     if (!sameIdentity(entryIdentity(moved), kept.identity)) {
       if (entryIdentity(finalDir) !== null) await keepAside();
       try {
-        await rename(moved, finalDir);
+        await putBack(moved, finalDir);
       } catch {
         await keepAside();
       }
@@ -3972,8 +4057,9 @@ export class DownloadManager {
     } catch (error) {
       if (entryIdentity(finalDir) !== null) await keepAside();
       try {
-        await rename(moved, finalDir);
-      } catch {
+        await putBack(moved, finalDir);
+      } catch (putBackError) {
+        if ((putBackError as NodeJS.ErrnoException).code === 'EEXIST') await keepAside();
         throw new Error(`The install failed and "${slug}" could not be put back. It is now at "${moved}".`);
       }
       await rmdir(holder).catch(() => {});
