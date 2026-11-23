@@ -1178,7 +1178,7 @@ impl Gemma4Inner {
         if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
             let cached_prefix_len = if reuse_cache
                 && allow_live_continue
-                && coordinator.can_continue_all(seq_id, tokens)
+                && coordinator.can_continue_strict_all(seq_id, tokens)
             {
                 coordinator
                     .continue_turn_all(seq_id, tokens, total_budget)

@@ -1023,9 +1023,12 @@ impl Inkling2StateStore {
             if Instant::now() >= deadline {
                 return false;
             }
-            self.drive_write_behind(coordinator, true);
+            let wb_before = self.disk.as_ref().map_or(0, |d| d.write_behind.len());
+            let staged = self.drive_write_behind(coordinator, true);
             let chained = self.chain_step(coordinator, deadline);
             let polled = self.poll_offload(coordinator);
+            let wb_progressed =
+                staged || self.disk.as_ref().map_or(0, |d| d.write_behind.len()) < wb_before;
 
             if !has_work(self) {
                 return true;
@@ -1033,7 +1036,7 @@ impl Inkling2StateStore {
             if Instant::now() >= deadline {
                 return false;
             }
-            if polled || chained {
+            if polled || chained || wb_progressed {
                 continue;
             }
             let Some(disk) = self.disk.as_ref() else {

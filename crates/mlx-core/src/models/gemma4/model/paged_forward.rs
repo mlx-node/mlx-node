@@ -48,7 +48,7 @@ impl Gemma4Inner {
             && self
                 .kv_cache_coordinator
                 .as_ref()
-                .is_some_and(|coordinator| coordinator.can_continue_all(seq_id, tokens))
+                .is_some_and(|coordinator| coordinator.can_continue_strict_all(seq_id, tokens))
         {
             let cached_prefix_len = self
                 .kv_cache_coordinator

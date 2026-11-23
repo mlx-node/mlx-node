@@ -179,7 +179,7 @@ impl HybridKVCacheCoordinator {
         seq_id: u32,
         tokens: &[u32],
     ) -> std::result::Result<u32, String> {
-        if self.can_continue_all(seq_id, tokens) {
+        if self.can_continue_strict_all(seq_id, tokens) {
             return self.continue_turn_all(seq_id, tokens, tokens.len() as u32);
         }
         self.reset_scheduled_request(seq_id)?;
