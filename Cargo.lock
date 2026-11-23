@@ -1765,23 +1765,55 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlx-core"
+name = "mlx-audio"
+version = "0.0.0"
+dependencies = [
+ "coreaudio-rs",
+ "objc2",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "thiserror",
+ "tokio",
+ "windows-sys",
+]
+
+[[package]]
+name = "mlx-clairic"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
- "cc",
- "coreaudio-rs",
- "criterion",
  "fancy-regex 0.20.2",
+ "image",
+ "llguidance",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror",
+ "tokenizers",
+ "toktrie",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
+name = "mlx-core"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "criterion",
  "futures",
  "half",
  "image",
  "libc",
- "llguidance",
  "memchr",
  "mimalloc-safe",
  "minijinja",
+ "mlx-audio",
+ "mlx-clairic",
  "mlx-db",
  "mlx-metal",
  "mlx-paged-attn",
@@ -1790,11 +1822,6 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "objc2",
- "objc2-core-audio",
- "objc2-core-audio-types",
- "objc2-core-foundation",
- "objc2-foundation",
  "parquet",
  "rand 0.10.3",
  "regex",
@@ -1806,7 +1833,6 @@ dependencies = [
  "sqlx",
  "tokenizers",
  "tokio",
- "toktrie",
  "tracing",
  "tracing-subscriber",
  "unicode-ident",

@@ -48,7 +48,7 @@ use super::ops::{
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::linear;
+use crate::models::moe_common::linear;
 use crate::nn::Activations;
 use crate::utils::gguf_kquant::KQuantFormat;
 
@@ -2818,8 +2818,8 @@ pub mod forced {
 
     use super::bad;
     use crate::array::{DType, MxArray};
-    use crate::models::deepseek_v41::ops::route_select;
     use crate::models::hy_v4_flash::config::MoeConfig;
+    use crate::models::moe_common::route_select;
 
     thread_local! {
         static FORCED: RefCell<HashMap<usize, Vec<u32>>> = RefCell::new(HashMap::new());

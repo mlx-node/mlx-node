@@ -65,13 +65,6 @@ Options:
                                   Token cadence for paged decode cache clear.
                                   Defaults to 1024 (mirrors DFlash's
                                   _DECODE_CLEAR_CACHE_INTERVAL_TOKENS).
-    MLX_PAGED_NATIVE_KV_WRITE     Set to 0/false/off to disable graph-native
-                                  paged KV writes for every paged family.
-                                  Batched decode hard-errors when off.
-    MLX_PAGED_GRAPH_DECODE_GATHER
-                                  Set to 0/false/off to disable the
-                                  graph-native paged decode gather for every
-                                  paged family.
     MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT
                                   Override retained Gemma4 sliding-cache
                                   checkpoints. Defaults dynamically from the

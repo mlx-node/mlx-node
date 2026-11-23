@@ -19,9 +19,6 @@
 //! and the rollback's cut leaves the exact rows.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::sync::Arc;
-use std::time::Instant;
-
 use napi::{Error, Result};
 
 use super::cache::WINDOW_SLACK;
@@ -30,19 +27,11 @@ use super::model::{Logits, Model, Want};
 use super::moe::RowKind;
 use super::mtp::{Draft, Lagged, MtpLayer, Seeds};
 use crate::array::MxArray;
-use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{
-    ChatBackend, FinalizeArgs, MtpBackend, MtpStepper, ResetScope, SaveStateArgs, SpecFrontier,
-    TurnOutput, WholeTurnArgs,
-};
-use crate::engine::decode::TurnStreaming;
-use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn};
-use crate::engine::params::{generated_capacity_hint, resolve_enable_thinking};
+use crate::engine::backend::{MtpStepper, SpecFrontier, TurnOutput, WholeTurnArgs};
+use crate::engine::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
+use crate::engine::mtp_turn::{FlatMtpBackend, run_flat_mtp_turn};
 use crate::engine::plan::{MediaCapabilities, SpeculativeKind, SpeculativePlan};
-use crate::engine::{ReasoningTracker, apply_all_penalties, compute_performance_metrics};
-use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
-use crate::stream::{Stream, WiredLimitContext};
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 /// Most trunk rows one cycle may add past the snapshot: the anchor plus
@@ -828,176 +817,12 @@ impl MtpStepper for Stepper<'_> {
     }
 }
 
-/// Puts `backend` back to an empty conversation and returns `e`.
-fn fail_closed<B: ChatBackend, T>(backend: &mut B, e: Error) -> Result<T> {
-    if let Err(r) = backend.reset_caches(ResetScope::Command) {
-        tracing::error!(
-            "hy_v4_flash MTP turn failed ({}) and the reset failed too ({})",
-            e.reason,
-            r.reason
-        );
-    }
-    Err(e)
-}
+impl FlatMtpBackend for Inner {}
 
-/// One whole MTP turn: the generic flat flow with `run_mtp_turn` as the
-/// decode loop.
-pub(crate) fn run_turn<B: MtpBackend>(
+/// One whole MTP turn: delegates to the engine-owned [`run_flat_mtp_turn`].
+pub(crate) fn run_turn<B: FlatMtpBackend>(
     backend: &mut B,
     args: &mut WholeTurnArgs<'_>,
 ) -> Result<TurnOutput> {
-    let tokens = args.tokens;
-    if tokens.is_empty() {
-        return Err(bad("empty prompt"));
-    }
-    let tokenizer = Arc::clone(args.tokenizer);
-    let mut p = args.params.clone();
-    p.extra_eos_ids = backend.extra_eos_ids();
-    let max_new = match backend.context_token_limit() {
-        Some(limit) => p
-            .max_new_tokens
-            .min(i32::try_from((limit + 1).saturating_sub(tokens.len())).unwrap_or(i32::MAX)),
-        None => p.max_new_tokens,
-    };
-    let report = p.report_performance;
-    let started = report.then(Instant::now);
-    let hit = backend.verify_cache_prefix(tokens, p.reuse_cache);
-    let (prefill, cached) = if hit > 0 && hit < tokens.len() {
-        (&tokens[hit..], hit)
-    } else {
-        if let Err(e) = backend.reset_caches(ResetScope::PrefixMiss) {
-            return fail_closed(backend, e);
-        }
-        (tokens, 0)
-    };
-    let stream = Stream::generation();
-    let _wired = backend
-        .wired_limit_bytes()
-        .map(|b| WiredLimitContext::new(b, vec![stream]));
-    let mut profiler = DecodeProfiler::new(
-        backend.profiler_label(args.plan.is_delta, args.sink.is_some()),
-        backend.family_name(),
-    );
-    profiler.set_prompt_tokens(prefill.len() as u32);
-    profiler.snapshot_memory_before();
-    let close = backend.think_end_for_turn(args.config, &tokenizer);
-    let mut tracker = ReasoningTracker::from_setup(&args.thinking, &close);
-    let skip_special = backend.stream_skip_special_tokens();
-    let mut ts = args.sink.map(|_| {
-        TurnStreaming::new(
-            &*backend,
-            tokenizer.inner(),
-            args.thinking.enabled,
-            skip_special,
-        )
-    });
-    let mut history = tokens.to_vec();
-    let mut generated = Vec::with_capacity(generated_capacity_hint(max_new));
-    let mut finish = String::from("length");
-    let mut first: Option<Instant> = None;
-
-    let decoded: Result<()> = (|| {
-        let progress = args.sink.and_then(|s| s.progress());
-        if let Some(pr) = progress {
-            pr.begin_prefill(prefill.len() as u32, cached as u32);
-        }
-        profiler.begin_prefill();
-        let logits = backend.prefill(prefill, stream)?;
-        profiler.end_prefill();
-        let logits = apply_all_penalties(logits, &history, &p)?;
-        let y = crate::sampling::sample(&logits, p.sampling_config)?;
-        y.eval();
-        if let Some(pr) = progress {
-            pr.first_token();
-        }
-        backend.eval_caches()?;
-        if report {
-            first = Some(Instant::now());
-        }
-        let ctx = match (args.sink, ts.as_mut()) {
-            (Some(s), Some(t)) => t.ctx(Some(s), args.cancelled),
-            _ => None,
-        };
-        let mut rng = rand::rng();
-        run_mtp_turn(
-            &mut *backend,
-            &mut rng,
-            MtpTurnArgs {
-                y,
-                depth: p.mtp_depth,
-                params: &p,
-                reasoning_tracker: &mut tracker,
-                profiler: &mut profiler,
-                max_new_tokens: max_new,
-                eos_id: args.eos_id,
-                generated_tokens: &mut generated,
-                token_history: &mut history,
-                finish_reason: &mut finish,
-                first_token_instant: &mut first,
-                report_perf: report,
-                generation_stream: stream,
-                prompt_hidden: None,
-                prompt_hidden_ids: None,
-                cancel_flag: args.cancelled,
-            },
-            ctx,
-        )?;
-        Ok(())
-    })();
-    if let Err(e) = decoded {
-        return fail_closed(backend, e);
-    }
-
-    backend.save_cache_state(SaveStateArgs {
-        reuse_cache: p.reuse_cache,
-        is_delta: args.plan.is_delta,
-        has_images: false,
-        generated_tokens: &generated,
-        finish_reason: &finish,
-        save_tokens: tokens,
-        save_expanded_tokens: None,
-        image_cache_key: 0,
-    });
-
-    let performance = if report {
-        compute_performance_metrics(started, first, prefill.len(), generated.len()).map(|mut m| {
-            backend.augment_performance(&profiler, &mut m);
-            m
-        })
-    } else {
-        None
-    };
-    if let (Some(s), Some(t)) = (args.sink, ts.as_mut()) {
-        let full = tokenizer
-            .decode_sync(&generated, skip_special)
-            .unwrap_or_else(|e| {
-                tracing::warn!("hy_v4_flash: failed to decode generated tokens: {e}");
-                String::new()
-            });
-        t.flush_residual(&full, p.include_reasoning, s);
-    }
-    let finalized = backend.finalize_turn(FinalizeArgs {
-        tokenizer: &tokenizer,
-        generated_tokens: &generated,
-        finish_reason: finish,
-        think_end_id: close.think_end_id,
-        think_end_str: close.think_end_str.as_deref(),
-        think_end_extra_ids: &close.think_end_extra_ids,
-        performance,
-        include_reasoning: p.include_reasoning,
-        thinking_enabled: args.thinking.enabled,
-        prompt_tokens: tokens.len() as u32,
-        reasoning: tracker.outcome(),
-    });
-    let mut result = match finalized {
-        Ok(r) => r,
-        Err(e) => return fail_closed(backend, e),
-    };
-    result.thinking_enabled = resolve_enable_thinking(args.config).unwrap_or(true);
-    result.cached_tokens = cached as u32;
-    if let (Some(s), Some(t)) = (args.sink, ts.as_mut()) {
-        t.emitter.finish(&result, s);
-        return Ok(TurnOutput::Streamed);
-    }
-    Ok(TurnOutput::Complete(Box::new(result)))
+    run_flat_mtp_turn(backend, args)
 }

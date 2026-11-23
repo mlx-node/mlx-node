@@ -10,9 +10,9 @@ use crate::array::MxArray;
 use crate::models::paddleocr_vl::config::VisionConfig;
 use crate::nn::LayerNorm;
 use crate::vision::embeddings::{PatchEmbedding, VisionPositionEmbedding};
-use crate::vision::encoder::VisionEncoderLayer;
+use crate::vision::encoder::{VisionEncoderLayer, build_vision_segment_boundaries};
 use crate::vision::projector::SpatialProjector;
-use crate::vision::rope_vision::VisionRotaryEmbedding;
+use crate::vision::rope_vision::{VisionRotaryEmbedding, compute_rot_pos_emb_2d};
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
 
@@ -204,70 +204,6 @@ impl PaddleOCRVisionModel {
         self.layers.push(Arc::new(layer.clone()));
     }
 
-    /// Compute rotary position embeddings for the grid
-    fn compute_rot_pos_emb(&self, grid_thw: &MxArray) -> Result<MxArray> {
-        let grid_data = grid_thw.to_int32()?;
-        let num_images = grid_thw.shape()?[0] as usize;
-
-        let mut height_ids: Vec<i32> = Vec::new();
-        let mut width_ids: Vec<i32> = Vec::new();
-
-        for img_idx in 0..num_images {
-            let t = grid_data[img_idx * 3];
-            let h = grid_data[img_idx * 3 + 1];
-            let w = grid_data[img_idx * 3 + 2];
-
-            let num_patches = t * h * w;
-
-            for idx in 0..num_patches {
-                let local_idx = idx % (h * w);
-                let h_id = local_idx / w;
-                let w_id = local_idx % w;
-                height_ids.push(h_id);
-                width_ids.push(w_id);
-            }
-        }
-
-        // Stack height and width position IDs
-        let h_ids = MxArray::from_int32(&height_ids, &[height_ids.len() as i64])?;
-        let w_ids = MxArray::from_int32(&width_ids, &[width_ids.len() as i64])?;
-        let pos_ids = MxArray::stack(vec![&h_ids, &w_ids], Some(-1))?;
-
-        // Get max grid size for computing frequencies
-        let max_h = grid_data
-            .iter()
-            .skip(1)
-            .step_by(3)
-            .max()
-            .copied()
-            .unwrap_or(1);
-        let max_w = grid_data
-            .iter()
-            .skip(2)
-            .step_by(3)
-            .max()
-            .copied()
-            .unwrap_or(1);
-        let max_size = max_h.max(max_w) as u32;
-
-        let freqs = self.rotary_pos_emb.forward(max_size)?;
-
-        // Gather frequencies using position IDs
-        // pos_ids: [total_patches, 2]
-        // freqs: [max_size, dim]
-        // Output: [total_patches, dim*2] (for h and w concatenated)
-
-        // Gather h and w frequencies separately
-        let h_ids_flat = pos_ids.slice_axis(1, 0, 1)?.reshape(&[-1])?;
-        let w_ids_flat = pos_ids.slice_axis(1, 1, 2)?.reshape(&[-1])?;
-
-        let h_freqs = freqs.take(&h_ids_flat, 0)?;
-        let w_freqs = freqs.take(&w_ids_flat, 0)?;
-
-        // Concatenate h and w frequencies
-        MxArray::concatenate_many(vec![&h_freqs, &w_freqs], Some(-1))
-    }
-
     /// Forward pass
     ///
     /// # Arguments
@@ -281,29 +217,16 @@ impl PaddleOCRVisionModel {
         let mut h = self.embeddings.forward(hidden_states, grid_thw)?;
 
         // Compute rotary position embeddings
-        let rotary_pos_emb = self.compute_rot_pos_emb(grid_thw)?;
+        let rotary_pos_emb = compute_rot_pos_emb_2d(&self.rotary_pos_emb, grid_thw)?;
 
-        // Compute cumulative sequence lengths for attention
-        let grid_data = grid_thw.to_int32()?;
-        let num_images = grid_thw.shape()?[0] as usize;
-
-        let mut cu_seqlens: Vec<i32> = vec![0];
-        for img_idx in 0..num_images {
-            let t = grid_data[img_idx * 3];
-            let h = grid_data[img_idx * 3 + 1];
-            let w = grid_data[img_idx * 3 + 2];
-            for _ in 0..t {
-                let prev = *cu_seqlens.last().ok_or_else(|| {
-                    Error::new(Status::GenericFailure, "cu_seqlens lost its seed element")
-                })?;
-                cu_seqlens.push(prev + h * w);
-            }
-        }
-        let cu_seqlens_arr = MxArray::from_int32(&cu_seqlens, &[cu_seqlens.len() as i64])?;
+        // Build cumulative per-image/frame segment boundaries and run segmented SDPA
+        // instead of constructing a quadratic global block-diagonal mask per layer.
+        let total_seq_len = h.shape()?[0];
+        let segment_boundaries = build_vision_segment_boundaries(grid_thw, total_seq_len)?;
 
         // Forward through encoder layers
         for layer in &self.layers {
-            h = layer.forward(&h, &cu_seqlens_arr, Some(&rotary_pos_emb))?;
+            h = layer.forward_segmented(&h, &segment_boundaries, Some(&rotary_pos_emb))?;
         }
 
         // Post layer norm

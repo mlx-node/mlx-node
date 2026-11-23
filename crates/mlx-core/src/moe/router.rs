@@ -105,6 +105,84 @@ pub fn topk_from_logits(
     }
 }
 
+/// Compute top-k routing weights and indices using sigmoid gating with an
+/// optional selection-only expert bias (DeepSeek-V3 / LFM2 / NemotronH /
+/// Inkling2 convention):
+///
+/// 1. `scores = sigmoid(logits.astype(Float32))` (skips cast when already F32)
+/// 2. `selection = scores + bias` when `bias` is `Some`, else `scores`
+/// 3. Top-k selection along axis `-1`:
+///    - `deterministic_tie_break = true`: descending `argsort(-selection)[:, :top_k]`
+///      (breaks exact ties in favor of lower expert indices; used by Inkling2)
+///    - `deterministic_tie_break = false`: `argpartition(selection, -top_k)[:, E-top_k:]`
+///      (used by LFM2 and NemotronH)
+/// 4. Gather routing weights from the **unbiased** `scores` at `top_indices`.
+/// 5. If `norm_topk`, divide by `sum(weights, axis=-1, keepdims=true) + renorm_eps`.
+/// 6. If `route_scale != 1.0`, multiply weights by `route_scale`.
+///
+/// `logits` must be 2D `[N, num_experts]`. Returns `(weights, indices)` each
+/// of shape `[N, top_k]`, with `weights` in `Float32` so each caller can cast
+/// back to its activation dtype at its own boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn sigmoid_biased_topk_from_logits(
+    logits: &MxArray,
+    bias: Option<&MxArray>,
+    top_k: i32,
+    renorm_eps: f64,
+    route_scale: f64,
+    norm_topk: bool,
+    deterministic_tie_break: bool,
+) -> Result<(MxArray, MxArray)> {
+    let shape = logits.shape()?;
+    if shape.len() != 2 {
+        return Err(Error::from_reason(format!(
+            "sigmoid_biased_topk_from_logits expects 2D [N, num_experts] logits, got {}D",
+            shape.len()
+        )));
+    }
+    let num_experts = shape[1];
+    let top_k_i64 = i64::from(top_k);
+    if top_k <= 0 || top_k_i64 > num_experts {
+        return Err(Error::from_reason(format!(
+            "sigmoid_biased_topk_from_logits requires 0 < top_k <= num_experts, got top_k={}, num_experts={}",
+            top_k, num_experts
+        )));
+    }
+
+    let logits_f32 = if logits.dtype()? == crate::array::DType::Float32 {
+        logits.clone()
+    } else {
+        logits.astype(crate::array::DType::Float32)?
+    };
+    let scores = Activations::sigmoid(&logits_f32)?;
+    let selection = match bias {
+        Some(b) => scores.add(b)?,
+        None => scores.clone(),
+    };
+
+    let top_indices = if deterministic_tie_break {
+        selection
+            .negative()?
+            .argsort(Some(-1))?
+            .slice_axis(1, 0, top_k_i64)?
+    } else {
+        let inds_full = selection.argpartition(-top_k, Some(-1))?;
+        inds_full.slice_axis(1, num_experts - top_k_i64, num_experts)?
+    };
+
+    let mut top_weights = scores.take_along_axis(&top_indices, -1)?;
+    if norm_topk {
+        let denom = top_weights
+            .sum(Some(&[-1]), Some(true))?
+            .add_scalar(renorm_eps)?;
+        top_weights = top_weights.div(&denom)?;
+    }
+    if route_scale != 1.0 {
+        top_weights = top_weights.mul_scalar(route_scale)?;
+    }
+    Ok((top_weights, top_indices))
+}
+
 /// Static configuration for a [`TopKRouter`].
 #[derive(Debug, Clone, Copy)]
 pub struct RouterConfig {
@@ -537,5 +615,70 @@ mod tests {
         // top_k = 0
         let r = topk_from_logits(&l, 4, 0, RoutingMode::GptOss);
         assert!(r.is_err(), "expected error when top_k == 0");
+    }
+
+    // ---------- sigmoid_biased_topk_from_logits direct tests ----------
+
+    #[test]
+    fn test_sigmoid_biased_topk_bias_selects_without_contaminating_weights() {
+        // Logits favor experts 0 and 1, while a large bias on experts 2 and 3
+        // flips top-2 selection to {2, 3}. Returned weights must be derived
+        // from the UNBIASED sigmoid(logits) of experts {2, 3}.
+        let l = MxArray::from_float32(&[2.0, 1.5, -1.0, -2.0], &[1, 4]).unwrap();
+        let bias = MxArray::from_float32(&[0.0, 0.0, 5.0, 5.0], &[4]).unwrap();
+
+        let (weights, indices) =
+            sigmoid_biased_topk_from_logits(&l, Some(&bias), 2, 1e-6, 2.5, true, false).unwrap();
+        weights.eval();
+        indices.eval();
+        let idx = indices.to_uint32().unwrap();
+        let w = weights.to_float32().unwrap();
+
+        let mut sorted_idx = idx.to_vec();
+        sorted_idx.sort_unstable();
+        assert_eq!(sorted_idx, vec![2, 3]);
+
+        let sig = |z: f32| 1.0f32 / (1.0 + (-z).exp());
+        let s2 = sig(-1.0);
+        let s3 = sig(-2.0);
+        let denom = s2 + s3 + 1e-6;
+        for (&e, &got) in idx.iter().zip(w.iter()) {
+            let expected = (if e == 2 { s2 } else { s3 }) / denom * 2.5;
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "expert {e}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sigmoid_biased_topk_deterministic_tie_break_prefers_lower_indices() {
+        // All logits and biases equal -> deterministic tie-break must pick [0, 1].
+        let l = MxArray::from_float32(&[0.0, 0.0, 0.0, 0.0], &[1, 4]).unwrap();
+        let (weights, indices) =
+            sigmoid_biased_topk_from_logits(&l, None, 2, 1e-20, 1.0, true, true).unwrap();
+        weights.eval();
+        indices.eval();
+        assert_eq!(indices.to_uint32().unwrap().as_ref(), &[0, 1]);
+        let w = weights.to_float32().unwrap();
+        assert!((w[0] - 0.5).abs() < 1e-5);
+        assert!((w[1] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_sigmoid_biased_topk_unnormalized_and_validation() {
+        let l = MxArray::from_float32(&[0.0, 1.0, 2.0, -1.0], &[1, 4]).unwrap();
+        let (weights, indices) =
+            sigmoid_biased_topk_from_logits(&l, None, 2, 1e-6, 1.0, false, true).unwrap();
+        weights.eval();
+        indices.eval();
+        assert_eq!(indices.to_uint32().unwrap().as_ref(), &[2, 1]);
+        let sig = |z: f32| 1.0f32 / (1.0 + (-z).exp());
+        let w = weights.to_float32().unwrap();
+        assert!((w[0] - sig(2.0)).abs() < 1e-5);
+        assert!((w[1] - sig(1.0)).abs() < 1e-5);
+
+        assert!(sigmoid_biased_topk_from_logits(&l, None, 0, 1e-6, 1.0, true, false).is_err());
+        assert!(sigmoid_biased_topk_from_logits(&l, None, 5, 1e-6, 1.0, true, false).is_err());
     }
 }

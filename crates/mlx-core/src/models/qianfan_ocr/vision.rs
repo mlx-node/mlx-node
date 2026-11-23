@@ -14,11 +14,12 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::persistence::get_tensor;
 use crate::models::qianfan_ocr::config::InternVisionConfig;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
+use crate::vision::cnn::get_tensor;
 use crate::vision::conv2d::Conv2d;
+use crate::vision::encoder::VisionMLP;
 use crate::vision::interpolate::bilinear_interpolate;
 
 // ============================================================================
@@ -256,44 +257,16 @@ impl Clone for InternVisionAttention {
 }
 
 // ============================================================================
-// InternVisionMLP
+// VisionMLP builder (shared GELU MLP from crate::vision::encoder)
 // ============================================================================
 
-/// Standard MLP with GELU activation (not gated SiLU).
-pub(crate) struct InternVisionMLP {
-    fc1: Linear,
-    fc2: Linear,
-}
-
-impl InternVisionMLP {
-    pub fn build(weights: &HashMap<String, MxArray>, prefix: &str) -> Result<Self> {
-        let fc1 = Linear::from_weights(
-            &get_tensor(weights, &format!("{prefix}.mlp.fc1.weight"))?,
-            Some(&get_tensor(weights, &format!("{prefix}.mlp.fc1.bias"))?),
-        )?;
-        let fc2 = Linear::from_weights(
-            &get_tensor(weights, &format!("{prefix}.mlp.fc2.weight"))?,
-            Some(&get_tensor(weights, &format!("{prefix}.mlp.fc2.bias"))?),
-        )?;
-
-        Ok(Self { fc1, fc2 })
-    }
-
-    /// Forward: x -> fc1 -> GELU -> fc2
-    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        let hidden = self.fc1.forward(x)?;
-        let activated = Activations::gelu(&hidden)?;
-        self.fc2.forward(&activated)
-    }
-}
-
-impl Clone for InternVisionMLP {
-    fn clone(&self) -> Self {
-        Self {
-            fc1: self.fc1.clone(),
-            fc2: self.fc2.clone(),
-        }
-    }
+fn build_vision_mlp(weights: &HashMap<String, MxArray>, prefix: &str) -> Result<VisionMLP> {
+    VisionMLP::new(
+        &get_tensor(weights, &format!("{prefix}.mlp.fc1.weight"))?,
+        Some(&get_tensor(weights, &format!("{prefix}.mlp.fc1.bias"))?),
+        &get_tensor(weights, &format!("{prefix}.mlp.fc2.weight"))?,
+        Some(&get_tensor(weights, &format!("{prefix}.mlp.fc2.bias"))?),
+    )
 }
 
 // ============================================================================
@@ -311,7 +284,7 @@ pub(crate) struct InternVisionEncoderLayer {
     /// Per-element multiplier [hidden_size] applied to attention output
     layer_scale_1: MxArray,
     layer_norm2: LayerNorm,
-    mlp: InternVisionMLP,
+    mlp: VisionMLP,
     /// Per-element multiplier [hidden_size] applied to MLP output
     layer_scale_2: MxArray,
 }
@@ -336,7 +309,7 @@ impl InternVisionEncoderLayer {
         )?;
 
         let attn = InternVisionAttention::build(weights, prefix, config)?;
-        let mlp = InternVisionMLP::build(weights, prefix)?;
+        let mlp = build_vision_mlp(weights, prefix)?;
 
         let layer_scale_1 = get_tensor(weights, &format!("{prefix}.ls1"))?;
         let layer_scale_2 = get_tensor(weights, &format!("{prefix}.ls2"))?;
@@ -607,7 +580,7 @@ mod tests {
         let weights = make_test_weights(&config, prefix);
 
         let layer_prefix = format!("{prefix}.layers.0");
-        let mlp = InternVisionMLP::build(&weights, &layer_prefix).unwrap();
+        let mlp = build_vision_mlp(&weights, &layer_prefix).unwrap();
 
         let d = config.hidden_size as i64;
         let b = 1i64;

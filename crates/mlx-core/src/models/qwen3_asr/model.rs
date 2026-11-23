@@ -674,215 +674,72 @@ impl TextDecoder {
     }
 
     /// One C++ graph-construction call for the entire decoder token. This is
-    /// the same dense Qwen3 fused step used by the text model, seeded with the
-    /// KV tensors produced by the multimodal prefill above. It removes the
+    /// the same Qwen3 fused step used by the text model, seeded with the KV
+    /// tensors produced by the multimodal prefill above. It removes the
     /// per-layer Rust/FFI dispatch from the latency-critical live path while
     /// retaining the exact Qwen3 attention/MLP graph.
     fn decode_fused(&self, token: &MxArray, kv: &mut FusedKv) -> Result<MxArray> {
-        use mlx_sys as sys;
-        use std::ptr;
+        use crate::models::qwen3::{
+            FusedQwen3PackedProj, FusedQwen3QuantWeights, FusedQwen3StepConfig,
+            forward_qwen3_fused_step,
+        };
 
-        let FusedKv {
-            keys: kv_keys,
-            values: kv_values,
-            cache_idx,
-        } = kv;
         let input_ids = token.reshape(&[1, 1])?;
-        let rope_offsets = MxArray::from_int32(&[*cache_idx], &[1])?;
-        let mut layer_weights: Vec<*mut sys::mlx_array> =
-            Vec::with_capacity(self.layers.len() * 11);
-        let mut quant_scales: Vec<*mut sys::mlx_array> = Vec::with_capacity(self.layers.len() * 7);
-        let mut quant_biases: Vec<*mut sys::mlx_array> = Vec::with_capacity(self.layers.len() * 7);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let packed = self.packed.as_ref().map(|packed| &packed.layers[index]);
-            layer_weights.push(layer.get_input_layernorm_weight().handle.0);
-            layer_weights.push(layer.get_post_attention_layernorm_weight().handle.0);
-            if let Some(packed) = packed {
-                layer_weights.extend([
-                    packed.q.weight.handle.0,
-                    packed.k.weight.handle.0,
-                    packed.v.weight.handle.0,
-                    packed.o.weight.handle.0,
-                ]);
-            } else {
-                layer_weights.extend([
-                    layer.self_attn.get_q_proj_weight().handle.0,
-                    layer.self_attn.get_k_proj_weight().handle.0,
-                    layer.self_attn.get_v_proj_weight().handle.0,
-                    layer.self_attn.get_o_proj_weight().handle.0,
-                ]);
-            }
-            layer_weights.push(
-                layer
-                    .self_attn
-                    .get_q_norm_weight()
-                    .map(|array| array.handle.0)
-                    .unwrap_or(ptr::null_mut()),
-            );
-            layer_weights.push(
-                layer
-                    .self_attn
-                    .get_k_norm_weight()
-                    .map(|array| array.handle.0)
-                    .unwrap_or(ptr::null_mut()),
-            );
-            if let Some(packed) = packed {
-                layer_weights.extend([
-                    packed.gate.weight.handle.0,
-                    packed.up.weight.handle.0,
-                    packed.down.weight.handle.0,
-                ]);
-                for projection in [
-                    &packed.q,
-                    &packed.k,
-                    &packed.v,
-                    &packed.o,
-                    &packed.gate,
-                    &packed.up,
-                    &packed.down,
-                ] {
-                    quant_scales.push(projection.scales.handle.0);
-                    quant_biases.push(
-                        projection
-                            .biases
-                            .as_ref()
-                            .map(|biases| biases.handle.0)
-                            .unwrap_or(ptr::null_mut()),
-                    );
-                }
-            } else {
-                layer_weights.extend([
-                    layer.mlp.get_gate_proj_weight().handle.0,
-                    layer.mlp.get_up_proj_weight().handle.0,
-                    layer.mlp.get_down_proj_weight().handle.0,
-                ]);
+        let rope_offsets = MxArray::from_int32(&[kv.cache_idx], &[1])?;
+        let step_config = FusedQwen3StepConfig {
+            hidden_size: self.config.hidden_size as i32,
+            num_heads: self.config.num_attention_heads as i32,
+            num_kv_heads: self.config.num_key_value_heads as i32,
+            head_dim: self.config.head_dim as i32,
+            rope_theta: self.config.rope_parameters.rope_theta as f32,
+            rms_norm_eps: self.config.rms_norm_eps as f32,
+            tie_word_embeddings: true,
+        };
+        fn as_fused_proj(p: &PackedProjection) -> FusedQwen3PackedProj<'_> {
+            FusedQwen3PackedProj {
+                weight: &p.weight,
+                scales: &p.scales,
+                biases: p.biases.as_ref(),
             }
         }
-        let key_ptrs: Vec<_> = kv_keys
-            .iter()
-            .map(|value| {
-                value
-                    .as_ref()
-                    .map(|array| array.handle.0)
-                    .unwrap_or(ptr::null_mut())
-            })
-            .collect();
-        let value_ptrs: Vec<_> = kv_values
-            .iter()
-            .map(|value| {
-                value
-                    .as_ref()
-                    .map(|array| array.handle.0)
-                    .unwrap_or(ptr::null_mut())
-            })
-            .collect();
-        let mut logits_ptr = ptr::null_mut();
-        let mut key_outputs = vec![ptr::null_mut(); self.layers.len()];
-        let mut value_outputs = vec![ptr::null_mut(); self.layers.len()];
-        let mut next_cache_idx = 0;
-        let final_norm = self.final_norm.get_weight();
+        let quantized = self.packed.as_ref().map(|packed| FusedQwen3QuantWeights {
+            embedding: as_fused_proj(&packed.embedding),
+            layers: packed
+                .layers
+                .iter()
+                .map(|layer| {
+                    [
+                        as_fused_proj(&layer.q),
+                        as_fused_proj(&layer.k),
+                        as_fused_proj(&layer.v),
+                        as_fused_proj(&layer.o),
+                        as_fused_proj(&layer.gate),
+                        as_fused_proj(&layer.up),
+                        as_fused_proj(&layer.down),
+                    ]
+                })
+                .collect(),
+            group_size: packed.settings.group_size,
+            bits: packed.settings.bits,
+            mode: packed.settings.mode.as_str(),
+        });
         let dense_embedding = self.packed.is_none().then(|| self.embedding.get_weight());
-        let (embedding_weight, embedding_scales, embedding_biases, group_size, bits, mode) =
-            if let Some(packed) = &self.packed {
-                (
-                    packed.embedding.weight.handle.0,
-                    packed.embedding.scales.handle.0,
-                    packed
-                        .embedding
-                        .biases
-                        .as_ref()
-                        .map(|biases| biases.handle.0)
-                        .unwrap_or(ptr::null_mut()),
-                    packed.settings.group_size,
-                    packed.settings.bits,
-                    packed.settings.mode.as_str(),
-                )
-            } else {
-                (
-                    dense_embedding
-                        .as_ref()
-                        .ok_or_else(|| Error::from_reason("dense embedding exists"))?
-                        .handle
-                        .0,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    0,
-                    0,
-                    "affine",
-                )
-            };
-        let mode = std::ffi::CString::new(mode)
-            .map_err(|_| Error::from_reason("Invalid Qwen3-ASR quantization mode"))?;
-        unsafe {
-            sys::mlx_qwen3_forward_step(
-                input_ids.handle.0,
-                embedding_weight,
-                layer_weights.as_ptr(),
-                if quant_scales.is_empty() {
-                    ptr::null()
-                } else {
-                    quant_scales.as_ptr()
-                },
-                if quant_biases.is_empty() {
-                    ptr::null()
-                } else {
-                    quant_biases.as_ptr()
-                },
-                embedding_scales,
-                embedding_biases,
-                group_size,
-                bits,
-                mode.as_ptr(),
-                self.layers.len() as i32,
-                final_norm.handle.0,
-                ptr::null_mut(),
-                true,
-                self.config.hidden_size as i32,
-                self.config.num_attention_heads as i32,
-                self.config.num_key_value_heads as i32,
-                self.config.head_dim as i32,
-                self.config.rope_parameters.rope_theta as f32,
-                self.config.rms_norm_eps as f32,
-                key_ptrs.as_ptr(),
-                value_ptrs.as_ptr(),
-                *cache_idx,
-                rope_offsets.handle.0,
-                ptr::null_mut(),
-                &mut logits_ptr,
-                key_outputs.as_mut_ptr(),
-                value_outputs.as_mut_ptr(),
-                &mut next_cache_idx,
-            );
-        }
-        if logits_ptr.is_null()
-            || key_outputs.iter().any(|pointer| pointer.is_null())
-            || value_outputs.iter().any(|pointer| pointer.is_null())
-        {
-            return Err(Error::from_reason(
-                "Fused Qwen3-ASR decoder returned a null output",
-            ));
-        }
-        for (slot, pointer) in kv_keys.iter_mut().zip(key_outputs) {
-            if let Some(array) = slot
-                && let Some(handle) = Arc::get_mut(&mut array.handle)
-            {
-                unsafe { handle.overwrite(pointer) };
-                continue;
-            }
-            *slot = Some(MxArray::from_handle(pointer, "qwen3_asr_fused_kv_key")?);
-        }
-        for (slot, pointer) in kv_values.iter_mut().zip(value_outputs) {
-            if let Some(array) = slot
-                && let Some(handle) = Arc::get_mut(&mut array.handle)
-            {
-                unsafe { handle.overwrite(pointer) };
-                continue;
-            }
-            *slot = Some(MxArray::from_handle(pointer, "qwen3_asr_fused_kv_value")?);
-        }
-        *cache_idx = next_cache_idx;
-        MxArray::from_handle(logits_ptr, "qwen3_asr_fused_logits")?
-            .reshape(&[self.config.vocab_size as i64])
+        let logits = forward_qwen3_fused_step(
+            &input_ids,
+            dense_embedding.as_ref(),
+            &self.layers,
+            &self.final_norm,
+            None,
+            quantized.as_ref(),
+            &step_config,
+            &mut kv.keys,
+            &mut kv.values,
+            &mut kv.cache_idx,
+            &rope_offsets,
+            None,
+            true,
+        )?;
+        logits.reshape(&[self.config.vocab_size as i64])
     }
 }
 

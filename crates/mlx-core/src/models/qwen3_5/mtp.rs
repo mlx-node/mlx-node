@@ -40,14 +40,19 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
+use crate::models::mtp_drafter::DrafterBodyVariant;
+use crate::models::quant_dispatch::{
+    QslBuildSpec, QslFp8Policy, QslSym8Policy, build_qsl, effective_plq_for,
+};
+use crate::moe::SwitchGLU;
 use crate::nn::{Linear, RMSNorm};
 
-use super::config::Qwen3_5Config;
-use super::decoder_layer::{AttentionType, DecoderLayer};
+use super::config::{Qwen3_5Config, Qwen35MoeParams};
+use super::decoder_layer::{AttentionType, DecoderLayer, MLPType};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{
-    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
-    release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
+    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
+    is_quantized_checkpoint, release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
     try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
     try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
 };
@@ -133,6 +138,7 @@ pub(crate) fn reject_unsupported_fp8_mtp_state(
 /// `config.n_mtp_layers > 0`. The decode loop is the only intended caller
 /// of [`forward`](Self::forward). See module docs for the architecture.
 pub struct Qwen3_5MTPModule {
+    is_moe: bool,
     pre_fc_norm_hidden: RMSNorm,
     pre_fc_norm_embedding: RMSNorm,
     fc: LinearProj,
@@ -141,7 +147,7 @@ pub struct Qwen3_5MTPModule {
 }
 
 impl Qwen3_5MTPModule {
-    /// Construct an MTP module sized from `config`.
+    /// Construct a dense MTP module sized from `config`.
     ///
     /// MTP layers are pinned to `fa_idx = max(full_attention_interval - 1,
     /// 0)`. We assert `config.is_linear_layer(fa_idx) == false` so a
@@ -151,6 +157,19 @@ impl Qwen3_5MTPModule {
     /// MTP layers — the speculative-decode flow downstream assumes
     /// full-attention KV caches per draft step.
     pub fn new(config: &Qwen3_5Config) -> Result<Self> {
+        Self::new_with_moe(config, None)
+    }
+
+    /// Construct a dense or MoE MTP module sized from `config` and optional
+    /// [`Qwen35MoeParams`].
+    ///
+    /// When `moe` is `Some`, each MTP layer's MLP flavor (`MLPType::MoE` vs
+    /// `MLPType::Dense`) follows `moe.is_moe_layer(fa_idx)`, mirroring the
+    /// main decoder at `fa_idx`.
+    pub(crate) fn new_with_moe(
+        config: &Qwen3_5Config,
+        moe: Option<&Qwen35MoeParams>,
+    ) -> Result<Self> {
         let n_layers = config.n_mtp_layers;
         if n_layers <= 0 {
             return Err(Error::from_reason(format!(
@@ -158,7 +177,7 @@ impl Qwen3_5MTPModule {
             )));
         }
 
-        let fa_idx = (config.full_attention_interval - 1).max(0) as usize;
+        let fa_idx = Self::mtp_fa_idx(config);
         if config.is_linear_layer(fa_idx) {
             return Err(Error::from_reason(format!(
                 "Qwen3_5MTPModule::new: refusing to build GDN (linear-attention) MTP layers. \
@@ -176,17 +195,38 @@ impl Qwen3_5MTPModule {
         // swaps it to `Quantized` if the checkpoint ships a quantized fc.
         let fc = LinearProj::Standard(Linear::new(hidden * 2, hidden, Some(false))?);
         let layers = (0..n_layers as usize)
-            .map(|_| DecoderLayer::new(config, fa_idx))
+            .map(|_| DecoderLayer::new_with_moe(config, moe, fa_idx))
             .collect::<Result<Vec<_>>>()?;
         let norm = RMSNorm::new(hidden, Some(config.rms_norm_eps))?;
 
         Ok(Self {
+            is_moe: moe.is_some(),
             pre_fc_norm_hidden,
             pre_fc_norm_embedding,
             fc,
             layers,
             norm,
         })
+    }
+
+    /// The full-attention layer index the MTP `DecoderLayer`s are pinned to.
+    fn mtp_fa_idx(config: &Qwen3_5Config) -> usize {
+        (config.full_attention_interval - 1).max(0) as usize
+    }
+
+    /// The MLP flavor (`Dense` vs `Moe`) of the MTP layer(s) for `(base, moe)`,
+    /// matching `new_with_moe`.
+    #[allow(dead_code)]
+    pub(crate) fn mtp_mlp_variant(
+        base: &Qwen3_5Config,
+        moe: Option<&Qwen35MoeParams>,
+    ) -> DrafterBodyVariant {
+        let fa_idx = Self::mtp_fa_idx(base);
+        if moe.is_some_and(|m| m.is_moe_layer(fa_idx)) {
+            DrafterBodyVariant::Moe
+        } else {
+            DrafterBodyVariant::Dense
+        }
     }
 
     /// Number of MTP DecoderLayers.
@@ -302,13 +342,14 @@ impl Qwen3_5MTPModule {
         &mut self,
         params: &mut HashMap<String, MxArray>,
         default_plq: PerLayerQuant,
+        default_gate_plq: Option<PerLayerQuant>,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         compute_dtype: DType,
     ) -> Result<()> {
         reject_unsupported_fp8_mtp_state(
             params,
             default_plq,
-            None,
+            default_gate_plq,
             per_layer_quant,
             "Qwen3_5MTPModule::apply_weights",
         )?;
@@ -324,12 +365,12 @@ impl Qwen3_5MTPModule {
         };
         let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
 
-        // Fresh per-prefix quant resolver, duplicating the closure in
-        // `apply_weights_inner`. Surgical duplication is preferred over a
-        // wide refactor of the dense persistence loader.
+        let plq_for = |prefix: &str| -> PerLayerQuant {
+            effective_plq_for(prefix, per_layer_quant, default_plq, default_gate_plq)
+        };
         let try_build_ql =
             |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<QuantizedLinear>> {
-                let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+                let plq = plq_for(prefix);
                 Ok(match plq.mode {
                     PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
                     PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -349,8 +390,8 @@ impl Qwen3_5MTPModule {
                         &mut tiled_prefixes.borrow_mut(),
                     )?,
                     // Unreachable in practice: `apply_weights_inner` skips the MTP
-                    // load entirely for sym8 checkpoints (the dense loader
-                    // disables speculative MTP under sym8). `None` here keeps the
+                    // load entirely for sym8 checkpoints (the loader disables
+                    // speculative MTP under sym8). `None` here keeps the
                     // exhaustive match honest without silently mis-packing.
                     PerLayerMode::Sym8 => None,
                     // Direct Qwen3.8 GGUFs may carry a packed inline MTP head;
@@ -382,6 +423,25 @@ impl Qwen3_5MTPModule {
                     }
                 })
             };
+        let try_build_qsl = |params: &HashMap<String, MxArray>,
+                             prefix: &str|
+         -> Result<Option<QuantizedSwitchLinear>> {
+            let plq = plq_for(prefix);
+            build_qsl(
+                params,
+                prefix,
+                plq,
+                QslBuildSpec {
+                    family: "qwen3_5_mtp",
+                    validate_storage: false,
+                    fp8: QslFp8Policy::ReturnNone,
+                    sym8: QslSym8Policy::RejectExplicitOrScaled(per_layer_quant),
+                    nvfp4_only: false,
+                    affine_optional_outer_scale: false,
+                    nvfp4_outer_scale: None,
+                },
+            )
+        };
 
         // Top-level normalizations.
         if let Some(w) = params.get("mtp.pre_fc_norm_hidden.weight") {
@@ -489,12 +549,10 @@ impl Qwen3_5MTPModule {
             attn.finalize_q_gate_block()?;
             attn.finalize_kv_proj()?;
 
-            // MLP — dense or per-mode quantized via the same swap as
-            // the main loop. The MTP MLP is always a `Standard` MLP at
-            // construction time; only quantization can flip it to
-            // `Quantized`.
+            // MLP — dense MLP, MoE switch_mlp + router gate + shared_expert, or
+            // already-quantized (no-op).
             match &mut layer.mlp {
-                MLPVariant::Standard(mlp) => {
+                MLPType::Dense(MLPVariant::Standard(mlp)) => {
                     if is_quantized {
                         let gate_key = format!("{}.mlp.gate_proj", prefix);
                         let up_key = format!("{}.mlp.up_proj", prefix);
@@ -527,18 +585,131 @@ impl Qwen3_5MTPModule {
                         }
                     }
                 }
-                MLPVariant::Quantized { .. } => {
-                    // Already swapped on a prior call — no-op. Reaching
-                    // this branch on a fresh module would indicate the
-                    // module was reused; not currently supported.
+                MLPType::Dense(MLPVariant::Quantized { .. }) => {
+                    // Already swapped on a prior call — no-op.
+                }
+                MLPType::MoE(moe) => {
+                    if is_quantized {
+                        if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
+                            moe.set_quantized_gate(ql);
+                        } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                            moe.set_gate_weight(w)?;
+                        }
+
+                        let gate_proj_key = format!("{}.mlp.switch_mlp.gate_proj", prefix);
+                        let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
+                        let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
+
+                        let q_gate = try_build_qsl(params, &gate_proj_key)?;
+                        let q_up = try_build_qsl(params, &up_proj_key)?;
+                        let q_down = try_build_qsl(params, &down_proj_key)?;
+
+                        if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                            let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
+                            moe.set_switch_mlp(quantized_switch);
+                        } else {
+                            if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                                moe.set_switch_mlp_gate_proj_weight(w);
+                            }
+                            if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                                moe.set_switch_mlp_up_proj_weight(w);
+                            }
+                            if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                                moe.set_switch_mlp_down_proj_weight(w);
+                            }
+                        }
+
+                        let se_gate_key = format!("{}.mlp.shared_expert.gate_proj", prefix);
+                        let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
+                        let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
+
+                        let q_se_gate = try_build_ql(params, &se_gate_key)?;
+                        let q_se_up = try_build_ql(params, &se_up_key)?;
+                        let q_se_down = try_build_ql(params, &se_down_key)?;
+
+                        if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
+                            moe.set_quantized_shared_expert(qg, qu, qd)?;
+                        } else {
+                            if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                                moe.set_shared_expert_gate_proj_weight(w)?;
+                            }
+                            if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                                moe.set_shared_expert_up_proj_weight(w)?;
+                            }
+                            if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                                moe.set_shared_expert_down_proj_weight(w)?;
+                            }
+                        }
+
+                        if let Some(ql) =
+                            try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))?
+                        {
+                            moe.set_quantized_shared_expert_gate(ql);
+                        } else if let Some(w) =
+                            params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                        {
+                            moe.set_shared_expert_gate_weight(w)?;
+                        }
+                        moe.finalize_grouped_layout()?;
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                            moe.set_gate_weight(w)?;
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                        {
+                            moe.set_switch_mlp_gate_proj_weight(w);
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
+                        {
+                            moe.set_switch_mlp_up_proj_weight(w);
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
+                        {
+                            moe.set_switch_mlp_down_proj_weight(w);
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
+                        {
+                            moe.set_shared_expert_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
+                        {
+                            moe.set_shared_expert_up_proj_weight(w)?;
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
+                        {
+                            moe.set_shared_expert_down_proj_weight(w)?;
+                        }
+                        if let Some(w) =
+                            params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                        {
+                            moe.set_shared_expert_gate_weight(w)?;
+                        }
+                    }
                 }
             }
 
-            if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-                layer.set_input_layernorm_weight(w, compute_dtype)?;
-            }
-            if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-                layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
+            if self.is_moe {
+                if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
+                    layer.set_input_layernorm_weight_raw(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix))
+                {
+                    layer.set_post_attention_layernorm_weight_raw(w)?;
+                }
+            } else {
+                if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
+                    layer.set_input_layernorm_weight(w, compute_dtype)?;
+                }
+                if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix))
+                {
+                    layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
+                }
             }
             // The layer owns its tiled projections now; drop the map's
             // row-major originals (see the dense loader's layer loop).
@@ -651,18 +822,54 @@ impl Qwen3_5MTPModule {
                     attn.get_k_norm_weight(),
                 );
             }
-            params.insert(
-                format!("{prefix}.mlp.gate_proj.weight"),
-                layer.mlp.get_gate_proj_weight(),
-            );
-            params.insert(
-                format!("{prefix}.mlp.up_proj.weight"),
-                layer.mlp.get_up_proj_weight(),
-            );
-            params.insert(
-                format!("{prefix}.mlp.down_proj.weight"),
-                layer.mlp.get_down_proj_weight(),
-            );
+            match &layer.mlp {
+                MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.up_proj.weight"),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.down_proj.weight"),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                MLPType::MoE(moe) => {
+                    params.insert(format!("{prefix}.mlp.gate.weight"), moe.get_gate_weight());
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.gate_proj.weight"),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.up_proj.weight"),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.down_proj.weight"),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert_gate.weight"),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
             params.insert(
                 format!("{prefix}.input_layernorm.weight"),
                 layer.get_input_layernorm_weight(),
@@ -818,6 +1025,7 @@ mod tests {
             .apply_weights(
                 &mut stored_fp8,
                 default_plq,
+                None,
                 &HashMap::new(),
                 DType::BFloat16,
             )
@@ -846,6 +1054,7 @@ mod tests {
             .apply_weights(
                 &mut stale_mxfp8,
                 default_plq,
+                None,
                 &HashMap::new(),
                 DType::BFloat16,
             )
@@ -874,7 +1083,7 @@ mod tests {
             },
         )]);
         let err = mtp
-            .apply_weights(&mut dense, default_plq, &explicit, DType::BFloat16)
+            .apply_weights(&mut dense, default_plq, None, &explicit, DType::BFloat16)
             .expect_err("explicit fp8_e4m3 MTP metadata must reject even with dense bytes");
         assert!(err.reason.contains("explicit fp8_e4m3"), "{}", err.reason);
     }
@@ -977,7 +1186,7 @@ mod tests {
         per_layer_quant: &HashMap<String, PerLayerQuant>,
         label: &str,
     ) -> bool {
-        match mtp.apply_weights(params, default_plq, per_layer_quant, DType::BFloat16) {
+        match mtp.apply_weights(params, default_plq, None, per_layer_quant, DType::BFloat16) {
             Ok(()) => true,
             Err(err) => {
                 let msg = err.reason.to_string();
@@ -1129,4 +1338,61 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn new_with_moe_builds_moe_layer_and_emits_required_keys() {
+        use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};
+
+        let cfg = tiny_mtp_cfg();
+        let moe = Qwen35MoeParams {
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: Some(64),
+            moe_intermediate_size: Some(64),
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+        };
+        assert_eq!(
+            Qwen3_5MTPModule::mtp_mlp_variant(&cfg, None),
+            DrafterBodyVariant::Dense
+        );
+        assert_eq!(
+            Qwen3_5MTPModule::mtp_mlp_variant(&cfg, Some(&moe)),
+            DrafterBodyVariant::Moe
+        );
+        let mut dense_override = moe.clone();
+        dense_override.mlp_only_layers = Some(vec![3]);
+        assert_eq!(
+            Qwen3_5MTPModule::mtp_mlp_variant(&cfg, Some(&dense_override)),
+            DrafterBodyVariant::Dense
+        );
+
+        let mtp = match Qwen3_5MTPModule::new_with_moe(&cfg, Some(&moe)) {
+            Ok(m) => m,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!(
+                        "skipping new_with_moe_builds_moe_layer_and_emits_required_keys \
+                         (MLX/Metal unavailable): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected new_with_moe failure: {msg}");
+            }
+        };
+        assert!(matches!(mtp.layers[0].mlp, MLPType::MoE(_)));
+        assert!(!mtp.has_quantized_weights());
+        let params = mtp.get_parameters();
+        let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, cfg.n_mtp_layers);
+        assert!(
+            missing.is_empty(),
+            "MoE get_parameters() must emit every required MoE MTP key; missing: {missing:?}"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "mtp_moe_tests.rs"]
+mod mtp_moe_tests;

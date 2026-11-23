@@ -12,6 +12,7 @@
  */
 
 import type { LoadableModel, SessionCapableModel } from '@mlx-node/lm';
+import { familyDataFor } from '@mlx-node/lm/family-data';
 
 import type { SystemOneModel } from '../decision-registry.js';
 import type { PublicModelEntry } from '../handler.js';
@@ -43,7 +44,7 @@ function identityOf(entry: DiscoveredModel): ModelIdentity {
 }
 
 function isDecisionEntry(entry: DiscoveredModel | undefined): boolean {
-  return entry !== undefined && (entry.modelType === 'clairic' || entry.modelType === 'clef');
+  return entry !== undefined && familyDataFor(entry.modelType)?.kind === 'decision';
 }
 
 /** A model whose SSD state cache holds its directory's lock until it closes. */

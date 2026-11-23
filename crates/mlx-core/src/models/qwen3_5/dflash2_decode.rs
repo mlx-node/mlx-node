@@ -43,7 +43,14 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     verify_budget: super::verify_tree::VerifyBudget,
     last_tree_is_chain: bool,
     last_tree_len: usize,
+    verify_confidence: Option<MxArray>,
+    verify_row_budget: Option<MxArray>,
     paged: PagedVerifyLane,
+}
+
+// FC+merged-KV costs cross over between retained heights 6 and 7 on MoE.
+fn prefer_full_width_context(keep: usize) -> bool {
+    (7..=8).contains(&keep)
 }
 
 /// A DFlash2 lane's two GDN cells with their pending rows.
@@ -737,12 +744,33 @@ impl Qwen35DFlash2Stepper<'_> {
         };
         let result = {
             let inner = &mut *self.inner;
+            let is_moe = inner.is_moe();
             let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
             match (
                 inner.caches.as_mut(),
                 inner.paged_adapter.as_mut(),
                 self.gdn_blobs.as_ref(),
             ) {
+                (Some(caches), Some(adapter), Some(gdn_blobs)) if is_moe => {
+                    super::paged_forward::run_paged_dflash2_verify_step_with_mode(
+                        verify_input,
+                        &inner.embedding,
+                        &mut inner.layers,
+                        caches,
+                        &inner.final_norm,
+                        &inner.lm_head,
+                        &inner.layer_kinds,
+                        adapter,
+                        &mut tape,
+                        rope_deltas,
+                        &self.tap_layers,
+                        gdn_blobs,
+                        self.verify_row_budget.as_ref(),
+                        window,
+                        false,
+                        super::paged_forward::VerifySubmit::Decode,
+                    )
+                }
                 (Some(caches), Some(adapter), Some(gdn_blobs)) => {
                     super::paged_forward::run_paged_dflash2_verify_step(
                         verify_input,
@@ -757,6 +785,7 @@ impl Qwen35DFlash2Stepper<'_> {
                         rope_deltas,
                         &self.tap_layers,
                         gdn_blobs,
+                        None,
                         window,
                     )
                 }
@@ -838,11 +867,31 @@ impl Qwen35DFlash2Stepper<'_> {
     }
 
     fn append_tapped(&mut self, tapped: &[MxArray], token_ids: &[u32]) -> Result<()> {
+        let is_moe = self.inner.is_moe();
         let draft = self
             .inner
             .dflash2
             .as_ref()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
+        if is_moe {
+            let keep = token_ids.len();
+            let full_width = prefer_full_width_context(keep)
+                && draft.config.block_size == 7
+                && tapped
+                    .first()
+                    .is_some_and(|hidden| hidden.shape_at(1).is_ok_and(|rows| rows == 8));
+            if full_width {
+                let fused = draft.fuse_context(tapped)?;
+                self.context.append_full_width_prefix(
+                    draft,
+                    &fused,
+                    self.next_position,
+                    token_ids,
+                )?;
+                self.next_position = self.next_position.saturating_add(keep as i32);
+                return Ok(());
+            }
+        }
         self.next_position = append_kept_taps(
             draft,
             &mut self.context,
@@ -1182,6 +1231,84 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         params: &crate::engine::params::ChatParams,
         rng: &mut dyn rand::Rng,
     ) -> Result<DsparkProposal> {
+        if self.inner.is_moe() {
+            let draft = self
+                .inner
+                .dflash2
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?;
+            let temperature = params
+                .sampling_config
+                .unwrap_or_default()
+                .temperature
+                .unwrap_or(1.0);
+            let greedy_fast = crate::sampling::is_greedy_temperature(temperature)
+                && params.repetition_penalty == 1.0
+                && params.presence_penalty == 0.0
+                && params.frequency_penalty == 0.0;
+            self.verify_confidence = None;
+            self.verify_row_budget = None;
+            let adaptive = params.mtp_adaptive_depth && greedy_fast;
+            let (path, draft_sparse_dists) = draft.propose(
+                &self.inner.embedding,
+                self.inner.lm_head.as_ref(),
+                &mut self.context,
+                anchor_id,
+                super::dflash2::DFLASH2_DRAFT_PROPOSALS,
+                temperature,
+                greedy_fast,
+                adaptive.then_some(&mut self.verify_confidence),
+                rng,
+            )?;
+            if let Some(confidence) = self.verify_confidence.as_ref() {
+                let policy = self.inner.dflash2_verify_budget.parameters(false, true);
+                let mut values = Vec::with_capacity(18);
+                values.push(policy.acceptance.slope);
+                values.extend(policy.acceptance.intercepts);
+                values.extend(policy.costs);
+                values.push(if policy.every_row { 1.0 } else { 0.0 });
+                let parameters = MxArray::from_float32(&values, &[18])?;
+                self.verify_row_budget = Some(MxArray::from_handle(
+                    unsafe {
+                        mlx_sys::mlx_dflash2_verify_budget(
+                            confidence.as_raw_ptr(),
+                            parameters.as_raw_ptr(),
+                        )
+                    },
+                    "dflash2_verify_budget",
+                )?);
+            }
+            let (draft_ids, device_draft_ids, device_draft_sparse) = match path {
+                super::dflash2::SelectorPath::Device(ids) => (Vec::new(), Some(ids), None),
+                super::dflash2::SelectorPath::Sampled { ids, rows } => {
+                    (Vec::new(), Some(ids), Some(rows))
+                }
+                super::dflash2::SelectorPath::Host(ids) => (ids, None, None),
+            };
+            if let Some(ids) = &device_draft_ids
+                && unsafe { mlx_sys::mlx_metal_is_available() }
+            {
+                let mut roots = vec![ids];
+                roots.extend(self.verify_row_budget.as_ref());
+                MxArray::async_eval_arrays(&roots);
+            }
+            let mut proposal = DsparkProposal {
+                draft_ids,
+                device_draft_ids,
+                device_draft_sparse,
+                draft_dists: Vec::new(),
+                draft_sparse_dists,
+                keep_probabilities: None,
+            };
+            self.paged.drafted = Some(match &proposal.device_draft_ids {
+                Some(ids) => DraftedProposals::Device(ids.clone()),
+                None => {
+                    DraftedProposals::Host(proposal.draft_ids.iter().map(|&id| id as u32).collect())
+                }
+            });
+            proposal.truncate(max_len);
+            return Ok(proposal);
+        }
         let draft = self
             .inner
             .dflash2
@@ -1209,6 +1336,11 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+        if self.inner.is_moe() {
+            self.verify_confidence = None;
+            self.verify_row_budget = None;
+            return self.paged_verify(VerifyIds::Host(verify_ids));
+        }
         if self.eager_flat {
             return self.flat_verify(verify_ids);
         }
@@ -1219,6 +1351,14 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     /// runs; the host ids are read back once the verify is queued. On the
     /// off-Metal eager flat lane, verify runs directly against the flat cache.
     fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
+        if self.inner.is_moe() {
+            let ids = DraftedProposals::Device(verify_ids.clone()).host()?;
+            if let Some(budget) = self.verify_row_budget.take() {
+                let rows = MxArray::from_int32(&[ids.len() as i32], &[1])?;
+                self.verify_row_budget = Some(budget.minimum(&rows)?);
+            }
+            return self.paged_verify(VerifyIds::Host(&ids));
+        }
         if self.eager_flat {
             return self.flat_verify_device(verify_ids);
         }
@@ -1231,6 +1371,42 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         let ids = DraftedProposals::Device(verify_ids.clone()).host()?;
         timeline::mark(Mark::ProposalReadback);
         self.paged_verify(VerifyIds::Host(&ids))
+    }
+
+    fn device_verification_budget(&self) -> Option<&MxArray> {
+        self.verify_row_budget.as_ref()
+    }
+
+    fn observe_device_verification(
+        &mut self,
+        rows: usize,
+        raw_matches: usize,
+        milliseconds: f64,
+    ) -> Result<()> {
+        let Some(confidence) = self.verify_confidence.take() else {
+            return Ok(());
+        };
+        self.verify_row_budget = None;
+        // Budget is a dependent root of confidence, already forced at acceptance.
+        let values = confidence.to_float32()?;
+        let confidence: [f32; 7] = values
+            .as_ref()
+            .try_into()
+            .map_err(|_| Error::from_reason("DFlash2 confidence width changed after verify"))?;
+        self.inner
+            .dflash2_verify_budget
+            .observe(
+                super::verify_budget::CycleObservation {
+                    confidence,
+                    verify_rows: rows as u32,
+                    accepted: raw_matches as u32,
+                    labels: true,
+                },
+                false,
+                milliseconds,
+            )
+            .map_err(Error::from_reason)?;
+        Ok(())
     }
 
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
@@ -1358,6 +1534,17 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     }
 
     fn eval_boundary(&self, token: &MxArray) {
+        if self.inner.is_moe() {
+            let mut arrays: Vec<&MxArray> = Vec::new();
+            crate::models::forward::CollectCacheArrays::collect_arrays(
+                &self.inner.caches,
+                &mut arrays,
+            );
+            self.context.collect_arrays(&mut arrays);
+            arrays.push(token);
+            MxArray::async_eval_arrays(&arrays);
+            return;
+        }
         if !crate::accelerator::supports_async_overlap() {
             return;
         }
@@ -1417,66 +1604,24 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         };
         let after_propose = std::time::Instant::now();
 
-        let lookup_info = self.lookup_index.match_info();
-        let eff_max_depth = max_depth.min(super::verify_tree::MAX_LOOKUP_CHAIN);
+        let lookup = super::verify_tree::cuda::prepare_tree_lookup(
+            &self.lookup_index,
+            self.lookup_enabled,
+            max_depth,
+        );
         let node_budget = max_nodes
             .min(self.tree_max_nodes)
             .clamp(1, super::verify_tree::MAX_TREE_NODES);
-        let lookup_cap = super::verify_tree::MAX_LOOKUP_CHAIN.min(eff_max_depth);
-        let lookup_proposals = if self.lookup_enabled && lookup_cap > 0 {
-            self.lookup_index.proposals(lookup_cap)
-        } else {
-            Vec::new()
-        };
-        let lookup_len = if lookup_info.match_len >= super::verify_tree::LookupIndex::MIN_MATCH {
-            lookup_proposals
-                .len()
-                .min(super::verify_tree::MAX_LOOKUP_CHAIN)
-        } else {
-            0
-        };
 
         let gpu_sel = if crate::accelerator::cuda_ops_available() && Self::cuda_gpu_tree_enabled() {
-            let mut lt = [0i32; super::verify_tree::MAX_TREE_NODES];
-            for (dst, &tok) in lt.iter_mut().zip(lookup_proposals.iter().take(lookup_len)) {
-                *dst = tok as i32;
-            }
-            let mut lr = [0.0f32; super::verify_tree::MAX_TREE_NODES * 4];
-            if lookup_len > 0 {
-                let agreements = [
-                    super::verify_tree::LookupAgreement::Top,
-                    super::verify_tree::LookupAgreement::Candidate,
-                    super::verify_tree::LookupAgreement::Absent,
-                    super::verify_tree::LookupAgreement::Unknown,
-                ];
-                for d in 0..lookup_len {
-                    for &ag in &agreements {
-                        lr[d * 4 + ag as usize] =
-                            self.lookup_acceptance
-                                .rate(false, lookup_info.match_len, d, ag);
-                    }
-                }
-            }
-            let budget_acc = self.verify_budget.acceptance(false);
-            let mut bi = [0.0f32; 8];
-            bi[..super::verify_tree::DRAFT_SLOTS].copy_from_slice(&budget_acc.intercepts);
-
-            let lookup_tokens_arr =
-                MxArray::from_int32(&lt, &[super::verify_tree::MAX_TREE_NODES as i64])?;
-            let lookup_rates_arr =
-                MxArray::from_float32(&lr, &[super::verify_tree::MAX_TREE_NODES as i64, 4])?;
-            let budget_intercepts_arr = MxArray::from_float32(&bi, &[8])?;
-            crate::kernels::dflash2::select_tree_cuda(
+            super::verify_tree::cuda::select_tree_gpu(
                 &candidates,
                 &scores,
-                &lookup_tokens_arr,
-                &lookup_rates_arr,
-                &budget_intercepts_arr,
+                &lookup,
+                &self.lookup_acceptance,
+                &self.verify_budget,
                 anchor,
-                lookup_len as i32,
-                node_budget as i32,
-                eff_max_depth as i32,
-                budget_acc.slope,
+                node_budget,
             )?
         } else {
             None
@@ -1543,23 +1688,14 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 &raw_parent,
                 &raw_meta,
             )?;
-            let walk = tree.greedy_walk(&target_argmax_all[..tree.len()]);
-
-            let labels = tree.budget_labels(&walk.emitted_tokens);
-            self.verify_budget.observe(false, &labels);
-            if lookup_len > 0 {
-                let outcome = tree.lookup_outcome_with_agreements(
-                    &lookup_proposals[..lookup_len],
-                    &walk.emitted_tokens,
-                    &agreements,
-                );
-                self.lookup_acceptance.observe(
-                    false,
-                    lookup_info.match_len,
-                    &outcome.verified,
-                    outcome.accepted,
-                );
-            }
+            let (walk, _) = super::verify_tree::cuda::finalize_tree_greedy_walk(
+                &tree,
+                &target_argmax_all[..tree.len()],
+                &lookup,
+                super::verify_tree::cuda::TreeLookupSource::Agreements(&agreements),
+                &mut self.verify_budget,
+                &mut self.lookup_acceptance,
+            );
             let is_full_chain = is_chain && tree.len() == node_budget;
             (
                 tree,
@@ -1585,10 +1721,10 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             let tree = super::verify_tree::build_verify_tree(
                 anchor,
                 &lattice,
-                &lookup_proposals,
-                lookup_info.match_len,
+                &lookup.proposals,
+                lookup.match_len,
                 node_budget,
-                Some(eff_max_depth),
+                Some(lookup.eff_max_depth),
                 false,
                 &self.verify_budget,
                 &self.lookup_acceptance,
@@ -1622,23 +1758,14 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                     tree.len()
                 )));
             }
-            let walk = tree.greedy_walk(&target_argmax);
-
-            let labels = tree.budget_labels(&walk.emitted_tokens);
-            self.verify_budget.observe(false, &labels);
-            if lookup_len > 0 {
-                let outcome = tree.lookup_outcome(
-                    &lookup_proposals[..lookup_len],
-                    &walk.emitted_tokens,
-                    &lattice,
-                );
-                self.lookup_acceptance.observe(
-                    false,
-                    lookup_info.match_len,
-                    &outcome.verified,
-                    outcome.accepted,
-                );
-            }
+            let (walk, _) = super::verify_tree::cuda::finalize_tree_greedy_walk(
+                &tree,
+                &target_argmax,
+                &lookup,
+                super::verify_tree::cuda::TreeLookupSource::Lattice(&lattice),
+                &mut self.verify_budget,
+                &mut self.lookup_acceptance,
+            );
             let is_chain = tree.is_chain();
             (
                 tree,
@@ -1660,7 +1787,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
         if phase_time {
             eprintln!(
                 "[dflash2-phase] tree(gpu={gpu_path},T={tree_nodes},chain={is_chain},match={},acc={accepted_draft_count}/{draft_count}): propose={:?} build_tree={:?} verify_build={:?} verify_eval={:?}",
-                lookup_info.match_len,
+                lookup.match_len,
                 after_propose.duration_since(started),
                 after_build_tree.duration_since(after_propose),
                 after_verify_build.duration_since(after_build_tree),
@@ -1775,9 +1902,11 @@ impl DsparkBackend for Qwen35Inner {
             .config
             .target_layers
             .clone();
-        let eager_flat = self.paged_adapter.is_none();
+        let is_moe = self.is_moe();
+        let eager_flat = !is_moe && self.paged_adapter.is_none();
         // Metal packs the prefill's per-layer GDN states into the paged lane's
         // current cell. The off-Metal lane snapshots those arrays per verify.
+        // MoE has no flat DFlash2 lane, so it always expects a paged adapter.
         let gdn_blobs = if eager_flat {
             None
         } else {
@@ -1879,6 +2008,8 @@ impl DsparkBackend for Qwen35Inner {
             verify_budget: super::verify_tree::VerifyBudget::new(),
             last_tree_is_chain: true,
             last_tree_len: 0,
+            verify_confidence: None,
+            verify_row_budget: None,
             paged,
         })
     }
@@ -2119,6 +2250,12 @@ impl DFlash2Target for Qwen35Inner {
 
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
         std::borrow::Cow::Borrowed(&self.config)
+    }
+
+    fn decode_row_expert_bytes(&self) -> u64 {
+        self.moe_config
+            .as_ref()
+            .map_or(0, |moe| moe.decode_row_expert_bytes(&self.config))
     }
 
     fn embedding_dtype(&self) -> Result<DType> {
@@ -3690,6 +3827,7 @@ pub(crate) mod paged_dflash2_tests {
                 0,
                 &taps,
                 &blobs,
+                None,
                 window,
             )
             .map(|(logits, _)| logits.eval())
@@ -13209,3 +13347,7 @@ pub(crate) mod paged_dflash2_tests {
 #[cfg(all(test, target_os = "macos"))]
 #[path = "dflash2_overlap_tests.rs"]
 mod overlap_tests;
+
+#[cfg(test)]
+#[path = "dflash2_decode_moe_tests.rs"]
+mod dflash2_decode_moe_tests;

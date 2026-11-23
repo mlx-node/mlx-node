@@ -61,7 +61,7 @@ import {
   type LoadModelOptions,
 } from '@mlx-node/lm';
 import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
-import { familyDataFor } from '@mlx-node/lm/family-data';
+import { familyDataFor, filterFamilyLoadOptions } from '@mlx-node/lm/family-data';
 import { discoverRerankers, type DiscoveredReranker } from '@mlx-node/rerank/catalog';
 import { validateRerankerFamilies, familyLoadOptions } from '@mlx-node/rerank/protocol';
 import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/types';
@@ -566,27 +566,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const options: LoadModelOptions = {
       ...(draftModelPath !== undefined ? { draftModelPath } : {}),
       ...(entry.modelType === 'inkling2' && !supportsAutomaticDFlash2(entry.modelType) ? { autoLoadDraft: false } : {}),
-      ...(opts.kvFormat !== undefined && familyDataFor(entry.modelType)?.acceptsKvFormat === true
-        ? { kvFormat: opts.kvFormat }
-        : {}),
-      ...(opts.maxMemoryBytes !== undefined && familyDataFor(entry.modelType)?.acceptsMaxMemory === true
-        ? { maxMemoryBytes: opts.maxMemoryBytes }
-        : {}),
-      ...(opts.maxContextTokens !== undefined && familyDataFor(entry.modelType)?.acceptsMaxContext === true
-        ? { maxContextTokens: opts.maxContextTokens }
-        : {}),
-      ...(opts.decodeShare !== undefined && familyDataFor(entry.modelType)?.acceptsDecodeShare === true
-        ? { decodeShare: opts.decodeShare }
-        : {}),
-      ...(opts.activations !== undefined && familyDataFor(entry.modelType)?.acceptsActivations === true
-        ? { activations: opts.activations }
-        : {}),
-      ...(familyDataFor(entry.modelType)?.acceptsCacheDisk === true
-        ? {
-            ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
-            ...(opts.cacheDir !== undefined ? { cacheDir: opts.cacheDir } : {}),
-          }
-        : {}),
+      ...filterFamilyLoadOptions(entry.modelType, opts),
     };
     try {
       return await timedLoad(
@@ -901,13 +881,7 @@ export function nativeContextEstimate(
   return async (path, modelType, options) => {
     if (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') return qwen35(path, modelType, options);
     if (modelType !== 'qwen4_exp') return null;
-    const qwen4Options = {
-      ...(options?.draftModelPath != null ? { draftModelPath: options.draftModelPath } : {}),
-      ...(options?.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
-      ...(options?.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
-      ...(options?.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
-      ...(options?.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
-    };
+    const qwen4Options = filterFamilyLoadOptions('qwen4_exp', options);
     const estimate = await qwen4Exp(path, Object.keys(qwen4Options).length === 0 ? null : qwen4Options);
     return estimate == null ? null : { windowTokens: estimate.windowTokens, bound: estimate.bound };
   };

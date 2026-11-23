@@ -3402,9 +3402,7 @@ pub(crate) fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
         attention.set_q_norm_weight(&cast(&weight)).expect("qn");
         let weight = attention.k_norm_weight();
         attention.set_k_norm_weight(&cast(&weight)).expect("kn");
-        if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(ref mut mlp) =
-            layer.mlp
-        {
+        if let crate::models::gemma4::mlp::Gemma4MLPVariant::Standard(ref mut mlp) = layer.mlp {
             let weight = mlp.gate_proj_weight();
             mlp.set_gate_proj_weight(&cast(&weight)).expect("gate");
             let weight = mlp.up_proj_weight();

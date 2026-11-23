@@ -3,6 +3,7 @@
 //! via [`crate::engine::backend::MtpBackend`]; their
 //! `ChatBackend::run_speculative_turn` delegates to `run_mtp_turn`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -10,19 +11,22 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
-use crate::engine::params::ChatParams;
-use crate::engine::penalties::{ReasoningTracker, ThinkingCut, apply_all_penalties};
-use crate::models::qwen3_5::mtp_decode::{
+use crate::engine::backend::{
+    FinalizeArgs, MtpBackend, MtpStepper, MtpTurnSetup, ResetScope, SaveStateArgs, TurnOutput,
+    WholeTurnArgs,
+};
+use crate::engine::decode::{StreamingCtx, TurnStreaming, mtp_trace_logits, trace_top2};
+use crate::engine::finalize::compute_performance_metrics;
+use crate::engine::mtp_decode::{
     MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_draft_sampling_config,
     mtp_trace_acceptance, sparse_accept_gate, trace_acceptance_dense, trace_acceptance_emit,
     trace_acceptance_greedy, trace_acceptance_sparse,
 };
+use crate::engine::params::{ChatParams, generated_capacity_hint, resolve_enable_thinking};
+use crate::engine::penalties::{ReasoningTracker, ThinkingCut, apply_all_penalties};
 use crate::nn::Embedding;
 use crate::sampling;
-use crate::stream::Stream;
-
-use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
+use crate::stream::{Stream, WiredLimitContext};
 
 /// Rows this turn's speculative reservation must cover per verify cycle —
 /// the plan's [`crate::engine::plan::SpeculativePlan::lookahead_rows`] at
@@ -32,7 +36,7 @@ use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
 /// Fixed-depth turns verify exactly `params.mtp_depth` drafts per cycle.
 /// Adaptive turns are not bounded by the requested seed depth: the
 /// throughput policy's `Explore` state sweeps every depth up to
-/// [`crate::models::qwen3_5::adaptive_depth::MAX_DEPTH`]
+/// [`crate::engine::adaptive_depth::MAX_DEPTH`]
 /// (`AdaptiveDepthPolicy::maybe_explore_transition`), so the reservation
 /// must cover that ladder too.
 pub(crate) fn turn_lookahead_rows(
@@ -42,7 +46,7 @@ pub(crate) fn turn_lookahead_rows(
     let max_cycle_depth = if params.mtp_adaptive_depth {
         params
             .mtp_depth
-            .max(crate::models::qwen3_5::adaptive_depth::MAX_DEPTH as usize)
+            .max(crate::engine::adaptive_depth::MAX_DEPTH as usize)
     } else {
         params.mtp_depth
     };
@@ -85,9 +89,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     rng: &mut impl rand::Rng,
     profiler: &mut crate::decode_profiler::DecodeProfiler,
     depth: usize,
-    mut ev_depth_policy: Option<
-        &mut crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy,
-    >,
+    mut ev_depth_policy: Option<&mut crate::engine::adaptive_depth::ExpectedValueDepthPolicy>,
     commit_anchor: MtpCommitAnchor,
     cut: Option<&ThinkingCut>,
 ) -> Result<(MtpCycleOutcome, MxArray)> {
@@ -231,7 +233,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             // their proposal distribution for Leviathan-Chen.
             sampling::sample(&draft_logits, params.sampling_config)?.reshape(&[1])?
         };
-        let draft_metrics = crate::models::qwen3_5::adaptive_depth::DraftMetrics {
+        let draft_metrics = crate::engine::adaptive_depth::DraftMetrics {
             top1_prob_topk: sparse_draft
                 .as_ref()
                 .and_then(|dist| dist.as_row().top_entry().map(|(_, prob)| prob)),
@@ -1239,8 +1241,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // returns it alongside the verify logits, and it stays alive
     // for the rest of the decode loop as long as the cycle holds it.
     let chained_cycles_enabled: bool =
-        crate::models::qwen3_5::mtp_decode::mtp_chained_cycles_enabled()
-            && step.chained_cycles_supported();
+        crate::engine::mtp_decode::mtp_chained_cycles_enabled() && step.chained_cycles_supported();
     let mut chained_hidden_opt: Option<MxArray> = None;
 
     // Adaptive MTP depth policy. When `mtp_adaptive_depth` is true
@@ -1255,15 +1256,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // The eager MTP verify forward builds its graph per cycle from
     // the live depth, so swinging the depth freely between cycles
     // carries no extra setup cost.
-    let mut mtp_depth_policy = crate::models::qwen3_5::adaptive_depth::AdaptiveDepthPolicy::new(
+    let mut mtp_depth_policy =
+        crate::engine::adaptive_depth::AdaptiveDepthPolicy::new(depth.min(u8::MAX as usize) as u8);
+    let mtp_adaptive_depth_mode = crate::engine::adaptive_depth::adaptive_depth_mode_from_env();
+    let mut mtp_ev_depth_policy = crate::engine::adaptive_depth::ExpectedValueDepthPolicy::new(
         depth.min(u8::MAX as usize) as u8,
     );
-    let mtp_adaptive_depth_mode =
-        crate::models::qwen3_5::adaptive_depth::adaptive_depth_mode_from_env();
-    let mut mtp_ev_depth_policy =
-        crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy::new(
-            depth.min(u8::MAX as usize) as u8,
-        );
 
     // Track cycles for the every-256-emitted-token cache clear.
     // We use the running `generated.len()` rather than a separate step
@@ -1663,10 +1661,10 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // `full | reduced | probe` state machine.
         let cycle_depth: usize = if p.mtp_adaptive_depth {
             match mtp_adaptive_depth_mode {
-                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::Throughput => {
+                crate::engine::adaptive_depth::AdaptiveDepthMode::Throughput => {
                     mtp_depth_policy.pick_depth() as usize
                 }
-                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::ExpectedValue => {
+                crate::engine::adaptive_depth::AdaptiveDepthMode::ExpectedValue => {
                     mtp_ev_depth_policy.max_depth() as usize
                 }
             }
@@ -1723,7 +1721,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         let ev_depth_policy = if p.mtp_adaptive_depth
             && matches!(
                 mtp_adaptive_depth_mode,
-                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::ExpectedValue
+                crate::engine::adaptive_depth::AdaptiveDepthMode::ExpectedValue
             ) {
             Some(&mut mtp_ev_depth_policy)
         } else {
@@ -1771,10 +1769,10 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             && replaced == 0
             && matches!(
                 mtp_adaptive_depth_mode,
-                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::Throughput
+                crate::engine::adaptive_depth::AdaptiveDepthMode::Throughput
             )
         {
-            mtp_depth_policy.record_cycle(crate::models::qwen3_5::adaptive_depth::CycleStats {
+            mtp_depth_policy.record_cycle(crate::engine::adaptive_depth::CycleStats {
                 depth: outcome.effective_depth as u8,
                 committed: cycle_committed,
                 wall_ns: cycle_wall_ns,
@@ -2004,6 +2002,272 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     })
 }
 
+/// Outcome of [`FlatMtpBackend::prefill_flat_mtp`].
+pub(crate) enum FlatMtpPrefill {
+    /// Prefill succeeded and produced the first sampled token `y`; proceed into
+    /// [`run_mtp_turn`].
+    Ready {
+        y: MxArray,
+        cached_prefix_len: usize,
+        prefill_len: usize,
+        first_token_instant: Option<Instant>,
+    },
+    /// Prefill degraded to a fallback turn (e.g. NemotronH MTP seed failure
+    /// running the turn autoregressively); return its output directly.
+    Fallback(TurnOutput),
+}
+
+/// Sub-trait for families whose flat-KV native MTP whole turn runs through
+/// [`run_flat_mtp_turn`] (HyV4Flash, NemotronH).
+///
+/// Every method has a default matching the standard flat-MTP flow
+/// (`hy_v4_flash`), so standard families only need
+/// `impl FlatMtpBackend for MyInner {}`.
+pub(crate) trait FlatMtpBackend: MtpBackend {
+    /// Adjust turn parameters (e.g. clamping adaptive depth) and return the
+    /// seed draft depth passed to [`run_mtp_turn`].
+    fn prepare_flat_mtp_params(&self, params: &mut ChatParams) -> usize {
+        params.mtp_depth
+    }
+
+    /// Resolve prefix reuse, prefill the prompt suffix, and sample the first
+    /// token `y` (plus any drafter-cache seeding).
+    fn prefill_flat_mtp(
+        &mut self,
+        args: &mut WholeTurnArgs<'_>,
+        params: &ChatParams,
+        history: &[u32],
+        stream: Stream,
+        profiler: &mut DecodeProfiler,
+        _wired: &mut Option<WiredLimitContext>,
+    ) -> Result<FlatMtpPrefill> {
+        let tokens = args.tokens;
+        let hit = self.verify_cache_prefix(tokens, params.reuse_cache);
+        let (prefill, cached) = if hit > 0 && hit < tokens.len() {
+            (&tokens[hit..], hit)
+        } else {
+            self.reset_caches(ResetScope::PrefixMiss)?;
+            (tokens, 0)
+        };
+        profiler.set_prompt_tokens(prefill.len() as u32);
+        let progress = args.sink.and_then(|s| s.progress());
+        if let Some(pr) = progress {
+            pr.begin_prefill(prefill.len() as u32, cached as u32);
+        }
+        profiler.begin_prefill();
+        let logits = self.prefill(prefill, stream)?;
+        profiler.end_prefill();
+        let logits = apply_all_penalties(logits, history, params)?;
+        let y = sampling::sample(&logits, params.sampling_config)?;
+        y.eval();
+        if let Some(pr) = progress {
+            pr.first_token();
+        }
+        self.eval_caches()?;
+        let first_token_instant = params.report_performance.then(Instant::now);
+        Ok(FlatMtpPrefill::Ready {
+            y,
+            cached_prefix_len: cached,
+            prefill_len: prefill.len(),
+            first_token_instant,
+        })
+    }
+
+    /// Fail closed after a prefill, decode, or finalize error.
+    ///
+    /// Default resets caches with [`ResetScope::Command`] and logs if the reset
+    /// also fails. Families whose `ResetScope::Command` would purge a shared
+    /// paged prefix cache (NemotronH) override this to return `error` directly.
+    fn fail_closed_flat_mtp(&mut self, error: Error) -> Error {
+        if let Err(reset_err) = self.reset_caches(ResetScope::Command) {
+            tracing::error!(
+                "{} MTP turn failed ({}) and the reset failed too ({})",
+                self.family_name(),
+                error.reason,
+                reset_err.reason
+            );
+        }
+        error
+    }
+
+    /// Optional backend-owned cooperative cancel flag polled during
+    /// [`run_mtp_turn`] (falls back to `args.cancelled` when `None`).
+    fn flat_mtp_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
+    /// Persist cache/history state after [`run_mtp_turn`] succeeds.
+    fn save_flat_mtp_state(
+        &mut self,
+        args: &WholeTurnArgs<'_>,
+        params: &ChatParams,
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        outcome: &MtpTurnOutcome,
+    ) {
+        let _ = outcome;
+        self.save_cache_state(SaveStateArgs {
+            reuse_cache: params.reuse_cache,
+            is_delta: args.plan.is_delta,
+            has_images: false,
+            generated_tokens,
+            finish_reason,
+            save_tokens: args.tokens,
+            save_expanded_tokens: None,
+            image_cache_key: 0,
+        });
+    }
+}
+
+/// Drive one flat-KV native MTP whole turn (sync or streaming via `args.sink`).
+pub(crate) fn run_flat_mtp_turn<B: FlatMtpBackend>(
+    backend: &mut B,
+    args: &mut WholeTurnArgs<'_>,
+) -> Result<TurnOutput> {
+    if args.tokens.is_empty() {
+        return Err(Error::from_reason(format!(
+            "{} MTP: empty prompt",
+            backend.family_name()
+        )));
+    }
+    let tokenizer = Arc::clone(args.tokenizer);
+    let mut p = args.params.clone();
+    p.extra_eos_ids = backend.extra_eos_ids();
+    let depth = backend.prepare_flat_mtp_params(&mut p);
+    let max_new = match backend.context_token_limit() {
+        Some(limit) => p
+            .max_new_tokens
+            .min(i32::try_from((limit + 1).saturating_sub(args.tokens.len())).unwrap_or(i32::MAX)),
+        None => p.max_new_tokens,
+    };
+    let report = p.report_performance;
+    let started = report.then(Instant::now);
+
+    let stream = Stream::generation();
+    let mut wired = backend
+        .wired_limit_bytes()
+        .map(|b| WiredLimitContext::new(b, vec![stream]));
+    let mut profiler = DecodeProfiler::new(
+        backend.profiler_label(args.plan.is_delta, args.sink.is_some()),
+        backend.family_name(),
+    );
+    profiler.snapshot_memory_before();
+
+    let close = backend.think_end_for_turn(args.config, &tokenizer);
+    let mut tracker = ReasoningTracker::from_setup(&args.thinking, &close);
+    let skip_special = backend.stream_skip_special_tokens();
+    let mut ts = args.sink.map(|_| {
+        TurnStreaming::new(
+            &*backend,
+            tokenizer.inner(),
+            args.thinking.enabled,
+            skip_special,
+        )
+    });
+    let mut history = args.tokens.to_vec();
+    let mut generated = Vec::with_capacity(generated_capacity_hint(max_new));
+    let mut finish = String::from("length");
+
+    let prefill_out =
+        match backend.prefill_flat_mtp(args, &p, &history, stream, &mut profiler, &mut wired) {
+            Ok(out) => out,
+            Err(e) => return Err(backend.fail_closed_flat_mtp(e)),
+        };
+    let (y, cached, prefill_len, mut first) = match prefill_out {
+        FlatMtpPrefill::Ready {
+            y,
+            cached_prefix_len,
+            prefill_len,
+            first_token_instant,
+        } => (y, cached_prefix_len, prefill_len, first_token_instant),
+        FlatMtpPrefill::Fallback(output) => return Ok(output),
+    };
+
+    let backend_cancel = backend.flat_mtp_cancel_flag();
+    let cancel_flag = backend_cancel.as_deref().or(args.cancelled);
+    let decoded = {
+        let ctx = match (args.sink, ts.as_mut()) {
+            (Some(s), Some(t)) => t.ctx(Some(s), args.cancelled),
+            _ => None,
+        };
+        let mut rng = rand::rng();
+        run_mtp_turn(
+            &mut *backend,
+            &mut rng,
+            MtpTurnArgs {
+                y,
+                depth,
+                params: &p,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: max_new,
+                eos_id: args.eos_id,
+                generated_tokens: &mut generated,
+                token_history: &mut history,
+                finish_reason: &mut finish,
+                first_token_instant: &mut first,
+                report_perf: report,
+                generation_stream: stream,
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                cancel_flag,
+            },
+            ctx,
+        )
+    };
+    let outcome = match decoded {
+        Ok(outcome) => outcome,
+        Err(e) => return Err(backend.fail_closed_flat_mtp(e)),
+    };
+
+    backend.save_flat_mtp_state(args, &p, &generated, &finish, &outcome);
+
+    let performance = if report {
+        compute_performance_metrics(started, first, prefill_len, generated.len()).map(|mut m| {
+            backend.augment_performance(&profiler, &mut m);
+            m
+        })
+    } else {
+        None
+    };
+    if let (Some(s), Some(t)) = (args.sink, ts.as_mut()) {
+        let full = tokenizer
+            .decode_sync(&generated, skip_special)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "{}: failed to decode generated tokens: {e}",
+                    backend.family_name()
+                );
+                String::new()
+            });
+        t.flush_residual(&full, p.include_reasoning, s);
+    }
+    let finalized = backend.finalize_turn(FinalizeArgs {
+        tokenizer: &tokenizer,
+        generated_tokens: &generated,
+        finish_reason: finish,
+        think_end_id: close.think_end_id,
+        think_end_str: close.think_end_str.as_deref(),
+        think_end_extra_ids: &close.think_end_extra_ids,
+        performance,
+        include_reasoning: p.include_reasoning,
+        thinking_enabled: args.thinking.enabled,
+        prompt_tokens: args.tokens.len() as u32,
+        reasoning: tracker.outcome(),
+    });
+    let mut result = match finalized {
+        Ok(r) => r,
+        Err(e) => return Err(backend.fail_closed_flat_mtp(e)),
+    };
+    result.thinking_enabled = resolve_enable_thinking(args.config).unwrap_or(true);
+    result.cached_tokens = cached as u32;
+    if let (Some(s), Some(t)) = (args.sink, ts.as_mut()) {
+        t.emitter.finish(&result, s);
+        return Ok(TurnOutput::Streamed);
+    }
+    Ok(TurnOutput::Complete(Box::new(result)))
+}
+
 #[cfg(test)]
 mod tests {
     //! `MtpStepper`-contract tests over a scripted mock — NO model, NO
@@ -2018,12 +2282,12 @@ mod tests {
     use napi::bindgen_prelude::*;
 
     use crate::array::MxArray;
+    use crate::engine::adaptive_depth::ExpectedValueDepthPolicy;
     use crate::engine::backend::{MtpStepper, SpecFrontier};
-    use crate::engine::params::ChatParams;
-    use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
-    use crate::models::qwen3_5::mtp_decode::{
+    use crate::engine::mtp_decode::{
         ForceSparseAcceptGuard, MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput,
     };
+    use crate::engine::params::ChatParams;
     use crate::nn::Embedding;
     use crate::sampling::SamplingConfig;
 
@@ -4718,7 +4982,7 @@ mod tests {
     #[test]
     fn turn_lookahead_rows_reads_the_plan_property() {
         use super::turn_lookahead_rows;
-        use crate::models::qwen3_5::adaptive_depth::MAX_DEPTH;
+        use crate::engine::adaptive_depth::MAX_DEPTH;
         let plan = crate::engine::plan::SpeculativePlan {
             kind: crate::engine::plan::SpeculativeKind::NativeMtp,
             supported_input_media: crate::engine::plan::MediaCapabilities::NONE,

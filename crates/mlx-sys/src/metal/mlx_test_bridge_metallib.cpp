@@ -22,6 +22,12 @@
 namespace mlx::core::mixed_projection {
 const std::vector<std::string>& kernel_names();
 }
+namespace mlx::core::inkling2_ops {
+const std::vector<std::string>& kernel_names();
+}
+namespace mlx::core::inkling2_moe {
+const std::vector<std::string>& kernel_names();
+}
 #endif
 
 // True on a Metal device of no Apple GPU family (a hosted VM GPU): its
@@ -114,7 +120,6 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
       names = {"splash_moe_route", "splash_moe_group", "splash_moe_gather",
           "splash_moe_gate_up_8", "splash_moe_gate_up_32",
           "splash_moe_down_8", "splash_moe_down_32",
-          "splash_moe_gate_up_source_8", "splash_moe_down_source_8",
           "splash_moe_combine", "splash_moe_probe_scatter",
           "splash_moe_gather_sg8", "splash_moe_gate_up_sg8",
           "splash_moe_down_sg8", "splash_moe_sg8_pack_probe"};
@@ -133,19 +138,29 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
       };
     } else if (std::strcmp(family, "inkling2") == 0) {
       prefix = "inkling2_";
-      // Check all inkling2-prefixed kernels (prefill + fused ops); paged_attention_inkling2_*
-      // are also built directly in `build`.
-      for (const auto& name : fast::paged::inkling2_kernel_names()) {
+      std::vector<std::string> all_inkling2_names;
+      for (const auto& name : fast::paged::inkling2_paged_kernel_names()) {
+        all_inkling2_names.push_back(name);
+      }
+      for (const auto& name : inkling2_ops::kernel_names()) {
+        all_inkling2_names.push_back(name);
+      }
+      for (const auto& name : inkling2_moe::kernel_names()) {
+        all_inkling2_names.push_back(name);
+      }
+      // Check all inkling2-prefixed kernels (prefill + fused ops + MoE);
+      // paged_attention_inkling2_* are also built directly in `build`.
+      for (const auto& name : all_inkling2_names) {
         if (name.rfind(prefix, 0) == 0) {
           names.push_back(name);
         }
       }
-      build = [&d] {
+      build = [&d, all_inkling2_names = std::move(all_inkling2_names)] {
         const bool lacks = mlx_test_gpu_lacks_apple_family();
         const bool q8q_ok = fast::paged::paged_prefill_int8_queries_supported(d);
         const bool nax_ok = metal::is_nax_available();
         int64_t built = 0;
-        for (const auto& name : fast::paged::inkling2_kernel_names()) {
+        for (const auto& name : all_inkling2_names) {
           if (lacks && name.rfind("inkling2_paged_prefill_", 0) == 0) continue;
           if (!q8q_ok && name.find("_q8q_") != std::string::npos) continue;
           const bool is_nax_only =

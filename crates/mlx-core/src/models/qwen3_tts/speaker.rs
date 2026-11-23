@@ -2,9 +2,9 @@ use super::config::SpeakerConfig;
 use super::weights::Weights;
 use crate::{
     array::{DType, MxArray},
-    audio::dsp::{mel_filter_bank, reflect_index},
     nn::{Activations, Conv1d},
 };
+use mlx_audio::dsp::{mel_filter_bank, reflect_index};
 use napi::{Error, Result};
 use rustfft::{FftPlanner, num_complex::Complex32};
 

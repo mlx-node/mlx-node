@@ -224,3 +224,52 @@ pub(super) fn affine_q4_g64_matmul_few(
         Ok(Some(MxArray::from_handle(handle, "affine_q4_g64_few")?))
     }
 }
+
+#[inline]
+pub(super) fn dequant_q8_bf16_cuda(
+    w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+) -> Result<Option<MxArray>> {
+    let handle = unsafe {
+        sys::mlx_qwen4_dequant_q8_bf16_cuda(
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+        )
+    };
+    if handle.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "qwen4_dequant_q8_bf16_cuda",
+        )?))
+    }
+}
+
+#[inline]
+pub(super) fn q8_prefill_cuda(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+    gs_shift: i32,
+    general_bias: bool,
+) -> Result<Option<MxArray>> {
+    let handle = unsafe {
+        sys::mlx_qwen4_q8_prefill_cuda(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+            gs_shift,
+            general_bias,
+        )
+    };
+    if handle.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(MxArray::from_handle(handle, "qwen4_q8_prefill_cuda")?))
+    }
+}

@@ -1,9 +1,9 @@
 use crate::array::MxArray;
+use crate::models::quantized_linear::QuantizedSwitchLinear;
+use crate::moe::{gather_sort, scatter_unsort};
 use crate::nn::{Activations, Linear};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-
-use super::quantized_linear::QuantizedSwitchLinear;
 
 /// Gemma4 MoE Router.
 ///
@@ -224,17 +224,11 @@ impl Gemma4MoE {
 
         // Sort by expert index for gather_mm efficiency.
         // Skip sorting when indices.size < 64 (single-token decode).
-        let flat_indices = top_k_indices.reshape(&[-1])?;
         let do_sort = ne * k >= 64;
 
         let (x_for_gather, idx_for_gather, needs_unsort) = if do_sort {
-            let order = flat_indices.argsort(Some(-1))?;
-            let inv_order_arr = order.argsort(Some(-1))?;
-            let idx_sorted = flat_indices.take(&order, 0)?;
-            let x_expanded = x_flat.reshape(&[ne, 1, hidden_size])?;
-            let token_indices = order.floor_divide(&self.k_scalar)?;
-            let x_sorted = x_expanded.take(&token_indices, 0)?;
-            (x_sorted, idx_sorted, Some(inv_order_arr))
+            let sorted = gather_sort(&x_flat, top_k_indices)?;
+            (sorted.x_sorted, sorted.idx_sorted, Some(sorted.inv_order))
         } else {
             let x_expanded = x_flat.reshape(&[ne, 1, hidden_size])?;
             // Positional indices (arange // k), NOT expert indices — expert IDs are
@@ -248,6 +242,7 @@ impl Gemma4MoE {
                 positions.floor_divide(&self.k_scalar)?
             };
             let x_rep = x_expanded.take(&token_indices, 0)?;
+            let flat_indices = top_k_indices.reshape(&[-1])?;
             (x_rep, flat_indices, None)
         };
 
@@ -280,12 +275,11 @@ impl Gemma4MoE {
             ExpertProj::Quantized(qsl) => qsl.forward(&hidden, &idx_for_gather, do_sort)?,
         };
 
-        let down_final = if let Some(inv_order) = needs_unsort {
-            down.take(&inv_order, 0)?
+        let expert_out = if let Some(inv_order) = needs_unsort {
+            scatter_unsort(&down, &inv_order, &[ne, k])?.squeeze(Some(&[-2]))?
         } else {
-            down
+            down.reshape(&[ne, k, hidden_size])?
         };
-        let expert_out = down_final.reshape(&[ne, k, hidden_size])?;
 
         // Apply routing weights: [ne, k, 1] * [ne, k, hidden]
         let weights_flat = top_k_weights.reshape(&[ne, k, 1])?;

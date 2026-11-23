@@ -16,7 +16,7 @@ use super::bank::{KqBank, KqStats};
 use super::rows::F8Table;
 use super::store::LANES_MAX;
 use crate::array::MxArray;
-pub use crate::models::deepseek_v41::stats::{host_pressure, rusage};
+pub use crate::utils::host::{host_pressure, rusage};
 
 pub const STATS_ENV: &str = "MLX_HY4_STATS";
 pub const PROFILE_ENV: &str = "MLX_HY4_PROFILE";

@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use super::decoder::GroupLimit;
 use crate::array::MxArray;
-use crate::models::qwen3_5::dflash2_state::plan::planned_checkpoints;
-use crate::models::qwen3_5::dflash2_state::store::{
+use crate::disk_tier::plan::planned_checkpoints;
+use crate::disk_tier::store::{
     Entry, EntryId, HybridStateStore, Lineage, StateBytes, StoreHit, lineage_bytes,
 };
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};

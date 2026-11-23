@@ -15,6 +15,7 @@ import { cpus, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { memoryStats, type SchedulerStats } from '@mlx-node/core';
+import { MODEL_FAMILY_DATA } from '@mlx-node/lm/family-data';
 
 import pkgJson from '../../package.json' with { type: 'json' };
 import type { ServerHealthStatus } from '../health.js';
@@ -191,8 +192,19 @@ function residencyFields(snapshot: ResidencySnapshot): Partial<RuntimeLoadRecord
   return fields;
 }
 
-/** Model types whose loads open a state tier; `''` is a resident of unknown type. */
-const STATE_TIER_TYPES: ReadonlySet<string> = new Set(['qwen3_5', 'qwen3_5_moe', '']);
+/**
+ * Model types whose loads publish a state tier to `memory_governor.dflash2_states.disk`;
+ * `''` is a resident of unknown type (counted conservatively so a summed limit is never
+ * attributed to one tier). Families with `acceptsCacheDisk` that omit
+ * `publishesGovernorStateDisk` (`qwen4_exp`, `hy_v4_flash`, `inkling2`) do not publish to
+ * `dflash2_states` and are intentionally excluded here.
+ */
+const STATE_TIER_TYPES: ReadonlySet<string> = new Set([
+  ...MODEL_FAMILY_DATA.filter(
+    (row) => 'publishesGovernorStateDisk' in row && row.publishesGovernorStateDisk === true,
+  ).map((row) => row.id),
+  '',
+]);
 
 /**
  * One persistent state tier's limit, or null when the governor's figure is not one tier's: the governor sums the

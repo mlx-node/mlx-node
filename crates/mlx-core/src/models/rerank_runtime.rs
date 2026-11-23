@@ -45,6 +45,14 @@ pub(crate) struct Runtime {
 fn worker_error(message: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("rerank_worker_failed: {message}"))
 }
+
+pub(crate) fn check_cancel(cancel: &AtomicBool, shutdown: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+        Err(Error::from_reason("rerank_cancelled: request cancelled"))
+    } else {
+        Ok(())
+    }
+}
 impl Runtime {
     pub async fn load<B: Backend>(
         init: impl FnOnce() -> Result<B> + Send + 'static,

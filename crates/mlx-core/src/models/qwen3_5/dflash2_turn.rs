@@ -3008,6 +3008,10 @@ where
     fn reached(&mut self, row: u32, outcome: Reached<'_>) -> Result<()> {
         reached(self.0, row, outcome)
     }
+
+    fn use_store_epilogue(&self) -> bool {
+        self.0.use_store_epilogue()
+    }
 }
 
 #[cfg(test)]

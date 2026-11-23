@@ -152,30 +152,6 @@ fn keys_token_major_pages_cross_the_host_and_refuse_raw_paths() {
         );
         let (k, v) = &payloads[0][0];
         assert!(pool.write_blocks_from_host(0, &[0], k, v).is_err());
-        let write = unsafe {
-            pool.write_kv(
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &[0],
-                MetalDtype::BFloat16,
-            )
-        };
-        assert!(write.is_err_and(|error| error.contains("has no host blob")));
-        let gather = unsafe {
-            pool.gather_attention(
-                0,
-                std::ptr::null_mut(),
-                MetalDtype::BFloat16,
-                &[0],
-                1,
-                8,
-                1.0,
-                0.0,
-                0,
-            )
-        };
-        assert!(gather.is_err_and(|error| error.contains("has no host blob")));
     }
 }
 

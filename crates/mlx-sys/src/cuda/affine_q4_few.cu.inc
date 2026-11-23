@@ -15,20 +15,11 @@ __device__ __forceinline__ void aq4_mma_m16n8k16_bf16(
     float& d0, float& d1, float& d2, float& d3,
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k16_bf16_v(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ uint4 aq4_ld_cs_u4(const uint4* ptr) {
-  uint4 v;
-  asm(
-      "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-      : "l"(ptr));
-  return v;
+  return ptx_ld_cs_u4(ptr);
 }
 
 // Extract two consecutive 4-bit nibbles from byte BYTE_IDX of w (and w_hi = w >> 4)

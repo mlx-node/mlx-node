@@ -1,18 +1,7 @@
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-
-/// Rotate the last dimension by splitting it in half and concatenating [-x2, x1].
-fn rotate_half(x: &MxArray) -> Result<MxArray> {
-    let ndim = x.ndim()?;
-    let last = x.shape_at(ndim - 1)?;
-    let half = last / 2;
-
-    let x1 = slice_last_dim(x, 0, half)?;
-    let x2 = slice_last_dim(x, half, last)?;
-    let neg_x2 = x2.negative()?;
-    MxArray::concatenate(&neg_x2, &x1, -1)
-}
+use crate::vision::rope_vision::rotate_half;
 
 /// Slice the last dimension of `x` in the range `[start, stop)`.
 fn slice_last_dim(x: &MxArray, start: i64, stop: i64) -> Result<MxArray> {

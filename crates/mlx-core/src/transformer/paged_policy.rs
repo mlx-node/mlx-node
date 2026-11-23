@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use crate::array::{DType, MxArray};
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
     SeqId, paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
@@ -42,52 +41,22 @@ pub(crate) fn warn_once_on_sync_fallback(
     }
 }
 
-/// Write one layer's paged-layout K/V chunk: graph-native
-/// `update_keys_values_native` when `MLX_PAGED_NATIVE_KV_WRITE` is on,
-/// synchronous `update_keys_values` otherwise or after a native-write error
-/// (a failed native write leaves the pool untouched, so this is not a
-/// double-write). Callers that must know which path ran — the shared
-/// transformer block couples its decode-gather gate to the write outcome —
-/// keep their own inline ladder rather than forcing the result through
-/// this signature.
+/// Write one layer's paged-layout K/V chunk via the graph-native
+/// `update_keys_values_native` path.
 pub(crate) fn write_kv_chunk(
     adapter: &mut PagedKVCacheAdapter,
     layer_idx: u32,
     keys_paged: &MxArray,
     values_paged: &MxArray,
     first_logical_position: u32,
-    family: &'static str,
+    _family: &'static str,
 ) -> Result<(), String> {
-    let native_written = native_kv_write_enabled()
-        && match adapter.update_keys_values_native(
-            layer_idx,
-            keys_paged,
-            values_paged,
-            first_logical_position,
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                warn_once_on_sync_fallback(family, "kv_write", layer_idx, &err);
-                false
-            }
-        };
-    if native_written {
-        return Ok(());
-    }
-    adapter
-        .update_keys_values(layer_idx, keys_paged, values_paged, first_logical_position)
-        .map(|_| ())
+    adapter.update_keys_values_native(layer_idx, keys_paged, values_paged, first_logical_position)
 }
 
-/// Gather historical K/V for one decode step: graph-native
-/// `gather_kv_for_decode_graph_with_plan` (compute route plus grouped
-/// partition plan, 0 = unplanned) when `MLX_PAGED_GRAPH_DECODE_GATHER`
-/// allows, synchronous `gather_kv_for_decode` otherwise or after a
-/// graph-gather error.
-///
-/// Callers that need an extra gate (e.g. the shared transformer block
-/// couples the read path to its KV write path) keep their own condition
-/// rather than forcing every gate into this signature.
+/// Gather historical K/V for one decode step via the graph-native
+/// `gather_kv_for_decode_graph_with_plan` path (compute route plus grouped
+/// partition plan, 0 = unplanned).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_kv_for_decode_with_route_and_fallback(
     adapter: &mut PagedKVCacheAdapter,
@@ -97,22 +66,16 @@ pub(crate) fn gather_kv_for_decode_with_route_and_fallback(
     softcap: f32,
     route: PagedDecodeRouteHint,
     grouped_stripes: u32,
-    family: &'static str,
+    _family: &'static str,
 ) -> Result<MxArray, String> {
-    if graph_decode_gather_enabled() {
-        match adapter.gather_kv_for_decode_graph_with_plan(
-            layer_idx,
-            queries,
-            scale,
-            softcap,
-            route,
-            grouped_stripes,
-        ) {
-            Ok(attn) => return Ok(attn),
-            Err(err) => warn_once_on_sync_fallback(family, "decode_gather", layer_idx, &err),
-        }
-    }
-    adapter.gather_kv_for_decode(layer_idx, queries, scale, softcap)
+    adapter.gather_kv_for_decode_graph_with_plan(
+        layer_idx,
+        queries,
+        scale,
+        softcap,
+        route,
+        grouped_stripes,
+    )
 }
 
 /// Reverse-order unwind of the rows a partially-recorded wave already

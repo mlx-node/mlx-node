@@ -320,6 +320,14 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsCacheDisk?: true;
   /**
+   * Native model publishes its SSD state tier (`disk_tier.rs`) to the process
+   * memory governor's `dflash2_states.disk` status (via
+   * `HybridSchedulerBackend::dflash2_state_status`). Families with
+   * `acceptsCacheDisk` that omit this flag (`qwen4_exp`, `hy_v4_flash`,
+   * `inkling2`) manage their own state tier outside `dflash2_states`.
+   */
+  readonly publishesGovernorStateDisk?: true;
+  /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
    * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
@@ -513,6 +521,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsDecodeShare: true,
     acceptsActivations: true,
     acceptsCacheDisk: true,
+    publishesGovernorStateDisk: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl', split: true },
@@ -536,6 +545,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsDecodeShare: true,
     acceptsActivations: true,
     acceptsCacheDisk: true,
+    publishesGovernorStateDisk: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {
@@ -916,4 +926,220 @@ export function matchFamily(modelPath: string, parsedConfig: unknown): ModelType
   const family = rows.find((candidate) => candidate.match.architectureProbe?.(matchContext) === true) ?? baseFamily;
   if (family === undefined) throw new UnsupportedModelTypeError(modelPath, config.rawModelTypeLabel);
   return family.id as ModelType;
+}
+
+/** Optional settings for `loadModel` / `loadSession`. */
+export interface LoadModelOptions {
+  /** Matching original HF checkpoint supplying Qwen4 MTP and vision omitted by GGUF. */
+  auxiliaryModelPath?: string;
+  /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
+  autoLoadDraft?: boolean;
+  /**
+   * Directory of an external draft checkpoint (config.json +
+   * model.safetensors) loaded alongside the target for speculative decoding.
+   * Gemma4 accepts either a DSpark draft or a Google gemma-4 assistant draft
+   * (`google/gemma-4-*-it-assistant`); the variant is auto-detected from
+   * the draft's config.json (`model_type` `gemma4_assistant` /
+   * `gemma4_unified_assistant` → assistant, `architectures` containing
+   * `Gemma4DSparkModel` → DSpark). When omitted, Gemma4 automatically loads
+   * an embedded draft from `<modelPath>/draft/` when present. Draft decoding
+   * runs on the flat KV-cache path, so the target checkpoint must not
+   * explicitly enable `use_block_paged_cache`.
+   *
+   * `qwen3_5` and `qwen3_5_moe` accept a matching `DFlash2DraftModel`
+   * companion, such as `z-lab/Qwen3.8-27B-DFlash2` for dense targets or
+   * `incoai/Qwen3.6-35B-A3B-DFlash2` for 35B-A3B MoE. It shares the target embedding and
+   * LM head, validates all companion tensors at load time, and takes
+   * precedence over an inline target MTP head. `qwen4_exp` accepts
+   * `incoai/Qwen3.8-Flash-Next-DFlash2`, only from this option (it is never
+   * discovered): a turn that sets `enableMtp` runs its cycle when it starts
+   * alone on a whole store whose banks are filled.
+   * Other model families reject this option.
+   */
+  draftModelPath?: string;
+  /**
+   * Full-attention K/V format of the block-paged pool for `qwen3_5`,
+   * `qwen3_5_moe` and `qwen4_exp` targets: `'int8'` — per-token symmetric
+   * int8 rows with one fp32 scale each, halving K/V memory and read
+   * bandwidth at a small, measured quality cost — or `'bf16'`. Unset: int8
+   * where the int8 kernels serve the model (qwen3_5 / MoE: Metal, 256-wide
+   * heads, BF16 compute; qwen4_exp: head 128 or 256), bf16 elsewhere. An
+   * explicit `'int8'` the kernels cannot serve, or on a load with no pool
+   * (qwen3_5 / MoE off Metal), fails the load; other model families reject
+   * it.
+   */
+  kvFormat?: 'int8' | 'bf16';
+  /**
+   * Metal memory budget in bytes for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
+   * targets (`--max-memory`). It can only lower the automatic budget the
+   * load's memory plan derives from the working set; the plan sizes the KV
+   * pool and the windows from it (and for `qwen4_exp` the expert store).
+   * `hy_v4_flash` sizes its expert cache within it. Other model families
+   * reject it.
+   */
+  maxMemoryBytes?: number;
+  /**
+   * Context token limit for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
+   * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
+   * tokens, and the load fails when its memory plan holds fewer. Past the
+   * native window the target's RoPE takes YaRN, which is static and changes
+   * answers at every length. `hy_v4_flash` takes it too, capped at 262,144
+   * with no YaRN. Other model families reject it.
+   */
+  maxContextTokens?: number;
+  /**
+   * Decode time owed per unit of prefill time while other requests generate,
+   * for `qwen3_5` and `qwen3_5_moe` targets (`--decode-share`): nonnegative
+   * and finite, default 0.5. Other model families reject it.
+   */
+  decodeShare?: number;
+  /**
+   * Int8 activations of `qwen3_5` and `qwen3_5_moe` targets
+   * (`--activations`): `'auto'` lets the paged attention over an int8 pool
+   * score int8 query codes for every query row at KV position 7,168 or
+   * later, in prefill, verify and decode alike, on Apple10 GPUs (M5) and
+   * later; `'bf16'` keeps every query bf16. Unset: `'auto'` for a `qwen3_5`
+   * load with a DFlash2 draft, `'bf16'` for a `qwen3_5` load with none and
+   * for `qwen3_5_moe`. Other model families reject it.
+   */
+  activations?: 'auto' | 'bf16';
+  /**
+   * SSD state tier of `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
+   * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
+   * `'0'` (off). Whether it survives a restart is the paged KV disk cache
+   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`; off, the tier is
+   * temporary. `hy_v4_flash` takes it for its stored states, with the same
+   * switch. Other model families reject it, as they do `cacheDir`.
+   */
+  cacheDisk?: string;
+  /** The persistent tier's root (`--cache-dir`); needs the switch on. */
+  cacheDir?: string;
+}
+
+/** Capability flags on {@link ModelFamilyData} that gate {@link LoadModelOptions} keys. */
+export type FamilyLoadOptionFlag = Extract<keyof ModelFamilyData, `accepts${string}`>;
+
+/** Keys of {@link LoadModelOptions} gated by a per-family `accepts*` capability flag. */
+export type GatedLoadOptionKey = Exclude<keyof LoadModelOptions, 'autoLoadDraft'>;
+
+/**
+ * Single declarative table mapping every `accepts*` capability flag on
+ * {@link MODEL_FAMILY_DATA} to the {@link LoadModelOptions} keys it gates and
+ * the human-facing label used in validation errors.
+ */
+export const FAMILY_LOAD_OPTION_SPECS = {
+  acceptsAuxiliaryModel: {
+    keys: ['auxiliaryModelPath'],
+    label: 'auxiliaryModelPath',
+  },
+  acceptsDraftModel: {
+    keys: ['draftModelPath'],
+    label: 'draftModelPath (speculative-decoding draft)',
+  },
+  acceptsMaxMemory: {
+    keys: ['maxMemoryBytes'],
+    label: 'maxMemoryBytes (Metal memory budget)',
+  },
+  acceptsMaxContext: {
+    keys: ['maxContextTokens'],
+    label: 'maxContextTokens (context token limit)',
+  },
+  acceptsActivations: {
+    keys: ['activations'],
+    label: 'activations (int8 activations)',
+  },
+  acceptsDecodeShare: {
+    keys: ['decodeShare'],
+    label: 'decodeShare (decode time owed per unit of prefill time)',
+  },
+  acceptsCacheDisk: {
+    keys: ['cacheDisk', 'cacheDir'],
+    label: 'cacheDisk and cacheDir (the SSD state tier)',
+  },
+  acceptsKvFormat: {
+    keys: ['kvFormat'],
+    label: 'kvFormat (K/V cache format)',
+  },
+} as const satisfies Record<
+  FamilyLoadOptionFlag,
+  { readonly keys: readonly GatedLoadOptionKey[]; readonly label: string }
+>;
+
+type CoveredLoadOptionKey = (typeof FAMILY_LOAD_OPTION_SPECS)[FamilyLoadOptionFlag]['keys'][number];
+// Compile-time completeness gate: every gated LoadModelOptions key must appear in FAMILY_LOAD_OPTION_SPECS.
+const _assertAllGatedLoadOptionsCovered: Exclude<GatedLoadOptionKey, CoveredLoadOptionKey> extends never
+  ? true
+  : never = true;
+void _assertAllGatedLoadOptionsCovered;
+
+const FAMILY_LOAD_OPTION_ENTRIES = Object.entries(FAMILY_LOAD_OPTION_SPECS) as ReadonlyArray<
+  [FamilyLoadOptionFlag, (typeof FAMILY_LOAD_OPTION_SPECS)[FamilyLoadOptionFlag]]
+>;
+
+type AcceptedLoadOptionKeyForRow<Row> = {
+  [F in FamilyLoadOptionFlag]: Row extends { readonly [K in F]: true }
+    ? (typeof FAMILY_LOAD_OPTION_SPECS)[F]['keys'][number]
+    : never;
+}[FamilyLoadOptionFlag];
+
+/** Subset of {@link LoadModelOptions} accepted by family `Id`. */
+export type FamilyLoadOptions<Id extends ModelType = ModelType> = Pick<
+  LoadModelOptions,
+  AcceptedLoadOptionKeyForRow<(typeof FAMILY_ROWS)[Id]>
+>;
+
+function formatFamilyList(ids: readonly string[]): string {
+  if (ids.length <= 1) return ids[0] ?? 'no';
+  return `${ids.slice(0, -1).join(', ')} and ${ids[ids.length - 1]}`;
+}
+
+/**
+ * Validate that every capability-gated option set on `options` is accepted by
+ * `modelType`. Throws a descriptive error listing the supporting families from
+ * {@link MODEL_FAMILY_DATA} when an unsupported option is passed.
+ */
+export function validateFamilyLoadOptions(
+  modelType: ModelType,
+  modelPath: string,
+  options: LoadModelOptions | undefined,
+): void {
+  if (options === undefined) return;
+  const family = familyDataFor(modelType);
+  if (family === undefined) {
+    throw new Error(`Internal error: missing model family descriptor for "${modelType}"`);
+  }
+  const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;
+  for (const [flag, spec] of FAMILY_LOAD_OPTION_ENTRIES) {
+    if (!spec.keys.some((key) => options[key] !== undefined)) continue;
+    if (family[flag] === true) continue;
+    const supported = rows.filter((row) => row[flag] === true).map((row) => row.id);
+    const verb = spec.keys.length > 1 ? 'are' : 'is';
+    throw new Error(
+      `${spec.label} ${verb} only supported by ${formatFamilyList(supported)} models; ${modelPath} has model_type "${modelType}"`,
+    );
+  }
+}
+
+/**
+ * Return a shallow object containing only the defined capability-gated
+ * {@link LoadModelOptions} accepted by `modelType`.
+ */
+export function filterFamilyLoadOptions<Id extends ModelType>(
+  modelType: Id,
+  options: LoadModelOptions | undefined,
+): FamilyLoadOptions<Id>;
+export function filterFamilyLoadOptions(modelType: string, options: LoadModelOptions | undefined): LoadModelOptions;
+export function filterFamilyLoadOptions(modelType: string, options: LoadModelOptions | undefined): LoadModelOptions {
+  if (options === undefined) return {};
+  const family = familyDataFor(modelType);
+  if (family === undefined) return {};
+  const filtered: Record<string, unknown> = {};
+  for (const [flag, spec] of FAMILY_LOAD_OPTION_ENTRIES) {
+    if (family[flag] !== true) continue;
+    for (const key of spec.keys) {
+      const value = options[key];
+      if (value !== undefined && value !== null) filtered[key] = value;
+    }
+  }
+  return filtered as LoadModelOptions;
 }

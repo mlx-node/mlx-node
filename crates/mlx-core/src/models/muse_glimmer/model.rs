@@ -27,21 +27,20 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::ModelThread;
 use crate::models::forward as fwd;
 use crate::models::gemma4::dspark::DsparkTap;
-use crate::models::gemma4::layer_cache::Gemma4LayerCache;
-use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
-use crate::models::gemma4::quantized_linear::LinearProj;
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, RMSNorm, rms_norm_unscaled};
 use crate::stream::Stream;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::tools::ToolCallResult;
-use crate::transformer::LayerKVCacheRoute;
 use crate::transformer::paged_kv_cache_adapter::ColdTierContext;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
+use crate::transformer::{
+    HybridKVCacheCoordinator, HybridLayerCache, LayerKVCacheRoute, PagedWindowSlot,
+};
 
 use super::config::{LayerKind, MuseGlimmerConfig};
 use super::decoder_layer::MuseGlimmerDecoderLayer;
 use super::dflash::DFlashModel;
-use super::kv_cache::PagedWindowSlot;
 use super::output_parser::{ParsedToolCall, ResponseTemplate};
 use super::stream_guard::{GuardOutcome, StreamGuard};
 
@@ -79,7 +78,7 @@ mod dflash_schedule_tests {
 }
 
 pub(crate) struct MusePagedRuntime {
-    pub(crate) coordinator: Gemma4KVCacheCoordinator,
+    pub(crate) coordinator: HybridKVCacheCoordinator,
     pub(crate) routes: Vec<LayerKVCacheRoute>,
     pub(crate) prefill_windows: Vec<PagedWindowSlot>,
     pub(crate) decode_windows: Vec<PagedWindowSlot>,
@@ -222,12 +221,11 @@ mod context_limit_tests {
     }
 }
 
-#[derive(Clone)]
-struct MuseSlidingColdCheckpoint {
-    boundary: u32,
-    tokens: Vec<u32>,
-    layer_kv: Vec<(MxArray, MxArray)>,
-}
+use crate::disk_tier::sliding_cold::{
+    GroupedSlidingColdCheckpoint, PreparedSlidingPrefix, build_sliding_cold_tier_context,
+    capture_grouped_sliding_cold_sidecar, cold_rung_candidates, prepare_grouped_sliding_prefix,
+    remember_grouped_sliding_cold_checkpoints,
+};
 
 pub(crate) type MuseGlimmerCmd = crate::engine::model_command::ModelCommand;
 
@@ -241,7 +239,7 @@ pub(crate) struct MuseGlimmerInner {
     /// packed-resident and a separate `lm_head.weight` is neither required nor
     /// consulted.
     pub(crate) lm_head: Option<LinearProj>,
-    pub(crate) caches: Vec<Gemma4LayerCache>,
+    pub(crate) caches: Vec<HybridLayerCache>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) response_template: Arc<ResponseTemplate>,
     pub(crate) cached_token_history: Vec<u32>,
@@ -262,21 +260,21 @@ pub(crate) struct MuseGlimmerInner {
     pub(crate) decode_timing: Option<std::time::Instant>,
     pub(crate) active_paged_seq: u32,
     pub(crate) active_flat_session: bool,
-    sliding_cold_checkpoints: HashMap<SeqId, VecDeque<MuseSlidingColdCheckpoint>>,
+    sliding_cold_checkpoints: HashMap<SeqId, VecDeque<GroupedSlidingColdCheckpoint>>,
 }
 
-fn init_caches(config: &MuseGlimmerConfig) -> Vec<Gemma4LayerCache> {
+fn init_caches(config: &MuseGlimmerConfig) -> Vec<HybridLayerCache> {
     config
         .text_config
         .layer_kinds
         .iter()
         .map(|kind| match kind {
-            LayerKind::Sliding => Gemma4LayerCache::new_sliding(
+            LayerKind::Sliding => HybridLayerCache::new_sliding(
                 // Config validation guarantees the window fits i32; clamp to
                 // i32::MAX (effectively no sliding bound) rather than panic.
                 i32::try_from(config.text_config.sliding_window).unwrap_or(i32::MAX),
             ),
-            LayerKind::Full => Gemma4LayerCache::new_global(),
+            LayerKind::Full => HybridLayerCache::new_global(),
         })
         .collect()
 }
@@ -351,41 +349,18 @@ impl MuseGlimmerInner {
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<ColdTierContext> {
         let coordinator = self.paged.as_ref().map(|paged| &paged.coordinator)?;
-        let manager = crate::cold_tier::global_cold_cache()?;
         let geometry = super::cold_sidecar::geometry(&self.config)?;
         let sidecar_policy = super::cold_sidecar::policy(&self.config)?;
-        let mut config_json = std::fs::read(Path::new(model_path).join("config.json")).ok()?;
-        config_json.extend_from_slice(&geometry.fingerprint_component());
-        let pool = coordinator.full_adapter().layer_kv_pool();
-        let pool_geometry = crate::cold_tier::ColdTierGeometry {
-            block_size: pool.block_size() as u64,
-            num_layers: pool.num_layers() as u64,
-            num_kv_heads: pool.config().num_kv_heads as u64,
-            head_size: pool.config().head_size as u64,
-            cache_dtype: format!("{:?}", pool.cache_dtype()),
-        };
-        match crate::cold_tier::build_model_fingerprint(
+        let config_json = std::fs::read(Path::new(model_path).join("config.json")).ok()?;
+        build_sliding_cold_tier_context(
             "muse_glimmer",
+            coordinator.full_adapter(),
+            &config_json,
+            &geometry.fingerprint_component(),
+            sidecar_policy,
             files,
-            Some(&config_json),
-            &pool_geometry,
             weights,
-        ) {
-            Some(fingerprint) => Some(ColdTierContext {
-                manager,
-                fingerprint,
-                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
-                    sidecar_policy,
-                ),
-            }),
-            None => {
-                tracing::warn!(
-                    "cold-tier persistence disabled for {}: could not establish a complete model fingerprint",
-                    files.label()
-                );
-                None
-            }
-        }
+        )
     }
 
     pub(crate) fn attach_cold_tier(
@@ -409,139 +384,26 @@ impl MuseGlimmerInner {
         reuse_cache: bool,
     ) -> Result<u32> {
         self.set_active_paged_owner(seq_id);
-        let total_budget = tokens.len() as u32;
         let geometry = super::cold_sidecar::geometry(&self.config);
-        let (block_size, plan) = {
-            let coordinator = &mut self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?
-                .coordinator;
-            let block_size = coordinator.full_adapter().block_size();
-            let extra_keys = crate::engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
-            let plan = coordinator
-                .full_adapter_mut()
-                .prepare_turn_per_block_with_max_cache_hit_tokens(
-                    seq_id,
-                    tokens,
-                    total_budget,
-                    reuse_cache,
-                    &extra_keys,
-                    cache_salt,
-                    false,
-                    total_budget.saturating_sub(1),
-                )
-                .map_err(Error::from_reason)?;
-            (block_size, plan)
-        };
-
-        if plan.continued_live_prefix {
-            let continued = self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
-                .coordinator
-                .continue_sliding_all(seq_id, tokens, total_budget, plan.cached_prefix_len);
-            if continued.is_ok() {
-                return Ok(plan.cached_prefix_len);
-            }
-            tracing::warn!(
-                target: "mlx_core::muse_glimmer::paged",
-                "Muse-Glimmer hybrid live continuation disagreed across groups; restarting cold"
-            );
-            let extra_keys = crate::engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
-            let coordinator = &mut self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
-                .coordinator;
-            coordinator
-                .full_adapter_mut()
-                .restart_prepared_turn_cold_per_block(
-                    seq_id,
-                    tokens,
-                    total_budget,
-                    &extra_keys,
-                    cache_salt,
-                )
-                .map_err(Error::from_reason)?;
-            coordinator
-                .reset_sliding_requests(seq_id)
-                .map_err(Error::from_reason)?;
-            self.sliding_cold_checkpoints.remove(&seq_id);
-            self.scheduled_dflash_states.remove(&seq_id);
-            return Ok(0);
-        }
-
-        self.sliding_cold_checkpoints.remove(&seq_id);
-        self.scheduled_dflash_states.remove(&seq_id);
-        if plan.cached_prefix_len == 0 {
-            self.paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
-                .coordinator
-                .reset_sliding_requests(seq_id)
-                .map_err(Error::from_reason)?;
-            return Ok(0);
-        }
-
-        let restored = self
-            .paged
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
-            .coordinator
-            .full_adapter_mut()
-            .take_restored_sidecar();
-        let installed = if let Some(geometry) = geometry.as_ref() {
-            let expected =
-                crate::models::gemma4::sliding_sidecar::layout_at(geometry, plan.cached_prefix_len);
-            crate::cold_tier::try_install_cold_sidecar(restored, &expected, |tensors, boundary| {
-                let Some(layer_kv) = crate::models::gemma4::sliding_sidecar::decode_layer_kv(
-                    geometry, tensors, boundary,
-                )?
-                else {
-                    return Ok(None);
-                };
-                let coordinator = &mut self
-                    .paged
-                    .as_mut()
-                    .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
-                    .coordinator;
-                if coordinator
-                    .restore_sliding_groups(seq_id, tokens, boundary, &layer_kv)
-                    .is_err()
-                {
-                    return Ok(None);
-                }
-                Ok(Some(boundary))
-            })?
-        } else {
-            None
-        };
-        if let Some(boundary) = installed {
-            return Ok(boundary);
-        }
-
-        let extra_keys = crate::engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let coordinator = &mut self
             .paged
             .as_mut()
-            .ok_or_else(|| Error::from_reason("checked Muse paged runtime"))?
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?
             .coordinator;
-        coordinator
-            .full_adapter_mut()
-            .restart_prepared_turn_cold_per_block(
-                seq_id,
-                tokens,
-                total_budget,
-                &extra_keys,
-                cache_salt,
-            )
-            .map_err(Error::from_reason)?;
-        coordinator
-            .reset_sliding_requests(seq_id)
-            .map_err(Error::from_reason)?;
-        Ok(0)
+        let outcome = prepare_grouped_sliding_prefix(
+            coordinator,
+            geometry.as_ref(),
+            seq_id,
+            tokens,
+            cache_salt,
+            reuse_cache,
+            "Muse-Glimmer",
+        )?;
+        if !matches!(outcome, PreparedSlidingPrefix::Continued(_)) {
+            self.sliding_cold_checkpoints.remove(&seq_id);
+            self.scheduled_dflash_states.remove(&seq_id);
+        }
+        Ok(outcome.cached_prefix_len())
     }
 
     pub(crate) fn remember_sliding_cold_checkpoints(&mut self, seq_id: SeqId) -> Result<()> {
@@ -562,75 +424,18 @@ impl MuseGlimmerInner {
         seq_id: SeqId,
         committed_tokens: Option<u32>,
     ) -> Result<()> {
-        let candidates = {
-            let Some(paged) = self.paged.as_ref() else {
-                return Ok(());
-            };
-            let full = paged.coordinator.full_adapter();
-            let anchors = self.cold_anchor_rungs();
-            if anchors.is_empty() {
-                return Ok(());
-            }
-            let Some(recorded) = full.current_token_count_for(seq_id) else {
-                return Ok(());
-            };
-            let frontier = committed_tokens.map_or(recorded, |committed| committed.min(recorded));
-            let Some(tokens) = full.request_tokens_for(seq_id) else {
-                return Ok(());
-            };
-            anchors
-                .iter()
-                .copied()
-                .filter(|boundary| *boundary <= frontier)
-                .filter_map(|boundary| {
-                    tokens
-                        .get(..boundary as usize)
-                        .map(|prefix| (boundary, prefix.to_vec(), anchors.len()))
-                })
-                .collect::<Vec<_>>()
+        let anchors = self.cold_anchor_rungs();
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(());
         };
-        for (boundary, tokens, limit) in candidates {
-            if self
-                .sliding_cold_checkpoints
-                .get(&seq_id)
-                .is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| entry.boundary == boundary && entry.tokens == tokens)
-                })
-            {
-                continue;
-            }
-            let Some(layer_kv) = self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime disappeared"))?
-                .coordinator
-                .read_sliding_groups_at(seq_id, boundary)
-                .map_err(Error::from_reason)?
-            else {
-                continue;
-            };
-            let entries = self.sliding_cold_checkpoints.entry(seq_id).or_default();
-            entries.push_back(MuseSlidingColdCheckpoint {
-                boundary,
-                tokens,
-                layer_kv,
-            });
-            while entries.len() > limit.max(1) {
-                entries.pop_front();
-            }
-        }
-        Ok(())
-    }
-
-    fn discard_sliding_checkpoints_through(&mut self, seq_id: SeqId, boundary: u32) {
-        if let Some(entries) = self.sliding_cold_checkpoints.get_mut(&seq_id) {
-            entries.retain(|entry| entry.boundary > boundary);
-            if entries.is_empty() {
-                self.sliding_cold_checkpoints.remove(&seq_id);
-            }
-        }
+        remember_grouped_sliding_cold_checkpoints(
+            &mut self.sliding_cold_checkpoints,
+            &mut paged.coordinator,
+            seq_id,
+            committed_tokens,
+            &anchors,
+            cold_rung_candidates,
+        )
     }
 
     fn capture_sliding_cold_sidecar(
@@ -639,120 +444,24 @@ impl MuseGlimmerInner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) {
-        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
-        let Some((block_size, frontier, request_tokens, anchors, manager, fingerprint, budget)) =
-            self.paged.as_ref().and_then(|paged| {
-                let full = paged.coordinator.full_adapter();
-                let cold = full.cold_tier()?;
-                if cold
-                    .sidecar_policy()
-                    .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
-                {
-                    return None;
-                }
-                Some((
-                    full.block_size(),
-                    full.cold_captured_blocks()
-                        .saturating_mul(full.block_size()),
-                    full.request_tokens_for(seq_id)?.to_vec(),
-                    super::cold_sidecar::anchor_rungs(full.block_size()),
-                    Arc::clone(&cold.manager),
-                    cold.fingerprint,
-                    full.cold_capture_budget(),
-                ))
-            })
-        else {
+        let Some(paged) = self.paged.as_mut() else {
+            crate::cold_tier::cold_sidecar_counters().record_capture_reached();
             return;
         };
-        let checkpoint = self
-            .sliding_cold_checkpoints
-            .get(&seq_id)
-            .and_then(|entries| {
-                entries.iter().rev().find(|entry| {
-                    entry.boundary <= frontier
-                        && request_tokens
-                            .get(..entry.boundary as usize)
-                            .is_some_and(|tokens| tokens == entry.tokens)
-                })
-            })
-            .cloned()
-            .or_else(|| {
-                let boundary = anchors
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|boundary| *boundary <= frontier)?;
-                let layer_kv = self
-                    .paged
-                    .as_mut()?
-                    .coordinator
-                    .read_sliding_groups_at(seq_id, boundary)
-                    .ok()??;
-                let tokens = request_tokens.get(..boundary as usize)?.to_vec();
-                Some(MuseSlidingColdCheckpoint {
-                    boundary,
-                    tokens,
-                    layer_kv,
-                })
-            });
-        let Some(checkpoint) = checkpoint else {
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            return;
-        };
-        let Some(key) = super::cold_sidecar::chain_key(
-            fingerprint,
-            &request_tokens,
+        let anchors =
+            super::cold_sidecar::anchor_rungs(paged.coordinator.full_adapter().block_size());
+        let geometry = super::cold_sidecar::geometry(&self.config);
+        capture_grouped_sliding_cold_sidecar(
+            &mut self.sliding_cold_checkpoints,
+            &mut paged.coordinator,
+            geometry.as_ref(),
+            seq_id,
+            &anchors,
             extra_keys_per_block,
-            block_size,
-            checkpoint.boundary,
             cache_salt,
-        ) else {
-            return;
-        };
-        if manager.contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow) {
-            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-            self.discard_sliding_checkpoints_through(seq_id, checkpoint.boundary);
-            return;
-        }
-        let refs = checkpoint
-            .layer_kv
-            .iter()
-            .flat_map(|(keys, values)| [keys, values])
-            .collect::<Vec<_>>();
-        if MxArray::eval_arrays(&refs).is_err() {
-            return;
-        }
-        let Some(geometry) = super::cold_sidecar::geometry(&self.config) else {
-            return;
-        };
-        let Ok(Some(tensors)) = crate::models::gemma4::sliding_sidecar::encode_layer_kv(
-            &geometry,
-            &checkpoint.layer_kv,
-            checkpoint.boundary,
-        ) else {
-            return;
-        };
-        let sidecar = mlx_paged_attn::ColdSidecar {
-            key,
-            fingerprint,
-            layout: crate::models::gemma4::sliding_sidecar::layout_at(
-                &geometry,
-                checkpoint.boundary,
-            ),
-            tensors,
-        };
-        let deadline = std::time::Instant::now() + budget.max_walk;
-        match manager.enqueue_sidecar_before(sidecar, deadline) {
-            Ok(true) => {
-                crate::cold_tier::cold_sidecar_counters().record_enqueued();
-                self.discard_sliding_checkpoints_through(seq_id, checkpoint.boundary);
-            }
-            Ok(false) => crate::cold_tier::cold_sidecar_counters().record_queue_drop(),
-            Err(error) => tracing::debug!(
-                target: "mlx_core::muse_glimmer::paged",
-                "Muse-Glimmer sliding sidecar enqueue failed: {error}"
-            ),
-        }
+            true,
+            "Muse-Glimmer",
+        );
     }
 
     pub(crate) fn release_paged_request(
@@ -842,13 +551,13 @@ impl MuseGlimmerInner {
         self.active_flat_session = false;
     }
 
-    pub(crate) fn install_flat_owner_caches(&mut self, caches: Option<Vec<Gemma4LayerCache>>) {
+    pub(crate) fn install_flat_owner_caches(&mut self, caches: Option<Vec<HybridLayerCache>>) {
         self.active_paged_seq = 0;
         self.active_flat_session = true;
         self.caches = caches.unwrap_or_else(|| init_caches(&self.config));
     }
 
-    pub(crate) fn take_flat_owner_caches(&mut self) -> Vec<Gemma4LayerCache> {
+    pub(crate) fn take_flat_owner_caches(&mut self) -> Vec<HybridLayerCache> {
         std::mem::replace(&mut self.caches, init_caches(&self.config))
     }
 
@@ -1685,29 +1394,17 @@ impl ChatBackend for MuseGlimmerInner {
             .into_iter()
             .map(ParsedToolCall::into_tool_call_result)
             .collect();
-        let finish_reason = if tool_calls.is_empty() {
-            args.finish_reason
-        } else {
-            "tool_calls".to_string()
-        };
-        Ok(ChatResult {
-            text: parsed.content.unwrap_or_default(),
+        let finish_reason_override = (!tool_calls.is_empty()).then_some("tool_calls");
+        let thinking = args.include_reasoning.then_some(parsed.reasoning).flatten();
+        Ok(crate::engine::finalize::assemble_parsed_chat_result(
+            args,
+            parsed.content.unwrap_or_default(),
             tool_calls,
-            thinking: args.include_reasoning.then_some(parsed.reasoning).flatten(),
-            thinking_enabled: args.thinking_enabled,
-            num_tokens: args.generated_tokens.len() as u32,
-            prompt_tokens: args.prompt_tokens,
-            reasoning_tokens: args.reasoning.tokens,
-            reasoning_close: args.reasoning.close_name(),
-            reasoning_cut_at: args.reasoning.cut_at,
-            reasoning_cycle_period: args.reasoning.cycle_period,
-            reasoning_stray_closes: args.reasoning.reported_stray_closes(),
-            finish_reason,
+            thinking,
+            finish_reason_override,
             raw_text,
-            public_raw_text: None,
-            cached_tokens: 0,
-            performance: args.performance,
-        })
+            None,
+        ))
     }
 
     fn stream_skip_special_tokens(&self) -> bool {
@@ -1947,7 +1644,7 @@ mod spec_paged_settle_tests {
             .expect("tiny adapter must construct");
             adapters.push(adapter);
         }
-        let coordinator = Gemma4KVCacheCoordinator::new(&specs, groups, adapters, 4)
+        let coordinator = HybridKVCacheCoordinator::new(&specs, groups, adapters, 4)
             .expect("tiny coordinator must construct");
         let routes = coordinator.routes().to_vec();
         Some(MusePagedRuntime {

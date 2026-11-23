@@ -56,7 +56,7 @@ use crate::engine::plan::{ExecutionPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatResult};
 use crate::engine::warmup::WarmupReport;
 use crate::model_thread::{LoopControl, ModelThread};
-use crate::models::deepseek_v41::chat::{gguf_tokenizer, shard_paths};
+use crate::models::gguf_chat::{gguf_tokenizer, shard_paths};
 use crate::moe_stream::budget::Admission;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;

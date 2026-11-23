@@ -128,27 +128,10 @@ impl TextDetImageProcessor {
         let resized = img.resize_exact(round_w, round_h, RESIZE_FILTER);
         let rgb_img = resized.to_rgb8();
 
-        let h = round_h as usize;
-        let w = round_w as usize;
-        let mut pixel_data: Vec<f32> = vec![0.0; h * w * 3];
-
         // Channel mapping: RGB->BGR. PaddleOCR loads as BGR (cv2.imread) and
-        // the mean/std values are in BGR order. We swap R and B before normalizing.
-        let channel_map = [2usize, 1, 0]; // BGR ordering
-
-        for y in 0..h {
-            for x in 0..w {
-                let pixel = rgb_img.get_pixel(x as u32, y as u32);
-                for c in 0..3 {
-                    let src_c = channel_map[c];
-                    let val = pixel[src_c] as f32 / 255.0;
-                    let normalized = (val - self.mean[c]) / self.std[c];
-                    pixel_data[(y * w + x) * 3 + c] = normalized;
-                }
-            }
-        }
-
-        let pixel_values = MxArray::from_float32(&pixel_data, &[1, h as i64, w as i64, 3])?;
+        // the mean/std values are in BGR order.
+        let pixel_values =
+            crate::vision::cnn::rgb_to_nhwc_f32(&rgb_img, Some(self.mean), Some(self.std), true)?;
 
         Ok((pixel_values, orig_h, orig_w, round_h, round_w))
     }

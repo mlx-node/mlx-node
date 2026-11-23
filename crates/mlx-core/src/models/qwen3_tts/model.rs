@@ -438,13 +438,10 @@ impl NativeModel {
             return Ok(id);
         }
         let speaker_audio =
-            crate::audio::dsp::resample_mono(&audio, sample_rate, speaker.config.sample_rate);
+            mlx_audio::dsp::resample_mono(&audio, sample_rate, speaker.config.sample_rate);
         super::check_cancelled(cancelled)?;
-        let codec_audio = crate::audio::dsp::resample_mono(
-            &audio,
-            sample_rate,
-            self.codec.config.input_sample_rate,
-        );
+        let codec_audio =
+            mlx_audio::dsp::resample_mono(&audio, sample_rate, self.codec.config.input_sample_rate);
         super::check_cancelled(cancelled)?;
         let speaker = speaker.encode(&speaker_audio)?;
         MxArray::eval_arrays(&[&speaker])?;

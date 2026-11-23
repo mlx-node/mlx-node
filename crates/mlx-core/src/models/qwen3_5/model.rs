@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Instant;
@@ -37,8 +37,11 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::record_decode_wave;
 
 use crate::engine;
+#[cfg(test)]
+use crate::engine::extract_chat_params;
+use crate::engine::mtp_decode;
 use crate::engine::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
+    apply_all_penalties, compute_performance_metrics, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::qwen3_5::config::Qwen3_5Config;
@@ -55,7 +58,6 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 };
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::mtp::Qwen3_5MTPModule;
-use crate::models::qwen3_5::mtp_decode;
 use crate::models::qwen3_5::persistence;
 use crate::vision::qwen::encoder::QwenVisionEncoder;
 use crate::vision::qwen::processing::QwenImageProcessor;
@@ -72,7 +74,9 @@ mod flat_dflash2;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
-pub(crate) use lifecycle::{LentRecurrent, cold_tier_config_json};
+pub(crate) use lifecycle::LentRecurrent;
+#[cfg(test)]
+pub(crate) use lifecycle::cold_tier_config_json;
 mod mtp;
 mod paged_backend;
 pub(crate) mod restore;
@@ -104,13 +108,11 @@ use self::forward::{
 use self::mtp::DenseMtpStepper;
 pub(crate) use self::mtp::Qwen35Decode;
 use self::paged_backend::{Qwen35PrefixState, StreamSender};
-#[cfg(test)]
-use self::state::configure_paged_mtp_profiler;
 use self::state::{
     DenseGdnCheckpointStoreTrace, DenseGdnHistoryCheckpoint, DenseGdnPrefixCheckpoint,
-    DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder, begin_paged_mtp_profiler,
-    clone_dense_linear_layer_caches, dense_paged_frontier_skew, dense_paged_linear_caches_ready,
-    fresh_dense_layer_caches, qwen35_dense_media_plan, qwen35_dense_session_media,
+    DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder, clone_dense_linear_layer_caches,
+    dense_paged_frontier_skew, dense_paged_linear_caches_ready, fresh_dense_layer_caches,
+    qwen35_dense_media_plan, qwen35_dense_session_media,
     qwen35_dense_session_media_matches_payloads,
 };
 pub(crate) use self::state::{
@@ -141,9 +143,6 @@ pub(crate) fn qwen35_max_concurrent_sequences(paged_active: bool, lanes: u32) ->
 pub(crate) use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 
 #[cfg(test)]
-mod paged_mtp_profiler_tests;
-
-#[cfg(test)]
 mod paged_context_capacity_tests;
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -152,6 +151,14 @@ mod paged_context_capacity_tests;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// MoE-specific parameters when this instance backs a `Qwen3_5MoeModel`;
+    /// `None` for dense Qwen3.5 / Qwen3.8 models.
+    pub(crate) moe_config: Option<super::config::Qwen35MoeParams>,
+    /// Preserves row-exact quantized matmul semantics in batched MoE decode
+    /// waves when quantized weights are sensitive to 1-ULP router input deltas.
+    pub(crate) row_exact_decode_projections: bool,
+    /// Adaptive GPU verify-row budget tracker used by MoE DFlash2 decode.
+    pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     /// The in-flight turn's cooperative-cancel flag, installed by the
     /// sync and streaming session wrappers via
     /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
@@ -176,9 +183,9 @@ pub(crate) struct Qwen35Inner {
     pub(crate) lm_head: Option<LinearProj>,
     pub(crate) clef_head: Option<crate::models::clef::head::JointHead>,
     pub(crate) clairic_head: Option<crate::models::clairic::head::ClairicHead>,
-    pub(crate) clairic_grammar: Option<Arc<crate::grammar::GrammarEngine>>,
+    pub(crate) clairic_grammar: Option<Arc<mlx_clairic::grammar::GrammarEngine>>,
     pub(crate) clairic_multimodal: crate::models::qwen3_5::config::Qwen3_5MultimodalTokens,
-    pub(crate) clairic_profile: Option<crate::models::clairic::profile::ClairicProfile>,
+    pub(crate) clairic_profile: Option<mlx_clairic::profile::ClairicProfile>,
     pub(crate) prism_hadamard: Option<crate::quant::prism_hadamard::PrismHadamardRuntime>,
     /// Optional external DFlash2 companion. When installed it takes
     /// precedence over the target checkpoint's inline one-layer MTP head.
@@ -356,6 +363,17 @@ pub(crate) struct Qwen35Inner {
     /// re-probes (the aggregate resets to zero) so a later easier turn
     /// can re-enable speculation.
     mtp_gated_turns: u32,
+    /// One-shot hint set before `engine::paged_turn::run_paged_turn` when the
+    /// turn plans native paged MTP. Consumed by `PagedBackend::paged_prefill`
+    /// so a cold prefill (`effective_cached_prefix_len == 0`) retains the
+    /// post-`final_norm` prompt hidden states for `begin_mtp_decode`'s
+    /// committed-history prompt seed.
+    pub(crate) want_paged_mtp_prompt_hidden: bool,
+    /// Stashed `(prompt_hidden, prompt_hidden_ids)` captured during
+    /// `PagedBackend::paged_prefill` for `run_paged_speculative_decode`.
+    /// Cleared on speculative admission refusal, turn finalization, abort, and
+    /// cache reset so stale hidden tensors never outlive one turn.
+    pub(crate) pending_prompt_hidden: Option<(MxArray, Vec<u32>)>,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -531,7 +549,7 @@ impl Qwen3_5ContextLimits {
 
 // Shared chat types live in the model-neutral engine module; import them for
 // internal use (no re-export — consumers import from `crate::engine::types`).
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///
@@ -574,7 +592,7 @@ pub struct Qwen3_5Model {
     /// Actual merge size installed on the loaded inner model, paired with
     /// `image_processor` for exact preflight geometry.
     pub(crate) spatial_merge_size: i32,
-    pub(crate) clairic_profile: Option<crate::models::clairic::profile::ClairicProfile>,
+    pub(crate) clairic_profile: Option<mlx_clairic::profile::ClairicProfile>,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// Directory containing tokenizer/config assets for this loaded model.
     /// For direct GGUF loads this is the lossless native-packed cache rather
@@ -926,9 +944,7 @@ impl Qwen3_5Model {
 impl Qwen3_5Model {
     /// Cached Clairic profile selected from `clair_head_config.json` at load time.
     /// Returns `None` for standard chat and CLEF loads.
-    pub(crate) fn clairic_profile(
-        &self,
-    ) -> Option<crate::models::clairic::profile::ClairicProfile> {
+    pub(crate) fn clairic_profile(&self) -> Option<mlx_clairic::profile::ClairicProfile> {
         self.clairic_profile
     }
 
@@ -1005,3 +1021,15 @@ pub(crate) mod dflash2_park_tests;
 
 #[cfg(test)]
 mod lane_state_tests;
+
+#[cfg(test)]
+mod moe_paged_tests;
+
+#[cfg(test)]
+mod mask_free_full_attention_parity_tests;
+
+#[cfg(test)]
+mod moe_eval_teacher_forced_tests;
+
+#[cfg(test)]
+mod moe_paged_speculative_routing_tests;

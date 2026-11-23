@@ -57,9 +57,6 @@ import { dirname, join } from 'node:path';
 import {
   GrpoTrainingEngine,
   NativeRewardRegistry,
-  Qwen3Model,
-  Qwen35Model,
-  Qwen35MoeModel,
   OutputStore,
   buildRewardOutputs,
   type GrpoEngineConfig,
@@ -73,6 +70,7 @@ import {
 import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types.js';
+import { createTrainingEngine, installTrainerSignalHandlers } from './trainer-utils.js';
 import { createTrainingLogger, type TrainingLogger } from './training-logger.js';
 
 // Re-export native types
@@ -529,15 +527,7 @@ export class GRPOTrainer<T = unknown> {
       weightDecay: this.config.weightDecay,
     };
 
-    if (model instanceof Qwen35Model) {
-      this.engine = GrpoTrainingEngine.fromQwen35(model, engineConfig);
-    } else if (model instanceof Qwen35MoeModel) {
-      this.engine = GrpoTrainingEngine.fromQwen35Moe(model, engineConfig);
-    } else if (model instanceof Qwen3Model) {
-      this.engine = new GrpoTrainingEngine(model, engineConfig);
-    } else {
-      throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
-    }
+    this.engine = createTrainingEngine(GrpoTrainingEngine, model, engineConfig);
 
     // Always setup signal handlers for crash recovery
     this.setupSignalHandlers();
@@ -555,11 +545,12 @@ export class GRPOTrainer<T = unknown> {
     if (this.signalHandlersInstalled) return;
     this.signalHandlersInstalled = true;
 
-    const gracefulShutdown = async (signal: string) => {
-      this.logger.warn(`Received ${signal}, initiating graceful shutdown...`);
-      this.stopRequested = true;
-
-      try {
+    installTrainerSignalHandlers({
+      logger: this.logger,
+      onStop: () => {
+        this.stopRequested = true;
+      },
+      onShutdown: async () => {
         // Skip checkpoint if recent one exists (within 10 steps)
         const stepsSinceCheckpoint = this.currentStep - this.lastCheckpointStep;
         if (this.config.outputDir && stepsSinceCheckpoint > 10) {
@@ -575,29 +566,9 @@ export class GRPOTrainer<T = unknown> {
           await this.outputStore.flush();
           this.logger.info('OutputStore finalized with crashed status');
         }
-      } catch (e) {
-        console.error('Emergency save failed:', e);
-      }
-
-      process.exit(0);
-    };
-
-    process.on('SIGTERM', () => {
-      gracefulShutdown('SIGTERM').catch(console.error);
-    });
-
-    process.on('SIGINT', () => {
-      gracefulShutdown('SIGINT').catch(console.error);
-    });
-
-    process.on('uncaughtException', (err) => {
-      console.error('Uncaught exception:', err);
-      gracefulShutdown('uncaughtException').catch(console.error);
-    });
-
-    process.on('unhandledRejection', (reason) => {
-      console.error('Unhandled rejection:', reason);
-      gracefulShutdown('unhandledRejection').catch(console.error);
+      },
+      errorMessage: 'Emergency save failed:',
+      handleUncaught: true,
     });
   }
 

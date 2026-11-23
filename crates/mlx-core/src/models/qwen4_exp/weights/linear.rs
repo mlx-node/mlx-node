@@ -127,7 +127,7 @@ impl Weight {
                             CudaQ8PrefillMode::Cublas => unreachable!(),
                         }
                     };
-                    if let Some(out) = crate::kernels::qwen4::q8_prefill_cuda(
+                    if let Some(out) = crate::kernels::linear::q8_prefill_cuda(
                         x,
                         &self.values,
                         scales,

@@ -6,10 +6,11 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
 use super::attention::{PagedPass, PagedWaveLane, Qwen3_5Attention, RopeMode};
-use super::config::Qwen3_5Config;
+use super::config::{Qwen3_5Config, Qwen35MoeParams};
 use super::gated_delta_net::GatedDeltaNet;
 use super::gdn_blob::{GdnWaveCells, gdn_wave_layer};
 use super::layer_cache::Qwen3_5LayerCache;
+use super::sparse_moe::SparseMoeBlock;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 
 /// Per-layer routing kind for Qwen3.5's paged dispatch.
@@ -93,15 +94,167 @@ impl LayerResidual {
     }
 }
 
-/// A single decoder layer in the Qwen3.5 dense model.
+/// MLP type for a Qwen3.5 decoder layer (dense MLP or sparse MoE block).
+///
+/// The `Dense` variant carries an inline `MLPVariant`; `MoE` is boxed.
+/// Constructed once per layer at load, never in a hot loop.
+#[allow(clippy::large_enum_variant)]
+pub enum MLPType {
+    Dense(MLPVariant),
+    MoE(Box<SparseMoeBlock>),
+}
+
+impl MLPType {
+    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::MoE(moe) => moe.forward(x),
+        }
+    }
+
+    pub fn forward_with_budget(
+        &self,
+        x: &MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::MoE(moe) => moe.forward_with_budget(x, row_budget),
+        }
+    }
+
+    pub(crate) fn forward_store_residual(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_store_residual(x, residual),
+            Self::MoE(moe) => residual.add(&moe.forward(x)?),
+        }
+    }
+
+    pub(crate) fn forward_verify_with_budget(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_verify(x, residual),
+            Self::MoE(moe) => residual.add(&moe.forward_with_budget(x, row_budget)?),
+        }
+    }
+
+    pub(crate) fn forward_verify_lanes(&self, x: &MxArray, residual: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_verify_lanes(x, residual),
+            Self::MoE(moe) => residual.add(&moe.forward(x)?),
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        match self {
+            Self::Dense(mlp) => mlp.is_quantized(),
+            Self::MoE(moe) => moe.is_quantized(),
+        }
+    }
+
+    pub fn finalize_gate_up(&mut self) -> Result<()> {
+        match self {
+            Self::Dense(mlp) => mlp.finalize_gate_up(),
+            Self::MoE(_) => Ok(()),
+        }
+    }
+
+    pub fn as_dense(&self) -> Option<&MLPVariant> {
+        match self {
+            Self::Dense(mlp) => Some(mlp),
+            Self::MoE(_) => None,
+        }
+    }
+
+    pub fn as_dense_mut(&mut self) -> Option<&mut MLPVariant> {
+        match self {
+            Self::Dense(mlp) => Some(mlp),
+            Self::MoE(_) => None,
+        }
+    }
+
+    pub fn as_moe(&self) -> Option<&SparseMoeBlock> {
+        match self {
+            Self::MoE(moe) => Some(moe),
+            Self::Dense(_) => None,
+        }
+    }
+
+    pub fn as_moe_mut(&mut self) -> Option<&mut SparseMoeBlock> {
+        match self {
+            Self::MoE(moe) => Some(moe),
+            Self::Dense(_) => None,
+        }
+    }
+
+    pub(crate) fn attach_planes(
+        &mut self,
+        array: MxArray,
+        tensor: crate::utils::gguf_planes::PlanesTensor,
+    ) -> Result<()> {
+        match self {
+            Self::Dense(mlp) => mlp.attach_planes(array, tensor),
+            Self::MoE(_) => Err(Error::from_reason(format!(
+                "planes {} cannot attach to an MoE MLP",
+                tensor.key
+            ))),
+        }
+    }
+
+    pub(crate) fn planes(&self) -> Vec<&crate::models::quantized_linear::AttachedPlanes> {
+        match self {
+            Self::Dense(mlp) => mlp.planes(),
+            Self::MoE(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn detach_planes(&mut self) -> Vec<crate::models::quantized_linear::AttachedPlanes> {
+        match self {
+            Self::Dense(mlp) => mlp.detach_planes(),
+            Self::MoE(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        match self {
+            Self::Dense(mlp) => mlp.clear_cuda_dense_prefill(),
+            Self::MoE(_) => {}
+        }
+    }
+
+    pub fn wave_ready(&self, hidden: i64) -> Result<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.wave_ready(hidden),
+            Self::MoE(_) => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_hadamard(&self) -> Option<(bool, bool, bool)> {
+        match self {
+            Self::Dense(mlp) => mlp.has_hadamard(),
+            Self::MoE(_) => None,
+        }
+    }
+}
+
+/// A single decoder layer in the Qwen3.5 model (dense or MoE).
 ///
 /// Each layer has:
 /// - Either linear attention (GatedDeltaNet) or full attention (Qwen3NextAttention)
-/// - Dense MLP (standard or quantized)
+/// - Either a dense MLP (standard or quantized) or a sparse MoE block
 /// - Pre-norm architecture with residual connections
 pub struct DecoderLayer {
     pub attn: AttentionType,
-    pub mlp: MLPVariant,
+    pub mlp: MLPType,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
 }
@@ -224,6 +377,14 @@ impl DecoderLayer {
         h.add(&self.mlp.forward(&normed)?)
     }
     pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
+        Self::new_with_moe(config, None, layer_idx)
+    }
+
+    pub(crate) fn new_with_moe(
+        config: &Qwen3_5Config,
+        moe: Option<&Qwen35MoeParams>,
+        layer_idx: usize,
+    ) -> Result<Self> {
         let is_linear = config.is_linear_layer(layer_idx);
 
         let attn = if is_linear {
@@ -232,10 +393,15 @@ impl DecoderLayer {
             AttentionType::Full(Qwen3_5Attention::new(config)?)
         };
 
-        let mlp = MLPVariant::Standard(MLP::new(
-            config.hidden_size as u32,
-            config.intermediate_size as u32,
-        )?);
+        let mlp = match moe {
+            Some(moe_params) if moe_params.is_moe_layer(layer_idx) => MLPType::MoE(Box::new(
+                SparseMoeBlock::new_with_params(config, moe_params)?,
+            )),
+            _ => MLPType::Dense(MLPVariant::Standard(MLP::new(
+                config.hidden_size as u32,
+                config.intermediate_size as u32,
+            )?)),
+        };
 
         let input_layernorm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
         let post_attention_layernorm =
@@ -247,6 +413,36 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
         })
+    }
+
+    fn forward_mlp_decode_rows(&self, x: &MxArray) -> Result<MxArray> {
+        let batch = usize::try_from(x.shape_at(0)?)
+            .map_err(|_| Error::from_reason("Qwen3.5 decode MLP received a negative batch"))?;
+        if batch == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 decode MLP requires at least one row",
+            ));
+        }
+        let rows = (0..batch)
+            .map(|row| {
+                let row = x.slice_axis(0, row as i64, row as i64 + 1)?;
+                self.mlp.forward(&row)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        MxArray::concatenate_many(rows.iter().collect(), Some(0))
+    }
+
+    /// Post-attention half of the layer whose expert tail routes only the rows
+    /// of `row_budget` (Splash `budgetsVerifyRows`). Dense MLPs ignore
+    /// `row_budget`.
+    fn finish_layer_with_budget(
+        &self,
+        x: &MxArray,
+        attn_out: MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+        h.add(&self.mlp.forward_with_budget(&normed, row_budget)?)
     }
 
     /// Forward pass.
@@ -304,6 +500,20 @@ impl DecoderLayer {
         use_kernel: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
     ) -> Result<MxArray> {
+        self.forward_with_tape_budget(x, mask, cache, position_ids, use_kernel, tape_sink, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_tape_budget(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
         // Pre-norm + attention (always on full T for cache fidelity)
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
@@ -319,8 +529,7 @@ impl DecoderLayer {
             }
         };
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        h.add(&self.mlp.forward(&normed)?)
+        self.finish_layer_with_budget(x, attn_out, row_budget)
     }
 
     /// Cross-layer `AddRMSNorm` variant of [`Self::forward_inner_with_tape`]:
@@ -606,6 +815,10 @@ impl DecoderLayer {
     }
 
     /// One uniform decode forward over independent recurrent-state rows.
+    ///
+    /// When `preserve_singleton_projection_graphs` is `true` (used by row-exact
+    /// MoE loads and MoE scheduled MTP verify), every projection, GDN layer,
+    /// and MLP/MoE block runs on each row's own graph.
     pub(crate) fn forward_paged_batched(
         &mut self,
         x: &MxArray,
@@ -613,10 +826,20 @@ impl DecoderLayer {
         adapter: &mut PagedKVCacheAdapter,
         rows: &[(SeqId, u32)],
         flat_cache: Option<&mut Qwen3_5LayerCache>,
+        preserve_singleton_projection_graphs: bool,
     ) -> Result<MxArray> {
-        self.forward_paged_batched_with_tape(x, kind, adapter, rows, flat_cache, None)
+        self.forward_paged_batched_with_tape(
+            x,
+            kind,
+            adapter,
+            rows,
+            flat_cache,
+            preserve_singleton_projection_graphs,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged_batched_with_tape(
         &mut self,
         x: &MxArray,
@@ -624,6 +847,7 @@ impl DecoderLayer {
         adapter: &mut PagedKVCacheAdapter,
         rows: &[(SeqId, u32)],
         flat_cache: Option<&mut Qwen3_5LayerCache>,
+        preserve_singleton_projection_graphs: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
     ) -> Result<MxArray> {
         match kind {
@@ -633,7 +857,58 @@ impl DecoderLayer {
                         "Qwen3_5DecoderLayer::forward_paged_batched: Linear kind/operator mismatch",
                     ));
                 }
-                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
+                if !preserve_singleton_projection_graphs {
+                    return self.forward_with_tape(x, None, flat_cache, None, true, tape_sink);
+                }
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = match &mut self.attn {
+                    AttentionType::Linear(gdn) => {
+                        let cache = flat_cache
+                            .and_then(|cache| cache.as_arrays_cache_mut())
+                            .ok_or_else(|| {
+                                Error::from_reason(
+                                    "Qwen3.5 batched GDN layer has no recurrent cache",
+                                )
+                            })?;
+                        let capture = tape_sink.is_some();
+                        let mut tapes = Vec::new();
+                        let (output, next_cache) = super::arrays_cache::forward_rows_independently(
+                            &normed,
+                            cache,
+                            |row, row_cache| {
+                                let mut tape = None;
+                                let output = gdn.forward_with_tape(
+                                    row,
+                                    None,
+                                    Some(row_cache),
+                                    true,
+                                    capture.then_some(&mut tape),
+                                )?;
+                                if capture {
+                                    tapes.push(tape.ok_or_else(|| {
+                                        Error::from_reason(
+                                            "GDN verify did not record an owner tape",
+                                        )
+                                    })?);
+                                }
+                                Ok(output)
+                            },
+                        )?;
+                        if let Some(sink) = tape_sink {
+                            *sink = Some(super::gated_delta_net::GdnLayerTape::stack_rows(&tapes)?);
+                        }
+                        *cache = next_cache;
+                        output
+                    }
+                    AttentionType::Full(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_batched: Linear operator disappeared",
+                        ));
+                    }
+                };
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+                h.add(&self.forward_mlp_decode_rows(&normed)?)
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 if let Some(tape) = tape_sink {
@@ -648,11 +923,21 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
-                let attn_out =
-                    attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
+                let attn_out = attn.forward_paged_batched(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    rows,
+                    preserve_singleton_projection_graphs,
+                )?;
                 let (h, normed) =
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                h.add(&self.mlp.forward(&normed)?)
+                let mlp_out = if preserve_singleton_projection_graphs {
+                    self.forward_mlp_decode_rows(&normed)?
+                } else {
+                    self.mlp.forward(&normed)?
+                };
+                h.add(&mlp_out)
             }
         }
     }
@@ -679,6 +964,7 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
         rope_position_offset: i32,
+        row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -692,7 +978,9 @@ impl DecoderLayer {
                          to a FullAttention operator",
                     ));
                 }
-                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
+                self.forward_with_tape_budget(
+                    x, None, flat_cache, None, true, tape_sink, row_budget,
+                )
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for paged layers
@@ -726,9 +1014,7 @@ impl DecoderLayer {
                     rope_position_offset,
                     &mut None,
                 )?;
-                let (h, normed) =
-                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                h.add(&self.mlp.forward(&normed)?)
+                self.finish_layer_with_budget(x, attn_out, row_budget)
             }
         }
     }
@@ -736,8 +1022,8 @@ impl DecoderLayer {
     /// [`Self::forward_paged_or_flat_with_tape`] for a DFlash2 verify
     /// (`PagedPass::Verify`): a mixer output projection with planes adds the
     /// residual in its `_r` store and the post-attention norm runs on that
-    /// hidden state alone; the MLP runs [`MLPVariant::forward_verify`]. A
-    /// projection without planes runs as in
+    /// hidden state alone; the MLP runs [`MLPVariant::forward_verify`] (or
+    /// budgeted MoE forward). A projection without planes runs as in
     /// [`Self::forward_paged_or_flat_with_tape`], with its bits.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_verify_with_tape(
@@ -749,6 +1035,7 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
         rope_position_offset: i32,
+        row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         /// The mixer's output: with the residual, or the delta to add.
         enum Mixed {
@@ -816,7 +1103,7 @@ impl DecoderLayer {
                 Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?
             }
         };
-        self.mlp.forward_verify(&normed, &h)
+        self.mlp.forward_verify_with_budget(&normed, &h, row_budget)
     }
 
     /// One layer of a verify wave, `x` `[N, T, H]` (lane `i` = row `i`):
@@ -886,6 +1173,16 @@ impl DecoderLayer {
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
+    /// Set `input_layernorm` preserving the raw tensor dtype (MoE parity).
+    pub fn set_input_layernorm_weight_raw(&mut self, w: &MxArray) -> Result<()> {
+        self.input_layernorm.set_weight(w)
+    }
+
+    /// Set `post_attention_layernorm` preserving the raw tensor dtype (MoE parity).
+    pub fn set_post_attention_layernorm_weight_raw(&mut self, w: &MxArray) -> Result<()> {
+        self.post_attention_layernorm.set_weight(w)
+    }
+
     /// Enable Float32 RMSNorm evaluation on `input_layernorm`, `post_attention_layernorm`,
     /// and (for full-attention layers) `q_norm` / `k_norm`.
     pub(crate) fn set_precise_f32_norms(&mut self) {
@@ -915,12 +1212,12 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) -> Result<()> {
-        self.mlp = MLPVariant::Quantized {
+        self.mlp = MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
             gate_up: None,
-        };
+        });
         self.mlp.finalize_gate_up()
     }
 

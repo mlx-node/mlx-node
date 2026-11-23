@@ -578,7 +578,7 @@ mod pass_length_tests {
 
         /// q, k, v, decay, beta, next history.
         fn run(&self, [qkv, a, b]: &[MxArray; 3], history: &MxArray) -> Vec<MxArray> {
-            crate::kernels::qwen4::metal::gdn_prepare(
+            crate::kernels::gdn::prepare(
                 qkv,
                 a,
                 b,

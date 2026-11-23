@@ -6,6 +6,7 @@
 //! and session layers, so each model family only implements its forward
 //! pass.
 
+pub(crate) mod adaptive_depth;
 pub(crate) mod backend;
 pub(crate) mod batch_sampling;
 pub(crate) mod cache;
@@ -28,6 +29,7 @@ pub(crate) mod latency;
 pub mod load_progress;
 pub(crate) mod memory_plan;
 pub(crate) mod model_command;
+pub(crate) mod mtp_decode;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;
 pub(crate) mod paged_epilogue;

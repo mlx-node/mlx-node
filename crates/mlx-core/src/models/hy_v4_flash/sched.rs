@@ -531,7 +531,7 @@ pub struct Paged {
     pub restored: u64,
     pub spec: Spec,
     /// The stored states' disk tier; `None` when it is off.
-    pub disk: Option<Disk>,
+    pub(crate) disk: Option<Disk>,
     /// Each owner's keys of its cell's whole blocks, as its turns wrote them.
     pub lines: HashMap<SeqId, Vec<Vec<u64>>>,
     _pool: PoolCacheLimitGuard,
@@ -622,7 +622,7 @@ impl Paged {
 
     /// Hands the pool's blocks and the RAM states to `disk` and takes back
     /// what a persistent tier holds.
-    pub fn attach_disk(&mut self, disk: Disk) -> Result<u64> {
+    pub(crate) fn attach_disk(&mut self, disk: Disk) -> Result<u64> {
         disk.attach(&mut self.adapter)?;
         let mut disk = disk;
         let adopted = disk.adopt(self.states.store_mut());
@@ -1902,7 +1902,7 @@ impl Inner {
         let mut out = empty_proposal();
         let target = params.sampling_config.unwrap_or_default();
         let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
-        let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
+        let cfg = crate::engine::mtp_decode::mtp_draft_sampling_config(target);
         let mut tok = MxArray::from_uint32(&[anchor], &[1])?;
         let mut step_ids: Vec<MxArray> = Vec::with_capacity(n);
         let mut step_dists: Vec<MxArray> = Vec::new();
@@ -2040,7 +2040,7 @@ impl Inner {
             };
             let target = req.params.sampling_config.unwrap_or_default();
             let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
-            let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
+            let cfg = crate::engine::mtp_decode::mtp_draft_sampling_config(target);
             active.push(ActiveLane {
                 req_idx: i,
                 seq: req.seq_id,
@@ -3025,69 +3025,24 @@ impl HybridSchedulerBackend for Inner {
         command: crate::engine::cmd::ChatCmd,
         owners: SchedulerOwnerContext<'_, Vec<u32>>,
     ) {
-        use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
-        let owner = match &command {
-            ChatCmd::SessionStart { config, .. }
-            | ChatCmd::SessionContinue { config, .. }
-            | ChatCmd::SessionContinueTool { config, .. }
-            | ChatCmd::StreamSessionStart { config, .. }
-            | ChatCmd::StreamSessionContinue { config, .. }
-            | ChatCmd::StreamSessionContinueTool { config, .. } => {
-                Some(config.cache_owner_id.clone().unwrap_or_default())
-            }
-            _ => None,
-        };
-        let Some(owner) = owner else {
-            handle_chat_cmd(self, command);
-            return;
-        };
-        let seq = *owners
-            .owner_sequences
-            .entry(owner.clone())
-            .or_insert_with(|| {
-                let seq = *owners.next_seq_id;
-                *owners.next_seq_id += 1;
-                seq
-            });
-        if let Err(error) = self.activate_exclusive_seq(seq) {
-            match command {
-                ChatCmd::SessionStart { reply, .. }
-                | ChatCmd::SessionContinue { reply, .. }
-                | ChatCmd::SessionContinueTool { reply, .. } => {
-                    let _ = reply.send(Err(error));
+        crate::engine::hybrid_scheduler::execute_exclusive_owner_barrier(
+            self,
+            command,
+            owners,
+            Self::activate_exclusive_seq,
+            |inner| {
+                inner
+                    .paged
+                    .as_ref()
+                    .map(|p| p.saved.clone())
+                    .unwrap_or_default()
+            },
+            |inner| {
+                if let Some(p) = inner.paged.as_mut() {
+                    p.owners.park();
                 }
-                ChatCmd::StreamSessionStart { stream_tx, .. }
-                | ChatCmd::StreamSessionContinue { stream_tx, .. }
-                | ChatCmd::StreamSessionContinueTool { stream_tx, .. } => {
-                    crate::engine::backend::ChunkSink::send(&stream_tx, Err(error));
-                }
-                _ => {}
-            }
-            owners.owner_sequences.remove(&owner);
-            owners.owner_states.remove(&owner);
-            return;
-        }
-        handle_chat_cmd(self, command);
-        let saved = self
-            .paged
-            .as_ref()
-            .map(|p| p.saved.clone())
-            .unwrap_or_default();
-        if saved.is_empty() {
-            // A turn that failed before the paged abort, or ran without
-            // reuse, has no frontier and holds no owner slot.
-            if let Some(p) = self.paged.as_mut() {
-                let _ = p.adapter.release_request_for(seq);
-            }
-            self.release_scheduled_recurrent_for(seq);
-            owners.owner_sequences.remove(&owner);
-            owners.owner_states.remove(&owner);
-        } else {
-            owners.owner_states.insert(owner, saved);
-            if let Some(p) = self.paged.as_mut() {
-                p.owners.park();
-            }
-        }
+            },
+        );
     }
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {

@@ -8,8 +8,10 @@ pub(crate) mod chat_napi;
 pub mod clairic;
 pub mod clef;
 pub mod deepseek_v41;
+pub(crate) mod engram_hash;
 pub(crate) mod forward;
 pub mod gemma4;
+pub(crate) mod gguf_chat;
 pub mod harrier;
 pub mod hy_v4_flash;
 pub mod inkling2;
@@ -17,6 +19,7 @@ pub mod int8_gemm;
 pub mod jina_reranker;
 pub mod k2_horizon;
 pub mod lfm2;
+pub(crate) mod moe_common;
 pub mod mtp_drafter;
 pub mod muse_glimmer;
 pub mod nemotron_h;
@@ -68,7 +71,7 @@ mod free_released_wiring_tests {
             (
                 "qwen35moe-3d-experts",
                 NativeGgufFamily::Qwen35Moe,
-                "models/qwen3_5_moe/persistence.rs",
+                "models/qwen3_5/persistence_moe.rs",
             ),
             (
                 "gemma4-mmproj",

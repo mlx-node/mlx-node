@@ -644,50 +644,6 @@ pub(crate) fn gated_delta_kernel(
     )))
 }
 
-/// Fused Metal GDN preparation (`mlx_qwen4_gdn_prepare`):
-/// returns `[q, k, v, decay, beta, next_history]`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gdn_prepare(
-    qkv: &MxArray,
-    a: &MxArray,
-    b: &MxArray,
-    conv: &MxArray,
-    history: &MxArray,
-    scale: &MxArray,
-    dt: &MxArray,
-    mean_eps: bool,
-    beta_input_dtype: bool,
-) -> Result<Option<[MxArray; 6]>> {
-    let mut outputs = [std::ptr::null_mut(); 6];
-    let ok = unsafe {
-        sys::mlx_qwen4_gdn_prepare(
-            qkv.as_raw_ptr(),
-            a.as_raw_ptr(),
-            b.as_raw_ptr(),
-            conv.as_raw_ptr(),
-            history.as_raw_ptr(),
-            scale.as_raw_ptr(),
-            dt.as_raw_ptr(),
-            mean_eps,
-            beta_input_dtype,
-            outputs.as_mut_ptr(),
-        )
-    };
-    if !ok {
-        return Ok(None);
-    }
-    let [q, k, v, decay, beta, next_history] = outputs;
-    Ok(Some([
-        MxArray::from_handle(q, "GDN prepared Q")?,
-        MxArray::from_handle(k, "GDN prepared K")?,
-        MxArray::from_handle(v, "GDN prepared V")?,
-        MxArray::from_handle(decay, "GDN prepared decay")?,
-        MxArray::from_handle(beta, "GDN prepared beta")?,
-        MxArray::from_handle(next_history, "GDN prepared history")?,
-    ]))
-}
-
 /// Fused causal depthwise window convolution + SiLU (`mlx_qwen4_window_conv`).
 #[inline]
 pub(crate) fn window_conv(

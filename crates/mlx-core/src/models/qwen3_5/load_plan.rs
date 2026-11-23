@@ -12,8 +12,9 @@ use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::memory_plan::{
     ContextBounds, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
     PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context, dflash2_lane_state_bytes,
-    live_memory,
+    lane_ceiling_for_physical_memory, live_memory, select_max_lanes_preserving_window,
 };
+pub(crate) use crate::engine::memory_plan::{decode_share_option, max_memory_option};
 use crate::models::mtp_drafter::{
     DrafterBodyVariant, detect_drafter_safetensors, missing_mtp_keys, reprefix_drafter_key,
 };
@@ -32,9 +33,9 @@ use super::dflash2::DFlash2Config;
 use super::dflash2_decode::{pool_decode_step_bytes, pool_lane_transient};
 use super::dflash2_turn::DFlash2Target;
 use super::persistence::{
-    compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
+    compute_dtype_of, mtp_expert_keys, mtp_sidecar_candidates, normalize_mtp_weight_key,
+    qwen35_text_key, settled_compute_dtype,
 };
-use crate::models::qwen3_5_moe::persistence::{mtp_expert_keys, settled_compute_dtype};
 
 /// The pool's element type for `format`. BF16 pages hold any compute dtype
 /// cast to bf16; int8 pages need BF16 rows. Either format exists only where
@@ -214,23 +215,13 @@ pub(crate) struct LoadLanes<'a> {
     pub state_staging_bytes: u64,
 }
 
-/// Physical memory from which a Qwen3.5 load may run the full hybrid
-/// live-state cap. A 256 GB Mac reports 256 GiB and a 192 GB Mac 192 GiB;
-/// 256 * 10^9 bytes lies between them.
-const ALL_LANES_PHYSICAL_BYTES: u64 = 256_000_000_000;
-
-/// Lane ceiling of every smaller machine, or of one whose memory is
-/// unreadable.
-const SMALL_MACHINE_LANES: usize = 4;
-
 /// The most decode lanes a Qwen3.5 load runs on a machine of
 /// `physical_bytes`: the hybrid live-state cap from 256 GB, 4 below.
 pub(crate) fn qwen35_lane_ceiling(physical_bytes: Option<u64>) -> usize {
-    let all = crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS;
-    match physical_bytes {
-        Some(bytes) if bytes >= ALL_LANES_PHYSICAL_BYTES => all,
-        _ => SMALL_MACHINE_LANES.min(all),
-    }
+    lane_ceiling_for_physical_memory(
+        physical_bytes,
+        crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS,
+    )
 }
 
 /// The decode lanes the scheduler can run on a Qwen3.5 load: this machine's
@@ -272,21 +263,13 @@ pub(crate) fn evaluate_qwen35_plan(
     live: LiveMemory,
     max_memory_bytes: Option<u64>,
 ) -> Result<MemoryPlan> {
-    let single = evaluate_qwen35_lanes(lanes, live, max_memory_bytes, 1)
-        .map_err(|error| Error::from_reason(error.message(label)))?;
-    let Some(window) = single.pool.map(|pool| pool.lane.window.maximum()) else {
-        return Ok(single);
-    };
-    for count in (2..=lanes.lanes).rev() {
-        if let Ok(plan) = evaluate_qwen35_lanes(lanes, live, max_memory_bytes, count)
-            && plan
-                .pool
-                .is_some_and(|pool| pool.lane.window.maximum() >= window)
-        {
-            return Ok(plan);
-        }
-    }
-    Ok(single)
+    let (plan, _) = select_max_lanes_preserving_window(
+        lanes.lanes,
+        |count| evaluate_qwen35_lanes(lanes, live, max_memory_bytes, count),
+        |plan| plan.pool.map(|pool| pool.lane.window.maximum()),
+    )
+    .map_err(|error| Error::from_reason(error.message(label)))?;
+    Ok(plan)
 }
 
 /// The plan of `lanes` with the decode step of `count` lanes.
@@ -637,17 +620,6 @@ fn measured_after_load(plan: &MemoryPlan, live: LiveMemory, pool_bytes: u64) -> 
     }
 }
 
-/// The `maxMemoryBytes` load option: a positive byte count.
-pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Option<u64>> {
-    match value {
-        None => Ok(None),
-        Some(bytes) if bytes > 0 => Ok(Some(bytes as u64)),
-        Some(_) => Err(Error::from_reason(format!(
-            "{label} load: maxMemoryBytes must be a positive byte count"
-        ))),
-    }
-}
-
 /// The activations of a load whose options name none: `Auto` for a dense
 /// load with a DFlash2 draft (Splash's default, `RuntimeResources`: int8
 /// queries from KV position 7,168 where the device scores them), `Bf16` for
@@ -725,18 +697,6 @@ pub(crate) fn device_builds_tile() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         false
-    }
-}
-
-/// The `decodeShare` load option (Splash `Engine::Engine`): nonnegative
-/// and finite; unset is Splash's 0.5.
-pub(crate) fn decode_share_option(label: &str, value: Option<f64>) -> Result<f64> {
-    match value {
-        None => Ok(crate::engine::scheduler::DEFAULT_DECODE_SHARE),
-        Some(share) if share.is_finite() && share >= 0.0 => Ok(share),
-        Some(_) => Err(Error::from_reason(format!(
-            "{label} load: decode share must be nonnegative and finite"
-        ))),
     }
 }
 
@@ -926,7 +886,7 @@ fn safetensors_dtypes(paths: &[PathBuf]) -> Result<Vec<(String, DType)>> {
 /// sidecar, else the split drafter.
 pub(crate) fn checkpoint_header(source: &CheckpointSource, moe: bool) -> Result<CheckpointHeader> {
     let mut raw_dtypes = match source {
-        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir))?,
+        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir)?)?,
         CheckpointSource::Gguf(checkpoint) => imported_dtypes(
             &checkpoint.main.header,
             &checkpoint.plans.0,
@@ -1083,9 +1043,11 @@ struct EstimatePlans {
 fn estimate_plans(label: &str, input: &EstimateInput<'_>) -> Result<Option<EstimatePlans>> {
     let raw = read_config_json(input.asset_dir)?;
     let (mut config, mtp_body, expert_row_bytes) = if input.moe {
-        let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
-        let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
-        (moe.to_dense_config(), body, moe.decode_row_expert_bytes())
+        let moe = super::persistence::parse_moe_config(&raw)?;
+        let (base, moe_params) = moe.split();
+        let body = super::mtp::Qwen3_5MTPModule::mtp_mlp_variant(&base, Some(&moe_params));
+        let expert_bytes = moe_params.decode_row_expert_bytes(&base);
+        (base, body, expert_bytes)
     } else {
         (
             crate::models::qwen3_5::persistence::parse_config(&raw)?,

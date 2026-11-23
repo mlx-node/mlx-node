@@ -244,6 +244,113 @@ impl Qwen3_5Config {
     }
 }
 
+/// MoE-specific configuration fields split out from `Qwen3_5MoeConfig`.
+///
+/// Paired with `Qwen3_5Config` so shared Qwen3.5 components (`DecoderLayer`,
+/// `SparseMoeBlock`, `Qwen3_5MTPModule`, and the unified model core) handle
+/// both dense (`Option<&Qwen35MoeParams>` == `None`) and MoE (`Some`) without
+/// changing the public NAPI `Qwen3_5Config` or `Qwen3_5MoeConfig` structs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Qwen35MoeParams {
+    pub num_experts: i32,
+    pub num_experts_per_tok: i32,
+    pub decoder_sparse_step: i32,
+    pub shared_expert_intermediate_size: Option<i32>,
+    pub moe_intermediate_size: Option<i32>,
+    pub norm_topk_prob: bool,
+    pub mlp_only_layers: Option<Vec<i32>>,
+}
+
+impl Qwen35MoeParams {
+    /// Returns whether a given layer should use MoE MLP.
+    pub(crate) fn is_moe_layer(&self, layer_idx: usize) -> bool {
+        if self.num_experts <= 0 {
+            return false;
+        }
+        let step = self.decoder_sparse_step;
+        if step <= 0 {
+            return false;
+        }
+        if let Some(ref mlp_only) = self.mlp_only_layers
+            && mlp_only.contains(&(layer_idx as i32))
+        {
+            return false;
+        }
+        (layer_idx + 1).is_multiple_of(step as usize)
+    }
+
+    /// Bytes one decode row's MoE layer allocates that the dense view does
+    /// not price: the top-k gathered inputs, the gate / up / SwiGLU and down
+    /// outputs with their unsort and weighting copies, the shared expert's
+    /// gate / up / SwiGLU (all bf16), and the router's bf16 logits and f32
+    /// probabilities.
+    #[allow(dead_code)]
+    pub(crate) fn decode_row_expert_bytes(&self, base: &Qwen3_5Config) -> u64 {
+        let dim = |v: i32| v.max(0) as u64;
+        let top_k = dim(self.num_experts_per_tok);
+        let hidden = dim(base.hidden_size);
+        let expert = dim(self.moe_intermediate_size.unwrap_or(base.intermediate_size));
+        let shared = dim(self
+            .shared_expert_intermediate_size
+            .unwrap_or(base.intermediate_size));
+        let elements = top_k
+            .saturating_mul(
+                hidden
+                    .saturating_mul(4)
+                    .saturating_add(expert.saturating_mul(3)),
+            )
+            .saturating_add(shared.saturating_mul(3));
+        elements
+            .saturating_mul(2)
+            .saturating_add(dim(self.num_experts).saturating_mul(6))
+    }
+
+    /// Reconstruct a full `Qwen3_5MoeConfig` from this MoE parameter set plus `base`.
+    #[allow(dead_code)]
+    pub(crate) fn to_moe_config(
+        &self,
+        base: &Qwen3_5Config,
+    ) -> crate::models::qwen3_5_moe::Qwen3_5MoeConfig {
+        crate::models::qwen3_5_moe::Qwen3_5MoeConfig {
+            vocab_size: base.vocab_size,
+            hidden_size: base.hidden_size,
+            num_layers: base.num_layers,
+            num_heads: base.num_heads,
+            num_kv_heads: base.num_kv_heads,
+            intermediate_size: base.intermediate_size,
+            rms_norm_eps: base.rms_norm_eps,
+            head_dim: base.head_dim,
+            tie_word_embeddings: base.tie_word_embeddings,
+            attention_bias: base.attention_bias,
+            max_position_embeddings: base.max_position_embeddings,
+            pad_token_id: base.pad_token_id,
+            eos_token_id: base.eos_token_id,
+            bos_token_id: base.bos_token_id,
+            linear_num_value_heads: base.linear_num_value_heads,
+            linear_num_key_heads: base.linear_num_key_heads,
+            linear_key_head_dim: base.linear_key_head_dim,
+            linear_value_head_dim: base.linear_value_head_dim,
+            linear_conv_kernel_dim: base.linear_conv_kernel_dim,
+            full_attention_interval: base.full_attention_interval,
+            partial_rotary_factor: base.partial_rotary_factor,
+            rope_theta: base.rope_theta,
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            decoder_sparse_step: self.decoder_sparse_step,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            mlp_only_layers: self.mlp_only_layers.clone(),
+            paged_cache_memory_mb: base.paged_cache_memory_mb,
+            paged_block_size: base.paged_block_size,
+            n_mtp_layers: base.n_mtp_layers,
+            qwen35_gguf_gdn_layout: base.qwen35_gguf_gdn_layout.clone(),
+            kv_format: base.kv_format.clone(),
+            rope_scaling: base.rope_scaling,
+        }
+    }
+}
+
 /// Multimodal token IDs and M-RoPE section geometry parsed from a Qwen3.5 /
 /// Clairic checkpoint's `config.json`.
 #[allow(dead_code)]

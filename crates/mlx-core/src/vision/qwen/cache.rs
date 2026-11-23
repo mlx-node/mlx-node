@@ -6,11 +6,9 @@ use crate::array::{DType, MxArray};
 use crate::engine;
 use crate::engine::vision::VisionMerge;
 use crate::inference_trace::elapsed_ms;
-use crate::models::paddleocr_vl::processing::{
-    ProcessedImage, ProcessedImages, aggregate_processed_images,
-};
 use crate::nn::Embedding;
 use crate::stream::{Stream, StreamContext};
+use crate::vision::processing::{ProcessedImage, ProcessedImages, aggregate_processed_images};
 use crate::vision::qwen::prompt::{get_rope_index, merge_input_ids_with_image_features};
 use napi::{Error, Result, Status};
 use std::collections::{HashMap, HashSet};

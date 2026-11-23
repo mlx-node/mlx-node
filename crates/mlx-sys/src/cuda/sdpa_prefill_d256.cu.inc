@@ -2,9 +2,7 @@ R"cuda(
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ float sdpa_p256_exp2f(float x) {
-  float r;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
-  return r;
+  return ptx_ex2_approx_ftz(x);
 }
 
 __device__ __forceinline__ void sdpa_p256_mma(
@@ -12,60 +10,36 @@ __device__ __forceinline__ void sdpa_p256_mma(
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1,
     float c0, float c1, float c2, float c3) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, "
-      "{%4, %5, %6, %7}, "
-      "{%8, %9}, "
-      "{%10, %11, %12, %13};\n"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-        "r"(b0), "r"(b1),
-        "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+  ptx_mma_m16n8k16_bf16_c_v(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
 }
 
 __device__ __forceinline__ void sdpa_p256_ldmatrix4(
     unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3,
     const void* smem_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-      : "r"(smem_addr));
+  ptx_ldmatrix_x4(r0, r1, r2, r3, smem_ptr);
 }
 
 __device__ __forceinline__ void sdpa_p256_ldmatrix4_trans(
     unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3,
     const void* smem_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-      : "r"(smem_addr));
+  ptx_ldmatrix_x4_trans(r0, r1, r2, r3, smem_ptr);
 }
 
 __device__ __forceinline__ void sdpa_p256_cp16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;\n"
-      :: "r"(smem_addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 __device__ __forceinline__ void sdpa_p256_cp16_zfill(
     void* smem_ptr, const void* glob_ptr, bool pred) {
-  unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  int src_size = pred ? 16 : 0;
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-      :: "r"(smem_addr), "l"(glob_ptr), "r"(src_size) : "memory");
+  ptx_cp_async16_cg_zfill(smem_ptr, glob_ptr, pred);
 }
 
 __device__ __forceinline__ void sdpa_p256_cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 __device__ __forceinline__ void sdpa_p256_cp_wait0() {
-  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+  ptx_cp_wait<0>();
 }
 
 __device__ __forceinline__ unsigned int sdpa_p256_pack_bf16x2(float lo, float hi) {

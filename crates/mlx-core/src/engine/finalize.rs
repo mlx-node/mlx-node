@@ -83,40 +83,110 @@ pub(crate) fn compute_performance_metrics(
     })
 }
 
-/// Shared finalization: parse thinking + tool calls from decoded text.
+/// Family-specific markup and parsers driving [`parse_thinking_and_tools_with`]
+/// and [`raw_text_with_reasoning_suppressed_with`].
+#[derive(Clone, Copy)]
+pub(crate) struct FinalizeMarkup {
+    pub markup: tools::MarkupSpec,
+    /// Opening reasoning tags stripped from the start of a reasoning span
+    /// (for old-style templates that emit the opener in generated text).
+    pub open_prefixes: &'static [&'static str],
+    pub parse_tools: fn(&str) -> (String, Vec<tools::ToolCallResult>),
+    pub parse_thinking: fn(&str) -> (String, Option<String>),
+    pub parse_fallback: fn(&str) -> (String, Vec<tools::ToolCallResult>, Option<String>),
+    /// When true, a confirmed close token matches the earliest close tag of
+    /// any pair in `markup.reasoning` (`think_end_str` winning ties), rather
+    /// than only `think_end_str`.
+    pub scan_all_reasoning_closes: bool,
+}
+
+/// Default ChatML markup (`<think>` / `<longcat_think>` and `<tool_call>`).
+pub(crate) const CHATML_FINALIZE_MARKUP: FinalizeMarkup = FinalizeMarkup {
+    markup: tools::CHATML_MARKUP,
+    open_prefixes: &["<think>", "<longcat_think>"],
+    parse_tools: tools::parse_tool_calls,
+    parse_thinking: tools::parse_thinking,
+    parse_fallback: tools::parse_generation_output,
+    scan_all_reasoning_closes: false,
+};
+
+fn has_any_think_end(
+    generated_tokens: &[u32],
+    think_end_id: Option<u32>,
+    think_end_extra_ids: &[u32],
+) -> bool {
+    think_end_id
+        .into_iter()
+        .chain(think_end_extra_ids.iter().copied())
+        .any(|id| generated_tokens.contains(&id))
+}
+
+fn emitted_close_tag<'a>(
+    text: &str,
+    think_end_str: Option<&'a str>,
+    spec: FinalizeMarkup,
+) -> Option<&'a str> {
+    if !spec.scan_all_reasoning_closes {
+        return think_end_str;
+    }
+    let mut best: Option<(usize, &'a str)> =
+        think_end_str.and_then(|tag| text.find(tag).map(|pos| (pos, tag)));
+    for &(_, close_tag) in spec.markup.reasoning {
+        if let Some(pos) = text.find(close_tag)
+            && best.is_none_or(|(bp, _)| pos < bp)
+        {
+            best = Some((pos, close_tag));
+        }
+    }
+    best.map(|(_, tag)| tag)
+}
+
+/// Parameterized finalization: parse thinking + tool calls from decoded text
+/// using `spec` and optional alternate close token IDs (`think_end_extra_ids`).
 ///
 /// Four-way branching based on the request's reasoning state:
 /// 1. `!thinking_enabled`: no-thinking mode — all text is content, no reasoning parsing.
-/// 2. `thinking_enabled` + `</think>` token confirmed: split at token-confirmed boundary.
-/// 3. `thinking_enabled` + no `</think>` token + `think_end_id` exists: truncated generation.
-/// 4. `thinking_enabled` + no `think_end_id` in vocab: text-level fallback via `split_at_think_end`.
+/// 2. `thinking_enabled` + close token confirmed: split at token-confirmed boundary.
+/// 3. `thinking_enabled` + no close token + `think_end_id` exists: truncated generation.
+/// 4. `thinking_enabled` + no `think_end_id` in vocab: text-level fallback preserving tool spans.
 ///
 /// `include_reasoning`: when false, thinking field is suppressed (set to None).
-pub(crate) fn parse_thinking_and_tools(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_thinking_and_tools_with(
     text: &str,
     generated_tokens: &[u32],
     thinking_enabled: bool,
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,
+    think_end_extra_ids: &[u32],
     include_reasoning: bool,
+    spec: FinalizeMarkup,
 ) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
     let (clean_text, tool_calls, thinking) = if !thinking_enabled {
         // No-thinking mode: all text is content, passed through verbatim.
-        // Any literal <think> tags are normal model output, not markup.
-        let (clean, calls) = tools::parse_tool_calls(text);
+        // Any literal think tags are normal model output, not markup.
+        let (clean, calls) = (spec.parse_tools)(text);
         (clean, calls, None)
-    } else if tools::has_think_end_token(generated_tokens, think_end_id) {
-        // Thinking mode with confirmed </think>: split at token boundary.
-        tools::split_at_think_end(text, think_end_str)
+    } else if has_any_think_end(generated_tokens, think_end_id, think_end_extra_ids) {
+        // Thinking mode with confirmed close token: split at token boundary.
+        let close_tag = emitted_close_tag(text, think_end_str, spec).or(think_end_str);
+        tools::split_at_think_end_with(
+            text,
+            close_tag,
+            spec.open_prefixes,
+            spec.parse_tools,
+            spec.parse_fallback,
+        )
     } else if think_end_id.is_some() {
-        // Thinking mode, truncated (no </think> before EOS/max_tokens):
+        // Thinking mode, truncated (no close token before EOS/max_tokens):
         // entire output is reasoning, no content.
         let thinking_text = text.trim();
-        // Strip leading <think>/<longcat_think> from old-style templates
-        // that emit it in the generated text.
-        let thinking_text = thinking_text
-            .strip_prefix("<think>")
-            .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
+        // Strip leading open tag from old-style templates that emit it in
+        // generated text.
+        let thinking_text = spec
+            .open_prefixes
+            .iter()
+            .find_map(|p| thinking_text.strip_prefix(p))
             .unwrap_or(thinking_text)
             .trim();
         let thinking = if thinking_text.is_empty() {
@@ -127,19 +197,19 @@ pub(crate) fn parse_thinking_and_tools(
         (String::new(), vec![], thinking)
     } else {
         // No think_end_id in vocab — cannot do token-level detection. Isolate reasoning
-        // from content at the text level BEFORE extracting tool calls, so a `<tool_call>`
+        // from content at the text level BEFORE extracting tool calls, so a tool call
         // nested inside a reasoning block is NOT surfaced as an executable tool call.
         // This matches the token-confirmed path (which parses tool calls only from the
-        // post-`</think>` content) and the `raw_text` scrub, so on this fallback the
+        // post-close content) and the `raw_text` scrub, so on this fallback the
         // `text`, `tool_calls`, and `raw_text` fields stay consistent. A standalone
-        // `<tool_call>` outside reasoning is preserved and still extracted.
-        let content = tools::strip_reasoning_preserving_tools(text);
-        let (clean, calls) = tools::parse_tool_calls(&content);
+        // tool call outside reasoning is preserved and still extracted.
+        let content = tools::strip_reasoning_preserving_tools_with(text, spec.markup);
+        let (clean, calls) = (spec.parse_tools)(&content);
         // Thinking field keeps the prior fallback derivation (reasoning parsed from the
         // tool-stripped text, so an in-argument think tag of a standalone tool call does
         // not masquerade as reasoning).
-        let (text_without_tools, _) = tools::parse_tool_calls(text);
-        let thinking = tools::parse_thinking(&text_without_tools).1;
+        let (text_without_tools, _) = (spec.parse_tools)(text);
+        let thinking = (spec.parse_thinking)(&text_without_tools).1;
         (clean.trim().to_string(), calls, thinking)
     };
 
@@ -149,20 +219,65 @@ pub(crate) fn parse_thinking_and_tools(
     (clean_text, tool_calls, thinking)
 }
 
+/// Shared ChatML finalization: parse thinking + tool calls from decoded text.
+pub(crate) fn parse_thinking_and_tools(
+    text: &str,
+    generated_tokens: &[u32],
+    thinking_enabled: bool,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    include_reasoning: bool,
+) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
+    parse_thinking_and_tools_with(
+        text,
+        generated_tokens,
+        thinking_enabled,
+        think_end_id,
+        think_end_str,
+        &[],
+        include_reasoning,
+        CHATML_FINALIZE_MARKUP,
+    )
+}
+
+/// Parameterized [`raw_text_with_reasoning_suppressed`]: remove the reasoning
+/// span using `spec` and optional `think_end_extra_ids` when reasoning is not
+/// requested, keeping post-reasoning content (including tool markup) verbatim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn raw_text_with_reasoning_suppressed_with(
+    text: &str,
+    generated_tokens: &[u32],
+    thinking_enabled: bool,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    think_end_extra_ids: &[u32],
+    include_reasoning: bool,
+    spec: FinalizeMarkup,
+) -> String {
+    // Reasoning requested, or no-thinking mode (all output is content): verbatim.
+    if include_reasoning || !thinking_enabled {
+        return text.to_string();
+    }
+    if has_any_think_end(generated_tokens, think_end_id, think_end_extra_ids) {
+        // Confirmed close token: keep everything after the FIRST occurrence verbatim.
+        if let Some(tag) = emitted_close_tag(text, think_end_str, spec)
+            && let Some(close_pos) = text.find(tag)
+        {
+            return text[close_pos + tag.len()..].to_string();
+        }
+        // Token confirmed but tag string unavailable/unlocatable: fall through to
+        // the text-level strip below.
+    } else if think_end_id.is_some() {
+        // Truncated generation (no close token before EOS/max): all reasoning.
+        return String::new();
+    }
+    // No think_end_id in vocab (or tag unlocatable): text-level scrub preserving
+    // tool spans verbatim.
+    tools::strip_reasoning_preserving_tools_with(text, spec.markup)
+}
+
 /// Build the `raw_text` field with the reasoning span removed when reasoning is
-/// not requested.
-///
-/// `raw_text` is normally the verbatim decoded generation (including
-/// `<think>…</think>`). When `include_reasoning` is false we additionally strip
-/// the reasoning span so a direct `raw_text` consumer cannot recover the model's
-/// chain-of-thought — matching the suppression already applied to the parsed
-/// `thinking` field and the streamed reasoning deltas.
-///
-/// The post-`</think>` content is kept VERBATIM (tool-call markup, whitespace,
-/// the model's exact bytes) so `raw_text`'s downstream uses (e.g. tool-call
-/// markup recovery) keep working. The branch structure mirrors
-/// `parse_thinking_and_tools` so the boundary is identical to the one used for
-/// the parsed `thinking`/`text` fields.
+/// not requested (ChatML markup).
 pub(crate) fn raw_text_with_reasoning_suppressed(
     text: &str,
     generated_tokens: &[u32],
@@ -171,29 +286,16 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
     think_end_str: Option<&str>,
     include_reasoning: bool,
 ) -> String {
-    // Reasoning requested, or no-thinking mode (all output is content): verbatim.
-    if include_reasoning || !thinking_enabled {
-        return text.to_string();
-    }
-    if tools::has_think_end_token(generated_tokens, think_end_id) {
-        // Confirmed </think>: keep everything after the FIRST occurrence verbatim.
-        if let Some(tag) = think_end_str
-            && let Some(close_pos) = text.find(tag)
-        {
-            return text[close_pos + tag.len()..].to_string();
-        }
-        // Token confirmed but tag string unavailable/unlocatable: fall through to
-        // the text-level strip below.
-    } else if think_end_id.is_some() {
-        // Truncated generation (no </think> before EOS/max): all reasoning.
-        return String::new();
-    }
-    // No think_end_id in vocab (or tag unlocatable): text-level scrub. Strips EVERY
-    // reasoning block of BOTH `<think>`/`<longcat_think>` families (parse_thinking
-    // alone only handles the first family) while preserving `<tool_call>…</tool_call>`
-    // spans verbatim — so reasoning-looking tags inside tool arguments can't corrupt
-    // the tool markup that `raw_text` consumers (e.g. server tool-call recovery) rely on.
-    tools::strip_reasoning_preserving_tools(text)
+    raw_text_with_reasoning_suppressed_with(
+        text,
+        generated_tokens,
+        thinking_enabled,
+        think_end_id,
+        think_end_str,
+        &[],
+        include_reasoning,
+        CHATML_FINALIZE_MARKUP,
+    )
 }
 
 #[cfg(test)]
@@ -201,6 +303,53 @@ thread_local! {
     /// The token ids the last result finalized on this thread decoded.
     pub(crate) static LAST_GENERATED: std::cell::RefCell<Vec<u32>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Assemble a [`ChatResult`] from already-decoded/parsed fields and shared
+/// turn metadata in `args`.
+///
+/// When `finish_reason_override` is `Some(reason)`, it replaces
+/// `args.finish_reason` (e.g. `"tool_calls"` when valid tool calls were parsed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_parsed_chat_result(
+    args: FinalizeArgs<'_>,
+    text: String,
+    tool_calls: Vec<tools::ToolCallResult>,
+    thinking: Option<String>,
+    finish_reason_override: Option<&str>,
+    raw_text: String,
+    public_raw_text: Option<String>,
+) -> ChatResult {
+    let finish_reason = finish_reason_override
+        .map(str::to_owned)
+        .unwrap_or(args.finish_reason);
+    ChatResult {
+        text,
+        tool_calls,
+        thinking,
+        // The session core overwrites this with the effective Jinja kwarg
+        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
+        // family finalizer returns. Keeping the decode-time value here makes
+        // direct/non-session callers conservative and fully initializes the
+        // shared result type.
+        thinking_enabled: args.thinking_enabled,
+        num_tokens: args.generated_tokens.len() as u32,
+        prompt_tokens: args.prompt_tokens,
+        reasoning_tokens: args.reasoning.tokens,
+        reasoning_close: args.reasoning.close_name(),
+        reasoning_cut_at: args.reasoning.cut_at,
+        reasoning_cycle_period: args.reasoning.cycle_period,
+        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+        finish_reason,
+        raw_text,
+        public_raw_text,
+        // Callers that reused a cached prefix overwrite this via their own
+        // `cached_prefix_len as u32` after this function returns. Defaulting
+        // to zero keeps the behavior of callers that do not (yet) thread
+        // the value through intact.
+        cached_tokens: 0,
+        performance: args.performance,
+    }
 }
 
 pub(crate) fn finalize_chat_result_with(
@@ -217,47 +366,27 @@ pub(crate) fn finalize_chat_result_with(
             tracing::warn!("Failed to decode generated tokens: {}", e);
             String::new()
         });
-    let num_tokens = args.generated_tokens.len() as u32;
     let (clean_text, tool_calls, thinking) = parse(&text, &args);
     let public_raw_text = scrub(&text, &args);
     // If we have valid tool calls, override finish reason
-    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-        "tool_calls".to_string()
-    } else {
-        args.finish_reason
-    };
+    let finish_reason_override = tool_calls
+        .iter()
+        .any(|tc| tc.status == "ok")
+        .then_some("tool_calls");
     let raw_text = if args.include_reasoning {
         text
     } else {
         public_raw_text.clone()
     };
-    Ok(ChatResult {
-        text: clean_text,
+    Ok(assemble_parsed_chat_result(
+        args,
+        clean_text,
         tool_calls,
         thinking,
-        // The session core overwrites this with the effective Jinja kwarg
-        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
-        // family finalizer returns. Keeping the decode-time value here makes
-        // direct/non-session callers conservative and fully initializes the
-        // shared result type.
-        thinking_enabled: args.thinking_enabled,
-        num_tokens,
-        prompt_tokens: args.prompt_tokens,
-        reasoning_tokens: args.reasoning.tokens,
-        reasoning_close: args.reasoning.close_name(),
-        reasoning_cut_at: args.reasoning.cut_at,
-        reasoning_cycle_period: args.reasoning.cycle_period,
-        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
-        finish_reason,
+        finish_reason_override,
         raw_text,
-        public_raw_text: Some(public_raw_text),
-        // Callers that reused a cached prefix overwrite this via their own
-        // `cached_prefix_len as u32` after this function returns. Defaulting
-        // to zero keeps the behavior of callers that do not (yet) thread
-        // the value through intact.
-        cached_tokens: 0,
-        performance: args.performance,
-    })
+        Some(public_raw_text),
+    ))
 }
 
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.

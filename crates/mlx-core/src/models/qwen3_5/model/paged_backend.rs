@@ -476,7 +476,8 @@ impl Qwen35Inner {
     /// Whether `seq`'s scheduled text prefill takes the draft-lane path of
     /// [`Self::dense_paged_prefill`], the one that can stop between layers.
     pub(crate) fn prefill_takes_passes(&self, seq: u32) -> bool {
-        self.dflash2.is_some()
+        !self.is_moe()
+            && self.dflash2.is_some()
             && !self.scheduled_mtp.owners.contains_key(&seq)
             && self.dflash2_states.turns.contains_key(&seq)
             && self.cached_rope_deltas.unwrap_or(0) == 0
@@ -644,8 +645,27 @@ impl Qwen35Inner {
         Option<MxArray>,
         Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     )> {
+        let (logits, draft, _prompt_hidden) =
+            self.dense_paged_prefill_unit_inner(suffix_tokens, prefix, draft, end_output, false)?;
+        Ok((logits, draft))
+    }
+
+    fn dense_paged_prefill_unit_inner(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Qwen35PrefixState,
+        draft: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+        end_output: crate::models::qwen3_5::paged_forward::ChunkOutput,
+        capture_prompt_hidden: bool,
+    ) -> Result<(
+        Option<MxArray>,
+        Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+        Option<MxArray>,
+    )> {
         // Scheduled MTP also retains the final normalized prompt row as the
-        // request-owned draft seed. The ordinary path only produces logits.
+        // request-owned draft seed. Cold serial paged MTP retains the
+        // post-`final_norm` hidden for every prompt token to seed committed
+        // drafter history before cycle 1. The ordinary path only produces logits.
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
             |i| self.config.is_linear_layer(i),
@@ -739,7 +759,7 @@ impl Qwen35Inner {
                 prefix.cache_salt,
                 checkpoint,
             );
-            return Ok((Some(logits), Some(context)));
+            return Ok((Some(logits), Some(context), None));
         }
         let draft_lane = self.dflash2.is_some()
             && mtp_seq.is_none()
@@ -779,7 +799,7 @@ impl Qwen35Inner {
                 prefix.cache_salt,
                 checkpoint,
             );
-            return Ok((logits, None));
+            return Ok((logits, None, None));
         }
         // Splash `publishReachedStateBoundaries` runs for every request: an
         // MTP sequence's prefill reaches its points as a plain one does.
@@ -821,7 +841,15 @@ impl Qwen35Inner {
                 };
                 &mut plain_target
             };
-        let (logits, checkpoint) = if mtp_seq.is_some() {
+        let keep_hidden_tokens = if mtp_seq.is_some() {
+            Some(suffix_tokens.len())
+        } else if capture_prompt_hidden {
+            Some(prefix.full_tokens.len())
+        } else {
+            None
+        };
+        let mut prompt_hidden = None;
+        let (logits, checkpoint) = if let Some(keep_tokens) = keep_hidden_tokens {
             let (logits, hidden, checkpoint) =
                 crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
                     &prefix.full_tokens,
@@ -832,12 +860,16 @@ impl Qwen35Inner {
                     target,
                     &layer_kinds,
                     chunk_size,
-                    Some(suffix_tokens.len()),
+                    Some(keep_tokens),
                     rope_deltas,
                     turn_cancel.as_deref(),
                     taps,
                 )?;
-            mtp_hidden = Some(hidden);
+            if mtp_seq.is_some() {
+                mtp_hidden = Some(hidden);
+            } else {
+                prompt_hidden = Some(hidden);
+            }
             (logits, checkpoint)
         } else {
             crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
@@ -868,7 +900,7 @@ impl Qwen35Inner {
             prefix.cache_salt,
             checkpoint,
         );
-        Ok((Some(logits), None))
+        Ok((Some(logits), None, prompt_hidden))
     }
 }
 
@@ -908,6 +940,10 @@ impl crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> for Qwen
         outcome: crate::models::qwen3_5::paged_forward::Reached,
     ) -> Result<()> {
         crate::models::qwen3_5::dflash2_turn::reached(self, row, outcome)
+    }
+
+    fn use_store_epilogue(&self) -> bool {
+        !self.is_moe()
     }
 }
 
@@ -963,6 +999,8 @@ impl PagedBackend for Qwen35Inner {
         prefix: &Self::PrefixState,
         stream: Stream,
     ) -> Result<MxArray> {
+        let want_prompt_hidden = std::mem::take(&mut self.want_paged_mtp_prompt_hidden);
+        self.pending_prompt_hidden = None;
         if self.draft_lane_turn() {
             return crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
                 self,
@@ -971,8 +1009,18 @@ impl PagedBackend for Qwen35Inner {
                 stream,
             );
         }
-        self.dense_paged_prefill(suffix_tokens, prefix, None)
-            .map(|(logits, _)| logits)
+        let capture_prompt_hidden = want_prompt_hidden && prefix.effective_cached_prefix_len() == 0;
+        let (logits, _, prompt_hidden) = self.dense_paged_prefill_unit_inner(
+            suffix_tokens,
+            prefix,
+            None,
+            crate::models::qwen3_5::paged_forward::ChunkOutput::Read,
+            capture_prompt_hidden,
+        )?;
+        let logits =
+            logits.ok_or_else(|| Error::from_reason("a read paged prefill gave no logits"))?;
+        self.pending_prompt_hidden = prompt_hidden.map(|h| (h, prefix.full_tokens.clone()));
+        Ok(logits)
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
@@ -986,7 +1034,143 @@ impl PagedBackend for Qwen35Inner {
         Ok(PagedStepper(Qwen35PagedDecode { inner: self }))
     }
 
+    fn admit_paged_speculative_decode(&mut self, p: &engine::ChatParams) -> Result<bool> {
+        // MTP acceptance gate: a previous turn whose draft head accepted below
+        // break-even decodes THIS turn plain AR.
+        if !p.mtp_adaptive_depth && !self.mtp_gate_allows(p.mtp_depth.max(1) as u32) {
+            self.pending_prompt_hidden = None;
+            return Ok(false);
+        }
+        let Some(plan) = self.execution_plan().speculative else {
+            self.pending_prompt_hidden = None;
+            return Ok(false);
+        };
+        // Pre-cycle lookahead reservation (I1) while AR fallback is still an
+        // option — allocator exhaustion inside the verify loop would instead
+        // surface as a turn error and invalidate the paged session.
+        let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
+            .unwrap_or(u32::MAX);
+        let reserved = crate::models::qwen3_5::dflash2_turn::lookahead_claimed(self, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("Qwen3.5 paged speculative admission: paged_adapter is None")
+                })?
+                .reserve_rows(rows)
+                .map(drop)
+                .map_err(Error::from_reason)
+        })
+        .map_err(|e| {
+            self.pending_prompt_hidden = None;
+            Error::from_reason(format!(
+                "Qwen3.5 paged speculative lookahead reservation: {}",
+                e.reason
+            ))
+        })?;
+        if !reserved {
+            self.pending_prompt_hidden = None;
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                lookahead_rows = rows,
+                "Qwen3.5 paged speculative lookahead reservation refused; falling back to \
+                 autoregressive decode"
+            );
+        }
+        Ok(reserved)
+    }
+
+    fn run_paged_speculative_decode(
+        &mut self,
+        args: crate::engine::backend::PagedSpeculativeArgs<'_, '_, '_>,
+    ) -> Result<()> {
+        // Pure-Rust eager paged dense MTP. The main Step-A / verify forwards
+        // route through the paged adapter (`run_paged_step_with_hidden` /
+        // `run_paged_verify_step`); the GDN recurrent state stays FLAT in
+        // `self.caches` Linear slots, so the tape replay (the rollback
+        // keystone) is IDENTICAL to the flat eager arm. Full-attention K/V
+        // lives in the paged pool, so the rollback rewinds it through the
+        // facade cycle, NOT a `self.caches` KV trim.
+        let crate::engine::backend::PagedSpeculativeArgs {
+            y,
+            prompt_len,
+            params,
+            reasoning_tracker,
+            profiler,
+            max_new_tokens,
+            eos_id,
+            generated_tokens,
+            token_history,
+            finish_reason,
+            first_token_instant,
+            report_perf,
+            generation_stream,
+            cancel_flag,
+            streaming,
+        } = args;
+        let (prompt_hidden, prompt_hidden_ids) = match self.pending_prompt_hidden.take() {
+            Some((hidden, ids)) => (Some(hidden), Some(ids)),
+            None => (None, None),
+        };
+        let mut owned_params = None;
+        let effective_params =
+            if params.extra_eos_ids.is_empty() && !self.gen_defaults.eos_token_ids.is_empty() {
+                let mut cloned = params.clone();
+                cloned.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+                owned_params.insert(cloned)
+            } else {
+                params
+            };
+        if !self.is_moe() {
+            profiler.set_label("chat_paged_mtp_eager");
+        }
+        MxArray::async_eval_arrays(&[&y]);
+        let mut rng = rand::rng();
+        let outcome = crate::engine::mtp_turn::run_mtp_turn(
+            self,
+            &mut rng,
+            crate::engine::mtp_turn::MtpTurnArgs {
+                y,
+                depth: effective_params.mtp_depth,
+                params: effective_params,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                // Reborrowed so the frontier check below can still read the
+                // emitted count once the loop returns.
+                generated_tokens: &mut *generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
+                report_perf,
+                generation_stream,
+                prompt_hidden,
+                prompt_hidden_ids,
+                cancel_flag,
+            },
+            streaming,
+        )?;
+        self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
+        debug_assert!(
+            !outcome.desynced,
+            "the paged dense MTP stepper must rewind both state kinds itself and never \
+             arm the flat desync latch"
+        );
+        // At the epilogue boundary: the adapter and the drop-last history the
+        // epilogue is about to persist must sit at ONE frontier before any GDN
+        // state is keyed on that history. Runs BEFORE `finish_paged_turn`
+        // reconciles, because reconcile would roll the adapter back to the
+        // history length without moving the recurrent state with it and hide
+        // exactly the skew this catches.
+        let expected_history_len = prompt_len + generated_tokens.len().saturating_sub(1);
+        self.check_dense_paged_frontier(expected_history_len, "paged MTP epilogue");
+        Ok(())
+    }
+
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
+        self.want_paged_mtp_prompt_hidden = false;
+        self.pending_prompt_hidden = None;
         // Terminal lifecycle block of a paged turn. Success: keep the request
         // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
         // qwen3's empty `&[]`), so the next turn's continue builds on the
@@ -1058,6 +1242,8 @@ impl PagedBackend for Qwen35Inner {
     }
 
     fn abort_paged_turn(&mut self) {
+        self.want_paged_mtp_prompt_hidden = false;
+        self.pending_prompt_hidden = None;
         // Hybrid error-path teardown: K/V and GDN may have advanced by
         // different amounts, so a bare adapter release would leave a false-live
         // recurrent session behind. Never register / keep live; invalidate all
@@ -1251,84 +1437,33 @@ impl Qwen35Inner {
 
     /// Whole-turn block-paged dispatch behind [`ChatBackend::run_paged_turn`].
     ///
-    /// Conditional router (dense differs from MoE here — `run_decode_loop` has
-    /// no MTP gate, so planned MTP must use the native paged-MTP cores):
-    ///   * planned MTP turns (sync or stream) use the matching eager paged-MTP
-    ///     core, including text deltas over an image-derived live session;
-    ///   * autoregressive turns (sync or stream) use the generic paged path via
-    ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
-    ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
+    /// Both autoregressive and native-MTP turns (sync or stream, including text
+    /// deltas over an image-derived live session) share the generic paged
+    /// driver (`engine::paged_turn::run_paged_turn`). Planned native MTP arms
+    /// `want_paged_mtp_prompt_hidden` so a cold prefill captures the prompt
+    /// hidden states for `begin_mtp_decode`'s committed-history seed; turns
+    /// blocked by the MTP acceptance gate leave the speculative lane before
+    /// prefill so no prompt hidden buffer is retained.
     pub(super) fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The MTP cores re-derive `p` from config (`extract_chat_params`). To
-        // match the engine's default `resolve_params`, fold
-        // generation_config.json defaults in first so the paged-MTP path
-        // honors them too (no-op when the checkpoint ships none).
-        let mut config = args.config.clone();
-        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
-        // MTP acceptance gate (same policy as the sync whole-turn core).
-        if planned_mtp
-            && !config.mtp_adaptive_depth.unwrap_or(false)
-            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        let mut constrained_params = args.params.clone();
+        constrained_params.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        // MTP acceptance gate: check before prefill so a gated turn neither
+        // retains full-prompt hidden states nor invokes
+        // `admit_paged_speculative_decode` a second time.
+        if matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        ) && !constrained_params.mtp_adaptive_depth
+            && !self.mtp_gate_allows(constrained_params.mtp_depth.max(1) as u32)
         {
-            planned_mtp = false;
-            config.enable_mtp = Some(false);
-            // THIS turn leaves the speculative lane. The generic paged driver
-            // below dispatches on `plan.decoder`, and dense implements no
-            // paged speculative core (its MTP lives in the forked cores
-            // above), so a stale `Speculative` would fail the turn on the
-            // erroring default hook instead of decoding it autoregressively.
             args.plan.decoder = DecoderPlan::Autoregressive;
         }
-        debug_assert!(!planned_mtp || self.has_mtp_weights());
-        let mut p = extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
-        if planned_mtp {
-            self.dflash2_states.generation_suffix =
-                args.tokenizer.generation_suffix(args.config).ok().flatten();
-            let report_perf = args.config.report_performance.unwrap_or(false);
-            let tokenizer = args.tokenizer.clone();
-            let thinking = args.thinking;
-            return match (args.sink, args.cancelled) {
-                (Some(sink), Some(cancelled)) => {
-                    let cb = StreamSender(sink);
-                    self.paged_turn_stream_core(
-                        args.tokens.to_vec(),
-                        tokenizer,
-                        args.eos_id,
-                        p,
-                        report_perf,
-                        &cb,
-                        cancelled,
-                        thinking,
-                        args.config,
-                    )?;
-                    Ok(TurnOutput::Streamed)
-                }
-                _ => {
-                    let result = self.paged_turn_sync_core(
-                        args.tokens.to_vec(),
-                        tokenizer,
-                        args.eos_id,
-                        p,
-                        report_perf,
-                        thinking,
-                        args.config,
-                    )?;
-                    Ok(TurnOutput::Complete(Box::new(result)))
-                }
-            };
-        }
-
-        // NON-MTP (sync or stream) → the generic AR+paged engine path.
-        //
-        // The specialized MTP/VLM paged cores perform their own hard capacity
-        // preflight. The ordinary AR path delegates directly to the generic
-        // paged engine, so constrain a copy of the already-resolved params here
-        // and make that exact copy authoritative for prefill + decode. This is
-        // the native backstop for callers that bypass the TypeScript
-        // `ChatSession` preflight.
-        let mut constrained_params = args.params.clone();
+        debug_assert!(
+            !matches!(
+                args.plan.decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+            ) || self.has_mtp_weights()
+        );
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
         if !self.draft_lane_turn() {
             self.dflash2_context = None;
@@ -1336,6 +1471,13 @@ impl Qwen35Inner {
             self.dflash2_prefix
                 .note_drop("paged_whole_turn", DropKind::Dirtied);
         }
+        self.want_paged_mtp_prompt_hidden = !self.is_moe()
+            && matches!(
+                args.plan.decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+            )
+            && self.has_mtp_weights();
+        self.pending_prompt_hidden = None;
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,

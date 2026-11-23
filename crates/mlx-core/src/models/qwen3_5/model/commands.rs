@@ -349,6 +349,12 @@ impl HybridSchedulerBackend for Qwen35Inner {
         )
     }
 
+    fn note_idle_owner_reclaimed(&self) {
+        crate::models::qwen3_5::dflash2_turn::log_reclaim(
+            crate::models::qwen3_5::dflash2_turn::GrowReclaim::Idle,
+        );
+    }
+
     fn claim_step_rows(
         state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Self>,
         plan: &crate::engine::scheduler::StepPlan,
@@ -365,13 +371,21 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
 
     fn supports_scheduled_speculation(&self) -> bool {
-        self.has_speculative_weights()
+        let has_spec = if self.is_moe() {
+            self.has_mtp_weights() && self.dflash2.is_none()
+        } else {
+            self.has_speculative_weights()
+        };
+        has_spec
             && self.paged_adapter.is_some()
             && self.config.recurrent_state_bytes() > 0
             && self.cached_rope_deltas.unwrap_or(0) == 0
     }
     fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
-        if let Some(bytes) = crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self) {
+        if !self.is_moe()
+            && let Some(bytes) =
+                crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self)
+        {
             return bytes;
         }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
@@ -390,7 +404,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
         Some(pool.lane.window.maximum())
     }
     fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
-        if let Some(bytes) = crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self) {
+        if !self.is_moe()
+            && let Some(bytes) =
+                crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self)
+        {
             return bytes;
         }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
@@ -399,6 +416,9 @@ impl HybridSchedulerBackend for Qwen35Inner {
         )
     }
     fn scheduled_lane_state_bytes(&self) -> u64 {
+        if self.is_moe() {
+            return 0;
+        }
         crate::models::qwen3_5::scheduled_dflash2::sequence_lane_bytes(self).unwrap_or(0)
     }
     fn prepare_contended_prefix(
@@ -455,7 +475,9 @@ impl HybridSchedulerBackend for Qwen35Inner {
     /// On a draft load the sequence's DFlash2 lane, at any position: its
     /// first prefill slice places the ring at the slice's start.
     fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
-        if let Some(draft) = self.dflash2.as_ref() {
+        if !self.is_moe()
+            && let Some(draft) = self.dflash2.as_ref()
+        {
             self.dflash2_states.begin_lane(seq_id, &draft.config);
             return Ok(true);
         }
@@ -464,7 +486,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
         )
     }
     fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
-        if self.dflash2.is_some() && self.dflash2_states.seq_lanes.contains_key(&seq_id) {
+        if !self.is_moe()
+            && self.dflash2.is_some()
+            && self.dflash2_states.seq_lanes.contains_key(&seq_id)
+        {
             return crate::models::qwen3_5::scheduled_dflash2::reserve_lane(self, seq_id);
         }
         if queries > crate::models::qwen3_5::scheduled_mtp::MAX_DRAFTS + 1 {
@@ -483,7 +508,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
         }
     }
     fn scheduled_sampled_rows(&self) -> bool {
-        self.dflash2.is_some()
+        !self.is_moe() && self.dflash2.is_some()
     }
     fn propose_scheduled(
         &mut self,
@@ -494,7 +519,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
         rng: &mut dyn rand::Rng,
         _confidence: bool,
     ) -> Result<crate::engine::backend::DsparkProposal> {
-        if self.dflash2.is_some() {
+        if !self.is_moe() && self.dflash2.is_some() {
             return crate::models::qwen3_5::scheduled_dflash2::propose(
                 self, seq_id, anchor, cap, params, rng,
             );
@@ -507,7 +532,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
     ) -> Result<MxArray> {
-        if self.dflash2.is_some() {
+        if !self.is_moe() && self.dflash2.is_some() {
             return crate::models::qwen3_5::scheduled_dflash2::verify(self, rows);
         }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::verify_scheduled_mtp(self, rows)
@@ -516,7 +541,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
     ) -> Result<Vec<Result<()>>> {
-        if self.dflash2.is_some() {
+        if !self.is_moe() && self.dflash2.is_some() {
             return crate::models::qwen3_5::scheduled_dflash2::commit(self, rows);
         }
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::commit_scheduled_mtp(self, rows)
@@ -635,7 +660,8 @@ impl HybridSchedulerBackend for Qwen35Inner {
     /// A draft load's text prefills take the draft-lane path; a pass checks
     /// the sequence's own path again.
     fn prefill_runs_in_passes(&self, seq_id: SeqId) -> bool {
-        self.dflash2.is_some()
+        !self.is_moe()
+            && self.dflash2.is_some()
             && !self.scheduled_mtp.owners.contains_key(&seq_id)
             && self.cached_rope_deltas.unwrap_or(0) == 0
     }
@@ -711,7 +737,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
             source.to_vec(),
             first_chunk,
         );
-        if self.draft_lane_turn() {
+        if self.is_moe() || self.draft_lane_turn() {
             return self
                 .paged_prefill(&source[start..end], &prefix, generation_stream)
                 .map(Some);

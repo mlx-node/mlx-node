@@ -24,8 +24,6 @@ mod block_allocator;
 mod block_table;
 mod cold_cache;
 mod config;
-#[cfg(target_os = "macos")]
-mod extern_c;
 mod layer_kv_pool;
 pub mod prefill_plan;
 mod prefix_registry;
@@ -49,14 +47,6 @@ pub mod metal {
 
 #[cfg(not(target_os = "macos"))]
 mod metal_dtype;
-
-// Re-export the extern "C" shim symbols so the C++ Custom primitives
-// in `crates/mlx-sys/src/mlx_paged_ops.cpp` can link against them.
-#[cfg(target_os = "macos")]
-pub use extern_c::{
-    mlx_paged_attn_paged_attention_dispatch, mlx_paged_attn_paged_attention_varlen_dispatch,
-    mlx_paged_attn_reshape_and_cache_dispatch,
-};
 
 pub use block_allocator::*;
 pub use block_table::*;

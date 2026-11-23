@@ -17,7 +17,7 @@ use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
 
-use crate::models::pp_doclayout_v3::persistence::get_tensor;
+use crate::vision::cnn::get_tensor;
 
 // ============================================================================
 // Pixel Shuffle v2

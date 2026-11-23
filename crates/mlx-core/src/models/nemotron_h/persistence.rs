@@ -26,17 +26,19 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
-    prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, params_weight_bytes,
+    parse_generation_defaults, prewarm_checkpoint_pages, register_loaded_weights_and_pool,
+    spawn_loaded_model_thread,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, admits_static_fp8_activation, default_per_layer_quant,
-    effective_plq_for, parse_quant_block, select_quantization_block,
+    InputAmaxPolicy, PerLayerMode, PerLayerQuant, QlBuildSpec, QlFp8Policy, QlModeAllow,
+    QlMxfp8Policy, QlSym8Policy, QlTiling, QslBuildSpec, QslFp8Policy, QslSym8Policy,
+    admits_static_fp8_activation, build_ql, build_qsl, default_per_layer_quant, effective_plq_for,
+    parse_quant_block, select_quantization_block,
 };
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, QuantizedLinear,
-    QuantizedSwitchLinear, is_quantized_checkpoint, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    QuantizedSwitchLinear, is_quantized_checkpoint,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -457,62 +459,68 @@ fn apply_weights(
         effective_plq_for(prefix, per_layer_quant, default_plq, None)
     };
 
-    let try_build_ql = |params: &HashMap<String, MxArray>,
-                        prefix: &str|
-     -> Result<Option<QuantizedLinear>> {
-        let plq = plq_for(prefix);
-        Ok(match plq.mode {
-            PerLayerMode::Nvfp4 => {
-                let built = try_build_nvfp4_quantized_linear(params, prefix);
-                // FAIL-CLOSED: the per-tensor `.global_scale` is applied by
-                // the CALLER, and only the shared-expert caller has a slot for
-                // it, so building here would drop `weight_scale_2` silently.
-                if built.is_some() && !nvfp4_global_scale_is_applied(prefix) {
-                    return Err(Error::from_reason(format!(
-                        "NVFP4 projection '{prefix}' is packed nvfp4 (.weight + .scales), but \
-                         only the shared experts apply the per-tensor '.global_scale' at \
-                         runtime — loading it here would drop weight_scale_2 and run the \
-                         projection ~1/weight_scale_2 (~1.15e4x) too large. {REGENERATE_HINT}"
-                    )));
-                }
-                built
-            }
-            PerLayerMode::Affine => {
-                let built = try_build_quantized_linear(params, prefix, plq.group_size, plq.bits);
-                if built.is_some() {
-                    require_affine_sidecars(params, prefix)?;
-                }
-                // W8A8: the static E4M3 activation scale rides along with
-                // the affine weights, so thread it here.
-                built.map(|ql| ql.with_input_amax(plq.input_amax))
-            }
-            PerLayerMode::Mxfp8 => {
-                return Err(Error::from_reason(format!(
-                    "Nemotron-H projection '{prefix}' resolves to mxfp8. \
-                         {REGENERATE_HINT}"
-                )));
-            }
-            other => {
-                let _ = other;
-                None
-            }
-        })
+    let validate_nvfp4 = |prefix: &str| -> Result<()> {
+        // FAIL-CLOSED: the per-tensor `.global_scale` is applied by the CALLER,
+        // and only the shared-expert caller has a slot for it, so building here
+        // would drop `weight_scale_2` silently.
+        if !nvfp4_global_scale_is_applied(prefix) {
+            return Err(Error::from_reason(format!(
+                "NVFP4 projection '{prefix}' is packed nvfp4 (.weight + .scales), but \
+                 only the shared experts apply the per-tensor '.global_scale' at \
+                 runtime — loading it here would drop weight_scale_2 and run the \
+                 projection ~1/weight_scale_2 (~1.15e4x) too large. {REGENERATE_HINT}"
+            )));
+        }
+        Ok(())
     };
+    let try_build_ql =
+        |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<QuantizedLinear>> {
+            let plq = plq_for(prefix);
+            let mxfp8_err =
+                format!("Nemotron-H projection '{prefix}' resolves to mxfp8. {REGENERATE_HINT}");
+            build_ql(
+                params,
+                prefix,
+                plq,
+                QlBuildSpec {
+                    validate_storage: false,
+                    fp8: QlFp8Policy::ReturnNone,
+                    sym8: QlSym8Policy::ReturnNone,
+                    mxfp8: QlMxfp8Policy::Reject { reason: &mxfp8_err },
+                    mxfp4: QlModeAllow::ReturnNone,
+                    kquant: QlModeAllow::ReturnNone,
+                    tiling: QlTiling::None,
+                    input_amax: InputAmaxPolicy::Unconditional,
+                    validate_nvfp4: Some(&validate_nvfp4),
+                    validate_affine: Some(&require_affine_sidecars),
+                    ..QlBuildSpec::standard("Nemotron-H")
+                },
+            )
+        };
     // Stacked-expert builder (3-D [E,N,K]). An NVFP4 stack is unusable without
     // its [E] global scale, so a missing sidecar is an error, not a fallback.
     let n_routed_experts = inner.config.n_routed_experts as i64;
+    let resolve_expert_scale = |params: &HashMap<String, MxArray>, prefix: &str| {
+        require_expert_global_scale(params, prefix, n_routed_experts)
+    };
     let try_build_qsl = |params: &HashMap<String, MxArray>,
                          prefix: &str|
-     -> Result<Option<(QuantizedSwitchLinear, MxArray)>> {
+     -> Result<Option<QuantizedSwitchLinear>> {
         let plq = plq_for(prefix);
-        if plq.mode != PerLayerMode::Nvfp4 {
-            return Ok(None);
-        }
-        let Some(qsl) = try_build_nvfp4_quantized_switch_linear(params, prefix) else {
-            return Ok(None);
-        };
-        let gs = require_expert_global_scale(params, prefix, n_routed_experts)?;
-        Ok(Some((qsl, gs)))
+        build_qsl(
+            params,
+            prefix,
+            plq,
+            QslBuildSpec {
+                family: "Nemotron-H",
+                validate_storage: false,
+                fp8: QslFp8Policy::ReturnNone,
+                sym8: QslSym8Policy::ReturnNone,
+                nvfp4_only: true,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: Some(&resolve_expert_scale),
+            },
+        )
     };
 
     let emb = params.get("embedding.weight").ok_or_else(|| {
@@ -712,13 +720,10 @@ fn apply_weights(
         try_build_qsl: &F,
     ) -> Result<Option<super::sparse_moe::ExpertProj>>
     where
-        F: Fn(&HashMap<String, MxArray>, &str) -> Result<Option<(QuantizedSwitchLinear, MxArray)>>,
+        F: Fn(&HashMap<String, MxArray>, &str) -> Result<Option<QuantizedSwitchLinear>>,
     {
-        if let Some((qsl, global_scale)) = try_build_qsl(params, key)? {
-            return Ok(Some(super::sparse_moe::ExpertProj::Quantized(
-                qsl,
-                global_scale,
-            )));
+        if let Some(qsl) = try_build_qsl(params, key)? {
+            return Ok(Some(super::sparse_moe::ExpertProj::Quantized(qsl)));
         }
         if let Some(w) = params.get(&format!("{}.weight", key)) {
             crate::models::quant_dispatch::ensure_dense_weight_floating(
@@ -977,10 +982,7 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
         info!("NemotronH tokenizer loaded");
     }
 
-    let weight_bytes: u64 = params
-        .values()
-        .map(|a| a.nbytes() as u64)
-        .fold(0u64, |acc, v| acc.saturating_add(v));
+    let weight_bytes: u64 = params_weight_bytes(&params);
 
     Ok((inner, weight_bytes))
 }
@@ -992,52 +994,39 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
     use super::model::NemotronHSchedulerState;
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
-        move || {
-            let (mut inner, weight_bytes) = load_inner(&model_path)?;
-            let pool_bytes = inner
-                .paged_adapter
-                .as_ref()
-                .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::pool_allocated_bytes)
-                .transpose()
-                .map_err(Error::from_reason)?
-                .unwrap_or(0);
-            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-            let pool_cache_limit_guard = inner.pool_cache_limit_guard.take().or_else(|| {
-                (pool_bytes != 0)
-                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
-            });
-            let mtp_active = inner.has_mtp_weights();
-            let paged_active = inner.paged_adapter.is_some();
-            let context_limits =
-                super::model::NemotronHContextLimits::from_tuple(inner.paged_context_limits());
-            let config = inner.config.clone();
-            let scheduler = NemotronHSchedulerState::new(inner)?;
-            Ok((
-                scheduler,
-                (
-                    config,
-                    cache_limit_guard,
-                    pool_cache_limit_guard,
-                    mtp_active,
-                    paged_active,
-                    context_limits,
-                ),
-            ))
-        },
-        |state, receiver| state.drive(receiver),
-    );
-
-    let (
-        config,
-        cache_limit_guard,
-        pool_cache_limit_guard,
-        mtp_active,
-        paged_active,
-        context_limits,
-    ) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (thread, (config, guards, mtp_active, paged_active, context_limits)) =
+        spawn_loaded_model_thread(
+            "Model thread exited during load",
+            move || {
+                let (mut inner, weight_bytes) = load_inner(&model_path)?;
+                let pool_bytes = inner
+                    .paged_adapter
+                    .as_ref()
+                    .map(
+                        crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::pool_allocated_bytes,
+                    )
+                    .transpose()
+                    .map_err(Error::from_reason)?
+                    .unwrap_or(0);
+                let guards = register_loaded_weights_and_pool(
+                    weight_bytes,
+                    pool_bytes,
+                    inner.pool_cache_limit_guard.take(),
+                );
+                let mtp_active = inner.has_mtp_weights();
+                let paged_active = inner.paged_adapter.is_some();
+                let context_limits =
+                    super::model::NemotronHContextLimits::from_tuple(inner.paged_context_limits());
+                let config = inner.config.clone();
+                let scheduler = NemotronHSchedulerState::new(inner)?;
+                Ok((
+                    scheduler,
+                    (config, guards, mtp_active, paged_active, context_limits),
+                ))
+            },
+            |state, receiver| state.drive(receiver),
+        )
+        .await?;
 
     Ok(NemotronHModel {
         thread,
@@ -1045,8 +1034,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         mtp_active,
         paged_active,
         context_limits,
-        _cache_limit_guard: cache_limit_guard,
-        _pool_cache_limit_guard: pool_cache_limit_guard,
+        _cache_limit_guard: guards.cache_limit,
+        _pool_cache_limit_guard: guards.pool_cache_limit,
     })
 }
 

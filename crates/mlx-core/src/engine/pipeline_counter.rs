@@ -161,11 +161,8 @@ mod tests {
         let before = read().expect("installed");
         let _ = mlx_metal::pipeline_counter::drain_serving();
 
-        let kernel = mlx_paged_attn::metal::MetalState::reshape_and_cache_kernel_name(
-            mlx_paged_attn::metal::MetalDtype::Float32,
-            mlx_paged_attn::metal::MetalDtype::Float32,
-        );
-        state.get_pipeline(&kernel).expect("paged pipeline");
+        let kernel = "residency_kick";
+        state.get_pipeline(kernel).expect("paged pipeline");
         let after_paged = read().expect("installed");
         assert_eq!(
             after_paged.created_serving - before.created_serving,
@@ -175,7 +172,7 @@ mod tests {
         let names = mlx_metal::pipeline_counter::drain_serving();
         assert_eq!(
             names.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            vec![kernel.as_str()]
+            vec![kernel]
         );
 
         let a = crate::array::MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).expect("a");
@@ -195,11 +192,14 @@ mod tests {
 
         {
             let _loading = loading_scope().expect("installed");
-            let kernel = mlx_paged_attn::metal::MetalState::reshape_and_cache_kernel_name(
-                mlx_paged_attn::metal::MetalDtype::Float16,
-                mlx_paged_attn::metal::MetalDtype::Float16,
-            );
-            state.get_pipeline(&kernel).expect("paged pipeline");
+            let function = state
+                .library
+                .get_function("residency_kick", None)
+                .expect("residency_kick function");
+            state
+                .device
+                .new_compute_pipeline_state_with_function(&function)
+                .expect("loading pipeline");
         }
         let after_loading = read().expect("installed");
         assert_eq!(

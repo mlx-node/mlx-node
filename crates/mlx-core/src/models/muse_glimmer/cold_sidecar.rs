@@ -4,7 +4,7 @@
 //! usable only when the sliding group has state at the same boundary, so its
 //! live window is persisted as a co-keyed `SlidingWindow` sidecar.
 
-use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdSidecarPolicy};
+use mlx_paged_attn::ColdSidecarPolicy;
 
 use crate::models::gemma4::sliding_sidecar::{SlidingSidecarGeometry, policy_for_geometry};
 
@@ -60,39 +60,6 @@ pub(crate) fn anchor_rungs(block_size: u32) -> Vec<u32> {
         rung = next;
     }
     rungs
-}
-
-/// Derive the sidecar key using the same parent-linked block chain as the K/V
-/// restore walk, but under the `SlidingWindow` domain tag.
-pub(crate) fn chain_key(
-    fingerprint: ColdCacheFingerprint,
-    request_tokens: &[u32],
-    extra_keys_per_block: &[Vec<u64>],
-    block_size: u32,
-    boundary: u32,
-    cache_salt: u64,
-) -> Option<ColdCacheKey> {
-    if block_size == 0 || boundary == 0 || !boundary.is_multiple_of(block_size) {
-        return None;
-    }
-    let blocks = boundary as usize / block_size as usize;
-    let mut parent = None;
-    for index in 0..blocks {
-        let extra_keys = extra_keys_per_block.get(index)?;
-        let start = index.checked_mul(block_size as usize)?;
-        let end = start.checked_add(block_size as usize)?;
-        let tokens = request_tokens.get(start..end)?;
-        parent = Some(ColdCacheKey::chain(
-            ColdGroup::SlidingWindow,
-            fingerprint,
-            parent,
-            tokens,
-            extra_keys,
-            cache_salt,
-            index,
-        ));
-    }
-    parent
 }
 
 #[cfg(test)]

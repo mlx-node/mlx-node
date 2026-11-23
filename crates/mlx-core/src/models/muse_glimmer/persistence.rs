@@ -8,27 +8,25 @@ use crate::array::MxArray;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, apply_rename_spec, load_checkpoint, parse_generation_defaults,
-};
-use crate::models::gemma4::quantized_linear::{
-    LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
-    try_build_sym8_quantized_linear,
+    CheckpointLeaseGuard, GgufPreloadGuard, KeyRule, RenameSpec, apply_rename_spec,
+    load_checkpoint, params_weight_bytes, parse_generation_defaults,
+    register_loaded_weights_and_pool, spawn_loaded_model_thread,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, ensure_affine_biases_present, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, ensure_row_major_kquant_layout, has_kquant_mode,
+    PerLayerMode, PerLayerQuant, QlBuildSpec, QlTiling, build_ql, ensure_dense_weight_floating,
+    ensure_kquant_storage_resolves_kquant, ensure_row_major_kquant_layout, has_kquant_mode,
     load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
 };
+use crate::models::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{AttentionKind, KVCacheDType};
 use crate::utils::gguf::NativeGgufFamily;
 use crate::utils::gguf_import::{GgufPreload, PreloadInput};
-use crate::utils::safetensors::{SafeTensorsFile, load_safetensors_lazy};
+use crate::utils::safetensors::{
+    SafeTensorsFile, checkpoint_safetensors_files, load_safetensors_lazy,
+};
 
 use super::attention::MuseGlimmerAttention;
 use super::config::MuseGlimmerConfig;
@@ -91,47 +89,15 @@ pub(super) fn build_projection_tiled(
     let plq = muse_projection_quant(prefix, overrides, default);
     let scales_key = format!("{prefix}.scales");
     if params.contains_key(&scales_key) {
-        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "muse_glimmer")?;
-        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "muse_glimmer")?;
-        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "muse_glimmer")?;
-        ensure_affine_biases_present(params, prefix, plq.mode, "muse_glimmer")?;
-        let quantized = match plq.mode {
-            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-            PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
-            // Tiled64 into the affine K-quant contract on a Metal host, as
-            // the K-quant arm (Muse-Glimmer threads no activation amax).
-            PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
-                params,
-                prefix,
-                plq.group_size,
-                plq.bits,
-                tiled,
-            )?,
-            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-            PerLayerMode::Q4K
-            | PerLayerMode::Q5K
-            | PerLayerMode::Q6K
-            | PerLayerMode::Q3K
-            | PerLayerMode::Q2K
-            | PerLayerMode::IQ4NL
-            | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S
-            | PerLayerMode::IQ2XXS
-            | PerLayerMode::IQ2XS
-            | PerLayerMode::IQ2S
-            | PerLayerMode::IQ3XXS
-            | PerLayerMode::IQ1S
-            | PerLayerMode::IQ1M => try_build_kquant_quantized_linear_tiled(
-                params,
-                prefix,
-                plq.mode,
-                plq.layout,
-                "muse_glimmer",
-                tiled,
-            )?,
-        }
+        let quantized = build_ql(
+            params,
+            prefix,
+            plq,
+            QlBuildSpec {
+                tiling: QlTiling::TileCollect(tiled),
+                ..QlBuildSpec::standard("muse_glimmer")
+            },
+        )?
         .ok_or_else(|| {
             Error::from_reason(format!(
                 "Muse-Glimmer projection '{prefix}' has quant sidecars but no complete quant group"
@@ -437,36 +403,15 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
 }
 
 fn primary_safetensor_is_mlx(path: &Path) -> Result<bool> {
-    let primary = if path.join("weights.safetensors").is_file() {
-        path.join("weights.safetensors")
-    } else if path.join("model.safetensors").is_file() {
-        path.join("model.safetensors")
-    } else {
-        let mut shards = std::fs::read_dir(path)
-            .map_err(|error| {
-                Error::from_reason(format!(
-                    "Failed to inspect Muse-Glimmer checkpoint directory: {error}"
-                ))
-            })?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|file| {
-                let name = file
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                    && name.ends_with(".safetensors")
-                    && name.contains("-of-")
-            })
-            .collect::<Vec<_>>();
-        shards.sort();
-        shards.into_iter().next().ok_or_else(|| {
+    let primary = checkpoint_safetensors_files(path)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
             Error::from_reason(format!(
                 "No model SafeTensors file found in {}",
                 path.display()
             ))
-        })?
-    };
+        })?;
     Ok(SafeTensorsFile::load(&primary)?
         .metadata
         .as_ref()
@@ -574,22 +519,6 @@ fn requires_row_exact_decode_projections(
             .any(|quant| quant.mode == PerLayerMode::Affine)
 }
 
-fn preload_gguf(input: &PreloadInput) -> Result<GgufPreload> {
-    let preload = GgufPreload::load(input)?;
-    let stats = &preload.stats;
-    tracing::info!(
-        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
-         {} GPU-repacked and {} other tensors",
-        stats.bytes,
-        stats.preload_secs,
-        stats.read_secs,
-        if stats.nocache { "off" } else { "on" },
-        stats.gpu_tensors,
-        stats.cpu_tensors,
-    );
-    Ok(preload)
-}
-
 /// With `preload_input`, `path` is the GGUF's asset directory (or a host
 /// config overlay of it). Model thread only.
 fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseGlimmerInner, u64)> {
@@ -604,16 +533,16 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
     let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
     let mut checkpoint_load = CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
     let from_gguf = preload_input.is_some();
-    let _free_released = crate::array::memory::FreeReleasedSources::enable(from_gguf);
-    let mut preload = preload_input
-        .map(|input| preload_gguf(&input))
-        .transpose()?;
+    let mut gguf = GgufPreloadGuard::load(preload_input.as_ref())?;
     let mut params = load_target_weights(
         path,
         config.text_config.tie_word_embeddings,
-        preload.as_mut(),
+        gguf.preload.as_mut(),
     )?;
-    let preloaded_draft = preload.map(|mut preload| std::mem::take(&mut preload.companion));
+    let preloaded_draft = gguf
+        .preload
+        .take()
+        .map(|mut preload| std::mem::take(&mut preload.companion));
     checkpoint_load.record_read();
     if persist_cold {
         crate::engine::persistence::prewarm_checkpoint_pages(path);
@@ -651,10 +580,7 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
     // Checkpoint byte total BEFORE installation: the layer loop releases the
     // row-major sources of Tiled64 K-quant projections from `params` (the
     // model owns same-sized tiled copies), so the map afterwards under-counts.
-    let text_weight_bytes = params
-        .values()
-        .map(|array| array.nbytes() as u64)
-        .fold(0u64, |acc, v| acc.saturating_add(v));
+    let text_weight_bytes = params_weight_bytes(&params);
     let mut tiled = Vec::<String>::new();
     let mut layers = Vec::with_capacity(text.num_hidden_layers);
     for index in 0..text.num_hidden_layers {
@@ -716,10 +642,7 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
     let gen_defaults = parse_generation_defaults(path);
     let draft = draft_params(path, preloaded_draft)?;
     let draft_bytes = match (&draft, from_gguf) {
-        (Some(params), true) => params
-            .values()
-            .map(|array| array.nbytes() as u64)
-            .fold(0u64, |acc, v| acc.saturating_add(v)),
+        (Some(params), true) => params_weight_bytes(params),
         (Some(_), false) => std::fs::metadata(path.join("draft.safetensors"))
             .map(|meta| meta.len())
             .unwrap_or(0),
@@ -768,13 +691,11 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
 }
 
 pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerModel> {
-    let source =
-        CheckpointSource::resolve(Path::new(model_path), NativeGgufFamily::MuseGlimmer).await?;
-    let loaded = load_with_source(&source).await;
-    if loaded.is_err() {
-        source.release_lease();
-    }
-    loaded
+    let lease =
+        CheckpointLeaseGuard::resolve(Path::new(model_path), NativeGgufFamily::MuseGlimmer).await?;
+    let loaded = load_with_source(lease.source()).await?;
+    lease.commit();
+    Ok(loaded)
 }
 
 /// The caller releases `source`'s lease when this fails.
@@ -788,58 +709,42 @@ pub(crate) async fn load_with_source(source: &CheckpointSource) -> Result<MuseGl
         }
     };
     let model_assets_path = model_path.clone();
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
-        move || {
-            let (inner, weight_bytes) = load_inner(Path::new(&model_path), preload_input)?;
-            let has_dflash = inner.dflash.is_some();
-            let pool_bytes = inner
-                .paged
-                .as_ref()
-                .map(|paged| paged.coordinator.pool_allocated_bytes())
-                .transpose()
-                .map_err(Error::from_reason)?
-                .unwrap_or(0);
-            let paged_active = inner.paged.is_some();
-            let context_limits = super::model::MuseGlimmerContextLimits::from_inner(&inner);
-            let max_concurrent_sequences =
-                crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
-                    inner.paged.as_ref().map_or(1, |paged| {
-                        paged.coordinator.max_concurrent_sequences() as usize
-                    }),
-                ) as u32;
-            let guard = crate::cache_limit::coordinator().register(weight_bytes);
-            let pool_guard = (pool_bytes != 0)
-                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
-            Ok((
-                MuseSchedulerState::new(inner)?,
-                (
-                    has_dflash,
-                    paged_active,
-                    max_concurrent_sequences,
-                    context_limits,
-                    guard,
-                    pool_guard,
-                ),
-            ))
-        },
-        |state, receiver| state.drive(receiver),
-    );
-    let (
-        has_dflash,
-        paged_active,
-        max_concurrent_sequences,
-        context_limits,
-        cache_limit_guard,
-        pool_cache_limit_guard,
-    ) = match init_rx.await {
-        Ok(Ok(init)) => init,
-        Ok(Err(error)) => return Err(error),
-        Err(_) => {
-            return Err(Error::from_reason(
-                "Muse-Glimmer model thread exited during load",
-            ));
-        }
-    };
+    let (thread, (has_dflash, paged_active, max_concurrent_sequences, context_limits, guards)) =
+        spawn_loaded_model_thread(
+            "Muse-Glimmer model thread exited during load",
+            move || {
+                let (inner, weight_bytes) = load_inner(Path::new(&model_path), preload_input)?;
+                let has_dflash = inner.dflash.is_some();
+                let pool_bytes = inner
+                    .paged
+                    .as_ref()
+                    .map(|paged| paged.coordinator.pool_allocated_bytes())
+                    .transpose()
+                    .map_err(Error::from_reason)?
+                    .unwrap_or(0);
+                let paged_active = inner.paged.is_some();
+                let context_limits = super::model::MuseGlimmerContextLimits::from_inner(&inner);
+                let max_concurrent_sequences =
+                    crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
+                        inner.paged.as_ref().map_or(1, |paged| {
+                            paged.coordinator.max_concurrent_sequences() as usize
+                        }),
+                    ) as u32;
+                let guards = register_loaded_weights_and_pool(weight_bytes, pool_bytes, None);
+                Ok((
+                    MuseSchedulerState::new(inner)?,
+                    (
+                        has_dflash,
+                        paged_active,
+                        max_concurrent_sequences,
+                        context_limits,
+                        guards,
+                    ),
+                ))
+            },
+            |state, receiver| state.drive(receiver),
+        )
+        .await?;
     Ok(MuseGlimmerModel {
         thread,
         model_assets_path,
@@ -847,8 +752,8 @@ pub(crate) async fn load_with_source(source: &CheckpointSource) -> Result<MuseGl
         paged_active,
         max_concurrent_sequences,
         context_limits,
-        _cache_limit_guard: cache_limit_guard,
-        _pool_cache_limit_guard: pool_cache_limit_guard,
+        _cache_limit_guard: guards.cache_limit,
+        _pool_cache_limit_guard: guards.pool_cache_limit,
     })
 }
 
@@ -859,7 +764,7 @@ mod tests {
         primary_safetensor_is_mlx, quant_lookup_prefix, requires_row_exact_decode_projections,
     };
     use crate::array::MxArray;
-    use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
+    use crate::models::quant_dispatch::{PerLayerMode, PerLayerQuant};
     use crate::utils::safetensors::save_safetensors;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

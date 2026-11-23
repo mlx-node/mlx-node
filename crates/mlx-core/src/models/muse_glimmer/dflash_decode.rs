@@ -1,24 +1,16 @@
 //! DFlash speculative-turn integration for Muse-Glimmer.
 
-use std::time::Instant;
-
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, TurnOutput, WholeTurnArgs,
+    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, ResetScope,
+    TurnOutput, WholeTurnArgs,
 };
-use crate::engine::decode::TurnStreaming;
-use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
-use crate::engine::finalize::compute_performance_metrics;
-use crate::engine::params::generated_capacity_hint;
-use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::models::gemma4::layer_cache::{
-    Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify,
-};
+use crate::engine::dspark_turn::{FlatDsparkBackend, FlatDsparkPrefix, run_flat_dspark_turn};
+use crate::engine::params::ChatParams;
 use crate::stream::{Stream, StreamContext};
+use crate::transformer::{HybridVerifyRollback, commit_after_verify, snapshot_before_verify};
 
 use super::dflash::DFlashContextCache;
 use super::model::MuseGlimmerInner;
@@ -34,7 +26,7 @@ pub(crate) struct MuseGlimmerDFlashStepper<'a> {
     context: DFlashContextCache,
     next_position: i32,
     tap_layers: Vec<usize>,
-    rollback: Option<Gemma4VerifyRollback>,
+    rollback: Option<HybridVerifyRollback>,
     tapped: Option<Vec<MxArray>>,
 }
 
@@ -351,12 +343,19 @@ impl MuseGlimmerInner {
     }
 
     pub(crate) fn dflash_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let tokenizer = args.tokenizer.clone();
-        let tokens = args.tokens.to_vec();
-        let is_delta = args.plan.is_delta;
-        let is_streaming = args.sink.is_some();
-        let mut params = ChatBackend::resolve_params(self, args.config);
-        params.extra_eos_ids = ChatBackend::extra_eos_ids(self);
+        run_flat_dspark_turn(self, args)
+    }
+}
+
+impl FlatDsparkBackend for MuseGlimmerInner {
+    const OVERWRITE_THINKING_ENABLED: bool = false;
+
+    fn prepare_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        params: &ChatParams,
+        is_delta: bool,
+    ) -> Result<FlatDsparkPrefix> {
         let prior_cached = if is_delta {
             self.cached_token_history.len()
         } else {
@@ -369,7 +368,7 @@ impl MuseGlimmerInner {
         let verified_hit = if is_delta {
             0
         } else {
-            ChatBackend::verify_cache_prefix(self, &tokens, params.reuse_cache)
+            ChatBackend::verify_cache_prefix(self, tokens, params.reuse_cache)
         };
         let cached_prefix = reusable_dflash_prefix(
             is_delta,
@@ -381,164 +380,70 @@ impl MuseGlimmerInner {
         if self.turn_cancelled() {
             return Err(Error::from_reason(PREFILL_CANCELLED));
         }
-        let prefill = if cached_prefix > 0 {
-            tokens[cached_prefix..].to_vec()
-        } else {
-            ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
-            tokens.clone()
-        };
-
-        let generation_stream = Stream::generation();
-        let report_performance = params.report_performance;
-        let generation_start = report_performance.then(Instant::now);
-        let mut first_token_instant = None;
-        let mut profiler = DecodeProfiler::new(
-            ChatBackend::profiler_label(self, is_delta, is_streaming),
-            ChatBackend::family_name(self),
-        );
-        profiler.set_prompt_tokens(prefill.len() as u32);
-        profiler.snapshot_memory_before();
-        profiler.begin_prefill();
-        let (last_logits, state) =
-            match self.dflash_prefill(&prefill, cached_prefix as i32, generation_stream) {
-                Ok(value) => value,
-                Err(error) => return Err(self.dflash_fail_closed(error)),
-            };
-        profiler.end_prefill();
-
-        let mut token_history = tokens.clone();
-        let y = match apply_all_penalties(last_logits, &token_history, &params)
-            .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
-        {
-            Ok(token) => token,
-            Err(error) => return Err(self.dflash_fail_closed(error)),
-        };
-        y.eval();
-        self.eval_caches()?;
-        if report_performance {
-            first_token_instant = Some(Instant::now());
-        }
-        self.dflash_turn_state = Some(state);
-
-        let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
-        let mut finish_reason = String::from("length");
-        let mut reasoning =
-            ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end(args.config));
-        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        // One streaming bundle — detokenizer + cursors + emitter — built
-        // only when a sink exists so the sync path never runs the emitter
-        // hook.
-        let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(
-                self,
-                tokenizer.inner(),
-                args.thinking.enabled,
-                stream_skip_special,
-            )
-        });
-        let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = self
             .dflash
             .as_ref()
             .ok_or_else(|| Error::from_reason("loaded DFlash companion"))?
             .config
             .block_size;
-        let mut rng = rand::rng();
-        let outcome = {
-            let streaming = turn_streaming
-                .as_mut()
-                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
-            run_dspark_turn(
-                self,
-                &mut rng,
-                DsparkTurnArgs {
-                    y,
-                    block_size,
-                    params: &params,
-                    reasoning_tracker: &mut reasoning,
-                    profiler: &mut profiler,
-                    max_new_tokens: params.max_new_tokens,
-                    eos_id: args.eos_id,
-                    generated_tokens: &mut generated,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant: &mut first_token_instant,
-                    report_perf: report_performance,
-                    generation_stream,
-                    cancel_flag: args.cancelled,
-                    turn_token_observer,
-                },
-                streaming,
-            )
+        let prefill_tokens = if cached_prefix > 0 {
+            tokens[cached_prefix..].to_vec()
+        } else {
+            ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
+            tokens.to_vec()
         };
-        let mut last_in_cache = match outcome {
-            Ok(outcome) => outcome.last_in_cache,
-            Err(error) => return Err(self.dflash_fail_closed(error)),
-        };
+        Ok(FlatDsparkPrefix {
+            prefill_tokens,
+            cached_prefix_len: cached_prefix,
+            prior_cached_len: prior_cached,
+            block_size,
+        })
+    }
+
+    fn flat_prefill_with_draft_state(
+        &mut self,
+        prefix: &FlatDsparkPrefix,
+        stream: Stream,
+    ) -> Result<MxArray> {
+        let (last_logits, state) = self.dflash_prefill(
+            &prefix.prefill_tokens,
+            prefix.cached_prefix_len as i32,
+            stream,
+        )?;
+        self.dflash_turn_state = Some(state);
+        Ok(last_logits)
+    }
+
+    fn fail_closed_flat_dspark(&mut self, error: Error) -> Error {
+        self.dflash_fail_closed(error)
+    }
+
+    fn finish_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        mut last_in_cache: bool,
+        _is_delta: bool,
+        _reuse_cache: bool,
+        stream: Stream,
+    ) -> Result<()> {
         if finish_reason == "length"
             && !last_in_cache
-            && let Some(&last) = generated.last()
+            && let Some(&last) = generated_tokens.last()
         {
-            self.dflash_materialize_final(last, generation_stream)?;
+            self.dflash_materialize_final(last, stream)?;
             last_in_cache = true;
         }
-        let saved_generated = if !last_in_cache && !generated.is_empty() {
-            &generated[..generated.len() - 1]
+        let saved_generated = if !last_in_cache && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
         } else {
-            generated.as_slice()
+            generated_tokens
         };
-        let mut history = tokens.clone();
+        let mut history = tokens.to_vec();
         history.extend_from_slice(saved_generated);
         self.cached_token_history = history;
-
-        let performance = if report_performance {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill.len(),
-                generated.len(),
-            )
-            .map(|mut metrics| {
-                ChatBackend::augment_performance(self, &profiler, &mut metrics);
-                metrics
-            })
-        } else {
-            None
-        };
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            let decoded = tokenizer
-                .decode_sync(&generated, stream_skip_special)
-                .unwrap_or_default();
-            ts.flush_residual(&decoded, params.include_reasoning, sink);
-        }
-        let prompt_tokens = if is_delta && is_streaming {
-            ChatBackend::stream_delta_prompt_tokens(self, tokens.len(), tokens.len() - prior_cached)
-        } else {
-            tokens.len() as u32
-        };
-        let mut result = ChatBackend::finalize_turn(
-            self,
-            FinalizeArgs {
-                tokenizer: &tokenizer,
-                generated_tokens: &generated,
-                finish_reason,
-                think_end_id: tokenizer.think_end_id(),
-                think_end_str: tokenizer.think_end_str(),
-                think_end_extra_ids: &[],
-                performance,
-                include_reasoning: params.include_reasoning,
-                thinking_enabled: args.thinking.enabled,
-                prompt_tokens,
-                reasoning: reasoning.outcome(),
-            },
-        )?;
-        result.cached_tokens = cached_prefix as u32;
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            ts.emitter.finish(&result, sink);
-            Ok(TurnOutput::Streamed)
-        } else {
-            Ok(TurnOutput::Complete(Box::new(result)))
-        }
+        Ok(())
     }
 }
 

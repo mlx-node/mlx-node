@@ -3548,6 +3548,59 @@ class Inkling2Q8SymMatmul : public fast::Custom {
 };
 
 } // namespace
+
+const std::vector<std::string>& kernel_names() {
+  static const std::vector<std::string> names = {
+      "inkling2_gate_sink_bf16",
+      "inkling2_gate_sink_f32",
+      "inkling2_situ_bf16",
+      "inkling2_situ_f32",
+      "inkling2_loop_blend_rms_norm_bf16",
+      "inkling2_loop_blend_rms_norm_f32",
+      "inkling2_sconv_k4_bf16",
+      "inkling2_sconv_k4_f32",
+      "inkling2_qr_clip_bf16",
+      "inkling2_qr_clip_f32",
+      "inkling2_sconv_k4_kv_prep_bf16",
+      "inkling2_sconv_k4_kv_prep_f32",
+      "inkling2_sconv_k4_kv_prep_paged_bf16",
+      "inkling2_block_attn_res_bf16",
+      "inkling2_block_attn_res_f32",
+      "inkling2_pair_rms_norm_f32",
+      "inkling2_pair_rms_norm_bf16",
+      "inkling2_sconv_k4_ragged_bf16",
+      "inkling2_sconv_k4_ragged_f32",
+      "inkling2_moe_router_proj_f32",
+      "inkling2_loop_ctrl_down_f32",
+      "inkling2_loop_ctrl_up_blend_f32",
+      "inkling2_rms_norm_from_sq_bf16",
+      "inkling2_rms_norm_from_sq_f32",
+      "inkling2_moe_route_f32",
+      "inkling2_moe_combine_bf16",
+      "inkling2_moe_combine_f32",
+      "inkling2_lm_head_softcap_f32",
+      "inkling2_lm_head_softcap_argmax_stage1",
+      "inkling2_lm_head_softcap_argmax_stage2",
+      "inkling2_markov_gate_bf16",
+      "inkling2_markov_fold_softcap_f32",
+      "inkling2_markov_fold_softcap_argmax_stage1",
+      "inkling2_bf16_linear_m1",
+      "inkling2_bf16_linear_nax_m8",
+      "inkling2_bf16_linear_batched",
+      "inkling2_bf16_linear_simd",
+      "inkling2_bf16_lm_head_softcap_argmax_p1",
+      "inkling2_bf16_lm_head_softcap_argmax_simd_stage1",
+      "inkling2_lm_head_q8_softcap_argmax_stage1",
+      "inkling2_lm_head_q8_bf16",
+      "inkling2_q8_sym_matmul_bf16",
+      "inkling2_q8_sym_matmul_nax_m8_bf16",
+      "inkling2_q8_sym_matmul_nax_m8_n32_bf16",
+      "inkling2_q8_sym_matmul_nax_bf16",
+      "inkling2_lm_head_q8_nax_softcap_argmax_p1",
+  };
+  return names;
+}
+
 } // namespace mlx::core::inkling2_ops
 
 extern "C" {

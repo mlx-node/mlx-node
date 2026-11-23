@@ -20,8 +20,8 @@ namespace {
 using namespace mlx::core;
 using namespace mlx_node::gguf_repack;
 
-constexpr char qwen4_gguf_repack_source[] =
-#include "cuda/qwen4_gguf_repack.cu.inc"
+constexpr char gguf_repack_source[] =
+#include "cuda/gguf_repack.cu.inc"
     ;
 
 class GgufRepackBandCuda final : public Primitive {
@@ -85,7 +85,7 @@ class GgufRepackBandCuda final : public Primitive {
     }
 
     auto fn = cu::jit_kernel(
-        encoder.device(), qwen4_gguf_repack_source, kKernels[kernel_].name);
+        encoder.device(), gguf_repack_source, kKernels[kernel_].name);
     encoder.add_kernel_node_raw(
         fn, dim3(grid_x, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
   }

@@ -6,35 +6,6 @@ pub(super) fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5Lay
     Qwen3_5LayerCache::fresh_layer_caches(config)
 }
 
-/// Create the profiler owned by a paged-MTP turn before its prefill starts.
-///
-/// Paged AR intentionally keeps its existing terminal-only metrics path and
-/// therefore does not allocate a decode profiler here. This helper starts the
-/// prefill timer immediately before the actual paged prefill; the caller ends
-/// it immediately afterward, then carries this same instance into
-/// `run_mtp_turn` for decode and acceptance accounting.
-pub(super) fn configure_paged_mtp_profiler(
-    mut profiler: crate::decode_profiler::DecodeProfiler,
-    fresh_suffix_tokens: u32,
-) -> crate::decode_profiler::DecodeProfiler {
-    profiler.set_prompt_tokens(fresh_suffix_tokens);
-    profiler.snapshot_memory_before();
-    profiler.begin_prefill();
-    profiler
-}
-
-pub(super) fn begin_paged_mtp_profiler(
-    eager_mtp_paged: bool,
-    fresh_suffix_tokens: u32,
-) -> Option<crate::decode_profiler::DecodeProfiler> {
-    eager_mtp_paged.then(|| {
-        configure_paged_mtp_profiler(
-            crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5"),
-            fresh_suffix_tokens,
-        )
-    })
-}
-
 /// Enforce one fixed token window against already-resolved chat parameters.
 /// Shared by dense and MoE so every native executor uses the same prompt
 /// rejection marker. Splash's budget: a prompt must leave room for one new
@@ -105,14 +76,14 @@ pub(super) struct DenseGdnHistoryCheckpoint {
     pub(super) last_used: u64,
 }
 
-pub(super) struct DenseGdnPrefixPreparation {
-    pub(super) state: &'static str,
+pub(crate) struct DenseGdnPrefixPreparation {
+    pub(crate) state: &'static str,
     /// The KV prefix the turn resumes from: the prepare's, or 0 once a
     /// disk state's KV without its GDN state restarted the turn cold.
-    pub(super) cached_prefix_len: u32,
-    pub(super) already_primed: bool,
-    pub(super) restored_prefix_tokens: u32,
-    pub(super) replayed_prefix_tokens: u32,
+    pub(crate) cached_prefix_len: u32,
+    pub(crate) already_primed: bool,
+    pub(crate) restored_prefix_tokens: u32,
+    pub(crate) replayed_prefix_tokens: u32,
 }
 
 #[derive(Default)]

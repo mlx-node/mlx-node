@@ -16,6 +16,7 @@ use napi::bindgen_prelude::*;
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::finalize::finalize_chat_result;
+use crate::engine::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
     extract_chat_params,
@@ -23,7 +24,6 @@ use crate::engine::params::{
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::progress::TurnProgress;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
-use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
 use crate::profiling::PerformanceMetrics;
 use crate::stream::Stream;

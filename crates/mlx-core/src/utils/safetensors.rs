@@ -512,27 +512,31 @@ fn read_passthrough_bytes(src: &PassthroughSource) -> Result<Vec<u8>> {
 /// the sorted `model-*-of-*.safetensors` shards. Stray or auxiliary
 /// `.safetensors` files in the directory are deliberately ignored so a sharded
 /// lookup resolves against the same files that produced the sanitized params.
-pub(crate) fn checkpoint_safetensors_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn checkpoint_safetensors_files(
+    dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
     for single in ["weights.safetensors", "model.safetensors"] {
         let p = dir.join(single);
         if p.exists() {
-            return vec![p];
+            return Ok(vec![p]);
         }
     }
     let mut shards: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                && name.ends_with(".safetensors")
-                && name.contains("-of-");
-            if is_shard {
-                shards.push(entry.path());
-            }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| Error::from_reason(format!("Failed to read model directory: {e}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| Error::from_reason(format!("Failed to read directory entry: {e}")))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+            && name.ends_with(".safetensors")
+            && name.contains("-of-");
+        if is_shard {
+            shards.push(entry.path());
         }
     }
     shards.sort();
-    shards
+    Ok(shards)
 }
 
 pub(crate) fn load_bf16_tensor_sharded(
@@ -557,7 +561,7 @@ pub(crate) fn load_bf16_tensor_sharded(
     let suffix = format!(".{key}");
     let mut exact: Vec<(std::path::PathBuf, TensorInfo, usize)> = Vec::new();
     let mut suffixed: Vec<(std::path::PathBuf, String, TensorInfo, usize)> = Vec::new();
-    for p in checkpoint_safetensors_files(model_dir) {
+    for p in checkpoint_safetensors_files(model_dir)? {
         let st = SafeTensorsFile::load(&p)?;
         if let Some(info) = st.tensors.get(key) {
             exact.push((p.clone(), info.clone(), st.data_offset));
@@ -1704,5 +1708,25 @@ mod tests {
         assert!(res.is_err(), "out-of-range read must return Err");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_safetensors_files_propagates_read_dir_errors() {
+        let base =
+            std::env::temp_dir().join(format!("st_checkpoint_read_dir_err_{}", std::process::id()));
+        let missing = base.join("does_not_exist");
+        assert!(
+            checkpoint_safetensors_files(&missing).is_err(),
+            "missing directory must return Err rather than empty Ok(vec![])"
+        );
+
+        std::fs::create_dir_all(&base).unwrap();
+        let file_path = base.join("not_a_dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        assert!(
+            checkpoint_safetensors_files(&file_path).is_err(),
+            "non-directory path must return Err rather than empty Ok(vec![])"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

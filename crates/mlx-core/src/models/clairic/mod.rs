@@ -1,38 +1,21 @@
-//! Clairic structured-extraction runtime modules and N-API bindings.
+//! Clairic structured-extraction runtime MLX/N-API bindings.
+//!
+//! Pure-Rust extraction logic, grammar constraints, prompt encoding, typed
+//! decoding, and orchestration live in the `mlx-clairic` workspace crate and
+//! are re-exported here for internal callers.
 
-pub mod ar;
 pub mod ar_engine;
-pub mod completion;
-pub mod contracts;
-pub mod crops;
-pub mod decimal_util;
-pub mod embedded;
-pub mod errors;
-pub mod grounding;
 pub mod head;
-pub mod html_rows;
-pub mod identifier_spelling;
-pub mod image_rows;
-pub mod json_validate;
-pub mod lists;
-pub mod media;
-pub mod media_cache;
-pub mod media_state_prompt;
-pub mod orchestrator;
-pub mod orientation;
-pub mod printed_numbers;
-pub mod printed_temporal;
-pub mod profile;
-pub mod receipt;
-pub mod row_omission;
-pub mod schema;
-pub mod scopes;
-pub mod settings;
-pub mod source_dates;
-pub mod source_rows;
-pub mod table_rows;
-pub mod typed_decode;
-pub mod typed_prompt;
+#[cfg(test)]
+mod orchestrator_tests;
+
+pub use mlx_clairic::{
+    ar, completion, contracts, crops, decimal_util, embedded, errors, grounding, head_config,
+    html_rows, identifier_spelling, image_rows, json_validate, lists, media, media_cache,
+    media_state_prompt, orchestrator, orientation, printed_numbers, printed_temporal, profile,
+    receipt, row_omission, schema, scopes, settings, source_dates, source_rows, table_rows,
+    typed_decode, typed_prompt, types,
+};
 
 use std::path::Path;
 use std::sync::{
@@ -48,8 +31,30 @@ use crate::engine::checkpoint_source::CheckpointSource;
 use crate::models::qwen3_5::{model::Qwen3_5Model, persistence};
 use crate::utils::gguf::NativeGgufFamily;
 
-use self::embedded::RenderedPdfPageData;
-use self::profile::ClairicProfile;
+use mlx_clairic::embedded::RenderedPdfPageData;
+use mlx_clairic::profile::ClairicProfile;
+
+/// Convert a pure-Rust [`mlx_clairic::ClairicError`] into a [`napi::Error`].
+pub(crate) fn to_napi_err(err: mlx_clairic::ClairicError) -> napi::Error {
+    napi::Error::from_reason(err.to_string())
+}
+
+/// Convert a [`napi::Error`] from MLX/tokenizer operations into a [`mlx_clairic::ClairicError`]
+/// without double-prefixing existing Clairic error prefixes.
+pub(crate) fn napi_to_clairic_err(err: napi::Error) -> mlx_clairic::ClairicError {
+    let msg = err.reason;
+    if msg == mlx_clairic::errors::CANCELLED_MESSAGE {
+        mlx_clairic::ClairicError::Cancelled
+    } else if let Some(rest) = msg.strip_prefix(mlx_clairic::errors::INVALID_REQUEST_PREFIX) {
+        mlx_clairic::ClairicError::InvalidRequest(rest.to_string())
+    } else if let Some(rest) = msg.strip_prefix(mlx_clairic::errors::QUEUE_FULL_PREFIX) {
+        mlx_clairic::ClairicError::QueueFull(rest.to_string())
+    } else if let Some(rest) = msg.strip_prefix(mlx_clairic::errors::INFERENCE_ERROR_PREFIX) {
+        mlx_clairic::ClairicError::Inference(rest.to_string())
+    } else {
+        mlx_clairic::ClairicError::Message(msg)
+    }
+}
 
 /// Pre-rendered RGB PDF page supplied from the host PDF renderer.
 #[napi(object)]
@@ -106,7 +111,9 @@ impl ClairicModel {
         match persistence::load_clairic_with_source(&source).await {
             Ok(backbone) => {
                 let profile = backbone.clairic_profile().ok_or_else(|| {
-                    errors::inference_error("Clairic checkpoint did not initialize a profile")
+                    to_napi_err(errors::inference_error(
+                        "Clairic checkpoint did not initialize a profile",
+                    ))
                 })?;
                 Ok(Self { backbone, profile })
             }
@@ -127,7 +134,9 @@ impl ClairicModel {
         cancellation: Option<&ClairicCancellation>,
     ) -> Result<String> {
         if request.len() > orchestrator::MAX_REQUEST_BYTES {
-            return Err(errors::invalid_request("request exceeds 16 MiB"));
+            return Err(to_napi_err(errors::invalid_request(
+                "request exceeds 16 MiB",
+            )));
         }
         let pages: Vec<RenderedPdfPageData> = rendered_pdf_pages
             .unwrap_or_default()
@@ -143,7 +152,7 @@ impl ClairicModel {
         let cancelled = cancellation.map(|c| c.flag.clone());
         self.backbone
             .run_clairic(move |inner| {
-                orchestrator::extract_json_on_inner(inner, &request, pages, cancelled.as_ref())
+                ar_engine::extract_json_on_inner(inner, &request, pages, cancelled.as_ref())
             })
             .await
     }

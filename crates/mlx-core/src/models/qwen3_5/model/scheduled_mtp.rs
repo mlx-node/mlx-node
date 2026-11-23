@@ -115,6 +115,7 @@ impl ScheduledMtpTarget for Qwen35Inner {
             .collect::<Vec<_>>();
         let ids = MxArray::from_uint32(&ids, &[rows.len() as i64, width as i64])?;
         let mut hidden = self.embedding.forward(&ids)?;
+        let preserve_singleton_projection_graphs = self.is_moe();
         for index in 0..self.layers.len() {
             let adapter = self
                 .paged_adapter
@@ -126,12 +127,25 @@ impl ScheduledMtpTarget for Qwen35Inner {
                 adapter,
                 &positions,
                 Some(&mut caches[index]),
+                preserve_singleton_projection_graphs,
                 Some(&mut tape[index]),
             )?;
         }
         let hidden = self.final_norm.forward(&hidden)?;
-        let logits =
-            super::forward::project_logits_from_hidden(&hidden, &self.lm_head, &self.embedding)?;
+        let logits = if preserve_singleton_projection_graphs {
+            let per_row = (0..rows.len() as i64)
+                .map(|row| {
+                    super::forward::project_logits_from_hidden(
+                        &hidden.slice_axis(0, row, row + 1)?,
+                        &self.lm_head,
+                        &self.embedding,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            MxArray::concatenate_many(per_row.iter().collect(), Some(0))?
+        } else {
+            super::forward::project_logits_from_hidden(&hidden, &self.lm_head, &self.embedding)?
+        };
         Ok((logits, hidden))
     }
 }
@@ -211,6 +225,75 @@ fn prefill_seed_owns_one_row_buffer() {
     }
     use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
     let mut inner = seeded_inner(8107);
+    let seq = 7;
+    inner.activate_scheduled_recurrent(seq).unwrap();
+    let prompt = [3u32, 1, 4, 1, 5, 9];
+    let prefix = inner
+        .prime_prefix_state(&prompt, true, 16, &[], seq as u64)
+        .unwrap();
+    assert_eq!(prefix.effective_cached_prefix_len, 0);
+    assert!(inner.begin_scheduled_mtp(seq, 0).unwrap());
+    inner
+        .paged_prefill(&prompt, &prefix, Stream::generation())
+        .unwrap()
+        .eval();
+    let seed = inner.mtp_state().owners[&seq].hidden.clone().unwrap();
+    seed.eval();
+    synchronize_mlx();
+    let hidden = inner.config.hidden_size as usize;
+    assert_eq!(seed.shape().unwrap().as_ref(), &[1, 1, hidden as i64]);
+    let info = unsafe { MlxMetalBuffer::from_mlx_array(seed.as_raw_ptr()) }.unwrap();
+    assert_eq!(
+        info.offset, 0,
+        "seed is a view into the prompt's hidden rows"
+    );
+    assert_eq!(info.data_size, hidden);
+}
+
+#[cfg(test)]
+pub(crate) fn seeded_moe_inner(seed: u64) -> Qwen35Inner {
+    seeded_moe_inner_with_config(seed, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn seeded_moe_inner_with_config(
+    seed: u64,
+    adjust: impl FnOnce(&mut crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig),
+) -> Qwen35Inner {
+    unsafe { mlx_sys::mlx_seed(seed) };
+    let mut config = super::moe_paged_tests::tiny_paged_forward_moe_cfg();
+    config.n_mtp_layers = 1;
+    config.vocab_size = 16;
+    adjust(&mut config);
+    let mut inner = Qwen35Inner::new_moe(config).unwrap();
+    super::moe_paged_tests::cast_moe_inner_weights_bf16(&mut inner);
+    let mut head = Linear::new(inner.config.hidden_size as u32, 16, Some(true)).unwrap();
+    head.set_weight(
+        &MxArray::zeros(
+            &[16, inner.config.hidden_size as i64],
+            Some(crate::array::DType::BFloat16),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let bias = MxArray::from_float32(&(0..16).map(|i| i as f32 / 16.0).collect::<Vec<_>>(), &[16])
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+    head.set_bias(Some(&bias)).unwrap();
+    inner.lm_head = Some(LinearProj::Standard(head));
+    inner.initialize_paged_adapter().unwrap();
+    inner
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn moe_prefill_seed_owns_one_row_buffer() {
+    if crate::test_support::paged_prefill_unsupported("moe_prefill_seed_owns_one_row_buffer") {
+        return;
+    }
+    use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+    let mut inner = seeded_moe_inner(8107);
     let seq = 7;
     inner.activate_scheduled_recurrent(seq).unwrap();
     let prompt = [3u32, 1, 4, 1, 5, 9];

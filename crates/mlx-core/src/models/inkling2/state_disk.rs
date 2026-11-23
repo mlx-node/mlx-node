@@ -14,17 +14,16 @@
 //! - **Restart survival**: persistent `DiskTier` (`persistPagedCache` / `MLX_PERSIST_PAGED_CACHE=1`)
 //!   adopts complete `(state blob + 8-layer Global KV chain)` entries via `adopt_states` on startup.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 #[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
-    CacheRecency, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdStateLabel, ColdStateLayout,
-    ColdStateObject, EnqueueRefused, Landed, MakeRoom, block_object_bytes, state_object_bytes,
+    CacheRecency, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdStateLabel, MakeRoom,
+    block_object_bytes,
 };
 use napi::bindgen_prelude::{Error, Result};
 
@@ -33,16 +32,20 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{
     CheckpointFiles, CheckpointLoadGuard, ColdTierGeometry, build_model_fingerprint,
 };
-use crate::disk_tier::{DiskTier, DiskTierOptions, PersistentIdentity, open_disk_tier};
-use crate::models::qwen3_5::dflash2_state::disk::{Tick, adopt_states, label_of, lineage_keys};
-use crate::models::qwen3_5::dflash2_state::store::{
-    DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass, StoreHit,
+use crate::disk_tier::state_disk::{
+    KvPoolHandle, Reclaimed, Staged, StateDiskCodec, StateDiskEngine, Tick, state_context,
 };
+use crate::disk_tier::store::{
+    Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass, StoreHit,
+};
+use crate::disk_tier::{DiskTier, DiskTierOptions, PersistentIdentity, open_disk_tier};
 use crate::transformer::KvFormat;
 use crate::transformer::paged_kv_cache_adapter::{
-    ChainPrefetch, ChainPrefetchStart, ColdContextBacking, ColdTierContext, PagedKVCacheAdapter,
-    RestoreUploadBudget, SeqId,
+    ChainPrefetch, ChainPrefetchStart, ColdTierContext, PagedKVCacheAdapter, RestoreUploadBudget,
+    SeqId,
 };
+
+pub(crate) use crate::disk_tier::state_disk::ReadWait;
 
 use super::config::Inkling2Config;
 use super::kv_cache::Inkling2KVCacheCoordinator;
@@ -466,52 +469,72 @@ pub(crate) struct Inkling2DiskCounters {
     pub adopted: u64,
 }
 
-struct PendingStateWrite {
-    id: EntryId,
-    key: ColdCacheKey,
-}
-
-struct ChainPersistCursor {
-    id: EntryId,
-    keys: Vec<ColdCacheKey>,
-    landed: usize,
-    in_flight: HashSet<ColdCacheKey>,
-    room: MakeRoom,
-}
-
-/// Guard marking an active parked restore waiting on the reusable state staging buffer.
-pub(crate) struct ReadWait {
-    counter: Arc<AtomicU32>,
-}
-
-impl Drop for ReadWait {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
-    }
-}
-
 /// Pending write-behind entry awaiting delay expiry.
 struct WriteBehindEntry {
     id: EntryId,
     published_at: Instant,
 }
 
-/// Model-owned StateDisk tier for Inkling-2-Mini (single reusable host staging buffer,
-/// dual-lane `ColdCacheManager` writer, 8-layer Global KV chain cursor, write-behind).
-pub(crate) struct Inkling2StateDisk {
-    pub(crate) tier: Arc<DiskTier>,
+/// Inkling2 codec for the shared governor-driven [`StateDiskEngine`].
+pub(crate) struct Inkling2StateCodec {
     pub(crate) geometry: Inkling2StateGeometry,
-    pub(crate) spans: Vec<u64>,
-    pub(crate) geometry_str: String,
-    pub(crate) global_block_bytes: u64,
-    staging: Option<Vec<u8>>,
-    landed_tx: Sender<Landed>,
-    landed_rx: Receiver<Landed>,
-    pending: Option<PendingStateWrite>,
-    chain: Option<ChainPersistCursor>,
+}
+
+impl StateDiskCodec for Inkling2StateCodec {
+    type State = Inkling2StateAnchor;
+    type EncodeCtx<'a> = ();
+
+    const STOP_CHAIN_AT_DEADLINE: bool = true;
+
+    fn encode_into(
+        &self,
+        _ctx: (),
+        _spans: &[u64],
+        entry: &Entry<Inkling2StateAnchor>,
+        state: &Inkling2StateAnchor,
+        into: &mut [u8],
+    ) -> Option<u32> {
+        let depth = u32::try_from(entry.depth()).ok()?;
+        if let Err(err) = self.geometry.encode_into(depth, state, into) {
+            tracing::warn!(
+                "Inkling2 StateDisk encode failed for entry {}: {err}",
+                entry.id()
+            );
+            return None;
+        }
+        Some(depth.saturating_sub(self.geometry.sliding_window))
+    }
+
+    fn adopt_copy(&self, _spans: &[u64], label: &ColdStateLabel) -> Option<(u64, u32)> {
+        let row = u32::try_from(label.tokens.len()).ok()?;
+        Some((
+            self.geometry.payload_bytes(),
+            row.saturating_sub(self.geometry.sliding_window),
+        ))
+    }
+}
+
+/// Model-owned StateDisk tier for Inkling-2-Mini backed by the shared
+/// [`StateDiskEngine`] (single reusable host staging buffer, dual-lane
+/// `ColdCacheManager` writer, 8-layer Global KV chain cursor, write-behind).
+pub(crate) struct Inkling2StateDisk {
+    pub(crate) engine: StateDiskEngine<Inkling2StateCodec>,
     write_behind: Vec<WriteBehindEntry>,
-    read_waiters: Arc<AtomicU32>,
     pub(crate) counters: Inkling2DiskCounters,
+}
+
+impl Deref for Inkling2StateDisk {
+    type Target = StateDiskEngine<Inkling2StateCodec>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl DerefMut for Inkling2StateDisk {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
 }
 
 impl Inkling2StateDisk {
@@ -522,103 +545,19 @@ impl Inkling2StateDisk {
     ) -> Result<Self> {
         let spans = geometry.spans();
         let geometry_str = geometry.geometry_string();
-        let staging_len = usize::try_from(geometry.payload_bytes())
-            .map_err(|_| Error::from_reason("Inkling2 StateDisk staging size overflows usize"))?;
-        let (landed_tx, landed_rx) = std::sync::mpsc::channel();
-        Ok(Self {
+        let engine = StateDiskEngine::new(
             tier,
-            geometry,
             spans,
             geometry_str,
             global_block_bytes,
-            staging: Some(vec![0u8; staging_len]),
-            landed_tx,
-            landed_rx,
-            pending: None,
-            chain: None,
+            Inkling2StateCodec { geometry },
+        )
+        .ok_or_else(|| Error::from_reason("Inkling2 StateDisk staging size overflows usize"))?;
+        Ok(Self {
+            engine,
             write_behind: Vec::new(),
-            read_waiters: Arc::new(AtomicU32::new(0)),
             counters: Inkling2DiskCounters::default(),
         })
-    }
-
-    pub(crate) fn wake_model_on_landing(&self, model_id: u64) {
-        if model_id == 0 {
-            return;
-        }
-        self.tier.manager.set_landing_wake(Some(Arc::new(move || {
-            crate::engine::governor::monitor::wake(model_id);
-        })));
-    }
-
-    pub(crate) fn writable(&self) -> bool {
-        self.tier.is_open()
-    }
-
-    pub(crate) fn writing(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub(crate) fn staging_free(&self) -> bool {
-        self.staging.is_some()
-    }
-
-    pub(crate) fn acquire_read_wait(&self) -> ReadWait {
-        self.read_waiters.fetch_add(1, Ordering::AcqRel);
-        ReadWait {
-            counter: Arc::clone(&self.read_waiters),
-        }
-    }
-
-    fn staging_for_write(&mut self) -> Option<Vec<u8>> {
-        if self.read_waiters.load(Ordering::Acquire) > 0 {
-            return None;
-        }
-        self.staging.take()
-    }
-
-    fn layout(&self, depth: usize) -> Option<ColdStateLayout> {
-        Some(ColdStateLayout {
-            boundary_tokens: u32::try_from(depth).ok()?,
-            spans: self.spans.clone(),
-            geometry: self.geometry_str.clone(),
-        })
-    }
-
-    pub(crate) fn state_key(&self, entry: &Entry<Inkling2StateAnchor>) -> Option<ColdCacheKey> {
-        lineage_keys(
-            ColdGroup::DFlash2State,
-            self.tier.state_fingerprint,
-            Lineage {
-                tokens: entry.tokens(),
-                extra_keys: entry.extra_keys(),
-                salt: entry.salt(),
-            },
-            entry.block_size(),
-        )
-        .last()
-        .copied()
-    }
-
-    pub(crate) fn kv_chain_keys(&self, entry: &Entry<Inkling2StateAnchor>) -> Vec<ColdCacheKey> {
-        lineage_keys(
-            ColdGroup::Kv,
-            self.tier.kv_fingerprint,
-            Lineage {
-                tokens: entry.tokens(),
-                extra_keys: entry.extra_keys(),
-                salt: entry.salt(),
-            },
-            entry.block_size(),
-        )
-    }
-
-    pub(crate) fn chain_on_disk(&self, entry: &Entry<Inkling2StateAnchor>) -> bool {
-        let keys = self.kv_chain_keys(entry);
-        !keys.is_empty()
-            && keys
-                .iter()
-                .all(|key| self.tier.manager.contains_in(key, ColdGroup::Kv))
     }
 
     pub(crate) fn entry_disk_restorable(&self, entry: &Entry<Inkling2StateAnchor>) -> bool {
@@ -628,40 +567,9 @@ impl Inkling2StateDisk {
                     .tier
                     .manager
                     .contains_in(&copy.key, ColdGroup::DFlash2State)
-                && self.chain_on_disk(entry)
+                && !entry.chain().is_empty()
+                && self.engine.chain_on_disk(entry)
         })
-    }
-
-    fn point_fits(&self, entry: &Entry<Inkling2StateAnchor>, room: MakeRoom) -> bool {
-        let Some(layout) = self.layout(entry.depth()) else {
-            return false;
-        };
-        let state_bytes = state_object_bytes(&layout, &label_of(entry));
-        let keys = self.kv_chain_keys(entry);
-        let missing = keys
-            .iter()
-            .filter(|k| !self.tier.manager.contains_in(k, ColdGroup::Kv))
-            .count() as u64;
-        let blocks = keys.len() as u64;
-        let limit = self.tier.limit;
-        let on_disk = entry.disk().is_some_and(|copy| copy.landed);
-        let lacking = missing
-            .saturating_mul(self.global_block_bytes)
-            .saturating_add(if on_disk { 0 } else { state_bytes });
-        let taken = self.tier.manager.total_bytes();
-        let Some(free) = self.tier.manager.room_above_reserve() else {
-            return false;
-        };
-        match room {
-            MakeRoom::Evict => {
-                blocks
-                    .saturating_mul(self.global_block_bytes)
-                    .saturating_add(state_bytes)
-                    <= limit
-                    && lacking <= free.saturating_add(taken)
-            }
-            MakeRoom::Refuse => taken <= limit && lacking <= (limit - taken).min(free),
-        }
     }
 }
 
@@ -932,65 +840,16 @@ impl Inkling2StateStore {
         let Some(entry) = self.store.get(id) else {
             return false;
         };
-        if entry.disk().is_some() {
+        if entry.disk().is_some() || !disk.point_fits(entry, room) {
             return false;
         }
-        let Some(anchor) = entry.ram() else {
-            return false;
-        };
-        if !disk.point_fits(entry, room) {
-            return false;
-        }
-        let Some(layout) = disk.layout(entry.depth()) else {
-            return false;
-        };
-        let Some(key) = disk.state_key(entry) else {
-            return false;
-        };
-        let label = label_of(entry);
-        let obj_bytes = state_object_bytes(&layout, &label);
-        let chain_on_disk = disk.chain_on_disk(entry);
-        let depth = u32::try_from(entry.depth()).unwrap_or(0);
-        let window_begin = depth.saturating_sub(disk.geometry.sliding_window);
-        let Some(mut staging) = disk.staging_for_write() else {
-            return false;
-        };
-        if let Err(err) = disk.geometry.encode_into(depth, anchor, &mut staging) {
-            tracing::warn!("Inkling2 StateDisk encode failed for entry {id}: {err}");
-            disk.staging = Some(staging);
-            disk.counters.offload_failures += 1;
-            return false;
-        }
-        let object = ColdStateObject {
-            key,
-            fingerprint: disk.tier.state_fingerprint,
-            layout,
-            label,
-            payload: staging,
-        };
-        match disk
-            .tier
-            .manager
-            .enqueue_state(object, room, disk.landed_tx.clone())
-        {
-            Ok(()) => {
-                disk.pending = Some(PendingStateWrite { id, key });
-                let copy = DiskCopy {
-                    key,
-                    bytes: obj_bytes,
-                    landed: false,
-                    window_begin,
-                    chain_owed: !chain_on_disk,
-                };
-                self.store.set_disk(id, Some(copy));
-                if !keep_ram {
-                    self.store.drop_ram(id);
-                }
+        match disk.engine.stage(&mut self.store, id, room, keep_ram, ()) {
+            Staged::Started => {
                 self.sync_marks(coordinator);
                 true
             }
-            Err(EnqueueRefused::Busy(object) | EnqueueRefused::Gone(object)) => {
-                disk.staging = Some(object.payload);
+            Staged::Busy => false,
+            Staged::Refused => {
                 disk.counters.offload_failures += 1;
                 false
             }
@@ -1007,35 +866,28 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         id: EntryId,
     ) -> ReclaimOutcome {
-        let Some(entry) = self.store.get(id) else {
+        let Some(disk) = self.disk.as_mut() else {
+            if let Some(entry) = self.store.get(id)
+                && entry.ram().is_some()
+            {
+                self.store.remove(id);
+                self.sync_marks(coordinator);
+            }
             return ReclaimOutcome::Erased;
         };
-        if entry.ram().is_none() {
-            return ReclaimOutcome::Erased;
+        let step = disk.engine.reclaim(&mut self.store, id, ());
+        if step.encode_or_enqueue_failed {
+            disk.counters.offload_failures += 1;
         }
-        if let Some(copy) = entry.disk() {
-            if copy.landed {
-                self.store.drop_ram(id);
-                self.sync_marks(coordinator);
-                return ReclaimOutcome::RamDropped;
-            }
-            return ReclaimOutcome::Pending;
+        if step.resync {
+            self.sync_marks(coordinator);
         }
-        let can_write = self
-            .disk
-            .as_ref()
-            .is_some_and(|d| d.writable() && d.point_fits(entry, MakeRoom::Evict));
-        if can_write {
-            if self.disk.as_ref().is_some_and(Inkling2StateDisk::writing) {
-                return ReclaimOutcome::Pending;
-            }
-            if self.stage_entry(coordinator, id, MakeRoom::Evict, false) {
-                return ReclaimOutcome::Spilled;
-            }
+        match step.outcome {
+            Reclaimed::Written => ReclaimOutcome::Spilled,
+            Reclaimed::RamDropped => ReclaimOutcome::RamDropped,
+            Reclaimed::Pending => ReclaimOutcome::Pending,
+            Reclaimed::Erased | Reclaimed::Nothing => ReclaimOutcome::Erased,
         }
-        self.store.remove(id);
-        self.sync_marks(coordinator);
-        ReclaimOutcome::Erased
     }
 
     /// Poll completed SSD writes & LRU evictions from `ColdCacheManager`.
@@ -1043,81 +895,10 @@ impl Inkling2StateStore {
         let Some(disk) = self.disk.as_mut() else {
             return false;
         };
-        let mut progressed = false;
-
-        // 1. Drop disk copies evicted by ColdCacheManager LRU.
-        let evicted = disk.tier.manager.take_evicted();
-        if !evicted.is_empty() {
-            let evicted_set: HashSet<ColdCacheKey> = evicted.into_iter().collect();
-            let drop_ids: Vec<(EntryId, bool)> = self
-                .store
-                .entries()
-                .filter_map(|e| {
-                    let copy = e.disk()?;
-                    evicted_set
-                        .contains(&copy.key)
-                        .then_some((e.id(), e.ram().is_none()))
-                })
-                .collect();
-            for (id, no_ram) in drop_ids {
-                self.store.set_disk(id, None);
-                if no_ram {
-                    self.store.remove(id);
-                }
-                progressed = true;
-            }
-        }
-
-        // 2. Drain Landed notifications (State and KV Block writes).
-        while let Ok(landed) = disk.landed_rx.try_recv() {
-            progressed = true;
-            match landed {
-                Landed::State { key, ok, payload } => {
-                    disk.staging = Some(payload);
-                    if let Some(pending) = disk.pending.take()
-                        && pending.key == key
-                    {
-                        if ok {
-                            disk.counters.offloads += 1;
-                            if let Some(entry) = self.store.get(pending.id)
-                                && let Some(mut copy) = entry.disk().copied()
-                            {
-                                copy.landed = true;
-                                copy.chain_owed = !disk.chain_on_disk(entry);
-                                self.store.set_disk(pending.id, Some(copy));
-                            }
-                        } else {
-                            disk.counters.offload_failures += 1;
-                            let no_ram = self
-                                .store
-                                .get(pending.id)
-                                .is_some_and(|e| e.ram().is_none());
-                            self.store.set_disk(pending.id, None);
-                            if no_ram {
-                                self.store.remove(pending.id);
-                            }
-                        }
-                    }
-                }
-                Landed::Block { key, ok } => {
-                    if let Some(cursor) = disk.chain.as_mut() {
-                        cursor.in_flight.remove(&key);
-                        if !ok {
-                            let failed_id = cursor.id;
-                            disk.chain = None;
-                            disk.counters.offload_failures += 1;
-                            let no_ram =
-                                self.store.get(failed_id).is_some_and(|e| e.ram().is_none());
-                            self.store.set_disk(failed_id, None);
-                            if no_ram {
-                                self.store.remove(failed_id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        let out = disk.engine.poll_offload(&mut self.store);
+        disk.counters.offloads += out.state_landed_ok;
+        disk.counters.offload_failures += out.offload_failures;
+        let progressed = out.landed || out.resync;
         if progressed {
             self.sync_marks(coordinator);
         }
@@ -1136,128 +917,13 @@ impl Inkling2StateStore {
         if !disk.writable() {
             return false;
         }
-        let mut progressed = false;
-
-        // Pick next owed entry if no cursor is active (prioritize RAM-less reclaimed entries first).
-        if disk.chain.is_none() {
-            let next = self
-                .store
-                .entries()
-                .filter(|e| e.disk().is_some_and(|c| c.chain_owed))
-                .min_by_key(|e| (e.ram().is_some(), e.publication()))
-                .map(|e| {
-                    let room = if e.ram().is_none() || disk.tier.persistent {
-                        MakeRoom::Evict
-                    } else {
-                        MakeRoom::Refuse
-                    };
-                    (e.id(), disk.kv_chain_keys(e), room)
-                });
-            if let Some((id, keys, room)) = next {
-                disk.chain = Some(ChainPersistCursor {
-                    id,
-                    keys,
-                    landed: 0,
-                    in_flight: HashSet::new(),
-                    room,
-                });
-            }
+        let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
+        let out = disk.engine.chain_step(&mut self.store, &kv, deadline);
+        disk.counters.offload_failures += out.offload_failures;
+        if out.step.failed || out.step.landed_all {
+            self.sync_marks(coordinator);
         }
-
-        let Some(mut cursor) = disk.chain.take() else {
-            return false;
-        };
-        let Some(entry) = self.store.get(cursor.id) else {
-            return false;
-        };
-        let full_adapter = coordinator.full_adapter();
-        let pool = full_adapter.layer_kv_pool();
-        let bs = entry.block_size() as usize;
-
-        loop {
-            while cursor.landed < cursor.keys.len()
-                && disk
-                    .tier
-                    .manager
-                    .contains_in(&cursor.keys[cursor.landed], ColdGroup::Kv)
-            {
-                cursor.landed += 1;
-            }
-            if cursor.landed >= cursor.keys.len() && cursor.in_flight.is_empty() {
-                if let Some(mut copy) = entry.disk().copied() {
-                    copy.chain_owed = false;
-                    self.store.set_disk(cursor.id, Some(copy));
-                    progressed = true;
-                }
-                self.sync_marks(coordinator);
-                return progressed;
-            }
-            if cursor.landed >= cursor.keys.len() {
-                // Waiting for in-flight blocks to land.
-                disk.chain = Some(cursor);
-                return progressed;
-            }
-            if !disk.tier.manager.has_block_room() {
-                disk.chain = Some(cursor);
-                return progressed;
-            }
-            let idx = cursor.landed;
-            let key = cursor.keys[idx];
-            if cursor.in_flight.contains(&key) {
-                disk.chain = Some(cursor);
-                return progressed;
-            }
-            let Some(&block_hash) = entry.chain().get(idx) else {
-                break;
-            };
-            let Some(phys_block) = full_adapter.cached_block(block_hash) else {
-                // Block was evicted before we could persist its chain: drop incomplete disk copy.
-                let no_ram = entry.ram().is_none();
-                self.store.set_disk(cursor.id, None);
-                if no_ram {
-                    self.store.remove(cursor.id);
-                }
-                self.sync_marks(coordinator);
-                return true;
-            };
-            let tok_slice = &entry.tokens()[idx * bs..(idx + 1) * bs];
-            match disk.tier.manager.capture_and_enqueue_tracked(
-                pool,
-                &phys_block,
-                key,
-                disk.tier.kv_fingerprint,
-                tok_slice,
-                deadline,
-                cursor.room,
-                disk.landed_tx.clone(),
-            ) {
-                Ok(true) => {
-                    cursor.in_flight.insert(key);
-                    cursor.landed += 1;
-                    progressed = true;
-                }
-                Ok(false) => {
-                    // Writer queue full or refused; try again next tick.
-                    disk.chain = Some(cursor);
-                    return progressed;
-                }
-                Err(err) => {
-                    tracing::warn!("Inkling2 StateDisk KV block capture failed: {err}");
-                    let no_ram = entry.ram().is_none();
-                    self.store.set_disk(cursor.id, None);
-                    if no_ram {
-                        self.store.remove(cursor.id);
-                    }
-                    self.sync_marks(coordinator);
-                    return true;
-                }
-            }
-            if Instant::now() >= deadline {
-                disk.chain = Some(cursor);
-                return progressed;
-            }
-        }
-        progressed
+        out.step.enqueued > 0 || out.step.landed_all || out.step.failed
     }
 
     /// Drive write-behind for eligible ordinary states whose delay has elapsed.
@@ -1266,16 +932,16 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         force: bool,
     ) -> bool {
-        let (writable, writing, persistent, read_waiters) = match self.disk.as_ref() {
+        let (writable, writing, persistent, has_waiters) = match self.disk.as_ref() {
             Some(d) => (
                 d.writable(),
                 d.writing(),
                 d.tier.persistent,
-                d.read_waiters.load(Ordering::Acquire),
+                d.has_read_waiters(),
             ),
             None => return false,
         };
-        if !writable || writing || (!force && read_waiters > 0) {
+        if !writable || writing || (!force && has_waiters) {
             return false;
         }
         if !persistent && !force {
@@ -1307,21 +973,24 @@ impl Inkling2StateStore {
 
     /// One tick of the StateDisk tier (called on scheduler drive passes and allocations).
     pub(crate) fn tick(&mut self, coordinator: &Inkling2KVCacheCoordinator, tick: Tick) -> bool {
-        let mut progressed = self.poll_offload(coordinator);
-        match tick {
-            Tick::Poll => {}
-            Tick::Wait { deadline } => {
-                progressed |= self.chain_step(coordinator, deadline);
-                progressed |= self.poll_offload(coordinator);
-            }
-            Tick::Full { .. } => {
-                progressed |= self.chain_step(coordinator, Instant::now());
-                if let Some(disk) = self.disk.as_ref() {
-                    disk.tier.measure();
-                }
-                progressed |= self.drive_write_behind(coordinator, false);
-                progressed |= self.poll_offload(coordinator);
-            }
+        let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
+        let out = {
+            let Some(disk) = self.disk.as_mut() else {
+                return false;
+            };
+            let kv_ref = disk.writable().then_some(&kv);
+            let out = disk.engine.tick(&mut self.store, kv_ref, tick);
+            disk.counters.offloads += out.state_landed_ok;
+            disk.counters.offload_failures += out.offload_failures;
+            out
+        };
+        let mut progressed = out.progressed || out.resync;
+        if out.resync {
+            self.sync_marks(coordinator);
+        }
+        if matches!(tick, Tick::Full { .. }) {
+            progressed |= self.drive_write_behind(coordinator, false);
+            progressed |= self.poll_offload(coordinator);
         }
         progressed
     }
@@ -1333,29 +1002,49 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         deadline: Instant,
     ) -> bool {
-        loop {
-            self.poll_offload(coordinator);
-            self.drive_write_behind(coordinator, true);
-            self.chain_step(coordinator, deadline);
-            self.poll_offload(coordinator);
-
-            let has_pending_write = self.disk.as_ref().is_some_and(Inkling2StateDisk::writing);
-            let has_owed_chain = self
+        let has_work = |this: &Self| {
+            let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
+            let has_owed_chain = this
                 .store
                 .entries()
                 .any(|e| e.disk().is_some_and(|c| c.chain_owed));
-            let has_waiting_wb = self.disk.as_ref().is_some_and(|d| {
+            let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
                 d.write_behind
                     .iter()
-                    .any(|w| self.store.get(w.id).is_some_and(|e| e.disk().is_none()))
+                    .any(|w| this.store.get(w.id).is_some_and(|e| e.disk().is_none()))
             });
-            if !has_pending_write && !has_owed_chain && !has_waiting_wb {
+            has_pending_write || has_owed_chain || has_waiting_wb
+        };
+        loop {
+            self.poll_offload(coordinator);
+            if !has_work(self) {
                 return true;
             }
             if Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let wb_before = self.disk.as_ref().map_or(0, |d| d.write_behind.len());
+            let staged = self.drive_write_behind(coordinator, true);
+            let chained = self.chain_step(coordinator, deadline);
+            let polled = self.poll_offload(coordinator);
+            let wb_progressed =
+                staged || self.disk.as_ref().map_or(0, |d| d.write_behind.len()) < wb_before;
+
+            if !has_work(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if polled || chained || wb_progressed {
+                continue;
+            }
+            let Some(disk) = self.disk.as_ref() else {
+                return false;
+            };
+            if !disk.engine.await_landing(deadline) {
+                return false;
+            }
         }
     }
 
@@ -1373,20 +1062,8 @@ impl Inkling2StateStore {
         if let Some(disk) = self.disk.as_ref() {
             all_flushed &= disk.tier.close(deadline);
         }
-        if !persistent {
-            // Strip disk copies on closed temporary tier.
-            let ids: Vec<(EntryId, bool)> = self
-                .store
-                .entries()
-                .filter(|e| e.disk().is_some())
-                .map(|e| (e.id(), e.ram().is_none()))
-                .collect();
-            for (id, no_ram) in ids {
-                self.store.set_disk(id, None);
-                if no_ram {
-                    self.store.remove(id);
-                }
-            }
+        if !persistent && let Some(disk) = self.disk.as_mut() {
+            disk.engine.strip_disk_copies(&mut self.store);
         }
         all_flushed
     }
@@ -1402,42 +1079,31 @@ impl Inkling2StateStore {
             self.ram_hits += 1;
             return Some((ram, false));
         }
-        // Wait briefly if a state write currently owns the staging buffer.
+        // Wait for an in-flight state write to hand back the staging buffer.
         let deadline = Instant::now()
             + Duration::from_secs_f64(crate::engine::governor::wait::RESOURCE_WAIT_SECONDS);
-        while self
-            .disk
-            .as_ref()
-            .is_some_and(|d| !d.staging_free() && d.writing())
-        {
-            self.poll_offload(coordinator);
-            if self
-                .disk
-                .as_ref()
-                .is_some_and(Inkling2StateDisk::staging_free)
-                || Instant::now() >= deadline
-            {
+        loop {
+            let disk = self.disk.as_ref()?;
+            if disk.staging_free() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            if !disk.writing() || crate::engine::governor::governor::cancelled() {
+                return None;
+            }
+            if !disk.engine.await_landing(deadline) {
+                return None;
+            }
+            self.poll_offload(coordinator);
         }
         let disk = self.disk.as_mut()?;
-        let entry = self.store.get(id)?;
-        let copy = *entry.disk()?;
-        let layout = disk.layout(entry.depth())?;
-        let depth = u32::try_from(entry.depth()).ok()?;
-        let mut staging = disk.staging.take()?;
-        let decoded = (|| {
-            disk.tier.manager.load_state(
-                copy.key,
-                disk.tier.state_fingerprint,
-                &layout,
-                entry.extra_keys(),
-                &mut staging,
-            )?;
-            disk.geometry.decode_from(depth, &staging).ok()
-        })();
-        disk.staging = Some(staging);
+        let decoded = disk.engine.read_into_staging(
+            &self.store,
+            id,
+            |codec, _spans, entry, _copy, staging| {
+                let depth = u32::try_from(entry.depth()).ok()?;
+                codec.geometry.decode_from(depth, staging).ok()
+            },
+        );
         if let Some(anchor) = decoded {
             disk.counters.ssd_hits += 1;
             Some((anchor, true))
@@ -1447,29 +1113,12 @@ impl Inkling2StateStore {
     }
 
     /// Adopt complete `(state blob + 8-layer Global KV chain)` entries from a persistent tier
-    /// on startup using the shared `adopt_states` engine helper.
+    /// on startup using the shared [`StateDiskEngine::adopt_all`].
     pub(crate) fn adopt_all(&mut self) -> u64 {
         let Some(disk) = self.disk.as_mut() else {
             return 0;
         };
-        if !disk.tier.persistent || self.store.entries().next().is_some() {
-            return 0;
-        }
-        let tier = Arc::clone(&disk.tier);
-        let spans = disk.spans.clone();
-        let geometry = disk.geometry_str.clone();
-        let sliding_window = disk.geometry.sliding_window;
-        let cached_bytes = disk.geometry.payload_bytes();
-        let adopted = adopt_states(
-            &mut self.store,
-            &tier,
-            &spans,
-            &geometry,
-            |label: &ColdStateLabel| {
-                let row = u32::try_from(label.tokens.len()).ok()?;
-                Some((cached_bytes, row.saturating_sub(sliding_window)))
-            },
-        );
+        let adopted = disk.engine.adopt_all(&mut self.store, false);
         disk.counters.adopted += adopted;
         adopted
     }
@@ -1753,11 +1402,7 @@ pub(crate) fn open_inkling2_state_disk(
     let global_block_bytes = block_object_bytes(coordinator.full_adapter().layer_kv_pool());
     let disk = Inkling2StateDisk::new(Arc::clone(&tier), geometry, global_block_bytes).ok()?;
     disk.wake_model_on_landing(model_id);
-    let context = ColdTierContext {
-        manager: Arc::clone(&tier.manager),
-        fingerprint: tier.kv_fingerprint,
-        backing: ColdContextBacking::StateOnly,
-    };
+    let context = state_context(&tier);
     Some((context, disk))
 }
 

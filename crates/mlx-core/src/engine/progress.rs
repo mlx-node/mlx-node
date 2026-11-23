@@ -420,11 +420,14 @@ mod tests {
         assert_eq!(open.phase, "slot");
         assert!(open.slot_ms.is_some_and(|ms| ms >= 30.0), "{open:?}");
         sleep_ms(30);
+        let first_prepare = std::time::Instant::now();
         p.enter(Waiting::Prepare);
         sleep_ms(10);
         p.enter(Waiting::Queued);
+        let mut prepare_wall = first_prepare.elapsed();
         assert_eq!(p.snapshot().phase, "queued");
         sleep_ms(40);
+        let second_prepare = std::time::Instant::now();
         p.enter(Waiting::Prepare);
         sleep_ms(10);
         p.restoring(48);
@@ -432,6 +435,7 @@ mod tests {
         assert_eq!(s.phase, "prepare");
         assert_eq!(s.cached_tokens, Some(48), "restoring is kept in prepare");
         p.begin_prefill(100, 48);
+        prepare_wall += second_prepare.elapsed();
 
         let s = p.snapshot();
         assert_eq!(s.phase, "prefill");
@@ -439,8 +443,10 @@ mod tests {
         let prepare = s.prepare_ms.expect("picked up");
         assert!(slot >= 60.0, "slot holds its own span: {s:?}");
         assert!(prepare >= 20.0, "two prepare spans add up: {s:?}");
+        // A sleep can run long on a loaded machine, so the bound is this test's own clock around the two
+        // prepare spans, not the length of another span. 1 ms covers the microsecond rounding of the sums.
         assert!(
-            prepare < slot,
+            prepare <= prepare_wall.as_secs_f64() * 1000.0 + 1.0,
             "the queued span and the slot span are not prepare time: {s:?}"
         );
         assert_eq!(s.wait_ms, wait);

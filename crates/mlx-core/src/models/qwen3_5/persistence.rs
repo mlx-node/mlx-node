@@ -14,11 +14,12 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
-    PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
-    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    ensure_row_major_kquant_layout, has_sym8_mode, is_kquant_mode, merge_per_layer, mode_to_str,
-    normalize_per_layer_key, parse_mode_str, parse_quant_settings, resolve_default_mode,
+    AffineSidecarPromotion, InputAmaxPolicy, PlainFp8Residency, QlBuildSpec, QlTiling,
+    QslBuildSpec, QslFp8Policy, QslSym8Policy, build_ql, build_qsl, default_per_layer_quant,
+    defer_plain_fp8_materialization, effective_plq_for, ensure_affine_biases_present,
+    ensure_dense_weight_floating, ensure_kquant_storage_resolves_kquant,
+    ensure_row_major_kquant_layout, has_kquant_mode, has_sym8_mode, is_kquant_mode,
+    merge_per_layer, mode_to_str, parse_mode_str, parse_quant_settings, resolve_default_mode,
     select_quantization_block,
 };
 use crate::nn::Linear;
@@ -28,25 +29,39 @@ use crate::utils::safetensors::load_safetensors_lazy;
 
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, dequant_fp8_weights,
-    get_config_bool, get_config_f64, get_config_i32, load_checkpoint,
-    prewarm_checkpoint_pages_with, strip_qwen35_vision_weight_prefix,
+    CheckpointLeaseGuard, GgufPreloadGuard, KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES,
+    apply_rename_spec, attach_pool_growth_notifier, dequant_fp8_weights, get_config_bool,
+    get_config_f64, get_config_i32, load_checkpoint, log_gguf_preload_stats, params_weight_bytes,
+    prewarm_checkpoint_pages_with, register_loaded_weights_and_pool, register_thread_memory_waker,
+    spawn_loaded_model_thread, strip_qwen35_vision_weight_prefix,
 };
 use crate::models::clef::head::{HeadConfig, JointHead};
 use crate::utils::gguf_import::GgufPreload;
 
 use super::config::Qwen3_5Config;
-use super::decoder_layer::AttentionType;
+use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner};
+pub use super::persistence_moe::{
+    create_random_qwen35_moe_checkpoint_sync, load_moe_for_tool, load_moe_with_thread,
+};
+#[cfg(test)]
+pub(crate) use super::persistence_moe::{load_moe_tool_source, sanitize_weights_moe};
+pub(crate) use super::persistence_moe::{
+    load_moe_with_source, mtp_expert_keys, parse_moe_config, settled_compute_dtype,
+};
+#[cfg(test)]
+use crate::models::quant_dispatch::ensure_int8_storage_resolves_sym8;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
-    PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    release_tiled_kquant_sources, try_build_affine_quantized_linear_tiled,
-    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear_tiled,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
+    PerLayerQuant, QuantizedSwitchLinear, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, release_tiled_kquant_sources,
 };
+#[cfg(test)]
+use crate::models::quantized_linear::{
+    try_build_quantized_linear, try_build_sym8_quantized_linear,
+};
+use crate::moe::SwitchGLU;
 use crate::vision::qwen::processing::QwenImageProcessor;
 
 const DISABLE_PACKED_QWEN_EMBEDDING_ENV: &str = "MLX_DISABLE_PACKED_QWEN_EMBEDDING";
@@ -264,17 +279,108 @@ pub(crate) static QWEN35_KEY_RENAMES: &[KeyRule] = &[
     },
 ];
 
-/// Norm suffixes eligible for the LM-body +1.0 shift.
+/// Per-layer RMSNorm suffixes shared across Qwen3.5 dense, Qwen3.5 MoE, and
+/// `convert.rs::Qwen35Recipe`.
 /// NOTE: `.linear_attn.norm.weight` is intentionally NOT included here.
 /// It's stored as f32 with final values (e.g. ~0.87), not as shifted weights.
-/// Matches mlx-lm, mlx-vlm, and MoE persistence behavior.
-const QWEN35_NORM_SUFFIXES: [&str; 5] = [
+pub(crate) const QWEN35_LAYER_NORM_SUFFIXES: [&str; 4] = [
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
-    "final_norm.weight",
     ".q_norm.weight",
     ".k_norm.weight",
 ];
+
+/// Whether `name` is an LM-body norm weight eligible for the +1.0 raw-HF shift.
+pub(crate) fn is_qwen35_norm_key(name: &str) -> bool {
+    name.ends_with("final_norm.weight")
+        || QWEN35_LAYER_NORM_SUFFIXES
+            .iter()
+            .any(|sfx| name.ends_with(sfx))
+}
+
+/// Whether `name` is an MTP-head norm weight eligible for the independent +1.0
+/// raw-HF MTP shift.
+pub(crate) fn is_qwen35_mtp_norm_key(name: &str) -> bool {
+    name.starts_with("mtp.")
+        && (name == "mtp.norm.weight"
+            || name.ends_with(".pre_fc_norm_hidden.weight")
+            || name.ends_with(".pre_fc_norm_embedding.weight")
+            || QWEN35_LAYER_NORM_SUFFIXES
+                .iter()
+                .any(|sfx| name.ends_with(sfx)))
+}
+
+/// Transpose an unsanitized HF 3-D conv1d weight `[C, 1, K]` to MLX `[C, K, 1]`
+/// when `name` is a `conv1d.weight` with `shape[2] != 1`.
+pub(crate) fn transpose_conv1d_if_needed(name: &str, array: MxArray) -> Result<MxArray> {
+    if name.contains("conv1d.weight") {
+        let shape = array.shape()?;
+        if shape.len() == 3 && shape[2] != 1 {
+            return array.transpose(Some(&[0, 2, 1]));
+        }
+    }
+    Ok(array)
+}
+
+/// Apply the raw-HF RMSNorm `+1.0` shift to a 1-D norm vector, optionally
+/// upcasting to `Float32` when `preserve_fp32` is true.
+pub(crate) fn shift_norm_plus_one(array: MxArray, preserve_fp32: bool) -> Result<MxArray> {
+    if array.ndim()? != 1 {
+        return Ok(array);
+    }
+    if preserve_fp32 {
+        let one = MxArray::scalar_float(1.0)?;
+        array.astype(DType::Float32)?.add(&one)
+    } else {
+        let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
+        array.add(&one)
+    }
+}
+
+/// Whether any `conv1d.weight` in `params` still has HF `[C, 1, K]` layout
+/// (`shape[-1] != 1`), distinguishing raw HF checkpoints from converted ones.
+pub(crate) fn has_unsanitized_conv1d(params: &HashMap<String, MxArray>) -> bool {
+    params.iter().any(|(name, array)| {
+        if !name.contains("conv1d.weight") {
+            return false;
+        }
+        match array.shape() {
+            Ok(shape) => shape.len() >= 2 && shape[shape.len() - 1] != 1,
+            Err(e) => {
+                warn!("Failed to read shape of conv1d weight '{}': {}", name, e);
+                false
+            }
+        }
+    })
+}
+
+/// Split raw Qwen3.5 / Qwen3.5-MoE checkpoint tensors into
+/// `(text_params, vision_params)`, stripping vision wrapper prefixes.
+pub(crate) fn split_qwen35_vision_text_params(
+    raw_params: HashMap<String, MxArray>,
+) -> (HashMap<String, MxArray>, Option<HashMap<String, MxArray>>) {
+    let has_vision = raw_params
+        .keys()
+        .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
+    if !has_vision {
+        return (raw_params, None);
+    }
+    let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+    let mut text_params: HashMap<String, MxArray> = HashMap::new();
+    for (name, array) in raw_params {
+        if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+            vision_params.insert(vkey.to_string(), array);
+        } else {
+            text_params.insert(name, array);
+        }
+    }
+    info!(
+        "Split: {} vision tensors, {} text tensors",
+        vision_params.len(),
+        text_params.len()
+    );
+    (text_params, Some(vision_params))
+}
 
 /// Value hook: conv1d axis fix (HF stores [channels, 1, kernel_size], we need
 /// [channels, kernel_size, 1] for depthwise conv) plus the +1.0 norm
@@ -294,25 +400,14 @@ fn apply_sanitized_value_transforms(
         let is_mtp_weight = name.starts_with("mtp.");
 
         if name.contains("conv1d.weight") {
-            let shape = value.shape()?;
-            if shape.len() == 3 && shape[2] != 1 {
-                *value = value.transpose(Some(&[0, 2, 1]))?;
-            }
+            *value = transpose_conv1d_if_needed(name, value.clone())?;
         }
 
         // Apply norm +1.0 fix for unsanitized LM-body weights. MTP norms are
         // excluded here (`!is_mtp_weight`) and corrected separately below.
-        let is_norm_suffix = QWEN35_NORM_SUFFIXES.iter().any(|sfx| name.ends_with(sfx));
+        let is_norm_suffix = is_qwen35_norm_key(name);
         let will_shift = needs_norm_fix && !is_mtp_weight && is_norm_suffix;
-        // MTP norm keys: the four shared norm suffixes plus the MTP-only
-        // `mtp.norm.weight` and the two pre-fc norms, none of which are
-        // covered by `norm_suffixes` / the `norm.weight`→`final_norm.weight`
-        // rename.
-        let is_mtp_norm = is_mtp_weight
-            && (name == "mtp.norm.weight"
-                || name.ends_with(".pre_fc_norm_hidden.weight")
-                || name.ends_with(".pre_fc_norm_embedding.weight")
-                || is_norm_suffix);
+        let is_mtp_norm = is_qwen35_mtp_norm_key(name);
         // Capture pre-shift mean for the first layer's norms so the
         // log shows whether the source was already sanitized (mean
         // ≈ 1.0 → DOUBLE-shift hazard) vs unsanitized (mean ≈ 0.0,
@@ -333,20 +428,13 @@ fn apply_sanitized_value_transforms(
         } else {
             None
         };
-        if will_shift && value.ndim()? == 1 {
-            if preserve_fp32_norms {
-                let one = MxArray::scalar_float(1.0)?;
-                *value = value.astype(DType::Float32)?.add(&one)?;
-            } else {
-                let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
-                *value = value.add(&one)?;
-            }
+        if will_shift {
+            *value = shift_norm_plus_one(value.clone(), preserve_fp32_norms)?;
         }
         // Independent MTP-norm correction (see `mtp_norms_need_shift`).
         // Mutually exclusive with `will_shift`, which requires `!is_mtp_weight`.
         if mtp_norms_need_shift && is_mtp_norm && value.ndim()? == 1 {
-            let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
-            *value = value.add(&one)?;
+            *value = shift_norm_plus_one(value.clone(), false)?;
             info!(
                 "Qwen3.5 sanitize_weights: SHIFTING +1 to MTP norm '{}'",
                 name,
@@ -428,93 +516,61 @@ pub(crate) fn mtp_norms_need_shift(
     Ok(need)
 }
 
-/// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
-/// 6. Remove MTP (multi-token prediction) weights
-/// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
-/// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
-fn sanitize_weights(
+/// Shared pre-transform sanitization for Qwen3.5 dense and MoE:
+/// detects raw-HF conv1d layout (`needs_norm_fix`), dequantizes FP8
+/// `weight_scale_inv` pairs, probes raw MTP norms, and runs the shared
+/// declarative `apply_rename_spec` pass.
+pub(crate) fn sanitize_qwen35_common(
     mut params: HashMap<String, MxArray>,
-    config: &Qwen3_5Config,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    preserve_split_projections: bool,
-    preserve_fp32_norms: bool,
-) -> Result<HashMap<String, MxArray>> {
+    tie_word_embeddings: bool,
+    n_mtp_layers: i32,
+    family: &str,
+    log_sample_norm: bool,
+) -> Result<(HashMap<String, MxArray>, bool, bool)> {
     let has_mtp_weights = params.keys().any(|k| k.contains("mtp."));
-    let has_unsanitized_conv1d = params.iter().any(|(name, array)| {
-        if !name.contains("conv1d.weight") {
-            return false;
-        }
-        match array.shape() {
-            Ok(shape) => shape.len() >= 2 && shape[shape.len() - 1] != 1,
-            Err(e) => {
-                warn!("Failed to read shape of conv1d weight '{}': {}", name, e);
-                false
-            }
-        }
-    });
-    // The +1.0 norm shift converts raw-HF Qwen3.5 layernorm weights (mean ~0,
-    // gamma stored in (γ-1) form for numerical stability) into the final form
-    // (mean ~1) the inference kernels expect. We only need it for RAW HF
-    // sources — our own convert pipeline (`mlx convert`) writes norms already
-    // in shifted form, so re-applying the +1 at load time DOUBLE-SHIFTS them
-    // and produces incoherent generation.
-    //
-    // The correct discriminator is `has_unsanitized_conv1d`: HF stores
-    // `linear_attn.conv1d.weight` as `[C, 1, K]` (kernel last == K), while our
-    // convert pipeline transposes it to `[C, K, 1]` (kernel last == 1). So
-    // shape[-1] != 1 ⇒ this is a raw HF source ⇒ norms also need shifting.
-    //
-    // MTP presence must NOT be a signal here. OR'ing in `has_mtp_weights` (on
-    // the assumption "ships MTP heads ⇒ raw HF source") breaks any model the
-    // convert pipeline produces with `mtp.*` retained (e.g.
-    // `qwen3.6-27b-nvfp4-mtp`): convert already shifted the norms, a second
-    // shift at load time double-shifts them, and AR generation produces
-    // garbage tokens. The SHIFTING +1 to norm trace below shows the effect:
-    // pre_mean ≈ 0.98, post_mean ≈ 1.98.
+    let has_unsanitized_conv1d = has_unsanitized_conv1d(&params);
+    // The correct discriminator is `has_unsanitized_conv1d` only — HF stores
+    // `linear_attn.conv1d.weight` as `[C, 1, K]`, while our convert pipeline
+    // transposes it to `[C, K, 1]`. MTP presence must NOT be a signal here:
+    // our convert pipeline ships MTP heads alongside already-shifted norms.
     let needs_norm_fix = has_unsanitized_conv1d;
 
-    info!(
-        "Qwen3.5 sanitize_weights: param_count={} has_mtp_weights={} has_unsanitized_conv1d={} \
-         needs_norm_fix={} (heuristic: has_unsanitized_conv1d only — mtp presence is no longer a signal)",
-        params.len(),
-        has_mtp_weights,
-        has_unsanitized_conv1d,
-        needs_norm_fix,
-    );
-
-    // Sample a norm value pre-shift to verify whether the shift is appropriate.
-    // If `needs_norm_fix` is true but the source's norms are already
-    // sanitized (mean ~1.0 instead of ~0.0), the +1.0 add at line 217 will
-    // DOUBLE-SHIFT them and produce gibberish output. This affects models
-    // converted by us that also preserve `mtp.*` keys.
-    if needs_norm_fix {
-        for (name, array) in &params {
-            if name.ends_with(".input_layernorm.weight") && name.contains("layers.0") {
-                if let (Ok(_shape), Ok(ndim)) = (array.shape(), array.ndim())
-                    && ndim == 1
-                {
-                    let dtype = array.dtype().ok();
-                    info!(
-                        "Qwen3.5 sanitize_weights: SAMPLE norm '{}' dtype={:?} \
-                         pre-shift (will add +1.0 if needs_norm_fix && norm_suffix && !is_mtp)",
-                        name, dtype
-                    );
+    if log_sample_norm {
+        info!(
+            "{family} sanitize_weights: param_count={} has_mtp_weights={} has_unsanitized_conv1d={} \
+             needs_norm_fix={} (heuristic: has_unsanitized_conv1d only — mtp presence is no longer a signal)",
+            params.len(),
+            has_mtp_weights,
+            has_unsanitized_conv1d,
+            needs_norm_fix,
+        );
+        if needs_norm_fix {
+            for (name, array) in &params {
+                if name.ends_with(".input_layernorm.weight") && name.contains("layers.0") {
+                    if let (Ok(_shape), Ok(ndim)) = (array.shape(), array.ndim())
+                        && ndim == 1
+                    {
+                        let dtype = array.dtype().ok();
+                        info!(
+                            "{family} sanitize_weights: SAMPLE norm '{}' dtype={:?} \
+                             pre-shift (will add +1.0 if needs_norm_fix && norm_suffix && !is_mtp)",
+                            name, dtype
+                        );
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
 
     if has_mtp_weights {
         info!(
-            "Qwen3.5: MTP weights detected in checkpoint (config.n_mtp_layers={}). \
+            "{family}: MTP weights detected in checkpoint (config.n_mtp_layers={}). \
              Retaining mtp.* keys for the speculative-decode MTP head.",
-            config.n_mtp_layers
+            n_mtp_layers
         );
     }
 
-    // FP8 dequantization pass — convert FP8 weights to bf16 before further processing.
-    // After all sanitization, FP8 weights are re-quantized to 4-bit affine for memory savings.
     let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
     dequant_fp8_weights(&mut params, DType::BFloat16)?;
     if had_fp8 {
@@ -523,20 +579,17 @@ fn sanitize_weights(
 
     // Independent of `needs_norm_fix`: a checkpoint can pair a shifted body
     // with raw MTP norms (e.g. mlx-community conversions keep `mtp.*` raw).
-    let mtp_norms_need_shift = mtp_norms_need_shift(&params, "Qwen3.5")?;
+    let mtp_norms_need_shift = mtp_norms_need_shift(&params, family)?;
 
     // Declarative key rewrite — drop visual-encoder weights (for VL models),
-    // strip the wrapper prefixes (VL models use `model.language_model.*`,
-    // text-only use `model.*`; the shared longest-first chain keeps raw
-    // VLM-wrapped `model.language_model.model.mtp.*` keys alive — see
-    // `mtp_drafter::strip_wrapper_prefix`), then apply the
-    // embed_tokens/norm renames and the tied `lm_head.*` drop.
+    // strip the wrapper prefixes via the shared longest-first chain, then
+    // apply the embed_tokens/norm renames and the tied `lm_head.*` drop.
     let mut rules: Vec<KeyRule> = Vec::with_capacity(3);
     rules.extend_from_slice(QWEN35_KEY_RENAMES);
-    if config.tie_word_embeddings {
+    if tie_word_embeddings {
         rules.push(KeyRule::DropPrefix("lm_head."));
     }
-    let mut result = apply_rename_spec(
+    let renamed = apply_rename_spec(
         params,
         &RenameSpec {
             raw_rules: QWEN35_RAW_DROPS,
@@ -544,6 +597,28 @@ fn sanitize_weights(
             rules: &rules,
             ..Default::default()
         },
+    )?;
+
+    Ok((renamed, needs_norm_fix, mtp_norms_need_shift))
+}
+
+/// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
+/// 6. Remove MTP (multi-token prediction) weights
+/// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
+/// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
+fn sanitize_weights(
+    params: HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    preserve_split_projections: bool,
+    preserve_fp32_norms: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let (mut result, needs_norm_fix, mtp_norms_need_shift) = sanitize_qwen35_common(
+        params,
+        config.tie_word_embeddings,
+        config.n_mtp_layers,
+        "Qwen3.5",
+        true,
     )?;
 
     apply_sanitized_value_transforms(
@@ -1776,7 +1851,8 @@ fn pin_load_kv_format(
 /// same byte size as the released originals) and add the returned CLEF
 /// residency byte delta: the pre-pass replaces packed backbone groups with
 /// int8 or bf16 arrays of a different size.
-fn apply_weights_inner_with_residency(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_weights_inner_with_residency(
     inner: &mut Qwen35Inner,
     params: &mut HashMap<String, MxArray>,
     config: &Qwen3_5Config,
@@ -1804,10 +1880,14 @@ fn apply_weights_inner_with_residency(
     // (Clairic checkpoints match `mlx_engine.py::PreciseRMSNorm`).
     preserve_fp32_norms: bool,
 ) -> Result<(PlainFp8Residency, i64)> {
+    let is_moe = inner.is_moe();
+    let family = inner.family_name();
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+    let default_gate_plq =
+        is_moe.then(|| super::persistence_moe::compute_moe_gate_default(default_mode));
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
     // The completeness gate at the end judges the CHECKPOINT, so it reads the
     // key set as loaded, not the map after tiled sources were released.
@@ -1851,118 +1931,29 @@ fn apply_weights_inner_with_residency(
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
      -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
-        let plq = resolve_plq_for(&per_layer_quant, prefix, default_plq);
-        // int8 STORAGE with non-sym8 metadata = config drift — fail loud
-        // before the int8 tensor can flow into the affine/mxfp builders.
-        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5")?;
-        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5")?;
-        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5")?;
-        ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5")?;
-        // The per-tensor FP8 activation scale this projection will carry
-        // (threaded below): only the recipe's activation-fp8 sites (attn
-        // q/k/v/o, merged GDN in_proj_qkvz, GDN out_proj) consume one.
-        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0`
-        // AND the weight shape is static-FP8 (mxfp8 8/32 or affine 8/32 — see
-        // `quant_dispatch::admits_static_fp8_activation`), so a stale /
-        // hand-edited / future-recipe config with `input_amax` on a
-        // NON-attn/GDN mxfp8 projection must NOT thread it — else it would
-        // fake-quant a non-site's activations, violating "activation FP8
-        // only on attn/GDN sites".
-        let nk = normalize_per_layer_key(prefix);
-        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
-        let input_amax = if is_site { plq.input_amax } else { None };
-        // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
-        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
-        // K-quant group must never silently fall back, see
-        // `try_build_sym8_quantized_linear`).
-        let built = match plq.mode {
-            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-            PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
-            PerLayerMode::Affine => {
-                // Tiled64 into the affine K-quant contract (`a4g64@t64` /
-                // `a8g64@t64`) on a Metal host, as the K-quant arm below and
-                // before the row merges so both halves share the layout; the
-                // repack keeps MLX's route for f16 companions, uncarried
-                // (bits, group) pairs and odd shapes. A calibrated
-                // activation-fp8 site keeps MLX's affine route, where the
-                // amax is honoured (the contract carries no calibration
-                // state). Tiled prefixes are released from the map once the
-                // layer is installed.
-                let built = if input_amax.is_some() {
-                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-                } else {
-                    try_build_affine_quantized_linear_tiled(
-                        params,
-                        prefix,
-                        plq.group_size,
-                        plq.bits,
-                        &mut tiled_prefixes.borrow_mut(),
-                    )?
-                };
-                // GGUF affine sidecars are f16 (never tiled). Under bf16/f32
-                // activations `quantized_matmul` promotes the call to f32 and
-                // re-casts scales/biases EVERY forward — pre-cast once instead
-                // (bit-identical values, fewer AsType dispatches). Under f16
-                // activations the native f16 path already matches; hoisting
-                // would flip it to f32 and cost MORE casts, so it stays off.
-                built
-                    .map(|mut ql| {
-                        if clef {
-                            ql.promote_affine_sidecars_to_bf16().map(|_| ql)
-                        } else {
-                            ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql)
-                        }
-                    })
-                    .transpose()?
-            }
-            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-            PerLayerMode::Q6K
-            | PerLayerMode::Q4K
-            | PerLayerMode::Q5K
-            | PerLayerMode::Q3K
-            | PerLayerMode::Q2K
-            | PerLayerMode::IQ4NL
-            | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S
-            | PerLayerMode::IQ2XXS
-            | PerLayerMode::IQ2XS
-            | PerLayerMode::IQ2S
-            | PerLayerMode::IQ3XXS
-            | PerLayerMode::IQ1S
-            | PerLayerMode::IQ1M => {
-                // Repack eligible 2-D K-quant projections into the Tiled64
-                // layout for the `_t64` Metal kernels (a Metal host; other
-                // hosts stay row-major). Done here, at the one place every qwen3_5
-                // projection is built, before the row merges: both halves of
-                // a merge then share the layout (the GDN pads its `in_proj_ba`
-                // to whole tiles itself, see `GatedDeltaNet::finalize_after_load`).
-                // Tiled prefixes are recorded so the layer loop can release
-                // the map's row-major originals once the layer is installed.
-                try_build_kquant_quantized_linear_tiled(
-                    params,
-                    prefix,
-                    plq.mode,
-                    plq.layout,
-                    "qwen3_5",
-                    &mut tiled_prefixes.borrow_mut(),
-                )?
-            }
+        let plq = if is_moe {
+            effective_plq_for(prefix, &per_layer_quant, default_plq, default_gate_plq)
+        } else {
+            resolve_plq_for(&per_layer_quant, prefix, default_plq)
         };
-        // Thread the per-tensor FP8 activation scale from the resolved
-        // per-layer quant record onto the built projection. Only calibrated
-        // mxfp8 attention/GDN overrides carry a `Some` amax in config; every
-        // other layer stays `None`, so forward behaviour is unchanged here.
-        // Also thread the normalized config key so the activation-amax
-        // calibration tap can bucket recorded `max|activation|` by projection —
-        // under the SAME site predicate as the consumed amax. A non-site mxfp8
-        // projection (e.g. a uniform-mxfp8 or hand-edited checkpoint's
-        // FFN/lm_head) gets `None` so the tap skips it and calibration never
-        // fake-quants a non-attn/GDN site. (The tap reads mxfp8 projections
-        // only, so a key on a tiled affine site is inert.)
-        let amax_key = is_site.then_some(nk);
-        let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
+        let promote_affine_sidecars = if is_moe {
+            AffineSidecarPromotion::None
+        } else if clef {
+            AffineSidecarPromotion::ToBf16
+        } else {
+            AffineSidecarPromotion::ToF32For(compute_dtype)
+        };
+        let built = build_ql(
+            params,
+            prefix,
+            plq,
+            QlBuildSpec {
+                tiling: QlTiling::TileCollect(&mut tiled_prefixes.borrow_mut()),
+                input_amax: InputAmaxPolicy::ActivationFp8SitesOnly,
+                promote_affine_sidecars,
+                ..QlBuildSpec::standard(family)
+            },
+        )?;
         let built = match built {
             Some(ql) => Some(ql.with_hadamard(prism.and_then(|r| r.projection(prefix)))?),
             None => None,
@@ -1973,6 +1964,32 @@ fn apply_weights_inner_with_residency(
             (Some(ql), Some(transform)) => Some(ql.with_sym8_hadamard(transform.clone())?),
             (built, _) => built,
         };
+        if let Some(linear) = built.as_ref() {
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
+        }
+        Ok(built)
+    };
+
+    let try_build_qsl = |params: &HashMap<String, MxArray>,
+                         prefix: &str|
+     -> Result<Option<QuantizedSwitchLinear>> {
+        let plq = effective_plq_for(prefix, &per_layer_quant, default_plq, default_gate_plq);
+        let built = build_qsl(
+            params,
+            prefix,
+            plq,
+            QslBuildSpec {
+                family: "qwen3_5_moe",
+                validate_storage: true,
+                fp8: QslFp8Policy::Allow,
+                sym8: QslSym8Policy::RejectExplicitOrScaled(&per_layer_quant),
+                nvfp4_only: false,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: None,
+            },
+        )?;
         if let Some(linear) = built.as_ref() {
             plain_fp8_residency
                 .borrow_mut()
@@ -2014,9 +2031,9 @@ fn apply_weights_inner_with_residency(
         // fail loud before the embedding/tied-lm_head sidecars reach a mode that
         // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
         // affine). Mirrors the linear builders' guard on `try_build_ql`.
-        ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5")?;
-        ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5")?;
-        ensure_row_major_kquant_layout(plq, "embedding", "qwen3_5")?;
+        ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, family)?;
+        ensure_affine_biases_present(params, "embedding", plq.mode, family)?;
+        ensure_row_major_kquant_layout(plq, "embedding", family)?;
         // Every inference consumer now carries `Embedding` itself: flat and
         // paged lookup call `forward`, tied logits call `as_linear`, MTP draft /
         // verify gather through `forward`, and VLM text merge does the same.
@@ -2071,24 +2088,52 @@ fn apply_weights_inner_with_residency(
 
     // Final norm
     if let Some(w) = params.get("final_norm.weight") {
-        let w = if preserve_fp32_norms {
-            w.astype(DType::Float32)?
+        if is_moe {
+            inner.final_norm.set_weight(w)?;
         } else {
-            super::sidecar_to_compute_dtype(w, norm_dtype)?
-        };
-        inner.final_norm.set_weight(&w)?;
+            let w = if preserve_fp32_norms {
+                w.astype(DType::Float32)?
+            } else {
+                super::sidecar_to_compute_dtype(w, norm_dtype)?
+            };
+            inner.final_norm.set_weight(&w)?;
+        }
     }
     if preserve_fp32_norms {
         inner.final_norm.set_precise_f32();
     }
 
-    // LM head. The outer `Some(head)` guard preserves the tied-embeddings
-    // path: when `tie_word_embeddings`, `inner.lm_head` is `None` and the head
-    // is never installed even if `lm_head.*` tensors are present. The head
-    // installs through the mode-aware `try_build_ql` dispatch (affine / mxfp8 /
-    // mxfp4 / nvfp4 / sym8) so non-affine quantized heads load, not just affine
-    // — the legacy `Linear::load_quantized` hardcoded affine dequant.
-    if let Some(ref mut head) = inner.lm_head {
+    // LM head. For dense checkpoints the outer `Some(head)` guard preserves
+    // the tied-embeddings path: when `tie_word_embeddings`, `inner.lm_head` is
+    // `None` and the head is never installed even if `lm_head.*` tensors are
+    // present. For MoE checkpoints, a quantized `lm_head` installs directly
+    // into `inner.lm_head` (matching pre-merge `qwen3_5_moe/persistence.rs`;
+    // real tied MoE checkpoints strip `lm_head.*` during `sanitize_weights_moe`).
+    // Both paths install through the mode-aware `try_build_ql` dispatch
+    // (affine / mxfp8 / mxfp4 / nvfp4 / sym8) so non-affine quantized heads
+    // load, not just affine — the legacy `Linear::load_quantized` hardcoded
+    // affine dequant.
+    if is_moe {
+        if is_quantized {
+            if let Some(ql) = try_build_ql(params, "lm_head")? {
+                inner.lm_head = Some(crate::models::quantized_linear::LinearProj::Quantized(ql));
+                release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
+                info!("Loaded quantized lm_head (mode-aware, quantized_matmul on forward)");
+            } else if let Some(ref mut head) = inner.lm_head
+                && let Some(w) = params.get("lm_head.weight")
+            {
+                // Dense fallback (no `.scales`) — same stripped-quant-group
+                // dtype guard as the embedding above.
+                ensure_dense_weight_floating("lm_head.weight", w)?;
+                head.set_weight(w, "lm_head")?;
+            }
+        } else if let Some(ref mut head) = inner.lm_head
+            && let Some(w) = params.get("lm_head.weight")
+        {
+            ensure_dense_weight_floating("lm_head.weight", w)?;
+            head.set_weight(w, "lm_head")?;
+        }
+    } else if let Some(ref mut head) = inner.lm_head {
         if let Some(ql) = try_build_ql(params, "lm_head")? {
             head.set_quantized(ql);
             release_tiled_kquant_sources(params, &mut tiled_prefixes.borrow_mut());
@@ -2410,7 +2455,7 @@ fn apply_weights_inner_with_residency(
 
         // Dense MLP weights
         match &mut layer.mlp {
-            MLPVariant::Standard(mlp) => {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 if is_quantized {
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
@@ -2465,24 +2510,182 @@ fn apply_weights_inner_with_residency(
                     mlp.finalize_gate_up()?;
                 }
             }
-            MLPVariant::Quantized { .. } => {}
+            MLPType::Dense(MLPVariant::Quantized { .. }) => {}
+            MLPType::MoE(moe) => {
+                if is_quantized {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
+                        moe.set_quantized_gate(ql);
+                    } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
+                        moe.set_gate_weight(w)?;
+                    }
+
+                    let gate_proj_key = format!("{}.mlp.switch_mlp.gate_proj", prefix);
+                    let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
+                    let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
+
+                    let q_gate = try_build_qsl(params, &gate_proj_key)?;
+                    let q_up = try_build_qsl(params, &up_proj_key)?;
+                    let q_down = try_build_qsl(params, &down_proj_key)?;
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                        let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
+                        moe.set_switch_mlp(quantized_switch);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", gate_proj_key), w)?;
+                            moe.set_switch_mlp_gate_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", up_proj_key), w)?;
+                            moe.set_switch_mlp_up_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", down_proj_key), w)?;
+                            moe.set_switch_mlp_down_proj_weight(w);
+                        }
+                    }
+
+                    let se_gate_key = format!("{}.mlp.shared_expert.gate_proj", prefix);
+                    let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
+                    let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
+
+                    let q_se_gate = try_build_ql(params, &se_gate_key)?;
+                    let q_se_up = try_build_ql(params, &se_up_key)?;
+                    let q_se_down = try_build_ql(params, &se_down_key)?;
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
+                        moe.set_quantized_shared_expert(qg, qu, qd)?;
+                        if moe.finalize_grouped_layout()? {
+                            tiled_prefixes.borrow_mut().extend([
+                                gate_proj_key.clone(),
+                                up_proj_key.clone(),
+                                down_proj_key.clone(),
+                            ]);
+                        }
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_gate_key), w)?;
+                            moe.set_shared_expert_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_up_key), w)?;
+                            moe.set_shared_expert_up_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_down_key), w)?;
+                            moe.set_shared_expert_down_proj_weight(w)?;
+                        }
+                    }
+
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))?
+                    {
+                        moe.set_quantized_shared_expert_gate(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
+                        moe.set_gate_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_gate_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_up_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_switch_mlp_down_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_up_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_down_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                }
+            }
         }
 
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-            let w = if preserve_fp32_norms {
-                w.astype(DType::Float32)?
+            if is_moe {
+                layer.set_input_layernorm_weight_raw(w)?;
             } else {
-                w.clone()
-            };
-            layer.set_input_layernorm_weight(&w, norm_dtype)?;
+                let w = if preserve_fp32_norms {
+                    w.astype(DType::Float32)?
+                } else {
+                    w.clone()
+                };
+                layer.set_input_layernorm_weight(&w, norm_dtype)?;
+            }
         }
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-            let w = if preserve_fp32_norms {
-                w.astype(DType::Float32)?
+            if is_moe {
+                layer.set_post_attention_layernorm_weight_raw(w)?;
             } else {
-                w.clone()
-            };
-            layer.set_post_attention_layernorm_weight(&w, norm_dtype)?;
+                let w = if preserve_fp32_norms {
+                    w.astype(DType::Float32)?
+                } else {
+                    w.clone()
+                };
+                layer.set_post_attention_layernorm_weight(&w, norm_dtype)?;
+            }
         }
         if preserve_fp32_norms {
             layer.set_precise_f32_norms();
@@ -2501,28 +2704,44 @@ fn apply_weights_inner_with_residency(
     // The speculative-decode loop is the only intended caller of
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
+    let moe_config_ref = inner.moe_config.as_ref();
+    let mtp_body = if is_moe {
+        super::mtp::Qwen3_5MTPModule::mtp_mlp_variant(config, moe_config_ref)
+    } else {
+        crate::models::mtp_drafter::DrafterBodyVariant::Dense
+    };
     if let Some(mtp) = inner.mtp.as_mut() {
-        if has_sym8_mode(top_level_mode, &per_layer_quant) {
+        let mtp_blocked_by_quant = has_sym8_mode(top_level_mode, &per_layer_quant)
+            || (is_moe && has_kquant_mode(top_level_mode, &per_layer_quant));
+        if mtp_blocked_by_quant {
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
-                 supported on the sym8 path; disabling speculative MTP.",
+                "{}: imported-quant checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on this quant path; disabling speculative MTP.",
+                if is_moe { "Qwen3.5-MoE" } else { "Qwen3.5" },
                 config.n_mtp_layers
             );
         } else {
             let missing_mtp = crate::models::mtp_drafter::missing_required_mtp_keys(
                 params,
-                crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+                mtp_body,
                 config.n_mtp_layers,
             );
             if missing_mtp.is_empty() {
-                mtp.apply_weights(params, default_plq, &per_layer_quant, compute_dtype)?;
+                mtp.apply_weights(
+                    params,
+                    default_plq,
+                    default_gate_plq,
+                    &per_layer_quant,
+                    compute_dtype,
+                )?;
                 inner.mtp_weights_loaded = true;
             } else {
                 inner.mtp_weights_loaded = false;
                 warn!(
-                    "Qwen3.5 config declares {} MTP layer(s), but MTP weights are incomplete; \
+                    "{} config declares {} MTP layer(s), but MTP weights are incomplete; \
                      disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                    if is_moe { "Qwen3.5-MoE" } else { "Qwen3.5" },
                     config.n_mtp_layers,
                     &missing_mtp[..missing_mtp.len().min(12)],
                     missing_mtp.len()
@@ -2532,7 +2751,7 @@ fn apply_weights_inner_with_residency(
     }
 
     // Validate mandatory weights
-    validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len())?;
+    validate_mandatory_weights(&checkpoint_keys, config, inner.layers.len(), is_moe)?;
 
     Ok((plain_fp8_residency.into_inner(), clef_byte_delta))
 }
@@ -2544,6 +2763,7 @@ fn validate_mandatory_weights(
     keys: &std::collections::HashSet<String>,
     config: &Qwen3_5Config,
     num_layers: usize,
+    is_moe: bool,
 ) -> Result<()> {
     let mut missing_mandatory = Vec::new();
     if !keys.contains("embedding.weight") {
@@ -2552,7 +2772,10 @@ fn validate_mandatory_weights(
     if !keys.contains("final_norm.weight") {
         missing_mandatory.push("final_norm.weight".to_string());
     }
-    if !config.tie_word_embeddings && !keys.contains("lm_head.weight") {
+    if !config.tie_word_embeddings
+        && !keys.contains("lm_head.weight")
+        && !(is_moe && keys.contains("lm_head.scales"))
+    {
         missing_mandatory.push("lm_head.weight".to_string());
     }
 
@@ -2571,7 +2794,12 @@ fn validate_mandatory_weights(
             layers_missing_attn.push(i);
         }
         let has_mlp = keys.contains(&format!("{}.mlp.gate_proj.weight", prefix))
-            || keys.contains(&format!("{}.mlp.gate_proj.scales", prefix));
+            || keys.contains(&format!("{}.mlp.gate_proj.scales", prefix))
+            || (is_moe
+                && (keys.contains(&format!("{}.mlp.gate.weight", prefix))
+                    || keys.contains(&format!("{}.mlp.gate.scales", prefix))
+                    || keys.contains(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    || keys.contains(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix))));
         if !has_mlp {
             layers_missing_mlp.push(i);
         }
@@ -2646,16 +2874,14 @@ pub async fn load_for_tool(
     kv_format: Option<crate::transformer::KvFormat>,
     activations: crate::transformer::Activations,
 ) -> Result<Qwen3_5Model> {
-    let source = CheckpointSource::resolve(
+    let lease = CheckpointLeaseGuard::resolve(
         Path::new(model_path),
         crate::utils::gguf::NativeGgufFamily::Qwen35,
     )
     .await?;
-    let loaded = load_tool_source(&source, kv_format, activations).await;
-    if loaded.is_err() {
-        source.release_lease();
-    }
-    loaded
+    let loaded = load_tool_source(lease.source(), kv_format, activations).await?;
+    lease.commit();
+    Ok(loaded)
 }
 
 /// Load mode for Qwen3.5 dense checkpoints.
@@ -2947,9 +3173,9 @@ pub(crate) fn check_clairic_assets(source: &CheckpointSource) -> Result<()> {
 /// `ClairicProcessor(path, tokenizer, VISION_MAX_PIXELS)` (`backend.py:1711-1720`).
 fn load_clairic_image_processor_config(
     dir: &Path,
-) -> crate::models::paddleocr_vl::processing::ImageProcessorConfig {
+) -> crate::vision::processing::ImageProcessorConfig {
     let mut cfg = crate::vision::qwen::processing::qwen35_vl_processor_config();
-    let max_cap = crate::models::clairic::settings::VISION_MAX_PIXELS as i32;
+    let max_cap = mlx_clairic::settings::VISION_MAX_PIXELS as i32;
     cfg.min_pixels = 65_536;
     cfg.max_pixels = max_cap;
 
@@ -3095,7 +3321,26 @@ async fn load_with_thread_impl(
         disk.cache_disk,
     );
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
+    let (
+        thread,
+        (
+            config,
+            model_id,
+            image_processor,
+            spatial_merge_size,
+            clairic_profile,
+            _tokenizer,
+            guards,
+            paged_active,
+            scheduled_lanes,
+            mtp_active,
+            vision_active,
+            context_limits,
+            warmup,
+            state_tier,
+        ),
+    ) = spawn_loaded_model_thread(
+        "Model thread exited during load",
         move || {
             let path = Path::new(&model_path);
 
@@ -3202,8 +3447,7 @@ async fn load_with_thread_impl(
                 // of embedding it in the main model shards. When present, prefer
                 // the sidecar and drop embedded MTP tensors so key normalization
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
-                let _free_released =
-                    crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
+                let _free_released = GgufPreloadGuard::enter(preload_input.is_some());
                 let mut streamed_params = HashMap::new();
                 let mut clef_layers_finalized = 0usize;
                 let mut prepared_clef = None;
@@ -3277,17 +3521,7 @@ async fn load_with_thread_impl(
                     None => None,
                 };
                 if let Some(preload) = preload.as_ref() {
-                    let stats = &preload.stats;
-                    info!(
-                        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
-                         {} GPU-repacked and {} other tensors",
-                        stats.bytes,
-                        stats.preload_secs,
-                        stats.read_secs,
-                        if stats.nocache { "off" } else { "on" },
-                        stats.gpu_tensors,
-                        stats.cpu_tensors,
-                    );
+                    log_gguf_preload_stats(&preload.stats);
                 }
                 let planes_arrays = preload
                     .as_mut()
@@ -3387,35 +3621,18 @@ async fn load_with_thread_impl(
                 }
 
                 // Split vision/text weights
-                let has_vision = raw_params
-                    .keys()
-                    .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
-                if prism_config.is_some() && has_vision {
+                if prism_config.is_some()
+                    && raw_params
+                        .keys()
+                        .any(|k| strip_qwen35_vision_weight_prefix(k).is_some())
+                {
                     return Err(Error::from_reason(
                         "prism_hadamard checkpoints are text-only (vision weights present)",
                     ));
                 }
 
-                let (text_raw_params, vision_params) = if has_vision {
-                    let mut vision_params: HashMap<String, MxArray> = HashMap::new();
-                    let mut text_params: HashMap<String, MxArray> = HashMap::new();
-                    for (name, array) in raw_params {
-                        if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
-                            let vkey = vkey.to_string();
-                            vision_params.insert(vkey, array);
-                        } else {
-                            text_params.insert(name, array);
-                        }
-                    }
-                    info!(
-                        "Split: {} vision tensors, {} text tensors",
-                        vision_params.len(),
-                        text_params.len()
-                    );
-                    (text_params, Some(vision_params))
-                } else {
-                    (raw_params, None)
-                };
+                let (text_raw_params, vision_params) = split_qwen35_vision_text_params(raw_params);
+                let has_vision = vision_params.is_some();
 
                 // Sanitize weights
                 let mut params = sanitize_weights(
@@ -3509,10 +3726,7 @@ async fn load_with_thread_impl(
                 // so the map afterwards under-counts the resident weights.
                 // `saturating_add` guards against overflow on a corrupted
                 // checkpoint.
-                let text_weight_bytes: u64 = params
-                    .values()
-                    .map(|a| a.nbytes() as u64)
-                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                let text_weight_bytes = params_weight_bytes(&params);
 
                 let clef_residency = clef.then(|| {
                     resolve_clef_residency(quantized, unsafe {
@@ -3580,9 +3794,7 @@ async fn load_with_thread_impl(
                         round_bf16,
                     )?;
                     inner.clairic_profile = Some(
-                        crate::models::clairic::profile::ClairicProfile::from_head_config(
-                            head.config(),
-                        ),
+                        mlx_clairic::profile::ClairicProfile::from_head_config(head.config()),
                     );
                     inner.clairic_head = Some(head);
                 }
@@ -3631,20 +3843,13 @@ async fn load_with_thread_impl(
                     let eos_id = tok
                         .token_to_id("<|im_end|>".to_string())
                         .unwrap_or_else(|| tok.get_eos_token_id());
-                    let grammar_engine = if eos_id == tok.get_eos_token_id() {
-                        crate::grammar::GrammarEngine::from_qwen3_tokenizer(
-                            tok,
-                            config.vocab_size as usize,
-                            vec![eos_id],
-                        )?
-                    } else {
-                        crate::grammar::GrammarEngine::new(
-                            tok.inner_arc(),
-                            config.vocab_size as usize,
-                            eos_id,
-                            vec![eos_id],
-                        )?
-                    };
+                    let grammar_engine = mlx_clairic::grammar::GrammarEngine::new(
+                        tok.inner_arc(),
+                        config.vocab_size as usize,
+                        eos_id,
+                        vec![eos_id],
+                    )
+                    .map_err(crate::models::clairic::to_napi_err)?;
                     inner.clairic_grammar = Some(Arc::new(grammar_engine));
                 }
 
@@ -3749,10 +3954,7 @@ async fn load_with_thread_impl(
                     weight_bytes = weight_bytes.saturating_add(head.nbytes());
                 }
                 if let Some(ref vparams) = vision_params {
-                    weight_bytes = vparams
-                        .values()
-                        .map(|a| a.nbytes() as u64)
-                        .fold(weight_bytes, |acc, v| acc.saturating_add(v));
+                    weight_bytes = weight_bytes.saturating_add(params_weight_bytes(vparams));
                 }
                 // The raw Uint8 weights + scales are already in `params`.
                 // Count only the retained BF16 correctness fallback arrays.
@@ -3815,19 +4017,16 @@ async fn load_with_thread_impl(
             let (mut inner, weight_bytes, pool_cache_limit_guard) = load_result?;
             #[cfg(test)]
             planes_real_tests::run_loaded_hook(&mut inner)?;
-            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let guards = register_loaded_weights_and_pool(weight_bytes, 0, pool_cache_limit_guard);
             // Dynamic (grow-on-demand) pools re-register their byte total on
             // every grow. The closure captures only the guard's id (Copy), so
             // the guard itself stays on this model for its whole lifetime —
             // the coordinator entry must outlive every grow the adapter makes.
             if let (Some(guard), Some(adapter)) = (
-                pool_cache_limit_guard.as_ref(),
+                guards.pool_cache_limit.as_ref(),
                 inner.paged_adapter.as_mut(),
             ) {
-                let pool_id = guard.id();
-                adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
-                    crate::cache_limit::coordinator().update_pool(pool_id, bytes);
-                })));
+                attach_pool_growth_notifier(adapter, guard);
             }
 
             let model_id = inner.model_id;
@@ -3868,8 +4067,7 @@ async fn load_with_thread_impl(
                     spatial_merge_size,
                     clairic_profile,
                     tokenizer_out,
-                    cache_limit_guard,
-                    pool_cache_limit_guard,
+                    guards,
                     paged_active,
                     scheduled_lanes,
                     mtp_active,
@@ -3881,30 +4079,9 @@ async fn load_with_thread_impl(
             ))
         },
         |state, receiver| state.drive(receiver),
-    );
-
-    let (
-        config,
-        model_id,
-        image_processor,
-        spatial_merge_size,
-        clairic_profile,
-        _tokenizer,
-        cache_limit_guard,
-        pool_cache_limit_guard,
-        paged_active,
-        scheduled_lanes,
-        mtp_active,
-        vision_active,
-        context_limits,
-        warmup,
-        state_tier,
-    ) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
-    if let Some(sender) = thread.cmd_sender() {
-        crate::engine::model_command::register_memory_waker(model_id, &sender);
-    }
+    )
+    .await?;
+    register_thread_memory_waker(model_id, &thread);
 
     Ok(Qwen3_5Model {
         thread,
@@ -3921,8 +4098,8 @@ async fn load_with_thread_impl(
         model_assets_path,
         state_tier,
         cache_limit_guards: std::sync::Mutex::new(Some((
-            cache_limit_guard,
-            pool_cache_limit_guard,
+            guards.cache_limit,
+            guards.pool_cache_limit,
         ))),
     })
 }
@@ -4408,7 +4585,7 @@ mod tests {
         assert_eq!(proc_cfg.min_pixels, 65_536);
         assert_eq!(
             proc_cfg.max_pixels,
-            crate::models::clairic::settings::VISION_MAX_PIXELS as i32
+            mlx_clairic::settings::VISION_MAX_PIXELS as i32
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -4825,12 +5002,12 @@ mod tests {
         );
         assert!(!live.contains_key(&format!("{p}.down_proj.weight")));
 
-        let MLPVariant::Quantized {
+        let MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
             ..
-        } = &inner.layers[0].mlp
+        }) = &inner.layers[0].mlp
         else {
             panic!("layer 0 MLP must be quantized");
         };
@@ -5104,12 +5281,12 @@ mod tests {
         assert!(live.contains_key("layers.1.linear_attn.in_proj_qkvz.weight"));
 
         for (layer, decoder) in inner.layers.iter().enumerate().take(2) {
-            let MLPVariant::Quantized {
+            let MLPType::Dense(MLPVariant::Quantized {
                 gate_proj,
                 up_proj,
                 down_proj,
                 ..
-            } = &decoder.mlp
+            }) = &decoder.mlp
             else {
                 panic!("layer {layer} MLP must be quantized");
             };
@@ -5176,9 +5353,9 @@ mod tests {
             let reference = |name: &str, bits: i32| {
                 try_build_quantized_linear(&params, name, 64, bits).unwrap()
             };
-            let MLPVariant::Quantized {
+            let MLPType::Dense(MLPVariant::Quantized {
                 gate_proj, up_proj, ..
-            } = &inner.layers[0].mlp
+            }) = &inner.layers[0].mlp
             else {
                 unreachable!()
             };
@@ -7422,18 +7599,18 @@ mod tests {
         assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
         assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
         match &layer.mlp {
-            MLPVariant::Quantized {
+            MLPType::Dense(MLPVariant::Quantized {
                 gate_proj,
                 up_proj,
                 down_proj,
                 gate_up,
-            } => {
+            }) => {
                 for ql in [gate_proj, up_proj, down_proj] {
                     assert_eq!(ql.mode(), sym8);
                 }
                 assert!(gate_up.is_none(), "sym8 projections never row-merge");
             }
-            MLPVariant::Standard(_) => panic!("layer 0 MLP must be quantized"),
+            _ => panic!("layer 0 MLP must be quantized"),
         }
     }
 
@@ -7654,11 +7831,11 @@ mod tests {
         assert_eq!(gdn.in_proj_modes(), (Some(sym8.clone()), None, None));
         assert_eq!(gdn.out_proj_mode(), Some(sym8.as_str()));
         match &layer.mlp {
-            MLPVariant::Standard(mlp) => {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 assert_eq!(mlp.get_gate_proj_weight().dtype().unwrap(), DType::BFloat16);
                 assert_eq!(mlp.get_down_proj_weight().dtype().unwrap(), DType::BFloat16);
             }
-            MLPVariant::Quantized { .. } => panic!("a mixed MLP must install dense"),
+            _ => panic!("a mixed MLP must install dense"),
         }
     }
 
@@ -8026,7 +8203,7 @@ mod tests {
         assert_eq!(gdn.prism_hadamard_sites(), (true, false, false, false));
         // gate/up K=1024 rotate; down K=128 does not.
         assert_eq!(layer.mlp.has_hadamard(), Some((true, true, false)));
-        if let MLPVariant::Quantized { gate_up, .. } = &layer.mlp {
+        if let MLPType::Dense(MLPVariant::Quantized { gate_up, .. }) = &layer.mlp {
             assert!(gate_up.is_none(), "sym8 projections never row-merge");
         } else {
             panic!("layer 0 MLP must be quantized");

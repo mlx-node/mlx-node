@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+pub(crate) use crate::models::qwen3_5::config::Qwen35MoeParams;
+
 /// Qwen3.5 MoE model configuration.
 ///
 /// Contains all fields including MoE-specific ones (num_experts, etc.).
@@ -148,15 +150,10 @@ impl Qwen3_5MoeConfig {
         self.rope_scaling.unwrap_or_default()
     }
 
-    /// Tokens per paged KV block; also the granularity of DFlash2 prefix
-    /// accounting.
-    pub(crate) fn paged_block_size(&self) -> u32 {
-        self.paged_block_size.unwrap_or(16)
-    }
-
     /// BF16 bytes for one request's complete GDN conv + recurrent state.
     /// The MoE feed-forward layers are stateless; full-attention K/V is
     /// accounted independently by the paged allocator.
+    #[cfg(test)]
     pub(crate) fn recurrent_state_bytes(&self) -> u64 {
         self.to_dense_config().recurrent_state_bytes()
     }
@@ -166,6 +163,7 @@ impl Qwen3_5MoeConfig {
     /// outputs with their unsort and weighting copies, the shared expert's
     /// gate / up / SwiGLU (all bf16), and the router's bf16 logits and f32
     /// probabilities.
+    #[cfg(test)]
     pub(crate) fn decode_row_expert_bytes(&self) -> u64 {
         let dim = |v: i32| v.max(0) as u64;
         let top_k = dim(self.num_experts_per_tok);
@@ -184,6 +182,27 @@ impl Qwen3_5MoeConfig {
         elements
             .saturating_mul(2)
             .saturating_add(dim(self.num_experts).saturating_mul(6))
+    }
+
+    /// Extract the 7 MoE-specific fields into a [`Qwen35MoeParams`] handle.
+    #[allow(dead_code)]
+    pub(crate) fn moe_params(&self) -> Qwen35MoeParams {
+        Qwen35MoeParams {
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            decoder_sparse_step: self.decoder_sparse_step,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            mlp_only_layers: self.mlp_only_layers.clone(),
+        }
+    }
+
+    /// Split this MoE config into its dense base [`Qwen3_5Config`] plus
+    /// [`Qwen35MoeParams`].
+    #[allow(dead_code)]
+    pub(crate) fn split(&self) -> (crate::models::qwen3_5::Qwen3_5Config, Qwen35MoeParams) {
+        (self.to_dense_config(), self.moe_params())
     }
 
     /// Convert to a dense Qwen3_5Config for shared types (attention, GatedDeltaNet)

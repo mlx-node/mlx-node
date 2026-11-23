@@ -29,64 +29,48 @@ R"cuda(
 #include <cuda_fp16.h>
 
 __device__ __forceinline__ void q8p_cp16(void* smem_ptr, const void* glob_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(addr), "l"(glob_ptr) : "memory");
+  ptx_cp_async16_cg(smem_ptr, glob_ptr);
 }
 
 __device__ __forceinline__ void q8p_cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::: "memory");
+  ptx_cp_commit();
 }
 
 template <int N>
 __device__ __forceinline__ void q8p_cp_wait() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+  ptx_cp_wait<N>();
 }
 
 __device__ __forceinline__ void q8p_ldm4(
     unsigned int& a0, unsigned int& a1, unsigned int& a2, unsigned int& a3,
     const void* smem_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-               : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+  ptx_ldmatrix_x4(a0, a1, a2, a3, smem_ptr);
 }
 
 __device__ __forceinline__ void q8p_ldm2(
     unsigned int& b0, unsigned int& b1, const void* smem_ptr) {
-  unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-               : "=r"(b0), "=r"(b1) : "r"(addr));
+  ptx_ldmatrix_x2(b0, b1, smem_ptr);
 }
 
 __device__ __forceinline__ void q8p_mma_s8_z(
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1,
     int& d0, int& d1, int& d2, int& d3) {
-  int z = 0;
-  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %10, %10, %10};"
-      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z));
+  ptx_mma_m16n8k32_s8_z(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3);
 }
 
 __device__ __forceinline__ void q8p_mma_bf16_z(
     float& d0, float& d1, float& d2, float& d3,
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1) {
-  float z = 0.0f;
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %10, %10, %10};"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(z));
+  ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ void q8p_mma_bf16(
     float& d0, float& d1, float& d2, float& d3,
     unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
     unsigned int b0, unsigned int b1) {
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+  ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ unsigned int q8p_s8x2_to_bf16x2(unsigned int p16) {

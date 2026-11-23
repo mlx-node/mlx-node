@@ -11,26 +11,21 @@ use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights,
-    load_all_safetensors, prewarm_checkpoint_pages,
+    load_all_safetensors, params_weight_bytes, parse_generation_defaults, prewarm_checkpoint_pages,
+    register_loaded_weights_and_pool, spawn_loaded_model_thread,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, default_per_layer_quant, dense_mlp_is_quantized,
-    dense_mlp_proj_bases, effective_plq_for, ensure_affine_biases_present,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    PerLayerMode, PerLayerQuant, QlBuildSpec, QlFp8Policy, QlSym8Policy, QlTiling, QslBuildSpec,
+    QslFp8Policy, QslSym8Policy, build_ql, build_qsl, default_per_layer_quant,
+    dense_mlp_is_quantized, dense_mlp_proj_bases, effective_plq_for, ensure_dense_weight_floating,
     has_sym8_mode, load_dense_mlp_variant, load_embedding_affine_or_bf16,
     load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint, try_build_kquant_quantized_linear,
-    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
 };
-use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
-use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
+use crate::moe::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
 use crate::nn::Linear;
@@ -52,54 +47,20 @@ fn build_lfm2_qsl(
 ) -> Result<Option<QuantizedSwitchLinear>> {
     // Experts are never gate-prefixed, so `gate_default = None` is fine here.
     let plq = effective_plq_for(prefix, per_layer_quant, default_plq, None);
-    // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
-    // the int8 stack can flow into the affine/mxfp QSL builders.
-    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_affine_biases_present(params, prefix, plq.mode, "lfm2_moe")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: expert projection '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
-        PerLayerMode::Affine => {
-            try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
-        }
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::Q2K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S
-        | PerLayerMode::IQ2XXS
-        | PerLayerMode::IQ2XS
-        | PerLayerMode::IQ2S
-        | PerLayerMode::IQ3XXS
-        | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
-            params, prefix, plq.mode, plq.layout, "lfm2_moe",
-        )?,
-        // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
-        // (`gather_qmm` has no sym8 pack). Convert force-emits affine-8
-        // per-layer overrides for experts under a sym8 default, so resolving
-        // sym8 here means a malformed/hand-edited checkpoint — loading the
-        // int8 stack as another pack would emit garbage.
-        PerLayerMode::Sym8 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: expert projection '{prefix}' resolved to sym8 quantization, but 3-D \
-                 stacked experts have no sym8 kernel (convert force-emits affine-8 overrides for \
-                 experts under a sym8 default) — malformed checkpoint, refusing to load"
-            )));
-        }
-    })
+    build_qsl(
+        params,
+        prefix,
+        plq,
+        QslBuildSpec {
+            family: "lfm2_moe",
+            validate_storage: true,
+            fp8: QslFp8Policy::RejectDgxOnly,
+            sym8: QslSym8Policy::RejectLfm2,
+            nvfp4_only: false,
+            affine_optional_outer_scale: false,
+            nvfp4_outer_scale: None,
+        },
+    )
 }
 
 /// Build the quantized router-gate QuantizedLinear for `prefix`.
@@ -118,55 +79,19 @@ fn build_lfm2_gate_ql(
         .get(prefix)
         .copied()
         .unwrap_or(default_gate_plq);
-    // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
-    // the int8 tensor can flow into the affine/mxfp builders.
-    ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_affine_biases_present(params, prefix, plq.mode, "lfm2_moe")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: router gate '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
-        PerLayerMode::Affine => {
-            try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-        }
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::Q2K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S
-        | PerLayerMode::IQ2XXS
-        | PerLayerMode::IQ2XS
-        | PerLayerMode::IQ2S
-        | PerLayerMode::IQ3XXS
-        | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => {
-            // The router gate is a small 2-D linear (N = num_experts), never
-            // tileable; the plain builder honours a (never emitted) marker.
-            try_build_kquant_quantized_linear(params, prefix, plq.mode, plq.layout, "lfm2_moe")?
-        }
-        // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert
-        // (it force-emits a per-layer override for `*.feed_forward.gate` under
-        // a sym8 default — `default_gate_plq` is affine too), so resolving
-        // sym8 here means a malformed/hand-edited checkpoint.
-        PerLayerMode::Sym8 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: router gate '{prefix}' resolved to sym8 quantization, but the router \
-                 gate has no sym8 dispatch (convert force-emits an affine-8 override for it \
-                 under a sym8 default) — malformed checkpoint, refusing to load"
-            )));
-        }
-    })
+    build_ql(
+        params,
+        prefix,
+        plq,
+        QlBuildSpec {
+            fp8: QlFp8Policy::Reject {
+                role: "router gate",
+            },
+            sym8: QlSym8Policy::RejectRouterGate,
+            tiling: QlTiling::None,
+            ..QlBuildSpec::standard("lfm2_moe")
+        },
+    )
 }
 
 /// LFM2 family tag for the shared non-MoE loader helpers in
@@ -350,21 +275,8 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     config.routed_scaling_factor = raw.get("routed_scaling_factor").and_then(|v| v.as_f64());
 
     // Parse eos_token_id from generation_config.json if available
-    let gen_config_path = model_path.join("generation_config.json");
-    if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
-        && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
-    {
-        // Override eos_token_id if present
-        if let Some(eos) = gen_val.get("eos_token_id") {
-            if let Some(id) = eos.as_i64() {
-                config.eos_token_id = id as i32;
-            } else if let Some(arr) = eos.as_array() {
-                // Use the first EOS token ID
-                if let Some(first) = arr.first().and_then(|v| v.as_i64()) {
-                    config.eos_token_id = first as i32;
-                }
-            }
-        }
+    if let Some(&first_eos) = parse_generation_defaults(model_path).eos_token_ids.first() {
+        config.eos_token_id = first_eos as i32;
     }
 
     // NOTE: the `use_block_paged_cache` default is NOT resolved here. Quant-ness
@@ -1178,10 +1090,7 @@ fn compute_weight_bytes(params: &HashMap<String, MxArray>, _config: &Lfm2Config)
     // Resident footprint = packed bytes of every checkpoint tensor. All
     // quantized lfm2 tensor classes (non-MoE linears, MoE experts, embedding)
     // are packed-only resident, so there is no dense dequant copy to add.
-    params
-        .values()
-        .map(|a| a.nbytes() as u64)
-        .fold(0u64, |acc, v| acc.saturating_add(v))
+    params_weight_bytes(params)
 }
 
 impl Lfm2Inner {
@@ -1376,7 +1285,8 @@ impl Lfm2Model {
     pub async fn load_from_dir(model_path: &str) -> Result<Self> {
         let model_path = model_path.to_string();
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
+        let (thread, (config, guards, paged_active)) = spawn_loaded_model_thread(
+            "Model thread exited during load",
             move || {
                 // `Lfm2Inner::load_from_dir` returns a deterministic
                 // weight-byte total alongside the inner; register it
@@ -1384,35 +1294,29 @@ impl Lfm2Model {
                 // active-memory sampling — the deterministic path is
                 // race-free against concurrent inference. See
                 // `cache_limit.rs` module docs.
-                let (inner, weight_bytes, pool_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
-                let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-                let pool_cache_limit_guard = (pool_bytes != 0)
-                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+                let (mut inner, weight_bytes, pool_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
+                let guards = register_loaded_weights_and_pool(
+                    weight_bytes,
+                    pool_bytes,
+                    inner.pool_cache_limit_guard.take(),
+                );
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
                     super::model::Lfm2SchedulerState::new(inner)?,
-                    (
-                        config,
-                        cache_limit_guard,
-                        pool_cache_limit_guard,
-                        paged_active,
-                    ),
+                    (config, guards, paged_active),
                 ))
             },
             |state, receiver| state.drive(receiver),
-        );
-
-        let (config, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        )
+        .await?;
 
         Ok(Lfm2Model {
             thread,
             config,
             paged_active,
-            _cache_limit_guard: cache_limit_guard,
-            _pool_cache_limit_guard: pool_cache_limit_guard,
+            _cache_limit_guard: guards.cache_limit,
+            _pool_cache_limit_guard: guards.pool_cache_limit,
         })
     }
 }

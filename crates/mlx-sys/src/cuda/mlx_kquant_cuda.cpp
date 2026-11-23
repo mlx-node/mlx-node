@@ -25,6 +25,7 @@ constexpr char kquant_few_source[] =
     ;
 
 constexpr char kquant_prefill_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/kquant_prefill.cu.inc"
     ;
 

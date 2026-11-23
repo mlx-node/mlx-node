@@ -124,7 +124,7 @@ fn maybe_grouped_coordinator(
 }
 
 fn group_count(coordinator: &Gemma4KVCacheCoordinator) -> usize {
-    coordinator.inner.groups().len()
+    coordinator.groups().len()
 }
 
 fn allocated_per_group(coordinator: &Gemma4KVCacheCoordinator) -> Vec<usize> {

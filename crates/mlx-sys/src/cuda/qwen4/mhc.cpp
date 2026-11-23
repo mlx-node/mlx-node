@@ -13,6 +13,7 @@ namespace {
 using namespace mlx_node::qwen4_cuda;
 
 constexpr char qwen4_mhc_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/qwen4_mhc.cu.inc"
     ;
 

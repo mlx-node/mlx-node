@@ -26,9 +26,7 @@ use super::indexer::TokTail;
 use super::ladder::{Kind, RAM_STATES};
 use super::prefill::{BLOCK_ROWS, Grid, StateRow, turn_row};
 use crate::array::MxArray;
-use crate::models::qwen3_5::dflash2_state::store::{
-    Entry, HybridStateStore, Lineage, StateBytes, StateClass,
-};
+use crate::disk_tier::store::{Entry, HybridStateStore, Lineage, StateBytes, StateClass};
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 prefix states: {msg}"))

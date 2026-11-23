@@ -4,39 +4,44 @@
 //! `paged_attention` Metal kernel actually masks K positions older than
 //! `context_len - sliding_window` from the softmax computation.
 //!
-//! Strategy: drive `dispatch_paged_attention_v1_raw` directly with a
-//! deterministic K/V pool and a constant Q, then compute a host-side
-//! reference using the same softmax-over-K-V formula the kernel
-//! implements. Any divergence between the kernel output and the host
-//! reference (within a small bf16 tolerance) is a bug. We test 5
-//! distinct window sizes (including 0 = no mask) plus a degenerate
-//! window > context_len case (which must collapse to the no-mask
-//! behaviour).
+//! Strategy: populate a `LayerKVPool` via `mlx_sys::mlx_paged_kv_write_forward`
+//! and drive `mlx_sys::mlx_paged_attention_forward` with a deterministic K/V
+//! pool and a constant Q, then compute a host-side reference using the same
+//! softmax-over-K-V formula the kernel implements. Any divergence between the
+//! kernel output and the host reference (within a small bf16 tolerance) is a
+//! bug. We test 6 distinct window sizes on the V1 path (including 0 = no mask
+//! and window > context_len) plus a V2 high-partition sliding-window case.
 //!
 //! Skips cleanly on hosts without Metal.
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
-use metal::MTLResourceOptions;
-use mlx_paged_attn::metal::{
-    MetalDtype, MetalState, PagedAttentionParams, RawBufferInfo, dispatch_paged_attention_v1_raw,
-};
+use mlx_paged_attn::metal::{MetalDtype, MetalState};
+use mlx_paged_attn::{LayerKVPool, PagedAttentionConfig};
+use mlx_sys::mlx_array;
 
-// Test config: 1 sequence, 1 KV head, 1 query head, head_size 64.
-// Context length = 32 tokens (≤ PARTITION_SIZE so V1 path runs).
-// Block size 16 → 2 blocks per sequence.
-const NUM_SEQS: u32 = 1;
+// V1 test config: 1 sequence, 1 KV head, 1 query head, head_size 64.
+// Context length = 32 tokens (<= PARTITION_SIZE so V1 path runs).
+// Block size 16 -> 2 blocks per sequence.
 const NUM_HEADS: u32 = 1;
 const NUM_KV_HEADS: u32 = 1;
 const HEAD_SIZE: u32 = 64;
 const BLOCK_SIZE: u32 = 16;
 const CONTEXT_LEN: u32 = 32;
-const NUM_BLOCKS: u32 = 2;
-const X_PACK: u32 = 8; // bf16 → x = 16 / sizeof(bf16) = 8
+const KV_DTYPE_BF16: u8 = 1;
 
-/// Convert f32 → bf16 (16-bit truncation of the upper bits).
+struct Owned(*mut mlx_array);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { mlx_sys::mlx_array_delete(self.0) };
+        }
+    }
+}
+
+/// Convert f32 -> bf16 (round-to-nearest-even).
 fn f32_to_bf16_bits(x: f32) -> u16 {
-    // Round-to-nearest-even using the next bit of the mantissa.
     let bits = x.to_bits();
     let lsb = (bits >> 16) & 1;
     let rounding_bias = 0x7FFF + lsb;
@@ -44,8 +49,27 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
+fn from_bf16(data: &[u16], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_bfloat16(data.as_ptr(), shape.as_ptr(), shape.len()) })
+}
+
+fn from_f32(data: &[f32], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_float32(data.as_ptr(), shape.as_ptr(), shape.len()) })
+}
+
+fn from_i32(data: &[i32], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_int32(data.as_ptr(), shape.as_ptr(), shape.len()) })
+}
+
+fn from_i64(data: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_int64(data.as_ptr(), [data.len() as i64].as_ptr(), 1) })
+}
+
+fn to_f32(array: &Owned) -> Vec<f32> {
+    let len = unsafe { mlx_sys::mlx_array_size(array.0) };
+    let mut out = vec![0.0f32; len];
+    assert!(unsafe { mlx_sys::mlx_array_to_float32(array.0, out.as_mut_ptr(), out.len()) });
+    out
 }
 
 /// True iff Metal is reachable on this host.
@@ -96,7 +120,7 @@ fn host_reference_attention(
         scores[t] = acc * scale;
     }
 
-    // 2. apply mask (set masked → -inf so softmax weight is 0).
+    // 2. apply mask (set masked -> -inf so softmax weight is 0).
     for (t, score) in scores.iter_mut().enumerate() {
         let is_masked = sw > 0 && (t as i64) < lower_bound;
         if is_masked {
@@ -129,190 +153,118 @@ fn host_reference_attention(
     out
 }
 
-/// Build the K-pool buffer in the layout
-/// `[num_blocks, num_kv_heads, head_size/x_pack, block_size, x_pack]`
-/// (kernel-native bf16) from a flat `[context_len][head_size]` source.
-///
-/// Slot t lives in block (t / BLOCK_SIZE), block_offset (t % BLOCK_SIZE).
-fn build_k_pool_bf16(k_per_token: &[f32]) -> Vec<u16> {
-    let num_blocks = NUM_BLOCKS as usize;
-    let num_kv_heads = NUM_KV_HEADS as usize;
-    let head_size = HEAD_SIZE as usize;
-    let block_size = BLOCK_SIZE as usize;
-    let x_pack = X_PACK as usize;
-    let head_per_block = (head_size / x_pack) * block_size * x_pack;
-    let stride_block = num_kv_heads * head_per_block;
-    let stride_head = head_per_block;
-    let stride_xidx = block_size * x_pack;
-    let stride_blockoff = x_pack;
-
-    let mut pool = vec![0u16; num_blocks * stride_block];
-
-    let context_len = CONTEXT_LEN as usize;
-    for t in 0..context_len {
-        let block_idx = t / block_size;
-        let block_offset = t % block_size;
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let x_idx = j / x_pack;
-                let x_offset = j % x_pack;
-                let pool_idx = block_idx * stride_block
-                    + h * stride_head
-                    + x_idx * stride_xidx
-                    + block_offset * stride_blockoff
-                    + x_offset;
-                pool[pool_idx] = f32_to_bf16_bits(k_per_token[t * head_size + j]);
-            }
-        }
-    }
-    pool
-}
-
-/// Build the V-pool buffer in the layout
-/// `[num_blocks, num_kv_heads, head_size, block_size]` from a flat
-/// `[context_len][head_size]` source.
-fn build_v_pool_bf16(v_per_token: &[f32]) -> Vec<u16> {
-    let num_blocks = NUM_BLOCKS as usize;
-    let num_kv_heads = NUM_KV_HEADS as usize;
-    let head_size = HEAD_SIZE as usize;
-    let block_size = BLOCK_SIZE as usize;
-    let head_per_block = head_size * block_size;
-    let stride_block = num_kv_heads * head_per_block;
-    let stride_head = head_per_block;
-    let stride_j = block_size;
-
-    let mut pool = vec![0u16; num_blocks * stride_block];
-
-    let context_len = CONTEXT_LEN as usize;
-    for t in 0..context_len {
-        let block_idx = t / block_size;
-        let block_offset = t % block_size;
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let pool_idx =
-                    block_idx * stride_block + h * stride_head + j * stride_j + block_offset;
-                pool[pool_idx] = f32_to_bf16_bits(v_per_token[t * head_size + j]);
-            }
-        }
-    }
-    pool
-}
-
-/// Run one paged_attention dispatch via the Rust raw entry point and
-/// return the output as a flat Vec<f32> of length `head_size`. The
-/// caller controls only `sliding_window`; everything else is fixed by
-/// the test config.
-#[allow(clippy::too_many_arguments)]
+/// Write `k_per_token` / `v_per_token` into a fresh BF16 `LayerKVPool` via
+/// `mlx_paged_kv_write_forward` and dispatch `mlx_paged_attention_forward`
+/// with the requested `sliding_window`.
 fn run_dispatch(
-    state: &MetalState,
-    k_pool_bytes: &[u16],
-    v_pool_bytes: &[u16],
-    q_bf16: &[u16],
-    block_table: &[u32],
-    seq_lens: &[u32],
+    k_per_token: &[f32],
+    v_per_token: &[f32],
+    q: &[f32],
+    context_len: u32,
     sliding_window: i32,
     scale: f32,
 ) -> Vec<f32> {
-    let key_pool = state
-        .device
-        .try_new_buffer_with_slice(k_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer_with_slice(v_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let q_buf = state
-        .device
-        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let block_table_buf = state
-        .device
-        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let seq_lens_buf = state
-        .device
-        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
-    let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
-    let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
-    let kv_head_stride = (HEAD_SIZE * BLOCK_SIZE) as i32;
-
-    let max_blocks_per_seq = block_table.len() as u32 / NUM_SEQS;
-    let params = PagedAttentionParams {
-        num_seqs: NUM_SEQS,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
+    let num_blocks = context_len.div_ceil(BLOCK_SIZE);
+    let config = PagedAttentionConfig {
         block_size: BLOCK_SIZE,
-        max_seq_len: CONTEXT_LEN,
-        max_num_blocks_per_seq: max_blocks_per_seq,
-        scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window,
+        gpu_memory_mb: 256,
+        head_size: HEAD_SIZE,
+        num_kv_heads: NUM_KV_HEADS,
+        num_layers: 1,
+        max_seq_len: Some(num_blocks * BLOCK_SIZE),
+        max_batch_size: Some(1),
     };
+    let pool = LayerKVPool::new(config, num_blocks, num_blocks, MetalDtype::BFloat16)
+        .expect("LayerKVPool::new must succeed");
 
-    let q_raw = RawBufferInfo {
-        ptr: q_buf.as_ptr() as *mut std::ffi::c_void,
-        offset: 0,
+    let k_bf16: Vec<u16> = k_per_token.iter().copied().map(f32_to_bf16_bits).collect();
+    let v_bf16: Vec<u16> = v_per_token.iter().copied().map(f32_to_bf16_bits).collect();
+    let q_bf16: Vec<u16> = q.iter().copied().map(f32_to_bf16_bits).collect();
+
+    let kv_shape = [context_len as i64, NUM_KV_HEADS as i64, HEAD_SIZE as i64];
+    let new_k = from_bf16(&k_bf16, &kv_shape);
+    let new_v = from_bf16(&v_bf16, &kv_shape);
+    let slots: Vec<i64> = (0..context_len as i64).collect();
+    let slot_mapping = from_i64(&slots);
+    let k_pool_in = Owned(pool.key_cache_array_raw(0).expect("key_cache_array_raw"));
+    let v_pool_in = Owned(
+        pool.value_cache_array_raw(0)
+            .expect("value_cache_array_raw"),
+    );
+    let k_scale_in = from_f32(&[1.0], &[1]);
+    let v_scale_in = from_f32(&[1.0], &[1]);
+
+    let mut write_out = [std::ptr::null_mut::<mlx_array>(); 4];
+    let [k_out, v_out, ks_out, vs_out] = &mut write_out;
+    let ok = unsafe {
+        mlx_sys::mlx_paged_kv_write_forward(
+            k_pool_in.0,
+            v_pool_in.0,
+            new_k.0,
+            new_v.0,
+            slot_mapping.0,
+            k_scale_in.0,
+            v_scale_in.0,
+            BLOCK_SIZE as i32,
+            NUM_KV_HEADS as i32,
+            HEAD_SIZE as i32,
+            KV_DTYPE_BF16,
+            false,
+            k_out,
+            v_out,
+            ks_out,
+            vs_out,
+        )
     };
+    assert!(ok, "mlx_paged_kv_write_forward must succeed");
+    let written = write_out.map(Owned);
+    let mut write_handles = write_out;
+    assert!(unsafe { mlx_sys::mlx_eval(write_handles.as_mut_ptr(), 4) });
+    let [k_pool, v_pool, k_scale, v_scale] = written;
+
+    let block_table_vec: Vec<i32> = (0..num_blocks as i32).collect();
+    let block_table = from_i32(&block_table_vec, &[1, num_blocks as i64]);
+    let seq_lens = from_i32(&[context_len as i32], &[1]);
+    let q_arr = from_bf16(&q_bf16, &[1, NUM_HEADS as i64, HEAD_SIZE as i64]);
 
     let out = unsafe {
-        dispatch_paged_attention_v1_raw(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
+        mlx_sys::mlx_paged_attention_forward(
+            q_arr.0,
+            k_pool.0,
+            v_pool.0,
+            block_table.0,
+            seq_lens.0,
+            k_scale.0,
+            v_scale.0,
+            scale,
+            /* softcap */ 0.0,
+            sliding_window,
+            BLOCK_SIZE as i32,
+            NUM_HEADS as i32,
+            NUM_KV_HEADS as i32,
+            HEAD_SIZE as i32,
+            KV_DTYPE_BF16,
         )
-    }
-    .expect("dispatch_paged_attention_v1_raw must succeed");
-
-    // Read the output buffer back as bf16 → f32.
-    let out_elems = (NUM_SEQS * NUM_HEADS * HEAD_SIZE) as usize;
-    let out_bytes = out_elems * std::mem::size_of::<u16>();
-    // Output buffer is StorageModePrivate; blit it to a shared buffer
-    // first so we can read it host-side.
-    let shared_out = state
-        .device
-        .try_new_buffer(out_bytes as u64, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-    let cmd = state
-        .command_queue
-        .try_new_command_buffer()
-        .expect("test command queue must provide a command buffer");
-    let blit = cmd
-        .try_new_blit_command_encoder()
-        .expect("test command buffer must provide a blit encoder");
-    blit.copy_from_buffer(&out.buffer, 0, &shared_out, 0, out_bytes as u64);
-    blit.end_encoding();
-    cmd.commit();
-    cmd.wait_until_completed();
-
-    let out_bits =
-        unsafe { std::slice::from_raw_parts(shared_out.contents() as *const u16, out_elems) };
-    out_bits.iter().map(|&b| bf16_bits_to_f32(b)).collect()
+    };
+    assert!(!out.is_null(), "mlx_paged_attention_forward must succeed");
+    let out = Owned(out);
+    let mut out_handles = [out.0];
+    assert!(unsafe { mlx_sys::mlx_eval(out_handles.as_mut_ptr(), 1) });
+    to_f32(&out)
 }
 
 /// Build deterministic K/V values for the test. K[t][d] depends on (t,
 /// d) so each token has a different attention score against a constant
 /// Q; V[t][d] depends on t so the weighted sum reveals which tokens
 /// contributed.
-fn build_synthetic_kv() -> (Vec<f32>, Vec<f32>) {
-    let context_len = CONTEXT_LEN as usize;
+fn build_synthetic_kv(context_len: usize) -> (Vec<f32>, Vec<f32>) {
     let head_size = HEAD_SIZE as usize;
     let mut k = vec![0.0f32; context_len * head_size];
     let mut v = vec![0.0f32; context_len * head_size];
 
     for t in 0..context_len {
         for d in 0..head_size {
-            // K: small magnitudes so QK · scale ≈ ±2 (reasonable softmax range)
+            // K: small magnitudes so QK · scale ~= +/-2 (reasonable softmax range)
             k[t * head_size + d] = ((t as f32) * 0.1 + (d as f32) * 0.01).sin() * 0.5;
             // V: each token contributes a distinct constant vector so the
             // weighted sum reveals which tokens dominated.
@@ -334,30 +286,12 @@ fn check_sliding_window(window: i32, label: &str) {
         eprintln!("skipping {label}: Metal not available on this host");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available (checked above)");
 
-    let (k_per_token, v_per_token) = build_synthetic_kv();
+    let (k_per_token, v_per_token) = build_synthetic_kv(CONTEXT_LEN as usize);
     let q = build_synthetic_q();
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
 
-    let q_bf16: Vec<u16> = q.iter().copied().map(f32_to_bf16_bits).collect();
-    let k_pool_bf16 = build_k_pool_bf16(&k_per_token);
-    let v_pool_bf16 = build_v_pool_bf16(&v_per_token);
-
-    // Block table: [block_0=0, block_1=1] for our 2-block sequence.
-    let block_table: Vec<u32> = vec![0, 1];
-    let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
-
-    let kernel_out = run_dispatch(
-        state,
-        &k_pool_bf16,
-        &v_pool_bf16,
-        &q_bf16,
-        &block_table,
-        &seq_lens,
-        window,
-        scale,
-    );
+    let kernel_out = run_dispatch(&k_per_token, &v_per_token, &q, CONTEXT_LEN, window, scale);
     let host_ref = host_reference_attention(
         &q,
         &k_per_token,
@@ -368,11 +302,11 @@ fn check_sliding_window(window: i32, label: &str) {
         window,
     );
 
-    // Tolerance: bf16 has ~7-bit mantissa → ~1e-2 relative precision.
+    // Tolerance: bf16 has ~7-bit mantissa -> ~1e-2 relative precision.
     // The accumulator inside the kernel is f32, so the dominant error
     // comes from truncating Q, K, V to bf16. A 5e-2 absolute tolerance
     // covers ~3 ULPs at typical magnitudes for the synthetic V values
-    // (|V| ≤ 3.4 in this config).
+    // (|V| <= 3.4 in this config).
     let mut max_diff = 0.0f32;
     let mut max_diff_idx = 0usize;
     for d in 0..(HEAD_SIZE as usize) {
@@ -445,38 +379,13 @@ fn sliding_window_one_differs_from_full_context() {
         eprintln!("skipping sliding_window_one_differs_from_full_context: Metal unavailable");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available (checked above)");
 
-    let (k_per_token, v_per_token) = build_synthetic_kv();
+    let (k_per_token, v_per_token) = build_synthetic_kv(CONTEXT_LEN as usize);
     let q = build_synthetic_q();
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
 
-    let q_bf16: Vec<u16> = q.iter().copied().map(f32_to_bf16_bits).collect();
-    let k_pool_bf16 = build_k_pool_bf16(&k_per_token);
-    let v_pool_bf16 = build_v_pool_bf16(&v_per_token);
-    let block_table: Vec<u32> = vec![0, 1];
-    let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
-
-    let out_no_mask = run_dispatch(
-        state,
-        &k_pool_bf16,
-        &v_pool_bf16,
-        &q_bf16,
-        &block_table,
-        &seq_lens,
-        0,
-        scale,
-    );
-    let out_w1 = run_dispatch(
-        state,
-        &k_pool_bf16,
-        &v_pool_bf16,
-        &q_bf16,
-        &block_table,
-        &seq_lens,
-        1,
-        scale,
-    );
+    let out_no_mask = run_dispatch(&k_per_token, &v_per_token, &q, CONTEXT_LEN, 0, scale);
+    let out_w1 = run_dispatch(&k_per_token, &v_per_token, &q, CONTEXT_LEN, 1, scale);
 
     let max_diff = out_no_mask
         .iter()
@@ -489,4 +398,54 @@ fn sliding_window_one_differs_from_full_context() {
          a no-op mask would silently produce equal outputs and pass the host-ref \
          check via shared bias"
     );
+}
+
+/// V2 high-partition path (`context_len > 512`): sliding window cuts across the
+/// first partition so partition 0 is wholly masked while partition 1 survives.
+#[test]
+fn sliding_window_v2_high_partition_matches_host_reference() {
+    if !metal_available() {
+        eprintln!(
+            "skipping sliding_window_v2_high_partition_matches_host_reference: Metal unavailable"
+        );
+        return;
+    }
+
+    const V2_CONTEXT_LEN: u32 = 640;
+    const WINDOW: i32 = 96;
+    let (k_per_token, v_per_token) = build_synthetic_kv(V2_CONTEXT_LEN as usize);
+    let q = build_synthetic_q();
+    let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
+
+    let kernel_out = run_dispatch(
+        &k_per_token,
+        &v_per_token,
+        &q,
+        V2_CONTEXT_LEN,
+        WINDOW,
+        scale,
+    );
+    let host_ref = host_reference_attention(
+        &q,
+        &k_per_token,
+        &v_per_token,
+        V2_CONTEXT_LEN as usize,
+        HEAD_SIZE as usize,
+        scale,
+        WINDOW,
+    );
+
+    let rel_tol = 1.5e-2_f32;
+    let abs_tol = 5.0e-2_f32;
+    for d in 0..(HEAD_SIZE as usize) {
+        let diff = (kernel_out[d] - host_ref[d]).abs();
+        let tol = abs_tol.max(rel_tol * host_ref[d].abs());
+        assert!(
+            diff < tol,
+            "V2 sliding_window={WINDOW} diverges at dim={d} \
+             (kernel={}, ref={}, diff={diff} > tol={tol})",
+            kernel_out[d],
+            host_ref[d]
+        );
+    }
 }

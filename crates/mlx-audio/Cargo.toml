@@ -1,0 +1,35 @@
+[package]
+name = "mlx-audio"
+version.workspace = true
+edition.workspace = true
+description = "OS audio capture, playback, DSP, and WAV codec for mlx-node"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.14.2"
+objc2 = "0.6.4"
+objc2-core-audio = "0.3.2"
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSArray",
+  "NSString",
+  "NSUUID",
+  "NSValue",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+] }

@@ -20,93 +20,9 @@ use crate::nn::{LayerNorm, Linear};
 use napi::Either;
 use napi::bindgen_prelude::*;
 
-use super::backbone::{FrozenBatchNorm2d, NativeConv2d};
+use crate::vision::cnn::{ConvBNAct, FrozenBatchNorm2d, NativeConv2d};
+
 use super::config::PPDocLayoutV3Config;
-
-// ============================================================================
-// ConvNormLayer: Conv2d + BatchNorm + optional Activation
-// ============================================================================
-
-/// Convolution + Batch Normalization + optional Activation layer.
-///
-/// Corresponds to PPDocLayoutV3ConvNormLayer in the reference implementation.
-/// Uses Conv2d (no bias) + FrozenBatchNorm2d + optional activation.
-///
-/// Padding is automatically computed as (kernel_size - 1) / 2.
-pub struct ConvNormLayer {
-    /// Convolution layer (no bias)
-    conv: NativeConv2d,
-    /// Frozen batch normalization
-    norm: FrozenBatchNorm2d,
-    /// Activation function name (None for identity)
-    activation: Option<String>,
-}
-
-impl ConvNormLayer {
-    /// Create a new ConvNormLayer.
-    ///
-    /// # Arguments
-    /// * `conv` - NativeConv2d layer (no bias)
-    /// * `norm` - FrozenBatchNorm2d layer
-    /// * `activation` - Optional activation name ("relu", "silu", "gelu")
-    pub fn new(conv: NativeConv2d, norm: FrozenBatchNorm2d, activation: Option<&str>) -> Self {
-        Self {
-            conv,
-            norm,
-            activation: activation.map(|s| s.to_string()),
-        }
-    }
-
-    /// Forward pass: Conv -> BN -> (optional Activation)
-    ///
-    /// Input/Output: [batch, height, width, channels] (NHWC)
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        let mut x = self.conv.forward(input)?;
-        x = self.norm.forward(&x)?;
-        if let Some(ref act) = self.activation {
-            x = super::apply_activation(&x, act)?;
-        }
-        Ok(x)
-    }
-}
-
-// ============================================================================
-// ConvLayer: Conv2d + BatchNorm + Activation (always has activation)
-// ============================================================================
-
-/// Convolution + Batch Normalization + Activation layer.
-///
-/// Corresponds to PPDocLayoutV3ConvLayer in the reference implementation.
-/// Like ConvNormLayer but activation is always present.
-/// Padding = kernel_size // 2.
-pub struct ConvLayer {
-    /// Convolution layer (no bias)
-    conv: NativeConv2d,
-    /// Frozen batch normalization
-    norm: FrozenBatchNorm2d,
-    /// Activation function name
-    activation: String,
-}
-
-impl ConvLayer {
-    /// Create a new ConvLayer.
-    pub fn new(conv: NativeConv2d, norm: FrozenBatchNorm2d, activation: &str) -> Self {
-        Self {
-            conv,
-            norm,
-            activation: activation.to_string(),
-        }
-    }
-
-    /// Forward pass: Conv -> BN -> Activation
-    ///
-    /// Input/Output: [batch, height, width, channels] (NHWC)
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        let mut x = self.conv.forward(input)?;
-        x = self.norm.forward(&x)?;
-        super::apply_activation(&x, &self.activation)
-    }
-}
 
 // ============================================================================
 // 2D Sinusoidal Position Embedding
@@ -464,16 +380,16 @@ impl Encoder {
 /// output = activation(conv3x3(x) + conv1x1(x))
 pub struct RepVggBlock {
     /// 3x3 convolution branch
-    conv1: ConvNormLayer,
+    conv1: ConvBNAct,
     /// 1x1 convolution branch
-    conv2: ConvNormLayer,
+    conv2: ConvBNAct,
     /// Activation function
     activation: String,
 }
 
 impl RepVggBlock {
     /// Create a new RepVggBlock.
-    pub fn new(conv1: ConvNormLayer, conv2: ConvNormLayer, activation: &str) -> Self {
+    pub fn new(conv1: ConvBNAct, conv2: ConvBNAct, activation: &str) -> Self {
         Self {
             conv1,
             conv2,
@@ -510,23 +426,23 @@ impl RepVggBlock {
 /// Output: [batch, H, W, out_channels] where out_channels = encoder_hidden_dim
 pub struct CSPRepLayer {
     /// 1x1 conv for bottleneck path (in_channels -> hidden_channels)
-    conv1: ConvNormLayer,
+    conv1: ConvBNAct,
     /// 1x1 conv for shortcut path (in_channels -> hidden_channels)
-    conv2: ConvNormLayer,
+    conv2: ConvBNAct,
     /// RepVGG bottleneck blocks
     bottlenecks: Vec<RepVggBlock>,
     /// Optional 1x1 conv for output projection (hidden_channels -> out_channels)
     /// None if hidden_channels == out_channels (identity)
-    conv3: Option<ConvNormLayer>,
+    conv3: Option<ConvBNAct>,
 }
 
 impl CSPRepLayer {
     /// Create a new CSPRepLayer.
     pub fn new(
-        conv1: ConvNormLayer,
-        conv2: ConvNormLayer,
+        conv1: ConvBNAct,
+        conv2: ConvBNAct,
         bottlenecks: Vec<RepVggBlock>,
-        conv3: Option<ConvNormLayer>,
+        conv3: Option<ConvBNAct>,
     ) -> Self {
         Self {
             conv1,
@@ -702,7 +618,7 @@ fn upsample_bilinear_2x(input: &MxArray) -> Result<MxArray> {
 /// Each layer has a 3x3 ConvLayer followed by 2x bilinear upsampling
 /// (if fpn_stride != base_stride). Uses align_corners=False to match Python reference.
 pub enum ScaleHeadLayer {
-    Conv(ConvLayer),
+    Conv(ConvBNAct),
     Upsample,
 }
 
@@ -756,7 +672,7 @@ pub struct MaskFeatFPN {
     /// Scale heads for each level
     scale_heads: Vec<ScaleHead>,
     /// Final output convolution
-    output_conv: ConvLayer,
+    output_conv: ConvBNAct,
 }
 
 impl MaskFeatFPN {
@@ -769,7 +685,7 @@ impl MaskFeatFPN {
     pub fn new(
         reorder_index: Vec<usize>,
         scale_heads: Vec<ScaleHead>,
-        output_conv: ConvLayer,
+        output_conv: ConvBNAct,
     ) -> Self {
         Self {
             reorder_index,
@@ -848,14 +764,14 @@ impl MaskFeatFPN {
 ///
 /// Produces the final mask prototype features (num_prototypes channels).
 pub struct EncoderMaskOutput {
-    /// 3x3 ConvLayer (in_channels -> in_channels)
-    base_conv: ConvLayer,
+    /// 3x3 ConvBNAct (in_channels -> in_channels)
+    base_conv: ConvBNAct,
     /// 1x1 Conv2d (in_channels -> num_prototypes), with bias
     conv: NativeConv2d,
 }
 
 impl EncoderMaskOutput {
-    pub fn new(base_conv: ConvLayer, conv: NativeConv2d) -> Self {
+    pub fn new(base_conv: ConvBNAct, conv: NativeConv2d) -> Self {
         Self { base_conv, conv }
     }
 
@@ -937,13 +853,13 @@ pub struct HybridEncoder {
 
     // FPN (top-down)
     /// Lateral 1x1 convolutions for FPN
-    lateral_convs: Vec<ConvNormLayer>,
+    lateral_convs: Vec<ConvBNAct>,
     /// CSPRepLayer blocks for FPN
     fpn_blocks: Vec<CSPRepLayer>,
 
     // PAN (bottom-up)
     /// Stride-2 3x3 convolutions for downsampling
-    downsample_convs: Vec<ConvNormLayer>,
+    downsample_convs: Vec<ConvBNAct>,
     /// CSPRepLayer blocks for PAN
     pan_blocks: Vec<CSPRepLayer>,
 
@@ -951,8 +867,8 @@ pub struct HybridEncoder {
     /// MaskFeatFPN for multi-level mask features
     mask_feature_head: MaskFeatFPN,
     /// Lateral convolution for x4_feat
-    encoder_mask_lateral: ConvLayer,
-    /// Final mask output (ConvLayer + 1x1 Conv)
+    encoder_mask_lateral: ConvBNAct,
+    /// Final mask output (ConvBNAct + 1x1 Conv)
     encoder_mask_output: EncoderMaskOutput,
 }
 
@@ -962,12 +878,12 @@ impl HybridEncoder {
     pub fn new(
         config: &PPDocLayoutV3Config,
         encoders: Vec<Encoder>,
-        lateral_convs: Vec<ConvNormLayer>,
+        lateral_convs: Vec<ConvBNAct>,
         fpn_blocks: Vec<CSPRepLayer>,
-        downsample_convs: Vec<ConvNormLayer>,
+        downsample_convs: Vec<ConvBNAct>,
         pan_blocks: Vec<CSPRepLayer>,
         mask_feature_head: MaskFeatFPN,
-        encoder_mask_lateral: ConvLayer,
+        encoder_mask_lateral: ConvBNAct,
         encoder_mask_output: EncoderMaskOutput,
     ) -> Self {
         let num_levels = config.encoder_in_channels.len();
@@ -1309,7 +1225,7 @@ mod tests {
 
         let conv = NativeConv2d::new(&weight, None, (1, 1), (0, 0), (1, 1), 1);
         let norm = FrozenBatchNorm2d::new(&bn_weight, &bn_bias, &bn_mean, &bn_var, 1e-5);
-        let layer = ConvNormLayer::new(conv, norm, Some("relu"));
+        let layer = ConvBNAct::new(conv, norm, "relu", None);
 
         let input = MxArray::from_float32(
             &vec![1.0; (4 * 4 * channels) as usize],

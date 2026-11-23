@@ -15,6 +15,7 @@ namespace mlx::core::affine_q4_few {
 namespace {
 
 constexpr char affine_q4_few_source[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/affine_q4_few.cu.inc"
     ;
 

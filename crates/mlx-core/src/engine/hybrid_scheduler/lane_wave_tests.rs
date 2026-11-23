@@ -109,7 +109,7 @@ fn dense_with_random_head() -> crate::models::qwen3_5::model::Qwen35Inner {
 }
 
 fn moe_with_random_head() -> crate::models::qwen3_5_moe::model::Qwen35MoeInner {
-    let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107);
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(8107);
     inner.lm_head = Some(random_head(inner.config.hidden_size));
     inner.grant_scheduled_lanes(8);
     inner
@@ -139,15 +139,13 @@ fn int8_dense(
 fn int8_moe(
     activations: crate::transformer::Activations,
 ) -> crate::models::qwen3_5_moe::model::Qwen35MoeInner {
-    let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner_with_config(
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner_with_config(
         8107,
         |config| config.kv_format = Some("int8".to_string()),
     );
     inner.lm_head = Some(random_head(inner.config.hidden_size));
     for layer in inner.layers.iter_mut() {
-        if let crate::models::qwen3_5_moe::decoder_layer::AttentionType::Full(attn) =
-            &mut layer.attn
-        {
+        if let crate::models::qwen3_5::decoder_layer::AttentionType::Full(attn) = &mut layer.attn {
             crate::models::qwen3_5::model::scheduled_mtp::sharpen_attention(attn);
         }
     }
@@ -258,7 +256,7 @@ fn a_scheduled_mtp_turn_reports_its_accepted_drafts() {
         crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107)
     });
     mtp_turns_report_accepted_drafts(|| {
-        crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107)
+        crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(8107)
     });
 }
 

@@ -553,7 +553,7 @@ impl Weight {
             && self.group == 32
             && let Some(biases) = &self.biases
             && let Some(fast) =
-                crate::kernels::qwen4::dequant_q8_bf16_cuda(&self.values, scales, biases)?
+                crate::kernels::linear::dequant_q8_bf16_cuda(&self.values, scales, biases)?
         {
             return Ok(fast);
         }

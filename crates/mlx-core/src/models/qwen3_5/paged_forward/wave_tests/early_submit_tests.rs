@@ -69,6 +69,7 @@ fn a_lone_dflash2_verify_queues_every_layer_but_the_last() -> Result<()> {
         l.rope_deltas,
         &TAPS,
         &l.gdn,
+        None,
         WINDOW,
     )?;
     let got = submits() - before;

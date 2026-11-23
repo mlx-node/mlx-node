@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::{Error, Result};
 
-use crate::array::memory::{FreeReleasedSources, materialize_weights, synchronize_and_clear_cache};
+use crate::array::memory::{materialize_weights, synchronize_and_clear_cache};
 use crate::array::{DType, MxArray};
 use crate::cache_limit;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
@@ -15,24 +15,22 @@ use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::governor::governor as memory_governor;
 use crate::engine::governor::governor::start_under_growth_lock;
 use crate::engine::memory_plan::live_memory;
-use crate::engine::model_command::register_memory_waker;
-use crate::engine::persistence::load_checkpoint;
-use crate::model_thread::ModelThread;
+use crate::engine::persistence::{
+    CheckpointLeaseGuard, GgufPreloadGuard, load_checkpoint, register_dynamic_pool,
+    register_thread_memory_waker, spawn_loaded_model_thread,
+};
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, effective_plq_for, load_embedding_affine_or_bf16,
-    load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk,
+    PerLayerMode, PerLayerQuant, QslBuildSpec, QslFp8Policy, QslSym8Policy, build_qsl,
+    effective_plq_for, load_embedding_affine_or_bf16, load_linear_proj_quantized_or_bf16,
+    load_quant_settings_from_disk,
 };
-use crate::models::quantized_linear::{
-    DEFAULT_QUANT_MODE, LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear,
-    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_switch_linear,
-};
+use crate::models::quantized_linear::{LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear};
 use crate::nn::{Embedding, LayerNorm, Linear};
 use crate::stream::WiredResidency;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::Activations;
 use crate::utils::gguf::NativeGgufFamily;
-use crate::utils::gguf_import::{GgufPreload, PreloadInput};
+use crate::utils::gguf_import::PreloadInput;
 
 use super::attention::Inkling2Attention;
 use super::attn_res::{LoopController, LoopLayerControllers};
@@ -72,19 +70,17 @@ pub async fn load_from_dir_with_paged_config(
     paged_cfg: Option<Inkling2PagedConfig>,
 ) -> Result<Inkling2Inner> {
     let path = Path::new(model_path);
-    let source = CheckpointSource::resolve(path, NativeGgufFamily::Inkling2).await?;
+    let lease = CheckpointLeaseGuard::resolve(path, NativeGgufFamily::Inkling2).await?;
     let source_dir = if path.is_file() {
         path.parent()
-            .unwrap_or_else(|| source.asset_dir())
+            .unwrap_or_else(|| lease.source().asset_dir())
             .to_path_buf()
     } else {
         path.to_path_buf()
     };
-    let loaded = load_with_source_dir(&source, &source_dir, paged_cfg).await;
-    if loaded.is_err() {
-        source.release_lease();
-    }
-    loaded
+    let loaded = load_with_source_dir(lease.source(), &source_dir, paged_cfg).await?;
+    lease.commit();
+    Ok(loaded)
 }
 
 /// Load using an already-resolved [`CheckpointSource`] and model directory.
@@ -138,7 +134,8 @@ pub(crate) async fn load_model_with_options(
     let max_context_raw = options.max_context_tokens;
 
     let path = Path::new(model_path);
-    let source = CheckpointSource::resolve(path, NativeGgufFamily::Inkling2).await?;
+    let lease = CheckpointLeaseGuard::resolve(path, NativeGgufFamily::Inkling2).await?;
+    let source = lease.source();
     let asset_dir = source.asset_dir().to_path_buf();
     let asset_dir_str = asset_dir.display().to_string();
     let source_dir = if path.is_file() {
@@ -146,7 +143,7 @@ pub(crate) async fn load_model_with_options(
     } else {
         path.to_path_buf()
     };
-    let (preload_input, gguf_vision_meta, is_gguf) = match &source {
+    let (preload_input, gguf_vision_meta, is_gguf) = match source {
         CheckpointSource::Dir(_) => (None, None, false),
         CheckpointSource::Gguf(checkpoint) => {
             checkpoint.check_asset_config()?;
@@ -185,7 +182,8 @@ pub(crate) async fn load_model_with_options(
     }
 
     let max_lanes = inkling2_scheduler_lanes();
-    let (thread, init_rx) = ModelThread::spawn_with_scheduler(
+    let (thread, meta) = spawn_loaded_model_thread(
+        "Inkling2 model thread terminated during initialization",
         move || -> Result<(Inkling2SchedulerState, InitMeta)> {
             let gguf_identity = preload_input.as_ref().map(|input| input.identity());
             let ckpt_files = CheckpointFiles::new(&asset_dir, gguf_identity.as_ref());
@@ -305,13 +303,11 @@ pub(crate) async fn load_model_with_options(
                         .adapter(gid)
                         .and_then(|a| a.pool_allocated_bytes())
                         .unwrap_or(0);
-                    let pool_guard = cache_limit::coordinator().register_pool(initial_bytes);
-                    let pool_id = pool_guard.id();
-                    if let Ok(adapter) = coordinator.adapter_mut(gid) {
-                        adapter.set_pool_growth_notifier(Some(Arc::new(move |new_bytes| {
-                            cache_limit::coordinator().update_pool(pool_id, new_bytes);
-                        })));
-                    }
+                    let pool_guard = if let Ok(adapter) = coordinator.adapter_mut(gid) {
+                        register_dynamic_pool(adapter, initial_bytes)
+                    } else {
+                        cache_limit::coordinator().register_pool(initial_bytes)
+                    };
                     pool_guards.push(pool_guard);
                 }
 
@@ -388,25 +384,11 @@ pub(crate) async fn load_model_with_options(
             Ok((scheduler_state, meta))
         },
         |state, receiver| state.drive(receiver),
-    );
+    )
+    .await?;
 
-    let meta = match init_rx.await {
-        Ok(Ok(meta)) => meta,
-        Ok(Err(err)) => {
-            source.release_lease();
-            return Err(err);
-        }
-        Err(_) => {
-            source.release_lease();
-            return Err(Error::from_reason(
-                "Inkling2 model thread terminated during initialization",
-            ));
-        }
-    };
-
-    if let Some(sender) = thread.cmd_sender() {
-        register_memory_waker(meta.model_id, &sender);
-    }
+    register_thread_memory_waker(meta.model_id, &thread);
+    lease.commit();
 
     Ok(Inkling2Model {
         thread,
@@ -477,8 +459,6 @@ fn load_weights_sync(
     gguf_vision_meta: Option<&HashMap<String, crate::utils::gguf::GgufMetaValue>>,
     is_gguf: bool,
 ) -> Result<Inkling2Inner> {
-    let _free_released_guard = FreeReleasedSources::enable(preload_input.is_some());
-
     let config_path = asset_dir.join("config.json");
     let config_raw = fs::read_to_string(&config_path).map_err(|e| {
         Error::from_reason(format!(
@@ -496,15 +476,15 @@ fn load_weights_sync(
         ));
     }
 
-    let mut preload = match preload_input {
-        Some(ref input) => Some(GgufPreload::load(input)?),
-        None => None,
-    };
+    let mut gguf = GgufPreloadGuard::load(preload_input.as_ref())?;
 
-    let load_vision =
-        config.vision_config.is_some() || preload.as_ref().is_some_and(|p| !p.companion.is_empty());
-    let raw_params = load_checkpoint(asset_dir, load_vision, preload.as_mut())?;
-    drop(preload);
+    let load_vision = config.vision_config.is_some()
+        || gguf
+            .preload
+            .as_ref()
+            .is_some_and(|p| !p.companion.is_empty());
+    let raw_params = load_checkpoint(asset_dir, load_vision, gguf.preload.as_mut())?;
+    drop(gguf.preload.take());
 
     // Strip leading `model.` prefix so keys match `load_quant_settings_from_disk`'s normalized
     // `per_layer_quant` namespace (keeping `lm_head.*`, `vision_tower.*`, `vision_projector.*`).
@@ -988,58 +968,20 @@ fn load_expert_switch_proj(
         }
 
         let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        let qsl = match plq.mode {
-            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, base),
-            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, base),
-            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, base),
-            PerLayerMode::Affine => {
-                let w = params.get(&format!("{base}.weight"));
-                let s = params.get(&format!("{base}.scales"));
-                let b = params.get(&format!("{base}.biases")).cloned();
-                match (w, s) {
-                    (Some(w), Some(s)) => {
-                        let mut q = QuantizedSwitchLinear::new(
-                            w.clone(),
-                            s.clone(),
-                            b,
-                            plq.group_size,
-                            plq.bits,
-                            DEFAULT_QUANT_MODE.to_string(),
-                        );
-                        if let Some(outer) = params.get(&format!("{base}.scale")) {
-                            q = q.with_outer_scale(outer.clone());
-                        }
-                        Some(q)
-                    }
-                    _ => None,
-                }
-            }
-            PerLayerMode::Q6K
-            | PerLayerMode::Q4K
-            | PerLayerMode::Q5K
-            | PerLayerMode::Q2K
-            | PerLayerMode::Q3K
-            | PerLayerMode::IQ4NL
-            | PerLayerMode::IQ4XS
-            | PerLayerMode::IQ3S
-            | PerLayerMode::IQ2XXS
-            | PerLayerMode::IQ2XS
-            | PerLayerMode::IQ2S
-            | PerLayerMode::IQ3XXS
-            | PerLayerMode::IQ1S
-            | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
-                params,
-                base,
-                plq.mode,
-                plq.layout,
-                FAMILY_NAME,
-            )?,
-            other => {
-                return Err(Error::from_reason(format!(
-                    "Inkling2: unsupported MoE expert quantization mode {other:?} on '{base}'"
-                )));
-            }
-        };
+        let qsl = build_qsl(
+            params,
+            base,
+            plq,
+            QslBuildSpec {
+                family: "Inkling2",
+                validate_storage: false,
+                fp8: QslFp8Policy::RejectUnsupported,
+                sym8: QslSym8Policy::RejectUnsupported,
+                nvfp4_only: false,
+                affine_optional_outer_scale: true,
+                nvfp4_outer_scale: None,
+            },
+        )?;
         let qsl = qsl.ok_or_else(|| {
             Error::from_reason(format!(
                 "Inkling2: failed to build quantized switch linear for '{base}' (mode={:?})",

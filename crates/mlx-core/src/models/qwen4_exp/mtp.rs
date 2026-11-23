@@ -429,7 +429,7 @@ impl Inner {
         let mut keep_probabilities = Vec::new();
         let cfg = params.sampling_config.unwrap_or_default();
         let greedy = crate::sampling::is_greedy_temperature(cfg.temperature.unwrap_or(1.0));
-        let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(cfg);
+        let cfg = crate::engine::mtp_decode::mtp_draft_sampling_config(cfg);
         for i in 0..cap.min(3) {
             self.decoder.check_cancelled()?;
             let (next, logits, draft) = self

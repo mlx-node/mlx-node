@@ -61,18 +61,9 @@ impl PPDocLayoutV3ImageProcessor {
             FilterType::CatmullRom,
         );
 
-        // Convert to RGB8
+        // Convert to RGB8 and normalize to [0, 1] NHWC [1, H, W, 3]
         let rgb_img = resized.to_rgb8();
-
-        // Convert pixels to float32 and rescale to [0, 1]
-        let h = self.target_height as usize;
-        let w = self.target_width as usize;
-        let channels = 3usize;
-        let pixel_data: Vec<f32> = rgb_img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
-
-        // Create MxArray [1, H, W, 3] in NHWC format
-        let pixel_values =
-            MxArray::from_float32(&pixel_data, &[1, h as i64, w as i64, channels as i64])?;
+        let pixel_values = crate::vision::cnn::rgb_to_nhwc_f32(&rgb_img, None, None, false)?;
 
         Ok((pixel_values, original_height, original_width))
     }

@@ -8,6 +8,7 @@
 #include "../kquant/kquant_m8_nax.h"
 #include "abi.h"
 #include "../kquant/kquant_sg8.h"
+#include "../common/moe_common.h"
 using namespace metal;
 using namespace mpp::tensor_ops;
 
@@ -24,13 +25,6 @@ inline bfloat splash_swiglu(bfloat gate, bfloat up) {
   bfloat sigmoid = splash_sigmoid(gate);
   bfloat activated = bfloat(float(sigmoid) * float(gate));
   return bfloat(float(activated) * float(up));
-}
-
-// Splash common/activation.h and shared/moe_gguf.metal epilogue. Gate and
-// up are already BF16; only the final gated product is rounded back to BF16.
-inline bfloat splash_source_swiglu(bfloat gate, bfloat up) {
-  float g=float(gate);
-  return bfloat(float(up)*(g/(1.0f+fast::exp2(-1.44269504089f*g))));
 }
 
 // Same 4 contiguous values per lane and BF16 accumulation contract as
@@ -99,7 +93,7 @@ kernel void splash_moe_route(
   for (uint rank = 0; rank < p.top_k; ++rank) {
     float best = -INFINITY; uint slot = ~0u;
     for (uint j = 0; j < 8; ++j)
-      if ((available & (1u << j)) && (slot == ~0u || scores[j] >= best)) { best = scores[j]; slot = j; }
+      if ((available & (1u << j)) && (slot == ~0u || moe_topk_better<false>(scores[j], j, best, slot))) { best = scores[j]; slot = j; }
     float winner_score = simd_max(best);
     // MLX argpartition currently uses a stable ascending merge sort and
     // takes its last K entries: ties prefer the larger expert ids.
@@ -132,9 +126,6 @@ kernel void splash_moe_route(
   }
 }
 
-inline uint splash_matmul_rows(uint rows, uint tile_rows) {
-  return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
-}
 inline bool splash_column_tile(device const SplashMoeTile *tiles, uint t, constant SplashMoeParams &p) {
   // Preserve the native grouped GEMM accumulation order for sparse experts
   // during prefill. Tiny BF16 rounding differences can change later routing.
@@ -161,17 +152,14 @@ kernel void splash_moe_group(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint count = atomic_load_explicit(counts + tid, memory_order_relaxed);
   uint nt = (count + p.tile_rows - 1) / p.tile_rows;
-  uint start = simd_prefix_exclusive_sum(nt);
-  if (lane == 31) totals[sg] = start + nt;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = 0; i < sg; ++i) start += totals[i];
+  uint start = moe_exclusive_prefix_sum_256(nt, totals, lane, sg);
   offsets[tid] = start;
   if (tid == 255) routed_tiles = start + nt;
   for (uint t = 0; t < nt; ++t) tiles[start + t] = {tid, min(p.tile_rows, count - t * p.tile_rows)};
   if (nt) {
     uint last = start + nt - 1, live = count - (nt - 1) * p.tile_rows;
     for (uint r = start * p.tile_rows + count;
-         r < last * p.tile_rows + splash_matmul_rows(live, p.tile_rows); ++r) routes[r] = ~0u;
+         r < last * p.tile_rows + moe_matmul_rows(live, p.tile_rows); ++r) routes[r] = ~0u;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = tid; r < live_rows * rpr; r += 256) {
@@ -183,7 +171,7 @@ kernel void splash_moe_group(
   }
   uint shared_tiles = (p.rows + p.tile_rows - 1) / p.tile_rows;
   uint shared_base = routed_tiles * p.tile_rows;
-  uint shared_rows = (shared_tiles - 1) * p.tile_rows + splash_matmul_rows(p.rows - (shared_tiles - 1) * p.tile_rows, p.tile_rows);
+  uint shared_rows = (shared_tiles - 1) * p.tile_rows + moe_matmul_rows(p.rows - (shared_tiles - 1) * p.tile_rows, p.tile_rows);
   for (uint t = tid; t < shared_tiles; t += 256)
     tiles[routed_tiles + t] = {p.experts, min(p.tile_rows, p.rows - t * p.tile_rows)};
   for (uint r = tid; r < shared_rows; r += 256) {
@@ -208,7 +196,7 @@ kernel void splash_moe_gather(
     device bfloat *out [[buffer(4)]], constant SplashMoeParams &p [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   if (group.x >= *count) return;
-  uint rows = splash_column_tile(tiles, group.x, p) ? tiles[group.x].rows : splash_matmul_rows(tiles[group.x].rows, p.tile_rows);
+  uint rows = splash_column_tile(tiles, group.x, p) ? tiles[group.x].rows : moe_matmul_rows(tiles[group.x].rows, p.tile_rows);
   uint col = group.y * 256 + (tid % 32) * 8;
   for (uint i = tid / 32; i < rows; i += 8) {
     uint row = group.x * p.tile_rows + i, route = routes[row];
@@ -273,92 +261,6 @@ template <class Run> inline void splash_format(SplashWeights s, uint column, uin
       case 5: { SplashDecoder<kq_m8::Q5K, 5, false> d(s,column,K); run(d); break; }
       default: { SplashDecoder<kq_m8::Q6K, 6, false> d(s,column,K); run(d); break; }
     }
-  }
-}
-
-// Source-specialized half-weight column tile. Adapted from Splash's
-// common/gguf_column_tile.h (Apache-2.0; see THIRD_PARTY_NOTICES). Native T64
-// code/metadata addressing is retained; only 32 half values remain live.
-// Separate entrypoints below exclude generic F32/double-half staging from
-// these pipelines, so its register allocation cannot survive a uniform branch.
-template <class Decoder>
-inline void splash_source_chunks(thread const Decoder& decoder, thread half4 (&v)[8]) {
-#pragma unroll
-  for (ushort j=0;j<4;++j) {
-    uint2 q=kq_m8::bytes8<Decoder::format>(decoder.codes,j);
-    float scale=j<2 ? decoder.coef.s.x : decoder.coef.s.y;
-    float bias=j<2 ? decoder.coef.m.x : decoder.coef.m.y;
-    float4 a=fma(float4(as_type<uchar4>(q.x)),float4(scale),float4(bias));
-    float4 b=fma(float4(as_type<uchar4>(q.y)),float4(scale),float4(bias));
-    v[2*j]=half4(a.x,b.x,a.y,b.y);
-    v[2*j+1]=half4(a.z,b.z,a.w,b.w);
-  }
-}
-template <class Run>
-inline void splash_source_format(SplashWeights s,uint column,uint K,Run run) {
-  // Host eligibility admits Q4/Q6 only. A single uniform format/layout choice
-  // serves both the column and half-MPP bodies without Q5/native precision code.
-  if(s.format&256) {
-    if((s.format&255)==4) { SplashDecoder<kq_m8::Q4K,4,true> d(s,column,K);run(d); }
-    else { SplashDecoder<kq_m8::Q6K,6,true> d(s,column,K);run(d); }
-  } else {
-    if((s.format&255)==4) { SplashDecoder<kq_m8::Q4K,4,false> d(s,column,K);run(d); }
-    else { SplashDecoder<kq_m8::Q6K,6,false> d(s,column,K);run(d); }
-  }
-}
-inline void splash_source_column(SplashWeights s,device const bfloat* x,
-    uint rows,uint K,uint column,thread float (&sums)[2]) {
-  sums[0]=sums[1]=0.0f;
-  splash_source_format(s,column,K,[&](auto decoder) {
-    for(uint step=0;step<K/32;++step) {
-      half4 v[8];splash_source_chunks(decoder,v);
-      if(step+1<K/32) decoder.load(step+1);
-#pragma unroll
-      for(ushort r=0;r<2;++r) {
-        if(r>=rows) break;
-        device const uint4* xr=reinterpret_cast<device const uint4*>(x+ulong(r)*K+step*32);
-        float sum=0.0f;
-#pragma unroll
-        for(ushort i=0;i<8;++i) {
-          const uint4 q=xr[i/2];
-          const float4 xv=float4(as_type<bfloat4>(i%2 ? q.zw : q.xy)),wv=float4(v[i]);
-          sum=sum+wv.x*xv.x;sum=sum+wv.y*xv.y;
-          sum=sum+wv.z*xv.z;sum=sum+wv.w*xv.w;
-        }
-        sums[r]+=sum;
-      }
-    }
-  });
-}
-
-template <ushort Rows,class Finish>
-inline void splash_source_staged(SplashWeights s,device bfloat* x,uint K,
-    uint column0,uint lane,threadgroup half* stage,Finish finish) {
-  constexpr auto desc=matmul2d_descriptor(Rows,32,32,false,true,false,
-      matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<desc,execution_simdgroups<1>> op;
-  tensor<device bfloat,dextents<int,2>,tensor_inline> at(x,dextents<int,2>{int(K),Rows},array<int,2>{1,int(K)});
-  tensor<threadgroup half,dextents<int,2>,tensor_inline> bt0(stage,dextents<int,2>{32,32},array<int,2>{1,32});
-  tensor<threadgroup half,dextents<int,2>,tensor_inline> bt1(stage+1024,dextents<int,2>{32,32},array<int,2>{1,32});
-  auto a=at.template slice<32,Rows>(0,0);
-  auto b0=bt0.template slice<32,32>(0,0),b1=bt1.template slice<32,32>(0,0);
-  auto acc=op.template get_destination_cooperative_tensor<decltype(a),decltype(b0),float>();
-  for(ushort i=0;i<acc.get_capacity();++i) acc[i]=0.0f;
-  splash_source_format(s,column0+lane,K,[&](auto decoder) {
-    for(uint step=0;step<K/32;++step) {
-      half4 v[8];splash_source_chunks(decoder,v);
-      threadgroup half4* dst=reinterpret_cast<threadgroup half4*>(stage+(step&1)*1024+lane*32);
-#pragma unroll
-      for(ushort i=0;i<8;++i) dst[i]=v[i];
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-      if(step+1<K/32) decoder.load(step+1);
-      auto av=at.template slice<32,Rows>(step*32,0);
-      if(step&1) op.run(av,b1,acc);else op.run(av,b0,acc);
-    }
-  });
-  for(ushort i=0;i<acc.get_capacity();++i) if(acc.is_valid_element(i)) {
-    auto index=acc.get_multidimensional_index(i);
-    finish(uint(index[1]),uint(index[0]),float(acc[i]));
   }
 }
 
@@ -462,7 +364,7 @@ template <ushort Max, class Run> inline void splash_live(uint rows, Run run) {
   run(integral_constant<ushort,Max>{});
 }
 
-template <ushort Rows,bool SourceColumn=false>
+template <ushort Rows>
 kernel void splash_moe_gate_up(
     device bfloat *x [[buffer(0)]], device const SplashMoeTile *tiles [[buffer(1)]], device const uint *count [[buffer(2)]],
     device const uint *gw [[buffer(3)]], device const uchar *gs [[buffer(4)]], device const half *gb [[buffer(5)]],
@@ -484,16 +386,13 @@ kernel void splash_moe_gate_up(
   threadgroup bfloat *gate=reinterpret_cast<threadgroup bfloat *>(stage);
   if (splash_column_tile(tiles,group.y,p)) {
     float sums[2];
-    if constexpr(SourceColumn) splash_source_column(w,input,t.rows,p.hidden,origin+lane,sums);
-    else splash_column(w,input,t.rows,p.hidden,origin+lane,sums);
+    splash_column(w,input,t.rows,p.hidden,origin+lane,sums);
     if((p.normalize>>8)==(up?2u:1u)) for(uint r=0;r<t.rows;++r) diagnostic[base+ulong(r)*p.intermediate+origin+lane]=bfloat(sums[r]);
     if (!up) for (uint r=0;r<t.rows;++r) gate[r*32+lane]=bfloat(sums[r]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up) for (uint r=0;r<t.rows;++r) {
       float g=float(gate[r*32+lane]);
-      out[base+ulong(r)*p.intermediate+origin+lane]=(SourceColumn || p.source_math)
-          ? splash_source_swiglu(bfloat(g),bfloat(sums[r]))
-          : splash_swiglu(bfloat(g),bfloat(sums[r]));
+      out[base+ulong(r)*p.intermediate+origin+lane]=splash_swiglu(bfloat(g),bfloat(sums[r]));
     }
     return;
   }
@@ -504,18 +403,17 @@ kernel void splash_moe_gate_up(
       if (!up) gate[r*32+c]=bfloat(v);
       else out[base+ulong(r)*p.intermediate+origin+c]=bfloat(v);
     };
-    if constexpr(SourceColumn) splash_source_staged<decltype(n)::value>(w,input,p.hidden,origin,lane,stage+sg*2048,finish);
-    else splash_staged<decltype(n)::value>(w,input,p.hidden,origin,lane,stage+sg*2048,bool(p.normalize&32),finish);
+    splash_staged<decltype(n)::value>(w,input,p.hidden,origin,lane,stage+sg*2048,bool(p.normalize&32),finish);
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     if (up) for (uint r=0;r<decltype(n)::value;++r) {
       float g=float(gate[r*32+lane]);
       ulong i=base+ulong(r)*p.intermediate+origin+lane;
-      out[i]=(SourceColumn || p.source_math) ? splash_source_swiglu(bfloat(g),out[i]) : splash_swiglu(bfloat(g),out[i]);
+      out[i]=splash_swiglu(bfloat(g),out[i]);
     }
   });
 }
 
-template <ushort Rows,bool SourceColumn=false>
+template <ushort Rows>
 kernel void splash_moe_down(
     device bfloat *x [[buffer(0)]], device const SplashMoeTile *tiles [[buffer(1)]], device const uint *count [[buffer(2)]],
     device const uint *w [[buffer(3)]], device const uchar *s [[buffer(4)]], device const half *b [[buffer(5)]],
@@ -530,19 +428,16 @@ kernel void splash_moe_down(
   ulong base=ulong(group.y)*Rows*p.hidden; uint origin=group.x*64+sg*32;
   if (splash_column_tile(tiles,group.y,p)) {
     float sums[2];
-    if constexpr(SourceColumn) splash_source_column(weights,input,t.rows,p.intermediate,origin+lane,sums);
-    else splash_column(weights,input,t.rows,p.intermediate,origin+lane,sums);
+    splash_column(weights,input,t.rows,p.intermediate,origin+lane,sums);
     for (uint r=0;r<t.rows;++r) out[base+ulong(r)*p.hidden+origin+lane]=bfloat(sums[r]);
   } else splash_live<Rows>(t.rows,[&](auto n) {
     auto finish=[&](uint r,uint c,float v) { out[base+ulong(r)*p.hidden+origin+c]=bfloat(v); };
-    if constexpr(SourceColumn) splash_source_staged<decltype(n)::value>(weights,input,p.intermediate,origin,lane,stage+sg*2048,finish);
-    else splash_staged<decltype(n)::value>(weights,input,p.intermediate,origin,lane,stage+sg*2048,bool(p.normalize&32),finish);
+    splash_staged<decltype(n)::value>(weights,input,p.intermediate,origin,lane,stage+sg*2048,bool(p.normalize&32),finish);
   });
 }
 
 kernel void splash_moe_combine(device const bfloat *experts [[buffer(0)]], device const uint *inverse [[buffer(1)]],
     device const float *weights [[buffer(2)]], device void *out [[buffer(3)]], constant SplashMoeParams &p [[buffer(4)]], device const int *row_budget [[buffer(5)]],
-    device const bfloat *residual [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   uint row=group.x,col=group.y*256+tid; float routed=0.0f; uint base=row*(p.top_k+1);
   // Dead routed slots have no inverse entry. Initialize their physical output
@@ -550,15 +445,6 @@ kernel void splash_moe_combine(device const bfloat *experts [[buffer(0)]], devic
   if((p.normalize&8) && row>=uint(clamp(*row_budget,1,int(p.rows)))) {
     if((p.normalize&6)==6) static_cast<device bfloat *>(out)[ulong(row)*p.hidden+col]=bfloat(0);
     else static_cast<device float *>(out)[ulong(row)*p.hidden+col]=0.0f;
-    return;
-  }
-  if(p.source_math) {
-    // Source combine starts at the BF16 residual in F32 and casts only once.
-    // The original zero-residual diagnostic remains independently available.
-    if(p.source_residual) routed=float(residual[ulong(row)*p.hidden+col]);
-    for(uint k=0;k<=p.top_k;++k)
-      routed += weights[base+k]*float(experts[ulong(inverse[base+k])*p.hidden+col]);
-    static_cast<device bfloat *>(out)[ulong(row)*p.hidden+col]=bfloat(routed);
     return;
   }
   for (uint k=0;k<p.top_k;++k) {
@@ -570,13 +456,7 @@ kernel void splash_moe_combine(device const bfloat *experts [[buffer(0)]], devic
   }
   float shared=weights[base+p.top_k]*float(experts[ulong(inverse[base+p.top_k])*p.hidden+col]);
   if (p.normalize & 4) shared=float(bfloat(shared));
-  if ((p.normalize & 6)==6) {
-    // The residual-inclusive primitive must keep its output meaning when a
-    // shapeless replay leaves M8: retain native FFN rounding, then BF16 add.
-    bfloat ffn=bfloat(routed+shared);
-    static_cast<device bfloat *>(out)[ulong(row)*p.hidden+col]=p.source_residual
-        ? bfloat(float(residual[ulong(row)*p.hidden+col])+float(ffn)) : ffn;
-  }
+  if ((p.normalize & 6)==6) static_cast<device bfloat *>(out)[ulong(row)*p.hidden+col]=bfloat(routed+shared);
   else static_cast<device float *>(out)[ulong(row)*p.hidden+col]=routed+shared;
 }
 
@@ -584,8 +464,6 @@ template [[host_name("splash_moe_gate_up_8")]] kernel decltype(splash_moe_gate_u
 template [[host_name("splash_moe_gate_up_32")]] kernel decltype(splash_moe_gate_up<32>) splash_moe_gate_up<32>;
 template [[host_name("splash_moe_down_8")]] kernel decltype(splash_moe_down<8>) splash_moe_down<8>;
 template [[host_name("splash_moe_down_32")]] kernel decltype(splash_moe_down<32>) splash_moe_down<32>;
-template [[host_name("splash_moe_gate_up_source_8")]] kernel decltype(splash_moe_gate_up<8,true>) splash_moe_gate_up<8,true>;
-template [[host_name("splash_moe_down_source_8")]] kernel decltype(splash_moe_down<8,true>) splash_moe_down<8,true>;
 
 kernel void splash_moe_probe_scatter(device const bfloat *source [[buffer(0)]],
     device const uint *inverse [[buffer(1)]], device bfloat *out [[buffer(2)]],

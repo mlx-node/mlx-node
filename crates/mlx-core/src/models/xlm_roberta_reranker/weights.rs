@@ -4,13 +4,13 @@ use crate::{
     models::{
         quant_dispatch::{self, KQuantLayout, PerLayerMode, PerLayerQuant},
         quantized_linear::{LinearProj, QuantizedLinear},
-        rerank_checkpoint::{UniqueMap, validate_header},
+        rerank_checkpoint::{
+            read_weights_with, validate_matrix_weights, validate_quantization, weight_formats,
+        },
     },
     nn::{Embedding, LayerNorm, Linear},
-    utils::safetensors::load_safetensors_lazy,
 };
 use napi::Result;
-use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -18,73 +18,7 @@ use std::{
 };
 
 pub(crate) fn read_weights(dir: &Path) -> Result<HashMap<String, MxArray>> {
-    let index_path = dir.join("model.safetensors.index.json");
-    let mut files = BTreeSet::new();
-    let expected = if index_path.exists() {
-        #[derive(Deserialize)]
-        struct Index {
-            weight_map: UniqueMap<String>,
-        }
-        let index: Index =
-            serde_json::from_str(&std::fs::read_to_string(index_path).map_err(invalid)?)
-                .map_err(invalid)?;
-        let map = index.weight_map.0;
-        if map.is_empty() {
-            return Err(invalid("empty weight_map"));
-        }
-        let mut expected = HashMap::new();
-        for (key, file) in map {
-            let file = file.as_str();
-            if Path::new(file).components().count() != 1 || !file.ends_with(".safetensors") {
-                return Err(invalid("invalid shard path"));
-            }
-            files.insert(file.to_owned());
-            expected.insert(key.clone(), file.to_owned());
-        }
-        Some(expected)
-    } else {
-        let found: Vec<_> = ["model.safetensors", "weights.safetensors"]
-            .into_iter()
-            .filter(|f| dir.join(f).exists())
-            .collect();
-        if found.len() != 1 {
-            return Err(invalid("expected one checkpoint or a safetensors index"));
-        }
-        files.insert(found[0].to_owned());
-        None
-    };
-    let mut out = HashMap::new();
-    for file in files {
-        validate_header(&dir.join(&file))?;
-        for (key, value) in load_safetensors_lazy(dir.join(&file))? {
-            if let Some(expected) = &expected
-                && expected.get(&key) != Some(&file)
-            {
-                return Err(invalid(format!("tensor {key} does not match shard index")));
-            }
-            if out.insert(key.clone(), value).is_some() {
-                return Err(invalid(format!("duplicate tensor {key}")));
-            }
-        }
-    }
-    if let Some(expected) = expected
-        && let Some(missing) = expected.keys().find(|key| !out.contains_key(*key))
-    {
-        return Err(invalid(format!("missing index tensor {missing}")));
-    }
-    Ok(out)
-}
-fn validate_quantization(q: PerLayerQuant, context: &str) -> Result<()> {
-    if q.bits != 4
-        || !matches!(q.mode, PerLayerMode::Affine | PerLayerMode::Mxfp4)
-        || q.input_amax.is_some()
-        || q.layout != KQuantLayout::RowMajor
-        || q.group_size <= 0
-        || (q.mode == PerLayerMode::Mxfp4 && q.group_size != 32)
-    {
-        return Err(invalid(format!("unsupported quantization for {context}")));
-    }
-    Ok(())
+    read_weights_with(dir, str::to_owned, None)
 }
 
 pub(crate) struct Weights {
@@ -152,49 +86,16 @@ impl Weights {
         Ok(t)
     }
     fn matrix(&self, base: &str, rows: i64, columns: i64) -> Result<()> {
-        let w = self.tensor(&format!("{base}.weight"))?;
-        let shape = w.shape()?;
-        if self.tensors.contains_key(&format!("{base}.scales")) {
-            if !self.has_quant_config {
-                return Err(invalid(
-                    "packed weights require explicit quantization metadata",
-                ));
-            }
-            let q = quant_dispatch::effective_plq_for(base, &self.overrides, self.default, None);
-            validate_quantization(q, base)?;
-            if columns % i64::from(q.group_size) != 0 || columns % 8 != 0 {
-                return Err(invalid(format!("invalid quantization geometry for {base}")));
-            }
-            if shape.as_ref() != [rows, columns / 8] || w.dtype()? != DType::Uint32 {
-                return Err(invalid(format!("invalid packed shape/dtype for {base}")));
-            }
-            let scales = self.tensor(&format!("{base}.scales"))?;
-            if scales.shape()?.as_ref() != [rows, columns / i64::from(q.group_size)] {
-                return Err(invalid(format!("invalid scales for {base}")));
-            }
-            if q.mode == PerLayerMode::Affine {
-                let biases = self.tensor(&format!("{base}.biases"))?;
-                if biases.shape()?.as_ref() != scales.shape()?.as_ref() {
-                    return Err(invalid(format!("invalid biases for {base}")));
-                }
-                quant_dispatch::ensure_dense_weight_floating(base, scales)?;
-                quant_dispatch::ensure_dense_weight_floating(base, biases)?;
-            } else if scales.dtype()? != DType::Uint8
-                || self.tensors.contains_key(&format!("{base}.biases"))
-            {
-                return Err(invalid(format!("invalid MXFP4 sidecars for {base}")));
-            }
-        } else {
-            quant_dispatch::ensure_dense_weight_floating(base, w)?;
-            if shape.as_ref() != [rows, columns]
-                || self.tensors.contains_key(&format!("{base}.biases"))
-            {
-                return Err(invalid(format!(
-                    "invalid dense shape or orphan sidecar for {base}"
-                )));
-            }
-        }
-        Ok(())
+        validate_matrix_weights(
+            &self.tensors,
+            &self.overrides,
+            self.default,
+            self.has_quant_config,
+            base,
+            rows,
+            columns,
+            true,
+        )
     }
 
     pub fn linear(&self, base: &str, rows: i64, columns: i64) -> Result<LinearProj> {
@@ -369,24 +270,7 @@ impl Weights {
         Ok(())
     }
     pub fn formats(&self) -> Vec<&'static str> {
-        let mut formats = BTreeSet::new();
-        for key in self
-            .tensors
-            .keys()
-            .filter_map(|k| k.strip_suffix(".weight"))
-        {
-            if self.tensors.contains_key(&format!("{key}.scales")) {
-                let q = quant_dispatch::effective_plq_for(key, &self.overrides, self.default, None);
-                formats.insert(if q.mode == PerLayerMode::Mxfp4 {
-                    "mxfp4"
-                } else {
-                    "affine-4bit"
-                });
-            } else {
-                formats.insert("dense");
-            }
-        }
-        formats.into_iter().collect()
+        weight_formats(&self.tensors, &self.overrides, self.default)
     }
 }
 

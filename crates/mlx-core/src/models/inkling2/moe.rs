@@ -4,6 +4,9 @@ use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_MODE, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear,
 };
+use crate::moe::{
+    SwitchLinear, SwitchProj, gather_sort, scatter_unsort, sigmoid_biased_topk_from_logits,
+};
 use crate::nn::Activations;
 
 use super::kernels::Inkling2MoeQuantMode;
@@ -40,8 +43,8 @@ pub(crate) fn moe_fused_enabled() -> bool {
     })
 }
 
-/// Expert projection backend: either packed quantized (`NVFP4`, `Q8_0` affine, K-quant, etc.)
-/// or dense FP/BF16 `[num_experts, out_features, in_features]`.
+/// Compatibility input enum for Inkling2 persistence; converts into the
+/// shared [`crate::moe::SwitchProj`].
 pub enum ExpertSwitchProj {
     Quantized(QuantizedSwitchLinear),
     Dense(MxArray),
@@ -70,42 +73,13 @@ impl ExpertSwitchProj {
         }
         Ok(())
     }
+}
 
-    pub fn outer_scale(&self) -> Option<&MxArray> {
-        match self {
-            Self::Quantized(q) => q.outer_scale(),
-            Self::Dense(_) => None,
-        }
-    }
-
-    pub fn forward_without_outer_scale(
-        &self,
-        x: &MxArray,
-        indices: &MxArray,
-        sorted: bool,
-    ) -> Result<MxArray> {
-        match self {
-            Self::Quantized(q) => q.forward_without_outer_scale(x, indices, sorted),
-            Self::Dense(w) => {
-                let w_t = w.transpose(Some(&[0, 2, 1]))?;
-                x.gather_mm(&w_t, indices, sorted)
-            }
-        }
-    }
-
-    pub fn weight_refs(&self) -> Vec<&MxArray> {
-        match self {
-            Self::Quantized(q) => {
-                let mut refs = vec![q.get_weight(), q.get_scales()];
-                if let Some(b) = q.get_biases() {
-                    refs.push(b);
-                }
-                if let Some(s) = q.outer_scale() {
-                    refs.push(s);
-                }
-                refs
-            }
-            Self::Dense(w) => vec![w],
+impl From<ExpertSwitchProj> for SwitchProj {
+    fn from(proj: ExpertSwitchProj) -> Self {
+        match proj {
+            ExpertSwitchProj::Quantized(q) => SwitchProj::Quantized(q),
+            ExpertSwitchProj::Dense(w) => SwitchProj::Standard(SwitchLinear::from_weight(w)),
         }
     }
 }
@@ -170,13 +144,11 @@ pub struct Inkling2MoE {
     pub router_bias_f32: Option<MxArray>,
 
     /// Stacked expert projections (`gate_up_proj`: `[E, 2*I, D]`, `down_proj`: `[E, D, I]`).
-    pub gate_up_proj: ExpertSwitchProj,
-    pub down_proj: ExpertSwitchProj,
+    pub gate_up_proj: SwitchProj,
+    pub down_proj: SwitchProj,
 
     /// Post-MoE static ShortConv weight `[D, 4]` (F32, oldest-to-newest).
     pub post_conv: MxArray,
-
-    k_scalar: MxArray,
 }
 
 impl Inkling2MoE {
@@ -191,11 +163,10 @@ impl Inkling2MoE {
         gate_up_interleaved: bool,
         router_weight: MxArray,
         router_bias: Option<MxArray>,
-        gate_up_proj: ExpertSwitchProj,
-        down_proj: ExpertSwitchProj,
+        gate_up_proj: impl Into<SwitchProj>,
+        down_proj: impl Into<SwitchProj>,
         post_conv: MxArray,
     ) -> Result<Self> {
-        let k_scalar = MxArray::scalar_int(top_k as i32)?;
         let router_weight_f32 = router_weight.astype(DType::Float32)?;
         let router_weight_t_f32 = router_weight_f32.transpose(None)?;
         let router_bias_f32 = match router_bias {
@@ -213,10 +184,9 @@ impl Inkling2MoE {
             router_weight_f32,
             router_weight_t_f32,
             router_bias_f32,
-            gate_up_proj,
-            down_proj,
+            gate_up_proj: gate_up_proj.into(),
+            down_proj: down_proj.into(),
             post_conv,
-            k_scalar,
         })
     }
 
@@ -243,23 +213,15 @@ impl Inkling2MoE {
             x.astype(DType::Float32)?
         };
         let router_logits = x_f32.matmul(&self.router_weight_t_f32)?; // `[T, E]`
-        let probs = Activations::sigmoid(&router_logits)?; // `[T, E]`
-        let sel_scores = if let Some(ref bias) = self.router_bias_f32 {
-            probs.add(bias)?
-        } else {
-            probs.clone()
-        };
-
-        // Descending argsort on `-sel_scores` breaks ties in favor of smaller expert indices.
-        let top_k_indices = sel_scores
-            .negative()?
-            .argsort(Some(-1))?
-            .slice_axis(1, 0, k)?; // `[T, K]`
-
-        // Gather unbiased sigmoid probs and normalize * route_scale
-        let probs_sel = probs.take_along_axis(&top_k_indices, -1)?; // `[T, K]`
-        let denom = probs_sel.sum(Some(&[-1]), Some(true))?.add_scalar(1e-20)?;
-        let mut gamma = probs_sel.div(&denom)?.mul_scalar(self.route_scale)?; // `[T, K]` FP32
+        let (mut gamma, top_k_indices) = sigmoid_biased_topk_from_logits(
+            &router_logits,
+            self.router_bias_f32.as_ref(),
+            self.top_k as i32,
+            1e-20,
+            self.route_scale,
+            true,
+            true,
+        )?;
 
         // 2. Prepare inputs for `QuantizedSwitchLinear`.
         // At `total_slots >= 64` (M>=8 verify/prefill), sorting by expert id keeps adjacent
@@ -271,14 +233,8 @@ impl Inkling2MoE {
         let do_sort = total_slots >= 64;
 
         let (x_for_gather, idx_for_gather, inv_order) = if do_sort {
-            let flat_indices = top_k_indices.reshape(&[-1])?; // `[T * K]`
-            let order = flat_indices.argsort(Some(-1))?;
-            let inv = order.argsort(Some(-1))?;
-            let idx_sorted = flat_indices.take(&order, 0)?;
-            let x_exp = x.reshape(&[t, 1, d])?;
-            let tok_idx = order.floor_divide(&self.k_scalar)?;
-            let x_sorted = x_exp.take(&tok_idx, 0)?;
-            (x_sorted, idx_sorted, Some(inv))
+            let sorted = gather_sort(x, &top_k_indices)?;
+            (sorted.x_sorted, sorted.idx_sorted, Some(sorted.inv_order))
         } else {
             (x.reshape(&[t, 1, 1, d])?, top_k_indices.clone(), None)
         };
@@ -335,13 +291,15 @@ impl Inkling2MoE {
         };
 
         // 5. `down_proj` WITHOUT outer scale; fold `down_proj.outer_scale()` directly into `gamma`
-        let mut down_out =
+        let down_out =
             self.down_proj
                 .forward_without_outer_scale(&act_in, &idx_for_gather, do_sort)?;
-        if let Some(ref inv) = inv_order {
-            down_out = down_out.take(inv, 0)?;
-        }
-        let down_tkd = down_out.reshape(&[t, k, d])?.astype(DType::Float32)?;
+        let down_tkd = match inv_order {
+            Some(ref inv) => scatter_unsort(&down_out, inv, &[t, k])?
+                .squeeze(Some(&[-2]))?
+                .astype(DType::Float32)?,
+            None => down_out.reshape(&[t, k, d])?.astype(DType::Float32)?,
+        };
 
         if let Some(outer) = self.down_proj.outer_scale() {
             let outer_f32 = if outer.dtype()? == DType::Float32 {
@@ -491,19 +449,15 @@ impl Inkling2MoE {
             )?;
             (idx, w, true)
         } else {
-            let probs = Activations::sigmoid(&router_logits)?;
-            let sel_scores = if let Some(ref bias) = self.router_bias_f32 {
-                probs.add(bias)?
-            } else {
-                probs.clone()
-            };
-            let topk = sel_scores
-                .negative()?
-                .argsort(Some(-1))?
-                .slice_axis(1, 0, k)?;
-            let probs_sel = probs.take_along_axis(&topk, -1)?;
-            let denom = probs_sel.sum(Some(&[-1]), Some(true))?.add_scalar(1e-20)?;
-            let gam = probs_sel.div(&denom)?.mul_scalar(self.route_scale)?;
+            let (gam, topk) = sigmoid_biased_topk_from_logits(
+                &router_logits,
+                self.router_bias_f32.as_ref(),
+                self.top_k as i32,
+                1e-20,
+                self.route_scale,
+                true,
+                true,
+            )?;
             (topk, gam, false)
         };
 
@@ -520,14 +474,8 @@ impl Inkling2MoE {
             let do_sort = total_slots >= 64;
 
             let (x_for_gather, idx_for_gather, inv_order) = if do_sort {
-                let flat_indices = top_k_indices.reshape(&[-1])?;
-                let order = flat_indices.argsort(Some(-1))?;
-                let inv = order.argsort(Some(-1))?;
-                let idx_sorted = flat_indices.take(&order, 0)?;
-                let x_exp = x.reshape(&[t, 1, d])?;
-                let tok_idx = order.floor_divide(&self.k_scalar)?;
-                let x_sorted = x_exp.take(&tok_idx, 0)?;
-                (x_sorted, idx_sorted, Some(inv))
+                let sorted = gather_sort(x, &top_k_indices)?;
+                (sorted.x_sorted, sorted.idx_sorted, Some(sorted.inv_order))
             } else {
                 (x.reshape(&[t, 1, 1, d])?, top_k_indices.clone(), None)
             };
@@ -582,11 +530,12 @@ impl Inkling2MoE {
                     act_dtype,
                 )?
             } else {
-                let down_u = match inv_order {
-                    Some(ref inv) => down_out.take(inv, 0)?,
-                    None => down_out,
+                let down_tkd = match inv_order {
+                    Some(ref inv) => scatter_unsort(&down_out, inv, &[t, k])?
+                        .squeeze(Some(&[-2]))?
+                        .astype(DType::Float32)?,
+                    None => down_out.reshape(&[t, k, d])?.astype(DType::Float32)?,
                 };
-                let down_tkd = down_u.reshape(&[t, k, d])?.astype(DType::Float32)?;
                 if !down_scale_folded && let Some(outer) = self.down_proj.outer_scale() {
                     let outer_f32 = if outer.dtype()? == DType::Float32 {
                         outer.clone()
@@ -776,7 +725,7 @@ impl Inkling2MoE {
         {
             return false;
         }
-        let (ExpertSwitchProj::Quantized(gu), ExpertSwitchProj::Quantized(dn)) =
+        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return false;
@@ -816,7 +765,7 @@ impl Inkling2MoE {
         {
             return Ok(None);
         }
-        let (ExpertSwitchProj::Quantized(gu), ExpertSwitchProj::Quantized(dn)) =
+        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return Ok(None);
@@ -892,7 +841,7 @@ impl Inkling2MoE {
         {
             return Ok(None);
         }
-        let (ExpertSwitchProj::Quantized(gu), ExpertSwitchProj::Quantized(dn)) =
+        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return Ok(None);

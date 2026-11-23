@@ -1120,7 +1120,6 @@ fn fused_convolve_matches_elementwise_chain() {
     let (hidden_size, group_size, kernel_size) = (64usize, 16i64, 2usize);
     let groups = hidden_size / group_size as usize;
     let conv = GroupedDynamicCausalConv {
-        source_enabled: false,
         base_kernel: MxArray::random_normal(
             &[2, kernel_size as i64, hidden_size as i64],
             0.0,
@@ -1468,7 +1467,6 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         .unwrap()
     };
     let conv = || GroupedDynamicCausalConv {
-        source_enabled: false,
         base_kernel: MxArray::random_normal(
             &[2, 2, hidden as i64],
             0.0,
@@ -2776,8 +2774,8 @@ mod adaptive_budget_tests {
         let old = MxArray::from_handle(old, "old")?;
         let path = MxArray::from_handle(path, "path")?;
         let confidence = MxArray::from_handle(confidence, "confidence")?;
-        let params = crate::models::qwen3_5_moe::verify_budget::VerifyBudget::default()
-            .parameters(false, true);
+        let params =
+            crate::models::qwen3_5::verify_budget::VerifyBudget::default().parameters(false, true);
         let mut values = vec![params.acceptance.slope];
         values.extend(params.acceptance.intercepts);
         values.extend(params.costs);

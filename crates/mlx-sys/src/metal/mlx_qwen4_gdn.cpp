@@ -151,7 +151,7 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
         "qwen4_gdn_prepare",
         {"qkv", "a", "b", "conv", "history", "scale", "dt"},
         {"q", "k", "v", "decay", "beta", "next_history"},
-#include "metal/qwen4/gdn_prepare.metal.inc"
+#include "metal/common/gdn_prepare.metal.inc"
         , complete_gdn_header, /*ensure_row_contiguous=*/false);
     auto result = fn(in,
                      {{1, t, 16, 128},

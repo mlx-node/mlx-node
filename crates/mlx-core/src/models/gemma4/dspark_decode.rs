@@ -24,21 +24,17 @@
 //!     variant dispatch ([`Gemma4DraftTurnState`] / [`Gemma4DraftStepper`] /
 //!     `begin_dspark_decode`), and the flat whole-turn core.
 
-use std::time::Instant;
-
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, TurnOutput, WholeTurnArgs,
+    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, ResetScope,
+    TurnOutput, WholeTurnArgs,
 };
-use crate::engine::decode::TurnStreaming;
-use crate::engine::dspark_turn::{DsparkTurnArgs, PagedDsparkBackend, run_dspark_turn};
-use crate::engine::finalize::compute_performance_metrics;
-use crate::engine::params::{ChatParams, generated_capacity_hint};
-use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::dspark_turn::{
+    FlatDsparkBackend, FlatDsparkPrefix, PagedDsparkBackend, run_flat_dspark_turn,
+};
+use crate::engine::params::ChatParams;
 use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
 use crate::models::forward::PREFILL_CANCELLED;
 use crate::stream::{Stream, StreamContext};
@@ -761,62 +757,13 @@ impl PagedDsparkBackend for Gemma4Inner {
     }
 }
 
-impl Gemma4Inner {
-    /// FLAT-lane draft whole-turn core behind gemma4's
-    /// `ChatBackend::run_speculative_turn` executor — the draft analog of the
-    /// engine's generic `chat_turn_core` tail, sync AND streaming through
-    /// the same body (`args.sink` presence selects the mode, mirroring
-    /// `vision_chat_turn` / the MTP whole-turn cores).
-    ///
-    /// The ASSISTANT drafter is the only one that runs here: its Q-only
-    /// attention reads the target's flat `Gemma4LayerCache` K/V arrays
-    /// directly, which the block-paged pools cannot hand it. DSpark verifies
-    /// against the paged pools and is routed to
-    /// `engine::dspark_turn::run_paged_dspark_turn` instead.
-    ///
-    /// Flow: resolve params (+ `extra_eos_ids`) → prefix decision via the
-    /// existing cache-prefix machinery → the assistant's chunked prefill
-    /// (keeping only the last token's post-final-norm hidden) → anchor sample
-    /// (byte-identical to the generic flow) → `run_dspark_turn` → save
-    /// (AR-parity: stop exits drop the final token, length exits
-    /// materialize its K/V and keep all — post-turn history AND cache
-    /// offsets equal the AR flow's for every stop shape) → finalize
-    /// (+ default `augment_performance`, which fills the `mtp_*`
-    /// acceptance fields). Every error between prefill start and the save
-    /// fails CLOSED (`draft_fail_closed`).
-    pub(crate) fn flat_draft_chat_turn(
+impl FlatDsparkBackend for Gemma4Inner {
+    fn prepare_flat_dspark_turn(
         &mut self,
-        args: &mut WholeTurnArgs<'_>,
-    ) -> Result<TurnOutput> {
-        let tokenizer = args.tokenizer.clone();
-        let eos_id = args.eos_id;
-        let thinking = args.thinking;
-        let is_delta = args.plan.is_delta;
-        let tokens: Vec<u32> = args.tokens.to_vec();
-        let is_streaming = args.sink.is_some();
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        // Owned params: re-resolve from the request config (deterministic —
-        // identical to what the session core handed us in `args.params`),
-        // then populate the stop-set the loop reads from
-        // `ChatParams::extra_eos_ids` (the generic flow threads it as a
-        // separate decode-loop argument instead).
-        let mut p = ChatBackend::resolve_params(self, args.config);
-        p.extra_eos_ids = ChatBackend::extra_eos_ids(self);
-        let reuse_cache = p.reuse_cache;
-        let report_perf = p.report_performance;
-        let max_new_tokens = p.max_new_tokens;
-
-        let generation_start = report_perf.then(Instant::now);
-        let mut first_token_instant: Option<Instant> = None;
-
-        // Prefix decision — the generic core's reset-or-delta split:
-        //   Fresh: all-or-nothing `verify_cache_prefix`; strict-extend hits
-        //   prefill only the tail, miss AND exact-match reset + re-prefill.
-        //   Delta: strict extension by construction (`tokens` == cached
-        //   history ++ delta); prefill exactly the tail.
+        tokens: &[u32],
+        params: &ChatParams,
+        is_delta: bool,
+    ) -> Result<FlatDsparkPrefix> {
         let prior_cached_len = if is_delta {
             self.cached_token_history.len()
         } else {
@@ -832,7 +779,7 @@ impl Gemma4Inner {
         let (prefill_tokens, cached_prefix_len): (Vec<u32>, usize) = if is_delta {
             (tokens[prior_cached_len..].to_vec(), prior_cached_len)
         } else {
-            let hit = ChatBackend::verify_cache_prefix(self, &tokens, reuse_cache);
+            let hit = ChatBackend::verify_cache_prefix(self, tokens, params.reuse_cache);
             if hit > 0 && hit < tokens.len() {
                 tracing::info!(
                     "DSpark cache reuse: {} cached tokens, {} new tokens to prefill",
@@ -842,261 +789,89 @@ impl Gemma4Inner {
                 (tokens[hit..].to_vec(), hit)
             } else {
                 ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
-                (tokens.clone(), 0)
+                (tokens.to_vec(), 0)
             }
         };
+        Ok(FlatDsparkPrefix {
+            prefill_tokens,
+            cached_prefix_len,
+            prior_cached_len,
+            block_size: params.mtp_depth,
+        })
+    }
 
-        let prompt_token_count = tokens.len();
-        let mut token_history: Vec<u32> = tokens.clone();
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = String::from("length");
-
-        let generation_stream = Stream::generation();
-
-        let mut profiler = DecodeProfiler::new(
-            ChatBackend::profiler_label(self, is_delta, is_streaming),
-            ChatBackend::family_name(self),
-        );
-        profiler.set_prompt_tokens(prefill_tokens.len() as u32);
-        profiler.snapshot_memory_before();
-
-        let mut reasoning_tracker =
-            ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(args.config));
-
-        // Streaming decode state (mirrors the generic core) — one bundle:
-        // detokenizer + cursors + emitter, built only when a sink exists
-        // so the sync path never runs the emitter hook.
-        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(
-                self,
-                tokenizer.inner(),
-                thinking.enabled,
-                stream_skip_special,
-            )
-        });
-
-        // --- variant prefill: target K/V + the draft's per-turn state ---
-        // From here until the save runs, every error FAILS CLOSED
-        // (`draft_fail_closed`): the target caches advance during
-        // prefill/verify with nothing recorded in `cached_token_history`
-        // yet, so an error abandoned mid-flight would leave a
-        // history-vs-cache offset mismatch that a later prefix-reuse hit
-        // could warm-start corrupt K/V from.
-        profiler.begin_prefill();
+    fn flat_prefill_with_draft_state(
+        &mut self,
+        prefix: &FlatDsparkPrefix,
+        stream: Stream,
+    ) -> Result<MxArray> {
         let (last_logits, turn_state) = match self.draft.as_ref() {
-            Some(Gemma4Draft::Assistant(_)) => match self.assistant_prefill_with_hidden(
-                &prefill_tokens,
-                cached_prefix_len as i32,
-                generation_stream,
-            ) {
-                Ok((logits, state)) => (logits, Gemma4DraftTurnState::Assistant(state)),
-                Err(e) => return Err(self.draft_fail_closed(e)),
-            },
+            Some(Gemma4Draft::Assistant(_)) => {
+                let (logits, state) = self.assistant_prefill_with_hidden(
+                    &prefix.prefill_tokens,
+                    prefix.cached_prefix_len as i32,
+                    stream,
+                )?;
+                (logits, Gemma4DraftTurnState::Assistant(state))
+            }
             _ => {
-                return Err(self.draft_fail_closed(Error::from_reason(
+                return Err(Error::from_reason(
                     "gemma4 flat draft turn: the flat lane serves the assistant drafter only",
-                )));
+                ));
             }
         };
-        profiler.end_prefill();
-
-        // --- anchor sample: byte-identical to the generic flow ---
-        let y = match apply_all_penalties(last_logits, &token_history, &p)
-            .and_then(|logits| crate::sampling::sample(&logits, p.sampling_config))
-        {
-            Ok(y) => y,
-            Err(e) => return Err(self.draft_fail_closed(e)),
-        };
-        y.eval();
-
-        if let Err(e) = ChatBackend::eval_caches(self) {
-            return Err(self.draft_fail_closed(e));
-        }
-        if report_perf {
-            first_token_instant = Some(Instant::now());
-        }
-
-        // Per-cycle draft cap: the assistant drafts by chained AR steps, so
-        // the resolved depth IS the cap.
-        let block_size = p.mtp_depth;
-
-        // Hand the prefill-built draft state to the stepper (taken by
-        // `begin_dspark_decode` inside the loop).
         self.draft_turn_state = Some(turn_state);
+        Ok(last_logits)
+    }
 
-        let mut rng = rand::rng();
-        let mut last_in_cache;
-        {
-            let streaming_ctx = turn_streaming
-                .as_mut()
-                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
-            let outcome = run_dspark_turn(
-                self,
-                &mut rng,
-                DsparkTurnArgs {
-                    y,
-                    block_size,
-                    params: &p,
-                    reasoning_tracker: &mut reasoning_tracker,
-                    profiler: &mut profiler,
-                    max_new_tokens,
-                    eos_id,
-                    generated_tokens: &mut generated_tokens,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant: &mut first_token_instant,
-                    report_perf,
-                    generation_stream,
-                    // H2: on SYNC turns `args.cancelled` is the whole-turn
-                    // cancel flag (streaming_ctx is None, so the loop's
-                    // sync polls are the only cancellation path); on
-                    // streaming turns it is the SAME flag StreamingCtx
-                    // carries — the polls are idempotent.
-                    cancel_flag: args.cancelled,
-                    turn_token_observer: None,
-                },
-                streaming_ctx,
-            );
-            // Fail CLOSED on any loop error: verify advances the target
-            // caches BEFORE commit resolves, so an error mid-cycle (or a
-            // failed rollback/commit) can leave K/V rows the history knows
-            // nothing about. The reset also clears the per-turn draft
-            // stash, whether or not `begin_dspark_decode` consumed it.
-            match outcome {
-                Ok(o) => last_in_cache = o.last_in_cache,
-                Err(e) => return Err(self.draft_fail_closed(e)),
-            }
-        }
+    fn fail_closed_flat_dspark(&mut self, error: Error) -> Error {
+        self.draft_fail_closed(error)
+    }
 
-        // --- save: AR-parity drop-last + length-exit materialization ---
-        // The loop reports `last_in_cache == false` on EVERY stop-shaped
-        // exit (in-cycle stop tokens are never committed — the loop's
-        // AR-parity exclusion — and boundary stops never had a slot) and on
-        // clean length exits (the final token is an unverified boundary).
-        //   Stop exits (`finish_reason != "length"`): drop the final token
-        //   from the persisted history — exactly the AR save, which never
-        //   forwards its final token and drops it on every non-length stop.
-        //   Length exits: the AR flow keeps ALL tokens and materializes the
-        //   final token's K/V with one extra forward
-        //   (`Gemma4Decode::materialize_final`); mirror it so the physical
-        //   cache offsets equal the keep-all history.
+    fn finish_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        mut last_in_cache: bool,
+        is_delta: bool,
+        _reuse_cache: bool,
+        stream: Stream,
+    ) -> Result<()> {
         if finish_reason == "length"
             && !last_in_cache
             && let Some(&final_token) = generated_tokens.last()
         {
-            if let Err(e) = self.flat_materialize_final(final_token, generation_stream) {
-                return Err(self.draft_fail_closed(e));
-            }
+            self.flat_materialize_final(final_token, stream)?;
             last_in_cache = true;
         }
         let drop_last = !last_in_cache;
         let history_tokens: &[u32] = if drop_last && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
-            &generated_tokens
+            generated_tokens
         };
         let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
-        new_history.extend_from_slice(&tokens);
+        new_history.extend_from_slice(tokens);
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         if !is_delta {
-            // Fresh text-only turn: clear any stale media keys (the draft
-            // path is text-only by its speculative-plan gate).
             self.cached_image_key = None;
             self.cached_audio_key = None;
         }
+        Ok(())
+    }
+}
 
-        // --- finalize ---
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill_tokens.len(),
-                generated_tokens.len(),
-            )
-            .map(|mut m| {
-                // Default augmentation fills the mtp_* acceptance fields
-                // from the profiler's recorded DSpark cycles.
-                ChatBackend::augment_performance(self, &profiler, &mut m);
-                m
-            })
-        } else {
-            None
-        };
-        let reasoning = reasoning_tracker.outcome();
-
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            // Residual flush through the emitter (same skip-special flag as
-            // the in-loop DecodeStream so `streamed_text_len` accounting
-            // stays consistent).
-            //
-            // CANCEL SEMANTICS (deliberate, verified AR/MTP parity): on a
-            // cancelled turn the loop's clamp commits the cancel-observed
-            // token to `generated_tokens` without step-streaming it; this
-            // flush then delivers its text, so the TOTAL streamed text
-            // equals `decode(generated_tokens)` — exactly the AR loop's
-            // documented origin/main contract (`engine/decode.rs`
-            // cancel-snapshot comment: the token is pushed at the loop top,
-            // the break skips the detok, and the post-loop residual flush
-            // re-streams the tail) and the MTP core's behavior (initial-arm
-            // skip + unconditioned family flush). Suppressing the suffix
-            // here would make a cancelled DSpark stream the ONLY path whose
-            // streamed text cannot reconstruct the terminal chunk's
-            // raw_text. The suffix is pinned to exactly ONE token by
-            // `dspark_turn_streaming_cancel_in_clamp_commits_exactly_once`.
-            let full_text = tokenizer
-                .decode_sync(&generated_tokens, stream_skip_special)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to decode generated tokens: {}", e);
-                    String::new()
-                });
-            ts.flush_residual(&full_text, p.include_reasoning, sink);
-        }
-
-        let reported_prompt_tokens: u32 = if is_delta && is_streaming {
-            let delta_len = prompt_token_count - prior_cached_len;
-            ChatBackend::stream_delta_prompt_tokens(self, prompt_token_count, delta_len)
-        } else {
-            prompt_token_count as u32
-        };
-
-        let mut result = ChatBackend::finalize_turn(
-            self,
-            FinalizeArgs {
-                tokenizer: &tokenizer,
-                generated_tokens: &generated_tokens,
-                finish_reason,
-                think_end_id,
-                think_end_str: think_end_str.as_deref(),
-                think_end_extra_ids: &[],
-                performance,
-                include_reasoning: p.include_reasoning,
-                thinking_enabled: thinking.enabled,
-                prompt_tokens: reported_prompt_tokens,
-                reasoning,
-            },
-        )?;
-        // `thinking_enabled` is replay provenance for the model-provided
-        // template, not Gemma4's decode-time ThinkingSetup (which is disabled
-        // by policy). Set it before both the terminal stream chunk and sync
-        // return, matching the generic and paged engines.
-        result.thinking_enabled =
-            crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
-        // cached_tokens mirrors the session core's overwrite: fresh turns
-        // report the matched prefix, delta turns the prior history length.
-        result.cached_tokens = if is_delta {
-            prior_cached_len as u32
-        } else {
-            cached_prefix_len as u32
-        };
-
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            ts.emitter.finish(&result, sink);
-            return Ok(TurnOutput::Streamed);
-        }
-        Ok(TurnOutput::Complete(Box::new(result)))
+impl Gemma4Inner {
+    /// FLAT-lane draft whole-turn core behind gemma4's
+    /// `ChatBackend::run_speculative_turn` executor, delegated to the shared
+    /// [`run_flat_dspark_turn`] driver.
+    pub(crate) fn flat_draft_chat_turn(
+        &mut self,
+        args: &mut WholeTurnArgs<'_>,
+    ) -> Result<TurnOutput> {
+        run_flat_dspark_turn(self, args)
     }
 
     /// Fail CLOSED after a draft turn error that may have left the target

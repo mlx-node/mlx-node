@@ -16,6 +16,7 @@ namespace mlx_node::qwen4_cuda {
 namespace {
 
 constexpr char kQwen4Q8PrefillSource[] =
+#include "cuda/ptx_helpers.cu.inc"
 #include "cuda/qwen4_q8_prefill.cu.inc"
     ;
 

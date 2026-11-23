@@ -11,8 +11,8 @@ use crate::array::DType;
 use crate::engine::memory_plan::{
     KvLayout, LaneShape, LiveMemory, MemoryBound, MemoryFootprint, MemoryPlan, PoolInput,
     RESIDENT_ALLOWANCE_TOKENS, SPECULATIVE_SCRATCH_TOKENS, StorePlan, StreamedInputs, StreamedPart,
-    allowance_dynamic_bytes, check_max_context, hard_budget_bytes, plan_streamed_store,
-    table_share_bytes,
+    allowance_dynamic_bytes, check_max_context, hard_budget_bytes, max_memory_option,
+    plan_streamed_store, resolve_kv_format as resolve_kv_format_shared, table_share_bytes,
 };
 use crate::transformer::KvFormat;
 
@@ -57,26 +57,21 @@ fn resolve_kv_format_for_metal(
     has_metal: bool,
 ) -> Result<KvFormat> {
     let served = has_metal && matches!(c.head_dim, 128 | 256);
-    let Some(requested) = requested else {
-        return Ok(if served {
-            KvFormat::Int8
-        } else {
-            KvFormat::Bf16
-        });
+    let default = if served {
+        KvFormat::Int8
+    } else {
+        KvFormat::Bf16
     };
-    let format = KvFormat::parse(Some(requested))
-        .map_err(|e| Error::from_reason(format!("{label}: {e}")))?;
-    if format == KvFormat::Int8 && !served {
-        return Err(Error::from_reason(if !has_metal {
-            format!("{label}: int8 KV pages require Metal; load with kvFormat 'bf16'")
+    resolve_kv_format_shared(label, requested, default, served, || {
+        if !has_metal {
+            "int8 KV pages require Metal; load with kvFormat 'bf16'".to_string()
         } else {
             format!(
-                "{label}: no int8 page kernels for head_dim {}; load with kvFormat 'bf16'",
+                "no int8 page kernels for head_dim {}; load with kvFormat 'bf16'",
                 c.head_dim
             )
-        }));
-    }
-    Ok(format)
+        }
+    })
 }
 
 pub(super) fn full_attention_layers(c: &Config) -> usize {
@@ -701,8 +696,7 @@ pub async fn estimate_qwen4_exp_context_window(
 ) -> Result<Option<Qwen4ExpContextEstimate>> {
     const LABEL: &str = "Qwen4Exp";
     let options = options.unwrap_or_default();
-    let max_memory =
-        crate::models::qwen3_5::load_plan::max_memory_option(LABEL, options.max_memory_bytes)?;
+    let max_memory = max_memory_option(LABEL, options.max_memory_bytes)?;
     let max_context =
         crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?;
     napi::bindgen_prelude::spawn_blocking(move || {

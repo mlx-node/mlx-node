@@ -17,151 +17,19 @@ pub const REQUIRED_AUDIO_SAMPLE_RATE: u32 = 16_000;
 
 /// Decode a RIFF/WAVE byte stream into a mono float32 PCM waveform at 16 kHz.
 ///
-/// The unified Gemma 4 audio feature extractor consumes a **mono float32
-/// 16 kHz** waveform; it does NOT decode containers or resample. Mirroring the
-/// IMAGE path (encoded bytes in, Rust decodes), file decode lives here. This is
-/// a minimal hand-rolled RIFF/WAVE parser — no new crate, hermetic build.
-///
-/// Supported `fmt ` formats:
-///   * PCM16 (`audioFormat == 1`, `bitsPerSample == 16`): `i16 → f32 / 32768.0`.
-///   * IEEE float32 (`audioFormat == 3`, `bitsPerSample == 32`): little-endian
-///     f32 passthrough.
-///
-/// Multi-channel input is downmixed to mono by averaging the channels per frame.
-/// The sample rate MUST be exactly 16 kHz — any other rate is rejected with a
-/// clear error (resampling is deliberately deferred to a higher layer). Unknown
-/// chunks between `fmt ` and `data` are skipped. Truncated or non-RIFF bytes are
-/// rejected.
+/// Delegates container chunk-walking, format decoding, and multi-channel mono
+/// downmixing to [`mlx_audio::wav::decode_wav_mono_f32`], then enforces
+/// Gemma 4's strict 16 kHz sample-rate contract (resampling is deliberately
+/// deferred to a higher layer).
 pub fn decode_wav_to_pcm(bytes: &[u8]) -> Result<Vec<f32>> {
-    // RIFF header: "RIFF" <u32 size> "WAVE".
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(Error::from_reason(
-            "decode_wav_to_pcm: not a RIFF/WAVE file (missing RIFF/WAVE header)",
-        ));
-    }
-
-    let mut audio_format: Option<u16> = None;
-    let mut num_channels: Option<u16> = None;
-    let mut sample_rate: Option<u32> = None;
-    let mut bits_per_sample: Option<u16> = None;
-    let mut data: Option<&[u8]> = None;
-
-    // Walk chunks starting after the 12-byte RIFF/WAVE header. Each chunk is
-    // a 4-byte id + 4-byte little-endian size + payload, with the payload
-    // padded to an even byte boundary.
-    let mut pos = 12usize;
-    while pos + 8 <= bytes.len() {
-        let chunk_id = &bytes[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([
-            bytes[pos + 4],
-            bytes[pos + 5],
-            bytes[pos + 6],
-            bytes[pos + 7],
-        ]) as usize;
-        let body_start = pos + 8;
-        let body_end = body_start.checked_add(chunk_size).ok_or_else(|| {
-            Error::from_reason("decode_wav_to_pcm: chunk size overflow (corrupt WAV)")
-        })?;
-        if body_end > bytes.len() {
-            return Err(Error::from_reason(
-                "decode_wav_to_pcm: truncated chunk (declared size exceeds file)",
-            ));
-        }
-        let body = &bytes[body_start..body_end];
-
-        if chunk_id == b"fmt " {
-            if body.len() < 16 {
-                return Err(Error::from_reason(
-                    "decode_wav_to_pcm: fmt chunk too short (need >= 16 bytes)",
-                ));
-            }
-            audio_format = Some(u16::from_le_bytes([body[0], body[1]]));
-            num_channels = Some(u16::from_le_bytes([body[2], body[3]]));
-            sample_rate = Some(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-            bits_per_sample = Some(u16::from_le_bytes([body[14], body[15]]));
-        } else if chunk_id == b"data" {
-            data = Some(body);
-        }
-
-        // Advance past payload + the pad byte for odd-length payloads.
-        pos = body_end + (chunk_size & 1);
-    }
-
-    let audio_format =
-        audio_format.ok_or_else(|| Error::from_reason("decode_wav_to_pcm: missing fmt chunk"))?;
-    let num_channels = num_channels.unwrap_or(0);
-    let sample_rate = sample_rate.unwrap_or(0);
-    let bits_per_sample = bits_per_sample.unwrap_or(0);
-    let data = data.ok_or_else(|| Error::from_reason("decode_wav_to_pcm: missing data chunk"))?;
-
-    if num_channels == 0 {
-        return Err(Error::from_reason(
-            "decode_wav_to_pcm: invalid channel count (0)",
-        ));
-    }
+    let (pcm, sample_rate) = mlx_audio::wav::decode_wav_mono_f32(bytes)
+        .map_err(|e| Error::from_reason(format!("decode_wav_to_pcm: {e}")))?;
     if sample_rate != REQUIRED_AUDIO_SAMPLE_RATE {
         return Err(Error::from_reason(format!(
             "gemma4 audio expects 16 kHz mono; got {sample_rate} Hz (resampling is not supported)"
         )));
     }
-
-    let channels = num_channels as usize;
-
-    // Decode interleaved samples into a flat f32 buffer, then downmix.
-    let interleaved: Vec<f32> = match (audio_format, bits_per_sample) {
-        // PCM16.
-        (1, 16) => {
-            if !data.len().is_multiple_of(2) {
-                return Err(Error::from_reason(
-                    "decode_wav_to_pcm: PCM16 data length is not a multiple of 2 bytes",
-                ));
-            }
-            data.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-                .collect()
-        }
-        // IEEE float32.
-        (3, 32) => {
-            if !data.len().is_multiple_of(4) {
-                return Err(Error::from_reason(
-                    "decode_wav_to_pcm: float32 data length is not a multiple of 4 bytes",
-                ));
-            }
-            data.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b))
-                .collect()
-        }
-        (fmt, bits) => {
-            return Err(Error::from_reason(format!(
-                "decode_wav_to_pcm: unsupported WAV format (audioFormat={fmt}, bitsPerSample={bits}); \
-                 only PCM16 (1/16) and IEEE float32 (3/32) are supported"
-            )));
-        }
-    };
-
-    if !interleaved.len().is_multiple_of(channels) {
-        return Err(Error::from_reason(
-            "decode_wav_to_pcm: sample count is not a multiple of the channel count",
-        ));
-    }
-
-    if channels == 1 {
-        return Ok(interleaved);
-    }
-
-    // Downmix to mono: mean of the per-frame channel samples.
-    let frames = interleaved.len() / channels;
-    let mut mono = Vec::with_capacity(frames);
-    for frame in 0..frames {
-        let base = frame * channels;
-        let sum: f32 = interleaved[base..base + channels].iter().sum();
-        mono.push(sum / channels as f32);
-    }
-    Ok(mono)
+    Ok(pcm)
 }
 
 /// Build the encoder-free audio frame tensor from a mono float32 PCM waveform.

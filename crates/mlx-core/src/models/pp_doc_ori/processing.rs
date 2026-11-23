@@ -31,23 +31,8 @@ pub fn preprocess(data: &[u8]) -> Result<MxArray> {
     let resized = img.resize_exact(INPUT_SIZE, INPUT_SIZE, FilterType::Triangle);
     let rgb_img = resized.to_rgb8();
 
-    let h = INPUT_SIZE as usize;
-    let w = INPUT_SIZE as usize;
-    let mut pixel_data: Vec<f32> = vec![0.0; h * w * 3];
-
     // RGB order (unlike text detection which uses BGR)
-    for y in 0..h {
-        for x in 0..w {
-            let pixel = rgb_img.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                let val = pixel[c] as f32 / 255.0;
-                let normalized = (val - MEAN[c]) / STD[c];
-                pixel_data[(y * w + x) * 3 + c] = normalized;
-            }
-        }
-    }
-
-    MxArray::from_float32(&pixel_data, &[1, h as i64, w as i64, 3])
+    crate::vision::cnn::rgb_to_nhwc_f32(&rgb_img, Some(MEAN), Some(STD), false)
 }
 
 /// Rotate encoded image bytes by the given angle (0, 90, 180, 270) and return PNG bytes.

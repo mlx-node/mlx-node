@@ -81,6 +81,10 @@ pub(crate) struct Qwen3Inner {
     /// cross-request prefix reuse. Defaults to `None` so the existing flat
     /// `Vec<KVCache>` path stays untouched.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Reserved atomically in [`Self::size_paged_pool_after_weight_load`] under
+    /// `pool_growth_lock` so concurrent loads cannot spend the same headroom;
+    /// taken by `persistence::load_with_thread`.
+    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     pub(crate) cached_kv_keys: Vec<Option<MxArray>>,
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
     pub(crate) cached_cache_idx: i32,
@@ -1221,6 +1225,7 @@ impl Qwen3Inner {
             kv_caches: None,
             tokenizer: None,
             paged_adapter,
+            pool_cache_limit_guard: None,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
             cached_cache_idx: 0,
@@ -1242,85 +1247,67 @@ impl Qwen3Inner {
     /// load-time probe can now see the model weights, so the selected pool is
     /// capped against the real working set instead of double-budgeting them.
     pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
-        if self.paged_adapter.is_none() {
-            return Ok(());
-        }
-        // An explicit pool size is an operator cap, not a sizing hint. The
-        // constructor already built and successfully co-resident-loaded that
-        // exact pool with the weights, so adaptive replacement is reserved for
-        // genuinely uncapped configurations.
-        if self.config.paged_cache_memory_mb.is_some() {
+        if self.paged_adapter.is_none() || self.config.paged_cache_memory_mb.is_some() {
             return Ok(());
         }
         // Drop the provisional pool before sizing/allocating its replacement.
         // It is still empty here: production calls this immediately after
         // weight materialization and before cold-tier attachment or inference.
         self.paged_adapter = None;
+        self.pool_cache_limit_guard = None;
 
         let block_size = self.config.paged_block_size.unwrap_or(16);
         let trained_context = u32::try_from(self.config.max_position_embeddings)
             .unwrap_or(1)
             .max(1);
         let per_seq_context = trained_context.min(scheduler_per_seq_context());
-        let requested_tokens =
-            per_seq_context.saturating_mul(scheduler_max_num_seqs_for(32) as u32);
+        let max_batch_size = scheduler_max_num_seqs_for(32) as u32;
+        let requested_tokens = per_seq_context.saturating_mul(max_batch_size);
         let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
-            requested_blocks,
-            self.config.num_layers as u32,
-            self.config.num_kv_heads as u32,
-            self.config.head_dim as u32,
-            block_size,
-            cache_dtype,
-            crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
-                Error::from_reason(format!(
-                    "Qwen3 paged cache sizing failed safely; refusing an uncapped pool request: {error}"
-                ))
-            })?,
-            0,
-        )
-        .map_err(|error| {
-            Error::from_reason(format!(
-                "Qwen3 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
-            ))
-        })?;
-        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
-        let pa_config = mlx_paged_attn::PagedAttentionConfig {
-            block_size,
-            gpu_memory_mb: selected_mb,
-            head_size: self.config.head_dim as u32,
-            num_kv_heads: self.config.num_kv_heads as u32,
-            num_layers: self.config.num_layers as u32,
-            max_seq_len: Some(per_seq_context),
-            max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
-        };
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            sizing.selected_blocks,
-            sizing.selected_blocks,
-            block_size,
-        )));
-        let pool = mlx_paged_attn::LayerKVPool::new(
-            pa_config,
-            sizing.selected_blocks,
-            sizing.selected_blocks,
-            cache_dtype,
-        )
-        .map_err(|error| {
-            Error::from_reason(format!("Failed to construct Qwen3 KV pool: {error}"))
-        })?;
-        self.paged_adapter = Some(
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
-                Error::from_reason(format!("Failed to construct Qwen3 paged adapter: {error}"))
-            })?,
-        );
+        let num_layers = self.config.num_layers as u32;
+        let num_kv_heads = self.config.num_kv_heads as u32;
+        let head_size = self.config.head_dim as u32;
+        let sized = crate::engine::persistence::size_paged_pool_after_weight_load(
+            &crate::engine::persistence::PagedPoolSizingSpec {
+                family: "Qwen3",
+                requested_blocks,
+                num_layers,
+                num_kv_heads,
+                head_size,
+                block_size,
+                cache_dtype,
+                extra_fixed_bytes: 0,
+            },
+            |selected_blocks, selected_bytes| {
+                let selected_mb = selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+                let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                    block_size,
+                    gpu_memory_mb: selected_mb,
+                    head_size,
+                    num_kv_heads,
+                    num_layers,
+                    max_seq_len: Some(per_seq_context),
+                    max_batch_size: Some(max_batch_size),
+                };
+                crate::engine::persistence::build_paged_kv_adapter(
+                    pa_config,
+                    selected_blocks,
+                    block_size,
+                    cache_dtype,
+                    "Qwen3",
+                )
+            },
+        )?;
+        self.paged_adapter = Some(sized.pool);
+        self.pool_cache_limit_guard = Some(sized.guard);
         info!(
             "Qwen3 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
             requested_blocks,
-            sizing.selected_blocks,
-            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            sized.selected_blocks,
+            sized.selected_bytes as f64 / (1u64 << 30) as f64,
             per_seq_context,
-            scheduler_max_num_seqs_for(32),
+            max_batch_size,
         );
         Ok(())
     }
@@ -4584,141 +4571,33 @@ impl Qwen3Model {
         rope_offsets: &MxArray,
         left_padding: &MxArray,
     ) -> Result<MxArray> {
-        use mlx_sys as sys;
-        use std::ptr;
-
-        let num_layers = layers.len();
-
-        // Collect layer weights into a flat array (11 weights per layer)
-        let mut layer_weights: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers * 11);
-
-        for layer in layers.iter() {
-            layer_weights.push(layer.get_input_layernorm_weight().handle.0);
-            layer_weights.push(layer.get_post_attention_layernorm_weight().handle.0);
-            layer_weights.push(layer.self_attn.get_q_proj_weight().handle.0);
-            layer_weights.push(layer.self_attn.get_k_proj_weight().handle.0);
-            layer_weights.push(layer.self_attn.get_v_proj_weight().handle.0);
-            layer_weights.push(layer.self_attn.get_o_proj_weight().handle.0);
-            if let Some(q_norm) = layer.self_attn.get_q_norm_weight() {
-                layer_weights.push(q_norm.handle.0);
-            } else {
-                layer_weights.push(ptr::null_mut());
-            }
-            if let Some(k_norm) = layer.self_attn.get_k_norm_weight() {
-                layer_weights.push(k_norm.handle.0);
-            } else {
-                layer_weights.push(ptr::null_mut());
-            }
-            layer_weights.push(layer.mlp.get_gate_proj_weight().handle.0);
-            layer_weights.push(layer.mlp.get_up_proj_weight().handle.0);
-            layer_weights.push(layer.mlp.get_down_proj_weight().handle.0);
-        }
-
-        let final_norm_weight = final_norm.get_weight();
-        let lm_head_weight_handle = if config.tie_word_embeddings {
-            ptr::null_mut()
-        } else {
-            lm_head.get_weight().handle.0
+        let step_config = FusedQwen3StepConfig {
+            hidden_size: config.hidden_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            rope_theta: config.rope_theta as f32,
+            rms_norm_eps: config.rms_norm_eps as f32,
+            tie_word_embeddings: config.tie_word_embeddings,
         };
-
-        // Prepare KV cache input pointers
-        let kv_keys_ptrs: Vec<*mut sys::mlx_array> = kv_keys
-            .iter()
-            .map(|k| k.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
-            .collect();
-        let kv_values_ptrs: Vec<*mut sys::mlx_array> = kv_values
-            .iter()
-            .map(|v| v.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
-            .collect();
-
-        // Prepare output arrays (will update in place)
-        let mut out_logits: *mut sys::mlx_array = ptr::null_mut();
-        let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
-        let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
-        let mut out_cache_idx: i32 = 0;
-
-        // Call the fused FFI function with array offsets
-        unsafe {
-            sys::mlx_qwen3_forward_step(
-                input_ids.handle.0,
-                embedding_weight.handle.0,
-                layer_weights.as_ptr(),
-                ptr::null(),
-                ptr::null(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-                0,
-                ptr::null(),
-                num_layers as i32,
-                final_norm_weight.handle.0,
-                lm_head_weight_handle,
-                config.tie_word_embeddings,
-                config.hidden_size,
-                config.num_heads,
-                config.num_kv_heads,
-                config.head_dim,
-                config.rope_theta as f32,
-                config.rms_norm_eps as f32,
-                kv_keys_ptrs.as_ptr(),
-                kv_values_ptrs.as_ptr(),
-                *cache_idx,
-                rope_offsets.handle.0,
-                // Never null: GQA 8/12/16 checkpoints (e.g. Qwen3-32B) would
-                // decode unmasked past 8192 keys on another SDPA kernel and
-                // change their logits bytes.
-                left_padding.handle.0,
-                &mut out_logits,
-                out_kv_keys.as_mut_ptr(),
-                out_kv_values.as_mut_ptr(),
-                &mut out_cache_idx,
-            );
-        }
-
-        // Update cache_idx
-        *cache_idx = out_cache_idx;
-
-        // Update KV cache in place - reuse existing MxArray handles when possible
-        for (i, (existing, new_ptr)) in kv_keys.iter_mut().zip(out_kv_keys).enumerate() {
-            if new_ptr.is_null() {
-                continue;
-            }
-            if let Some(arr) = existing {
-                // Try to reuse the existing handle
-                if let Some(inner) = Arc::get_mut(&mut arr.handle) {
-                    unsafe { inner.overwrite(new_ptr) };
-                } else {
-                    // Fall back to creating a new MxArray (shouldn't happen in fast path)
-                    *existing = Some(MxArray::from_handle(new_ptr, "forward_fused kv_keys")?);
-                }
-            } else {
-                // First time - create new MxArray
-                *existing = Some(MxArray::from_handle(
-                    new_ptr,
-                    &format!("forward_fused kv_keys[{}]", i),
-                )?);
-            }
-        }
-
-        for (i, (existing, new_ptr)) in kv_values.iter_mut().zip(out_kv_values).enumerate() {
-            if new_ptr.is_null() {
-                continue;
-            }
-            if let Some(arr) = existing {
-                if let Some(inner) = Arc::get_mut(&mut arr.handle) {
-                    unsafe { inner.overwrite(new_ptr) };
-                } else {
-                    *existing = Some(MxArray::from_handle(new_ptr, "forward_fused kv_values")?);
-                }
-            } else {
-                *existing = Some(MxArray::from_handle(
-                    new_ptr,
-                    &format!("forward_fused kv_values[{}]", i),
-                )?);
-            }
-        }
-
-        MxArray::from_handle(out_logits, "forward_fused logits")
+        // `left_padding` is never null for Qwen3: GQA 8/12/16 checkpoints
+        // (e.g. Qwen3-32B) would decode unmasked past 8192 keys on another
+        // SDPA kernel and change their logits bytes.
+        forward_qwen3_fused_step(
+            input_ids,
+            Some(embedding_weight),
+            layers,
+            final_norm,
+            Some(lm_head),
+            None,
+            &step_config,
+            kv_keys,
+            kv_values,
+            cache_idx,
+            rope_offsets,
+            Some(left_padding),
+            false,
+        )
     }
 
     /// Get model configuration
@@ -4726,6 +4605,288 @@ impl Qwen3Model {
     pub fn get_config(&self) -> Qwen3Config {
         self.config.clone()
     }
+}
+
+/// Configuration parameters for [`forward_qwen3_fused_step`].
+pub(crate) struct FusedQwen3StepConfig {
+    pub hidden_size: i32,
+    pub num_heads: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub rope_theta: f32,
+    pub rms_norm_eps: f32,
+    pub tie_word_embeddings: bool,
+}
+
+/// One packed quantized projection `(weight, scales, optional biases)` for the
+/// fused Qwen3 C++ step.
+pub(crate) struct FusedQwen3PackedProj<'a> {
+    pub weight: &'a MxArray,
+    pub scales: &'a MxArray,
+    pub biases: Option<&'a MxArray>,
+}
+
+/// Quantized weights bundle for [`forward_qwen3_fused_step`].
+///
+/// Each layer entry holds the 7 linear projections in the order expected by
+/// `mlx_qwen3_forward_step`: `[q, k, v, o, gate, up, down]`.
+pub(crate) struct FusedQwen3QuantWeights<'a> {
+    pub embedding: FusedQwen3PackedProj<'a>,
+    pub layers: Vec<[FusedQwen3PackedProj<'a>; 7]>,
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: &'a str,
+}
+
+/// Shared FFI packing and in-place KV-cache handle update for
+/// `sys::mlx_qwen3_forward_step`, shared by `qwen3` and `qwen3_asr`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_qwen3_fused_step(
+    input_ids: &MxArray,
+    dense_embedding_weight: Option<&MxArray>,
+    layers: &[TransformerBlock],
+    final_norm: &RMSNorm,
+    lm_head: Option<&Linear>,
+    quantized: Option<&FusedQwen3QuantWeights<'_>>,
+    config: &FusedQwen3StepConfig,
+    kv_keys: &mut [Option<MxArray>],
+    kv_values: &mut [Option<MxArray>],
+    cache_idx: &mut i32,
+    rope_offsets: &MxArray,
+    left_padding: Option<&MxArray>,
+    require_non_null_outputs: bool,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+    use std::ptr;
+
+    let num_layers = layers.len();
+    if let Some(q) = quantized
+        && q.layers.len() != num_layers
+    {
+        return Err(Error::from_reason(format!(
+            "Fused Qwen3 quantized layer count ({}) does not match decoder layer count ({num_layers})",
+            q.layers.len()
+        )));
+    }
+
+    // Collect layer weights into a flat array (11 weights per layer)
+    let mut layer_weights: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers * 11);
+    let mut quant_scales: Vec<*mut sys::mlx_array> = Vec::with_capacity(if quantized.is_some() {
+        num_layers * 7
+    } else {
+        0
+    });
+    let mut quant_biases: Vec<*mut sys::mlx_array> = Vec::with_capacity(if quantized.is_some() {
+        num_layers * 7
+    } else {
+        0
+    });
+
+    for (index, layer) in layers.iter().enumerate() {
+        let packed = quantized.map(|q| &q.layers[index]);
+        layer_weights.push(layer.get_input_layernorm_weight().handle.0);
+        layer_weights.push(layer.get_post_attention_layernorm_weight().handle.0);
+        if let Some(projs) = packed {
+            layer_weights.extend([
+                projs[0].weight.handle.0,
+                projs[1].weight.handle.0,
+                projs[2].weight.handle.0,
+                projs[3].weight.handle.0,
+            ]);
+        } else {
+            layer_weights.extend([
+                layer.self_attn.get_q_proj_weight().handle.0,
+                layer.self_attn.get_k_proj_weight().handle.0,
+                layer.self_attn.get_v_proj_weight().handle.0,
+                layer.self_attn.get_o_proj_weight().handle.0,
+            ]);
+        }
+        layer_weights.push(
+            layer
+                .self_attn
+                .get_q_norm_weight()
+                .map(|a| a.handle.0)
+                .unwrap_or(ptr::null_mut()),
+        );
+        layer_weights.push(
+            layer
+                .self_attn
+                .get_k_norm_weight()
+                .map(|a| a.handle.0)
+                .unwrap_or(ptr::null_mut()),
+        );
+        if let Some(projs) = packed {
+            layer_weights.extend([
+                projs[4].weight.handle.0,
+                projs[5].weight.handle.0,
+                projs[6].weight.handle.0,
+            ]);
+            for proj in projs {
+                quant_scales.push(proj.scales.handle.0);
+                quant_biases.push(proj.biases.map(|b| b.handle.0).unwrap_or(ptr::null_mut()));
+            }
+        } else {
+            layer_weights.extend([
+                layer.mlp.get_gate_proj_weight().handle.0,
+                layer.mlp.get_up_proj_weight().handle.0,
+                layer.mlp.get_down_proj_weight().handle.0,
+            ]);
+        }
+    }
+
+    let final_norm_weight = final_norm.get_weight();
+    let lm_head_weight = if config.tie_word_embeddings {
+        None
+    } else {
+        Some(
+            lm_head
+                .ok_or_else(|| Error::from_reason("Fused Qwen3 step requires lm_head when untied"))?
+                .get_weight(),
+        )
+    };
+    let lm_head_weight_handle = lm_head_weight
+        .as_ref()
+        .map(|w| w.handle.0)
+        .unwrap_or(ptr::null_mut());
+
+    let mode_cstr = quantized
+        .map(|q| {
+            std::ffi::CString::new(q.mode)
+                .map_err(|_| Error::from_reason("Invalid fused Qwen3 quantization mode"))
+        })
+        .transpose()?;
+    let (embedding_weight_ptr, embedding_scales_ptr, embedding_biases_ptr, group_size, bits) =
+        if let Some(q) = quantized {
+            (
+                q.embedding.weight.handle.0,
+                q.embedding.scales.handle.0,
+                q.embedding
+                    .biases
+                    .map(|b| b.handle.0)
+                    .unwrap_or(ptr::null_mut()),
+                q.group_size,
+                q.bits,
+            )
+        } else {
+            let dense_emb = dense_embedding_weight.ok_or_else(|| {
+                Error::from_reason("Fused Qwen3 dense step requires embedding weight")
+            })?;
+            (dense_emb.handle.0, ptr::null_mut(), ptr::null_mut(), 0, 0)
+        };
+    let mode_ptr = mode_cstr
+        .as_ref()
+        .map(|m| m.as_ptr())
+        .unwrap_or(ptr::null());
+
+    // Prepare KV cache input pointers
+    let kv_keys_ptrs: Vec<*mut sys::mlx_array> = kv_keys
+        .iter()
+        .map(|k| k.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+        .collect();
+    let kv_values_ptrs: Vec<*mut sys::mlx_array> = kv_values
+        .iter()
+        .map(|v| v.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+        .collect();
+
+    // Prepare output arrays (will update in place)
+    let mut out_logits: *mut sys::mlx_array = ptr::null_mut();
+    let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+    let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+    let mut out_cache_idx: i32 = 0;
+
+    unsafe {
+        sys::mlx_qwen3_forward_step(
+            input_ids.handle.0,
+            embedding_weight_ptr,
+            layer_weights.as_ptr(),
+            if quant_scales.is_empty() {
+                ptr::null()
+            } else {
+                quant_scales.as_ptr()
+            },
+            if quant_biases.is_empty() {
+                ptr::null()
+            } else {
+                quant_biases.as_ptr()
+            },
+            embedding_scales_ptr,
+            embedding_biases_ptr,
+            group_size,
+            bits,
+            mode_ptr,
+            num_layers as i32,
+            final_norm_weight.handle.0,
+            lm_head_weight_handle,
+            config.tie_word_embeddings,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta,
+            config.rms_norm_eps,
+            kv_keys_ptrs.as_ptr(),
+            kv_values_ptrs.as_ptr(),
+            *cache_idx,
+            rope_offsets.handle.0,
+            left_padding.map(|a| a.handle.0).unwrap_or(ptr::null_mut()),
+            &mut out_logits,
+            out_kv_keys.as_mut_ptr(),
+            out_kv_values.as_mut_ptr(),
+            &mut out_cache_idx,
+        );
+    }
+
+    if require_non_null_outputs
+        && (out_logits.is_null()
+            || out_kv_keys.iter().any(|p| p.is_null())
+            || out_kv_values.iter().any(|p| p.is_null()))
+    {
+        return Err(Error::from_reason(
+            "Fused Qwen3 decoder returned a null output",
+        ));
+    }
+
+    // Update cache_idx
+    *cache_idx = out_cache_idx;
+
+    // Update KV cache in place - reuse existing MxArray handles when possible
+    for (i, (existing, new_ptr)) in kv_keys.iter_mut().zip(out_kv_keys).enumerate() {
+        if new_ptr.is_null() {
+            continue;
+        }
+        if let Some(arr) = existing {
+            if let Some(inner) = Arc::get_mut(&mut arr.handle) {
+                unsafe { inner.overwrite(new_ptr) };
+            } else {
+                *existing = Some(MxArray::from_handle(new_ptr, "forward_fused kv_keys")?);
+            }
+        } else {
+            *existing = Some(MxArray::from_handle(
+                new_ptr,
+                &format!("forward_fused kv_keys[{}]", i),
+            )?);
+        }
+    }
+
+    for (i, (existing, new_ptr)) in kv_values.iter_mut().zip(out_kv_values).enumerate() {
+        if new_ptr.is_null() {
+            continue;
+        }
+        if let Some(arr) = existing {
+            if let Some(inner) = Arc::get_mut(&mut arr.handle) {
+                unsafe { inner.overwrite(new_ptr) };
+            } else {
+                *existing = Some(MxArray::from_handle(new_ptr, "forward_fused kv_values")?);
+            }
+        } else {
+            *existing = Some(MxArray::from_handle(
+                new_ptr,
+                &format!("forward_fused kv_values[{}]", i),
+            )?);
+        }
+    }
+
+    MxArray::from_handle(out_logits, "forward_fused logits")
 }
 
 #[napi]

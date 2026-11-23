@@ -7,7 +7,7 @@ use crate::array::MxArray;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::models::pp_doclayout_v3::backbone::HGNetV2Backbone;
+use crate::vision::cnn::HGNetV2Backbone;
 
 use super::config::TextDetConfig;
 use super::db_head::PFHeadLocal;

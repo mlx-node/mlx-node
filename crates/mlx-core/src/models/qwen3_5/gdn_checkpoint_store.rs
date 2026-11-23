@@ -246,30 +246,15 @@ pub(crate) fn compute_paged_prefix_block_hashes(
     }
 
     let prefix_len = prefix_len as usize;
-    let block_size = block_size as usize;
-    if prefix_len > tokens.len() {
-        return None;
-    }
-
-    let num_blocks = prefix_len / block_size;
-    let mut hashes = Vec::with_capacity(num_blocks);
-    let mut parent_hash = 0;
-    for block_idx in 0..num_blocks {
-        let extra_keys = extra_keys_per_block.get(block_idx)?;
-        let start = block_idx * block_size;
-        let end = start + block_size;
-        parent_hash = if block_idx == 0 && cache_salt != 0 {
-            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
-            salted_keys.extend_from_slice(extra_keys);
-            salted_keys.push(cache_salt);
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
-        } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
-        };
-        hashes.push(parent_hash);
-    }
-
-    Some(hashes)
+    let prefix_tokens = tokens.get(..prefix_len)?;
+    let num_blocks = prefix_len / block_size as usize;
+    let extra_keys = extra_keys_per_block.get(..num_blocks)?;
+    Some(mlx_paged_attn::chain_hashes_per_block(
+        prefix_tokens,
+        block_size,
+        extra_keys,
+        cache_salt,
+    ))
 }
 
 #[cfg(test)]

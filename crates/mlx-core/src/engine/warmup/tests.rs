@@ -86,7 +86,7 @@ fn dense_on(lanes: usize) -> (Qwen35Inner, Arc<FakeIo>) {
 }
 
 fn moe(lanes: usize) -> Qwen35MoeInner {
-    let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5741_0102);
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(0x5741_0102);
     inner.tokenizer = Some(content_tokenizer());
     inner.memory_registration = Some(registration());
     inner.mtp_weights_loaded = true;
@@ -654,11 +654,11 @@ fn on_state_tier(tier: &TestTier) -> Qwen35Inner {
 
 /// [`on_state_tier`] for the tiny MoE model with no MTP head.
 fn moe_on_state_tier(tier: &TestTier) -> Qwen35MoeInner {
-    let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner_with_config(
+    let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner_with_config(
         0x5741_0109,
         |config| config.n_mtp_layers = 0,
     );
-    let dense = inner.config.to_dense_config();
+    let dense = inner.config.clone();
     crate::models::qwen3_5::dflash2_state::disk::tests::attach_tier(
         &mut inner.dflash2_states,
         &dense,

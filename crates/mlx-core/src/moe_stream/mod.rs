@@ -6,6 +6,7 @@
 pub mod bank;
 pub mod budget;
 pub mod cache;
+pub mod directory;
 pub mod io;
 pub mod repack;
 #[cfg(test)]

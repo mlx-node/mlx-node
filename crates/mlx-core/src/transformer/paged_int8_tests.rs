@@ -519,12 +519,6 @@ fn read_entries(adapter: &mut PagedKVCacheAdapter) -> Vec<(&'static str, MxArray
                 .unwrap(),
         ),
         (
-            "decode raw",
-            adapter
-                .gather_kv_for_decode(1, &queries(1, 1), scale, 1.0)
-                .unwrap(),
-        ),
-        (
             "prefill chunk",
             adapter
                 .gather_kv_for_prefill_chunk(1, &queries(4, 2), 16, scale)

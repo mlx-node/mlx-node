@@ -7,8 +7,12 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedDecodeRouteHint, PagedKVCacheAdapter, PagedRaggedRow, SeqId,
+};
+use crate::transformer::paged_policy::{
+    gather_kv_for_decode_with_route_and_fallback, write_kv_chunk,
+};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::ptr;
@@ -311,60 +315,26 @@ impl TransformerBlock {
             .self_attn
             .compute_qkv(&normed, first_logical_position as i32)?;
 
-        // 3. Always write the new K/V chunk through to the paged pool so
-        //    future tokens (or future requests sharing this prefix) can
-        //    read them back via gather. Note: the adapter's
-        //    `record_tokens` MUST already have advanced the cursor by the
-        //    chunk size before this call (see method docstring).
-        //
-        //    Prefer the graph-native, lazily-scheduled
-        //    `update_keys_values_native` so the same-step attention read
-        //    stays inside MLX's dependency graph instead of forcing a
-        //    blocking `mlx_metal_synchronize()` + command-buffer host wait
-        //    on every layer/token (see
-        //    `PagedKVCacheAdapter::update_keys_values`). Falls back to the
-        //    synchronous write automatically when
-        //    `MLX_PAGED_NATIVE_KV_WRITE=0` or when the native write errors.
+        // 3. Write the new K/V chunk through `paged_policy::write_kv_chunk` so
+        //    the same-step attention read stays inside MLX's dependency graph.
+        //    The adapter's `record_tokens` MUST already have advanced the cursor
+        //    by the chunk size before this call.
         let trace_enabled = inference_trace_enabled();
         let write_trace_start = trace_enabled.then(Instant::now);
-        let write_path = if native_kv_write_enabled() {
-            match adapter.update_keys_values_native(
-                layer_idx,
-                &qkv.keys,
-                &qkv.values,
-                first_logical_position,
-            ) {
-                Ok(()) => "native",
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3 paged_kv_write_fallback layer={} first_position={} error={}",
-                            layer_idx, first_logical_position, err
-                        ));
-                    }
-                    adapter
-                        .update_keys_values(
-                            layer_idx,
-                            &qkv.keys,
-                            &qkv.values,
-                            first_logical_position,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    "legacy"
-                }
-            }
-        } else {
-            adapter
-                .update_keys_values(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
-                .map_err(napi::Error::from_reason)?;
-            "legacy"
-        };
+        write_kv_chunk(
+            adapter,
+            layer_idx,
+            &qkv.keys,
+            &qkv.values,
+            first_logical_position,
+            "qwen3",
+        )
+        .map_err(napi::Error::from_reason)?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3 paged_kv_write_done layer={} first_position={} path={} elapsed_ms={:.1}",
+                "[MLX_TRACE] qwen3 paged_kv_write_done layer={} first_position={} path=native elapsed_ms={:.1}",
                 layer_idx,
                 first_logical_position,
-                write_path,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
         }
@@ -445,88 +415,32 @@ impl TransformerBlock {
                 .transpose(Some(&[0, 2, 1, 3]))?
                 .reshape(&[num_tokens, n_heads, head_dim])?
         } else {
-            // Decode: K/V at the new position has just been written to the
-            // pool by the write step above. When that write went native,
-            // use the graph-native `gather_kv_for_decode_graph` so the
-            // native paged-kv-write output and the attention read stay in
-            // one MLX dependency graph — no per-layer host sync — falling
-            // back to the synchronous `gather_kv_for_decode` kernel only if
-            // the graph gather errors. When the write landed on the legacy
-            // branch (flag off or native-write error), use the synchronous
-            // `gather_kv_for_decode` directly so `MLX_PAGED_NATIVE_KV_WRITE=0`
-            // fully reverts BOTH the write and the decode read.
-            //
-            // Both kernels return the query/io dtype. Cast back to x's dtype
-            // so the rest of the block stays homogeneous. This is a
-            // zero-extra-host-buffer path — the K/V are not materialized as
-            // MxArrays at all.
-            //
-            // Both expect queries shape `[1, num_query_heads, head_size]`
-            // (3-D). `qkv.queries` from `compute_qkv` is already
-            // `[num_tokens=1, n_heads, head_dim]` for the single-token
-            // decode chunk, so it's a direct fit.
+            // Decode: gather full historical K/V through `paged_policy` so the
+            // native KV write and attention read stay in one MLX dependency
+            // graph. `qkv.queries` is `[1, n_heads, head_dim]`; cast back to
+            // `x`'s dtype so the rest of the block stays homogeneous.
             let scale = self.self_attn.get_scale();
 
             let gather_trace_start = trace_enabled.then(Instant::now);
-            let attn_3d = if write_path == "native" && graph_decode_gather_enabled() {
-                match adapter.gather_kv_for_decode_graph(
+            let attn_3d = gather_kv_for_decode_with_route_and_fallback(
+                adapter,
+                layer_idx,
+                &qkv.queries,
+                scale as f32,
+                /* softcap */ 1.0,
+                PagedDecodeRouteHint::Auto,
+                /* grouped_stripes */ 0,
+                "qwen3",
+            )
+            .map_err(napi::Error::from_reason)?;
+            if trace_enabled {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3 decode_gather_done layer={} path=graph elapsed_ms={:.1}",
                     layer_idx,
-                    &qkv.queries,
-                    scale as f32,
-                    /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3 decode_gather_done layer={} path=graph elapsed_ms={:.1}",
-                                layer_idx,
-                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        attn_3d
-                    }
-                    Err(err) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3 decode_gather_fallback layer={} path=raw error={}",
-                                layer_idx, err
-                            ));
-                        }
-                        adapter
-                            .gather_kv_for_decode(
-                                layer_idx,
-                                &qkv.queries,
-                                scale as f32,
-                                /* softcap */ 1.0,
-                            )
-                            .map_err(napi::Error::from_reason)?
-                    }
-                }
-            } else {
-                // Flag off (or the native write above errored): take the
-                // synchronous gather directly, matching the legacy write.
-                let attn_3d = adapter
-                    .gather_kv_for_decode(
-                        layer_idx,
-                        &qkv.queries,
-                        scale as f32,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3 decode_gather_done layer={} path=legacy elapsed_ms={:.1}",
-                        layer_idx,
-                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-                attn_3d
-            };
+                    gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                ));
+            }
 
-            // Cast back to x's dtype.
-            // Both gathers return `[1, n_heads, head_dim]`, which is
-            // exactly the layout `output_projection` expects for
-            // `batch * seq_len = 1`.
             let target_dtype = x.dtype()?;
             attn_3d.astype(target_dtype)?
         };
@@ -571,11 +485,6 @@ impl TransformerBlock {
         if rows.is_empty() {
             return Err(Error::from_reason(
                 "forward_paged_adapter_batched requires at least one row",
-            ));
-        }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "forward_paged_adapter_batched requires MLX_PAGED_NATIVE_KV_WRITE=1",
             ));
         }
 
@@ -641,11 +550,6 @@ impl TransformerBlock {
                 "forward_paged_adapter_ragged expects x [{total_queries},1,H], got {:?}",
                 x_shape.as_ref()
             )));
-        }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "forward_paged_adapter_ragged requires MLX_PAGED_NATIVE_KV_WRITE=1",
-            ));
         }
 
         let mut offsets = Vec::with_capacity(total_queries as usize);

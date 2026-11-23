@@ -2665,12 +2665,7 @@ bool validate_affine4_experts(const array &wg, const array &sg, const array &bg,
   return true;
 }
 
-const std::string &hy4_gguf_nax_header() {
-  static const std::string header =
-      std::string(mlx::core::quantized_preamble::nax()) +
-      hy4_q8_prefill_swz_header() + R"METAL(
-using namespace mlx::steel;
-
+const char *kHy4GgufQ4kScaleHelpers = R"METAL(
 inline uint32_t hy4_gguf_sc_byte(const thread uint32_t* sc_w, int idx) {
   return (sc_w[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu;
 }
@@ -2695,6 +2690,12 @@ inline void hy4_gguf_q4k_group_scale(
   m_g = -blk_dmin * float(m);
 }
 )METAL";
+
+const std::string &hy4_gguf_nax_header() {
+  static const std::string header =
+      std::string(mlx::core::quantized_preamble::nax()) +
+      hy4_q8_prefill_swz_header() + "\nusing namespace mlx::steel;\n" +
+      kHy4GgufQ4kScaleHelpers;
   return header;
 }
 
@@ -2721,31 +2722,8 @@ hy4_gguf_prefill_indirect_down_kernel() {
 }
 
 const std::string &hy4_gguf_m3_header() {
-  static const std::string header = hy4_m3_common_header() + R"METAL(
-inline uint32_t hy4_gguf_sc_byte(const thread uint32_t* sc_w, int idx) {
-  return (sc_w[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu;
-}
-
-inline void hy4_gguf_q4k_group_scale(
-    const thread uint32_t* sc_w,
-    float blk_d,
-    float blk_dmin,
-    int g,
-    thread float& d_g,
-    thread float& m_g) {
-  uint32_t sc, m;
-  if (g < 4) {
-    sc = hy4_gguf_sc_byte(sc_w, g) & 63u;
-    m = hy4_gguf_sc_byte(sc_w, g + 4) & 63u;
-  } else {
-    const uint32_t q4 = hy4_gguf_sc_byte(sc_w, g + 4);
-    sc = (q4 & 0x0Fu) | ((hy4_gguf_sc_byte(sc_w, g - 4) >> 6) << 4);
-    m = (q4 >> 4) | ((hy4_gguf_sc_byte(sc_w, g) >> 6) << 4);
-  }
-  d_g = blk_d * float(sc);
-  m_g = -blk_dmin * float(m);
-}
-)METAL";
+  static const std::string header =
+      hy4_m3_common_header() + kHy4GgufQ4kScaleHelpers;
   return header;
 }
 

@@ -247,6 +247,7 @@ pub(super) struct Gemma4GroupedSlidingColdCheckpoint {
 /// is still present in the live sliding window. Reading it here is exact (the
 /// adapter addresses absolute token ranges), and returning `None` once it has
 /// rotated out preserves the fail-closed full+sliding restore contract.
+#[cfg(test)]
 pub(super) fn resolve_grouped_sliding_cold_checkpoint(
     checkpoints: Option<&VecDeque<Gemma4GroupedSlidingColdCheckpoint>>,
     anchors: &[u32],
@@ -1031,6 +1032,7 @@ pub(super) fn gemma4_select_cold_capture_candidate<C, K>(
 /// same break-at-the-first-underivable-block rule the restore's
 /// `deepest_backed_boundary` applies, so the two sides agree on which
 /// boundaries exist at all.
+#[cfg(test)]
 pub(super) fn gemma4_sliding_cold_sidecar_chain_key(
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
     request_tokens: &[u32],

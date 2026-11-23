@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use napi::{Error, Result};
 
+pub use crate::models::engram_hash::EngramConfig;
+pub use crate::models::moe_common::YarnConfig;
 use crate::utils::gguf::{GgufFile, GgufMetaValue};
 
 const ARCH: &str = "deepseek41";
@@ -13,48 +15,10 @@ const ARCH: &str = "deepseek41";
 const GATING_SQRT_SOFTPLUS: u64 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct YarnConfig {
-    pub factor: f32,
-    pub original_seq_len: usize,
-    pub beta_fast: f32,
-    pub beta_slow: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct CandidateConfig {
     pub source_layer: usize,
     pub topk_blocks: usize,
     pub block_size: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct EngramConfig {
-    pub layers: Vec<usize>,
-    pub max_ngram: usize,
-    pub n_heads: usize,
-    pub head_dim: usize,
-    pub multipliers: Vec<u64>,
-    /// Global row offset of each (layer, n-gram order, head) column in the one
-    /// GGUF table; `(max_ngram - 1) * n_heads` columns per engram layer.
-    pub head_offsets: Vec<u64>,
-    pub head_vocab_sizes: Vec<u64>,
-    /// Raw token id; the hash uses `token_map[pad_token_id]`.
-    pub pad_token_id: usize,
-    pub token_map: Vec<u32>,
-    pub compressed_vocab_size: usize,
-    pub vocab_size: Option<u64>,
-}
-
-impl EngramConfig {
-    pub fn n_cols(&self) -> usize {
-        (self.max_ngram - 1) * self.n_heads
-    }
-
-    /// Table rows of engram layer `e` (the reference's `engram_num_embeddings`).
-    pub fn layer_rows(&self, e: usize) -> u64 {
-        let n = self.n_cols();
-        self.head_vocab_sizes[e * n..(e + 1) * n].iter().sum()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

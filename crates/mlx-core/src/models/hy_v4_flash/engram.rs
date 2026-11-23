@@ -11,8 +11,7 @@ use napi::{Error, Result};
 use super::moe::qlinear;
 use super::weights::EngramWeights;
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::EngramConfig;
-use crate::models::deepseek_v41::engram_hash::EngramHasher;
+use crate::models::engram_hash::{EngramConfig, EngramHasher};
 use crate::nn::Activations;
 
 /// `HY_V4_FLASH_ENGRAM_EPS` (f32 machine epsilon, 2^-23).

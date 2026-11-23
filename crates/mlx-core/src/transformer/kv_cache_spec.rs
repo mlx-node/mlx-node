@@ -656,6 +656,195 @@ fn div_ceil(n: u32, d: u32) -> u32 {
     if n == 0 { 0 } else { 1 + (n - 1) / d }
 }
 
+// ─── The window-carrying contract ────────────────────────────────────────────
+
+/// How one attention route can express a sliding window.
+///
+/// This is a property of the ROUTE, supplied by the dispatch site, because that
+/// is the fact the route knows and the group does not. Adding a route means
+/// adding a variant, and a new variant is a compile error in
+/// [`paged_window_for_kind`]'s match rather than a silently window-blind path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCarrier {
+    /// The route hands the window to the kernel as the `sliding_window: i32` FFI
+    /// argument, and the kernel derives its own per-query-row lower bound from
+    /// it. Take the value from [`PagedWindowSlot::kernel_slot`].
+    KernelArgument,
+    /// The route builds an explicit boolean mask and hands it to SDPA. Take the
+    /// window from [`PagedWindowSlot::mask_window`] and pass it as
+    /// `create_causal_mask(seq_len, Some(cached_prefix_len), window)`.
+    ExplicitMask,
+    /// The route has no way to express a window: no kernel argument, no mask
+    /// parameter. Legal for a full-attention group and for nothing else.
+    Unsupported,
+}
+
+impl WindowCarrier {
+    /// Can this route carry a non-zero window at all?
+    pub fn can_carry_a_window(self) -> bool {
+        match self {
+            Self::KernelArgument | Self::ExplicitMask => true,
+            Self::Unsupported => false,
+        }
+    }
+}
+
+/// The window argument for ONE admitted attention dispatch.
+///
+/// Fields are private and there is no `Default`, no public constructor and no
+/// `From`. The only way to obtain one is [`paged_window_for_kind`] /
+/// [`paged_window_for_group`] / [`admit_paged_dispatch_plan`], each of which
+/// derives the window from the group's own [`AttentionKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedWindowSlot {
+    carrier: WindowCarrier,
+    /// 0 means full attention. Non-zero only ever came from an
+    /// `AttentionKind::SlidingWindow` payload, validated to fit `i32`.
+    window: i32,
+}
+
+impl PagedWindowSlot {
+    /// The value for the kernel's `sliding_window: i32` FFI slot, or `None` when
+    /// this dispatch is not a kernel-argument route and therefore has no such
+    /// slot to fill.
+    pub fn kernel_slot(&self) -> Option<i32> {
+        match self.carrier {
+            WindowCarrier::KernelArgument => Some(self.window),
+            WindowCarrier::ExplicitMask | WindowCarrier::Unsupported => None,
+        }
+    }
+
+    /// The `window_size` argument for `create_causal_mask`, or `None` when no
+    /// mask is needed.
+    pub fn mask_window(&self) -> Option<i32> {
+        match self.carrier {
+            WindowCarrier::ExplicitMask if self.window != 0 => Some(self.window),
+            _ => None,
+        }
+    }
+
+    /// Does this dispatch have a window to lose?
+    pub fn is_windowed(&self) -> bool {
+        self.window != 0
+    }
+
+    /// The route that was admitted.
+    pub fn carrier(&self) -> WindowCarrier {
+        self.carrier
+    }
+}
+
+/// Admit ONE dispatch: pair an attention kind with the route that will execute
+/// it, or refuse.
+///
+/// Refuses:
+///   * a windowed kind on a route whose [`WindowCarrier`] cannot express a window.
+///   * a `SlidingWindow { sliding_window: 0 }` payload.
+///   * a window past `i32::MAX` (both the kernel FFI argument and
+///     `create_causal_mask` take an `i32`).
+pub fn paged_window_for_kind(
+    attention_kind: AttentionKind,
+    carrier: WindowCarrier,
+) -> std::result::Result<PagedWindowSlot, String> {
+    let window = match attention_kind {
+        AttentionKind::Full => 0,
+        AttentionKind::SlidingWindow { sliding_window: 0 } => {
+            return Err(
+                "paged dispatch: a SlidingWindow { sliding_window: 0 } spec \
+                 reached dispatch admission; 0 is the Metal kernel's \"disable the sliding \
+                 mask\" sentinel (mlx_paged_ops.cpp:482), so it is full causal attention \
+                 and not a window — reject it at config load, where the field has a name"
+                    .to_string(),
+            );
+        }
+        AttentionKind::SlidingWindow { sliding_window } => {
+            i32::try_from(sliding_window).map_err(|_| {
+                format!(
+                    "paged dispatch: sliding window {sliding_window} exceeds \
+                     i32::MAX ({}), so it cannot reach a dispatch intact; both consumers \
+                     take an i32 — the kernel's sliding_window FFI slot, which rejects a \
+                     negative (mlx_paged_ops.cpp:483), and create_causal_mask's \
+                     window_size, where a negative width masks EVERY key with no error \
+                     and returns the uniform mean of all V rows. Reject the window at \
+                     config load, where the field has a name",
+                    i32::MAX
+                )
+            })?
+        }
+    };
+
+    if window != 0 && !carrier.can_carry_a_window() {
+        return Err(format!(
+            "paged dispatch: a sliding-window group (window {window}) was \
+             routed to {carrier:?}, which cannot express a window. Dropping it makes the \
+             dispatch attend every position back to 0, including positions already retired \
+             to the reserved null block — never-written StorageModePrivate memory. Either \
+             give the route a window (kernel sliding_window argument, or \
+             create_causal_mask's window_size) and report the matching WindowCarrier, or \
+             route the sliding group elsewhere"
+        ));
+    }
+
+    Ok(PagedWindowSlot { carrier, window })
+}
+
+/// [`paged_window_for_kind`] for a [`KVCacheGroup`], attaching group id and
+/// layer count to any refusal error.
+pub fn paged_window_for_group(
+    group: &KVCacheGroup,
+    carrier: WindowCarrier,
+) -> std::result::Result<PagedWindowSlot, String> {
+    paged_window_for_kind(group.attention_kind, carrier).map_err(|e| {
+        format!(
+            "{e} (group_id {}, {} layers: {:?})",
+            group.group_id,
+            group.layer_indices.len(),
+            group.layer_indices
+        )
+    })
+}
+
+/// Admit EVERY group of one turn against the routes that turn selected, before
+/// any of them launches.
+///
+/// `carriers` is indexed by `group_id` (and position), returning one
+/// [`PagedWindowSlot`] per group in `group_id` order.
+pub fn admit_paged_dispatch_plan(
+    groups: &[KVCacheGroup],
+    carriers: &[WindowCarrier],
+) -> std::result::Result<Vec<PagedWindowSlot>, String> {
+    if groups.is_empty() {
+        return Err(
+            "paged dispatch: no KV cache groups to admit; a hybrid paged decoder is \
+             hybrid by construction and must present its KV cache groups"
+                .to_string(),
+        );
+    }
+    if groups.len() != carriers.len() {
+        return Err(format!(
+            "paged dispatch: {} KV cache group(s) but {} route carrier(s); \
+             carriers are indexed by group_id, so a missing entry would leave a group \
+             dispatching unadmitted — which is how a sliding group loses its window",
+            groups.len(),
+            carriers.len()
+        ));
+    }
+
+    let mut slots = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        if group.group_id != index {
+            return Err(format!(
+                "paged dispatch: group at position {index} reports group_id \
+                 {}; carriers are indexed by group_id and position, so a gap or a \
+                 permutation would apply each route to the wrong group",
+                group.group_id
+            ));
+        }
+        slots.push(paged_window_for_group(group, carriers[index])?);
+    }
+    Ok(slots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

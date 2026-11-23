@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::models::deepseek_v41::DeepseekV41Config;
+use crate::models::moe_common::YarnConfig;
 use crate::utils::gguf::parse_gguf;
 
 fn fixture(name: &str) -> PathBuf {

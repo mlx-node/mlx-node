@@ -1129,7 +1129,7 @@ mod mtp_turn_tests {
             let verify_hiddens = det_rows(h, 2, 33.0);
             let emb = step.embedding().clone();
             step.commit_mtp(
-                crate::models::qwen3_5::mtp_decode::MtpCommitAnchor::IncludeAnchor,
+                crate::engine::mtp_decode::MtpCommitAnchor::IncludeAnchor,
                 &seed_h,
                 &verify_hiddens,
                 &committed_ids,
@@ -1251,7 +1251,7 @@ mod mtp_turn_tests {
             .expect("draft");
         let emb = step.embedding().clone();
         step.commit_mtp(
-            crate::models::qwen3_5::mtp_decode::MtpCommitAnchor::IncludeAnchor,
+            crate::engine::mtp_decode::MtpCommitAnchor::IncludeAnchor,
             &seed_h,
             &det_rows(h, 2, 33.0),
             &[13u32, 21u32],
@@ -1292,7 +1292,7 @@ mod mtp_turn_tests {
     /// `MIN_DEPTH..=MAX_DEPTH` independent of the seed.
     #[test]
     fn adaptive_depth_policy_escapes_a_depth_1_seed() {
-        use crate::models::qwen3_5::adaptive_depth::{AdaptiveDepthPolicy, CycleStats};
+        use crate::engine::adaptive_depth::{AdaptiveDepthPolicy, CycleStats};
 
         // Seeded the way the NemotronH call site does: the already-clamped depth.
         let mut policy = AdaptiveDepthPolicy::new(1);
@@ -1345,7 +1345,7 @@ mod mtp_turn_tests {
             .expect("draft");
         let emb = step.embedding().clone();
         step.commit_mtp(
-            crate::models::qwen3_5::mtp_decode::MtpCommitAnchor::IncludeAnchor,
+            crate::engine::mtp_decode::MtpCommitAnchor::IncludeAnchor,
             &seed_h,
             &det_rows(h, 3, 33.0),
             &[13u32, 21u32, 34u32],

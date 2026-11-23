@@ -12,11 +12,11 @@ use super::block::Block;
 use super::cache::{Candidates, CompressedCache, ForwardShared, TopK, WindowCache};
 use super::config::DeepseekV41Config;
 use super::engram::{Engram, EngramRows};
-use super::engram_hash::EngramHasher;
 use super::moe::{ExpertBank, Experts, Moe, MoeWeights, Routes};
-use super::ops::hc_pre;
-use super::store::{Dense, Weight};
+use super::store::Dense;
 use crate::array::{DType, MxArray};
+use crate::models::engram_hash::EngramHasher;
+use crate::models::moe_common::{Weight, hc_pre};
 use crate::moe_stream::bank::StagingBank;
 
 thread_local! {

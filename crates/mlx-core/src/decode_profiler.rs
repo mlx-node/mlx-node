@@ -412,17 +412,6 @@ impl DecodeProfiler {
         self.enabled = true;
     }
 
-    /// Test-only view of the turn-start metadata recorded before decode.
-    #[cfg(test)]
-    pub(crate) fn turn_start_state_for_test(&self) -> (u32, bool, bool, f64) {
-        (
-            self.prompt_tokens,
-            self.prefill_start.is_some(),
-            self.memory_before.is_some(),
-            self.prefill_ms,
-        )
-    }
-
     /// Test-only: did a phase with this exact name run (i.e. was
     /// `begin(name)` reached while the profiler was enabled)? Used by
     /// accept-path coverage tests to assert which decode branch executed

@@ -816,31 +816,20 @@ impl ChatBackend for Gemma4Inner {
                 starts_in_prompted_channel,
             );
         promote_channel_only_output(&mut parsed, starts_in_prompted_channel);
-        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            args.finish_reason
-        };
-        Ok(ChatResult {
-            text: parsed.text,
-            tool_calls: parsed.tool_calls,
-            thinking: parsed.thinking,
-            // Generic and paged session cores overwrite this with the
-            // effective Jinja kwarg after family finalization.
-            thinking_enabled: args.thinking_enabled,
-            num_tokens: args.generated_tokens.len() as u32,
-            prompt_tokens: args.prompt_tokens,
-            reasoning_tokens: args.reasoning.tokens,
-            reasoning_close: args.reasoning.close_name(),
-            reasoning_cut_at: args.reasoning.cut_at,
-            reasoning_cycle_period: args.reasoning.cycle_period,
-            reasoning_stray_closes: args.reasoning.reported_stray_closes(),
-            finish_reason,
+        let finish_reason_override = parsed
+            .tool_calls
+            .iter()
+            .any(|tc| tc.status == "ok")
+            .then_some("tool_calls");
+        Ok(crate::engine::finalize::assemble_parsed_chat_result(
+            args,
+            parsed.text,
+            parsed.tool_calls,
+            parsed.thinking,
+            finish_reason_override,
             raw_text,
-            public_raw_text: None,
-            cached_tokens: 0,
-            performance: args.performance,
-        })
+            None,
+        ))
     }
 
     fn execution_plan(&self) -> ExecutionPlan {

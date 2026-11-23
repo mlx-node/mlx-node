@@ -839,31 +839,6 @@ impl GatedDeltaNet {
         )
     }
 
-    /// Explicit residual-inclusive output, with unchanged cache/tape ownership.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_source_residual_with_tape(
-        &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        cache: Option<&mut ArraysCache>,
-        use_kernel: bool,
-        tape_sink: Option<&mut Option<GdnLayerTape>>,
-        residual: &MxArray,
-    ) -> Result<MxArray> {
-        self.forward_with_tape_impl(
-            x,
-            mask,
-            None,
-            cache,
-            use_kernel,
-            tape_sink,
-            Some(MixerResidual::Source(residual)),
-            None,
-            None,
-            None,
-        )
-    }
-
     /// The unmasked, untaped prefill forward whose output projection adds
     /// `residual` in its GEMM store where the shape takes the epilogue GEMM
     /// ([`Self::out_proj_store_route`]); residual-inclusive output, the bits
@@ -937,7 +912,7 @@ impl GatedDeltaNet {
         x: &MxArray,
         cache: Option<&mut ArraysCache>,
         use_kernel: bool,
-        residual: Option<&MxArray>,
+        residual: Option<MixerResidual<'_>>,
         plan: &GdnCapturePlan<'_>,
     ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
         let mut captured = Vec::with_capacity(plan.rows.len());
@@ -948,7 +923,7 @@ impl GatedDeltaNet {
             cache,
             use_kernel,
             None,
-            residual.map(MixerResidual::Source),
+            residual,
             Some((plan, &mut captured)),
             None,
             None,
@@ -1157,7 +1132,7 @@ impl GatedDeltaNet {
                 use_kernel,
                 batch,
                 seq_len,
-                !matches!(residual, Some(MixerResidual::Source(_))),
+                true,
                 rows,
             )?
         {
@@ -3875,78 +3850,6 @@ mod tests {
                     diff <= 3e-2 * peak,
                     "T={t}: padded merge off by {diff} of peak {peak}"
                 );
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn source_mixer_gdn_fallback_preserves_cache_and_tape() -> Result<()> {
-        let net = kernel_geometry_net();
-        let mut reference = ArraysCache::new(2);
-        let mut fused = ArraysCache::new(2);
-        for rows in [1, 7, 8, 33, 8] {
-            let x = rand_bf16(&[1, rows, 64]);
-            let residual = rand_bf16(&[1, rows, 64]);
-            let mut reference_tape = None;
-            let mut fused_tape = None;
-            let delta = net.forward_with_tape(
-                &x,
-                None,
-                Some(&mut reference),
-                true,
-                Some(&mut reference_tape),
-            )?;
-            let hidden = net.forward_source_residual_with_tape(
-                &x,
-                None,
-                Some(&mut fused),
-                true,
-                Some(&mut fused_tape),
-                &residual,
-            )?;
-            assert_eq!(
-                hidden.to_uint16_native()?,
-                residual.add(&delta)?.to_uint16_native()?
-            );
-            for slot in 0..2 {
-                assert_eq!(
-                    reference
-                        .get(slot)
-                        .unwrap()
-                        .astype(DType::Float32)?
-                        .to_float32()?
-                        .as_ref(),
-                    fused
-                        .get(slot)
-                        .unwrap()
-                        .astype(DType::Float32)?
-                        .to_float32()?
-                        .as_ref()
-                );
-            }
-            assert_eq!(reference_tape.is_some(), fused_tape.is_some());
-            if let (Some(a), Some(b)) = (reference_tape, fused_tape) {
-                // Normalized q/k and recurrence inputs may be F32 in the
-                // generic fallback. Compare exact values without assuming
-                // every tape field has the activation's BF16 dtype.
-                for (left, right) in [
-                    (&a.qkv, &b.qkv),
-                    (&a.kernel.q, &b.kernel.q),
-                    (&a.kernel.k, &b.kernel.k),
-                    (&a.kernel.v, &b.kernel.v),
-                    (&a.kernel.g, &b.kernel.g),
-                    (&a.kernel.beta, &b.kernel.beta),
-                ] {
-                    let bits = |v: &MxArray| -> Result<Vec<u32>> {
-                        Ok(v.astype(DType::Float32)?
-                            .to_float32()?
-                            .iter()
-                            .map(|x| x.to_bits())
-                            .collect())
-                    };
-                    assert_eq!(left.dtype()?, right.dtype()?);
-                    assert_eq!(bits(left)?, bits(right)?);
-                }
             }
         }
         Ok(())

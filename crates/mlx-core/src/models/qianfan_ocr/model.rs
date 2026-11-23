@@ -21,19 +21,19 @@
  * legacy layout used to share mutable model state with `spawn_blocking`
  * closures.
  */
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
-use napi::{Env, Status, bindgen_prelude::*};
+use napi::{Env, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
 use tracing::info;
 
 use crate::array::{MxArray, synchronize_and_clear_cache};
+use crate::engine::persistence::load_all_safetensors;
 use crate::engine::types::{
     ChatConfig, ChatResult, ChatSessionCall, ChatStreamChunk, ChatStreamHandle,
 };
@@ -53,7 +53,7 @@ use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, MultimodalContentOrder, Qwen3Tokenizer};
 use crate::tools;
 use crate::transformer::kv_cache::KVCache;
-use crate::utils::safetensors::SafeTensorsFile;
+use crate::vision::qwen::prompt::merge_input_ids_with_image_features;
 
 /// Processor marker emitted once per image content part by Qianfan-OCR's
 /// model-provided Jinja template. The vision processor replaces it with the
@@ -553,11 +553,11 @@ impl QianfanOCRInner {
             } else {
                 vision_features
             };
-            let merged_embeds = merge_vision_features(
-                &input_ids,
-                &text_embeds,
-                &vision_features,
+            let merged_embeds = merge_input_ids_with_image_features(
                 self.config.img_context_token_id,
+                &vision_features,
+                &text_embeds,
+                &input_ids,
             )?;
             merged_embeds.slice_axis(1, plan.clamped_prefix as i64, token_ids.len() as i64)?
         } else {
@@ -2131,58 +2131,6 @@ fn parse_config_json(raw: &Value) -> QianfanOCRConfig {
     }
 }
 
-/// Load SafeTensors weights from a model directory (single or sharded).
-fn load_safetensors_weights(path: &Path) -> Result<HashMap<String, MxArray>> {
-    let single = path.join("model.safetensors");
-    let mut all_weights: HashMap<String, MxArray> = HashMap::new();
-
-    if single.exists() {
-        let st = SafeTensorsFile::load(&single)?;
-        info!(
-            "  Loading {} tensors from model.safetensors",
-            st.tensor_names().len()
-        );
-        all_weights = st.load_tensors(&single)?;
-    } else {
-        // Try sharded format
-        let mut shard_index = 1;
-        loop {
-            let mut found_shard = None;
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&format!("model-{:05}-of-", shard_index))
-                    && name.ends_with(".safetensors")
-                {
-                    found_shard = Some(entry.path());
-                    break;
-                }
-            }
-
-            match found_shard {
-                Some(shard_path) => {
-                    info!("  Loading shard: {}", shard_path.display());
-                    let st = SafeTensorsFile::load(&shard_path)?;
-                    let shard_weights = st.load_tensors(&shard_path)?;
-                    all_weights.extend(shard_weights);
-                    shard_index += 1;
-                }
-                None => {
-                    if shard_index == 1 {
-                        return Err(Error::new(
-                            Status::InvalidArg,
-                            format!("No SafeTensors files found in {}", path.display()),
-                        ));
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(all_weights)
-}
-
 /// Load a `QianfanOCRInner` from a model directory.
 ///
 /// Runs synchronously on the dedicated model thread inside
@@ -2254,7 +2202,7 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
     );
 
     // --- Load SafeTensors weights ---
-    let all_weights = load_safetensors_weights(path)?;
+    let all_weights = load_all_safetensors(path, false)?;
     info!("  Loaded {} total tensors", all_weights.len());
 
     // Transform keys if still in HuggingFace format (has vision_model. prefix)
@@ -2377,73 +2325,6 @@ fn expand_qianfan_image_placeholders(
     }
 
     Ok(expanded)
-}
-
-/// Merge vision features into text embeddings at image placeholder positions.
-///
-/// Replaces positions in `text_embeddings` where `input_ids == img_context_token_id`
-/// with corresponding vision features from `vision_features`.
-fn merge_vision_features(
-    input_ids: &MxArray,
-    text_embeddings: &MxArray,
-    vision_features: &MxArray,
-    img_context_token_id: i32,
-) -> Result<MxArray> {
-    let input_shape = input_ids.shape()?;
-    let batch_size = input_shape[0];
-
-    let image_token = MxArray::scalar_int(img_context_token_id)?;
-    let image_positions = input_ids.equal(&image_token)?;
-
-    let embed_shape = text_embeddings.shape()?;
-    let hidden_dim = embed_shape[2];
-
-    let mut batch_outputs: Vec<MxArray> = Vec::new();
-    let mut feature_start_idx = 0i64;
-
-    for batch_idx in 0..batch_size {
-        let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
-        let batch_mask = batch_mask.squeeze(Some(&[0]))?;
-
-        let mask_sum = batch_mask.sum(None, None)?;
-        let num_positions = mask_sum.to_int32()?[0] as i64;
-
-        if num_positions > 0 {
-            let batch_features = vision_features.slice_axis(
-                0,
-                feature_start_idx,
-                feature_start_idx + num_positions,
-            )?;
-
-            let batch_embeds = text_embeddings.slice_axis(0, batch_idx, batch_idx + 1)?;
-            let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
-
-            let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
-            let cumsum = mask_int.cumsum(0)?;
-
-            let ones = MxArray::scalar_int(1)?;
-            let feature_indices = cumsum.sub(&ones)?;
-            let zeros =
-                MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
-            let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
-
-            let gathered_features = batch_features.take(&feature_indices, 0)?;
-
-            let mask_expanded = batch_mask.reshape(&[-1, 1])?;
-            let mask_expanded =
-                MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
-
-            let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
-            batch_outputs.push(batch_output);
-            feature_start_idx += num_positions;
-        } else {
-            let batch_embeds = text_embeddings.slice_axis(0, batch_idx, batch_idx + 1)?;
-            batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
-        }
-    }
-
-    let refs: Vec<&MxArray> = batch_outputs.iter().collect();
-    MxArray::stack(refs, Some(0))
 }
 
 /// Stack pixel values from multiple ProcessedImages into a single array.

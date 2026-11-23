@@ -45,8 +45,7 @@ use super::weights::{
 };
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::models::deepseek_v41::ops::inv_freqs;
-use crate::models::deepseek_v41::store::Weight;
+use crate::models::moe_common::{Weight, inv_freqs};
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
 

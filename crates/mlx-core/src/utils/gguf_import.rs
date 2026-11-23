@@ -1404,35 +1404,16 @@ pub(crate) fn transform_imported(
     plan: &ImportPlan,
     opts: &ImportOptions,
 ) -> Result<ImportedWeights> {
-    transform_imported_part(raw, gguf, plan, opts, true, |_| Ok(()))
+    transform_imported_part(raw, gguf, plan, opts, true)
 }
 
-/// Run `before_dtype` after remapping, layout fixups and CLEF extraction, but
-/// before conversion can change the source norm precision.
-pub(crate) fn transform_imported_with_before_dtype<F>(
-    raw: HashMap<String, MxArray>,
-    gguf: &GgufFile,
-    plan: &ImportPlan,
-    opts: &ImportOptions,
-    before_dtype: F,
-) -> Result<ImportedWeights>
-where
-    F: FnOnce(&HashMap<String, MxArray>) -> Result<()>,
-{
-    transform_imported_part(raw, gguf, plan, opts, true, before_dtype)
-}
-
-fn transform_imported_part<F>(
+fn transform_imported_part(
     raw: HashMap<String, MxArray>,
     gguf: &GgufFile,
     plan: &ImportPlan,
     opts: &ImportOptions,
     extract_head: bool,
-    before_dtype: F,
-) -> Result<ImportedWeights>
-where
-    F: FnOnce(&HashMap<String, MxArray>) -> Result<()>,
-{
+) -> Result<ImportedWeights> {
     tracing::info!("Remapping tensor names to HuggingFace format...");
     let mut weights = remap_keys(raw, &gguf.metadata)?;
 
@@ -1457,8 +1438,6 @@ where
     } else {
         None
     };
-
-    before_dtype(&weights)?;
 
     let mut views: HashSet<String> = weights
         .iter()
@@ -1689,9 +1668,7 @@ impl GgufPreload {
         }
         let mut transform = |map| {
             let mut imported =
-                transform_imported_part(map, main_header, main_plan, &input.opts, false, |_| {
-                    Ok(())
-                })?;
+                transform_imported_part(map, main_header, main_plan, &input.opts, false)?;
             materialize(&mut imported.weights, &imported.views)?;
             match consume.as_deref_mut() {
                 Some(consume) => consume(imported.weights),

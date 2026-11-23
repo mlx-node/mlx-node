@@ -114,7 +114,7 @@ pub(crate) struct DenseMtpStepper<'a> {
     config: Qwen3_5Config,
     /// The sequence this turn's paged main-forwards belong to, claimed at
     /// `begin_mtp_decode`.
-    owner: SpecOwner,
+    pub(super) owner: SpecOwner,
     /// Per-layer attention/linear classification consumed by the paged
     /// forwards.
     layer_kinds: Vec<crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind>,
@@ -219,7 +219,11 @@ impl DenseMtpStepper<'_> {
             ));
         }
         let owner = self.owner;
-        self.open_verify_cycle(owner, depth + 1);
+        if self.inner.is_moe() {
+            self.open_verify_cycle_strict(owner, depth + 1)?;
+        } else {
+            self.open_verify_cycle(owner, depth + 1);
+        }
         let inner = &mut *self.inner;
         let adapter = owner
             .resolve(&mut inner.paged_adapter, "eager paged MTP verify_step")
@@ -252,6 +256,23 @@ impl DenseMtpStepper<'_> {
     /// adapter that no longer answers to this turn's owner, whose
     /// `record_tokens` fails the verify a few lines later, so the pre-facade
     /// error semantics stand.
+    /// Strict MoE cycle opener: fails the verify instead of falling back to
+    /// an unticketed rollback outside the facade.
+    pub(super) fn open_verify_cycle_strict(&mut self, owner: SpecOwner, rows: usize) -> Result<()> {
+        self.close_abandoned_cycle();
+        let seq_id = owner.seq_id();
+        let ticket =
+            crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows)
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "eager MoE MTP-paged verify cycle ({rows} rows) on sequence \
+                         {seq_id} could not be opened: {e}"
+                    ))
+                })?;
+        self.open_cycle = Some(ticket);
+        Ok(())
+    }
+
     fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) {
         self.close_abandoned_cycle();
         let seq_id = owner.seq_id();
@@ -319,7 +340,11 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
-        Some("mtp_eager")
+        Some(if self.inner.is_moe() {
+            "moe_mtp_eager"
+        } else {
+            "mtp_eager"
+        })
     }
 
     // Step A main forward: eager pre-norm + final-norm + project. Returns
@@ -481,6 +506,19 @@ impl MtpStepper for DenseMtpStepper<'_> {
                          rows) failed (ignored): {e}",
                     );
                 }
+            }
+            None if self.inner.is_moe() => {
+                // `verify_step` on MoE refuses to write rows it could not open
+                // a cycle for, so fail closed rather than retracting outside
+                // the facade.
+                self.recurrent_frontier = None;
+                self.replay_err = Some(Error::from_reason(format!(
+                    "eager MoE MTP-paged rollback on sequence {} found no open verify \
+                     cycle ({accepted_drafts} of {depth} drafts accepted); refusing to \
+                     retract the adapter outside the facade",
+                    owner.seq_id()
+                )));
+                return;
             }
             None => {
                 // No cycle to close: `verify_step` could not open one,
@@ -943,12 +981,13 @@ impl MtpBackend for Qwen35Inner {
             }
         };
 
+        let is_moe = self.is_moe();
         let mut stepper = DenseMtpStepper {
             inner: self,
             mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
             committed_len: 0,
             use_committed,
-            chained_cycles_supported: has_prompt_seed,
+            chained_cycles_supported: is_moe || has_prompt_seed,
             snap: None,
             tape: Vec::new(),
             last_cycle_steps: 0,

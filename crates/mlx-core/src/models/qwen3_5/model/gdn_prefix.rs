@@ -174,7 +174,7 @@ impl Qwen35Inner {
         Ok(true)
     }
 
-    pub(super) fn find_dense_gdn_prefix_checkpoint(
+    pub(crate) fn find_dense_gdn_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
         requested_prefix_len: u32,
@@ -319,7 +319,7 @@ impl Qwen35Inner {
         );
     }
 
-    pub(super) fn publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
+    pub(crate) fn publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
         &mut self,
         tokens: &[u32],
         extra_keys_per_block: &[Vec<u64>],
@@ -377,121 +377,7 @@ impl Qwen35Inner {
         crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
-    /// Prefill for the hand-written paged cores (sync + stream, text).
-    ///
-    /// The engine's `PagedBackend::paged_prefill` serves only AR turns; a
-    /// planned-MTP turn returns from `paged_whole_turn` before the engine runs
-    /// and prefills here instead. Both cores share this one body so the chunk
-    /// size cannot be right in one core and wrong in the other.
-    ///
-    /// `keep_prompt_hidden_tokens` is `Some` exactly when the caller wants the
-    /// per-token prompt hidden for the MTP prompt-prefix seed; the returned
-    /// hidden is `Some` on that arm and `None` otherwise.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_dense_core_paged_prefill(
-        &mut self,
-        tokens: &[u32],
-        suffix: &[u32],
-        cached_prefix_len: u32,
-        gdn_prefix_already_primed: bool,
-        keep_prompt_hidden_tokens: Option<usize>,
-        layer_kinds: &[crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind],
-        context: &'static str,
-    ) -> Result<(
-        MxArray,
-        Option<MxArray>,
-        Vec<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
-    )> {
-        let embed = self.embedding.clone();
-        // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
-        // image prefill); feeds the scalar-offset RoPE for the suffix.
-        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
-            self.cold_gdn_prefill_chunk_size(),
-        );
-        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
-        // can borrow `self.layers`/`self.caches` mutably at the same time.
-        // Threaded into BOTH arms: the AR chunk loop and the planned-MTP
-        // `_with_hidden` chunk loop poll it at every chunk boundary.
-        let turn_cancel = self.turn_cancel.clone();
-        // Splash `publishReachedStateBoundaries` runs for every request: an
-        // MTP turn's prefill reaches its points as a plain one does.
-        let lane_states = self.dflash2.is_none()
-            && self
-                .dflash2_states
-                .turns
-                .contains_key(&crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self));
-        let cached = cached_prefix_len as usize;
-        let captures = if lane_states {
-            crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
-                self,
-                cached,
-                cached + suffix.len(),
-                chunk_size,
-            )
-        } else {
-            Vec::new()
-        };
-        let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
-        let taps = lane_states
-            .then_some(&mut sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink);
-        let mut lane_target;
-        let mut plain_target;
-        let target: &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> =
-            if lane_states {
-                lane_target = crate::models::qwen3_5::dflash2_turn::LanePrefill(&mut *self);
-                &mut lane_target
-            } else {
-                plain_target = crate::models::qwen3_5::paged_forward::PrefillParts {
-                    layers: &mut self.layers,
-                    caches: self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(format!("{context}: caches not initialized"))
-                    })?,
-                    final_norm: &self.final_norm,
-                    lm_head: &self.lm_head,
-                    adapter: self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(format!("{context}: paged_adapter dropped"))
-                    })?,
-                };
-                &mut plain_target
-            };
-        if let Some(keep_tokens) = keep_prompt_hidden_tokens {
-            let (logits, hidden, checkpoints) =
-                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    target,
-                    layer_kinds,
-                    chunk_size,
-                    Some(keep_tokens),
-                    rope_deltas,
-                    turn_cancel.as_deref(),
-                    taps,
-                )?;
-            Ok((logits, Some(hidden), checkpoints))
-        } else {
-            let (logits, checkpoints) =
-                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    target,
-                    layer_kinds,
-                    chunk_size,
-                    rope_deltas,
-                    turn_cancel.as_deref(),
-                    taps,
-                )?;
-            Ok((logits, None, checkpoints))
-        }
-    }
-
-    pub(super) fn prepare_dense_gdn_prefix_state(
+    pub(crate) fn prepare_dense_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,

@@ -40,21 +40,7 @@ fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("deepseek_v41 store: {msg}"))
 }
 
-/// Something `linear` can use as an f32 `[out, in]` weight.
-pub trait Weight {
-    fn f32(&self) -> Result<MxArray>;
-
-    /// `x @ W^T` for an f32 `x`.
-    fn mm_t(&self, x: &MxArray) -> Result<MxArray> {
-        x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?)
-    }
-}
-
-impl Weight for MxArray {
-    fn f32(&self) -> Result<MxArray> {
-        self.astype(DType::Float32)
-    }
-}
+pub use crate::models::moe_common::{POOL_LIMIT, Weight};
 
 /// A dense weight: an array, or Q8_0 as MLX affine 8-bit (`w` `[rows, k /
 /// 4]` uint32 codes q + 128, `scales` `[rows, k / 32]` f16). The f32 form
@@ -268,8 +254,6 @@ type Located = (usize, u64, GgufTensorInfo);
 /// Expert projections in bank order.
 const PROJS: [&str; 3] = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
 const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
-/// MLX free-buffer pool ceiling.
-pub const POOL_LIMIT: usize = 1 << 30;
 /// v1 context limit: the admission's KV / compute terms use it.
 pub const CTX_LIMIT: usize = 16_384;
 

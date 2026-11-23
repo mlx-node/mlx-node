@@ -9,9 +9,9 @@ use crate::array::MxArray;
 use crate::vision::embeddings::PatchEmbedding;
 #[cfg(test)]
 use crate::vision::encoder::VisionAttention;
-use crate::vision::encoder::VisionEncoderLayer;
+use crate::vision::encoder::{VisionEncoderLayer, build_vision_segment_boundaries};
 use crate::vision::projector::SpatialProjector;
-use crate::vision::rope_vision::VisionRotaryEmbedding;
+use crate::vision::rope_vision::{VisionRotaryEmbedding, compute_rot_pos_emb_2d};
 use napi::bindgen_prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -222,60 +222,6 @@ impl QwenVisionEncoder {
         params
     }
 
-    /// Compute 2D rotary position embeddings for the grid
-    fn compute_rot_pos_emb(&self, grid_thw: &MxArray) -> Result<MxArray> {
-        let grid_data = grid_thw.to_int32()?;
-        let num_images = grid_thw.shape()?[0] as usize;
-
-        let mut height_ids: Vec<i32> = Vec::new();
-        let mut width_ids: Vec<i32> = Vec::new();
-
-        for img_idx in 0..num_images {
-            let t = grid_data[img_idx * 3];
-            let h = grid_data[img_idx * 3 + 1];
-            let w = grid_data[img_idx * 3 + 2];
-
-            let num_patches = t * h * w;
-            for idx in 0..num_patches {
-                let local_idx = idx % (h * w);
-                height_ids.push(local_idx / w);
-                width_ids.push(local_idx % w);
-            }
-        }
-
-        let h_ids = MxArray::from_int32(&height_ids, &[height_ids.len() as i64])?;
-        let w_ids = MxArray::from_int32(&width_ids, &[width_ids.len() as i64])?;
-        let pos_ids = MxArray::stack(vec![&h_ids, &w_ids], Some(-1))?;
-
-        // Max grid size for frequency computation
-        let max_h = grid_data
-            .iter()
-            .skip(1)
-            .step_by(3)
-            .max()
-            .copied()
-            .unwrap_or(1);
-        let max_w = grid_data
-            .iter()
-            .skip(2)
-            .step_by(3)
-            .max()
-            .copied()
-            .unwrap_or(1);
-        let max_size = max_h.max(max_w) as u32;
-
-        let freqs = self.rotary_pos_emb.forward(max_size)?;
-
-        // Gather h and w frequencies separately then concatenate
-        let h_ids_flat = pos_ids.slice_axis(1, 0, 1)?.reshape(&[-1])?;
-        let w_ids_flat = pos_ids.slice_axis(1, 1, 2)?.reshape(&[-1])?;
-
-        let h_freqs = freqs.take(&h_ids_flat, 0)?;
-        let w_freqs = freqs.take(&w_ids_flat, 0)?;
-
-        MxArray::concatenate_many(vec![&h_freqs, &w_freqs], Some(-1))
-    }
-
     /// Forward pass
     ///
     /// # Arguments
@@ -344,34 +290,14 @@ impl QwenVisionEncoder {
         };
 
         // Compute 2D rotary position embeddings
-        let rotary_pos_emb = self.compute_rot_pos_emb(grid_thw)?;
+        let rotary_pos_emb = compute_rot_pos_emb_2d(&self.rotary_pos_emb, grid_thw)?;
 
         // Build cumulative image/frame boundaries. Qwen vision attention is
         // block-diagonal across these segments. Keep the boundaries on the CPU
         // and dispatch one fused SDPA per segment rather than allocating a
         // `[total_patches, total_patches]` additive mask.
-        let mut segment_boundaries: Vec<i64> = vec![0];
-        for img_idx in 0..num_images {
-            let t = i64::from(grid_data[img_idx * 3]);
-            let h_dim = i64::from(grid_data[img_idx * 3 + 1]);
-            let w_dim = i64::from(grid_data[img_idx * 3 + 2]);
-            let segment_len = h_dim
-                .checked_mul(w_dim)
-                .ok_or_else(|| Error::from_reason("Qwen vision segment length overflow"))?;
-            for _ in 0..t {
-                let prev = *segment_boundaries.last().unwrap_or(&0);
-                segment_boundaries.push(prev.checked_add(segment_len).ok_or_else(|| {
-                    Error::from_reason("Qwen vision cumulative segment length overflow")
-                })?);
-            }
-        }
         let total_seq_len = h.shape()?[0];
-        if segment_boundaries.last().copied() != Some(total_seq_len) {
-            return Err(Error::from_reason(format!(
-                "Qwen vision grid covers {} patches but patch embedding produced {total_seq_len}",
-                segment_boundaries.last().copied().unwrap_or(0),
-            )));
-        }
+        let segment_boundaries = build_vision_segment_boundaries(grid_thw, total_seq_len)?;
 
         // Forward through encoder layers. MLX builds lazy graphs, so leaving all
         // 27 blocks attached to the final merger output retains every layer's

@@ -7,9 +7,8 @@ use napi::{Error, Result};
 use super::config::{HcConfig, MoeConfig};
 use super::weights::{Dense, HcWeights};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::linear;
-use crate::models::deepseek_v41::ops::hc_pre;
-use crate::models::deepseek_v41::store::Weight;
+pub use crate::models::moe_common::route_select_fast;
+use crate::models::moe_common::{Weight, hc_pre, linear};
 use crate::nn::Activations;
 
 /// Vocab rows per f32 head chunk (16384 x 3072 f32 = 192 MiB).
@@ -1036,101 +1035,6 @@ pub fn router_topk_gpu(
     Ok(Some((ids, weights)))
 }
 
-fn route_rows(
-    scores: &[f32],
-    bias: Option<&[f32]>,
-    n: usize,
-    k: usize,
-    route_scale: f32,
-    norm: bool,
-    out_ids: &mut [u32],
-    out_weights: &mut [f32],
-) {
-    let cmp = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1));
-    let mut pairs: Vec<(f32, u32)> = Vec::with_capacity(n);
-    for ((row_scores, row_ids), row_weights) in scores
-        .chunks_exact(n)
-        .zip(out_ids.chunks_exact_mut(k))
-        .zip(out_weights.chunks_exact_mut(k))
-    {
-        pairs.clear();
-        match bias {
-            Some(b) => pairs.extend(
-                row_scores
-                    .iter()
-                    .zip(b)
-                    .enumerate()
-                    .map(|(e, (&s, &bi))| (s + bi, e as u32)),
-            ),
-            None => pairs.extend(row_scores.iter().enumerate().map(|(e, &s)| (s, e as u32))),
-        }
-        if k < n {
-            pairs.select_nth_unstable_by(k - 1, cmp);
-        }
-        let top = &mut pairs[..k];
-        top.sort_unstable_by(cmp);
-        let sum = top
-            .iter()
-            .fold(0.0f32, |a, &(_, e)| a + row_scores[e as usize])
-            + 1e-20;
-        for (j, &(_, e)) in top.iter().enumerate() {
-            let x = row_scores[e as usize];
-            row_ids[j] = e;
-            row_weights[j] = (if norm && k > 1 { x / sum } else { x }) * route_scale;
-        }
-    }
-}
-
-/// O(N) per-row top-k selection matching `deepseek_v41::ops::route_select`
-/// bit-for-bit, parallelized across rows when `rows >= 256`.
-pub fn route_select_fast(
-    scores: &[f32],
-    bias: Option<&[f32]>,
-    n: usize,
-    k: usize,
-    route_scale: f32,
-    norm: bool,
-) -> (Vec<u32>, Vec<f32>) {
-    let rows = scores.len() / n;
-    if rows == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let mut ids = vec![0u32; rows * k];
-    let mut weights = vec![0.0f32; rows * k];
-    if rows < 256 {
-        route_rows(
-            scores,
-            bias,
-            n,
-            k,
-            route_scale,
-            norm,
-            &mut ids,
-            &mut weights,
-        );
-        return (ids, weights);
-    }
-    let threads = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(8)
-        .min(8)
-        .min(rows / 32)
-        .max(1);
-    let chunk_rows = rows.div_ceil(threads);
-    std::thread::scope(|scope| {
-        for ((sc, id), wt) in scores
-            .chunks(chunk_rows * n)
-            .zip(ids.chunks_mut(chunk_rows * k))
-            .zip(weights.chunks_mut(chunk_rows * k))
-        {
-            scope.spawn(move || {
-                route_rows(sc, bias, n, k, route_scale, norm, id, wt);
-            });
-        }
-    });
-    (ids, weights)
-}
-
 /// Top `n_used` experts per row by `score + bias` (ties to the lowest id),
 /// weights from the unbiased scores `/ (Σ + 1e-20) · route_scale`.
 /// Row-major `scores [rows, n_experts]`; `[rows, n_used]` ids and weights.
@@ -1304,59 +1208,6 @@ pub(crate) fn try_bf16_lm_head(xf: &MxArray, head: &Dense) -> Result<Option<MxAr
         return Ok(None);
     }
     Ok(Some(MxArray::from_handle(h, "hy_v4_flash bf16_lm_head")?))
-}
-
-/// Gathers token rows from a zero-copy GGUF Q8_0 mmap buffer directly into
-/// `[..ids.shape, dim]` f32 on Metal. Returns `Ok(None)` when Metal or the
-/// arguments are unsupported.
-pub(crate) fn gguf_q8_0_embed_rows(
-    ids: &MxArray,
-    buf: &MxArray,
-    byte_offset: u64,
-    vocab: i64,
-    dim: i64,
-) -> Result<Option<MxArray>> {
-    let (Ok(v_i32), Ok(d_i32)) = (i32::try_from(vocab), i32::try_from(dim)) else {
-        return Ok(None);
-    };
-    if v_i32 <= 0 || d_i32 <= 0 || d_i32 % 32 != 0 {
-        return Ok(None);
-    }
-    let orig_shape = dims(ids)?;
-    let mut out_shape = orig_shape.clone();
-    out_shape.push(dim);
-    let n: i64 = orig_shape.iter().copied().product();
-    if n == 0 {
-        return Ok(Some(MxArray::zeros(&out_shape, Some(DType::Float32))?));
-    }
-    let flat = if orig_shape.len() == 1 {
-        ids.clone()
-    } else {
-        ids.reshape(&[n])?
-    };
-    let flat = match flat.dtype()? {
-        DType::Int32 | DType::Uint32 => flat,
-        _ => flat.astype(DType::Int32)?,
-    };
-    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
-    let h = unsafe {
-        mlx_sys::mlx_hy4_gguf_q8_0_embed_rows(
-            flat.as_raw_ptr(),
-            buf.as_raw_ptr(),
-            byte_offset,
-            v_i32,
-            d_i32,
-        )
-    };
-    if h.is_null() {
-        return Ok(None);
-    }
-    let out = MxArray::from_handle(h, "hy_v4_flash gguf_q8_0_embed_rows")?;
-    if orig_shape.len() == 1 {
-        Ok(Some(out))
-    } else {
-        Ok(Some(out.reshape(&out_shape)?))
-    }
 }
 
 /// f32 logits `[s, vocab]` of `x [s, d]`; see `head_logits_chunked`.

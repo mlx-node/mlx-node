@@ -62,13 +62,13 @@ fn multi_block_round_trip_bf16_head_dim_512() {
     let v_prefix = MxArray::from_bfloat16(&v_prefix_bits, &[16, 1, 512]).unwrap();
     k_prefix.eval();
     v_prefix.eval();
-    match adapter.update_keys_values(0, &k_prefix, &v_prefix, 0) {
+    match adapter.update_keys_values_native(0, &k_prefix, &v_prefix, 0) {
         Ok(()) => {}
         Err(e) if e.contains("Metal GPU not available") => {
             eprintln!("skipping multi_block_round_trip_bf16_head_dim_512 (prefix): {e}");
             return;
         }
-        Err(e) => panic!("update_keys_values prefix: {e}"),
+        Err(e) => panic!("update_keys_values_native prefix: {e}"),
     }
 
     // Step 2: write 1 token at position 16 (start of block 1). K = 0.25, V = 0.75.
@@ -79,13 +79,13 @@ fn multi_block_round_trip_bf16_head_dim_512() {
     let v_suffix = MxArray::from_bfloat16(&v_suffix_bits, &[1, 1, 512]).unwrap();
     k_suffix.eval();
     v_suffix.eval();
-    match adapter.update_keys_values(0, &k_suffix, &v_suffix, 16) {
+    match adapter.update_keys_values_native(0, &k_suffix, &v_suffix, 16) {
         Ok(()) => {}
         Err(e) if e.contains("Metal GPU not available") => {
             eprintln!("skipping multi_block_round_trip_bf16_head_dim_512 (suffix): {e}");
             return;
         }
-        Err(e) => panic!("update_keys_values suffix: {e}"),
+        Err(e) => panic!("update_keys_values_native suffix: {e}"),
     }
 
     // Step 3: read [0, 17) and verify each position has the expected value.

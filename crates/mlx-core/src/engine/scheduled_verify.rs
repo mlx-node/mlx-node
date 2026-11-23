@@ -8,6 +8,31 @@ use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
 use napi::bindgen_prelude::{Error, Result};
 use std::collections::HashSet;
 
+/// Partition indices of eligible `rows` into verify-wave groups of `2..=max_wave_lanes`.
+///
+/// Groups with fewer than 2 rows (including a lone trailing row, or any call with
+/// `max_wave_lanes < 2`) are dropped so callers only pay wave-packing overhead when
+/// at least two lanes can stack together.
+pub(crate) fn partition_verify_wave_groups<T>(
+    rows: &[T],
+    max_wave_lanes: usize,
+    mut eligible: impl FnMut(&T) -> bool,
+) -> Vec<Vec<usize>> {
+    if max_wave_lanes < 2 {
+        return Vec::new();
+    }
+    let indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| eligible(row).then_some(idx))
+        .collect();
+    indices
+        .chunks(max_wave_lanes)
+        .filter(|group| group.len() >= 2)
+        .map(<[usize]>::to_vec)
+        .collect()
+}
+
 pub(crate) struct ScheduledVerifyBatch {
     entries: Vec<VerifyEntry>,
 }
@@ -542,5 +567,34 @@ mod tests {
         );
         assert!(model.events.contains(&"discard:1".into()));
         assert!(model.events.contains(&"discard:2".into()));
+    }
+
+    #[test]
+    fn partition_verify_wave_groups_drops_lone_trailing_row_and_small_caps() {
+        let rows = [10u32, 20, 30, 40, 50];
+        assert!(partition_verify_wave_groups(&rows, 0, |_| true).is_empty());
+        assert!(partition_verify_wave_groups(&rows, 1, |_| true).is_empty());
+        assert!(partition_verify_wave_groups(&rows[..1], 4, |_| true).is_empty());
+        assert_eq!(
+            partition_verify_wave_groups(&rows, 4, |_| true),
+            vec![vec![0, 1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn partition_verify_wave_groups_chunks_eligible_rows_preserving_indices() {
+        let rows = [true, false, true, true, false, true, true, true];
+        assert_eq!(
+            partition_verify_wave_groups(&rows, 4, |&ok| ok),
+            vec![vec![0, 2, 3, 5], vec![6, 7]]
+        );
+        assert_eq!(
+            partition_verify_wave_groups(&rows, 3, |&ok| ok),
+            vec![vec![0, 2, 3], vec![5, 6, 7]]
+        );
+        assert_eq!(
+            partition_verify_wave_groups(&rows, 2, |&ok| ok),
+            vec![vec![0, 2], vec![3, 5], vec![6, 7]]
+        );
     }
 }

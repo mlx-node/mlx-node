@@ -18,24 +18,22 @@ use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::MxArray;
 use crate::engine::backend::ChatBackend;
-use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+use crate::engine::cmd::ChatCmd;
 use crate::engine::governor::governor::{Governor, MemoryAccounts, ModelGuard};
 use crate::engine::governor::ledger::{
     FreeOutcome, Stage, Taken as LedgerTaken, UnitKey, UnitRuns, Victim, VictimQuery,
 };
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefillPass,
-    ScheduledPrefixAdmission, ScheduledReply, ScheduledRestoreResult, SchedulerOwnerContext,
-    StepClaims,
+    DualLaneChatBarrier, HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor,
+    ScheduledPrefillPass, ScheduledPrefixAdmission, ScheduledRestoreResult, SchedulerOwnerContext,
+    StepClaims, execute_dual_lane_chat_barrier,
 };
 use crate::engine::model_command::{FamilyCommand, ModelCommand};
 use crate::engine::scheduler::{MeasuredConfig, PreemptionMode, StepPlan};
-use crate::engine::types::ChatConfig;
 use crate::model_thread::ResponseTx;
 use crate::models::qwen3_5::dflash2_state::disk::{Tick, instant_at};
 use crate::models::qwen3_5::dflash2_state::store::{StateClass, StoreHit};
 use crate::stream::{Stream, WiredResidency};
-use crate::tokenizer::ChatMessage;
 use crate::transformer::paged_kv_cache_adapter::{
     ChainPrefetchStart, PagedKVCacheAdapter, RestoreUploadBudget, SeqId,
 };
@@ -84,75 +82,68 @@ pub(crate) struct Inkling2OwnerState {
     pub flat_cache: Option<Inkling2FlatCache>,
 }
 
-fn inkling2_chat_parts(command: &ChatCmd) -> Option<(&[ChatMessage], &ChatConfig)> {
-    match command {
-        ChatCmd::SessionStart {
-            messages, config, ..
+impl DualLaneChatBarrier for Inkling2Inner {
+    fn prepare_reset_barrier(&mut self) {
+        self.prefill_runs.clear();
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_seq = 0;
         }
-        | ChatCmd::SessionContinue {
-            messages, config, ..
-        }
-        | ChatCmd::SessionContinueTool {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionStart {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionContinue {
-            messages, config, ..
-        }
-        | ChatCmd::StreamSessionContinueTool {
-            messages, config, ..
-        } => Some((messages, config)),
-        ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => None,
     }
-}
 
-fn inkling2_owner_id(command: &ChatCmd) -> Option<&str> {
-    inkling2_chat_parts(command)
-        .and_then(|(_, config)| config.cache_owner_id.as_deref())
-        .filter(|owner| !owner.is_empty())
-}
+    fn command_uses_flat_lane(&self, _command: &ChatCmd) -> bool {
+        self.paged.is_none()
+    }
 
-fn inkling2_is_session_start(command: &ChatCmd) -> bool {
-    matches!(
-        command,
-        ChatCmd::SessionStart { .. } | ChatCmd::StreamSessionStart { .. }
-    )
-}
+    fn prepare_ownerless_barrier(&mut self, _flat_lane: bool) {
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_seq = 0;
+        }
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+    }
 
-fn inkling2_send_error(command: ChatCmd, error: Error) {
-    match command {
-        ChatCmd::SessionStart {
-            reply, cancelled, ..
+    fn finish_ownerless_barrier(&mut self, flat_lane: bool) {
+        if !flat_lane && !ChatBackend::has_live_session(self) {
+            let _ = self.release_scheduled_cache(0);
         }
-        | ChatCmd::SessionContinue {
-            reply, cancelled, ..
+    }
+
+    fn owner_has_flat_state(state: &Self::OwnerState) -> bool {
+        state.flat_cache.is_some()
+    }
+
+    fn install_flat_owner_state(&mut self, state: Self::OwnerState) {
+        self.flat_cache = state.flat_cache;
+        self.cached_token_history = state.cached_token_history;
+        self.cached_image_key = state.cached_image_key;
+    }
+
+    fn capture_flat_owner_state(&mut self) -> Self::OwnerState {
+        Inkling2OwnerState {
+            cached_token_history: self.cached_token_history.clone(),
+            cached_image_key: self.cached_image_key,
+            flat_cache: self.flat_cache.take(),
         }
-        | ChatCmd::SessionContinueTool {
-            reply, cancelled, ..
-        } => ScheduledReply::Sync(reply).send_error(error, cancelled.as_ref()),
-        ChatCmd::StreamSessionStart {
-            stream_tx,
-            cancelled,
-            ..
+    }
+
+    fn install_paged_owner_state(&mut self, seq_id: SeqId, state: Self::OwnerState) {
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_seq = seq_id;
         }
-        | ChatCmd::StreamSessionContinue {
-            stream_tx,
-            cancelled,
-            ..
+        self.cached_token_history = state.cached_token_history;
+        self.cached_image_key = state.cached_image_key;
+    }
+
+    fn capture_paged_owner_state(&mut self) -> Self::OwnerState {
+        Inkling2OwnerState {
+            cached_token_history: self.cached_token_history.clone(),
+            cached_image_key: self.cached_image_key,
+            flat_cache: None,
         }
-        | ChatCmd::StreamSessionContinueTool {
-            stream_tx,
-            cancelled,
-            ..
-        } => ScheduledReply::Stream(stream_tx).send_error(error, cancelled.as_ref()),
-        ChatCmd::ResetCaches { reply } => {
-            let _ = reply.send(Err(error));
-        }
-        ChatCmd::ReleaseCacheOwner { reply, .. } => {
-            let _ = reply.send(Err(error));
-        }
+    }
+
+    fn release_dead_paged_owner(&mut self, seq_id: SeqId) {
+        let _ = self.release_scheduled_cache(seq_id);
     }
 }
 
@@ -1190,105 +1181,7 @@ impl HybridSchedulerBackend for Inkling2Inner {
         command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        if matches!(&command, ChatCmd::ResetCaches { .. }) {
-            self.prefill_runs.clear();
-            if let Some(rt) = self.paged.as_mut() {
-                rt.active_seq = 0;
-            }
-            handle_chat_cmd(self, command);
-            return;
-        }
-
-        let flat_lane = self.paged.is_none();
-        let Some(owner_id) = inkling2_owner_id(&command).map(str::to_owned) else {
-            if let Some(rt) = self.paged.as_mut() {
-                rt.active_seq = 0;
-            }
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-            handle_chat_cmd(self, command);
-            if !flat_lane && !ChatBackend::has_live_session(self) {
-                let _ = self.release_scheduled_cache(0);
-            }
-            return;
-        };
-
-        if inkling2_is_session_start(&command) {
-            let seq_id = owners.owner_sequences.get(&owner_id).copied();
-            if let Err(error) =
-                self.release_owner_resources(seq_id, owners.owner_states.get(&owner_id))
-            {
-                inkling2_send_error(command, error);
-                return;
-            }
-            owners.owner_sequences.remove(&owner_id);
-            owners.owner_states.remove(&owner_id);
-        } else {
-            let state = owners.owner_states.get(&owner_id);
-            let has_owner = if flat_lane {
-                state.is_some_and(|s| s.flat_cache.is_some())
-            } else {
-                owners.owner_sequences.contains_key(&owner_id)
-            };
-            if !has_owner {
-                inkling2_send_error(
-                    command,
-                    Error::from_reason(
-                        "chat session continuation requires an initialized cache owner (call chatSessionStart first)",
-                    ),
-                );
-                return;
-            }
-        }
-
-        let state = owners.owner_states.remove(&owner_id).unwrap_or_default();
-        if flat_lane {
-            self.flat_cache = state.flat_cache;
-            self.cached_token_history = state.cached_token_history;
-            self.cached_image_key = state.cached_image_key;
-            handle_chat_cmd(self, command);
-            let live = ChatBackend::has_live_session(self);
-            let saved = Inkling2OwnerState {
-                cached_token_history: self.cached_token_history.clone(),
-                cached_image_key: self.cached_image_key,
-                flat_cache: self.flat_cache.take(),
-            };
-            if live {
-                owners.owner_states.insert(owner_id, saved);
-            } else {
-                owners.owner_sequences.remove(&owner_id);
-            }
-        } else {
-            let seq_id = owners
-                .owner_sequences
-                .get(&owner_id)
-                .copied()
-                .unwrap_or_else(|| {
-                    let seq_id = *owners.next_seq_id;
-                    *owners.next_seq_id = owners.next_seq_id.saturating_add(1);
-                    owners.owner_sequences.insert(owner_id.clone(), seq_id);
-                    seq_id
-                });
-            if let Some(rt) = self.paged.as_mut() {
-                rt.active_seq = seq_id;
-            }
-            self.cached_token_history = state.cached_token_history;
-            self.cached_image_key = state.cached_image_key;
-            handle_chat_cmd(self, command);
-            if ChatBackend::has_live_session(self) {
-                owners.owner_states.insert(
-                    owner_id,
-                    Inkling2OwnerState {
-                        cached_token_history: self.cached_token_history.clone(),
-                        cached_image_key: self.cached_image_key,
-                        flat_cache: None,
-                    },
-                );
-            } else {
-                let _ = self.release_scheduled_cache(seq_id);
-                owners.owner_sequences.remove(&owner_id);
-            }
-        }
+        execute_dual_lane_chat_barrier(self, command, owners);
     }
 }
 

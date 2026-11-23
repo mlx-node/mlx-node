@@ -64,12 +64,15 @@ fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
     Arc::new(tok)
 }
 
-/// Dense forks its own paged MTP core, so the acceptance gate runs in
-/// `paged_whole_turn` instead of in `admit_paged_speculative_decode` the
-/// way MoE's does. A gated turn falls through to the generic paged driver,
-/// which dispatches on `plan.decoder` — so the gate has to restate the
-/// plan, or the fall-through lands on the erroring default hook and fails
-/// the turn it was supposed to decode autoregressively.
+/// Dense routes paged native-MTP turns through the shared
+/// `engine::paged_turn::run_paged_turn` driver:
+/// 1. `admit_paged_speculative_decode` implements the generic driver's
+///    speculative-admission contract — returning `Ok(false)` (never the old
+///    erroring trait default) when gated out or when no speculative plan is
+///    active, and dropping any stashed `pending_prompt_hidden`.
+/// 2. `paged_whole_turn` also enforces the gate before prefill so a gated turn
+///    leaves the speculative lane (`args.plan.decoder == Autoregressive`) and
+///    never allocates full-prompt hidden states.
 ///
 /// MUTATION: drop the `args.plan.decoder = DecoderPlan::Autoregressive`
 /// restatement — the final assertion fails.
@@ -77,18 +80,17 @@ fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
 fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
     let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
 
-    // Dense implements no paged speculative core, so the generic driver's
-    // speculative branch is a turn FAILURE, not an autoregressive
-    // fallback. That is what the restatement below has to avoid.
-    let probe = extract_chat_params(&ChatConfig::default());
-    let refusal = <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
-        .expect_err("dense must inherit the erroring default hook");
+    // Dense implements `admit_paged_speculative_decode` directly: without an
+    // active speculative plan it returns `Ok(false)` (AR fallback), not the
+    // erroring default trait hook.
+    let probe = extract_chat_params(&ChatConfig {
+        enable_mtp: Some(true),
+        ..ChatConfig::default()
+    });
     assert!(
-        refusal
-            .reason
-            .contains("implements no paged speculative core"),
-        "unexpected refusal: {}",
-        refusal.reason
+        !<Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+            .expect("dense must implement admit_paged_speculative_decode"),
+        "without MTP weights / paged pool, admission declines cleanly to AR"
     );
 
     // 0-of-5 accepted first drafts: confidently below break-even.
@@ -98,6 +100,25 @@ fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
     );
     inner.mtp_draft_accepted = 0;
     inner.mtp_draft_attempted = 5;
+    inner.pending_prompt_hidden = Some((
+        MxArray::zeros(&[1, 3, 64], Some(crate::array::DType::BFloat16)).expect("hidden"),
+        vec![1, 2, 3],
+    ));
+    assert!(
+        !<Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+            .expect("gated admission must decline cleanly to AR"),
+        "a gated turn must decline speculative admission"
+    );
+    assert!(
+        inner.pending_prompt_hidden.is_none(),
+        "declining speculative admission must clear any stashed prompt_hidden"
+    );
+
+    // Reset the gate streak and verify `paged_whole_turn` restates the plan
+    // before preflight/prefill.
+    inner.mtp_draft_accepted = 0;
+    inner.mtp_draft_attempted = 5;
+    inner.mtp_gated_turns = 0;
 
     let tokenizer = tiny_tokenizer();
     let config = ChatConfig {
@@ -150,6 +171,56 @@ fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
         DecoderPlan::Autoregressive,
         "a gated turn must leave the speculative lane before the generic \
          paged driver reads plan.decoder"
+    );
+    assert!(
+        !inner.want_paged_mtp_prompt_hidden,
+        "a gated or rejected turn must not leave want_paged_mtp_prompt_hidden armed"
+    );
+}
+
+#[test]
+fn admit_paged_speculative_decode_admits_when_ungated_and_pool_has_room() {
+    // SAFETY: nullary availability predicate.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let mut cfg = super::paged_construction_tests::tiny_paged_forward_cfg();
+    cfg.num_layers = 4;
+    cfg.full_attention_interval = 4;
+    cfg.n_mtp_layers = 1;
+    let mut inner = Qwen35Inner::new(cfg).expect("construct");
+    inner.mtp_weights_loaded = true;
+    super::dflash2_park_tests::install_pool(
+        &mut inner,
+        4,
+        4,
+        super::dflash2_park_tests::passing_probe(),
+    )
+    .expect("install pool");
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset request");
+
+    let probe = extract_chat_params(&ChatConfig {
+        enable_mtp: Some(true),
+        ..ChatConfig::default()
+    });
+    assert!(
+        <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+            .expect("ungated admission with room must succeed"),
+        "ungated dense MTP turn with pool headroom must be admitted"
+    );
+
+    // Now block the gate on the same healthy pool: admission must return Ok(false).
+    inner.mtp_draft_accepted = 0;
+    inner.mtp_draft_attempted = 5;
+    assert!(
+        !<Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+            .expect("gated admission must not error"),
+        "gated dense MTP turn must decline even with pool headroom"
     );
 }
 

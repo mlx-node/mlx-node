@@ -2,7 +2,7 @@ use super::{
     config::{Config, Options, Policy, Profile, invalid},
     weights::Weights,
 };
-use crate::models::rerank_runtime::Request;
+use crate::models::rerank_runtime::{Request, check_cancel};
 use crate::{
     array::{
         self, DType, MxArray,
@@ -16,10 +16,7 @@ use crate::{
 use napi::{Error, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{path::Path, sync::atomic::AtomicBool};
 use tokenizers::Tokenizer;
 
 struct Layer {
@@ -108,14 +105,6 @@ fn sanitize_text(text: &str) -> String {
         }
     }
     clean
-}
-
-pub(super) fn check_cancel(cancel: &AtomicBool, shutdown: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
-        Err(Error::from_reason("rerank_cancelled: request cancelled"))
-    } else {
-        Ok(())
-    }
 }
 
 impl Model {

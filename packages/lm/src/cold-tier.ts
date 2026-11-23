@@ -79,15 +79,12 @@ export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType
 /**
  * Model families whose disk cache is the model's own SSD state tier
  * (`disk_tier.rs`), not the process cold tier above: their turns never touch
- * `coldCacheStats()`.
+ * `coldCacheStats()`. Derived from the `acceptsCacheDisk` flags on the
+ * `MODEL_FAMILY_DATA` rows.
  */
-export const COLD_TIER_STATE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
-  'qwen3_5',
-  'qwen3_5_moe',
-  'qwen4_exp',
-  'hy_v4_flash',
-  'inkling2',
-]);
+export const COLD_TIER_STATE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
+  MODEL_FAMILY_DATA.filter((row) => 'acceptsCacheDisk' in row && row.acceptsCacheDisk === true).map((row) => row.id),
+);
 
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */
 export function coldTierRestoreFamilyList(): string[] {

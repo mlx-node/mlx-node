@@ -2,9 +2,12 @@ use super::super::tapped_tree_rows;
 use super::{DraftStepper, Verified};
 use crate::array::MxArray;
 use crate::engine::backend::DsparkTreeGreedyResult;
+use crate::models::qwen3_5::verify_tree::cuda::{
+    TreeLookupSource, finalize_tree_greedy_walk, prepare_tree_lookup, select_tree_gpu,
+};
 use crate::models::qwen3_5::verify_tree::{
-    DRAFT_SLOTS, LookupAgreement, LookupIndex, MAX_LOOKUP_CHAIN, MAX_TREE_NODES, TreeCostModel,
-    TreeDeviceViews, VerifyTree, build_verify_tree, build_verify_tree_cost_aware,
+    DraftLattice, LookupAgreement, MAX_TREE_NODES, TreeCostModel, TreeDeviceViews, VerifyTree,
+    build_verify_tree, build_verify_tree_cost_aware,
 };
 use napi::{Error, Result};
 
@@ -120,68 +123,31 @@ impl DraftStepper<'_> {
             draft_slots,
         )?;
 
-        let lookup_info = self.lookup_index.match_info();
-        let eff_max_depth = max_depth.min(MAX_LOOKUP_CHAIN);
+        let lookup = prepare_tree_lookup(&self.lookup_index, self.lookup_enabled, max_depth);
         let max_cap = max_nodes.clamp(1, MAX_TREE_NODES);
-        let lookup_cap = MAX_LOOKUP_CHAIN.min(eff_max_depth);
-        let lookup_proposals = if self.lookup_enabled && lookup_cap > 0 {
-            self.lookup_index.proposals(lookup_cap)
-        } else {
-            Vec::new()
-        };
-        let lookup_len = if lookup_info.match_len >= LookupIndex::MIN_MATCH {
-            lookup_proposals.len().min(MAX_LOOKUP_CHAIN)
-        } else {
-            0
-        };
+
+        enum TreeLookupBacking {
+            Lattice(DraftLattice),
+            Agreements(Vec<LookupAgreement>),
+        }
 
         // Optional GPU `select_tree_cuda` when a fixed tree width is pinned and
         // `MLX_QWEN4_GPU_TREE=1`; otherwise evaluate the 7.6 KB lattice on host
         // and run MoE-cost-aware adaptive sizing `T* = argmax E[T] / Cost(T)`
         // (or fixed-width `build_verify_tree` when `MLX_QWEN4_TREE_MAX_NODES` is set).
-        let (tree, views, lattice_opt, agreements_opt) = if let Some(fixed) =
-            self.tree_fixed_max_nodes
+        let (tree, views, lookup_backing) = if let Some(fixed) = self.tree_fixed_max_nodes
             && self.gpu_tree_enabled
             && crate::accelerator::cuda_ops_available()
         {
             let node_budget = max_cap.min(fixed);
-            let mut lt = [0i32; MAX_TREE_NODES];
-            for (dst, &tok) in lt.iter_mut().zip(lookup_proposals.iter().take(lookup_len)) {
-                *dst = tok as i32;
-            }
-            let mut lr = [0.0f32; MAX_TREE_NODES * 4];
-            if lookup_len > 0 {
-                let agreements = [
-                    LookupAgreement::Top,
-                    LookupAgreement::Candidate,
-                    LookupAgreement::Absent,
-                    LookupAgreement::Unknown,
-                ];
-                for d in 0..lookup_len {
-                    for &ag in &agreements {
-                        lr[d * 4 + ag as usize] =
-                            self.lookup_acceptance
-                                .rate(false, lookup_info.match_len, d, ag);
-                    }
-                }
-            }
-            let budget_acc = self.verify_budget.acceptance(false);
-            let mut bi = [0.0f32; 8];
-            bi[..DRAFT_SLOTS].copy_from_slice(&budget_acc.intercepts);
-            let lookup_tokens_arr = MxArray::from_int32(&lt, &[MAX_TREE_NODES as i64])?;
-            let lookup_rates_arr = MxArray::from_float32(&lr, &[MAX_TREE_NODES as i64, 4])?;
-            let budget_intercepts_arr = MxArray::from_float32(&bi, &[8])?;
-            if let Some(sel) = crate::kernels::dflash2::select_tree_cuda(
+            if let Some(sel) = select_tree_gpu(
                 &candidates,
                 &scores,
-                &lookup_tokens_arr,
-                &lookup_rates_arr,
-                &budget_intercepts_arr,
+                &lookup,
+                &self.lookup_acceptance,
+                &self.verify_budget,
                 anchor,
-                lookup_len as i32,
-                node_budget as i32,
-                eff_max_depth as i32,
-                budget_acc.slope,
+                node_budget,
             )? {
                 MxArray::eval_arrays_with_context(
                     &[&sel.tree_tokens, &sel.parent, &sel.node_meta],
@@ -203,7 +169,7 @@ impl DraftStepper<'_> {
                 } else {
                     tree.to_device_views()?
                 };
-                (tree, views, None, Some(agreements))
+                (tree, views, TreeLookupBacking::Agreements(agreements))
             } else {
                 let lattice = self
                     .draft
@@ -211,16 +177,16 @@ impl DraftStepper<'_> {
                 let tree = build_verify_tree(
                     anchor,
                     &lattice,
-                    &lookup_proposals,
-                    lookup_info.match_len,
+                    &lookup.proposals,
+                    lookup.match_len,
                     node_budget,
-                    Some(eff_max_depth),
+                    Some(lookup.eff_max_depth),
                     false,
                     &self.verify_budget,
                     &self.lookup_acceptance,
                 );
                 let views = tree.to_device_views()?;
-                (tree, views, Some(lattice), None)
+                (tree, views, TreeLookupBacking::Lattice(lattice))
             }
         } else {
             let lattice = self
@@ -230,10 +196,10 @@ impl DraftStepper<'_> {
                 build_verify_tree(
                     anchor,
                     &lattice,
-                    &lookup_proposals,
-                    lookup_info.match_len,
+                    &lookup.proposals,
+                    lookup.match_len,
                     max_cap.min(fixed),
-                    Some(eff_max_depth),
+                    Some(lookup.eff_max_depth),
                     false,
                     &self.verify_budget,
                     &self.lookup_acceptance,
@@ -242,10 +208,10 @@ impl DraftStepper<'_> {
                 build_verify_tree_cost_aware(
                     anchor,
                     &lattice,
-                    &lookup_proposals,
-                    lookup_info.match_len,
+                    &lookup.proposals,
+                    lookup.match_len,
                     max_cap,
-                    Some(eff_max_depth),
+                    Some(lookup.eff_max_depth),
                     false,
                     &self.verify_budget,
                     &self.lookup_acceptance,
@@ -253,7 +219,7 @@ impl DraftStepper<'_> {
                 )
             };
             let views = tree.to_device_views()?;
-            (tree, views, Some(lattice), None)
+            (tree, views, TreeLookupBacking::Lattice(lattice))
         };
         let propose_us = t_propose.elapsed().as_micros() as u64;
 
@@ -271,34 +237,19 @@ impl DraftStepper<'_> {
                 tree.len()
             )));
         }
-        let walk = tree.greedy_walk(&target_argmax);
-
-        let labels = tree.budget_labels(&walk.emitted_tokens);
-        self.verify_budget.observe(false, &labels);
-        if lookup_len > 0 {
-            let outcome = if let Some(ref lattice) = lattice_opt {
-                tree.lookup_outcome(
-                    &lookup_proposals[..lookup_len],
-                    &walk.emitted_tokens,
-                    lattice,
-                )
-            } else if let Some(ref agreements) = agreements_opt {
-                tree.lookup_outcome_with_agreements(
-                    &lookup_proposals[..lookup_len],
-                    &walk.emitted_tokens,
-                    agreements,
-                )
-            } else {
-                Default::default()
-            };
-            self.lookup_acceptance.observe(
-                false,
-                lookup_info.match_len,
-                &outcome.verified,
-                outcome.accepted,
-            );
-            self.tree_lookup_accepted += outcome.accepted;
-        }
+        let lookup_source = match &lookup_backing {
+            TreeLookupBacking::Lattice(lattice) => TreeLookupSource::Lattice(lattice),
+            TreeLookupBacking::Agreements(agreements) => TreeLookupSource::Agreements(agreements),
+        };
+        let (walk, lookup_accepted) = finalize_tree_greedy_walk(
+            &tree,
+            &target_argmax,
+            &lookup,
+            lookup_source,
+            &mut self.verify_budget,
+            &mut self.lookup_acceptance,
+        );
+        self.tree_lookup_accepted += lookup_accepted;
 
         let is_chain = tree.is_chain();
         let draft_count = tree.depth.iter().copied().max().unwrap_or(0).max(0) as usize;

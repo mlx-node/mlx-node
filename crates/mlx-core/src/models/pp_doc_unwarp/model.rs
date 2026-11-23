@@ -7,8 +7,8 @@
 //! All operations use NHWC format (MLX native).
 
 use crate::array::MxArray;
-use crate::models::pp_doclayout_v3::backbone::{FrozenBatchNorm2d, NativeConv2d};
 use crate::nn::activations::Activations;
+use crate::vision::cnn::{ConvBNAct, FrozenBatchNorm2d, NativeConv2d};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -18,24 +18,6 @@ use super::processing;
 // ============================================================================
 // Building blocks
 // ============================================================================
-
-/// Conv + BN + ReLU block (used in head and bridge)
-pub struct ConvBNRelu {
-    conv: NativeConv2d,
-    bn: FrozenBatchNorm2d,
-}
-
-impl ConvBNRelu {
-    pub fn new(conv: NativeConv2d, bn: FrozenBatchNorm2d) -> Self {
-        Self { conv, bn }
-    }
-
-    pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        let x = self.conv.forward(input)?;
-        let x = self.bn.forward(&x)?;
-        Activations::relu(&x)
-    }
-}
 
 /// Residual block with optional dilation.
 ///
@@ -128,30 +110,30 @@ impl ResnetEncoder {
 /// bridge_1 through bridge_6 with different dilation patterns, concatenated + 1x1 conv
 pub struct Bridge {
     /// bridge_1: single dilated conv (dilation=1)
-    bridge_1: Vec<ConvBNRelu>,
+    bridge_1: Vec<ConvBNAct>,
     /// bridge_2: single dilated conv (dilation=2)
-    bridge_2: Vec<ConvBNRelu>,
+    bridge_2: Vec<ConvBNAct>,
     /// bridge_3: single dilated conv (dilation=5)
-    bridge_3: Vec<ConvBNRelu>,
+    bridge_3: Vec<ConvBNAct>,
     /// bridge_4: 3 dilated convs (dilation=8,3,2)
-    bridge_4: Vec<ConvBNRelu>,
+    bridge_4: Vec<ConvBNAct>,
     /// bridge_5: 3 dilated convs (dilation=12,7,4)
-    bridge_5: Vec<ConvBNRelu>,
+    bridge_5: Vec<ConvBNAct>,
     /// bridge_6: 3 dilated convs (dilation=18,12,6)
-    bridge_6: Vec<ConvBNRelu>,
+    bridge_6: Vec<ConvBNAct>,
     /// 1x1 conv to reduce concatenated channels
-    bridge_concat: ConvBNRelu,
+    bridge_concat: ConvBNAct,
 }
 
 impl Bridge {
     pub fn new(
-        bridge_1: Vec<ConvBNRelu>,
-        bridge_2: Vec<ConvBNRelu>,
-        bridge_3: Vec<ConvBNRelu>,
-        bridge_4: Vec<ConvBNRelu>,
-        bridge_5: Vec<ConvBNRelu>,
-        bridge_6: Vec<ConvBNRelu>,
-        bridge_concat: ConvBNRelu,
+        bridge_1: Vec<ConvBNAct>,
+        bridge_2: Vec<ConvBNAct>,
+        bridge_3: Vec<ConvBNAct>,
+        bridge_4: Vec<ConvBNAct>,
+        bridge_5: Vec<ConvBNAct>,
+        bridge_6: Vec<ConvBNAct>,
+        bridge_concat: ConvBNAct,
     ) -> Self {
         Self {
             bridge_1,
@@ -164,7 +146,7 @@ impl Bridge {
         }
     }
 
-    fn forward_branch(branch: &[ConvBNRelu], input: &MxArray) -> Result<MxArray> {
+    fn forward_branch(branch: &[ConvBNAct], input: &MxArray) -> Result<MxArray> {
         let mut x = input.clone();
         for layer in branch {
             x = layer.forward(&x)?;
@@ -292,7 +274,7 @@ impl OutputHead {
 /// UVDoc document unwarping model.
 pub struct UVDocNet {
     /// Initial head: 2x (Conv5x5/s2 + BN + ReLU)
-    head: Vec<ConvBNRelu>,
+    head: Vec<ConvBNAct>,
     /// ResNet encoder with dilated residual blocks
     encoder: ResnetEncoder,
     /// Multi-scale dilated bridge
@@ -303,7 +285,7 @@ pub struct UVDocNet {
 
 impl UVDocNet {
     pub fn new(
-        head: Vec<ConvBNRelu>,
+        head: Vec<ConvBNAct>,
         encoder: ResnetEncoder,
         bridge: Bridge,
         out_2d: OutputHead,

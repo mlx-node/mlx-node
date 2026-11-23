@@ -23,11 +23,12 @@ use crate::array::attention::scaled_dot_product_attention;
 use crate::engine::persistence::load_all_safetensors;
 use crate::nn::{Linear, RMSNorm, RoPE};
 
+use crate::models::quantized_linear::LinearProj;
+
 use super::attention::Gemma4ProportionalRoPE;
 use super::config::Gemma4Config;
 use super::dspark::{apply_norm_weight, take_tensor};
 use super::mlp::GemmaMLP;
-use super::quantized_linear::LinearProj;
 
 /// Draft `model_type` values accepted by the loader: the dense/MoE assistant
 /// (`26B-A4B`/`31B`) and the unified-multimodal assistant (`12B`).

@@ -523,7 +523,7 @@ impl GRPOTrainingEngine {
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
-        let dispatch = TrainingDispatch::Qwen35Moe(sender);
+        let dispatch = TrainingDispatch::Qwen35Dense(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
         dispatch.send_train(TrainCmd::InitTraining {
             config: Box::new(config.clone()),

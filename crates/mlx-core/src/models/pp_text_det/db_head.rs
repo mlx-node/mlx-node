@@ -19,9 +19,7 @@ use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use napi::bindgen_prelude::*;
 
-use crate::models::pp_doclayout_v3::backbone::{
-    FrozenBatchNorm2d, NativeConv2d, NativeConvTranspose2d,
-};
+use crate::vision::cnn::{FrozenBatchNorm2d, NativeConv2d, NativeConvTranspose2d};
 
 /// Head: a single branch (binarize or threshold) of the DB head.
 ///

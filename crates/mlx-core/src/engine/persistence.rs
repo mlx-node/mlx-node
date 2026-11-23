@@ -17,7 +17,7 @@ use crate::models::quant_dispatch::{
     SYMMETRIC_ZERO_POINT_KEY, normalize_per_layer_key, parse_symmetric_zero_points,
     select_quantization_block,
 };
-use crate::utils::safetensors::load_safetensors_lazy;
+use crate::utils::safetensors::{checkpoint_safetensors_files, load_safetensors_lazy};
 
 /// Whether the Metal-only native paths can run on this host.
 ///
@@ -88,68 +88,39 @@ pub(crate) fn load_all_safetensors(
     dir: &Path,
     load_vision: bool,
 ) -> Result<HashMap<String, MxArray>> {
-    let single_path = if dir.join("weights.safetensors").exists() {
-        Some(dir.join("weights.safetensors"))
-    } else if dir.join("model.safetensors").exists() {
-        Some(dir.join("model.safetensors"))
-    } else {
-        None
-    };
-
-    if let Some(path) = single_path {
-        info!("Loading weights from: {} (mmap)", path.display());
-        let mut params = load_safetensors_lazy(&path)?;
-        // Rebuild the derived biases BEFORE the media sidecar joins the map, and
-        // keep it that way. `SymmetricZeroPoints::for_key` falls back to the
-        // top-level default for any key it has no entry for, so a main model
-        // imported from Q4_0 (zero point 8) paired with an mmproj imported from
-        // Q8_0 (128) would derive every vision bias at the main model's offset.
-        // Running afterwards turns a loud missing-`.biases` failure into silent
-        // corruption; running first leaves the sidecar to its own guards.
-        expand_symmetric_affine_biases(dir, &mut params)?;
-        append_vision_safetensors(dir, load_vision, &mut params)?;
-        return Ok(params);
-    }
-
-    let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|e| Error::from_reason(format!("Failed to read model directory: {}", e)))?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| Error::from_reason(format!("Failed to read directory entry: {}", e)))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-            && name.ends_with(".safetensors")
-            && name.contains("-of-");
-        if is_shard {
-            shard_files.push(entry.path());
-        }
-    }
-
-    if shard_files.is_empty() {
+    let files = checkpoint_safetensors_files(dir)?;
+    if files.is_empty() {
         return Err(Error::from_reason(format!(
             "No safetensors files found in {}",
             dir.display()
         )));
     }
 
-    shard_files.sort();
-    info!(
-        "Loading {} sharded safetensors files (mmap)",
-        shard_files.len()
-    );
+    let mut all_params: HashMap<String, MxArray> = if files.len() == 1
+        && matches!(
+            files[0].file_name().and_then(|n| n.to_str()),
+            Some("weights.safetensors" | "model.safetensors")
+        ) {
+        info!("Loading weights from: {} (mmap)", files[0].display());
+        load_safetensors_lazy(&files[0])?
+    } else {
+        info!("Loading {} sharded safetensors files (mmap)", files.len());
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        for shard_path in &files {
+            info!("  Loading shard: {} (mmap)", shard_path.display());
+            let shard_params = load_safetensors_lazy(shard_path)?;
+            params.extend(shard_params);
+        }
+        params
+    };
 
-    let mut all_params: HashMap<String, MxArray> = HashMap::new();
-    for shard_path in &shard_files {
-        info!("  Loading shard: {} (mmap)", shard_path.display());
-        let shard_params = load_safetensors_lazy(shard_path)?;
-        all_params.extend(shard_params);
-    }
-
-    // Same deliberate order as the single-file branch above: derive first, then
-    // append the media sidecar, so a main/mmproj pair imported from different
-    // symmetric ggml formats cannot inherit the wrong zero point.
+    // Rebuild the derived biases BEFORE the media sidecar joins the map, and
+    // keep it that way. `SymmetricZeroPoints::for_key` falls back to the
+    // top-level default for any key it has no entry for, so a main model
+    // imported from Q4_0 (zero point 8) paired with an mmproj imported from
+    // Q8_0 (128) would derive every vision bias at the main model's offset.
+    // Running afterwards turns a loud missing-`.biases` failure into silent
+    // corruption; running first leaves the sidecar to its own guards.
     expand_symmetric_affine_biases(dir, &mut all_params)?;
     append_vision_safetensors(dir, load_vision, &mut all_params)?;
 
@@ -950,6 +921,15 @@ pub(crate) const WRAPPER_STRIP_PREFIXES: &[&str] = &[
     "model.",
 ];
 
+/// Strip the longest matching HF/VLM wrapper prefix from `key`, or return
+/// `key` unchanged when none matches.
+pub(crate) fn strip_wrapper_prefix(key: &str) -> &str {
+    WRAPPER_STRIP_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+        .unwrap_or(key)
+}
+
 /// One declarative key rule inside a [`RenameSpec`].
 ///
 /// Inside [`RenameSpec::rules`] the rules run IN ORDER against the current
@@ -1315,6 +1295,319 @@ pub fn parse_generation_defaults(model_dir: &Path) -> ModelGenerationDefaults {
     }
 
     defaults
+}
+
+// ===========================================================================
+// Shared load-runner, GGUF preload, weight-byte, and paged-pool helpers
+// ===========================================================================
+
+/// Deterministic byte total of every array in `params`, saturating on overflow
+/// so a corrupted checkpoint cannot wrap the cache-limit coordinator.
+pub(crate) fn params_weight_bytes(params: &HashMap<String, MxArray>) -> u64 {
+    params
+        .values()
+        .map(|a| a.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v))
+}
+
+/// Emit the standard GGUF preload summary log line.
+pub(crate) fn log_gguf_preload_stats(stats: &crate::utils::gguf_import::LoadStats) {
+    info!(
+        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
+         {} GPU-repacked and {} other tensors",
+        stats.bytes,
+        stats.preload_secs,
+        stats.read_secs,
+        if stats.nocache { "off" } else { "on" },
+        stats.gpu_tensors,
+        stats.cpu_tensors,
+    );
+}
+
+/// Load a GGUF checkpoint into memory and log the standard preload stats line.
+pub(crate) fn load_gguf_preload(
+    input: &crate::utils::gguf_import::PreloadInput,
+) -> Result<crate::utils::gguf_import::GgufPreload> {
+    let preload = crate::utils::gguf_import::GgufPreload::load(input)?;
+    log_gguf_preload_stats(&preload.stats);
+    Ok(preload)
+}
+
+/// RAII guard pairing [`crate::array::memory::FreeReleasedSources`] with an
+/// optional [`crate::utils::gguf_import::GgufPreload`].
+///
+/// Both [`Self::load`] and [`Self::enter`] carry `#[track_caller]` so
+/// `TEST_FREE_RELEASED_SITES` attributes the guard to each family's
+/// `persistence.rs` (preserving `every_gguf_loader_enables_free_released_sources`).
+pub(crate) struct GgufPreloadGuard {
+    _free_released: crate::array::memory::FreeReleasedSources,
+    pub(crate) preload: Option<crate::utils::gguf_import::GgufPreload>,
+}
+
+impl GgufPreloadGuard {
+    /// Enable `FreeReleasedSources` when `input.is_some()` and load the GGUF
+    /// preload with standard stats logging. Keep the returned guard alive
+    /// through the entire weight-apply + materialization pass.
+    #[track_caller]
+    pub(crate) fn load(input: Option<&crate::utils::gguf_import::PreloadInput>) -> Result<Self> {
+        let _free_released = crate::array::memory::FreeReleasedSources::enable(input.is_some());
+        let preload = input.map(load_gguf_preload).transpose()?;
+        Ok(Self {
+            _free_released,
+            preload,
+        })
+    }
+
+    /// Enable `FreeReleasedSources` around a family-specific preload path
+    /// (e.g. Gemma4 PLE sharding or Qwen3.5 CLEF streamed loading).
+    #[track_caller]
+    pub(crate) fn enter(from_gguf: bool) -> crate::array::memory::FreeReleasedSources {
+        crate::array::memory::FreeReleasedSources::enable(from_gguf)
+    }
+}
+
+/// RAII lease guard over a resolved [`crate::engine::checkpoint_source::CheckpointSource`].
+///
+/// Releases any acquired GGUF lease on drop unless [`Self::commit`] is called
+/// after the model finishes loading (covering early `?` returns and async
+/// cancellation automatically).
+pub(crate) struct CheckpointLeaseGuard {
+    source: crate::engine::checkpoint_source::CheckpointSource,
+    committed: bool,
+}
+
+impl CheckpointLeaseGuard {
+    pub(crate) async fn resolve(
+        path: &Path,
+        family: crate::utils::gguf::NativeGgufFamily,
+    ) -> Result<Self> {
+        let source =
+            crate::engine::checkpoint_source::CheckpointSource::resolve(path, family).await?;
+        Ok(Self {
+            source,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &crate::engine::checkpoint_source::CheckpointSource {
+        &self.source
+    }
+
+    /// Commit the load so the GGUF lease stays pinned for the loaded model's
+    /// lifetime.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CheckpointLeaseGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.source.release_lease();
+        }
+    }
+}
+
+/// Inputs for adaptive post-weight-load paged KV pool sizing.
+pub(crate) struct PagedPoolSizingSpec<'a> {
+    pub family: &'a str,
+    pub requested_blocks: u32,
+    pub num_layers: u32,
+    pub num_kv_heads: u32,
+    pub head_size: u32,
+    pub block_size: u32,
+    pub cache_dtype: mlx_paged_attn::metal::MetalDtype,
+    /// Extra non-KV fixed bytes (e.g. Mamba/ShortConv state) counted alongside
+    /// sibling registered pools when probing live Metal headroom.
+    pub extra_fixed_bytes: u64,
+}
+
+/// Outcome of [`size_paged_pool_after_weight_load`].
+pub(crate) struct SizedPagedPool<T> {
+    pub pool: T,
+    pub selected_blocks: u32,
+    pub selected_bytes: u64,
+    pub guard: crate::cache_limit::PoolCacheLimitGuard,
+}
+
+/// Size, atomically reserve, and construct an uncapped paged KV pool after
+/// model weights are resident.
+///
+/// Holds [`crate::cache_limit::pool_growth_lock`] across sizing → CAS
+/// reservation (`try_register_pool_if_total_eq`) → `build_pool` allocation so
+/// concurrent model loads or pool grows cannot probe stale sibling totals and
+/// spend the same Metal headroom twice.
+pub(crate) fn size_paged_pool_after_weight_load<T, F>(
+    spec: &PagedPoolSizingSpec<'_>,
+    build_pool: F,
+) -> Result<SizedPagedPool<T>>
+where
+    F: FnOnce(u32, u64) -> Result<T>,
+{
+    let _growth_guard = crate::cache_limit::pool_growth_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let coordinator = crate::cache_limit::coordinator();
+    let hard_budget = crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
+        Error::from_reason(format!(
+            "{} paged cache sizing failed safely; refusing an uncapped pool request: {error}",
+            spec.family
+        ))
+    })?;
+    let (selected_blocks, selected_bytes, guard) = {
+        let mut reserved = None;
+        for _ in 0..8 {
+            let sibling = coordinator.registered_pool_bytes();
+            let reserved_bytes = sibling.saturating_add(spec.extra_fixed_bytes);
+            let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+                spec.requested_blocks,
+                spec.num_layers,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.block_size,
+                spec.cache_dtype,
+                hard_budget,
+                reserved_bytes,
+            )
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "{} adaptive paged cache sizing failed safely; refusing an uncapped pool \
+                     request: {error}",
+                    spec.family
+                ))
+            })?;
+            if let Some(guard) =
+                coordinator.try_register_pool_if_total_eq(sibling, sizing.selected_bytes)
+            {
+                reserved = Some((sizing.selected_blocks, sizing.selected_bytes, guard));
+                break;
+            }
+        }
+        reserved.ok_or_else(|| {
+            Error::from_reason(format!(
+                "{} adaptive paged cache sizing failed safely; concurrent pool reservation kept \
+                 racing",
+                spec.family
+            ))
+        })?
+    };
+    let pool = build_pool(selected_blocks, selected_bytes)?;
+    Ok(SizedPagedPool {
+        pool,
+        selected_blocks,
+        selected_bytes,
+        guard,
+    })
+}
+
+/// Construct a fixed-capacity [`PagedKVCacheAdapter`] backed by a
+/// [`mlx_paged_attn::BlockAllocator`] and [`mlx_paged_attn::LayerKVPool`].
+pub(crate) fn build_paged_kv_adapter(
+    pa_config: mlx_paged_attn::PagedAttentionConfig,
+    num_blocks: u32,
+    block_size: u32,
+    cache_dtype: mlx_paged_attn::metal::MetalDtype,
+    family: &str,
+) -> Result<crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
+    let allocator = std::sync::Arc::new(std::sync::Mutex::new(
+        mlx_paged_attn::BlockAllocator::new(num_blocks, num_blocks, block_size),
+    ));
+    let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to construct {family} KV pool: {error}"))
+        })?;
+    crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::new(
+        allocator,
+        std::sync::Arc::new(pool),
+        block_size,
+    )
+    .map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to construct {family} paged adapter: {error}"
+        ))
+    })
+}
+
+/// Process-wide cache-limit guards owned by a loaded model for its lifetime.
+pub(crate) struct LoadedModelGuards {
+    pub cache_limit: crate::cache_limit::CacheLimitGuard,
+    pub pool_cache_limit: Option<crate::cache_limit::PoolCacheLimitGuard>,
+}
+
+/// Register deterministic `weight_bytes` with the cache-limit coordinator and
+/// keep an already-reserved `existing_pool_guard` (or register `pool_bytes`
+/// when non-zero).
+pub(crate) fn register_loaded_weights_and_pool(
+    weight_bytes: u64,
+    pool_bytes: u64,
+    existing_pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+) -> LoadedModelGuards {
+    let coordinator = crate::cache_limit::coordinator();
+    let cache_limit = coordinator.register(weight_bytes);
+    let pool_cache_limit = existing_pool_guard
+        .or_else(|| (pool_bytes != 0).then(|| coordinator.register_pool(pool_bytes)));
+    LoadedModelGuards {
+        cache_limit,
+        pool_cache_limit,
+    }
+}
+
+/// Wire a dynamic (grow-on-demand) paged KV adapter so every pool growth
+/// updates its registered `PoolCacheLimitGuard` entry.
+pub(crate) fn attach_pool_growth_notifier(
+    adapter: &mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
+    guard: &crate::cache_limit::PoolCacheLimitGuard,
+) {
+    let pool_id = guard.id();
+    adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
+        crate::cache_limit::coordinator().update_pool(pool_id, bytes);
+    })));
+}
+
+/// Register a dynamic pool's `initial_bytes` and immediately attach its growth
+/// notifier to `adapter`.
+pub(crate) fn register_dynamic_pool(
+    adapter: &mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
+    initial_bytes: u64,
+) -> crate::cache_limit::PoolCacheLimitGuard {
+    let guard = crate::cache_limit::coordinator().register_pool(initial_bytes);
+    attach_pool_growth_notifier(adapter, &guard);
+    guard
+}
+
+/// Spawn a scheduler-driven model thread and await its initialization payload.
+pub(crate) async fn spawn_loaded_model_thread<Cmd, State, Init, Meta, LoopBody>(
+    exit_error: &str,
+    init_fn: Init,
+    loop_body: LoopBody,
+) -> Result<(crate::model_thread::ModelThread<Cmd>, Meta)>
+where
+    Cmd: Send + 'static,
+    Init: FnOnce() -> Result<(State, Meta)> + Send + 'static,
+    Meta: Send + 'static,
+    LoopBody: FnMut(
+            &mut State,
+            &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+        ) -> crate::model_thread::LoopControl
+        + Send
+        + 'static,
+{
+    let (thread, init_rx) =
+        crate::model_thread::ModelThread::spawn_with_scheduler(init_fn, loop_body);
+    let meta = init_rx
+        .await
+        .map_err(|_| Error::from_reason(exit_error))??;
+    Ok((thread, meta))
+}
+
+/// Register a memory-pressure waker on `thread` if its command sender is open.
+pub(crate) fn register_thread_memory_waker<Ext: Send + 'static>(
+    model_id: u64,
+    thread: &crate::model_thread::ModelThread<crate::engine::model_command::ModelCommand<Ext>>,
+) {
+    if let Some(sender) = thread.cmd_sender() {
+        crate::engine::model_command::register_memory_waker(model_id, &sender);
+    }
 }
 
 #[cfg(test)]

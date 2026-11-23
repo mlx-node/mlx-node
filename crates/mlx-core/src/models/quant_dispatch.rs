@@ -34,10 +34,14 @@ use tracing::warn;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
-    NVFP4_GROUP_SIZE, QuantizedLinear, try_build_affine_quantized_linear_tiled,
-    try_build_kquant_quantized_linear_tiled, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear,
-    try_build_sym8_quantized_linear,
+    NVFP4_GROUP_SIZE, QuantizedLinear, QuantizedSwitchLinear,
+    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
+    try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear,
+    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 use crate::nn::Embedding;
 
@@ -1892,60 +1896,228 @@ pub(crate) fn dense_mlp_is_quantized(params: &HashMap<String, MxArray>, prefix: 
         .any(|base| params.contains_key(&format!("{base}.scales")))
 }
 
-/// Build a NON-MoE `QuantizedLinear` for `base`, dispatching on the resolved
-/// per-layer quant mode. Shared by `k2_horizon` and `lfm2` (whose copies were
-/// verbatim modulo the `family` error-string tag).
-///
-/// `Ok(None)` = the `.weight`/`.scales` group is incomplete (the caller fails
-/// loud naming the projection); `Err` = a mode/storage skew this builder must
-/// never silently skip — the sym8 builder's fail-loud validation in
-/// particular must surface verbatim (a malformed sym8 layer must NEVER
-/// silently fall back to dense/bf16 — an int8 weight loaded dense emits
-/// garbage; see `try_build_sym8_quantized_linear`).
-pub(crate) fn build_non_moe_ql(
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-    family: &str,
-) -> Result<Option<QuantizedLinear>> {
-    // Non-MoE bases never take the gate branch of `effective_plq_for` (it keys
-    // on `.mlp.gate` / `.mlp.shared_expert_gate`), so `gate_default = None`.
-    let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-    // int8 STORAGE with non-sym8 metadata = config drift / stale quantization
-    // metadata — fail loud before dispatch. This also keeps a metadata-skewed
-    // sym8 checkpoint out of the compiled C++ path's affine quant-info
-    // registration (the compiled gate keys on config metadata only).
-    ensure_int8_storage_resolves_sym8(params, base, plq.mode, family)?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, family)?;
-    ensure_kquant_storage_resolves_kquant(params, base, plq.mode, family)?;
-    ensure_affine_biases_present(params, base, plq.mode, family)?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "{family}: projection '{base}' resolved to fp8_e4m3, but plain per-output \
-                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
+// ============================================
+// Parameterized QuantizedLinear & QuantizedSwitchLinear dispatch
+// ============================================
+
+/// How [`build_ql`] handles `PerLayerMode::Fp8E4m3`.
+#[derive(Clone, Copy)]
+pub(crate) enum QlFp8Policy {
+    Allow,
+    /// Reject with the non-Qwen3.5 DGX message naming `role` (e.g.
+    /// `"projection"` or `"router gate"`).
+    Reject {
+        role: &'static str,
+    },
+    ReturnNone,
+}
+
+/// How [`build_ql`] handles `PerLayerMode::Sym8`.
+#[derive(Clone, Copy)]
+pub(crate) enum QlSym8Policy {
+    Allow,
+    RejectRouterGate,
+    ReturnNone,
+}
+
+/// How [`build_ql`] handles `PerLayerMode::Mxfp8`.
+#[derive(Clone, Copy)]
+pub(crate) enum QlMxfp8Policy<'a> {
+    Allow,
+    Reject { reason: &'a str },
+}
+
+/// Policy for modes that a family either allows normally or ignores (`Ok(None)`).
+#[derive(Clone, Copy)]
+pub(crate) enum QlModeAllow {
+    Allow,
+    ReturnNone,
+}
+
+/// How [`build_ql`] handles Tiled64 repacking for Affine & K-quant projections.
+pub(crate) enum QlTiling<'a> {
+    /// Never tile (plain `try_build_quantized_linear` &
+    /// `try_build_kquant_quantized_linear`).
+    None,
+    /// Tile eligible Affine (unless `input_amax.is_some()`) & K-quant
+    /// projections, discarding the recorded repacked prefixes (for callers that
+    /// borrow `params` by `&`).
+    TileDiscard,
+    /// Tile eligible Affine (unless `input_amax.is_some()`) & K-quant
+    /// projections, appending repacked prefixes to the caller's collector for
+    /// later `release_tiled_kquant_sources`.
+    TileCollect(&'a mut Vec<String>),
+}
+
+/// How [`build_ql`] threads static FP8 activation `input_amax` / `amax_key`.
+#[derive(Clone, Copy)]
+pub(crate) enum InputAmaxPolicy {
+    None,
+    /// Only attach `plq.input_amax` and normalized `amax_key` on the recipe's
+    /// activation-FP8 sites (`is_activation_fp8_site`).
+    ActivationFp8SitesOnly,
+    /// Attach `plq.input_amax` unconditionally (no `amax_key`).
+    Unconditional,
+}
+
+/// Post-build promotion of Affine `.scales`/`.biases` sidecars.
+#[derive(Clone, Copy)]
+pub(crate) enum AffineSidecarPromotion {
+    None,
+    ToBf16,
+    ToF32For(DType),
+}
+
+/// Per-family policy table for [`build_ql`].
+pub(crate) struct QlBuildSpec<'a> {
+    pub family: &'a str,
+    pub validate_storage: bool,
+    pub fp8: QlFp8Policy,
+    pub sym8: QlSym8Policy,
+    pub mxfp8: QlMxfp8Policy<'a>,
+    pub mxfp4: QlModeAllow,
+    pub kquant: QlModeAllow,
+    pub tiling: QlTiling<'a>,
+    pub input_amax: InputAmaxPolicy,
+    pub promote_affine_sidecars: AffineSidecarPromotion,
+    /// Optional NVFP4 post-build guard (e.g. Nemotron-H `.global_scale` gate).
+    pub validate_nvfp4: Option<&'a dyn Fn(&str) -> Result<()>>,
+    /// Optional Affine post-build guard (e.g. Nemotron-H `require_affine_sidecars`).
+    pub validate_affine: Option<&'a dyn Fn(&HashMap<String, MxArray>, &str) -> Result<()>>,
+}
+
+impl<'a> QlBuildSpec<'a> {
+    /// Standard full-mode policy: storage guards on, all modes allowed,
+    /// Tiled64 repacking enabled (discarding collector), no activation amax,
+    /// no sidecar promotion.
+    pub(crate) fn standard(family: &'a str) -> Self {
+        Self {
+            family,
+            validate_storage: true,
+            fp8: QlFp8Policy::Allow,
+            sym8: QlSym8Policy::Allow,
+            mxfp8: QlMxfp8Policy::Allow,
+            mxfp4: QlModeAllow::Allow,
+            kquant: QlModeAllow::Allow,
+            tiling: QlTiling::TileDiscard,
+            input_amax: InputAmaxPolicy::None,
+            promote_affine_sidecars: AffineSidecarPromotion::None,
+            validate_nvfp4: None,
+            validate_affine: None,
         }
-        // Tiled64 into the affine K-quant contract on a Metal host, as the
-        // K-quant arm below (and with the same load-time transient: the
-        // row-major source stays in the `&` map until the loader drops it).
-        PerLayerMode::Affine => try_build_affine_quantized_linear_tiled(
-            params,
-            base,
-            plq.group_size,
-            plq.bits,
-            &mut Vec::new(),
-        )?,
-        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
+    }
+}
+
+/// Build a 2-D [`QuantizedLinear`] for `prefix` from resolved `plq`, governed
+/// by `spec`. Centralizes the 20-arm [`PerLayerMode`] switch shared across
+/// model families without altering any per-family behavior or error contract.
+pub(crate) fn build_ql(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    plq: PerLayerQuant,
+    spec: QlBuildSpec<'_>,
+) -> Result<Option<QuantizedLinear>> {
+    if spec.validate_storage {
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, spec.family)?;
+        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, spec.family)?;
+        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, spec.family)?;
+        ensure_affine_biases_present(params, prefix, plq.mode, spec.family)?;
+    }
+
+    let (input_amax, amax_key) = match spec.input_amax {
+        InputAmaxPolicy::None => (None, None),
+        InputAmaxPolicy::ActivationFp8SitesOnly => {
+            let nk = normalize_per_layer_key(prefix);
+            let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+            (
+                if is_site { plq.input_amax } else { None },
+                is_site.then_some(nk),
+            )
+        }
+        InputAmaxPolicy::Unconditional => (plq.input_amax, None),
+    };
+
+    let mut discard_tiled = Vec::new();
+    let tiled_collector = match spec.tiling {
+        QlTiling::None => None,
+        QlTiling::TileDiscard => Some(&mut discard_tiled),
+        QlTiling::TileCollect(collector) => Some(collector),
+    };
+
+    let built = match plq.mode {
+        PerLayerMode::Mxfp4 => match spec.mxfp4 {
+            QlModeAllow::Allow => try_build_mxfp4_quantized_linear(params, prefix),
+            QlModeAllow::ReturnNone => None,
+        },
+        PerLayerMode::Mxfp8 => match spec.mxfp8 {
+            QlMxfp8Policy::Allow => try_build_mxfp8_quantized_linear(params, prefix),
+            QlMxfp8Policy::Reject { reason } => {
+                return Err(Error::from_reason(reason.to_string()));
+            }
+        },
+        PerLayerMode::Nvfp4 => {
+            let built = try_build_nvfp4_quantized_linear(params, prefix);
+            if built.is_some()
+                && let Some(validate) = spec.validate_nvfp4
+            {
+                validate(prefix)?;
+            }
+            built
+        }
+        PerLayerMode::Fp8E4m3 => match spec.fp8 {
+            QlFp8Policy::Allow => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
+            QlFp8Policy::Reject { role } => {
+                return Err(Error::from_reason(format!(
+                    "{}: {role} '{prefix}' resolved to fp8_e4m3, but plain per-output \
+                     E4M3 storage is supported only by Qwen3.5 DGX artifacts",
+                    spec.family
+                )));
+            }
+            QlFp8Policy::ReturnNone => None,
+        },
+        PerLayerMode::Affine => {
+            let built = match tiled_collector {
+                Some(tiled) if input_amax.is_none() => try_build_affine_quantized_linear_tiled(
+                    params,
+                    prefix,
+                    plq.group_size,
+                    plq.bits,
+                    tiled,
+                )?,
+                _ => try_build_quantized_linear(params, prefix, plq.group_size, plq.bits),
+            };
+            if built.is_some()
+                && let Some(validate) = spec.validate_affine
+            {
+                validate(params, prefix)?;
+            }
+            match spec.promote_affine_sidecars {
+                AffineSidecarPromotion::None => built,
+                AffineSidecarPromotion::ToBf16 => built
+                    .map(|mut ql| ql.promote_affine_sidecars_to_bf16().map(|_| ql))
+                    .transpose()?,
+                AffineSidecarPromotion::ToF32For(compute_dtype) => built
+                    .map(|mut ql| ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql))
+                    .transpose()?,
+            }
+        }
+        PerLayerMode::Sym8 => match spec.sym8 {
+            QlSym8Policy::Allow => try_build_sym8_quantized_linear(params, prefix)?,
+            QlSym8Policy::RejectRouterGate => {
+                return Err(Error::from_reason(format!(
+                    "{}: router gate '{prefix}' resolved to sym8 quantization, but the router \
+                     gate has no sym8 dispatch (convert force-emits an affine-8 override for it \
+                     under a sym8 default) — malformed checkpoint, refusing to load",
+                    spec.family
+                )));
+            }
+            QlSym8Policy::ReturnNone => None,
+        },
         PerLayerMode::Q6K
         | PerLayerMode::Q4K
         | PerLayerMode::Q5K
-        | PerLayerMode::Q2K
         | PerLayerMode::Q3K
+        | PerLayerMode::Q2K
         | PerLayerMode::IQ4NL
         | PerLayerMode::IQ4XS
         | PerLayerMode::IQ3S
@@ -1954,23 +2126,220 @@ pub(crate) fn build_non_moe_ql(
         | PerLayerMode::IQ2S
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => {
-            // Tiled64 for the `_t64` Metal kernels: a `t64` checkpoint tensor
-            // is built tiled as-is; a row-major one is permuted here. These
-            // loaders (lfm2, k2_horizon) take the map by `&`, so the permuted
-            // projection's row-major source stays in the map until the loader
-            // drops it (a load-time transient, not a resident cost); the
-            // converter's on-disk `t64` layout avoids the permute entirely.
-            try_build_kquant_quantized_linear_tiled(
-                params,
-                base,
-                plq.mode,
-                plq.layout,
-                family,
-                &mut Vec::new(),
-            )?
+        | PerLayerMode::IQ1M => match spec.kquant {
+            QlModeAllow::ReturnNone => None,
+            QlModeAllow::Allow => match tiled_collector {
+                Some(tiled) => try_build_kquant_quantized_linear_tiled(
+                    params,
+                    prefix,
+                    plq.mode,
+                    plq.layout,
+                    spec.family,
+                    tiled,
+                )?,
+                None => try_build_kquant_quantized_linear(
+                    params,
+                    prefix,
+                    plq.mode,
+                    plq.layout,
+                    spec.family,
+                )?,
+            },
+        },
+    };
+
+    Ok(match spec.input_amax {
+        InputAmaxPolicy::None => built,
+        InputAmaxPolicy::ActivationFp8SitesOnly => {
+            built.map(|ql| ql.with_input_amax(input_amax).with_amax_key(amax_key))
         }
+        InputAmaxPolicy::Unconditional => built.map(|ql| ql.with_input_amax(input_amax)),
     })
+}
+
+/// How [`build_qsl`] handles `PerLayerMode::Fp8E4m3`.
+#[derive(Clone, Copy)]
+pub(crate) enum QslFp8Policy {
+    Allow,
+    RejectDgxOnly,
+    RejectGemma4Experts,
+    RejectUnsupported,
+    ReturnNone,
+}
+
+/// How [`build_qsl`] handles `PerLayerMode::Sym8`.
+#[derive(Clone, Copy)]
+pub(crate) enum QslSym8Policy<'a> {
+    RejectLfm2,
+    RejectGemma4,
+    /// Allow dense fallback (`Ok(None)`) when `.scales` is absent AND `prefix`
+    /// has no explicit override in `per_layer_quant`; fail loud otherwise.
+    RejectExplicitOrScaled(&'a HashMap<String, PerLayerQuant>),
+    RejectUnsupported,
+    ReturnNone,
+}
+
+/// Per-family policy table for [`build_qsl`].
+pub(crate) struct QslBuildSpec<'a> {
+    pub family: &'a str,
+    pub validate_storage: bool,
+    pub fp8: QslFp8Policy,
+    pub sym8: QslSym8Policy<'a>,
+    /// When true, only `PerLayerMode::Nvfp4` builds; all other modes return
+    /// `Ok(None)`.
+    pub nvfp4_only: bool,
+    /// When true, attach optional `{prefix}.scale` as outer scale on Affine.
+    pub affine_optional_outer_scale: bool,
+    /// Optional hook to resolve and attach a required NVFP4 outer scale.
+    pub nvfp4_outer_scale: Option<&'a dyn Fn(&HashMap<String, MxArray>, &str) -> Result<MxArray>>,
+}
+
+/// Build a 3-D stacked-expert [`QuantizedSwitchLinear`] for `prefix` from
+/// resolved `plq`, governed by `spec`.
+pub(crate) fn build_qsl(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    plq: PerLayerQuant,
+    spec: QslBuildSpec<'_>,
+) -> Result<Option<QuantizedSwitchLinear>> {
+    if spec.validate_storage {
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, spec.family)?;
+        ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, spec.family)?;
+        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, spec.family)?;
+        ensure_affine_biases_present(params, prefix, plq.mode, spec.family)?;
+    }
+
+    if spec.nvfp4_only && plq.mode != PerLayerMode::Nvfp4 {
+        return Ok(None);
+    }
+
+    Ok(match plq.mode {
+        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
+        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+        PerLayerMode::Nvfp4 => {
+            let built = try_build_nvfp4_quantized_switch_linear(params, prefix);
+            match (built, spec.nvfp4_outer_scale) {
+                (Some(qsl), Some(resolve_scale)) => {
+                    let gs = resolve_scale(params, prefix)?;
+                    Some(qsl.with_outer_scale(gs))
+                }
+                (built, _) => built,
+            }
+        }
+        PerLayerMode::Fp8E4m3 => match spec.fp8 {
+            QslFp8Policy::Allow => try_build_fp8_e4m3_quantized_switch_linear(params, prefix)?,
+            QslFp8Policy::RejectDgxOnly => {
+                return Err(Error::from_reason(format!(
+                    "{}: expert projection '{prefix}' resolved to fp8_e4m3, but plain \
+                     per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts",
+                    spec.family
+                )));
+            }
+            QslFp8Policy::RejectGemma4Experts => {
+                return Err(Error::from_reason(format!(
+                    "{} expert layer '{prefix}' resolved to fp8_e4m3, but plain \
+                     per-output E4M3 storage is supported only for 2-D attention/linear \
+                     tensors; Gemma4 experts must use the upstream NVFP4 low class",
+                    spec.family
+                )));
+            }
+            QslFp8Policy::RejectUnsupported => {
+                return Err(Error::from_reason(format!(
+                    "{}: unsupported MoE expert quantization mode {:?} on '{prefix}'",
+                    spec.family, plq.mode
+                )));
+            }
+            QslFp8Policy::ReturnNone => None,
+        },
+        PerLayerMode::Affine => {
+            let built = try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits);
+            if spec.affine_optional_outer_scale {
+                built.map(|q| match params.get(&format!("{prefix}.scale")) {
+                    Some(outer) => q.with_outer_scale(outer.clone()),
+                    None => q,
+                })
+            } else {
+                built
+            }
+        }
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::Q2K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S
+        | PerLayerMode::IQ2XXS
+        | PerLayerMode::IQ2XS
+        | PerLayerMode::IQ2S
+        | PerLayerMode::IQ3XXS
+        | PerLayerMode::IQ1S
+        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
+            params,
+            prefix,
+            plq.mode,
+            plq.layout,
+            spec.family,
+        )?,
+        PerLayerMode::Sym8 => match spec.sym8 {
+            QslSym8Policy::RejectLfm2 => {
+                return Err(Error::from_reason(format!(
+                    "{}: expert projection '{prefix}' resolved to sym8 quantization, but 3-D \
+                     stacked experts have no sym8 kernel (convert force-emits affine-8 overrides \
+                     for experts under a sym8 default) — malformed checkpoint, refusing to load",
+                    spec.family
+                )));
+            }
+            QslSym8Policy::RejectGemma4 => {
+                return Err(Error::from_reason(format!(
+                    "sym8 expert layer '{prefix}': 3-D switch (expert) tensors cannot be sym8 \
+                     (convert forces experts to affine under a sym8 default) — malformed checkpoint"
+                )));
+            }
+            QslSym8Policy::RejectExplicitOrScaled(per_layer_quant) => {
+                if !params.contains_key(&format!("{prefix}.scales"))
+                    && !per_layer_quant.contains_key(prefix)
+                {
+                    return Ok(None);
+                }
+                return Err(Error::from_reason(format!(
+                    "sym8 layer '{prefix}': per-expert switch_mlp projections (3-D stacked \
+                     experts) have no sym8 kernel; convert forces these to an affine-8 \
+                     per-layer override — re-convert the checkpoint"
+                )));
+            }
+            QslSym8Policy::RejectUnsupported => {
+                return Err(Error::from_reason(format!(
+                    "{}: unsupported MoE expert quantization mode {:?} on '{prefix}'",
+                    spec.family, plq.mode
+                )));
+            }
+            QslSym8Policy::ReturnNone => None,
+        },
+    })
+}
+
+/// Build a NON-MoE `QuantizedLinear` for `base`, dispatching on the resolved
+/// per-layer quant mode. Shared by `k2_horizon` and `lfm2` (whose copies were
+/// verbatim modulo the `family` error-string tag).
+pub(crate) fn build_non_moe_ql(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    family: &str,
+) -> Result<Option<QuantizedLinear>> {
+    let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+    build_ql(
+        params,
+        base,
+        plq,
+        QlBuildSpec {
+            fp8: QlFp8Policy::Reject { role: "projection" },
+            ..QlBuildSpec::standard(family)
+        },
+    )
 }
 
 /// Load a NON-MoE `LinearProj` either quantized (ANY mode) or plain bf16,

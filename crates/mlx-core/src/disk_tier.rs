@@ -1124,7 +1124,13 @@ fn open_persistent(
     }))
 }
 
+pub(crate) mod binary_codec;
+pub(crate) mod plan;
+pub(crate) mod prefix_disk;
+pub(crate) mod sliding_cold;
 pub(crate) mod source_hold;
+pub(crate) mod state_disk;
+pub(crate) mod store;
 
 #[cfg(all(test, unix))]
 mod tests;

@@ -1111,56 +1111,6 @@ fn get_param<'a>(
         .ok_or_else(|| Error::from_reason(format!("Missing {}", key)))
 }
 
-struct GatherSortResult {
-    x_sorted: MxArray,
-    idx_sorted: MxArray,
-    inv_order: MxArray,
-}
-
-/// Sort tokens by expert assignment for efficient gather_mm.
-/// Replicates Python `_gather_sort` from mlx-lm switch_layers.py.
-fn functional_gather_sort(x: &MxArray, indices: &MxArray) -> Result<GatherSortResult> {
-    let idx_shape = indices.shape()?;
-    let m = *idx_shape
-        .last()
-        .ok_or_else(|| Error::from_reason("empty indices"))?;
-
-    let flat_indices = indices.reshape(&[-1])?;
-    let order = flat_indices.argsort(Some(-1))?;
-    let inv_order = order.argsort(Some(-1))?;
-    let idx_sorted = flat_indices.take(&order, 0)?;
-
-    let x_shape = x.shape()?;
-    let d = *x_shape
-        .last()
-        .ok_or_else(|| Error::from_reason("gather_sort: x has empty shape"))?;
-    let x_flat = x.reshape(&[-1, 1, d])?;
-    let m_scalar = MxArray::scalar_int(m as i32)?;
-    let token_indices = order.floor_divide(&m_scalar)?;
-    let x_sorted = x_flat.take(&token_indices, 0)?;
-
-    Ok(GatherSortResult {
-        x_sorted,
-        idx_sorted,
-        inv_order,
-    })
-}
-
-/// Unsort gather_mm output back to original token order.
-fn functional_scatter_unsort(
-    x: &MxArray,
-    inv_order: &MxArray,
-    orig_shape: &[i64],
-) -> Result<MxArray> {
-    let unsorted = x.take(inv_order, 0)?;
-    let x_shape = unsorted.shape()?;
-    let mut new_shape = orig_shape.to_vec();
-    for &dim in &x_shape[1..] {
-        new_shape.push(dim);
-    }
-    unsorted.reshape(&new_shape)
-}
-
 /// Sparse MoE routing and expert computation (functional).
 ///
 /// Uses `gather_mm` for efficient expert-indexed matmuls instead of looping
@@ -1218,18 +1168,18 @@ fn sparse_moe_functional(
     // Expand x for gather_mm: [ne, D] -> [ne, 1, 1, D]
     let x_expanded = x_flat.reshape(&[ne, 1, 1, hidden_size])?;
 
-    // Sort optimization (same threshold as stateful SwitchGLU in switch_glu.rs)
+    // Sort optimization (same threshold as stateful SwitchGLU in moe::switch)
     let do_sort = top_indices.size()? >= 64;
 
     let y = if do_sort {
-        let sorted = functional_gather_sort(&x_expanded, &top_indices)?;
+        let sorted = crate::moe::gather_sort(&x_expanded, &top_indices)?;
         let idx = &sorted.idx_sorted;
         let gate_out = sorted.x_sorted.gather_mm(&gate_proj_t, idx, true)?;
         let up_out = sorted.x_sorted.gather_mm(&up_proj_t, idx, true)?;
         let gate_act = Activations::silu_for_autograd(&gate_out)?;
         let activated = gate_act.mul(&up_out)?;
         let expert_out = activated.gather_mm(&down_proj_t, idx, true)?;
-        functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
+        crate::moe::scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
     } else {
         let gate_out = x_expanded.gather_mm(&gate_proj_t, &top_indices, false)?;
         let up_out = x_expanded.gather_mm(&up_proj_t, &top_indices, false)?;

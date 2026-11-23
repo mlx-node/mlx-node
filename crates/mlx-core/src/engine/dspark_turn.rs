@@ -20,13 +20,14 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix,
-    TurnOutput, TurnTokenObserver, WholeTurnArgs,
+    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, FinalizeArgs, PagedBackend,
+    PagedPrefix, TurnOutput, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::dspark_timeline::{self as timeline, Mark};
+use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::paged_turn::FinishPagedTurnArgs;
-use crate::engine::params::{ChatParams, generated_capacity_hint};
+use crate::engine::params::{ChatParams, generated_capacity_hint, resolve_enable_thinking};
 use crate::engine::penalties::{CutTargets, ReasoningTracker, ThinkingCut, apply_all_penalties};
 use crate::engine::plan::SpeculativeDraftWidth;
 use crate::engine::spec_paged::SpecTurnEpilogue;
@@ -2078,6 +2079,304 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
             emitter: turn_streaming.map(|ts| ts.emitter),
         },
     )
+}
+
+/// Build parallel-infill query token ids: `[anchor, mask, ..., mask]` with
+/// `1 + draft_len` entries for DFlash / DFlash2 drafters.
+pub(crate) fn parallel_query_ids(anchor: u32, mask: usize, draft_len: usize) -> Vec<i32> {
+    let mut ids = Vec::with_capacity(draft_len.saturating_add(1));
+    ids.push(anchor as i32);
+    ids.resize(draft_len.saturating_add(1), mask as i32);
+    ids
+}
+
+/// Non-causal sliding-window attention mask `[1, 1, query_len, key_len]` for
+/// parallel-infill drafters whose keys span `key_base..key_base+key_len`.
+/// Returns `Ok(None)` when every key already falls inside `window`.
+pub(crate) fn non_causal_sliding_mask(
+    query_base: i32,
+    query_len: i64,
+    key_base: i32,
+    key_len: i64,
+    window: i64,
+) -> Result<Option<MxArray>> {
+    if key_len <= window {
+        return Ok(None);
+    }
+    let queries = MxArray::arange(
+        f64::from(query_base),
+        f64::from(query_base) + query_len as f64,
+        None,
+        None,
+    )?
+    .reshape(&[query_len, 1])?;
+    let keys = MxArray::arange(
+        f64::from(key_base),
+        f64::from(key_base) + key_len as f64,
+        None,
+        None,
+    )?
+    .reshape(&[1, key_len])?;
+    let distance = queries.sub(&keys)?;
+    let window = MxArray::scalar_int(window as i32)?;
+    Ok(Some(
+        distance
+            .less(&window)?
+            .reshape(&[1, 1, query_len, key_len])?,
+    ))
+}
+
+/// Per-turn prefix plan returned by [`FlatDsparkBackend::prepare_flat_dspark_turn`].
+pub(crate) struct FlatDsparkPrefix {
+    /// Tokens to prefill on this turn (full prompt on cold/miss, suffix on hit/delta).
+    pub prefill_tokens: Vec<u32>,
+    /// Number of prompt tokens served from cache (reported in `ChatResult.cached_tokens`).
+    pub cached_prefix_len: usize,
+    /// Prior live history length on delta turns (used for streaming delta prompt accounting).
+    pub prior_cached_len: usize,
+    /// Hard per-cycle draft block cap passed to [`run_dspark_turn`].
+    pub block_size: usize,
+}
+
+/// Sub-trait for a family whose flat-KV draft speculative turn runs through
+/// [`run_flat_dspark_turn`] instead of duplicating the prefill/sample/loop/save/finalize
+/// boilerplate (Gemma4 Assistant, Muse-Glimmer DFlash, Qwen4Exp flat DFlash2).
+pub(crate) trait FlatDsparkBackend: DsparkBackend {
+    /// Whether [`run_flat_dspark_turn`] overwrites `result.thinking_enabled` with
+    /// `resolve_enable_thinking(args.config).unwrap_or(true)` after `finalize_turn`.
+    /// Families under `ThinkingPolicy::AlwaysOnBudgetFromEffort` (Muse-Glimmer) set
+    /// this to `false` to preserve `args.thinking.enabled`.
+    const OVERWRITE_THINKING_ENABLED: bool = true;
+
+    /// Validate prompt/draft/cancel state and resolve the prefix vs. prefill suffix.
+    ///
+    /// Errors returned here do NOT invoke [`Self::fail_closed_flat_dspark`] so a
+    /// pre-prefill cancel preserves the live session; backends that mutate state
+    /// before failing here (e.g. `draft_taps_on`) must fail-close themselves.
+    fn prepare_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        params: &ChatParams,
+        is_delta: bool,
+    ) -> Result<FlatDsparkPrefix>;
+
+    /// Run the flat target prefill alongside draft-state capture and stash the
+    /// per-turn draft state for [`DsparkBackend::begin_dspark_decode`].
+    fn flat_prefill_with_draft_state(
+        &mut self,
+        prefix: &FlatDsparkPrefix,
+        stream: Stream,
+    ) -> Result<MxArray>;
+
+    /// Post-prefill cache evaluation hook (default: `self.eval_caches()`).
+    fn eval_after_flat_prefill(&self) -> Result<()> {
+        self.eval_caches()
+    }
+
+    /// Fail closed after any error between prefill start and save completion.
+    fn fail_closed_flat_dspark(&mut self, error: Error) -> Error;
+
+    /// Persist post-turn cache/history state (including optional length-exit
+    /// final-token materialization and draft-tap teardown).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_flat_dspark_turn(
+        &mut self,
+        tokens: &[u32],
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        last_in_cache: bool,
+        is_delta: bool,
+        reuse_cache: bool,
+        stream: Stream,
+    ) -> Result<()>;
+}
+
+/// Drive one FLAT-KV DSpark / DFlash / Assistant speculative whole turn,
+/// supporting both sync and streaming callers through `args.sink`.
+pub(crate) fn run_flat_dspark_turn<B: FlatDsparkBackend>(
+    backend: &mut B,
+    args: &mut WholeTurnArgs<'_>,
+) -> Result<TurnOutput> {
+    let tokenizer = args.tokenizer.clone();
+    let eos_id = args.eos_id;
+    let thinking = args.thinking;
+    let is_delta = args.plan.is_delta;
+    let tokens: Vec<u32> = args.tokens.to_vec();
+    let is_streaming = args.sink.is_some();
+
+    let mut params = backend.resolve_params(args.config);
+    params.extra_eos_ids = backend.extra_eos_ids();
+    let reuse_cache = params.reuse_cache;
+    let report_perf = params.report_performance;
+    let max_new_tokens = params.max_new_tokens;
+
+    let prefix = backend.prepare_flat_dspark_turn(&tokens, &params, is_delta)?;
+
+    let generation_start = report_perf.then(Instant::now);
+    let mut first_token_instant: Option<Instant> = None;
+
+    let prompt_token_count = tokens.len();
+    let mut token_history: Vec<u32> = tokens.clone();
+    let mut generated_tokens: Vec<u32> =
+        Vec::with_capacity(generated_capacity_hint(max_new_tokens));
+    let mut finish_reason = String::from("length");
+
+    let generation_stream = Stream::generation();
+
+    let mut profiler = DecodeProfiler::new(
+        backend.profiler_label(is_delta, is_streaming),
+        backend.family_name(),
+    );
+    profiler.set_prompt_tokens(prefix.prefill_tokens.len() as u32);
+    profiler.snapshot_memory_before();
+
+    let close = backend.think_end_for_turn(args.config, &tokenizer);
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &close);
+
+    let stream_skip_special = backend.stream_skip_special_tokens();
+    let mut turn_streaming = args.sink.map(|_| {
+        TurnStreaming::new(
+            backend,
+            tokenizer.inner(),
+            thinking.enabled,
+            stream_skip_special,
+        )
+    });
+    let turn_token_observer = backend.turn_token_observer();
+
+    let progress = args.sink.and_then(|sink| sink.progress());
+    if let Some(progress) = progress {
+        progress.begin_prefill(
+            prefix.prefill_tokens.len() as u32,
+            prefix.cached_prefix_len as u32,
+        );
+    }
+    profiler.begin_prefill();
+    let last_logits = match backend.flat_prefill_with_draft_state(&prefix, generation_stream) {
+        Ok(logits) => logits,
+        Err(error) => return Err(backend.fail_closed_flat_dspark(error)),
+    };
+    profiler.end_prefill();
+
+    let y = match apply_all_penalties(last_logits, &token_history, &params)
+        .and_then(|logits| sampling::sample(&logits, params.sampling_config))
+    {
+        Ok(token) => token,
+        Err(error) => return Err(backend.fail_closed_flat_dspark(error)),
+    };
+    y.eval();
+
+    if let Err(error) = backend.eval_after_flat_prefill() {
+        return Err(backend.fail_closed_flat_dspark(error));
+    }
+    if let Some(progress) = progress {
+        progress.first_token();
+    }
+    if report_perf {
+        first_token_instant = Some(Instant::now());
+    }
+
+    let mut rng = rand::rng();
+    let outcome = {
+        let streaming_ctx = turn_streaming
+            .as_mut()
+            .and_then(|ts| ts.ctx(args.sink, args.cancelled));
+        run_dspark_turn(
+            backend,
+            &mut rng,
+            DsparkTurnArgs {
+                y,
+                block_size: prefix.block_size,
+                params: &params,
+                reasoning_tracker: &mut reasoning_tracker,
+                profiler: &mut profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf,
+                generation_stream,
+                cancel_flag: args.cancelled,
+                turn_token_observer,
+            },
+            streaming_ctx,
+        )
+    };
+    let last_in_cache = match outcome {
+        Ok(outcome) => outcome.last_in_cache,
+        Err(error) => return Err(backend.fail_closed_flat_dspark(error)),
+    };
+
+    if let Err(error) = backend.finish_flat_dspark_turn(
+        &tokens,
+        &generated_tokens,
+        &finish_reason,
+        last_in_cache,
+        is_delta,
+        reuse_cache,
+        generation_stream,
+    ) {
+        return Err(backend.fail_closed_flat_dspark(error));
+    }
+
+    let performance = if report_perf {
+        compute_performance_metrics(
+            generation_start,
+            first_token_instant,
+            prefix.prefill_tokens.len(),
+            generated_tokens.len(),
+        )
+        .map(|mut metrics| {
+            backend.augment_performance(&profiler, &mut metrics);
+            metrics
+        })
+    } else {
+        None
+    };
+    let reasoning = reasoning_tracker.outcome();
+
+    if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+        let full_text = tokenizer
+            .decode_sync(&generated_tokens, stream_skip_special)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        ts.flush_residual(&full_text, params.include_reasoning, sink);
+    }
+
+    let reported_prompt_tokens: u32 = if is_delta && is_streaming {
+        let delta_len = prompt_token_count.saturating_sub(prefix.prior_cached_len);
+        backend.stream_delta_prompt_tokens(prompt_token_count, delta_len)
+    } else {
+        prompt_token_count as u32
+    };
+
+    let mut result = backend.finalize_turn(FinalizeArgs {
+        tokenizer: &tokenizer,
+        generated_tokens: &generated_tokens,
+        finish_reason,
+        think_end_id: close.think_end_id,
+        think_end_str: close.think_end_str.as_deref(),
+        think_end_extra_ids: &close.think_end_extra_ids,
+        performance,
+        include_reasoning: params.include_reasoning,
+        thinking_enabled: thinking.enabled,
+        prompt_tokens: reported_prompt_tokens,
+        reasoning,
+    })?;
+    if B::OVERWRITE_THINKING_ENABLED {
+        result.thinking_enabled = resolve_enable_thinking(args.config).unwrap_or(true);
+    }
+    result.cached_tokens = prefix.cached_prefix_len as u32;
+
+    if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
+        ts.emitter.finish(&result, sink);
+        return Ok(TurnOutput::Streamed);
+    }
+    Ok(TurnOutput::Complete(Box::new(result)))
 }
 
 #[cfg(test)]

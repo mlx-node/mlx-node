@@ -2,10 +2,20 @@
 
 use super::*;
 
+#[cfg(test)]
 pub(super) fn resolve_qwen35_chat_params(
     config: &ChatConfig,
     defaults: &crate::engine::ModelGenerationDefaults,
     dflash_block_size: Option<usize>,
+) -> crate::engine::params::ChatParams {
+    resolve_qwen35_chat_params_for_family(config, defaults, dflash_block_size, false)
+}
+
+pub(super) fn resolve_qwen35_chat_params_for_family(
+    config: &ChatConfig,
+    defaults: &crate::engine::ModelGenerationDefaults,
+    dflash_block_size: Option<usize>,
+    is_moe: bool,
 ) -> crate::engine::params::ChatParams {
     // Mirror ChatBackend's default resolution before applying the
     // algorithm-specific DFlash knobs. Overriding `resolve_params` must not
@@ -17,9 +27,11 @@ pub(super) fn resolve_qwen35_chat_params(
         // DFlash uses the companion's trained proposal width. The shared
         // mtpDepth option belongs to native MTP, not this block draft.
         params.mtp_depth = block_size;
-        // This companion uses fixed-width speculation; shared adaptive
-        // controls remain available to native MTP and other draft families.
-        params.mtp_adaptive_depth = false;
+        if !is_moe {
+            // Dense companion uses fixed-width speculation; MoE preserves
+            // `mtp_adaptive_depth` to drive GPU `VerifyBudget`.
+            params.mtp_adaptive_depth = false;
+        }
     }
     params
 }
@@ -32,7 +44,7 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn family_name(&self) -> &'static str {
-        "qwen3_5"
+        Qwen35Inner::family_name(self)
     }
 
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
@@ -61,10 +73,11 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
-        resolve_qwen35_chat_params(
+        resolve_qwen35_chat_params_for_family(
             config,
             &self.gen_defaults,
             self.dflash2.as_ref().map(|draft| draft.config.block_size),
+            self.is_moe(),
         )
     }
 
@@ -90,6 +103,8 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        self.want_paged_mtp_prompt_hidden = false;
+        self.pending_prompt_hidden = None;
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.dflash2_prefix
@@ -210,7 +225,13 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5")?;
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check(self.log_label())?;
+        if self.is_moe() {
+            self.dflash2_context = None;
+            self.dflash2_turn_state = None;
+            self.dflash2_prefix
+                .note_drop("chat_backend_prefill", DropKind::Dirtied);
+        }
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
         // state).
@@ -233,7 +254,14 @@ impl ChatBackend for Qwen35Inner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5")?;
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check(self.log_label())?;
+        let is_moe = self.is_moe();
+        if is_moe {
+            self.dflash2_context = None;
+            self.dflash2_turn_state = None;
+            self.dflash2_prefix
+                .note_drop("chat_backend_begin_decode", DropKind::Dirtied);
+        }
         let p = turn.params;
 
         let is_streaming = self.turn_is_streaming.get();
@@ -244,8 +272,9 @@ impl ChatBackend for Qwen35Inner {
             let max_kv_len_estimate =
                 engine::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
             info!(
-                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} \
+                "{} chat_decode entry: prompt_len={} max_new_tokens={} \
                  prefill_seq_len={} max_kv_len={} is_delta={} branch=\"AR\"",
+                self.log_label(),
                 turn.total_seq_len,
                 p.max_new_tokens,
                 prefill_len,
@@ -256,10 +285,13 @@ impl ChatBackend for Qwen35Inner {
 
         let embedding = self.embedding.clone();
 
-        let relabel = match (is_streaming, turn.is_delta) {
-            (false, _) => "chat_rust",
-            (true, false) => "chat_stream_rust",
-            (true, true) => "chat_stream_delta_rust",
+        let relabel = match (is_moe, is_streaming, turn.is_delta) {
+            (true, false, _) => "moe_chat_rust",
+            (true, true, false) => "moe_chat_stream_rust",
+            (true, true, true) => "moe_chat_stream_delta_rust",
+            (false, false, _) => "chat_rust",
+            (false, true, false) => "chat_stream_rust",
+            (false, true, true) => "chat_stream_delta_rust",
         };
 
         Ok(Qwen35Decode {
@@ -270,7 +302,27 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
-        let speculative = if self.dflash2.is_some() {
+        let speculative = if self.is_moe() {
+            if self.paged_adapter.is_none() {
+                None
+            } else if self.dflash2.is_some() {
+                Some(SpeculativePlan {
+                    kind: SpeculativeKind::DraftModel,
+                    supported_input_media: MediaCapabilities::NONE,
+                    supported_context_media: MediaCapabilities::NONE,
+                    supports_paged_attention: true,
+                    supports_streaming: true,
+                })
+            } else {
+                self.has_mtp_weights().then_some(SpeculativePlan {
+                    kind: SpeculativeKind::NativeMtp,
+                    supported_input_media: MediaCapabilities::NONE,
+                    supported_context_media: MediaCapabilities::NONE,
+                    supports_paged_attention: true,
+                    supports_streaming: true,
+                })
+            }
+        } else if self.dflash2.is_some() {
             Some(SpeculativePlan {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
@@ -318,11 +370,15 @@ impl ChatBackend for Qwen35Inner {
         // planned executor earlier and never consult either hook. The labels
         // are the engine defaults.
         self.turn_is_streaming.set(is_streaming);
-        match (is_streaming, is_delta) {
-            (false, false) => "chat",
-            (false, true) => "chat_delta",
-            (true, false) => "chat_stream",
-            (true, true) => "chat_stream_delta",
+        match (self.is_moe(), is_streaming, is_delta) {
+            (true, false, false) => "moe_chat",
+            (true, false, true) => "moe_chat_delta",
+            (true, true, false) => "moe_chat_stream",
+            (true, true, true) => "moe_chat_stream_delta",
+            (false, false, false) => "chat",
+            (false, false, true) => "chat_delta",
+            (false, true, false) => "chat_stream",
+            (false, true, true) => "chat_stream_delta",
         }
     }
 
@@ -360,6 +416,11 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        if self.is_moe() {
+            return Err(Error::from_reason(
+                "Qwen3.5 MoE has no flat speculative turn",
+            ));
+        }
         debug_assert!(self.paged_adapter.is_none());
         debug_assert!(args.media.is_empty());
         if matches!(
@@ -382,10 +443,9 @@ impl ChatBackend for Qwen35Inner {
 
 impl Qwen35Inner {
     fn paged_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Both SYNC and STREAMING turns take the paged core. The paged
-        // cores self-handle MTP via the `eager_mtp_paged` arm
-        // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
-        // the streaming eager-MTP path.
+        // Both SYNC and STREAMING turns take the generic paged engine
+        // (`engine::paged_turn::run_paged_turn`), with external DFlash2 routing
+        // through `run_paged_dspark_turn`.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
         if matches!(
@@ -411,33 +471,29 @@ impl Qwen35Inner {
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                self.vision_paged_turn_stream_core(
+                self.vision_paged_turn_core(
                     tokens,
                     args.media.images,
                     tokenizer,
                     args.eos_id,
                     p,
                     report_perf,
-                    &cb,
-                    cancelled,
+                    Some((&cb, cancelled)),
                     args.thinking,
                     args.config,
-                )?;
-                Ok(TurnOutput::Streamed)
+                )
             }
-            _ => {
-                let result = self.vision_paged_turn_sync_core(
-                    tokens,
-                    args.media.images,
-                    tokenizer,
-                    args.eos_id,
-                    p,
-                    report_perf,
-                    args.thinking,
-                    args.config,
-                )?;
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
+            _ => self.vision_paged_turn_core(
+                tokens,
+                args.media.images,
+                tokenizer,
+                args.eos_id,
+                p,
+                report_perf,
+                None,
+                args.thinking,
+                args.config,
+            ),
         }
     }
 }

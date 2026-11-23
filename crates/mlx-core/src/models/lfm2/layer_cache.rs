@@ -1,6 +1,5 @@
 use crate::array::MxArray;
-use crate::models::qwen3_5::arrays_cache::ArraysCache;
-use crate::transformer::KVCache;
+use crate::transformer::{ArraysCache, KVCache};
 
 /// Per-layer cache for LFM2 decoder layers.
 ///

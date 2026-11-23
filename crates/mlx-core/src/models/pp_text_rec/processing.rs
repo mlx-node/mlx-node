@@ -87,29 +87,9 @@ impl TextRecImageProcessor {
         let new_w = self.compute_resized_width(width, height, self.max_width);
         let new_h = self.target_height;
 
-        // Resize
+        // Resize and normalize in BGR order (RGB -> BGR channel swap)
         let resized = image::imageops::resize(img, new_w, new_h, RESIZE_FILTER);
-
-        // Output is exactly the resized dimensions (no padding)
-        let out_w = new_w as usize;
-        let out_h = new_h as usize;
-        let mut pixel_data: Vec<f32> = Vec::with_capacity(out_h * out_w * 3);
-
-        // Channel mapping: RGB->BGR. Pixel[0]=R->out[2], Pixel[1]=G->out[1], Pixel[2]=B->out[0]
-        let channel_map = [2usize, 1, 0]; // BGR ordering
-
-        for y in 0..out_h {
-            for x in 0..out_w {
-                let pixel = resized.get_pixel(x as u32, y as u32);
-                for (c, &src_c) in channel_map.iter().enumerate() {
-                    let val = pixel[src_c] as f32 / 255.0;
-                    let normalized = (val - self.mean[c]) / self.std[c];
-                    pixel_data.push(normalized);
-                }
-            }
-        }
-
-        MxArray::from_float32(&pixel_data, &[1, out_h as i64, out_w as i64, 3])
+        crate::vision::cnn::rgb_to_nhwc_f32(&resized, Some(self.mean), Some(self.std), true)
     }
 }
 

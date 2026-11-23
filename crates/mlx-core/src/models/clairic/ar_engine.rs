@@ -8,26 +8,45 @@ use std::collections::HashMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use image::RgbImage;
+use mlx_clairic::ar::EOS as AR_EOS;
+use mlx_clairic::embedded::RenderedPdfPageData;
+use mlx_clairic::errors::check_cancel;
+use mlx_clairic::grammar::{fill_batch_allowed_bitmasks, mask_and_score_row_bitmask};
+use mlx_clairic::media::{hex_digest, rgb_image_digest};
+use mlx_clairic::media_cache::{MediaCache, PreparedImages};
+use mlx_clairic::orchestrator::{ClairicBackend, extract_json};
+use mlx_clairic::profile::ClairicProfile;
+use mlx_clairic::settings::SEGMENT_TOKENS;
+use mlx_clairic::typed_prompt::{EncodedRecord, build_prediction_views_for_len};
+pub use mlx_clairic::types::{ArGenOutput, ArGenTask, FinishReason};
 use napi::Result;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::array::{DType, MxArray};
-use crate::grammar::{GrammarSpec, fill_batch_allowed_bitmasks, mask_and_score_row_bitmask};
 use crate::models::forward as model_fwd;
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::model::Qwen35Inner;
 use crate::stream::{Stream, StreamContext};
+use crate::vision::processing::ProcessedImage;
 use crate::vision::qwen::processing::merged_image_token_count;
 use crate::vision::qwen::prompt::{
     get_rope_index, inject_image_placeholders_with_token_id, merge_input_ids_with_image_features,
 };
 
-use super::errors::{check_cancel, inference_error, invalid_request};
-use super::media::{hex_digest, rgb_image_digest};
-use super::settings::SEGMENT_TOKENS;
-use super::typed_decode;
-use super::typed_prompt::{EncodedRecord, build_prediction_views_for_len};
+/// MLX-specialized prepared image cache entry holding `ProcessedImage` tensors.
+pub type ClairicPreparedImages<M = ()> = PreparedImages<ProcessedImage, M>;
+
+/// MLX-specialized LRU media cache holding `ProcessedImage` tensors.
+pub type ClairicMediaCache<M = ()> = MediaCache<ProcessedImage, M>;
+
+fn invalid_request(message: impl std::fmt::Display) -> napi::Error {
+    super::to_napi_err(mlx_clairic::errors::invalid_request(message))
+}
+
+fn inference_error(message: impl std::fmt::Display) -> napi::Error {
+    super::to_napi_err(mlx_clairic::errors::inference_error(message))
+}
 
 /// Threshold above which [`ClairicEngine::clear_request_caches`] drains MLX's
 /// Metal allocator free pool (512 MiB, matching CLEF's cache drain threshold).
@@ -60,36 +79,6 @@ impl Default for EngineOptions {
             memory_cap_bytes: None,
         }
     }
-}
-
-/// One deterministic grammar-constrained autoregressive generation task.
-#[derive(Debug, Clone)]
-pub struct ArGenTask {
-    pub id: String,
-    pub input_ids: Vec<u32>,
-    pub media: Option<Vec<Arc<RgbImage>>>,
-    pub media_key: Option<String>,
-    pub grammar: GrammarSpec,
-    pub max_new_tokens: usize,
-    pub stop_token_ids: Vec<u32>,
-}
-
-/// Termination reason for an [`ArGenOutput`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinishReason {
-    Stop(u32),
-    Length,
-}
-
-/// Output of one task executed by [`ClairicEngine::generate_batch`].
-#[derive(Debug, Clone)]
-pub struct ArGenOutput {
-    pub id: String,
-    pub output_ids: Vec<u32>,
-    pub text: String,
-    pub finish_reason: FinishReason,
-    pub output_token_logprobs: Vec<(f32, u32)>,
-    pub first_step_token_logprobs: Vec<(f32, u32)>,
 }
 
 /// Cached `B=1` layer states after running a shared image prefix up to
@@ -186,16 +175,6 @@ impl<'a> ClairicEngine<'a> {
         &self.options
     }
 
-    /// Borrow the underlying `Qwen35Inner` state.
-    pub(crate) fn inner(&self) -> &Qwen35Inner {
-        self.inner
-    }
-
-    /// Mutably borrow the underlying `Qwen35Inner` state.
-    pub(crate) fn inner_mut(&mut self) -> &mut Qwen35Inner {
-        self.inner
-    }
-
     /// Drop all per-request vision feature caches and shared prefix snapshots,
     /// draining the Metal allocator pool only when it exceeds 512 MiB.
     pub fn clear_request_caches(&mut self) {
@@ -255,7 +234,7 @@ impl<'a> ClairicEngine<'a> {
         };
 
         let (input_start, stop, views, as_layout) =
-            build_prediction_views_for_len(item, states_len)?;
+            build_prediction_views_for_len(item, states_len).map_err(super::to_napi_err)?;
 
         // Scope the immutable borrow of `clairic_head` so `lm_head` projection
         // can run cleanly right afterwards.
@@ -341,7 +320,7 @@ impl<'a> ClairicEngine<'a> {
             .tokenizer
             .as_ref()
             .ok_or_else(|| inference_error("Clairic tokenizer is not loaded"))?;
-        typed_decode::decode_head_outputs(
+        super::head::decode_head_outputs(
             &head_out,
             item,
             Some(tokenizer.inner()),
@@ -1135,7 +1114,11 @@ impl<'a> ClairicEngine<'a> {
 
         let mut matchers = tasks
             .iter()
-            .map(|t| grammar_engine.compile(&t.grammar))
+            .map(|t| {
+                grammar_engine
+                    .compile(&t.grammar)
+                    .map_err(super::to_napi_err)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let mut tokens: Vec<Vec<u32>> = vec![Vec::new(); size];
@@ -1148,7 +1131,8 @@ impl<'a> ClairicEngine<'a> {
             check_cancel_opt(cancelled)?;
 
             let active: Vec<bool> = (0..size).map(|row| !done[row] || step == 0).collect();
-            let bitmasks = fill_batch_allowed_bitmasks(&mut matchers, &active)?;
+            let bitmasks =
+                fill_batch_allowed_bitmasks(&mut matchers, &active).map_err(super::to_napi_err)?;
             let step_score_ids: &[u32] = if step == 0 { score_token_ids } else { &[] };
 
             for row in 0..size {
@@ -1176,7 +1160,9 @@ impl<'a> ClairicEngine<'a> {
                     done[row] = true;
                 }
                 if !matchers[row].is_terminated() {
-                    let accepted = matchers[row].accept_token(choice)?;
+                    let accepted = matchers[row]
+                        .accept_token(choice)
+                        .map_err(super::to_napi_err)?;
                     if !accepted && !is_stop {
                         return Err(inference_error(format!(
                             "Generated token {choice} rejected by grammar for task {:?}",
@@ -1236,13 +1222,130 @@ impl Drop for ClairicEngine<'_> {
     }
 }
 
+impl ClairicBackend for ClairicEngine<'_> {
+    fn tokenizer(&self) -> mlx_clairic::Result<Arc<tokenizers::Tokenizer>> {
+        self.inner
+            .tokenizer
+            .as_ref()
+            .map(|t| t.inner_arc())
+            .ok_or_else(|| mlx_clairic::errors::inference_error("Clairic tokenizer is not loaded"))
+    }
+
+    fn eos_token_id(&self) -> mlx_clairic::Result<u32> {
+        let tokenizer = self.inner.tokenizer.as_ref().ok_or_else(|| {
+            mlx_clairic::errors::inference_error("Clairic tokenizer is not loaded")
+        })?;
+        let vocab = self.inner.config.vocab_size.max(1) as u32;
+        Ok(tokenizer
+            .token_to_id(AR_EOS.to_string())
+            .filter(|&id| id < vocab)
+            .unwrap_or_else(|| {
+                let tok_eos = tokenizer.get_eos_token_id();
+                if tok_eos < vocab {
+                    tok_eos
+                } else {
+                    (self.inner.config.eos_token_id.max(0) as u32).min(vocab - 1)
+                }
+            }))
+    }
+
+    fn image_token_id(&self) -> u32 {
+        self.inner.clairic_multimodal.image_token_id.max(0) as u32
+    }
+
+    fn vision_end_token_id(&self) -> u32 {
+        ClairicEngine::vision_end_token_id(self)
+    }
+
+    fn profile(&self) -> ClairicProfile {
+        self.inner.clairic_profile.unwrap_or(ClairicProfile::Flash)
+    }
+
+    fn build_vision_tokens(
+        &self,
+        images: &[Arc<RgbImage>],
+    ) -> mlx_clairic::Result<(Vec<u32>, usize)> {
+        let tokenizer = self.inner.tokenizer.as_ref().ok_or_else(|| {
+            mlx_clairic::errors::inference_error("Clairic tokenizer is not loaded")
+        })?;
+        let processor = self.inner.image_processor.as_ref().ok_or_else(|| {
+            mlx_clairic::errors::inference_error("QwenImageProcessor is not loaded for image input")
+        })?;
+        let merge_size = self.inner.spatial_merge_size.unwrap_or(2);
+        let image_token_id = u32::try_from(self.inner.clairic_multimodal.image_token_id)
+            .map_err(|_| mlx_clairic::errors::inference_error("invalid image_token_id"))?;
+        let vision_end_id = u32::try_from(self.inner.clairic_multimodal.vision_end_token_id)
+            .map_err(|_| mlx_clairic::errors::inference_error("invalid vision_end_token_id"))?;
+        let vision_start_id = tokenizer.token_to_id("<|vision_start|>".to_string());
+
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut total_image_tokens = 0usize;
+        for img in images {
+            let processed = processor
+                .process_rgb_image(img)
+                .map_err(super::napi_to_clairic_err)?;
+            let grid = processed.image_grid_thw();
+            if grid.len() != 3 {
+                return Err(mlx_clairic::errors::inference_error(format!(
+                    "Expected 3-element image_grid_thw, got {grid:?}"
+                )));
+            }
+            let merged = merged_image_token_count(grid[0], grid[1], grid[2], merge_size)
+                .map_err(super::napi_to_clairic_err)?;
+            if let Some(vs) = vision_start_id {
+                tokens.push(vs);
+            }
+            tokens.extend(std::iter::repeat_n(image_token_id, merged));
+            tokens.push(vision_end_id);
+            total_image_tokens += merged;
+        }
+        Ok((tokens, total_image_tokens))
+    }
+
+    fn read_typed(
+        &mut self,
+        item: &EncodedRecord,
+        media: Option<&[Arc<RgbImage>]>,
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> mlx_clairic::Result<Map<String, Value>> {
+        ClairicEngine::read_typed(self, item, media, cancelled).map_err(super::napi_to_clairic_err)
+    }
+
+    fn generate_batch(
+        &mut self,
+        tasks: &[ArGenTask],
+        score_token_ids: &[u32],
+        cancelled: Option<&Arc<AtomicBool>>,
+    ) -> mlx_clairic::Result<Vec<ArGenOutput>> {
+        ClairicEngine::generate_batch(self, tasks, score_token_ids, cancelled)
+            .map_err(super::napi_to_clairic_err)
+    }
+
+    fn clear_request_caches(&mut self) {
+        ClairicEngine::clear_request_caches(self);
+    }
+}
+
+/// Full dual-path Clairic request entry point running on `&mut Qwen35Inner`
+/// via [`ClairicEngine`] and [`mlx_clairic::orchestrator::extract_json`].
+pub(crate) fn extract_json_on_inner(
+    inner: &mut Qwen35Inner,
+    raw_request: &str,
+    rendered_pdf_pages: Vec<RenderedPdfPageData>,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<String> {
+    let mut engine = ClairicEngine::with_defaults(inner);
+    extract_json(&mut engine, raw_request, rendered_pdf_pages, cancelled)
+        .map_err(super::to_napi_err)
+}
+
 // =============================================================================
 // Pure helpers
 // =============================================================================
 
 fn check_cancel_opt(cancelled: Option<&Arc<AtomicBool>>) -> Result<()> {
     if let Some(flag) = cancelled {
-        check_cancel(flag)?;
+        check_cancel(flag).map_err(super::to_napi_err)?;
     }
     Ok(())
 }
@@ -1404,14 +1507,14 @@ fn broadcast_layer_caches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::GrammarEngine;
     use crate::models::clairic::head::{self, ClairicHead, ClairicHeadConfig};
-    use crate::models::clairic::profile::ClairicProfile;
-    use crate::models::clairic::typed_prompt::{EncodeRecordOptions, encode_record};
     use crate::models::qwen3_5::attention::RopeMode;
     use crate::models::qwen3_5::config::{Qwen3_5Config, Qwen3_5MultimodalTokens};
     use crate::models::qwen3_5::decoder_layer::AttentionType;
     use crate::tokenizer::Qwen3Tokenizer;
+    use mlx_clairic::grammar::{GrammarEngine, GrammarSpec};
+    use mlx_clairic::profile::ClairicProfile;
+    use mlx_clairic::typed_prompt::{EncodeRecordOptions, encode_record};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1753,7 +1856,10 @@ mod tests {
                         .unwrap();
                 }
             }
-            if let crate::models::quantized_linear::MLPVariant::Standard(mlp) = &mut layer.mlp {
+            if let crate::models::qwen3_5::decoder_layer::MLPType::Dense(
+                crate::models::quantized_linear::MLPVariant::Standard(mlp),
+            ) = &mut layer.mlp
+            {
                 mlp.set_gate_proj_weight(&det_arr(s + 9, &[inter, h], 0.08))
                     .unwrap();
                 mlp.set_up_proj_weight(&det_arr(s + 10, &[inter, h], 0.08))

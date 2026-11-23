@@ -189,11 +189,9 @@ pub(super) fn gdn_prepare(
         Some(s) => s.clone(),
         None => MxArray::zeros(&[3, 10240], Some(DType::BFloat16))?,
     };
-    let prepared = if use_cuda {
-        cuda::gdn_prepare(qkv, a, b, conv, &old, scale, dt)?
-    } else {
-        metal::gdn_prepare(qkv, a, b, conv, &old, scale, dt)?
-    };
+    // qwen4 semantics: L2-style norm (`mean_eps = false`) and FP32 `beta`
+    // (`beta_input_dtype = false`), matching `math::l2` + `math::gdn_gates`.
+    let prepared = crate::kernels::gdn::prepare(qkv, a, b, conv, &old, scale, dt, false, false)?;
     let Some([q, k, v, decay, beta, history]) = prepared else {
         return Ok(None);
     };

@@ -1,0 +1,1357 @@
+//! Content-keyed resume states for hybrid paged-KV + recurrent/sidecar turns
+//! (Splash `StateCache`).
+//!
+//! An entry is one state on one complete KV block: the recurrent/sidecar cell
+//! at a block-aligned row of a token lineage. It holds no target KV: the KV is
+//! the prefix cache's chain, which the entry keeps resident by marking the
+//! block it sits on (Splash `StateMarks`). Lookup keys on the paged
+//! allocator's chained block hashes plus an exact token compare and the cache
+//! salt; the owner id plays no part. Memory alone bounds the store: the
+//! governor takes its entries as units (Splash has no count or byte cap).
+//!
+//! Every byte the store holds is an MLX array the allocator already counts, so
+//! nothing here registers with `cache_limit::coordinator()`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use mlx_paged_attn::CacheRecency;
+use napi::bindgen_prelude::*;
+
+use crate::transformer::cold_tier::part_page_image_keys;
+
+/// Bytes a parked state keeps alive.
+pub(crate) trait StateBytes {
+    fn state_bytes(&self) -> u64;
+}
+
+/// The prompt or history a key is computed from. Blocks past the end of
+/// `extra_keys` carry no extra keys.
+#[derive(Clone, Copy)]
+pub(crate) struct Lineage<'a> {
+    pub(crate) tokens: &'a [u32],
+    pub(crate) extra_keys: &'a [Vec<u64>],
+    pub(crate) salt: u64,
+}
+
+impl<'a> Lineage<'a> {
+    pub(crate) fn text(tokens: &'a [u32], salt: u64) -> Self {
+        Self {
+            tokens,
+            extra_keys: &[],
+            salt,
+        }
+    }
+}
+
+pub(crate) type EntryId = u64;
+
+/// The rows a state may hold past its last whole 32-token block: the 16-row
+/// part page a state moved from a 16-token store ends on. Its KV is a
+/// fragment object of that many rows on the tier, not a block.
+pub(crate) const PART_PAGE_ROWS: usize = 16;
+
+/// A publication's class (Splash `StateClass` as `StateCache` keeps it): a
+/// checkpoint is disposable and goes before ordinary states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateClass {
+    Checkpoint,
+    Ordinary,
+}
+
+/// What [`HybridStateStore::insert`] did: `new` is false when a state on the
+/// same block was reused, `upgraded` when that reuse made a checkpoint
+/// ordinary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Inserted {
+    pub(crate) id: EntryId,
+    pub(crate) new: bool,
+    pub(crate) upgraded: bool,
+}
+
+/// A state's copy on the SSD tier (Splash `StateCache::Entry::disk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskCopy {
+    pub(crate) key: mlx_paged_attn::ColdCacheKey,
+    /// The object's file size, what the tier's quota is charged.
+    pub(crate) bytes: u64,
+    /// The write landed; until then the copy is in flight.
+    pub(crate) landed: bool,
+    /// The first row the copy's context window holds (Splash
+    /// `QwenLogicalLengths`, which the entry keeps beside its slot).
+    pub(crate) window_begin: u32,
+    /// Some block of the state's chain is not on the tier yet: the chain
+    /// stays marked (Splash `StateCache::marks`: a disk state needs its KV
+    /// as it is).
+    pub(crate) chain_owed: bool,
+}
+
+/// One state on one block: a RAM copy, a disk copy, or both (Splash
+/// `StateCache::Entry`).
+pub(crate) struct Entry<S> {
+    id: EntryId,
+    block_size: u32,
+    salt: u64,
+    tokens: Vec<u32>,
+    /// Per whole block, from block 0; blocks past the end carry none.
+    extra_keys: Vec<Vec<u64>>,
+    chain: Vec<u64>,
+    ram: Option<S>,
+    /// The state's own bytes, its lineage aside (Splash `cachedBytes`).
+    cached_bytes: u64,
+    lineage_bytes: u64,
+    disk: Option<DiskCopy>,
+    last_used: u64,
+    checkpoint: bool,
+    publication: u64,
+}
+
+impl<S> Entry<S> {
+    pub(crate) fn id(&self) -> EntryId {
+        self.id
+    }
+
+    /// The row the state resumes at: its lineage's length.
+    pub(crate) fn depth(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub(crate) fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Its blocks' image keys, the last listed one carrying some.
+    pub(crate) fn extra_keys(&self) -> &[Vec<u64>] {
+        &self.extra_keys
+    }
+
+    /// Chain hashes of the entry's whole blocks.
+    pub(crate) fn chain(&self) -> &[u64] {
+        &self.chain
+    }
+
+    /// The block the state sits on (Splash keys a state by its KV block).
+    pub(crate) fn mark(&self) -> u64 {
+        self.chain.last().copied().unwrap_or_default()
+    }
+
+    /// The RAM copy; `None` for a state on disk only.
+    pub(crate) fn ram(&self) -> Option<&S> {
+        self.ram.as_ref()
+    }
+
+    pub(crate) fn disk(&self) -> Option<&DiskCopy> {
+        self.disk.as_ref()
+    }
+
+    pub(crate) fn salt(&self) -> u64 {
+        self.salt
+    }
+
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// The RAM copy's bytes and its lineage's token and chain vectors: a
+    /// state on disk only holds its lineage alone.
+    pub(crate) fn state_bytes(&self) -> u64 {
+        let ram = if self.ram.is_some() {
+            self.cached_bytes
+        } else {
+            0
+        };
+        ram.saturating_add(self.lineage_bytes)
+    }
+
+    /// Its block's chain must stay resident: a RAM copy, or a disk copy
+    /// whose chain is not all on the tier yet.
+    fn marks_chain(&self) -> bool {
+        self.ram.is_some() || self.disk.is_some_and(|disk| disk.chain_owed)
+    }
+
+    pub(crate) fn last_used(&self) -> u64 {
+        self.last_used
+    }
+
+    pub(crate) fn checkpoint(&self) -> bool {
+        self.checkpoint
+    }
+
+    /// Set once when the entry is made; an upgrade keeps it (Splash
+    /// `StateCache::entryFor`, `makeOrdinary`).
+    pub(crate) fn publication(&self) -> u64 {
+        self.publication
+    }
+
+    /// The bytes its RAM copy holds once it has one, its lineage's too.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.cached_bytes.saturating_add(self.lineage_bytes)
+    }
+
+    /// The entry's lineage equals `prompt[..depth]` and `depth < |prompt|`
+    /// (a RAM copy or a disk copy: Splash `StateCache::acquireDeepest`).
+    /// A state on a part page resumes with its fragment. No chain hash
+    /// covers the part page's image keys, so they must be the keys the
+    /// prompt has for those rows of that page; one with no whole block
+    /// under it resumes nothing.
+    fn resumes(&self, prompt: &PromptKey<'_>) -> bool {
+        let depth = self.depth();
+        let blocks = self.chain.len();
+        let on_part_page = || {
+            blocks > 0
+                && part_page_image_keys(keys_at(prompt.extra_keys, blocks), PART_PAGE_ROWS)
+                    .is_some_and(|keys| keys == keys_at(&self.extra_keys, blocks))
+        };
+        (self.ram.is_some() || self.disk.is_some())
+            && depth > 0
+            && (depth.is_multiple_of(self.block_size as usize) || on_part_page())
+            && depth < prompt.tokens.len()
+            && self.block_size == prompt.block_size
+            && self.salt == prompt.salt
+            && prompt.chain.get(..blocks) == Some(&self.chain[..])
+            && prompt.tokens[..depth] == self.tokens[..]
+    }
+}
+
+/// The image keys of block `index`; none past the end of `keys`.
+fn keys_at(keys: &[Vec<u64>], index: usize) -> &[u64] {
+    keys.get(index).map_or(&[][..], Vec::as_slice)
+}
+
+struct PromptKey<'a> {
+    tokens: &'a [u32],
+    extra_keys: &'a [Vec<u64>],
+    chain: Vec<u64>,
+    block_size: u32,
+    salt: u64,
+}
+
+fn block_chain(lineage: Lineage<'_>, block_size: u32) -> Vec<u64> {
+    let bs = block_size as usize;
+    let blocks = lineage.tokens.len() / bs;
+    if blocks == 0 || u32::try_from(blocks * bs).is_err() {
+        return Vec::new();
+    }
+    let extra_keys: Vec<Vec<u64>> = (0..blocks)
+        .map(|block| lineage.extra_keys.get(block).cloned().unwrap_or_default())
+        .collect();
+    mlx_paged_attn::chain_hashes_per_block(
+        &lineage.tokens[..blocks * bs],
+        block_size,
+        &extra_keys,
+        lineage.salt,
+    )
+}
+
+/// The bytes an entry's lineage vectors hold.
+pub(crate) fn lineage_bytes(tokens: usize, chain: usize) -> u64 {
+    (tokens as u64)
+        .saturating_mul(std::mem::size_of::<u32>() as u64)
+        .saturating_add((chain as u64).saturating_mul(std::mem::size_of::<u64>() as u64))
+}
+
+/// Shared by every store, so a store built in another's place never
+/// repeats a generation the old one handed out.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    GENERATIONS.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoreHit {
+    pub(crate) id: EntryId,
+    pub(crate) depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoreBytes {
+    pub(crate) entries: usize,
+    pub(crate) state_bytes: u64,
+}
+
+pub(crate) struct HybridStateStore<S> {
+    block_size: u32,
+    entries: Vec<Entry<S>>,
+    next_id: EntryId,
+    publications: u64,
+    /// Blocks an unfinished turn resumes from, with an entry there or not
+    /// (Splash `StateCache::uses_`).
+    uses: HashMap<u64, u32>,
+    recency: Arc<CacheRecency>,
+    /// Taken anew whenever an entry, or its RAM or disk copy, comes or
+    /// goes.
+    generation: u64,
+}
+
+impl<S: StateBytes> HybridStateStore<S> {
+    pub(crate) fn new(block_size: u32) -> Self {
+        Self {
+            block_size: block_size.max(1),
+            entries: Vec::new(),
+            next_id: 1,
+            publications: 0,
+            uses: HashMap::new(),
+            recency: Arc::new(CacheRecency::new()),
+            generation: next_generation(),
+        }
+    }
+
+    /// Equal across two reads only when no entry and no copy of one came
+    /// or went between them: a lookup's answer, and whether its entry has a
+    /// copy, stand while it does.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn changed(&mut self) {
+        self.generation = next_generation();
+    }
+
+    /// Stamp from `recency` from now on, the clock the model's other caches
+    /// share.
+    pub(crate) fn share_recency(&mut self, recency: Arc<CacheRecency>) {
+        self.recency = recency;
+    }
+
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub(crate) fn bytes(&self) -> StoreBytes {
+        StoreBytes {
+            entries: self.entries.len(),
+            state_bytes: self
+                .entries
+                .iter()
+                .fold(0, |sum, entry| sum.saturating_add(entry.state_bytes())),
+        }
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &Entry<S>> {
+        self.entries.iter()
+    }
+
+    pub(crate) fn get(&self, id: EntryId) -> Option<&Entry<S>> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    fn get_mut(&mut self, id: EntryId) -> Option<&mut Entry<S>> {
+        self.entries.iter_mut().find(|entry| entry.id == id)
+    }
+
+    fn prompt_key<'a>(&self, lineage: Lineage<'a>) -> PromptKey<'a> {
+        PromptKey {
+            tokens: lineage.tokens,
+            extra_keys: lineage.extra_keys,
+            chain: block_chain(lineage, self.block_size),
+            block_size: self.block_size,
+            salt: lineage.salt,
+        }
+    }
+
+    /// Publishes `state` at the end of `lineage`, which must be a whole
+    /// number of blocks (Splash `Cache::blockAt`). A state already on the
+    /// same block of the same lineage is reused and restamped instead, an
+    /// ordinary publication upgrading a checkpoint there (Splash
+    /// `reuseCompositeState`: one state per block). A checkpoint at a block
+    /// in use is ordinary at once (Splash `StateCache::publicationEntry`).
+    pub(crate) fn insert(
+        &mut self,
+        lineage: Lineage<'_>,
+        state: S,
+        class: StateClass,
+    ) -> Result<Inserted> {
+        let row = lineage.tokens.len();
+        let bs = self.block_size as usize;
+        if row == 0 || !row.is_multiple_of(bs) {
+            return Err(Error::from_reason(format!(
+                "DFlash2 state at row {row} is not a complete KV block (block size {bs})"
+            )));
+        }
+        let key = self.prompt_key(lineage);
+        if let Some(id) = self.entry_on(&key) {
+            let upgraded = class == StateClass::Ordinary && self.make_ordinary(id);
+            self.restamp(id);
+            return Ok(Inserted {
+                id,
+                new: false,
+                upgraded,
+            });
+        }
+        let cached_bytes = state.state_bytes();
+        Ok(self.push_entry(lineage, key, Some(state), cached_bytes, class, None))
+    }
+
+    /// Publishes a state whose only copy is `disk`, `cached_bytes` long,
+    /// at the end of `lineage` (Splash `StateCache::publishStateToDisk`: a
+    /// block's state is published once, so no state may sit there).
+    pub(crate) fn insert_disk(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+    ) -> Result<EntryId> {
+        let row = lineage.tokens.len();
+        if row == 0 || !row.is_multiple_of(self.block_size as usize) {
+            return Err(Error::from_reason(format!(
+                "DFlash2 state at row {row} is not a complete KV block"
+            )));
+        }
+        let key = self.prompt_key(lineage);
+        if self.entry_on(&key).is_some() {
+            return Err(Error::from_reason(
+                "a block's state is published once; reuse it instead",
+            ));
+        }
+        Ok(self
+            .push_entry(lineage, key, None, cached_bytes, class, Some(disk))
+            .id)
+    }
+
+    /// Takes back a persistent tier's state whose only copy is `disk`,
+    /// stamped `last_used` as its earlier process left it (Splash
+    /// `StateCache::adoptDisk`: one state per block).
+    pub(crate) fn adopt_disk(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+        last_used: u64,
+    ) -> Result<EntryId> {
+        let id = self.insert_disk(lineage, cached_bytes, class, disk)?;
+        if let Some(entry) = self.get_mut(id) {
+            entry.last_used = last_used;
+        }
+        Ok(id)
+    }
+
+    /// [`Self::adopt_disk`] for a state on a part page: its lineage is whole
+    /// 32-token blocks and [`PART_PAGE_ROWS`] more rows. Its chain is the
+    /// whole blocks'; it keeps the image keys of its part page too, which
+    /// its object's key and label carry.
+    pub(crate) fn adopt_disk_on_part_page(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+        last_used: u64,
+    ) -> Result<EntryId> {
+        let row = lineage.tokens.len();
+        let block = self.block_size as usize;
+        if block != 2 * PART_PAGE_ROWS || row % block != PART_PAGE_ROWS {
+            return Err(Error::from_reason(format!(
+                "DFlash2 state at row {row} is not on a {PART_PAGE_ROWS}-row part page of \
+                 {block}-token blocks"
+            )));
+        }
+        let key = self.prompt_key(lineage);
+        if self.entry_on(&key).is_some() {
+            return Err(Error::from_reason(
+                "a block's state is published once; reuse it instead",
+            ));
+        }
+        let id = self
+            .push_entry(lineage, key, None, cached_bytes, class, Some(disk))
+            .id;
+        if let Some(entry) = self.get_mut(id) {
+            entry.last_used = last_used;
+        }
+        Ok(id)
+    }
+
+    /// New stamps continue after `stamp`, one an earlier process handed out
+    /// (Splash `CacheRecency::continueAfter`).
+    pub(crate) fn continue_after(&self, stamp: u64) {
+        self.recency.continue_after(stamp);
+    }
+
+    /// The clock's next stamp.
+    #[cfg(test)]
+    pub(crate) fn next_stamp(&self) -> u64 {
+        self.recency.next()
+    }
+
+    fn push_entry(
+        &mut self,
+        lineage: Lineage<'_>,
+        key: PromptKey<'_>,
+        ram: Option<S>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: Option<DiskCopy>,
+    ) -> Inserted {
+        let mark = key.chain.last().copied().unwrap_or_default();
+        let checkpoint = class == StateClass::Checkpoint && !self.in_use(mark);
+        let lineage_bytes = lineage_bytes(lineage.tokens.len(), key.chain.len());
+        let part_page = usize::from(
+            !lineage
+                .tokens
+                .len()
+                .is_multiple_of(self.block_size as usize),
+        );
+        let mut extra_keys: Vec<Vec<u64>> = lineage
+            .extra_keys
+            .iter()
+            .take(key.chain.len() + part_page)
+            .cloned()
+            .collect();
+        while extra_keys.last().is_some_and(Vec::is_empty) {
+            extra_keys.pop();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.publications += 1;
+        self.changed();
+        let stamp = self.recency.next();
+        self.entries.push(Entry {
+            id,
+            block_size: self.block_size,
+            salt: lineage.salt,
+            tokens: lineage.tokens.to_vec(),
+            extra_keys,
+            chain: key.chain,
+            ram,
+            cached_bytes,
+            lineage_bytes,
+            disk,
+            last_used: stamp,
+            checkpoint,
+            publication: self.publications,
+        });
+        Inserted {
+            id,
+            new: true,
+            upgraded: false,
+        }
+    }
+
+    /// Splash `Cache::superseded`: the ordinary states past `id`'s block
+    /// all go on through one next block, so its conversation went on from
+    /// it.
+    pub(crate) fn superseded(&self, id: EntryId) -> bool {
+        let Some(entry) = self.get(id) else {
+            return false;
+        };
+        let depth = entry.chain.len();
+        let mut next: Option<u64> = None;
+        for other in &self.entries {
+            if other.checkpoint
+                || other.chain.len() <= depth
+                || other.chain[..depth] != entry.chain[..]
+            {
+                continue;
+            }
+            match next {
+                Some(block) if block != other.chain[depth] => return false,
+                _ => next = Some(other.chain[depth]),
+            }
+        }
+        next.is_some()
+    }
+
+    /// The entry on `key`'s rows. No chain hash covers a part page's image
+    /// keys, so a part-page key also needs that page's keys equal.
+    fn entry_on(&self, key: &PromptKey<'_>) -> Option<EntryId> {
+        let blocks = key.chain.len();
+        let part_page = !key.tokens.len().is_multiple_of(key.block_size as usize);
+        self.entries
+            .iter()
+            .find(|old| {
+                old.salt == key.salt
+                    && old.block_size == key.block_size
+                    && old.chain == key.chain
+                    && old.tokens[..] == key.tokens[..]
+                    && (!part_page
+                        || keys_at(&old.extra_keys, blocks) == keys_at(key.extra_keys, blocks))
+            })
+            .map(Entry::id)
+    }
+
+    /// The block `lineage` ends on and the state there, if any (Splash
+    /// `Cache::blockAt`, `StateCache::stateResident`).
+    pub(crate) fn locate(&self, lineage: Lineage<'_>) -> (u64, Option<EntryId>) {
+        let key = self.prompt_key(lineage);
+        (
+            key.chain.last().copied().unwrap_or_default(),
+            self.entry_on(&key),
+        )
+    }
+
+    /// Reuses entry `id` and restamps it; an ordinary reuse upgrades a
+    /// checkpoint, a checkpoint never downgrades an ordinary state (Splash
+    /// `StateCache::reuseStoredState`). False when it is gone.
+    pub(crate) fn reuse(&mut self, id: EntryId, checkpoint: bool) -> bool {
+        if self.get(id).is_none() {
+            return false;
+        }
+        if !checkpoint {
+            self.make_ordinary(id);
+        }
+        self.restamp(id);
+        true
+    }
+
+    /// True when `id` was a checkpoint (Splash `StateCache::makeOrdinary`:
+    /// the publication stays).
+    fn make_ordinary(&mut self, id: EntryId) -> bool {
+        self.get_mut(id)
+            .is_some_and(|entry| std::mem::replace(&mut entry.checkpoint, false))
+    }
+
+    fn restamp(&mut self, id: EntryId) {
+        let stamp = self.recency.next();
+        if let Some(entry) = self.get_mut(id) {
+            entry.last_used = stamp;
+        }
+    }
+
+    /// The deepest state `b < |P|` whose lineage equals `P[..b]`; on a tie
+    /// the most recently used (Splash `StateCache::acquireDeepest`).
+    pub(crate) fn lookup(&self, prompt: Lineage<'_>) -> Option<StoreHit> {
+        let key = self.prompt_key(prompt);
+        self.entries
+            .iter()
+            .filter(|entry| entry.resumes(&key))
+            .max_by_key(|entry| (entry.depth(), entry.last_used))
+            .map(|entry| StoreHit {
+                id: entry.id,
+                depth: entry.depth(),
+            })
+    }
+
+    /// [`Self::lookup`] among states at most `depth` deep: the GDN half of a
+    /// composite state serves a request that needs no draft (Splash
+    /// `QwenStateStorage::restore` with `restoreDraftState` false).
+    pub(crate) fn lookup_within(&self, prompt: Lineage<'_>, depth: usize) -> Option<StoreHit> {
+        let key = self.prompt_key(prompt);
+        self.entries
+            .iter()
+            .filter(|entry| entry.depth() <= depth && entry.resumes(&key))
+            .max_by_key(|entry| (entry.depth(), entry.last_used))
+            .map(|entry| StoreHit {
+                id: entry.id,
+                depth: entry.depth(),
+            })
+    }
+
+    /// The deepest state of [`Self::lookup_within`] that `accept` takes,
+    /// deeper ones it refuses passed over, the prompt's chain hashed once.
+    pub(crate) fn deepest_accepted_within(
+        &self,
+        prompt: Lineage<'_>,
+        depth: usize,
+        mut accept: impl FnMut(EntryId) -> bool,
+    ) -> Option<StoreHit> {
+        let key = self.prompt_key(prompt);
+        let mut hits: Vec<&Entry<S>> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.depth() <= depth && entry.resumes(&key))
+            .collect();
+        hits.sort_by_key(|entry| std::cmp::Reverse((entry.depth(), entry.last_used)));
+        hits.into_iter()
+            .find(|entry| accept(entry.id))
+            .map(|entry| StoreHit {
+                id: entry.id,
+                depth: entry.depth(),
+            })
+    }
+
+    /// Stamps `id` newest (Splash `StateCache::release` after a restore).
+    pub(crate) fn touch(&mut self, id: EntryId) {
+        self.restamp(id);
+    }
+
+    /// An unfinished turn resumes from the state at `block`, published or
+    /// yet to be; a checkpoint there becomes ordinary (Splash
+    /// `StateCache::useState`). Recency is set when the last use ends.
+    pub(crate) fn use_state(&mut self, block: u64) {
+        let uses = self.uses.entry(block).or_insert(0);
+        *uses += 1;
+        if *uses == 1 {
+            for entry in self
+                .entries
+                .iter_mut()
+                .filter(|entry| entry.mark() == block)
+            {
+                entry.checkpoint = false;
+            }
+        }
+    }
+
+    /// Ends one use of `block`; at the last, its state becomes the newest of
+    /// its class (Splash `StateCache::unuse`).
+    pub(crate) fn end_use(&mut self, block: u64) {
+        let Some(uses) = self.uses.get_mut(&block) else {
+            return;
+        };
+        *uses -= 1;
+        if *uses > 0 {
+            return;
+        }
+        self.uses.remove(&block);
+        if let Some(id) = self
+            .entries
+            .iter()
+            .find(|entry| entry.mark() == block)
+            .map(Entry::id)
+        {
+            self.restamp(id);
+        }
+    }
+
+    pub(crate) fn in_use(&self, block: u64) -> bool {
+        self.uses.contains_key(&block)
+    }
+
+    /// `id` and its publication while it is a checkpoint (Splash
+    /// `StateCache::checkpointState`).
+    pub(crate) fn checkpoint_state(&self, id: EntryId) -> Option<(EntryId, u64)> {
+        self.get(id)
+            .filter(|entry| entry.checkpoint)
+            .map(|entry| (entry.id, entry.publication))
+    }
+
+    /// Splash `StateCache::checkpointPinned`: no restore holds a lease on a
+    /// stored state, so a checkpoint is never pinned.
+    pub(crate) fn checkpoint_pinned(&self, _id: EntryId, _publication: u64) -> bool {
+        false
+    }
+
+    /// Some entry sits on a strict descendant of `block` (Splash
+    /// `KvCache::stateBelow`).
+    pub(crate) fn state_below(&self, block: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.chain[..entry.chain.len().saturating_sub(1)].contains(&block))
+    }
+
+    /// The block hashes of `lineage`'s whole blocks, as the store keys them.
+    pub(crate) fn chain(&self, lineage: Lineage<'_>) -> Vec<u64> {
+        block_chain(lineage, self.block_size)
+    }
+
+    /// Drops one entry; frees no block (its chain becomes dead leaves once
+    /// the caller re-syncs the marks, Splash `StateCache::erase`). A use of
+    /// its block stays.
+    pub(crate) fn remove(&mut self, id: EntryId) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.id != id);
+        let removed = self.entries.len() < before;
+        if removed {
+            self.changed();
+        }
+        removed
+    }
+
+    /// The block of every entry whose chain must stay resident.
+    pub(crate) fn marks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|entry| entry.marks_chain())
+            .map(Entry::mark)
+    }
+
+    /// Sets `id`'s disk copy; false when it is gone.
+    pub(crate) fn set_disk(&mut self, id: EntryId, disk: Option<DiskCopy>) -> bool {
+        let set = self.get_mut(id).map(|entry| entry.disk = disk).is_some();
+        if set {
+            self.changed();
+        }
+        set
+    }
+
+    /// A copy taken here may land: the generation moves.
+    pub(crate) fn disk_mut(&mut self, id: EntryId) -> Option<&mut DiskCopy> {
+        self.changed();
+        self.get_mut(id).and_then(|entry| entry.disk.as_mut())
+    }
+
+    /// Gives disk-only `id` its RAM copy back (Splash
+    /// `StateCache::promote`); false when it is gone or holds one.
+    pub(crate) fn promote(&mut self, id: EntryId, state: S) -> bool {
+        match self.get_mut(id) {
+            Some(entry) if entry.ram.is_none() => {
+                entry.ram = Some(state);
+                self.changed();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops `id`'s RAM copy (Splash `StateCache::discardRam`).
+    pub(crate) fn drop_ram(&mut self, id: EntryId) -> Option<S> {
+        let dropped = self.get_mut(id).and_then(|entry| entry.ram.take());
+        if dropped.is_some() {
+            self.changed();
+        }
+        dropped
+    }
+
+    /// Drops every entry and use (`ResetScope::Command`, a new pool).
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.uses.clear();
+        self.changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    struct TestState {
+        name: String,
+        bytes: u64,
+        log: Log,
+    }
+
+    impl StateBytes for TestState {
+        fn state_bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push(format!("drop {}", self.name));
+        }
+    }
+
+    type Store = HybridStateStore<TestState>;
+
+    const BS: u32 = 16;
+    const ANCHOR: u64 = 60;
+
+    fn lineage(seed: u32, len: usize) -> Vec<u32> {
+        (0..len as u32).map(|i| seed * 100_000 + i).collect()
+    }
+
+    fn fork(base: &[u32], at: usize, len: usize, seed: u32) -> Vec<u32> {
+        let mut tokens = base[..at].to_vec();
+        tokens.extend((0..(len - at) as u32).map(|i| seed * 100_000 + 50_000 + i));
+        tokens
+    }
+
+    struct Fixture {
+        log: Log,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self { log: Rc::default() }
+        }
+
+        fn state(&self, name: &str) -> TestState {
+            TestState {
+                name: name.to_owned(),
+                bytes: ANCHOR,
+                log: self.log.clone(),
+            }
+        }
+
+        fn drain(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.borrow_mut())
+        }
+    }
+
+    fn hit(store: &Store, prompt: &[u32], salt: u64) -> Option<usize> {
+        store
+            .lookup(Lineage::text(prompt, salt))
+            .map(|hit| hit.depth)
+    }
+
+    #[test]
+    fn deepest_exact_resume_across_states() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 100);
+        let b = lineage(2, 300);
+        store
+            .insert(
+                Lineage::text(&a[..64], 0),
+                fx.state("a64"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        store
+            .insert(
+                Lineage::text(&b[..160], 0),
+                fx.state("b160"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        store
+            .insert(
+                Lineage::text(&b[..240], 0),
+                fx.state("b240"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+
+        assert_eq!(hit(&store, &fork(&a, 80, 120, 3), 0), Some(64));
+        assert_eq!(hit(&store, &fork(&a, 40, 120, 3), 0), None);
+        assert_eq!(hit(&store, &fork(&b, 250, 400, 4), 0), Some(240));
+        assert_eq!(hit(&store, &fork(&b, 200, 400, 4), 0), Some(160));
+        // `b < |P|`: a prompt equal to the lineage cannot resume at its end.
+        assert_eq!(hit(&store, &b[..240], 0), Some(160));
+    }
+
+    #[test]
+    fn equal_depth_prefers_recent() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let base = lineage(1, 64);
+        let id = store
+            .insert(
+                Lineage::text(&base, 0),
+                fx.state("c64"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let prompt = [base.clone(), vec![1, 2]].concat();
+        let found = store.lookup(Lineage::text(&prompt, 0)).unwrap();
+        assert_eq!((found.id, found.depth), (id, 64));
+
+        let other = store
+            .insert(
+                Lineage::text(&base, 9),
+                fx.state("c64 salt 9"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        assert_ne!(other, id);
+        assert_eq!(store.lookup(Lineage::text(&prompt, 9)).unwrap().id, other);
+    }
+
+    #[test]
+    fn salt_isolates_lineages() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 100);
+        store
+            .insert(
+                Lineage::text(&a[..96], 7),
+                fx.state("a"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        assert_eq!(hit(&store, &a, 7), Some(96));
+        assert_eq!(hit(&store, &a, 0), None);
+        assert_eq!(hit(&store, &a, 8), None);
+    }
+
+    #[test]
+    fn extra_keys_split_lineages_with_equal_tokens() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 100);
+        let image = vec![vec![], vec![42]];
+        let keyed = Lineage {
+            tokens: &a[..32],
+            extra_keys: &image,
+            salt: 0,
+        };
+        store
+            .insert(keyed, fx.state("a32"), StateClass::Ordinary)
+            .unwrap();
+        store
+            .insert(
+                Lineage::text(&a[..16], 0),
+                fx.state("a16"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        let probe = Lineage {
+            tokens: &a,
+            extra_keys: &image,
+            salt: 0,
+        };
+        assert_eq!(store.lookup(probe).map(|hit| hit.depth), Some(32));
+        // Without the image key only the block before it still lines up.
+        assert_eq!(hit(&store, &a, 0), Some(16));
+    }
+
+    #[test]
+    fn block_size_32_keys_match_the_allocator_chain() {
+        let fx = Fixture::new();
+        let mut store = Store::new(32);
+        let a = lineage(1, 100);
+        let id = store
+            .insert(
+                Lineage::text(&a[..64], 5),
+                fx.state("a"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let expected =
+            mlx_paged_attn::chain_hashes_per_block(&a[..64], 32, &vec![Vec::new(); 2], 5);
+        let entry = store.get(id).unwrap();
+        assert_eq!(entry.chain(), &expected[..]);
+        assert_eq!(entry.mark(), expected[1]);
+        assert!(
+            store
+                .insert(
+                    Lineage::text(&a[..48], 5),
+                    fx.state("bad"),
+                    StateClass::Ordinary
+                )
+                .is_err(),
+            "48 is a 16-boundary, not a 32-boundary"
+        );
+        assert_eq!(hit(&store, &fork(&a, 70, 120, 2), 5), Some(64));
+        assert_eq!(hit(&store, &fork(&a, 60, 120, 2), 5), None);
+    }
+
+    #[test]
+    fn hash_collision_with_different_tokens_misses() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 100);
+        let b = lineage(2, 100);
+        store
+            .insert(
+                Lineage::text(&a[..64], 0),
+                fx.state("a"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        // Forge a collision: A's entry now carries B's block hashes.
+        store.entries[0].chain = block_chain(Lineage::text(&b[..64], 0), BS);
+        assert_eq!(hit(&store, &b, 0), None);
+    }
+
+    /// The stored-state probe takes the deepest state `accept` takes: a
+    /// deeper state it refuses is passed over for the next one down, not
+    /// for the shallowest; none when it refuses every one; states past the
+    /// depth or off the lineage are never offered.
+    #[test]
+    fn the_probe_takes_the_deepest_state_it_accepts() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 200);
+        let mut ids = Vec::new();
+        for (row, name) in [(32, "a32"), (64, "a64"), (96, "a96"), (160, "a160")] {
+            let inserted = store
+                .insert(
+                    Lineage::text(&a[..row], 0),
+                    fx.state(name),
+                    StateClass::Ordinary,
+                )
+                .unwrap();
+            ids.push((inserted.id, row));
+        }
+        let other = store
+            .insert(
+                Lineage::text(&lineage(2, 128), 0),
+                fx.state("b128"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let id_at = |row: usize| ids.iter().find(|(_, at)| *at == row).unwrap().0;
+        let prompt = Lineage::text(&a[..120], 0);
+        let probe = |refused: &[usize]| {
+            let mut offered = Vec::new();
+            let found = store.deepest_accepted_within(prompt, 119, |id| {
+                offered.push(id);
+                !refused.iter().any(|&row| id_at(row) == id)
+            });
+            (found.map(|hit| (hit.id, hit.depth)), offered)
+        };
+
+        assert_eq!(probe(&[]).0, Some((id_at(96), 96)));
+        let (found, offered) = probe(&[96]);
+        assert_eq!(found, Some((id_at(64), 64)), "the deeper state is refused");
+        assert_eq!(offered, vec![id_at(96), id_at(64)]);
+        assert_eq!(
+            probe(&[96, 64]).0,
+            Some((id_at(32), 32)),
+            "two deeper states are refused"
+        );
+        let (found, offered) = probe(&[96, 64, 32]);
+        assert_eq!(found, None, "every state is refused");
+        assert!(!offered.contains(&id_at(160)), "past the depth");
+        assert!(!offered.contains(&other), "off the lineage");
+    }
+
+    /// A state sits only on a complete KV block (Splash `Cache::blockAt`).
+    /// Mutation PB1: `insert` skips the alignment check → red.
+    #[test]
+    fn a_state_sits_only_on_a_whole_block() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 100);
+        for row in [0, 40, 99] {
+            let error = store
+                .insert(
+                    Lineage::text(&a[..row], 0),
+                    fx.state("x"),
+                    StateClass::Ordinary,
+                )
+                .err()
+                .map(|error| error.reason);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("is not a complete KV block")),
+                "row {row}: {error:?}"
+            );
+        }
+        assert_eq!(store.bytes().entries, 0);
+        store
+            .insert(
+                Lineage::text(&a[..96], 0),
+                fx.state("a"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        assert_eq!(store.bytes().entries, 1);
+    }
+
+    /// One state per block: a second publish on the same block of the same
+    /// lineage reuses the first and restamps it (Splash
+    /// `reuseCompositeState`); another salt is another block.
+    /// Mutation DD1: no dedup in `insert` → red (two entries).
+    #[test]
+    fn a_second_state_on_one_block_reuses_the_first() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 192);
+        let first = store
+            .insert(
+                Lineage::text(&a, 0),
+                fx.state("first"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let stamp = store.get(first).unwrap().last_used();
+        let again = store
+            .insert(
+                Lineage::text(&a, 0),
+                fx.state("again"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        assert_eq!(again, first);
+        assert_eq!(store.bytes().entries, 1);
+        assert!(store.get(first).unwrap().last_used() > stamp);
+        assert_eq!(fx.drain(), vec!["drop again".to_owned()]);
+        store
+            .insert(
+                Lineage::text(&a, 3),
+                fx.state("salted"),
+                StateClass::Ordinary,
+            )
+            .unwrap();
+        assert_eq!(store.bytes().entries, 2);
+    }
+
+    /// The last use of a block restamps its state.
+    #[test]
+    fn end_use_restamps_and_units_go_oldest_first() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = store
+            .insert(
+                Lineage::text(&lineage(1, 32), 0),
+                fx.state("a"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let b = store
+            .insert(
+                Lineage::text(&lineage(2, 32), 0),
+                fx.state("b"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let a_mark = store.get(a).unwrap().mark();
+        let oldest = |store: &Store| {
+            store
+                .entries()
+                .min_by_key(|entry| entry.last_used())
+                .map(|entry| entry.id())
+        };
+        assert_eq!(oldest(&store), Some(a));
+        store.use_state(a_mark);
+        store.use_state(a_mark);
+        store.end_use(a_mark);
+        assert!(store.in_use(a_mark));
+        assert_eq!(oldest(&store), Some(a));
+        store.end_use(a_mark);
+        assert!(!store.in_use(a_mark));
+        assert_eq!(oldest(&store), Some(b));
+        assert!(store.remove(b));
+        assert!(!store.remove(b));
+        assert_eq!(store.marks().count(), 1);
+    }
+
+    #[test]
+    fn inserting_leaves_cache_limit_totals_unchanged() {
+        let fx = Fixture::new();
+        let before = crate::cache_limit::coordinator().registered_pool_bytes();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 64);
+        store
+            .insert(Lineage::text(&a, 0), fx.state("a"), StateClass::Ordinary)
+            .unwrap();
+        assert_eq!(
+            crate::cache_limit::coordinator().registered_pool_bytes(),
+            before
+        );
+    }
+
+    fn class_of(store: &Store, id: EntryId) -> StateClass {
+        if store.get(id).unwrap().checkpoint() {
+            StateClass::Checkpoint
+        } else {
+            StateClass::Ordinary
+        }
+    }
+
+    /// Splash `StateCache`: an ordinary publication or a use upgrades a
+    /// checkpoint and keeps its publication; a checkpoint never downgrades
+    /// an ordinary state; a checkpoint at a block in use is ordinary.
+    /// Mutation UP1 (a reuse keeps the old class) → red.
+    #[test]
+    fn ordinary_publication_upgrades_a_checkpoint() {
+        use StateClass::{Checkpoint, Ordinary};
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 64);
+        let first = store
+            .insert(Lineage::text(&a, 0), fx.state("cp"), Checkpoint)
+            .unwrap();
+        assert!(first.new);
+        assert_eq!(class_of(&store, first.id), Checkpoint);
+        let publication = store.get(first.id).unwrap().publication();
+        assert_eq!(
+            store.checkpoint_state(first.id),
+            Some((first.id, publication))
+        );
+        assert!(!store.checkpoint_pinned(first.id, publication));
+        let again = store
+            .insert(Lineage::text(&a, 0), fx.state("ord"), Ordinary)
+            .unwrap();
+        assert_eq!(
+            again,
+            Inserted {
+                id: first.id,
+                new: false,
+                upgraded: true
+            }
+        );
+        assert_eq!(store.bytes().entries, 1);
+        assert_eq!(class_of(&store, first.id), Ordinary);
+        assert_eq!(store.get(first.id).unwrap().publication(), publication);
+        assert_eq!(store.checkpoint_state(first.id), None);
+
+        let down = store
+            .insert(Lineage::text(&a, 0), fx.state("cp again"), Checkpoint)
+            .unwrap();
+        assert!(!down.new && !down.upgraded);
+        assert_eq!(class_of(&store, first.id), Ordinary);
+
+        let b = lineage(2, 64);
+        let used = store
+            .insert(Lineage::text(&b, 0), fx.state("b"), Checkpoint)
+            .unwrap()
+            .id;
+        assert_ne!(store.get(used).unwrap().publication(), publication);
+        store.use_state(store.get(used).unwrap().mark());
+        assert_eq!(class_of(&store, used), Ordinary);
+
+        let c = lineage(3, 64);
+        let c_mark = block_chain(Lineage::text(&c, 0), BS)
+            .last()
+            .copied()
+            .unwrap();
+        store.use_state(c_mark);
+        let in_use = store
+            .insert(Lineage::text(&c, 0), fx.state("c"), Checkpoint)
+            .unwrap()
+            .id;
+        assert_eq!(class_of(&store, in_use), Ordinary);
+        assert!(store.reuse(in_use, true));
+        assert!(!store.reuse(999, false));
+    }
+
+    /// An entry's bytes count its lineage's token and chain vectors
+    /// (03-PLAN "count the token vectors").
+    /// Mutation TB1 (lineage bytes not added) → red.
+    #[test]
+    fn state_bytes_count_the_lineage() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let short: Vec<u32> = (0..1_600).collect();
+        let long: Vec<u32> = (0..78_592).collect();
+        let a = store
+            .insert(
+                Lineage::text(&short, 0),
+                fx.state("short"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        let b = store
+            .insert(
+                Lineage::text(&long, 0),
+                fx.state("long"),
+                StateClass::Ordinary,
+            )
+            .unwrap()
+            .id;
+        assert_eq!(store.get(a).unwrap().state_bytes(), ANCHOR + 6_400 + 800);
+        assert_eq!(
+            store.get(b).unwrap().state_bytes(),
+            ANCHOR + 314_368 + 39_296
+        );
+        assert_eq!(
+            store.bytes().state_bytes,
+            2 * ANCHOR + 6_400 + 800 + 314_368 + 39_296
+        );
+    }
+
+    /// Splash `KvCache::stateBelow` looks at strict ancestors only.
+    /// Mutation SB1 (the entry's own block counts) → red.
+    #[test]
+    fn state_below_sees_strict_ancestors_only() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 48);
+        let chain = block_chain(Lineage::text(&a, 0), BS);
+        assert_eq!(chain.len(), 3);
+        store
+            .insert(Lineage::text(&a, 0), fx.state("a"), StateClass::Ordinary)
+            .unwrap();
+        assert!(store.state_below(chain[0]));
+        assert!(store.state_below(chain[1]));
+        assert!(!store.state_below(chain[2]));
+        assert!(!store.state_below(0x5eed));
+    }
+
+    #[test]
+    fn new_store_keeps_the_block_size() {
+        assert_eq!(Store::new(16).block_size(), 16);
+        assert_eq!(Store::new(0).block_size(), 1);
+    }
+}

@@ -1441,7 +1441,7 @@ pub(super) mod tests {
             }
         }
         check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107));
-        check(|| crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107));
+        check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(8107));
     }
 
     /// A native error at the greedy verify eval fails the speculative row with
@@ -1622,7 +1622,7 @@ pub(super) mod tests {
                 |inner, seq| inner.mtp_state().owners.contains_key(&seq),
             );
             check(
-                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107),
+                crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(8107),
                 replay,
                 |inner, seq| inner.mtp_state().owners.contains_key(&seq),
             );

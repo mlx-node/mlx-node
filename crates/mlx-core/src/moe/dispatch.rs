@@ -7,9 +7,10 @@
 //! expert at a time instead of rebinding the RHS per slot.
 //!
 //! This module owns the canonical implementation. Model-specific call
-//! sites (see `crate::models::privacy_filter::experts` and
-//! `crate::models::qwen3_5_moe::switch_glu`) import these helpers
-//! instead of carrying their own near-identical copies.
+//! sites (see `crate::moe::switch`, `crate::models::privacy_filter::experts`,
+//! `crate::models::gemma4::moe`, `crate::models::inkling2::moe`, and
+//! `crate::utils::functional`) import these helpers instead of carrying
+//! their own near-identical copies.
 //!
 //! The matching `do_sort = indices.size() >= 64` heuristic lives at the
 //! call sites because it depends on shape introspection they already

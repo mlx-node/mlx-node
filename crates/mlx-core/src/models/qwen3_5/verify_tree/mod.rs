@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 mod budget;
+pub(crate) mod cuda;
 mod lattice;
 mod sam;
 #[cfg(test)]
@@ -34,7 +35,8 @@ pub(crate) use lattice::DraftLattice;
 pub(crate) use sam::LookupMatchInfo;
 pub(crate) use sam::{LookupAcceptance, LookupAgreement, LookupIndex};
 pub(crate) use tree::{
-    TreeCostModel, TreeDeviceViews, VerifyTree, build_verify_tree, build_verify_tree_cost_aware,
+    TreeCostModel, TreeDeviceViews, TreeWalkResult, VerifyTree, build_verify_tree,
+    build_verify_tree_cost_aware,
 };
 
 /// Maximum nodes in one verification tree (root anchor + up to 15 speculative

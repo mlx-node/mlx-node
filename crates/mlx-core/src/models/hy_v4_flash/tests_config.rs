@@ -5,10 +5,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::config::{Attn, DEFAULT_CONTEXT_CAP};
-use super::header::{self, Header};
 use super::scan::{ENGRAM_TABLE, ExpertClass, MtpLayer, Role, Scan};
 use super::test_support::{fixture, j_u64, j_u64s, j_usize, j_usizes, real_scan};
-use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+use crate::utils::gguf::{
+    GgufFile, GgufMetaValue, GgufTensorInfo, GgufTensorType, parse_gguf_reader,
+};
 
 #[derive(Clone)]
 enum Kv {
@@ -121,14 +122,10 @@ impl Fixture {
         let data_start = (b.len() as u64).div_ceil(ALIGN) * ALIGN;
         (b, data_start + off)
     }
-    fn header_with_len(&self, shrink: u64) -> Header {
+    fn header_with_len(&self, shrink: u64) -> (GgufFile, u64) {
         let (bytes, len) = self.bytes_and_len();
-        let (gguf, bools) = header::parse(&mut Cursor::new(bytes)).unwrap();
-        Header {
-            gguf,
-            bools,
-            file_len: len - shrink,
-        }
+        let gguf = parse_gguf_reader(Cursor::new(bytes)).unwrap();
+        (gguf, len - shrink)
     }
     fn scan(&self) -> napi::Result<Scan> {
         Scan::from_headers(&[PathBuf::from("tiny.gguf")], &[self.header_with_len(0)])
@@ -581,12 +578,25 @@ fn truncated_file_is_refused() {
 #[test]
 fn bool_arrays_survive_the_header_walk() {
     let (bytes, _) = tiny().bytes_and_len();
-    let (gguf, bools) = header::parse(&mut Cursor::new(bytes)).unwrap();
-    let swa = &bools["hy_v4_flash.attention.sliding_window_pattern"];
-    let ix = &bools["hy_v4_flash.attention.indexer.types"];
+    let gguf = parse_gguf_reader(Cursor::new(bytes)).unwrap();
+    let swa = gguf
+        .metadata
+        .get("hy_v4_flash.attention.sliding_window_pattern")
+        .and_then(GgufMetaValue::as_bool_array)
+        .unwrap();
+    let ix = gguf
+        .metadata
+        .get("hy_v4_flash.attention.indexer.types")
+        .and_then(GgufMetaValue::as_bool_array)
+        .unwrap();
     assert_eq!(swa, &[false, true, true, false, false]);
     assert_eq!(ix, &[true, false, false, true]);
-    assert_eq!((bools.len(), gguf.tensors.len()), (2, tiny_tensors().len()));
+    let bool_arrays = gguf
+        .metadata
+        .values()
+        .filter(|v| v.as_bool_array().is_some())
+        .count();
+    assert_eq!((bool_arrays, gguf.tensors.len()), (2, tiny_tensors().len()));
 }
 
 fn hex_bits(v: &Value) -> u32 {

@@ -20,8 +20,8 @@ pub use persistence::{
     QuantizationConfig, load_from_directory,
 };
 pub use quantized_linear::{
-    LoadedProj, PrivacyFilterQuantizedSwitchLinear, QuantizedLinear, TensorQuantParams, project_2d,
-    project_moe,
+    LinearProj, QuantizedLinear, QuantizedSwitchLinear, SwitchLinear, SwitchProj,
+    TensorQuantParams, load_linear_proj, load_moe_proj,
 };
 pub use spans::{Entity, extract_spans};
 pub use transformer::Block;

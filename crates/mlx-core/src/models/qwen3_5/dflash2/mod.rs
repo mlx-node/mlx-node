@@ -36,7 +36,7 @@ use compiled::CompiledDraft;
 pub(crate) use config::DFlash2Config;
 use config::DraftExecutionPolicy;
 #[cfg(test)]
-use layers::{DFlash2Attention, DFlash2Mlp, GroupedDynamicCausalConv, non_causal_sliding_mask};
+use layers::{DFlash2Attention, DFlash2Mlp, GroupedDynamicCausalConv};
 use layers::{DFlash2Layer, DraftLayerOutput, DraftResidual};
 #[cfg(test)]
 use loader::{
@@ -58,6 +58,9 @@ pub(crate) use test_helpers::{
 };
 
 use crate::array::MxArray;
+#[cfg(test)]
+use crate::engine::dspark_turn::non_causal_sliding_mask;
+use crate::engine::dspark_turn::parallel_query_ids;
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::nn::{Embedding, RMSNorm};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
@@ -68,13 +71,6 @@ pub(crate) const DFLASH2_DRAFT_PROPOSALS: usize = 7;
 /// Rows of the one verify graph: the anchor and the proposals (Splash
 /// `SPLASH_TARGET_VERIFY_ROWS`).
 pub(crate) const DFLASH2_VERIFY_ROWS: usize = DFLASH2_DRAFT_PROPOSALS + 1;
-
-fn parallel_query_ids(anchor: u32, mask: usize, draft_len: usize) -> Vec<i32> {
-    let mut ids = Vec::with_capacity(draft_len.saturating_add(1));
-    ids.push(anchor as i32);
-    ids.resize(draft_len.saturating_add(1), mask as i32);
-    ids
-}
 
 /// What a draft must match in its target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,18 +182,12 @@ impl DFlash2Model {
                 .unwrap_or(target.intermediate_size),
         ];
         let supported = self.config.supports_moe_execution_defaults(target_profile);
-        let source_conv_supported = self.config.supports_source_conv(target_profile);
         // Also safe if a future internal caller changes policy after tracing:
         // erase captured graphs without clearing a prior fail-closed latch.
         self.invalidate_compiled();
-        self.execution_policy = self
-            .execution_policy
-            .with_moe_profile(supported)
-            .with_source_conv_profile(source_conv_supported);
+        self.execution_policy = self.execution_policy.with_moe_profile(supported);
         for layer in &mut self.layers {
             layer.attention.tensor_attention_enabled = self.execution_policy.tensor_attention();
-            layer.attention_conv.source_enabled = self.execution_policy.source_conv();
-            layer.mlp_conv.source_enabled = self.execution_policy.source_conv();
         }
     }
 

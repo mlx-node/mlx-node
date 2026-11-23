@@ -27,9 +27,7 @@ use super::moe::{RowKind, per_row, qlinear};
 use super::ops::{fast_partial_rope_tail, rms_norm, rope_inv_freqs};
 use super::weights::{Dense, IndexerWeights};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::linear;
-use crate::models::deepseek_v41::indexer::INDEX_CHUNK_BYTES;
-use crate::models::deepseek_v41::ops::inv_freqs;
+use crate::models::moe_common::{INDEX_CHUNK_BYTES, inv_freqs, linear};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 fn bad(msg: impl std::fmt::Display) -> Error {

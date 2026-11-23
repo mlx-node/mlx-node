@@ -9,8 +9,43 @@
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
-use metal::{MTLResourceOptions, MTLSize};
+use metal::{Library, MTLResourceOptions, MTLSize};
 use mlx_paged_attn::metal::MetalState;
+use std::path::PathBuf;
+
+const GROUPED_QWEN35_REDUCE_KERNEL: &str = "paged_attention_grouped_bfloat16_hs256_striped_reduce";
+const GROUPED_D512_REDUCE_KERNEL: &str = "paged_attention_grouped_bfloat16_hs512_striped_reduce";
+
+/// Locate `mlx-sys`'s prebuilt `paged_attn.metallib`.
+fn load_paged_attn_library(state: &MetalState) -> Library {
+    let mut candidates = Vec::new();
+    if let Some(env_path) = std::env::var_os("MLX_PAGED_ATTN_METALLIB") {
+        candidates.push(PathBuf::from(env_path));
+    }
+    candidates.push(PathBuf::from(mlx_sys::PAGED_ATTN_METALLIB_PATH));
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin_dir) = exe.parent()
+    {
+        candidates.push(bin_dir.join("paged_attn.metallib"));
+        candidates.push(bin_dir.join("Resources").join("paged_attn.metallib"));
+        if let Some(parent) = bin_dir.parent() {
+            candidates.push(parent.join("paged_attn.metallib"));
+        }
+    }
+    let path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| panic!("paged_attn.metallib not found; searched {candidates:?}"));
+    let bytes: &'static [u8] = Box::leak(
+        std::fs::read(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+            .into_boxed_slice(),
+    );
+    state
+        .device
+        .new_library_with_data(bytes)
+        .unwrap_or_else(|e| panic!("failed to load {}: {e}", path.display()))
+}
 
 const NUM_HEADS: usize = 3;
 const QUERY_ROWS: usize = 2;
@@ -116,7 +151,7 @@ impl ReducerInputs {
     }
 }
 
-fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
+fn run_reducer_case(state: &MetalState, library: &Library, head_size: usize, num_stripes: usize) {
     let inputs = ReducerInputs::new(num_stripes, head_size);
     let expected = inputs.host_reference(num_stripes, head_size);
 
@@ -158,13 +193,19 @@ fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
         .expect("test buffer-with-value allocation must succeed");
 
     let pipeline_name = match head_size {
-        256 => MetalState::paged_attention_grouped_qwen35_reduce_kernel_name(),
-        512 => MetalState::paged_attention_grouped_d512_reduce_kernel_name(),
+        256 => GROUPED_QWEN35_REDUCE_KERNEL,
+        512 => GROUPED_D512_REDUCE_KERNEL,
         _ => panic!("unsupported grouped reducer head size {head_size}"),
     };
+    let function = library
+        .get_function(pipeline_name, None)
+        .unwrap_or_else(|e| {
+            panic!("kernel '{pipeline_name}' not found in paged_attn.metallib: {e}")
+        });
     let pipeline = state
-        .get_pipeline(pipeline_name)
-        .expect("grouped striped reducer pipeline must load");
+        .device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap_or_else(|e| panic!("failed to create pipeline for '{pipeline_name}': {e}"));
     let command_buffer = state
         .command_queue
         .try_new_command_buffer()
@@ -236,6 +277,8 @@ fn grouped_striped_reducers_match_host_reference() {
         Err(error) => panic!("unexpected MetalState::get failure: {error}"),
     };
 
+    let library = load_paged_attn_library(state);
+
     // Keep allocations and GPU work sequential. Each case drops all of its
     // buffers before the next representative production stripe count begins.
     for (head_size, stripe_counts) in [
@@ -243,7 +286,7 @@ fn grouped_striped_reducers_match_host_reference() {
         (512, &[4, 8, 16, 32, 64, 128][..]),
     ] {
         for &num_stripes in stripe_counts {
-            run_reducer_case(state, head_size, num_stripes);
+            run_reducer_case(state, &library, head_size, num_stripes);
         }
     }
 }

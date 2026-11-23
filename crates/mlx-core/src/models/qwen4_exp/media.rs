@@ -21,19 +21,17 @@ pub(super) const IMAGE_LIMITS: crate::vision::qwen::prompt::ImageLimits =
     };
 
 pub(super) fn image_processor() -> QwenImageProcessor {
-    QwenImageProcessor::new(Some(
-        crate::models::paddleocr_vl::processing::ImageProcessorConfig {
-            min_pixels: 65536,
-            max_pixels: 262144,
-            patch_size: 16,
-            temporal_patch_size: 2,
-            merge_size: 2,
-            image_mean: vec![0.5; 3],
-            image_std: vec![0.5; 3],
-            do_rescale: true,
-            do_normalize: true,
-        },
-    ))
+    QwenImageProcessor::new(Some(crate::vision::processing::ImageProcessorConfig {
+        min_pixels: 65536,
+        max_pixels: 262144,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        merge_size: 2,
+        image_mean: vec![0.5; 3],
+        image_std: vec![0.5; 3],
+        do_rescale: true,
+        do_normalize: true,
+    }))
 }
 
 pub struct Vision {
