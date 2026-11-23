@@ -306,10 +306,10 @@ jobs:
       matrix:
         include:
           - shard: qwen4_exp
-            test_args: models::qwen4_exp::
+            test_args: 'models::qwen4_exp::'
             run_doc: false
           - shard: core
-            test_args: -- --skip models::qwen4_exp::
+            test_args: '-- --skip models::qwen4_exp::'
             run_doc: true
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
