@@ -16,6 +16,8 @@ import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vite-plus/test';
 
+import { modelsDirUnavailableMessage } from '../../server/src/host/paths.js';
+import { ApiError } from '../src/api/errors.js';
 import { handleModels } from '../src/api/handlers/models.js';
 import { type CatalogItem, catalogSlug, catalogWithState } from '../src/catalog.js';
 import {
@@ -27,6 +29,7 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
+  modelsDirUnavailable,
   readCompletion,
   summarizeForeignEntry,
 } from '../src/models.js';
@@ -147,6 +150,44 @@ describe('GET /api/models', () => {
     const missing = await handleModels(paths(join(modelsDir, 'does-not-exist')));
     expect(missing.models).toEqual([]);
     expect(missing.host.diskFreeBytes).toBeNull();
+  });
+});
+
+describe('a models directory that is a link to a missing disk', () => {
+  it('is an error with the plain sentence, not an empty library', async () => {
+    const link = join(modelsDir, 'models-link');
+    const target = join(modelsDir, 'Volumes', 'Disk', 'models');
+    symlinkSync(target, link);
+    // The engine and the CLI say the same words (`ModelsDirUnavailableError`).
+    const sentence = modelsDirUnavailableMessage(link, target);
+    expect(sentence).toBe(
+      `The models folder ${link} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`,
+    );
+    expect(modelsDirUnavailable(link)).toBe(sentence);
+    let caught: unknown;
+    try {
+      await handleModels({
+        modelsDir: link,
+        tracesDir: '',
+        runtimeDir: '',
+        cacheRoot: undefined,
+        prefixCacheRoot: undefined,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({ code: 'E_UNAVAILABLE', message: sentence, reason: 'models-dir-unavailable' });
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(modelsDir, 'Volumes'))).toBe(false);
+  });
+
+  it('is not raised for a missing folder, a live link or a real folder', () => {
+    expect(modelsDirUnavailable(join(modelsDir, 'does-not-exist'))).toBeNull();
+    expect(modelsDirUnavailable(modelsDir)).toBeNull();
+    const live = join(modelsDir, 'live-link');
+    symlinkSync(modelsDir, live);
+    expect(modelsDirUnavailable(live)).toBeNull();
   });
 });
 

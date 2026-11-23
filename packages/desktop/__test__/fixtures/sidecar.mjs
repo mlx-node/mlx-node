@@ -33,6 +33,13 @@ function errSync(text) {
   writeSync(2, `${text}\n`);
 }
 
+if (MODE === 'start-failed') {
+  // The line `runSidecar` writes when `createHost` rejects (`STARTUP_FAILURE_PREFIX`).
+  errSync('fixture: an earlier line');
+  errSync(`[mlx] inference host failed to start: ${process.env.MLX_TEST_START_FAILURE ?? 'fixture reason'}`);
+  process.exit(Number(process.env.MLX_TEST_EXIT_CODE ?? 78));
+}
+
 if (MODE === 'crash-now') {
   errSync('fixture: dying on purpose');
   process.exit(Number(process.env.MLX_TEST_EXIT_CODE ?? 7));

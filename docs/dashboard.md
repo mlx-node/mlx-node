@@ -230,6 +230,14 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the crawler choice (Firecrawl or Off), with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry)                                        | `/providers`                                                                                                 |
 | `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                                                                    | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
 
+A models folder that is a link to a missing target (a folder on a disk that is not connected) is not an empty
+library: `GET /api/models` answers 503 `models-dir-unavailable` with "The models folder … is a link to …, which is not
+available. Connect that disk, or change the link, then try again." The Models page shows it in place of the table, and
+`/` opens Models rather than Onboarding. Install answers the same 503 before a job exists, and a job whose disk goes
+away fails with the same sentence; neither makes a folder in place of the link. The engine (`resolveModelsDir`,
+`ModelsDirUnavailableError`) and the CLI say the same words, and the desktop sidecar exits 78 on it, so the
+supervisor stops at once instead of retrying.
+
 A System One run changes only the Output card. The four metric tiles are always there and show "—" when the mode
 on screen has no result. The Output status line is always there too, with three faces in one box: rest ("No run yet"
 or "Last run · model · time"), running, and failed. A failed run puts its text in that line, removes the answers and
@@ -237,6 +245,10 @@ shows each requested row with "—", so answers of an earlier input never sit un
 when the line is not in view. Nothing in the card reacts before `--duration-hold`, so a run that fails at once
 changes nothing on a repeat. The Highlights tab marks character ranges in the request text only: a run with only an
 image or PDF has no text to mark, and the tab says so and shows the image.
+
+The Engine alerts for `restarting` and `failed` add "Reason: …" when the last start failed with a reason: the
+message of the sidecar's `[mlx] inference host failed to start:` line, as `failureReason` of `supervisor.json`. MAIN
+writes it only while the state is `restarting` or `failed`, so a good start, a stop or a new start clears it.
 
 The Engine "In flight" card is a table with fixed columns (Model, Phase, Progress, Started, Context) under a
 header that counts turns per served model ("2 turns on 1 model"). A row names the model that serves the turn
@@ -1171,8 +1183,10 @@ day's file.
 The desktop MAIN process writes `~/.mlx-node/desktop/supervisor.json`
 (`packages/desktop/src/main/supervisor-state-file.ts`): supervisor state (`stopped`, `starting`, `running`,
 `restarting`, `failed`, `lying`), sidecar pid, generation, the restart policy's `streak` and `shortLivedFailures`,
-last exit verdict, health and the native error count. Exit reasons, stderr and native error text are never written. A
-reader ignores the file when MAIN's pid is dead.
+last exit verdict, health and the native error count. Exit reasons, stderr and native error text are never written;
+the one text is `failureReason`, the message of the sidecar's start-failure line (written before any request runs),
+one line of at most 300 characters, set only while the state is `restarting` or `failed`. A reader ignores the file
+when MAIN's pid is dead.
 
 ### The index
 

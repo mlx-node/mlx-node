@@ -1166,6 +1166,7 @@ export function writeSupervisorFile(home: string, mainPid: number, sidecarPid: n
     nativeErrorsCapped: false,
     lastNativeErrorContext: null,
     lastNativeErrorAt: null,
+    failureReason: null,
   };
   writeJson(supervisorPath, state);
 }

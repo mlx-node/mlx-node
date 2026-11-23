@@ -165,6 +165,7 @@ describe('Overview engine panel', () => {
           nativeErrorsCapped: false,
           lastNativeErrorContext: null,
           lastNativeErrorAt: null,
+          failureReason: null,
           writtenAt: Date.now(),
         },
       }),

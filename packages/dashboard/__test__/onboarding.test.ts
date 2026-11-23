@@ -12,7 +12,7 @@ import { MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { DownloadEvent } from '../src/download.js';
 import type { ApiCall } from '../src/runtime.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
-import { deferred, renderPage, type RenderedPage, sequence, STUB_FAILURE, stubApi } from './render.js';
+import { deferred, renderPage, type RenderedPage, sequence, STUB_FAILURE, stubApi, stubError } from './render.js';
 
 const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   ...item,
@@ -117,6 +117,26 @@ describe('first model onboarding', () => {
     const offered = [...page.container.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((el) => el.value);
     expect(offered).toEqual((offeredFloored ? visible : unfloored).map((item) => item.hfRepo));
     if (offeredFloored) expect(page.text()).not.toContain("larger than this Mac's memory");
+  });
+
+  it('opens the Models page, not onboarding, when the models folder is a link to a missing disk', async () => {
+    const sentence =
+      'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.';
+    dispose = stubApi({
+      ...routes(),
+      '/models': stubError('E_UNAVAILABLE', sentence, 'models-dir-unavailable'),
+    });
+    page = await renderPage(createElement(App), (text) => text.includes(sentence));
+    // Mutation: drop the reason branch from the gate → it stays on the Overview → red.
+    expect(window.location.pathname).toBe('/models');
+    expect(page.text()).not.toContain('No local models yet');
+    expect(page.text()).not.toContain('Download model');
+  });
+
+  it('keeps any other model list failure on the Overview', async () => {
+    dispose = stubApi({ ...routes(), '/models': stubError('E_UNAVAILABLE', 'Dashboard database is unavailable') });
+    page = await renderPage(createElement(App), (text) => text.includes('Overview'));
+    expect(window.location.pathname).toBe('/');
   });
 
   it('keeps returning users in their existing workspace', async () => {

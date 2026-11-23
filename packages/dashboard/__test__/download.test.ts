@@ -5543,3 +5543,115 @@ describe('Update: adopt a folder the app did not create, in place', () => {
     expect(isModelInstalled(dir)).toBe(true);
   });
 });
+
+describe('a models directory that is a link to a missing disk', () => {
+  let root: string;
+  let link: string;
+  let target: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'dash-dl-link-'));
+    link = join(root, 'models');
+    target = join(root, 'Volumes', 'Disk', 'models');
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const sentence = (): string =>
+    `The models folder ${link} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`;
+
+  it('refuses Install with the plain sentence and writes nothing anywhere', async () => {
+    symlinkSync(target, link);
+    hub.modelInfoUsesFetch = true;
+    const fetched: string[] = [];
+    const inner = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 });
+    const m = new DownloadManager({
+      modelsDir: link,
+      cacheDir,
+      fetchImpl: (input, init) => {
+        fetched.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+        return inner(input, init);
+      },
+    });
+    expect(() => m.start(REPO)).toThrow(sentence());
+    const ctx = { downloads: m, modelsDir: link } as unknown as ApiContext;
+    const res = await dispatch(ctx, {
+      method: 'POST',
+      pathname: '/api/downloads',
+      query: new URLSearchParams(),
+      body: { repo: REPO },
+    });
+    expect(res.status).toBe(503);
+    expect(res.ok ? '' : res.message).toBe(sentence());
+    expect(m.jobs()).toEqual([]);
+    // No folder in place of the link, none at its target, nothing in the HF cache, no request.
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+    expect(readdirSync(cacheDir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(hub.downloaded).toEqual([]);
+
+    await expect(m.planAdoption(REPO)).rejects.toThrow(sentence());
+    const plan = await dispatch(ctx, {
+      method: 'POST',
+      pathname: '/api/downloads/adopt-plan',
+      query: new URLSearchParams(),
+      body: { repo: REPO },
+    });
+    expect(plan.status).toBe(503);
+    expect(plan.ok ? '' : plan.message).toBe(sentence());
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+    expect(fetched).toEqual([]);
+
+    // The disk is back: the same Install runs to the end into the link target.
+    mkdirSync(target, { recursive: true });
+    const id = m.start(REPO);
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
+    expect(events.map((event) => event.type)).toContain('done');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readdirSync(target)).toContain(REPO.split('/').pop()!.toLowerCase());
+  });
+
+  it('fails a running and a queued job whose disk went away with the same sentence', async () => {
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, link);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 });
+    let parked = false;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!parked && url.includes('/api/models/')) {
+        parked = true;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir: link, cacheDir, fetchImpl: gated });
+    const first = m.start(REPO);
+    const second = m.start(REPO_OTHER);
+    const events: DownloadEvent[] = [];
+    m.subscribe(first, (event) => events.push(event));
+    m.subscribe(second, (event) => events.push(event));
+    await waitFor(() => parked);
+
+    // The disk goes away while the first job waits on the network.
+    rmSync(join(root, 'Volumes'), { recursive: true, force: true });
+    release!();
+    await waitFor(() => events.filter((event) => event.type === 'error' || event.type === 'done').length === 2);
+
+    for (const id of [first, second]) {
+      const error = events.find((event) => event.type === 'error' && event.id === id);
+      expect(error?.type === 'error' ? error.message : '', id === first ? 'running' : 'queued').toBe(sentence());
+    }
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+  });
+});

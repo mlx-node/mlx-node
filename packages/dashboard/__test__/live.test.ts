@@ -101,6 +101,7 @@ function supervisorFile(extra: Record<string, unknown> = {}): Record<string, unk
     nativeErrorsCapped: true,
     lastNativeErrorContext: 'array_eval',
     lastNativeErrorAt: T - 100,
+    failureReason: null,
     ...extra,
   };
 }
@@ -210,6 +211,26 @@ describe('live: judging a writer', () => {
       withMain.close();
       withoutMain.close();
     }
+  });
+
+  it('reads the failure reason: a string up to 300 characters, null, or no reason when absent', () => {
+    const reason = 'The models folder /h/.mlx-node/models is a link to /Volumes/Disk/models, which is not available.';
+    expect(parseSupervisorFile(supervisorFile({ state: 'failed', failureReason: reason }), () => true)).toMatchObject({
+      state: 'failed',
+      failureReason: reason,
+    });
+    expect(parseSupervisorFile(supervisorFile(), () => true)?.failureReason).toBeNull();
+    expect(parseSupervisorFile(supervisorFile({ failureReason: 'x'.repeat(300) }), () => true)?.failureReason).toBe(
+      'x'.repeat(300),
+    );
+    // Mutation: accept any length → red.
+    expect(
+      parseSupervisorFile(supervisorFile({ failureReason: 'x'.repeat(301) }), () => true)?.failureReason,
+    ).toBeNull();
+    const older = supervisorFile({ state: 'failed', streak: 6 });
+    delete older.failureReason;
+    expect(parseSupervisorFile(older, () => true)).toMatchObject({ state: 'failed', streak: 6, failureReason: null });
+    expect(parseSupervisorFile(supervisorFile({ failureReason: 7 }), () => true)).toBeNull();
   });
 
   it('the default liveness probe does not import the server package', () => {

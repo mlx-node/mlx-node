@@ -18,10 +18,13 @@ import { AddressInfo } from 'node:net';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { ModelsDirUnavailableError } from '../../server/src/host/paths.js';
+import { STARTUP_FAILURE_PREFIX } from '../src/inference/exit-codes.js';
 import {
   endpointModels,
   EXIT_STARTUP_FAILED,
   handleSidecarRequest,
+  isPermanentStartupFailure,
   NoParentChannelError,
   resolveParentChannel,
   runSidecar,
@@ -231,6 +234,21 @@ describe('the readiness handshake', () => {
     // fast exit turns it into a visible `failed` with the reason attached.
     expect(h.exits).toEqual([EXIT_STARTUP_FAILED]);
     expect(h.stderr.join('\n')).toContain('No models discovered');
+  });
+
+  it('exits 78 with the plain sentence when the models folder is a link to a missing disk', async () => {
+    // Mutation: drop the name from isPermanentStartupFailure → red (exits 1, six retries).
+    const unavailable = new ModelsDirUnavailableError('/Users/x/.mlx-node/models', '/Volumes/Disk/models');
+    expect(isPermanentStartupFailure(unavailable)).toBe(true);
+    const h = harness(() => Promise.reject(unavailable));
+    await runSidecar(h.deps);
+
+    expect(h.exits).toEqual([EXIT_STARTUP_FAILED]);
+    // The one line MAIN reads the reason from.
+    expect(h.stderr).toEqual([`${STARTUP_FAILURE_PREFIX}${unavailable.message}`]);
+    expect(unavailable.message).toBe(
+      'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.',
+    );
   });
 
   it('exits 1, not 78, for a startup failure a retry could clear', async () => {

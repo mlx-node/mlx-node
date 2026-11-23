@@ -12,10 +12,30 @@
  * and on a headless box the dlopen is a liability rather than a cost.
  */
 
-import { mkdirSync, readFileSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
+import { lstat, mkdir, readFile, readlink, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+
+/**
+ * The models folder is a link whose target does not exist, such as a folder on
+ * a disk that is not connected. Nothing can be served or downloaded until the
+ * target is back, so the desktop sidecar treats it as a permanent start failure.
+ */
+export class ModelsDirUnavailableError extends Error {
+  constructor(
+    readonly modelsDir: string,
+    readonly linkTarget: string,
+  ) {
+    super(modelsDirUnavailableMessage(modelsDir, linkTarget));
+    this.name = 'ModelsDirUnavailableError';
+  }
+}
+
+/** The user-facing text of {@link ModelsDirUnavailableError}; the dashboard's `modelsDirUnavailable` says the same. */
+export function modelsDirUnavailableMessage(modelsDir: string, linkTarget: string): string {
+  return `The models folder ${modelsDir} is a link to ${linkTarget}, which is not available. Connect that disk, or change the link, then try again.`;
+}
 
 /** Absolute path to `$HOME/.mlx-node`. Used for `config.json` lookup and as the default parent of `models/`. */
 export function resolveMlxNodeHome(): string {
@@ -31,7 +51,8 @@ export function resolveMlxNodeHome(): string {
  *   3. `modelsDir` field in `$HOME/.mlx-node/config.json`
  *   4. `$HOME/.mlx-node/models`
  *
- * Creates the chosen directory (recursive) before returning.
+ * Creates the chosen directory (recursive) before returning. Throws
+ * {@link ModelsDirUnavailableError} when it is a link whose target is missing.
  */
 export function resolveModelsDir(explicit?: string): string {
   if (explicit && explicit.length > 0) {
@@ -113,11 +134,79 @@ function parseModelsDirConfig(raw: string, configPath: string): string | undefin
 }
 
 function ensureDir(path: string): string {
-  mkdirSync(path, { recursive: true });
+  try {
+    mkdirSync(path, { recursive: true });
+  } catch (error) {
+    throw explainMkdirError(error, path, missingLinkTarget(path));
+  }
   return path;
 }
 
 async function ensureDirAsync(path: string): Promise<string> {
-  await mkdir(path, { recursive: true });
+  try {
+    await mkdir(path, { recursive: true });
+  } catch (error) {
+    throw explainMkdirError(error, path, await missingLinkTargetAsync(path));
+  }
   return path;
+}
+
+/** Where `path` points when it is a link whose target is missing (`lstat` a link, `stat` ENOENT); else null. */
+function missingLinkTarget(path: string): string | null {
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  try {
+    statSync(path);
+    return null;
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') return null;
+  }
+  try {
+    return resolve(dirname(path), readlinkSync(path));
+  } catch {
+    return null;
+  }
+}
+
+async function missingLinkTargetAsync(path: string): Promise<string | null> {
+  try {
+    if (!(await lstat(path)).isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  try {
+    await stat(path);
+    return null;
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') return null;
+  }
+  try {
+    return resolve(dirname(path), await readlink(path));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A missing link target gets its own error. A file in the way (EEXIST for the
+ * folder itself, ENOTDIR for a folder above it) gets one sentence more, since
+ * Node's text names only the syscall. Every other error is left as it is.
+ */
+function explainMkdirError(error: unknown, path: string, linkTarget: string | null): unknown {
+  if (linkTarget !== null) return new ModelsDirUnavailableError(path, linkTarget);
+  const code = errorCode(error);
+  if (error instanceof Error && (code === 'EEXIST' || code === 'ENOTDIR')) {
+    return new Error(
+      `${error.message}. The models folder ${path} cannot be made: it, or a folder above it, is a file.`,
+      { cause: error },
+    );
+  }
+  return error;
+}
+
+function errorCode(error: unknown): unknown {
+  return typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
 }

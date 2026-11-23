@@ -1065,6 +1065,8 @@ export interface SupervisorLive {
   nativeErrorsCapped: boolean;
   lastNativeErrorContext: string | null;
   lastNativeErrorAt: number | null;
+  /** Why the last start failed, one line; set only while `restarting` or `failed`. */
+  failureReason: string | null;
   writtenAt: number;
 }
 

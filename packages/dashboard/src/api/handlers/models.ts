@@ -11,6 +11,7 @@ import {
   deleteLocalModel,
   isModelPresent,
   isRegularFile,
+  modelsDirUnavailable,
   type ModelsResponse,
 } from '../../models.js';
 import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
@@ -54,6 +55,10 @@ function diskFreeBytes(dir: string): number | null {
 }
 
 export async function handleModels(ctx: ApiPaths): Promise<ModelsResponse> {
+  // A link to a missing disk is not an empty library: an empty list would read as "no model installed" and send a
+  // first run to Onboarding. The page branches on the reason.
+  const unavailable = modelsDirUnavailable(ctx.modelsDir);
+  if (unavailable !== null) throw new ApiError('E_UNAVAILABLE', unavailable, 'models-dir-unavailable');
   const { models, companions, warnings } = discoverLocalModels(ctx.modelsDir);
   const served = await servedIdsByEntry(ctx.modelsDir);
   for (const model of models) model.servedIds = served.get(model.name) ?? [];

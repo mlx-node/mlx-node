@@ -1,6 +1,6 @@
 /**
- * Sidecar exit codes shared between the child that exits and MAIN that judges
- * the exit.
+ * Sidecar exit codes, and the start-failure line, shared between the child
+ * that exits and MAIN that judges the exit.
  *
  * A leaf with no imports on purpose: `main/supervisor/state.ts` reads this to
  * decide restartability, and it must not pull in `sidecar.ts` — that module
@@ -17,3 +17,10 @@
  * problem that retrying an unchanged child cannot fix.
  */
 export const EXIT_STARTUP_FAILED = 78;
+
+/**
+ * The start of the one stderr line the child writes when `createHost` rejects;
+ * the rest of the line is the error's message. MAIN finds it in the stderr tail
+ * and shows the message as the failure's reason.
+ */
+export const STARTUP_FAILURE_PREFIX = '[mlx] inference host failed to start: ';

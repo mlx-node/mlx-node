@@ -1,4 +1,9 @@
-import { DownloadConflictError, DownloadsClosedError, type ReplaceBlocker } from '../../download.js';
+import {
+  DownloadConflictError,
+  DownloadsClosedError,
+  ModelsDirUnavailableError,
+  type ReplaceBlocker,
+} from '../../download.js';
 import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
 import { requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
@@ -69,7 +74,9 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
   } catch (err) {
     // The manager is draining for shutdown: the request is well-formed, the
     // server is simply going away, so answer 503 rather than blaming the caller.
-    if (err instanceof DownloadsClosedError) throw ApiError.unavailable(err.message);
+    if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
+      throw ApiError.unavailable(err.message);
+    }
     if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Failed to start download');
   }
@@ -85,7 +92,9 @@ export async function handleDownloadAdoptPlan(ctx: MainApiContext, req: ApiReque
   try {
     return await ctx.downloads.planAdoption(repo);
   } catch (err) {
-    if (err instanceof DownloadsClosedError) throw ApiError.unavailable(err.message);
+    if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
+      throw ApiError.unavailable(err.message);
+    }
     if (err instanceof DownloadConflictError) throw ApiError.conflict(err.message);
     throw ApiError.badRequest(err instanceof Error ? err.message : 'Could not check the folder');
   }

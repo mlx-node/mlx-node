@@ -108,6 +108,7 @@ import {
   isSafeRelPath,
   isWeightFile,
   modelsChildPath,
+  modelsDirUnavailable,
   readCompletion,
   sameForeignEntry,
   summarizeForeignEntry,
@@ -583,6 +584,20 @@ export class DownloadsClosedError extends Error {
     super('The dashboard is shutting down; not accepting new downloads');
     this.name = 'DownloadsClosedError';
   }
+}
+
+/** The models directory is a link whose target is missing ({@link modelsDirUnavailable}). The API answers 503. */
+export class ModelsDirUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelsDirUnavailableError';
+  }
+}
+
+/** Throw {@link ModelsDirUnavailableError} when the models directory is a link to a missing target. */
+function assertModelsDirAvailable(modelsDir: string): void {
+  const unavailable = modelsDirUnavailable(modelsDir);
+  if (unavailable !== null) throw new ModelsDirUnavailableError(unavailable);
 }
 
 /**
@@ -1282,6 +1297,8 @@ export class DownloadManager {
     if (!catalogDownloadRepos().includes(repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
+    // Refused before a job exists: nothing is fetched into the HF cache and nothing is made under the link.
+    assertModelsDirAvailable(this.modelsDir);
     const asked = opts?.replaceBlocker;
     const token = opts?.adopt;
     const active = this.activeJobFor(repo);
@@ -1361,6 +1378,7 @@ export class DownloadManager {
    */
   async planAdoption(repo: string): Promise<AdoptPlanSummary> {
     if (this.closed) throw new DownloadsClosedError();
+    assertModelsDirAvailable(this.modelsDir);
     if (!catalogDownloadRepos().includes(repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
@@ -2111,7 +2129,8 @@ export class DownloadManager {
           `[downloads] job ${job.id} (${job.repo}) failed:`,
           truncateMessage(error instanceof Error ? (error.stack ?? error.message) : String(error)),
         );
-        let message = truncateMessage(describeFailure(error));
+        // A disk that went away under a queued or running job fails it with the plain sentence, not mkdir's ENOTDIR.
+        let message = truncateMessage(modelsDirUnavailable(this.modelsDir) ?? describeFailure(error));
         if (job.replace !== null && !job.swapStarted) message = withNothingRemoved(message);
         if (job.adopt !== null && !job.swapStarted) message = withNothingChanged(message);
         this.emit({ type: 'error', id: job.id, message });

@@ -1268,6 +1268,32 @@ export function defaultModelsDir(): string {
   return join(home, 'models');
 }
 
+/**
+ * The plain sentence for a models directory that is a link whose target is missing (a folder on a disk that is not
+ * connected); null for anything else, including a directory that does not exist yet. The same text as
+ * `ModelsDirUnavailableError` in `@mlx-node/server/host/paths`, which the engine and the CLI throw.
+ */
+export function modelsDirUnavailable(modelsDir: string): string | null {
+  try {
+    if (!lstatSync(modelsDir).isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  try {
+    statSync(modelsDir);
+    return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+  }
+  let target: string;
+  try {
+    target = resolve(dirname(modelsDir), readlinkSync(modelsDir));
+  } catch {
+    return null;
+  }
+  return `The models folder ${modelsDir} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`;
+}
+
 function readModelsDirFromConfig(configPath: string): string | undefined {
   // Type-gated like every other config read in this module: a FIFO here would
   // block the server before it ever finished starting.

@@ -137,6 +137,7 @@ describe('presentTray', () => {
         signal: null,
         atMs: 1,
         stderrTail: [],
+        startFailure: null,
       };
       expect(presentTray(snapshot('restarting', { streak: 2, lastExit: exit })).statusLabel).toBe(
         'Inference: restarting (failure 2)',
@@ -157,6 +158,7 @@ describe('presentTray', () => {
             signal: null,
             atMs: 1,
             stderrTail: [],
+            startFailure: null,
           },
         }),
       );

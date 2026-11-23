@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import {
   createSupervisorStateWriter,
+  MAX_FAILURE_REASON_CHARS,
+  oneLineReason,
   projectSupervisorState,
   type SupervisorStateFile,
   type SupervisorStateWriterIo,
@@ -29,6 +31,7 @@ function snapshot(overrides: Partial<SupervisorSnapshot> = {}): SupervisorSnapsh
       signal: 'SIGABRT',
       atMs: 1000,
       stderrTail: ['libc++abi: terminating due to uncaught exception: secret detail'],
+      startFailure: null,
     },
     health: { status: 'loading', models: { resident: ['private-model'] } },
     nativeErrors: [{ context: 'array_eval', detail: 'std::runtime_error: secret detail', observedAtMs: 900 }],
@@ -65,9 +68,43 @@ describe('supervisor state file', () => {
       nativeErrorsCapped: false,
       lastNativeErrorContext: 'array_eval',
       lastNativeErrorAt: 900,
+      failureReason: null,
     } satisfies SupervisorStateFile);
     const text = JSON.stringify(file);
     for (const leaked of ['secret', 'private', 'token', 'trace', 'http']) expect(text).not.toContain(leaked);
+  });
+
+  it('writes the start-failure reason only while restarting or failed', () => {
+    const reason =
+      'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.';
+    const failedExit = { ...snapshot().lastExit!, startFailure: reason };
+    for (const state of ['restarting', 'failed'] as const) {
+      expect(projectSupervisorState(snapshot({ state, lastExit: failedExit }), 1, 1).failureReason).toBe(reason);
+    }
+    // A good start, a stop and a new start clear it, though `lastExit` still names the failed child.
+    // Mutation: write it whenever `lastExit` has one → red.
+    for (const state of ['running', 'lying', 'stopped', 'starting'] as const) {
+      expect(projectSupervisorState(snapshot({ state, lastExit: failedExit }), 1, 1).failureReason, state).toBeNull();
+    }
+    // A crash with no start-failure line, and a clean exit, carry no reason: exit reasons stay out of the file.
+    expect(projectSupervisorState(snapshot({ state: 'failed' }), 1, 1).failureReason).toBeNull();
+    const clean = { ...failedExit, verdict: 'clean' as const };
+    expect(projectSupervisorState(snapshot({ state: 'failed', lastExit: clean }), 1, 1).failureReason).toBeNull();
+  });
+
+  it('puts the reason on one line and caps its length', () => {
+    expect(oneLineReason('first\nsecond\r\tthird\u0000\u001b[31m\u007f\u009b\u2028end')).toBe(
+      'first second  third  [31m   end',
+    );
+    expect(oneLineReason(' \n\t ')).toBeNull();
+    expect(oneLineReason('x'.repeat(MAX_FAILURE_REASON_CHARS))).toBe('x'.repeat(MAX_FAILURE_REASON_CHARS));
+    const long = oneLineReason('y'.repeat(MAX_FAILURE_REASON_CHARS + 50))!;
+    expect(long.length).toBe(MAX_FAILURE_REASON_CHARS);
+    expect(long.endsWith('…')).toBe(true);
+    // A cut must not leave half a surrogate pair.
+    const emoji = oneLineReason(`${'z'.repeat(MAX_FAILURE_REASON_CHARS - 2)}😀😀😀`)!;
+    expect(emoji.length).toBeLessThanOrEqual(MAX_FAILURE_REASON_CHARS);
+    expect(emoji.isWellFormed()).toBe(true);
   });
 
   it('rejects a native error context outside the safe charset', () => {
