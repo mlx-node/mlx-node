@@ -31,6 +31,31 @@ fn eval_native(handles: &mut [*mut sys::mlx_array]) -> std::result::Result<(), S
     }
 }
 
+fn async_eval_native(handles: &mut [*mut sys::mlx_array]) -> std::result::Result<(), String> {
+    let mut error = [0_u8; MLX_EVAL_ERROR_CAPACITY];
+    let ok = unsafe {
+        sys::mlx_async_eval_with_error(
+            handles.as_mut_ptr(),
+            handles.len(),
+            error.as_mut_ptr().cast(),
+            error.len(),
+        )
+    };
+    if ok {
+        return Ok(());
+    }
+
+    let detail = unsafe { CStr::from_ptr(error.as_ptr().cast()) }
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    if detail.is_empty() {
+        Err("unknown native MLX exception".to_owned())
+    } else {
+        Err(detail)
+    }
+}
+
 /// The native exception the last `mlx_array_item_at_*` or `mlx_synchronize`
 /// on this thread caught, cleared on read (Splash
 /// `NativeRuntime::executionFailed`).
@@ -65,8 +90,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Test-only: the next checked eval or synchronize named `context` on this
-/// thread throws `text` natively. Disarmed when the guard drops.
+/// Test-only: the next checked eval, async_eval or synchronize named `context`
+/// on this thread throws `text` natively. Disarmed when the guard drops.
 #[cfg(test)]
 pub(crate) fn fail_native_call_at(context: &str, text: &str) -> NativeFailureGuard {
     NATIVE_FAILURE_AT.with(|slot| *slot.borrow_mut() = Some((context.to_owned(), text.to_owned())));
@@ -282,6 +307,46 @@ impl MxArray {
     /// or [`Self::flush_graph_barrier`] at new call sites to make intent explicit.
     pub(crate) fn async_eval_arrays(arrays: &[&MxArray]) {
         Self::flush_graph_barrier(arrays);
+    }
+
+    /// Asynchronously submit unevaluated arrays onto the active stream,
+    /// propagating any native C++ exception with `context` attached to both the
+    /// structured trace event and the returned [`Error`].
+    ///
+    /// Already-available arrays (`is_available() == true`) are skipped so
+    /// callers do not pay FFI overhead or invoke `async_eval` when nothing is
+    /// pending.
+    pub(crate) fn async_eval_arrays_with_context(arrays: &[&MxArray], context: &str) -> Result<()> {
+        if arrays.is_empty() {
+            return Ok(());
+        }
+        let mut handles: Vec<*mut sys::mlx_array> = arrays
+            .iter()
+            .map(|arr| arr.handle.0)
+            .filter(|&ptr| !ptr.is_null() && !unsafe { sys::mlx_array_is_available(ptr) })
+            .collect();
+        if handles.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        arm_native_failure_at(context);
+        match async_eval_native(&mut handles) {
+            Ok(()) => Ok(()),
+            Err(detail) => {
+                tracing::error!(
+                    target: "mlx_core::inference",
+                    event = "mlx_async_eval_failed",
+                    context,
+                    array_count = handles.len(),
+                    error = %detail,
+                    "MLX async array submission failed"
+                );
+                Err(Error::from_reason(format!(
+                    "MLX async_eval failed in {context} while submitting {} arrays: {detail}",
+                    handles.len()
+                )))
+            }
+        }
     }
 
     /// Synchronously evaluate multiple arrays (blocking).
@@ -704,5 +769,30 @@ mod native_error_tests {
         );
         assert!(is_gpu_out_of_memory(&error.reason), "{}", error.reason);
         assert!(crate::array::memory::synchronize_and_clear_cache_checked("probe_sync").is_ok());
+    }
+
+    /// A native failure thrown at async_eval fails the checked helper with its
+    /// text, once; an unarmed submission succeeds and materializes the array.
+    #[test]
+    fn a_failed_async_eval_returns_the_native_error() {
+        let lazy = lazy_six();
+        assert!(!lazy.is_available(), "lazy_six must start unevaluated");
+        {
+            let _armed = fail_native_call_at("probe_async_eval", OOM);
+            let error = MxArray::async_eval_arrays_with_context(&[&lazy], "probe_async_eval")
+                .expect_err("the async_eval fails");
+            assert_eq!(
+                error.reason,
+                format!(
+                    "MLX async_eval failed in probe_async_eval while submitting 1 arrays: {OOM}"
+                )
+            );
+            assert!(is_gpu_out_of_memory(&error.reason), "{}", error.reason);
+        }
+        MxArray::async_eval_arrays_with_context(&[&lazy], "probe_async_eval")
+            .expect("unarmed async_eval succeeds");
+        assert_eq!(lazy.item_at_int32(0).expect("async_eval materialized"), 6);
+        MxArray::async_eval_arrays_with_context(&[&lazy], "probe_async_eval")
+            .expect("already available array is a clean no-op");
     }
 }

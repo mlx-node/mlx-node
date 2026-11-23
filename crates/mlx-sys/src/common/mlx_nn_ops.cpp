@@ -222,6 +222,44 @@ void mlx_copy_error(char* error_out,
 
 }  // namespace
 
+// Asynchronous eval with caller-owned error buffer so C++ exceptions from
+// scheduling/submission propagate back to Rust instead of being dropped.
+bool mlx_async_eval_with_error(mlx_array** handles,
+                               size_t count,
+                               char* error_out,
+                               size_t error_capacity) {
+  if (error_out && error_capacity > 0) {
+    error_out[0] = '\0';
+  }
+  if (!handles || count == 0) {
+    return true;
+  }
+  try {
+    mlx_node::CudaGraphsEvalReadLock graphs_eval_lock;
+    mlx_throw_test_native_failure();
+    std::vector<array> arrays;
+    arrays.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (handles[i]) {
+        arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+      }
+    }
+    if (arrays.empty()) {
+      return true;
+    }
+    mlx::core::async_eval(std::move(arrays));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_copy_error(error_out, error_capacity, e.what());
+    mlx_trace_native_error("async_eval", e.what());
+    return false;
+  } catch (...) {
+    mlx_copy_error(error_out, error_capacity, "unknown C++ exception");
+    mlx_trace_native_error("async_eval", "unknown C++ exception");
+    return false;
+  }
+}
+
 // Synchronous eval — matches Python's mx.eval(arrays).
 // Unlike async_eval, this blocks until all arrays are materialized. The
 // caller-owned error buffer carries the native exception across the C ABI so

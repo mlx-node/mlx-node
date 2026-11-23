@@ -1713,7 +1713,7 @@ impl<'a> ClairicEngine<'a> {
             // CUDA's default stream so GPU execution overlaps with CPU grammar
             // compilation and step-0 bitmask generation (`cuda_graphs_guard`
             // remains alive until after step-0 eval completes).
-            cuda_async_kick_decode(&init_logits, &cache);
+            cuda_async_kick_decode(&init_logits, &cache, "clairic::prefill_async_eval")?;
             if let Some(start) = prefill_start {
                 self.timings.chunk_prefill_ms += elapsed_ms(start);
             }
@@ -2016,7 +2016,7 @@ impl<'a> ClairicEngine<'a> {
                 // Submit next decode step + lm_head + caches asynchronously
                 // onto CUDA's default stream so GPU execution overlaps with
                 // next iteration's CPU grammar bitmask generation.
-                cuda_async_kick_decode(&cur_logits, &cache);
+                cuda_async_kick_decode(&cur_logits, &cache, "clairic::decode_async_eval")?;
                 if let Some(start) = t_step {
                     self.timings.decode_step_ms += elapsed_ms(start);
                     self.timings.decode_steps += 1;
@@ -2430,6 +2430,17 @@ fn disarm_gdn_inplace_state(layers: &mut [Qwen3_5LayerCache]) -> Result<()> {
     Ok(())
 }
 
+/// Collect `logits` and all `cache` layer arrays and submit any unevaluated
+/// handles asynchronously via [`MxArray::async_eval_arrays_with_context`].
+fn async_eval_decode_state(logits: &MxArray, cache: &BatchCacheState, context: &str) -> Result<()> {
+    let mut arrays: Vec<&MxArray> = Vec::with_capacity(1 + cache.layers.len() * 2);
+    arrays.push(logits);
+    for layer in &cache.layers {
+        layer.collect_arrays(&mut arrays);
+    }
+    MxArray::async_eval_arrays_with_context(&arrays, context)
+}
+
 /// Submit unevaluated `logits` and `cache` layer arrays asynchronously onto
 /// CUDA's single default GPU stream so GPU execution overlaps with CPU grammar
 /// compilation and bitmask construction.
@@ -2437,29 +2448,11 @@ fn disarm_gdn_inplace_state(layers: &mut [Qwen3_5LayerCache]) -> Result<()> {
 /// Single-stream safety: on CUDA `Stream::generation()` collapses to
 /// `default_stream(Device::gpu)` (zero cross-stream `AtomicEvent::wait`),
 /// matching `qwen4_exp::decoder::cuda_deferred::cuda_async_eval`.
-fn cuda_async_kick_decode(logits: &MxArray, cache: &BatchCacheState) {
+fn cuda_async_kick_decode(logits: &MxArray, cache: &BatchCacheState, context: &str) -> Result<()> {
     if !crate::accelerator::cuda_ops_available() {
-        return;
+        return Ok(());
     }
-    let mut arrays: Vec<&MxArray> = Vec::with_capacity(1 + cache.layers.len() * 2);
-    arrays.push(logits);
-    for layer in &cache.layers {
-        layer.collect_arrays(&mut arrays);
-    }
-    let mut handles: Vec<*mut mlx_sys::mlx_array> = arrays
-        .iter()
-        .map(|a| a.as_raw_ptr())
-        .filter(|&ptr| !ptr.is_null() && !unsafe { mlx_sys::mlx_array_is_available(ptr) })
-        .collect();
-    if handles.is_empty() {
-        return;
-    }
-    // SAFETY: All pointers in `handles` are non-null, borrowed from live
-    // `MxArray`s for the duration of this call, and `mlx_async_eval` catches
-    // C++ exceptions internally.
-    unsafe {
-        mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
-    }
+    async_eval_decode_state(logits, cache, context)
 }
 
 fn check_cancel_opt(cancelled: Option<&Arc<AtomicBool>>) -> Result<()> {
@@ -3594,5 +3587,167 @@ mod tests {
             assert!(ac.get(2).is_none());
         }
         Ok(())
+    }
+
+    #[test]
+    fn cuda_async_kick_decode_propagates_native_errors() -> Result<()> {
+        let base_logits = MxArray::from_float32(&[1.0, 2.0], &[1, 2])?;
+        let logits = base_logits.add(&base_logits)?;
+        let base_conv = MxArray::from_float32(&[0.5, 1.5], &[1, 2])?;
+        let conv = base_conv.add(&base_conv)?;
+        let base_state = MxArray::from_float32(&[2.0, 3.0], &[1, 2])?;
+        let state = base_state.add(&base_state)?;
+        assert!(!logits.is_available());
+        assert!(!conv.is_available());
+        assert!(!state.is_available());
+
+        let mut ac = ArraysCache::new(2);
+        ac.set(0, conv)?;
+        ac.set(1, state)?;
+        let cache = BatchCacheState {
+            layers: vec![
+                Qwen3_5LayerCache::Linear(ac),
+                Qwen3_5LayerCache::new_full_attention(),
+            ],
+            valid: None,
+            cache_len: 1,
+            next_positions: vec![1],
+        };
+
+        for context in ["clairic::prefill_async_eval", "clairic::decode_async_eval"] {
+            let injected = format!("synthetic native failure at {context}");
+            let _armed = crate::array::fail_native_call_at(context, &injected);
+            let err = async_eval_decode_state(&logits, &cache, context)
+                .expect_err("async_eval_decode_state must propagate native failure");
+            assert_eq!(
+                err.reason,
+                format!("MLX async_eval failed in {context} while submitting 3 arrays: {injected}")
+            );
+        }
+
+        for context in ["clairic::prefill_async_eval", "clairic::decode_async_eval"] {
+            let injected = format!("synthetic cuda kick failure at {context}");
+            let _armed = crate::array::fail_native_call_at(context, &injected);
+            let res = cuda_async_kick_decode(&logits, &cache, context);
+            if crate::accelerator::cuda_ops_available() {
+                let err =
+                    res.expect_err("cuda_async_kick_decode must propagate native failure on CUDA");
+                assert_eq!(
+                    err.reason,
+                    format!(
+                        "MLX async_eval failed in {context} while submitting 3 arrays: {injected}"
+                    )
+                );
+            } else {
+                res.expect("cuda_async_kick_decode is a no-op off CUDA");
+            }
+        }
+
+        async_eval_decode_state(&logits, &cache, "clairic::decode_async_eval")?;
+        assert_eq!(logits.to_float32()?.to_vec(), vec![2.0, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn ar_engine_propagates_cuda_async_eval_failures_and_recovers() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+
+        let (mut inner, eos_id, vision_end_id) = synthetic_clairic_inner();
+        let score_ids = vec![eos_id];
+
+        let shared = [10u32, 11, 12, 13, 14, vision_end_id];
+        let mk_seq = |suf: &[u32]| {
+            let mut v = shared.to_vec();
+            v.extend_from_slice(suf);
+            v
+        };
+        let tasks = vec![
+            ArGenTask {
+                id: "p0".to_string(),
+                input_ids: mk_seq(&[21, 22, 23, 24, 25, 26, 27, 28, 29, 30]),
+                media: None,
+                media_key: Some("doc-page-async-err".to_string()),
+                grammar: GrammarSpec::JsonSchema(json!({ "enum": ["alpha-beta-gamma-delta"] })),
+                max_new_tokens: 32,
+                stop_token_ids: vec![eos_id],
+            },
+            ArGenTask {
+                id: "p1".to_string(),
+                input_ids: mk_seq(&[31, 32, 33, 34, 35, 36, 37, 38, 39, 40]),
+                media: None,
+                media_key: Some("doc-page-async-err".to_string()),
+                grammar: GrammarSpec::JsonSchema(json!({ "enum": ["alpha-beta-gamma-delta"] })),
+                max_new_tokens: 32,
+                stop_token_ids: vec![eos_id],
+            },
+        ];
+
+        let mut engine = ClairicEngine::new(
+            &mut inner,
+            EngineOptions {
+                prefix_cache: true,
+                ..EngineOptions::default()
+            },
+        );
+
+        {
+            let _armed = crate::array::fail_native_call_at(
+                "clairic::prefill_async_eval",
+                "synthetic prefill async failure",
+            );
+            let err = engine
+                .generate_batch(&tasks, &score_ids, None)
+                .expect_err("prefill async_eval failure must propagate");
+            assert!(
+                err.reason.contains("clairic::prefill_async_eval")
+                    && err.reason.contains("synthetic prefill async failure"),
+                "unexpected prefill error: {}",
+                err.reason
+            );
+            assert_eq!(engine.prefix_caches.len(), 1);
+        }
+
+        {
+            let _armed = crate::array::fail_native_call_at(
+                "clairic::decode_async_eval",
+                "synthetic decode async failure",
+            );
+            let err = engine
+                .generate_batch(&tasks, &score_ids, None)
+                .expect_err("decode async_eval failure must propagate");
+            assert!(
+                err.reason.contains("clairic::decode_async_eval")
+                    && err.reason.contains("synthetic decode async failure"),
+                "unexpected decode error: {}",
+                err.reason
+            );
+            assert_eq!(engine.prefix_caches.len(), 1);
+        }
+
+        let recovered = engine
+            .generate_batch(&tasks, &score_ids, None)
+            .expect("recovered generate_batch");
+        drop(engine);
+
+        let mut baseline_engine = ClairicEngine::new(
+            &mut inner,
+            EngineOptions {
+                prefix_cache: false,
+                ..EngineOptions::default()
+            },
+        );
+        let baseline = baseline_engine
+            .generate_batch(&tasks, &score_ids, None)
+            .expect("baseline generate_batch");
+        assert_eq!(recovered.len(), baseline.len());
+        for (rec, base) in recovered.iter().zip(baseline.iter()) {
+            assert!(!rec.output_ids.is_empty());
+            assert_eq!(rec.output_ids, base.output_ids);
+            assert_eq!(rec.text, base.text);
+            assert_eq!(rec.finish_reason, FinishReason::Stop(eos_id));
+            assert_eq!(rec.finish_reason, base.finish_reason);
+        }
     }
 }

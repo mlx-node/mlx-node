@@ -290,6 +290,12 @@ unsafe extern "C-unwind" {
     /// Read readiness without evaluating or scheduling the array.
     pub fn mlx_array_is_available(handle: *mut mlx_array) -> bool;
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
+    pub fn mlx_async_eval_with_error(
+        handles: *mut *mut mlx_array,
+        count: usize,
+        error_out: *mut std::ffi::c_char,
+        error_capacity: usize,
+    ) -> bool;
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_eval_with_error(
         handles: *mut *mut mlx_array,
@@ -4915,6 +4921,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_alloc_gpu_uninit(shape: *const i64, ndim: usize, dtype: i32)
     -> *mut mlx_array;
     pub fn mlx_array_ensure_cuda_device(arr: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_cuda_host_bytes(arr: *mut mlx_array) -> usize;
     /// Native Metal allocation with a CPU-visible pointer and a last-array
     /// lease (`mlx_array_alloc.cpp`). Null on unsupported builds or failure;
     /// `release_fn(ctx)` is not invoked on a null return.

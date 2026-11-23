@@ -61,6 +61,27 @@ CudaAllocStream& cuda_alloc_stream() {
   static auto* s = new CudaAllocStream();
   return *s;
 }
+
+const mlx::core::cu::CudaBuffer* eligible_cuda_host_buffer(array* arr) {
+  if (arr->status() != array::Status::available) {
+    CudaGraphsEvalReadLock graphs_eval_lock;
+    arr->eval();
+  }
+  // Skip empty tensors and <= 8 byte scalar-pool tensors
+  // (CudaAllocator::malloc_async always places <= 8 byte allocations in
+  // SmallSizePool with device == -1).
+  if (!arr->flags().row_contiguous || arr->data_size() != arr->size() ||
+      arr->nbytes() <= 8 || arr->buffer().ptr() == nullptr) {
+    return nullptr;
+  }
+  auto* src_cbuf =
+      static_cast<const mlx::core::cu::CudaBuffer*>(arr->buffer().ptr());
+  if (src_cbuf == nullptr || src_cbuf->device >= 0 ||
+      src_cbuf->data == nullptr) {
+    return nullptr;
+  }
+  return src_cbuf;
+}
 #endif
 
 }  // namespace
@@ -140,21 +161,8 @@ mlx_array* mlx_array_ensure_cuda_device(mlx_array* handle) {
   try {
     if (!handle || !mlx::core::cu::is_available()) return nullptr;
     auto* arr = reinterpret_cast<array*>(handle);
-    if (arr->status() != array::Status::available) {
-      CudaGraphsEvalReadLock graphs_eval_lock;
-      arr->eval();
-    }
-    // Skip empty tensors and <= 8 byte scalar-pool tensors
-    // (CudaAllocator::malloc_async always places <= 8 byte allocations in
-    // SmallSizePool with device == -1).
-    if (!arr->flags().row_contiguous || arr->data_size() != arr->size() ||
-        arr->nbytes() <= 8 || arr->buffer().ptr() == nullptr) {
-      return nullptr;
-    }
-    auto* src_cbuf =
-        static_cast<mlx::core::cu::CudaBuffer*>(arr->buffer().ptr());
-    if (src_cbuf == nullptr || src_cbuf->device >= 0 ||
-        src_cbuf->data == nullptr) {
+    const auto* src_cbuf = eligible_cuda_host_buffer(arr);
+    if (src_cbuf == nullptr) {
       return nullptr;
     }
     const size_t bytes = arr->nbytes();
@@ -197,6 +205,23 @@ mlx_array* mlx_array_ensure_cuda_device(mlx_array* handle) {
 #else
   (void)handle;
   return nullptr;
+#endif
+}
+
+// Return `arr->nbytes()` iff `handle` is a CUDA host-backed (`device < 0`)
+// array eligible for `mlx_array_ensure_cuda_device`, else `0`.
+size_t mlx_array_cuda_host_bytes(mlx_array* handle) {
+#ifdef MLX_NODE_CUDA_ENABLED
+  try {
+    if (!handle || !mlx::core::cu::is_available()) return 0;
+    auto* arr = reinterpret_cast<array*>(handle);
+    return eligible_cuda_host_buffer(arr) != nullptr ? arr->nbytes() : 0;
+  } catch (...) {
+    return 0;
+  }
+#else
+  (void)handle;
+  return 0;
 #endif
 }
 
