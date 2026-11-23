@@ -2190,20 +2190,21 @@ function writeCodingAgents(home: string): void {
 }
 
 /**
- * A catalog entry installed by the app, from before the entry named its tokenizer source: it reads as installed with
- * an update, with no network.
+ * The first build of a catalog model (Qwen3.8-27B UD-Q4_K_XL) installed by the app, from before the build named its
+ * tokenizer source: it reads as installed with an update, with no network.
  */
 export const CATALOG_INSTALL = {
-  repo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
-  slug: 'gemma-4-26b-a4b-it-gguf',
-  file: 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf',
-  sizeGb: 16.9,
+  repo: 'unsloth/Qwen3.8-27B-GGUF',
+  slug: 'qwen3.8-27b-gguf',
+  build: 'UD-Q4_K_XL',
+  file: 'Qwen3.8-27B-UD-Q4_K_XL.gguf',
+  sizeGb: 16.4,
 } as const;
 
 function writeCatalogInstall(home: string, now: number): void {
   const dir = join(fixturePaths(home).modelsDir, CATALOG_INSTALL.slug);
   mkdirSync(dir, { recursive: true });
-  writeJson(join(dir, 'config.json'), { model_type: 'gemma4', max_position_embeddings: 262144 });
+  writeJson(join(dir, 'config.json'), { model_type: 'qwen3_5', max_position_embeddings: 262144 });
   const weights = join(dir, CATALOG_INSTALL.file);
   writeFileSync(weights, '');
   truncateSync(weights, Math.round(CATALOG_INSTALL.sizeGb * GIB));

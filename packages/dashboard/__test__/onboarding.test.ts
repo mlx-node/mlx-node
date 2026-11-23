@@ -1,14 +1,14 @@
 /** @vitest-environment happy-dom */
 
 import App from '@/App';
-import type { CatalogItem } from '@/lib/types';
+import type { CatalogBuildItem, CatalogItem } from '@/lib/types';
 import Models from '@/pages/models';
 import { Storage } from 'happy-dom';
 import { act, createElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { MODEL_CATALOG } from '../../agent/src/catalog.js';
+import { catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { DownloadEvent } from '../src/download.js';
 import type { ApiCall } from '../src/runtime.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
@@ -17,15 +17,33 @@ import { deferred, renderPage, type RenderedPage, sequence, STUB_FAILURE, stubAp
 const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   ...item,
   draft: undefined,
-  slug: item.hfRepo.split('/').at(-1)!.toLowerCase(),
-  installed: false,
-  present: false,
-  blockedByForeignDir: false,
-  blocker: null,
-  localRevision: null,
-  localAssetsRepo: null,
-  localAssetsRevision: null,
+  builds: item.builds.map((build): CatalogBuildItem => ({
+    id: build.id,
+    hfRepo: catalogBuildRepo(build),
+    sizeGb: build.sizeGb,
+    source: build.source,
+    slug: catalogBuildSlug(build),
+    installed: false,
+    present: false,
+    heldBy: null,
+    blockedByForeignDir: false,
+    blocker: null,
+    localRevision: null,
+    localAssetsRepo: null,
+    localAssetsRevision: null,
+  })),
 }));
+
+/** The folder of the build every surface chooses first. */
+function slugOf(item: CatalogItem): string {
+  return item.builds[0].slug;
+}
+
+/** `item` with its first build on disk or not. */
+function withPresent(item: CatalogItem, present: boolean): CatalogItem {
+  const [first, ...rest] = item.builds;
+  return { ...item, builds: [{ ...first, present }, ...rest] };
+}
 const visible = items.filter((item) => !item.hidden && item.category !== 'systemone');
 /** The choices on the 64 GiB Mac of {@link routes}: the entries with a 96 GiB floor are left out. */
 const unfloored = visible.filter((item) => item.minMemoryGb === undefined);
@@ -96,7 +114,7 @@ describe('first model onboarding', () => {
     expect(calls.some((call) => call.method === 'POST')).toBe(false);
     expect(page.container.querySelectorAll('input[type=radio]')).toHaveLength(unfloored.length);
     const selected = page.container.querySelector<HTMLInputElement>('input:checked');
-    expect(selected?.value).toBe(visible.find((item) => item.isDefault)!.hfRepo);
+    expect(selected?.value).toBe(visible.find((item) => item.isDefault)!.label);
     for (const item of items.filter((item) => item.hidden)) expect(page.text()).not.toContain(item.label);
   });
 
@@ -115,7 +133,7 @@ describe('first model onboarding', () => {
     });
     page = await renderPage(createElement(App), (text) => text.includes('Download model'));
     const offered = [...page.container.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((el) => el.value);
-    expect(offered).toEqual((offeredFloored ? visible : unfloored).map((item) => item.hfRepo));
+    expect(offered).toEqual((offeredFloored ? visible : unfloored).map((item) => item.label));
     if (offeredFloored) expect(page.text()).not.toContain("larger than this Mac's memory");
   });
 
@@ -178,7 +196,13 @@ describe('first model onboarding', () => {
         ...routes(dir),
         '/models': library.body,
         ...(action === 'Explore while downloading'
-          ? { '/downloads': { jobs: [{ id: 'ongoing', repo: visible[0].hfRepo, state: 'running' }] } }
+          ? {
+              '/downloads': {
+                jobs: [
+                  { id: 'ongoing', slug: slugOf(visible[0]), repo: visible[0].builds[0].hfRepo, state: 'running' },
+                ],
+              },
+            }
           : {}),
       });
       page = await renderPage(createElement(App), (text) => text.includes('Choose your first model'));
@@ -242,7 +266,7 @@ describe('first model onboarding', () => {
     window.history.replaceState({}, '', '/welcome');
     dispose = stubApi({
       ...routes(dir),
-      '/catalog': { items: items.map((item) => ({ ...item, present: item.isDefault })) },
+      '/catalog': { items: items.map((item) => withPresent(item, item.isDefault === true)) },
     });
     page = await renderPage(createElement(App), (text) => text.includes('Model ready'));
     await act(async () => button('Set up coding agents').click());
@@ -255,12 +279,12 @@ describe('first model onboarding', () => {
     const chosen = visible[1];
     const calls: ApiCall[] = [];
     let listener: ((event: DownloadEvent) => void) | undefined;
-    const refreshed = deferred({ items: items.map((item) => ({ ...item, present: item.hfRepo === chosen.hfRepo })) });
+    const refreshed = deferred({ items: items.map((item) => withPresent(item, item.label === chosen.label)) });
     dispose = stubApi(
       {
         ...routes(),
         '/catalog': sequence({ items }, refreshed.body),
-        '/downloads': sequence({ jobs: [] }, { id: 'chosen-job', repo: chosen.hfRepo }),
+        '/downloads': sequence({ jobs: [] }, { id: 'chosen-job', slug: slugOf(chosen), repo: chosen.builds[0].hfRepo }),
         '/downloads/chosen-job': { cancelled: true, id: 'chosen-job' },
       },
       {
@@ -274,20 +298,20 @@ describe('first model onboarding', () => {
       },
     );
     await mount();
-    const radio = page!.container.querySelector<HTMLInputElement>(`input[value="${chosen.hfRepo}"]`)!;
+    const radio = page!.container.querySelector<HTMLInputElement>(`input[value="${chosen.label}"]`)!;
     await act(async () => radio.click());
     expect(radio.checked).toBe(true);
     await act(async () => button('Download model').click());
     await waitFor(() => expect(listener).toBeDefined());
-    expect(calls.find((call) => call.method === 'POST')?.body).toEqual({ repo: chosen.hfRepo });
-    await act(async () => listener!({ type: 'done', id: 'chosen-job', outputDir: `/models/${chosen.slug}` }));
+    expect(calls.find((call) => call.method === 'POST')?.body).toEqual({ slug: slugOf(chosen) });
+    await act(async () => listener!({ type: 'done', id: 'chosen-job', outputDir: `/models/${slugOf(chosen)}` }));
     await waitFor(() => expect(page!.text()).toContain('Checking download…'));
     expect(page!.text()).not.toContain('Model ready');
     expect(hasButton('Set up coding agents')).toBe(false);
     await act(async () => refreshed.release());
     await waitFor(() => expect(hasButton('Set up coding agents')).toBe(true));
     expect(page!.text()).toContain('Model ready');
-    expect(page!.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.hfRepo);
+    expect(page!.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.label);
   });
 
   it('restores an existing non-default download and recovers after cancellation', async () => {
@@ -297,7 +321,16 @@ describe('first model onboarding', () => {
       {
         ...routes(),
         '/downloads': {
-          jobs: [{ id: 'existing-job', repo: chosen.hfRepo, state: 'running', receivedBytes: 10, totalBytes: 100 }],
+          jobs: [
+            {
+              id: 'existing-job',
+              slug: slugOf(chosen),
+              repo: chosen.builds[0].hfRepo,
+              state: 'running',
+              receivedBytes: 10,
+              totalBytes: 100,
+            },
+          ],
         },
         '/downloads/existing-job': { cancelled: true, id: 'existing-job' },
       },
@@ -314,7 +347,7 @@ describe('first model onboarding', () => {
       text.includes('Downloading'),
     );
     await waitFor(() => expect(listener).toBeDefined());
-    expect(page.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.hfRepo);
+    expect(page.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.label);
     expect(page.container.querySelector('fieldset')?.disabled).toBe(true);
     await act(async () => button('Cancel').click());
     await act(async () => listener!({ type: 'cancelled', id: 'existing-job' }));
@@ -327,7 +360,9 @@ describe('first model onboarding', () => {
     dispose = stubApi(
       {
         ...routes(),
-        '/downloads': { jobs: [{ id: 'failed-job', repo: visible[0].hfRepo, state: 'running' }] },
+        '/downloads': {
+          jobs: [{ id: 'failed-job', slug: slugOf(visible[0]), repo: visible[0].builds[0].hfRepo, state: 'running' }],
+        },
         '/downloads/failed-job': {},
       },
       {
@@ -349,12 +384,12 @@ describe('first model onboarding', () => {
     expect(button('Download model').disabled).toBe(false);
 
     await act(async () =>
-      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[1].hfRepo}"]`)!.click(),
+      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[1].label}"]`)!.click(),
     );
     expect(page.container.querySelector('[role=alert]')).toBeNull();
     expect(button('Download model').disabled).toBe(false);
     await act(async () =>
-      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[0].hfRepo}"]`)!.click(),
+      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[0].label}"]`)!.click(),
     );
     expect(page.container.querySelector('[role=alert]')?.textContent).toContain('Connection lost');
   });
@@ -368,10 +403,10 @@ describe('first model onboarding', () => {
     );
     await mount();
     const requested = page!.container.querySelector<HTMLInputElement>('input:checked')!.value;
-    const other = visible.find((item) => item.hfRepo !== requested)!;
+    const other = visible.find((item) => item.label !== requested)!;
     await act(async () => button('Download model').click());
     await waitFor(() => expect(calls.some((call) => call.method === 'POST')).toBe(true));
-    await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${other.hfRepo}"]`)!.click());
+    await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${other.label}"]`)!.click());
     await act(async () => failedStart.release());
     await waitFor(() => expect(button('Download model').disabled).toBe(false));
     expect(page!.container.querySelector('[role=alert]')).toBeNull();

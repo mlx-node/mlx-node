@@ -21,7 +21,7 @@ import { Button } from '../../components/arc/button/button';
 import { CopyButton } from '../../components/arc/copy-button/copy-button';
 import { Drawer, DrawerContent, useDrawerItem } from '../../components/arc/drawer/drawer';
 import { Select } from '../../components/arc/select/select';
-import { hasUpdate } from '../../lib/catalog';
+import { catalogBuildAt, hasUpdate } from '../../lib/catalog';
 import {
   formatBytes,
   formatClock,
@@ -242,8 +242,8 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
     live: { minIntervalMs: LIVE_REFETCH_FAST_MS },
   });
 
-  const catalogItem = props.catalog.find((item) => item.slug === model.name);
-  const update = catalogItem !== undefined && hasUpdate(catalogItem, props.remoteRevisions);
+  const catalogBuild = catalogBuildAt(props.catalog, model.name);
+  const update = catalogBuild !== undefined && hasUpdate(catalogBuild, props.remoteRevisions);
   const state = liveStateOf(model, props.live);
   const resident = (() => {
     for (const process of props.live?.processes ?? []) {
@@ -266,18 +266,18 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
       numeric: true,
     },
   ];
-  if (catalogItem !== undefined) {
+  if (catalogBuild !== undefined) {
     disk.push({
       key: 'source',
       label: 'Source',
       value: (
-        <a className="link" href={`https://huggingface.co/${catalogItem.hfRepo}`} target="_blank" rel="noreferrer">
-          {catalogItem.hfRepo} <ExternalLink size={12} aria-hidden="true" className="inline" />
+        <a className="link" href={`https://huggingface.co/${catalogBuild.hfRepo}`} target="_blank" rel="noreferrer">
+          {catalogBuild.hfRepo} <ExternalLink size={12} aria-hidden="true" className="inline" />
         </a>
       ),
     });
-    if (catalogItem.localRevision !== null) {
-      disk.push({ key: 'revision', label: 'Revision', value: catalogItem.localRevision.slice(0, 7), mono: true });
+    if (catalogBuild.localRevision !== null) {
+      disk.push({ key: 'revision', label: 'Revision', value: catalogBuild.localRevision.slice(0, 7), mono: true });
     }
   }
 

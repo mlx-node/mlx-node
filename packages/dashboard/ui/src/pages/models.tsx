@@ -95,14 +95,15 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
       <Onboarding
         catalog={catalog}
         models={models}
-        activeRepos={Object.keys(downloads.active)}
+        activeSlugs={Object.keys(downloads.active)}
         downloadError={downloads.downloadError}
         downloadsLoading={downloads.downloadsLoading}
         downloadsError={downloads.downloadsError}
         reloadDownloads={downloads.reloadDownloads}
-        renderDownload={(item) => (
+        renderDownload={(build) => (
           <CatalogDownloadAction
-            {...downloads.downloadProps(item)}
+            {...downloads.downloadProps(build)}
+            buildName={build.id}
             prominent
             installLabel="Download model"
             settlingLabel="Checking download…"
@@ -156,8 +157,8 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   const catalogItems = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
   const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
   const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
-  const present = chatCatalogItems.filter((item) => item.present).length;
-  const systemOnePresent = systemOneCatalogItems.filter((item) => item.present).length;
+  const present = chatCatalogItems.filter((item) => item.builds[0].present).length;
+  const systemOnePresent = systemOneCatalogItems.filter((item) => item.builds[0].present).length;
   const activeCount = Object.keys(downloads.active).length;
 
   const setFocus = (name: string | null): void => {
@@ -194,28 +195,29 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   };
   const dir = models.data?.dir ?? '';
   const home = useHomeDir();
-  const settlingRepos = catalogItems
+  const settlingSlugs = catalogItems
     .filter((item) => {
-      const props = downloads.downloadProps(item);
+      const props = downloads.downloadProps(item.builds[0]);
       return props.settling || props.updateSettling;
     })
-    .map((item) => item.hfRepo)
+    .map((item) => item.builds[0].slug)
     .join('\n');
   const commands = useMemo((): AppCommand[] => {
     const list: AppCommand[] = [];
     for (const item of catalogItems) {
-      const props = downloads.downloadProps(item);
+      const build = item.builds[0];
+      const props = downloads.downloadProps(build);
       if (props.job !== undefined || props.settling) continue;
-      if (!item.present && !item.blockedByForeignDir) {
+      if (!build.present && !build.blockedByForeignDir && build.heldBy === null) {
         list.push({
-          id: `models:install:${item.hfRepo}`,
+          id: `models:install:${build.slug}`,
           label: `Install ${item.label}`,
           group: 'Models',
           run: props.onInstall,
         });
-      } else if (item.present && props.updateAvailable && !props.updateSettling) {
+      } else if (build.present && props.updateAvailable && !props.updateSettling) {
         list.push({
-          id: `models:update:${item.hfRepo}`,
+          id: `models:update:${build.slug}`,
           label: `Update ${item.label}`,
           group: 'Models',
           run: props.onInstall,
@@ -236,7 +238,7 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
       });
     }
     return list;
-  }, [catalog.data, updates.data, updates.error, downloads.active, settlingRepos, dir, home]);
+  }, [catalog.data, updates.data, updates.error, downloads.active, settlingSlugs, dir, home]);
   useCommands(commands);
 
   const totalBytes = [...localModels, ...companions].reduce((sum, model) => sum + model.sizeBytes, 0);
@@ -391,13 +393,13 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
             <CatalogGrid>
               {chatCatalogItems.map((item) => (
                 <CatalogCardEntry
-                  key={item.hfRepo}
+                  key={item.label}
                   item={item}
                   downloads={downloads}
                   host={host}
                   detailsTo={
-                    localModels.some((model) => model.name === item.slug)
-                      ? `/models?focus=${encodeURIComponent(item.slug)}`
+                    localModels.some((model) => model.name === item.builds[0].slug)
+                      ? `/models?focus=${encodeURIComponent(item.builds[0].slug)}`
                       : undefined
                   }
                 />
@@ -426,16 +428,18 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
             <CatalogGrid>
               {systemOneCatalogItems.map((item) => (
                 <CatalogCardEntry
-                  key={item.hfRepo}
+                  key={item.label}
                   item={item}
                   downloads={downloads}
                   host={host}
                   detailsTo={
-                    localModels.some((model) => model.name === item.slug)
-                      ? `/models?focus=${encodeURIComponent(item.slug)}`
+                    localModels.some((model) => model.name === item.builds[0].slug)
+                      ? `/models?focus=${encodeURIComponent(item.builds[0].slug)}`
                       : undefined
                   }
-                  openTo={item.present ? `/system-one?model=${encodeURIComponent(item.slug)}` : undefined}
+                  openTo={
+                    item.builds[0].present ? `/system-one?model=${encodeURIComponent(item.builds[0].slug)}` : undefined
+                  }
                 />
               ))}
             </CatalogGrid>
@@ -466,18 +470,20 @@ function CatalogCardEntry(props: {
   openTo?: string | undefined;
 }): ReactElement {
   const { item, downloads } = props;
-  const download = downloads.downloadProps(item);
+  const build = item.builds[0];
+  const download = downloads.downloadProps(build);
   const draft =
     item.draft === undefined
       ? undefined
-      : // Drafts carry no tokenizer sidecars of their own.
-        downloads.downloadProps({ ...item.draft, localAssetsRepo: null, localAssetsRevision: null });
+      : // Drafts carry no tokenizer sidecars of their own, and no other build shares their folder.
+        downloads.downloadProps({ ...item.draft, heldBy: null, localAssetsRepo: null, localAssetsRevision: null });
   const busy = download.job !== undefined || draft?.job !== undefined;
   return (
     <div className="min-w-0" data-downloading={busy ? '' : undefined}>
       <CatalogCard
         {...download}
-        item={item}
+        entry={item}
+        item={build}
         draftDownload={draft}
         host={props.host}
         detailsTo={props.detailsTo}

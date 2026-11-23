@@ -72,12 +72,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import {
-  catalogDownloadRepos,
-  catalogEntryForRepo,
-  catalogSelectionForRepo,
-  catalogUpdateRepos,
-} from '@mlx-node/agent/catalog';
+import { type CatalogTarget, catalogTargetForSlug, catalogUpdateRepos } from '@mlx-node/agent/catalog';
 import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
@@ -95,7 +90,7 @@ const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
  */
 const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 
-import { catalogBlocker } from './catalog.js';
+import { catalogBlocker, heldByOtherBuild } from './catalog.js';
 import {
   type DownloadCompletion,
   DOWNLOAD_COMPLETE_MARKER,
@@ -219,7 +214,7 @@ function isWantedFileFor(path: string, globs: RegExp[] | undefined): boolean {
  * Sidecar files a GGUF quantization repo typically lacks, fetched from the
  * catalog entry's `assetsRepo` (the base model's repo). Names absent from the
  * assetsRepo are skipped, so one fixed list serves every model family. See
- * {@link CatalogEntry.assetsRepo} for why these are mandatory for tool
+ * {@link CatalogBuild.assetsRepo} for why these are mandatory for tool
  * calling rather than optional metadata.
  */
 const ASSET_SIDECAR_CANDIDATES = [
@@ -611,6 +606,22 @@ export class DownloadConflictError extends Error {
   }
 }
 
+/** The catalog build or draft that installs to the folder `slug`; any other folder is refused. */
+function catalogTarget(slug: string): CatalogTarget {
+  const target = catalogTargetForSlug(slug);
+  if (target === undefined) throw new Error(`"${slug}" is not a folder of the model catalog`);
+  return target;
+}
+
+/** The globs and sidecar source a job of `target` plans; a draft has neither. */
+function selectionOf(target: CatalogTarget): { globs?: readonly string[]; assetsRepo?: string } {
+  if (target.kind === 'draft') return {};
+  return {
+    ...(target.globs !== undefined ? { globs: target.globs } : {}),
+    ...(target.assetsRepo !== undefined ? { assetsRepo: target.assetsRepo } : {}),
+  };
+}
+
 /** The numbers of the blocking entry the user confirmed, echoed by `POST /api/downloads`. */
 export type ReplaceBlocker = Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>;
 
@@ -746,7 +757,7 @@ interface AdoptWanted {
   revision: string;
 }
 
-/** A plan of Update for one repo: what the job checks, downloads and leaves, and the token that names it. */
+/** A plan of Update for one folder: what the job checks, downloads and leaves, and the token that names it. */
 interface AdoptPlan {
   token: string;
   revision: string;
@@ -1125,13 +1136,17 @@ async function fsyncFile(path: string): Promise<void> {
  */
 type JobStatus = 'running' | 'committing' | 'done' | 'error' | 'cancelled';
 
-/** A settled job: it holds no in-flight work and no longer owns its repo. */
+/** A settled job: it holds no in-flight work and no longer owns its folder. */
 function isTerminal(state: JobStatus): boolean {
   return state === 'done' || state === 'error' || state === 'cancelled';
 }
 
 interface JobState {
   id: string;
+  /** The folder the job installs to under the models directory: the key of a job. */
+  slug: string;
+  /** The catalog build or draft that installs to {@link slug}, looked up when the job was accepted. */
+  target: CatalogTarget;
   repo: string;
   state: JobStatus;
   /** Job-level aggregate bytes across all files. */
@@ -1242,7 +1257,7 @@ export class DownloadManager {
   private currentFile: FileContext | null = null;
   /** The sweep of crashed Reinstall backups started with the manager; every job waits for it. */
   private readonly reinstallRecovery: Promise<void>;
-  /** The last Update plan per repo; a request must carry its token. */
+  /** The last Update plan per folder; a request must carry its token. */
   private readonly adoptPlans = new Map<string, AdoptPlan>();
   /**
    * Files whose hash did not match, keyed `<slug>\0<path>`, so the next plan refuses an unchanged file without hashing
@@ -1262,31 +1277,34 @@ export class DownloadManager {
   }
 
   /**
-   * Queue a catalog repo for download. Rejects any repo not in the catalog, and
-   * refuses outright once {@link shutdown} has begun — the HTTP listener stays
+   * Queue the catalog build or draft that installs to the folder `slug`. Rejects a folder no catalog target installs
+   * to, and refuses outright once {@link shutdown} has begun — the HTTP listener stays
    * attached across the drain, so a late POST would otherwise be adopted by the
    * loop `shutdown` is awaiting and could keep `close()` from ever completing.
-   * `replaceBlocker` makes the job a Reinstall: the unowned entry at the repo's slug, which must hold no model
+   * A folder that holds another build of the same repository is refused with {@link DownloadConflictError}: the
+   * owned swap would delete that build.
+   * `replaceBlocker` makes the job a Reinstall: the unowned entry at the slug, which must hold no model
    * files and must still match these numbers, is replaced once the new model is downloaded and verified. Refused with
    * {@link DownloadConflictError} when either does not hold, and nothing is queued.
    *
-   * At most ONE nonterminal job exists per repo: a request that arrives while a
-   * job for that repo is queued or in flight hands back THAT job's id instead of
-   * allocating another. The Models page tracks a single job id per repo, so a
+   * At most ONE nonterminal job exists per folder: a request that arrives while a
+   * job for that folder is queued or in flight hands back THAT job's id instead of
+   * allocating another. Two builds of one repository install to two folders, so
+   * each gets its own job. The Models page tracks a single job id per folder, so a
    * duplicate request (a double-click on Install, or a second dashboard tab whose
    * card still reads Install) would otherwise leave an untracked twin that Cancel
    * can no longer reach yet that still downloads and installs. Reusing keeps the
    * request idempotent — no 409 for the SPA to render as a red failure — and
    * matches the stance {@link processJob} already takes below, where re-asking for
    * an already-published repo+revision short-circuits to `done` rather than
-   * erroring. A Reinstall request while a plain job holds the repo is refused instead: that job would not replace
+   * erroring. A Reinstall request while a plain job holds the folder is refused instead: that job would not replace
    * the entry the user asked to replace.
    *
-   * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the repo, which the
+   * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the folder, which the
    * request uses up. A repeat Update request while the Update job is active hands back its id; one while another job
-   * holds the repo is refused.
+   * holds the folder is refused.
    */
-  start(repo: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): string {
+  start(slug: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): string {
     if (this.closed) throw new DownloadsClosedError();
     // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
@@ -1294,14 +1312,12 @@ export class DownloadManager {
     // so admitting one here allocates a job that fails mid-download with a 401
     // instead of being refused up front. No UI reaches this for a hidden entry
     // (the Models page filters `!item.hidden`); a direct API POST does.
-    if (!catalogDownloadRepos().includes(repo)) {
-      throw new Error(`Repo "${repo}" is not in the model catalog`);
-    }
+    const target = catalogTarget(slug);
     // Refused before a job exists: nothing is fetched into the HF cache and nothing is made under the link.
     assertModelsDirAvailable(this.modelsDir);
     const asked = opts?.replaceBlocker;
     const token = opts?.adopt;
-    const active = this.activeJobFor(repo);
+    const active = this.activeJobFor(slug);
     if (active !== undefined) {
       if (token !== undefined && active.adopt === null) {
         throw new DownloadConflictError(
@@ -1315,12 +1331,15 @@ export class DownloadManager {
       }
       return active.id;
     }
-    const replace = asked === undefined ? null : this.acceptReplace(repo, asked);
-    const adopt = token === undefined ? null : this.acceptAdopt(repo, token);
+    this.assertNotHeld(target);
+    const replace = asked === undefined ? null : this.acceptReplace(slug, asked);
+    const adopt = token === undefined ? null : this.acceptAdopt(slug, token);
     const id = randomUUID();
     this.jobsById.set(id, {
       id,
-      repo,
+      slug,
+      target,
+      repo: target.repo,
       state: 'running',
       receivedBytes: 0,
       totalBytes: 0,
@@ -1337,11 +1356,24 @@ export class DownloadManager {
   }
 
   /**
-   * The server's summary of the entry a Reinstall of `repo` would replace, when it is still what the user confirmed.
-   * The target is the repo's own slug under the models directory, never a path from the caller.
+   * Refuses a build whose folder holds another build of the same repository: the owned swap of an install, and the
+   * folder check of an Update, would act on that other build.
    */
-  private acceptReplace(repo: string, asked: ReplaceBlocker): ForeignEntrySummary {
-    const slug = repo.split('/').pop()!.toLowerCase();
+  private assertNotHeld(target: CatalogTarget): void {
+    if (target.kind !== 'build') return;
+    const held = heldByOtherBuild(this.modelsDir, target.slug);
+    if (held !== null) {
+      throw new DownloadConflictError(
+        `"${target.slug}" holds ${held}. Delete it in Local models, then install ${target.build.id}.`,
+      );
+    }
+  }
+
+  /**
+   * The server's summary of the entry a Reinstall into `slug` would replace, when it is still what the user confirmed.
+   * The target is the catalog folder under the models directory, never a path from the caller.
+   */
+  private acceptReplace(slug: string, asked: ReplaceBlocker): ForeignEntrySummary {
     const target = modelsChildPath(this.modelsDir, slug, 'replace');
     // Moving a directory to a new parent (the swap's rename into `.staging`) needs write access on the directory.
     // Checked first: a folder that cannot be read also counts as holding model files, and this text says why.
@@ -1351,54 +1383,51 @@ export class DownloadManager {
       );
     }
     if (holdsModelFiles(target)) throw new DownloadConflictError(heldModelMessage(slug));
-    const now = catalogBlocker(this.modelsDir, repo);
+    const now = catalogBlocker(this.modelsDir, slug);
     if (now === null || !sameForeignEntry(now, asked)) {
       throw new DownloadConflictError(`"${slug}" changed on disk. Check it, then try again.`);
     }
     return now;
   }
 
-  /** The plan an Update request confirmed, taken out of `adoptPlans`: it must be the server's last plan for the repo. */
-  private acceptAdopt(repo: string, token: string): AdoptPlan {
-    const plan = this.adoptPlans.get(repo);
+  /** The plan an Update request confirmed, taken out of `adoptPlans`: it must be the server's last plan for the folder. */
+  private acceptAdopt(slug: string, token: string): AdoptPlan {
+    const plan = this.adoptPlans.get(slug);
     if (plan === undefined || plan.token !== token) {
-      const slug = repo.split('/').pop()!.toLowerCase();
       throw new DownloadConflictError(`"${slug}" changed on disk. Close this, then use Update again.`);
     }
-    this.adoptPlans.delete(repo);
+    this.adoptPlans.delete(slug);
     return plan;
   }
 
   /**
-   * Plan an Update of the folder at the repo's slug that holds a model the app did not create: which catalog files are
+   * Plan an Update of the catalog folder `slug` that holds a model the app did not create: which catalog files are
    * there to be checked by hash, which are missing and will be downloaded, and which other files stay. Reads only
    * `lstat` data and the remote manifests, through the raw fetch with a deadline, so a running job neither counts its
-   * bytes nor cancels it. The plan is kept per repo, and a request to start the Update must carry its token. A folder
-   * Update cannot take is refused with a {@link DownloadConflictError} that names the file.
+   * bytes nor cancels it. The plan is kept per folder, and a request to start the Update must carry its token. A
+   * folder Update cannot take is refused with a {@link DownloadConflictError} that names the file.
    */
-  async planAdoption(repo: string): Promise<AdoptPlanSummary> {
+  async planAdoption(slug: string): Promise<AdoptPlanSummary> {
     if (this.closed) throw new DownloadsClosedError();
     assertModelsDirAvailable(this.modelsDir);
-    if (!catalogDownloadRepos().includes(repo)) {
-      throw new Error(`Repo "${repo}" is not in the model catalog`);
-    }
-    if (this.activeJobFor(repo) !== undefined) {
+    const target = catalogTarget(slug);
+    if (this.activeJobFor(slug) !== undefined) {
       throw new DownloadConflictError('A download of this model is already in the queue. Cancel it, then use Update.');
     }
+    this.assertNotHeld(target);
     await this.reinstallRecovery;
-    const slug = repo.split('/').pop()!.toLowerCase();
     let plan: AdoptPlan;
     try {
-      plan = await this.computeAdoptPlan(repo, slug, this.deadlineFetch());
+      plan = await this.computeAdoptPlan(target, this.deadlineFetch());
     } catch (error) {
       if (error instanceof DownloadConflictError) throw error;
       throw new Error(`Could not check the folder: ${describeFailure(error)}`);
     }
-    this.adoptPlans.set(repo, plan);
+    this.adoptPlans.set(slug, plan);
     const bytesOf = (items: ReadonlyArray<{ file: ListFileEntry }>): number =>
       items.reduce((sum, item) => sum + (item.file.size > 0 ? item.file.size : 0), 0);
     return {
-      repo,
+      repo: target.repo,
       slug,
       token: plan.token,
       revision: plan.revision,
@@ -1410,7 +1439,8 @@ export class DownloadManager {
   }
 
   /** The folder gates and the whole plan of an Update, read through `fetchImpl`. */
-  private async computeAdoptPlan(repo: string, slug: string, fetchImpl: typeof fetch): Promise<AdoptPlan> {
+  private async computeAdoptPlan(catalog: CatalogTarget, fetchImpl: typeof fetch): Promise<AdoptPlan> {
+    const { slug, repo } = catalog;
     const target = modelsChildPath(this.modelsDir, slug, 'update');
     if (!isRealDirectory(target) || isDownloaderOwned(target)) {
       throw new DownloadConflictError(changedOnDiskMessage(slug));
@@ -1420,7 +1450,7 @@ export class DownloadManager {
         `The app cannot add files to "${slug}": it has no write permission on it. Change its permissions, then try again.`,
       );
     }
-    const { revision, selection, files, sidecarPlan } = await this.resolveWanted(repo, fetchImpl);
+    const { revision, selection, files, sidecarPlan } = await this.resolveWanted(catalog, fetchImpl);
     const wanted: AdoptWanted[] = files.map((file) => ({ file, repo, revision }));
     if (sidecarPlan !== null) {
       for (const file of sidecarPlan.files) {
@@ -1441,13 +1471,13 @@ export class DownloadManager {
   }
 
   /**
-   * The one nonterminal (queued / in-flight / committing) job for `repo`, if any.
-   * Derived from `jobsById` on demand rather than kept in a repo→id index, so it
+   * The one nonterminal (queued / in-flight / committing) job for the folder `slug`, if any.
+   * Derived from `jobsById` on demand rather than kept in a slug→id index, so it
    * can never go stale: every terminal transition and every dismissal already
    * updates `jobsById`, and a second structure would have to be cleared at each of
-   * those sites. The registry holds at most a handful of catalog repos.
+   * those sites. The registry holds at most a handful of catalog folders.
    */
-  private activeJobFor(repo: string): JobState | undefined {
+  private activeJobFor(slug: string): JobState | undefined {
     for (const job of this.jobsById.values()) {
       // `!job.cancelled` as well as the state: a cancel of the IN-FLIGHT job
       // returns while the job is still `running`, because `cancel()` leaves the
@@ -1456,7 +1486,7 @@ export class DownloadManager {
       // answer a fresh Install with an id that is already stopping — the caller
       // subscribes to a stream whose next frame is `cancelled`, and no download
       // happens. A job on its way out is not an active job.
-      if (job.repo === repo && !isTerminal(job.state) && !job.cancelled) return job;
+      if (job.slug === slug && !isTerminal(job.state) && !job.cancelled) return job;
     }
     return undefined;
   }
@@ -1547,6 +1577,7 @@ export class DownloadManager {
 
   jobs(): Array<{
     id: string;
+    slug: string;
     repo: string;
     state: JobStatus;
     receivedBytes: number;
@@ -1556,6 +1587,7 @@ export class DownloadManager {
       const job = this.jobsById.get(id)!;
       return {
         id: job.id,
+        slug: job.slug,
         repo: job.repo,
         state: job.state,
         receivedBytes: job.receivedBytes,
@@ -1820,12 +1852,12 @@ export class DownloadManager {
   }
 
   /**
-   * Everything a job installs for `repoName`, read through `fetchImpl`: one pinned revision, the glob-filtered
+   * Everything a job installs for `target`, read through `fetchImpl`: one pinned revision, the glob-filtered
    * manifest (which must carry a weight payload), and the sidecar plan. `processJob` runs the same steps one by one,
    * because it records the revision in the update cache before it lists anything.
    */
   private async resolveWanted(
-    repoName: string,
+    target: CatalogTarget,
     fetchImpl: typeof fetch,
   ): Promise<{
     revision: string;
@@ -1833,9 +1865,9 @@ export class DownloadManager {
     files: ListFileEntry[];
     sidecarPlan: SidecarPlan | null;
   }> {
+    const repoName = target.repo;
     const revision = await this.resolveRevision(repoName, fetchImpl);
-    const catalogEntry = catalogEntryForRepo(repoName, process.platform);
-    const selection = catalogEntry === undefined ? {} : catalogSelectionForRepo(catalogEntry, repoName);
+    const selection = selectionOf(target);
     const files = await this.listWantedFiles(repoName, revision, selection.globs?.map(globToRegex), fetchImpl);
     assertModelPayload(repoName, files, selection.assetsRepo);
     const sidecarPlan =
@@ -1844,9 +1876,7 @@ export class DownloadManager {
   }
 
   private async processJob(job: JobState): Promise<void> {
-    // Resolved per platform, matching the allowlist gate in `start` — a job can
-    // only exist for THIS platform's repo, so the lookup cannot miss.
-    const slug = job.repo.split('/').pop()!.toLowerCase();
+    const slug = job.slug;
     const finalDir = join(this.modelsDir, slug);
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
@@ -1931,15 +1961,10 @@ export class DownloadManager {
       // and removed on both success and failure.
       stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}.${process.pid}.${randomUUID()}`);
 
-      // The catalog entry this job installs, and the file-selection fields
-      // that apply to THIS repo: `globs`/`assetsRepo` describe the GGUF build
-      // only, so a platform-specific override repo (the pre-converted CUDA
-      // build) gets neither — globbing safetensors shards would filter out
-      // every weight. `start` already allowlisted the repo against the
-      // catalog, so an undefined entry is only a theoretical catalog-edit
-      // race — treat it as no globs and no sidecars, the pre-filter behavior.
-      const catalogEntry = catalogEntryForRepo(job.repo, process.platform);
-      const selection = catalogEntry === undefined ? {} : catalogSelectionForRepo(catalogEntry, job.repo);
+      // The file-selection fields of the target `start` looked up: a draft and
+      // a platform-specific override repo (the pre-converted CUDA build) carry
+      // no globs and no sidecar source.
+      const selection = selectionOf(job.target);
       const globs = selection.globs?.map(globToRegex);
 
       const files = await this.listWantedFiles(job.repo, revision, globs, this.wrappedFetch);
@@ -1974,11 +1999,13 @@ export class DownloadManager {
         fileCount: aggregateFileCount,
       });
 
-      // Already published, complete, AND pinned to THIS repo+revision (marker
-      // present): the resume/skip case — re-downloading nothing. Gating on the
-      // marker's identity is load-bearing: a complete install of a DIFFERENT
-      // revision (or repo) of the same slug must NOT read as done at this revision's
-      // byte total. On a mismatch, fall through to download the resolved revision;
+      // Already published, complete, AND pinned to THIS repo+revision with every
+      // planned primary file listed (marker present): the resume/skip case —
+      // re-downloading nothing. Gating on the marker's identity is load-bearing:
+      // a complete install of a DIFFERENT revision (or repo) of the same slug must
+      // NOT read as done at this revision's byte total, and neither must an
+      // install of another build of the same repo and revision, whose files are
+      // not this build's. On a mismatch, fall through to download the resolved revision;
       // publish's `isDownloaderOwned`-guarded owned-swap then replaces the stale one
       // (an UNOWNED dir without our marker is still refused there, never destroyed).
       //
@@ -1993,6 +2020,7 @@ export class DownloadManager {
         installed !== undefined &&
         installed.repo === job.repo &&
         installed.revision === revision &&
+        files.every((file) => installed.files.includes(file.path)) &&
         isModelInstalled(finalDir) &&
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
         (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
@@ -2176,7 +2204,7 @@ export class DownloadManager {
   ): Promise<void> {
     const target = modelsChildPath(this.modelsDir, slug, 'update');
     const at = ++this.resolveSeq;
-    const plan = await this.computeAdoptPlan(job.repo, slug, this.wrappedFetch);
+    const plan = await this.computeAdoptPlan(job.target, this.wrappedFetch);
     this.noteJobRevision(job.repo, plan.revision, at);
     if (plan.token !== confirmed.token) {
       throw new Error(`"${slug}" or the catalog changed after you confirmed. ${NOTHING_CHANGED} Use Update again.`);
@@ -2813,7 +2841,7 @@ export class DownloadManager {
    * A fetch failure fails the job rather than publishing without the
    * sidecars: a GGUF without the official tokenizer files is exactly the
    * broken-tool-calling state the fetch exists to prevent (see
-   * {@link CatalogEntry.assetsRepo}).
+   * {@link CatalogBuild.assetsRepo}).
    */
   private async downloadAssetSidecars(
     plan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] },

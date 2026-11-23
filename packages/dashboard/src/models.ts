@@ -302,22 +302,20 @@ function variantFolderGgufs(modelDir: string, rootEntries: readonly string[]): {
 }
 
 /**
- * The quant label of `modelDir` (listed as `folderName`) when its weights are GGUF, or `undefined` when they are not:
- * the root holds primary safetensors, or no GGUF counts by the rule of {@link isModelPresent} (the root GGUFs, else
- * the variant-folder ones). A root file is a build only by the variant walk's split rule ({@link ggufSplitPartNames}:
- * a first part with every part beside it). Each file's build is the one discovery names it by (`ggufVariant`: the
- * file name's quant tag, else its variant folder's). One build gives that build; several give `GGUF`, because the
- * folder is one row that serves each build under its own id. A `config.json` beside GGUF weights is the base model's,
- * so its quant block never applies.
+ * The builds of the GGUF weights of `modelDir` (listed as `folderName`), each once, in file order; empty when its
+ * weights are not GGUF: the root holds primary safetensors, or no GGUF counts by the rule of {@link isModelPresent}
+ * (the root GGUFs, else the variant-folder ones). A root file is a build only by the variant walk's split rule
+ * ({@link ggufSplitPartNames}: a first part with every part beside it). Each file's build is the one discovery names
+ * it by (`ggufVariant`: the file name's quant tag, else its variant folder's).
  */
-function ggufBuildLabel(modelDir: string, folderName: string): string | undefined {
+export function ggufBuilds(modelDir: string, folderName: string): string[] {
   let entries: string[];
   try {
     entries = readdirSync(modelDir);
   } catch {
-    return undefined;
+    return [];
   }
-  if (holdsPrimarySafetensors(modelDir, entries)) return undefined;
+  if (holdsPrimarySafetensors(modelDir, entries)) return [];
   const root = rootGgufNames(modelDir, entries);
   const files: { folder: string | undefined; name: string }[] =
     root.length > 0
@@ -330,8 +328,18 @@ function ggufBuildLabel(modelDir: string, folderName: string): string | undefine
     const names = ggufNames(name, folderName, folder);
     builds.add(ggufVariant(names.stem, folderName, folder, names.id).variant);
   }
-  if (builds.size === 0) return undefined;
-  return builds.size === 1 ? [...builds][0]! : 'GGUF';
+  return [...builds];
+}
+
+/**
+ * The quant label of `modelDir` when its weights are GGUF ({@link ggufBuilds}), or `undefined` when they are not. One
+ * build gives that build; several give `GGUF`, because the folder is one row that serves each build under its own id.
+ * A `config.json` beside GGUF weights is the base model's, so its quant block never applies.
+ */
+function ggufBuildLabel(modelDir: string, folderName: string): string | undefined {
+  const builds = ggufBuilds(modelDir, folderName);
+  if (builds.length === 0) return undefined;
+  return builds.length === 1 ? builds[0]! : 'GGUF';
 }
 
 /** Entries {@link holdsModelFiles} reads before it gives up and answers "holds model files". */
@@ -702,13 +710,17 @@ function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>)
 
 /**
  * Quantization label from `quantization` / `quantization_config`. Micro-scaling
- * and NVFP modes surface by name (`mxfp4`, `mxfp8`, `nvfp4`, `sym8`); affine
+ * and NVFP modes surface by name (`mxfp4`, `mxfp8`, `nvfp4`, `sym8`); a
+ * modelopt checkpoint by its algorithm in lower case (`nvfp4`); affine
  * folds bits into the label (`affine-4bit`); a config with no quant block is
  * full-precision (`null`).
  */
 function detectQuantLabel(config: Record<string, unknown>): string | null {
   const quant = asObject(config.quantization) ?? asObject(config.quantization_config);
   if (quant === undefined) return null;
+  if (quant.quant_method === 'modelopt' && typeof quant.quant_algo === 'string' && quant.quant_algo !== '') {
+    return quant.quant_algo.toLowerCase();
+  }
   const mode =
     typeof quant.mode === 'string'
       ? quant.mode

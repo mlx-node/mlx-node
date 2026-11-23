@@ -13,7 +13,7 @@ import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
 import { modelBlurb, offeredOnHost } from '../lib/catalog';
 import { dismissOnboarding } from '../lib/onboarding';
-import type { CatalogItem, CatalogResponse, ModelsResponse } from '../lib/types';
+import type { CatalogBuildItem, CatalogResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
 import { WindowDragStrip } from '../shell/window-chrome';
 import { hostNote } from './models/catalog';
@@ -22,26 +22,32 @@ import type { ModelDownloadError } from './models/use-model-downloads';
 interface OnboardingProps {
   catalog: AsyncState<CatalogResponse>;
   models: AsyncState<ModelsResponse>;
-  activeRepos: string[];
+  /** The folders with a job this page follows. */
+  activeSlugs: string[];
   downloadError: ModelDownloadError | null;
   downloadsLoading: boolean;
   downloadsError: Error | undefined;
   reloadDownloads: () => void;
-  renderDownload: (item: CatalogItem) => ReactNode;
+  renderDownload: (build: CatalogBuildItem) => ReactNode;
 }
 
 const STEPS = ['Choose a model', 'Download', 'Set up coding agents'] as const;
 
-function availability(item: CatalogItem): string {
-  if (item.blockedByForeignDir) return 'Folder needs cleanup';
-  if (item.present) return 'Downloaded';
+/** The folder of `build` is in the way of its install. */
+function blocked(build: CatalogBuildItem): boolean {
+  return build.blockedByForeignDir || build.heldBy !== null;
+}
+
+function availability(build: CatalogBuildItem): string {
+  if (blocked(build)) return 'Folder needs cleanup';
+  if (build.present) return 'Downloaded';
   return 'One-time download';
 }
 
 export default function Onboarding({
   catalog,
   models,
-  activeRepos,
+  activeSlugs,
   downloadError,
   downloadsLoading,
   downloadsError,
@@ -49,19 +55,20 @@ export default function Onboarding({
   renderDownload,
 }: OnboardingProps): ReactElement {
   const navigate = useNavigate();
-  const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
+  const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
   const host = models.data?.host;
   const items = (catalog.data?.items ?? []).filter(
     (item) => offeredOnHost(item, host) && item.category !== 'systemone',
   );
-  const activeRepo = activeRepos.find((repo) => items.some((item) => item.hfRepo === repo));
+  const activeLabel = items.find((item) => activeSlugs.includes(item.builds[0].slug))?.label;
   const selected =
-    items.find((item) => item.hfRepo === (activeRepo ?? selectedRepo)) ??
-    items.find((item) => item.isDefault === true && !item.blockedByForeignDir) ??
-    items.find((item) => !item.blockedByForeignDir) ??
+    items.find((item) => item.label === (activeLabel ?? selectedLabel)) ??
+    items.find((item) => item.isDefault === true && !blocked(item.builds[0])) ??
+    items.find((item) => !blocked(item.builds[0])) ??
     items[0];
-  const downloading = activeRepo !== undefined;
-  const ready = selected?.present === true && !downloading;
+  const selectedBuild = selected?.builds[0];
+  const downloading = activeLabel !== undefined;
+  const ready = selectedBuild?.present === true && !downloading;
   const error = catalog.error ?? models.error ?? downloadsError;
   const loading = catalog.loading || models.loading || downloadsLoading;
   const modelsDir = models.data?.dir;
@@ -69,8 +76,8 @@ export default function Onboarding({
     modelsDir !== undefined && modelsDir !== '' && !models.loading && !models.refreshing && models.error === undefined;
 
   useEffect(() => {
-    if (activeRepo !== undefined) setSelectedRepo(activeRepo);
-  }, [activeRepo]);
+    if (activeLabel !== undefined) setSelectedLabel(activeLabel);
+  }, [activeLabel]);
 
   const finish = (to: string): void => {
     // The root route checks dismissal for this library; leaving before its identity is known would reopen onboarding.
@@ -141,21 +148,22 @@ export default function Onboarding({
       >
         <legend className="sr-only">Choose your first model</legend>
         {items.map((item) => {
-          const note = hostNote(item, host);
+          const build = item.builds[0];
+          const note = hostNote(build, item.minMemoryGb, host);
           return (
             <ChoiceCard
-              key={item.hfRepo}
+              key={item.label}
               name="first-model"
-              value={item.hfRepo}
-              checked={selected?.hfRepo === item.hfRepo}
-              disabled={item.blockedByForeignDir}
-              onChange={setSelectedRepo}
+              value={item.label}
+              checked={selected?.label === item.label}
+              disabled={blocked(build)}
+              onChange={setSelectedLabel}
               ariaLabel={item.label}
-              describedBy={`description-${item.slug}`}
-              descriptionId={`description-${item.slug}`}
+              describedBy={`description-${build.slug}`}
+              descriptionId={`description-${build.slug}`}
               media={<ModelLogo model={item.label} className="size-7" />}
               badge={
-                item.present ? (
+                build.present ? (
                   <Badge tone="success" size="sm">
                     On this Mac
                   </Badge>
@@ -167,7 +175,7 @@ export default function Onboarding({
               }
               title={prettyModelName(item.label)}
               description={modelBlurb(item)}
-              meta={`~${item.sizeGb} GB · ${availability(item)}`}
+              meta={`~${build.sizeGb} GB · ${availability(build)}`}
               warning={note ?? undefined}
             />
           );
@@ -176,7 +184,7 @@ export default function Onboarding({
     );
   }
 
-  const showDock = error === undefined && !loading && selected !== undefined;
+  const showDock = error === undefined && !loading && selected !== undefined && selectedBuild !== undefined;
 
   return (
     <div data-onboarding="" className="grid h-screen grid-rows-[40px_minmax(0,1fr)_auto] text-foreground">
@@ -239,7 +247,7 @@ export default function Onboarding({
                       ? 'The download is complete.'
                       : downloading
                         ? 'Keep the app open. You can look around while it downloads.'
-                        : `About ${selected.sizeGb} GB to download.`}
+                        : `About ${selectedBuild.sizeGb} GB to download.`}
                   </p>
                 </div>
                 <div className="grid w-[17.5rem] max-w-full shrink-0 justify-items-center gap-2">
@@ -261,11 +269,11 @@ export default function Onboarding({
                     </>
                   ) : (
                     <>
-                      <div className="w-full">{renderDownload(selected)}</div>
+                      <div className="w-full">{renderDownload(selectedBuild)}</div>
                       {downloading ? null : (
                         <a
                           className="link inline-flex items-center gap-1 text-caption"
-                          href={`https://huggingface.co/${selected.hfRepo}`}
+                          href={`https://huggingface.co/${selectedBuild.hfRepo}`}
                           target="_blank"
                           rel="noreferrer"
                         >
@@ -277,7 +285,7 @@ export default function Onboarding({
                   )}
                 </div>
               </div>
-              {downloadError?.repo === selected.hfRepo ? (
+              {downloadError?.slug === selectedBuild.slug ? (
                 <div className="mt-3">
                   <Alert tone="danger" title="Download failed">
                     {downloadError.message} Please try again.

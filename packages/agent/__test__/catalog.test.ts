@@ -1,14 +1,17 @@
 import { totalmem } from 'node:os';
 
+import { ggufNames, ggufVariant } from '@mlx-node/lm/model-variant';
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
-  type CatalogEntry,
-  catalogDownloadRepos,
-  catalogEntryForRepo,
+  type CatalogBuild,
+  catalogBuildRepo,
+  catalogBuildSlug,
+  catalogDraftSlug,
   catalogFitsMemory,
-  catalogRepo,
-  catalogRepoFor,
+  catalogSharesRepo,
+  catalogTargetForSlug,
+  catalogTargets,
   catalogUpdateRepos,
   MODEL_CATALOG,
   visibleCatalog,
@@ -24,6 +27,9 @@ const MAC_96 = 96 * GIB;
 const SMALL_MAC = 36 * GIB;
 /** The entries the catalog offers only from 96 GiB. */
 const FLOORED = ['Qwen3.8-Flash-Next', 'Hy4-flash'];
+
+/** `[path, bytes]` of every file of a repository listing. */
+type RepoFiles = ReadonlyArray<readonly [string, number]>;
 
 /** `mlx download model --glob` matching for `*`-only globs: anchored, case-insensitive. */
 function globMatches(pattern: string, text: string): boolean {
@@ -44,7 +50,7 @@ function globMatches(pattern: string, text: string): boolean {
   return true;
 }
 
-/** Repo files the downloader always takes beside a glob selection. */
+/** Repo files the downloader always takes beside a glob selection (`CORE_FILES` in `packages/dashboard/src/download.ts`). */
 const CORE_FILES = new Set([
   'config.json',
   'tokenizer.json',
@@ -54,296 +60,545 @@ const CORE_FILES = new Set([
   'merges.txt',
 ]);
 
-/** The files a glob-filtered install takes: a glob matches the basename or the full repo path, plus the core files. */
-function selectedFiles(entry: CatalogEntry, files: readonly string[]): string[] {
-  return files.filter(
-    (file) =>
-      CORE_FILES.has(file) ||
-      entry.globs!.some((glob) => globMatches(glob, file) || globMatches(glob, file.split('/').pop()!)),
+/** The downloader's filter with no globs (`isWantedFile` in `packages/dashboard/src/download.ts`). */
+function defaultWanted(path: string): boolean {
+  return (
+    CORE_FILES.has(path) ||
+    ['.safetensors', '.json', '.pdiparams', '.yml', '.gguf', '.jinja'].some((suffix) => path.endsWith(suffix))
   );
 }
 
-/** Expected weight variant per visible entry; every unsloth repo ships UD-Q4_K_XL, AngelSlim ships no UD quants. */
-const VARIANT: Record<string, string> = {
-  'Qwen3.8-27B': 'UD-Q4_K_XL',
-  'Inkling-2-Mini': 'UD-Q4_K_XL',
-  'Gemma-4-26B-A4B': 'UD-Q4_K_XL',
-  'Qwen3.8-Flash-Next': 'UD-Q4_K_XL',
-  'Hy4-flash': 'Q4_K_M',
-};
+/**
+ * The files an install of `build` takes, in listing order: with globs, a glob matches the basename or the full repo
+ * path, plus the core files; without, the default filter (`isWantedFileFor` in `packages/dashboard/src/download.ts`).
+ */
+function selectedFiles(build: CatalogBuild, files: RepoFiles): string[] {
+  const globs = build.globs;
+  return files
+    .map(([path]) => path)
+    .filter((path) =>
+      globs === undefined
+        ? defaultWanted(path)
+        : CORE_FILES.has(path) ||
+          globs.some((glob) => globMatches(glob, path) || globMatches(glob, path.split('/').pop()!)),
+    );
+}
 
-/** `AngelSlim/Hy4-flash-GGUF` files on Hugging Face (2026-11-19, main ecd803c859a3). */
-const HY4_REPO_FILES = [
-  '.gitattributes',
-  'Hy4-flash-IQ2_AH-00001-of-00002.gguf',
-  'Hy4-flash-IQ2_AH-00002-of-00002.gguf',
-  'Hy4-flash-Q3_K-00001-of-00002.gguf',
-  'Hy4-flash-Q3_K-00002-of-00002.gguf',
-  'Hy4-flash-Q4_K_M-00001-of-00002.gguf',
-  'Hy4-flash-Q4_K_M-00002-of-00002.gguf',
-  'Hy4-flash-SPARK-4Bit-Fast.gguf',
-  'Hy4-flash-SPARK-4Bit.gguf',
-  'LICENSE',
-  'README.md',
-  'README_CN.md',
-  'README_SPARK-4Bit.md',
-  'hy4-flash-gguf-benchmark.png',
-  'mmproj-Hy4-flash-bf16.gguf',
-  'patch/hy4-flash-mac-minimal.patch',
-  'patch/hy4-flash-spark.patch',
+/** The byte sum of `paths` in `files`. */
+function bytesOf(files: RepoFiles, paths: readonly string[]): number {
+  const sizes = new Map(files);
+  return paths.reduce((sum, path) => sum + sizes.get(path)!, 0);
+}
+
+/** The build `id` of the entry `label`. */
+function buildOf(label: string, id: string): CatalogBuild {
+  const build = MODEL_CATALOG.find((entry) => entry.label === label)?.builds.find((candidate) => candidate.id === id);
+  if (build === undefined) throw new Error(`no build ${label} ${id}`);
+  return build;
+}
+
+/** Every build of every entry, hidden ones included. */
+const ALL_BUILDS = MODEL_CATALOG.flatMap((entry) => entry.builds.map((build) => ({ entry, build })));
+
+/** `unsloth/Qwen3.8-27B-GGUF` files on Hugging Face (2026-11-23, main 4af51b35). */
+const QWEN_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 4238],
+  ['BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf', 49986159616],
+  ['BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf', 4671576000],
+  ['MTP/mtp-Qwen3.8-27B-Q4_0.gguf', 1369590656],
+  ['Qwen3.8-27B-Q4_0.gguf', 16056478688],
+  ['Qwen3.8-27B-Q4_1.gguf', 17540705248],
+  ['Qwen3.8-27B-Q8_0.gguf', 29047086048],
+  ['Qwen3.8-27B-UD-IQ1_M.gguf', 6729166848],
+  ['Qwen3.8-27B-UD-IQ1_S.gguf', 6192222208],
+  ['Qwen3.8-27B-UD-IQ2_S.gguf', 8422719488],
+  ['Qwen3.8-27B-UD-IQ2_XS.gguf', 7625883648],
+  ['Qwen3.8-27B-UD-IQ2_XXS.gguf', 7206043648],
+  ['Qwen3.8-27B-UD-IQ3_S.gguf', 12040883104],
+  ['Qwen3.8-27B-UD-IQ3_XXS.gguf', 10934860704],
+  ['Qwen3.8-27B-UD-IQ4_XS.gguf', 14352911264],
+  ['Qwen3.8-27B-UD-Q2_K_XL.gguf', 9948666784],
+  ['Qwen3.8-27B-UD-Q3_K_XL.gguf', 13146393504],
+  ['Qwen3.8-27B-UD-Q4_K_M.gguf', 16564259744],
+  ['Qwen3.8-27B-UD-Q4_K_S.gguf', 15358213024],
+  ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 17659407264],
+  ['Qwen3.8-27B-UD-Q5_K_M.gguf', 19870878624],
+  ['Qwen3.8-27B-UD-Q5_K_S.gguf', 18764794784],
+  ['Qwen3.8-27B-UD-Q5_K_XL.gguf', 20976962464],
+  ['Qwen3.8-27B-UD-Q6_K.gguf', 21980441504],
+  ['Qwen3.8-27B-UD-Q6_K_L.gguf', 24181549984],
+  ['Qwen3.8-27B-UD-Q6_K_M.gguf', 23087180704],
+  ['Qwen3.8-27B-UD-Q6_K_XL.gguf', 25299061664],
+  ['Qwen3.8-27B-UD-Q8_K_L.gguf', 28045695904],
+  ['Qwen3.8-27B-UD-Q8_K_XL.gguf', 31457991680],
+  ['README.md', 6945],
+  ['config.json', 3760],
+  ['imatrix_unsloth.gguf', 13642656],
+  ['mmproj-BF16.gguf', 931146432],
+  ['mmproj-F16.gguf', 927607488],
 ];
 
 /** `unsloth/Inkling-2-Mini-GGUF` files on Hugging Face (2026-11-23, main 800c946d7b9c). */
-const INKLING_REPO_FILES = [
-  '.gitattributes',
-  'Inkling-2-Mini-UD-IQ1_M.gguf',
-  'Inkling-2-Mini-UD-IQ1_S.gguf',
-  'Inkling-2-Mini-UD-IQ2_XXS.gguf',
-  'Inkling-2-Mini-UD-IQ3_XXS.gguf',
-  'Inkling-2-Mini-UD-IQ4_XS.gguf',
-  'Inkling-2-Mini-UD-Q2_K_XL.gguf',
-  'Inkling-2-Mini-UD-Q3_K_XL.gguf',
-  'Inkling-2-Mini-UD-Q4_K_M.gguf',
-  'Inkling-2-Mini-UD-Q4_K_XL.gguf',
-  'Inkling-2-Mini-UD-Q8_K_XL.gguf',
-  'Mainline_Support/Inkling-2-Mini-UD-IQ1_M.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-IQ1_S.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-IQ2_XXS.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-IQ3_XXS.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-IQ4_XS.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-Q3_K_XL.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file',
-  'Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file',
-  'Mainline_Support/README.md',
-  'Mainline_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file',
-  'README.md',
-  'assets/size_vs_kld.png',
-  'assets/size_vs_top1.png',
-  'dspark-Inkling-2-Mini-Q8_0.gguf',
-  'dspark/README.md',
-  'dspark/dspark-Inkling-2-Mini-BF16-mainline.gguf_file',
-  'dspark/dspark-Inkling-2-Mini-BF16.gguf',
-  'mmproj-BF16.gguf',
-  'mmproj-F16.gguf',
-  'mmproj-F32.gguf',
+const INKLING_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 5674],
+  ['Inkling-2-Mini-UD-IQ1_M.gguf', 8024441024],
+  ['Inkling-2-Mini-UD-IQ1_S.gguf', 7764291776],
+  ['Inkling-2-Mini-UD-IQ2_XXS.gguf', 8486236352],
+  ['Inkling-2-Mini-UD-IQ3_XXS.gguf', 11663309504],
+  ['Inkling-2-Mini-UD-IQ4_XS.gguf', 15733755232],
+  ['Inkling-2-Mini-UD-Q2_K_XL.gguf', 9138715328],
+  ['Inkling-2-Mini-UD-Q3_K_XL.gguf', 13631778016],
+  ['Inkling-2-Mini-UD-Q4_K_M.gguf', 16610543328],
+  ['Inkling-2-Mini-UD-Q4_K_XL.gguf', 17629759456],
+  ['Inkling-2-Mini-UD-Q8_K_XL.gguf', 22867451616],
+  ['Mainline_Support/Inkling-2-Mini-UD-IQ1_M.gguf_file', 8024442304],
+  ['Mainline_Support/Inkling-2-Mini-UD-IQ1_S.gguf_file', 7764293056],
+  ['Mainline_Support/Inkling-2-Mini-UD-IQ2_XXS.gguf_file', 8486237632],
+  ['Mainline_Support/Inkling-2-Mini-UD-IQ3_XXS.gguf_file', 11663310784],
+  ['Mainline_Support/Inkling-2-Mini-UD-IQ4_XS.gguf_file', 15733756512],
+  ['Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file', 9138716608],
+  ['Mainline_Support/Inkling-2-Mini-UD-Q3_K_XL.gguf_file', 13631779296],
+  ['Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file', 16610544608],
+  ['Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file', 17629760736],
+  ['Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file', 22867452896],
+  ['Mainline_Support/README.md', 5733],
+  ['Mainline_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file', 503889952],
+  ['README.md', 56464],
+  ['assets/size_vs_kld.png', 273844],
+  ['assets/size_vs_top1.png', 275713],
+  ['dspark-Inkling-2-Mini-Q8_0.gguf', 402278560],
+  ['dspark/README.md', 4144],
+  ['dspark/dspark-Inkling-2-Mini-BF16-mainline.gguf_file', 749371936],
+  ['dspark/dspark-Inkling-2-Mini-BF16.gguf', 647792800],
+  ['mmproj-BF16.gguf', 641805760],
+  ['mmproj-F16.gguf', 639348160],
+  ['mmproj-F32.gguf', 1273048512],
+];
+
+/** `thinkingmachines/Inkling-2-Mini` files on Hugging Face (2026-11-23, main 7a67ae23). */
+const INKLING_ORIGINAL_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 1570],
+  ['README.md', 54898],
+  ['chat_template.jinja', 6868],
+  ['config.json', 2722],
+  ['generation_config.json', 98],
+  ['hf_quant_config.json', 67924],
+  ['model-00001-of-00001.safetensors', 19526019168],
+  ['model.safetensors.index.json', 109300],
+  ['mtp.safetensors', 635801416],
+  ['processor_config.json', 461],
+  ['special_tokens_map.json', 529],
+  ['tiktoken/tokenizer.model', 3386494],
+  ['tokenizer.json', 26178678],
+  ['tokenizer_config.json', 13235],
 ];
 
 /** `unsloth/Qwen3.8-Flash-Next-GGUF` files on Hugging Face (2026-11-23, main f5d175de2cf7). */
-const FLASH_NEXT_REPO_FILES = [
-  '.gitattributes',
-  'BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00002-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00004-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00005-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00006-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00007-of-00008.gguf',
-  'BF16/Qwen3.8-Flash-Next-BF16-00008-of-00008.gguf',
-  'MTP/README.md',
-  'MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf',
-  'MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf',
-  'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
-  'MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf',
-  'MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf',
-  'MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf',
-  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf',
-  'README.md',
-  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf',
-  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf',
-  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf',
-  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf',
-  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf',
-  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf',
-  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf',
-  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf',
-  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf',
-  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf',
-  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf',
-  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf',
-  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf',
-  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf',
-  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf',
-  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf',
-  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf',
-  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf',
-  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf',
-  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf',
-  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf',
-  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf',
-  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf',
-  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf',
-  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf',
-  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00004.gguf',
-  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00004.gguf',
-  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00004-of-00004.gguf',
-  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
-  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf',
-  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf',
-  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00002-of-00006.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00003-of-00006.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00004-of-00006.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00005-of-00006.gguf',
-  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00006-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf',
-  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf',
-  'engram/Qwen3.8-Flash-Next-engram-BF16.gguf_file',
-  'engram/Qwen3.8-Flash-Next-engram-IQ4_NL.gguf_file',
-  'engram/Qwen3.8-Flash-Next-engram-Q5_1.gguf_file',
-  'engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file',
-  'engram/README.md',
-  'engram/set_split.py',
-  'imatrix_unsloth.gguf_file',
-  'mmproj-BF16.gguf',
-  'mmproj-F16.gguf',
-  'mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
+const FLASH_NEXT_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 9116],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf', 10946368],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00002-of-00008.gguf', 10447201664],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf', 102400491712],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00004-of-00008.gguf', 48394236672],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00005-of-00008.gguf', 48367899040],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00006-of-00008.gguf', 48615233984],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00007-of-00008.gguf', 48367899040],
+  ['BF16/Qwen3.8-Flash-Next-BF16-00008-of-00008.gguf', 47426022016],
+  ['MTP/README.md', 5906],
+  ['MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf', 7770760320],
+  ['MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf', 2786204800],
+  ['MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf', 4137429120],
+  ['MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf', 5227963456],
+  ['MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf', 1907151936],
+  ['MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf', 2786568256],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf', 10946624],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf', 682434912],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf', 54400261312],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf', 49446841216],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf', 49668930400],
+  ['Q8_0/Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf', 34015618784],
+  ['README.md', 60460],
+  ['UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf', 10946618],
+  ['UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf', 39196009888],
+  ['UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf', 28800138432],
+  ['UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf', 10946618],
+  ['UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf', 37568095648],
+  ['UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf', 28800138432],
+  ['UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf', 10946618],
+  ['UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf', 47021008288],
+  ['UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf', 28800138432],
+  ['UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf', 10946618],
+  ['UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf', 49946027488],
+  ['UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf', 4869325888],
+  ['UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf', 28800138432],
+  ['UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf', 10946618],
+  ['UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf', 49604491008],
+  ['UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf', 15256783680],
+  ['UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf', 28800138432],
+  ['UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf', 10946618],
+  ['UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf', 41738806688],
+  ['UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf', 28800138432],
+  ['UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf', 10946618],
+  ['UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf', 49732486272],
+  ['UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf', 1037181344],
+  ['UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf', 28800138432],
+  ['UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf', 10946618],
+  ['UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00004.gguf', 49742117248],
+  ['UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00004.gguf', 10911746208],
+  ['UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00004-of-00004.gguf', 28800138432],
+  ['UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf', 10946618],
+  ['UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf', 49720539552],
+  ['UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf', 32803030176],
+  ['UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf', 28800138432],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf', 10946618],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00002-of-00006.gguf', 682434912],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00003-of-00006.gguf', 54400261312],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00004-of-00006.gguf', 49990245824],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00005-of-00006.gguf', 49882416192],
+  ['UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00006-of-00006.gguf', 3320101792],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf', 10946624],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf', 682434912],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf', 54400261312],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf', 49814108512],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf', 49419317344],
+  ['UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf', 14838313984],
+  ['engram/Qwen3.8-Flash-Next-engram-BF16.gguf_file', 102400491712],
+  ['engram/Qwen3.8-Flash-Next-engram-IQ4_NL.gguf_file', 28800138432],
+  ['engram/Qwen3.8-Flash-Next-engram-Q5_1.gguf_file', 38400184512],
+  ['engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file', 54400261312],
+  ['engram/README.md', 5097],
+  ['engram/set_split.py', 350],
+  ['imatrix_unsloth.gguf_file', 580038720],
+  ['mmproj-BF16.gguf', 907542944],
+  ['mmproj-F16.gguf', 904004000],
+  ['mtp-Qwen3.8-Flash-Next-Q8_0.gguf', 4137429120],
 ];
 
+/** `AngelSlim/Hy4-flash-GGUF` files on Hugging Face (2026-11-19, main ecd803c859a3). */
+const HY4_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 2753],
+  ['Hy4-flash-IQ2_AH-00001-of-00002.gguf', 71635656768],
+  ['Hy4-flash-IQ2_AH-00002-of-00002.gguf', 63360616128],
+  ['Hy4-flash-Q3_K-00001-of-00002.gguf', 92010389504],
+  ['Hy4-flash-Q3_K-00002-of-00002.gguf', 63360616128],
+  ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 104986517504],
+  ['Hy4-flash-Q4_K_M-00002-of-00002.gguf', 63360616128],
+  ['Hy4-flash-SPARK-4Bit-Fast.gguf', 159611554144],
+  ['Hy4-flash-SPARK-4Bit.gguf', 162509777248],
+  ['LICENSE', 13942],
+  ['README.md', 4868],
+  ['README_CN.md', 4612],
+  ['README_MAC-Metal.md', 10447],
+  ['README_SPARK-4Bit.md', 13234],
+  ['mmproj-Hy4-flash-bf16.gguf', 1044397440],
+  ['patch/hy4-flash-mac-minimal.patch', 303694],
+  ['patch/hy4-flash-spark.patch', 315266],
+];
+
+/** The real file list of each published GGUF build's repository. */
+const REPO_FILES: ReadonlyMap<string, RepoFiles> = new Map([
+  ['unsloth/Qwen3.8-27B-GGUF', QWEN_REPO_FILES],
+  ['unsloth/Inkling-2-Mini-GGUF', INKLING_REPO_FILES],
+  ['thinkingmachines/Inkling-2-Mini', INKLING_ORIGINAL_REPO_FILES],
+  ['unsloth/Qwen3.8-Flash-Next-GGUF', FLASH_NEXT_REPO_FILES],
+  ['AngelSlim/Hy4-flash-GGUF', HY4_REPO_FILES],
+]);
+
+describe('install folders', () => {
+  it('pins every install folder', () => {
+    const folders = [
+      ...ALL_BUILDS.map(({ entry, build }) => [entry.label, build.id, catalogBuildSlug(build, 'darwin')]),
+      ...MODEL_CATALOG.flatMap((entry) =>
+        entry.draft === undefined ? [] : [[entry.label, entry.draft.label, catalogDraftSlug(entry.draft)]],
+      ),
+    ];
+    expect(folders).toEqual([
+      ['Qwen3.8-27B', 'UD-Q4_K_XL', 'qwen3.8-27b-gguf'],
+      ['Qwen3.8-27B', 'UD-Q4_K_M', 'qwen3.8-27b-gguf-ud-q4_k_m'],
+      ['Inkling-2-Mini', 'UD-Q4_K_XL', 'inkling-2-mini-gguf'],
+      ['Inkling-2-Mini', 'UD-Q4_K_M', 'inkling-2-mini-gguf-ud-q4_k_m'],
+      ['Inkling-2-Mini', 'Original', 'inkling-2-mini'],
+      ['Qwen3.8-Flash-Next', 'UD-Q4_K_XL', 'qwen3.8-flash-next-gguf'],
+      ['Hy4-flash', 'Q4_K_M', 'hy4-flash-gguf'],
+      ['Gemma-4-12B', 'MXFP', 'gemma-4-12b-it-mxfp-mlx'],
+      ['Nemotron-3.5-Lightning-30B-A3B', 'NVFP4', 'nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4-mlx'],
+      ['Clairic Flash (9B)', 'UD-Q4_K_XL', 'clairic-flash-gguf'],
+      ['Clairic (27B)', 'UD-Q4_K_XL', 'clairic-gguf'],
+      ['Qwen3.8-27B', 'DFlash2', 'qwen3.8-27b-dflash2'],
+    ]);
+    const names = folders.map((row) => row[2]);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it('gives at most one build of a repository the folder with no suffix', () => {
+    const plain = new Map<string, number>();
+    for (const { build } of ALL_BUILDS) {
+      if (build.folderSuffix !== undefined) continue;
+      plain.set(build.hfRepo, (plain.get(build.hfRepo) ?? 0) + 1);
+    }
+    for (const [repo, count] of plain) expect(count, repo).toBe(1);
+    // A suffix is only for a build whose repository another build already installs.
+    for (const { build } of ALL_BUILDS) {
+      if (build.folderSuffix !== undefined) expect(catalogSharesRepo(build, 'darwin'), build.id).toBe(true);
+    }
+  });
+
+  it('names the repositories two builds share, and only those', () => {
+    const shared = ALL_BUILDS.filter(({ build }) => catalogSharesRepo(build, 'darwin')).map(({ entry, build }) => [
+      entry.label,
+      build.id,
+    ]);
+    expect(shared).toEqual([
+      ['Qwen3.8-27B', 'UD-Q4_K_XL'],
+      ['Qwen3.8-27B', 'UD-Q4_K_M'],
+      ['Inkling-2-Mini', 'UD-Q4_K_XL'],
+      ['Inkling-2-Mini', 'UD-Q4_K_M'],
+    ]);
+  });
+
+  it('resolves the CUDA build only when a build carries one, and its folder follows the repo', () => {
+    // Via the pure parameter, never by mutating `process.platform`: that global is
+    // shared with every test file on this worker.
+    const withCuda: CatalogBuild = { id: 't', hfRepo: 'a/Metal', hfRepoCuda: 'a/Cuda-X', sizeGb: 1, source: 'MLX' };
+    expect(catalogBuildRepo(withCuda, 'linux')).toBe('a/Cuda-X');
+    expect(catalogBuildRepo(withCuda, 'darwin')).toBe('a/Metal');
+    expect(catalogBuildSlug(withCuda, 'linux')).toBe('cuda-x');
+    expect(catalogBuildSlug({ ...withCuda, folderSuffix: 'q4' }, 'darwin')).toBe('metal-q4');
+    for (const { entry, build } of ALL_BUILDS) {
+      expect(build.hfRepoCuda, entry.label).toBeUndefined();
+      expect(catalogBuildRepo(build, 'linux'), entry.label).toBe(build.hfRepo);
+      expect(catalogBuildRepo(build), entry.label).toBe(catalogBuildRepo(build, process.platform));
+    }
+  });
+});
+
+describe('builds', () => {
+  it('pins the four chat models and their builds to their verified repos + sidecar sources', () => {
+    // Load-bearing strings: a typo here is a 404 at best and the wrong weights
+    // at worst. Verified on Hugging Face.
+    expect(
+      visibleCatalog(BIG_MAC).map((entry) => [
+        entry.label,
+        entry.builds.map((build) => [build.id, build.hfRepo, build.assetsRepo, build.sizeGb, build.source]),
+      ]),
+    ).toEqual([
+      [
+        'Qwen3.8-27B',
+        [
+          ['UD-Q4_K_XL', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 17.7, 'Unsloth GGUF'],
+          ['UD-Q4_K_M', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 16.6, 'Unsloth GGUF'],
+        ],
+      ],
+      [
+        'Inkling-2-Mini',
+        [
+          ['UD-Q4_K_XL', 'unsloth/Inkling-2-Mini-GGUF', 'thinkingmachines/Inkling-2-Mini', 18.7, 'Unsloth GGUF'],
+          ['UD-Q4_K_M', 'unsloth/Inkling-2-Mini-GGUF', 'thinkingmachines/Inkling-2-Mini', 17.7, 'Unsloth GGUF'],
+          ['Original', 'thinkingmachines/Inkling-2-Mini', undefined, 20.2, 'Thinking Machines'],
+        ],
+      ],
+      [
+        'Qwen3.8-Flash-Next',
+        [['UD-Q4_K_XL', 'unsloth/Qwen3.8-Flash-Next-GGUF', 'Qwen/Qwen3.8-Flash-Next', 111.3, 'Unsloth GGUF']],
+      ],
+      ['Hy4-flash', [['Q4_K_M', 'AngelSlim/Hy4-flash-GGUF', 'tencent/Hy4-flash', 168.3, 'AngelSlim GGUF']]],
+    ]);
+    expect(MODEL_CATALOG.map((entry) => entry.label)).not.toContain('Gemma-4-26B-A4B');
+  });
+
+  it('every repo is a plausible HF slug, and every build id is unique in its entry', () => {
+    for (const entry of MODEL_CATALOG) {
+      const ids = entry.builds.map((build) => build.id);
+      expect(new Set(ids).size, entry.label).toBe(ids.length);
+      for (const build of entry.builds) {
+        expect(build.hfRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
+        if (build.assetsRepo !== undefined) {
+          expect(build.assetsRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
+        }
+      }
+    }
+  });
+
+  it('every GGUF build names an assetsRepo for tokenizer sidecars', () => {
+    // The GGUF repos ship no tokenizer files; without the official sidecars
+    // the native runtime extracts the embedded tokenizer and tool calling
+    // silently breaks (see the assetsRepo field comment).
+    for (const entry of visibleCatalog(BIG_MAC)) {
+      for (const build of entry.builds) {
+        if (build.hfRepo.endsWith('-GGUF')) expect(build.assetsRepo, `${entry.label} ${build.id}`).toBeDefined();
+      }
+    }
+  });
+
+  it('a build id is the tag discovery reads from its weight file', () => {
+    // The weight file of each build, in the folder it installs to, through the
+    // engine's own name parser.
+    const weights: ReadonlyArray<readonly [CatalogBuild, string, string | undefined]> = [
+      [buildOf('Qwen3.8-27B', 'UD-Q4_K_XL'), 'Qwen3.8-27B-UD-Q4_K_XL.gguf', undefined],
+      [buildOf('Qwen3.8-27B', 'UD-Q4_K_M'), 'Qwen3.8-27B-UD-Q4_K_M.gguf', undefined],
+      [buildOf('Inkling-2-Mini', 'UD-Q4_K_XL'), 'Inkling-2-Mini-UD-Q4_K_XL.gguf', undefined],
+      [buildOf('Inkling-2-Mini', 'UD-Q4_K_M'), 'Inkling-2-Mini-UD-Q4_K_M.gguf', undefined],
+      [buildOf('Qwen3.8-Flash-Next', 'UD-Q4_K_XL'), 'Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf', 'UD-Q4_K_XL'],
+      [buildOf('Hy4-flash', 'Q4_K_M'), 'Hy4-flash-Q4_K_M-00001-of-00002.gguf', undefined],
+    ];
+    for (const [build, file, variantFolder] of weights) {
+      const folder = catalogBuildSlug(build, 'darwin');
+      const names = ggufNames(file, folder, variantFolder);
+      expect(ggufVariant(names.stem, folder, variantFolder, names.id).variant, file).toBe(build.id);
+    }
+  });
+});
+
+describe('the files each build installs', () => {
+  it('selects the real files of every published build, and its size is their byte sum', () => {
+    const expected: ReadonlyArray<readonly [string, string, readonly string[], number]> = [
+      ['Qwen3.8-27B', 'UD-Q4_K_XL', ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'config.json'], 17_659_411_024],
+      ['Qwen3.8-27B', 'UD-Q4_K_M', ['Qwen3.8-27B-UD-Q4_K_M.gguf', 'config.json'], 16_564_263_504],
+      [
+        'Inkling-2-Mini',
+        'UD-Q4_K_XL',
+        ['Inkling-2-Mini-UD-Q4_K_XL.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf', 'mmproj-BF16.gguf'],
+        18_673_843_776,
+      ],
+      [
+        'Inkling-2-Mini',
+        'UD-Q4_K_M',
+        ['Inkling-2-Mini-UD-Q4_K_M.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf', 'mmproj-BF16.gguf'],
+        17_654_627_648,
+      ],
+      [
+        'Inkling-2-Mini',
+        'Original',
+        [
+          'chat_template.jinja',
+          'config.json',
+          'generation_config.json',
+          'hf_quant_config.json',
+          'model-00001-of-00001.safetensors',
+          'model.safetensors.index.json',
+          'mtp.safetensors',
+          'processor_config.json',
+          'special_tokens_map.json',
+          'tokenizer.json',
+          'tokenizer_config.json',
+        ],
+        20_188_200_399,
+      ],
+      [
+        'Qwen3.8-Flash-Next',
+        'UD-Q4_K_XL',
+        [
+          'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+          'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf',
+          'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf',
+          'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf',
+        ],
+        111_334_654_778,
+      ],
+      [
+        'Hy4-flash',
+        'Q4_K_M',
+        ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
+        168_347_133_632,
+      ],
+    ];
+    const covered = new Set<CatalogBuild>();
+    for (const [label, id, files, bytes] of expected) {
+      const build = buildOf(label, id);
+      covered.add(build);
+      const listing = REPO_FILES.get(build.hfRepo)!;
+      const selected = selectedFiles(build, listing);
+      expect(selected, `${label} ${id}`).toEqual(files);
+      expect(bytesOf(listing, selected), `${label} ${id}`).toBe(bytes);
+      expect(Math.round(bytes / 1e8) / 10, `${label} ${id}`).toBe(build.sizeGb);
+    }
+    // Every chat build of the catalog is checked here.
+    for (const entry of visibleCatalog(BIG_MAC)) {
+      for (const build of entry.builds) expect(covered.has(build), `${entry.label} ${build.id}`).toBe(true);
+    }
+  });
+
+  it('the Qwen UD-Q4_K_M glob takes one weight and not the XL file', () => {
+    const selected = selectedFiles(buildOf('Qwen3.8-27B', 'UD-Q4_K_M'), QWEN_REPO_FILES);
+    expect(selected.filter((path) => path.endsWith('.gguf'))).toEqual(['Qwen3.8-27B-UD-Q4_K_M.gguf']);
+    expect(selected).not.toContain('Qwen3.8-27B-UD-Q4_K_XL.gguf');
+  });
+
+  it('the Inkling UD-Q4_K_M glob leaves Mainline_Support alone', () => {
+    // `*UD-Q4_K_M*` would also take `Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file`,
+    // 16.6 GB more of the same tensors.
+    const selected = selectedFiles(buildOf('Inkling-2-Mini', 'UD-Q4_K_M'), INKLING_REPO_FILES);
+    expect(selected).toHaveLength(3);
+    expect(selected).not.toContain('Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file');
+    expect(selected).not.toContain('Inkling-2-Mini-UD-Q4_K_XL.gguf');
+  });
+
+  it('Inkling Original takes the default filter: no globs, no sidecar repo, and not the tiktoken file', () => {
+    const original = buildOf('Inkling-2-Mini', 'Original');
+    expect(original.globs).toBeUndefined();
+    expect(original.assetsRepo).toBeUndefined();
+    expect(selectedFiles(original, INKLING_ORIGINAL_REPO_FILES)).not.toContain('tiktoken/tokenizer.model');
+  });
+});
+
+describe('download targets', () => {
+  it('lists every build and draft of the visible entries, hidden entries left out', () => {
+    expect(catalogTargets('darwin').map((target) => [target.kind, target.slug, target.repo])).toEqual([
+      ['build', 'qwen3.8-27b-gguf', 'unsloth/Qwen3.8-27B-GGUF'],
+      ['build', 'qwen3.8-27b-gguf-ud-q4_k_m', 'unsloth/Qwen3.8-27B-GGUF'],
+      ['draft', 'qwen3.8-27b-dflash2', 'z-lab/Qwen3.8-27B-DFlash2'],
+      ['build', 'inkling-2-mini-gguf', 'unsloth/Inkling-2-Mini-GGUF'],
+      ['build', 'inkling-2-mini-gguf-ud-q4_k_m', 'unsloth/Inkling-2-Mini-GGUF'],
+      ['build', 'inkling-2-mini', 'thinkingmachines/Inkling-2-Mini'],
+      ['build', 'qwen3.8-flash-next-gguf', 'unsloth/Qwen3.8-Flash-Next-GGUF'],
+      ['build', 'hy4-flash-gguf', 'AngelSlim/Hy4-flash-GGUF'],
+      ['build', 'clairic-flash-gguf', 'Brooooooklyn/Clairic-Flash-GGUF'],
+      ['build', 'clairic-gguf', 'Brooooooklyn/Clairic-GGUF'],
+    ]);
+    for (const entry of MODEL_CATALOG.filter((item) => item.hidden)) {
+      for (const build of entry.builds)
+        expect(catalogTargetForSlug(catalogBuildSlug(build)), entry.label).toBeUndefined();
+    }
+  });
+
+  it("carries a build's globs and sidecar source", () => {
+    const target = catalogTargetForSlug('qwen3.8-27b-gguf-ud-q4_k_m', 'darwin');
+    expect(target?.kind).toBe('build');
+    if (target?.kind !== 'build') return;
+    expect(target.build).toBe(buildOf('Qwen3.8-27B', 'UD-Q4_K_M'));
+    expect(target.globs).toEqual(['*UD-Q4_K_M*', 'config.json']);
+    expect(target.assetsRepo).toBe('Qwen/Qwen3.8-27B');
+    const original = catalogTargetForSlug('inkling-2-mini', 'darwin');
+    expect(original?.kind === 'build' && original.globs === undefined && original.assetsRepo === undefined).toBe(true);
+    expect(catalogTargetForSlug('someone-not-in-catalog')).toBeUndefined();
+  });
+});
+
 describe('catalogUpdateRepos — update discovery covers the sidecar sources', () => {
-  it('adds every visible entry assetsRepo to the download repo set', async () => {
-    const { catalogDownloadRepos, catalogUpdateRepos, MODEL_CATALOG } = await import('../src/catalog.js');
-    const downloads = catalogDownloadRepos();
-    const updates = catalogUpdateRepos();
-    // Superset, deduped.
-    for (const repo of downloads) expect(updates).toContain(repo);
+  it('lists each target repo and each build assetsRepo once, and no hidden repo', () => {
+    const updates = catalogUpdateRepos('darwin');
     expect(new Set(updates).size).toBe(updates.length);
+    for (const target of catalogTargets('darwin')) expect(updates).toContain(target.repo);
     // The assets sources are the point: a sidecar-only upstream change moves
     // nothing in the primary repo, so without these it raises no badge and the
     // repair job is unreachable.
-    const assets = MODEL_CATALOG.filter((entry) => !entry.hidden && entry.assetsRepo !== undefined).map(
-      (entry) => entry.assetsRepo!,
-    );
-    expect(assets.length).toBeGreaterThan(0);
-    for (const repo of assets) expect(updates).toContain(repo);
-    // Hidden entries stay out of both (their repos 401).
+    for (const entry of visibleCatalog(BIG_MAC)) {
+      for (const build of entry.builds) {
+        if (build.assetsRepo !== undefined) expect(updates).toContain(build.assetsRepo);
+      }
+    }
+    // Hidden entries stay out (their repos 401).
     for (const entry of MODEL_CATALOG.filter((item) => item.hidden)) {
-      expect(updates).not.toContain(entry.hfRepo);
-      if (entry.assetsRepo !== undefined) expect(updates).not.toContain(entry.assetsRepo);
+      for (const build of entry.builds) expect(updates).not.toContain(build.hfRepo);
     }
   });
 });
 
 describe('MODEL_CATALOG', () => {
-  it('is non-empty', () => {
-    expect(MODEL_CATALOG.length).toBeGreaterThan(0);
-  });
-
   it('has exactly one default entry', () => {
     const defaults = MODEL_CATALOG.filter((entry) => entry.isDefault);
     expect(defaults).toHaveLength(1);
     expect(defaults[0]!.label).toBe('Qwen3.8-27B');
-  });
-
-  it('resolves one repo per entry, with the CUDA build only when an entry carries one', () => {
-    // The whole platform split rides on this. Getting it wrong is silent: the
-    // wrong-platform repo is a real, downloadable checkpoint, so nothing errors
-    // — the user simply installs the build this catalog exists to steer them
-    // away from. It also silently breaks every provenance test that writes a
-    // marker naming `hfRepo` instead of the resolved repo.
-    //
-    // Via the pure helper, never by mutating `process.platform`: that global is
-    // shared with every test file on this worker, and stubbing it here made a
-    // sibling suite's download allowlist reject its own module-level repo.
-    const withCuda: CatalogEntry = { label: 't', hfRepo: 'a/metal', hfRepoCuda: 'a/cuda', sizeGb: 1, description: 't' };
-    expect(catalogRepoFor(withCuda, 'linux')).toBe('a/cuda');
-    expect(catalogRepoFor(withCuda, 'darwin')).toBe('a/metal');
-    // Every CURRENT entry is single-repo (the UD-Q4_K_XL GGUF build runs
-    // identically on Metal and CUDA), so both platforms install `hfRepo`.
-    for (const entry of MODEL_CATALOG) {
-      expect(entry.hfRepoCuda, entry.label).toBeUndefined();
-      expect(catalogRepoFor(entry, 'linux'), entry.label).toBe(entry.hfRepo);
-      expect(catalogRepoFor(entry, 'darwin'), entry.label).toBe(entry.hfRepo);
-      // And the live resolver agrees with the helper on THIS platform.
-      expect(catalogRepo(entry), entry.label).toBe(catalogRepoFor(entry, process.platform));
-    }
-  });
-
-  it('pins the five visible entries to their verified GGUF repos + sidecar sources', () => {
-    // Load-bearing strings: a typo here is a 404 at best and the wrong weights
-    // at worst. Verified on Hugging Face — the GGUF repos ship the globbed
-    // variant (plus MTP/mmproj where globbed in), the assetsRepos ship the
-    // tokenizer/config files the GGUF repos lack (ungated, unlike google/*).
-    expect(visibleCatalog(BIG_MAC).map((entry) => [entry.hfRepo, entry.assetsRepo])).toEqual([
-      ['unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B'],
-      ['unsloth/Inkling-2-Mini-GGUF', 'thinkingmachines/Inkling-2-Mini'],
-      ['unsloth/gemma-4-26B-A4B-it-GGUF', 'unsloth/gemma-4-26B-A4B-it'],
-      ['unsloth/Qwen3.8-Flash-Next-GGUF', 'Qwen/Qwen3.8-Flash-Next'],
-      ['AngelSlim/Hy4-flash-GGUF', 'tencent/Hy4-flash'],
-    ]);
-  });
-
-  it('every hfRepo is a plausible HF slug', () => {
-    for (const entry of MODEL_CATALOG) {
-      expect(entry.hfRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
-    }
-  });
-
-  it('every visible entry carries a glob filter that selects exactly one weight variant', () => {
-    // Without the filter the downloader takes every .gguf in a multi-variant
-    // unsloth repo — 100+ GB of quants the user never asked for.
-    const visible = visibleCatalog(BIG_MAC);
-    expect(visible.map((entry) => entry.label).sort()).toEqual(Object.keys(VARIANT).sort());
-    for (const entry of visible) {
-      expect(entry.globs, entry.label).toBeDefined();
-      expect(entry.globs!.length, entry.label).toBeGreaterThan(0);
-      expect(
-        entry.globs!.some((glob) => glob.includes(VARIANT[entry.label]!)),
-        entry.label,
-      ).toBe(true);
-    }
-  });
-
-  it('Hy4-flash globs select exactly the two Q4_K_M shards out of the AngelSlim repo', () => {
-    // The repo also ships Q3_K, IQ2_AH, two SPARK builds and a vision
-    // projector: one of them in the selection is 63-162 GB of extra download.
-    const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
-    expect(selectedFiles(hy4, HY4_REPO_FILES)).toEqual([
-      'Hy4-flash-Q4_K_M-00001-of-00002.gguf',
-      'Hy4-flash-Q4_K_M-00002-of-00002.gguf',
-    ]);
-  });
-
-  it('Inkling-2-Mini globs select the root weight, vision tower and DSpark draft, never the Mainline_Support copy', () => {
-    // `*UD-Q4_K_XL*` would also take `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`,
-    // 17.6 GB more of the same tensors.
-    const inkling = MODEL_CATALOG.find((entry) => entry.label === 'Inkling-2-Mini')!;
-    const selected = selectedFiles(inkling, INKLING_REPO_FILES);
-    expect(selected).toEqual(['Inkling-2-Mini-UD-Q4_K_XL.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf', 'mmproj-BF16.gguf']);
-    expect(selected).not.toContain('Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file');
-    // 17,629,759,456 + 402,278,560 + 641,805,760 B.
-    expect(inkling.sizeGb).toBe(18.7);
-  });
-
-  it('Qwen3.8-Flash-Next globs select exactly the four UD-Q4_K_XL shards in their repo folder', () => {
-    const flashNext = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-Flash-Next')!;
-    expect(selectedFiles(flashNext, FLASH_NEXT_REPO_FILES)).toEqual([
-      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
-      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf',
-      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf',
-      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf',
-    ]);
-    // 10,946,618 + 49,720,539,552 + 32,803,030,176 + 28,800,138,432 B.
-    expect(flashNext.sizeGb).toBe(111.3);
-  });
-
-  it('Hy4-flash is sized to its two shards', () => {
-    const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
-    // 104,986,517,504 + 63,360,616,128 B.
-    expect(hy4.sizeGb).toBe(168.3);
-    expect(hy4.hidden).toBeUndefined();
-    expect(hy4.draft).toBeUndefined();
   });
 
   it('only Qwen3.8-Flash-Next and Hy4-flash carry a memory floor, 96 GiB each', () => {
@@ -354,22 +609,7 @@ describe('MODEL_CATALOG', () => {
     expect(MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!.minMemoryGb).toBeGreaterThanOrEqual(39);
   });
 
-  it('every visible entry names an assetsRepo for tokenizer sidecars', () => {
-    // The GGUF repos ship no tokenizer files; without the official sidecars
-    // the native runtime extracts the embedded tokenizer and tool calling
-    // silently breaks (see the assetsRepo field comment).
-    for (const entry of visibleCatalog(BIG_MAC)) {
-      expect(entry.assetsRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
-    }
-  });
-
-  it('Qwen3.8-27B keeps its optional DFlash2 companion beside the MTP weights', () => {
-    // MTP is inline in the UD-Q4_K_XL file itself (auto-detected at load);
-    // the repo's separate MTP/*.gguf is deliberately not downloaded
-    // and covers the default path; the DFlash2 draft stays offered as an
-    // optional, never-auto-installed companion for checkpoints that pair
-    // with it, so the dashboard companion card and its download allowlist
-    // entry survive.
+  it('Qwen3.8-27B keeps its optional DFlash2 companion, and no other entry has one', () => {
     const qwen = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B');
     expect(qwen?.draft?.hfRepo).toBe('z-lab/Qwen3.8-27B-DFlash2');
     for (const entry of MODEL_CATALOG) {
@@ -383,36 +623,11 @@ describe('MODEL_CATALOG', () => {
     expect(new Set(labels).size).toBe(labels.length);
   });
 
-  it('every size is positive and every description is non-empty', () => {
-    for (const entry of MODEL_CATALOG) {
-      expect(entry.sizeGb, entry.label).toBeGreaterThan(0);
+  it('every size is positive and every description and source is non-empty', () => {
+    for (const { entry, build } of ALL_BUILDS) {
+      expect(build.sizeGb, entry.label).toBeGreaterThan(0);
+      expect(build.source.trim().length, entry.label).toBeGreaterThan(0);
       expect(entry.description.trim().length, entry.label).toBeGreaterThan(0);
-    }
-  });
-});
-
-describe('catalogEntryForRepo', () => {
-  it('finds an entry by its resolved repo on any platform', () => {
-    // Current entries are single-repo, so the platform argument cannot change
-    // the answer; it exists for the day a platform-split entry returns.
-    const entry = MODEL_CATALOG.find((candidate) => candidate.isDefault)!;
-    expect(catalogEntryForRepo(entry.hfRepo, 'darwin')).toBe(entry);
-    expect(catalogEntryForRepo(entry.hfRepo, 'linux')).toBe(entry);
-  });
-
-  it('returns undefined for a repo the catalog does not carry', () => {
-    expect(catalogEntryForRepo('someone/not-in-catalog', process.platform)).toBeUndefined();
-  });
-
-  it('matches through catalogRepoFor, never a raw hfRepo comparison', () => {
-    // The matching rule matters the day a platform-split entry returns: a
-    // lookup must resolve against the repo THIS platform installs. Pinned
-    // with the pure helper since no current entry carries the split.
-    const split: CatalogEntry = { label: 't', hfRepo: 'a/metal', hfRepoCuda: 'a/cuda', sizeGb: 1, description: 't' };
-    expect(catalogRepoFor(split, 'linux')).toBe('a/cuda');
-    expect(catalogRepoFor(split, 'darwin')).toBe('a/metal');
-    for (const entry of MODEL_CATALOG) {
-      expect(catalogEntryForRepo(catalogRepoFor(entry, 'linux'), 'linux'), entry.label).toBe(entry);
     }
   });
 });
@@ -472,22 +687,30 @@ describe('visibleCatalog', () => {
 describe('visibleSystemOneCatalog', () => {
   it('returns the verified Clairic Hugging Face entries and keeps them out of visibleCatalog', () => {
     const sysOne = visibleSystemOneCatalog();
-    expect(sysOne.map((entry) => [entry.label, entry.hfRepo, entry.assetsRepo, entry.sizeGb, entry.category])).toEqual([
-      ['Clairic Flash (9B)', 'Brooooooklyn/Clairic-Flash-GGUF', 'Cloudflare/clairic-flash', 7.6, 'systemone'],
-      ['Clairic (27B)', 'Brooooooklyn/Clairic-GGUF', 'Cloudflare/clairic', 18.9, 'systemone'],
+    expect(
+      sysOne.map((entry) => [
+        entry.label,
+        entry.builds.map((build) => [build.id, build.hfRepo, build.assetsRepo, build.sizeGb]),
+        entry.category,
+      ]),
+    ).toEqual([
+      [
+        'Clairic Flash (9B)',
+        [['UD-Q4_K_XL', 'Brooooooklyn/Clairic-Flash-GGUF', 'Cloudflare/clairic-flash', 7.6]],
+        'systemone',
+      ],
+      ['Clairic (27B)', [['UD-Q4_K_XL', 'Brooooooklyn/Clairic-GGUF', 'Cloudflare/clairic', 18.9]], 'systemone'],
     ]);
-    const chatRepos = new Set(visibleCatalog().map((entry) => entry.hfRepo));
-    for (const entry of sysOne) {
-      expect(chatRepos.has(entry.hfRepo)).toBe(false);
-    }
+    const chatRepos = new Set(visibleCatalog().flatMap((entry) => entry.builds.map((build) => build.hfRepo)));
+    for (const entry of sysOne) expect(chatRepos.has(entry.builds[0].hfRepo)).toBe(false);
   });
 
-  it('includes System One repos in both catalogDownloadRepos and catalogUpdateRepos', () => {
-    const downloads = catalogDownloadRepos();
+  it('includes System One repos in the download targets and catalogUpdateRepos', () => {
     const updates = catalogUpdateRepos();
     for (const entry of visibleSystemOneCatalog()) {
-      expect(downloads).toContain(entry.hfRepo);
-      expect(updates).toContain(entry.hfRepo);
+      const build = entry.builds[0];
+      expect(catalogTargetForSlug(catalogBuildSlug(build))?.repo).toBe(build.hfRepo);
+      expect(updates).toContain(build.hfRepo);
     }
   });
 });

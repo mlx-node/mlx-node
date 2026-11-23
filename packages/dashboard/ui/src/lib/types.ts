@@ -34,65 +34,79 @@ export interface ModelsResponse {
 
 export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
 
-export interface CatalogItem {
-  label: string;
+/** One build of a catalog model with the state of its install folder. */
+export interface CatalogBuildItem {
+  /** The build's name on every surface: `UD-Q4_K_XL`, `Original`. */
+  id: string;
   hfRepo: string;
   sizeGb: number;
+  /** Who made the files and in which format: `Unsloth GGUF`, `Thinking Machines`. */
+  source: string;
+  /** One short fact after the source: `1.1 GB smaller`. */
+  note?: string;
+  /** What comes with the weights. */
+  included?: string;
+  /**
+   * Base-model repo the build CURRENTLY sources its tokenizer sidecars from — compared against `localAssetsRepo` so
+   * a switched source is itself an update (the marker's repo is what the probe map lacks).
+   */
+  assetsRepo?: string;
+  /** The folder under the models directory this build installs to; the key of its download. */
+  slug: string;
+  /** A dashboard-owned (completion-marker) install of this build is in its folder. */
+  installed: boolean;
+  /**
+   * A loadable checkpoint of this build is on disk regardless of the dashboard marker — true for {@link installed},
+   * and also for a build installed via the `mlx download` CLI / wizard. Gate the Install action on this (an unowned
+   * present model can't be overwritten).
+   */
+  present: boolean;
+  /**
+   * The build the folder holds when it holds another build of the same repository (`UD-Q4_K_M`), or `another model`
+   * for a loadable model that names no build. The server refuses an install into it. `null` otherwise.
+   */
+  heldBy: string | null;
+  /**
+   * The folder is occupied by something the downloader does not own and holds no loadable checkpoint (an
+   * interrupted `mlx download`, a hand-made folder, a symlink). Install is refused server-side in this state, so the
+   * card names the blockage rather than offering a button that always errors.
+   */
+  blockedByForeignDir: boolean;
+  /** What occupies the folder; non-null exactly when `blockedByForeignDir` is true. */
+  blocker: CatalogBlocker | null;
+  /**
+   * Commit sha the local bytes were pinned to, or `null` when no completion marker exists to read (hand copy,
+   * pre-marker CLI install, renamed dir). `null` means staleness is unknowable, never "up to date".
+   */
+  localRevision: string | null;
+  /**
+   * Base-model repo the install's tokenizer sidecars came from, and the commit they were pinned to — or `null` when
+   * the install used none or predates the field. Update discovery compares this pair too: a sidecar-only upstream
+   * change moves nothing in the primary repo, so without it no badge appears and the Installed button (disabled)
+   * keeps the repair job unreachable.
+   */
+  localAssetsRepo: string | null;
+  localAssetsRevision: string | null;
+}
+
+export interface CatalogItem {
+  label: string;
   description: string;
   category?: 'chat' | 'systemone';
   isDefault?: boolean;
   hidden?: boolean;
   /** Physical RAM in GiB the model's load needs at least; the page leaves the entry out below it. */
   minMemoryGb?: number;
-  slug: string;
-  /** A dashboard-owned (completion-marker) install of this model is present. */
-  installed: boolean;
-  /**
-   * A loadable checkpoint is present on disk regardless of the dashboard marker —
-   * true for {@link installed}, and also for a model installed via the `mlx
-   * download` CLI / wizard. Gate the Install action on this (an unowned present
-   * model can't be overwritten).
-   */
-  present: boolean;
-  /**
-   * The slug directory is occupied by something the downloader does not own and
-   * holds no loadable checkpoint (an interrupted `mlx download`, a hand-made
-   * folder, a symlink). Install is refused server-side in this state, so the card
-   * names the blockage rather than offering a button that always errors.
-   */
-  blockedByForeignDir: boolean;
-  /** What occupies the slug; non-null exactly when `blockedByForeignDir` is true. */
-  blocker: CatalogBlocker | null;
-  /**
-   * Commit sha the local bytes were pinned to, or `null` when no completion
-   * marker exists to read (hand copy, pre-marker CLI install, renamed dir).
-   * `null` means staleness is unknowable, never "up to date".
-   */
-  localRevision: string | null;
-  /**
-   * Base-model repo the install's tokenizer sidecars came from, and the commit
-   * they were pinned to — or `null` when the install used none or predates the
-   * field. Update discovery compares this pair too: a sidecar-only upstream
-   * change moves nothing in the primary repo, so without it no badge appears
-   * and the Installed button (disabled) keeps the repair job unreachable.
-   */
-  localAssetsRepo: string | null;
-  localAssetsRevision: string | null;
-  /**
-   * Base-model repo the catalog entry CURRENTLY sources its tokenizer
-   * sidecars from — compared against `localAssetsRepo` so a switched source
-   * is itself an update (the marker's repo is what the probe map lacks).
-   */
-  assetsRepo?: string;
+  /** In catalog order; `builds[0]` is the build every surface chooses first. */
+  builds: CatalogBuildItem[];
   /** Separate optional draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
-  globs?: string[];
 }
 
 export type CatalogDraftItem = Pick<
-  CatalogItem,
-  'label' | 'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
->;
+  CatalogBuildItem,
+  'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
+> & { label: string };
 
 /** An entry at a catalog slug that the app did not create, measured without following a link or opening a file. */
 export interface CatalogBlocker {
@@ -131,6 +145,8 @@ export interface CatalogUpdatesResponse {
 
 export interface DownloadJob {
   id: string;
+  /** The folder the job installs to; the key of a download. */
+  slug: string;
   repo: string;
   state: 'running' | 'committing' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
@@ -143,6 +159,7 @@ export interface DownloadsResponse {
 
 export interface DownloadStartResponse {
   id: string;
+  slug: string;
   repo: string;
 }
 

@@ -1,3 +1,5 @@
+import { catalogTargetForSlug } from '@mlx-node/agent/catalog';
+
 import {
   DownloadConflictError,
   DownloadsClosedError,
@@ -51,12 +53,16 @@ function parseAdoptToken(value: unknown): string | undefined {
   return value as string;
 }
 
+/**
+ * `POST /api/downloads` with `{ slug, replaceBlocker?, adopt? }`: `slug` is the catalog folder to install. Answers
+ * `{ id, slug, repo }`.
+ */
 export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unknown {
   const body = requireBody(req);
-  const fields = (body ?? {}) as { repo?: unknown; replaceBlocker?: unknown; adopt?: unknown };
-  const repo = fields.repo;
-  if (typeof repo !== 'string' || repo === '') {
-    throw ApiError.badRequest('Body must include a "repo" string');
+  const fields = (body ?? {}) as { slug?: unknown; replaceBlocker?: unknown; adopt?: unknown };
+  const slug = fields.slug;
+  if (typeof slug !== 'string' || slug === '') {
+    throw ApiError.badRequest('Body must include a "slug" string');
   }
   const replaceBlocker = parseReplaceBlocker(fields.replaceBlocker);
   const adopt = parseAdoptToken(fields.adopt);
@@ -65,12 +71,13 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
   }
   try {
     const id = ctx.downloads.start(
-      repo,
+      slug,
       replaceBlocker !== undefined ? { replaceBlocker } : adopt !== undefined ? { adopt } : undefined,
     );
     // Accepted, not done: the route declares `successStatus: 202` so the HTTP
-    // adapter still answers 202 for a job that is only queued.
-    return { id, repo };
+    // adapter still answers 202 for a job that is only queued. `start` accepted
+    // the slug, so the catalog has its target.
+    return { id, slug, repo: catalogTargetForSlug(slug)!.repo };
   } catch (err) {
     // The manager is draining for shutdown: the request is well-formed, the
     // server is simply going away, so answer 503 rather than blaming the caller.
@@ -82,15 +89,15 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
   }
 }
 
-/** `POST /api/downloads/adopt-plan`: the plan of an Update for `repo`, whose token a later start must carry. */
+/** `POST /api/downloads/adopt-plan` with `{ slug }`: the plan of an Update of that folder, whose token a later start must carry. */
 export async function handleDownloadAdoptPlan(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
   const body = requireBody(req);
-  const repo = ((body ?? {}) as { repo?: unknown }).repo;
-  if (typeof repo !== 'string' || repo === '') {
-    throw ApiError.badRequest('Body must include a "repo" string');
+  const slug = ((body ?? {}) as { slug?: unknown }).slug;
+  if (typeof slug !== 'string' || slug === '') {
+    throw ApiError.badRequest('Body must include a "slug" string');
   }
   try {
-    return await ctx.downloads.planAdoption(repo);
+    return await ctx.downloads.planAdoption(slug);
   } catch (err) {
     if (err instanceof DownloadsClosedError || err instanceof ModelsDirUnavailableError) {
       throw ApiError.unavailable(err.message);

@@ -1,56 +1,11 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { MODEL_CATALOG } from '../../agent/src/catalog.js';
-import { catalogBuildLabel, hasUpdate, modelBlurb, offeredOnHost } from '../ui/src/lib/catalog.js';
-
-describe('catalogBuildLabel', () => {
-  it('takes the build from the first starred glob', () => {
-    expect(catalogBuildLabel({ hfRepo: 'unsloth/Qwen3.8-27B-GGUF', globs: ['*.json', '*UD-Q4_K_XL*', '*Q8_0*'] })).toBe(
-      'UD-Q4_K_XL',
-    );
-  });
-
-  it('takes the build from a glob that ends in .gguf', () => {
-    expect(
-      catalogBuildLabel({
-        hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
-        globs: ['*UD-Q4_K_XL.gguf', 'mmproj-BF16.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf'],
-      }),
-    ).toBe('UD-Q4_K_XL');
-  });
-
-  it('skips globs that name a file type or are not starred on both ends', () => {
-    expect(
-      catalogBuildLabel({
-        hfRepo: 'org/Model-GGUF',
-        globs: ['*Q4.gguf*', 'Q4*', '**', '*', '*.gguf', 'Q4.gguf', '*Q4.Q8.gguf', '*Q4*.gguf', '*Q4.safetensors'],
-      }),
-    ).toBeNull();
-  });
-
-  it('gives every visible catalog entry a build', () => {
-    for (const entry of MODEL_CATALOG.filter((item) => !item.hidden)) {
-      expect(catalogBuildLabel(entry), entry.label).not.toBeNull();
-    }
-  });
-
-  it('reads an mxfp / nvfp part of the repo name, upper-cased', () => {
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Qwen3.6-35B-A3B-mxfp4' })).toBe('MXFP4');
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/gemma-4-26b-NVFP4-text' })).toBe('NVFP4');
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Model-mxfp8', globs: [] })).toBe('MXFP8');
-  });
-
-  it('is null when nothing names a build', () => {
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Qwen3.6-35B-A3B-4bit' })).toBeNull();
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/notmxfp4' })).toBeNull();
-  });
-});
+import { catalogBuildAt, hasUpdate, modelBlurb, offeredOnHost } from '../ui/src/lib/catalog.js';
+import type { CatalogBuildItem, CatalogItem } from '../ui/src/lib/types.js';
 
 describe('modelBlurb', () => {
-  it('keeps the two special cases, then the catalog description', () => {
-    expect(modelBlurb({ label: 'Gemma-4-26B-A4B', description: 'x', isDefault: true })).toBe(
-      'Fast responses, with a smaller download to get started.',
-    );
+  it('keeps the default case, then the catalog description', () => {
     expect(modelBlurb({ label: 'Qwen3.6', description: 'x', isDefault: true })).toBe(
       'Our recommended starting point for working with tools.',
     );
@@ -62,6 +17,36 @@ describe('modelBlurb', () => {
       const entry = MODEL_CATALOG.find((item) => item.label === label)!;
       expect(modelBlurb(entry), label).toBe(entry.description);
     }
+  });
+});
+
+describe('catalogBuildAt', () => {
+  function build(id: string, slug: string): CatalogBuildItem {
+    return {
+      id,
+      hfRepo: 'org/model-GGUF',
+      sizeGb: 1,
+      source: 'GGUF',
+      slug,
+      installed: false,
+      present: false,
+      heldBy: null,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+      localAssetsRepo: null,
+      localAssetsRevision: null,
+    };
+  }
+  const items: CatalogItem[] = [
+    { label: 'A', description: '', builds: [build('UD-Q4_K_XL', 'a-gguf')] },
+    { label: 'B', description: '', builds: [build('UD-Q4_K_XL', 'b-gguf'), build('UD-Q4_K_M', 'b-gguf-ud-q4_k_m')] },
+  ];
+
+  it('finds a later build of an entry by its folder, and nothing for a folder no build installs to', () => {
+    expect(catalogBuildAt(items, 'b-gguf-ud-q4_k_m')?.id).toBe('UD-Q4_K_M');
+    expect(catalogBuildAt(items, 'a-gguf')?.id).toBe('UD-Q4_K_XL');
+    expect(catalogBuildAt(items, 'b')).toBeUndefined();
   });
 });
 

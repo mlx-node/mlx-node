@@ -8,7 +8,7 @@ import { toast } from '../../lib/toast';
 import type {
   AdoptPlanResponse,
   CancelDownloadResponse,
-  CatalogItem,
+  CatalogBuildItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   DownloadJob,
@@ -23,17 +23,18 @@ function isUpdateInPlace(item: Pick<DownloadItem, 'blocker'>): boolean {
   return item.blocker?.holdsModel === true;
 }
 
-/** The card of `repo` in a catalog body: an entry or the draft block of one. */
-function catalogItemOf(body: CatalogResponse | undefined, repo: string): Pick<DownloadItem, 'blocker'> | undefined {
+/** The build or draft that installs to the folder `slug` in a catalog body. */
+function catalogItemOf(body: CatalogResponse | undefined, slug: string): Pick<DownloadItem, 'blocker'> | undefined {
   for (const item of body?.items ?? []) {
-    if (item.hfRepo === repo) return item;
-    if (item.draft?.hfRepo === repo) return item.draft;
+    const build = item.builds.find((candidate) => candidate.slug === slug);
+    if (build !== undefined) return build;
+    if (item.draft?.slug === slug) return item.draft;
   }
   return undefined;
 }
 
 export interface ModelDownloadError {
-  repo: string;
+  slug: string;
   message: string;
 }
 
@@ -46,7 +47,7 @@ function isTerminalJob(state: DownloadJob['state']): boolean {
   return state === 'done' || state === 'error' || state === 'cancelled';
 }
 
-/** A download this page follows: the one job the server holds for a repo while it is neither settled nor absent. */
+/** A download this page follows: the one job the server holds for a folder while it is neither settled nor absent. */
 export interface ActiveJob {
   id: string;
   /** `cancel()` refuses a publishing job, so the card drops its Cancel here. */
@@ -72,7 +73,7 @@ interface SettledBodies {
 }
 
 export type DownloadItem = Pick<
-  CatalogItem,
+  CatalogBuildItem,
   | 'hfRepo'
   | 'installed'
   | 'localRevision'
@@ -82,6 +83,7 @@ export type DownloadItem = Pick<
   | 'present'
   | 'blockedByForeignDir'
   | 'blocker'
+  | 'heldBy'
   | 'slug'
 >;
 
@@ -91,9 +93,9 @@ export interface CatalogDownloadProps {
   /** Onboarding: the one loud button of its surface. */
   prominent?: boolean;
   item: DownloadItem;
-  /** Upstream has different bytes at this repo than the local marker records. */
+  /** Upstream has different bytes at this build's repo than the local marker records. */
   updateAvailable: boolean;
-  /** This repo's job settled but the catalog body it invalidated has not arrived: every field is pre-download. */
+  /** This folder's job settled but the catalog body it invalidated has not arrived: every field is pre-download. */
   settling: boolean;
   /** The same, for the separately fetched remote shas `updateAvailable` is computed against. */
   updateSettling: boolean;
@@ -114,7 +116,7 @@ export interface CatalogDownloadProps {
 }
 
 export interface ModelDownloads {
-  /** repo → the job this page follows. */
+  /** folder → the job this page follows. */
   active: Readonly<Record<string, ActiveJob>>;
   downloadError: ModelDownloadError | null;
   downloadProps: (item: DownloadItem) => CatalogDownloadProps;
@@ -138,7 +140,7 @@ export function useModelDownloads(
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
   /**
-   * For a repo whose job just settled, the bodies that were current when it did. `setActive` clears synchronously while
+   * For a folder whose job just settled, the bodies that were current when it did. `setActive` clears synchronously while
    * `reload()` only marks the old body refreshing, so one committed render still carries the pre-download state: a live
    * Install (or Update available) that would start a second job. Holding the bodies makes the window self-closing:
    * a new identity IS the refreshed body. Both, because the verdict joins both and they arrive independently.
@@ -153,7 +155,7 @@ export function useModelDownloads(
 
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
   const [downloadError, setDownloadError] = useState<ModelDownloadError | null>(null);
-  /** Repos whose job failed while this page was unmounted, announced once the catalog body is here. */
+  /** Folders whose job failed while this page was unmounted, announced once the catalog body is here. */
   const [failedAway, setFailedAway] = useState<readonly string[]>([]);
   // `useJson` keeps the old body on screen across a reconnect until the new runtime answers. Remember that exact
   // object so the reconcile effect does not read it as the new runtime's registry.
@@ -180,7 +182,7 @@ export function useModelDownloads(
       const next: Record<string, ActiveJob> = {};
       for (const job of jobs) {
         if (isTerminalJob(job.state)) continue;
-        next[job.repo] = {
+        next[job.slug] = {
           id: job.id,
           committing: job.state === 'committing',
           cancelling: false,
@@ -188,9 +190,9 @@ export function useModelDownloads(
           source: 'server',
         };
       }
-      for (const [repo, job] of Object.entries(prev)) {
-        if (job.source === 'local' && job.connection === connection && next[repo]?.id !== job.id) {
-          next[repo] = job;
+      for (const [slug, job] of Object.entries(prev)) {
+        if (job.source === 'local' && job.connection === connection && next[slug]?.id !== job.id) {
+          next[slug] = job;
         }
       }
       return next;
@@ -201,7 +203,7 @@ export function useModelDownloads(
     const failed: string[] = [];
     for (const job of jobs) {
       if (!isTerminalJob(job.state)) continue;
-      if (job.state === 'error') failed.push(job.repo);
+      if (job.state === 'error') failed.push(job.slug);
       settled = true;
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
     }
@@ -213,7 +215,7 @@ export function useModelDownloads(
         const next = new Map(prev);
         for (const job of jobs) {
           if (isTerminalJob(job.state))
-            next.set(job.repo, { catalog: catalogBody.current, updates: updatesBody.current });
+            next.set(job.slug, { catalog: catalogBody.current, updates: updatesBody.current });
         }
         return next;
       });
@@ -227,33 +229,33 @@ export function useModelDownloads(
   useEffect(() => {
     if (failedAway.length === 0) return;
     if (catalog.data === undefined && catalog.error === undefined) return;
-    for (const repo of failedAway) {
-      const item = catalogItemOf(catalog.data, repo);
+    for (const slug of failedAway) {
+      const item = catalogItemOf(catalog.data, slug);
       toast.error(item !== undefined && isUpdateInPlace(item) ? 'Update failed' : 'Download failed', {
-        description: repo,
+        description: slug,
       });
     }
     setFailedAway([]);
   }, [failedAway, catalog.data, catalog.error]);
 
   const starting = useRef(new Set<string>());
-  const install = async (repo: string): Promise<void> => {
-    if (starting.current.has(repo)) return;
-    starting.current.add(repo);
+  const install = async (slug: string): Promise<void> => {
+    if (starting.current.has(slug)) return;
+    starting.current.add(slug);
     setDownloadError(null);
     const startedConnection = connection;
     try {
-      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
+      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { slug });
       if (getConnectionGeneration() !== startedConnection) return;
       setActive((prev) => ({
         ...prev,
-        [repo]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
+        [slug]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
       }));
     } catch (err) {
-      setDownloadError({ repo, message: errMessage(err) });
+      setDownloadError({ slug, message: errMessage(err) });
       toast.error('Failed to start download', { description: errMessage(err) });
     } finally {
-      starting.current.delete(repo);
+      starting.current.delete(slug);
     }
   };
 
@@ -265,7 +267,7 @@ export function useModelDownloads(
     const startedConnection = connection;
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', {
-        repo: item.hfRepo,
+        slug: item.slug,
         replaceBlocker: {
           kind: blocker.kind,
           fileCount: blocker.fileCount,
@@ -273,74 +275,74 @@ export function useModelDownloads(
           truncated: blocker.truncated,
         },
       });
-      reinstalls.current.set(item.hfRepo, { id: res.id, connection: startedConnection });
+      reinstalls.current.set(item.slug, { id: res.id, connection: startedConnection });
     } catch (err) {
       reloadCatalog();
       throw err;
     }
   };
   const planUpdate = (item: DownloadItem): Promise<AdoptPlanResponse> =>
-    mutate<AdoptPlanResponse>('POST', '/downloads/adopt-plan', { repo: item.hfRepo });
+    mutate<AdoptPlanResponse>('POST', '/downloads/adopt-plan', { slug: item.slug });
   const updateInPlace = async (item: DownloadItem, token: string): Promise<void> => {
     const startedConnection = connection;
     try {
-      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo: item.hfRepo, adopt: token });
-      reinstalls.current.set(item.hfRepo, { id: res.id, connection: startedConnection });
+      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { slug: item.slug, adopt: token });
+      reinstalls.current.set(item.slug, { id: res.id, connection: startedConnection });
     } catch (err) {
       reloadCatalog();
       throw err;
     }
   };
-  const reinstallStarted = (repo: string): void => {
-    const kept = reinstalls.current.get(repo);
-    reinstalls.current.delete(repo);
+  const reinstallStarted = (slug: string): void => {
+    const kept = reinstalls.current.get(slug);
+    reinstalls.current.delete(slug);
     if (kept === undefined || kept.connection !== getConnectionGeneration()) return;
     setDownloadError(null);
     setActive((prev) =>
-      prev[repo]?.id === kept.id
+      prev[slug]?.id === kept.id
         ? prev
         : {
             ...prev,
-            [repo]: { id: kept.id, committing: false, cancelling: false, connection: kept.connection, source: 'local' },
+            [slug]: { id: kept.id, committing: false, cancelling: false, connection: kept.connection, source: 'local' },
           },
     );
   };
 
   const onDownloadDone = (item: DownloadItem, keptDir: string | undefined): void => {
-    const repo = item.hfRepo;
+    const slug = item.slug;
     toast.success(isUpdateInPlace(item) ? 'Update complete' : 'Download complete', {
       description:
-        keptDir === undefined ? repo : `Files that were added or changed in the old folder are in ${keptDir}.`,
+        keptDir === undefined ? slug : `Files that were added or changed in the old folder are in ${keptDir}.`,
     });
-    const id = active[repo]?.id;
+    const id = active[slug]?.id;
     setActive((prev) => {
       const next = { ...prev };
-      delete next[repo];
+      delete next[slug];
       return next;
     });
     // Dismiss the settled job, or a later delete of this model would remount progress on the stale id and replay done.
     if (id !== undefined) {
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
     }
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
+    setSettledOn((prev) => new Map(prev).set(slug, settledBodies()));
     models.reload();
     catalog.reload();
     updates.reload();
   };
 
   const onDownloadError = (item: DownloadItem, message: string): void => {
-    const repo = item.hfRepo;
-    setDownloadError({ repo, message });
+    const slug = item.slug;
+    setDownloadError({ slug, message });
     toast.error(isUpdateInPlace(item) ? 'Update failed' : 'Download failed', { description: message });
     // `error` can still have installed: refresh both halves of the update verdict.
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
+    setSettledOn((prev) => new Map(prev).set(slug, settledBodies()));
     models.reload();
     catalog.reload();
     updates.reload();
-    const id = active[repo]?.id;
+    const id = active[slug]?.id;
     setActive((prev) => {
       const next = { ...prev };
-      delete next[repo];
+      delete next[slug];
       return next;
     });
     if (id !== undefined) {
@@ -349,30 +351,30 @@ export function useModelDownloads(
   };
 
   /** The job stopped without finishing, learned from the STREAM (a cancel from elsewhere, or shutdown). Silent. */
-  const onDownloadCancelled = (repo: string): void => {
+  const onDownloadCancelled = (slug: string): void => {
     setActive((prev) => {
-      if (prev[repo] === undefined) return prev;
+      if (prev[slug] === undefined) return prev;
       const next = { ...prev };
-      delete next[repo];
+      delete next[slug];
       return next;
     });
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
+    setSettledOn((prev) => new Map(prev).set(slug, settledBodies()));
     models.reload();
     catalog.reload();
     updates.reload();
   };
 
-  const cancel = async (repo: string, id: string): Promise<void> => {
+  const cancel = async (slug: string, id: string): Promise<void> => {
     try {
       await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
-      toast.success('Download cancelled', { description: repo });
+      toast.success('Download cancelled', { description: slug });
       // Mark, never drop: the job emits its terminal frame as it unwinds, and only that frame proves it is done
       // touching the disk. Dropping here would close the stream before it lands.
       setActive((prev) => {
-        const job = prev[repo];
+        const job = prev[slug];
         // A queued job settles inside cancel(), so its frame can beat this reply: never resurrect or mark another id.
         if (job === undefined || job.id !== id) return prev;
-        return { ...prev, [repo]: { ...job, cancelling: true } };
+        return { ...prev, [slug]: { ...job, cancelling: true } };
       });
     } catch (err) {
       toast.error('Failed to cancel download', { description: errMessage(err) });
@@ -387,18 +389,18 @@ export function useModelDownloads(
   const downloadProps = (item: DownloadItem): CatalogDownloadProps => ({
     item,
     updateAvailable: hasUpdate(item, remoteRevisions),
-    settling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.catalog === catalog.data,
-    updateSettling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.updates === updates.data,
-    job: active[item.hfRepo],
-    onInstall: () => install(item.hfRepo),
+    settling: settledOn.has(item.slug) && settledOn.get(item.slug)?.catalog === catalog.data,
+    updateSettling: settledOn.has(item.slug) && settledOn.get(item.slug)?.updates === updates.data,
+    job: active[item.slug],
+    onInstall: () => install(item.slug),
     onReinstall: () => reinstall(item),
-    onReinstallStarted: () => reinstallStarted(item.hfRepo),
+    onReinstallStarted: () => reinstallStarted(item.slug),
     onPlanUpdate: () => planUpdate(item),
     onUpdateInPlace: (token) => updateInPlace(item, token),
     onDone: (keptDir) => onDownloadDone(item, keptDir),
     onError: (message) => onDownloadError(item, message),
-    onCancelled: () => onDownloadCancelled(item.hfRepo),
-    onCancel: (id) => void cancel(item.hfRepo, id),
+    onCancelled: () => onDownloadCancelled(item.slug),
+    onCancel: (id) => void cancel(item.slug, id),
   });
 
   return {

@@ -163,7 +163,7 @@ describe('catalogWithState category propagation', () => {
   it('tags chat and systemone entries with their category', () => {
     const items = catalogWithState(modelsDir);
     const clairic = items.filter((item) => item.category === 'systemone');
-    expect(clairic.map((item) => item.hfRepo)).toEqual([
+    expect(clairic.map((item) => item.builds[0].hfRepo)).toEqual([
       'Brooooooklyn/Clairic-Flash-GGUF',
       'Brooooooklyn/Clairic-GGUF',
     ]);

@@ -1,38 +1,8 @@
 /** Pure helpers for catalog cards (Models) and the first-model choice (Onboarding). */
 
-import type { CatalogItem, ModelsResponse } from './types';
+import type { CatalogBuildItem, CatalogItem, ModelsResponse } from './types';
 
 const GIB = 2 ** 30;
-
-const BUILD_NAMES = new Set(['mxfp', 'mxfp4', 'mxfp8', 'nvfp', 'nvfp4', 'nvfp8']);
-
-const GGUF_SUFFIX = '.gguf';
-
-/** The build a glob names: `UD-Q4_K_XL` from `*UD-Q4_K_XL*` or `*UD-Q4_K_XL.gguf`, or null for any other shape. */
-function starredBuild(glob: string): string | null {
-  if (!glob.startsWith('*')) return null;
-  let inner: string;
-  if (glob.endsWith(GGUF_SUFFIX)) inner = glob.slice(1, -GGUF_SUFFIX.length);
-  else if (glob.length >= 3 && glob.endsWith('*')) inner = glob.slice(1, -1);
-  else return null;
-  if (inner.length === 0 || inner.includes('.') || inner.includes('*')) return null;
-  return inner;
-}
-
-/** "UD-Q4_K_XL" from globs ['*UD-Q4_K_XL*', …] or ['*UD-Q4_K_XL.gguf', …]; else "MXFP4" / "NVFP4" / "MXFP8" from the repo name; else null. */
-export function catalogBuildLabel(item: Pick<CatalogItem, 'hfRepo' | 'globs'>): string | null {
-  for (const glob of item.globs ?? []) {
-    const build = starredBuild(glob);
-    if (build !== null) return build;
-  }
-  const slash = item.hfRepo.lastIndexOf('/');
-  const base = slash === -1 ? item.hfRepo : item.hfRepo.slice(slash + 1);
-  for (const part of base.split('-')) {
-    const lower = part.toLowerCase();
-    if (BUILD_NAMES.has(lower)) return part.toUpperCase();
-  }
-  return null;
-}
 
 /**
  * Whether the page offers `item` on this Mac: not hidden, and its memory floor met. An entry with a floor waits
@@ -47,16 +17,23 @@ export function offeredOnHost(
   return host !== undefined && host.totalMemBytes >= item.minMemoryGb * GIB;
 }
 
+/** The build that installs to the folder `slug`, from any entry. */
+export function catalogBuildAt(items: readonly CatalogItem[], slug: string): CatalogBuildItem | undefined {
+  for (const item of items) {
+    const build = item.builds.find((candidate) => candidate.slug === slug);
+    if (build !== undefined) return build;
+  }
+  return undefined;
+}
+
 /** One plain sentence about a catalog model. */
 export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'isDefault'>): string {
-  const label = item.label.toLowerCase();
-  if (label.includes('gemma-4-26b')) return 'Fast responses, with a smaller download to get started.';
   if (item.isDefault === true) return 'Our recommended starting point for working with tools.';
   return item.description;
 }
 
 /**
- * Whether an installed catalog model has newer bytes upstream.
+ * Whether an installed catalog build has newer bytes upstream.
  *
  * Gated on `installed`, never `present`: only a dashboard-owned install at the
  * canonical slug carries a revision to compare AND can actually be re-installed.
@@ -64,7 +41,7 @@ export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'is
  */
 export function hasUpdate(
   item: Pick<
-    CatalogItem,
+    CatalogBuildItem,
     'hfRepo' | 'installed' | 'localRevision' | 'assetsRepo' | 'localAssetsRepo' | 'localAssetsRevision'
   >,
   remoteRevisions: ReadonlyMap<string, string | null>,

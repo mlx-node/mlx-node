@@ -38,7 +38,6 @@ describe('classifyModel', () => {
     expect(Object.fromEntries(MODEL_CATALOG.map((entry) => [entry.label, classifyModel(entry.label)]))).toEqual({
       'Qwen3.8-27B': 'qwen',
       'Inkling-2-Mini': 'generic',
-      'Gemma-4-26B-A4B': 'gemma',
       'Qwen3.8-Flash-Next': 'qwen',
       'Hy4-flash': 'hy',
       'Gemma-4-12B': 'gemma',

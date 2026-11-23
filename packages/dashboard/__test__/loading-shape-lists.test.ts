@@ -27,6 +27,7 @@
  */
 
 import type {
+  CatalogItem,
   CatalogResponse,
   DownloadsResponse,
   LocalModel,
@@ -158,6 +159,38 @@ function localModel(overrides: Partial<LocalModel>): LocalModel {
   };
 }
 
+/** A catalog entry of one build that is not on disk. */
+function catalogItem(
+  label: string,
+  description: string,
+  hfRepo: string,
+  sizeGb: number,
+  isDefault?: true,
+): CatalogItem {
+  return {
+    label,
+    description,
+    ...(isDefault === undefined ? {} : { isDefault }),
+    builds: [
+      {
+        id: 'UD-Q4_K_XL',
+        hfRepo,
+        sizeGb,
+        source: 'GGUF',
+        slug: hfRepo.slice(hfRepo.indexOf('/') + 1).toLowerCase(),
+        installed: false,
+        present: false,
+        heldBy: null,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
+      },
+    ],
+  };
+}
+
 /** The three routes the Models page reads, with a two-model directory. */
 function modelsRoutes(): Record<string, unknown> {
   const models: ModelsResponse = {
@@ -169,49 +202,9 @@ function modelsRoutes(): Record<string, unknown> {
   // Three visible entries, matching the served catalog — one of them the default.
   const catalog: CatalogResponse = {
     items: [
-      {
-        label: 'Qwen3.8-27B',
-        hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
-        sizeGb: 23.3,
-        description: 'Best tool use — recommended default',
-        slug: 'qwen3.8-27b-mxfp4-mlx',
-        isDefault: true,
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
-      },
-      {
-        label: 'Qwen-AgentWorld-35B-A3B',
-        hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
-        sizeGb: 23.3,
-        description: 'Agent-tuned MoE, fast decode',
-        slug: 'qwen-agentworld-35b-a3b-mxfp4-mlx',
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
-      },
-      {
-        label: 'Gemma-4-26B-A4B',
-        hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
-        sizeGb: 16.2,
-        description: 'MoE, fast decode',
-        slug: 'gemma-4-26b-a4b-unsloth-mxfp4-mlx',
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
-      },
+      catalogItem('Qwen3.8-27B', 'Best tool use — recommended default', 'unsloth/Qwen3.8-27B-GGUF', 17.7, true),
+      catalogItem('Inkling-2-Mini', 'Vision MoE, fast decode', 'unsloth/Inkling-2-Mini-GGUF', 18.7),
+      catalogItem('Clairic Flash (9B)', 'Structured extraction', 'Brooooooklyn/Clairic-Flash-GGUF', 7.6),
     ],
   };
   const downloads: DownloadsResponse = { jobs: [] };
@@ -248,7 +241,7 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
 
   it('builds the recommended-models placeholders out of the same panels', async () => {
     const { loading, loaded } = await shapesAcrossLoad(page(), modelsRoutes(), (text) =>
-      text.includes('Qwen-AgentWorld-35B-A3B'),
+      text.includes('Clairic Flash (9B)'),
     );
     expect(loading.skeletons).toBeGreaterThan(0);
     expect(loaded.catalogCards).toBe(3);

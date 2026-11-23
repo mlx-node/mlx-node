@@ -27,6 +27,7 @@ import type {
   CacheScope,
   AdoptPlanResponse,
   CatalogBlocker,
+  CatalogBuildItem,
   CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
@@ -804,11 +805,15 @@ describe('Models page — the Install affordance', () => {
   const LABEL = 'Qwen3.8-27B';
   const SLUG = 'qwen3.8-27b-mxfp4-mlx';
 
+  /** The state of the card's one build, plus the entry fields a test sets. */
+  type CardOverrides = Partial<CatalogBuildItem> & Pick<CatalogItem, 'category' | 'draft'>;
+
   function catalogRoutes(
-    item: Partial<CatalogItem>,
+    overrides: CardOverrides,
     jobs: DownloadJob[] = [],
     updates: CatalogUpdatesResponse = { items: [] },
   ): Record<string, unknown> {
+    const { category, draft, ...build } = overrides;
     const models: ModelsResponse = {
       models: [],
       warnings: [],
@@ -819,18 +824,27 @@ describe('Models page — the Install affordance', () => {
       items: [
         {
           label: LABEL,
-          hfRepo: REPO,
-          sizeGb: 23.3,
           description: 'Best tool use',
-          slug: SLUG,
-          installed: false,
-          present: false,
-          blockedByForeignDir: false,
-          blocker: null,
-          localRevision: null,
-          localAssetsRepo: null,
-          localAssetsRevision: null,
-          ...item,
+          ...(category === undefined ? {} : { category }),
+          ...(draft === undefined ? {} : { draft }),
+          builds: [
+            {
+              id: 'MXFP4',
+              hfRepo: REPO,
+              sizeGb: 23.3,
+              source: 'MLX',
+              slug: SLUG,
+              installed: false,
+              present: false,
+              heldBy: null,
+              blockedByForeignDir: false,
+              blocker: null,
+              localRevision: null,
+              localAssetsRepo: null,
+              localAssetsRevision: null,
+              ...build,
+            },
+          ],
         },
       ],
     };
@@ -855,7 +869,7 @@ describe('Models page — the Install affordance', () => {
   }
 
   function downloadJob(overrides: Partial<DownloadJob>): DownloadJob {
-    return { id: 'job-1', repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
+    return { id: 'job-1', slug: SLUG, repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
   }
 
   /** Job ids every mounted card subscribed to, in order. */
@@ -925,8 +939,12 @@ describe('Models page — the Install affordance', () => {
 
   /** Labels of the palette commands the mounted page registers, as of the last render. */
   let paletteLabels: string[] = [];
+  /** Ids of the same commands. */
+  let paletteIds: string[] = [];
   function PaletteProbe(): null {
-    paletteLabels = usePageCommands().map((command) => String(command.label));
+    const commands = usePageCommands();
+    paletteLabels = commands.map((command) => String(command.label));
+    paletteIds = commands.map((command) => command.id);
     return null;
   }
 
@@ -952,18 +970,50 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Install');
   });
 
+  it('keys the palette Install command by the build folder', async () => {
+    recordRequests(catalogRoutes({}));
+    await mountModels();
+    // Two builds of one repository share `hfRepo`; only the folder tells their commands apart.
+    expect(paletteIds).toContain(`models:install:${SLUG}`);
+  });
+
+  it('names the other build a folder holds and offers no Install into it', async () => {
+    recordRequests(catalogRoutes({ heldBy: 'UD-Q4_K_M' }));
+    await mountModels();
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    // Mutation: drop the heldBy branch of CatalogDownloadAction → the card offers Install → red.
+    expect(card.textContent).toContain(`${SLUG} holds UD-Q4_K_M. Delete it in Local models to install MXFP4 here.`);
+    expect(buttonLabels()).not.toContain('Install');
+    expect(paletteLabels).not.toContain(`Install ${LABEL}`);
+  });
+
+  it('follows a job by its folder, not by its repository', async () => {
+    // A job of another build of the same repository installs to another folder.
+    recordRequests(catalogRoutes({}, [downloadJob({}), downloadJob({ id: 'job-sibling', slug: `${SLUG}-ud-q4_k_m` })]));
+    await mountModels();
+    // Mutation: key `active` by job.repo → the card follows no job, or the sibling's → red.
+    expect(openedStreams).toEqual(['job-1']);
+  });
+
   /** {@link catalogRoutes} plus a streamed entry with a memory floor, on a Mac with `memGib` of RAM. */
   function floorRoutes(memGib: number): Record<string, unknown> {
     const routes = catalogRoutes({});
     const catalog = routes['/catalog'] as CatalogResponse;
+    const first = catalog.items[0]!;
     const streamed: CatalogItem = {
-      ...catalog.items[0]!,
+      ...first,
       label: 'Hy4-flash',
-      hfRepo: 'AngelSlim/Hy4-flash-GGUF',
-      slug: 'hy4-flash-gguf',
-      sizeGb: 168.3,
       description: '512-expert MoE streamed from SSD',
       minMemoryGb: 96,
+      builds: [
+        {
+          ...first.builds[0],
+          id: 'Q4_K_M',
+          hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+          slug: 'hy4-flash-gguf',
+          sizeGb: 168.3,
+        },
+      ],
     };
     routes['/catalog'] = { items: [...catalog.items, streamed] };
     routes['/models'] = {
@@ -993,15 +1043,15 @@ describe('Models page — the Install affordance', () => {
 
   it('hostNote keeps the weights note for entries without a memory floor only', () => {
     const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null };
-    expect(hostNote({ sizeGb: 168.3, present: false }, host)).toContain("larger than this Mac's memory");
-    expect(hostNote({ sizeGb: 168.3, present: false, minMemoryGb: 96 }, host)).toBeNull();
+    expect(hostNote({ sizeGb: 168.3, present: false }, undefined, host)).toContain("larger than this Mac's memory");
+    expect(hostNote({ sizeGb: 168.3, present: false }, 96, host)).toBeNull();
   });
 
   it.each([96, 128])('hostNote gives Qwen3.8-Flash-Next and Hy4-flash no note on a %i GiB Mac', (gib) => {
     const host = { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null };
     for (const label of ['Qwen3.8-Flash-Next', 'Hy4-flash']) {
       const entry = MODEL_CATALOG.find((item) => item.label === label)!;
-      expect(hostNote({ ...entry, present: false }, host), label).toBeNull();
+      expect(hostNote({ sizeGb: entry.builds[0].sizeGb, present: false }, entry.minMemoryGb, host), label).toBeNull();
     }
   });
 
@@ -1094,7 +1144,9 @@ describe('Models page — the Install affordance', () => {
   it('resumes a companion download and subscribes to its own progress', async () => {
     const draft = draftItem();
     recordRequests(
-      catalogRoutes({ present: true, installed: true, draft }, [downloadJob({ id: 'draft-job', repo: draft.hfRepo })]),
+      catalogRoutes({ present: true, installed: true, draft }, [
+        downloadJob({ id: 'draft-job', slug: draft.slug, repo: draft.hfRepo }),
+      ]),
     );
     await mountModels();
     expect(openedStreams).toContain('draft-job');
@@ -1370,7 +1422,7 @@ describe('Models page — the Install affordance', () => {
     const calls = serveReinstall(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
       ok: true,
       status: 202,
-      body: { id: 'job-reinstall', repo: REPO },
+      body: { id: 'job-reinstall', slug: SLUG, repo: REPO },
     }));
     await mountModels();
     await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
@@ -1386,7 +1438,7 @@ describe('Models page — the Install affordance', () => {
     await waitFor(() => openedStreams.includes('job-reinstall'));
     const posts = calls.filter((call) => call.method === 'POST');
     expect(posts.map((call) => call.body)).toEqual([
-      { repo: REPO, replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 192_223_904, truncated: false } },
+      { slug: SLUG, replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 192_223_904, truncated: false } },
     ]);
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
     await waitFor(() => (card.textContent ?? '').includes('Replaces the old directory when the download is complete.'));
@@ -1427,11 +1479,13 @@ describe('Models page — the Install affordance', () => {
     onPlanUpdate: () => Promise<AdoptPlanResponse> = () => Promise.reject(new Error('no plan')),
   ): Parameters<typeof CatalogDownloadAction>[0] {
     return {
+      buildName: 'MXFP4',
       item: {
         hfRepo: REPO,
         slug: SLUG,
         installed: false,
         present: false,
+        heldBy: null,
         blockedByForeignDir: true,
         blocker,
         localRevision: null,
@@ -1472,7 +1526,7 @@ describe('Models page — the Install affordance', () => {
     serveReinstall(catalogRoutes({ present: true, installed: true, draft }), () => ({
       ok: true,
       status: 202,
-      body: { id: 'job-draft', repo: draft.hfRepo },
+      body: { id: 'job-draft', slug: draft.slug, repo: draft.hfRepo },
     }));
     await mountModels();
     const companion = mounted!.container
@@ -1552,14 +1606,14 @@ describe('Models page — the Install affordance', () => {
       const held = heldPlan({ ok: true, status: 200, body: { ...PLAN, ...overrides } });
       const calls = serveReinstall(
         catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
-        () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+        () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
         held.answer,
       );
       await mountModels();
       expect(posts(calls, '/downloads/adopt-plan')).toEqual([]);
       await act(async () => buttonNamed(mounted!.container, 'Update').click());
       await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 1);
-      expect(posts(calls, '/downloads/adopt-plan')).toEqual([{ repo: REPO }]);
+      expect(posts(calls, '/downloads/adopt-plan')).toEqual([{ slug: SLUG }]);
       expect(buttonNamed(mounted!.container, 'Checking…').disabled).toBe(true);
       await settle();
       expect(updateDialog()).toBeUndefined();
@@ -1575,7 +1629,7 @@ describe('Models page — the Install affordance', () => {
   it('drops the plan when the confirmation closes, so the next click loads a new one', async () => {
     const calls = serveReinstall(
       catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
-      () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
       () => ({ ok: true, status: 200, body: PLAN }),
     );
     await mountModels();
@@ -1620,7 +1674,7 @@ describe('Models page — the Install affordance', () => {
     let plans = 0;
     const calls = serveReinstall(
       catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
-      () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
       () =>
         ++plans === 1
           ? { ok: false, status: 409, code: 'E_CONFLICT', message: refusal }
@@ -1650,7 +1704,7 @@ describe('Models page — the Install affordance', () => {
     onTestFinished(() => success.mockRestore());
     const calls = serveReinstall(
       catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
-      () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
       () => ({ ok: true, status: 200, body: PLAN }),
     );
     await mountModels();
@@ -1658,7 +1712,7 @@ describe('Models page — the Install affordance', () => {
     await waitFor(() => updateDialog() !== undefined);
     await act(async () => buttonNamed(updateDialog()!, 'Update').click());
     await waitFor(() => openedStreams.includes('job-update'));
-    expect(posts(calls, '/downloads')).toEqual([{ repo: REPO, adopt: PLAN.token }]);
+    expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG, adopt: PLAN.token }]);
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
     await waitFor(() => (card.textContent ?? '').includes(`Checks the files in ${SLUG}. Nothing is deleted.`));
     expect(buttonNamed(card, 'Cancel')).toBeTruthy();
@@ -1677,7 +1731,7 @@ describe('Models page — the Install affordance', () => {
     await waitFor(() => (card.textContent ?? '').includes('Checking Clairic-Flash-UD-Q4_K_XL.gguf'));
     emitDownload('done', { id: 'job-update', outputDir: `/models/${SLUG}` });
     await waitFor(() => success.mock.calls.length > 0);
-    expect(success.mock.calls).toEqual([['Update complete', { description: REPO }]]);
+    expect(success.mock.calls).toEqual([['Update complete', { description: SLUG }]]);
   });
 
   it('keeps a refused Update in the confirmation, reloads the catalog, raises no toast', async () => {
@@ -1729,7 +1783,7 @@ describe('Models page — the Install affordance', () => {
     const routes = catalogRoutes({ blockedByForeignDir: true, blocker: HELD, category: 'systemone' });
     serveReinstall(
       routes,
-      () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
       () => ({ ok: true, status: 200, body: PLAN }),
     );
     function DrawerPage(): ReactNode {
@@ -1783,7 +1837,7 @@ describe('Models page — the Install affordance', () => {
     });
     await mountModels();
     await waitFor(() => error.mock.calls.length > 0);
-    expect(error.mock.calls).toEqual([['Update failed', { description: REPO }]]);
+    expect(error.mock.calls).toEqual([['Update failed', { description: SLUG }]]);
   });
 
   it('waits for the catalog before it names an Update that failed while the page was away', async () => {
@@ -1798,7 +1852,7 @@ describe('Models page — the Install affordance', () => {
     let open: Promise<void> | undefined;
     const calls = serveReinstall(
       routes,
-      () => ({ ok: true, status: 202, body: { id: 'job-update', repo: REPO } }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
       undefined,
       (path) => {
         if (path !== '/catalog') return undefined;
@@ -1821,7 +1875,7 @@ describe('Models page — the Install affordance', () => {
     await mountModels();
     await waitFor(() => error.mock.calls.length > 0);
     expect(atCatalog).toEqual([]);
-    expect(error.mock.calls).toEqual([['Update failed', { description: REPO }]]);
+    expect(error.mock.calls).toEqual([['Update failed', { description: SLUG }]]);
   });
 
   it('tells where the kept files are when a later update is done', async () => {
@@ -2591,7 +2645,7 @@ describe('Models page — the Install affordance', () => {
         call: async (call: ApiCall) => {
           const path = call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path;
           if (call.method === 'POST' && path === '/downloads') {
-            return { ok: true as const, status: 202, body: { id: 'job-b', repo: REPO } };
+            return { ok: true as const, status: 202, body: { id: 'job-b', slug: SLUG, repo: REPO } };
           }
           if (call.method === 'DELETE' && path === '/downloads/job-a') {
             await heldDelete;
@@ -2809,7 +2863,7 @@ describe('Models page — the Install affordance', () => {
       await mountModels();
       expect(
         failed.mock.calls.map((call) => [call[0], (call[1] as { description?: string } | undefined)?.description]),
-      ).toEqual([['Download failed', REPO]]);
+      ).toEqual([['Download failed', SLUG]]);
       expect(dismissed(calls)).toEqual(['job-bad']);
       // …and the card is back at Install, ready for the retry.
       expect(buttonLabels()).toContain('Install');
@@ -2897,7 +2951,7 @@ describe('Models page — the Install affordance', () => {
             return { ok: true as const, status: 200, body: await olderDownloads };
           }
           if (call.method === 'POST' && path === '/downloads') {
-            return { ok: true as const, status: 202, body: { id: 'job-local', repo: REPO } };
+            return { ok: true as const, status: 202, body: { id: 'job-local', slug: SLUG, repo: REPO } };
           }
           if (call.method === 'GET' && Object.hasOwn(routes, path)) {
             return { ok: true as const, status: 200, body: routes[path] };

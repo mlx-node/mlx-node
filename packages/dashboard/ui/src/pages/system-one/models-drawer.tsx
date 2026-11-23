@@ -13,7 +13,7 @@ import type { ModelDownloads } from '../models/use-model-downloads';
 
 export function isSystemOneCatalogItem(item: CatalogItem): boolean {
   if (item.category === 'systemone') return true;
-  const hay = `${item.label} ${item.hfRepo} ${item.slug}`.toLowerCase();
+  const hay = `${item.label} ${item.builds[0].hfRepo} ${item.builds[0].slug}`.toLowerCase();
   return hay.includes('clairic') || hay.includes('clef');
 }
 
@@ -77,16 +77,18 @@ export function SystemOneModelsDrawer({
           ) : (
             <div className="grid gap-3">
               {items.map((item) => {
-                const props = downloads.downloadProps(item);
+                const build = item.builds[0];
+                const props = downloads.downloadProps(build);
                 return (
                   <CatalogCard
-                    key={item.hfRepo}
+                    key={item.label}
                     {...props}
-                    item={item}
+                    entry={item}
+                    item={build}
                     host={host}
                     detailsTo={
-                      localModels.some((model) => model.name === item.slug)
-                        ? `/models?focus=${encodeURIComponent(item.slug)}`
+                      localModels.some((model) => model.name === build.slug)
+                        ? `/models?focus=${encodeURIComponent(build.slug)}`
                         : undefined
                     }
                   />
@@ -126,8 +128,9 @@ export function NoSystemOneModelsCard({
       ) : items.length > 0 ? (
         <CatalogGrid>
           {items.map((item) => {
-            const props = downloads.downloadProps(item);
-            return <CatalogCard key={item.hfRepo} {...props} item={item} host={host} />;
+            const build = item.builds[0];
+            const props = downloads.downloadProps(build);
+            return <CatalogCard key={item.label} {...props} entry={item} item={build} host={host} />;
           })}
         </CatalogGrid>
       ) : (

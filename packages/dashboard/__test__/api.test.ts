@@ -276,9 +276,14 @@ describe('dashboard api — models & catalog', () => {
   it('serves the catalog with install state', async () => {
     const res = await api.fetch('/api/catalog');
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ slug: string; installed: boolean; hfRepo: string }> };
+    const body = (await res.json()) as {
+      items: Array<{ builds: Array<{ slug: string; installed: boolean; hfRepo: string }> }>;
+    };
     expect(body.items.length).toBeGreaterThan(0);
-    for (const item of body.items) expect(typeof item.installed).toBe('boolean');
+    for (const item of body.items) {
+      expect(item.builds.length).toBeGreaterThan(0);
+      for (const build of item.builds) expect(typeof build.installed).toBe('boolean');
+    }
   });
 });
 
@@ -1760,16 +1765,19 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
 });
 
 describe('dashboard api — downloads', () => {
-  it('lists jobs and rejects a non-catalog repo', async () => {
+  it('lists jobs and rejects a folder the catalog does not install', async () => {
     const list = (await (await api.fetch('/api/downloads')).json()) as { jobs: unknown[] };
     expect(Array.isArray(list.jobs)).toBe(true);
 
     const bad = await api.fetch('/api/downloads', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repo: 'someone/not-in-catalog' }),
+      body: JSON.stringify({ slug: 'someone-not-in-catalog' }),
     });
     expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toBe(
+      '"someone-not-in-catalog" is not a folder of the model catalog',
+    );
   });
 
   // Finding E: the cancel route is wired end-to-end through the real runtime and
@@ -1792,6 +1800,10 @@ describe('dashboard api — downloads', () => {
     expect(((await res.json()) as { error: string }).error).toContain('not available over this transport');
   });
 });
+
+/** A catalog folder (Qwen3.8-27B UD-Q4_K_XL) and the repository it installs, for the route tests below. */
+const CATALOG_SLUG = 'qwen3.8-27b-gguf';
+const CATALOG_REPO = 'unsloth/Qwen3.8-27B-GGUF';
 
 /** Dispatch one request against a stub context, with no runtime or socket. */
 function call(ctx: ApiContext, method: string, pathname: string, body?: unknown): ReturnType<typeof dispatch> {
@@ -1839,9 +1851,16 @@ describe('dashboard api — cancel download route', () => {
 describe('dashboard api — download start is 202 Accepted', () => {
   it('answers 202 (not 200) for an accepted download start', async () => {
     const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
-    const res = await call(ctx, 'POST', '/api/downloads', { repo: 'org/repo' });
+    const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
     expect(res.status).toBe(202);
-    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', repo: 'org/repo' });
+    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', slug: CATALOG_SLUG, repo: CATALOG_REPO });
+  });
+
+  it('answers 400 for a body that names a repo and no folder', async () => {
+    const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { repo: CATALOG_REPO });
+    expect(res.status).toBe(400);
+    expect(res.ok ? '' : res.message).toBe('Body must include a "slug" string');
   });
 });
 
@@ -1888,7 +1907,7 @@ describe('dashboard api — method-not-allowed vs not-found', () => {
 describe('dashboard api — start download route', () => {
   function postDownload(start: () => string): ReturnType<typeof dispatch> {
     const ctx = { downloads: { start } } as unknown as ApiContext;
-    return call(ctx, 'POST', '/api/downloads', { repo: 'org/model' });
+    return call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
   }
 
   it('answers 503 once the download manager is shutting down', async () => {
@@ -1901,9 +1920,9 @@ describe('dashboard api — start download route', () => {
     expect(res.ok ? '' : res.message).toContain('shutting down');
   });
 
-  it('still answers 400 for a repo the catalog does not carry', async () => {
+  it('still answers 400 for a folder the catalog does not install', async () => {
     const res = await postDownload(() => {
-      throw new Error('Repo "org/model" is not in the model catalog');
+      throw new Error('"org-model" is not a folder of the model catalog');
     });
     expect(res.status).toBe(400);
     expect(res.ok ? '' : res.code).toBe('E_BAD_REQUEST');
@@ -1911,7 +1930,7 @@ describe('dashboard api — start download route', () => {
 });
 
 describe('dashboard api — Update plan route', () => {
-  function postPlan(planAdoption: (repo: string) => Promise<unknown>, body: unknown = { repo: 'org/model' }) {
+  function postPlan(planAdoption: (slug: string) => Promise<unknown>, body: unknown = { slug: CATALOG_SLUG }) {
     const ctx = { downloads: { planAdoption } } as unknown as ApiContext;
     return call(ctx, 'POST', '/api/downloads/adopt-plan', body);
   }
@@ -1921,13 +1940,13 @@ describe('dashboard api — Update plan route', () => {
     expect(route?.thread).toBe('main');
 
     const seen: string[] = [];
-    const ok = await postPlan(async (repo) => {
-      seen.push(repo);
-      return { repo, token: 'a'.repeat(64) };
+    const ok = await postPlan(async (slug) => {
+      seen.push(slug);
+      return { slug, token: 'a'.repeat(64) };
     });
-    expect(seen).toEqual(['org/model']);
+    expect(seen).toEqual([CATALOG_SLUG]);
     expect(ok.status).toBe(200);
-    expect(ok.ok ? ok.body : null).toEqual({ repo: 'org/model', token: 'a'.repeat(64) });
+    expect(ok.ok ? ok.body : null).toEqual({ slug: CATALOG_SLUG, token: 'a'.repeat(64) });
 
     const text = '"model" holds links or special files. Update cannot check it.';
     const conflict = await postPlan(() => Promise.reject(new DownloadConflictError(text)));
@@ -1965,14 +1984,14 @@ describe('dashboard api — Update start', () => {
   }
 
   it('passes the token of the plan to the manager', async () => {
-    const { res, calls } = postStart({ repo: 'org/model', adopt: '0123456789abcdef'.repeat(4) });
+    const { res, calls } = postStart({ slug: CATALOG_SLUG, adopt: '0123456789abcdef'.repeat(4) });
     expect((await res).status).toBe(202);
-    expect(calls).toEqual([['org/model', { adopt: '0123456789abcdef'.repeat(4) }]]);
+    expect(calls).toEqual([[CATALOG_SLUG, { adopt: '0123456789abcdef'.repeat(4) }]]);
   });
 
   it('rejects adopt with replaceBlocker', async () => {
     const { res, calls } = postStart({
-      repo: 'org/model',
+      slug: CATALOG_SLUG,
       adopt: 'a'.repeat(64),
       replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 1, truncated: false },
     });
@@ -1990,7 +2009,7 @@ describe('dashboard api — Update start', () => {
     ['a number', 42],
     ['null', null],
   ])('rejects a token that is not 64 hex chars: %s', async (_name, adopt) => {
-    const { res, calls } = postStart({ repo: 'org/model', adopt });
+    const { res, calls } = postStart({ slug: CATALOG_SLUG, adopt });
     const answer = await res;
     expect(answer.status).toBe(400);
     expect(answer.ok ? '' : answer.message).toBe('"adopt" must be the 64-character token of an Update plan');

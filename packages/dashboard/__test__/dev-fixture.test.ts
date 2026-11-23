@@ -311,8 +311,10 @@ describe('dev fixture content for the manage pages', () => {
 
   it('blocks one catalog slug with a one-file leftover that Reinstall can replace', () => {
     writeFixtureHome(home, { now });
-    const entry = catalogWithState(fixturePaths(home).modelsDir).find((item) => item.slug === CATALOG_BLOCKED.slug);
-    expect(entry?.blocker).toEqual({
+    const build = catalogWithState(fixturePaths(home).modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_BLOCKED.slug);
+    expect(build?.blocker).toEqual({
       kind: 'directory',
       fileCount: 1,
       sizeBytes: CATALOG_BLOCKED.sizeBytes,
@@ -328,21 +330,31 @@ describe('dev fixture content for the manage pages', () => {
 
   it('holds one catalog slug with a GGUF folder that Update can adopt', () => {
     writeFixtureHome(home, { now });
-    const catalog = catalogWithState(fixturePaths(home).modelsDir);
-    const entry = catalog.find((item) => item.slug === CATALOG_UPDATE.slug);
-    expect(entry).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
-    expect(entry?.blocker).toMatchObject({ kind: 'directory', fileCount: 4, truncated: false, holdsModel: true });
-    expect(catalog.find((item) => item.slug === CATALOG_BLOCKED.slug)?.blocker?.holdsModel).toBe(false);
+    const builds = catalogWithState(fixturePaths(home).modelsDir).flatMap((item) => item.builds);
+    const build = builds.find((item) => item.slug === CATALOG_UPDATE.slug);
+    expect(build).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
+    expect(build?.blocker).toMatchObject({ kind: 'directory', fileCount: 4, truncated: false, holdsModel: true });
+    expect(builds.find((item) => item.slug === CATALOG_BLOCKED.slug)?.blocker?.holdsModel).toBe(false);
   });
 
-  it('installs one catalog entry that reads as installed with an update, with no network', () => {
+  it('installs the first build of one catalog model that reads as installed with an update, with no network', () => {
     writeFixtureHome(home, { now });
-    const entry = catalogWithState(fixturePaths(home).modelsDir).find((item) => item.slug === CATALOG_INSTALL.slug);
-    expect(entry?.installed).toBe(true);
-    expect(entry?.localRevision).not.toBeNull();
-    // The marker predates the entry's tokenizer source, which the page reads as an update.
-    expect(entry?.assetsRepo).toBeDefined();
-    expect(entry?.localAssetsRepo).toBeNull();
+    const item = catalogWithState(fixturePaths(home).modelsDir).find((entry) =>
+      entry.builds.some((build) => build.slug === CATALOG_INSTALL.slug),
+    );
+    const [first, second] = item?.builds ?? [];
+    expect(first).toMatchObject({
+      slug: CATALOG_INSTALL.slug,
+      id: CATALOG_INSTALL.build,
+      hfRepo: CATALOG_INSTALL.repo,
+    });
+    expect(first?.installed).toBe(true);
+    expect(first?.localRevision).not.toBeNull();
+    // The marker predates the build's tokenizer source, which the page reads as an update.
+    expect(first?.assetsRepo).toBeDefined();
+    expect(first?.localAssetsRepo).toBeNull();
+    // The other build of the repository is not on disk.
+    expect(second).toMatchObject({ present: false, installed: false, heldBy: null, blocker: null });
   });
 
   it('writes a long session with subagents and a live session whose last turn is still running', () => {

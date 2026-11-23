@@ -13,26 +13,26 @@ import { Badge } from '../../components/arc/badge/badge';
 import { Button } from '../../components/arc/button/button';
 import { Tooltip } from '../../components/arc/tooltip/tooltip';
 import { DownloadProgress } from '../../components/download-progress';
-import { catalogBuildLabel } from '../../lib/catalog';
 import { errMessage } from '../../lib/errors';
 import { formatBytes, formatBytesParts, formatCount, formatCountNoun } from '../../lib/format';
 import { truncateMiddle } from '../../lib/labels';
-import type { AdoptPlanResponse, CatalogBlocker, CatalogItem, ModelsResponse } from '../../lib/types';
+import type { AdoptPlanResponse, CatalogBlocker, CatalogBuildItem, CatalogItem, ModelsResponse } from '../../lib/types';
 import type { CatalogDownloadProps } from './use-model-downloads';
 
 const GB = 1e9;
 const GIB = 2 ** 30;
 
-/** The one note a catalog card or an onboarding choice shows about room on this Mac, or null. */
+/** The one note a catalog card or an onboarding choice shows about room on this Mac for `build`, or null. */
 export function hostNote(
-  item: Pick<CatalogItem, 'sizeGb' | 'present' | 'minMemoryGb'>,
+  build: Pick<CatalogBuildItem, 'sizeGb' | 'present'>,
+  minMemoryGb: number | undefined,
   host: ModelsResponse['host'] | undefined,
 ): string | null {
   if (host === undefined) return null;
-  if (!item.present && host.diskFreeBytes !== null && item.sizeGb * GB > host.diskFreeBytes) {
-    return `Needs about ${item.sizeGb} GB. ${formatBytes(host.diskFreeBytes)} is free on this disk.`;
+  if (!build.present && host.diskFreeBytes !== null && build.sizeGb * GB > host.diskFreeBytes) {
+    return `Needs about ${build.sizeGb} GB. ${formatBytes(host.diskFreeBytes)} is free on this disk.`;
   }
-  if (item.minMemoryGb === undefined && item.sizeGb * GIB > host.totalMemBytes) {
+  if (minMemoryGb === undefined && build.sizeGb * GIB > host.totalMemBytes) {
     return `Weights are larger than this Mac's memory (${formatBytes(host.totalMemBytes)}).`;
   }
   return null;
@@ -49,6 +49,8 @@ export function HostNote({ text, as: Tag = 'p' }: { text: string; as?: 'p' | 'sp
 }
 
 export interface CatalogDownloadActionProps extends CatalogDownloadProps {
+  /** The name of what `item` installs (`UD-Q4_K_XL`, `DFlash2`), for a folder that holds another build. */
+  buildName: string;
   /** `/models?focus=…` when a local model is the installed one. */
   detailsTo?: string;
   /** Optional direct workspace link (e.g. `/system-one?model=…`). */
@@ -328,6 +330,7 @@ export function CatalogDownloadAction({
   detailsTo,
   openTo,
   companion = false,
+  buildName,
 }: CatalogDownloadActionProps): ReactElement {
   const [starting, setStarting] = useState(false);
   const start = async (): Promise<void> => {
@@ -398,6 +401,14 @@ export function CatalogDownloadAction({
           </>
         ) : null}
       </p>
+    );
+  }
+  if (item.heldBy !== null) {
+    return (
+      <Alert tone="warning" title="Needs cleanup">
+        <span className="font-mono">{item.slug}</span> holds {item.heldBy}. Delete it in Local models to install{' '}
+        {buildName} here.
+      </Alert>
     );
   }
   if (item.blocker?.holdsModel === true && item.blocker.kind === 'directory' && !item.blocker.truncated) {
@@ -472,20 +483,20 @@ function hfUrl(repo: string): string {
   return `https://huggingface.co/${repo}`;
 }
 
-export interface CatalogCardProps extends CatalogDownloadActionProps {
-  item: CatalogItem;
+export interface CatalogCardProps extends Omit<CatalogDownloadActionProps, 'item' | 'buildName'> {
+  entry: CatalogItem;
+  /** The build the card shows; `item` of the download props is this build. */
+  item: CatalogBuildItem;
   draftDownload?: CatalogDownloadProps;
   host: ModelsResponse['host'] | undefined;
 }
 
 /** One recommended model: link, badges, size and build, a host note, its action, and its optional draft. */
-export function CatalogCard({ item, draftDownload, host, ...download }: CatalogCardProps): ReactElement {
-  const build = catalogBuildLabel(item);
-  const note = hostNote(item, host);
-  const meta = [`~${item.sizeGb} GB`, build].filter((part): part is string => part !== null).join(' · ');
+export function CatalogCard({ entry, item, draftDownload, host, ...download }: CatalogCardProps): ReactElement {
+  const note = hostNote(item, entry.minMemoryGb, host);
   return (
     <div data-model={item.slug} className="min-w-0">
-      <Panel ariaLabel={item.label}>
+      <Panel ariaLabel={entry.label}>
         <div className="grid min-w-0 gap-3">
           <div className="flex min-w-0 items-start justify-between gap-2">
             <a
@@ -494,19 +505,19 @@ export function CatalogCard({ item, draftDownload, host, ...download }: CatalogC
               target="_blank"
               rel="noreferrer"
             >
-              <ModelLogo model={item.label} className="size-[18px] shrink-0" />
-              <span className="min-w-0 truncate" title={item.label}>
-                {item.label}
+              <ModelLogo model={entry.label} className="size-[18px] shrink-0" />
+              <span className="min-w-0 truncate" title={entry.label}>
+                {entry.label}
               </span>
               <ExternalLink size={12} aria-hidden="true" className="shrink-0 text-muted" />
             </a>
             <span className="flex shrink-0 items-center gap-1">
-              {item.category === 'systemone' ? (
+              {entry.category === 'systemone' ? (
                 <Badge color="violet" size="sm">
                   System One
                 </Badge>
               ) : null}
-              {item.isDefault === true ? (
+              {entry.isDefault === true ? (
                 <Badge tone="info" size="sm">
                   Default
                 </Badge>
@@ -518,32 +529,37 @@ export function CatalogCard({ item, draftDownload, host, ...download }: CatalogC
               ) : null}
             </span>
           </div>
-          <p className="m-0 line-clamp-2 text-body text-secondary">{item.description}</p>
-          <p className="m-0 text-caption text-secondary tabular-nums">{meta}</p>
+          <p className="m-0 line-clamp-2 text-body text-secondary">{entry.description}</p>
+          <p className="m-0 text-caption text-secondary tabular-nums">{`~${item.sizeGb} GB · ${item.id}`}</p>
           {note !== null ? <HostNote text={note} /> : null}
-          <CatalogDownloadAction item={item} {...download} />
-          {item.draft !== undefined && draftDownload !== undefined ? (
+          <CatalogDownloadAction item={item} buildName={item.id} {...download} />
+          {entry.draft !== undefined && draftDownload !== undefined ? (
             <>
               <Rule />
-              <div role="group" aria-label={`${item.draft.label} companion`} className="grid gap-2">
+              <div role="group" aria-label={`${entry.draft.label} companion`} className="grid gap-2">
                 <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
                   <span className="flex min-w-0 items-center gap-2">
                     <a
                       className="min-w-0 truncate text-body font-medium text-foreground"
-                      href={hfUrl(item.draft.hfRepo)}
+                      href={hfUrl(entry.draft.hfRepo)}
                       target="_blank"
                       rel="noreferrer"
                     >
-                      {item.draft.label}
+                      {entry.draft.label}
                     </a>
                     <Badge size="sm">Optional</Badge>
                   </span>
-                  <span className="text-caption text-secondary tabular-nums">~{item.draft.sizeGb} GB</span>
+                  <span className="text-caption text-secondary tabular-nums">~{entry.draft.sizeGb} GB</span>
                 </div>
                 <p className="m-0 text-caption text-secondary">
                   Can speed up replies. Used automatically the next time this model loads.
                 </p>
-                <CatalogDownloadAction {...draftDownload} companion installLabel={`Install ${item.draft.label}`} />
+                <CatalogDownloadAction
+                  {...draftDownload}
+                  companion
+                  buildName={entry.draft.label}
+                  installLabel={`Install ${entry.draft.label}`}
+                />
               </div>
             </>
           ) : null}

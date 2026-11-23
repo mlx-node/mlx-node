@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogRepo, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
+import { type CatalogEntry, catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { runFirstRunWizard, type WizardIO } from '../../packages/cli/src/commands/agent/wizard.js';
@@ -19,20 +19,28 @@ function shellSplit(renderedArgs: string): string[] {
   return words;
 }
 
+/** The models dir every wizard run below is given. */
+const MODELS_DIR = '/custom/models';
+
+/** The platform-resolved repo of the first build of `entry`, the build the wizard installs. */
+function repoOf(entry: CatalogEntry): string {
+  return catalogBuildRepo(entry.builds[0]);
+}
+
 /**
  * The argv contract the wizard must hand `mlx download model` for one entry:
- * the platform-resolved repo, the entry's globs, the sidecar assets repo, and
- * (when a models dir is pinned) the output under `<modelsDir>/<slug>`. Written
- * out literally — a change to the wizard's argv shape must fail here.
+ * the platform-resolved repo of its first build, that build's globs, the
+ * sidecar assets repo, and the output under `<modelsDir>/<build folder>`.
+ * Written out literally — a change to the wizard's argv shape must fail here.
  */
-function expectedArgv(entry: CatalogEntry, modelsDir?: string): string[] {
-  const repo = catalogRepo(entry);
-  const argv = ['-m', repo];
-  for (const glob of entry.globs ?? []) argv.push('-g', glob);
-  if (entry.assetsRepo !== undefined) argv.push('--assets-repo', entry.assetsRepo);
+function expectedArgv(entry: CatalogEntry, modelsDir: string = MODELS_DIR): string[] {
+  const build = entry.builds[0];
+  const argv = ['-m', repoOf(entry)];
+  for (const glob of build.globs ?? []) argv.push('-g', glob);
+  if (build.assetsRepo !== undefined) argv.push('--assets-repo', build.assetsRepo);
   // The prescribed selection is the complete model, never a partial glob run.
   argv.push('--complete');
-  if (modelsDir !== undefined) argv.push('-o', join(modelsDir, repo.split('/').pop()!.toLowerCase()));
+  argv.push('-o', join(modelsDir, catalogBuildSlug(build)));
   return argv;
 }
 
@@ -77,89 +85,89 @@ describe('runFirstRunWizard', () => {
     const { io, selectCalls } = makeIO();
     const { download } = makeDownload();
 
-    await runFirstRunWizard({ io, download });
+    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
 
     expect(selectCalls).toHaveLength(1);
     const choices = selectCalls[0]!.choices;
 
     const visible = visibleCatalog();
-    expect(choices.map((c) => c.value).sort()).toEqual(visible.map((e) => catalogRepo(e)).sort());
+    expect(choices.map((c) => c.value).sort()).toEqual(visible.map((e) => e.label).sort());
 
     // Default entry is preselected by coming first.
     const defaultEntry = visible.find((e) => e.isDefault)!;
     expect(defaultEntry).toBeDefined();
-    expect(choices[0]!.value).toBe(catalogRepo(defaultEntry));
+    expect(choices[0]!.value).toBe(defaultEntry.label);
 
     // Hidden entries are never offered (the catalog must actually carry one
     // for this assertion to mean anything).
     const hidden = MODEL_CATALOG.filter((e) => e.hidden);
     expect(hidden.length).toBeGreaterThan(0);
     for (const entry of hidden) {
-      expect(choices.map((c) => c.value)).not.toContain(catalogRepo(entry));
+      expect(choices.map((c) => c.value)).not.toContain(entry.label);
     }
 
-    // Labels carry size and description.
+    // Labels carry the first build's size and the description.
     for (const entry of visible) {
-      const choice = choices.find((c) => c.value === catalogRepo(entry))!;
+      const choice = choices.find((c) => c.value === entry.label)!;
       expect(choice.name).toContain(entry.label);
-      expect(choice.name).toContain(`(~${entry.sizeGb} GB)`);
+      expect(choice.name).toContain(`(~${entry.builds[0].sizeGb} GB)`);
       expect(choice.name).toContain(entry.description);
     }
   });
 
-  it('passes the chosen repo to download and returns it', async () => {
+  it('downloads the first build of the chosen model and returns its folder', async () => {
     const visible = visibleCatalog();
     const entry = visible[visible.length - 1]!;
-    const chosen = catalogRepo(entry);
-    const { io } = makeIO({ chosen });
+    const { io } = makeIO({ chosen: entry.label });
     const { download, calls } = makeDownload();
 
-    const result = await runFirstRunWizard({ io, download });
+    const result = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
 
-    expect(result).toBe(chosen);
+    expect(result).toBe(catalogBuildSlug(entry.builds[0]));
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual(expectedArgv(entry));
   });
 
-  it('carries the entry globs and assets repo into the download argv', async () => {
+  it('carries the build globs and assets repo into the download argv', async () => {
     // The catalog must actually carry a multi-variant GGUF entry for this to
-    // mean anything: the wizard exists to install one UD-Q4_K_XL variant plus
+    // mean anything: the wizard exists to install one weight variant plus
     // the base-model tokenizer sidecars, never every quant in the repo.
-    const entry = visibleCatalog().find((e) => e.globs !== undefined && e.assetsRepo !== undefined);
+    const entry = visibleCatalog().find((e) => e.builds[0].globs !== undefined && e.builds[0].assetsRepo !== undefined);
     expect(entry).toBeDefined();
-    expect(entry!.globs!.length).toBeGreaterThan(0);
-    const { io } = makeIO({ chosen: catalogRepo(entry!) });
+    expect(entry!.builds[0].globs!.length).toBeGreaterThan(0);
+    const { io } = makeIO({ chosen: entry!.label });
     const { download, calls } = makeDownload();
 
-    await runFirstRunWizard({ io, download });
+    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
 
     expect(calls[0]).toEqual(expectedArgv(entry!));
   });
 
-  it('pins the download output under modelsDir when provided', async () => {
+  it('pins the download output to the build folder under modelsDir', async () => {
     const entry = visibleCatalog()[0]!;
-    const { io } = makeIO({ chosen: catalogRepo(entry) });
+    const { io } = makeIO({ chosen: entry.label });
     const { download, calls } = makeDownload();
 
-    await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
+    await runFirstRunWizard({ io, download, modelsDir: '/other/models' });
 
-    expect(calls[0]).toEqual(expectedArgv(entry, '/custom/models'));
+    expect(calls[0]).toEqual(expectedArgv(entry, '/other/models'));
+    expect(calls[0]!.slice(-2)).toEqual(['-o', '/other/models/qwen3.8-27b-gguf']);
   });
 
   it('throws without prompting or downloading when not a TTY', async () => {
     const { io, selectCalls } = makeIO({ isTTY: false });
     const { download, calls } = makeDownload();
 
-    await expect(runFirstRunWizard({ io, download })).rejects.toThrow(/mlx download model/);
+    await expect(runFirstRunWizard({ io, download, modelsDir: MODELS_DIR })).rejects.toThrow(/mlx download model/);
 
     // The hint must list every offered repo so headless users can copy a command.
     try {
-      await runFirstRunWizard({ io, download });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
       for (const entry of visibleCatalog()) {
-        expect(message).toContain(catalogRepo(entry));
+        expect(message).toContain(repoOf(entry));
       }
     }
 
@@ -172,17 +180,17 @@ describe('runFirstRunWizard', () => {
     const { download, calls } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
       for (const entry of visibleCatalog()) {
-        const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)))!;
+        const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
         expect(line).toBeDefined();
         const renderedArgs = line.trim().replace(/^mlx download model /, '');
         // The hint must reconstruct the interactive argv exactly — including
         // the globs and assets repo, so a headless user gets the same file set.
-        expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, '/custom/models'));
+        expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry));
       }
     }
     expect(calls).toHaveLength(0);
@@ -205,8 +213,8 @@ describe('runFirstRunWizard', () => {
     }
 
     for (const entry of visibleCatalog()) {
-      const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
-      const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)));
+      const slug = catalogBuildSlug(entry.builds[0]);
+      const line = message.split('\n').find((l) => l.includes(repoOf(entry)));
       expect(line).toBeDefined();
       const renderedArgs = line!.trim().replace(/^mlx download model /, '');
       // Round-trip: a real POSIX shell parses the displayed command back
@@ -225,18 +233,18 @@ describe('runFirstRunWizard', () => {
     const { download } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
       const entry = visibleCatalog()[0]!;
-      const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
+      const slug = catalogBuildSlug(entry.builds[0]);
       // Safe paths stay readable: the -o value renders unquoted...
       expect(message).toContain(`-o /custom/models/${slug}`);
       // ...and the whole line still parses back to the intended argv.
-      const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)))!;
+      const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
       const renderedArgs = line.trim().replace(/^mlx download model /, '');
-      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, '/custom/models'));
+      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry));
     }
   });
 });
